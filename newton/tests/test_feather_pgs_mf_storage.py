@@ -7,10 +7,12 @@ import inspect
 import itertools
 import re
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
 
+import newton
 from newton._src.solvers.feather_pgs import solver_feather_pgs as fpgs
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -23,6 +25,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 from newton._src.solvers.feather_pgs.mf_gs_source import get_source
 from newton._src.solvers.feather_pgs.row_metadata import _DENSE_META_MAX_PARENT
 from newton.tests.feather_pgs_paired_fixture import pack_endpoints, solve_fixture
+from newton.tests.test_feather_pgs_masked_patch_rows import _three_size_model
 
 # The cube puzzle's streamed-metadata shape: 2304 dense and matrix-free rows over 75 coordinates.
 _CUBE = {
@@ -116,19 +119,62 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
     def test_hardware_capacity_streams_only_when_required(self):
         """Preserve all hardware rows when resident impulses exceed the device limit."""
         options = {"has_drive_rows": False, "fuse_vel_limits": False}
-        self.assertEqual(fpgs._select_mfgs_storage(256, 37248, 1551, 101376, **options), (False, True))
-        self.assertEqual(fpgs._select_mfgs_storage(256, 37248, 1551, 232448, **options), (True, False))
-        self.assertEqual(fpgs._select_mfgs_storage(256, 15984, 3135, 101376, **options), (True, False))
+        self.assertEqual(fpgs._select_mfgs_storage(256, 37248, 1551, 101376, **options)[:2], (False, True))
+        self.assertEqual(fpgs._select_mfgs_storage(256, 37248, 1551, 232448, **options)[:2], (True, False))
+        self.assertEqual(fpgs._select_mfgs_storage(256, 15984, 3135, 101376, **options)[:2], (True, False))
 
     def test_storage_boundary_and_remaining_state(self):
         """Include tile storage and reject an unrepresentable velocity working set."""
         options = {"has_drive_rows": False, "fuse_vel_limits": False}
         # Four streamed metadata arrays leave velocities and two impulse arrays.
         required = 128 + 4 * (29 + 1024 + 4096)
-        self.assertEqual(fpgs._select_mfgs_storage(1024, 4096, 29, required, **options), (False, False))
-        self.assertEqual(fpgs._select_mfgs_storage(1024, 4096, 29, required - 1, **options), (False, True))
+        self.assertEqual(fpgs._select_mfgs_storage(1024, 4096, 29, required, **options)[:2], (False, False))
+        self.assertEqual(fpgs._select_mfgs_storage(1024, 4096, 29, required - 1, **options)[:2], (False, True))
         with self.assertRaisesRegex(ValueError, "MF-GS.*shared memory"):
             fpgs._select_mfgs_storage(256, 37248, 26000, 101376, **options)
+
+    def test_single_wave_launches_keep_row_types_and_parents_resident(self):
+        """Keep packed row metadata resident only for grids of one block per SM within 48 KiB of static memory."""
+        options = {"has_drive_rows": False, "fuse_vel_limits": False}
+
+        def select(shape, shared_memory, blocks, sms=188):
+            return fpgs._select_mfgs_storage(*shape, shared_memory, **options, block_count=blocks, sm_count=sms)
+
+        cube = (2304, 2304, 75)
+        # 128 worlds, one block each, on 188 SMs: velocities, dense and MF impulses and the packed
+        # row metadata take 128 + 4 * (75 + 3 * 2304) = 28076 bytes; the float metadata streams.
+        storage = select(cube, 101376, 128)
+        self.assertEqual(storage[:3], (False, False, True))
+        self.assertIn("28076 <= 49152 bytes", storage.reason)
+        self.assertEqual(select(cube, 232448, 128)[:3], (False, False, True))
+        # A grid of one block per SM is the largest that cannot lose concurrency to the extra bytes.
+        self.assertTrue(select(cube, 101376, 188).resident_row_metadata)
+        for blocks in (189, 16384):
+            with self.subTest(blocks=blocks):
+                storage = select(cube, 101376, blocks)
+                self.assertEqual(storage[:3], (False, False, False))
+                self.assertIn(f"{blocks}-block grid exceeds one block per SM (188 SMs)", storage.reason)
+        # 48 KiB of static shared memory: 128 + 4 * (5344 + 2 * 2304 + 2304) bytes is exactly the budget.
+        self.assertTrue(select((2304, 2304, 5344), 101376, 128).resident_row_metadata)
+        storage = select((2304, 2304, 5345), 101376, 128)
+        self.assertFalse(storage.resident_row_metadata)
+        self.assertIn("49156 bytes of static shared memory, over the 49152-byte budget", storage.reason)
+        # A device that exposes less than 48 KiB sets the budget.
+        self.assertTrue(select(cube, 28076, 128).resident_row_metadata)
+        self.assertFalse(select(cube, 28075, 128).resident_row_metadata)
+        # Streamed MF impulses leave room: 128 + 4 * (1551 + 2 * 256) = 8380 bytes.
+        storage = select((256, 37248, 1551), 101376, 32)
+        self.assertEqual(storage[:3], (False, True, True))
+        self.assertIn("8380 <= 49152", storage.reason)
+        # Resident MF impulses do not: 22528 of them hold the block at 98492 bytes.
+        self.assertEqual(select((256, 22528, 1551), 101376, 32)[:3], (False, False, False))
+        # Resident metadata already holds the packed rows; an unknown launch shape keeps them streamed.
+        storage = select((192, 64, 22), 101376, 16384)
+        self.assertEqual(storage[:3], (True, False, False))
+        self.assertIn("Row metadata is resident", storage.reason)
+        storage = fpgs._select_mfgs_storage(*cube, 101376, **options)
+        self.assertEqual(storage[:3], (False, False, False))
+        self.assertIn("launch shape is unknown", storage.reason)
 
     def test_resident_row_metadata_reads_what_the_streamed_source_reads(self):
         """Read every row type and parent from the packed array where the streamed source reads global memory.
@@ -525,6 +571,95 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
                     np.testing.assert_array_equal(
                         banks[1][output].numpy().view(np.uint32), banks[0][output].numpy().view(np.uint32)
                     )
+
+    def test_solver_selects_resident_row_metadata_and_replays_its_launches_bitwise(self):
+        """Keep row types and parents resident on a one-block-per-SM grid; its launches match the streamed twin.
+
+        A dense row capacity of 320 streams the row metadata of a two-world patch scene (a standing
+        robot, an arm resting its tip on the ground and a free box). Every MF-GS launch of four
+        steps is replayed from its inputs through the streamed kernel, which must give identical
+        impulses and velocities. With fewer SMs than worlds the solver keeps the streamed kernel.
+        """
+        device = wp.get_device("cuda:0")
+        model = _three_size_model(device)
+        options = {
+            "pgs_mode": "matrix_free",
+            "pgs_iterations": 8,
+            "enable_joint_limits": True,
+            "dense_max_constraints": 320,
+            "mf_max_constraints": 32,
+            "mf_gs_incremental_rows": 0,
+            "sparse_mass_matrix": "off",
+        }
+        factory, calls = fpgs._get_pgs_solve_mf_gs_kernel, []
+
+        def recording(*args, **kwargs):
+            kernel = factory(*args, **kwargs)
+            calls.append((args, kwargs, kernel))
+            return kernel
+
+        with mock.patch.object(fpgs, "_get_pgs_solve_mf_gs_kernel", recording):
+            solver = fpgs.SolverFeatherPGS(model, **options)
+        production = solver._pgs_solve_mf_gs_kernel
+        sweep = solver.get_path_selection()["routes"]["sweep"]
+        self.assertEqual(sweep["mf_gs"], production.key)
+        self.assertIn("_gmeta_smeta", production.key)
+        storage = sweep["mf_gs_storage"]
+        self.assertEqual((storage["metadata"], storage["row_types_and_parents"]), ("streamed", "resident"))
+        self.assertIn("2-block grid fits one block per SM", storage["reason"])
+        args, kwargs = next((args, kwargs) for args, kwargs, kernel in calls if kernel is production)
+        twin = factory(*args, **{**kwargs, "resident_row_metadata": False})
+        names = list(inspect.signature(production.func).parameters)
+        launch_tiled, replays = wp.launch_tiled, []
+
+        def replay(kernel, *args, **kwargs):
+            if kernel is not production:
+                return launch_tiled(kernel, *args, **kwargs)
+            inputs, outputs = list(kwargs["inputs"]), list(kwargs["outputs"])
+            before = [wp.clone(value) if isinstance(value, wp.array) else value for value in inputs + outputs]
+            initial = before[names.index("world_impulses")].numpy()
+            result = launch_tiled(kernel, *args, **kwargs)
+            launch_tiled(twin, *args, **{**kwargs, "inputs": before[: len(inputs)], "outputs": before[len(inputs) :]})
+            replays.append((inputs + outputs, before, initial))
+            return result
+
+        def bits(array):
+            return np.ascontiguousarray(array.numpy()).view(np.uint8)
+
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False, deterministic=True)
+        contacts = pipeline.contacts()
+        states = [model.state(), model.state()]
+        control = model.control()
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        with mock.patch.object(fpgs.wp, "launch_tiled", replay):
+            for _ in range(4):
+                states[0].clear_forces()
+                pipeline.collide(states[0], contacts)
+                solver.step(states[0], states[1], control, contacts, 1.0 / 240.0)
+                states.reverse()
+        self.assertGreater(len(replays), 0)
+        rings = solved = 0
+        for production_operands, twin_operands, initial in replays:
+            for name, ours, theirs in zip(names, production_operands, twin_operands, strict=True):
+                if isinstance(ours, wp.array):
+                    np.testing.assert_array_equal(bits(ours), bits(theirs), err_msg=name)
+            solved += not np.array_equal(production_operands[names.index("world_impulses")].numpy(), initial)
+            counts = production_operands[names.index("world_constraint_count")].numpy()
+            types = production_operands[names.index("world_row_type")].numpy()
+            parents = production_operands[names.index("world_row_parent")].numpy()
+            for world, count in enumerate(counts):
+                normal = types[world, :count] == PGS_CONSTRAINT_TYPE_CONTACT
+                linked = (parents[world, :count] >= 0) & (parents[world, :count] != np.arange(count))
+                rings += int(np.count_nonzero(normal & linked))
+        self.assertGreater(solved, 0, "no replayed launch changed a dense impulse")
+        self.assertGreater(rings, 0, "no dense normal row linked a patch ring")
+        with mock.patch.object(device, "sm_count", 1):
+            declined = fpgs.SolverFeatherPGS(model, **options)
+        storage = declined.get_path_selection()["routes"]["sweep"]["mf_gs_storage"]
+        self.assertIn("_gmeta", declined._pgs_solve_mf_gs_kernel.key)
+        self.assertNotIn("_smeta", declined._pgs_solve_mf_gs_kernel.key)
+        self.assertEqual((storage["metadata"], storage["row_types_and_parents"]), ("streamed", "streamed"))
+        self.assertIn("2-block grid exceeds one block per SM (1 SMs)", storage["reason"])
 
     def test_streamed_impulses_match_resident_with_friction_and_limits(self):
         """Match mixed contact triples, warm impulses, limits and graph replay exactly."""

@@ -8,9 +8,12 @@ They do not change the numerical method, row capacity, or iteration budget.
 """
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 _MFGS_RESIDENT_METADATA_MAX_BYTES = 4096
 _MFGS_TILE_SHARED_STORAGE_BYTES = 128
+# Static shared memory a block may declare to keep its packed row metadata resident [B].
+_MFGS_STATIC_SHARED_MAX_BYTES = 48 * 1024
 
 
 def _use_resident_mfgs_metadata(
@@ -35,6 +38,21 @@ def _use_resident_mfgs_metadata(
     return metadata_bytes <= _MFGS_RESIDENT_METADATA_MAX_BYTES and total_shared_bytes <= max_shared_memory
 
 
+class _MFGSStorage(NamedTuple):
+    """Storage classes of one MF-GS kernel specialization and why they were chosen.
+
+    ``shared_metadata`` keeps every per-row metadata array in shared memory;
+    otherwise the arrays stream from global memory and ``resident_row_metadata``
+    says whether the packed dense row types and parents stay in shared memory.
+    ``stream_mf_impulses`` keeps the matrix-free impulses in global memory.
+    """
+
+    shared_metadata: bool
+    stream_mf_impulses: bool
+    resident_row_metadata: bool
+    reason: str
+
+
 def _select_mfgs_storage(
     max_constraints: int,
     mf_max_constraints: int,
@@ -43,13 +61,26 @@ def _select_mfgs_storage(
     *,
     has_drive_rows: bool,
     fuse_vel_limits: bool,
-) -> tuple[bool, bool]:
+    block_count: int | None = None,
+    sm_count: int | None = None,
+) -> _MFGSStorage:
     """Select metadata and impulse storage without changing row capacity or order.
 
     Stream MF impulses only when they cannot fit alongside the shared world
     velocity and dense state. This is a construction-time capacity fallback,
     not a claim that global storage is faster for resident-sized workloads.
+
+    Streamed metadata keeps the packed dense row types and parents resident
+    when the launch grid of ``block_count`` blocks holds at most one block per
+    SM, so their ``4 * max_constraints`` bytes cannot cost concurrency, and the
+    block then declares at most 48 KiB of static shared memory. The sweep reads
+    them on every row and along every patch ring, as chains of dependent loads.
+    Both storage classes hold identical values, so results are bitwise
+    identical. Without the launch shape the packed metadata streams with the rest.
     """
+    metadata_arrays = 4 + 4 * int(has_drive_rows) + int(fuse_vel_limits)
+    metadata_bytes = 4 * max_constraints * metadata_arrays
+    metadata_budget = _MFGS_RESIDENT_METADATA_MAX_BYTES
     shared_metadata = _use_resident_mfgs_metadata(
         max_constraints,
         mf_max_constraints,
@@ -58,14 +89,54 @@ def _select_mfgs_storage(
         has_drive_rows=has_drive_rows,
         fuse_vel_limits=fuse_vel_limits,
     )
-    metadata_arrays = (4 + 4 * int(has_drive_rows) + int(fuse_vel_limits)) if shared_metadata else 0
+    if shared_metadata:
+        reason = f"Row metadata is resident: {metadata_bytes} bytes fit the {metadata_budget}-byte budget."
+    elif metadata_bytes > metadata_budget:
+        reason = f"Row metadata streams: {metadata_bytes} bytes exceed the {metadata_budget}-byte budget."
+    else:
+        resident_bytes = (
+            _MFGS_TILE_SHARED_STORAGE_BYTES
+            + 4 * (max_world_dofs + max_constraints + mf_max_constraints)
+            + metadata_bytes
+        )
+        reason = (
+            f"Row metadata streams: resident, the block would need {resident_bytes} bytes of shared memory; "
+            f"the device exposes {max_shared_memory}."
+        )
+    metadata_arrays = metadata_arrays if shared_metadata else 0
     fixed_bytes = _MFGS_TILE_SHARED_STORAGE_BYTES + 4 * (max_world_dofs + max_constraints * (1 + metadata_arrays))
     if fixed_bytes > max_shared_memory:
         raise ValueError(
             f"MF-GS world velocity and dense state require {fixed_bytes} bytes of shared memory "
             f"even with streamed MF impulses, but the device exposes {max_shared_memory} bytes"
         )
-    return shared_metadata, fixed_bytes + 4 * mf_max_constraints > max_shared_memory
+    impulse_bytes = fixed_bytes + 4 * mf_max_constraints
+    stream_mf_impulses = impulse_bytes > max_shared_memory
+    if stream_mf_impulses:
+        reason += f" MF impulses stream: {impulse_bytes} bytes exceed the device's {max_shared_memory}."
+    resident_row_metadata = False
+    if not shared_metadata:
+        static_bytes = fixed_bytes + 4 * max_constraints + (0 if stream_mf_impulses else 4 * mf_max_constraints)
+        budget = min(_MFGS_STATIC_SHARED_MAX_BYTES, max_shared_memory)
+        if block_count is None or sm_count is None:
+            reason += " Row types and parents stream too: the launch shape is unknown."
+        elif block_count > sm_count:
+            reason += (
+                f" Row types and parents stream too: the {block_count}-block grid exceeds one block per SM "
+                f"({sm_count} SMs)."
+            )
+        elif static_bytes > budget:
+            reason += (
+                f" Row types and parents stream too: resident, the block would declare {static_bytes} bytes of "
+                f"static shared memory, over the {budget}-byte budget."
+            )
+        else:
+            resident_row_metadata = True
+            reason += (
+                f" Row types and parents stay resident: the {block_count}-block grid fits one block per SM "
+                f"({sm_count} SMs) and the block declares {static_bytes} <= {budget} bytes of static shared memory."
+            )
+    return _MFGSStorage(shared_metadata, stream_mf_impulses, resident_row_metadata, reason)
 
 
 _HINV_JT_MAX_CHUNK_SIZE = 32

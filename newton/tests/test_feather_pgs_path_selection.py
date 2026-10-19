@@ -378,8 +378,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(routes["sweep"]["driver"], "split_interleaved")
         self.assertEqual(routes["sweep"]["dense"], {"kernels": ["pgs_solve_loop"]})
         self.assertEqual(routes["sweep"]["free_body_matrix_free"], "pgs_solve_mf_loop")
-        # Only the matrix-free step packs row metadata.
+        # Only the matrix-free step packs row metadata, and only its GS kernel chooses a storage.
         self.assertIsNone(routes["sweep"]["mf_meta_pack"])
+        self.assertIsNone(routes["sweep"]["mf_gs_storage"])
         self.assertEqual(routes["free_rigid_bodies"]["count"], 1)
         self.assertEqual(routes["free_rigid_bodies"]["owners"], ["split_matrix_free_rows"])
         self.assertIsNone(routes["held_tree"]["owner"])
@@ -1111,6 +1112,14 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 self.assertEqual("local_residual" in owners, bool(solver._pgs_solve_local_residual_kernels))
                 pack = routes["sweep"]["mf_meta_pack"]
                 self.assertEqual(pack is None, solver.pgs_mode != "matrix_free")
+                # The MF-GS kernel's name spells the storage the record reports.
+                mf_gs, storage = routes["sweep"]["mf_gs"], routes["sweep"]["mf_gs_storage"]
+                self.assertEqual(storage is None, mf_gs is None)
+                if storage is not None:
+                    streamed = storage["metadata"] == "streamed"
+                    self.assertEqual("_gmeta" in mf_gs, streamed)
+                    self.assertEqual("_smeta" in mf_gs, streamed and storage["row_types_and_parents"] == "resident")
+                    self.assertEqual("_glambda" in mf_gs, storage["mf_impulses"] == "streamed")
                 # Applied routing options agree with the routes they request.
                 tiers = routes["sweep"]["tiers"]
                 parallel = tiers is not None and tiers["family"] in ("parallel", "keyed_parallel")

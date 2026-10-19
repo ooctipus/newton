@@ -658,6 +658,7 @@ def _sweep(solver, source) -> dict:
         "sparse_diagonal": _key(solver._pgs_solve_sparse_diagonal_kernel),
         "paired_factor": _key(solver._paired_factor_solve_kernel),
         "mf_gs": _key(solver._pgs_solve_mf_gs_kernel),
+        "mf_gs_storage": _mf_gs_storage(solver),
         "tiers": _tiers(solver),
         "response_block": solver._rb_build_kernel is not None,
         "local": local,
@@ -666,6 +667,23 @@ def _sweep(solver, source) -> dict:
         "dense": dense,
         "free_body_matrix_free": free_body,
         "propagation": propagation,
+    }
+
+
+def _mf_gs_storage(solver) -> dict | None:
+    # Storage classes of the MF-GS kernel, chosen by execution_plan._select_mfgs_storage.
+    storage = solver._mfgs_storage
+    if storage is None:
+        return None
+
+    def storage_class(resident):
+        return "resident" if resident else "streamed"
+
+    return {
+        "metadata": storage_class(storage.shared_metadata),
+        "row_types_and_parents": storage_class(storage.shared_metadata or storage.resident_row_metadata),
+        "mf_impulses": storage_class(not storage.stream_mf_impulses),
+        "reason": storage.reason,
     }
 
 

@@ -1014,6 +1014,7 @@ _MFGS_TILE_SHARED_STORAGE_BYTES = _execution_plan._MFGS_TILE_SHARED_STORAGE_BYTE
 _HINV_JT_MAX_CHUNK_SIZE = _execution_plan._HINV_JT_MAX_CHUNK_SIZE
 _FUSED_ROW_CHUNK = _execution_plan._FUSED_ROW_CHUNK
 _use_resident_mfgs_metadata = _execution_plan._use_resident_mfgs_metadata
+_MFGSStorage = _execution_plan._MFGSStorage
 _select_mfgs_storage = _execution_plan._select_mfgs_storage
 _fused_response_chunk_size = _execution_plan._fused_response_chunk_size
 _align_shared_memory = _execution_plan._align_shared_memory
@@ -3293,14 +3294,15 @@ class SolverFeatherPGS(SolverBase):
                 model.device,
                 stage_velocities=os.environ.get("FEATHER_PGS_MF_MULTIBLOCK_STAGE_VELOCITIES") == "1",
             )
-            shared_metadata, _ = _select_mfgs_storage(
+            # The dense-tile variants keep their packed row metadata streamed.
+            shared_metadata = _select_mfgs_storage(
                 self.dense_max_constraints,
                 self.mf_max_constraints,
                 self.max_world_dofs,
                 int(getattr(model.device, "max_shared_memory_per_block", 0)),
                 has_drive_rows=self.drive_mode == "physx_pgs",
                 fuse_vel_limits=self.fuse_joint_velocity_limits,
-            )
+            ).shared_metadata
             self._pgs_solve_mf_dense_tiles_kernel = _get_pgs_solve_mf_gs_kernel(
                 self.dense_max_constraints,
                 self.mf_max_constraints,
@@ -3346,7 +3348,8 @@ class SolverFeatherPGS(SolverBase):
         which kernels run: the held-tree owner and its lane layouts, the contact-row
         producer with each DOF size's row-builder kernels and friction law (from
         the plan the row build dispatches on), local, paired and sparse responses,
-        the sweep kernels per route and tier and what drives them, resolved worlds,
+        the sweep kernels per route and tier, what drives them and the matrix-free
+        sweep's shared-memory storage (``sweep.mf_gs_storage``), resolved worlds,
         publication, velocity limits, free bodies, the friction law and the
         grouped-dynamics kernels, each with a reason; a size whose response the
         grouped kernel solves reports ``hinv_jt_kernel`` ``"grouped"``. The
@@ -7386,6 +7389,8 @@ class SolverFeatherPGS(SolverBase):
             else None
         )
         self._pgs_solve_mf_gs_kernel = None
+        # Storage classes of the MF-GS kernel (_MFGSStorage); recorded by get_path_selection().
+        self._mfgs_storage = None
         self._pgs_solve_mf_gs_incremental_kernel = None
         self._pgs_solve_mf_gs_incremental_kernels = []
         self._ink_sizes = None
@@ -7466,24 +7471,27 @@ class SolverFeatherPGS(SolverBase):
             and self.mf_max_constraints > 0
         ):
             has_drive_rows = self.drive_mode == "physx_pgs"
-            shared_metadata, stream_mf_impulses = False, False
+            # The grid _launch_matrix_free_gs_solve launches: one block per world, or the general-world queue's.
+            general_blocks = self._local_general_solver_blocks if self._local_internal_fast_path else self.world_count
+            storage = _MFGSStorage(False, False, False, "Without CUDA no shared-memory storage applies.")
             if model.device.is_cuda:
-                shared_metadata, stream_mf_impulses = _select_mfgs_storage(
+                storage = _select_mfgs_storage(
                     self.dense_max_constraints,
                     self.mf_max_constraints,
                     self.max_world_dofs,
                     int(model.device.max_shared_memory_per_block),
                     has_drive_rows=has_drive_rows,
                     fuse_vel_limits=self.fuse_joint_velocity_limits,
+                    block_count=int(general_blocks),
+                    sm_count=int(model.device.sm_count),
                 )
             # Preserve the explicit diagnostic override without hiding it in a
             # cached factory: storage is part of the kernel specialization key.
-            stream_mf_impulses |= os.environ.get("FEATHER_PGS_MFGS_STREAM_LAMBDA", "").strip().lower() in (
-                "1",
-                "true",
-                "yes",
-                "on",
-            )
+            stream_override = os.environ.get("FEATHER_PGS_MFGS_STREAM_LAMBDA", "").strip().lower()
+            if stream_override in ("1", "true", "yes", "on") and not storage.stream_mf_impulses:
+                stream_reason = storage.reason + " FEATHER_PGS_MFGS_STREAM_LAMBDA streams MF impulses."
+                storage = storage._replace(stream_mf_impulses=True, reason=stream_reason)
+            self._mfgs_storage = storage
             use_rb = (
                 self.mf_gs_response_block_rows > 0
                 and self._point_contact_paths
@@ -7531,8 +7539,9 @@ class SolverFeatherPGS(SolverBase):
                 has_dense_velocity_limit_rows=self.enable_joint_velocity_limits,
                 fuse_vel_limits=self.fuse_joint_velocity_limits,
                 friction_mode=self.friction_mode,
-                shared_metadata=shared_metadata,
-                stream_mf_impulses=stream_mf_impulses,
+                shared_metadata=storage.shared_metadata,
+                resident_row_metadata=storage.resident_row_metadata,
+                stream_mf_impulses=storage.stream_mf_impulses,
                 skip_local_internal_worlds=self._local_internal_fast_path,
                 local_internal_max_constraints=self._dense_internal_max_rows,
                 contact_torsion=self._contact_torsion_enabled,
