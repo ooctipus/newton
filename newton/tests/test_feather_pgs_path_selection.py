@@ -1209,8 +1209,10 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     self.assertEqual(parallel, switch == "1")
                 if parallel:
                     self.assertEqual(tiers["linked_rows"], patch_law)
+                    # Linked tiers step each friction pair isotropically; point tiers keep per-row steps.
+                    self.assertEqual(tiers["pair_step"], "isotropic" if patch_law else "per_row")
                     for tier in tiers["tiers"]:
-                        self.assertEqual(tier["kernel"].endswith("_linked"), patch_law, tier)
+                        self.assertEqual(tier["kernel"].endswith("_linked_iso"), patch_law, tier)
                 self.assertEqual(applied["grouped_dynamics"], routes["dynamics"]["grouped_topology"])
                 self.assertEqual(
                     applied["lazy_kinematics"],

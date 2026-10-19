@@ -429,6 +429,12 @@ FLAGS = declare(
         "=1 admits patch friction to the parallel tiers and keyed rows (default off: it keeps its serial sweeps).",
     ),
     _flag(
+        "FEATHER_PGS_POINT_PAIR_STEP",
+        "experiment",
+        _SOLVER,
+        "isotropic steps each point-friction pair of the parallel tiers with one step (default per_row).",
+    ),
+    _flag(
         "FEATHER_PGS_PREDICTED_TWISTS",
         "policy",
         ("tree_kinetic_owner",),

@@ -424,6 +424,23 @@ def _solver_factory_calls():
         )
     for label, args, kwargs in _linked_tier_calls():
         yield label, solver._get_pgs_solve_parallel_kernel, args, kwargs
+    # Point tiers with the isotropic pair step of the linked tiers (FEATHER_PGS_POINT_PAIR_STEP=isotropic).
+    for tier, matrix_free, inkernel in itertools.product(((32, 0), (48, 32)), (False, True), ((18, 0, 0, 0), None)):
+        kwargs = {
+            "rows": tier[0],
+            "min_rows": tier[1],
+            "sweeps": 24,
+            "matrix_free": matrix_free,
+            "inkernel_response": inkernel,
+            "exact_row_sums": matrix_free,
+            "pair_step": "isotropic",
+        }
+        yield (
+            name + "_get_pgs_solve_parallel_kernel",
+            solver._get_pgs_solve_parallel_kernel,
+            (64, 32, 18, _ARCH),
+            kwargs,
+        )
 
 
 def _spliced_sweep_calls():

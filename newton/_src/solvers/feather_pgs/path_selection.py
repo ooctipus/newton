@@ -744,6 +744,11 @@ def _tiers(solver) -> dict | None:
             "inkernel_response": solver._ink_sizes is not None,
             # Every built tier projects each friction pair on its patch ring's pooled normal load (patch friction).
             "linked_rows": all(getattr(kernel, "_fpgs_linked_rows", False) for kernel in kernels),
+            # How a friction pair's tangent rows step: one isotropic step (the linked tiers' law, which shares the
+            # serial sweep's fixed point) or each row's own step.
+            "pair_step": "isotropic"
+            if all(getattr(kernel, "_fpgs_pair_step", "per_row") == "isotropic" for kernel in kernels)
+            else "per_row",
             "nesterov": bool(solver.mf_gs_parallel_nesterov),
             "matrix_free": bool(solver.mf_gs_parallel_matrix_free),
             "sweeps": int(solver.mf_gs_parallel_sweeps),

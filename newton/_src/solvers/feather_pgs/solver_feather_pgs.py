@@ -1718,7 +1718,8 @@ class SolverFeatherPGS(SolverBase):
                 rows or excess rows retain serial solving. The effective limit is capped at 96 for response-block
                 sweeps or 128 for matrix-free sweeps, and rounded down to a multiple of four. Persistent patch
                 friction keeps the serial kernels unless ``FEATHER_PGS_PATCH_PARALLEL_ROWS=1`` opts it in; each
-                tangent pair then projects on its patch's pooled normal load.
+                tangent pair then projects on its patch's pooled normal load with one isotropic step, which
+                shares the serial sweep's fixed point.
             mf_gs_parallel_sweeps (int, optional): Maximum number of parallel sweeps per launch (early exit when no
                 impulse changes). Independent of ``pgs_iterations``; preserve the sweep allowance when comparing
                 execution speed, and validate convergence separately.
@@ -7793,6 +7794,7 @@ class SolverFeatherPGS(SolverBase):
                             exact_row_sums=_MF_EXACT_ROWSUM,
                             world_rows=self._world_rows,
                             linked_rows=self._friction_anchors_enabled,
+                            pair_step=self._parallel_pair_step(),
                         )
                     )
                     self._pgs_solve_mf_gs_incremental_kernels[-1]._fpgs_tier = tier_index
@@ -7816,6 +7818,7 @@ class SolverFeatherPGS(SolverBase):
                             exact_row_sums=_MF_EXACT_ROWSUM,
                             world_rows=self._world_rows,
                             linked_rows=self._friction_anchors_enabled,
+                            pair_step=self._parallel_pair_step(),
                             lean_sweep=os.environ.get("FEATHER_PGS_SHADOW_VARIANT", "lean") == "lean",
                             bound_finger=os.environ.get("FEATHER_PGS_SHADOW_VARIANT", "lean") == "finger",
                         )
@@ -16221,10 +16224,12 @@ class SolverFeatherPGS(SolverBase):
 
         They pool each friction pair's cone over its patch ring and write the patch
         row law, so under ``FEATHER_PGS_PATCH_PARALLEL_ROWS=1`` patch friction honors
-        ``mf_gs_parallel_rows`` and keyed rows as point friction does. The switch is
-        opt-in: the tiers scale a sliding pair's impulse radially after per-row step
-        scales, a different fixed point than the serial sweep's, which moved
-        body-velocity RMS by 0.4-0.9% on Allegro and ANYmal flat. By default patch
+        ``mf_gs_parallel_rows`` and keyed rows as point friction does. The linked
+        tiers step each friction pair isotropically, so a sliding pair converges to
+        the serial pair solve's maximal dissipation and the tiers share the serial
+        sweep's fixed point; with per-row steps they did not, which moved
+        body-velocity RMS by 0.4-0.9% on Allegro and ANYmal flat. The switch stays
+        opt-in until the tiers' accuracy and speed gates pass. By default patch
         friction keeps its serial sweeps. Torsion and compliance keep ordinary rows.
         """
         if self._point_contact_paths:
@@ -16238,9 +16243,25 @@ class SolverFeatherPGS(SolverBase):
             )
         return True, (
             "Patch friction honors mf_gs_parallel_rows and keyed rows: in the parallel (Jacobi) sweeps each tangent "
-            "pair projects on its patch ring's pooled normal load, as point pairs project on their own normal. "
+            "pair projects on its patch ring's pooled normal load, as point pairs project on their own normal, with "
+            "one isotropic step per pair, so the tiers share the serial sweep's fixed point. "
             "FEATHER_PGS_PATCH_PARALLEL_ROWS=1 opted in; by default patch friction keeps its serial sweeps."
         )
+
+    def _parallel_pair_step(self) -> str:
+        """The friction pair step of the parallel tiers (``routes.sweep.tiers.pair_step``).
+
+        The linked (patch) tiers always step each pair isotropically: it is their law,
+        and it gives them the serial sweep's fixed point. The point tiers keep per-row
+        steps unless the private experiment ``FEATHER_PGS_POINT_PAIR_STEP=isotropic``
+        opts them in.
+        """
+        if self._friction_anchors_enabled:
+            return "isotropic"
+        step = os.environ.get("FEATHER_PGS_POINT_PAIR_STEP") or "per_row"
+        if step not in ("per_row", "isotropic"):
+            raise ValueError(f"FEATHER_PGS_POINT_PAIR_STEP must be per_row or isotropic, got {step!r}")
+        return step
 
     def _velocity_limit_sweep_law(self) -> tuple[str | None, str]:
         """Return the law the matrix-free sweep kernels give velocity-limit rows, and why.
@@ -28026,6 +28047,7 @@ def _get_pgs_solve_parallel_kernel(
     bound_finger: bool = False,
     row_inputs=None,
     linked_rows: bool = False,
+    pair_step: str | None = None,
 ) -> "wp.Kernel":
     """Scaled parallel projection (Jacobi with per-row step scaling and Nesterov momentum) for dense-row worlds.
 
@@ -28034,6 +28056,16 @@ def _get_pgs_solve_parallel_kernel(
     patch (a circular list, -1 for a contact without a patch), as the patch link writes it before the sweep. Within
     a sweep every pair reads the freshly clamped impulses of all its ring's normals, which this sweep updated
     together, just as a point pair reads its own freshly clamped normal.
+
+    ``pair_step`` sets how a friction pair's two tangent rows step. ``"per_row"`` keeps each row's own step scale,
+    so the radial projection onto the disk follows the step metric ``diag(1 / s)`` of two unequal steps: a sliding
+    pair converges to a friction direction turned towards its stiffer tangent, not the serial pair solve's maximal
+    dissipation. ``"isotropic"`` gives both rows the smaller of their two steps; the projection is then the
+    projection in the pair's own metric, so a sliding pair converges to maximal dissipation and the tiers share
+    the serial sweep's fixed point. A row keeps its own step when its sibling is not an admitted friction row of
+    the same normal, or when either step is zero (a zero-Jacobian tangent would otherwise freeze its live sibling).
+    The default is ``"isotropic"`` for ``linked_rows`` (the patch tier law) and ``"per_row"`` otherwise; an
+    isotropic kernel's name gains ``_iso``.
 
     With ``inkernel_response=(NA, NB, OA, OB)`` (group sizes and world-DOF offsets; matrix-free only) the kernel does not read ``J_world``/``Y_world``/``diag``:
     it gathers the group-layout Jacobian rows of the world's (at most two) articulations, solves ``Y = H^-1 J^T``
@@ -28055,6 +28087,11 @@ def _get_pgs_solve_parallel_kernel(
     Section 12.
     """
     _validate_dense_metadata_encoding(max_constraints)
+    if pair_step is None:
+        pair_step = "isotropic" if linked_rows else "per_row"
+    if pair_step not in ("per_row", "isotropic"):
+        raise ValueError(f"pair_step must be 'per_row' or 'isotropic', got {pair_step!r}")
+    isotropic_step = _ISOTROPIC_PAIR_STEP if pair_step == "isotropic" else ""
     M_D = max_constraints
     D = max_world_dofs
     AM = int(rows)
@@ -28610,7 +28647,7 @@ def _get_pgs_solve_parallel_kernel(
     SYNC();
 #endif
 
-    if ({STOP} == 3) return;
+{isotropic_step}    if ({STOP} == 3) return;
     float t_k = 1.0f;
     for (int sweep = 0; sweep < {NSWEEPS}; ++sweep) {{
         const int global_iter = iteration_offset + sweep;
@@ -28998,6 +29035,8 @@ def _get_pgs_solve_parallel_kernel(
         name += "_local_fallback"
     if linked_rows:
         name += "_linked"
+    if pair_step == "isotropic":
+        name += "_iso"
     if row_inputs is not None:
         name = name.replace("pgs_solve_parallel_", "pgs_solve_kinetic_keyed_parallel_", 1)
     kernel = make_row_kernel(name, snippet, pgs_solve_parallel_signature, input_arguments, dispatch="parallel")
@@ -29006,7 +29045,32 @@ def _get_pgs_solve_parallel_kernel(
     kernel._fpgs_extra_inputs = True  # takes the in-kernel response inputs after defer_dense_response
     kernel._fpgs_world_rows = bool(WR)
     kernel._fpgs_linked_rows = bool(linked_rows)  # recorded as routes.sweep.tiers.linked_rows
+    kernel._fpgs_pair_step = pair_step  # recorded as routes.sweep.tiers.pair_step
     return kernel
+
+
+# A friction pair's isotropic step in the parallel sweep (``pair_step="isotropic"``), emitted after the step
+# scales are final and before the sweeps. The pair's first tangent row's lane handles it.
+_ISOTROPIC_PAIR_STEP = """    // Both tangent rows of a friction pair take the smaller of their two steps, so the radial projection onto
+    // the friction disk is the projection in the pair's step metric and a sliding pair converges to maximal
+    // dissipation. A row keeps its own step when its sibling is not an admitted friction row of the same
+    // normal, or when either step is zero.
+    for (int i = lane; i < n_rows; i += NT) {
+        if (s_kind[i] == 1 && i == s_parent[i] + 1) {
+            const int j = i + 1;
+            if (j < n_rows && s_kind[j] == 1 && s_parent[j] == s_parent[i]) {
+                const float step_a = s_step[i];
+                const float step_b = s_step[j];
+                if (step_a > 0.0f && step_b > 0.0f) {
+                    const float step_pair = fminf(step_a, step_b);
+                    s_step[i] = step_pair;
+                    s_step[j] = step_pair;
+                }
+            }
+        }
+    }
+    SYNC();
+"""
 
 
 def _link_parallel_friction_pairs(snippet: str) -> str:
@@ -29014,7 +29078,10 @@ def _link_parallel_friction_pairs(snippet: str) -> str:
 
     Normal rows keep their clamped value through the friction projection, so a pair
     reads every normal of its ring at the value this sweep stores, summed in ring
-    order from the pair's own normal as the ordered sweeps sum it.
+    order from the pair's own normal as the ordered sweeps sum it. The linked tiers
+    step each pair isotropically (``pair_step``), so the radial projection onto that
+    pooled disk has the serial pair solve's fixed point: the linked tiers and the
+    serial patch sweep share their solution.
     """
     ring = (
         "float load = s_x[p];\n"

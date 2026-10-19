@@ -6,10 +6,12 @@
 The parallel tiers update all rows of a world together (projected Jacobi with
 per-row step scales and Nesterov momentum). Under patch friction a contact's
 normal row links the next normal of its patch ring, and each tangent pair is
-projected into the disk of radius ``mu * (sum of its ring's normal impulses)``.
-The reference below repeats the kernel's sweep in float64 so the CUDA kernels
-can be checked row by row. Keyed rows write the patch row law themselves; the
-CPU fallback checks it against the general producer and the patch link.
+projected into the disk of radius ``mu * (sum of its ring's normal impulses)``
+with one isotropic step, so a sliding pair converges to the serial pair solve's
+maximal dissipation. The reference below repeats the kernel's sweep in float64
+so the CUDA kernels can be checked row by row. Keyed rows write the patch row
+law themselves; the CPU fallback checks it against the general producer and the
+patch link.
 """
 
 import inspect
@@ -65,7 +67,7 @@ def _sibling(row, parent):
 
 
 def parallel_sweep_reference(
-    case, *, matrix_free, inkernel, exact, sweeps, nesterov, tol, linked, omega=1.0, friction_start=0
+    case, *, matrix_free, inkernel, exact, sweeps, nesterov, tol, linked, omega=1.0, friction_start=0, pair_step=None
 ):
     """Repeat one world of the parallel tier's sweep in float64.
 
@@ -75,7 +77,10 @@ def parallel_sweep_reference(
     ``|A|`` over admitted rows (A-based tiers and exact row sums) or the
     row-sum bound ``sum_d |P_id| sum_j |Q_jd|`` of the matrix-free tiers, with
     ``(P, Q) = (J, Y)`` or the whitened rows ``(Z, Z)`` of the in-kernel
-    response. Every sweep steps all rows from the extrapolated impulses, clamps
+    response. With the isotropic ``pair_step`` (the default of ``linked``) both
+    rows of a friction pair take the smaller of their two steps, unless the
+    sibling is not an admitted friction row of the same normal or either step is
+    zero. Every sweep steps all rows from the extrapolated impulses, clamps
     normal and limit rows, scales each tangent pair into its disk (the ring's
     pooled normal load when ``linked``), restarts momentum against the last step
     and stops once no row changes.
@@ -98,6 +103,13 @@ def parallel_sweep_reference(
         bound = np.abs(A[:, admitted]).sum(axis=1)
     weight = np.where(bound > 0.0, np.minimum(np.diag(A) / np.where(bound > 0.0, bound, 1.0), 1.0), 0.0)
     step = np.where(admitted, weight * omega / np.where(diag > 0.0, diag, 1.0), 0.0)
+    if (pair_step or ("isotropic" if linked else "per_row")) == "isotropic":
+        for row in np.flatnonzero(kinds == 1):
+            parent, sibling = parents[row], row + 1
+            if row != parent + 1 or sibling >= len(kinds) or kinds[sibling] != 1 or parents[sibling] != parent:
+                continue
+            if step[row] > 0.0 and step[sibling] > 0.0:
+                step[row] = step[sibling] = min(step[row], step[sibling])
     b = case["rhs"] + J @ v - A @ lam0
     x, y, t = lam0.copy(), lam0.copy(), 1.0
     for sweep in range(sweeps):
@@ -254,6 +266,46 @@ def spread_rows(case, seed):
     return spread, order
 
 
+def sliding_pair_case(*, masses=(4.0, 1.0), sliding=(1.0, 1.0), live_tangents=2):
+    """One contact on a six-coordinate body whose two tangents have unequal effective masses, sliding.
+
+    The normal acts along coordinate 2 and closes at 1 m/s; the tangents act along
+    coordinates 0 and 1 with effective masses ``masses``, at the tangential velocity
+    ``sliding``. ``live_tangents=1`` zeroes the second tangent's Jacobian, as a pair
+    whose second direction no joint can move. The normal links itself, a ring of
+    one, and the pair's coefficient 0.5 makes it slide.
+    """
+    H = np.diag((masses[0], masses[1], 1.0, 1.0, 1.0, 1.0))
+    L = np.linalg.cholesky(H)
+    J = np.zeros((3, _DOFS))
+    J[0, 2] = J[1, 0] = 1.0
+    if live_tangents == 2:
+        J[2, 1] = 1.0
+    Y = np.linalg.solve(H, J.T).T
+    cfm = 1.0e-5
+    return {
+        "J": J,
+        "Y": Y,
+        "Z": np.linalg.solve(L, J.T).T,
+        "L": L,
+        "cfm": cfm,
+        "diag": np.einsum("ij,ij->i", J, Y) + cfm,
+        "kinds": np.array((0, 1, 1), np.int32),
+        "types": np.array((PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_FRICTION)),
+        "parents": np.array((0, 0, 0), np.int32),
+        "mu": np.array((0.0, 0.5, 0.5)),
+        "rhs": np.zeros(3),
+        "impulses": np.zeros(3),
+        "velocity": np.array((sliding[0], sliding[1], -1.0, 0.0, 0.0, 0.0)),
+    }
+
+
+def friction_alignment(impulses, velocity):
+    """Cosine between a pair's tangent impulse and the negated tangential velocity it leaves (1: maximal dissipation)."""
+    friction, slip = impulses[1:3], velocity[:2]
+    return float(-friction @ slip / (np.linalg.norm(friction) * np.linalg.norm(slip)))
+
+
 def ring_rows(parents, normal):
     """The normal rows of the patch ring that starts at ``normal``, in ring order."""
     ring, row = [normal], parents[normal]
@@ -312,9 +364,37 @@ _LINKED_BLOCK_PAIR = (
 )
 
 
+# Golden text of the isotropic pair step: the pair's first tangent row's lane gives both rows the smaller step,
+# unless the sibling is not an admitted friction row of the same normal or either step is zero.
+_ISOTROPIC_STEP = (
+    "    for (int i = lane; i < n_rows; i += NT) {\n"
+    "        if (s_kind[i] == 1 && i == s_parent[i] + 1) {\n"
+    "            const int j = i + 1;\n"
+    "            if (j < n_rows && s_kind[j] == 1 && s_parent[j] == s_parent[i]) {\n"
+    "                const float step_a = s_step[i];\n"
+    "                const float step_b = s_step[j];\n"
+    "                if (step_a > 0.0f && step_b > 0.0f) {\n"
+    "                    const float step_pair = fminf(step_a, step_b);\n"
+    "                    s_step[i] = step_pair;\n"
+    "                    s_step[j] = step_pair;\n"
+    "                }\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "    SYNC();\n"
+    "    if (0 == 3) return;\n"
+    "    float t_k = 1.0f;\n"
+)
+
+
+def _without_isotropic_step(text):
+    """Remove the isotropic pair step, comment included, from a tier's native source."""
+    return text.replace(source._ISOTROPIC_PAIR_STEP, "")
+
+
 class TestParallelPatchReference(unittest.TestCase):
     def test_linked_factory_pools_only_the_friction_disk(self):
-        """Build linked tiers as the point tiers with the golden ring walk, and refuse in-sweep world rows."""
+        """Build linked tiers as the point tiers with the golden ring walk and isotropic step; refuse world rows."""
         for rows, min_rows, matrix_free, inkernel in itertools.product(
             (32, 64), (0,), (False, True), (None, (6, 0, 0, 0))
         ):
@@ -328,7 +408,8 @@ class TestParallelPatchReference(unittest.TestCase):
             with self.subTest(**options):
                 point = source._get_pgs_solve_parallel_kernel(_CAPACITY, 32, _DOFS, "120", **options)
                 linked = source._get_pgs_solve_parallel_kernel(_CAPACITY, 32, _DOFS, "120", linked_rows=True, **options)
-                self.assertEqual(linked.key, point.key + "_linked")
+                self.assertEqual(linked.key, point.key + "_linked_iso")
+                self.assertEqual((point._fpgs_pair_step, linked._fpgs_pair_step), ("per_row", "isotropic"))
                 point_source = point._fpgs_row_native_source
                 linked_source = linked._fpgs_row_native_source
                 for text, golden in (
@@ -336,12 +417,20 @@ class TestParallelPatchReference(unittest.TestCase):
                     (point_source, _POINT_BLOCK_PAIR),
                     (linked_source, _LINKED_WARP_PAIR),
                     (linked_source, _LINKED_BLOCK_PAIR),
+                    (linked_source, _ISOTROPIC_STEP),
                 ):
                     self.assertEqual(text.count(golden), 1, golden)
-                # Nothing but the two projections differs from the point tier.
-                restored = linked_source.replace(_LINKED_WARP_PAIR, _POINT_WARP_PAIR)
+                self.assertNotIn("step_pair", point_source)
+                # Nothing but the two projections and the pair step differs from the point tier.
+                restored = _without_isotropic_step(linked_source).replace(_LINKED_WARP_PAIR, _POINT_WARP_PAIR)
                 self.assertEqual(restored.replace(_LINKED_BLOCK_PAIR, _POINT_BLOCK_PAIR), point_source)
                 self.assertEqual(linked._fpgs_block_dim, point._fpgs_block_dim)
+                # The per-row law of the linked tiers remains available to compare against.
+                per_row = source._get_pgs_solve_parallel_kernel(
+                    _CAPACITY, 32, _DOFS, "120", linked_rows=True, pair_step="per_row", **options
+                )
+                self.assertEqual(per_row.key, point.key + "_linked")
+                self.assertEqual(per_row._fpgs_row_native_source, _without_isotropic_step(linked_source))
         with self.assertRaisesRegex(ValueError, "linked_rows"):
             source._get_pgs_solve_parallel_kernel(
                 _CAPACITY,
@@ -375,9 +464,14 @@ class TestParallelPatchReference(unittest.TestCase):
                     point, _ = parallel_sweep_reference(point_case, linked=False, **options)
                     assert_pooled_coulomb(self, linked_case, linked, linked=True)
                     assert_pooled_coulomb(self, point_case, point, linked=False)
-                    # Without links the ring walk stops at the normal: the point law exactly.
-                    same, _ = parallel_sweep_reference(point_case, linked=True, **options)
-                    np.testing.assert_array_equal(same, point)
+                    # Without links the ring walk stops at the normal: the point law exactly, with either pair step.
+                    for pair_step in ("per_row", "isotropic"):
+                        same, _ = parallel_sweep_reference(point_case, linked=True, pair_step=pair_step, **options)
+                        expected, _ = parallel_sweep_reference(point_case, linked=False, pair_step=pair_step, **options)
+                        np.testing.assert_array_equal(same, expected)
+                    np.testing.assert_array_equal(
+                        expected, parallel_sweep_reference(point_case, linked=True, **options)[0]
+                    )
                     # The patch anchors pool four normals at half the coefficient, which moves the solution.
                     self.assertGreater(np.max(np.abs(linked - point)), 1.0e-3)
 
@@ -421,6 +515,67 @@ class TestParallelPatchReference(unittest.TestCase):
                 np.testing.assert_allclose(moved, impulses[order], rtol=1.0e-12, atol=1.0e-14)
                 np.testing.assert_allclose(moved_velocity, velocity, rtol=1.0e-12, atol=1.0e-14)
                 assert_pooled_coulomb(self, spread, moved, linked=True)
+
+    def test_point_tiers_opt_into_the_isotropic_step(self):
+        """Give point tiers the isotropic pair step only on request, and reject unknown pair steps."""
+        options = {"rows": 32, "sweeps": 24, "matrix_free": True, "inkernel_response": (6, 0, 0, 0)}
+        point = source._get_pgs_solve_parallel_kernel(_CAPACITY, 32, _DOFS, "120", **options)
+        isotropic = source._get_pgs_solve_parallel_kernel(_CAPACITY, 32, _DOFS, "120", pair_step="isotropic", **options)
+        self.assertEqual(isotropic.key, point.key + "_iso")
+        self.assertEqual(isotropic._fpgs_row_native_source.count(_ISOTROPIC_STEP), 1)
+        self.assertEqual(_without_isotropic_step(isotropic._fpgs_row_native_source), point._fpgs_row_native_source)
+        with self.assertRaisesRegex(ValueError, "pair_step"):
+            source._get_pgs_solve_parallel_kernel(_CAPACITY, 32, _DOFS, "120", pair_step="radial", **options)
+
+    def test_solver_steps_linked_pairs_isotropically(self):
+        """Step every linked pair isotropically, and point pairs per row unless the private experiment opts in."""
+        decide = SolverFeatherPGS._parallel_pair_step
+        for anchors, flag, expected in (
+            (True, None, "isotropic"),
+            (True, "per_row", "isotropic"),
+            (False, None, "per_row"),
+            (False, "per_row", "per_row"),
+            (False, "isotropic", "isotropic"),
+        ):
+            with self.subTest(anchors=anchors, flag=flag), patch.dict(os.environ):
+                os.environ.pop(_PAIR_STEP_FLAG, None)
+                if flag is not None:
+                    os.environ[_PAIR_STEP_FLAG] = flag
+                self.assertEqual(decide(SimpleNamespace(_friction_anchors_enabled=anchors)), expected)
+        with patch.dict(os.environ, {_PAIR_STEP_FLAG: "radial"}), self.assertRaisesRegex(ValueError, "radial"):
+            decide(SimpleNamespace(_friction_anchors_enabled=False))
+
+    def test_isotropic_pairs_slide_with_maximal_dissipation(self):
+        """Slide a pair with fourfold unequal tangent masses against its velocity, as the serial pair solve does.
+
+        Per-row steps turn the converged friction towards the heavier tangent (cosine 0.86
+        against the slip); the isotropic step aligns it with the slip.
+        """
+        case = sliding_pair_case()
+        for matrix_free, inkernel in itertools.product((False, True), repeat=2):
+            options = {"matrix_free": matrix_free, "inkernel": inkernel, "exact": False, "nesterov": True, "tol": 0.0}
+            with self.subTest(matrix_free=matrix_free, inkernel=inkernel):
+                impulses, velocity = parallel_sweep_reference(case, sweeps=2000, linked=True, **options)
+                per_row, per_row_velocity = parallel_sweep_reference(
+                    case, sweeps=2000, linked=True, pair_step="per_row", **options
+                )
+                # The pair slides on its disk, radius 0.5 times the normal impulse.
+                self.assertAlmostEqual(np.linalg.norm(impulses[1:3]), 0.5 * impulses[0], delta=1.0e-9)
+                self.assertGreater(np.linalg.norm(velocity[:2]), 0.5)
+                self.assertGreaterEqual(friction_alignment(impulses, velocity), 1.0 - 1.0e-9)
+                self.assertLess(friction_alignment(per_row, per_row_velocity), 0.9)
+
+    def test_isotropic_step_keeps_a_lone_live_tangent(self):
+        """Drive the live tangent of a pair whose sibling has no Jacobian to the disk, as without the pair step."""
+        case = sliding_pair_case(sliding=(1.0, 0.0), live_tangents=1)
+        for matrix_free, inkernel in itertools.product((False, True), repeat=2):
+            options = {"matrix_free": matrix_free, "inkernel": inkernel, "exact": False, "nesterov": True, "tol": 0.0}
+            with self.subTest(matrix_free=matrix_free, inkernel=inkernel):
+                impulses, _ = parallel_sweep_reference(case, sweeps=2000, linked=True, **options)
+                per_row, _ = parallel_sweep_reference(case, sweeps=2000, linked=True, pair_step="per_row", **options)
+                np.testing.assert_allclose(impulses, per_row, rtol=1.0e-12, atol=1.0e-15)
+                self.assertAlmostEqual(-impulses[1], 0.5 * impulses[0], delta=1.0e-9)
+                self.assertEqual(impulses[2], 0.0)
 
 
 class _RowsBuilt(Exception):
@@ -596,7 +751,7 @@ class TestKeyedPatchRows(unittest.TestCase):
         options = {"rows": 32, "sweeps": 24, "matrix_free": True, "inkernel_response": (16, 6, 0, 16)}
         point = factory(128, 32, 22, "120", **options)
         linked = factory(128, 32, 22, "120", linked_rows=True, **options)
-        self.assertEqual(linked.key, point.key + "_linked")
+        self.assertEqual(linked.key, point.key + "_linked_iso")
         self.assertTrue(linked.key.startswith("pgs_solve_kinetic_keyed_parallel_"))
         self.assertIn("patch_law", inspect.signature(linked.func).parameters)
         self.assertNotIn("patch_law", inspect.signature(point.func).parameters)
@@ -607,11 +762,12 @@ class TestKeyedPatchRows(unittest.TestCase):
             self.assertNotIn(written, text)
         self.assertIn("patch_law.patches.point_a.data[contact]", text)
         self.assertIn("patch_law.patches.phi.data[contact][r - 1]", text)
-        for golden in (_LINKED_WARP_PAIR, _LINKED_BLOCK_PAIR):
+        for golden in (_LINKED_WARP_PAIR, _LINKED_BLOCK_PAIR, _ISOTROPIC_STEP):
             self.assertEqual(text.count(golden), 1, golden)
 
 
 _SWITCH = "FEATHER_PGS_PATCH_PARALLEL_ROWS"
+_PAIR_STEP_FLAG = "FEATHER_PGS_POINT_PAIR_STEP"
 
 
 def _cpu_arm():
@@ -697,7 +853,8 @@ class TestPatchParallelAdmission(unittest.TestCase):
             with self.subTest(anchors=anchors, linked=linked):
                 tiers = path_selection._tiers(probe)
                 self.assertEqual(tiers["linked_rows"], linked)
-                self.assertEqual(tiers["tiers"][0]["kernel"].endswith("_linked"), linked)
+                self.assertEqual(tiers["tiers"][0]["kernel"].endswith("_linked_iso"), linked)
+                self.assertEqual(tiers["pair_step"], "isotropic" if linked else "per_row")
 
     def test_in_sweep_world_rows_serve_point_friction_only(self):
         """Build contact rows inside the sweep only under point friction, the law that builder writes.
@@ -821,6 +978,46 @@ class TestParallelPatchKernel(unittest.TestCase):
                     np.testing.assert_allclose(velocity, expected_velocity, rtol=1.0e-3, atol=2.0e-5 * scale)
                     assert_pooled_coulomb(self, case, impulses.astype(np.float64), linked=linked, atol=2.0e-5 * scale)
 
+    def test_tiers_slide_pairs_with_maximal_dissipation(self):
+        """Converge a sliding pair of unequal tangent masses to maximal dissipation, and keep a lone live tangent.
+
+        With tolerance 0 and 2000 sweeps every tier reaches the reference's fixed
+        point: the friction opposes the slip it leaves (cosine at least 1 - 1e-5),
+        and the live tangent of a pair whose sibling has no Jacobian saturates its disk.
+        """
+        device = wp.get_device("cuda:0")
+        arch = str(device.arch)
+        cases = {
+            "unequal masses": sliding_pair_case(),
+            "one live tangent": sliding_pair_case(sliding=(1.0, 0.0), live_tangents=1),
+        }
+        for (name, case), matrix_free, inkernel in itertools.product(cases.items(), (False, True), (False, True)):
+            options = {"matrix_free": matrix_free, "inkernel": inkernel, "exact": False, "nesterov": True}
+            with self.subTest(case=name, **options):
+                kernel = source._get_pgs_solve_parallel_kernel(
+                    _CAPACITY,
+                    32,
+                    _DOFS,
+                    arch,
+                    rows=32,
+                    sweeps=2000,
+                    tol=0.0,
+                    matrix_free=matrix_free,
+                    inkernel_response=(_DOFS, 0, 0, 0) if inkernel else None,
+                    linked_rows=True,
+                )
+                impulses, velocity = _launch_parallel(kernel, case, inkernel=inkernel, device=device)
+                impulses, velocity = impulses.astype(np.float64), velocity.astype(np.float64)
+                expected, expected_velocity = parallel_sweep_reference(
+                    case, sweeps=2000, tol=0.0, linked=True, **options
+                )
+                np.testing.assert_allclose(impulses, expected, rtol=1.0e-4, atol=1.0e-6)
+                np.testing.assert_allclose(velocity, expected_velocity, rtol=1.0e-4, atol=1.0e-6)
+                if name == "unequal masses":
+                    self.assertGreaterEqual(friction_alignment(impulses, velocity), 1.0 - 1.0e-5)
+                else:
+                    self.assertAlmostEqual(-impulses[1], 0.5 * impulses[0], delta=1.0e-5)
+
 
 _STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
 # Float-order tolerances of an exact route change (assert_states_close of the sparse solver tests).
@@ -902,6 +1099,34 @@ def _sliding_boxes(device, speeds, *, mu=0.5):
     return model
 
 
+def _sliding_sphere(device, axes, masses, speed, *, mu=0.5):
+    """A sphere on a chain of prismatic joints along ``axes`` (link masses ``masses``, the sphere last) on the ground.
+
+    The sphere starts sliding at ``speed`` along the first two axes. Each tangent of
+    its single contact moves the links downstream of its joint, so unequal link masses
+    give unequal tangent effective masses; an axis left out leaves its tangent row
+    without a Jacobian.
+    """
+    builder = newton.ModelBuilder()
+    cfg = builder.default_shape_cfg.copy()
+    cfg.density, cfg.mu = 0.0, mu
+    parent, joints = -1, []
+    for axis, mass in zip(axes, masses, strict=True):
+        body = builder.add_link(mass=mass, inertia=wp.mat33(np.eye(3) * 1.0e-3), lock_inertia=True)
+        joints.append(builder.add_joint_prismatic(parent=parent, child=body, axis=axis))
+        parent = body
+    builder.add_shape_sphere(parent, radius=0.05, cfg=cfg)
+    builder.add_articulation(joints)
+    builder.add_ground_plane(cfg=cfg)
+    model = builder.finalize(device=device)
+    q, qd = model.joint_q.numpy(), model.joint_qd.numpy()
+    q[len(axes) - 1] = 0.049  # the vertical joint, last: the sphere rests 1 mm deep
+    qd[: len(speed)] = speed
+    model.joint_q.assign(q)
+    model.joint_qd.assign(qd)
+    return model
+
+
 def _assert_tier_owned(test, solver, budget):
     """Require the parallel tiers to have solved every world with rows in the last step.
 
@@ -962,9 +1187,10 @@ class TestPatchParallelRoutes(unittest.TestCase):
             self.assertIsNone(solver._sparse_mass_matrix_size)
             keys = [kernel.key for kernel in solver._pgs_solve_mf_gs_incremental_kernels]
             self.assertTrue(keys)
-            self.assertTrue(all(key.endswith("_linked") == linked for key in keys), keys)
+            self.assertTrue(all(key.endswith("_linked_iso") == linked for key in keys), keys)
             tiers = solver.get_path_selection()["routes"]["sweep"]["tiers"]
             self.assertEqual((tiers["family"], tiers["linked_rows"]), ("parallel", linked))
+            self.assertEqual(tiers["pair_step"], "isotropic" if linked else "per_row")
         # By default, patch friction keeps the serial route it had before the tiers learned the ring.
         self.assertEqual(default._ink_rows, 0)
         self.assertEqual(default._pgs_solve_mf_gs_incremental_kernels, [])
@@ -1044,7 +1270,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
         self.assertEqual(patch_friction._world_rows_owned_le(), 0)
         for kernel in patch_friction._pgs_solve_mf_gs_incremental_kernels:
             self.assertFalse(kernel._fpgs_world_rows)
-            self.assertTrue(kernel.key.endswith("_linked"))
+            self.assertTrue(kernel.key.endswith("_linked_iso"))
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "Parallel matrix-free tiers require CUDA")
@@ -1053,15 +1279,15 @@ class TestPatchParallelPhysics(unittest.TestCase):
 
     Parallel tiers are Jacobi sweeps, not float reorderings of the serial sweep.
     While every pair sticks the two schemes share their fixed point, and the
-    rollouts differ by the convergence gap. Once a pair slides they do not: the
-    tiers scale the pair radially after per-row step scales, which turns its
+    rollouts differ by the convergence gap. Once a pair slides the point tiers do
+    not: they scale the pair radially after per-row step scales, which turns its
     sliding direction and, through the coupling, moves the normals and the body
-    velocity, for point and patch friction alike (on this module's reference case
-    the converged velocities of the two schemes differ by 4-15 % for either law).
-    So the point tiers' measured gap on the same fixture, with a floor at the
-    float-order tolerance of an exact route change, bounds the patch tiers' gap.
-    Every parallel step must leave each world in the tiers' domain, so the
-    comparison is never serial against serial.
+    velocity (on this module's reference case the converged velocities of the two
+    schemes differ by 4-15 %). The linked tiers step each pair isotropically and
+    keep the serial fixed point, so the point tiers' measured gap on the same
+    fixture, with a floor at the float-order tolerance of an exact route change,
+    bounds the patch tiers' gap. Every parallel step must leave each world in the
+    tiers' domain, so the comparison is never serial against serial.
     """
 
     def test_standing_feet_match_the_serial_patch_sweep(self):
@@ -1132,6 +1358,73 @@ class TestPatchParallelPhysics(unittest.TestCase):
         point_gap = abs(distances[0.0, 32] - distances[0.0, 0])
         patch_gap = abs(distances[0.2, 32] - distances[0.2, 0])
         self.assertLessEqual(patch_gap, max(3.0 * point_gap, 0.01 * expected), distances)
+
+    def test_sliding_contact_reaches_the_serial_fixed_point(self):
+        """Slide one contact of fourfold unequal tangent masses to the serial patch sweep's converged velocity.
+
+        The linked tiers (tolerance 0, 2000 sweeps) and the serial sweep (2000
+        iterations) converge from the same state. Each step's friction impulse,
+        recovered from the velocity change through the diagonal joint-space mass,
+        opposes the slip it leaves (cosine at least 1 - 1e-5), and the two routes'
+        velocities agree to 1e-5 relative. Per-row steps turned the tiers' friction
+        towards the heavier tangent (cosine 0.86).
+        """
+        axes, masses = (newton.Axis.X, newton.Axis.Y, newton.Axis.Z), (3.0, 0.01, 1.0)
+        tangent_mass = np.array((sum(masses), sum(masses[1:])))
+        model = _sliding_sphere("cuda:0", axes, masses, (1.0, 1.0))
+        converged = {"mf_gs_parallel_sweeps": 2000, "mf_gs_parallel_tol": 0.0}
+        with patch.dict(os.environ, {_SWITCH: "1"}):
+            routes = {
+                "serial": _matrix_free_solver(model, beta=0.2, parallel_rows=0, pgs_iterations=2000),
+                "tier": _matrix_free_solver(model, beta=0.2, parallel_rows=32, **converged),
+                "tier_response_block": _matrix_free_solver(
+                    model, beta=0.2, parallel_rows=32, mf_gs_parallel_matrix_free=False, **converged
+                ),
+            }
+        velocities = {}
+        for name, solver in routes.items():
+            alignments, previous = [], model.joint_qd.numpy()[:2].astype(np.float64)
+
+            def check(step, solver, contacts, state, name=name, alignments=alignments):
+                nonlocal previous
+                if name != "serial":
+                    _assert_tier_owned(self, solver, 32)
+                velocity = state.joint_qd.numpy()[:2].astype(np.float64)
+                friction = tangent_mass * (velocity - previous)
+                previous = velocity
+                if np.linalg.norm(friction) > 1.0e-6:
+                    alignments.append(
+                        float(-friction @ velocity / (np.linalg.norm(friction) * np.linalg.norm(velocity)))
+                    )
+
+            state, _ = _rollout(model, solver, 4, after_step=check)
+            with self.subTest(route=name):
+                self.assertTrue(alignments, "the contact never carried friction")
+                self.assertGreaterEqual(min(alignments), 1.0 - 1.0e-5, alignments)
+            velocities[name] = state.joint_qd.numpy().astype(np.float64)
+        scale = float(np.max(np.abs(velocities["serial"])))
+        for name in ("tier", "tier_response_block"):
+            np.testing.assert_allclose(velocities[name], velocities["serial"], atol=1.0e-5 * scale, err_msg=name)
+
+    def test_lone_live_tangent_keeps_its_friction(self):
+        """Brake a sphere whose second tangent no joint moves as the serial sweep brakes it.
+
+        The isotropic step leaves a pair alone when either step is zero: the zero
+        Jacobian of the frozen tangent must not stop the live one.
+        """
+        model = _sliding_sphere("cuda:0", (newton.Axis.X, newton.Axis.Z), (3.0, 1.0), (1.0,))
+        converged = {"mf_gs_parallel_sweeps": 2000, "mf_gs_parallel_tol": 0.0}
+        with patch.dict(os.environ, {_SWITCH: "1"}):
+            serial = _matrix_free_solver(model, beta=0.2, parallel_rows=0, pgs_iterations=2000)
+            tier = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **converged)
+        speeds = {}
+        for name, solver in (("serial", serial), ("tier", tier)):
+            state, _ = _rollout(model, solver, 6)
+            speeds[name] = float(state.joint_qd.numpy()[0])
+        _assert_tier_owned(self, tier, 32)
+        # Six steps of mu * g at the sphere's weight over the four-fold chain mass brake it by about 0.03 m/s.
+        self.assertLess(speeds["serial"], 1.0 - 0.01)
+        self.assertAlmostEqual(speeds["tier"], speeds["serial"], delta=1.0e-5)
 
 
 if __name__ == "__main__":
