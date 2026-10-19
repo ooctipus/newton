@@ -1364,15 +1364,21 @@ def _clear_jacobian(
     :data:`_MASKED_CLEAR_MIN_BLOCK_ENTRIES`, or with blocks under that entry,
     ``J.zero_()`` clears the whole of ``J`` (one memset when ``J`` is contiguous).
     Otherwise only the selected blocks are zeroed, so the cost follows the selection
-    and the other blocks keep the caller's values. The choice depends on the device
-    and the shape of ``J`` alone: it never reads the mask, and a graph capture
-    records the same clear for every mask.
+    and the other blocks keep the caller's values. A graph capture of a masked call
+    zeroes only the selected blocks of a non-contiguous ``J`` too, whatever their
+    size: ``J.zero_()`` is then Warp's strided fill, which its APIC capture (every CPU
+    capture, and a CUDA capture with ``apic=True``) cannot record. The choice depends
+    on the device, the shape and layout of ``J`` and whether a capture is on: it never
+    reads the mask, and a graph capture records the same clear for every mask.
     """
-    min_entries = _MASKED_CLEAR_MIN_BLOCK_ENTRIES["cuda" if device.is_cuda else "cpu"]
-    if mask is not None and min_entries is not None and J.shape[1] * J.shape[2] >= min_entries:
-        _launch_zero_selected_blocks(J, mask, articulation_count, device)
-    else:
-        J.zero_()
+    if mask is not None:
+        min_entries = _MASKED_CLEAR_MIN_BLOCK_ENTRIES["cuda" if device.is_cuda else "cpu"]
+        if (min_entries is not None and J.shape[1] * J.shape[2] >= min_entries) or (
+            not J.is_contiguous and device.is_capturing
+        ):
+            _launch_zero_selected_blocks(J, mask, articulation_count, device)
+            return
+    J.zero_()
 
 
 def eval_jacobian(
@@ -1402,8 +1408,9 @@ def eval_jacobian(
               The block ``J[i]`` of each selected articulation is overwritten in
               full, with zeros in the rows past its links and the columns past its
               DOFs. Blocks of unselected articulations are either zeroed or left
-              unchanged, and which is unspecified (it may depend on the device and
-              the shape of ``J``); zero ``J`` first if code reads them.
+              unchanged, and which is unspecified (it may depend on the device, on
+              the shape and memory layout of ``J`` and on whether a graph capture
+              records the call); zero ``J`` first if code reads them.
 
     Returns:
         The Jacobian array J, or None if the model has no articulations.

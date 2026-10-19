@@ -1356,6 +1356,49 @@ def test_jacobian_mask_graph_replay_matches_eager(test, device):
                 _assert_bits_equal(J_np[~selected], np.full_like(J_ref[~selected], _unselected_after_clear(route)))
 
 
+def test_jacobian_mask_graph_replay_fills_strided_view(test, device):
+    """Capture a masked eval_jacobian into a non-contiguous view and replay it, on the device's own crossover.
+
+    Warp's APIC capture, which every CPU capture uses and a CUDA capture with
+    ``apic=True`` adds, cannot record the fill that zeroes a non-contiguous array, so
+    a capture clears the view's selected blocks with the per-block kernel, whatever
+    their size. Each replay starts from a reset buffer and a new mask: the selected
+    blocks must equal the eager unmasked result bitwise, the unselected ones keep the
+    reset values, and nothing outside the view is written.
+    """
+    captures = {"default": {}}
+    if device.is_cuda:
+        captures["apic"] = {"apic": True}
+    selections = {"some": np.array([True, False, False, True]), "others": np.array([False, True, True, False])}
+    for leaf_count in (6, 18):  # blocks of 252 and 2052 entries
+        model, state = _build_fans(device, leaf_count)
+        J_ref = newton.eval_jacobian(model, state).numpy()
+        count, rows, cols = J_ref.shape
+        whole = _filled((count, rows + 2, cols + 3), _SENTINEL, device)
+        window = (slice(None), slice(1, 1 + rows), slice(2, 2 + cols))
+        J = whole[window]
+        test.assertFalse(J.is_contiguous)
+        mask = wp.array(selections["some"], dtype=bool, device=device)
+        joint_S_s = wp.zeros(model.joint_dof_count, dtype=wp.spatial_vector, device=device)
+        # Load the modules eagerly; a capture cannot compile them.
+        newton.eval_jacobian(model, state, J, joint_S_s=joint_S_s, mask=mask)
+
+        for capture_name, options in captures.items():
+            with test.subTest(leaves=leaf_count, capture=capture_name):
+                with wp.ScopedCapture(device, **options) as capture:
+                    newton.eval_jacobian(model, state, J, joint_S_s=joint_S_s, mask=mask)
+
+                for name, selected in selections.items():
+                    with test.subTest(selection=name):
+                        mask.assign(selected)
+                        whole.assign(np.full(whole.shape, _SENTINEL, dtype=np.float32))
+                        wp.capture_launch(capture.graph)
+
+                        expected = np.full(whole.shape, _SENTINEL, dtype=np.float32)
+                        expected[window][selected] = J_ref[selected]
+                        _assert_bits_equal(whole.numpy(), expected)
+
+
 def test_mass_matrix_mask_graph_replay_matches_eager(test, device):
     """Replay a captured masked eval_mass_matrix whose internal Jacobian is allocated during the capture.
 
@@ -1929,6 +1972,12 @@ add_function_test(
     TestJacobianMassMatrix,
     "test_jacobian_mask_graph_replay_matches_eager",
     test_jacobian_mask_graph_replay_matches_eager,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_jacobian_mask_graph_replay_fills_strided_view",
+    test_jacobian_mask_graph_replay_fills_strided_view,
     devices=devices,
 )
 add_function_test(
