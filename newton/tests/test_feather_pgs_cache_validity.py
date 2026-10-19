@@ -357,13 +357,13 @@ def _recorded_launches(kinds=("launch_tiled",)):
     return stack, launched
 
 
-def _cpu_owner(*, motion_velocity=False):
+def _cpu_owner(*, motion_velocity=False, worlds=2):
     """A CPU solver with a mixed held-tree owner installed, as cached_dynamics installs one on CUDA.
 
     ``motion_velocity`` builds the owner of a velocity-limit solver (whose matrix-free mode CPU
-    lacks): its groups read prescaled velocities.
+    lacks): its groups read prescaled velocities. Each group holds one tree per world.
     """
-    model = _build(wp.get_device("cpu"), worlds=2)
+    model = _build(wp.get_device("cpu"), worlds=worlds)
     solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
     solver.enable_joint_velocity_limits = motion_velocity
     owner = MixedTreeKineticState(solver)
@@ -665,15 +665,22 @@ def _launch_kinds(owner):
         yield counted
 
 
-def _classify_every_launch(owner):
-    """Classify every repair launch of a small fixture on a one-block grid.
+def _force_classification(group, classify=True):
+    """Classify (or not) a group's repair launches on a one-block grid, whatever their size and device.
 
-    A fixture's launches have fewer blocks than the listed grid, which leaves them unclassified; a
-    one-block grid classifies them and makes that block stride over every listed block.
+    A fixture's launches have fewer blocks than the classification threshold, and CPU groups keep
+    the one-pass repair; a one-block grid also makes that block stride over every listed block.
     """
+    group._classify_switch = True
+    group._repair_grid = 1
+    group._classify_above = 0 if classify else group.launch_count
+    group._bind_kernels()
+
+
+def _classify_every_launch(owner):
+    """Classify every repair launch of a small fixture on a one-block grid."""
     for group in _groups(owner):
-        group._repair_grid = 1
-        group._bind_kernels()
+        _force_classification(group)
         if not group.classify_first:
             raise AssertionError("The fixture's repair must be classified on CUDA")
 
@@ -907,8 +914,7 @@ class TestFeatherPGSRepairRecord(unittest.TestCase):
         """
         compare_case, motion_case, classified_case = _cpu_owner(), _cpu_owner(motion_velocity=True), _cpu_owner()
         for group in classified_case[2].groups:
-            group._classify_switch, group._repair_grid = True, 1
-            group._bind_kernels()
+            _force_classification(group)
 
         def check(group, validation, skip, bound):
             record = path_selection._tree_group(group)
@@ -1118,6 +1124,27 @@ def _repair_arrays(group, data):
 
 
 class TestFeatherPGSClassifiedRepair(unittest.TestCase):
+    def test_only_launches_above_two_grids_are_classified(self):
+        """Classify a repair only when its launch has more blocks than two listed grids.
+
+        Up to two grids the one-pass launch's early exits cost about what the classified repair's
+        launches do, and a copied bank is compared inside the one-pass repair. CPU has no listed
+        grid and keeps the one-pass repair: the owners are built with a one-block grid and switched
+        on as on CUDA, so two-world groups (two blocks) keep the one-pass repair, with the in-kernel
+        comparison, and three-world groups classify.
+        """
+        with patch.object(tree_kinetic_owner, "listed_repair_blocks", return_value=1):
+            small, large = _cpu_owner(worlds=2)[2], _cpu_owner(worlds=3)[2]
+        for owner, blocks, classified in ((small, 2, False), (large, 3, True)):
+            for group in owner.groups:
+                with self.subTest(blocks=blocks, bodies=group.layout.bodies):
+                    group._classify_switch = True
+                    group._bind_kernels()
+                    self.assertEqual((group._repair_grid, group.launch_count), (1, blocks))
+                    self.assertEqual(group.classify_first, classified)
+                    self.assertEqual(group.classify_kernel is not None, classified)
+                    self.assertEqual(group.bank_repair_kernel is None, classified)
+
     def test_repair_lists_its_blocks_when_the_groups_may_be_current(self):
         """Classify and repair over the block list whenever the groups may be current; else launch every block.
 
@@ -1126,9 +1153,10 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
         comparison pass before the listed repair. The first eager step and a step from a bank no
         finish published launch the one-pass repair. Inside a graph capture the first repair is
         always classified, and compares whenever the output bank is another bank (ordinary motion
-        only), as when Isaac Lab captures before any eager step. Only a launch of more blocks than
-        the listed grid is classified, and CPU keeps the one-pass repair: the test switches the CPU
-        groups on with a one-block grid. Launches are recorded, not run, and the capture id is
+        only), as when Isaac Lab captures before any eager step. CPU keeps the one-pass repair, and
+        the fixture's launches are too small to classify (see
+        :meth:`test_only_launches_above_two_grids_are_classified`): the test forces the
+        classification on a one-block grid. Launches are recorded, not run, and the capture id is
         stubbed.
         """
         case, fresh_case, motion_case = _cpu_owner(), _cpu_owner(), _cpu_owner(motion_velocity=True)
@@ -1136,12 +1164,7 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
             for group in target.groups:
                 self.assertFalse(group.classify_first)
                 self.assertIsNone(group.classify_kernel)
-                group._classify_switch = True
-                group._repair_grid = group.launch_count
-                group._bind_kernels()
-                self.assertFalse(group.classify_first)  # not more blocks than the grid
-                group._repair_grid = 1
-                group._bind_kernels()
+                _force_classification(group)
                 self.assertTrue(group.classify_first)
                 self.assertIsNone(group.bank_repair_kernel)
                 self.assertEqual(group.bank_kernel is None, group.motion_velocity)
@@ -1324,9 +1347,7 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                         for key, value in arrays.items():
                             value.assign(start[key])
                         for group in _groups(owner):
-                            # A one-block grid classifies and strides; a whole-launch grid does not classify.
-                            group._repair_grid = 1 if classify else group.launch_count
-                            group._bind_kernels()
+                            _force_classification(group, classify)
                             self.assertEqual(group.classify_first, classify)
                             # Eagerly, after a finish that published the output bank.
                             group._published, group._published_capture = (output.joint_q.ptr, output.joint_qd.ptr), 0

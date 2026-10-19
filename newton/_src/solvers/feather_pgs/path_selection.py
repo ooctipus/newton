@@ -273,7 +273,7 @@ def _tree_group(group) -> dict:
         # Within one graph capture, a repair after this group's finish on the bank it published
         # launches nothing (FEATHER_PGS_TREE_REPAIR_SKIP=0 keeps it; motion-velocity layouts always launch).
         "captured_repair_skip": bool(group.skip_captured_repairs),
-        # On CUDA, a repair of more blocks than the listed grid lists the blocks that repair (and
+        # On CUDA, a repair of more blocks than two listed grids lists the blocks that repair (and
         # compare) and repairs over the list: always inside a capture, eagerly when the groups should
         # be stamped with the input bank or compared (FEATHER_PGS_TREE_REPAIR_CLASSIFY=0 keeps one
         # launch per block).

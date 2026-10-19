@@ -120,6 +120,16 @@ def listed_repair_blocks(device):
     return _LISTED_BLOCKS_PER_SM * int(device.sm_count)
 
 
+# Listed grids of blocks a one-pass repair must exceed to be classified. Up to two
+# grids the one-pass launch's early exits cost about what the classified repair's
+# three or four launches do (head: 8.4-9.6 us for a current 8192-block packed repair,
+# 11-31 us at 16384 blocks), and a copied bank is compared inside the one-pass repair
+# without the passes; a packed repair keeps its registers with the comparison inside
+# (sm_120: 72 against 72 to 80), a chain-scan or unpacked one does not (78 to 96,
+# 80 to 117).
+_CLASSIFIED_GRIDS = 2
+
+
 class TreeKineticState:
     """Own one current cache with device state-bank tags and a separate held W.
 
@@ -147,8 +157,8 @@ class TreeKineticState:
     would take the early exit. The solver calls :meth:`forget_continuity`
     from every host call that changes validity, requests or the step.
 
-    On CUDA (:attr:`classify_first`), a repair of more blocks than the capped
-    grid of :func:`listed_repair_blocks` lists the blocks that need it, one
+    On CUDA (:attr:`classify_first`), a repair of more blocks than two capped
+    grids of :func:`listed_repair_blocks` lists the blocks that need it, one
     thread per block, and repairs over that list on the capped grid, instead
     of launching a block per group that mostly confirms its cache: inside a
     capture, and eagerly when the groups are expected to be stamped with the
@@ -371,6 +381,8 @@ class TreeKineticState:
         self._compare_blocks = wp.empty(groups, dtype=int, device=device)
         self._list_counts = wp.zeros(2, dtype=int, device=device)
         self._repair_grid = listed_repair_blocks(device)
+        # Blocks a repair launch must exceed to be classified.
+        self._classify_above = _CLASSIFIED_GRIDS * self._repair_grid
         self.data.current_valid.zero_()
         self.bias = self.data.bias
         self.geometric = self.data.geometric
@@ -406,10 +418,10 @@ class TreeKineticState:
         on_cpu = self.solver.model.device.is_cpu
         self.block_dim = max(layout.block, self._chain_block_dim)
         self.launch_count = self.group_count // layout.pack
-        # Only a launch of more blocks than the listed repair's grid is classified: one of
-        # at most that many blocks ends in about a wave of early exits, which costs no more
-        # than the classification's launches (a 4096-block packed repair ran 5.6-6.5 us).
-        self.classify_first = self._classify_switch and 0 < self._repair_grid < self.launch_count
+        # Only a launch of more blocks than _CLASSIFIED_GRIDS listed grids is classified.
+        self.classify_first = (
+            self._classify_switch and 0 < self._repair_grid and self._classify_above < self.launch_count
+        )
         self.repair_kernel = native.get_state_kernel(
             False,
             self.chain_scan,
