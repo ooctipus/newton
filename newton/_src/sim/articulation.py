@@ -1447,7 +1447,9 @@ def eval_jacobian(
               Shape [articulation_count]. If None, computes for all articulations.
               The block ``J[i]`` of each selected articulation is overwritten in
               full, with zeros in the rows past its links and the columns past its
-              DOFs. Entries of unselected articulations are left unchanged.
+              DOFs. Blocks of unselected articulations are either zeroed or left
+              unchanged, and which is unspecified; zero ``J`` first if code reads
+              them.
 
     Returns:
         The Jacobian array J, or None if the model has no articulations.

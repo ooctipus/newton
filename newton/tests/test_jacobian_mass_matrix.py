@@ -297,12 +297,34 @@ def _skip_while_warp_debugging(test):
         test.skipTest("A Warp debugging aid is on, so the clear does not replay recorded launches")
 
 
+def _bits(array):
+    """Return the float32 bit patterns of ``array``, so that comparisons tell ``-0.0`` from ``0.0``."""
+    return np.ascontiguousarray(array, dtype=np.float32).view(np.uint32)
+
+
 def _assert_bits_equal(actual, expected):
     """Assert that two float32 arrays hold the same bits, so that ``-0.0`` does not pass for ``0.0``."""
-    np.testing.assert_array_equal(
-        np.ascontiguousarray(actual, dtype=np.float32).view(np.uint32),
-        np.ascontiguousarray(expected, dtype=np.float32).view(np.uint32),
-    )
+    np.testing.assert_array_equal(_bits(actual), _bits(expected))
+
+
+def _assert_masked_jacobian(actual, expected, before, selected):
+    """Assert what a masked eval_jacobian guarantees for a buffer that held ``before``.
+
+    Each selected block equals the unmasked result ``expected`` bitwise. Each
+    unselected block is either zero or still holds ``before``, bit for bit.
+
+    Args:
+        actual: Jacobian after the masked call, shape [articulation_count, rows, columns].
+        expected: Unmasked Jacobian of the same state.
+        before: Buffer contents before the call, broadcastable to ``actual``.
+        selected: Boolean articulation selection.
+    """
+    _assert_bits_equal(actual[selected], expected[selected])
+    before = np.broadcast_to(np.asarray(before, dtype=np.float32), actual.shape)
+    for i in np.flatnonzero(~selected):
+        block = _bits(actual[i])
+        if block.any() and not np.array_equal(block, _bits(before[i])):
+            raise AssertionError(f"unselected block {i} is neither zero nor left unchanged")
 
 
 def _record_clears():
@@ -747,8 +769,8 @@ def test_jacobian_with_mask(test, device):
     # First articulation should have non-zero Jacobian
     test.assertNotEqual(np.abs(J_np[0]).max(), 0.0)
 
-    # The second articulation is masked out, so its block keeps the zeros of the
-    # zero-initialized buffer: a masked eval_jacobian leaves unselected blocks untouched.
+    # The second articulation is masked out. A masked eval_jacobian either zeroes its
+    # block or leaves it unchanged, and the buffer was zero-initialized: zero either way.
     test.assertEqual(np.abs(J_np[1]).max(), 0.0)
 
 
@@ -799,11 +821,12 @@ def test_mass_matrix_with_mask(test, device):
     test.assertNotEqual(H_np[1, 0, 0], 0.0)
 
 
-def test_jacobian_mask_overwrites_only_selected_blocks(test, device):
-    """Overwrite whole selected blocks and leave unselected articulations' entries untouched.
+def test_jacobian_mask_overwrites_selected_blocks(test, device):
+    """Overwrite whole selected blocks and leave unselected ones zeroed or unchanged.
 
     Every selected block, padding included, must equal the unmasked result bitwise
-    whatever the buffer held before; every unselected block keeps the caller's values.
+    whatever the buffer held before; every unselected block is zero or keeps the
+    caller's values.
     """
     model, state = _build_mixed_articulations(device)
     J_ref = newton.eval_jacobian(model, state).numpy()
@@ -814,9 +837,7 @@ def test_jacobian_mask_overwrites_only_selected_blocks(test, device):
             mask = wp.array(selected, dtype=bool, device=device)
             test.assertIs(newton.eval_jacobian(model, state, J, mask=mask), J)
 
-            J_np = J.numpy()
-            _assert_bits_equal(J_np[selected], J_ref[selected])
-            _assert_bits_equal(J_np[~selected], np.full_like(J_ref[~selected], _SENTINEL))
+            _assert_masked_jacobian(J.numpy(), J_ref, _SENTINEL, selected)
 
 
 def test_jacobian_mask_skips_whole_buffer_clear(test, device):
@@ -849,8 +870,8 @@ def test_jacobian_mask_without_buffer_zeroes_unselected(test, device):
     _assert_bits_equal(J[~selected], np.zeros_like(J_ref[~selected]))
 
 
-def test_articulation_view_jacobian_writes_only_view_blocks(test, device):
-    """Write only the view's articulation blocks, narrowed by a per-world mask, through the view."""
+def test_articulation_view_jacobian_overwrites_view_blocks(test, device):
+    """Overwrite the view's articulation blocks, narrowed by a per-world mask, and no others' values."""
     model, state = _build_mixed_articulations(device)
     J_ref = newton.eval_jacobian(model, state).numpy()
     view = newton.selection.ArticulationView(model, "fan", verbose=False)
@@ -864,9 +885,7 @@ def test_articulation_view_jacobian_writes_only_view_blocks(test, device):
 
             selected = view.get_model_articulation_mask(mask=view_mask).numpy()
             test.assertEqual(int(selected.sum()), 3 if mask is None else 1)
-            J_np = J.numpy()
-            _assert_bits_equal(J_np[selected], J_ref[selected])
-            _assert_bits_equal(J_np[~selected], np.full_like(J_ref[~selected], _SENTINEL))
+            _assert_masked_jacobian(J.numpy(), J_ref, _SENTINEL, selected)
 
 
 def test_articulation_view_of_every_articulation_clears_whole_buffers(test, device):
@@ -896,10 +915,7 @@ def test_articulation_view_of_every_articulation_clears_whole_buffers(test, devi
 
     J = _filled(J_ref.shape, _SENTINEL, device)
     view.eval_jacobian(state, J, mask=wp.array([False, True, False], dtype=bool, device=device))
-    selected = model.articulation_world.numpy() == 1
-    J_np = J.numpy()
-    _assert_bits_equal(J_np[selected], J_ref[selected])
-    _assert_bits_equal(J_np[~selected], np.full_like(J_ref[~selected], _SENTINEL))
+    _assert_masked_jacobian(J.numpy(), J_ref, _SENTINEL, model.articulation_world.numpy() == 1)
 
 
 def test_mass_matrix_mask_zeroes_unselected_articulations(test, device):
@@ -907,7 +923,8 @@ def test_mass_matrix_mask_zeroes_unselected_articulations(test, device):
 
     This is the mask convention that eval_inverse_dynamics_passive documents as
     mirroring eval_mass_matrix. It must hold when H holds stale values and the
-    supplied Jacobian carries NaN in every block eval_jacobian left unselected.
+    supplied Jacobian, evaluated into a NaN-filled buffer, carries NaN in every
+    block that the mask leaves unselected.
     """
     model, state = _build_mixed_articulations(device)
     H_ref = newton.eval_mass_matrix(model, state).numpy()
@@ -916,6 +933,10 @@ def test_mass_matrix_mask_zeroes_unselected_articulations(test, device):
         mask = wp.array(selected, dtype=bool, device=device)
         J = _filled(_jacobian_shape(model), np.nan, device)
         newton.eval_jacobian(model, state, J, mask=mask)
+        # eval_jacobian may zero the unselected blocks; NaN shows any read of them.
+        J_np = J.numpy()
+        J_np[~selected] = np.nan
+        J.assign(J_np)
         for source, supplied in (("supplied", J), ("internal", None)):
             with test.subTest(selection=name, jacobian=source):
                 H = _filled(H_ref.shape, _SENTINEL, device)
@@ -1274,7 +1295,7 @@ def test_jacobian_mask_graph_replay_matches_eager(test, device):
     """Clear and fill the blocks that the mask selects when a captured masked evaluation replays.
 
     Each replay starts from a reset buffer and a new mask: the selected blocks must
-    equal the eager unmasked result and the others keep the reset values.
+    equal the eager unmasked result and the others be zero or keep the reset values.
     """
     model, state = _build_mixed_articulations(device)
     J_ref = newton.eval_jacobian(model, state).numpy()
@@ -1295,9 +1316,7 @@ def test_jacobian_mask_graph_replay_matches_eager(test, device):
             J.assign(np.full(J_ref.shape, _SENTINEL, dtype=np.float32))
             wp.capture_launch(capture.graph)
 
-            J_np = J.numpy()
-            _assert_bits_equal(J_np[selected], J_ref[selected])
-            _assert_bits_equal(J_np[~selected], np.full_like(J_ref[~selected], _SENTINEL))
+            _assert_masked_jacobian(J.numpy(), J_ref, _SENTINEL, selected)
 
 
 def test_mass_matrix_mask_graph_replay_matches_eager(test, device):
@@ -1785,8 +1804,8 @@ add_function_test(TestJacobianMassMatrix, "test_jacobian_with_mask", test_jacobi
 add_function_test(TestJacobianMassMatrix, "test_mass_matrix_with_mask", test_mass_matrix_with_mask, devices=devices)
 add_function_test(
     TestJacobianMassMatrix,
-    "test_jacobian_mask_overwrites_only_selected_blocks",
-    test_jacobian_mask_overwrites_only_selected_blocks,
+    "test_jacobian_mask_overwrites_selected_blocks",
+    test_jacobian_mask_overwrites_selected_blocks,
     devices=devices,
 )
 add_function_test(
@@ -1803,8 +1822,8 @@ add_function_test(
 )
 add_function_test(
     TestJacobianMassMatrix,
-    "test_articulation_view_jacobian_writes_only_view_blocks",
-    test_articulation_view_jacobian_writes_only_view_blocks,
+    "test_articulation_view_jacobian_overwrites_view_blocks",
+    test_articulation_view_jacobian_overwrites_view_blocks,
     devices=devices,
 )
 add_function_test(
