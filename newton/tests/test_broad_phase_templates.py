@@ -8,6 +8,7 @@ and sorted candidate sets are compared with :class:`BroadPhaseExplicit` on every
 device; on CPU, where both run serially in list order, the arrays must be equal.
 """
 
+import itertools
 import json
 import os
 import unittest
@@ -39,17 +40,22 @@ def _synthetic(
     global_pairs=2,
     gap=2,
     empty_template=False,
+    globals_last=False,
 ):
-    """Random templates over worlds of ``world_shapes`` shapes, globals first, ``gap`` spare shapes between worlds.
+    """Random templates over worlds of ``world_shapes`` shapes, ``gap`` spare shapes after each world.
 
     Args:
         template_specs: Per template, (global-local pair count, local pair count).
         empty_template: Add a template without pairs, which the list skips.
+        globals_last: Number the global shapes after the last world instead of before the first, so
+            every global-local pair stores its global shape second.
 
     Returns:
         (record, shape_count): the unbound record and the shapes it spans.
     """
     rng = np.random.default_rng(seed)
+    stride = world_shapes + gap
+    first_global = worlds * stride if globals_last else 0
     templates = []
     for global_local_count, local_count in template_specs:
         local_pairs = set()
@@ -58,7 +64,7 @@ def _synthetic(
             local_pairs.add((a, b))
         global_local = set()
         while len(global_local) < global_local_count:
-            global_local.add((int(rng.integers(global_shapes)), int(rng.integers(world_shapes))))
+            global_local.add((first_global + int(rng.integers(global_shapes)), int(rng.integers(world_shapes))))
         templates.append(
             (
                 np.asarray(sorted(global_local), dtype=np.int32).reshape((-1, 2)),
@@ -67,7 +73,7 @@ def _synthetic(
         )
     if empty_template:
         templates.append((np.empty((0, 2), dtype=np.int32), np.empty((0, 2), dtype=np.int32)))
-    starts = global_shapes + np.arange(worlds, dtype=np.int64) * (world_shapes + gap)
+    starts = (0 if globals_last else global_shapes) + np.arange(worlds, dtype=np.int64) * stride
     assignment = rng.integers(len(templates), size=worlds)
     runs = []
     for world, template in enumerate(assignment.tolist()):
@@ -78,13 +84,23 @@ def _synthetic(
     global_list = set()
     while len(global_list) < global_pairs:
         a, b = sorted(rng.choice(global_shapes, size=2, replace=False).tolist())
-        global_list.add((a, b))
+        global_list.add((first_global + a, first_global + b))
     record = ShapePairTemplates(
         global_pairs=np.asarray(sorted(global_list), dtype=np.int32).reshape((-1, 2)),
         templates=tuple(templates),
         runs=tuple((template, np.asarray(run, dtype=np.int32)) for template, run in runs),
     )
-    return record, int(starts[-1] + world_shapes + gap) if worlds else global_shapes
+    return record, global_shapes + worlds * stride
+
+
+def _global_second_count(record):
+    """Count list pairs whose global shape follows the local one: the kernel must swap them to (min, max)."""
+    count = 0
+    for template, starts in record.runs:
+        global_local = record.templates[template][0]
+        local = global_local[None, :, 1] + np.asarray(starts, dtype=np.int64)[:, None]
+        count += int((global_local[None, :, 0] > local).sum())
+    return count
 
 
 def _random_bounds(seed, shape_count, device):
@@ -171,19 +187,27 @@ def _assert_same_candidates(test, device, flat, template, capacity, everything=N
 def test_synthetic_templates_match_flat_kernel(test, device):
     """Test the same candidates as the flat kernel over random templates, runs, globals and bounds."""
     cases = (
-        # (template specs, worlds, world shapes): small templates pack 8 worlds per block.
-        (((3, 20), (0, 9), (2, 0)), 21, 12),
+        # (template specs, worlds, world shapes, globals last): small templates pack 8 worlds per block.
+        (((3, 20), (0, 9), (2, 0)), 21, 12, False),
         # One large template: several warps per world, global block, tail block.
-        (((5, 300),), 7, 40),
+        (((5, 300),), 7, 40, False),
         # Many shapes per world with few pairs: shared memory limits worlds per block.
-        (((40, 260), (0, 120)), 9, 300),
+        (((40, 260), (0, 120)), 9, 300, False),
         # 1100 pairs per world: one 256-lane world per block, as on the largest templates.
-        (((8, 1100),), 5, 60),
+        (((8, 1100),), 5, 60, False),
+        # Global shapes after the worlds: every global-local pair is swapped to (min, max).
+        (((6, 40), (3, 0), (0, 15)), 13, 16, True),
     )
-    for case, (specs, worlds, world_shapes) in enumerate(cases):
+    for case, (specs, worlds, world_shapes, globals_last) in enumerate(cases):
         record, shape_count = _synthetic(
-            case, worlds=worlds, world_shapes=world_shapes, template_specs=specs, empty_template=case == 0
+            case,
+            worlds=worlds,
+            world_shapes=world_shapes,
+            template_specs=specs,
+            empty_template=case == 0,
+            globals_last=globals_last,
         )
+        test.assertEqual(_global_second_count(record) > 0, globals_last)
         pairs = wp.array(record.replay(), dtype=wp.vec2i, device=device)
         layout = BroadPhaseExplicitTemplates(record, device=device)
         test.assertIsNone(layout.unsupported_reason)
@@ -277,13 +301,40 @@ def _robot(variant=0):
     return robot
 
 
-def _replicated_builder(worlds=11, *, global_pair=True, residual=True, mixed=True, empty=True):
+_GLOBAL_ORDERS = ("first", "last", "split")
+
+
+def _replicated_builder(worlds=11, *, global_pair=True, residual=True, mixed=True, empty=True, global_order="first"):
+    """Replicated robots between global shapes.
+
+    Args:
+        global_pair: Add a global kinematic box that touches the ground: one global-global pair.
+        residual: Filter the ground against worlds 1 and 5, which gives them templates of their own.
+        mixed: Use the second robot variant in every fourth world.
+        empty: Make world 3 shapeless and world 7 non-colliding.
+        global_order: Add the global shapes before the worlds (``"first"``), after them (``"last"``,
+            as ``replicate()`` followed by ``add_ground_plane()``), or the ground before and the box
+            after (``"split"``). Global shapes after the worlds are stored second in their pairs.
+    """
     builder = newton.ModelBuilder()
-    ground = builder.add_ground_plane()
-    if global_pair:
-        # A global kinematic box that touches the ground: one global-global pair.
-        body = builder.add_body(xform=wp.transform((0.0, 0.0, -0.4), wp.quat_identity()), is_kinematic=True)
-        builder.add_shape_box(body, hx=30.0, hy=3.0, hz=0.5)
+    ground = None
+
+    def add_ground():
+        nonlocal ground
+        ground = builder.add_ground_plane()
+
+    def add_box():
+        if global_pair:
+            body = builder.add_body(xform=wp.transform((0.0, 0.0, -0.4), wp.quat_identity()), is_kinematic=True)
+            builder.add_shape_box(body, hx=30.0, hy=3.0, hz=0.5)
+
+    leading, trailing = {
+        "first": ((add_ground, add_box), ()),
+        "last": ((), (add_ground, add_box)),
+        "split": ((add_ground,), (add_box,)),
+    }[global_order]
+    for add in leading:
+        add()
     robot, other = _robot(), _robot(1)
     first_shape = []
     for world in range(worlds):
@@ -304,6 +355,8 @@ def _replicated_builder(worlds=11, *, global_pair=True, residual=True, mixed=Tru
             builder.add_world(other, xform=xform)
         else:
             builder.add_world(robot, xform=xform)
+    for add in trailing:
+        add()
     if residual:
         # World-specific filters give worlds 1 and 5 a template of their own.
         for world in (1, 5):
@@ -326,6 +379,9 @@ class TestShapePairTemplateRecord(unittest.TestCase):
             "global pair": {"global_pair": True, "residual": False, "mixed": False, "empty": False},
             "residual filters": {"global_pair": True, "residual": True, "mixed": False, "empty": False},
             "mixed worlds": {"global_pair": True, "residual": True, "mixed": True, "empty": True},
+            "globals last": {"global_order": "last"},
+            "globals split": {"global_order": "split"},
+            "replicate, ground last": {"global_pair": False, "residual": False, "mixed": False, "global_order": "last"},
         }
         for name, options in layouts.items():
             with self.subTest(layout=name):
@@ -334,7 +390,10 @@ class TestShapePairTemplateRecord(unittest.TestCase):
                 self.assertIsInstance(record, ShapePairTemplates)
                 self.assertTrue(record.describes(model.shape_contact_pairs))
                 np.testing.assert_array_equal(record.replay(), model.shape_contact_pairs.numpy())
-                self.assertEqual(record.global_pairs.shape[0], int(options["global_pair"]))
+                self.assertEqual(record.global_pairs.shape[0], int(options.get("global_pair", True)))
+                # Global shapes added after the worlds are stored second in their pairs.
+                order = options.get("global_order", "first")
+                self.assertEqual(_global_second_count(record) > 0, order != "first")
         model = _finalize(_replicated_builder(), "cpu")
         record = model._shape_contact_pair_templates
         # Robot, variant, filtered and pair-free worlds use four templates.
@@ -465,13 +524,22 @@ def _kernel_record(pipeline):
     return pipeline.get_collision_selection()["narrow_phase"]["broad_phase_kernel"]
 
 
+def _global_order_models(test, device):
+    """Yield (global order, model, posed state); global shapes after the worlds make the kernel swap pairs."""
+    for global_order in _GLOBAL_ORDERS:
+        model = _finalize(_replicated_builder(global_order=global_order), device)
+        test.assertEqual(_global_second_count(model._shape_contact_pair_templates) > 0, global_order != "first")
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+        yield global_order, model, state
+
+
 def test_pipeline_templates_match_flat_contacts(test, device):
-    """Produce the flat kernel's candidates and contacts with the world templates."""
-    model = _finalize(_replicated_builder(), device)
-    state = model.state()
-    newton.eval_fk(model, model.joint_q, model.joint_qd, state)
-    for deterministic in (False, True):
-        with test.subTest(deterministic=deterministic):
+    """Produce the flat kernel's candidates and contacts with the world templates, globals first or last."""
+    for (global_order, model, state), deterministic in itertools.product(
+        _global_order_models(test, device), (False, True)
+    ):
+        with test.subTest(global_order=global_order, deterministic=deterministic):
             templated = _pipeline(model, "1", deterministic=deterministic)
             flat = _pipeline(model, "0", deterministic=deterministic)
             record = _kernel_record(templated)
@@ -503,19 +571,23 @@ def test_pipeline_templates_match_flat_contacts(test, device):
 
 
 def test_pipeline_immovable_filter_matches_flat(test, device):
-    """Filter static and kinematic pairs exactly as the flat kernel does."""
-    model = _finalize(_replicated_builder(), device)
-    state = model.state()
-    newton.eval_fk(model, model.joint_q, model.joint_qd, state)
-    templated = _pipeline(model, "1", include_static_kinematic_pairs=False)
-    flat = _pipeline(model, "0", include_static_kinematic_pairs=False)
-    templated_contacts = _contacts(templated, model, state)
-    flat_contacts = _contacts(flat, model, state)
-    count = int(flat.broad_phase_pair_count.numpy()[0])
-    test.assertEqual(int(templated.broad_phase_pair_count.numpy()[0]), count)
-    codes = _sorted_codes(templated.broad_phase_shape_pairs.numpy(), count, count)
-    np.testing.assert_array_equal(codes, _sorted_codes(flat.broad_phase_shape_pairs.numpy(), count, count))
-    np.testing.assert_array_equal(_contact_rows(templated_contacts), _contact_rows(flat_contacts))
+    """Filter static and kinematic pairs exactly as the flat kernel does, globals first or last."""
+    for global_order, model, state in _global_order_models(test, device):
+        with test.subTest(global_order=global_order):
+            templated = _pipeline(model, "1", include_static_kinematic_pairs=False)
+            flat = _pipeline(model, "0", include_static_kinematic_pairs=False)
+            templated_contacts = _contacts(templated, model, state)
+            flat_contacts = _contacts(flat, model, state)
+            count = int(flat.broad_phase_pair_count.numpy()[0])
+            test.assertEqual(int(templated.broad_phase_pair_count.numpy()[0]), count)
+            templated_pairs = templated.broad_phase_shape_pairs.numpy()
+            flat_pairs = flat.broad_phase_shape_pairs.numpy()
+            if device.is_cpu:
+                np.testing.assert_array_equal(templated_pairs[:count], flat_pairs[:count])
+            np.testing.assert_array_equal(
+                _sorted_codes(templated_pairs, count, count), _sorted_codes(flat_pairs, count, count)
+            )
+            np.testing.assert_array_equal(_contact_rows(templated_contacts), _contact_rows(flat_contacts))
 
 
 class TestBroadPhaseTemplateSelection(unittest.TestCase):
@@ -570,25 +642,24 @@ class TestBroadPhaseTemplateSelection(unittest.TestCase):
 
 def test_graph_replays_template_broad_phase(test, device):
     """Capture the template broad phase in a CUDA graph and replay the flat kernel's candidates."""
-    model = _finalize(_replicated_builder(), device)
-    state = model.state()
-    newton.eval_fk(model, model.joint_q, model.joint_qd, state)
-    templated = _pipeline(model, "1")
-    flat = _pipeline(model, "0")
-    test.assertEqual(_kernel_record(templated)["kernel"], "world_templates")
-    flat_contacts = _contacts(flat, model, state)
-    count = int(flat.broad_phase_pair_count.numpy()[0])
-    contacts = _contacts(templated, model, state)  # load modules before capture
-    with wp.ScopedCapture(device=device, force_module_load=False) as capture:
-        templated.collide(state, contacts)
-    for _ in range(3):
-        wp.capture_launch(capture.graph)
-    test.assertEqual(int(templated.broad_phase_pair_count.numpy()[0]), count)
-    np.testing.assert_array_equal(
-        _sorted_codes(templated.broad_phase_shape_pairs.numpy(), count, count),
-        _sorted_codes(flat.broad_phase_shape_pairs.numpy(), count, count),
-    )
-    np.testing.assert_array_equal(_contact_rows(contacts), _contact_rows(flat_contacts))
+    for global_order, model, state in _global_order_models(test, device):
+        with test.subTest(global_order=global_order):
+            templated = _pipeline(model, "1")
+            flat = _pipeline(model, "0")
+            test.assertEqual(_kernel_record(templated)["kernel"], "world_templates")
+            flat_contacts = _contacts(flat, model, state)
+            count = int(flat.broad_phase_pair_count.numpy()[0])
+            contacts = _contacts(templated, model, state)  # load modules before capture
+            with wp.ScopedCapture(device=device, force_module_load=False) as capture:
+                templated.collide(state, contacts)
+            for _ in range(3):
+                wp.capture_launch(capture.graph)
+            test.assertEqual(int(templated.broad_phase_pair_count.numpy()[0]), count)
+            np.testing.assert_array_equal(
+                _sorted_codes(templated.broad_phase_shape_pairs.numpy(), count, count),
+                _sorted_codes(flat.broad_phase_shape_pairs.numpy(), count, count),
+            )
+            np.testing.assert_array_equal(_contact_rows(contacts), _contact_rows(flat_contacts))
 
 
 class TestBroadPhaseTemplates(unittest.TestCase):
