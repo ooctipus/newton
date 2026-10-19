@@ -281,6 +281,24 @@ class TestKeyedRowsCPU(unittest.TestCase):
             self.assertFalse(hasattr(owner.prefix, "row_dof"))
             self.assertFalse(hasattr(owner.prefix, "row_sign"))
 
+    def test_changed_motion_keeps_held_factors(self):
+        """Rebuild the current rows from changed motion and keep the held factors bit-identical."""
+        with np.load(next(captures())) as snapshot:
+            # The fallback count makes every world materialize its current rows.
+            solver, state, aug, contact, owner = run_rows(snapshot, "cpu", fallback=True)
+            held = {n: solver.L_by_size[n].numpy().copy() for n in (16, 6)}
+            current = {n: solver.J_by_size[n].numpy().copy() for n in (16, 6)}
+            changed = aug.joint_S_s.numpy()
+            changed[:, :3] += np.float32(0.0125)
+            aug.joint_S_s.assign(changed)
+            owner.begin_rows(state, aug, solver.dt)
+            owner.produce_contacts(state, aug, contact, solver.dt)
+            owner.finish_rows()
+            moved = max(np.max(np.abs(solver.J_by_size[n].numpy() - current[n])) for n in (16, 6))
+            self.assertGreater(moved, 1e-3)
+            for n in (16, 6):
+                np.testing.assert_array_equal(solver.L_by_size[n].numpy(), held[n])
+
     def test_actual_prefix_and_contact_rows(self):
         """Preserve typed identities and independently verify fallback current physical rows."""
         for path in captures():
