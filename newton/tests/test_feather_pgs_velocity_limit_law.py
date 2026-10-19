@@ -16,6 +16,7 @@ reaches every visit of a velocity-limit row in every serial sweep generator.
 The CUDA tests run the kernels against a float64 reference and roll out solvers.
 """
 
+import ast
 import inspect
 import itertools
 import os
@@ -228,6 +229,48 @@ class TestVelocityLimitLawSources(unittest.TestCase):
         accumulated, accumulated_sources = _native_sources(factory, 48, 18, 12, velocity_limit_law="accumulated")
         self.assertEqual(accumulated.key, kernel.key)
         self.assertEqual(accumulated_sources, sources)
+
+    def test_solver_passes_its_law_to_every_sweep_it_builds(self):
+        """Pass ``velocity_limit_law`` at every call of a sweep factory that takes one in the solver module.
+
+        The solver builds each matrix-free sweep with ``_velocity_limit_kernel_law()``, so its kernels apply the
+        law that ``routes.velocity_limits.law`` reports. A call that omits the argument builds the stateless law
+        under either option, as the multi-block solver's dense-tile sweeps
+        (``FEATHER_PGS_MF_MULTIBLOCK_DENSE_TILES=1``) did.
+        """
+        factories = set()
+        for name, value in vars(solver_source).items():
+            if callable(value) and not isinstance(value, type):
+                try:
+                    parameters = inspect.signature(value).parameters
+                except (TypeError, ValueError):
+                    continue
+                if "velocity_limit_law" in parameters:
+                    factories.add(name)
+        self.assertLessEqual(
+            {
+                "_get_pgs_solve_mf_gs_kernel",
+                "_get_pgs_solve_mf_gs_incremental_kernel",
+                "_get_pgs_solve_propagation_full_iteration_kernel",
+                "_get_pgs_solve_sparse_kernel",
+                "get_response_block_sweep_lane_kernel",
+                "get_response_block_sweep_warp_kernel",
+            },
+            factories,
+        )
+        calls, missing = 0, []
+        for node in ast.walk(ast.parse(inspect.getsource(solver_source))):
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            name = function.id if isinstance(function, ast.Name) else getattr(function, "attr", None)
+            if name not in factories:
+                continue
+            calls += 1
+            if "velocity_limit_law" not in {keyword.arg for keyword in node.keywords}:
+                missing.append(f"{name} at line {node.lineno}")
+        self.assertGreaterEqual(calls, 9)
+        self.assertEqual(missing, [])
 
     def test_unknown_laws_are_rejected(self):
         """Reject a law that is neither stateless nor accumulated in every generator and the solver."""
@@ -705,6 +748,30 @@ class TestVelocityLimitLawRollouts(unittest.TestCase):
                     speeds.append(float(abs(state.joint_qd.numpy()[0])))
                 self.assertGreater(max(speeds), 0.99 * limit, speeds)
                 self.assertLessEqual(max(speeds), limit * (1.0 + 1.0e-5), speeds)
+
+    def test_dense_tile_sweeps_take_the_solver_law(self):
+        """Build the multi-block solver's dense-tile sweeps with the law its other sweeps take.
+
+        ``FEATHER_PGS_MF_MULTIBLOCK_DENSE_TILES=1`` replaces the MF-GS kernel of the phase-6 dense pass with an
+        unstaged or a staged dense-tile kernel. Phase 6 visits no velocity-limit row (phase 5 runs the ordinary
+        kernel), so the law moves no impulse there, but the kernels must carry the law that
+        ``routes.velocity_limits.law`` reports.
+        """
+        model = _pushed_arm("cuda:0", 1.0)
+        multiblock = {"FEATHER_PGS_MF_MULTIBLOCK": "1", "FEATHER_PGS_MF_MULTIBLOCK_DENSE_TILES": "1"}
+        for law in ("stateless", "accumulated"):
+            with self.subTest(law=law), mock.patch.dict(os.environ, multiblock):
+                os.environ.pop(_LAW_FLAG, None)
+                solver = _matrix_free_solver(model, law, mf_gs_incremental_rows=0)
+                self.assertIsNotNone(solver._mf_dense_support)
+                self.assertEqual(solver.get_path_selection()["routes"]["velocity_limits"]["law"], law)
+                kernels = (
+                    solver._pgs_solve_mf_gs_kernel,
+                    solver._pgs_solve_mf_dense_tiles_kernel,
+                    solver._pgs_solve_mf_dense_tiles_staged_kernel,
+                )
+                for kernel in kernels:
+                    self.assertEqual("_vacc" in kernel.key, law == "accumulated", kernel.key)
 
     def test_accumulated_serial_sweep_converges_to_the_parallel_tier(self):
         """Converge every serial sweep route under the accumulated law to the parallel tier's fixed point.

@@ -3492,6 +3492,7 @@ class SolverFeatherPGS(SolverBase):
                 shared_metadata=shared_metadata,
                 stream_mf_impulses=True,
                 dense_support_tiles=True,
+                velocity_limit_law=self._velocity_limit_kernel_law(),
             )
             self._pgs_solve_mf_dense_tiles_staged_kernel = _get_pgs_solve_mf_gs_kernel(
                 self.dense_max_constraints,
@@ -3506,6 +3507,7 @@ class SolverFeatherPGS(SolverBase):
                 stream_mf_impulses=True,
                 dense_support_tiles=True,
                 stage_velocities=True,
+                velocity_limit_law=self._velocity_limit_kernel_law(),
             )
         # Record the applied options once; get_path_selection() returns detached copies.
         self._applied_options = applied_options(self, SolverFeatherPGS.__init__, requested_options)
