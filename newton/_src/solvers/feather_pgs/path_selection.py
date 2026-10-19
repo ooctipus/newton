@@ -126,6 +126,13 @@ def _response_block_rows(solver, rows) -> int:
     return int(rows) if solver._rb_build_kernel is not None else 0
 
 
+def _linked_tier_sweeps(solver) -> int:
+    if solver._ink_rows <= 0:
+        return 0
+    linked = [kernel for kernel in solver._pgs_solve_mf_gs_incremental_kernels if kernel._fpgs_linked_rows]
+    return max((int(kernel._fpgs_sweeps) for kernel in linked), default=0)
+
+
 # Options whose request can resolve to another value, or to no owner or tier at all.
 _EFFECTIVE = {
     "sparse_mass_matrix": lambda solver: "on" if solver._sparse_mass_matrix_size is not None else "off",
@@ -151,6 +158,8 @@ _EFFECTIVE = {
     ),
     # The sweeps' law after the schedule and row gates (routes.velocity_limits.law).
     "velocity_limit_law": lambda solver: solver._velocity_limit_kernel_law(),
+    # The largest budget of the built linked (patch) tiers; 0 without them.
+    "mf_gs_parallel_linked_sweeps": _linked_tier_sweeps,
 }
 
 
@@ -165,10 +174,10 @@ def applied_options(solver, init, arguments: dict) -> dict:
     request, which can still decline other owners when its own mechanism does
     not engage (for example ``grouped_dynamics`` and ``lazy_kinematics``);
     ``routes`` names the owners. ``source`` is ``"environment"`` when an
-    ``IL_NEWTON_FPGS_*`` legacy alias changed the applied value, ``"argument"``
-    when the requested value differs from the declared default and
-    ``"default"`` otherwise; Python cannot tell an omitted option from one
-    passed with its default value.
+    ``IL_NEWTON_FPGS_*`` legacy alias or a ``FEATHER_PGS_*`` override changed
+    the applied value, ``"argument"`` when the requested value differs from the
+    declared default and ``"default"`` otherwise; Python cannot tell an omitted
+    option from one passed with its default value.
     """
     record = {}
     environment = getattr(solver, "_environment_options", frozenset())
@@ -760,10 +769,19 @@ def _tiers(solver) -> dict | None:
             "velocity_limit_pass": all(getattr(kernel, "_fpgs_velocity_limit_pass", False) for kernel in kernels),
             "nesterov": bool(solver.mf_gs_parallel_nesterov),
             "matrix_free": bool(solver.mf_gs_parallel_matrix_free),
-            "sweeps": int(solver.mf_gs_parallel_sweeps),
+            # The largest tier budget; each tier records its own. Point tiers sweep mf_gs_parallel_sweeps, linked
+            # tiers mf_gs_parallel_linked_sweeps when set ("mf_gs_parallel_linked_sweeps" or "auto").
+            "sweeps": max(int(kernel._fpgs_sweeps) for kernel in kernels),
+            "sweeps_rule": solver._par_sweeps_rule,
+            "sweeps_reason": solver._par_sweeps_reason,
             "tolerance": json_value(solver.mf_gs_parallel_tol),
             "tiers": [
-                {"rows": int(rows), "min_rows": int(min_rows), "kernel": _key(kernel)}
+                {
+                    "rows": int(rows),
+                    "min_rows": int(min_rows),
+                    "sweeps": int(kernel._fpgs_sweeps),
+                    "kernel": _key(kernel),
+                }
                 for (rows, min_rows), kernel in zip(solver._par_tiers, kernels, strict=False)
             ],
         }

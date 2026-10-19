@@ -429,6 +429,12 @@ FLAGS = declare(
         "=1 admits patch friction to the parallel tiers and keyed rows (default off: it keeps its serial sweeps).",
     ),
     _flag(
+        "FEATHER_PGS_PATCH_PARALLEL_SWEEPS",
+        "policy",
+        _SOLVER,
+        "A positive count or auto overrides mf_gs_parallel_linked_sweeps, the linked tiers' sweep budget.",
+    ),
+    _flag(
         "FEATHER_PGS_POINT_PAIR_STEP",
         "experiment",
         _SOLVER,

@@ -1372,6 +1372,7 @@ class SolverFeatherPGS(SolverBase):
         mf_gs_incremental_rows: int = 32,
         mf_gs_parallel_rows: int = 0,
         mf_gs_parallel_sweeps: int = 24,
+        mf_gs_parallel_linked_sweeps: int | Literal["auto"] | None = None,
         mf_gs_parallel_nesterov: bool = True,
         mf_gs_parallel_tol: float = 1e-4,
         mf_gs_parallel_matrix_free: bool = False,
@@ -1723,7 +1724,21 @@ class SolverFeatherPGS(SolverBase):
                 shares the serial sweep's fixed point.
             mf_gs_parallel_sweeps (int, optional): Maximum number of parallel sweeps per launch (early exit when no
                 impulse changes). Independent of ``pgs_iterations``; preserve the sweep allowance when comparing
-                execution speed, and validate convergence separately.
+                execution speed, and validate convergence separately. The tiers that serve persistent patch
+                friction take ``mf_gs_parallel_linked_sweeps`` when it is set.
+            mf_gs_parallel_linked_sweeps (int | Literal["auto"] | None, optional): Sweep budget of the parallel
+                tiers that serve persistent patch friction (linked tiers); point-friction tiers keep
+                ``mf_gs_parallel_sweeps``. Jacobi sweeps need more passes than serial sweeps where many rows
+                couple through one body, so a contact-rich patch world can need more than
+                ``mf_gs_parallel_sweeps`` to reach the serial sweep's accuracy. ``None`` uses
+                ``mf_gs_parallel_sweeps``; a positive count sets every linked tier's budget. ``"auto"`` gives
+                each linked tier serving up to ``R`` rows ``ceil(3 * pgs_iterations * sqrt(R / 32))`` sweeps,
+                within ``[mf_gs_parallel_sweeps, 128]``, from ``pgs_iterations`` at construction: the serial
+                sweep's iteration count sets the accuracy to match, and larger worlds converge more slowly.
+                Every world still exits early once its impulses change by less than ``mf_gs_parallel_tol``.
+                The environment variable ``FEATHER_PGS_PATCH_PARALLEL_SWEEPS`` (a positive count or ``auto``)
+                overrides the argument. ``get_path_selection()`` reports each tier's budget under
+                ``routes.sweep.tiers``. Experimental. Defaults to None.
             mf_gs_parallel_nesterov (bool, optional): Apply Nesterov momentum to the parallel sweeps.
             mf_gs_parallel_tol (float, optional): Relative impulse change below which the parallel sweep exits early.
             mf_gs_parallel_matrix_free (bool, optional): Parallel sweep without the response block (per sweep
@@ -2280,6 +2295,14 @@ class SolverFeatherPGS(SolverBase):
         self.velocity_limit_law = check_velocity_limit_law(
             os.environ.get("FEATHER_PGS_VELOCITY_LIMIT_LAW") or velocity_limit_law
         )
+        # FEATHER_PGS_PATCH_PARALLEL_SWEEPS overrides the argument, so recipes set the linked tiers' budget.
+        requested_linked_sweeps = _linked_sweeps_request(mf_gs_parallel_linked_sweeps, "mf_gs_parallel_linked_sweeps")
+        environment_linked_sweeps = os.environ.get("FEATHER_PGS_PATCH_PARALLEL_SWEEPS")
+        self.mf_gs_parallel_linked_sweeps = (
+            _linked_sweeps_request(environment_linked_sweeps, "FEATHER_PGS_PATCH_PARALLEL_SWEEPS")
+            if environment_linked_sweeps
+            else requested_linked_sweeps
+        )
         # Options whose effective value an IL_NEWTON_FPGS_* alias or a FEATHER_PGS_* override changed;
         # get_path_selection() reports their source as "environment".
         argument_decay = requested_pgs_decay if pgs_warmstart or not mf_warmstart else float(mf_warmstart_decay)
@@ -2291,6 +2314,7 @@ class SolverFeatherPGS(SolverBase):
                 ("pgs_warmstart", self.pgs_warmstart != (bool(pgs_warmstart) or bool(mf_warmstart))),
                 ("pgs_warmstart_decay", self.pgs_warmstart_decay != argument_decay),
                 ("velocity_limit_law", self.velocity_limit_law != velocity_limit_law),
+                ("mf_gs_parallel_linked_sweeps", self.mf_gs_parallel_linked_sweeps != requested_linked_sweeps),
             )
             if changed
         )
@@ -7783,7 +7807,8 @@ class SolverFeatherPGS(SolverBase):
                     self._tier_count_views = [self._tier_counts[t : t + 1] for t in range(len(tiers))]
                     self._tier_world_views = [self._tier_worlds[t] for t in range(len(tiers))]
                     self._tier_blocks = int(min(self.world_count, _TIER_BLOCKS))
-                for tier_index, (rows_, min_rows_) in enumerate(tiers):
+                tier_sweeps, self._par_sweeps_rule, self._par_sweeps_reason = self._parallel_tier_sweeps(tiers)
+                for tier_index, ((rows_, min_rows_), sweeps_) in enumerate(zip(tiers, tier_sweeps, strict=True)):
                     self._pgs_solve_mf_gs_incremental_kernels.append(
                         parallel_factory(
                             self.dense_max_constraints,
@@ -7791,7 +7816,7 @@ class SolverFeatherPGS(SolverBase):
                             self.max_world_dofs,
                             device_arch,
                             rows=rows_,
-                            sweeps=self.mf_gs_parallel_sweeps,
+                            sweeps=sweeps_,
                             nesterov=self.mf_gs_parallel_nesterov,
                             min_rows=min_rows_,
                             tol=self.mf_gs_parallel_tol,
@@ -7816,7 +7841,7 @@ class SolverFeatherPGS(SolverBase):
                             self.max_world_dofs,
                             device_arch,
                             rows=rows_,
-                            sweeps=self.mf_gs_parallel_sweeps,
+                            sweeps=sweeps_,
                             nesterov=self.mf_gs_parallel_nesterov,
                             min_rows=min_rows_,
                             tol=self.mf_gs_parallel_tol,
@@ -16283,6 +16308,37 @@ class SolverFeatherPGS(SolverBase):
             and self._friction_anchors_enabled
             and self.enable_joint_velocity_limits
         )
+
+    def _parallel_tier_sweeps(self, tiers) -> tuple[list[int], str, str]:
+        """Return each parallel tier's sweep budget, the rule that set it, and why (``routes.sweep.tiers``).
+
+        ``tiers`` lists ``(rows, min_rows)`` per tier. Point tiers sweep
+        ``mf_gs_parallel_sweeps``. Linked (patch) tiers sweep ``mf_gs_parallel_linked_sweeps``
+        when it is set; under ``"auto"`` each takes :func:`_auto_linked_sweeps` of its row
+        bound. Every world still exits early at ``mf_gs_parallel_tol``.
+        """
+        sweeps = int(self.mf_gs_parallel_sweeps)
+        linked = self.mf_gs_parallel_linked_sweeps
+        if not self._friction_anchors_enabled:
+            reason = "Point tiers sweep mf_gs_parallel_sweeps; mf_gs_parallel_linked_sweeps budgets linked tiers only."
+            return [sweeps] * len(tiers), "mf_gs_parallel_sweeps", reason
+        if linked is None:
+            reason = "Linked tiers sweep mf_gs_parallel_sweeps: mf_gs_parallel_linked_sweeps is unset."
+            return [sweeps] * len(tiers), "mf_gs_parallel_sweeps", reason
+        source = (
+            "FEATHER_PGS_PATCH_PARALLEL_SWEEPS"
+            if "mf_gs_parallel_linked_sweeps" in self._environment_options
+            else "mf_gs_parallel_linked_sweeps"
+        )
+        if linked != "auto":
+            return [int(linked)] * len(tiers), "mf_gs_parallel_linked_sweeps", f"{source}={int(linked)}."
+        reason = (
+            f"{source}='auto': a linked tier serving up to R rows sweeps "
+            f"ceil({_LINKED_SWEEPS_PER_ITERATION} * pgs_iterations * sqrt(R / 32)) times with "
+            f"pgs_iterations={int(self.pgs_iterations)}, within [mf_gs_parallel_sweeps={sweeps}, "
+            f"{_LINKED_SWEEPS_CAP}]; every world exits early at mf_gs_parallel_tol."
+        )
+        return [_auto_linked_sweeps(rows, self.pgs_iterations, sweeps) for rows, _ in tiers], "auto", reason
 
     def _velocity_limit_sweep_law(self) -> tuple[str | None, str]:
         """Return the law the matrix-free sweep kernels give velocity-limit rows, and why.
@@ -28004,6 +28060,40 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_incremental_template)
 
 
+# mf_gs_parallel_linked_sweeps="auto": the budget grows with the serial sweep's iteration count, whose accuracy the
+# linked tiers must match, and with the square root of a tier's row bound, as Jacobi sweeps with momentum need more
+# passes where more rows couple through one body. The factor is fitted to the measured row-bucket accuracy of the
+# linked tiers against the serial sweep on contact-rich workloads at 8 and 12 iterations; probe data may refit it.
+_LINKED_SWEEPS_PER_ITERATION = 3
+_LINKED_SWEEPS_CAP = 128
+
+
+def _linked_sweeps_request(value, name: str) -> int | str | None:
+    """Validate a linked-tier sweep request: ``None``, ``"auto"`` or a positive count (decimal text included)."""
+    if value is None or value == "auto":
+        return value
+    count = value
+    if isinstance(value, str):
+        try:
+            count = int(value)
+        except ValueError:
+            count = None
+    if isinstance(count, bool) or not isinstance(count, (int, np.integer)) or count < 1:
+        raise ValueError(f"{name} must be None, 'auto' or a positive sweep count, got {value!r}")
+    return int(count)
+
+
+def _auto_linked_sweeps(rows: int, iterations: int, sweeps: int) -> int:
+    """The ``"auto"`` sweep budget of a linked tier serving up to ``rows`` rows.
+
+    ``ceil(3 * iterations * sqrt(rows / 32))``, at least ``sweeps`` (``mf_gs_parallel_sweeps``)
+    and at most 128. The ceiling is exact: the least ``n`` with ``32 n^2 >= (3 iterations)^2 rows``.
+    """
+    square = -(-((_LINKED_SWEEPS_PER_ITERATION * int(iterations)) ** 2 * int(rows)) // 32)
+    raw = math.isqrt(square - 1) + 1 if square > 0 else 0
+    return max(int(sweeps), min(raw, _LINKED_SWEEPS_CAP))
+
+
 def _parallel_register_whitening_mode(
     *,
     enabled: bool,
@@ -29084,6 +29174,7 @@ def _get_pgs_solve_parallel_kernel(
     kernel._fpgs_linked_rows = bool(linked_rows)  # recorded as routes.sweep.tiers.linked_rows
     kernel._fpgs_pair_step = pair_step  # recorded as routes.sweep.tiers.pair_step
     kernel._fpgs_velocity_limit_pass = velocity_limit_pass  # recorded as routes.sweep.tiers.velocity_limit_pass
+    kernel._fpgs_sweeps = NSWEEPS  # recorded as routes.sweep.tiers.tiers[i].sweeps
     return kernel
 
 
