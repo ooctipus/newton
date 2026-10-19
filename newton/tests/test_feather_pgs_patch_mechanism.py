@@ -4092,9 +4092,11 @@ def run_captured_contact_writes(test, device):
 def run_captured_entry_filter(test, device, replays):
     """Keep patch pairs across substeps of a coupled entry's filtered contacts, sorting after each filter pass.
 
-    A graph collides, filters the contacts for a coupled entry and builds the
-    patch frame of the filtered buffer twice, as an entry's substeps do; replays
-    match an always-sort patch state bitwise.
+    A graph holds two collision passes. Each collides, filters the contacts for
+    a coupled entry and builds the patch frame of the filtered buffer twice, as
+    an entry's substeps do. The collision pass notes a write of its own buffer
+    only, so the filter's note alone makes the second pass sort. Replays match
+    an always-sort patch state bitwise.
     """
     from newton.solvers import SolverSemiImplicit  # noqa: PLC0415
     from newton.solvers.experimental.coupled import SolverCoupled  # noqa: PLC0415
@@ -4121,30 +4123,34 @@ def run_captured_entry_filter(test, device, replays):
     plain = _FrictionPatchState(model, 128, True, phi[0])
     patches = _FrictionPatchState(model, 128, True, phi[1], reuse_frames=True)
 
-    def entry_substeps(states):
-        pipeline.collide(state, contacts)
-        filtered = coupled.entry_contacts("boxes", contacts)
-        for substep in range(2):
-            for patch_state in states:
-                patch_state.build(model, state, filtered)
-                patch_state.store(state)
-            if substep == 0:
-                wp.launch(_nudge_poses, dim=model.body_count, inputs=[state.body_q, 1.0e-4], device=device)
+    def entry_passes(states, passes=2):
+        """Collide, filter and build twice per pass; the poses move up in a pass and back in the next."""
+        for index in range(passes):
+            pipeline.collide(state, contacts)
+            filtered = coupled.entry_contacts("boxes", contacts)
+            for substep in range(2):
+                for patch_state in states:
+                    patch_state.build(model, state, filtered)
+                    patch_state.store(state)
+                if substep == 0:
+                    step = 1.0e-4 if index % 2 == 0 else -1.0e-4
+                    wp.launch(_nudge_poses, dim=model.body_count, inputs=[state.body_q, step], device=device)
         return filtered
 
-    filtered = entry_substeps((plain, patches))
+    filtered = entry_passes((plain, patches), passes=1)
     test.assertIsNot(filtered, contacts)
     test.assertGreater(int(filtered.rigid_contact_count.numpy()[0]), 0, "the boxes must touch the ground")
     outcomes = _admitted_modes(patches)
     with _capture_without_nodes(None, device) as capture:
-        entry_substeps((patches,))
-    test.assertEqual(outcomes, ["sort", "keep"])
+        entry_passes((patches,))
+    test.assertEqual(outcomes, ["sort", "keep", "sort", "keep"])
     for replay in range(replays):
         before = wp.clone(state.body_q)
         wp.capture_launch(capture.graph)
         state.body_q.assign(before)
-        entry_substeps((plain,))
+        entry_passes((plain,))
         assert_same_state(patches, plain, f"replay {replay}", records=False)
+        test.assertGreater(int(filtered.rigid_contact_count.numpy()[0]), 0, f"replay {replay}: the boxes must touch")
     test.assertEqual(int(patches.frame_status.numpy()[0]), 0)
 
 
