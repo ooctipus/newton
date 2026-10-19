@@ -387,6 +387,18 @@ def _solver_factory_calls():
         kwargs = {"skip_incremental_rows": skip_rows, "has_drive_rows": drives, "velocity_limit_law": "accumulated"}
         factory = solver._get_pgs_solve_mf_gs_kernel.__wrapped__
         yield name + "_get_pgs_solve_mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
+    # The resident row metadata cases above, under the accumulated law.
+    for drives in (False, True):
+        kwargs = {
+            "shared_metadata": False,
+            "resident_row_metadata": True,
+            "has_drive_rows": drives,
+            "has_dense_velocity_limit_rows": drives,
+            "skip_incremental_rows": 0 if drives else 32,
+            "velocity_limit_law": "accumulated",
+        }
+        factory = solver._get_pgs_solve_mf_gs_kernel.__wrapped__
+        yield name + "_get_pgs_solve_mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
     for tier, drives, local in itertools.product(((32, 0), (64, 32)), *([(False, True)] * 2)):
         kwargs = {
             "incremental_rows": tier[0],
@@ -820,6 +832,9 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
                 "response_block_sweep.get_response_block_sweep_warp_kernel",
             },
         )
+        # The MF-GS kernels that keep row metadata resident are pinned under both laws.
+        resident = [name for name in self.current if "resident_row_metadata=True" in name]
+        self.assertEqual({"velocity_limit_law='accumulated'" in name for name in resident}, {False, True})
         # The patch-only linked tiers are pinned beside the point tiers they extend.
         linked = [name for name in self.current if "linked_rows=True" in name]
         self.assertTrue(linked)
