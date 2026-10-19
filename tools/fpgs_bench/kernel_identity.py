@@ -29,9 +29,11 @@ kernel, builds each kernel as a fresh process would, and runs with
 ``PYTHONHASHSEED=0``.
 
 The inventory is the point-stream pin inventory, the factory variants those
-pins do not reach (:func:`factory_calls`) and a held-tree layout grid
-(:func:`held_tree_calls`). Nothing is compiled and no device is needed; a full
-record takes about half a minute on the CPU.
+pins do not reach (:func:`factory_calls`), a held-tree layout grid
+(:func:`held_tree_calls`) and a census of every flag combination of the sweep
+factories that vote an exit (:func:`census_calls`), recorded by hash only.
+Nothing is compiled and no device is needed; a full record takes about a
+minute and a half on the CPU, the census about a minute of it.
 
 Run from the root of a Newton checkout with the import-time switches
 (``FEATHER_PGS_*``) unset::
@@ -45,7 +47,10 @@ of the parent commit, so one copy of this script records both sides.
 """
 
 import argparse
+import collections
+import dataclasses
 import hashlib
+import inspect
 import itertools
 import json
 import os
@@ -55,7 +60,7 @@ import time
 from pathlib import Path
 
 ARCH = "120"
-FAMILIES = ("pins", "factories", "held_tree")
+FAMILIES = ("pins", "factories", "held_tree", "census")
 COLUMNS = ("hash", "cuda", "cpu")
 # Import-time switches select other generated kernels (environment_flags.PREFIXES).
 SWITCH_PREFIXES = ("FEATHER_PGS_", "IL_NEWTON_FPGS_")
@@ -417,6 +422,250 @@ def held_tree_calls():
                 yield "tree_kinetic_state.get_predictor_kernel", predictor, (chain,), kwargs
 
 
+def _axis(name, values=(False, True)):
+    """One census axis: a keyword over its values."""
+    return tuple({name: value} for value in values)
+
+
+def _combinations(axes):
+    """Merge one option of every axis, for every combination of options."""
+    for options in itertools.product(*axes):
+        merged = {}
+        for option in options:
+            merged.update(option)
+        yield merged
+
+
+def census_calls():
+    """Yield ``(name, factory, args, kwargs)`` for every flag combination of the sweep factories that vote an exit.
+
+    A rewrite of these factories' friction-law splices and exit votes, or of
+    the matrix-free Gauss-Seidel generator's text rewrites, can be exact for
+    each flag alone and still change a combination of flags. The census takes
+    the product of each factory's flags at fixed shapes: matrix-free
+    Gauss-Seidel (one shape within a warp's width of coordinates, one beyond
+    it), sparse (one shape small enough for subwarp sweeps), paired factor,
+    local owners plain and over packet rows, sparse diagonal, incremental,
+    parallel and keyed parallel tiers, and the response-block sweeps. The
+    held-coordinate bindings of ``mf_gs_source.get_source``, which no factory
+    passes, are hashed as text.
+    """
+    from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
+        keyed_rows,
+        mf_gs_source,
+        response_block_sweep,
+        row_packets,
+    )
+    from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel  # noqa: PLC0415
+
+    name = "solver_feather_pgs."
+    mf_gs = (
+        _axis("friction_mode", ("current", "bisection", "bisection_desaxce", "coulomb_newton")),
+        _axis("software_pipeline", (True, False)),
+        _axis("shared_metadata", (True, False)),
+        _axis("stream_mf_impulses"),
+        _axis("has_drive_rows", (True, False)),
+        _axis("has_dense_velocity_limit_rows", (True, False)),
+        _axis("fuse_vel_limits"),
+        ({}, {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
+        _axis("contact_torsion"),
+        _axis("factor_coordinates"),
+        _axis("skip_incremental_rows", (0, 32)),
+        _axis("skip_response_block"),
+        _axis("independent_components"),
+        _axis("dense_support_tiles"),
+        _axis("stage_velocities"),
+    )
+    local = (
+        _axis("paired_dof_count", (0, 6)),
+        _axis("persistent_queue"),
+        _axis("warps_per_block", (1, 2)),
+        _axis("lanes_per_world", (32, 16, 8)),
+        _axis("contact_capable", (True, False)),
+        ({}, {"mf_max_constraints": 64, "local_mf_max_constraints": 12}),
+        _axis("dense_response_matrix"),
+    )
+    keyed = KeyedLayout(16, 6, 0, 16, 128, False, 0)
+    specs = (
+        (
+            name + "_get_pgs_solve_mf_gs_kernel",
+            solver._get_pgs_solve_mf_gs_kernel,
+            ((64, 32, 12, ARCH), (192, 64, 40, ARCH)),
+            mf_gs,
+        ),
+        (
+            "mf_gs_source.get_source",
+            mf_gs_source.get_source,
+            ((192, 64, 29, ARCH),),
+            (
+                ({"factor_coordinates": True, "has_drive_rows": False, "has_dense_velocity_limit_rows": False},),
+                _axis("independent_components"),
+                _axis(
+                    "held_policy", (None, Named("held_policy", ("/* entry */", "/* staging */", "/* publication */")))
+                ),
+                _axis("shared_arena"),
+                _axis("cpu_body", ("", "/* scalar recurrence */")),
+            ),
+        ),
+        (
+            "sparse_pgs._get_pgs_solve_sparse_kernel",
+            _get_pgs_solve_sparse_kernel,
+            ((48, 18, 12), (32, 8, 8)),
+            (
+                ({}, {"mf_max_constraints": 32, "free_row_dofs": 6}),
+                _axis("active_rows"),
+                _axis("use_support_table"),
+                _axis("contact_triplets"),
+                _axis("velocity_limits"),
+                _axis("lanes_per_world", (32, 16, 8)),
+                _axis("local_factors"),
+                _axis("warm_start"),
+                _axis("linked_rows"),
+            ),
+        ),
+        (
+            name + "_get_pgs_solve_paired_factor_kernel",
+            solver._get_pgs_solve_paired_factor_kernel,
+            ((192, 29, 23, 6, ARCH),),
+            (_axis("contact_triples"), _axis("independent_components"), _axis("contact_units")),
+        ),
+        (
+            name + "_get_pgs_solve_local_owned_kernel",
+            solver._get_pgs_solve_local_owned_kernel,
+            ((192, 20, 9, ARCH),),
+            local,
+        ),
+        (
+            "row_packets.get_local_factory(9, 6, 40)",
+            row_packets.get_local_factory.__wrapped__(9, 6, 40),
+            ((192, 20, 9, ARCH),),
+            local,
+        ),
+        (
+            name + "_get_pgs_solve_sparse_diagonal_kernel",
+            solver._get_pgs_solve_sparse_diagonal_kernel,
+            ((64, 10, 9, ARCH),),
+            (_axis("contact_triples"), _axis("speculative_contact_batches"), _axis("contact_units")),
+        ),
+        (
+            name + "_get_pgs_solve_mf_gs_incremental_kernel",
+            solver._get_pgs_solve_mf_gs_incremental_kernel,
+            ((64, 32, 12, ARCH),),
+            (
+                ({"incremental_rows": 32}, {"incremental_rows": 64, "min_rows": 32}),
+                _axis("has_drive_rows", (True, False)),
+                _axis("has_dense_velocity_limit_rows", (True, False)),
+                _axis("skip_local_internal_worlds"),
+            ),
+        ),
+        (
+            name + "_get_pgs_solve_parallel_kernel",
+            solver._get_pgs_solve_parallel_kernel,
+            ((192, 32, 18, ARCH),),
+            (
+                tuple({"rows": rows, "min_rows": low, "sweeps": 24} for rows, low in ((32, 0), (48, 32), (128, 96))),
+                _axis("nesterov", (True, False)),
+                _axis("matrix_free"),
+                _axis("has_drive_rows"),
+                _axis("has_dense_velocity_limit_rows"),
+                _axis("skip_local_internal_worlds"),
+                _axis("inkernel_response", (None, (18, 0, 0, 0))),
+                _axis("exact_row_sums"),
+                _axis("world_rows"),
+                _axis("lean_sweep"),
+                _axis("bound_finger"),
+                _axis("linked_rows"),
+            ),
+        ),
+        (
+            f"keyed_rows.get_parallel_factory({keyed!r})",
+            keyed_rows.get_parallel_factory.__wrapped__(solver._get_pgs_solve_parallel_kernel, keyed),
+            ((128, 32, 22, ARCH),),
+            (
+                tuple(
+                    {
+                        "rows": rows,
+                        "min_rows": low,
+                        "sweeps": 24,
+                        "matrix_free": True,
+                        "inkernel_response": (16, 6, 0, 16),
+                    }
+                    for rows, low in ((32, 0), (64, 32), (96, 64), (128, 96))
+                ),
+                _axis("nesterov", (True, False)),
+                _axis("exact_row_sums"),
+                _axis("has_drive_rows"),
+                _axis("skip_local_internal_worlds"),
+                _axis("linked_rows"),
+            ),
+        ),
+        (
+            "response_block_sweep.get_response_block_sweep_lane_kernel",
+            response_block_sweep.get_response_block_sweep_lane_kernel,
+            ((192, 64, 22),),
+            (_axis("lane_rows", (8, 16)), _axis("has_drive_rows")),
+        ),
+        (
+            "response_block_sweep.get_response_block_sweep_warp_kernel",
+            response_block_sweep.get_response_block_sweep_warp_kernel,
+            ((192, 64, 22),),
+            (_axis("rows", (32, 64)), _axis("lane_rows", (16,)), _axis("has_drive_rows")),
+        ),
+    )
+    for factory_name, cached, shapes, axes in specs:
+        factory = _unwrapped(cached)
+        for args, kwargs in itertools.product(shapes, _combinations(axes)):
+            yield factory_name, factory, args, kwargs
+
+
+def census(select=(), skip=()):
+    """Return ``({label: row}, {factory: rejection summary})`` for :func:`census_calls`, by hash only.
+
+    Code digests of its thousands of variants would take minutes, and an
+    unchanged hash proves the code unchanged. Labels omit keywords given at a
+    factory's default; calls labeled in ``skip`` are left to the families that
+    recorded them. Rejected combinations are summarized per factory by count,
+    messages and a digest of their labels, so that a change of admission shows
+    in a diff as a changed rejection.
+    """
+    import warp as wp  # noqa: PLC0415
+
+    rows, rejected, defaults = {}, {}, {}
+    for name, factory, args, options in census_calls():
+        if id(factory) not in defaults:
+            parameters = inspect.signature(factory).parameters.values()
+            defaults[id(factory)] = {p.name: p.default for p in parameters if p.default is not p.empty}
+        kwargs = {
+            key: value
+            for key, value in options.items()
+            if key not in defaults[id(factory)] or _value(value) != defaults[id(factory)][key]
+        }
+        key = label(name, args, kwargs)
+        if key in skip or key in rows or (select and not any(text in key for text in select)):
+            continue
+        try:
+            built = factory(*map(_value, args), **{k: _value(v) for k, v in kwargs.items()})
+        except (ValueError, NotImplementedError, RuntimeError, AssertionError) as error:
+            # Generators also refuse a combination when a source seam guard fails.
+            rejected.setdefault(name, []).append((key, f"{type(error).__name__}: {error}"))
+            continue
+        if isinstance(built, wp.Kernel):
+            rows[key] = {"family": "census", **kernel_digests(built, codegen=False)}
+        else:
+            # Generated source text (mf_gs_source.GeneratedSource).
+            rows[key] = {"family": "census", "key": name, "hash": digest(json.dumps(dataclasses.astuple(built)))}
+    summaries = {}
+    for name, entries in rejected.items():
+        messages = collections.Counter(message for _, message in entries)
+        listed = "; ".join(f"{count} x {message}" for message, count in sorted(messages.items()))
+        summaries[f"{name} [census]"] = (
+            f"{len(entries)} rejected, labels {digest(json.dumps(sorted(entries)))[:16]}: {listed}"
+        )
+    return rows, summaries
+
+
 def _switches():
     return sorted(name for name in os.environ if name.startswith(SWITCH_PREFIXES))
 
@@ -434,7 +683,7 @@ def _import_newton(root):
 
 
 def inventory(families, select=()):
-    """Return ``({label: (family, kernel)}, {label: rejection})`` for the chosen families."""
+    """Return ``({label: (family, kernel)}, {label: rejection})`` for the chosen families but the census."""
     import warp as wp  # noqa: PLC0415
 
     kernels, rejected = {}, {}
@@ -528,6 +777,10 @@ def record(path, *, root=None, families=FAMILIES, select=(), codegen=True, allow
     for key in sorted(kernels):
         family, kernel = kernels[key]
         rows[key] = {"family": family, **kernel_digests(kernel, codegen=codegen)}
+    if "census" in families:
+        variants, summaries = census(select, skip=rows.keys())
+        rows = dict(sorted({**rows, **variants}.items()))
+        rejected.update(summaries)
     result = {
         "warp": wp.config.version,
         "newton": str(package),
@@ -618,7 +871,9 @@ def main(argv=None):
     record_parser.add_argument("--root", help="Newton checkout to import (default: the one holding this script)")
     record_parser.add_argument("--family", action="append", choices=FAMILIES, help="restrict to these families")
     record_parser.add_argument("--select", action="append", default=[], help="keep labels containing this text")
-    record_parser.add_argument("--hash-only", action="store_true", help="skip the generated code digests")
+    record_parser.add_argument(
+        "--hash-only", action="store_true", help="skip the generated code digests (the census never records them)"
+    )
     record_parser.add_argument("--allow-switches", action="store_true", help="record under FEATHER_PGS_* switches")
     diff_parser = commands.add_parser("diff", help="compare two records")
     diff_parser.add_argument("parent")

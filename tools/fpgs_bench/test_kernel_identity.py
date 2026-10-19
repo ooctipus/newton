@@ -119,6 +119,41 @@ class TestKernelIdentity(unittest.TestCase):
         expected = {(16, 40, False), (6, 21, False), (9, 86, True), (6, 86, True), (23, 222, True), (6, 222, True)}
         self.assertEqual(observed, expected)
 
+    def test_combinations_take_one_option_of_every_axis(self):
+        """Merge one option of every census axis, for every combination of options."""
+        axes = (identity._axis("a"), ({}, {"b": 1, "c": 2}))
+        self.assertEqual(
+            list(identity._combinations(axes)),
+            [{"a": False}, {"a": False, "b": 1, "c": 2}, {"a": True}, {"a": True, "b": 1, "c": 2}],
+        )
+
+    def test_census_hashes_admitted_combinations_and_summarizes_rejections(self):
+        """Hash every admitted flag combination of a factory, labeled by its non-default flags; count rejections."""
+        rows, rejected = identity.census(("_get_pgs_solve_paired_factor_kernel",))
+        self.assertEqual(len(rows), 6)
+        self.assertIn("solver_feather_pgs._get_pgs_solve_paired_factor_kernel(192, 29, 23, 6, '120')", rows)
+        self.assertTrue(
+            all(set(row) == {"family", "key", "hash"} and row["family"] == "census" for row in rows.values())
+        )
+        self.assertEqual(list(rejected), ["solver_feather_pgs._get_pgs_solve_paired_factor_kernel [census]"])
+        self.assertRegex(next(iter(rejected.values())), r"^2 rejected, labels [0-9a-f]{16}: 2 x ValueError: ")
+        # A call another family records keeps its code digests there.
+        skipped, _ = identity.census(("_get_pgs_solve_paired_factor_kernel",), skip=rows.keys())
+        self.assertEqual(skipped, {})
+
+    def test_census_hashes_generated_source_text(self):
+        """Hash the held-coordinate bindings of the matrix-free generator, which no factory passes, as text."""
+        import dataclasses  # noqa: PLC0415
+
+        from newton._src.solvers.feather_pgs import mf_gs_source  # noqa: PLC0415
+
+        rows, _ = identity.census(("mf_gs_source.get_source",))
+        recipe = {"factor_coordinates": True, "has_drive_rows": False, "has_dense_velocity_limit_rows": False}
+        source = mf_gs_source.get_source(192, 64, 29, "120", **recipe)
+        key = identity.label("mf_gs_source.get_source", (192, 64, 29, "120"), recipe)
+        self.assertEqual(rows[key]["hash"], identity.digest(json.dumps(dataclasses.astuple(source))))
+        self.assertTrue(any("held_policy=held_policy" in key for key in rows))
+
     def test_label_names_calls_like_the_pins(self):
         """Label calls with positional values, sorted keywords and named layouts."""
         layout = identity.Named("chain9", object())
