@@ -291,6 +291,8 @@
   "solver_feather_pgs._get_pgs_solve_mf_gs_kernel(64, 32, 12, '120', has_dense_velocity_limit_rows=False, has_drive_rows=False, resident_row_metadata=True, shared_metadata=False, skip_incremental_rows=32)": "dd6d96e1b61e88cbce56612dce890e61134ac21e2c832e40859e8a092732465e",
   "solver_feather_pgs._get_pgs_solve_mf_gs_kernel(64, 32, 12, '120', has_dense_velocity_limit_rows=True, has_drive_rows=True, resident_row_metadata=True, shared_metadata=False, skip_incremental_rows=0)": "ceb61c600bc24ab45a6397c2408fa69957b4e205eeeb5a8224c7ba6da9558e2f",
   "solver_feather_pgs._get_pgs_solve_mf_gs_kernel(72, 32, 18, '120', has_dense_velocity_limit_rows=False, has_drive_rows=False, skip_incremental_rows=48)": "600eeb1a9efbdff02733758b2e96cc789977d839a28bac05da3631d766b37dbb",
+  "solver_feather_pgs._get_pgs_solve_mf_kernel(32, 64, '120', has_velocity_limit_rows=False)": "3cbb0e6615e62183dcb0f42f42a0827d52b7abe50d27c80aeb0fc83cc8fd18e8",
+  "solver_feather_pgs._get_pgs_solve_mf_kernel(32, 64, '120', has_velocity_limit_rows=True)": "13c9d1c84bde6d02038098fc0674bad8b4cb5a0e7ab3a5dc62048a000ac29b98",
   "solver_feather_pgs._get_pgs_solve_mf_kernel(32, 8, '120')": "81b51f642dc2a083360b103cc6f9a68d10482228f2bff15fc09f947a1560c01a",
   "solver_feather_pgs._get_pgs_solve_paired_factor_kernel(192, 29, 23, 6, '120', False, False)": "fca35acd5252d38109ec1389c97d01f908a58c27c1f77a730b2c585acf14cfa7",
   "solver_feather_pgs._get_pgs_solve_paired_factor_kernel(192, 29, 23, 6, '120', False, False, contact_units=True)": "54844c876c3aa2775564c071d527d8e92c672ff3fdc7d17204e8fed6b6bcdabd",

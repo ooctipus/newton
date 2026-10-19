@@ -334,6 +334,11 @@ def _solver_factory_calls():
         }
         factory = solver._get_pgs_solve_mf_gs_kernel.__wrapped__
         yield name + "_get_pgs_solve_mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
+    # The split free-body sweep, with and without the free-body velocity-limit law.
+    for velocity_limits in (False, True):
+        factory = solver._get_pgs_solve_mf_kernel.__wrapped__
+        kwargs = {"has_velocity_limit_rows": velocity_limits}
+        yield name + "_get_pgs_solve_mf_kernel", factory, (32, 64, _ARCH), kwargs
     for triples, components in itertools.product((False, True), repeat=2):
         factory = solver._get_pgs_solve_paired_factor_kernel.__wrapped__
         yield name + "_get_pgs_solve_paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, triples, components), {}
