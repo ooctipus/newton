@@ -1424,7 +1424,7 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
         left unforced (one-pass repairs, then the one-pass repair that compares banks) and a
         motion-velocity owner forced alike (its one-pass motion repair every time). Every held-tree
         launch, those at construction included, is checked before it runs, and every kernel each
-        owner bound must have run.
+        group bound must have run in a launch of that group's cache.
         """
         device = wp.get_device(device)
         launched = []
@@ -1432,9 +1432,10 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
         def checked(launch):
             def launch_checked(kernel, *args, **kwargs):
                 if kernel.key.startswith("tree_kinetic_"):
+                    inputs = kwargs.get("inputs", ())
                     # Checked before the launch: Warp would run a struct passed in another struct's place.
-                    self.assertEqual(_input_mismatches(kernel, kwargs.get("inputs", ())), [], kernel.key)
-                    launched.append(kernel)
+                    self.assertEqual(_input_mismatches(kernel, inputs), [], kernel.key)
+                    launched.append((kernel, inputs))
                 return launch(kernel, *args, **kwargs)
 
             return launch_checked
@@ -1454,24 +1455,23 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                     solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
                     solver.enable_joint_velocity_limits = motion
                     owner = MixedTreeKineticState(solver)
-                    kinds = {}
+                    groups = []
                     for group in owner.groups:
                         if forced:
                             _force_classification(group)
                         self.assertEqual(group.classify_first, forced and not motion)
-                        kinds.update(
-                            {
-                                group.repair_kernel: "repair",
-                                group.finish_kernel: "finish",
-                                group.predictor_kernel: "predict",
-                                group.classify_kernel: "classify",
-                                group.bank_kernel: "bank",
-                                group.listed_repair_kernel: "listed",
-                                group.bank_repair_kernel: "bank_repair",
-                            }
-                        )
-                    kinds.pop(None, None)
-                    self.assertEqual(set(kinds.values()), {"repair", "finish", "predict", *bound})
+                        kernels = {
+                            group.repair_kernel: "repair",
+                            group.finish_kernel: "finish",
+                            group.predictor_kernel: "predict",
+                            group.classify_kernel: "classify",
+                            group.bank_kernel: "bank",
+                            group.listed_repair_kernel: "listed",
+                            group.bank_repair_kernel: "bank_repair",
+                        }
+                        kernels.pop(None, None)
+                        self.assertEqual(sorted(kernels.values()), sorted({"repair", "finish", "predict", *bound}))
+                        groups.append((group, kernels))
                     states, control = [model.state(), model.state()], model.control()
                     solver._last_step_dt = DT
                     augmented = solver._prepare_augmented_state(states[0], states[1], control)
@@ -1491,7 +1491,12 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                     coordinates[0] += np.float32(0.01)
                     states[1].joint_q.assign(coordinates)
                     owner.begin(states[1], augmented, velocities[1], DT, False, state_out=states[0])
-                    self.assertEqual({kinds[kernel] for kernel in launched if kernel in kinds}, set(kinds.values()))
+                    # Checked per group, by the cache each held-tree launch passes: the owner holds two groups (a
+                    # free body and an arm), and every kind would still run with one group's classified forms skipped.
+                    for group, kernels in groups:
+                        ran = {kernel for kernel, inputs in launched if any(value is group.data for value in inputs)}
+                        unlaunched = sorted(kind for kernel, kind in kernels.items() if kernel not in ran)
+                        self.assertEqual(unlaunched, [], f"group of {group.layout.bodies} bodies")
                     if motion:
                         self.assertTrue(all("_motion" in group.repair_kernel.key for group in owner.groups))
 
