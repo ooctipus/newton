@@ -9,7 +9,11 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.solve_policy import TRACE_GRID
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
+
+TOLERANCE = TRACE_GRID[8]
+"""The velocity tolerance of the tests, 1e-3 [m/s or rad/s], a point of the trace's grid."""
 
 
 def _build(device, worlds=8):
@@ -127,13 +131,19 @@ class TestFeatherPGSSparseTolerance(unittest.TestCase):
             self._rollout(8, relative_tolerance=1.0)
 
     def test_velocity_tolerance_stops_earlier_near_the_exact_law(self):
-        """Stay near the exact law in fewer sweeps under a velocity tolerance, with every exit sweep within it."""
+        """Stay near the exact law in fewer sweeps under a velocity tolerance, with every exit sweep within it.
+
+        Over a 12-step rollout a 1e-3 tolerance stays within 1e-2 of the exact law, executes no more
+        sweeps, and stops only on final sweeps within the tolerance. On a first solve, identical in
+        both runs, at a budget of 64 sweeps the tolerance stops each world exactly where the exact
+        law's trace predicts for 1e-3, which is earlier than the exact law.
+        """
         exact, _ = self._rollout(8)
         counted, exact_solver = self._rollout(8, readout="sweeps")
         np.testing.assert_array_equal(counted, exact)
         again, _ = self._rollout(8, velocity_tolerance=0.0, readout="trace")
         np.testing.assert_array_equal(again, exact)
-        loose, solver = self._rollout(8, velocity_tolerance=1.0e-3, readout="trace")
+        loose, solver = self._rollout(8, velocity_tolerance=TOLERANCE, readout="trace")
         self.assertLess(float(np.abs(loose - exact).max()), 1.0e-2)
         law = solver.get_path_selection()["routes"]["sweep"]["exit_law"]
         self.assertEqual((law["law"], list(law["honored"].values())), ("velocity", ["sparse_pgs"]))
@@ -142,11 +152,25 @@ class TestFeatherPGSSparseTolerance(unittest.TestCase):
         self.assertEqual(slot["solves"], exact_slot["solves"])
         self.assertLessEqual(slot["mean_sweeps"], exact_slot["mean_sweeps"])
         trace = slot["trace"]
-        stopped = trace["reasons"]["stationary"] + trace["reasons"]["tolerance"]
-        self.assertGreater(stopped, 0)
-        # A stopped solve's final sweep changed by at most 1e-3 in velocity: magnitude bins up to 10^-2.5.
-        within = sum(sum(entry["bins"][:14]) for entry in trace["final_change"].values())
-        self.assertGreaterEqual(within, stopped)
+        self.assertEqual(sum(trace["reasons"].values()), slot["solves"])
+        # A stopped solve's final sweep changed by at most 1e-3, in magnitude bins below 10^-2.5 (14 and up),
+        # so only solves that ran out of budget reach those bins.
+        beyond = sum(sum(entry["bins"][14:]) for entry in trace["final_change"].values())
+        self.assertLessEqual(beyond, trace["reasons"]["budget"])
+
+        budget = 64
+        _, traced = self._rollout(budget, readout="trace", steps=1)
+        _, stopped = self._rollout(budget, velocity_tolerance=TOLERANCE, readout="trace", steps=1)
+        (predicted,) = traced.get_path_selection()["measurements"]["solve_readout"]["slots"]
+        (actual,) = stopped.get_path_selection()["measurements"]["solve_readout"]["slots"]
+        point = TRACE_GRID.index(TOLERANCE)
+        stops = predicted["trace"]["stops"][point]
+        self.assertEqual(sum(stops), predicted["solves"])
+        np.testing.assert_array_equal(actual["sweeps"][1:budget], stops[1:budget])
+        self.assertEqual(actual["sweeps"][budget], stops[budget] + stops[budget + 1])
+        self.assertEqual(actual["exhausted"], stops[budget + 1])
+        self.assertLess(actual["mean_sweeps"], predicted["mean_sweeps"])
+        self.assertGreater(actual["trace"]["reasons"]["tolerance"], 0)
         with self.assertRaises(ValueError):
             self._rollout(8, velocity_tolerance=-1.0)
 
