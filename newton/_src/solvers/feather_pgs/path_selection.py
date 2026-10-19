@@ -760,8 +760,9 @@ def _tiers(solver) -> dict | None:
             "inkernel_response": solver._ink_sizes is not None,
             # Every built tier projects each friction pair on its patch ring's pooled normal load (patch friction).
             "linked_rows": all(getattr(kernel, "_fpgs_linked_rows", False) for kernel in kernels),
-            # How a friction pair's tangent rows step: one isotropic step (the linked tiers' law, which shares the
-            # serial sweep's fixed point) or each row's own step.
+            # How a friction pair's tangent rows step: one isotropic step (the linked tiers' law, the serial pair
+            # solve's friction law) or each row's own step. routes.friction.parallel_rows says whether the tiers
+            # share the serial sweep's whole fixed point, which also depends on the velocity-limit law.
             "pair_step": "isotropic"
             if all(getattr(kernel, "_fpgs_pair_step", "per_row") == "isotropic" for kernel in kernels)
             else "per_row",

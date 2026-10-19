@@ -1720,8 +1720,9 @@ class SolverFeatherPGS(SolverBase):
                 rows or excess rows retain serial solving. The effective limit is capped at 96 for response-block
                 sweeps or 128 for matrix-free sweeps, and rounded down to a multiple of four. Persistent patch
                 friction keeps the serial kernels unless ``FEATHER_PGS_PATCH_PARALLEL_ROWS=1`` opts it in; each
-                tangent pair then projects on its patch's pooled normal load with one isotropic step, which
-                shares the serial sweep's fixed point.
+                tangent pair then projects on its patch's pooled normal load with one isotropic step, the serial
+                pair solve's friction law. The tiers accumulate joint velocity-limit rows, so they share the serial
+                sweep's fixed point under ``velocity_limit_law="accumulated"`` or without joint velocity limits.
             mf_gs_parallel_sweeps (int, optional): Maximum number of parallel sweeps per launch (early exit when no
                 impulse changes). Independent of ``pgs_iterations``; preserve the sweep allowance when comparing
                 execution speed, and validate convergence separately. The tiers that serve persistent patch
@@ -16260,11 +16261,13 @@ class SolverFeatherPGS(SolverBase):
         row law, so under ``FEATHER_PGS_PATCH_PARALLEL_ROWS=1`` patch friction honors
         ``mf_gs_parallel_rows`` and keyed rows as point friction does. The linked
         tiers step each friction pair isotropically, so a sliding pair converges to
-        the serial pair solve's maximal dissipation and the tiers share the serial
-        sweep's fixed point; with per-row steps they did not, which moved
-        body-velocity RMS by 0.4-0.9% on Allegro and ANYmal flat. The switch stays
-        opt-in until the tiers' accuracy and speed gates pass. By default patch
-        friction keeps its serial sweeps. Torsion and compliance keep ordinary rows.
+        the serial pair solve's maximal dissipation; with per-row steps it did not,
+        which moved body-velocity RMS by 0.4-0.9% on two contact-rich patch-friction
+        workloads. Whether the tiers then share the serial sweep's whole fixed point
+        depends on the joint velocity limits (:meth:`_parallel_velocity_limit_agreement`).
+        The switch stays opt-in until the tiers' accuracy and speed gates pass. By
+        default patch friction keeps its serial sweeps. Torsion and compliance keep
+        ordinary rows.
         """
         if self._point_contact_paths:
             return True, "Point friction: parallel tiers and keyed rows serve it."
@@ -16278,17 +16281,36 @@ class SolverFeatherPGS(SolverBase):
         return True, (
             "Patch friction honors mf_gs_parallel_rows and keyed rows: in the parallel (Jacobi) sweeps each tangent "
             "pair projects on its patch ring's pooled normal load, as point pairs project on their own normal, with "
-            "one isotropic step per pair, so the tiers share the serial sweep's fixed point. "
+            "one isotropic step per pair, the serial pair solve's friction law. "
+            f"{self._parallel_velocity_limit_agreement()} "
             "FEATHER_PGS_PATCH_PARALLEL_ROWS=1 opted in; by default patch friction keeps its serial sweeps."
+        )
+
+    def _parallel_velocity_limit_agreement(self) -> str:
+        """Say whether the parallel tiers share the serial sweep's fixed point at the joint velocity limits.
+
+        Recorded in ``routes.friction.parallel_rows``. The tiers project joint
+        velocity-limit rows as accumulated unilateral rows; the serial sweeps do so
+        only under the accumulated law (``routes.velocity_limits.law``). Under PhysX's
+        stateless clamp the two converge to different velocities wherever a limit
+        binds. The tiers serve dense rows only, so free-body limits do not enter.
+        """
+        if not self.enable_joint_velocity_limits or np.isinf(self.velocity_limit_activation_fraction):
+            return "Without joint velocity-limit rows the tiers share the serial sweep's fixed point."
+        if self._velocity_limit_sweep_law()[0] == "accumulated":
+            return "Both accumulate joint velocity-limit rows, so the tiers share the serial sweep's fixed point."
+        return (
+            "The tiers accumulate joint velocity-limit rows, which the serial sweeps clamp statelessly "
+            "(routes.velocity_limits.law), so their fixed points differ wherever a limit binds."
         )
 
     def _parallel_pair_step(self) -> str:
         """The friction pair step of the parallel tiers (``routes.sweep.tiers.pair_step``).
 
         The linked (patch) tiers always step each pair isotropically: it is their law,
-        and it gives them the serial sweep's fixed point. The point tiers keep per-row
-        steps unless the private experiment ``FEATHER_PGS_POINT_PAIR_STEP=isotropic``
-        opts them in.
+        and it gives a sliding pair the serial pair solve's maximal dissipation. The
+        point tiers keep per-row steps unless the private experiment
+        ``FEATHER_PGS_POINT_PAIR_STEP=isotropic`` opts them in.
         """
         if self._friction_anchors_enabled:
             return "isotropic"
@@ -28173,8 +28195,8 @@ def _get_pgs_solve_parallel_kernel(
     so the radial projection onto the disk follows the step metric ``diag(1 / s)`` of two unequal steps: a sliding
     pair converges to a friction direction turned towards its stiffer tangent, not the serial pair solve's maximal
     dissipation. ``"isotropic"`` gives both rows the smaller of their two steps; the projection is then the
-    projection in the pair's own metric, so a sliding pair converges to maximal dissipation and the tiers share
-    the serial sweep's fixed point. A row keeps its own step when its sibling is not an admitted friction row of
+    projection in the pair's own metric, so a sliding pair converges to maximal dissipation, the serial pair
+    solve's friction law. A row keeps its own step when its sibling is not an admitted friction row of
     the same normal, or when either step is zero (a zero-Jacobian tangent would otherwise freeze its live sibling).
     The default is ``"isotropic"`` for ``linked_rows`` (the patch tier law) and ``"per_row"`` otherwise; an
     isotropic kernel's name gains ``_iso``.
@@ -28191,7 +28213,10 @@ def _get_pgs_solve_parallel_kernel(
 
     Same signature and launch contract as :func:`_get_pgs_solve_mf_gs_kernel`; owns the worlds the legacy kernel
     skips (``skip_incremental_rows = rows``): no matrix-free rows, at most ``rows`` dense rows, no deferred response.
-    Drive and velocity-limit rows are not supported (the solver enables this kernel only without them).
+    Drive rows take the PhysX drive update from tables staged in shared memory (``has_drive_rows``), and
+    velocity-limit rows project as accumulated unilateral rows, like contact normals and position limits. The tiers
+    therefore share the serial sweeps' fixed point only where those accumulate velocity-limit rows too
+    (``velocity_limit_law="accumulated"``).
 
     One warp per world. The warp builds the response block ``A = J Y^T`` once in shared memory, the per-row step
     scales ``w_i = A_ii / sum_j |A_ij|`` (generalised mass splitting, which keeps the parallel iteration from
@@ -29285,7 +29310,8 @@ def _link_parallel_friction_pairs(snippet: str) -> str:
     order from the pair's own normal as the ordered sweeps sum it. The linked tiers
     step each pair isotropically (``pair_step``), so the radial projection onto that
     pooled disk has the serial pair solve's fixed point: the linked tiers and the
-    serial patch sweep share their solution.
+    serial patch sweep share their friction solution, and their whole solution where
+    both accumulate the velocity-limit rows.
     """
     ring = (
         "float load = s_x[p];\n"

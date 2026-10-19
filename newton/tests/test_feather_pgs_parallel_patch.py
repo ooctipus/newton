@@ -19,7 +19,7 @@ import itertools
 import math
 import os
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -939,6 +939,42 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 admitted, reason = SolverFeatherPGS._admit_parallel_contact_paths(other_law)
                 self.assertFalse(admitted)
                 self.assertIn("torsion", reason)
+
+    def test_admission_says_where_the_tiers_share_the_serial_fixed_point(self):
+        """Claim the serial sweep's fixed point for patch tiers only where both accumulate velocity-limit rows.
+
+        The tiers project joint velocity-limit rows as accumulated unilateral rows. The
+        serial sweeps do so only under ``velocity_limit_law="accumulated"`` and outside
+        the PhysX grasp schedule; under the stateless clamp the two converge to
+        different velocities wherever a limit binds, so the reason must not claim a
+        shared fixed point there.
+        """
+        for limits, fraction, law, schedule, shared in (
+            (False, 0.0, "stateless", "interleaved", True),
+            (True, float("inf"), "stateless", "interleaved", True),  # the limits never activate
+            (True, 0.0, "accumulated", "interleaved", True),
+            (True, 0.0, "stateless", "interleaved", False),
+            (True, 0.0, "accumulated", "physx_grasp", False),  # the grasp schedule keeps PhysX's clamp
+        ):
+            probe = SimpleNamespace(
+                _point_contact_paths=False,
+                _law_agnostic_contact_paths=True,
+                pgs_mode="matrix_free",
+                pgs_schedule=schedule,
+                enable_joint_velocity_limits=limits,
+                velocity_limit_activation_fraction=fraction,
+                velocity_limit_law=law,
+                _environment_options=frozenset(),
+            )
+            for name in ("_velocity_limit_sweep_law", "_parallel_velocity_limit_agreement"):
+                setattr(probe, name, MethodType(getattr(SolverFeatherPGS, name), probe))
+            with self.subTest(limits=limits, fraction=fraction, law=law, schedule=schedule):
+                with patch.dict(os.environ, {_SWITCH: "1"}):
+                    admitted, reason = SolverFeatherPGS._admit_parallel_contact_paths(probe)
+                self.assertTrue(admitted)
+                self.assertIn("one isotropic step per pair", reason)
+                self.assertEqual("share the serial sweep's fixed point" in reason, shared, reason)
+                self.assertEqual("fixed points differ wherever a limit binds" in reason, not shared, reason)
 
     def test_route_record_reads_the_built_tiers(self):
         """Record the tiers' ring-pooled projection and sweep budgets from the kernels built, not from the law."""
