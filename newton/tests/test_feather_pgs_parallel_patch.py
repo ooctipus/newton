@@ -1810,7 +1810,9 @@ class TestPatchParallelRoutes(unittest.TestCase):
         pass must leave the sphere at least 5 % past its limit, or the fixture cannot
         show what the pass does, and the pass must hold it to 1e-5 (the reference on
         the CPU rows of test_last_word_holds_a_pushed_sphere_at_its_limit: 43.5 % and
-        1.7e-6 past).
+        1.7e-6 past). Converged (2000 sweeps, tolerance 0), the tier's limit rows hold
+        the limit to 1e-5 without the pass, and the pass moves no velocity by more
+        than 1e-6.
         """
         limit = 0.5
         model = _pushed_sphere("cuda:0", limit=limit)
@@ -1824,17 +1826,17 @@ class TestPatchParallelRoutes(unittest.TestCase):
                     enable_joint_velocity_limits=limits,
                     mf_gs_parallel_linked_velocity_limit_pass=requested,
                 )
-            truncated = {
-                requested: _matrix_free_solver(
+            budgets = {
+                (sweeps, requested): _matrix_free_solver(
                     model,
                     beta=0.2,
                     parallel_rows=32,
                     enable_joint_velocity_limits=True,
                     mf_gs_parallel_linked_velocity_limit_pass=requested,
-                    mf_gs_parallel_sweeps=2,
+                    mf_gs_parallel_sweeps=sweeps,
                     mf_gs_parallel_tol=0.0,
                 )
-                for requested in (False, True)
+                for sweeps, requested in itertools.product((2, 2000), (False, True))
             }
         for (limits, requested), solver in built.items():
             with self.subTest(limits=limits, requested=requested):
@@ -1854,15 +1856,21 @@ class TestPatchParallelRoutes(unittest.TestCase):
                     self.assertGreater(speed, 2.0 * limit, "the push must carry an unlimited sphere past its limit")
                 elif requested:
                     self.assertLessEqual(speed, limit * (1.0 + 1.0e-5))
-        speeds = {}
-        for requested, solver in truncated.items():
+        velocities = {}
+        for (sweeps, requested), solver in budgets.items():
             keys = [kernel.key for kernel in solver._pgs_solve_mf_gs_incremental_kernels]
-            self.assertTrue(keys and all("_sweeps2_" in key and key.endswith("_lw") == requested for key in keys), keys)
+            self.assertTrue(
+                keys and all(f"_sweeps{sweeps}_" in key and key.endswith("_lw") == requested for key in keys), keys
+            )
             state, _ = _rollout(model, solver, 1)
             _assert_tier_owned(self, solver, 32)
-            speeds[requested] = float(np.max(np.abs(state.joint_qd.numpy()[:2])))
-        self.assertGreater(speeds[False], 1.05 * limit, f"two sweeps already hold the limit: {speeds}")
-        self.assertLessEqual(speeds[True], limit * (1.0 + 1.0e-5), speeds)
+            velocities[sweeps, requested] = state.joint_qd.numpy().astype(np.float64)
+        speeds = {budget: float(np.max(np.abs(velocity[:2]))) for budget, velocity in velocities.items()}
+        self.assertGreater(speeds[2, False], 1.05 * limit, f"two sweeps already hold the limit: {speeds}")
+        for budget in ((2, True), (2000, False), (2000, True)):
+            self.assertLessEqual(speeds[budget], limit * (1.0 + 1.0e-5), (budget, speeds))
+        # A converged tier leaves the pass nothing to push.
+        np.testing.assert_allclose(velocities[2000, True], velocities[2000, False], rtol=0.0, atol=1.0e-6)
 
     def test_linked_tiers_take_their_own_sweep_budget(self):
         """Build each linked tier with its budget, record it, and leave point tiers on mf_gs_parallel_sweeps."""
