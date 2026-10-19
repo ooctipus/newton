@@ -79,6 +79,9 @@ def _nxn_broadphase_precomputed_pairs(
 class _PairTemplateData:
     # Global-global pairs: they lead the explicit list and are read from it.
     global_count: int
+    # Leading blocks that test the global-global pairs, ``global_chunk`` consecutive pairs each.
+    global_blocks: int
+    global_chunk: int
     # First shape of each world with template pairs (a "slot"), in explicit-list order.
     slot_shape_start: wp.array[int]
     # Template index of each slot.
@@ -101,14 +104,20 @@ def _immovable(shape: str) -> str:
     )
 
 
-# The global-global pairs of block 0 (when there are any), tested from the explicit list itself.
+# The global-global pairs, tested from the explicit list itself: the leading
+# global_blocks blocks take global_chunk consecutive pairs each, so a long
+# global list spreads over the GPU as in the flat kernel. Blocks run in
+# order on CPU, which keeps the list order there.
 _TEMPLATE_GLOBAL = f"""
-    if (data.global_count > 0 && block == 0) {{
-        for (int i0 = 0; i0 < data.global_count; i0 += STEP) {{
+    if (block < data.global_blocks) {{
+        const int begin = block * data.global_chunk;
+        const int remaining = data.global_count - begin;
+        const int end = begin + (remaining < data.global_chunk ? remaining : data.global_chunk);
+        for (int i0 = begin; i0 < end; i0 += STEP) {{
             const int i = i0 + LANE;
             bool hit = false;
             int a = 0, b = 0;
-            if (i < data.global_count) {{
+            if (i < end) {{
                 const wp::vec2i pair = pairs.data[i];
                 a = pair[0];
                 b = pair[1];
@@ -124,7 +133,7 @@ APPEND
         }}
         return;
     }}
-    const int world_block = block - (data.global_count > 0 ? 1 : 0);
+    const int world_block = block - data.global_blocks;
 """
 
 # One world group: its slot, template and the base of its shared segment.
@@ -191,7 +200,7 @@ APPEND
 
 # write_pair's contract with one atomic per warp: the count advances by every
 # hit, and only indices below the capacity are written. Loops around it are
-# warp-uniform (a world group is whole warps; block 0 strides by the block).
+# warp-uniform (a world group is whole warps; a global block strides by the block).
 _TEMPLATE_APPEND_CUDA = """
             {
                 const unsigned int mask = __ballot_sync(0xffffffffu, hit);
@@ -942,23 +951,27 @@ class BroadPhaseExplicitTemplates:
 
     Each world stages the AABBs its template references once (in shared memory on
     CUDA) and tests the template's entries against them, so the explicit list is
-    not streamed. Built from :class:`ShapePairTemplates` and verified against the
-    list they replay into, it tests exactly that list's pairs with the overlap and
-    immovable-pair rules of :class:`BroadPhaseExplicit` and writes them as the list
-    stores them. Only the order of the output differs on CUDA, where it is set by
-    atomics in both kernels; on CPU the output equals :class:`BroadPhaseExplicit`'s.
-    AABBs must be pre-expanded: per-shape gaps and speculative displacement are not
-    supported.
+    not streamed. The global-global pairs that lead the list are read from it, a
+    chunk per leading block. Built from :class:`ShapePairTemplates` and verified
+    against the list they replay into, it tests exactly that list's pairs with the
+    overlap and immovable-pair rules of :class:`BroadPhaseExplicit` and writes them
+    as the list stores them. Only the order of the output differs on CUDA, where it
+    is set by atomics in both kernels; on CPU the output equals
+    :class:`BroadPhaseExplicit`'s. AABBs must be pre-expanded: per-shape gaps and
+    speculative displacement are not supported.
     """
 
     AUTO_MIN_PAIRS = 1 << 20
-    """Pairs below which automatic selection keeps the flat kernel (the stream it saves is small)."""
+    """Template pairs below which automatic selection keeps the flat kernel (the stream it saves is small).
+
+    Global-global pairs do not count: they are streamed from the list as in the flat kernel."""
     AUTO_MIN_PAIRS_PER_WORLD = 64
     """Mean pairs per world below which automatic selection keeps the flat kernel."""
     MAX_STAGED_SHAPES = 1024
     """Most shapes a world's template may reference."""
     _SHARED_BYTES = 32 * 1024
     _STAGED_SHAPE_BYTES = 32  # six bounds, the shape id and the immovable flag
+    _GLOBAL_PAIRS_PER_LANE = 8  # global-global pairs per lane of a leading block
 
     def __init__(self, templates: ShapePairTemplates, *, device: Devicelike = None):
         """Lay the templates out for the device.
@@ -997,7 +1010,8 @@ class BroadPhaseExplicitTemplates:
         counts = joined(slot_counts, np.int64)
         self.template_count = len(stages)
         self.slot_count = int(counts.shape[0])
-        self.pair_count = self.global_count + int(counts.sum())
+        self.template_pair_count = int(counts.sum())
+        self.pair_count = self.global_count + self.template_pair_count
         self.pairs_per_world = max((packed.shape[0] for packed in entries), default=0)
         self.mean_pairs_per_world = float(counts.mean()) if counts.shape[0] else 0.0
         self.staged_shapes = max((stage.shape[0] for stage in stages), default=0)
@@ -1007,6 +1021,9 @@ class BroadPhaseExplicitTemplates:
             1,
             min(256 // self.threads_per_world, self._SHARED_BYTES // (self.staged_capacity * self._STAGED_SHAPE_BYTES)),
         )
+        self.block_dim = self.threads_per_world * self.worlds_per_block
+        self.global_chunk = self.block_dim * self._GLOBAL_PAIRS_PER_LANE
+        self.global_blocks = -(-self.global_count // self.global_chunk)
         self.unsupported_reason = None
         self.data = None
         if self.staged_shapes > self.MAX_STAGED_SHAPES:
@@ -1015,7 +1032,7 @@ class BroadPhaseExplicitTemplates:
                 f"{self.MAX_STAGED_SHAPES}."
             )
             return
-        if self.pair_count >= 1 << 31:
+        if self.pair_count > np.iinfo(np.int32).max - self.block_dim:
             self.unsupported_reason = "The explicit pair list exceeds 32-bit indexing."
             return
 
@@ -1046,6 +1063,8 @@ class BroadPhaseExplicitTemplates:
 
         data = _PairTemplateData()
         data.global_count = self.global_count
+        data.global_blocks = self.global_blocks
+        data.global_chunk = self.global_chunk
         for name in (
             "slot_shape_start",
             "slot_template",
@@ -1062,10 +1081,10 @@ class BroadPhaseExplicitTemplates:
 
     @property
     def automatic(self) -> bool:
-        """Whether automatic selection uses these templates: enough pairs, and enough per world."""
+        """Whether automatic selection uses these templates: enough template pairs, and enough per world."""
         return (
             self.unsupported_reason is None
-            and self.pair_count >= self.AUTO_MIN_PAIRS
+            and self.template_pair_count >= self.AUTO_MIN_PAIRS
             and self.mean_pairs_per_world >= self.AUTO_MIN_PAIRS_PER_WORLD
         )
 
@@ -1075,6 +1094,7 @@ class BroadPhaseExplicitTemplates:
             "templates": self.template_count,
             "worlds": self.slot_count,
             "global_pairs": self.global_count,
+            "global_blocks": self.global_blocks,
             "pairs": self.pair_count,
             "pairs_per_world": self.pairs_per_world,
             "staged_shapes": self.staged_shapes,
@@ -1140,7 +1160,7 @@ class BroadPhaseExplicitTemplates:
         """
         if self.unsupported_reason is not None:
             raise ValueError(self.unsupported_reason)
-        blocks = (1 if self.global_count else 0) + -(-self.slot_count // self.worlds_per_block)
+        blocks = self.global_blocks + -(-self.slot_count // self.worlds_per_block)
         if blocks == 0:
             return
         self._upload()
@@ -1159,7 +1179,7 @@ class BroadPhaseExplicitTemplates:
                 candidate_pair_count,
                 candidate_pair.shape[0],
             ],
-            block_dim=self.threads_per_world * self.worlds_per_block,
+            block_dim=self.block_dim,
             device=self.device,
             record_tape=False,
         )

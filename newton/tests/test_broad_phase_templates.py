@@ -188,27 +188,28 @@ def _assert_same_candidates(test, device, flat, template, capacity, everything=N
 def test_synthetic_templates_match_flat_kernel(test, device):
     """Test the same candidates as the flat kernel over random templates, runs, globals and bounds."""
     cases = (
-        # (template specs, worlds, world shapes, globals last): small templates pack 8 worlds per block.
-        (((3, 20), (0, 9), (2, 0)), 21, 12, False),
-        # One large template: several warps per world, global block, tail block.
-        (((5, 300),), 7, 40, False),
+        # Small templates pack 8 worlds per block.
+        {"template_specs": ((3, 20), (0, 9), (2, 0)), "worlds": 21, "world_shapes": 12, "empty_template": True},
+        # One large template: several warps per world, a global block, a tail block.
+        {"template_specs": ((5, 300),), "worlds": 7, "world_shapes": 40},
         # Over 256 staged shapes per world: shared memory, not lanes, limits worlds per block (3 x 64 lanes).
-        (((40, 260), (0, 120)), 9, 400, False),
+        {"template_specs": ((40, 260), (0, 120)), "worlds": 9, "world_shapes": 400},
         # 1100 pairs per world: one 256-lane world per block, as on the largest templates.
-        (((8, 1100),), 5, 60, False),
+        {"template_specs": ((8, 1100),), "worlds": 5, "world_shapes": 60},
         # Global shapes after the worlds: every global-local pair is swapped to (min, max).
-        (((6, 40), (3, 0), (0, 15)), 13, 16, True),
+        {"template_specs": ((6, 40), (3, 0), (0, 15)), "worlds": 13, "world_shapes": 16, "globals_last": True},
+        # 2500 global-global pairs fill two leading blocks of 2048 (256 lanes x 8 pairs).
+        {
+            "template_specs": ((4, 30), (0, 12)),
+            "worlds": 10,
+            "world_shapes": 14,
+            "global_shapes": 80,
+            "global_pairs": 2500,
+        },
     )
-    for case, (specs, worlds, world_shapes, globals_last) in enumerate(cases):
-        record, shape_count = _synthetic(
-            case,
-            worlds=worlds,
-            world_shapes=world_shapes,
-            template_specs=specs,
-            empty_template=case == 0,
-            globals_last=globals_last,
-        )
-        test.assertEqual(_global_second_count(record) > 0, globals_last)
+    for case, options in enumerate(cases):
+        record, shape_count = _synthetic(case, **options)
+        test.assertEqual(_global_second_count(record) > 0, options.get("globals_last", False))
         pairs = wp.array(record.replay(), dtype=wp.vec2i, device=device)
         layout = BroadPhaseExplicitTemplates(record, device=device)
         test.assertIsNone(layout.unsupported_reason)
@@ -217,6 +218,7 @@ def test_synthetic_templates_match_flat_kernel(test, device):
         if case == 2:
             test.assertGreater(layout.staged_shapes, 256)
             test.assertLess(layout.worlds_per_block, 256 // layout.threads_per_world)
+        test.assertEqual(layout.global_blocks, 2 if case == 5 else 1)
         lower, upper = _random_bounds(100 + case, shape_count, device)
         shape_body, body_flags = _random_bodies(200 + case, shape_count, device)
         for include in (True, False):
@@ -482,22 +484,33 @@ class TestShapePairTemplateRecord(unittest.TestCase):
 
 
 class TestBroadPhaseTemplateRule(unittest.TestCase):
-    def _single(self, pairs_per_world, worlds, staged=None):
+    def _single(self, pairs_per_world, worlds, staged=None, global_pairs=0):
         staged = pairs_per_world + 1 if staged is None else staged
         local = np.stack((np.zeros(pairs_per_world), 1 + np.arange(pairs_per_world) % (staged - 1)), axis=1)
         record = ShapePairTemplates(
-            global_pairs=np.empty((0, 2), dtype=np.int32),
+            global_pairs=np.zeros((global_pairs, 2), dtype=np.int32),
             templates=((np.empty((0, 2), dtype=np.int32), local.astype(np.int32)),),
             runs=((0, (np.arange(worlds) * staged).astype(np.int32)),),
         )
         return BroadPhaseExplicitTemplates(record, device="cpu")
 
     def test_automatic_rule_admits_large_templates(self):
-        """Admit automatically only at 2**20 pairs or more and 64 or more pairs per world."""
+        """Admit automatically only at 2**20 template pairs or more and 64 or more pairs per world."""
         self.assertTrue(self._single(64, 16384).automatic)
         self.assertFalse(self._single(63, 16645).automatic)
         self.assertFalse(self._single(64, 16383).automatic)
         self.assertEqual(self._single(64, 16384).pair_count, 1 << 20)
+
+    def test_global_pairs_do_not_count_toward_admission(self):
+        """Keep the flat kernel automatically when only global-global pairs make the list large."""
+        # Global-global pairs are streamed from the list as in the flat kernel, so they save nothing.
+        layout = self._single(64, 16, global_pairs=1 << 20)
+        self.assertGreaterEqual(layout.pair_count, layout.AUTO_MIN_PAIRS)
+        self.assertGreaterEqual(layout.mean_pairs_per_world, layout.AUTO_MIN_PAIRS_PER_WORLD)
+        self.assertFalse(layout.automatic)
+        # They spread over leading blocks of 256 lanes x 8 pairs instead of running in one block.
+        self.assertEqual(layout.global_blocks, (1 << 20) // 2048)
+        self.assertEqual(layout.describe()["global_blocks"], layout.global_blocks)
 
     def test_staging_capacity_bounds_admission(self):
         """Refuse templates referencing more shapes than a world can stage."""

@@ -2830,8 +2830,8 @@ class CollisionPipeline:
                 reason = layout.unsupported_reason
             elif setting is None and not layout.automatic:
                 reason = (
-                    f"Automatic: below {layout.AUTO_MIN_PAIRS} pairs or {layout.AUTO_MIN_PAIRS_PER_WORLD} pairs per "
-                    "world, the flat pair kernel is kept."
+                    f"Automatic: below {layout.AUTO_MIN_PAIRS} template pairs or {layout.AUTO_MIN_PAIRS_PER_WORLD} "
+                    "pairs per world, the flat pair kernel is kept."
                 )
             elif not layout.verify(self.shape_pairs_filtered):
                 reason = "The explicit pairs no longer match the model's world templates."
