@@ -7,6 +7,7 @@ import collections
 import contextlib
 import functools
 import itertools
+import json
 import os
 import unittest
 from types import SimpleNamespace
@@ -16,7 +17,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import cached_state_binding, capture_joins, tree_kinetic_owner
+from newton._src.solvers.feather_pgs import cached_state_binding, capture_joins, path_selection, tree_kinetic_owner
 from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.test_feather_pgs_mixed_tree_free_body import _build
@@ -888,6 +889,99 @@ class TestFeatherPGSCapturedRepair(unittest.TestCase):
             np.testing.assert_allclose(finals[1][field], finals[0][field], rtol=0.0, atol=2e-6, err_msg=field)
 
 
+def _captured_repairs(solver):
+    """The route record's launch forms of every held-tree group's repairs in the latest capture."""
+    return [group["captured_repairs"] for group in solver.get_path_selection()["routes"]["held_tree"]["groups"]]
+
+
+class TestFeatherPGSRepairRecord(unittest.TestCase):
+    def test_route_record_names_the_bound_repair_launches(self):
+        """Report each held-tree group's input validation, launch choices and kernels as the owner binds them.
+
+        For a comparing owner, a motion-velocity owner and groups forced to classify, the record's
+        ``input_validation``, ``captured_repair_skip`` and ``classify_first`` and every kernel key
+        match the bound kernels (None where unbound). ``captured_repairs`` lists how each repair of
+        the latest capture was launched, starting over with the first repair of a new capture;
+        eager repairs leave it alone. The record is JSON-serializable. Launches are recorded, not
+        run, and the capture id is stubbed.
+        """
+        compare_case, motion_case, classified_case = _cpu_owner(), _cpu_owner(motion_velocity=True), _cpu_owner()
+        for group in classified_case[2].groups:
+            group._classify_switch, group._repair_grid = True, 1
+            group._bind_kernels()
+
+        def check(group, validation, skip, bound):
+            record = path_selection._tree_group(group)
+            json.dumps(record, allow_nan=False)
+            self.assertEqual(record["input_validation"], validation)
+            self.assertEqual(record["captured_repair_skip"], skip)
+            self.assertEqual(record["classify_first"], group.classify_first)
+            kernels = {
+                "repair": group.repair_kernel,
+                "finish": group.finish_kernel,
+                "predict": group.predictor_kernel,
+                "bank": group.bank_kernel,
+                "bank_repair": group.bank_repair_kernel,
+                "classify": group.classify_kernel,
+                "listed_repair": group.listed_repair_kernel,
+            }
+            self.assertEqual(record["kernels"], {key: None if k is None else k.key for key, k in kernels.items()})
+            self.assertEqual(
+                {key for key, k in kernels.items() if k is not None}, {"repair", "finish", "predict", *bound}
+            )
+
+        for group in compare_case[2].groups:
+            self.assertFalse(group.classify_first)
+            check(group, "content", True, {"bank_repair"})
+        for group in motion_case[2].groups:
+            self.assertFalse(group.classify_first)
+            check(group, "identity", False, set())
+        for group in classified_case[2].groups:
+            self.assertTrue(group.classify_first)
+            check(group, "content", True, {"bank", "classify", "listed_repair"})
+
+        def run(case, call, capture):
+            stack, _ = _recorded_launches(("launch", "launch_tiled"))
+            with stack, patch.object(capture_joins, "capture_id", return_value=capture):
+                call(case[2], case[4])
+
+        def begin(state_in, state_out):
+            return lambda owner, augmented: owner.begin(
+                state_in, augmented, state_in.joint_qd, DT, False, state_out=state_out
+            )
+
+        def finish(state_in, state_out):
+            return lambda owner, augmented: owner.finish(state_in, augmented, state_out, DT, False)
+
+        def records(case):
+            return [path_selection._tree_group(group)["captured_repairs"] for group in case[2].groups]
+
+        s0, s1 = classified_case[3]
+        groups = len(classified_case[2].groups)
+        self.assertEqual(records(classified_case), [[]] * groups)
+        run(classified_case, begin(s0, s1), 5)
+        run(classified_case, finish(s0, s1), 5)
+        run(classified_case, begin(s1, s0), 5)
+        run(classified_case, finish(s1, s0), 5)
+        classified_case[2].forget_continuity()
+        run(classified_case, begin(s0, s1), 5)
+        self.assertEqual(records(classified_case), [["classified_compared", "skipped", "classified"]] * groups)
+        run(classified_case, begin(s0, s1), 0)
+        self.assertEqual(records(classified_case), [["classified_compared", "skipped", "classified"]] * groups)
+        run(classified_case, begin(s0, s1), 6)
+        self.assertEqual(records(classified_case), [["classified_compared"]] * groups)
+        c0, c1 = compare_case[3]
+        run(compare_case, begin(c0, c1), 3)
+        run(compare_case, finish(c0, c1), 3)
+        run(compare_case, begin(c1, c0), 3)
+        self.assertEqual(records(compare_case), [["one_pass_compared", "skipped"]] * len(compare_case[2].groups))
+        m0, m1 = motion_case[3]
+        run(motion_case, begin(m0, m1), 4)
+        run(motion_case, finish(m0, m1), 4)
+        run(motion_case, begin(m1, m0), 4)
+        self.assertEqual(records(motion_case), [["one_pass", "one_pass"]] * len(motion_case[2].groups))
+
+
 class TestFeatherPGSColdCapture(unittest.TestCase):
     """Capture a solver's first step before any eager step, as Isaac Lab records its physics graph at start-up."""
 
@@ -931,6 +1025,8 @@ class TestFeatherPGSColdCapture(unittest.TestCase):
                         self.assertEqual(kinds, {"classify": groups, "bank": groups, "listed": groups})
                     else:
                         self.assertEqual(kinds, {"bank_repair": groups})
+                    form = "classified_compared" if classified else "one_pass_compared"
+                    self.assertEqual(_captured_repairs(solver), [[form]] * groups)
                     wp.capture_launch(capture.graph)  # builds every cache
                     before = _generations(owner)
                     for _ in range(replays - 1):
@@ -983,14 +1079,16 @@ class TestFeatherPGSColdCapture(unittest.TestCase):
                         rollout.block()
                     motion = name == "motion"
                     if classified and motion:
-                        expected = {"classify": 2 * groups, "listed": 2 * groups}
+                        expected, forms = {"classify": 2 * groups, "listed": 2 * groups}, ["classified"] * 2
                     elif classified:
                         expected = {"classify": groups, "bank": groups, "listed": groups}
+                        forms = ["classified_compared", "skipped"]
                     elif motion:
-                        expected = {"repair": 2 * groups}
+                        expected, forms = {"repair": 2 * groups}, ["one_pass"] * 2
                     else:
-                        expected = {"bank_repair": groups}
+                        expected, forms = {"bank_repair": groups}, ["one_pass_compared", "skipped"]
                     self.assertEqual(kinds, expected)
+                    self.assertEqual(_captured_repairs(solver), [forms] * groups)
                     for _ in range(4):
                         rollout.reset_worlds((1,))
                         wp.capture_launch(capture.graph)

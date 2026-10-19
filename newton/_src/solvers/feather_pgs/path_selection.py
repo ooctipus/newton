@@ -278,6 +278,9 @@ def _tree_group(group) -> dict:
         # be stamped with the input bank or compared (FEATHER_PGS_TREE_REPAIR_CLASSIFY=0 keeps one
         # launch per block).
         "classify_first": bool(group.classify_first),
+        # How each repair of the latest graph capture was recorded, in order: "skipped", "one_pass" or
+        # "classified", with "_compared" when it compares input banks; empty before any capture.
+        "captured_repairs": list(group._captured_repairs[1]) if group._captured_repairs else [],
         "motion_velocity": bool(group.motion_velocity),
         "publishes_twists": bool(group.publishes_twists),
         # Several admissible widths are timed once at construction (measurements.held_tree_lane_timing_us);

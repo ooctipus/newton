@@ -385,6 +385,9 @@ class TreeKineticState:
         # launches; the kernels check each group's own stamp.
         self._published = None
         self._published_capture = 0
+        # (capture id, launch form of each repair recorded in it) of the latest capture,
+        # for the route record.
+        self._captured_repairs = None
         self._bind_kernels()
         if not self.chain_scan:
             self._choose_lanes()
@@ -670,6 +673,7 @@ class TreeKineticState:
             # block would take the early exit. (A non-finite cache stays invalid, and
             # the predictor then makes its articulations' next state NaN with or
             # without a repair.)
+            self._record_capture(capture, "skipped")
             self._motion_binding = binding
             return
         data = self._publication(state_in, state_aug, state_in, dt)
@@ -738,6 +742,8 @@ class TreeKineticState:
                 device=device,
             )
         self._published, self._published_capture = source, capture
+        form = ("classified" if classify else "one_pass") + ("_compared" if compare else "")
+        self._record_capture(capture, form)
         self._motion_binding = binding
 
     def _repair_form(self, source, state_out, capture, device):
@@ -763,6 +769,14 @@ class TreeKineticState:
         # input bank repairs every group, which the one-pass launch does more cheaply.
         compare = self.bank_compare and distinct and self._published == output
         return compare, self.classify_first and (compare or source == self._published)
+
+    def _record_capture(self, capture, form):
+        """Remember how each repair of the latest capture was recorded, for the route record."""
+        if capture == 0:
+            return
+        if self._captured_repairs is None or self._captured_repairs[0] != capture:
+            self._captured_repairs = (capture, [])
+        self._captured_repairs[1].append(form)
 
     def _validate_motion(self, state, state_aug, velocity):
         """Reject invalid working descriptors before changing current-cache validity."""
