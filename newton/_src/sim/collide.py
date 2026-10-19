@@ -169,7 +169,7 @@ def _iter_pair_blocks(pairs: wp.array[wp.vec2i] | np.ndarray) -> Iterator[np.nda
     however many worlds replicate the list.
     """
     if not isinstance(pairs, wp.array):
-        pairs = np.asarray(pairs).reshape(-1, 2)
+        pairs = (pairs.numpy() if hasattr(pairs, "numpy") else np.asarray(pairs)).reshape(-1, 2)
     count = len(pairs)
     for begin in range(0, count, _PAIR_SCAN_BLOCK):
         # Warp slices do not clamp their end.
