@@ -380,6 +380,9 @@ class TreeKineticState:
         self._repair_blocks = wp.empty(groups, dtype=int, device=device)
         self._compare_blocks = wp.empty(groups, dtype=int, device=device)
         self._list_counts = wp.zeros(2, dtype=int, device=device)
+        # The bank argument of the shared launch ABI where no kernel reads it: no
+        # arrays, so a read would fault rather than compare stale words.
+        self._no_bank = native.StateBank()
         self._repair_grid = listed_repair_blocks(device)
         # Blocks a repair launch must exceed to be classified.
         self._classify_above = _CLASSIFIED_GRIDS * self._repair_grid
@@ -502,7 +505,18 @@ class TreeKineticState:
         data = self._publication(probe_in, solver, probe_out, 1.0 / 240.0)
         # Steady state: finish without a geometry refresh, then predict (repair
         # exits early on an unchanged bank and refresh is periodic).
-        finish_arguments = [self.sparse.plan, self.plan, data, self.data, solver._mass_update_requested, 0]
+        finish_arguments = [
+            self.sparse.plan,
+            self.plan,
+            data,
+            self.data,
+            solver._mass_update_requested,
+            0,
+            probe_in.joint_qd,
+            self._repair_blocks,
+            self._list_counts,
+            self._no_bank,
+        ]
         force = ForceInput()
         force.joint_q, force.joint_qd, force.predictor_qd = probe_in.joint_q, probe_in.joint_qd, probe_in.joint_qd
         force.joint_f, force.body_f, force.body_flags = model.control().joint_f, probe_in.body_f, model.body_flags
@@ -690,6 +704,10 @@ class TreeKineticState:
             return
         data = self._publication(state_in, state_aug, state_in, dt)
         compare, classify = self._repair_form(source, state_out, capture, device)
+        # Every repair takes the launch ABI of the finish (get_state_kernel): only an
+        # alternate-motion repair reads stage3_qd, otherwise the state's own velocity
+        # (_validate_motion); only a listed repair reads the block list, and only a
+        # comparing repair a bank.
         arguments = [
             self.sparse.plan,
             self.plan,
@@ -697,9 +715,9 @@ class TreeKineticState:
             self.data,
             self.solver._mass_update_requested,
             int(global_refresh),
+            stage3_qd,
         ]
-        if self.motion_velocity:
-            arguments.append(stage3_qd)
+        lists = [self._repair_blocks, self._list_counts]
         if classify:
             # List the blocks that repair (and, when comparing, those that compare
             # first) and run the repair over the list on the capped grid. Passing the
@@ -709,14 +727,7 @@ class TreeKineticState:
             wp.launch(
                 self.classify_kernel,
                 dim=self.launch_count,
-                inputs=[
-                    *arguments[:6],
-                    stage3_qd,
-                    bank,
-                    self._repair_blocks,
-                    self._compare_blocks,
-                    self._list_counts,
-                ],
+                inputs=[*arguments, bank, self._repair_blocks, self._compare_blocks, self._list_counts],
                 block_dim=64,
                 device=device,
             )
@@ -732,7 +743,7 @@ class TreeKineticState:
             wp.launch_tiled(
                 self.listed_repair_kernel,
                 dim=[self.launch_count],
-                inputs=[*arguments, self._repair_blocks, self._list_counts],
+                inputs=[*arguments, *lists, self._no_bank],
                 block_dim=self.block_dim,
                 max_blocks=self._repair_grid,
                 device=device,
@@ -741,7 +752,7 @@ class TreeKineticState:
             wp.launch_tiled(
                 self.bank_repair_kernel,
                 dim=[self.launch_count],
-                inputs=[*arguments, self._bank(state_out, state_in)],
+                inputs=[*arguments, *lists, self._bank(state_out, state_in)],
                 block_dim=self.block_dim,
                 device=device,
             )
@@ -749,7 +760,7 @@ class TreeKineticState:
             wp.launch_tiled(
                 self.repair_kernel,
                 dim=[self.launch_count],
-                inputs=arguments,
+                inputs=[*arguments, *lists, self._no_bank],
                 block_dim=self.block_dim,
                 device=device,
             )
@@ -865,6 +876,11 @@ class TreeKineticState:
                 self.data,
                 self.solver._mass_update_requested,
                 int(next_refresh),
+                # The repair inputs of the shared launch ABI, unread by a finish.
+                state_in.joint_qd,
+                self._repair_blocks,
+                self._list_counts,
+                self._no_bank,
             ],
             block_dim=self.block_dim,
             device=self.solver.model.device,

@@ -39,14 +39,17 @@ def fixture(floating, device):
 
 class TestPrescaledTreeContract(unittest.TestCase):
     def test_motion_input_is_an_explicit_factory_contract(self):
-        """Retain the ordinary repair ABI while declaring a separate motion input."""
+        """Select the alternate motion by factory argument; every repair and finish takes the motion input."""
         layout = TreeLayout(4, 3, 6, 3, 2, 0, (2, 1, 0))
         ordinary = get_state_kernel(False, layout=layout)
         alternate = get_state_kernel(False, layout=layout, motion_velocity=True)
+        finish = get_state_kernel(True, layout=layout)
         self.assertIs(ordinary, get_state_kernel(False, layout=layout))
         self.assertIsNot(ordinary, alternate)
-        self.assertNotIn("motion_qd", [arg.label for arg in ordinary.adj.args])
-        self.assertIn("motion_qd", [arg.label for arg in alternate.adj.args])
+        # One launch ABI keeps every stage one call below the kernel; only the alternate repair reads the input,
+        # which follows the six common arguments.
+        for kernel in (ordinary, alternate, finish):
+            self.assertEqual([arg.label for arg in kernel.adj.args][6], "motion_qd")
 
     def check_current_motion(self, device, exclude_driven=False):
         for floating in (False, True):

@@ -5,14 +5,12 @@
 """Generated current/next tree moments, bias and fused state publication."""
 
 import functools
-from textwrap import indent
 from types import SimpleNamespace
 
 import warp as wp
 
 from ...sim import BodyFlags
-from . import cached_force, response_operator, sparse_factor, tree_chain_scan
-from .cached_state import StateOperands, StateStages, make_body_terms, make_state_kernel
+from . import cached_force, kernels, response_operator, sparse_factor, tree_chain_scan
 from .publication_data import PublicationData
 from .tree_kinetic_layout import REFERENCE_LAYOUT, THREADS, TreeLayout
 
@@ -110,6 +108,38 @@ class ForceInput:
     stage_clocks: wp.array2d[wp.int64]
     predicted_twist: wp.array[wp.spatial_vector]
     publish_twists: int
+
+
+@wp.struct
+class TreeGroup:
+    """One tree group in a finish or repair: its threads, articulation, refresh and state block.
+
+    Admission fills every field but the state block, which a group admitted
+    for a rebuild allocates next; every later stage reads the group from here.
+    """
+
+    address: wp.uint64
+    lane: int
+    stride: int
+    group: int
+    art: int
+    ds: int
+    js: int
+    refresh: int
+    # Alternate repair motion: whether the motion velocity differs from the state bank's.
+    motion_changed: int
+    # Whether this launch rebuilds the group's current state.
+    admitted: int
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    return wp::int64(clock64());
+#else
+    return wp::int64(0);
+#endif
+""")
+def _clock() -> wp.int64: ...
 
 
 _LANES_SOURCE = r"""
@@ -787,10 +817,11 @@ def get_helpers(
 
     ``reference`` keeps the shared-memory scans and the depth-level subtree
     reduction on warp-sized layouts (the forms the A/B tests compare against);
-    ``clocked`` adds the collection stage counters. Both change the emitted
-    code, so they are arguments (cache-key members), never environment reads.
-    ``host`` keeps the CPU scratch in static storage (see
-    ``_HOST_STORAGE_SOURCE``); the default is the form CUDA owners launch.
+    ``clocked`` adds the collection (``stage_clocks`` columns 13-15) and body
+    term (16-21) counters. Both change the emitted code, so they are
+    arguments (cache-key members), never environment reads. ``host`` keeps
+    the CPU scratch in static storage (see ``_HOST_STORAGE_SOURCE``); the
+    default is the form CUDA owners launch.
     """
     plan_type = tree_chain_scan.ChainPlan if chain_scan else KineticPlan
     # A warp-sized layout scans in registers through shuffles; two-warp layouts
@@ -861,50 +892,102 @@ def get_helpers(
         refresh: int,
     ): ...
 
-    from . import kernels  # noqa: PLC0415
+    # A root-only free body is a free rigid body (in a forest, a free root may
+    # be one): the matrix-free contact path reads its spatial inertia and bias
+    # wrench every substep, so publish them through the ordinary free-rigid
+    # finalization; the runtime free-rigid test skips tree bodies. A single
+    # free-root tree of several bodies never takes this branch (it cost Cassie
+    # flat and Humanoid 3-4% in the finish kernel).
+    free_rigid = (layout.bodies == 1 and layout.root_dofs == 6) or (layout.forest and layout.free_roots > 0)
 
-    store = "_store_terms(address, local, mass, radius, inertia_com, wrench, refresh)"
-    if (layout.bodies == 1 and layout.root_dofs == 6) or (layout.forest and layout.free_roots > 0):
-        # A root-only free body is a free rigid body (in a forest, a free root
-        # may be one): the matrix-free contact path reads its spatial inertia
-        # and bias wrench every substep, so publish them through the ordinary
-        # free-rigid finalization; the runtime free-rigid test skips tree
-        # bodies. A single free-root tree of several bodies never takes this
-        # branch (it cost Cassie flat and Humanoid 3-4% in the finish kernel).
-        store += """
-if data.is_free_rigid[data.body_to_articulation[body]] != 0:
-    data.body_q_com[body] = pose_com
-    data.body_a_s[body] = acceleration
-    kernels.finalize_body_dynamics_values(
-        body,
-        data.body_to_articulation[body],
-        pose,
-        pose_com,
-        data.body_com,
-        data.body_mass,
-        data.body_inertia,
-        data.is_free_rigid,
-        origin,
-        0,
-        0,
-        data.gravity,
-        velocity,
-        acceleration,
-        data.body_I_s,
-        data.body_inertia_terms,
-        data.body_f_s,
-        data.body_qd,
-    )"""
-    _body_terms = make_body_terms(
-        "address: wp.uint64, body: int, local: int, world: int, pose: wp.transform, pose_com: wp.transform, origin: wp.vec3, velocity: wp.spatial_vector, acceleration: wp.spatial_vector, data: PublicationData, cache: KineticData, refresh: int",
-        dict(globals(), _store_terms=_store_terms, _inertia_action=_inertia_action, kernels=kernels),
-        refresh="refresh",
-        cache="cache",
-        com_offset="radius",
-        body_velocity=body_velocity,
-        store=store,
-        clocked=clocked,
-    )
+    @wp.func
+    def _body_terms(
+        g: TreeGroup,
+        body: int,
+        local: int,
+        pose: wp.transform,
+        pose_com: wp.transform,
+        origin: wp.vec3,
+        velocity: wp.spatial_vector,
+        acceleration: wp.spatial_vector,
+        data: PublicationData,
+        cache: KineticData,
+    ):
+        """Publish one body's twist and store its bias wrench, moments and COM offset.
+
+        ``clocked`` records the cycles of the terms, the publication and the
+        stores in ``stage_clocks`` columns 16-18 (local body 0) or 19-21 (a
+        free rigid body).
+        """
+        if wp.static(clocked):
+            clock_b0 = _clock()
+        radius = wp.transform_get_translation(pose_com) - origin
+        rotation = wp.transform_get_rotation(pose_com)
+        mass = data.body_mass[body]
+        inertia_local = data.body_inertia[body]
+        linear, omega = wp.spatial_top(velocity), wp.spatial_bottom(velocity)
+        a, alpha = wp.spatial_top(acceleration), wp.spatial_bottom(acceleration)
+        inertia_com = wp.mat33()
+        angular_momentum = wp.vec3()
+        angular_acceleration_force = wp.vec3()
+        if g.refresh != 0:
+            matrix = wp.quat_to_matrix(rotation)
+            inertia_com = matrix * inertia_local * wp.transpose(matrix)
+            angular_momentum = inertia_com * omega
+            angular_acceleration_force = inertia_com * alpha
+        else:
+            angular_momentum = _inertia_action(rotation, inertia_local, omega)
+            angular_acceleration_force = _inertia_action(rotation, inertia_local, alpha)
+        velocity_com = linear + wp.cross(omega, radius)
+        force = mass * (a + wp.cross(alpha, radius) + wp.cross(omega, velocity_com) - data.gravity[0])
+        torque = angular_acceleration_force + wp.cross(omega, angular_momentum) + wp.cross(radius, force)
+        wrench = wp.spatial_vector(force, torque)
+        if wp.static(clocked):
+            clock_b1 = _clock()
+        public_radius = wp.transform_point(pose, data.body_com[body]) - origin
+        data.body_qd[body] = wp.spatial_vector(linear + wp.cross(omega, public_radius), omega)
+        if wp.static(body_velocity):
+            data.body_v_s[body] = velocity
+        cache.com_offset[g.group, local] = radius
+        if wp.static(clocked):
+            clock_b2 = _clock()
+        _store_terms(g.address, local, mass, radius, inertia_com, wrench, g.refresh)
+        if wp.static(free_rigid):
+            if data.is_free_rigid[data.body_to_articulation[body]] != 0:
+                data.body_q_com[body] = pose_com
+                data.body_a_s[body] = acceleration
+                kernels.finalize_body_dynamics_values(
+                    body,
+                    data.body_to_articulation[body],
+                    pose,
+                    pose_com,
+                    data.body_com,
+                    data.body_mass,
+                    data.body_inertia,
+                    data.is_free_rigid,
+                    origin,
+                    0,
+                    0,
+                    data.gravity,
+                    velocity,
+                    acceleration,
+                    data.body_I_s,
+                    data.body_inertia_terms,
+                    data.body_f_s,
+                    data.body_qd,
+                )
+        if wp.static(clocked):
+            clock_b3 = _clock()
+            if data.stage_clocks.shape[0] > g.group:
+                column = int(-1)
+                if local == 0:
+                    column = 16
+                elif data.is_free_rigid[data.body_to_articulation[body]] != 0:
+                    column = 19
+                if column >= 0:
+                    data.stage_clocks[g.group, column] = clock_b1 - clock_b0
+                    data.stage_clocks[g.group, column + 1] = clock_b2 - clock_b1
+                    data.stage_clocks[g.group, column + 2] = clock_b3 - clock_b2
 
     @wp.func_native(collect_source)
     def _collect(
@@ -941,7 +1024,23 @@ def get_state_kernel(
     clocked: bool = False,
     host: bool = False,
 ):
-    """Build complete repair/finish using original generalized integration laws.
+    """Build a complete repair, or with ``finish`` a complete finish, from its stage functions.
+
+    Each stage reads its group from the :class:`TreeGroup` admission returns.
+    Admission binds the group's threads and, in a repair, skips a group whose
+    current cache already holds its state bank. A finish then integrates with
+    the original generalized laws: accelerations, free-root transport and
+    joints. Both store relative joint poses; scan poses and publish
+    articulation origins; store joint axes and relative velocities and scan
+    motion; publish bodies with their bias wrenches and moments; and collect
+    bias, geometry and validity.
+
+    Every finish and repair takes one launch ABI, which keeps each stage one
+    call below the kernel: after the six common arguments, the alternate
+    motion velocity ``motion_qd``, a listed repair's block list
+    ``repair_blocks`` and its count ``repair_count``, and the ``bank`` a
+    repair compares its input bank with. A kernel leaves the inputs of the
+    other forms unread.
 
     ``listed`` builds the repair over the block list of
     :func:`get_classify_kernel` and :func:`get_bank_kernel`: logical block
@@ -957,8 +1056,9 @@ def get_state_kernel(
     early exit. It serves launches too small to classify, where a comparison
     pass of its own would cost a launch. Classified launches compare in
     :func:`get_bank_kernel` instead. ``reference`` and ``clocked`` select the
-    comparison forms and the stage counters; ``host`` the static CPU scratch
-    of an owner on the CPU (see :func:`get_helpers`).
+    comparison forms and the stage counters (``stage_clocks`` columns 0-7 for
+    the stages, 22-24 for motion; see :func:`get_helpers`); ``host`` the
+    static CPU scratch of an owner on the CPU.
     """
     if finish and motion_velocity:
         raise ValueError("Alternate motion velocity is a repair-only contract")
@@ -970,195 +1070,402 @@ def get_state_kernel(
     release = _keep_static if host else _release
     plan_type = h.plan_type
     _lanes, _sync, _sub, _different_motion = _thread_helpers(layout)
-    pack = layout.pack
-    scan_poses, scan_motion, collect = h._scan_poses, h._scan_motion, h._collect
+    banked = bank_coordinates != 0
+    _bank_matches = _bank_binding(bank_coordinates, layout) if banked else None
+    scan_poses, scan_motion, collect, body_terms = h._scan_poses, h._scan_motion, h._collect, h._body_terms
     _storage, _store_motion, _load_motion = h._storage, h._store_motion, h._load_motion
     _store_origin, _load_origin, _store_axis = h._store_origin, h._load_origin, h._store_axis
-    _body_terms = h._body_terms
-    bodies, dofs, free_root = layout.bodies, layout.dofs, layout.root_dofs == 6
-    operands = StateOperands(
-        bodies,
-        dofs,
-        "js + local",
-        "ds + local",
-        "if wp.static(free_root) and lane == 0" if not layout.forest else "if lane < wp.static(free_roots)",
-        "plan.root_slot[group]" if not layout.forest else "plan.root_slot[group * wp.static(free_roots) + lane]",
-    )
+    bodies, dofs, pack, free_root = layout.bodies, layout.dofs, layout.pack, layout.root_dofs == 6
     roots, free_roots, forest = len(layout.roots), layout.free_roots, layout.forest
-    motion_setup = "motion_changed = _different_motion(data.joint_qd, motion_qd, ds, dofs)\n" if motion_velocity else ""
-    motion_reuse = "        and motion_changed == 0\n" if motion_velocity else ""
-    motion_bind = "qd = motion_qd" if motion_velocity else ""
-    listed_block = "if item >= repair_count[0]:\n    return\nblock = repair_blocks[item]\n" if listed else ""
-    bank_setup, bank_rebind = "", ""
-    if bank_coordinates:
-        _bank_matches = _bank_binding(bank_coordinates, layout)
-        bank_setup = """    rebind = int(0)
-    if valid != 0 and source_matches == 0:
-        if _same_source(cache, group, bank.joint_q, bank.joint_qd) != 0:
-            source_matches = _bank_matches(bank, data.joint_q_start[js], ds, js, data.joint_q, data.joint_qd, data.joint_child, data.body_q, data.body_qd)
-            rebind = source_matches
-"""
-        bank_rebind = """        if rebind != 0 and lane == 0:
-            _stamp_source(cache, group, data.joint_q, data.joint_qd)
-"""
-    motion_clock = ["pass"] * 4
-    if clocked:
-        motion_clock = [f"clock_m{k} = _clock()" for k in range(4)]
-        motion_clock[3] += (
-            "\n    if local == 0 and data.stage_clocks.shape[0] > group:\n"
-            "        data.stage_clocks[group, 22] = clock_m1 - clock_m0\n"
-            "        data.stage_clocks[group, 23] = clock_m2 - clock_m1\n"
-            "        data.stage_clocks[group, 24] = clock_m3 - clock_m2"
-        )
-    stamp = "_stamp_source(cache, group, q, qd)"
-    if motion_velocity:
-        # An override source must not be reused when a later begin returns to
-        # ordinary motion, even if no finish occurred between the two calls.
-        stamp = """if motion_changed == 0:
-    _stamp_source(cache, group, q, data.joint_qd)
-else:
-    _stamp_source(cache, group, q, qd)"""
-    stages = StateStages(
-        setup=f"""
-{"item" if listed else "block"}, logical_lane = wp.tid()
-lanes = _lanes()
-lane, stride = lanes[0], lanes[1]
-if stride == 1 and logical_lane != 0:
-    return
-{listed_block}\
-group = block * wp.static(pack) + lanes[2]
-art = p.group_to_art[group]
-ds, js = p.art_dof_start[art], p.art_joint_start[art]
-{motion_setup}\
-refresh = int(global_refresh != 0)
-valid = cache.current_valid[art]
-if wp.static(forest):
-    for root in range(1, wp.static(roots)):
-        valid = wp.min(valid, cache.current_valid[plan.arts[group, root]])
-if not wp.static(finish):
-    refresh = int(refresh != 0 or requests[art] != 0)
-    if wp.static(forest):
-        for root in range(1, wp.static(roots)):
-            refresh = int(refresh != 0 or requests[plan.arts[group, root]] != 0)
-    source_matches = _same_source(cache, group, data.joint_q, data.joint_qd)
-{bank_setup}\
-    if (
-        valid != 0
-        and source_matches != 0
-{motion_reuse}\
-        and (
-            refresh == 0
-            or (
-                cache.geometry_valid[group] != 0 and cache.geometry_generation[group] == cache.generation[group]
-            )
-        )
-    ):
-{bank_rebind}\
-        return
-if lane == 0:
-    cache.current_valid[art] = 0
-    if wp.static(forest):
-        for root in range(1, wp.static(roots)):
-            cache.current_valid[plan.arts[group, root]] = 0
-""",
-        relative="""
-if wp.static(not forest):
-    if local == 0:
-        _store_origin(address, 1, wp.transform_get_translation(relative))
-        relative = wp.transform(wp.vec3(), wp.transform_get_rotation(relative))
-else:
-    if plan.parent[local] < 0:
-        _store_origin(address, 2 * plan.root_of[local] + 1, wp.transform_get_translation(relative))
-        relative = wp.transform(wp.vec3(), wp.transform_get_rotation(relative))
-""",
-        poses=f"""
-scan_poses(address, plan)
-if wp.static(not forest):
-    if lane == 0:
-        root_body = data.joint_child[js]
-        origin = wp.transform_point(_load_pose(address, 0), data.body_com[root_body])
-        _store_origin(address, 0, origin)
-        data.articulation_origin[art] = origin + _load_origin(address, 1)
-else:
-    for root in range(lane, wp.static(roots), stride):
-        root_local = plan.root_local[root]
-        root_body = data.joint_child[js + root_local]
-        origin = wp.transform_point(_load_pose(address, root_local), data.body_com[root_body])
-        _store_origin(address, 2 * root, origin)
-        data.articulation_origin[plan.arts[group, root]] = origin + _load_origin(address, 2 * root + 1)
-_sync()
-origin = _load_origin(address, 0)
-shift = _load_origin(address, 1)
-{motion_bind}
-""",
-        motion=f"""
-for local in range(lane, bodies, stride):
-    {motion_clock[0]}
-    joint = js + local
-    parent = plan.parent[local]
-    if wp.static(forest):
-        origin = _load_origin(address, 2 * plan.root_of[local])
-        shift = _load_origin(address, 2 * plan.root_of[local] + 1)
-    anchor = data.joint_X_p[joint]
-    if parent >= 0:
-        anchor = _load_pose(address, parent) * anchor
-    else:
-        anchor = wp.transform(wp.transform_get_translation(anchor) - shift, wp.transform_get_rotation(anchor))
-    anchor = wp.transform(wp.transform_get_translation(anchor) - origin, wp.transform_get_rotation(anchor))
-    {motion_clock[1]}
-    velocity = kernels.jcalc_motion(
-        data.joint_type[joint],
-        data.joint_axis,
-        data.joint_dof_dim[joint, 0],
-        data.joint_dof_dim[joint, 1],
-        anchor,
-        qd,
-        data.joint_qd_start[joint],
-        data.joint_S_s,
-    )
-    {motion_clock[2]}
-    start = data.joint_qd_start[joint]
-    count = data.joint_dof_dim[joint, 0] + data.joint_dof_dim[joint, 1]
-    for k in range(count):
-        _store_axis(address, start - ds + k, data.joint_S_s[start + k])
-    _store_motion(address, local, velocity)
-    {motion_clock[3]}
-_sync()
-scan_motion(address, plan)
-""",
-        bodies="""
-for local in range(lane, bodies, stride):
-    body = data.joint_child[js + local]
-    if wp.static(forest):
-        origin = _load_origin(address, 2 * plan.root_of[local])
-        shift = _load_origin(address, 2 * plan.root_of[local] + 1)
-    pose = _load_pose(address, local)
-    data.body_q[body] = wp.transform(
-        wp.transform_get_translation(pose) + shift, wp.transform_get_rotation(pose)
-    )
-    _body_terms(
-        address,
-        body,
-        local,
-        group,
-        pose,
-        pose * data.body_X_com[body],
-        origin,
-        _load_motion(address, local, 0),
-        _load_motion(address, local, 1),
-        data,
-        cache,
-        refresh,
-    )
-_sync()
-""",
-        collect="""
-collect(address, group, p, plan, cache, refresh)
 
-if lane == 0:
-"""
-        + indent(stamp, "    "),
-    )
+    @wp.func
+    def admit(
+        block: int,
+        logical_lane: int,
+        p: sparse_factor.SparsePlan,
+        plan: plan_type,
+        data: PublicationData,
+        cache: KineticData,
+        requests: wp.array[int],
+        global_refresh: int,
+        motion_qd: wp.array[float],
+        repair_blocks: wp.array[int],
+        repair_count: wp.array[int],
+        bank: StateBank,
+    ) -> TreeGroup:
+        """Bind the group's threads; admit it unless a repair finds its current cache valid.
+
+        A listed repair takes its block from the list. A repair that compares
+        banks keeps the cache of a group stamped with ``bank`` whose input bank
+        holds the same words, and stamps it with the input bank.
+        """
+        g = TreeGroup()
+        lanes = _lanes()
+        g.lane = lanes[0]
+        g.stride = lanes[1]
+        if g.stride == 1 and logical_lane != 0:
+            return g
+        if wp.static(listed):
+            if block >= repair_count[0]:
+                return g
+            block = repair_blocks[block]
+        g.group = block * wp.static(pack) + lanes[2]
+        g.art = p.group_to_art[g.group]
+        g.ds = p.art_dof_start[g.art]
+        g.js = p.art_joint_start[g.art]
+        if wp.static(motion_velocity):
+            g.motion_changed = _different_motion(data.joint_qd, motion_qd, g.ds, dofs)
+        refresh = int(global_refresh != 0)
+        valid = cache.current_valid[g.art]
+        if wp.static(forest):
+            for root in range(1, wp.static(roots)):
+                valid = wp.min(valid, cache.current_valid[plan.arts[g.group, root]])
+        if not wp.static(finish):
+            refresh = int(refresh != 0 or requests[g.art] != 0)
+            if wp.static(forest):
+                for root in range(1, wp.static(roots)):
+                    refresh = int(refresh != 0 or requests[plan.arts[g.group, root]] != 0)
+            source_matches = _same_source(cache, g.group, data.joint_q, data.joint_qd)
+            if wp.static(banked):
+                rebind = int(0)
+                if valid != 0 and source_matches == 0:
+                    if _same_source(cache, g.group, bank.joint_q, bank.joint_qd) != 0:
+                        source_matches = _bank_matches(
+                            bank,
+                            data.joint_q_start[g.js],
+                            g.ds,
+                            g.js,
+                            data.joint_q,
+                            data.joint_qd,
+                            data.joint_child,
+                            data.body_q,
+                            data.body_qd,
+                        )
+                        rebind = source_matches
+            if (
+                valid != 0
+                and source_matches != 0
+                and g.motion_changed == 0
+                and (
+                    refresh == 0
+                    or (
+                        cache.geometry_valid[g.group] != 0
+                        and cache.geometry_generation[g.group] == cache.generation[g.group]
+                    )
+                )
+            ):
+                if wp.static(banked):
+                    if rebind != 0 and g.lane == 0:
+                        _stamp_source(cache, g.group, data.joint_q, data.joint_qd)
+                return g
+        g.refresh = refresh
+        if g.lane == 0:
+            cache.current_valid[g.art] = 0
+            if wp.static(forest):
+                for root in range(1, wp.static(roots)):
+                    cache.current_valid[plan.arts[g.group, root]] = 0
+        g.admitted = 1
+        return g
+
+    @wp.func
+    def accelerations(g: TreeGroup, data: PublicationData):
+        """Recover each coordinate's acceleration from its solved velocity."""
+        for local in range(g.lane, dofs, g.stride):
+            dof = g.ds + local
+            kernels._light_update_qdd_from_velocity(
+                dof,
+                data.joint_qd,
+                data.kinematic_dof_mask,
+                1.0 / data.dt,
+                data.v_out,
+                data.joint_qdd,
+            )
+        _sync()
+
+    @wp.func
+    def transport(g: TreeGroup, plan: plan_type, data: PublicationData):
+        """Remove the free roots' velocity transport from their accelerations."""
+        if wp.static(not forest):
+            if wp.static(free_root) and g.lane == 0:
+                kernels._light_remove_free_root_transport_from_qdd(
+                    plan.root_slot[g.group],
+                    data.free_root_joint_indices,
+                    data.joint_qd_start,
+                    data.kinematic_joint_mask,
+                    data.joint_qd,
+                    data.joint_qdd,
+                )
+        else:
+            if g.lane < wp.static(free_roots):
+                kernels._light_remove_free_root_transport_from_qdd(
+                    plan.root_slot[g.group * wp.static(free_roots) + g.lane],
+                    data.free_root_joint_indices,
+                    data.joint_qd_start,
+                    data.kinematic_joint_mask,
+                    data.joint_qd,
+                    data.joint_qdd,
+                )
+        _sync()
+
+    @wp.func
+    def integrate(g: TreeGroup, data: PublicationData):
+        """Integrate every joint's coordinates into the next state bank."""
+        for local in range(g.lane, bodies, g.stride):
+            joint = g.js + local
+            kernels._light_integrate_generalized_joints(
+                joint,
+                data.joint_type,
+                data.joint_parent,
+                data.joint_child,
+                data.joint_q_start,
+                data.joint_qd_start,
+                data.kinematic_joint_mask,
+                data.joint_dof_dim,
+                data.body_com,
+                data.joint_X_c,
+                data.joint_q,
+                data.joint_qd,
+                data.joint_qdd,
+                data.dt,
+                data.angular_damping,
+                data.joint_q_new,
+                data.joint_qd_new,
+            )
+        _sync()
+
+    @wp.func
+    def relative_poses(g: TreeGroup, plan: plan_type, data: PublicationData, q: wp.array[float]):
+        """Store each joint's pose in its parent; a root's translation goes to its origin slot."""
+        for local in range(g.lane, bodies, g.stride):
+            joint = g.js + local
+            transform = kernels.jcalc_transform(
+                data.joint_type[joint],
+                data.joint_axis,
+                data.joint_qd_start[joint],
+                data.joint_dof_dim[joint, 0],
+                data.joint_dof_dim[joint, 1],
+                q,
+                data.joint_q_start[joint],
+            )
+            relative = data.joint_X_p[joint] * transform * wp.transform_inverse(data.joint_X_c[joint])
+            if wp.static(not forest):
+                if local == 0:
+                    _store_origin(g.address, 1, wp.transform_get_translation(relative))
+                    relative = wp.transform(wp.vec3(), wp.transform_get_rotation(relative))
+            else:
+                if plan.parent[local] < 0:
+                    _store_origin(g.address, 2 * plan.root_of[local] + 1, wp.transform_get_translation(relative))
+                    relative = wp.transform(wp.vec3(), wp.transform_get_rotation(relative))
+            _store_pose(g.address, local, relative)
+        _sync()
+
+    @wp.func
+    def poses(g: TreeGroup, plan: plan_type, data: PublicationData):
+        """Complete the pose scan and publish each articulation's origin."""
+        scan_poses(g.address, plan)
+        if wp.static(not forest):
+            if g.lane == 0:
+                root_body = data.joint_child[g.js]
+                origin = wp.transform_point(_load_pose(g.address, 0), data.body_com[root_body])
+                _store_origin(g.address, 0, origin)
+                data.articulation_origin[g.art] = origin + _load_origin(g.address, 1)
+        else:
+            for root in range(g.lane, wp.static(roots), g.stride):
+                root_local = plan.root_local[root]
+                root_body = data.joint_child[g.js + root_local]
+                origin = wp.transform_point(_load_pose(g.address, root_local), data.body_com[root_body])
+                _store_origin(g.address, 2 * root, origin)
+                data.articulation_origin[plan.arts[g.group, root]] = origin + _load_origin(g.address, 2 * root + 1)
+        _sync()
+
+    @wp.func
+    def motion(
+        g: TreeGroup, origin: wp.vec3, shift: wp.vec3, plan: plan_type, data: PublicationData, qd: wp.array[float]
+    ):
+        """Store each joint's axes and relative velocity at the origin, then complete the motion scan.
+
+        ``clocked`` records local body 0's anchor, joint-motion and store
+        cycles in ``stage_clocks`` columns 22-24.
+        """
+        for local in range(g.lane, bodies, g.stride):
+            if wp.static(clocked):
+                clock_m0 = _clock()
+            joint = g.js + local
+            parent = plan.parent[local]
+            if wp.static(forest):
+                origin = _load_origin(g.address, 2 * plan.root_of[local])
+                shift = _load_origin(g.address, 2 * plan.root_of[local] + 1)
+            anchor = data.joint_X_p[joint]
+            if parent >= 0:
+                anchor = _load_pose(g.address, parent) * anchor
+            else:
+                anchor = wp.transform(wp.transform_get_translation(anchor) - shift, wp.transform_get_rotation(anchor))
+            anchor = wp.transform(wp.transform_get_translation(anchor) - origin, wp.transform_get_rotation(anchor))
+            if wp.static(clocked):
+                clock_m1 = _clock()
+            velocity = kernels.jcalc_motion(
+                data.joint_type[joint],
+                data.joint_axis,
+                data.joint_dof_dim[joint, 0],
+                data.joint_dof_dim[joint, 1],
+                anchor,
+                qd,
+                data.joint_qd_start[joint],
+                data.joint_S_s,
+            )
+            if wp.static(clocked):
+                clock_m2 = _clock()
+            start = data.joint_qd_start[joint]
+            count = data.joint_dof_dim[joint, 0] + data.joint_dof_dim[joint, 1]
+            for k in range(count):
+                _store_axis(g.address, start - g.ds + k, data.joint_S_s[start + k])
+            _store_motion(g.address, local, velocity)
+            if wp.static(clocked):
+                clock_m3 = _clock()
+                if local == 0 and data.stage_clocks.shape[0] > g.group:
+                    data.stage_clocks[g.group, 22] = clock_m1 - clock_m0
+                    data.stage_clocks[g.group, 23] = clock_m2 - clock_m1
+                    data.stage_clocks[g.group, 24] = clock_m3 - clock_m2
+        _sync()
+        scan_motion(g.address, plan)
+
+    @wp.func
+    def publish(
+        g: TreeGroup, origin: wp.vec3, shift: wp.vec3, plan: plan_type, data: PublicationData, cache: KineticData
+    ):
+        """Publish each body's pose and twist with its bias wrench and moments."""
+        for local in range(g.lane, bodies, g.stride):
+            body = data.joint_child[g.js + local]
+            if wp.static(forest):
+                origin = _load_origin(g.address, 2 * plan.root_of[local])
+                shift = _load_origin(g.address, 2 * plan.root_of[local] + 1)
+            pose = _load_pose(g.address, local)
+            data.body_q[body] = wp.transform(
+                wp.transform_get_translation(pose) + shift, wp.transform_get_rotation(pose)
+            )
+            body_terms(
+                g,
+                body,
+                local,
+                pose,
+                pose * data.body_X_com[body],
+                origin,
+                _load_motion(g.address, local, 0),
+                _load_motion(g.address, local, 1),
+                data,
+                cache,
+            )
+        _sync()
+
+    @wp.func
+    def close(
+        g: TreeGroup,
+        p: sparse_factor.SparsePlan,
+        plan: plan_type,
+        data: PublicationData,
+        cache: KineticData,
+        q: wp.array[float],
+        qd: wp.array[float],
+    ):
+        """Collect bias, geometry and validity, and record the state bank the cache now holds."""
+        collect(g.address, g.group, p, plan, cache, g.refresh)
+        if g.lane == 0:
+            if wp.static(motion_velocity):
+                # An override source must not be reused when a later begin returns to
+                # ordinary motion, even if no finish occurred between the two calls.
+                if g.motion_changed == 0:
+                    _stamp_source(cache, g.group, q, data.joint_qd)
+                else:
+                    _stamp_source(cache, g.group, q, qd)
+            else:
+                _stamp_source(cache, g.group, q, qd)
+
+    # One launch ABI for every finish and repair: motion_qd is the velocity an
+    # alternate-motion repair reads, repair_blocks and repair_count a listed
+    # repair's block list, bank the bank a comparing repair reads. Every other
+    # kernel leaves them unread.
+    def kinetic_state(
+        p: sparse_factor.SparsePlan,
+        plan: plan_type,
+        data: PublicationData,
+        cache: KineticData,
+        requests: wp.array[int],
+        global_refresh: int,
+        motion_qd: wp.array[float],
+        repair_blocks: wp.array[int],
+        repair_count: wp.array[int],
+        bank: StateBank,
+    ):
+        block, logical_lane = wp.tid()
+        g = admit(
+            block,
+            logical_lane,
+            p,
+            plan,
+            data,
+            cache,
+            requests,
+            global_refresh,
+            motion_qd,
+            repair_blocks,
+            repair_count,
+            bank,
+        )
+        if g.admitted == 0:
+            return
+        # Stage cycles of lane 0, stage_clocks columns 0-7: accelerations,
+        # root transport, joint integration, relative poses, poses, motion,
+        # publication, collection.
+        if wp.static(clocked):
+            clock_0 = _clock()
+        g.address = _storage()
+        q = data.joint_q
+        qd = data.joint_qd
+        if wp.static(finish):
+            accelerations(g, data)
+            if wp.static(clocked):
+                clock_i1 = _clock()
+            transport(g, plan, data)
+            if wp.static(clocked):
+                clock_i2 = _clock()
+            integrate(g, data)
+            q = data.joint_q_new
+            qd = data.joint_qd_new
+        if wp.static(clocked):
+            clock_1 = _clock()
+            if not wp.static(finish):
+                clock_i1 = clock_0
+                clock_i2 = clock_0
+        relative_poses(g, plan, data, q)
+        if wp.static(clocked):
+            clock_2 = _clock()
+        poses(g, plan, data)
+        origin = _load_origin(g.address, 0)
+        shift = _load_origin(g.address, 1)
+        if wp.static(motion_velocity):
+            qd = motion_qd
+        if wp.static(clocked):
+            clock_3 = _clock()
+        motion(g, origin, shift, plan, data, qd)
+        if wp.static(clocked):
+            clock_4 = _clock()
+        publish(g, origin, shift, plan, data, cache)
+        if wp.static(clocked):
+            clock_5 = _clock()
+        close(g, p, plan, data, cache, q, qd)
+        if wp.static(clocked):
+            clock_6 = _clock()
+            if g.lane == 0 and data.stage_clocks.shape[0] > g.group:
+                data.stage_clocks[g.group, 0] = clock_i1 - clock_0
+                data.stage_clocks[g.group, 1] = clock_i2 - clock_i1
+                data.stage_clocks[g.group, 2] = clock_1 - clock_i2
+                data.stage_clocks[g.group, 3] = clock_2 - clock_1
+                data.stage_clocks[g.group, 4] = clock_3 - clock_2
+                data.stage_clocks[g.group, 5] = clock_4 - clock_3
+                data.stage_clocks[g.group, 6] = clock_5 - clock_4
+                data.stage_clocks[g.group, 7] = clock_6 - clock_5
+        release(g.address)
+
     name = f"tree_kinetic_finish{bodies}" if finish else f"tree_kinetic_repair{bodies}"
     if layout.forest:
         name += f"_forest{roots}"
@@ -1166,25 +1473,14 @@ if lane == 0:
         name += f"_l{layout.lanes}"
     if chain_scan:
         name += "_chain"
-    signature = "p: sparse_factor.SparsePlan, plan: plan_type, data: PublicationData, cache: KineticData, requests: wp.array[int], global_refresh: int"
     if motion_velocity:
         name += "_motion"
-        signature += ", motion_qd: wp.array[float]"
     if listed:
         name += "_listed"
-        signature += ", repair_blocks: wp.array[int], repair_count: wp.array[int]"
-    if bank_coordinates:
+    if banked:
         name += "_banked"
-        signature += ", bank: StateBank"
-    return make_state_kernel(
-        name,
-        signature,
-        operands,
-        stages,
-        dict(globals(), **locals(), _release=release),
-        finish=finish,
-        clocked=clocked,
-    )
+    kinetic_state.__name__ = kinetic_state.__qualname__ = name
+    return wp.kernel(module="unique", enable_backward=False)(kinetic_state)
 
 
 @functools.cache
