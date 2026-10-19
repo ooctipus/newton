@@ -251,6 +251,14 @@ def _exact_template(pair_count, staged):
     )
 
 
+_LAUNCH_TILED = wp.launch_tiled
+
+
+def _launch_tiled_one_block(*args, **kwargs):
+    """``wp.launch_tiled`` with the CUDA grid capped at one block."""
+    return _LAUNCH_TILED(*args, **kwargs, max_blocks=1)
+
+
 def test_layout_shapes_match_flat_kernel(test, device):
     """Choose lanes per world and worlds per block, and test each launch shape like the flat kernel."""
     expectations = (
@@ -272,6 +280,15 @@ def test_layout_shapes_match_flat_kernel(test, device):
             flat, template = _launch_both(pairs, layout, lower, upper)
             test.assertGreater(flat[1], 0)
             _assert_same_candidates(test, device, flat, template, pairs.shape[0])
+            # Each thread runs one logical block (shared memory is staged once per block), so the
+            # kernel has no grid-stride loop and a capped CUDA grid is refused.
+            test.assertIs(layout._kernel.options.get("grid_stride"), False)
+            if device.is_cuda:
+                with (
+                    mock.patch.object(wp, "launch_tiled", _launch_tiled_one_block),
+                    test.assertRaisesRegex(RuntimeError, "grid_stride"),
+                ):
+                    _launch_both(pairs, layout, lower, upper)
 
 
 def test_static_pairs_filtered_without_body_flags(test, device):

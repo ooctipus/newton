@@ -327,7 +327,10 @@ def _pair_template_kernel(slots: int, threads: int, worlds: int):
         )
 
     kernel.__name__ = kernel.__qualname__ = f"broad_phase_pair_templates_{slots}_{threads}_{worlds}"
-    return wp.kernel(enable_backward=False, module="unique")(kernel)
+    # The CUDA snippet stages one block's worlds in shared memory behind a single
+    # __syncthreads(), so each thread must run exactly one logical block: no
+    # grid-stride loop, and Warp refuses a launch that caps the grid.
+    return wp.kernel(enable_backward=False, module="unique", grid_stride=False)(kernel)
 
 
 @wp.kernel(enable_backward=False)
