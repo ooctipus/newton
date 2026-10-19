@@ -835,12 +835,46 @@ def _sweep_kernels(solver, record) -> set:
     return keys
 
 
+def _uncounted_worlds(record) -> dict:
+    """Owners whose sweeps solve whole worlds without counters, with the worlds each one solves.
+
+    Those worlds hold rows, so the skip counter leaves them out, and the counted sweeps do not enter
+    them: their solves are in no slot and not skipped. The incremental tiers count their own worlds.
+    """
+    owners = {}
+    tiers = record["tiers"] or {}
+    if tiers.get("family") in ("parallel", "keyed_parallel"):
+        rows = max(int(tier["rows"]) for tier in tiers["tiers"])
+        owners["parallel_tiers"] = (
+            f"Worlds without matrix-free rows and with 1 to {rows} dense rows that no local owner claims: the "
+            "parallel (Jacobi) tiers solve them under their own sweep budget and mf_gs_parallel_tol, and the "
+            "matrix-free sweep returns before its first sweep."
+        )
+    if record["response_block"]:
+        owners["response_block"] = (
+            "Worlds the response-block build claims: the response-block sweeps solve them, and the matrix-free "
+            "sweep returns before its first sweep."
+        )
+    if record["dense_tiles"]:
+        owners["dense_tiles"] = (
+            "Every world's dense rows on the multi-block driver: the dense-tile kernels sweep them at row phase 6 "
+            "in place of the matrix-free sweep."
+        )
+    if record["propagation"] is not None:
+        owners["propagation"] = (
+            "Worlds whose rows are all propagation rows: the propagation sweeps solve them, and the other sweeps "
+            "return before their first sweep."
+        )
+    return owners
+
+
 def _readout(solver, record) -> dict:
     """Which sweep kernels of the route count their sweeps under ``pgs_solve_readout``, and why the others do not."""
     counted = solver._solve_readout.kernels
     uncounted = sorted(_sweep_kernels(solver, record) - counted.keys())
     if record["response_block"]:
         uncounted.append("response_block")
+    uncounted_worlds = _uncounted_worlds(record) if counted else {}
     if solver.pgs_solve_readout == "off":
         reason = "pgs_solve_readout is off."
     elif not counted:
@@ -853,10 +887,17 @@ def _readout(solver, record) -> dict:
         reason = "Contact and internal rows sweep in separate launches, so a solve counts once per launch."
     else:
         reason = f"The {record['driver']} driver runs part of a solve per launch, so counts are per launch."
+    if uncounted_worlds:
+        reason += (
+            " The owners in uncounted_worlds solve whole worlds without counters: those solves are in no slot "
+            "and not skipped."
+        )
     return {
         "mode": solver.pgs_solve_readout if counted else "off",
         "counted": dict(sorted(counted.items())),
         "uncounted": uncounted if counted else [],
+        # Owners of whole worlds whose solves neither a slot nor the skip counter counts, with those worlds.
+        "uncounted_worlds": uncounted_worlds,
         # Variants that could not compile the requested trace count their sweeps without it.
         "declined": dict(sorted(solver._solve_policy_declined.items())) if solver.pgs_solve_readout == "trace" else {},
         # Passes whose solves of worlds without rows, which the matrix-free sweeps do not enter, count as skipped.

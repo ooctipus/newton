@@ -831,6 +831,41 @@ class TestSweepPolicyRecords(unittest.TestCase):
         self.assertIn("once per launch", path_selection._readout(_policy_solver(), record)["reason"])
         self.assertIn("solves its worlds", path_selection._readout(_policy_solver(), _sweep_record())["reason"])
 
+    def test_records_name_the_worlds_no_counter_counts(self):
+        """Name each owner that solves whole worlds without counters, and none where counted sweeps own every world.
+
+        The matrix-free sweep returns before its first sweep for the worlds the parallel tiers, the
+        response-block sweeps or the multi-block driver's dense tiles own, and the propagation sweeps
+        solve the worlds whose rows are all propagation rows. Those worlds hold rows, so the skip
+        counter leaves them out too: without a record their solves would vanish from the summary.
+        The incremental tiers count their own worlds.
+        """
+        parallel = {"family": "parallel", "tiers": [{"rows": 32, "kernel": "tier32"}, {"rows": 48, "kernel": "tier48"}]}
+        incremental = {"family": "incremental", "tiers": [{"kernel": "incremental_kernel"}]}
+        propagation = {"mode": "propagation", "row_solve": "propagation_kernel", "cached_response": False}
+        for fields, owners in (
+            ({}, []),
+            ({"tiers": incremental}, []),
+            ({"tiers": parallel}, ["parallel_tiers"]),
+            ({"tiers": {**parallel, "family": "keyed_parallel"}}, ["parallel_tiers"]),
+            ({"response_block": True}, ["response_block"]),
+            ({"propagation": propagation, "driver": "propagation_phases"}, ["propagation"]),
+            ({"dense_tiles": True, "driver": "multiblock"}, ["dense_tiles"]),
+        ):
+            with self.subTest(fields=sorted(fields)):
+                readout = path_selection._readout(_policy_solver(), _sweep_record(**fields))
+                self.assertEqual(sorted(readout["uncounted_worlds"]), owners)
+                if owners:
+                    self.assertIn("uncounted_worlds", readout["reason"])
+                json.dumps(readout, allow_nan=False)
+        # The tiers' worlds are bounded by the largest tier's rows.
+        readout = path_selection._readout(_policy_solver(), _sweep_record(tiers=parallel))
+        self.assertIn("1 to 48 dense rows", readout["uncounted_worlds"]["parallel_tiers"])
+        # Without counted sweeps nothing is counted, so no owner is named.
+        solver = _policy_solver(readout="off")
+        solver._solve_readout = SimpleNamespace(kernels={}, skipped_passes=())
+        self.assertEqual(path_selection._readout(solver, _sweep_record(tiers=parallel))["uncounted_worlds"], {})
+
     def test_records_name_the_passes_that_count_skipped_solves(self):
         """Name the passes whose solves of worlds without rows count as skipped, and none without counted sweeps."""
         record = _sweep_record()

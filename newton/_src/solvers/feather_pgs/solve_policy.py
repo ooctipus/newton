@@ -434,10 +434,14 @@ class SolveReadoutRecord:
     rows: the route that launches them registers skip counters
     (:meth:`register_skipped`) and counts, at each launch
     (:meth:`count_skipped`), the worlds without rows of any family, so a
-    world's solves are its slots' solves plus its skipped ones. On the
-    propagation contact routes the uncounted propagation sweeps solve a world
-    whose rows are all propagation rows; neither a slot nor the skip counter
-    counts its solves.
+    world's solves are its slots' solves plus its skipped ones. Sweeps
+    without counters can own whole worlds that hold rows: the parallel
+    (Jacobi) tiers and the response-block sweeps the worlds they claim from
+    the matrix-free sweep, the multi-block driver's dense tiles every world's
+    dense rows, and the propagation sweeps a world whose rows are all
+    propagation rows. Neither a slot nor the skip counter counts those
+    solves; the route record names their owners
+    (``routes.sweep.readout.uncounted_worlds``).
     """
 
     def __init__(self, policy: SolvePolicy):
@@ -577,9 +581,10 @@ class SolveReadoutRecord:
         counters, the ``solves`` of worlds without dense, matrix-free or
         propagation rows, which entered no sweep, and the number of ``worlds``
         they came from: the matrix-free sweeps return before their first sweep
-        for such a world, so no slot counts it. Each solve of a world without
-        propagation rows is counted once, by a slot or here; the propagation
-        sweeps, which solve the others, carry no counters.
+        for such a world, so no slot counts it. Each solve of a world that a
+        counted sweep owns is counted once, by a slot or here; the worlds that
+        sweeps without counters own, which hold rows, are counted by neither
+        (``routes.sweep.readout.uncounted_worlds``).
         """
         slots = []
         for (key, _), slot in self._slots.items():
