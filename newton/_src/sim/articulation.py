@@ -1223,16 +1223,23 @@ def _zero_selected_articulation_blocks(
             row += 1
 
 
-_MASKED_CLEAR_MIN_BLOCK_ENTRIES = 1024
-"""Block size, in entries, from which a masked :func:`eval_jacobian` zeroes only the selected blocks.
+_MASKED_CLEAR_MIN_BLOCK_ENTRIES: dict[str, int | None] = {"cuda": 1024, "cpu": None}
+"""Block size, in entries, from which a masked :func:`eval_jacobian` zeroes only the selected blocks, per device kind.
 
-Smaller blocks are zeroed with the rest of the Jacobian by one memset, which the
-per-block clear does not beat there. Measured on an RTX PRO 6000 (Blackwell) with
-every block selected, the per-block clear took 1.9 to 8.9 times the memset's time on
-blocks of 6 to 252 entries, and 1.05 to 1.12 times on 594-entry blocks (0.86 times
-with every other block selected). From 1026 entries on it took at most 1.03 times
-the memset's time with every block selected and 0.50 to 0.65 times with every other
-block selected. No size between 594 and 1026 entries was measured.
+Smaller blocks, and every block on a device kind mapped to ``None``, are zeroed with
+the rest of the Jacobian by ``J.zero_()``, one memset when ``J`` is contiguous.
+Measured against that memset on an RTX PRO 6000 (Blackwell), the only GPU measured,
+the per-block kernel took 1.9 to 8.9 times as long on blocks of 6 to 252 entries with
+every block selected, and 1.05 to 1.12 times on 594-entry blocks (0.86 times with
+every other block selected). From 1026 entries on it took at most 1.03 times as long
+with every block selected and 0.50 to 0.65 times with every other block selected. No
+size between 594 and 1026 entries was measured. On the CPU the per-block kernel's
+threads run serially: it took 8.5 ms against the memset's 0.45 ms on a
+128 x 654 x 108 Jacobian with half of the blocks selected. A NumPy fill of the
+selected blocks, the other CPU candidate, took 1.2 to 5.1 times as long as the memset
+with every block selected, and 1.0 to 3.2 times with every other block selected on
+Jacobians of 0.5 to 67 MB (0.59 times on 289 MB), for blocks of 1024 to 70632
+entries.
 """
 
 _CLEAR_REPLAY_CAPACITY = 16
@@ -1253,8 +1260,9 @@ _warp_config = vars(wp.config)
 """Warp's live configuration values.
 
 Reading them here skips the Python attribute hook of :mod:`warp.config`, which costs
-about 0.1 us per read: the four reads of a replayed clear would add 30% to its host
-time on the CPU.
+about 0.1 us per read. A replayed clear reads four of them; on an RTX PRO 6000 the
+replayed clear of a small model (4096 blocks of 24 entries) took 3.3 us per call, to
+which the hook would add about 11%.
 """
 
 
@@ -1286,9 +1294,10 @@ def _clear_launch_arguments(
 def _launch_zero_selected_blocks(
     blocks: wp.array3d[float], mask: wp.array[bool], articulation_count: int, device: wp.Device
 ) -> None:
-    """Launch :func:`_zero_selected_articulation_blocks` on the first ``articulation_count`` blocks.
+    """Zero the blocks that ``mask`` selects among the first ``articulation_count`` and leave the others untouched.
 
-    A call with Warp arrays replays the launch recorded for the same arrays and
+    The clear is a launch of :func:`_zero_selected_articulation_blocks`. A call with
+    Warp arrays replays the launch recorded for the same arrays and
     articulation count, which reads the values that a :func:`warp.launch` of them
     would. Packing a launch costs more host time than the clear takes on a small
     model, where it would make the clear slower than the whole-buffer memset it
@@ -1346,46 +1355,22 @@ def _launch_zero_selected_blocks(
     launch.launch()
 
 
-def _zero_selected_blocks(
-    blocks: wp.array3d[float], mask: wp.array[bool], articulation_count: int, device: wp.Device
-) -> None:
-    """Zero the per-articulation blocks that ``mask`` selects and leave the others untouched.
-
-    On the CPU a NumPy fill clears the selected blocks: the kernel's threads run
-    serially there. The fill is host code, which a graph capture does not record, so
-    a capture takes a kernel, which reads the mask when the graph replays. So does
-    any mask other than a Boolean Warp array on ``device`` with an entry per
-    articulation: the launch then converts or rejects it as the Jacobian launch does.
-    """
-    if (
-        device.is_cpu
-        and not device.is_capturing
-        and isinstance(blocks, wp.array)
-        and isinstance(mask, wp.array)
-        and blocks.device == device
-        and mask.device == device
-        and mask.dtype is wp.bool
-        and mask.ndim == 1
-        and mask.shape[0] >= articulation_count
-    ):
-        blocks.numpy()[:articulation_count][mask.numpy()[:articulation_count]] = 0.0
-    else:
-        _launch_zero_selected_blocks(blocks, mask, articulation_count, device)
-
-
 def _clear_jacobian(
     J: wp.array3d[float], mask: wp.array[bool] | None, articulation_count: int, device: wp.Device
 ) -> None:
     """Zero what :func:`eval_jacobian` needs zeroed in a supplied ``J``: every block that ``mask`` selects.
 
-    Without a mask, or with blocks of fewer than :data:`_MASKED_CLEAR_MIN_BLOCK_ENTRIES`
-    entries, one memset zeroes the whole of ``J``. Otherwise only the selected blocks
-    are zeroed, so the cost follows the selection and the other blocks keep the
-    caller's values. The choice depends on the shape of ``J`` alone: it never reads
-    the mask, and a graph capture records the same clear for every mask.
+    Without a mask, with no entry for the device kind in
+    :data:`_MASKED_CLEAR_MIN_BLOCK_ENTRIES`, or with blocks under that entry,
+    ``J.zero_()`` clears the whole of ``J`` (one memset when ``J`` is contiguous).
+    Otherwise only the selected blocks are zeroed, so the cost follows the selection
+    and the other blocks keep the caller's values. The choice depends on the device
+    and the shape of ``J`` alone: it never reads the mask, and a graph capture
+    records the same clear for every mask.
     """
-    if mask is not None and J.shape[1] * J.shape[2] >= _MASKED_CLEAR_MIN_BLOCK_ENTRIES:
-        _zero_selected_blocks(J, mask, articulation_count, device)
+    min_entries = _MASKED_CLEAR_MIN_BLOCK_ENTRIES["cuda" if device.is_cuda else "cpu"]
+    if mask is not None and min_entries is not None and J.shape[1] * J.shape[2] >= min_entries:
+        _launch_zero_selected_blocks(J, mask, articulation_count, device)
     else:
         J.zero_()
 
@@ -1417,8 +1402,8 @@ def eval_jacobian(
               The block ``J[i]`` of each selected articulation is overwritten in
               full, with zeros in the rows past its links and the columns past its
               DOFs. Blocks of unselected articulations are either zeroed or left
-              unchanged, and which is unspecified (it may depend on the shape of
-              ``J``); zero ``J`` first if code reads them.
+              unchanged, and which is unspecified (it may depend on the device and
+              the shape of ``J``); zero ``J`` first if code reads them.
 
     Returns:
         The Jacobian array J, or None if the model has no articulations.

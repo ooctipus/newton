@@ -21,7 +21,6 @@ from newton._src.sim.articulation import (
     _clear_replays,
     _launch_zero_selected_blocks,
     _zero_selected_articulation_blocks,
-    _zero_selected_blocks,
 )
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
@@ -284,8 +283,8 @@ def _filled(shape, value, device):
     return wp.array(np.full(shape, value, dtype=np.float32), dtype=float, device=device)
 
 
-_CLEAR_ROUTES = {"whole buffer": 2**62, "selected blocks": 0}
-"""Crossover block sizes that send every masked eval_jacobian through one clear.
+_CLEAR_ROUTES = {"whole buffer": None, "selected blocks": 0}
+"""Crossover block sizes that send every masked eval_jacobian through one clear, on every device.
 
 ``"whole buffer"`` zeroes the whole Jacobian with one memset, ``"selected blocks"``
 only the blocks that the mask selects.
@@ -294,7 +293,8 @@ only the blocks that the mask selects.
 
 def _clear_route(route):
     """Return a patch under which every masked eval_jacobian takes ``route``, a key of :data:`_CLEAR_ROUTES`."""
-    return mock.patch.object(articulation_module, "_MASKED_CLEAR_MIN_BLOCK_ENTRIES", _CLEAR_ROUTES[route])
+    crossover = _CLEAR_ROUTES[route]
+    return mock.patch.dict(articulation_module._MASKED_CLEAR_MIN_BLOCK_ENTRIES, {"cpu": crossover, "cuda": crossover})
 
 
 def _unselected_after_clear(route):
@@ -370,7 +370,9 @@ def _jacobian_clear_route(model, state, J, mask):
     with (
         patches[0],
         patches[1],
-        mock.patch.object(articulation_module, "_zero_selected_blocks", wraps=_zero_selected_blocks) as clear,
+        mock.patch.object(
+            articulation_module, "_launch_zero_selected_blocks", wraps=_launch_zero_selected_blocks
+        ) as clear,
     ):
         newton.eval_jacobian(model, state, J, mask=mask)
     whole = sum(ptr == J.ptr for ptr, _shape, _dtype in cleared)
@@ -875,13 +877,17 @@ def test_jacobian_mask_overwrites_selected_blocks(test, device):
 
 
 def test_jacobian_mask_clear_follows_block_size(test, device):
-    """Zero small Jacobians whole and only the selected blocks of large ones, whatever the mask selects.
+    """Zero Jacobians with small blocks, and all CPU Jacobians, whole; on CUDA zero only the selected large blocks.
 
-    Blocks under the crossover size are zeroed with the rest of the buffer by one
-    memset, which a masked clear kernel does not beat there; from that size on only
-    the selected blocks are cleared and the others keep their values. The choice
-    reads the block size alone, so masks that select every articulation, some or
-    none take the same clear. Without a mask the whole buffer is cleared.
+    Blocks under the device's crossover size are zeroed with the rest of the buffer
+    by one memset, which a masked clear does not beat there; from that size on only
+    the selected blocks are cleared and the others keep their values. The CPU has no
+    crossover: the per-block kernel's threads run serially there, and a host fill of
+    the selected blocks is slower than the memset unless few blocks are selected.
+    The choice reads the device and the block size alone, so masks that select every
+    articulation, some or none take the same clear. Without a mask the whole buffer
+    is cleared. On CUDA this is the test of the shipped crossover: 252-entry blocks
+    take the memset and 2052-entry blocks the per-block clear.
     """
     selections = {
         "none": np.zeros(4, dtype=bool),
@@ -889,7 +895,8 @@ def test_jacobian_mask_clear_follows_block_size(test, device):
         "all": np.ones(4, dtype=bool),
     }
     # Blocks of 42 x 6 = 252 and 114 x 18 = 2052 entries.
-    for leaf_count, route in ((6, "whole buffer"), (18, "selected blocks")):
+    for leaf_count, cuda_route in ((6, "whole buffer"), (18, "selected blocks")):
+        route = cuda_route if device.is_cuda else "whole buffer"
         model, state = _build_fans(device, leaf_count)
         J_ref = newton.eval_jacobian(model, state).numpy()
         for name, selected in selections.items():
@@ -909,10 +916,11 @@ def test_jacobian_mask_clear_follows_block_size(test, device):
     # A block of exactly the crossover size takes the selected-block clear.
     mask = wp.array(selections["some"], dtype=bool, device=device)
     block_size = J_ref.shape[1] * J_ref.shape[2]
-    for crossover, route in ((block_size, "selected blocks"), (block_size + 1, "whole buffer")):
+    kind = "cuda" if device.is_cuda else "cpu"
+    for crossover, route in ((block_size, "selected blocks"), (block_size + 1, "whole buffer"), (None, "whole buffer")):
         with (
             test.subTest(crossover=crossover),
-            mock.patch.object(articulation_module, "_MASKED_CLEAR_MIN_BLOCK_ENTRIES", crossover),
+            mock.patch.dict(articulation_module._MASKED_CLEAR_MIN_BLOCK_ENTRIES, {kind: crossover}),
         ):
             J = _filled(J_ref.shape, _SENTINEL, device)
             test.assertEqual(_jacobian_clear_route(model, state, J, mask), route)
@@ -931,7 +939,7 @@ def test_jacobian_mask_without_buffer_zeroes_unselected(test, device):
 
 
 def test_articulation_view_jacobian_overwrites_view_blocks(test, device):
-    """Overwrite the view's articulation blocks, narrowed by a per-world mask, and no others' values."""
+    """Overwrite the view's blocks, narrowed by a per-world mask, and leave the others zeroed or unchanged."""
     model, state = _build_mixed_articulations(device)
     J_ref = newton.eval_jacobian(model, state).numpy()
     view = newton.selection.ArticulationView(model, "fan", verbose=False)
@@ -1039,7 +1047,7 @@ def test_mass_matrix_scratch_skips_redundant_clears(test, device):
 
 
 def test_zero_selected_blocks_matches_numpy(test, device):
-    """Zero exactly the selected per-articulation blocks, through the device path and through the kernel.
+    """Zero exactly the selected per-articulation blocks through the clear kernel.
 
     Block sizes range from one entry, under a warp, to far more entries than the 256
     threads that walk a block, odd sizes included. A buffer may hold more blocks than
@@ -1050,41 +1058,40 @@ def test_zero_selected_blocks_matches_numpy(test, device):
     selected = np.array([True, False, True, True, False])
     mask = wp.array(selected, dtype=bool, device=device)
     shapes = ((5, 1, 1), (5, 6, 1), (5, 12, 2), (5, 1, 300), (5, 66, 31), (5, 37, 33), (5, 64, 32), (5, 654, 108))
-    for clear in (_zero_selected_blocks, _launch_zero_selected_blocks):
-        for shape in shapes:
-            with test.subTest(clear=clear.__name__, shape=shape):
-                values = rng.normal(size=shape).astype(np.float32)
-                blocks = wp.array(values, dtype=float, device=device)
-                clear(blocks, mask, shape[0], device)
-                expected = values.copy()
-                expected[selected] = 0.0
-                _assert_bits_equal(blocks.numpy(), expected)
-
-        with test.subTest(clear=clear.__name__, shape="more blocks than articulations"):
-            values = rng.normal(size=(7, 6, 2)).astype(np.float32)
+    for shape in shapes:
+        with test.subTest(shape=shape):
+            values = rng.normal(size=shape).astype(np.float32)
             blocks = wp.array(values, dtype=float, device=device)
-            clear(blocks, wp.array(np.append(selected, True), dtype=bool, device=device), 5, device)
+            _launch_zero_selected_blocks(blocks, mask, shape[0], device)
             expected = values.copy()
-            expected[:5][selected] = 0.0
+            expected[selected] = 0.0
             _assert_bits_equal(blocks.numpy(), expected)
 
-        with test.subTest(clear=clear.__name__, shape="misaligned buffer"):
-            values = rng.normal(size=1 + 5 * 12).astype(np.float32)
-            whole = wp.array(values, dtype=float, device=device)
-            clear(whole[1:].reshape((5, 6, 2)), mask, 5, device)
-            expected = values.copy()
-            expected[1:].reshape(5, 12)[selected] = 0.0
-            _assert_bits_equal(whole.numpy(), expected)
+    with test.subTest(shape="more blocks than articulations"):
+        values = rng.normal(size=(7, 6, 2)).astype(np.float32)
+        blocks = wp.array(values, dtype=float, device=device)
+        _launch_zero_selected_blocks(blocks, wp.array(np.append(selected, True), dtype=bool, device=device), 5, device)
+        expected = values.copy()
+        expected[:5][selected] = 0.0
+        _assert_bits_equal(blocks.numpy(), expected)
 
-        # The first view starts 256 bytes into the buffer, the second 380 bytes.
-        for name, rows, cols in (("aligned", slice(2, 10), slice(4, 16)), ("misaligned", slice(3, 11), slice(5, 17))):
-            with test.subTest(clear=clear.__name__, shape=f"{name} strided view"):
-                values = rng.normal(size=(5, 20, 30)).astype(np.float32)
-                whole = wp.array(values, dtype=float, device=device)
-                clear(whole[:, rows, cols], mask, 5, device)
-                expected = values.copy()
-                expected[selected, rows, cols] = 0.0
-                _assert_bits_equal(whole.numpy(), expected)
+    with test.subTest(shape="misaligned buffer"):
+        values = rng.normal(size=1 + 5 * 12).astype(np.float32)
+        whole = wp.array(values, dtype=float, device=device)
+        _launch_zero_selected_blocks(whole[1:].reshape((5, 6, 2)), mask, 5, device)
+        expected = values.copy()
+        expected[1:].reshape(5, 12)[selected] = 0.0
+        _assert_bits_equal(whole.numpy(), expected)
+
+    # The first view starts 256 bytes into the buffer, the second 380 bytes.
+    for name, rows, cols in (("aligned", slice(2, 10), slice(4, 16)), ("misaligned", slice(3, 11), slice(5, 17))):
+        with test.subTest(shape=f"{name} strided view"):
+            values = rng.normal(size=(5, 20, 30)).astype(np.float32)
+            whole = wp.array(values, dtype=float, device=device)
+            _launch_zero_selected_blocks(whole[:, rows, cols], mask, 5, device)
+            expected = values.copy()
+            expected[selected, rows, cols] = 0.0
+            _assert_bits_equal(whole.numpy(), expected)
 
 
 def test_zero_selected_blocks_launches_whole_warps_per_block(test, device):
@@ -1288,20 +1295,6 @@ def test_zero_selected_blocks_replay_cache_takes_concurrent_records(test, device
                 _assert_bits_equal(blocks.numpy(), expected)
 
 
-def test_zero_selected_blocks_fills_cpu_memory_on_host(test, device):
-    """Clear selected CPU blocks with a host fill, not the kernel, whose per-entry loop runs far slower on CPU."""
-    blocks = wp.array(np.ones((4, 6, 3), dtype=np.float32), dtype=float, device=device)
-    mask = wp.array([True, False, True, False], dtype=bool, device=device)
-
-    with mock.patch.object(wp, "launch", wraps=wp.launch) as launch:
-        _zero_selected_blocks(blocks, mask, 4, device)
-
-    test.assertEqual(launch.call_count, 0)
-    expected = np.ones((4, 6, 3), dtype=np.float32)
-    expected[[0, 2]] = 0.0
-    _assert_bits_equal(blocks.numpy(), expected)
-
-
 def test_jacobian_mask_accepts_masks_the_launch_converts(test, device):
     """Select the same articulations from masks that only the kernel launch accepts as from an exact mask.
 
@@ -1405,11 +1398,11 @@ def test_jacobian_mask_clear_is_not_taped(test, device):
     overwrites ``J.grad``: the per-block kernel's adjoint writes into unselected
     blocks and past ``J``. Graph captures and, on the CPU, NumPy masks launch the
     clear through :func:`warp.launch`. ``J`` views the front of a larger buffer, so a
-    gradient write past ``J`` shows in the buffer's tail. Every case must leave the
-    gradient of the eager call, whose clear the tape never sees.
+    gradient write past ``J`` shows in the buffer's tail. Every case, on either
+    clear, must leave the gradient of the eager call, whose clear the tape never sees.
     """
     selected = np.array([False, True, False, True])
-    for leaf_count in (6, 18):  # 252- and 2052-entry blocks: the whole-buffer memset and the per-block kernel
+    for leaf_count in (6, 18):  # blocks of 252 and 2052 entries
         model, state = _build_fans(device, leaf_count)
         shape = _jacobian_shape(model)
         size = int(np.prod(shape))
@@ -1427,27 +1420,29 @@ def test_jacobian_mask_clear_is_not_taped(test, device):
         def numpy_mask(J, model=model, state=state, joint_S_s=joint_S_s):
             newton.eval_jacobian(model, state, J, joint_S_s=joint_S_s, mask=selected)
 
-        # Load the modules eagerly; a capture cannot compile them.
-        eager(wp.zeros(shape, dtype=float, device=device))
         cases = {"eager": eager, "capture": captured}
         if device.is_cpu:
             cases["NumPy mask"] = numpy_mask
-        gradients = {}
-        for name, evaluate in cases.items():
-            with test.subTest(leaves=leaf_count, case=name):
-                buffer = wp.zeros(size + 4096, dtype=float, device=device, requires_grad=True)
-                tape = wp.Tape()
-                with tape:
-                    evaluate(buffer[:size].reshape(shape))
-                taped = [launch[0].key for launch in tape.launches]
-                test.assertNotIn(_zero_selected_articulation_blocks.key, taped)
+        for route in _CLEAR_ROUTES:
+            gradients = {}
+            with _clear_route(route):
+                # Load the modules eagerly; a capture cannot compile them.
+                eager(wp.zeros(shape, dtype=float, device=device))
+                for name, evaluate in cases.items():
+                    with test.subTest(leaves=leaf_count, route=route, case=name):
+                        buffer = wp.zeros(size + 4096, dtype=float, device=device, requires_grad=True)
+                        tape = wp.Tape()
+                        with tape:
+                            evaluate(buffer[:size].reshape(shape))
+                        taped = [launch[0].key for launch in tape.launches]
+                        test.assertNotIn(_zero_selected_articulation_blocks.key, taped)
 
-                buffer.grad.fill_(1.0)
-                tape.backward()
-                gradients[name] = buffer.grad.numpy()
-                np.testing.assert_array_equal(gradients[name][size:], 1.0)
-                np.testing.assert_array_equal(gradients[name][:size].reshape(shape[0], -1)[~selected], 1.0)
-                _assert_bits_equal(gradients[name], gradients["eager"])
+                        buffer.grad.fill_(1.0)
+                        tape.backward()
+                        gradients[name] = buffer.grad.numpy()
+                        np.testing.assert_array_equal(gradients[name][size:], 1.0)
+                        np.testing.assert_array_equal(gradients[name][:size].reshape(shape[0], -1)[~selected], 1.0)
+                        _assert_bits_equal(gradients[name], gradients["eager"])
 
 
 def test_prismatic_joint_jacobian(test, device):
@@ -1922,12 +1917,6 @@ add_function_test(
     TestJacobianMassMatrix,
     "test_zero_selected_blocks_replay_cache_takes_concurrent_records",
     test_zero_selected_blocks_replay_cache_takes_concurrent_records,
-    devices=[device for device in devices if device.is_cpu],
-)
-add_function_test(
-    TestJacobianMassMatrix,
-    "test_zero_selected_blocks_fills_cpu_memory_on_host",
-    test_zero_selected_blocks_fills_cpu_memory_on_host,
     devices=[device for device in devices if device.is_cpu],
 )
 add_function_test(
