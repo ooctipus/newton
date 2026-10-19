@@ -15,6 +15,7 @@ from newton._src.geometry.contact_reduction_global import (
     GlobalContactReducerData,
     export_contact_to_buffer,
 )
+from newton.tests.unittest_utils import StdOutCapture
 
 
 @wp.kernel
@@ -54,8 +55,18 @@ class TestContactReductionOverflow(unittest.TestCase):
                 getattr(reducer, field).fill_(1)
                 # Inject a producer failure to isolate the status handoff from
                 # shape-pair selection; buffer exhaustion is exercised above.
-                with patch.object(pipeline.narrow_phase, "global_contact_reducer", reducer):
-                    pipeline.collide(state, contacts)
+                capture = StdOutCapture()
+                capture.begin()
+                try:
+                    with patch.object(pipeline.narrow_phase, "global_contact_reducer", reducer):
+                        pipeline.collide(state, contacts)
+                    # CUDA holds device printf output until the host synchronizes, which
+                    # would otherwise print the warning inside a later test.
+                    wp.synchronize_device(device)
+                finally:
+                    printed = capture.end()
+                if field == "ht_insert_failures":
+                    self.assertIn("Contact reduction hashtable insert failures 1.", printed)
                 solver.step(state, output, model.control(), contacts, 1.0 / 240.0)
                 with self.assertRaisesRegex(RuntimeError, "capacity"):
                     solver.check_constraint_capacity()
