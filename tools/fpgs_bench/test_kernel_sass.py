@@ -168,12 +168,12 @@ class TestKernelSass(unittest.TestCase):
         ]
         self.assertEqual(sorted(classified), sorted(ordinary))
 
-    def test_scalar_branch_kernels_compile_at_their_launch_blocks(self):
-        """Compile the scalar-branch repair at the group's repair block and its other kernels at their module's.
+    def test_scalar_branch_kernels_group_at_their_launch_blocks(self):
+        """Group the scalar-branch kernels at the blocks kernel_sass compiles them at: the repair at its launch block.
 
         The held-tree owner's scalar-branch group has no layout, so its kernels are in the pins family: the
         repair launches one warp per articulation in blocks of four, the predict, finish and listed drive
-        kernels at Warp's default block.
+        kernels at Warp's default block. Nothing is compiled here; this checks the grouping a record uses.
         """
         from newton._src.solvers.feather_pgs import scalar_branches  # noqa: PLC0415
 
