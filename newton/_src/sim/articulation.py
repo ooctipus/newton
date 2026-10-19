@@ -1336,14 +1336,14 @@ def _launch_zero_selected_blocks(
     :func:`_zero_selected_block_words`; larger blocks, and any other layout, by
     :func:`_zero_selected_articulation_blocks`.
 
-    Outside a graph capture, a call with Warp arrays replays the launch recorded for
-    the same arrays and articulation count, which reads the values that a
-    :func:`warp.launch` of them would. Packing a launch costs more host time than the
-    clear takes on a small model, where it would make the clear slower than the
-    whole-buffer memset it replaces. A capture records its own
-    launches. So does a call while a Warp debugging aid is on: printed launches and
-    CUDA error checks happen in :func:`warp.launch`, and a recorded launch keeps the
-    module build it was recorded with, so a replay would also skip the checks of a
+    A call with Warp arrays replays the launch recorded for the same arrays and
+    articulation count, which reads the values that a :func:`warp.launch` of them
+    would. Packing a launch costs more host time than the clear takes on a small
+    model, where it would make the clear slower than the whole-buffer memset it
+    replaces. Other masks, graph captures and Warp's debugging aids take
+    :func:`warp.launch` instead: a capture records its own launches, printed launches
+    and CUDA error checks happen in :func:`warp.launch`, and a recorded launch keeps
+    the module build it was recorded with, so a replay would skip the checks of a
     debug or floating-point-checking build.
 
     No launch is recorded on a :class:`warp.Tape`, so a backward pass sees the clear
@@ -1400,11 +1400,10 @@ def _zero_selected_blocks(
     """Zero the per-articulation blocks that ``mask`` selects and leave the others untouched.
 
     On the CPU a NumPy fill clears the selected blocks: the kernels' threads run
-    serially there. The fill is host code, which a graph
-    capture does not record, so a capture takes a kernel, which reads the mask
-    when the graph replays. So does any mask other than a Boolean Warp array on
-    ``device`` with an entry per articulation: the launch then converts or rejects
-    it as the Jacobian launch does.
+    serially there. The fill is host code, which a graph capture does not record, so
+    a capture takes a kernel, which reads the mask when the graph replays. So does
+    any mask other than a Boolean Warp array on ``device`` with an entry per
+    articulation: the launch then converts or rejects it as the Jacobian launch does.
     """
     if (
         device.is_cpu
