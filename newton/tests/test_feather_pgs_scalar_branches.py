@@ -269,7 +269,8 @@ def recipe_solver(model, *, scalar, compact=True, prismatic=True, **options):
         mock.patch.object(solver_module, "_SPARSE_CONTACT_DIRECT", True),
         mock.patch.object(solver_module, "_PRISMATIC_PUBLICATION", prismatic),
         mock.patch.object(solver_module, "_PRISMATIC_LINEAR_STATE", prismatic),
-        mock.patch.object(solver_module, "_SCALAR_BRANCHES", scalar),
+        # Read at construction, so an exported value cannot change the route.
+        mock.patch.dict(os.environ, {"FEATHER_PGS_SCALAR_BRANCHES": str(int(scalar))}),
     ):
         return SolverFeatherPGS(model, **arguments)
 
@@ -1277,6 +1278,28 @@ class TestScalarBranchRule(unittest.TestCase):
         # The tree layout's packing fields hold no value for a group without a tree layout.
         self.assertEqual((scalar["trees_per_block"], scalar["block_dim"]), (None, None))
         self.assertIsInstance(tree["trees_per_block"], int)
+
+    def test_scalar_branches_are_read_at_construction(self):
+        """Request scalar branches from FEATHER_PGS_SCALAR_BRANCHES as the solver's construction record holds it.
+
+        Newton is imported before each value is exported here, so a switch read at import would
+        not see it, and the record's ``environment.applied`` would contradict the route.
+        """
+        model = build_branch_model(worlds=2)
+        plan = mock.Mock(wraps=sb.plan_scalar_branches)
+        for value, requested in ((None, False), ("0", False), ("1", True)):
+            with (
+                self.subTest(value=value),
+                mock.patch.dict(os.environ),
+                mock.patch.object(sb, "plan_scalar_branches", plan),
+            ):
+                os.environ.pop("FEATHER_PGS_SCALAR_BRANCHES", None)
+                if value is not None:
+                    os.environ["FEATHER_PGS_SCALAR_BRANCHES"] = value
+                solver = SolverFeatherPGS(model, pgs_mode="split")
+                self.assertEqual(plan.call_args.kwargs, {"requested": requested})
+                applied = solver.get_path_selection()["environment"]["applied"]
+                self.assertEqual(applied.get("FEATHER_PGS_SCALAR_BRANCHES"), value)
 
     def test_cpu_route_record_reports_the_rule(self):
         """Report scalar branches as off on CPU, where no diagonal-mass group shares a sparse-diagonal response."""

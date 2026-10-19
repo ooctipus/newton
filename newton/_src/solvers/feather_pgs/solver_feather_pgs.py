@@ -304,9 +304,6 @@ _FUSED_PUBLISH = os.environ.get("FEATHER_PGS_FUSED_PUBLISH", "0") == "1"
 # Experimental Stage 7 producer partition, leaving all solve/mass budgets intact.
 _PRISMATIC_PUBLICATION = os.environ.get("FEATHER_PGS_PRISMATIC_PUBLICATION", "0") == "1"
 _PRISMATIC_LINEAR_STATE = os.environ.get("FEATHER_PGS_PRISMATIC_LINEAR_STATE", "0") == "1"
-# Experimental scalar branches of the held-tree owner (scalar_branches.py); where
-# admitted they take precedence over the two prismatic opt-ins above.
-_SCALAR_BRANCHES = os.environ.get("FEATHER_PGS_SCALAR_BRANCHES", "0") == "1"
 _COMPACT_CONTACT_BOUNDARY = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_BOUNDARY", "0") == "1"
 _COMPACT_CONTACT_ORDERING = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_ORDERING", "0") == "1"
 _DEBUG_CACHE = os.environ.get("FEATHER_PGS_DEBUG_CACHE") == "1"
@@ -3342,10 +3339,13 @@ class SolverFeatherPGS(SolverBase):
         # Scalar branches take a diagonal-mass group of world-fixed roots over
         # one-coordinate leaves (scalar_branches.py), which the held-tree owner
         # then publishes; the prismatic opt-ins serve the same articulations and
-        # give way. The owner is decided below; if it declines, they apply.
+        # give way. The owner is decided below; if it declines, they apply. The
+        # switch is read here, at construction, like the environment record.
         from .scalar_branches import plan_scalar_branches  # noqa: PLC0415
 
-        self._scalar_branches, self._scalar_branches_reason = plan_scalar_branches(self, requested=_SCALAR_BRANCHES)
+        self._scalar_branches, self._scalar_branches_reason = plan_scalar_branches(
+            self, requested=os.environ.get("FEATHER_PGS_SCALAR_BRANCHES", "0") == "1"
+        )
         if self._scalar_branches is None:
             self._configure_prismatic_publication()
 
