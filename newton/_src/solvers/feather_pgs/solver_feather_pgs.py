@@ -1737,8 +1737,9 @@ class SolverFeatherPGS(SolverBase):
                 ``mf_gs_parallel_sweeps`` to reach the serial sweep's accuracy. ``None`` uses
                 ``mf_gs_parallel_sweeps``; a positive count sets every linked tier's budget. ``"auto"`` gives
                 each linked tier serving up to ``R`` rows ``ceil(3 * pgs_iterations * sqrt(R / 32))`` sweeps,
-                within ``[mf_gs_parallel_sweeps, 128]``, from ``pgs_iterations`` at construction: the serial
-                sweep's iteration count sets the accuracy to match, and larger worlds converge more slowly.
+                at least ``mf_gs_parallel_sweeps`` and at most 128 unless ``mf_gs_parallel_sweeps`` is larger,
+                from ``pgs_iterations`` at construction: the serial sweep's iteration count sets the accuracy to
+                match, and larger worlds converge more slowly.
                 Every world still exits early once its impulses change by less than ``mf_gs_parallel_tol``.
                 The environment variable ``FEATHER_PGS_PATCH_PARALLEL_SWEEPS`` (a positive count or ``auto``)
                 overrides the argument. ``get_path_selection()`` reports each tier's budget under
@@ -16363,8 +16364,9 @@ class SolverFeatherPGS(SolverBase):
         reason = (
             f"{source}='auto': a linked tier serving up to R rows sweeps "
             f"ceil({_LINKED_SWEEPS_PER_ITERATION} * pgs_iterations * sqrt(R / 32)) times with "
-            f"pgs_iterations={int(self.pgs_iterations)}, within [mf_gs_parallel_sweeps={sweeps}, "
-            f"{_LINKED_SWEEPS_CAP}]; every world exits early at mf_gs_parallel_tol."
+            f"pgs_iterations={int(self.pgs_iterations)}, at least mf_gs_parallel_sweeps={sweeps} and at most "
+            f"{_LINKED_SWEEPS_CAP} unless mf_gs_parallel_sweeps is larger; every world exits early at "
+            "mf_gs_parallel_tol."
         )
         return [_auto_linked_sweeps(rows, self.pgs_iterations, sweeps) for rows, _ in tiers], "auto", reason
 
@@ -28093,8 +28095,10 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
 
 # mf_gs_parallel_linked_sweeps="auto": the budget grows with the serial sweep's iteration count, whose accuracy the
 # linked tiers must match, and with the square root of a tier's row bound, as Jacobi sweeps with momentum need more
-# passes where more rows couple through one body. The factor is fitted to the measured row-bucket accuracy of the
-# linked tiers against the serial sweep on contact-rich workloads at 8 and 12 iterations; probe data may refit it.
+# passes where more rows couple through one body. The factor is a two-workload fit (contact-rich patch friction at 8
+# and 12 iterations) to the global p90 accuracy gate, not to every row bucket: at 12 iterations the 32-row tier's
+# 36 sweeps leave its worlds at 1.57x the serial sweep's p90 error, and the measured buckets first all reach parity
+# near a factor of 3.5. Refit it from per-bucket probe data before any default relies on it.
 _LINKED_SWEEPS_PER_ITERATION = 3
 _LINKED_SWEEPS_CAP = 128
 
@@ -28118,7 +28122,8 @@ def _auto_linked_sweeps(rows: int, iterations: int, sweeps: int) -> int:
     """The ``"auto"`` sweep budget of a linked tier serving up to ``rows`` rows.
 
     ``ceil(3 * iterations * sqrt(rows / 32))``, at least ``sweeps`` (``mf_gs_parallel_sweeps``)
-    and at most 128. The ceiling is exact: the least ``n`` with ``32 n^2 >= (3 iterations)^2 rows``.
+    and at most 128 unless ``sweeps`` is larger. The ceiling is exact: the least ``n`` with
+    ``32 n^2 >= (3 iterations)^2 rows``.
     """
     square = -(-((_LINKED_SWEEPS_PER_ITERATION * int(iterations)) ** 2 * int(rows)) // 32)
     raw = math.isqrt(square - 1) + 1 if square > 0 else 0

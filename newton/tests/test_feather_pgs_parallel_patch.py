@@ -1051,7 +1051,11 @@ class TestLinkedTierSweeps(unittest.TestCase):
                         SolverFeatherPGS(model)
 
     def test_auto_budget_grows_with_iterations_and_tier_rows(self):
-        """Sweep ceil(3 * pgs_iterations * sqrt(rows / 32)) times, within [mf_gs_parallel_sweeps, 128]."""
+        """Sweep ceil(3 * pgs_iterations * sqrt(rows / 32)) times within the linked tiers' bounds.
+
+        The budget is at least mf_gs_parallel_sweeps and at most 128, unless
+        mf_gs_parallel_sweeps is larger.
+        """
         for rows, iterations, sweeps, expected in (
             (32, 12, 24, 36),
             (64, 12, 24, 51),
@@ -1087,9 +1091,22 @@ class TestLinkedTierSweeps(unittest.TestCase):
                 if linked == "auto":
                     self.assertEqual((budgets, rule), ([36, 51, 63, 72], "auto"))
                     self.assertIn("pgs_iterations=12", reason)
+                    self.assertIn("at least mf_gs_parallel_sweeps=24 and at most 128", reason)
                 else:
                     self.assertEqual((budgets, rule), ([40] * 4, "mf_gs_parallel_linked_sweeps"))
                 self.assertTrue(reason.startswith(_SWEEPS_FLAG if environment else "mf_gs_parallel_linked_sweeps"))
+        # mf_gs_parallel_sweeps above the cap keeps its own budget; the reason states the bounds that way round.
+        probe = SimpleNamespace(
+            _friction_anchors_enabled=True,
+            _environment_options=frozenset(),
+            mf_gs_parallel_linked_sweeps="auto",
+            mf_gs_parallel_sweeps=160,
+            pgs_iterations=12,
+        )
+        budgets, rule, reason = SolverFeatherPGS._parallel_tier_sweeps(probe, tiers)
+        self.assertEqual((budgets, rule), ([160] * 4, "auto"))
+        self.assertIn("at most 128 unless mf_gs_parallel_sweeps is larger", reason)
+        self.assertNotIn("[mf_gs_parallel_sweeps", reason)
 
     def test_option_records_its_source(self):
         """Report the override as the option's source; a solver without linked tiers applies no linked budget."""
