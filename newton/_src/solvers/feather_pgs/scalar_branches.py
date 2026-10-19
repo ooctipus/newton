@@ -847,8 +847,8 @@ class ScalarBranchState:
         outright. Other notifications (Isaac Lab re-poses fixed roots through
         ``joint_X_p`` with ``JOINT_PROPERTIES`` on resets) compare the frozen
         topology arrays on the device with one small readback, which also
-        watches the joint frames and axes, unless the owning held-tree owner's
-        proofs already hold them.
+        watches the joint frames and axes, unless the held-tree owner that
+        composes the group already proves them.
 
         Returns:
             Whether the proof ran and found the topology, frames and axes

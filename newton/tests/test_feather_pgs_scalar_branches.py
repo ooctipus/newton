@@ -45,10 +45,11 @@ ARM_DROPPED_FIELDS = ("body_q_com", "body_a_s", "body_f_s", "body_I_s", "_body_i
 KEY_BOUND = {"rtol": 3.0e-5, "atol": 5.0e-6}
 # Key-only contact impulses [N·s] (1e-4 to 1e-2 per step in these tests) at the keys' relative bound.
 IMPULSE_BOUND = {"rtol": KEY_BOUND["rtol"], "atol": 1.0e-8}
-# The held-solve bound (ae6baadb) on the arm: twice the ordinary solver's distance from the
-# reference, at least 1e-5, plus the scalar route's own run-to-run spread. Every reference arm here
-# runs ordinary dynamics (no cached owner takes these worlds, and cached_dynamics selects only that
-# owner), so the ordinary distance is zero and the floor applies.
+# The arm moves from ordinary dynamics (every reference here: no cached owner takes these worlds,
+# and cached_dynamics selects only that owner) to the held owner: the same law at the same mass
+# cadence in another float order. It is bounded by the held-solve tests' 1e-5 floor (ae6baadb) plus
+# the scalar route's own run-to-run spread. Their other term, twice the ordinary solver's distance
+# from a held law, measures this very move, so it cannot bound it.
 ARM_FLOOR = 1.0e-5
 # Coordinates of the fixtures' arm. A star of as many leaves shares the arm's size group, which is
 # then not diagonal: the recipe refuses its prismatic linear state and no scalar plan exists.
@@ -1389,7 +1390,7 @@ def _close(test, expected, actual, index, tag, *, rtol, atol):
 
 
 def _arm_within(test, reference, actual, bodies, tag, *, again=None):
-    """Bound the arm bodies' A/B difference by the held-solve rule plus the scalar route's A/A spread ``again``."""
+    """Bound the arm bodies' A/B difference by ``ARM_FLOOR`` plus the scalar route's A/A spread ``again``."""
     actual = actual.numpy()[bodies]
     test.assertTrue(np.all(np.isfinite(actual)), tag)
     spread = 0.0 if again is None else _excess(again.numpy()[bodies], actual)
@@ -1486,7 +1487,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         reset after a coordinate write, a root re-pose, a state bank copied back
         into the input (which every cache must repair) and captured graphs with
         masked and full resets. The arm moves to the held owner's float order,
-        within the held-solve bound (``ARM_FLOOR``) plus the twin's spread.
+        within the held-solve floor (``ARM_FLOOR``) plus the twin's spread.
         An eager twin of the scalar route does the captured work step by step:
         each replay must give what it gives. The FK/ID fields that neither the
         family writes for the keys nor the held owner for the arm hold NaN
@@ -1898,7 +1899,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         re-pose must republish them. Revolute torques differ by the velocity
         product's rounding, which ordinary dynamics evaluates and the family
         does not (it is zero on the leaf's own axis), so leaves compare at a
-        physics tolerance; the held arm at the held-solve bound.
+        physics tolerance; the held arm at the held-solve floor.
         """
         device = wp.get_device("cuda:0")
         model = build_branch_model(device, worlds=2, leaves=STAR_LEAVES, kinds=("prismatic", "revolute"), shapes=True)
