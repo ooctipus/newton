@@ -3410,7 +3410,12 @@ class SolverFeatherPGS(SolverBase):
         contact rows built outside the sweep: the parallel tiers build keyed rows'
         direct rows in the sweep (``direct_rows``), the free-body matrix-free and
         propagation rows follow ``free_rigid_bodies``, and the debug row checks
-        name their own builders (``row_check_by_dof``). ``measurements`` holds the
+        name their own builders (``row_check_by_dof``).
+        ``dynamics.double_buffer_mass_matrix_clear_dofs`` lists the DOF sizes
+        whose double-buffered mass matrix the end of a refresh step clears (empty
+        without a double buffer, where the ordinary route's stage 1 clears it), and
+        ``contact_consumers.max_blocks`` the block cap of the launches over the
+        contact capacity (0: uncapped). ``measurements`` holds the
         construction-time lane timings, kept out of ``routes`` so that two runs of
         one configuration compare equal. ``options`` records every constructor
         option's requested, declared-default and applied value, captured once at

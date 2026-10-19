@@ -973,9 +973,11 @@ def _dynamics(solver, source) -> dict:
         "async_augmented_drives": bool(solver._async_augmented_drives),
         "parallel_augmented_drive_topology": bool(solver._parallel_augmented_drive_topology),
         "double_buffer": bool(solver._double_buffer),
-        # Sizes whose double-buffered mass matrix the end of a refresh step clears; the sizes a
-        # held-tree owner factors from its own geometry have no reader (_unread_mass_matrix_sizes).
-        "mass_matrix_clear_dofs": []
+        # Sizes whose double-buffered mass matrix the end of a refresh step clears on the memset
+        # stream: empty without a double buffer, where the ordinary route's stage 1 clears H before
+        # CRBA. Sizes a held-tree owner factors from its own geometry have no reader
+        # (_unread_mass_matrix_sizes).
+        "double_buffer_mass_matrix_clear_dofs": []
         if solver._memset_stream is None
         else sorted(int(size) for size in solver.size_groups if size not in solver._unread_mass_sizes),
         "size_group_streams": any(stream is not None for stream in solver._size_streams.values()),

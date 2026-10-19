@@ -442,6 +442,18 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
         solver._tree_kinetic_state = None
         self.assertEqual(len(touched_matrices()), len(matrices))
 
+    def test_clear_record_names_the_double_buffer(self):
+        """Record no double-buffer mass matrix clear on a route without a double buffer.
+
+        Stage 1 of the ordinary route clears H there, so an empty list must not read as "no clears".
+        """
+        model = _build(wp.get_device("cpu"), worlds=2)
+        solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+        self.assertIsNone(solver._memset_stream)
+        dynamics = solver.get_path_selection()["routes"]["dynamics"]
+        self.assertEqual(dynamics["double_buffer_mass_matrix_clear_dofs"], [])
+        self.assertNotIn("mass_matrix_clear_dofs", dynamics)
+
     @unittest.skipUnless(wp.is_cuda_available(), "The double-buffered mass matrix is a CUDA path")
     def test_cuda_held_owner_clears_no_mass_matrix(self):
         """Issue no end-of-step mass matrix clear under a held-tree owner, and every clear without one."""
@@ -452,7 +464,7 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
                 solver = _mixed_solver(model, owner=owner)
                 self.assertEqual(solver._tree_kinetic_state is not None, owner)
                 self.assertIsNotNone(solver._memset_stream)
-                record = solver.get_path_selection()["routes"]["dynamics"]["mass_matrix_clear_dofs"]
+                record = solver.get_path_selection()["routes"]["dynamics"]["double_buffer_mass_matrix_clear_dofs"]
                 self.assertEqual(record, [] if owner else sorted(int(size) for size in solver.size_groups))
                 matrices = _mass_matrices(solver)
                 rollout = _Rollout(model, solver)
