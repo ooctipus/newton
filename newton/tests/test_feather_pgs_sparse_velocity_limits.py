@@ -326,6 +326,7 @@ def _case(
     depth=1,
     activation_fraction=0.0,
     friction_anchor_beta=0.0,
+    velocity_limit_law="stateless",
 ):
     model = split_tests._model(floating=floating, branches=branches, depth=depth)
     limits = np.full(model.joint_dof_count, 0.25, np.float32)
@@ -349,6 +350,7 @@ def _case(
             double_buffer=False,
             update_mass_matrix_interval=2,
             restitution_velocity_threshold=0.01,
+            velocity_limit_law=velocity_limit_law,
             **({} if enabled else ORDINARY_ROUTE),
         )
     state, out, control = model.state(), model.state(), model.control()
@@ -490,6 +492,22 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
                             # The violated side keeps its total: 1.75 speed units over the response.
                             self.assertGreater(max(impulses[world, :2]), 0.1)
                     np.testing.assert_array_equal(delta[1], 0.0)
+
+    def test_accumulated_law_matches_the_dense_reference(self):
+        """Accumulate velocity-limit impulses in factor coordinates as the ordinary sweep accumulates them."""
+        for shape in ({"floating": False, "branches": 1, "depth": 3}, {"floating": True, "branches": 3, "depth": 1}):
+            with self.subTest(shape=shape):
+                reference = _case(False, velocity_limit_law="accumulated", **shape)
+                candidate = _case(True, velocity_limit_law="accumulated", **shape)
+                self.assertTrue(candidate[1]._sparse_velocity_limits)
+                self.assertIn("_vacc", candidate[1]._pgs_solve_sparse_kernel.key)
+                self.assertIn("_vacc", reference[1]._pgs_solve_mf_gs_kernel.key)
+                for case in (reference, candidate):
+                    self.assertEqual(case[1].get_path_selection()["routes"]["velocity_limits"]["law"], "accumulated")
+                for _ in range(4):
+                    split_tests._step(reference)
+                    split_tests._step(candidate)
+                    self._assert_state(reference, candidate)
 
     def test_serial_and_branched_dense_reference(self):
         """Keep signed clamps, contacts and momentum response on independent tree shapes under either friction law."""

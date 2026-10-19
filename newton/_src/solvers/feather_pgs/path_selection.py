@@ -142,6 +142,8 @@ _EFFECTIVE = {
     "mf_gs_response_block_lane_rows": lambda solver: _response_block_rows(solver, getattr(solver, "_rb_lane_rows", 0)),
     "use_parallel_streams": _streams_created,
     "propagation_cached_response": lambda solver: bool(solver._propagation_cached_response_active),
+    # The sweeps' law after the schedule and row gates (routes.velocity_limits.law).
+    "velocity_limit_law": lambda solver: solver._velocity_limit_kernel_law(),
 }
 
 
@@ -823,9 +825,13 @@ def _velocity_limits(solver) -> dict:
     matrix_free = solver.pgs_mode == "matrix_free"
     model = solver.model
     prescale = solver.enable_joint_velocity_limits and model.joint_count > 0 and model.articulation_count > 0
+    # The law the matrix-free sweep kernels were built with; the fused drive clamp keeps PhysX's.
+    law, law_reason = solver._velocity_limit_sweep_law()
     return {
         "joint": joint,
         "reason": reason,
+        "law": law,
+        "law_reason": law_reason,
         # Lanes per articulation of the pre-solve PhysX velocity prescale; 0 when it launches no kernel.
         "prescale_lanes": int(solver._velocity_prescale_lanes) if prescale else 0,
         "activation_fraction": json_value(solver.velocity_limit_activation_fraction),

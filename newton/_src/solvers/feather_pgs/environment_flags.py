@@ -678,6 +678,12 @@ FLAGS = declare(
         "on the bank it published launches nothing).",
     ),
     _flag(
+        "FEATHER_PGS_VELOCITY_LIMIT_LAW",
+        "policy",
+        _SOLVER,
+        "stateless or accumulated overrides the velocity_limit_law argument (unset: the argument).",
+    ),
+    _flag(
         "FEATHER_PGS_WORLD_ROWS",
         "experiment",
         _SOLVER,

@@ -13,17 +13,20 @@ is independent of the row order and is the fixed point of the parallel tiers.
 The CPU tests check the generated sources: the stateless law keeps them (the
 point-stream pins hold every family's stateless text), and the accumulated law
 reaches every visit of a velocity-limit row in every serial sweep generator.
-The CUDA tests run the kernels against a float64 reference.
+The CUDA tests run the kernels against a float64 reference and roll out solvers.
 """
 
 import inspect
 import itertools
+import os
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import warp as wp
 
+import newton
 from newton._src.solvers.feather_pgs import mf_gs_source
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_source
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
@@ -32,6 +35,9 @@ from newton._src.solvers.feather_pgs.response_block_sweep import (
     get_response_block_sweep_warp_kernel,
 )
 from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel
+from newton.solvers import SolverFeatherPGS
+
+_LAW_FLAG = "FEATHER_PGS_VELOCITY_LIMIT_LAW"
 
 # Every serial sweep generator with velocity-limit rows: (factory, arguments, options, accumulated sites).
 # Each site is the accumulated expression one visit of a velocity-limit row compiles.
@@ -214,12 +220,103 @@ class TestVelocityLimitLawSources(unittest.TestCase):
         self.assertEqual(accumulated_sources, sources)
 
     def test_unknown_laws_are_rejected(self):
-        """Reject a law that is neither stateless nor accumulated in every generator."""
+        """Reject a law that is neither stateless nor accumulated in every generator and the solver."""
         for name, (factory, args, options, _) in _GENERATORS.items():
             with self.subTest(generator=name), self.assertRaisesRegex(ValueError, "velocity_limit_law"):
                 factory(*args, velocity_limit_law="clamped", **options)
         with self.assertRaisesRegex(ValueError, "velocity_limit_law"):
             mf_gs_source.get_source(64, 32, 12, "120", velocity_limit_law="clamped")
+
+
+def _cpu_arm():
+    builder = newton.ModelBuilder()
+    body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    builder.add_articulation([builder.add_joint_revolute(-1, body)])
+    return builder.finalize(device="cpu")
+
+
+def _law_probe(**changes):
+    """A stand-in with the attributes the sweep-law decision reads: a matrix-free solver with joint limits."""
+    probe = {
+        "pgs_mode": "matrix_free",
+        "pgs_schedule": "interleaved",
+        "enable_joint_velocity_limits": True,
+        "_has_rigid_body_velocity_limits": False,
+        "_free_rigid_body_count": 0,
+        "velocity_limit_activation_fraction": 0.0,
+        "velocity_limit_law": "accumulated",
+        "_environment_options": frozenset(),
+    }
+    probe.update(changes)
+    return SimpleNamespace(**probe)
+
+
+class TestVelocityLimitLawOption(unittest.TestCase):
+    def test_sweep_law_follows_the_schedule_and_the_rows(self):
+        """Build the requested law where velocity-limit rows exist, except under PhysX's grasp schedule."""
+        decide = SolverFeatherPGS._velocity_limit_sweep_law
+        for changes, law, words in (
+            ({}, "accumulated", "velocity_limit_law='accumulated'"),
+            ({"velocity_limit_law": "stateless"}, "stateless", "velocity_limit_law='stateless'"),
+            ({"pgs_schedule": "contact_then_internal"}, "accumulated", "velocity_limit_law="),
+            ({"pgs_schedule": "physx_grasp"}, "stateless", "physx_grasp"),
+            ({"enable_joint_velocity_limits": False}, "stateless", "No velocity-limit rows"),
+            # Free-body velocity limits are rows of their own.
+            (
+                {
+                    "enable_joint_velocity_limits": False,
+                    "_has_rigid_body_velocity_limits": True,
+                    "_free_rigid_body_count": 1,
+                },
+                "accumulated",
+                "velocity_limit_law=",
+            ),
+            ({"velocity_limit_activation_fraction": float("inf")}, "stateless", "No velocity-limit rows"),
+            ({"_environment_options": frozenset({"velocity_limit_law"})}, "accumulated", _LAW_FLAG),
+            ({"pgs_mode": "split"}, None, "Split mode"),
+        ):
+            with self.subTest(**{key: str(value) for key, value in changes.items()}):
+                probe = _law_probe(**changes)
+                selected, reason = decide(probe)
+                self.assertEqual(selected, law)
+                self.assertIn(words, reason)
+
+    def test_option_records_the_requested_and_the_applied_law(self):
+        """Default to the stateless law, record the request, and apply none in split mode."""
+        model = _cpu_arm()
+        with mock.patch.dict(os.environ):
+            os.environ.pop(_LAW_FLAG, None)
+            default = SolverFeatherPGS(model)
+            accumulated = SolverFeatherPGS(model, velocity_limit_law="accumulated")
+        self.assertEqual(default.velocity_limit_law, "stateless")
+        self.assertEqual(accumulated.velocity_limit_law, "accumulated")
+        selected = accumulated.get_path_selection()
+        self.assertEqual(
+            selected["options"]["velocity_limit_law"],
+            {"applied": "stateless", "requested": "accumulated", "default": "stateless", "source": "argument"},
+        )
+        limits = selected["routes"]["velocity_limits"]
+        self.assertIsNone(limits["law"])
+        self.assertIn("Split mode", limits["law_reason"])
+        with self.assertRaisesRegex(ValueError, "velocity_limit_law"):
+            SolverFeatherPGS(model, velocity_limit_law="clamped")
+
+    def test_environment_overrides_the_argument(self):
+        """Let FEATHER_PGS_VELOCITY_LIMIT_LAW override the argument and record the environment as the source."""
+        model = _cpu_arm()
+        with mock.patch.dict(os.environ, {_LAW_FLAG: "accumulated"}):
+            solver = SolverFeatherPGS(model)
+            explicit = SolverFeatherPGS(model, velocity_limit_law="accumulated")
+        self.assertEqual(solver.velocity_limit_law, "accumulated")
+        record = solver.get_path_selection()
+        self.assertEqual(record["options"]["velocity_limit_law"]["source"], "environment")
+        self.assertEqual(record["environment"]["applied"][_LAW_FLAG], "accumulated")
+        # An override that agrees with the argument changes nothing.
+        self.assertEqual(explicit.get_path_selection()["options"]["velocity_limit_law"]["source"], "argument")
+        with mock.patch.dict(os.environ, {_LAW_FLAG: "stateless"}):
+            self.assertEqual(SolverFeatherPGS(model, velocity_limit_law="accumulated").velocity_limit_law, "stateless")
+        with mock.patch.dict(os.environ, {_LAW_FLAG: "clamped"}), self.assertRaisesRegex(ValueError, "clamped"):
+            SolverFeatherPGS(model)
 
 
 def serial_velocity_limit_reference(mass, velocity, jacobian, bias, *, law, iterations):
@@ -390,6 +487,138 @@ class TestVelocityLimitLawKernels(unittest.TestCase):
                 else:
                     # The stateless law brakes the shoulder to 0.197 instead of 0.267 when its row leads.
                     self.assertGreater(move, 0.05)
+
+
+def _pushed_arm(device, limit):
+    """One revolute link about z without gravity, its velocity limited to ``limit``."""
+    builder = newton.ModelBuilder(gravity=0.0)
+    body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    builder.add_articulation([builder.add_joint_revolute(-1, body, axis=wp.vec3(0.0, 0.0, 1.0))])
+    model = builder.finalize(device=device)
+    model.joint_velocity_limit.assign(np.full(model.joint_dof_count, limit, np.float32))
+    return model
+
+
+# Matrix-free routes that sweep dense velocity-limit rows (sparse factors and the propagation schedules are
+# covered by test_feather_pgs_sparse_velocity_limits and test_feather_pgs_fused_velocity_limit_ordering).
+_DENSE_ROUTES = {
+    "mf_gs": {"mf_gs_incremental_rows": 0},
+    "incremental": {"mf_gs_incremental_rows": 32},
+    "response_block": {"mf_gs_incremental_rows": 0, "mf_gs_response_block_rows": 64},
+}
+
+
+def _matrix_free_solver(model, law, **options):
+    settings = {
+        "pgs_mode": "matrix_free",
+        "enable_joint_velocity_limits": True,
+        "friction_anchor_beta": 0.0,
+        "sparse_mass_matrix": "off",
+        "cached_dynamics": "off",
+        "pgs_iterations": 8,
+        "dense_max_constraints": 32,
+        "mf_max_constraints": 32,
+        "velocity_limit_law": law,
+    }
+    settings.update(options)
+    return SolverFeatherPGS(model, **settings)
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "Matrix-free FPGS requires CUDA")
+class TestVelocityLimitLawRollouts(unittest.TestCase):
+    def test_constant_torque_never_pushes_past_the_limit(self):
+        """Hold a revolute DOF that a constant torque pushes past its limit at the limit under either law."""
+        limit, dt = 1.0, 1.0 / 240.0
+        model = _pushed_arm("cuda:0", limit)
+        for (route, options), law in itertools.product(_DENSE_ROUTES.items(), ("stateless", "accumulated")):
+            with self.subTest(route=route, law=law):
+                solver = _matrix_free_solver(model, law, **options)
+                routes = solver.get_path_selection()["routes"]
+                self.assertEqual(routes["velocity_limits"]["law"], law)
+                self.assertEqual("_vacc" in routes["sweep"]["mf_gs"], law == "accumulated")
+                self.assertEqual(routes["sweep"]["response_block"], route == "response_block")
+                tiers = routes["sweep"]["tiers"]
+                self.assertEqual(tiers is not None and tiers["family"] == "incremental", route == "incremental")
+                state, out, control = model.state(), model.state(), model.control()
+                control.joint_f.assign(np.array([120.0], np.float32))  # 0.5 rad/s per step
+                speeds = []
+                for _ in range(8):
+                    solver.step(state, out, control, None, dt)
+                    state, out = out, state
+                    speeds.append(float(abs(state.joint_qd.numpy()[0])))
+                self.assertGreater(max(speeds), 0.99 * limit, speeds)
+                self.assertLessEqual(max(speeds), limit * (1.0 + 1.0e-5), speeds)
+
+    def test_accumulated_serial_sweep_converges_to_the_parallel_tier(self):
+        """Converge the serial sweep under the accumulated law to the parallel tier's fixed point.
+
+        A palm joint carries three two-link fingers, every joint velocity-limited.
+        One step from rest with torques that push some joints past their limits and
+        leave others inside couples the limit rows through the hand's mass matrix.
+        The parallel tier (tolerance 0, 2000 sweeps) solves the complementarity
+        problem; the serial sweep at 2000 iterations matches it to 1e-5 under the
+        accumulated law. The stateless serial sweep's distance is reported, not bounded.
+        """
+        model = _limited_hand("cuda:0")
+        # Unconstrained step velocities (0.05, 0.33, -1.42, -0.45, 2.07, -0.46, 0.62) rad/s: three limits bind at
+        # the solution, and the coupling keeps four joints inside theirs.
+        torques = np.array([0.03, 0.006, -0.005, 0.0002, 0.008, -0.007, 0.001], np.float32)
+        converged = {"pgs_iterations": 2000, "mf_gs_parallel_sweeps": 2000, "mf_gs_parallel_tol": 0.0}
+        velocities = {}
+        for name, law, options in (
+            ("serial_stateless", "stateless", {"mf_gs_incremental_rows": 0}),
+            ("serial", "accumulated", {"mf_gs_incremental_rows": 0}),
+            ("tier", "accumulated", {"mf_gs_incremental_rows": 0, "mf_gs_parallel_rows": 32}),
+            (
+                "tier_matrix_free",
+                "accumulated",
+                {"mf_gs_incremental_rows": 0, "mf_gs_parallel_rows": 32, "mf_gs_parallel_matrix_free": True},
+            ),
+        ):
+            solver = _matrix_free_solver(model, law, **converged, **options)
+            self.assertEqual(solver._ink_rows, 32 if name.startswith("tier") else 0)
+            state, out, control = model.state(), model.state(), model.control()
+            control.joint_f.assign(torques)
+            solver.step(state, out, control, None, 1.0 / 240.0)
+            counts = solver.constraint_count.numpy()
+            self.assertLessEqual(int(counts.max()), 32)
+            velocities[name] = out.joint_qd.numpy().astype(np.float64)
+        limited = np.abs(velocities["serial"])
+        self.assertTrue(np.any(limited >= _HAND_LIMIT * (1.0 - 1.0e-4)), "no limit binds")
+        self.assertTrue(np.any(limited <= 0.9 * _HAND_LIMIT), "every limit binds")
+        stateless_gap = float(np.max(np.abs(velocities["serial_stateless"] - velocities["tier"])))
+        for tier in ("tier", "tier_matrix_free"):
+            np.testing.assert_allclose(
+                velocities["serial"],
+                velocities[tier],
+                atol=1.0e-5,
+                err_msg=f"{tier}; the stateless serial sweep lies {stateless_gap:.3e} from the tier",
+            )
+
+
+_HAND_LIMIT = 0.5
+
+
+def _limited_hand(device):
+    """A palm joint carrying three two-link fingers in one plane, every joint limited to ``_HAND_LIMIT``."""
+    builder = newton.ModelBuilder(gravity=0.0)
+    axis = wp.vec3(0.0, 0.0, 1.0)
+    palm = builder.add_link(mass=0.4, inertia=wp.mat33(np.eye(3) * 2.0e-3))
+    joints = [builder.add_joint_revolute(-1, palm, axis=axis)]
+    for finger in range(3):
+        parent, offset = palm, wp.vec3(0.03 * (finger - 1), 0.08, 0.0)
+        for _ in range(2):
+            link = builder.add_link(mass=0.05, inertia=wp.mat33(np.eye(3) * 2.0e-5))
+            joints.append(
+                builder.add_joint_revolute(
+                    parent, link, axis=axis, parent_xform=wp.transform(offset, wp.quat_identity())
+                )
+            )
+            parent, offset = link, wp.vec3(0.0, 0.04, 0.0)
+    builder.add_articulation(joints)
+    model = builder.finalize(device=device)
+    model.joint_velocity_limit.assign(np.full(model.joint_dof_count, _HAND_LIMIT, np.float32))
+    return model
 
 
 if __name__ == "__main__":

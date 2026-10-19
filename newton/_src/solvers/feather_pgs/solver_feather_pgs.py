@@ -1377,6 +1377,7 @@ class SolverFeatherPGS(SolverBase):
         mf_gs_parallel_matrix_free: bool = False,
         mf_gs_response_block_rows: int = 0,
         mf_gs_response_block_lane_rows: int = 16,
+        velocity_limit_law: Literal["stateless", "accumulated"] = "stateless",
         grouped_dynamics: bool = False,
         lazy_kinematics: bool = False,
         bilateral_preelimination_include_mimics: bool = True,
@@ -1691,6 +1692,20 @@ class SolverFeatherPGS(SolverBase):
                 independent of the drive-row visit, so it stays active during velocity-only
                 iterations under ``pgs_velocity_drive_mode="freeze"``, exactly like the
                 dedicated rows it replaces. Defaults to True.
+            velocity_limit_law (str, optional): How the matrix-free sweeps project the dedicated
+                joint and free-body velocity-limit rows, which keep the last word at the end of
+                every iteration either way. ``"stateless"`` is PhysX's clamp: each visit applies
+                only the impulse that removes the current overshoot and stores that correction,
+                so an impulse that later rows made unnecessary is never released and the
+                converged velocity depends on the row order. ``"accumulated"`` treats the row like
+                a contact normal or a position limit, with a non-negative accumulated impulse
+                ``max(old - r / d, 0)``; the sweeps then converge to the complementarity solution
+                that split mode and the parallel matrix-free tiers already solve. The
+                ``"physx_grasp"`` schedule always keeps PhysX's stateless clamp, and the fused
+                drive clamp of ``fuse_joint_velocity_limits`` is unaffected. The environment
+                variable ``FEATHER_PGS_VELOCITY_LIMIT_LAW`` overrides the argument.
+                ``get_path_selection()`` reports the law the sweeps apply under
+                ``routes.velocity_limits.law``. Experimental. Defaults to ``"stateless"``.
             mf_gs_incremental_rows (int, optional): Row budget of the incremental-residual
                 matrix-free Gauss-Seidel kernel. Worlds with only dense articulated rows and at
                 most this many rows solve through a shared-memory response block instead of
@@ -2252,8 +2267,13 @@ class SolverFeatherPGS(SolverBase):
             raise ValueError(f"pgs_warmstart_decay must be finite and non-negative, got {pgs_warmstart_decay!r}")
         self.pgs_warmstart = bool(pgs_warmstart) or legacy_mf_warmstart
         self.pgs_warmstart_decay = requested_pgs_decay if pgs_warmstart or not legacy_mf_warmstart else legacy_mf_decay
-        # Options whose effective value an IL_NEWTON_FPGS_* alias changed; get_path_selection()
-        # reports their source as "environment".
+        # FEATHER_PGS_VELOCITY_LIMIT_LAW overrides the argument, so recipes select the law without code changes.
+        check_velocity_limit_law(velocity_limit_law)
+        self.velocity_limit_law = check_velocity_limit_law(
+            os.environ.get("FEATHER_PGS_VELOCITY_LIMIT_LAW") or velocity_limit_law
+        )
+        # Options whose effective value an IL_NEWTON_FPGS_* alias or a FEATHER_PGS_* override changed;
+        # get_path_selection() reports their source as "environment".
         argument_decay = requested_pgs_decay if pgs_warmstart or not mf_warmstart else float(mf_warmstart_decay)
         self._environment_options = frozenset(
             name
@@ -2262,6 +2282,7 @@ class SolverFeatherPGS(SolverBase):
                 ("mf_warmstart_decay", legacy_mf_decay != float(mf_warmstart_decay)),
                 ("pgs_warmstart", self.pgs_warmstart != (bool(pgs_warmstart) or bool(mf_warmstart))),
                 ("pgs_warmstart_decay", self.pgs_warmstart_decay != argument_decay),
+                ("velocity_limit_law", self.velocity_limit_law != velocity_limit_law),
             )
             if changed
         )
@@ -5629,6 +5650,7 @@ class SolverFeatherPGS(SolverBase):
             local_factors=self._sparse_local_factors,
             warm_start=self.pgs_warmstart,
             linked_rows=self._friction_anchors_enabled,
+            velocity_limit_law=self._velocity_limit_kernel_law(),
         )
 
     def _sparse_small_world_lanes(self, solve_shared_bytes: int, shared_limit: int, mf_capacity: int) -> int:
@@ -7715,6 +7737,7 @@ class SolverFeatherPGS(SolverBase):
                 skip_incremental_rows=max(incremental_rows, parallel_rows),
                 skip_response_block=use_rb,
                 independent_components=self._paired_components is not None,
+                velocity_limit_law=self._velocity_limit_kernel_law(),
             )
             if use_rb:
                 self._build_response_block_sweep(model, has_drive_rows)
@@ -7817,6 +7840,7 @@ class SolverFeatherPGS(SolverBase):
                             has_dense_velocity_limit_rows=self.enable_joint_velocity_limits,
                             skip_local_internal_worlds=self._local_internal_fast_path,
                             min_rows=min_rows,
+                            velocity_limit_law=self._velocity_limit_kernel_law(),
                         )
                     )
                 self._pgs_solve_mf_gs_incremental_kernel = self._pgs_solve_mf_gs_incremental_kernels[0]
@@ -7921,6 +7945,7 @@ class SolverFeatherPGS(SolverBase):
                             device_arch,
                             worlds_per_block=self._propagation_fused_worlds_per_block,
                             fuse_vel_limits=self.fuse_joint_velocity_limits,
+                            velocity_limit_law=self._velocity_limit_kernel_law(),
                         )
                     )
                 else:
@@ -8408,16 +8433,19 @@ class SolverFeatherPGS(SolverBase):
             has_drive_rows=has_drive_rows,
             skip_local_internal_worlds=self._local_internal_fast_path,
         )
+        law = self._velocity_limit_kernel_law()
         self._rb_sweep_lane_kernel = (
-            get_response_block_sweep_lane_kernel(m_d, m_mf, dofs, lane_rows=lane_rows, has_drive_rows=has_drive_rows)
+            get_response_block_sweep_lane_kernel(
+                m_d, m_mf, dofs, lane_rows=lane_rows, has_drive_rows=has_drive_rows, velocity_limit_law=law
+            )
             if lane_rows > 0
             else None
         )
         self._rb_sweep_warp32_kernel = get_response_block_sweep_warp_kernel(
-            m_d, m_mf, dofs, rows=32, lane_rows=lane_rows, has_drive_rows=has_drive_rows
+            m_d, m_mf, dofs, rows=32, lane_rows=lane_rows, has_drive_rows=has_drive_rows, velocity_limit_law=law
         )
         self._rb_sweep_warp64_kernel = get_response_block_sweep_warp_kernel(
-            m_d, m_mf, dofs, rows=64, lane_rows=lane_rows, has_drive_rows=has_drive_rows
+            m_d, m_mf, dofs, rows=64, lane_rows=lane_rows, has_drive_rows=has_drive_rows, velocity_limit_law=law
         )
         slots = list_count_slots(lane_rows)
         self._rb_counts = wp.zeros(slots, dtype=wp.int32, device=device)
@@ -16213,6 +16241,40 @@ class SolverFeatherPGS(SolverBase):
             "pair projects on its patch ring's pooled normal load, as point pairs project on their own normal. "
             "FEATHER_PGS_PATCH_PARALLEL_ROWS=1 opted in; by default patch friction keeps its serial sweeps."
         )
+
+    def _velocity_limit_sweep_law(self) -> tuple[str | None, str]:
+        """Return the law the matrix-free sweep kernels give velocity-limit rows, and why.
+
+        Recorded as ``routes.velocity_limits.law``. Split mode has no matrix-free
+        velocity-limit pass (``None``). The ``physx_grasp`` schedule keeps PhysX's
+        stateless clamp. Without velocity-limit rows the kernels keep their stateless
+        build, so a model without limits runs the same kernels under either law.
+        """
+        if self.pgs_mode != "matrix_free":
+            return None, (
+                "Split mode has no matrix-free velocity-limit pass; its free-body sweep and the post-solve root "
+                "clamp keep their own laws."
+            )
+        if self.pgs_schedule == "physx_grasp":
+            return "stateless", "pgs_schedule='physx_grasp' keeps PhysX's stateless velocity clamp."
+        rows = self.enable_joint_velocity_limits or (
+            self._has_rigid_body_velocity_limits and self._free_rigid_body_count > 0
+        )
+        if not rows or np.isinf(self.velocity_limit_activation_fraction):
+            return "stateless", (
+                "No velocity-limit rows can exist: the sweep kernels keep their stateless build under "
+                f"velocity_limit_law={self.velocity_limit_law!r}."
+            )
+        source = (
+            "FEATHER_PGS_VELOCITY_LIMIT_LAW"
+            if "velocity_limit_law" in self._environment_options
+            else "velocity_limit_law"
+        )
+        return self.velocity_limit_law, f"{source}={self.velocity_limit_law!r}."
+
+    def _velocity_limit_kernel_law(self) -> str:
+        """The ``velocity_limit_law`` argument of every matrix-free sweep kernel this solver builds."""
+        return self._velocity_limit_sweep_law()[0] or "stateless"
 
     def _admit_world_rows(self) -> bool:
         """Whether the in-kernel-response tiers build their worlds' contact rows themselves (WORLD_ROWS).
