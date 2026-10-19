@@ -60,6 +60,9 @@ _STREAMED_OPTIONS = (
         "skip_incremental_rows": 0,
     },
     {"max_constraints": 1024, "mf_max_constraints": 4096, "max_world_dofs": 604},
+    # The accumulated velocity-limit law, in the dense limit pass and in streamed free-body totals.
+    {"has_drive_rows": True, "has_dense_velocity_limit_rows": True, "velocity_limit_law": "accumulated"},
+    {"stream_mf_impulses": True, "velocity_limit_law": "accumulated"},
 )
 
 
@@ -640,8 +643,8 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
         phase, from warm and signed-zero impulses, with delayed friction, iteration offsets,
         regularization and deferred responses, both one world per block and through a two-block
         queue whose blocks reuse their shared memory across worlds, then once more from a captured
-        graph. The drive and limit case runs the end-of-iteration limit scans (row phases 0, 2 and
-        5), which read row types from global memory in both kernels.
+        graph. The drive and limit cases run the end-of-iteration limit scans (row phases 0, 2 and
+        5), which read row types from global memory in both kernels, under either velocity-limit law.
         """
         device = wp.get_device()
         if not device.is_cuda:
@@ -652,6 +655,12 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
             ("large_capacity", (2304, 48, 75), contacts, (220, 300)),
             ("small_capacity", (48, 12, 29), contacts, (5, 9)),
             ("drives_and_limits", (48, 12, 29), limits, (5, 9)),
+            (
+                "accumulated_limits",
+                (48, 12, 29),
+                {"has_drive_rows": True, "has_dense_velocity_limit_rows": True, "velocity_limit_law": "accumulated"},
+                (5, 9),
+            ),
             ("bisection", (48, 12, 29), {"friction_mode": "bisection", "has_drive_rows": False}, (5, 9)),
             ("streamed_impulses", (48, 12, 29), {"stream_mf_impulses": True, "has_drive_rows": False}, (5, 9)),
         )
