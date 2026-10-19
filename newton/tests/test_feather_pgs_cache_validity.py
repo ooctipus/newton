@@ -58,14 +58,19 @@ def _fixed_root(model, world):
     return int(np.flatnonzero(roots & (model.joint_world.numpy() == world))[0])
 
 
-def _mixed_solver(model, *, forest=False, owner=True, **options):
-    """A dense-route solver with the mixed held-tree owner, or with ordinary dynamics when ``owner`` is False."""
+def _mixed_solver(model, *, forest=False, owner=True, lanes=None, **options):
+    """A dense-route solver with the mixed held-tree owner, or with ordinary dynamics when ``owner`` is False.
+
+    ``lanes`` fixes the held-tree lane width (several small trees per block); by default each tree has a block.
+    """
     environment = {
         "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": str(int(owner)),
         "FEATHER_PGS_TREE_KINETIC_STATE": "0",
         "FEATHER_PGS_TREE_FOREST": str(int(forest)),
         **ONE_TREE_PER_BLOCK,
     }
+    if lanes is not None:
+        environment["FEATHER_PGS_TREE_LANE_PACK"] = str(lanes)
     settings = {
         "pgs_mode": "matrix_free",
         "pgs_iterations": 8,
@@ -78,17 +83,22 @@ def _mixed_solver(model, *, forest=False, owner=True, **options):
         return SolverFeatherPGS(model, **settings)
 
 
-def _owned_case(name, device):
-    """A model and a solver with the named held-tree owner kind: per-size groups, the forest or the sparse tree."""
+def _owned_case(name, device, **options):
+    """A model and a solver with the named held-tree owner kind: per-size groups, the forest or the sparse tree.
+
+    ``options`` override the solver's settings. A captured graph bakes the mass refresh flags of the steps it
+    records, so a test that compares replays with eager steps uses an ``update_mass_matrix_interval`` that
+    divides the steps per graph (the mixed cases refresh every 2 steps, the sparse case every 4 by default).
+    """
     if name == "mixed":
         model = _build(device, worlds=4)
-        return model, _mixed_solver(model)
+        return model, _mixed_solver(model, **options)
     if name == "forest":
         model = _build(device, worlds=4, prescribed=True)
-        return model, _mixed_solver(model, forest=True)
+        return model, _mixed_solver(model, forest=True, **options)
     model = _build_model()
     with patch.dict(os.environ, ONE_TREE_PER_BLOCK):
-        return model, _make_solver(model, True, cached_dynamics="on", friction_anchor_beta=0.0)
+        return model, _make_solver(model, True, **{"cached_dynamics": "on", "friction_anchor_beta": 0.0, **options})
 
 
 class _Rollout:
@@ -513,7 +523,8 @@ class TestFeatherPGSInputBank(unittest.TestCase):
         device = wp.get_device("cuda:0")
         finals = []
         for captured in (False, True):
-            model, solver, owner = self._owned("sparse", device)
+            # One step per graph: refresh every step, as every replay does.
+            model, solver, owner = self._owned("sparse", device, update_mass_matrix_interval=1)
             rollout = _Rollout(model, solver, copy_back=True)
             rollout.step()
             advance = rollout.step
@@ -548,8 +559,8 @@ class TestFeatherPGSInputBank(unittest.TestCase):
             np.testing.assert_array_equal(end - start, 6)
 
     @staticmethod
-    def _owned(name, device):
-        model, solver = _owned_case(name, device)
+    def _owned(name, device, **options):
+        model, solver = _owned_case(name, device, **options)
         owner = solver._tree_kinetic_state
         if owner is None:
             raise AssertionError(f"The {name} fixture must admit a held-tree owner")
@@ -660,7 +671,9 @@ class TestFeatherPGSCapturedRepair(unittest.TestCase):
                 with self.subTest(owner=name, steps=steps):
                     finals = []
                     for captured in (False, True):
-                        model, solver, owner = TestFeatherPGSInputBank._owned(name, device)
+                        model, solver, owner = TestFeatherPGSInputBank._owned(
+                            name, device, update_mass_matrix_interval=2
+                        )
                         rollout = _Rollout(model, solver)
                         rollout.block()
 
@@ -765,7 +778,8 @@ class TestFeatherPGSCapturedRepair(unittest.TestCase):
 
         finals = []
         for captured in (False, True):
-            model, solver, owner = TestFeatherPGSInputBank._owned("sparse", device)
+            # Two single-step graphs alternate: refresh every other step, as their replays do.
+            model, solver, owner = TestFeatherPGSInputBank._owned("sparse", device, update_mass_matrix_interval=2)
             rollout = _Rollout(model, solver)
             rollout.block()
             steps = [rollout.step, rollout.step]
@@ -863,21 +877,24 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
         """
         device = wp.get_device("cuda:0")
         rng = np.random.default_rng(20261019)
-        packed = {"FEATHER_PGS_TREE_LANE_PACK": "8"}
+        # Eight lanes per tree: four trees share each block of the per-size groups and of the forest.
         cases = {
-            "mixed": lambda: _mixed_solver(_build(device, worlds=8)),
-            "forest": lambda: _mixed_solver(_build(device, worlds=8, prescribed=True), forest=True),
+            "mixed": lambda: _mixed_solver(_build(device, worlds=8), lanes=8),
+            "forest": lambda: _mixed_solver(_build(device, worlds=8, prescribed=True), forest=True, lanes=8),
             "sparse": lambda: _owned_case("sparse", device)[1],
             "motion": lambda: _mixed_solver(
-                _build(device, worlds=8, speed_limit=0.8), enable_joint_velocity_limits=True
+                _build(device, worlds=8, speed_limit=0.8), lanes=8, enable_joint_velocity_limits=True
             ),
         }
         for name, build in cases.items():
-            with self.subTest(owner=name), patch.dict(os.environ, packed if name != "sparse" else {}):
+            with self.subTest(owner=name):
                 solver = build()
                 owner = solver._tree_kinetic_state
                 self.assertIsNotNone(owner)
                 self.assertTrue(owner.classify_first)
+                packs = [group.layout.pack for group in _groups(owner)]
+                self.assertTrue(all(pack == 4 for pack in packs) if name != "sparse" else packs == [1], packs)
+                self.assertEqual(name == "sparse", _groups(owner)[0].chain_scan)
                 rollout = _Rollout(solver.model, solver)
                 rollout.block()
                 state = rollout.states[0]
