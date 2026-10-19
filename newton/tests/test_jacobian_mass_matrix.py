@@ -5,13 +5,27 @@
 
 from __future__ import annotations
 
+import gc
 import unittest
+import weakref
+from unittest import mock
 
 import numpy as np
 import warp as wp
 
 import newton
+from newton._src.sim.articulation import (
+    _CLEAR_REPLAY_CAPACITY,
+    _clear_replays,
+    _launch_zero_selected_blocks,
+    _zero_selected_articulation_blocks,
+    _zero_selected_block_words,
+    _zero_selected_blocks,
+)
 from newton.tests.unittest_utils import add_function_test, get_test_devices
+
+_SENTINEL = np.float32(-7.25)
+"""Stale buffer value that no Jacobian or mass-matrix entry of the fixtures takes."""
 
 
 def _build_translated_prismatic_chain(device):
@@ -137,6 +151,174 @@ def _build_d6_three_angular(device):
     builder.add_articulation([j], label="d6_three_angular")
 
     return builder.finalize(device=device), child
+
+
+def _offset(x, y, z):
+    """Return a translation-only transform."""
+    return wp.transform(wp.vec3(x, y, z), wp.quat_identity())
+
+
+def _build_mixed_articulations(device, world_count=3):
+    """Build replicated worlds of three articulations whose Jacobian blocks all carry padding.
+
+    Each world holds a fixed-base chain (4 links, 6 DOFs: revolute, prismatic, ball,
+    revolute), a fan of six one-DOF leaves on a fixed root (7 links, 6 DOFs) and a
+    floating chain (2 links, 7 DOFs). The fan sets the link count and the floating chain
+    the DOF count, so every articulation's block has padded rows or columns. Joint
+    coordinates are moved away from the reference pose before forward kinematics.
+
+    Args:
+        device: Device on which to finalize the model.
+        world_count: Number of replicated worlds.
+
+    Returns:
+        Tuple containing the finalized model and the posed state.
+    """
+    inertia = wp.mat33(np.eye(3, dtype=np.float32) * 0.01)
+    world = newton.ModelBuilder()
+
+    links = [world.add_link(mass=1.0 + 0.2 * i, com=wp.vec3(0.05 * i, -0.03, 0.02), inertia=inertia) for i in range(4)]
+    chain = [
+        world.add_joint_revolute(-1, links[0], axis=newton.Axis.Z, parent_xform=_offset(0.1, 0.0, 0.2)),
+        world.add_joint_prismatic(links[0], links[1], axis=newton.Axis.X, parent_xform=_offset(0.3, 0.0, 0.0)),
+        world.add_joint_ball(links[1], links[2], parent_xform=_offset(0.0, 0.25, 0.0)),
+        world.add_joint_revolute(links[2], links[3], axis=newton.Axis.Y, parent_xform=_offset(0.2, 0.0, 0.1)),
+    ]
+    world.add_articulation(chain, label="chain")
+
+    root = world.add_link(mass=2.0, inertia=inertia)
+    fan = [world.add_joint_fixed(-1, root, parent_xform=_offset(1.0, 0.0, 0.0))]
+    for i in range(6):
+        leaf = world.add_link(mass=0.3, com=wp.vec3(0.0, 0.01 * i, 0.02), inertia=inertia)
+        add_joint, axis = (
+            (world.add_joint_prismatic, newton.Axis.Z) if i % 2 == 0 else (world.add_joint_revolute, newton.Axis.X)
+        )
+        fan.append(add_joint(root, leaf, axis=axis, parent_xform=_offset(0.1 * i, 0.05, 0.0)))
+    world.add_articulation(fan, label="fan")
+
+    base = world.add_link(mass=1.5, com=wp.vec3(0.02, 0.0, -0.01), inertia=inertia)
+    tip = world.add_link(mass=0.7, com=wp.vec3(0.1, 0.0, 0.0), inertia=inertia)
+    floater = [
+        world.add_joint_free(base, parent_xform=_offset(0.0, 1.0, 0.5)),
+        world.add_joint_revolute(base, tip, axis=newton.Axis.Y, parent_xform=_offset(0.2, 0.0, 0.0)),
+    ]
+    world.add_articulation(floater, label="floater")
+
+    scene = newton.ModelBuilder()
+    scene.replicate(world, world_count=world_count)
+    model = scene.finalize(device=device)
+
+    state = model.state()
+    q = state.joint_q.numpy()
+    q_start = model.joint_q_start.numpy()
+    rng = np.random.default_rng(7)
+    for joint, joint_type in enumerate(model.joint_type.numpy()):
+        start = q_start[joint]
+        if joint_type in (newton.JointType.REVOLUTE, newton.JointType.PRISMATIC):
+            q[start] = rng.uniform(-0.8, 0.8)
+        elif joint_type in (newton.JointType.BALL, newton.JointType.FREE):
+            if joint_type == newton.JointType.FREE:
+                q[start : start + 3] = rng.uniform(-0.5, 0.5, 3)
+                start += 3
+            quat = rng.normal(size=4)
+            q[start : start + 4] = quat / np.linalg.norm(quat)
+    state.joint_q.assign(q)
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    return model, state
+
+
+def _build_fans(device, leaf_count, world_count=4):
+    """Build replicated worlds of one fan of one-DOF leaves on a fixed root.
+
+    The leaves alternate between prismatic and revolute joints. Each Jacobian block
+    holds ``6 * (leaf_count + 1) * leaf_count`` entries.
+
+    Args:
+        device: Device on which to finalize the model.
+        leaf_count: Number of leaves.
+        world_count: Number of replicated worlds.
+
+    Returns:
+        Tuple containing the finalized model and the state after forward kinematics.
+    """
+    inertia = wp.mat33(np.eye(3, dtype=np.float32) * 0.01)
+    world = newton.ModelBuilder()
+    root = world.add_link(mass=2.0, inertia=inertia)
+    fan = [world.add_joint_fixed(-1, root)]
+    for i in range(leaf_count):
+        leaf = world.add_link(mass=0.3, com=wp.vec3(0.0, 0.01 * i, 0.02), inertia=inertia)
+        add_joint, axis = (
+            (world.add_joint_prismatic, newton.Axis.Z) if i % 2 == 0 else (world.add_joint_revolute, newton.Axis.X)
+        )
+        fan.append(add_joint(root, leaf, axis=axis, parent_xform=_offset(0.1 * i, 0.05, 0.0)))
+    world.add_articulation(fan, label="fan")
+
+    scene = newton.ModelBuilder()
+    scene.replicate(world, world_count=world_count)
+    model = scene.finalize(device=device)
+    state = model.state()
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    return model, state
+
+
+def _mixed_selections(model):
+    """Return named articulation selections over :func:`_build_mixed_articulations` as boolean arrays."""
+    labels = np.asarray(model.articulation_label)
+    world = model.articulation_world.numpy()
+    return {
+        "fan": labels == "fan",
+        "mixed": ((labels == "chain") & (world == 0)) | ((labels != "chain") & (world == 1)),
+        "none": np.zeros(model.articulation_count, dtype=bool),
+        "all": np.ones(model.articulation_count, dtype=bool),
+    }
+
+
+def _jacobian_shape(model):
+    """Return the model-wide padded Jacobian shape."""
+    return (model.articulation_count, model.max_joints_per_articulation * 6, model.max_dofs_per_articulation)
+
+
+def _filled(shape, value, device):
+    """Return a float array of ``shape`` holding ``value`` everywhere."""
+    return wp.array(np.full(shape, value, dtype=np.float32), dtype=float, device=device)
+
+
+def _record_clears():
+    """Patch whole-array clears and return the patches and the list of cleared array pointers.
+
+    ``wp.zeros`` clears through :meth:`warp.array.zero_`, so zero-initialized
+    allocations are recorded as well.
+    """
+    cleared = []
+    zero_, fill_ = wp.array.zero_, wp.array.fill_
+
+    def record_zero(array):
+        cleared.append((array.ptr, array.shape, array.dtype))
+        zero_(array)
+
+    def record_fill(array, value):
+        cleared.append((array.ptr, array.shape, array.dtype))
+        fill_(array, value)
+
+    patches = (mock.patch.object(wp.array, "zero_", record_zero), mock.patch.object(wp.array, "fill_", record_fill))
+    return patches, cleared
+
+
+def _nan_filled_float_allocations():
+    """Return a patch under which every float array from ``wp.empty`` starts as NaN.
+
+    Uninitialized memory may hold anything; NaN makes any read of an entry that was
+    never written show up in the results.
+    """
+    empty = wp.empty
+
+    def nan_empty(*args, **kwargs):
+        array = empty(*args, **kwargs)
+        if array.dtype == wp.float32:
+            array.fill_(np.nan)
+        return array
+
+    return mock.patch.object(wp, "empty", nan_empty)
 
 
 def _diagonal_inertia(ix, iy, iz):
@@ -594,6 +776,382 @@ def test_mass_matrix_with_mask(test, device):
     test.assertNotEqual(H_np[1, 0, 0], 0.0)
 
 
+def test_jacobian_mask_overwrites_only_selected_blocks(test, device):
+    """Overwrite whole selected blocks and leave unselected articulations' entries untouched.
+
+    Every selected block, padding included, must equal the unmasked result bitwise
+    whatever the buffer held before; every unselected block keeps the caller's values.
+    """
+    model, state = _build_mixed_articulations(device)
+    J_ref = newton.eval_jacobian(model, state).numpy()
+
+    for name, selected in _mixed_selections(model).items():
+        with test.subTest(selection=name):
+            J = _filled(J_ref.shape, _SENTINEL, device)
+            mask = wp.array(selected, dtype=bool, device=device)
+            test.assertIs(newton.eval_jacobian(model, state, J, mask=mask), J)
+
+            J_np = J.numpy()
+            np.testing.assert_array_equal(J_np[selected], J_ref[selected])
+            np.testing.assert_array_equal(J_np[~selected], np.full_like(J_ref[~selected], _SENTINEL))
+
+
+def test_jacobian_mask_skips_whole_buffer_clear(test, device):
+    """Clear the whole Jacobian buffer only when no mask is given."""
+    model, state = _build_mixed_articulations(device)
+    J = wp.zeros(_jacobian_shape(model), dtype=float, device=device)
+    mask = wp.array(_mixed_selections(model)["fan"], dtype=bool, device=device)
+
+    patches, cleared = _record_clears()
+    with patches[0], patches[1]:
+        newton.eval_jacobian(model, state, J, mask=mask)
+        masked_clears = [ptr for ptr, _shape, _dtype in cleared]
+        cleared.clear()
+        newton.eval_jacobian(model, state, J)
+        unmasked_clears = [ptr for ptr, _shape, _dtype in cleared]
+
+    test.assertNotIn(J.ptr, masked_clears)
+    test.assertIn(J.ptr, unmasked_clears)
+
+
+def test_jacobian_mask_without_buffer_zeroes_unselected(test, device):
+    """Return zero blocks for unselected articulations when eval_jacobian allocates J."""
+    model, state = _build_mixed_articulations(device)
+    J_ref = newton.eval_jacobian(model, state).numpy()
+    selected = _mixed_selections(model)["mixed"]
+
+    J = newton.eval_jacobian(model, state, mask=wp.array(selected, dtype=bool, device=device)).numpy()
+
+    np.testing.assert_array_equal(J[selected], J_ref[selected])
+    np.testing.assert_array_equal(J[~selected], np.zeros_like(J_ref[~selected]))
+
+
+def test_articulation_view_jacobian_writes_only_view_blocks(test, device):
+    """Write only the view's articulation blocks, narrowed by a per-world mask, through the view."""
+    model, state = _build_mixed_articulations(device)
+    J_ref = newton.eval_jacobian(model, state).numpy()
+    view = newton.selection.ArticulationView(model, "fan", verbose=False)
+    world_mask = np.array([False, True, False])
+
+    for name, mask in (("view", None), ("world 1", world_mask)):
+        with test.subTest(selection=name):
+            J = _filled(J_ref.shape, _SENTINEL, device)
+            view_mask = None if mask is None else wp.array(mask, dtype=bool, device=device)
+            test.assertIs(view.eval_jacobian(state, J, mask=view_mask), J)
+
+            selected = view.get_model_articulation_mask(mask=view_mask).numpy()
+            test.assertEqual(int(selected.sum()), 3 if mask is None else 1)
+            J_np = J.numpy()
+            np.testing.assert_array_equal(J_np[selected], J_ref[selected])
+            np.testing.assert_array_equal(J_np[~selected], np.full_like(J_ref[~selected], _SENTINEL))
+
+
+def test_zero_selected_blocks_matches_numpy(test, device):
+    """Zero exactly the selected per-articulation blocks, through the device path and through the kernels.
+
+    Block shapes sit on both sides of the blockwise kernel's lane count and of the
+    block size at which it replaces word stores, with odd sizes that word stores
+    cannot cover. A buffer may hold more blocks than the mask covers, a misaligned
+    buffer cannot take word stores, and a strided view must change only inside its
+    own window, whether or not it starts on an 8-byte boundary.
+    """
+    rng = np.random.default_rng(3)
+    selected = np.array([True, False, True, True, False])
+    mask = wp.array(selected, dtype=bool, device=device)
+    shapes = ((5, 1, 1), (5, 6, 1), (5, 12, 2), (5, 1, 300), (5, 66, 31), (5, 37, 33), (5, 64, 32), (5, 654, 108))
+    for clear in (_zero_selected_blocks, _launch_zero_selected_blocks):
+        for shape in shapes:
+            with test.subTest(clear=clear.__name__, shape=shape):
+                values = rng.normal(size=shape).astype(np.float32)
+                blocks = wp.array(values, dtype=float, device=device)
+                clear(blocks, mask, shape[0], device)
+                expected = values.copy()
+                expected[selected] = 0.0
+                np.testing.assert_array_equal(blocks.numpy(), expected)
+
+        with test.subTest(clear=clear.__name__, shape="more blocks than articulations"):
+            values = rng.normal(size=(7, 6, 2)).astype(np.float32)
+            blocks = wp.array(values, dtype=float, device=device)
+            clear(blocks, wp.array(np.append(selected, True), dtype=bool, device=device), 5, device)
+            expected = values.copy()
+            expected[:5][selected] = 0.0
+            np.testing.assert_array_equal(blocks.numpy(), expected)
+
+        with test.subTest(clear=clear.__name__, shape="misaligned buffer"):
+            values = rng.normal(size=1 + 5 * 12).astype(np.float32)
+            whole = wp.array(values, dtype=float, device=device)
+            clear(whole[1:].reshape((5, 6, 2)), mask, 5, device)
+            expected = values.copy()
+            expected[1:].reshape(5, 12)[selected] = 0.0
+            np.testing.assert_array_equal(whole.numpy(), expected)
+
+        # The first view starts 256 bytes into the buffer, the second 380 bytes.
+        for name, rows, cols in (("aligned", slice(2, 10), slice(4, 16)), ("misaligned", slice(3, 11), slice(5, 17))):
+            with test.subTest(clear=clear.__name__, shape=f"{name} strided view"):
+                values = rng.normal(size=(5, 20, 30)).astype(np.float32)
+                whole = wp.array(values, dtype=float, device=device)
+                clear(whole[:, rows, cols], mask, 5, device)
+                expected = values.copy()
+                expected[selected, rows, cols] = 0.0
+                np.testing.assert_array_equal(whole.numpy(), expected)
+
+
+def test_zero_selected_blocks_kernel_by_block_size(test, device):
+    """Clear small blocks with one thread per 8-byte word of the selected range and large ones block by block.
+
+    A block walk spends its setup on every block, which outweighs the stores of a
+    small block; word stores keep a warp's 256 bytes contiguous at any block size.
+    Odd blocks, misaligned buffers and strided views cannot take word stores.
+    """
+    mask = wp.array([True, False, True, True, False], dtype=bool, device=device)
+    misaligned = wp.zeros(1 + 5 * 12, dtype=float, device=device)[1:].reshape((5, 6, 2))
+    # 8 x 12 windows of 20 x 30 blocks, starting 256 bytes into the buffer.
+    aligned_strided = wp.zeros((5, 20, 30), dtype=float, device=device)[:, 2:10, 4:16]
+    cases = {
+        "6 x 1": (wp.zeros((5, 6, 1), dtype=float, device=device), _zero_selected_block_words, 15),
+        "66 x 31": (wp.zeros((5, 66, 31), dtype=float, device=device), _zero_selected_block_words, 5 * 33 * 31),
+        "37 x 33": (wp.zeros((5, 37, 33), dtype=float, device=device), _zero_selected_articulation_blocks, (5, 256)),
+        "64 x 32": (wp.zeros((5, 64, 32), dtype=float, device=device), _zero_selected_articulation_blocks, (5, 256)),
+        "misaligned": (misaligned, _zero_selected_articulation_blocks, (5, 32)),
+        "aligned strided": (aligned_strided, _zero_selected_articulation_blocks, (5, 96)),
+    }
+    for name, (blocks, kernel, dim) in cases.items():
+        with (
+            test.subTest(blocks=name),
+            mock.patch.dict(_clear_replays, clear=True),
+            mock.patch.object(wp, "launch", wraps=wp.launch) as launch,
+        ):
+            _launch_zero_selected_blocks(blocks, mask, 5, device)
+            test.assertEqual(launch.call_count, 1)
+            test.assertIs(launch.call_args.args[0], kernel)
+            test.assertEqual(launch.call_args.kwargs["dim"], dim)
+
+
+def test_zero_selected_blocks_replays_recorded_launch(test, device):
+    """Replay the clear recorded for the same buffer and mask instead of packing a new launch.
+
+    ``warp.launch`` packs every argument on each call, which costs more host time
+    than the clear of a small model. A replay reads the mask's current values, a
+    new buffer records its own launch, and a graph capture launches directly so the
+    graph holds the launch.
+    """
+    values = np.arange(4 * 6 * 2, dtype=np.float32).reshape(4, 6, 2) + 1.0
+    blocks = wp.array(values, dtype=float, device=device)
+    mask = wp.array([True, False, False, True], dtype=bool, device=device)
+
+    def expect(selected):
+        expected = values.copy()
+        expected[np.asarray(selected)] = 0.0
+        np.testing.assert_array_equal(blocks.numpy(), expected)
+
+    with mock.patch.dict(_clear_replays, clear=True), mock.patch.object(wp, "launch", wraps=wp.launch) as launch:
+        _launch_zero_selected_blocks(blocks, mask, 4, device)
+        test.assertEqual(launch.call_count, 1)
+        test.assertTrue(launch.call_args.kwargs["record_cmd"])
+        expect([True, False, False, True])
+
+        for selected in ([True, False, False, True], [False, True, True, False]):
+            blocks.assign(values)
+            mask.assign(selected)
+            _launch_zero_selected_blocks(blocks, mask, 4, device)
+            expect(selected)
+        test.assertEqual(launch.call_count, 1)
+        test.assertEqual(len(_clear_replays), 1)
+
+        other = wp.array(values, dtype=float, device=device)
+        _launch_zero_selected_blocks(other, mask, 4, device)
+        test.assertEqual(launch.call_count, 2)
+        np.testing.assert_array_equal(other.numpy()[[1, 2]], np.zeros((2, 6, 2), dtype=np.float32))
+        np.testing.assert_array_equal(other.numpy()[[0, 3]], values[[0, 3]])
+
+        blocks.assign(values)
+        with wp.ScopedCapture(device) as capture:
+            _launch_zero_selected_blocks(blocks, mask, 4, device)
+        test.assertEqual(launch.call_count, 3)
+        test.assertFalse(launch.call_args.kwargs.get("record_cmd", False))
+        wp.capture_launch(capture.graph)
+        expect([False, True, True, False])
+
+
+def test_zero_selected_blocks_replay_holds_no_buffers(test, device):
+    """Keep no buffer or mask alive through a recorded clear, and keep a bounded number of them.
+
+    A recorded launch reaches its arrays through views that do not own memory, so a
+    Jacobian freed by its caller, or allocated per call as in eval_mass_matrix, is
+    released at once.
+    """
+    with mock.patch.dict(_clear_replays, clear=True):
+        blocks = wp.zeros((4, 6, 2), dtype=float, device=device)
+        mask = wp.array([True, False, True, False], dtype=bool, device=device)
+        _launch_zero_selected_blocks(blocks, mask, 4, device)
+        test.assertEqual(len(_clear_replays), 1)
+        references = (weakref.ref(blocks), weakref.ref(mask))
+        del blocks, mask
+        gc.collect()
+        test.assertEqual([reference() for reference in references], [None, None])
+
+        kept = [wp.zeros((4, 6, 2), dtype=float, device=device) for _ in range(_CLEAR_REPLAY_CAPACITY + 3)]
+        mask = wp.array([True, False, True, False], dtype=bool, device=device)
+        for blocks in kept:
+            _launch_zero_selected_blocks(blocks, mask, 4, device)
+        test.assertEqual(len(_clear_replays), _CLEAR_REPLAY_CAPACITY)
+
+
+def test_zero_selected_blocks_fills_cpu_memory_on_host(test, device):
+    """Clear selected CPU blocks with a host fill, not the kernel, whose per-entry loop runs far slower on CPU."""
+    blocks = wp.array(np.ones((4, 6, 3), dtype=np.float32), dtype=float, device=device)
+    mask = wp.array([True, False, True, False], dtype=bool, device=device)
+
+    with mock.patch.object(wp, "launch", wraps=wp.launch) as launch:
+        _zero_selected_blocks(blocks, mask, 4, device)
+
+    test.assertEqual(launch.call_count, 0)
+    np.testing.assert_array_equal(blocks.numpy().reshape(4, -1).max(axis=1), [0.0, 1.0, 0.0, 1.0])
+
+
+def test_jacobian_mask_accepts_masks_the_launch_converts(test, device):
+    """Select the same articulations from masks that only the kernel launch accepts as from an exact mask.
+
+    The launch reads the first ``articulation_count`` entries of a longer Warp mask
+    and, on the CPU, takes a NumPy Boolean mask through its array interface. The
+    masked mass matrix, whose internal Jacobian goes through the same clear, must
+    agree as well.
+    """
+    model, state = _build_mixed_articulations(device)
+    selected = _mixed_selections(model)["mixed"]
+    exact = wp.array(selected, dtype=bool, device=device)
+    J_ref = _filled(_jacobian_shape(model), _SENTINEL, device)
+    newton.eval_jacobian(model, state, J_ref, mask=exact)
+    H_ref = newton.eval_mass_matrix(model, state, mask=exact).numpy()
+
+    masks = {"longer Warp mask": wp.array(np.append(selected, [True, False]), dtype=bool, device=device)}
+    if device.is_cpu:
+        masks["NumPy mask"] = selected
+    for name, mask in masks.items():
+        with test.subTest(mask=name):
+            J = _filled(_jacobian_shape(model), _SENTINEL, device)
+            newton.eval_jacobian(model, state, J, mask=mask)
+            np.testing.assert_array_equal(J.numpy(), J_ref.numpy())
+            np.testing.assert_array_equal(newton.eval_mass_matrix(model, state, mask=mask).numpy(), H_ref)
+
+
+def test_jacobian_mask_graph_replay_matches_eager(test, device):
+    """Clear and fill the blocks that the mask selects when a captured masked evaluation replays.
+
+    Each replay starts from a reset buffer and a new mask: the selected blocks must
+    equal the eager unmasked result and the others keep the reset values.
+    """
+    model, state = _build_mixed_articulations(device)
+    J_ref = newton.eval_jacobian(model, state).numpy()
+    selections = _mixed_selections(model)
+    mask = wp.array(selections["mixed"], dtype=bool, device=device)
+    joint_S_s = wp.zeros(model.joint_dof_count, dtype=wp.spatial_vector, device=device)
+    J = _filled(J_ref.shape, _SENTINEL, device)
+
+    # Load the modules eagerly; a capture cannot compile them.
+    newton.eval_jacobian(model, state, J, joint_S_s=joint_S_s, mask=mask)
+    with wp.ScopedCapture(device) as capture:
+        newton.eval_jacobian(model, state, J, joint_S_s=joint_S_s, mask=mask)
+
+    for name in ("mixed", "fan", "all"):
+        with test.subTest(selection=name):
+            selected = selections[name]
+            mask.assign(selected)
+            J.assign(np.full(J_ref.shape, _SENTINEL, dtype=np.float32))
+            wp.capture_launch(capture.graph)
+
+            J_np = J.numpy()
+            np.testing.assert_array_equal(J_np[selected], J_ref[selected])
+            np.testing.assert_array_equal(J_np[~selected], np.full_like(J_ref[~selected], _SENTINEL))
+
+
+def test_mass_matrix_mask_graph_replay_matches_eager(test, device):
+    """Replay a captured masked eval_mass_matrix whose internal Jacobian is allocated during the capture.
+
+    New float allocations start as NaN, as reused memory may hold anything, so a
+    replay must clear the blocks that the mask selects when it runs.
+    """
+    if device.is_cuda and not wp.is_mempool_enabled(device):
+        test.skipTest("Allocating during CUDA graph capture requires the memory pool")
+    model, state = _build_mixed_articulations(device)
+    H_ref = newton.eval_mass_matrix(model, state).numpy()
+    selections = _mixed_selections(model)
+    mask = wp.array(selections["mixed"], dtype=bool, device=device)
+    H = _filled(H_ref.shape, _SENTINEL, device)
+    body_I_s = wp.empty(model.body_count, dtype=wp.spatial_matrix, device=device)
+    joint_S_s = wp.zeros(model.joint_dof_count, dtype=wp.spatial_vector, device=device)
+
+    # Load the modules eagerly; a capture cannot compile them.
+    newton.eval_mass_matrix(model, state, H, body_I_s=body_I_s, joint_S_s=joint_S_s, mask=mask)
+    with _nan_filled_float_allocations(), wp.ScopedCapture(device) as capture:
+        newton.eval_mass_matrix(model, state, H, body_I_s=body_I_s, joint_S_s=joint_S_s, mask=mask)
+
+    for name in ("mixed", "fan"):
+        with test.subTest(selection=name):
+            selected = selections[name]
+            mask.assign(selected)
+            H.assign(np.full(H_ref.shape, _SENTINEL, dtype=np.float32))
+            wp.capture_launch(capture.graph)
+
+            H_np = H.numpy()
+            np.testing.assert_array_equal(H_np[selected], H_ref[selected])
+            np.testing.assert_array_equal(H_np[~selected], np.zeros_like(H_ref[~selected]))
+
+
+def test_jacobian_mask_clear_is_not_taped(test, device):
+    """Keep the masked clear off a wp.Tape, as the whole-buffer clear it replaces.
+
+    A taped clear would run its kernel's adjoint in ``tape.backward()``, which
+    overwrites ``J.grad``: the word kernel's adjoint zeroes whole selected blocks,
+    and the per-block kernel's writes into unselected blocks and past ``J``. Graph
+    captures and, on the CPU, NumPy masks launch the clear through
+    :func:`warp.launch`. ``J`` views the front of a larger buffer, so a gradient
+    write past ``J`` shows in the buffer's tail. Every case must leave the gradient
+    of the eager call, whose clear the tape never sees.
+    """
+    selected = np.array([False, True, False, True])
+    for leaf_count in (6, 18):  # 252- and 2052-entry blocks: the word and the per-block kernel
+        model, state = _build_fans(device, leaf_count)
+        shape = _jacobian_shape(model)
+        size = int(np.prod(shape))
+        joint_S_s = wp.zeros(model.joint_dof_count, dtype=wp.spatial_vector, device=device)
+        mask = wp.array(selected, dtype=bool, device=device)
+
+        def eager(J, model=model, state=state, joint_S_s=joint_S_s, mask=mask):
+            newton.eval_jacobian(model, state, J, joint_S_s=joint_S_s, mask=mask)
+
+        def captured(J, model=model, state=state, joint_S_s=joint_S_s, mask=mask):
+            with wp.ScopedCapture(device) as capture:
+                newton.eval_jacobian(model, state, J, joint_S_s=joint_S_s, mask=mask)
+            wp.capture_launch(capture.graph)
+
+        def numpy_mask(J, model=model, state=state, joint_S_s=joint_S_s):
+            newton.eval_jacobian(model, state, J, joint_S_s=joint_S_s, mask=selected)
+
+        # Load the modules eagerly; a capture cannot compile them.
+        eager(wp.zeros(shape, dtype=float, device=device))
+        cases = {"eager": eager, "capture": captured}
+        if device.is_cpu:
+            cases["NumPy mask"] = numpy_mask
+        gradients = {}
+        for name, evaluate in cases.items():
+            with test.subTest(leaves=leaf_count, case=name):
+                buffer = wp.zeros(size + 4096, dtype=float, device=device, requires_grad=True)
+                tape = wp.Tape()
+                with tape:
+                    evaluate(buffer[:size].reshape(shape))
+                taped = [launch[0].key for launch in tape.launches]
+                test.assertNotIn(_zero_selected_articulation_blocks.key, taped)
+                test.assertNotIn(_zero_selected_block_words.key, taped)
+
+                buffer.grad.fill_(1.0)
+                tape.backward()
+                gradients[name] = buffer.grad.numpy()
+                np.testing.assert_array_equal(gradients[name][size:], 1.0)
+                np.testing.assert_array_equal(gradients[name][:size].reshape(shape[0], -1)[~selected], 1.0)
+                np.testing.assert_array_equal(gradients[name], gradients["eager"])
+
+
 def test_prismatic_joint_jacobian(test, device):
     """Test Jacobian for prismatic joint."""
     builder = newton.ModelBuilder()
@@ -988,6 +1546,84 @@ add_function_test(
 )
 add_function_test(TestJacobianMassMatrix, "test_jacobian_with_mask", test_jacobian_with_mask, devices=devices)
 add_function_test(TestJacobianMassMatrix, "test_mass_matrix_with_mask", test_mass_matrix_with_mask, devices=devices)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_jacobian_mask_overwrites_only_selected_blocks",
+    test_jacobian_mask_overwrites_only_selected_blocks,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_jacobian_mask_skips_whole_buffer_clear",
+    test_jacobian_mask_skips_whole_buffer_clear,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_jacobian_mask_without_buffer_zeroes_unselected",
+    test_jacobian_mask_without_buffer_zeroes_unselected,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_articulation_view_jacobian_writes_only_view_blocks",
+    test_articulation_view_jacobian_writes_only_view_blocks,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_zero_selected_blocks_matches_numpy",
+    test_zero_selected_blocks_matches_numpy,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_zero_selected_blocks_kernel_by_block_size",
+    test_zero_selected_blocks_kernel_by_block_size,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_zero_selected_blocks_replays_recorded_launch",
+    test_zero_selected_blocks_replays_recorded_launch,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_zero_selected_blocks_replay_holds_no_buffers",
+    test_zero_selected_blocks_replay_holds_no_buffers,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_zero_selected_blocks_fills_cpu_memory_on_host",
+    test_zero_selected_blocks_fills_cpu_memory_on_host,
+    devices=[device for device in devices if device.is_cpu],
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_jacobian_mask_accepts_masks_the_launch_converts",
+    test_jacobian_mask_accepts_masks_the_launch_converts,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_jacobian_mask_graph_replay_matches_eager",
+    test_jacobian_mask_graph_replay_matches_eager,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_mass_matrix_mask_graph_replay_matches_eager",
+    test_mass_matrix_mask_graph_replay_matches_eager,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_jacobian_mask_clear_is_not_taped",
+    test_jacobian_mask_clear_is_not_taped,
+    devices=devices,
+)
 add_function_test(
     TestJacobianMassMatrix, "test_prismatic_joint_jacobian", test_prismatic_joint_jacobian, devices=devices
 )

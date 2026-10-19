@@ -2003,9 +2003,11 @@ class ArticulationView:
         Args:
             state: The state containing body transforms (body_q).
             J: Optional output array for the Jacobian, shape (articulation_count, max_links*6, max_dofs).
-               If None, allocates internally.
+               If None, allocates a zero-initialized array.
             joint_S_s: Optional pre-allocated temp array for motion subspaces.
             mask: Optional mask of articulations in this ArticulationView (all by default).
+                Blocks of articulations outside the selection are left unchanged, as in
+                :func:`~newton.eval_jacobian`.
 
         Returns:
             The Jacobian array J, or None if the model has no articulations.

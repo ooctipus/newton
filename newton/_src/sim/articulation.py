@@ -1190,6 +1190,206 @@ def eval_articulation_jacobian(
             j = joint_ancestor[j]
 
 
+@wp.kernel(enable_backward=False)
+def _zero_selected_articulation_blocks(
+    articulation_mask: wp.array[bool],
+    lane_count: int,
+    # outputs
+    blocks: wp.array3d[float],
+):
+    """Zero the whole block ``blocks[i]`` of every articulation ``i`` selected by the mask.
+
+    ``lane_count`` threads share one articulation and walk its block in row-major
+    order with stride ``lane_count``, so consecutive lanes store consecutive entries.
+    Like the memset it stands in for, the clear has no adjoint.
+    """
+    art_idx, lane = wp.tid()
+    if not articulation_mask[art_idx]:
+        return
+
+    cols = blocks.shape[2]
+    row = lane // cols
+    col = lane - row * cols
+    row_step = lane_count // cols
+    col_step = lane_count - row_step * cols
+    while row < blocks.shape[1]:
+        blocks[art_idx, row, col] = 0.0
+        row += row_step
+        col += col_step
+        if col >= cols:
+            col -= cols
+            row += 1
+
+
+@wp.kernel(enable_backward=False)
+def _zero_selected_block_words(
+    articulation_mask: wp.array[bool],
+    words_per_block: int,
+    # outputs
+    words: wp.array[wp.uint64],
+):
+    """Zero 8-byte word ``i`` of a contiguous buffer of per-articulation blocks if its articulation is selected.
+
+    A zero word is two ``0.0`` entries. One thread per word, so a warp stores 256
+    contiguous bytes, as a memset does, however few entries each block holds.
+    Like the memset it stands in for, the clear has no adjoint.
+    """
+    i = wp.tid()
+    if articulation_mask[i // words_per_block]:
+        words[i] = wp.uint64(0)
+
+
+_BLOCKWISE_CLEAR_MIN_ENTRIES = 2048
+"""Block size, in entries, from which the masked clear walks each block with its own threads.
+
+Below it :func:`_zero_selected_block_words` clears the buffer word by word: the
+per-block walk spends its setup on every block, which outweighs the stores of a
+small block.
+"""
+
+_CLEAR_REPLAY_CAPACITY = 16
+"""Number of recorded clear launches kept for replay; the oldest is dropped first."""
+
+_clear_replays: dict[tuple, wp.Launch] = {}
+"""Recorded clear launches, keyed by every argument value they pack."""
+
+
+def _unowned_view(array: wp.array, dtype=None, shape: tuple[int, ...] | None = None) -> wp.array:
+    """Return a view of ``array``'s memory that does not keep the memory alive.
+
+    Without ``shape`` the view keeps the shape and strides of ``array``; with it, the
+    view is contiguous.
+    """
+    return wp.array(
+        ptr=array.ptr,
+        dtype=array.dtype if dtype is None else dtype,
+        shape=array.shape if shape is None else shape,
+        strides=array.strides if shape is None else None,
+        device=array.device,
+    )
+
+
+def _clear_launch_arguments(
+    blocks: wp.array3d[float], mask: wp.array[bool], articulation_count: int, *, owned: bool = True
+) -> tuple[wp.Kernel, int | tuple[int, int], list, list]:
+    """Return the kernel, launch dimensions, inputs and outputs that clear the selected blocks.
+
+    Args:
+        blocks: Per-articulation blocks, shape [articulation_count or more, rows, columns].
+        mask: Articulation mask.
+        articulation_count: Number of leading blocks that the mask covers.
+        owned: Whether array arguments may keep their memory alive. A recorded launch
+            gets views that do not, so that it never extends a buffer's lifetime.
+    """
+    if not owned:
+        mask = _unowned_view(mask)
+    block_size = blocks.shape[1] * blocks.shape[2]
+    word_count = articulation_count * (block_size // 2)
+    if (
+        isinstance(blocks, wp.array)
+        and blocks.dtype is wp.float32
+        and block_size % 2 == 0
+        and block_size < _BLOCKWISE_CLEAR_MIN_ENTRIES
+        and word_count < 2**31
+        and blocks.is_contiguous
+        and blocks.ptr % 8 == 0
+    ):
+        if owned:
+            words = blocks.reshape((-1, 2)).view(wp.vec2).view(wp.uint64)
+        else:
+            words = _unowned_view(blocks, wp.uint64, (word_count,))
+        return _zero_selected_block_words, word_count, [mask, block_size // 2], [words]
+
+    # A whole number of warps per articulation, at most one 256-thread block.
+    lane_count = min(256, 32 * ((block_size + 31) // 32))
+    if not owned:
+        blocks = _unowned_view(blocks)
+    return _zero_selected_articulation_blocks, (articulation_count, lane_count), [mask, lane_count], [blocks]
+
+
+def _launch_zero_selected_blocks(
+    blocks: wp.array3d[float], mask: wp.array[bool], articulation_count: int, device: wp.Device
+) -> None:
+    """Launch a clear of the blocks that ``mask`` selects among the first ``articulation_count`` blocks.
+
+    Blocks of an even number of entries, fewer than :data:`_BLOCKWISE_CLEAR_MIN_ENTRIES`,
+    in a contiguous, 8-byte aligned float32 buffer are cleared by
+    :func:`_zero_selected_block_words`; larger blocks, and any other layout, by
+    :func:`_zero_selected_articulation_blocks`.
+
+    Outside a graph capture, a call with Warp arrays replays the launch recorded for
+    the same argument values, as :func:`warp.launch` would pack them. Packing costs
+    more host time than the clear takes on a small model, where it would make the
+    clear slower than the whole-buffer memset it replaces. A capture records its own
+    launches.
+
+    No launch is recorded on a :class:`warp.Tape`, so a backward pass sees the clear
+    as it saw the ``J.zero_()`` it replaces: not at all.
+    """
+    block_size = blocks.shape[1] * blocks.shape[2]
+    if block_size == 0 or articulation_count == 0:
+        return
+    if not (isinstance(blocks, wp.array) and isinstance(mask, wp.array)) or device.is_capturing:
+        kernel, dim, inputs, outputs = _clear_launch_arguments(blocks, mask, articulation_count)
+        wp.launch(kernel, dim=dim, inputs=inputs, outputs=outputs, device=device, record_tape=False)
+        return
+
+    key = (
+        device.alias,
+        articulation_count,
+        blocks.ptr,
+        blocks.shape,
+        blocks.strides,
+        blocks.dtype,
+        blocks.device.alias,
+        mask.ptr,
+        mask.shape,
+        mask.strides,
+        mask.dtype,
+        mask.device.alias,
+    )
+    launch = _clear_replays.get(key)
+    if launch is None:
+        kernel, dim, inputs, outputs = _clear_launch_arguments(blocks, mask, articulation_count, owned=False)
+        launch = wp.launch(
+            kernel, dim=dim, inputs=inputs, outputs=outputs, device=device, record_tape=False, record_cmd=True
+        )
+        if launch is None:
+            return  # warp.launch launches nothing either
+        if len(_clear_replays) >= _CLEAR_REPLAY_CAPACITY:
+            del _clear_replays[next(iter(_clear_replays))]
+        _clear_replays[key] = launch
+    launch.launch()
+
+
+def _zero_selected_blocks(
+    blocks: wp.array3d[float], mask: wp.array[bool], articulation_count: int, device: wp.Device
+) -> None:
+    """Zero the per-articulation blocks that ``mask`` selects and leave the others untouched.
+
+    On the CPU a NumPy fill clears the selected blocks: the kernels' per-entry
+    loops run serially there. The fill is host code, which a graph
+    capture does not record, so a capture takes a kernel, which reads the mask
+    when the graph replays. So does any mask other than a Boolean Warp array on
+    ``device`` with an entry per articulation: the launch then converts or rejects
+    it as the Jacobian launch does.
+    """
+    if (
+        device.is_cpu
+        and not device.is_capturing
+        and isinstance(blocks, wp.array)
+        and isinstance(mask, wp.array)
+        and blocks.device == device
+        and mask.device == device
+        and mask.dtype is wp.bool
+        and mask.ndim == 1
+        and mask.shape[0] >= articulation_count
+    ):
+        blocks.numpy()[:articulation_count][mask.numpy()[:articulation_count]] = 0.0
+    else:
+        _launch_zero_selected_blocks(blocks, mask, articulation_count, device)
+
+
 def eval_jacobian(
     model: Model,
     state: State,
@@ -1208,12 +1408,15 @@ def eval_jacobian(
         model: The model containing articulation definitions.
         state: The state containing body transforms (body_q).
         J: Optional output array for the Jacobian, shape (articulation_count, max_links*6, max_dofs).
-           If None, allocates internally.
+           If None, allocates a zero-initialized array.
         joint_S_s: Optional pre-allocated temp array for motion subspaces,
                    shape (joint_dof_count,), dtype wp.spatial_vector.
                    If None, allocates internally.
         mask: Optional boolean mask to select which articulations to compute.
               Shape [articulation_count]. If None, computes for all articulations.
+              The block ``J[i]`` of each selected articulation is overwritten in
+              full, with zeros in the rows past its links and the columns past its
+              DOFs. Entries of unselected articulations are left unchanged.
 
     Returns:
         The Jacobian array J, or None if the model has no articulations.
@@ -1221,18 +1424,20 @@ def eval_jacobian(
     if model.articulation_count == 0:
         return None
 
-    # Allocate output if not provided
     if J is None:
         max_links = model.max_joints_per_articulation
         max_dofs = model.max_dofs_per_articulation
-        J = wp.empty(
+        J = wp.zeros(
             (model.articulation_count, max_links * 6, max_dofs),
             dtype=float,
             device=model.device,
         )
-
-    # Zero the output buffer
-    J.zero_()
+    elif mask is None:
+        J.zero_()
+    else:
+        # The kernel writes only selected blocks, so clearing just those leaves the
+        # caller's values in the rest and keeps the cost proportional to the selection.
+        _zero_selected_blocks(J, mask, model.articulation_count, model.device)
 
     # Allocate temp if not provided
     if joint_S_s is None:
