@@ -26,24 +26,21 @@ HEIGHTFIELD_ROW_COUNT = len(HEIGHTFIELD_TYPED_ROWS) + 1
 
 @wp.func
 def heightfield_row(type_a: int, type_b: int, data_b: wp.vec4, exclude_convex: int) -> int:
-    """Return the row that serves a triangle pair of these shapes, or -1 for the terrain convex-cells owner.
+    """Return the row that serves a triangle pair of these shapes, or -1 when no row does.
 
     Mirrors the filters of the typed and fallback kernels made by
     ``create_mesh_triangle_contacts_to_reducer_kernel``: a typed row takes its
     type on a heightfield (a cylinder only with a zero barrel radius); the
     fallback takes every other pair unless the convex-cells owner serves
-    heightfield/convex-hull pairs.
+    heightfield/convex-hull pairs. Typed row indices come from
+    ``HEIGHTFIELD_TYPED_ROWS``, the table the row kernels are built from.
     """
     if type_a == GeoType.HFIELD:
-        # The row order is HEIGHTFIELD_TYPED_ROWS.
         if heightfield_typed_primitive(type_b, data_b):
-            if type_b == GeoType.SPHERE:
-                return 0
-            if type_b == GeoType.CYLINDER:
-                return 1
-            if type_b == GeoType.CAPSULE:
-                return 2
-            return 3
+            for row in range(wp.static(len(HEIGHTFIELD_TYPED_ROWS))):
+                if type_b == wp.static(HEIGHTFIELD_TYPED_ROWS[row]):
+                    return row
+            return -1
         if exclude_convex != 0 and type_b == GeoType.CONVEX_MESH:
             return -1
     return wp.static(len(HEIGHTFIELD_TYPED_ROWS))

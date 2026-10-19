@@ -170,13 +170,59 @@ def exported(contacts):
     return [getattr(contacts, name).numpy()[:count].view(np.uint32).copy() for name in names]
 
 
+def row_kernels(narrow):
+    """Return the kernels each typed row launches, in row order (the cylinder split replaces row 1)."""
+    rows = []
+    for row, kernel in enumerate(narrow._heightfield_primitive_kernels):
+        split = narrow._heightfield_cylinder_split and row == HEIGHTFIELD_TYPED_ROWS.index(int(newton.GeoType.CYLINDER))
+        rows.append(tuple(narrow._heightfield_cylinder_split_kernels) if split else (kernel,))
+    return rows
+
+
+def collide_observed(owner, state, contacts):
+    """Collide and record, per typed row, every launched row kernel's stream length input and its value at launch."""
+    narrow = owner.narrow_phase
+    rows = row_kernels(narrow)
+    launched = [[] for _ in rows]
+    launch = wp.launch
+
+    def observe(*args, **kwargs):
+        kernel = kwargs.get("kernel", args[0] if args else None)
+        for row, kernels in enumerate(rows):
+            if any(kernel is candidate for candidate in kernels):
+                length = kwargs["inputs"][9]  # The row kernels' triangle_pairs_count argument.
+                launched[row].append((kernel, length, int(length.numpy()[0])))
+        return launch(*args, **kwargs)
+
+    with patch.object(wp, "launch", side_effect=observe):
+        owner.collide(state, contacts)
+    return launched
+
+
 class TestHeightfieldRowGate(unittest.TestCase):
-    def collide_pair(self, gated, reference, state):
-        """Collide both pipelines and require identical raw and exported contacts."""
+    def assert_row_launches(self, narrow, launched, reached):
+        """Every row kernel must read its gated length: the stream length if a current pair reaches the row, else 0."""
+        triangles = int(narrow.triangle_pairs_count.numpy()[0])
+        for row, (name, kernels) in enumerate(zip(ROW_NAMES, row_kernels(narrow), strict=True)):
+            with self.subTest(row=name):
+                self.assertEqual([entry[0] for entry in launched[row]], list(kernels))
+                for _kernel, length, value in launched[row]:
+                    self.assertIs(length, narrow._heightfield_row_count_views[row])
+                    self.assertEqual(value, triangles if name in reached else 0)
+
+    def collide_pair(self, gated, reference, state, reached=None):
+        """Collide both pipelines and require identical raw and exported contacts.
+
+        With ``reached``, also require that the gated rows launch with the gated stream lengths.
+        """
         outputs = []
         for owner in (gated, reference):
             contacts = owner.contacts()
-            owner.collide(state, contacts)
+            if owner is gated and reached is not None:
+                launched = collide_observed(owner, state, contacts)
+                self.assert_row_launches(owner.narrow_phase, launched, reached)
+            else:
+                owner.collide(state, contacts)
             owner.narrow_phase.check_buffer_capacity()
             outputs.append(contacts)
         device = wp.get_device(state.body_q.device)
@@ -199,7 +245,7 @@ class TestHeightfieldRowGate(unittest.TestCase):
         gated, reference = pipeline(model, True), pipeline(model, False)
         self.assertTrue(gated.narrow_phase._heightfield_row_gate)
         self.assertFalse(reference.narrow_phase._heightfield_row_gate)
-        self.collide_pair(gated, reference, state)
+        self.collide_pair(gated, reference, state, reached={"sphere"})
         triangles = int(gated.narrow_phase.triangle_pairs_count.numpy()[0])
         self.assertGreater(triangles, 0)
         self.assertGreater(int(gated.narrow_phase.global_contact_reducer.contact_count.numpy()[0]), 0)
@@ -215,23 +261,25 @@ class TestHeightfieldRowGate(unittest.TestCase):
         types = model.shape_type.numpy().copy()
         scales = model.shape_scale.numpy().copy()
         edited = 1  # The first sphere; shape 0 is the heightfield.
-        cylinder, ellipsoid = int(newton.GeoType.CYLINDER), int(newton.GeoType.ELLIPSOID)
+        kinds = newton.GeoType
         cases = (
             # A barrel cylinder is served by the generic fallback, a regular one by its typed row.
-            ("barrel", cylinder, (0.05, 0.03, 0.2), {"sphere", "fallback"}),
-            ("regular", cylinder, (0.05, 0.03, 0.0), {"sphere", "cylinder"}),
-            ("ellipsoid", ellipsoid, (0.05, 0.04, 0.03), {"sphere", "fallback"}),
+            ("barrel", kinds.CYLINDER, (0.05, 0.03, 0.2), {"sphere", "fallback"}),
+            ("regular", kinds.CYLINDER, (0.05, 0.03, 0.0), {"sphere", "cylinder"}),
+            ("capsule", kinds.CAPSULE, (0.03, 0.05, 0.0), {"sphere", "capsule"}),
+            ("box", kinds.BOX, (0.04, 0.03, 0.02), {"sphere", "box"}),
+            ("ellipsoid", kinds.ELLIPSOID, (0.05, 0.04, 0.03), {"sphere", "fallback"}),
             ("restored", int(types[edited]), tuple(scales[edited]), {"sphere"}),
         )
         for name, kind, scale, reached in cases:
             with self.subTest(device=device, case=name):
                 current_types, current_scales = types.copy(), scales.copy()
-                current_types[edited] = kind
+                current_types[edited] = int(kind)
                 current_scales[edited] = scale
                 model.shape_type.assign(current_types)
                 model.shape_scale.assign(current_scales)
                 if graph is None:
-                    self.collide_pair(gated, reference, state)
+                    self.collide_pair(gated, reference, state, reached=reached)
                 else:
                     wp.capture_launch(graph)
                     reference.collide(state, reference.contacts())
@@ -257,9 +305,19 @@ class TestHeightfieldRowGate(unittest.TestCase):
         model = rough_terrain_model(device, kinds, per_kind=2, terrain_yaw=0.3)
         state = model.state()
         gated, reference = pipeline(model, True), pipeline(model, False)
-        self.collide_pair(gated, reference, state)
+        self.collide_pair(gated, reference, state, reached=set(ROW_NAMES))
         triangles = int(gated.narrow_phase.triangle_pairs_count.numpy()[0])
         self.assertEqual(self.row_lengths(gated), dict.fromkeys(ROW_NAMES, triangles))
+
+        # The staged cylinder query replaces the cylinder row with three kernels that read its gated length.
+        split = {"NEWTON_HEIGHTFIELD_CYLINDER_SPLIT": "1", "NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES": "0"}
+        spheres = rough_terrain_model(device, ("sphere", "capsule"), per_kind=2)
+        for scene, reached in ((model, set(ROW_NAMES)), (spheres, {"sphere", "capsule"})):
+            with self.subTest(device=device, cylinder_split=sorted(reached)):
+                gated = pipeline(scene, True, environment=split)
+                reference = pipeline(scene, False, environment=split)
+                self.assertTrue(gated.narrow_phase._heightfield_cylinder_split)
+                self.collide_pair(gated, reference, scene.state(), reached=reached)
 
         hulls = rough_terrain_model(device, ("hull",), per_kind=3)
         state = hulls.state()
@@ -271,7 +329,7 @@ class TestHeightfieldRowGate(unittest.TestCase):
                 gated = pipeline(hulls, True, convex_collision=choice)
                 reference = pipeline(hulls, False, convex_collision=choice)
                 self.assertEqual(gated.narrow_phase._heightfield_fallback_excludes_convex, not fallback)
-                self.collide_pair(gated, reference, state)
+                self.collide_pair(gated, reference, state, reached={"fallback"} if fallback else set())
                 triangles = int(gated.narrow_phase.triangle_pairs_count.numpy()[0])
                 self.assertGreater(triangles, 0)
                 self.assertGreater(int(gated.narrow_phase.global_contact_reducer.contact_count.numpy()[0]), 0)
