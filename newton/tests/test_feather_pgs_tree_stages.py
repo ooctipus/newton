@@ -194,6 +194,13 @@ class TestTreeKineticStages(unittest.TestCase):
                     np.testing.assert_array_equal(array.numpy(), before[name], err_msg=name)
 
     def check_motion_input_ignored(self, device):
+        """Launch each finish and ordinary repair with the state's velocity and with NaN as the motion input.
+
+        Every launch must rebuild its groups' caches (a new generation), so
+        that equal outputs show an unread input rather than an early exit. The
+        repairs are admitted because the caches are stamped with the bank the
+        preceding finish published into, not with the input bank.
+        """
         device = wp.get_device(device)
         for alternate in (False, True):
             model = _build(device, worlds=2, speed_limit=0.8 if alternate else None)
@@ -217,6 +224,8 @@ class TestTreeKineticStages(unittest.TestCase):
                         start = {key: array.numpy().copy() for key, array in _state_arrays(group, data).items()}
                         plain = _launch(group, kernel, data, state.joint_qd, start)
                         poisoned = _launch(group, kernel, data, nan, start)
+                        for launched in (plain, poisoned):
+                            self.assertTrue((launched["cache.generation"] != start["cache.generation"]).all())
                         differ = [key for key in plain if plain[key].tobytes() != poisoned[key].tobytes()]
                         if alternate and name == "repair":
                             self.assertTrue(differ)
