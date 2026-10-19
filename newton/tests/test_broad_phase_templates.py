@@ -24,6 +24,7 @@ from newton._src.geometry.broad_phase_nxn import (
     BroadPhaseExplicit,
     BroadPhaseExplicitTemplates,
     ShapePairTemplates,
+    _nxn_broadphase_precomputed_pairs,
     replay_shape_pair_templates,
 )
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
@@ -271,7 +272,7 @@ def test_layout_shapes_match_flat_kernel(test, device):
         record = _exact_template(pair_count, staged)
         layout = BroadPhaseExplicitTemplates(record, device=device)
         with test.subTest(pairs=pair_count, staged=staged):
-            test.assertEqual((layout.pairs_per_world, layout.staged_shapes), (pair_count, staged))
+            test.assertEqual((layout.max_pairs_per_world, layout.staged_shapes), (pair_count, staged))
             test.assertEqual(layout.threads_per_world, threads)
             test.assertEqual(layout.worlds_per_block, worlds_per_block)
             pairs = wp.array(record.replay(), dtype=wp.vec2i, device=device)
@@ -537,6 +538,43 @@ class TestBroadPhaseTemplateRule(unittest.TestCase):
         self.assertFalse(too_many.automatic)
         self.assertFalse(too_many.verify(wp.zeros(too_many.pair_count, dtype=wp.vec2i, device="cpu")))
 
+    def test_describe_reports_largest_and_mean_templates(self):
+        """Report the largest template's pairs, which set the lanes, next to the mean the rule uses."""
+        record, _ = _synthetic(3, worlds=12, world_shapes=20, template_specs=((2, 70), (1, 9)))
+        described = BroadPhaseExplicitTemplates(record, device="cpu").describe()
+        per_world = [sum(map(len, record.templates[template])) for template, starts in record.runs for _ in starts]
+        self.assertEqual(len(set(per_world)), 2)
+        self.assertEqual(described["max_pairs_per_world"], 72)
+        self.assertAlmostEqual(described["mean_pairs_per_world"], float(np.mean(per_world)))
+        self.assertLess(described["mean_pairs_per_world"], 72)
+        self.assertNotIn("pairs_per_world", described)
+        json.dumps(described, allow_nan=False)
+
+    def test_flat_kernel_order_follows_the_module_option(self):
+        """Report ordered flat-kernel writes only when its module runs Warp's deterministic mode."""
+        options = _nxn_broadphase_precomputed_pairs.module.options
+        self.assertFalse(BroadPhaseExplicitTemplates.flat_kernel_orders_writes())
+        with mock.patch.dict(options, {"deterministic": wp.DeterministicMode.RUN_TO_RUN}):
+            self.assertTrue(BroadPhaseExplicitTemplates.flat_kernel_orders_writes())
+        self.assertFalse(BroadPhaseExplicitTemplates.flat_kernel_orders_writes())
+
+    def test_verification_uploads_the_layout(self):
+        """Allocate the device layout in verify(), so a verified layout allocates nothing in launch()."""
+        empty = (np.empty((0, 2), dtype=np.int32), np.empty((0, 2), dtype=np.int32))
+        records = {
+            "template pairs": _synthetic(4, worlds=5, world_shapes=10, template_specs=((2, 12),))[0],
+            # Worlds without template pairs: verify() returned before uploading.
+            "global pairs only": ShapePairTemplates(
+                np.array([[0, 1]], dtype=np.int32), (empty,), ((0, np.array([2, 3], dtype=np.int32)),)
+            ),
+        }
+        for name, record in records.items():
+            with self.subTest(case=name):
+                layout = BroadPhaseExplicitTemplates(record, device="cpu")
+                self.assertIsNone(layout.data)
+                self.assertTrue(layout.verify(wp.array(record.replay(), dtype=wp.vec2i, device="cpu")))
+                self.assertIsNotNone(layout.data)
+
 
 def _contacts(pipeline, model, state):
     contacts = pipeline.contacts()
@@ -696,6 +734,9 @@ class TestBroadPhaseTemplateSelection(unittest.TestCase):
         record = _kernel_record(_pipeline(model, None))
         self.assertEqual(record["source"], "automatic")
         self.assertEqual(record["templates"]["templates"], 3)
+        # Lanes follow the largest template, the automatic rule the mean.
+        layout = record["templates"]
+        self.assertGreater(layout["max_pairs_per_world"], layout["mean_pairs_per_world"])
         self.assertIsNone(_kernel_record(_pipeline(model, "1", broad_phase="nxn")))
 
         state = model.state()
@@ -749,6 +790,39 @@ class TestBroadPhaseTemplateSelection(unittest.TestCase):
             np.testing.assert_array_equal(
                 getattr(contacts, name).numpy(), getattr(flat_contacts, name).numpy(), err_msg=name
             )
+
+    def test_global_pairs_only_keep_the_flat_kernel(self):
+        """Keep the flat kernel, even when forced, for a list whose world templates hold no pairs."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        body = builder.add_body(xform=wp.transform((0.0, 0.0, 0.3), wp.quat_identity()))
+        builder.add_shape_box(body, hx=0.5, hy=0.5, hz=0.5)  # a global body: one global-global pair
+        visual = newton.ModelBuilder()
+        visual.add_shape_sphere(
+            visual.add_body(), radius=0.1, cfg=newton.ModelBuilder.ShapeConfig(has_shape_collision=False)
+        )
+        for world in range(3):
+            builder.add_world(visual, xform=wp.transform((2.0 * world, 0.0, 0.0), wp.quat_identity()))
+        model = _finalize(builder, "cpu")
+        self.assertEqual(model.shape_contact_pair_count, 1)
+        pipeline = _pipeline(model, "1")
+        record = _kernel_record(pipeline)
+        self.assertEqual(record["kernel"], "flat_pairs")
+        self.assertIn("hold no pairs", record["reason"])
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+        _, launches = _launched(functools.partial(_contacts, pipeline, model, state))
+        self.assertEqual(launches, {"templates": 0, "flat": 1})
+        self.assertEqual(int(pipeline.broad_phase_pair_count.numpy()[0]), 1)
+
+    def test_deterministic_mode_keeps_the_flat_kernel(self):
+        """Keep the flat kernel when Warp orders its writes, unless the pipeline sorts contacts anyway."""
+        model = _finalize(_replicated_builder(), "cpu")
+        with mock.patch.object(BroadPhaseExplicitTemplates, "flat_kernel_orders_writes", return_value=True):
+            record = _kernel_record(_pipeline(model, "1"))
+            self.assertEqual(record["kernel"], "flat_pairs")
+            self.assertIn("deterministic mode", record["reason"])
+            self.assertEqual(_kernel_record(_pipeline(model, "1", deterministic=True))["kernel"], "world_templates")
 
     def test_changed_list_keeps_the_flat_kernel(self):
         """Fall back when the model-built list was changed in place after finalization."""

@@ -1015,10 +1015,10 @@ class BroadPhaseExplicitTemplates:
         self.slot_count = int(counts.shape[0])
         self.template_pair_count = int(counts.sum())
         self.pair_count = self.global_count + self.template_pair_count
-        self.pairs_per_world = max((packed.shape[0] for packed in entries), default=0)
+        self.max_pairs_per_world = max((packed.shape[0] for packed in entries), default=0)
         self.mean_pairs_per_world = float(counts.mean()) if counts.shape[0] else 0.0
         self.staged_shapes = max((stage.shape[0] for stage in stages), default=0)
-        self.threads_per_world = min(256, max(32, _next_power_of_two(math.ceil(self.pairs_per_world / 8))))
+        self.threads_per_world = min(256, max(32, _next_power_of_two(math.ceil(self.max_pairs_per_world / 8))))
         self.staged_capacity = max(32, -(-self.staged_shapes // 32) * 32)
         self.worlds_per_block = max(
             1,
@@ -1045,7 +1045,8 @@ class BroadPhaseExplicitTemplates:
         entry_start[1:] = np.cumsum([packed.shape[0] for packed in entries])
         slot_pair_start = np.zeros(self.slot_count, dtype=np.int64)
         slot_pair_start[1:] = np.cumsum(counts)[:-1]
-        # Host layout; uploaded on first use, so a pipeline that keeps the flat kernel allocates nothing.
+        # Host layout, uploaded by verify() (or the first launch), so a pipeline that keeps the
+        # flat kernel without verifying allocates nothing.
         self._host = {
             "slot_shape_start": joined(slot_starts, np.int32),
             "slot_template": joined(slot_templates, np.int32),
@@ -1099,18 +1100,29 @@ class BroadPhaseExplicitTemplates:
             "global_pairs": self.global_count,
             "global_blocks": self.global_blocks,
             "pairs": self.pair_count,
-            "pairs_per_world": self.pairs_per_world,
+            "max_pairs_per_world": self.max_pairs_per_world,
+            "mean_pairs_per_world": self.mean_pairs_per_world,
             "staged_shapes": self.staged_shapes,
             "threads_per_world": self.threads_per_world,
             "worlds_per_block": self.worlds_per_block,
         }
 
+    @staticmethod
+    def flat_kernel_orders_writes() -> bool:
+        """Whether Warp's deterministic mode orders :class:`BroadPhaseExplicit`'s candidate writes.
+
+        The flat kernel appends each hit with a counter atomic, which a deterministic module
+        runs in ordered passes; this kernel's per-warp atomics cannot be ordered that way.
+        """
+        return int(_nxn_broadphase_precomputed_pairs.module.options.get("deterministic") or 0) != 0
+
     def verify(self, pairs: wp.array[wp.vec2i]) -> bool:
         """Return whether the templates enumerate ``pairs`` exactly, position by position.
 
         Global-global pairs are read from ``pairs`` itself; every template entry is
-        decoded on the device and compared with the pair at its position. Launches
-        and synchronizes, so call it at construction, outside graph capture.
+        decoded on the device and compared with the pair at its position. Launches,
+        allocates the device layout and synchronizes, so call it at construction,
+        outside graph capture; a verified layout allocates nothing in :meth:`launch`.
         """
         if (
             self.unsupported_reason is not None
@@ -1122,9 +1134,9 @@ class BroadPhaseExplicitTemplates:
             or pairs.shape[0] != self.pair_count
         ):
             return False
+        self._upload()
         if self.slot_count == 0:
             return True
-        self._upload()
         mismatch = wp.zeros(1, dtype=wp.int32, device=self.device)
         wp.launch_tiled(
             _verify_pair_templates,
@@ -1150,6 +1162,7 @@ class BroadPhaseExplicitTemplates:
         """Test the templates against pre-expanded AABBs.
 
         The caller zeroes ``candidate_pair_count``, as with ``skip_count_zero=True``.
+        Without a prior :meth:`verify`, the first call allocates the device layout.
 
         Args:
             shape_lower: Lower AABB bounds, expanded by the effective gaps, shape [shape_count].

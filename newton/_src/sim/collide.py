@@ -2382,7 +2382,7 @@ class CollisionPipeline:
             )
             self.hydroelastic_sdf = self.narrow_phase.hydroelastic_sdf
 
-        self._select_explicit_pair_kernel(model, pair_templates, using_expert_components)
+        self._select_explicit_pair_kernel(model, pair_templates, using_expert_components, deterministic)
 
         # A declared variable that an explicit argument superseded was present but not applied.
         superseded = []
@@ -2803,12 +2803,15 @@ class CollisionPipeline:
         self._body_pair_reduction_capture_tokens: set[object] = set()
         self._captured_contacts: Contacts | None = None
 
-    def _select_explicit_pair_kernel(self, model: Model, setting: str | None, using_expert_components: bool) -> None:
+    def _select_explicit_pair_kernel(
+        self, model: Model, setting: str | None, using_expert_components: bool, deterministic: bool
+    ) -> None:
         """Choose the explicit broad-phase kernel once, at construction, and record why.
 
         The world-template kernel replaces the flat one only where it tests the same
         pairs: the explicit list must be the model-built replay of per-world templates,
-        and the templates are verified against its contents on the device.
+        and the templates are verified against its contents on the device. Verification
+        also allocates the layout, so ``collide()`` allocates nothing for it.
         """
         self._pair_templates = None
         if self.broad_phase_mode != "explicit":
@@ -2824,10 +2827,18 @@ class CollisionPipeline:
             reason = "Speculative contacts sweep AABBs, which only the flat pair kernel supports."
         elif templates is None or not templates.describes(self.shape_pairs_filtered):
             reason = "The explicit pairs are not the model-built replay of per-world templates."
+        elif not deterministic and BroadPhaseExplicitTemplates.flat_kernel_orders_writes():
+            # A deterministic pipeline sorts its contacts, so only then is the candidate order free.
+            reason = (
+                "Warp's deterministic mode orders the flat pair kernel's candidate writes; the world-template "
+                "kernel does not."
+            )
         else:
             layout = BroadPhaseExplicitTemplates(templates, device=self.device)
             if layout.unsupported_reason is not None:
                 reason = layout.unsupported_reason
+            elif layout.slot_count == 0:
+                reason = "The world templates hold no pairs; the flat pair kernel tests the global pairs."
             elif setting is None and not layout.automatic:
                 reason = (
                     f"Automatic: below {layout.AUTO_MIN_PAIRS} template pairs or {layout.AUTO_MIN_PAIRS_PER_WORLD} "
