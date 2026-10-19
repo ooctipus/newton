@@ -3,6 +3,7 @@
 
 """Test boundary-only checked capture without simulator, Warp, or GPU imports."""
 
+import contextlib
 import enum
 import importlib
 import inspect
@@ -17,6 +18,21 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import checked_capture as checked
+
+
+@contextlib.contextmanager
+def fresh_modules(modules):
+    """Hold only the given Newton and Lab modules, as a capture process does before selection.
+
+    The import guard rejects every other loaded Newton or Lab module, and a test
+    process that imported the real packages for other tests holds some.
+    """
+    with patch.dict(sys.modules, modules):
+        for name in list(sys.modules):
+            package = name.partition(".")[0]
+            if (package in ("newton", "isaaclab") or package.startswith("isaaclab_")) and name not in modules:
+                del sys.modules[name]
+        yield
 
 
 def source_modules(lab, newton):
@@ -438,7 +454,7 @@ class TestCheckedCapture(unittest.TestCase):
                     "--output",
                     str(output / "capture.json"),
                 ]
-                with patch.dict("sys.modules", modules), patch.object(checked, "COMPAT_PATH", helper):
+                with fresh_modules(modules), patch.object(checked, "COMPAT_PATH", helper):
                     if supported and not drift:
                         self.assertEqual(checked.main(args), 0)
                     else:
@@ -578,7 +594,7 @@ class TestCheckedCapture(unittest.TestCase):
                 ]
                 original_argv = sys.argv
                 original_constructor = Pipeline.__init__
-                with patch.dict("sys.modules", modules):
+                with fresh_modules(modules):
                     if boundary_count == 2:
                         self.assertEqual(checked.main(argv), 0)
                         self.assertEqual(json.loads((output / "capture.json").read_text())["argv"], forwarded)
