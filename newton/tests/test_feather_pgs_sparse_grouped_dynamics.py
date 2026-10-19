@@ -13,16 +13,20 @@ import newton
 from newton.tests.test_feather_pgs_sparse_solver import STATE_FIELDS, _build_model, _make_solver, _step
 
 
-def _case(grouped, *, free_count=0):
-    """Construct the same eight-sweep native problem with either dynamics mapping."""
+def _case(grouped, *, free_count=0, friction_anchor_beta=0.0, environment=None):
+    """Construct the same eight-sweep native problem with either dynamics mapping.
+
+    ``friction_anchor_beta=None`` selects the solver's default patch friction, and
+    ``environment`` adds ``FEATHER_PGS_*`` variables for the construction.
+    """
     model = _build_model(free_count=free_count)
-    with patch.dict(os.environ, {"FEATHER_PGS_SPARSE_GROUPED_DYNAMICS": "1"}):
+    with patch.dict(os.environ, {"FEATHER_PGS_SPARSE_GROUPED_DYNAMICS": "1", **(environment or {})}):
         solver = _make_solver(
             model,
             True,
             grouped_dynamics=grouped,
             pgs_iterations=8,
-            friction_anchor_beta=0.0,
+            friction_anchor_beta=friction_anchor_beta,
             dense_max_constraints=64,
             mf_max_constraints=64,
         )
@@ -65,10 +69,22 @@ class TestSparseGroupedDynamics(unittest.TestCase):
                 self.assertTrue(np.all(lam[np.isin(types, (0, 3))] >= -1e-7))
 
     def test_grouped_sparse_contact_and_free_body_response(self):
-        """Preserve eight-sweep physics on branched and mixed robot/free worlds."""
-        for free_count in (0, 2):
+        """Preserve eight-sweep physics on branched and mixed robot/free worlds.
+
+        Worlds that pair an articulation with free rigid bodies keep the dense route under
+        both friction laws. ``FEATHER_PGS_PATCH_DENSE_PATHS=0`` returns patch friction's
+        free-body worlds to native sparse factors, the one route that still composes
+        grouped dynamics with free-body response, so the mixed worlds run there.
+        """
+        for free_count, beta, environment in (
+            (0, 0.0, None),
+            (2, None, {"FEATHER_PGS_PATCH_DENSE_PATHS": "0"}),
+        ):
             with self.subTest(free_count=free_count):
-                plain, grouped = _case(False, free_count=free_count), _case(True, free_count=free_count)
+                plain, grouped = (
+                    _case(flag, free_count=free_count, friction_anchor_beta=beta, environment=environment)
+                    for flag in (False, True)
+                )
                 self.assert_native_grouped(grouped)
                 contact_seen = limit_seen = False
                 for _ in range(8):
@@ -78,6 +94,16 @@ class TestSparseGroupedDynamics(unittest.TestCase):
                     limit_seen |= bool(np.any(grouped[1].row_type.numpy() == 3))
                     self.assert_physics_close(plain, grouped)
                 self.assertTrue(contact_seen and limit_seen)
+
+    def test_free_body_worlds_keep_the_dense_route(self):
+        """Keep mixed robot/free worlds on the dense route under point and default patch friction."""
+        for beta in (0.0, None):
+            with self.subTest(friction_anchor_beta=beta):
+                environment = {"FEATHER_PGS_PATCH_DENSE_PATHS": "1"}
+                solver = _case(True, free_count=2, friction_anchor_beta=beta, environment=environment)[1]
+                self.assertIsNone(solver._sparse_mass_matrix_size)
+                self.assertIn("free rigid bodies", solver.get_path_selection()["reasons"]["sparse_mass_matrix"])
+                self.assertIsNotNone(solver._grouped_topology)
 
     def test_grouped_sparse_graph_held_factor_and_masked_reset(self):
         """Replay the mass cadence and refresh only the explicitly reset world."""
