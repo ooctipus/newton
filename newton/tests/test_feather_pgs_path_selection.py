@@ -1557,9 +1557,11 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_paired_factor_sweep_excludes_a_requested_patch_tier(self):
         """Serve a free-body world with the paired factor sweep even when a requested patch tier declined sparse factors.
 
-        Under FEATHER_PGS_PATCH_PARALLEL_ROWS=1 a tier that mf_gs_parallel_rows requests declines sparse factors
-        before the free-body rule does, as the friction record says. The paired factor sweep then admitted on the
-        dense route excludes the tiers and keyed rows, so it walks the patch contact units and no tier is built.
+        Patch friction admits a tier that mf_gs_parallel_rows requests by default (the test sets
+        FEATHER_PGS_PATCH_PARALLEL_ROWS=1 so that an exported opt-out cannot change the route), and the tier declines
+        sparse factors before the free-body rule does, as the friction record says. The paired factor sweep then
+        admitted on the dense route excludes the tiers and keyed rows, so it walks the patch contact units and no
+        tier is built.
         """
         model = _branched_arm_and_box()
         with patch.dict(os.environ, {"FEATHER_PGS_PATCH_PARALLEL_ROWS": "1"}):

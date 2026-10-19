@@ -1860,9 +1860,9 @@ class TestPatchParallelRoutes(unittest.TestCase):
         """Name in the route record the keyed-row builders one step launches, under both laws.
 
         The in-kernel parallel sweep (FEATHER_PGS_INK=1) admits keyed rows on CUDA, for patch friction
-        under FEATHER_PGS_PATCH_PARALLEL_ROWS=1. The keyed parallel tiers build the direct rows in the
-        sweep, which every entry points to; the scatter and the fallback are the row builders a step
-        launches outside it.
+        by default; the test sets FEATHER_PGS_PATCH_PARALLEL_ROWS=1 so that an exported opt-out cannot
+        change the route. The keyed parallel tiers build the direct rows in the sweep, which every entry
+        points to; the scatter and the fallback are the row builders a step launches outside it.
         """
         model = standing_model()
         with patch.object(source, "_INK_ON", True), patch.dict(os.environ, {_SWITCH: "1"}):
