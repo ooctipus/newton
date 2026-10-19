@@ -1762,9 +1762,11 @@ def get_source(
                 "int row_type = world_row_type.data[off_dense + i];",
                 snippet,
             )
-        # The end-of-iteration limit scans visit every dense row, including
-        # rows a split row-phase launch does not stage, so they read the row
-        # type from its global source in both variants.
+        # The end-of-iteration limit scans keep the global row-type reads in
+        # both variants, so resident_row_metadata changes only the row loop
+        # and the friction projectors. Packed reads would be exact there too:
+        # the scans run in row phases 0 and 2, which stage every dense row,
+        # and 5, which stages [0, bounds[1]) and scans [0, bounds[0]).
         snippet = re.sub(
             r"\(s_meta_dense\[i\] & \d+\)",
             "(world_row_type.data[off_dense + i])",

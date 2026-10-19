@@ -270,8 +270,9 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
 
         Decoding each packed read back into the global read it stands for must give the streamed
         source byte for byte: the variants differ in the storage of row types and parents only.
-        The end-of-iteration limit scans visit rows a split row-phase launch does not stage, so
-        both read the row type from global memory there.
+        The end-of-iteration limit scans keep the streamed source's global row-type reads, so the
+        variants differ only in the row loop and the friction projectors (packed reads would be
+        exact there too: every row a scan visits is staged).
         """
         for options in _STREAMED_OPTIONS:
             with self.subTest(options=options):
@@ -281,6 +282,7 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                 self.assertNotIn("s_meta_dense", streamed)
                 self.assertEqual(resident.count(f"__shared__ int   s_meta_dense[{rows}];"), 1)
                 self.assertIn("int row_type = s_meta_dense[i] &", resident)
+                # The limit scans' row-type reads stay global, as in the streamed source.
                 self.assertNotIn("(s_meta_dense[i] &", resident)
                 self.assertEqual(
                     resident.count("(world_row_type.data[off_dense + i])"),
@@ -595,8 +597,8 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
         phase, from warm and signed-zero impulses, with delayed friction, iteration offsets,
         regularization and deferred responses, both one world per block and through a two-block
         queue whose blocks reuse their shared memory across worlds, then once more from a captured
-        graph. The drive and limit case holds every end-of-iteration limit scan, whose rows a
-        split row-phase launch does not stage.
+        graph. The drive and limit case runs the end-of-iteration limit scans (row phases 0, 2 and
+        5), which read row types from global memory in both kernels.
         """
         device = wp.get_device()
         if not device.is_cuda:
