@@ -10630,14 +10630,9 @@ class SolverFeatherPGS(SolverBase):
         with wp.ScopedTimer("S2_Cholesky", print=False, use_nvtx=self._nvtx, synchronize=False):
             for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
                 with ctx:
-                    if size in (self._compact_diagonal_mass_size, self._sparse_mass_matrix_size):
-                        pass
-                    elif self._execution_plan.use_diagonal_mass(size):
-                        self._stage2_cholesky_diagonal(size)
-                    elif self._execution_plan.use_tiled_cholesky(size):
-                        self._stage2_cholesky_tiled(size)
-                    else:
-                        self._stage2_cholesky_loop(size)
+                    factor = self._stage2_factor(size)
+                    if factor is not None:
+                        factor(size)
                     self._stage2_materialize_paired_inverse(size)
         # ══════════════════════════════════════════════════════════════
         # STAGE 3: Triangular solve + v_hat
@@ -12998,29 +12993,34 @@ class SolverFeatherPGS(SolverBase):
                         flush=True,
                     )
 
+    def _stage2_factor(self, size: int):
+        """The stage-2 factorization of one DOF size, or ``None`` when stage 2 has none to run.
+
+        :meth:`step` and :meth:`_unread_mass_matrix_sizes` both dispatch through this. Compact
+        and sparse sizes keep no dense factor, and a tiled or loop size with a fused
+        CRBA-Cholesky kernel was factored in stage 1 (by the held-tree owner's refresh when one
+        is installed). Every factorization it returns reads the size's dense mass matrix H.
+        """
+        if size in (self._compact_diagonal_mass_size, self._sparse_mass_matrix_size):
+            return None
+        if self._execution_plan.use_diagonal_mass(size):
+            return self._stage2_cholesky_diagonal
+        if self._execution_plan.use_tiled_cholesky(size):
+            return None if self._crba_cholesky_kernels_by_size[size] is not None else self._stage2_cholesky_tiled
+        return None if self._crba_cholesky_warp_kernels_by_size[size] is not None else self._stage2_cholesky_loop
+
     def _unread_mass_matrix_sizes(self) -> tuple[int, ...]:
         """DOF sizes whose dense mass matrix H no stage reads while a held-tree owner is installed.
 
-        The owner refreshes every factor from its own geometry, and ``_stage1_crba``
-        returns before any H write. Stage 2, whose dispatch this mirrors, reads H only
-        where it factors it: a diagonal-mass size, or a tiled or loop size without the
-        fused CRBA-Cholesky kernel whose place the owner's refresh takes. Compact and
-        sparse sizes keep a placeholder H.
+        Under an owner, ``_stage1_crba`` hands the factor refresh to the owner and returns before
+        any H write, and no other stage writes H, so H keeps its allocation zeros. Stage 2 reads H
+        only for the sizes :meth:`_stage2_factor` routes to a factorization. Skipping the
+        end-of-step clear of the other sizes is exact on both counts: no reader, and the clear
+        would rewrite zeros.
         """
         if self._tree_kinetic_state is None:
             return ()
-        sizes = []
-        for size in self.size_groups:
-            if size in (self._compact_diagonal_mass_size, self._sparse_mass_matrix_size):
-                sizes.append(size)
-            elif self._execution_plan.use_diagonal_mass(size):
-                continue
-            elif self._execution_plan.use_tiled_cholesky(size):
-                if self._crba_cholesky_kernels_by_size[size] is not None:
-                    sizes.append(size)
-            elif self._crba_cholesky_warp_kernels_by_size[size] is not None:
-                sizes.append(size)
-        return tuple(sizes)
+        return tuple(size for size in self.size_groups if self._stage2_factor(size) is None)
 
     def _stage2_cholesky_diagonal(self, size: int) -> None:
         """Factor an articulation group known to have diagonal generalized inertia."""
@@ -13040,10 +13040,9 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage2_cholesky_tiled(self, size: int):
+        """Factor a tiled size's H; :meth:`_stage2_factor` routes fused sizes past it."""
         model = self.model
         n_arts = self.n_arts_by_size[size]
-        if self._crba_cholesky_kernels_by_size[size] is not None:
-            return
         if size == self._paired_response_primary_size and not self._paired_factor_coordinates:
             if self._paired_cholesky_inverse_kernel is None or self._paired_response_inverse_identity is None:
                 raise RuntimeError("Paired Cholesky/inverse kernel is unavailable")
@@ -13080,8 +13079,7 @@ class SolverFeatherPGS(SolverBase):
         )
 
     def _stage2_cholesky_loop(self, size: int):
-        if self._crba_cholesky_warp_kernels_by_size[size] is not None:
-            return
+        """Factor a loop size's H; :meth:`_stage2_factor` routes fused sizes past it."""
         model = self.model
         n_arts = self.n_arts_by_size[size]
         wp.launch(

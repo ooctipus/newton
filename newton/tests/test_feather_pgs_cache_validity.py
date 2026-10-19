@@ -3,6 +3,7 @@
 
 """Keep held-tree caches valid across host calls that change none of their inputs."""
 
+import functools
 import os
 import unittest
 from types import SimpleNamespace
@@ -320,11 +321,12 @@ def _mass_matrices(solver):
 
 
 class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
-    def test_unread_sizes_mirror_the_factor_dispatch(self):
-        """Report exactly the sizes whose stage-2 factorization reads no dense mass matrix under an owner.
+    def test_unread_sizes_follow_the_factor_classifier(self):
+        """Report exactly the sizes stage 2 factors without reading a dense mass matrix, under an owner.
 
-        A compact size passes; a diagonal size, and a tiled or loop size without its fused
-        CRBA-Cholesky kernel, factor H; the fused kernels' sizes return before reading it.
+        ``_stage2_factor`` routes a compact size and the sizes with a fused CRBA-Cholesky kernel to no
+        factorization, and a diagonal size and a tiled or loop size without its fused kernel to one
+        that reads H. ``_unread_mass_matrix_sizes`` lists the first kind.
         """
         sizes = (2, 4, 6, 18, 24, 25)
         fused_tiled = {24}
@@ -355,28 +357,90 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
             L_by_size=opaque(),
             group_to_art=opaque(),
         )
-        unread = SolverFeatherPGS._unread_mass_matrix_sizes(solver)
-        self.assertEqual(unread, (2, 6, 24))
+        for name in ("_stage2_factor", "_stage2_cholesky_diagonal", "_stage2_cholesky_tiled", "_stage2_cholesky_loop"):
+            setattr(solver, name, functools.partial(getattr(SolverFeatherPGS, name), solver))
+        factors = {size: SolverFeatherPGS._stage2_factor(solver, size) for size in sizes}
+        self.assertEqual(
+            {size: None if factor is None else factor.func.__name__ for size, factor in factors.items()},
+            {
+                2: None,
+                4: "_stage2_cholesky_diagonal",
+                6: None,
+                18: "_stage2_cholesky_loop",
+                24: None,
+                25: "_stage2_cholesky_tiled",
+            },
+        )
+        self.assertEqual(SolverFeatherPGS._unread_mass_matrix_sizes(solver), (2, 6, 24))
         launched = []
 
         def record(kernel, *args, inputs=(), **kwargs):
             launched.extend(inputs)
 
         with patch.object(wp, "launch", record), patch.object(wp, "launch_tiled", record):
-            for size in sizes:
-                launched.clear()
-                if size == solver._compact_diagonal_mass_size:
-                    pass  # stage 2 skips compact sizes
-                elif solver._execution_plan.use_diagonal_mass(size):
-                    SolverFeatherPGS._stage2_cholesky_diagonal(solver, size)
-                elif solver._execution_plan.use_tiled_cholesky(size):
-                    SolverFeatherPGS._stage2_cholesky_tiled(solver, size)
-                else:
-                    SolverFeatherPGS._stage2_cholesky_loop(solver, size)
-                reads = any(item is solver.H_by_size[size] for item in launched)
-                self.assertEqual(reads, size not in unread, f"size {size}")
+            for size, factor in factors.items():
+                if factor is not None:
+                    launched.clear()
+                    factor(size)
+                    self.assertTrue(any(item is solver.H_by_size[size] for item in launched), f"size {size}")
         solver._tree_kinetic_state = None
         self.assertEqual(SolverFeatherPGS._unread_mass_matrix_sizes(solver), ())
+
+    def test_step_factors_every_size_through_the_classifier(self):
+        """Dispatch each size's stage-2 factorization in ``step`` through ``_stage2_factor``.
+
+        ``_unread_mass_matrix_sizes`` reads the same classifier, so the sizes whose clear it skips
+        cannot drift from the factorizations a step runs.
+        """
+        model = _build(wp.get_device("cpu"), worlds=2)
+        solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+        state_in, state_out = model.state(), model.state()
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        classify = SolverFeatherPGS._stage2_factor
+        with patch.object(SolverFeatherPGS, "_stage2_factor", autospec=True, side_effect=classify) as recorded:
+            solver.step(state_in, state_out, model.control(), None, DT)
+        self.assertEqual([call.args[1] for call in recorded.call_args_list], list(solver.size_groups))
+        self.assertTrue(all(call.args[0] is solver for call in recorded.call_args_list))
+
+    def test_owner_stage1_writes_no_mass_matrix(self):
+        """Leave every dense mass matrix untouched in stage 1 while a held-tree owner refreshes the factors.
+
+        No other stage writes H, so under an owner H keeps its allocation zeros and the end-of-step
+        clear its sizes skip could not change a value even with a reader. Without the owner the
+        same stage clears and fills H.
+        """
+        model = _build(wp.get_device("cpu"), worlds=2)
+        solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+        state_in = model.state()
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        state_aug = solver._prepare_augmented_state(state_in, model.state(), model.control())
+        matrices = list(solver.H_by_size.values())
+        self.assertTrue(matrices)
+
+        def touched_matrices():
+            """Run stage 1 with launches and clears recorded, not executed; return the H arrays they touch."""
+            touched = []
+
+            def launch(kernel, *args, inputs=(), outputs=(), **kwargs):
+                touched.extend([*inputs, *outputs])
+
+            def zero(array):
+                touched.append(array)
+
+            with (
+                patch.object(wp, "launch", launch),
+                patch.object(wp, "launch_tiled", launch),
+                patch.object(wp.array, "zero_", zero),
+            ):
+                solver._stage1_crba(state_aug, None, None)
+            return [array for array in matrices if any(item is array for item in touched)]
+
+        refreshed = []
+        solver._tree_kinetic_state = SimpleNamespace(sparse=SimpleNamespace(refresh=refreshed.append))
+        self.assertEqual(touched_matrices(), [])
+        self.assertEqual(refreshed, [state_aug])
+        solver._tree_kinetic_state = None
+        self.assertEqual(len(touched_matrices()), len(matrices))
 
     @unittest.skipUnless(wp.is_cuda_available(), "The double-buffered mass matrix is a CUDA path")
     def test_cuda_held_owner_clears_no_mass_matrix(self):
