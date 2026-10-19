@@ -414,7 +414,7 @@ def test_joints_without_freedom_weld_whatever_their_type(test, device):
             test.assertEqual(record["welded_bodies"], 3 * _WORLDS)
 
 
-_REACH_ARM_USD = """#usda 1.0
+_ROOT_JOINT_ARM_USD = """#usda 1.0
 (
     metersPerUnit = 1
     upAxis = "Z"
@@ -424,16 +424,16 @@ def Xform "arm" (
     prepend apiSchemas = ["PhysicsArticulationRootAPI"]
 )
 {
-    def PhysicsJoint "rootJoint"
+    def PhysicsJoint "root"
     {
-        rel physics:body0 = </arm/base_link>
+        rel physics:body0 = </arm/base>
         point3f physics:localPos0 = (0, 0, 0)
         point3f physics:localPos1 = (0, 0, 0)
         quatf physics:localRot0 = (1, 0, 0, 0)
         quatf physics:localRot1 = (1, 0, 0, 0)
     }
 
-    def Xform "base_link" (
+    def Xform "base" (
         prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
     )
     {
@@ -451,7 +451,7 @@ def Xform "arm" (
         }
     }
 
-    def Xform "shoulder_link" (
+    def Xform "link" (
         prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
     )
     {
@@ -467,10 +467,10 @@ def Xform "arm" (
         }
     }
 
-    def PhysicsRevoluteJoint "shoulder_pan_joint"
+    def PhysicsRevoluteJoint "hinge"
     {
-        rel physics:body0 = </arm/base_link>
-        rel physics:body1 = </arm/shoulder_link>
+        rel physics:body0 = </arm/base>
+        rel physics:body1 = </arm/link>
         uniform token physics:axis = "Z"
         point3f physics:localPos0 = (0, 0, 0.2)
         point3f physics:localPos1 = (0, 0, 0)
@@ -481,12 +481,12 @@ def Xform "arm" (
 """
 
 
-def _reach_scene(device, *, source):
-    """Replicate an arm whose root joint is a D6 joint without axes, its base on a static table, beside a free box.
+def _arm_on_table_scene(device, *, source):
+    """Replicate an arm whose base rests on a static table, beside a free box on the table.
 
-    The ground lies 1.05 m below the table top, as in reach scenes. ``source="usd"`` imports the
-    arm from a generic USD ``PhysicsJoint`` root, which names the base and no other body; the
-    builder variant adds that D6 joint directly.
+    The arm's root is a D6 joint without axes: ``source="usd"`` imports it from a USD
+    ``PhysicsJoint`` that names the base and no other body, and ``source="builder"`` adds it
+    directly. A global ground lies well below the table.
     """
     proto = newton.ModelBuilder()
     proto.rigid_gap = 0.01
@@ -495,36 +495,37 @@ def _reach_scene(device, *, source):
         from pxr import Usd
 
         stage = Usd.Stage.CreateInMemory()
-        stage.GetRootLayer().ImportFromString(_REACH_ARM_USD)
+        stage.GetRootLayer().ImportFromString(_ROOT_JOINT_ARM_USD)
         proto.add_usd(stage)
     else:
-        base = proto.add_link(label="base_link")
+        base = proto.add_link(label="base")
         proto.add_shape_cylinder(base, xform=_pose(0.0, 0.0, 0.01), radius=0.075, half_height=0.015)
-        shoulder = proto.add_link(xform=_pose(0.0, 0.0, 0.2), label="shoulder_link")
-        proto.add_shape_sphere(shoulder, radius=0.05)
+        link = proto.add_link(xform=_pose(0.0, 0.0, 0.2), label="link")
+        proto.add_shape_sphere(link, radius=0.05)
         root = proto.add_joint_d6(-1, base)
-        hinge = proto.add_joint_revolute(base, shoulder, axis=(0.0, 0.0, 1.0), parent_xform=_pose(0.0, 0.0, 0.2))
+        hinge = proto.add_joint_revolute(base, link, axis=(0.0, 0.0, 1.0), parent_xform=_pose(0.0, 0.0, 0.2))
         proto.add_articulation([root, hinge])
     _box(proto, proto.add_body(xform=_pose(0.4, 0.3), label="box"), 0.4, 0.3)
     scene = newton.ModelBuilder()
-    scene.add_ground_plane(height=-1.05)
+    scene.add_ground_plane(height=-2.0)
     scene.replicate(proto, _WORLDS, spacing=(3.0, 0.0, 0.0))
     return scene.finalize(device=device)
 
 
 def test_census_drops_exactly_the_contacts_without_response(test, device):
-    """Drop exactly the contacts FeatherPGS gives neither side a response DOF, for a reach-like arm.
+    """Drop exactly the contacts FeatherPGS gives neither side a response DOF, for an arm on a table.
 
-    The arm's root joint is a D6 joint without axes, as the USD importer makes of a generic root
-    ``PhysicsJoint``. A census of the contacts with the pairs kept classifies each by whether
-    FeatherPGS gives either side a response DOF: the base's table contacts get none, the free
-    box's do. The default must drop exactly the former and count the base as welded.
+    The arm's root joint is a D6 joint without axes, as the USD importer makes of a
+    ``PhysicsJoint`` that names one body. A census of the contacts with the pairs kept classifies
+    each by whether FeatherPGS gives either side a response DOF: the base's table contacts get
+    none, the free box's do. The default must drop exactly the former and count the base as
+    welded.
     """
     for source in ("builder", "usd"):
         with test.subTest(source=source):
             if source == "usd" and not USD_AVAILABLE:
                 test.skipTest("Requires usd-core")
-            model = _reach_scene(device, source=source)
+            model = _arm_on_table_scene(device, source=source)
             # The arm's root joint has no degree of freedom, whatever made it.
             roots = np.flatnonzero(model.joint_parent.numpy() == -1)
             dofs = np.diff(model.joint_qd_start.numpy())[roots]
