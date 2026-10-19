@@ -10,7 +10,8 @@ existed, and the snapshots hold no gradient, so a tape records the same step.
 
 The flag-on and flag-off arms are separate solver instances compared row by
 row, so they must reserve every contact's rows at the same slots. On CUDA that
-holds only while the compared scene's contacts fit in one warp (``WARP_SIZE``).
+needs the compared scene's contacts to fit in one warp, and it assumes that one
+warp reserves them in a fixed order (``WARP_SIZE``).
 """
 
 import ctypes
@@ -48,7 +49,11 @@ CUDA_INSTANCE_ATOL = 2.0e-6
 # Each contact reserves its rows with an atomic_add on its world's slot counter. On CUDA,
 # the warps of that launch reach a counter in a run-varying order, so two instances give a
 # world's contacts the same slots only when one warp reserves them all. Impulses are stored
-# by slot and swept in slot order, so the compared scene keeps its contacts in one warp.
+# by slot, and another slot order can also change the solve, so the compared scene keeps its
+# contacts in one warp. That also assumes same-address atomics within one warp resolve in a
+# fixed order on a given GPU, which CUDA does not document: a slot-order mismatch on this
+# scene means the assumption failed there, and the comparison should then be bounded by two
+# flag-off instances rather than the solver changing.
 WARP_SIZE = 32
 
 
@@ -76,18 +81,44 @@ def _assert_same(test, device, actual, expected, label):
         np.testing.assert_array_equal(actual, expected, err_msg=label)
 
 
-def _assert_same_reservations(test, actual, expected, label):
-    """Require both arms to place every contact's rows at the same slots, which comparing them by slot assumes."""
+def _assert_same_reservations(test, device, actual, expected, label, states):
+    """Require both arms to place every contact's rows at the same slots, which comparing them by slot assumes.
+
+    ``states`` holds the arms' states after the step, in the same order. A
+    failure reports their largest difference and names the cause the
+    differing fields point to: the same rows in another slot order, or other
+    routes or row counts.
+    """
     test.assertEqual(sorted(actual), sorted(expected), label)
-    for name, values in expected.items():
-        np.testing.assert_array_equal(
-            actual[name],
-            values,
-            err_msg=(
-                f"{label} {name}: the arms reserved contact rows in different slots, so their impulses and row sweeps "
-                "are not comparable; on CUDA, contacts past the first warp reserve in a run-varying order"
-            ),
-        )
+    differing = [name for name, values in expected.items() if not np.array_equal(actual[name], values)]
+    if not differing:
+        return
+    cuda = wp.get_device(device).is_cuda
+    if differing == ["contact_slot"]:
+        reserved = "the same rows in another slot order"
+        if not cuda:
+            cause = "the CPU reserves rows serially, so the flag changed the reservation order"
+        elif len(expected["contact_path"]) > WARP_SIZE:
+            cause = "contacts in different warps reserve in a run-varying order; keep the compared contacts in one warp"
+        else:
+            cause = (
+                "every contact is in one warp, so same-address atomics within a warp did not resolve in a fixed "
+                "order on this GPU (see WARP_SIZE)"
+            )
+    else:
+        reserved = "other routes or row counts"
+        if cuda:
+            cause = (
+                "a contact at a routing threshold (gap gate, friction eligibility, patch weight) may have flipped "
+                "between the instances' slightly different inputs, or the flag changed the routing"
+            )
+        else:
+            cause = "the arms' inputs to the step agreed bitwise, so the flag changed the routing"
+    difference = max(float(np.abs(states[0][name] - states[1][name]).max()) for name in STATE_FIELDS)
+    test.fail(
+        f"{label}: the arms reserved {reserved} (differing: {', '.join(differing)}; largest state difference "
+        f"after the step: {difference:.3g}): {cause}"
+    )
 
 
 def _assert_same_steps(test, device, on, off):
@@ -102,7 +133,9 @@ def _assert_same_steps(test, device, on, off):
     for step, (expected, actual) in enumerate(zip(off["trajectory"], on["trajectory"], strict=True)):
         label = f"step {step}"
         test.assertEqual(on["contact_counts"][step], off["contact_counts"][step], f"{label} live contacts")
-        _assert_same_reservations(test, on["reservations"][step], off["reservations"][step], label)
+        _assert_same_reservations(
+            test, device, on["reservations"][step], off["reservations"][step], label, states=(actual, expected)
+        )
         for name, values in expected.items():
             _assert_same(test, device, actual[name], values, f"{label} {name}")
 
