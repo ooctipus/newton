@@ -52,7 +52,7 @@ class TestPrescaledTreeContract(unittest.TestCase):
         for kernel in (ordinary, alternate, finish):
             self.assertEqual([arg.label for arg in kernel.adj.args][6], "motion_qd")
 
-    def test_classified_repair_takes_no_motion_input(self):
+    def test_classified_repair_reads_no_motion_input(self):
         """Build the classification and the listed repair for ordinary motion only.
 
         Owners keep the one-pass repair of a motion-velocity layout, which repairs on every step, so
