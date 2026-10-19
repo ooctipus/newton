@@ -11582,10 +11582,13 @@ class SolverFeatherPGS(SolverBase):
         """Return the device flag of patch frames left empty by a stale reuse, or ``None`` when none can be.
 
         Only a build that keeps its pairs through frame reuse sets the flag, so
-        without frame reuse the host reads it never.
+        without frame reuse the host reads it never. A model without
+        articulations allocates no patch state at all.
         """
-        patches = self._friction_patches
-        return patches.frame_status if patches.reuse_frames else None
+        patches = getattr(self, "_friction_patches", None)
+        if patches is None or not patches.reuse_frames:
+            return None
+        return patches.frame_status
 
     def constraint_row_watermarks(self) -> dict:
         """Return the opt-in constraint/contact row high-water marks.
