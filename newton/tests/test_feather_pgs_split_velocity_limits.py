@@ -486,8 +486,9 @@ class TestSplitFreeBodyVelocityLimitsCUDA(_SplitVelocityLimitChecks, unittest.Te
                 for _ in range(3):
                     velocity = _step(cuda)
                     _assert_on_limit_scale(velocity, _step(cpu), CONTACT_LIMITS)
-                    # Every axis stays within its limit.
-                    np.testing.assert_array_less(np.abs(velocity), CONTACT_LIMITS * (1.0 + RTOL))
+                    # Every axis of every body stays within its limit.
+                    bound = np.broadcast_to(CONTACT_LIMITS * (1.0 + RTOL), velocity.shape)
+                    np.testing.assert_array_less(np.abs(velocity), bound)
                     expected, actual = _free_body_rows(cpu), _free_body_rows(cuda)
                     np.testing.assert_array_equal(actual.count, expected.count)
                     np.testing.assert_array_equal(actual.type, expected.type)
