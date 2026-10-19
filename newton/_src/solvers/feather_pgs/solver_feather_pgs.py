@@ -26625,6 +26625,7 @@ def _get_pgs_solve_mf_gs_kernel(
     *,
     software_pipeline: bool = True,
     shared_metadata: bool = True,
+    resident_row_metadata: bool = False,
     stream_mf_impulses: bool = False,
     has_drive_rows: bool = True,
     has_dense_velocity_limit_rows: bool = True,
@@ -26659,6 +26660,13 @@ def _get_pgs_solve_mf_gs_kernel(
     Streamed impulses have one owner (lane 0); warp broadcasts preserve the
     same values and sequential projection order without cross-lane memory races.
 
+    ``shared_metadata=False`` streams the per-row metadata from global memory
+    (``_gmeta``). ``resident_row_metadata`` then keeps the packed dense row
+    types and parents in shared memory (``_gmeta_smeta``, 4 bytes per dense
+    row): the row loop, the friction parents and the patch-ring walks read them
+    there, the end-of-iteration limit scans from their global source as before.
+    Both read identical values, so results are bitwise identical.
+
     The generated kernel omits drive state and dense joint-velocity-limit work
     when those row types cannot be produced by the solver configuration.
 
@@ -26690,6 +26698,7 @@ def _get_pgs_solve_mf_gs_kernel(
         friction_mode,
         software_pipeline=software_pipeline,
         shared_metadata=shared_metadata,
+        resident_row_metadata=resident_row_metadata,
         stream_mf_impulses=stream_mf_impulses,
         has_drive_rows=has_drive_rows,
         has_dense_velocity_limit_rows=has_dense_velocity_limit_rows,
@@ -26879,6 +26888,8 @@ def _get_pgs_solve_mf_gs_kernel(
         name += "_nopipe"
     if not shared_metadata:
         name += "_gmeta"
+    if resident_row_metadata:
+        name += "_smeta"
     if stream_mf_impulses:
         name += "_glambda"
     if skip_local_internal_worlds:

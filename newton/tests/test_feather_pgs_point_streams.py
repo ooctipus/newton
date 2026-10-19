@@ -322,6 +322,18 @@ def _solver_factory_calls():
         }
         factory = solver._get_pgs_solve_mf_gs_kernel.__wrapped__
         yield name + "_get_pgs_solve_mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
+    # Streamed metadata with the packed row types and parents resident, which single-wave launches
+    # of large dense capacities select under either law; drives add the limit scans' global reads.
+    for drives in (False, True):
+        kwargs = {
+            "shared_metadata": False,
+            "resident_row_metadata": True,
+            "has_drive_rows": drives,
+            "has_dense_velocity_limit_rows": drives,
+            "skip_incremental_rows": 0 if drives else 32,
+        }
+        factory = solver._get_pgs_solve_mf_gs_kernel.__wrapped__
+        yield name + "_get_pgs_solve_mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
     for triples, components in itertools.product((False, True), repeat=2):
         factory = solver._get_pgs_solve_paired_factor_kernel.__wrapped__
         yield name + "_get_pgs_solve_paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, triples, components), {}
