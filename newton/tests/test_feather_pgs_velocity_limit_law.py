@@ -20,6 +20,7 @@ import inspect
 import itertools
 import os
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest import mock
 
@@ -31,8 +32,17 @@ from newton._src.solvers.feather_pgs import mf_gs_source
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_source
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
 from newton._src.solvers.feather_pgs.response_block_sweep import (
+    RB_A_SLOT,
+    RB_CLASS_LANE,
+    RB_CLASS_WARP32,
+    RB_CLASS_WARP64,
+    RB_NM,
+    RB_NV,
+    RB_STRIDE,
+    get_response_block_build_kernel,
     get_response_block_sweep_lane_kernel,
     get_response_block_sweep_warp_kernel,
+    list_count_slots,
 )
 from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel
 from newton.solvers import SolverFeatherPGS
@@ -379,18 +389,25 @@ class TestVelocityLimitLawReference(unittest.TestCase):
         np.testing.assert_allclose(results["stateless", (1, 0)], _CHAIN_SOLUTION, atol=1.0e-12)
 
 
-def _dense_row_values(device, *, order, row_phase, iterations):
-    """Inputs of a matrix-free sweep kernel holding the chain's two velocity-limit rows in ``order``."""
+def _dense_row_values(device, *, order, row_phase, iterations, first_row=0):
+    """Inputs of a matrix-free sweep kernel holding the chain's two velocity-limit rows in ``order``.
+
+    ``first_row`` puts that many inactive velocity-limit rows (no Jacobian, zero
+    diagonal) before the chain's, which then occupy rows ``first_row`` and
+    ``first_row + 1``.
+    """
     rows = list(order)
-    capacity, dofs = 4, 2
+    count = first_row + 2
+    capacity, dofs = max(4, count), 2
+    chain = slice(first_row, count)
     jacobian = np.zeros((1, capacity, dofs), np.float32)
-    jacobian[0, :2] = _CHAIN_JACOBIAN[rows]
+    jacobian[0, chain] = _CHAIN_JACOBIAN[rows]
     response = np.zeros_like(jacobian)
-    response[0, :2] = np.linalg.solve(_CHAIN_MASS, _CHAIN_JACOBIAN[rows].T).T
+    response[0, chain] = np.linalg.solve(_CHAIN_MASS, _CHAIN_JACOBIAN[rows].T).T
     diagonal = np.zeros((1, capacity), np.float32)
-    diagonal[0, :2] = np.einsum("ij,ij->i", jacobian[0, :2], response[0, :2])
+    diagonal[0, chain] = np.einsum("ij,ij->i", jacobian[0, chain], response[0, chain])
     bias = np.zeros((1, capacity), np.float32)
-    bias[0, :2] = _CHAIN_BIAS[rows]
+    bias[0, chain] = _CHAIN_BIAS[rows]
     row_type = np.full((1, capacity), VELOCITY_LIMIT, np.int32)
 
     def array(value, dtype=wp.float32):
@@ -404,9 +421,9 @@ def _dense_row_values(device, *, order, row_phase, iterations):
         "general_world_grid_stride": 1,
         "use_general_world_queue": 0,
         "rb_class": zero_int,
-        "world_constraint_count": array([2], wp.int32),
-        # Both rows are the velocity-limit segment of a phase-5 launch.
-        "dense_phase_bounds": array([[0, 2]], wp.int32),
+        "world_constraint_count": array([count], wp.int32),
+        # Every row is in the velocity-limit segment of a phase-5 launch.
+        "dense_phase_bounds": array([[0, count]], wp.int32),
         "local_solve_owner": zero_int,
         "world_dof_indices": array([[0, 1]], wp.int32),
         "world_deferred_dof_mask": array([[0, 0]], wp.int32),
@@ -446,8 +463,68 @@ def _dense_row_values(device, *, order, row_phase, iterations):
     return values
 
 
+def _response_block_values(device, values, *, lane_rows):
+    """Add one world's response-block build and sweep buffers to ``values`` (the solver's layout)."""
+    slots = list_count_slots(lane_rows)
+    values.update(
+        world_count=1,
+        grid_stride=1,
+        # The build reads the velocity that the sweep then updates in place, as in the solver.
+        v_in=values["v_out"],
+        rb_class=wp.zeros(1, dtype=wp.int32, device=device),
+        rb_counts=wp.zeros(slots, dtype=wp.int32, device=device),
+        rb_lists=wp.zeros(slots, dtype=wp.int32, device=device),
+        rb_A=wp.zeros(RB_A_SLOT, dtype=wp.float32, device=device),
+        rb_vec=wp.zeros(RB_NV * RB_STRIDE, dtype=wp.float32, device=device),
+        rb_meta=wp.zeros(RB_NM * RB_STRIDE, dtype=wp.int32, device=device),
+    )
+    return values
+
+
+def _launch_inputs(kernel, values, *, stand_in_device=None):
+    """Return ``kernel``'s launch inputs from ``values``, by parameter name.
+
+    With ``stand_in_device`` a parameter that ``values`` lacks gets a one-element
+    zero stand-in on that device (zero for a scalar); without it every parameter
+    must be in ``values``.
+    """
+    arguments = {arg.label: arg.type for arg in kernel.adj.args}
+    inputs = []
+    for name in inspect.signature(kernel.func).parameters:
+        kind = arguments[name]
+        if name in values or stand_in_device is None:
+            inputs.append(values[name])
+        elif wp.types.is_array(kind):
+            inputs.append(wp.zeros((1,) * kind.ndim, dtype=kind.dtype, device=stand_in_device))
+        else:
+            inputs.append(kind(0))
+    return inputs
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "Matrix-free sweep kernels require CUDA")
 class TestVelocityLimitLawKernels(unittest.TestCase):
+    def _check_chain(self, values, velocities, *, order, law, first_row=0, **labels):
+        """Compare one launch on the chain with the float64 reference sweep and keep its velocity."""
+        velocities[order] = values["v_out"].numpy().astype(np.float64)
+        expected, impulses = serial_velocity_limit_reference(
+            _CHAIN_MASS, _CHAIN_VELOCITY, _CHAIN_JACOBIAN[list(order)], _CHAIN_BIAS[list(order)], law=law, iterations=64
+        )
+        chain = values["world_impulses"].numpy()[0, first_row : first_row + 2]
+        with self.subTest(law=law, order=order, **labels):
+            np.testing.assert_allclose(velocities[order], expected, atol=2.0e-6)
+            np.testing.assert_allclose(chain, impulses, atol=2.0e-6)
+
+    def _check_order_move(self, velocities, *, law, **labels):
+        """Hold the accumulated result in either row order; record the stateless law's order dependence."""
+        move = float(np.max(np.abs(velocities[(0, 1)] - velocities[(1, 0)])))
+        with self.subTest(law=law, **labels):
+            if law == "accumulated":
+                self.assertLessEqual(move, 1.0e-6)
+                np.testing.assert_allclose(velocities[(0, 1)], _CHAIN_SOLUTION, atol=2.0e-6)
+            else:
+                # The stateless law brakes the shoulder to 0.197 instead of 0.267 when its row leads.
+                self.assertGreater(move, 0.05)
+
     def test_serial_sweeps_follow_the_reference_in_either_row_order(self):
         """Run the chain's rows through the serial sweeps in both orders and both row phases.
 
@@ -474,33 +551,79 @@ class TestVelocityLimitLawKernels(unittest.TestCase):
             velocities = {}
             for order in ((0, 1), (1, 0)):
                 values = _dense_row_values(device, order=order, row_phase=row_phase, iterations=64)
+                wp.launch_tiled(kernel, dim=[1], inputs=_launch_inputs(kernel, values), block_dim=32, device=device)
+                self._check_chain(values, velocities, order=order, law=law, kernel=name, row_phase=row_phase)
+            self._check_order_move(velocities, law=law, kernel=name, row_phase=row_phase)
+
+    def test_response_block_sweeps_follow_the_reference_in_either_row_order(self):
+        """Run the chain's rows through every response-block sweep class in both orders and both row phases.
+
+        The build classifies the world: the lane sweep owns worlds of at most
+        ``lane_rows`` rows, the 32-row warp sweep worlds of at most 32 rows and
+        the 64-row warp sweep the rest. Behind 32 inactive rows the chain lands in
+        the second half of the 64-row sweep's lanes. Each class stores the
+        accumulated total, so a stored correction would leave the reference.
+        """
+        device = wp.get_device("cuda:0")
+        classes = {
+            # class: (lane_rows, sweep factory, inactive rows before the chain, class the build assigns)
+            "lane": (2, partial(get_response_block_sweep_lane_kernel, lane_rows=2), 0, RB_CLASS_LANE),
+            "warp32": (0, partial(get_response_block_sweep_warp_kernel, rows=32, lane_rows=0), 0, RB_CLASS_WARP32),
+            "warp64": (0, partial(get_response_block_sweep_warp_kernel, rows=64, lane_rows=0), 32, RB_CLASS_WARP64),
+        }
+        for (name, (lane_rows, sweep_factory, first_row, world_class)), law, row_phase in itertools.product(
+            classes.items(), ("stateless", "accumulated"), (0, 5)
+        ):
+            velocities = {}
+            for order in ((0, 1), (1, 0)):
+                values = _dense_row_values(device, order=order, row_phase=row_phase, iterations=64, first_row=first_row)
+                _response_block_values(device, values, lane_rows=lane_rows)
+                capacity = values["world_impulses"].shape[1]
+                build = get_response_block_build_kernel(capacity, 1, 2, lane_rows=lane_rows, has_drive_rows=False)
+                sweep = sweep_factory(capacity, 1, 2, has_drive_rows=False, velocity_limit_law=law)
+                self.assertEqual("_vacc" in sweep.key, law == "accumulated", sweep.key)
+                for kernel in (build, sweep):
+                    wp.launch_tiled(kernel, dim=[1], inputs=_launch_inputs(kernel, values), block_dim=32, device=device)
+                self.assertEqual(int(values["rb_class"].numpy()[0]), world_class)
+                self._check_chain(
+                    values, velocities, order=order, law=law, first_row=first_row, sweep=name, row_phase=row_phase
+                )
+            self._check_order_move(velocities, law=law, sweep=name, row_phase=row_phase)
+
+    def test_propagation_full_iteration_follows_the_reference_in_either_row_order(self):
+        """Run the chain's rows through the propagation full-iteration kernel in both orders.
+
+        The kernel visits velocity-limit rows in the phase-5 stage of every
+        iteration. The world holds no matrix-free or propagation row and no
+        articulation of the kernel's size group, so every input it never reads is
+        a one-element zero stand-in.
+        """
+        device = wp.get_device("cuda:0")
+        arch = str(device.arch)
+        for law in ("stateless", "accumulated"):
+            kernel = solver_source._get_pgs_solve_propagation_full_iteration_kernel(
+                4, 1, 2, 1, 1, 2, arch, velocity_limit_law=law
+            )
+            self.assertEqual("_vacc" in kernel.key, law == "accumulated", kernel.key)
+            velocities = {}
+            for order in ((0, 1), (1, 0)):
+                values = _dense_row_values(device, order=order, row_phase=5, iterations=64)
+                values.update(
+                    world_count=1,
+                    world_dof_start=wp.array([0], dtype=wp.int32, device=device),
+                    # The world owns no articulation of the walked size group: no tree walk.
+                    world_group_art_start=wp.zeros(2, dtype=wp.int32, device=device),
+                    max_propagation_bodies=1,
+                )
                 wp.launch_tiled(
                     kernel,
                     dim=[1],
-                    inputs=[values[parameter] for parameter in inspect.signature(kernel.func).parameters],
+                    inputs=_launch_inputs(kernel, values, stand_in_device=device),
                     block_dim=32,
                     device=device,
                 )
-                velocities[order] = values["v_out"].numpy().astype(np.float64)
-                expected, impulses = serial_velocity_limit_reference(
-                    _CHAIN_MASS,
-                    _CHAIN_VELOCITY,
-                    _CHAIN_JACOBIAN[list(order)],
-                    _CHAIN_BIAS[list(order)],
-                    law=law,
-                    iterations=64,
-                )
-                with self.subTest(kernel=name, law=law, row_phase=row_phase, order=order):
-                    np.testing.assert_allclose(velocities[order], expected, atol=2.0e-6)
-                    np.testing.assert_allclose(values["world_impulses"].numpy()[0, :2], impulses, atol=2.0e-6)
-            move = float(np.max(np.abs(velocities[(0, 1)] - velocities[(1, 0)])))
-            with self.subTest(kernel=name, law=law, row_phase=row_phase):
-                if law == "accumulated":
-                    self.assertLessEqual(move, 1.0e-6)
-                    np.testing.assert_allclose(velocities[(0, 1)], _CHAIN_SOLUTION, atol=2.0e-6)
-                else:
-                    # The stateless law brakes the shoulder to 0.197 instead of 0.267 when its row leads.
-                    self.assertGreater(move, 0.05)
+                self._check_chain(values, velocities, order=order, law=law, kernel="propagation_full_iteration")
+            self._check_order_move(velocities, law=law, kernel="propagation_full_iteration")
 
 
 def _pushed_arm(device, limit):
@@ -541,7 +664,12 @@ def _matrix_free_solver(model, law, **options):
 @unittest.skipUnless(wp.is_cuda_available(), "Matrix-free FPGS requires CUDA")
 class TestVelocityLimitLawRollouts(unittest.TestCase):
     def test_constant_torque_never_pushes_past_the_limit(self):
-        """Hold a revolute DOF that a constant torque pushes past its limit at the limit under either law."""
+        """Hold a revolute DOF that a constant torque pushes past its limit at the limit under either law.
+
+        Every sweep kernel of the route is built with the requested law: the
+        matrix-free GS kernel, the incremental tiers and the three response-block
+        sweeps.
+        """
         limit, dt = 1.0, 1.0 / 240.0
         model = _pushed_arm("cuda:0", limit)
         for (route, options), law in itertools.product(_DENSE_ROUTES.items(), ("stateless", "accumulated")):
@@ -549,10 +677,21 @@ class TestVelocityLimitLawRollouts(unittest.TestCase):
                 solver = _matrix_free_solver(model, law, **options)
                 routes = solver.get_path_selection()["routes"]
                 self.assertEqual(routes["velocity_limits"]["law"], law)
-                self.assertEqual("_vacc" in routes["sweep"]["mf_gs"], law == "accumulated")
                 self.assertEqual(routes["sweep"]["response_block"], route == "response_block")
                 tiers = routes["sweep"]["tiers"]
                 self.assertEqual(tiers is not None and tiers["family"] == "incremental", route == "incremental")
+                kernels = [routes["sweep"]["mf_gs"]]
+                if route == "incremental":
+                    kernels += [tier["kernel"] for tier in tiers["tiers"]]
+                if route == "response_block":
+                    sweeps = (
+                        solver._rb_sweep_lane_kernel,
+                        solver._rb_sweep_warp32_kernel,
+                        solver._rb_sweep_warp64_kernel,
+                    )
+                    kernels += [kernel.key for kernel in sweeps]
+                for key in kernels:
+                    self.assertEqual("_vacc" in key, law == "accumulated", key)
                 state, out, control = model.state(), model.state(), model.control()
                 control.joint_f.assign(np.array([120.0], np.float32))  # 0.5 rad/s per step
                 speeds = []
@@ -564,24 +703,32 @@ class TestVelocityLimitLawRollouts(unittest.TestCase):
                 self.assertLessEqual(max(speeds), limit * (1.0 + 1.0e-5), speeds)
 
     def test_accumulated_serial_sweep_converges_to_the_parallel_tier(self):
-        """Converge the serial sweep under the accumulated law to the parallel tier's fixed point.
+        """Converge every serial sweep route under the accumulated law to the parallel tier's fixed point.
 
         A palm joint carries three two-link fingers, every joint velocity-limited.
         One step from rest with torques that push some joints past their limits and
         leave others inside couples the limit rows through the hand's mass matrix.
         The parallel tier (tolerance 0, 2000 sweeps) solves the complementarity
-        problem; the serial sweep at 2000 iterations matches it to 1e-5 under the
-        accumulated law. The stateless serial sweep's distance is reported, not bounded.
+        problem; at 2000 iterations the matrix-free GS kernel, the incremental tier
+        and the response-block lane and warp sweeps (the warp sweep forced with
+        ``mf_gs_response_block_lane_rows=0``) match it to 1e-5 under the
+        accumulated law. The stateless serial sweep converges more than 1e-4 away
+        (1.1e-3 in a float64 reference), so a route built with the stateless law
+        cannot pass.
         """
         model = _limited_hand("cuda:0")
         # Unconstrained step velocities (0.05, 0.33, -1.42, -0.45, 2.07, -0.46, 0.62) rad/s: three limits bind at
         # the solution, and the coupling keeps four joints inside theirs.
         torques = np.array([0.03, 0.006, -0.005, 0.0002, 0.008, -0.007, 0.001], np.float32)
         converged = {"pgs_iterations": 2000, "mf_gs_parallel_sweeps": 2000, "mf_gs_parallel_tol": 0.0}
+        response_block = {"mf_gs_incremental_rows": 0, "mf_gs_response_block_rows": 64}
         velocities = {}
         for name, law, options in (
             ("serial_stateless", "stateless", {"mf_gs_incremental_rows": 0}),
             ("serial", "accumulated", {"mf_gs_incremental_rows": 0}),
+            ("incremental", "accumulated", {"mf_gs_incremental_rows": 32}),
+            ("response_block_lane", "accumulated", response_block),
+            ("response_block_warp", "accumulated", {**response_block, "mf_gs_response_block_lane_rows": 0}),
             ("tier", "accumulated", {"mf_gs_incremental_rows": 0, "mf_gs_parallel_rows": 32}),
             (
                 "tier_matrix_free",
@@ -591,22 +738,40 @@ class TestVelocityLimitLawRollouts(unittest.TestCase):
         ):
             solver = _matrix_free_solver(model, law, **converged, **options)
             self.assertEqual(solver._ink_rows, 32 if name.startswith("tier") else 0)
+            # Each serial route sweeps the hand's rows with kernels of the requested law.
+            if name == "incremental":
+                route_kernels = list(solver._pgs_solve_mf_gs_incremental_kernels)
+                self.assertTrue(route_kernels)
+            elif name.startswith("response_block"):
+                lane = solver._rb_sweep_lane_kernel
+                self.assertEqual(lane is None, name == "response_block_warp")
+                route_kernels = [solver._rb_sweep_warp32_kernel, *([lane] if lane is not None else [])]
+            else:
+                route_kernels = [solver._pgs_solve_mf_gs_kernel]
+            for kernel in route_kernels:
+                self.assertEqual("_vacc" in kernel.key, law == "accumulated", kernel.key)
             state, out, control = model.state(), model.state(), model.control()
             control.joint_f.assign(torques)
             solver.step(state, out, control, None, 1.0 / 240.0)
             counts = solver.constraint_count.numpy()
             self.assertLessEqual(int(counts.max()), 32)
+            if name.startswith("response_block"):
+                # The build assigned the hand's world to the sweep class under test.
+                world_class = RB_CLASS_WARP32 if name == "response_block_warp" else RB_CLASS_LANE
+                self.assertEqual(int(solver._rb_class.numpy()[0]), world_class)
             velocities[name] = out.joint_qd.numpy().astype(np.float64)
         limited = np.abs(velocities["serial"])
         self.assertTrue(np.any(limited >= _HAND_LIMIT * (1.0 - 1.0e-4)), "no limit binds")
         self.assertTrue(np.any(limited <= 0.9 * _HAND_LIMIT), "every limit binds")
         stateless_gap = float(np.max(np.abs(velocities["serial_stateless"] - velocities["tier"])))
-        for tier in ("tier", "tier_matrix_free"):
+        # The comparison below discriminates the laws only while the stateless law lands elsewhere.
+        self.assertGreater(stateless_gap, 1.0e-4)
+        for route in ("serial", "incremental", "response_block_lane", "response_block_warp", "tier_matrix_free"):
             np.testing.assert_allclose(
-                velocities["serial"],
-                velocities[tier],
+                velocities[route],
+                velocities["tier"],
                 atol=1.0e-5,
-                err_msg=f"{tier}; the stateless serial sweep lies {stateless_gap:.3e} from the tier",
+                err_msg=f"{route}; the stateless serial sweep lies {stateless_gap:.3e} from the tier",
             )
 
 
