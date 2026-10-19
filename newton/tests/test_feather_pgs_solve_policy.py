@@ -386,8 +386,41 @@ class TestSolveReadoutRecord(unittest.TestCase):
         self.assertAlmostEqual(summary["full_budget_fraction"], 2.0 / 3.0)
         self.assertAlmostEqual(summary["mean_sweeps"], 10.0 / 3.0)
         self.assertEqual(summary["world_mean_sweeps"]["p50"], 3.0)
+        self.assertEqual(summary["pass"], "position")
         self.assertNotIn("trace", summary)
         json.dumps(record.summary(), allow_nan=False)
+
+    def test_velocity_pass_counts_in_its_own_slots(self):
+        """Count launches inside the velocity pass in slots of their own budget, apart from the position solve.
+
+        A velocity pass of one or two sweeps exhausts nearly every solve; counted in the position
+        solve's slot, those solves would read as full-budget position solves.
+        """
+        record = SolveReadoutRecord(SWEEPS)
+        counted = SimpleNamespace(key="counted_kernel", _fpgs_solve_readout="sweeps")
+        position_only = SimpleNamespace(key="position_only", _fpgs_solve_readout="sweeps")
+        record.register(counted, "mf_gs", world_count=2, budget=8, device="cpu", velocity_budget=2)
+        record.register(position_only, "sparse_pgs", world_count=2, budget=8, device="cpu")
+        (position,) = record.operands(counted)
+        with record.velocity_pass():
+            (velocity,) = record.operands(counted)
+            self.assertEqual(record.operands(position_only), [])
+        self.assertIs(record.operands(counted)[0], position)
+        self.assertEqual((position.sweeps.shape, velocity.sweeps.shape), ((9, 2), (3, 2)))
+        self.assertEqual(record.kernels, {"counted_kernel": "mf_gs", "position_only": "sparse_pgs"})
+        # Two velocity-pass solves of world 0, both of two sweeps without stopping.
+        sweeps = np.zeros((3, 2), dtype=np.int32)
+        sweeps[2, 0] = 2
+        velocity.sweeps.assign(sweeps)
+        velocity.exhausted.assign(np.array([2, 0], dtype=np.int32))
+        slots = {(slot["kernel"], slot["pass"]): slot for slot in record.summary()["slots"]}
+        self.assertEqual(
+            sorted(slots),
+            [("counted_kernel", "position"), ("counted_kernel", "velocity"), ("position_only", "position")],
+        )
+        self.assertEqual(slots[("counted_kernel", "position")]["solves"], 0)
+        velocity_slot = slots[("counted_kernel", "velocity")]
+        self.assertEqual((velocity_slot["budget"], velocity_slot["solves"], velocity_slot["exhausted"]), (2, 2, 2))
 
     def test_trace_record_summarizes_stops_reasons_and_final_changes(self):
         """Summarize the trace's per-tolerance stopping sweeps, exit reasons and final-sweep changes."""

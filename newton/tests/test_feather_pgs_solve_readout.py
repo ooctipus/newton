@@ -35,6 +35,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_LOCAL_SOLVE_OWNER_SINGLE,
 )
 from newton._src.solvers.feather_pgs.solve_policy import (
+    SOLVE_PASSES,
     TRACE_GRID,
     TRACE_KINDS,
     TRACE_REASONS,
@@ -538,6 +539,28 @@ def _matrix_free_route():
     }
 
 
+def _incremental_route():
+    """Contacting tripods without free bodies: every world holds only dense rows, which the incremental tier owns.
+
+    Each world's three feet rest in the ground and one leg starts beyond its limit, about a dozen rows,
+    within the tier's 32; without free bodies no world has matrix-free rows or a local owner.
+    """
+    from newton.tests.test_feather_pgs_sparse_solver import _build_model  # noqa: PLC0415
+
+    return {
+        "model": _build_model(),
+        "options": {
+            "pgs_mode": "matrix_free",
+            "sparse_mass_matrix": "off",
+            "friction_anchor_beta": 0.0,
+            "enable_joint_limits": True,
+            "dense_max_constraints": 96,
+            "mf_max_constraints": 64,
+        },
+        "labels": {"mf_gs_incremental"},
+    }
+
+
 def _policy_routes():
     """The routes whose local, paired and incremental sweeps compile the velocity law and trace."""
     return (
@@ -657,6 +680,26 @@ class TestSolveReadoutRoutes(unittest.TestCase):
     def test_matrix_free_route_counts_without_changing_results(self):
         """Count the matrix-free Gauss-Seidel sweep and its incremental tier without changing the trajectory."""
         self._lockstep(_matrix_free_route())
+
+    def test_velocity_pass_counts_in_its_own_slots(self):
+        """Count the velocity pass's sweeps in slots of their own budget, each world-solve once per pass."""
+        route, steps = _incremental_route(), 4
+        (solver,) = self._solvers(route, [{"pgs_solve_readout": "sweeps", "pgs_velocity_iterations": 2}])
+        for _ in self._steps(route, [solver], steps):
+            pass
+        summary = solver.get_path_selection()["measurements"]["solve_readout"]
+        slots = {(slot["route"], slot["pass"]): slot for slot in summary["slots"]}
+        # Every counted kernel holds one slot per pass.
+        self.assertEqual(
+            sorted((slot["kernel"], slot["pass"]) for slot in summary["slots"]),
+            sorted((kernel, solve_pass) for kernel in solver._solve_readout.kernels for solve_pass in SOLVE_PASSES),
+        )
+        for solve_pass, budget in (("position", BUDGET), ("velocity", 2)):
+            with self.subTest(solve_pass=solve_pass):
+                slot = slots[("mf_gs_incremental", solve_pass)]
+                self.assertEqual(slot["budget"], budget)
+                self.assertEqual(slot["solves"], steps * route["model"].world_count)
+                self.assertEqual(len(slot["sweeps"]), budget + 1)
 
     def test_trace_changes_no_result_and_records_every_solve(self):
         """Trace the local, paired and matrix-free sweeps unchanged, once per solve and grid tolerance."""

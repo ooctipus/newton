@@ -1832,12 +1832,13 @@ class SolverFeatherPGS(SolverBase):
                 the absolute tolerance only. Defaults to 0.0.
             pgs_solve_readout (str, optional): Opt-in counters of the native Gauss-Seidel sweeps.
                 ``"sweeps"`` counts, per sweep kernel and world, how many sweeps each solve executed
-                and whether it stopped before its budget; ``"trace"`` adds, per solve, the sweep at
-                which each velocity tolerance from 1e-7 to 1e-1 [m/s or rad/s] would have stopped it,
-                its exit reason, and the largest velocity-scaled change of its final sweep with that
-                row's kind; it records changes without the impulse slack of ``pgs_change_tolerance``
-                and ``pgs_relative_change_tolerance``, so its stops predict runs with both at zero.
-                ``get_path_selection()`` summarizes them under
+                and whether it stopped before its budget, the velocity pass of
+                ``pgs_velocity_iterations`` apart from the position solve; ``"trace"`` adds, per
+                solve, the sweep at which each velocity tolerance from 1e-7 to 1e-1 [m/s or rad/s]
+                would have stopped it, its exit reason, and the largest velocity-scaled change of its
+                final sweep with that row's kind; it records changes without the impulse slack of
+                ``pgs_change_tolerance`` and ``pgs_relative_change_tolerance``, so its stops predict
+                runs with both at zero. ``get_path_selection()`` summarizes them under
                 ``measurements["solve_readout"]``, which synchronizes the device once. Neither
                 readout changes a computed value. The sparse, sparse-diagonal, matrix-free
                 Gauss-Seidel, paired factor, local and incremental sweeps count; the others run
@@ -5849,9 +5850,13 @@ class SolverFeatherPGS(SolverBase):
         else:
             if not policy.exact:
                 self._solve_policy_honored[kernel.key] = route
-        budget = max(int(self.pgs_iterations), int(self.pgs_velocity_iterations), 1)
         self._solve_readout.register(
-            kernel, route, world_count=int(self.world_count), budget=budget, device=self.model.device
+            kernel,
+            route,
+            world_count=int(self.world_count),
+            budget=max(int(self.pgs_iterations), 1),
+            device=self.model.device,
+            velocity_budget=int(self.pgs_velocity_iterations),
         )
         return kernel
 
@@ -10734,31 +10739,33 @@ class SolverFeatherPGS(SolverBase):
             return
 
         self._pack_mf_meta(self.mf_rhs_unbiased)
-        if self._propagation_contacts_enabled():
-            self._launch_matrix_free_gs_solve_propagation_tree(
-                soft_relax=True,
-                dense_rhs=self.rhs_unbiased,
-                propagation_rhs=self.propagation_rhs_unbiased,
-                mf_meta=self.mf_meta_packed,
-                iterations=self.pgs_velocity_iterations,
-                omega=self.pgs_omega,
-                friction_start_iteration=self._contact_friction_start_iteration(
-                    self.pgs_velocity_iterations, velocity_pass=True
-                ),
-                freeze_drive_rows=self.pgs_velocity_drive_mode == "freeze",
-            )
-        else:
-            self._launch_matrix_free_gs_solve(
-                soft_relax=True,
-                dense_rhs=self.rhs_unbiased,
-                mf_meta=self.mf_meta_packed,
-                iterations=self.pgs_velocity_iterations,
-                omega=self.pgs_omega,
-                friction_start_iteration=self._contact_friction_start_iteration(
-                    self.pgs_velocity_iterations, velocity_pass=True
-                ),
-                freeze_drive_rows=self.pgs_velocity_drive_mode == "freeze",
-            )
+        # The solve readout counts this pass's short sweeps apart from the position solve.
+        with self._solve_readout.velocity_pass():
+            if self._propagation_contacts_enabled():
+                self._launch_matrix_free_gs_solve_propagation_tree(
+                    soft_relax=True,
+                    dense_rhs=self.rhs_unbiased,
+                    propagation_rhs=self.propagation_rhs_unbiased,
+                    mf_meta=self.mf_meta_packed,
+                    iterations=self.pgs_velocity_iterations,
+                    omega=self.pgs_omega,
+                    friction_start_iteration=self._contact_friction_start_iteration(
+                        self.pgs_velocity_iterations, velocity_pass=True
+                    ),
+                    freeze_drive_rows=self.pgs_velocity_drive_mode == "freeze",
+                )
+            else:
+                self._launch_matrix_free_gs_solve(
+                    soft_relax=True,
+                    dense_rhs=self.rhs_unbiased,
+                    mf_meta=self.mf_meta_packed,
+                    iterations=self.pgs_velocity_iterations,
+                    omega=self.pgs_omega,
+                    friction_start_iteration=self._contact_friction_start_iteration(
+                        self.pgs_velocity_iterations, velocity_pass=True
+                    ),
+                    freeze_drive_rows=self.pgs_velocity_drive_mode == "freeze",
+                )
 
     def _conclude_matrix_free_position_problem(self, dt: float) -> None:
         """Switch the current q0 constraint problem to its velocity-iteration RHS."""

@@ -37,6 +37,7 @@ readout changes a computed value.
 """
 
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass, fields
 
 import numpy as np
@@ -47,6 +48,9 @@ from .row_inputs import RowArgument
 
 SOLVE_READOUTS = ("off", "sweeps", "trace")
 """Accepted readouts: no counter, executed sweeps, or executed sweeps with the exit-law trace."""
+
+SOLVE_PASSES = ("position", "velocity")
+"""Solve passes a readout counts apart: the position solve and the velocity pass (``pgs_velocity_iterations``)."""
 
 TRACE_GRID = tuple(10.0 ** (-7.0 + 0.5 * point) for point in range(13))
 """Velocity tolerances [m/s or rad/s] at which the trace records where each solve would stop: 1e-7 to 1e-1."""
@@ -388,6 +392,7 @@ def sweep_exit(
 @dataclass
 class _ReadoutSlot:
     label: str
+    solve_pass: str
     operand: object
     arrays: dict
 
@@ -395,64 +400,88 @@ class _ReadoutSlot:
 class SolveReadoutRecord:
     """Host owner of the readout counters of a solver's sweep kernels.
 
-    Each readout kernel gets one slot of counters, allocated at registration
-    (outside graph capture) and passed as the kernel's last argument. The
-    counters accumulate over every launch, captured graph replays included,
-    so a window is the difference of two summaries.
+    Each readout kernel gets one slot of counters per solve pass it runs in
+    (:data:`SOLVE_PASSES`), allocated at registration (outside graph capture)
+    and passed as the kernel's last argument: the position solve's slot, and
+    a velocity-pass slot when the solver runs that pass, so that its short
+    budgets do not fill the position solve's histogram. Launches inside
+    :meth:`velocity_pass` take the velocity-pass slot. The counters accumulate
+    over every launch, captured graph replays included, so a window is the
+    difference of two summaries.
     """
 
     def __init__(self, policy: SolvePolicy):
         self.policy = policy
-        self._slots: dict[str, _ReadoutSlot] = {}
+        self._slots: dict[tuple[str, str], _ReadoutSlot] = {}
+        self._labels: dict[str, str] = {}
+        self._pass = "position"
 
-    def register(self, kernel, label: str, *, world_count: int, budget: int, device) -> None:
+    def register(self, kernel, label: str, *, world_count: int, budget: int, device, velocity_budget: int = 0) -> None:
         """Allocate the counters of a readout kernel; kernels without a readout operand are ignored.
 
         Args:
             kernel: A sweep kernel built under a policy with a readout.
             label: Route of the kernel in the record, such as ``"sparse_pgs"``.
             world_count: Number of worlds the kernel can solve.
-            budget: Largest sweep budget a launch of the kernel passes.
+            budget: Largest sweep budget a position-solve launch of the kernel passes.
             device: Device of the counters.
+            velocity_budget: Sweep budget of the velocity pass, or 0 when the solver runs none.
         """
         readout = getattr(kernel, "_fpgs_solve_readout", False) if kernel is not None else False
-        if not readout or kernel.key in self._slots:
+        if not readout or kernel.key in self._labels:
             return
-        rows, worlds = max(int(budget), 1) + 1, max(int(world_count), 1)
-        arrays = {
-            "sweeps": wp.zeros((rows, worlds), dtype=wp.int32, device=device),
-            "exhausted": wp.zeros(worlds, dtype=wp.int32, device=device),
-        }
-        operand = SolveReadout()
-        if readout == "trace":
-            arrays["stops"] = wp.zeros((len(TRACE_GRID), rows + 1), dtype=wp.int64, device=device)
-            arrays["reasons"] = wp.zeros(len(TRACE_REASONS), dtype=wp.int64, device=device)
-            arrays["limits"] = wp.zeros((len(TRACE_KINDS), TRACE_BINS), dtype=wp.int64, device=device)
-            operand = SolveTrace()
-        for name, array in arrays.items():
-            setattr(operand, name, array)
-        self._slots[kernel.key] = _ReadoutSlot(label, operand, arrays)
+        self._labels[kernel.key] = label
+        budgets = {"position": budget, "velocity": velocity_budget}
+        worlds = max(int(world_count), 1)
+        for solve_pass in SOLVE_PASSES:
+            if solve_pass != "position" and int(budgets[solve_pass]) <= 0:
+                continue
+            rows = max(int(budgets[solve_pass]), 1) + 1
+            arrays = {
+                "sweeps": wp.zeros((rows, worlds), dtype=wp.int32, device=device),
+                "exhausted": wp.zeros(worlds, dtype=wp.int32, device=device),
+            }
+            operand = SolveReadout()
+            if readout == "trace":
+                arrays["stops"] = wp.zeros((len(TRACE_GRID), rows + 1), dtype=wp.int64, device=device)
+                arrays["reasons"] = wp.zeros(len(TRACE_REASONS), dtype=wp.int64, device=device)
+                arrays["limits"] = wp.zeros((len(TRACE_KINDS), TRACE_BINS), dtype=wp.int64, device=device)
+                operand = SolveTrace()
+            for name, array in arrays.items():
+                setattr(operand, name, array)
+            self._slots[(kernel.key, solve_pass)] = _ReadoutSlot(label, solve_pass, operand, arrays)
+
+    @contextmanager
+    def velocity_pass(self):
+        """Count the launches made inside the context in the velocity-pass slots."""
+        previous, self._pass = self._pass, "velocity"
+        try:
+            yield
+        finally:
+            self._pass = previous
 
     def operands(self, kernel) -> list:
-        """Return the readout operand to append to a launch of ``kernel``, or nothing."""
-        slot = self._slots.get(getattr(kernel, "key", None)) if kernel is not None else None
+        """Return the readout operand to append to a launch of ``kernel`` in the current pass, or nothing."""
+        key = getattr(kernel, "key", None) if kernel is not None else None
+        slot = self._slots.get((key, self._pass))
         return [] if slot is None else [slot.operand]
 
     @property
     def kernels(self) -> dict[str, str]:
         """``{kernel key: route label}`` of the registered readout kernels."""
-        return {key: slot.label for key, slot in self._slots.items()}
+        return dict(self._labels)
 
     def summary(self) -> dict:
         """Read the counters and summarize every slot; this synchronizes with the device.
 
-        ``sweeps[k]`` counts the solves that executed ``k`` sweeps (the last
-        entry also holds longer solves), ``exhausted`` the solves that ran their
-        whole budget without stopping. A traced slot adds ``trace``. Counts are
-        cumulative since construction.
+        A slot is one kernel in one solve pass (``pass``). ``sweeps[k]`` counts
+        the solves that executed ``k`` sweeps (the last entry also holds longer
+        solves), ``exhausted`` the solves that ran their whole budget without
+        stopping. A traced slot adds ``trace``. Counts are cumulative since
+        construction.
         """
         slots = []
-        for key, slot in self._slots.items():
+        for (key, _), slot in self._slots.items():
             sweeps = slot.arrays["sweeps"].numpy().astype(np.int64)
             exhausted = int(slot.arrays["exhausted"].numpy().astype(np.int64).sum())
             histogram = sweeps.sum(axis=1)
@@ -464,6 +493,7 @@ class SolveReadoutRecord:
             world_mean = (executed[:, None] * sweeps).sum(axis=0)[active] / per_world[active]
             record = {
                 "kernel": key,
+                "pass": slot.solve_pass,
                 "route": slot.label,
                 "budget": budget,
                 "solves": solves,
