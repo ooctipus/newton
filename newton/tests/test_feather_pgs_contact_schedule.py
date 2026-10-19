@@ -8,7 +8,8 @@ triples) in row order and list the remaining contacts serially. Two serial
 walks over a world's rows define these outputs; lane 0 ran them before the warp
 built the schedules in parallel. The tests compare every output of the
 builders, bitwise, with a transliteration of those walks, on synthetic worlds
-and on the rows the solver produces.
+and on the rows the solver produces, and check that the unit builder takes its
+warp-parallel path exactly where the rows form units.
 """
 
 import unittest
@@ -332,22 +333,47 @@ def _triple_twin_rows():
         yield (capacity, dofs), _triple_worlds(seed, worlds=140, capacity=capacity, dofs=dofs)
 
 
+def _builder_arrays(rows, device, *, units):
+    """Return the builder's inputs and outputs, in launch order, as device copies of the rows."""
+    inputs = ("row_count", "bounds", *(("row_type", "row_parent") if units else ()))
+    return (
+        [wp.array(rows[name], dtype=wp.int32, device=device) for name in inputs],
+        {name: wp.array(rows[name], dtype=wp.int32, device=device) for name in _OUTPUTS},
+    )
+
+
+def _launch(kernel, rows, device, *, units):
+    """Run a schedule builder kernel over the rows; return every output."""
+    inputs, outputs = _builder_arrays(rows, device, units=units)
+    wp.launch(kernel, dim=rows["row_type"].shape[0] * 32, inputs=inputs, outputs=list(outputs.values()), device=device)
+    return {name: array.numpy() for name, array in outputs.items()}
+
+
 def _launch_builder(rows, device, *, units, serial_contacts):
     """Run a schedule builder over the rows; return every output."""
-    worlds, capacity = rows["row_type"].shape
+    capacity, dofs = rows["row_type"].shape[1], rows["group_heads"].shape[1]
     kernel = _get_build_independent_sparse_contact_groups_kernel(
-        capacity, rows["group_heads"].shape[1], str(device.arch), build_serial_contacts=serial_contacts, units=units
+        capacity, dofs, str(device.arch), build_serial_contacts=serial_contacts, units=units
     )
-    arrays = {name: wp.array(rows[name], dtype=wp.int32, device=device) for name in rows}
-    unit_rows = [arrays["row_type"], arrays["row_parent"]] if units else []
-    wp.launch(
-        kernel,
-        dim=worlds * 32,
-        inputs=[arrays["row_count"], arrays["bounds"], *unit_rows],
-        outputs=[arrays[name] for name in _OUTPUTS],
-        device=device,
-    )
-    return {name: arrays[name].numpy() for name in _OUTPUTS}
+    return _launch(kernel, rows, device, units=units)
+
+
+def _unit_builder_path_marks(rows, device):
+    """Return, per world, ``1`` where the unit builder takes its warp-parallel path, else :data:`_UNWRITTEN`.
+
+    The builder is rebuilt without serial lists, so that nothing else writes the serial count, and with a
+    lane-0 store of ``1`` there after its parallel links, which only the parallel path runs.
+    """
+    link_source = solver_module._link_scalar_contacts_source
+
+    def marked_link_source(**kwargs):
+        return f"{link_source(**kwargs)}\n    if (lane == 0) serial_count_out.data[world] = 1;\n"
+
+    capacity, dofs = rows["row_type"].shape[1], rows["group_heads"].shape[1]
+    with mock.patch.object(solver_module, "_link_scalar_contacts_source", marked_link_source):
+        kernel = solver_module._build_independent_sparse_contact_units_kernel(capacity, dofs, False)
+    unmarked = {**rows, "serial_count": np.full(rows["row_type"].shape[0], _UNWRITTEN, np.int32)}
+    return _launch(kernel, unmarked, device, units=True)["serial_count"]
 
 
 def _assert_outputs_equal(actual, expected, label):
@@ -542,6 +568,20 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
                     _assert_outputs_equal(actual, expected, f"capacity {capacity}")
 
     @unittest.skipUnless(wp.is_cuda_available(), "the contact schedule builders require CUDA")
+    def test_unit_builder_takes_the_parallel_path_where_rows_form_units(self):
+        """Schedule exactly the synthetic worlds whose rows form units on the unit builder's warp-parallel path.
+
+        The serial walks give the same outputs on either path, so only a builder that marks its path tells
+        them apart.
+        """
+        device = wp.get_device("cuda:0")
+        for (capacity, dofs), rows in _unit_twin_rows():
+            with self.subTest(capacity=capacity, dofs=dofs):
+                forms = [_rows_form_units(rows, world) for world in range(rows["row_count"].shape[0])]
+                marks = _unit_builder_path_marks(rows, device)
+                np.testing.assert_array_equal(marks, np.where(forms, 1, _UNWRITTEN))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "the contact schedule builders require CUDA")
     def test_triple_builder_matches_the_serial_walks(self):
         """Build triple schedules bitwise equal to the serial walks, in every layout and at capacity edges."""
         device = wp.get_device("cuda:0")
@@ -568,28 +608,21 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
                 kernel = _get_build_independent_sparse_contact_groups_kernel(
                     capacity, 33, str(device.arch), build_serial_contacts=True, units=units
                 )
-                arrays = {name: wp.array(rows[name], dtype=wp.int32, device=device) for name in rows}
+                inputs, outputs = _builder_arrays(rows, device, units=units)
                 marked = wp.array(rows["sparse_row_dof"], dtype=wp.int32, device=device)
-                unit_rows = [arrays["row_type"], arrays["row_parent"]] if units else []
 
-                def build(kernel=kernel, arrays=arrays, marked=marked, unit_rows=unit_rows, worlds=worlds):
-                    wp.copy(arrays["sparse_row_dof"], marked)
-                    wp.launch(
-                        kernel,
-                        dim=worlds * 32,
-                        inputs=[arrays["row_count"], arrays["bounds"], *unit_rows],
-                        outputs=[arrays[name] for name in _OUTPUTS],
-                        device=device,
-                    )
+                def build(kernel=kernel, inputs=inputs, outputs=outputs, marked=marked, worlds=worlds):
+                    wp.copy(outputs["sparse_row_dof"], marked)
+                    wp.launch(kernel, dim=worlds * 32, inputs=inputs, outputs=list(outputs.values()), device=device)
 
                 build()
                 with wp.ScopedCapture(device=device) as capture:
                     build()
                 for replay in range(2):
                     for name in ("group_count", "group_heads", "serial_count", "serial"):
-                        arrays[name].fill_(_UNWRITTEN)
+                        outputs[name].fill_(_UNWRITTEN)
                     wp.capture_launch(capture.graph)
-                    actual = {name: arrays[name].numpy() for name in _OUTPUTS}
+                    actual = {name: array.numpy() for name, array in outputs.items()}
                     _assert_outputs_equal(actual, expected, f"replay {replay}")
 
     @unittest.skipUnless(wp.is_cuda_available(), "the sparse-diagonal contact owner requires CUDA")
@@ -597,8 +630,9 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
         """Schedule the patch units the solver produces, through both producers, as the serial walks do.
 
         Every builder launch of six solver steps is recorded: its rows and marks before the launch and
-        its outputs after. The rows form units, so the builder takes its parallel path, and both the
-        independent and the serial schedule are populated.
+        its outputs after. The rows satisfy the layout predicate, a builder that marks its path takes
+        the warp-parallel path in every world, and both the independent and the serial schedule are
+        populated.
         """
         device = wp.get_device("cuda:0")
         model = build_solver_fixture(device)
@@ -613,6 +647,8 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
                 for step, (before, after) in enumerate(records):
                     for world in range(before["row_count"].shape[0]):
                         self.assertTrue(_rows_form_units(before, world), f"step {step} world {world}")
+                    marks = _unit_builder_path_marks(before, device)
+                    np.testing.assert_array_equal(marks, 1, err_msg=f"step {step}: worlds left the parallel path")
                     _assert_outputs_equal(after, _serial_unit_walks(before, serial_contacts=True), f"step {step}")
                 self.assertGreater(sum(int(np.sum(after["group_count"])) for _, after in records), 0)
                 self.assertGreater(sum(int(np.sum(after["serial_count"])) for _, after in records), 0)
