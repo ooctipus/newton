@@ -489,7 +489,20 @@ class TestVelocityExitLaw(unittest.TestCase):
                 if policy.counts and not policy.traces and snippet.count("solve_readout_sweeps(") != 1:
                     self.fail(f"{kernel.key} {kwargs}: the readout records no exit or more than one")
             checked[name] += 1
-        self.assertTrue(all(checked.values()), checked)
+        # The admitted combinations per factory: a factory gate that starts refusing some must not shrink the census.
+        self.assertEqual(
+            checked,
+            {
+                "sparse": 96,
+                "sparse_lanes": 32,
+                "mf_gs": 1344,
+                "paired": 6,
+                "local": 48,
+                "packets": 48,
+                "sparse_diagonal": 5,
+                "incremental": 32,
+            },
+        )
 
     def test_trace_records_every_vote_and_each_sweep(self):
         """Record each change before its vote and every sweep at its exit, under the exact law."""
