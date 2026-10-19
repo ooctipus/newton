@@ -1,14 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""End-to-end coverage for mixed propagation-colored contact units."""
+"""End-to-end coverage for mixed propagation-colored contact units, including the serial tail."""
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import solver_feather_pgs
 from newton.solvers import SolverFeatherPGS
 
 DT = 1.0 / 240.0
@@ -16,6 +18,12 @@ RADIUS = 0.05
 ROW_CAPACITY = 6
 CONTACT_COUNT = 4
 FRICTION_GAP_THRESHOLD = 0.0
+# (x, y, gap) of the sphere feet of one body: three penetrate at the corners of a triangle
+# and take three rows each, one hovers under the centre and takes one. Feet farther apart
+# than two radii stay separate friction patches.
+SHARED_FEET = ((0.15, 0.0, -0.002), (0.0, 0.0, 0.006), (-0.075, 0.13, -0.001), (-0.075, -0.13, -0.0015))
+SHARED_ROW_COUNT = 10
+TAIL_COLOR_CAP = 2
 
 
 def _build_mixed_gap_model(device: str) -> newton.Model:
@@ -42,8 +50,33 @@ def _build_mixed_gap_model(device: str) -> newton.Model:
     return scene.finalize(device=device)
 
 
-def _make_solver(model: newton.Model, response: str) -> SolverFeatherPGS:
-    """Build a serial or colored propagation solver with six contact rows."""
+def _build_shared_body_model(device: str) -> newton.Model:
+    """Build one body on four sphere feet, so every ground contact unit shares that body."""
+    scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    world = newton.ModelBuilder()
+    cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.6, margin=0.0, gap=0.015)
+    body = world.add_link(
+        xform=wp.transform(wp.vec3(0.0, 0.0, RADIUS), wp.quat_identity()),
+        mass=1.0,
+        inertia=wp.mat33(0.02, 0.0, 0.0, 0.0, 0.02, 0.0, 0.0, 0.0, 0.02),
+        lock_inertia=True,
+    )
+    for x, y, gap in SHARED_FEET:
+        foot = wp.transform(wp.vec3(x, y, gap), wp.quat_identity())
+        world.add_shape_sphere(body, xform=foot, radius=RADIUS, cfg=cfg)
+    world.add_articulation([world.add_joint_free(parent=-1, child=body)])
+    scene.add_world(world)
+    scene.add_ground_plane(cfg=cfg)
+    return scene.finalize(device=device)
+
+
+def _make_solver(model: newton.Model, response: str, *, row_capacity: int = ROW_CAPACITY) -> SolverFeatherPGS:
+    """Build a serial or colored propagation solver with ``row_capacity`` contact rows.
+
+    Propagation takes the dense and the matrix-free row capacities together: the dense share
+    stays at three rows and the matrix-free share takes the rest.
+    """
+    dense_rows = 3
     return SolverFeatherPGS(
         model,
         angular_damping=0.0,
@@ -53,8 +86,8 @@ def _make_solver(model: newton.Model, response: str) -> SolverFeatherPGS:
         pgs_warmstart=False,
         mf_warmstart=False,
         propagation_cached_response=False,
-        dense_max_constraints=3,
-        mf_max_constraints=3,
+        dense_max_constraints=dense_rows,
+        mf_max_constraints=row_capacity - dense_rows,
         contact_friction_gap_threshold=FRICTION_GAP_THRESHOLD,
         contact_speculative_scale=0.0,
         use_parallel_streams=False,
@@ -62,11 +95,11 @@ def _make_solver(model: newton.Model, response: str) -> SolverFeatherPGS:
 
 
 def _seed_state(model: newton.Model, state: newton.State) -> tuple[np.ndarray, np.ndarray]:
-    """Give every sphere the same downward speed and a distinct tangent speed."""
+    """Give every free body the same downward speed and a distinct tangent speed."""
     joint_q = state.joint_q.numpy().copy()
     joint_qd = np.zeros(state.joint_qd.shape, dtype=np.float32)
     dof_starts = model.joint_qd_start.numpy()
-    for index in range(CONTACT_COUNT):
+    for index in range(model.joint_count):
         dof = int(dof_starts[index])
         joint_qd[dof] = 0.15 + 0.03 * index
         joint_qd[dof + 2] = -0.1
@@ -129,6 +162,34 @@ def _assert_mixed_topology(test: unittest.TestCase, solver: SolverFeatherPGS, co
     slots = solver.contact_slot.numpy()[:count]
     starts = np.cumsum(lengths[ordered]) - lengths[ordered]
     np.testing.assert_array_equal(slots[ordered], starts)
+
+
+def _assert_overflow_topology(
+    test: unittest.TestCase, solver: SolverFeatherPGS, contacts: newton.Contacts, colors: int
+) -> np.ndarray:
+    """Assert one color each for the first ``colors`` shared-body units and the serial tail for the rest.
+
+    The units share the body, so first-fit gives each unit the next color in contact-index
+    order until the color cap runs out; the remaining units fill the tail in the same order,
+    and every unit's rows follow the previous unit's rows. Returns each unit's row count.
+    """
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    test.assertEqual(count, CONTACT_COUNT)
+    np.testing.assert_array_equal(solver.contact_path.numpy()[:count], np.full(CONTACT_COUNT, 2, dtype=np.int32))
+    lengths = solver.contact_slots_needed.numpy()[:count]
+    test.assertEqual(sorted(lengths.tolist()), [1, 3, 3, 3])
+    test.assertEqual(int(solver.propagation_constraint_count.numpy()[0]), SHARED_ROW_COUNT)
+    test.assertEqual(int(solver.color_world_unit_cursor.numpy()[0]), CONTACT_COUNT)
+
+    # Entry -2 starts the serial tail and entry -1 holds the unit total.
+    offsets = solver.color_world_offsets.numpy().reshape(solver.world_count, -1)[0]
+    np.testing.assert_array_equal(offsets[: colors + 1], np.arange(colors + 1))
+    test.assertEqual(int(offsets[-2]), colors)
+    test.assertEqual(int(offsets[-1]), CONTACT_COUNT)
+
+    test.assertEqual(solver.color_unit_sorted.numpy()[:CONTACT_COUNT].tolist(), list(range(CONTACT_COUNT)))
+    np.testing.assert_array_equal(solver.contact_slot.numpy()[:count], np.cumsum(lengths) - lengths)
+    return lengths
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "propagation-colored requires CUDA")
@@ -226,6 +287,63 @@ class TestFeatherPGSColoredUnitCapacity(unittest.TestCase):
             rtol=0.0,
             atol=1.0e-6,
         )
+
+    def test_color_overflow_tail_matches_one_color_per_unit(self):
+        """Sweep the units beyond the color cap in the serial tail as one color per unit would.
+
+        Every unit shares the body, so first-fit gives each unit its own color in
+        contact-index order. Under a two-color cap the last two units overflow into the
+        ordered serial tail, which must sweep them in that same order: on the same contacts,
+        the impulses, body velocity and a short trajectory match the uncapped solve.
+        """
+        device = "cuda:0"
+        model = _build_shared_body_model(device)
+        uncapped = _make_solver(model, "propagation-colored", row_capacity=SHARED_ROW_COUNT)
+        with patch.object(solver_feather_pgs, "PROPAGATION_COLOR_TAIL", TAIL_COLOR_CAP):
+            capped = _make_solver(model, "propagation-colored", row_capacity=SHARED_ROW_COUNT)
+        arms = [(solver, model.state(), model.state()) for solver in (uncapped, capped)]
+        for _, state_in, _ in arms:
+            _seed_state(model, state_in)
+        # One contact set feeds both arms, so both sweep the units in one contact-index order.
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+        contacts = pipeline.contacts()
+        control = model.control()
+
+        for step in range(4):
+            pipeline.collide(arms[0][1], contacts)
+            for solver, state_in, state_out in arms:
+                state_in.clear_forces()
+                solver.step(state_in, state_out, control, contacts, DT)
+
+            if step == 0:
+                _assert_overflow_topology(self, uncapped, contacts, CONTACT_COUNT)
+                lengths = _assert_overflow_topology(self, capped, contacts, TAIL_COLOR_CAP)
+                # Three of the four units take friction rows, so the two-unit tail holds one in
+                # any contact order, and the tail's rows carry load: the comparison below
+                # covers the tail's own sweep, friction pairs included.
+                self.assertIn(3, lengths[TAIL_COLOR_CAP:].tolist())
+                tail_start = int(np.sum(lengths[:TAIL_COLOR_CAP]))
+                self.assertGreater(float(np.max(capped.propagation_impulses.numpy()[0, tail_start:])), 0.0)
+            for name in ("propagation_impulses", "propagation_body_qd"):
+                np.testing.assert_allclose(
+                    getattr(capped, name).numpy(),
+                    getattr(uncapped, name).numpy(),
+                    rtol=2.0e-5,
+                    atol=2.0e-6,
+                    err_msg=name,
+                )
+            (_, _, uncapped_out), (_, _, capped_out) = arms
+            for name in ("joint_q", "joint_qd"):
+                np.testing.assert_allclose(
+                    getattr(capped_out, name).numpy(),
+                    getattr(uncapped_out, name).numpy(),
+                    rtol=2.0e-5,
+                    atol=2.0e-6,
+                    err_msg=name,
+                )
+            arms = [(solver, state_out, state_in) for solver, state_in, state_out in arms]
+        for solver, _, _ in arms:
+            solver.check_constraint_capacity()
 
 
 if __name__ == "__main__":
