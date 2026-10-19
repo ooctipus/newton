@@ -2569,6 +2569,7 @@ class CollisionPipeline:
                         exclude_primitives=True, exclude_heightfield_convex=True
                     ),
                 )
+                self.narrow_phase._heightfield_fallback_excludes_convex = True
         # Why the terrain convex-cells owner is or is not installed, reported by get_collision_selection().
         if not self.narrow_phase.has_heightfields:
             self._terrain_cells_reason = None
@@ -2907,6 +2908,12 @@ class CollisionPipeline:
                     *common,
                 ),
             )
+        if narrow._heightfield_row_gate:
+            row_gate_reason = "Default: each typed row scans the triangle stream only when a current pair reaches it."
+        elif not narrow._heightfield_primitive_query:
+            row_gate_reason = "Off: the typed primitive table is off."
+        else:
+            row_gate_reason = "NEWTON_HEIGHTFIELD_ROW_GATE=0: every typed row scans the whole triangle stream."
         cells = self._heightfield_convex_cells
         cell_kernel = narrow._heightfield_convex_cell_kernel
         return {
@@ -2917,6 +2924,7 @@ class CollisionPipeline:
                 "source": requests["primitive_query_source"],
                 "reason": primitive_reason,
                 "rows": rows,
+                "row_gate": {"enabled": bool(narrow._heightfield_row_gate), "reason": row_gate_reason},
             },
             "convex_cells": {
                 "owner": None

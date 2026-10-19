@@ -63,6 +63,7 @@ from ..geometry.heightfield_cells import heightfield_cell_overlaps_kernel
 from ..geometry.heightfield_cylinder import create_heightfield_cylinder_split_kernels
 from ..geometry.heightfield_features import WELD_FLAT_SEAMS, HeightfieldFeatureContext, flat_seam_query_allowed
 from ..geometry.heightfield_primitive_contact import ANALYTIC_PRIMITIVE_QUERIES, analytic_primitives_default
+from ..geometry.heightfield_row_gate import HEIGHTFIELD_ROW_COUNT, HEIGHTFIELD_TYPED_ROWS, heightfield_row_gate_kernel
 from ..geometry.mpr import create_solve_mpr, create_support_map_function
 from ..geometry.sdf_contact import (
     MESH_SDF_BLOCK_DIM,
@@ -2381,6 +2382,10 @@ class NarrowPhase:
     retain the generic query, including barrel cylinders. Admission requires stock
     buffered contact writing without finite queries, deterministic mode,
     speculative contacts or hydroelastic SDFs; no geometry is cached by this option.
+    Each typed row scans the triangle stream only when a current heightfield
+    pair reaches it: a small kernel reads the current pair list, shape types and
+    dimensions every pass and hands rows without pairs a zero stream length.
+    ``NEWTON_HEIGHTFIELD_ROW_GATE=0`` restores full scans; contacts are identical.
 
     Experimental, default-off ``NEWTON_HEIGHTFIELD_CYLINDER_SPLIT=1`` additionally
     separates the admitted regular-cylinder query into MPR, queued GJK and
@@ -2650,13 +2655,11 @@ class NarrowPhase:
 
             self._heightfield_convex_cell_kernel = get_kernel()
         if self._heightfield_primitive_query:
-            # Index 1 is the cylinder query (the cylinder split replaces it); the
-            # generic fallback comes last and excludes every typed primitive.
+            # The typed rows follow HEIGHTFIELD_TYPED_ROWS, so index 1 is the cylinder
+            # query (the cylinder split replaces it); the generic fallback comes last
+            # and excludes every typed primitive.
             self._heightfield_primitive_kernels = (
-                create_mesh_triangle_contacts_to_reducer_kernel(int(GeoType.SPHERE)),
-                create_mesh_triangle_contacts_to_reducer_kernel(int(GeoType.CYLINDER)),
-                create_mesh_triangle_contacts_to_reducer_kernel(int(GeoType.CAPSULE)),
-                create_mesh_triangle_contacts_to_reducer_kernel(int(GeoType.BOX)),
+                *(create_mesh_triangle_contacts_to_reducer_kernel(row) for row in HEIGHTFIELD_TYPED_ROWS),
                 # Convex hulls stay in the fallback scan (a typed kernel is one more
                 # pass over every candidate pair: Go2 rough +2%); with the closed-form
                 # row on, the fallback runs that row for them. The opt-in convex-cells
@@ -2666,6 +2669,13 @@ class NarrowPhase:
                     exclude_heightfield_convex=self._heightfield_convex_cells_requested,
                 ),
             )
+        # Whether the fallback row leaves heightfield/convex-hull pairs to the convex-cells owner.
+        self._heightfield_fallback_excludes_convex = self._heightfield_convex_cells_requested
+        row_gate = os.environ.get("NEWTON_HEIGHTFIELD_ROW_GATE", "1")
+        if row_gate not in ("0", "1"):
+            raise ValueError("NEWTON_HEIGHTFIELD_ROW_GATE must be 0 or 1")
+        # Each typed row scans the triangle stream only when a current pair can reach it.
+        self._heightfield_row_gate = row_gate == "1" and self._heightfield_primitive_query
         cylinder_split = os.environ.get("NEWTON_HEIGHTFIELD_CYLINDER_SPLIT", "0")
         if cylinder_split not in ("0", "1"):
             raise ValueError("NEWTON_HEIGHTFIELD_CYLINDER_SPLIT must be 0 or 1")
@@ -2748,6 +2758,7 @@ class NarrowPhase:
             "primitive_query_source": "environment" if heightfield_primitive_query is None else "argument",
             "cylinder_split": cylinder_split == "1",
             "export_cleanup": export_cleanup == "1",
+            "row_gate": row_gate == "1",
         }
         self._finite_bounds = None
         self._finite_source = None
@@ -2990,6 +3001,8 @@ class NarrowPhase:
             n += 3 if has_meshes else 0  # mesh_plane, mesh_plane_vtx, mesh_mesh
             mesh_weight_idx = n if has_meshes and self.reduce_contacts else None
             n += 2 if mesh_weight_idx is not None else 0  # mesh-plane vertices, mesh-mesh edges
+            row_gate_idx = n if self._heightfield_row_gate else None
+            n += HEIGHTFIELD_ROW_COUNT if row_gate_idx is not None else 0  # typed terrain row lengths
             c = wp.zeros(n, dtype=wp.int32, device=device)
             self._counter_array = c
             # Separate storage: per-frame counter resets must not erase history.
@@ -3016,6 +3029,15 @@ class NarrowPhase:
                 c[mesh_weight_idx + 1 : mesh_weight_idx + 2] if mesh_weight_idx is not None else None
             )
             self.shape_pairs_mesh_mesh_count = c[mesh_only_idx + 2 : mesh_only_idx + 3] if has_meshes else None
+            # One triangle-stream length per typed terrain row, in row order; zero skips the row's scan.
+            self._heightfield_row_counts = (
+                c[row_gate_idx : row_gate_idx + HEIGHTFIELD_ROW_COUNT] if row_gate_idx is not None else None
+            )
+            self._heightfield_row_count_views = (
+                tuple(c[row_gate_idx + row : row_gate_idx + row + 1] for row in range(HEIGHTFIELD_ROW_COUNT))
+                if row_gate_idx is not None
+                else ()
+            )
 
             # Pair and work buffers
             self.gjk_candidate_pairs = wp.zeros(max_candidate_pairs, dtype=wp.vec2i, device=device)
@@ -3680,13 +3702,38 @@ class NarrowPhase:
                         record_tape=False,
                     )
                 if self._heightfield_primitive_query:
+                    if self._heightfield_row_gate:
+                        wp.launch(
+                            kernel=heightfield_row_gate_kernel,
+                            dim=self.total_num_threads,
+                            inputs=[
+                                self.shape_pairs_mesh,
+                                self.shape_pairs_mesh_count,
+                                shape_types,
+                                shape_data,
+                                self.triangle_pairs_count,
+                                int(self._heightfield_fallback_excludes_convex),
+                                self.total_num_threads,
+                            ],
+                            outputs=[self._heightfield_row_counts],
+                            device=device,
+                            block_dim=self.block_dim,
+                            record_tape=False,
+                        )
                     for primitive_index, primitive_kernel in enumerate(self._heightfield_primitive_kernels):
+                        row_inputs = triangle_inputs
+                        if self._heightfield_row_gate:
+                            # The same row kernel reads its gated stream length as triangle_pairs_count.
+                            length = self._heightfield_row_count_views[primitive_index]
+                            row_inputs = [
+                                length if value is self.triangle_pairs_count else value for value in triangle_inputs
+                            ]
                         kernels = (primitive_kernel,)
-                        inputs = triangle_inputs
+                        inputs = row_inputs
                         if self._heightfield_cylinder_split and primitive_index == 1:
                             kernels = self._heightfield_cylinder_split_kernels
                             inputs = [
-                                *triangle_inputs,
+                                *row_inputs,
                                 self._heightfield_cylinder_query_results,
                                 self._heightfield_cylinder_gjk_indices,
                                 self._heightfield_cylinder_gjk_count,

@@ -211,6 +211,12 @@ NEWTON_FLAGS = declare(
         "=1 splits terrain queries into typed per-primitive kernels; convex_collision may force it.",
     ),
     EnvironmentFlag(
+        "NEWTON_HEIGHTFIELD_ROW_GATE",
+        "policy",
+        _NARROW,
+        "=0 scans the whole terrain triangle stream in every typed row, even rows no current pair reaches (default 1).",
+    ),
+    EnvironmentFlag(
         "NEWTON_HEIGHTFIELD_WELD_FLAT_SEAMS",
         "experiment",
         ("geometry.heightfield_features",),
