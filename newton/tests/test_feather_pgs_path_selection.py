@@ -235,7 +235,9 @@ def _graph_and_reset_rollout(model, sparse, cached_dynamics, *, deterministic=Fa
 
 def _first_patch_step(model, cached_dynamics):
     """Step a fresh standing solver once, eagerly, and copy the poses and twists its release test reads."""
-    solver = _make_solver(model, False, cached_dynamics=cached_dynamics, mf_gs_incremental_rows=0)
+    # The caller compares the opt-in stage-3 snapshot of the predicted velocity.
+    with patch.dict(os.environ, {"FEATHER_PGS_DEBUG_SNAPSHOTS": "1"}):
+        solver = _make_solver(model, False, cached_dynamics=cached_dynamics, mf_gs_incremental_rows=0)
     state, output = model.state(), model.state()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     pipeline = newton.CollisionPipeline(model, convex_collision="ordinary", deterministic=True)

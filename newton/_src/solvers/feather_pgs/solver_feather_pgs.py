@@ -1198,6 +1198,15 @@ class SolverFeatherPGS(SolverBase):
     tangent changes by the new normal impulse. This feature is experimental
     and may change without notice.
 
+    The per-substep snapshots of the velocity predictor are off by default.
+    Set ``FEATHER_PGS_DEBUG_SNAPSHOTS=1`` before construction to keep, for
+    external NaN dumpers, the predictor's input joint velocity [m/s or rad/s],
+    unconstrained joint acceleration [m/s² or rad/s²] and predicted joint
+    velocity [m/s or rad/s] in ``_debug_stage3_qd_work``,
+    ``_debug_stage3_joint_qdd`` and ``_debug_stage3_v_hat``, each shaped like
+    ``joint_qd`` and copied on every substep. Unset, the three attributes are
+    ``None`` and no copy runs. Physics is the same either way.
+
     """
 
     # The default configuration is conformance-tested against body-pair-reduced
@@ -2350,6 +2359,9 @@ class SolverFeatherPGS(SolverBase):
         # The position/velocity split needs only v_out_snap. Full row snapshots
         # are diagnostics and can consume several GB in large batched models.
         self._debug_buffers_enabled = bool(pgs_debug)
+        # External NaN dumpers read the stage-3 snapshots; nothing in the solver
+        # does. They cost three copies per substep, so they are opt-in.
+        self._debug_stage3_snapshots = os.environ.get("FEATHER_PGS_DEBUG_SNAPSHOTS") == "1"
         self._pgs_convergence_log: list[np.ndarray] = []
         # Per-step, per-iteration NCP / MDP residual log for the matrix_free
         # debug path. Each entry is an ndarray of shape
@@ -3400,6 +3412,9 @@ class SolverFeatherPGS(SolverBase):
         declared names to their values, ``unknown`` lists undeclared names
         (recorded, not rejected), ``retired`` lists retired names whose value did
         not reject construction and ``isaac_lab`` is empty for this family.
+        ``routes.diagnostics`` records the diagnostics that add launches to a
+        step: ``stage3_snapshots`` is enabled when ``FEATHER_PGS_DEBUG_SNAPSHOTS=1``
+        allocated the stage-3 snapshots, which every substep then copies.
         Switches read at import keep the values present at import. The record is
         host-only, detached from solver state and JSON-compliant (non-finite
         floats are strings).
@@ -5888,12 +5903,18 @@ class SolverFeatherPGS(SolverBase):
             self._deferred_dense_qd_delta = None
             self._propagation_tau = None
             self._propagation_qd_delta = None
-            # The stage-3 snapshots stay unconditional (small: one dof-vector
-            # each): the rsl_rl NaN-anomaly dumper reads them in default
-            # configs, where _debug_buffers_enabled is False.
-            self._debug_stage3_qd_work = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
-            self._debug_stage3_joint_qdd = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
-            self._debug_stage3_v_hat = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
+            # Stage-3 snapshots for external NaN dumpers, which read them by
+            # these names: None unless FEATHER_PGS_DEBUG_SNAPSHOTS=1.
+            snapshot = self._debug_stage3_snapshots
+            self._debug_stage3_qd_work = (
+                wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad) if snapshot else None
+            )
+            self._debug_stage3_joint_qdd = (
+                wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad) if snapshot else None
+            )
+            self._debug_stage3_v_hat = (
+                wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad) if snapshot else None
+            )
             self._debug_position_v_out = (
                 wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
                 if self._debug_buffers_enabled
@@ -10645,9 +10666,10 @@ class SolverFeatherPGS(SolverBase):
                             self._stage3_trisolve_loop(size, state_aug)
                 self._stage3_compute_v_hat(state_in, state_aug, dt, stage3_qd)
                 self._clamp_rigid_velocity_limits(self.v_hat)
-            wp.copy(self._debug_stage3_qd_work, stage3_qd)
-            wp.copy(self._debug_stage3_joint_qdd, state_aug.joint_qdd)
-            wp.copy(self._debug_stage3_v_hat, self.v_hat)
+            if self._debug_stage3_snapshots:
+                wp.copy(self._debug_stage3_qd_work, stage3_qd)
+                wp.copy(self._debug_stage3_joint_qdd, state_aug.joint_qdd)
+                wp.copy(self._debug_stage3_v_hat, self.v_hat)
 
         # Wait for pipelined collide (if running on separate stream)
         if collide_done_event is not None:

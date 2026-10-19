@@ -146,6 +146,12 @@ FLAGS = declare(
         "Spin iterations launched at the start of each step to expose stream races (default 0).",
     ),
     _flag(
+        "FEATHER_PGS_DEBUG_SNAPSHOTS",
+        "diagnostic",
+        _SOLVER,
+        "=1 copies the stage-3 joint velocity, acceleration and predicted velocity every substep for NaN dumps.",
+    ),
+    _flag(
         "FEATHER_PGS_DENSE_ROW_BUDGETS",
         "policy",
         _SOLVER,

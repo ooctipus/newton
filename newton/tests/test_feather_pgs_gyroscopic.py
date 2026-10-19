@@ -3,7 +3,9 @@
 
 """Free rigid bodies must not gain energy from their gyroscopic bias."""
 
+import os
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -268,7 +270,9 @@ class TestFeatherPGSGyroscopic(unittest.TestCase):
         from newton._src.solvers.feather_pgs import kernels  # noqa: PLC0415
 
         model, state, output = _model("cpu", np.diag([0.001, 0.02, 0.0205]), (20.0, 4.0, 10.0))
-        solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
+        # The opt-in stage-3 snapshots hold the predictor's input velocity and acceleration.
+        with patch.dict(os.environ, {"FEATHER_PGS_DEBUG_SNAPSHOTS": "1"}):
+            solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0)
         dt = 1.0 / 240.0
         solver.step(state, output, model.control(), None, dt)
         qd = solver._debug_stage3_qd_work

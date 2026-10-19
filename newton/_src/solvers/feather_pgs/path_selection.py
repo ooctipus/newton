@@ -210,6 +210,7 @@ def route_selection(solver) -> dict:
         "free_rigid_bodies": _free_rigid_bodies(solver),
         "friction": _friction(solver),
         "dynamics": _dynamics(solver, source),
+        "diagnostics": _diagnostics(solver),
     }
 
 
@@ -963,3 +964,19 @@ def _dynamics(solver, source) -> dict:
         "loop_joints": bool(solver._has_loop_joints),
         "prescribed_response": bool(solver._has_prescribed_response),
     }
+
+
+def _diagnostics(solver) -> dict:
+    """Diagnostics that add launches to every step; none reads back into the physics."""
+    # Mirrors _allocate_common_buffers: a model without joints has no stage 3 to snapshot.
+    snapshots = solver._debug_stage3_qd_work is not None
+    if snapshots:
+        reason = (
+            "FEATHER_PGS_DEBUG_SNAPSHOTS=1: every substep copies the stage-3 joint velocity, acceleration and "
+            "predicted velocity into _debug_stage3_qd_work, _debug_stage3_joint_qdd and _debug_stage3_v_hat."
+        )
+    elif solver._debug_stage3_snapshots:
+        reason = "FEATHER_PGS_DEBUG_SNAPSHOTS=1, but the model has no joints to snapshot."
+    else:
+        reason = "Off: FEATHER_PGS_DEBUG_SNAPSHOTS=1 opts in to three stage-3 snapshot copies per substep."
+    return {"stage3_snapshots": {"enabled": snapshots, "reason": reason}}
