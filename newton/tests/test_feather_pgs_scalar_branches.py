@@ -6,7 +6,8 @@
 The CPU tests compare the scalar kernels, bound through ``ScalarBranchState``,
 with the head chain they replace, launched on the same inputs: the prismatic
 linear state route for prismatic leaves (bitwise) and ordinary dynamics for
-revolute leaves.
+revolute leaves. ``TestGripperContactBound`` checks the CUDA arm-key press
+bound on ordinary dynamics, the law both CUDA routes integrate.
 """
 
 import dataclasses
@@ -51,6 +52,14 @@ IMPULSE_BOUND = {"rtol": KEY_BOUND["rtol"], "atol": 1.0e-8}
 # the scalar route's own run-to-run spread. Their other term, twice the ordinary solver's distance
 # from a held law, measures this very move, so it cannot bound it.
 ARM_FLOOR = 1.0e-5
+# The arm-key press (_press_key_with_tip, _gripper_switch): float32 spacings of the contact's world
+# position that two float orders of the tip's and the key's poses may leave between two routes (one
+# per body and route), the fraction of the head route's iteration-budget error a route switch may
+# move the contact impulses by, and the sweeps of the converged reference (the CPU twin converges
+# by 256).
+GRIPPER_POSE_SPACINGS = 4
+GRIPPER_BUDGET_FRACTION = 0.1
+GRIPPER_REFERENCE_ITERATIONS = 512
 # Coordinates of the fixtures' arm. A star of as many leaves shares the arm's size group, which is
 # then not diagonal: the recipe refuses its prismatic linear state and no scalar plan exists.
 ARM_DOFS = 6
@@ -1442,6 +1451,140 @@ def _key_law(model, leaves, dofs, axes, q, qd, steps, push=None):
     return np.asarray(coordinates)
 
 
+def _press_key_with_tip(model, layout, solver, *, shift=0.0, steps=12):
+    """Press every world's fifth key with its arm's tip through a held contact while 2 N push the tip down.
+
+    ``shift`` raises the tip's contact witness along the contact normal [m]. Returns the contacts'
+    normal impulses [N·s] and the keys' coordinates [m] after every step (``steps x worlds``), the
+    normal rows' Delassus diagonal at the first step [1/kg] and the tips' largest world coordinate
+    at the start [m].
+    """
+    keys = layout.key_leaves.reshape(model.world_count, -1)[:, 4]
+    coordinates = layout.key_coordinates.reshape(model.world_count, -1)[:, 4]
+    pairs = [(int(tip), int(key)) for tip, key in zip(layout.arm_tips, keys, strict=True)]
+    states, control = [model.state(), model.state()], model.control()
+    contacts = newton.Contacts(len(pairs), 0, device=model.device)
+    newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+    install_held_contacts(model, states[0], contacts, pairs)
+    if shift:
+        # The tip's witness sits at the upright tip's origin, whose z axis is the contact normal's.
+        points = contacts.rigid_contact_point0.numpy()
+        points[: len(pairs), 2] += np.float32(shift)
+        contacts.rigid_contact_point0.assign(points)
+    extent = float(np.abs(states[0].body_q.numpy()[layout.arm_tips, :3]).max())
+    force = np.zeros((model.body_count, 6), dtype=np.float32)
+    force[layout.arm_tips, 2] = -2.0
+    impulses, travel, diagonal = [], [], None
+    for _step in range(steps):
+        current, following = states
+        current.body_f.assign(force)
+        solver.step(current, following, control, contacts, DT)
+        states = [following, current]
+        world, slot = solver.contact_world.numpy()[: len(pairs)], solver.contact_slot.numpy()[: len(pairs)]
+        if np.any(slot < 0):
+            raise AssertionError("Every held contact must own a row")
+        impulses.append(solver.impulses.numpy()[world, slot].astype(np.float64))
+        travel.append(following.joint_q.numpy()[coordinates].astype(np.float64))
+        if diagonal is None:
+            diagonal = solver.diag.numpy()[world, slot].astype(np.float64)
+    return {"impulses": np.asarray(impulses), "travel": np.asarray(travel), "diagonal": diagonal, "extent": extent}
+
+
+def _gripper_switch(head, other, reference, *, beta, dt):
+    """Measure a route switch in :func:`_press_key_with_tip` against the pose floor and the head's iteration budget.
+
+    Returns per world [N·s]: ``first``, the first step's impulse difference, and ``floor``,
+    ``GRIPPER_POSE_SPACINGS`` float32 spacings of the tips' largest coordinate through the contact's
+    position correction ``beta / (D dt)``; ``switch``, the largest difference over every step, and
+    ``bound``, ``GRIPPER_BUDGET_FRACTION`` of ``budget`` (the head's largest distance from the
+    converged ``reference``) plus the floor.
+    """
+    spacing = float(np.spacing(np.float32(head["extent"])))
+    floor = GRIPPER_POSE_SPACINGS * beta * spacing / (head["diagonal"] * dt)
+    budget = np.abs(head["impulses"] - reference["impulses"]).max(axis=0)
+    return {
+        "first": np.abs(other["impulses"][0] - head["impulses"][0]),
+        "floor": floor,
+        "switch": np.abs(other["impulses"] - head["impulses"]).max(axis=0),
+        "budget": budget,
+        "bound": GRIPPER_BUDGET_FRACTION * budget + floor,
+    }
+
+
+def _assert_gripper_switch(test, head, other, reference, *, beta, dt):
+    """Hold a route switch in :func:`_press_key_with_tip` to the head's response, pose, budget and travel bounds.
+
+    The normal rows' Delassus diagonal, the key's inverse mass along the normal, compares at the
+    keys' FMA bound; the impulses at :func:`_gripper_switch`'s bounds; the travel at 1e-3 relative.
+    """
+    for press in (head, other, reference):
+        test.assertTrue(np.all(np.isfinite(press["impulses"])) and np.all(np.isfinite(press["travel"])))
+    test.assertGreater(float(head["impulses"].max()), 0.0, "The tip must press the key")
+    np.testing.assert_allclose(other["diagonal"], head["diagonal"], rtol=KEY_BOUND["rtol"], err_msg="diagonal")
+    switch = _gripper_switch(head, other, reference, beta=beta, dt=dt)
+    test.assertTrue(
+        np.all(switch["first"] <= switch["floor"]),
+        f"first impulses differ by {switch['first']} N s, above the pose floor {switch['floor']} N s",
+    )
+    test.assertTrue(
+        np.all(switch["switch"] <= switch["bound"]),
+        f"impulses differ by {switch['switch']} N s, above {GRIPPER_BUDGET_FRACTION} of the iteration budget's "
+        f"error {switch['budget']} N s plus the pose floor",
+    )
+    np.testing.assert_allclose(other["travel"], head["travel"], rtol=1.0e-3, atol=1.0e-7)
+
+
+class TestGripperContactBound(unittest.TestCase):
+    """The arm-key press bound of the CUDA A/B on ordinary dynamics, the law both CUDA routes integrate."""
+
+    def _press(self, *, iterations=8, shift=0.0, defect=None):
+        """Press keys on CPU ordinary dynamics (split mode), optionally with a defect in the keys' response."""
+        model = build_branch_model(worlds=2, leaves=STAR_LEAVES, shapes=True)
+        layout = _Layout(model)
+        if defect == "double_stiffness":
+            # The keys' inverse mass counts the drive stiffness K = ke dt^2 + kd dt twice.
+            armature = model.joint_armature.numpy()
+            ke, kd = model.joint_target_ke.numpy(), model.joint_target_kd.numpy()
+            armature[layout.key_dofs] += ke[layout.key_dofs] * DT * DT + kd[layout.key_dofs] * DT
+            model.joint_armature.assign(armature)
+        elif defect == "no_drive":
+            for name in ("joint_target_ke", "joint_target_kd"):
+                values = getattr(model, name).numpy()
+                values[layout.key_dofs] = 0.0
+                getattr(model, name).assign(values)
+        model.rigid_contact_max = model.world_count
+        solver = recipe_solver(model, scalar=False, prismatic=False, pgs_mode="split", pgs_iterations=iterations)
+        return solver, _press_key_with_tip(model, layout, solver, shift=shift)
+
+    def test_bound_admits_float_order_and_refuses_defects(self):
+        """Admit a one-spacing displacement of the tip under the press bound and refuse defects in the keys' response.
+
+        Shifting the tip's contact witness by one float32 spacing of its largest coordinate along
+        the normal stands in for another float order of its pose: the first impulses move by the
+        contact's position-correction gain ``pgs_beta / (D dt)`` times the shift, within a factor of
+        two (the friction cone's coupling sets the factor), and every bound of
+        ``test_gripper_contact_matches_the_prismatic_route`` holds. An inverse mass that counts the
+        drive stiffness twice, or keys without drives, stand in for defects of the scalar family:
+        their contact rows' diagonal moves by tens of percent, their first impulses miss the pose
+        floor by more than tenfold, and the budget bound fails.
+        """
+        solver, head = self._press()
+        _, reference = self._press(iterations=GRIPPER_REFERENCE_ITERATIONS)
+        spacing = float(np.spacing(np.float32(head["extent"])))
+        _, shifted = self._press(shift=spacing)
+        gain = solver.pgs_beta / (head["diagonal"] * DT)
+        moved = head["impulses"][0] - shifted["impulses"][0]
+        self.assertTrue(np.all((moved >= 0.5 * gain * spacing) & (moved <= 2.0 * gain * spacing)), moved)
+        _assert_gripper_switch(self, head, shifted, reference, beta=solver.pgs_beta, dt=DT)
+        for defect in ("double_stiffness", "no_drive"):
+            with self.subTest(defect=defect):
+                _, broken = self._press(defect=defect)
+                self.assertTrue(np.all(np.abs(broken["diagonal"] / head["diagonal"] - 1.0) > 0.1), broken["diagonal"])
+                switch = _gripper_switch(head, broken, reference, beta=solver.pgs_beta, dt=DT)
+                self.assertTrue(np.all(switch["first"] > 10.0 * switch["floor"]), switch)
+                self.assertTrue(np.any(switch["switch"] > switch["bound"]), switch)
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "Scalar branches run on the CUDA held-tree owner")
 class TestScalarBranchOwner(unittest.TestCase):
     def _poison(self, solver, layout):
@@ -1856,45 +1999,51 @@ class TestScalarBranchOwner(unittest.TestCase):
             np.testing.assert_allclose(spring[index], expected, rtol=1.0e-4, atol=1.0e-7)
 
     def test_gripper_contact_matches_the_prismatic_route(self):
-        """Press a key with the arm's tip through a contact: key travel and impulses track the head route.
+        """Press a key with the arm's tip: travel and impulses stay within the head's pose and budget bounds.
 
-        The arm takes the held owner's float order, so the bound is relative
-        (1e-3) rather than the keys' FMA bound; a defect in the scalar family's
-        contact response would miss it by orders of magnitude.
+        The scalar route changes two float orders at once: the key's (scalar kernels, CPU-bitwise
+        with the prismatic linear state, within FMA contraction on CUDA) and the arm's (the held
+        owner instead of ordinary dynamics). Both integrate the same law, so the bound is what that
+        law leaves undetermined at the recipe's eight sweeps (``_assert_gripper_switch``):
+
+        - The contact response is determined: the normal row's Delassus diagonal ``D``, 29 1/kg and
+          the key's inverse mass along the normal alone (the upright arm's tip does not move along
+          the normal), matches the head's within the keys' FMA bound.
+        - The first step starts both routes from one state. They differ by the float order of the
+          tip's and the key's poses, about one float32 spacing of the contact's world position each,
+          which the contact's position correction turns into ``pgs_beta / (D dt)`` times that
+          displacement: 1.6 N s/m, 1e-7 N s per spacing of 0.5 m. The first impulses must agree
+          within the response to four spacings, the pose floor. Measured on CUDA: 6.8e-8 and
+          4.2e-8 N s, which a 3e-8 m shift of the tip's witness (one spacing of its 0.3 m height)
+          reproduces on the CPU twin (``TestGripperContactBound``: 6.9e-8 and 4.2e-8).
+        - Later steps inherit a friction history that eight sweeps leave unconverged: on the CPU
+          twin the loaded world's key slides at the friction cone for four steps and then sticks
+          1e-5 m deeper inside it, where the same head solver at ``GRIPPER_REFERENCE_ITERATIONS``
+          sweeps holds it in place at the cone, and its normal impulse ends about 10% (4.8e-4 N s)
+          short of that converged run. The history amplifies the first difference (CUDA: 9.4e-6
+          N s, 2% of that error; a one-spacing shift on the CPU twin: 0.3%). Every step's impulses
+          must agree within a tenth of the head's distance from the converged run plus the pose
+          floor, which also keeps the scalar route within the head's own distance from the
+          converged run, up to that tenth.
+        - The key's travel moves far less (under 7e-8 m for a one-spacing shift on the CPU twin,
+          against the budget's 1e-5 m) and keeps a 1e-3 relative bound.
+
+        A defect in the scalar family's response misses these by orders of magnitude: on the CPU
+        twin an inverse mass that counts the drive stiffness twice moves the diagonal by 29% and the
+        first impulses by 135 and 620 times the pose floor, and keys without drives carry no load.
         """
         device = wp.get_device("cuda:0")
         model = build_branch_model(device, worlds=2, leaves=STAR_LEAVES, shapes=True)
         layout = _Layout(model)
-        keys = layout.key_leaves.reshape(model.world_count, -1)[:, 4]
-        pairs = [(int(tip), int(key)) for tip, key in zip(layout.arm_tips, keys, strict=True)]
-        model.rigid_contact_max = len(pairs)
-        solvers = [recipe_solver(model, scalar=False), recipe_solver(model, scalar=True)]
-        self._assert_routes(*solvers)
-        states = [[model.state(), model.state()] for _ in solvers]
-        controls = [model.control() for _ in solvers]
-        contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]
-        for index, pair in enumerate(states):
-            newton.eval_fk(model, pair[0].joint_q, pair[0].joint_qd, pair[0])
-            install_held_contacts(model, pair[0], contacts[index], pairs)
-        coordinates = layout.key_coordinates.reshape(model.world_count, -1)[:, 4]
-        travel, impulses = [[], []], [[], []]
-        for _step in range(12):
-            force = np.zeros((model.body_count, 6), dtype=np.float32)
-            force[layout.arm_tips, 2] = -2.0
-            for index, solver in enumerate(solvers):
-                current, following = states[index]
-                current.body_f.assign(force)
-                solver.step(current, following, controls[index], contacts[index], DT)
-                states[index] = [following, current]
-                world, slot = solver.contact_world.numpy()[: len(pairs)], solver.contact_slot.numpy()[: len(pairs)]
-                self.assertTrue(np.all(slot >= 0))
-                impulses[index].append(solver.impulses.numpy()[world, slot].copy())
-                travel[index].append(following.joint_q.numpy()[coordinates].copy())
-        travel, impulses = np.asarray(travel), np.asarray(impulses)
-        self.assertTrue(np.all(np.isfinite(impulses)) and np.all(np.isfinite(travel)))
-        self.assertGreater(float(impulses[0].max()), 0.0, "The tip must press the key")
-        np.testing.assert_allclose(impulses[1], impulses[0], rtol=1.0e-3, atol=1.0e-7)
-        np.testing.assert_allclose(travel[1], travel[0], rtol=1.0e-3, atol=1.0e-7)
+        model.rigid_contact_max = model.world_count
+        head, scalar = recipe_solver(model, scalar=False), recipe_solver(model, scalar=True)
+        self._assert_routes(head, scalar)
+        # The head route converged: the same solver with many more sweeps.
+        reference = recipe_solver(model, scalar=False, pgs_iterations=GRIPPER_REFERENCE_ITERATIONS)
+        self.assertIsNone(reference._tree_kinetic_state)
+        self.assertTrue(reference._prismatic_linear_state)
+        presses = [_press_key_with_tip(model, layout, solver) for solver in (head, scalar, reference)]
+        _assert_gripper_switch(self, *presses, beta=head.pgs_beta, dt=DT)
 
     def test_mixed_leaves_follow_ordinary_dynamics(self):
         """Own a star of prismatic and revolute leaves end to end and track ordinary dynamics.
