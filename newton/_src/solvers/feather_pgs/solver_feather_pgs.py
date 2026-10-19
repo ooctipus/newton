@@ -1999,8 +1999,6 @@ class SolverFeatherPGS(SolverBase):
                 enable_joint_limits=enable_joint_limits,
             )
         )
-        for message in ignored_choices.values():
-            warnings.warn(message, UserWarning, stacklevel=_CONSTRUCTOR_CALLER)
         cholesky_kernel = kernel_choices["cholesky_kernel"]
         trisolve_kernel = kernel_choices["trisolve_kernel"]
         hinv_jt_kernel = kernel_choices["hinv_jt_kernel"]
@@ -2023,8 +2021,7 @@ class SolverFeatherPGS(SolverBase):
         self._friction_anchor_beta_source = "argument"
         if friction_anchor_beta is None:
             # An explicit point algorithm remains a valid way to select point
-            # friction, also as a pgs_kernel request that matrix-free mode
-            # ignores. The ordinary constructor enables persistent patches.
+            # friction. The ordinary constructor enables persistent patches.
             if contact_compliance:
                 friction_anchor_beta = 0.0
                 self._friction_anchor_beta_source = "default_compliance"
@@ -2035,10 +2032,7 @@ class SolverFeatherPGS(SolverBase):
                     UserWarning,
                     stacklevel=_CONSTRUCTOR_CALLER,
                 )
-            elif friction_mode != "current" or self._requested_kernel_choices["pgs_kernel"] in (
-                "tiled_contact",
-                "streaming",
-            ):
+            elif friction_mode != "current" or effective_pgs_kernel in ("tiled_contact", "streaming"):
                 friction_anchor_beta = 0.0
                 self._friction_anchor_beta_source = "default_point_solver"
                 warnings.warn(
@@ -2048,9 +2042,26 @@ class SolverFeatherPGS(SolverBase):
                     UserWarning,
                     stacklevel=_CONSTRUCTOR_CALLER,
                 )
+            elif "pgs_kernel" in ignored_choices and self._requested_kernel_choices["pgs_kernel"] in (
+                "tiled_contact",
+                "streaming",
+            ):
+                # Matrix-free mode runs no point-contact kernel, yet the request
+                # still selects point friction, as it did before such requests
+                # raised. Omitting it alone selects patch friction, so its
+                # warning says how to keep point friction.
+                friction_anchor_beta = 0.0
+                self._friction_anchor_beta_source = "default_point_kernel_request"
+                ignored_choices["pgs_kernel"] += (
+                    " Because friction_anchor_beta is omitted, this point-contact request still selects "
+                    "velocity-only point friction. Omitting pgs_kernel alone selects the default patch friction; "
+                    "also pass friction_anchor_beta=0 to keep point friction."
+                )
             else:
                 friction_anchor_beta = 0.2
                 self._friction_anchor_beta_source = "default"
+        for message in ignored_choices.values():
+            warnings.warn(message, UserWarning, stacklevel=_CONSTRUCTOR_CALLER)
         self.friction_anchor_beta = float(friction_anchor_beta)
         if not np.isfinite(self.friction_anchor_beta) or self.friction_anchor_beta < 0.0:
             raise ValueError("friction_anchor_beta must be finite and non-negative")

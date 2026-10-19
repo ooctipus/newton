@@ -31,7 +31,14 @@ _APPLIED_ATTRIBUTES = {
 
 _BETA_REASONS = {
     "default": "friction_anchor_beta omitted: persistent patch friction at the 0.2 default.",
-    "default_point_solver": "friction_anchor_beta omitted with a point-contact solver: point friction.",
+    "default_point_solver": (
+        "friction_anchor_beta omitted with a point-contact solver (a coupled friction_mode or a contact-only split"
+        " pgs_kernel): point friction."
+    ),
+    "default_point_kernel_request": (
+        "friction_anchor_beta omitted with a contact-only pgs_kernel request, which matrix_free mode ignores:"
+        " point friction."
+    ),
     "default_compliance": "friction_anchor_beta omitted with contact_compliance: point friction.",
     "argument": "friction_anchor_beta passed explicitly.",
 }

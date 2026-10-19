@@ -11,6 +11,7 @@ import os
 import types
 import unittest
 import warnings
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -18,7 +19,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import friction_patches, keyed_rows, path_selection
+from newton._src.solvers.feather_pgs import environment_flags, friction_patches, keyed_rows, path_selection
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.configuration import resolve_kernel_choices
 from newton._src.solvers.feather_pgs.contact_row_plan import BUILDER_METHODS, contact_row_plan
@@ -70,6 +71,15 @@ def _cpu_model():
     body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
     builder.add_articulation([builder.add_joint_revolute(-1, body)])
     return builder.finalize(device="cpu")
+
+
+@contextmanager
+def _without_solver_environment():
+    """Remove every FEATHER_PGS_ and IL_NEWTON_FPGS_ variable, so construction warns only about its arguments."""
+    with patch.dict(os.environ):
+        for name in [name for name in os.environ if name.startswith(environment_flags.PREFIXES)]:
+            del os.environ[name]
+        yield
 
 
 def _cpu_free_body_model(velocity_limit=None):
@@ -1743,6 +1753,83 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 resolve_kernel_choices(
                     {**auto, **choice}, {}, is_cpu=is_cpu, pgs_mode=mode, enable_joint_limits=joint_limits
                 )
+
+    def test_ignored_contact_kernel_request_warns_that_it_selects_point_friction(self):
+        """Name point friction in the ignore warning of a contact-only matrix-free request when beta is omitted.
+
+        CPU construction stops at the matrix-free device check, after both friction and kernel choices
+        have warned. A contact-only request (tiled_contact, streaming) still selects point friction
+        while friction_anchor_beta is omitted, so its warning must say how to keep that law once the
+        request is dropped. Other requests, an explicit beta and a coupled friction_mode, which is a
+        point-contact solver of its own, leave the request without that effect.
+        """
+        model = _cpu_model()
+        selects_point_friction = "this point-contact request still selects velocity-only point friction"
+        point_solver = "The selected point-contact solver uses velocity-only friction."
+        for kwargs, kernel_clause, solver_warning in (
+            ({"pgs_kernel": "tiled_contact"}, True, False),
+            ({"pgs_kernel": "streaming"}, True, False),
+            ({"pgs_kernel": "loop"}, False, False),
+            ({"pgs_kernel": "tiled_row"}, False, False),
+            ({"pgs_kernel": "tiled_contact", "friction_anchor_beta": 0.0}, False, False),
+            ({"pgs_kernel": "streaming", "friction_anchor_beta": 0.2}, False, False),
+            ({"pgs_kernel": "tiled_contact", "friction_mode": "bisection"}, False, True),
+        ):
+            with self.subTest(**kwargs):
+                with _without_solver_environment(), warnings.catch_warnings(record=True) as recorded:
+                    warnings.simplefilter("always")
+                    with self.assertRaisesRegex(NotImplementedError, "pgs_mode='matrix_free' requires CUDA"):
+                        SolverFeatherPGS(model, pgs_mode="matrix_free", **kwargs)
+                messages = [str(item.message) for item in recorded]
+                ignored = [item for item in recorded if "is ignored in matrix_free mode" in str(item.message)]
+                self.assertEqual(len(ignored), 1, messages)
+                self.assertTrue(
+                    str(ignored[0].message).startswith(f"pgs_kernel={kwargs['pgs_kernel']!r} is ignored"), messages
+                )
+                self.assertEqual(os.path.basename(ignored[0].filename), os.path.basename(__file__))
+                self.assertEqual(selects_point_friction in str(ignored[0].message), kernel_clause, messages)
+                if kernel_clause:
+                    self.assertIn("also pass friction_anchor_beta=0 to keep point friction", str(ignored[0].message))
+                self.assertEqual(any(point_solver in message for message in messages), solver_warning, messages)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Matrix-free mode requires CUDA")
+    def test_ignored_contact_kernel_request_selects_point_friction(self):
+        """Build the automatic point-friction solver for a contact-only matrix-free request with beta omitted.
+
+        The request runs no kernel but still selects point friction, so the solver must equal the
+        automatic one with friction_anchor_beta=0 apart from the friction record, which names the
+        ignored request as the source. A loop or tiled_row request leaves the default patch friction.
+        """
+        builder = newton.ModelBuilder()
+        body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        builder.add_articulation([builder.add_joint_revolute(-1, body)])
+        model = builder.finalize(device="cuda:0")
+        point = SolverFeatherPGS(model, pgs_mode="matrix_free", friction_anchor_beta=0.0).get_path_selection()
+        default = SolverFeatherPGS(model, pgs_mode="matrix_free").get_path_selection()
+        for kernel, reference, source in (
+            ("tiled_contact", point, "default_point_kernel_request"),
+            ("streaming", point, "default_point_kernel_request"),
+            ("loop", default, "default"),
+            ("tiled_row", default, "default"),
+        ):
+            with self.subTest(pgs_kernel=kernel):
+                with self.assertWarnsRegex(UserWarning, f"pgs_kernel='{kernel}' is ignored in matrix_free mode"):
+                    solver = SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_kernel=kernel)
+                self.assertEqual(solver.pgs_kernel, "tiled_row")
+                self.assertEqual(solver.friction_anchor_beta, reference["routes"]["friction"]["friction_anchor_beta"])
+                selected = solver.get_path_selection()
+                friction = selected["routes"].pop("friction")
+                expected = reference["routes"]["friction"]
+                self.assertEqual(friction["anchor_beta_source"], source)
+                if source == "default_point_kernel_request":
+                    self.assertIn("matrix_free mode ignores", friction["reason"])
+                self.assertEqual(
+                    {**friction, "anchor_beta_source": None, "reason": None},
+                    {**expected, "anchor_beta_source": None, "reason": None},
+                )
+                self.assertEqual(selected["routes"], {k: v for k, v in reference["routes"].items() if k != "friction"})
+                for key in ("kernel_plan_by_dof", "pgs_kernel", "sparse_mass_matrix", "cached_dynamics"):
+                    self.assertEqual(selected[key], reference[key], key)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Matrix-free mode requires CUDA")
     def test_matrix_free_ignores_an_explicit_pgs_kernel(self):
