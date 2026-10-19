@@ -160,17 +160,22 @@ class TestTreePhysicalCPU(unittest.TestCase):
 
 class TestTreePhysicalCUDA(TestTreePhysicalCPU):
     def test_default_admission_and_motion_velocity(self):
-        """Select native trees and their explicit prescaled-velocity contract."""
+        """Select native trees, their default chain scan and the prescaled-velocity contract."""
         if not wp.get_cuda_devices():
             self.skipTest("No leased CUDA device")
         with patch.dict(os.environ):
             os.environ.pop("FEATHER_PGS_TREE_KINETIC_STATE", None)
             os.environ.pop("FEATHER_PGS_TREE_CHAIN_SCAN", None)
-            os.environ["FEATHER_PGS_TREE_CHAIN_SCAN"] = "0"
             case = split._case(True, floating=True, branches=3, depth=2, device="cuda:0")
             self.assertIsNotNone(case[1]._tree_kinetic_state)
             self.assertTrue(case[1]._tree_kinetic_state.chain_scan)
             self.assertEqual(case[1]._tree_kinetic_state.block_dim, 32)
+            # The flag opts out of the chain scan, not of the native tree.
+            os.environ["FEATHER_PGS_TREE_CHAIN_SCAN"] = "0"
+            unscanned = split._solver(case[0], True)
+            self.assertIsNotNone(unscanned._tree_kinetic_state)
+            self.assertFalse(unscanned._tree_kinetic_state.chain_scan)
+            del os.environ["FEATHER_PGS_TREE_CHAIN_SCAN"]
             ordinary = split._solver(
                 case[0], True, pgs_mode="matrix_free", pgs_kernel="auto", enable_joint_velocity_limits=True
             )
