@@ -3,11 +3,12 @@
 
 """Hold the sparse-diagonal contact schedules to the serial walks that define them.
 
-The builders link each coordinate's scalar contact units in row order and list
-the remaining units serially. Two serial walks over a world's rows define these
-outputs; lane 0 ran them before the warp built the schedules in parallel. The
-tests compare every output of the builders, bitwise, with a transliteration of
-those walks, on synthetic worlds and on the rows the solver produces.
+The builders link each coordinate's scalar contacts (patch units or point
+triples) in row order and list the remaining contacts serially. Two serial
+walks over a world's rows define these outputs; lane 0 ran them before the warp
+built the schedules in parallel. The tests compare every output of the
+builders, bitwise, with a transliteration of those walks, on synthetic worlds
+and on the rows the solver produces.
 """
 
 import unittest
@@ -18,8 +19,16 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
-from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
-from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_build_independent_sparse_contact_groups_kernel
+from newton._src.solvers.feather_pgs.kernels import (
+    PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_COUNT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
+    PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+)
+from newton._src.solvers.feather_pgs.solver_feather_pgs import (
+    _get_build_independent_sparse_contact_groups_kernel,
+    _get_mark_independent_sparse_contact_candidates_kernel,
+)
 from newton.tests.test_feather_pgs_compact_contact import build_solver_fixture, install_patch_contacts
 from newton.tests.test_feather_pgs_response_diagonal import _mark_patch_units, _patch_unit_cases, _unit_schedule_oracle
 
@@ -27,6 +36,44 @@ _FRICTION = PGS_CONSTRAINT_TYPE_FRICTION
 # Initial content of every output, so that entries a builder must not write are checked too.
 _UNWRITTEN = -7
 _OUTPUTS = ("sparse_row_dof", "group_count", "group_heads", "serial_count", "serial")
+# (capacity, coordinates) of the synthetic twins: the pinned shape, rows across several chunks of
+# 32 with a capacity off the chunk and triple grids, a single coordinate, and the keyboard's 114.
+_UNIT_SHAPES = ((64, 10), (97, 33), (40, 1), (130, 114))
+_TRIPLE_SHAPES = ((64, 10), (98, 33), (40, 1), (300, 114))
+
+
+def _reserve(links, world, heads_of_contacts, dofs):
+    """Return the coordinates' chain heads after reserving those of coupled contacts (``-2``)."""
+    heads = np.full(dofs, -1)
+    for head in heads_of_contacts:
+        coords = links[world, head]
+        if not np.any(coords < -1):
+            heads[coords[coords >= 0]] = -2
+    return heads
+
+
+def _prepend(links, heads, world, head):
+    """Prepend a scalar contact to its coordinate's chain unless a coupled contact reserved it."""
+    coord_0, coord_1 = (int(value) for value in links[world, head])
+    if coord_0 < -1 or coord_1 < -1:
+        coordinate = coord_0 if coord_0 >= 0 else coord_1
+        if heads[coordinate] != -2:
+            following = int(heads[coordinate])
+            links[world, head, 0 if coord_0 < 0 else 1] = -(following + 3) if following >= 0 else -2
+            heads[coordinate] = head
+        else:
+            links[world, head, 0 if coord_0 < -1 else 1] = -1
+
+
+def _finish(out, world, heads, serial):
+    """Store the chain heads compacted by coordinate and, when listed, the serial contacts."""
+    chained = heads[heads >= 0]
+    out["group_heads"][world, : len(chained)] = chained
+    out["group_heads"][world, len(chained) :] = heads[len(chained) :]
+    out["group_count"][world] = len(chained)
+    if serial is not None:
+        out["serial"][world, : len(serial)] = serial
+        out["serial_count"][world] = len(serial)
 
 
 def _serial_unit_walks(rows, *, serial_contacts):
@@ -42,43 +89,48 @@ def _serial_unit_walks(rows, *, serial_contacts):
     """
     out = {name: rows[name].copy() for name in _OUTPUTS}
     links = out["sparse_row_dof"]
-    dofs = out["group_heads"].shape[1]
     for w in range(rows["row_count"].shape[0]):
         start, end = int(rows["bounds"][w, 1]), int(rows["row_count"][w])
         row_type, parent = rows["row_type"][w], rows["row_parent"][w]
-        heads = np.full(dofs, -1)
-        for row in range(start, end):
-            coords = links[w, row]
-            if row_type[row] != _FRICTION and not np.any(coords < -1):
-                heads[coords[coords >= 0]] = -2
+        heads = _reserve(
+            links, w, [row for row in range(start, end) if row_type[row] != _FRICTION], len(out["group_heads"][w])
+        )
         row = end - 1
         while row >= start:
             head = row
             if row_type[row] == _FRICTION and start <= parent[row] < row:
                 head = int(parent[row])
-            coord_0, coord_1 = (int(value) for value in links[w, head])
-            if coord_0 < -1 or coord_1 < -1:
-                coordinate = coord_0 if coord_0 >= 0 else coord_1
-                if heads[coordinate] != -2:
-                    following = int(heads[coordinate])
-                    links[w, head, 0 if coord_0 < 0 else 1] = -(following + 3) if following >= 0 else -2
-                    heads[coordinate] = head
-                else:
-                    links[w, head, 0 if coord_0 < -1 else 1] = -1
+            _prepend(links, heads, w, head)
             row = head - 1
+        serial = None
         if serial_contacts:
-            count, head = 0, start
+            serial, head = [], start
             while head < end:
                 if not np.any(links[w, head] < -1):
-                    out["serial"][w, count] = head
-                    count += 1
+                    serial.append(head)
                 owns_tangents = head + 2 < end and row_type[head + 1] == _FRICTION and parent[head + 1] == head
                 head += 3 if owns_tangents else 1
-            out["serial_count"][w] = count
-        chained = heads[heads >= 0]
-        out["group_heads"][w, : len(chained)] = chained
-        out["group_heads"][w, len(chained) :] = heads[len(chained) :]
-        out["group_count"][w] = len(chained)
+        _finish(out, w, heads, serial)
+    return out
+
+
+def _serial_triple_walks(rows, *, serial_contacts):
+    """Return every output of the serial walks over point contact triples.
+
+    The walks visit the segment's whole triples, at every third row from its start:
+    reserve the coordinates of coupled triples, prepend the scalar triples to their
+    coordinates' chains from the last, list the remaining triples from the first, and
+    compact the chain heads by coordinate.
+    """
+    out = {name: rows[name].copy() for name in _OUTPUTS}
+    links = out["sparse_row_dof"]
+    for w in range(rows["row_count"].shape[0]):
+        normals = range(int(rows["bounds"][w, 1]), int(rows["row_count"][w]) - 2, 3)
+        heads = _reserve(links, w, normals, len(out["group_heads"][w]))
+        for normal in reversed(normals):
+            _prepend(links, heads, w, normal)
+        serial = [normal for normal in normals if not np.any(links[w, normal] < -1)] if serial_contacts else None
+        _finish(out, w, heads, serial)
     return out
 
 
@@ -99,6 +151,37 @@ def _rows_form_units(rows, world):
     return True
 
 
+def _empty_rows(worlds, capacity, dofs, serial_capacity):
+    """Rows of empty contact segments, with every output at its unwritten value."""
+    return {
+        "row_count": np.zeros(worlds, np.int32),
+        "bounds": np.zeros((worlds, 2), np.int32),
+        # Rows outside the segments hold a type no row family uses.
+        "row_type": np.full((worlds, capacity), PGS_CONSTRAINT_TYPE_COUNT, np.int32),
+        "row_parent": np.full((worlds, capacity), -1, np.int32),
+        "sparse_row_dof": np.full((worlds, capacity, 2), -1, np.int32),
+        "group_count": np.full(worlds, _UNWRITTEN, np.int32),
+        "group_heads": np.full((worlds, dofs), _UNWRITTEN, np.int32),
+        "serial_count": np.full(worlds, _UNWRITTEN, np.int32),
+        "serial": np.full((worlds, serial_capacity), _UNWRITTEN, np.int32),
+    }
+
+
+def _mark(rng, rows, world, row, coordinate, dofs, *, scalar):
+    """Write a contact row's sparse coordinates as the marker leaves them.
+
+    A scalar contact names one coordinate and marks the other slot ``-2``; otherwise the row is coupled
+    to a second coordinate or to the dense articulation, or has no sparse coordinate.
+    """
+    draw = rng.random()
+    if scalar or draw < 0.65:
+        slot = int(rng.integers(0, 2))
+        rows["sparse_row_dof"][world, row, slot] = coordinate
+        rows["sparse_row_dof"][world, row, 1 - slot] = -2
+    elif draw < 0.85:
+        rows["sparse_row_dof"][world, row] = (coordinate, int(rng.integers(-1, dofs)))
+
+
 def _unit_worlds(seed, *, worlds, capacity, dofs):
     """Rows of patch contact units, marked as the unit marker leaves them, in layouts that cover the builder.
 
@@ -110,22 +193,12 @@ def _unit_worlds(seed, *, worlds, capacity, dofs):
     tangent row follows a unit, or the segment ends after a unit's first tangent row.
     """
     rng = np.random.default_rng(seed)
-    rows = {
-        "row_count": np.zeros(worlds, np.int32),
-        "bounds": np.zeros((worlds, 2), np.int32),
-        "row_type": np.full((worlds, capacity), 7, np.int32),
-        "row_parent": np.full((worlds, capacity), -1, np.int32),
-        "sparse_row_dof": np.full((worlds, capacity, 2), -1, np.int32),
-        "group_count": np.full(worlds, _UNWRITTEN, np.int32),
-        "group_heads": np.full((worlds, dofs), _UNWRITTEN, np.int32),
-        "serial_count": np.full(worlds, _UNWRITTEN, np.int32),
-        "serial": np.full((worlds, capacity), _UNWRITTEN, np.int32),
-    }
+    rows = _empty_rows(worlds, capacity, dofs, capacity)
     layouts = ("random", "random", "chain", "spread", "full", "empty", "inverted", "broken", "broken")
     for w in range(worlds):
         layout = layouts[w % len(layouts)]
         start = 0 if layout in ("chain", "spread", "full") else int(rng.integers(1, 4))
-        rows["row_type"][w, :start] = 3
+        rows["row_type"][w, :start] = PGS_CONSTRAINT_TYPE_JOINT_LIMIT
         hot = rng.integers(0, dofs, size=3)
         row = start
         while layout not in ("empty", "inverted") and row < capacity:
@@ -142,15 +215,8 @@ def _unit_worlds(seed, *, worlds, capacity, dofs):
             rows["row_type"][w, row + 1 : row + count] = _FRICTION
             rows["row_parent"][w, row + 1 : row + count] = row
             coordinate = {"chain": 0, "spread": (7 * row) % dofs}.get(layout, int(rng.choice(hot)))
-            draw = rng.random()
-            if draw < 0.65 or layout in ("chain", "spread", "full"):
-                slot = int(rng.integers(0, 2))
-                rows["sparse_row_dof"][w, row, slot] = coordinate
-                rows["sparse_row_dof"][w, row, 1 - slot] = -2
-            elif draw < 0.85:
-                rows["sparse_row_dof"][w, row] = (coordinate, int(rng.integers(-1, dofs)))
-            for tangent in range(row + 1, row + count):
-                rows["sparse_row_dof"][w, tangent, 0] = coordinate
+            _mark(rng, rows, w, row, coordinate, dofs, scalar=layout in ("chain", "spread", "full"))
+            rows["sparse_row_dof"][w, row + 1 : row + count, 0] = coordinate
             row += count
         end = start - 1 if layout == "inverted" else row
         if layout == "broken":
@@ -185,18 +251,51 @@ def _unit_worlds(seed, *, worlds, capacity, dofs):
     return rows
 
 
-def _launch_unit_builder(rows, device, *, serial_contacts):
-    """Run the unit builder over the rows; return every output."""
+def _triple_worlds(seed, *, worlds, capacity, dofs):
+    """Rows of point contact triples, marked as the triple marker leaves them.
+
+    Worlds draw one layout each: random triples on few coordinates (long chains, reserved coordinates and
+    rows without a sparse coordinate), triples of one coordinate or spread over every coordinate up to the
+    capacity, segments that end one or two rows into a marked triple, and empty and inverted segments.
+    """
+    rng = np.random.default_rng(seed)
+    rows = _empty_rows(worlds, capacity, dofs, (capacity + 2) // 3)
+    layouts = ("random", "random", "chain", "spread", "partial", "empty", "inverted")
+    for w in range(worlds):
+        layout = layouts[w % len(layouts)]
+        start = 0 if layout in ("chain", "spread") else int(rng.integers(1, 4))
+        hot = rng.integers(0, dofs, size=3)
+        triples = (
+            (capacity - start) // 3 if layout in ("chain", "spread") else int(rng.integers(0, (capacity - start) // 3))
+        )
+        for normal in range(start, start + 3 * triples + (3 if layout == "partial" else 0), 3):
+            if normal + 3 > capacity:
+                break
+            coordinate = {"chain": 0, "spread": (7 * normal) % dofs}.get(layout, int(rng.choice(hot)))
+            _mark(rng, rows, w, normal, coordinate, dofs, scalar=layout in ("chain", "spread", "partial"))
+            rows["sparse_row_dof"][w, normal + 1 : normal + 3, 0] = coordinate
+        end = {"empty": start, "inverted": start - 1}.get(layout, start + 3 * triples)
+        if layout == "partial":
+            end = min(end + int(rng.integers(1, 3)), capacity)
+        elif layout in ("chain", "spread"):
+            end = capacity
+        rows["bounds"][w, 1] = start
+        rows["row_count"][w] = end
+    return rows
+
+
+def _launch_builder(rows, device, *, units, serial_contacts):
+    """Run a schedule builder over the rows; return every output."""
     worlds, capacity = rows["row_type"].shape
-    dofs = rows["group_heads"].shape[1]
     kernel = _get_build_independent_sparse_contact_groups_kernel(
-        capacity, dofs, str(device.arch), build_serial_contacts=serial_contacts, units=True
+        capacity, rows["group_heads"].shape[1], str(device.arch), build_serial_contacts=serial_contacts, units=units
     )
     arrays = {name: wp.array(rows[name], dtype=wp.int32, device=device) for name in rows}
+    unit_rows = [arrays["row_type"], arrays["row_parent"]] if units else []
     wp.launch(
         kernel,
         dim=worlds * 32,
-        inputs=[arrays["row_count"], arrays["bounds"], arrays["row_type"], arrays["row_parent"]],
+        inputs=[arrays["row_count"], arrays["bounds"], *unit_rows],
         outputs=[arrays[name] for name in _OUTPUTS],
         device=device,
     )
@@ -208,9 +307,50 @@ def _assert_outputs_equal(actual, expected, label):
         np.testing.assert_array_equal(actual[name], expected[name], err_msg=f"{label}: {name}")
 
 
+def _record_schedules(model, device, *, anchors, compact, steps=6):
+    """Step a solver over the patch fixture's contacts; return each schedule build's rows before and outputs after."""
+    with (
+        mock.patch.object(solver_module, "_COMPACT_CONTACT_BOUNDARY", compact),
+        mock.patch.object(solver_module, "_SPARSE_CONTACT_DIRECT", True),
+    ):
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            pgs_mode="matrix_free",
+            pgs_iterations=8,
+            use_parallel_streams=True,
+            enable_joint_limits=True,
+            dense_max_constraints=64,
+            mf_max_constraints=64,
+            **({} if anchors else {"friction_anchor_beta": 0.0}),
+        )
+    names = ("row_count", "bounds", *(("row_type", "row_parent") if anchors else ()), *_OUTPUTS)
+    records = []
+    launch = wp.launch
+
+    def recording_launch(kernel, *args, **kwargs):
+        if kernel is not solver._build_independent_sparse_contact_groups_kernel:
+            return launch(kernel, *args, **kwargs)
+        arrays = dict(zip(names, (*kwargs["inputs"], *kwargs["outputs"]), strict=True))
+        before = {name: array.numpy().copy() for name, array in arrays.items()}
+        result = launch(kernel, *args, **kwargs)
+        records.append((before, {name: arrays[name].numpy().copy() for name in _OUTPUTS}))
+        return result
+
+    states = [model.state(), model.state()]
+    control = model.control()
+    contacts = newton.Contacts(model.rigid_contact_max, 0, device=device)
+    newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+    install_patch_contacts(model, states[0], contacts)
+    with mock.patch.object(wp, "launch", recording_launch):
+        for _ in range(steps):
+            solver.step(states[0], states[1], control, contacts, 1 / 240)
+            states.reverse()
+    return solver, records
+
+
 class TestFeatherPGSContactSchedule(unittest.TestCase):
     def test_serial_unit_walks_match_the_unit_oracle(self):
-        """Reproduce the unit schedule oracle with the serial walks the builder must equal."""
+        """Reproduce the unit schedule oracle with the serial walks the unit builder must equal."""
         device = wp.get_device("cpu")
         for (dense, seed, capacity), rows in _patch_unit_cases():
             with self.subTest(dense=dense, seed=seed, capacity=capacity):
@@ -218,15 +358,12 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
                 expected = _unit_schedule_oracle(rows, marked)
                 worlds, dofs = rows["worlds"], rows["dofs"]
                 inputs = {
+                    **_empty_rows(worlds, capacity, dofs, capacity),
                     "row_count": rows["row_count"],
                     "bounds": rows["bounds"],
                     "row_type": rows["row_type"],
                     "row_parent": rows["row_parent"],
                     "sparse_row_dof": marked,
-                    "group_count": np.zeros(worlds, np.int32),
-                    "group_heads": np.full((worlds, dofs), _UNWRITTEN, np.int32),
-                    "serial_count": np.zeros(worlds, np.int32),
-                    "serial": np.full((worlds, capacity), _UNWRITTEN, np.int32),
                 }
                 walks = _serial_unit_walks(inputs, serial_contacts=True)
                 np.testing.assert_array_equal(walks["sparse_row_dof"], expected["sparse_row_dof"])
@@ -241,8 +378,64 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
                     self.assertEqual(int(walks["serial_count"][world]), len(heads))
                     np.testing.assert_array_equal(walks["serial"][world, : len(heads)], heads)
 
-    def test_unit_worlds_cover_both_builder_paths(self):
-        """Draw unit layouts the builder takes in parallel and layouts it leaves to the serial walks."""
+    def test_serial_triple_walks_keep_coupled_coordinates_serial(self):
+        """Chain scalar triples by coordinate and keep those on a coupled triple's coordinate serial.
+
+        Triples at rows 0 and 9 touch coordinate 2, those at rows 3 and 6 coordinate 3, and the triple
+        at row 3 also touches the dense articulation. The marker leaves the others scalar.
+        """
+        device = wp.get_device("cpu")
+        rows = _empty_rows(1, 12, 4, 4)
+        rows["row_count"][0] = 12
+        for normal, coordinate in ((0, 2), (3, 3), (6, 3), (9, 2)):
+            rows["sparse_row_dof"][0, normal : normal + 3, 0] = coordinate
+        marked = wp.array(rows["sparse_row_dof"], device=device)
+        wp.launch(
+            _get_mark_independent_sparse_contact_candidates_kernel(108, "cpu"),
+            dim=4,
+            inputs=[
+                wp.array((4,), dtype=wp.int32, device=device),
+                4,
+                wp.zeros(4, dtype=wp.int32, device=device),
+                wp.array((0, 3, 6, 9), dtype=wp.int32, device=device),
+                wp.zeros(4, dtype=wp.int32, device=device),
+                wp.array((-1, 1, -1, -1), dtype=wp.int32, device=device),
+                wp.zeros(4, dtype=wp.int32, device=device),
+                wp.full(4, 3, dtype=wp.int32, device=device),
+                wp.array((108, 6), dtype=wp.int32, device=device),
+            ],
+            outputs=[marked],
+            device=device,
+        )
+        walks = _serial_triple_walks({**rows, "sparse_row_dof": marked.numpy()}, serial_contacts=True)
+        self.assertEqual(int(walks["group_count"][0]), 1)
+        self.assertEqual(int(walks["group_heads"][0, 0]), 0)
+        self.assertEqual(int(walks["serial_count"][0]), 2)
+        np.testing.assert_array_equal(walks["serial"][0, :2], (3, 6))
+        np.testing.assert_array_equal(walks["sparse_row_dof"][0, ::3, 1], (-12, -1, -1, -2))
+
+    def test_serial_walks_agree_on_three_row_units(self):
+        """Schedule contacts of three rows each alike with the unit and the triple walks."""
+        rows = _triple_worlds(3, worlds=70, capacity=98, dofs=33)
+        for w in range(70):
+            start, end = int(rows["bounds"][w, 1]), int(rows["row_count"][w])
+            if end > start:
+                rows["row_count"][w] = end = start + 3 * ((end - start) // 3)
+            for normal in range(start, end - 2, 3):
+                rows["row_type"][w, normal] = PGS_CONSTRAINT_TYPE_CONTACT
+                rows["row_type"][w, normal + 1 : normal + 3] = _FRICTION
+                rows["row_parent"][w, normal : normal + 3] = normal
+        units = _serial_unit_walks({**rows, "serial": np.full((70, 98), _UNWRITTEN, np.int32)}, serial_contacts=True)
+        triples = _serial_triple_walks(rows, serial_contacts=True)
+        for name in ("sparse_row_dof", "group_count", "group_heads", "serial_count"):
+            np.testing.assert_array_equal(units[name], triples[name], err_msg=name)
+        for w, count in enumerate(units["serial_count"]):
+            np.testing.assert_array_equal(units["serial"][w, :count], triples["serial"][w, :count])
+        self.assertGreater(int(np.sum(units["group_count"])), 70)
+        self.assertGreater(int(np.sum(np.maximum(units["serial_count"], 0))), 70)
+
+    def test_synthetic_worlds_cover_both_builder_paths(self):
+        """Draw layouts the unit builder takes in parallel and layouts it leaves to the serial walks."""
         rows = _unit_worlds(0, worlds=96, capacity=97, dofs=33)
         forms = [_rows_form_units(rows, world) for world in range(96)]
         walks = _serial_unit_walks(rows, serial_contacts=True)
@@ -252,51 +445,75 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
         self.assertGreater(int(np.max(rows["row_count"] - rows["bounds"][:, 1])), 64)
         self.assertGreater(int(np.sum(walks["group_count"])), 96)
         self.assertGreater(int(np.sum(np.maximum(walks["serial_count"], 0))), 96)
+        triples = _triple_worlds(0, worlds=70, capacity=98, dofs=33)
+        walks = _serial_triple_walks(triples, serial_contacts=True)
+        self.assertGreater(int(np.max(triples["row_count"] - triples["bounds"][:, 1])), 3 * 32)
+        self.assertGreater(int(np.sum(walks["group_count"])), 70)
+        self.assertGreater(int(np.sum(np.maximum(walks["serial_count"], 0))), 70)
 
     @unittest.skipUnless(wp.is_cuda_available(), "the contact schedule builders require CUDA")
     def test_unit_builder_matches_the_serial_walks(self):
         """Build unit schedules bitwise equal to the serial walks, in every layout and at capacity edges."""
         device = wp.get_device("cuda:0")
-        for seed, (capacity, dofs) in enumerate(((64, 10), (97, 33), (40, 1), (130, 114))):
+        for seed, (capacity, dofs) in enumerate(_UNIT_SHAPES):
             rows = _unit_worlds(seed, worlds=180, capacity=capacity, dofs=dofs)
             for serial_contacts in (False, True):
                 with self.subTest(capacity=capacity, dofs=dofs, serial_contacts=serial_contacts):
                     expected = _serial_unit_walks(rows, serial_contacts=serial_contacts)
-                    actual = _launch_unit_builder(rows, device, serial_contacts=serial_contacts)
+                    actual = _launch_builder(rows, device, units=True, serial_contacts=serial_contacts)
                     _assert_outputs_equal(actual, expected, f"capacity {capacity}")
 
     @unittest.skipUnless(wp.is_cuda_available(), "the contact schedule builders require CUDA")
-    def test_unit_builder_replays_in_graphs(self):
-        """Rebuild the same unit schedules from captured graphs as from eager launches."""
+    def test_triple_builder_matches_the_serial_walks(self):
+        """Build triple schedules bitwise equal to the serial walks, in every layout and at capacity edges."""
         device = wp.get_device("cuda:0")
-        rows = _unit_worlds(5, worlds=90, capacity=97, dofs=33)
-        expected = _serial_unit_walks(rows, serial_contacts=True)
-        worlds, capacity = rows["row_type"].shape
-        kernel = _get_build_independent_sparse_contact_groups_kernel(
-            capacity, 33, str(device.arch), build_serial_contacts=True, units=True
-        )
-        arrays = {name: wp.array(rows[name], dtype=wp.int32, device=device) for name in rows}
-        marked = wp.array(rows["sparse_row_dof"], dtype=wp.int32, device=device)
+        for seed, (capacity, dofs) in enumerate(_TRIPLE_SHAPES):
+            rows = _triple_worlds(seed, worlds=140, capacity=capacity, dofs=dofs)
+            for serial_contacts in (False, True):
+                with self.subTest(capacity=capacity, dofs=dofs, serial_contacts=serial_contacts):
+                    expected = _serial_triple_walks(rows, serial_contacts=serial_contacts)
+                    actual = _launch_builder(rows, device, units=False, serial_contacts=serial_contacts)
+                    _assert_outputs_equal(actual, expected, f"capacity {capacity}")
 
-        def build():
-            wp.copy(arrays["sparse_row_dof"], marked)
-            wp.launch(
-                kernel,
-                dim=worlds * 32,
-                inputs=[arrays["row_count"], arrays["bounds"], arrays["row_type"], arrays["row_parent"]],
-                outputs=[arrays[name] for name in _OUTPUTS],
-                device=device,
-            )
+    @unittest.skipUnless(wp.is_cuda_available(), "the contact schedule builders require CUDA")
+    def test_builders_replay_in_graphs(self):
+        """Rebuild the same unit and triple schedules from captured graphs as the serial walks give."""
+        device = wp.get_device("cuda:0")
+        for units in (True, False):
+            with self.subTest(units=units):
+                if units:
+                    rows = _unit_worlds(5, worlds=90, capacity=97, dofs=33)
+                    expected = _serial_unit_walks(rows, serial_contacts=True)
+                else:
+                    rows = _triple_worlds(5, worlds=70, capacity=98, dofs=33)
+                    expected = _serial_triple_walks(rows, serial_contacts=True)
+                worlds, capacity = rows["row_type"].shape
+                kernel = _get_build_independent_sparse_contact_groups_kernel(
+                    capacity, 33, str(device.arch), build_serial_contacts=True, units=units
+                )
+                arrays = {name: wp.array(rows[name], dtype=wp.int32, device=device) for name in rows}
+                marked = wp.array(rows["sparse_row_dof"], dtype=wp.int32, device=device)
+                unit_rows = [arrays["row_type"], arrays["row_parent"]] if units else []
 
-        build()
-        with wp.ScopedCapture(device=device) as capture:
-            build()
-        for replay in range(2):
-            for name in ("group_count", "group_heads", "serial_count", "serial"):
-                arrays[name].fill_(_UNWRITTEN)
-            wp.capture_launch(capture.graph)
-            actual = {name: arrays[name].numpy() for name in _OUTPUTS}
-            _assert_outputs_equal(actual, expected, f"replay {replay}")
+                def build(kernel=kernel, arrays=arrays, marked=marked, unit_rows=unit_rows, worlds=worlds):
+                    wp.copy(arrays["sparse_row_dof"], marked)
+                    wp.launch(
+                        kernel,
+                        dim=worlds * 32,
+                        inputs=[arrays["row_count"], arrays["bounds"], *unit_rows],
+                        outputs=[arrays[name] for name in _OUTPUTS],
+                        device=device,
+                    )
+
+                build()
+                with wp.ScopedCapture(device=device) as capture:
+                    build()
+                for replay in range(2):
+                    for name in ("group_count", "group_heads", "serial_count", "serial"):
+                        arrays[name].fill_(_UNWRITTEN)
+                    wp.capture_launch(capture.graph)
+                    actual = {name: arrays[name].numpy() for name in _OUTPUTS}
+                    _assert_outputs_equal(actual, expected, f"replay {replay}")
 
     @unittest.skipUnless(wp.is_cuda_available(), "the sparse-diagonal contact owner requires CUDA")
     def test_unit_builder_matches_the_serial_walks_on_solver_rows(self):
@@ -309,57 +526,37 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
         device = wp.get_device("cuda:0")
         model = build_solver_fixture(device)
         model.rigid_contact_max = 24
-        launch = wp.launch
         for compact in (False, True):
-            with (
-                self.subTest(compact=compact),
-                mock.patch.object(solver_module, "_COMPACT_CONTACT_BOUNDARY", compact),
-                mock.patch.object(solver_module, "_SPARSE_CONTACT_DIRECT", True),
-            ):
-                solver = newton.solvers.SolverFeatherPGS(
-                    model,
-                    pgs_mode="matrix_free",
-                    pgs_iterations=8,
-                    use_parallel_streams=True,
-                    enable_joint_limits=True,
-                    dense_max_constraints=64,
-                    mf_max_constraints=64,
-                )
+            with self.subTest(compact=compact):
+                solver, records = _record_schedules(model, device, anchors=True, compact=compact)
                 self.assertTrue(solver._sparse_diagonal_contact_units)
                 self.assertTrue(solver._sparse_diagonal_speculative_contact_batches)
                 self.assertEqual(solver._compact_contact_boundary, compact)
-                records = []
-
-                def recording_launch(kernel, *args, records=records, solver=solver, **kwargs):
-                    if kernel is not solver._build_independent_sparse_contact_groups_kernel:
-                        return launch(kernel, *args, **kwargs)
-                    names = ("row_count", "bounds", "row_type", "row_parent", *_OUTPUTS)
-                    arrays = dict(zip(names, (*kwargs["inputs"], *kwargs["outputs"]), strict=True))
-                    before = {name: array.numpy().copy() for name, array in arrays.items()}
-                    result = launch(kernel, *args, **kwargs)
-                    records.append((before, {name: arrays[name].numpy().copy() for name in _OUTPUTS}))
-                    return result
-
-                states = [model.state(), model.state()]
-                control = model.control()
-                contacts = newton.Contacts(model.rigid_contact_max, 0, device=device)
-                newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
-                install_patch_contacts(model, states[0], contacts)
-                with mock.patch.object(wp, "launch", recording_launch):
-                    for _ in range(6):
-                        solver.step(states[0], states[1], control, contacts, 1 / 240)
-                        states.reverse()
                 self.assertEqual(len(records), 6)
-                independent = serial = 0
                 for step, (before, after) in enumerate(records):
                     for world in range(before["row_count"].shape[0]):
                         self.assertTrue(_rows_form_units(before, world), f"step {step} world {world}")
-                    expected = _serial_unit_walks(before, serial_contacts=True)
-                    _assert_outputs_equal(after, expected, f"step {step}")
-                    independent += int(np.sum(after["group_count"]))
-                    serial += int(np.sum(after["serial_count"]))
-                self.assertGreater(independent, 0)
-                self.assertGreater(serial, 0)
+                    _assert_outputs_equal(after, _serial_unit_walks(before, serial_contacts=True), f"step {step}")
+                self.assertGreater(sum(int(np.sum(after["group_count"])) for _, after in records), 0)
+                self.assertGreater(sum(int(np.sum(after["serial_count"])) for _, after in records), 0)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "the sparse-diagonal contact owner requires CUDA")
+    def test_triple_builder_matches_the_serial_walks_on_solver_rows(self):
+        """Schedule the point triples the solver produces, through both producers, as the serial walks do."""
+        device = wp.get_device("cuda:0")
+        model = build_solver_fixture(device)
+        model.rigid_contact_max = 24
+        for compact in (False, True):
+            with self.subTest(compact=compact):
+                solver, records = _record_schedules(model, device, anchors=False, compact=compact)
+                self.assertTrue(solver._sparse_diagonal_contact_triples)
+                self.assertTrue(solver._sparse_diagonal_speculative_contact_batches)
+                self.assertEqual(solver._compact_contact_boundary, compact)
+                self.assertEqual(len(records), 6)
+                for step, (before, after) in enumerate(records):
+                    _assert_outputs_equal(after, _serial_triple_walks(before, serial_contacts=True), f"step {step}")
+                self.assertGreater(sum(int(np.sum(after["group_count"])) for _, after in records), 0)
+                self.assertGreater(sum(int(np.sum(after["serial_count"])) for _, after in records), 0)
 
 
 if __name__ == "__main__":

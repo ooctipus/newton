@@ -25607,7 +25607,9 @@ def _get_build_independent_sparse_contact_groups_kernel(
     """Build exact independent and serial contact schedules for sparse diagonal response.
 
     ``units`` schedules patch contact units instead of contact triples (see
-    :func:`_build_independent_sparse_contact_units_kernel`).
+    :func:`_build_independent_sparse_contact_units_kernel`). Each world's warp
+    links the scalar triples and lists the remaining ones in parallel; the
+    schedules equal those of serial walks over the segment's whole triples.
     """
     del device_arch
     M = int(max_constraints)
@@ -25620,17 +25622,7 @@ def _get_build_independent_sparse_contact_groups_kernel(
     // Compact the remaining contacts in original row order. The solve may
     // inspect up to four normals concurrently, but any active batch is still
     // applied through this serial list in exact GS order.
-    if (lane == 0) {{
-        int serial_count = 0;
-        for (int normal = contact_start; normal + 2 < contact_end; normal += 3) {{
-            const int sparse_row = sparse_world_base + normal * 2;
-            const bool scheduled_independently = sparse_row_dof.data[sparse_row] < -1
-                || sparse_row_dof.data[sparse_row + 1] < -1;
-            if (!scheduled_independently)
-                serial_normals.data[world * {S} + serial_count++] = normal;
-        }}
-        serial_count_out.data[world] = serial_count;
-    }}
+{_list_serial_contacts_source(count="triple_count", stride=3, head="true", serial_capacity=S)}
     __syncwarp(MASK);
 """
         if build_serial_contacts
@@ -25644,6 +25636,9 @@ def _get_build_independent_sparse_contact_groups_kernel(
     const int contact_end = world_constraint_count.data[world];
     const int head_base = world * {D};
     const int sparse_world_base = world * {M} * 2;
+    const unsigned earlier_lanes = (1u << lane) - 1u;
+    // The contact segment's whole triples.
+    const int triple_count = contact_end > contact_start ? (contact_end - contact_start) / 3 : 0;
     for (int coordinate = lane; coordinate < {D}; coordinate += 32)
         group_heads.data[head_base + coordinate] = -1;
     __syncwarp(MASK);
@@ -25662,36 +25657,9 @@ def _get_build_independent_sparse_contact_groups_kernel(
     }}
     __syncwarp(MASK);
 
-    // Prepending candidates in reverse row order makes each negative link
-    // reproduce the original ascending GS order.
-    if (lane == 0) {{
-        int normal = contact_start + ((contact_end - contact_start) / 3 - 1) * 3;
-        while (normal >= contact_start) {{
-            const int sparse_row = sparse_world_base + normal * 2;
-            const int coord_0 = sparse_row_dof.data[sparse_row];
-            const int coord_1 = sparse_row_dof.data[sparse_row + 1];
-            const bool scalar_candidate = coord_0 < -1 || coord_1 < -1;
-            const int scalar_coordinate = coord_0 >= 0 ? coord_0 : coord_1;
-            if (scalar_candidate) {{
-                if (group_heads.data[head_base + scalar_coordinate] != -2) {{
-                    const int next_normal = group_heads.data[head_base + scalar_coordinate];
-                    const int link = next_normal >= 0 ? -(next_normal + 3) : -2;
-                    if (sparse_row_dof.data[sparse_row] < 0)
-                        sparse_row_dof.data[sparse_row] = link;
-                    else
-                        sparse_row_dof.data[sparse_row + 1] = link;
-                    group_heads.data[head_base + scalar_coordinate] = normal;
-                }} else if (coord_0 < -1) {{
-                    sparse_row_dof.data[sparse_row] = -1;
-                }} else {{
-                    sparse_row_dof.data[sparse_row + 1] = -1;
-                }}
-            }}
-            normal -= 3;
-        }}
-    }}
-    __syncwarp(MASK);
-
+    // Link each coordinate's scalar triples in ascending row order, so that
+    // every negative link reproduces the original GS order.
+{_link_scalar_contacts_source(count="triple_count", stride=3, head="true", dofs=D)}
 {serial_schedule}
 
     int count = 0;
