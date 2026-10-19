@@ -142,6 +142,13 @@ _EFFECTIVE = {
     "mf_gs_response_block_lane_rows": lambda solver: _response_block_rows(solver, getattr(solver, "_rb_lane_rows", 0)),
     "use_parallel_streams": _streams_created,
     "propagation_cached_response": lambda solver: bool(solver._propagation_cached_response_active),
+    "mf_gs_parallel_linked_velocity_limit_pass": lambda solver: bool(
+        solver._ink_rows > 0
+        and any(
+            getattr(kernel, "_fpgs_velocity_limit_pass", False)
+            for kernel in solver._pgs_solve_mf_gs_incremental_kernels
+        )
+    ),
     # The sweeps' law after the schedule and row gates (routes.velocity_limits.law).
     "velocity_limit_law": lambda solver: solver._velocity_limit_kernel_law(),
 }
@@ -749,6 +756,8 @@ def _tiers(solver) -> dict | None:
             "pair_step": "isotropic"
             if all(getattr(kernel, "_fpgs_pair_step", "per_row") == "isotropic" for kernel in kernels)
             else "per_row",
+            # The last-word velocity-limit pass after the final sweep (mf_gs_parallel_linked_velocity_limit_pass).
+            "velocity_limit_pass": all(getattr(kernel, "_fpgs_velocity_limit_pass", False) for kernel in kernels),
             "nesterov": bool(solver.mf_gs_parallel_nesterov),
             "matrix_free": bool(solver.mf_gs_parallel_matrix_free),
             "sweeps": int(solver.mf_gs_parallel_sweeps),

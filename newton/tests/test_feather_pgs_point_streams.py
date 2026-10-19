@@ -111,8 +111,14 @@ def _label(name, args, kwargs):
 
 
 def _linked_tier_calls():
-    """Patch-only parallel tiers, whose friction pairs pool their patch ring's normal impulses."""
-    for tier, matrix_free, inkernel in itertools.product(((32, 0), (48, 32)), (False, True), ((18, 0, 0, 0), None)):
+    """Patch-only parallel tiers, whose friction pairs pool their patch ring's normal impulses.
+
+    Each also with the opt-in last-word velocity-limit pass
+    (``mf_gs_parallel_linked_velocity_limit_pass``).
+    """
+    for tier, matrix_free, inkernel, last_word in itertools.product(
+        ((32, 0), (48, 32)), (False, True), ((18, 0, 0, 0), None), (False, True)
+    ):
         kwargs = {
             "rows": tier[0],
             "min_rows": tier[1],
@@ -122,6 +128,8 @@ def _linked_tier_calls():
             "exact_row_sums": matrix_free,
             "linked_rows": True,
         }
+        if last_word:
+            kwargs["velocity_limit_pass"] = True
         yield "solver_feather_pgs._get_pgs_solve_parallel_kernel", (64, 32, 18, _ARCH), kwargs
 
 

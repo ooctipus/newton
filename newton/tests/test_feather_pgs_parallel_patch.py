@@ -32,6 +32,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+    PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     compute_world_contact_bias,
 )
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
@@ -67,7 +68,19 @@ def _sibling(row, parent):
 
 
 def parallel_sweep_reference(
-    case, *, matrix_free, inkernel, exact, sweeps, nesterov, tol, linked, omega=1.0, friction_start=0, pair_step=None
+    case,
+    *,
+    matrix_free,
+    inkernel,
+    exact,
+    sweeps,
+    nesterov,
+    tol,
+    linked,
+    omega=1.0,
+    friction_start=0,
+    pair_step=None,
+    velocity_limit_pass=False,
 ):
     """Repeat one world of the parallel tier's sweep in float64.
 
@@ -83,7 +96,8 @@ def parallel_sweep_reference(
     zero. Every sweep steps all rows from the extrapolated impulses, clamps
     normal and limit rows, scales each tangent pair into its disk (the ring's
     pooled normal load when ``linked``), restarts momentum against the last step
-    and stops once no row changes.
+    and stops once no row changes. ``velocity_limit_pass`` then pushes every
+    violated velocity-limit row onto its limit, in row order.
     """
     J, Y, Z = case["J"], case["Y"], case["Z"]
     kinds, parents, mu = case["kinds"], case["parents"], case["mu"]
@@ -140,6 +154,12 @@ def parallel_sweep_reference(
         x, y = projected, projected + beta * (projected - x)
         if sweep >= friction_start and not changed:
             break
+    if velocity_limit_pass:
+        x = x.copy()
+        for row in np.flatnonzero((kinds == 0) & (case["types"] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)):
+            residual = b[row] + A[row] @ x
+            if residual < 0.0 and diag[row] > 0.0:
+                x[row] -= residual / diag[row]
     return x, v + Y.T @ (x - lam0)
 
 
@@ -297,6 +317,38 @@ def sliding_pair_case(*, masses=(4.0, 1.0), sliding=(1.0, 1.0), live_tangents=2)
         "rhs": np.zeros(3),
         "impulses": np.zeros(3),
         "velocity": np.array((sliding[0], sliding[1], -1.0, 0.0, 0.0, 0.0)),
+    }
+
+
+def limited_contact_case(limit=0.5):
+    """A contact whose impulse pushes a velocity-limited coordinate past its limit.
+
+    The normal closes at 2 m/s along coordinate 2 with a lever onto coordinate 3,
+    which moves at 0.3 against an upper limit of ``limit``. Two Jacobi sweeps leave
+    the limit violated by about 0.76; converged, the limit holds with an impulse.
+    """
+    H = np.eye(_DOFS)
+    H[3, 3] = 0.2
+    L = np.linalg.cholesky(H)
+    J = np.zeros((2, _DOFS))
+    J[0, 2], J[0, 3] = 1.0, 0.6
+    J[1, 3] = -1.0  # upper limit: limit - qd_3 >= 0
+    Y = np.linalg.solve(H, J.T).T
+    cfm = 1.0e-5
+    return {
+        "J": J,
+        "Y": Y,
+        "Z": np.linalg.solve(L, J.T).T,
+        "L": L,
+        "cfm": cfm,
+        "diag": np.einsum("ij,ij->i", J, Y) + cfm,
+        "kinds": np.array((0, 0), np.int32),
+        "types": np.array((PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT), np.int32),
+        "parents": np.array((-1, -1), np.int32),
+        "mu": np.zeros(2),
+        "rhs": np.array((0.0, limit)),
+        "impulses": np.zeros(2),
+        "velocity": np.array((0.0, 0.0, -2.0, 0.3, 0.0, 0.0)),
     }
 
 
@@ -576,6 +628,61 @@ class TestParallelPatchReference(unittest.TestCase):
                 np.testing.assert_allclose(impulses, per_row, rtol=1.0e-12, atol=1.0e-15)
                 self.assertAlmostEqual(-impulses[1], 0.5 * impulses[0], delta=1.0e-9)
                 self.assertEqual(impulses[2], 0.0)
+
+    def test_velocity_limit_pass_reaches_every_tier_variant(self):
+        """Stage the velocity-limit flag and append the last word to each tier variant only on request."""
+        variants = {
+            "response block": ({"matrix_free": False}, "A_AT(i, j) * s_x[j]"),
+            "matrix-free": ({"matrix_free": True}, "J_world.data[jy_world_base + i * 6 + d]"),
+            "in-kernel matrix-free": ({"matrix_free": True, "inkernel_response": (6, 0, 0, 0)}, "ZAT(d, i)"),
+            "in-kernel response block": ({"matrix_free": False, "inkernel_response": (6, 0, 0, 0)}, "ZAT(d, i)"),
+        }
+        for name, (options, row_read) in variants.items():
+            with self.subTest(variant=name):
+                settings = {"rows": 32, "sweeps": 24, "linked_rows": True, **options}
+                plain = source._get_pgs_solve_parallel_kernel(_CAPACITY, 32, _DOFS, "120", **settings)
+                last_word = source._get_pgs_solve_parallel_kernel(
+                    _CAPACITY, 32, _DOFS, "120", velocity_limit_pass=True, **settings
+                )
+                self.assertEqual(last_word.key, plain.key + "_lw")
+                self.assertEqual((plain._fpgs_velocity_limit_pass, last_word._fpgs_velocity_limit_pass), (False, True))
+                text = last_word._fpgs_row_native_source
+                self.assertNotIn("s_vlim", plain._fpgs_row_native_source)
+                self.assertEqual(text.count("s_vlim[i] = row_type == 4 ? 1 : 0;"), 1)
+                self.assertEqual(text.count("Last word: ordered push-only velocity-limit pass"), 1)
+                self.assertIn(row_read, text)
+                # The pass runs between the final sweep and the velocity reconstruction.
+                self.assertLess(text.index("Last word"), text.index("v_out.data[global_dof] ="))
+                self.assertGreater(text.index("Last word"), text.index("for (int sweep = 0;"))
+
+    def test_solver_builds_the_pass_for_limited_linked_tiers(self):
+        """Build the last-word pass only for linked tiers with joint velocity limits, and only on request."""
+        decide = SolverFeatherPGS._parallel_velocity_limit_pass
+        for requested, anchors, limits in itertools.product((False, True), repeat=3):
+            probe = SimpleNamespace(
+                mf_gs_parallel_linked_velocity_limit_pass=requested,
+                _friction_anchors_enabled=anchors,
+                enable_joint_velocity_limits=limits,
+            )
+            with self.subTest(requested=requested, anchors=anchors, limits=limits):
+                self.assertEqual(decide(probe), requested and anchors and limits)
+
+    def test_last_word_holds_a_truncated_limit(self):
+        """Hold the limit after two sweeps with the last word, and leave a converged tier unchanged."""
+        case = limited_contact_case()
+        for matrix_free, inkernel in itertools.product((False, True), repeat=2):
+            options = {"matrix_free": matrix_free, "inkernel": inkernel, "exact": False, "nesterov": True, "tol": 0.0}
+            with self.subTest(matrix_free=matrix_free, inkernel=inkernel):
+                _, truncated = parallel_sweep_reference(case, sweeps=2, linked=True, **options)
+                _, held = parallel_sweep_reference(case, sweeps=2, linked=True, velocity_limit_pass=True, **options)
+                self.assertLess(case["J"][1] @ truncated + case["rhs"][1], -0.5)
+                # The push divides by the regularized diagonal: cfm leaves 3e-6 of the limit.
+                self.assertGreaterEqual(case["J"][1] @ held + case["rhs"][1], -1.0e-5 * case["rhs"][1])
+                converged, _ = parallel_sweep_reference(case, sweeps=2000, linked=True, **options)
+                unchanged, _ = parallel_sweep_reference(
+                    case, sweeps=2000, linked=True, velocity_limit_pass=True, **options
+                )
+                np.testing.assert_allclose(unchanged, converged, atol=1.0e-12)
 
 
 class _RowsBuilt(Exception):
@@ -1018,6 +1125,49 @@ class TestParallelPatchKernel(unittest.TestCase):
                 else:
                     self.assertAlmostEqual(-impulses[1], 0.5 * impulses[0], delta=1.0e-5)
 
+    def test_last_word_holds_a_truncated_tier_at_the_limit(self):
+        """Exit a tier stopped after two sweeps within its velocity limit, and change a converged one by 1e-6 at most.
+
+        The last word pushes the limit row that the contact's impulse drove past its limit
+        back onto it (relative 1e-5); with 2000 sweeps the limit holds already, and the
+        pass leaves the impulses within 1e-6.
+        """
+        device = wp.get_device("cuda:0")
+        arch = str(device.arch)
+        case = limited_contact_case()
+        limit = case["rhs"][1]
+        for matrix_free, inkernel, sweeps in itertools.product((False, True), (False, True), (2, 2000)):
+            options = {"matrix_free": matrix_free, "inkernel": inkernel, "exact": False, "nesterov": True}
+            with self.subTest(sweeps=sweeps, **options):
+                results = {}
+                for last_word in (False, True):
+                    kernel = source._get_pgs_solve_parallel_kernel(
+                        _CAPACITY,
+                        32,
+                        _DOFS,
+                        arch,
+                        rows=32,
+                        sweeps=sweeps,
+                        tol=0.0,
+                        matrix_free=matrix_free,
+                        inkernel_response=(_DOFS, 0, 0, 0) if inkernel else None,
+                        linked_rows=True,
+                        velocity_limit_pass=last_word,
+                    )
+                    impulses, velocity = _launch_parallel(kernel, case, inkernel=inkernel, device=device)
+                    expected, expected_velocity = parallel_sweep_reference(
+                        case, sweeps=sweeps, tol=0.0, linked=True, velocity_limit_pass=last_word, **options
+                    )
+                    np.testing.assert_allclose(impulses, expected, rtol=1.0e-4, atol=1.0e-5)
+                    np.testing.assert_allclose(velocity, expected_velocity, rtol=1.0e-4, atol=1.0e-5)
+                    results[last_word] = impulses.astype(np.float64), velocity.astype(np.float64)
+                speed = -(case["J"][1] @ results[True][1])  # qd_3
+                self.assertLessEqual(speed, limit * (1.0 + 1.0e-5))
+                if sweeps == 2:
+                    self.assertGreater(-(case["J"][1] @ results[False][1]), 1.5 * limit)
+                else:
+                    np.testing.assert_allclose(results[True][0], results[False][0], atol=1.0e-6)
+
 
 _STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
 # Float-order tolerances of an exact route change (assert_states_close of the sparse solver tests).
@@ -1247,6 +1397,35 @@ class TestPatchParallelRoutes(unittest.TestCase):
                     with launched_kernels() as keys:
                         _rollout(model, solver, 1)
                     assert_row_builders_named(self, record, keys)
+
+    def test_limited_linked_tiers_take_the_last_word_on_request(self):
+        """Build the last-word pass into velocity-limited linked tiers only on request, and record it."""
+        model = _sliding_sphere("cuda:0", (newton.Axis.X, newton.Axis.Y, newton.Axis.Z), (3.0, 0.01, 1.0), (1.0, 1.0))
+        model.joint_velocity_limit.assign(np.full(model.joint_dof_count, 0.5, np.float32))
+        built = {}
+        with patch.dict(os.environ, {_SWITCH: "1"}):
+            for limits, requested in itertools.product((False, True), repeat=2):
+                built[limits, requested] = _matrix_free_solver(
+                    model,
+                    beta=0.2,
+                    parallel_rows=32,
+                    enable_joint_velocity_limits=limits,
+                    mf_gs_parallel_linked_velocity_limit_pass=requested,
+                )
+        for (limits, requested), solver in built.items():
+            with self.subTest(limits=limits, requested=requested):
+                last_word = limits and requested
+                keys = [kernel.key for kernel in solver._pgs_solve_mf_gs_incremental_kernels]
+                self.assertTrue(keys)
+                self.assertTrue(all(key.endswith("_linked_iso_lw" if last_word else "_linked_iso") for key in keys))
+                selected = solver.get_path_selection()
+                self.assertEqual(selected["routes"]["sweep"]["tiers"]["velocity_limit_pass"], last_word)
+                self.assertEqual(selected["options"]["mf_gs_parallel_linked_velocity_limit_pass"]["applied"], last_word)
+                state, _ = _rollout(model, solver, 2)
+                for name in _STATE_FIELDS:
+                    self.assertTrue(np.isfinite(getattr(state, name).numpy()).all(), name)
+                if limits:
+                    self.assertLessEqual(float(np.max(np.abs(state.joint_qd.numpy()[:2]))), 0.5 * (1.0 + 1.0e-5))
 
     def test_in_sweep_world_rows_stay_point_only(self):
         """Own no in-sweep world rows under patch friction with INK and WORLD_ROWS and keyed rows declined."""

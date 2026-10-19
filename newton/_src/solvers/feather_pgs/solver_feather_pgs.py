@@ -1375,6 +1375,7 @@ class SolverFeatherPGS(SolverBase):
         mf_gs_parallel_nesterov: bool = True,
         mf_gs_parallel_tol: float = 1e-4,
         mf_gs_parallel_matrix_free: bool = False,
+        mf_gs_parallel_linked_velocity_limit_pass: bool = False,
         mf_gs_response_block_rows: int = 0,
         mf_gs_response_block_lane_rows: int = 16,
         velocity_limit_law: Literal["stateless", "accumulated"] = "stateless",
@@ -1730,6 +1731,12 @@ class SolverFeatherPGS(SolverBase):
                 the block costs ``O(m^2 D)`` to build plus ``O(m^2)`` per sweep; matrix-free costs ``O(m D)`` per
                 sweep. Consider matrix-free when block construction dominates, such as contact-rich hands;
                 small row sets or many sweeps may favor the block. Compare total cost at the required convergence.
+            mf_gs_parallel_linked_velocity_limit_pass (bool, optional): Give the joint velocity limits the last word
+                in the parallel tiers that serve persistent patch friction, as the serial sweeps' end-of-iteration
+                pass gives it to them: after the final sweep one warp pushes every violated velocity-limit row back
+                onto its limit, in row order. It changes nothing once a tier converges and bounds the limit overshoot
+                of a tier its sweep budget stops early. Applies only with ``enable_joint_velocity_limits`` and
+                linked tiers. Experimental. Defaults to False.
             mf_gs_response_block_rows (int, optional): Row budget of the response-block Gauss-Seidel
                 sweep on the matrix-free path. Worlds whose dense plus matrix-free row count is at most
                 this many rows are swept from a per-world response block ``J H^-1 J^T`` built once per
@@ -2363,6 +2370,7 @@ class SolverFeatherPGS(SolverBase):
         self.mf_gs_parallel_nesterov = bool(mf_gs_parallel_nesterov)
         self.mf_gs_parallel_tol = float(mf_gs_parallel_tol)
         self.mf_gs_parallel_matrix_free = bool(mf_gs_parallel_matrix_free)
+        self.mf_gs_parallel_linked_velocity_limit_pass = bool(mf_gs_parallel_linked_velocity_limit_pass)
         # Response-block sweep budgets (see class docstring); 0 rows disables the path.
         self.mf_gs_response_block_rows = int(mf_gs_response_block_rows)
         self.mf_gs_response_block_lane_rows = int(mf_gs_response_block_lane_rows)
@@ -7795,6 +7803,7 @@ class SolverFeatherPGS(SolverBase):
                             world_rows=self._world_rows,
                             linked_rows=self._friction_anchors_enabled,
                             pair_step=self._parallel_pair_step(),
+                            velocity_limit_pass=self._parallel_velocity_limit_pass(),
                         )
                     )
                     self._pgs_solve_mf_gs_incremental_kernels[-1]._fpgs_tier = tier_index
@@ -16262,6 +16271,18 @@ class SolverFeatherPGS(SolverBase):
         if step not in ("per_row", "isotropic"):
             raise ValueError(f"FEATHER_PGS_POINT_PAIR_STEP must be per_row or isotropic, got {step!r}")
         return step
+
+    def _parallel_velocity_limit_pass(self) -> bool:
+        """Whether the parallel tiers end with the last-word velocity-limit pass (``routes.sweep.tiers``).
+
+        ``mf_gs_parallel_linked_velocity_limit_pass`` requests it for the linked (patch)
+        tiers; it has rows to push only with joint velocity limits.
+        """
+        return bool(
+            self.mf_gs_parallel_linked_velocity_limit_pass
+            and self._friction_anchors_enabled
+            and self.enable_joint_velocity_limits
+        )
 
     def _velocity_limit_sweep_law(self) -> tuple[str | None, str]:
         """Return the law the matrix-free sweep kernels give velocity-limit rows, and why.
@@ -28048,6 +28069,7 @@ def _get_pgs_solve_parallel_kernel(
     row_inputs=None,
     linked_rows: bool = False,
     pair_step: str | None = None,
+    velocity_limit_pass: bool = False,
 ) -> "wp.Kernel":
     """Scaled parallel projection (Jacobi with per-row step scaling and Nesterov momentum) for dense-row worlds.
 
@@ -28066,6 +28088,11 @@ def _get_pgs_solve_parallel_kernel(
     the same normal, or when either step is zero (a zero-Jacobian tangent would otherwise freeze its live sibling).
     The default is ``"isotropic"`` for ``linked_rows`` (the patch tier law) and ``"per_row"`` otherwise; an
     isotropic kernel's name gains ``_iso``.
+
+    ``velocity_limit_pass`` adds the last word of the serial sweeps' velocity-limit pass after the final sweep
+    (:func:`_parallel_velocity_limit_pass`): an ordered, push-only pass over the velocity-limit rows that changes
+    nothing at the tiers' fixed point and bounds the limit overshoot of a tier stopped early. Its name gains
+    ``_lw``.
 
     With ``inkernel_response=(NA, NB, OA, OB)`` (group sizes and world-DOF offsets; matrix-free only) the kernel does not read ``J_world``/``Y_world``/``diag``:
     it gathers the group-layout Jacobian rows of the world's (at most two) articulations, solves ``Y = H^-1 J^T``
@@ -28092,6 +28119,7 @@ def _get_pgs_solve_parallel_kernel(
     if pair_step not in ("per_row", "isotropic"):
         raise ValueError(f"pair_step must be 'per_row' or 'isotropic', got {pair_step!r}")
     isotropic_step = _ISOTROPIC_PAIR_STEP if pair_step == "isotropic" else ""
+    velocity_limit_pass = bool(velocity_limit_pass)
     M_D = max_constraints
     D = max_world_dofs
     AM = int(rows)
@@ -28371,6 +28399,13 @@ def _get_pgs_solve_parallel_kernel(
             ink_stage = ink_stage.replace(old_publish, publication)
     if row_inputs is not None and operands.stage is not None:
         ink_stage = operands.stage
+    velocity_limit_shared = velocity_limit_stage = velocity_limit_last_word = ""
+    if velocity_limit_pass:
+        velocity_limit_shared = "    __shared__ int   s_vlim[AM];    // velocity-limit rows, for the last-word pass\n"
+        velocity_limit_stage = f"        s_vlim[i] = row_type == {T_VLIM} ? 1 : 0;\n"
+        velocity_limit_last_word = _parallel_velocity_limit_pass(
+            matrix_free=bool(MF), inkernel=bool(INK), world_rows=bool(WR), dofs=D
+        )
     snippet = f"""
 #if defined(__CUDA_ARCH__)
     const unsigned MASK = 0xFFFFFFFF;
@@ -28425,7 +28460,7 @@ def _get_pgs_solve_parallel_kernel(
     __shared__ float s_mu[AM];
     __shared__ int   s_parent[AM];
     __shared__ int   s_kind[AM];    // 0 unilateral, 1 friction, 2 bilateral, -1 frozen
-    __shared__ float s_A[{MF} ? 1 : AM * AP];   // response block, row-major with padded stride (A-based variant)
+{velocity_limit_shared}    __shared__ float s_A[{MF} ? 1 : AM * AP];   // response block, row-major with padded stride (A-based variant)
     __shared__ __align__(16) float s_Yt[{MF} ? YS * {D} : 4]; // matrix-free: staged Y rows, d-major (Z rows with in-kernel response)
     __shared__ float s_colsum[{MF} ? {D} : 1];   // matrix-free: sum_j |Y_jd| over admitted rows (step-scale bound)
     __shared__ __align__(16) float s_dv[({MF} || {INK}) ? (({D} + 3) & ~3) : 4];   // matrix-free: Y^T y (Z^T y / final dv with in-kernel response)
@@ -28460,7 +28495,7 @@ def _get_pgs_solve_parallel_kernel(
         const int row_type = {input_row_type} & {ROW_TYPE_MASK};
         s_parent[i] = {input_parent};
         s_mu[i] = {input_mu};
-        // in-kernel response: the diagonal is formed below (J_i . Y_i + cfm_i); admit provisionally here.
+{velocity_limit_stage}        // in-kernel response: the diagonal is formed below (J_i . Y_i + cfm_i); admit provisionally here.
         const float diag = {INK} ? 1.0f : world_diag.data[off_dense + i];
         int kind = 2;
         if (row_type == {T_CONTACT} || row_type == {T_LIMIT} || row_type == {T_VLIM}) kind = 0;
@@ -28826,7 +28861,7 @@ def _get_pgs_solve_parallel_kernel(
         }}
     }}
 
-#if {INK}
+{velocity_limit_last_word}#if {INK}
     // u = Z^T (x - lam0), then dv = L^-T u per articulation (one lane per group, short serial chain).
     for (int d = lane; d < {D}; d += NT) {{
         float u = 0.0f;
@@ -29037,6 +29072,8 @@ def _get_pgs_solve_parallel_kernel(
         name += "_linked"
     if pair_step == "isotropic":
         name += "_iso"
+    if velocity_limit_pass:
+        name += "_lw"
     if row_inputs is not None:
         name = name.replace("pgs_solve_parallel_", "pgs_solve_kinetic_keyed_parallel_", 1)
     kernel = make_row_kernel(name, snippet, pgs_solve_parallel_signature, input_arguments, dispatch="parallel")
@@ -29046,7 +29083,83 @@ def _get_pgs_solve_parallel_kernel(
     kernel._fpgs_world_rows = bool(WR)
     kernel._fpgs_linked_rows = bool(linked_rows)  # recorded as routes.sweep.tiers.linked_rows
     kernel._fpgs_pair_step = pair_step  # recorded as routes.sweep.tiers.pair_step
+    kernel._fpgs_velocity_limit_pass = velocity_limit_pass  # recorded as routes.sweep.tiers.velocity_limit_pass
     return kernel
+
+
+def _parallel_velocity_limit_pass(*, matrix_free: bool, inkernel: bool, world_rows: bool, dofs: int) -> str:
+    """Return a parallel tier's last-word velocity-limit pass, run once after the final sweep.
+
+    Warp 0 walks the admitted velocity-limit rows in row order on the tier's iterate
+    ``x``. With ``r_i = b'_i + (A x)_i``, the residual the sweeps use, a violated row
+    (``r_i < 0``) is pushed onto its limit: ``x_i += -r_i / d_i``. The pass only
+    pushes, so it changes nothing at the tiers' fixed point (no row is violated there),
+    and the limit keeps the last word of a tier stopped early, as in the serial
+    sweeps' end-of-iteration pass. ``(A x)_i`` is ``Z_i . w`` with ``w = Z^T x`` under
+    in-kernel response (``d_i = |Z_i|^2 + cfm_i``), ``J_i . w`` with ``w = Y^T x``
+    for the matrix-free tier, and a response-block row product otherwise (``d_i``
+    the assembled diagonal); ``w`` follows each push.
+    """
+    if not inkernel and not matrix_free:
+        return """    {   // Last word: ordered push-only velocity-limit pass after the final sweep (warp 0).
+        SYNC();
+        if (lane < 32) {
+            for (int i = 0; i < n_rows; ++i) {
+                if (s_kind[i] != 0 || s_vlim[i] == 0) continue;
+                float part = 0.0f;
+                for (int j = lane; j < n_rows; j += 32) part += A_AT(i, j) * s_x[j];
+                for (int off = 16; off > 0; off >>= 1) part += __shfl_xor_sync(MASK, part, off);
+                const float r_vlim = s_rhs[i] + part;
+                const float diag_vlim = world_diag.data[off_dense + i];
+                if (r_vlim < 0.0f && diag_vlim > 0.0f && lane == 0) s_x[i] += -r_vlim / diag_vlim;
+                __syncwarp();
+            }
+        }
+        SYNC();
+    }
+"""
+    if inkernel:
+        row = column = "ZAT(d, i)"
+        diagonal = f"zz + (({int(world_rows)} && s_row_c[i] >= 0) ? wr_pgs_cfm : world_row_cfm.data[off_dense + i])"
+        response = "ZAT(d, j)"
+    else:
+        row, column = f"J_world.data[jy_world_base + i * {dofs} + d]", "s_Yt[d * YS + i]"
+        diagonal = "world_diag.data[off_dense + i]"
+        response = "s_Yt[d * YS + j]"
+    return f"""    {{   // Last word: ordered push-only velocity-limit pass after the final sweep (warp 0), on x and w.
+        SYNC();
+        for (int d = lane; d < {dofs}; d += NT) {{
+            float acc = 0.0f;
+            for (int j = 0; j < n_rows; ++j) acc += {response} * s_x[j];
+            s_dv[d] = acc;
+        }}
+        SYNC();
+        if (lane < 32) {{
+            for (int i = 0; i < n_rows; ++i) {{
+                if (s_kind[i] != 0 || s_vlim[i] == 0) continue;
+                float part = 0.0f, zz = 0.0f;
+                for (int d = lane; d < {dofs}; d += 32) {{
+                    const float row = {row};
+                    part += row * s_dv[d];
+                    zz += row * row;
+                }}
+                for (int off = 16; off > 0; off >>= 1) {{
+                    part += __shfl_xor_sync(MASK, part, off);
+                    zz += __shfl_xor_sync(MASK, zz, off);
+                }}
+                const float r_vlim = s_rhs[i] + part;
+                const float diag_vlim = {diagonal};
+                if (r_vlim < 0.0f && diag_vlim > 0.0f) {{
+                    const float delta_vlim = -r_vlim / diag_vlim;
+                    if (lane == 0) s_x[i] += delta_vlim;
+                    for (int d = lane; d < {dofs}; d += 32) s_dv[d] += {column} * delta_vlim;
+                }}
+                __syncwarp();
+            }}
+        }}
+        SYNC();
+    }}
+"""
 
 
 # A friction pair's isotropic step in the parallel sweep (``pair_step="isotropic"``), emitted after the step
