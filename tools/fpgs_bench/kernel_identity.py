@@ -34,8 +34,8 @@ the pinned factory calls), the factory variants those pins do not reach
 (:func:`factory_calls`), a held-tree layout grid of the factory-built tree
 kernels (:func:`held_tree_calls`) and a census of every flag combination of the
 sweep factories that vote an exit (:func:`census_calls`), recorded by hash only.
-Nothing is compiled and no device is needed; a full record takes about a
-minute and a half on the CPU, the census about a minute of it.
+Nothing is compiled and no device is needed; a full record takes under three
+minutes on the CPU, the census about two of them.
 
 Run from the root of a Newton checkout with the import-time switches
 (``FEATHER_PGS_*``) unset::
@@ -494,9 +494,11 @@ def census_calls():
     Gauss-Seidel (one shape within a warp's width of coordinates, one beyond
     it), sparse (one shape small enough for subwarp sweeps), paired factor,
     local owners plain and over packet rows, sparse diagonal, incremental,
-    parallel and keyed parallel tiers, and the response-block sweeps. The
-    held-coordinate bindings of ``mf_gs_source.get_source``, which no factory
-    passes, are hashed as text.
+    parallel and keyed parallel tiers, the response-block sweeps and the fused
+    propagation iteration. Every factory that takes a velocity-limit law is
+    crossed with both laws, and the matrix-free Gauss-Seidel sweep with
+    resident row metadata. The held-coordinate bindings of
+    ``mf_gs_source.get_source``, which no factory passes, are hashed as text.
     """
     from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
         keyed_rows,
@@ -507,8 +509,10 @@ def census_calls():
     from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.velocity_limit_law import VELOCITY_LIMIT_LAWS  # noqa: PLC0415
 
     name = "solver_feather_pgs."
+    laws = _axis("velocity_limit_law", VELOCITY_LIMIT_LAWS)
     mf_gs = (
         _axis("friction_mode", ("current", "bisection", "bisection_desaxce", "coulomb_newton")),
         _axis("software_pipeline", (True, False)),
@@ -525,6 +529,8 @@ def census_calls():
         _axis("independent_components"),
         _axis("dense_support_tiles"),
         _axis("stage_velocities"),
+        _axis("resident_row_metadata"),
+        laws,
     )
     local = (
         _axis("paired_dof_count", (0, 6)),
@@ -555,6 +561,7 @@ def census_calls():
                 ),
                 _axis("shared_arena"),
                 _axis("cpu_body", ("", "/* scalar recurrence */")),
+                laws,
             ),
         ),
         (
@@ -571,6 +578,7 @@ def census_calls():
                 _axis("local_factors"),
                 _axis("warm_start"),
                 _axis("linked_rows"),
+                laws,
             ),
         ),
         (
@@ -606,6 +614,7 @@ def census_calls():
                 _axis("has_drive_rows", (True, False)),
                 _axis("has_dense_velocity_limit_rows", (True, False)),
                 _axis("skip_local_internal_worlds"),
+                laws,
             ),
         ),
         (
@@ -653,13 +662,19 @@ def census_calls():
             "response_block_sweep.get_response_block_sweep_lane_kernel",
             response_block_sweep.get_response_block_sweep_lane_kernel,
             ((192, 64, 22),),
-            (_axis("lane_rows", (8, 16)), _axis("has_drive_rows")),
+            (_axis("lane_rows", (8, 16)), _axis("has_drive_rows"), laws),
         ),
         (
             "response_block_sweep.get_response_block_sweep_warp_kernel",
             response_block_sweep.get_response_block_sweep_warp_kernel,
             ((192, 64, 22),),
-            (_axis("rows", (32, 64)), _axis("lane_rows", (16,)), _axis("has_drive_rows")),
+            (_axis("rows", (32, 64)), _axis("lane_rows", (16,)), _axis("has_drive_rows"), laws),
+        ),
+        (
+            name + "_get_pgs_solve_propagation_full_iteration_kernel",
+            solver._get_pgs_solve_propagation_full_iteration_kernel,
+            ((64, 32, 18, 48, 8, 18, ARCH),),
+            (_axis("worlds_per_block", (1, 2)), _axis("fuse_vel_limits"), laws),
         ),
     )
     for factory_name, cached, shapes, axes in specs:
