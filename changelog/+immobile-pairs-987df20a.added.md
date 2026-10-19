@@ -1,0 +1,1 @@
+Add `CollisionPipeline(include_immobile_pairs=...)`, the `immobile_pairs` record of `CollisionPipeline.get_collision_selection()` with the welded bodies, immobile shapes and dropped pairs, and `CollisionPipeline.notify_model_changed()`, which refreshes the immobile shapes after `Model.body_flags` or `Model.joint_enabled` change.

@@ -195,8 +195,28 @@ class TestKinematicLinks(unittest.TestCase):
                         model,
                         broad_phase=broad_phase,
                         include_static_kinematic_pairs=True,
+                        include_immobile_pairs=True,
                     )
                     self.assertGreater(count, 0)
+
+                with self.subTest(
+                    shape_a=shape_a,
+                    shape_b=shape_b,
+                    broad_phase=broad_phase,
+                    include_static_kinematic_pairs=True,
+                    include_immobile_pairs=False,
+                ):
+                    # Two static shapes are structurally immobile; kinematic bodies can move.
+                    count = _rigid_contact_count(
+                        model,
+                        broad_phase=broad_phase,
+                        include_static_kinematic_pairs=True,
+                        include_immobile_pairs=False,
+                    )
+                    if shape_a == shape_b == "static":
+                        self.assertEqual(count, 0)
+                    else:
+                        self.assertGreater(count, 0)
 
     def test_immovable_filter_does_not_remove_dynamic_pairs(self):
         for shape_a, shape_b in [
@@ -290,11 +310,13 @@ def _rigid_contact_count(
     *,
     broad_phase: str = "explicit",
     include_static_kinematic_pairs: bool = True,
+    include_immobile_pairs: bool | None = None,
 ) -> int:
     pipeline = newton.CollisionPipeline(
         model,
         broad_phase=broad_phase,
         include_static_kinematic_pairs=include_static_kinematic_pairs,
+        include_immobile_pairs=include_immobile_pairs,
     )
     contacts = pipeline.contacts()
     pipeline.collide(model.state(), contacts)

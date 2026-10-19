@@ -133,6 +133,12 @@ NEWTON_PREFIXES = ("NEWTON_",)
 
 NEWTON_FLAGS = declare(
     EnvironmentFlag(
+        "NEWTON_BROAD_PHASE_IMMOBILE_FILTER",
+        "policy",
+        _COLLIDE,
+        "=0 keeps pairs whose shapes are both static or welded to the world (default 1 drops them).",
+    ),
+    EnvironmentFlag(
         "NEWTON_CACHE_PATH",
         "policy",
         ("utils.download_assets",),

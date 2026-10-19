@@ -2417,11 +2417,13 @@ class TestShapePairsMaxScaling(unittest.TestCase):
 
         for reduce_contacts in (False, True):
             with self.subTest(reduce_contacts=reduce_contacts):
+                # Both meshes are static, so the pair is immobile; keep it to exercise the mesh stage.
                 pipeline = newton.CollisionPipeline(
                     model,
                     broad_phase="explicit",
                     shape_pairs_filtered=shape_pairs,
                     reduce_contacts=reduce_contacts,
+                    include_immobile_pairs=True,
                 )
                 contacts = pipeline.contacts()
 
@@ -2444,10 +2446,12 @@ class TestShapePairsMaxScaling(unittest.TestCase):
         )
         model = builder.finalize(device="cpu")
         shape_pairs = wp.array(np.array([[0, 1]], dtype=np.int32), dtype=wp.vec2i, device="cpu")
+        # Both planes are static, so the pair is immobile; keep it to exercise the generic convex stage.
         pipeline = newton.CollisionPipeline(
             model,
             broad_phase="explicit",
             shape_pairs_filtered=shape_pairs,
+            include_immobile_pairs=True,
         )
         contacts = pipeline.contacts()
 
