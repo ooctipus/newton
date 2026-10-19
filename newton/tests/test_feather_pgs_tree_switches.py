@@ -278,7 +278,6 @@ class TestTreeKernelSwitches(unittest.TestCase):
             options = {
                 "layout": group.layout,
                 "body_velocity": group._body_velocity,
-                "copy_reuse": group.copy_reuse,
                 "reference": group.reference,
                 "clocked": group.clocked,
             }
