@@ -1205,7 +1205,8 @@ class SolverFeatherPGS(SolverBase):
     velocity [m/s or rad/s] in ``_debug_stage3_qd_work``,
     ``_debug_stage3_joint_qdd`` and ``_debug_stage3_v_hat``, each shaped like
     ``joint_qd`` and copied on every substep. Unset, the three attributes are
-    ``None`` and no copy runs. Physics is the same either way.
+    ``None`` and no copy runs. The snapshots hold no gradient, so physics and
+    a :class:`warp.Tape`'s record are the same either way.
 
     """
 
@@ -5903,18 +5904,14 @@ class SolverFeatherPGS(SolverBase):
             self._deferred_dense_qd_delta = None
             self._propagation_tau = None
             self._propagation_qd_delta = None
-            # Stage-3 snapshots for external NaN dumpers, which read them by
-            # these names: None unless FEATHER_PGS_DEBUG_SNAPSHOTS=1.
+            # Stage-3 snapshots for external NaN dumpers, which read their values
+            # by these names: None unless opted in. Without a gradient, wp.copy
+            # neither copies the source's gradient nor records an adjoint that
+            # would overwrite it, so the opt-in leaves a wp.Tape unchanged.
             snapshot = self._debug_stage3_snapshots
-            self._debug_stage3_qd_work = (
-                wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad) if snapshot else None
-            )
-            self._debug_stage3_joint_qdd = (
-                wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad) if snapshot else None
-            )
-            self._debug_stage3_v_hat = (
-                wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad) if snapshot else None
-            )
+            self._debug_stage3_qd_work = wp.zeros_like(model.joint_qd, requires_grad=False) if snapshot else None
+            self._debug_stage3_joint_qdd = wp.zeros_like(model.joint_qd, requires_grad=False) if snapshot else None
+            self._debug_stage3_v_hat = wp.zeros_like(model.joint_qd, requires_grad=False) if snapshot else None
             self._debug_position_v_out = (
                 wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
                 if self._debug_buffers_enabled

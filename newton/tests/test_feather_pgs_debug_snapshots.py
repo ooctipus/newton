@@ -5,7 +5,8 @@
 
 Without ``FEATHER_PGS_DEBUG_SNAPSHOTS=1`` the solver allocates no snapshot and
 launches no snapshot copy. With it, the external NaN dumpers read the same
-attributes, shapes and values as before the switch existed.
+attributes, shapes and values as before the switch existed, and the snapshots
+hold no gradient, so a tape records the same step.
 """
 
 import ctypes
@@ -104,6 +105,61 @@ def _scene(device, worlds=2):
     # Free joints with the legacy DOF-shaped target layout warn at finalize.
     with patch.object(newton, "use_coord_layout_targets", True):
         return builder.finalize(device=device)
+
+
+@wp.kernel
+def _sum_of_squares(values: wp.array[float], total: wp.array[float]):
+    i = wp.tid()
+    wp.atomic_add(total, 0, values[i] * values[i])
+
+
+def _gradient_arm(device):
+    """A fixed-base two-link arm whose model records gradients."""
+    builder = newton.ModelBuilder()
+    parent, joints = -1, []
+    for link in range(2):
+        body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.05), lock_inertia=True)
+        joints.append(
+            builder.add_joint_revolute(
+                parent=parent,
+                child=body,
+                axis=newton.Axis.Y,
+                parent_xform=wp.transform(wp.vec3(0.0, 0.0, 1.0 if link == 0 else -0.2), wp.quat_identity()),
+                target_ke=5.0,
+                target_kd=1.0,
+            )
+        )
+        parent = body
+    builder.add_articulation(joints)
+    return builder.finalize(device=device, requires_grad=True)
+
+
+def _taped_step(model, *, snapshots):
+    """Step once under a tape, then back-propagate a loss on the input and output joint velocities.
+
+    The loss reads the input velocity itself, so its gradient reaches the input
+    however much of it flows back through the step.
+    """
+    with _snapshot_flag(snapshots):
+        solver = SolverFeatherPGS(model)
+    state_in, state_out = model.state(requires_grad=True), model.state(requires_grad=True)
+    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+    state_in.joint_qd.assign(np.array([0.3, -0.5], dtype=np.float32))
+    loss = wp.zeros(1, dtype=float, requires_grad=True, device=model.device)
+    tape = wp.Tape()
+    with tape:
+        solver.step(state_in, state_out, model.control(), None, DT)
+        for velocity in (state_in.joint_qd, state_out.joint_qd):
+            wp.launch(_sum_of_squares, dim=velocity.shape[0], inputs=[velocity], outputs=[loss], device=model.device)
+    tape.backward(loss)
+    return {
+        "solver": solver,
+        "tape_entries": len(tape.launches),
+        "joint_qd_out": state_out.joint_qd.numpy().copy(),
+        "loss": loss.numpy().copy(),
+        "joint_qd_grad": state_in.joint_qd.grad.numpy().copy(),
+        "joint_q_grad": state_in.joint_q.grad.numpy().copy(),
+    }
 
 
 def _is_snapshot(solver, array):
@@ -296,6 +352,29 @@ class TestFeatherPGSDebugSnapshots(unittest.TestCase):
         state_in, state_out = model.state(), model.state()
         solver.step(state_in, state_out, None, None, DT)
         self.assertTrue(np.all(np.isfinite(state_out.particle_q.numpy())))
+
+    def test_snapshots_record_no_gradients(self):
+        """Leave a tape's record and its input gradients unchanged when the flag keeps the snapshots.
+
+        The snapshots hold no gradient, so wp.copy neither copies the sources'
+        gradients nor records an adjoint copy, which in the backward pass would
+        overwrite the sources' gradients with the snapshots' zeros. CPU covers
+        it: wp.copy's gradient handling is the same on every device.
+        """
+        model = _gradient_arm("cpu")
+        runs = {snapshots: _taped_step(model, snapshots=snapshots) for snapshots in (False, True)}
+        solver = runs[True]["solver"]
+        for name in SNAPSHOTS:
+            snapshot = getattr(solver, name)
+            self.assertIsInstance(snapshot, wp.array, name)
+            self.assertFalse(snapshot.requires_grad, name)
+            self.assertIsNone(snapshot.grad, name)
+        self.assertEqual(runs[True]["tape_entries"], runs[False]["tape_entries"])
+        for name in ("joint_qd_out", "loss", "joint_qd_grad", "joint_q_grad"):
+            np.testing.assert_array_equal(runs[True][name], runs[False][name], err_msg=name)
+        # The loss's own term, 2 * qd_in, reaches the input: an overwrite would show.
+        self.assertTrue(np.all(np.isfinite(runs[False]["joint_qd_grad"])))
+        self.assertGreater(float(np.abs(runs[False]["joint_qd_grad"]).max()), 0.1)
 
 
 def _graph_node_types(graph):

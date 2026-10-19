@@ -1,0 +1,1 @@
+Stop the FeatherPGS stage-3 debug snapshots from zeroing gradients: on a model with `requires_grad=True`, each snapshot copy recorded an adjoint on a `wp.Tape` that overwrote the gradient of its source, such as the step's input joint velocity, with zeros. The snapshots are now off by default and hold no gradient when kept.
