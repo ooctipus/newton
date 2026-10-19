@@ -5,6 +5,7 @@
 
 import functools
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import warp as wp
@@ -16,6 +17,9 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 
 TOLERANCE = TRACE_GRID[8]
 """The velocity tolerance of the tests, 1e-3 [m/s or rad/s], a point of the trace's grid."""
+
+BUDGET = 32
+"""Sweep budget of the rollouts: the exact law runs every sweep of their first solve, which a tolerance shortens."""
 
 
 def _build(device, worlds=8, *, hip_pitch=False):
@@ -88,13 +92,15 @@ def _build(device, worlds=8, *, hip_pitch=False):
     return model, contacts
 
 
-def _first_solve_changes(model, contacts, sweeps, dt=0.005):
-    """Replay the rollouts' first solve on the CPU, one sweep at a time; return each world's largest change per sweep.
+def _first_solve_sweeps(model, contacts, sweeps, dt=0.005):
+    """Replay the rollouts' first solve on the CPU, one sweep at a time, and return each row's change per sweep.
 
     The CPU split route assembles the rows the native sparse sweep solves (Delassus matrix, right-hand
     side and diagonal, from the rollouts' first state), and its dense loop kernel applies the same
-    sweep law, one sweep per launch. Row ``i``'s impulse change times ``A_ii`` is the velocity-scaled
-    change the trace records; the result has shape ``[world_count, sweeps]``.
+    sweep law, one sweep per launch, from the zero impulses the rollouts start from. ``change`` holds
+    each row's impulse change, shape ``[sweeps, world_count, rows]``; times the row's diagonal
+    ``A_ii`` (``diagonal``) it is the velocity-scaled change the trace records. ``live`` marks each
+    world's rows, ``[world_count, rows]``.
     """
     solver = SolverFeatherPGS(model, pgs_mode="split", pgs_iterations=1, friction_anchor_beta=0.0)
     state_in, state_out = model.state(), model.state()
@@ -102,10 +108,7 @@ def _first_solve_changes(model, contacts, sweeps, dt=0.005):
     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
     solver.step(state_in, state_out, model.control(), contacts, dt)
     impulses = wp.zeros_like(solver.impulses)
-    counts, diagonal = solver.constraint_count.numpy(), solver.diag.numpy()
-    live = np.arange(diagonal.shape[1]) < counts[:, None]
-    previous = impulses.numpy().copy()
-    changes = np.zeros((len(counts), sweeps))
+    history = [impulses.numpy().copy()]
     for sweep in range(sweeps):
         wp.launch(
             pgs_solve_loop,
@@ -127,27 +130,38 @@ def _first_solve_changes(model, contacts, sweeps, dt=0.005):
             ],
             device=model.device,
         )
-        current = impulses.numpy().copy()
-        changes[:, sweep] = np.where(live, np.abs(current - previous) * diagonal, 0.0).max(axis=1)
-        previous = current
-    return changes
+        history.append(impulses.numpy().copy())
+    counts = solver.constraint_count.numpy()
+    return SimpleNamespace(
+        change=np.abs(np.diff(np.stack(history), axis=0)),
+        diagonal=solver.diag.numpy(),
+        live=np.arange(solver.impulses.shape[1]) < counts[:, None],
+    )
+
+
+def _first_stops(quiet, live):
+    """Return, per world, the first sweep after which every live row is quiet, or 0 if no sweep is."""
+    quiet = np.where(live, quiet, True).all(axis=-1)
+    return np.where(quiet.any(axis=0), quiet.argmax(axis=0) + 1, 0)
 
 
 class TestSparseToleranceFixture(unittest.TestCase):
-    """The velocity-tolerance test's premise, replayed on the CPU twin of the sweep law."""
+    """The tolerance tests' premise, replayed on the CPU twin of the sweep law."""
 
     def test_first_solve_falls_within_the_tolerance_early(self):
-        """Fall within 1e-3 in every world well before the 64-sweep budget on legs that pitch at the hip.
+        """Fall within 1e-3 in every world well before the rollouts' budget, all of which the exact law runs.
 
         The velocity-tolerance test stops these solves at their first sweep within 1e-3 and needs it
-        to come before the exact law stops. On legs without hip pitch the replay drifts instead, by
-        about 0.2 m/s every sweep, so neither law would stop within the budget.
+        to come before the exact law stops; on legs that pitch at the hip no sweep within the budget
+        leaves every impulse unchanged. On legs without hip pitch the replay drifts instead, by about
+        0.2 m/s every sweep, so neither law would stop within the budget.
         """
         model, contacts = _build("cpu", hip_pitch=True)
-        changes = _first_solve_changes(model, contacts, 64)
-        within = changes <= TOLERANCE
-        self.assertTrue(within.any(axis=1).all(), changes[:, -1])
-        self.assertLess(int(within.argmax(axis=1).max()) + 1, 32)
+        replay = _first_solve_sweeps(model, contacts, BUDGET)
+        self.assertEqual(_first_stops(replay.change == 0.0, replay.live).tolist(), [0] * len(replay.live))
+        stops = _first_stops(replay.change * replay.diagonal <= TOLERANCE, replay.live)
+        self.assertTrue((stops > 0).all(), stops)
+        self.assertLessEqual(int(stops.max()), 3 * BUDGET // 4)
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "Native sparse factors are a CUDA path")
@@ -207,29 +221,31 @@ class TestFeatherPGSSparseTolerance(unittest.TestCase):
     def test_velocity_tolerance_stops_earlier_near_the_exact_law(self):
         """Stay near the exact law in fewer sweeps under a velocity tolerance, with every exit sweep within it.
 
-        Over a 12-step rollout a 1e-3 tolerance stays within 1e-2 of the exact law, executes no more
-        sweeps, and stops only on final sweeps within the tolerance. On a first solve, identical in
-        both runs, at a budget of 64 sweeps the tolerance stops each world exactly where the exact
+        Over a 12-step rollout at a budget of 32 sweeps, all of which the exact law runs in the first
+        solve, a 1e-3 tolerance stops that solve earlier, stays within 1e-2 of the exact law, executes
+        fewer sweeps, and stops only on final sweeps within the tolerance. On a first solve, identical
+        in both runs, at a budget of 64 sweeps the tolerance stops each world exactly where the exact
         law's trace predicts for 1e-3, which is earlier than the exact law. The legs pitch at the hip,
         so the sweep converges (``TestSparseToleranceFixture`` replays that solve on the CPU); on
         legs without it, it drifts and neither law stops within any budget.
         """
         rollout = functools.partial(self._rollout, hip_pitch=True)
-        exact, _ = rollout(8)
-        counted, exact_solver = rollout(8, readout="sweeps")
+        exact, _ = rollout(BUDGET)
+        counted, exact_solver = rollout(BUDGET, readout="sweeps")
         np.testing.assert_array_equal(counted, exact)
-        again, _ = rollout(8, velocity_tolerance=0.0, readout="trace")
+        again, _ = rollout(BUDGET, velocity_tolerance=0.0, readout="trace")
         np.testing.assert_array_equal(again, exact)
-        loose, solver = rollout(8, velocity_tolerance=TOLERANCE, readout="trace")
+        loose, solver = rollout(BUDGET, velocity_tolerance=TOLERANCE, readout="trace")
         self.assertLess(float(np.abs(loose - exact).max()), 1.0e-2)
         law = solver.get_path_selection()["routes"]["sweep"]["exit_law"]
         self.assertEqual((law["law"], list(law["honored"].values())), ("velocity", ["sparse_pgs"]))
         (slot,) = solver.get_path_selection()["measurements"]["solve_readout"]["slots"]
         (exact_slot,) = exact_solver.get_path_selection()["measurements"]["solve_readout"]["slots"]
         self.assertEqual(slot["solves"], exact_slot["solves"])
-        self.assertLessEqual(slot["mean_sweeps"], exact_slot["mean_sweeps"])
+        self.assertLess(slot["mean_sweeps"], exact_slot["mean_sweeps"])
         trace = slot["trace"]
         self.assertEqual(sum(trace["reasons"].values()), slot["solves"])
+        self.assertGreater(trace["reasons"]["tolerance"], 0)
         # A stopped solve's final sweep changed by at most 1e-3, in magnitude bins below 10^-2.5 (14 and up),
         # so only solves that ran out of budget reach those bins.
         beyond = sum(sum(entry["bins"][14:]) for entry in trace["final_change"].values())
