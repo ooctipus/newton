@@ -617,9 +617,13 @@ def _tier_worlds(solver):
 def _tier_route():
     """A tripod world beside a free-body world, with the parallel tiers of ``mf_gs_parallel_rows`` built.
 
-    The tripod's world holds only dense rows, within the tiers' bound, so the tiers solve it without
-    counters and the matrix-free sweep returns before its first sweep there; the free body's
-    matrix-free rows keep its world on the counted matrix-free sweep.
+    The tripod's world holds only dense rows (24 while its feet touch the ground: six contacts and
+    six joint-limit rows), within the tiers' bound, so the tiers solve it without counters and the
+    matrix-free sweep returns before its first sweep there; the free body's matrix-free rows keep
+    its world on the counted matrix-free sweep. The tiled response keeps the local owners out: the
+    automatic choice gives the tripod's 9 DOFs the parallel-row response, which makes a world with
+    one small non-free articulation, in a model with free bodies, a local-owner candidate, and its
+    counted local sweep would claim the world whenever it holds at most 9 rows of one phase.
     """
     from newton.tests.test_feather_pgs_sparse_solver import _build_model  # noqa: PLC0415
 
@@ -634,6 +638,7 @@ def _tier_route():
             "mf_max_constraints": 64,
             "mf_gs_parallel_rows": 32,
         },
+        "overrides": {"hinv_jt_kernel": "tiled"},
         "labels": {"mf_gs"},
         "owners": ({"mf_gs"},),
         "solving": {"mf_gs"},
@@ -850,10 +855,13 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         The tiers solve the tripod's world without counters, so neither the matrix-free slot nor the
         skip counter may count it: the slot's solves, the skipped ones and the tiers' world-solves,
         found from each step's row counts, must add up to every world at every step. The tiers keep
-        their own exit under a velocity tolerance, which the exit law records and warns about.
+        their own exit under a velocity tolerance, which the exit law records and warns about; the
+        matrix-free sweep is then the route's only sweep that honors it, as no local owner is built.
         """
         route, steps = _tier_route(), 4
         solver, summary, model = self._lockstep(route, steps=steps)
+        # The route's premise: no local owner claims the tripod's world, so the tiers own it.
+        self.assertFalse(solver._local_internal_fast_path)
         sweep = solver.get_path_selection()["routes"]["sweep"]
         tier_kernels = {tier["kernel"] for tier in sweep["tiers"]["tiers"]}
         self.assertEqual(sweep["tiers"]["family"], "parallel")
