@@ -690,9 +690,12 @@ def branch_topology(model, articulations: np.ndarray, articulation_joint_end: np
     return kinds, ""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class ScalarBranchPlan:
-    """A size group whose articulations are all scalar branches."""
+    """A size group whose articulations are all scalar branches.
+
+    Plans compare and hash by identity: ``dofs`` is an array.
+    """
 
     size: int
     """Leaves (coordinates) per articulation."""

@@ -917,6 +917,9 @@ class TestScalarBranchRule(unittest.TestCase):
                     [model.joint_qd_start.numpy()[starts[a] + 1] + np.arange(7) for a in solver.group_to_art[7].numpy()]
                 )
                 np.testing.assert_array_equal(plan.dofs, np.sort(expected))
+                # A plan holds an array, so it compares and hashes by identity.
+                self.assertNotEqual(plan, dataclasses.replace(plan, dofs=plan.dofs.copy()))
+                self.assertEqual(len({plan, plan}), 1)
 
     def test_admits_the_keyboard_shaped_fixture(self):
         """Admit the 108-key group of the two-world 108+6 fixture, whatever the arm's root."""
