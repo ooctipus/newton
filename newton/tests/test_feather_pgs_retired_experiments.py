@@ -11,6 +11,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.core import environment_flags as core_flags
 from newton._src.solvers.feather_pgs import environment_flags
 
 RETIRED_FLAGS = (
@@ -127,10 +128,18 @@ class TestFeatherPGSRetiredExperiments(unittest.TestCase):
                     newton.solvers.SolverFeatherPGS(None)
 
     def test_packed_route_flags_run_the_general_route_cpu(self):
-        """Construct a G1 recipe's flags on the general route and record them as retired."""
+        """Construct a recipe's packed-route flags on the general route, record them as retired and warn about them."""
         model = _humanoids("cpu")
         plain = _selection(model, {})
-        recipe = _selection(model, dict.fromkeys(PACKED_ROUTE_FLAGS, "1"))
+        # The solver warns once per process about retired names; report them afresh.
+        with (
+            patch.object(core_flags, "_WARNED_RETIRED", set()),
+            self.assertWarnsRegex(
+                UserWarning,
+                rf"^Ignoring retired environment variables that select nothing: {', '.join(sorted(PACKED_ROUTE_FLAGS))}\.",
+            ),
+        ):
+            recipe = _selection(model, dict.fromkeys(PACKED_ROUTE_FLAGS, "1"))
         self.assertEqual(
             recipe["environment"],
             {"applied": {}, "unknown": [], "retired": sorted(PACKED_ROUTE_FLAGS), "isaac_lab": {}},

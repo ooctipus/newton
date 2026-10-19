@@ -402,7 +402,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_constructor_warnings_name_the_caller(self):
         """Attribute construction warnings to the constructor's caller, not to the keyword-only shim."""
         model = _cpu_model()
-        with warnings.catch_warnings(record=True) as recorded:
+        # A retired FEATHER_PGS_ name in the process environment would add its own warning.
+        with _without_solver_environment(), warnings.catch_warnings(record=True) as recorded:
             warnings.simplefilter("always")
             SolverFeatherPGS(model, 0.05, contact_friction_anchor_limit=2, contact_shared_anchor=True)
         messages = {str(item.message).split(" ")[0]: os.path.basename(item.filename) for item in recorded}

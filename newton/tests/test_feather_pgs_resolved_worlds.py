@@ -16,6 +16,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.core import environment_flags as core_flags
 from newton._src.solvers.feather_pgs import kernels
 from newton._src.solvers.feather_pgs import resolved_worlds as rw
 from newton._src.solvers.feather_pgs.friction_patches import (
@@ -886,7 +887,12 @@ class TestResolvedWorldsSparseRoute(unittest.TestCase):
             "FEATHER_PGS_SPARSE_LEVEL_UPDATE": "1",
             "FEATHER_PGS_SPARSE_PARALLEL_LIMITS": "1",
         }
-        with patch.dict(os.environ, env):
+        # The solver warns once per process about retired names; report them afresh.
+        with (
+            patch.dict(os.environ, env),
+            patch.object(core_flags, "_WARNED_RETIRED", set()),
+            self.assertWarnsRegex(UserWarning, "^Ignoring retired environment variables that select nothing: "),
+        ):
             solver = SolverFeatherPGS(
                 model,
                 pgs_mode="matrix_free",
@@ -897,6 +903,7 @@ class TestResolvedWorldsSparseRoute(unittest.TestCase):
                 friction_anchor_beta=0.0,
                 mf_gs_incremental_rows=0,
             )
+        self.assertLessEqual(set(env), set(solver.get_path_selection()["environment"]["retired"]))
         self.assertIsNotNone(solver._sparse_mass_matrix_size)
         routes = solver.get_path_selection()["routes"]
         self.assertNotIn("research_sparse_factor", routes)
