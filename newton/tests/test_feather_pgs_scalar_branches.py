@@ -1059,6 +1059,65 @@ class TestScalarBranchKernels(unittest.TestCase):
         # The leaves turned: the published body velocities carry angular parts.
         self.assertGreater(float(np.abs(pair.states["mine"][0].body_qd.numpy()[pair.bodies, 3:]).max()), 1.0e-4)
 
+    def test_other_drives_match_the_drive_kernel(self):
+        """Prepare the drives outside the branches as the full drive kernel does and leave the branches' alone.
+
+        The branches' predict evaluates their own drives (the twins above), so
+        drive preparation covers only the other DOFs: their stiffness and
+        forces carry the full kernel's bits, including a clamped force and a
+        nonpositive stiffness, and nothing writes the branches' entries.
+        """
+        model = build_branch_model(worlds=3)
+        pair = _Pair(model)
+        layout = _Layout(model)
+        rng = np.random.default_rng(23)
+        ke, kd = model.joint_target_ke.numpy(), model.joint_target_kd.numpy()
+        effort = model.joint_effort_limit.numpy()
+        ke[layout.arm_dofs[0]] = kd[layout.arm_dofs[0]] = 0.0
+        effort[layout.arm_dofs[1]] = 1.0e-3
+        model.joint_target_ke.assign(ke)
+        model.joint_target_kd.assign(kd)
+        model.joint_effort_limit.assign(effort)
+        state, control = model.state(), model.control()
+        state.joint_q.assign(rng.uniform(-0.3, 0.3, model.joint_coord_count).astype(np.float32))
+        state.joint_qd.assign(rng.uniform(-0.5, 0.5, model.joint_dof_count).astype(np.float32))
+        control.joint_target_q.assign(rng.uniform(-0.2, 0.2, control.joint_target_q.shape[0]).astype(np.float32))
+        control.joint_target_qd.assign(rng.uniform(-0.1, 0.1, control.joint_target_qd.shape[0]).astype(np.float32))
+        head = pair.head
+        wp.launch(
+            solver_module._prepare_augmented_joint_drives_by_dof,
+            dim=model.joint_dof_count,
+            inputs=[
+                head._augmented_drive_row_by_dof,
+                head._augmented_drive_q_index_by_dof,
+                head._augmented_drive_target_index_by_dof,
+                state.joint_q,
+                state.joint_qd,
+                model.joint_target_ke,
+                model.joint_target_kd,
+                control.joint_target_q,
+                control.joint_target_qd,
+                model.joint_effort_limit,
+                DT,
+            ],
+            outputs=[head.aug_row_K, head.joint_tau],
+            device=model.device,
+        )
+        pair.mine.aug_row_K.fill_(-7.0)
+        pair.mine.joint_tau.fill_(-7.0)
+        pair.state.launch_other_drives(state, pair.mine, control, DT)
+        others = pair.state.other_drive_dofs.numpy()
+        np.testing.assert_array_equal(np.sort(np.concatenate([others, pair.dofs])), np.arange(model.joint_dof_count))
+        self.assertEqual(pair.state.record()["drive_dofs"], len(others))
+        rows = pair.mine._augmented_drive_row_by_dof.numpy()
+        np.testing.assert_array_equal(pair.mine.joint_tau.numpy()[others], head.joint_tau.numpy()[others])
+        other_rows = rows[others][rows[others] >= 0]
+        np.testing.assert_array_equal(pair.mine.aug_row_K.numpy()[other_rows], head.aug_row_K.numpy()[other_rows])
+        self.assertIn(0.0, head.aug_row_K.numpy()[other_rows])
+        self.assertIn(np.float32(1.0e-3), np.abs(head.joint_tau.numpy()[others]))
+        np.testing.assert_array_equal(pair.mine.joint_tau.numpy()[pair.dofs], -7.0)
+        np.testing.assert_array_equal(pair.mine.aug_row_K.numpy()[rows[pair.dofs]], -7.0)
+
     def test_validation_accepts_frames_and_rejects_topology(self):
         """Accept numeric and frame notifications; refuse a changed parent or group map.
 
@@ -1097,13 +1156,22 @@ def _close(test, expected, actual, index, tag, *, rtol, atol):
 
 @unittest.skipUnless(wp.is_cuda_available(), "Scalar branches run on the CUDA held-tree owner")
 class TestScalarBranchOwner(unittest.TestCase):
-    def _poison(self, solver, bodies):
-        """Fill the FK/ID fields the scalar family stops writing with NaN for its bodies."""
+    def _poison(self, solver, bodies, dofs):
+        """Fill what the scalar family neither writes nor reads with NaN for its bodies and DOFs.
+
+        That is the FK/ID fields of its bodies, and the drive stiffness and
+        forces of its DOFs, which its predict evaluates itself.
+        """
         for name in DROPPED_FIELDS:
             array = getattr(solver, name)
             values = array.numpy()
             values[bodies] = np.nan
             array.assign(values)
+        tau, stiffness = solver.joint_tau.numpy(), solver.aug_row_K.numpy()
+        tau[dofs] = np.nan
+        stiffness[solver._augmented_drive_row_by_dof.numpy()[dofs]] = np.nan
+        solver.joint_tau.assign(tau)
+        solver.aug_row_K.assign(stiffness)
 
     def test_owner_matches_the_prismatic_route(self):
         """Own 108-key worlds as scalar branches beside a held arm and track the prismatic linear state route.
@@ -1134,7 +1202,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         self.assertIsNone(scalar._prismatic_publication)
         self.assertFalse(scalar._prismatic_linear_state)
         self.assertIs(owner.scalar.predictor_kernel, sb.predict_prismatic_branches)
-        self._poison(scalar, layout.key_bodies)
+        self._poison(scalar, layout.key_bodies, layout.key_dofs)
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
         contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]
@@ -1241,10 +1309,39 @@ class TestScalarBranchOwner(unittest.TestCase):
             mask.assign(np.asarray(reset, dtype=np.bool_))
             inputs(replay + 11)
             write_coordinates(reset)
-            self._poison(scalar, layout.key_bodies)
+            self._poison(scalar, layout.key_bodies, layout.key_dofs)
             for graph in graphs:
                 wp.capture_launch(graph)
             compare(f"replay {replay}")
+
+    def test_drive_kernel_covers_only_the_other_dofs(self):
+        """Launch the drive preparation over the DOFs outside the branches only; the branches fold theirs.
+
+        Without this restriction the full drive kernel runs over every DOF,
+        the branches' 1.77 M of keyboard-shaped worlds included.
+        """
+        device = wp.get_device("cuda:0")
+        model = build_branch_model(device, worlds=2, leaves=12, shapes=True)
+        model.rigid_contact_max = 1
+        solver = recipe_solver(model, scalar=True)
+        states, control = [model.state(), model.state()], model.control()
+        contacts = newton.Contacts(model.rigid_contact_max, 0, device=device)
+        contacts.rigid_contact_count.zero_()
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        launched = []
+        original = wp.launch
+
+        def record(kernel, *args, **kwargs):
+            launched.append((kernel, kwargs.get("dim")))
+            return original(kernel, *args, **kwargs)
+
+        with mock.patch.object(wp, "launch", record):
+            solver.step(states[0], states[1], control, contacts, DT)
+        kernels = [kernel for kernel, _dim in launched]
+        self.assertNotIn(solver_module._prepare_augmented_joint_drives_by_dof, kernels)
+        dims = [dim for kernel, dim in launched if kernel is sb.prepare_listed_augmented_drives]
+        self.assertEqual(dims, [model.joint_dof_count - 12 * model.world_count])
+        self.assertTrue(np.isfinite(states[1].joint_q.numpy()).all())
 
     def test_key_press_follows_the_drive_law(self):
         """Press keys with an external force and release them: both routes follow the drive's closed form.

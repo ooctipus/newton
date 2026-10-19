@@ -581,6 +581,47 @@ def finish_scalar_branches(
         )
 
 
+@wp.kernel(enable_backward=False)
+def prepare_listed_augmented_drives(
+    dofs: wp.array[int],
+    drive_row_by_dof: wp.array[int],
+    drive_q_index_by_dof: wp.array[int],
+    drive_target_index_by_dof: wp.array[int],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_target_ke: wp.array[float],
+    joint_target_kd: wp.array[float],
+    joint_target_pos: wp.array[float],
+    joint_target_vel: wp.array[float],
+    joint_effort_limit: wp.array[float],
+    dt: float,
+    # outputs
+    row_K: wp.array[float],
+    drive_tau: wp.array[float],
+):
+    """``_prepare_augmented_joint_drives_by_dof`` over listed DOFs: those whose drives no branch predict folds."""
+    dof = dofs[wp.tid()]
+    drive_tau[dof] = 0.0
+    row = drive_row_by_dof[dof]
+    if row < 0:
+        return
+    u0, stiffness = _drive_terms(
+        dof,
+        joint_q[drive_q_index_by_dof[dof]],
+        joint_qd[dof],
+        dt,
+        drive_row_by_dof,
+        drive_target_index_by_dof,
+        joint_target_ke,
+        joint_target_kd,
+        joint_target_pos,
+        joint_target_vel,
+        joint_effort_limit,
+    )
+    row_K[row] = stiffness
+    drive_tau[dof] = u0
+
+
 def branch_topology(model, articulations: np.ndarray, articulation_joint_end: np.ndarray) -> tuple:
     """Check that every articulation is a world-fixed root over one-coordinate leaves.
 
@@ -757,6 +798,10 @@ class ScalarBranchState:
         self.predictor_kernel = predict_prismatic_branches if plan.prismatic else predict_scalar_branches
         self.finish_kernel = finish_prismatic_branches if plan.prismatic else finish_scalar_branches
         self.lane_timing = {}
+        # The predict folds the branches' augmented drives, so the drive
+        # preparation runs only over the other DOFs.
+        others = np.setdiff1d(np.arange(model.joint_dof_count, dtype=np.int32), plan.dofs).astype(np.int32)
+        self.other_drive_dofs = wp.array(others, dtype=int, device=device) if others.size else None
         self._plan_dimensions = self._dimensions()
         self._proof = DeviceProof(
             [(name, getattr(model, name)) for name in (*_TOPOLOGY_FIELDS, *_LIVE_FIELDS)]
@@ -808,6 +853,8 @@ class ScalarBranchState:
             "publishes_twists": False,
             "lane_choice": "static",
             "kinds": list(self.plan.kinds),
+            # The predict evaluates the branches' drives; the drive kernel runs over the other DOFs only.
+            "drive_dofs": 0 if self.other_drive_dofs is None else int(self.other_drive_dofs.shape[0]),
             "kernels": {
                 "repair": self.repair_kernel.key,
                 "finish": self.finish_kernel.key,
@@ -907,6 +954,37 @@ class ScalarBranchState:
             ],
             outputs=[state_in.body_q, state_aug.joint_S_s, solver.articulation_origin],
             block_dim=128,
+            device=model.device,
+        )
+
+    def launch_other_drives(self, state_in, state_aug, control, dt):
+        """Prepare the augmented drives of the DOFs outside the branches, whose ``predict`` folds its own.
+
+        Writes the drive rows' ``K`` and the drive forces into ``joint_tau`` as
+        ``_prepare_augmented_joint_drives_by_dof`` does, for the listed DOFs only.
+        """
+        if self.other_drive_dofs is None:
+            return
+        solver, model = self.solver, self.solver.model
+        wp.launch(
+            prepare_listed_augmented_drives,
+            dim=self.other_drive_dofs.shape[0],
+            inputs=[
+                self.other_drive_dofs,
+                solver._augmented_drive_row_by_dof,
+                solver._augmented_drive_q_index_by_dof,
+                solver._augmented_drive_target_index_by_dof,
+                state_in.joint_q,
+                state_in.joint_qd,
+                model.joint_target_ke,
+                model.joint_target_kd,
+                control.joint_target_q,
+                control.joint_target_qd,
+                model.joint_effort_limit,
+                dt,
+            ],
+            outputs=[solver.aug_row_K, state_aug.joint_tau],
+            block_dim=256,
             device=model.device,
         )
 

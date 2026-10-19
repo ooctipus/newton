@@ -12406,7 +12406,11 @@ class SolverFeatherPGS(SolverBase):
         dynamics_stream = self._articulation_dynamics_stream
         dynamics_stream.wait_event(wp.get_stream(model.device).record_event())
         with wp.ScopedStream(dynamics_stream, sync_enter=False):
-            if self._parallel_augmented_drive_topology:
+            scalar = getattr(self._tree_kinetic_state, "scalar", None)
+            if scalar is not None:
+                # Scalar branches evaluate their drives in their predict.
+                scalar.launch_other_drives(state_in, state_aug, control, dt)
+            elif self._parallel_augmented_drive_topology:
                 wp.launch(
                     _prepare_augmented_joint_drives_by_dof,
                     dim=model.joint_dof_count,
