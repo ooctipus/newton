@@ -331,6 +331,32 @@ def test_notifications_refresh_the_immobile_set(test, device):
                 model.joint_enabled.assign(enabled)
 
 
+def test_unchanged_notifications_skip_the_refresh(test, device):
+    """Rewrite the immobile set only after a notified array changed, reading only the notified arrays."""
+    model, worlds = _pair_scene(device)
+    base_body = int(model.shape_body.numpy()[worlds[0]["base"]])
+    flags = model.body_flags.numpy().copy()
+    with _flag(None):
+        pipeline = newton.CollisionPipeline(model)
+    mask = pipeline._immobile_shape_body
+    try:
+        with patch.object(mask, "assign", wraps=mask.assign) as assign:
+            pipeline.notify_model_changed(ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_PROPERTIES)
+            test.assertEqual(assign.call_count, 0)
+            changed = flags.copy()
+            changed[base_body] = int(BodyFlags.KINEMATIC)
+            model.body_flags.assign(changed)
+            # A joint notification re-reads the joint enables only.
+            pipeline.notify_model_changed(ModelFlags.JOINT_PROPERTIES)
+            test.assertEqual(assign.call_count, 0)
+            test.assertEqual(pipeline.get_collision_selection()["immobile_pairs"]["welded_bodies"], 3 * _WORLDS)
+            pipeline.notify_model_changed(ModelFlags.BODY_PROPERTIES)
+            test.assertEqual(assign.call_count, 1)
+            test.assertEqual(pipeline.get_collision_selection()["immobile_pairs"]["welded_bodies"], 3 * _WORLDS - 2)
+    finally:
+        model.body_flags.assign(flags)
+
+
 def test_captured_collide_reads_notified_set(test, device):
     """Replay a captured collide with the immobile set of the latest notification, and refuse one in capture."""
     model, worlds = _pair_scene(device)
@@ -479,6 +505,7 @@ for name, function in (
         test_models_without_immobile_pairs_keep_unfiltered_arguments,
     ),
     ("test_notifications_refresh_the_immobile_set", test_notifications_refresh_the_immobile_set),
+    ("test_unchanged_notifications_skip_the_refresh", test_unchanged_notifications_skip_the_refresh),
     ("test_environment_flag_values", test_environment_flag_values),
     ("test_fixed_base_arm_trajectories_match", test_fixed_base_arm_trajectories_match),
 ):

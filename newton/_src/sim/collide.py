@@ -3115,26 +3115,35 @@ class CollisionPipeline:
             self._heightfield_convex_cells.invalidate()
 
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
-        """Refresh pipeline data derived from the model after supported model changes.
+        """Refresh the immobile shapes after body-flag or joint-enable changes.
 
-        While the broad phase drops pairs of structurally immobile shapes (see
-        ``include_immobile_pairs``), body changes (``ModelFlags.BODY_PROPERTIES``,
-        which covers :attr:`~newton.Model.body_flags`) and joint changes
-        (``ModelFlags.JOINT_PROPERTIES``, which here also covers
-        :attr:`~newton.Model.joint_enabled`) recompute which shapes are immobile.
-        The result is written in place, so CUDA graphs captured earlier use it on
-        their next replay. Other flags need no pipeline update. Call outside CUDA
-        graph capture.
+        This method handles two flags, and only while the broad phase drops pairs of
+        structurally immobile shapes (see ``include_immobile_pairs``):
+        ``ModelFlags.BODY_PROPERTIES`` copies :attr:`~newton.Model.body_flags` from the
+        device and ``ModelFlags.JOINT_PROPERTIES`` copies :attr:`~newton.Model.joint_enabled`.
+        The immobile shapes are recomputed only when a copied array changed, and are
+        written in place, so graphs captured earlier use them on their next replay. Other
+        properties these flags cover, such as :attr:`~newton.Model.joint_q` or
+        :attr:`~newton.Model.joint_X_p`, do not affect the pipeline and need no
+        notification here. Other flags are ignored: after material changes call
+        :meth:`refresh_body_pair_reduction_groups`, and before geometry edits
+        :meth:`invalidate_convex_cells`.
 
         Args:
             flags: Bit-mask of :class:`~newton.ModelFlags` or custom ``int`` bits
                 indicating which model properties changed.
+
+        Raises:
+            RuntimeError: If a handled flag arrives while the broad phase drops immobile
+                pairs and the model's device is capturing a graph.
         """
-        if self._immobile_shape_body is None or not flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_PROPERTIES):
+        body = bool(flags & ModelFlags.BODY_PROPERTIES)
+        joint = bool(flags & ModelFlags.JOINT_PROPERTIES)
+        if self._immobile_shape_body is None or not (body or joint):
             return
         if self.model.device.is_capturing:
             raise RuntimeError("notify_model_changed() reads the model on the host; call it outside graph capture")
-        self._refresh_immobile_pairs()
+        self._refresh_immobile_pairs(body=body, joint=joint)
 
     def refresh_body_pair_reduction_groups(self):
         """Rebuild material-equivalence reduction groups from current materials.
@@ -3409,7 +3418,7 @@ class CollisionPipeline:
         degree of freedom of its own. A shape is structurally immobile when it is static or
         belongs to a welded body. Joints and shape ownership are fixed once a model is
         finalized and are read here once; body flags and joint enables are runtime state,
-        read on each :meth:`welded_bodies` call that passes the model.
+        which :meth:`read_body_flags` and :meth:`read_joint_enables` copy from the device.
         """
 
         def __init__(self, model: Model):
@@ -3426,25 +3435,34 @@ class CollisionPipeline:
             self.fixed_child = child[self.fixed_joints]
             self.parent_joints = np.bincount(child[attached], minlength=self.body_count)
 
-        def welded_bodies(self, model: Model | None) -> np.ndarray:
+        def read_joint_enables(self, model: Model) -> np.ndarray | None:
+            """Return whether each joint of ``fixed_joints`` is enabled, or ``None`` when all are."""
+            if model.joint_enabled is None or not len(self.fixed_joints):
+                return None
+            return model.joint_enabled.numpy()[self.fixed_joints].astype(bool)
+
+        def read_body_flags(self, model: Model) -> np.ndarray | None:
+            """Return whether each body is dynamic and not kinematic, or ``None`` when all are dynamic."""
+            if model.body_flags is None or not self.body_count:
+                return None
+            flags = model.body_flags.numpy()
+            return ((flags & int(BodyFlags.DYNAMIC)) != 0) & ((flags & int(BodyFlags.KINEMATIC)) == 0)
+
+        def welded_bodies(self, enabled: np.ndarray | None, dynamic: np.ndarray | None) -> np.ndarray:
             """Return a host mask of the welded bodies.
 
             Args:
-                model: The model whose current :attr:`~newton.Model.joint_enabled` and
-                    :attr:`~newton.Model.body_flags` apply: a disabled joint does not weld,
-                    and only a dynamic body welds, because the user can move a kinematic
-                    body and everything welded to it. ``None`` ignores both, which bounds
-                    the welded set over every state they can take.
+                enabled: :meth:`read_joint_enables`; a disabled joint does not weld.
+                dynamic: :meth:`read_body_flags`; only a dynamic body welds, because the user
+                    can move a kinematic body and everything welded to it. With both ``None``
+                    the result bounds the welded set over every state of the two arrays.
             """
             fixed_parent, fixed_child = self.fixed_parent, self.fixed_child
+            if enabled is not None:
+                fixed_parent, fixed_child = fixed_parent[enabled], fixed_child[enabled]
             eligible = self.parent_joints > 0
-            if model is not None:
-                if model.joint_enabled is not None and len(self.fixed_joints):
-                    enabled = model.joint_enabled.numpy()[self.fixed_joints].astype(bool)
-                    fixed_parent, fixed_child = fixed_parent[enabled], fixed_child[enabled]
-                if model.body_flags is not None and self.body_count:
-                    flags = model.body_flags.numpy()
-                    eligible &= ((flags & int(BodyFlags.DYNAMIC)) != 0) & ((flags & int(BodyFlags.KINEMATIC)) == 0)
+            if dynamic is not None:
+                eligible &= dynamic
             # Every parent joint must weld; a body with another parent joint keeps its freedom.
             eligible &= np.bincount(fixed_child, minlength=self.body_count) == self.parent_joints
             welded = np.zeros(self.body_count, dtype=bool)
@@ -3478,11 +3496,12 @@ class CollisionPipeline:
         self._colliding_shapes = _shape_collide_mask(model, len(topology.shape_body))
         self._immobile_shape_body = None
         self._no_body_flags = None
+        self._immobile_inputs = None
         pairs = self.shape_pairs_filtered
         if self.broad_phase_mode != "explicit":
             pairs = getattr(model, "shape_contact_pairs", None)
         # Topology alone bounds the immobile shapes over every body-flag and joint-enable state.
-        reachable = topology.immobile_shapes(topology.welded_bodies(None))
+        reachable = topology.immobile_shapes(topology.welded_bodies(None, None))
         if pairs is None:
             self._immobile_pair_candidates = None
             possible = int(np.count_nonzero(reachable & self._colliding_shapes)) > 1
@@ -3511,10 +3530,23 @@ class CollisionPipeline:
         self._immobile_pairs = {"enabled": self._immobile_shape_body is not None, "source": source, "reason": reason}
         self._refresh_immobile_pairs()
 
-    def _refresh_immobile_pairs(self) -> None:
-        """Recompute the immobile shapes under the model's current body flags and joint enables."""
+    def _refresh_immobile_pairs(self, *, body: bool = True, joint: bool = True) -> None:
+        """Recompute the immobile shapes from the model's body flags (``body``) and joint enables (``joint``).
+
+        Each named array is copied from the device; when neither differs from the previous
+        refresh, nothing is recomputed or written.
+        """
         topology = self._weld_topology
-        welded = topology.welded_bodies(self.model)
+        previous = self._immobile_inputs
+        enabled = topology.read_joint_enables(self.model) if joint or previous is None else previous[0]
+        dynamic = topology.read_body_flags(self.model) if body or previous is None else previous[1]
+        if previous is not None and all(
+            np.array_equal(new, old) if new is not None and old is not None else new is old
+            for new, old in zip((enabled, dynamic), previous, strict=True)
+        ):
+            return
+        self._immobile_inputs = (enabled, dynamic)
+        welded = topology.welded_bodies(enabled, dynamic)
         immobile = topology.immobile_shapes(welded)
         if self._immobile_shape_body is not None:
             # Immobile shapes read as static in the broad phase's immovable-pair test.
