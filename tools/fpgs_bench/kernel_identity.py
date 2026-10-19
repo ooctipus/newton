@@ -422,13 +422,14 @@ def held_tree_calls():
     """Yield every held-tree layout's kernels as they run, plus the switch variants of four layouts.
 
     Every held-tree operator requires body velocity, so the state kernels are
-    recorded with it. Each layout yields its repair, finish and predictor;
+    recorded with it. Each layout yields its repair, finish and predictor and,
     outside motion-velocity layouts, whose stamps a copied bank may name, the
     one-pass repair that compares input banks (the first repair of a captured
-    step); and the kernels of a launch large enough to classify: the
-    classification, the listed repair and, outside motion-velocity layouts,
-    the comparison pass. The switched layouts add the comparison forms, the
-    stage clocks and the repair and finish without body velocity.
+    step) and the kernels of a launch large enough to classify: the
+    classification, the listed repair and the comparison pass. Owners classify
+    only layouts of ordinary motion; a motion-velocity layout keeps its
+    one-pass repair at any size. The switched layouts add the comparison
+    forms, the stage clocks and the repair and finish without body velocity.
     """
     from newton._src.solvers.feather_pgs import tree_kinetic_state as native  # noqa: PLC0415
 
@@ -455,14 +456,12 @@ def held_tree_calls():
                 yield "tree_kinetic_state.get_predictor_kernel", predictor, (chain,), kwargs
         # A group's coordinates: a free root's quaternion takes one more than its three rotation velocities.
         coordinates = tree.dofs + tree.free_roots
-        compares = "motion_velocity" not in repair_options
-        if compares:
+        if "motion_velocity" not in repair_options:
             kwargs = {**layout, "body_velocity": True, "bank_coordinates": coordinates}
             yield "tree_kinetic_state.get_state_kernel", state, (False, chain), kwargs
-        yield "tree_kinetic_state.get_classify_kernel", classify, (chain,), {**layout, **repair_options}
-        kwargs = {**layout, **repair_options, "body_velocity": True, "listed": True}
-        yield "tree_kinetic_state.get_state_kernel", state, (False, chain), kwargs
-        if compares:
+            yield "tree_kinetic_state.get_classify_kernel", classify, (chain,), {**layout, **repair_options}
+            kwargs = {**layout, **repair_options, "body_velocity": True, "listed": True}
+            yield "tree_kinetic_state.get_state_kernel", state, (False, chain), kwargs
             yield "tree_kinetic_state.get_bank_kernel", bank, (chain,), {**layout, "coordinates": coordinates}
 
 
