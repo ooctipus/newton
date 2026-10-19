@@ -286,6 +286,17 @@ def _filled(shape, value, device):
     return wp.array(np.full(shape, value, dtype=np.float32), dtype=float, device=device)
 
 
+_WARP_DEBUGGING_OFF = {"mode": "release", "verify_fp": False, "print_launches": False, "verify_cuda": False}
+"""Settings of the Warp debugging aids under which the masked clear replays recorded launches."""
+
+
+def _skip_while_warp_debugging(test):
+    """Skip a test of replayed clears while a Warp debugging aid is on: every clear then launches directly."""
+    config = wp.config
+    if config.mode == "debug" or config.verify_fp or config.print_launches or config.verify_cuda:
+        test.skipTest("A Warp debugging aid is on, so the clear does not replay recorded launches")
+
+
 def _assert_bits_equal(actual, expected):
     """Assert that two float32 arrays hold the same bits, so that ``-0.0`` does not pass for ``0.0``."""
     np.testing.assert_array_equal(
@@ -1056,6 +1067,7 @@ def test_zero_selected_blocks_replays_recorded_launch(test, device):
     new buffer records its own launch, and a graph capture launches directly so the
     graph holds the launch.
     """
+    _skip_while_warp_debugging(test)
     values = np.arange(4 * 6 * 2, dtype=np.float32).reshape(4, 6, 2) + 1.0
     blocks = wp.array(values, dtype=float, device=device)
     mask = wp.array([True, False, False, True], dtype=bool, device=device)
@@ -1101,6 +1113,7 @@ def test_zero_selected_blocks_replay_holds_no_buffers(test, device):
     Jacobian freed by its caller, or allocated per call as in eval_mass_matrix, is
     released at once.
     """
+    _skip_while_warp_debugging(test)
     with mock.patch.dict(_clear_replays, clear=True):
         blocks = wp.zeros((4, 6, 2), dtype=float, device=device)
         mask = wp.array([True, False, True, False], dtype=bool, device=device)
@@ -1136,13 +1149,13 @@ def test_zero_selected_blocks_launches_directly_for_warp_debugging(test, device)
     """
     blocks = wp.zeros((4, 6, 2), dtype=float, device=device)
     mask = wp.array([True, False, True, False], dtype=bool, device=device)
-    aids = {"none": ("print_launches", False), "debug mode": ("mode", "debug")}
-    aids.update({name: (name, True) for name in ("verify_fp", "print_launches", "verify_cuda")})
-    for aid, (setting, value) in aids.items():
+    aids = {"none": {}, "debug mode": {"mode": "debug"}}
+    aids.update({name: {name: True} for name in ("verify_fp", "print_launches", "verify_cuda")})
+    for aid, settings in aids.items():
         with (
             test.subTest(aid=aid),
             mock.patch.dict(_clear_replays, clear=True),
-            mock.patch.object(wp.config, setting, value),
+            mock.patch.multiple(wp.config, **{**_WARP_DEBUGGING_OFF, **settings}),
             mock.patch.object(wp, "launch") as launch,
         ):
             for _ in range(2):
@@ -1161,6 +1174,7 @@ def test_zero_selected_blocks_replay_cache_takes_concurrent_records(test, device
     and the second drop raises KeyError. With the lock, the second thread reads only
     after the first has finished, and the wait times out.
     """
+    _skip_while_warp_debugging(test)
     meet_at_size, meet_at_oldest = threading.Barrier(2, timeout=0.1), threading.Barrier(2, timeout=0.1)
 
     def meet(barrier):
