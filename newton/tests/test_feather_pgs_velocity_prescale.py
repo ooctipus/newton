@@ -648,9 +648,10 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
         # Allocate the lazily created buffers before the capture.
         env_step()
 
-        inputs = [wp.empty_like(model.joint_qd) for _ in range(2)]
-        consumed = [wp.empty_like(model.joint_qd) for _ in range(2)]
-        launches = []
+        # Prefilled: a record that no copy in the graph wrote fails the bitwise check below.
+        inputs = [wp.full(model.joint_dof_count, _UNWRITTEN, dtype=float, device=device) for _ in range(2)]
+        consumed = [wp.full(model.joint_dof_count, _UNWRITTEN, dtype=float, device=device) for _ in range(2)]
+        launches, predicted = [], []
         launch = solver._launch_velocity_prescale
         predict = solver._tree_kinetic_state.predict
 
@@ -663,8 +664,11 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
             launches.append(prescaled_joint_qd)
 
         def recording_predict(state, augmented, step_control, velocity, dt):
+            # Each substep predicts once, after its own prescale, from the prescaled velocity.
+            self.assertEqual(len(predicted), len(launches) - 1)
             self.assertIs(velocity, launches[-1])
-            wp.copy(consumed[len(launches) - 1], velocity)
+            wp.copy(consumed[len(predicted)], velocity)
+            predicted.append(velocity)
             predict(state, augmented, step_control, velocity, dt)
 
         solver._launch_velocity_prescale = recording_launch
@@ -677,6 +681,7 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
             solver.seed_double_buffer_events()
             env_step()
         self.assertEqual(len(launches), 2)
+        self.assertEqual(len(predicted), 2)
         self.assertTrue(all(prescaled is solver.qd_work for prescaled in launches))
 
         drive_slot = solver._vel_limit_drive_slot_arg.numpy()
