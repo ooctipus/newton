@@ -967,16 +967,26 @@ def _dynamics(solver, source) -> dict:
 
 
 def _diagnostics(solver) -> dict:
-    """Diagnostics that add launches to every step; none reads back into the physics."""
+    """Opt-in per-step diagnostics recorded so far: the stage-3 snapshots, which the solver never reads."""
+    switches = " and ".join(
+        switch
+        for switch, on in (
+            ("FEATHER_PGS_DEBUG_SNAPSHOTS=1", solver._debug_stage3_snapshot_flag),
+            ("pgs_debug=True", solver._debug_buffers_enabled),
+        )
+        if on
+    )
     # Mirrors _allocate_common_buffers: a model without joints has no stage 3 to snapshot.
     snapshots = solver._debug_stage3_qd_work is not None
     if snapshots:
         reason = (
-            "FEATHER_PGS_DEBUG_SNAPSHOTS=1: every substep copies the stage-3 joint velocity, acceleration and "
-            "predicted velocity into _debug_stage3_qd_work, _debug_stage3_joint_qdd and _debug_stage3_v_hat."
+            f"{switches}: every substep copies the stage-3 joint velocity, acceleration and predicted velocity "
+            "into _debug_stage3_qd_work, _debug_stage3_joint_qdd and _debug_stage3_v_hat."
         )
-    elif solver._debug_stage3_snapshots:
-        reason = "FEATHER_PGS_DEBUG_SNAPSHOTS=1, but the model has no joints to snapshot."
+    elif switches:
+        reason = f"{switches}, but the model has no joints to snapshot."
     else:
-        reason = "Off: FEATHER_PGS_DEBUG_SNAPSHOTS=1 opts in to three stage-3 snapshot copies per substep."
+        reason = (
+            "Off: FEATHER_PGS_DEBUG_SNAPSHOTS=1 or pgs_debug=True opts in to three stage-3 snapshot copies per substep."
+        )
     return {"stage3_snapshots": {"enabled": snapshots, "reason": reason}}

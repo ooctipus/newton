@@ -3,10 +3,10 @@
 
 """The per-substep stage-3 snapshots are opt-in diagnostics that never change physics.
 
-Without ``FEATHER_PGS_DEBUG_SNAPSHOTS=1`` the solver allocates no snapshot and
-launches no snapshot copy. With it, the external NaN dumpers read the same
-attributes, shapes and values as before the switch existed, and the snapshots
-hold no gradient, so a tape records the same step.
+Without ``FEATHER_PGS_DEBUG_SNAPSHOTS=1`` or ``pgs_debug=True`` the solver
+allocates no snapshot and launches no snapshot copy. With either, the external
+NaN dumpers read the same attributes, shapes and values as before the switch
+existed, and the snapshots hold no gradient, so a tape records the same step.
 """
 
 import ctypes
@@ -342,6 +342,8 @@ class TestFeatherPGSDebugSnapshots(unittest.TestCase):
 
     def test_model_without_joints_allocates_no_snapshots(self):
         """Allocate no snapshot and step particles when the flag is set but the model has no joints."""
+        from newton._src.solvers.feather_pgs import path_selection  # noqa: PLC0415
+
         builder = newton.ModelBuilder()
         builder.add_particle(pos=(0.0, 0.0, 1.0), vel=(0.0, 0.0, 0.0), mass=1.0)
         model = builder.finalize(device="cpu")
@@ -349,9 +351,32 @@ class TestFeatherPGSDebugSnapshots(unittest.TestCase):
             solver = SolverFeatherPGS(model)
         for name in SNAPSHOTS:
             self.assertIsNone(getattr(solver, name), name)
+        # get_path_selection() cannot describe a model without joints yet: its friction
+        # record reads the patch pipeline, which such a model never builds.
+        record = path_selection._diagnostics(solver)["stage3_snapshots"]
+        self.assertFalse(record["enabled"])
+        self.assertEqual(record["reason"], f"{FLAG}=1, but the model has no joints to snapshot.")
         state_in, state_out = model.state(), model.state()
         solver.step(state_in, state_out, None, None, DT)
         self.assertTrue(np.all(np.isfinite(state_out.particle_q.numpy())))
+
+    def test_pgs_debug_keeps_snapshots(self):
+        """Copy the snapshots under pgs_debug without the flag, and record that pgs_debug enabled them."""
+        model = _scene("cpu", worlds=1)
+        run = _rollout(model, snapshots=False, steps=2, pgs_debug=True)
+        solver = run["solver"]
+        for name in SNAPSHOTS:
+            self.assertIsInstance(getattr(solver, name), wp.array, name)
+        for step, step_copies in enumerate(run["copies"]):
+            taken = [dest for dest, _, _ in step_copies if _is_snapshot(solver, dest)]
+            self.assertEqual(len(taken), len(SNAPSHOTS), step)
+            for dest, name in zip(taken, SNAPSHOTS, strict=True):
+                self.assertIs(dest, getattr(solver, name), (step, name))
+        selected = solver.get_path_selection()
+        record = selected["routes"]["diagnostics"]["stage3_snapshots"]
+        self.assertTrue(record["enabled"])
+        self.assertTrue(record["reason"].startswith("pgs_debug=True: "), record["reason"])
+        self.assertNotIn(FLAG, selected["environment"]["applied"])
 
     def test_snapshots_record_no_gradients(self):
         """Leave a tape's record and its input gradients unchanged when the flag keeps the snapshots.

@@ -1204,9 +1204,10 @@ class SolverFeatherPGS(SolverBase):
     unconstrained joint acceleration [m/s² or rad/s²] and predicted joint
     velocity [m/s or rad/s] in ``_debug_stage3_qd_work``,
     ``_debug_stage3_joint_qdd`` and ``_debug_stage3_v_hat``, each shaped like
-    ``joint_qd`` and copied on every substep. Unset, the three attributes are
-    ``None`` and no copy runs. The snapshots hold no gradient, so physics and
-    a :class:`warp.Tape`'s record are the same either way.
+    ``joint_qd`` and copied on every substep. ``pgs_debug=True`` keeps them
+    too. Otherwise the three attributes are ``None`` and no copy runs. The
+    snapshots hold no gradient, so physics and a :class:`warp.Tape`'s record
+    are the same either way.
 
     """
 
@@ -2361,8 +2362,10 @@ class SolverFeatherPGS(SolverBase):
         # are diagnostics and can consume several GB in large batched models.
         self._debug_buffers_enabled = bool(pgs_debug)
         # External NaN dumpers read the stage-3 snapshots; nothing in the solver
-        # does. They cost three copies per substep, so they are opt-in.
-        self._debug_stage3_snapshots = os.environ.get("FEATHER_PGS_DEBUG_SNAPSHOTS") == "1"
+        # does. They cost three copies per substep, so they are opt-in, and
+        # pgs_debug, which keeps the solver's other diagnostics, keeps them too.
+        self._debug_stage3_snapshot_flag = os.environ.get("FEATHER_PGS_DEBUG_SNAPSHOTS") == "1"
+        self._debug_stage3_snapshots = self._debug_stage3_snapshot_flag or self._debug_buffers_enabled
         self._pgs_convergence_log: list[np.ndarray] = []
         # Per-step, per-iteration NCP / MDP residual log for the matrix_free
         # debug path. Each entry is an ndarray of shape
@@ -3413,9 +3416,9 @@ class SolverFeatherPGS(SolverBase):
         declared names to their values, ``unknown`` lists undeclared names
         (recorded, not rejected), ``retired`` lists retired names whose value did
         not reject construction and ``isaac_lab`` is empty for this family.
-        ``routes.diagnostics`` records the diagnostics that add launches to a
-        step: ``stage3_snapshots`` is enabled when ``FEATHER_PGS_DEBUG_SNAPSHOTS=1``
-        allocated the stage-3 snapshots, which every substep then copies.
+        ``routes.diagnostics.stage3_snapshots`` records whether
+        ``FEATHER_PGS_DEBUG_SNAPSHOTS=1`` or ``pgs_debug`` allocated the stage-3
+        snapshots, which every substep then copies.
         Switches read at import keep the values present at import. The record is
         host-only, detached from solver state and JSON-compliant (non-finite
         floats are strings).
