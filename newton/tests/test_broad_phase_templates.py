@@ -26,6 +26,7 @@ from newton._src.geometry.broad_phase_nxn import (
     BroadPhaseExplicitTemplates,
     ShapePairTemplates,
     _nxn_broadphase_precomputed_pairs,
+    _pair_template_kernel,
     replay_shape_pair_templates,
 )
 from newton.tests.unittest_utils import (
@@ -949,12 +950,17 @@ def test_first_captured_collide_matches_eager(test, device):
     """Capture a pipeline's first collide(), templates on and off, and replay it like eager runs on live state.
 
     Each broad-phase mode is captured without a warm-up and reads nothing back from the device
-    inside the capture; the world templates are verified and uploaded when the pipeline is built,
-    so the captured template launch allocates nothing.
+    inside the capture; the world templates are verified and uploaded, and their kernel loaded,
+    when the pipeline is built, so the captured template launch neither allocates nor loads a
+    module (which drivers older than CUDA 12.3 refuse during capture).
     """
     model = _finalize(_replicated_builder(), device)
+    layout = BroadPhaseExplicitTemplates(model._shape_contact_pair_templates, device=device)
+    kernel = _pair_template_kernel(layout.staged_capacity, layout.threads_per_world, layout.worlds_per_block)
     for broad_phase, setting in itertools.product(("explicit", "nxn", "sap"), ("1", "0")):
         with test.subTest(broad_phase=broad_phase, templates=setting):
+            # Earlier tests may have launched the same kernel: start unloaded to see where it loads.
+            kernel.module.unload()
             state = model.state()
             newton.eval_fk(model, model.joint_q, model.joint_qd, state)
             captured = _pipeline(model, setting, broad_phase=broad_phase)
@@ -965,12 +971,16 @@ def test_first_captured_collide_matches_eager(test, device):
                 test.assertEqual(record["kernel"], "world_templates" if templated else "flat_pairs")
             else:
                 test.assertIsNone(record)
+            # A pipeline that launches the template kernel loads it when built; the others leave it unloaded.
+            loaded = set(kernel.module.execs)
+            test.assertEqual(bool(loaded), templated)
             if templated:
                 test.assertIsNotNone(captured._pair_templates.data)
             contacts = captured.contacts()
             with _recorded_while_capturing(wp.get_device(device)) as recorded:
                 graph, launches = _launched(functools.partial(_capture_collide, captured, state, contacts))
             test.assertEqual(recorded, [])
+            test.assertEqual(set(kernel.module.execs), loaded, "the capture loaded the template kernel")
             test.assertEqual(
                 launches, {"templates": int(templated), "flat": int(broad_phase == "explicit" and not templated)}
             )

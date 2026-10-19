@@ -1058,7 +1058,7 @@ class BroadPhaseExplicitTemplates:
         }
 
     def _upload(self) -> None:
-        """Upload the layout and bind the kernel for this launch shape, once."""
+        """Upload the layout and load the kernel for this launch shape, once."""
         if self.data is not None:
             return
 
@@ -1081,6 +1081,10 @@ class BroadPhaseExplicitTemplates:
         self._slot_pair_start = device_array("slot_pair_start")
         self._empty = wp.empty(0, dtype=wp.int32, device=self.device)
         self._kernel = _pair_template_kernel(self.staged_capacity, self.threads_per_world, self.worlds_per_block)
+        # Load the variant launch() runs (Warp launches CPU kernels with block_dim 1) outside any
+        # capture: drivers older than CUDA 12.3 cannot load a module during graph capture, and
+        # capture_begin then preloads only the variants already loaded, else block_dim 256.
+        wp.load_module(self._kernel.module, device=self.device, block_dim=1 if self.device.is_cpu else self.block_dim)
         self.data = data
 
     @property
@@ -1121,8 +1125,9 @@ class BroadPhaseExplicitTemplates:
 
         Global-global pairs are read from ``pairs`` itself; every template entry is
         decoded on the device and compared with the pair at its position. Launches,
-        allocates the device layout and synchronizes, so call it at construction,
-        outside graph capture; a verified layout allocates nothing in :meth:`launch`.
+        allocates the device layout, loads the template kernel and synchronizes, so
+        call it at construction, outside graph capture; a verified layout neither
+        allocates nor loads a module in :meth:`launch`.
         """
         if (
             self.unsupported_reason is not None
@@ -1162,7 +1167,8 @@ class BroadPhaseExplicitTemplates:
         """Test the templates against pre-expanded AABBs.
 
         The caller zeroes ``candidate_pair_count``, as with ``skip_count_zero=True``.
-        Without a prior :meth:`verify`, the first call allocates the device layout.
+        Without a prior :meth:`verify`, the first call allocates the device layout and
+        loads the kernel.
 
         Args:
             shape_lower: Lower AABB bounds, expanded by the effective gaps, shape [shape_count].
