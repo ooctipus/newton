@@ -5,10 +5,11 @@
 
 Split mode sweeps free-body rows after the dense rows: on the CPU in ``pgs_solve_mf_loop``, on CUDA in the
 shared-memory sweep of ``_get_pgs_solve_mf_kernel``. Each finitely limited body axis owns a lower and an
-upper velocity-limit row (``J = +e`` and ``-e``, ``rhs = limit``). The stateless law pushes a row only while
-its limit is violated (``J v + rhs < 0``), by the whole correction, and keeps that correction rather than an
-accumulated impulse. A sweep that relaxes these rows as bilateral rows drives every limited axis onto its
-limit instead, so it accelerates a body that moves below its limit.
+upper velocity-limit row (``J = +e`` and ``-e``, ``rhs = limit``) at the tail of its world's rows. The
+stateless law pushes a row only while its limit is violated (``J v + rhs < 0``), by the whole correction
+whatever ``pgs_omega`` relaxes, and keeps that correction rather than an accumulated impulse. A sweep that
+relaxes these rows as bilateral rows drives every limited axis onto its limit instead, so it accelerates a
+body that moves below its limit.
 """
 
 import unittest
@@ -34,6 +35,8 @@ INERTIA = 0.1
 # Velocities agree to this fraction of their axis's limit: the default pgs_cfm leaves 1e-6 of each correction
 # on a 1 kg box (1e-7 on its 0.1 kg m^2 axes), and free flight keeps a velocity to float32 rounding.
 RTOL = 1.0e-5
+# An under-relaxed sweep: the other rows take this fraction of their correction, the velocity-limit rows all of it.
+RELAXED_OMEGA = 0.6
 
 # Initial (linear [m/s], angular [rad/s]) velocity of one box per world, below both limits in magnitude.
 BELOW = (
@@ -53,7 +56,7 @@ SWEEP_ANGULAR = ((-3.5, 0.0, 2.9), (5.0, -1.0, -3.0), (0.2, -6.0, 3.1))
 
 
 def _free_boxes(
-    device, worlds, *, articulated=False, limits=(LINEAR_LIMIT, ANGULAR_LIMIT), fraction=0.0, wrenches=None
+    device, worlds, *, articulated=False, limits=(LINEAR_LIMIT, ANGULAR_LIMIT), fraction=0.0, omega=1.0, wrenches=None
 ):
     """One free box per world, in split mode, launched at ``worlds`` (linear, angular) velocities.
 
@@ -65,6 +68,7 @@ def _free_boxes(
         limits: (linear [m/s], angular [rad/s]) speed limits of every box; None leaves the speed attributes
             unregistered.
         fraction: The solver's ``velocity_limit_activation_fraction``.
+        omega: The solver's ``pgs_omega``.
         wrenches: Velocity change [m/s, rad/s] that a constant body wrench adds over one step, per world.
     """
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
@@ -90,7 +94,13 @@ def _free_boxes(
         builder.end_world()
     model = builder.finalize(device=device)
     # Without angular damping, free flight keeps the angular velocity exactly.
-    solver = SolverFeatherPGS(model, pgs_mode="split", velocity_limit_activation_fraction=fraction, angular_damping=0.0)
+    solver = SolverFeatherPGS(
+        model,
+        pgs_mode="split",
+        velocity_limit_activation_fraction=fraction,
+        pgs_omega=omega,
+        angular_damping=0.0,
+    )
     state_0, state_1 = model.state(), model.state()
     starts = model.joint_qd_start.numpy()
     joints = [int(np.flatnonzero(model.joint_child.numpy() == box)[0]) for box in boxes]
@@ -162,13 +172,15 @@ def _clamped_magnitudes(velocity):
     return clamped
 
 
-def _sweep(device, *, iterations, articulated=False):
-    """Sweep each box's velocity-limit rows once from the ``SWEEP_*`` velocities.
+def _sweep(device, *, iterations, articulated=False, omega=1.0):
+    """Sweep each box's velocity-limit rows ``iterations`` times from the ``SWEEP_*`` velocities.
 
     A step at rest builds the rows (``velocity_limit_activation_fraction=0`` allocates all twelve); the sweep
     then starts from velocities that the step's predictor clamp never saw, so the rows alone decide.
     """
-    run = _free_boxes(device, [((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))] * len(SWEEP_LINEAR), articulated=articulated)
+    run = _free_boxes(
+        device, [((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))] * len(SWEEP_LINEAR), articulated=articulated, omega=omega
+    )
     _step(run)
     solver = run.solver
     # The sweep reads the response DOFs the free-body map assigns, not the joint coordinates.
@@ -205,20 +217,21 @@ class _SplitVelocityLimitChecks:
         np.testing.assert_allclose(rows.rhs, LIMITS[rows.axis], rtol=1.0e-6)
 
     def test_sweep_pushes_only_violated_limits(self):
-        """Push each violated limit back by its whole correction, and leave satisfied rows at zero impulse."""
+        """Push each violated limit back by its whole, unrelaxed correction, and leave satisfied rows at zero impulse."""
         for articulated in (False, True):
-            with self.subTest(articulated=articulated):
-                swept = _sweep(self.device, iterations=1, articulated=articulated)
-                rows = swept.rows
-                # One sweep: a violated axis lands on its limit, an axis inside both limits keeps its velocity.
-                _assert_on_limit_scale(swept.velocity, np.clip(swept.start, -LIMITS, LIMITS))
-                inside = np.abs(swept.start) <= LIMITS
-                np.testing.assert_allclose(swept.velocity[inside], swept.start[inside], rtol=0.0, atol=1.0e-6)
-                # Each row stores the stateless correction it applied from the starting velocity.
-                residual = rows.sign * np.take_along_axis(swept.start, rows.axis, axis=1) + rows.rhs
-                correction = np.where(residual < 0.0, -residual * rows.eff_mass_inv, 0.0)
-                np.testing.assert_allclose(swept.impulses, correction, rtol=RTOL, atol=0.0)
-                self.assertTrue(np.any(correction > 0.0))
+            for omega in (1.0, RELAXED_OMEGA):
+                with self.subTest(articulated=articulated, omega=omega):
+                    swept = _sweep(self.device, iterations=1, articulated=articulated, omega=omega)
+                    rows = swept.rows
+                    # One sweep: a violated axis lands on its limit, an axis inside both limits keeps its velocity.
+                    _assert_on_limit_scale(swept.velocity, np.clip(swept.start, -LIMITS, LIMITS))
+                    inside = np.abs(swept.start) <= LIMITS
+                    np.testing.assert_allclose(swept.velocity[inside], swept.start[inside], rtol=0.0, atol=1.0e-6)
+                    # Each row stores the stateless correction it applied from the starting velocity.
+                    residual = rows.sign * np.take_along_axis(swept.start, rows.axis, axis=1) + rows.rhs
+                    correction = np.where(residual < 0.0, -residual * rows.eff_mass_inv, 0.0)
+                    np.testing.assert_allclose(swept.impulses, correction, rtol=RTOL, atol=0.0)
+                    self.assertTrue(np.any(correction > 0.0))
 
     def test_sweep_keeps_corrections_not_accumulated_impulses(self):
         """Converge onto the limits and store each row's last correction, not the impulse it accumulated."""
@@ -311,10 +324,10 @@ class TestSplitFreeBodyVelocityLimitsCUDA(_SplitVelocityLimitChecks, unittest.Te
 
     def test_cuda_sweep_and_step_match_the_cpu(self):
         """Reproduce the CPU free-body sweep and step on CUDA."""
-        for iterations in (1, 12):
-            with self.subTest(sweep_iterations=iterations):
-                cpu = _sweep("cpu", iterations=iterations)
-                cuda = _sweep(self.device, iterations=iterations)
+        for iterations, omega in ((1, 1.0), (1, RELAXED_OMEGA), (12, 1.0)):
+            with self.subTest(sweep_iterations=iterations, omega=omega):
+                cpu = _sweep("cpu", iterations=iterations, omega=omega)
+                cuda = _sweep(self.device, iterations=iterations, omega=omega)
                 _assert_on_limit_scale(cuda.velocity, cpu.velocity)
                 if iterations == 1:
                     np.testing.assert_allclose(cuda.impulses, cpu.impulses, rtol=RTOL, atol=1.0e-6)
