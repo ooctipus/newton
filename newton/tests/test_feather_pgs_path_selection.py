@@ -1065,6 +1065,10 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             # ring-pooled (linked) parallel tiers, as point friction builds its tiers.
             patch_parallel,
             ({"sparse_mass_matrix": "off", "pgs_schedule": "physx_grasp", "friction_anchor_beta": 0.0}, {}),
+            # 320 dense rows stream the row metadata (5120 bytes); the two-world grid keeps row types and parents
+            # resident, under either friction law.
+            ({"sparse_mass_matrix": "off", "dense_max_constraints": 320}, {}),
+            ({"sparse_mass_matrix": "off", "dense_max_constraints": 320, "friction_anchor_beta": 0.0}, {}),
             # Lazy publication defers only on the fused world-dynamics kernel, and never under patch friction.
             (
                 {
@@ -1086,7 +1090,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 {},
             ),
         )
-        built = opted_in = 0
+        built = opted_in = resident_rows = 0
         for (options, model_options), switch in [(case, None) for case in cases] + [(patch_parallel, "1")]:
             with self.subTest(options=options, model=model_options, switch=switch):
                 try:
@@ -1120,6 +1124,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     self.assertEqual("_gmeta" in mf_gs, streamed)
                     self.assertEqual("_smeta" in mf_gs, streamed and storage["row_types_and_parents"] == "resident")
                     self.assertEqual("_glambda" in mf_gs, storage["mf_impulses"] == "streamed")
+                    resident_rows += "_gmeta_smeta" in mf_gs
                 # Applied routing options agree with the routes they request.
                 tiers = routes["sweep"]["tiers"]
                 parallel = tiers is not None and tiers["family"] in ("parallel", "keyed_parallel")
@@ -1154,6 +1159,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     self.assertEqual(grouped["lanes_per_articulation"], solver._grouped_topology.lanes_per_articulation)
         self.assertGreaterEqual(built, 8)
         self.assertEqual(opted_in, 1, "The opted-in patch-friction parallel arm must build")
+        self.assertGreaterEqual(
+            resident_rows, 1, "A streamed-metadata route must keep its row types and parents resident"
+        )
 
     def test_private_override_validation_and_cpu_precedence(self):
         """Validate effective overrides while preserving explicit choices and CPU fallbacks."""
