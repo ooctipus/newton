@@ -136,9 +136,9 @@ class _LaunchReplay:
     one clone. The production launch then runs on the caller's arrays and the twin on the clones, and
     both results are copied to the host before the stand-in returns: later stages and steps rewrite the
     caller's arrays, so a comparison made after the run would see another state. Each record names the
-    operands whose bits differ and holds the scalar operands and host copies of the ``keep`` operands
-    before and after the production launch. Production launches must pass ``inputs`` and ``outputs`` by
-    keyword.
+    operands whose bits differ and holds the launch grid, the scalar operands and host copies of the
+    ``keep`` operands before and after the production launch. Production launches must pass ``dim``,
+    ``inputs`` and ``outputs`` by keyword.
     """
 
     def __init__(self, production, twin, keep=()):
@@ -169,6 +169,7 @@ class _LaunchReplay:
             self.records.append(
                 {
                     "differ": [name for name in arrays if not np.array_equal(_bits(ours[name]), _bits(theirs[name]))],
+                    "dim": list(kwargs["dim"]),
                     "scalars": {name: value for name, value in operands.items() if name not in arrays},
                     "before": before,
                     "after": {name: ours[name] for name in self.keep},
@@ -808,6 +809,11 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
                 storage = sweep["mf_gs_storage"]
                 self.assertEqual((storage["metadata"], storage["row_types_and_parents"]), ("streamed", "resident"))
                 self.assertIn("2-block grid fits one block per SM", storage["reason"])
+                # The selection judged the grid the launches use.
+                self.assertEqual(solver._mf_gs_block_count, 2)
+                self.assertEqual(
+                    {(*record["dim"], record["scalars"]["general_world_grid_stride"]) for record in records}, {(2, 2)}
+                )
                 self.assertEqual({record["scalars"]["row_phase"] for record in records}, phases)
                 for index, record in enumerate(records):
                     self.assertEqual(

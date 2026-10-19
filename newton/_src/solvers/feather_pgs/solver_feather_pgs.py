@@ -7391,6 +7391,11 @@ class SolverFeatherPGS(SolverBase):
         self._pgs_solve_mf_gs_kernel = None
         # Storage classes of the MF-GS kernel (_MFGSStorage); recorded by get_path_selection().
         self._mfgs_storage = None
+        # Blocks of every MF-GS sweep launch: one per world, or the general-world queue's grid. The
+        # storage selection keeps row metadata resident for this grid, so launches must use it too.
+        self._mf_gs_block_count = int(
+            self._local_general_solver_blocks if self._local_internal_fast_path else self.world_count
+        )
         self._pgs_solve_mf_gs_incremental_kernel = None
         self._pgs_solve_mf_gs_incremental_kernels = []
         self._ink_sizes = None
@@ -7471,8 +7476,6 @@ class SolverFeatherPGS(SolverBase):
             and self.mf_max_constraints > 0
         ):
             has_drive_rows = self.drive_mode == "physx_pgs"
-            # The grid _launch_matrix_free_gs_solve launches: one block per world, or the general-world queue's.
-            general_blocks = self._local_general_solver_blocks if self._local_internal_fast_path else self.world_count
             # Preserve the explicit diagnostic override without hiding it in a
             # cached factory: storage is part of the kernel specialization key.
             # The selection sizes the resident row metadata with its choice.
@@ -7493,7 +7496,7 @@ class SolverFeatherPGS(SolverBase):
                     int(model.device.max_shared_memory_per_block),
                     has_drive_rows=has_drive_rows,
                     fuse_vel_limits=self.fuse_joint_velocity_limits,
-                    block_count=int(general_blocks),
+                    block_count=self._mf_gs_block_count,
                     sm_count=int(model.device.sm_count),
                     force_stream_mf_impulses=force_stream_mf_impulses,
                 )
@@ -8851,11 +8854,7 @@ class SolverFeatherPGS(SolverBase):
                             "defer_dense_response": int(defer_dense_response),
                             "regularize": int(self._regularization_enabled and not soft_relax),
                             "use_general_world_queue": int(bool(self._local_internal_fast_path)),
-                            "general_block_count": int(
-                                self._local_general_solver_blocks
-                                if self._local_internal_fast_path
-                                else self.world_count
-                            ),
+                            "general_block_count": int(self._mf_gs_block_count),
                             "skip_local_internal_worlds": bool(self._local_internal_fast_path),
                         },
                         _f,
@@ -8881,7 +8880,7 @@ class SolverFeatherPGS(SolverBase):
                 if residual_stream is not None:
                     residual_stream.wait_event(local_ready_event)
             use_general_queue = bool(self._local_internal_fast_path)
-            general_block_count = self._local_general_solver_blocks if use_general_queue else self.world_count
+            general_block_count = self._mf_gs_block_count
             if local_stream is not None:
                 # Admit scarce residual and paired worlds before the bulk single-world grid can occupy the GPU.
                 if residual_stream is not None:
