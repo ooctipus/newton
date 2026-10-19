@@ -377,10 +377,23 @@ def split_world_case(solver, world=0):
     articulations in index order) and adds the predicted velocity's ``J v_hat``
     into the right-hand side; the case keeps the bias apart, ``v_hat`` as its
     velocity and cold impulses. Contact and limit rows clamp at zero and
-    friction rows pair. Returns the case and ``v_hat + Y^T lambda`` of the
-    impulses the split sweep solved.
+    friction rows pair; a world with any other row, such as a drive, mimic or
+    connect row, raises ``ValueError``. Returns the case and ``v_hat + Y^T lambda``
+    of the impulses the split sweep solved.
     """
     count = int(solver.constraint_count.numpy()[world])
+    types = solver.row_type.numpy()[world, :count]
+    unmodelled = sorted(
+        set(types.tolist())
+        - {
+            PGS_CONSTRAINT_TYPE_CONTACT,
+            PGS_CONSTRAINT_TYPE_FRICTION,
+            PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
+            PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+        }
+    )
+    if unmodelled:
+        raise ValueError(f"split_world_case models contact, friction and limit rows only, not row types {unmodelled}")
     worlds, starts = solver.art_to_world.numpy(), solver.articulation_dof_start.numpy()
     predicted = solver.v_hat.numpy().astype(np.float64)
     blocks = []
@@ -396,7 +409,6 @@ def split_world_case(solver, world=0):
     J = np.concatenate([block[1] for block in blocks], axis=1).astype(np.float64)
     Y = np.concatenate([block[2] for block in blocks], axis=1).astype(np.float64)
     velocity = np.concatenate([block[3] for block in blocks])
-    types = solver.row_type.numpy()[world, :count]
     cfm = solver.row_cfm.numpy()[world, :count].astype(np.float64)
     case = {
         "J": J,
