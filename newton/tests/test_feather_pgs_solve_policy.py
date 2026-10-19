@@ -390,6 +390,36 @@ class TestSolveReadoutRecord(unittest.TestCase):
         self.assertNotIn("trace", summary)
         json.dumps(record.summary(), allow_nan=False)
 
+    def test_summary_separates_solves_past_their_first_sweep(self):
+        """Summarize the solves that ran past their first sweep apart from the one-sweep solves.
+
+        The sparse sweeps record a world without rows as a solve that stopped after one sweep, which
+        would dilute the full-budget fraction of the worlds a tolerance could shorten.
+        """
+        record = SolveReadoutRecord(SWEEPS)
+        counted = SimpleNamespace(key="counted_kernel", _fpgs_solve_readout="sweeps")
+        record.register(counted, "sparse_pgs", world_count=3, budget=4, device="cpu")
+        (operand,) = record.operands(counted)
+        # World 0: two solves of four sweeps; world 1: one of two; world 2 has no rows: three one-sweep solves.
+        sweeps = np.zeros((5, 3), dtype=np.int32)
+        sweeps[4, 0], sweeps[2, 1], sweeps[1, 2] = 2, 1, 3
+        operand.sweeps.assign(sweeps)
+        (summary,) = record.summary()["slots"]
+        self.assertEqual((summary["solves"], summary["sweeps"]), (6, [0, 3, 1, 0, 2]))
+        self.assertAlmostEqual(summary["full_budget_fraction"], 2.0 / 6.0)
+        past = summary["past_first_sweep"]
+        self.assertEqual(past["solves"], 3)
+        self.assertAlmostEqual(past["full_budget_fraction"], 2.0 / 3.0)
+        self.assertAlmostEqual(past["mean_sweeps"], 10.0 / 3.0)
+        # A one-sweep budget leaves nothing past the first sweep.
+        short = SimpleNamespace(key="short_kernel", _fpgs_solve_readout="sweeps")
+        record.register(short, "mf_gs", world_count=1, budget=1, device="cpu")
+        self.assertEqual(
+            record.summary()["slots"][1]["past_first_sweep"],
+            {"solves": 0, "full_budget_fraction": None, "mean_sweeps": None},
+        )
+        json.dumps(record.summary(), allow_nan=False)
+
     def test_velocity_pass_counts_in_its_own_slots(self):
         """Count launches inside the velocity pass in slots of their own budget, apart from the position solve.
 

@@ -479,6 +479,13 @@ class SolveReadoutRecord:
         solves), ``exhausted`` the solves that ran their whole budget without
         stopping. A traced slot adds ``trace``. Counts are cumulative since
         construction.
+
+        A solve whose first sweep changes nothing stops after it: a world
+        without rows, which the sparse and sparse-diagonal sweeps enter like
+        any other, or one whose rows need no update. No tolerance shortens
+        those; ``past_first_sweep`` summarizes the other solves. The
+        full-budget fraction among the solves of worlds with rows lies between
+        ``full_budget_fraction`` and ``past_first_sweep["full_budget_fraction"]``.
         """
         slots = []
         for (key, _), slot in self._slots.items():
@@ -501,6 +508,7 @@ class SolveReadoutRecord:
                 "exhausted": exhausted,
                 "full_budget_fraction": float(histogram[-1] / solves) if solves else None,
                 "mean_sweeps": float((executed * histogram).sum() / solves) if solves else None,
+                "past_first_sweep": _past_first_sweep(histogram),
                 "worlds": int(active.sum()),
                 "world_mean_sweeps": {
                     name: float(np.percentile(world_mean, q)) if world_mean.size else None
@@ -511,6 +519,18 @@ class SolveReadoutRecord:
                 record["trace"] = _trace_summary(slot.arrays)
             slots.append(record)
         return {"readout": self.policy.readout, "slots": slots}
+
+
+def _past_first_sweep(histogram) -> dict:
+    """Solves, full-budget fraction and mean sweeps of the solves that executed more than one sweep."""
+    longer = histogram[2:]
+    solves = int(longer.sum())
+    executed = np.arange(2, len(histogram), dtype=np.float64)
+    return {
+        "solves": solves,
+        "full_budget_fraction": float(histogram[-1] / solves) if solves else None,
+        "mean_sweeps": float((executed * longer).sum() / solves) if solves else None,
+    }
 
 
 def _trace_summary(arrays) -> dict:
