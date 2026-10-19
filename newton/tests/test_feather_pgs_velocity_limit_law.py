@@ -596,7 +596,8 @@ class TestVelocityLimitLawKernels(unittest.TestCase):
         The kernel visits velocity-limit rows in the phase-5 stage of every
         iteration. The world holds no matrix-free or propagation row and no
         articulation of the kernel's size group, so every input it never reads is
-        a one-element zero stand-in.
+        a one-element zero stand-in. It stages every dense row's drive tables,
+        which therefore span the row capacity.
         """
         device = wp.get_device("cuda:0")
         arch = str(device.arch)
@@ -615,6 +616,8 @@ class TestVelocityLimitLawKernels(unittest.TestCase):
                     world_group_art_start=wp.zeros(2, dtype=wp.int32, device=device),
                     max_propagation_bodies=1,
                 )
+                for name in ("target_vel_bias", "vel_multiplier", "impulse_multiplier", "max_impulse"):
+                    values[f"world_drive_{name}"] = wp.zeros_like(values["world_diag"])
                 wp.launch_tiled(
                     kernel,
                     dim=[1],
