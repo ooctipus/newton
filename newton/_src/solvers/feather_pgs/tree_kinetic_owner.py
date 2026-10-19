@@ -168,15 +168,18 @@ class TreeKineticState:
     capture, and eagerly when the groups are expected to be stamped with the
     input bank or compared with the output bank.
 
-    Motion-velocity layouts keep the one-pass repair. Their repair launches on
-    every step, and a group exits early only when, besides the conditions
-    above, the step's velocity prescale (computed after the last finish) left
-    each of its velocities unchanged, as it does for an articulation within
-    every joint velocity limit. A classification would add a list clear and a
-    launch to every step to skip at most the one-pass launch's early exits:
-    on a 16384-group velocity-limited chain, the classification and the listed
-    repair took as long as the one-pass repair, and the two extra graph nodes
-    per step cost 36 us per eight steps.
+    Motion-velocity layouts keep the one-pass repair, a measured trade-off.
+    Their repair launches on every step, and a group exits early only when,
+    besides the conditions above, each of its velocities compares equal to
+    the step's prescaled velocity (computed after the last finish): as when
+    the articulation's prescale ratio stayed 1 and no velocity is NaN (a NaN
+    velocity never compares equal, so its group repairs on every step). A
+    classification adds a list clear and a launch to every step, and it can
+    save no more than the one-pass launch's early exits. On a 16384-group
+    velocity-limited chain the classification and the listed repair took as
+    long as the one-pass repair, and their two extra graph nodes per step
+    cost 36 us per eight steps; where nearly every group exits, the
+    classification measured no gain.
     """
 
     def __init__(
