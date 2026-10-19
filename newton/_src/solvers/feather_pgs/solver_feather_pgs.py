@@ -1427,7 +1427,11 @@ class SolverFeatherPGS(SolverBase):
                 the held-tree owner is admitted wherever its topology, representation and row policy
                 allow (``FEATHER_PGS_MIXED_TREE_KINETIC_STATE=0`` disables it). Explicit dense kernels
                 disable auto and conflict with ``on``. Factor refresh intervals and numerical budgets
-                are unchanged.
+                are unchanged. Where the held-tree owner is admitted, a diagonal-mass group of
+                world-fixed roots over one-coordinate prismatic or revolute leaves runs as its scalar
+                branches by default, superseding the prismatic publication opt-ins
+                (``FEATHER_PGS_SCALAR_BRANCHES=0`` opts out); :meth:`get_path_selection` reports it
+                under ``routes.held_tree.scalar_branches``.
             contact_torsion_radius: Experimental effective spin radius [m], zero disables.
                 Explicit material/footprint assumption: for uniform pressure on a disk
                 of radius R, the effective radius is 2*R/3. Does not consume the generic
@@ -3342,11 +3346,12 @@ class SolverFeatherPGS(SolverBase):
         # one-coordinate leaves (scalar_branches.py), which the held-tree owner
         # then publishes; the prismatic opt-ins serve the same articulations and
         # give way. The owner is decided below; if it declines, they apply. The
-        # switch is read here, at construction, like the environment record.
+        # switch, on unless =0, is read here, at construction, like the
+        # environment record.
         from .scalar_branches import plan_scalar_branches  # noqa: PLC0415
 
         self._scalar_branches, self._scalar_branches_reason = plan_scalar_branches(
-            self, requested=os.environ.get("FEATHER_PGS_SCALAR_BRANCHES", "0") == "1"
+            self, requested=os.environ.get("FEATHER_PGS_SCALAR_BRANCHES", "1") != "0"
         )
         if self._scalar_branches is None:
             self._configure_prismatic_publication()

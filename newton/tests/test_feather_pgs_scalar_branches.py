@@ -22,8 +22,8 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import environment_flags, path_selection
 from newton._src.solvers.feather_pgs import kernels as fk
-from newton._src.solvers.feather_pgs import path_selection
 from newton._src.solvers.feather_pgs import scalar_branches as sb
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.device_proof import DeviceProof
@@ -1102,7 +1102,10 @@ class TestScalarBranchRule(unittest.TestCase):
         """Report the request, the diagonal group and each decline of the solver or its model, with its reason."""
         model = build_branch_model(worlds=2)
         solver = cpu_solver(model, 7)
-        self.assertIn("Off: FEATHER_PGS_SCALAR_BRANCHES=1", sb.plan_scalar_branches(solver, requested=False)[1])
+        self.assertIn("Off: FEATHER_PGS_SCALAR_BRANCHES=0", sb.plan_scalar_branches(solver, requested=False)[1])
+        self.assertIn(
+            "(default; FEATHER_PGS_SCALAR_BRANCHES=0 opts out)", sb.plan_scalar_branches(solver, requested=True)[1]
+        )
         with mock.patch.object(solver, "_compact_diagonal_mass_size", None):
             plan, reason = sb.plan_scalar_branches(solver, requested=True)
             self.assertIsNone(plan)
@@ -1282,14 +1285,18 @@ class TestScalarBranchRule(unittest.TestCase):
         self.assertIsInstance(tree["trees_per_block"], int)
 
     def test_scalar_branches_are_read_at_construction(self):
-        """Request scalar branches from FEATHER_PGS_SCALAR_BRANCHES as the solver's construction record holds it.
+        """Request scalar branches unless FEATHER_PGS_SCALAR_BRANCHES=0, as the solver's construction record holds it.
 
         Newton is imported before each value is exported here, so a switch read at import would
-        not see it, and the record's ``environment.applied`` would contradict the route.
+        not see it, and the record's ``environment.applied`` would contradict the route. The
+        registry declares the flag a default-on policy whose ``=0`` opts out.
         """
+        flag = environment_flags.FLAGS["FEATHER_PGS_SCALAR_BRANCHES"]
+        self.assertEqual(flag.kind, "policy")
+        self.assertTrue(flag.meaning.startswith("=0 ") and flag.meaning.endswith("(default on)."), flag.meaning)
         model = build_branch_model(worlds=2)
         plan = mock.Mock(wraps=sb.plan_scalar_branches)
-        for value, requested in ((None, False), ("0", False), ("1", True)):
+        for value, requested in ((None, True), ("0", False), ("1", True)):
             with (
                 self.subTest(value=value),
                 mock.patch.dict(os.environ),
@@ -2462,7 +2469,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         head = recipe_solver(model, scalar=False).get_path_selection()["routes"]
         self.assertIsNone(head["held_tree"]["owner"])
         self.assertFalse(head["held_tree"]["scalar_branches"]["enabled"])
-        self.assertIn("Off: FEATHER_PGS_SCALAR_BRANCHES=1", head["held_tree"]["scalar_branches"]["reason"])
+        self.assertIn("Off: FEATHER_PGS_SCALAR_BRANCHES=0", head["held_tree"]["scalar_branches"]["reason"])
         self.assertTrue(head["publication"]["prismatic_linear_state"])
         # Without the held-tree owner the branches stay on ordinary dynamics with the recipe's opt-ins:
         # every route is the one of the same solver built without the flag, apart from the reason.
