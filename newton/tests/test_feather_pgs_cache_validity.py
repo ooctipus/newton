@@ -357,6 +357,37 @@ def _recorded_launches(kinds=("launch_tiled",)):
     return stack, launched
 
 
+def _input_mismatches(kernel, inputs):
+    """Name each parameter of ``kernel`` whose launch input has another type, or both counts when they differ.
+
+    Warp checks an array input's dtype and dimensions at launch but packs whatever it is given for a
+    struct parameter, so a struct, or an array, in another struct's place would launch unchecked.
+    """
+    parameters = kernel.adj.args
+    if len(inputs) != len(parameters):
+        return [f"{len(inputs)} inputs for {len(parameters)} parameters"]
+    mismatched = []
+    for parameter, value in zip(parameters, inputs, strict=True):
+        if wp.types.is_array(parameter.type):
+            matches = (
+                isinstance(value, wp.array)
+                and wp.types.types_equal(value.dtype, parameter.type.dtype)
+                and value.ndim == parameter.type.ndim
+            )
+        elif wp.types.type_is_struct(parameter.type):
+            matches = getattr(value, "_cls", None) is parameter.type
+        elif wp.types.type_is_int(parameter.type):
+            # Warp converts a Python integer to the parameter's integer type.
+            matches = isinstance(value, (int, parameter.type))
+        elif wp.types.type_is_float(parameter.type):
+            matches = isinstance(value, (float, parameter.type))
+        else:
+            matches = isinstance(value, parameter.type)
+        if not matches:
+            mismatched.append(parameter.label)
+    return mismatched
+
+
 def _cpu_owner(*, motion_velocity=False, worlds=2):
     """A CPU solver with a mixed held-tree owner installed, as cached_dynamics installs one on CUDA.
 
@@ -1383,6 +1414,100 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
         with patch.dict(os.environ, {"FEATHER_PGS_TREE_REPAIR_CLASSIFY": "0"}):
             self.assertEqual(tree_kinetic_owner.launch_switches(), (True, False))
         self.assertEqual(tree_kinetic_owner.launch_switches(), (True, True))
+
+    def check_owner_launches(self, device):
+        """Run every launch form of ordinary and motion-velocity owners; each must match its kernel's parameters.
+
+        Three owners of two-world scenes take two steps and a copy-back begin: an ordinary owner
+        forced to classify on a one-block grid (one-pass first repair, then classification and
+        listed repair, then classification, comparison pass and listed repair), an ordinary owner
+        left unforced (one-pass repairs, then the one-pass repair that compares banks) and a
+        motion-velocity owner forced alike (its one-pass motion repair every time). Every held-tree
+        launch, those at construction included, is checked before it runs, and every kernel each
+        owner bound must have run.
+        """
+        device = wp.get_device(device)
+        launched = []
+
+        def checked(launch):
+            def launch_checked(kernel, *args, **kwargs):
+                if kernel.key.startswith("tree_kinetic_"):
+                    # Checked before the launch: Warp would run a struct passed in another struct's place.
+                    self.assertEqual(_input_mismatches(kernel, kwargs.get("inputs", ())), [], kernel.key)
+                    launched.append(kernel)
+                return launch(kernel, *args, **kwargs)
+
+            return launch_checked
+
+        # Each owner's (alternate motion, forced classification) and the kernels it binds besides its
+        # repair, finish and predictor.
+        owners = {
+            "classified": (False, True, {"classify", "bank", "listed"}),
+            "one_pass": (False, False, {"bank_repair"}),
+            "motion": (True, True, set()),
+        }
+        with patch.multiple(wp, launch=checked(wp.launch), launch_tiled=checked(wp.launch_tiled)):
+            for name, (motion, forced, bound) in owners.items():
+                with self.subTest(owner=name):
+                    launched.clear()
+                    model = _build(device, worlds=2, speed_limit=0.8 if motion else None)
+                    solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+                    solver.enable_joint_velocity_limits = motion
+                    owner = MixedTreeKineticState(solver)
+                    kinds = {}
+                    for group in owner.groups:
+                        if forced:
+                            _force_classification(group)
+                        self.assertEqual(group.classify_first, forced and not motion)
+                        kinds.update(
+                            {
+                                group.repair_kernel: "repair",
+                                group.finish_kernel: "finish",
+                                group.predictor_kernel: "predict",
+                                group.classify_kernel: "classify",
+                                group.bank_kernel: "bank",
+                                group.listed_repair_kernel: "listed",
+                                group.bank_repair_kernel: "bank_repair",
+                            }
+                        )
+                    kinds.pop(None, None)
+                    self.assertEqual(set(kinds.values()), {"repair", "finish", "predict", *bound})
+                    states, control = [model.state(), model.state()], model.control()
+                    solver._last_step_dt = DT
+                    augmented = solver._prepare_augmented_state(states[0], states[1], control)
+                    # A motion-velocity owner reads a prescaled velocity bank of its own.
+                    velocities = [wp.clone(state.joint_qd) if motion else state.joint_qd for state in states]
+                    for source, refresh in ((0, True), (1, False)):
+                        state, output, velocity = states[source], states[1 - source], velocities[source]
+                        owner.begin(state, augmented, velocity, DT, refresh)
+                        solver.mass_update_mask.fill_(1)
+                        owner.refresh(augmented)
+                        owner.predict(state, augmented, control, velocity, DT)
+                        solver.v_out.assign(solver.v_hat)
+                        owner.finish(state, augmented, output, DT, refresh)
+                    # A copy of the bank the last finish published, one coordinate changed.
+                    states[1].assign(states[0])
+                    coordinates = states[1].joint_q.numpy()
+                    coordinates[0] += np.float32(0.01)
+                    states[1].joint_q.assign(coordinates)
+                    owner.begin(states[1], augmented, velocities[1], DT, False, state_out=states[0])
+                    self.assertEqual({kinds[kernel] for kernel in launched if kernel in kinds}, set(kinds.values()))
+                    if motion:
+                        self.assertTrue(all("_motion" in group.repair_kernel.key for group in owner.groups))
+
+    def test_owner_launches_match_their_kernels(self):
+        """Launch every held-tree kernel an owner binds with one input of each parameter's type, on CPU.
+
+        The classification takes the six common arguments, not the motion input of the launch ABI
+        that every finish and repair shares; the classified forms are ordinary motion's. CPU owners
+        keep the one-pass repair, so classification is forced; see :meth:`check_owner_launches`.
+        """
+        self.check_owner_launches("cpu")
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
+    def test_cuda_owner_launches_match_their_kernels(self):
+        """Launch every held-tree kernel a CUDA owner binds, construction's lane timing included, with matching inputs."""
+        self.check_owner_launches("cuda:0")
 
     @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
     def test_cuda_classified_repair_matches_the_one_pass_repair(self):
