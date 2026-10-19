@@ -1335,12 +1335,14 @@ class TestLinkedTierSweeps(unittest.TestCase):
         self.assertNotIn("[mf_gs_parallel_sweeps", reason)
 
     def test_option_records_its_source(self):
-        """Report the override as the option's source; a solver without linked tiers applies no linked budget."""
+        """Default to "auto", report the override as the option's source, and apply no budget without linked tiers."""
+        default = inspect.signature(SolverFeatherPGS).parameters["mf_gs_parallel_linked_sweeps"].default
+        self.assertEqual(default, "auto")
         model = _cpu_arm()
         for environment, argument, expected, source_name in (
-            (None, None, None, "default"),
-            (None, "auto", "auto", "argument"),
-            ("64", None, 64, "environment"),
+            (None, "auto", "auto", "default"),
+            (None, None, None, "argument"),
+            ("64", "auto", 64, "environment"),
             ("auto", 32, "auto", "environment"),
             ("48", 48, 48, "argument"),
         ):
@@ -1355,6 +1357,14 @@ class TestLinkedTierSweeps(unittest.TestCase):
                 self.assertEqual((option["requested"], option["source"]), (argument, source_name))
                 self.assertEqual(option["applied"], 0)  # no tiers on CPU
                 self.assertEqual(selected["environment"]["applied"].get(_SWEEPS_FLAG), environment)
+        with patch.dict(os.environ):
+            os.environ.pop(_SWEEPS_FLAG, None)
+            omitted = SolverFeatherPGS(model, friction_anchor_beta=0.2)
+        self.assertEqual(omitted.mf_gs_parallel_linked_sweeps, "auto")
+        self.assertEqual(
+            omitted.get_path_selection()["options"]["mf_gs_parallel_linked_sweeps"],
+            {"applied": 0, "requested": "auto", "default": "auto", "source": "default"},
+        )
 
     def test_budget_carries_a_truncated_tier_to_the_serial_fixed_point(self):
         """Leave a two-sweep linked tier short of a sliding stance's serial fixed point, and reach it within budget.
@@ -1845,6 +1855,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
         limit = 0.5
         model = _pushed_sphere("cuda:0", limit=limit)
         built = {}
+        # The pass is under test, not the budget: every tier sweeps mf_gs_parallel_sweeps.
         with patch.dict(os.environ, {_SWITCH: "1"}):
             for limits, requested in itertools.product((False, True), repeat=2):
                 built[limits, requested] = _matrix_free_solver(
@@ -1853,6 +1864,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
                     parallel_rows=32,
                     enable_joint_velocity_limits=limits,
                     mf_gs_parallel_linked_velocity_limit_pass=requested,
+                    mf_gs_parallel_linked_sweeps=None,
                 )
             budgets = {
                 (sweeps, requested): _matrix_free_solver(
@@ -1862,6 +1874,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
                     enable_joint_velocity_limits=True,
                     mf_gs_parallel_linked_velocity_limit_pass=requested,
                     mf_gs_parallel_sweeps=sweeps,
+                    mf_gs_parallel_linked_sweeps=None,
                     mf_gs_parallel_tol=0.0,
                 )
                 for sweeps, requested in itertools.product((2, 2000), (False, True))
@@ -2107,18 +2120,16 @@ class TestPatchParallelPhysics(unittest.TestCase):
         with the same request keep two sweeps.
         """
         model = sliding_stance("cuda:0")
-        truncated = {"mf_gs_parallel_sweeps": 2, "mf_gs_parallel_tol": 0.0}
+        # The truncated tier opts out of the default "auto" budget, which would sweep it 30 times.
+        truncated = {"mf_gs_parallel_sweeps": 2, "mf_gs_parallel_tol": 0.0, "mf_gs_parallel_linked_sweeps": None}
+        budgeted = {**truncated, "mf_gs_parallel_linked_sweeps": 2000}
         with patch.dict(os.environ, {_SWITCH: "1"}):
             routes = {
                 "serial": _matrix_free_solver(model, beta=0.2, parallel_rows=0, pgs_iterations=2000),
                 "truncated": _matrix_free_solver(model, beta=0.2, parallel_rows=32, **truncated),
-                "linked_budget": _matrix_free_solver(
-                    model, beta=0.2, parallel_rows=32, mf_gs_parallel_linked_sweeps=2000, **truncated
-                ),
+                "linked_budget": _matrix_free_solver(model, beta=0.2, parallel_rows=32, **budgeted),
             }
-            point = _matrix_free_solver(
-                model, beta=0.0, parallel_rows=32, mf_gs_parallel_linked_sweeps=2000, **truncated
-            )
+            point = _matrix_free_solver(model, beta=0.0, parallel_rows=32, **budgeted)
         point_keys = [kernel.key for kernel in point._pgs_solve_mf_gs_incremental_kernels]
         self.assertTrue(
             point_keys and all("_sweeps2_" in key and "_linked" not in key for key in point_keys), point_keys

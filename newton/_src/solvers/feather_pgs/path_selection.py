@@ -772,7 +772,7 @@ def _tiers(solver) -> dict | None:
             "nesterov": bool(solver.mf_gs_parallel_nesterov),
             "matrix_free": bool(solver.mf_gs_parallel_matrix_free),
             # The largest tier budget; each tier records its own. Point tiers sweep mf_gs_parallel_sweeps, linked
-            # tiers mf_gs_parallel_linked_sweeps when set ("mf_gs_parallel_linked_sweeps" or "auto").
+            # tiers mf_gs_parallel_linked_sweeps unless it is None (rule "auto", its default, or a count).
             "sweeps": max(int(kernel._fpgs_sweeps) for kernel in kernels),
             "sweeps_rule": solver._par_sweeps_rule,
             "sweeps_reason": solver._par_sweeps_reason,

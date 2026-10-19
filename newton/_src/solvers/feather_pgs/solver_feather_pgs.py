@@ -1373,7 +1373,7 @@ class SolverFeatherPGS(SolverBase):
         mf_gs_incremental_rows: int = 32,
         mf_gs_parallel_rows: int = 0,
         mf_gs_parallel_sweeps: int = 24,
-        mf_gs_parallel_linked_sweeps: int | Literal["auto"] | None = None,
+        mf_gs_parallel_linked_sweeps: int | Literal["auto"] | None = "auto",
         mf_gs_parallel_nesterov: bool = True,
         mf_gs_parallel_tol: float = 1e-4,
         mf_gs_parallel_matrix_free: bool = False,
@@ -1730,7 +1730,7 @@ class SolverFeatherPGS(SolverBase):
             mf_gs_parallel_sweeps (int, optional): Maximum number of parallel sweeps per launch (early exit when no
                 impulse changes). Independent of ``pgs_iterations``; preserve the sweep allowance when comparing
                 execution speed, and validate convergence separately. The tiers that serve persistent patch
-                friction take ``mf_gs_parallel_linked_sweeps`` when it is set.
+                friction take ``mf_gs_parallel_linked_sweeps`` instead unless it is ``None``.
             mf_gs_parallel_linked_sweeps (int | Literal["auto"] | None, optional): Sweep budget of the parallel
                 tiers that serve persistent patch friction (linked tiers); point-friction tiers keep
                 ``mf_gs_parallel_sweeps``. Jacobi sweeps need more passes than serial sweeps where many rows
@@ -1745,7 +1745,7 @@ class SolverFeatherPGS(SolverBase):
                 Every world still exits early once its impulses change by less than ``mf_gs_parallel_tol``.
                 The environment variable ``FEATHER_PGS_PATCH_PARALLEL_SWEEPS`` (a positive count or ``auto``)
                 overrides the argument. ``get_path_selection()`` reports each tier's budget under
-                ``routes.sweep.tiers``. Experimental. Defaults to None.
+                ``routes.sweep.tiers``. Experimental. Defaults to ``"auto"``.
             mf_gs_parallel_nesterov (bool, optional): Apply Nesterov momentum to the parallel sweeps.
             mf_gs_parallel_tol (float, optional): Relative impulse change below which the parallel sweep exits early.
             mf_gs_parallel_matrix_free (bool, optional): Parallel sweep without the response block (per sweep
@@ -16345,8 +16345,9 @@ class SolverFeatherPGS(SolverBase):
 
         ``tiers`` lists ``(rows, min_rows)`` per tier. Point tiers sweep
         ``mf_gs_parallel_sweeps``. Linked (patch) tiers sweep ``mf_gs_parallel_linked_sweeps``
-        when it is set; under ``"auto"`` each takes :func:`_auto_linked_sweeps` of its row
-        bound. Every world still exits early at ``mf_gs_parallel_tol``.
+        unless it is ``None``; under ``"auto"``, the default, each takes
+        :func:`_auto_linked_sweeps` of its row bound. Every world still exits early at
+        ``mf_gs_parallel_tol``.
         """
         sweeps = int(self.mf_gs_parallel_sweeps)
         linked = self.mf_gs_parallel_linked_sweeps
@@ -16354,7 +16355,7 @@ class SolverFeatherPGS(SolverBase):
             reason = "Point tiers sweep mf_gs_parallel_sweeps; mf_gs_parallel_linked_sweeps budgets linked tiers only."
             return [sweeps] * len(tiers), "mf_gs_parallel_sweeps", reason
         if linked is None:
-            reason = "Linked tiers sweep mf_gs_parallel_sweeps: mf_gs_parallel_linked_sweeps is unset."
+            reason = "Linked tiers sweep mf_gs_parallel_sweeps: mf_gs_parallel_linked_sweeps is None."
             return [sweeps] * len(tiers), "mf_gs_parallel_sweeps", reason
         source = (
             "FEATHER_PGS_PATCH_PARALLEL_SWEEPS"
