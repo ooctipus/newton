@@ -1,0 +1,1 @@
+Speed up the FeatherPGS joint velocity prescale used with `enable_joint_velocity_limits=True`: it now runs in parallel lane groups per articulation and writes its result without a separate copy, with results bit-identical to the previous serial kernel.

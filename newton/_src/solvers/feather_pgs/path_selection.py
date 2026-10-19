@@ -776,9 +776,13 @@ def _velocity_limits(solver) -> dict:
         )
     limits = bool(solver._has_rigid_body_velocity_limits)
     matrix_free = solver.pgs_mode == "matrix_free"
+    model = solver.model
+    prescale = solver.enable_joint_velocity_limits and model.joint_count > 0 and model.articulation_count > 0
     return {
         "joint": joint,
         "reason": reason,
+        # Lanes per articulation of the pre-solve PhysX velocity prescale; 0 when it launches no kernel.
+        "prescale_lanes": int(solver._velocity_prescale_lanes) if prescale else 0,
         "activation_fraction": json_value(solver.velocity_limit_activation_fraction),
         "rigid_body_limits": limits,
         # Mirrors _allocate_mf_buffers and the row allocation of _stage4_build_rows (both modes),

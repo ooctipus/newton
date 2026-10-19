@@ -212,8 +212,49 @@ def clamp_free_root_velocity_limits(
             qd[ds + 5] = ang[2] * scale
 
 
-@wp.kernel
+@wp.func
+def _prescaled_axis_count(
+    joint: int,
+    joint_type: wp.array[int],
+    joint_child: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    body_flags: wp.array[wp.int32],
+) -> int:
+    """Return how many leading DOFs of ``joint`` the PhysX velocity prescale reads and scales.
+
+    Joint types without a PhysX joint velocity limit and kinematic children
+    have none.
+    """
+    jtype = joint_type[joint]
+    if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
+        return 0
+    if (body_flags[joint_child[joint]] & BodyFlags.KINEMATIC) != 0:
+        return 0
+    return joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1]
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    for (int offset = lanes >> 1; offset > 0; offset >>= 1) {
+        const float other = __shfl_xor_sync(0xffffffffu, ratio, offset);
+        if (other < ratio)
+            ratio = other;
+    }
+#endif
+    return ratio;
+""")
+def _articulation_lane_min(ratio: float, lanes: int) -> float:
+    """Return the smallest ``ratio`` of an aligned group of ``lanes`` CUDA lanes; one lane on CPU.
+
+    Every lane of a complete warp must call it with the same power-of-two
+    ``lanes``.
+    """
+
+
+@wp.kernel(enable_backward=False)
 def prescale_joint_velocity_limits(
+    articulation_count: int,
+    lanes: int,
     articulation_start: wp.array[int],
     joint_type: wp.array[int],
     joint_child: wp.array[int],
@@ -223,8 +264,9 @@ def prescale_joint_velocity_limits(
     body_flags: wp.array[wp.int32],
     drive_slot: wp.array[int],
     skip_driven: int,
-    # in/out
     joint_qd: wp.array[float],
+    # out
+    prescaled_joint_qd: wp.array[float],
 ):
     """PhysX-style pre-solve joint velocity scaling.
 
@@ -241,25 +283,32 @@ def prescale_joint_velocity_limits(
     derived from ``joint_target_ke/kd > 0`` and is stable across steps.
     When ``skip_driven == 0``, ``drive_slot`` is never read (a 1-element
     dummy is safe).
+
+    An aligned group of ``lanes`` threads owns each articulation, the joints
+    from ``articulation_start[art]`` up to the next articulation's start. Lane
+    ``k`` takes joints ``k, k + lanes, ...`` and the group combines the lanes'
+    ratios with a minimum. Every candidate ratio is 1 or a quotient of two
+    positive numbers, never NaN or -0, so the minimum selects one of them
+    and its bits do not depend on the order, as in the serial loop. Each DOF
+    of ``prescaled_joint_qd`` is written once: scaled DOFs get
+    ``joint_qd * ratio`` and every other DOF, including those of joints ahead
+    of the first articulation, a copy of ``joint_qd``. CUDA launches cover
+    complete warps with a power-of-two ``lanes`` of at most 32; CPU launches
+    use one lane.
     """
-    art = wp.tid()
-    joint_start = articulation_start[art]
-    joint_end = articulation_start[art + 1]
+    tid = wp.tid()
+    art = tid // lanes
+    lane = tid - art * lanes
+    joint_start = int(0)
+    joint_end = int(0)
+    if art < articulation_count:
+        joint_start = articulation_start[art]
+        joint_end = articulation_start[art + 1]
 
     ratio = float(1.0)
-    for j in range(joint_start, joint_end):
-        if (body_flags[joint_child[j]] & BodyFlags.KINEMATIC) != 0:
-            continue
-        jtype = joint_type[j]
-        if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
-            continue
-
-        lin_count = joint_dof_dim[j, 0]
-        ang_count = joint_dof_dim[j, 1]
-        axis_count = lin_count + ang_count
+    for j in range(joint_start + lane, joint_end, lanes):
         qd_start = joint_qd_start[j]
-
-        for axis in range(axis_count):
+        for axis in range(_prescaled_axis_count(j, joint_type, joint_child, joint_dof_dim, body_flags)):
             dof = qd_start + axis
             if skip_driven != 0:
                 if drive_slot[dof] >= 0:
@@ -270,28 +319,28 @@ def prescale_joint_velocity_limits(
                 scale = limit / qd_abs
                 if scale < ratio:
                     ratio = scale
+    # Padding lanes past the last articulation take part with ratio 1.
+    ratio = _articulation_lane_min(ratio, lanes)
 
-    if ratio >= 1.0:
-        return
-
-    for j in range(joint_start, joint_end):
-        if (body_flags[joint_child[j]] & BodyFlags.KINEMATIC) != 0:
-            continue
-        jtype = joint_type[j]
-        if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
-            continue
-
-        lin_count = joint_dof_dim[j, 0]
-        ang_count = joint_dof_dim[j, 1]
-        axis_count = lin_count + ang_count
-        qd_start = joint_qd_start[j]
-
-        for axis in range(axis_count):
-            dof = qd_start + axis
-            if skip_driven != 0:
-                if drive_slot[dof] >= 0:
-                    continue
-            joint_qd[dof] = joint_qd[dof] * ratio
+    if art == 0:
+        # Joints ahead of the first articulation keep their velocity.
+        for dof in range(lane, joint_qd_start[joint_start], lanes):
+            prescaled_joint_qd[dof] = joint_qd[dof]
+    if ratio < 1.0:
+        for j in range(joint_start + lane, joint_end, lanes):
+            qd_start = joint_qd_start[j]
+            scaled_end = qd_start + _prescaled_axis_count(j, joint_type, joint_child, joint_dof_dim, body_flags)
+            for dof in range(qd_start, joint_qd_start[j + 1]):
+                qd = joint_qd[dof]
+                if dof < scaled_end:
+                    if skip_driven == 0:
+                        qd = qd * ratio
+                    elif drive_slot[dof] < 0:
+                        qd = qd * ratio
+                prescaled_joint_qd[dof] = qd
+    else:
+        for dof in range(joint_qd_start[joint_start] + lane, joint_qd_start[joint_end], lanes):
+            prescaled_joint_qd[dof] = joint_qd[dof]
 
 
 @wp.func

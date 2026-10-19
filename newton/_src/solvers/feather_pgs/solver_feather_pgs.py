@@ -648,6 +648,27 @@ def _warn_constraint_row_overflow(
             )
 
 
+def _velocity_prescale_launch(articulation_start: np.ndarray, *, cuda: bool) -> tuple[int, int]:
+    """Return the lanes per articulation and the thread count of the joint velocity prescale.
+
+    A lane group as wide as the mean articulation's joint count, rounded up to a
+    power of two of at most one warp, covers a typical articulation in one
+    strided pass while many articulations share the device; larger ones take a
+    few passes. CUDA launches cover complete warps. CPU threads cannot exchange
+    values, so a CPU launch runs one lane per articulation.
+    """
+    count = len(articulation_start) - 1
+    if count <= 0:
+        return 1, 0
+    if not cuda:
+        return 1, count
+    mean_joints = (int(articulation_start[-1]) - int(articulation_start[0])) / count
+    lanes = 1
+    while lanes < 32 and lanes < mean_joints:
+        lanes *= 2
+    return lanes, (count * lanes + 31) // 32 * 32
+
+
 @dataclass(frozen=True)
 class _FeatherPGSModelPlan:
     """Immutable articulation and generalized-response plan."""
@@ -3350,7 +3371,8 @@ class SolverFeatherPGS(SolverBase):
         the plan the row build dispatches on), local, paired and sparse responses,
         the sweep kernels per route and tier, what drives them and the matrix-free
         sweep's shared-memory storage (``sweep.mf_gs_storage``), resolved worlds,
-        publication, velocity limits, free bodies, the friction law and the
+        publication, velocity limits and the lane width of their prescale, free bodies,
+        the friction law and the
         grouped-dynamics kernels, each with a reason; a size whose response the
         grouped kernel solves reports ``hinv_jt_kernel`` ``"grouped"``. The
         row builders (``contact_rows.builder_by_dof``) are those of the dense
@@ -5847,6 +5869,10 @@ class SolverFeatherPGS(SolverBase):
             self.v_hat = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self.v_out = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self.qd_work = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
+            # The joint velocity prescale writes every DOF of qd_work (see _launch_velocity_prescale).
+            self._velocity_prescale_lanes, self._velocity_prescale_threads = _velocity_prescale_launch(
+                model.articulation_start.numpy(), cuda=model.device.is_cuda
+            )
             self.v_mf_accum = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self.v_out_snap = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self._deferred_dense_tau = None
@@ -5870,6 +5896,7 @@ class SolverFeatherPGS(SolverBase):
             self.v_hat = None
             self.v_out = None
             self.qd_work = None
+            self._velocity_prescale_lanes, self._velocity_prescale_threads = 1, 0
             self.v_mf_accum = None
             self.v_out_snap = None
             self._deferred_dense_tau = None
@@ -11762,6 +11789,33 @@ class SolverFeatherPGS(SolverBase):
                 device=self.model.device,
             )
 
+    def _launch_velocity_prescale(self, joint_qd: wp.array, prescaled_joint_qd: wp.array) -> None:
+        """Write every DOF's PhysX-prescaled joint velocity in one launch, without a separate copy."""
+        model = self.model
+        if not model.articulation_count:
+            wp.copy(prescaled_joint_qd, joint_qd)
+            return
+        wp.launch(
+            prescale_joint_velocity_limits,
+            dim=self._velocity_prescale_threads,
+            inputs=[
+                model.articulation_count,
+                self._velocity_prescale_lanes,
+                model.articulation_start,
+                model.joint_type,
+                model.joint_child,
+                model.joint_qd_start,
+                model.joint_dof_dim,
+                model.joint_velocity_limit,
+                model.body_flags,
+                self._vel_limit_drive_slot_arg,
+                self._vel_limit_skip_driven,
+                joint_qd,
+            ],
+            outputs=[prescaled_joint_qd],
+            device=model.device,
+        )
+
     def _stage1_fk_id(self, state_in: State, state_aug: State, state_out: State) -> tuple[wp.Event | None, wp.array]:
         model = self.model
 
@@ -11798,24 +11852,7 @@ class SolverFeatherPGS(SolverBase):
         else:
             state_aug.body_f_s.zero_()
         if self.enable_joint_velocity_limits:
-            wp.copy(self.qd_work, state_in.joint_qd)
-            wp.launch(
-                prescale_joint_velocity_limits,
-                dim=model.articulation_count,
-                inputs=[
-                    model.articulation_start,
-                    model.joint_type,
-                    model.joint_child,
-                    model.joint_qd_start,
-                    model.joint_dof_dim,
-                    model.joint_velocity_limit,
-                    model.body_flags,
-                    self._vel_limit_drive_slot_arg,
-                    self._vel_limit_skip_driven,
-                ],
-                outputs=[self.qd_work],
-                device=model.device,
-            )
+            self._launch_velocity_prescale(state_in.joint_qd, self.qd_work)
             stage3_qd = self.qd_work
         else:
             stage3_qd = state_in.joint_qd
