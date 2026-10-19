@@ -148,6 +148,47 @@ def _keyed_tier_kwargs(*, linked):
         yield kwargs
 
 
+def _suite_sparse_sweeps():
+    """Native sparse sweeps at the shapes the benchmark suite builds: ``(size, kwargs, patch_only)``."""
+    active = {"active_rows": True}
+    triplets = {"active_rows": True, "use_support_table": True, "contact_triplets": True}
+    for size, kwargs in (
+        ((100, 43, 18), active),
+        ((112, 18, 12), triplets),
+        ((128, 25, 16), triplets),
+        ((128, 27, 21), {"use_support_table": True}),
+        ((16, 6, 6), {"use_support_table": True, "velocity_limits": True, "lanes_per_world": 8, "local_factors": True}),
+        ((256, 18, 12), triplets),
+        ((48, 18, 18), triplets),
+        ((48, 25, 16), triplets),
+        ((56, 43, 18), active),
+        ((64, 14, 10), {"use_support_table": True, "lanes_per_world": 16}),
+        ((64, 9, 9), {"velocity_limits": True, "lanes_per_world": 16}),
+        ((80, 18, 18), triplets),
+    ):
+        yield size, kwargs, False
+    # Persistent patch friction links the patch rings of the active sweeps.
+    for size, kwargs in (
+        ((100, 43, 18), active),
+        ((112, 18, 12), triplets),
+        ((128, 25, 16), triplets),
+        ((256, 18, 12), triplets),
+        ((48, 18, 18), triplets),
+        ((48, 25, 16), triplets),
+        ((56, 43, 18), active),
+        ((72, 18, 12), triplets),
+        ((80, 18, 18), triplets),
+    ):
+        yield size, {**kwargs, "linked_rows": True}, True
+
+
+def _suite_diagonal_sweeps():
+    """Sparse-diagonal sweeps at the suite's shapes: ``(args, kwargs, patch_only)``; contact units are patch-only."""
+    for shape in ((1024, 114, 6, _ARCH), (256, 13, 9, _ARCH)):
+        yield shape, {"contact_triples": True, "speculative_contact_batches": True}, False
+        yield shape, {"speculative_contact_batches": True, "contact_units": True}, True
+
+
 def _patch_only_factory_labels():
     """Labels of the factory-built kernels only patch friction launches."""
     for name, args, kwargs in _linked_tier_calls():
@@ -155,6 +196,12 @@ def _patch_only_factory_labels():
     yield _label("keyed_rows.get_patch_fallback_kernel", (_keyed_layout(),), {})
     for kwargs in _keyed_tier_kwargs(linked=True):
         yield _label("keyed_rows.get_parallel_factory", (_keyed_layout(), 128, 32, 22, _ARCH), kwargs)
+    for size, kwargs, patch_only in _suite_sparse_sweeps():
+        if patch_only:
+            yield _label("sparse_pgs._get_pgs_solve_sparse_kernel", size, kwargs)
+    for args, kwargs, patch_only in _suite_diagonal_sweeps():
+        if patch_only:
+            yield _label("solver_feather_pgs._get_pgs_solve_sparse_diagonal_kernel", args, kwargs)
 
 
 _PATCH_ONLY |= frozenset(_patch_only_factory_labels())
@@ -365,6 +412,87 @@ def _spliced_sweep_calls():
             yield name + "get_response_block_sweep_warp_kernel", factory, (192, 64, 22), {**kwargs, "rows": rows}
 
 
+def _suite_shape_calls():
+    """Factory kernels at the shapes the benchmark suite's routes build, beyond those pinned above.
+
+    Each call reproduces the kernel name its route records and, where a head
+    profile ran the route, the profile's kernel suffix: the matrix-free
+    Gauss-Seidel, sparse, sparse-diagonal and keyed parallel sweeps, the keyed
+    limit rows, the sparse mass factors, the sparse contact responses, the
+    packet prefix and the paired-component preparation. A byte-identical
+    rewrite of their generators then keeps the binaries the suite runs.
+    """
+    from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
+        keyed_row_layout,
+        keyed_rows,
+        paired_components,
+        row_packets,
+        sparse_contact,
+        sparse_mass_matrix,
+        sparse_pgs,
+    )
+    from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
+
+    name = "solver_feather_pgs."
+    no_drives = {"has_drive_rows": False, "has_dense_velocity_limit_rows": False}
+    factory = solver._get_pgs_solve_mf_gs_kernel.__wrapped__
+    for args, kwargs in (
+        ((192, 64, 22, _ARCH), {"has_drive_rows": False}),
+        ((192, 64, 22, _ARCH), {"has_drive_rows": False, "skip_incremental_rows": 128}),
+        ((192, 64, 15, _ARCH), {**no_drives, "skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
+        ((192, 64, 29, _ARCH), {**no_drives, "factor_coordinates": True, "independent_components": True}),
+        ((72, 32, 18, _ARCH), {**no_drives, "skip_incremental_rows": 48}),
+    ):
+        yield name + "_get_pgs_solve_mf_gs_kernel", factory, args, kwargs
+    factory = sparse_pgs._get_pgs_solve_sparse_kernel.__wrapped__
+    for size, kwargs, _ in _suite_sparse_sweeps():
+        yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, size, kwargs
+    factory = solver._get_pgs_solve_sparse_diagonal_kernel.__wrapped__
+    for args, kwargs, _ in _suite_diagonal_sweeps():
+        yield name + "_get_pgs_solve_sparse_diagonal_kernel", factory, args, kwargs
+
+    def parallel(layout, *args, **kwargs):
+        return keyed_rows.get_parallel_factory.__wrapped__(solver._get_pgs_solve_parallel_kernel, layout)(
+            *args, **kwargs
+        )
+
+    def limit_prefix(layout):
+        return keyed_row_layout.prefix_kernel.__wrapped__(layout, keyed_rows.PrefixInput, keyed_rows.KineticRows)
+
+    # The tiers read only a layout's coordinate blocks; its limit masks shape the limit rows.
+    limited = KeyedLayout(16, 6, 0, 16, 128, True, 0xFFFF, 0xFFFF)
+    single = KeyedLayout(18, 0, 0, 0, 48, False, 0)
+    for layout, shape, tiers, exact in (
+        (limited, (192, 64, 22, _ARCH), ((32, 0), (64, 32), (96, 64), (128, 96)), False),
+        (single, (72, 32, 18, _ARCH), ((32, 0), (48, 32)), True),
+    ):
+        blocks = (layout.primary, layout.secondary, layout.primary_offset, layout.secondary_offset)
+        for rows, min_rows in tiers:
+            kwargs = {
+                "rows": rows,
+                "min_rows": min_rows,
+                "sweeps": 24,
+                "matrix_free": True,
+                "inkernel_response": blocks,
+            }
+            if exact:
+                kwargs["exact_row_sums"] = True
+            yield "keyed_rows.get_parallel_factory", parallel, (layout, *shape), kwargs
+    yield "keyed_row_layout.prefix_kernel", limit_prefix, (limited,), {}
+    factory = sparse_mass_matrix._get_crba_sparse_factor_kernel.__wrapped__
+    for size in ((6, 21), (9, 44), (14, 81), (18, 117), (18, 135), (25, 194), (27, 243), (43, 434)):
+        yield "sparse_mass_matrix._get_crba_sparse_factor_kernel", factory, size, {}
+        yield "sparse_mass_matrix._get_crba_sparse_factor_kernel", factory, size, {"geometric": True}
+    # 18 coordinates with a support table are pinned with the patch-varied factories.
+    factory = sparse_contact._get_sparse_contact_response_kernel.__wrapped__
+    for dofs, table in ((6, True), (9, False), (14, True), (25, True), (27, True), (43, False)):
+        kwargs = {"prepare_rows": True, "use_support_table": table}
+        yield "sparse_contact._get_sparse_contact_response_kernel", factory, (dofs,), kwargs
+    yield "row_packets.get_prefix_kernel", row_packets.get_prefix_kernel.__wrapped__, (9, 1, 40), {}
+    yield "paired_components.get_prepare_kernel", paired_components.get_prepare_kernel.__wrapped__, (23, 6), {}
+
+
 def _keyed_row_calls():
     """Keyed rows of a 16+6 coordinate world (keyed_rows.py), including their parallel tiers."""
     from newton._src.solvers.feather_pgs import keyed_rows  # noqa: PLC0415
@@ -396,6 +524,7 @@ def _factory_kernels():
         _sparse_contact_calls(),
         _solver_factory_calls(),
         _spliced_sweep_calls(),
+        _suite_shape_calls(),
         _keyed_row_calls(),
     ):
         try:
@@ -583,6 +712,11 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
                 self.assertIn(family, families)
                 # Every friction law launches these sweeps, so their pins are point pins.
                 self.assertFalse({name for name in self.current if name.startswith(family + "(")} & _PATCH_ONLY)
+
+    def test_inventory_builds_the_suite_shapes(self):
+        """Build every factory call at the suite's shapes; the suite's routes build them, so none may be rejected."""
+        labels = {_label(name, args, kwargs) for name, _, args, kwargs in _suite_shape_calls()}
+        self.assertEqual(sorted(labels - set(self.current)), [])
 
 
 def record():

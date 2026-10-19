@@ -134,10 +134,11 @@ def _unwrapped(factory):
 def factory_calls():
     """Yield ``(name, factory, args, kwargs)`` for factory variants the point-stream pins do not reach.
 
-    Each matrix-free Gauss-Seidel flag is toggled alone on two bases, then the
-    shapes the benchmark suite's routes select are added; a second keyed-row
-    coordinate layout (one articulation, no secondary block) and the Cholesky
-    factor families follow. Calls a factory rejects are recorded as rejected.
+    Each matrix-free Gauss-Seidel flag is toggled alone on two bases (the pins
+    hold the suite's shapes); the fallback and linked parallel tiers of a
+    second keyed-row coordinate layout (one articulation, no secondary block)
+    and the Cholesky factor families follow. Calls a factory rejects are
+    recorded as rejected.
     """
     from newton._src.solvers.feather_pgs import keyed_rows, small_cholesky  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
@@ -166,15 +167,6 @@ def factory_calls():
     for base in ({}, {"has_drive_rows": False, "has_dense_velocity_limit_rows": False}):
         for change in toggles:
             yield name + "_get_pgs_solve_mf_gs_kernel", mf_gs, (64, 32, 12, ARCH), {**base, **change}
-    no_drives = {"has_drive_rows": False, "has_dense_velocity_limit_rows": False}
-    for args, kwargs in (
-        ((192, 64, 22, ARCH), {"has_drive_rows": False}),
-        ((192, 64, 22, ARCH), {"has_drive_rows": False, "skip_incremental_rows": 128}),
-        ((72, 32, 18, ARCH), {**no_drives, "skip_incremental_rows": 48}),
-        ((192, 64, 15, ARCH), {**no_drives, "skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
-        ((192, 64, 29, ARCH), {**no_drives, "factor_coordinates": True, "independent_components": True}),
-    ):
-        yield name + "_get_pgs_solve_mf_gs_kernel", mf_gs, args, kwargs
 
     def parallel(layout, *args, **kwargs):
         factory = keyed_rows.get_parallel_factory.__wrapped__(solver._get_pgs_solve_parallel_kernel, layout)
@@ -183,7 +175,7 @@ def factory_calls():
     layout = Named("KeyedLayout(18, 0, 0, 0, 48, False, 0)", KeyedLayout(18, 0, 0, 0, 48, False, 0))
     yield "keyed_rows.get_fallback_kernel", _unwrapped(keyed_rows.get_fallback_kernel), (layout,), {}
     yield "keyed_rows.get_patch_fallback_kernel", _unwrapped(keyed_rows.get_patch_fallback_kernel), (layout,), {}
-    for (rows, min_rows), linked in ((tier, linked) for tier in ((32, 0), (48, 32)) for linked in (False, True)):
+    for rows, min_rows in ((32, 0), (48, 32)):
         kwargs = {
             "rows": rows,
             "min_rows": min_rows,
@@ -191,9 +183,8 @@ def factory_calls():
             "matrix_free": True,
             "inkernel_response": (18, 0, 0, 0),
             "exact_row_sums": True,
+            "linked_rows": True,
         }
-        if linked:
-            kwargs["linked_rows"] = True
         yield "keyed_rows.get_parallel_factory", parallel, (layout, 72, 32, 18, ARCH), kwargs
 
     for size in (6, 9, 16):
