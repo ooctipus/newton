@@ -261,7 +261,9 @@ def _held_tree_groups(solver) -> tuple:
         return None, []
     if hasattr(owner, "groups"):
         groups = list(owner.groups)
-        return ("forest" if any(group.layout.forest for group in groups) else "mixed"), groups
+        # Scalar branch groups hold no tree layout.
+        forest = any(getattr(getattr(group, "layout", None), "forest", False) for group in groups)
+        return ("forest" if forest else "mixed"), groups
     return "tree", [owner]
 
 
@@ -272,11 +274,21 @@ def _held_tree(solver) -> dict:
         "owner": kind,
         "reason": solver._cached_dynamics_selection_reason,
         "layout_reason": getattr(owner, "forest_reason", None),
+        # Whether a diagonal-mass group of world-fixed roots over one-coordinate
+        # leaves runs as scalar branches (FEATHER_PGS_SCALAR_BRANCHES=1).
+        "scalar_branches": {
+            "enabled": getattr(owner, "scalar", None) is not None,
+            "reason": getattr(solver, "_scalar_branches_reason", None),
+        },
         "groups": [_tree_group(group) for group in groups],
     }
 
 
 def _tree_group(group) -> dict:
+    record = getattr(group, "record", None)
+    if record is not None:
+        # A scalar branch group: one thread per coordinate, no lanes or tree layout.
+        return record()
     layout, operator = group.layout, group.sparse
     return {
         "operator": type(operator).__name__,

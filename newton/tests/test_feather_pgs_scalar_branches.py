@@ -10,7 +10,10 @@ revolute leaves.
 """
 
 import dataclasses
+import json
+import os
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -19,6 +22,7 @@ import newton
 from newton._src.solvers.feather_pgs import kernels as fk
 from newton._src.solvers.feather_pgs import scalar_branches as sb
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
+from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
 from newton._src.solvers.feather_pgs.prismatic_linear_state import (
     finalize_prismatic_linear_state,
     get_linear_inverse_mass_kernel,
@@ -31,6 +35,10 @@ DT = 1.0 / 240.0
 GRAVITY = (0.7, -1.2, -9.1)
 # Fields the scalar family stops writing for its bodies; no consumer on its route reads them.
 DROPPED_FIELDS = ("body_q_com", "body_v_s", "body_a_s", "body_f_s", "body_I_s", "_body_inertia_terms")
+# CUDA bounds against the prismatic linear state route: the keys' are that route's own A/B
+# tolerances (FMA contraction); the arm leaves the serial route for the held owner's float order.
+KEY_BOUND = {"rtol": 3.0e-5, "atol": 5.0e-6}
+ARM_BOUND = {"rtol": 1.0e-4, "atol": 1.0e-4}
 
 
 def build_branch_model(
@@ -202,6 +210,77 @@ def same(test, expected, actual, index, name):
     expected, actual = expected.numpy()[index], actual.numpy()[index]
     test.assertTrue(np.all(np.isfinite(actual)), name)
     np.testing.assert_array_equal(actual, expected, err_msg=name)
+
+
+def recipe_solver(model, *, scalar, compact=True, **options):
+    """The keyboard recipe's solver: compact contacts and both prismatic opt-ins, plus scalar branches if asked."""
+    arguments = {
+        "pgs_mode": "matrix_free",
+        "pgs_iterations": 8,
+        "update_mass_matrix_interval": 2,
+        "use_parallel_streams": True,
+        "enable_joint_limits": True,
+        "dense_max_constraints": 64,
+        "mf_max_constraints": 64,
+        **options,
+    }
+    with (
+        mock.patch.object(solver_module, "_COMPACT_CONTACT_BOUNDARY", compact),
+        mock.patch.object(solver_module, "_SPARSE_CONTACT_DIRECT", True),
+        mock.patch.object(solver_module, "_PRISMATIC_PUBLICATION", True),
+        mock.patch.object(solver_module, "_PRISMATIC_LINEAR_STATE", True),
+        mock.patch.object(solver_module, "_SCALAR_BRANCHES", scalar),
+    ):
+        return SolverFeatherPGS(model, **arguments)
+
+
+def install_held_contacts(model, state, contacts, pairs):
+    """Hold one contact per ``(body, other body or -1 for the world)`` pair with fixed local witnesses.
+
+    Both witnesses start at the first body's origin with normal ``-z`` (as
+    ``install_contacts`` of the compact-contact tests), so a contact starts at
+    zero gap and pushes back once its first body moves down against the other.
+    """
+    shape_body = model.shape_body.numpy()
+    poses = state.body_q.numpy().astype(np.float64)
+    capacity = contacts.rigid_contact_shape0.shape[0]
+    shapes = np.full((2, capacity), -1, dtype=np.int32)
+    points = np.zeros((2, capacity, 3), dtype=np.float32)
+    for contact, bodies in enumerate(pairs):
+        witness = poses[bodies[0], :3]
+        for end, body in enumerate(bodies):
+            if body < 0:
+                points[end, contact] = witness
+                continue
+            shapes[end, contact] = int(np.flatnonzero(shape_body == body)[0])
+            pose = poses[body]
+            offset, rotation = witness - pose[:3], -pose[3:6]
+            points[end, contact] = offset + 2.0 * np.cross(rotation, np.cross(rotation, offset) + pose[6] * offset)
+    for end in range(2):
+        getattr(contacts, f"rigid_contact_shape{end}").assign(shapes[end])
+        getattr(contacts, f"rigid_contact_point{end}").assign(points[end])
+        getattr(contacts, f"rigid_contact_margin{end}").zero_()
+    contacts.rigid_contact_normal.assign(np.tile(np.array([0.0, 0.0, -1.0], np.float32), (capacity, 1)))
+    contacts.rigid_contact_count.assign(np.array([len(pairs)], dtype=np.int32))
+
+
+class _Layout:
+    """Index sets of a branch model: the scalar family's coordinates, DOFs and bodies, and the arm's."""
+
+    def __init__(self, model):
+        starts = model.articulation_start.numpy()
+        child, q_start, qd_start = model.joint_child.numpy(), model.joint_q_start.numpy(), model.joint_qd_start.numpy()
+        self.branches = branch_articulations(model)
+        self.arms = self.branches + 1
+        size = branch_size(model)
+        leaves = [starts[a] + 1 + np.arange(size) for a in self.branches]
+        self.key_coordinates = np.concatenate([q_start[joints] for joints in leaves])
+        self.key_dofs = np.concatenate([qd_start[joints] for joints in leaves])
+        self.key_bodies = np.concatenate([child[starts[a] : starts[a + 1]] for a in self.branches])
+        self.key_leaves = np.concatenate([child[joints] for joints in leaves])
+        self.arm_dofs = np.concatenate([np.arange(qd_start[starts[a]], qd_start[starts[a + 1]]) for a in self.arms])
+        self.arm_bodies = np.concatenate([child[starts[a] : starts[a + 1]] for a in self.arms])
+        self.arm_tips = child[starts[self.arms + 1] - 1]
 
 
 class _PrismaticRoute:
@@ -858,6 +937,38 @@ class TestScalarBranchRule(unittest.TestCase):
         solver.enable_joint_velocity_limits = True
         self.assertIn("velocity limits", sb.plan_scalar_branches(solver, requested=True)[1])
 
+    def test_owner_composes_the_scalar_group(self):
+        """Compose the scalar group beside the arm's tree group, keep the forest off it, and validate both.
+
+        The owner is built directly on CPU, where the solver keeps ordinary dynamics.
+        """
+        model = build_branch_model(worlds=2)
+        solver = cpu_solver(model, 7)
+        solver._scalar_branches, _reason = sb.plan_scalar_branches(solver, requested=True)
+        owner = MixedTreeKineticState(solver)
+        self.assertIsInstance(owner.scalar, sb.ScalarBranchState)
+        self.assertEqual([type(group).__name__ for group in owner.groups], ["TreeKineticState", "ScalarBranchState"])
+        self.assertEqual([group.sparse.size for group in owner.groups], [6, 7])
+        # The scalar group validates its input bank by identity, so the owner does.
+        self.assertFalse(owner.bank_compare)
+        # Every group proves its inputs unchanged: the notification keeps the caches.
+        self.assertTrue(owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES))
+        owner.invalidate()
+        np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 0)
+        with mock.patch.dict(os.environ, {"FEATHER_PGS_TREE_FOREST": "1"}):
+            forced = MixedTreeKineticState(solver)
+        self.assertIn("Scalar branches own", forced.forest_reason)
+        self.assertEqual(len(forced.groups), 2)
+
+    def test_cpu_route_record_reports_the_rule(self):
+        """Report scalar branches as off on CPU, where no diagonal-mass group shares a sparse-diagonal response."""
+        record = SolverFeatherPGS(build_branch_model(worlds=2), pgs_mode="split").get_path_selection()
+        json.dumps(record, allow_nan=False)
+        self.assertEqual(
+            record["routes"]["held_tree"]["scalar_branches"],
+            {"enabled": False, "reason": "No diagonal-mass group shares the sparse-diagonal response."},
+        )
+
 
 class TestScalarBranchKernels(unittest.TestCase):
     def test_prismatic_branches_match_the_linear_state_route(self):
@@ -976,6 +1087,316 @@ class TestScalarBranchKernels(unittest.TestCase):
         self.assertFalse(pair.state.validate_model(newton.ModelFlags.JOINT_DOF_PROPERTIES))
         with self.assertRaisesRegex(RuntimeError, "joint_parent changed"):
             pair.state.validate_model(joint)
+
+
+def _close(test, expected, actual, index, tag, *, rtol, atol):
+    actual, expected = actual.numpy()[index], expected.numpy()[index]
+    test.assertTrue(np.all(np.isfinite(actual)), tag)
+    np.testing.assert_allclose(actual, expected, rtol=rtol, atol=atol, err_msg=tag)
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "Scalar branches run on the CUDA held-tree owner")
+class TestScalarBranchOwner(unittest.TestCase):
+    def _poison(self, solver, bodies):
+        """Fill the FK/ID fields the scalar family stops writing with NaN for its bodies."""
+        for name in DROPPED_FIELDS:
+            array = getattr(solver, name)
+            values = array.numpy()
+            values[bodies] = np.nan
+            array.assign(values)
+
+    def test_owner_matches_the_prismatic_route(self):
+        """Own 108-key worlds as scalar branches beside a held arm and track the prismatic linear state route.
+
+        The held-tree plan caps a group at 64 bodies, so the recipe's route had no
+        owner for this keyboard-shaped model. Keys stay within the FMA bound of
+        the prismatic linear state route through floor contacts, the mass
+        cadence, an inertial and drive notification, a masked reset after a
+        coordinate write, a root re-pose and captured graphs with masked and full
+        resets; the arm moves to the held owner's float order. The FK/ID fields
+        the family stops writing hold NaN for its bodies throughout, so nothing
+        on the route reads them.
+        """
+        device = wp.get_device("cuda:0")
+        model = build_branch_model(device, worlds=4, leaves=108, shapes=True)
+        layout = _Layout(model)
+        starts, child = model.articulation_start.numpy(), model.joint_child.numpy()
+        floors = [int(child[starts[a] + 1 + k]) for a in layout.branches for k in (0, 17, 53, 107)]
+        model.rigid_contact_max = len(floors)
+        solvers = [recipe_solver(model, scalar=False), recipe_solver(model, scalar=True)]
+        head, scalar = solvers
+        self.assertIsNone(head._tree_kinetic_state)
+        self.assertTrue(head._prismatic_linear_state)
+        owner = scalar._tree_kinetic_state
+        self.assertIsInstance(owner, MixedTreeKineticState)
+        self.assertIsInstance(owner.scalar, sb.ScalarBranchState)
+        self.assertEqual(sorted(group.sparse.size for group in owner.groups), [6, 108])
+        self.assertIsNone(scalar._prismatic_publication)
+        self.assertFalse(scalar._prismatic_linear_state)
+        self.assertIs(owner.scalar.predictor_kernel, sb.predict_prismatic_branches)
+        self._poison(scalar, layout.key_bodies)
+        states = [[model.state(), model.state()] for _ in solvers]
+        controls = [model.control() for _ in solvers]
+        contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]
+        for index, pair in enumerate(states):
+            newton.eval_fk(model, pair[0].joint_q, pair[0].joint_qd, pair[0])
+            install_held_contacts(model, pair[0], contacts[index], [(body, -1) for body in floors])
+        worlds = model.world_count
+
+        def inputs(sequence):
+            force = np.zeros((model.body_count, 6), dtype=np.float32)
+            force[floors[1::4], 2] = -0.3 * sequence
+            force[layout.arm_tips, :3] = (0.05 * sequence, -0.1, 0.02)
+            for index, pair in enumerate(states):
+                for state in pair:
+                    state.body_f.assign(force)
+                controls[index].joint_f.assign(np.linspace(-0.01, 0.02, model.joint_dof_count, dtype=np.float32))
+                controls[index].joint_target_q.fill_(-0.0004 * sequence)
+
+        def write_coordinates(reset):
+            for pair in states:
+                q, qd = pair[0].joint_q.numpy(), pair[0].joint_qd.numpy()
+                for world, selected in enumerate(reset):
+                    if selected:
+                        q[layout.key_coordinates.reshape(worlds, -1)[world]] -= 0.0005
+                        qd[layout.arm_dofs.reshape(worlds, -1)[world]] *= -0.5
+                pair[0].joint_q.assign(q)
+                pair[0].joint_qd.assign(qd)
+
+        def compare(tag):
+            for name, index in (("joint_q", layout.key_coordinates), ("joint_qd", layout.key_dofs)):
+                _close(
+                    self, getattr(states[0][0], name), getattr(states[1][0], name), index, f"{tag} {name}", **KEY_BOUND
+                )
+            for name in ("body_q", "body_qd"):
+                _close(
+                    self,
+                    getattr(states[0][0], name),
+                    getattr(states[1][0], name),
+                    layout.key_bodies,
+                    f"{tag} key {name}",
+                    **KEY_BOUND,
+                )
+                _close(
+                    self,
+                    getattr(states[0][0], name),
+                    getattr(states[1][0], name),
+                    layout.arm_bodies,
+                    f"{tag} arm {name}",
+                    **ARM_BOUND,
+                )
+            _close(self, head.v_hat, scalar.v_hat, layout.key_dofs, f"{tag} v_hat", **KEY_BOUND)
+            _close(
+                self,
+                head._diagonal_inverse_mass,
+                scalar._diagonal_inverse_mass,
+                layout.key_dofs,
+                f"{tag} minv",
+                **KEY_BOUND,
+            )
+            for solver in solvers:
+                solver.check_constraint_capacity()
+                self.assertGreater(int(solver.constraint_count.numpy().sum()), 0)
+            self.assertEqual(int(sum(int(group.status.numpy().sum()) for group in owner.groups[:-1])), 0)
+
+        mask = wp.array([True] + [False] * (worlds - 1), dtype=wp.bool, device=device)
+        for step in range(10):
+            inputs(step + 1)
+            if step == 3:
+                model.body_mass.assign(model.body_mass.numpy() * 1.1)
+                model.joint_armature.assign(model.joint_armature.numpy() * 1.2)
+                model.joint_target_ke.assign(model.joint_target_ke.numpy() * 1.15)
+                for solver in solvers:
+                    solver.notify_model_changed(
+                        newton.ModelFlags.BODY_INERTIAL_PROPERTIES | newton.ModelFlags.JOINT_DOF_PROPERTIES
+                    )
+            if step == 5:
+                write_coordinates((True,) + (False,) * (worlds - 1))
+                for index, solver in enumerate(solvers):
+                    solver.reset(states[index][0], mask)
+            if step == 7:
+                # Lift the keyboards through their fixed roots, as Isaac Lab's resets re-pose them.
+                frames = model.joint_X_p.numpy()
+                frames[starts[layout.branches], 2] += 0.001
+                model.joint_X_p.assign(frames)
+                for solver in solvers:
+                    solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+            for index, solver in enumerate(solvers):
+                current, following = states[index]
+                solver.step(current, following, controls[index], contacts[index], DT)
+                states[index] = [following, current]
+            compare(f"step {step}")
+
+        graphs = []
+        for index, solver in enumerate(solvers):
+            current, following = states[index]
+            with wp.ScopedCapture(device=device) as capture:
+                solver.seed_double_buffer_events()
+                solver.reset(current, mask)
+                solver.step(current, following, controls[index], contacts[index], DT)
+                solver.step(following, current, controls[index], contacts[index], DT)
+            graphs.append(capture.graph)
+        # Mask contents, coordinates and forces change between replays without rebinding graph inputs.
+        for replay, reset in enumerate(((True, False, False, False), (False, True, True, False), (True,) * worlds)):
+            mask.assign(np.asarray(reset, dtype=np.bool_))
+            inputs(replay + 11)
+            write_coordinates(reset)
+            self._poison(scalar, layout.key_bodies)
+            for graph in graphs:
+                wp.capture_launch(graph)
+            compare(f"replay {replay}")
+
+    def test_key_press_follows_the_drive_law(self):
+        """Press keys with an external force and release them: both routes follow the drive's closed form.
+
+        Without contacts or active limits each key is a scalar system: the
+        implicit drive gives ``(m |S|^2 + armature + K) qdd = u0 + forces`` with
+        ``K = ke dt^2 + kd dt`` and ``u0 = -(ke (q + dt qd) + kd qd)`` for zero
+        targets, plus the passive spring and damping and gravity along the axis.
+        The press and the spring-back are integrated in float64 from the model's
+        values and compared with both routes, which also match each other.
+        """
+        device = wp.get_device("cuda:0")
+        model = build_branch_model(device, worlds=2, leaves=6, shapes=True)
+        layout = _Layout(model)
+        lower, upper = model.joint_limit_lower.numpy(), model.joint_limit_upper.numpy()
+        lower[layout.key_dofs], upper[layout.key_dofs] = -0.5, 0.5
+        model.joint_limit_lower.assign(lower)
+        model.joint_limit_upper.assign(upper)
+        model.joint_q.zero_()
+        model.joint_qd.zero_()
+        model.rigid_contact_max = 1
+        solvers = [recipe_solver(model, scalar=False), recipe_solver(model, scalar=True)]
+        self.assertIsNotNone(solvers[1]._tree_kinetic_state.scalar)
+        states = [[model.state(), model.state()] for _ in solvers]
+        controls = [model.control() for _ in solvers]
+        contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]
+        for control, contact, pair in zip(controls, contacts, states, strict=True):
+            control.joint_target_q.zero_()
+            control.joint_target_qd.zero_()
+            contact.rigid_contact_count.zero_()
+            newton.eval_fk(model, pair[0].joint_q, pair[0].joint_qd, pair[0])
+        press, release = 20, 60
+        travel = [[], []]
+        axes = None
+        for step in range(press + release):
+            force = np.zeros((model.body_count, 6), dtype=np.float32)
+            if 0 < step <= press:
+                # Along each key's motion axis, which the first step published.
+                force[layout.key_leaves, :3] = -1.5 * axes / np.linalg.norm(axes, axis=1, keepdims=True)
+            for index, solver in enumerate(solvers):
+                current, following = states[index]
+                current.body_f.assign(force)
+                solver.step(current, following, controls[index], contacts[index], DT)
+                states[index] = [following, current]
+                travel[index].append(following.joint_q.numpy()[layout.key_coordinates].copy())
+            if step == 0:
+                axes = solvers[1].joint_S_s.numpy()[layout.key_dofs, :3].astype(np.float64)
+                np.testing.assert_allclose(
+                    solvers[0].joint_S_s.numpy()[layout.key_dofs, :3], axes, rtol=1.0e-6, atol=1.0e-7
+                )
+        travel = np.asarray(travel, dtype=np.float64)
+        np.testing.assert_allclose(travel[1], travel[0], rtol=1.0e-5, atol=1.0e-8)
+        # The same discrete law in float64.
+        dofs = layout.key_dofs
+        m = model.body_mass.numpy()[layout.key_leaves].astype(np.float64)
+        ke = model.joint_target_ke.numpy()[dofs].astype(np.float64)
+        kd = model.joint_target_kd.numpy()[dofs].astype(np.float64)
+        spring = model.joint_spring_stiffness.numpy()[dofs].astype(np.float64)
+        reference = model.joint_spring_ref.numpy()[dofs].astype(np.float64)
+        damping = model.joint_damping.numpy()[dofs].astype(np.float64)
+        inertia = (
+            m * np.sum(axes * axes, axis=1)
+            + model.joint_armature.numpy()[dofs].astype(np.float64)
+            + ke * DT * DT
+            + kd * DT
+        )
+        weight = m * (axes @ model.gravity.numpy()[0].astype(np.float64))
+        q, qd = np.zeros(len(dofs)), np.zeros(len(dofs))
+        expected = []
+        for step in range(press + release):
+            pressing = -1.5 * np.linalg.norm(axes, axis=1) if 0 < step <= press else 0.0
+            drive = -(ke * (q + DT * qd) + kd * qd)
+            qd = qd + DT * (weight + pressing + spring * (reference - q) - damping * qd + drive) / inertia
+            q = q + DT * qd
+            expected.append(q.copy())
+        expected = np.asarray(expected)
+        self.assertGreater(float(np.abs(expected).max()), 2.0e-3)
+        for index in range(2):
+            np.testing.assert_allclose(travel[index], expected, rtol=1.0e-4, atol=2.0e-6)
+
+    def test_gripper_contact_matches_the_prismatic_route(self):
+        """Press a key with the arm's tip through a contact: key travel and impulses track the head route.
+
+        The arm takes the held owner's float order, so the bound is relative
+        (1e-3) rather than the keys' FMA bound; a defect in the scalar family's
+        contact response would miss it by orders of magnitude.
+        """
+        device = wp.get_device("cuda:0")
+        model = build_branch_model(device, worlds=2, leaves=12, shapes=True)
+        layout = _Layout(model)
+        keys = layout.key_leaves.reshape(model.world_count, -1)[:, 4]
+        pairs = [(int(tip), int(key)) for tip, key in zip(layout.arm_tips, keys, strict=True)]
+        model.rigid_contact_max = len(pairs)
+        solvers = [recipe_solver(model, scalar=False), recipe_solver(model, scalar=True)]
+        states = [[model.state(), model.state()] for _ in solvers]
+        controls = [model.control() for _ in solvers]
+        contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]
+        for index, pair in enumerate(states):
+            newton.eval_fk(model, pair[0].joint_q, pair[0].joint_qd, pair[0])
+            install_held_contacts(model, pair[0], contacts[index], pairs)
+        coordinates = layout.key_coordinates.reshape(model.world_count, -1)[:, 4]
+        travel, impulses = [[], []], [[], []]
+        for _step in range(12):
+            force = np.zeros((model.body_count, 6), dtype=np.float32)
+            force[layout.arm_tips, 2] = -2.0
+            for index, solver in enumerate(solvers):
+                current, following = states[index]
+                current.body_f.assign(force)
+                solver.step(current, following, controls[index], contacts[index], DT)
+                states[index] = [following, current]
+                world, slot = solver.contact_world.numpy()[: len(pairs)], solver.contact_slot.numpy()[: len(pairs)]
+                self.assertTrue(np.all(slot >= 0))
+                impulses[index].append(solver.impulses.numpy()[world, slot].copy())
+                travel[index].append(following.joint_q.numpy()[coordinates].copy())
+        travel, impulses = np.asarray(travel), np.asarray(impulses)
+        self.assertTrue(np.all(np.isfinite(impulses)) and np.all(np.isfinite(travel)))
+        self.assertGreater(float(impulses[0].max()), 0.0, "The tip must press the key")
+        np.testing.assert_allclose(impulses[1], impulses[0], rtol=1.0e-3, atol=1.0e-7)
+        np.testing.assert_allclose(travel[1], travel[0], rtol=1.0e-3, atol=1.0e-7)
+
+    def test_route_record_names_the_scalar_group(self):
+        """Record the scalar group, its precedence over the prismatic opt-ins, and its decline without an owner."""
+        device = wp.get_device("cuda:0")
+        model = build_branch_model(device, worlds=2, leaves=12)
+        record = recipe_solver(model, scalar=True).get_path_selection()
+        json.dumps(record, allow_nan=False)
+        held, publication = record["routes"]["held_tree"], record["routes"]["publication"]
+        self.assertEqual(held["owner"], "mixed")
+        self.assertTrue(held["scalar_branches"]["enabled"])
+        self.assertIn("supersede FEATHER_PGS_PRISMATIC", held["scalar_branches"]["reason"])
+        groups = {group["operator"]: group for group in held["groups"]}
+        self.assertEqual(set(groups), {"TreeHeldOperator", "ScalarBranchState"})
+        self.assertEqual(
+            (groups["ScalarBranchState"]["dofs"], groups["ScalarBranchState"]["kinds"]), (12, ["prismatic"])
+        )
+        self.assertEqual(groups["ScalarBranchState"]["kernels"]["predict"], sb.predict_prismatic_branches.key)
+        self.assertEqual(groups["TreeHeldOperator"]["dofs"], 6)
+        self.assertEqual(len(record["measurements"]["held_tree_lane_timing_us"]), 2)
+        self.assertEqual((publication["owner"], publication["prismatic_publication"]), ("cached", False))
+        self.assertFalse(publication["prismatic_linear_state"])
+        head = recipe_solver(model, scalar=False).get_path_selection()["routes"]
+        self.assertIsNone(head["held_tree"]["owner"])
+        self.assertFalse(head["held_tree"]["scalar_branches"]["enabled"])
+        self.assertIn("Off: FEATHER_PGS_SCALAR_BRANCHES=1", head["held_tree"]["scalar_branches"]["reason"])
+        self.assertTrue(head["publication"]["prismatic_linear_state"])
+        # Without the held-tree owner the branches stay on ordinary dynamics with the recipe's opt-ins.
+        declined = recipe_solver(model, scalar=True, cached_dynamics="off")
+        self.assertIsNone(declined._scalar_branches)
+        routes = declined.get_path_selection()["routes"]
+        self.assertFalse(routes["held_tree"]["scalar_branches"]["enabled"])
+        self.assertIn("did not take them", routes["held_tree"]["scalar_branches"]["reason"])
+        self.assertTrue(routes["publication"]["prismatic_linear_state"])
 
 
 if __name__ == "__main__":

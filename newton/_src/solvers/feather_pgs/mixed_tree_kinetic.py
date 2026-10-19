@@ -324,6 +324,9 @@ def forest_families(solver):
     """The per-root family sizes of the forest (0 for a prescribed root), or ``None``."""
     if not supported(solver):
         return None
+    if getattr(solver, "_scalar_branches", None) is not None:
+        # Scalar branches own their size group outside any tree plan.
+        return None
     model = solver.model
     worlds = int(solver.world_count)
     art_world = solver.art_to_world.numpy()
@@ -529,6 +532,9 @@ class MixedTreeKineticState:
         # One read of the kernel and launch switches for every group this owner composes.
         self.reference, self.clocked = kernel_switches()
         skip, classify = launch_switches()
+        # A size group of scalar branches (scalar_branches.py) is owned in place
+        # of a tree group: one thread per coordinate, no tree plan.
+        scalar = getattr(solver, "_scalar_branches", None)
         default = forest_default(solver)
         override = os.environ.get("FEATHER_PGS_TREE_FOREST")
         forest = (override if override is not None else "1" if default else "0") == "1"
@@ -540,10 +546,14 @@ class MixedTreeKineticState:
                 else "Default: a prescribed root and no diagonal-mass family make one group per world cheaper."
             )
         else:
-            operators = [TreeHeldOperator(solver, size) for size in solver.size_groups]
+            operators = [
+                TreeHeldOperator(solver, size) for size in solver.size_groups if scalar is None or size != scalar.size
+            ]
             if self.coverage[-1]:
                 operators.append(PrescribedRootOperator(solver))
-            if forest:
+            if forest and scalar is not None:
+                self.forest_reason = "Scalar branches own the diagonal-mass group, so no group spans a world."
+            elif forest:
                 self.forest_reason = "The world layout does not admit one forest group."
             elif override is not None:
                 self.forest_reason = "FEATHER_PGS_TREE_FOREST keeps per-size groups."
@@ -567,10 +577,18 @@ class MixedTreeKineticState:
             )
             operator.kinetic_state = group
             self.groups.append(group)
+        self.scalar = None
+        if scalar is not None:
+            from .scalar_branches import ScalarBranchState  # noqa: PLC0415
+
+            self.scalar = ScalarBranchState(solver, scalar, admission=admission)
+            self.groups.append(self.scalar)
         # The existing solver lifecycle delegates factor refresh to this binding.
         self.sparse = self
-        # Every group compares input banks (fixed and free roots alike) and skips
+        # Every tree group compares input banks (fixed and free roots alike) and skips
         # captured repairs unless the solver prescales velocities; see TreeKineticState.
+        # Scalar branches do neither, and the solver then validates a changed input
+        # bank by identity for the whole owner.
         self.bank_compare = all(group.bank_compare for group in self.groups)
         self.skip_captured_repairs = all(group.skip_captured_repairs for group in self.groups)
 

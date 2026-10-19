@@ -304,6 +304,9 @@ _FUSED_PUBLISH = os.environ.get("FEATHER_PGS_FUSED_PUBLISH", "0") == "1"
 # Experimental Stage 7 producer partition, leaving all solve/mass budgets intact.
 _PRISMATIC_PUBLICATION = os.environ.get("FEATHER_PGS_PRISMATIC_PUBLICATION", "0") == "1"
 _PRISMATIC_LINEAR_STATE = os.environ.get("FEATHER_PGS_PRISMATIC_LINEAR_STATE", "0") == "1"
+# Experimental scalar branches of the held-tree owner (scalar_branches.py); where
+# admitted they take precedence over the two prismatic opt-ins above.
+_SCALAR_BRANCHES = os.environ.get("FEATHER_PGS_SCALAR_BRANCHES", "0") == "1"
 _COMPACT_CONTACT_BOUNDARY = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_BOUNDARY", "0") == "1"
 _COMPACT_CONTACT_ORDERING = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_ORDERING", "0") == "1"
 _DEBUG_CACHE = os.environ.get("FEATHER_PGS_DEBUG_CACHE") == "1"
@@ -3336,20 +3339,15 @@ class SolverFeatherPGS(SolverBase):
         self._prismatic_publication = None
         self._prismatic_linear_state = False
         self._prismatic_linear_valid = None
-        if (
-            (_PRISMATIC_PUBLICATION or _PRISMATIC_LINEAR_STATE)
-            and not model.requires_grad
-            and not self.grouped_dynamics
-        ):
-            from .prismatic_publication import PrismaticPublicationPlan  # noqa: PLC0415
+        # Scalar branches take a diagonal-mass group of world-fixed roots over
+        # one-coordinate leaves (scalar_branches.py), which the held-tree owner
+        # then publishes; the prismatic opt-ins serve the same articulations and
+        # give way. The owner is decided below; if it declines, they apply.
+        from .scalar_branches import plan_scalar_branches  # noqa: PLC0415
 
-            self._prismatic_publication = PrismaticPublicationPlan.build(model, self.articulation_joint_end)
-        if _PRISMATIC_LINEAR_STATE:
-            if _GROUPED_CHECK or _DEBUG_CACHE_CMP:
-                raise ValueError("prismatic linear state does not support materialized-inertia debug comparisons")
-            from .prismatic_linear_state import configure_linear_state  # noqa: PLC0415
-
-            configure_linear_state(self)
+        self._scalar_branches, self._scalar_branches_reason = plan_scalar_branches(self, requested=_SCALAR_BRANCHES)
+        if self._scalar_branches is None:
+            self._configure_prismatic_publication()
 
         self._compact_contact_boundary = False
         # The compact producer writes the point and the patch row law; torsion and compliance keep ordinary rows.
@@ -3377,6 +3375,14 @@ class SolverFeatherPGS(SolverBase):
         from .cached_dynamics import install as install_cached_dynamics  # noqa: PLC0415
 
         install_cached_dynamics(self)
+        if self._scalar_branches is not None and getattr(self._tree_kinetic_state, "scalar", None) is None:
+            # Ordinary dynamics keeps the branches, with the opt-ins they superseded.
+            self._scalar_branches = None
+            self._scalar_branches_reason = (
+                f"The held-tree owner did not take them: {self._cached_dynamics_selection_reason}"
+            )
+            if self._tree_kinetic_state is None:
+                self._configure_prismatic_publication()
         self._unread_mass_sizes = self._unread_mass_matrix_sizes()
         # Decide the fused publication now: its host checks must not run inside
         # a later graph capture of the first step.
@@ -3550,6 +3556,8 @@ class SolverFeatherPGS(SolverBase):
         construction; the applied value is the one in effect after construction's
         gates and clamps, off (``False``, ``0`` or ``"off"``) when the owner, tier
         or stream an option requests was not built.
+        ``routes.held_tree.scalar_branches`` states whether a diagonal-mass group
+        runs as scalar branches, and why.
         ``environment`` records the ``FEATHER_PGS_*`` and
         ``IL_NEWTON_FPGS_*`` variables present at construction: ``applied`` maps
         declared names to their values, ``unknown`` lists undeclared names
@@ -17558,6 +17566,24 @@ class SolverFeatherPGS(SolverBase):
         """Publish body poses and CoM velocities of ``state`` (used with ``lazy_kinematics``)."""
         if self._fused_k1 and self.lazy_kinematics:
             self._stage7_update_kinematics(state, self._last_debug_state_aug, force=True)
+
+    def _configure_prismatic_publication(self) -> None:
+        """Build the opt-in prismatic Stage 7 producer and its linear state (``prismatic_*.py``)."""
+        model = self.model
+        if (
+            (_PRISMATIC_PUBLICATION or _PRISMATIC_LINEAR_STATE)
+            and not model.requires_grad
+            and not self.grouped_dynamics
+        ):
+            from .prismatic_publication import PrismaticPublicationPlan  # noqa: PLC0415
+
+            self._prismatic_publication = PrismaticPublicationPlan.build(model, self.articulation_joint_end)
+        if _PRISMATIC_LINEAR_STATE:
+            if _GROUPED_CHECK or _DEBUG_CACHE_CMP:
+                raise ValueError("prismatic linear state does not support materialized-inertia debug comparisons")
+            from .prismatic_linear_state import configure_linear_state  # noqa: PLC0415
+
+            configure_linear_state(self)
 
     def _publication_deferred(self) -> bool:
         """Whether body-state publication waits for :meth:`publish_kinematics`.

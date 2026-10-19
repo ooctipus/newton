@@ -777,18 +777,45 @@ class ScalarBranchState:
         )
 
     def record(self) -> dict:
-        """Host-only route record of this group (see ``path_selection``)."""
+        """Host-only route record of this group, in the tree groups' schema (see ``path_selection``).
+
+        Predict and finish run one thread per coordinate (``lanes``), repair one
+        warp per articulation; there is no tree layout, lane timing or block packing.
+        """
+        size = int(self.size)
         return {
             "operator": type(self).__name__,
-            "size": int(self.size),
+            "size": size,
             "group_count": int(self.group_count),
-            "kinds": list(self.plan.kinds),
+            "bodies": size + 1,
+            "dofs": size,
+            "lanes": size,
+            "trees_per_block": None,
+            "block_dim": None,
+            "roots": [0],
+            "root_coordinates": [0],
+            # A diagonal-mass family, negated as in the tree groups' records.
+            "root_families": [-size],
+            "chain_scan": False,
+            "chain_scan_requested": False,
             "response": "diagonal",
             "input_validation": "content" if self.bank_compare else "identity",
+            # Every repair launches, one warp per articulation, and none is classified or compared.
+            "captured_repair_skip": bool(self.skip_captured_repairs),
+            "classify_first": False,
+            "captured_repairs": [],
+            "motion_velocity": False,
+            "publishes_twists": False,
+            "lane_choice": "static",
+            "kinds": list(self.plan.kinds),
             "kernels": {
                 "repair": self.repair_kernel.key,
                 "finish": self.finish_kernel.key,
                 "predict": self.predictor_kernel.key,
+                "bank": None,
+                "bank_repair": None,
+                "classify": None,
+                "listed_repair": None,
             },
         }
 

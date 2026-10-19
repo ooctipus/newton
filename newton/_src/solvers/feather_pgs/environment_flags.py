@@ -450,13 +450,15 @@ FLAGS = declare(
         "FEATHER_PGS_PRISMATIC_LINEAR_STATE",
         "experiment",
         _SOLVER,
-        "=1 keeps current linear state for fixed-root one-body prismatic branches.",
+        "=1 keeps current linear state for fixed-root one-body prismatic branches; superseded where "
+        "FEATHER_PGS_SCALAR_BRANCHES=1 admits them.",
     ),
     _flag(
         "FEATHER_PGS_PRISMATIC_PUBLICATION",
         "experiment",
         _SOLVER,
-        "=1 publishes fixed-root prismatic stars body-parallel.",
+        "=1 publishes fixed-root prismatic stars body-parallel; superseded where FEATHER_PGS_SCALAR_BRANCHES=1 "
+        "admits them.",
     ),
     _flag(
         "FEATHER_PGS_REGISTER_WHITENING",
@@ -499,6 +501,13 @@ FLAGS = declare(
         "policy",
         _SOLVER,
         "Values other than 1 disable in-place limit-prefix and contact packets for the local solve owners.",
+    ),
+    _flag(
+        "FEATHER_PGS_SCALAR_BRANCHES",
+        "experiment",
+        _SOLVER,
+        "=1 runs a diagonal-mass group of world-fixed roots over one-coordinate leaves as scalar branches of the "
+        "held-tree owner, which then also owns the other articulations; it supersedes the prismatic opt-ins there.",
     ),
     _flag(
         "FEATHER_PGS_SHADOW_LEAN",
