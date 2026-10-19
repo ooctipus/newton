@@ -320,10 +320,14 @@ def held_tree_layouts():
     stored factor permutation), kinetic plans at 4, 8, 16, 32 and 64 lanes, and
     forests with a free and a prescribed root, with sparse, Cholesky and
     diagonal responses and an alternate repair motion. Every layout but
-    ``chain_free44_l64_permuted``, ``kinetic_free17``, ``kinetic_free44_l64``
-    and ``forest10_free`` has the sizes, entry count, depth and permutation of
-    a tree the suite runs, so its finish and repair compile as that tree's do.
-    The depth of a chain plan reaches none of its kernels.
+    ``chain_free44_l64_permuted``, ``kinetic_free1_l8_unlimited``,
+    ``kinetic_free17``, ``kinetic_free44_l64`` and ``forest10_free`` has the
+    sizes, entry count, depth and permutation of a tree the suite runs, so its
+    finish and repair compile as that tree's do. ``kinetic_free1_l8_unlimited``
+    is the suite's 8-lane free body without velocity limits: its repairs
+    compare input banks, so the grid records the comparing repair and the
+    comparison pass at every packed width. The depth of a chain plan reaches
+    none of its kernels.
     """
     from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout  # noqa: PLC0415
 
@@ -355,6 +359,7 @@ def held_tree_layouts():
         "chain_fixed11": (tree(11, 9, 8, 0, entries=44), True, "sparse", motion),
         "kinetic_fixed3_l4": (tree(3, 2, 2, 0, lanes=4), False, "cholesky", {}),
         "kinetic_free1_l8": (tree(1, 6, 0, 6, lanes=8), False, "cholesky", motion),
+        "kinetic_free1_l8_unlimited": (tree(1, 6, 0, 6, lanes=8), False, "cholesky", {}),
         "kinetic_fixed11_l16": (tree(11, 9, 9, 0, lanes=16, entries=44), False, "cholesky", {}),
         "kinetic_fixed9_l16_diagonal": (tree(9, 4, 2, 0, lanes=16, entries=4), False, "diagonal", {}),
         "kinetic_free17": (tree(17, 18, 4, 6), False, "cholesky", {}),

@@ -124,9 +124,9 @@ class TestKernelIdentity(unittest.TestCase):
 
         Every layout records its finish, its repair, its classification and its
         listed repair and, outside motion-velocity layouts, its one-pass repair
-        that compares input banks and its comparison pass. The state kernels
-        without body velocity stay recorded as a switch of four layouts, both
-        forests among them.
+        that compares input banks and its comparison pass, which every lane
+        width records. The state kernels without body velocity stay recorded as
+        a switch of four layouts, both forests among them.
         """
         calls = [
             (name, args, kwargs["layout"].name, {key: value for key, value in kwargs.items() if key != "layout"})
@@ -150,6 +150,9 @@ class TestKernelIdentity(unittest.TestCase):
                 self.assertEqual(passes in calls, compares)
         without = {layout for _, _, layout, options in calls if options.get("body_velocity") is False}
         self.assertEqual(without, {"chain_free13", "kinetic_fixed11_l16", "forest13_l16", "forest32"})
+        layouts = identity.held_tree_layouts().values()
+        widths = {tree.lanes for tree, _, _, options in layouts if not options.get("motion_velocity", False)}
+        self.assertEqual(widths, {4, 8, 16, 32, 64})
 
     def test_combinations_take_one_option_of_every_axis(self):
         """Merge one option of every census axis, for every combination of options."""
