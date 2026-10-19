@@ -106,7 +106,7 @@ def _reservations(solver, contacts):
     return reservation
 
 
-def _scene(device, worlds=COMPARED_WORLDS):
+def _scene(device, *, worlds):
     """A fixed-base arm whose tip touches the ground, a floating two-link body and a free box, per world."""
     builder = newton.ModelBuilder()
     for _world in range(worlds):
@@ -151,6 +151,11 @@ def _scene(device, worlds=COMPARED_WORLDS):
     # Free joints with the legacy DOF-shaped target layout warn at finalize.
     with patch.object(newton, "use_coord_layout_targets", True):
         return builder.finalize(device=device)
+
+
+def _compared_scene(device):
+    """The scene every flag-on/flag-off comparison steps, and the one the one-warp CPU test checks."""
+    return _scene(device, worlds=COMPARED_WORLDS)
 
 
 @wp.kernel
@@ -301,7 +306,7 @@ def _configurations(device):
 
 def test_default_skips_snapshot_copies(test, device):
     """Allocate and copy no stage-3 snapshot unless the flag is set; launch everything else unchanged."""
-    model = _scene(device)
+    model = _compared_scene(device)
     for label, options in _configurations(device).items():
         with test.subTest(configuration=label):
             off = _rollout(model, snapshots=False, **options)
@@ -328,7 +333,7 @@ def test_default_skips_snapshot_copies(test, device):
 
 def test_opt_in_keeps_snapshot_attributes(test, device):
     """Copy the stage-3 velocity, acceleration and prediction into the dumper's attributes every substep."""
-    model = _scene(device)
+    model = _compared_scene(device)
     for label, options in _configurations(device).items():
         with test.subTest(configuration=label):
             run = _rollout(model, snapshots=True, record_values=True, **options)
@@ -363,7 +368,7 @@ def test_opt_in_keeps_snapshot_attributes(test, device):
 
 def test_snapshots_leave_physics_unchanged(test, device):
     """Step every configuration to the same states and impulses with and without the snapshots, bitwise on CPU."""
-    model = _scene(device)
+    model = _compared_scene(device)
     for label, options in _configurations(device).items():
         with test.subTest(configuration=label):
             off = _rollout(model, snapshots=False, **options)
@@ -384,14 +389,15 @@ class TestFeatherPGSDebugSnapshots(unittest.TestCase):
     def test_compared_scene_keeps_contacts_in_one_warp(self):
         """Keep every step of the compared scene, for as long as the captured test replays it, within one warp.
 
-        The eager and captured comparisons step this scene for up to
-        GRAPH_STEPS + 1 substeps in split and matrix-free mode. On CUDA, contacts
-        past the first warp reserve rows in a run-varying order, and the arms
-        would then differ by their slot order rather than by the flag; eight
-        worlds put 97-104 contacts in four warps. The CPU checks the scene in
-        split mode under both friction laws before any GPU runs it.
+        The eager and captured comparisons all build this scene through
+        _compared_scene and step it for up to GRAPH_STEPS + 1 substeps in split
+        and matrix-free mode. On CUDA, contacts past the first warp reserve rows
+        in a run-varying order, and the arms would then differ by their slot
+        order rather than by the flag; eight worlds put 97-104 contacts in four
+        warps. The CPU checks the scene in split mode under both friction laws
+        before any GPU runs it.
         """
-        model = _scene("cpu")
+        model = _compared_scene("cpu")
         for label, options in _modes_and_laws("cpu").items():
             with self.subTest(configuration=label):
                 run = _rollout(model, snapshots=False, steps=GRAPH_STEPS + 1, **options)
@@ -573,7 +579,7 @@ class TestFeatherPGSDebugSnapshotsGraph(unittest.TestCase):
         Covers split and matrix-free mode under patch and point friction.
         """
         device = wp.get_device("cuda:0")
-        model = _scene(device)
+        model = _compared_scene(device)
         for label, options in _modes_and_laws(device).items():
             with self.subTest(configuration=label):
                 off = _graph_rollout(model, snapshots=False, **options)
