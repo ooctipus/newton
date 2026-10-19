@@ -18,6 +18,7 @@ import newton
 import newton._src.sim.articulation as articulation_module
 from newton._src.sim.articulation import (
     _CLEAR_REPLAY_CAPACITY,
+    _clear_launch_arguments,
     _clear_replays,
     _launch_zero_selected_blocks,
     _zero_selected_articulation_blocks,
@@ -992,11 +993,13 @@ def test_zero_selected_blocks_matches_numpy(test, device):
 
 
 def test_zero_selected_blocks_kernel_by_block_size(test, device):
-    """Clear small blocks with one thread per 8-byte word of the selected range and large ones block by block.
+    """Clear small blocks word by word and large ones block by block.
 
-    A block walk spends its setup on every block, which outweighs the stores of a
-    small block; word stores keep a warp's 256 bytes contiguous at any block size.
-    Odd blocks, misaligned buffers and strided views cannot take word stores.
+    The word kernel runs one thread per 8-byte word of the blocks that the mask
+    covers and stores only the selected words. A block walk spends its setup on every
+    block, which outweighs the stores of a small block; word stores keep a warp's
+    256 bytes contiguous at any block size. Odd blocks, misaligned buffers and
+    strided views cannot take word stores.
     """
     mask = wp.array([True, False, True, True, False], dtype=bool, device=device)
     misaligned = wp.zeros(1 + 5 * 12, dtype=float, device=device)[1:].reshape((5, 6, 2))
@@ -1020,6 +1023,29 @@ def test_zero_selected_blocks_kernel_by_block_size(test, device):
             test.assertEqual(launch.call_count, 1)
             test.assertIs(launch.call_args.args[0], kernel)
             test.assertEqual(launch.call_args.kwargs["dim"], dim)
+
+
+def test_zero_selected_blocks_word_view_spans_covered_blocks(test, device):
+    """Pack only the blocks that the mask covers into the word kernel's view, owned or not.
+
+    A buffer may hold more blocks than ``articulation_count``. Warp rejects a view of
+    2**31 or more words, so a view of the whole buffer could fail where the launch
+    reaches far fewer words.
+    """
+    values = np.ones((7, 6, 2), dtype=np.float32)
+    expected = values.copy()
+    expected[[0, 2, 3]] = 0.0
+    blocks = wp.array(values, dtype=float, device=device)
+    mask = wp.array([True, False, True, True, False, True, True], dtype=bool, device=device)
+    for owned in (True, False):
+        with test.subTest(owned=owned):
+            blocks.assign(values)
+            kernel, dim, inputs, outputs = _clear_launch_arguments(blocks, mask, 5, owned=owned)
+            test.assertIs(kernel, _zero_selected_block_words)
+            test.assertEqual(dim, 5 * 6)
+            test.assertEqual((outputs[0].ptr, outputs[0].shape), (blocks.ptr, (5 * 6,)))
+            wp.launch(kernel, dim=dim, inputs=inputs, outputs=outputs, device=device)
+            _assert_bits_equal(blocks.numpy(), expected)
 
 
 def test_zero_selected_blocks_replays_recorded_launch(test, device):
@@ -1795,6 +1821,12 @@ add_function_test(
     TestJacobianMassMatrix,
     "test_zero_selected_blocks_kernel_by_block_size",
     test_zero_selected_blocks_kernel_by_block_size,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_zero_selected_blocks_word_view_spans_covered_blocks",
+    test_zero_selected_blocks_word_view_spans_covered_blocks,
     devices=devices,
 )
 add_function_test(

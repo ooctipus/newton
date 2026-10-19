@@ -1246,14 +1246,20 @@ _BLOCKWISE_CLEAR_MIN_ENTRIES = 2048
 
 Below it :func:`_zero_selected_block_words` clears the buffer word by word: the
 per-block walk spends its setup on every block, which outweighs the stores of a
-small block.
+small block. The value is predicted from the kernels' instruction counts, not
+measured.
 """
 
 _CLEAR_REPLAY_CAPACITY = 16
 """Number of recorded clear launches kept for replay; the oldest is dropped first."""
 
 _clear_replays: dict[tuple, wp.Launch] = {}
-"""Recorded clear launches, keyed by every argument value they pack."""
+"""Recorded clear launches, keyed by every value the clear kernels read.
+
+The key holds the launch device, the articulation count, and each array's address,
+shape, strides, data type and device. The recorded views carry no gradient arrays,
+which the kernels never read.
+"""
 
 _clear_replays_lock = threading.Lock()
 """Serializes changes to :data:`_clear_replays`; lookups read it without the lock."""
@@ -1308,7 +1314,7 @@ def _clear_launch_arguments(
         and blocks.ptr % 8 == 0
     ):
         if owned:
-            words = blocks.reshape((-1, 2)).view(wp.vec2).view(wp.uint64)
+            words = blocks[:articulation_count].reshape((-1, 2)).view(wp.vec2).view(wp.uint64)
         else:
             words = _unowned_view(blocks, wp.uint64, (word_count,))
         return _zero_selected_block_words, word_count, [mask, block_size // 2], [words]
@@ -1331,9 +1337,10 @@ def _launch_zero_selected_blocks(
     :func:`_zero_selected_articulation_blocks`.
 
     Outside a graph capture, a call with Warp arrays replays the launch recorded for
-    the same argument values, as :func:`warp.launch` would pack them. Packing costs
-    more host time than the clear takes on a small model, where it would make the
-    clear slower than the whole-buffer memset it replaces. A capture records its own
+    the same arrays and articulation count, which reads the values that a
+    :func:`warp.launch` of them would. Packing a launch costs more host time than the
+    clear takes on a small model, where it would make the clear slower than the
+    whole-buffer memset it replaces. A capture records its own
     launches. So does a call while a Warp debugging aid is on: printed launches and
     CUDA error checks happen in :func:`warp.launch`, and a recorded launch keeps the
     module build it was recorded with, so a replay would also skip the checks of a
@@ -1392,8 +1399,8 @@ def _zero_selected_blocks(
 ) -> None:
     """Zero the per-articulation blocks that ``mask`` selects and leave the others untouched.
 
-    On the CPU a NumPy fill clears the selected blocks: the kernels' per-entry
-    loops run serially there. The fill is host code, which a graph
+    On the CPU a NumPy fill clears the selected blocks: the kernels' threads run
+    serially there. The fill is host code, which a graph
     capture does not record, so a capture takes a kernel, which reads the mask
     when the graph replays. So does any mask other than a Boolean Warp array on
     ``device`` with an entry per articulation: the launch then converts or rejects
