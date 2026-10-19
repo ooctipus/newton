@@ -11,6 +11,7 @@ shuffles included, so every lane width is checked on CPU as well.
 """
 
 import itertools
+import os
 import unittest
 from unittest.mock import patch
 
@@ -22,6 +23,7 @@ from newton._src.sim import BodyFlags, JointType
 from newton._src.solvers.feather_pgs.kernels import prescale_joint_velocity_limits
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _velocity_prescale_launch
 from newton.solvers import SolverFeatherPGS
+from newton.tests import test_feather_pgs_mixed_tree_free_body as mixed_tree
 
 
 @wp.kernel
@@ -595,6 +597,97 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
                     self.assertFalse(np.array_equal(expected, joint_qd))
                     _assert_bits_equal(solver.qd_work.numpy(), expected)
                     _assert_bits_equal(state.joint_qd.numpy(), joint_qd)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Joint velocity limits require the CUDA matrix-free mode")
+    def test_captured_owner_route_prescales_bitwise_cuda(self):
+        """Prescale each substep of a captured env step bit for bit on the held-tree route under both friction laws.
+
+        This is the route of the velocity-limited suite tasks: a held-tree owner, parallel streams
+        and one CUDA graph of a collision and two substeps. Copies inside the graph record each
+        substep's input velocity and the velocity that the owner's predictor consumes.
+        """
+        for device in wp.get_cuda_devices():
+            for friction_anchor_beta in (0.0, 0.2):
+                with self.subTest(device=str(device), friction_anchor_beta=friction_anchor_beta):
+                    self._check_captured_owner_route(device, friction_anchor_beta)
+
+    def _check_captured_owner_route(self, device, friction_anchor_beta):
+        # Per world, a fixed-base arm with 0.8 rad/s revolute limits over a free box on the ground.
+        model = mixed_tree._build(device, speed_limit=0.8)
+        owner = {"FEATHER_PGS_MIXED_TREE_KINETIC_STATE": "1", "FEATHER_PGS_TREE_KINETIC_STATE": "0"}
+        with patch.dict(os.environ, owner):
+            solver = SolverFeatherPGS(
+                model,
+                pgs_mode="matrix_free",
+                drive_mode="augmented",
+                enable_joint_limits=True,
+                enable_joint_velocity_limits=True,
+                friction_anchor_beta=friction_anchor_beta,
+            )
+        self.assertIsNotNone(solver._tree_kinetic_state)
+        self.assertTrue(solver.use_parallel_streams)
+        pipeline = newton.CollisionPipeline(model, deterministic=friction_anchor_beta > 0.0)
+        contacts = pipeline.contacts()
+        states, control = (model.state(), model.state()), model.control()
+        revolute = np.flatnonzero(model.joint_type.numpy() == int(newton.JointType.REVOLUTE))
+        fast = np.zeros(model.joint_dof_count, dtype=np.float32)
+        # Most arm joints start above their limit.
+        fast[model.joint_qd_start.numpy()[revolute]] = np.random.default_rng(11).uniform(-1.5, 1.5, len(revolute))
+
+        def set_fast_velocities():
+            states[0].joint_qd.assign(fast)
+            newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+
+        def env_step():
+            pipeline.collide(states[0], contacts)
+            for state_in, state_out in (states, states[::-1]):
+                state_in.clear_forces()
+                solver.step(state_in, state_out, control, contacts, mixed_tree.DT)
+
+        set_fast_velocities()
+        # Allocate the lazily created buffers before the capture.
+        env_step()
+
+        inputs = [wp.empty_like(model.joint_qd) for _ in range(2)]
+        consumed = [wp.empty_like(model.joint_qd) for _ in range(2)]
+        launches = []
+        launch = solver._launch_velocity_prescale
+        predict = solver._tree_kinetic_state.predict
+
+        def recording_launch(joint_qd, prescaled_joint_qd):
+            destinations = []
+            with _recording_copies(destinations):
+                launch(joint_qd, prescaled_joint_qd)
+            self.assertFalse(any(destination is prescaled_joint_qd for destination in destinations))
+            wp.copy(inputs[len(launches)], joint_qd)
+            launches.append(prescaled_joint_qd)
+
+        def recording_predict(state, augmented, step_control, velocity, dt):
+            self.assertIs(velocity, launches[-1])
+            wp.copy(consumed[len(launches) - 1], velocity)
+            predict(state, augmented, step_control, velocity, dt)
+
+        solver._launch_velocity_prescale = recording_launch
+        solver._tree_kinetic_state.predict = recording_predict
+        with wp.ScopedCapture(device=device) as capture:
+            env_step()
+        self.assertEqual(len(launches), 2)
+        self.assertTrue(all(prescaled is solver.qd_work for prescaled in launches))
+
+        drive_slot = solver._vel_limit_drive_slot_arg.numpy()
+        scaled = 0
+        for replay in range(3):
+            # An episode reset between env steps, as a training loop does.
+            set_fast_velocities()
+            solver.reset(states[0])
+            wp.capture_launch(capture.graph)
+            for substep in range(2):
+                source = inputs[substep].numpy()
+                expected = _serial(_model_layout(model, source, drive_slot), solver._vel_limit_skip_driven, device)
+                _assert_bits_equal(consumed[substep].numpy(), expected, f"replay={replay} substep={substep}")
+                scaled += int(np.count_nonzero(expected != source))
+        self.assertGreater(scaled, 0)
+        self.assertTrue(np.isfinite(states[0].body_q.numpy()).all())
 
     def test_route_records_no_prescale_without_velocity_limits(self):
         """Record lane width 0 when no prescale kernel runs."""
