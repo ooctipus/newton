@@ -19,6 +19,7 @@ body past a limit, as a contact row pushes a body out of the ground.
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -26,8 +27,10 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
+    PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
+from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_mf_kernel
 from newton.solvers import SolverFeatherPGS
 
 DT = 1.0 / 60.0
@@ -70,9 +73,9 @@ CONTACT_LIMIT = 0.1
 CONTACT_LIMITS = np.array([CONTACT_LIMIT] * 3 + [ANGULAR_LIMIT] * 3)
 
 
-def _begin_model(limits):
-    """Start a model without gravity, registering the rigid-body speed attributes unless ``limits`` is None."""
-    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+def _begin_model(limits, *, gravity=(0.0, 0.0, 0.0)):
+    """Start a model, without gravity by default, that registers the speed attributes unless ``limits`` is None."""
+    builder = newton.ModelBuilder(gravity=gravity)
     if limits is not None:
         SolverFeatherPGS.register_custom_attributes(builder)
     return builder
@@ -106,11 +109,12 @@ def _split_run(builder, device, bodies, *, velocities=None, wrenches=None, **opt
     """Finalize ``builder`` on ``device`` with a split-mode solver and a collision pipeline.
 
     Args:
-        builder: The model, one world per entry of ``bodies``.
+        builder: The model.
         device: Warp device of the model and solver.
-        bodies: The free bodies whose velocities :func:`_step` returns, one per world.
-        velocities: Initial [world, 6] (linear [m/s], angular [rad/s]) velocity of each body; zero if None.
-        wrenches: Velocity change [m/s, rad/s] that a constant body wrench adds over one step, per world.
+        bodies: The free bodies whose velocities :func:`_step` returns.
+        velocities: Initial [body, 6] (linear [m/s], angular [rad/s]) velocity of each of ``bodies``; zero if
+            None.
+        wrenches: Velocity change [m/s, rad/s] that a constant body wrench adds over one step, per body.
         options: Further :class:`~newton.solvers.SolverFeatherPGS` options.
     """
     model = builder.finalize(device=device)
@@ -197,6 +201,24 @@ def _pressed_spheres(device, *, articulated=False):
         builder.end_world()
     builder.add_ground_plane()
     return _split_run(builder, device, spheres)
+
+
+def _landing_boxes(device, *, articulated=False, worlds=8):
+    """Three tilted boxes per world dropped onto a ground plane, with registered but infinite speed limits."""
+    builder = _begin_model(INFINITE_LIMITS, gravity=(0.0, 0.0, -9.81))
+    boxes = []
+    for _ in range(worlds):
+        builder.begin_world()
+        for k in range(3):
+            xform = wp.transform(wp.vec3(0.3 * k, 0.05 * k, 0.12 + 0.25 * k), wp.quat_rpy(0.1 * k, 0.2, 0.05))
+            box = _add_body(builder, xform, INFINITE_LIMITS)
+            builder.add_shape_box(box, hx=0.1, hy=0.08, hz=0.06)
+            boxes.append(box)
+        if articulated:
+            _add_arm(builder)
+        builder.end_world()
+    builder.add_ground_plane()
+    return _split_run(builder, device, boxes)
 
 
 def _step(run):
@@ -290,7 +312,7 @@ class _SplitVelocityLimitChecks:
         np.testing.assert_allclose(rows.rhs, LIMITS[rows.axis], rtol=1.0e-6)
 
     def test_sweep_pushes_only_violated_limits(self):
-        """Push each violated limit back by its whole, unrelaxed correction, and leave satisfied rows at zero impulse."""
+        """Push each violated limit back by its whole, unrelaxed correction; satisfied rows keep zero impulse."""
         for articulated in (False, True):
             for omega in (1.0, RELAXED_OMEGA):
                 with self.subTest(articulated=articulated, omega=omega):
@@ -470,6 +492,57 @@ class TestSplitFreeBodyVelocityLimitsCUDA(_SplitVelocityLimitChecks, unittest.Te
                     np.testing.assert_array_equal(actual.count, expected.count)
                     np.testing.assert_array_equal(actual.type, expected.type)
                     np.testing.assert_allclose(actual.impulses, expected.impulses, rtol=RTOL, atol=1.0e-6)
+
+    def check_sweeps_match_bitwise(self, run, steps):
+        """Run each free-body sweep of ``steps`` steps twice, with the solver's sweep and with the one without the law.
+
+        Both runs of a sweep start from the same rows, impulses and velocities and must leave the same impulses
+        and velocities, bit for bit; the solver's sweep then carries the step on. Returns the row types seen.
+        """
+        solver = run.solver
+        law_sweep = solver._pgs_solve_mf_kernel
+        plain_sweep = _get_pgs_solve_mf_kernel(
+            solver.mf_max_constraints, solver.max_mf_bodies, solver.model.device.arch
+        )
+        solve = solver._mf_pgs_solve
+        row_types = set()
+
+        def solve_twice(iterations, *args, **kwargs):
+            impulses, velocity = wp.clone(solver.mf_impulses), wp.clone(solver.v_out)
+            solver._pgs_solve_mf_kernel = plain_sweep
+            try:
+                solve(iterations, *args, **kwargs)
+            finally:
+                solver._pgs_solve_mf_kernel = law_sweep
+            expected = solver.mf_impulses.numpy(), solver.v_out.numpy()
+            wp.copy(solver.mf_impulses, impulses)
+            wp.copy(solver.v_out, velocity)
+            solve(iterations, *args, **kwargs)
+            np.testing.assert_array_equal(solver.mf_impulses.numpy(), expected[0])
+            np.testing.assert_array_equal(solver.v_out.numpy(), expected[1])
+            rows = _free_body_rows(run)
+            live = np.arange(rows.type.shape[1])[None, :] < rows.count[:, None]
+            row_types.update(np.unique(rows.type[live]).tolist())
+
+        with mock.patch.object(solver, "_mf_pgs_solve", solve_twice):
+            for _ in range(steps):
+                _step(run)
+        return row_types
+
+    def test_velocity_limit_sweep_keeps_other_rows_bitwise(self):
+        """Sweep contact and friction rows bit for bit like the sweep built without the velocity-limit law.
+
+        Registered but infinite speed limits select the ``_vlim`` sweep although no velocity-limit row is
+        built. Every free-body sweep of tilted boxes landing on the ground runs twice from the same state:
+        with the solver's sweep and with the sweep without the law.
+        """
+        for articulated in (False, True):
+            with self.subTest(articulated=articulated):
+                run = _landing_boxes(self.device, articulated=articulated)
+                self.assertTrue(run.solver._pgs_solve_mf_kernel.key.endswith("_vlim"))
+                row_types = self.check_sweeps_match_bitwise(run, steps=45)
+                self.assertLessEqual({PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION}, row_types)
+                self.assertNotIn(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT, row_types)
 
 
 if __name__ == "__main__":
