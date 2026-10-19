@@ -8,6 +8,7 @@ import dataclasses
 import os
 import warnings
 import weakref
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Literal
 
@@ -156,6 +157,24 @@ def _has_generic_convex_pairs(
         shape_pairs_filtered=shape_pairs_filtered,
     )
     return True if count is None else count > 0
+
+
+_PAIR_SCAN_BLOCK = 65536
+
+
+def _iter_pair_blocks(pairs: wp.array[wp.vec2i] | np.ndarray) -> Iterator[np.ndarray]:
+    """Yield a pair list as host blocks of shape ``(n, 2)``.
+
+    A device list is copied one block at a time, so a scan's host memory stays bounded
+    however many worlds replicate the list.
+    """
+    if not isinstance(pairs, wp.array):
+        pairs = np.asarray(pairs).reshape(-1, 2)
+    count = len(pairs)
+    for begin in range(0, count, _PAIR_SCAN_BLOCK):
+        # Warp slices do not clamp their end.
+        block = pairs[begin : min(begin + _PAIR_SCAN_BLOCK, count)]
+        yield (block.numpy() if isinstance(block, wp.array) else block).reshape(-1, 2)
 
 
 @wp.struct
@@ -3529,15 +3548,13 @@ class CollisionPipeline:
             else:
                 possible = bool(np.any(weldable & colliding)) and int(np.count_nonzero(colliding)) > 1
         else:
-            pairs = (pairs.numpy() if hasattr(pairs, "numpy") else np.asarray(pairs)).reshape(-1, 2)
             candidates = []
-            # Bound temporary gathers independently of the replicated world count.
-            for block in (pairs[begin : begin + 65536] for begin in range(0, len(pairs), 65536)):
+            for block in _iter_pair_blocks(pairs):
                 listed = reachable[block[:, 0]] & reachable[block[:, 1]]
                 if weldable is not None:
                     listed |= weldable[block[:, 0]] | weldable[block[:, 1]]
                 candidates.append(block[listed])
-            candidates = np.concatenate(candidates) if candidates else pairs[:0]
+            candidates = np.concatenate(candidates) if candidates else np.empty((0, 2), dtype=np.int32)
             self._immobile_pair_candidates = candidates
             if weldable is None:
                 possible = len(candidates) > 0

@@ -300,6 +300,25 @@ def test_record_reports_excluded_pairs(test, device):
                 test.assertEqual(pipeline.get_collision_selection()["immobile_pairs"]["enabled"], enabled)
 
 
+def test_long_explicit_lists_count_every_block(test, device):
+    """Count the immobile pairs of an explicit list that spans several scan blocks, as of a shorter copy."""
+    model, _ = _pair_scene(device)
+    listed = model.shape_contact_pairs.numpy()
+    # The scan reads 65536 pairs at a time; end the tiled list inside a block.
+    tiles = 65536 // len(listed) + 2
+    tiled = wp.array(np.tile(listed, (tiles, 1)), dtype=wp.vec2i, device=device)
+    test.assertGreater(len(tiled), 65536)
+    for include_static_kinematic_pairs in (True, False):
+        with test.subTest(include_static_kinematic_pairs=include_static_kinematic_pairs), _flag(None):
+            options = {"include_static_kinematic_pairs": include_static_kinematic_pairs}
+            single = newton.CollisionPipeline(model, **options).get_collision_selection()["immobile_pairs"]
+            pipeline = newton.CollisionPipeline(model, shape_pairs_filtered=tiled, **options)
+            record = pipeline.get_collision_selection()["immobile_pairs"]
+            test.assertGreater(single["excluded_pairs"], 0)
+            test.assertEqual(record["listed_pairs"], tiles * single["listed_pairs"])
+            test.assertEqual(record["excluded_pairs"], tiles * single["excluded_pairs"])
+
+
 def test_models_without_immobile_pairs_keep_unfiltered_arguments(test, device):
     """Leave the broad phase unfiltered when no candidate pair can join two immobile shapes."""
     builder = newton.ModelBuilder()
@@ -546,6 +565,7 @@ for name, function in (
         test_static_kinematic_composition_ignores_unrelated_pairs,
     ),
     ("test_record_reports_excluded_pairs", test_record_reports_excluded_pairs),
+    ("test_long_explicit_lists_count_every_block", test_long_explicit_lists_count_every_block),
     (
         "test_models_without_immobile_pairs_keep_unfiltered_arguments",
         test_models_without_immobile_pairs_keep_unfiltered_arguments,
