@@ -125,7 +125,7 @@ class TestHeldTreeContactLaw(unittest.TestCase):
             for beta, law in ((0.0, "point"), (0.2, "patch")):
                 with self.subTest(law=law):
                     solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
-                    # With the opt-in switch on, both laws may run the parallel tiers.
+                    # With the switch on (its default), both laws may run the parallel tiers.
                     self.assertEqual(seen[-1], (*_CONTACT_LAWS[law], True))
                     self.assertEqual(
                         (solver._law_agnostic_contact_paths, solver._point_contact_paths), _CONTACT_LAWS[law]

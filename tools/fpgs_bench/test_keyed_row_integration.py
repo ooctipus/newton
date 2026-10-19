@@ -48,8 +48,8 @@ def make_case(
         patch.object(source, "_WR_ON", world_rows and not enabled),
         patch.object(source, "_REGISTER_WHITENING", exact),
     ):
-        # Patch friction opts in to the parallel tiers and keyed rows; point friction runs with the
-        # switch unset, its default, whatever the exported environment says.
+        # Patch friction sets the switch that admits it to the parallel tiers and keyed rows (its default);
+        # point friction runs with the switch unset, whatever the exported environment says.
         os.environ.pop("FEATHER_PGS_PATCH_PARALLEL_ROWS", None)
         if beta > 0.0:
             os.environ["FEATHER_PGS_PATCH_PARALLEL_ROWS"] = "1"

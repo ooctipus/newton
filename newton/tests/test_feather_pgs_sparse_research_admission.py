@@ -35,9 +35,9 @@ class _AdmissionProbe(SimpleNamespace):
     def _point_contact_paths(self):
         return self._law_agnostic_contact_paths and not self._friction_anchors_enabled
 
-    # Patch friction may run the parallel tiers only under the opt-in
-    # FEATHER_PGS_PATCH_PARALLEL_ROWS=1, which the probe's _patch_parallel_rows
-    # stands for: on in the probe, off in the solver by default.
+    # Patch friction may run the parallel tiers unless FEATHER_PGS_PATCH_PARALLEL_ROWS=0
+    # opts it out, which the probe's _patch_parallel_rows stands for: on in the probe,
+    # as in the solver by default.
     @property
     def _parallel_contact_paths(self):
         return self._point_contact_paths or (self._law_agnostic_contact_paths and self._patch_parallel_rows)
@@ -255,10 +255,10 @@ class TestSparseResearchAdmission(unittest.TestCase):
     def test_patch_friction_yields_only_to_a_parallel_tier_it_runs(self):
         """Keep the ordinary buffers for a patch parallel tier, but not for split mode, response blocks or the default.
 
-        Opted in, patch friction runs the recipe's parallel tier as point friction does,
-        so the tier's request declines sparse factors in matrix-free mode. Split mode
-        builds no tier, response blocks stay point-only, and by default, without
-        FEATHER_PGS_PATCH_PARALLEL_ROWS=1, patch friction keeps its sparse route.
+        Patch friction runs the recipe's parallel tier as point friction does, so the
+        tier's request declines sparse factors in matrix-free mode. Split mode builds no
+        tier, response blocks stay point-only, and opted out with
+        FEATHER_PGS_PATCH_PARALLEL_ROWS=0, patch friction keeps its sparse route.
         """
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
         for name, changes, declined in (
@@ -283,8 +283,8 @@ class TestSparseResearchAdmission(unittest.TestCase):
     def test_patch_route_claims_follow_the_recorded_precedence(self):
         """Claim a patch free-body world for a requested tier, then for the dense route, then for sparse factors.
 
-        This is the order the patch friction record states. A tier that mf_gs_parallel_rows requests under
-        FEATHER_PGS_PATCH_PARALLEL_ROWS=1 declines sparse factors first, whatever FEATHER_PGS_PATCH_DENSE_PATHS
+        This is the order the patch friction record states. A tier that mf_gs_parallel_rows requests (unless
+        FEATHER_PGS_PATCH_PARALLEL_ROWS=0) declines sparse factors first, whatever FEATHER_PGS_PATCH_DENSE_PATHS
         says; without it the free-body rule keeps the world dense unless FEATHER_PGS_PATCH_DENSE_PATHS=0; with
         neither the world reaches sparse topology admission.
         """

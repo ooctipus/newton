@@ -50,8 +50,8 @@ _BETA_REASONS = {
 # sweeps fuse patch anchor triplets (_admit_sparse_contact_triplets). It governs
 # law-agnostic solvers only.
 _PATCH_ROUTE_PRECEDENCE = (
-    " Patch routes, first claim first: a parallel tier that mf_gs_parallel_rows requests under"
-    " FEATHER_PGS_PATCH_PARALLEL_ROWS=1 declines native sparse factors, worlds with free rigid bodies then keep the"
+    " Patch routes, first claim first: a parallel tier that mf_gs_parallel_rows requests (unless"
+    " FEATHER_PGS_PATCH_PARALLEL_ROWS=0) declines native sparse factors, worlds with free rigid bodies then keep the"
     " dense route unless FEATHER_PGS_PATCH_DENSE_PATHS=0, and native sparse factors take the worlds whose topology"
     " they admit, own their rows and may select patch rows at sweep entry (sparse_mass_matrix.active_rows,"
     " FEATHER_PGS_PATCH_ACTIVE_ROWS). Where native sparse factors admit contact triplets"
@@ -61,8 +61,8 @@ _PATCH_ROUTE_PRECEDENCE = (
     " (paired_response.factor_coordinates) excludes the parallel tiers, keyed_rows and local_packets, even a tier"
     " whose request declined sparse factors, and walks patch contact units (paired_response.contact_units) unless"
     " FEATHER_PGS_PATCH_DENSE_PATHS=0. The row producer (contact_rows.producer) is the first admitted of"
-    " local_packets, keyed_rows (FEATHER_PGS_PATCH_PARALLEL_ROWS=1), the compact and sparse producers and general,"
-    " whose masked rows take the patch row law unless FEATHER_PGS_PATCH_DENSE_PATHS=0;"
+    " local_packets, keyed_rows (unless FEATHER_PGS_PATCH_PARALLEL_ROWS=0), the compact and sparse producers and"
+    " general, whose masked rows take the patch row law unless FEATHER_PGS_PATCH_DENSE_PATHS=0;"
     " contact_rows.builder_by_dof names each size's builder kernels and the law they write."
 )
 # Contact torsion (patch friction does not admit compliance) takes none of those routes.

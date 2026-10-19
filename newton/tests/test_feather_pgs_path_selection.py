@@ -522,7 +522,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 self.assertNotIn(-1, positions)
                 self.assertEqual(positions, sorted(positions))
                 self.assertIn("excludes the parallel tiers, keyed_rows and local_packets", precedence)
-                self.assertIn("local_packets, keyed_rows (FEATHER_PGS_PATCH_PARALLEL_ROWS=1)", precedence)
+                self.assertIn("local_packets, keyed_rows (unless FEATHER_PGS_PATCH_PARALLEL_ROWS=0)", precedence)
                 self.assertIn("contact_rows.builder_by_dof names each size's builder kernels", precedence)
                 # The general builder's masked rows take the patch row law unless FEATHER_PGS_PATCH_DENSE_PATHS=0.
                 method = "per_contact" if flag == "0" else "masked_combined"
@@ -1114,8 +1114,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_route_record_is_json_across_routes(self):
         """Build a JSON-compliant record for every major admitted construction route.
 
-        Every case runs with ``FEATHER_PGS_PATCH_PARALLEL_ROWS`` unset, its default; the
-        patch-friction parallel case also runs opted in (``=1``).
+        Every case runs with ``FEATHER_PGS_PATCH_PARALLEL_ROWS`` unset, its default (on); the
+        patch-friction parallel case also runs opted out (``=0``).
         """
         patch_parallel = ({"sparse_mass_matrix": "off", "mf_gs_parallel_rows": 48}, {"free_count": 2})
         cases = (
@@ -1133,8 +1133,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             ({"grouped_dynamics": True}, {}),
             ({"grouped_dynamics": True, "sparse_mass_matrix": "off", "friction_anchor_beta": 0.0}, {}),
             ({"enable_joint_velocity_limits": True}, {}),
-            # By default patch friction builds no parallel tier, whatever the requested budget; opted in, it builds
-            # ring-pooled (linked) parallel tiers, as point friction builds its tiers.
+            # Patch friction builds ring-pooled (linked) parallel tiers, as point friction builds its tiers; opted
+            # out it builds none, whatever the requested budget.
             patch_parallel,
             ({"sparse_mass_matrix": "off", "pgs_schedule": "physx_grasp", "friction_anchor_beta": 0.0}, {}),
             # 320 dense rows stream the row metadata (5120 bytes); the two-world grid keeps row types and parents
@@ -1162,8 +1162,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 {},
             ),
         )
-        built = opted_in = resident_rows = 0
-        for (options, model_options), switch in [(case, None) for case in cases] + [(patch_parallel, "1")]:
+        built = opted_out = resident_rows = 0
+        for (options, model_options), switch in [(case, None) for case in cases] + [(patch_parallel, "0")]:
             with self.subTest(options=options, model=model_options, switch=switch):
                 try:
                     # Set the switch as the arm says, whatever the exported environment holds.
@@ -1175,7 +1175,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 except (ValueError, NotImplementedError):
                     continue  # The record describes admitted constructors only.
                 built += 1
-                opted_in += switch is not None
+                opted_out += switch is not None
                 with assert_host_only():
                     selected = solver.get_path_selection()
                 json.dumps(selected, allow_nan=False)
@@ -1201,12 +1201,12 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 tiers = routes["sweep"]["tiers"]
                 parallel = tiers is not None and tiers["family"] in ("parallel", "keyed_parallel")
                 self.assertEqual(applied["mf_gs_parallel_rows"], tiers["tiers"][-1]["rows"] if parallel else 0)
-                # Patch friction is admitted to the parallel tiers only opted in, and its opted-in arm builds
-                # them: ring-pooled (linked) tiers, where point friction builds point tiers.
+                # Patch friction is admitted to the parallel tiers unless opted out, and the case that requests
+                # them builds them: ring-pooled (linked) tiers, where point friction builds point tiers.
                 patch_law = routes["friction"]["law"] == "patch"
-                self.assertEqual(routes["friction"]["parallel_rows"]["admitted"], not patch_law or switch == "1")
+                self.assertEqual(routes["friction"]["parallel_rows"]["admitted"], not patch_law or switch != "0")
                 if patch_law:
-                    self.assertEqual(parallel, switch == "1")
+                    self.assertEqual(parallel, options is patch_parallel[0] and switch != "0")
                 if parallel:
                     self.assertEqual(tiers["linked_rows"], patch_law)
                     # Linked tiers step each friction pair isotropically; point tiers keep per-row steps.
@@ -1232,7 +1232,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 if grouped is not None:
                     self.assertEqual(grouped["lanes_per_articulation"], solver._grouped_topology.lanes_per_articulation)
         self.assertGreaterEqual(built, 8)
-        self.assertEqual(opted_in, 1, "The opted-in patch-friction parallel arm must build")
+        self.assertEqual(opted_out, 1, "The opted-out patch-friction parallel arm must build")
         self.assertGreaterEqual(
             resident_rows, 1, "A streamed-metadata route must keep its row types and parents resident"
         )

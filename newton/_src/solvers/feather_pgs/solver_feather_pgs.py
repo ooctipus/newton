@@ -1722,11 +1722,13 @@ class SolverFeatherPGS(SolverBase):
                 ``0`` disables it. Requires the same conditions as ``mf_gs_incremental_rows`` and takes precedence.
                 Consider small contact sets, such as an arm against fixed geometry; worlds with mixed/free-body
                 rows or excess rows retain serial solving. The effective limit is capped at 96 for response-block
-                sweeps or 128 for matrix-free sweeps, and rounded down to a multiple of four. Persistent patch
-                friction keeps the serial kernels unless ``FEATHER_PGS_PATCH_PARALLEL_ROWS=1`` opts it in; each
-                tangent pair then projects on its patch's pooled normal load with one isotropic step, the serial
-                pair solve's friction law. The tiers accumulate joint velocity-limit rows, so they share the serial
-                sweep's fixed point under ``velocity_limit_law="accumulated"`` or without joint velocity limits.
+                sweeps or 128 for matrix-free sweeps, and rounded down to a multiple of four. Under persistent
+                patch friction each tangent pair projects on its patch's pooled normal load with one isotropic
+                step, the serial pair solve's friction law; ``FEATHER_PGS_PATCH_PARALLEL_ROWS=0`` keeps patch
+                friction on the serial kernels. The tiers accumulate joint velocity-limit rows. The worlds they
+                decline keep the serial sweep and its ``velocity_limit_law``, ``"stateless"`` by default, so tier
+                and serial worlds share one fixed point under ``velocity_limit_law="accumulated"`` or without
+                joint velocity limits.
             mf_gs_parallel_sweeps (int, optional): Maximum number of parallel sweeps per launch (early exit when no
                 impulse changes). Independent of ``pgs_iterations``; preserve the sweep allowance when comparing
                 execution speed, and validate convergence separately. The tiers that serve persistent patch
@@ -2954,8 +2956,8 @@ class SolverFeatherPGS(SolverBase):
         # The parallel matrix-free tiers pool each friction pair's cone over its patch
         # ring and keyed rows write the patch row law, so both can serve point and patch
         # friction (Jacobi sweeps, not the serial patch sweep). Patch friction takes them
-        # only under the opt-in FEATHER_PGS_PATCH_PARALLEL_ROWS=1; by default it keeps
-        # its serial sweeps and ordinary rows.
+        # by default; FEATHER_PGS_PATCH_PARALLEL_ROWS=0 keeps its serial sweeps and
+        # ordinary rows.
         self._parallel_contact_paths, self._parallel_contact_paths_reason = self._admit_parallel_contact_paths()
         # Patch friction on the dense route: the paired factor sweep walks patch
         # contact units, the masked row builder writes the patch row law, the
@@ -3170,7 +3172,7 @@ class SolverFeatherPGS(SolverBase):
         # limit prefix and contact packets built in place for the local solve
         # owners (row_packets.py), with the point or the patch row law;
         # FEATHER_PGS_ROW_PACKETS=0 opts out. The keyed rows below take patch
-        # friction only under FEATHER_PGS_PATCH_PARALLEL_ROWS=1.
+        # friction unless FEATHER_PGS_PATCH_PARALLEL_ROWS=0.
         self._row_packets = None
         if self._sparse_mass_matrix_size is not None:
             self._row_packets_reason = "Native sparse factors own the contact rows."
@@ -3198,7 +3200,7 @@ class SolverFeatherPGS(SolverBase):
             self._keyed_rows_reason = (
                 "Keyed rows write the point and patch row laws; torsion and compliance keep ordinary rows."
                 if not self._law_agnostic_contact_paths
-                else "Patch friction keeps ordinary rows unless FEATHER_PGS_PATCH_PARALLEL_ROWS=1 opts it in."
+                else "Patch friction keeps ordinary rows: FEATHER_PGS_PATCH_PARALLEL_ROWS=0 opts it out."
             )
         elif os.environ.get("FEATHER_PGS_KEYED_ROWS", "1") == "0":
             self._keyed_rows_reason = "FEATHER_PGS_KEYED_ROWS=0 disables keyed rows."
@@ -14424,8 +14426,8 @@ class SolverFeatherPGS(SolverBase):
 
             # The first admitted producer writes every contact row: local row packets, keyed rows,
             # the compact and sparse producers, then the general builder. Under patch friction this
-            # order is the row precedence: the packets (Franka) and keyed rows opted in with
-            # FEATHER_PGS_PATCH_PARALLEL_ROWS=1 take their worlds' rows before the general builder's
+            # order is the row precedence: the packets (Franka) and keyed rows (unless
+            # FEATHER_PGS_PATCH_PARALLEL_ROWS=0) take their worlds' rows before the general builder's
             # masked patch rows (_masked_contact_rows), and native sparse factors admit neither.
             # get_path_selection() records the same plan (routes.contact_rows).
             plan = contact_row_plan(self)
@@ -15901,7 +15903,7 @@ class SolverFeatherPGS(SolverBase):
         coefficients.
 
         This decides only the general builder's method (contact_row_plan). Local row packets, keyed
-        rows (under patch friction only with FEATHER_PGS_PATCH_PARALLEL_ROWS=1), the compact producers
+        rows (under patch friction unless FEATHER_PGS_PATCH_PARALLEL_ROWS=0), the compact producers
         and native sparse factors own their worlds' rows first, so masked patch rows serve the rest.
         """
         if self._point_contact_paths:
@@ -16267,50 +16269,56 @@ class SolverFeatherPGS(SolverBase):
         """Decide whether the parallel tiers and keyed rows may serve this contact law, and why.
 
         They pool each friction pair's cone over its patch ring and write the patch
-        row law, so under ``FEATHER_PGS_PATCH_PARALLEL_ROWS=1`` patch friction honors
-        ``mf_gs_parallel_rows`` and keyed rows as point friction does. The linked
-        tiers step each friction pair isotropically, so a sliding pair converges to
-        the serial pair solve's maximal dissipation; with per-row steps it did not,
-        which moved body-velocity RMS by 0.4-0.9% on two contact-rich patch-friction
-        workloads. Whether the tiers then share the serial sweep's whole fixed point
-        depends on the joint velocity limits (:meth:`_parallel_velocity_limit_agreement`).
-        The switch stays opt-in until the tiers' accuracy and speed gates pass. By
-        default patch friction keeps its serial sweeps. Torsion and compliance keep
+        row law, so patch friction honors ``mf_gs_parallel_rows`` and keyed rows as
+        point friction does, unless ``FEATHER_PGS_PATCH_PARALLEL_ROWS=0`` keeps it on
+        its serial sweeps and ordinary rows. The linked tiers step each friction pair
+        isotropically, so a sliding pair converges to the serial pair solve's maximal
+        dissipation; with per-row steps it did not, which moved body-velocity RMS by
+        0.4-0.9% on two contact-rich patch-friction workloads. Whether the tiers then
+        share the serial sweep's whole fixed point depends on the joint velocity
+        limits, and the worlds the tiers decline keep the serial sweep and its law
+        (:meth:`_parallel_velocity_limit_agreement`). Torsion and compliance keep
         ordinary rows.
         """
         if self._point_contact_paths:
             return True, "Point friction: parallel tiers and keyed rows serve it."
         if not self._law_agnostic_contact_paths:
             return False, "Contact torsion and compliance keep serial sweeps and ordinary rows."
-        if os.environ.get("FEATHER_PGS_PATCH_PARALLEL_ROWS") != "1":
+        if os.environ.get("FEATHER_PGS_PATCH_PARALLEL_ROWS") == "0":
             return False, (
-                "Patch friction ignores mf_gs_parallel_rows and keyed rows and keeps its serial sweeps "
-                "unless FEATHER_PGS_PATCH_PARALLEL_ROWS=1 opts it in (default off)."
+                "Patch friction ignores mf_gs_parallel_rows and keyed rows and keeps its serial sweeps: "
+                "FEATHER_PGS_PATCH_PARALLEL_ROWS=0 opts it out (default on)."
             )
         return True, (
             "Patch friction honors mf_gs_parallel_rows and keyed rows: in the parallel (Jacobi) sweeps each tangent "
             "pair projects on its patch ring's pooled normal load, as point pairs project on their own normal, with "
             "one isotropic step per pair, the serial pair solve's friction law. "
             f"{self._parallel_velocity_limit_agreement()} "
-            "FEATHER_PGS_PATCH_PARALLEL_ROWS=1 opted in; by default patch friction keeps its serial sweeps."
+            "FEATHER_PGS_PATCH_PARALLEL_ROWS=0 keeps patch friction on its serial sweeps."
         )
 
     def _parallel_velocity_limit_agreement(self) -> str:
         """Say whether the parallel tiers share the serial sweep's fixed point at the joint velocity limits.
 
         Recorded in ``routes.friction.parallel_rows``. The tiers project joint
-        velocity-limit rows as accumulated unilateral rows; the serial sweeps do so
-        only under the accumulated law (``routes.velocity_limits.law``). Under PhysX's
-        stateless clamp the two converge to different velocities wherever a limit
+        velocity-limit rows as accumulated unilateral rows. The worlds they decline
+        (more dense rows than the largest tier's, or free-body rows) keep the serial
+        sweep, which does so only under the accumulated law
+        (``routes.velocity_limits.law``). Under PhysX's stateless clamp, the default,
+        tier and serial worlds converge to different velocities wherever a limit
         binds. The tiers serve dense rows only, so free-body limits do not enter.
         """
         if not self.enable_joint_velocity_limits or np.isinf(self.velocity_limit_activation_fraction):
             return "Without joint velocity-limit rows the tiers share the serial sweep's fixed point."
         if self._velocity_limit_sweep_law()[0] == "accumulated":
-            return "Both accumulate joint velocity-limit rows, so the tiers share the serial sweep's fixed point."
+            return (
+                "Both accumulate joint velocity-limit rows, so the tiers share the serial sweep's fixed point; the "
+                "worlds they decline keep that sweep."
+            )
         return (
-            "The tiers accumulate joint velocity-limit rows, which the serial sweeps clamp statelessly "
-            "(routes.velocity_limits.law), so their fixed points differ wherever a limit binds."
+            "The tiers accumulate joint velocity-limit rows; the worlds they decline keep the serial sweep, which "
+            "clamps them statelessly (routes.velocity_limits.law), so the two fixed points differ wherever a limit "
+            "binds."
         )
 
     def _parallel_pair_step(self) -> str:

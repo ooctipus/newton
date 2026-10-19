@@ -174,7 +174,7 @@ def assert_torsion_neutral_routes(test, reference, selected_out):
     """Require a zero-radius and a selected-out torsion solver to share the pinned ordinary route.
 
     The selected-out arm runs the torsion sweep on ordinary rows, so it must decline the parallel
-    tiers (they have no torsion pass) and keyed rows whatever its friction law and the opt-in
+    tiers (they have no torsion pass) and keyed rows whatever its friction law and
     ``FEATHER_PGS_PATCH_PARALLEL_ROWS`` say.
     """
     test.assertFalse(selected_out.get_path_selection()["routes"]["friction"]["parallel_rows"]["admitted"])
@@ -392,14 +392,14 @@ class TestTorsionNeutralRoute(unittest.TestCase):
         The CUDA comparisons of a zero radius against a selected-out radius require equal neutral
         records before comparing states. Records are decided at construction, so both arms are
         built here in split mode, with the CUDA-only torsion mode check patched out, and neither
-        is stepped. ``FEATHER_PGS_PATCH_PARALLEL_ROWS=1`` admits patch friction to the parallel
-        rows that torsion keeps a solver out of, as point friction is admitted: the zero-radius arm
-        is admitted in three of the four cases, the selected-out arm in none.
+        is stepped. ``FEATHER_PGS_PATCH_PARALLEL_ROWS`` admits patch friction to the parallel rows
+        that torsion keeps a solver out of unless it is ``0``, as point friction is admitted: the
+        zero-radius arm is admitted in three of the four cases, the selected-out arm in none.
         """
         model = pads("cpu")
         split = {"pgs_mode": "split", "friction_anchor_beta": 0.0, "pgs_warmstart": False, **TORSION_OFF_ROUTE}
         for law, options in (("point", {}), ("patch", PATCH_OPTIONS)):
-            for switch in (None, "1"):
+            for switch in (None, "0"):
                 with (
                     self.subTest(law=law, FEATHER_PGS_PATCH_PARALLEL_ROWS=switch),
                     patch.dict(os.environ),
@@ -414,7 +414,7 @@ class TestTorsionNeutralRoute(unittest.TestCase):
                     )
                     self.assertTrue(selected_out._contact_torsion_enabled)
                     friction = reference.get_path_selection()["routes"]["friction"]
-                    self.assertEqual(friction["parallel_rows"]["admitted"], law == "point" or switch == "1")
+                    self.assertEqual(friction["parallel_rows"]["admitted"], law == "point" or switch != "0")
                     assert_torsion_neutral_routes(self, reference, selected_out)
 
 
