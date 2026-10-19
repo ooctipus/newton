@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Launch the solver's contact-capacity consumers over one resident wave of blocks."""
+"""Launch the solver's contact-capacity consumers over about one wave of blocks."""
 
 import unittest
 from types import SimpleNamespace
@@ -16,7 +16,7 @@ from newton._src.solvers.feather_pgs import kernels, keyed_rows
 from newton._src.solvers.feather_pgs.contact_input import ContactInput
 from newton.solvers import SolverFeatherPGS
 
-# Every launch over the contact capacity that grid-strides over one wave.
+# Every launch over the contact capacity that grid-strides over the capped grid.
 _CONSUMERS = (
     kernels.compute_contact_linear_force_from_impulses,
     kernels.pack_contact_linear_force_as_spatial,
@@ -183,7 +183,7 @@ class TestFeatherPGSCapacityLaunches(unittest.TestCase):
     def test_capacity_launches_take_the_recorded_blocks(self):
         """Give every capacity-sized consumer launch the route record's block count.
 
-        The record's count is one resident wave on CUDA and 0 (uncapped) on CPU; a count set on the
+        The record's count is about one wave on CUDA and 0 (uncapped) on CPU; a count set on the
         solver reaches the force export, the warm-start snapshot and every warm-start gather the
         configuration launches.
         """
@@ -236,8 +236,8 @@ class TestFeatherPGSCapacityLaunches(unittest.TestCase):
                     self.assertTrue(keys & {kernel.key for kernel in _CONSUMERS[3:]}, "a warm-start gather must run")
                     self.assertEqual({blocks for _, blocks in launched}, {3}, launched)
 
-    def test_capacity_blocks_are_one_wave(self):
-        """Size the capped grid as one resident wave of 256-thread blocks per SM, and leave CPU uncapped."""
+    def test_capacity_blocks_fill_every_sm(self):
+        """Size the capped grid as 8 blocks of 256 threads per SM, about one wave, and leave CPU uncapped."""
         for name in _devices():
             with self.subTest(device=name):
                 device = wp.get_device(name)

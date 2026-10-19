@@ -11,6 +11,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.sim.contacts import contact_capacity_blocks
 from newton._src.solvers.feather_pgs import keyed_rows as rows
 from newton._src.solvers.feather_pgs import solver_feather_pgs as source
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
@@ -34,8 +35,12 @@ def make_case(
     model_factory=None,
     beta=0.0,
     deterministic=False,
+    rigid_contact_max=None,
 ):
     model = _build_model(free_count=free_count) if model_factory is None else model_factory()
+    if rigid_contact_max is not None:
+        # The solver sizes its contact scratch from the model's capacity at construction.
+        model.rigid_contact_max = rigid_contact_max
     with (
         patch.dict(os.environ, {"FEATHER_PGS_KEYED_ROWS": ("" if enabled is None else str(int(enabled)))}),
         patch.object(source, "_INK_ON", True),
@@ -62,7 +67,8 @@ def make_case(
         )
     state, out = model.state(), model.state()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=128, deterministic=deterministic)
+    contact_capacity = 128 if rigid_contact_max is None else rigid_contact_max
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=contact_capacity, deterministic=deterministic)
     return model, solver, state, out, model.control(), pipeline, pipeline.contacts()
 
 
@@ -209,20 +215,27 @@ class TestKeyedRowIntegration(unittest.TestCase):
                     self.assertTrue(linked, "A box foot must link several normals in one ring")
 
     def test_key_scatters_take_the_recorded_blocks(self):
-        """Launch the key scatters over the route record's block count, solving as on the full grid.
+        """Launch the key scatters over the route record's block count, solving as on the capped default grid.
 
         Point friction scatters its keys after the fallback counts and patch friction before the
-        patch link. One block loops over every contact, so a solver forced to one block solves the
-        same rows as the default one-wave grid.
+        patch link. A solver forced to one block strides that block over the whole 1,024-slot
+        buffer, four iterations whose later ones hold only empty slots, and solves the same rows
+        as the default grid. This tripod has far fewer than 256 live contacts, so every live one
+        falls in the first iteration; test_key_scatters_match_on_a_capped_grid in
+        test_feather_pgs_capacity_launches covers live contacts in later iterations.
         """
         device = wp.get_device("cuda:0")
         for beta, scatter in ((0.0, rows.scatter_contact_keys), (0.2, rows.scatter_patch_contact_keys)):
             with self.subTest(friction_anchor_beta=beta):
                 with patch.dict(os.environ, {"FEATHER_PGS_RESOLVED_WORLDS": "0"}):
-                    wave, single = (make_case(True, 32, 1, beta=beta, deterministic=True) for _ in range(2))
+                    wave, single = (
+                        make_case(True, 32, 1, beta=beta, deterministic=True, rigid_contact_max=1024) for _ in range(2)
+                    )
                 self.assertEqual(wave[1]._keyed_rows.patch, beta > 0.0)
+                self.assertEqual(wave[-1].rigid_contact_max, 1024)
+                self.assertEqual(wave[1]._max_contacts_alloc, 1024)
                 record = wave[1].get_path_selection()["routes"]["contact_consumers"]
-                self.assertEqual(record["max_blocks"], 8 * device.sm_count)
+                self.assertEqual(record["max_blocks"], contact_capacity_blocks(device))
                 single[1]._contact_capacity_blocks = 1
                 blocks, launch = [], wp.launch
 

@@ -2387,7 +2387,8 @@ class SolverFeatherPGS(SolverBase):
         if self.tile_threads not in (32, 64, 128, 256):
             raise ValueError(f"tile_threads must be one of (32, 64, 128, 256), got {tile_threads!r}")
         # Launches over the contact capacity (the force export, the warm-start snapshot
-        # and gathers, the keyed-row key scatters) grid-stride over one resident wave.
+        # and gathers, the propagation unit collection, the keyed-row key scatters)
+        # grid-stride over about one wave of blocks.
         self._contact_capacity_blocks = contact_capacity_blocks(model.device)
 
         self.cholesky_kernel = cholesky_kernel

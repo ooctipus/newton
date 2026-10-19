@@ -15,6 +15,7 @@ import math
 
 import numpy as np
 
+from ...sim.contacts import CAPACITY_BLOCKS_PER_SM
 from .contact_row_plan import contact_row_plan
 
 # Options whose applied value lives under another attribute after construction.
@@ -442,10 +443,11 @@ def _contact_consumers(solver) -> dict:
     return {
         "max_blocks": blocks,
         "reason": (
-            "Launches over the contact capacity (force export, warm-start snapshot and gathers, keyed-row key"
-            " scatters) grid-stride over one resident wave of 256-thread blocks."
+            "Launches over the contact capacity (force export, warm-start snapshot and gathers, propagation unit"
+            f" collection, keyed-row key scatters) grid-stride over {CAPACITY_BLOCKS_PER_SM} blocks of 256 threads"
+            " per SM, about one wave."
             if blocks
-            else "Uncapped: a CPU launch loops over every slot."
+            else "Uncapped: a CPU launch, or a kernel compiled without the grid-stride loop, covers every slot."
         ),
     }
 

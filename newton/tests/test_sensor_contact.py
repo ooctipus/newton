@@ -712,8 +712,8 @@ class TestSensorContact(unittest.TestCase):
         # Verify orthogonality
         self.assertAlmostEqual(np.dot(friction[0], n), 0.0, places=5)
 
-    def test_accumulation_grid_strides_over_one_wave(self):
-        """Accumulate over the capacity on one resident wave of blocks, exactly as on the full grid.
+    def test_accumulation_matches_on_a_capped_grid(self):
+        """Accumulate over the capacity on a capped grid exactly as on the full grid.
 
         The forces, normals and points are small integers along the axes, so every sum is exact
         in any order: one block, which loops over all the contacts, must reproduce the full grid

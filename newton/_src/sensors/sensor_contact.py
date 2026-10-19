@@ -535,7 +535,7 @@ class SensorContact:
             raise ValueError("At most one of `counterpart_bodies` and `counterpart_shapes` may be specified.")
 
         self.device = model.device
-        # The accumulation launches over the contact capacity; one resident wave covers it.
+        # The accumulation launches over the contact capacity; about one wave of blocks covers it.
         self._capacity_blocks = contact_capacity_blocks(self.device)
         self.verbose = verbose if verbose is not None else wp.config.log_level <= wp.LOG_DEBUG
 
