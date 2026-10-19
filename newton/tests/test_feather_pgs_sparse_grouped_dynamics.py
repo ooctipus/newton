@@ -72,15 +72,16 @@ class TestSparseGroupedDynamics(unittest.TestCase):
         """Preserve eight-sweep physics on branched and mixed robot/free worlds.
 
         Worlds that pair an articulation with free rigid bodies keep the dense route under
-        both friction laws. ``FEATHER_PGS_PATCH_DENSE_PATHS=0`` returns patch friction's
-        free-body worlds to native sparse factors, the one route that still composes
-        grouped dynamics with free-body response, so the mixed worlds run there.
+        both friction laws, where grouped dynamics runs on ordinary factors. Only patch
+        friction with ``FEATHER_PGS_PATCH_DENSE_PATHS=0`` returns them to native sparse
+        factors: the one route on which sparse factors compose grouped dynamics with
+        free-body response, so the mixed worlds run there.
         """
         for free_count, beta, environment in (
             (0, 0.0, None),
             (2, None, {"FEATHER_PGS_PATCH_DENSE_PATHS": "0"}),
         ):
-            with self.subTest(free_count=free_count):
+            with self.subTest(free_count=free_count, friction_anchor_beta=beta, environment=environment):
                 plain, grouped = (
                     _case(flag, free_count=free_count, friction_anchor_beta=beta, environment=environment)
                     for flag in (False, True)
@@ -96,13 +97,19 @@ class TestSparseGroupedDynamics(unittest.TestCase):
                 self.assertTrue(contact_seen and limit_seen)
 
     def test_free_body_worlds_keep_the_dense_route(self):
-        """Keep mixed robot/free worlds on the dense route under point and default patch friction."""
-        for beta in (0.0, None):
-            with self.subTest(friction_anchor_beta=beta):
-                environment = {"FEATHER_PGS_PATCH_DENSE_PATHS": "1"}
+        """Keep mixed robot/free worlds on the dense route unless patch friction opts out of it.
+
+        Point friction keeps them there whatever ``FEATHER_PGS_PATCH_DENSE_PATHS`` says, and
+        patch friction keeps them there by default, which is why the physics test runs its
+        mixed worlds under patch friction with the opt-out.
+        """
+        for beta, dense_paths in ((0.0, "1"), (None, "1"), (0.0, "0")):
+            environment = {"FEATHER_PGS_PATCH_DENSE_PATHS": dense_paths}
+            with self.subTest(friction_anchor_beta=beta, environment=environment):
                 solver = _case(True, free_count=2, friction_anchor_beta=beta, environment=environment)[1]
                 self.assertIsNone(solver._sparse_mass_matrix_size)
-                self.assertIn("free rigid bodies", solver.get_path_selection()["reasons"]["sparse_mass_matrix"])
+                reason = solver.get_path_selection()["reasons"]["sparse_mass_matrix"]
+                self.assertIn("free rigid bodies keep the dense route", reason)
                 self.assertIsNotNone(solver._grouped_topology)
 
     def test_grouped_sparse_graph_held_factor_and_masked_reset(self):

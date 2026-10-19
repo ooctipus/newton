@@ -175,6 +175,16 @@ class TestSparseResearchAdmission(unittest.TestCase):
             solver._friction_anchors_enabled = True
             solver._has_free_rigid_bodies = True
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+        # Point friction's free-body worlds keep the dense route whatever that switch says.
+        with (
+            self.subTest(friction_anchors=False, FEATHER_PGS_PATCH_DENSE_PATHS="0"),
+            mock.patch.dict(os.environ, {"FEATHER_PGS_PATCH_DENSE_PATHS": "0"}, clear=True),
+        ):
+            solver = _eligible_solver()
+            solver._has_free_rigid_bodies = True
+            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+            self.assertIsNone(solver._sparse_mass_matrix_size)
+            self.assertIn("free rigid bodies", solver._sparse_selection_reason)
         # The decline is about free rigid bodies, not the friction law: without them, both laws reach admission.
         for anchors in (False, True):
             with (
