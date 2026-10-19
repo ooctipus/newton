@@ -14,7 +14,7 @@ from ...sim import BodyFlags
 from . import cached_force, response_operator, sparse_factor, tree_chain_scan
 from .cached_state import StateOperands, StateStages, make_body_terms, make_state_kernel
 from .publication_data import PublicationData
-from .tree_kinetic_layout import REFERENCE_LAYOUT, TreeLayout
+from .tree_kinetic_layout import REFERENCE_LAYOUT, THREADS, TreeLayout
 
 
 @wp.func
@@ -114,7 +114,7 @@ class ForceInput:
 
 _LANES_SOURCE = r"""
 #if defined(__CUDA_ARCH__)
-    return wp::vec_t<3,int>($LANE,$STRIDE,$SUB);
+    return wp::vec_t<3,int>(LANE,STRIDE,SUB);
 #else
     return wp::vec_t<3,int>(0,1,0);
 #endif
@@ -122,21 +122,21 @@ _LANES_SOURCE = r"""
 
 _SYNC_SOURCE = r"""
 #if defined(__CUDA_ARCH__)
-    $SYNC;
+    SYNC();
 #endif
 """
 
 _SUB_SOURCE = r"""
 #if defined(__CUDA_ARCH__)
-    return $SUB;
+    return SUB;
 #else
     return 0;
 #endif
 """
 
-_THREADS = r"""
+_LANE_STRIDE = r"""
 #if defined(__CUDA_ARCH__)
-    const int lane=$LANE,stride=$STRIDE;
+    const int lane=LANE,stride=STRIDE;
 #else
     const int lane=0,stride=1;
 #endif
@@ -147,9 +147,9 @@ _DIFFERENT_MOTION_SOURCE = r"""
     if(state_qd.data==motion_qd.data)return 0;
     int different=0;
 #if defined(__CUDA_ARCH__)
-    for(int i=$LANE;i<count;i+=$STRIDE)
+    for(int i=LANE;i<count;i+=STRIDE)
         different|=state_qd.data[start+i]!=motion_qd.data[start+i];
-    return $ANY different);
+    return ANY(different);
 #else
     for(int i=0;i<count;++i)different|=state_qd.data[start+i]!=motion_qd.data[start+i];
     return different;
@@ -160,10 +160,10 @@ _DIFFERENT_MOTION_SOURCE = r"""
 @functools.cache
 def _thread_helpers(layout):
     """Lane, barrier and sub-tree natives for one tree layout."""
-    lanes_source = layout.render(_LANES_SOURCE)
-    sync_source = layout.render(_SYNC_SOURCE)
-    sub_source = layout.render(_SUB_SOURCE)
-    motion_source = layout.render(_DIFFERENT_MOTION_SOURCE)
+    lanes_source = layout.render(THREADS + _LANES_SOURCE)
+    sync_source = layout.render(THREADS + _SYNC_SOURCE)
+    sub_source = layout.render(THREADS + _SUB_SOURCE)
+    motion_source = layout.render(THREADS + _DIFFERENT_MOTION_SOURCE)
 
     @wp.func_native(lanes_source)
     def _lanes() -> wp.vec3i: ...
@@ -226,7 +226,7 @@ _BANK_MATCHES = r"""
             reinterpret_cast<const unsigned*>(bank.body_qd.data+body)[k%6];
     }
 #if defined(__CUDA_ARCH__)
-    return $ALL equal);
+    return ALL(equal);
 #else
     return equal?1:0;
 #endif
@@ -247,9 +247,8 @@ def _bank_binding(coordinates, layout):
     differ: keeping it is exact up to that reordering (float-reorder), not
     bitwise.
     """
-    source = _BANK_MATCHES.replace("$COORDINATES", str(coordinates))
 
-    @wp.func_native(layout.render(_THREADS + source))
+    @wp.func_native(layout.render(THREADS + _LANE_STRIDE + _BANK_MATCHES, COORDINATES=str(coordinates)))
     def matches(
         bank: StateBank,
         first_q: int,
@@ -265,9 +264,12 @@ def _bank_binding(coordinates, layout):
     return matches
 
 
+# A launch block's vote, not a tree's (the prelude's ANY): a packed layout's
+# block is one warp of several trees, an unpacked block one tree.
 _BLOCK_VOTE = r"""
 #if defined(__CUDA_ARCH__)
-    return $VOTE value);
+    if constexpr(LANES<32)return __any_sync(0xffffffffu,value);
+    else return __syncthreads_or(value);
 #else
     return value;
 #endif
@@ -281,9 +283,8 @@ def _block_vote(layout):
     A packed layout's block is one warp of several trees, so the vote spans the
     warp; an unpacked block holds one tree and votes over the block.
     """
-    source = _BLOCK_VOTE.replace("$VOTE", "__any_sync(0xffffffffu," if layout.lanes < 32 else "__syncthreads_or(")
 
-    @wp.func_native(source)
+    @wp.func_native(layout.render(THREADS + _BLOCK_VOTE))
     def block_any(value: int) -> int: ...
 
     return block_any
@@ -302,17 +303,17 @@ def _load_pose(address: wp.uint64, body: int) -> wp.transform: ...
 _POSE = r"""
     float* s=reinterpret_cast<float*>(address);
 #if defined(__CUDA_ARCH__)
-    const int body=$LANE;
+    const int body=LANE;
     wp::transform value;
     if(body<$BODIES)for(int k=0;k<7;++k)value[k]=s[7*body+k];
     for(int round=0;round<$ROUNDS;++round) {
         const int parent=body<$BODIES?p.jump.data[round*$BODIES+body]:-1;
         wp::transform ancestor;
         if(parent>=0)for(int k=0;k<7;++k)ancestor[k]=s[7*parent+k];
-        $SYNC;
+        SYNC();
         if(parent>=0)value=wp::transform_multiply(ancestor,value);
         if(body<$BODIES)for(int k=0;k<7;++k)s[7*body+k]=value[k];
-        $SYNC;
+        SYNC();
     }
 #else
     wp::transform old[$BODIES];
@@ -330,15 +331,15 @@ _POSE = r"""
 _MOTION = r"""
     float* s=reinterpret_cast<float*>(address)+$MOTION;
 #if defined(__CUDA_ARCH__)
-    const int body=$LANE;
+    const int body=LANE;
     float v[6]={},a[6]={};
     if(body<$BODIES)for(int k=0;k<6;++k){v[k]=s[6*body+k];s[$SIX_BODIES+6*body+k]=0.0f;}
-    $SYNC;
+    SYNC();
     for(int round=0;round<$ROUNDS;++round) {
         const int parent=body<$BODIES?p.jump.data[round*$BODIES+body]:-1;
         float pv[6],pa[6];
         if(parent>=0)for(int k=0;k<6;++k){pv[k]=s[6*parent+k];pa[k]=s[$SIX_BODIES+6*parent+k];}
-        $SYNC;
+        SYNC();
         if(parent>=0) {
             const wp::vec3 pl(pv[0],pv[1],pv[2]),pw(pv[3],pv[4],pv[5]);
             const wp::vec3 vl(v[0],v[1],v[2]),vw(v[3],v[4],v[5]);
@@ -347,7 +348,7 @@ _MOTION = r"""
             for(int k=0;k<6;++k)v[k]=pv[k]+v[k];
         }
         if(body<$BODIES)for(int k=0;k<6;++k){s[6*body+k]=v[k];s[$SIX_BODIES+6*body+k]=a[k];}
-        $SYNC;
+        SYNC();
     }
 #else
     float ov[$BODIES][6],oa[$BODIES][6];
@@ -374,20 +375,20 @@ _MOTION = r"""
 _POSE_SHFL = r"""
     float* s=reinterpret_cast<float*>(address);
 #if defined(__CUDA_ARCH__)
-    const int lane=$LANE,body=lane;
+    const int lane=LANE,body=lane;
     wp::transform value=wp::transform_identity<float>();
     if(body<$BODIES)for(int k=0;k<7;++k)value[k]=s[7*body+k];
     int parent=body<$BODIES?p.parent.data[body]:-1;
     for(int round=0;round<$ROUNDS;++round) {
         const int source=parent>=0?parent:lane;
         wp::transform ancestor;
-        for(int k=0;k<7;++k)ancestor[k]=__shfl_sync($MASK,value[k],source$SHFL);
-        const int next=__shfl_sync($MASK,parent,source$SHFL);
+        for(int k=0;k<7;++k)ancestor[k]=__shfl_sync(MASK,value[k],source,WIDTH);
+        const int next=__shfl_sync(MASK,parent,source,WIDTH);
         if(parent>=0)value=wp::transform_multiply(ancestor,value);
         parent=parent>=0?next:-1;
     }
     if(body<$BODIES)for(int k=0;k<7;++k)s[7*body+k]=value[k];
-    $SYNC;
+    SYNC();
 #else
     wp::transform old[$BODIES];
     for(int round=0;round<$ROUNDS;++round) {
@@ -404,15 +405,15 @@ _POSE_SHFL = r"""
 _MOTION_SHFL = r"""
     float* s=reinterpret_cast<float*>(address)+$MOTION;
 #if defined(__CUDA_ARCH__)
-    const int lane=$LANE,body=lane;
+    const int lane=LANE,body=lane;
     float v[6]={},a[6]={};
     if(body<$BODIES)for(int k=0;k<6;++k)v[k]=s[6*body+k];
     int parent=body<$BODIES?p.parent.data[body]:-1;
     for(int round=0;round<$ROUNDS;++round) {
         const int source=parent>=0?parent:lane;
         float pv[6],pa[6];
-        for(int k=0;k<6;++k){pv[k]=__shfl_sync($MASK,v[k],source$SHFL);pa[k]=__shfl_sync($MASK,a[k],source$SHFL);}
-        const int next=__shfl_sync($MASK,parent,source$SHFL);
+        for(int k=0;k<6;++k){pv[k]=__shfl_sync(MASK,v[k],source,WIDTH);pa[k]=__shfl_sync(MASK,a[k],source,WIDTH);}
+        const int next=__shfl_sync(MASK,parent,source,WIDTH);
         if(parent>=0) {
             const wp::vec3 pl(pv[0],pv[1],pv[2]),pw(pv[3],pv[4],pv[5]);
             const wp::vec3 vl(v[0],v[1],v[2]),vw(v[3],v[4],v[5]);
@@ -423,7 +424,7 @@ _MOTION_SHFL = r"""
         parent=parent>=0?next:-1;
     }
     if(body<$BODIES)for(int k=0;k<6;++k){s[6*body+k]=v[k];s[$SIX_BODIES+6*body+k]=a[k];}
-    $SYNC;
+    SYNC();
 #else
     float ov[$BODIES][6],oa[$BODIES][6];
     for(int body=0;body<$BODIES;++body)for(int k=0;k<6;++k)s[$SIX_BODIES+6*body+k]=0.0f;
@@ -444,16 +445,16 @@ _MOTION_SHFL = r"""
 """
 
 
-_COLLECT = r"""    $PHYSICAL_DECL
+_COLLECT = r"""    $PHYSICAL_TABLE
 
     float* s=reinterpret_cast<float*>(address);
 #if defined(__CUDA_ARCH__)
-    const int lane=$LANE,stride=$STRIDE;
+    const int lane=LANE,stride=STRIDE;
 #else
     const int lane=0,stride=1;
 #endif
-$CLOCKC0$REDUCE
-$CLOCKC1    for(int dof=lane;dof<$DOFS;dof+=stride) {
+$CLOCK0$REDUCE
+$CLOCK1    for(int dof=lane;dof<$DOFS;dof+=stride) {
         const int body=p.dof_joint.data[dof];
         float bias=0.0f;
         for(int k=0;k<6;++k)bias+=s[$AXIS+6*dof+k]*s[$WRENCH+6*body+k];
@@ -475,9 +476,9 @@ $CLOCKC1    for(int dof=lane;dof<$DOFS;dof+=stride) {
         }
     }
 #if defined(__CUDA_ARCH__)
-    $SYNC;
+    SYNC();
 #endif
-$CLOCKC2    if(refresh)for(int e=lane;e<$NNZ;e+=stride) {
+$CLOCK2    if(refresh)for(int e=lane;e<$NNZ;e+=stride) {
         const int row=$PHYSICAL_ROW,col=$PHYSICAL_COL,src=p.source.data[e];
         const int projection=src==col?row:col;
         float value=0.0f;
@@ -492,9 +493,9 @@ $CLOCKC2    if(refresh)for(int e=lane;e<$NNZ;e+=stride) {
         }
     }
 #if defined(__CUDA_ARCH__)
-    $SYNC;
+    SYNC();
 #endif
-$CLOCKC3    if(lane==0) {
+$CLOCK3    if(lane==0) {
         cache.generation.data[group]+=1;
         $CURRENT_VALID
         cache.geometry_valid.data[group]=refresh&&cache.status.data[group]==0;
@@ -512,20 +513,21 @@ _FORCE = cached_force.ForceOperands(
     dt="f.dt",
 )
 
-_PREDICT = r"""    $PHYSICAL_DECL
+_PREDICT = r"""    $PHYSICAL_TABLE
 
     const int art=p.group_to_art.data[group];
     const int ds=p.art_dof_start.data[art],js=p.art_joint_start.data[art];
 #if defined(__CUDA_ARCH__)
-    const int lane=$LANE,stride=$STRIDE;
-    $PRED_SCRATCH_DECL
+    const int lane=LANE,stride=STRIDE;
+    __shared__ float s_all[$PRED_SCRATCH*$PACK];__shared__ int nonzero_all[$PACK];
+    float* s=s_all+SUB*$PRED_SCRATCH;int& nonzero=nonzero_all[SUB];
 #else
     const int lane=0,stride=1;
     float s[$PRED_SCRATCH];int nonzero=0;
 #endif
     if(lane==0)nonzero=0;
 $CLOCK0#if defined(__CUDA_ARCH__)
-    $SYNC;
+    SYNC();
 #endif
     for(int local=lane;local<$BODIES;local+=stride) {
         const int body=p.joint_child.data[js+local];
@@ -544,7 +546,7 @@ $CLOCK0#if defined(__CUDA_ARCH__)
         }
     }
 #if defined(__CUDA_ARCH__)
-    $SYNC;
+    SYNC();
 #endif
 $CLOCK1$REDUCE
     for(int i=lane;i<$DOFS;i+=stride) {
@@ -555,7 +557,7 @@ $CLOCK1$REDUCE
         s[$SIX_BODIES+i]=value;
     }
 #if defined(__CUDA_ARCH__)
-    $SYNC;
+    SYNC();
 #endif
 $CLOCK2    $FORWARD_STAGE
 $CLOCK3    for(int col=lane;col<$DOFS;col+=stride) {
@@ -573,7 +575,7 @@ $CLOCK3    for(int col=lane;col<$DOFS;col+=stride) {
         }
     }
 #if defined(__CUDA_ARCH__)
-    $SYNC;
+    SYNC();
 #endif
 $CLOCK4    // A prescribed (kinematic) free root keeps its given velocity: no transport.
     $TRANSPORT_BLOCK
@@ -588,7 +590,7 @@ _LEVEL_REDUCE = r"""    for(int level=$LAST_PARENT;level>=0;--level) {
             }
         }
 #if defined(__CUDA_ARCH__)
-        $SYNC;
+        SYNC();
 #endif
     }
 """
@@ -613,19 +615,19 @@ _INTERVAL_REDUCE = (
         w[0]=dfs_body>=0?s[slot]:0.0f;
         #pragma unroll
         for(int b=1;b<$WINDOWS;++b){
-            const float t=__shfl_down_sync($MASK,w[b-1],1<<(b-1)$SHFL);
+            const float t=__shfl_down_sync(MASK,w[b-1],1<<(b-1),WIDTH);
             w[b]=w[b-1]+(lane+(1<<(b-1))<$LANES?t:0.0f);
         }
         float sum=0.0f;
         int offset=lane;
         #pragma unroll
         for(int b=$WINDOWS-1;b>=0;--b){
-            const float t=__shfl_sync($MASK,w[b],offset$SHFL);
+            const float t=__shfl_sync(MASK,w[b],offset,WIDTH);
             if((dfs_len>>b)&1){sum+=t;offset+=1<<b;}
         }
         if(dfs_body>=0)s[slot]=sum;
     }
-    $SYNC;
+    SYNC();
     }
 #else
 """
@@ -641,7 +643,7 @@ _INTERVAL_REDUCE = (
 _TWIST_BLOCK = r"""
 #if defined(__CUDA_ARCH__)
     if(f.publish_twists!=0) {
-        $SYNC;
+        SYNC();
         float tw[6]={};
         if(lane<$BODIES) {
             const int first=ds+plan.body_dof_start.data[lane],count=plan.body_dof_count.data[lane];
@@ -655,8 +657,8 @@ _TWIST_BLOCK = r"""
         for(int round=0;round<$ROUNDS;++round) {
             const int source=twist_parent>=0?twist_parent:lane;
             float ptw[6];
-            for(int k=0;k<6;++k)ptw[k]=__shfl_sync($MASK,tw[k],source$SHFL);
-            const int next=__shfl_sync($MASK,twist_parent,source$SHFL);
+            for(int k=0;k<6;++k)ptw[k]=__shfl_sync(MASK,tw[k],source,WIDTH);
+            const int next=__shfl_sync(MASK,twist_parent,source,WIDTH);
             if(twist_parent>=0)for(int k=0;k<6;++k)tw[k]+=ptw[k];
             twist_parent=twist_parent>=0?next:-1;
         }
@@ -677,21 +679,22 @@ _EXTERNAL_REDUCE = r"""    if(nonzero)for(int level=$LAST_PARENT;level>=0;--leve
             }
         }
 #if defined(__CUDA_ARCH__)
-        $SYNC;
+        SYNC();
 #endif
     }
 """
 
 
-# The default form, which CUDA owners launch, keeps the scratch in shared
-# memory. Its CPU branch never links: Warp's CPU JIT links only a curated C
-# runtime subset, without malloc and free. That branch and the free in
-# _release stay verbatim because this text is part of every CUDA tree kernel's
-# content hash (its kernel-cache key). An owner on the CPU builds the
-# host=True form below.
+# The default form, which CUDA owners launch, keeps one tree's state block in
+# shared memory; packed trees take consecutive blocks of one array. Its CPU
+# branch never links: Warp's CPU JIT links only a curated C runtime subset,
+# without malloc and free. That branch and the free in _release stay verbatim
+# because this text is part of every CUDA tree kernel's content hash (its
+# kernel-cache key). An owner on the CPU builds the host=True form below.
 _STORAGE_SOURCE = r"""
 #if defined(__CUDA_ARCH__)
-    $STATE_SCRATCH_DECL
+    __shared__ float values[$TOTAL*$PACK];
+    return reinterpret_cast<uint64_t>(values+SUB*$TOTAL);
 #else
     return reinterpret_cast<uint64_t>(malloc($TOTAL*sizeof(float)));
 #endif
@@ -704,7 +707,8 @@ _STORAGE_SOURCE = r"""
 # direct-construction tests build CPU owners.
 _HOST_STORAGE_SOURCE = r"""
 #if defined(__CUDA_ARCH__)
-    $STATE_SCRATCH_DECL
+    __shared__ float values[$TOTAL*$PACK];
+    return reinterpret_cast<uint64_t>(values+SUB*$TOTAL);
 #else
     static float values[$TOTAL];return reinterpret_cast<uint64_t>(values);
 #endif
@@ -714,7 +718,7 @@ _HOST_STORAGE_SOURCE = r"""
 def _host_storage(layout):
     """Return the scratch of an owner on the CPU, which the kernels release with ``_keep_static``."""
 
-    @wp.func_native(layout.render(_HOST_STORAGE_SOURCE))
+    @wp.func_native(layout.render(THREADS + _HOST_STORAGE_SOURCE))
     def _storage() -> wp.uint64: ...
 
     return _storage
@@ -735,6 +739,38 @@ _STORE_TERMS_SOURCE = r"""
             t[4+3*i+j]=inertia.data[i][j]+mass*((i==j?wp::dot(radius,radius):0.0f)-radius[i]*radius[j]);
     }
 """
+
+
+def _native_clocks(clocked, owner, *, stages, column):
+    """Return a native's cycle-counter fragments ``CLOCK0`` to ``CLOCK<stages>``, empty unless ``clocked``.
+
+    Each fragment reads the cycle counter at a stage boundary; the last also
+    writes lane 0's ``stages`` stage durations to ``<owner>.stage_clocks[group,
+    column:column + stages]``.
+    """
+    if not clocked:
+        return {f"CLOCK{k}": "" for k in range(stages + 1)}
+    copies = ",".join(f"c{k}=c0" for k in range(1, stages + 1))
+    fragments = {"CLOCK0": f"#if defined(__CUDA_ARCH__)\n    long long c0=clock64(),{copies};\n#endif\n"}
+    for k in range(1, stages + 1):
+        fragments[f"CLOCK{k}"] = f"#if defined(__CUDA_ARCH__)\n    c{k}=clock64();\n#endif\n"
+    durations = "".join(f"o[{k}]=c{k + 1}-c{k};" for k in range(stages))
+    fragments[f"CLOCK{stages}"] += (
+        f"#if defined(__CUDA_ARCH__)\n    if(lane==0&&{owner}.stage_clocks.shape[0]>group){{long long* o={owner}.stage_clocks.data"
+        f"+group*{owner}.stage_clocks.shape[1]+{column};{durations}}}\n#endif\n"
+    )
+    return fragments
+
+
+def _current_valid(layout):
+    """Native statement marking the group's articulations current when no stage reported a failure."""
+    if not layout.forest:
+        return "cache.current_valid.data[p.group_to_art.data[group]]=cache.status.data[group]==0;"
+    roots = len(layout.roots)
+    return (
+        f"for(int r=0;r<{roots};++r)"
+        f"cache.current_valid.data[plan.arts.data[group*{roots}+r]]=cache.status.data[group]==0;"
+    )
 
 
 @functools.cache
@@ -758,32 +794,27 @@ def get_helpers(
     """
     plan_type = tree_chain_scan.ChainPlan if chain_scan else KineticPlan
     # A warp-sized layout scans in registers through shuffles; two-warp layouts
-    # keep the shared-memory jump table.
+    # keep the shared-memory jump table. Chain plans address their threads directly.
     register_scan = not chain_scan and layout.lanes <= 32 and not reference
-    pose_source = layout.render(tree_chain_scan._POSE if chain_scan else _POSE_SHFL if register_scan else _POSE)
-    motion_source = layout.render(tree_chain_scan._MOTION if chain_scan else _MOTION_SHFL if register_scan else _MOTION)
-    interval_reduce = not chain_scan and layout.lanes <= 32 and not reference
-    reduction = (
-        tree_chain_scan.reduction_source(moments=True, layout=layout)
-        if chain_scan
-        else layout.render(_INTERVAL_REDUCE if interval_reduce else _LEVEL_REDUCE)
+    if chain_scan:
+        pose_source = layout.render(tree_chain_scan._POSE)
+        motion_source = layout.render(tree_chain_scan._MOTION)
+        reduction = tree_chain_scan.reduction_source(moments=True, layout=layout)
+    else:
+        pose_source = layout.render(THREADS + (_POSE_SHFL if register_scan else _POSE))
+        motion_source = layout.render(THREADS + (_MOTION_SHFL if register_scan else _MOTION))
+        reduction = _INTERVAL_REDUCE if register_scan else _LEVEL_REDUCE
+    collect_source = layout.render(
+        THREADS + _COLLECT,
+        PHYSICAL_TABLE=layout.physical_table(),
+        PHYSICAL_ROW=layout.physical("p.row.data[e]"),
+        PHYSICAL_COL=layout.physical("p.col.data[e]"),
+        REDUCE=reduction,
+        CURRENT_VALID=_current_valid(layout),
+        **_native_clocks(clocked, "cache", stages=3, column=13),
     )
-    collect_text = _COLLECT.replace("$REDUCE", reduction)
-    for k in range(4):
-        statement = ""
-        if clocked and k == 0:
-            statement = "#if defined(__CUDA_ARCH__)\n    long long c0=clock64(),c1=c0,c2=c0,c3=c0;\n#endif\n"
-        elif clocked:
-            statement = f"#if defined(__CUDA_ARCH__)\n    c{k}=clock64();\n#endif\n"
-        if clocked and k == 3:
-            statement += (
-                "#if defined(__CUDA_ARCH__)\n    if(lane==0&&cache.stage_clocks.shape[0]>group){long long* o=cache.stage_clocks.data"
-                "+group*cache.stage_clocks.shape[1]+13;o[0]=c1-c0;o[1]=c2-c1;o[2]=c3-c2;}\n#endif\n"
-            )
-        collect_text = collect_text.replace(f"$CLOCKC{k}", statement)
-    collect_source = layout.render(collect_text)
 
-    @wp.func_native(layout.render(_STORAGE_SOURCE))
+    @wp.func_native(layout.render(THREADS + _STORAGE_SOURCE))
     def _storage() -> wp.uint64: ...
 
     @wp.func_native(
@@ -1359,30 +1390,25 @@ def get_predictor_kernel(
     adds the predictor stage counters (see :func:`get_helpers`).
     """
     plan_type = tree_chain_scan.ChainPlan if chain_scan else KineticPlan
-    reduction = (
-        tree_chain_scan.reduction_source(moments=False, layout=layout)
-        if chain_scan
-        else layout.render(_EXTERNAL_REDUCE)
-    )
     if chain_scan:
-        reduction = "if(nonzero) {\n" + reduction + "}\n"
+        reduction = "if(nonzero) {\n" + tree_chain_scan.reduction_source(moments=False, layout=layout) + "}\n"
+    else:
+        reduction = _EXTERNAL_REDUCE
     inverse = response_operator.SparseInverseFactor(
         "d.W.data+group*$NNZ",
         response_operator.IndexedSupport(
             "$DOFS", "p.index.data", "p.inverse_count.data", "p.inverse_nodes.data", "$INVERSE_WIDTH"
         ),
     )
-    physical = (
-        f"{layout.dofs - 1}-$index"
-        if layout.permutation == tuple(range(layout.dofs - 1, -1, -1))
-        else "physical[$index]"
-    )
     operations = {
+        "PHYSICAL_TABLE": layout.physical_table(),
         "KINEMATIC_FLAG": str(int(BodyFlags.KINEMATIC)),
         "SHIFT": cached_force.shift_wrench(
             "input", "cache.com_offset.data[group*$BODIES+local]", "s[6*local+k]", "s[6*local+3+k]"
         ),
         "PROJECT": cached_force.project_wrench("f.S.data[dof]", "s[6*body+k]", "value"),
+        # Passive springs act on no root coordinate.
+        "SPRING_GUARD": f"i>={layout.root_dofs}" if not layout.forest else "plan.dof_passive.data[i]!=0",
         "PASSIVE": _FORCE.passive("plan.q_index.data[group*$DOFS+i]", "dof"),
         "VELOCITY": _FORCE.velocity("dof", "f.qdd.data[dof]"),
         "TRANSPORT_BLOCK": (
@@ -1397,9 +1423,9 @@ def get_predictor_kernel(
         ),
         "REDUCE": reduction,
         "TRANSPOSE_ACTION": inverse.transpose("col", "s[$WHITE+$index]"),
-        "RESPONSE_PHYSICAL": "$PHYSICAL_INDEX",
+        "RESPONSE_PHYSICAL": layout.physical("col"),
     }
-    forward = inverse.forward("row", f"s[$SIX_BODIES+{physical}]")
+    forward = inverse.forward("row", f"s[$SIX_BODIES+{layout.physical('$index')}]")
     operations["FORWARD_STAGE"] = (
         """for(int row=lane;row<$DOFS;row+=stride) {
         """
@@ -1408,7 +1434,7 @@ def get_predictor_kernel(
         s[$WHITE+row]=value;
     }
 #if defined(__CUDA_ARCH__)
-    $SYNC;
+    SYNC();
 #endif
 """
     )
@@ -1465,7 +1491,7 @@ def get_predictor_kernel(
             + "\n".join(parallel)
             + "\n#else\n"
             + "\n".join(serial)
-            + "\n#endif\n#if defined(__CUDA_ARCH__)\n$SYNC;\n#endif\n"
+            + "\n#endif\n#if defined(__CUDA_ARCH__)\nSYNC();\n#endif\n"
         )
         operations["TRANSPOSE_ACTION"] = "float value=s[$WHITE+col];"
         operations["RESPONSE_PHYSICAL"] = "col"
@@ -1478,24 +1504,7 @@ def get_predictor_kernel(
     elif response != "sparse":
         raise ValueError("Unknown held tree response representation")
     operations["TWIST_BLOCK"] = _TWIST_BLOCK if (layout.lanes <= 32 and not chain_scan) else ""
-    source = _PREDICT
-    for k in range(6):
-        statement = ""
-        if clocked and k == 0:
-            statement = (
-                "#if defined(__CUDA_ARCH__)\n    long long c0=clock64(),c1=c0,c2=c0,c3=c0,c4=c0,c5=c0;\n#endif\n"
-            )
-        elif clocked:
-            statement = f"#if defined(__CUDA_ARCH__)\n    c{k}=clock64();\n#endif\n"
-        if clocked and k == 5:
-            statement += (
-                "#if defined(__CUDA_ARCH__)\n    if(lane==0&&f.stage_clocks.shape[0]>group){long long* o=f.stage_clocks.data"
-                "+group*f.stage_clocks.shape[1]+8;o[0]=c1-c0;o[1]=c2-c1;o[2]=c3-c2;o[3]=c4-c3;o[4]=c5-c4;}\n#endif\n"
-            )
-        source = source.replace(f"$CLOCK{k}", statement)
-    for name, operation in operations.items():
-        source = source.replace("$" + name, operation)
-    source = layout.render(source)
+    source = layout.render(THREADS + _PREDICT, **operations, **_native_clocks(clocked, "f", stages=5, column=8))
 
     @wp.func_native(source)
     def native(

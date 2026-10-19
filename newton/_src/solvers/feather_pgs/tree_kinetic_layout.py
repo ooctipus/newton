@@ -6,6 +6,25 @@
 from dataclasses import dataclass
 from string import Template
 
+# Thread primitives of one tree's lane group, from its lane count alone. A tree
+# of LANES < 32 threads shares a warp with others (one per SUB) and
+# synchronizes, votes and shuffles within its MASK at width WIDTH; a tree of
+# 32 or 64 threads owns its block and uses block barriers and votes. A native
+# whose CUDA side uses LANE, STRIDE, SUB, MASK, WIDTH, SYNC(), ALL(p) or ANY(p)
+# starts with this prelude; names a native does not use compile away.
+THREADS = r"""
+#if defined(__CUDA_ARCH__)
+    constexpr int LANES=$LANES,WIDTH=LANES<32?LANES:32;
+    const unsigned MASK=(0xffffffffu>>(32-WIDTH))<<(threadIdx.x&(31&~(WIDTH-1)));
+    const int LANE=LANES<32?threadIdx.x&(LANES-1):threadIdx.x;
+    const int STRIDE=LANES<32?LANES:blockDim.x;
+    const int SUB=LANES<32?threadIdx.x/LANES:0;
+    auto SYNC=[&]{if constexpr(LANES<32)__syncwarp(MASK);else __syncthreads();};
+    auto ALL=[&](int p){if constexpr(LANES<32)return __all_sync(MASK,p);else return __syncthreads_and(p);};
+    auto ANY=[&](int p){if constexpr(LANES<32)return __any_sync(MASK,p);else return __syncthreads_or(p);};
+#endif
+"""
+
 
 @dataclass(frozen=True)
 class TreeLayout:
@@ -93,57 +112,29 @@ class TreeLayout:
         """Threads per block."""
         return 64 if self.lanes == 64 else 32
 
-    def render(self, source):
-        """Resolve named layout operands; never search for source statements."""
-        reverse = self.permutation == tuple(range(self.dofs - 1, -1, -1))
+    @property
+    def reverse(self):
+        """Whether factor coordinates run in reverse physical order."""
+        return self.permutation == tuple(range(self.dofs - 1, -1, -1))
 
-        def physical(index):
-            return f"{self.dofs - 1}-{index}" if reverse else f"physical[{index}]"
+    def physical(self, index):
+        """Native expression of the physical coordinate of factor coordinate ``index``.
 
-        if self.lanes < 32:
-            base = 31 & ~(self.lanes - 1)
-            mask = f"((0xffffffffu>>(32-{self.lanes}))<<(threadIdx.x&{base}))"
-            threads = {
-                "LANE": f"(threadIdx.x&{self.lanes - 1})",
-                "STRIDE": str(self.lanes),
-                "SUB": f"(threadIdx.x/{self.lanes})",
-                "MASK": mask,
-                "SYNC": f"__syncwarp({mask})",
-                "ALL": f"__all_sync({mask},",
-                "ANY": f"__any_sync({mask},",
-            }
-        else:
-            threads = {
-                "LANE": "threadIdx.x",
-                "STRIDE": "blockDim.x",
-                "SUB": "0",
-                "MASK": "0xffffffffu",
-                "SYNC": "__syncthreads()",
-                "ALL": "__syncthreads_and(",
-                "ANY": "__syncthreads_or(",
-            }
-        pred = 6 * self.bodies + 2 * self.dofs
-        total = self.origin_offset + 6 * len(self.roots)
-        if self.pack > 1:
-            scratch = {
-                "PRED_SCRATCH_DECL": f"__shared__ float s_all[{pred * self.pack}];__shared__ int nonzero_all[{self.pack}];"
-                f"float* s=s_all+{threads['SUB']}*{pred};int& nonzero=nonzero_all[{threads['SUB']}];",
-                "STATE_SCRATCH_DECL": f"__shared__ float values[{total * self.pack}];"
-                f"return reinterpret_cast<uint64_t>(values+{threads['SUB']}*{total});",
-            }
-        else:
-            # One tree per block keeps the original direct declarations (a
-            # pointer into a per-block array costs a measurable few percent).
-            scratch = {
-                "PRED_SCRATCH_DECL": f"__shared__ float s[{pred}];__shared__ int nonzero;",
-                "STATE_SCRATCH_DECL": f"__shared__ float values[{total}];return reinterpret_cast<uint64_t>(values);",
-            }
-        values = {
-            **threads,
-            **scratch,
+        A permutation other than the reverse order reads the table that
+        :meth:`physical_table` declares.
+        """
+        return f"{self.dofs - 1}-{index}" if self.reverse else f"physical[{index}]"
+
+    def physical_table(self):
+        """Native declaration of the factor-to-physical coordinate table :meth:`physical` reads."""
+        if self.reverse:
+            return ""
+        return f"constexpr int physical[{self.dofs}]={{{','.join(map(str, self.permutation))}}};"
+
+    def sizes(self):
+        """Every size a native template names, by its ``$NAME``."""
+        return {
             "LANES": self.lanes,
-            # Warp-shuffle scans: the shuffle width of a packed group (a full warp needs none).
-            "SHFL": f",{self.lanes}" if self.lanes < 32 else "",
             # Window sums of 1, 2, 4, ... lanes a lane group can hold (interval reductions).
             "WINDOWS": self.lanes.bit_length() if self.lanes <= 32 else 6,
             "PACK": self.pack,
@@ -164,25 +155,25 @@ class TreeLayout:
             "TOTAL": self.origin_offset + 6 * len(self.roots),
             "ROOT_COUNT": len(self.roots),
             "FREE_ROOTS": self.free_roots,
-            # Passive springs act on no root coordinate.
-            "SPRING_GUARD": f"i>={self.root_dofs}" if not self.forest else "plan.dof_passive.data[i]!=0",
-            "CURRENT_VALID": (
-                "cache.current_valid.data[p.group_to_art.data[group]]=cache.status.data[group]==0;"
-                if not self.forest
-                else f"for(int r=0;r<{len(self.roots)};++r)"
-                f"cache.current_valid.data[plan.arts.data[group*{len(self.roots)}+r]]=cache.status.data[group]==0;"
-            ),
             "WHITE": 6 * self.bodies + self.dofs,
             "PRED_SCRATCH": 6 * self.bodies + 2 * self.dofs,
-            "PHYSICAL_DECL": ""
-            if reverse
-            else f"constexpr int physical[{self.dofs}]={{{','.join(map(str, self.permutation))}}};",
-            "PHYSICAL_ROW": physical("p.row.data[e]"),
-            "PHYSICAL_COL": physical("p.col.data[e]"),
-            "PHYSICAL_INDEX": physical("col"),
             "FREE_ROOT": int(self.root_dofs == 6),
         }
-        return Template(source).substitute(values)
+
+    def render(self, source, **fragments):
+        """Fill a native template with the layout's sizes and the caller's code fragments.
+
+        The layout supplies sizes only. Each fragment is code its owner
+        composed, placed at the template's ``$NAME`` slot of the same name
+        after its own sizes are filled; one substitution pass places them all,
+        so no fragment is searched for, reordered or rewritten afterwards.
+        """
+        sizes = self.sizes()
+        clashes = sizes.keys() & fragments.keys()
+        if clashes:
+            raise ValueError(f"Native fragments shadow layout sizes: {sorted(clashes)}")
+        values = {name: Template(text).substitute(sizes) for name, text in fragments.items()}
+        return Template(source).substitute(sizes, **values)
 
 
 # The 44-body, 43-coordinate free-root chain the kernels were first written for;

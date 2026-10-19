@@ -7,6 +7,8 @@ Only tree traversal changes. All poses, common-origin motion, bias, moments,
 held-factor actions and publication retain their original physical meanings.
 """
 
+from string import Template
+
 import numpy as np
 import warp as wp
 
@@ -159,10 +161,13 @@ _COMPOSE_MOTION = r"""
     for(int k=0;k<6;++k)v[k]=pv[k]+v[k];
 """
 
-_MOTION = r"""
+_MOTION = (
+    r"""
     float* s=reinterpret_cast<float*>(address)+$MOTION;
     auto compose=[](float* v,float* a,const float* pv,const float* pa) {
-COMPOSE_MOTION
+"""
+    + _COMPOSE_MOTION
+    + r"""
     };
 #if defined(__CUDA_ARCH__)
     const int lane=threadIdx.x,body=p.chain_meta.data[5*lane];
@@ -214,63 +219,54 @@ COMPOSE_MOTION
         }
     }
 #endif
-""".replace("COMPOSE_MOTION", _COMPOSE_MOTION)
+"""
+)
 
-
-def reduction_source(*, moments, layout=REFERENCE_LAYOUT):
-    """Add light subtrees before an inclusive heavy-chain suffix; never subtract."""
-    address = f"(k<6?{layout.wrench_offset}+6*BODY+k:{layout.moment_offset}+13*BODY+k-6)" if moments else "(6*BODY+k)"
-    count = "(refresh?19:6)" if moments else "6"
-    vector = r"""
+# One stage loop of the CUDA subtree reduction over a fixed number of components.
+_VECTOR_REDUCTION = Template(r"""
     {
-    float values[COMPONENTS];
+    float values[$components];
     for(int stage=plan.chain_levels-1;stage>=0;--stage) {
         const bool active=body>=0&&level==stage;
         const int width=plan.stage_width.data[stage];
         #pragma unroll
-        for(int k=0;k<COMPONENTS;++k)values[k]=active?s[slot(body,k)]:0.0f;
+        for(int k=0;k<$components;++k)values[k]=active?s[slot(body,k)]:0.0f;
         if(active)for(int edge=first;edge<last;++edge) {
             const int child=plan.light_children.data[edge];
             #pragma unroll
-            for(int k=0;k<COMPONENTS;++k)values[k]+=s[slot(child,k)];
+            for(int k=0;k<$components;++k)values[k]+=s[slot(child,k)];
         }
         for(int offset=1;offset<width;offset*=2) {
             const bool combine=active&&position+offset<length;
             const int source=combine?((thread+offset)&31):(thread&31);
             #pragma unroll
-            for(int k=0;k<COMPONENTS;++k) {
+            for(int k=0;k<$components;++k) {
                 const float next=__shfl_sync(0xffffffffu,values[k],source,32);
                 if(combine)values[k]+=next;
             }
         }
         if(active) {
             #pragma unroll
-            for(int k=0;k<COMPONENTS;++k)s[slot(body,k)]=values[k];
+            for(int k=0;k<$components;++k)s[slot(body,k)]=values[k];
         }
         __syncthreads();
     }
     }
-"""
-    # Fixed component counts expose independent channels to the compiler. A
-    # runtime component-major loop serialized every shuffle chain and repeated
-    # the light-child list/address walk for all 6 or 19 channels. The new loop
-    # order preserves each channel's exact light-child and suffix-add order.
-    cuda = vector.replace("COMPONENTS", "6")
-    if moments:
-        cuda = "if(refresh) " + vector.replace("COMPONENTS", "19") + " else " + cuda
-    source = r"""
+""")
+
+_REDUCTION = Template(r"""
     {
-    auto slot=[](int body,int k){return ADDRESS;};
+    auto slot=[](int body,int k){return $address;};
 #if defined(__CUDA_ARCH__)
     const int thread=threadIdx.x,body=plan.chain_meta.data[5*thread];
     const int position=thread-plan.chain_meta.data[5*thread+1];
     const int length=plan.chain_meta.data[5*thread+2],level=plan.chain_meta.data[5*thread+3];
     const int first=body>=0?plan.light_offsets.data[body]:0;
     const int last=body>=0?plan.light_offsets.data[body+1]:0;
-VECTOR_REDUCTION
+$vector
 #else
     for(int stage=plan.chain_levels-1;stage>=0;--stage) {
-        for(int k=0;k<COMPONENTS;++k) {
+        for(int k=0;k<$components;++k) {
             float value[64]={},old[64];
             for(int thread=0;thread<64;++thread) {
                 const int body=plan.chain_meta.data[5*thread];
@@ -296,9 +292,17 @@ VECTOR_REDUCTION
     }
 #endif
     }
-"""
-    return (
-        source.replace("VECTOR_REDUCTION", cuda)
-        .replace("ADDRESS", address.replace("BODY", "body"))
-        .replace("COMPONENTS", count)
-    )
+""")
+
+
+def reduction_source(*, moments, layout=REFERENCE_LAYOUT):
+    """Add light subtrees before an inclusive heavy-chain suffix; never subtract."""
+    address = f"(k<6?{layout.wrench_offset}+6*body+k:{layout.moment_offset}+13*body+k-6)" if moments else "(6*body+k)"
+    # Fixed component counts expose independent channels to the compiler. A
+    # runtime component-major loop serialized every shuffle chain and repeated
+    # the light-child list/address walk for all 6 or 19 channels. The new loop
+    # order preserves each channel's exact light-child and suffix-add order.
+    vector = _VECTOR_REDUCTION.substitute(components=6)
+    if moments:
+        vector = "if(refresh) " + _VECTOR_REDUCTION.substitute(components=19) + " else " + vector
+    return _REDUCTION.substitute(address=address, vector=vector, components="(refresh?19:6)" if moments else "6")
