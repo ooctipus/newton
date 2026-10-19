@@ -57,33 +57,36 @@ def prepare_sensing_rows_kernel(
     position_matrix: wp.array2d[wp.vec3],
     position_weight: wp.array2d[float],
 ):
-    """Clear one sensing row's accumulated outputs and, given body transforms, update its transform.
+    """Clear one (row, column) entry of every accumulated output; column 0 also prepares its row.
 
-    Positions are cleared together with forces so that an entry never pairs a fresh force with a
-    stale position. One thread per row replaces a separate clear of each output.
+    Column 0 clears the row's totals and, given body transforms, updates the row's sensing transform.
+    One launch over rows x columns replaces a separate clear of each output, and consecutive threads
+    store consecutive columns of a row. Positions are cleared together with forces so that an entry
+    never pairs a fresh force with a stale position.
     """
-    tid = wp.tid()
-    if total_force:
-        total_force[tid] = wp.vec3(0.0)
-        total_force_friction[tid] = wp.vec3(0.0)
+    row, col = wp.tid()
     if force_matrix:
-        for col in range(force_matrix.shape[1]):
-            force_matrix[tid, col] = wp.vec3(0.0)
-            force_matrix_friction[tid, col] = wp.vec3(0.0)
-            position_matrix[tid, col] = wp.vec3(0.0)
-            position_weight[tid, col] = 0.0
+        force_matrix[row, col] = wp.vec3(0.0)
+        force_matrix_friction[row, col] = wp.vec3(0.0)
+        position_matrix[row, col] = wp.vec3(0.0)
+        position_weight[row, col] = 0.0
+    if col != 0:
+        return
+    if total_force:
+        total_force[row] = wp.vec3(0.0)
+        total_force_friction[row] = wp.vec3(0.0)
     if not body_q:
         return
-    index = indices[tid]
-    sensing_kind = sensing_kinds[tid]
+    index = indices[row]
+    sensing_kind = sensing_kinds[row]
     if sensing_kind == wp.static(_SENSING_KIND_BODY):
-        transforms[tid] = body_q[index]
+        transforms[row] = body_q[index]
     elif sensing_kind == wp.static(_SENSING_KIND_SHAPE):
         body_index = shape_body[index]
         if body_index >= 0:
-            transforms[tid] = wp.transform_multiply(body_q[body_index], shape_transform[index])
+            transforms[row] = wp.transform_multiply(body_q[body_index], shape_transform[index])
         else:
-            transforms[tid] = shape_transform[index]
+            transforms[row] = shape_transform[index]
 
 
 @wp.kernel(enable_backward=False)
@@ -729,10 +732,12 @@ class SensorContact:
             )
         if contacts.device != self.device:
             raise ValueError(f"Contacts device ({contacts.device}) does not match sensor device ({self.device}).")
-        # One launch clears every output row and, given body transforms, updates the sensing transforms.
+        # One launch over rows x counterpart columns clears every output and, given body
+        # transforms, updates the sensing transforms.
+        columns = self.force_matrix.shape[1] if self.force_matrix is not None else 1
         wp.launch(
             prepare_sensing_rows_kernel,
-            dim=len(self._sensing_indices),
+            dim=(len(self._sensing_indices), columns),
             inputs=[
                 self._sensing_indices,
                 self._sensing_kinds,
