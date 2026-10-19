@@ -3643,10 +3643,10 @@ class SolverFeatherPGS(SolverBase):
         whose double-buffered mass matrix the end of a refresh step clears (empty
         without a double buffer, where the ordinary route's stage 1 clears it), and
         ``contact_consumers.max_blocks`` the block cap of the launches over the
-        contact capacity (0: uncapped). ``measurements`` holds the
-        construction-time lane timings and, under ``pgs_solve_readout``, the
-        cumulative sweep counts (``solve_readout``), kept out of ``routes`` so that
-        two runs of one configuration compare equal. ``options`` records every constructor
+        contact capacity (0: uncapped). ``measurements`` holds the construction-time
+        lane timings and, under ``pgs_solve_readout``, the cumulative sweep counts
+        (``solve_readout``), kept out of ``routes`` so that two runs of one
+        configuration compare equal. ``options`` records every constructor
         option's requested, declared-default and applied value, captured once at
         construction; the applied value is the one in effect after construction's
         gates and clamps, off (``False``, ``0`` or ``"off"``) when the owner, tier
