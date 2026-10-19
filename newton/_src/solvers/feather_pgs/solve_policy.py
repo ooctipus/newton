@@ -530,6 +530,11 @@ class SolveReadoutRecord:
         """``{kernel key: route label}`` of the registered readout kernels."""
         return dict(self._labels)
 
+    @property
+    def skipped_passes(self) -> tuple[str, ...]:
+        """Solve passes that count the solves of worlds without rows as skipped (:meth:`register_skipped`)."""
+        return tuple(self._skipped)
+
     def summary(self) -> dict:
         """Read the counters and summarize every slot; this synchronizes with the device.
 

@@ -3634,7 +3634,8 @@ class SolverFeatherPGS(SolverBase):
         bodies, the friction law and the grouped-dynamics kernels, each with a
         reason; a size whose response the grouped kernel solves reports
         ``hinv_jt_kernel`` ``"grouped"``; ``routes.sweep.readout`` names the
-        sweep kernels that count their sweeps, and ``routes.sweep.exit_law`` the
+        sweep kernels that count their sweeps and the passes that count the solves
+        of worlds without rows as skipped, and ``routes.sweep.exit_law`` the
         sweeps that honor, decline or ignore ``pgs_velocity_change_tolerance``. The
         row builders (``contact_rows.builder_by_dof``) are those of the dense
         contact rows built outside the sweep: the parallel tiers build keyed rows'

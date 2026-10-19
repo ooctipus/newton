@@ -688,6 +688,9 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         self.assertEqual(counts["counted"], counted._solve_readout.kernels)
         summary = record["measurements"]["solve_readout"]
         self.assertEqual(summary["readout"], readout)
+        # The route record names the passes whose skipped solves the summary holds.
+        self.assertEqual(counts["skipped_passes"], [] if route.get("enters_rowless_worlds") else ["position"])
+        self.assertEqual([entry["pass"] for entry in summary["skipped"]], counts["skipped_passes"])
         for slot in summary["slots"]:
             with self.subTest(kernel=slot["kernel"]):
                 self.assertEqual(slot["budget"], BUDGET)

@@ -859,6 +859,8 @@ def _readout(solver, record) -> dict:
         "uncounted": uncounted if counted else [],
         # Variants that could not compile the requested trace count their sweeps without it.
         "declined": dict(sorted(solver._solve_policy_declined.items())) if solver.pgs_solve_readout == "trace" else {},
+        # Passes whose solves of worlds without rows, which the matrix-free sweeps do not enter, count as skipped.
+        "skipped_passes": list(solver._solve_readout.skipped_passes) if counted else [],
         "reason": reason,
     }
 

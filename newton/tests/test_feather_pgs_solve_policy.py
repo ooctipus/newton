@@ -740,6 +740,7 @@ class TestSolverReadoutOption(unittest.TestCase):
                 self.assertEqual((option["requested"], option["applied"], option["default"]), (requested, "off", "off"))
                 readout = selection["routes"]["sweep"]["readout"]
                 self.assertEqual((readout["mode"], readout["counted"], readout["uncounted"]), ("off", {}, []))
+                self.assertEqual(readout["skipped_passes"], [])
                 self.assertIn("off" if requested == "off" else "No sweep", readout["reason"])
                 self.assertNotIn("solve_readout", selection["measurements"])
                 law = selection["routes"]["sweep"]["exit_law"]
@@ -768,12 +769,12 @@ def _sweep_record(**fields):
     return record
 
 
-def _policy_solver(*, readout="sweeps", tolerance=0.0, declined=(), honored=(), **attributes):
-    """The solver attributes the sweep records read, counting the matrix-free kernel."""
+def _policy_solver(*, readout="sweeps", tolerance=0.0, declined=(), honored=(), skipped=("position",), **attributes):
+    """The solver attributes the sweep records read, counting the matrix-free kernel and its skipped solves."""
     return SimpleNamespace(
         pgs_solve_readout=readout,
         pgs_velocity_change_tolerance=tolerance,
-        _solve_readout=SimpleNamespace(kernels={"mf_gs_kernel": "mf_gs"}),
+        _solve_readout=SimpleNamespace(kernels={"mf_gs_kernel": "mf_gs"}, skipped_passes=tuple(skipped)),
         _solve_policy_declined=dict.fromkeys(declined, "mf_gs: the variant keeps the exact law"),
         _solve_policy_honored=dict.fromkeys(honored, "mf_gs"),
         **attributes,
@@ -823,6 +824,17 @@ class TestSweepPolicyRecords(unittest.TestCase):
         record = _sweep_record(driver="contact_then_internal")
         self.assertIn("once per launch", path_selection._readout(_policy_solver(), record)["reason"])
         self.assertIn("solves its worlds", path_selection._readout(_policy_solver(), _sweep_record())["reason"])
+
+    def test_records_name_the_passes_that_count_skipped_solves(self):
+        """Name the passes whose solves of worlds without rows count as skipped, and none without counted sweeps."""
+        record = _sweep_record()
+        for skipped in ((), ("position",), ("position", "velocity")):
+            with self.subTest(skipped=skipped):
+                readout = path_selection._readout(_policy_solver(skipped=skipped), record)
+                self.assertEqual(readout["skipped_passes"], list(skipped))
+        solver = _policy_solver()
+        solver._solve_readout = SimpleNamespace(kernels={}, skipped_passes=("position",))
+        self.assertEqual(path_selection._readout(solver, record)["skipped_passes"], [])
 
 
 if __name__ == "__main__":
