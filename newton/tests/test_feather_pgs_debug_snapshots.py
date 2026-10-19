@@ -15,6 +15,7 @@ warp reserves them in a fixed order (``WARP_SIZE``).
 """
 
 import ctypes
+import math
 import os
 import sys
 import unittest
@@ -39,6 +40,10 @@ DT = 1.0 / 240.0
 FRICTION_LAWS = {"patch": {}, "point": {"friction_anchor_beta": 0.0}}
 # Worlds of the compared scene: up to 26 live contacts per step, one warp's worth.
 COMPARED_WORLDS = 2
+# The scene's fixed-base arm leans this far (rad) off vertical with its tip sphere on the ground.
+# Hanging straight down, the tip's contact normal passes through both joint axes, so the normal
+# row has no joint Jacobian and every PGS iteration adds beta * depth / dt / cfm to its impulse.
+ARM_TILT = 0.5
 # Substeps replayed from captured graphs, after one eager warm-up substep.
 GRAPH_STEPS = 12
 # Driver node types (CUgraphNodeType) of a captured CUDA graph.
@@ -157,8 +162,12 @@ def _reservations(solver, contacts):
 
 
 def _scene(device, *, worlds):
-    """A fixed-base arm whose tip touches the ground, a floating two-link body and a free box, per world."""
+    """A fixed-base arm leaning its tip on the ground, a floating two-link body and a free box, per world."""
     builder = newton.ModelBuilder()
+    # Tilted by ARM_TILT, the straight arm (two 0.2 m links) puts its 0.03 m tip sphere on the ground.
+    mount = wp.transform(
+        wp.vec3(0.0, 0.0, 0.4 * math.cos(ARM_TILT) + 0.03), wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), ARM_TILT)
+    )
     for _world in range(worlds):
         builder.begin_world()
         parent, joints = -1, []
@@ -169,7 +178,7 @@ def _scene(device, *, worlds):
                     parent=parent,
                     child=body,
                     axis=newton.Axis.Y,
-                    parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.42 if link == 0 else -0.2), wp.quat_identity()),
+                    parent_xform=mount if link == 0 else wp.transform(wp.vec3(0.0, 0.0, -0.2), wp.quat_identity()),
                     target_ke=5.0,
                     target_kd=1.0,
                     velocity_limit=1.5,
@@ -439,7 +448,7 @@ class TestFeatherPGSDebugSnapshots(unittest.TestCase):
         _compared_scene and step it for up to GRAPH_STEPS + 1 substeps in split
         and matrix-free mode. On CUDA, contacts past the first warp reserve rows
         in a run-varying order, and the arms would then differ by their slot
-        order rather than by the flag; eight worlds put 97-104 contacts in four
+        order rather than by the flag; eight worlds put 104 contacts in four
         warps. The CPU checks the scene in split mode under both friction laws
         before any GPU runs it.
         """
@@ -449,6 +458,26 @@ class TestFeatherPGSDebugSnapshots(unittest.TestCase):
                 run = _rollout(model, snapshots=False, steps=GRAPH_STEPS + 1, **options)
                 self.assertGreater(min(run["contact_counts"]), 0)
                 self.assertLessEqual(max(run["contact_counts"]), WARP_SIZE, run["contact_counts"])
+
+    def test_compared_scene_stays_bounded(self):
+        """Keep the compared scene's joint speeds and impulses physical for as long as the captured test replays it.
+
+        The comparisons step a scene that rests and slides, not one that blows
+        up and magnifies any difference between the arms. Hanging straight down
+        with its tip 1 cm in the ground, the arm's normal row had no joint
+        Jacobian: its impulse reached 5.76e6 (12 iterations of
+        beta * depth / dt / cfm), and the warm start then spun the joints past
+        1,700 rad/s. The bounds are about twice the scene's peaks of 4.5 rad/s
+        (the floating body's tail) and 2.6 N s.
+        """
+        model = _compared_scene("cpu")
+        for label, options in _modes_and_laws("cpu").items():
+            with self.subTest(configuration=label):
+                run = _rollout(model, snapshots=False, steps=GRAPH_STEPS + 1, **options)
+                speed = max(float(np.abs(record["joint_qd"]).max()) for record in run["trajectory"])
+                impulse = max(float(np.abs(record["impulses"]).max()) for record in run["trajectory"])
+                self.assertLess(speed, 10.0, "largest joint speed")
+                self.assertLess(impulse, 10.0, "largest contact impulse")
 
     def test_flag_is_declared_as_a_diagnostic(self):
         """Declare the switch in the FeatherPGS registry as a diagnostic the solver reads."""
