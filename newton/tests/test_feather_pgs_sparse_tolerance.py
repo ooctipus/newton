@@ -3,12 +3,14 @@
 
 """Native sparse sweeps honor impulse-change and velocity-change tolerances for early exit."""
 
+import functools
 import unittest
 
 import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.kernels import pgs_solve_loop
 from newton._src.solvers.feather_pgs.solve_policy import TRACE_GRID
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 
@@ -16,13 +18,22 @@ TOLERANCE = TRACE_GRID[8]
 """The velocity tolerance of the tests, 1e-3 [m/s or rad/s], a point of the trace's grid."""
 
 
-def _build(device, worlds=8):
-    """Fixed-base revolute chains whose tips press spheres into the ground."""
+def _build(device, worlds=8, *, hip_pitch=False):
+    """Fixed-base revolute chains whose tips press spheres into the ground.
+
+    Each leg rolls at the hip and pitches at the knee, so the two feet's six contact rows meet five
+    coordinates: the Delassus matrix is singular and the rows' velocity targets are inconsistent, so
+    a sweep drifts along its null space instead of settling. ``hip_pitch`` adds a pitch joint at each
+    hip; the six rows then meet seven coordinates and the sweep converges.
+    """
     builder = newton.ModelBuilder()
     shape_cfg = builder.default_shape_cfg.copy()
     shape_cfg.density = 0.0
     shape_cfg.mu = 0.7
     shapes = []
+    legs = ((newton.Axis.X, 0.0), (newton.Axis.Y, 0.0), (newton.Axis.Y, -0.25))
+    if not hip_pitch:
+        legs = (legs[0], legs[2])
     for _world in range(worlds):
         builder.begin_world()
         # A fixed-base torso with two legs: the branching keeps the mass factor sparse.
@@ -37,14 +48,14 @@ def _build(device, worlds=8):
         ]
         for side in (-1.0, 1.0):
             parent = torso
-            for link in range(2):
+            for link, (axis, drop) in enumerate(legs):
                 body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.05), lock_inertia=True)
-                offset = wp.vec3(0.0, 0.15 * side, 0.0) if link == 0 else wp.vec3(0.0, 0.0, -0.25)
+                offset = wp.vec3(0.0, 0.15 * side, 0.0) if link == 0 else wp.vec3(0.0, 0.0, drop)
                 joints.append(
                     builder.add_joint_revolute(
                         parent=parent,
                         child=body,
-                        axis=newton.Axis.Y if link else newton.Axis.X,
+                        axis=axis,
                         parent_xform=wp.transform(offset, wp.quat_identity()),
                     )
                 )
@@ -77,6 +88,68 @@ def _build(device, worlds=8):
     return model, contacts
 
 
+def _first_solve_changes(model, contacts, sweeps, dt=0.005):
+    """Replay the rollouts' first solve on the CPU, one sweep at a time; return each world's largest change per sweep.
+
+    The CPU split route assembles the rows the native sparse sweep solves (Delassus matrix, right-hand
+    side and diagonal, from the rollouts' first state), and its dense loop kernel applies the same
+    sweep law, one sweep per launch. Row ``i``'s impulse change times ``A_ii`` is the velocity-scaled
+    change the trace records; the result has shape ``[world_count, sweeps]``.
+    """
+    solver = SolverFeatherPGS(model, pgs_mode="split", pgs_iterations=1, friction_anchor_beta=0.0)
+    state_in, state_out = model.state(), model.state()
+    state_in.joint_qd.fill_(0.3)
+    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+    solver.step(state_in, state_out, model.control(), contacts, dt)
+    impulses = wp.zeros_like(solver.impulses)
+    counts, diagonal = solver.constraint_count.numpy(), solver.diag.numpy()
+    live = np.arange(diagonal.shape[1]) < counts[:, None]
+    previous = impulses.numpy().copy()
+    changes = np.zeros((len(counts), sweeps))
+    for sweep in range(sweeps):
+        wp.launch(
+            pgs_solve_loop,
+            dim=solver.world_count,
+            inputs=[
+                solver.constraint_count,
+                solver.dense_max_constraints,
+                solver.diag,
+                solver.C,
+                solver.rhs,
+                impulses,
+                1,
+                solver.pgs_omega,
+                solver.row_type,
+                solver.row_parent,
+                solver.row_mu,
+                0,
+                sweep,
+            ],
+            device=model.device,
+        )
+        current = impulses.numpy().copy()
+        changes[:, sweep] = np.where(live, np.abs(current - previous) * diagonal, 0.0).max(axis=1)
+        previous = current
+    return changes
+
+
+class TestSparseToleranceFixture(unittest.TestCase):
+    """The velocity-tolerance test's premise, replayed on the CPU twin of the sweep law."""
+
+    def test_first_solve_falls_within_the_tolerance_early(self):
+        """Fall within 1e-3 in every world well before the 64-sweep budget on legs that pitch at the hip.
+
+        The velocity-tolerance test stops these solves at their first sweep within 1e-3 and needs it
+        to come before the exact law stops. On legs without hip pitch the replay drifts instead, by
+        about 0.2 m/s every sweep, so neither law would stop within the budget.
+        """
+        model, contacts = _build("cpu", hip_pitch=True)
+        changes = _first_solve_changes(model, contacts, 64)
+        within = changes <= TOLERANCE
+        self.assertTrue(within.any(axis=1).all(), changes[:, -1])
+        self.assertLess(int(within.argmax(axis=1).max()) + 1, 32)
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "Native sparse factors are a CUDA path")
 class TestFeatherPGSSparseTolerance(unittest.TestCase):
     def _rollout(
@@ -89,9 +162,10 @@ class TestFeatherPGSSparseTolerance(unittest.TestCase):
         readout="off",
         steps=12,
         dt=0.005,
+        hip_pitch=False,
     ):
         device = wp.get_device("cuda:0")
-        model, contacts = _build(device)
+        model, contacts = _build(device, hip_pitch=hip_pitch)
         solver = SolverFeatherPGS(
             model,
             pgs_mode="split",
@@ -136,14 +210,17 @@ class TestFeatherPGSSparseTolerance(unittest.TestCase):
         Over a 12-step rollout a 1e-3 tolerance stays within 1e-2 of the exact law, executes no more
         sweeps, and stops only on final sweeps within the tolerance. On a first solve, identical in
         both runs, at a budget of 64 sweeps the tolerance stops each world exactly where the exact
-        law's trace predicts for 1e-3, which is earlier than the exact law.
+        law's trace predicts for 1e-3, which is earlier than the exact law. The legs pitch at the hip,
+        so the sweep converges (``TestSparseToleranceFixture`` replays that solve on the CPU); on
+        legs without it, it drifts and neither law stops within any budget.
         """
-        exact, _ = self._rollout(8)
-        counted, exact_solver = self._rollout(8, readout="sweeps")
+        rollout = functools.partial(self._rollout, hip_pitch=True)
+        exact, _ = rollout(8)
+        counted, exact_solver = rollout(8, readout="sweeps")
         np.testing.assert_array_equal(counted, exact)
-        again, _ = self._rollout(8, velocity_tolerance=0.0, readout="trace")
+        again, _ = rollout(8, velocity_tolerance=0.0, readout="trace")
         np.testing.assert_array_equal(again, exact)
-        loose, solver = self._rollout(8, velocity_tolerance=TOLERANCE, readout="trace")
+        loose, solver = rollout(8, velocity_tolerance=TOLERANCE, readout="trace")
         self.assertLess(float(np.abs(loose - exact).max()), 1.0e-2)
         law = solver.get_path_selection()["routes"]["sweep"]["exit_law"]
         self.assertEqual((law["law"], list(law["honored"].values())), ("velocity", ["sparse_pgs"]))
@@ -159,8 +236,8 @@ class TestFeatherPGSSparseTolerance(unittest.TestCase):
         self.assertLessEqual(beyond, trace["reasons"]["budget"])
 
         budget = 64
-        _, traced = self._rollout(budget, readout="trace", steps=1)
-        _, stopped = self._rollout(budget, velocity_tolerance=TOLERANCE, readout="trace", steps=1)
+        _, traced = rollout(budget, readout="trace", steps=1)
+        _, stopped = rollout(budget, velocity_tolerance=TOLERANCE, readout="trace", steps=1)
         (predicted,) = traced.get_path_selection()["measurements"]["solve_readout"]["slots"]
         (actual,) = stopped.get_path_selection()["measurements"]["solve_readout"]["slots"]
         point = TRACE_GRID.index(TOLERANCE)
@@ -172,7 +249,7 @@ class TestFeatherPGSSparseTolerance(unittest.TestCase):
         self.assertLess(actual["mean_sweeps"], predicted["mean_sweeps"])
         self.assertGreater(actual["trace"]["reasons"]["tolerance"], 0)
         with self.assertRaises(ValueError):
-            self._rollout(8, velocity_tolerance=-1.0)
+            rollout(8, velocity_tolerance=-1.0)
 
 
 if __name__ == "__main__":
