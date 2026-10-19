@@ -1893,6 +1893,76 @@ class TestPatchParallelRoutes(unittest.TestCase):
                         _rollout(model, solver, 1)
                     assert_row_builders_named(self, record, keys)
 
+    def test_keyed_linked_tiers_replay_alike_with_and_without_frame_reuse(self):
+        """Replay captured keyed linked-tier steps bit for bit whether a shared contact frame is kept or sorted again.
+
+        Patch friction runs keyed rows into the linked tiers by default, and a captured build that shares the
+        previous captured build's contact frame keeps its sorted pairs (``FEATHER_PGS_PATCH_FRAME_REUSE``, default
+        on). Neither the source A/B nor the tier probes ran the two together. A graph of one collision pass and two
+        substeps sorts its first build and keeps the second; under ``=0`` it sorts both. Frame reuse keeps the
+        patch state bitwise, so every replay must leave the same joint coordinates, velocities and impulses
+        under both settings.
+        """
+        from newton.tests.test_feather_pgs_patch_mechanism import _admitted_modes  # noqa: PLC0415
+        from newton.tests.unittest_utils import scoped_capture_after_gc  # noqa: PLC0415
+
+        model = standing_model()
+        dt = 1.0 / 240.0
+        replays = {}
+        for reuse in (None, "0"):
+            with (
+                patch.object(source, "_INK_ON", True),
+                patch.multiple(source, **ROW_SWITCHES_OFF),
+                patch.dict(os.environ, {_SWITCH: "1"}),
+            ):
+                for name in (
+                    "FEATHER_PGS_KEYED_ROWS",
+                    "FEATHER_PGS_PATCH_FRAME_REUSE",
+                    "FEATHER_PGS_PATCH_CONDITIONAL_NODES",
+                ):
+                    os.environ.pop(name, None)
+                if reuse is not None:
+                    os.environ["FEATHER_PGS_PATCH_FRAME_REUSE"] = reuse
+                solver = _matrix_free_solver(model, beta=0.2, parallel_rows=32, enable_joint_limits=True)
+                self.assertIsNotNone(solver._keyed_rows, solver.get_path_selection()["routes"]["contact_rows"])
+                tiers = solver.get_path_selection()["routes"]["sweep"]["tiers"]
+                self.assertEqual((tiers["family"], tiers["linked_rows"]), ("keyed_parallel", True))
+                self.assertEqual(solver._friction_patches.reuse_frames, reuse is None)
+                states, control = [model.state(), model.state()], model.control()
+                newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+                pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True)
+                contacts = pipeline.contacts()
+
+                def pair(states=states, solver=solver, pipeline=pipeline, contacts=contacts, control=control):
+                    """One collision pass, then two substeps that share its contact frame and return to states[0]."""
+                    pipeline.collide(states[0], contacts)
+                    for state, following in ((states[0], states[1]), (states[1], states[0])):
+                        state.clear_forces()
+                        solver.step(state, following, control, contacts, dt)
+
+                # Eager pairs load every kernel and buffer the graph launches; eager builds always sort.
+                for _ in range(2):
+                    pair()
+                outcomes = _admitted_modes(solver._friction_patches)
+                with scoped_capture_after_gc(device=model.device) as capture:
+                    pair()
+                self.assertEqual(outcomes, ["sort", "keep"] if reuse is None else ["sort", "sort"], reuse)
+                replays[reuse] = []
+                for _ in range(3):
+                    wp.capture_launch(capture.graph)
+                    replays[reuse].append(
+                        {
+                            "joint_q": states[0].joint_q.numpy(),
+                            "joint_qd": states[0].joint_qd.numpy(),
+                            "impulses": solver.impulses.numpy(),
+                        }
+                    )
+                self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0, "the feet must touch the ground")
+        self.assertTrue(np.any(replays[None][-1]["impulses"] != 0.0), "the feet must carry impulses")
+        for replay, (kept, sorted_every_build) in enumerate(zip(replays[None], replays["0"], strict=True)):
+            for name, value in kept.items():
+                np.testing.assert_array_equal(value, sorted_every_build[name], f"replay {replay}: {name}")
+
     def test_limited_linked_tiers_take_the_last_word_on_request(self):
         """Build the last-word pass into velocity-limited linked tiers only on request, record it, and hold the limit.
 
