@@ -7,6 +7,8 @@ from string import Template
 
 import warp as wp
 
+from .device_preludes import DevicePrelude
+
 
 @wp.func
 def friction_pair_candidate(
@@ -220,11 +222,13 @@ def get_pair_source(*, cpu=False):
     )
 
 
-FRICTION_PAIR_CUDA = get_pair_source()
+FRICTION_PAIR = DevicePrelude("friction_pair", get_pair_source())
+"""The bounded friction-pair law, ``friction_pair_candidate``, for native sweeps."""
 
 # A sparse sweep can retain this metric while residuals, impulses, and radius
 # change. Both entries use exactly the same bounded root and relaxation body.
-FRICTION_PAIR_CACHED_CUDA = (
+FRICTION_PAIR_CACHED = DevicePrelude(
+    "friction_pair_cached",
     """
     struct FrictionPairMetric { float scale, largest, smallest, vx, vy; };
     const auto friction_pair_metric = [](float a, float c, float d) {
@@ -244,5 +248,6 @@ FRICTION_PAIR_CACHED_CUDA = (
     + _FRICTION_PAIR_STATE_CUDA
     + """
     };
-"""
+""",
 )
+"""The same law split into ``friction_pair_metric`` and ``friction_pair_from_metric``."""

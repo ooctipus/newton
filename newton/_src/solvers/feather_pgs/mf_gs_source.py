@@ -7,7 +7,8 @@ import re
 from dataclasses import dataclass
 
 from .contact_torsion import torque_sweep_source
-from .friction import FRICTION_PAIR_CUDA
+from .device_preludes import DevicePrelude, cuda_native
+from .friction import FRICTION_PAIR
 from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
@@ -21,6 +22,11 @@ from .row_metadata import (
     _validate_dense_metadata_encoding,
 )
 from .velocity_limit_law import accumulated_update, check_velocity_limit_law
+
+# The dense-tile variant owns one fixed row phase; any other launch is a device error, never a different phase.
+_DENSE_TILE_ENTRY = DevicePrelude(
+    "dense_tile_entry", '    if (row_phase != 6 || defer_dense_response != 0) { asm("trap;"); return; }'
+)
 
 
 @dataclass(frozen=True)
@@ -1550,9 +1556,7 @@ def get_source(
         // is a fixed point, so subsequent sweeps are redundant.
 """
 
-    snippet = f"""
-#if defined(__CUDA_ARCH__)
-    const unsigned MASK = 0xFFFFFFFF;
+    snippet = f"""    const unsigned MASK = 0xFFFFFFFF;
     int lane = threadIdx.x;{held_entry}
 
     int m_dense = world_constraint_count.data[world];
@@ -1889,7 +1893,7 @@ def get_source(
     # array — a (1, 1) dummy when the fused clamp is off — and
     # fuse_vel_limits only gates the clamp code emission above.
 
-    snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
+    entry = ()
     if dense_support_tiles:
         # Keep the existing dense projector, but compile out phases this wrapper
         # cannot own. In particular no MF pipeline registers or row scan remain.
@@ -1928,12 +1932,7 @@ def get_source(
                 if snippet.count(old) != 1:
                     raise ValueError("Dense tile staging expected one velocity load/store loop")
                 snippet = snippet.replace(old, new)
-        # Invalid use is a device error, never a silently different row phase.
-        snippet = snippet.replace(
-            "#if defined(__CUDA_ARCH__)",
-            "#if defined(__CUDA_ARCH__)\n"
-            '    if (row_phase != 6 || defer_dense_response != 0) { asm("trap;"); return; }',
-            1,
-        )
+        entry = (_DENSE_TILE_ENTRY,)
 
+    snippet = cuda_native(snippet, preludes=(*entry, FRICTION_PAIR))
     return GeneratedSource(snippet, mf_phase if held_policy is not None else None, arena_offset if shared_arena else 0)

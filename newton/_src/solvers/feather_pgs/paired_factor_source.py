@@ -3,7 +3,8 @@
 
 """Share the paired GS recurrence through explicit representation entry and exit."""
 
-from .friction import FRICTION_PAIR_CUDA
+from .device_preludes import cuda_native
+from .friction import FRICTION_PAIR
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -535,4 +536,4 @@ def get_source(
 
 {exit_code}    for (int i = lane; i < m; i += 32) world_impulses.data[off + i] = s_lam[i];
 """
-    return "\n#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA + "\n" + body + "#endif\n"
+    return cuda_native(body + "#endif\n", preludes=(FRICTION_PAIR,))

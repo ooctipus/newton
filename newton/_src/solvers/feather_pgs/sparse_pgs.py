@@ -7,7 +7,8 @@ from functools import cache
 
 import warp as wp
 
-from .friction import FRICTION_PAIR_CACHED_CUDA, FRICTION_PAIR_CUDA
+from .device_preludes import cuda_native
+from .friction import FRICTION_PAIR, FRICTION_PAIR_CACHED
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -399,8 +400,7 @@ def _get_pgs_solve_sparse_kernel(
         mf_writeback = """
     for (int i = lane; i < mf_count; i += 32) mf_impulses.data[mf_offset + i] = mf_impulse[i];
 """
-    setup = f"""
-    __shared__ float delta_storage[{W * D}];
+    setup = f"""    __shared__ float delta_storage[{W * D}];
     __shared__ float impulse_storage[{W * M}];
     __shared__ float rhs_storage[{W * M}];
     __shared__ float diagonal_storage[{W * M}];
@@ -618,7 +618,7 @@ def _get_pgs_solve_sparse_kernel(
     sweep_finish = """
         if (global_iteration >= friction_start_iteration && __ballot_sync(MASK, changed != 0) == 0u) break;
 """
-    friction_source = FRICTION_PAIR_CUDA
+    friction = FRICTION_PAIR
     if contact_triplets:
         triplet_setup, triplet_update = _contact_triplet_code(
             M, S, Q, contact_type, friction_type, linked=linked_rows, active=active_rows
@@ -640,16 +640,14 @@ def _get_pgs_solve_sparse_kernel(
             "pair = friction_pair_cached(metric_slot, denominator,",
         )
         row_update = triplet_update + row_update
-        friction_source = FRICTION_PAIR_CACHED_CUDA
+        friction = FRICTION_PAIR_CACHED
     writeback = f"""
     for (int d = lane; d < {D}; d += {L}) factor_velocity_delta.data[world * {D} + d] = delta[d];
     for (int i = lane; i < count; i += {L}) world_impulses.data[offset + i] = impulse[i];
 {mf_writeback}
 """
-    snippet = (
-        "#if defined(__CUDA_ARCH__)\n"
-        + friction_source
-        + setup
+    snippet = cuda_native(
+        setup
         + f"""
     for (int iteration = 0; iteration < iterations; ++iteration) {{
         const int global_iteration = iteration_offset + iteration;
@@ -664,7 +662,9 @@ def _get_pgs_solve_sparse_kernel(
     }}
 {writeback}
 #endif
-"""
+""",
+        preludes=(friction,),
+        lead="",
     )
 
     @wp.func_native(snippet)

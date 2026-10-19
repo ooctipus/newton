@@ -62,7 +62,8 @@ from .contact_torsion import (
     prepare_torsion_velocity_pass,
     validate_torsion_step,
 )
-from .friction import FRICTION_PAIR_CUDA
+from .device_preludes import cuda_native
+from .friction import FRICTION_PAIR
 from .friction_patches import (
     _CHUNK_SORT_CAPACITY,
     _LIVE_SORT_CAPACITY,
@@ -19699,9 +19700,7 @@ def _get_pgs_solve_tiled_row_kernel(
         else:
             admission_code += f"    if (m <= {min_rows} && !unsupported) return;\n"
 
-    snippet = f"""
-#if defined(__CUDA_ARCH__)
-    const int TILE_M = {TILE_M};{stride_constant}
+    snippet = f"""    const int TILE_M = {TILE_M};{stride_constant}
     const int TILE_M_SQ = {TILE_M_SQ};
     const int TILE_TRI = {TILE_TRI};
     const unsigned MASK = 0xFFFFFFFF;
@@ -19815,7 +19814,7 @@ def _get_pgs_solve_tiled_row_kernel(
 #endif
 """
 
-    snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
+    snippet = cuda_native(snippet, preludes=(FRICTION_PAIR,))
 
     @wp.func_native(snippet)
     def pgs_solve_native(
@@ -20423,9 +20422,7 @@ def _get_pgs_solve_mf_kernel(
         else ""
     )
 
-    snippet = f"""
-#if defined(__CUDA_ARCH__)
-    const int MF_MAX_C = {MF_MAX_C};
+    snippet = f"""    const int MF_MAX_C = {MF_MAX_C};
     const int MAX_BODIES = {MAX_BODIES};
 
     int lane = threadIdx.x;
@@ -20638,7 +20635,7 @@ def _get_pgs_solve_mf_kernel(
 #endif
 """
 
-    snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
+    snippet = cuda_native(snippet, preludes=(FRICTION_PAIR,))
 
     @wp.func_native(snippet)
     def pgs_solve_mf_native(
@@ -21236,9 +21233,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
             }}
 """
 
-    snippet = f"""
-#if defined(__CUDA_ARCH__)
-    const int t = threadIdx.x;
+    snippet = f"""    const int t = threadIdx.x;
     const int warp_id = t >> 5;
     const int lane = t & 31;
     const int world = tile * {W} + warp_id;
@@ -21292,7 +21287,7 @@ def _get_pgs_solve_propagation_colored_warp_kernel(
 #endif
 """
 
-    snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
+    snippet = cuda_native(snippet, preludes=(FRICTION_PAIR,))
 
     @wp.func_native(snippet)
     def pgs_solve_propagation_colored_warp_native(
@@ -21706,9 +21701,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
     }}
 """
 
-    snippet = f"""
-#if defined(__CUDA_ARCH__)
-    const int world = tile;
+    snippet = f"""    const int world = tile;
     if (world >= world_count) return;
     int m = propagation_constraint_count.data[world];
     if (m > {M}) m = {M};
@@ -21741,7 +21734,7 @@ def _get_pgs_solve_propagation_colored_block_kernel(
 #endif
 """
 
-    snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
+    snippet = cuda_native(snippet, preludes=(FRICTION_PAIR,))
 
     @wp.func_native(snippet)
     def pgs_solve_propagation_colored_block_native(
@@ -21856,9 +21849,7 @@ def _get_pgs_solve_propagation_contact_kernel(
     contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
     friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
 
-    snippet = f"""
-#if defined(__CUDA_ARCH__)
-    const int lane = threadIdx.x & 31;
+    snippet = f"""    const int lane = threadIdx.x & 31;
     const int world = tile * {W} + (threadIdx.x >> 5);
     if (world >= world_count) return;
     int m = propagation_constraint_count.data[world];
@@ -22031,7 +22022,7 @@ def _get_pgs_solve_propagation_contact_kernel(
 #endif
 """
 
-    snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
+    snippet = cuda_native(snippet, preludes=(FRICTION_PAIR,))
 
     @wp.func_native(snippet)
     def pgs_solve_propagation_native(
@@ -22229,9 +22220,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
     friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
 
-    snippet = """
-#if defined(__CUDA_ARCH__)
-    const unsigned MASK = 0xffffffffu;
+    snippet = """    const unsigned MASK = 0xffffffffu;
     const int lane = threadIdx.x & 31;
     const int _slot = threadIdx.x >> 5;
     const int world = tile * __W__ + _slot;
@@ -23028,7 +23017,7 @@ def _get_pgs_solve_propagation_full_iteration_kernel(
     # array — a (1, 1) dummy when the fused clamp is off — and
     # fuse_vel_limits only gates the clamp code emission above.
 
-    snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
+    snippet = cuda_native(snippet, preludes=(FRICTION_PAIR,))
 
     @wp.func_native(snippet)
     def pgs_solve_propagation_full_iteration_native(
@@ -25798,9 +25787,7 @@ def _get_pgs_solve_local_owned_kernel(
         else """            const float factor_diagonal = s_L[i * {dofs} + i];
             response[i] = factor_diagonal != 0.0f ? value / factor_diagonal : 0.0f;"""
     ).format(dofs=dofs)
-    snippet = f"""
-#if defined(__CUDA_ARCH__)
-{group_setup}
+    snippet = f"""{group_setup}
     const int art = candidate_articulations.data[candidate];
     const int group = articulation_group_index.data[art];
     const int world = articulation_world.data[art];
@@ -25903,8 +25890,7 @@ def _get_pgs_solve_local_owned_kernel(
 {shared_cleanup}
 #endif
 """
-    if contact_capable:
-        snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
+    snippet = cuda_native(snippet, preludes=(FRICTION_PAIR,) if contact_capable else ())
     snippet = snippet.replace("__syncwarp();", "__syncwarp(MASK);")
 
     def pgs_solve_local_internal_signature(
@@ -27053,9 +27039,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 if (patch_load <= 0.0f) row += 2;
             }}"""
 
-    snippet = f"""
-#if defined(__CUDA_ARCH__)
-    const unsigned MASK = 0xffffffffu;
+    snippet = f"""    const unsigned MASK = 0xffffffffu;
     const int lane = threadIdx.x & 31;
     int row_count = world_constraint_count.data[world];
     if (row_count > {M}) row_count = {M};
@@ -27233,7 +27217,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
 {chr(10).join(limit_stores)}
 #endif
 """
-    snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
+    snippet = cuda_native(snippet, preludes=(FRICTION_PAIR,))
 
     @wp.func_native(snippet)
     def pgs_solve_sparse_diagonal_native(
@@ -27798,9 +27782,7 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
         else ""
     )
 
-    snippet = f"""
-#if defined(__CUDA_ARCH__)
-    const unsigned MASK = 0xFFFFFFFF;
+    snippet = f"""    const unsigned MASK = 0xFFFFFFFF;
     const int lane = threadIdx.x;
 
     int m_dense = world_constraint_count.data[world];
@@ -28022,7 +28004,7 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
 #endif
 """
 
-    snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\n" + FRICTION_PAIR_CUDA, 1)
+    snippet = cuda_native(snippet, preludes=(FRICTION_PAIR,))
 
     @wp.func_native(snippet)
     def pgs_solve_mf_gs_incremental_native(
