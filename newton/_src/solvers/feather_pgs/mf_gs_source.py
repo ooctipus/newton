@@ -197,11 +197,12 @@ def get_source(
         flag="iteration_changed",
         terms=(("delta_impulse_vlim", "denom", str(velocity_limit_type)),),
     )
+    # The fused clamp corrects a drive row's velocity limit, so the trace counts it as a velocity limit.
     drive_limit_vote = vote(
         solve_policy,
         "                    if (delta_fvl != 0.0f) iteration_changed = 1;",
         flag="iteration_changed",
-        terms=(("delta_fvl", "denom_fvl", str(int(PGS_CONSTRAINT_TYPE_JOINT_TARGET))),),
+        terms=(("delta_fvl", "denom_fvl", str(velocity_limit_type)),),
     )
     mf_vote = vote(
         solve_policy,

@@ -319,6 +319,19 @@ class TestVelocityExitLaw(unittest.TestCase):
                 self.assertEqual(body.count("solve_trace_sweep("), 1)
                 self.assertNotIn("0.001f", body)
 
+    def test_trace_names_the_fused_drive_clamp_a_velocity_limit(self):
+        """Trace the matrix-free sweep's fused drive velocity clamp under the velocity-limit kind, not the drive's."""
+        kernel = solver._get_pgs_solve_mf_gs_kernel.__wrapped__(
+            64, 32, 12, "120", has_drive_rows=True, fuse_vel_limits=True, solve_policy=TRACE
+        )
+        snippet = _policy_snippet(self, kernel, "solve_trace_sweep(")
+        velocity_limit = int(kernels.PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
+        self.assertEqual(TRACE_KINDS[velocity_limit], "velocity_limit")
+        records = [line.strip() for line in snippet.splitlines() if "solve_trace_change(fabsf(delta_fvl)" in line]
+        self.assertEqual(
+            records, [f"if (delta_fvl != 0.0f) solve_trace_change(fabsf(delta_fvl) * (denom_fvl), {velocity_limit});"]
+        )
+
     def test_variants_without_the_law_refuse_it(self):
         """Refuse the velocity law and trace where the matrix-free sweep keeps uncovered votes."""
         for options in ({"friction_mode": "bisection"}, {"contact_torsion": True}):
