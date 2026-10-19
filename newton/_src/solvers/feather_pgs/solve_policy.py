@@ -43,7 +43,6 @@ import numpy as np
 import warp as wp
 
 from .device_preludes import DevicePrelude
-from .kernels import PGS_CONSTRAINT_TYPE_COUNT
 from .row_inputs import RowArgument
 
 SOLVE_READOUTS = ("off", "sweeps", "trace")
@@ -56,12 +55,10 @@ TRACE_REASONS = ("stationary", "tolerance", "budget")
 """Exit reasons of a traced solve: no change, changes within the tolerance, or the sweep budget ran out."""
 
 TRACE_KINDS = ("contact", "drive", "friction", "joint_limit", "velocity_limit", "mimic", "connect", "torsion", "none")
-"""Row kinds of the trace's final-sweep change, by constraint type; ``"none"`` when no row changed."""
+"""Row kinds of the trace's final-sweep change, indexed by constraint type; ``"none"`` when no row changed."""
 
 TRACE_BINS = 26
 """Magnitude bins of the final-sweep change: 0 for exactly zero, then half decades from 1e-9 to 1e3."""
-
-assert len(TRACE_KINDS) == PGS_CONSTRAINT_TYPE_COUNT + 1
 
 
 class SolvePolicyUnsupported(ValueError):
@@ -84,22 +81,27 @@ class SolveReadout:
 
 @wp.struct
 class SolveTrace:
-    """Device counters of one sweep kernel under ``readout="trace"``."""
+    """Device counters of one sweep kernel under ``readout="trace"``.
+
+    The per-world counts are 32-bit like :class:`SolveReadout`'s; the
+    stopping, reason and final-change counts sum over every world, so they
+    are 64-bit and do not wrap within a training-length run.
+    """
 
     sweeps: wp.array2d[wp.int32]
     """Solves by executed sweeps and world, as :attr:`SolveReadout.sweeps`."""
     exhausted: wp.array[wp.int32]
     """Solves per world that ran out of budget, as :attr:`SolveReadout.exhausted`."""
-    stops: wp.array2d[wp.int32]
+    stops: wp.array2d[wp.int64]
     """Solves by grid tolerance and stopping sweep, shape ``[len(TRACE_GRID), rows + 1]``.
 
     Column ``k`` counts the solves whose largest velocity-scaled change first
     fell to the tolerance after sweep ``k``; the last column counts the solves
     for which it never did within their executed sweeps.
     """
-    reasons: wp.array[wp.int32]
+    reasons: wp.array[wp.int64]
     """Solves by exit reason (:data:`TRACE_REASONS`)."""
-    limits: wp.array2d[wp.int32]
+    limits: wp.array2d[wp.int64]
     """Final sweeps by the kind of their largest velocity-scaled change and its magnitude bin, ``[kinds, bins]``."""
 
 
@@ -135,7 +137,7 @@ SWEEP_TRACE = DevicePrelude(
             const int column = executed < columns - 1 ? executed : columns - 2;
             for (int point = 0; point < {len(TRACE_GRID)}; ++point) {{
                 if (((solve_trace_open >> point) & 1u) != 0u && change <= grid[point]) {{
-                    atomicAdd(&readout.stops.data[point * columns + column], 1);
+                    atomicAdd(reinterpret_cast<unsigned long long*>(&readout.stops.data[point * columns + column]), 1ull);
                     solve_trace_open &= ~(1u << point);
                 }}
             }}
@@ -144,7 +146,7 @@ SWEEP_TRACE = DevicePrelude(
         const int rows = readout.sweeps.shape[0];
         atomicAdd(&readout.sweeps.data[(executed < rows ? executed : rows - 1) * readout.sweeps.shape[1] + trace_world], 1);
         if (!stopped) atomicAdd(&readout.exhausted.data[trace_world], 1);
-        atomicAdd(&readout.reasons.data[stopped ? (change > 0.0f ? 1 : 0) : 2], 1);
+        atomicAdd(reinterpret_cast<unsigned long long*>(&readout.reasons.data[stopped ? (change > 0.0f ? 1 : 0) : 2]), 1ull);
         const int kinds = readout.limits.shape[0], bins = readout.limits.shape[1];
         const int kind_row = kind >= 0 && kind < kinds - 1 ? kind : kinds - 1;
         int bin = 0;
@@ -152,9 +154,10 @@ SWEEP_TRACE = DevicePrelude(
             bin = isfinite(change) ? static_cast<int>(floorf(2.0f * log10f(change))) + 19 : bins - 1;
             bin = bin < 1 ? 1 : (bin > bins - 1 ? bins - 1 : bin);
         }}
-        atomicAdd(&readout.limits.data[kind_row * bins + bin], 1);
+        atomicAdd(reinterpret_cast<unsigned long long*>(&readout.limits.data[kind_row * bins + bin]), 1ull);
         for (int point = 0; point < {len(TRACE_GRID)}; ++point)
-            if (((solve_trace_open >> point) & 1u) != 0u) atomicAdd(&readout.stops.data[point * columns + columns - 1], 1);
+            if (((solve_trace_open >> point) & 1u) != 0u)
+                atomicAdd(reinterpret_cast<unsigned long long*>(&readout.stops.data[point * columns + columns - 1]), 1ull);
     }};""",
 )
 """Device state and helpers of the trace; ``readout`` is the kernel's :class:`SolveTrace` operand."""
@@ -422,9 +425,9 @@ class SolveReadoutRecord:
         }
         operand = SolveReadout()
         if readout == "trace":
-            arrays["stops"] = wp.zeros((len(TRACE_GRID), rows + 1), dtype=wp.int32, device=device)
-            arrays["reasons"] = wp.zeros(len(TRACE_REASONS), dtype=wp.int32, device=device)
-            arrays["limits"] = wp.zeros((len(TRACE_KINDS), TRACE_BINS), dtype=wp.int32, device=device)
+            arrays["stops"] = wp.zeros((len(TRACE_GRID), rows + 1), dtype=wp.int64, device=device)
+            arrays["reasons"] = wp.zeros(len(TRACE_REASONS), dtype=wp.int64, device=device)
+            arrays["limits"] = wp.zeros((len(TRACE_KINDS), TRACE_BINS), dtype=wp.int64, device=device)
             operand = SolveTrace()
         for name, array in arrays.items():
             setattr(operand, name, array)

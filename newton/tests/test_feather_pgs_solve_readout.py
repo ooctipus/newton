@@ -65,9 +65,9 @@ def _trace(device, worlds, budget=BUDGET):
     operand = SolveTrace()
     operand.sweeps = wp.zeros((budget + 1, worlds), dtype=wp.int32, device=device)
     operand.exhausted = wp.zeros(worlds, dtype=wp.int32, device=device)
-    operand.stops = wp.zeros((len(TRACE_GRID), budget + 2), dtype=wp.int32, device=device)
-    operand.reasons = wp.zeros(len(TRACE_REASONS), dtype=wp.int32, device=device)
-    operand.limits = wp.zeros((len(TRACE_KINDS), 26), dtype=wp.int32, device=device)
+    operand.stops = wp.zeros((len(TRACE_GRID), budget + 2), dtype=wp.int64, device=device)
+    operand.reasons = wp.zeros(len(TRACE_REASONS), dtype=wp.int64, device=device)
+    operand.limits = wp.zeros((len(TRACE_KINDS), 26), dtype=wp.int64, device=device)
     return operand
 
 

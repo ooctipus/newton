@@ -19,7 +19,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import mf_dispatch, mf_gs_source, paired_factor_source, row_packets
+from newton._src.solvers.feather_pgs import kernels, mf_dispatch, mf_gs_source, paired_factor_source, row_packets
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver
 from newton._src.solvers.feather_pgs.device_preludes import ARCHITECTURE_GUARD
 from newton._src.solvers.feather_pgs.row_inputs import make_row_kernel
@@ -400,6 +400,50 @@ class TestSolveReadoutRecord(unittest.TestCase):
         self.assertAlmostEqual(trace["final_change"]["friction"]["at_most"]["p50"], 10.0**-0.5)
         self.assertAlmostEqual(trace["final_change_all"]["p99"], 10.0**-0.5)
         json.dumps(record.summary(), allow_nan=False)
+
+    def test_trace_totals_hold_counts_beyond_32_bits(self):
+        """Sum the trace's stopping, reason and final-change counts over every world without wrapping at 2**31.
+
+        16384 worlds solving a few times per step pass 2**31 solves within about 3e4 steps, a
+        training-length run; the per-world counts stay 32-bit.
+        """
+        record = SolveReadoutRecord(TRACE)
+        traced = SimpleNamespace(key="traced_kernel", _fpgs_solve_readout="trace")
+        record.register(traced, "sparse_pgs", world_count=16384, budget=8, device="cpu")
+        (operand,) = record.operands(traced)
+        self.assertEqual(
+            {name: getattr(operand, name).dtype for name in ("sweeps", "exhausted")},
+            dict.fromkeys(("sweeps", "exhausted"), wp.int32),
+        )
+        for name in ("stops", "reasons", "limits"):
+            self.assertEqual(getattr(operand, name).dtype, wp.int64, name)
+        total = 3 * 2**31
+        stops = np.zeros((len(TRACE_GRID), 10), dtype=np.int64)
+        stops[:, 9] = total
+        operand.stops.assign(stops)
+        operand.reasons.assign(np.array([0, 0, total], dtype=np.int64))
+        limits = np.zeros((len(TRACE_KINDS), TRACE_BINS), dtype=np.int64)
+        limits[0, 20] = total
+        operand.limits.assign(limits)
+        trace = record.summary()["slots"][0]["trace"]
+        self.assertEqual([row[-1] for row in trace["stops"]], [total] * len(TRACE_GRID))
+        self.assertEqual(trace["reasons"]["budget"], total)
+        self.assertEqual(trace["final_change"]["contact"]["count"], total)
+
+    def test_trace_kinds_name_every_constraint_type(self):
+        """Name every constraint type at its own index of the trace's kinds, followed by the kind of no change."""
+        names = {
+            kernels.PGS_CONSTRAINT_TYPE_CONTACT: "contact",
+            kernels.PGS_CONSTRAINT_TYPE_JOINT_TARGET: "drive",
+            kernels.PGS_CONSTRAINT_TYPE_FRICTION: "friction",
+            kernels.PGS_CONSTRAINT_TYPE_JOINT_LIMIT: "joint_limit",
+            kernels.PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT: "velocity_limit",
+            kernels.PGS_CONSTRAINT_TYPE_MIMIC: "mimic",
+            kernels.PGS_CONSTRAINT_TYPE_CONNECT: "connect",
+            kernels.PGS_CONSTRAINT_TYPE_TORSION: "torsion",
+        }
+        self.assertEqual(len(names), kernels.PGS_CONSTRAINT_TYPE_COUNT)
+        self.assertEqual(TRACE_KINDS, (*(names[kind] for kind in range(kernels.PGS_CONSTRAINT_TYPE_COUNT)), "none"))
 
 
 class TestSolverReadoutOption(unittest.TestCase):
