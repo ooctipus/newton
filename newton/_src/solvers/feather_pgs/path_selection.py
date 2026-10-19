@@ -818,11 +818,11 @@ def _velocity_limits(solver) -> dict:
             "Dedicated velocity-limit rows (the fused clamp needs matrix-free physx_pgs drives, a finite "
             "activation fraction and model joint velocity limits).",
         )
+    free_body_law, free_body_law_reason = _split_free_body_velocity_limit_law(solver)
     limits = bool(solver._has_rigid_body_velocity_limits)
     matrix_free = solver.pgs_mode == "matrix_free"
     model = solver.model
     prescale = solver.enable_joint_velocity_limits and model.joint_count > 0 and model.articulation_count > 0
-    free_body_law, free_body_law_reason = _split_free_body_velocity_limit_law(solver)
     return {
         "joint": joint,
         "reason": reason,
