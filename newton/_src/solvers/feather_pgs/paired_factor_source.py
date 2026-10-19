@@ -11,7 +11,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
-from .solve_policy import EXACT_POLICY, SolvePolicy, SolvePolicyUnsupported, sweep_exit
+from .solve_policy import EXACT_POLICY, SolvePolicy, sweep_exit, vote
 
 
 def _physical_entry(D, P, S, independent_components):
@@ -63,15 +63,17 @@ def _physical_exit(P, S, independent_components):
 """
 
 
-def _unit_walk(D, factor_rows, contact_type, friction_type, joint_limit_type, joint_velocity_limit_type):
+def _unit_walk(D, factor_rows, contact_type, friction_type, joint_limit_type, joint_velocity_limit_type, votes):
     """Sweep every row with the general branch's law, solving each unit's tangent pair once.
 
     A unit is a row and, when the next row is a tangent row naming it as its
     parent, that tangent pair. Patch contacts are units of one row, or of three
     when they own an anchor; the general branch visits a pair's second tangent
     row only to skip it. A tangent row outside a unit keeps that branch's law:
-    zeroed while friction is delayed, and otherwise left alone.
+    zeroed while friction is delayed, and otherwise left alone. ``votes`` holds
+    the change votes of the row and the two tangents (:func:`solve_policy.vote`).
     """
+    row_vote, tangent1_vote, tangent2_vote = votes
     return f"""        for (int i = 0; i < m;) {{
             const int row_type = static_cast<int>(s_type[i]);
             if (row_type == {friction_type}) {{
@@ -121,7 +123,7 @@ def _unit_walk(D, factor_rows, contact_type, friction_type, joint_limit_type, jo
                 }}
                 s_lam[i] = new_impulse;
                 if (delta_impulse != 0.0f) {{
-                    iteration_changed = 1;
+{row_vote}
                     factor_velocity += row_factor * delta_impulse;
                 }}
                 __syncwarp(MASK);
@@ -180,11 +182,11 @@ def _unit_walk(D, factor_rows, contact_type, friction_type, joint_limit_type, jo
             s_lam[tangent1] = new_tangent1;
             s_lam[tangent2] = new_tangent2;
             if (tangent2_delta != 0.0f) {{
-                iteration_changed = 1;
+{tangent2_vote}
                 factor_velocity += tangent2_factor * tangent2_delta;
             }}
             if (tangent1_delta != 0.0f) {{
-                iteration_changed = 1;
+{tangent1_vote}
                 factor_velocity += tangent1_factor * tangent1_delta;
             }}
             __syncwarp(MASK);
@@ -223,8 +225,6 @@ def get_source(
         raise ValueError("paired factor source requires positive capacity and two components spanning at most 32 DOFs")
     if contact_triples and contact_units:
         raise ValueError("contact triples and contact units are exclusive paired factor schedules")
-    if not solve_policy.exact or solve_policy.traces:
-        raise SolvePolicyUnsupported("The paired factor sweep keeps the exact law and the plain sweep count")
     W = 2
     contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
     friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
@@ -267,6 +267,23 @@ def get_source(
     def product(factor, row):
         return f"{factor} * factor_velocity"
 
+    def change_vote(indent, change, scale, kind):
+        return vote(
+            solve_policy,
+            " " * indent + "iteration_changed = 1;",
+            flag="iteration_changed",
+            terms=((change, scale, str(kind)),),
+        )
+
+    friction = friction_type
+    tangent_votes = [change_vote(16, f"tangent{k}_delta", f"s_diag[tangent{k}]", friction) for k in (1, 2)]
+    triple_tangent1_vote, triple_tangent2_vote = (
+        change_vote(20, f"tangent{k}_delta", f"s_diag[tangent{k}]", friction) for k in (1, 2)
+    )
+    prefix_vote = change_vote(20, "delta", "denom", "row_type")
+    normal_vote = change_vote(24, "normal_delta", "normal_denom", contact_type)
+    sibling_vote = change_vote(16, "sibling_delta", "s_diag[sibling]", friction)
+    general_vote = change_vote(16, "delta_impulse", "denom", "row_type")
     if contact_units:
         loads = f"""    for (int i = lane; i < m; i += 32) {{
         s_lam[i] = world_impulses.data[off + i];
@@ -276,7 +293,10 @@ def get_source(
     }}
 
 """
-        sweep = _unit_walk(D, factor_rows, contact_type, friction_type, joint_limit_type, joint_velocity_limit_type)
+        votes = (change_vote(20, "delta_impulse", "denom", "row_type"), *tangent_votes)
+        sweep = _unit_walk(
+            D, factor_rows, contact_type, friction_type, joint_limit_type, joint_velocity_limit_type, votes
+        )
     else:
         loads = f"""    int contact_start = dense_phase_bounds.data[world * 2 + 1];
     if (contact_start < 0) contact_start = 0;
@@ -322,7 +342,7 @@ def get_source(
                 const float delta = new_impulse - old_impulse;{fences[0]}
                 s_lam[i] = new_impulse;
                 if (delta != 0.0f) {{
-                    iteration_changed = 1;
+{prefix_vote}
                     factor_velocity += row_factor * delta;
                 }}
                 __syncwarp(MASK);
@@ -349,7 +369,7 @@ def get_source(
                     const float normal_delta = new_normal - old_normal;{fences[1]}
                     s_lam[normal] = new_normal;
                     if (normal_delta != 0.0f) {{
-                        iteration_changed = 1;
+{normal_vote}
                         factor_velocity += normal_factor * normal_delta;
                     }}
                 }}
@@ -404,11 +424,11 @@ def get_source(
                 s_lam[tangent1] = new_tangent1;
                 s_lam[tangent2] = new_tangent2;
                 if (tangent2_delta != 0.0f) {{
-                    iteration_changed = 1;
+{triple_tangent2_vote}
                     factor_velocity += tangent2_factor * tangent2_delta;
                 }}
                 if (tangent1_delta != 0.0f) {{
-                    iteration_changed = 1;
+{triple_tangent1_vote}
                     factor_velocity += tangent1_factor * tangent1_delta;
                 }}
                 __syncwarp(MASK);
@@ -503,11 +523,11 @@ def get_source(
             s_lam[i] = new_impulse;
 
             if (sibling_delta != 0.0f) {{
-                iteration_changed = 1;
+{sibling_vote}
                 factor_velocity += sibling_factor * sibling_delta;
             }}
             if (delta_impulse != 0.0f) {{
-                iteration_changed = 1;
+{general_vote}
                 factor_velocity += row_factor * delta_impulse;
             }}
             __syncwarp(MASK);

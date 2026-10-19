@@ -64,11 +64,26 @@ _SCALED_VOTES = {
         "fabsf(delta_impulse_vlim) * (denom)",
         "fabsf(delta_impulse_mf_vlim) * (1.0f / mf_diag)",
     ),
+    "paired": (
+        "fabsf(delta_impulse) * (denom)",
+        "fabsf(tangent1_delta) * (s_diag[tangent1])",
+        "fabsf(tangent2_delta) * (s_diag[tangent2])",
+    ),
+    "local": ("fabsf(delta_impulse) * (1.0f / inverse_diagonal)",),
+    "packets": (
+        "fabsf(delta_impulse) * (1.0f / inverse_diagonal)",
+        "fabsf(sibling_delta) * (sibling_inverse_diagonal > 0.0f ? 1.0f / sibling_inverse_diagonal : 0.0f)",
+    ),
     "sparse_diagonal": (
         "fabsf(delta_impulse) * (denominator)",
         "fabsf(sibling_delta) * (s_diag[sibling])",
         "fabsf(delta_impulse) * (normal_denom)",
         "fabsf(tangent1_delta) * (s_diag[tangent1])",
+    ),
+    "incremental": (
+        "fabsf(delta_impulse) * (s_diag[i])",
+        "fabsf(sib_delta) * (s_diag[sib])",
+        "fabsf(delta_impulse_vlim) * (s_diag[i])",
     ),
 }
 
@@ -280,11 +295,6 @@ class TestVelocityExitLaw(unittest.TestCase):
         """Replace every change vote of every policy factory by its velocity-scaled form at a positive tolerance."""
         for name, factory, args, kwargs in _factory_calls():
             with self.subTest(factory=name):
-                if name not in _SCALED_VOTES:
-                    for policy in (VELOCITY, TRACE):
-                        with self.assertRaises(SolvePolicyUnsupported):
-                            factory(*args, solve_policy=policy, **kwargs)
-                    continue
                 kernel = factory(*args, solve_policy=VELOCITY, **kwargs)
                 self.assertTrue(kernel.key.endswith("_vtol0p001"), kernel.key)
                 snippet = _policy_snippet(self, kernel, "0.001f")
@@ -298,8 +308,6 @@ class TestVelocityExitLaw(unittest.TestCase):
     def test_trace_records_every_vote_and_each_sweep(self):
         """Record each change before its vote and every sweep at its exit, under the exact law."""
         for name, factory, args, kwargs in _factory_calls():
-            if name not in _SCALED_VOTES:
-                continue
             with self.subTest(factory=name):
                 kernel = factory(*args, solve_policy=TRACE, **kwargs)
                 self.assertEqual(kernel._fpgs_solve_readout, "trace")

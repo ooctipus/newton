@@ -1847,8 +1847,8 @@ class SolverFeatherPGS(SolverBase):
                 entry also require every zero-impulse unilateral row to be violated by at most the
                 tolerance. On native sparse sweeps it adds to ``pgs_change_tolerance`` and
                 ``pgs_relative_change_tolerance``. Zero keeps the exact stationary-sweep exit. The
-                native sparse, sparse-diagonal and matrix-free Gauss-Seidel sweeps honor it, the last
-                one except under non-default friction modes or contact torsion; the other sweeps and
+                sweeps that ``pgs_solve_readout`` counts honor it, except the matrix-free sweep under
+                non-default friction modes or contact torsion; fixed-iteration and parallel sweeps and
                 launch-per-iteration drivers do not (``routes.sweep.exit_law``, with a warning).
                 Experimental. Defaults to 0.0.
             pgs_contact_regularization (float, optional): Dimensionless regularizer ``g`` of contact
@@ -25183,8 +25183,6 @@ def _get_pgs_solve_local_owned_kernel(
         raise ValueError("lanes_per_world must be 8, 16, or 32")
     if not contact_capable and paired_dof_count:
         raise ValueError("only single-articulation kernels may omit contact handling")
-    if not solve_policy.exact or solve_policy.traces:
-        raise SolvePolicyUnsupported("The local owners keep the exact law and the plain sweep count")
     if local_mf_max_constraints and (not contact_capable or not paired_dof_count or mf_max_constraints <= 0):
         raise ValueError("local MF rows require a contact-capable articulation pair and positive MF storage")
     max_rows = max_constraints
@@ -25372,6 +25370,27 @@ def _get_pgs_solve_local_owned_kernel(
         joint_limit_projection = "(joint_limit_rows & row_bit) != 0u && new_impulse < 0.0f"
         impulse_active = "(active_rows & (1u << row)) != 0u"
     iteration_setup = "        const int global_iteration = iteration_offset + iteration;" if contact_capable else ""
+    friction_kind = str(int(PGS_CONSTRAINT_TYPE_FRICTION))
+    # Contactless owners keep no row types in shared memory; their trace reads the stored type.
+    row_kind = "row_type" if contact_capable else "world_row_type.data[world_row_base + row]"
+
+    def local_vote(indent, change, scale, kind):
+        return vote(solve_policy, " " * indent + "changed = 1;", flag="changed", terms=((change, scale, kind),))
+
+    sibling_vote = local_vote(
+        24,
+        "sibling_delta",
+        "sibling_inverse_diagonal > 0.0f ? 1.0f / sibling_inverse_diagonal : 0.0f",
+        friction_kind,
+    )
+    mf_sibling_vote = local_vote(
+        24,
+        "sibling_delta_mf",
+        "sibling_inverse_diagonal_mf > 0.0f ? 1.0f / sibling_inverse_diagonal_mf : 0.0f",
+        friction_kind,
+    )
+    mf_main_vote = local_vote(16, "delta_impulse_mf", "1.0f / inverse_diagonal", "mf_row_type")
+    main_vote = local_vote(16, "delta_impulse", "1.0f / inverse_diagonal", row_kind)
     friction_gate = (
         f"""            if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}
                 && global_iteration < friction_start_iteration) {{
@@ -25462,7 +25481,7 @@ def _get_pgs_solve_local_owned_kernel(
                     const float sibling_delta = sibling_new - sibling_old;
                     s_lambda[sibling] = sibling_new;
                     if (sibling_delta != 0.0f) {{
-                        changed = 1;
+{sibling_vote}
                         {sibling_state_update}
                     }}
                 }}
@@ -25897,7 +25916,7 @@ def _get_pgs_solve_local_owned_kernel(
                     const float sibling_delta_mf = sibling_new_mf - sibling_old_mf;
                     s_mf_lambda[sibling_mf] = sibling_new_mf;
                     if (sibling_delta_mf != 0.0f) {{
-                        changed = 1;
+{mf_sibling_vote}
                         {mf_sibling_state_update}
                     }}
                 }}
@@ -25906,7 +25925,7 @@ def _get_pgs_solve_local_owned_kernel(
             const float delta_impulse_mf = new_impulse_mf - old_impulse_mf;
             s_mf_lambda[mf_row] = new_impulse_mf;
             if (delta_impulse_mf != 0.0f) {{
-                changed = 1;
+{mf_main_vote}
                 {mf_main_state_update}
             }}
             __syncwarp();
@@ -26018,7 +26037,7 @@ def _get_pgs_solve_local_owned_kernel(
             const float delta_impulse = new_impulse - old_impulse;
             s_lambda[row] = new_impulse;
             if (delta_impulse != 0.0f) {{
-                changed = 1;
+{main_vote}
                 {main_state_update}
             }}
 {row_sync}
@@ -27904,8 +27923,6 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
     MIN_ROWS = int(min_rows)
     if MIN_ROWS < 0 or MIN_ROWS >= AM:
         raise ValueError("min_rows must be in [0, incremental_rows)")
-    if not solve_policy.exact or solve_policy.traces:
-        raise SolvePolicyUnsupported("The incremental sweep keeps the exact law and the plain sweep count")
     ROW_TYPE_MASK = _DENSE_META_ROW_TYPE_MASK
     T_CONTACT = int(PGS_CONSTRAINT_TYPE_CONTACT)
     T_FRICTION = int(PGS_CONSTRAINT_TYPE_FRICTION)
@@ -27976,6 +27993,24 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
                     } else {
                         new_impulse = 0.0f;
                     }"""
+    vlim_vote = vote(
+        solve_policy,
+        "                    iteration_changed = 1;",
+        flag="iteration_changed",
+        terms=(("delta_impulse_vlim", "s_diag[i]", str(T_VLIM)),),
+    )
+    row_vote = vote(
+        solve_policy,
+        "                iteration_changed = 1;",
+        flag="iteration_changed",
+        terms=(("delta_impulse", "s_diag[i]", "s_type[i]"),),
+    )
+    sibling_vote = vote(
+        solve_policy,
+        "                iteration_changed = 1;",
+        flag="iteration_changed",
+        terms=(("sib_delta", "s_diag[sib]", str(T_FRICTION)),),
+    )
     vlim_pass = (
         f"""
         if (row_phase == 0 || row_phase == 2) {{
@@ -27989,7 +28024,7 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
                     s_app[i] += delta_impulse_vlim;
                 }}
                 if (delta_impulse_vlim != 0.0f) {{
-                    iteration_changed = 1;
+{vlim_vote}
                     for (int r = lane; r < n_rows_total; r += 32) s_res[r] += s_A[i * {AM} + r] * delta_impulse_vlim;
                 }}
                 __syncwarp();
@@ -28200,11 +28235,11 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
                 }}
             }}
             if (delta_impulse != 0.0f) {{
-                iteration_changed = 1;
+{row_vote}
                 for (int r = lane; r < n_rows_total; r += 32) s_res[r] += s_A[i * {AM} + r] * delta_impulse;
             }}
             if (sib_delta != 0.0f) {{
-                iteration_changed = 1;
+{sibling_vote}
                 for (int r = lane; r < n_rows_total; r += 32) s_res[r] += s_A[sib * {AM} + r] * sib_delta;
             }}
             __syncwarp();

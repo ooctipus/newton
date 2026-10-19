@@ -16,10 +16,12 @@ once.
 whose velocity-scaled changes fit the tolerance. Before that sweep it runs
 exactly the exact-law sweeps, so its outputs equal the exact law's at that
 budget, and the trace of an exact solve predicts that sweep for every grid
-tolerance.
+tolerance. On the solver routes the trace changes no result and records every
+solve once per grid tolerance, and a tolerance reaches every counted sweep.
 """
 
 import unittest
+import warnings
 from unittest import mock
 
 import numpy as np
@@ -201,6 +203,92 @@ class _SparseCase:
         return list(zip(self.delta.numpy(), self.impulses.numpy(), strict=True))
 
 
+class _LocalCase:
+    """A local owner's three-coordinate problem: world 0 owns a mimic and a joint-limit row, world 1 is not owned."""
+
+    def __init__(self, device):
+        dofs, rows, local_rows = 3, 4, 2
+        self.shape, self.device, self.worlds = (rows, local_rows, dofs), device, 2
+        lower = np.array([[2.0, 0.0, 0.0], [0.25, 1.5, 0.0], [-0.1, 0.2, 1.25]], dtype=np.float32)
+        jacobian = np.zeros((2, rows, dofs), dtype=np.float32)
+        jacobian[0, 0] = [1.0, 0.5, -0.25]
+        jacobian[0, 1] = [-0.4, 0.3, 0.8]
+        jacobian[1, 0] = [0.2, -0.1, 0.7]
+        rhs = np.zeros((2, rows), dtype=np.float32)
+        rhs[0, :2] = [-0.2, 0.15]
+        cfm = np.zeros((2, rows), dtype=np.float32)
+        cfm[0, :2] = [0.01, 0.02]
+        row_type = np.zeros((2, rows), dtype=np.int32)
+        row_type[0, :2] = [PGS_CONSTRAINT_TYPE_MIMIC, PGS_CONSTRAINT_TYPE_JOINT_LIMIT]
+        row_type[1, 0] = PGS_CONSTRAINT_TYPE_MIMIC
+        candidates = wp.array([0, 1], dtype=wp.int32, device=device)
+        lower_group = wp.array(np.stack([lower, np.eye(dofs, dtype=np.float32)]), dtype=wp.float32, device=device)
+        jacobian_group = wp.array(jacobian, dtype=wp.float32, device=device)
+        # Outputs: the diagonal (initially the compliance), the impulses and the articulations' velocities.
+        self.initial = (
+            wp.array(cfm, dtype=wp.float32, device=device),
+            wp.zeros((2, rows), dtype=wp.float32, device=device),
+            wp.array([0.3, -0.5, 0.1, 9.0, 8.0, 7.0], dtype=wp.float32, device=device),
+        )
+        self.outputs = tuple(wp.clone(array) for array in self.initial)
+        self.inputs = [
+            candidates,
+            candidates,
+            PGS_LOCAL_SOLVE_OWNER_SINGLE,
+            wp.array([0, 1], dtype=wp.int32, device=device),
+            wp.array([0, 1], dtype=wp.int32, device=device),
+            wp.array([0, 3], dtype=wp.int32, device=device),
+            # World 1 belongs to another owner: its solve returns before any sweep.
+            wp.array([PGS_LOCAL_SOLVE_OWNER_SINGLE, 0], dtype=wp.int32, device=device),
+            wp.array([2, 1], dtype=wp.int32, device=device),
+            lower_group,
+            jacobian_group,
+            lower_group,
+            jacobian_group,
+            wp.array(rhs, dtype=wp.float32, device=device),
+            wp.array(row_type, dtype=wp.int32, device=device),
+            wp.full((2, rows), -1, dtype=wp.int32, device=device),
+            wp.zeros((2, rows), dtype=wp.float32, device=device),
+            wp.zeros(2, dtype=wp.int32, device=device),
+            wp.zeros((2, 4), dtype=wp.int32, device=device),
+            wp.zeros((2, 1), dtype=wp.float32, device=device),
+            *[wp.zeros((2, 1, 6), dtype=wp.float32, device=device) for _ in range(4)],
+            wp.zeros((2, 1), dtype=wp.float32, device=device),
+            0,
+            wp.zeros((2, rows), dtype=wp.float32, device=device),
+            wp.zeros((2, 1), dtype=wp.float32, device=device),
+        ]
+
+    def kernel(self, policy=None):
+        options = {} if policy is None else {"solve_policy": policy}
+        return _get_pgs_solve_local_owned_kernel(*self.shape, self.device.arch, **options)
+
+    def run(self, kernel, iterations, *extra):
+        """Restore the initial diagonal, impulses and velocities and solve."""
+        for output, initial in zip(self.outputs, self.initial, strict=True):
+            wp.copy(output, initial)
+        wp.launch_tiled(
+            kernel,
+            dim=[self.worlds],
+            inputs=[*self.inputs, iterations, 1.0, 0, 0],
+            outputs=[*self.outputs, *extra],
+            block_dim=32,
+            device=self.device,
+        )
+
+    def read(self):
+        """Per-world outputs: the impulses, the articulation's velocities and the diagonal."""
+        diagonal, impulses, velocities = (array.numpy() for array in self.outputs)
+        return [(impulses[world], velocities[3 * world : 3 * world + 3], diagonal[world]) for world in range(2)]
+
+
+def _assert_bitwise(actual, expected):
+    """Check per-world outputs bitwise equal."""
+    for actual_world, expected_world in zip(actual, expected, strict=True):
+        for actual_array, expected_array in zip(actual_world, expected_world, strict=True):
+            np.testing.assert_array_equal(actual_array, expected_array)
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "Native Gauss-Seidel sweeps run on CUDA")
 class TestSolveReadoutKernels(unittest.TestCase):
     """Counts of single kernels against the stationary-sweep rule, replayed at every budget."""
@@ -308,86 +396,46 @@ class TestSolveReadoutKernels(unittest.TestCase):
 
     def test_local_counts_sweeps_to_the_stationary_exit(self):
         """Count only the owned world's sweeps to its first stationary sweep, with bitwise outputs."""
-        device = wp.get_cuda_device()
-        dofs, rows, local_rows = 3, 4, 2
-        lower = np.array([[2.0, 0.0, 0.0], [0.25, 1.5, 0.0], [-0.1, 0.2, 1.25]], dtype=np.float32)
-        jacobian = np.zeros((2, rows, dofs), dtype=np.float32)
-        jacobian[0, 0] = [1.0, 0.5, -0.25]
-        jacobian[0, 1] = [-0.4, 0.3, 0.8]
-        jacobian[1, 0] = [0.2, -0.1, 0.7]
-        velocity = np.array([0.3, -0.5, 0.1, 9.0, 8.0, 7.0], dtype=np.float32)
-        rhs = np.zeros((2, rows), dtype=np.float32)
-        rhs[0, :2] = [-0.2, 0.15]
-        cfm = np.zeros((2, rows), dtype=np.float32)
-        cfm[0, :2] = [0.01, 0.02]
-        row_type = np.zeros((2, rows), dtype=np.int32)
-        row_type[0, :2] = [PGS_CONSTRAINT_TYPE_MIMIC, PGS_CONSTRAINT_TYPE_JOINT_LIMIT]
-        row_type[1, 0] = PGS_CONSTRAINT_TYPE_MIMIC
-        candidates = wp.array([0, 1], dtype=wp.int32, device=device)
-        lower_group = wp.array(np.stack([lower, np.eye(dofs, dtype=np.float32)]), dtype=wp.float32, device=device)
-        jacobian_group = wp.array(jacobian, dtype=wp.float32, device=device)
-        mf = [
-            wp.zeros(2, dtype=wp.int32, device=device),
-            wp.zeros((2, 4), dtype=wp.int32, device=device),
-            wp.zeros((2, 1), dtype=wp.float32, device=device),
-            *[wp.zeros((2, 1, 6), dtype=wp.float32, device=device) for _ in range(4)],
-            wp.zeros((2, 1), dtype=wp.float32, device=device),
-            0,
-            wp.zeros((2, rows), dtype=wp.float32, device=device),
-            wp.zeros((2, 1), dtype=wp.float32, device=device),
-        ]
-
-        def launch(kernel, iterations, *extra):
-            diagonal = wp.array(cfm, dtype=wp.float32, device=device)
-            impulses = wp.zeros((2, rows), dtype=wp.float32, device=device)
-            velocities = wp.array(velocity, dtype=wp.float32, device=device)
-            wp.launch_tiled(
-                kernel,
-                dim=[2],
-                inputs=[
-                    candidates,
-                    candidates,
-                    PGS_LOCAL_SOLVE_OWNER_SINGLE,
-                    wp.array([0, 1], dtype=wp.int32, device=device),
-                    wp.array([0, 1], dtype=wp.int32, device=device),
-                    wp.array([0, 3], dtype=wp.int32, device=device),
-                    # World 1 belongs to another owner: its solve returns before any sweep.
-                    wp.array([PGS_LOCAL_SOLVE_OWNER_SINGLE, 0], dtype=wp.int32, device=device),
-                    wp.array([2, 1], dtype=wp.int32, device=device),
-                    lower_group,
-                    jacobian_group,
-                    lower_group,
-                    jacobian_group,
-                    wp.array(rhs, dtype=wp.float32, device=device),
-                    wp.array(row_type, dtype=wp.int32, device=device),
-                    wp.full((2, rows), -1, dtype=wp.int32, device=device),
-                    wp.zeros((2, rows), dtype=wp.float32, device=device),
-                    *mf,
-                    iterations,
-                    1.0,
-                    0,
-                    0,
-                ],
-                outputs=[diagonal, impulses, velocities, *extra],
-                block_dim=32,
-                device=device,
-            )
-            velocity_out = velocities.numpy()
-            return [
-                (impulses.numpy()[world], velocity_out[3 * world : 3 * world + 3], diagonal.numpy()[world])
-                for world in range(2)
-            ]
-
-        exact = _get_pgs_solve_local_owned_kernel(rows, local_rows, dofs, device.arch)
-        counted = _get_pgs_solve_local_owned_kernel(rows, local_rows, dofs, device.arch, solve_policy=SWEEPS)
-        outputs = [launch(exact, budget) for budget in range(BUDGET + 1)]
+        case = _LocalCase(wp.get_cuda_device())
+        exact, counted = case.kernel(), case.kernel(SWEEPS)
+        outputs = []
+        for budget in range(BUDGET + 1):
+            case.run(exact, budget)
+            outputs.append(case.read())
         executed, stopped = _expected_counts(outputs)
-        operand = _readout(device, 2)
-        result = launch(counted, BUDGET, operand)
-        for actual, expected in zip(result, outputs[BUDGET], strict=True):
-            for actual_array, expected_array in zip(actual, expected, strict=True):
-                np.testing.assert_array_equal(actual_array, expected_array)
+        operand = _readout(case.device, case.worlds)
+        case.run(counted, BUDGET, operand)
+        _assert_bitwise(case.read(), outputs[BUDGET])
         _assert_counts(self, operand, executed, stopped, solved=(0,))
+
+    def test_local_trace_predicts_where_each_tolerance_stops(self):
+        """Stop the local owner's tolerance runs where its exact trace predicted, with the exact outputs there."""
+        case = _LocalCase(wp.get_cuda_device())
+        exact = case.kernel()
+        outputs = []
+        for budget in range(BUDGET + 1):
+            case.run(exact, budget)
+            outputs.append(case.read())
+        trace = _trace(case.device, case.worlds)
+        case.run(case.kernel(SolvePolicy(readout="trace")), BUDGET, trace)
+        _assert_bitwise(case.read(), outputs[BUDGET])
+        # Only the owned world solves: one record per grid tolerance, exit reason and final sweep.
+        stops = trace.stops.numpy()
+        np.testing.assert_array_equal(stops.sum(axis=1), np.ones(len(TRACE_GRID), dtype=np.int32))
+        self.assertEqual((int(trace.reasons.numpy().sum()), int(trace.limits.numpy().sum())), (1, 1))
+        for point in (4, 8, 12):
+            with self.subTest(tolerance=TRACE_GRID[point]):
+                stop = int(np.flatnonzero(stops[point])[0])
+                operand = _readout(case.device, case.worlds)
+                policy = SolvePolicy(readout="sweeps", velocity_change_tolerance=TRACE_GRID[point])
+                case.run(case.kernel(policy), BUDGET, operand)
+                sweeps, exhausted = operand.sweeps.numpy(), operand.exhausted.numpy()
+                np.testing.assert_array_equal(sweeps[:, 1], 0)
+                executed = int(np.flatnonzero(sweeps[:, 0])[0])
+                self.assertEqual(executed, min(stop, BUDGET))
+                self.assertEqual(int(exhausted[0]), int(stop > BUDGET))
+                # Before its exit a tolerance run sweeps exactly as the exact law does.
+                _assert_bitwise(case.read(), [outputs[executed][0], outputs[BUDGET][1]])
 
 
 def _sparse_route():
@@ -476,27 +524,30 @@ def _matrix_free_route():
     }
 
 
+def _policy_routes():
+    """The routes whose local, paired and incremental sweeps compile the velocity law and trace."""
+    return (
+        _mixed_route("par_row", 13, {"local_internal", "local_pair", "local_residual", "mf_gs"}),
+        _mixed_route("auto", 23, {"paired_factor"}),
+        _matrix_free_route(),
+    )
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "Native Gauss-Seidel sweeps run on CUDA")
 class TestSolveReadoutRoutes(unittest.TestCase):
     """Every counted route leaves the trajectory unchanged and counts its world-solves."""
 
-    def _lockstep(self, route, *, steps=4, dt=1.0 / 240.0):
-        """Step two solvers without and one with the readout from one state on shared contacts.
-
-        The second solver without readout is a control: where the route itself is
-        bitwise reproducible, the readout solver must match it bitwise; where
-        atomically ordered bookkeeping makes the route vary between runs, it must
-        stay as close as the control does. Returns the readout solver, its
-        summary and the model.
-        """
-        model, options = route["model"], {**route["options"], "double_buffer": False, "pgs_iterations": BUDGET}
-        solvers = []
+    @staticmethod
+    def _solvers(route, variants):
+        """Build one solver per option set of ``variants`` on the route's model, with the route's overrides."""
+        options = {**route["options"], "double_buffer": False, "pgs_iterations": BUDGET}
         with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", route.get("overrides", {})):
-            for readout in ("off", "off", "sweeps"):
-                solvers.append(SolverFeatherPGS(model, pgs_solve_readout=readout, **options))
-        counted = solvers[-1]
-        self.assertTrue(set(counted._solve_readout.kernels.values()) & route["labels"], counted._solve_readout.kernels)
-        self.assertEqual(solvers[0]._solve_readout.kernels, {})
+            return [SolverFeatherPGS(route["model"], **options, **variant) for variant in variants]
+
+    @staticmethod
+    def _steps(route, solvers, steps, dt=1.0 / 240.0):
+        """Step every solver from one prepared state on shared contacts; yield each step's output states."""
+        model = route["model"]
         states = [(model.state(), model.state()) for _ in solvers]
         for solver, (state, _) in zip(solvers, states, strict=True):
             if "prepare" in route:
@@ -514,20 +565,38 @@ class TestSolveReadoutRoutes(unittest.TestCase):
                 state_in.clear_forces()
                 solver.step(state_in, state_out, control, contacts, dt)
             states = [(state_out, state_in) for state_in, state_out in states]
+            yield step, [state for state, _ in states]
+
+    def _lockstep(self, route, *, readout="sweeps", steps=4):
+        """Step two solvers without and one with the readout from one state on shared contacts.
+
+        The second solver without readout is a control: where the route itself is
+        bitwise reproducible, the readout solver must match it bitwise; where
+        atomically ordered bookkeeping makes the route vary between runs, it must
+        stay as close as the control does. Returns the readout solver, its
+        summary and the model.
+        """
+        model = route["model"]
+        variants = [{"pgs_solve_readout": "off"}, {"pgs_solve_readout": "off"}, {"pgs_solve_readout": readout}]
+        solvers = self._solvers(route, variants)
+        counted = solvers[-1]
+        self.assertTrue(set(counted._solve_readout.kernels.values()) & route["labels"], counted._solve_readout.kernels)
+        self.assertEqual(solvers[0]._solve_readout.kernels, {})
+        for step, states in self._steps(route, solvers, steps):
             for name in STATE_FIELDS:
-                reference, control_run, actual = (getattr(state, name).numpy() for state, _ in states)
+                reference, control_run, actual = (getattr(state, name).numpy() for state in states)
                 if np.array_equal(control_run, reference):
                     np.testing.assert_array_equal(actual, reference, err_msg=f"{name} at step {step}")
                 else:
                     spread = float(np.abs(control_run - reference).max())
                     np.testing.assert_allclose(actual, reference, rtol=0.0, atol=10.0 * spread, err_msg=name)
         record = counted.get_path_selection()
-        self.assertEqual(record["options"]["pgs_solve_readout"]["applied"], "sweeps")
-        readout = record["routes"]["sweep"]["readout"]
-        self.assertEqual(readout["mode"], "sweeps")
-        self.assertEqual(readout["counted"], counted._solve_readout.kernels)
+        self.assertEqual(record["options"]["pgs_solve_readout"]["applied"], readout)
+        counts = record["routes"]["sweep"]["readout"]
+        self.assertEqual(counts["mode"], readout)
+        self.assertEqual(counts["counted"], counted._solve_readout.kernels)
         summary = record["measurements"]["solve_readout"]
-        self.assertEqual(summary["readout"], "sweeps")
+        self.assertEqual(summary["readout"], readout)
         for slot in summary["slots"]:
             with self.subTest(kernel=slot["kernel"]):
                 self.assertEqual(slot["budget"], BUDGET)
@@ -574,6 +643,39 @@ class TestSolveReadoutRoutes(unittest.TestCase):
     def test_matrix_free_route_counts_without_changing_results(self):
         """Count the matrix-free Gauss-Seidel sweep and its incremental tier without changing the trajectory."""
         self._lockstep(_matrix_free_route())
+
+    def test_trace_changes_no_result_and_records_every_solve(self):
+        """Trace the local, paired and matrix-free sweeps unchanged, once per solve and grid tolerance."""
+        for route in _policy_routes():
+            with self.subTest(labels=sorted(route["labels"])):
+                solver, summary, _ = self._lockstep(route, readout="trace")
+                self.assertEqual(solver.get_path_selection()["routes"]["sweep"]["exit_law"]["declined"], {})
+                for slot in summary["slots"]:
+                    with self.subTest(kernel=slot["kernel"]):
+                        trace = slot["trace"]
+                        self.assertEqual([sum(row) for row in trace["stops"]], [slot["solves"]] * len(TRACE_GRID))
+                        self.assertEqual(sum(trace["reasons"].values()), slot["solves"])
+                        self.assertEqual(sum(kind["count"] for kind in trace["final_change"].values()), slot["solves"])
+
+    def test_tolerance_reaches_every_counted_sweep(self):
+        """Compile a velocity tolerance into every counted local, paired and matrix-free sweep, and step on it."""
+        for route in _policy_routes():
+            with self.subTest(labels=sorted(route["labels"])):
+                variant = {"pgs_solve_readout": "sweeps", "pgs_velocity_change_tolerance": 1.0e-3}
+                with warnings.catch_warnings():
+                    # A route's fixed-iteration sweeps keep their own law, about which the solver may warn.
+                    warnings.simplefilter("ignore", UserWarning)
+                    (solver,) = self._solvers(route, [variant])
+                counted = solver._solve_readout.kernels
+                self.assertTrue(set(counted.values()) & route["labels"], counted)
+                law = solver.get_path_selection()["routes"]["sweep"]["exit_law"]
+                self.assertEqual((law["law"], law["declined"]), ("velocity", {}))
+                self.assertEqual(set(law["honored"]), set(counted))
+                for step, (state,) in self._steps(route, [solver], steps=4):
+                    for name in STATE_FIELDS:
+                        self.assertTrue(np.isfinite(getattr(state, name).numpy()).all(), f"{name} at step {step}")
+                summary = solver.get_path_selection()["measurements"]["solve_readout"]
+                self.assertGreater(sum(slot["solves"] for slot in summary["slots"]), 0)
 
 
 if __name__ == "__main__":
