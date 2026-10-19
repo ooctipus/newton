@@ -52,7 +52,8 @@ def _fixture(kind="locked_d6"):
     solver._create_inverse_shape_mapping()
     state = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
+    # A fixed root and the ground are both immobile; keep their pair for the converter to reject.
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, include_immobile_pairs=True)
     contacts = pipeline.contacts()
     pipeline.collide(state, contacts)
     return model, solver, state, pipeline, contacts, case_shape, dynamic_shape
@@ -76,6 +77,10 @@ class TestMuJoCoResponseFilter(unittest.TestCase):
         for kind in ("fixed", "locked_d6"):
             with self.subTest(kind=kind):
                 model, solver, state, _, contacts, case, dynamic = _fixture(kind)
+                # The converter, not the broad phase, has to reject the root's ground contact.
+                count = int(contacts.rigid_contact_count.numpy()[0])
+                raw = (contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count])
+                self.assertIn(case, np.concatenate(raw))
                 geom = int(solver.newton_shape_to_mjc_geom.numpy()[case])
                 body = int(solver.mj_model.geom_bodyid[geom])
                 self.assertGreater(int(solver.mj_model.body_weldid[body]), 0)
