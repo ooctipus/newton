@@ -33,6 +33,7 @@ from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State, St
 from ...sim.articulation import eval_fk
 from ...sim.contacts import contact_capacity_blocks
 from ...sim.enums import BodyFlags, JointType
+from ...utils.deprecation import deprecate_nonkeyword_arguments
 from ..semi_implicit.kernels_contact import (
     eval_particle_body_contact_forces,
     eval_particle_contact_forces,
@@ -1059,6 +1060,10 @@ _estimate_hinv_jt_shared_memory = _execution_plan._estimate_hinv_jt_shared_memor
 _select_hinv_jt_chunk_size = _execution_plan._select_hinv_jt_chunk_size
 _FeatherPGSExecutionPlan = _execution_plan._FeatherPGSExecutionPlan
 
+# Warnings raised in the constructor body name the constructor's caller, two frames up: the
+# body runs inside the keyword-only shim (deprecate_nonkeyword_arguments).
+_CONSTRUCTOR_CALLER = 3
+
 
 class SolverFeatherPGS(SolverBase):
     """A semi-implicit integrator using symplectic Euler that operates
@@ -1296,9 +1301,11 @@ class SolverFeatherPGS(SolverBase):
         """Experimental construction-only shape-label regular expressions."""
         return self._contact_torsion_shape_patterns
 
+    @deprecate_nonkeyword_arguments
     def __init__(
         self,
         model: Model,
+        *,
         angular_damping: float = 0.05,
         update_mass_matrix_interval: int = 1,
         enable_contact_friction: bool = True,
@@ -1357,7 +1364,6 @@ class SolverFeatherPGS(SolverBase):
         pgs_warmstart_decay: float = 1.0,
         warn_constraint_overflow: bool = True,
         friction_anchor_beta: float | None = None,
-        *,
         pgs_change_tolerance: float = 0.0,
         pgs_relative_change_tolerance: float = 0.0,
         mf_gs_incremental_rows: int = 32,
@@ -1384,7 +1390,12 @@ class SolverFeatherPGS(SolverBase):
         sparse_mass_matrix: Literal["auto", "on", "off"] = "auto",
         cached_dynamics: Literal["auto", "on", "off"] = "auto",
     ):
-        """
+        """Create the solver for ``model``.
+
+        Every option after ``model`` is keyword-only. Passing options positionally is
+        deprecated: they still bind in declaration order, with a
+        :class:`DeprecationWarning` that names the keywords to use.
+
         Args:
             model (Model): the model to be simulated.
             cholesky_kernel: Factor kernel. ``auto`` uses topology, size and device resources.
@@ -1984,7 +1995,7 @@ class SolverFeatherPGS(SolverBase):
             )
         )
         for message in ignored_choices.values():
-            warnings.warn(message, UserWarning, stacklevel=2)
+            warnings.warn(message, UserWarning, stacklevel=_CONSTRUCTOR_CALLER)
         cholesky_kernel = kernel_choices["cholesky_kernel"]
         trisolve_kernel = kernel_choices["trisolve_kernel"]
         hinv_jt_kernel = kernel_choices["hinv_jt_kernel"]
@@ -2017,7 +2028,7 @@ class SolverFeatherPGS(SolverBase):
                     "contact_compliance does not support persistent friction patches. "
                     "Set friction_anchor_beta=0 explicitly to retain this law without the warning.",
                     UserWarning,
-                    stacklevel=2,
+                    stacklevel=_CONSTRUCTOR_CALLER,
                 )
             elif friction_mode != "current" or self._requested_kernel_choices["pgs_kernel"] in (
                 "tiled_contact",
@@ -2030,7 +2041,7 @@ class SolverFeatherPGS(SolverBase):
                     "Omit the point solver selection to use default patch friction, or set "
                     "friction_anchor_beta=0 explicitly to keep point friction without this warning.",
                     UserWarning,
-                    stacklevel=2,
+                    stacklevel=_CONSTRUCTOR_CALLER,
                 )
             else:
                 friction_anchor_beta = 0.2
@@ -2043,7 +2054,7 @@ class SolverFeatherPGS(SolverBase):
                 "contact_friction_anchor_limit is deprecated and ignored. Patch friction is enabled by default; "
                 "use friction_anchor_beta to adjust it or explicitly set zero to disable it.",
                 DeprecationWarning,
-                stacklevel=2,
+                stacklevel=_CONSTRUCTOR_CALLER,
             )
         self._friction_anchors_enabled = self.friction_anchor_beta > 0.0
         if self.contact_compliance and self._friction_anchors_enabled:
@@ -2062,7 +2073,7 @@ class SolverFeatherPGS(SolverBase):
                 "contact_shared_anchor still applies to normal rows; set friction_anchor_beta=0 "
                 "to apply shared-anchor flags to point friction rows as well.",
                 UserWarning,
-                stacklevel=2,
+                stacklevel=_CONSTRUCTOR_CALLER,
             )
         try:
             self.contact_speculative_scale = float(contact_speculative_scale)

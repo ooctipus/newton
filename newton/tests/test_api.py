@@ -199,11 +199,13 @@ class TestApi(unittest.TestCase):
         link_sig = inspect.signature(newton.ModelBuilder.add_link)
         shape_sig = inspect.signature(newton.ModelBuilder.add_shape_box)
         solver_sig = inspect.signature(newton.solvers.SolverSemiImplicit.__init__)
+        feather_pgs_sig = inspect.signature(newton.solvers.SolverFeatherPGS.__init__)
 
         self.assertEqual(body_sig.parameters["xform"].kind, inspect.Parameter.KEYWORD_ONLY)
         self.assertEqual(link_sig.parameters["xform"].kind, inspect.Parameter.KEYWORD_ONLY)
         self.assertEqual(shape_sig.parameters["xform"].kind, inspect.Parameter.KEYWORD_ONLY)
         self.assertEqual(solver_sig.parameters["angular_damping"].kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertEqual(feather_pgs_sig.parameters["angular_damping"].kind, inspect.Parameter.KEYWORD_ONLY)
 
 
 if __name__ == "__main__":

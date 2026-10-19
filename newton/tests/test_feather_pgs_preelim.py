@@ -29,15 +29,16 @@ class TestPreeliminationSignature(unittest.TestCase):
         self.assertIs(option.default, True)
 
     def test_legacy_joint_gap_position_is_preserved(self):
-        """Bind a legacy positional gap without silently coercing it to a boolean."""
-        signature = inspect.signature(newton.solvers.SolverFeatherPGS)
-        positional = [p for p in signature.parameters.values() if p.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD]
-        self.assertEqual(len(positional), 55)
-        self.assertEqual(positional[12].name, "joint_limit_activation_gap")
-        arguments = [object()] + [p.default for p in positional[1:12]] + [0.123]
-        bound = signature.bind_partial(*arguments, bilateral_preelimination_include_mimics=False)
-        self.assertEqual(bound.arguments["joint_limit_activation_gap"], 0.123)
-        self.assertIs(bound.arguments["bilateral_preelimination_include_mimics"], False)
+        """Bind a deprecated positional gap to the gap option without silently coercing it to a boolean."""
+        parameters = list(inspect.signature(newton.solvers.SolverFeatherPGS).parameters.values())
+        self.assertEqual(parameters[12].name, "joint_limit_activation_gap")
+        arguments = [parameter.default for parameter in parameters[1:12]] + [0.123]
+        model = newton.ModelBuilder().finalize(device="cpu")
+        with self.assertWarnsRegex(DeprecationWarning, "'joint_limit_activation_gap' positionally"):
+            solver = newton.solvers.SolverFeatherPGS(model, *arguments, bilateral_preelimination_include_mimics=False)
+        self.assertEqual(solver.joint_limit_activation_gap, 0.123)
+        self.assertIs(solver.enable_bilateral_preelimination, False)
+        self.assertIs(solver.bilateral_preelimination_include_mimics, False)
 
 
 def _run_four_bar(steps: int = 720, crank_target: float = 0.6, pgs_iterations: int = 2, **solver_kwargs):

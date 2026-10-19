@@ -1,0 +1,1 @@
+Deprecate passing `SolverFeatherPGS` options positionally. Every argument after `model` is now keyword-only; positional calls keep working during the deprecation period and emit a `DeprecationWarning` that names the keywords to use. Pass options by keyword, for example `SolverFeatherPGS(model, angular_damping=0.1)` instead of `SolverFeatherPGS(model, 0.1)`.

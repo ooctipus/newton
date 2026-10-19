@@ -10,6 +10,7 @@ import json
 import os
 import types
 import unittest
+import warnings
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -313,7 +314,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             self.assertEqual(options[name], {"applied": False, "requested": True, "default": True, "source": "default"})
         solver = SolverFeatherPGS(
             model,
-            0.1,
+            angular_damping=0.1,
             friction_anchor_beta=0.0,
             pgs_iterations=7,
             parallel_tree=True,
@@ -344,6 +345,57 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(selected["routes"]["friction"]["anchor_beta_source"], "argument")
         solver.pgs_iterations = 3
         self.assertEqual(solver.get_path_selection()["options"]["pgs_iterations"]["applied"], 7)
+
+    def test_positional_options_warn_and_build_the_keyword_solver(self):
+        """Bind deprecated positional options like keywords, warning only for positional use.
+
+        Every option after model is keyword-only. The deprecation shim binds positional values in
+        declaration order, so a positional call over the 54 legacy options must build the solver
+        the same keywords build: every requested and applied option, route and reason.
+        """
+        model = _cpu_model()
+        parameters = list(inspect.signature(SolverFeatherPGS).parameters.values())
+        self.assertEqual(parameters[0].name, "model")
+        self.assertEqual({parameter.kind for parameter in parameters[1:]}, {inspect.Parameter.KEYWORD_ONLY})
+        legacy = {parameter.name: parameter.default for parameter in parameters[1:55]}
+        self.assertEqual((parameters[1].name, parameters[54].name), ("angular_damping", "friction_anchor_beta"))
+        legacy.update(
+            angular_damping=0.1,
+            joint_limit_activation_gap=0.123,
+            pgs_iterations=7,
+            pgs_beta=0.3,
+            dense_max_constraints=16,
+            friction_anchor_beta=0.0,
+        )
+        with self.assertWarnsRegex(
+            DeprecationWarning,
+            r"^Passing 'angular_damping', 'update_mass_matrix_interval', .*, 'friction_anchor_beta' positionally "
+            r"to SolverFeatherPGS\.__init__\(\) is deprecated\. Pass these arguments as keyword arguments instead\.$",
+        ) as caught:
+            positional = SolverFeatherPGS(model, *legacy.values())
+        self.assertEqual(os.path.basename(caught.filename), os.path.basename(__file__))
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("always")
+            keyword = SolverFeatherPGS(model, **legacy)
+            SolverFeatherPGS(model=model)
+        self.assertEqual([str(item.message) for item in recorded if "positionally" in str(item.message)], [])
+        selected, expected = positional.get_path_selection(), keyword.get_path_selection()
+        del selected["measurements"], expected["measurements"]
+        self.assertEqual(selected, expected)
+        self.assertEqual(selected["options"]["joint_limit_activation_gap"]["applied"], 0.123)
+        self.assertEqual(selected["options"]["dense_max_constraints"]["source"], "argument")
+
+    def test_constructor_warnings_name_the_caller(self):
+        """Attribute construction warnings to the constructor's caller, not to the keyword-only shim."""
+        model = _cpu_model()
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("always")
+            SolverFeatherPGS(model, 0.05, contact_friction_anchor_limit=2, contact_shared_anchor=True)
+        messages = {str(item.message).split(" ")[0]: os.path.basename(item.filename) for item in recorded}
+        self.assertEqual(
+            messages,
+            dict.fromkeys(("Passing", "contact_friction_anchor_limit", "Patch"), os.path.basename(__file__)),
+        )
 
     def test_cpu_options_record_legacy_alias_environment(self):
         """Attribute an option the IL_NEWTON_FPGS_ warm-start aliases changed to the environment."""
