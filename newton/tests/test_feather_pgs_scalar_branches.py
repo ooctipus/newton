@@ -1426,6 +1426,18 @@ def _normal_impulses(test, solver, count):
     return solver.impulses.numpy()[_contact_rows(test, solver, count)].astype(np.float64)
 
 
+def _key_inertia(model, leaves, dofs, axes):
+    """A prismatic key's mass along its coordinate [kg]: ``m |S|^2 + armature + ke dt^2 + kd dt``.
+
+    ``axes`` are the keys' motion axes ``S`` in float64; the last two terms are the implicit drive's.
+    """
+    m = model.body_mass.numpy()[leaves].astype(np.float64)
+    ke = model.joint_target_ke.numpy()[dofs].astype(np.float64)
+    kd = model.joint_target_kd.numpy()[dofs].astype(np.float64)
+    armature = model.joint_armature.numpy()[dofs].astype(np.float64)
+    return m * np.sum(axes * axes, axis=1) + armature + ke * DT * DT + kd * DT
+
+
 def _key_law(model, leaves, dofs, axes, q, qd, steps, push=None):
     """Integrate keys by their scalar law in float64 and return their coordinates after each step.
 
@@ -1442,8 +1454,7 @@ def _key_law(model, leaves, dofs, axes, q, qd, steps, push=None):
     spring = model.joint_spring_stiffness.numpy()[dofs].astype(np.float64)
     reference = model.joint_spring_ref.numpy()[dofs].astype(np.float64)
     damping = model.joint_damping.numpy()[dofs].astype(np.float64)
-    armature = model.joint_armature.numpy()[dofs].astype(np.float64)
-    inertia = m * np.sum(axes * axes, axis=1) + armature + ke * DT * DT + kd * DT
+    inertia = _key_inertia(model, leaves, dofs, axes)
     weight = m * (axes @ model.gravity.numpy()[0].astype(np.float64))
     q, qd = np.array(q, dtype=np.float64), np.array(qd, dtype=np.float64)
     coordinates = []
@@ -1461,10 +1472,13 @@ def _press_key_with_tip(test, model, layout, solver, *, shift=0.0, steps=12):
 
     ``shift`` raises the tip's contact witness along the contact normal [m]. Returns the contacts'
     normal impulses [N·s] and the keys' coordinates [m] after every step (``steps x worlds``), the
-    normal rows' Delassus diagonal at the first step [1/kg] and the tips' largest world coordinate
-    at the start [m].
+    normal rows' Delassus diagonal at the first step and its ``closed_form`` [1/kg] and the tips'
+    largest world coordinate at the start [m]. The closed form is the key's inverse mass along the
+    normal, ``(n.S)^2 / (m |S|^2 + armature + ke dt^2 + kd dt)``, plus the solver's CFM: the
+    upright tip does not move along the normal.
     """
     keys = layout.key_leaves.reshape(model.world_count, -1)[:, 4]
+    dofs = layout.key_dofs.reshape(model.world_count, -1)[:, 4]
     coordinates = layout.key_coordinates.reshape(model.world_count, -1)[:, 4]
     pairs = [(int(tip), int(key)) for tip, key in zip(layout.arm_tips, keys, strict=True)]
     states, control = [model.state(), model.state()], model.control()
@@ -1479,7 +1493,7 @@ def _press_key_with_tip(test, model, layout, solver, *, shift=0.0, steps=12):
     extent = float(np.abs(states[0].body_q.numpy()[layout.arm_tips, :3]).max())
     force = np.zeros((model.body_count, 6), dtype=np.float32)
     force[layout.arm_tips, 2] = -2.0
-    impulses, travel, diagonal = [], [], None
+    impulses, travel, diagonal, closed_form = [], [], None, None
     for _step in range(steps):
         current, following = states
         current.body_f.assign(force)
@@ -1490,7 +1504,17 @@ def _press_key_with_tip(test, model, layout, solver, *, shift=0.0, steps=12):
         travel.append(following.joint_q.numpy()[coordinates].astype(np.float64))
         if diagonal is None:
             diagonal = solver.diag.numpy()[rows].astype(np.float64)
-    return {"impulses": np.asarray(impulses), "travel": np.asarray(travel), "diagonal": diagonal, "extent": extent}
+            axes = solver.joint_S_s.numpy()[dofs, :3].astype(np.float64)
+            normals = contacts.rigid_contact_normal.numpy()[: len(pairs)].astype(np.float64)
+            along = np.sum(normals * axes, axis=1)
+            closed_form = along * along / _key_inertia(model, keys, dofs, axes) + solver.pgs_cfm
+    return {
+        "impulses": np.asarray(impulses),
+        "travel": np.asarray(travel),
+        "diagonal": diagonal,
+        "closed_form": closed_form,
+        "extent": extent,
+    }
 
 
 def _gripper_switch(head, other, reference, *, beta, dt):
@@ -1517,14 +1541,23 @@ def _gripper_switch(head, other, reference, *, beta, dt):
 def _assert_gripper_switch(test, head, other, reference, *, beta, dt):
     """Hold a route switch in :func:`_press_key_with_tip` to the head's response, pose, budget and travel bounds.
 
-    The normal rows' Delassus diagonal, the key's inverse mass along the normal, compares at the
-    keys' FMA bound; the impulses at :func:`_gripper_switch`'s bounds; the travel at 1e-3 relative.
+    The head's normal rows' Delassus diagonal matches its closed form within 1e-4 (the tip adds
+    under 2e-6 of it on the CPU twin), which keeps the pose floor finite, and the switch's matches
+    the head's at the keys' FMA bound. The converged ``reference`` must stay within a quarter of the
+    head's impulse at every step (the CPU twin's head comes within 11% and 8e-5 of it), so a broken
+    reference cannot widen the budget. The impulses then compare at :func:`_gripper_switch`'s
+    bounds and the travel at 1e-3 relative.
     """
     for press in (head, other, reference):
         test.assertTrue(np.all(np.isfinite(press["impulses"])) and np.all(np.isfinite(press["travel"])))
     test.assertGreater(float(head["impulses"].max()), 0.0, "The tip must press the key")
+    np.testing.assert_allclose(head["diagonal"], head["closed_form"], rtol=1.0e-4, err_msg="diagonal law")
     np.testing.assert_allclose(other["diagonal"], head["diagonal"], rtol=KEY_BOUND["rtol"], err_msg="diagonal")
     switch = _gripper_switch(head, other, reference, beta=beta, dt=dt)
+    test.assertTrue(
+        np.all(np.abs(reference["impulses"] - head["impulses"]) <= 0.25 * np.abs(head["impulses"]) + switch["floor"]),
+        f"the converged reference is {switch['budget']} N s from the head, beyond a quarter of its impulse",
+    )
     test.assertTrue(
         np.all(switch["first"] <= switch["floor"]),
         f"first impulses differ by {switch['first']} N s, above the pose floor {switch['floor']} N s",
@@ -2009,9 +2042,10 @@ class TestScalarBranchOwner(unittest.TestCase):
         owner instead of ordinary dynamics). Both integrate the same law, so the bound is what that
         law leaves undetermined at the recipe's eight sweeps (``_assert_gripper_switch``):
 
-        - The contact response is determined: the normal row's Delassus diagonal ``D``, 29 1/kg and
-          the key's inverse mass along the normal alone (the upright arm's tip does not move along
-          the normal), matches the head's within the keys' FMA bound.
+        - The contact response is determined: the normal row's Delassus diagonal ``D``, 29 1/kg,
+          is the key's inverse mass along the normal (the upright arm's tip adds under 2e-6 of it on
+          the CPU twin). The head's matches that closed form within 1e-4, and the scalar route's the
+          head's within the keys' FMA bound.
         - The first step starts both routes from one state. They differ by the float order of the
           tip's and the key's poses, about one float32 spacing of the contact's world position each,
           which the contact's position correction turns into ``pgs_beta / (D dt)`` times that
@@ -2027,7 +2061,8 @@ class TestScalarBranchOwner(unittest.TestCase):
           N s, 2% of that error; a one-spacing shift on the CPU twin: 0.3%). Every step's impulses
           must agree within a tenth of the head's distance from the converged run plus the pose
           floor, which also keeps the scalar route within the head's own distance from the
-          converged run, up to that tenth.
+          converged run, up to that tenth. The converged run must stay within a quarter of the
+          head's impulse at every step, so a broken reference cannot widen the bound.
         - The key's travel moves far less (under 7e-8 m for a one-spacing shift on the CPU twin,
           against the budget's 1e-5 m) and keeps a 1e-3 relative bound.
 
