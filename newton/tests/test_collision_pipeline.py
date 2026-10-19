@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import ctypes
+import gc
 import unittest
 import warnings
 from collections import Counter
@@ -95,6 +97,20 @@ def type_to_str(shape_type: GeoType):
         return "unknown"
 
 
+@contextlib.contextmanager
+def _scoped_capture(*args, **kwargs):
+    """``wp.ScopedCapture`` that first frees the garbage earlier tests left in reference cycles.
+
+    Warp keeps the frame of a ``wp.func`` defined at run time in a cycle, and with it the locals
+    of every caller, so a test's model can outlive the test until the cyclic collector runs.
+    When that collection falls inside a CUDA capture and destroys a mesh SDF's texture, CUDA
+    rejects the call and invalidates the capture.
+    """
+    gc.collect()
+    with wp.ScopedCapture(*args, **kwargs) as capture:
+        yield capture
+
+
 class CollisionSetup:
     def __init__(
         self,
@@ -151,7 +167,7 @@ class CollisionSetup:
 
         self.graph = None
         if wp.get_device(device).is_cuda:
-            with wp.ScopedCapture(device=device) as capture:
+            with _scoped_capture(device=device) as capture:
                 self.simulate()
             self.graph = capture.graph
 
@@ -192,7 +208,7 @@ class CollisionSetup:
 
     def capture(self):
         if wp.get_device(self._device).is_cuda:
-            with wp.ScopedCapture(device=self._device) as capture:
+            with _scoped_capture(device=self._device) as capture:
                 self.simulate()
             self.graph = capture.graph
         else:
@@ -449,7 +465,7 @@ def test_collision_pipeline_first_call_capture(test, device):
     contacts = pipeline.contacts()
     state = model.state()
 
-    with wp.ScopedCapture(device=device) as capture:
+    with _scoped_capture(device=device) as capture:
         pipeline.collide(state, contacts)
 
     wp.capture_launch(capture.graph)
@@ -460,6 +476,92 @@ add_function_test(
     TestCollisionPipeline,
     "test_collision_pipeline_first_call_capture",
     test_collision_pipeline_first_call_capture,
+    devices=get_cuda_test_devices(mode="basic"),
+)
+
+
+@contextlib.contextmanager
+def _automatic_collection_disabled():
+    """Keep the allocator from collecting on its own, so only explicit collections free garbage."""
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()
+
+
+class _CaptureProbe:
+    """Garbage in a reference cycle that records whether its device was capturing when it was freed."""
+
+    def __init__(self, device, capturing: list[bool]):
+        self.device = device
+        self.capturing = capturing
+        self.cycle = self
+
+    def __del__(self):
+        self.capturing.append(self.device.is_capturing)
+
+
+def test_capture_frees_pending_garbage_first(test, device):
+    """Free garbage that earlier tests left in reference cycles before a capture begins, not inside it."""
+    device = wp.get_device(device)
+    capturing = []
+    marker = wp.zeros(1, dtype=wp.int32, device=device)
+    with _automatic_collection_disabled():
+        _CaptureProbe(device, capturing)
+        with _scoped_capture(device=device) as capture:
+            # A collection the allocator could start inside the capture.
+            gc.collect()
+            marker.fill_(1)
+    test.assertEqual(capturing, [False])
+    wp.capture_launch(capture.graph)
+    test.assertEqual(int(marker.numpy()[0]), 1)
+
+
+def test_setup_capture_survives_texture_garbage(test, device):
+    """Capture and run a collision setup while an earlier test's texture waits for the cyclic collector.
+
+    CUDA rejects a texture destroyed inside a capture and invalidates the capture, so a collection
+    inside it (forced here) must find no texture left to free.
+    """
+    simulate = CollisionSetup.simulate
+
+    def collect_then_simulate(setup):
+        gc.collect()
+        simulate(setup)
+
+    with _automatic_collection_disabled():
+        garbage = {"texture": wp.Texture3D(np.zeros((2, 2, 2), dtype=np.float32), device=device)}
+        garbage["cycle"] = garbage
+        del garbage
+        with mock.patch.object(CollisionSetup, "simulate", collect_then_simulate):
+            setup = CollisionSetup(
+                viewer=newton.viewer.ViewerNull(),
+                device=device,
+                solver_fn=newton.solvers.SolverXPBD,
+                sim_substeps=10,
+                shape_type_a=GeoType.BOX,
+                shape_type_b=GeoType.BOX,
+            )
+    test.assertIsNotNone(setup.graph)
+    for _ in range(100):
+        setup.step()
+    setup.test(TestLevel.VELOCITY_YZ, 0)
+    setup.test(TestLevel.VELOCITY_LINEAR, 1)
+
+
+add_function_test(
+    TestCollisionPipeline,
+    "test_capture_frees_pending_garbage_first",
+    test_capture_frees_pending_garbage_first,
+    devices=get_test_devices(mode="basic"),
+)
+add_function_test(
+    TestCollisionPipeline,
+    "test_setup_capture_survives_texture_garbage",
+    test_setup_capture_survives_texture_garbage,
     devices=get_cuda_test_devices(mode="basic"),
 )
 
@@ -3307,7 +3409,7 @@ def test_deterministic_pipeline_500_steps(test, device):
         # ``example_basic_pendulum``).
         _frame()
 
-        with wp.ScopedCapture(device=device) as capture:
+        with _scoped_capture(device=device) as capture:
             _frame()
         graph = capture.graph
 
@@ -3381,7 +3483,7 @@ def test_static_empty_gjk_specialization_under_graph_capture(test, device):
     state = model.state()
     contacts = specialized.contacts()
     reference_contacts = reference.contacts()
-    with wp.ScopedCapture(device=device) as capture:
+    with _scoped_capture(device=device) as capture:
         specialized.collide(state, contacts)
         reference.collide(state, reference_contacts)
     for _ in range(2):
@@ -3527,7 +3629,7 @@ def test_split_gjk_mpr_matches_fused_under_graph_capture(test, device):
     fused_contacts = fused.contacts()
     split.collide(state, split_contacts)
     fused.collide(state, fused_contacts)
-    with wp.ScopedCapture(device=device) as capture:
+    with _scoped_capture(device=device) as capture:
         split.collide(state, split_contacts)
         fused.collide(state, fused_contacts)
     wp.capture_launch(capture.graph)
@@ -3731,7 +3833,7 @@ def test_deterministic_pipeline_sticky_500_steps(test, device):
         # the same warm-up state).
         _frame()
 
-        with wp.ScopedCapture(device=device) as capture:
+        with _scoped_capture(device=device) as capture:
             _frame()
         graph = capture.graph
 
@@ -5164,7 +5266,7 @@ def test_graph_capture_stable(test, device):
     test.assertGreater(int(np.sum(contacts.soft_contact_indices.numpy()[:total0][:, 1] >= 0)), 0)
 
     # Capture the flag-on collide and replay it; counts must be stable across replays.
-    with wp.ScopedCapture(device) as capture:
+    with _scoped_capture(device) as capture:
         pipeline.collide(state, contacts)
     for _ in range(3):
         wp.capture_launch(capture.graph)
@@ -5347,6 +5449,12 @@ add_function_test(
     test_expert_narrow_phase_voxel_resolution,
     devices=get_test_devices(),
 )
+
+
+def tearDownModule():
+    # Free the SDF textures these tests left in reference cycles before a later module captures
+    # a graph in the same process (see _scoped_capture).
+    gc.collect()
 
 
 if __name__ == "__main__":
