@@ -65,6 +65,8 @@ def get_source(
     """
     if resident_row_metadata and shared_metadata:
         raise ValueError("resident_row_metadata applies to streamed metadata (shared_metadata=False)")
+    if resident_row_metadata and dense_support_tiles:
+        raise ValueError("resident_row_metadata does not apply to dense support tiles, whose row metadata streams")
     if fuse_vel_limits and not has_drive_rows:
         raise ValueError("fuse_vel_limits requires has_drive_rows")
     if stage_velocities and not dense_support_tiles:

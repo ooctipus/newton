@@ -325,6 +325,11 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "streamed metadata"):
             factory(*shape, resident_row_metadata=True, **options)
+        # The dense-tile variants keep their row metadata streamed; nothing selects the combination.
+        tiles = {"has_drive_rows": False, "has_dense_velocity_limit_rows": False, "dense_support_tiles": True}
+        factory(*shape, shared_metadata=False, **tiles)
+        with self.assertRaisesRegex(ValueError, "dense support tiles"):
+            factory(*shape, shared_metadata=False, resident_row_metadata=True, **tiles)
 
     def test_launch_replay_compares_each_launch_when_it_runs(self):
         """Compare each replayed launch with its twin before later stages rewrite the operands they share.
