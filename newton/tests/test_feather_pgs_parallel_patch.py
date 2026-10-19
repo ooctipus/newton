@@ -1739,6 +1739,19 @@ def _assert_tier_owned(test, solver, budget):
             test.assertEqual(int(mf_rows), 0, f"world {world}")
 
 
+def _drop_budget_override(test):
+    """Run ``test`` without an exported ``FEATHER_PGS_PATCH_PARALLEL_SWEEPS``, which overrides every linked budget.
+
+    The tier tests request their budgets, or rely on the ``"auto"`` default or on
+    ``mf_gs_parallel_sweeps`` reaching the linked tiers. The environment is restored
+    after the test.
+    """
+    environment = patch.dict(os.environ)
+    environment.start()
+    test.addCleanup(environment.stop)
+    os.environ.pop(_SWEEPS_FLAG, None)
+
+
 def _friction_pairs(solver, world):
     """Each friction pair's impulse magnitude and pooled budget ``mu * (ring's normal impulses)``."""
     count = int(solver.constraint_count.numpy()[world])
@@ -1756,6 +1769,10 @@ def _friction_pairs(solver, world):
 
 @unittest.skipUnless(wp.is_cuda_available(), "Parallel matrix-free tiers require CUDA")
 class TestPatchParallelRoutes(unittest.TestCase):
+    def setUp(self):
+        """Build every tier with the budget the test requests (:func:`_drop_budget_override`)."""
+        _drop_budget_override(self)
+
     def test_patch_runs_linked_tiers_unless_switched_off(self):
         """Build linked tiers for patch friction unless the switch is 0, and point tiers for point friction.
 
@@ -1998,6 +2015,10 @@ class TestPatchParallelPhysics(unittest.TestCase):
     bounds the patch tiers' gap. Every parallel step must leave each world in the
     tiers' domain, so the comparison is never serial against serial.
     """
+
+    def setUp(self):
+        """Build every tier with the budget the test requests (:func:`_drop_budget_override`)."""
+        _drop_budget_override(self)
 
     def test_standing_feet_match_the_serial_patch_sweep(self):
         """Keep loaded, ring-linked anchors and the serial sweep's motion on two box feet."""
