@@ -133,10 +133,16 @@ def _linked_tier_calls():
         yield "solver_feather_pgs._get_pgs_solve_parallel_kernel", (64, 32, 18, _ARCH), kwargs
 
 
-def _keyed_layout():
-    """The 16+6 coordinate layout of the keyed-row sweeps."""
+def _keyed_layout(*, velocity_limits=False):
+    """The 16+6 coordinate layout of the keyed-row sweeps.
+
+    ``velocity_limits`` gives the 16 primary coordinates joint velocity limits, as a
+    solver with ``enable_joint_velocity_limits`` plans them (the free block has none).
+    """
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
 
+    if velocity_limits:
+        return KeyedLayout(16, 6, 0, 16, 128, True, (1 << 16) - 1)
     return KeyedLayout(16, 6, 0, 16, 128, False, 0)
 
 
@@ -197,6 +203,16 @@ def _suite_diagonal_sweeps():
         yield shape, {"speculative_contact_batches": True, "contact_units": True}, True
 
 
+def _keyed_last_word_calls():
+    """Linked keyed tiers of a velocity-limited layout with the last-word pass (patch-only).
+
+    The solver builds the pass (``mf_gs_parallel_linked_velocity_limit_pass``) only with
+    joint velocity limits, so these tiers read a layout that plans velocity-limit rows.
+    """
+    for kwargs in _keyed_tier_kwargs(linked=True):
+        yield (_keyed_layout(velocity_limits=True), 128, 32, 22, _ARCH), {**kwargs, "velocity_limit_pass": True}
+
+
 def _patch_only_factory_labels():
     """Labels of the factory-built kernels only patch friction launches."""
     for name, args, kwargs in _linked_tier_calls():
@@ -210,6 +226,8 @@ def _patch_only_factory_labels():
     for args, kwargs, patch_only in _suite_diagonal_sweeps():
         if patch_only:
             yield _label("solver_feather_pgs._get_pgs_solve_sparse_diagonal_kernel", args, kwargs)
+    for args, kwargs in _keyed_last_word_calls():
+        yield _label("keyed_rows.get_parallel_factory", args, kwargs)
 
 
 _PATCH_ONLY |= frozenset(_patch_only_factory_labels())
@@ -606,6 +624,8 @@ def _keyed_row_calls():
     yield "keyed_rows.get_patch_fallback_kernel", keyed_rows.get_patch_fallback_kernel.__wrapped__, (layout,), {}
     for kwargs in _keyed_tier_kwargs(linked=True):
         yield "keyed_rows.get_parallel_factory", parallel, (layout, 128, 32, 22, _ARCH), kwargs
+    for args, kwargs in _keyed_last_word_calls():
+        yield "keyed_rows.get_parallel_factory", parallel, args, kwargs
 
 
 def _factory_kernels():
@@ -804,6 +824,11 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
         linked = [name for name in self.current if "linked_rows=True" in name]
         self.assertTrue(linked)
         self.assertTrue(set(linked) <= _PATCH_ONLY)
+        # Their last-word velocity-limit pass, in the plain and the keyed-row tiers.
+        last_word = {name.split("(", 1)[0] for name in linked if "velocity_limit_pass=True" in name}
+        self.assertEqual(
+            last_word, {"solver_feather_pgs._get_pgs_solve_parallel_kernel", "keyed_rows.get_parallel_factory"}
+        )
 
     def test_inventory_covers_the_spliced_sweeps(self):
         """Reach the sweeps that splice the friction law or vote an exit, beyond the patch-varied factories."""

@@ -630,20 +630,38 @@ class TestParallelPatchReference(unittest.TestCase):
                 self.assertEqual(impulses[2], 0.0)
 
     def test_velocity_limit_pass_reaches_every_tier_variant(self):
-        """Stage the velocity-limit flag and append the last word to each tier variant only on request."""
+        """Stage the velocity-limit flag and append the last word to each tier variant only on request.
+
+        The keyed-row tiers read their rows from a layout that plans joint velocity
+        limits, as a solver with ``enable_joint_velocity_limits`` builds them.
+        """
+        plain_tiers = (source._get_pgs_solve_parallel_kernel, (_CAPACITY, 32, _DOFS, "120"))
+        keyed_tiers = (
+            keyed_rows.get_parallel_factory(
+                source._get_pgs_solve_parallel_kernel, KeyedLayout(16, 6, 0, 16, 128, True, (1 << 16) - 1)
+            ),
+            (128, 32, 22, "120"),
+        )
         variants = {
-            "response block": ({"matrix_free": False}, "A_AT(i, j) * s_x[j]"),
-            "matrix-free": ({"matrix_free": True}, "J_world.data[jy_world_base + i * 6 + d]"),
-            "in-kernel matrix-free": ({"matrix_free": True, "inkernel_response": (6, 0, 0, 0)}, "ZAT(d, i)"),
-            "in-kernel response block": ({"matrix_free": False, "inkernel_response": (6, 0, 0, 0)}, "ZAT(d, i)"),
+            "response block": (plain_tiers, {"matrix_free": False}, "A_AT(i, j) * s_x[j]"),
+            "matrix-free": (plain_tiers, {"matrix_free": True}, "J_world.data[jy_world_base + i * 6 + d]"),
+            "in-kernel matrix-free": (
+                plain_tiers,
+                {"matrix_free": True, "inkernel_response": (6, 0, 0, 0)},
+                "ZAT(d, i)",
+            ),
+            "in-kernel response block": (
+                plain_tiers,
+                {"matrix_free": False, "inkernel_response": (6, 0, 0, 0)},
+                "ZAT(d, i)",
+            ),
+            "keyed rows": (keyed_tiers, {"matrix_free": True, "inkernel_response": (16, 6, 0, 16)}, "ZAT(d, i)"),
         }
-        for name, (options, row_read) in variants.items():
+        for name, ((factory, args), options, row_read) in variants.items():
             with self.subTest(variant=name):
                 settings = {"rows": 32, "sweeps": 24, "linked_rows": True, **options}
-                plain = source._get_pgs_solve_parallel_kernel(_CAPACITY, 32, _DOFS, "120", **settings)
-                last_word = source._get_pgs_solve_parallel_kernel(
-                    _CAPACITY, 32, _DOFS, "120", velocity_limit_pass=True, **settings
-                )
+                plain = factory(*args, **settings)
+                last_word = factory(*args, velocity_limit_pass=True, **settings)
                 self.assertEqual(last_word.key, plain.key + "_lw")
                 self.assertEqual((plain._fpgs_velocity_limit_pass, last_word._fpgs_velocity_limit_pass), (False, True))
                 text = last_word._fpgs_row_native_source
