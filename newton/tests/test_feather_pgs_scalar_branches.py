@@ -1312,11 +1312,13 @@ class TestScalarBranchOwner(unittest.TestCase):
         owner for this keyboard-shaped model. Keys and their floor-contact
         impulses stay within the FMA bound of the prismatic linear state route
         through the mass cadence, an inertial and drive notification, a masked
-        reset after a coordinate write, a root re-pose and captured graphs with
+        reset after a coordinate write, a root re-pose, a state bank copied back
+        into the input (which every cache must repair) and captured graphs with
         masked and full resets; the arm moves to the held owner's float order.
-        The FK/ID fields that neither the family writes for the keys nor the
-        held owner for the arm hold NaN throughout, so nothing on the route
-        reads them.
+        An eager twin of the scalar route does the captured work step by step:
+        each replay must give what it gives. The FK/ID fields that neither the
+        family writes for the keys nor the held owner for the arm hold NaN
+        throughout, so nothing on the route reads them.
         """
         device = wp.get_device("cuda:0")
         model = build_branch_model(device, worlds=4, leaves=KEYBOARD_LEAVES, shapes=True)
@@ -1324,10 +1326,16 @@ class TestScalarBranchOwner(unittest.TestCase):
         starts, child = model.articulation_start.numpy(), model.joint_child.numpy()
         floors = [int(child[starts[a] + 1 + k]) for a in layout.branches for k in (0, 17, 53, 107)]
         model.rigid_contact_max = len(floors)
-        solvers = [recipe_solver(model, scalar=False), recipe_solver(model, scalar=True)]
-        head, scalar = solvers
-        owner = self._assert_routes(head, scalar)
-        self._poison(scalar, layout)
+        # The head, the scalar route (captured below) and the scalar route's eager twin.
+        solvers = [
+            recipe_solver(model, scalar=False),
+            recipe_solver(model, scalar=True),
+            recipe_solver(model, scalar=True),
+        ]
+        head, scalar, twin = solvers
+        owners = [self._assert_routes(head, solver) for solver in (scalar, twin)]
+        for solver in (scalar, twin):
+            self._poison(solver, layout)
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
         contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]
@@ -1391,10 +1399,32 @@ class TestScalarBranchOwner(unittest.TestCase):
             impulses = [_normal_impulses(self, solver, len(floors)) for solver in solvers]
             np.testing.assert_allclose(impulses[1], impulses[0], err_msg=f"{tag} impulses", **IMPULSE_BOUND)
             loads.append(float(impulses[0].max()))
+            # The twin does the scalar route's work eagerly: it must give the same state and impulses.
+            for name, index in (("joint_q", layout.key_coordinates), ("joint_qd", layout.key_dofs)):
+                _close(
+                    self,
+                    getattr(states[1][0], name),
+                    getattr(states[2][0], name),
+                    index,
+                    f"{tag} twin {name}",
+                    **KEY_BOUND,
+                )
+            for name in ("body_q", "body_qd"):
+                bodies = np.concatenate([layout.key_bodies, layout.arm_bodies])
+                _close(
+                    self,
+                    getattr(states[1][0], name),
+                    getattr(states[2][0], name),
+                    bodies,
+                    f"{tag} twin {name}",
+                    **KEY_BOUND,
+                )
+            np.testing.assert_allclose(impulses[2], impulses[1], err_msg=f"{tag} twin impulses", **IMPULSE_BOUND)
             for solver in solvers:
                 solver.check_constraint_capacity()
                 self.assertGreater(int(solver.constraint_count.numpy().sum()), 0)
-            self.assertEqual(int(sum(int(group.status.numpy().sum()) for group in owner.groups[:-1])), 0)
+            for owner in owners:
+                self.assertEqual(int(sum(int(group.status.numpy().sum()) for group in owner.groups[:-1])), 0)
 
         loads = []
         mask = wp.array([True] + [False] * (worlds - 1), dtype=wp.bool, device=device)
@@ -1422,11 +1452,16 @@ class TestScalarBranchOwner(unittest.TestCase):
             for index, solver in enumerate(solvers):
                 current, following = states[index]
                 solver.step(current, following, controls[index], contacts[index], DT)
-                states[index] = [following, current]
+                if step == 8:
+                    # Copy the output back into the input bank, as Isaac Lab does after an odd number of
+                    # substeps: the next step reads a bank no cache published, so every route repairs.
+                    current.assign(following)
+                else:
+                    states[index] = [following, current]
             compare(f"step {step}")
 
         graphs = []
-        for index, solver in enumerate(solvers):
+        for index, solver in enumerate(solvers[:2]):
             current, following = states[index]
             with wp.ScopedCapture(device=device) as capture:
                 solver.seed_double_buffer_events()
@@ -1439,9 +1474,15 @@ class TestScalarBranchOwner(unittest.TestCase):
             mask.assign(np.asarray(reset, dtype=np.bool_))
             inputs(replay + 11)
             write_coordinates(reset)
-            self._poison(scalar, layout)
+            for solver in (scalar, twin):
+                self._poison(solver, layout)
             for graph in graphs:
                 wp.capture_launch(graph)
+            # The eager twin of the captured work.
+            current, following = states[2]
+            twin.reset(current, mask)
+            twin.step(current, following, controls[2], contacts[2], DT)
+            twin.step(following, current, controls[2], contacts[2], DT)
             compare(f"replay {replay}")
         # The comparison is not vacuous: the floors carried the keys.
         self.assertGreater(max(loads), 0.0)
