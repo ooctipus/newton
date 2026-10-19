@@ -37,9 +37,21 @@ _FRICTION = PGS_CONSTRAINT_TYPE_FRICTION
 _UNWRITTEN = -7
 _OUTPUTS = ("sparse_row_dof", "group_count", "group_heads", "serial_count", "serial")
 # (capacity, coordinates) of the synthetic twins: the pinned shape, rows across several chunks of
-# 32 with a capacity off the chunk and triple grids, a single coordinate, and the keyboard's 114.
+# 32 with a capacity off the chunk and triple grids, a single coordinate, and 114 coordinates (seven
+# coordinate bits, four chunks of coordinates to compact).
 _UNIT_SHAPES = ((64, 10), (97, 33), (40, 1), (130, 114))
 _TRIPLE_SHAPES = ((64, 10), (98, 33), (40, 1), (300, 114))
+# Ways the synthetic unit worlds break the unit layout, in the order ``_unit_worlds`` draws them.
+_FLAWS = (
+    "a tangent row starts the segment",
+    "a first tangent row names another row",
+    "a second tangent row names the first",
+    "a third tangent row follows a unit",
+    "the segment ends after a unit's first tangent row",
+)
+# Flaws that can make the reverse walk visit a row the parallel path skips, so that a mark on that row
+# changes the links. The others change only the serial list.
+_LINK_FLAWS = (0, 2, 3)
 
 
 def _reserve(links, world, heads_of_contacts, dofs):
@@ -134,6 +146,25 @@ def _serial_triple_walks(rows, *, serial_contacts):
     return out
 
 
+def _schedule_unit_heads(rows, *, serial_contacts):
+    """Return every output of scheduling exactly the non-friction rows as unit heads.
+
+    These are the outputs of the builder's warp-parallel path. They equal the serial walks' outputs when
+    the rows form units (:func:`_rows_form_units`), because both walks then visit exactly these rows.
+    """
+    out = {name: rows[name].copy() for name in _OUTPUTS}
+    links = out["sparse_row_dof"]
+    for w in range(rows["row_count"].shape[0]):
+        start, end = int(rows["bounds"][w, 1]), int(rows["row_count"][w])
+        unit_heads = [row for row in range(start, end) if rows["row_type"][w, row] != _FRICTION]
+        heads = _reserve(links, w, unit_heads, len(out["group_heads"][w]))
+        for head in reversed(unit_heads):
+            _prepend(links, heads, w, head)
+        serial = [head for head in unit_heads if not np.any(links[w, head] < -1)] if serial_contacts else None
+        _finish(out, w, heads, serial)
+    return out
+
+
 def _rows_form_units(rows, world):
     """Whether a world's contact rows form units, each head followed by its two tangent rows or none."""
     start, end = int(rows["bounds"][world, 1]), int(rows["row_count"][world])
@@ -188,13 +219,15 @@ def _unit_worlds(seed, *, worlds, capacity, dofs):
     Worlds draw one layout each: random units on few coordinates (long chains, reserved coordinates and
     rows without a sparse coordinate), one-row units of one coordinate up to the capacity, units spread
     over every coordinate, three-row units filling the capacity, empty and inverted segments, and rows
-    that break the unit layout, which the builder schedules with the serial walks: a tangent row starts
-    the segment, a first tangent row names another row, a second tangent row names the first, a third
-    tangent row follows a unit, or the segment ends after a unit's first tangent row.
+    that break the unit layout, which the builder schedules with the serial walks. Broken worlds take
+    the flaws of :data:`_FLAWS` in turn, and ``rows["flaw"]`` records each world's flaw (``-1`` where
+    the rows keep the layout).
     """
     rng = np.random.default_rng(seed)
     rows = _empty_rows(worlds, capacity, dofs, capacity)
+    rows["flaw"] = np.full(worlds, -1, np.int32)
     layouts = ("random", "random", "chain", "spread", "full", "empty", "inverted", "broken", "broken")
+    broken = 0
     for w in range(worlds):
         layout = layouts[w % len(layouts)]
         start = 0 if layout in ("chain", "spread", "full") else int(rng.integers(1, 4))
@@ -225,7 +258,10 @@ def _unit_worlds(seed, *, worlds, capacity, dofs):
                 for h in range(start, end - 3)
                 if rows["row_type"][w, h] != _FRICTION and rows["row_type"][w, h + 1] == _FRICTION
             ]
-            flaw = int(rng.integers(0, 5)) if owners else 0
+            # Flaws past the first need a unit with tangent rows that another row follows.
+            flaw = broken % len(_FLAWS) if owners else 0
+            broken += 1
+            rows["flaw"][w] = flaw
             owner = int(rng.choice(owners)) if owners else start
             if flaw == 0:
                 # The segment starts at a tangent row.
@@ -284,6 +320,18 @@ def _triple_worlds(seed, *, worlds, capacity, dofs):
     return rows
 
 
+def _unit_twin_rows():
+    """Yield the synthetic unit worlds of the CUDA twins, one set per shape of :data:`_UNIT_SHAPES`."""
+    for seed, (capacity, dofs) in enumerate(_UNIT_SHAPES):
+        yield (capacity, dofs), _unit_worlds(seed, worlds=180, capacity=capacity, dofs=dofs)
+
+
+def _triple_twin_rows():
+    """Yield the synthetic triple worlds of the CUDA twins, one set per shape of :data:`_TRIPLE_SHAPES`."""
+    for seed, (capacity, dofs) in enumerate(_TRIPLE_SHAPES):
+        yield (capacity, dofs), _triple_worlds(seed, worlds=140, capacity=capacity, dofs=dofs)
+
+
 def _launch_builder(rows, device, *, units, serial_contacts):
     """Run a schedule builder over the rows; return every output."""
     worlds, capacity = rows["row_type"].shape
@@ -305,6 +353,12 @@ def _launch_builder(rows, device, *, units, serial_contacts):
 def _assert_outputs_equal(actual, expected, label):
     for name in _OUTPUTS:
         np.testing.assert_array_equal(actual[name], expected[name], err_msg=f"{label}: {name}")
+
+
+def _differing_worlds(first, second):
+    """Return, per world, whether any output of two schedules differs."""
+    worlds = len(first["group_count"])
+    return np.any([np.any((first[name] != second[name]).reshape(worlds, -1), axis=1) for name in _OUTPUTS], axis=0)
 
 
 def _record_schedules(model, device, *, anchors, compact, steps=6):
@@ -350,7 +404,7 @@ def _record_schedules(model, device, *, anchors, compact, steps=6):
 
 class TestFeatherPGSContactSchedule(unittest.TestCase):
     def test_serial_unit_walks_match_the_unit_oracle(self):
-        """Reproduce the unit schedule oracle with the serial walks the unit builder must equal."""
+        """Reproduce the unit schedule oracle with the serial walks and with the schedule over the heads alone."""
         device = wp.get_device("cpu")
         for (dense, seed, capacity), rows in _patch_unit_cases():
             with self.subTest(dense=dense, seed=seed, capacity=capacity):
@@ -366,6 +420,7 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
                     "sparse_row_dof": marked,
                 }
                 walks = _serial_unit_walks(inputs, serial_contacts=True)
+                _assert_outputs_equal(_schedule_unit_heads(inputs, serial_contacts=True), walks, "heads alone")
                 np.testing.assert_array_equal(walks["sparse_row_dof"], expected["sparse_row_dof"])
                 np.testing.assert_array_equal(walks["group_count"], expected["group_count"])
                 for world in range(worlds):
@@ -435,28 +490,51 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
         self.assertGreater(int(np.sum(np.maximum(units["serial_count"], 0))), 70)
 
     def test_synthetic_worlds_cover_both_builder_paths(self):
-        """Draw layouts the unit builder takes in parallel and layouts it leaves to the serial walks."""
-        rows = _unit_worlds(0, worlds=96, capacity=97, dofs=33)
-        forms = [_rows_form_units(rows, world) for world in range(96)]
-        walks = _serial_unit_walks(rows, serial_contacts=True)
-        self.assertGreater(sum(forms), 48)
-        self.assertGreater(forms.count(False), 4)
-        # Chains cross chunks of 32 rows, and both schedules are populated.
-        self.assertGreater(int(np.max(rows["row_count"] - rows["bounds"][:, 1])), 64)
-        self.assertGreater(int(np.sum(walks["group_count"])), 96)
-        self.assertGreater(int(np.sum(np.maximum(walks["serial_count"], 0))), 96)
-        triples = _triple_worlds(0, worlds=70, capacity=98, dofs=33)
-        walks = _serial_triple_walks(triples, serial_contacts=True)
-        self.assertGreater(int(np.max(triples["row_count"] - triples["bounds"][:, 1])), 3 * 32)
-        self.assertGreater(int(np.sum(walks["group_count"])), 70)
-        self.assertGreater(int(np.sum(np.maximum(walks["serial_count"], 0))), 70)
+        """Draw unit layouts the builder takes in parallel and broken layouts it must leave to the serial walks.
+
+        The layout check rejects exactly the broken worlds, and wherever the rows form units the schedule
+        over the heads alone, which the parallel path builds, equals the serial walks'. In every shape, each
+        flaw breaks a world where the two differ with serial lists built, and each flaw of
+        :data:`_LINK_FLAWS` one where they differ without, so a layout check that admitted the flaw would
+        fail the CUDA twin.
+        """
+        longest = 0
+        for (capacity, dofs), rows in _unit_twin_rows():
+            worlds = rows["row_count"].shape[0]
+            forms = np.array([_rows_form_units(rows, world) for world in range(worlds)])
+            np.testing.assert_array_equal(forms, rows["flaw"] < 0)
+            self.assertGreater(int(np.sum(forms)), worlds // 2)
+            for serial_contacts in (False, True):
+                walks = _serial_unit_walks(rows, serial_contacts=serial_contacts)
+                differ = _differing_worlds(walks, _schedule_unit_heads(rows, serial_contacts=serial_contacts))
+                self.assertFalse(np.any(differ & forms), f"capacity {capacity}: the heads schedule left the walks")
+                for flaw in range(len(_FLAWS)) if serial_contacts else _LINK_FLAWS:
+                    with self.subTest(capacity=capacity, dofs=dofs, serial_contacts=serial_contacts, flaw=_FLAWS[flaw]):
+                        self.assertTrue(np.any(differ & (rows["flaw"] == flaw)))
+                if serial_contacts:
+                    # Both schedules are populated.
+                    self.assertGreater(int(np.sum(walks["group_count"])), worlds // 3)
+                    self.assertGreater(int(np.sum(np.maximum(walks["serial_count"], 0))), worlds)
+            longest = max(longest, int(np.max(rows["row_count"] - rows["bounds"][:, 1])))
+        # Chains cross chunks of 32 rows.
+        self.assertGreater(longest, 64)
+
+    def test_synthetic_triple_worlds_cross_chunks(self):
+        """Draw triple worlds that span several chunks of 32 triples and populate both schedules."""
+        longest = 0
+        for (capacity, _dofs), rows in _triple_twin_rows():
+            walks = _serial_triple_walks(rows, serial_contacts=True)
+            worlds = rows["row_count"].shape[0]
+            self.assertGreater(int(np.sum(walks["group_count"])), worlds // 3, f"capacity {capacity}")
+            self.assertGreater(int(np.sum(np.maximum(walks["serial_count"], 0))), worlds, f"capacity {capacity}")
+            longest = max(longest, int(np.max(rows["row_count"] - rows["bounds"][:, 1])))
+        self.assertGreater(longest, 3 * 64)
 
     @unittest.skipUnless(wp.is_cuda_available(), "the contact schedule builders require CUDA")
     def test_unit_builder_matches_the_serial_walks(self):
         """Build unit schedules bitwise equal to the serial walks, in every layout and at capacity edges."""
         device = wp.get_device("cuda:0")
-        for seed, (capacity, dofs) in enumerate(_UNIT_SHAPES):
-            rows = _unit_worlds(seed, worlds=180, capacity=capacity, dofs=dofs)
+        for (capacity, dofs), rows in _unit_twin_rows():
             for serial_contacts in (False, True):
                 with self.subTest(capacity=capacity, dofs=dofs, serial_contacts=serial_contacts):
                     expected = _serial_unit_walks(rows, serial_contacts=serial_contacts)
@@ -467,8 +545,7 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
     def test_triple_builder_matches_the_serial_walks(self):
         """Build triple schedules bitwise equal to the serial walks, in every layout and at capacity edges."""
         device = wp.get_device("cuda:0")
-        for seed, (capacity, dofs) in enumerate(_TRIPLE_SHAPES):
-            rows = _triple_worlds(seed, worlds=140, capacity=capacity, dofs=dofs)
+        for (capacity, dofs), rows in _triple_twin_rows():
             for serial_contacts in (False, True):
                 with self.subTest(capacity=capacity, dofs=dofs, serial_contacts=serial_contacts):
                     expected = _serial_triple_walks(rows, serial_contacts=serial_contacts)
