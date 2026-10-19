@@ -738,17 +738,19 @@ Structurally Immobile Pairs
 
 By default, :class:`~CollisionPipeline` drops candidate pairs whose shapes are both
 *structurally immobile*: static shapes (``body=-1``) and the shapes of bodies welded to the world.
-A body is welded when it is dynamic and every joint that names it as the child is an enabled fixed
-joint from the world or from another welded body, like the base link of a fixed-base robot and
-anything fixed to it. Kinematic bodies can move, so neither they nor the bodies welded to them are
-immobile, and their pairs are kept. The filter applies in every broad phase mode, also to pairs
-that come from different builders, such as a global ground and a robot base replicated into
-each world.
+A body is welded when it is dynamic and every joint that names it as the child is an enabled joint
+without degrees of freedom from the world or from another welded body, like the base link of a
+fixed-base robot and anything fixed to it. The joint's degree-of-freedom count decides, not its
+type: a fixed joint welds, and so does a D6 joint without axes, which the USD importer makes of a
+generic ``PhysicsJoint`` that attaches a robot's root to the world. Kinematic bodies can move, so
+neither they nor the bodies welded to them are immobile, and their pairs are kept. The filter
+applies in every broad phase mode, also to pairs that come from different builders, such as a
+global ground and a robot base replicated into each world.
 
 Neither shape of such a pair can move, so its contacts have no dynamics in a solver that gives
 welded bodies no degrees of freedom; :class:`~newton.solvers.SolverFeatherPGS` discards them
 anyway. Dropping them in the broad phase removes their contact generation and solver bookkeeping.
-Solvers that resolve fixed joints as constraints no longer see these contacts either, and contact
+Solvers that resolve such joints as constraints no longer see these contacts either, and contact
 sensors no longer report them. With ``include_static_kinematic_pairs=False``, a welded body also
 counts as static for that filter, so its pairs with kinematic shapes are dropped as well.
 
@@ -758,11 +760,11 @@ immobile shapes and dropped pairs. Pass ``include_immobile_pairs=True``, or set
 
 The immobile set is computed at construction. Code that changes :attr:`~Model.joint_enabled` or
 :attr:`~Model.body_flags` at runtime must notify the pipeline as well as the solver; otherwise a
-body released from a fixed joint keeps no contacts with static shapes and falls through them:
+body released from its welding joint keeps no contacts with static shapes and falls through them:
 
 .. code-block:: python
 
-    model.joint_enabled.assign(enabled)  # disables the fixed joint that welds a body
+    model.joint_enabled.assign(enabled)  # disables the joint that welds a body
     solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
     pipeline.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
 

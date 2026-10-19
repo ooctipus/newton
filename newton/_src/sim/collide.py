@@ -48,7 +48,7 @@ from ..geometry.support_function import (
 )
 from ..geometry.types import GeoType
 from ..sim.contacts import Contacts, note_contact_frame_write
-from ..sim.enums import BodyFlags, JointType, ModelFlags
+from ..sim.enums import BodyFlags, ModelFlags
 from ..sim.model import Model
 from ..sim.state import State
 
@@ -1777,7 +1777,10 @@ class CollisionPipeline:
                 shapes are both structurally immobile. A shape is structurally
                 immobile when it is static or belongs to a body welded to the
                 world: a dynamic body whose every parent joint is an enabled
-                fixed joint from the world or from another welded body. Neither
+                joint without degrees of freedom, from the world or from another
+                welded body. The joint's degree-of-freedom count decides, not its
+                type: a fixed joint welds, and so does a D6 joint without axes,
+                which the USD importer makes of a generic root joint. Neither
                 shape of such a pair can move, so its contacts have no dynamics
                 in a solver that gives welded bodies no degrees of freedom.
                 Kinematic bodies can move, so they and the bodies welded to them
@@ -1785,13 +1788,13 @@ class CollisionPipeline:
                 ``NEWTON_BROAD_PHASE_IMMOBILE_FILTER`` environment variable:
                 unset or ``1`` drops these pairs in the broad phase, ``0`` keeps
                 them. ``False`` drops them. ``True`` keeps them, as before: for
-                solvers that resolve fixed joints as constraints and respond to
+                solvers that resolve such joints as constraints and respond to
                 such contacts, and for contact sensors that should report them.
                 The immobile set is computed at construction; code that changes
                 :attr:`~newton.Model.body_flags` or
                 :attr:`~newton.Model.joint_enabled` at runtime must also call
-                :meth:`notify_model_changed`, or a body released from a fixed
-                joint keeps no contacts with static shapes.
+                :meth:`notify_model_changed`, or a body released from its
+                welding joint keeps no contacts with static shapes.
             sdf_hydroelastic_config: Configuration for hydroelastic collision
                 handling. Defaults to None.
             shape_pairs_max: Override for the broad-phase candidate-pair
@@ -3440,33 +3443,36 @@ class CollisionPipeline:
     class _WeldTopology:
         """Host copy of the joint topology that welds bodies to the world.
 
-        A body is welded when it has a parent joint and every joint that names it as the
-        child is a fixed joint from the world or from another welded body, so it has no
-        degree of freedom of its own. A shape is structurally immobile when it is static or
-        belongs to a welded body. Joints and shape ownership are fixed once a model is
-        finalized and are read here once; body flags and joint enables are runtime state,
-        which :meth:`read_body_flags` and :meth:`read_joint_enables` copy from the device.
+        A joint without degrees of freedom welds its child to its parent, whatever its type: a
+        fixed joint, or a D6 joint without axes, which the USD importer makes of a generic
+        root joint. A body is welded when it has a parent joint and every joint that names it
+        as the child welds it to the world or to another welded body, so it has no degree of
+        freedom of its own. A shape is structurally immobile when it is static or belongs to a
+        welded body. Joints and shape ownership are fixed once a model is finalized and are
+        read here once; body flags and joint enables are runtime state, which
+        :meth:`read_body_flags` and :meth:`read_joint_enables` copy from the device.
         """
 
         def __init__(self, model: Model):
             self.body_count = int(model.body_count)
             empty = np.empty(0, dtype=np.int32)
             self.shape_body = model.shape_body.numpy() if model.shape_count else empty
-            has_joints = self.body_count > 0 and int(model.joint_count) > 0
-            joint_type = model.joint_type.numpy() if has_joints else empty
-            parent = model.joint_parent.numpy() if has_joints else empty
-            child = model.joint_child.numpy() if has_joints else empty
+            joint_count = int(model.joint_count) if self.body_count > 0 else 0
+            parent = model.joint_parent.numpy() if joint_count else empty
+            child = model.joint_child.numpy() if joint_count else empty
+            # Judge the DOF count, not the type; joint_qd_start ends with a sentinel.
+            dofs = np.diff(model.joint_qd_start.numpy()[: joint_count + 1]) if joint_count else empty
             attached = (child >= 0) & (child < self.body_count)
-            self.fixed_joints = np.flatnonzero(attached & (joint_type == int(JointType.FIXED)))
-            self.fixed_parent = parent[self.fixed_joints]
-            self.fixed_child = child[self.fixed_joints]
+            self.weld_joints = np.flatnonzero(attached & (dofs == 0))
+            self.weld_parent = parent[self.weld_joints]
+            self.weld_child = child[self.weld_joints]
             self.parent_joints = np.bincount(child[attached], minlength=self.body_count)
 
         def read_joint_enables(self, model: Model) -> np.ndarray | None:
-            """Return whether each joint of ``fixed_joints`` is enabled, or ``None`` when all are."""
-            if model.joint_enabled is None or not len(self.fixed_joints):
+            """Return whether each joint of ``weld_joints`` is enabled, or ``None`` when all are."""
+            if model.joint_enabled is None or not len(self.weld_joints):
                 return None
-            return model.joint_enabled.numpy()[self.fixed_joints].astype(bool)
+            return model.joint_enabled.numpy()[self.weld_joints].astype(bool)
 
         def read_body_flags(self, model: Model) -> np.ndarray | None:
             """Return a host copy of the body flags, or ``None`` without them."""
@@ -3492,21 +3498,21 @@ class CollisionPipeline:
                     can move a kinematic body and everything welded to it. With both ``None``
                     the result bounds the welded set over every state of the two arrays.
             """
-            fixed_parent, fixed_child = self.fixed_parent, self.fixed_child
+            weld_parent, weld_child = self.weld_parent, self.weld_child
             if enabled is not None:
-                fixed_parent, fixed_child = fixed_parent[enabled], fixed_child[enabled]
+                weld_parent, weld_child = weld_parent[enabled], weld_child[enabled]
             eligible = self.parent_joints > 0
             if flags is not None:
                 eligible &= ((flags & int(BodyFlags.DYNAMIC)) != 0) & ((flags & int(BodyFlags.KINEMATIC)) == 0)
             # Every parent joint must weld; a body with another parent joint keeps its freedom.
-            eligible &= np.bincount(fixed_child, minlength=self.body_count) == self.parent_joints
+            eligible &= np.bincount(weld_child, minlength=self.body_count) == self.parent_joints
             welded = np.zeros(self.body_count, dtype=bool)
-            from_world = fixed_parent < 0
-            parent_index = np.where(from_world, 0, fixed_parent)
-            # Weld outward from the world, one fixed joint per pass, until the set stops growing.
+            from_world = weld_parent < 0
+            parent_index = np.where(from_world, 0, weld_parent)
+            # Weld outward from the world, one joint per pass, until the set stops growing.
             while True:
                 anchored = from_world | welded[parent_index]
-                grown = eligible & (np.bincount(fixed_child[anchored], minlength=self.body_count) == self.parent_joints)
+                grown = eligible & (np.bincount(weld_child[anchored], minlength=self.body_count) == self.parent_joints)
                 if np.array_equal(grown, welded):
                     return welded
                 welded = grown

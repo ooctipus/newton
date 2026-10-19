@@ -16,7 +16,7 @@ import newton
 from newton import BodyFlags, ModelFlags
 from newton._src.geometry.broad_phase_nxn import BroadPhaseAllPairs, BroadPhaseExplicit
 from newton._src.geometry.broad_phase_sap import BroadPhaseSAP
-from newton.tests.unittest_utils import add_function_test, get_test_devices
+from newton.tests.unittest_utils import USD_AVAILABLE, add_function_test, get_test_devices
 
 _FLAG = "NEWTON_BROAD_PHASE_IMMOBILE_FILTER"
 _MODES = ("explicit", "nxn", "sap")
@@ -58,8 +58,13 @@ def _pose(x, y, z=0.05):
     return wp.transform(wp.vec3(x, y, z), wp.quat_identity())
 
 
-def _pair_scene(device):
+def _pair_scene(device, *, locked_d6=False):
     """Build one world of every shape role on a global ground and replicate it, as scene builders do.
+
+    Args:
+        device: The device to finalize the model on.
+        locked_d6: Use D6 joints instead: one without axes for every fixed joint, and one with
+            the revolute joint's axis for the revolute joint.
 
     Returns:
         The model and, per world, the shape index of each role. Every role rests on the
@@ -74,29 +79,34 @@ def _pair_scene(device):
         roles[role] = _box(proto, body, x, y)
         return body
 
+    def weld(parent, child, **kwargs):
+        if locked_d6:
+            # Filter the parent's shapes as a fixed joint does, so that both scenes list the same pairs.
+            return proto.add_joint_d6(parent, child, collision_filter_parent=True, **kwargs)
+        return proto.add_joint_fixed(parent, child, **kwargs)
+
     roles["table"] = _box(proto, -1, 0.6, 0.0, z=0.1, half=0.1)
     base = link("base", 0.0, 0.0)
     mount = link("mount", 0.0, 0.3)
     proto.add_articulation(
-        [
-            proto.add_joint_fixed(-1, base, parent_xform=_pose(0.0, 0.0)),
-            proto.add_joint_fixed(base, mount, parent_xform=_pose(0.0, 0.3, 0.0)),
-        ]
+        [weld(-1, base, parent_xform=_pose(0.0, 0.0)), weld(base, mount, parent_xform=_pose(0.0, 0.3, 0.0))]
     )
     post = link("post", 0.09, 0.0)
-    proto.add_articulation([proto.add_joint_fixed(-1, post, parent_xform=_pose(0.09, 0.0))])
+    proto.add_articulation([weld(-1, post, parent_xform=_pose(0.09, 0.0))])
     arm = link("arm", -0.6, 0.0)
-    proto.add_articulation([proto.add_joint_revolute(-1, arm, axis=(0.0, 0.0, 1.0), parent_xform=_pose(-0.6, 0.0))])
+    if locked_d6:
+        hinge = newton.ModelBuilder.JointDofConfig(axis=(0.0, 0.0, 1.0))
+        root = proto.add_joint_d6(-1, arm, angular_axes=[hinge], parent_xform=_pose(-0.6, 0.0))
+    else:
+        root = proto.add_joint_revolute(-1, arm, axis=(0.0, 0.0, 1.0), parent_xform=_pose(-0.6, 0.0))
+    proto.add_articulation([root])
     held = link("welded_kinematic", -0.3, 0.6, kinematic=True)
     carried = link("on_kinematic", -0.3, 0.9)
     proto.add_articulation(
-        [
-            proto.add_joint_fixed(-1, held, parent_xform=_pose(-0.3, 0.6)),
-            proto.add_joint_fixed(held, carried, parent_xform=_pose(0.0, 0.3, 0.0)),
-        ]
+        [weld(-1, held, parent_xform=_pose(-0.3, 0.6)), weld(held, carried, parent_xform=_pose(0.0, 0.3, 0.0))]
     )
     loose = link("loose", 0.3, 0.6)
-    proto.add_articulation([proto.add_joint_fixed(-1, loose, parent_xform=_pose(0.3, 0.6), enabled=False)])
+    proto.add_articulation([weld(-1, loose, parent_xform=_pose(0.3, 0.6), enabled=False)])
     roles["free"] = _box(proto, proto.add_body(xform=_pose(0.0, -0.6), label="free"), 0.0, -0.6)
     kinematic = proto.add_body(xform=_pose(0.09, -0.6), is_kinematic=True, label="kinematic")
     roles["kinematic"] = _box(proto, kinematic, 0.09, -0.6)
@@ -384,6 +394,180 @@ def test_every_parent_joint_must_weld(test, device):
                     test.assertEqual(record["welded_bodies"], _WORLDS)
 
 
+def test_joints_without_freedom_weld_whatever_their_type(test, device):
+    """Weld through D6 joints without axes as through fixed joints, and not through a D6 joint with an axis."""
+    fixed, _ = _pair_scene(device)
+    locked, _ = _pair_scene(device, locked_d6=True)
+    joint_types = set(locked.joint_type.numpy().tolist())
+    test.assertIn(int(newton.JointType.D6), joint_types)
+    test.assertNotIn(int(newton.JointType.FIXED), joint_types)
+    for mode, environment in _LAUNCHES:
+        with test.subTest(broad_phase=mode, **environment), patch.dict(os.environ, environment), _flag(None):
+            expected = newton.CollisionPipeline(fixed, broad_phase=mode)
+            pipeline = newton.CollisionPipeline(locked, broad_phase=mode)
+            test.assertEqual(
+                _ordered(_candidate_pairs(pipeline, locked)[0], device),
+                _ordered(_candidate_pairs(expected, fixed)[0], device),
+            )
+            record = pipeline.get_collision_selection()["immobile_pairs"]
+            test.assertEqual(record, expected.get_collision_selection()["immobile_pairs"])
+            test.assertEqual(record["welded_bodies"], 3 * _WORLDS)
+
+
+_REACH_ARM_USD = """#usda 1.0
+(
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "arm" (
+    prepend apiSchemas = ["PhysicsArticulationRootAPI"]
+)
+{
+    def PhysicsJoint "rootJoint"
+    {
+        rel physics:body0 = </arm/base_link>
+        point3f physics:localPos0 = (0, 0, 0)
+        point3f physics:localPos1 = (0, 0, 0)
+        quatf physics:localRot0 = (1, 0, 0, 0)
+        quatf physics:localRot1 = (1, 0, 0, 0)
+    }
+
+    def Xform "base_link" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+    )
+    {
+        float physics:mass = 4
+
+        def Cylinder "collision" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            uniform token axis = "Z"
+            double height = 0.03
+            double radius = 0.075
+            double3 xformOp:translate = (0, 0, 0.01)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+    }
+
+    def Xform "shoulder_link" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+    )
+    {
+        float physics:mass = 2
+        double3 xformOp:translate = (0, 0, 0.2)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Sphere "collision" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double radius = 0.05
+        }
+    }
+
+    def PhysicsRevoluteJoint "shoulder_pan_joint"
+    {
+        rel physics:body0 = </arm/base_link>
+        rel physics:body1 = </arm/shoulder_link>
+        uniform token physics:axis = "Z"
+        point3f physics:localPos0 = (0, 0, 0.2)
+        point3f physics:localPos1 = (0, 0, 0)
+        quatf physics:localRot0 = (1, 0, 0, 0)
+        quatf physics:localRot1 = (1, 0, 0, 0)
+    }
+}
+"""
+
+
+def _reach_scene(device, *, source):
+    """Replicate an arm whose root joint is a D6 joint without axes, its base on a static table, beside a free box.
+
+    The ground lies 1.05 m below the table top, as in reach scenes. ``source="usd"`` imports the
+    arm from a generic USD ``PhysicsJoint`` root, which names the base and no other body; the
+    builder variant adds that D6 joint directly.
+    """
+    proto = newton.ModelBuilder()
+    proto.rigid_gap = 0.01
+    _box(proto, -1, 0.3, 0.0, z=-0.5, half=0.5)
+    if source == "usd":
+        from pxr import Usd
+
+        stage = Usd.Stage.CreateInMemory()
+        stage.GetRootLayer().ImportFromString(_REACH_ARM_USD)
+        proto.add_usd(stage)
+    else:
+        base = proto.add_link(label="base_link")
+        proto.add_shape_cylinder(base, xform=_pose(0.0, 0.0, 0.01), radius=0.075, half_height=0.015)
+        shoulder = proto.add_link(xform=_pose(0.0, 0.0, 0.2), label="shoulder_link")
+        proto.add_shape_sphere(shoulder, radius=0.05)
+        root = proto.add_joint_d6(-1, base)
+        hinge = proto.add_joint_revolute(base, shoulder, axis=(0.0, 0.0, 1.0), parent_xform=_pose(0.0, 0.0, 0.2))
+        proto.add_articulation([root, hinge])
+    _box(proto, proto.add_body(xform=_pose(0.4, 0.3), label="box"), 0.4, 0.3)
+    scene = newton.ModelBuilder()
+    scene.add_ground_plane(height=-1.05)
+    scene.replicate(proto, _WORLDS, spacing=(3.0, 0.0, 0.0))
+    return scene.finalize(device=device)
+
+
+def test_census_drops_exactly_the_contacts_without_response(test, device):
+    """Drop exactly the contacts FeatherPGS gives neither side a response DOF, for a reach-like arm.
+
+    The arm's root joint is a D6 joint without axes, as the USD importer makes of a generic root
+    ``PhysicsJoint``. A census of the contacts with the pairs kept classifies each by whether
+    FeatherPGS gives either side a response DOF: the base's table contacts get none, the free
+    box's do. The default must drop exactly the former and count the base as welded.
+    """
+    for source in ("builder", "usd"):
+        with test.subTest(source=source):
+            if source == "usd" and not USD_AVAILABLE:
+                test.skipTest("Requires usd-core")
+            model = _reach_scene(device, source=source)
+            # The arm's root joint has no degree of freedom, whatever made it.
+            roots = np.flatnonzero(model.joint_parent.numpy() == -1)
+            dofs = np.diff(model.joint_qd_start.numpy())[roots]
+            types = model.joint_type.numpy()[roots]
+            test.assertEqual(int(np.count_nonzero((types == int(newton.JointType.D6)) & (dofs == 0))), _WORLDS)
+
+            solver = newton.solvers.SolverFeatherPGS(model)
+            shape_body = model.shape_body.numpy()
+            body = np.maximum(shape_body, 0)
+            articulation = solver.body_to_articulation.numpy()[body]
+            responds = (
+                (shape_body >= 0)
+                & (articulation >= 0)
+                & (solver.articulation_response_dof_count.numpy()[np.maximum(articulation, 0)] > 0)
+                & (solver.body_has_response_dofs.numpy()[body] != 0)
+                & ((model.body_flags.numpy()[body] & int(BodyFlags.KINEMATIC)) == 0)
+            )
+            census = {}
+            for flag in ("0", None):
+                pipeline = _pipeline(model, flag)
+                _, contacts = _candidate_pairs(pipeline, model)
+                count = int(contacts.rigid_contact_count.numpy()[0])
+                pairs = np.sort(
+                    np.stack(
+                        (contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count])
+                    ),
+                    axis=0,
+                )
+                census[flag] = (pairs, pipeline.get_collision_selection()["immobile_pairs"])
+            pairs, _ = census["0"]
+            silent = ~responds[pairs[0]] & ~responds[pairs[1]]
+            # The base's table contacts and the box's, in every world; the base is the cylinder.
+            base = model.shape_type.numpy() == int(newton.GeoType.CYLINDER)
+            on_base = base[pairs[0]] | base[pairs[1]]
+            test.assertGreaterEqual(int(np.count_nonzero(on_base)), _WORLDS)
+            test.assertTrue(np.all(silent[on_base]))
+            test.assertGreaterEqual(int(np.count_nonzero(~silent)), _WORLDS)
+            kept, record = census[None]
+            test.assertEqual(sorted(map(tuple, kept.T.tolist())), sorted(map(tuple, pairs[:, ~silent].T.tolist())))
+            test.assertTrue(record["enabled"])
+            test.assertEqual(record["welded_bodies"], _WORLDS)
+
+
 def test_notifications_refresh_the_immobile_set(test, device):
     """Follow body-flag and joint-enable changes once the pipeline is notified."""
     model, worlds = _pair_scene(device)
@@ -511,14 +695,17 @@ def test_environment_flag_values(test, device):
         test.assertNotIn(_FLAG, selection["environment"]["overridden"])
 
 
-def _arm_scene(device):
-    """A fixed-base arm whose base rests in the ground and whose link presses a free cube, in two worlds."""
+def _arm_scene(device, *, locked_d6=False):
+    """A fixed-base arm whose base rests in the ground and whose link presses a free cube, in two worlds.
+
+    ``locked_d6`` roots the base with a D6 joint without axes instead of a fixed joint.
+    """
     proto = newton.ModelBuilder()
     proto.rigid_gap = 0.01
     base_pose = wp.transform(wp.vec3(0.0, 0.0, 0.049), wp.quat_identity())
     base = proto.add_link(xform=base_pose, label="base")
     proto.add_shape_box(base, hx=0.1, hy=0.1, hz=0.05)
-    root = proto.add_joint_fixed(-1, base, parent_xform=base_pose)
+    root = (proto.add_joint_d6 if locked_d6 else proto.add_joint_fixed)(-1, base, parent_xform=base_pose)
     arm = proto.add_link(label="arm")
     proto.add_shape_box(arm, hx=0.25, hy=0.03, hz=0.02)
     hinge = proto.add_joint_revolute(
@@ -568,6 +755,69 @@ def _list_immobile_contacts_last(contacts, immobile):
     return count - int(np.count_nonzero(dropped))
 
 
+def _check_arm_steps(test, model, law, friction_anchor_beta, device):
+    """Step the arm scene with and without the base's ground pairs from the same state, and compare every step."""
+    shape_body = model.shape_body.numpy()
+    # Body 0 of each world is the welded base, body 1 the arm and body 2 the cube.
+    local = np.where(shape_body < 0, -1, shape_body % 3)
+    immobile = local <= 0
+    control = model.control()
+    solvers = [newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=friction_anchor_beta) for _ in range(2)]
+    test.assertEqual([solver.get_path_selection()["routes"]["friction"]["law"] for solver in solvers], [law] * 2)
+    # Sorted contacts compare element by element: the reference keeps the base's ground pairs.
+    pipelines = (_pipeline(model, "0", deterministic=True), _pipeline(model, None, deterministic=True))
+    reference, contacts = (pipeline.contacts() for pipeline in pipelines)
+    state = model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+    # Every step gets new states, kept alive so that no address recurs: a solver must not take a
+    # copied input for its own last output.
+    states = [state]
+    dropped_contacts = arm_contacts = 0
+    for _ in range(60):
+        pipelines[0].collide(state, reference)
+        pipelines[1].collide(state, contacts)
+        listed = int(reference.rigid_contact_count.numpy()[0])
+        kept = _list_immobile_contacts_last(reference, immobile)
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        test.assertEqual(count, kept)
+        for name in _CONTACT_GEOMETRY:
+            np.testing.assert_array_equal(
+                getattr(contacts, f"rigid_contact_{name}").numpy()[:count],
+                getattr(reference, f"rigid_contact_{name}").numpy()[:kept],
+            )
+        dropped_contacts += listed - kept
+        shapes = np.stack(
+            (contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count])
+        )
+        ends = np.sort(local[shapes], axis=0)
+        arm_contacts += int(np.count_nonzero((ends[0] == 1) & (ends[1] == 2)))
+        outputs = []
+        for solver, buffer in zip(solvers, (reference, contacts), strict=True):
+            state_in, state_out = model.state(), model.state()
+            state_in.assign(state)
+            state_in.clear_forces()
+            solver.step(state_in, state_out, control, buffer, 1.0 / 120.0)
+            states += [state_in, state_out]
+            outputs.append(state_out)
+        # FeatherPGS gives the base's ground contacts no row and every other contact the same rows.
+        paths = [solver.contact_path.numpy().copy() for solver in solvers]
+        needed = [solver.contact_slots_needed.numpy().copy() for solver in solvers]
+        np.testing.assert_array_equal(paths[0][kept:listed], -1)
+        np.testing.assert_array_equal(paths[1][:count], paths[0][:kept])
+        rows = paths[0][:kept] >= 0
+        np.testing.assert_array_equal(needed[1][:count][rows], needed[0][:kept][rows])
+        expected, actual = (np.concatenate((output.joint_q.numpy(), output.joint_qd.numpy())) for output in outputs)
+        test.assertTrue(np.all(np.isfinite(actual)))
+        if wp.get_device(device).is_cpu:
+            np.testing.assert_array_equal(actual, expected)
+        else:
+            np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-5)
+        state = outputs[0]
+    # The base rests in the ground and the arm presses the cube.
+    test.assertGreater(dropped_contacts, 0)
+    test.assertGreater(arm_contacts, 0)
+
+
 def test_fixed_base_arm_trajectories_match(test, device):
     """Step FeatherPGS alike without the base's ground contacts, under point and patch friction.
 
@@ -578,73 +828,13 @@ def test_fixed_base_arm_trajectories_match(test, device):
     order reproduces the difference). The reference lists them last instead, so that every other
     contact keeps its index. Contacts and rows then agree exactly, and states bitwise on CPU and
     within 1e-5 on CUDA, where only the accumulation order of floating-point atomics may differ.
+    The base is rooted by a fixed joint and by a D6 joint without axes.
     """
-    model = _arm_scene(device)
-    shape_body = model.shape_body.numpy()
-    # Body 0 of each world is the welded base, body 1 the arm and body 2 the cube.
-    local = np.where(shape_body < 0, -1, shape_body % 3)
-    immobile = local <= 0
-    control = model.control()
-    for law, beta in (("point", 0.0), ("patch", 0.2)):
-        with test.subTest(friction=law):
-            solvers = [newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=beta) for _ in range(2)]
-            test.assertEqual(
-                [solver.get_path_selection()["routes"]["friction"]["law"] for solver in solvers], [law] * 2
-            )
-            # Sorted contacts compare element by element: the reference keeps the base's ground pairs.
-            pipelines = (_pipeline(model, "0", deterministic=True), _pipeline(model, None, deterministic=True))
-            reference, contacts = (pipeline.contacts() for pipeline in pipelines)
-            state = model.state()
-            newton.eval_fk(model, model.joint_q, model.joint_qd, state)
-            # Every step gets new states, kept alive so that no address recurs: a solver must not
-            # take a copied input for its own last output.
-            states = [state]
-            dropped_contacts = arm_contacts = 0
-            for _ in range(60):
-                pipelines[0].collide(state, reference)
-                pipelines[1].collide(state, contacts)
-                listed = int(reference.rigid_contact_count.numpy()[0])
-                kept = _list_immobile_contacts_last(reference, immobile)
-                count = int(contacts.rigid_contact_count.numpy()[0])
-                test.assertEqual(count, kept)
-                for name in _CONTACT_GEOMETRY:
-                    np.testing.assert_array_equal(
-                        getattr(contacts, f"rigid_contact_{name}").numpy()[:count],
-                        getattr(reference, f"rigid_contact_{name}").numpy()[:kept],
-                    )
-                dropped_contacts += listed - kept
-                shapes = np.stack(
-                    (contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count])
-                )
-                ends = np.sort(local[shapes], axis=0)
-                arm_contacts += int(np.count_nonzero((ends[0] == 1) & (ends[1] == 2)))
-                outputs = []
-                for solver, buffer in zip(solvers, (reference, contacts), strict=True):
-                    state_in, state_out = model.state(), model.state()
-                    state_in.assign(state)
-                    state_in.clear_forces()
-                    solver.step(state_in, state_out, control, buffer, 1.0 / 120.0)
-                    states += [state_in, state_out]
-                    outputs.append(state_out)
-                # FeatherPGS gives the base's ground contacts no row and every other contact the same rows.
-                paths = [solver.contact_path.numpy().copy() for solver in solvers]
-                needed = [solver.contact_slots_needed.numpy().copy() for solver in solvers]
-                np.testing.assert_array_equal(paths[0][kept:listed], -1)
-                np.testing.assert_array_equal(paths[1][:count], paths[0][:kept])
-                rows = paths[0][:kept] >= 0
-                np.testing.assert_array_equal(needed[1][:count][rows], needed[0][:kept][rows])
-                expected, actual = (
-                    np.concatenate((output.joint_q.numpy(), output.joint_qd.numpy())) for output in outputs
-                )
-                test.assertTrue(np.all(np.isfinite(actual)))
-                if wp.get_device(device).is_cpu:
-                    np.testing.assert_array_equal(actual, expected)
-                else:
-                    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-5)
-                state = outputs[0]
-            # The base rests in the ground and the arm presses the cube.
-            test.assertGreater(dropped_contacts, 0)
-            test.assertGreater(arm_contacts, 0)
+    for root in ("fixed", "locked_d6"):
+        model = _arm_scene(device, locked_d6=root == "locked_d6")
+        for law, beta in (("point", 0.0), ("patch", 0.2)):
+            with test.subTest(root=root, friction=law):
+                _check_arm_steps(test, model, law, beta, device)
 
 
 class TestCollisionImmobilePairs(unittest.TestCase):
@@ -667,6 +857,11 @@ for name, function in (
         test_models_without_immobile_pairs_keep_unfiltered_arguments,
     ),
     ("test_every_parent_joint_must_weld", test_every_parent_joint_must_weld),
+    ("test_joints_without_freedom_weld_whatever_their_type", test_joints_without_freedom_weld_whatever_their_type),
+    (
+        "test_census_drops_exactly_the_contacts_without_response",
+        test_census_drops_exactly_the_contacts_without_response,
+    ),
     ("test_notifications_refresh_the_immobile_set", test_notifications_refresh_the_immobile_set),
     ("test_unchanged_notifications_skip_the_refresh", test_unchanged_notifications_skip_the_refresh),
     # Warp captures graphs on CPU devices as well.
