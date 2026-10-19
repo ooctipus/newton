@@ -14,7 +14,7 @@ import newton
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
-from newton._src.solvers.feather_pgs.tree_kinetic_state import get_state_kernel
+from newton._src.solvers.feather_pgs.tree_kinetic_state import get_classify_kernel, get_state_kernel
 from newton.tests import test_feather_pgs_sparse_split as split
 from tools.fpgs_bench.public_state_oracle import physical_mass
 from tools.fpgs_bench.test_tree_kinetic_state import fixture as tree_fixture
@@ -50,6 +50,36 @@ class TestPrescaledTreeContract(unittest.TestCase):
         # which follows the six common arguments.
         for kernel in (ordinary, alternate, finish):
             self.assertEqual([arg.label for arg in kernel.adj.args][6], "motion_qd")
+
+    def test_classified_repair_takes_no_motion_input(self):
+        """Build the classification and the listed repair for ordinary motion only.
+
+        Owners keep the one-pass repair of a motion-velocity layout, which repairs on every step, so
+        no owner launches a classified repair of an alternate motion: the classification takes no
+        motion velocity (its arguments are the repair's operands, the comparison bank, the two block
+        lists and their counts) and the listed repair refuses one.
+        """
+        layout = TreeLayout(4, 3, 6, 3, 2, 0, (2, 1, 0))
+        classify = get_classify_kernel(layout=layout)
+        self.assertEqual(
+            [arg.label for arg in classify.adj.args],
+            [
+                "p",
+                "plan",
+                "data",
+                "cache",
+                "requests",
+                "global_refresh",
+                "bank",
+                "repair_blocks",
+                "compare_blocks",
+                "counts",
+            ],
+        )
+        listed = get_state_kernel(False, layout=layout, listed=True)
+        self.assertNotIn("motion_qd", [arg.label for arg in listed.adj.args])
+        with self.assertRaisesRegex(ValueError, "ordinary motion"):
+            get_state_kernel(False, layout=layout, motion_velocity=True, listed=True)
 
     def check_current_motion(self, device, exclude_driven=False):
         for floating in (False, True):

@@ -740,10 +740,12 @@ class TreeKineticState:
             # input bank as the comparison bank lists nothing for comparison.
             bank = self._bank(state_out if compare else state_in, state_in)
             self._list_counts.zero_()
+            # The classification is a contract of ordinary motion: it takes the six common
+            # arguments, not the motion input of the repair ABI.
             wp.launch(
                 self.classify_kernel,
                 dim=self.launch_count,
-                inputs=[*arguments, bank, self._repair_blocks, self._compare_blocks, self._list_counts],
+                inputs=[*arguments[:6], bank, self._repair_blocks, self._compare_blocks, self._list_counts],
                 block_dim=_CLASSIFY_BLOCK_DIM,
                 device=device,
             )

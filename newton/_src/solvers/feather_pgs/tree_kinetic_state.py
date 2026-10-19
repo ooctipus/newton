@@ -1048,6 +1048,7 @@ def get_state_kernel(
     ``repair_count[0]`` return at once, so a launch over every block on a
     capped grid (Warp's grid-stride loop) costs little more than the listed
     blocks. Each listed group runs the repair unchanged, early exit included.
+    Like the classification, it is a contract of ordinary motion.
 
     ``bank_coordinates`` (a group's coordinate count) builds the one-pass
     repair that compares input banks inside its blocks: a valid group stamped
@@ -1064,6 +1065,8 @@ def get_state_kernel(
         raise ValueError("Alternate motion velocity is a repair-only contract")
     if finish and listed:
         raise ValueError("A listed launch is a repair-only contract")
+    if listed and motion_velocity:
+        raise ValueError("A listed launch is a contract of the repair of ordinary motion")
     if bank_coordinates and (finish or motion_velocity or listed):
         raise ValueError("A compared input bank is a contract of the one-pass repair of ordinary motion")
     h = get_helpers(layout, chain_scan, body_velocity, reference=reference, clocked=clocked, host=host)
@@ -1573,28 +1576,15 @@ def get_bank_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFERENCE_
     return wp.kernel(module="unique", enable_backward=False)(bank_pass)
 
 
-# One thread's form of the repair's motion test (_DIFFERENT_MOTION_SOURCE): whether any
-# of a group's velocities differs from its motion velocity.
-@wp.func_native(
-    "if(state_qd.data==motion_qd.data)return 0;"
-    "for(int i=0;i<count;++i)if(state_qd.data[start+i]!=motion_qd.data[start+i])return 1;"
-    "return 0;"
-)
-def _motion_differs(state_qd: wp.array[float], motion_qd: wp.array[float], start: int, count: int) -> int: ...
-
-
 @functools.cache
-def get_classify_kernel(
-    chain_scan: bool = False, *, layout: TreeLayout = REFERENCE_LAYOUT, motion_velocity: bool = False
-):
+def get_classify_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFERENCE_LAYOUT):
     """List the repair blocks holding a group whose repair would not take its early exit; one thread per block.
 
     A group takes its early exit when its cache and its forest roots' caches
-    are valid, it is stamped with the input bank, its motion velocity is
-    unchanged (motion-velocity layouts only), and the step does not refresh it
-    or its geometry is current. A group of ordinary motion that meets every
-    condition but the stamp, which names the ``bank`` argument instead, is
-    left to the comparison: its block goes to ``compare_blocks`` (counted in
+    are valid, it is stamped with the input bank, and the step does not
+    refresh it or its geometry is current. A group that meets every condition
+    but the stamp, which names the ``bank`` argument instead, is left to the
+    comparison: its block goes to ``compare_blocks`` (counted in
     ``counts[1]``), and :func:`get_bank_kernel` appends the block to the
     repair list unless every group in it then exits. Any other block with a
     group that does not exit goes to ``repair_blocks`` (counted in
@@ -1603,9 +1593,15 @@ def get_classify_kernel(
     (``get_state_kernel(listed=True)``) runs each listed group's repair
     unchanged; blocks share no cache, state or publication entries, so every
     group computes the same values as in the one-pass launch.
+
+    The classification is a contract of ordinary motion. A motion-velocity
+    layout's repair runs on every step, and its groups also exit only where
+    every prescaled velocity compares equal to the input velocity; the owner
+    keeps its one-pass launch (see
+    :class:`~.tree_kinetic_owner.TreeKineticState`).
     """
     plan_type = tree_chain_scan.ChainPlan if chain_scan else KineticPlan
-    pack, roots, forest, dofs = layout.pack, len(layout.roots), layout.forest, layout.dofs
+    pack, roots, forest = layout.pack, len(layout.roots), layout.forest
 
     def classify(
         p: sparse_factor.SparsePlan,
@@ -1614,7 +1610,6 @@ def get_classify_kernel(
         cache: KineticData,
         requests: wp.array[int],
         global_refresh: int,
-        motion_qd: wp.array[float],
         bank: StateBank,
         repair_blocks: wp.array[int],
         compare_blocks: wp.array[int],
@@ -1641,14 +1636,10 @@ def get_classify_kernel(
             if current != 0:
                 own = _same_source(cache, group, data.joint_q, data.joint_qd)
             exits = own
-            if wp.static(motion_velocity):
-                if exits != 0:
-                    exits = int(_motion_differs(data.joint_qd, motion_qd, p.art_dof_start[art], wp.static(dofs)) == 0)
             if exits == 0:
                 candidate = int(0)
-                if wp.static(not motion_velocity):
-                    if current != 0 and own == 0:
-                        candidate = _same_source(cache, group, bank.joint_q, bank.joint_qd)
+                if current != 0 and own == 0:
+                    candidate = _same_source(cache, group, bank.joint_q, bank.joint_qd)
                 if candidate != 0:
                     compared = 1
                 else:
@@ -1665,8 +1656,6 @@ def get_classify_kernel(
         name += f"_l{layout.lanes}"
     if chain_scan:
         name += "_chain"
-    if motion_velocity:
-        name += "_motion"
     classify.__name__ = classify.__qualname__ = name
     return wp.kernel(module="unique", enable_backward=False)(classify)
 

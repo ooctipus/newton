@@ -1337,15 +1337,21 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
             stack, records = _recorded_launches(("launch", "launch_tiled"))
             with stack, patch.object(capture_joins, "capture_id", return_value=capture):
                 target.begin(state_in, augmented, state_in.joint_qd, DT, False, state_out=state_out)
-            recorded = [(kinds[kernel], inputs, kwargs) for kernel, inputs, kwargs in records if kernel in kinds]
-            for index, (kind, inputs, kwargs) in enumerate(recorded):
+            recorded = [
+                (kinds[kernel], kernel, inputs, kwargs) for kernel, inputs, kwargs in records if kernel in kinds
+            ]
+            for index, (kind, kernel, inputs, kwargs) in enumerate(recorded):
+                # One input per kernel argument, as a launch that runs requires.
+                labels = [arg.label for arg in kernel.adj.args]
+                self.assertEqual(len(inputs), len(labels), kind)
                 if kind in ("bank", "listed"):
                     self.assertEqual(kwargs.get("max_blocks"), target.groups[0]._repair_grid)
                 if kind == "classify":
                     compares = index + 1 < len(recorded) and recorded[index + 1][0] == "bank"
                     expected = (state_out if compares else state_in).joint_q.ptr
-                    banks.append(getattr(getattr(inputs[7], "joint_q", None), "ptr", None) == expected)
-            return [kind for kind, _, _ in recorded]
+                    bank = inputs[labels.index("bank")]
+                    banks.append(getattr(getattr(bank, "joint_q", None), "ptr", None) == expected)
+            return [kind for kind, _, _, _ in recorded]
 
         def finish(case, state_in, state_out, capture=0):
             target, augmented = case[2], case[4]
