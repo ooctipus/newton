@@ -3,11 +3,20 @@
 
 """The held-tree finish and repair are authored stage functions over one tree-group operand."""
 
+import re
 import unittest
 from pathlib import Path
 
+import numpy as np
+import warp as wp
+
+import newton
 from newton._src.solvers.feather_pgs import tree_kinetic_state
+from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
+from newton._src.solvers.feather_pgs.publication_data import PublicationData
+from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
+from newton.tests.test_feather_pgs_mixed_tree_free_body import DT, _build
 
 # A packed fixed-root tree, a free root body, a two-warp free-root tree and a forest with a free root.
 _LAYOUTS = (
@@ -29,6 +38,7 @@ _LAYOUTS = (
     ),
 )
 _STAGES = ("accelerations", "transport", "integrate", "relative_poses", "poses", "motion", "publish", "close")
+_ADMISSION = re.compile(r"admit_\d+\(")
 
 
 def _kernels(layout):
@@ -41,6 +51,68 @@ def _kernels(layout):
     yield "repair_listed_motion", state(False, layout=layout, motion_velocity=True, listed=True)
     # A group's coordinate count: a free root's quaternion takes one more than its three rotation velocities.
     yield "repair_banked", state(False, layout=layout, bank_coordinates=layout.dofs + layout.free_roots)
+
+
+def _input_uses(kernel, name="motion_qd"):
+    """Statements of a kernel's generated CPU code that use launch input ``name`` other than to declare or admit it."""
+    from warp._src.context import ModuleBuilder, ModuleHasher  # noqa: PLC0415
+
+    module = kernel.module
+    module.get_module_hash()
+    options = dict(module.resolve_options(wp.config), output_arch=None)
+    source = ModuleBuilder(module, options, hasher=ModuleHasher([kernel], options)).codegen("cpu")
+    # The launch argument and the parameters and fields that declare the input.
+    declaration = re.compile(rf"((wp::array_t<wp::\w+>|StateBank_\w+)\s*&?\s*)?(var_|adj_)?{name}\s*[,);]?")
+    word = re.compile(rf"\b{name}\b|\bvar_{name}\b")
+    uses = []
+    for line in source.splitlines():
+        code = line.split("//", 1)[0].strip()
+        if not word.search(code) or f"_wp_args->{name}" in code or _ADMISSION.search(code):
+            continue
+        if not declaration.fullmatch(code):
+            uses.append(code)
+    return uses
+
+
+def _state_arrays(group, data=None):
+    """Every array a finish or repair of ``group`` can write: its cache's, and its publication's when given."""
+    structs = [("cache", group.data, tree_kinetic_state.KineticData)]
+    if data is not None:
+        structs.append(("data", data, PublicationData))
+    arrays = {}
+    for prefix, instance, struct in structs:
+        for name in struct.vars:
+            value = getattr(instance, name)
+            if isinstance(value, wp.array) and value.size:
+                arrays[f"{prefix}.{name}"] = value
+    return arrays
+
+
+def _launch(group, kernel, data, velocity, start):
+    """Launch a state kernel from the arrays in ``start`` with ``velocity`` as its motion input; return what it left."""
+    arrays = _state_arrays(group, data)
+    for name, array in arrays.items():
+        array.assign(start[name])
+    wp.launch_tiled(
+        kernel,
+        dim=[group.launch_count],
+        inputs=[
+            group.sparse.plan,
+            group.plan,
+            data,
+            group.data,
+            group.solver._mass_update_requested,
+            1,
+            velocity,
+            group._repair_blocks,
+            group._list_counts,
+            group._no_bank,
+        ],
+        block_dim=group.block_dim,
+        device=group.solver.model.device,
+    )
+    # A CPU array's numpy() is a view; copy what the launch left.
+    return {name: array.numpy().copy() for name, array in arrays.items()}
 
 
 class TestTreeKineticStages(unittest.TestCase):
@@ -70,6 +142,100 @@ class TestTreeKineticStages(unittest.TestCase):
             with self.subTest(layout=layout.bodies):
                 self.assertEqual(len({tuple(args) for args in labels.values()}), 1)
                 self.assertEqual(labels["finish"][6:], ["motion_qd", "repair_blocks", "repair_count", "bank"])
+
+    def test_only_the_alternate_motion_repair_reads_the_motion_input(self):
+        """Generate no use of the motion input but its hand-off to admission, except in the alternate-motion repairs."""
+        wp.init()
+        for layout in _LAYOUTS:
+            for name, kernel in _kernels(layout):
+                with self.subTest(layout=layout.bodies, kernel=name):
+                    uses = _input_uses(kernel)
+                    if name in ("repair_motion", "repair_listed_motion"):
+                        self.assertTrue(any("different_motion" in use for use in uses), uses)
+                    else:
+                        self.assertEqual(uses, [])
+
+    def test_only_listed_and_comparing_repairs_read_their_inputs(self):
+        """Read the block list only in the listed repairs and the bank only in the repair that compares banks."""
+        wp.init()
+        readers = {
+            "repair_blocks": ("repair_listed", "repair_listed_motion"),
+            "repair_count": ("repair_listed", "repair_listed_motion"),
+            "bank": ("repair_banked",),
+        }
+        for layout in _LAYOUTS:
+            for name, kernel in _kernels(layout):
+                for argument, forms in readers.items():
+                    with self.subTest(layout=layout.bodies, kernel=name, input=argument):
+                        uses = _input_uses(kernel, argument)
+                        if name in forms:
+                            self.assertTrue(uses)
+                        else:
+                            self.assertEqual(uses, [])
+
+    def test_owners_without_alternate_motion_reject_another_velocity(self):
+        """Refuse a velocity other than the state's in begin and predict, before any cache changes."""
+        model = _build(wp.get_device("cpu"), worlds=2)
+        solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+        owner = MixedTreeKineticState(solver)
+        state, output, control = model.state(), model.state(), model.control()
+        augmented = solver._prepare_augmented_state(state, output, control)
+        other = wp.clone(state.joint_qd)
+        self.assertTrue(owner.groups)
+        for group in owner.groups:
+            with self.subTest(layout=group.layout.root_families):
+                self.assertFalse(group.motion_velocity)
+                before = {name: array.numpy().copy() for name, array in _state_arrays(group).items()}
+                with self.assertRaisesRegex(RuntimeError, "excludes alternate prescaled predictor velocity"):
+                    group.begin(state, augmented, other, DT, True)
+                with self.assertRaisesRegex(RuntimeError, "excludes alternate prescaled predictor velocity"):
+                    group.predict(state, augmented, control, other, DT)
+                for name, array in _state_arrays(group).items():
+                    np.testing.assert_array_equal(array.numpy(), before[name], err_msg=name)
+
+    def check_motion_input_ignored(self, device):
+        device = wp.get_device(device)
+        for alternate in (False, True):
+            model = _build(device, worlds=2, speed_limit=0.8 if alternate else None)
+            solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+            solver.enable_joint_velocity_limits = alternate
+            owner = MixedTreeKineticState(solver)
+            state, output, control = model.state(), model.state(), model.control()
+            rng = np.random.default_rng(41)
+            state.joint_qd.assign(rng.uniform(-0.4, 0.4, model.joint_dof_count).astype(np.float32))
+            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+            augmented = solver._prepare_augmented_state(state, output, control)
+            nan = wp.full(state.joint_qd.shape, float("nan"), dtype=float, device=device)
+            for group in owner.groups:
+                for name, kernel, published in (
+                    ("finish", group.finish_kernel, output),
+                    ("repair", group.repair_kernel, state),
+                ):
+                    with self.subTest(alternate=alternate, layout=group.layout.root_families, kernel=name):
+                        self.assertEqual(group.motion_velocity, alternate)
+                        data = group._publication(state, augmented, published, DT)
+                        start = {key: array.numpy().copy() for key, array in _state_arrays(group, data).items()}
+                        plain = _launch(group, kernel, data, state.joint_qd, start)
+                        poisoned = _launch(group, kernel, data, nan, start)
+                        differ = [key for key in plain if plain[key].tobytes() != poisoned[key].tobytes()]
+                        if alternate and name == "repair":
+                            self.assertTrue(differ)
+                        else:
+                            self.assertEqual(differ, [])
+
+    def test_finish_and_ordinary_repair_ignore_the_motion_input_cpu(self):
+        """Leave bitwise-equal state after a CPU finish or ordinary repair whose motion input holds NaN.
+
+        An alternate-motion repair reads the input, so its NaN shows: the
+        comparison sees a read. CPU owners launch their kernels with static
+        scratch.
+        """
+        self.check_motion_input_ignored("cpu")
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA unavailable")
+    def test_finish_and_ordinary_repair_ignore_the_motion_input_cuda(self):
+        """Leave bitwise-equal state after a CUDA finish or ordinary repair whose motion input holds NaN."""
+        self.check_motion_input_ignored("cuda:0")
 
 
 if __name__ == "__main__":
