@@ -105,6 +105,20 @@ class TestKernelIdentity(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(identity.report(hash_only, hash_only, ("cuda", "cpu")), 0)
 
+    def test_held_factor_calls_index_like_their_owners(self):
+        """Read a tree's own geometry record, and each held forest family's root block of the forest record."""
+        observed = {
+            (
+                args[0],
+                kwargs.get("geometric_stride") or max(kwargs["geometric_index"].value) + 1,
+                kwargs.get("geometric_group", False),
+            )
+            for _, _, args, kwargs in identity.held_factor_calls()
+        }
+        # Stride: a tree's entry count, or the forest's; a prescribed root holds no factor.
+        expected = {(16, 40, False), (6, 21, False), (9, 86, True), (6, 86, True), (23, 222, True), (6, 222, True)}
+        self.assertEqual(observed, expected)
+
     def test_label_names_calls_like_the_pins(self):
         """Label calls with positional values, sorted keywords and named layouts."""
         layout = identity.Named("chain9", object())

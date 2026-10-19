@@ -46,6 +46,7 @@ of the parent commit, so one copy of this script records both sides.
 
 import argparse
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -136,10 +137,14 @@ def factory_calls():
 
     Each matrix-free Gauss-Seidel flag is toggled alone on two bases (the pins
     hold the suite's shapes); the fallback and linked parallel tiers of a
-    second keyed-row coordinate layout (one articulation, no secondary block)
-    and the Cholesky factor families follow. Calls a factory rejects are
+    second keyed-row coordinate layout (one articulation, no secondary block),
+    the Cholesky factor families with the held trees' geometric refreshes
+    (:func:`held_factor_calls`), the revolute propagation trees and the opt-in
+    register-whitening parallel tiers follow. Calls a factory rejects are
     recorded as rejected.
     """
+    from unittest.mock import patch  # noqa: PLC0415
+
     from newton._src.solvers.feather_pgs import keyed_rows, small_cholesky  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
@@ -210,6 +215,97 @@ def factory_calls():
             yield name + factory, _unwrapped(getattr(solver, factory)), (size, ARCH), {}
         factory = _unwrapped(solver._get_inverse_cholesky_register_kernel)
         yield name + "_get_inverse_cholesky_register_kernel", factory, (size, ARCH), {"lower_only": True}
+    yield from held_factor_calls()
+
+    # One-warp propagation trees of single-coordinate joints, with and without a multi-coordinate root.
+    for factory, size, free_root in itertools.product(
+        ("_get_factor_propagation_tree_revolute_kernel", "_get_propagation_tree_body_response_revolute_kernel"),
+        (7, 18),
+        (False, True),
+    ):
+        kwargs = {"has_free_root": True} if free_root else {}
+        yield name + factory, _unwrapped(getattr(solver, factory)), (size, ARCH), kwargs
+
+    def whitened(*args, **kwargs):
+        with patch.object(solver, "_REGISTER_WHITENING", True):
+            return solver._get_pgs_solve_parallel_kernel(*args, **kwargs)
+
+    # FEATHER_PGS_REGISTER_WHITENING=1 on the parallel tiers the pins hold opted out, at each measured layout.
+    for arch, (rows, min_rows) in itertools.product(("120", "103"), ((32, 0), (48, 32))):
+        kwargs = {
+            "rows": rows,
+            "min_rows": min_rows,
+            "sweeps": 24,
+            "matrix_free": True,
+            "inkernel_response": (18, 0, 0, 0),
+            "world_rows": True,
+            "exact_row_sums": True,
+        }
+        yield name + "_get_pgs_solve_parallel_kernel[register_whitening]", whitened, (64, 32, 18, arch), kwargs
+
+
+def held_factor_calls():
+    """Yield the geometric Cholesky refreshes of held trees, indexed as their owners index them.
+
+    A topology lists each joint's parent and coordinate count. Its sparse mass
+    plan numbers the packed physical geometry, and the refresh of a held
+    factor reads that record through a physical (row, col) index, as the tree
+    and forest operators of ``mixed_tree_kinetic`` bind it: a tree reads its
+    own record; each held family of a forest reads its root's block of the
+    forest's record, whose stride is the forest's entry count, through a group
+    map. A prescribed root (family 0) holds no factor.
+    """
+    import numpy as np  # noqa: PLC0415
+
+    from newton._src.solvers.feather_pgs import small_cholesky  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseMassMatrixPlan  # noqa: PLC0415
+
+    def chains(count, length, *, base=()):
+        """A fixed root, or ``base``, carrying ``count`` revolute chains of ``length`` joints at its last joint."""
+        joints = list(base) or [(-1, 0)]
+        attach = len(joints) - 1
+        for _ in range(count):
+            parent = attach
+            for _ in range(length):
+                joints.append((parent, 1))
+                parent = len(joints) - 1
+        return joints
+
+    free_body = [(-1, 6)]
+    arm = chains(1, 7)
+    leaves = [*arm, (len(arm) - 1, 1), (len(arm) - 1, 1)]
+    small = _unwrapped(small_cholesky.get_kernel)
+    for name, trees, families in (
+        ("four_chains", (chains(4, 4),), None),
+        ("free_body", (free_body,), None),
+        ("chain_two_leaves+free+prescribed", (leaves, free_body, free_body), (9, 6, 0)),
+        ("chain_four_chains+free+prescribed", (chains(4, 4, base=arm), free_body, free_body), (23, 6, 0)),
+    ):
+        joints = [
+            (parent + sum(map(len, trees[:position])) if parent >= 0 else -1, count)
+            for position, tree in enumerate(trees)
+            for parent, count in tree
+        ]
+        mass = _SparseMassMatrixPlan.build(*map(np.asarray, zip(*joints, strict=True)))
+        physical = np.full((mass.dof_count, mass.dof_count), -1, np.int32)
+        for entry, (row, col) in enumerate(zip(mass.entry_rows, mass.columns, strict=True)):
+            a, b = mass.permutation[row], mass.permutation[col]
+            physical[a, b] = physical[b, a] = entry
+        if families is None:
+            index = Named(f"{name}.index", tuple(map(int, physical.ravel())))
+            yield "small_cholesky.get_kernel", small, (mass.dof_count,), {"geometric": True, "geometric_index": index}
+            continue
+        offsets = np.cumsum([0, *(sum(count for _, count in tree) for tree in trees[:-1])])
+        for root, (family, offset) in enumerate(zip(families, offsets, strict=True)):
+            if family:
+                block = physical[offset : offset + family, offset : offset + family]
+                kwargs = {
+                    "geometric": True,
+                    "geometric_index": Named(f"{name}.index[{root}]", tuple(map(int, block.ravel()))),
+                    "geometric_stride": mass.nonzero_count,
+                    "geometric_group": True,
+                }
+                yield "small_cholesky.get_kernel", small, (family,), kwargs
 
 
 def held_tree_layouts():
