@@ -1706,9 +1706,9 @@ class SolverFeatherPGS(SolverBase):
                 independent of the row order, which the parallel matrix-free tiers also solve. The
                 ``"physx_grasp"`` schedule always keeps PhysX's stateless clamp, and the fused
                 drive clamp of ``fuse_joint_velocity_limits`` is unaffected. Split mode, which has
-                no joint velocity-limit rows, applies neither law: its free-body sweep keeps the
-                stateless clamp that ``get_path_selection()`` reports under
-                ``routes.velocity_limits.free_body_sweep_law``. The environment variable
+                no joint velocity-limit rows, applies neither law: where its free-body sweep has
+                velocity-limit rows it keeps the stateless clamp that ``get_path_selection()``
+                reports under ``routes.velocity_limits.free_body_sweep_law``. The environment variable
                 ``FEATHER_PGS_VELOCITY_LIMIT_LAW`` overrides the argument.
                 ``get_path_selection()`` reports the law the serial sweeps apply under
                 ``routes.velocity_limits.law``, and the parallel tiers' law, accumulated under either
@@ -16389,18 +16389,22 @@ class SolverFeatherPGS(SolverBase):
 
         Recorded as ``routes.velocity_limits.law``; the parallel tiers accumulate joint
         velocity-limit rows whatever this law (``routes.sweep.tiers.velocity_limit_law``).
-        Split mode has no joint velocity-limit
-        rows and no matrix-free velocity-limit pass, so it applies neither law (``None``);
-        ``routes.velocity_limits.free_body_sweep_law`` records the stateless law of its
-        free-body sweep. The ``physx_grasp`` schedule keeps PhysX's
-        stateless clamp. Without velocity-limit rows the kernels keep their stateless
-        build, so a model without limits runs the same kernels under either law.
+        Split mode has no joint velocity-limit rows and no matrix-free velocity-limit pass,
+        so it applies neither law (``None``); ``routes.velocity_limits.free_body_sweep_law``
+        records the law of its free-body sweep, stateless where free-body velocity-limit
+        rows can exist and ``None`` where none can (no free rigid bodies, native sparse
+        split rows, unregistered speed attributes or an infinite activation fraction). The
+        ``physx_grasp`` schedule keeps PhysX's stateless clamp. Without velocity-limit rows
+        the kernels keep their stateless build, so a model without limits runs the same
+        kernels under either law.
         """
         if self.pgs_mode != "matrix_free":
+            # The rule, not this solver's outcome: free_body_sweep_law records whether its sweep has such rows.
             return None, (
                 "Split mode has no joint velocity-limit rows and no matrix-free velocity-limit pass, so it applies "
-                "neither law: routes.velocity_limits.free_body_sweep_law records the stateless law of its free-body "
-                "sweep, and the post-solve root clamp keeps its own."
+                "neither law. routes.velocity_limits.free_body_sweep_law records the law of its free-body sweep, "
+                "stateless where free-body velocity-limit rows can exist, and the post-solve root clamp, where it "
+                "runs (routes.velocity_limits.root_clamp), keeps its own."
             )
         if self.pgs_schedule == "physx_grasp":
             return "stateless", "pgs_schedule='physx_grasp' keeps PhysX's stateless velocity clamp."

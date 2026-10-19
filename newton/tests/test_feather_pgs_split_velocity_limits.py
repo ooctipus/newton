@@ -417,7 +417,9 @@ class _SplitVelocityLimitChecks:
 
         ``velocity_limit_law`` selects the law of the matrix-free sweeps. Split mode has no joint velocity-limit
         rows, and its free-body sweep applies the stateless law that ``free_body_sweep_law`` records, so an
-        accumulated request changes no kernel, impulse or velocity, and the record says which law applies.
+        accumulated request changes no kernel, impulse or velocity, and the record says which law applies. Where
+        no free-body velocity-limit row can exist (no free body, or an infinite activation fraction),
+        ``free_body_sweep_law`` is None and the law reason claims no free-body law either.
         """
         runs = {law: _pressed_spheres(self.device, velocity_limit_law=law) for law in ("stateless", "accumulated")}
         velocities = {law: _step(run) for law, run in runs.items()}
@@ -435,8 +437,25 @@ class _SplitVelocityLimitChecks:
                 limits = record["routes"]["velocity_limits"]
                 self.assertIsNone(limits["law"])
                 self.assertIn("free_body_sweep_law", limits["law_reason"])
+                self.assertIn("stateless where free-body velocity-limit rows can exist", limits["law_reason"])
                 self.assertEqual(limits["free_body_sweep_law"], "stateless")
                 self.assertIn("velocity_limit_law", limits["free_body_sweep_law_reason"])
+        builder = _begin_model(None)
+        _add_arm(builder)
+        without_free_bodies = SolverFeatherPGS(builder.finalize(device=self.device), pgs_mode="split")
+        never_activated = _free_boxes(self.device, [((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))], fraction=float("inf"))
+        for name, solver, words in (
+            ("without_free_bodies", without_free_bodies, "No split free-body sweep"),
+            ("never_activated", never_activated.solver, "fraction=inf"),
+        ):
+            with self.subTest(name):
+                limits = solver.get_path_selection()["routes"]["velocity_limits"]
+                self.assertIsNone(limits["law"])
+                self.assertIsNone(limits["free_body_sweep_law"])
+                self.assertIn(words, limits["free_body_sweep_law_reason"])
+                # The law reason defers to free_body_sweep_law instead of claiming a stateless free-body law.
+                self.assertIn("free_body_sweep_law records the law of its free-body sweep", limits["law_reason"])
+                self.assertNotIn("records the stateless law", limits["law_reason"])
 
     def test_route_records_the_velocity_limit_sweep(self):
         """Record the stateless free-body law, and on CUDA its ``_vlim`` sweep, wherever limit rows can exist."""
