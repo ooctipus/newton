@@ -1465,7 +1465,8 @@ class TestScalarBranchOwner(unittest.TestCase):
     def test_route_record_names_the_scalar_group(self):
         """Record the scalar group, its precedence over the prismatic opt-ins, and its decline without an owner."""
         device = wp.get_device("cuda:0")
-        model = build_branch_model(device, worlds=2, leaves=12)
+        model = build_branch_model(device, worlds=2, leaves=12, shapes=True)
+        model.rigid_contact_max = 1
         record = recipe_solver(model, scalar=True).get_path_selection()
         json.dumps(record, allow_nan=False)
         held, publication = record["routes"]["held_tree"], record["routes"]["publication"]
