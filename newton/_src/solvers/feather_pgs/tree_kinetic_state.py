@@ -239,9 +239,13 @@ def _bank_binding(coordinates, layout):
 
     A group's coordinates (free-root positions and quaternions included), its
     velocities and its bodies' public poses and twists are compared as 32-bit
-    words: equal banks are bitwise identical inputs, so the cache published
-    from one is the cache a repair would compute from the other. The group's
-    lanes stride the words and vote.
+    words, and the group's lanes stride the words and vote. Equal banks are
+    identical inputs, so a group that matches keeps the cache the last finish
+    published from those words, as a group stepped from the bank that finish
+    wrote does. A repair would compute it from the same words with the same
+    stage source in another kernel, whose floating-point contraction may
+    differ: keeping it is exact up to that reordering (float-reorder), not
+    bitwise.
     """
     source = _BANK_MATCHES.replace("$COORDINATES", str(coordinates))
 
