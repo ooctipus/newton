@@ -8,8 +8,11 @@ and sorted candidate sets are compared with :class:`BroadPhaseExplicit` on every
 device; on CPU, where both run serially in list order, the arrays must be equal.
 """
 
+import json
+import os
 import unittest
 import warnings
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -21,7 +24,9 @@ from newton._src.geometry.broad_phase_nxn import (
     ShapePairTemplates,
     replay_shape_pair_templates,
 )
-from newton.tests.unittest_utils import add_function_test, get_test_devices
+from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
+
+_FLAG = "NEWTON_BROAD_PHASE_TEMPLATES"
 
 
 def _synthetic(
@@ -410,6 +415,182 @@ class TestBroadPhaseTemplateRule(unittest.TestCase):
         self.assertFalse(too_many.verify(wp.zeros(too_many.pair_count, dtype=wp.vec2i, device="cpu")))
 
 
+def _contacts(pipeline, model, state):
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)
+    return contacts
+
+
+_CONTACT_ARRAYS = (
+    "rigid_contact_count",
+    "rigid_contact_shape0",
+    "rigid_contact_shape1",
+    "rigid_contact_point0",
+    "rigid_contact_point1",
+    "rigid_contact_offset0",
+    "rigid_contact_offset1",
+    "rigid_contact_normal",
+    "rigid_contact_margin0",
+    "rigid_contact_margin1",
+)
+
+
+def _contact_rows(contacts):
+    """Contacts as rows (shapes, points, offsets, normal, margins), sorted so slot order is ignored."""
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    columns = [
+        contacts.rigid_contact_shape0.numpy()[:count, None].astype(np.float64),
+        contacts.rigid_contact_shape1.numpy()[:count, None].astype(np.float64),
+        contacts.rigid_contact_point0.numpy()[:count].astype(np.float64),
+        contacts.rigid_contact_point1.numpy()[:count].astype(np.float64),
+        contacts.rigid_contact_offset0.numpy()[:count].astype(np.float64),
+        contacts.rigid_contact_offset1.numpy()[:count].astype(np.float64),
+        contacts.rigid_contact_normal.numpy()[:count].astype(np.float64),
+        contacts.rigid_contact_margin0.numpy()[:count, None].astype(np.float64),
+        contacts.rigid_contact_margin1.numpy()[:count, None].astype(np.float64),
+    ]
+    rows = np.concatenate(columns, axis=1)
+    return rows[np.lexsort(rows.T[::-1])]
+
+
+def _pipeline(model, setting, **kwargs):
+    environ = {} if setting is None else {_FLAG: setting}
+    with mock.patch.dict(os.environ, environ):
+        if setting is None:
+            os.environ.pop(_FLAG, None)
+        return newton.CollisionPipeline(model, **kwargs)
+
+
+def _kernel_record(pipeline):
+    return pipeline.get_collision_selection()["narrow_phase"]["broad_phase_kernel"]
+
+
+def test_pipeline_templates_match_flat_contacts(test, device):
+    """Produce the flat kernel's candidates and contacts with the world templates."""
+    model = _finalize(_replicated_builder(), device)
+    state = model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+    for deterministic in (False, True):
+        with test.subTest(deterministic=deterministic):
+            templated = _pipeline(model, "1", deterministic=deterministic)
+            flat = _pipeline(model, "0", deterministic=deterministic)
+            record = _kernel_record(templated)
+            test.assertEqual(record["kernel"], "world_templates")
+            test.assertEqual(record["source"], "environment")
+            test.assertEqual(record["templates"]["global_pairs"], 1)
+            test.assertEqual(_kernel_record(flat)["kernel"], "flat_pairs")
+            templated_contacts = _contacts(templated, model, state)
+            flat_contacts = _contacts(flat, model, state)
+            count = int(flat.broad_phase_pair_count.numpy()[0])
+            test.assertGreater(count, 0)
+            test.assertEqual(int(templated.broad_phase_pair_count.numpy()[0]), count)
+            test.assertGreater(int(flat_contacts.rigid_contact_count.numpy()[0]), 0)
+            templated_pairs = templated.broad_phase_shape_pairs.numpy()
+            flat_pairs = flat.broad_phase_shape_pairs.numpy()
+            if device.is_cpu:
+                # Serial CPU runs keep list order.
+                np.testing.assert_array_equal(templated_pairs[:count], flat_pairs[:count])
+            np.testing.assert_array_equal(
+                _sorted_codes(templated_pairs, count, count), _sorted_codes(flat_pairs, count, count)
+            )
+            if device.is_cpu or deterministic:
+                # Serial CPU runs keep list order, and deterministic pipelines sort contacts.
+                for name in _CONTACT_ARRAYS:
+                    np.testing.assert_array_equal(
+                        getattr(templated_contacts, name).numpy(), getattr(flat_contacts, name).numpy(), err_msg=name
+                    )
+            np.testing.assert_array_equal(_contact_rows(templated_contacts), _contact_rows(flat_contacts))
+
+
+def test_pipeline_immovable_filter_matches_flat(test, device):
+    """Filter static and kinematic pairs exactly as the flat kernel does."""
+    model = _finalize(_replicated_builder(), device)
+    state = model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+    templated = _pipeline(model, "1", include_static_kinematic_pairs=False)
+    flat = _pipeline(model, "0", include_static_kinematic_pairs=False)
+    templated_contacts = _contacts(templated, model, state)
+    flat_contacts = _contacts(flat, model, state)
+    count = int(flat.broad_phase_pair_count.numpy()[0])
+    test.assertEqual(int(templated.broad_phase_pair_count.numpy()[0]), count)
+    codes = _sorted_codes(templated.broad_phase_shape_pairs.numpy(), count, count)
+    np.testing.assert_array_equal(codes, _sorted_codes(flat.broad_phase_shape_pairs.numpy(), count, count))
+    np.testing.assert_array_equal(_contact_rows(templated_contacts), _contact_rows(flat_contacts))
+
+
+class TestBroadPhaseTemplateSelection(unittest.TestCase):
+    def test_fallbacks_keep_the_flat_kernel(self):
+        """Keep the flat kernel, with a reason, wherever the templates do not stand for the list."""
+        model = _finalize(_replicated_builder(), "cpu")
+        cases = {
+            "automatic, small": (None, {}, "Automatic: below"),
+            "environment 0": ("0", {}, "NEWTON_BROAD_PHASE_TEMPLATES=0"),
+            "user pairs": ("1", {"shape_pairs_filtered": wp.clone(model.shape_contact_pairs)}, "not the model-built"),
+            "speculative": (
+                "1",
+                {"speculative_config": newton.CollisionPipeline.SpeculativeContactConfig()},
+                "Speculative",
+            ),
+        }
+        for name, (setting, kwargs, reason) in cases.items():
+            with self.subTest(case=name):
+                record = _kernel_record(_pipeline(model, setting, **kwargs))
+                self.assertEqual(record["kernel"], "flat_pairs")
+                self.assertIn(reason, record["reason"])
+                json.dumps(record, allow_nan=False)
+        record = _kernel_record(_pipeline(model, None))
+        self.assertEqual(record["source"], "automatic")
+        self.assertEqual(record["templates"]["templates"], 3)
+        self.assertIsNone(_kernel_record(_pipeline(model, "1", broad_phase="nxn")))
+
+    def test_changed_list_keeps_the_flat_kernel(self):
+        """Fall back when the model-built list was changed in place after finalization."""
+        model = _finalize(_replicated_builder(), "cpu")
+        pairs = model.shape_contact_pairs.numpy()
+        pairs[-1] = pairs[-2]
+        model.shape_contact_pairs.assign(pairs)
+        record = _kernel_record(_pipeline(model, "1"))
+        self.assertEqual(record["kernel"], "flat_pairs")
+        self.assertIn("no longer match", record["reason"])
+
+    def test_general_list_keeps_the_flat_kernel(self):
+        """Keep the flat kernel for a list without world templates."""
+        builder = _replicated_builder()
+        builder.shape_collision_filter_pairs.append((0, builder.first_shape[2]))
+        record = _kernel_record(_pipeline(_finalize(builder, "cpu"), "1"))
+        self.assertEqual(record["kernel"], "flat_pairs")
+        self.assertIn("not the model-built", record["reason"])
+
+    def test_invalid_setting_raises(self):
+        """Reject values other than 0 and 1."""
+        model = _finalize(_replicated_builder(), "cpu")
+        with self.assertRaisesRegex(ValueError, "NEWTON_BROAD_PHASE_TEMPLATES must be 0 or 1"):
+            _pipeline(model, "auto")
+
+
+def test_graph_replays_template_broad_phase(test, device):
+    """Capture the template broad phase in a CUDA graph and replay the flat kernel's candidates."""
+    model = _finalize(_replicated_builder(), device)
+    state = model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+    templated = _pipeline(model, "1")
+    flat = _pipeline(model, "0")
+    test.assertEqual(_kernel_record(templated)["kernel"], "world_templates")
+    flat_contacts = _contacts(flat, model, state)
+    count = int(flat.broad_phase_pair_count.numpy()[0])
+    contacts = _contacts(templated, model, state)  # load modules before capture
+    with wp.ScopedCapture(device=device, force_module_load=False) as capture:
+        templated.collide(state, contacts)
+    for _ in range(3):
+        wp.capture_launch(capture.graph)
+    test.assertEqual(int(templated.broad_phase_pair_count.numpy()[0]), count)
+    np.testing.assert_array_equal(
+        _sorted_codes(templated.broad_phase_shape_pairs.numpy(), count, count),
+        _sorted_codes(flat.broad_phase_shape_pairs.numpy(), count, count),
+    )
+    np.testing.assert_array_equal(_contact_rows(contacts), _contact_rows(flat_contacts))
+
+
 class TestBroadPhaseTemplates(unittest.TestCase):
     pass
 
@@ -419,8 +600,16 @@ for _name, _function in (
     ("test_synthetic_templates_match_flat_kernel", test_synthetic_templates_match_flat_kernel),
     ("test_layout_shapes_launches", test_layout_shapes_launches),
     ("test_verification_rejects_a_changed_list", test_verification_rejects_a_changed_list),
+    ("test_pipeline_templates_match_flat_contacts", test_pipeline_templates_match_flat_contacts),
+    ("test_pipeline_immovable_filter_matches_flat", test_pipeline_immovable_filter_matches_flat),
 ):
     add_function_test(TestBroadPhaseTemplates, _name, _function, devices=devices)
+add_function_test(
+    TestBroadPhaseTemplates,
+    "test_graph_replays_template_broad_phase",
+    test_graph_replays_template_broad_phase,
+    devices=get_cuda_test_devices(mode="basic"),
+)
 
 
 if __name__ == "__main__":

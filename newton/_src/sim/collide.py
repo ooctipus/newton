@@ -17,7 +17,7 @@ import warp as wp
 
 from ..core.environment_flags import record_newton_environment
 from ..core.reset import normalize_reset_world_mask
-from ..geometry.broad_phase_nxn import BroadPhaseAllPairs, BroadPhaseExplicit
+from ..geometry.broad_phase_nxn import BroadPhaseAllPairs, BroadPhaseExplicit, BroadPhaseExplicitTemplates
 from ..geometry.broad_phase_sap import BroadPhaseSAP
 from ..geometry.collision_core import compute_tight_aabb_from_support
 from ..geometry.contact_data import (
@@ -1762,6 +1762,11 @@ class CollisionPipeline:
                 "nxn"/"sap" modes, ignored. The pair count and shape-type routing are used to size
                 and specialize internal buffers at construction, so do not modify or resize the
                 array while the pipeline is in use. Rebuild the pipeline after changing the pairs.
+                When the pairs are the ``model.shape_contact_pairs`` that :meth:`ModelBuilder.finalize`
+                replayed from per-world templates, and the templates are large, the broad phase tests
+                each world's template instead of streaming the list; the candidate pairs are the same
+                set. Set ``NEWTON_BROAD_PHASE_TEMPLATES=0`` before construction to keep the flat
+                kernel, or ``1`` to test templates of any size.
             include_static_kinematic_pairs: Whether to generate contacts for
                 pairs where both shapes are immovable. Set to ``False`` to
                 filter static-static, static-kinematic, and
@@ -1967,6 +1972,9 @@ class CollisionPipeline:
             raise ValueError("NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP must be 0 or 1")
         self._pair_shape_prep = pair_shape_prep == "1"
         self.prepared_shape_indices = None
+        pair_templates = os.environ.get("NEWTON_BROAD_PHASE_TEMPLATES")
+        if pair_templates not in (None, "0", "1"):
+            raise ValueError("NEWTON_BROAD_PHASE_TEMPLATES must be 0 or 1")
         convex_cells = os.environ.get("NEWTON_NARROW_PHASE_CONVEX_CELLS", "0")
         self._convex_cells = None
         self._heightfield_convex_cells = None
@@ -2373,6 +2381,8 @@ class CollisionPipeline:
                 else None,
             )
             self.hydroelastic_sdf = self.narrow_phase.hydroelastic_sdf
+
+        self._select_explicit_pair_kernel(model, pair_templates, using_expert_components)
 
         # A declared variable that an explicit argument superseded was present but not applied.
         superseded = []
@@ -2793,6 +2803,52 @@ class CollisionPipeline:
         self._body_pair_reduction_capture_tokens: set[object] = set()
         self._captured_contacts: Contacts | None = None
 
+    def _select_explicit_pair_kernel(self, model: Model, setting: str | None, using_expert_components: bool) -> None:
+        """Choose the explicit broad-phase kernel once, at construction, and record why.
+
+        The world-template kernel replaces the flat one only where it tests the same
+        pairs: the explicit list must be the model-built replay of per-world templates,
+        and the templates are verified against its contents on the device.
+        """
+        self._pair_templates = None
+        if self.broad_phase_mode != "explicit":
+            self._explicit_pair_kernel = None
+            return
+        layout = None
+        templates = getattr(model, "_shape_contact_pair_templates", None)
+        if using_expert_components:
+            reason = "A prebuilt broad phase keeps its own kernel."
+        elif setting == "0":
+            reason = "NEWTON_BROAD_PHASE_TEMPLATES=0 keeps the flat pair kernel."
+        elif self._speculative_enabled:
+            reason = "Speculative contacts sweep AABBs, which only the flat pair kernel supports."
+        elif templates is None or not templates.describes(self.shape_pairs_filtered):
+            reason = "The explicit pairs are not the model-built replay of per-world templates."
+        else:
+            layout = BroadPhaseExplicitTemplates(templates, device=self.device)
+            if layout.unsupported_reason is not None:
+                reason = layout.unsupported_reason
+            elif setting is None and not layout.automatic:
+                reason = (
+                    f"Automatic: below {layout.AUTO_MIN_PAIRS} pairs or {layout.AUTO_MIN_PAIRS_PER_WORLD} pairs per "
+                    "world, the flat pair kernel is kept."
+                )
+            elif not layout.verify(self.shape_pairs_filtered):
+                reason = "The explicit pairs no longer match the model's world templates."
+            else:
+                self._pair_templates = layout
+                reason = (
+                    "NEWTON_BROAD_PHASE_TEMPLATES=1 tests the world templates."
+                    if setting == "1"
+                    else "Automatic: large world templates replace the flat pair stream."
+                )
+        self._explicit_pair_kernel = {
+            "kernel": "world_templates" if self._pair_templates is not None else "flat_pairs",
+            "source": "automatic" if setting is None else "environment",
+            "reason": reason,
+            "templates": None if layout is None else layout.describe(),
+        }
+
     def get_collision_selection(self) -> dict:
         """Read the requested and current convex method outside CUDA graph capture.
 
@@ -2803,8 +2859,11 @@ class CollisionPipeline:
         fields read the chooser's device state and synchronize: never call this
         inside a timed window or a graph capture.
 
-        ``narrow_phase`` records the coherent-convex mode and the generic convex
-        query variants. ``heightfield`` (``None`` without heightfield collision)
+        ``narrow_phase`` records the coherent-convex mode, the broad phase and the
+        generic convex query variants. Its ``broad_phase_kernel`` (``None`` unless
+        the broad phase is explicit) records whether the flat pair kernel or the
+        world-template kernel tests the explicit pairs, why, and the template
+        layout. ``heightfield`` (``None`` without heightfield collision)
         records the terrain midphase, the typed primitive table and its
         closed-form rows, the route convex-hull pairs take, the terrain
         convex-cells owner and its chooser, and each opt-in terrain route with
@@ -2884,7 +2943,7 @@ class CollisionPipeline:
         return result
 
     def _narrow_phase_selection(self) -> dict:
-        """Host-only record of the coherent-convex mode and the generic convex query variants."""
+        """Host-only record of the coherent-convex mode, the broad phase and the generic convex query variants."""
         narrow = self.narrow_phase
 
         def mode(value):
@@ -2902,6 +2961,7 @@ class CollisionPipeline:
                 "reason": reason,
             },
             "broad_phase": self.broad_phase_mode,
+            "broad_phase_kernel": copy.deepcopy(self._explicit_pair_kernel),
             "split_gjk_mpr": bool(narrow.split_gjk_mpr),
             "lean_gjk_mpr": bool(narrow._use_lean_gjk_mpr),
             "sparse_gjk_pairs": bool(narrow.sparse_gjk_pairs),
@@ -3912,6 +3972,18 @@ class CollisionPipeline:
                 skip_count_zero=True,  # Already zeroed by compute_shape_aabbs
                 shape_displacement=self._shape_displacement if speculative_active else None,
                 sort_axis_displacement_limit=max_speculative_extension if speculative_active else None,
+            )
+        elif self._pair_templates is not None:
+            # Same pairs as the flat list (verified at construction), tested per world template.
+            self._pair_templates.launch(
+                self.narrow_phase.shape_aabb_lower,
+                self.narrow_phase.shape_aabb_upper,
+                self.shape_pairs_filtered,
+                self.broad_phase_shape_pairs,
+                self.broad_phase_pair_count,
+                shape_body=model.shape_body,
+                body_flags=model.body_flags,
+                include_static_kinematic_pairs=self.include_static_kinematic_pairs,
             )
         else:  # BroadPhaseExplicit
             self.broad_phase.launch(

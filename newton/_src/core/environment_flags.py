@@ -139,6 +139,12 @@ NEWTON_FLAGS = declare(
         "=0 keeps pairs whose shapes are both static or welded to the world (default 1 drops them).",
     ),
     EnvironmentFlag(
+        "NEWTON_BROAD_PHASE_TEMPLATES",
+        "policy",
+        _COLLIDE,
+        "World-template explicit broad phase: 1 for any model-built template list, 0 off; unset admits large ones.",
+    ),
+    EnvironmentFlag(
         "NEWTON_CACHE_PATH",
         "policy",
         ("utils.download_assets",),
