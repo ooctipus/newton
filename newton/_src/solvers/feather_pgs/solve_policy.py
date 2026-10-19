@@ -437,10 +437,12 @@ class SolveReadoutRecord:
     world's solves are its slots' solves plus its skipped ones. Sweeps
     without counters can own whole worlds that hold rows: the parallel
     (Jacobi) tiers and the response-block sweeps the worlds they claim from
-    the matrix-free sweep, the multi-block driver's dense tiles every world's
-    dense rows, and the propagation sweeps a world whose rows are all
-    propagation rows. Neither a slot nor the skip counter counts those
-    solves; the route record names their owners
+    the matrix-free sweep, and the propagation sweeps a world whose rows are
+    all propagation rows. Neither a slot nor the skip counter counts those
+    solves. The multi-block driver's kernels own rows of every world instead
+    (its dense tiles the dense rows, its color, tail and mass-split kernels
+    the matrix-free rows), so a counted launch there counts a world without
+    those rows' sweeps. The route record names all of these owners
     (``routes.sweep.readout.uncounted_worlds``).
     """
 

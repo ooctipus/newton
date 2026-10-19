@@ -823,6 +823,7 @@ def _sweep_record(**fields):
             "free_body_matrix_free",
             "tiers",
             "local",
+            "multiblock",
             "dense",
             "propagation",
         )
@@ -862,6 +863,26 @@ class TestSweepPolicyRecords(unittest.TestCase):
         self.assertEqual(path_selection._readout(solver, record)["uncounted"], tiles)
         self.assertEqual(path_selection._exit_law(solver, record)["ignored"], tiles)
         self.assertEqual(path_selection._readout(solver, _sweep_record())["uncounted"], [])
+
+    def test_records_name_the_multiblock_kernels(self):
+        """Name the multi-block driver's free-body kernels as uncounted, ignoring the tolerance and owning rows.
+
+        Between the dense row-phase launches of the matrix-free sweep, the driver's color, tail or
+        mass-split kernels sweep every world's matrix-free rows without counters or an exit. The
+        record names them by the driver's flag, as it names the response-block sweeps.
+        """
+        solver = _policy_solver(tolerance=1.0e-3, honored=("mf_gs_kernel",))
+        for mode in ("colored", "mass_split"):
+            with self.subTest(mode=mode):
+                record = _sweep_record(driver="multiblock", multiblock=mode)
+                readout, law = path_selection._readout(solver, record), path_selection._exit_law(solver, record)
+                self.assertEqual(readout["uncounted"], ["multiblock"])
+                self.assertEqual(law["ignored"], ["multiblock"])
+                self.assertEqual(list(readout["uncounted_worlds"]), ["multiblock"])
+                self.assertIn("matrix-free rows", readout["uncounted_worlds"]["multiblock"])
+                messages = path_selection.policy_warnings({"readout": readout, "exit_law": law})
+                self.assertIn("'multiblock'", messages[0])
+                json.dumps({"readout": readout, "exit_law": law}, allow_nan=False)
 
     def test_declined_trace_is_recorded_and_warned_apart_from_the_law(self):
         """Record and warn a declined trace under the readout, and a declined tolerance under the exit law."""
@@ -905,11 +926,12 @@ class TestSweepPolicyRecords(unittest.TestCase):
     def test_records_name_the_worlds_no_counter_counts(self):
         """Name each owner that solves whole worlds without counters, and none where counted sweeps own every world.
 
-        The matrix-free sweep returns before its first sweep for the worlds the parallel tiers, the
-        response-block sweeps or the multi-block driver's dense tiles own, and the propagation sweeps
-        solve the worlds whose rows are all propagation rows. Those worlds hold rows, so the skip
-        counter leaves them out too: without a record their solves would vanish from the summary.
-        The incremental tiers count their own worlds.
+        The matrix-free sweep returns before its first sweep for the worlds the parallel tiers or the
+        response-block sweeps own, and the propagation sweeps solve the worlds whose rows are all
+        propagation rows. Those worlds hold rows, so the skip counter leaves them out too: without a
+        record their solves would vanish from the summary. The multi-block driver's dense tiles and
+        its color, tail and mass-split kernels own rows of every world. The incremental tiers count
+        their own worlds.
         """
         parallel = {"family": "parallel", "tiers": [{"rows": 32, "kernel": "tier32"}, {"rows": 48, "kernel": "tier48"}]}
         incremental = {"family": "incremental", "tiers": [{"kernel": "incremental_kernel"}]}
@@ -921,7 +943,8 @@ class TestSweepPolicyRecords(unittest.TestCase):
             ({"tiers": {**parallel, "family": "keyed_parallel"}}, ["parallel_tiers"]),
             ({"response_block": True}, ["response_block"]),
             ({"propagation": propagation, "driver": "propagation_phases"}, ["propagation"]),
-            ({"dense_tiles": True, "driver": "multiblock"}, ["dense_tiles"]),
+            ({"multiblock": "colored", "driver": "multiblock"}, ["multiblock"]),
+            ({"multiblock": "colored", "dense_tiles": True, "driver": "multiblock"}, ["dense_tiles", "multiblock"]),
         ):
             with self.subTest(fields=sorted(fields)):
                 readout = path_selection._readout(_policy_solver(), _sweep_record(**fields))

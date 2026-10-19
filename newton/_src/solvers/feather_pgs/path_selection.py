@@ -835,11 +835,19 @@ def _sweep_kernels(solver, record) -> set:
     return keys
 
 
-def _uncounted_worlds(record) -> dict:
-    """Owners whose sweeps solve whole worlds without counters, with the worlds each one solves.
+def _flagged_owners(record) -> list[str]:
+    """Owners of sweeps without counters or exit that a sweep record names by a flag, not by kernel keys."""
+    return [name for name in ("response_block", "multiblock") if record[name]]
 
-    Those worlds hold rows, so the skip counter leaves them out, and the counted sweeps do not enter
-    them: their solves are in no slot and not skipped. The incremental tiers count their own worlds.
+
+def _uncounted_worlds(record) -> dict:
+    """Owners whose sweeps solve rows without counters, with the worlds or rows each one solves.
+
+    A world one owns whole holds rows, so the skip counter leaves it out, and the counted sweeps do
+    not enter it: its solves are in no slot and not skipped. The multi-block driver's kernels own
+    part of every world instead (the dense tiles its dense rows, the color, tail and mass-split
+    kernels its matrix-free rows), so a counted launch counts such a world without those rows'
+    sweeps. The incremental tiers count their own worlds.
     """
     owners = {}
     tiers = record["tiers"] or {}
@@ -860,6 +868,12 @@ def _uncounted_worlds(record) -> dict:
             "Every world's dense rows on the multi-block driver: the dense-tile kernels sweep them at row phase 6 "
             "in place of the matrix-free sweep."
         )
+    if record["multiblock"]:
+        owners["multiblock"] = (
+            "Every world's matrix-free rows on the multi-block driver: its color, tail or mass-split kernels sweep "
+            "them after each dense row-phase launch, without counters or an exit, so the matrix-free sweep's "
+            "slot counts its dense row-phase launches only."
+        )
     if record["propagation"] is not None:
         owners["propagation"] = (
             "Worlds whose rows are all propagation rows: the propagation sweeps solve them, and the other sweeps "
@@ -871,9 +885,7 @@ def _uncounted_worlds(record) -> dict:
 def _readout(solver, record) -> dict:
     """Which sweep kernels of the route count their sweeps under ``pgs_solve_readout``, and why the others do not."""
     counted = solver._solve_readout.kernels
-    uncounted = sorted(_sweep_kernels(solver, record) - counted.keys())
-    if record["response_block"]:
-        uncounted.append("response_block")
+    uncounted = sorted(_sweep_kernels(solver, record) - counted.keys()) + _flagged_owners(record)
     uncounted_worlds = _uncounted_worlds(record) if counted else {}
     if solver.pgs_solve_readout == "off":
         reason = "pgs_solve_readout is off."
@@ -893,8 +905,8 @@ def _readout(solver, record) -> dict:
         )
     if uncounted_worlds:
         reason += (
-            " The owners in uncounted_worlds solve whole worlds without counters: those solves are in no slot "
-            "and not skipped."
+            " The owners in uncounted_worlds sweep their rows without counters: the solves of a world one owns "
+            "whole are in no slot and not skipped."
         )
     return {
         "mode": solver.pgs_solve_readout if counted else "off",
@@ -915,9 +927,7 @@ def _exit_law(solver, record) -> dict:
     tolerance = float(solver.pgs_velocity_change_tolerance)
     honored = dict(sorted(solver._solve_policy_honored.items()))
     declined = dict(sorted(solver._solve_policy_declined.items())) if tolerance > 0.0 else {}
-    ignored = sorted(_sweep_kernels(solver, record) - honored.keys() - declined.keys())
-    if record["response_block"]:
-        ignored.append("response_block")
+    ignored = sorted(_sweep_kernels(solver, record) - honored.keys() - declined.keys()) + _flagged_owners(record)
     driver_honors = record["driver"] in ("direct", "contact_then_internal")
     if tolerance == 0.0:
         reason = "pgs_velocity_change_tolerance is 0: every sweep keeps the exact stationary-sweep law."
