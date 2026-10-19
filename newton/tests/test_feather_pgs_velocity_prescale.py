@@ -6,6 +6,8 @@
 ``_serial_prescale`` is ``kernels.prescale_joint_velocity_limits`` as it was
 before it ran in lanes (main b7932853): one thread per articulation scaled a
 copy of the joint velocities in place. It stays here as the reference.
+``_emulate_lanes`` replays the threads of a CUDA lane launch in NumPy, warp
+shuffles included, so every lane width is checked on CPU as well.
 """
 
 import itertools
@@ -121,6 +123,10 @@ _CASES = (
     (4, 101, 1, 0),
     (5, 2, 0, 1),
 )
+# Every lane width a CUDA launch can use.
+_LANE_WIDTHS = (1, 2, 4, 8, 16, 32)
+# Joint types whose leading DOFs the prescale reads and scales.
+_LIMITED_TYPES = (int(JointType.PRISMATIC), int(JointType.REVOLUTE), int(JointType.D6))
 
 
 def _layout(seed: int, articulations: int, *, leading_joints: int = 0, long_every: int = 0) -> dict:
@@ -206,25 +212,105 @@ def _serial(layout: dict, skip_driven: int, device) -> np.ndarray:
 
 
 def _lanes(layout: dict, skip_driven: int, device, lanes: int) -> tuple[np.ndarray, np.ndarray]:
-    """Return the lane kernel's output, every DOF prefilled as unwritten, and its input afterwards."""
+    """Return the lane kernel's output, every DOF prefilled as unwritten, and its input afterwards.
+
+    The launch covers complete warps. CPU threads cannot exchange ratios, so with more than one lane
+    a CPU launch scales each lane's joints by that lane's own ratio.
+    """
     count = len(layout["articulation_start"]) - 1
     arrays = [wp.array(layout[name], device=device) for name in _ARRAYS]
     joint_qd = wp.array(layout["joint_qd"], device=device)
     output = wp.full(len(layout["joint_qd"]), _UNWRITTEN, dtype=float, device=device)
-    if wp.get_device(device).is_cpu:
-        # CPU threads cannot exchange ratios.
-        assert lanes == 1
-        threads = count
-    else:
-        threads = (count * lanes + 31) // 32 * 32
     wp.launch(
         prescale_joint_velocity_limits,
-        dim=threads,
+        dim=(count * lanes + 31) // 32 * 32,
         inputs=[count, lanes, *arrays, skip_driven, joint_qd],
         outputs=[output],
         device=device,
     )
     return output.numpy(), joint_qd.numpy()
+
+
+def _emulated_axis_count(layout: dict, joint: int) -> int:
+    """Return how many leading DOFs of ``joint`` the prescale reads and scales."""
+    if int(layout["joint_type"][joint]) not in _LIMITED_TYPES:
+        return 0
+    if int(layout["body_flags"][layout["joint_child"][joint]]) & int(BodyFlags.KINEMATIC):
+        return 0
+    return int(layout["joint_dof_dim"][joint].sum())
+
+
+def _emulate_lanes(
+    layout: dict, skip_driven: int, lanes: int, *, combine: bool
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Replay in NumPy, in thread order, every thread of a complete-warp lane launch.
+
+    Thread ``tid`` is lane ``tid % lanes`` of articulation ``tid // lanes``; threads past the last
+    articulation pad the launch. With ``combine`` each aligned group of lanes takes its minimum ratio
+    through the XOR butterfly of a 32-lane warp, as on CUDA. Without it each lane keeps its own ratio,
+    as on CPU, where the lane minimum returns its input.
+
+    Returns:
+        The written velocities (``_UNWRITTEN`` where no thread wrote), the number of writes of each
+        DOF and the ratio of each thread.
+    """
+    start, qd_start = layout["articulation_start"], layout["joint_qd_start"]
+    qd, limit, drive = layout["joint_qd"], layout["joint_velocity_limit"], layout["drive_slot"]
+    count = len(start) - 1
+    threads = (count * lanes + 31) // 32 * 32
+    joints = [
+        (int(start[tid // lanes]), int(start[tid // lanes + 1])) if tid // lanes < count else (0, 0)
+        for tid in range(threads)
+    ]
+
+    def skipped(dof: int) -> bool:
+        return skip_driven != 0 and drive[dof] >= 0
+
+    ratios = np.ones(threads, dtype=np.float32)
+    # A tiny speed under a huge limit overflows to an infinite quotient, as in the kernel.
+    with np.errstate(over="ignore"):
+        for tid, (first, end) in enumerate(joints):
+            for joint in range(first + tid % lanes, end, lanes):
+                begin = int(qd_start[joint])
+                for dof in range(begin, begin + _emulated_axis_count(layout, joint)):
+                    speed = np.abs(qd[dof])
+                    if not skipped(dof) and limit[dof] > 0.0 and np.isfinite(limit[dof]) and speed > 0.0:
+                        scale = limit[dof] / speed
+                        if scale < ratios[tid]:
+                            ratios[tid] = scale
+    if combine:
+        lane = np.arange(32)
+        for warp in range(0, threads, 32):
+            ratio = ratios[warp : warp + 32]
+            offset = lanes >> 1
+            while offset:
+                other = ratio[lane ^ offset]
+                ratio[:] = np.where(other < ratio, other, ratio)
+                offset >>= 1
+
+    output = np.full(len(qd), _UNWRITTEN, dtype=np.float32)
+    writes = np.zeros(len(qd), dtype=np.int64)
+    # An infinite speed times a zero ratio is NaN, as in the kernel.
+    with np.errstate(invalid="ignore"):
+        for tid, (first, end) in enumerate(joints):
+            lane, ratio = tid % lanes, ratios[tid]
+            dofs = []
+            if tid // lanes == 0:
+                # Joints ahead of the first articulation.
+                dofs += [(dof, False) for dof in range(lane, int(qd_start[first]), lanes)]
+            if ratio < 1.0:
+                for joint in range(first + lane, end, lanes):
+                    begin = int(qd_start[joint])
+                    scaled_end = begin + _emulated_axis_count(layout, joint)
+                    dofs += [
+                        (dof, dof < scaled_end and not skipped(dof)) for dof in range(begin, int(qd_start[joint + 1]))
+                    ]
+            else:
+                dofs += [(dof, False) for dof in range(int(qd_start[first]) + lane, int(qd_start[end]), lanes)]
+            for dof, scaled in dofs:
+                output[dof] = qd[dof] * ratio if scaled else qd[dof]
+                writes[dof] += 1
+    return output, writes, ratios
 
 
 def _assert_bits_equal(actual: np.ndarray, expected: np.ndarray, message: str = ""):
@@ -347,7 +433,43 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
         """Write every DOF bit for bit like the serial prescale for every lane width of a warp."""
         for device in wp.get_cuda_devices():
             with self.subTest(device=str(device)):
-                self._check_layouts(device, (1, 2, 4, 8, 16, 32))
+                self._check_layouts(device, _LANE_WIDTHS)
+
+    def test_every_lane_width_in_emulation_and_on_cpu(self):
+        """Match the serial prescale at every lane width in emulation, and the kernel's lane mapping on CPU.
+
+        With the warp butterfly, every lane of a group holds the same ratio bits and each DOF is
+        written once. A CPU launch of the kernel, whose lanes keep their own ratios, must match the
+        emulation without the butterfly wherever at most one thread writes a DOF: lanes of a group
+        can then take different branches, which split the DOFs differently. That output differs from
+        the serial prescale, so the CUDA test of these layouts catches a missing or broken butterfly.
+        """
+        uncombined_errors = dict.fromkeys(_LANE_WIDTHS[1:], 0)
+        for seed, articulations, leading, long_every in _CASES:
+            layout = _layout(seed, articulations, leading_joints=leading, long_every=long_every)
+            count = len(layout["articulation_start"]) - 1
+            for skip_driven in (0, 1):
+                expected = _serial(layout, skip_driven, "cpu")
+                for lanes in _LANE_WIDTHS:
+                    message = f"seed={seed} skip_driven={skip_driven} lanes={lanes}"
+                    combined, writes, ratios = _emulate_lanes(layout, skip_driven, lanes, combine=True)
+                    _assert_bits_equal(combined, expected, message)
+                    np.testing.assert_array_equal(writes, 1, err_msg=message)
+                    group_bits = ratios[: count * lanes].view(np.uint32).reshape(count, lanes)
+                    np.testing.assert_array_equal(
+                        group_bits, np.broadcast_to(group_bits[:, :1], group_bits.shape), err_msg=message
+                    )
+
+                    uncombined, writes, _ = _emulate_lanes(layout, skip_driven, lanes, combine=False)
+                    actual, source = _lanes(layout, skip_driven, "cpu", lanes)
+                    single = writes <= 1
+                    _assert_bits_equal(actual[single], uncombined[single], message)
+                    _assert_bits_equal(source, layout["joint_qd"], message)
+                    if lanes > 1:
+                        errors = uncombined.view(np.uint32) != expected.view(np.uint32)
+                        uncombined_errors[lanes] += int(np.count_nonzero(errors))
+        for lanes, errors in uncombined_errors.items():
+            self.assertGreater(errors, 100, f"lanes={lanes}")
 
     def test_dofless_and_unarticulated_layouts(self):
         """Copy the velocities of joints outside every articulation and write nothing for DOF-less joints."""
