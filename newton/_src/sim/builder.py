@@ -46,6 +46,7 @@ from ..geometry import (
     compute_shape_radius,
     transform_inertia,
 )
+from ..geometry.broad_phase_nxn import ShapePairTemplates
 from ..geometry.flags import MeshProperties
 from ..geometry.inertia import validate_and_correct_inertia_kernel, verify_and_correct_inertia
 from ..geometry.types import Heightfield
@@ -13060,33 +13061,26 @@ class ModelBuilder:
                     else:
                         template_runs.append(([world_start], cached_pairs))
 
-                chunks = []
-                if contact_pairs:
-                    chunks.append(np.asarray(contact_pairs, dtype=np.int32).reshape((-1, 2)))
-                for starts, (global_local_pairs, local_pairs) in template_runs:
-                    offsets = np.asarray(starts, dtype=np.int32)
-                    global_count = global_local_pairs.shape[0]
-                    pairs_per_world = global_count + local_pairs.shape[0]
-                    if pairs_per_world == 0:
-                        continue
-                    replay = np.empty((offsets.shape[0], pairs_per_world, 2), dtype=np.int32)
-                    if global_count:
-                        global_replay = replay[:, :global_count, :]
-                        global_replay[:, :, 0] = global_local_pairs[:, 0]
-                        # Cached global/local pairs hold an absolute global id
-                        # and a world-local id shifted per world during replay.
-                        global_replay[:, :, 1] = global_local_pairs[:, 1] + offsets[:, None]
-                        global_replay.sort(axis=2)
-                    if pairs_per_world > global_count:
-                        replay[:, global_count:, :] = local_pairs[None, :, :] + offsets[:, None, None]
-                    chunks.append(replay.reshape((-1, 2)))
-
-                if chunks:
-                    pair_array = np.concatenate(chunks, axis=0)
-                else:
-                    pair_array = np.empty((0, 2), dtype=np.int32)
+                # Keep the templates on the model with the list they replay
+                # into, so the collision pipeline can test them per world
+                # instead of streaming the list.
+                templates: list[tuple[np.ndarray, np.ndarray]] = []
+                runs: list[tuple[int, np.ndarray]] = []
+                template_index: dict[int, int] = {}
+                for starts, cached_pairs in template_runs:
+                    index = template_index.setdefault(id(cached_pairs), len(templates))
+                    if index == len(templates):
+                        templates.append(cached_pairs)
+                    runs.append((index, np.asarray(starts, dtype=np.int32)))
+                record = ShapePairTemplates(
+                    global_pairs=np.asarray(contact_pairs, dtype=np.int32).reshape((-1, 2)),
+                    templates=tuple(templates),
+                    runs=tuple(runs),
+                )
+                pair_array = record.replay()
                 model.shape_contact_pairs = wp.array(pair_array, dtype=wp.vec2i, device=model.device)
                 model.shape_contact_pair_count = len(pair_array)
+                model._shape_contact_pair_templates = record.bind(model.shape_contact_pairs)
                 return
 
         contact_pairs: list[tuple[int, int]] = []
@@ -13133,6 +13127,8 @@ class ModelBuilder:
 
         model.shape_contact_pairs = wp.array(candidate_pairs, dtype=wp.vec2i, device=model.device)
         model.shape_contact_pair_count = len(candidate_pairs)
+        # This list has no world templates; drop any record of an earlier list.
+        model._shape_contact_pair_templates = None
 
 
 ModelBuilder.ShapeConfig.__init__ = deprecate_nonkeyword_arguments(ModelBuilder.ShapeConfig.__init__)

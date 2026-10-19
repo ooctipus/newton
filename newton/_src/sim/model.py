@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..actuators.actuator import Actuator
+    from ..geometry.broad_phase_nxn import ShapePairTemplates
     from ..utils.heightfield import HeightfieldData
     from .collide import CollisionPipeline
 
@@ -880,6 +881,12 @@ class Model:
         """
         self.shape_contact_pair_count: int = 0
         """Number of shape contact pairs."""
+        self._shape_contact_pair_templates: ShapePairTemplates | None = None
+        """Per-world templates that :meth:`ModelBuilder.finalize` replayed into :attr:`shape_contact_pairs`.
+
+        ``None`` when the list was built otherwise; the collision pipeline tests the
+        templates instead of streaming the list while they still describe it.
+        """
         self.shape_world: wp.array[wp.int32] | None = None
         """World index for each shape, shape [shape_count], int. -1 for global."""
         self.shape_world_start: wp.array[wp.int32] | None = None

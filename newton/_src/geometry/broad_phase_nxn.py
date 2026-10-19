@@ -12,6 +12,9 @@ See Also:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
+
 import numpy as np
 import warp as wp
 
@@ -532,4 +535,98 @@ class BroadPhaseExplicit:
             ],
             device=device,
             record_tape=False,
+        )
+
+
+def replay_shape_pair_templates(
+    global_pairs: np.ndarray,
+    templates: Sequence[tuple[np.ndarray, np.ndarray]],
+    runs: Sequence[tuple[int, np.ndarray]],
+) -> np.ndarray:
+    """Expand per-world pair templates into the explicit pair list they describe.
+
+    The list holds ``global_pairs`` first. Then, run by run and world by world, it
+    holds the template's global-local pairs, ordered ``(min, max)`` after the
+    world-local id is shifted by the world's first shape, followed by the
+    template's local pairs shifted the same way.
+
+    Args:
+        global_pairs: Pairs between global shapes, shape [global_pair_count, 2], int32.
+        templates: Per template, its global-local pairs (absolute global id, world-local
+            id), shape [n, 2], and its local pairs, shape [m, 2], both int32.
+        runs: Consecutive worlds that share a template: the template index and the first
+            shape of each world, shape [world_count], int32.
+
+    Returns:
+        The explicit pair list, shape [pair_count, 2], int32.
+    """
+    chunks = []
+    if global_pairs.shape[0]:
+        chunks.append(global_pairs)
+    for template, starts in runs:
+        global_local_pairs, local_pairs = templates[template]
+        offsets = np.asarray(starts, dtype=np.int32)
+        global_count = global_local_pairs.shape[0]
+        pairs_per_world = global_count + local_pairs.shape[0]
+        if pairs_per_world == 0:
+            continue
+        replay = np.empty((offsets.shape[0], pairs_per_world, 2), dtype=np.int32)
+        if global_count:
+            global_replay = replay[:, :global_count, :]
+            global_replay[:, :, 0] = global_local_pairs[:, 0]
+            global_replay[:, :, 1] = global_local_pairs[:, 1] + offsets[:, None]
+            global_replay.sort(axis=2)
+        if pairs_per_world > global_count:
+            replay[:, global_count:, :] = local_pairs[None, :, :] + offsets[:, None, None]
+        chunks.append(replay.reshape((-1, 2)))
+    if chunks:
+        return np.concatenate(chunks, axis=0)
+    return np.empty((0, 2), dtype=np.int32)
+
+
+@dataclass(frozen=True, eq=False)
+class ShapePairTemplates:
+    """Per-world pair templates that replay into an explicit pair list.
+
+    :meth:`~newton.ModelBuilder.finalize` keeps them on the model next to the
+    ``shape_contact_pairs`` array it replayed them into, so
+    :class:`~newton.CollisionPipeline` can test the templates instead of
+    streaming that array.
+    """
+
+    global_pairs: np.ndarray
+    """Pairs between global shapes, which lead the list, shape [global_pair_count, 2], int32."""
+    templates: tuple[tuple[np.ndarray, np.ndarray], ...]
+    """Per template, its global-local pairs (absolute global id, world-local id), shape [n, 2],
+    and its local pairs, shape [m, 2], both int32."""
+    runs: tuple[tuple[int, np.ndarray], ...]
+    """Consecutive worlds that share a template: the template index and each world's first
+    shape, shape [world_count], int32."""
+    pairs_ptr: int = 0
+    """Address of the array the replay was uploaded to; 0 while unbound."""
+    pair_count: int = 0
+    """Length of that array."""
+    pairs_device: str = ""
+    """Device of that array."""
+
+    def replay(self) -> np.ndarray:
+        """Return the explicit pair list these templates describe, shape [pair_count, 2], int32."""
+        return replay_shape_pair_templates(self.global_pairs, self.templates, self.runs)
+
+    def bind(self, pairs: wp.array[wp.vec2i]) -> ShapePairTemplates:
+        """Return a copy that describes ``pairs``, the array :meth:`replay` was uploaded to."""
+        return replace(
+            self, pairs_ptr=int(pairs.ptr or 0), pair_count=int(pairs.shape[0]), pairs_device=str(pairs.device)
+        )
+
+    def describes(self, pairs: object) -> bool:
+        """Return whether ``pairs`` is the array this record was bound to (same device, address and length).
+
+        A pipeline still checks the contents on the device before it relies on them.
+        """
+        return (
+            isinstance(pairs, wp.array)
+            and str(pairs.device) == self.pairs_device
+            and int(pairs.ptr or 0) == self.pairs_ptr
+            and int(pairs.shape[0]) == self.pair_count
         )
