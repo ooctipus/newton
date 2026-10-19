@@ -11,7 +11,9 @@ each through two steps of begin, predict, finish and a repeated begin; then
 two steps whose caller copies the published bank back into the input bank, one
 coordinate changed, so that the repair compares the two banks, first in the
 one-pass repair and then classified on a one-block grid (classification,
-comparison pass and listed repair); then an invalidated begin. After each call
+comparison pass and listed repair); then an invalidated begin. A group of
+alternate motion validates by identity alone and is never classified, so both
+copy-back steps run its one-pass repair. After each call
 it stores every array of the publication the kernels received and of the
 owner's caches, with the state, response and spring arrays around them, and
 the held-tree kernels the call launched, in launch order
@@ -310,7 +312,8 @@ class Recorder:
             state.body_f.assign(rng.normal(0, 0.1, (model.body_count, 6)).astype(np.float32))
         for form in ("copied", "copied-classified"):
             if form == "copied-classified":
-                # Classify every repair launch on a one-block grid, whatever its size and device.
+                # Classify every repair launch on a one-block grid, whatever its size and device (owners keep
+                # the one-pass repair of a motion-velocity group).
                 for group in groups:
                     group._classify_switch, group._repair_grid, group._classify_above = True, 1, 0
                     group._bind_kernels()

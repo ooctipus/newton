@@ -143,22 +143,30 @@ class TestKernelSass(unittest.TestCase):
         self.assertNotIn("REGRESSION", output.getvalue())
 
     def test_launch_blocks_follow_the_owner_launches(self):
-        """Compile classifications at the owner's classification block and every other held-tree kernel at its layout's."""
+        """Compile classifications at the owner's classification block and every other held-tree kernel at its layout's.
+
+        Owners classify only layouts of ordinary motion, so those layouts alone record a classification.
+        """
         from newton._src.solvers.feather_pgs import tree_kinetic_owner  # noqa: PLC0415
 
         calls = list(sass.identity.held_tree_calls())
         blocks = sass.launch_blocks(("held_tree",))
         self.assertEqual(len(blocks), len(calls))
         self.assertEqual(sass.classify_block(), tree_kinetic_owner._CLASSIFY_BLOCK_DIM)
-        classifications = 0
+        classified = []
         for name, _, args, kwargs in calls:
             block = blocks[sass.identity.label(name, args, kwargs)]
             if name == "tree_kinetic_state.get_classify_kernel":
-                classifications += 1
+                classified.append(kwargs["layout"].name)
                 self.assertEqual(block, 64)
             else:
                 self.assertEqual(block, kwargs["layout"].value.block)
-        self.assertEqual(classifications, len(sass.identity.held_tree_layouts()))
+        ordinary = [
+            name
+            for name, (_, _, _, options) in sass.identity.held_tree_layouts().items()
+            if not options.get("motion_velocity", False)
+        ]
+        self.assertEqual(sorted(classified), sorted(ordinary))
 
     def test_report_fails_kernels_that_lose_resident_blocks_or_spill(self):
         """Exit 2 when a kernel keeps fewer blocks resident or spills more to local memory."""
