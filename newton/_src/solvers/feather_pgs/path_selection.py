@@ -817,14 +817,20 @@ def _sweep(solver, source) -> dict:
     return record
 
 
-def _sweep_kernels(record) -> set:
-    """Every sweep kernel key a sweep record names."""
+def _sweep_kernels(solver, record) -> set:
+    """Every sweep kernel key of a sweep record, with the dense-tile kernels the record names only by a flag."""
     keys = {record[name] for name in ("sparse", "sparse_diagonal", "paired_factor", "mf_gs", "free_body_matrix_free")}
     keys.update(tier["kernel"] for tier in (record["tiers"] or {}).get("tiers", ()))
     for owner in ("internal", "pair", "residual"):
         keys.update((record["local"] or {}).get(owner, {}).values())
     keys.update((record["dense"] or {}).get("kernels", ()))
     keys.update(value for key, value in (record["propagation"] or {}).items() if key not in ("mode", "cached_response"))
+    if record["dense_tiles"]:
+        # They replace the matrix-free sweep at the multi-block driver's row phase 6, built without a policy.
+        keys.update(
+            _key(getattr(solver, name, None))
+            for name in ("_pgs_solve_mf_dense_tiles_kernel", "_pgs_solve_mf_dense_tiles_staged_kernel")
+        )
     keys.discard(None)
     return keys
 
@@ -832,7 +838,7 @@ def _sweep_kernels(record) -> set:
 def _readout(solver, record) -> dict:
     """Which sweep kernels of the route count their sweeps under ``pgs_solve_readout``, and why the others do not."""
     counted = solver._solve_readout.kernels
-    uncounted = sorted(_sweep_kernels(record) - counted.keys())
+    uncounted = sorted(_sweep_kernels(solver, record) - counted.keys())
     if record["response_block"]:
         uncounted.append("response_block")
     if solver.pgs_solve_readout == "off":
@@ -841,14 +847,18 @@ def _readout(solver, record) -> dict:
         reason = (
             "No sweep of this route carries counters: fixed-iteration, Jacobi-tier and response-block sweeps do not."
         )
-    elif record["driver"] in ("direct", "contact_then_internal"):
+    elif record["driver"] == "direct":
         reason = "Each launch of a counted kernel solves its worlds; uncounted sweeps carry no counters."
+    elif record["driver"] == "contact_then_internal":
+        reason = "Contact and internal rows sweep in separate launches, so a solve counts once per launch."
     else:
         reason = f"The {record['driver']} driver runs part of a solve per launch, so counts are per launch."
     return {
         "mode": solver.pgs_solve_readout if counted else "off",
         "counted": dict(sorted(counted.items())),
         "uncounted": uncounted if counted else [],
+        # Variants that could not compile the requested trace count their sweeps without it.
+        "declined": dict(sorted(solver._solve_policy_declined.items())) if solver.pgs_solve_readout == "trace" else {},
         "reason": reason,
     }
 
@@ -857,8 +867,8 @@ def _exit_law(solver, record) -> dict:
     """Which sweep kernels of the route stop under the velocity law (``pgs_velocity_change_tolerance``), and why not."""
     tolerance = float(solver.pgs_velocity_change_tolerance)
     honored = dict(sorted(solver._solve_policy_honored.items()))
-    declined = dict(sorted(solver._solve_policy_declined.items()))
-    ignored = sorted(_sweep_kernels(record) - honored.keys() - declined.keys())
+    declined = dict(sorted(solver._solve_policy_declined.items())) if tolerance > 0.0 else {}
+    ignored = sorted(_sweep_kernels(solver, record) - honored.keys() - declined.keys())
     if record["response_block"]:
         ignored.append("response_block")
     driver_honors = record["driver"] in ("direct", "contact_then_internal")
@@ -879,12 +889,33 @@ def _exit_law(solver, record) -> dict:
         "law": "velocity" if tolerance > 0.0 and honored else "exact",
         "velocity_change_tolerance": json_value(tolerance),
         "honored": honored,
-        # Variants that could not compile the requested law or trace keep the exact law (and a plain count).
+        # Variants that could not compile the requested law keep the exact law.
         "declined": declined,
         "ignored": ignored if tolerance > 0.0 else [],
         "driver_honors": driver_honors,
         "reason": reason,
     }
+
+
+def policy_warnings(sweep) -> list[str]:
+    """Return a warning per requested solve policy that some sweeps of a sweep record do not apply.
+
+    Args:
+        sweep: The ``routes.sweep`` record of :func:`route_selection`.
+    """
+    messages = []
+    law = sweep["exit_law"]
+    if law["velocity_change_tolerance"] > 0.0 and (law["declined"] or law["ignored"] or not law["driver_honors"]):
+        messages.append(
+            f"pgs_velocity_change_tolerance applies only to some sweeps of this solver: {law['reason']} "
+            f"Declined: {sorted(law['declined'])}; ignored: {law['ignored']}."
+        )
+    if sweep["readout"]["declined"]:
+        messages.append(
+            "pgs_solve_readout='trace' applies only to some sweeps of this solver; these count their sweeps "
+            f"without the trace: {sorted(sweep['readout']['declined'])}."
+        )
+    return messages
 
 
 def _mf_gs_storage(solver) -> dict | None:

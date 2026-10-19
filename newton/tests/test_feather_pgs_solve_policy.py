@@ -19,7 +19,14 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import kernels, mf_dispatch, mf_gs_source, paired_factor_source, row_packets
+from newton._src.solvers.feather_pgs import (
+    kernels,
+    mf_dispatch,
+    mf_gs_source,
+    paired_factor_source,
+    path_selection,
+    row_packets,
+)
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver
 from newton._src.solvers.feather_pgs.device_preludes import ARCHITECTURE_GUARD
 from newton._src.solvers.feather_pgs.row_inputs import make_row_kernel
@@ -566,6 +573,85 @@ class TestSolverReadoutOption(unittest.TestCase):
                 self.assertNotIn("solve_readout", selection["measurements"])
                 law = selection["routes"]["sweep"]["exit_law"]
                 self.assertEqual((law["law"], law["honored"], law["declined"], law["ignored"]), ("exact", {}, {}, []))
+                self.assertEqual(readout["declined"], {})
+
+
+def _sweep_record(**fields):
+    """A matrix-free ``routes.sweep`` record naming only its matrix-free Gauss-Seidel kernel, with ``fields`` set."""
+    record = dict.fromkeys(
+        (
+            "sparse",
+            "sparse_diagonal",
+            "paired_factor",
+            "free_body_matrix_free",
+            "tiers",
+            "local",
+            "dense",
+            "propagation",
+        )
+    )
+    record.update(
+        route="matrix_free_gs", driver="direct", mf_gs="mf_gs_kernel", response_block=False, dense_tiles=False
+    )
+    record.update(fields)
+    return record
+
+
+def _policy_solver(*, readout="sweeps", tolerance=0.0, declined=(), honored=(), **attributes):
+    """The solver attributes the sweep records read, counting the matrix-free kernel."""
+    return SimpleNamespace(
+        pgs_solve_readout=readout,
+        pgs_velocity_change_tolerance=tolerance,
+        _solve_readout=SimpleNamespace(kernels={"mf_gs_kernel": "mf_gs"}),
+        _solve_policy_declined=dict.fromkeys(declined, "mf_gs: the variant keeps the exact law"),
+        _solve_policy_honored=dict.fromkeys(honored, "mf_gs"),
+        **attributes,
+    )
+
+
+class TestSweepPolicyRecords(unittest.TestCase):
+    """The readout and exit-law records of a route's sweeps and the warnings they raise."""
+
+    def test_records_name_the_dense_tile_kernels(self):
+        """Name the dense-tile kernels, built without a policy, as uncounted and ignoring the tolerance."""
+        solver = _policy_solver(
+            tolerance=1.0e-3,
+            honored=("mf_gs_kernel",),
+            _pgs_solve_mf_dense_tiles_kernel=SimpleNamespace(key="dense_tiles_kernel"),
+            _pgs_solve_mf_dense_tiles_staged_kernel=SimpleNamespace(key="dense_tiles_staged_kernel"),
+        )
+        record = _sweep_record(driver="multiblock", dense_tiles=True)
+        tiles = ["dense_tiles_kernel", "dense_tiles_staged_kernel"]
+        self.assertEqual(path_selection._readout(solver, record)["uncounted"], tiles)
+        self.assertEqual(path_selection._exit_law(solver, record)["ignored"], tiles)
+        self.assertEqual(path_selection._readout(solver, _sweep_record())["uncounted"], [])
+
+    def test_declined_trace_is_recorded_and_warned_apart_from_the_law(self):
+        """Record and warn a declined trace under the readout, and a declined tolerance under the exit law."""
+        for readout, tolerance in (("trace", 0.0), ("sweeps", 1.0e-3), ("trace", 1.0e-3)):
+            with self.subTest(readout=readout, tolerance=tolerance):
+                solver = _policy_solver(readout=readout, tolerance=tolerance, declined=("mf_gs_kernel",))
+                record = _sweep_record()
+                sweep = {
+                    "readout": path_selection._readout(solver, record),
+                    "exit_law": path_selection._exit_law(solver, record),
+                }
+                self.assertEqual(sweep["readout"]["mode"], readout)
+                self.assertEqual(list(sweep["readout"]["declined"]), ["mf_gs_kernel"] if readout == "trace" else [])
+                self.assertEqual(list(sweep["exit_law"]["declined"]), ["mf_gs_kernel"] if tolerance else [])
+                messages = path_selection.policy_warnings(sweep)
+                self.assertEqual(
+                    [message.split(" ", 1)[0] for message in messages],
+                    ["pgs_velocity_change_tolerance"] * bool(tolerance)
+                    + ["pgs_solve_readout='trace'"] * (readout == "trace"),
+                )
+                json.dumps(sweep, allow_nan=False)
+
+    def test_phase_launches_count_once_each(self):
+        """Say that a contact-then-internal solve counts once per row-phase launch."""
+        record = _sweep_record(driver="contact_then_internal")
+        self.assertIn("once per launch", path_selection._readout(_policy_solver(), record)["reason"])
+        self.assertIn("solves its worlds", path_selection._readout(_policy_solver(), _sweep_record())["reason"])
 
 
 if __name__ == "__main__":

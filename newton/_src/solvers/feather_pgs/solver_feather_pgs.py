@@ -233,6 +233,7 @@ from .path_selection import (
     grouped_response,
     measurement_selection,
     options_selection,
+    policy_warnings,
     route_selection,
 )
 from .response_block_sweep import (
@@ -1842,7 +1843,9 @@ class SolverFeatherPGS(SolverBase):
                 ``measurements["solve_readout"]``, which synchronizes the device once. Neither
                 readout changes a computed value. The sparse, sparse-diagonal, matrix-free
                 Gauss-Seidel, paired factor, local and incremental sweeps count; the others run
-                without counters (``routes.sweep.readout``). Defaults to ``"off"``.
+                without counters (``routes.sweep.readout``), and a sweep variant that cannot trace
+                counts without the trace (``routes.sweep.readout.declined``, with a warning).
+                Defaults to ``"off"``.
             pgs_velocity_change_tolerance (float, optional): Velocity exit law of the native
                 Gauss-Seidel sweeps [m/s or rad/s]. A sweep stops a world once no row's impulse change
                 times its effective-mass diagonal, ``|dlambda| * A_ii`` (the change of the row's own
@@ -3601,14 +3604,9 @@ class SolverFeatherPGS(SolverBase):
             )
         # Record the applied options once; get_path_selection() returns detached copies.
         self._applied_options = applied_options(self, SolverFeatherPGS.__init__, requested_options)
-        if self.pgs_velocity_change_tolerance > 0.0:
-            law = route_selection(self)["sweep"]["exit_law"]
-            if law["declined"] or law["ignored"] or not law["driver_honors"]:
-                warnings.warn(
-                    f"pgs_velocity_change_tolerance applies only to some sweeps of this solver: {law['reason']} "
-                    f"Declined: {sorted(law['declined'])}; ignored: {law['ignored']}.",
-                    stacklevel=2,
-                )
+        if self.pgs_velocity_change_tolerance > 0.0 or self.pgs_solve_readout == "trace":
+            for message in policy_warnings(route_selection(self)["sweep"]):
+                warnings.warn(message, stacklevel=2)
 
     def get_path_selection(self) -> dict:
         """Return requested choices, active plans and selection reasons.
@@ -3634,7 +3632,8 @@ class SolverFeatherPGS(SolverBase):
         bodies, the friction law and the grouped-dynamics kernels, each with a
         reason; a size whose response the grouped kernel solves reports
         ``hinv_jt_kernel`` ``"grouped"``; ``routes.sweep.readout`` names the
-        sweep kernels that count their sweeps. The
+        sweep kernels that count their sweeps, and ``routes.sweep.exit_law`` the
+        sweeps that honor, decline or ignore ``pgs_velocity_change_tolerance``. The
         row builders (``contact_rows.builder_by_dof``) are those of the dense
         contact rows built outside the sweep: the parallel tiers build keyed rows'
         direct rows in the sweep (``direct_rows``), the free-body matrix-free and
@@ -5832,8 +5831,8 @@ class SolverFeatherPGS(SolverBase):
 
         A sweep variant that cannot compile the policy's velocity law or trace
         keeps the exact law, with the plain sweep count when a readout was
-        requested; ``routes.sweep.exit_law`` records it. Counters are allocated
-        here, outside any graph capture.
+        requested; ``routes.sweep.exit_law`` and ``routes.sweep.readout`` record
+        it. Counters are allocated here, outside any graph capture.
 
         Args:
             route: Owner of the sweep in the records, such as ``"sparse_pgs"``.

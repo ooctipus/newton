@@ -681,6 +681,29 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         """Count the matrix-free Gauss-Seidel sweep and its incremental tier without changing the trajectory."""
         self._lockstep(_matrix_free_route())
 
+    def test_declined_trace_counts_without_it_and_warns(self):
+        """Warn about, record and count without the trace a sweep variant that cannot trace.
+
+        The matrix-free sweep traces only the current friction law; under bisection friction it
+        keeps the plain count, which a trace request records under the readout, not the exit law.
+        """
+        route = _matrix_free_route()
+        with self.assertWarnsRegex(UserWarning, "pgs_solve_readout='trace'"):
+            (solver,) = self._solvers(route, [{"pgs_solve_readout": "trace", "friction_mode": "bisection"}])
+        key = solver._pgs_solve_mf_gs_kernel.key
+        sweep = solver.get_path_selection()["routes"]["sweep"]
+        self.assertIn(key, sweep["readout"]["declined"])
+        self.assertEqual((sweep["readout"]["mode"], sweep["exit_law"]["declined"]), ("trace", {}))
+        for _ in self._steps(route, [solver], 2):
+            pass
+        (slot,) = [
+            slot
+            for slot in solver.get_path_selection()["measurements"]["solve_readout"]["slots"]
+            if slot["kernel"] == key
+        ]
+        self.assertNotIn("trace", slot)
+        self.assertGreater(slot["solves"], 0)
+
     def test_velocity_pass_counts_in_its_own_slots(self):
         """Count the velocity pass's sweeps in slots of their own budget, each world-solve once per pass."""
         route, steps = _incremental_route(), 4
@@ -706,7 +729,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         for route in _policy_routes():
             with self.subTest(labels=sorted(route["labels"])):
                 solver, summary, _ = self._lockstep(route, readout="trace")
-                self.assertEqual(solver.get_path_selection()["routes"]["sweep"]["exit_law"]["declined"], {})
+                self.assertEqual(solver.get_path_selection()["routes"]["sweep"]["readout"]["declined"], {})
                 for slot in summary["slots"]:
                     with self.subTest(kernel=slot["kernel"]):
                         trace = slot["trace"]
