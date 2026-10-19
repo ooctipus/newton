@@ -361,7 +361,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
 
         Every option after model is keyword-only. The deprecation shim binds positional values in
         declaration order, so a positional call over the 54 legacy options must build the solver
-        the same keywords build: every requested and applied option, route and reason.
+        the same keywords build: every requested and applied option, route and reason. A 55th
+        positional value would bind an option that was always keyword-only, so it still raises.
         """
         model = _cpu_model()
         parameters = list(inspect.signature(SolverFeatherPGS).parameters.values())
@@ -394,6 +395,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(selected, expected)
         self.assertEqual(selected["options"]["joint_limit_activation_gap"]["applied"], 0.123)
         self.assertEqual(selected["options"]["dense_max_constraints"]["source"], "argument")
+        self.assertEqual(parameters[55].name, "pgs_change_tolerance")
+        with self.assertRaisesRegex(TypeError, r"takes at most 56 positional arguments but 57 were given$"):
+            SolverFeatherPGS(model, *legacy.values(), parameters[55].default)
 
     def test_constructor_warnings_name_the_caller(self):
         """Attribute construction warnings to the constructor's caller, not to the keyword-only shim."""

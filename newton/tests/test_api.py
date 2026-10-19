@@ -192,6 +192,25 @@ class TestApi(unittest.TestCase):
 
         self.assertEqual(solver.angular_damping, 0.123)
 
+    def test_keyword_only_deprecation_shim_caps_legacy_positions(self):
+        """Bind deprecated positions only up to last_positional and reject later keyword-only parameters."""
+        from newton._src.utils.deprecation import deprecate_nonkeyword_arguments  # noqa: PLC0415
+
+        def options(first, *, legacy=1, last_legacy=2, keyword_only=3):
+            return first, legacy, last_legacy, keyword_only
+
+        capped = deprecate_nonkeyword_arguments(last_positional="last_legacy")(options)
+        with self.assertWarnsRegex(DeprecationWarning, "Passing 'legacy', 'last_legacy' positionally"):
+            self.assertEqual(capped(0, 10, 20), (0, 10, 20, 3))
+        with self.assertRaisesRegex(TypeError, r"options\(\) takes at most 3 positional arguments but 4 were given$"):
+            capped(0, 10, 20, 30)
+        self.assertEqual(capped(0, keyword_only=30), (0, 1, 2, 30))
+        # Without a cap, every keyword-only parameter keeps a deprecated position.
+        with self.assertWarnsRegex(DeprecationWarning, "'keyword_only' positionally"):
+            self.assertEqual(deprecate_nonkeyword_arguments(options)(0, 10, 20, 30), (0, 10, 20, 30))
+        with self.assertRaisesRegex(TypeError, "has no keyword-only parameter 'first'"):
+            deprecate_nonkeyword_arguments(last_positional="first")(options)
+
     def test_keyword_only_deprecation_shim_preserves_signature(self):
         import newton  # noqa: PLC0415
 

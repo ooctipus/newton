@@ -1302,7 +1302,7 @@ class SolverFeatherPGS(SolverBase):
         """Experimental construction-only shape-label regular expressions."""
         return self._contact_torsion_shape_patterns
 
-    @deprecate_nonkeyword_arguments
+    @deprecate_nonkeyword_arguments(last_positional="friction_anchor_beta")
     def __init__(
         self,
         model: Model,
@@ -1393,9 +1393,12 @@ class SolverFeatherPGS(SolverBase):
     ):
         """Create the solver for ``model``.
 
-        Every option after ``model`` is keyword-only. Passing options positionally is
-        deprecated: they still bind in declaration order, with a
-        :class:`DeprecationWarning` that names the keywords to use.
+        Every option after ``model`` is keyword-only. Passing the options from
+        ``angular_damping`` through ``friction_anchor_beta`` positionally, as earlier
+        releases allowed, is deprecated: they still bind in declaration order, with a
+        :class:`DeprecationWarning` that names the keywords to use. The later options
+        were always keyword-only and still raise :class:`TypeError` when passed
+        positionally.
 
         Args:
             model (Model): the model to be simulated.
@@ -1787,8 +1790,7 @@ class SolverFeatherPGS(SolverBase):
                 the current tangent frame and clamped to the current friction cone.
                 Defaults to False.
             pgs_warmstart_decay (float, optional): Finite non-negative scale applied to
-                contact impulses carried from the previous frame. This option is appended to
-                the constructor to preserve its established positional layout. Defaults to 1.0.
+                contact impulses carried from the previous frame. Defaults to 1.0.
             warn_constraint_overflow (bool, optional): Emit a device-side warning the first time each dense,
                 matrix-free, or propagation row family exceeds its configured per-world capacity. The warning
                 reports the world, requested rows, row limit, and dropped contact/friction rows without a host
