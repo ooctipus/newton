@@ -3537,7 +3537,8 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
 
         By default each graph sorts its first build and keeps the second, without
         a conditional node; under the opt-in nodes the first build sorts only a
-        changed frame.
+        changed frame. A probe captured between the builds shows on every replay
+        which of them sorted (:class:`_SortProbe`).
         """
         for nodes in _node_modes():
             with self.subTest(nodes=nodes):
@@ -3550,28 +3551,34 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
                     for twin in (graph, eager):
                         twin.pair(collide=True)
                 captured = {}
-                outcomes = _admitted_modes(graph.patches)
+                probe = _SortProbe(graph.patches, 2)
+                outcomes, sorts = _admitted_modes(graph.patches), _counted_sort_calls(graph.patches)
                 for name, stream, collide in (("collide", 0, True), ("step", 0, False), ("swap", 1, False)):
                     with _capture_without_nodes(nodes) as capture:
                         graph.solver.seed_double_buffer_events()
-                        graph.pair(stream, collide)
+                        probe.start()
+                        probe.mark()
+                        graph.substep(stream, collide)
+                        probe.check(0)
+                        probe.mark()
+                        graph.substep(stream)
+                        probe.check(1)
                     captured[name] = capture.graph
                     self.assertEqual(_conditional_node_count(capture.graph) > 0, nodes == "1", name)
                 first = "sort" if nodes is None else "node"
                 self.assertEqual(outcomes, [first, "keep"] * 3)
-                n = graph.patches.capacity
+                self.assertEqual(len(sorts), 3, "each graph records the sort of its first build only")
                 for index, event in enumerate(_SOLVER_PLAN):
                     context = f"pair {index} {event}"
                     stream = _change((graph, eager), event, rng)
-                    keys = graph.patches.current.keys.numpy()
-                    keys[n:] = -12345
-                    graph.patches.current.keys.assign(keys)
                     wp.capture_launch(captured[event if event in ("collide", "swap") else "step"])
                     eager.pair(stream, collide=event == "collide")
-                    sorted_any = nodes is None or any(_sorts_each_substep(event))
-                    intact = bool(np.all(graph.patches.current.keys.numpy()[n:] == -12345))
-                    self.assertEqual(
-                        intact, not sorted_any, f"{context}: the radix sort ran {'never' if intact else 'once'}"
+                    # By default the first build always sorts; a node sorts only a changed frame.
+                    first_sorts = nodes is None or _sorts_each_substep(event)[0]
+                    np.testing.assert_array_equal(
+                        probe.intact.numpy(),
+                        [int(not first_sorts), 1],
+                        f"{context}: sorts of the first and second build",
                     )
                     graph.assert_sorted(self, stream, context)
                     _assert_same_twins(graph, eager, context)
@@ -3735,6 +3742,68 @@ def _poison_sort_scratch(twin):
 def _sort_scratch_intact(twin):
     """Whether no radix sort ran since :func:`_poison_sort_scratch`."""
     return bool(np.all(twin.patches.current.keys.numpy()[twin.patches.capacity :] == -12345))
+
+
+@wp.kernel(enable_backward=False)
+def _fill_flags(flags: wp.array[wp.int32], value: int):
+    flags[wp.tid()] = value
+
+
+@wp.kernel(enable_backward=False)
+def _poison_scratch(keys: wp.array[wp.int64], capacity: int, poison: wp.int64):
+    """Fill the second half of the pair keys, which only the radix sort writes."""
+    keys[capacity + wp.tid()] = poison
+
+
+@wp.kernel(enable_backward=False)
+def _check_scratch(keys: wp.array[wp.int64], capacity: int, poison: wp.int64, intact: wp.array[wp.int32], slot: int):
+    """Clear ``intact[slot]`` if a radix sort overwrote the poisoned second half of the pair keys."""
+    if keys[capacity + wp.tid()] != poison:
+        intact[slot] = 0
+
+
+class _SortProbe:
+    """Record on the device whether the radix sort ran between the builds a graph captures.
+
+    :meth:`mark` poisons the second half of the pair keys, which only the radix
+    sort writes, and :meth:`check` records in ``intact[slot]`` whether it still
+    holds the poison. Both launch on the capturing stream, so each replay
+    evaluates them between the same builds; :meth:`start` resets ``intact``.
+    """
+
+    def __init__(self, patches, slots):
+        self.keys, self.capacity, self.device = patches.current.keys, patches.capacity, patches.device
+        self.intact = wp.zeros(slots, dtype=wp.int32, device=self.device)
+        self.poison = wp.int64(-12345)
+
+    def start(self):
+        wp.launch(_fill_flags, dim=self.intact.shape[0], inputs=[self.intact, 1], device=self.device)
+
+    def mark(self):
+        wp.launch(
+            _poison_scratch, dim=self.capacity, inputs=[self.keys, self.capacity, self.poison], device=self.device
+        )
+
+    def check(self, slot):
+        wp.launch(
+            _check_scratch,
+            dim=self.capacity,
+            inputs=[self.keys, self.capacity, self.poison, self.intact, slot],
+            device=self.device,
+        )
+
+
+def _counted_sort_calls(patches):
+    """Return the list each pair sort that ``patches`` launches or captures appends to, reading no device array."""
+    calls = []
+    order = patches._order_pairs
+
+    def counted(**kwargs):
+        calls.append(1)
+        order(**kwargs)
+
+    patches._order_pairs = counted
+    return calls
 
 
 def _assert_same_twins(graph, eager, context):
@@ -3931,18 +4000,29 @@ def _reverse_contacts(contacts):
     )
 
 
-def _step_passes(twin, passes):
+def _step_passes(twin, passes, probe=None):
     """Step ``twin`` through collision passes, each a substep count, colliding on each pass's first substep.
 
     Each pass reverses its live contacts after colliding, so that the slots hold
-    pairs out of order and a kept build that lost its sorted pairs shows.
+    pairs out of order and a kept build that lost its sorted pairs shows. A
+    :class:`_SortProbe` records whether pass ``p`` sorted in its first substep
+    in ``intact[2 * p]`` and in its later substeps in ``intact[2 * p + 1]``.
     """
-    for substeps in passes:
+    if probe is not None:
+        probe.start()
+    for index, substeps in enumerate(passes):
+        if probe is not None:
+            probe.mark()
         for substep in range(substeps):
             if substep == 0:
                 twin.pipeline.collide(twin.states[0], twin.streams[0])
                 _reverse_contacts(twin.streams[0])
             twin.substep()
+            if probe is not None and substep == 0:
+                probe.check(2 * index)
+                probe.mark()
+        if probe is not None:
+            probe.check(2 * index + 1)
 
 
 # Collision passes captured in one graph, each a substep count: one pass of two
@@ -3958,8 +4038,10 @@ _COLLISION_PASSES = {
 def run_captured_collision_passes(test, device, replays):
     """Replay graphs of collision passes bitwise as the eager always-sort chain, sorting once per pass.
 
-    No graph holds a conditional node. On CUDA the graph twin keeps the radix
-    sort, whose poisoned scratch half shows that every replay sorted.
+    No graph holds a conditional node. The graph twin takes the radix sort,
+    which also records into CPU captures: a probe captured between the builds
+    shows on every replay that each pass's first substep sorts and its later
+    substeps do not (:class:`_SortProbe`), as the sorts the capture records do.
     """
     cuda = wp.get_device(device).is_cuda
     # The squeezing jaws need CUDA; on the CPU, boxes landed on the ground keep their contacts.
@@ -3972,22 +4054,22 @@ def run_captured_collision_passes(test, device, replays):
             for _ in range(2 if cuda else 12):
                 for twin in (graph, eager):
                     twin.pair(collide=True)
-            if cuda:
-                graph.patches.live_sort = False
-            outcomes = _admitted_modes(graph.patches)
+            graph.patches.live_sort = False
+            probe = _SortProbe(graph.patches, 2 * len(passes))
+            outcomes, sorts = _admitted_modes(graph.patches), _counted_sort_calls(graph.patches)
             with _capture_without_nodes(None, device) as capture:
                 graph.solver.seed_double_buffer_events()
-                _step_passes(graph, passes)
+                _step_passes(graph, passes, probe)
             test.assertEqual(outcomes, [mode for count in passes for mode in ("sort", *("keep",) * (count - 1))])
+            test.assertEqual(len(sorts), len(passes), "the graph records one sort per collision pass")
             if cuda:
                 test.assertEqual(_conditional_node_count(capture.graph), 0)
             for replay in range(replays):
-                if cuda:
-                    _poison_sort_scratch(graph)
                 wp.capture_launch(capture.graph)
                 _step_passes(eager, passes)
-                if cuda:
-                    test.assertFalse(_sort_scratch_intact(graph), f"{name} replay {replay} must sort")
+                np.testing.assert_array_equal(
+                    probe.intact.numpy(), [0, 1] * len(passes), f"{name} replay {replay}: sorts by pass and substep"
+                )
                 _assert_same_twins(graph, eager, f"{name} replay {replay}")
             test.assertGreater(int(graph.streams[0].rigid_contact_count.numpy()[0]), 0, "the bodies must touch")
             test.assertTrue(np.any(graph.patches.previous.valid.numpy()), "the passes must carry anchors")
