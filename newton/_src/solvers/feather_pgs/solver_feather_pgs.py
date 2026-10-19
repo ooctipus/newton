@@ -25737,6 +25737,13 @@ def _link_scalar_contacts_source(*, count: str, stride: int, head: str, dofs: in
     positions from the last: a contact links to the next lane of its coordinate, found by one
     ballot per coordinate bit, else to the coordinate's running head, and the chunk's first
     contact of the coordinate becomes that head.
+
+    The fragment runs on every lane of one world's warp and uses the builder's ``MASK``, ``lane``,
+    ``contact_start``, ``sparse_world_base``, ``head_base``, ``sparse_row_dof`` and ``group_heads``,
+    the names ``head`` reads, and ``earlier_lanes``, which must equal ``(1u << lane) - 1u``. A scalar
+    contact's unmarked slot must hold a coordinate in ``[0, dofs)``, as the marker leaves it: the
+    fragment reads ``group_heads`` at that coordinate and matches peers on its low
+    ``(dofs - 1).bit_length()`` bits only.
     """
     coordinate_bits = max(dofs - 1, 0).bit_length()
     return f"""
@@ -25785,6 +25792,11 @@ def _list_serial_contacts_source(*, count: str, stride: int, head: str, serial_c
     Positions and ``head`` are those of :func:`_link_scalar_contacts_source`. A contact head
     without a link (no marked coordinate left below ``-1``) joins ``serial_normals``, compacted
     by one ballot per chunk of 32 positions, and lane 0 writes their count.
+
+    The fragment runs on every lane of one world's warp and uses the builder's ``MASK``, ``lane``,
+    ``world``, ``contact_start``, ``sparse_world_base``, ``sparse_row_dof``, ``serial_normals`` and
+    ``serial_count_out``, the names ``head`` reads, and ``earlier_lanes``, which must equal
+    ``(1u << lane) - 1u``. It declares ``serial_count`` in the scope it is placed in.
     """
     return f"""
     int serial_count = 0;
@@ -25816,14 +25828,14 @@ def _build_independent_sparse_contact_units_kernel(M: int, D: int, build_serial_
     links and the serial list holding unit heads. Members of a patch ring share
     their body pair, hence their coordinate and independence class.
 
-    Two serial walks over the rows define the schedules, and lane 0 runs them for
-    any row layout. When the rows form units as the producers write them, both
-    walks visit exactly the non-friction rows, and the warp builds the same links,
-    heads and serial list in parallel instead.
+    Two serial walks over the rows define the schedules. When the rows form units
+    as the producers write them, both walks visit exactly the non-friction rows,
+    and the warp builds the same links, heads and serial list in parallel; lane 0
+    runs the walks for any other row layout.
     """
     friction = int(PGS_CONSTRAINT_TYPE_FRICTION)
     unit_head = f"world_row_type.data[row_base + normal] != {friction}"
-    # The serial walks that define the schedules, which lane 0 runs for any row layout.
+    # The serial walks that define the schedules, which lane 0 runs for any other row layout.
     serial_walks = f"""
     // Prepending candidates in reverse row order makes each negative link
     // reproduce the original ascending GS order. Each step lands on the last
