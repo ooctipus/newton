@@ -517,8 +517,9 @@ def test_census_drops_exactly_the_contacts_without_response(test, device):
 
     The arm's root joint is a D6 joint without axes, as the USD importer makes of a
     ``PhysicsJoint`` that names one body. A census of the contacts with the pairs kept classifies
-    each by whether FeatherPGS gives either side a response DOF: the base's table contacts get
-    none, the free box's do. The default must drop exactly the former and count the base as
+    each by whether FeatherPGS gives either side a response DOF, and a FeatherPGS step on those
+    contacts must reserve rows for exactly the responding ones: the free box's table contacts get
+    rows, the base's get none. The default must drop exactly the latter and count the base as
     welded.
     """
     for source in ("builder", "usd"):
@@ -543,10 +544,13 @@ def test_census_drops_exactly_the_contacts_without_response(test, device):
                 & (solver.body_has_response_dofs.numpy()[body] != 0)
                 & ((model.body_flags.numpy()[body] & int(BodyFlags.KINEMATIC)) == 0)
             )
+            state = model.state()
+            newton.eval_fk(model, model.joint_q, model.joint_qd, state)
             census = {}
             for flag in ("0", None):
                 pipeline = _pipeline(model, flag)
-                _, contacts = _candidate_pairs(pipeline, model)
+                contacts = pipeline.contacts()
+                pipeline.collide(state, contacts)
                 count = int(contacts.rigid_contact_count.numpy()[0])
                 pairs = np.sort(
                     np.stack(
@@ -554,8 +558,8 @@ def test_census_drops_exactly_the_contacts_without_response(test, device):
                     ),
                     axis=0,
                 )
-                census[flag] = (pairs, pipeline.get_collision_selection()["immobile_pairs"])
-            pairs, _ = census["0"]
+                census[flag] = (pairs, pipeline.get_collision_selection()["immobile_pairs"], contacts)
+            pairs, _, listed = census["0"]
             silent = ~responds[pairs[0]] & ~responds[pairs[1]]
             # The base's table contacts and the box's, in every world; the base is the cylinder.
             base = model.shape_type.numpy() == int(newton.GeoType.CYLINDER)
@@ -563,7 +567,12 @@ def test_census_drops_exactly_the_contacts_without_response(test, device):
             test.assertGreaterEqual(int(np.count_nonzero(on_base)), _WORLDS)
             test.assertTrue(np.all(silent[on_base]))
             test.assertGreaterEqual(int(np.count_nonzero(~silent)), _WORLDS)
-            kept, record = census[None]
+            # The census is FeatherPGS's own: it reserves no row for exactly the silent contacts.
+            solver.step(state, model.state(), model.control(), listed, 1.0 / 120.0)
+            path = solver.contact_path.numpy()[: len(silent)]
+            np.testing.assert_array_equal(path[silent], -1)
+            test.assertTrue(np.all(path[~silent] >= 0), path)
+            kept, record, _ = census[None]
             test.assertEqual(sorted(map(tuple, kept.T.tolist())), sorted(map(tuple, pairs[:, ~silent].T.tolist())))
             test.assertTrue(record["enabled"])
             test.assertEqual(record["welded_bodies"], _WORLDS)
