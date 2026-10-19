@@ -186,8 +186,11 @@ def _free_boxes(
     )
 
 
-def _pressed_spheres(device, *, articulated=False):
-    """One sphere per world at rest, pressed ``DEPTHS`` into a ground plane, with a ``CONTACT_LIMIT`` speed limit."""
+def _pressed_spheres(device, *, articulated=False, **options):
+    """One sphere per world at rest, pressed ``DEPTHS`` into a ground plane, with a ``CONTACT_LIMIT`` speed limit.
+
+    ``options`` are further :class:`~newton.solvers.SolverFeatherPGS` options.
+    """
     limits = (CONTACT_LIMIT, ANGULAR_LIMIT)
     builder = _begin_model(limits)
     spheres = []
@@ -200,7 +203,7 @@ def _pressed_spheres(device, *, articulated=False):
             _add_arm(builder)
         builder.end_world()
     builder.add_ground_plane()
-    return _split_run(builder, device, spheres)
+    return _split_run(builder, device, spheres, **options)
 
 
 def _landing_boxes(device, *, articulated=False, worlds=8):
@@ -408,6 +411,32 @@ class _SplitVelocityLimitChecks:
                 np.testing.assert_allclose(
                     np.where(limit, rows.impulses, 0.0), correction, rtol=0.0, atol=RTOL * CONTACT_LIMIT * MASS
                 )
+
+    def test_velocity_limit_law_leaves_the_free_body_sweep(self):
+        """Keep the stateless free-body sweep under either ``velocity_limit_law``, which split mode does not apply.
+
+        ``velocity_limit_law`` selects the law of the matrix-free sweeps. Split mode has no joint velocity-limit
+        rows, and its free-body sweep applies the stateless law that ``free_body_sweep_law`` records, so an
+        accumulated request changes no kernel, impulse or velocity, and the record says which law applies.
+        """
+        runs = {law: _pressed_spheres(self.device, velocity_limit_law=law) for law in ("stateless", "accumulated")}
+        velocities = {law: _step(run) for law, run in runs.items()}
+        np.testing.assert_array_equal(velocities["accumulated"], velocities["stateless"])
+        np.testing.assert_array_equal(
+            _velocity_limit_impulses(runs["accumulated"]), _velocity_limit_impulses(runs["stateless"])
+        )
+        selected = {law: run.solver.get_path_selection() for law, run in runs.items()}
+        sweeps = {law: record["routes"]["sweep"]["free_body_matrix_free"] for law, record in selected.items()}
+        self.assertEqual(sweeps["accumulated"], sweeps["stateless"])
+        for law, record in selected.items():
+            with self.subTest(law=law):
+                self.assertEqual(record["options"]["velocity_limit_law"]["requested"], law)
+                self.assertIsNone(record["options"]["velocity_limit_law"]["applied"])
+                limits = record["routes"]["velocity_limits"]
+                self.assertIsNone(limits["law"])
+                self.assertIn("free_body_sweep_law", limits["law_reason"])
+                self.assertEqual(limits["free_body_sweep_law"], "stateless")
+                self.assertIn("velocity_limit_law", limits["free_body_sweep_law_reason"])
 
     def test_route_records_the_velocity_limit_sweep(self):
         """Record the stateless free-body law, and on CUDA its ``_vlim`` sweep, wherever limit rows can exist."""

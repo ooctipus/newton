@@ -282,7 +282,11 @@ class TestVelocityLimitLawOption(unittest.TestCase):
                 self.assertIn(words, reason)
 
     def test_option_records_the_requested_and_the_applied_law(self):
-        """Default to the stateless law, record the request, and apply none in split mode."""
+        """Default to the stateless law, record the request, and apply none in split mode.
+
+        The applied option and ``routes.velocity_limits.law`` agree: split mode builds
+        no matrix-free sweep, so it applies neither law.
+        """
         model = _cpu_arm()
         with mock.patch.dict(os.environ):
             os.environ.pop(_LAW_FLAG, None)
@@ -290,14 +294,20 @@ class TestVelocityLimitLawOption(unittest.TestCase):
             accumulated = SolverFeatherPGS(model, velocity_limit_law="accumulated")
         self.assertEqual(default.velocity_limit_law, "stateless")
         self.assertEqual(accumulated.velocity_limit_law, "accumulated")
-        selected = accumulated.get_path_selection()
-        self.assertEqual(
-            selected["options"]["velocity_limit_law"],
-            {"applied": "stateless", "requested": "accumulated", "default": "stateless", "source": "argument"},
-        )
-        limits = selected["routes"]["velocity_limits"]
-        self.assertIsNone(limits["law"])
-        self.assertIn("Split mode", limits["law_reason"])
+        for solver, requested in ((default, "stateless"), (accumulated, "accumulated")):
+            selected = solver.get_path_selection()
+            self.assertEqual(
+                selected["options"]["velocity_limit_law"],
+                {
+                    "applied": None,
+                    "requested": requested,
+                    "default": "stateless",
+                    "source": "default" if requested == "stateless" else "argument",
+                },
+            )
+            limits = selected["routes"]["velocity_limits"]
+            self.assertIsNone(limits["law"])
+            self.assertIn("Split mode", limits["law_reason"])
         with self.assertRaisesRegex(ValueError, "velocity_limit_law"):
             SolverFeatherPGS(model, velocity_limit_law="clamped")
 

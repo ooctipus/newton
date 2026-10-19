@@ -14,8 +14,12 @@ what a sweep does with it:
   brakes harder than the limit itself requires.
 * ``"accumulated"`` keeps the row's impulse as a total, like a contact normal's
   or a position limit's: ``new = max(old - r / d, 0)``, unrelaxed. Sweeps then
-  converge to the complementarity solution, the fixed point that split mode and
-  the parallel matrix-free tiers already solve.
+  converge to the complementarity solution, which is independent of the row
+  order and is the fixed point the parallel matrix-free tiers solve.
+
+Split mode has no joint velocity-limit rows and applies neither law: its
+free-body sweep applies the stateless clamp outside these generators, as
+``routes.velocity_limits.free_body_sweep_law`` records.
 
 Every generator emits its accumulated sites through :func:`accumulated_update`
 (or :func:`accumulated_impulse` where a site computes the change itself), so the

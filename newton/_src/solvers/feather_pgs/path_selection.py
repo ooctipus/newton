@@ -156,8 +156,9 @@ _EFFECTIVE = {
             for kernel in solver._pgs_solve_mf_gs_incremental_kernels
         )
     ),
-    # The sweeps' law after the schedule and row gates (routes.velocity_limits.law).
-    "velocity_limit_law": lambda solver: solver._velocity_limit_kernel_law(),
+    # The sweeps' law after the schedule and row gates (routes.velocity_limits.law): None in split mode, which
+    # builds no matrix-free sweep and applies no law.
+    "velocity_limit_law": lambda solver: solver._velocity_limit_sweep_law()[0],
     # The largest budget of the built linked (patch) tiers; 0 without them.
     "mf_gs_parallel_linked_sweeps": _linked_tier_sweeps,
 }
@@ -892,7 +893,8 @@ def _split_free_body_velocity_limit_law(solver) -> tuple[str | None, str]:
         return "stateless", (
             "A violated free-body velocity-limit row pushes by its whole, unrelaxed correction and keeps that "
             "correction instead of an accumulated impulse; the rows end every iteration. The CPU loop applies "
-            "this law and CUDA builds the _vlim sweep for it."
+            "this law and CUDA builds the _vlim sweep for it; velocity_limit_law selects the law of the "
+            "matrix-free sweeps and does not apply here."
         )
     if solver._has_rigid_body_velocity_limits:
         return None, "velocity_limit_activation_fraction=inf reserves no free-body velocity-limit row."

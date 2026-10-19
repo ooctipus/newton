@@ -50,9 +50,10 @@ def _get_pgs_solve_sparse_kernel(
     This uses the existing interleaved row order and paired friction law,
     including linked patch normal loads. The caller admits only augmented
     drives, immediate response, and no warm start or torsion. ``velocity_limits``
-    adds a final articulated limit pass to each sweep, with stateless,
-    unrelaxed corrections accumulated in the factor delta. It requires full
-    ordered rows and no independent free-body response. Seeded patch impulses
+    adds a final articulated limit pass to each sweep, whose unrelaxed
+    corrections under ``velocity_limit_law`` accumulate in the factor delta.
+    It requires full ordered rows and no independent free-body response.
+    Seeded patch impulses
     retain the ordinary delta semantics.
     Independent free-body rows follow the articulated rows in every sweep,
     retaining their own response, capacity, friction law, and impulse buffer.
@@ -94,7 +95,7 @@ def _get_pgs_solve_sparse_kernel(
     ``warm_start`` seeds the factor delta with the response of the impulses
     already stored in the row buffer before the first sweep, so carried
     contact impulses act on the velocity exactly as the ordinary route
-    installs them in ``v_out``. Velocity-limit rows stay stateless. It
+    installs them in ``v_out``. Warm start seeds no velocity-limit row. It
     requires no independent free-body rows.
 
     ``velocity_limit_law="accumulated"`` makes the final velocity-limit pass
