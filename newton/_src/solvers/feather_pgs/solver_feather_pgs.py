@@ -3376,13 +3376,21 @@ class SolverFeatherPGS(SolverBase):
 
         install_cached_dynamics(self)
         if self._scalar_branches is not None and getattr(self._tree_kinetic_state, "scalar", None) is None:
-            # Ordinary dynamics keeps the branches, with the opt-ins they superseded.
             self._scalar_branches = None
-            self._scalar_branches_reason = (
-                f"The held-tree owner did not take them: {self._cached_dynamics_selection_reason}"
-            )
             if self._tree_kinetic_state is None:
+                # Ordinary dynamics keeps the branches, with the opt-ins they superseded.
+                self._scalar_branches_reason = (
+                    f"The held-tree owner did not take them ({self._cached_dynamics_selection_reason}); "
+                    "the prismatic opt-ins apply."
+                )
                 self._configure_prismatic_publication()
+            else:
+                # Every cached owner excludes the prismatic opt-ins (today no other owner admits
+                # a sparse-diagonal response, so this branch is defensive).
+                self._scalar_branches_reason = (
+                    "A cached owner without scalar branches took these worlds: "
+                    f"{self._cached_dynamics_selection_reason}"
+                )
         self._unread_mass_sizes = self._unread_mass_matrix_sizes()
         # Decide the fused publication now: its host checks must not run inside
         # a later graph capture of the first step.
