@@ -1,0 +1,1 @@
+Build FeatherPGS sparse-diagonal schedules of patch contact units with each world's whole warp instead of serial walks on one lane. Worlds whose rows do not form units keep the serial walks. The schedules, and hence the solved impulses, are unchanged.

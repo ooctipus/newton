@@ -25756,6 +25756,88 @@ def _get_build_independent_sparse_contact_groups_kernel(
     return wp.kernel(enable_backward=False, module="unique")(build_independent_sparse_contact_groups_template)
 
 
+def _link_scalar_contacts_source(*, count: str, stride: int, head: str, dofs: int) -> str:
+    """Return CUDA source that links each coordinate's scalar contacts across a world's warp.
+
+    Contacts lie ``stride`` rows apart from ``contact_start``: position ``p`` is row
+    ``contact_start + p * stride`` for ``p`` below the C expression ``count``, and the C
+    condition ``head`` on ``normal`` tells whether that row heads a contact. A scalar contact
+    (one marked coordinate) links to the next scalar contact of its coordinate in row order
+    (``-(next + 3)``, ``-2`` at the chain end) unless a coupled contact reserved the coordinate
+    (``-1``), and ``group_heads`` ends with each chain's first contact. These are the outputs of
+    prepending the contacts to their chains in reverse row order. The warp visits chunks of 32
+    positions from the last: a contact links to the next lane of its coordinate, found by one
+    ballot per coordinate bit, else to the coordinate's running head, and the chunk's first
+    contact of the coordinate becomes that head.
+    """
+    coordinate_bits = max(dofs - 1, 0).bit_length()
+    return f"""
+    for (int chunk = ({count} + 31) / 32 - 1; chunk >= 0; --chunk) {{
+        const int normal = contact_start + (chunk * 32 + lane) * {stride};
+        int coordinate = -1;
+        int link_row = 0;
+        int running = -1;
+        if (chunk * 32 + lane < {count}) {{
+            const int sparse_row = sparse_world_base + normal * 2;
+            const int coord_0 = sparse_row_dof.data[sparse_row];
+            const int coord_1 = sparse_row_dof.data[sparse_row + 1];
+            if (({head}) && (coord_0 < -1 || coord_1 < -1)) {{
+                const int scalar_coordinate = coord_0 >= 0 ? coord_0 : coord_1;
+                running = group_heads.data[head_base + scalar_coordinate];
+                if (running != -2) {{
+                    coordinate = scalar_coordinate;
+                    link_row = coord_0 < 0 ? sparse_row : sparse_row + 1;
+                }} else {{
+                    sparse_row_dof.data[coord_0 < -1 ? sparse_row : sparse_row + 1] = -1;
+                }}
+            }}
+        }}
+        unsigned peers = __ballot_sync(MASK, coordinate >= 0);
+        for (int bit = 0; bit < {coordinate_bits}; ++bit) {{
+            const unsigned ones = __ballot_sync(MASK, (coordinate >> bit) & 1);
+            peers &= ((coordinate >> bit) & 1) ? ones : ~ones;
+        }}
+        if (coordinate >= 0) {{
+            const unsigned later = peers & ~earlier_lanes & ~(1u << lane);
+            const int next_normal = later != 0u
+                ? contact_start + (chunk * 32 + __ffs((int)later) - 1) * {stride} : running;
+            sparse_row_dof.data[link_row] = next_normal >= 0 ? -(next_normal + 3) : -2;
+        }}
+        __syncwarp(MASK);
+        if (coordinate >= 0 && (peers & earlier_lanes) == 0u)
+            group_heads.data[head_base + coordinate] = normal;
+        __syncwarp(MASK);
+    }}
+"""
+
+
+def _list_serial_contacts_source(*, count: str, stride: int, head: str, serial_capacity: int) -> str:
+    """Return CUDA source that lists the contacts outside every chain, in row order, across the warp.
+
+    Positions and ``head`` are those of :func:`_link_scalar_contacts_source`. A contact head
+    without a link (no marked coordinate left below ``-1``) joins ``serial_normals``, compacted
+    by one ballot per chunk of 32 positions, and lane 0 writes their count.
+    """
+    return f"""
+    int serial_count = 0;
+    for (int base = 0; base < {count}; base += 32) {{
+        const int normal = contact_start + (base + lane) * {stride};
+        bool serial = false;
+        if (base + lane < {count}) {{
+            const int sparse_row = sparse_world_base + normal * 2;
+            const int coord_0 = sparse_row_dof.data[sparse_row];
+            const int coord_1 = sparse_row_dof.data[sparse_row + 1];
+            serial = ({head}) && !(coord_0 < -1 || coord_1 < -1);
+        }}
+        const unsigned serial_lanes = __ballot_sync(MASK, serial);
+        if (serial)
+            serial_normals.data[world * {serial_capacity} + serial_count + __popc(serial_lanes & earlier_lanes)] = normal;
+        serial_count += __popc(serial_lanes);
+    }}
+    if (lane == 0) serial_count_out.data[world] = serial_count;
+"""
+
+
 def _build_independent_sparse_contact_units_kernel(M: int, D: int, build_serial_contacts: bool) -> "wp.Kernel":
     """Build the independent and serial schedules over patch contact units.
 
@@ -25765,62 +25847,16 @@ def _build_independent_sparse_contact_units_kernel(M: int, D: int, build_serial_
     unit's head as parent. The schedules are those of the triple builder, with
     links and the serial list holding unit heads. Members of a patch ring share
     their body pair, hence their coordinate and independence class.
+
+    Two serial walks over the rows define the schedules, and lane 0 runs them for
+    any row layout. When the rows form units as the producers write them, both
+    walks visit exactly the non-friction rows, and the warp builds the same links,
+    heads and serial list in parallel instead.
     """
     friction = int(PGS_CONSTRAINT_TYPE_FRICTION)
-    serial_schedule = (
-        f"""
-    // Compact the remaining units in original row order. The solve may
-    // inspect up to four units concurrently, but any active batch is still
-    // applied through this serial list in exact GS order.
-    if (lane == 0) {{
-        int serial_count = 0;
-        int normal = contact_start;
-        while (normal < contact_end) {{
-            const int sparse_row = sparse_world_base + normal * 2;
-            const bool scheduled_independently = sparse_row_dof.data[sparse_row] < -1
-                || sparse_row_dof.data[sparse_row + 1] < -1;
-            if (!scheduled_independently)
-                serial_normals.data[world * {M} + serial_count++] = normal;
-            const bool owns_tangents = normal + 2 < contact_end
-                && world_row_type.data[row_base + normal + 1] == {friction}
-                && world_row_parent.data[row_base + normal + 1] == normal;
-            normal += owns_tangents ? 3 : 1;
-        }}
-        serial_count_out.data[world] = serial_count;
-    }}
-    __syncwarp(MASK);
-"""
-        if build_serial_contacts
-        else ""
-    )
-
-    snippet = f"""
-#if defined(__CUDA_ARCH__)
-    constexpr unsigned MASK = 0xffffffffu;
-    const int contact_start = dense_phase_bounds.data[world * 2 + 1];
-    const int contact_end = world_constraint_count.data[world];
-    const int head_base = world * {D};
-    const int row_base = world * {M};
-    const int sparse_world_base = world * {M} * 2;
-    for (int coordinate = lane; coordinate < {D}; coordinate += 32)
-        group_heads.data[head_base + coordinate] = -1;
-    __syncwarp(MASK);
-
-    // Reserve every diagonal coordinate used by a coupled unit. A scalar
-    // unit sharing one must remain in the serial chain to preserve GS order.
-    for (int normal = contact_start + lane; normal < contact_end; normal += 32) {{
-        if (world_row_type.data[row_base + normal] == {friction}) continue;
-        const int sparse_row = sparse_world_base + normal * 2;
-        const int coord_0 = sparse_row_dof.data[sparse_row];
-        const int coord_1 = sparse_row_dof.data[sparse_row + 1];
-        const bool scalar_candidate = coord_0 < -1 || coord_1 < -1;
-        if (!scalar_candidate) {{
-            if (coord_0 >= 0) atomicExch(&group_heads.data[head_base + coord_0], -2);
-            if (coord_1 >= 0) atomicExch(&group_heads.data[head_base + coord_1], -2);
-        }}
-    }}
-    __syncwarp(MASK);
-
+    unit_head = f"world_row_type.data[row_base + normal] != {friction}"
+    # The serial walks that define the schedules, which lane 0 runs for any row layout.
+    serial_walks = f"""
     // Prepending candidates in reverse row order makes each negative link
     // reproduce the original ascending GS order. Each step lands on the last
     // row of the previous unit, which is its head or one of its tangent rows.
@@ -25856,8 +25892,89 @@ def _build_independent_sparse_contact_units_kernel(M: int, D: int, build_serial_
         }}
     }}
     __syncwarp(MASK);
+"""
+    serial_schedule = (
+        f"""
+    // Compact the remaining units in original row order. The solve may
+    // inspect up to four units concurrently, but any active batch is still
+    // applied through this serial list in exact GS order.
+    if (lane == 0) {{
+        int serial_count = 0;
+        int normal = contact_start;
+        while (normal < contact_end) {{
+            const int sparse_row = sparse_world_base + normal * 2;
+            const bool scheduled_independently = sparse_row_dof.data[sparse_row] < -1
+                || sparse_row_dof.data[sparse_row + 1] < -1;
+            if (!scheduled_independently)
+                serial_normals.data[world * {M} + serial_count++] = normal;
+            const bool owns_tangents = normal + 2 < contact_end
+                && world_row_type.data[row_base + normal + 1] == {friction}
+                && world_row_parent.data[row_base + normal + 1] == normal;
+            normal += owns_tangents ? 3 : 1;
+        }}
+        serial_count_out.data[world] = serial_count;
+    }}
+    __syncwarp(MASK);
+"""
+        if build_serial_contacts
+        else ""
+    )
+    parallel_serial_schedule = (
+        _list_serial_contacts_source(count="contact_end - contact_start", stride=1, head=unit_head, serial_capacity=M)
+        if build_serial_contacts
+        else ""
+    )
+    parallel_links = _link_scalar_contacts_source(count="contact_end - contact_start", stride=1, head=unit_head, dofs=D)
 
+    snippet = f"""
+#if defined(__CUDA_ARCH__)
+    constexpr unsigned MASK = 0xffffffffu;
+    const int contact_start = dense_phase_bounds.data[world * 2 + 1];
+    const int contact_end = world_constraint_count.data[world];
+    const int head_base = world * {D};
+    const int row_base = world * {M};
+    const int sparse_world_base = world * {M} * 2;
+    const unsigned earlier_lanes = (1u << lane) - 1u;
+    for (int coordinate = lane; coordinate < {D}; coordinate += 32)
+        group_heads.data[head_base + coordinate] = -1;
+    __syncwarp(MASK);
+
+    // Reserve every diagonal coordinate used by a coupled unit. A scalar
+    // unit sharing one must remain in the serial chain to preserve GS order.
+    // Also check the layout: the segment starts at a head, and each head is
+    // followed by the next head or the segment end, directly or after its two
+    // tangent rows naming it. Both serial walks then visit exactly the heads.
+    bool rows_form_units = contact_start >= contact_end
+        || world_row_type.data[row_base + contact_start] != {friction};
+    for (int normal = contact_start + lane; normal < contact_end; normal += 32) {{
+        const int sparse_row = sparse_world_base + normal * 2;
+        const int coord_0 = sparse_row_dof.data[sparse_row];
+        const int coord_1 = sparse_row_dof.data[sparse_row + 1];
+        const bool unit_head = world_row_type.data[row_base + normal] != {friction};
+        const bool tangent_1 = normal + 1 < contact_end && world_row_type.data[row_base + normal + 1] == {friction};
+        const bool tangent_2 = normal + 2 < contact_end && world_row_type.data[row_base + normal + 2] == {friction};
+        const bool tangent_3 = normal + 3 < contact_end && world_row_type.data[row_base + normal + 3] == {friction};
+        const bool named_1 = normal + 1 < contact_end && world_row_parent.data[row_base + normal + 1] == normal;
+        const bool named_2 = normal + 2 < contact_end && world_row_parent.data[row_base + normal + 2] == normal;
+        if (!unit_head) continue;
+        if (tangent_1 && !(named_1 && tangent_2 && named_2 && !tangent_3)) rows_form_units = false;
+        const bool scalar_candidate = coord_0 < -1 || coord_1 < -1;
+        if (!scalar_candidate) {{
+            if (coord_0 >= 0) atomicExch(&group_heads.data[head_base + coord_0], -2);
+            if (coord_1 >= 0) atomicExch(&group_heads.data[head_base + coord_1], -2);
+        }}
+    }}
+    rows_form_units = __all_sync(MASK, rows_form_units);
+    __syncwarp(MASK);
+
+    if (rows_form_units) {{
+{parallel_links}
+{parallel_serial_schedule}
+    }} else {{
+{serial_walks}
 {serial_schedule}
+    }}
+    __syncwarp(MASK);
 
     int count = 0;
     for (int coordinate_base = 0; coordinate_base < {D}; coordinate_base += 32) {{
