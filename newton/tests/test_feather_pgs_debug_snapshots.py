@@ -90,6 +90,23 @@ def _assert_same_reservations(test, actual, expected, label):
         )
 
 
+def _assert_same_steps(test, device, on, off):
+    """Compare the flag-on and flag-off rollouts step by step.
+
+    Per step: the live contact count, the row reservations, then the states
+    and impulses. A step collides and routes its input state, which the
+    previous iteration compared as that step's output, so arms that diverge
+    fail at the first step that shows it rather than at a later step's
+    contacts or routing.
+    """
+    for step, (expected, actual) in enumerate(zip(off["trajectory"], on["trajectory"], strict=True)):
+        label = f"step {step}"
+        test.assertEqual(on["contact_counts"][step], off["contact_counts"][step], f"{label} live contacts")
+        _assert_same_reservations(test, on["reservations"][step], off["reservations"][step], label)
+        for name, values in expected.items():
+            _assert_same(test, device, actual[name], values, f"{label} {name}")
+
+
 def _reservations(solver, contacts):
     """Return the live contacts' routing and the per-world row counts after a step.
 
@@ -375,11 +392,7 @@ def test_snapshots_leave_physics_unchanged(test, device):
             on = _rollout(model, snapshots=True, **options)
             test.assertGreater(min(off["contact_counts"]), 0)
             test.assertLessEqual(max(off["contact_counts"]), WARP_SIZE, "the compared contacts must fit in one warp")
-            test.assertEqual(off["contact_counts"], on["contact_counts"])
-            for step, (expected, actual) in enumerate(zip(off["trajectory"], on["trajectory"], strict=True)):
-                _assert_same_reservations(test, on["reservations"][step], off["reservations"][step], f"step {step}")
-                for name, values in expected.items():
-                    _assert_same(test, device, actual[name], values, f"step {step} {name}")
+            _assert_same_steps(test, device, on, off)
             moved = np.abs(off["trajectory"][-1]["joint_q"] - model.joint_q.numpy()).max()
             test.assertGreater(float(moved), 1.0e-4, "the scene must move")
             test.assertGreater(float(np.abs(off["trajectory"][-1]["impulses"]).max()), 0.0)
@@ -519,8 +532,10 @@ def _graph_node_types(graph):
 def _graph_rollout(model, *, snapshots, steps=GRAPH_STEPS, **solver_kwargs):
     """Capture one substep per state order, replay them, and record each graph's nodes and captured copies.
 
-    Also returns the final state and impulses, the last replay's row
-    reservations and the live contact count of every substep.
+    Also returns, per substep as _rollout does, the live contact count, the
+    state and impulses after the substep and its row reservations. Substep 0
+    is the eager warm-up and substep k the k-th replay. Reading the results
+    synchronizes between replays, as reading the contact count already does.
     """
     device = model.device
     with _snapshot_flag(snapshots):
@@ -531,16 +546,23 @@ def _graph_rollout(model, *, snapshots, steps=GRAPH_STEPS, **solver_kwargs):
     newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
     states[0].joint_qd.assign(np.linspace(-0.6, 0.6, model.joint_dof_count, dtype=np.float32))
     control = model.control()
+    trajectory, reservations = [], []
 
     def substep(state_in, state_out):
         state_in.clear_forces()
         solver.step(state_in, state_out, control, contacts, DT)
+
+    def record():
+        trajectory.append({name: getattr(states[0], name).numpy().copy() for name in STATE_FIELDS})
+        trajectory[-1]["impulses"] = solver.impulses.numpy().copy()
+        reservations.append(_reservations(solver, contacts))
 
     # Compile and initialize the layouts before capture.
     pipeline.collide(states[0], contacts)
     counts = [int(contacts.rigid_contact_count.numpy()[0])]
     substep(states[0], states[1])
     states.reverse()
+    record()
     copy, copies, graphs = wp.copy, [], []
 
     def record_copy(dest, src, *args, **kwargs):
@@ -559,12 +581,11 @@ def _graph_rollout(model, *, snapshots, steps=GRAPH_STEPS, **solver_kwargs):
         counts.append(int(contacts.rigid_contact_count.numpy()[0]))
         wp.capture_launch(graphs[step % 2])
         states.reverse()
-    final = {name: getattr(states[0], name).numpy().copy() for name in STATE_FIELDS}
-    final["impulses"] = solver.impulses.numpy().copy()
+        record()
     return {
         "solver": solver,
-        "final": final,
-        "reservations": _reservations(solver, contacts),
+        "trajectory": trajectory,
+        "reservations": reservations,
         "contact_counts": counts,
         "node_types": [_graph_node_types(graph) for graph in graphs],
         "copies": copies,
@@ -576,7 +597,8 @@ class TestFeatherPGSDebugSnapshotsGraph(unittest.TestCase):
     def test_captured_substeps_have_no_snapshot_memcpy_nodes(self):
         """Capture no snapshot memcpy node by default and three per substep under the flag; replay the same states.
 
-        Covers split and matrix-free mode under patch and point friction.
+        Covers split and matrix-free mode under patch and point friction, and
+        compares the arms after the warm-up substep and after every replay.
         """
         device = wp.get_device("cuda:0")
         model = _compared_scene(device)
@@ -586,11 +608,8 @@ class TestFeatherPGSDebugSnapshotsGraph(unittest.TestCase):
                 on = _graph_rollout(model, snapshots=True, **options)
                 self.assertGreater(min(off["contact_counts"]), 0)
                 self.assertLessEqual(
-                    max(off["contact_counts"] + on["contact_counts"]),
-                    WARP_SIZE,
-                    "the compared contacts must fit in one warp",
+                    max(off["contact_counts"]), WARP_SIZE, "the compared contacts must fit in one warp"
                 )
-                self.assertEqual(off["contact_counts"], on["contact_counts"])
                 for name in SNAPSHOTS:
                     self.assertIsNone(getattr(off["solver"], name), name)
                 for off_copies, on_copies in zip(off["copies"], on["copies"], strict=True):
@@ -604,9 +623,7 @@ class TestFeatherPGSDebugSnapshotsGraph(unittest.TestCase):
                         if not _is_snapshot(on["solver"], dest)
                     ]
                     self.assertEqual([(_signature(dest), _signature(src)) for dest, src in off_copies], kept)
-                _assert_same_reservations(self, on["reservations"], off["reservations"], "last replay")
-                for name, values in off["final"].items():
-                    _assert_same(self, device, on["final"][name], values, name)
+                _assert_same_steps(self, device, on, off)
                 failed = [types for types in off["node_types"] + on["node_types"] if isinstance(types, str)]
                 if failed:
                     # Warp found the driver, so on Linux libcuda.so.1 is loaded: a failed query is a bug here.
