@@ -520,21 +520,25 @@ class TestBroadPhaseTemplateRule(unittest.TestCase):
         return BroadPhaseExplicitTemplates(record, device="cpu")
 
     def test_automatic_rule_admits_large_templates(self):
-        """Admit automatically only at 2**20 template pairs or more and 64 or more pairs per world."""
-        self.assertTrue(self._single(64, 16384).automatic)
-        self.assertFalse(self._single(63, 16645).automatic)
-        self.assertFalse(self._single(64, 16383).automatic)
-        self.assertEqual(self._single(64, 16384).pair_count, 1 << 20)
+        """Admit automatically only at 2**20 template pairs or more and 128 or more pairs per world."""
+        self.assertTrue(self._single(128, 8192).automatic)
+        self.assertFalse(self._single(127, 8257).automatic)
+        self.assertFalse(self._single(128, 8191).automatic)
+        self.assertEqual(self._single(128, 8192).pair_count, 1 << 20)
+        # At 64 pairs per world the template kernel only ties the flat one on the device.
+        self.assertFalse(self._single(64, 16384).automatic)
 
     def test_global_pairs_do_not_count_toward_admission(self):
         """Keep the flat kernel automatically when only global-global pairs make the list large."""
         # Global-global pairs are streamed from the list as in the flat kernel, so they save nothing.
-        layout = self._single(64, 16, global_pairs=1 << 20)
+        layout = self._single(128, 16, global_pairs=1 << 20)
         self.assertGreaterEqual(layout.pair_count, layout.AUTO_MIN_PAIRS)
         self.assertGreaterEqual(layout.mean_pairs_per_world, layout.AUTO_MIN_PAIRS_PER_WORLD)
         self.assertFalse(layout.automatic)
-        # They spread over leading blocks of 256 lanes x 8 pairs instead of running in one block.
-        self.assertEqual(layout.global_blocks, (1 << 20) // 2048)
+        # They spread over leading blocks of the launch's lanes x 8 pairs instead of running in one block.
+        self.assertEqual(layout.global_chunk, layout.block_dim * 8)
+        self.assertEqual(layout.global_blocks, -(-(1 << 20) // layout.global_chunk))
+        self.assertGreater(layout.global_blocks, 1)
         self.assertEqual(layout.describe()["global_blocks"], layout.global_blocks)
 
     def test_staging_capacity_bounds_admission(self):

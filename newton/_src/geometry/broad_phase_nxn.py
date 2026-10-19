@@ -968,8 +968,11 @@ class BroadPhaseExplicitTemplates:
     """Template pairs below which automatic selection keeps the flat kernel (the stream it saves is small).
 
     Global-global pairs do not count: they are streamed from the list as in the flat kernel."""
-    AUTO_MIN_PAIRS_PER_WORLD = 64
-    """Mean pairs per world below which automatic selection keeps the flat kernel."""
+    AUTO_MIN_PAIRS_PER_WORLD = 128
+    """Mean pairs per world below which automatic selection keeps the flat kernel.
+
+    Measured on an RTX PRO 6000 at 16384 worlds: at 64 pairs per world the template kernel only ties
+    the flat one (0.998x, and 1.002x with 1000 global shapes); from 137 it wins (0.92x, 0.78x at 166)."""
     MAX_STAGED_SHAPES = 1024
     """Most shapes a world's template may reference."""
     _SHARED_BYTES = 32 * 1024
