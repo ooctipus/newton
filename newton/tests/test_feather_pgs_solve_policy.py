@@ -13,6 +13,7 @@ import dataclasses
 import inspect
 import itertools
 import json
+import re
 import unittest
 from types import SimpleNamespace
 
@@ -47,6 +48,7 @@ from newton._src.solvers.feather_pgs.solve_policy import (
     vote,
 )
 from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel
+from newton._src.solvers.feather_pgs.velocity_limit_law import VELOCITY_LIMIT_LAWS
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
 from newton.tests.test_feather_pgs_point_streams import _kernel_hash
@@ -147,6 +149,10 @@ def _factory_calls():
     )
 
 
+# An accumulated velocity-limit impulse, max(old - r / d, 0) with the unrelaxed step, as velocity_limit_law emits it.
+_LAW_SITE = re.compile(r"fmaxf\(old_\w+ - residual")
+
+
 def _axis(name, values=(False, True)):
     """One census axis: a keyword over its values."""
     return tuple({name: value} for value in values)
@@ -156,9 +162,12 @@ def _vote_census():
     """Every combination of the flags that add or remove vote sites, per policy factory: ``(name, factory, args, kwargs)``.
 
     The axes follow the exit-voting factories' census in ``tools/fpgs_bench/kernel_identity.py`` at one
-    shape each. The matrix-free sweep keeps the current friction law without torsion or dense tiles, the
+    shape each, crossed with the factories' other options that rewrite their sweeps: the velocity-limit
+    law of the sparse, matrix-free and incremental sweeps and the matrix-free sweep's resident row
+    metadata. The matrix-free sweep keeps the current friction law without torsion or dense tiles, the
     variants that compile the velocity law; the census pins the others' text unchanged.
     """
+    laws = _axis("velocity_limit_law", VELOCITY_LIMIT_LAWS)
     local = (
         _axis("paired_dof_count", (0, 6)),
         _axis("persistent_queue"),
@@ -182,13 +191,20 @@ def _vote_census():
                 _axis("local_factors"),
                 _axis("warm_start"),
                 _axis("linked_rows"),
+                laws,
             ),
         ),
         (
             "sparse_lanes",
             _get_pgs_solve_sparse_kernel.__wrapped__,
             (32, 8, 8),
-            (_axis("lanes_per_world", (16, 8)), _axis("velocity_limits"), _axis("local_factors"), _axis("warm_start")),
+            (
+                _axis("lanes_per_world", (16, 8)),
+                _axis("velocity_limits"),
+                _axis("local_factors"),
+                _axis("warm_start"),
+                laws,
+            ),
         ),
         (
             "mf_gs",
@@ -206,6 +222,8 @@ def _vote_census():
                 _axis("skip_incremental_rows", (0, 32)),
                 _axis("skip_response_block"),
                 _axis("independent_components"),
+                _axis("resident_row_metadata"),
+                laws,
             ),
         ),
         (
@@ -231,6 +249,7 @@ def _vote_census():
                 _axis("has_drive_rows"),
                 _axis("has_dense_velocity_limit_rows"),
                 _axis("skip_local_internal_worlds"),
+                laws,
             ),
         ),
     )
@@ -421,27 +440,54 @@ class TestVelocityExitLaw(unittest.TestCase):
         exit record. Vote sites that only some flags emit (velocity-limit lanes, free-body rows, fused
         drive clamps, streamed impulses, local matrix-free rows) would otherwise keep the exact law
         unnoticed.
+
+        Every policy, the plain readout included, must also compose with the factory's other options:
+        its kernel is the policy-less kernel's name plus the policy's suffix, it appends one readout
+        operand when it counts, and it keeps the policy-less sweep's velocity-limit law sites, the
+        law's ``_vacc`` name, its row-metadata storage and its record of the law.
         """
         checked = dict.fromkeys(_SCALED_VOTES, 0)
         for name, factory, args, kwargs in _vote_census():
             try:
-                factory(*args, **kwargs)
+                plain = factory(*args, **kwargs)
             except (ValueError, NotImplementedError, RuntimeError, AssertionError):
                 continue
-            for policy in (VELOCITY, TRACED_VELOCITY):
+            body = max(_native_snippets(plain), key=len)
+            law_sites = len(_LAW_SITE.findall(body))
+            accumulated = kwargs.get("velocity_limit_law") == "accumulated"
+            # The law emits what its name says: accumulated sites under its _vacc name, none without it.
+            if ("_vacc" in plain.key) != (law_sites > 0) or (law_sites and not accumulated):
+                self.fail(f"{plain.key} {kwargs}: {law_sites} accumulated law sites")
+            if kwargs.get("resident_row_metadata") and ("_smeta" not in plain.key or "s_meta_dense" not in body):
+                self.fail(f"{plain.key} {kwargs}: resident row metadata is not resident")
+            for policy in (SWEEPS, VELOCITY, TRACED_VELOCITY):
                 kernel = factory(*args, solve_policy=policy, **kwargs)
-                snippets = {snippet for snippet in _native_snippets(kernel) if "0.001f" in snippet}
-                if len(snippets) != 1:
-                    self.fail(f"{kernel.key}: {len(snippets)} snippets hold the tolerance")
-                (snippet,) = snippets
+                self.assertEqual(kernel.key, plain.key + policy.suffix, kwargs)
+                self.assertEqual(getattr(kernel, "_fpgs_solve_readout", False), policy.counts and policy.readout)
+                labels = [argument.label for argument in kernel.adj.args]
+                self.assertEqual(labels, [argument.label for argument in plain.adj.args] + ["readout"] * policy.counts)
+                if hasattr(plain, "_fpgs_velocity_limit_law"):
+                    self.assertEqual(getattr(kernel, "_fpgs_velocity_limit_law", None), plain._fpgs_velocity_limit_law)
+                snippet = max(_native_snippets(kernel), key=len)
+                if len(_LAW_SITE.findall(snippet)) != law_sites or ("s_meta_dense" in snippet) != (
+                    "s_meta_dense" in body
+                ):
+                    self.fail(f"{kernel.key} {kwargs}: the policy rewrote the law or the row metadata")
+                if not policy.exact:
+                    snippets = {snippet for snippet in _native_snippets(kernel) if "0.001f" in snippet}
+                    if len(snippets) != 1:
+                        self.fail(f"{kernel.key}: {len(snippets)} snippets hold the tolerance")
+                    (snippet,) = snippets
                 votes = [line.strip() for line in snippet.splitlines() if "changed = 1;" in line]
-                unbounded = [line for line in votes if "<= 0.001f" not in line]
+                unbounded = [line for line in votes if not policy.exact and "<= 0.001f" not in line]
                 if not votes or unbounded:
                     self.fail(f"{kernel.key} {kwargs}: unbounded votes {unbounded[:2] or 'none found'}")
                 if policy.traces and (
                     snippet.count("solve_trace_sweep(") != 1 or snippet.count("solve_trace_change(") < len(votes)
                 ):
                     self.fail(f"{kernel.key} {kwargs}: the trace misses a vote or the exit")
+                if policy.counts and not policy.traces and snippet.count("solve_readout_sweeps(") != 1:
+                    self.fail(f"{kernel.key} {kwargs}: the readout records no exit or more than one")
             checked[name] += 1
         self.assertTrue(all(checked.values()), checked)
 
