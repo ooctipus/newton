@@ -28,6 +28,17 @@ ordinary dynamics without evaluating the velocity product, which is zero for
 them. The family never writes ``body_q_com``, ``body_v_s``, ``body_a_s``,
 ``body_f_s``, ``body_I_s`` or the compact inertia terms of its bodies, which no
 consumer on its route reads.
+
+A leaf's inverse mass, ``1 / (m |S|^2 + armature + K)`` for a prismatic leaf
+and ``1 / (S^T I S + armature + K)`` for a revolute one, depends on the inertial
+values, the armature and the drive's ``K = ke dt^2 + kd dt``, never on the
+pose, so a root re-pose leaves it unchanged. It still refreshes wherever the
+solver's mass mask selects (the update cadence plus the requests that resets
+and inertial, DOF and body notifications raise), as the prismatic linear
+state's does: that keeps prismatic leaves bitwise with that route and follows
+a changed step duration, which no notification announces. M6 timed prototype
+predict and finish kernels at 489 us per substep with this cadence over 16384
+keyboard-sized worlds, against 500 us with a refresh on every substep.
 """
 
 from __future__ import annotations
