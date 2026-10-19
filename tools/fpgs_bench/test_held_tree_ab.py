@@ -6,6 +6,7 @@
 import contextlib
 import io
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,7 +16,27 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import tree_kinetic_owner
+from newton.tests.test_feather_pgs_cache_validity import _input_mismatches
 from tools.fpgs_bench import held_tree_ab as ab
+
+# The owners the per-size groups of test_feather_pgs_cache_validity's launch check leave out, by scene:
+# (forest, chain scan, alternate motion) of the scene's one group.
+_OWNER_SCENES = {
+    "single-floating1-chains0": (False, False, False),
+    "prescaled-floating1-chains0": (False, False, True),
+    "single-floating1-chains1": (False, True, False),
+    "prescaled-floating1-chains1": (False, True, True),
+    "forest-arm-box": (True, False, False),
+    "forest-speed-limit": (True, False, True),
+}
+
+
+def _form(key):
+    """The launch form a held-tree kernel key names: its stage, or a repair's form."""
+    stage = re.match(r"tree_kinetic_([a-z]+)\d", key).group(1)
+    if stage != "repair":
+        return stage
+    return next((form for form in ("banked", "listed", "motion") if key.endswith(f"_{form}")), "repair")
 
 
 class TestHeldTreeAB(unittest.TestCase):
@@ -94,6 +115,53 @@ class TestHeldTreeAB(unittest.TestCase):
         self.assertIn("tree_kinetic_finish4", records["mixed-arm-box/0/finish/launched"].tolist())
         self.assertEqual(tree_kinetic_owner.TreeKineticState._publication.__name__, "_publication")
         self.assertEqual((wp.launch.__name__, wp.launch_tiled.__name__), ("launch", "launch_tiled"))
+
+    def test_single_tree_and_forest_launches_match_their_kernels(self):
+        """Launch every held-tree kernel of sparse single trees and forests with one input of each parameter's type.
+
+        Warp checks an array input at launch but packs whatever it is given for a struct
+        parameter, so a kinetic plan in a chain-scan plan's place would launch. The scenes cover the
+        owners that the per-size groups of test_feather_pgs_cache_validity's launch check leave out:
+        a sparse single tree on a kinetic and on a chain-scan plan and a forest group, each with
+        ordinary and alternate motion. Each launch is checked before it runs, and each scene runs
+        every form its group binds: the finish and the predictor; for ordinary motion the one-pass,
+        comparing and listed repairs, the classification and the comparison pass; for alternate
+        motion its one-pass motion repair.
+        """
+        checked = []
+
+        def checking(launch):
+            def launch_checked(kernel, *args, **kwargs):
+                if kernel.key.startswith("tree_kinetic_"):
+                    self.assertEqual(_input_mismatches(kernel, kwargs.get("inputs", ())), [], kernel.key)
+                    checked.append(kernel.key)
+                return launch(kernel, *args, **kwargs)
+
+            return launch_checked
+
+        environment = {name: value for name, value in os.environ.items() if not name.startswith("FEATHER_PGS_")}
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, environment, clear=True),
+            contextlib.redirect_stdout(io.StringIO()),
+            patch.multiple(wp, launch=checking(wp.launch), launch_tiled=checking(wp.launch_tiled)),
+        ):
+            records = ab.record(Path(directory) / "record.npz", scenes=tuple(_OWNER_SCENES))
+        ordinary = {"finish", "predict", "repair", "banked", "listed", "classify", "bank"}
+        for scene, (forest, chain_scan, motion) in _OWNER_SCENES.items():
+            tag = scene if scene.startswith(("single-", "prescaled-")) else f"mixed-{scene}"
+            with self.subTest(scene=tag):
+                self.assertEqual(records[f"{tag}/layout"][:, [3, 4, 6]].tolist(), [[forest, chain_scan, motion]])
+                launched = {
+                    key
+                    for name, keys in records.items()
+                    if name.startswith(f"{tag}/") and name.endswith("/launched")
+                    for key in keys.tolist()
+                }
+                self.assertLessEqual(launched, set(checked))
+                self.assertEqual(
+                    {_form(key) for key in launched}, {"finish", "predict", "motion"} if motion else ordinary
+                )
 
     def test_worlds_set_the_mixed_scenes_world_count(self):
         """Build the mixed scenes over the requested world count; the single trees keep their fixtures' two."""
