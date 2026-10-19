@@ -1423,9 +1423,11 @@ class SolverFeatherPGS(SolverBase):
                 ``auto`` selects a qualified cache for the current topology, factor and row policy;
                 unsupported cases use ordinary prediction/publication. ``on`` requires admission;
                 ``off`` disables these paired caches. Explicit choices override legacy cache
-                environment settings; ``auto`` retains those settings when present. Mixed held
-                factors require ``on`` or their legacy opt-in. Explicit dense kernels disable auto
-                and conflict with ``on``. Factor refresh intervals and numerical budgets are unchanged.
+                environment settings; ``auto`` retains those settings when present. Under ``auto``
+                the held-tree owner is admitted wherever its topology, representation and row policy
+                allow (``FEATHER_PGS_MIXED_TREE_KINETIC_STATE=0`` disables it). Explicit dense kernels
+                disable auto and conflict with ``on``. Factor refresh intervals and numerical budgets
+                are unchanged.
             contact_torsion_radius: Experimental effective spin radius [m], zero disables.
                 Explicit material/footprint assumption: for uniform pressure on a disk
                 of radius R, the effective radius is 2*R/3. Does not consume the generic
