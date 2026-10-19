@@ -32,8 +32,10 @@ every solve executed; ``readout="trace"`` adds, per solve, the sweep at which
 each tolerance of :data:`TRACE_GRID` would have stopped it, its exit reason,
 and the largest velocity-scaled change of its final sweep with that row's
 kind. The counters are one operand per kernel, appended to the kernel's
-arguments, and :class:`SolveReadoutRecord` owns them on the host. Neither
-readout changes a computed value.
+arguments, and :class:`SolveReadoutRecord` owns them on the host. The
+matrix-free sweeps enter no world without rows, so the record also counts
+those solves as skipped, in a launch of its own. Neither readout changes a
+computed value.
 """
 
 import math
@@ -107,6 +109,18 @@ class SolveTrace:
     """Solves by exit reason (:data:`TRACE_REASONS`)."""
     limits: wp.array2d[wp.int64]
     """Final sweeps by the kind of their largest velocity-scaled change and its magnitude bin, ``[kinds, bins]``."""
+
+
+@wp.kernel
+def count_skipped_solves(
+    world_constraint_count: wp.array[int],
+    mf_constraint_count: wp.array[int],
+    skipped: wp.array[wp.int32],
+):
+    """Count one skipped solve of every world without dense or matrix-free rows."""
+    world = wp.tid()
+    if world_constraint_count[world] == 0 and mf_constraint_count[world] == 0:
+        skipped[world] = skipped[world] + 1
 
 
 SWEEP_READOUT = DevicePrelude(
@@ -408,12 +422,20 @@ class SolveReadoutRecord:
     :meth:`velocity_pass` take the velocity-pass slot. The counters accumulate
     over every launch, captured graph replays included, so a window is the
     difference of two summaries.
+
+    A sweep that returns before its first sweep for a world records nothing
+    for it. The matrix-free sweeps do so for every world without rows, such
+    as one the resolved-world classifier left without rows: the route that
+    launches them registers skip counters (:meth:`register_skipped`) and
+    counts those worlds at each launch (:meth:`count_skipped`), so a world's
+    solves are its slots' solves plus its skipped ones.
     """
 
     def __init__(self, policy: SolvePolicy):
         self.policy = policy
         self._slots: dict[tuple[str, str], _ReadoutSlot] = {}
         self._labels: dict[str, str] = {}
+        self._skipped: dict[str, wp.array] = {}
         self._pass = "position"
 
     def register(self, kernel, label: str, *, world_count: int, budget: int, device, velocity_budget: int = 0) -> None:
@@ -451,6 +473,43 @@ class SolveReadoutRecord:
                 setattr(operand, name, array)
             self._slots[(kernel.key, solve_pass)] = _ReadoutSlot(label, solve_pass, operand, arrays)
 
+    def register_skipped(self, *, world_count: int, device, velocity_budget: int = 0) -> None:
+        """Allocate per-world counters of the solves that enter no sweep because the world has no rows.
+
+        Ignored without a readout, or when already registered.
+
+        Args:
+            world_count: Number of worlds the route's launches cover.
+            device: Device of the counters.
+            velocity_budget: Sweep budget of the velocity pass, or 0 when the solver runs none.
+        """
+        if not self.policy.counts or self._skipped or int(world_count) <= 0:
+            return
+        budgets = {"position": 1, "velocity": int(velocity_budget)}
+        for solve_pass in SOLVE_PASSES:
+            if budgets[solve_pass] > 0:
+                self._skipped[solve_pass] = wp.zeros(int(world_count), dtype=wp.int32, device=device)
+
+    def count_skipped(self, world_constraint_count: wp.array, mf_constraint_count: wp.array) -> None:
+        """Count, in the current pass, one skipped solve of every world without dense or matrix-free rows.
+
+        A launch of its own, made only under a registered readout; capturable.
+
+        Args:
+            world_constraint_count: Dense rows per world.
+            mf_constraint_count: Matrix-free rows per world.
+        """
+        skipped = self._skipped.get(self._pass)
+        if skipped is None:
+            return
+        wp.launch(
+            count_skipped_solves,
+            dim=skipped.shape[0],
+            inputs=[world_constraint_count, mf_constraint_count],
+            outputs=[skipped],
+            device=skipped.device,
+        )
+
     @contextmanager
     def velocity_pass(self):
         """Count the launches made inside the context in the velocity-pass slots."""
@@ -486,6 +545,12 @@ class SolveReadoutRecord:
         those; ``past_first_sweep`` summarizes the other solves. The
         full-budget fraction among the solves of worlds with rows lies between
         ``full_budget_fraction`` and ``past_first_sweep["full_budget_fraction"]``.
+
+        ``skipped`` holds, per solve pass of a route that registered skip
+        counters, the ``solves`` of worlds without rows that entered no sweep
+        and the number of ``worlds`` they came from: the matrix-free sweeps
+        return before their first sweep for such a world, so no slot counts
+        it. Each of those worlds' solves is counted once, by a slot or here.
         """
         slots = []
         for (key, _), slot in self._slots.items():
@@ -518,7 +583,11 @@ class SolveReadoutRecord:
             if "stops" in slot.arrays:
                 record["trace"] = _trace_summary(slot.arrays)
             slots.append(record)
-        return {"readout": self.policy.readout, "slots": slots}
+        skipped = []
+        for solve_pass, array in self._skipped.items():
+            counts = array.numpy().astype(np.int64)
+            skipped.append({"pass": solve_pass, "solves": int(counts.sum()), "worlds": int(np.count_nonzero(counts))})
+        return {"readout": self.policy.readout, "slots": slots, "skipped": skipped}
 
 
 def _past_first_sweep(histogram) -> dict:

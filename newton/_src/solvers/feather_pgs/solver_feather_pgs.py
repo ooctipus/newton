@@ -1844,7 +1844,9 @@ class SolverFeatherPGS(SolverBase):
                 readout changes a computed value. The sparse, sparse-diagonal, matrix-free
                 Gauss-Seidel, paired factor, local and incremental sweeps count; the others run
                 without counters (``routes.sweep.readout``), and a sweep variant that cannot trace
-                counts without the trace (``routes.sweep.readout.declined``, with a warning).
+                counts without the trace (``routes.sweep.readout.declined``, with a warning). The
+                matrix-free sweeps enter no world without rows (such as one the resolved-world
+                classifier left without rows); the readout counts those solves as ``skipped``.
                 Defaults to ``"off"``.
             pgs_velocity_change_tolerance (float, optional): Velocity exit law of the native
                 Gauss-Seidel sweeps [m/s or rad/s]. A sweep stops a world once no row's impulse change
@@ -8068,6 +8070,12 @@ class SolverFeatherPGS(SolverBase):
                         )
                     )
                 self._pgs_solve_mf_gs_incremental_kernel = self._pgs_solve_mf_gs_incremental_kernels[0]
+            # No matrix-free sweep enters a world without rows; the readout counts those solves as skipped.
+            self._solve_readout.register_skipped(
+                world_count=int(self.world_count),
+                device=model.device,
+                velocity_budget=int(self.pgs_velocity_iterations),
+            )
 
         # The gate of the row builder (_stage4_build_rows): it allocates free-body velocity-limit rows into
         # rigid_velocity_limit_slot when free rigid bodies exist, and an infinite activation fraction reserves
@@ -9292,6 +9300,8 @@ class SolverFeatherPGS(SolverBase):
                         indent=2,
                     )
                 print(f"[fpgs-capture] wrote {_base}.npz/.json", flush=True)
+            # Under a readout, count the worlds without rows, which every sweep below returns from.
+            self._solve_readout.count_skipped(self.constraint_count, self.mf_constraint_count)
             launch_local = bool(
                 (
                     self._pgs_solve_local_internal_kernels

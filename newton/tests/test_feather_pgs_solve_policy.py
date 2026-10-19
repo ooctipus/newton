@@ -592,6 +592,44 @@ class TestSolveReadoutRecord(unittest.TestCase):
         velocity_slot = slots[("counted_kernel", "velocity")]
         self.assertEqual((velocity_slot["budget"], velocity_slot["solves"], velocity_slot["exhausted"]), (2, 2, 2))
 
+    def test_worlds_without_rows_count_as_skipped_per_pass(self):
+        """Count, per pass, one skipped solve per launch of every world without dense or matrix-free rows.
+
+        The matrix-free sweeps return before their first sweep for such a world, so no slot records
+        it; a world's solves are its slots' solves plus its skipped ones.
+        """
+        record = SolveReadoutRecord(SWEEPS)
+        counted = SimpleNamespace(key="counted_kernel", _fpgs_solve_readout="sweeps")
+        record.register(counted, "mf_gs_incremental", world_count=3, budget=4, device="cpu", velocity_budget=2)
+        record.register_skipped(world_count=3, device="cpu", velocity_budget=2)
+        # World 0 holds dense rows and world 2 matrix-free rows; world 1 has none.
+        dense = wp.array([4, 0, 0], dtype=wp.int32, device="cpu")
+        free = wp.array([0, 0, 2], dtype=wp.int32, device="cpu")
+        for _ in range(2):
+            record.count_skipped(dense, free)
+        with record.velocity_pass():
+            record.count_skipped(dense, free)
+        # A second registration keeps the counters.
+        record.register_skipped(world_count=3, device="cpu")
+        summary = record.summary()
+        self.assertEqual(
+            summary["skipped"],
+            [{"pass": "position", "solves": 2, "worlds": 1}, {"pass": "velocity", "solves": 1, "worlds": 1}],
+        )
+        self.assertEqual([slot["solves"] for slot in summary["slots"]], [0, 0])
+        json.dumps(summary, allow_nan=False)
+
+    def test_skip_counters_need_a_readout_and_a_registering_route(self):
+        """Count no skipped solve without a readout, or on a route that registered no skip counters."""
+        empty = wp.zeros(2, dtype=wp.int32, device="cpu")
+        for policy, register in ((EXACT_POLICY, True), (SWEEPS, False)):
+            with self.subTest(policy=policy, register=register):
+                record = SolveReadoutRecord(policy)
+                if register:
+                    record.register_skipped(world_count=2, device="cpu")
+                record.count_skipped(empty, empty)
+                self.assertEqual(record.summary()["skipped"], [])
+
     def test_trace_record_summarizes_stops_reasons_and_final_changes(self):
         """Summarize the trace's per-tolerance stopping sweeps, exit reasons and final-sweep changes."""
         record = SolveReadoutRecord(TRACE)

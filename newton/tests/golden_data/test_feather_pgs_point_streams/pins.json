@@ -264,6 +264,7 @@
   "scalar_branches.predict_scalar_branches": "f38907a1766876bd25fbca5c44c22afced1a6c11618b70a9c5fedecda5227a22",
   "scalar_branches.prepare_listed_augmented_drives": "09dbf6609575c6b9d3a1ebff6649cbeef512848771ccf03a1135b66192cf6923",
   "scalar_branches.repair_scalar_branches": "efff51fed0789d1a88fc1b96d706f00c1f885874686f6681059a967383c0193c",
+  "solve_policy.count_skipped_solves": "a16b7c113814e0d314a65dd57ba2d16081cba4fafaff15514498b8746eb4d0b9",
   "solver_feather_pgs._accumulate_row_capacity_telemetry": "d909544ecf9669c05bf97c1de0396fe39ff5195c068c12a899905c12588a4e3e",
   "solver_feather_pgs._accumulate_row_watermark": "91493d15a468654d25833fca1813f2964674ac21cd8ba8e300163344143cc7e3",
   "solver_feather_pgs._clear_dense_row_state": "2222d5f2eb4dabf325036b3739f4d68380ff09821b1b42ea1dce421548ce1b73",

@@ -10,7 +10,8 @@ after ``s`` sweeps has the same impulses and velocities after ``s - 1`` and
 after ``s`` sweeps. The kernel tests replay a solve at every sweep budget and
 check the counts against that rule; the solver tests check that every route's
 readout leaves the trajectory bitwise unchanged and counts each world-solve
-once.
+once: in the slot of the sweep that solved it, or, for a world without rows
+that the matrix-free sweeps do not enter, as skipped.
 
 ``pgs_velocity_change_tolerance`` stops a solve earlier, after the first sweep
 whose velocity-scaled changes fit the tolerance. Before that sweep it runs
@@ -291,6 +292,17 @@ def _assert_bitwise(actual, expected):
             np.testing.assert_array_equal(actual_array, expected_array)
 
 
+def _rowless(solver):
+    """Worlds of the solver's last step without dense or matrix-free rows."""
+    dense, free = solver.constraint_count.numpy(), solver.mf_constraint_count.numpy()
+    return int(np.count_nonzero((dense == 0) & (free == 0)))
+
+
+def _skipped(summary, solve_pass="position"):
+    """Skipped world-solves of a readout summary in one solve pass."""
+    return sum(entry["solves"] for entry in summary["skipped"] if entry["pass"] == solve_pass)
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "Native Gauss-Seidel sweeps run on CUDA")
 class TestSolveReadoutKernels(unittest.TestCase):
     """Counts of single kernels against the stationary-sweep rule, replayed at every budget."""
@@ -474,6 +486,7 @@ def _sparse_route():
         "owners": ({"sparse_pgs"},),
         "solving": {"sparse_pgs"},
         "prepare": prepare,
+        "enters_rowless_worlds": True,
     }
 
 
@@ -500,6 +513,7 @@ def _diagonal_route():
         "owners": ({"sparse_diagonal"},),
         "solving": {"sparse_diagonal"},
         "prepare": prepare,
+        "enters_rowless_worlds": True,
     }
 
 
@@ -561,8 +575,10 @@ def _matrix_free_route():
 def _incremental_route():
     """Contacting tripods without free bodies: every world holds only dense rows, which the incremental tier owns.
 
-    Each world's three feet rest in the ground and one leg starts beyond its limit, about a dozen rows,
-    within the tier's 32; without free bodies no world has matrix-free rows or a local owner.
+    Each world's three feet start in the ground and one leg beyond its limit, within the tier's 32 rows;
+    without free bodies no world has matrix-free rows or a local owner. Pushed out of the ground by the
+    first step, the tripods rise for a few steps, in which every row of their worlds separates at the
+    predictor: the resolved-world classifier leaves those worlds without rows, and no sweep enters them.
     """
     from newton.tests.test_feather_pgs_sparse_solver import _build_model  # noqa: PLC0415
 
@@ -655,7 +671,9 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         counted = solvers[-1]
         self.assertTrue(set(counted._solve_readout.kernels.values()) & route["labels"], counted._solve_readout.kernels)
         self.assertEqual(solvers[0]._solve_readout.kernels, {})
+        rowless = 0
         for step, states in self._steps(route, solvers, steps):
+            rowless += _rowless(counted)
             for name in STATE_FIELDS:
                 reference, control_run, actual = (getattr(state, name).numpy() for state in states)
                 if np.array_equal(control_run, reference):
@@ -677,16 +695,27 @@ class TestSolveReadoutRoutes(unittest.TestCase):
                 self.assertEqual(slot["sweeps"][0], 0)
                 self.assertLessEqual(slot["exhausted"], slot["sweeps"][BUDGET])
                 self.assertLessEqual(slot["worlds"], model.world_count)
-        self._assert_owned(route, summary, steps)
+        self._assert_owned(route, summary, steps, rowless)
         return counted, summary, model
 
-    def _assert_owned(self, route, summary, steps):
-        """Check that one kernel of each owner group solved every world at every step, and each solving label ran."""
+    def _assert_owned(self, route, summary, steps, rowless):
+        """Check that each owner group's kernels and the skipped record cover every world at every step once.
+
+        The sparse and diagonal-mass sweeps enter every world; the matrix-free sweeps enter no world
+        without rows, whose ``rowless`` world-steps the readout must count as skipped. Each solving
+        label must also have run.
+        """
         world_count = route["model"].world_count
+        skipped = _skipped(summary)
+        self.assertEqual(skipped, 0 if route.get("enters_rowless_worlds") else rowless)
         for owners in route["owners"]:
             with self.subTest(owners=sorted(owners)):
-                solves = sum(slot["solves"] for slot in summary["slots"] if slot["route"] in owners)
-                self.assertEqual(solves, steps * world_count)
+                solves = sum(
+                    slot["solves"]
+                    for slot in summary["slots"]
+                    if slot["route"] in owners and slot["pass"] == "position"
+                )
+                self.assertEqual(solves + skipped, steps * world_count)
         for label in route["solving"]:
             with self.subTest(solving=label):
                 self.assertGreater(sum(slot["solves"] for slot in summary["slots"] if slot["route"] == label), 0)
@@ -728,9 +757,19 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         self._lockstep(_matrix_free_route())
 
     def test_incremental_route_counts_without_changing_results(self):
-        """Count the incremental tier's sweeps without changing the trajectory, every world at every solve."""
-        solver, _, _ = self._lockstep(_incremental_route())
+        """Count the incremental tier's sweeps without changing the trajectory, and the solves of resolved worlds.
+
+        While the tripods rise, the resolved-world classifier leaves their worlds without rows and no
+        sweep enters them; the readout counts those solves as skipped, so with the tier's slot they
+        cover every world at every solve.
+        """
+        solver, summary, model = self._lockstep(_incremental_route())
         self.assertTrue(solver._pgs_solve_mf_gs_incremental_kernels)
+        self.assertTrue(solver.get_path_selection()["routes"]["resolved_worlds"]["enabled"])
+        (skipped,) = summary["skipped"]
+        self.assertEqual(skipped["pass"], "position")
+        self.assertGreater(skipped["solves"], 0)
+        self.assertLessEqual(skipped["worlds"], model.world_count)
 
     def test_declined_trace_counts_without_it_and_warns(self):
         """Warn about, record and count without the trace a sweep variant that cannot trace.
@@ -759,20 +798,24 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         """Count the velocity pass's sweeps in slots of their own budget, each world-solve once per pass."""
         route, steps = _incremental_route(), 4
         (solver,) = self._solvers(route, [{"pgs_solve_readout": "sweeps", "pgs_velocity_iterations": 2}])
+        rowless = 0
         for _ in self._steps(route, [solver], steps):
-            pass
+            rowless += _rowless(solver)
         summary = solver.get_path_selection()["measurements"]["solve_readout"]
         slots = {(slot["route"], slot["pass"]): slot for slot in summary["slots"]}
-        # Every counted kernel holds one slot per pass.
+        # Every counted kernel holds one slot per pass, and the route one skip counter per pass.
         self.assertEqual(
             sorted((slot["kernel"], slot["pass"]) for slot in summary["slots"]),
             sorted((kernel, solve_pass) for kernel in solver._solve_readout.kernels for solve_pass in SOLVE_PASSES),
         )
+        self.assertEqual([entry["pass"] for entry in summary["skipped"]], list(SOLVE_PASSES))
         for solve_pass, budget in (("position", BUDGET), ("velocity", 2)):
             with self.subTest(solve_pass=solve_pass):
                 slot = slots[("mf_gs_incremental", solve_pass)]
                 self.assertEqual(slot["budget"], budget)
-                self.assertEqual(slot["solves"], steps * route["model"].world_count)
+                # Both passes sweep the same rows: a world without rows skips both.
+                self.assertEqual(_skipped(summary, solve_pass), rowless)
+                self.assertEqual(slot["solves"] + rowless, steps * route["model"].world_count)
                 self.assertEqual(len(slot["sweeps"]), budget + 1)
 
     def test_trace_changes_no_result_and_records_every_solve(self):
@@ -792,9 +835,9 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         """Step every policy route under a velocity tolerance beside the exact law: near it, in no more sweeps.
 
         From one state on shared contacts, a 1e-3 tolerance compiled into every counted sweep must keep
-        every joint velocity within 1e-2 of the exact law's over 12 steps, count every world-solve once,
-        execute no more sweeps than the exact law on the route (and per route label whose solve count
-        matches), and fewer on at least one route.
+        every joint velocity within 1e-2 of the exact law's over 12 steps, count every world-solve once
+        (in a slot or as skipped), execute no more sweeps than the exact law on the route (and per route
+        label whose solve count matches), and fewer on at least one route.
         """
         steps, tolerance = 12, 1.0e-3
         savings = {}
@@ -815,16 +858,19 @@ class TestSolveReadoutRoutes(unittest.TestCase):
                 self.assertEqual((law["law"], law["declined"]), ("velocity", {}))
                 self.assertEqual(set(law["honored"]), set(counted))
                 deviation = 0.0
+                # The two trajectories differ slightly, so each solver's worlds may lack rows at other steps.
+                rowless = [0, 0]
                 for step, (exact_state, loose_state) in self._steps(route, [exact, loose], steps):
+                    rowless = [count + _rowless(solver) for count, solver in zip(rowless, (exact, loose), strict=True)]
                     for field in STATE_FIELDS:
                         self.assertTrue(np.isfinite(getattr(loose_state, field).numpy()).all(), f"{field} at {step}")
                     difference = loose_state.joint_qd.numpy() - exact_state.joint_qd.numpy()
                     deviation = max(deviation, float(np.abs(difference).max()))
                 self.assertLess(deviation, 1.0e-2)
                 totals = []
-                for solver in (exact, loose):
+                for solver, solver_rowless in zip((exact, loose), rowless, strict=True):
                     summary = solver.get_path_selection()["measurements"]["solve_readout"]
-                    self._assert_owned(route, summary, steps)
+                    self._assert_owned(route, summary, steps, solver_rowless)
                     by_label = {}
                     for slot in summary["slots"]:
                         solves, sweeps = by_label.get(slot["route"], (0, 0))
