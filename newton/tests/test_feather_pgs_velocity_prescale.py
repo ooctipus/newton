@@ -8,6 +8,7 @@ before it ran in lanes (main b7932853): one thread per articulation scaled a
 copy of the joint velocities in place. It stays here as the reference.
 """
 
+import itertools
 import unittest
 from unittest.mock import patch
 
@@ -93,6 +94,8 @@ _FIXED_DOF_DIMS = {
     JointType.BALL: (0, 3),
     JointType.FIXED: (0, 0),
     JointType.FREE: (3, 3),
+    JointType.DISTANCE: (3, 3),
+    JointType.ROD: (2, 2),
 }
 # Finite, zero, negative, infinite, NaN, tiny and huge limits.
 _LIMITS = np.array((0.5, 1.0, 2.5, 4.0, 0.0, -1.0, np.inf, np.nan, 1.0e-30, 1.0e30), dtype=np.float32)
@@ -107,6 +110,16 @@ _ARRAYS = (
     "joint_velocity_limit",
     "body_flags",
     "drive_slot",
+)
+# Random layouts: seed, articulation count, joints ahead of the first articulation and the
+# interval of articulations longer than a warp (0: none).
+_CASES = (
+    (0, 1, 0, 0),
+    (1, 3, 2, 0),
+    (2, 37, 0, 5),
+    (3, 37, 3, 7),
+    (4, 101, 1, 0),
+    (5, 2, 0, 1),
 )
 
 
@@ -130,7 +143,15 @@ def _layout(seed: int, articulations: int, *, leading_joints: int = 0, long_ever
 
     for _ in range(leading_joints):
         add(JointType.REVOLUTE)
-    kinds = (JointType.PRISMATIC, JointType.REVOLUTE, JointType.D6, JointType.BALL, JointType.FIXED)
+    kinds = (
+        JointType.PRISMATIC,
+        JointType.REVOLUTE,
+        JointType.D6,
+        JointType.BALL,
+        JointType.FIXED,
+        JointType.DISTANCE,
+        JointType.ROD,
+    )
     for art in range(articulations):
         starts.append(len(types))
         if rng.random() < 0.1:
@@ -289,21 +310,21 @@ def _recording_copies(destinations: list):
 
 class TestFeatherPGSVelocityPrescale(unittest.TestCase):
     def _check_layouts(self, device, lane_widths):
-        scaled = unscaled = 0
-        for seed, articulations, leading, long_every in (
-            (0, 1, 0, 0),
-            (1, 3, 2, 0),
-            (2, 37, 0, 5),
-            (3, 37, 3, 7),
-            (4, 101, 1, 0),
-            (5, 2, 0, 1),
-        ):
+        scaled = unscaled = scaled_articulations = copied_articulations = 0
+        for seed, articulations, leading, long_every in _CASES:
             layout = _layout(seed, articulations, leading_joints=leading, long_every=long_every)
+            dof_ranges = list(itertools.pairwise(layout["joint_qd_start"][layout["articulation_start"]].tolist()))
             for skip_driven in (0, 1):
                 expected = _serial(layout, skip_driven, device)
                 changed = expected.view(np.uint32) != layout["joint_qd"].view(np.uint32)
                 scaled += int(np.count_nonzero(changed))
                 unscaled += int(np.count_nonzero(~changed))
+                for first, end in dof_ranges:
+                    if end > first:
+                        if changed[first:end].any():
+                            scaled_articulations += 1
+                        else:
+                            copied_articulations += 1
                 for lanes in lane_widths:
                     actual, source = _lanes(layout, skip_driven, device, lanes)
                     message = f"seed={seed} skip_driven={skip_driven} lanes={lanes}"
@@ -312,6 +333,10 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
         # Both the scaling and the copying branches ran.
         self.assertGreater(scaled, 100)
         self.assertGreater(unscaled, 100)
+        # A ratio below 1 changes the DOF that set it, so an articulation whose DOFs all keep their
+        # bits took the copy branch. Unscaled DOFs of scaled articulations do not count here.
+        self.assertGreaterEqual(scaled_articulations, 10)
+        self.assertGreaterEqual(copied_articulations, 10)
 
     def test_lanes_match_serial_prescale_bitwise_cpu(self):
         """Write every DOF bit for bit like the serial prescale of a copy, with one lane per articulation."""
