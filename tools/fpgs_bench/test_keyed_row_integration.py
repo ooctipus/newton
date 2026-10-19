@@ -214,7 +214,8 @@ class TestKeyedRowIntegration(unittest.TestCase):
 
         original = rows.get_parallel_factory
         layout = KeyedLayout(16, 6, 0, 16, 128, True, (1 << 16) - 1)
-        with patch.object(rows, "get_parallel_factory", lambda factory: original(factory, layout)):
+        # The capture binds its owner's topology layout; read at this explicit one instead.
+        with patch.object(rows, "get_parallel_factory", lambda factory, _topology: original(factory, layout)):
             test = capture.TestKeyedRowsCUDA()
             test.setUp()
             test.test_native_parallel_matched_current_inputs()
