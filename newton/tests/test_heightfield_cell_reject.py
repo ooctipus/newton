@@ -190,7 +190,7 @@ def _collide(
     if midphase is not None:
         pipeline.narrow_phase._heightfield_packed_pairs = False
     if schedule is not None:
-        pipeline.narrow_phase._heightfield_lane_small_cells, pipeline.narrow_phase._heightfield_lane_width = schedule
+        pipeline.narrow_phase._set_lane_schedule(*schedule)
     contacts = pipeline.contacts()
     state = model.state()
     if speculative:

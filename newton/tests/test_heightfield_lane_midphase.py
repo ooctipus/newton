@@ -9,6 +9,7 @@ barrel cylinders and ellipsoids (generic fallback), boxes hovering above every
 cell under them and boxes covering many cells.
 """
 
+import ctypes
 import os
 import unittest
 from unittest.mock import patch
@@ -19,7 +20,7 @@ import warp as wp
 import newton
 from newton._src.core.environment_flags import NEWTON_FLAGS
 from newton._src.geometry.heightfield_geometric import PairProjection
-from newton._src.geometry.heightfield_lanes import CellWindow, DeferredPairs
+from newton._src.geometry.heightfield_lanes import CellWindow
 from newton._src.geometry.narrow_phase import NarrowPhase
 from newton.tests.test_heightfield_packed_pairs import logical
 from newton.tests.test_heightfield_row_gate import raw_multiset, rough_terrain_model
@@ -78,6 +79,12 @@ def multiset(triples):
     return triples[np.lexsort(triples.T[::-1])] if len(triples) else triples
 
 
+def deferred_stored(narrow):
+    """Return how many pairs the last pass stored for the lane pass (the rest walked in place)."""
+    deferred = narrow._heightfield_lane_deferred
+    return min(int(deferred.count.numpy()[0]), deferred.windows.shape[0])
+
+
 class TestHeightfieldLaneMidphase(unittest.TestCase):
     def assert_tags_name_pairs(self, narrow):
         """Every pair-CSR tag must index the shape pair that emitted the triangle."""
@@ -132,10 +139,9 @@ class TestHeightfieldLaneMidphase(unittest.TestCase):
                 narrow = actual.narrow_phase
                 for small_cells, lanes in schedules:
                     with self.subTest(small_cells=small_cells, lanes=lanes):
-                        narrow._heightfield_lane_small_cells = small_cells
-                        narrow._heightfield_lane_width = lanes
+                        narrow._set_lane_schedule(small_cells, lanes)
                         self.collide(actual, state, after)
-                        self.assertGreater(int(narrow._heightfield_lane_deferred.count.numpy()[0]), 0)
+                        self.assertGreater(deferred_stored(narrow), 0)
                         self.assert_same_stream(reference, actual, ordered=False)
 
     def test_original_triangles_cpu(self):
@@ -156,8 +162,7 @@ class TestHeightfieldLaneMidphase(unittest.TestCase):
         state = model.state()
         for route in ("cell", "geometric"):
             reference, actual = pipeline(model, route, False), pipeline(model, route, True)
-            actual.narrow_phase._heightfield_lane_small_cells = 3
-            actual.narrow_phase._heightfield_lane_width = 8
+            actual.narrow_phase._set_lane_schedule(3, 8)
             heights = model.heightfield_elevations.numpy().copy()
             poses = state.body_q.numpy().copy()
             scales = model.shape_scale.numpy().copy()
@@ -206,16 +211,16 @@ class TestHeightfieldLaneMidphase(unittest.TestCase):
         state = model.state()
         reference, actual = pipeline(model, "geometric", False), pipeline(model, "geometric", True)
         narrow = actual.narrow_phase
-        small = DeferredPairs()
-        small.windows = wp.zeros(3, dtype=CellWindow, device="cpu")
-        small.projections = wp.zeros(3, dtype=PairProjection, device="cpu")
-        small.count = narrow._heightfield_lane_deferred.count
-        narrow._heightfield_lane_deferred = small
-        narrow._heightfield_lane_small_cells = 0
-        narrow._heightfield_lane_width = 4
+        narrow._set_lane_schedule(0, 4, capacity=3)
         self.collide(reference, state)
         self.collide(actual, state)
-        self.assertGreater(int(small.count.numpy()[0]), 3)
+        self.assertGreater(int(narrow._heightfield_lane_deferred.count.numpy()[0]), 3)
+        self.assertEqual(deferred_stored(narrow), 3)
+        self.assert_same_stream(reference, actual, ordered=False)
+        # A schedule that defers but has no storage walks every pair in place.
+        narrow._set_lane_schedule(0, 4, capacity=0)
+        self.collide(actual, state)
+        self.assertGreater(int(narrow._heightfield_lane_deferred.count.numpy()[0]), 0)
         self.assert_same_stream(reference, actual, ordered=False)
 
     def test_triangle_capacity_overflow_cpu(self):
@@ -233,8 +238,9 @@ class TestHeightfieldLaneMidphase(unittest.TestCase):
             actual.narrow_phase.triangle_pairs.numpy(), reference.narrow_phase.triangle_pairs.numpy()
         )
         narrow = actual.narrow_phase
-        narrow._heightfield_lane_small_cells, narrow._heightfield_lane_width = 0, 4
+        narrow._set_lane_schedule(0, 4)
         actual.collide(state, actual.contacts())
+        self.assertGreater(deferred_stored(narrow), 0)
         self.assertEqual(int(narrow.triangle_pairs_count.numpy()[0]), total)
         everything = pipeline(model, "geometric", False)
         everything.collide(state, everything.contacts())
@@ -245,18 +251,30 @@ class TestHeightfieldLaneMidphase(unittest.TestCase):
         """Admit the lane midphase with packed cell rejection and report it in the collision record."""
 
         def create(**options):
-            options = {"has_heightfields": True, "has_meshes": False, **options}
-            return NarrowPhase(max_candidate_pairs=8, max_triangle_pairs=16, device="cpu", **options)
+            options = {"max_candidate_pairs": 8, "has_heightfields": True, "has_meshes": False, **options}
+            return NarrowPhase(max_triangle_pairs=16, device="cpu", **options)
 
         flags = {"NEWTON_HEIGHTFIELD_CELL_REJECT": "1", "NEWTON_NARROW_PHASE_PACKED_HEIGHTFIELD_PAIRS": "1"}
         with patch.dict(os.environ, flags):
             os.environ.pop("NEWTON_HEIGHTFIELD_LANE_MIDPHASE", None)
             narrow = create()
             self.assertTrue(narrow._heightfield_lane_midphase)
-            # CPU kernels run one lane per block: nothing is deferred and the order is the original one.
+            # CPU kernels run one lane per block: nothing is deferred, the order is the
+            # original one and no deferred storage is allocated.
             self.assertEqual((narrow._heightfield_lane_small_cells, narrow._heightfield_lane_width), (-1, 1))
+            self.assertEqual(narrow._heightfield_lane_deferred.windows.shape[0], 0)
+            self.assertEqual(narrow._heightfield_lane_deferred.projections.shape[0], 0)
+            # A deferring schedule stores half the routed-pair bound.
+            self.assertEqual(narrow._heightfield_lane_capacity, 4)
+            narrow._set_lane_schedule(16, 16)
             self.assertEqual(narrow._heightfield_lane_deferred.windows.shape[0], 4)
-            self.assertEqual(create(max_heightfield_pairs=3)._heightfield_lane_deferred.windows.shape[0], 2)
+            self.assertEqual(create(max_heightfield_pairs=3)._heightfield_lane_capacity, 2)
+            # Without a bound, a standalone NarrowPhase stores at most 1 << 16 deferred pairs.
+            many = 1 << 18
+            self.assertEqual(create(max_candidate_pairs=many)._heightfield_lane_capacity, 1 << 16)
+            self.assertEqual(
+                create(max_candidate_pairs=many, max_heightfield_pairs=many)._heightfield_lane_capacity, many // 2
+            )
             self.assertFalse(create(has_meshes=True)._heightfield_lane_midphase)
             with self.assertRaises(ValueError):
                 create(max_heightfield_pairs=-1)
@@ -281,11 +299,17 @@ class TestHeightfieldLaneMidphase(unittest.TestCase):
         record = lanes.get_collision_selection()["heightfield"]["lane_midphase"]
         self.assertTrue(record["enabled"])
         self.assertEqual((record["small_cells"], record["lanes"]), (-1, 1))
-        # Two heightfield pairs per kind and world: the storage holds half of them.
-        self.assertEqual(record["deferred_capacity"], 2)
+        self.assertEqual((record["deferred_capacity"], record["deferred_bytes"]), (0, 0))
         self.assertIn("lanes", record["reason"])
+        # Two heightfield pairs per kind and world bound the routed pairs; a deferring
+        # schedule stores half of them, each with its window and enclosing-box projection.
+        lanes.narrow_phase._set_lane_schedule(16, 16)
+        record = lanes.get_collision_selection()["heightfield"]["lane_midphase"]
+        per_pair = ctypes.sizeof(CellWindow.ctype) + ctypes.sizeof(PairProjection.ctype)
+        self.assertEqual((record["deferred_capacity"], record["deferred_bytes"]), (2, 2 * per_pair))
         record = original.get_collision_selection()["heightfield"]["lane_midphase"]
         self.assertFalse(record["enabled"])
+        self.assertIsNone(record["deferred_bytes"])
         self.assertIn("NEWTON_HEIGHTFIELD_LANE_MIDPHASE=0", record["reason"])
 
 

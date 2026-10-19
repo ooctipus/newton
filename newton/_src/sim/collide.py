@@ -2184,7 +2184,8 @@ class CollisionPipeline:
                         )
                 if has_heightfields:
                     # Heightfield pairs with any shape other than a mesh or a heightfield
-                    # reach the terrain midphase; this bounds its per-pair storage.
+                    # reach the terrain midphase. This static upper bound on its routed
+                    # pairs (not the per-pass count) sizes its per-pair storage.
                     hfield, mesh = int(GeoType.HFIELD), int(GeoType.MESH)
                     if self.shape_pairs_filtered is not None:
                         explicit = pairs_np.reshape(-1, 2).astype(np.int64)
@@ -2941,6 +2942,10 @@ class CollisionPipeline:
             "small_cells": narrow._heightfield_lane_small_cells,
             "lanes": narrow._heightfield_lane_width,
             "deferred_capacity": None if deferred is None else int(deferred.windows.shape[0]),
+            # Device bytes of the deferred windows and enclosing-box projections.
+            "deferred_bytes": None
+            if deferred is None
+            else int(deferred.windows.capacity + deferred.projections.capacity),
             "reason": lane_reason,
         }
         if narrow._heightfield_row_gate:

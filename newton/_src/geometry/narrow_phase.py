@@ -96,6 +96,9 @@ _SPARSE_GJK_PAIR_CAPACITY_THRESHOLD = 1_000_000
 # warp-level triangle appends by 43-70%, and bound a warp's in-place walk at 16 cells.
 _LANE_SMALL_CELLS = 16
 _LANE_WIDTH = 16
+# Deferred lane-pass pairs stored when NarrowPhase gets no max_heightfield_pairs bound
+# (288 bytes each with the geometric cull); pass 1 walks any further long pair in place.
+_LANE_DEFAULT_CAPACITY = 1 << 16
 
 
 @wp.func
@@ -2476,9 +2479,10 @@ class NarrowPhase:
                 to ``max_candidate_pairs``.
             max_mesh_plane_pairs: Maximum number of routed mesh-plane pairs. Defaults
                 to ``max_candidate_pairs``.
-            max_heightfield_pairs: Maximum number of routed heightfield pairs. The
-                lane midphase stores up to half this many long pairs for its lane
-                pass and walks further ones in place. Defaults to ``max_candidate_pairs``.
+            max_heightfield_pairs: Upper bound on routed heightfield pairs. On CUDA
+                the lane midphase stores up to half this many long pairs for its lane
+                pass, at most 65536 when no bound is given, and walks further ones in
+                place. Defaults to ``max_candidate_pairs``.
             reduce_contacts: Whether to reduce contacts for mesh-mesh and mesh-plane collisions.
                 When True, uses shared memory contact reduction to select representative contacts.
                 This improves performance and stability for meshes with many vertices. Defaults to True.
@@ -2789,10 +2793,15 @@ class NarrowPhase:
         # lane midphase keeps that pass and moves the cells of long pairs to lanes.
         self._heightfield_lane_midphase = lane_midphase == "1" and self._heightfield_packed_pairs
         # CPU kernels run one lane per block, in order (Warp GH-1413): defer nothing
-        # there, which keeps the original triangle order.
+        # there, which keeps the original triangle order and needs no deferred storage.
         lane_device = wp.get_device(device)
         self._heightfield_lane_small_cells = _LANE_SMALL_CELLS if lane_device.is_cuda else -1
         self._heightfield_lane_width = _LANE_WIDTH if lane_device.is_cuda else 1
+        # Deferred pairs that fit when the schedule defers: half the routed-pair bound, or
+        # at most _LANE_DEFAULT_CAPACITY when the caller gave none.
+        self._heightfield_lane_capacity = (self.max_heightfield_pairs + 1) // 2
+        if max_heightfield_pairs is None:
+            self._heightfield_lane_capacity = min(self._heightfield_lane_capacity, _LANE_DEFAULT_CAPACITY)
         self._heightfield_lane_deferred = None
         self._finite_bounds = None
         self._finite_source = None
@@ -3075,18 +3084,12 @@ class NarrowPhase:
                 else ()
             )
             if lane_idx is not None:
-                from .heightfield_geometric import PairProjection  # noqa: PLC0415
-                from .heightfield_lanes import CellWindow, DeferredPairs  # noqa: PLC0415
+                from .heightfield_lanes import DeferredPairs  # noqa: PLC0415
 
-                # Half the routed pairs fit; the per-pair pass walks any further long pair in place.
-                capacity = max(1, (self.max_heightfield_pairs + 1) // 2)
                 deferred = DeferredPairs()
-                deferred.windows = wp.empty(capacity, dtype=CellWindow, device=device)
-                deferred.projections = wp.empty(
-                    capacity if self._heightfield_geometric_cull else 0, dtype=PairProjection, device=device
-                )
                 deferred.count = c[lane_idx : lane_idx + 1]
                 self._heightfield_lane_deferred = deferred
+                self._set_lane_schedule(self._heightfield_lane_small_cells, self._heightfield_lane_width)
                 self._heightfield_lane_empty = (
                     wp.empty(0, dtype=wp.uint64, device=device),
                     wp.empty((0, 2), dtype=wp.vec3, device=device),
@@ -3222,6 +3225,28 @@ class NarrowPhase:
             self.mesh_plane_target_blocks = self.num_tile_blocks
             self.mesh_plane_block_offsets = None
             self.mesh_plane_block_counts = None
+
+    def _set_lane_schedule(self, small_cells: int, lanes: int, *, capacity: int | None = None) -> None:
+        """Set the lane midphase schedule and allocate its deferred-pair storage.
+
+        Pairs with more than ``small_cells`` cells (none when negative) move to the
+        lane pass, ``lanes`` lanes each. ``capacity`` deferred pairs fit, by default
+        none when nothing is deferred and ``_heightfield_lane_capacity`` otherwise;
+        pass 1 walks any further long pair in place, so the triangle set stays exact.
+        Call it only between collisions, never while a captured graph is reused.
+        """
+        from .heightfield_geometric import PairProjection  # noqa: PLC0415
+        from .heightfield_lanes import CellWindow  # noqa: PLC0415
+
+        if capacity is None:
+            capacity = 0 if small_cells < 0 else self._heightfield_lane_capacity
+        deferred = self._heightfield_lane_deferred
+        deferred.windows = wp.empty(capacity, dtype=CellWindow, device=self.device)
+        deferred.projections = wp.empty(
+            capacity if self._heightfield_geometric_cull else 0, dtype=PairProjection, device=self.device
+        )
+        self._heightfield_lane_small_cells = small_cells
+        self._heightfield_lane_width = lanes
 
     def _launch_lane_midphase(
         self,
