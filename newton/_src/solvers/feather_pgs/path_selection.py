@@ -642,7 +642,6 @@ def _sweep(solver, source) -> dict:
             dense = {
                 "kernels": [_key(kernel) for kernel in budgets or (solver._pgs_solve_tiled_row_kernel,)],
                 "row_budgets": bool(budgets),
-                "register_state": bool(solver._pgs_solve_tiled_row_register_kernels),
             }
         elif solver.pgs_kernel == "tiled_contact":
             dense = {"kernels": [_key(solver._pgs_solve_tiled_contact_kernel)]}

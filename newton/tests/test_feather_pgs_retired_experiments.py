@@ -20,6 +20,7 @@ RETIRED_FLAGS = (
     "FEATHER_PGS_SPARSE_PAIRED_GS",
     "FEATHER_PGS_COUPLED_CONTACT",
     "FEATHER_PGS_COUPLED_JACOBI",
+    "FEATHER_PGS_DENSE_ROW_REGISTERS",
 )
 
 # The packed sparse-factor route's selectors, which Isaac Lab's G1 recipes still set.

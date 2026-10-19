@@ -58,7 +58,6 @@ from .contact_torsion import (
     prepare_torsion_velocity_pass,
     validate_torsion_step,
 )
-from .dense_row_state import get_dense_row_state_kernel
 from .friction import FRICTION_PAIR_CUDA
 from .friction_patches import (
     _CHUNK_SORT_CAPACITY,
@@ -1137,18 +1136,13 @@ class SolverFeatherPGS(SolverBase):
     construction to disable this selection, or ``=1`` to select it for smaller
     CUDA batches with 64- or 128-row capacity.
 
-    Additional experimental performance modes are disabled by default. Set
-    ``FEATHER_PGS_DENSE_ROW_BUDGETS=1`` and
-    ``FEATHER_PGS_DENSE_ROW_REGISTERS=1`` before construction to retain row
-    state in registers in the CUDA, 64-row-capacity ``tiled_row`` path.
-    The register mode retains its existing 64-row restriction. CPU execution
-    and other sweep mappings retain their existing implementation. Set
+    An additional experimental performance mode is disabled by default. Set
     ``FEATHER_PGS_REGISTER_WHITENING=1`` before
     importing Newton to enable register whitening for the measured 18-DOF,
     32/48-row matrix-free world-row layouts on CUDA architectures 103/120.
     Unsupported whitening configurations retain the existing implementation.
-    These modes preserve the selected solver formulation and iteration policy;
-    they do not imply equivalence between different solver formulations.
+    This mode preserves the selected solver formulation and iteration policy;
+    it does not imply equivalence between different solver formulations.
 
     Eligible CUDA worlds use leaf-first sparse mass factors and contact rows
     in ``matrix_free`` mode. Articulations retain separate coordinate blocks;
@@ -7370,7 +7364,6 @@ class SolverFeatherPGS(SolverBase):
 
         self._pgs_solve_tiled_row_kernel = None
         self._pgs_solve_tiled_row_budgets = ()
-        self._pgs_solve_tiled_row_register_kernels = ()
         self._pgs_solve_tiled_contact_kernel = None
         self._pgs_solve_streaming_kernel = None
         if self.dense_max_constraints > 0:
@@ -7395,11 +7388,6 @@ class SolverFeatherPGS(SolverBase):
                         )
                         for budget, minimum in ((32, 0), (self.dense_max_constraints, 32))
                     )
-                    if self.dense_max_constraints == 64 and os.environ.get("FEATHER_PGS_DENSE_ROW_REGISTERS") == "1":
-                        self._pgs_solve_tiled_row_register_kernels = tuple(
-                            get_dense_row_state_kernel(device_arch, 2, row_budget=budget) for budget in (32, 64)
-                        )
-                        self._pgs_solve_tiled_row_budgets = self._pgs_solve_tiled_row_register_kernels
             elif self.pgs_kernel == "tiled_contact":
                 self._pgs_solve_tiled_contact_kernel = _get_pgs_solve_tiled_contact_kernel(
                     self.dense_max_constraints, device_arch
@@ -16722,10 +16710,9 @@ class SolverFeatherPGS(SolverBase):
         if pgs_kernel is None:
             raise RuntimeError("Tiled row PGS kernel is unavailable for this solver shape")
         for kernel in self._pgs_solve_tiled_row_budgets or (pgs_kernel,):
-            worlds_per_block = 2 if kernel in self._pgs_solve_tiled_row_register_kernels else 1
             wp.launch_tiled(
                 kernel,
-                dim=[(self.world_count + worlds_per_block - 1) // worlds_per_block],
+                dim=[self.world_count],
                 inputs=[
                     self.constraint_count,
                     self.diag,
@@ -16740,7 +16727,7 @@ class SolverFeatherPGS(SolverBase):
                     self._pgs_friction_start_iteration,
                     self._pgs_iteration_offset,
                 ],
-                block_dim=32 * worlds_per_block,
+                block_dim=32,
                 device=self.model.device,
             )
 

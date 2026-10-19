@@ -85,13 +85,11 @@ uv run --no-project --python /path/to/isaaclab/.venv/bin/python \
   --steps 40 --profile-steps 40 \
   --check-overflow \
   --fpgs-env 0:FEATHER_PGS_DENSE_ROW_BUDGETS=1 \
-  --fpgs-env 0:FEATHER_PGS_DENSE_ROW_REGISTERS=1 \
   --fpgs-env 1:FEATHER_PGS_DENSE_ROW_BUDGETS=1 \
-  --fpgs-env 1:FEATHER_PGS_DENSE_ROW_REGISTERS=1 \
   --output-dir /path/outside/all/checkouts/backend-comparison
 ```
 
-The example explicitly enables the current cached dense-row implementation on both GPUs; use a Newton revision containing those flags and the FPGS sticky capacity-check API. Omit those four feature overrides to measure the selected revision's defaults. Add the separately calibrated `--capacity` settings described below; the example does not supply universal safe capacities. The two Newton paths may be the same checkout when comparing backends from one revision. Task names come from the selected Lab helper (currently `ant`, `humanoid`, `franka`, `anymald`, `allegro`, `g1`, `kuka`, and `cartpole`). Repeated `--task` options preserve order and remove duplicates. Both arms use seed zero. FPGS receives the existing FPGS recipe's solver attributes and environment settings; MJWarp receives its own existing backend defaults, with no FPGS attributes or solver flags inherited.
+The example explicitly enables the dense row budgets on both GPUs; use a Newton revision containing that flag and the FPGS sticky capacity-check API. Omit those two feature overrides to measure the selected revision's defaults. Add the separately calibrated `--capacity` settings described below; the example does not supply universal safe capacities. The two Newton paths may be the same checkout when comparing backends from one revision. Task names come from the selected Lab helper (currently `ant`, `humanoid`, `franka`, `anymald`, `allegro`, `g1`, `kuka`, and `cartpole`). Repeated `--task` options preserve order and remove duplicates. Both arms use seed zero. FPGS receives the existing FPGS recipe's solver attributes and environment settings; MJWarp receives its own existing backend defaults, with no FPGS attributes or solver flags inherited.
 
 Explicit per-device optimization flags can be added only on the FPGS side, for example `--fpgs-env 0:FEATHER_PGS_DENSE_ROW_BUDGETS=1`. The accepted prefixes are `FEATHER_PGS_` and `NEWTON_NARROW_PHASE_`. There are no generic solver/physics-attribute overrides; the driver does not judge whether a manually selected feature flag preserves numerical semantics. All inherited `FEATHER_`, `NEWTON_`, and `FPGS_PROBE_` flags are discarded before each child launch.
 

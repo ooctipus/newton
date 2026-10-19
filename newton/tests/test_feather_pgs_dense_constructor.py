@@ -25,45 +25,32 @@ def _small_worlds(device, world_count=3):
 
 
 class TestFeatherPGSDenseConstructor(unittest.TestCase):
-    """Keep the register-state feature behind its actual shape and flag guards."""
+    """Keep the dense row budgets behind their actual shape and flag guards."""
 
     def _check_device(self, device, world_count=3, cases=None):
         model = _small_worlds(device, world_count)
         self.assertEqual(model.articulation_count, world_count)
         cases = cases or (
-            # budget flag, register flag, capacity, dense kernel
-            (None, None, 64, "tiled_row"),
-            ("0", "0", 64, "tiled_row"),
-            ("0", "1", 64, "tiled_row"),
-            ("1", "0", 64, "tiled_row"),
-            ("1", "1", 64, "tiled_row"),
-            ("1", "1", 32, "tiled_row"),
-            ("1", "1", 96, "tiled_row"),
-            (None, None, 128, "tiled_row"),
-            ("0", "1", 128, "tiled_row"),
-            ("1", "0", 128, "tiled_row"),
-            ("1", "1", 128, "tiled_row"),
-            ("1", "1", 64, "loop"),
-            ("1", "1", 64, "tiled_contact"),
-            ("1", "1", 64, "streaming"),
+            # budget flag, capacity, dense kernel
+            (None, 64, "tiled_row"),
+            ("0", 64, "tiled_row"),
+            ("1", 64, "tiled_row"),
+            ("1", 32, "tiled_row"),
+            ("1", 96, "tiled_row"),
+            (None, 128, "tiled_row"),
+            ("0", 128, "tiled_row"),
+            ("1", 128, "tiled_row"),
+            ("1", 64, "loop"),
+            ("1", 64, "tiled_contact"),
+            ("1", 64, "streaming"),
         )
-        for budgets, registers, capacity, mode in cases:
-            with self.subTest(
-                device=str(device),
-                budgets=budgets,
-                registers=registers,
-                capacity=capacity,
-                mode=mode,
-            ):
+        for budgets, capacity, mode in cases:
+            with self.subTest(device=str(device), budgets=budgets, capacity=capacity, mode=mode):
                 with patch.dict(os.environ):
-                    for name, value in (
-                        ("FEATHER_PGS_DENSE_ROW_BUDGETS", budgets),
-                        ("FEATHER_PGS_DENSE_ROW_REGISTERS", registers),
-                    ):
-                        if value is None:
-                            os.environ.pop(name, None)
-                        else:
-                            os.environ[name] = value
+                    if budgets is None:
+                        os.environ.pop("FEATHER_PGS_DENSE_ROW_BUDGETS", None)
+                    else:
+                        os.environ["FEATHER_PGS_DENSE_ROW_BUDGETS"] = budgets
                     if model.device.is_cpu and mode != "loop":
                         with self.assertRaisesRegex(ValueError, "pgs_kernel.*requires CUDA"):
                             newton.solvers.SolverFeatherPGS(model, pgs_kernel=mode)
@@ -84,7 +71,6 @@ class TestFeatherPGSDenseConstructor(unittest.TestCase):
                 self.assertEqual(solver.dense_max_constraints, capacity)
                 self.assertEqual(solver.C.shape, (world_count, capacity, capacity))
                 selected = solver._pgs_solve_tiled_row_budgets
-                registered = getattr(solver, "_pgs_solve_tiled_row_register_kernels", ())
                 eligible = (
                     model.device.is_cuda
                     and mode == "tiled_row"
@@ -102,21 +88,11 @@ class TestFeatherPGSDenseConstructor(unittest.TestCase):
                     self.assertIsNone(solver._pgs_solve_tiled_row_kernel)
                 if not eligible:
                     self.assertEqual(selected, ())
-                    self.assertEqual(registered, ())
-                elif registers == "1" and capacity == 64:
-                    self.assertEqual(selected, registered)
+                else:
                     self.assertEqual(
                         [kernel.key for kernel in selected],
-                        [
-                            "pgs_solve_dense_row_state_b32_w2",
-                            "pgs_solve_dense_row_state_b64_w2",
-                        ],
+                        [f"pgs_solve_tiled_row_{capacity}_b32_m0", f"pgs_solve_tiled_row_{capacity}_b{capacity}_m32"],
                     )
-                else:
-                    self.assertEqual(registered, ())
-                    self.assertEqual(len(selected), 2)
-                    self.assertNotEqual(selected[0].key, selected[1].key)
-                    self.assertTrue(all("dense_row_state" not in kernel.key for kernel in selected))
                 if selected:
                     original_labels = [argument.label for argument in solver._pgs_solve_tiled_row_kernel.adj.args]
                     for kernel in selected:
@@ -133,7 +109,7 @@ class TestFeatherPGSDenseConstructor(unittest.TestCase):
         self._check_device(wp.get_device("cpu"))
 
     def test_cuda_constructor_selects_only_eligible_layouts(self):
-        """Select explicit CUDA budgets while restricting register storage to C64."""
+        """Select explicit CUDA budgets only for 64- and 128-row tiled_row capacities."""
         devices = wp.get_cuda_devices()
         if not devices:
             self.skipTest("CUDA constructor selection requires a CUDA device")
@@ -149,10 +125,10 @@ class TestFeatherPGSDenseConstructor(unittest.TestCase):
                 devices[0],
                 world_count=world_count,
                 cases=(
-                    (None, None, 128, "tiled_row"),
-                    ("0", "1", 128, "tiled_row"),
-                    ("1", "1", 128, "tiled_row"),
-                    (None, None, 64, "tiled_row"),
+                    (None, 128, "tiled_row"),
+                    ("0", 128, "tiled_row"),
+                    ("1", 128, "tiled_row"),
+                    (None, 64, "tiled_row"),
                 ),
             )
 

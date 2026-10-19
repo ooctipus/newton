@@ -35,6 +35,7 @@ _RETIRED_ORDER = [
     "FEATHER_PGS_SPARSE_PAIRED_GS",
     "FEATHER_PGS_COUPLED_CONTACT",
     "FEATHER_PGS_COUPLED_JACOBI",
+    "FEATHER_PGS_DENSE_ROW_REGISTERS",
 ]
 # The retired packed sparse-factor route's selectors: ignored and recorded, never rejected.
 _RETIRED_IGNORED = [

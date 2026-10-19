@@ -159,9 +159,9 @@ FLAGS = declare(
     ),
     _flag(
         "FEATHER_PGS_DENSE_ROW_REGISTERS",
-        "experiment",
-        _SOLVER,
-        "=1 with DENSE_ROW_BUDGETS=1 keeps 64-row tiled_row state in registers.",
+        "retired",
+        ("environment_flags",),
+        "Retired register-state copy of the 64-row tiled_row sweep; =1 raises.",
     ),
     _flag(
         "FEATHER_PGS_FK_CACHE_SNAPSHOT",
