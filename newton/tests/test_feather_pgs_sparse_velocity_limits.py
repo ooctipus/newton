@@ -40,15 +40,22 @@ from newton.tests.test_feather_pgs_sparse_research_admission import _eligible_so
 
 class TestSparseVelocityLimitAdmission(unittest.TestCase):
     def test_auto_and_enabled_velocity_owner_reach_topology(self):
-        """Admit the unchanged augmented matrix-free recipe under either friction law before planning its factor."""
+        """Admit the unchanged augmented matrix-free recipe under either friction law before planning its factor.
+
+        Warm starting is admitted without free rigid bodies: the sparse sweep
+        seeds its factor delta with the carried impulses' response.
+        """
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        for patches in (False, True):
+        warm_starts = ({}, {"pgs_warmstart": True}, {"_mf_warmstart_enabled": True})
+        for patches, warm_start in itertools.product((False, True), warm_starts):
             solver = _eligible_solver()
             solver.enable_joint_velocity_limits = True
             solver._friction_anchors_enabled = patches
+            for key, value in warm_start.items():
+                setattr(solver, key, value)
             for environment in ({}, {"FEATHER_PGS_SPARSE_VELOCITY_LIMITS": "1"}):
                 with (
-                    self.subTest(patches=patches, environment=environment),
+                    self.subTest(patches=patches, warm_start=warm_start, environment=environment),
                     mock.patch.dict(os.environ, environment, clear=True),
                     self.assertRaises(_TopologyReached),
                 ):
@@ -60,8 +67,8 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
         for changes, flag in (
             ({}, "0"),
-            ({"pgs_warmstart": True}, "1"),
-            ({"_mf_warmstart_enabled": True}, "1"),
+            ({"pgs_warmstart": True, "_has_free_rigid_bodies": True}, "1"),
+            ({"_mf_warmstart_enabled": True, "_has_free_rigid_bodies": True}, "1"),
             ({"_has_free_rigid_bodies": True}, "1"),
             ({"drive_mode": "physx_pgs"}, "1"),
             ({"articulated_contact_response": "propagation"}, "1"),
