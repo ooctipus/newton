@@ -5446,10 +5446,11 @@ class SolverFeatherPGS(SolverBase):
             # (measured: Kuka lift 12.7 ms there against 15.5 on sparse factors).
             # Both friction laws: patch friction walks contact units in the paired
             # sweep, writes masked patch rows and keeps the resolved-world
-            # classifier, unless FEATHER_PGS_PATCH_DENSE_PATHS=0. An opted-in
-            # parallel tier's request declines sparse factors first (above); the
-            # active-row scan below serves only worlds sparse factors keep, never
-            # free-body ones.
+            # classifier, unless FEATHER_PGS_PATCH_DENSE_PATHS=0. A parallel tier
+            # that mf_gs_parallel_rows requests (unless
+            # FEATHER_PGS_PATCH_PARALLEL_ROWS=0) declines sparse factors first
+            # (above); the active-row scan below serves only worlds sparse factors
+            # keep, never free-body ones.
             self._sparse_selection_reason = (
                 "Worlds with free rigid bodies keep the dense route for the held-tree owner and paired response."
             )
@@ -14426,7 +14427,7 @@ class SolverFeatherPGS(SolverBase):
 
             # The first admitted producer writes every contact row: local row packets, keyed rows,
             # the compact and sparse producers, then the general builder. Under patch friction this
-            # order is the row precedence: the packets (Franka) and keyed rows (unless
+            # order is the row precedence: the local row packets and keyed rows (unless
             # FEATHER_PGS_PATCH_PARALLEL_ROWS=0) take their worlds' rows before the general builder's
             # masked patch rows (_masked_contact_rows), and native sparse factors admit neither.
             # get_path_selection() records the same plan (routes.contact_rows).
