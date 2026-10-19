@@ -2750,14 +2750,19 @@ class TestPatchFrameModes(unittest.TestCase):
         the same scope, and a write noted on the stream makes it sort. Contacts
         without a generation array sort and end the chain. The wrappers carry
         none of the private state of :class:`~newton.Contacts`, and every build
-        matches a chain that sorts each frame.
+        matches a chain that sorts each frame. The noted write reorders the
+        stream's contacts and keeps its generation and count, and the contacts
+        without a generation hold another order, so a build that kept its pairs
+        after either would group contacts by stale pairs that the device check
+        cannot see.
         """
         rng = np.random.default_rng(46)
         scene = _Scene("cpu", 46)
         scene.active[:] = True
         live = scene.frame()
         stream = _swapped_stream(scene, live, rng)
-        anonymous = SimpleNamespace(**{k: v for k, v in vars(stream).items() if k != "contact_generation"})
+        other = _swapped_stream(scene, live, rng)
+        anonymous = SimpleNamespace(**{k: v for k, v in vars(other).items() if k != "contact_generation"})
         sources = {
             "stream": lambda: stream,
             "wrapper": lambda: SimpleNamespace(**vars(stream)),
@@ -2768,6 +2773,7 @@ class TestPatchFrameModes(unittest.TestCase):
         for event in ("stream", "wrapper", "write", "wrapper", "stream", "anonymous", "wrapper", "wrapper"):
             if event == "write":
                 note_contact_frame_write(stream.contact_generation)
+                _swapped_stream(scene, live, rng, stream=stream)
                 continue
             contacts = sources[event]()
             for state in (plain, patches):
