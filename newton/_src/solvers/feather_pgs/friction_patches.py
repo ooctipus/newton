@@ -1496,6 +1496,23 @@ class _FrictionPatchState:
         self.merges = 0
         while _SORT_CHUNK << self.merges < capacity:
             self.merges += 1
+        self._load_capture_modules()
+
+    def _load_capture_modules(self):
+        """Load the modules of the kernels that captured builds launch first, on a CUDA device.
+
+        With frame reuse alone only captured builds launch _prepare_frame, and
+        only a conditional node's body launches _record_sorted_frame, so their
+        modules would otherwise first load inside a graph capture. Each kernel
+        has a module of its own: loading it compiles nothing else. CPU captures
+        build as eager ones do.
+        """
+        if not self.device.is_cuda:
+            return
+        if self.reuse_frames or self.conditional_nodes:
+            _prepare_frame.module.load(self.device)
+        if self.conditional_nodes:
+            _record_sorted_frame.module.load(self.device)
 
     def update_geometry(self, model):
         """Refresh scales and retire affected history after explicit geometry edits."""

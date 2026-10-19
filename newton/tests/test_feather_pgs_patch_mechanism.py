@@ -2682,6 +2682,54 @@ class TestPatchFrameModes(unittest.TestCase):
                 self.assertEqual(tuple(outcomes), expected)
                 np.testing.assert_array_equal(patches.frame_status.numpy(), [0])
 
+    def test_capture_kernels_load_at_construction(self):
+        """Load the modules of the kernels that captured builds launch first when a CUDA patch state is built.
+
+        Without them, the first capture would load those modules. A stand-in
+        CUDA device lets the CPU check which modules load; a CPU state loads
+        none, since CPU captures build as eager ones do.
+        """
+        scene = _Scene("cpu", 49)
+        phi = wp.zeros(128, dtype=wp.vec2, device="cpu")
+        cuda = SimpleNamespace(is_cuda=True)
+        cases = (
+            (False, False, []),
+            (True, False, ["_prepare_frame"]),
+            (False, True, ["_prepare_frame", "_record_sorted_frame"]),
+            (True, True, ["_prepare_frame", "_record_sorted_frame"]),
+        )
+        for reuse, nodes, expected in cases:
+            with self.subTest(reuse=reuse, nodes=nodes):
+                loaded = []
+                kernels = (friction_patches._prepare_frame, friction_patches._record_sorted_frame)
+                with contextlib.ExitStack() as stack:
+                    for kernel in kernels:
+                        stack.enter_context(
+                            mock.patch.object(
+                                kernel.module,
+                                "load",
+                                side_effect=lambda device, key=kernel.key, loaded=loaded: loaded.append((key, device)),
+                            )
+                        )
+                    patches = _FrictionPatchState(
+                        scene.model, 128, True, phi, reuse_frames=reuse, conditional_nodes=nodes
+                    )
+                    self.assertEqual(loaded, [], "a CPU state loads no module")
+                    patches.device = cuda
+                    patches._load_capture_modules()
+                self.assertEqual([key for key, _ in loaded], expected)
+                self.assertTrue(all(device is cuda for _, device in loaded))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "module loads per device need CUDA")
+    def test_solver_loads_the_frame_reuse_prepare_before_capture(self):
+        """Load _prepare_frame's module on the solver's CUDA device at construction, so no capture loads it."""
+        module = friction_patches._prepare_frame.module
+        with mock.patch.object(module, "load", wraps=module.load) as load:
+            twin = _SolverTwin("cuda:0", nodes=False)
+        self.assertTrue(twin.patches.reuse_frames)
+        load.assert_any_call(twin.patches.device)
+        self.assertIn((twin.patches.device.context, module.options["block_dim"]), module.execs)
+
     def test_forget_frame_drops_the_device_record_only_for_conditional_nodes(self):
         """Make the next build sort after forget_frame(); only nodes, which trust the record, need it dropped too.
 
