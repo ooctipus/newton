@@ -168,8 +168,11 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
     def test_proven_joint_notification_keeps_held_caches(self):
         """Keep held-tree validity on a joint-property notification the owner proves unchanged.
 
-        Any other cache input invalidates as before, a moved joint frame still raises before any
-        change, and without an owner nothing proves the frames, so the FK/ID cache is invalidated.
+        Any other cache input invalidates as before. A moved joint frame invalidates every cache
+        without raising, and the moved frame is the proof's reference from then on: a later
+        notification that moves nothing keeps the caches, and restoring the frame moves it again.
+        A changed joint axis raises before any change, and without an owner nothing proves the
+        frames, so the FK/ID cache is invalidated.
         """
         model = _build(wp.get_device("cpu"), worlds=2)
         solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
@@ -216,18 +219,28 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
                 mark_valid()
                 self.assertTrue(invalidating_launches(flags))
                 self.assertEqual(validity(), invalid)
-        # A moved fixed root raises before any cache changes; restoring it is accepted again.
-        mark_valid()
+        # A moved fixed root invalidates every cache; the next notification that moves nothing keeps
+        # them, and restoring the root moves it again.
         frames = model.joint_X_p.numpy().copy()
         moved = frames.copy()
         moved[_fixed_root(model, 1), 2] += 0.25
-        model.joint_X_p.assign(moved)
-        with self.assertRaisesRegex(RuntimeError, "joint_X_p"):
+        for written, kept in ((moved, False), (moved, True), (frames, False), (frames, True)):
+            mark_valid()
+            model.joint_X_p.assign(written)
+            launched = invalidating_launches(JOINT)
+            self.assertEqual(bool(launched), not kept)
+            self.assertEqual(validity(), valid if kept else invalid)
+        # A changed joint axis raises before any cache changes.
+        mark_valid()
+        axes = model.joint_axis.numpy().copy()
+        turned = axes.copy()
+        turned[model.joint_qd_start.numpy()[_fixed_root(model, 1) + 1]] = (1.0, 0.0, 0.0)
+        model.joint_axis.assign(turned)
+        with self.assertRaisesRegex(RuntimeError, "joint_axis"):
             solver.notify_model_changed(JOINT)
         self.assertEqual(validity(), valid)
-        model.joint_X_p.assign(frames)
+        model.joint_axis.assign(axes)
         self.assertEqual(invalidating_launches(JOINT), [])
-        self.assertEqual(validity(), valid)
         ordinary = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
         ordinary._fk_id_cache_enabled = True
         ordinary._fk_id_cache_valid.fill_(1)
@@ -320,7 +333,11 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
     def test_cuda_moved_frames_and_other_inputs_keep_their_contract(self):
-        """Raise on a moved root and invalidate every group on joint plus inertial notifications."""
+        """Invalidate every group on a moved root and on joint plus inertial notifications; keep unmoved frames.
+
+        The moved root's welded base takes its new pose on the next step, and a notification that
+        moves nothing afterwards keeps every cache.
+        """
         model = _build(wp.get_device("cuda:0"), worlds=4)
         solver = _mixed_solver(model)
         owner = solver._tree_kinetic_state
@@ -328,14 +345,20 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         rollout = _Rollout(model, solver)
         rollout.block()
         np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 1)
-        frames = model.joint_X_p.numpy().copy()
-        moved = frames.copy()
-        moved[_fixed_root(model, 2), 0] += 0.1
+        root = _fixed_root(model, 2)
+        base = int(model.joint_child.numpy()[root])
+        before = rollout.states[0].body_q.numpy()[base].copy()
+        moved = model.joint_X_p.numpy().copy()
+        moved[root, 0] += 0.1
         model.joint_X_p.assign(moved)
-        with self.assertRaisesRegex(RuntimeError, "joint_X_p"):
-            solver.notify_model_changed(JOINT)
+        solver.notify_model_changed(JOINT)
+        np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 0)
+        for group in owner.groups:
+            np.testing.assert_array_equal(group.geometry_valid.numpy(), 0)
+        rollout.block()
         np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 1)
-        model.joint_X_p.assign(frames)
+        shift = np.array([0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        np.testing.assert_allclose(rollout.states[0].body_q.numpy()[base], before + shift, atol=1.0e-6)
         solver.notify_model_changed(JOINT)
         np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 1)
         solver.notify_model_changed(JOINT | newton.ModelFlags.BODY_INERTIAL_PROPERTIES)

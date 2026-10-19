@@ -209,6 +209,23 @@ def _build(
     return model
 
 
+def _fixed_root_joints(model):
+    """Root joints of articulations welded to the world (FIXED joints without a parent)."""
+    roots = model.articulation_start.numpy()[:-1]
+    fixed = (model.joint_type.numpy()[roots] == int(newton.JointType.FIXED)) & (model.joint_parent.numpy()[roots] == -1)
+    return roots[fixed]
+
+
+def _repose_fixed_roots(model, solver, lift):
+    """Lift every fixed root through its parent frame and notify, as Isaac Lab's fixed-base root writes do."""
+    roots = _fixed_root_joints(model)
+    frames = model.joint_X_p.numpy()
+    frames[roots, 2] += lift
+    model.joint_X_p.assign(frames)
+    solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+    return roots
+
+
 TRAY_VELOCITY = 0.25
 
 
@@ -602,6 +619,54 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
                 self.assertEqual(int(sum(int(group.status.numpy().sum()) for group in owner.groups)), 0)
                 self._assert_patch_history(plain_solver, owner_solver)
 
+    def test_fixed_root_repose_keeps_the_owner(self):
+        """Re-pose fixed roots mid-rollout through joint_X_p and JOINT_PROPERTIES and keep tracking the ordinary route.
+
+        Isaac Lab writes a fixed-base articulation's root pose into
+        ``joint_X_p`` and notifies ``JOINT_PROPERTIES`` on every reset. The held
+        kernels read joint frames live: a write that moves no frame keeps every
+        cache (the next step only finishes), and a moved root invalidates every
+        cache (the next step repairs every tree), so the owner accepts the new
+        frames instead of refusing them.
+        """
+        lift, rewrite_after, repose_after = 0.03, 10, 20
+        rollouts, generations = [], []
+        for owner in (False, True):
+            model = _build(wp.get_device("cuda:0"))
+            steps = []
+
+            def repose(solver, contacts, model=model, steps=steps):
+                steps.append(len(steps))
+                held = solver._tree_kinetic_state
+                if held is not None:
+                    # Every finish and every recomputing repair adds one to its tree's generation.
+                    generations.append([int(group.data.generation.numpy().sum()) for group in held.groups])
+                if len(steps) == rewrite_after:
+                    model.joint_X_p.assign(model.joint_X_p.numpy())
+                    solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+                if len(steps) == repose_after:
+                    _repose_fixed_roots(model, solver, lift)
+
+            rollouts.append((model, *_rollout(model, owner=owner, steps=60, observe=repose)))
+        (model, _plain_solver, plain_owner, plain, plain_qd) = rollouts[0]
+        (_, owner_solver, owner, cached, cached_qd) = rollouts[1]
+        self.assertIsNone(plain_owner)
+        self.assertIsInstance(owner, MixedTreeKineticState)
+        self.assertIs(owner_solver._tree_kinetic_state, owner)
+        self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
+        np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
+        np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
+        # The welded bases moved by the lift and hold the new pose.
+        bases = model.joint_child.numpy()[_fixed_root_joints(model)]
+        np.testing.assert_allclose(cached[-1, bases, 2] - cached[repose_after - 2, bases, 2], lift, atol=1.0e-6)
+        self.assertEqual(int(sum(int(group.status.numpy().sum()) for group in owner.groups)), 0)
+        # Generations added by each step; entry k is the step after the k-th observation.
+        added = np.diff(np.asarray(generations), axis=0)
+        trees = np.asarray([group.group_count for group in owner.groups])
+        np.testing.assert_array_equal(added[rewrite_after - 1], trees, err_msg="unmoved frames keep every cache")
+        np.testing.assert_array_equal(added[repose_after - 1], 2 * trees, err_msg="a moved root repairs every tree")
+
 
 def _box_anchor_corners(model, solver, contacts, box=4):
     """Per world: the box-frame corner signs (x, y) of the box contacts that carry patch anchors."""
@@ -666,6 +731,43 @@ class TestFeatherPGSMixedTreePatchFixture(unittest.TestCase):
         for step, (first, second) in enumerate(zip(*histories, strict=True)):
             np.testing.assert_array_equal(first, second, err_msg=f"previous.valid at step {step}")
         self.assertTrue(histories[0][-1].any(), "The resting boxes hold anchors")
+
+
+class TestFeatherPGSMixedTreeFrames(unittest.TestCase):
+    """Check on CPU which model changes the held-tree groups accept."""
+
+    def test_joint_frame_notifications_keep_the_held_groups(self):
+        """Report moved joint frames under JOINT_PROPERTIES without raising, prove unmoved ones, refuse a changed axis.
+
+        The owner is built directly on CPU, where the solver keeps ordinary
+        dynamics, and validated as ``notify_model_changed`` validates it: a
+        proof that finds every frame and axis unchanged (``True``) keeps the
+        caches, a moved frame (``False``) invalidates them, and the moved frames
+        are the proof's reference from then on.
+        """
+        joint = newton.ModelFlags.JOINT_PROPERTIES
+        model = _build(wp.get_device("cpu"), worlds=2)
+        solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+        owner = MixedTreeKineticState(solver)
+        self.assertTrue(owner.groups)
+        roots = _fixed_root_joints(model)
+        self.assertEqual(len(roots), model.world_count)
+        self.assertTrue(owner.validate_model(joint))
+        frames = model.joint_X_p.numpy()
+        frames[roots, :3] += (0.1, -0.05, 0.03)
+        model.joint_X_p.assign(frames)
+        self.assertFalse(owner.validate_model(joint))
+        self.assertTrue(owner.validate_model(joint))
+        child_frames = model.joint_X_c.numpy()
+        child_frames[roots + 1, 2] += 0.01
+        model.joint_X_c.assign(child_frames)
+        self.assertFalse(owner.validate_model(joint))
+        self.assertTrue(owner.validate_model(newton.ModelFlags.ALL))
+        axes = model.joint_axis.numpy()
+        axes[model.joint_qd_start.numpy()[roots + 1]] = (1.0, 0.0, 0.0)
+        model.joint_axis.assign(axes)
+        with self.assertRaisesRegex(RuntimeError, "joint_axis changed"):
+            owner.validate_model(joint)
 
 
 if __name__ == "__main__":

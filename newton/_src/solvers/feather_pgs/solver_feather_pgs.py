@@ -3790,11 +3790,12 @@ class SolverFeatherPGS(SolverBase):
         With cached dynamics active, a notification whose only flag among the
         cached inputs is :attr:`~newton.ModelFlags.JOINT_PROPERTIES` keeps the
         cache once the cache's device checksums of every joint frame and axis
-        match their construction values; a changed joint frame raises, as
-        before. That flag covers the :class:`~newton.Model` joint arrays only:
-        after writing :class:`~newton.State` joint coordinates outside
-        :meth:`step`, call :meth:`reset` with a world mask or
-        :meth:`notify_state_changed`.
+        match their stored values. A moved joint frame, as when Isaac Lab
+        re-poses a fixed root through :attr:`~newton.Model.joint_X_p`,
+        invalidates every cache instead, and a changed joint axis raises. That
+        flag covers the :class:`~newton.Model` joint arrays only: after writing
+        :class:`~newton.State` joint coordinates outside :meth:`step`, call
+        :meth:`reset` with a world mask or :meth:`notify_state_changed`.
         """
         # Derive the kinematic state first: a body-flag change the solver
         # cannot absorb raises here, before any mask, cache or owner changes.
@@ -3827,7 +3828,8 @@ class SolverFeatherPGS(SolverBase):
             # The owner's device checksums of every joint frame and axis just
             # matched (an exact host fingerprint on CPU), and stepping never reads
             # Model.joint_q: every cache input is as it was. Isaac Lab notifies so
-            # on each fixed-root pose write.
+            # on each fixed-root pose write. A moved frame leaves the flag in place
+            # and invalidates every cache below.
             cache_inputs = 0
         if tree_kinetic is not None and cache_inputs:
             tree_kinetic.invalidate()

@@ -3,15 +3,20 @@
 
 """Prove frozen plan arrays unchanged on the device with one small readback.
 
-Cache owners bake topology (parents, axes, anchors, body membership, group
-maps) into their kernels and must refuse to run after it changes. Reading
-every plan array back to the host to fingerprint it on each model-change
-notification costs several milliseconds per notification at 16k worlds, and
-Isaac Lab notifies on every reset. This helper keeps a position-sensitive
-checksum of each array's words (two 32-bit sums, no device copy), recomputes
-them with one kernel launch over every array and reads back one small
-vector. Arrays that cannot be viewed as device words (host arrays,
-non-contiguous views, ``None``) keep a host fingerprint.
+Cache owners bake topology (parents, axes, body membership, group maps) into
+their kernels and must refuse to run after it changes. Reading every plan
+array back to the host to fingerprint it on each model-change notification
+costs several milliseconds per notification at 16k worlds, and Isaac Lab
+notifies on every reset. This helper keeps a position-sensitive checksum of
+each array's words (two 32-bit sums, no device copy), recomputes them with one
+kernel launch over every array and reads back one small vector. Arrays that
+cannot be viewed as device words (host arrays, non-contiguous views, ``None``)
+keep a host fingerprint.
+
+An owner may also watch arrays its kernels read live, such as joint frames: a
+changed watched array does not raise, the validation reports it, and its new
+checksums replace the stored ones, so the owner can invalidate its caches and
+keep them across later notifications that change nothing.
 """
 
 import hashlib
@@ -126,9 +131,14 @@ def fingerprint(array):
 class DeviceProof:
     """Frozen evidence for a named set of arrays, validated on the device when possible."""
 
-    def __init__(self, entries, device):
-        """``entries``: iterable of ``(label, array)``; ``device``: the owner's device."""
+    def __init__(self, entries, device, *, watched=()):
+        """``entries``: iterable of ``(label, array)``; ``device``: the owner's device.
+
+        ``watched`` names the entries whose change :meth:`validate` reports and
+        stores instead of raising; every other entry is frozen.
+        """
         self.device = device
+        self.watched = frozenset(watched)
         self.labels = []
         self._sizes_by_label = {}
         self._host = {}
@@ -172,8 +182,18 @@ class DeviceProof:
         return self._sums.numpy()[: 2 * len(views)].tolist()
 
     def validate(self, current, what):
-        """Raise ``RuntimeError`` naming the first changed array; ``current`` maps label to array."""
-        views = []
+        """Raise ``RuntimeError`` naming the first changed frozen array; ``current`` maps label to array.
+
+        A watched array whose content changed is reported instead, and its new
+        checksums (or host fingerprint) replace the stored ones, so the next
+        validation compares with its content now. A watched array whose size
+        changed raises as a frozen one does.
+
+        Returns:
+            The labels of the changed watched arrays, in entry order; empty when
+            none changed.
+        """
+        views, moved, fingerprints = [], [], {}
         for label in self.labels:
             array = current(label)
             if label in self._sizes_by_label:
@@ -181,13 +201,34 @@ class DeviceProof:
                 if view is None or view.shape[0] != self._sizes_by_label[label]:
                     raise RuntimeError(f"{what} {label} changed; reconstruct and recapture")
                 views.append((label, view))
-            elif fingerprint(array) != self._host[label]:
+                continue
+            value, frozen = fingerprint(array), self._host[label]
+            if value == frozen:
+                continue
+            # A host fingerprint leads with the array's shape and dtype.
+            if label not in self.watched or value is None or frozen is None or value[:2] != frozen[:2]:
                 raise RuntimeError(f"{what} {label} changed; reconstruct and recapture")
-        if not views:
-            return
-        # A notification arrives on most Isaac Lab steps: one launch and one
-        # small readback per notification, and no frozen device copies.
-        sums = self._checksums([view for _, view in views])
-        for slot, (label, _) in enumerate(views):
-            if sums[2 * slot : 2 * slot + 2] != self._frozen[2 * slot : 2 * slot + 2]:
-                raise RuntimeError(f"{what} {label} changed; reconstruct and recapture")
+            fingerprints[label] = value
+        stored = {}
+        if views:
+            # A notification arrives on most Isaac Lab steps: one launch and one
+            # small readback per notification, and no frozen device copies.
+            sums = self._checksums([view for _, view in views])
+            for slot, (label, _) in enumerate(views):
+                window = slice(2 * slot, 2 * slot + 2)
+                if sums[window] == self._frozen[window]:
+                    continue
+                if label not in self.watched:
+                    raise RuntimeError(f"{what} {label} changed; reconstruct and recapture")
+                stored[label] = (window, sums[window])
+        # Every frozen array is proven unchanged: store the watched arrays' new content.
+        for label in self.labels:
+            if label in fingerprints:
+                self._host[label] = fingerprints[label]
+            elif label in stored:
+                window, values = stored[label]
+                self._frozen[window] = values
+            else:
+                continue
+            moved.append(label)
+        return moved

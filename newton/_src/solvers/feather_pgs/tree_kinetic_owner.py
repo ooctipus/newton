@@ -27,9 +27,11 @@ _PLAN_FIELDS = (
     *PLAN_FIELDS,
     "joint_ancestor",
     "joint_axis",
-    "joint_X_p",
-    "joint_X_c",
 )
+# Joint frames are watched, not frozen: the kernels read joint_X_p and joint_X_c
+# live, so a JOINT_PROPERTIES notification that moves a frame (Isaac Lab re-poses
+# fixed roots this way on resets) invalidates the caches instead of raising.
+_FRAME_FIELDS = ("joint_X_p", "joint_X_c")
 _MAPPING_FIELDS = ("group_to_art", "art_to_world", "art_dof_start", "free_root_joint_indices")
 
 _fingerprint = fingerprint
@@ -424,11 +426,13 @@ class TreeKineticState:
         if not self.chain_scan:
             self._choose_lanes()
         self._plan_dimensions = self._dimensions()
-        # Everything make_plan and the kernels bake in, proven on the device.
+        # Everything make_plan and the kernels bake in, proven on the device, and the
+        # joint frames, which the kernels read live, watched.
         self._proof = DeviceProof(
-            [(name, getattr(model, name)) for name in _PLAN_FIELDS]
+            [(name, getattr(model, name)) for name in (*_PLAN_FIELDS, *_FRAME_FIELDS)]
             + [(f"{name} mapping", self._mapping(name)) for name in _MAPPING_FIELDS],
             device,
+            watched=_FRAME_FIELDS,
         )
 
     def _bind_kernels(self):
@@ -607,24 +611,30 @@ class TreeKineticState:
         """Reject changed baked ownership before notification invalidates any state.
 
         Numeric notifications (joint DOF, inertial, shape and model properties)
-        change values the caches refresh from, never parents, axes, anchors or
-        body membership, so they are accepted outright. Every other
-        notification compares the baked plan arrays on the device (one small
-        readback) instead of fingerprinting them on the host; Isaac Lab issues
-        a notification on every reset. Body flags are not baked: the kernels
+        change values the caches refresh from, never parents, axes or body
+        membership, so they are accepted outright. Every other notification
+        compares the baked plan arrays on the device (one small readback)
+        instead of fingerprinting them on the host; Isaac Lab issues a
+        notification on every reset. Joint frames are not baked but watched:
+        the kernels read them live, so a ``JOINT_PROPERTIES`` notification may
+        move them, as Isaac Lab does to re-pose a fixed root; the proof then
+        reports them moved and stores their new checksums, and the solver
+        invalidates every cache. Body flags are not baked either: the kernels
         read the kinematic masks and armature the solver re-derives in place,
         after rejecting any flag change it cannot absorb.
 
         Returns:
-            Whether the proof ran and passed: the device checksums of every
-            baked plan array, the joint frames ``joint_X_p`` and ``joint_X_c``
-            and the joint axes included, match their construction values. A
-            device checksum is two position-sensitive 32-bit sums, not a
-            word-by-word compare: one changed word always shows, and a random
-            multi-word change collides with a probability of about 2**-64.
-            Arrays the proof cannot view as device words (every array on CPU)
-            compare by an exact host fingerprint. Numeric notifications skip
-            the proof and return ``False``.
+            Whether the proof ran and found every input unchanged: the device
+            checksums of every baked plan array, the joint axes included, and
+            of the joint frames ``joint_X_p`` and ``joint_X_c`` match the
+            values stored at construction or at the last notification that
+            moved a frame. ``False`` when a frame moved. A device checksum is
+            two position-sensitive 32-bit sums, not a word-by-word compare: one
+            changed word always shows, and a random multi-word change collides
+            with a probability of about 2**-64. Arrays the proof cannot view as
+            device words (every array on CPU) compare by an exact host
+            fingerprint. Numeric notifications skip the proof and return
+            ``False``.
         """
         if flags is not None and int(flags) != 0 and int(flags) & ~_NUMERIC_FLAGS == 0:
             return False
@@ -636,8 +646,8 @@ class TreeKineticState:
                 return self._mapping(label[: -len(" mapping")])
             return getattr(self.solver.model, label)
 
-        self._proof.validate(current, "Tree kinetic static")
-        return True
+        # A moved frame invalidates instead of raising; any other change raises.
+        return not self._proof.validate(current, "Tree kinetic static")
 
     def forget_continuity(self):
         """Launch the next repair: a host call changed what the last finish left on the device."""
