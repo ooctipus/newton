@@ -17,12 +17,16 @@ from newton.tests.test_heightfield_cell_reject import make_model
 
 
 def create_pipeline(model, packed):
-    """Select only the independent-pair mapping, preserving current geometry."""
+    """Select only the independent-pair mapping, preserving current geometry.
+
+    The one-pass midphase is pinned: these tests inspect its dispatch and inputs.
+    """
     with patch.dict(
         os.environ,
         {
             "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
             "NEWTON_NARROW_PHASE_PACKED_HEIGHTFIELD_PAIRS": str(int(packed)),
+            "NEWTON_HEIGHTFIELD_LANE_MIDPHASE": "0",
         },
     ):
         return newton.CollisionPipeline(model, reduce_contacts=True, rigid_contact_max=128, max_triangle_pairs=128)

@@ -117,7 +117,9 @@ class TestHeightfieldGeometricCull(unittest.TestCase):
     def check_current_admission_guards(self, device):
         """Withdraw unknown geometry and read the current reducer threshold every call."""
         model = make_model(device, z=0.015)
-        owner = pipeline(model, True)
+        # Replay the one-pass midphase's recorded inputs; the lane midphase takes the same.
+        with patch.dict(os.environ, {"NEWTON_HEIGHTFIELD_LANE_MIDPHASE": "0"}):
+            owner = pipeline(model, True)
         state, contacts = model.state(), owner.contacts()
         recorded = []
         launch = wp.launch

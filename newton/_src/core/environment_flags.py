@@ -193,6 +193,13 @@ NEWTON_FLAGS = declare(
         "=1 rejects separated terrain triangles with enclosing boxes before the contact query.",
     ),
     EnvironmentFlag(
+        "NEWTON_HEIGHTFIELD_LANE_MIDPHASE",
+        "policy",
+        _NARROW,
+        "=0 keeps one thread per pair over every cell of the terrain midphase instead of lanes for long windows "
+        "(default 1).",
+    ),
+    EnvironmentFlag(
         "NEWTON_HEIGHTFIELD_PAIR_CSR",
         "experiment",
         _NARROW,

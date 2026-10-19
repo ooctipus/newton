@@ -90,6 +90,12 @@ from ..utils.heightfield import (
 )
 
 _SPARSE_GJK_PAIR_CAPACITY_THRESHOLD = 1_000_000
+# CUDA lane midphase: pairs with more cells than this move to the lane pass, which
+# gives each of them this many lanes. Replayed on recorded rough-terrain pair
+# lists, these values cut the warp iterations of the height test by 40-69% and the
+# warp-level triangle appends by 43-70%, and bound a warp's in-place walk at 16 cells.
+_LANE_SMALL_CELLS = 16
+_LANE_WIDTH = 16
 
 
 @wp.func
@@ -2354,7 +2360,12 @@ class NarrowPhase:
     unculled tiled midphase, or ``NEWTON_NARROW_PHASE_PACKED_HEIGHTFIELD_PAIRS=0`` to
     disable only the packed mapping. Mixed triangle-mesh and heightfield scenes
     retain the upstream tiled midphase and its cell rejection. Contact ordering
-    and redundant manifold point selection may change.
+    and redundant manifold point selection may change. On CUDA, a pair whose
+    window holds more than 16 cells moves to a second pass that splits its cells
+    over 16 lanes of a warp; every cell runs the same tests, so the emitted
+    triangles are unchanged and only their order differs. On CPU every pair keeps
+    one thread and the original order. ``NEWTON_HEIGHTFIELD_LANE_MIDPHASE=0``
+    keeps one thread per pair everywhere.
     Rejection pays when many XY-overlapping cells lie below bodies; profile the
     opt-out for densely touching terrain where these extra bound tests rarely reject.
     Prefer this default for capsule/cylinder terrain contacts; finite-query
@@ -2425,6 +2436,7 @@ class NarrowPhase:
         max_triangle_pairs: int = 1000000,
         max_mesh_mesh_pairs: int | None = None,
         max_mesh_plane_pairs: int | None = None,
+        max_heightfield_pairs: int | None = None,
         reduce_contacts: bool = True,
         device: Devicelike | None = None,
         shape_aabb_lower: wp.array[wp.vec3] | None = None,
@@ -2464,6 +2476,9 @@ class NarrowPhase:
                 to ``max_candidate_pairs``.
             max_mesh_plane_pairs: Maximum number of routed mesh-plane pairs. Defaults
                 to ``max_candidate_pairs``.
+            max_heightfield_pairs: Maximum number of routed heightfield pairs. The
+                lane midphase stores up to half this many long pairs for its lane
+                pass and walks further ones in place. Defaults to ``max_candidate_pairs``.
             reduce_contacts: Whether to reduce contacts for mesh-mesh and mesh-plane collisions.
                 When True, uses shared memory contact reduction to select representative contacts.
                 This improves performance and stability for meshes with many vertices. Defaults to True.
@@ -2550,6 +2565,8 @@ class NarrowPhase:
             raise ValueError("max_mesh_mesh_pairs must be non-negative or None")
         if max_mesh_plane_pairs is not None and max_mesh_plane_pairs < 0:
             raise ValueError("max_mesh_plane_pairs must be non-negative or None")
+        if max_heightfield_pairs is not None and max_heightfield_pairs < 0:
+            raise ValueError("max_heightfield_pairs must be non-negative or None")
         self.max_mesh_mesh_pairs = min(
             max_candidate_pairs,
             max_candidate_pairs if max_mesh_mesh_pairs is None else max_mesh_mesh_pairs,
@@ -2557,6 +2574,10 @@ class NarrowPhase:
         self.max_mesh_plane_pairs = min(
             max_candidate_pairs,
             max_candidate_pairs if max_mesh_plane_pairs is None else max_mesh_plane_pairs,
+        )
+        self.max_heightfield_pairs = min(
+            max_candidate_pairs,
+            max_candidate_pairs if max_heightfield_pairs is None else max_heightfield_pairs,
         )
         self.device = device
         self.reduce_contacts = reduce_contacts
@@ -2760,6 +2781,19 @@ class NarrowPhase:
             "export_cleanup": export_cleanup == "1",
             "row_gate": row_gate == "1",
         }
+        lane_midphase = os.environ.get("NEWTON_HEIGHTFIELD_LANE_MIDPHASE", "1")
+        if lane_midphase not in ("0", "1"):
+            raise ValueError("NEWTON_HEIGHTFIELD_LANE_MIDPHASE must be 0 or 1")
+        self._route_requests["lane_midphase"] = lane_midphase == "1"
+        # Packed cell rejection owns every heightfield pair with one thread; the
+        # lane midphase keeps that pass and moves the cells of long pairs to lanes.
+        self._heightfield_lane_midphase = lane_midphase == "1" and self._heightfield_packed_pairs
+        # CPU kernels run one lane per block, in order (Warp GH-1413): defer nothing
+        # there, which keeps the original triangle order.
+        lane_device = wp.get_device(device)
+        self._heightfield_lane_small_cells = _LANE_SMALL_CELLS if lane_device.is_cuda else -1
+        self._heightfield_lane_width = _LANE_WIDTH if lane_device.is_cuda else 1
+        self._heightfield_lane_deferred = None
         self._finite_bounds = None
         self._finite_source = None
         self.mesh_sdf_texture_only = mesh_sdf_texture_only
@@ -3003,6 +3037,8 @@ class NarrowPhase:
             n += 2 if mesh_weight_idx is not None else 0  # mesh-plane vertices, mesh-mesh edges
             row_gate_idx = n if self._heightfield_row_gate else None
             n += HEIGHTFIELD_ROW_COUNT if row_gate_idx is not None else 0  # typed terrain row lengths
+            lane_idx = n if self._heightfield_lane_midphase else None
+            n += 1 if lane_idx is not None else 0  # deferred terrain pairs
             c = wp.zeros(n, dtype=wp.int32, device=device)
             self._counter_array = c
             # Separate storage: per-frame counter resets must not erase history.
@@ -3038,6 +3074,24 @@ class NarrowPhase:
                 if row_gate_idx is not None
                 else ()
             )
+            if lane_idx is not None:
+                from .heightfield_geometric import PairProjection  # noqa: PLC0415
+                from .heightfield_lanes import CellWindow, DeferredPairs  # noqa: PLC0415
+
+                # Half the routed pairs fit; the per-pair pass walks any further long pair in place.
+                capacity = max(1, (self.max_heightfield_pairs + 1) // 2)
+                deferred = DeferredPairs()
+                deferred.windows = wp.empty(capacity, dtype=CellWindow, device=device)
+                deferred.projections = wp.empty(
+                    capacity if self._heightfield_geometric_cull else 0, dtype=PairProjection, device=device
+                )
+                deferred.count = c[lane_idx : lane_idx + 1]
+                self._heightfield_lane_deferred = deferred
+                self._heightfield_lane_empty = (
+                    wp.empty(0, dtype=wp.uint64, device=device),
+                    wp.empty((0, 2), dtype=wp.vec3, device=device),
+                    wp.empty(0, dtype=wp.int32, device=device),
+                )
 
             # Pair and work buffers
             self.gjk_candidate_pairs = wp.zeros(max_candidate_pairs, dtype=wp.vec2i, device=device)
@@ -3168,6 +3222,59 @@ class NarrowPhase:
             self.mesh_plane_target_blocks = self.num_tile_blocks
             self.mesh_plane_block_offsets = None
             self.mesh_plane_block_counts = None
+
+    def _launch_lane_midphase(
+        self,
+        device,
+        shape_types,
+        shape_data,
+        shape_transform,
+        shape_source,
+        shape_gap,
+        shape_collision_aabb_lower,
+        shape_collision_aabb_upper,
+        shape_heightfield_index,
+        heightfield_data,
+        heightfield_elevations,
+    ):
+        """Run the per-pair pass and, on CUDA, the lane pass of the terrain midphase."""
+        from .heightfield_lanes import TerrainPairs, TerrainTriangles, create_lane_midphase_kernels  # noqa: PLC0415
+
+        geometric = self._heightfield_geometric_cull
+        tagged = self._heightfield_pair_csr
+        no_sources, no_bounds, no_tags = self._heightfield_lane_empty
+        scene = TerrainPairs()
+        scene.transforms = shape_transform
+        scene.gaps = shape_gap
+        scene.data = shape_data
+        scene.lower = shape_collision_aabb_lower
+        scene.upper = shape_collision_aabb_upper
+        scene.heightfield_index = shape_heightfield_index
+        scene.heightfield = heightfield_data
+        scene.elevations = heightfield_elevations
+        scene.pairs = self.shape_pairs_mesh
+        scene.pair_count = self.shape_pairs_mesh_count
+        scene.types = shape_types
+        scene.sources = shape_source if geometric else no_sources
+        scene.bounds = self._finite_bounds if geometric else no_bounds
+        scene.bound_source = self._finite_source if geometric else no_sources
+        triangles = TerrainTriangles()
+        triangles.triples = self.triangle_pairs
+        triangles.count = self.triangle_pairs_count
+        triangles.tags = self._pair_csr.triangle_pair if tagged else no_tags
+        pairs_kernel, lanes_kernel = create_lane_midphase_kernels(geometric, tagged)
+        passes = [(pairs_kernel, self._heightfield_lane_small_cells)]
+        if self._heightfield_lane_small_cells >= 0:
+            passes.append((lanes_kernel, self._heightfield_lane_width))
+        for kernel, parameter in passes:
+            wp.launch(
+                kernel=kernel,
+                dim=self.total_num_threads,
+                inputs=[scene, triangles, self._heightfield_lane_deferred, parameter, self.total_num_threads],
+                device=device,
+                block_dim=self.tile_size_mesh_convex,
+                record_tape=False,
+            )
 
     def launch_custom_write(
         self,
@@ -3616,15 +3723,30 @@ class NarrowPhase:
             if self._heightfield_pair_csr:
                 midphase_kernel = self._pair_csr.midphase
                 midphase_outputs.append(self._pair_csr.triangle_pair)
-            wp.launch(
-                kernel=midphase_kernel,
-                dim=[midphase_workers, second_dim],
-                inputs=midphase_inputs,
-                outputs=midphase_outputs,
-                device=device,
-                block_dim=self.tile_size_mesh_convex,
-                record_tape=False,
-            )
+            if self._heightfield_lane_midphase:
+                self._launch_lane_midphase(
+                    device,
+                    shape_types,
+                    shape_data,
+                    shape_transform,
+                    shape_source,
+                    shape_gap,
+                    shape_collision_aabb_lower,
+                    shape_collision_aabb_upper,
+                    shape_heightfield_index,
+                    heightfield_data,
+                    heightfield_elevations,
+                )
+            else:
+                wp.launch(
+                    kernel=midphase_kernel,
+                    dim=[midphase_workers, second_dim],
+                    inputs=midphase_inputs,
+                    outputs=midphase_outputs,
+                    device=device,
+                    block_dim=self.tile_size_mesh_convex,
+                    record_tape=False,
+                )
 
             # Launch contact processing for triangle pairs
             if self.reduce_contacts:

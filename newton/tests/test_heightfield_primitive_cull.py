@@ -200,7 +200,9 @@ class TestHeightfieldPrimitiveCull(unittest.TestCase):
         """Read current dimensions and withdraw unsafe primitive metadata each call."""
         for kind in ("sphere", "capsule", "cylinder"):
             model = primitive_model(device, kind)
-            owner = primitive_pipeline(model, True)
+            # Replay the one-pass midphase's recorded inputs; the lane midphase takes the same.
+            with patch.dict(os.environ, {"NEWTON_HEIGHTFIELD_LANE_MIDPHASE": "0"}):
+                owner = primitive_pipeline(model, True)
             recorded = []
             launch = wp.launch
 

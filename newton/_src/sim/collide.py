@@ -2112,6 +2112,7 @@ class CollisionPipeline:
             mesh_sdf_identity_scale_only = False
             max_mesh_mesh_pairs = self.shape_pairs_max
             max_mesh_plane_pairs = self.shape_pairs_max
+            max_heightfield_pairs = None
             if hasattr(model, "shape_type") and model.shape_type is not None:
                 shape_types = model.shape_type.numpy()
                 # Gate the mesh/heightfield narrow-phase stages pair-aware:
@@ -2181,6 +2182,21 @@ class CollisionPipeline:
                             bool(scale_baked[shape_sdf_index[shape_idx]]) or identity_shape_scale[shape_idx]
                             for shape_idx in np.flatnonzero(mesh_sdf_shapes)
                         )
+                if has_heightfields:
+                    # Heightfield pairs with any shape other than a mesh or a heightfield
+                    # reach the terrain midphase; this bounds its per-pair storage.
+                    hfield, mesh = int(GeoType.HFIELD), int(GeoType.MESH)
+                    if self.shape_pairs_filtered is not None:
+                        explicit = pairs_np.reshape(-1, 2).astype(np.int64)
+                        valid = np.all((explicit >= 0) & (explicit < len(shape_types)), axis=1)
+                        first, second = shape_types[explicit[valid, 0]], shape_types[explicit[valid, 1]]
+                        partner = np.where(first == hfield, second, first)
+                        routed = ((first == hfield) != (second == hfield)) & (partner != mesh)
+                        max_heightfield_pairs = int(np.count_nonzero(routed))
+                    else:
+                        partners = colliding_mask & (shape_types != hfield) & (shape_types != mesh)
+                        max_heightfield_pairs = _compute_per_world_mask_pair_max(model, heightfield_mask, partners)
+                    max_heightfield_pairs = min(self.shape_pairs_max, max_heightfield_pairs)
                 if self.broad_phase_mode == "explicit":
                     # Explicit pairs are not constrained by shape_world and may
                     # intentionally connect shapes from different worlds.
@@ -2266,6 +2282,7 @@ class CollisionPipeline:
                 max_triangle_pairs=max_triangle_pairs,
                 max_mesh_mesh_pairs=max_mesh_mesh_pairs,
                 max_mesh_plane_pairs=max_mesh_plane_pairs,
+                max_heightfield_pairs=max_heightfield_pairs,
                 reduce_contacts=self.reduce_contacts,
                 device=device,
                 shape_aabb_lower=shape_aabb_lower,
@@ -2908,6 +2925,24 @@ class CollisionPipeline:
                     *common,
                 ),
             )
+        deferred = narrow._heightfield_lane_deferred
+        if narrow._heightfield_lane_midphase and narrow._heightfield_lane_small_cells >= 0:
+            lane_reason = (
+                "Default: one thread per pair; pairs with more than small_cells cells split their cells over lanes."
+            )
+        elif narrow._heightfield_lane_midphase:
+            lane_reason = "Default on CPU: one thread per pair walks every cell in the original order; no lanes split."
+        elif not requests["lane_midphase"]:
+            lane_reason = "NEWTON_HEIGHTFIELD_LANE_MIDPHASE=0: one thread per pair walks every cell."
+        else:
+            lane_reason = "Off: the lane midphase needs packed heightfield cell rejection (no triangle meshes)."
+        lane_midphase = {
+            "enabled": bool(narrow._heightfield_lane_midphase),
+            "small_cells": narrow._heightfield_lane_small_cells,
+            "lanes": narrow._heightfield_lane_width,
+            "deferred_capacity": None if deferred is None else int(deferred.windows.shape[0]),
+            "reason": lane_reason,
+        }
         if narrow._heightfield_row_gate:
             row_gate_reason = "Default: each typed row scans the triangle stream only when a current pair reaches it."
         elif not narrow._heightfield_primitive_query:
@@ -2918,6 +2953,7 @@ class CollisionPipeline:
         cell_kernel = narrow._heightfield_convex_cell_kernel
         return {
             "midphase": midphase,
+            "lane_midphase": lane_midphase,
             "hull_route": hull,
             "primitive_query": {
                 "enabled": bool(narrow._heightfield_primitive_query),
