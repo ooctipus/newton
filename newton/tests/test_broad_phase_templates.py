@@ -1,7 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Per-world pair templates that ModelBuilder keeps next to the explicit pair list it replays them into."""
+"""World-template explicit broad phase: the builder's template record and the kernel that tests it.
+
+The template kernel must test exactly the pairs of the flat explicit list. Counts
+and sorted candidate sets are compared with :class:`BroadPhaseExplicit` on every
+device; on CPU, where both run serially in list order, the arrays must be equal.
+"""
 
 import unittest
 import warnings
@@ -10,7 +15,237 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.geometry.broad_phase_nxn import ShapePairTemplates, replay_shape_pair_templates
+from newton._src.geometry.broad_phase_nxn import (
+    BroadPhaseExplicit,
+    BroadPhaseExplicitTemplates,
+    ShapePairTemplates,
+    replay_shape_pair_templates,
+)
+from newton.tests.unittest_utils import add_function_test, get_test_devices
+
+
+def _synthetic(
+    seed,
+    *,
+    worlds,
+    world_shapes,
+    template_specs,
+    global_shapes=3,
+    global_pairs=2,
+    gap=2,
+    empty_template=False,
+):
+    """Random templates over worlds of ``world_shapes`` shapes, globals first, ``gap`` spare shapes between worlds.
+
+    Args:
+        template_specs: Per template, (global-local pair count, local pair count).
+        empty_template: Add a template without pairs, which the list skips.
+
+    Returns:
+        (record, shape_count): the unbound record and the shapes it spans.
+    """
+    rng = np.random.default_rng(seed)
+    templates = []
+    for global_local_count, local_count in template_specs:
+        local_pairs = set()
+        while len(local_pairs) < local_count:
+            a, b = sorted(rng.choice(world_shapes, size=2, replace=False).tolist())
+            local_pairs.add((a, b))
+        global_local = set()
+        while len(global_local) < global_local_count:
+            global_local.add((int(rng.integers(global_shapes)), int(rng.integers(world_shapes))))
+        templates.append(
+            (
+                np.asarray(sorted(global_local), dtype=np.int32).reshape((-1, 2)),
+                np.asarray(sorted(local_pairs), dtype=np.int32).reshape((-1, 2)),
+            )
+        )
+    if empty_template:
+        templates.append((np.empty((0, 2), dtype=np.int32), np.empty((0, 2), dtype=np.int32)))
+    starts = global_shapes + np.arange(worlds, dtype=np.int64) * (world_shapes + gap)
+    assignment = rng.integers(len(templates), size=worlds)
+    runs = []
+    for world, template in enumerate(assignment.tolist()):
+        if runs and runs[-1][0] == template:
+            runs[-1][1].append(int(starts[world]))
+        else:
+            runs.append((template, [int(starts[world])]))
+    global_list = set()
+    while len(global_list) < global_pairs:
+        a, b = sorted(rng.choice(global_shapes, size=2, replace=False).tolist())
+        global_list.add((a, b))
+    record = ShapePairTemplates(
+        global_pairs=np.asarray(sorted(global_list), dtype=np.int32).reshape((-1, 2)),
+        templates=tuple(templates),
+        runs=tuple((template, np.asarray(run, dtype=np.int32)) for template, run in runs),
+    )
+    return record, int(starts[-1] + world_shapes + gap) if worlds else global_shapes
+
+
+def _random_bounds(seed, shape_count, device):
+    """Quantized boxes, so bounds often touch exactly, with some NaN and empty boxes."""
+    rng = np.random.default_rng(seed)
+    center = rng.integers(-4, 5, size=(shape_count, 3)) * 0.25
+    half = rng.integers(0, 4, size=(shape_count, 3)) * 0.25
+    lower = (center - half).astype(np.float32)
+    upper = (center + half).astype(np.float32)
+    lower[3::17, 1] = np.nan
+    lower[5::19] = upper[5::19] + 1.0  # empty boxes
+    upper[7::23, 2] = -0.0
+    lower[7::23, 2] = 0.0
+    return wp.array(lower, dtype=wp.vec3, device=device), wp.array(upper, dtype=wp.vec3, device=device)
+
+
+def _random_bodies(seed, shape_count, device):
+    """Shape bodies with static (-1), dynamic and kinematic bodies."""
+    rng = np.random.default_rng(seed)
+    body_count = max(1, shape_count // 3)
+    shape_body = rng.integers(-1, body_count, size=shape_count).astype(np.int32)
+    body_flags = np.where(rng.random(body_count) < 0.4, 2, 1).astype(np.int32)
+    return wp.array(shape_body, dtype=wp.int32, device=device), wp.array(body_flags, dtype=wp.int32, device=device)
+
+
+def _launch_both(pairs, layout, lower, upper, *, capacity=None, shape_body=None, body_flags=None, include=True):
+    device = pairs.device
+    capacity = max(1, pairs.shape[0]) if capacity is None else capacity
+    flat_pairs = wp.zeros(capacity, dtype=wp.vec2i, device=device)
+    flat_count = wp.zeros(1, dtype=wp.int32, device=device)
+    BroadPhaseExplicit().launch(
+        lower,
+        upper,
+        None,
+        pairs,
+        pairs.shape[0],
+        flat_pairs,
+        flat_count,
+        shape_body=shape_body,
+        body_flags=body_flags,
+        include_static_kinematic_pairs=include,
+    )
+    template_pairs = wp.zeros(capacity, dtype=wp.vec2i, device=device)
+    template_count = wp.zeros(1, dtype=wp.int32, device=device)
+    layout.launch(
+        lower,
+        upper,
+        pairs,
+        template_pairs,
+        template_count,
+        shape_body=shape_body,
+        body_flags=body_flags,
+        include_static_kinematic_pairs=include,
+    )
+    return (
+        (flat_pairs.numpy(), int(flat_count.numpy()[0])),
+        (template_pairs.numpy(), int(template_count.numpy()[0])),
+    )
+
+
+def _sorted_codes(pairs, count, capacity):
+    written = pairs[: min(count, capacity)].astype(np.int64)
+    return np.sort(written[:, 0] << 32 | written[:, 1])
+
+
+def _assert_same_candidates(test, device, flat, template, capacity, everything=None):
+    """Equal counts and candidate sets; on CPU equal arrays. Saturated CUDA runs write distinct real hits."""
+    (flat_pairs, flat_count), (template_pairs, template_count) = flat, template
+    test.assertEqual(template_count, flat_count)
+    if device.is_cpu:
+        # Both kernels run serially in list order on CPU: the arrays match, order included.
+        np.testing.assert_array_equal(template_pairs, flat_pairs)
+    elif flat_count <= capacity:
+        np.testing.assert_array_equal(
+            _sorted_codes(template_pairs, template_count, capacity), _sorted_codes(flat_pairs, flat_count, capacity)
+        )
+    else:
+        # Which hits fill the capacity depends on scheduling in both kernels.
+        written = _sorted_codes(template_pairs, template_count, capacity)
+        test.assertEqual(np.unique(written).shape[0], capacity)
+        test.assertTrue(np.isin(written, everything).all())
+
+
+def test_synthetic_templates_match_flat_kernel(test, device):
+    """Test the same candidates as the flat kernel over random templates, runs, globals and bounds."""
+    cases = (
+        # (template specs, worlds, world shapes): small templates pack 8 worlds per block.
+        (((3, 20), (0, 9), (2, 0)), 21, 12),
+        # One large template: several warps per world, global block, tail block.
+        (((5, 300),), 7, 40),
+        # Many shapes per world with few pairs: shared memory limits worlds per block.
+        (((40, 260), (0, 120)), 9, 300),
+        # 1100 pairs per world: one 256-lane world per block, as on the largest templates.
+        (((8, 1100),), 5, 60),
+    )
+    for case, (specs, worlds, world_shapes) in enumerate(cases):
+        record, shape_count = _synthetic(
+            case, worlds=worlds, world_shapes=world_shapes, template_specs=specs, empty_template=case == 0
+        )
+        pairs = wp.array(record.replay(), dtype=wp.vec2i, device=device)
+        layout = BroadPhaseExplicitTemplates(record, device=device)
+        test.assertIsNone(layout.unsupported_reason)
+        test.assertTrue(layout.verify(pairs))
+        test.assertEqual(layout.pair_count, pairs.shape[0])
+        lower, upper = _random_bounds(100 + case, shape_count, device)
+        shape_body, body_flags = _random_bodies(200 + case, shape_count, device)
+        for include in (True, False):
+            for bodies in ((None, None), (shape_body, body_flags), (shape_body, None)):
+                with test.subTest(
+                    case=case, include=include, bodies=bodies[0] is not None, flags=bodies[1] is not None
+                ):
+                    flat, template = _launch_both(
+                        pairs, layout, lower, upper, shape_body=bodies[0], body_flags=bodies[1], include=include
+                    )
+                    test.assertGreater(flat[1], 0)
+                    _assert_same_candidates(test, device, flat, template, pairs.shape[0])
+        # Saturation: the count still reaches every hit, as in write_pair.
+        everything = _sorted_codes(*_launch_both(pairs, layout, lower, upper)[0], pairs.shape[0])
+        capacity = 5
+        with test.subTest(case=case, capacity=capacity):
+            flat, template = _launch_both(pairs, layout, lower, upper, capacity=capacity)
+            test.assertGreater(flat[1], capacity)
+            _assert_same_candidates(test, device, flat, template, capacity, everything)
+
+
+def _exact_template(pair_count, staged):
+    """One template with exactly ``pair_count`` local pairs over exactly ``staged`` shapes, two worlds."""
+    pairs = [(0, k) for k in range(1, staged)]
+    pairs += [(i, j) for i in range(1, staged) for j in range(i + 1, staged)][: pair_count - len(pairs)]
+    return ShapePairTemplates(
+        global_pairs=np.empty((0, 2), dtype=np.int32),
+        templates=((np.empty((0, 2), dtype=np.int32), np.asarray(pairs[:pair_count], dtype=np.int32)),),
+        runs=((0, np.array([0, staged], dtype=np.int32)),),
+    )
+
+
+def test_layout_shapes_launches(test, device):
+    """Choose lanes per world from the largest template and worlds per block from shared memory."""
+    expectations = (
+        (23, 12, 32, 8),  # one warp per world, eight worlds per block
+        (305, 41, 64, 4),  # two warps per world
+        (300, 300, 64, 3),  # 300 staged shapes leave shared memory for three worlds
+        (1108, 61, 256, 1),  # one 256-lane world per block, as on the largest templates
+    )
+    for pair_count, staged, threads, worlds_per_block in expectations:
+        layout = BroadPhaseExplicitTemplates(_exact_template(pair_count, staged), device=device)
+        with test.subTest(pairs=pair_count, staged=staged):
+            test.assertEqual((layout.pairs_per_world, layout.staged_shapes), (pair_count, staged))
+            test.assertEqual(layout.threads_per_world, threads)
+            test.assertEqual(layout.worlds_per_block, worlds_per_block)
+
+
+def test_verification_rejects_a_changed_list(test, device):
+    """Refuse a list whose length or any entry differs from the templates' replay."""
+    record, _ = _synthetic(7, worlds=6, world_shapes=10, template_specs=((2, 12), (1, 5)))
+    replay = record.replay()
+    layout = BroadPhaseExplicitTemplates(record, device=device)
+    test.assertTrue(layout.verify(wp.array(replay, dtype=wp.vec2i, device=device)))
+    changed = replay.copy()
+    changed[-1] = changed[-2]
+    test.assertFalse(layout.verify(wp.array(changed, dtype=wp.vec2i, device=device)))
+    test.assertFalse(layout.verify(wp.array(replay[:-1], dtype=wp.vec2i, device=device)))
+    swapped = replay.copy()
+    row = record.global_pairs.shape[0] + 1
+    swapped[row] = swapped[row, ::-1]
+    test.assertFalse(layout.verify(wp.array(swapped, dtype=wp.vec2i, device=device)))
 
 
 def _robot(variant=0):
@@ -146,6 +381,46 @@ class TestShapePairTemplateRecord(unittest.TestCase):
         expected = [[0, 7], [0, 3], [1, 7], [1, 2], [2, 3], [0, 6], [4, 7], [4, 5], [5, 6]]
         self.assertEqual(replay.tolist(), expected)
         self.assertEqual(replay.dtype, np.int32)
+
+
+class TestBroadPhaseTemplateRule(unittest.TestCase):
+    def _single(self, pairs_per_world, worlds, staged=None):
+        staged = pairs_per_world + 1 if staged is None else staged
+        local = np.stack((np.zeros(pairs_per_world), 1 + np.arange(pairs_per_world) % (staged - 1)), axis=1)
+        record = ShapePairTemplates(
+            global_pairs=np.empty((0, 2), dtype=np.int32),
+            templates=((np.empty((0, 2), dtype=np.int32), local.astype(np.int32)),),
+            runs=((0, (np.arange(worlds) * staged).astype(np.int32)),),
+        )
+        return BroadPhaseExplicitTemplates(record, device="cpu")
+
+    def test_automatic_rule_admits_large_templates(self):
+        """Admit automatically only at 2**20 pairs or more and 64 or more pairs per world."""
+        self.assertTrue(self._single(64, 16384).automatic)
+        self.assertFalse(self._single(63, 16645).automatic)
+        self.assertFalse(self._single(64, 16383).automatic)
+        self.assertEqual(self._single(64, 16384).pair_count, 1 << 20)
+
+    def test_staging_capacity_bounds_admission(self):
+        """Refuse templates referencing more shapes than a world can stage."""
+        self.assertIsNone(self._single(1023, 2).unsupported_reason)
+        too_many = self._single(1024, 2)
+        self.assertIn("1025 shapes", too_many.unsupported_reason)
+        self.assertFalse(too_many.automatic)
+        self.assertFalse(too_many.verify(wp.zeros(too_many.pair_count, dtype=wp.vec2i, device="cpu")))
+
+
+class TestBroadPhaseTemplates(unittest.TestCase):
+    pass
+
+
+devices = get_test_devices(mode="basic")
+for _name, _function in (
+    ("test_synthetic_templates_match_flat_kernel", test_synthetic_templates_match_flat_kernel),
+    ("test_layout_shapes_launches", test_layout_shapes_launches),
+    ("test_verification_rejects_a_changed_list", test_verification_rejects_a_changed_list),
+):
+    add_function_test(TestBroadPhaseTemplates, _name, _function, devices=devices)
 
 
 if __name__ == "__main__":

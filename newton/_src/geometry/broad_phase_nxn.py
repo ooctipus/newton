@@ -12,6 +12,8 @@ See Also:
 
 from __future__ import annotations
 
+import functools
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
@@ -20,6 +22,7 @@ import warp as wp
 
 from ..core.types import Devicelike
 from .broad_phase_common import (
+    BODY_FLAG_KINEMATIC,
     check_aabb_overlap_moving,
     is_pair_excluded,
     is_shape_pair_immovable_filtered,
@@ -70,6 +73,285 @@ def _nxn_broadphase_precomputed_pairs(
             candidate_pair_count,
             max_candidate_pair,
         )
+
+
+@wp.struct
+class _PairTemplateData:
+    # Global-global pairs: they lead the explicit list and are read from it.
+    global_count: int
+    # First shape of each world with template pairs (a "slot"), in explicit-list order.
+    slot_shape_start: wp.array[int]
+    # Template index of each slot.
+    slot_template: wp.array[int]
+    # Start of each template's staged shapes in ``stage``, shape [template_count + 1].
+    template_stage_start: wp.array[int]
+    # Start of each template's entries in ``entries``, shape [template_count + 1].
+    template_entry_start: wp.array[int]
+    # Staged shapes per template: a world-local id, or ``-(global id + 1)``.
+    stage: wp.array[int]
+    # Pairs of staged-shape indices, packed ``a | (b << 16)``, in explicit-list order.
+    entries: wp.array[int]
+
+
+def _immovable(shape: str) -> str:
+    """C++ for ``is_shape_pair_immovable_filtered``'s per-shape test (static, or kinematic when flags exist)."""
+    return (
+        f"(shape_body.data[{shape}] < 0 || (body_flags.shape[0] > 0 && "
+        f"(body_flags.data[shape_body.data[{shape}]] & {int(BODY_FLAG_KINEMATIC)}) != 0))"
+    )
+
+
+# The global-global pairs of block 0 (when there are any), tested from the explicit list itself.
+_TEMPLATE_GLOBAL = f"""
+    if (data.global_count > 0 && block == 0) {{
+        for (int i0 = 0; i0 < data.global_count; i0 += STEP) {{
+            const int i = i0 + LANE;
+            bool hit = false;
+            int a = 0, b = 0;
+            if (i < data.global_count) {{
+                const wp::vec2i pair = pairs.data[i];
+                a = pair[0];
+                b = pair[1];
+                const wp::vec3 la = lower.data[a];
+                const wp::vec3 ua = upper.data[a];
+                const wp::vec3 lb = lower.data[b];
+                const wp::vec3 ub = upper.data[b];
+                hit = la[0] <= ub[0] && ua[0] >= lb[0] && la[1] <= ub[1] && ua[1] >= lb[1] && la[2] <= ub[2]
+                    && ua[2] >= lb[2];
+                if (hit && immovable_filter) hit = !({_immovable("a")} && {_immovable("b")});
+            }}
+APPEND
+        }}
+        return;
+    }}
+    const int world_block = block - (data.global_count > 0 ? 1 : 0);
+"""
+
+# One world group: its slot, template and the base of its shared segment.
+_TEMPLATE_WORLD = """
+        const int slot = world_block * WORLDS + group;
+        int start = 0, stage_begin = 0, stage_count = 0, entry_begin = 0, entry_count = 0;
+        if (slot < data.slot_shape_start.shape[0]) {
+            const int t = data.slot_template.data[slot];
+            start = data.slot_shape_start.data[slot];
+            stage_begin = data.template_stage_start.data[t];
+            stage_count = data.template_stage_start.data[t + 1] - stage_begin;
+            entry_begin = data.template_entry_start.data[t];
+            entry_count = data.template_entry_start.data[t + 1] - entry_begin;
+        }
+        const int base = group * SLOTS;
+"""
+
+# Stage the world's referenced AABBs, shape ids and immovable flags once.
+_TEMPLATE_STAGE = f"""
+        for (int i = LANE; i < stage_count; i += STEP) {{
+            const int code = data.stage.data[stage_begin + i];
+            const int shape = code >= 0 ? start + code : -code - 1;
+            const wp::vec3 lo = lower.data[shape];
+            const wp::vec3 hi = upper.data[shape];
+            s_lx[base + i] = lo[0];
+            s_ly[base + i] = lo[1];
+            s_lz[base + i] = lo[2];
+            s_ux[base + i] = hi[0];
+            s_uy[base + i] = hi[1];
+            s_uz[base + i] = hi[2];
+            s_shape[base + i] = shape;
+            s_fixed[base + i] = immovable_filter && {_immovable("shape")};
+        }}
+"""
+
+# Test the template's entries in explicit-list order. The overlap test is
+# check_aabb_overlap's with zero gaps (x + 0 compares like x) and is symmetric
+# in its two boxes; the pair is written as (min, max), as the list stores it.
+_TEMPLATE_TEST = """
+        for (int e0 = 0; e0 < entry_count; e0 += STEP) {
+            const int e = e0 + LANE;
+            bool hit = false;
+            int a = 0, b = 0;
+            if (e < entry_count) {
+                const unsigned int packed = (unsigned int)data.entries.data[entry_begin + e];
+                const int ia = base + (int)(packed & 0xffffu);
+                const int ib = base + (int)(packed >> 16);
+                hit = s_lx[ia] <= s_ux[ib] && s_ux[ia] >= s_lx[ib] && s_ly[ia] <= s_uy[ib] && s_uy[ia] >= s_ly[ib]
+                    && s_lz[ia] <= s_uz[ib] && s_uz[ia] >= s_lz[ib];
+                if (hit && immovable_filter) hit = !(s_fixed[ia] && s_fixed[ib]);
+                if (hit) {
+                    a = s_shape[ia];
+                    b = s_shape[ib];
+                    if (a > b) {
+                        const int swap = a;
+                        a = b;
+                        b = swap;
+                    }
+                }
+            }
+APPEND
+        }
+"""
+
+# write_pair's contract with one atomic per warp: the count advances by every
+# hit, and only indices below the capacity are written. Loops around it are
+# warp-uniform (a world group is whole warps; block 0 strides by the block).
+_TEMPLATE_APPEND_CUDA = """
+            {
+                const unsigned int mask = __ballot_sync(0xffffffffu, hit);
+                if (mask != 0u) {
+                    const int warp_lane = thread & 31;
+                    const int leader = __ffs(mask) - 1;
+                    int first = 0;
+                    if (warp_lane == leader) first = atomicAdd(candidate_pair_count.data, __popc(mask));
+                    first = __shfl_sync(0xffffffffu, first, leader);
+                    if (hit) {
+                        const int index = first + __popc(mask & ((1u << warp_lane) - 1u));
+                        if (index < max_candidate_pair) candidate_pair.data[index] = wp::vec2i(a, b);
+                    }
+                }
+            }
+"""
+
+_TEMPLATE_APPEND_CPU = """
+            if (hit) {
+                const int index = candidate_pair_count.data[0]++;
+                if (index < max_candidate_pair) candidate_pair.data[index] = wp::vec2i(a, b);
+            }
+"""
+
+
+def _pair_template_source(slots: int, threads: int, worlds: int) -> str:
+    """CUDA and CPU source of the world-template kernel.
+
+    CUDA runs ``worlds`` world groups of ``threads`` lanes per block; CPU runs
+    the block's groups, and every loop in them, serially in explicit-list order.
+    """
+
+    def fill(text: str, lane: str, step: str, append: str) -> str:
+        return text.replace("LANE", lane).replace("STEP", step).replace("APPEND", append)
+
+    def arrays(qualifier: str) -> str:
+        capacity = slots * worlds
+        names = ("s_lx", "s_ly", "s_lz", "s_ux", "s_uy", "s_uz")
+        lines = [f"    {qualifier}float {name}[{capacity}];" for name in names]
+        lines += [f"    {qualifier}int s_shape[{capacity}];", f"    {qualifier}int s_fixed[{capacity}];"]
+        return "\n".join(lines) + "\n"
+
+    world = _TEMPLATE_WORLD.replace("WORLDS", str(worlds)).replace("SLOTS", str(slots))
+    return (
+        "#if defined(__CUDA_ARCH__)\n"
+        + arrays("__shared__ ")
+        + "    const int thread = threadIdx.x;\n"
+        + fill(_TEMPLATE_GLOBAL, "thread", "(int)blockDim.x", _TEMPLATE_APPEND_CUDA)
+        + f"    const int group = thread / {threads};\n"
+        + f"    const int lane = thread - group * {threads};\n"
+        + "    {\n"
+        + world
+        + fill(_TEMPLATE_STAGE, "lane", str(threads), "")
+        + "        __syncthreads();\n"
+        + fill(_TEMPLATE_TEST, "lane", str(threads), _TEMPLATE_APPEND_CUDA)
+        + "    }\n"
+        + "#else\n"
+        + "    if (logical_lane != 0) return;\n"
+        + arrays("")
+        + fill(_TEMPLATE_GLOBAL, "0", "1", _TEMPLATE_APPEND_CPU)
+        + f"    for (int group = 0; group < {worlds}; ++group) {{\n"
+        + world
+        + fill(_TEMPLATE_STAGE, "0", "1", "")
+        + fill(_TEMPLATE_TEST, "0", "1", _TEMPLATE_APPEND_CPU)
+        + "    }\n"
+        + "#endif\n"
+    )
+
+
+@functools.cache
+def _pair_template_kernel(slots: int, threads: int, worlds: int):
+    """World-template broad-phase kernel; launch tiled with ``block_dim = threads * worlds``.
+
+    Args:
+        slots: Staged shapes per world group (shared-memory capacity).
+        threads: Lanes per world group, a multiple of 32 so every warp serves one world.
+        worlds: World groups per block.
+    """
+
+    @wp.func_native(_pair_template_source(slots, threads, worlds))
+    def test_templates(
+        block: int,
+        logical_lane: int,
+        lower: wp.array[wp.vec3],
+        upper: wp.array[wp.vec3],
+        pairs: wp.array[wp.vec2i],
+        data: _PairTemplateData,
+        shape_body: wp.array[int],
+        body_flags: wp.array[int],
+        immovable_filter: bool,
+        candidate_pair: wp.array[wp.vec2i],
+        candidate_pair_count: wp.array[int],
+        max_candidate_pair: int,
+    ): ...
+
+    def kernel(
+        lower: wp.array[wp.vec3],
+        upper: wp.array[wp.vec3],
+        pairs: wp.array[wp.vec2i],
+        data: _PairTemplateData,
+        shape_body: wp.array[int],
+        body_flags: wp.array[int],
+        include_static_kinematic_pairs: bool,
+        candidate_pair: wp.array[wp.vec2i],
+        candidate_pair_count: wp.array[int],
+        max_candidate_pair: int,
+    ):
+        block, lane = wp.tid()
+        # is_shape_pair_immovable_filtered: no filtering without shape metadata.
+        immovable_filter = (not include_static_kinematic_pairs) and shape_body.shape[0] > 0
+        test_templates(
+            block,
+            lane,
+            lower,
+            upper,
+            pairs,
+            data,
+            shape_body,
+            body_flags,
+            immovable_filter,
+            candidate_pair,
+            candidate_pair_count,
+            max_candidate_pair,
+        )
+
+    kernel.__name__ = kernel.__qualname__ = f"broad_phase_pair_templates_{slots}_{threads}_{worlds}"
+    return wp.kernel(enable_backward=False, module="unique")(kernel)
+
+
+@wp.kernel(enable_backward=False)
+def _verify_pair_templates(
+    data: _PairTemplateData,
+    slot_pair_start: wp.array[int],
+    pairs: wp.array[wp.vec2i],
+    stride: int,
+    mismatch: wp.array[int],
+):
+    """Count template entries whose decoded pair differs from the explicit list at its position."""
+    slot, lane = wp.tid()
+    template = data.slot_template[slot]
+    start = data.slot_shape_start[slot]
+    stage_begin = data.template_stage_start[template]
+    entry_begin = data.template_entry_start[template]
+    entry_count = data.template_entry_start[template + 1] - entry_begin
+    offset = slot_pair_start[slot]
+    entry = lane
+    while entry < entry_count:
+        packed = data.entries[entry_begin + entry]
+        code_a = data.stage[stage_begin + (packed & 0xFFFF)]
+        code_b = data.stage[stage_begin + (packed >> 16)]
+        shape_a = start + code_a
+        if code_a < 0:
+            shape_a = -code_a - 1
+        shape_b = start + code_b
+        if code_b < 0:
+            shape_b = -code_b - 1
+        pair = pairs[offset + entry]
+        if wp.min(shape_a, shape_b) != pair[0] or wp.max(shape_a, shape_b) != pair[1]:
+            wp.atomic_add(mismatch, 0, 1)
+        entry += stride
 
 
 @wp.func
@@ -629,4 +911,255 @@ class ShapePairTemplates:
             and str(pairs.device) == self.pairs_device
             and int(pairs.ptr or 0) == self.pairs_ptr
             and int(pairs.shape[0]) == self.pair_count
+        )
+
+
+def _next_power_of_two(value: int) -> int:
+    return 1 << max(0, int(value) - 1).bit_length()
+
+
+def _template_layout(global_local: np.ndarray, local: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Stage list and packed entries of one template, entries in replay order.
+
+    The stage list holds the referenced world-local ids, ascending, then the
+    referenced global ids encoded as ``-(id + 1)``. An entry packs the stage
+    indices of its two shapes as ``a | (b << 16)``.
+    """
+    local_ids = np.unique(np.concatenate((global_local[:, 1], local.reshape(-1)))).astype(np.int64)
+    global_ids = np.unique(global_local[:, 0]).astype(np.int64)
+    stage = np.concatenate((local_ids, -global_ids - 1)).astype(np.int32)
+    if stage.shape[0] > 1 << 16:
+        return stage, np.empty(0, dtype=np.int32)
+    first = np.concatenate(
+        (local_ids.shape[0] + np.searchsorted(global_ids, global_local[:, 0]), np.searchsorted(local_ids, local[:, 0]))
+    )
+    second = np.concatenate((np.searchsorted(local_ids, global_local[:, 1]), np.searchsorted(local_ids, local[:, 1])))
+    return stage, (first | (second << 16)).astype(np.int32)
+
+
+class BroadPhaseExplicitTemplates:
+    """Explicit broad phase over per-world pair templates instead of the flat pair list.
+
+    Each world stages the AABBs its template references once (in shared memory on
+    CUDA) and tests the template's entries against them, so the explicit list is
+    not streamed. Built from :class:`ShapePairTemplates` and verified against the
+    list they replay into, it tests exactly that list's pairs with the overlap and
+    immovable-pair rules of :class:`BroadPhaseExplicit` and writes them as the list
+    stores them. Only the order of the output differs on CUDA, where it is set by
+    atomics in both kernels; on CPU the output equals :class:`BroadPhaseExplicit`'s.
+    AABBs must be pre-expanded: per-shape gaps and speculative displacement are not
+    supported.
+    """
+
+    AUTO_MIN_PAIRS = 1 << 20
+    """Pairs below which automatic selection keeps the flat kernel (the stream it saves is small)."""
+    AUTO_MIN_PAIRS_PER_WORLD = 64
+    """Mean pairs per world below which automatic selection keeps the flat kernel."""
+    MAX_STAGED_SHAPES = 1024
+    """Most shapes a world's template may reference."""
+    _SHARED_BYTES = 32 * 1024
+    _STAGED_SHAPE_BYTES = 32  # six bounds, the shape id and the immovable flag
+
+    def __init__(self, templates: ShapePairTemplates, *, device: Devicelike = None):
+        """Lay the templates out for the device.
+
+        Args:
+            templates: Templates of the explicit pair list this broad phase replaces.
+            device: Device of the explicit pair list and of the AABBs.
+        """
+        self.device = wp.get_device(device)
+        self.global_count = int(templates.global_pairs.shape[0])
+        stages: list[np.ndarray] = []
+        entries: list[np.ndarray] = []
+        compact: dict[int, int] = {}
+        slot_starts: list[np.ndarray] = []
+        slot_templates: list[np.ndarray] = []
+        slot_counts: list[np.ndarray] = []
+        for template, starts in templates.runs:
+            global_local, local = templates.templates[template]
+            entry_count = int(global_local.shape[0] + local.shape[0])
+            if entry_count == 0:
+                continue
+            index = compact.get(template)
+            if index is None:
+                index = compact[template] = len(stages)
+                stage, packed = _template_layout(global_local, local)
+                stages.append(stage)
+                entries.append(packed)
+            world_starts = np.asarray(starts, dtype=np.int32)
+            slot_starts.append(world_starts)
+            slot_templates.append(np.full(world_starts.shape[0], index, dtype=np.int32))
+            slot_counts.append(np.full(world_starts.shape[0], entry_count, dtype=np.int64))
+
+        def joined(parts: list[np.ndarray], dtype) -> np.ndarray:
+            return np.concatenate(parts).astype(dtype) if parts else np.empty(0, dtype=dtype)
+
+        counts = joined(slot_counts, np.int64)
+        self.template_count = len(stages)
+        self.slot_count = int(counts.shape[0])
+        self.pair_count = self.global_count + int(counts.sum())
+        self.pairs_per_world = max((packed.shape[0] for packed in entries), default=0)
+        self.mean_pairs_per_world = float(counts.mean()) if counts.shape[0] else 0.0
+        self.staged_shapes = max((stage.shape[0] for stage in stages), default=0)
+        self.threads_per_world = min(256, max(32, _next_power_of_two(math.ceil(self.pairs_per_world / 8))))
+        self.staged_capacity = max(32, -(-self.staged_shapes // 32) * 32)
+        self.worlds_per_block = max(
+            1,
+            min(256 // self.threads_per_world, self._SHARED_BYTES // (self.staged_capacity * self._STAGED_SHAPE_BYTES)),
+        )
+        self.unsupported_reason = None
+        self.data = None
+        if self.staged_shapes > self.MAX_STAGED_SHAPES:
+            self.unsupported_reason = (
+                f"A world template references {self.staged_shapes} shapes; the template kernel stages at most "
+                f"{self.MAX_STAGED_SHAPES}."
+            )
+            return
+        if self.pair_count >= 1 << 31:
+            self.unsupported_reason = "The explicit pair list exceeds 32-bit indexing."
+            return
+
+        stage_start = np.zeros(len(stages) + 1, dtype=np.int64)
+        stage_start[1:] = np.cumsum([stage.shape[0] for stage in stages])
+        entry_start = np.zeros(len(entries) + 1, dtype=np.int64)
+        entry_start[1:] = np.cumsum([packed.shape[0] for packed in entries])
+        slot_pair_start = np.zeros(self.slot_count, dtype=np.int64)
+        slot_pair_start[1:] = np.cumsum(counts)[:-1]
+        # Host layout; uploaded on first use, so a pipeline that keeps the flat kernel allocates nothing.
+        self._host = {
+            "slot_shape_start": joined(slot_starts, np.int32),
+            "slot_template": joined(slot_templates, np.int32),
+            "template_stage_start": stage_start.astype(np.int32),
+            "template_entry_start": entry_start.astype(np.int32),
+            "stage": joined(stages, np.int32),
+            "entries": joined(entries, np.int32),
+            "slot_pair_start": (self.global_count + slot_pair_start).astype(np.int32),
+        }
+
+    def _upload(self) -> None:
+        """Upload the layout and bind the kernel for this launch shape, once."""
+        if self.data is not None:
+            return
+
+        def device_array(name: str) -> wp.array[int]:
+            return wp.array(self._host[name], dtype=wp.int32, device=self.device)
+
+        data = _PairTemplateData()
+        data.global_count = self.global_count
+        for name in (
+            "slot_shape_start",
+            "slot_template",
+            "template_stage_start",
+            "template_entry_start",
+            "stage",
+            "entries",
+        ):
+            setattr(data, name, device_array(name))
+        self._slot_pair_start = device_array("slot_pair_start")
+        self._empty = wp.empty(0, dtype=wp.int32, device=self.device)
+        self._kernel = _pair_template_kernel(self.staged_capacity, self.threads_per_world, self.worlds_per_block)
+        self.data = data
+
+    @property
+    def automatic(self) -> bool:
+        """Whether automatic selection uses these templates: enough pairs, and enough per world."""
+        return (
+            self.unsupported_reason is None
+            and self.pair_count >= self.AUTO_MIN_PAIRS
+            and self.mean_pairs_per_world >= self.AUTO_MIN_PAIRS_PER_WORLD
+        )
+
+    def describe(self) -> dict:
+        """Host-only, JSON-compliant summary of the layout and launch shape."""
+        return {
+            "templates": self.template_count,
+            "worlds": self.slot_count,
+            "global_pairs": self.global_count,
+            "pairs": self.pair_count,
+            "pairs_per_world": self.pairs_per_world,
+            "staged_shapes": self.staged_shapes,
+            "threads_per_world": self.threads_per_world,
+            "worlds_per_block": self.worlds_per_block,
+        }
+
+    def verify(self, pairs: wp.array[wp.vec2i]) -> bool:
+        """Return whether the templates enumerate ``pairs`` exactly, position by position.
+
+        Global-global pairs are read from ``pairs`` itself; every template entry is
+        decoded on the device and compared with the pair at its position. Launches
+        and synchronizes, so call it at construction, outside graph capture.
+        """
+        if (
+            self.unsupported_reason is not None
+            or not isinstance(pairs, wp.array)
+            or pairs.dtype != wp.vec2i
+            or pairs.ndim != 1
+            or not pairs.is_contiguous
+            or str(pairs.device) != str(self.device)
+            or pairs.shape[0] != self.pair_count
+        ):
+            return False
+        if self.slot_count == 0:
+            return True
+        self._upload()
+        mismatch = wp.zeros(1, dtype=wp.int32, device=self.device)
+        wp.launch_tiled(
+            _verify_pair_templates,
+            dim=[self.slot_count],
+            inputs=[self.data, self._slot_pair_start, pairs, 1 if self.device.is_cpu else 256, mismatch],
+            block_dim=256,
+            device=self.device,
+        )
+        return int(mismatch.numpy()[0]) == 0
+
+    def launch(
+        self,
+        shape_lower: wp.array[wp.vec3],
+        shape_upper: wp.array[wp.vec3],
+        shape_pairs: wp.array[wp.vec2i],
+        candidate_pair: wp.array[wp.vec2i],
+        candidate_pair_count: wp.array[int],
+        *,
+        shape_body: wp.array[int] | None = None,
+        body_flags: wp.array[int] | None = None,
+        include_static_kinematic_pairs: bool = True,
+    ) -> None:
+        """Test the templates against pre-expanded AABBs.
+
+        The caller zeroes ``candidate_pair_count``, as with ``skip_count_zero=True``.
+
+        Args:
+            shape_lower: Lower AABB bounds, expanded by the effective gaps, shape [shape_count].
+            shape_upper: Upper AABB bounds, expanded by the effective gaps, shape [shape_count].
+            shape_pairs: The explicit pair list these templates were verified against.
+            candidate_pair: Output pairs; its length is the capacity.
+            candidate_pair_count: Number of overlapping pairs found, shape [1].
+            shape_body: Body of each shape; omitting it disables immovable-pair filtering.
+            body_flags: Body flags used to identify kinematic bodies.
+            include_static_kinematic_pairs: Whether to keep pairs whose shapes are both immovable.
+        """
+        if self.unsupported_reason is not None:
+            raise ValueError(self.unsupported_reason)
+        blocks = (1 if self.global_count else 0) + -(-self.slot_count // self.worlds_per_block)
+        if blocks == 0:
+            return
+        self._upload()
+        wp.launch_tiled(
+            self._kernel,
+            dim=[blocks],
+            inputs=[
+                shape_lower,
+                shape_upper,
+                shape_pairs,
+                self.data,
+                self._empty if shape_body is None else shape_body,
+                self._empty if body_flags is None else body_flags,
+                include_static_kinematic_pairs,
+                candidate_pair,
+                candidate_pair_count,
+                candidate_pair.shape[0],
+            ],
+            block_dim=self.threads_per_world * self.worlds_per_block,
+            device=self.device,
+            record_tape=False,
         )
