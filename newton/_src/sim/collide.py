@@ -3489,7 +3489,10 @@ class CollisionPipeline:
             possible = int(np.count_nonzero(reachable & self._colliding_shapes)) > 1
         else:
             pairs = (pairs.numpy() if hasattr(pairs, "numpy") else np.asarray(pairs)).reshape(-1, 2)
-            self._immobile_pair_candidates = pairs[reachable[pairs[:, 0]] & reachable[pairs[:, 1]]]
+            # Bound temporary gathers independently of the replicated world count.
+            blocks = (pairs[begin : begin + 65536] for begin in range(0, len(pairs), 65536))
+            candidates = [block[reachable[block[:, 0]] & reachable[block[:, 1]]] for block in blocks]
+            self._immobile_pair_candidates = np.concatenate(candidates) if candidates else pairs[:0]
             possible = len(self._immobile_pair_candidates) > 0
         if requested and possible:
             self._immobile_shape_body = wp.zeros(len(topology.shape_body), dtype=wp.int32, device=self.device)
