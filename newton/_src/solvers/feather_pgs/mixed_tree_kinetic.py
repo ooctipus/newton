@@ -581,7 +581,12 @@ class MixedTreeKineticState:
         if scalar is not None:
             from .scalar_branches import ScalarBranchState  # noqa: PLC0415
 
-            self.scalar = ScalarBranchState(solver, scalar, admission=admission)
+            # A tree group's proof holds the model topology, the joint axes and
+            # art_to_world and watches the joint frames, and the coverage proof every
+            # size's group map: beside one, the scalar group's own proof would add a
+            # launch and a readback to each notification for nothing.
+            proven = any(isinstance(group, TreeKineticState) for group in self.groups)
+            self.scalar = ScalarBranchState(solver, scalar, admission=admission, prove=not proven)
             self.groups.append(self.scalar)
         # The existing solver lifecycle delegates factor refresh to this binding.
         self.sparse = self

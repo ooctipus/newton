@@ -22,6 +22,7 @@ import newton
 from newton._src.solvers.feather_pgs import kernels as fk
 from newton._src.solvers.feather_pgs import scalar_branches as sb
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
+from newton._src.solvers.feather_pgs.device_proof import DeviceProof
 from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
 from newton._src.solvers.feather_pgs.prismatic_linear_state import (
     finalize_prismatic_linear_state,
@@ -1018,6 +1019,37 @@ class TestScalarBranchRule(unittest.TestCase):
             forced = MixedTreeKineticState(solver)
         self.assertIn("Scalar branches own", forced.forest_reason)
         self.assertEqual(len(forced.groups), 2)
+
+    def test_owner_proves_the_scalar_topology_through_its_tree_groups(self):
+        """Validate a notification with the owner's and the arm group's proofs alone, and still refuse new topology.
+
+        The arm group's proof holds the model topology and art_to_world and
+        watches every joint frame, and the owner's coverage proof every size's
+        group map, so beside them the scalar group adds no proof (one launch and
+        one readback per notification) of its own: a moved key root is reported
+        through the arm group's proof, so the solver invalidates every cache. A
+        scalar group built alone keeps its proof.
+        """
+        joint = newton.ModelFlags.JOINT_PROPERTIES
+        model = build_branch_model(worlds=2)
+        solver = cpu_solver(model, 7)
+        solver._scalar_branches, _reason = sb.plan_scalar_branches(solver, requested=True)
+        owner = MixedTreeKineticState(solver)
+        validate = DeviceProof.validate
+        with mock.patch.object(DeviceProof, "validate", autospec=True, side_effect=validate) as proofs:
+            self.assertTrue(owner.validate_model(joint))
+        self.assertEqual(proofs.call_count, 2)
+        self.assertIsNotNone(sb.ScalarBranchState(solver, solver._scalar_branches)._proof)
+        frames = model.joint_X_p.numpy()
+        frames[model.articulation_start.numpy()[owner.scalar.group_to_art.numpy()[1]], 2] += 0.01
+        model.joint_X_p.assign(frames)
+        self.assertFalse(owner.validate_model(joint))
+        self.assertTrue(owner.validate_model(joint))
+        parents = model.joint_parent.numpy()
+        parents[model.articulation_start.numpy()[owner.scalar.group_to_art.numpy()[0]] + 2] = -1
+        model.joint_parent.assign(parents)
+        with self.assertRaisesRegex(RuntimeError, "joint_parent changed"):
+            owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES)
 
     def test_cpu_route_record_reports_the_rule(self):
         """Report scalar branches as off on CPU, where no diagonal-mass group shares a sparse-diagonal response."""

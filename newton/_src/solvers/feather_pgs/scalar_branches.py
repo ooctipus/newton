@@ -781,7 +781,8 @@ class ScalarBranchState:
     # Every repair launches: one warp per articulation exits on a valid cache.
     skip_captured_repairs = False
 
-    def __init__(self, solver, plan: ScalarBranchPlan, *, admission=None):
+    def __init__(self, solver, plan: ScalarBranchPlan, *, admission=None, prove=True):
+        """Bind the group's kernels; ``prove=False`` leaves the topology proof to an owner that holds it."""
         self.solver = solver
         self.plan = plan
         self.size = plan.size
@@ -803,11 +804,15 @@ class ScalarBranchState:
         others = np.setdiff1d(np.arange(model.joint_dof_count, dtype=np.int32), plan.dofs).astype(np.int32)
         self.other_drive_dofs = wp.array(others, dtype=int, device=device) if others.size else None
         self._plan_dimensions = self._dimensions()
-        self._proof = DeviceProof(
-            [(name, getattr(model, name)) for name in (*_TOPOLOGY_FIELDS, *_LIVE_FIELDS)]
-            + [("group_to_art", self.group_to_art), ("art_to_world", solver.art_to_world)],
-            device,
-            watched=_LIVE_FIELDS,
+        self._proof = (
+            DeviceProof(
+                [(name, getattr(model, name)) for name in (*_TOPOLOGY_FIELDS, *_LIVE_FIELDS)]
+                + [("group_to_art", self.group_to_art), ("art_to_world", solver.art_to_world)],
+                device,
+                watched=_LIVE_FIELDS,
+            )
+            if prove
+            else None
         )
 
     def _dimensions(self):
@@ -873,18 +878,23 @@ class ScalarBranchState:
         outright. Other notifications (Isaac Lab re-poses fixed roots through
         ``joint_X_p`` with ``JOINT_PROPERTIES`` on resets) compare the frozen
         topology arrays on the device with one small readback, which also
-        watches the joint frames and axes.
+        watches the joint frames and axes, unless the owning held-tree owner's
+        proofs already hold them.
 
         Returns:
             Whether the proof ran and found the topology, frames and axes
             unchanged (see :meth:`TreeKineticState.validate_model`); ``False``
             after a moved frame or axis, which the caller invalidates, and for
-            numeric notifications, which skip the proof.
+            numeric notifications, which skip the proof. Without a proof of its
+            own, ``True``: the owner's tree groups prove the same model arrays,
+            and the owner keeps the caches only when every proof passes.
         """
         if flags is not None and int(flags) != 0 and int(flags) & ~_NUMERIC_FLAGS == 0:
             return False
         if self._dimensions() != self._plan_dimensions:
             raise RuntimeError("Scalar branch dimensions changed; reconstruct and recapture")
+        if self._proof is None:
+            return True
 
         def current(label):
             if label == "group_to_art":
