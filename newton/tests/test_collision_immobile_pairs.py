@@ -16,10 +16,14 @@ import newton
 from newton import BodyFlags, ModelFlags
 from newton._src.geometry.broad_phase_nxn import BroadPhaseAllPairs, BroadPhaseExplicit
 from newton._src.geometry.broad_phase_sap import BroadPhaseSAP
-from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
+from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 _FLAG = "NEWTON_BROAD_PHASE_IMMOBILE_FILTER"
 _MODES = ("explicit", "nxn", "sap")
+# Every broad-phase launch the pipeline can select, as a mode and the environment selecting it.
+# NEWTON_BROAD_PHASE_TEMPLATES=1 selects a world-template kernel for explicit pairs where one
+# exists, which must apply the filter as well; elsewhere the variable is recorded as unknown.
+_LAUNCHES = (("explicit", {}), ("explicit", {"NEWTON_BROAD_PHASE_TEMPLATES": "1"}), ("nxn", {}), ("sap", {}))
 _WORLDS = 2
 # Roles whose shapes cannot move: static, welded to the world, or welded through a fixed chain.
 _IMMOBILE = frozenset(("ground", "table", "base", "mount", "post"))
@@ -160,8 +164,8 @@ def test_broad_phases_drop_only_immobile_pairs(test, device):
     """Drop exactly the pairs of two static or welded shapes in every broad phase, by default."""
     model, worlds = _pair_scene(device)
     role = _role_of(worlds)
-    for mode in _MODES:
-        with test.subTest(broad_phase=mode):
+    for mode, environment in _LAUNCHES:
+        with test.subTest(broad_phase=mode, **environment), patch.dict(os.environ, environment):
             kept, _ = _candidate_pairs(_pipeline(model, broad_phase=mode), model)
             unfiltered, _ = _candidate_pairs(_pipeline(model, "0", broad_phase=mode), model)
             immobile = [pair for pair in unfiltered if role[pair[0]] in _IMMOBILE and role[pair[1]] in _IMMOBILE]
@@ -262,7 +266,7 @@ def test_static_kinematic_composition_ignores_unrelated_pairs(test, device):
 
 
 def test_record_reports_excluded_pairs(test, device):
-    """Report the choice, its source and the welded bodies, immobile shapes and excluded pairs."""
+    """Report the choice, its source and the welded bodies, immobile shapes and excluded pairs, as launched."""
     model, worlds = _pair_scene(device)
     role = _role_of(worlds)
     # Base, mount and post of each world are welded; the ground and every table are static.
@@ -271,7 +275,7 @@ def test_record_reports_excluded_pairs(test, device):
     listed = model.shape_contact_pairs.numpy().tolist()
     pairs = sum(role.get(a) in _IMMOBILE and role.get(b) in _IMMOBILE for a, b in listed)
     test.assertGreater(pairs, 4 * _WORLDS)
-    for mode in _MODES:
+    for mode, environment in _LAUNCHES:
         for flag, argument, source, enabled, reason in (
             (None, None, "default", True, "Default: "),
             ("1", None, "environment", True, f"{_FLAG}=1: "),
@@ -279,8 +283,15 @@ def test_record_reports_excluded_pairs(test, device):
             ("0", False, "argument", True, "include_immobile_pairs=False: "),
             (None, True, "argument", False, "Off: include_immobile_pairs=True "),
         ):
-            with test.subTest(broad_phase=mode, flag=flag, argument=argument), _flag(flag):
+            subtest = test.subTest(broad_phase=mode, flag=flag, argument=argument, **environment)
+            with subtest, patch.dict(os.environ, environment), _flag(flag):
                 pipeline = newton.CollisionPipeline(model, broad_phase=mode, include_immobile_pairs=argument)
+                # The launch agrees with the record: overlapping immobile pairs reach it only when off.
+                candidates, _ = _candidate_pairs(pipeline, model)
+                joined = [
+                    pair for pair in candidates if role.get(pair[0]) in _IMMOBILE and role.get(pair[1]) in _IMMOBILE
+                ]
+                test.assertEqual(not joined, enabled)
                 record = pipeline.get_collision_selection()["immobile_pairs"]
                 test.assertEqual(
                     {key: value for key, value in record.items() if key != "reason"},
@@ -329,7 +340,7 @@ def test_models_without_immobile_pairs_keep_unfiltered_arguments(test, device):
     builder.add_articulation([builder.add_joint_fixed(-1, base, parent_xform=_pose(0.0, 0.0))])
     _box(builder, builder.add_body(xform=_pose(0.3, 0.0), label="free"), 0.3, 0.0)
     model = builder.finalize(device=device)
-    for mode in ("explicit", "nxn"):
+    for mode in _MODES:
         with test.subTest(broad_phase=mode), _flag(None):
             pipeline = newton.CollisionPipeline(model, broad_phase=mode)
             record = pipeline.get_collision_selection()["immobile_pairs"]
@@ -340,6 +351,37 @@ def test_models_without_immobile_pairs_keep_unfiltered_arguments(test, device):
             )
             pairs, _ = _candidate_pairs(pipeline, model)
             test.assertEqual(_ordered(pairs, device), _ordered(_unfiltered_candidates(pipeline, model, mode), device))
+
+
+def test_every_parent_joint_must_weld(test, device):
+    """Keep a fixed root mobile when a loop joint outside its tree also names it as the child."""
+    for loop in (False, True):
+        proto = newton.ModelBuilder()
+        base = proto.add_link(xform=_pose(0.0, 0.0), label="base")
+        base_shape = _box(proto, base, 0.0, 0.0)
+        proto.add_articulation([proto.add_joint_fixed(-1, base, parent_xform=_pose(0.0, 0.0))])
+        arm = proto.add_link(xform=_pose(0.0, 0.5), label="arm")
+        _box(proto, arm, 0.0, 0.5)
+        proto.add_articulation([proto.add_joint_revolute(-1, arm, axis=(0.0, 0.0, 1.0), parent_xform=_pose(0.0, 0.5))])
+        if loop:
+            proto.add_joint_revolute(arm, base, axis=(0.0, 0.0, 1.0), parent_xform=_pose(0.0, -0.5, 0.0))
+        scene = newton.ModelBuilder()
+        ground = scene.add_ground_plane()
+        shape_start = scene.shape_count
+        scene.replicate(proto, _WORLDS, spacing=(3.0, 0.0, 0.0))
+        model = scene.finalize(device=device)
+        ground_base = {(ground, shape_start + world * proto.shape_count + base_shape) for world in range(_WORLDS)}
+        for mode in _MODES:
+            with test.subTest(loop=loop, broad_phase=mode), _flag(None):
+                pipeline = newton.CollisionPipeline(model, broad_phase=mode)
+                pairs, _ = _candidate_pairs(pipeline, model)
+                record = pipeline.get_collision_selection()["immobile_pairs"]
+                if loop:
+                    test.assertLessEqual(ground_base, set(pairs))
+                    test.assertEqual(record["welded_bodies"], 0)
+                else:
+                    test.assertFalse(ground_base & set(pairs))
+                    test.assertEqual(record["welded_bodies"], _WORLDS)
 
 
 def test_notifications_refresh_the_immobile_set(test, device):
@@ -499,7 +541,9 @@ def _arm_scene(device):
 
 
 def _arm_trajectory(model, *, flag, friction_anchor_beta, steps=60):
+    """Step the arm scene; return its joint trajectory, base-ground and arm-cube contact counts and friction law."""
     solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=friction_anchor_beta)
+    law = solver.get_path_selection()["routes"]["friction"]["law"]
     # Deterministic contacts keep the remaining contacts in one order on CUDA as well.
     pipeline = _pipeline(model, flag, deterministic=model.device.is_cuda)
     contacts = pipeline.contacts()
@@ -525,28 +569,35 @@ def _arm_trajectory(model, *, flag, friction_anchor_beta, steps=60):
         solver.step(state_0, state_1, control, contacts, 1.0 / 120.0)
         state_0, state_1 = state_1, state_0
         trajectory.append(np.concatenate((state_0.joint_q.numpy(), state_0.joint_qd.numpy())))
-    return np.asarray(trajectory), static_contacts, arm_contacts
+    return np.asarray(trajectory), static_contacts, arm_contacts, law
 
 
 def test_fixed_base_arm_trajectories_match(test, device):
-    """Step FeatherPGS identically without the base's ground contacts, under point and patch friction."""
+    """Step FeatherPGS alike without the base's ground contacts, under point and patch friction.
+
+    CPU kernels run serially, so the remaining contacts keep their order and the trajectories
+    are bitwise equal there. CUDA reserves contact rows with per-world atomics, whose order can
+    follow the dropped contacts, so on CUDA they agree within ten times the spread of two
+    identical runs.
+    """
     model = _arm_scene(device)
     for law, beta in (("point", 0.0), ("patch", 0.2)):
         with test.subTest(friction=law):
-            reference, reference_static, reference_arm = _arm_trajectory(model, flag="0", friction_anchor_beta=beta)
-            trajectory, static, arm = _arm_trajectory(model, flag=None, friction_anchor_beta=beta)
+            reference, reference_static, reference_arm, reference_law = _arm_trajectory(
+                model, flag="0", friction_anchor_beta=beta
+            )
+            trajectory, static, arm, selected_law = _arm_trajectory(model, flag=None, friction_anchor_beta=beta)
+            test.assertEqual((reference_law, selected_law), (law, law))
             # The base rests in the ground and the arm presses the cube.
             test.assertGreater(reference_static, 0)
             test.assertEqual(static, 0)
             test.assertGreater(arm, 0)
+            test.assertEqual(arm, reference_arm)
             test.assertTrue(np.all(np.isfinite(trajectory)))
-            repeat, _, _ = _arm_trajectory(model, flag="0", friction_anchor_beta=beta)
-            if np.array_equal(repeat, reference):
-                # The remaining contacts keep their order, and the dropped ones had no response.
-                test.assertEqual(arm, reference_arm)
+            if wp.get_device(device).is_cpu:
                 np.testing.assert_array_equal(trajectory, reference)
             else:
-                # Float reduction order already varies between identical runs.
+                repeat = _arm_trajectory(model, flag="0", friction_anchor_beta=beta)[0]
                 spread = float(np.max(np.abs(repeat - reference)))
                 np.testing.assert_allclose(trajectory, reference, rtol=0.0, atol=max(1.0e-5, 10.0 * spread))
 
@@ -570,18 +621,15 @@ for name, function in (
         "test_models_without_immobile_pairs_keep_unfiltered_arguments",
         test_models_without_immobile_pairs_keep_unfiltered_arguments,
     ),
+    ("test_every_parent_joint_must_weld", test_every_parent_joint_must_weld),
     ("test_notifications_refresh_the_immobile_set", test_notifications_refresh_the_immobile_set),
     ("test_unchanged_notifications_skip_the_refresh", test_unchanged_notifications_skip_the_refresh),
+    # Warp captures graphs on CPU devices as well.
+    ("test_captured_collide_reads_notified_set", test_captured_collide_reads_notified_set),
     ("test_environment_flag_values", test_environment_flag_values),
     ("test_fixed_base_arm_trajectories_match", test_fixed_base_arm_trajectories_match),
 ):
     add_function_test(TestCollisionImmobilePairs, name, function, devices=devices)
-add_function_test(
-    TestCollisionImmobilePairs,
-    "test_captured_collide_reads_notified_set",
-    test_captured_collide_reads_notified_set,
-    devices=get_cuda_test_devices(),
-)
 
 
 if __name__ == "__main__":
