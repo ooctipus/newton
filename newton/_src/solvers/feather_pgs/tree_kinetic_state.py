@@ -877,6 +877,7 @@ def get_state_kernel(
     body_velocity: bool = False,
     motion_velocity: bool = False,
     listed: bool = False,
+    bank_coordinates: int = 0,
     reference: bool = False,
     clocked: bool = False,
     host: bool = False,
@@ -888,15 +889,23 @@ def get_state_kernel(
     ``repair_blocks[item]`` and items past ``repair_count[0]`` return at once,
     so a launch over every block on a capped grid (Warp's grid-stride loop)
     costs little more than the listed blocks. Each listed group runs the
-    repair unchanged, early exit included. ``reference`` and ``clocked``
-    select the comparison forms and the stage counters; ``host`` the static
-    CPU scratch of an owner on the CPU (see
-    :func:`get_helpers`).
+    repair unchanged, early exit included.
+
+    ``bank_coordinates`` (a group's coordinate count) builds the one-pass
+    repair that also takes the comparison of :func:`get_bank_kernel`: a valid
+    group stamped with the ``bank`` argument compares the two banks and, when
+    they are equal, is restamped and takes the early exit. It serves launches
+    too small to classify, where a separate comparison pass would cost a
+    launch. ``reference`` and ``clocked`` select the comparison forms and the
+    stage counters; ``host`` the static CPU scratch of an owner on the CPU
+    (see :func:`get_helpers`).
     """
     if finish and motion_velocity:
         raise ValueError("Alternate motion velocity is a repair-only contract")
     if finish and listed:
         raise ValueError("A listed launch is a repair-only contract")
+    if bank_coordinates and (finish or motion_velocity or listed):
+        raise ValueError("A compared input bank is a contract of the one-pass repair of ordinary motion")
     h = get_helpers(layout, chain_scan, body_velocity, reference=reference, clocked=clocked, host=host)
     release = _keep_static if host else _release
     plan_type = h.plan_type
@@ -920,6 +929,18 @@ def get_state_kernel(
     motion_reuse = "        and motion_changed == 0\n" if motion_velocity else ""
     motion_bind = "qd = motion_qd" if motion_velocity else ""
     listed_block = "if item >= repair_count[0]:\n    return\nblock = repair_blocks[item]\n" if listed else ""
+    bank_setup, bank_rebind = "", ""
+    if bank_coordinates:
+        _bank_matches = _bank_binding(bank_coordinates, layout)
+        bank_setup = """    rebind = int(0)
+    if valid != 0 and source_matches == 0:
+        if _same_source(cache, group, bank.joint_q, bank.joint_qd) != 0:
+            source_matches = _bank_matches(bank, data.joint_q_start[js], ds, js, data.joint_q, data.joint_qd, data.joint_child, data.body_q, data.body_qd)
+            rebind = source_matches
+"""
+        bank_rebind = """        if rebind != 0 and lane == 0:
+            _stamp_source(cache, group, data.joint_q, data.joint_qd)
+"""
     motion_clock = ["pass"] * 4
     if clocked:
         motion_clock = [f"clock_m{k} = _clock()" for k in range(4)]
@@ -960,6 +981,7 @@ if not wp.static(finish):
         for root in range(1, wp.static(roots)):
             refresh = int(refresh != 0 or requests[plan.arts[group, root]] != 0)
     source_matches = _same_source(cache, group, data.joint_q, data.joint_qd)
+{bank_setup}\
     if (
         valid != 0
         and source_matches != 0
@@ -971,6 +993,7 @@ if not wp.static(finish):
             )
         )
     ):
+{bank_rebind}\
         return
 if lane == 0:
     cache.current_valid[art] = 0
@@ -1090,6 +1113,9 @@ if lane == 0:
     if listed:
         name += "_listed"
         signature += ", repair_blocks: wp.array[int], repair_count: wp.array[int]"
+    if bank_coordinates:
+        name += "_banked"
+        signature += ", bank: StateBank"
     return make_state_kernel(
         name,
         signature,

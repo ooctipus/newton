@@ -573,7 +573,6 @@ class MixedTreeKineticState:
         # captured repairs unless the solver prescales velocities; see TreeKineticState.
         self.bank_compare = all(group.bank_compare for group in self.groups)
         self.skip_captured_repairs = all(group.skip_captured_repairs for group in self.groups)
-        self.classify_first = all(group.classify_first for group in self.groups)
 
     def _coverage_arrays(self):
         solver, model = self.solver, self.solver.model

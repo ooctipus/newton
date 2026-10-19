@@ -136,10 +136,11 @@ class TreeKineticState:
     would take the early exit. The solver calls :meth:`forget_continuity`
     from every host call that changes validity, requests or the step.
 
-    On CUDA (:attr:`classify_first`), a repair whose groups are expected to
-    be stamped with the input bank lists the blocks that need it, one thread
-    per block, and repairs over that list on a capped grid, instead of
-    launching a block per group that mostly confirms its cache.
+    On CUDA (:attr:`classify_first`), a repair of more blocks than the capped
+    grid of :func:`listed_repair_blocks`, whose groups are expected to be
+    stamped with the input bank, lists the blocks that need it, one thread per
+    block, and repairs over that list on the capped grid, instead of launching
+    a block per group that mostly confirms its cache.
     """
 
     def __init__(
@@ -177,8 +178,9 @@ class TreeKineticState:
         # A motion-velocity repair also compares the prescaled velocity, which the
         # step recomputes after the finish; its launches always run.
         self.skip_captured_repairs = bool(skip) and not self.motion_velocity
-        # The CPU twin keeps the one-pass repair.
-        self.classify_first = bool(classify) and device.is_cuda
+        # The CPU twin keeps the one-pass repair; _bind_kernels sets classify_first
+        # from this and the launch size of the bound layout.
+        self._classify_switch = bool(classify) and device.is_cuda
         # (capture id, whether the finish computed the next geometry) of the last
         # finish inside a capture; the next begin consumes it.
         self._continuity = None
@@ -384,6 +386,12 @@ class TreeKineticState:
 
         layout = self.layout
         on_cpu = self.solver.model.device.is_cpu
+        self.block_dim = max(layout.block, self._chain_block_dim)
+        self.launch_count = self.group_count // layout.pack
+        # Only a launch of more blocks than the listed repair's grid is classified: one of
+        # at most that many blocks ends in about a wave of early exits, which costs no more
+        # than the classification's three launches (Allegro's 4096-block repairs: 5.6-6.5 us).
+        self.classify_first = self._classify_switch and 0 < self._repair_grid < self.launch_count
         self.repair_kernel = native.get_state_kernel(
             False,
             self.chain_scan,
@@ -394,11 +402,25 @@ class TreeKineticState:
             clocked=self.clocked,
             host=on_cpu,
         )
-        self.bank_kernel = (
-            native.get_bank_kernel(self.chain_scan, layout=layout, coordinates=self.bank_coordinates)
-            if self.bank_compare
-            else None
-        )
+        # A classified repair takes the comparison as a pass of its own, so the classification
+        # sees the restamped groups. Otherwise a second one-pass repair kernel compares inside
+        # its blocks, and only steps that compare launch it: no extra launch, and every other
+        # step keeps its kernel (comparing inside raises a chain-scan repair's registers, 80 to
+        # 151 on a 13-body chain on sm_120, but not a packed one's, 72 either way).
+        self.bank_kernel = self.bank_repair_kernel = None
+        if self.bank_compare and self.classify_first:
+            self.bank_kernel = native.get_bank_kernel(self.chain_scan, layout=layout, coordinates=self.bank_coordinates)
+        elif self.bank_compare:
+            self.bank_repair_kernel = native.get_state_kernel(
+                False,
+                self.chain_scan,
+                layout=layout,
+                body_velocity=self._body_velocity,
+                bank_coordinates=self.bank_coordinates,
+                reference=self.reference,
+                clocked=self.clocked,
+                host=on_cpu,
+            )
         self.classify_kernel = self.listed_repair_kernel = None
         if self.classify_first:
             self.classify_kernel = native.get_classify_kernel(
@@ -413,6 +435,7 @@ class TreeKineticState:
                 listed=True,
                 reference=self.reference,
                 clocked=self.clocked,
+                host=on_cpu,
             )
         self.finish_kernel = native.get_state_kernel(
             True,
@@ -426,8 +449,6 @@ class TreeKineticState:
         self.predictor_kernel = native.get_predictor_kernel(
             self.chain_scan, layout=layout, response=self._response, reference=self.reference, clocked=self.clocked
         )
-        self.block_dim = max(layout.block, self._chain_block_dim)
-        self.launch_count = self.group_count // layout.pack
 
     def _choose_lanes(self):
         """Time the candidate lane widths on this model and keep the fastest.
@@ -636,19 +657,20 @@ class TreeKineticState:
             self._motion_binding = binding
             return
         data = self._publication(state_in, state_aug, state_in, dt)
+        # The stamps name the output bank: an odd substep count copied it back into
+        # the input bank, or the caller passes a copy of it.
         compared = (
             self.bank_compare
             and state_out is not None
             and self._published == _bank_pointers(state_out)
             and source != self._published
         )
-        if compared:
-            # The stamps name the output bank: an odd substep count copied it
-            # back into the input bank, or the caller passes a copy of it.
+        bank = self._bank(state_out, state_in) if compared else None
+        if compared and self.classify_first:
             wp.launch_tiled(
                 self.bank_kernel,
                 dim=[self.launch_count],
-                inputs=[self.sparse.plan, self.plan, data, self.data, self._bank(state_out, state_in)],
+                inputs=[self.sparse.plan, self.plan, data, self.data, bank],
                 block_dim=self.block_dim,
                 device=device,
             )
@@ -681,6 +703,14 @@ class TreeKineticState:
                 inputs=[*arguments, self._repair_blocks, self._repair_count],
                 block_dim=self.block_dim,
                 max_blocks=self._repair_grid,
+                device=device,
+            )
+        elif compared:
+            wp.launch_tiled(
+                self.bank_repair_kernel,
+                dim=[self.launch_count],
+                inputs=[*arguments, bank],
+                block_dim=self.block_dim,
                 device=device,
             )
         else:
