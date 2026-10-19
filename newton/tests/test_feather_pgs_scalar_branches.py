@@ -30,6 +30,7 @@ from newton._src.solvers.feather_pgs.prismatic_linear_state import (
 )
 from newton._src.solvers.feather_pgs.prismatic_publication import PrismaticPublicationPlan
 from newton.solvers import SolverFeatherPGS
+from newton.tests.test_feather_pgs_subtree_reduce import _assert_switch_within, _excess
 
 DT = 1.0 / 240.0
 GRAVITY = (0.7, -1.2, -9.1)
@@ -42,7 +43,11 @@ ARM_DROPPED_FIELDS = ("body_q_com", "body_a_s", "body_f_s", "body_I_s", "_body_i
 KEY_BOUND = {"rtol": 3.0e-5, "atol": 5.0e-6}
 # Key-only contact impulses [N·s] (1e-4 to 1e-2 per step in these tests) at the keys' relative bound.
 IMPULSE_BOUND = {"rtol": KEY_BOUND["rtol"], "atol": 1.0e-8}
-ARM_BOUND = {"rtol": 1.0e-4, "atol": 1.0e-4}
+# The held-solve bound (ae6baadb) on the arm: twice the ordinary solver's distance from the
+# reference, at least 1e-5, plus the scalar route's own run-to-run spread. Every reference arm here
+# runs ordinary dynamics (no cached owner takes these worlds, and cached_dynamics selects only that
+# owner), so the ordinary distance is zero and the floor applies.
+ARM_FLOOR = 1.0e-5
 # Coordinates of the fixtures' arm. A star of as many leaves shares the arm's size group, which is
 # then not diagonal: the recipe refuses its prismatic linear state and no scalar plan exists.
 ARM_DOFS = 6
@@ -1225,6 +1230,14 @@ def _close(test, expected, actual, index, tag, *, rtol, atol):
     np.testing.assert_allclose(actual, expected, rtol=rtol, atol=atol, err_msg=tag)
 
 
+def _arm_within(test, reference, actual, bodies, tag, *, again=None):
+    """Bound the arm bodies' A/B difference by the held-solve rule plus the scalar route's A/A spread ``again``."""
+    actual = actual.numpy()[bodies]
+    test.assertTrue(np.all(np.isfinite(actual)), tag)
+    spread = 0.0 if again is None else _excess(again.numpy()[bodies], actual)
+    _assert_switch_within(test, tag, _excess(actual, reference.numpy()[bodies]), spread, ARM_FLOOR)
+
+
 def _normal_impulses(test, solver, count):
     """The solved normal impulse [N·s] of each of the first ``count`` contacts, in contact order."""
     world, slot = solver.contact_world.numpy()[:count], solver.contact_slot.numpy()[:count]
@@ -1314,7 +1327,8 @@ class TestScalarBranchOwner(unittest.TestCase):
         through the mass cadence, an inertial and drive notification, a masked
         reset after a coordinate write, a root re-pose, a state bank copied back
         into the input (which every cache must repair) and captured graphs with
-        masked and full resets; the arm moves to the held owner's float order.
+        masked and full resets. The arm moves to the held owner's float order,
+        within the held-solve bound (``ARM_FLOOR``) plus the twin's spread.
         An eager twin of the scalar route does the captured work step by step:
         each replay must give what it gives. The FK/ID fields that neither the
         family writes for the keys nor the held owner for the arm hold NaN
@@ -1378,13 +1392,13 @@ class TestScalarBranchOwner(unittest.TestCase):
                     f"{tag} key {name}",
                     **KEY_BOUND,
                 )
-                _close(
+                _arm_within(
                     self,
                     getattr(states[0][0], name),
                     getattr(states[1][0], name),
                     layout.arm_bodies,
                     f"{tag} arm {name}",
-                    **ARM_BOUND,
+                    again=getattr(states[2][0], name),
                 )
             _close(self, head.v_hat, scalar.v_hat, layout.key_dofs, f"{tag} v_hat", **KEY_BOUND)
             _close(
@@ -1726,7 +1740,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         re-pose must republish them. Revolute torques differ by the velocity
         product's rounding, which ordinary dynamics evaluates and the family
         does not (it is zero on the leaf's own axis), so leaves compare at a
-        physics tolerance.
+        physics tolerance; the held arm at the held-solve bound.
         """
         device = wp.get_device("cuda:0")
         model = build_branch_model(device, worlds=2, leaves=STAR_LEAVES, kinds=("prismatic", "revolute"), shapes=True)
@@ -1781,13 +1795,12 @@ class TestScalarBranchOwner(unittest.TestCase):
                     f"{tag} {name}",
                     **leaves,
                 )
-                _close(
+                _arm_within(
                     self,
                     getattr(states[0][0], name),
                     getattr(states[1][0], name),
                     layout.arm_bodies,
                     f"{tag} arm {name}",
-                    **ARM_BOUND,
                 )
             # Same motion axes and origins: the contact producer reads both.
             _close(self, solvers[0].joint_S_s, solvers[1].joint_S_s, layout.key_dofs, f"{tag} joint_S_s", **leaves)
