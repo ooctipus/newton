@@ -1,0 +1,1 @@
+Documentation only: SolverFeatherPGS.seed_double_buffer_events() now states that steps run before a capture require a device synchronization before capturing.

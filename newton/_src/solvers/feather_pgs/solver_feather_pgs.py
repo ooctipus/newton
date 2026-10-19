@@ -8028,9 +8028,12 @@ class SolverFeatherPGS(SolverBase):
         """Record initial memset_done events on the main stream.
 
         Must be called inside CUDA graph capture, before the first ``step()`` call.
-        Since buffers are allocated with ``wp.zeros()``, they are already zeroed;
-        recording here provides trivially-satisfied wait targets for the first two
-        substeps.
+        Seeded events are not waited on: the first two captured substeps rely on
+        their buffers being clear already. That holds for the ``wp.zeros()``
+        allocation, but each :meth:`step` that ran before the capture queued
+        clears on the memset stream that nothing in the graph waits for. After
+        such steps, synchronize the device (for example with
+        ``wp.synchronize_device()``) before capturing.
         """
         if self._memset_stream is None:
             return
