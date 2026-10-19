@@ -969,6 +969,53 @@ class TestScalarBranchRule(unittest.TestCase):
             {"enabled": False, "reason": "No diagonal-mass group shares the sparse-diagonal response."},
         )
 
+    def _admitted(self, model):
+        """A plan the rule admits for the model's branch group, as the CUDA route builds it."""
+        solver = cpu_solver(model, branch_size(model))
+        plan, reason = sb.plan_scalar_branches(solver, requested=True)
+        self.assertIsNotNone(plan, reason)
+        return plan, reason
+
+    def test_admitted_branches_skip_the_prismatic_opt_ins(self):
+        """Build no prismatic publication or linear state where the owner takes the scalar branches.
+
+        CPU installs no owner, so the install is replaced by one that takes the plan.
+        """
+        model = build_branch_model(worlds=2)
+        admitted = self._admitted(model)
+
+        def install(solver):
+            solver._tree_kinetic_state = mock.Mock(scalar=object(), copy_reuse=False)
+            solver._cached_dynamics_selection_reason = "A test owner takes the branches."
+
+        with (
+            mock.patch.object(sb, "plan_scalar_branches", return_value=admitted),
+            mock.patch("newton._src.solvers.feather_pgs.cached_dynamics.install", install),
+            mock.patch.object(solver_module, "_PRISMATIC_PUBLICATION", True),
+        ):
+            solver = SolverFeatherPGS(model, pgs_mode="split")
+        self.assertIs(solver._scalar_branches, admitted[0])
+        self.assertEqual(solver._scalar_branches_reason, admitted[1])
+        self.assertIsNone(solver._prismatic_publication)
+        self.assertFalse(solver._prismatic_linear_state)
+
+    def test_declined_branches_restore_the_prismatic_opt_ins(self):
+        """Drop an admitted plan the held-tree owner does not take and build the prismatic opt-ins as without it."""
+        model = build_branch_model(worlds=2)
+        with (
+            mock.patch.object(sb, "plan_scalar_branches", return_value=self._admitted(model)),
+            mock.patch.object(solver_module, "_PRISMATIC_PUBLICATION", True),
+        ):
+            solver = SolverFeatherPGS(model, pgs_mode="split")
+        self.assertIsNone(solver._tree_kinetic_state)
+        self.assertIsNone(solver._scalar_branches)
+        self.assertIn("did not take them", solver._scalar_branches_reason)
+        self.assertIn("CPU", solver._scalar_branches_reason)
+        self.assertIsNotNone(solver._prismatic_publication)
+        plain = SolverFeatherPGS(model, pgs_mode="split")
+        self.assertIsNone(plain._prismatic_publication)
+        self.assertIn("No diagonal-mass group", plain._scalar_branches_reason)
+
 
 class TestScalarBranchKernels(unittest.TestCase):
     def test_prismatic_branches_match_the_linear_state_route(self):
