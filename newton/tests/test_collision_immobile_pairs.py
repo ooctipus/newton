@@ -755,12 +755,24 @@ def _list_immobile_contacts_last(contacts, immobile):
     return count - int(np.count_nonzero(dropped))
 
 
+def _arm_shape_roles(model):
+    """Return each shape's role in the arm scene: -1 static, 0 the welded base, 1 the arm and 2 the cube."""
+    shape_body = model.shape_body.numpy()
+    # Body 0 of each world is the base, body 1 the arm and body 2 the cube.
+    return np.where(shape_body < 0, -1, shape_body % 3)
+
+
+def _contact_roles(contacts, roles):
+    """Return the roles of each live contact's two shapes, the smaller first, shape [2, count]."""
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    shapes = np.stack((contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count]))
+    return np.sort(roles[shapes], axis=0)
+
+
 def _check_arm_steps(test, model, law, friction_anchor_beta, device):
     """Step the arm scene with and without the base's ground pairs from the same state, and compare every step."""
-    shape_body = model.shape_body.numpy()
-    # Body 0 of each world is the welded base, body 1 the arm and body 2 the cube.
-    local = np.where(shape_body < 0, -1, shape_body % 3)
-    immobile = local <= 0
+    roles = _arm_shape_roles(model)
+    immobile = roles <= 0
     control = model.control()
     solvers = [newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=friction_anchor_beta) for _ in range(2)]
     test.assertEqual([solver.get_path_selection()["routes"]["friction"]["law"] for solver in solvers], [law] * 2)
@@ -786,10 +798,7 @@ def _check_arm_steps(test, model, law, friction_anchor_beta, device):
                 getattr(reference, f"rigid_contact_{name}").numpy()[:kept],
             )
         dropped_contacts += listed - kept
-        shapes = np.stack(
-            (contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count])
-        )
-        ends = np.sort(local[shapes], axis=0)
+        ends = _contact_roles(contacts, roles)
         arm_contacts += int(np.count_nonzero((ends[0] == 1) & (ends[1] == 2)))
         outputs = []
         for solver, buffer in zip(solvers, (reference, contacts), strict=True):
@@ -799,13 +808,18 @@ def _check_arm_steps(test, model, law, friction_anchor_beta, device):
             solver.step(state_in, state_out, control, buffer, 1.0 / 120.0)
             states += [state_in, state_out]
             outputs.append(state_out)
-        # FeatherPGS gives the base's ground contacts no row and every other contact the same rows.
-        paths = [solver.contact_path.numpy().copy() for solver in solvers]
-        needed = [solver.contact_slots_needed.numpy().copy() for solver in solvers]
+        # FeatherPGS gives the base's ground contacts no row and every other contact the same rows:
+        # the same route, row count, world and first row.
+        rows_of = {
+            name: [getattr(solver, f"contact_{name}").numpy().copy() for solver in solvers]
+            for name in ("path", "slots_needed", "world", "slot")
+        }
+        paths = rows_of.pop("path")
         np.testing.assert_array_equal(paths[0][kept:listed], -1)
         np.testing.assert_array_equal(paths[1][:count], paths[0][:kept])
         rows = paths[0][:kept] >= 0
-        np.testing.assert_array_equal(needed[1][:count][rows], needed[0][:kept][rows])
+        for name, values in rows_of.items():
+            np.testing.assert_array_equal(values[1][:count][rows], values[0][:kept][rows], err_msg=f"contact_{name}")
         expected, actual = (np.concatenate((output.joint_q.numpy(), output.joint_qd.numpy())) for output in outputs)
         test.assertTrue(np.all(np.isfinite(actual)))
         if wp.get_device(device).is_cpu:
@@ -818,17 +832,17 @@ def _check_arm_steps(test, model, law, friction_anchor_beta, device):
     test.assertGreater(arm_contacts, 0)
 
 
-def test_fixed_base_arm_trajectories_match(test, device):
-    """Step FeatherPGS alike without the base's ground contacts, under point and patch friction.
+def test_fixed_base_arm_steps_match(test, device):
+    """Step FeatherPGS alike without the base's ground contacts, from the same state every step.
 
-    Both runs start every step from the same state. FeatherPGS reserves a world's contact rows with
-    atomics, which CUDA serves in warp order, so the dropped contacts must not move the others:
-    listed in place, they push world 1's last arm-cube contacts into a second warp, which CUDA
-    served first, and 12 PGS iterations then end up to 1.2e-2 rad/s apart (a CPU run with that row
-    order reproduces the difference). The reference lists them last instead, so that every other
-    contact keeps its index. Contacts and rows then agree exactly, and states bitwise on CPU and
-    within 1e-5 on CUDA, where only the accumulation order of floating-point atomics may differ.
-    The base is rooted by a fixed joint and by a D6 joint without axes.
+    Under point and patch friction, with the base rooted by a fixed joint and by a D6 joint
+    without axes. FeatherPGS reserves a world's contact rows with atomics, which CUDA can serve in
+    warp order, so the dropped contacts must not move the others. Left in place, they push world
+    1's last arm-cube contacts into a second warp; on the GPU, states then ended up to 1.2e-2
+    rad/s apart after 12 PGS iterations, and a CPU run that reserves those contacts' rows first
+    reproduces that. The reference therefore lists the dropped contacts last, so that every other
+    contact keeps its index. Contact geometry and rows then agree exactly, and states bitwise on
+    CPU and within 1e-5 on CUDA, which allows float atomics to accumulate in another order.
     """
     for root in ("fixed", "locked_d6"):
         model = _arm_scene(device, locked_d6=root == "locked_d6")
@@ -867,7 +881,7 @@ for name, function in (
     # Warp captures graphs on CPU devices as well.
     ("test_captured_collide_reads_notified_set", test_captured_collide_reads_notified_set),
     ("test_environment_flag_values", test_environment_flag_values),
-    ("test_fixed_base_arm_trajectories_match", test_fixed_base_arm_trajectories_match),
+    ("test_fixed_base_arm_steps_match", test_fixed_base_arm_steps_match),
 ):
     add_function_test(TestCollisionImmobilePairs, name, function, devices=devices)
 
