@@ -212,7 +212,7 @@ def same(test, expected, actual, index, name):
     np.testing.assert_array_equal(actual, expected, err_msg=name)
 
 
-def recipe_solver(model, *, scalar, compact=True, **options):
+def recipe_solver(model, *, scalar, compact=True, prismatic=True, **options):
     """The keyboard recipe's solver: compact contacts and both prismatic opt-ins, plus scalar branches if asked."""
     arguments = {
         "pgs_mode": "matrix_free",
@@ -227,8 +227,8 @@ def recipe_solver(model, *, scalar, compact=True, **options):
     with (
         mock.patch.object(solver_module, "_COMPACT_CONTACT_BOUNDARY", compact),
         mock.patch.object(solver_module, "_SPARSE_CONTACT_DIRECT", True),
-        mock.patch.object(solver_module, "_PRISMATIC_PUBLICATION", True),
-        mock.patch.object(solver_module, "_PRISMATIC_LINEAR_STATE", True),
+        mock.patch.object(solver_module, "_PRISMATIC_PUBLICATION", prismatic),
+        mock.patch.object(solver_module, "_PRISMATIC_LINEAR_STATE", prismatic),
         mock.patch.object(solver_module, "_SCALAR_BRANCHES", scalar),
     ):
         return SolverFeatherPGS(model, **arguments)
@@ -1461,6 +1461,95 @@ class TestScalarBranchOwner(unittest.TestCase):
         self.assertGreater(float(impulses[0].max()), 0.0, "The tip must press the key")
         np.testing.assert_allclose(impulses[1], impulses[0], rtol=1.0e-3, atol=1.0e-7)
         np.testing.assert_allclose(travel[1], travel[0], rtol=1.0e-3, atol=1.0e-7)
+
+    def test_mixed_leaves_follow_ordinary_dynamics(self):
+        """Own a star of prismatic and revolute leaves end to end and track ordinary dynamics.
+
+        The prismatic opt-ins do not admit revolute leaves, so the reference is
+        ordinary dynamics (cached_dynamics='off'); the scalar family runs its
+        general kernels: revolute motion axes about the published origin,
+        their inverse mass from the COM inertia and their COM velocities. Floor
+        contacts on both leaf kinds read those axes and the origin, and a root
+        re-pose must republish them. Revolute torques differ by the velocity
+        product's rounding, which ordinary dynamics evaluates and the family
+        does not (it is zero on the leaf's own axis), so leaves compare at a
+        physics tolerance.
+        """
+        device = wp.get_device("cuda:0")
+        model = build_branch_model(device, worlds=2, leaves=12, kinds=("prismatic", "revolute"), shapes=True)
+        layout = _Layout(model)
+        starts, child = model.articulation_start.numpy(), model.joint_child.numpy()
+        # Even leaves are prismatic and odd ones revolute.
+        floors = [int(child[starts[a] + 1 + k]) for a in layout.branches for k in (0, 3, 6, 9)]
+        model.rigid_contact_max = len(floors)
+        solvers = [
+            recipe_solver(model, scalar=False, prismatic=False, cached_dynamics="off"),
+            recipe_solver(model, scalar=True, prismatic=False),
+        ]
+        self.assertIsNone(solvers[0]._tree_kinetic_state)
+        owner = solvers[1]._tree_kinetic_state
+        self.assertIsInstance(owner.scalar, sb.ScalarBranchState)
+        self.assertEqual(owner.scalar.plan.kinds, ("prismatic", "revolute"))
+        self.assertIs(owner.scalar.predictor_kernel, sb.predict_scalar_branches)
+        self.assertIs(owner.scalar.finish_kernel, sb.finish_scalar_branches)
+        states = [[model.state(), model.state()] for _ in solvers]
+        controls = [model.control() for _ in solvers]
+        contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]
+        for index, pair in enumerate(states):
+            newton.eval_fk(model, pair[0].joint_q, pair[0].joint_qd, pair[0])
+            install_held_contacts(model, pair[0], contacts[index], [(body, -1) for body in floors])
+        leaves = {"rtol": 1.0e-4, "atol": 1.0e-6}
+        for step in range(12):
+            force = np.zeros((model.body_count, 6), dtype=np.float32)
+            force[floors[1::2], 2] = -0.2 * (step + 1)
+            for index, pair in enumerate(states):
+                pair[0].body_f.assign(force)
+                controls[index].joint_target_q.fill_(-0.0003 * (step + 1))
+            if step == 6:
+                frames = model.joint_X_p.numpy()
+                frames[starts[layout.branches], :3] += (0.002, -0.001, 0.001)
+                frames[starts[layout.branches], 3:] = np.asarray(wp.quat_rpy(0.32, -0.18, 0.41))
+                model.joint_X_p.assign(frames)
+                for solver in solvers:
+                    solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+            for index, solver in enumerate(solvers):
+                current, following = states[index]
+                solver.step(current, following, controls[index], contacts[index], DT)
+                states[index] = [following, current]
+            tag = f"step {step}"
+            for name, index in (("joint_q", layout.key_coordinates), ("joint_qd", layout.key_dofs)):
+                _close(self, getattr(states[0][0], name), getattr(states[1][0], name), index, f"{tag} {name}", **leaves)
+            for name in ("body_q", "body_qd"):
+                _close(
+                    self,
+                    getattr(states[0][0], name),
+                    getattr(states[1][0], name),
+                    layout.key_bodies,
+                    f"{tag} {name}",
+                    **leaves,
+                )
+                _close(
+                    self,
+                    getattr(states[0][0], name),
+                    getattr(states[1][0], name),
+                    layout.arm_bodies,
+                    f"{tag} arm {name}",
+                    **ARM_BOUND,
+                )
+            # Same motion axes and origins: the contact producer reads both.
+            _close(self, solvers[0].joint_S_s, solvers[1].joint_S_s, layout.key_dofs, f"{tag} joint_S_s", **leaves)
+            _close(
+                self,
+                solvers[0].articulation_origin,
+                solvers[1].articulation_origin,
+                layout.branches,
+                f"{tag} origin",
+                rtol=1.0e-6,
+                atol=1.0e-7,
+            )
+            for solver in solvers:
+                solver.check_constraint_capacity()
+        self.assertGreater(float(np.abs(states[1][0].body_qd.numpy()[layout.key_leaves, 3:]).max()), 1.0e-4)
 
     def test_route_record_names_the_scalar_group(self):
         """Record the scalar group, its precedence over the prismatic opt-ins, and its decline without an owner."""
