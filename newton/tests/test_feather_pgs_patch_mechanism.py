@@ -1385,7 +1385,9 @@ class _WideRows(_Rows):
     gives them, from array operations: each route reserves a world's slots in
     one random order of the live contacts. Slots past the live count keep
     stale values, and the row arrays need not hold three rows per slot of the
-    capacity in every world.
+    capacity in every world. A contact without a body (a static pair) keeps a
+    random world: world 0 would gather every copy's static contacts, and the
+    row arrays' width would grow with the copies.
     """
 
     def generate(self, reference, live, routes=(0, 1, 2)):
@@ -1397,7 +1399,7 @@ class _WideRows(_Rows):
         path = rng.integers(0, 3, size=n)
         needed = rng.choice([1, 3], size=n)
         body = np.where(body_a >= 0, body_a, body_b)
-        world[:live] = np.where(body >= 0, self.scene.body_world[np.maximum(body, 0)], 0)
+        world[:live] = np.where(body >= 0, self.scene.body_world[np.maximum(body, 0)], world[:live])
         # Contacts of one pair mostly share a route, as the allocator assigns them.
         shared = rng.random(live) < 0.9
         path[:live] = np.where(shared, (np.maximum(body_a, body_b) + 7) % 3, rng.integers(0, 3, size=live))
@@ -1694,6 +1696,25 @@ class TestPatchLaunchShapes(unittest.TestCase):
                         coverage["live"], widest, "the live contacts must outnumber every grid's threads"
                     )
                     self.assertGreater(coverage["carried"], 0, "the frames must carry anchor history")
+
+    def test_wide_rows_stay_narrow_with_static_pairs(self):
+        """Keep the device-scale row arrays as wide as one copy's fullest world, whatever the copy count.
+
+        Static pairs have no body and so no world of their own. Gathering every
+        copy's static contacts in world 0 made the rows grow with the copies,
+        past the device's memory at device scale.
+        """
+        copies, worlds, per_world = 64, 4, 16
+        live = copies * worlds * per_world
+        scene = SimpleNamespace(worlds=copies * worlds, body_world=np.arange(copies * worlds, dtype=np.int32))
+        static = np.full(live, -1, dtype=np.int32)
+        reference = SimpleNamespace(
+            current=SimpleNamespace(body_a=wp.array(static, device="cpu"), body_b=wp.array(static, device="cpu")),
+            view=SimpleNamespace(weight=wp.ones(live, dtype=float, device="cpu")),
+        )
+        rows = _WideRows(scene, live, np.random.default_rng(7))
+        rows.generate(reference, live)
+        self.assertLessEqual(rows.rows, 8 * 3 * per_world + 8, "a world's rows must not grow with the copies")
 
 
 def _ring_case(device, seed, *, contacts=600, worlds=3):
