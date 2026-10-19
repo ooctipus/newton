@@ -14,6 +14,7 @@ from tools.fpgs_bench.active_wrench_control import Result
 
 
 class TestCoulombHybridDataflow(unittest.TestCase):
+    @hybrid.requires_reference
     def test_parallel_continuation_matches_original_nonzero_recurrence(self):
         """Continue the original projected momentum recurrence without reseeding."""
         z = np.array([[1.0, 0.4, 0.0], [0.2, 1.0, 0.3], [0.3, -0.1, 0.8]])

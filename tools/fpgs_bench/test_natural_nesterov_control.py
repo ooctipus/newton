@@ -8,9 +8,11 @@ import unittest
 import numpy as np
 
 from tools.fpgs_bench import natural_nesterov_control as control
+from tools.fpgs_bench.coulomb_block_hybrid import requires_reference
 
 
 class TestNaturalNesterovControl(unittest.TestCase):
+    @requires_reference
     def test_isolated_anisotropic_sliding(self):
         """Converge to antiparallel physical friction with a common pair step."""
         z = np.diag([1.0, 1.0, np.sqrt(2.0)])
@@ -30,6 +32,7 @@ class TestNaturalNesterovControl(unittest.TestCase):
         self.assertLess(result.work["final_physical"]["mdp"], 3e-5)
         self.assertEqual(result.work["majorizer_products"], 0)
 
+    @requires_reference
     def test_residual_history_matches_direct_operator(self):
         """Recover the feasible-state residual before restart changes momentum."""
         z = np.array([[1.0, 0.2], [0.3, 0.8], [-0.1, 0.4]])
@@ -52,6 +55,7 @@ class TestNaturalNesterovControl(unittest.TestCase):
         self.assertEqual(result.work["operator_products"], 2 * z.size * result.work["operator_passes"])
         self.assertEqual(result.work["stop_operator_products"], 0)
 
+    @requires_reference
     def test_duplicate_normals_expose_unstable_map(self):
         """Preserve the physical PSD counterexample rather than hiding a cycle."""
         result = control.natural_continue(

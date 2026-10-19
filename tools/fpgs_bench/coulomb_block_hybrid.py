@@ -14,13 +14,21 @@ from tools.fpgs_bench import coulomb_block_control as block
 
 REFERENCE_PATH = Path("/tmp/fpgs-anymal-lazy-reference-zE5yUe/method.py")
 REFERENCE_SHA = "553c12619971e9cbeb950e1940797d91057950d70d789c1202861f1e6fcf485f"
+# A test that needs the reference declares it with this decorator. Where the
+# file is absent the stand-in below fails any other test that reaches it.
+requires_reference = unittest.skipUnless(
+    REFERENCE_PATH.is_file(), f"Pinned parallel CPU reference {REFERENCE_PATH} is unavailable"
+)
 
 
 class _MissingReference:
-    """Stand in for an absent reference: every use skips the test that makes it."""
+    """Stand in for an absent reference: every use raises :class:`FileNotFoundError`."""
 
     def __getattr__(self, name):
-        raise unittest.SkipTest(f"Pinned parallel CPU reference {REFERENCE_PATH} is unavailable")
+        if name.startswith("__"):
+            # Introspection (deepcopy, inspect.unwrap, NumPy) probes optional dunders.
+            raise AttributeError(name)
+        raise FileNotFoundError(f"Pinned parallel CPU reference {REFERENCE_PATH} is unavailable")
 
 
 if REFERENCE_PATH.is_file():

@@ -8,9 +8,11 @@ import unittest
 import numpy as np
 
 from tools.fpgs_bench import padmm_control as control
+from tools.fpgs_bench.coulomb_block_hybrid import requires_reference
 
 
 class TestPADMMControl(unittest.TestCase):
+    @requires_reference
     def test_woodbury_matches_dense(self):
         """Solve the fixed augmented operator without a row-space factor."""
         z = np.array([[1.0, 0.2], [0.3, 1.1], [-0.4, 0.6]])
@@ -30,6 +32,7 @@ class TestPADMMControl(unittest.TestCase):
         result = control.project_cone(np.array([0.2, 0.6, 0.8]), 0.5)
         self.assertAlmostEqual(np.linalg.norm(result[1:]), 0.5 * result[0])
 
+    @requires_reference
     def test_isolated_anisotropic_sliding_fixed_point(self):
         """Preserve an exact physical sliding solution under one PADMM update."""
         Z = np.diag([1.0, 1.0, np.sqrt(2.0)])
@@ -43,6 +46,7 @@ class TestPADMMControl(unittest.TestCase):
         for actual, expected in ((f1, y), (y1, y), (z1, dual)):
             np.testing.assert_allclose(actual, expected, atol=3e-15)
 
+    @requires_reference
     def test_dual_correction_uses_previous_state(self):
         """Match Algorithm 1 ordering with nonzero prior primal and dual state."""
         data = control.prepare(

@@ -8,6 +8,7 @@ import unittest
 import numpy as np
 
 from tools.fpgs_bench import accelerated_padmm_control as control
+from tools.fpgs_bench.coulomb_block_hybrid import requires_reference
 
 
 class TestAcceleratedPADMMControl(unittest.TestCase):
@@ -45,6 +46,7 @@ class TestAcceleratedPADMMControl(unittest.TestCase):
             return f, y, z, y + beta * (y - yprev), z + beta * (z - zprev), an, e
         return f, y, z, yprev, zprev, 1.0, energy / 0.999
 
+    @requires_reference
     def test_successful_momentum_matches_dense_source_order(self):
         """Extrapolate current y/z relative to previous unaccelerated iterates."""
         args = (
@@ -63,6 +65,7 @@ class TestAcceleratedPADMMControl(unittest.TestCase):
         self.assertFalse(result[-1]["restart"])
         self.assertGreater(result[-1]["beta"], 0)
 
+    @requires_reference
     def test_forced_restart_rewinds_hats_not_published_state(self):
         """Rewind hats to previous y/z while retaining the just-computed state."""
         args = (
@@ -83,6 +86,7 @@ class TestAcceleratedPADMMControl(unittest.TestCase):
         np.testing.assert_array_equal(result[4], args[2])
         self.assertFalse(np.array_equal(result[1], result[3]))
 
+    @requires_reference
     def test_physical_sliding_fixed_point(self):
         """Preserve a physical Coulomb fixed point with consistent dual hats."""
         Z = np.diag([1.0, 1.0, np.sqrt(2.0)])

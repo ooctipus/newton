@@ -11,6 +11,22 @@ from tools.fpgs_bench import coulomb_block_hybrid as hybrid
 
 
 class TestCoulombBlockHybrid(unittest.TestCase):
+    def test_undeclared_use_of_an_absent_reference_fails(self):
+        """Fail, never skip, a test that reaches an absent reference without declaring it.
+
+        Only a declared skip may hide the reference: a test that proves the
+        reference path is not taken must fail when a regression takes it.
+        """
+        try:
+            hybrid._MissingReference().gram(np.eye(2))
+        except unittest.SkipTest as error:
+            self.fail(f"An undeclared use of the absent reference skipped its test: {error}")
+        except FileNotFoundError as error:
+            self.assertIn(str(hybrid.REFERENCE_PATH), str(error))
+        else:
+            self.fail("The absent reference returned an attribute")
+
+    @hybrid.requires_reference
     def test_fresh_parallel_reproduces_pinned_reference_both_tiers(self):
         """Keep anisotropic steps, fresh-normal disk projection and warp association."""
         for count in (6, 36):

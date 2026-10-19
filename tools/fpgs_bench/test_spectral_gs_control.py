@@ -8,9 +8,11 @@ import unittest
 import numpy as np
 
 from tools.fpgs_bench import spectral_gs_control as control
+from tools.fpgs_bench.coulomb_block_hybrid import requires_reference
 
 
 class TestSpectralGSControl(unittest.TestCase):
+    @requires_reference
     def test_duplicate_normals_see_preceding_response(self):
         """Resolve duplicate normals in one ordered pass without amplification."""
         result = control.solve(
@@ -28,6 +30,7 @@ class TestSpectralGSControl(unittest.TestCase):
         self.assertEqual(result.work["sweeps"], 1)
         self.assertTrue(result.work["physical_stop"])
 
+    @requires_reference
     def test_isolated_anisotropic_sliding(self):
         """Converge to physical antiparallel slip using one common tangent step."""
         jacobian = np.diag([1.0, 1.0, np.sqrt(2.0)])
@@ -49,6 +52,7 @@ class TestSpectralGSControl(unittest.TestCase):
         self.assertEqual(result.work["root_probes"], 0)
         self.assertEqual(result.work["majorizer_products"], 0)
 
+    @requires_reference
     def test_incoming_state_applies_only_delta(self):
         """Retain current velocity and use only impulse changes within budget."""
         jacobian = np.array([[1.0, 0.2], [0.3, 0.8]])
