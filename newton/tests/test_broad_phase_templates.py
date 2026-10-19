@@ -8,7 +8,9 @@ and sorted candidate sets are compared with :class:`BroadPhaseExplicit` on every
 device; on CPU, where both run serially in list order, the arrays must be equal.
 """
 
+import contextlib
 import functools
+import gc
 import itertools
 import json
 import os
@@ -849,9 +851,14 @@ class TestBroadPhaseTemplateSelection(unittest.TestCase):
             _pipeline(model, "auto")
 
 
-def _capture_collide(pipeline, state, contacts):
-    """Capture one ``collide()`` in a CUDA graph (modules must be loaded) and return the graph."""
-    with wp.ScopedCapture(device=pipeline.device, force_module_load=False) as capture:
+def _capture_collide(pipeline, state, contacts, **capture_options):
+    """Capture one ``collide()`` in a graph and return the graph.
+
+    Garbage that earlier tests left in reference cycles is freed first: a Warp texture freed
+    inside a CUDA capture would invalidate it.
+    """
+    gc.collect()
+    with wp.ScopedCapture(device=pipeline.device, **capture_options) as capture:
         pipeline.collide(state, contacts)
     return capture.graph
 
@@ -881,7 +888,9 @@ def test_graph_replays_template_broad_phase(test, device):
             flat = _pipeline(model, "0")
             test.assertEqual(_kernel_record(templated)["kernel"], "world_templates")
             contacts = _contacts(templated, model, state)  # load modules before capture
-            graph, launches = _launched(functools.partial(_capture_collide, templated, state, contacts))
+            graph, launches = _launched(
+                functools.partial(_capture_collide, templated, state, contacts, force_module_load=False)
+            )
             test.assertEqual(launches, {"templates": 1, "flat": 0})
             count = _replay_matches_flat(test, graph, templated, contacts, flat, state)
             # Lift world 4 clear of the global box and its static shape: the replay must read the new poses.
@@ -889,6 +898,79 @@ def test_graph_replays_template_broad_phase(test, device):
             body_q[model.body_world.numpy() == 4, 2] += 3.0
             state.body_q.assign(body_q)
             test.assertLess(_replay_matches_flat(test, graph, templated, contacts, flat, state), count)
+
+
+@contextlib.contextmanager
+def _host_reads_while_capturing(device):
+    """Record the device reads and synchronizations made while ``device`` captures a graph."""
+    calls = []
+
+    def recorded(name, function):
+        def call(*args, **kwargs):
+            if device.is_capturing:
+                calls.append(name)
+            return function(*args, **kwargs)
+
+        return call
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(mock.patch.object(wp.array, "numpy", recorded("numpy", wp.array.numpy)))
+        for name in ("synchronize", "synchronize_device", "synchronize_stream"):
+            stack.enter_context(mock.patch.object(wp, name, recorded(name, getattr(wp, name))))
+        yield calls
+
+
+def test_first_captured_collide_matches_eager(test, device):
+    """Capture a pipeline's first collide(), templates on and off, and replay it like eager runs on live state.
+
+    Each broad-phase mode is captured without a warm-up and reads nothing back from the device
+    inside the capture; the world templates are verified and uploaded when the pipeline is built.
+    """
+    model = _finalize(_replicated_builder(), device)
+    for broad_phase, setting in itertools.product(("explicit", "nxn", "sap"), ("1", "0")):
+        with test.subTest(broad_phase=broad_phase, templates=setting):
+            state = model.state()
+            newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+            captured = _pipeline(model, setting, broad_phase=broad_phase)
+            eager = _pipeline(model, setting, broad_phase=broad_phase)
+            templated = broad_phase == "explicit" and setting == "1"
+            record = _kernel_record(captured)
+            if broad_phase == "explicit":
+                test.assertEqual(record["kernel"], "world_templates" if templated else "flat_pairs")
+            else:
+                test.assertIsNone(record)
+            if templated:
+                test.assertIsNotNone(captured._pair_templates.data)
+            contacts = captured.contacts()
+            with _host_reads_while_capturing(wp.get_device(device)) as reads:
+                graph, launches = _launched(functools.partial(_capture_collide, captured, state, contacts))
+            test.assertEqual(reads, [])
+            test.assertEqual(
+                launches, {"templates": int(templated), "flat": int(broad_phase == "explicit" and not templated)}
+            )
+            eager_contacts = eager.contacts()
+            counts = []
+            for lift in (0.0, 3.0):
+                if lift:
+                    # Lift world 4 clear of the global box and its static shape: the replay must read the new poses.
+                    body_q = state.body_q.numpy()
+                    body_q[model.body_world.numpy() == 4, 2] += lift
+                    state.body_q.assign(body_q)
+                captured.broad_phase_shape_pairs.zero_()
+                captured.broad_phase_pair_count.zero_()
+                contacts.rigid_contact_count.zero_()
+                wp.capture_launch(graph)
+                eager.collide(state, eager_contacts)
+                count = int(eager.broad_phase_pair_count.numpy()[0])
+                test.assertGreater(count, 0)
+                test.assertEqual(int(captured.broad_phase_pair_count.numpy()[0]), count)
+                np.testing.assert_array_equal(
+                    _sorted_codes(captured.broad_phase_shape_pairs.numpy(), count, count),
+                    _sorted_codes(eager.broad_phase_shape_pairs.numpy(), count, count),
+                )
+                np.testing.assert_array_equal(_contact_rows(contacts), _contact_rows(eager_contacts))
+                counts.append(count)
+            test.assertLess(counts[1], counts[0])
 
 
 class TestBroadPhaseTemplates(unittest.TestCase):
@@ -903,6 +985,7 @@ for _name, _function in (
     ("test_verification_rejects_a_changed_list", test_verification_rejects_a_changed_list),
     ("test_pipeline_templates_match_flat_contacts", test_pipeline_templates_match_flat_contacts),
     ("test_pipeline_immovable_filter_matches_flat", test_pipeline_immovable_filter_matches_flat),
+    ("test_first_captured_collide_matches_eager", test_first_captured_collide_matches_eager),
 ):
     add_function_test(TestBroadPhaseTemplates, _name, _function, devices=devices)
 add_function_test(
