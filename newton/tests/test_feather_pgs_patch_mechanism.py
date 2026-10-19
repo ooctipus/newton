@@ -29,6 +29,13 @@ without a product compare bitwise on every device, and every field compares
 bitwise on the CPU. A twin state on another grid of the same compiled module
 steps alongside on CUDA and must match the state under test bitwise
 (:func:`_twin`), so races do not hide below the payload bound.
+
+Captured builds prepare through ``_prepare_frame`` and eager builds through
+``_prepare``, two kernels whose float code NVRTC chooses separately. Solver
+graph tests therefore compare with an always-sort chain that prepares through
+``_prepare_frame`` as well (:func:`_sort_every_build`), which tests frame
+reuse bitwise on any device, and :func:`run_sorting_prepare_parity` compares
+the two kernels on their own.
 """
 
 import contextlib
@@ -2579,6 +2586,21 @@ def _captured(patches, scope=_HOST_SCOPE):
     return patches
 
 
+def _sort_every_build(patches):
+    """Make every later build of ``patches`` sort through _prepare_frame, as a captured build that keeps nothing does.
+
+    Each build reports a capture scope of its own, so none keeps the previous
+    build's pairs. A chain of such builds prepares through the kernel that
+    captured builds launch, so a graph must match it bitwise whatever code the
+    compiler gives _prepare_frame and _prepare; :func:`run_sorting_prepare_parity`
+    compares those two.
+    """
+    if not patches.reuse_frames or patches.conditional_nodes:
+        raise AssertionError("sorting every build through _prepare_frame needs frame reuse without nodes")
+    serials = itertools.count()
+    return _captured(patches, lambda: ("always sort", next(serials)))
+
+
 def _counted_sorts(patches):
     """Return the list each pair sort of ``patches`` appends its live count to."""
     sorts = []
@@ -2598,6 +2620,43 @@ def _recording_pair(scene, capacity):
     plain = _FrictionPatchState(scene.model, capacity, True, phi[0])
     recording = _captured(_FrictionPatchState(scene.model, capacity, True, phi[1], reuse_frames=True))
     return plain, recording
+
+
+def run_sorting_prepare_parity(test, device, *, worlds=3, contacts=96, capacity=128):
+    """Prepare and store new frames bitwise as _prepare does, through _prepare_frame in sort mode.
+
+    The frame-reusing state builds as captured, so every new frame takes
+    _prepare_frame in sort mode, which records the frame in the same launch
+    (no _record_sorted_frame), followed by the same sort as the state without
+    frame reuse. Frames cover live, sparse, overflowing, empty and gated
+    contacts, including static and missing shapes and flipped pairs.
+    """
+    rng = np.random.default_rng(41)
+    scene = _Scene(device, 41, worlds=worlds, contacts=contacts)
+    plain, recording = _recording_pair(scene, capacity)
+    launched = []
+    original = wp.launch
+
+    def record(kernel, *args, **kwargs):
+        launched.append(kernel.key)
+        return original(kernel, *args, **kwargs)
+
+    for step, mode in enumerate(("live", "live", "sparse", "overflow", "live", "empty", "gates", "live")):
+        context = f"{device} step {step} {mode}"
+        scene.move()
+        scene.frame("live" if mode == "gates" else mode)
+        gates = _gates(scene, rng) if mode == "gates" else {}
+        plain.build(scene.model, scene.state, scene.contacts, **gates)
+        launched.clear()
+        with mock.patch.object(wp, "launch", record):
+            recording.build(scene.model, scene.state, scene.contacts, **gates)
+        test.assertEqual(launched.count("_prepare_frame"), 1, context)
+        test.assertNotIn("_record_sorted_frame", launched, f"{context}: the prepare records the frame")
+        assert_same_state(recording, plain, f"{context} build", records=False)
+        _assert_record(test, recording, _frame_identity(recording, scene.contacts), context)
+        for state in (plain, recording):
+            state.store(scene.state)
+        assert_same_state(recording, plain, f"{context} store", records=False)
 
 
 # Capture scopes of the admission table: a graph's main body, a conditional body of
@@ -2756,32 +2815,19 @@ class TestPatchFrameModes(unittest.TestCase):
 
     def test_sorting_prepare_matches_prepare_and_records_the_frame(self):
         """Prepare bitwise as _prepare where the sort follows, and record the frame in the same launch."""
-        rng = np.random.default_rng(41)
-        scene = _Scene("cpu", 41)
-        plain, recording = _recording_pair(scene, 128)
-        launched = []
-        original = wp.launch
+        run_sorting_prepare_parity(self, "cpu")
 
-        def record(kernel, *args, **kwargs):
-            launched.append(kernel.key)
-            return original(kernel, *args, **kwargs)
+    @unittest.skipUnless(wp.is_cuda_available(), "the CUDA build of the prepare kernels needs CUDA")
+    def test_sorting_prepare_matches_prepare_on_the_device(self):
+        """Prepare bitwise as _prepare on CUDA, where each kernel's float code is NVRTC's choice.
 
-        for step, mode in enumerate(("live", "live", "sparse", "overflow", "live", "empty", "gates", "live")):
-            context = f"step {step} {mode}"
-            scene.move()
-            scene.frame("live" if mode == "gates" else mode)
-            gates = _gates(scene, rng) if mode == "gates" else {}
-            plain.build(scene.model, scene.state, scene.contacts, **gates)
-            launched.clear()
-            with mock.patch.object(wp, "launch", record):
-                recording.build(scene.model, scene.state, scene.contacts, **gates)
-            self.assertEqual(launched.count("_prepare_frame"), 1, context)
-            self.assertNotIn("_record_sorted_frame", launched, f"{context}: the prepare records the frame")
-            assert_same_state(recording, plain, f"{context} build", records=False)
-            _assert_record(self, recording, _frame_identity(recording, scene.contacts), context)
-            for state in (plain, recording):
-                state.store(scene.state)
-            assert_same_state(recording, plain, f"{context} store", records=False)
+        This decides whether the default's captured builds, which prepare through
+        _prepare_frame, step bitwise as builds without frame reuse, which prepare
+        through _prepare. The graph tests compare with a chain that prepares
+        through _prepare_frame too (:func:`_sort_every_build`), so their
+        admission check holds either way.
+        """
+        run_sorting_prepare_parity(self, "cuda:0", worlds=48, contacts=2048, capacity=3072)
 
     def test_keep_mode_reuses_the_sorted_pairs_of_the_recorded_frame(self):
         """Keep a recorded frame's sorted pairs on the substeps that share it, bitwise as builds that sort it anew."""
@@ -3038,12 +3084,14 @@ def _nodes_flag(value):
 class _SolverTwin:
     """A FeatherPGS scene under default patch friction with two contact streams and double-buffered states.
 
-    ``reuse=False`` sorts every patch build (``FEATHER_PGS_PATCH_FRAME_REUSE=0``),
-    the always-sort chain other twins compare with; by default captured builds
-    keep reused frames. ``nodes=True`` forces the opt-in conditional nodes on
-    (also on the CPU, where they do not exist, for tests that branch on the host)
-    and ``nodes=False`` turns them off; ``None`` keeps the solver's own choice,
-    which takes them only where the flag requests them (:func:`_nodes_flag`).
+    ``reuse=False`` sorts every patch build (``FEATHER_PGS_PATCH_FRAME_REUSE=0``);
+    by default captured builds keep reused frames, and :meth:`sort_every_build`
+    makes the twin the always-sort chain that graph twins compare with, which
+    prepares through the same kernel as their captured builds. ``nodes=True``
+    forces the opt-in conditional nodes on (also on the CPU, where they do not
+    exist, for tests that branch on the host) and ``nodes=False`` turns them
+    off; ``None`` keeps the solver's own choice, which takes them only where the
+    flag requests them (:func:`_nodes_flag`).
     ``jaws`` selects the squeezing gripper of the friction-anchor tests, whose
     graphs capture two solver steps each, and ``boxes`` free boxes above a
     ground plane, whose contact frames are empty until they land, instead of the
@@ -3098,6 +3146,15 @@ class _SolverTwin:
         """Two substeps that return to ``states[0]``, collided first when ``collide``."""
         self.substep(stream, collide)
         self.substep(stream)
+
+    def sort_every_build(self):
+        """Sort every later patch build through _prepare_frame (:func:`_sort_every_build`) and return the twin.
+
+        Call it after the eager steps that precede a graph's capture, which a
+        graph twin also prepares through _prepare.
+        """
+        _sort_every_build(self.patches)
+        return self
 
     def throw(self, speed):
         """Give every free body of ``states[0]`` an upward velocity."""
@@ -3545,12 +3602,13 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
             with self.subTest(reuse=reuse, nodes=nodes):
                 rng = np.random.default_rng(6)
                 graph = _graph_twin(nodes, reuse=reuse, jaws=True)
-                eager = _SolverTwin("cuda:0", reuse=False, nodes=False, jaws=True)
+                eager = _SolverTwin("cuda:0", nodes=False, jaws=True)
                 # The memset stream forked at each step's end must stay valid across a node's capture pause.
                 self.assertIsNotNone(graph.solver._memset_stream, "the jaws double-buffer their mass matrices")
                 for _ in range(3):
                     for twin in (graph, eager):
                         twin.pair(collide=True)
+                eager.sort_every_build()
                 captured = {}
                 probe = _SortProbe(graph.patches, 2)
                 outcomes, sorts = _admitted_modes(graph.patches), _counted_sort_calls(graph.patches)
@@ -3593,10 +3651,11 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
             with self.subTest(nodes=nodes):
                 rng = np.random.default_rng(8)
                 graph = _graph_twin(nodes, jaws=True)
-                eager = _SolverTwin("cuda:0", reuse=False, nodes=False, jaws=True)
+                eager = _SolverTwin("cuda:0", nodes=False, jaws=True)
                 # Eager steps leave the slots holding the first stream's frame, recorded as sorted.
                 for twin in (graph, eager):
                     twin.pair(collide=True)
+                eager.sort_every_build()
                 count = int(graph.streams[0].rigid_contact_count.numpy()[0])
                 order = np.concatenate((rng.permutation(count), np.arange(count, graph.streams[0].rigid_contact_max)))
                 # The replacement holds the frame reordered, with the same generation and count.
@@ -3622,10 +3681,11 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         for nodes in _node_modes():
             with self.subTest(nodes=nodes):
                 graph = _graph_twin(nodes, jaws=True)
-                eager = _SolverTwin("cuda:0", reuse=False, nodes=False, jaws=True)
+                eager = _SolverTwin("cuda:0", nodes=False, jaws=True)
                 for _ in range(3):
                     for twin in (graph, eager):
                         twin.pair(collide=True)
+                eager.sort_every_build()
                 side = wp.Stream("cuda:0")
                 overlapped = wp.zeros(1024, dtype=float, device="cuda:0")
                 outcomes = _admitted_modes(graph.patches)
@@ -3653,16 +3713,15 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         for nodes in _node_modes():
             with self.subTest(nodes=nodes):
                 graphs = (_graph_twin(nodes, jaws=True), _graph_twin(nodes, boxes=True))
-                eagers = (
-                    _SolverTwin("cuda:0", reuse=False, nodes=False, jaws=True),
-                    _SolverTwin("cuda:0", reuse=False, nodes=False, boxes=True),
-                )
+                eagers = (_SolverTwin("cuda:0", nodes=False, jaws=True), _SolverTwin("cuda:0", nodes=False, boxes=True))
                 for twin in graphs:
                     self.assertIsNotNone(twin.solver._memset_stream, "both solvers double-buffer their mass matrices")
                 # The boxes land before the captures.
                 for _ in range(12):
                     for twin in (*graphs, *eagers):
                         twin.pair(collide=True)
+                for twin in eagers:
+                    twin.sort_every_build()
                 captured = []
                 for together in (True, False):
                     with _capture_without_nodes(nodes) as capture:
@@ -3698,10 +3757,12 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
             with self.subTest(reuse=reuse, nodes=nodes):
                 graph = _graph_twin(nodes, reuse=reuse, boxes=True, radix=False)
                 self.assertEqual(graph.patches.live_sort, reuse is None)
-                eager, control = (_SolverTwin("cuda:0", reuse=False, nodes=False, boxes=True) for _ in range(2))
+                eager, control = (_SolverTwin("cuda:0", nodes=False, boxes=True) for _ in range(2))
                 twins = (graph, eager, control)
                 for twin in twins:
                     twin.pair(collide=True)
+                for twin in (eager, control):
+                    twin.sort_every_build()
                 captured = {}
                 outcomes = _admitted_modes(graph.patches)
                 for collide in (True, False):
@@ -4075,11 +4136,12 @@ def run_captured_collision_passes(test, device, replays):
     for name, passes in _COLLISION_PASSES.items():
         with test.subTest(device=device, passes=name):
             graph = _SolverTwin(device, nodes=False, **scene)
-            eager = _SolverTwin(device, reuse=False, nodes=False, **scene)
+            eager = _SolverTwin(device, nodes=False, **scene)
             test.assertTrue(graph.patches.reuse_frames)
             for _ in range(2 if cuda else 12):
                 for twin in (graph, eager):
                     twin.pair(collide=True)
+            eager.sort_every_build()
             graph.patches.live_sort = False
             probe = _SortProbe(graph.patches, 2 * len(passes))
             outcomes, sorts = _admitted_modes(graph.patches), _counted_sort_calls(graph.patches)
@@ -4109,10 +4171,11 @@ def run_captured_steps_without_a_collision_pass(test, device, replays):
     replays, as they may around a graph of substeps.
     """
     graph = _SolverTwin(device, nodes=False, boxes=True)
-    eager = _SolverTwin(device, reuse=False, nodes=False, boxes=True)
+    eager = _SolverTwin(device, nodes=False, boxes=True)
     for _ in range(12):
         for twin in (graph, eager):
             twin.pair(collide=True)
+    eager.sort_every_build()
     outcomes = _admitted_modes(graph.patches)
     with _capture_without_nodes(None, device) as capture:
         graph.solver.seed_double_buffer_events()
@@ -4154,10 +4217,11 @@ def run_captured_contact_writes(test, device):
     for write in ("count", "generation", "clear"):
         with test.subTest(device=device, write=write):
             graph = _SolverTwin(device, nodes=False, boxes=True)
-            eager = _SolverTwin(device, reuse=False, nodes=False, boxes=True)
+            eager = _SolverTwin(device, nodes=False, boxes=True)
             for _ in range(12):
                 for twin in (graph, eager):
                     twin.pair(collide=True)
+            eager.sort_every_build()
             test.assertTrue(np.any(graph.patches.previous.valid.numpy()), "the landed boxes must store anchors")
             saved = {twin: wp.zeros(1, dtype=wp.int32, device=device) for twin in (graph, eager)}
 
@@ -4228,7 +4292,7 @@ def run_captured_entry_filter(test, device, replays):
     poses[:, 2] = 0.019
     state.body_q.assign(poses)
     phi = [wp.zeros(128, dtype=wp.vec2, device=device) for _ in range(2)]
-    plain = _FrictionPatchState(model, 128, True, phi[0])
+    plain = _FrictionPatchState(model, 128, True, phi[0], reuse_frames=True)
     patches = _FrictionPatchState(model, 128, True, phi[1], reuse_frames=True)
 
     def entry_passes(states, passes=2):
@@ -4246,6 +4310,7 @@ def run_captured_entry_filter(test, device, replays):
         return filtered
 
     filtered = entry_passes((plain, patches), passes=1)
+    _sort_every_build(plain)
     test.assertIsNot(filtered, contacts)
     test.assertGreater(int(filtered.rigid_contact_count.numpy()[0]), 0, "the boxes must touch the ground")
     outcomes = _admitted_modes(patches)
