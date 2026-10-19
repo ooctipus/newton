@@ -135,17 +135,19 @@ class TestFeatherPGSFusedVelocityLimitOrdering(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free FPGS requires CUDA")
     def test_impact_drives_an_unlimited_arm_past_the_limit(self):
-        """Drive the arm at least twice past the limit when no velocity limit acts, so the limit tests bind.
+        """Drive the arm at least twice past the limit on every contact response when no velocity limit acts.
 
-        Every other test here holds the limit through the impact, which an impact
-        that never reached the limit would pass vacuously. A CPU split solver
-        (augmented drives, 8 iterations) carries the unlimited arm to 6.3 times
-        the limit.
+        Every other test here holds the limit through the impact on one of these
+        responses, which an impact that never reached the limit would pass
+        vacuously. A CPU split solver (augmented drives, 8 iterations) carries the
+        unlimited arm to 6.3 times the limit.
         """
-        speed = self._max_arm_speed_over_impact(
-            fuse=False, articulated_contact_response="immediate", velocity_limits=False
-        )
-        self.assertGreater(speed, 2.0 * QDOT_MAX)
+        for response in ("immediate", "propagation", "propagation-fused"):
+            with self.subTest(articulated_contact_response=response):
+                speed = self._max_arm_speed_over_impact(
+                    fuse=False, articulated_contact_response=response, velocity_limits=False
+                )
+                self.assertGreater(speed, 2.0 * QDOT_MAX)
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free FPGS requires CUDA")
     def test_dedicated_rows_hold_limit_through_impact(self):
