@@ -1556,14 +1556,21 @@ class SolverFeatherPGS(SolverBase):
                 Explicit positive gains with an incompatible point algorithm raise an error.
                 Each step sorts its patch contact pairs, except a step captured in a CUDA graph
                 right after another captured step of the same graph over the same ``Contacts``,
-                with no collision pass, :meth:`~newton.Contacts.clear` or coupled-solver contact
-                filter in between: it reuses that step's sorted pairs, which saves the sort on
-                every substep that shares a collision pass. Code that rewrites contact arrays
-                between two such captured steps must do so through those writers. A step that
-                finds its contacts rewritten otherwise (a different ``contact_generation``, count
-                or ``Contacts``) is solved without patch friction rows and its anchors are
-                released; :meth:`constraint_capacity_status` reports it as ``patch_frames`` and
-                :meth:`check_constraint_capacity` raises. ``FEATHER_PGS_PATCH_FRAME_REUSE=0``
+                with no write of those contacts by Newton in between (a collision pass,
+                :meth:`~newton.Contacts.clear`, a coupled-solver contact filter or
+                :meth:`~newton.solvers.SolverMuJoCo.update_contacts`): it reuses that step's
+                sorted pairs, which saves the sort on every substep that shares a collision
+                pass. Code that rewrites contact arrays between two such captured steps must
+                call :meth:`~newton.Contacts.clear` first, which makes the next step sort, or set
+                ``FEATHER_PGS_PATCH_FRAME_REUSE=0``. Otherwise only a change of
+                ``contact_generation`` or of the contact count is detected: that step is solved
+                without patch friction rows and its anchors are released;
+                :meth:`constraint_capacity_status` reports it as ``patch_frames`` and
+                :meth:`check_constraint_capacity` raises. A rewrite that keeps both but changes
+                which shapes a contact slot pairs, or reorders contacts, is not detected: that
+                step groups its contacts by the previous step's sorted pairs. Rewriting only
+                contact points, normals or margins is exact, since pairs depend on the shapes
+                alone and every step recomputes the rest. ``FEATHER_PGS_PATCH_FRAME_REUSE=0``
                 sorts every step. The experimental opt-in ``FEATHER_PGS_PATCH_CONDITIONAL_NODES=1``
                 sorts the other captured steps under a conditional graph node that skips empty
                 contact frames and the frame sorted last (the same ``Contacts``,
@@ -11508,12 +11515,12 @@ class SolverFeatherPGS(SolverBase):
         The keys ``dense``, ``matrix_free``, and ``propagation`` identify row
         buffers whose capacity omitted constraints. ``contacts`` identifies an
         incoming contact count exceeding its materialized storage.
-        ``patch_frames`` identifies a captured step of patch friction that
-        found its contact frame rewritten since the previous captured step of
-        the same graph without a collision pass or :meth:`~newton.Contacts.clear`,
-        and solved that step without patch friction rows (see
-        ``friction_anchor_beta``). Flags remain set across later successful
-        steps and :meth:`reset` calls.
+        ``patch_frames`` identifies a captured step of patch friction whose
+        ``contact_generation`` or contact count changed since the previous
+        captured step of the same graph without a write Newton noted (such as
+        a collision pass or :meth:`~newton.Contacts.clear`), and which was
+        solved without patch friction rows (see ``friction_anchor_beta``).
+        Flags remain set across later successful steps and :meth:`reset` calls.
 
         Call outside CUDA graph capture, on the solver's execution stream or
         after explicitly joining that stream. This copies five integers to the
@@ -11563,10 +11570,10 @@ class SolverFeatherPGS(SolverBase):
         frame_status = getattr(self._friction_patches, "frame_status", None)
         if frame_status is not None and frame_status.numpy()[0]:
             raise RuntimeError(
-                "FeatherPGS solved captured steps without patch friction: their contacts were rewritten since the "
-                "previous captured step of the same graph without a collision pass or Contacts.clear(). Write "
-                "contacts between captured steps through those, or set FEATHER_PGS_PATCH_FRAME_REUSE=0; "
-                "constraint_capacity_status(clear=True) clears the flag."
+                "FeatherPGS solved captured steps without patch friction: their contact generation or count changed "
+                "since the previous captured step of the same graph without a collision pass or Contacts.clear(). "
+                "Call Contacts.clear() before rewriting contacts between captured steps, or set "
+                "FEATHER_PGS_PATCH_FRAME_REUSE=0; constraint_capacity_status(clear=True) clears the flag."
             )
 
     def constraint_row_watermarks(self) -> dict:

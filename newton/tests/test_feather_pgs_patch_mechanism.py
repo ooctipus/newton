@@ -2832,6 +2832,51 @@ class TestPatchFrameModes(unittest.TestCase):
                 _assert_record(self, patches, _frame_identity(patches, contacts), f"{change} sort")
                 np.testing.assert_array_equal(patches.frame_status.numpy(), [1])
 
+    def test_keep_mode_misses_unnoted_rewrites_of_equal_generation_and_count(self):
+        """Keep the pairs through unnoted in-place rewrites that keep the generation and count, as documented.
+
+        The device guard compares the generation and the raw count only. A
+        rewrite of points, normals and margins alone keeps every pair, so the
+        kept build equals a sorting build bitwise. Reordering the contacts in
+        place goes unseen: the kept build groups them by the previous order's
+        pairs, with indices still below the live count, and reports nothing.
+        """
+        rng = np.random.default_rng(48)
+        for rewrite in ("geometry", "order"):
+            with self.subTest(rewrite=rewrite):
+                scene = _Scene("cpu", 48)
+                scene.active[:] = True
+                plain, recording = _recording_pair(scene, 128)
+                sorts = _counted_sorts(recording)
+                live = scene.frame()
+                self.assertGreater(live, 2)
+                for state in (plain, recording):
+                    state.build(scene.model, scene.state, scene.contacts)
+                kept = recording.current.indices.numpy()[:live].copy()
+                contacts = scene.contacts
+                if rewrite == "geometry":
+                    for name in ("rigid_contact_point0", "rigid_contact_point1", "rigid_contact_normal"):
+                        values = getattr(contacts, name).numpy()
+                        values[:live] += rng.normal(scale=1.0e-3, size=(live, 3))
+                        getattr(contacts, name).assign(values)
+                    margins = contacts.rigid_contact_margin0.numpy()
+                    margins[:live] = rng.uniform(0.0, 2.0e-3, size=live)
+                    contacts.rigid_contact_margin0.assign(margins)
+                else:
+                    _swapped_stream(scene, live, rng, contacts)
+                for state in (plain, recording):
+                    state.build(scene.model, scene.state, contacts)
+                self.assertEqual(len(sorts), 1, "the unnoted rewrite is admitted as a reuse")
+                np.testing.assert_array_equal(recording.frame_status.numpy(), [0], "the guard cannot see it")
+                self.assertEqual(int(recording.extent.numpy()[1]), live)
+                if rewrite == "geometry":
+                    assert_same_state(recording, plain, rewrite, records=False)
+                    continue
+                indices = recording.current.indices.numpy()[:live]
+                np.testing.assert_array_equal(indices, kept, "the kept build holds the previous order")
+                self.assertFalse(np.array_equal(indices, plain.current.indices.numpy()[:live]), "the order is stale")
+                np.testing.assert_array_equal(np.sort(indices), np.arange(live), "indices stay below the live count")
+
 
 def _expected_pairs(model, contacts, capacity):
     """Return the sorted pair keys and slot order of the live contacts, computed on the host."""

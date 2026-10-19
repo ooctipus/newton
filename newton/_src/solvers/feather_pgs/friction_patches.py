@@ -1415,9 +1415,13 @@ class _FrictionPatchState:
     ``contact_generation`` array, and no write of that contact stream was noted
     since (:func:`~newton._src.sim.contacts.note_contact_frame_write`) nor
     :meth:`forget_frame` called. Every other build sorts. The device checks each
-    kept build against the frame the last sort recorded: a frame rewritten by a
-    writer the host never saw leaves that build empty and latches
-    ``frame_status``, so stale pairs never group contacts.
+    kept build's contact generation and raw count against the frame the last
+    sort recorded: a writer the host never saw that changed either leaves that
+    build empty and latches ``frame_status``. One that kept both but changed the
+    shapes of a contact slot, or the contacts' order, goes unseen, and the kept
+    build groups its contacts by the stale pairs; its kept indices still lie
+    below the live count. Rewrites of points, normals or margins alone are
+    exact: pair keys follow the shapes, and a kept build prepares the rest anew.
 
     ``small_live_sort`` lets capacities up to ``_CHUNK_SORT_CAPACITY`` sort only
     their live slots, as capacities from ``_LIVE_SORT_CAPACITY`` on do.
