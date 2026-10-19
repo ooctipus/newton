@@ -129,7 +129,7 @@ def fingerprint(array):
 
 
 class DeviceProof:
-    """Frozen evidence for a named set of arrays, validated on the device when possible."""
+    """Frozen and watched evidence for a named set of arrays, validated on the device when possible."""
 
     def __init__(self, entries, device, *, watched=()):
         """``entries``: iterable of ``(label, array)``; ``device``: the owner's device.

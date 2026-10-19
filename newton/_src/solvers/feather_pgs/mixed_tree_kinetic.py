@@ -615,7 +615,10 @@ class MixedTreeKineticState:
         """Reject ownership changes before any cache or notification mutation.
 
         Returns:
-            Whether every group's proof ran and passed (see :meth:`TreeKineticState.validate_model`).
+            Whether every group's proof ran and found its inputs unchanged (see
+            :meth:`TreeKineticState.validate_model`). A scalar group without a
+            proof of its own counts as passed: its tree neighbours prove the
+            same model arrays.
         """
         if not proof_runs(flags):
             # Numeric notifications cannot change ownership; see TreeKineticState.
