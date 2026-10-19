@@ -14,7 +14,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import cached_state_binding, capture_joins
+from newton._src.solvers.feather_pgs import cached_state_binding, capture_joins, tree_kinetic_owner
 from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.test_feather_pgs_mixed_tree_free_body import _build
@@ -572,8 +572,9 @@ def _counted_launches(kernels):
 
 
 def _repair_kernels(owner):
-    """Every kernel that repairs a group's cache."""
-    return {group.repair_kernel for group in _groups(owner)}
+    """Every kernel that repairs a group's cache: the one-pass repair and the repair over a classified block list."""
+    kernels = {group.repair_kernel for group in _groups(owner)}
+    return kernels | {group.listed_repair_kernel for group in _groups(owner)} - {None}
 
 
 class TestFeatherPGSCapturedRepair(unittest.TestCase):
@@ -785,6 +786,157 @@ class TestFeatherPGSCapturedRepair(unittest.TestCase):
             finals.append({field: getattr(rollout.states[0], field).numpy() for field in STATE_FIELDS})
         for field in STATE_FIELDS:
             np.testing.assert_allclose(finals[1][field], finals[0][field], rtol=0.0, atol=2e-6, err_msg=field)
+
+
+def _repair_arrays(group, data):
+    """Every array a group's repair reads or writes: its publication operands and its cache, by name."""
+    arrays = {}
+    for prefix, struct in (("data", data), ("cache", group.data)):
+        for name in struct._cls.vars:
+            value = getattr(struct, name)
+            if isinstance(value, wp.array) and name != "stage_clocks":
+                arrays[f"{prefix}.{name}"] = value
+    return arrays
+
+
+class TestFeatherPGSClassifiedRepair(unittest.TestCase):
+    def test_repair_lists_its_blocks_when_the_groups_should_be_current(self):
+        """Classify and repair over the block list when the stamps should name the input bank; else launch every block.
+
+        The list is expected after a finish that published the input bank and after a bank
+        comparison. The first step, and a step from a bank no finish published without a
+        comparison, launch the one-pass repair. CPU keeps the one-pass repair unless a group is
+        switched; launches are recorded, not run.
+        """
+        _, _, owner, (s0, s1), augmented = _cpu_owner()
+        self.assertFalse(owner.classify_first)
+        for group in owner.groups:
+            self.assertIsNone(group.classify_kernel)
+            group.classify_first = True
+            group._bind_kernels()
+        kinds = {}
+        for group in owner.groups:
+            kinds.update(
+                {
+                    group.repair_kernel: "repair",
+                    group.bank_kernel: "bank",
+                    group.classify_kernel: "classify",
+                    group.listed_repair_kernel: "listed",
+                }
+            )
+
+        def launches(call):
+            stack, records = _recorded_launches(("launch", "launch_tiled"))
+            with stack:
+                call()
+            listed = [kwargs.get("max_blocks") for kernel, _, kwargs in records if kinds.get(kernel) == "listed"]
+            self.assertTrue(all(blocks == owner.groups[0]._repair_grid for blocks in listed))
+            return [kinds[kernel] for kernel, _, _ in records if kernel in kinds]
+
+        def begin(state_in, state_out=None):
+            return launches(lambda: owner.begin(state_in, augmented, state_in.joint_qd, DT, False, state_out=state_out))
+
+        def finish():
+            launches(lambda: owner.finish(s0, augmented, s1, DT, False))
+
+        groups = len(owner.groups)
+        self.assertEqual(begin(s0, s1), ["repair"] * groups)  # nothing published yet
+        finish()
+        self.assertEqual(begin(s1, s0), ["classify", "listed"] * groups)  # the finish published the input bank
+        finish()
+        self.assertEqual(begin(s0, s1), ["bank", "classify", "listed"] * groups)  # a copy, compared first
+        finish()
+        self.assertEqual(begin(s0), ["repair"] * groups)  # another bank, no comparison
+        with patch.dict(os.environ, {"FEATHER_PGS_TREE_REPAIR_CLASSIFY": "0"}):
+            self.assertEqual(tree_kinetic_owner.launch_switches(), (True, False))
+        self.assertEqual(tree_kinetic_owner.launch_switches(), (True, True))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
+    def test_cuda_classified_repair_matches_the_one_pass_repair(self):
+        """Compute bitwise the same caches and publication with the classified repair as with one block per group.
+
+        From one device state with random invalid, requested, geometrically stale, foreign-stamped
+        and (velocity-limit layouts) motion-changed groups, the one-pass repair and the classified
+        repair write identical words to every array the repair reaches, for packed per-size groups,
+        a packed forest, chain-scan sparse trees and a velocity-limit layout. The blocks the
+        classification lists are exactly those with a group the one-pass repair recomputed.
+        """
+        device = wp.get_device("cuda:0")
+        rng = np.random.default_rng(20261019)
+        packed = {"FEATHER_PGS_TREE_LANE_PACK": "8"}
+        cases = {
+            "mixed": lambda: _mixed_solver(_build(device, worlds=8)),
+            "forest": lambda: _mixed_solver(_build(device, worlds=8, prescribed=True), forest=True),
+            "sparse": lambda: _owned_case("sparse", device)[1],
+            "motion": lambda: _mixed_solver(
+                _build(device, worlds=8, speed_limit=0.8), enable_joint_velocity_limits=True
+            ),
+        }
+        for name, build in cases.items():
+            with self.subTest(owner=name), patch.dict(os.environ, packed if name != "sparse" else {}):
+                solver = build()
+                owner = solver._tree_kinetic_state
+                self.assertIsNotNone(owner)
+                self.assertTrue(owner.classify_first)
+                rollout = _Rollout(solver.model, solver)
+                rollout.block()
+                state = rollout.states[0]
+                for seed in range(4):
+                    motion = wp.clone(state.joint_qd)
+                    data = _groups(owner)[0]._publication(state, solver, state, DT)
+                    arrays = {}
+                    for index, group in enumerate(_groups(owner)):
+                        arrays.update({f"{index}.{key}": value for key, value in _repair_arrays(group, data).items()})
+                    arrays["requests"] = solver._mass_update_requested
+                    self._scramble(rng, owner, solver, state, motion, seed)
+                    start = {key: value.numpy().copy() for key, value in arrays.items()}
+                    results = []
+                    for classify in (False, True):
+                        for key, value in arrays.items():
+                            value.assign(start[key])
+                        for group in _groups(owner):
+                            group.classify_first = classify
+                            group._published = (state.joint_q.ptr, state.joint_qd.ptr)
+                            group._continuity = None
+                        velocity = motion if _groups(owner)[0].motion_velocity else state.joint_qd
+                        owner.begin(state, solver, velocity, DT, bool(seed % 2))
+                        results.append({key: value.numpy().copy() for key, value in arrays.items()})
+                        if classify:
+                            listed = [
+                                np.sort(group._repair_blocks.numpy()[: int(group._repair_count.numpy()[0])])
+                                for group in _groups(owner)
+                            ]
+                    for key in arrays:
+                        np.testing.assert_array_equal(results[1][key], results[0][key], err_msg=f"{name} {seed} {key}")
+                    for index, (group, blocks) in enumerate(zip(_groups(owner), listed, strict=True)):
+                        generation = f"{index}.cache.generation"
+                        repaired = results[0][generation] != start[generation]
+                        expected = np.flatnonzero(repaired.reshape(-1, group.layout.pack).any(axis=1))
+                        np.testing.assert_array_equal(blocks, expected, err_msg=f"{name} {seed} group {index}")
+                    for group in _groups(owner):
+                        group.classify_first = True
+
+    @staticmethod
+    def _scramble(rng, owner, solver, state, motion, seed):
+        """Invalidate, request, stale, foreign-stamp and (motion layouts) motion-change random groups."""
+        arts = solver.model.articulation_count
+        valid = solver._fk_id_cache_valid.numpy()
+        valid[rng.random(arts) < 0.3] = 0
+        solver._fk_id_cache_valid.assign(valid)
+        solver._mass_update_requested.assign((rng.random(arts) < 0.2).astype(np.int32))
+        for group in _groups(owner):
+            count = group.group_count
+            geometry = group.geometry_valid.numpy()
+            geometry[rng.random(count) < 0.2] = 0
+            group.geometry_valid.assign(geometry)
+            stamps = group.data.source_q.numpy()
+            stamps[rng.random(count) < 0.2] = 12345
+            group.data.source_q.assign(stamps)
+        if _groups(owner)[0].motion_velocity:
+            qd = motion.numpy()
+            changed = rng.random(qd.size) < 0.1
+            qd[changed] = qd[changed] * 0.5 + 0.01 * (seed + 1)
+            motion.assign(qd)
 
 
 def _mass_matrices(solver):

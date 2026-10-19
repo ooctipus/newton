@@ -601,6 +601,13 @@ FLAGS = declare(
         "=1 selects the serial held solve, level reduction and shared-memory scans in held-tree kernels.",
     ),
     _flag(
+        "FEATHER_PGS_TREE_REPAIR_CLASSIFY",
+        "policy",
+        ("tree_kinetic_owner",),
+        "=0 keeps the one-pass held-tree repair launch (default 1 on CUDA: list the blocks to repair, then repair "
+        "over the list on a capped grid).",
+    ),
+    _flag(
         "FEATHER_PGS_TREE_REPAIR_SKIP",
         "policy",
         ("tree_kinetic_owner",),

@@ -94,13 +94,30 @@ def launch_switches():
     """Read the held-tree repair launch switches, once per owner.
 
     ``FEATHER_PGS_TREE_REPAIR_SKIP=0`` launches the repair of every captured
-    step, also where every block would take the early exit. The switch
-    chooses launches, not emitted code.
+    step, also where every block would take the early exit.
+    ``FEATHER_PGS_TREE_REPAIR_CLASSIFY=0`` keeps the one-pass repair launch
+    over every block. The switches choose launches, not emitted code.
 
     Returns:
-        ``(skip,)``.
+        ``(skip, classify)``.
     """
-    return (os.environ.get("FEATHER_PGS_TREE_REPAIR_SKIP", "1") != "0",)
+    return (
+        os.environ.get("FEATHER_PGS_TREE_REPAIR_SKIP", "1") != "0",
+        os.environ.get("FEATHER_PGS_TREE_REPAIR_CLASSIFY", "1") != "0",
+    )
+
+
+# Blocks per SM of a listed repair's grid: the most a CUDA SM keeps resident, so a
+# long list keeps the one-pass launch's concurrency and a short one exits in about a
+# wave. A grid-stride loop covers every block of the list.
+_LISTED_BLOCKS_PER_SM = 32
+
+
+def listed_repair_blocks(device):
+    """Grid of a listed repair: :data:`_LISTED_BLOCKS_PER_SM` per SM, or 0 (every block) without grid-stride kernels."""
+    if not device.is_cuda or not getattr(wp.config, "default_grid_stride", True):
+        return 0
+    return _LISTED_BLOCKS_PER_SM * int(device.sm_count)
 
 
 class TreeKineticState:
@@ -118,6 +135,11 @@ class TreeKineticState:
     motion-velocity layouts (:attr:`skip_captured_repairs`): every block
     would take the early exit. The solver calls :meth:`forget_continuity`
     from every host call that changes validity, requests or the step.
+
+    On CUDA (:attr:`classify_first`), a repair whose groups are expected to
+    be stamped with the input bank lists the blocks that need it, one thread
+    per block, and repairs over that list on a capped grid, instead of
+    launching a block per group that mostly confirms its cache.
     """
 
     def __init__(
@@ -131,6 +153,7 @@ class TreeKineticState:
         reference=None,
         clocked=None,
         skip=None,
+        classify=None,
     ):
         from . import tree_kinetic_state as native  # noqa: PLC0415
 
@@ -148,11 +171,14 @@ class TreeKineticState:
         # Motion-velocity layouts keep identity validation: their repair reads the
         # prescaled velocity, and the solver keeps its host identity check for them.
         self.bank_compare = not self.motion_velocity
-        if skip is None:
-            (skip,) = launch_switches()
+        switches = launch_switches()
+        skip = switches[0] if skip is None else skip
+        classify = switches[1] if classify is None else classify
         # A motion-velocity repair also compares the prescaled velocity, which the
         # step recomputes after the finish; its launches always run.
         self.skip_captured_repairs = bool(skip) and not self.motion_velocity
+        # The CPU twin keeps the one-pass repair.
+        self.classify_first = bool(classify) and device.is_cuda
         # (capture id, whether the finish computed the next geometry) of the last
         # finish inside a capture; the next begin consumes it.
         self._continuity = None
@@ -325,6 +351,11 @@ class TreeKineticState:
         self.data.source_q = wp.zeros(groups, dtype=wp.uint64, device=device)
         self.data.source_qd = wp.zeros(groups, dtype=wp.uint64, device=device)
         self.data.status = wp.zeros(groups, dtype=int, device=device)
+        # A listed repair's blocks (at most one per group) and their count, allocated
+        # before any capture.
+        self._repair_blocks = wp.empty(groups, dtype=int, device=device)
+        self._repair_count = wp.zeros(1, dtype=int, device=device)
+        self._repair_grid = listed_repair_blocks(device)
         self.data.current_valid.zero_()
         self.bias = self.data.bias
         self.geometric = self.data.geometric
@@ -368,6 +399,21 @@ class TreeKineticState:
             if self.bank_compare
             else None
         )
+        self.classify_kernel = self.listed_repair_kernel = None
+        if self.classify_first:
+            self.classify_kernel = native.get_classify_kernel(
+                self.chain_scan, layout=layout, motion_velocity=self.motion_velocity
+            )
+            self.listed_repair_kernel = native.get_state_kernel(
+                False,
+                self.chain_scan,
+                layout=layout,
+                body_velocity=self._body_velocity,
+                motion_velocity=self.motion_velocity,
+                listed=True,
+                reference=self.reference,
+                clocked=self.clocked,
+            )
         self.finish_kernel = native.get_state_kernel(
             True,
             self.chain_scan,
@@ -590,12 +636,13 @@ class TreeKineticState:
             self._motion_binding = binding
             return
         data = self._publication(state_in, state_aug, state_in, dt)
-        if (
+        compared = (
             self.bank_compare
             and state_out is not None
             and self._published == _bank_pointers(state_out)
             and source != self._published
-        ):
+        )
+        if compared:
             # The stamps name the output bank: an odd substep count copied it
             # back into the input bank, or the caller passes a copy of it.
             wp.launch_tiled(
@@ -615,13 +662,35 @@ class TreeKineticState:
         ]
         if self.motion_velocity:
             arguments.append(stage3_qd)
-        wp.launch_tiled(
-            self.repair_kernel,
-            dim=[self.launch_count],
-            inputs=arguments,
-            block_dim=self.block_dim,
-            device=device,
-        )
+        if self.classify_first and (compared or source == self._published):
+            # Most groups should be stamped with this bank and only confirm their
+            # caches: list the blocks that repair and run the repair over the list.
+            # Without that expectation (first step, an identity invalidation) every
+            # group repairs and the one-pass launch is cheaper.
+            self._repair_count.zero_()
+            wp.launch(
+                self.classify_kernel,
+                dim=self.launch_count,
+                inputs=[*arguments[:6], stage3_qd, self._repair_blocks, self._repair_count],
+                block_dim=64,
+                device=device,
+            )
+            wp.launch_tiled(
+                self.listed_repair_kernel,
+                dim=[self.launch_count],
+                inputs=[*arguments, self._repair_blocks, self._repair_count],
+                block_dim=self.block_dim,
+                max_blocks=self._repair_grid,
+                device=device,
+            )
+        else:
+            wp.launch_tiled(
+                self.repair_kernel,
+                dim=[self.launch_count],
+                inputs=arguments,
+                block_dim=self.block_dim,
+                device=device,
+            )
         self._published = source
         self._motion_binding = binding
 

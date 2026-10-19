@@ -876,18 +876,27 @@ def get_state_kernel(
     layout: TreeLayout = REFERENCE_LAYOUT,
     body_velocity: bool = False,
     motion_velocity: bool = False,
+    listed: bool = False,
     reference: bool = False,
     clocked: bool = False,
     host: bool = False,
 ):
     """Build complete repair/finish using original generalized integration laws.
 
-    ``reference`` and ``clocked`` select the comparison forms and the stage
-    counters; ``host`` the static CPU scratch of an owner on the CPU (see
+    ``listed`` builds the repair over the block list of
+    :func:`get_classify_kernel`: logical block ``item`` repairs listed block
+    ``repair_blocks[item]`` and items past ``repair_count[0]`` return at once,
+    so a launch over every block on a capped grid (Warp's grid-stride loop)
+    costs little more than the listed blocks. Each listed group runs the
+    repair unchanged, early exit included. ``reference`` and ``clocked``
+    select the comparison forms and the stage counters; ``host`` the static
+    CPU scratch of an owner on the CPU (see
     :func:`get_helpers`).
     """
     if finish and motion_velocity:
         raise ValueError("Alternate motion velocity is a repair-only contract")
+    if finish and listed:
+        raise ValueError("A listed launch is a repair-only contract")
     h = get_helpers(layout, chain_scan, body_velocity, reference=reference, clocked=clocked, host=host)
     release = _keep_static if host else _release
     plan_type = h.plan_type
@@ -910,6 +919,7 @@ def get_state_kernel(
     motion_setup = "motion_changed = _different_motion(data.joint_qd, motion_qd, ds, dofs)\n" if motion_velocity else ""
     motion_reuse = "        and motion_changed == 0\n" if motion_velocity else ""
     motion_bind = "qd = motion_qd" if motion_velocity else ""
+    listed_block = "if item >= repair_count[0]:\n    return\nblock = repair_blocks[item]\n" if listed else ""
     motion_clock = ["pass"] * 4
     if clocked:
         motion_clock = [f"clock_m{k} = _clock()" for k in range(4)]
@@ -929,11 +939,12 @@ else:
     _stamp_source(cache, group, q, qd)"""
     stages = StateStages(
         setup=f"""
-block, logical_lane = wp.tid()
+{"item" if listed else "block"}, logical_lane = wp.tid()
 lanes = _lanes()
 lane, stride = lanes[0], lanes[1]
 if stride == 1 and logical_lane != 0:
     return
+{listed_block}\
 group = block * wp.static(pack) + lanes[2]
 art = p.group_to_art[group]
 ds, js = p.art_dof_start[art], p.art_joint_start[art]
@@ -1076,6 +1087,9 @@ if lane == 0:
     if motion_velocity:
         name += "_motion"
         signature += ", motion_qd: wp.array[float]"
+    if listed:
+        name += "_listed"
+        signature += ", repair_blocks: wp.array[int], repair_count: wp.array[int]"
     return make_state_kernel(
         name,
         signature,
@@ -1152,6 +1166,84 @@ def get_bank_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFERENCE_
         name += "_chain"
     bank_pass.__name__ = bank_pass.__qualname__ = name
     return wp.kernel(module="unique", enable_backward=False)(bank_pass)
+
+
+# One thread's form of the repair's motion test (_DIFFERENT_MOTION_SOURCE): whether any
+# of a group's velocities differs from its motion velocity.
+@wp.func_native(
+    "if(state_qd.data==motion_qd.data)return 0;"
+    "for(int i=0;i<count;++i)if(state_qd.data[start+i]!=motion_qd.data[start+i])return 1;"
+    "return 0;"
+)
+def _motion_differs(state_qd: wp.array[float], motion_qd: wp.array[float], start: int, count: int) -> int: ...
+
+
+@functools.cache
+def get_classify_kernel(
+    chain_scan: bool = False, *, layout: TreeLayout = REFERENCE_LAYOUT, motion_velocity: bool = False
+):
+    """List the repair blocks holding a group whose repair would not take its early exit; one thread per block.
+
+    A group needs its repair unless the repair's setup would return early: its
+    cache and its forest roots' caches are valid, it is stamped with the input
+    bank, its motion velocity is unchanged (motion-velocity layouts only), and
+    the step does not refresh it or its geometry is current. A block is listed,
+    in no set order, when any of its groups needs its repair. The listed repair
+    (``get_state_kernel(listed=True)``) runs each listed group's repair
+    unchanged; blocks share no cache, state or publication entries, so every
+    group computes the same values as in the one-pass launch.
+    """
+    plan_type = tree_chain_scan.ChainPlan if chain_scan else KineticPlan
+    pack, roots, forest, dofs = layout.pack, len(layout.roots), layout.forest, layout.dofs
+
+    def classify(
+        p: sparse_factor.SparsePlan,
+        plan: plan_type,
+        data: PublicationData,
+        cache: KineticData,
+        requests: wp.array[int],
+        global_refresh: int,
+        motion_qd: wp.array[float],
+        repair_blocks: wp.array[int],
+        repair_count: wp.array[int],
+    ):
+        block = wp.tid()
+        needed = int(0)
+        for sub in range(wp.static(pack)):
+            group = block * wp.static(pack) + sub
+            art = p.group_to_art[group]
+            valid = cache.current_valid[art]
+            refresh = int(global_refresh != 0 or requests[art] != 0)
+            if wp.static(forest):
+                for root in range(1, wp.static(roots)):
+                    valid = wp.min(valid, cache.current_valid[plan.arts[group, root]])
+                    refresh = int(refresh != 0 or requests[plan.arts[group, root]] != 0)
+            exits = int(valid != 0)
+            if exits != 0:
+                exits = _same_source(cache, group, data.joint_q, data.joint_qd)
+            if exits != 0 and refresh != 0:
+                exits = int(
+                    cache.geometry_valid[group] != 0 and cache.geometry_generation[group] == cache.generation[group]
+                )
+            if wp.static(motion_velocity):
+                if exits != 0:
+                    exits = int(_motion_differs(data.joint_qd, motion_qd, p.art_dof_start[art], wp.static(dofs)) == 0)
+            if exits == 0:
+                needed = 1
+        if needed != 0:
+            repair_blocks[wp.atomic_add(repair_count, 0, 1)] = block
+
+    name = f"tree_kinetic_classify{layout.bodies}"
+    if forest:
+        name += f"_forest{roots}"
+    if pack > 1:
+        name += f"_l{layout.lanes}"
+    if chain_scan:
+        name += "_chain"
+    if motion_velocity:
+        name += "_motion"
+    classify.__name__ = classify.__qualname__ = name
+    return wp.kernel(module="unique", enable_backward=False)(classify)
 
 
 @functools.cache

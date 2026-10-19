@@ -273,6 +273,9 @@ def _tree_group(group) -> dict:
         # Within one graph capture, a repair after this group's finish on the bank it published
         # launches nothing (FEATHER_PGS_TREE_REPAIR_SKIP=0 keeps it; motion-velocity layouts always launch).
         "captured_repair_skip": bool(group.skip_captured_repairs),
+        # On CUDA, a repair whose groups should be stamped with the step's input bank lists the blocks
+        # that repair and repairs over the list (FEATHER_PGS_TREE_REPAIR_CLASSIFY=0 keeps one launch per block).
+        "classify_first": bool(group.classify_first),
         "motion_velocity": bool(group.motion_velocity),
         "publishes_twists": bool(group.publishes_twists),
         # Several admissible widths are timed once at construction (measurements.held_tree_lane_timing_us);
@@ -282,6 +285,10 @@ def _tree_group(group) -> dict:
             "repair": _key(group.repair_kernel),
             "finish": _key(group.finish_kernel),
             "predict": _key(group.predictor_kernel),
+            # None where the group neither compares input banks nor classifies its repair.
+            "bank": _key(group.bank_kernel),
+            "classify": _key(group.classify_kernel),
+            "listed_repair": _key(group.listed_repair_kernel),
         },
     }
 
