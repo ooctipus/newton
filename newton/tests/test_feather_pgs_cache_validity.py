@@ -14,7 +14,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import cached_state_binding
+from newton._src.solvers.feather_pgs import cached_state_binding, capture_joins
 from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.test_feather_pgs_mixed_tree_free_body import _build
@@ -377,6 +377,7 @@ class TestFeatherPGSInputBank(unittest.TestCase):
                     bank_compare=bank_compare,
                     begin=lambda *args, **kwargs: calls.append(kwargs),
                     invalidate=lambda world_mask=None: None,
+                    forget_continuity=lambda: None,
                 )
                 expected = int(bank_compare)
                 solver._fk_id_cache_valid.fill_(1)
@@ -555,6 +556,235 @@ class TestFeatherPGSInputBank(unittest.TestCase):
         if name == "forest" and not (len(owner.groups) == 1 and owner.groups[0].layout.forest):
             raise AssertionError(owner.forest_reason)
         return model, solver, owner
+
+
+@contextlib.contextmanager
+def _counted_launches(kernels):
+    """Run every tiled launch and count, in the yielded list, those of ``kernels``."""
+    counted, launch = [0], wp.launch_tiled
+
+    def count(kernel, *args, **kwargs):
+        counted[0] += kernel in kernels
+        return launch(kernel, *args, **kwargs)
+
+    with patch.object(wp, "launch_tiled", count):
+        yield counted
+
+
+def _repair_kernels(owner):
+    """Every kernel that repairs a group's cache."""
+    return {group.repair_kernel for group in _groups(owner)}
+
+
+class TestFeatherPGSCapturedRepair(unittest.TestCase):
+    def test_repair_after_a_finish_of_the_same_capture_launches_nothing(self):
+        """Launch no repair after a finish of the same capture that published the step's input bank.
+
+        The next repair launches when the capture changes or ends, when the step reads another
+        bank, when it needs geometry the finish did not compute, after any host call that changes
+        validity, requests or the step duration, under ``FEATHER_PGS_TREE_REPAIR_SKIP=0`` and for a
+        motion-velocity layout. CPU has no graph capture: launches are recorded, not run, and the
+        capture id is stubbed.
+        """
+        case = _cpu_owner()
+        model, solver, owner, _, _ = case
+        self.assertTrue(owner.skip_captured_repairs)
+        everyone = len(owner.groups)
+
+        def repairs(target, call, capture):
+            """The repair launches of ``call`` inside capture ``capture`` (0 outside any capture)."""
+            kernels = _repair_kernels(target)
+            stack, records = _recorded_launches()
+            with stack, patch.object(capture_joins, "capture_id", return_value=capture):
+                call()
+            return sum(kernel in kernels for kernel, _, _ in records)
+
+        def step(case=case, *, input_bank=1, next_refresh=False, refresh=False, finish_capture=7, capture=7):
+            """Finish from bank 0 into bank 1 in ``finish_capture``, then count the repairs of a step from ``input_bank``."""
+            _, _, target, banks, augmented = case
+            finish = functools.partial(target.finish, banks[0], augmented, banks[1], DT, next_refresh)
+            repairs(target, finish, finish_capture)
+            return begin(case, input_bank=input_bank, refresh=refresh, capture=capture)
+
+        def begin(case=case, *, input_bank=1, refresh=False, capture=7):
+            _, _, target, banks, augmented = case
+            state_in, state_out = banks[input_bank], banks[1 - input_bank]
+            call = functools.partial(
+                target.begin, state_in, augmented, state_in.joint_qd, DT, refresh, state_out=state_out
+            )
+            return repairs(target, call, capture)
+
+        self.assertEqual(step(), 0)  # the next step of the same capture
+        self.assertEqual(begin(), everyone)  # a begin consumes the record
+        self.assertEqual(step(refresh=True), everyone)  # the step needs geometry the finish did not compute
+        self.assertEqual(step(next_refresh=True, refresh=True), 0)  # the finish computed it
+        self.assertEqual(step(capture=8), everyone)  # another capture
+        self.assertEqual(step(capture=0), everyone)  # the capture ended
+        self.assertEqual(step(finish_capture=0, capture=0), everyone)  # eager steps
+        self.assertEqual(step(input_bank=0), everyone)  # another bank (a copy-back compares, then repairs)
+        no_worlds = wp.zeros(model.world_count, dtype=wp.bool, device=model.device)
+        banks = case[3]
+        for name, call in (
+            ("reset", lambda: solver.reset(banks[1], no_worlds)),
+            ("notify_state_changed", solver.notify_state_changed),
+            ("notify_model_changed", lambda: solver.notify_model_changed(JOINT)),
+            ("step duration", lambda: solver._track_step_dt(2.0 * DT)),
+        ):
+            with self.subTest(host_call=name):
+                solver._last_step_dt = DT
+                self.assertEqual(step(), 0)
+                repairs(owner, functools.partial(owner.finish, banks[0], case[4], banks[1], DT, False), 7)
+                call()
+                self.assertEqual(begin(), everyone)
+        with patch.dict(os.environ, {"FEATHER_PGS_TREE_REPAIR_SKIP": "0"}):
+            switched = _cpu_owner()
+        self.assertFalse(switched[2].skip_captured_repairs)
+        self.assertEqual(step(switched), len(switched[2].groups))
+        motion = _cpu_owner(motion_velocity=True)
+        self.assertFalse(motion[2].skip_captured_repairs)
+        self.assertEqual(step(motion), len(motion[2].groups))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
+    def test_cuda_captured_steps_repair_once(self):
+        """Launch one repair per group in a captured block of 2 or 8 steps and replay it as eager stepping does.
+
+        The later steps of a block follow a finish of the same capture on the bank it published,
+        so their repairs launch nothing. Worlds reset between replays repair through the block's
+        first repair; every cache generation, geometry generation and state matches eager stepping,
+        including the interval-2 geometry refresh cadence.
+        """
+        device = wp.get_device("cuda:0")
+        for name in ("mixed", "forest", "sparse"):
+            for steps in (2, 8):
+                with self.subTest(owner=name, steps=steps):
+                    finals = []
+                    for captured in (False, True):
+                        model, solver, owner = TestFeatherPGSInputBank._owned(name, device)
+                        rollout = _Rollout(model, solver)
+                        rollout.block()
+
+                        def block(rollout=rollout, steps=steps):
+                            for _ in range(steps):
+                                rollout.step()
+
+                        advance = block
+                        if captured:
+                            with (
+                                _counted_launches(_repair_kernels(owner)) as counted,
+                                wp.ScopedCapture(device=device) as capture,
+                            ):
+                                solver.seed_double_buffer_events()
+                                block()
+                            self.assertEqual(counted[0], len(_groups(owner)))
+                            advance = functools.partial(wp.capture_launch, capture.graph)
+                        for _ in range(3):
+                            rollout.reset_worlds((1,))
+                            advance()
+                        finals.append(
+                            {
+                                **{field: getattr(rollout.states[0], field).numpy() for field in STATE_FIELDS},
+                                "generation": _generations(owner),
+                                "geometry_generation": [
+                                    group.data.geometry_generation.numpy() for group in _groups(owner)
+                                ],
+                                "geometric": [group.geometric.numpy() for group in _groups(owner)],
+                            }
+                        )
+                    for key in ("generation", "geometry_generation"):
+                        for eager, replayed in zip(finals[0][key], finals[1][key], strict=True):
+                            np.testing.assert_array_equal(replayed, eager, err_msg=key)
+                    for eager, replayed in zip(finals[0]["geometric"], finals[1]["geometric"], strict=True):
+                        np.testing.assert_allclose(replayed, eager, rtol=0.0, atol=2e-6, err_msg="geometric")
+                    for field in STATE_FIELDS:
+                        np.testing.assert_allclose(
+                            finals[1][field], finals[0][field], rtol=0.0, atol=2e-6, err_msg=field
+                        )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
+    def test_cuda_host_calls_between_captured_steps_keep_the_repair(self):
+        """Launch the second step's repair when a reset, a state notification or a new step duration falls between."""
+        device = wp.get_device("cuda:0")
+        for hook in ("reset", "notify_state_changed", "step duration"):
+            with self.subTest(host_call=hook):
+                finals = []
+                for captured in (False, True):
+                    model, solver, owner = TestFeatherPGSInputBank._owned("mixed", device)
+                    rollout = _Rollout(model, solver)
+                    rollout.block()
+                    no_worlds = wp.zeros(model.world_count, dtype=wp.bool, device=device)
+
+                    def block(rollout=rollout, solver=solver, hook=hook, no_worlds=no_worlds):
+                        rollout.step()
+                        if hook == "reset":
+                            solver.reset(rollout.states[0], no_worlds)
+                        elif hook == "notify_state_changed":
+                            solver.notify_state_changed()
+                        else:
+                            solver._track_step_dt(1.5 * DT)
+                        rollout.step()
+
+                    advance = block
+                    if captured:
+                        with (
+                            _counted_launches(_repair_kernels(owner)) as counted,
+                            wp.ScopedCapture(device=device) as capture,
+                        ):
+                            solver.seed_double_buffer_events()
+                            block()
+                        self.assertEqual(counted[0], 2 * len(_groups(owner)))
+                        advance = functools.partial(wp.capture_launch, capture.graph)
+                    for _ in range(3):
+                        advance()
+                    finals.append({field: getattr(rollout.states[0], field).numpy() for field in STATE_FIELDS})
+                for field in STATE_FIELDS:
+                    np.testing.assert_allclose(finals[1][field], finals[0][field], rtol=0.0, atol=2e-6, err_msg=field)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
+    def test_cuda_motion_layouts_and_separate_captures_repair_every_time(self):
+        """Keep every captured repair of a velocity-limit layout and the first repair of each separate capture.
+
+        Two single-step graphs captured one after the other, replayed with an eager reset between
+        them, each repair, and match eager stepping.
+        """
+        device = wp.get_device("cuda:0")
+        model = _build(device, worlds=4, speed_limit=0.8)
+        solver = _mixed_solver(model, enable_joint_velocity_limits=True)
+        owner = solver._tree_kinetic_state
+        self.assertFalse(owner.skip_captured_repairs)
+        rollout = _Rollout(model, solver)
+        rollout.block()
+        with _counted_launches(_repair_kernels(owner)) as counted, wp.ScopedCapture(device=device):
+            solver.seed_double_buffer_events()
+            rollout.block()
+        self.assertEqual(counted[0], 2 * len(owner.groups))
+
+        def replay(rollout, graph):
+            wp.capture_launch(graph)
+            rollout.states.reverse()  # as the captured step did
+
+        finals = []
+        for captured in (False, True):
+            model, solver, owner = TestFeatherPGSInputBank._owned("sparse", device)
+            rollout = _Rollout(model, solver)
+            rollout.block()
+            steps = [rollout.step, rollout.step]
+            if captured:
+                steps = []
+                for _ in range(2):
+                    with (
+                        _counted_launches(_repair_kernels(owner)) as counted,
+                        wp.ScopedCapture(device=device) as capture,
+                    ):
+                        rollout.step()
+                    self.assertEqual(counted[0], len(_groups(owner)))
+                    steps.append(functools.partial(replay, rollout, capture.graph))
+            for _ in range(3):
+                for world, advance in enumerate(steps):
+                    rollout.reset_worlds((world,))
+                    advance()
+            finals.append({field: getattr(rollout.states[0], field).numpy() for field in STATE_FIELDS})
+        for field in STATE_FIELDS:
+            np.testing.assert_allclose(finals[1][field], finals[0][field], rtol=0.0, atol=2e-6, err_msg=field)
 
 
 def _mass_matrices(solver):

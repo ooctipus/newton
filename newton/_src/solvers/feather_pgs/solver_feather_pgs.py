@@ -3677,6 +3677,7 @@ class SolverFeatherPGS(SolverBase):
             self._friction_patches.update_geometry(self.model)
         tree_kinetic = getattr(self, "_tree_kinetic_state", None)
         frames_proven = tree_kinetic is not None and tree_kinetic.validate_model(flags)
+        self._forget_repair_continuity()
         if self._row_packets is not None:
             self._row_packets.validate_notification(flags)
         if self._keyed_rows is not None:
@@ -4395,6 +4396,21 @@ class SolverFeatherPGS(SolverBase):
         index = self._connect_index(joint)
         return self._connect_anchor_p_np[index].copy(), self._connect_anchor_c_np[index].copy()
 
+    def _forget_repair_continuity(self) -> None:
+        """Launch the held-tree owner's next repair after a host call that changes its validity or inputs."""
+        owner = getattr(self, "_tree_kinetic_state", None)
+        if owner is not None:
+            owner.forget_continuity()
+
+    def _track_step_dt(self, dt: float) -> None:
+        """Record the step duration; a change refreshes mass and invalidates the FK/ID cache of every articulation."""
+        if self._last_step_dt is not None and abs(self._last_step_dt - dt) > 1.0e-8:
+            self._force_mass_update = True
+            if self._fk_id_cache_enabled:
+                self._fk_id_cache_valid.zero_()
+            self._forget_repair_continuity()
+        self._last_step_dt = dt
+
     def notify_state_changed(self, articulations: wp.array | None = None) -> None:
         """Invalidate cached kinematics after writing joint state outside :meth:`step`.
 
@@ -4409,6 +4425,7 @@ class SolverFeatherPGS(SolverBase):
         """
         if not self._fk_id_cache_enabled:
             return
+        self._forget_repair_continuity()
         if articulations is None:
             self._fk_id_cache_valid.zero_()
             return
@@ -10569,15 +10586,7 @@ class SolverFeatherPGS(SolverBase):
                 )
         if _FPGS_CAPTURE:
             self._fpgs_step_n = getattr(self, "_fpgs_step_n", -1) + 1
-        if self._last_step_dt is None:
-            self._last_step_dt = dt
-        elif abs(self._last_step_dt - dt) > 1.0e-8:
-            self._force_mass_update = True
-            if self._fk_id_cache_enabled:
-                self._fk_id_cache_valid.zero_()
-            self._last_step_dt = dt
-        else:
-            self._last_step_dt = dt
+        self._track_step_dt(dt)
 
         model = self.model
 
@@ -11887,12 +11896,14 @@ class SolverFeatherPGS(SolverBase):
             if _DEBUG_CACHE_MODE == "zero_even":
                 if self._step % 2 == 0:
                     self._fk_id_cache_valid.zero_()
+                    self._forget_repair_continuity()
             elif _DEBUG_CACHE_MODE != "nozero" and not getattr(
                 getattr(self, "_tree_kinetic_state", None), "bank_compare", False
             ):
                 # Owners that compare input banks validate a changed bank on the device.
                 if self._fk_id_cache_source_state is not None and state_in is not self._fk_id_cache_source_state:
                     self._fk_id_cache_valid.zero_()
+                    self._forget_repair_continuity()
             self._fk_id_cache_source_state = state_in
             if self._fk_id_cache_uses_snapshot:
                 cache = self._fk_id_cache

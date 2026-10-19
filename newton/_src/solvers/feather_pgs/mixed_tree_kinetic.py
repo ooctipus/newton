@@ -13,7 +13,7 @@ from .device_proof import DeviceProof
 from .small_cholesky import geometric_kernel
 from .sparse_factor import bind_operator_plan, operator_metadata
 from .sparse_mass_matrix import _SparseMassMatrixPlan
-from .tree_kinetic_owner import _NUMERIC_FLAGS, TreeKineticState, kernel_switches
+from .tree_kinetic_owner import _NUMERIC_FLAGS, TreeKineticState, kernel_switches, launch_switches
 from .tree_kinetic_plan import make_plan
 from .tree_kinetic_state import HeldResponse
 
@@ -526,8 +526,9 @@ class MixedTreeKineticState:
         self._dimensions = (solver.model.joint_count, solver.model.body_count, solver.model.articulation_count)
         # The coverage proof's inputs, compared on the device on notification.
         self._proof = DeviceProof(list(self._coverage_arrays()), solver.model.device)
-        # One read of the kernel switches for every group this owner composes.
+        # One read of the kernel and launch switches for every group this owner composes.
         self.reference, self.clocked = kernel_switches()
+        (skip,) = launch_switches()
         default = forest_default(solver)
         override = os.environ.get("FEATHER_PGS_TREE_FOREST")
         forest = (override if override is not None else "1" if default else "0") == "1"
@@ -561,14 +562,16 @@ class MixedTreeKineticState:
                 response="diagonal" if operator.diagonal else "cholesky",
                 reference=self.reference,
                 clocked=self.clocked,
+                skip=skip,
             )
             operator.kinetic_state = group
             self.groups.append(group)
         # The existing solver lifecycle delegates factor refresh to this binding.
         self.sparse = self
-        # Every group compares input banks (fixed and free roots alike) unless the
-        # solver prescales velocities; see TreeKineticState.
+        # Every group compares input banks (fixed and free roots alike) and skips
+        # captured repairs unless the solver prescales velocities; see TreeKineticState.
         self.bank_compare = all(group.bank_compare for group in self.groups)
+        self.skip_captured_repairs = all(group.skip_captured_repairs for group in self.groups)
 
     def _coverage_arrays(self):
         solver, model = self.solver, self.solver.model
@@ -611,6 +614,11 @@ class MixedTreeKineticState:
         """Invalidate all component caches for selected worlds."""
         for group in self.groups:
             group.invalidate(world_mask)
+
+    def forget_continuity(self):
+        """Launch every component's next repair (see :meth:`TreeKineticState.forget_continuity`)."""
+        for group in self.groups:
+            group.forget_continuity()
 
     def begin(self, state, augmented, velocity, dt, refresh, *, state_out=None):
         """Repair every current component before any factor or force consumer (see :meth:`TreeKineticState.begin`)."""

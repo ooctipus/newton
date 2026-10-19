@@ -1,18 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Ask the CUDA driver whether a stream capture may be paused for a conditional graph node.
+"""Ask which graph capture records a stream, and whether it may be paused for a conditional node.
 
 :func:`warp.capture_if` ends the capture to record its branch and resumes it
 afterwards. Ending a capture fails while a stream forked into it holds captured
 work the capturing stream has not joined (CUDA error 904), and Warp's own
 ``capture_end`` finds that work the same way as :func:`capture_has_unjoined_work`:
 graph leaf nodes that are not among the stream's capture dependencies.
+:func:`capture_id` names the capture a host decision was recorded in.
 """
 
 import ctypes
 import functools
 import sys
+
+import warp as wp
 
 _CUDA_SUCCESS = 0
 _CAPTURE_STATUS_ACTIVE = 1
@@ -43,6 +46,25 @@ def _driver():
     for query in (capture_info, graph_nodes, graph_edges):
         query.restype = ctypes.c_int
     return capture_info, graph_nodes, graph_edges
+
+
+def capture_id(device) -> int:
+    """Warp's id of the graph capture recording ``device``'s current stream, or 0 outside one.
+
+    Warp registers each capture it begins, external ones announced with
+    ``wp.capture_begin(external=True)`` included, under its stream in
+    ``device.captures``; the graph keeps the driver's capture id, which a
+    resumed capture renews, and the driver never reuses an id within a process.
+    Both are Warp internals: without them, or for a capture Warp does not know,
+    the result is 0, which no recorded capture matches.
+
+    Args:
+        device: The Warp device whose current stream may be capturing.
+    """
+    if not device.is_cuda:
+        return 0
+    graph = getattr(device, "captures", {}).get(wp.get_stream(device))
+    return int(getattr(graph, "capture_id", 0) or 0)
 
 
 def capture_queries_available() -> bool:

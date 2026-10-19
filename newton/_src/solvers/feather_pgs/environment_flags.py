@@ -601,6 +601,13 @@ FLAGS = declare(
         "=1 selects the serial held solve, level reduction and shared-memory scans in held-tree kernels.",
     ),
     _flag(
+        "FEATHER_PGS_TREE_REPAIR_SKIP",
+        "policy",
+        ("tree_kinetic_owner",),
+        "=0 launches every captured held-tree repair (default 1: a repair after a finish of the same capture "
+        "on the bank it published launches nothing).",
+    ),
+    _flag(
         "FEATHER_PGS_WORLD_ROWS",
         "experiment",
         _SOLVER,

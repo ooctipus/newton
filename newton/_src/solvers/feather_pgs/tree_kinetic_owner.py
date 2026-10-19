@@ -11,7 +11,7 @@ import numpy as np
 import warp as wp
 
 from ...sim import ModelFlags
-from . import cached_state_binding
+from . import cached_state_binding, capture_joins
 from .device_proof import DeviceProof, fingerprint
 from .publication_data import PLAN_FIELDS
 from .tree_kinetic_plan import cooperative_block_dim, lane_candidates, make_plan
@@ -90,6 +90,19 @@ def kernel_switches():
     )
 
 
+def launch_switches():
+    """Read the held-tree repair launch switches, once per owner.
+
+    ``FEATHER_PGS_TREE_REPAIR_SKIP=0`` launches the repair of every captured
+    step, also where every block would take the early exit. The switch
+    chooses launches, not emitted code.
+
+    Returns:
+        ``(skip,)``.
+    """
+    return (os.environ.get("FEATHER_PGS_TREE_REPAIR_SKIP", "1") != "0",)
+
+
 class TreeKineticState:
     """Own one current cache with device state-bank tags and a separate held W.
 
@@ -99,6 +112,12 @@ class TreeKineticState:
     output bank instead, as after a caller copies the output bank back into
     the input bank, a comparison pass before the repair moves the stamp of
     every group whose two banks hold the same words to the input bank.
+
+    Within one graph capture, a repair that follows this owner's finish and
+    reads the bank that finish published launches nothing outside
+    motion-velocity layouts (:attr:`skip_captured_repairs`): every block
+    would take the early exit. The solver calls :meth:`forget_continuity`
+    from every host call that changes validity, requests or the step.
     """
 
     def __init__(
@@ -111,6 +130,7 @@ class TreeKineticState:
         response="sparse",
         reference=None,
         clocked=None,
+        skip=None,
     ):
         from . import tree_kinetic_state as native  # noqa: PLC0415
 
@@ -128,6 +148,14 @@ class TreeKineticState:
         # Motion-velocity layouts keep identity validation: their repair reads the
         # prescaled velocity, and the solver keeps its host identity check for them.
         self.bank_compare = not self.motion_velocity
+        if skip is None:
+            (skip,) = launch_switches()
+        # A motion-velocity repair also compares the prescaled velocity, which the
+        # step recomputes after the finish; its launches always run.
+        self.skip_captured_repairs = bool(skip) and not self.motion_velocity
+        # (capture id, whether the finish computed the next geometry) of the last
+        # finish inside a capture; the next begin consumes it.
+        self._continuity = None
         self.group_count = sparse_owner.plan.group_to_art.size
         # Kernel-selecting switches: a composite owner passes the values it read
         # for all of its groups; a direct construction reads them here.
@@ -481,8 +509,13 @@ class TreeKineticState:
         self._proof.validate(current, "Tree kinetic static")
         return True
 
+    def forget_continuity(self):
+        """Launch the next repair: a host call changed what the last finish left on the device."""
+        self._continuity = None
+
     def invalidate(self, world_mask=None):
         """Invalidate current state for every owned articulation in selected worlds."""
+        self.forget_continuity()
         cached_state_binding.invalidate(
             self.solver.world_count,
             world_mask,
@@ -538,9 +571,25 @@ class TreeKineticState:
         """
         self._validate_call(state_in, state_aug, dt)
         binding = self._validate_motion(state_in, state_aug, stage3_qd)
-        data = self._publication(state_in, state_aug, state_in, dt)
         device = self.solver.model.device
         source = _bank_pointers(state_in)
+        continuity, self._continuity = self._continuity, None
+        if (
+            continuity is not None
+            and source == self._published
+            and continuity[0] == capture_joins.capture_id(device)
+            and (not global_refresh or continuity[1])
+        ):
+            # This capture's last finish published into this bank and no host call
+            # has touched validity or requests since. Every group with a finite cache
+            # is valid, stamped with this bank, unrequested and, unless this step
+            # needs geometry the finish did not compute, geometrically current: its
+            # block would take the early exit. (A non-finite cache stays invalid, and
+            # the predictor then makes its articulations' next state NaN with or
+            # without a repair.)
+            self._motion_binding = binding
+            return
+        data = self._publication(state_in, state_aug, state_in, dt)
         if (
             self.bank_compare
             and state_out is not None
@@ -656,3 +705,5 @@ class TreeKineticState:
             device=self.solver.model.device,
         )
         self._published = _bank_pointers(state_out)
+        capture = capture_joins.capture_id(self.solver.model.device) if self.skip_captured_repairs else 0
+        self._continuity = (capture, bool(next_refresh)) if capture else None
