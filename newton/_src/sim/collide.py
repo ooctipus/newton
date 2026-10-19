@@ -3992,9 +3992,7 @@ class CollisionPipeline:
                 self.shape_pairs_filtered,
                 self.broad_phase_shape_pairs,
                 self.broad_phase_pair_count,
-                shape_body=model.shape_body,
-                body_flags=model.body_flags,
-                include_static_kinematic_pairs=self.include_static_kinematic_pairs,
+                **pair_filter,
             )
         else:  # BroadPhaseExplicit
             self.broad_phase.launch(
