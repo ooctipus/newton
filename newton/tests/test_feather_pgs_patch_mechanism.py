@@ -2742,6 +2742,40 @@ class TestPatchFrameModes(unittest.TestCase):
                 self.assertEqual(tuple(outcomes), expected)
                 np.testing.assert_array_equal(patches.frame_status.numpy(), [0])
 
+    def test_admission_follows_the_generation_array_through_contacts_wrappers(self):
+        """Admit builds through wrappers of a contact stream as builds of the stream, keyed by its generation array.
+
+        A fresh object around the stream's arrays, as a caller may build per
+        substep, keeps the pairs that the previous build of the stream sorted in
+        the same scope, and a write noted on the stream makes it sort. Contacts
+        without a generation array sort and end the chain. The wrappers carry
+        none of the private state of :class:`~newton.Contacts`, and every build
+        matches a chain that sorts each frame.
+        """
+        rng = np.random.default_rng(46)
+        scene = _Scene("cpu", 46)
+        scene.active[:] = True
+        live = scene.frame()
+        stream = _swapped_stream(scene, live, rng)
+        anonymous = SimpleNamespace(**{k: v for k, v in vars(stream).items() if k != "contact_generation"})
+        sources = {
+            "stream": lambda: stream,
+            "wrapper": lambda: SimpleNamespace(**vars(stream)),
+            "anonymous": lambda: anonymous,
+        }
+        plain, patches = _recording_pair(scene, 128)
+        outcomes = _admitted_modes(patches)
+        for event in ("stream", "wrapper", "write", "wrapper", "stream", "anonymous", "wrapper", "wrapper"):
+            if event == "write":
+                note_contact_frame_write(stream.contact_generation)
+                continue
+            contacts = sources[event]()
+            for state in (plain, patches):
+                state.build(scene.model, scene.state, contacts)
+            assert_same_state(patches, plain, event, records=False)
+        self.assertEqual(outcomes, ["sort", "keep", "sort", "keep", "sort", "sort", "keep"])
+        np.testing.assert_array_equal(patches.frame_status.numpy(), [0])
+
     def test_capture_kernels_load_at_construction(self):
         """Load the modules of the kernels that captured builds launch first when a CUDA patch state is built.
 
