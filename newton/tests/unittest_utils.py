@@ -5,6 +5,7 @@ import contextlib
 import ctypes
 import ctypes.util
 import dataclasses
+import gc
 import importlib.util
 import io
 import os
@@ -78,6 +79,25 @@ def assert_host_only():
             error = AssertionError(f"unexpected device access: {label}.{name}")
             stack.enter_context(mock.patch.object(owner, name, side_effect=error))
         yield
+
+
+@contextlib.contextmanager
+def scoped_capture_after_gc(*args, **kwargs):
+    """:class:`warp.ScopedCapture` that first frees the garbage earlier tests left in reference cycles.
+
+    ``wp.func`` holds its own frame in a local, a reference cycle whose ``f_back`` chain keeps the
+    locals of every caller alive, so a model built in one test can outlive it until the cyclic
+    collector runs. A collection inside a CUDA capture that destroys a Warp texture, such as a mesh
+    SDF's, is refused (error 900) and invalidates the capture (901). The ``newton.tests`` runner
+    collects after every test; plain ``python -m unittest`` does not.
+
+    Args:
+        *args: Positional arguments of :class:`warp.ScopedCapture`.
+        **kwargs: Keyword arguments of :class:`warp.ScopedCapture`.
+    """
+    gc.collect()
+    with wp.ScopedCapture(*args, **kwargs) as capture:
+        yield capture
 
 
 try:

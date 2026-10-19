@@ -65,6 +65,7 @@ from newton.tests.unittest_utils import (
     configure_sdf_for_collision_shapes,
     get_cuda_test_devices,
     get_test_devices,
+    scoped_capture_after_gc,
 )
 
 
@@ -95,20 +96,6 @@ def type_to_str(shape_type: GeoType):
         return "plane"
     else:
         return "unknown"
-
-
-@contextlib.contextmanager
-def _scoped_capture(*args, **kwargs):
-    """``wp.ScopedCapture`` that first frees the garbage earlier tests left in reference cycles.
-
-    Warp keeps the frame of a ``wp.func`` defined at run time in a cycle, and with it the locals
-    of every caller, so a test's model can outlive the test until the cyclic collector runs.
-    When that collection falls inside a CUDA capture and destroys a mesh SDF's texture, CUDA
-    rejects the call and invalidates the capture.
-    """
-    gc.collect()
-    with wp.ScopedCapture(*args, **kwargs) as capture:
-        yield capture
 
 
 class CollisionSetup:
@@ -167,7 +154,7 @@ class CollisionSetup:
 
         self.graph = None
         if wp.get_device(device).is_cuda:
-            with _scoped_capture(device=device) as capture:
+            with scoped_capture_after_gc(device=device) as capture:
                 self.simulate()
             self.graph = capture.graph
 
@@ -208,7 +195,7 @@ class CollisionSetup:
 
     def capture(self):
         if wp.get_device(self._device).is_cuda:
-            with _scoped_capture(device=self._device) as capture:
+            with scoped_capture_after_gc(device=self._device) as capture:
                 self.simulate()
             self.graph = capture.graph
         else:
@@ -465,7 +452,7 @@ def test_collision_pipeline_first_call_capture(test, device):
     contacts = pipeline.contacts()
     state = model.state()
 
-    with _scoped_capture(device=device) as capture:
+    with scoped_capture_after_gc(device=device) as capture:
         pipeline.collide(state, contacts)
 
     wp.capture_launch(capture.graph)
@@ -511,7 +498,7 @@ def test_capture_frees_pending_garbage_first(test, device):
     marker = wp.zeros(1, dtype=wp.int32, device=device)
     with _automatic_collection_disabled():
         _CaptureProbe(device, capturing)
-        with _scoped_capture(device=device) as capture:
+        with scoped_capture_after_gc(device=device) as capture:
             # A collection the allocator could start inside the capture.
             gc.collect()
             marker.fill_(1)
@@ -3409,7 +3396,7 @@ def test_deterministic_pipeline_500_steps(test, device):
         # ``example_basic_pendulum``).
         _frame()
 
-        with _scoped_capture(device=device) as capture:
+        with scoped_capture_after_gc(device=device) as capture:
             _frame()
         graph = capture.graph
 
@@ -3483,7 +3470,7 @@ def test_static_empty_gjk_specialization_under_graph_capture(test, device):
     state = model.state()
     contacts = specialized.contacts()
     reference_contacts = reference.contacts()
-    with _scoped_capture(device=device) as capture:
+    with scoped_capture_after_gc(device=device) as capture:
         specialized.collide(state, contacts)
         reference.collide(state, reference_contacts)
     for _ in range(2):
@@ -3629,7 +3616,7 @@ def test_split_gjk_mpr_matches_fused_under_graph_capture(test, device):
     fused_contacts = fused.contacts()
     split.collide(state, split_contacts)
     fused.collide(state, fused_contacts)
-    with _scoped_capture(device=device) as capture:
+    with scoped_capture_after_gc(device=device) as capture:
         split.collide(state, split_contacts)
         fused.collide(state, fused_contacts)
     wp.capture_launch(capture.graph)
@@ -3833,7 +3820,7 @@ def test_deterministic_pipeline_sticky_500_steps(test, device):
         # the same warm-up state).
         _frame()
 
-        with _scoped_capture(device=device) as capture:
+        with scoped_capture_after_gc(device=device) as capture:
             _frame()
         graph = capture.graph
 
@@ -5266,7 +5253,7 @@ def test_graph_capture_stable(test, device):
     test.assertGreater(int(np.sum(contacts.soft_contact_indices.numpy()[:total0][:, 1] >= 0)), 0)
 
     # Capture the flag-on collide and replay it; counts must be stable across replays.
-    with _scoped_capture(device) as capture:
+    with scoped_capture_after_gc(device) as capture:
         pipeline.collide(state, contacts)
     for _ in range(3):
         wp.capture_launch(capture.graph)
@@ -5453,7 +5440,7 @@ add_function_test(
 
 def tearDownModule():
     # Free the SDF textures these tests left in reference cycles before a later module captures
-    # a graph in the same process (see _scoped_capture).
+    # a graph in the same process (see scoped_capture_after_gc).
     gc.collect()
 
 

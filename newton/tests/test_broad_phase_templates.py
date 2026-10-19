@@ -10,7 +10,6 @@ device; on CPU, where both run serially in list order, the arrays must be equal.
 
 import contextlib
 import functools
-import gc
 import itertools
 import json
 import os
@@ -29,7 +28,12 @@ from newton._src.geometry.broad_phase_nxn import (
     _nxn_broadphase_precomputed_pairs,
     replay_shape_pair_templates,
 )
-from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
+from newton.tests.unittest_utils import (
+    add_function_test,
+    get_cuda_test_devices,
+    get_test_devices,
+    scoped_capture_after_gc,
+)
 
 _FLAG = "NEWTON_BROAD_PHASE_TEMPLATES"
 
@@ -852,13 +856,8 @@ class TestBroadPhaseTemplateSelection(unittest.TestCase):
 
 
 def _capture_collide(pipeline, state, contacts, **capture_options):
-    """Capture one ``collide()`` in a graph and return the graph.
-
-    Garbage that earlier tests left in reference cycles is freed first: a Warp texture freed
-    inside a CUDA capture would invalidate it.
-    """
-    gc.collect()
-    with wp.ScopedCapture(device=pipeline.device, **capture_options) as capture:
+    """Capture one ``collide()`` in a graph and return the graph."""
+    with scoped_capture_after_gc(device=pipeline.device, **capture_options) as capture:
         pipeline.collide(state, contacts)
     return capture.graph
 
