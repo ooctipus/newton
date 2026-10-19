@@ -334,11 +334,6 @@ def _solver_factory_calls():
         }
         factory = solver._get_pgs_solve_mf_gs_kernel.__wrapped__
         yield name + "_get_pgs_solve_mf_gs_kernel", factory, (64, 32, 12, _ARCH), kwargs
-    # The split free-body sweep, with and without the free-body velocity-limit law.
-    for velocity_limits in (False, True):
-        factory = solver._get_pgs_solve_mf_kernel.__wrapped__
-        kwargs = {"has_velocity_limit_rows": velocity_limits}
-        yield name + "_get_pgs_solve_mf_kernel", factory, (32, 64, _ARCH), kwargs
     for triples, components in itertools.product((False, True), repeat=2):
         factory = solver._get_pgs_solve_paired_factor_kernel.__wrapped__
         yield name + "_get_pgs_solve_paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, triples, components), {}
@@ -347,6 +342,11 @@ def _solver_factory_calls():
         factory = solver._get_pgs_solve_paired_factor_kernel.__wrapped__
         args = (192, 29, 23, 6, _ARCH, False, components)
         yield name + "_get_pgs_solve_paired_factor_kernel", factory, args, {"contact_units": True}
+    # The split free-body sweep: the plain call (the variant without the free-body velocity-limit law, under
+    # the factory's default label) and the variant with the law.
+    factory = solver._get_pgs_solve_mf_kernel.__wrapped__
+    for kwargs in ({}, {"has_velocity_limit_rows": True}):
+        yield name + "_get_pgs_solve_mf_kernel", factory, (32, 8, _ARCH), kwargs
     # Parallel tiers: one articulation per world with in-kernel response and world rows,
     # and the response-block variants without them.
     for tier, matrix_free, inkernel, world_rows in itertools.product(
