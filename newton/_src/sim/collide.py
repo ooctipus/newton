@@ -1747,10 +1747,13 @@ class CollisionPipeline:
                 pairs where both shapes are immovable. Set to ``False`` to
                 filter static-static, static-kinematic, and
                 kinematic-kinematic pairs. Defaults to ``True`` for backward
-                compatibility. Pairs of two structurally immobile shapes,
-                static-static pairs included, follow ``include_immobile_pairs``
-                instead; with both filters on, a welded body also counts as
-                immovable here.
+                compatibility. With ``True``, pairs of two structurally
+                immobile shapes, static-static pairs included, follow
+                ``include_immobile_pairs``. ``False`` drops static-static pairs
+                whatever ``include_immobile_pairs`` says; while the broad phase
+                also drops immobile pairs, a body welded to the world counts as
+                static here, so its pairs with static, welded and kinematic
+                shapes are dropped as well.
             include_immobile_pairs: Whether to generate contacts for pairs whose
                 shapes are both structurally immobile. A shape is structurally
                 immobile when it is static or belongs to a body welded to the
@@ -2800,12 +2803,16 @@ class CollisionPipeline:
         ``include_immobile_pairs``), where that choice came from (``source``:
         ``"default"``, ``"environment"`` or ``"argument"``) and why
         (``reason``), and, as of construction or the last
-        :meth:`notify_model_changed` that refreshed them, how many bodies are
-        welded to the world (``welded_bodies``), how many colliding shapes are
-        immobile (``immobile_shapes``), how many candidate pairs join two of
-        them (``immobile_pairs``: pairs of the explicit list, or for ``"nxn"``
-        and ``"sap"`` of the model's pair list; ``None`` without one) and how
-        many of those the broad phase drops (``excluded_pairs``).
+        :meth:`notify_model_changed` that changed them (notifications refresh
+        only while ``enabled``), how many bodies are welded to the world
+        (``welded_bodies``), how many colliding shapes are immobile
+        (``immobile_shapes``), how many listed pairs join two of them
+        (``listed_pairs``: pairs of the explicit list, or for ``"nxn"`` and
+        ``"sap"`` of the model's pair list; ``None`` without one) and how many
+        listed pairs the broad phase drops that ``include_immobile_pairs=True``
+        would keep (``excluded_pairs``): the listed immobile pairs, or with
+        ``include_static_kinematic_pairs=False`` the pairs of a welded shape
+        with a static, welded or kinematic one.
         """
         owner = getattr(self.narrow_phase, "_convex_method_choice", None)
         result = {"requested": self.convex_collision, "reason": self._convex_selection_reason}
@@ -3442,18 +3449,26 @@ class CollisionPipeline:
             return model.joint_enabled.numpy()[self.fixed_joints].astype(bool)
 
         def read_body_flags(self, model: Model) -> np.ndarray | None:
-            """Return whether each body is dynamic and not kinematic, or ``None`` when all are dynamic."""
+            """Return a host copy of the body flags, or ``None`` without them."""
             if model.body_flags is None or not self.body_count:
                 return None
-            flags = model.body_flags.numpy()
-            return ((flags & int(BodyFlags.DYNAMIC)) != 0) & ((flags & int(BodyFlags.KINEMATIC)) == 0)
+            # numpy() aliases the memory of a CPU array, which the next refresh compares against.
+            return np.array(model.body_flags.numpy())
 
-        def welded_bodies(self, enabled: np.ndarray | None, dynamic: np.ndarray | None) -> np.ndarray:
+        def kinematic_shapes(self, flags: np.ndarray | None) -> np.ndarray:
+            """Return a host mask of the shapes of kinematic bodies under :meth:`read_body_flags`."""
+            kinematic = np.zeros(len(self.shape_body), dtype=bool)
+            if flags is not None:
+                on_body = self.shape_body >= 0
+                kinematic[on_body] = (flags[self.shape_body[on_body]] & int(BodyFlags.KINEMATIC)) != 0
+            return kinematic
+
+        def welded_bodies(self, enabled: np.ndarray | None, flags: np.ndarray | None) -> np.ndarray:
             """Return a host mask of the welded bodies.
 
             Args:
                 enabled: :meth:`read_joint_enables`; a disabled joint does not weld.
-                dynamic: :meth:`read_body_flags`; only a dynamic body welds, because the user
+                flags: :meth:`read_body_flags`; only a dynamic body welds, because the user
                     can move a kinematic body and everything welded to it. With both ``None``
                     the result bounds the welded set over every state of the two arrays.
             """
@@ -3461,8 +3476,8 @@ class CollisionPipeline:
             if enabled is not None:
                 fixed_parent, fixed_child = fixed_parent[enabled], fixed_child[enabled]
             eligible = self.parent_joints > 0
-            if dynamic is not None:
-                eligible &= dynamic
+            if flags is not None:
+                eligible &= ((flags & int(BodyFlags.DYNAMIC)) != 0) & ((flags & int(BodyFlags.KINEMATIC)) == 0)
             # Every parent joint must weld; a body with another parent joint keeps its freedom.
             eligible &= np.bincount(fixed_child, minlength=self.body_count) == self.parent_joints
             welded = np.zeros(self.body_count, dtype=bool)
@@ -3486,11 +3501,14 @@ class CollisionPipeline:
     def _configure_immobile_pairs(self, model: Model, requested: bool, source: str) -> None:
         """Decide once, at construction, whether the broad phase drops pairs of structurally immobile shapes.
 
-        The filter is installed only when a candidate pair can join two such shapes in some
-        state of the body flags and joint enables, so other models keep the unfiltered
-        broad-phase arguments. Candidates come from the explicit pairs or, for ``"nxn"`` and
-        ``"sap"``, from the model's pair list, which applies the same world, group and
-        filter-pair rules as those broad phases.
+        The filter is installed only when it can change a candidate pair in some state of the
+        body flags and joint enables, so other models keep the unfiltered broad-phase
+        arguments: with ``include_static_kinematic_pairs=True``, a pair that can join two
+        immobile shapes; with ``False``, where a welded body also reads as static against
+        kinematic ones and any body can become kinematic, a pair that touches a shape that can
+        be welded. That makes the composed rule independent of unrelated pairs. Candidates
+        come from the explicit pairs or, for ``"nxn"`` and ``"sap"``, from the model's pair
+        list, which applies the same world, group and filter-pair rules as those broad phases.
         """
         self._weld_topology = topology = self._WeldTopology(model)
         self._colliding_shapes = _shape_collide_mask(model, len(topology.shape_body))
@@ -3502,16 +3520,29 @@ class CollisionPipeline:
             pairs = getattr(model, "shape_contact_pairs", None)
         # Topology alone bounds the immobile shapes over every body-flag and joint-enable state.
         reachable = topology.immobile_shapes(topology.welded_bodies(None, None))
+        weldable = None if self.include_static_kinematic_pairs else reachable & (topology.shape_body >= 0)
         if pairs is None:
             self._immobile_pair_candidates = None
-            possible = int(np.count_nonzero(reachable & self._colliding_shapes)) > 1
+            colliding = self._colliding_shapes
+            if weldable is None:
+                possible = int(np.count_nonzero(reachable & colliding)) > 1
+            else:
+                possible = bool(np.any(weldable & colliding)) and int(np.count_nonzero(colliding)) > 1
         else:
             pairs = (pairs.numpy() if hasattr(pairs, "numpy") else np.asarray(pairs)).reshape(-1, 2)
+            candidates = []
             # Bound temporary gathers independently of the replicated world count.
-            blocks = (pairs[begin : begin + 65536] for begin in range(0, len(pairs), 65536))
-            candidates = [block[reachable[block[:, 0]] & reachable[block[:, 1]]] for block in blocks]
-            self._immobile_pair_candidates = np.concatenate(candidates) if candidates else pairs[:0]
-            possible = len(self._immobile_pair_candidates) > 0
+            for block in (pairs[begin : begin + 65536] for begin in range(0, len(pairs), 65536)):
+                listed = reachable[block[:, 0]] & reachable[block[:, 1]]
+                if weldable is not None:
+                    listed |= weldable[block[:, 0]] | weldable[block[:, 1]]
+                candidates.append(block[listed])
+            candidates = np.concatenate(candidates) if candidates else pairs[:0]
+            self._immobile_pair_candidates = candidates
+            if weldable is None:
+                possible = len(candidates) > 0
+            else:
+                possible = bool(np.any(weldable[candidates[:, 0]] | weldable[candidates[:, 1]]))
         if requested and possible:
             self._immobile_shape_body = wp.zeros(len(topology.shape_body), dtype=wp.int32, device=self.device)
             self._no_body_flags = wp.empty(0, dtype=wp.int32, device=self.device)
@@ -3519,14 +3550,24 @@ class CollisionPipeline:
             setting = "include_immobile_pairs=True" if source == "argument" else "NEWTON_BROAD_PHASE_IMMOBILE_FILTER=0"
             reason = f"Off: {setting} keeps pairs whose shapes are both static or welded to the world."
         elif not possible:
-            reason = "No candidate pair can join two shapes that are static or welded to the world."
+            reason = (
+                "No candidate pair can join two shapes that are static or welded to the world."
+                if weldable is None
+                else "No candidate pair can touch a body welded to the world, and include_static_kinematic_pairs=False "
+                "already drops static-static pairs."
+            )
         else:
             setting = {
                 "default": "Default",
                 "environment": "NEWTON_BROAD_PHASE_IMMOBILE_FILTER=1",
                 "argument": "include_immobile_pairs=False",
             }[source]
-            reason = f"{setting}: the broad phase drops pairs whose shapes are both static or welded to the world."
+            dropped = (
+                "both static or welded to the world"
+                if weldable is None
+                else "each static, welded to the world or kinematic (include_static_kinematic_pairs=False)"
+            )
+            reason = f"{setting}: the broad phase drops pairs whose shapes are {dropped}."
         self._immobile_pairs = {"enabled": self._immobile_shape_body is not None, "source": source, "reason": reason}
         self._refresh_immobile_pairs()
 
@@ -3539,25 +3580,34 @@ class CollisionPipeline:
         topology = self._weld_topology
         previous = self._immobile_inputs
         enabled = topology.read_joint_enables(self.model) if joint or previous is None else previous[0]
-        dynamic = topology.read_body_flags(self.model) if body or previous is None else previous[1]
+        flags = topology.read_body_flags(self.model) if body or previous is None else previous[1]
         if previous is not None and all(
             np.array_equal(new, old) if new is not None and old is not None else new is old
-            for new, old in zip((enabled, dynamic), previous, strict=True)
+            for new, old in zip((enabled, flags), previous, strict=True)
         ):
             return
-        self._immobile_inputs = (enabled, dynamic)
-        welded = topology.welded_bodies(enabled, dynamic)
+        self._immobile_inputs = (enabled, flags)
+        welded = topology.welded_bodies(enabled, flags)
         immobile = topology.immobile_shapes(welded)
         if self._immobile_shape_body is not None:
             # Immobile shapes read as static in the broad phase's immovable-pair test.
             self._immobile_shape_body.assign(np.where(immobile, -1, topology.shape_body).astype(np.int32))
         pairs = self._immobile_pair_candidates
-        count = None if pairs is None else int(np.count_nonzero(immobile[pairs[:, 0]] & immobile[pairs[:, 1]]))
+        listed = excluded = None
+        if pairs is not None:
+            first, second = pairs[:, 0], pairs[:, 1]
+            listed = excluded = int(np.count_nonzero(immobile[first] & immobile[second]))
+            if not self.include_static_kinematic_pairs:
+                # The test drops static and kinematic pairs anyway; welded shapes join them.
+                immovable = (topology.shape_body < 0) | topology.kinematic_shapes(flags)
+                masked = immovable | immobile
+                dropped = masked[first] & masked[second] & ~(immovable[first] & immovable[second])
+                excluded = int(np.count_nonzero(dropped))
         self._immobile_pairs.update(
             welded_bodies=int(np.count_nonzero(welded)),
             immobile_shapes=int(np.count_nonzero(immobile & self._colliding_shapes)),
-            immobile_pairs=count,
-            excluded_pairs=count if self._immobile_shape_body is not None else 0,
+            listed_pairs=listed,
+            excluded_pairs=excluded if self._immobile_shape_body is not None else 0,
         )
 
     def _broad_phase_pair_filter(self, model: Model) -> dict:

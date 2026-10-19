@@ -219,6 +219,48 @@ def test_static_kinematic_filter_composes(test, device):
             test.assertEqual(_ordered(kept, device), _ordered(expected, device))
 
 
+def _welded_against_kinematic(device, *, ground):
+    """Replicate a welded box that overlaps a kinematic box, optionally with a global ground far below both.
+
+    Returns:
+        The model and, per world, the shape pair of the two boxes.
+    """
+    proto = newton.ModelBuilder()
+    base = proto.add_link(xform=_pose(0.0, 0.0, 1.0), label="base")
+    base_shape = _box(proto, base, 0.0, 0.0)
+    proto.add_articulation([proto.add_joint_fixed(-1, base, parent_xform=_pose(0.0, 0.0, 1.0))])
+    kinematic = proto.add_body(xform=_pose(0.09, 0.0, 1.0), is_kinematic=True, label="kinematic")
+    kinematic_shape = _box(proto, kinematic, 0.09, 0.0)
+    scene = newton.ModelBuilder()
+    if ground:
+        scene.add_ground_plane()
+    shape_start = scene.shape_count
+    scene.replicate(proto, _WORLDS, spacing=(3.0, 0.0, 0.0))
+    offsets = [shape_start + world * proto.shape_count for world in range(_WORLDS)]
+    return scene.finalize(device=device), [(offset + base_shape, offset + kinematic_shape) for offset in offsets]
+
+
+def test_static_kinematic_composition_ignores_unrelated_pairs(test, device):
+    """Drop welded-kinematic pairs under include_static_kinematic_pairs=False whether or not a ground is listed."""
+    for ground in (False, True):
+        model, welded_kinematic = _welded_against_kinematic(device, ground=ground)
+        for mode in _MODES:
+            with test.subTest(ground=ground, broad_phase=mode), _flag(None):
+                pipeline = newton.CollisionPipeline(model, broad_phase=mode, include_static_kinematic_pairs=False)
+                pairs, _ = _candidate_pairs(pipeline, model)
+                test.assertFalse(set(welded_kinematic) & set(pairs))
+                record = pipeline.get_collision_selection()["immobile_pairs"]
+                test.assertTrue(record["enabled"])
+                # Each world adds its welded-kinematic pair to the static-kinematic filter, and with
+                # a ground its welded-static pair; the static-kinematic pairs were dropped before.
+                test.assertEqual(record["listed_pairs"], _WORLDS if ground else 0)
+                test.assertEqual(record["excluded_pairs"], (2 if ground else 1) * _WORLDS)
+                kept = newton.CollisionPipeline(
+                    model, broad_phase=mode, include_static_kinematic_pairs=False, include_immobile_pairs=True
+                )
+                test.assertLessEqual(set(welded_kinematic), set(_candidate_pairs(kept, model)[0]))
+
+
 def test_record_reports_excluded_pairs(test, device):
     """Report the choice, its source and the welded bodies, immobile shapes and excluded pairs."""
     model, worlds = _pair_scene(device)
@@ -247,7 +289,7 @@ def test_record_reports_excluded_pairs(test, device):
                         "source": source,
                         "welded_bodies": welded,
                         "immobile_shapes": shapes,
-                        "immobile_pairs": pairs,
+                        "listed_pairs": pairs,
                         "excluded_pairs": pairs if enabled else 0,
                     },
                 )
@@ -273,7 +315,7 @@ def test_models_without_immobile_pairs_keep_unfiltered_arguments(test, device):
             pipeline = newton.CollisionPipeline(model, broad_phase=mode)
             record = pipeline.get_collision_selection()["immobile_pairs"]
             test.assertFalse(record["enabled"])
-            test.assertEqual(record["immobile_pairs"], 0)
+            test.assertEqual(record["listed_pairs"], 0)
             test.assertEqual(
                 record["reason"], "No candidate pair can join two shapes that are static or welded to the world."
             )
@@ -499,6 +541,10 @@ for name, function in (
     ("test_broad_phases_drop_only_immobile_pairs", test_broad_phases_drop_only_immobile_pairs),
     ("test_opt_out_keeps_the_unfiltered_broad_phase", test_opt_out_keeps_the_unfiltered_broad_phase),
     ("test_static_kinematic_filter_composes", test_static_kinematic_filter_composes),
+    (
+        "test_static_kinematic_composition_ignores_unrelated_pairs",
+        test_static_kinematic_composition_ignores_unrelated_pairs,
+    ),
     ("test_record_reports_excluded_pairs", test_record_reports_excluded_pairs),
     (
         "test_models_without_immobile_pairs_keep_unfiltered_arguments",
