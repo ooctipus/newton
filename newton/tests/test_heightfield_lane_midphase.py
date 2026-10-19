@@ -24,7 +24,7 @@ import newton
 from newton._src.core.environment_flags import NEWTON_FLAGS
 from newton._src.geometry import heightfield_cells, heightfield_geometric, heightfield_lanes
 from newton._src.geometry.heightfield_geometric import PairProjection
-from newton._src.geometry.heightfield_lanes import CellWindow, _cell_window
+from newton._src.geometry.heightfield_lanes import CellWindow, _cell_window, _reserve_triangles
 from newton._src.geometry.narrow_phase import NarrowPhase
 from newton._src.utils.heightfield import HeightfieldData
 from newton.tests.test_heightfield_packed_pairs import logical
@@ -205,6 +205,36 @@ def window_kernel(
 ):
     """Build the lane window of the pair (shape 0, shape 1)."""
     windows[0] = _cell_window(0, 0, 1, heightfield, transforms, lower, upper, data, gaps, True)
+
+
+def reservation_calls(tid):
+    """Yield (call, amount) for every reservation this thread makes in ``reserve_kernel``."""
+    if tid % 7 == 3:
+        return
+    for call in range(tid % 5 + (tid // 32) % 3):
+        if (tid + call) % 4 == 1:
+            continue
+        yield call, 1 + (tid * 3 + call) % 2
+        if (tid * 5 + call) % 11 == 0:
+            return
+
+
+@wp.kernel(enable_backward=False)
+def reserve_kernel(count: wp.array[int], slots: wp.array[wp.vec3i]):
+    """Reserve one or two slots per call from lanes with diverging trip counts, skips and early exits."""
+    tid = wp.tid()
+    if tid % 7 == 3:
+        return
+    for call in range(tid % 5 + (tid / 32) % 3):
+        if (tid + call) % 4 == 1:
+            continue
+        amount = 1 + (tid * 3 + call) % 2
+        base = _reserve_triangles(count, amount)
+        for sub in range(amount):
+            if base + sub < slots.shape[0]:
+                slots[base + sub] = wp.vec3i(tid, call, sub)
+        if (tid * 5 + call) % 11 == 0:
+            return
 
 
 def deferred_stored(narrow):
@@ -553,6 +583,44 @@ class TestHeightfieldLaneMidphase(unittest.TestCase):
     def test_window_boundaries_cuda(self):
         """Match the original midphase at ulp-level bounds on CUDA, where each pass is compiled separately."""
         self.check_window_boundaries("cuda:0")
+
+    def check_reserve_triangles(self, device):
+        """Partition the triangle counter exactly with warp-aggregated reservations.
+
+        Every thread reserves one or two slots per call, with thread-dependent
+        trip counts, skipped calls, early returns before and after reserving and
+        a partial last warp, so the lanes that call together change from call
+        to call. The reserved ranges must cover ``[0, total)`` exactly once and
+        each call's two slots must be consecutive.
+        """
+        threads = 1000
+        count = wp.zeros(1, dtype=int, device=device)
+        slots = wp.full(4 * threads, wp.vec3i(-1, -1, -1), dtype=wp.vec3i, device=device)
+        wp.launch(reserve_kernel, threads, inputs=[count, slots], device=device, block_dim=128)
+        expected = [
+            (tid, call, sub)
+            for tid in range(threads)
+            for call, amount in reservation_calls(tid)
+            for sub in range(amount)
+        ]
+        total = int(count.numpy()[0])
+        self.assertEqual(total, len(expected))
+        written = [tuple(slot) for slot in slots.numpy()[:total].tolist()]
+        self.assertEqual(sorted(written), sorted(expected))
+        self.assertTrue(np.all(slots.numpy()[total:] == -1))
+        position = {slot: index for index, slot in enumerate(written)}
+        for tid, call, sub in expected:
+            if sub == 1:
+                self.assertEqual(position[(tid, call, 1)], position[(tid, call, 0)] + 1)
+
+    def test_reserve_triangles_cpu(self):
+        """Partition the triangle counter with one atomic per reservation on CPU."""
+        self.check_reserve_triangles("cpu")
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
+    def test_reserve_triangles_cuda(self):
+        """Partition the triangle counter with ballots, one leader atomic and a shuffle per CUDA call group."""
+        self.check_reserve_triangles("cuda:0")
 
     def test_inverted_window_is_empty_cpu(self):
         """Keep a window empty when an inverted, huge local box saturates its cell bounds.
