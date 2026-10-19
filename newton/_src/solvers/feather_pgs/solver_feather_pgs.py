@@ -3853,9 +3853,9 @@ class SolverFeatherPGS(SolverBase):
             from .tree_kinetic_owner import proof_runs  # noqa: PLC0415
 
             if proof_runs(flags):
-                # The owner's proof ran and found a moved joint frame (or a moved axis of
-                # a scalar-branch group, which reads axes live): invalidate every cache,
-                # whichever flag announced the move.
+                # The owner's proof ran and found a moved joint frame (a changed axis
+                # raises in every group's proof): invalidate every cache, whichever flag
+                # announced the move.
                 cache_inputs |= int(ModelFlags.JOINT_PROPERTIES)
         if tree_kinetic is not None and cache_inputs:
             tree_kinetic.invalidate()

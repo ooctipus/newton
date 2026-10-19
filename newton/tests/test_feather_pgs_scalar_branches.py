@@ -1354,12 +1354,15 @@ class TestScalarBranchKernels(unittest.TestCase):
         np.testing.assert_array_equal(pair.mine.aug_row_K.numpy()[rows[pair.dofs]], -7.0)
 
     def test_validation_accepts_frames_and_rejects_topology(self):
-        """Accept numeric and frame notifications; refuse a changed parent or group map.
+        """Accept numeric and frame notifications; refuse a changed axis, parent or group map.
 
-        The group reads frames and axes live: a notification that moved one
-        reports it (``False``, the caller invalidates), and the next that moves
-        nothing proves them unchanged (``True``, the caller keeps the caches).
-        Numeric notifications skip the proof (``False``).
+        The group reads frames live: a notification that moved one reports it
+        (``False``, the caller invalidates), and the next that moves nothing
+        proves them unchanged (``True``, the caller keeps the caches). An axis
+        is frozen, as in the tree groups: a revolute leaf's inverse mass depends
+        on it and refreshes only at the mass cadence. A changed axis raises
+        before any frame is stored. Numeric notifications skip the proof
+        (``False``).
         """
         joint = newton.ModelFlags.JOINT_PROPERTIES
         model = build_branch_model(worlds=2)
@@ -1368,8 +1371,13 @@ class TestScalarBranchKernels(unittest.TestCase):
         frames = model.joint_X_p.numpy()
         frames[:, 2] += 0.05
         model.joint_X_p.assign(frames)
-        axes = model.joint_axis.numpy()
-        axes[pair.dofs[0]] = (0.0, 0.0, 1.0)
+        axes = model.joint_axis.numpy().copy()
+        turned = axes.copy()
+        turned[pair.dofs[0]] = (0.0, 0.0, 1.0)
+        model.joint_axis.assign(turned)
+        with self.assertRaisesRegex(RuntimeError, "joint_axis changed"):
+            pair.state.validate_model(joint)
+        # The refusal stored nothing: with the axis restored, the moved frames are still reported.
         model.joint_axis.assign(axes)
         self.assertFalse(pair.state.validate_model(joint))
         self.assertTrue(pair.state.validate_model(newton.ModelFlags.ALL))

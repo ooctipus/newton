@@ -32,11 +32,14 @@ consumer on its route reads.
 A leaf's inverse mass, ``1 / (m |S|^2 + armature + K)`` for a prismatic leaf
 and ``1 / (S^T I S + armature + K)`` for a revolute one, depends on the inertial
 values, the armature and the drive's ``K = ke dt^2 + kd dt``, never on the
-pose, so a root re-pose leaves it unchanged. It still refreshes wherever the
-solver's mass mask selects (the update cadence plus the requests that resets
-and inertial, DOF and body notifications raise), as the prismatic linear
-state's does: that keeps prismatic leaves bitwise with that route and follows
-a changed step duration, which no notification announces. M6 timed prototype
+pose, so a root re-pose leaves it unchanged. A revolute leaf's also depends on
+its axis, which the group's proof freezes, and on its child frame, which a
+notification may move; the new value then takes effect at the next refresh, as
+in a tree group's held factor. The inverse mass refreshes wherever the solver's
+mass mask selects (the update cadence plus the requests that resets and
+inertial, DOF and body notifications raise), as the prismatic linear state's
+does: that keeps prismatic leaves bitwise with that route and follows a
+changed step duration, which no notification announces. M6 timed prototype
 predict and finish kernels at 489 us per substep with this cadence over 16384
 keyboard-sized worlds, against 500 us with a refresh on every substep.
 """
@@ -63,8 +66,10 @@ _REPAIR_LANES = wp.constant(32)
 # compiles the repair at this block.
 _REPAIR_BLOCK_DIM = 128
 
-# Topology arrays the plan and the kernels' index arithmetic rely on.
-_TOPOLOGY_FIELDS = (
+# Topology arrays the plan and the kernels' index arithmetic rely on, and the
+# joint axes, frozen as in the tree groups: a revolute leaf's inverse mass
+# depends on its axis but refreshes only at the mass cadence.
+_FROZEN_FIELDS = (
     "articulation_start",
     "joint_type",
     "joint_parent",
@@ -72,11 +77,12 @@ _TOPOLOGY_FIELDS = (
     "joint_q_start",
     "joint_qd_start",
     "joint_dof_dim",
+    "joint_axis",
 )
-# Frames and axes are read live, so they are watched, not frozen: a notification
-# that moves one invalidates the caches. Inertial values arrive with numeric
+# Frames are read live, so they are watched, not frozen: a notification that
+# moves one invalidates the caches. Inertial values arrive with numeric
 # notifications, which invalidate them anyway.
-_LIVE_FIELDS = ("joint_X_p", "joint_X_c", "joint_axis")
+_FRAME_FIELDS = ("joint_X_p", "joint_X_c")
 
 
 @wp.func
@@ -824,10 +830,10 @@ class ScalarBranchState:
         self._plan_dimensions = self._dimensions()
         self._proof = (
             DeviceProof(
-                [(name, getattr(model, name)) for name in (*_TOPOLOGY_FIELDS, *_LIVE_FIELDS)]
+                [(name, getattr(model, name)) for name in (*_FROZEN_FIELDS, *_FRAME_FIELDS)]
                 + [("group_to_art", self.group_to_art), ("art_to_world", solver.art_to_world)],
                 device,
-                watched=_LIVE_FIELDS,
+                watched=_FRAME_FIELDS,
             )
             if prove
             else None
@@ -845,22 +851,24 @@ class ScalarBranchState:
         )
 
     def validate_model(self, flags=None):
-        """Reject topology changes; frames, axes and inertial values are read live.
+        """Reject topology and axis changes; frames and inertial values are read live.
 
         Numeric notifications cannot change the topology and are accepted
         outright. Other notifications (Isaac Lab re-poses fixed roots through
         ``joint_X_p`` with ``JOINT_PROPERTIES`` on resets) compare the frozen
-        topology arrays on the device with one small readback, which also
-        watches the joint frames and axes, unless the held-tree owner that
-        composes the group already proves them.
+        topology arrays and joint axes on the device with one small readback,
+        which also watches the joint frames, unless the held-tree owner that
+        composes the group already proves them. A changed axis raises, as in
+        the tree groups: a revolute leaf's inverse mass depends on it and
+        refreshes only at the mass cadence.
 
         Returns:
-            Whether the proof ran and found the topology, frames and axes
+            Whether the proof ran and found the topology, axes and frames
             unchanged (see :meth:`TreeKineticState.validate_model`); ``False``
-            after a moved frame or axis, which the caller invalidates, and for
-            numeric notifications, which skip the proof. Without a proof of its
-            own, ``True``: the owner's tree groups prove the same model arrays,
-            and the owner keeps the caches only when every proof passes.
+            after a moved frame, which the caller invalidates, and for numeric
+            notifications, which skip the proof. Without a proof of its own,
+            ``True``: the owner's tree groups prove the same model arrays, and
+            the owner keeps the caches only when every proof passes.
         """
         if not proof_runs(flags):
             return False
