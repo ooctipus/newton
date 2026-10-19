@@ -915,6 +915,120 @@ class _Pair:
         self.step_index += 1
 
 
+def check_owner_launches(test, device):
+    """Launch every kernel of an owner beside scalar branches; each launch must match its kernel's parameters.
+
+    The owner composition of the held-tree launch check (``check_owner_launches`` of the cache-validity
+    tests) that the keyboard class takes: a scalar group beside an arm's tree group. The scalar group
+    holds no bank stamps, so the tree group binds no comparison: forced to classify on a one-block grid
+    it binds the classification and the listed repair, otherwise its one-pass repair alone. Each owner
+    takes two steps, the other DOFs' drive preparation included, and a copy-back begin. Every held-tree
+    and scalar launch is checked before it runs, the scalar kernels' outputs included, and every kernel
+    each group bound must have run: a tree group's by the cache its launches pass, the scalar group's by
+    kernel. On CPU the owner is built directly, as ``cached_dynamics`` builds it on CUDA, where the
+    recipe's solver installs it (construction's lane timing included).
+    """
+    from newton.tests.test_feather_pgs_cache_validity import (  # noqa: PLC0415
+        _force_classification,
+        _input_mismatches,
+    )
+
+    device = wp.get_device(device)
+    scalar_kernels = {
+        sb.repair_scalar_branches: "repair",
+        sb.predict_prismatic_branches: "predict",
+        sb.predict_scalar_branches: "predict",
+        sb.finish_prismatic_branches: "finish",
+        sb.finish_scalar_branches: "finish",
+        sb.prepare_listed_augmented_drives: "drives",
+    }
+    launched = []
+
+    def checked(launch):
+        def launch_checked(kernel, *args, **kwargs):
+            if kernel.key.startswith("tree_kinetic_") or kernel in scalar_kernels:
+                # Checked before the launch: Warp would run a struct passed in another struct's place.
+                inputs = [*kwargs.get("inputs", ()), *kwargs.get("outputs", ())]
+                test.assertEqual(_input_mismatches(kernel, inputs), [], kernel.key)
+                launched.append((kernel, inputs))
+            return launch(kernel, *args, **kwargs)
+
+        return launch_checked
+
+    for forced in (True, False):
+        with test.subTest(classified=forced):
+            launched.clear()
+            with mock.patch.multiple(wp, launch=checked(wp.launch), launch_tiled=checked(wp.launch_tiled)):
+                if device.is_cpu:
+                    model = build_branch_model(device, worlds=2)
+                    solver = cpu_solver(model, branch_size(model))
+                    solver._scalar_branches, _reason = sb.plan_scalar_branches(solver, requested=True)
+                    owner = MixedTreeKineticState(solver)
+                else:
+                    model = build_branch_model(device, worlds=2, leaves=PRESS_LEAVES, shapes=True)
+                    model.rigid_contact_max = 1
+                    solver = recipe_solver(model, scalar=True)
+                    owner = solver._tree_kinetic_state
+                test.assertIsInstance(owner, MixedTreeKineticState)
+                test.assertIsInstance(owner.scalar, sb.ScalarBranchState)
+                test.assertFalse(owner.bank_compare)
+                groups = []
+                for group in owner.groups:
+                    if group is owner.scalar:
+                        kernels = {
+                            group.repair_kernel: "repair",
+                            group.predictor_kernel: "predict",
+                            group.finish_kernel: "finish",
+                            sb.prepare_listed_augmented_drives: "drives",
+                        }
+                    else:
+                        if forced:
+                            _force_classification(group)
+                        test.assertEqual(group.classify_first, forced)
+                        test.assertFalse(group.bank_compare)
+                        kernels = {
+                            group.repair_kernel: "repair",
+                            group.finish_kernel: "finish",
+                            group.predictor_kernel: "predict",
+                            group.classify_kernel: "classify",
+                            group.bank_kernel: "bank",
+                            group.listed_repair_kernel: "listed",
+                            group.bank_repair_kernel: "bank_repair",
+                        }
+                        kernels.pop(None, None)
+                        bound = {"classify", "listed"} if forced else set()
+                        test.assertEqual(sorted(kernels.values()), sorted({"repair", "finish", "predict", *bound}))
+                    groups.append((group, kernels))
+                test.assertEqual(sum(group is owner.scalar for group, _ in groups), 1)
+                states, control = [model.state(), model.state()], model.control()
+                solver._last_step_dt = DT
+                augmented = solver._prepare_augmented_state(states[0], states[1], control)
+                for source, refresh in ((0, True), (1, False)):
+                    state, output = states[source], states[1 - source]
+                    owner.begin(state, augmented, state.joint_qd, DT, refresh)
+                    owner.scalar.launch_other_drives(state, augmented, control, DT)
+                    solver.mass_update_mask.fill_(1)
+                    owner.refresh(augmented)
+                    owner.predict(state, augmented, control, state.joint_qd, DT)
+                    solver.v_out.assign(solver.v_hat)
+                    owner.finish(state, augmented, output, DT, refresh)
+                # A copy of the bank the last finish published, one coordinate changed: identity validation
+                # launches the one-pass repair, which compares nothing.
+                states[1].assign(states[0])
+                coordinates = states[1].joint_q.numpy()
+                coordinates[0] += np.float32(0.01)
+                states[1].joint_q.assign(coordinates)
+                owner.begin(states[1], augmented, states[1].joint_qd, DT, False, state_out=states[0])
+            for group, kernels in groups:
+                if group is owner.scalar:
+                    ran = {kernel for kernel, _ in launched}
+                else:
+                    ran = {kernel for kernel, inputs in launched if any(value is group.data for value in inputs)}
+                unlaunched = sorted(kind for kernel, kind in kernels.items() if kernel not in ran)
+                test.assertEqual(unlaunched, [], type(group).__name__)
+            test.assertTrue(np.isfinite(states[0].joint_q.numpy()).all())
+
+
 class TestScalarBranchRule(unittest.TestCase):
     def test_world_fixed_one_coordinate_stars_are_admitted(self):
         """Admit prismatic, revolute and mixed leaf stars on FIXED and zero-coordinate D6 roots."""
@@ -1102,6 +1216,14 @@ class TestScalarBranchRule(unittest.TestCase):
                     launches(lambda owner=owner: owner.begin(s0, augmented, s0.joint_qd, DT, False, state_out=s1)),
                     copy_back,
                 )
+
+    def test_owner_launches_match_their_kernels(self):
+        """Launch every kernel of an owner beside scalar branches with one input of each parameter's type, on CPU.
+
+        CPU owners keep the one-pass repair, so the arm group's classification is forced; see
+        :func:`check_owner_launches`.
+        """
+        check_owner_launches(self, "cpu")
 
     def test_owner_proves_the_scalar_topology_through_its_tree_groups(self):
         """Validate a notification with the owner's and the arm group's proofs alone, and still refuse new topology.
@@ -1902,6 +2024,10 @@ class TestScalarBranchOwner(unittest.TestCase):
             compare(f"replay {replay}")
         # The comparison is not vacuous: the floors carried the keys.
         self.assertGreater(max(loads), 0.0)
+
+    def test_cuda_owner_launches_match_their_kernels(self):
+        """Launch every kernel the recipe's owner beside scalar branches binds, construction's included, with matching inputs."""
+        check_owner_launches(self, "cuda:0")
 
     def test_drive_kernel_covers_only_the_other_dofs(self):
         """Launch the drive preparation over the DOFs outside the branches only; the branches fold theirs.
