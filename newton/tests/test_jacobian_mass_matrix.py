@@ -283,6 +283,14 @@ def _filled(shape, value, device):
     return wp.array(np.full(shape, value, dtype=np.float32), dtype=float, device=device)
 
 
+def _assert_bits_equal(actual, expected):
+    """Assert that two float32 arrays hold the same bits, so that ``-0.0`` does not pass for ``0.0``."""
+    np.testing.assert_array_equal(
+        np.ascontiguousarray(actual, dtype=np.float32).view(np.uint32),
+        np.ascontiguousarray(expected, dtype=np.float32).view(np.uint32),
+    )
+
+
 def _record_clears():
     """Patch whole-array clears and return the patches and the list of cleared array pointers.
 
@@ -793,8 +801,8 @@ def test_jacobian_mask_overwrites_only_selected_blocks(test, device):
             test.assertIs(newton.eval_jacobian(model, state, J, mask=mask), J)
 
             J_np = J.numpy()
-            np.testing.assert_array_equal(J_np[selected], J_ref[selected])
-            np.testing.assert_array_equal(J_np[~selected], np.full_like(J_ref[~selected], _SENTINEL))
+            _assert_bits_equal(J_np[selected], J_ref[selected])
+            _assert_bits_equal(J_np[~selected], np.full_like(J_ref[~selected], _SENTINEL))
 
 
 def test_jacobian_mask_skips_whole_buffer_clear(test, device):
@@ -823,8 +831,8 @@ def test_jacobian_mask_without_buffer_zeroes_unselected(test, device):
 
     J = newton.eval_jacobian(model, state, mask=wp.array(selected, dtype=bool, device=device)).numpy()
 
-    np.testing.assert_array_equal(J[selected], J_ref[selected])
-    np.testing.assert_array_equal(J[~selected], np.zeros_like(J_ref[~selected]))
+    _assert_bits_equal(J[selected], J_ref[selected])
+    _assert_bits_equal(J[~selected], np.zeros_like(J_ref[~selected]))
 
 
 def test_articulation_view_jacobian_writes_only_view_blocks(test, device):
@@ -843,8 +851,8 @@ def test_articulation_view_jacobian_writes_only_view_blocks(test, device):
             selected = view.get_model_articulation_mask(mask=view_mask).numpy()
             test.assertEqual(int(selected.sum()), 3 if mask is None else 1)
             J_np = J.numpy()
-            np.testing.assert_array_equal(J_np[selected], J_ref[selected])
-            np.testing.assert_array_equal(J_np[~selected], np.full_like(J_ref[~selected], _SENTINEL))
+            _assert_bits_equal(J_np[selected], J_ref[selected])
+            _assert_bits_equal(J_np[~selected], np.full_like(J_ref[~selected], _SENTINEL))
 
 
 def test_articulation_view_of_every_articulation_clears_whole_buffers(test, device):
@@ -869,15 +877,15 @@ def test_articulation_view_of_every_articulation_clears_whole_buffers(test, devi
     jacobian_clears = [ptr for ptr, shape, _dtype in cleared if shape == J_ref.shape]
     test.assertEqual(len(jacobian_clears), 2)
     test.assertIn(J.ptr, jacobian_clears)
-    np.testing.assert_array_equal(J.numpy(), J_ref)
-    np.testing.assert_array_equal(H.numpy(), H_ref)
+    _assert_bits_equal(J.numpy(), J_ref)
+    _assert_bits_equal(H.numpy(), H_ref)
 
     J = _filled(J_ref.shape, _SENTINEL, device)
     view.eval_jacobian(state, J, mask=wp.array([False, True, False], dtype=bool, device=device))
     selected = model.articulation_world.numpy() == 1
     J_np = J.numpy()
-    np.testing.assert_array_equal(J_np[selected], J_ref[selected])
-    np.testing.assert_array_equal(J_np[~selected], np.full_like(J_ref[~selected], _SENTINEL))
+    _assert_bits_equal(J_np[selected], J_ref[selected])
+    _assert_bits_equal(J_np[~selected], np.full_like(J_ref[~selected], _SENTINEL))
 
 
 def test_mass_matrix_mask_zeroes_unselected_articulations(test, device):
@@ -900,8 +908,8 @@ def test_mass_matrix_mask_zeroes_unselected_articulations(test, device):
                 test.assertIs(newton.eval_mass_matrix(model, state, H, J=supplied, mask=mask), H)
 
                 H_np = H.numpy()
-                np.testing.assert_array_equal(H_np[selected], H_ref[selected])
-                np.testing.assert_array_equal(H_np[~selected], np.zeros_like(H_ref[~selected]))
+                _assert_bits_equal(H_np[selected], H_ref[selected])
+                _assert_bits_equal(H_np[~selected], np.zeros_like(H_ref[~selected]))
 
 
 def test_mass_matrix_scratch_skips_redundant_clears(test, device):
@@ -952,7 +960,7 @@ def test_zero_selected_blocks_matches_numpy(test, device):
                 clear(blocks, mask, shape[0], device)
                 expected = values.copy()
                 expected[selected] = 0.0
-                np.testing.assert_array_equal(blocks.numpy(), expected)
+                _assert_bits_equal(blocks.numpy(), expected)
 
         with test.subTest(clear=clear.__name__, shape="more blocks than articulations"):
             values = rng.normal(size=(7, 6, 2)).astype(np.float32)
@@ -960,7 +968,7 @@ def test_zero_selected_blocks_matches_numpy(test, device):
             clear(blocks, wp.array(np.append(selected, True), dtype=bool, device=device), 5, device)
             expected = values.copy()
             expected[:5][selected] = 0.0
-            np.testing.assert_array_equal(blocks.numpy(), expected)
+            _assert_bits_equal(blocks.numpy(), expected)
 
         with test.subTest(clear=clear.__name__, shape="misaligned buffer"):
             values = rng.normal(size=1 + 5 * 12).astype(np.float32)
@@ -968,7 +976,7 @@ def test_zero_selected_blocks_matches_numpy(test, device):
             clear(whole[1:].reshape((5, 6, 2)), mask, 5, device)
             expected = values.copy()
             expected[1:].reshape(5, 12)[selected] = 0.0
-            np.testing.assert_array_equal(whole.numpy(), expected)
+            _assert_bits_equal(whole.numpy(), expected)
 
         # The first view starts 256 bytes into the buffer, the second 380 bytes.
         for name, rows, cols in (("aligned", slice(2, 10), slice(4, 16)), ("misaligned", slice(3, 11), slice(5, 17))):
@@ -978,7 +986,7 @@ def test_zero_selected_blocks_matches_numpy(test, device):
                 clear(whole[:, rows, cols], mask, 5, device)
                 expected = values.copy()
                 expected[selected, rows, cols] = 0.0
-                np.testing.assert_array_equal(whole.numpy(), expected)
+                _assert_bits_equal(whole.numpy(), expected)
 
 
 def test_zero_selected_blocks_kernel_by_block_size(test, device):
@@ -1027,7 +1035,7 @@ def test_zero_selected_blocks_replays_recorded_launch(test, device):
     def expect(selected):
         expected = values.copy()
         expected[np.asarray(selected)] = 0.0
-        np.testing.assert_array_equal(blocks.numpy(), expected)
+        _assert_bits_equal(blocks.numpy(), expected)
 
     with mock.patch.dict(_clear_replays, clear=True), mock.patch.object(wp, "launch", wraps=wp.launch) as launch:
         _launch_zero_selected_blocks(blocks, mask, 4, device)
@@ -1046,8 +1054,8 @@ def test_zero_selected_blocks_replays_recorded_launch(test, device):
         other = wp.array(values, dtype=float, device=device)
         _launch_zero_selected_blocks(other, mask, 4, device)
         test.assertEqual(launch.call_count, 2)
-        np.testing.assert_array_equal(other.numpy()[[1, 2]], np.zeros((2, 6, 2), dtype=np.float32))
-        np.testing.assert_array_equal(other.numpy()[[0, 3]], values[[0, 3]])
+        _assert_bits_equal(other.numpy()[[1, 2]], np.zeros((2, 6, 2), dtype=np.float32))
+        _assert_bits_equal(other.numpy()[[0, 3]], values[[0, 3]])
 
         blocks.assign(values)
         with wp.ScopedCapture(device) as capture:
@@ -1091,7 +1099,9 @@ def test_zero_selected_blocks_fills_cpu_memory_on_host(test, device):
         _zero_selected_blocks(blocks, mask, 4, device)
 
     test.assertEqual(launch.call_count, 0)
-    np.testing.assert_array_equal(blocks.numpy().reshape(4, -1).max(axis=1), [0.0, 1.0, 0.0, 1.0])
+    expected = np.ones((4, 6, 3), dtype=np.float32)
+    expected[[0, 2]] = 0.0
+    _assert_bits_equal(blocks.numpy(), expected)
 
 
 def test_jacobian_mask_accepts_masks_the_launch_converts(test, device):
@@ -1116,8 +1126,8 @@ def test_jacobian_mask_accepts_masks_the_launch_converts(test, device):
         with test.subTest(mask=name):
             J = _filled(_jacobian_shape(model), _SENTINEL, device)
             newton.eval_jacobian(model, state, J, mask=mask)
-            np.testing.assert_array_equal(J.numpy(), J_ref.numpy())
-            np.testing.assert_array_equal(newton.eval_mass_matrix(model, state, mask=mask).numpy(), H_ref)
+            _assert_bits_equal(J.numpy(), J_ref.numpy())
+            _assert_bits_equal(newton.eval_mass_matrix(model, state, mask=mask).numpy(), H_ref)
 
 
 def test_jacobian_mask_graph_replay_matches_eager(test, device):
@@ -1146,8 +1156,8 @@ def test_jacobian_mask_graph_replay_matches_eager(test, device):
             wp.capture_launch(capture.graph)
 
             J_np = J.numpy()
-            np.testing.assert_array_equal(J_np[selected], J_ref[selected])
-            np.testing.assert_array_equal(J_np[~selected], np.full_like(J_ref[~selected], _SENTINEL))
+            _assert_bits_equal(J_np[selected], J_ref[selected])
+            _assert_bits_equal(J_np[~selected], np.full_like(J_ref[~selected], _SENTINEL))
 
 
 def test_mass_matrix_mask_graph_replay_matches_eager(test, device):
@@ -1179,8 +1189,8 @@ def test_mass_matrix_mask_graph_replay_matches_eager(test, device):
             wp.capture_launch(capture.graph)
 
             H_np = H.numpy()
-            np.testing.assert_array_equal(H_np[selected], H_ref[selected])
-            np.testing.assert_array_equal(H_np[~selected], np.zeros_like(H_ref[~selected]))
+            _assert_bits_equal(H_np[selected], H_ref[selected])
+            _assert_bits_equal(H_np[~selected], np.zeros_like(H_ref[~selected]))
 
 
 def test_jacobian_mask_clear_is_not_taped(test, device):
@@ -1234,7 +1244,7 @@ def test_jacobian_mask_clear_is_not_taped(test, device):
                 gradients[name] = buffer.grad.numpy()
                 np.testing.assert_array_equal(gradients[name][size:], 1.0)
                 np.testing.assert_array_equal(gradients[name][:size].reshape(shape[0], -1)[~selected], 1.0)
-                np.testing.assert_array_equal(gradients[name], gradients["eager"])
+                _assert_bits_equal(gradients[name], gradients["eager"])
 
 
 def test_prismatic_joint_jacobian(test, device):
