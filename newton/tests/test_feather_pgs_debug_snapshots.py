@@ -7,6 +7,10 @@ Without ``FEATHER_PGS_DEBUG_SNAPSHOTS=1`` or ``pgs_debug=True`` the solver
 allocates no snapshot and launches no snapshot copy. With either, the external
 NaN dumpers read the same attributes, shapes and values as before the switch
 existed, and the snapshots hold no gradient, so a tape records the same step.
+
+The flag-on and flag-off arms are separate solver instances compared row by
+row, so they must reserve every contact's rows at the same slots. On CUDA that
+holds only while the compared scene's contacts fit in one warp (``WARP_SIZE``).
 """
 
 import ctypes
@@ -28,12 +32,24 @@ FLAG = "FEATHER_PGS_DEBUG_SNAPSHOTS"
 # joint acceleration and the predicted velocity before contacts.
 SNAPSHOTS = ("_debug_stage3_qd_work", "_debug_stage3_joint_qdd", "_debug_stage3_v_hat")
 STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
+# Besides contact_path, the routing arrays that place a routed contact's rows (allocate_world_contact_slots).
+RESERVATION_FIELDS = ("contact_world", "contact_slot", "contact_slots_needed")
 DT = 1.0 / 240.0
+FRICTION_LAWS = {"patch": {}, "point": {"friction_anchor_beta": 0.0}}
+# Worlds of the compared scene: up to 26 live contacts per step, one warp's worth.
+COMPARED_WORLDS = 2
+# Substeps replayed from captured graphs, after one eager warm-up substep.
+GRAPH_STEPS = 12
 # Driver node types (CUgraphNodeType) of a captured CUDA graph.
 KERNEL_NODE, MEMCPY_NODE, MEMSET_NODE = 0, 1, 2
 # Separate CUDA solver instances may order float atomic accumulations differently,
 # so they compare within the repository's cross-instance bound; CPU runs serially.
 CUDA_INSTANCE_ATOL = 2.0e-6
+# Each contact reserves its rows with an atomic_add on its world's slot counter. On CUDA,
+# the warps of that launch reach a counter in a run-varying order, so two instances give a
+# world's contacts the same slots only when one warp reserves them all. Impulses are stored
+# by slot and swept in slot order, so the compared scene keeps its contacts in one warp.
+WARP_SIZE = 32
 
 
 @contextmanager
@@ -60,7 +76,37 @@ def _assert_same(test, device, actual, expected, label):
         np.testing.assert_array_equal(actual, expected, err_msg=label)
 
 
-def _scene(device, worlds=2):
+def _assert_same_reservations(test, actual, expected, label):
+    """Require both arms to place every contact's rows at the same slots, which comparing them by slot assumes."""
+    test.assertEqual(sorted(actual), sorted(expected), label)
+    for name, values in expected.items():
+        np.testing.assert_array_equal(
+            actual[name],
+            values,
+            err_msg=(
+                f"{label} {name}: the arms reserved contact rows in different slots, so their impulses and row sweeps "
+                "are not comparable; on CUDA, contacts past the first warp reserve in a run-varying order"
+            ),
+        )
+
+
+def _reservations(solver, contacts):
+    """Return the live contacts' routing and the per-world row counts after a step.
+
+    A contact without rows (path below 0) keeps stale routing entries, so its
+    world, first slot and row count read as -1.
+    """
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    path = solver.contact_path.numpy()[:count].copy()
+    reservation = {name: np.where(path >= 0, getattr(solver, name).numpy()[:count], -1) for name in RESERVATION_FIELDS}
+    reservation["contact_path"] = path
+    reservation["constraint_count"] = solver.constraint_count.numpy().copy()
+    if getattr(solver, "mf_constraint_count", None) is not None:
+        reservation["mf_constraint_count"] = solver.mf_constraint_count.numpy().copy()
+    return reservation
+
+
+def _scene(device, worlds=COMPARED_WORLDS):
     """A fixed-base arm whose tip touches the ground, a floating two-link body and a free box, per world."""
     builder = newton.ModelBuilder()
     for _world in range(worlds):
@@ -173,11 +219,12 @@ def _signature(array):
 def _rollout(model, *, snapshots, steps=6, record_values=False, **solver_kwargs):
     """Step eagerly through the collision pipeline, recording every copy and kernel launch per step.
 
-    Returns the solver, the states after each step, and per step the copies
-    (destination, source and, with ``record_values``, the source's values when
-    the destination is a snapshot) and the launched kernel keys. Reading the
-    values synchronizes a CUDA device inside the step, so only the test that
-    compares them asks for them.
+    Returns the solver, the states after each step, and per step the live
+    contact count, the row reservations, the copies (destination, source and,
+    with ``record_values``, the source's values when the destination is a
+    snapshot) and the launched kernel keys. Reading the values synchronizes a
+    CUDA device inside the step, so only the test that compares them asks for
+    them.
     """
     with _snapshot_flag(snapshots):
         solver = SolverFeatherPGS(model, **solver_kwargs)
@@ -187,7 +234,7 @@ def _rollout(model, *, snapshots, steps=6, record_values=False, **solver_kwargs)
     newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
     states[0].joint_qd.assign(np.linspace(-0.6, 0.6, model.joint_dof_count, dtype=np.float32))
     control = model.control()
-    copies, launches, inputs, trajectory = [], [], [], []
+    copies, launches, inputs, trajectory, counts, reservations = [], [], [], [], [], []
     copy, launch, launch_tiled = wp.copy, wp.launch, wp.launch_tiled
     reading = False
 
@@ -218,12 +265,14 @@ def _rollout(model, *, snapshots, steps=6, record_values=False, **solver_kwargs)
         copies.append([])
         launches.append([])
         pipeline.collide(states[0], contacts)
+        counts.append(int(contacts.rigid_contact_count.numpy()[0]))
         states[0].clear_forces()
         inputs.append(states[0])
         with patch.multiple(wp, **spies):
             solver.step(states[0], states[1], control, contacts, DT)
         trajectory.append({name: getattr(states[1], name).numpy().copy() for name in STATE_FIELDS})
         trajectory[-1]["impulses"] = solver.impulses.numpy().copy()
+        reservations.append(_reservations(solver, contacts))
         states.reverse()
     return {
         "solver": solver,
@@ -231,14 +280,20 @@ def _rollout(model, *, snapshots, steps=6, record_values=False, **solver_kwargs)
         "launches": launches,
         "inputs": inputs,
         "trajectory": trajectory,
-        "contacts": int(contacts.rigid_contact_count.numpy()[0]),
+        "contact_counts": counts,
+        "reservations": reservations,
     }
 
 
+def _modes_and_laws(device):
+    """Solver options per PGS mode and friction law: split mode on every device, matrix-free mode on CUDA only."""
+    modes = ("split", "matrix_free") if wp.get_device(device).is_cuda else ("split",)
+    return {f"{mode}_{law}": {"pgs_mode": mode, **options} for mode in modes for law, options in FRICTION_LAWS.items()}
+
+
 def _configurations(device):
-    configurations = {"patch": {}, "point": {"friction_anchor_beta": 0.0}}
+    configurations = _modes_and_laws(device)
     if wp.get_device(device).is_cuda:
-        configurations["matrix_free"] = {"pgs_mode": "matrix_free"}
         # Velocity limits need matrix-free mode; the predictor then starts from the prescaled qd_work.
         configurations["velocity_limits"] = {"pgs_mode": "matrix_free", "enable_joint_velocity_limits": True}
     return configurations
@@ -313,9 +368,11 @@ def test_snapshots_leave_physics_unchanged(test, device):
         with test.subTest(configuration=label):
             off = _rollout(model, snapshots=False, **options)
             on = _rollout(model, snapshots=True, **options)
-            test.assertGreater(off["contacts"], 0)
-            test.assertEqual(off["contacts"], on["contacts"])
+            test.assertGreater(min(off["contact_counts"]), 0)
+            test.assertLessEqual(max(off["contact_counts"]), WARP_SIZE, "the compared contacts must fit in one warp")
+            test.assertEqual(off["contact_counts"], on["contact_counts"])
             for step, (expected, actual) in enumerate(zip(off["trajectory"], on["trajectory"], strict=True)):
+                _assert_same_reservations(test, on["reservations"][step], off["reservations"][step], f"step {step}")
                 for name, values in expected.items():
                     _assert_same(test, device, actual[name], values, f"step {step} {name}")
             moved = np.abs(off["trajectory"][-1]["joint_q"] - model.joint_q.numpy()).max()
@@ -324,6 +381,23 @@ def test_snapshots_leave_physics_unchanged(test, device):
 
 
 class TestFeatherPGSDebugSnapshots(unittest.TestCase):
+    def test_compared_scene_keeps_contacts_in_one_warp(self):
+        """Keep every step of the compared scene, for as long as the captured test replays it, within one warp.
+
+        The eager and captured comparisons step this scene for up to
+        GRAPH_STEPS + 1 substeps in split and matrix-free mode. On CUDA, contacts
+        past the first warp reserve rows in a run-varying order, and the arms
+        would then differ by their slot order rather than by the flag; eight
+        worlds put 97-104 contacts in four warps. The CPU checks the scene in
+        split mode under both friction laws before any GPU runs it.
+        """
+        model = _scene("cpu")
+        for label, options in _modes_and_laws("cpu").items():
+            with self.subTest(configuration=label):
+                run = _rollout(model, snapshots=False, steps=GRAPH_STEPS + 1, **options)
+                self.assertGreater(min(run["contact_counts"]), 0)
+                self.assertLessEqual(max(run["contact_counts"]), WARP_SIZE, run["contact_counts"])
+
     def test_flag_is_declared_as_a_diagnostic(self):
         """Declare the switch in the FeatherPGS registry as a diagnostic the solver reads."""
         from newton._src.solvers.feather_pgs import environment_flags  # noqa: PLC0415
@@ -436,8 +510,12 @@ def _graph_node_types(graph):
     return types
 
 
-def _graph_rollout(model, *, snapshots, steps=12, **solver_kwargs):
-    """Capture one substep per state order, replay them, and record each graph's nodes and captured copies."""
+def _graph_rollout(model, *, snapshots, steps=GRAPH_STEPS, **solver_kwargs):
+    """Capture one substep per state order, replay them, and record each graph's nodes and captured copies.
+
+    Also returns the final state and impulses, the last replay's row
+    reservations and the live contact count of every substep.
+    """
     device = model.device
     with _snapshot_flag(snapshots):
         solver = SolverFeatherPGS(model, **solver_kwargs)
@@ -454,6 +532,7 @@ def _graph_rollout(model, *, snapshots, steps=12, **solver_kwargs):
 
     # Compile and initialize the layouts before capture.
     pipeline.collide(states[0], contacts)
+    counts = [int(contacts.rigid_contact_count.numpy()[0])]
     substep(states[0], states[1])
     states.reverse()
     copy, copies, graphs = wp.copy, [], []
@@ -471,6 +550,7 @@ def _graph_rollout(model, *, snapshots, steps=12, **solver_kwargs):
             graphs.append(capture.graph)
     for step in range(steps):
         pipeline.collide(states[0], contacts)
+        counts.append(int(contacts.rigid_contact_count.numpy()[0]))
         wp.capture_launch(graphs[step % 2])
         states.reverse()
     final = {name: getattr(states[0], name).numpy().copy() for name in STATE_FIELDS}
@@ -478,6 +558,8 @@ def _graph_rollout(model, *, snapshots, steps=12, **solver_kwargs):
     return {
         "solver": solver,
         "final": final,
+        "reservations": _reservations(solver, contacts),
+        "contact_counts": counts,
         "node_types": [_graph_node_types(graph) for graph in graphs],
         "copies": copies,
     }
@@ -486,13 +568,23 @@ def _graph_rollout(model, *, snapshots, steps=12, **solver_kwargs):
 @unittest.skipUnless(wp.is_cuda_available(), "Graph capture requires CUDA")
 class TestFeatherPGSDebugSnapshotsGraph(unittest.TestCase):
     def test_captured_substeps_have_no_snapshot_memcpy_nodes(self):
-        """Capture no snapshot memcpy node by default and three per substep under the flag; replay the same states."""
+        """Capture no snapshot memcpy node by default and three per substep under the flag; replay the same states.
+
+        Covers split and matrix-free mode under patch and point friction.
+        """
         device = wp.get_device("cuda:0")
-        model = _scene(device, worlds=8)
-        for mode in ("split", "matrix_free"):
-            with self.subTest(pgs_mode=mode):
-                off = _graph_rollout(model, snapshots=False, pgs_mode=mode)
-                on = _graph_rollout(model, snapshots=True, pgs_mode=mode)
+        model = _scene(device)
+        for label, options in _modes_and_laws(device).items():
+            with self.subTest(configuration=label):
+                off = _graph_rollout(model, snapshots=False, **options)
+                on = _graph_rollout(model, snapshots=True, **options)
+                self.assertGreater(min(off["contact_counts"]), 0)
+                self.assertLessEqual(
+                    max(off["contact_counts"] + on["contact_counts"]),
+                    WARP_SIZE,
+                    "the compared contacts must fit in one warp",
+                )
+                self.assertEqual(off["contact_counts"], on["contact_counts"])
                 for name in SNAPSHOTS:
                     self.assertIsNone(getattr(off["solver"], name), name)
                 for off_copies, on_copies in zip(off["copies"], on["copies"], strict=True):
@@ -506,6 +598,7 @@ class TestFeatherPGSDebugSnapshotsGraph(unittest.TestCase):
                         if not _is_snapshot(on["solver"], dest)
                     ]
                     self.assertEqual([(_signature(dest), _signature(src)) for dest, src in off_copies], kept)
+                _assert_same_reservations(self, on["reservations"], off["reservations"], "last replay")
                 for name, values in off["final"].items():
                     _assert_same(self, device, on["final"][name], values, name)
                 failed = [types for types in off["node_types"] + on["node_types"] if isinstance(types, str)]
