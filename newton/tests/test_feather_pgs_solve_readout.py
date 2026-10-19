@@ -954,6 +954,50 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         summary = solver.get_path_selection()["measurements"]["solve_readout"]
         self.assertEqual(_skipped(summary), launches["rowless"])
 
+    def test_fused_propagation_counts_nothing_and_says_why(self):
+        """Allocate no counter and honor no tolerance where the fused propagation kernel runs every solve.
+
+        Under ``articulated_contact_response="propagation-fused"`` one kernel sweeps every world's
+        dense, matrix-free and propagation rows, and none of the counted sweeps launches. The solver
+        then builds its sweeps under the exact policy: the readout and the tolerance apply nowhere,
+        the records and the applied options say so, the solver warns about the tolerance, and no
+        measurement reports counters that never count.
+        """
+        from newton.tests.test_feather_pgs_free_root_predictor import _build_slider  # noqa: PLC0415
+
+        model = _build_slider("cuda:0", articulated=True)
+        with self.assertWarnsRegex(UserWarning, "pgs_velocity_change_tolerance"):
+            solver = SolverFeatherPGS(
+                model,
+                pgs_mode="matrix_free",
+                articulated_contact_response="propagation-fused",
+                pgs_solve_readout="sweeps",
+                pgs_velocity_change_tolerance=1.0e-3,
+            )
+        self.assertIsNotNone(solver._pgs_solve_propagation_full_iteration_kernel)
+        self.assertEqual((solver._solve_readout.kernels, solver._solve_policy_honored), ({}, {}))
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+        contacts = pipeline.contacts()
+        for _ in range(3):
+            pipeline.collide(state_in, contacts)
+            solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+            state_in, state_out = state_out, state_in
+        self.assertGreater(int(solver.propagation_constraint_count.numpy().sum()), 0)
+        record = solver.get_path_selection()
+        sweep = record["routes"]["sweep"]
+        self.assertEqual(sweep["driver"], "propagation_fused")
+        self.assertEqual((sweep["readout"]["mode"], sweep["readout"]["counted"]), ("off", {}))
+        self.assertIn("fused propagation kernel", sweep["readout"]["reason"])
+        self.assertEqual((sweep["exit_law"]["law"], sweep["exit_law"]["honored"]), ("exact", {}))
+        self.assertIn(sweep["propagation"]["full_iteration"], sweep["exit_law"]["ignored"])
+        self.assertIn("fused propagation kernel", sweep["exit_law"]["reason"])
+        options = record["options"]
+        self.assertEqual(options["pgs_solve_readout"]["applied"], "off")
+        self.assertEqual(options["pgs_velocity_change_tolerance"]["applied"], 0.0)
+        self.assertNotIn("solve_readout", record["measurements"])
+
     def test_trace_changes_no_result_and_records_every_solve(self):
         """Trace the local, paired and matrix-free sweeps unchanged, once per solve and grid tolerance."""
         for route in _policy_routes():

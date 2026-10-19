@@ -960,6 +960,40 @@ class TestSweepPolicyRecords(unittest.TestCase):
         solver._solve_readout = SimpleNamespace(kernels={}, skipped_passes=())
         self.assertEqual(path_selection._readout(solver, _sweep_record(tiers=parallel))["uncounted_worlds"], {})
 
+    def test_fused_propagation_records_why_nothing_counts(self):
+        """Say that the fused propagation kernel runs every solve where no sweep counts or honors a tolerance.
+
+        Under ``articulated_contact_response="propagation-fused"`` none of the counted sweeps
+        launches, so the solver builds them under the exact policy, without counters: the records
+        then name the fused kernel as the reason, not fixed-iteration or Jacobi-tier sweeps.
+        """
+        fused = {
+            "mode": "propagation-fused",
+            "row_solve": "propagation_kernel",
+            "full_iteration": "fused_kernel",
+            "cached_response": False,
+        }
+        solver = _policy_solver(tolerance=1.0e-3)
+        solver._solve_readout = SimpleNamespace(kernels={}, skipped_passes=())
+        record = _sweep_record(driver="propagation_fused", propagation=fused)
+        sweep = {
+            "readout": path_selection._readout(solver, record),
+            "exit_law": path_selection._exit_law(solver, record),
+        }
+        readout, law = sweep["readout"], sweep["exit_law"]
+        self.assertEqual((readout["mode"], readout["counted"], readout["uncounted_worlds"]), ("off", {}, {}))
+        self.assertIn("fused propagation kernel", readout["reason"])
+        self.assertEqual((law["law"], law["honored"], law["driver_honors"]), ("exact", {}, False))
+        self.assertIn("fused_kernel", law["ignored"])
+        self.assertIn("fused propagation kernel", law["reason"])
+        (message,) = path_selection.policy_warnings(sweep)
+        self.assertIn("fused propagation kernel", message)
+        json.dumps(sweep, allow_nan=False)
+        # The propagation route that launches its row phases one by one keeps the general reasons.
+        record = _sweep_record(driver="propagation_phases", propagation={**fused, "mode": "propagation"})
+        self.assertIn("No sweep", path_selection._readout(solver, record)["reason"])
+        self.assertIn("No sweep", path_selection._exit_law(solver, record)["reason"])
+
     def test_records_name_the_passes_that_count_skipped_solves(self):
         """Name the passes whose solves of worlds without rows count as skipped, and none without counted sweeps."""
         record = _sweep_record()

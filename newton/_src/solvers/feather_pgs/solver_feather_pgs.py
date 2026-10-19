@@ -1849,7 +1849,8 @@ class SolverFeatherPGS(SolverBase):
                 classifier left without rows); the readout counts those solves as ``skipped``. Worlds
                 with rows that a sweep without counters owns, such as those of the parallel tiers of
                 ``mf_gs_parallel_rows``, are counted by neither; ``routes.sweep.readout.uncounted_worlds``
-                names their owners. Defaults to ``"off"``.
+                names their owners. Under ``articulated_contact_response="propagation-fused"`` one fused
+                kernel without counters runs every solve, so nothing counts. Defaults to ``"off"``.
             pgs_velocity_change_tolerance (float, optional): Velocity exit law of the native
                 Gauss-Seidel sweeps [m/s or rad/s]. A sweep stops a world once no row's impulse change
                 times its effective-mass diagonal, ``|dlambda| * A_ii`` (the change of the row's own
@@ -1861,9 +1862,9 @@ class SolverFeatherPGS(SolverBase):
                 where the exact law stops; with either positive, the unvisited-row bound has no impulse
                 slack and can add sweeps. Zero keeps the exact stationary-sweep exit. The
                 sweeps that ``pgs_solve_readout`` counts honor it, except the matrix-free sweep under
-                non-default friction modes or contact torsion; fixed-iteration and parallel sweeps and
-                launch-per-iteration drivers do not (``routes.sweep.exit_law``, with a warning).
-                Experimental. Defaults to 0.0.
+                non-default friction modes or contact torsion; fixed-iteration and parallel sweeps,
+                launch-per-iteration drivers and the fused propagation kernel do not
+                (``routes.sweep.exit_law``, with a warning). Experimental. Defaults to 0.0.
             pgs_contact_regularization (float, optional): Dimensionless regularizer ``g`` of contact
                 rows on every route (matrix-free, dense, propagation). Each position iteration moves a
                 row's impulse toward the hard solution with weight ``1/(1+g)`` and toward zero with
@@ -2647,6 +2648,11 @@ class SolverFeatherPGS(SolverBase):
         self._has_prescribed_response = bool(np.any(self._model_plan.prescribed_articulation != 0))
         self._refresh_body_prescribed()
         self._compute_articulation_metadata(model)
+        if self._fused_propagation_solves():
+            # None of the policy's sweeps launches, so none carries counters or the velocity law: build
+            # them under the exact policy; routes.sweep.readout and routes.sweep.exit_law say why.
+            self._solve_policy = EXACT_POLICY
+            self._solve_readout = SolveReadoutRecord(EXACT_POLICY)
         self._validate_heterogeneous_world_support(model)
         # Loop-closing joints are excluded from the tree (see _FeatherPGSModelPlan.build)
         # and enforced as CONNECT rows; the propagation-family kernels still iterate full
@@ -4144,6 +4150,20 @@ class SolverFeatherPGS(SolverBase):
         if self._has_non_free_articulations:
             return True
         return self._route_free_free_contacts and self._has_free_rigid_bodies
+
+    def _fused_propagation_solves(self) -> bool:
+        """Whether the fused propagation kernel runs every solve, so that none of the policy's sweeps launches.
+
+        Under ``articulated_contact_response="propagation-fused"`` one kernel sweeps every world's
+        dense, matrix-free and propagation rows for the fixed iteration count of the position solve
+        and of the velocity pass (:meth:`_launch_propagation_full_iteration_fused_solve`), unless
+        contact compliance drives the position solve's sweeps itself.
+        """
+        return bool(
+            self.propagation_full_fused_iterations
+            and not self.contact_compliance
+            and self._propagation_contacts_enabled()
+        )
 
     def _propagation_cached_response_candidate(self) -> bool:
         """True when the cached-response buffers/kernels may be built at all.

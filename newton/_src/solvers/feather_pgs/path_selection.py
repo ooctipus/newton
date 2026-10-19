@@ -882,6 +882,11 @@ def _uncounted_worlds(record) -> dict:
     return owners
 
 
+def _fused_propagation(record) -> bool:
+    """Whether one fused propagation kernel runs every solve of a sweep record's route."""
+    return (record["propagation"] or {}).get("mode") == "propagation-fused"
+
+
 def _readout(solver, record) -> dict:
     """Which sweep kernels of the route count their sweeps under ``pgs_solve_readout``, and why the others do not."""
     counted = solver._solve_readout.kernels
@@ -889,6 +894,11 @@ def _readout(solver, record) -> dict:
     uncounted_worlds = _uncounted_worlds(record) if counted else {}
     if solver.pgs_solve_readout == "off":
         reason = "pgs_solve_readout is off."
+    elif not counted and _fused_propagation(record):
+        reason = (
+            "The fused propagation kernel sweeps every world's dense, matrix-free and propagation rows without "
+            "counters, and none of the sweeps that count launches, so nothing counts."
+        )
     elif not counted:
         reason = (
             "No sweep of this route carries counters: fixed-iteration, Jacobi-tier and response-block sweeps do not."
@@ -931,6 +941,11 @@ def _exit_law(solver, record) -> dict:
     driver_honors = record["driver"] in ("direct", "contact_then_internal")
     if tolerance == 0.0:
         reason = "pgs_velocity_change_tolerance is 0: every sweep keeps the exact stationary-sweep law."
+    elif not honored and _fused_propagation(record):
+        reason = (
+            "The fused propagation kernel runs every solve's fixed iteration count without an exit, and none of "
+            "the sweeps that compile the velocity law launches, so no sweep applies it."
+        )
     elif not honored:
         reason = "No sweep of this route compiles the velocity law; every sweep keeps the exact law."
     elif not driver_honors:
