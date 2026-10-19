@@ -69,6 +69,7 @@ def build_branch_model(
     chain=False,
     multi=False,
     descendant=False,
+    particle=False,
 ):
     """Per world: a tilted root over one-coordinate leaves (a keyboard's class) beside a fixed-base six-joint arm.
 
@@ -77,7 +78,8 @@ def build_branch_model(
     ``"fixed"``, ``"d6"`` (zero coordinates), ``"revolute"`` or ``"free"``.
     ``chain`` hangs the second leaf from the first, ``multi`` makes the last
     leaf a two-coordinate D6 joint and ``descendant`` welds a body to the first
-    leaf. ``shapes`` adds a box to each leaf and a sphere to the arm's tip.
+    leaf. ``shapes`` adds a box to each leaf and a sphere to the arm's tip;
+    ``particle`` adds one particle to the model.
     """
     template = newton.ModelBuilder(gravity=GRAVITY)
     case = template.add_link(
@@ -187,6 +189,8 @@ def build_branch_model(
         template.add_articulation(chain_joints)
     builder = newton.ModelBuilder(gravity=GRAVITY)
     builder.replicate(template, worlds, spacing=(1.0, 0.0, 0.0))
+    if particle:
+        builder.add_particle(wp.vec3(0.0, 0.0, 1.0), wp.vec3(), 0.01)
     model = builder.finalize(device=device)
     rng = np.random.default_rng(5)
     model.joint_q.assign(rng.uniform(-0.004, 0.0, model.joint_coord_count).astype(np.float32))
@@ -952,19 +956,45 @@ class TestScalarBranchRule(unittest.TestCase):
                 self.assertIn(words, reason)
 
     def test_plan_reasons_follow_the_solver(self):
-        """Report the request, the diagonal group and velocity limits before the topology."""
+        """Report the request, the diagonal group and each decline of the solver or its model, with its reason."""
         model = build_branch_model(worlds=2)
         solver = cpu_solver(model, 7)
         self.assertIn("Off: FEATHER_PGS_SCALAR_BRANCHES=1", sb.plan_scalar_branches(solver, requested=False)[1])
-        solver._compact_diagonal_mass_size = None
-        plan, reason = sb.plan_scalar_branches(solver, requested=True)
-        self.assertIsNone(plan)
-        self.assertIn("No diagonal-mass group", reason)
-        # A model without a diagonal group gives the same reason with the request off.
-        self.assertEqual(sb.plan_scalar_branches(solver, requested=False)[1], reason)
-        solver._compact_diagonal_mass_size = 7
-        solver.enable_joint_velocity_limits = True
-        self.assertIn("velocity limits", sb.plan_scalar_branches(solver, requested=True)[1])
+        with mock.patch.object(solver, "_compact_diagonal_mass_size", None):
+            plan, reason = sb.plan_scalar_branches(solver, requested=True)
+            self.assertIsNone(plan)
+            self.assertIn("No diagonal-mass group", reason)
+            # A model without a diagonal group gives the same reason with the request off.
+            self.assertEqual(sb.plan_scalar_branches(solver, requested=False)[1], reason)
+        plan, _reason = sb.plan_scalar_branches(solver, requested=True)
+        self.assertIsNotNone(plan)
+        # A drive row that reads another coordinate than its leaf's, and leaves out of coordinate order.
+        q_index = solver._augmented_drive_q_index_by_dof.numpy()
+        q_index[plan.dofs[0]] += 1
+        q_index = wp.array(q_index, dtype=int, device=model.device)
+        offsets = dict(solver._crba_dof_joint_offset_by_size)
+        offsets[7] = wp.array(np.roll(np.arange(1, 8), 1), dtype=int, device=model.device)
+        for attribute, value, words in (
+            ("enable_joint_velocity_limits", True, "velocity limits"),
+            ("_direct_diagonal_inertia_sizes", frozenset(), "do not each move one body"),
+            ("_crba_dof_joint_offset_by_size", offsets, "do not follow its leaves"),
+            ("_parallel_augmented_drive_topology", False, "owned drive-row topology"),
+            ("_augmented_drive_q_index_by_dof", q_index, "do not read its leaf coordinates"),
+        ):
+            with self.subTest(attribute=attribute), mock.patch.object(solver, attribute, value):
+                plan, reason = sb.plan_scalar_branches(solver, requested=True)
+                self.assertIsNone(plan)
+                self.assertIn(words, reason)
+        with self.subTest("gradients"), mock.patch.object(model, "requires_grad", True):
+            plan, reason = sb.plan_scalar_branches(solver, requested=True)
+            self.assertIsNone(plan)
+            self.assertIn("exclude gradients and particles", reason)
+        with self.subTest("particles"):
+            particles = cpu_solver(build_branch_model(worlds=2, particle=True), 7)
+            self.assertEqual(particles.model.particle_count, 1)
+            plan, reason = sb.plan_scalar_branches(particles, requested=True)
+            self.assertIsNone(plan)
+            self.assertIn("exclude gradients and particles", reason)
 
     def test_owner_composes_the_scalar_group(self):
         """Compose the scalar group beside the arm's tree group, keep the forest off it, and validate both.
@@ -1029,21 +1059,33 @@ class TestScalarBranchRule(unittest.TestCase):
         self.assertFalse(solver._prismatic_linear_state)
 
     def test_declined_branches_restore_the_prismatic_opt_ins(self):
-        """Drop an admitted plan the held-tree owner does not take and build the prismatic opt-ins as without it."""
+        """Drop an admitted plan the held-tree owner does not take and build the prismatic opt-ins as without it.
+
+        The declined solver and a twin built without the plan under the same
+        opt-in must hold the same publication plan and the same routes, apart
+        from the scalar branches' reason.
+        """
         model = build_branch_model(worlds=2)
-        with (
-            mock.patch.object(sb, "plan_scalar_branches", return_value=self._admitted(model)),
-            mock.patch.object(solver_module, "_PRISMATIC_PUBLICATION", True),
-        ):
-            solver = SolverFeatherPGS(model, pgs_mode="split")
+        with mock.patch.object(solver_module, "_PRISMATIC_PUBLICATION", True):
+            with mock.patch.object(sb, "plan_scalar_branches", return_value=self._admitted(model)):
+                solver = SolverFeatherPGS(model, pgs_mode="split")
+            plain = SolverFeatherPGS(model, pgs_mode="split")
         self.assertIsNone(solver._tree_kinetic_state)
         self.assertIsNone(solver._scalar_branches)
         self.assertIn("did not take them", solver._scalar_branches_reason)
         self.assertIn("CPU", solver._scalar_branches_reason)
-        self.assertIsNotNone(solver._prismatic_publication)
-        plain = SolverFeatherPGS(model, pgs_mode="split")
-        self.assertIsNone(plain._prismatic_publication)
         self.assertIn("No diagonal-mass group", plain._scalar_branches_reason)
+        for name in ("joint_end", "body_joint"):
+            np.testing.assert_array_equal(
+                getattr(solver._prismatic_publication, name).numpy(),
+                getattr(plain._prismatic_publication, name).numpy(),
+            )
+        routes = [twin.get_path_selection()["routes"] for twin in (solver, plain)]
+        for record in routes:
+            self.assertFalse(record["held_tree"]["scalar_branches"]["enabled"])
+            del record["held_tree"]["scalar_branches"]["reason"]
+        self.assertEqual(routes[0], routes[1])
+        self.assertTrue(routes[0]["publication"]["prismatic_publication"])
 
 
 class TestScalarBranchKernels(unittest.TestCase):
@@ -1843,13 +1885,18 @@ class TestScalarBranchOwner(unittest.TestCase):
         self.assertFalse(head["held_tree"]["scalar_branches"]["enabled"])
         self.assertIn("Off: FEATHER_PGS_SCALAR_BRANCHES=1", head["held_tree"]["scalar_branches"]["reason"])
         self.assertTrue(head["publication"]["prismatic_linear_state"])
-        # Without the held-tree owner the branches stay on ordinary dynamics with the recipe's opt-ins.
+        # Without the held-tree owner the branches stay on ordinary dynamics with the recipe's opt-ins:
+        # every route is the one of the same solver built without the flag, apart from the reason.
         declined = recipe_solver(model, scalar=True, cached_dynamics="off")
         self.assertIsNone(declined._scalar_branches)
         routes = declined.get_path_selection()["routes"]
         self.assertFalse(routes["held_tree"]["scalar_branches"]["enabled"])
         self.assertIn("did not take them", routes["held_tree"]["scalar_branches"]["reason"])
         self.assertTrue(routes["publication"]["prismatic_linear_state"])
+        plain = recipe_solver(model, scalar=False, cached_dynamics="off").get_path_selection()["routes"]
+        for record in (routes, plain):
+            del record["held_tree"]["scalar_branches"]["reason"]
+        self.assertEqual(routes, plain)
 
 
 if __name__ == "__main__":
