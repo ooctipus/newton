@@ -66,6 +66,66 @@ def _native_snippets(kernel):
     return snippets
 
 
+def _splices(module_file, text, prelude_names):
+    """Return the prelude and guard splices of one module's source, which only ``device_preludes`` may make.
+
+    Prelude text reaches a body only through ``cuda_native``: no other module names the guard constant,
+    calls the friction law's source producer (``friction`` calls it once, to declare the prelude), reads
+    a prelude's ``source`` or concatenates a prelude, and none replaces or extends an opening guard.
+
+    Args:
+        module_file: File name of the module, for the messages and the producer's own module.
+        text: Python source of the module.
+        prelude_names: Module-level names bound to a prelude anywhere in the package.
+    """
+    violations = []
+    for node in ast.walk(ast.parse(text)):
+        location = f"{module_file}:{getattr(node, 'lineno', 0)}"
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "replace"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and "__CUDA_ARCH__" in node.args[0].value
+        ):
+            violations.append(f"{location}: replace() at an architecture guard")
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            # A guard followed by code held in a variable is the splice idiom cuda_native replaces.
+            if (
+                isinstance(node.left, ast.Constant)
+                and isinstance(node.left.value, str)
+                and node.left.value.endswith(ARCHITECTURE_GUARD)
+                and isinstance(node.right, (ast.Name, ast.Attribute))
+            ):
+                violations.append(f"{location}: code concatenated after an opening guard")
+            for operand in (node.left, node.right):
+                if isinstance(operand, ast.Name) and operand.id in prelude_names:
+                    violations.append(f"{location}: prelude {operand.id} concatenated")
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "source"
+            and (
+                (isinstance(node.value, ast.Name) and node.value.id in prelude_names)
+                or "prelude" in ast.unparse(node.value).lower()
+            )
+        ):
+            violations.append(f"{location}: prelude source of {ast.unparse(node.value)} read")
+        if (
+            (isinstance(node, ast.Name) and node.id == "ARCHITECTURE_GUARD")
+            or (isinstance(node, ast.Attribute) and node.attr == "ARCHITECTURE_GUARD")
+            or (isinstance(node, ast.alias) and node.name == "ARCHITECTURE_GUARD")
+        ):
+            violations.append(f"{location}: the architecture guard named outside the helper")
+        if isinstance(node, ast.Call) and module_file != "friction.py":
+            function = node.func
+            called = function.id if isinstance(function, ast.Name) else getattr(function, "attr", None)
+            if called == "get_pair_source":
+                violations.append(f"{location}: the friction law's source taken outside its prelude")
+    return violations
+
+
 def split_preludes(snippet, preludes):
     """Return ``(lead, declared prelude names, body)`` of a snippet composed by ``cuda_native``.
 
@@ -172,48 +232,38 @@ class TestNoPreludeSplices(unittest.TestCase):
     """Join prelude text to native bodies in ``device_preludes`` only."""
 
     def test_no_module_splices_a_prelude_or_guard(self):
-        """Find no guard replace, code concatenated after an opening guard or prelude read outside the helper."""
+        """Find no prelude or guard splice in any module of the package but the composition helper."""
         modules = _modules()
         _, prelude_names = _preludes(modules)
         helper_file = Path(device_preludes.__file__).resolve()
         violations = []
         for module in modules.values():
             path = Path(module.__file__).resolve()
-            if path == helper_file:
-                continue
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                location = f"{path.name}:{getattr(node, 'lineno', 0)}"
-                if (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "replace"
-                    and node.args
-                    and isinstance(node.args[0], ast.Constant)
-                    and isinstance(node.args[0].value, str)
-                    and "__CUDA_ARCH__" in node.args[0].value
-                ):
-                    violations.append(f"{location}: replace() at an architecture guard")
-                if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-                    # A guard followed by code held in a variable is the splice idiom cuda_native replaces.
-                    if (
-                        isinstance(node.left, ast.Constant)
-                        and isinstance(node.left.value, str)
-                        and node.left.value.endswith(ARCHITECTURE_GUARD)
-                        and isinstance(node.right, (ast.Name, ast.Attribute))
-                    ):
-                        violations.append(f"{location}: code concatenated after an opening guard")
-                    for operand in (node.left, node.right):
-                        if isinstance(operand, ast.Name) and operand.id in prelude_names:
-                            violations.append(f"{location}: prelude {operand.id} concatenated")
-                if (
-                    isinstance(node, ast.Attribute)
-                    and node.attr == "source"
-                    and isinstance(node.value, ast.Name)
-                    and node.value.id in prelude_names
-                ):
-                    violations.append(f"{location}: prelude source of {node.value.id} read")
+            if path != helper_file:
+                violations += _splices(path.name, path.read_text(encoding="utf-8"), prelude_names)
         self.assertEqual(violations, [])
+
+    def test_scan_finds_every_splice_idiom(self):
+        """Flag each way of joining prelude text or a guard to a body by hand, and not a composed body."""
+        idioms = {
+            "guard replace": 'snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\\n" + law)',
+            "guard then code": 'snippet = "\\n#if defined(__CUDA_ARCH__)\\n" + law',
+            "prelude concatenated": "snippet = FRICTION_PAIR + body",
+            "prelude source": "snippet = FRICTION_PAIR.source + body",
+            "guard then the law's source": 'snippet = "#if defined(__CUDA_ARCH__)\\n" + get_pair_source() + body',
+            "f-string of the law's source": 'snippet = f"#if defined(__CUDA_ARCH__)\\n{get_pair_source()}{body}"',
+            "joined guard": 'snippet = "".join([ARCHITECTURE_GUARD, law, body])',
+            "imported guard": "from .device_preludes import ARCHITECTURE_GUARD",
+            "declared prelude source": "snippet = policy.preludes[0].source + body",
+        }
+        for idiom, text in idioms.items():
+            with self.subTest(idiom=idiom):
+                self.assertTrue(_splices("module.py", text, {"FRICTION_PAIR"}))
+        composed = "snippet = cuda_native(body, preludes=(FRICTION_PAIR, *policy.preludes))"
+        self.assertEqual(_splices("module.py", composed, {"FRICTION_PAIR"}), [])
+        self.assertEqual(
+            _splices("friction.py", 'FRICTION_PAIR = DevicePrelude("friction_pair", get_pair_source())', set()), []
+        )
 
 
 if __name__ == "__main__":
