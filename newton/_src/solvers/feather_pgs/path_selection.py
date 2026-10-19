@@ -17,6 +17,7 @@ import numpy as np
 
 from ...sim.contacts import CAPACITY_BLOCKS_PER_SM
 from .contact_row_plan import contact_row_plan
+from .friction_patches import _CHUNK_SORT_CAPACITY, _LIVE_SORT_CAPACITY, _SORT_SLOT_BITS
 
 # Options whose applied value lives under another attribute after construction.
 _APPLIED_ATTRIBUTES = {
@@ -863,6 +864,43 @@ def _free_rigid_bodies(solver) -> dict:
     }
 
 
+def _pair_sort(patches) -> dict:
+    """Record the patch pair sort: over the live slots only (``live``), or a radix sort over the whole capacity.
+
+    The choice follows ``_uses_live_sort``: the live sort from ``live_from``
+    contact slots on and, with frame reuse, up to ``live_up_to`` slots, while
+    the pair keys leave room for its slot bits.
+    """
+    capacity = int(patches.capacity)
+    if patches.live_sort:
+        if capacity >= _LIVE_SORT_CAPACITY:
+            reason = f"From {_LIVE_SORT_CAPACITY:,} contact slots the pair sort orders only the live slots."
+        else:
+            reason = (
+                f"Up to {_CHUNK_SORT_CAPACITY:,} contact slots the pair sort orders only the live slots, so a frame "
+                "without contacts costs no sort."
+            )
+    elif patches.key_bits + _SORT_SLOT_BITS > 62:
+        reason = (
+            f"{patches.key_bits}-bit pair keys leave no room for the live sort's {_SORT_SLOT_BITS} slot bits: the "
+            "radix sort orders the whole capacity."
+        )
+    elif capacity > _CHUNK_SORT_CAPACITY:
+        reason = (
+            f"Between {_CHUNK_SORT_CAPACITY:,} and {_LIVE_SORT_CAPACITY:,} contact slots the radix sort orders the "
+            "whole capacity."
+        )
+    else:
+        reason = "Without frame reuse (FEATHER_PGS_PATCH_FRAME_REUSE=0) the radix sort orders the whole capacity."
+    return {
+        "live": bool(patches.live_sort),
+        "capacity": capacity,
+        "live_up_to": _CHUNK_SORT_CAPACITY if patches.small_live_sort else None,
+        "live_from": _LIVE_SORT_CAPACITY,
+        "reason": reason,
+    }
+
+
 def _friction(solver) -> dict:
     patch = bool(solver._friction_anchors_enabled)
     reason = _BETA_REASONS[solver._friction_anchor_beta_source]
@@ -895,6 +933,7 @@ def _friction(solver) -> dict:
             "enabled": solver._friction_patches.reuse_frames,
             "reason": solver._patch_frame_reuse_reason,
         },
+        "pair_sort": _pair_sort(solver._friction_patches) if patch else None,
         "conditional_nodes": {
             "enabled": solver._friction_patches.conditional_nodes,
             "reason": solver._patch_conditional_nodes_reason,

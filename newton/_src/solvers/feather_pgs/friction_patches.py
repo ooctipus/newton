@@ -1450,6 +1450,7 @@ class _FrictionPatchState:
         self.view.point_b = wp.zeros(n, dtype=wp.vec3, device=device)
         self.reuse_frames = bool(reuse_frames and enabled)
         self.conditional_nodes = bool(conditional_nodes and enabled)
+        self.small_live_sort = bool(small_live_sort)
         # (capture scope, weak generation array, frame-write tick) of the previous
         # captured build, which a build in the same scope may keep the pairs of.
         self._last_build = None

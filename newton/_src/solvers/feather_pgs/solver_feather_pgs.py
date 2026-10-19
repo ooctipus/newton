@@ -13393,9 +13393,9 @@ class SolverFeatherPGS(SolverBase):
             )
         return True, (
             "A captured build keeps the sorted patch pairs of the previous build captured in the same graph over the "
-            "same Contacts when the host noted no write of them in between (a collision pass, Contacts.clear() or a "
-            f"coupled-solver filter); other builds sort, only their live slots up to {_CHUNK_SORT_CAPACITY:,} contact "
-            "slots."
+            "same Contacts when the host noted no write of them in between (such as a collision pass, "
+            "Contacts.clear() or a coupled-solver filter); other builds sort, only their live slots up to "
+            f"{_CHUNK_SORT_CAPACITY:,} contact slots."
         )
 
     def _patch_conditional_nodes(self, device, *, frame_reuse=False) -> tuple[bool, str]:

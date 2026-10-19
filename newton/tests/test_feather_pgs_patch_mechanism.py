@@ -50,7 +50,7 @@ import newton
 from newton._src.sim import contacts as contacts_module
 from newton._src.sim.contacts import note_contact_frame_write
 from newton._src.solvers.feather_pgs import environment_flags as fpgs_flags
-from newton._src.solvers.feather_pgs import friction_patches
+from newton._src.solvers.feather_pgs import friction_patches, path_selection
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.friction_patches import (
     FrictionPatches,
@@ -3143,7 +3143,7 @@ def _sorts_each_substep(event):
     return (event != "step", False)
 
 
-# The route record of b7932853, before static frame reuse, with the nodes flag unset.
+# The conditional-node route record from before static frame reuse, with the nodes flag unset.
 _UNCONDITIONAL_NODES_RECORD = {
     "enabled": False,
     "reason": "Conditional graph nodes are an experimental opt-in that FEATHER_PGS_PATCH_CONDITIONAL_NODES=1 "
@@ -3182,17 +3182,28 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
                     self.assertIn(reason, friction["conditional_nodes"]["reason"])
                     if options:
                         self.assertIn("Point friction", friction["frame_reuse"]["reason"])
-                    elif reuse == "0":
+                        self.assertIsNone(friction["pair_sort"])
+                        continue
+                    if reuse == "0":
                         self.assertIn("FEATHER_PGS_PATCH_FRAME_REUSE=0", friction["frame_reuse"]["reason"])
                     else:
                         self.assertIn("previous build captured in the same graph", friction["frame_reuse"]["reason"])
+                    # The arms' contact capacity is small: the live sort follows frame reuse.
+                    pair_sort = friction["pair_sort"]
+                    self.assertEqual(pair_sort["live"], reused)
+                    self.assertEqual(pair_sort["live"], solver._friction_patches.live_sort)
+                    self.assertEqual(pair_sort["capacity"], solver._friction_patches.capacity)
+                    self.assertLessEqual(pair_sort["capacity"], friction_patches._CHUNK_SORT_CAPACITY)
+                    self.assertEqual(pair_sort["live_up_to"], friction_patches._CHUNK_SORT_CAPACITY if reused else None)
+                    self.assertIn("Up to 16,384" if reused else "FEATHER_PGS_PATCH_FRAME_REUSE=0", pair_sort["reason"])
 
     def test_frame_reuse_opt_out_records_the_route_before_frame_reuse(self):
-        """Take and record under FEATHER_PGS_PATCH_FRAME_REUSE=0 the sort and node route of b7932853.
+        """Take and record under FEATHER_PGS_PATCH_FRAME_REUSE=0 the sort and node route from before frame reuse.
 
-        Both arms record the same routes apart from the frame_reuse field and the
-        conditional-node reason, which with frame reuse names only the builds that
-        do not keep their pairs.
+        Both arms record the same routes apart from the frame_reuse and pair_sort
+        fields and the conditional-node reason, which with frame reuse names only
+        the builds that do not keep their pairs. The opt-out records the radix
+        sort, and frame reuse the live sort, on a solver of few contact slots.
         """
         self.assertEqual(fpgs_flags.FLAGS["FEATHER_PGS_PATCH_FRAME_REUSE"].kind, "policy")
         routes = {}
@@ -3203,13 +3214,46 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
             # Small frames sort their live slots only with frame reuse; the opt-out keeps the radix sort.
             self.assertLessEqual(solver._friction_patches.capacity, friction_patches._CHUNK_SORT_CAPACITY)
             self.assertEqual(solver._friction_patches.live_sort, reuse is None)
+            self.assertEqual(routes[reuse]["routes"]["friction"]["pair_sort"]["live"], reuse is None)
+        self.assertIn("FEATHER_PGS_PATCH_FRAME_REUSE=0", routes["0"]["routes"]["friction"]["pair_sort"]["reason"])
         self.assertEqual(routes["0"]["routes"]["friction"]["conditional_nodes"], _UNCONDITIONAL_NODES_RECORD)
         self.assertIn("do not keep their pairs", routes[None]["routes"]["friction"]["conditional_nodes"]["reason"])
         for selected in routes.values():
             del selected["routes"]["friction"]["frame_reuse"]
+            del selected["routes"]["friction"]["pair_sort"]
             del selected["routes"]["friction"]["conditional_nodes"]["reason"]
             selected.pop("environment", None)
         self.assertEqual(routes[None], routes["0"])
+
+    def test_route_records_the_pair_sort(self):
+        """Record the live sort or the radix sort with the reason that capacity, key width and frame reuse give."""
+        large, small = friction_patches._LIVE_SORT_CAPACITY, friction_patches._CHUNK_SORT_CAPACITY
+        cases = (
+            # (live_sort, capacity, key_bits, small_live_sort, reason)
+            (True, small, 51, True, "Up to 16,384"),
+            (True, large, 51, True, "From 2,000,000"),
+            (True, large, 51, False, "From 2,000,000"),
+            (False, small, 51, False, "FEATHER_PGS_PATCH_FRAME_REUSE=0"),
+            (False, small + 1, 51, True, "Between 16,384 and 2,000,000"),
+            (False, small, 52, True, "52-bit pair keys"),
+        )
+        for live, capacity, key_bits, small_live_sort, reason in cases:
+            with self.subTest(capacity=capacity, key_bits=key_bits, small_live_sort=small_live_sort):
+                patches = SimpleNamespace(
+                    live_sort=live, capacity=capacity, key_bits=key_bits, small_live_sort=small_live_sort
+                )
+                self.assertEqual(friction_patches._uses_live_sort(capacity, key_bits, small=small_live_sort), live)
+                record = path_selection._pair_sort(patches)
+                self.assertEqual(
+                    {name: record[name] for name in ("live", "capacity", "live_up_to", "live_from")},
+                    {
+                        "live": live,
+                        "capacity": capacity,
+                        "live_up_to": small if small_live_sort else None,
+                        "live_from": large,
+                    },
+                )
+                self.assertIn(reason, record["reason"])
 
     def test_solver_falls_back_without_conditional_node_support(self):
         """Keep the patch pair sort unconditional where Warp, the driver or its capture queries lack support."""
