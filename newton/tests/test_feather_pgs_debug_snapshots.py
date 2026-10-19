@@ -213,7 +213,7 @@ def _scene(device, *, worlds):
 
 
 def _compared_scene(device):
-    """The scene every flag-on/flag-off comparison steps, and the one the one-warp CPU test checks."""
+    """The scene every flag-on/flag-off comparison steps, and the one the CPU scene tests check."""
     return _scene(device, worlds=COMPARED_WORLDS)
 
 
@@ -467,8 +467,8 @@ class TestFeatherPGSDebugSnapshots(unittest.TestCase):
         with its tip 1 cm in the ground, the arm's normal row had no joint
         Jacobian: its impulse reached 5.76e6 (12 iterations of
         beta * depth / dt / cfm), and the warm start then spun the joints past
-        1,700 rad/s. The bounds are about twice the scene's peaks of 4.5 rad/s
-        (the floating body's tail) and 2.6 N s.
+        1,700 rad/s. The bounds are at least twice the scene's peaks of
+        4.5 rad/s (the floating body's tail) and 2.6 N s.
         """
         model = _compared_scene("cpu")
         for label, options in _modes_and_laws("cpu").items():
