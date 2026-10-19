@@ -622,6 +622,25 @@ class TestHeightfieldLaneMidphase(unittest.TestCase):
         """Partition the triangle counter with ballots, one leader atomic and a shuffle per CUDA call group."""
         self.check_reserve_triangles("cuda:0")
 
+    def test_launch_arguments_follow_bound_arrays_cpu(self):
+        """Build the lane kernels' arguments once and rebuild them when a bound array is replaced."""
+        model = rough_terrain_model("cpu", ("sphere", "airborne"), per_kind=2)
+        state = model.state()
+        reference, actual = pipeline(model, "geometric", False), pipeline(model, "geometric", True)
+        narrow = actual.narrow_phase
+        self.collide(actual, state)
+        built = narrow._heightfield_lane_launch
+        self.collide(actual, state)
+        self.assertIs(narrow._heightfield_lane_launch, built)
+        before = len(stream(narrow)[0])
+        # Replace the elevation array with one at the top height, which reaches the hovering boxes.
+        model.heightfield_elevations = wp.full_like(model.heightfield_elevations, 1.0)
+        self.collide(reference, state)
+        self.collide(actual, state)
+        self.assertGreater(len(stream(narrow)[0]), before)
+        self.assert_same_stream(reference, actual, ordered=True)
+        self.assertIsNot(narrow._heightfield_lane_launch, built)
+
     def test_inverted_window_is_empty_cpu(self):
         """Keep a window empty when an inverted, huge local box saturates its cell bounds.
 

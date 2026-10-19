@@ -2803,6 +2803,8 @@ class NarrowPhase:
         if max_heightfield_pairs is None:
             self._heightfield_lane_capacity = min(self._heightfield_lane_capacity, _LANE_DEFAULT_CAPACITY)
         self._heightfield_lane_deferred = None
+        # The lane midphase's kernels and struct arguments, with the route and arrays they were built for.
+        self._heightfield_lane_launch = None
         self._finite_bounds = None
         self._finite_source = None
         self.mesh_sdf_texture_only = mesh_sdf_texture_only
@@ -3262,32 +3264,66 @@ class NarrowPhase:
         heightfield_data,
         heightfield_elevations,
     ):
-        """Run the per-pair pass and, on CUDA, the lane pass of the terrain midphase."""
-        from .heightfield_lanes import TerrainPairs, TerrainTriangles, create_lane_midphase_kernels  # noqa: PLC0415
+        """Run the per-pair pass and, on CUDA, the lane pass of the terrain midphase.
 
+        The kernels and their struct arguments are built on the first call and
+        again only when the route or a bound array changes, so a collision does
+        not rebuild them.
+        """
         geometric = self._heightfield_geometric_cull
         tagged = self._heightfield_pair_csr
         no_sources, no_bounds, no_tags = self._heightfield_lane_empty
-        scene = TerrainPairs()
-        scene.transforms = shape_transform
-        scene.gaps = shape_gap
-        scene.data = shape_data
-        scene.lower = shape_collision_aabb_lower
-        scene.upper = shape_collision_aabb_upper
-        scene.heightfield_index = shape_heightfield_index
-        scene.heightfield = heightfield_data
-        scene.elevations = heightfield_elevations
-        scene.pairs = self.shape_pairs_mesh
-        scene.pair_count = self.shape_pairs_mesh_count
-        scene.types = shape_types
-        scene.sources = shape_source if geometric else no_sources
-        scene.bounds = self._finite_bounds if geometric else no_bounds
-        scene.bound_source = self._finite_source if geometric else no_sources
-        triangles = TerrainTriangles()
-        triangles.triples = self.triangle_pairs
-        triangles.count = self.triangle_pairs_count
-        triangles.tags = self._pair_csr.triangle_pair if tagged else no_tags
-        pairs_kernel, lanes_kernel = create_lane_midphase_kernels(geometric, tagged)
+        arrays = (
+            shape_transform,
+            shape_gap,
+            shape_data,
+            shape_collision_aabb_lower,
+            shape_collision_aabb_upper,
+            shape_heightfield_index,
+            heightfield_data,
+            heightfield_elevations,
+            self.shape_pairs_mesh,
+            self.shape_pairs_mesh_count,
+            shape_types,
+            shape_source if geometric else no_sources,
+            self._finite_bounds if geometric else no_bounds,
+            self._finite_source if geometric else no_sources,
+            self.triangle_pairs,
+            self.triangle_pairs_count,
+            self._pair_csr.triangle_pair if tagged else no_tags,
+        )
+        cached = self._heightfield_lane_launch
+        if (
+            cached is None
+            or cached[0] != (geometric, tagged)
+            or any(old is not new for old, new in zip(cached[1], arrays, strict=True))
+        ):
+            from .heightfield_lanes import TerrainPairs, TerrainTriangles, create_lane_midphase_kernels  # noqa: PLC0415
+
+            scene = TerrainPairs()
+            triangles = TerrainTriangles()
+            (
+                scene.transforms,
+                scene.gaps,
+                scene.data,
+                scene.lower,
+                scene.upper,
+                scene.heightfield_index,
+                scene.heightfield,
+                scene.elevations,
+                scene.pairs,
+                scene.pair_count,
+                scene.types,
+                scene.sources,
+                scene.bounds,
+                scene.bound_source,
+                triangles.triples,
+                triangles.count,
+                triangles.tags,
+            ) = arrays
+            cached = ((geometric, tagged), arrays, scene, triangles, create_lane_midphase_kernels(geometric, tagged))
+            self._heightfield_lane_launch = cached
+        _route, _arrays, scene, triangles, (pairs_kernel, lanes_kernel) = cached
         passes = [(pairs_kernel, self._heightfield_lane_small_cells)]
         if self._heightfield_lane_small_cells >= 0:
             passes.append((lanes_kernel, self._heightfield_lane_width))
