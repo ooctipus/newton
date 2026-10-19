@@ -1684,9 +1684,20 @@ class TestPatchParallelRoutes(unittest.TestCase):
                     assert_row_builders_named(self, record, keys)
 
     def test_limited_linked_tiers_take_the_last_word_on_request(self):
-        """Build the last-word pass into velocity-limited linked tiers only on request, and record it."""
+        """Build the last-word pass into velocity-limited linked tiers only on request, record it, and hold the limit.
+
+        A sphere whose joints are limited to 0.5 starts sliding at 1.0. Only the
+        pass promises the limit: a tier without it ends wherever its sweep budget
+        or tolerance stops it, so at the default budget (24 sweeps to a tolerance
+        of 1e-4) whether it holds the limit to 1e-5 turns on the sweep at which it
+        exits. Truncated to two sweeps (tolerance 0), the tier without the pass
+        must leave the sphere at least 5 % past its limit, or the fixture cannot
+        show what the pass does (the float64 reference on the first step's rows:
+        44 %); the pass holds it to 1e-5.
+        """
+        limit = 0.5
         model = _sliding_sphere("cuda:0", (newton.Axis.X, newton.Axis.Y, newton.Axis.Z), (3.0, 0.01, 1.0), (1.0, 1.0))
-        model.joint_velocity_limit.assign(np.full(model.joint_dof_count, 0.5, np.float32))
+        model.joint_velocity_limit.assign(np.full(model.joint_dof_count, limit, np.float32))
         built = {}
         with patch.dict(os.environ, {_SWITCH: "1"}):
             for limits, requested in itertools.product((False, True), repeat=2):
@@ -1697,6 +1708,18 @@ class TestPatchParallelRoutes(unittest.TestCase):
                     enable_joint_velocity_limits=limits,
                     mf_gs_parallel_linked_velocity_limit_pass=requested,
                 )
+            truncated = {
+                requested: _matrix_free_solver(
+                    model,
+                    beta=0.2,
+                    parallel_rows=32,
+                    enable_joint_velocity_limits=True,
+                    mf_gs_parallel_linked_velocity_limit_pass=requested,
+                    mf_gs_parallel_sweeps=2,
+                    mf_gs_parallel_tol=0.0,
+                )
+                for requested in (False, True)
+            }
         for (limits, requested), solver in built.items():
             with self.subTest(limits=limits, requested=requested):
                 last_word = limits and requested
@@ -1709,8 +1732,17 @@ class TestPatchParallelRoutes(unittest.TestCase):
                 state, _ = _rollout(model, solver, 2)
                 for name in _STATE_FIELDS:
                     self.assertTrue(np.isfinite(getattr(state, name).numpy()).all(), name)
-                if limits:
-                    self.assertLessEqual(float(np.max(np.abs(state.joint_qd.numpy()[:2]))), 0.5 * (1.0 + 1.0e-5))
+                if last_word:
+                    self.assertLessEqual(float(np.max(np.abs(state.joint_qd.numpy()[:2]))), limit * (1.0 + 1.0e-5))
+        speeds = {}
+        for requested, solver in truncated.items():
+            keys = [kernel.key for kernel in solver._pgs_solve_mf_gs_incremental_kernels]
+            self.assertTrue(keys and all("_sweeps2_" in key and key.endswith("_lw") == requested for key in keys), keys)
+            state, _ = _rollout(model, solver, 1)
+            _assert_tier_owned(self, solver, 32)
+            speeds[requested] = float(np.max(np.abs(state.joint_qd.numpy()[:2])))
+        self.assertGreater(speeds[False], 1.05 * limit, f"two sweeps already hold the limit: {speeds}")
+        self.assertLessEqual(speeds[True], limit * (1.0 + 1.0e-5), speeds)
 
     def test_linked_tiers_take_their_own_sweep_budget(self):
         """Build each linked tier with its budget, record it, and leave point tiers on mf_gs_parallel_sweeps."""
