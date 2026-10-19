@@ -48,9 +48,6 @@ def _nxn_broadphase_precomputed_pairs(
     shape1 = pair[0]
     shape2 = pair[1]
 
-    if is_shape_pair_immovable_filtered(shape1, shape2, shape_body, body_flags, include_static_kinematic_pairs):
-        return
-
     # Check if gaps are provided (empty array means AABBs are pre-expanded)
     gap1 = 0.0
     gap2 = 0.0
@@ -61,6 +58,9 @@ def _nxn_broadphase_precomputed_pairs(
     if check_aabb_overlap_moving(
         shape1, shape2, shape_bounding_box_lower, shape_bounding_box_upper, gap1, gap2, shape_displacement
     ):
+        # Only overlapping pairs gather their bodies for the immovable test; most listed pairs are apart.
+        if is_shape_pair_immovable_filtered(shape1, shape2, shape_body, body_flags, include_static_kinematic_pairs):
+            return
         write_pair(
             pair,
             candidate_pair,
@@ -194,9 +194,6 @@ def _nxn_broadphase_kernel(
     if not test_world_and_group_pair(world1, world2, collision_group1, collision_group2):
         return
 
-    if is_shape_pair_immovable_filtered(shape1, shape2, shape_body, body_flags, include_static_kinematic_pairs):
-        return
-
     # Check if gaps are provided (empty array means AABBs are pre-expanded)
     gap1 = 0.0
     gap2 = 0.0
@@ -207,6 +204,9 @@ def _nxn_broadphase_kernel(
     if check_aabb_overlap_moving(
         shape1, shape2, shape_bounding_box_lower, shape_bounding_box_upper, gap1, gap2, shape_displacement
     ):
+        # Only overlapping pairs gather their bodies for the immovable test.
+        if is_shape_pair_immovable_filtered(shape1, shape2, shape_body, body_flags, include_static_kinematic_pairs):
+            return
         # Skip explicitly excluded pairs (e.g. shape_collision_filter_pairs)
         if num_filter_pairs > 0 and is_pair_excluded(wp.vec2i(shape1, shape2), filter_pairs, num_filter_pairs):
             return

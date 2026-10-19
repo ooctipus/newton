@@ -289,9 +289,6 @@ def _process_single_sap_pair(
     shape1 = pair[0]
     shape2 = pair[1]
 
-    if is_shape_pair_immovable_filtered(shape1, shape2, shape_body, body_flags, include_static_kinematic_pairs):
-        return
-
     # Skip explicitly excluded pairs (e.g. shape_collision_filter_pairs)
     if num_filter_pairs > 0 and is_pair_excluded(pair, filter_pairs, num_filter_pairs):
         return
@@ -306,6 +303,9 @@ def _process_single_sap_pair(
     if check_aabb_overlap_moving(
         shape1, shape2, shape_bounding_box_lower, shape_bounding_box_upper, gap1, gap2, shape_displacement
     ):
+        # Only overlapping pairs gather their bodies for the immovable test.
+        if is_shape_pair_immovable_filtered(shape1, shape2, shape_body, body_flags, include_static_kinematic_pairs):
+            return
         write_pair(
             pair,
             candidate_pair,
