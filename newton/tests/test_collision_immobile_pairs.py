@@ -397,21 +397,34 @@ def test_every_parent_joint_must_weld(test, device):
 def test_joints_without_freedom_weld_whatever_their_type(test, device):
     """Weld through D6 joints without axes as through fixed joints, and not through a D6 joint with an axis."""
     fixed, _ = _pair_scene(device)
-    locked, _ = _pair_scene(device, locked_d6=True)
-    joint_types = set(locked.joint_type.numpy().tolist())
-    test.assertIn(int(newton.JointType.D6), joint_types)
-    test.assertNotIn(int(newton.JointType.FIXED), joint_types)
+    locked, worlds = _pair_scene(device, locked_d6=True)
+    joint_type = locked.joint_type.numpy()
+    dofs = np.diff(locked.joint_qd_start.numpy())
+    test.assertNotIn(int(newton.JointType.FIXED), joint_type.tolist())
+    # Every D6 joint is a weld without axes, except the arm's root, which has one.
+    d6 = joint_type == int(newton.JointType.D6)
+    arm_bodies = locked.shape_body.numpy()[[world["arm"] for world in worlds]]
+    arm_root = np.isin(locked.joint_child.numpy(), arm_bodies)
+    test.assertEqual(int(np.count_nonzero(arm_root)), _WORLDS)
+    test.assertTrue(np.all(d6[arm_root] & (dofs[arm_root] == 1)))
+    test.assertEqual(int(np.count_nonzero(d6 & ~arm_root)), 6 * _WORLDS)
+    test.assertTrue(np.all(dofs[d6 & ~arm_root] == 0))
+    ground_base = {tuple(sorted((world["ground"], world["base"]))) for world in worlds}
     for mode, environment in _LAUNCHES:
         with test.subTest(broad_phase=mode, **environment), patch.dict(os.environ, environment), _flag(None):
             expected = newton.CollisionPipeline(fixed, broad_phase=mode)
             pipeline = newton.CollisionPipeline(locked, broad_phase=mode)
-            test.assertEqual(
-                _ordered(_candidate_pairs(pipeline, locked)[0], device),
-                _ordered(_candidate_pairs(expected, fixed)[0], device),
-            )
+            kept, _ = _candidate_pairs(pipeline, locked)
+            test.assertEqual(_ordered(kept, device), _ordered(_candidate_pairs(expected, fixed)[0], device))
             record = pipeline.get_collision_selection()["immobile_pairs"]
             test.assertEqual(record, expected.get_collision_selection()["immobile_pairs"])
             test.assertEqual(record["welded_bodies"], 3 * _WORLDS)
+            # The welds drop pairs that the opt-out keeps, such as the base's on the ground.
+            test.assertTrue(record["enabled"])
+            test.assertGreater(record["excluded_pairs"], 0)
+            unfiltered, _ = _candidate_pairs(_pipeline(locked, "0", broad_phase=mode), locked)
+            test.assertLessEqual(ground_base, set(unfiltered))
+            test.assertFalse(ground_base & set(kept))
 
 
 _ROOT_JOINT_ARM_USD = """#usda 1.0
