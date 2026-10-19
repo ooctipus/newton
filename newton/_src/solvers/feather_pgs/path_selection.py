@@ -285,10 +285,10 @@ def _held_tree(solver) -> dict:
 
 
 def _tree_group(group) -> dict:
-    record = getattr(group, "record", None)
-    if record is not None:
-        # A scalar branch group: one thread per coordinate, no lanes or tree layout.
-        return record()
+    from .scalar_branches import ScalarBranchState  # noqa: PLC0415
+
+    if isinstance(group, ScalarBranchState):
+        return _scalar_group(group)
     layout, operator = group.layout, group.sparse
     return {
         "operator": type(operator).__name__,
@@ -336,6 +336,57 @@ def _tree_group(group) -> dict:
             "bank_repair": _key(group.bank_repair_kernel),
             "classify": _key(group.classify_kernel),
             "listed_repair": _key(group.listed_repair_kernel),
+        },
+    }
+
+
+def _scalar_group(group) -> dict:
+    """A scalar branch group (``scalar_branches.py``) in the tree groups' schema.
+
+    Its predict and finish run one thread per coordinate (``lanes``) and its
+    repair one warp per articulation, so the tree layout's packing fields
+    (``trees_per_block``, ``block_dim``) are ``None``. Every repair launches,
+    and none is classified or compares input banks (``input_validation`` is
+    the group's, "identity"), so the comparison and classification kernels are
+    ``None``. ``kinds`` lists its leaf joint kinds; ``drive_dofs`` counts the
+    DOFs whose drives the drive kernel still prepares, since the group's
+    predict evaluates its own.
+    """
+    size = int(group.size)
+    others = group.other_drive_dofs
+    return {
+        "operator": type(group).__name__,
+        "size": size,
+        "group_count": int(group.group_count),
+        "bodies": size + 1,
+        "dofs": size,
+        "lanes": size,
+        "trees_per_block": None,
+        "block_dim": None,
+        "roots": [0],
+        "root_coordinates": [0],
+        # A diagonal-mass family, negated as for the tree groups.
+        "root_families": [-size],
+        "chain_scan": False,
+        "chain_scan_requested": False,
+        "response": "diagonal",
+        "input_validation": "content" if group.bank_compare else "identity",
+        "captured_repair_skip": bool(group.skip_captured_repairs),
+        "classify_first": False,
+        "captured_repairs": [],
+        "motion_velocity": bool(group.motion_velocity),
+        "publishes_twists": False,
+        "lane_choice": "static",
+        "kinds": list(group.plan.kinds),
+        "drive_dofs": 0 if others is None else int(others.shape[0]),
+        "kernels": {
+            "repair": _key(group.repair_kernel),
+            "finish": _key(group.finish_kernel),
+            "predict": _key(group.predictor_kernel),
+            "bank": None,
+            "bank_repair": None,
+            "classify": None,
+            "listed_repair": None,
         },
     }
 

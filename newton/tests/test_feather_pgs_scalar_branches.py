@@ -1110,6 +1110,28 @@ class TestScalarBranchRule(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "joint_parent changed"):
             owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES)
 
+    def test_scalar_group_record_follows_the_tree_schema(self):
+        """Record the scalar group with every field of a tree group's record, plus its leaf kinds and drive DOFs.
+
+        The owner is built directly on CPU and recorded as ``get_path_selection`` records it.
+        """
+        model = build_branch_model(worlds=2)
+        solver = cpu_solver(model, 7)
+        solver._scalar_branches, solver._scalar_branches_reason = sb.plan_scalar_branches(solver, requested=True)
+        with mock.patch.object(solver, "_tree_kinetic_state", MixedTreeKineticState(solver)):
+            held = path_selection._held_tree(solver)
+        json.dumps(held, allow_nan=False)
+        self.assertEqual(held["owner"], "mixed")
+        self.assertTrue(held["scalar_branches"]["enabled"])
+        tree, scalar = held["groups"]
+        self.assertEqual((set(scalar) - set(tree), set(tree) - set(scalar)), ({"kinds", "drive_dofs"}, set()))
+        self.assertEqual((scalar["operator"], scalar["dofs"], scalar["kinds"]), ("ScalarBranchState", 7, ["prismatic"]))
+        self.assertEqual(scalar["drive_dofs"], model.joint_dof_count - 7 * model.world_count)
+        self.assertEqual(scalar["kernels"]["finish"], sb.finish_prismatic_branches.key)
+        # The tree layout's packing fields hold no value for a group without a tree layout.
+        self.assertEqual((scalar["trees_per_block"], scalar["block_dim"]), (None, None))
+        self.assertIsInstance(tree["trees_per_block"], int)
+
     def test_cpu_route_record_reports_the_rule(self):
         """Report scalar branches as off on CPU, where no diagonal-mass group shares a sparse-diagonal response."""
         record = SolverFeatherPGS(build_branch_model(worlds=2), pgs_mode="split").get_path_selection()
@@ -1317,7 +1339,7 @@ class TestScalarBranchKernels(unittest.TestCase):
         pair.state.launch_other_drives(state, pair.mine, control, DT)
         others = pair.state.other_drive_dofs.numpy()
         np.testing.assert_array_equal(np.sort(np.concatenate([others, pair.dofs])), np.arange(model.joint_dof_count))
-        self.assertEqual(pair.state.record()["drive_dofs"], len(others))
+        self.assertEqual(path_selection._tree_group(pair.state)["drive_dofs"], len(others))
         rows = pair.mine._augmented_drive_row_by_dof.numpy()
         np.testing.assert_array_equal(pair.mine.joint_tau.numpy()[others], head.joint_tau.numpy()[others])
         other_rows = rows[others][rows[others] >= 0]
