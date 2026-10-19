@@ -29,8 +29,10 @@ def _flag(name: str, kind: FlagKind, modules: tuple[str, ...], meaning: str) -> 
     return EnvironmentFlag(name, kind, tuple(_PACKAGE + module for module in modules), meaning)
 
 
-# Retired selectors come first, in the order the solver has always checked them:
-# when several are set to 1, the first one names the error.
+# Retired selectors that raise come first, in the order the solver has always
+# checked them, with each newly retired one last: when several are set to 1, the
+# first one names the error. The ignored ones (IGNORED_RETIRED) sit in name order
+# with the other flags.
 FLAGS = declare(
     _flag(
         "FEATHER_PGS_SINGLE_FACTOR",
@@ -43,6 +45,12 @@ FLAGS = declare(
     _flag("FEATHER_PGS_SPARSE_PAIRED_GS", "retired", ("environment_flags",), "Retired experiment; =1 raises."),
     _flag("FEATHER_PGS_COUPLED_CONTACT", "retired", ("environment_flags",), "Retired experiment; =1 raises."),
     _flag("FEATHER_PGS_COUPLED_JACOBI", "retired", ("environment_flags",), "Retired experiment; =1 raises."),
+    _flag(
+        "FEATHER_PGS_DENSE_ROW_REGISTERS",
+        "retired",
+        ("environment_flags",),
+        "Retired register-state copy of the 64-row tiled_row sweep; =1 raises.",
+    ),
     _flag(
         "FEATHER_PGS_CAPTURE_COUNT",
         "diagnostic",
@@ -156,12 +164,6 @@ FLAGS = declare(
         "policy",
         _SOLVER,
         "tiled_row row budgets: 1 on for 64 or 128 rows, unset automatic (128 rows, 1024+ worlds), else off.",
-    ),
-    _flag(
-        "FEATHER_PGS_DENSE_ROW_REGISTERS",
-        "retired",
-        ("environment_flags",),
-        "Retired register-state copy of the 64-row tiled_row sweep; =1 raises.",
     ),
     _flag(
         "FEATHER_PGS_FK_CACHE_SNAPSHOT",

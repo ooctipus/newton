@@ -273,6 +273,13 @@ class TestEnvironmentFlagRegistry(unittest.TestCase):
         self.assertEqual(sorted(fpgs_flags.IGNORED_RETIRED), _RETIRED_IGNORED)
         self.assertTrue(fpgs_flags.IGNORED_RETIRED <= set(retired))
 
+    def test_rejected_retired_selectors_lead_the_declarations(self):
+        """Declare the retired selectors that raise first, in check order, and every other name in name order."""
+        names = list(fpgs_flags.FLAGS)
+        self.assertEqual(names[: len(_RETIRED_ORDER)], _RETIRED_ORDER)
+        rest = names[len(_RETIRED_ORDER) :]
+        self.assertEqual(rest, sorted(rest))
+
     def test_scan_separates_reads_from_citations(self):
         """List literal and constructed names, split environment reads from citations, refuse the rest."""
         source = "\n".join(
