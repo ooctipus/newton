@@ -115,6 +115,95 @@ def _row_metadata_codec(source):
     return round_trip
 
 
+def _host(array):
+    """Copy a Warp array to a host array of its own (a CPU array's ``numpy()`` is a view of it)."""
+    return np.array(array.numpy(), copy=True)
+
+
+def _bits(values):
+    """View a host array's raw bytes, so equality also tells signed zeros and NaN payloads apart."""
+    return np.ascontiguousarray(values).view(np.uint8)
+
+
+class _LaunchReplay:
+    """Replay each launch of a production kernel through a twin and compare the two right away.
+
+    :meth:`wrap` returns a stand-in for ``wp.launch_tiled`` that passes other kernels through. Before a
+    production launch it clones every array operand once, so operands bound to one array stay bound to
+    one clone. The production launch then runs on the caller's arrays and the twin on the clones, and
+    both results are copied to the host before the stand-in returns: later stages and steps rewrite the
+    caller's arrays, so a comparison made after the run would see another state. Each record names the
+    operands whose bits differ and holds the scalar operands and host copies of the ``keep`` operands
+    before and after the production launch. Production launches must pass ``inputs`` and ``outputs`` by
+    keyword.
+    """
+
+    def __init__(self, production, twin, keep=()):
+        self.production, self.twin, self.keep = production, twin, tuple(keep)
+        self.names = list(inspect.signature(production.func).parameters)
+        self.records = []
+
+    def wrap(self, launch_tiled):
+        """Return the ``wp.launch_tiled`` stand-in that replays and records the production launches."""
+
+        def replay(kernel, *args, **kwargs):
+            if kernel is not self.production:
+                return launch_tiled(kernel, *args, **kwargs)
+            inputs, outputs = list(kwargs["inputs"]), list(kwargs.get("outputs") or ())
+            operands = dict(zip(self.names, inputs + outputs, strict=True))
+            arrays = {name: value for name, value in operands.items() if isinstance(value, wp.array)}
+            clones = {}
+            for value in arrays.values():
+                if id(value) not in clones:
+                    clones[id(value)] = wp.clone(value)
+            twin_operands = [clones[id(value)] if isinstance(value, wp.array) else value for value in inputs + outputs]
+            before = {name: _host(arrays[name]) for name in self.keep}
+            result = launch_tiled(kernel, *args, **kwargs)
+            twin_kwargs = {**kwargs, "inputs": twin_operands[: len(inputs)], "outputs": twin_operands[len(inputs) :]}
+            launch_tiled(self.twin, *args, **twin_kwargs)
+            ours = {name: _host(value) for name, value in arrays.items()}
+            theirs = {name: _host(clones[id(value)]) for name, value in arrays.items()}
+            self.records.append(
+                {
+                    "differ": [name for name in arrays if not np.array_equal(_bits(ours[name]), _bits(theirs[name]))],
+                    "scalars": {name: value for name, value in operands.items() if name not in arrays},
+                    "before": before,
+                    "after": {name: ours[name] for name in self.keep},
+                }
+            )
+            return result
+
+        return replay
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def _replay_production(source: wp.array[float], shifted: wp.array[float], velocity: wp.array[float]):
+    i, _lane = wp.tid()
+    shifted[i] = source[i] + 1.0
+    velocity[i] = 0.5 * velocity[i] + shifted[i]
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def _replay_twin(source: wp.array[float], shifted: wp.array[float], velocity: wp.array[float]):
+    i, _lane = wp.tid()
+    shifted[i] = source[i] + 1.0
+    velocity[i] = 0.5 * velocity[i] + shifted[i]
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def _replay_offset_twin(source: wp.array[float], shifted: wp.array[float], velocity: wp.array[float]):
+    i, _lane = wp.tid()
+    shifted[i] = source[i] + 1.0
+    velocity[i] = 0.5 * velocity[i] + shifted[i] + 1.0
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def _replay_rewrite(source: wp.array[float], velocity: wp.array[float]):
+    i, _lane = wp.tid()
+    source[i] = 2.0 * source[i] + 1.0
+    velocity[i] = velocity[i] - 3.0
+
+
 class TestFeatherPGSMFStorage(unittest.TestCase):
     def test_hardware_capacity_streams_only_when_required(self):
         """Preserve all hardware rows when resident impulses exceed the device limit."""
@@ -236,6 +325,37 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "streamed metadata"):
             factory(*shape, resident_row_metadata=True, **options)
+
+    def test_launch_replay_compares_each_launch_when_it_runs(self):
+        """Compare each replayed launch with its twin before later stages rewrite the operands they share.
+
+        Three steps launch a kernel on persistent arrays, one of them bound to two operands, and then
+        rewrite those arrays with another kernel, which the replay passes through. An identical twin
+        matches every launch, the shared operand included, and a twin that writes other values differs
+        in that operand at every launch.
+        """
+        device = wp.get_device("cpu")
+        for twin, differ in ((_replay_twin, []), (_replay_offset_twin, ["velocity"])):
+            source = wp.array(np.arange(4, dtype=np.float32), device=device)
+            velocity = wp.zeros(4, dtype=float, device=device)
+            replay = _LaunchReplay(_replay_production, twin, keep=("velocity",))
+            with mock.patch.object(wp, "launch_tiled", replay.wrap(wp.launch_tiled)):
+                for _ in range(3):
+                    wp.launch_tiled(
+                        _replay_production,
+                        dim=[4],
+                        inputs=[source, source],
+                        outputs=[velocity],
+                        block_dim=32,
+                        device=device,
+                    )
+                    wp.launch_tiled(_replay_rewrite, dim=[4], inputs=[source, velocity], block_dim=32, device=device)
+            with self.subTest(twin=twin.key):
+                self.assertEqual([record["differ"] for record in replay.records], [differ] * 3)
+                for record in replay.records:
+                    self.assertFalse(np.array_equal(record["before"]["velocity"], record["after"]["velocity"]))
+                # The launches wrote through the shared operand and the rewrites ran between them: s -> 2 (s + 1) + 1.
+                np.testing.assert_array_equal(source.numpy(), [21.0, 29.0, 37.0, 45.0])
 
     def test_streaming_factory_owns_global_impulses_on_one_lane(self):
         """Stream the uniform paired projection; reject single-lane nonlinear paths."""
@@ -572,13 +692,49 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
                         banks[1][output].numpy().view(np.uint32), banks[0][output].numpy().view(np.uint32)
                     )
 
+    def _replay_solver_launches(self, model, options):
+        """Build a solver and replay every MF-GS launch of four steps through its streamed twin.
+
+        Returns the solver and the replay records (see :class:`_LaunchReplay`).
+        """
+        factory, calls = fpgs._get_pgs_solve_mf_gs_kernel, []
+
+        def recording(*args, **kwargs):
+            kernel = factory(*args, **kwargs)
+            calls.append((args, kwargs, kernel))
+            return kernel
+
+        with mock.patch.object(fpgs, "_get_pgs_solve_mf_gs_kernel", recording):
+            solver = fpgs.SolverFeatherPGS(model, **options)
+        production = solver._pgs_solve_mf_gs_kernel
+        self.assertIn("_gmeta_smeta", production.key)
+        args, kwargs = next((args, kwargs) for args, kwargs, kernel in calls if kernel is production)
+        twin = factory(*args, **{**kwargs, "resident_row_metadata": False})
+        self.assertEqual(twin.key, production.key.replace("_gmeta_smeta", "_gmeta", 1))
+        keep = ("world_constraint_count", "world_row_type", "world_row_parent", "world_impulses")
+        replay = _LaunchReplay(production, twin, keep=keep)
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False, deterministic=True)
+        contacts = pipeline.contacts()
+        states = [model.state(), model.state()]
+        control = model.control()
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        with mock.patch.object(wp, "launch_tiled", replay.wrap(wp.launch_tiled)):
+            for _ in range(4):
+                states[0].clear_forces()
+                pipeline.collide(states[0], contacts)
+                solver.step(states[0], states[1], control, contacts, 1.0 / 240.0)
+                states.reverse()
+        return solver, replay.records
+
     def test_solver_selects_resident_row_metadata_and_replays_its_launches_bitwise(self):
         """Keep row types and parents resident on a one-block-per-SM grid; its launches match the streamed twin.
 
         A dense row capacity of 320 streams the row metadata of a two-world patch scene (a standing
-        robot, an arm resting its tip on the ground and a free box). Every MF-GS launch of four
-        steps is replayed from its inputs through the streamed kernel, which must give identical
-        impulses and velocities. With fewer SMs than worlds the solver keeps the streamed kernel.
+        robot, an arm resting its tip on the ground and a free box). Every MF-GS launch of four steps
+        is replayed from its operands through the streamed kernel and compared bit for bit as it
+        runs: the interleaved schedule's full sweeps (row phase 0) and the split schedule's limit,
+        contact and velocity-limit passes (row phases 3, 4 and 5), whose contact pass stages only the
+        contact rows. With fewer SMs than worlds the solver keeps the streamed kernel.
         """
         device = wp.get_device("cuda:0")
         model = _three_size_model(device)
@@ -591,68 +747,34 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
             "mf_gs_incremental_rows": 0,
             "sparse_mass_matrix": "off",
         }
-        factory, calls = fpgs._get_pgs_solve_mf_gs_kernel, []
-
-        def recording(*args, **kwargs):
-            kernel = factory(*args, **kwargs)
-            calls.append((args, kwargs, kernel))
-            return kernel
-
-        with mock.patch.object(fpgs, "_get_pgs_solve_mf_gs_kernel", recording):
-            solver = fpgs.SolverFeatherPGS(model, **options)
-        production = solver._pgs_solve_mf_gs_kernel
-        sweep = solver.get_path_selection()["routes"]["sweep"]
-        self.assertEqual(sweep["mf_gs"], production.key)
-        self.assertIn("_gmeta_smeta", production.key)
-        storage = sweep["mf_gs_storage"]
-        self.assertEqual((storage["metadata"], storage["row_types_and_parents"]), ("streamed", "resident"))
-        self.assertIn("2-block grid fits one block per SM", storage["reason"])
-        args, kwargs = next((args, kwargs) for args, kwargs, kernel in calls if kernel is production)
-        twin = factory(*args, **{**kwargs, "resident_row_metadata": False})
-        names = list(inspect.signature(production.func).parameters)
-        launch_tiled, replays = wp.launch_tiled, []
-
-        def replay(kernel, *args, **kwargs):
-            if kernel is not production:
-                return launch_tiled(kernel, *args, **kwargs)
-            inputs, outputs = list(kwargs["inputs"]), list(kwargs["outputs"])
-            before = [wp.clone(value) if isinstance(value, wp.array) else value for value in inputs + outputs]
-            initial = before[names.index("world_impulses")].numpy()
-            result = launch_tiled(kernel, *args, **kwargs)
-            launch_tiled(twin, *args, **{**kwargs, "inputs": before[: len(inputs)], "outputs": before[len(inputs) :]})
-            replays.append((inputs + outputs, before, initial))
-            return result
-
-        def bits(array):
-            return np.ascontiguousarray(array.numpy()).view(np.uint8)
-
-        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False, deterministic=True)
-        contacts = pipeline.contacts()
-        states = [model.state(), model.state()]
-        control = model.control()
-        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
-        with mock.patch.object(fpgs.wp, "launch_tiled", replay):
-            for _ in range(4):
-                states[0].clear_forces()
-                pipeline.collide(states[0], contacts)
-                solver.step(states[0], states[1], control, contacts, 1.0 / 240.0)
-                states.reverse()
-        self.assertGreater(len(replays), 0)
-        rings = solved = 0
-        for production_operands, twin_operands, initial in replays:
-            for name, ours, theirs in zip(names, production_operands, twin_operands, strict=True):
-                if isinstance(ours, wp.array):
-                    np.testing.assert_array_equal(bits(ours), bits(theirs), err_msg=name)
-            solved += not np.array_equal(production_operands[names.index("world_impulses")].numpy(), initial)
-            counts = production_operands[names.index("world_constraint_count")].numpy()
-            types = production_operands[names.index("world_row_type")].numpy()
-            parents = production_operands[names.index("world_row_parent")].numpy()
-            for world, count in enumerate(counts):
-                normal = types[world, :count] == PGS_CONSTRAINT_TYPE_CONTACT
-                linked = (parents[world, :count] >= 0) & (parents[world, :count] != np.arange(count))
-                rings += int(np.count_nonzero(normal & linked))
-        self.assertGreater(solved, 0, "no replayed launch changed a dense impulse")
-        self.assertGreater(rings, 0, "no dense normal row linked a patch ring")
+        for schedule, phases in (("interleaved", {0}), ("physx_grasp", {3, 4, 5})):
+            with self.subTest(schedule=schedule):
+                solver, records = self._replay_solver_launches(model, {**options, "pgs_schedule": schedule})
+                sweep = solver.get_path_selection()["routes"]["sweep"]
+                self.assertEqual(sweep["mf_gs"], solver._pgs_solve_mf_gs_kernel.key)
+                storage = sweep["mf_gs_storage"]
+                self.assertEqual((storage["metadata"], storage["row_types_and_parents"]), ("streamed", "resident"))
+                self.assertIn("2-block grid fits one block per SM", storage["reason"])
+                self.assertEqual({record["scalars"]["row_phase"] for record in records}, phases)
+                for index, record in enumerate(records):
+                    self.assertEqual(
+                        record["differ"], [], f"launch {index}, row phase {record['scalars']['row_phase']}"
+                    )
+                # The launches solve patch rings: some move dense impulses, and dense normal rows link rings.
+                solved = sum(
+                    not np.array_equal(record["before"]["world_impulses"], record["after"]["world_impulses"])
+                    for record in records
+                )
+                self.assertGreater(solved, 0, "no replayed launch changed a dense impulse")
+                rings = 0
+                for record in records:
+                    before = record["before"]
+                    types, parents = before["world_row_type"], before["world_row_parent"]
+                    for world, count in enumerate(before["world_constraint_count"]):
+                        normal = types[world, :count] == PGS_CONSTRAINT_TYPE_CONTACT
+                        linked = (parents[world, :count] >= 0) & (parents[world, :count] != np.arange(count))
+                        rings += int(np.count_nonzero(normal & linked))
+                self.assertGreater(rings, 0, "no dense normal row linked a patch ring")
         with mock.patch.object(device, "sm_count", 1):
             declined = fpgs.SolverFeatherPGS(model, **options)
         storage = declined.get_path_selection()["routes"]["sweep"]["mf_gs_storage"]
