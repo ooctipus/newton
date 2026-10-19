@@ -16,7 +16,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
 from .row_inputs import make_row_kernel
-from .solve_policy import EXACT_POLICY, SolvePolicy, sweep_exit
+from .solve_policy import EXACT_POLICY, SolvePolicy, sweep_exit, vote
 from .sparse_mass_matrix import _SparseRowSupport
 from .velocity_limit_law import accumulated_impulse, accumulated_update, check_velocity_limit_law
 
@@ -110,6 +110,9 @@ def _get_pgs_solve_sparse_kernel(
 
     ``solve_policy`` compiles the sweep's stopping rule and readout
     (:mod:`solve_policy`); a readout appends its operand after ``support``.
+    Under a velocity tolerance an active-row sweep also bounds, before it
+    stops, the violation of every zero-impulse unilateral row, which its scan
+    may have left unvisited.
     """
     M, D, S = int(max_constraints), int(max_world_dofs), int(max_row_dofs)
     F = int(mf_max_constraints)
@@ -255,6 +258,7 @@ def _get_pgs_solve_sparse_kernel(
                 const int row = word * 32 + __ffs(pending) - 1;
                 pending &= pending - 1u;"""
         row_loop_end = "            }\n        }"
+    impulse_slack = "change_tolerance + relative_change_tolerance * fabsf(new_impulse)"
     mf_storage = mf_initialize = mf_sweep = mf_writeback = ""
     if accumulated_limits:
         free_velocity_limit = (
@@ -267,6 +271,18 @@ def _get_pgs_solve_sparse_kernel(
                 new_impulse = residual < 0.0f ? -residual * inverse_diagonal : 0.0f;"""
         free_change = f"const float change = kind == {velocity_limit_type} ? new_impulse : new_impulse - old_impulse;"
     if F:
+        sibling_inverse = "__int_as_float(mf_meta.data[(mf_offset + sibling) * 4 + 1])"
+        mf_vote = vote(
+            solve_policy,
+            """                if (!(fabsf(change) <= change_tolerance + relative_change_tolerance * fabsf(new_impulse)
+                      && fabsf(sibling_change) <= change_tolerance + relative_change_tolerance * fabsf(new_impulse))) changed = 1;""",
+            flag="changed",
+            terms=(
+                ("change", "inverse_diagonal > 0.0f ? 1.0f / inverse_diagonal : 0.0f", "kind"),
+                ("sibling_change", f"{sibling_inverse} > 0.0f ? 1.0f / {sibling_inverse} : 0.0f", str(friction_type)),
+            ),
+            slack=(impulse_slack, impulse_slack),
+        )
         mf_storage = f"""
     __shared__ float mf_impulse_storage[{W * F}];
     __shared__ float mf_incident_storage[{W * F}];
@@ -391,8 +407,7 @@ def _get_pgs_solve_sparse_kernel(
             {free_change}
             if (lane == 0) mf_impulse[row] = new_impulse;
             if (change != 0.0f || sibling_change != 0.0f) {{
-                if (!(fabsf(change) <= change_tolerance + relative_change_tolerance * fabsf(new_impulse)
-                      && fabsf(sibling_change) <= change_tolerance + relative_change_tolerance * fabsf(new_impulse))) changed = 1;
+{mf_vote}
                 if (index >= 0) {{
                     float value = delta[index];
                     if (sibling_change != 0.0f) value += sibling_right * sibling_change;
@@ -464,6 +479,13 @@ def _get_pgs_solve_sparse_kernel(
 """
     velocity_filter = velocity_sweep = ""
     if velocity_limits:
+        velocity_vote = vote(
+            solve_policy,
+            "                if (!(fabsf(correction) <= change_tolerance)) changed = 1;",
+            flag="changed",
+            terms=(("correction", "denominator", str(velocity_limit_type)),),
+            slack=("change_tolerance",),
+        )
         # Storage puts velocity rows before contacts, but their original law
         # owns the final pass. Scalar rows need only one residual reduction.
         velocity_filter = f"""
@@ -510,7 +532,7 @@ def _get_pgs_solve_sparse_kernel(
             const float residual = __shfl_sync(MASK, dot, 0, {L}) + rhs[row];
 {final_velocity_limit}
             if (correction != 0.0f) {{
-                if (!(fabsf(correction) <= change_tolerance)) changed = 1;
+{velocity_vote}
                 #pragma unroll
                 for (int q = 0; q < {Q}; ++q)
                     if (indices[q] >= 0) delta[indices[q]] += responses[q] * correction;
@@ -518,6 +540,14 @@ def _get_pgs_solve_sparse_kernel(
             __syncwarp(MASK);
         }}
 """
+    row_vote = vote(
+        solve_policy,
+        """                if (!(fabsf(change) <= change_tolerance + relative_change_tolerance * fabsf(new_impulse)
+                      && fabsf(sibling_change) <= change_tolerance + relative_change_tolerance * fabsf(new_impulse))) changed = 1;""",
+        flag="changed",
+        terms=(("change", "denominator", "row_type"), ("sibling_change", "diagonal[sibling]", str(friction_type))),
+        slack=(impulse_slack, impulse_slack),
+    )
     row_update = f"""
             const int row_type = static_cast<int>(type[row]);
 {velocity_filter}
@@ -606,8 +636,7 @@ def _get_pgs_solve_sparse_kernel(
             const float change = new_impulse - old_impulse;
             if (lane == 0) impulse[row] = new_impulse;
             if (change != 0.0f || sibling_change != 0.0f) {{
-                if (!(fabsf(change) <= change_tolerance + relative_change_tolerance * fabsf(new_impulse)
-                      && fabsf(sibling_change) <= change_tolerance + relative_change_tolerance * fabsf(new_impulse))) changed = 1;
+{row_vote}
                 #pragma unroll
                 for (int q = 0; q < {Q}; ++q) {{
                     if (indices[q] >= 0) {{
@@ -621,16 +650,54 @@ def _get_pgs_solve_sparse_kernel(
             }}
             __syncwarp(MASK);
 """
+    violation = None
+    if active_rows:
+        # Rows unselected at sweep entry are not visited: a zero-impulse unilateral row's violation
+        # is the velocity change its visit would make, so a tolerance also bounds it.
+        violation = (
+            f"""float sweep_violation = 0.0f;
+int sweep_violation_kind = -1;
+for (int first = 0; first < count; first += 32) {{
+    const int row = first + lane;
+    const int kind = row < count ? static_cast<int>(type[row]) : -1;
+    if ((kind == {contact_type} || kind == {limit_type}) && impulse[row] == 0.0f && diagonal[row] > 0.0f) {{
+        float dot = 0.0f;
+        #pragma unroll
+        for (int entry = 0; entry < {S}; ++entry) {{
+            const int index = {index_read};
+            if (index >= 0) dot += row_factor.data[row_base + row * {S} + entry] * delta[index];
+        }}
+        const float residual = dot + rhs[row];
+        const float excess = isfinite(residual) ? fmaxf(-residual, 0.0f) : __int_as_float(0x7f800000);
+        if (excess > sweep_violation) {{
+            sweep_violation = excess;
+            sweep_violation_kind = kind;
+        }}
+    }}
+}}
+for (int offset = 16; offset > 0; offset >>= 1) {{
+    const float other = __shfl_xor_sync(MASK, sweep_violation, offset);
+    const int other_kind = __shfl_xor_sync(MASK, sweep_violation_kind, offset);
+    if (other > sweep_violation || (other == sweep_violation && other_kind > sweep_violation_kind)) {{
+        sweep_violation = other;
+        sweep_violation_kind = other_kind;
+    }}
+}}""",
+            "sweep_violation",
+            "sweep_violation_kind",
+        )
     sweep_finish = "\n" + sweep_exit(
         solve_policy,
         "        if (global_iteration >= friction_start_iteration && __ballot_sync(MASK, changed != 0) == 0u) break;\n",
         gate="global_iteration >= friction_start_iteration",
         quiet="__ballot_sync(MASK, changed != 0) == 0u",
+        violation=violation,
+        lanes=L,
     )
     friction = FRICTION_PAIR
     if contact_triplets:
         triplet_setup, triplet_update = _contact_triplet_code(
-            M, S, Q, contact_type, friction_type, linked=linked_rows, active=active_rows
+            M, S, Q, contact_type, friction_type, linked=linked_rows, active=active_rows, solve_policy=solve_policy
         )
         setup += triplet_setup
         active_scan += "\n        int consumed_tangent = -1;\n"
@@ -803,15 +870,23 @@ def _get_pgs_solve_sparse_kernel(
         kernel = make_row_kernel(
             name, snippet, solve_native.func, solve_policy.arguments, dispatch="tiles", groups=W, lanes=L
         )
-        kernel._fpgs_solve_readout = True
+        kernel._fpgs_solve_readout = solve_policy.readout
         return kernel
-    solve.__name__ = f"pgs_solve_sparse_{M}_{D}_{S}_{F}_{P}{suffix}"
+    solve.__name__ = f"pgs_solve_sparse_{M}_{D}_{S}_{F}_{P}{suffix}{solve_policy.suffix}"
     solve.__qualname__ = solve.__name__
     return wp.kernel(enable_backward=False, module="unique")(solve)
 
 
 def _contact_triplet_code(
-    M: int, S: int, Q: int, contact_type: int, friction_type: int, *, linked: bool = False, active: bool = True
+    M: int,
+    S: int,
+    Q: int,
+    contact_type: int,
+    friction_type: int,
+    *,
+    linked: bool = False,
+    active: bool = True,
+    solve_policy: SolvePolicy = EXACT_POLICY,
 ) -> tuple[str, str]:
     """Native additions for one-call metrics and ordered register-held updates.
 
@@ -821,7 +896,8 @@ def _contact_triplet_code(
     so the early exit matches under a relative change tolerance too. Unlinked
     transactions bound every change by the new normal.
     ``active`` fuses selected rows of the active-row scan; otherwise the
-    transaction runs inside the full ordered sweep.
+    transaction runs inside the full ordered sweep. ``solve_policy`` compiles
+    the transaction's change vote.
     """
     pairs = M // 3
     cache_size = min(_SPARSE_CONTACT_METRIC_CACHE_SIZE, pairs)
@@ -832,9 +908,10 @@ def _contact_triplet_code(
     ring_load, load = "", "new_normal"
     tangent_state = "float tangent_change = 0.0f, sibling_change = 0.0f;"
     tangent_keep = ""
-    change_test = """if (!(fabsf(normal_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal)
+    change_test = """                    if (!(fabsf(normal_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal)
                           && fabsf(tangent_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal)
                           && fabsf(sibling_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal))) changed = 1;"""
+    normal_slack = tangent_slack = "change_tolerance + relative_change_tolerance * fabsf(new_normal)"
     if linked:
         ring_load = """
                 float load = new_normal;
@@ -845,13 +922,25 @@ def _contact_triplet_code(
         tangent_state = "float tangent_change = 0.0f, sibling_change = 0.0f, tangent_value = 0.0f;"
         tangent_keep = "\n                    tangent_value = new_tangent;"
         # Rows r and r + 1 bound their changes by their own new impulses, the pair by its first tangent.
-        change_test = """if (normal_change != 0.0f
+        change_test = """                    if (normal_change != 0.0f
                         && !(fabsf(normal_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal)))
                         changed = 1;
                     if ((tangent_change != 0.0f || sibling_change != 0.0f)
                         && !(fabsf(tangent_change) <= change_tolerance + relative_change_tolerance * fabsf(tangent_value)
                              && fabsf(sibling_change) <= change_tolerance + relative_change_tolerance * fabsf(tangent_value)))
                         changed = 1;"""
+        tangent_slack = "change_tolerance + relative_change_tolerance * fabsf(tangent_value)"
+    change_test = vote(
+        solve_policy,
+        change_test,
+        flag="changed",
+        terms=(
+            ("normal_change", "diagonal[row]", str(contact_type)),
+            ("tangent_change", "diagonal[tangent]", str(friction_type)),
+            ("sibling_change", "diagonal[sibling]", str(friction_type)),
+        ),
+        slack=(normal_slack, tangent_slack, tangent_slack),
+    )
     setup = f"""
     __shared__ float metric_storage[{2 * cache_size * 5}];
     __shared__ signed char metric_map_storage[{2 * pairs}];
@@ -983,7 +1072,7 @@ def _contact_triplet_code(
                     }}
                 }}
                 if (normal_change != 0.0f || tangent_change != 0.0f || sibling_change != 0.0f) {{
-                    {change_test}
+{change_test}
                     #pragma unroll
                     for (int q = 0; q < {Q}; ++q)
                         if (indices[q] >= 0) delta[indices[q]] = velocities[q];

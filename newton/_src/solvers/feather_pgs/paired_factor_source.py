@@ -11,7 +11,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
-from .solve_policy import EXACT_POLICY, SolvePolicy, sweep_exit
+from .solve_policy import EXACT_POLICY, SolvePolicy, SolvePolicyUnsupported, sweep_exit
 
 
 def _physical_entry(D, P, S, independent_components):
@@ -223,6 +223,8 @@ def get_source(
         raise ValueError("paired factor source requires positive capacity and two components spanning at most 32 DOFs")
     if contact_triples and contact_units:
         raise ValueError("contact triples and contact units are exclusive paired factor schedules")
+    if not solve_policy.exact or solve_policy.traces:
+        raise SolvePolicyUnsupported("The paired factor sweep keeps the exact law and the plain sweep count")
     W = 2
     contact_type = int(PGS_CONSTRAINT_TYPE_CONTACT)
     friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)

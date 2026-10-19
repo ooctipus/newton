@@ -10,6 +10,7 @@ from .contact_torsion import torque_sweep_source
 from .device_preludes import DevicePrelude, cuda_native
 from .friction import FRICTION_PAIR
 from .kernels import (
+    PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_CONSTRAINT_TYPE_TORSION,
@@ -21,7 +22,7 @@ from .row_metadata import (
     _mf_parent_expression,
     _validate_dense_metadata_encoding,
 )
-from .solve_policy import EXACT_POLICY, SolvePolicy, sweep_exit
+from .solve_policy import EXACT_POLICY, SolvePolicy, SolvePolicyUnsupported, sweep_exit, vote
 from .velocity_limit_law import accumulated_update, check_velocity_limit_law
 
 # The dense-tile variant owns one fixed row phase; any other launch is a device error, never a different phase.
@@ -115,6 +116,12 @@ def get_source(
         raise ValueError("Independent components require the paired factor-coordinate solve")
     if solve_policy.counts and (held_policy is not None or shared_arena or dense_support_tiles):
         raise ValueError("A solve readout requires the physical bindings without dense support tiles")
+    if (not solve_policy.exact or solve_policy.traces) and (
+        friction_mode != "current" or contact_torsion or dense_support_tiles or held_policy is not None or shared_arena
+    ):
+        raise SolvePolicyUnsupported(
+            "The velocity exit law and trace cover the current-friction physical sweep without torsion or dense tiles"
+        )
     _validate_dense_metadata_encoding(max_constraints)
     M_D = max_constraints
     M_MF = mf_max_constraints
@@ -168,6 +175,52 @@ def get_source(
     if cpu_body and held_policy is None:
         raise ValueError("Only the held-coordinate owner supplies a scalar CPU recurrence")
     held_entry = "\n" + held_policy[0] if held_policy is not None else ""
+    # Change votes under the solve policy; the exact law keeps each site's own text.
+    friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
+    velocity_limit_type = int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
+    mf_sibling_inverse = "__int_as_float(mf_meta.data[off_meta + sib * 4 + 1])"
+    dense_sibling_vote = vote(
+        solve_policy,
+        "                    if (sib_delta != 0.0f) iteration_changed = 1;",
+        flag="iteration_changed",
+        terms=(("sib_delta", "s_diag_dense[sib]", str(friction_type)),),
+    )
+    mf_sibling_vote = vote(
+        solve_policy,
+        "                    if (sib_delta != 0.0f) iteration_changed = 1;",
+        flag="iteration_changed",
+        terms=(("sib_delta", f"{mf_sibling_inverse} > 0.0f ? 1.0f / {mf_sibling_inverse} : 0.0f", str(friction_type)),),
+    )
+    dense_limit_vote = vote(
+        solve_policy,
+        "                    iteration_changed = 1;",
+        flag="iteration_changed",
+        terms=(("delta_impulse_vlim", "denom", str(velocity_limit_type)),),
+    )
+    drive_limit_vote = vote(
+        solve_policy,
+        "                    if (delta_fvl != 0.0f) iteration_changed = 1;",
+        flag="iteration_changed",
+        terms=(("delta_fvl", "denom_fvl", str(int(PGS_CONSTRAINT_TYPE_JOINT_TARGET))),),
+    )
+    mf_vote = vote(
+        solve_policy,
+        "                iteration_changed = 1;",
+        flag="iteration_changed",
+        terms=(("delta_impulse", "mf_diag > 0.0f ? 1.0f / mf_diag : 0.0f", "mf_rt"),),
+    )
+    mf_limit_vote = vote(
+        solve_policy,
+        "                    iteration_changed = 1;",
+        flag="iteration_changed",
+        terms=(("delta_impulse_mf_vlim", "1.0f / mf_diag", str(velocity_limit_type)),),
+    )
+    dense_vote = vote(
+        solve_policy,
+        "                iteration_changed = 1;",
+        flag="iteration_changed",
+        terms=(("delta_impulse", "denom", "row_type"),),
+    )
     dense_rhs = "rows.r0.data[off_dense + i]" if held_policy is not None else "rhs_bias.data[off_dense + i]"
     velocity_load = (
         "s_v[d] = 0.0f;" if held_policy is not None else "s_v[d] = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;"
@@ -562,7 +615,7 @@ def get_source(
                     __syncwarp();
                     if (lane == 0) s_lam_dense[sib] = b * scale;
                     __syncwarp();
-                    if (sib_delta != 0.0f) iteration_changed = 1;
+{dense_sibling_vote}
                     {dense_sib_v_code}
                 }}
 """
@@ -1132,7 +1185,7 @@ def get_source(
                     new_impulse = a * scale;
                     float sib_delta = b * scale - s_lam_mf[sib];
                     s_lam_mf[sib] = b * scale;
-                    if (sib_delta != 0.0f) iteration_changed = 1;
+{mf_sibling_vote}
                     if (lane < 6 && dof_a >= 0)
                         s_v[dof_a + lane] += mf_MiJt_a.data[sib_mf6 + lane] * sib_delta;
                     if (lane >= 6 && lane < 12 && dof_b >= 0)
@@ -1299,7 +1352,7 @@ def get_source(
 {dense_velocity_limit_law}
 
                 if (delta_impulse_vlim != 0.0f) {{
-                    iteration_changed = 1;
+{dense_limit_vote}
                     for (int d = lane; d < {D}; d += 32) {{
                         if (defer_dense_response == 0 ||
                             world_deferred_dof_mask.data[deferred_mask_base + d] == 0) {{
@@ -1347,7 +1400,7 @@ def get_source(
 
                 if (fabsf(jv_fvl) > qdot_max_fvl) {{
                     float delta_fvl = (fminf(fmaxf(jv_fvl, -qdot_max_fvl), qdot_max_fvl) - jv_fvl) / denom_fvl;
-                    if (delta_fvl != 0.0f) iteration_changed = 1;
+{drive_limit_vote}
                     for (int d = lane; d < {D}; d += 32) {{
                         if (defer_dense_response == 0 ||
                             world_deferred_dof_mask.data[deferred_mask_base + d] == 0) {{
@@ -1493,7 +1546,7 @@ def get_source(
 
             // V update using prefetched MiJt values
             if (delta_impulse != 0.0f) {{
-                iteration_changed = 1;
+{mf_vote}
                 if (lane < 6 && dof_a >= 0) {{
                     s_v[dof_a + lane] += cur_MiJta * delta_impulse;
                 }}
@@ -1545,7 +1598,7 @@ def get_source(
 {mf_velocity_limit_law}
 
                 if (delta_impulse_mf_vlim != 0.0f) {{
-                    iteration_changed = 1;
+{mf_limit_vote}
                     if (lane < 6 && dof_a >= 0) {{
                         s_v[dof_a + lane] += mf_MiJt_a.data[row_mf6 + lane] * delta_impulse_mf_vlim;
                     }}
@@ -1744,7 +1797,7 @@ def get_source(
 
             // V update using prefetched Y
             if (delta_impulse != 0.0f) {{
-                iteration_changed = 1;
+{dense_vote}
                 {dense_v_update_code}
             }}
             __syncwarp();

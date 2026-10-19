@@ -254,7 +254,15 @@ from .row_build import (
 from .row_build_native import get_row_build_native_kernel
 from .row_build_rows import build_contact_rows
 from .row_inputs import make_row_kernel
-from .solve_policy import EXACT_POLICY, SOLVE_READOUTS, SolvePolicy, SolveReadoutRecord, sweep_exit
+from .solve_policy import (
+    EXACT_POLICY,
+    SOLVE_READOUTS,
+    SolvePolicy,
+    SolvePolicyUnsupported,
+    SolveReadoutRecord,
+    sweep_exit,
+    vote,
+)
 from .sparse_contact import (
     SparseContactRows,
     _get_sparse_contact_response_kernel,
@@ -1372,7 +1380,8 @@ class SolverFeatherPGS(SolverBase):
         friction_anchor_beta: float | None = None,
         pgs_change_tolerance: float = 0.0,
         pgs_relative_change_tolerance: float = 0.0,
-        pgs_solve_readout: Literal["off", "sweeps"] = "off",
+        pgs_solve_readout: Literal["off", "sweeps", "trace"] = "off",
+        pgs_velocity_change_tolerance: float = 0.0,
         mf_gs_incremental_rows: int = 32,
         mf_gs_parallel_rows: int = 0,
         mf_gs_parallel_sweeps: int = 24,
@@ -1823,11 +1832,25 @@ class SolverFeatherPGS(SolverBase):
                 the absolute tolerance only. Defaults to 0.0.
             pgs_solve_readout (str, optional): Opt-in counters of the native Gauss-Seidel sweeps.
                 ``"sweeps"`` counts, per sweep kernel and world, how many sweeps each solve executed
-                and whether it stopped before its budget; ``get_path_selection()`` summarizes them
-                under ``measurements["solve_readout"]``, which synchronizes the device once.
-                Counting changes no computed value. The sparse, sparse-diagonal, matrix-free
+                and whether it stopped before its budget; ``"trace"`` adds, per solve, the sweep at
+                which each velocity tolerance from 1e-7 to 1e-1 [m/s or rad/s] would have stopped it,
+                its exit reason, and the largest velocity-scaled change of its final sweep with that
+                row's kind. ``get_path_selection()`` summarizes them under
+                ``measurements["solve_readout"]``, which synchronizes the device once. Neither
+                readout changes a computed value. The sparse, sparse-diagonal, matrix-free
                 Gauss-Seidel, paired factor, local and incremental sweeps count; the others run
                 without counters (``routes.sweep.readout``). Defaults to ``"off"``.
+            pgs_velocity_change_tolerance (float, optional): Velocity exit law of the native
+                Gauss-Seidel sweeps [m/s or rad/s]. A sweep stops a world once no row's impulse change
+                times its effective-mass diagonal, ``|dlambda| * A_ii`` (the change of the row's own
+                velocity), exceeds the tolerance; sweeps that visit only the rows selected at sweep
+                entry also require every zero-impulse unilateral row to be violated by at most the
+                tolerance. On native sparse sweeps it adds to ``pgs_change_tolerance`` and
+                ``pgs_relative_change_tolerance``. Zero keeps the exact stationary-sweep exit. The
+                native sparse, sparse-diagonal and matrix-free Gauss-Seidel sweeps honor it, the last
+                one except under non-default friction modes or contact torsion; the other sweeps and
+                launch-per-iteration drivers do not (``routes.sweep.exit_law``, with a warning).
+                Experimental. Defaults to 0.0.
             pgs_contact_regularization (float, optional): Dimensionless regularizer ``g`` of contact
                 rows on every route (matrix-free, dense, propagation). Each position iteration moves a
                 row's impulse toward the hard solution with weight ``1/(1+g)`` and toward zero with
@@ -2245,8 +2268,18 @@ class SolverFeatherPGS(SolverBase):
         if pgs_solve_readout not in SOLVE_READOUTS:
             raise ValueError(f"pgs_solve_readout must be one of {SOLVE_READOUTS}, got {pgs_solve_readout!r}")
         self.pgs_solve_readout = pgs_solve_readout
-        self._solve_policy = SolvePolicy(readout=pgs_solve_readout)
+        self.pgs_velocity_change_tolerance = float(pgs_velocity_change_tolerance)
+        if not (np.isfinite(self.pgs_velocity_change_tolerance) and self.pgs_velocity_change_tolerance >= 0.0):
+            raise ValueError(
+                f"pgs_velocity_change_tolerance must be finite and non-negative, got {pgs_velocity_change_tolerance!r}"
+            )
+        self._solve_policy = SolvePolicy(
+            readout=pgs_solve_readout, velocity_change_tolerance=self.pgs_velocity_change_tolerance
+        )
         self._solve_readout = SolveReadoutRecord(self._solve_policy)
+        # Sweep kernels built under the velocity law, and those whose variant kept the exact law, with why.
+        self._solve_policy_honored = {}
+        self._solve_policy_declined = {}
         self.pgs_velocity_iterations = max(int(pgs_velocity_iterations), 0)
         self.enable_restitution = bool(enable_restitution)
         threshold_error = "restitution_velocity_threshold must be finite and non-negative"
@@ -3562,6 +3595,14 @@ class SolverFeatherPGS(SolverBase):
             )
         # Record the applied options once; get_path_selection() returns detached copies.
         self._applied_options = applied_options(self, SolverFeatherPGS.__init__, requested_options)
+        if self.pgs_velocity_change_tolerance > 0.0:
+            law = route_selection(self)["sweep"]["exit_law"]
+            if law["declined"] or law["ignored"] or not law["driver_honors"]:
+                warnings.warn(
+                    f"pgs_velocity_change_tolerance applies only to some sweeps of this solver: {law['reason']} "
+                    f"Declined: {sorted(law['declined'])}; ignored: {law['ignored']}.",
+                    stacklevel=2,
+                )
 
     def get_path_selection(self) -> dict:
         """Return requested choices, active plans and selection reasons.
@@ -5761,7 +5802,9 @@ class SolverFeatherPGS(SolverBase):
             and solve_shared_bytes * (32 // self._sparse_solve_lanes) + local_factor_bytes
             <= min(shared_limit, _SPARSE_LOCAL_WORKSPACE_BYTES)
         )
-        self._pgs_solve_sparse_kernel = _get_pgs_solve_sparse_kernel(
+        self._pgs_solve_sparse_kernel = self._sweep_kernel(
+            "sparse_pgs",
+            _get_pgs_solve_sparse_kernel,
             self.dense_max_constraints,
             self.max_world_dofs,
             max_support,
@@ -5776,21 +5819,36 @@ class SolverFeatherPGS(SolverBase):
             warm_start=self.pgs_warmstart,
             linked_rows=self._friction_anchors_enabled,
             velocity_limit_law=self._velocity_limit_kernel_law(),
-            solve_policy=self._solve_policy,
         )
-        self._register_solve_readout(self._pgs_solve_sparse_kernel, "sparse_pgs")
 
-    def _register_solve_readout(self, kernel, route: str) -> None:
-        """Allocate the counters of a sweep kernel built with a readout, outside any graph capture.
+    def _sweep_kernel(self, route: str, factory, *args, **kwargs):
+        """Build a Gauss-Seidel sweep under the solve policy and allocate its readout counters.
+
+        A sweep variant that cannot compile the policy's velocity law or trace
+        keeps the exact law, with the plain sweep count when a readout was
+        requested; ``routes.sweep.exit_law`` records it. Counters are allocated
+        here, outside any graph capture.
 
         Args:
-            kernel: The sweep kernel, or ``None`` when its owner was not built.
-            route: Owner of the kernel in the readout summary.
+            route: Owner of the sweep in the records, such as ``"sparse_pgs"``.
+            factory: The sweep factory, which takes the policy as ``solve_policy``.
+            *args: Positional arguments of the factory.
+            **kwargs: Keyword arguments of the factory.
         """
+        policy = self._solve_policy
+        try:
+            kernel = factory(*args, solve_policy=policy, **kwargs)
+        except SolvePolicyUnsupported as error:
+            kernel = factory(*args, solve_policy=SolvePolicy(readout="sweeps" if policy.counts else "off"), **kwargs)
+            self._solve_policy_declined[kernel.key] = f"{route}: {error}"
+        else:
+            if not policy.exact:
+                self._solve_policy_honored[kernel.key] = route
         budget = max(int(self.pgs_iterations), int(self.pgs_velocity_iterations), 1)
         self._solve_readout.register(
             kernel, route, world_count=int(self.world_count), budget=budget, device=self.model.device
         )
+        return kernel
 
     def _sparse_small_world_lanes(self, solve_shared_bytes: int, shared_limit: int, mf_capacity: int) -> int:
         """Return the lanes per world (8 or 16) that pack a small complete sparse sweep, or 0 for whole warps.
@@ -7554,7 +7612,9 @@ class SolverFeatherPGS(SolverBase):
                 factor_coordinates=self._paired_factor_coordinates,
             )
             self._paired_factor_solve_kernel = (
-                _get_pgs_solve_paired_factor_kernel(
+                self._sweep_kernel(
+                    "paired_factor",
+                    _get_pgs_solve_paired_factor_kernel,
                     self.dense_max_constraints,
                     self.max_world_dofs,
                     primary_size,
@@ -7563,12 +7623,10 @@ class SolverFeatherPGS(SolverBase):
                     contact_triples=self._factor_coordinate_contact_triples,
                     independent_components=self._paired_components is not None,
                     contact_units=self._factor_coordinate_contact_units,
-                    solve_policy=self._solve_policy,
                 )
                 if self._paired_factor_coordinates
                 else None
             )
-            self._register_solve_readout(self._paired_factor_solve_kernel, "paired_factor")
         else:
             self._paired_factor_solve_kernel = None
 
@@ -7633,7 +7691,9 @@ class SolverFeatherPGS(SolverBase):
                     warps_per_block = 2 if count % (2 * worlds_per_warp) == 0 else 1
                     self._pgs_solve_local_internal_warps_per_block[size] = warps_per_block
                     self._pgs_solve_local_internal_worlds_per_block[size] = warps_per_block * 32 // lanes_per_world
-                    self._pgs_solve_local_internal_kernels[size] = local_factory(
+                    self._pgs_solve_local_internal_kernels[size] = self._sweep_kernel(
+                        "local_internal",
+                        local_factory,
                         self.dense_max_constraints,
                         min(self._local_solve_max_rows, size),
                         size,
@@ -7642,15 +7702,15 @@ class SolverFeatherPGS(SolverBase):
                         lanes_per_world=lanes_per_world,
                         contact_capable=False,
                         dense_response_matrix=True,
-                        solve_policy=self._solve_policy,
                     )
-                    self._register_solve_readout(self._pgs_solve_local_internal_kernels[size], "local_internal")
             for size, count in self._local_pair_art_counts.items():
                 if count > 0:
                     solver_blocks = self._local_pair_solver_blocks[size]
                     warps_per_block = 2 if solver_blocks % 2 == 0 else 1
                     self._pgs_solve_local_pair_warps_per_block[size] = warps_per_block
-                    self._pgs_solve_local_pair_kernels[size] = local_factory(
+                    self._pgs_solve_local_pair_kernels[size] = self._sweep_kernel(
+                        "local_pair",
+                        local_factory,
                         self.dense_max_constraints,
                         self._local_solve_max_rows,
                         size,
@@ -7659,13 +7719,13 @@ class SolverFeatherPGS(SolverBase):
                         persistent_queue=True,
                         warps_per_block=warps_per_block,
                         dense_response_matrix=True,
-                        solve_policy=self._solve_policy,
                     )
-                    self._register_solve_readout(self._pgs_solve_local_pair_kernels[size], "local_pair")
             for size, count in self._local_residual_art_counts.items():
                 if count > 0:
                     warps_per_block = self._local_residual_warps_per_block[size]
-                    self._pgs_solve_local_residual_kernels[size] = local_factory(
+                    self._pgs_solve_local_residual_kernels[size] = self._sweep_kernel(
+                        "local_residual",
+                        local_factory,
                         self.dense_max_constraints,
                         self._local_residual_max_rows,
                         size,
@@ -7676,9 +7736,7 @@ class SolverFeatherPGS(SolverBase):
                         mf_max_constraints=self.mf_max_constraints,
                         local_mf_max_constraints=self._local_residual_mf_max_rows,
                         dense_response_matrix=True,
-                        solve_policy=self._solve_policy,
                     )
-                    self._register_solve_readout(self._pgs_solve_local_residual_kernels[size], "local_residual")
 
         sparse_contact_schedule = self._sparse_diagonal_contact_triples or self._sparse_diagonal_contact_units
         self._mark_independent_sparse_contact_candidates_kernel = (
@@ -7702,7 +7760,9 @@ class SolverFeatherPGS(SolverBase):
             else None
         )
         self._pgs_solve_sparse_diagonal_kernel = (
-            _get_pgs_solve_sparse_diagonal_kernel(
+            self._sweep_kernel(
+                "sparse_diagonal",
+                _get_pgs_solve_sparse_diagonal_kernel,
                 self.dense_max_constraints,
                 self.max_world_dofs,
                 self._sparse_diagonal_dense_size,
@@ -7710,12 +7770,10 @@ class SolverFeatherPGS(SolverBase):
                 contact_triples=self._sparse_diagonal_contact_triples,
                 speculative_contact_batches=self._sparse_diagonal_speculative_contact_batches,
                 contact_units=self._sparse_diagonal_contact_units,
-                solve_policy=self._solve_policy,
             )
             if self._sparse_diagonal_contact_solve
             else None
         )
-        self._register_solve_readout(self._pgs_solve_sparse_diagonal_kernel, "sparse_diagonal")
         self._pgs_solve_mf_gs_kernel = None
         # Storage classes of the MF-GS kernel (_MFGSStorage); recorded by get_path_selection().
         self._mfgs_storage = None
@@ -7867,7 +7925,9 @@ class SolverFeatherPGS(SolverBase):
                 )
                 parallel_rows -= parallel_rows % 4
                 incremental_rows = 0
-            self._pgs_solve_mf_gs_kernel = _get_pgs_solve_mf_gs_kernel(
+            self._pgs_solve_mf_gs_kernel = self._sweep_kernel(
+                "mf_gs",
+                _get_pgs_solve_mf_gs_kernel,
                 self.dense_max_constraints,
                 self.mf_max_constraints,
                 self.max_world_dofs,
@@ -7887,9 +7947,7 @@ class SolverFeatherPGS(SolverBase):
                 skip_response_block=use_rb,
                 independent_components=self._paired_components is not None,
                 velocity_limit_law=self._velocity_limit_kernel_law(),
-                solve_policy=self._solve_policy,
             )
-            self._register_solve_readout(self._pgs_solve_mf_gs_kernel, "mf_gs")
             if use_rb:
                 self._build_response_block_sweep(model, has_drive_rows)
             self._pgs_solve_mf_gs_incremental_kernels = []
@@ -7985,7 +8043,9 @@ class SolverFeatherPGS(SolverBase):
                     tiers.append((incremental_rows, 32))
                 for rows, min_rows in tiers:
                     self._pgs_solve_mf_gs_incremental_kernels.append(
-                        _get_pgs_solve_mf_gs_incremental_kernel(
+                        self._sweep_kernel(
+                            "mf_gs_incremental",
+                            _get_pgs_solve_mf_gs_incremental_kernel,
                             self.dense_max_constraints,
                             self.mf_max_constraints,
                             self.max_world_dofs,
@@ -7996,10 +8056,8 @@ class SolverFeatherPGS(SolverBase):
                             skip_local_internal_worlds=self._local_internal_fast_path,
                             min_rows=min_rows,
                             velocity_limit_law=self._velocity_limit_kernel_law(),
-                            solve_policy=self._solve_policy,
                         )
                     )
-                    self._register_solve_readout(self._pgs_solve_mf_gs_incremental_kernels[-1], "mf_gs_incremental")
                 self._pgs_solve_mf_gs_incremental_kernel = self._pgs_solve_mf_gs_incremental_kernels[0]
 
         # The gate of the row builder (_stage4_build_rows): it allocates free-body velocity-limit rows into
@@ -19611,10 +19669,10 @@ def _get_pgs_solve_paired_factor_kernel(
             groups=W,
             lanes=32,
         )
-        kernel._fpgs_solve_readout = True
+        kernel._fpgs_solve_readout = solve_policy.readout
         return kernel
-    pgs_solve_paired_factor_template.__name__ = name
-    pgs_solve_paired_factor_template.__qualname__ = name
+    pgs_solve_paired_factor_template.__name__ = name + solve_policy.suffix
+    pgs_solve_paired_factor_template.__qualname__ = name + solve_policy.suffix
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_paired_factor_template)
 
 
@@ -25125,6 +25183,8 @@ def _get_pgs_solve_local_owned_kernel(
         raise ValueError("lanes_per_world must be 8, 16, or 32")
     if not contact_capable and paired_dof_count:
         raise ValueError("only single-articulation kernels may omit contact handling")
+    if not solve_policy.exact or solve_policy.traces:
+        raise SolvePolicyUnsupported("The local owners keep the exact law and the plain sweep count")
     if local_mf_max_constraints and (not contact_capable or not paired_dof_count or mf_max_constraints <= 0):
         raise ValueError("local MF rows require a contact-capable articulation pair and positive MF storage")
     max_rows = max_constraints
@@ -25625,12 +25685,14 @@ def _get_pgs_solve_local_owned_kernel(
             && __ballot_sync(MASK, changed != 0) == 0u) break;""",
             gate="global_iteration >= friction_start_iteration",
             quiet="__ballot_sync(MASK, changed != 0) == 0u",
+            lanes=lanes_per_world,
         )
         if contact_capable
         else sweep_exit(
             solve_policy,
             "        if (__ballot_sync(MASK, changed != 0) == 0u) break;",
             quiet="__ballot_sync(MASK, changed != 0) == 0u",
+            lanes=lanes_per_world,
         )
     )
     mf_setup = (
@@ -26041,7 +26103,7 @@ def _get_pgs_solve_local_owned_kernel(
         lanes=lanes_per_world,
     )
     if solve_policy.counts:
-        kernel._fpgs_solve_readout = True
+        kernel._fpgs_solve_readout = solve_policy.readout
     return kernel
 
 
@@ -26627,6 +26689,29 @@ def _get_pgs_solve_sparse_diagonal_kernel(
     limit_loads = []
     limit_projection = []
     limit_stores = []
+    limit_type, contact_type = int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT), int(PGS_CONSTRAINT_TYPE_CONTACT)
+    friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
+    limit_vote = vote(
+        solve_policy,
+        "                if (delta_lambda != 0.0f) iteration_changed = 1;",
+        flag="iteration_changed",
+        terms=(("delta_lambda", "limit_denom", str(limit_type)),),
+    )
+    normal_vote = vote(
+        solve_policy,
+        "                        iteration_changed = 1;",
+        flag="iteration_changed",
+        terms=(("delta_impulse", "normal_denom", str(contact_type)),),
+    )
+    tangent_votes = [
+        vote(
+            solve_policy,
+            "                    iteration_changed = 1;",
+            flag="iteration_changed",
+            terms=((f"tangent{index}_delta", f"s_diag[tangent{index}]", str(friction_type)),),
+        )
+        for index in (1, 2)
+    ]
     for element in range(elems_per_lane):
         coord = f"lane + {element * 32}" if element else "lane"
         limit_declarations.append(
@@ -26657,7 +26742,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 const float delta_lambda = new_lambda - old_lambda;
                 limit_lower_lambda_{element} = new_lambda;
                 s_v[{coord}] += limit_response_{element} * delta_lambda;
-                if (delta_lambda != 0.0f) iteration_changed = 1;
+{limit_vote}
             }}
             if ((limit_active_{element} & 2) != 0) {{
                 const float residual = -s_v[{coord}] + limit_upper_rhs_{element};
@@ -26666,7 +26751,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 const float delta_lambda = new_lambda - old_lambda;
                 limit_upper_lambda_{element} = new_lambda;
                 s_v[{coord}] -= limit_response_{element} * delta_lambda;
-                if (delta_lambda != 0.0f) iteration_changed = 1;
+{limit_vote}
             }}
         }}"""
         )
@@ -26715,7 +26800,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                     const float delta_impulse = new_impulse - old_impulse;
                     s_lambda[normal] = new_impulse;
                     if (delta_impulse != 0.0f) {{
-                        iteration_changed = 1;
+{normal_vote}
                         s_v[scalar_coord] += normal_y * delta_impulse;
                     }}
                 }}
@@ -26772,11 +26857,11 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 s_lambda[tangent1] = new_tangent1;
                 s_lambda[tangent2] = new_tangent2;
                 if (tangent2_delta != 0.0f) {{
-                    iteration_changed = 1;
+{tangent_votes[1]}
                     s_v[scalar_coord] += tangent2_y * tangent2_delta;
                 }}
                 if (tangent1_delta != 0.0f) {{
-                    iteration_changed = 1;
+{tangent_votes[0]}
                     s_v[scalar_coord] += tangent1_y * tangent1_delta;
                 }}
                 normal = next_normal;
@@ -26931,7 +27016,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                     const float delta_impulse = new_impulse - old_impulse;
                     s_lambda[normal] = new_impulse;
                     if (delta_impulse != 0.0f) {{
-                        iteration_changed = 1;
+{normal_vote}
                         s_v[scalar_coord] += normal_y * delta_impulse;
                     }}
                 }}
@@ -26996,11 +27081,11 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 s_lambda[tangent1] = new_tangent1;
                 s_lambda[tangent2] = new_tangent2;
                 if (tangent2_delta != 0.0f) {{
-                    iteration_changed = 1;
+{tangent_votes[1]}
                     s_v[scalar_coord] += tangent2_y * tangent2_delta;
                 }}
                 if (tangent1_delta != 0.0f) {{
-                    iteration_changed = 1;
+{tangent_votes[0]}
                     s_v[scalar_coord] += tangent1_y * tangent1_delta;
                 }}
                 normal = next_normal;
@@ -27129,6 +27214,18 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 if (patch_load <= 0.0f) row += 2;
             }}"""
 
+    sibling_vote = vote(
+        solve_policy,
+        "                    iteration_changed = 1;",
+        flag="iteration_changed",
+        terms=(("sibling_delta", "s_diag[sibling]", str(friction_type)),),
+    )
+    row_vote = vote(
+        solve_policy,
+        "                iteration_changed = 1;",
+        flag="iteration_changed",
+        terms=(("delta_impulse", "denominator", "row_type"),),
+    )
     sweep_end = sweep_exit(
         solve_policy,
         """        if (global_iteration >= friction_start_iteration
@@ -27286,7 +27383,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 const float sibling_delta = sibling_new - sibling_old;
                 s_lambda[sibling] = sibling_new;
                 if (sibling_delta != 0.0f) {{
-                    iteration_changed = 1;
+{sibling_vote}
                     if (sibling_coord >= 0)
                         s_v[sibling_coord] += sibling_response * sibling_delta;
                 }}
@@ -27295,7 +27392,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
             const float delta_impulse = new_impulse - old_impulse;
             s_lambda[row] = new_impulse;
             if (delta_impulse != 0.0f) {{
-                iteration_changed = 1;
+{row_vote}
                 if (coord >= 0) s_v[coord] += response * delta_impulse;
             }}
             __syncwarp(MASK);
@@ -27435,10 +27532,10 @@ def _get_pgs_solve_sparse_diagonal_kernel(
             solve_policy.arguments,
             dispatch="worlds",
         )
-        kernel._fpgs_solve_readout = True
+        kernel._fpgs_solve_readout = solve_policy.readout
         return kernel
-    pgs_solve_sparse_diagonal_template.__name__ = name
-    pgs_solve_sparse_diagonal_template.__qualname__ = name
+    pgs_solve_sparse_diagonal_template.__name__ = name + solve_policy.suffix
+    pgs_solve_sparse_diagonal_template.__qualname__ = name + solve_policy.suffix
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_sparse_diagonal_template)
 
 
@@ -27756,7 +27853,7 @@ def _get_pgs_solve_mf_gs_kernel(
     if not dense_support_tiles:
         result.mf_native = pgs_solve_mf_gs_native
     if solve_policy.counts:
-        result._fpgs_solve_readout = True
+        result._fpgs_solve_readout = solve_policy.readout
     return result
 
 
@@ -27807,6 +27904,8 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
     MIN_ROWS = int(min_rows)
     if MIN_ROWS < 0 or MIN_ROWS >= AM:
         raise ValueError("min_rows must be in [0, incremental_rows)")
+    if not solve_policy.exact or solve_policy.traces:
+        raise SolvePolicyUnsupported("The incremental sweep keeps the exact law and the plain sweep count")
     ROW_TYPE_MASK = _DENSE_META_ROW_TYPE_MASK
     T_CONTACT = int(PGS_CONSTRAINT_TYPE_CONTACT)
     T_FRICTION = int(PGS_CONSTRAINT_TYPE_FRICTION)
@@ -28302,10 +28401,10 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
             solve_policy.arguments,
             dispatch="parallel",
         )
-        kernel._fpgs_solve_readout = True
+        kernel._fpgs_solve_readout = solve_policy.readout
     else:
-        pgs_solve_mf_gs_incremental_template.__name__ = name
-        pgs_solve_mf_gs_incremental_template.__qualname__ = name
+        pgs_solve_mf_gs_incremental_template.__name__ = name + solve_policy.suffix
+        pgs_solve_mf_gs_incremental_template.__qualname__ = name + solve_policy.suffix
         kernel = wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_incremental_template)
     kernel._fpgs_velocity_limit_law = velocity_limit_law  # recorded as routes.sweep.tiers.velocity_limit_law
     return kernel

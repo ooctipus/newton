@@ -236,7 +236,8 @@ class TestVelocityLimitLawSources(unittest.TestCase):
         The solver builds each matrix-free sweep with ``_velocity_limit_kernel_law()``, so its kernels apply the
         law that ``routes.velocity_limits.law`` reports. A call that omits the argument builds the stateless law
         under either option, as the multi-block solver's dense-tile sweeps
-        (``FEATHER_PGS_MF_MULTIBLOCK_DENSE_TILES=1``) did.
+        (``FEATHER_PGS_MF_MULTIBLOCK_DENSE_TILES=1``) did. A sweep built through ``_sweep_kernel(route, factory,
+        ...)``, which applies the solve policy, is a call of its factory.
         """
         factories = set()
         for name, value in vars(solver_source).items():
@@ -264,6 +265,9 @@ class TestVelocityLimitLawSources(unittest.TestCase):
                 continue
             function = node.func
             name = function.id if isinstance(function, ast.Name) else getattr(function, "attr", None)
+            if name == "_sweep_kernel" and len(node.args) > 1 and isinstance(node.args[1], ast.Name):
+                # _sweep_kernel(route, factory, *args, **kwargs) calls the factory under the solve policy.
+                name = node.args[1].id
             if name not in factories:
                 continue
             calls += 1

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Native sparse sweeps honor an absolute impulse-change tolerance for early exit."""
+"""Native sparse sweeps honor impulse-change and velocity-change tolerances for early exit."""
 
 import unittest
 
@@ -75,7 +75,17 @@ def _build(device, worlds=8):
 
 @unittest.skipUnless(wp.is_cuda_available(), "Native sparse factors are a CUDA path")
 class TestFeatherPGSSparseTolerance(unittest.TestCase):
-    def _rollout(self, iterations, *, tolerance=0.0, relative_tolerance=0.0, steps=12, dt=0.005):
+    def _rollout(
+        self,
+        iterations,
+        *,
+        tolerance=0.0,
+        relative_tolerance=0.0,
+        velocity_tolerance=0.0,
+        readout="off",
+        steps=12,
+        dt=0.005,
+    ):
         device = wp.get_device("cuda:0")
         model, contacts = _build(device)
         solver = SolverFeatherPGS(
@@ -85,6 +95,8 @@ class TestFeatherPGSSparseTolerance(unittest.TestCase):
             pgs_iterations=iterations,
             pgs_change_tolerance=tolerance,
             pgs_relative_change_tolerance=relative_tolerance,
+            pgs_velocity_change_tolerance=velocity_tolerance,
+            pgs_solve_readout=readout,
             friction_anchor_beta=0.0,
         )
         self.assertIsNotNone(solver._sparse_mass_matrix_size)
@@ -113,6 +125,30 @@ class TestFeatherPGSSparseTolerance(unittest.TestCase):
             self._rollout(8, tolerance=-1.0)
         with self.assertRaises(ValueError):
             self._rollout(8, relative_tolerance=1.0)
+
+    def test_velocity_tolerance_stops_earlier_near_the_exact_law(self):
+        """Stay near the exact law in fewer sweeps under a velocity tolerance, with every exit sweep within it."""
+        exact, _ = self._rollout(8)
+        counted, exact_solver = self._rollout(8, readout="sweeps")
+        np.testing.assert_array_equal(counted, exact)
+        again, _ = self._rollout(8, velocity_tolerance=0.0, readout="trace")
+        np.testing.assert_array_equal(again, exact)
+        loose, solver = self._rollout(8, velocity_tolerance=1.0e-3, readout="trace")
+        self.assertLess(float(np.abs(loose - exact).max()), 1.0e-2)
+        law = solver.get_path_selection()["routes"]["sweep"]["exit_law"]
+        self.assertEqual((law["law"], list(law["honored"].values())), ("velocity", ["sparse_pgs"]))
+        (slot,) = solver.get_path_selection()["measurements"]["solve_readout"]["slots"]
+        (exact_slot,) = exact_solver.get_path_selection()["measurements"]["solve_readout"]["slots"]
+        self.assertEqual(slot["solves"], exact_slot["solves"])
+        self.assertLessEqual(slot["mean_sweeps"], exact_slot["mean_sweeps"])
+        trace = slot["trace"]
+        stopped = trace["reasons"]["stationary"] + trace["reasons"]["tolerance"]
+        self.assertGreater(stopped, 0)
+        # A stopped solve's final sweep changed by at most 1e-3 in velocity: magnitude bins up to 10^-2.5.
+        within = sum(sum(entry["bins"][:14]) for entry in trace["final_change"].values())
+        self.assertGreaterEqual(within, stopped)
+        with self.assertRaises(ValueError):
+            self._rollout(8, velocity_tolerance=-1.0)
 
 
 if __name__ == "__main__":

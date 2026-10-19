@@ -164,8 +164,11 @@ _EFFECTIVE = {
     "velocity_limit_law": lambda solver: solver._velocity_limit_sweep_law()[0],
     # The largest budget of the built linked (patch) tiers; 0 without them.
     "mf_gs_parallel_linked_sweeps": _linked_tier_sweeps,
-    # A readout applies only where a sweep kernel carries its counters.
+    # A readout applies only where a sweep kernel carries its counters, the velocity law where a sweep compiles it.
     "pgs_solve_readout": lambda solver: solver.pgs_solve_readout if solver._solve_readout.kernels else "off",
+    "pgs_velocity_change_tolerance": lambda solver: (
+        solver.pgs_velocity_change_tolerance if solver._solve_policy_honored else 0.0
+    ),
 }
 
 
@@ -810,6 +813,7 @@ def _sweep(solver, source) -> dict:
         "propagation": propagation,
     }
     record["readout"] = _readout(solver, record)
+    record["exit_law"] = _exit_law(solver, record)
     return record
 
 
@@ -845,6 +849,40 @@ def _readout(solver, record) -> dict:
         "mode": solver.pgs_solve_readout if counted else "off",
         "counted": dict(sorted(counted.items())),
         "uncounted": uncounted if counted else [],
+        "reason": reason,
+    }
+
+
+def _exit_law(solver, record) -> dict:
+    """Which sweep kernels of the route stop under the velocity law (``pgs_velocity_change_tolerance``), and why not."""
+    tolerance = float(solver.pgs_velocity_change_tolerance)
+    honored = dict(sorted(solver._solve_policy_honored.items()))
+    declined = dict(sorted(solver._solve_policy_declined.items()))
+    ignored = sorted(_sweep_kernels(record) - honored.keys() - declined.keys())
+    if record["response_block"]:
+        ignored.append("response_block")
+    driver_honors = record["driver"] in ("direct", "contact_then_internal")
+    if tolerance == 0.0:
+        reason = "pgs_velocity_change_tolerance is 0: every sweep keeps the exact stationary-sweep law."
+    elif not honored:
+        reason = "No sweep of this route compiles the velocity law; every sweep keeps the exact law."
+    elif not driver_honors:
+        reason = (
+            f"The {record['driver']} driver runs part of a solve per launch, so a sweep's exit cannot end the solve."
+        )
+    else:
+        reason = (
+            "Honored sweeps stop a world once every velocity-scaled change of a sweep is within the tolerance; "
+            "declined sweeps keep the exact law, ignored ones their fixed iteration count or own tolerance."
+        )
+    return {
+        "law": "velocity" if tolerance > 0.0 and honored else "exact",
+        "velocity_change_tolerance": json_value(tolerance),
+        "honored": honored,
+        # Variants that could not compile the requested law or trace keep the exact law (and a plain count).
+        "declined": declined,
+        "ignored": ignored if tolerance > 0.0 else [],
+        "driver_honors": driver_honors,
         "reason": reason,
     }
 
