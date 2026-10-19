@@ -187,12 +187,15 @@ class TestVariantComparison(unittest.TestCase):
             "mf_gs_parallel_rows": 64,
             "mf_gs_parallel_matrix_free": False,
             "mf_gs_parallel_sweeps": 4,
+            "mf_gs_parallel_linked_sweeps": "auto",
+            "mf_gs_parallel_linked_sweeps_applied": 0,
         }
         run = {"variant": "candidate"}
         checks = {"boundaries": [{"solver_recipe": dict(recipe)} for _ in range(2)]}
         actual, invariant = driver.checked_recipe(args, run, checks, 4)
         self.assertEqual(actual, recipe)
         self.assertNotIn("pgs_mode", invariant)
+        self.assertNotIn("mf_gs_parallel_linked_sweeps", invariant)
         self.assertEqual(invariant["mf_gs_parallel_sweeps"], 4)
         checks["boundaries"][1]["solver_recipe"]["mf_gs_parallel_sweeps"] = 3
         with self.assertRaisesRegex(RuntimeError, "recipe changed"):
@@ -201,12 +204,17 @@ class TestVariantComparison(unittest.TestCase):
         args.solver_recipes["candidate"]["pgs_mode"] = "matrix_free"
         with self.assertRaisesRegex(RuntimeError, "requested solver recipe"):
             driver.checked_recipe(args, run, checks, 4)
+        args.solver_recipes["candidate"]["pgs_mode"] = "split"
+        for name, value in (("mf_gs_parallel_linked_sweeps", "fast"), ("mf_gs_parallel_linked_sweeps_applied", None)):
+            checks["boundaries"][0]["solver_recipe"] = {**recipe, name: value}
+            with self.assertRaisesRegex(RuntimeError, "recipe metadata"):
+                driver.checked_recipe(args, run, checks, 4)
         del checks["boundaries"][0]["solver_recipe"]
         with self.assertRaisesRegex(RuntimeError, "recipe metadata"):
             driver.checked_recipe(args, run, checks, 4)
 
     def test_parallel_recipe_cannot_silently_raise_iteration_budget(self):
-        """Require explicitly enabled parallel sweeps to retain the task allowance."""
+        """Require explicitly enabled parallel sweeps, linked tiers' included, to retain the task allowance."""
         args = driver.parse_args([*self.argv, "--candidate-solver-attr", "mf_gs_parallel_rows=128"])
         recipe = {
             "grouped_dynamics": False,
@@ -215,6 +223,8 @@ class TestVariantComparison(unittest.TestCase):
             "mf_gs_parallel_rows": 128,
             "mf_gs_parallel_matrix_free": False,
             "mf_gs_parallel_sweeps": 24,
+            "mf_gs_parallel_linked_sweeps": "auto",
+            "mf_gs_parallel_linked_sweeps_applied": 0,
         }
         checks = {"boundaries": [{"solver_recipe": dict(recipe)} for _ in range(2)]}
         with self.assertRaisesRegex(RuntimeError, "parallel sweeps"):
@@ -228,6 +238,43 @@ class TestVariantComparison(unittest.TestCase):
         self.assertEqual(
             driver.checked_recipe(args, {"variant": "candidate"}, checks, 8)[0]["mf_gs_parallel_sweeps"], 8
         )
+        # Patch-friction (linked) tiers that sweep the "auto" budget raise the allowance the point tiers keep; at
+        # the allowance (FEATHER_PGS_PATCH_PARALLEL_SWEEPS=8) they retain it.
+        for applied, allowed in ((30, False), (8, True)):
+            for boundary in checks["boundaries"]:
+                boundary["solver_recipe"]["mf_gs_parallel_linked_sweeps_applied"] = applied
+            if allowed:
+                actual, invariant = driver.checked_recipe(args, {"variant": "candidate"}, checks, 8)
+                self.assertEqual(actual["mf_gs_parallel_linked_sweeps_applied"], 8)
+                # The selecting arm's own budget is checked here, not compared with the other arm's.
+                self.assertNotIn("mf_gs_parallel_linked_sweeps_applied", invariant)
+            else:
+                with self.assertRaisesRegex(RuntimeError, "parallel sweeps"):
+                    driver.checked_recipe(args, {"variant": "candidate"}, checks, 8)
+
+    def test_unselected_linked_budget_is_a_shared_physics_budget(self):
+        """Fingerprint the applied linked budget when no arm selects the tiers, and never the revision's request."""
+        args = driver.parse_args(self.argv)
+        recipe = {
+            "grouped_dynamics": False,
+            "lazy_kinematics": True,
+            "pgs_mode": "matrix_free",
+            "mf_gs_parallel_rows": 128,
+            "mf_gs_parallel_matrix_free": True,
+            "mf_gs_parallel_sweeps": 24,
+            "mf_gs_parallel_linked_sweeps": None,
+            "mf_gs_parallel_linked_sweeps_applied": 0,
+        }
+        invariants = []
+        for request, applied in ((None, 0), ("auto", 0), ("auto", 90)):
+            arm = {**recipe, "mf_gs_parallel_linked_sweeps": request, "mf_gs_parallel_linked_sweeps_applied": applied}
+            checks = {"boundaries": [{"solver_recipe": dict(arm)} for _ in range(2)]}
+            invariants.append(driver.checked_recipe(args, {"variant": "candidate"}, checks, 12)[1])
+        # A revision without the option and one with it agree while neither builds linked tiers; a candidate whose
+        # recipe now builds them at 90 sweeps differs, so the comparison refuses it.
+        self.assertEqual(invariants[0], invariants[1])
+        self.assertNotEqual(invariants[1], invariants[2])
+        self.assertEqual(invariants[2]["mf_gs_parallel_linked_sweeps_applied"], 90)
 
     def test_physics_and_wall_medians_remain_distinct(self):
         """Reject partial/nonfinite data and never substitute graph gain for wall gain."""
@@ -324,6 +371,8 @@ class TestVariantComparison(unittest.TestCase):
                         "mf_gs_parallel_rows": 64,
                         "mf_gs_parallel_matrix_free": False,
                         "mf_gs_parallel_sweeps": 4,
+                        "mf_gs_parallel_linked_sweeps": "auto",
+                        "mf_gs_parallel_linked_sweeps_applied": 0,
                     },
                 }
                 for i in range(2)

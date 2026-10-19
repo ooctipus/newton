@@ -30,6 +30,17 @@ RECIPE_TYPES = {
     "mf_gs_parallel_matrix_free": bool,
     "mf_gs_parallel_sweeps": int,
 }
+# Recorded with the recipe, never selected: the linked (patch-friction) tiers' budget request after its environment
+# override (None, "auto" or a count), and the largest budget the built linked tiers sweep (0 without them).
+LINKED_SWEEPS = "mf_gs_parallel_linked_sweeps"
+LINKED_SWEEPS_APPLIED = "mf_gs_parallel_linked_sweeps_applied"
+
+
+def linked_sweeps_recorded(recipe: dict) -> bool:
+    """Require both linked-budget fields: a request of None, "auto" or a count, and an applied count."""
+    request, applied = recipe.get(LINKED_SWEEPS), recipe.get(LINKED_SWEEPS_APPLIED)
+    valid_request = request is None or request == "auto" or (type(request) is int and request >= 1)
+    return LINKED_SWEEPS in recipe and valid_request and type(applied) is int and applied >= 0
 
 
 def recipe_attributes(entries: list[str]) -> dict:
@@ -56,7 +67,9 @@ def checked_recipe(args, run: dict, checks: dict, iterations: int) -> tuple[dict
     """Verify actual per-arm settings and retain all nonselected invariants."""
     recipes = [boundary.get("solver_recipe") for boundary in checks["boundaries"]]
     if len(recipes) != 2 or any(
-        not isinstance(recipe, dict) or any(type(recipe.get(name)) is not kind for name, kind in RECIPE_TYPES.items())
+        not isinstance(recipe, dict)
+        or any(type(recipe.get(name)) is not kind for name, kind in RECIPE_TYPES.items())
+        or not linked_sweeps_recorded(recipe)
         for recipe in recipes
     ):
         raise RuntimeError("Missing or invalid actual solver recipe metadata")
@@ -66,17 +79,24 @@ def checked_recipe(args, run: dict, checks: dict, iterations: int) -> tuple[dict
     requested = args.solver_recipes[run["variant"]]
     if any(actual[name] != value for name, value in requested.items()):
         raise RuntimeError("Actual solver differs from the requested solver recipe")
+    # Linked tiers sweep their own budget ("auto" by default), so an explicit parallel arm holds it to the
+    # allowance too: set FEATHER_PGS_PATCH_PARALLEL_SWEEPS to pgs_iterations on such an arm.
     if (
         actual["pgs_mode"] == "matrix_free"
         and actual["mf_gs_parallel_rows"] > 0
         and (
             requested.get("pgs_mode") == "matrix_free" or any(name.startswith("mf_gs_parallel_") for name in requested)
         )
-        and actual["mf_gs_parallel_sweeps"] != iterations
+        and (actual["mf_gs_parallel_sweeps"] != iterations or actual[LINKED_SWEEPS_APPLIED] not in (0, iterations))
     ):
         raise RuntimeError("Explicit parallel sweeps must match the unchanged pgs_iterations budget")
     selected = set().union(*args.solver_recipes.values())
-    return actual, {name: value for name, value in actual.items() if name not in selected}
+    # The request is each revision's own default; the applied linked budget is the physics budget both arms share,
+    # unless an arm selects the parallel tiers and the check above holds its budget to the allowance.
+    excluded = selected | {LINKED_SWEEPS}
+    if any(name == "pgs_mode" or name.startswith("mf_gs_parallel_") for name in selected):
+        excluded.add(LINKED_SWEEPS_APPLIED)
+    return actual, {name: value for name, value in actual.items() if name not in excluded}
 
 
 def arm_order(rounds: int):

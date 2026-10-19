@@ -10,6 +10,11 @@ they are labeled baseline/candidate, not FPGS/MJWarp. It requires exactly two
 selected GPUs, starts them simultaneously for each arm, alternates AB/BA rounds,
 and reuses this directory's checked capture, source/idle guards and child-group
 cleanup. No unchecked route or arbitrary solver-attribute override is exposed.
+An arm that selects the parallel tiers (`pgs_mode=matrix_free` or an
+`mf_gs_parallel_*` attribute) must keep every tier at the `pgs_iterations`
+allowance. Linked (patch-friction) tiers sweep `mf_gs_parallel_linked_sweeps`,
+`"auto"` by default, so set `FEATHER_PGS_PATCH_PARALLEL_SWEEPS` to the iteration
+count on such an arm; otherwise both arms must build the same linked budget.
 Example reproducing the structural Keyboard experiment:
 
 ```sh

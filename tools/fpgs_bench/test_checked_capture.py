@@ -726,9 +726,28 @@ class TestCheckedCapture(unittest.TestCase):
         solver._fused_k1 = True
         solver._grouped_topology = object()
         checked.check_solver("feather_pgs", solver, entry)
+        # A revision without linked tier budgets records no request and no applied budget.
+        expected.update(mf_gs_parallel_linked_sweeps=None, mf_gs_parallel_linked_sweeps_applied=0)
         self.assertEqual(entry["solver_recipe"], expected)
         self.assertTrue(entry["solver_paths"]["fused_k1"])
         self.assertTrue(entry["solver_paths"]["grouped_topology"])
+
+    def test_fpgs_linked_tier_budget_is_recorded(self):
+        """Record the linked tiers' budget request and the budget the built tiers sweep, which may exceed the rest."""
+        solver = fpgs()
+        solver.mf_gs_parallel_sweeps, solver.mf_gs_parallel_linked_sweeps = 24, "auto"
+        selection = {"options": {"mf_gs_parallel_linked_sweeps": {"applied": 90, "requested": "auto"}}}
+        solver.get_path_selection = Mock(return_value=selection)
+        entry = {}
+        checked.check_solver("feather_pgs", solver, entry)
+        recipe = entry["solver_recipe"]
+        self.assertEqual((recipe["mf_gs_parallel_sweeps"], recipe["mf_gs_parallel_linked_sweeps"]), (24, "auto"))
+        self.assertEqual(recipe["mf_gs_parallel_linked_sweeps_applied"], 90)
+        solver.get_path_selection.assert_called_once_with()
+        # Without linked tiers the record applies no linked budget.
+        selection["options"]["mf_gs_parallel_linked_sweeps"]["applied"] = 0
+        checked.check_solver("feather_pgs", solver, entry)
+        self.assertEqual(entry["solver_recipe"]["mf_gs_parallel_linked_sweeps_applied"], 0)
 
     def test_fpgs_failure_records_flags_before_raising(self):
         """Retain overflow evidence and reject even a defective no-op checker."""

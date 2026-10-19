@@ -374,6 +374,20 @@ def fused_contact_metadata(solver) -> dict:
     return result
 
 
+def linked_tier_sweeps(solver) -> int:
+    """Return the largest sweep budget of the built linked (patch-friction) tiers, 0 without them.
+
+    Linked tiers sweep ``mf_gs_parallel_linked_sweeps`` (``"auto"`` by default), not
+    ``mf_gs_parallel_sweeps``; the solver's options record holds the applied budget.
+    A revision without the option builds no linked tier budget of its own.
+    """
+    select = getattr(solver, "get_path_selection", None)
+    if not callable(select):
+        return 0
+    option = select().get("options", {}).get("mf_gs_parallel_linked_sweeps")
+    return 0 if option is None else int(option["applied"])
+
+
 def check_solver(physics: str, solver, entry: dict) -> None:
     """Publish flag details before raising; never clear or change solver state."""
     entry["solver_class"] = type(solver).__name__
@@ -389,8 +403,10 @@ def check_solver(physics: str, solver, entry: dict) -> None:
                 "mf_gs_parallel_rows",
                 "mf_gs_parallel_matrix_free",
                 "mf_gs_parallel_sweeps",
+                "mf_gs_parallel_linked_sweeps",
             )
         }
+        entry["solver_recipe"]["mf_gs_parallel_linked_sweeps_applied"] = linked_tier_sweeps(solver)
         entry["solver_paths"] = {
             "fused_k1": bool(getattr(solver, "_fused_k1", False)),
             "grouped_topology": getattr(solver, "_grouped_topology", None) is not None,
