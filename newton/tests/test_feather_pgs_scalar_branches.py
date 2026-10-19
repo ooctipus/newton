@@ -1414,11 +1414,16 @@ def _arm_within(test, reference, actual, bodies, tag, *, again=None):
     _assert_switch_within(test, tag, _excess(actual, reference.numpy()[bodies]), spread, ARM_FLOOR)
 
 
-def _normal_impulses(test, solver, count):
-    """The solved normal impulse [N·s] of each of the first ``count`` contacts, in contact order."""
+def _contact_rows(test, solver, count):
+    """The ``(world, slot)`` normal row of each of the first ``count`` contacts, in contact order."""
     world, slot = solver.contact_world.numpy()[:count], solver.contact_slot.numpy()[:count]
     test.assertTrue(np.all(slot >= 0), "every held contact owns a row")
-    return solver.impulses.numpy()[world, slot].astype(np.float64)
+    return world, slot
+
+
+def _normal_impulses(test, solver, count):
+    """The solved normal impulse [N·s] of each of the first ``count`` contacts, in contact order."""
+    return solver.impulses.numpy()[_contact_rows(test, solver, count)].astype(np.float64)
 
 
 def _key_law(model, leaves, dofs, axes, q, qd, steps, push=None):
@@ -1451,7 +1456,7 @@ def _key_law(model, leaves, dofs, axes, q, qd, steps, push=None):
     return np.asarray(coordinates)
 
 
-def _press_key_with_tip(model, layout, solver, *, shift=0.0, steps=12):
+def _press_key_with_tip(test, model, layout, solver, *, shift=0.0, steps=12):
     """Press every world's fifth key with its arm's tip through a held contact while 2 N push the tip down.
 
     ``shift`` raises the tip's contact witness along the contact normal [m]. Returns the contacts'
@@ -1480,13 +1485,11 @@ def _press_key_with_tip(model, layout, solver, *, shift=0.0, steps=12):
         current.body_f.assign(force)
         solver.step(current, following, control, contacts, DT)
         states = [following, current]
-        world, slot = solver.contact_world.numpy()[: len(pairs)], solver.contact_slot.numpy()[: len(pairs)]
-        if np.any(slot < 0):
-            raise AssertionError("Every held contact must own a row")
-        impulses.append(solver.impulses.numpy()[world, slot].astype(np.float64))
+        rows = _contact_rows(test, solver, len(pairs))
+        impulses.append(solver.impulses.numpy()[rows].astype(np.float64))
         travel.append(following.joint_q.numpy()[coordinates].astype(np.float64))
         if diagonal is None:
-            diagonal = solver.diag.numpy()[world, slot].astype(np.float64)
+            diagonal = solver.diag.numpy()[rows].astype(np.float64)
     return {"impulses": np.asarray(impulses), "travel": np.asarray(travel), "diagonal": diagonal, "extent": extent}
 
 
@@ -1554,7 +1557,7 @@ class TestGripperContactBound(unittest.TestCase):
                 getattr(model, name).assign(values)
         model.rigid_contact_max = model.world_count
         solver = recipe_solver(model, scalar=False, prismatic=False, pgs_mode="split", pgs_iterations=iterations)
-        return solver, _press_key_with_tip(model, layout, solver, shift=shift)
+        return solver, _press_key_with_tip(self, model, layout, solver, shift=shift)
 
     def test_bound_admits_float_order_and_refuses_defects(self):
         """Admit a one-spacing displacement of the tip under the press bound and refuse defects in the keys' response.
@@ -2042,7 +2045,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         reference = recipe_solver(model, scalar=False, pgs_iterations=GRIPPER_REFERENCE_ITERATIONS)
         self.assertIsNone(reference._tree_kinetic_state)
         self.assertTrue(reference._prismatic_linear_state)
-        presses = [_press_key_with_tip(model, layout, solver) for solver in (head, scalar, reference)]
+        presses = [_press_key_with_tip(self, model, layout, solver) for solver in (head, scalar, reference)]
         _assert_gripper_switch(self, *presses, beta=head.pgs_beta, dt=DT)
 
     def test_mixed_leaves_follow_ordinary_dynamics(self):
