@@ -303,7 +303,7 @@ def _tree_group(group) -> dict:
         # On CUDA, a repair of more blocks than two listed grids lists the blocks that repair (and
         # compare) and repairs over the list: always inside a capture, eagerly when the groups should
         # be stamped with the input bank or compared (FEATHER_PGS_TREE_REPAIR_CLASSIFY=0 keeps one
-        # launch per block).
+        # launch per block; motion-velocity layouts always do).
         "classify_first": bool(group.classify_first),
         # How each repair of the latest graph capture was recorded, in order: "skipped", "one_pass" or
         # "classified", with "_compared" when it compares input banks; empty before any capture.

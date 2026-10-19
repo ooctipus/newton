@@ -167,6 +167,16 @@ class TreeKineticState:
     of launching a block per group that mostly confirms its cache: inside a
     capture, and eagerly when the groups are expected to be stamped with the
     input bank or compared with the output bank.
+
+    Motion-velocity layouts keep the one-pass repair. Their repair launches on
+    every step, and a group exits early only when, besides the conditions
+    above, the step's velocity prescale (computed after the last finish) left
+    each of its velocities unchanged, as it does for an articulation within
+    every joint velocity limit. A classification would add a list clear and a
+    launch to every step to skip at most the one-pass launch's early exits:
+    on a 16384-group velocity-limited chain, the classification and the listed
+    repair took as long as the one-pass repair, and the two extra graph nodes
+    per step cost 36 us per eight steps.
     """
 
     def __init__(
@@ -205,7 +215,7 @@ class TreeKineticState:
         # step recomputes after the finish; its launches always run.
         self.skip_captured_repairs = bool(skip) and not self.motion_velocity
         # The CPU twin keeps the one-pass repair; _bind_kernels sets classify_first
-        # from this and the launch size of the bound layout.
+        # from this, the motion contract and the launch size of the bound layout.
         self._classify_switch = bool(classify) and device.is_cuda
         # (capture id, whether the finish computed the next geometry) of the last
         # finish inside a capture; the next begin consumes it.
@@ -425,9 +435,13 @@ class TreeKineticState:
         on_cpu = self.solver.model.device.is_cpu
         self.block_dim = max(layout.block, self._chain_block_dim)
         self.launch_count = self.group_count // layout.pack
-        # Only a launch of more blocks than _CLASSIFIED_GRIDS listed grids is classified.
+        # Only a launch of more blocks than _CLASSIFIED_GRIDS listed grids is classified, and
+        # never a motion-velocity layout's, which repairs on every step (see the class docstring).
         self.classify_first = (
-            self._classify_switch and 0 < self._repair_grid and self._classify_above < self.launch_count
+            self._classify_switch
+            and not self.motion_velocity
+            and 0 < self._repair_grid
+            and self._classify_above < self.launch_count
         )
         self.repair_kernel = native.get_state_kernel(
             False,
@@ -460,15 +474,13 @@ class TreeKineticState:
             )
         self.classify_kernel = self.listed_repair_kernel = None
         if self.classify_first:
-            self.classify_kernel = native.get_classify_kernel(
-                self.chain_scan, layout=layout, motion_velocity=self.motion_velocity
-            )
+            # Ordinary motion only: classify_first excludes motion-velocity layouts.
+            self.classify_kernel = native.get_classify_kernel(self.chain_scan, layout=layout)
             self.listed_repair_kernel = native.get_state_kernel(
                 False,
                 self.chain_scan,
                 layout=layout,
                 body_velocity=self._body_velocity,
-                motion_velocity=self.motion_velocity,
                 listed=True,
                 reference=self.reference,
                 clocked=self.clocked,

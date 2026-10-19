@@ -680,7 +680,7 @@ FLAGS = declare(
         "policy",
         ("tree_kinetic_owner",),
         "=0 keeps the one-pass held-tree repair launch (default 1 on CUDA: list the blocks to repair, then repair "
-        "over the list on a capped grid).",
+        "over the list on a capped grid; motion-velocity layouts always launch one pass).",
     ),
     _flag(
         "FEATHER_PGS_TREE_REPAIR_SKIP",
