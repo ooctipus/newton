@@ -886,7 +886,11 @@ def _readout(solver, record) -> dict:
     elif record["driver"] == "contact_then_internal":
         reason = "Contact and internal rows sweep in separate launches, so a solve counts once per launch."
     else:
-        reason = f"The {record['driver']} driver runs part of a solve per launch, so counts are per launch."
+        reason = (
+            f"The {record['driver']} driver runs part of a solve per launch, so counts are per launch; a launch "
+            "whose row phase holds none of a world's rows can return before its first sweep, which counts that "
+            "world in no slot and not as skipped."
+        )
     if uncounted_worlds:
         reason += (
             " The owners in uncounted_worlds solve whole worlds without counters: those solves are in no slot "

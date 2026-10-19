@@ -885,10 +885,22 @@ class TestSweepPolicyRecords(unittest.TestCase):
                 json.dumps(sweep, allow_nan=False)
 
     def test_phase_launches_count_once_each(self):
-        """Say that a contact-then-internal solve counts once per row-phase launch."""
+        """Say that a contact-then-internal solve counts once per row-phase launch.
+
+        A driver that launches one row phase at a time counts per launch too, and its sweeps
+        return before their first sweep for a world without rows of the launch's phase (the
+        matrix-free sweep at the velocity-limit phase, the incremental tier at the drive-and-limit,
+        contact and velocity-limit phases), so the record says that such a launch counts the world
+        nowhere.
+        """
         record = _sweep_record(driver="contact_then_internal")
         self.assertIn("once per launch", path_selection._readout(_policy_solver(), record)["reason"])
         self.assertIn("solves its worlds", path_selection._readout(_policy_solver(), _sweep_record())["reason"])
+        for driver in ("physx_grasp", "propagation_phases", "multiblock"):
+            with self.subTest(driver=driver):
+                reason = path_selection._readout(_policy_solver(), _sweep_record(driver=driver))["reason"]
+                self.assertIn("counts are per launch", reason)
+                self.assertIn("in no slot and not as skipped", reason)
 
     def test_records_name_the_worlds_no_counter_counts(self):
         """Name each owner that solves whole worlds without counters, and none where counted sweeps own every world.

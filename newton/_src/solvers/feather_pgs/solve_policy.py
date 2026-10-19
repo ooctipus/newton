@@ -581,9 +581,14 @@ class SolveReadoutRecord:
         counters, the ``solves`` of worlds without dense, matrix-free or
         propagation rows, which entered no sweep, and the number of ``worlds``
         they came from: the matrix-free sweeps return before their first sweep
-        for such a world, so no slot counts it. Each solve of a world that a
-        counted sweep owns is counted once, by a slot or here; the worlds that
-        sweeps without counters own, which hold rows, are counted by neither
+        for such a world, so no slot counts it. Under the direct driver
+        (``routes.sweep.driver``) each solve of a world that a counted sweep
+        owns is counted once, by a slot or here, and under the
+        contact-then-internal driver once per launch. Drivers that launch one
+        row phase at a time count per launch, and a launch whose phase holds
+        none of a world's rows can return before its first sweep, which counts
+        that world nowhere. The worlds that sweeps without counters own, which
+        hold rows, are counted by neither
         (``routes.sweep.readout.uncounted_worlds``).
         """
         slots = []
