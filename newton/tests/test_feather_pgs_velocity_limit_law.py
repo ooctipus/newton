@@ -325,7 +325,11 @@ class TestVelocityLimitLawOption(unittest.TestCase):
         self.assertEqual(explicit.get_path_selection()["options"]["velocity_limit_law"]["source"], "argument")
         with mock.patch.dict(os.environ, {_LAW_FLAG: "stateless"}):
             self.assertEqual(SolverFeatherPGS(model, velocity_limit_law="accumulated").velocity_limit_law, "stateless")
-        with mock.patch.dict(os.environ, {_LAW_FLAG: "clamped"}), self.assertRaisesRegex(ValueError, "clamped"):
+        # An unknown law names the variable that supplied it, not the argument.
+        with (
+            mock.patch.dict(os.environ, {_LAW_FLAG: "clamped"}),
+            self.assertRaisesRegex(ValueError, f"^{_LAW_FLAG} must be one of .*, got 'clamped'$"),
+        ):
             SolverFeatherPGS(model)
 
 

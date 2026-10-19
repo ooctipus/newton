@@ -30,14 +30,18 @@ the generated sources of the stateless law byte-identical.
 VELOCITY_LIMIT_LAWS = ("stateless", "accumulated")
 
 
-def check_velocity_limit_law(law: str) -> str:
+def check_velocity_limit_law(law: str, *, source: str = "velocity_limit_law") -> str:
     """Return ``law`` when it names a velocity-limit law.
+
+    Args:
+        law: The requested law.
+        source: The argument or environment variable that supplied ``law``, named in the error.
 
     Raises:
         ValueError: If ``law`` is not one of :data:`VELOCITY_LIMIT_LAWS`.
     """
     if law not in VELOCITY_LIMIT_LAWS:
-        raise ValueError(f"velocity_limit_law must be one of {VELOCITY_LIMIT_LAWS}, got {law!r}")
+        raise ValueError(f"{source} must be one of {VELOCITY_LIMIT_LAWS}, got {law!r}")
     return law
 
 

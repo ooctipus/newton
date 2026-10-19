@@ -2296,8 +2296,11 @@ class SolverFeatherPGS(SolverBase):
         self.pgs_warmstart_decay = requested_pgs_decay if pgs_warmstart or not legacy_mf_warmstart else legacy_mf_decay
         # FEATHER_PGS_VELOCITY_LIMIT_LAW overrides the argument, so recipes select the law without code changes.
         check_velocity_limit_law(velocity_limit_law)
-        self.velocity_limit_law = check_velocity_limit_law(
-            os.environ.get("FEATHER_PGS_VELOCITY_LIMIT_LAW") or velocity_limit_law
+        environment_law = os.environ.get("FEATHER_PGS_VELOCITY_LIMIT_LAW")
+        self.velocity_limit_law = (
+            check_velocity_limit_law(environment_law, source="FEATHER_PGS_VELOCITY_LIMIT_LAW")
+            if environment_law
+            else velocity_limit_law
         )
         # FEATHER_PGS_PATCH_PARALLEL_SWEEPS overrides the argument, so recipes set the linked tiers' budget.
         requested_linked_sweeps = _linked_sweeps_request(mf_gs_parallel_linked_sweeps, "mf_gs_parallel_linked_sweeps")
