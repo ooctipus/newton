@@ -3723,7 +3723,8 @@ class NarrowPhase:
             if self._heightfield_pair_csr:
                 midphase_kernel = self._pair_csr.midphase
                 midphase_outputs.append(self._pair_csr.triangle_pair)
-            if self._heightfield_lane_midphase:
+            # The lane passes replace only the packed per-pair launch.
+            if self._heightfield_lane_midphase and self._heightfield_packed_pairs:
                 self._launch_lane_midphase(
                     device,
                     shape_types,

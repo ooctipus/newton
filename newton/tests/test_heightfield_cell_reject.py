@@ -15,6 +15,7 @@ import warp as wp
 
 import newton
 from newton._src.geometry import heightfield_cells
+from newton._src.geometry.collision_core import ENABLE_TILE_BVH_QUERY
 from newton._src.geometry.heightfield_cells import _cell_is_above
 from newton._src.geometry.narrow_phase import NarrowPhase
 from newton._src.utils import heightfield as original_heightfield
@@ -151,8 +152,27 @@ def _model(
     return builder.finalize(device=device)
 
 
-def _collide(model, *, legacy=False, speculative=False, packed=None, midphase=None, reduce_contacts=False):
+def _collide(
+    model,
+    *,
+    legacy=False,
+    speculative=False,
+    packed=None,
+    midphase=None,
+    reduce_contacts=False,
+    lanes=None,
+    schedule=None,
+    launches=None,
+):
+    """Collide once and return the pipeline and the physical contact geometry.
+
+    ``lanes=False`` builds the pipeline with the one-pass packed midphase,
+    ``schedule`` forces the lane midphase's ``(small_cells, lanes)`` and
+    ``launches`` collects the ``(kernel key, dim)`` of every midphase launch.
+    """
     reference = {"NEWTON_HEIGHTFIELD_CELL_REJECT": "0"} if legacy or midphase is not None else {}
+    if lanes is not None:
+        reference["NEWTON_HEIGHTFIELD_LANE_MIDPHASE"] = str(int(lanes))
     with patch.dict(os.environ, reference):
         pipeline = newton.CollisionPipeline(
             model,
@@ -169,6 +189,8 @@ def _collide(model, *, legacy=False, speculative=False, packed=None, midphase=No
         pipeline.narrow_phase._heightfield_packed_pairs = packed
     if midphase is not None:
         pipeline.narrow_phase._heightfield_packed_pairs = False
+    if schedule is not None:
+        pipeline.narrow_phase._heightfield_lane_small_cells, pipeline.narrow_phase._heightfield_lane_width = schedule
     contacts = pipeline.contacts()
     state = model.state()
     if speculative:
@@ -180,7 +202,17 @@ def _collide(model, *, legacy=False, speculative=False, packed=None, midphase=No
         if midphase is not None
         else nullcontext()
     )
-    with override:
+    launch = wp.launch
+
+    def observe(*args, **kwargs):
+        kernel = kwargs.get("kernel", args[0] if args else None)
+        key = getattr(kernel, "key", "")
+        if "overlaps" in key:
+            launches.append((key, kwargs.get("dim")))
+        return launch(*args, **kwargs)
+
+    spy = patch.object(wp, "launch", side_effect=observe) if launches is not None else nullcontext()
+    with override, spy:
         pipeline.collide(state, contacts, dt=0.01 if speculative else None)
     count = int(contacts.rigid_contact_count.numpy()[0])
     assert count <= contacts.rigid_contact_max
@@ -327,24 +359,62 @@ class TestHeightfieldCellReject(unittest.TestCase):
         self.assertEqual(int(default.narrow_phase.triangle_pairs_count.numpy()[0]), 0)
         self.assertEqual(len(geometry[0]), 0)
 
+    def collide_arms(self, model, **options):
+        """Collide on every midphase launch route and check which kernels each route launched.
+
+        Returns ``{arm: (pipeline, geometry)}`` for the lane passes with the device's
+        schedule and with every window deferred, the one-pass packed launch and the
+        tiled launch.
+        """
+        arms = {
+            "lanes": {},
+            "lanes_deferred": {"schedule": (0, 4)},
+            "packed": {"lanes": False},
+            "tiled": {"packed": False},
+        }
+        results = {}
+        for arm, choice in arms.items():
+            launches = []
+            pipeline, geometry = _collide(model, launches=launches, **choice, **options)
+            narrow = pipeline.narrow_phase
+            stem = "heightfield_cell_overlaps"
+            if arm.startswith("lanes"):
+                expected = [f"{stem}_pairs"]
+                if narrow._heightfield_lane_small_cells >= 0:
+                    expected.append(f"{stem}_lanes")
+                self.assertEqual([key for key, _dim in launches], expected)
+            else:
+                second = narrow.tile_size_mesh_convex if ENABLE_TILE_BVH_QUERY else 1
+                dim = [narrow.total_num_threads, 1] if arm == "packed" else [narrow.num_tile_blocks, second]
+                self.assertEqual(launches, [(f"{stem}_kernel", dim)])
+            if arm == "lanes_deferred":
+                # Every pair with a cell was handed to the lane pass.
+                deferred = narrow._heightfield_lane_deferred
+                stored = min(int(deferred.count.numpy()[0]), deferred.windows.shape[0])
+                self.assertEqual(stored, int(deferred.count.numpy()[0]))
+                self.assertGreater(stored, 0)
+            results[arm] = (pipeline, geometry)
+        return results
+
     def test_packed_and_tiled_rejection(self):
-        """Use identical cell rejection and contact geometry in both launch routes."""
+        """Use identical cell rejection and contact geometry in every launch route."""
         for z in (0.2, 0.02):
             with self.subTest(z=z):
                 model = _model(device=self.device, z=z)
-                packed, a = _collide(model, packed=True)
-                tiled, b = _collide(model, packed=False)
-                self.assertEqual(
-                    int(packed.narrow_phase.triangle_pairs_count.numpy()[0]),
-                    int(tiled.narrow_phase.triangle_pairs_count.numpy()[0]),
-                )
-                if z == 0.2:
-                    self.assertEqual(int(tiled.narrow_phase.triangle_pairs_count.numpy()[0]), 0)
-                    self.assertEqual(len(a[0]), 0)
-                    self.assertEqual(len(b[0]), 0)
-                else:
-                    self.assertGreater(len(a[0]), 0)
-                    self.assert_geometry_equal(a, b)
+                arms = self.collide_arms(model)
+                counts = {
+                    arm: int(owner.narrow_phase.triangle_pairs_count.numpy()[0]) for arm, (owner, _) in arms.items()
+                }
+                self.assertEqual(len(set(counts.values())), 1, counts)
+                _, a = arms["packed"]
+                for arm, (_, b) in arms.items():
+                    with self.subTest(arm=arm):
+                        if z == 0.2:
+                            self.assertEqual(counts[arm], 0)
+                            self.assertEqual(len(b[0]), 0)
+                        else:
+                            self.assertGreater(len(b[0]), 0)
+                            self.assert_geometry_equal(a, b)
 
     def test_mixed_mesh_route(self):
         """Select the tiled route in a real mixed scene without changing terrain results."""
@@ -428,9 +498,8 @@ class TestHeightfieldCellReject(unittest.TestCase):
         before, a = _collide(model, legacy=True)
         self.assertGreater(int(before.narrow_phase.triangle_pairs_count.numpy()[0]), 0)
         self.assertGreater(len(a[0]), 0)
-        for packed in (True, False):
-            with self.subTest(packed=packed):
-                after, b = _collide(model, packed=packed)
+        for arm, (after, b) in self.collide_arms(model).items():
+            with self.subTest(arm=arm):
                 self.assertEqual(
                     int(before.narrow_phase.triangle_pairs_count.numpy()[0]),
                     int(after.narrow_phase.triangle_pairs_count.numpy()[0]),
