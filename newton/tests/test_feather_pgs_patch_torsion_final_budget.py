@@ -18,17 +18,19 @@ class TestFinalPatchBudget(unittest.TestCase):
             for iterations in (1, 2, 4, 8, 64):
                 for spin, sliding in ((0.0, 1.0), (10.0, 1.0), (100.0, 0.0)):
                     with self.subTest(kernel=kernel, iterations=iterations, spin=spin, sliding=sliding):
-                        result, solver, *_ = fixture(
-                            0.0075,
-                            friction_anchor_beta=0.2,
-                            pgs_kernel=kernel,
-                            pgs_iterations=iterations,
-                            closing=0.1,
-                            spin=spin,
-                            sliding=sliding,
-                            contact_shared_anchor=False,
-                            contact_friction_shared_anchor=False,
-                        )
+                        # The fixture solves matrix-free, which ignores the kernel request with a warning.
+                        with self.assertWarnsRegex(UserWarning, f"pgs_kernel='{kernel}' is ignored in matrix_free"):
+                            result, solver, *_ = fixture(
+                                0.0075,
+                                friction_anchor_beta=0.2,
+                                pgs_kernel=kernel,
+                                pgs_iterations=iterations,
+                                closing=0.1,
+                                spin=spin,
+                                sliding=sliding,
+                                contact_shared_anchor=False,
+                                contact_friction_shared_anchor=False,
+                            )
                         count = int(result["count"][0])
                         response = result["Y_world"][0, :count].T @ result["impulses"][0, :count]
                         np.testing.assert_allclose(result["v_out"] - result["v_hat"], response, atol=2e-5)

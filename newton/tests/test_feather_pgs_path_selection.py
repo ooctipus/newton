@@ -19,6 +19,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import friction_patches, keyed_rows, path_selection
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
+from newton._src.solvers.feather_pgs.configuration import resolve_kernel_choices
 from newton._src.solvers.feather_pgs.contact_row_plan import BUILDER_METHODS, contact_row_plan
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.path_selection import applied_options
@@ -1638,6 +1639,94 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             with self.subTest(name=name, value=value), self.assertRaisesRegex(ValueError, name):
                 SolverFeatherPGS(model, **{name: value})
 
+    def test_matrix_free_resolution_ignores_an_explicit_pgs_kernel(self):
+        """Resolve an explicit matrix-free pgs_kernel like auto on every device, returning its warning.
+
+        Split mode still selects the kernel with its device and joint-limit rules, and matrix-free
+        mode still rejects unknown names and an explicit delassus_kernel.
+        """
+        auto = dict.fromkeys(
+            (
+                "cholesky_kernel",
+                "trisolve_kernel",
+                "hinv_jt_kernel",
+                "delassus_kernel",
+                "pgs_kernel",
+                "sparse_mass_matrix",
+                "cached_dynamics",
+            ),
+            "auto",
+        )
+        for is_cpu, automatic in ((False, "tiled_row"), (True, "loop")):
+            for kernel in ("loop", "tiled_row", "tiled_contact", "streaming"):
+                with self.subTest(is_cpu=is_cpu, pgs_kernel=kernel):
+                    resolved, explicit_dense, reasons, ignored = resolve_kernel_choices(
+                        {**auto, "pgs_kernel": kernel},
+                        {},
+                        is_cpu=is_cpu,
+                        pgs_mode="matrix_free",
+                        enable_joint_limits=True,
+                    )
+                    reference = resolve_kernel_choices(
+                        auto, {}, is_cpu=is_cpu, pgs_mode="matrix_free", enable_joint_limits=True
+                    )
+                    self.assertEqual(reference[3], {})
+                    self.assertEqual(resolved, reference[0])
+                    self.assertEqual(resolved["pgs_kernel"], automatic)
+                    self.assertFalse(explicit_dense)
+                    self.assertEqual(list(ignored), ["pgs_kernel"])
+                    self.assertIn(f"pgs_kernel={kernel!r} is ignored in matrix_free mode", ignored["pgs_kernel"])
+                    self.assertTrue(reasons["pgs_kernel"].startswith(f"Explicit pgs_kernel={kernel!r} is ignored"))
+        resolved, _, _, ignored = resolve_kernel_choices(
+            {**auto, "pgs_kernel": "streaming"}, {}, is_cpu=False, pgs_mode="split", enable_joint_limits=False
+        )
+        self.assertEqual((resolved["pgs_kernel"], ignored), ("streaming", {}))
+        for is_cpu, mode, choice, joint_limits, message in (
+            (False, "split", {"pgs_kernel": "streaming"}, True, "contact-only"),
+            (True, "split", {"pgs_kernel": "tiled_row"}, False, "requires CUDA"),
+            (False, "matrix_free", {"pgs_kernel": "typo"}, False, "must be one of"),
+            (False, "matrix_free", {"delassus_kernel": "tiled"}, False, "delassus_kernel is unused in matrix_free"),
+        ):
+            with self.subTest(is_cpu=is_cpu, pgs_mode=mode, choice=choice), self.assertRaisesRegex(ValueError, message):
+                resolve_kernel_choices(
+                    {**auto, **choice}, {}, is_cpu=is_cpu, pgs_mode=mode, enable_joint_limits=joint_limits
+                )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Matrix-free mode requires CUDA")
+    def test_matrix_free_ignores_an_explicit_pgs_kernel(self):
+        """Build the automatic matrix-free solver for an explicit pgs_kernel and warn that it is ignored.
+
+        An explicit friction law keeps a point kernel from selecting point friction, so every route
+        and kernel plan must equal the automatic solver's; only the request, its option record and
+        the pgs_kernel reason name the ignored kernel.
+        """
+        builder = newton.ModelBuilder()
+        body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        builder.add_articulation([builder.add_joint_revolute(-1, body)])
+        model = builder.finalize(device="cuda:0")
+        for beta in (0.0, 0.2):
+            reference = SolverFeatherPGS(model, pgs_mode="matrix_free", friction_anchor_beta=beta).get_path_selection()
+            for kernel in ("loop", "tiled_row", "tiled_contact", "streaming"):
+                with self.subTest(friction_anchor_beta=beta, pgs_kernel=kernel):
+                    with self.assertWarnsRegex(UserWarning, f"pgs_kernel='{kernel}' is ignored in matrix_free mode"):
+                        solver = SolverFeatherPGS(
+                            model, pgs_mode="matrix_free", pgs_kernel=kernel, friction_anchor_beta=beta
+                        )
+                    self.assertEqual(solver.pgs_kernel, "tiled_row")
+                    selected = solver.get_path_selection()
+                    for key in ("routes", "kernel_plan_by_dof", "pgs_kernel", "sparse_mass_matrix", "cached_dynamics"):
+                        self.assertEqual(selected[key], reference[key], key)
+                    self.assertEqual(selected["requested"], {**reference["requested"], "pgs_kernel": kernel})
+                    self.assertEqual(
+                        selected["options"]["pgs_kernel"],
+                        {"applied": "tiled_row", "requested": kernel, "default": "auto", "source": "argument"},
+                    )
+                    self.assertEqual(
+                        selected["reasons"]["pgs_kernel"],
+                        f"{reference['reasons']['pgs_kernel']} Explicit pgs_kernel={kernel!r} is ignored in "
+                        "matrix_free mode.",
+                    )
+
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse factors require CUDA")
     def test_public_dense_kernels_override_sparse_and_fused_dispatch(self):
         """Select actual dense kernels while leaving unspecified choices automatic."""
@@ -1651,11 +1740,17 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertFalse(split._execution_plan.hinv_jt_fused_sizes)
         for kwargs, message in (
             ({"sparse_mass_matrix": "on", "trisolve_kernel": "loop"}, "conflicts"),
-            ({"pgs_kernel": "loop"}, "pgs_kernel"),
             ({"delassus_kernel": "tiled"}, "delassus_kernel"),
         ):
             with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, message):
                 SolverFeatherPGS(model, pgs_mode="matrix_free", **kwargs)
+        # pgs_kernel is no dense factor choice: matrix-free mode ignores it and keeps automatic admission.
+        with self.assertWarnsRegex(UserWarning, "pgs_kernel='loop' is ignored in matrix_free mode"):
+            ignored = SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_kernel="loop")
+        self.assertEqual(
+            ignored.get_path_selection()["sparse_mass_matrix"],
+            SolverFeatherPGS(model, pgs_mode="matrix_free").get_path_selection()["sparse_mass_matrix"],
+        )
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse factors require CUDA")
     def test_force_sparse_and_dense_with_graph_replay(self):

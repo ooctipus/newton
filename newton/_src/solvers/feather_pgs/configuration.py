@@ -31,25 +31,33 @@ def resolve_kernel_choices(
     is_cpu: bool,
     pgs_mode: str,
     enable_joint_limits: bool,
-) -> tuple[dict[str, str], bool, dict[str, str]]:
-    """Return effective choices, explicit dense ownership and construction-time reasons.
+) -> tuple[dict[str, str], bool, dict[str, str], dict[str, str]]:
+    """Return effective choices, explicit dense ownership, construction-time reasons and ignored requests.
 
     Public choices take precedence over private test hooks. A private hook is
     validated before CPU fallback, but does not acquire explicit dense ownership.
     Topology and resource admission remain the responsibility of execution planning.
+    Matrix-free mode owns its sweep kernels, so a valid explicit ``pgs_kernel``
+    there resolves like ``auto`` on any device; the last mapping holds the warning
+    the caller emits for it.
     """
     pgs_kernel = requested["pgs_kernel"]
-    if pgs_mode != "matrix_free" and enable_joint_limits and pgs_kernel in ("tiled_contact", "streaming"):
+    matrix_free = pgs_mode == "matrix_free"
+    if not matrix_free and enable_joint_limits and pgs_kernel in ("tiled_contact", "streaming"):
         raise ValueError(f"pgs_kernel={pgs_kernel!r} is contact-only and cannot solve joint-limit rows")
+    ignored = {}
     for name, value in requested.items():
         if value not in _KERNEL_CHOICES[name]:
             raise ValueError(f"{name} must be one of {_KERNEL_CHOICES[name]}, got {value!r}")
-        if is_cpu and value not in ("auto", _CPU_KERNELS[name]):
+        if matrix_free and name == "pgs_kernel" and value != "auto":
+            ignored[name] = (
+                f"pgs_kernel={value!r} is ignored in matrix_free mode, which owns its sweep kernels; "
+                "omit it or use pgs_mode='split'."
+            )
+        elif is_cpu and value not in ("auto", _CPU_KERNELS[name]):
             raise ValueError(f"{name}={value!r} requires CUDA; use 'auto' or {_CPU_KERNELS[name]!r}")
-    if pgs_mode == "matrix_free":
-        for name in ("pgs_kernel", "delassus_kernel"):
-            if requested[name] != "auto":
-                raise ValueError(f"{name} is unused in matrix_free mode; use 'auto' or pgs_mode='split'")
+    if matrix_free and requested["delassus_kernel"] != "auto":
+        raise ValueError("delassus_kernel is unused in matrix_free mode; use 'auto' or pgs_mode='split'")
     explicit_dense = any(requested[name] != "auto" for name in _DENSE_KERNELS)
     for name in ("sparse_mass_matrix", "cached_dynamics"):
         if requested[name] == "on" and explicit_dense:
@@ -67,11 +75,15 @@ def resolve_kernel_choices(
                 raise ValueError(f"{name} must be one of {sorted(_KERNEL_CHOICES[name])}")
             resolved[name] = value
             reasons[name] = f"Private override selects {name}={value!r}."
-    if pgs_kernel == "auto":
+    if pgs_kernel == "auto" or "pgs_kernel" in ignored:
         resolved["pgs_kernel"] = "loop" if is_cpu else "tiled_row"
-        reasons["pgs_kernel"] = f"Automatic {'CPU' if is_cpu else 'CUDA'} default: {resolved['pgs_kernel']}."
+        reasons["pgs_kernel"] = (
+            f"Explicit pgs_kernel={pgs_kernel!r} is ignored in matrix_free mode."
+            if "pgs_kernel" in ignored
+            else f"Automatic {'CPU' if is_cpu else 'CUDA'} default: {resolved['pgs_kernel']}."
+        )
     if is_cpu:
         for name in (*_DENSE_KERNELS, "pgs_kernel"):
             resolved[name] = _CPU_KERNELS[name]
             reasons[name] += f" CPU uses {_CPU_KERNELS[name]}."
-    return resolved, explicit_dense, reasons
+    return resolved, explicit_dense, reasons, ignored

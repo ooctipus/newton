@@ -1884,8 +1884,10 @@ class SolverFeatherPGS(SolverBase):
             mf_max_constraints (int, optional): Maximum number of matrix-free constraints per world.
                 Packed metadata in matrix-free mode supports at most 65535 rows. Defaults to 512.
             pgs_kernel: Dense PGS implementation. ``auto`` uses ``loop`` on CPU and ``tiled_row`` on CUDA.
-                Explicit ``loop``, ``tiled_row``, ``tiled_contact`` and ``streaming`` require split mode
-                and a supported device. Matrix-free mode requires ``auto`` and owns its sweep dispatcher.
+                Explicit ``loop``, ``tiled_row``, ``tiled_contact`` and ``streaming`` select the split-mode
+                kernel and require a supported device. Matrix-free mode owns its sweep dispatcher: an
+                explicit choice there warns and is ignored, except that ``tiled_contact`` or
+                ``streaming`` still selects point friction when ``friction_anchor_beta`` is omitted.
             pgs_chunk_size (int, optional): Chunk size (in contacts, i.e. groups of 3 constraint rows)
                 for the streaming PGS kernel. Controls how many block-rows of the Delassus matrix are
                 preloaded into shared memory at once. 1 = current streaming behavior (one block-row
@@ -1972,13 +1974,17 @@ class SolverFeatherPGS(SolverBase):
             "sparse_mass_matrix": sparse_mass_matrix,
             "cached_dynamics": cached_dynamics,
         }
-        kernel_choices, self._explicit_dense_kernels, self._kernel_choice_reasons = resolve_kernel_choices(
-            self._requested_kernel_choices,
-            self._kernel_overrides,
-            is_cpu=model.device.is_cpu,
-            pgs_mode=pgs_mode,
-            enable_joint_limits=enable_joint_limits,
+        kernel_choices, self._explicit_dense_kernels, self._kernel_choice_reasons, ignored_choices = (
+            resolve_kernel_choices(
+                self._requested_kernel_choices,
+                self._kernel_overrides,
+                is_cpu=model.device.is_cpu,
+                pgs_mode=pgs_mode,
+                enable_joint_limits=enable_joint_limits,
+            )
         )
+        for message in ignored_choices.values():
+            warnings.warn(message, UserWarning, stacklevel=2)
         cholesky_kernel = kernel_choices["cholesky_kernel"]
         trisolve_kernel = kernel_choices["trisolve_kernel"]
         hinv_jt_kernel = kernel_choices["hinv_jt_kernel"]
@@ -2001,7 +2007,8 @@ class SolverFeatherPGS(SolverBase):
         self._friction_anchor_beta_source = "argument"
         if friction_anchor_beta is None:
             # An explicit point algorithm remains a valid way to select point
-            # friction. The ordinary constructor enables persistent patches.
+            # friction, also as a pgs_kernel request that matrix-free mode
+            # ignores. The ordinary constructor enables persistent patches.
             if contact_compliance:
                 friction_anchor_beta = 0.0
                 self._friction_anchor_beta_source = "default_compliance"
@@ -2012,7 +2019,10 @@ class SolverFeatherPGS(SolverBase):
                     UserWarning,
                     stacklevel=2,
                 )
-            elif friction_mode != "current" or effective_pgs_kernel in ("tiled_contact", "streaming"):
+            elif friction_mode != "current" or self._requested_kernel_choices["pgs_kernel"] in (
+                "tiled_contact",
+                "streaming",
+            ):
                 friction_anchor_beta = 0.0
                 self._friction_anchor_beta_source = "default_point_solver"
                 warnings.warn(
@@ -3530,6 +3540,11 @@ class SolverFeatherPGS(SolverBase):
                 if self.lazy_kinematics and self._fused_k1
                 else "Ordinary state publication remains active.",
                 "pgs_kernel": "Matrix-free mode owns the iteration kernel; split PGS selection is unused."
+                + (
+                    ""
+                    if self._requested_kernel_choices["pgs_kernel"] == "auto"
+                    else f" {self._kernel_choice_reasons['pgs_kernel']}"
+                )
                 if self.pgs_mode == "matrix_free"
                 else self._kernel_choice_reasons["pgs_kernel"],
                 "kernel_plan_by_dof": kernel_reasons,
