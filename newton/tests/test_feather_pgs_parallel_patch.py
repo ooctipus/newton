@@ -9,9 +9,10 @@ normal row links the next normal of its patch ring, and each tangent pair is
 projected into the disk of radius ``mu * (sum of its ring's normal impulses)``
 with one isotropic step, so a sliding pair converges to the serial pair solve's
 maximal dissipation. The reference below repeats the kernel's sweep in float64
-so the CUDA kernels can be checked row by row. Keyed rows write the patch row
-law themselves; the CPU fallback checks it against the general producer and the
-patch link.
+so the CUDA kernels can be checked row by row; on CPU it also sweeps the rows a
+split solver builds, against that solver's serial solution. Keyed rows write the
+patch row law themselves; the CPU fallback checks it against the general
+producer and the patch link.
 """
 
 import inspect
@@ -37,7 +38,12 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_patch_parity import assert_loaded_anchors, assert_ring_coulomb, standing_model
+from newton.tests.feather_pgs_patch_parity import (
+    SLIDING_FEET,
+    assert_loaded_anchors,
+    assert_ring_coulomb,
+    standing_model,
+)
 from newton.tests.feather_pgs_row_builders import (
     ROW_SWITCHES_OFF,
     assert_row_builders_named,
@@ -352,6 +358,63 @@ def limited_contact_case(limit=0.5):
     }
 
 
+def sliding_stance(device):
+    """Two box feet sliding forward at 0.5 m/s on low friction (:data:`SLIDING_FEET`), one world.
+
+    Each foot is a patch: a ring of four normals with two anchors. The floating,
+    legged body couples all sixteen rows (the response block of the first step
+    has a condition number of about 500 on its range), so a parallel tier needs
+    many sweeps where a single contact needs one or two.
+    """
+    return standing_model(device=device, worlds=1, **SLIDING_FEET)
+
+
+def split_world_case(solver, world=0):
+    """One world's rows of a CPU split solver's last step as a reference case, and the velocity of its own solve.
+
+    Split mode keeps each articulation's columns in its size group (the world's
+    articulations in index order) and adds the predicted velocity's ``J v_hat``
+    into the right-hand side; the case keeps the bias apart, ``v_hat`` as its
+    velocity and cold impulses. Contact and limit rows clamp at zero and
+    friction rows pair. Returns the case and ``v_hat + Y^T lambda`` of the
+    impulses the split sweep solved.
+    """
+    count = int(solver.constraint_count.numpy()[world])
+    worlds, starts = solver.art_to_world.numpy(), solver.articulation_dof_start.numpy()
+    predicted = solver.v_hat.numpy().astype(np.float64)
+    blocks = []
+    for size in solver.size_groups:
+        jacobian, response = solver.J_by_size[size].numpy(), solver.Y_by_size[size].numpy()
+        for group, art in enumerate(solver.group_to_art[size].numpy()):
+            if worlds[art] == world:
+                start = int(starts[art])
+                blocks.append(
+                    (int(art), jacobian[group, :count], response[group, :count], predicted[start : start + size])
+                )
+    blocks.sort(key=lambda block: block[0])
+    J = np.concatenate([block[1] for block in blocks], axis=1).astype(np.float64)
+    Y = np.concatenate([block[2] for block in blocks], axis=1).astype(np.float64)
+    velocity = np.concatenate([block[3] for block in blocks])
+    types = solver.row_type.numpy()[world, :count]
+    cfm = solver.row_cfm.numpy()[world, :count].astype(np.float64)
+    case = {
+        "J": J,
+        "Y": Y,
+        "Z": None,
+        "L": None,
+        "cfm": cfm,
+        "diag": np.einsum("ij,ij->i", J, Y) + cfm,
+        "kinds": np.where(types == PGS_CONSTRAINT_TYPE_FRICTION, 1, 0).astype(np.int32),
+        "types": types,
+        "parents": solver.row_parent.numpy()[world, :count].astype(np.int32),
+        "mu": solver.row_mu.numpy()[world, :count].astype(np.float64),
+        "rhs": solver.rhs.numpy()[world, :count].astype(np.float64) - J @ velocity,
+        "impulses": np.zeros(count),
+        "velocity": velocity,
+    }
+    return case, velocity + Y.T @ solver.impulses.numpy()[world, :count].astype(np.float64)
+
+
 def friction_alignment(impulses, velocity):
     """Cosine between a pair's tangent impulse and the negated tangential velocity it leaves (1: maximal dissipation)."""
     friction, slip = impulses[1:3], velocity[:2]
@@ -378,6 +441,29 @@ def assert_pooled_coulomb(test, case, impulses, *, linked, atol=1.0e-6):
         budget = case["mu"][row] * ring_load(case["parents"], impulses, parent, linked=linked)
         test.assertLessEqual(math.hypot(impulses[row], impulses[row + 1]), budget + atol, f"pair at row {row}")
     test.assertGreater(pairs, 0)
+
+
+# Sweep budgets compare a tier's velocity with the serial fixed point's, relative to its largest component. Two
+# sweeps must leave at least _TRUNCATED_GAP of it, or the fixture converges too fast to show what a budget carries
+# (the sliding stance: 3.4e-2); the budget must close that gap to _BUDGET_SHRINK of itself and land within
+# _BUDGET_GAP of the scale (float32 solves of the stance agree to about 1e-7 of it).
+_TRUNCATED_GAP = 1.0e-3
+_BUDGET_SHRINK = 1.0e-3
+_BUDGET_GAP = 1.0e-5
+
+
+def assert_budget_reaches_the_fixed_point(test, truncated, budget, scale):
+    """Require a two-sweep tier short of the serial fixed point and its sweep budget carrying it there.
+
+    ``truncated`` and ``budget`` are the largest velocity gaps to the serial
+    solution after two sweeps and after the budget, ``scale`` the solution's
+    largest velocity. A fixture that two sweeps converge fails here instead of
+    passing vacuously.
+    """
+    gaps = {"two sweeps": truncated, "budget": budget, "scale": scale}
+    test.assertGreater(truncated, _TRUNCATED_GAP * scale, f"two sweeps already converge the fixture: {gaps}")
+    test.assertLess(budget, _BUDGET_SHRINK * truncated, f"the budget leaves the truncated gap open: {gaps}")
+    test.assertLess(budget, _BUDGET_GAP * scale, f"the budget stops short of the serial fixed point: {gaps}")
 
 
 # Golden text of the parallel sweep's friction projection, one warp (NT == 32) and several warps. The point
@@ -1148,6 +1234,37 @@ class TestLinkedTierSweeps(unittest.TestCase):
                 self.assertEqual(option["applied"], 0)  # no tiers on CPU
                 self.assertEqual(selected["environment"]["applied"].get(_SWEEPS_FLAG), environment)
 
+    def test_budget_carries_a_truncated_tier_to_the_serial_fixed_point(self):
+        """Leave a two-sweep linked tier short of a sliding stance's serial fixed point, and reach it within budget.
+
+        The rows are the first step of :func:`sliding_stance` as a CPU split solver
+        builds them, and that solver's serial sweep (2000 iterations) gives the
+        fixed point. The matrix-free linked tier (the float64 reference) stops
+        3.4e-2 of the velocity scale short of it after two sweeps and lands within
+        1.1e-7 of the scale after 2000 (:func:`assert_budget_reaches_the_fixed_point`).
+        TestPatchParallelPhysics runs the solver's tiers on the same stance.
+        """
+        model = sliding_stance("cpu")
+        solver = SolverFeatherPGS(
+            model, friction_anchor_beta=0.2, pgs_iterations=2000, sparse_mass_matrix="off", cached_dynamics="off"
+        )
+        _rollout(model, solver, 1)
+        case, serial = split_world_case(solver)
+        # Sixteen contact rows: two patch rings of four normals, each ring with two anchors.
+        rings = {
+            tuple(sorted(ring_rows(case["parents"], int(normal))))
+            for normal in np.flatnonzero(case["types"] == PGS_CONSTRAINT_TYPE_CONTACT)
+        }
+        self.assertEqual(sorted(len(ring) for ring in rings), [4, 4])
+        self.assertEqual(int(np.count_nonzero(case["types"] == PGS_CONSTRAINT_TYPE_FRICTION)), 8)
+        self.assertEqual(len(case["types"]), 16)
+        options = {"matrix_free": True, "inkernel": False, "exact": False, "nesterov": True, "tol": 0.0, "linked": True}
+        gaps = {}
+        for sweeps in (2, 2000):
+            _, velocity = parallel_sweep_reference(case, sweeps=sweeps, **options)
+            gaps[sweeps] = float(np.max(np.abs(velocity - serial)))
+        assert_budget_reaches_the_fixed_point(self, gaps[2], gaps[2000], float(np.max(np.abs(serial))))
+
 
 def _dummy(arg):
     """A one-element stand-in for an input the kernel variant never reads."""
@@ -1790,13 +1907,18 @@ class TestPatchParallelPhysics(unittest.TestCase):
     def test_linked_budget_carries_the_tiers_to_the_serial_fixed_point(self):
         """Converge the linked tiers on their own budget while the shared budget stays truncated.
 
-        With ``mf_gs_parallel_sweeps=2`` and tolerance 0 a sliding contact's linked tier
-        stops short of the serial sweep's converged velocity; the linked budget of 2000
-        sweeps alone carries it there (1e-5 relative), and point tiers built with the
-        same request keep two sweeps.
+        On the first step of :func:`sliding_stance` a linked tier that
+        ``mf_gs_parallel_sweeps=2`` (tolerance 0) stops must stay short of the
+        serial sweep's velocity (2000 iterations), and the linked budget of 2000
+        sweeps alone must carry it there (:func:`assert_budget_reaches_the_fixed_point`;
+        the float64 reference on the CPU split rows: 3.4e-2 of the scale after two
+        sweeps, 1.1e-7 after 2000). A single sliding contact cannot show what a budget
+        carries: two sweeps converge it (4.2e-6 of the scale in the reference). One
+        step keeps the comparison on the solve, as later steps add the float32 drift
+        of the feet's poses that the position correction amplifies. Point tiers built
+        with the same request keep two sweeps.
         """
-        axes, masses = (newton.Axis.X, newton.Axis.Y, newton.Axis.Z), (3.0, 0.01, 1.0)
-        model = _sliding_sphere("cuda:0", axes, masses, (1.0, 1.0))
+        model = sliding_stance("cuda:0")
         truncated = {"mf_gs_parallel_sweeps": 2, "mf_gs_parallel_tol": 0.0}
         with patch.dict(os.environ, {_SWITCH: "1"}):
             routes = {
@@ -1819,14 +1941,16 @@ class TestPatchParallelPhysics(unittest.TestCase):
             self.assertTrue(kernels and all(f"_sweeps{sweeps}_" in kernel.key for kernel in kernels), name)
         velocities = {}
         for name, solver in routes.items():
-            state, _ = _rollout(model, solver, 4)
+            state, _ = _rollout(model, solver, 1)
             if name != "serial":
                 _assert_tier_owned(self, solver, 32)
             velocities[name] = state.joint_qd.numpy().astype(np.float64)
+        gaps = {
+            name: float(np.max(np.abs(velocities[name] - velocities["serial"])))
+            for name in ("truncated", "linked_budget")
+        }
         scale = float(np.max(np.abs(velocities["serial"])))
-        np.testing.assert_allclose(velocities["linked_budget"], velocities["serial"], atol=1.0e-5 * scale)
-        gap = float(np.max(np.abs(velocities["truncated"] - velocities["serial"])))
-        self.assertGreater(gap, 1.0e-4 * scale, "two sweeps should leave the tier short of the fixed point")
+        assert_budget_reaches_the_fixed_point(self, gaps["truncated"], gaps["linked_budget"], scale)
 
     def test_lone_live_tangent_keeps_its_friction(self):
         """Brake a sphere whose second tangent no joint moves as the serial sweep brakes it.
