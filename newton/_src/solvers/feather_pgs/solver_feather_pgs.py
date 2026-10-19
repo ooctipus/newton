@@ -3828,13 +3828,15 @@ class SolverFeatherPGS(SolverBase):
             # Geometry edits retire affected material points; unrelated shape
             # properties keep their history and live materials are checked per step.
             self._friction_patches.update_geometry(self.model)
-        tree_kinetic = getattr(self, "_tree_kinetic_state", None)
-        frames_proven = tree_kinetic is not None and tree_kinetic.validate_model(flags)
-        self._forget_repair_continuity()
         if self._row_packets is not None:
             self._row_packets.validate_notification(flags)
         if self._keyed_rows is not None:
             self._keyed_rows.validate_notification(flags)
+        # The owner's proof stores a moved joint frame as its new reference, so it runs
+        # after every check that can still refuse the notification.
+        tree_kinetic = getattr(self, "_tree_kinetic_state", None)
+        frames_proven = tree_kinetic is not None and tree_kinetic.validate_model(flags)
+        self._forget_repair_continuity()
         cache_inputs = int(flags) & int(
             ModelFlags.JOINT_PROPERTIES
             | ModelFlags.JOINT_DOF_PROPERTIES

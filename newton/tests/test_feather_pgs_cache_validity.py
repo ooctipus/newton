@@ -255,6 +255,41 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         ordinary.notify_model_changed(JOINT)
         np.testing.assert_array_equal(ordinary._fk_id_cache_valid.numpy(), 0)
 
+    def test_refused_notification_stores_no_moved_frame(self):
+        """Store no moved frame in the held-tree proof when a row owner refuses the notification.
+
+        The proof stores a moved frame as its new reference, so it runs after every check that can
+        still refuse the notification. A refusal changes no cache, and the next notification still
+        finds the frame moved and invalidates every cache instead of keeping caches built from the
+        old frame.
+        """
+        model = _build(wp.get_device("cpu"), worlds=2)
+        solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+        owner = MixedTreeKineticState(solver)
+        # Install the owner as cached_dynamics does on CUDA; CPU admission keeps ordinary dynamics.
+        solver._tree_kinetic_state = owner
+        solver._fk_id_cache_enabled = True
+        validity_arrays = [solver._fk_id_cache_valid, *(group.geometry_valid for group in owner.groups)]
+
+        def refuse(flags):
+            raise RuntimeError("Row topology changed; reconstruct the solver")
+
+        refusal = SimpleNamespace(validate_notification=refuse)
+        frames = model.joint_X_p.numpy().copy()
+        moved = frames.copy()
+        moved[_fixed_root(model, 1), 2] += 0.25
+        # Move the root, then move it back: each write is a move the refused notification must not store.
+        for row_owner, written in (("_row_packets", moved), ("_keyed_rows", frames)):
+            with self.subTest(row_owner=row_owner):
+                for array in validity_arrays:
+                    array.fill_(1)
+                model.joint_X_p.assign(written)
+                with patch.object(solver, row_owner, refusal), self.assertRaisesRegex(RuntimeError, "Row topology"):
+                    solver.notify_model_changed(JOINT)
+                self.assertEqual([int(array.numpy().min()) for array in validity_arrays], [1] * len(validity_arrays))
+                solver.notify_model_changed(JOINT)
+                self.assertEqual([int(array.numpy().max()) for array in validity_arrays], [0] * len(validity_arrays))
+
     @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
     def test_cuda_joint_notification_every_step_repairs_nothing(self):
         """Repair no group when a proven joint notification precedes every step, for every owner kind.
