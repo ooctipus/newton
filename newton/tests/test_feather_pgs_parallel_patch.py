@@ -2012,23 +2012,42 @@ class TestPatchParallelPhysics(unittest.TestCase):
     schemes differ by 4-15 %). The linked tiers step each pair isotropically and
     keep the serial fixed point, so the point tiers' measured gap on the same
     fixture, with a floor at the float-order tolerance of an exact route change,
-    bounds the patch tiers' gap. Every parallel step must leave each world in the
-    tiers' domain, so the comparison is never serial against serial.
+    bounds the patch tiers' gap. Where the two are compared, both sweep
+    ``mf_gs_parallel_sweeps`` (``mf_gs_parallel_linked_sweeps=None``), so the bound
+    compares the laws at one budget; the linked tiers' default ``"auto"`` budget
+    sweeps more and must stay within the same bound of the serial sweep. Every
+    parallel step must leave each world in the tiers' domain, so the comparison is
+    never serial against serial.
     """
+
+    # (friction_anchor_beta, mf_gs_parallel_rows, mf_gs_parallel_linked_sweeps): each law's serial sweep and tiers at
+    # mf_gs_parallel_sweeps, and the patch tiers at their default budget.
+    _ARMS = ((0.0, 0, None), (0.0, 32, None), (0.2, 0, None), (0.2, 32, None), (0.2, 32, "auto"))
 
     def setUp(self):
         """Build every tier with the budget the test requests (:func:`_drop_budget_override`)."""
         _drop_budget_override(self)
 
+    def _assert_budget(self, solver, parallel_rows, linked):
+        """Require the tiers to sweep 24 times, or the auto budget's 30 at eight iterations and 32 rows."""
+        keys = [kernel.key for kernel in solver._pgs_solve_mf_gs_incremental_kernels]
+        self.assertEqual(bool(keys), bool(parallel_rows), keys)
+        sweeps = 30 if linked == "auto" else 24
+        self.assertTrue(all(f"_sweeps{sweeps}_" in key for key in keys), keys)
+
     def test_standing_feet_match_the_serial_patch_sweep(self):
-        """Keep loaded, ring-linked anchors and the serial sweep's motion on two box feet."""
+        """Keep loaded, ring-linked anchors and the serial sweep's motion on two box feet.
+
+        The patch tiers' gap to the serial patch sweep, at the point tiers' budget and
+        at the default ``"auto"`` budget, stays within the point tiers' gap bound.
+        """
         model = standing_model()
         velocity = model.joint_qd.numpy()
         velocity[0::10] = 0.05  # the torsos drift sideways, loading the feet's friction without slipping
         model.joint_qd.assign(velocity)
         with patch.dict(os.environ, {_SWITCH: "1"}):
             states = {}
-            for beta, parallel_rows in itertools.product((0.0, 0.2), (0, 32)):
+            for beta, parallel_rows, linked in self._ARMS:
 
                 def check(step, solver, contacts, state, beta=beta, parallel_rows=parallel_rows):
                     for name in _STATE_FIELDS:
@@ -2042,27 +2061,35 @@ class TestPatchParallelPhysics(unittest.TestCase):
                         assert_ring_coulomb(solver)
                         assert_loaded_anchors(solver, contacts, carried=step > 0)
 
-                solver = _matrix_free_solver(model, beta=beta, parallel_rows=parallel_rows)
-                states[beta, parallel_rows] = _rollout(model, solver, 24, after_step=check)[0]
-        point_gap = _state_differences(states[0.0, 32], states[0.0, 0])
-        patch_gap = _state_differences(states[0.2, 32], states[0.2, 0])
-        measured = {"point_gap": point_gap, "patch_gap": patch_gap}
+                solver = _matrix_free_solver(
+                    model, beta=beta, parallel_rows=parallel_rows, mf_gs_parallel_linked_sweeps=linked
+                )
+                self._assert_budget(solver, parallel_rows, linked)
+                states[beta, parallel_rows, linked] = _rollout(model, solver, 24, after_step=check)[0]
+        point_gap = _state_differences(states[0.0, 32, None], states[0.0, 0, None])
+        patch_gap = _state_differences(states[0.2, 32, None], states[0.2, 0, None])
+        auto_gap = _state_differences(states[0.2, 32, "auto"], states[0.2, 0, None])
+        measured = {"point_gap": point_gap, "patch_gap": patch_gap, "auto_gap": auto_gap}
         for name in _STATE_FIELDS:
-            self.assertLessEqual(patch_gap[name], 3.0 * point_gap[name] + _STATE_FLOOR[name], (name, measured))
+            bound = 3.0 * point_gap[name] + _STATE_FLOOR[name]
+            self.assertLessEqual(patch_gap[name], bound, (name, measured))
+            self.assertLessEqual(auto_gap[name], bound, (name, measured))
 
     def test_box_rests_and_slides_like_the_serial_patch_sweep(self):
         """Hold a resting box, and stop a sliding one where the serial patch sweep stops it.
 
         A sliding box saturates its patch's pooled cone: each anchor pair carries
         mu / 2 of the four normals' load. Pooling each pair on its own normal would
-        halve the friction and double the stopping distance.
+        halve the friction and double the stopping distance. The patch tiers at the
+        point tiers' budget and at the default ``"auto"`` budget stop the box within
+        the point tiers' gap bound of the serial patch sweep.
         """
         speed, mu, gravity = 1.0, 0.5, 9.81
         expected = speed * speed / (2.0 * mu * gravity)
         model = _sliding_boxes("cuda:0", (0.0, speed), mu=mu)
         distances = {}
         with patch.dict(os.environ, {_SWITCH: "1"}):
-            for beta, parallel_rows in itertools.product((0.0, 0.2), (0, 32)):
+            for beta, parallel_rows, linked in self._ARMS:
                 ratios = []
 
                 def check(step, solver, contacts, state, ratios=ratios, parallel_rows=parallel_rows):
@@ -2072,10 +2099,13 @@ class TestPatchParallelPhysics(unittest.TestCase):
                         pairs = _friction_pairs(solver, world=1)
                         ratios.extend(magnitude / budget for magnitude, budget in pairs if budget > 0.0)
 
-                solver = _matrix_free_solver(model, beta=beta, parallel_rows=parallel_rows)
+                solver = _matrix_free_solver(
+                    model, beta=beta, parallel_rows=parallel_rows, mf_gs_parallel_linked_sweeps=linked
+                )
+                self._assert_budget(solver, parallel_rows, linked)
                 state, _ = _rollout(model, solver, 96, after_step=check)
                 q, qd = state.joint_q.numpy(), state.joint_qd.numpy()
-                with self.subTest(beta=beta, parallel_rows=parallel_rows):
+                with self.subTest(beta=beta, parallel_rows=parallel_rows, linked=linked):
                     self.assertLess(np.max(np.abs(q[0:2])), 2.0e-4, "the resting box must not creep")
                     self.assertLess(abs(qd[3]), 1.0e-3, "the sliding box must stop")
                     self.assertLess(abs(q[3] - expected), 0.2 * expected, "friction must act at the full coefficient")
@@ -2084,10 +2114,11 @@ class TestPatchParallelPhysics(unittest.TestCase):
                     # A parallel iterate is projected onto its pooled cone; a serial sweep may update
                     # a ring normal after the pair, leaving the pair marginally outside.
                     self.assertLess(max(ratios), 1.0 + (1.0e-4 if parallel_rows else 5.0e-3))
-                distances[beta, parallel_rows] = float(q[3])
-        point_gap = abs(distances[0.0, 32] - distances[0.0, 0])
-        patch_gap = abs(distances[0.2, 32] - distances[0.2, 0])
-        self.assertLessEqual(patch_gap, max(3.0 * point_gap, 0.01 * expected), distances)
+                distances[beta, parallel_rows, linked] = float(q[3])
+        point_gap = abs(distances[0.0, 32, None] - distances[0.0, 0, None])
+        for linked in (None, "auto"):
+            patch_gap = abs(distances[0.2, 32, linked] - distances[0.2, 0, None])
+            self.assertLessEqual(patch_gap, max(3.0 * point_gap, 0.01 * expected), (linked, distances))
 
     def test_sliding_contact_reaches_the_serial_fixed_point(self):
         """Slide one contact of fourfold unequal tangent masses to the serial patch sweep's converged velocity.
