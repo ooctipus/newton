@@ -5,7 +5,7 @@
 
 ``record`` builds held-tree owners on small scenes: single trees on kinetic
 and chain-scan schedules with fixed and free roots and ordinary or prescaled
-repair motion, and per-size and forest groups with a free body, a
+repair motion, and per-size and forest groups with a free body, a short arm, a
 diagonal-mass family, mimic rows, velocity limits and stage clocks. It drives
 each through two steps of begin, predict, finish and a repeated begin; then
 two steps whose caller copies the published bank back into the input bank, one
@@ -22,10 +22,17 @@ differ bitwise, so both arms must also have launched the same kernels on the
 same layouts; stage clocks (cycle counts) and the cached state-bank pointers
 are not compared.
 
-On CPU, owners build their kernels with static scratch and no release, as
-this Warp's CPU JIT cannot resolve ``malloc`` and ``free``. Lane packing
-defaults to one tree per block, so construction times no lane width;
-``--lane-pack 16`` packs the small trees and skips the wider ones. Each scene
+On CPU, owners build their kernels with static scratch and no release, as this
+Warp's CPU JIT cannot resolve ``malloc`` and ``free``, and keep one tree per
+block. Lane packing defaults to one tree per block, so construction times no
+lane width; on CUDA ``--lane-pack`` fixes the width of every tree it covers
+and skips the scenes with a wider tree. A group's trees must fill whole
+blocks, or the width doubles until they do
+(:func:`~newton._src.solvers.feather_pgs.tree_kinetic_plan.lanes_for`): a
+group of one tree per world packs 4 lanes when the world count is a multiple
+of 8, and 8 lanes when it is a multiple of 4. ``--worlds`` sets the mixed
+scenes' world count (default 2); the single trees' fixtures replicate two
+worlds in every checkout, so none runs narrower than 16 lanes. Each scene
 prints its groups' widths. ``--scene`` records only the named scenes.
 ``--poison`` fills freed device memory with a value before each scene, so a
 read of an array no kernel wrote shows in both arms' records.
@@ -34,6 +41,7 @@ Run with the import-time switches (``FEATHER_PGS_*``) unset::
 
     python tools/fpgs_bench/held_tree_ab.py record child.npz --device cuda:0
     python tools/fpgs_bench/held_tree_ab.py record parent.npz --root /path/to/parent --device cuda:0
+    python tools/fpgs_bench/held_tree_ab.py record child-l4.npz --device cuda:0 --lane-pack 4 --worlds 8
     python tools/fpgs_bench/held_tree_ab.py compare parent.npz child.npz
 
 ``--root`` imports Newton and the scenes' fixtures from another checkout, as
@@ -59,6 +67,8 @@ _HELD_TREE = "tree_kinetic_"
 # Mixed scenes: (_build options, owner options, one forest group per world).
 MIXED_SCENES = {
     "arm-box": ({}, {}, False),
+    # A two-joint arm: a fixed-root tree of three bodies and two coordinates, which packs four lanes.
+    "short-arm-box": ({"links": 2}, {}, False),
     "arm-box-tray": ({"prescribed": True}, {}, False),
     "quadruped": ({"quadruped": True}, {}, False),
     "cabinet": ({"cabinet": True}, {}, False),
@@ -134,13 +144,14 @@ class Recorder:
     Args:
         device: The Warp device the scenes are built on.
         poison: The value left in freed device memory before each scene (0: none).
+        worlds: The mixed scenes' world count.
         scenes: The scenes to record, by single-tree tag or mixed scene name (``None``: every scene).
     """
 
-    def __init__(self, device, poison=0.0, *, scenes=None):
+    def __init__(self, device, poison=0.0, *, worlds=2, scenes=None):
         from newton._src.solvers.feather_pgs import tree_kinetic_state as native  # noqa: PLC0415
 
-        self.device, self.poison = device, poison
+        self.device, self.poison, self.worlds = device, poison, worlds
         self.scenes = None if scenes is None else set(scenes)
         self.records, self.published, self.launched = {}, [], []
         self.native = native
@@ -356,7 +367,7 @@ class Recorder:
             if not self.selected(tag):
                 continue
             self.poison_heap()
-            model = _build(wp.get_device(self.device), worlds=2, **options)
+            model = _build(wp.get_device(self.device), worlds=self.worlds, **options)
             solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
             # Velocity limits are solved by matrix-free sweeps; the owner's motion contract reads only the flag.
             solver.enable_joint_velocity_limits = owner_options.get("motion", False)
@@ -383,7 +394,7 @@ class Recorder:
             self.drive(f"mixed-{tag}", model, solver, owner, owner.groups, owner.refresh, motion=motion)
 
 
-def record(path, *, root=None, device="cpu", lane_pack=0, poison=0.0, scenes=None):
+def record(path, *, root=None, device="cpu", lane_pack=0, poison=0.0, worlds=2, scenes=None):
     """Record the scenes' arrays to ``path`` (see the module docstring) and return them.
 
     Args:
@@ -392,11 +403,14 @@ def record(path, *, root=None, device="cpu", lane_pack=0, poison=0.0, scenes=Non
         device: The Warp device.
         lane_pack: ``FEATHER_PGS_TREE_LANE_PACK``: 0 for one tree per block, or a fixed lane width.
         poison: The value left in freed device memory before each scene (0: none).
+        worlds: The mixed scenes' world count.
         scenes: The scenes to record, by single-tree tag or mixed scene name (default: every scene).
     """
     switches = sorted(name for name in os.environ if name.startswith("FEATHER_PGS_"))
     if switches:
         raise SystemExit(f"Unset the import-time switches: {', '.join(switches)}")
+    if worlds < 1:
+        raise SystemExit("--worlds must be positive")
     unknown = sorted(set(scenes or ()) - set(single_scene_names()) - set(MIXED_SCENES))
     if unknown:
         raise SystemExit(f"Unknown scenes: {', '.join(unknown)}")
@@ -408,7 +422,7 @@ def record(path, *, root=None, device="cpu", lane_pack=0, poison=0.0, scenes=Non
         import warp as wp  # noqa: PLC0415
 
         log_level, wp.config.log_level = wp.config.log_level, wp.LOG_WARNING
-        recorder = Recorder(device, poison, scenes=scenes)
+        recorder = Recorder(device, poison, worlds=worlds, scenes=scenes)
         try:
             with recorder.hooks():
                 recorder.single_scenes()
@@ -470,6 +484,7 @@ def main(argv=None):
         "--lane-pack", type=int, default=0, choices=(0, 4, 8, 16, 32), help="FEATHER_PGS_TREE_LANE_PACK (default 0)"
     )
     record_parser.add_argument("--poison", type=float, default=0.0, help="value left in freed memory before each scene")
+    record_parser.add_argument("--worlds", type=int, default=2, help="world count of the mixed scenes (default 2)")
     record_parser.add_argument(
         "--scene",
         action="append",
@@ -488,6 +503,7 @@ def main(argv=None):
             device=arguments.device,
             lane_pack=arguments.lane_pack,
             poison=arguments.poison,
+            worlds=arguments.worlds,
             scenes=arguments.scenes,
         )
         return 0

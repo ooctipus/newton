@@ -95,6 +95,23 @@ class TestHeldTreeAB(unittest.TestCase):
         self.assertEqual(tree_kinetic_owner.TreeKineticState._publication.__name__, "_publication")
         self.assertEqual((wp.launch.__name__, wp.launch_tiled.__name__), ("launch", "launch_tiled"))
 
+    def test_worlds_set_the_mixed_scenes_world_count(self):
+        """Build the mixed scenes over the requested world count; the single trees keep their fixtures' two."""
+        environment = {name: value for name, value in os.environ.items() if not name.startswith("FEATHER_PGS_")}
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, environment, clear=True),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            records = ab.record(
+                Path(directory) / "record.npz", worlds=3, scenes=("short-arm-box", "single-floating0-chains0")
+            )
+        # The short arm's three-body tree beside the free box, one of each per world.
+        self.assertEqual(records["mixed-short-arm-box/layout"][:, 0].tolist(), [1, 3])
+        for index in range(2):
+            self.assertEqual(records[f"mixed-short-arm-box/0/finish/cache{index}.status"].shape, (3,))
+        self.assertEqual(records["single-floating0-chains0/0/finish/cache0.status"].shape, (2,))
+
 
 if __name__ == "__main__":
     unittest.main()
