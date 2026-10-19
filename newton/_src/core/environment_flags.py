@@ -10,6 +10,8 @@ solver (``FEATHER_PGS_*`` in ``newton._src.solvers.feather_pgs.environment_flags
 ``newton/tests/test_environment_flags.py`` scans the sources and keeps the
 declarations equal to the read sites, so a new variable must be declared here.
 A record only classifies what the environment held; the read sites are unchanged.
+:func:`retired_notice` turns a record's retired names into a warning, once per
+name and process.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal, get_args
+from typing import Any, Literal, get_args
 
 FlagKind = Literal["policy", "experiment", "diagnostic", "reference", "retired"]
 """``policy`` turns off or tunes a default, ``experiment`` opts into a non-default
@@ -94,6 +96,32 @@ def record_environment(
         else:
             applied[name] = environ[name]
     return {"applied": applied, "unknown": unknown, "retired": retired, "isaac_lab": isaac_lab}
+
+
+_WARNED_RETIRED: set[str] = set()
+"""Retired names that :func:`retired_notice` has reported in this process."""
+
+
+def retired_notice(record: Mapping[str, Any]) -> str | None:
+    """Return a warning that names the retired variables of ``record`` this process has not reported.
+
+    Retired names select nothing, so construction proceeds and the record lists them; the
+    caller emits the text as a :class:`UserWarning`. Each name is reported once per process.
+
+    Args:
+        record: A record returned by :func:`record_environment`.
+
+    Returns:
+        The warning text, or ``None`` when the record lists no retired name not yet reported.
+    """
+    names = [name for name in record["retired"] if name not in _WARNED_RETIRED]
+    if not names:
+        return None
+    _WARNED_RETIRED.update(names)
+    return (
+        f"Ignoring retired environment variables that select nothing: {', '.join(names)}. Remove them from "
+        "the environment; the construction record lists them under environment['retired']."
+    )
 
 
 _COLLIDE = ("sim.collide",)

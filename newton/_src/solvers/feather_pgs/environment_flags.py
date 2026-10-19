@@ -4,11 +4,11 @@
 """Declared ``FEATHER_PGS_*`` environment variables of SolverFeatherPGS.
 
 Each entry names the modules that read it; ``newton/tests/test_environment_flags.py``
-keeps the declarations equal to the read sites. Retired selectors are rejected
-here for the solver, except those of :data:`IGNORED_RETIRED`, which recipes still
-set: they select nothing and the record lists them as retired. The solver records
-its environment once at construction and records undeclared names instead of
-rejecting them.
+keeps the declarations equal to the read sites. Retired selectors set to 1 are
+rejected here for the solver, except those of :data:`IGNORED_RETIRED`, which
+recipes still set: they select nothing and the record lists them as retired. The
+solver records its environment once at construction, warns once per process about
+each retired name present and records undeclared names instead of rejecting them.
 """
 
 from __future__ import annotations
@@ -50,6 +50,12 @@ FLAGS = declare(
         "retired",
         ("environment_flags",),
         "Retired register-state copy of the 64-row tiled_row sweep; =1 raises.",
+    ),
+    _flag(
+        "FEATHER_PGS_ALLEGRO_KINETIC_ROWS",
+        "retired",
+        ("environment_flags",),
+        "Retired alias that turned keyed rows on; ignored (FEATHER_PGS_KEYED_ROWS=0 opts out of them).",
     ),
     _flag(
         "FEATHER_PGS_CAPTURE_COUNT",
@@ -178,6 +184,12 @@ FLAGS = declare(
         "=0 disables the CUDA FK/inverse-dynamics cache.",
     ),
     _flag(
+        "FEATHER_PGS_FRANKA_COMPACT_WORKSPACE",
+        "retired",
+        ("environment_flags",),
+        "Retired compact workspace of a removed robot-specific owner; ignored.",
+    ),
+    _flag(
         "FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO",
         "experiment",
         _SOLVER,
@@ -250,6 +262,12 @@ FLAGS = declare(
         "Lanes per articulation in grouped dynamics (default twice the widest tree level, at most 32).",
     ),
     _flag(
+        "FEATHER_PGS_INDEPENDENT_COMPONENTS",
+        "retired",
+        ("environment_flags",),
+        "Retired independent-components variant of a removed robot-specific owner; ignored.",
+    ),
+    _flag(
         "FEATHER_PGS_INK",
         "experiment",
         _SOLVER,
@@ -278,6 +296,24 @@ FLAGS = declare(
         "policy",
         _SOLVER,
         "=0 disables the topology-generated keyed contact rows.",
+    ),
+    _flag(
+        "FEATHER_PGS_KUKA_CURRENT_CONTACT",
+        "retired",
+        ("environment_flags",),
+        "Retired current-contact geometry of a removed robot-specific owner; ignored.",
+    ),
+    _flag(
+        "FEATHER_PGS_KUKA_JOINT_WORLD",
+        "retired",
+        ("environment_flags",),
+        "Retired joint-world prediction of a removed robot-specific owner; ignored.",
+    ),
+    _flag(
+        "FEATHER_PGS_LOCAL_ROW_PACKETS",
+        "retired",
+        ("environment_flags",),
+        "Retired row-packet producer of a removed robot-specific owner; ignored (see FEATHER_PGS_ROW_PACKETS).",
     ),
     _flag(
         "FEATHER_PGS_MFGS_STREAM_LAMBDA",
@@ -350,6 +386,12 @@ FLAGS = declare(
         "policy",
         _SOLVER,
         "Values other than 1 disable independent components in the paired response.",
+    ),
+    _flag(
+        "FEATHER_PGS_PAIRED_GENERAL_OVERLAP",
+        "retired",
+        ("environment_flags",),
+        "Retired overlap of the paired and general solve streams; ignored.",
     ),
     _flag(
         "FEATHER_PGS_PATCH_ACTIVE_ROWS",
@@ -459,10 +501,22 @@ FLAGS = declare(
         "Timing twin variant: lean (default) or finger.",
     ),
     _flag(
+        "FEATHER_PGS_SIMPLE_WORLD_ZERO",
+        "retired",
+        ("environment_flags",),
+        "Retired simple-world classifier of a removed robot-specific owner; ignored.",
+    ),
+    _flag(
         "FEATHER_PGS_SKIP_J_CLEAR",
         "experiment",
         _SOLVER,
         "=1 skips the Jacobian clear when masked or native builders write rows in full.",
+    ),
+    _flag(
+        "FEATHER_PGS_SPARSE_BRANCH_SWEEPS",
+        "retired",
+        ("environment_flags",),
+        "Retired branch-Jacobi sparse sweep; ignored, sparse factors keep their ordered sweeps.",
     ),
     _flag(
         "FEATHER_PGS_SPARSE_CONTACT_BLOCK",
@@ -636,6 +690,12 @@ FLAGS = declare(
         "=1 compares in-kernel world rows with the materialized rows.",
     ),
     _flag(
+        "FEATHER_PGS_WORLD_SCAN_PUBLICATION",
+        "retired",
+        ("environment_flags",),
+        "Retired world-scan publication of a removed robot-specific owner; ignored.",
+    ),
+    _flag(
         "FEATHER_PGS_WR_STOP",
         "diagnostic",
         _SOLVER,
@@ -662,14 +722,26 @@ FLAGS = declare(
 )
 
 
-# The retired packed sparse-factor route's selectors and the G1 chain-scan
-# alias. Isaac Lab's G1 recipes still set them, so they are ignored rather than
-# rejected: the general route runs and the construction record lists them as
-# retired.
+# Retired names that Isaac Lab's benchmark recipes still set: the packed
+# sparse-factor route's selectors (480f0f44), the chain-scan and keyed-row
+# aliases (d35949d6), and the selectors of removed research owners and of the
+# branch-Jacobi sweep (790f9782, aa2f332b). Nothing in Newton or Isaac Lab reads
+# them, and recipes are not Newton's to edit, so they are ignored rather than
+# rejected: the general route runs, the construction record lists them as retired
+# and the solver warns once per process.
 IGNORED_RETIRED = frozenset(
     (
+        "FEATHER_PGS_ALLEGRO_KINETIC_ROWS",
+        "FEATHER_PGS_FRANKA_COMPACT_WORKSPACE",
         "FEATHER_PGS_G1_CHAIN_SCAN",
+        "FEATHER_PGS_INDEPENDENT_COMPONENTS",
+        "FEATHER_PGS_KUKA_CURRENT_CONTACT",
+        "FEATHER_PGS_KUKA_JOINT_WORLD",
+        "FEATHER_PGS_LOCAL_ROW_PACKETS",
         "FEATHER_PGS_PACKED_TREE_KINETIC_STATE",
+        "FEATHER_PGS_PAIRED_GENERAL_OVERLAP",
+        "FEATHER_PGS_SIMPLE_WORLD_ZERO",
+        "FEATHER_PGS_SPARSE_BRANCH_SWEEPS",
         "FEATHER_PGS_SPARSE_CONTACT_BLOCK",
         "FEATHER_PGS_SPARSE_FACTOR",
         "FEATHER_PGS_SPARSE_LEVEL_UPDATE",
@@ -677,6 +749,7 @@ IGNORED_RETIRED = frozenset(
         "FEATHER_PGS_SPARSE_METRIC_TANGENTS",
         "FEATHER_PGS_SPARSE_PARALLEL_LIMITS",
         "FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS",
+        "FEATHER_PGS_WORLD_SCAN_PUBLICATION",
     )
 )
 
