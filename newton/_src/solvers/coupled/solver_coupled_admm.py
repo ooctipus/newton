@@ -957,6 +957,8 @@ class SolverCoupledADMM(SolverCoupled):
 
     def notify_model_changed(self, flags: int) -> None:
         super().notify_model_changed(flags)
+        if self._admm_collision_pipeline is not None:
+            self._admm_collision_pipeline.notify_model_changed(flags)
         if int(flags) & int(ModelFlags.BODY_INERTIAL_PROPERTIES):
             self._refresh_admm_body_effective_mass_buffers()
             self._cache_admm_joint_proxy_effective_masses()
@@ -1094,6 +1096,9 @@ class SolverCoupledADMM(SolverCoupled):
                 self.model,
                 broad_phase="explicit",
                 shape_pairs_filtered=admm_shape_pairs,
+                # Cross-solver joints become compliant attachments here, so a body the model
+                # welds to the world through one can move: keep the pairs of welded bodies.
+                include_immobile_pairs=True,
                 rigid_contact_max=rigid_contact_max,
                 soft_contact_max=None if self._admm_rigid_particle_contact_specs else 0,
                 soft_contact_margin=0.0,
