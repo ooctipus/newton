@@ -38,7 +38,12 @@ class TestContactReductionOverflow(unittest.TestCase):
         self.assertEqual(int(reducer.buffer_overflows.numpy()[0]), 0)
 
     def test_reducer_failures_reach_solver_status(self):
-        """Latch reduction losses without watermark mode and clear producer status on reuse."""
+        """Latch reduction losses without watermark mode and clear producer status on reuse.
+
+        The collide that reports the injected insert failure must print its
+        warning inside this test's own output capture, so that no device output
+        of this test reaches a later test's output check.
+        """
         device = wp.get_device()
         builder = newton.ModelBuilder()
         builder.add_ground_plane()
@@ -60,8 +65,10 @@ class TestContactReductionOverflow(unittest.TestCase):
                 try:
                     with patch.object(pipeline.narrow_phase, "global_contact_reducer", reducer):
                         pipeline.collide(state, contacts)
-                    # CUDA holds device printf output until the host synchronizes, which
-                    # would otherwise print the warning inside a later test.
+                    # Device printf output reaches stdout when the host synchronizes the
+                    # CUDA context, which the status reads below (copies on the default
+                    # stream) do not; the warning would otherwise print inside a later
+                    # test's output check.
                     wp.synchronize_device(device)
                 finally:
                     printed = capture.end()
