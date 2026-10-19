@@ -191,8 +191,8 @@ def test_synthetic_templates_match_flat_kernel(test, device):
         (((3, 20), (0, 9), (2, 0)), 21, 12, False),
         # One large template: several warps per world, global block, tail block.
         (((5, 300),), 7, 40, False),
-        # Many shapes per world with few pairs: shared memory limits worlds per block.
-        (((40, 260), (0, 120)), 9, 300, False),
+        # Over 256 staged shapes per world: shared memory, not lanes, limits worlds per block (3 x 64 lanes).
+        (((40, 260), (0, 120)), 9, 400, False),
         # 1100 pairs per world: one 256-lane world per block, as on the largest templates.
         (((8, 1100),), 5, 60, False),
         # Global shapes after the worlds: every global-local pair is swapped to (min, max).
@@ -213,6 +213,9 @@ def test_synthetic_templates_match_flat_kernel(test, device):
         test.assertIsNone(layout.unsupported_reason)
         test.assertTrue(layout.verify(pairs))
         test.assertEqual(layout.pair_count, pairs.shape[0])
+        if case == 2:
+            test.assertGreater(layout.staged_shapes, 256)
+            test.assertLess(layout.worlds_per_block, 256 // layout.threads_per_world)
         lower, upper = _random_bounds(100 + case, shape_count, device)
         shape_body, body_flags = _random_bodies(200 + case, shape_count, device)
         for include in (True, False):
@@ -245,20 +248,50 @@ def _exact_template(pair_count, staged):
     )
 
 
-def test_layout_shapes_launches(test, device):
-    """Choose lanes per world from the largest template and worlds per block from shared memory."""
+def test_layout_shapes_match_flat_kernel(test, device):
+    """Choose lanes per world and worlds per block, and test each launch shape like the flat kernel."""
     expectations = (
         (23, 12, 32, 8),  # one warp per world, eight worlds per block
         (305, 41, 64, 4),  # two warps per world
-        (300, 300, 64, 3),  # 300 staged shapes leave shared memory for three worlds
+        (300, 300, 64, 3),  # 300 staged shapes leave shared memory for three worlds: 192-thread blocks
         (1108, 61, 256, 1),  # one 256-lane world per block, as on the largest templates
     )
-    for pair_count, staged, threads, worlds_per_block in expectations:
-        layout = BroadPhaseExplicitTemplates(_exact_template(pair_count, staged), device=device)
+    for case, (pair_count, staged, threads, worlds_per_block) in enumerate(expectations):
+        record = _exact_template(pair_count, staged)
+        layout = BroadPhaseExplicitTemplates(record, device=device)
         with test.subTest(pairs=pair_count, staged=staged):
             test.assertEqual((layout.pairs_per_world, layout.staged_shapes), (pair_count, staged))
             test.assertEqual(layout.threads_per_world, threads)
             test.assertEqual(layout.worlds_per_block, worlds_per_block)
+            pairs = wp.array(record.replay(), dtype=wp.vec2i, device=device)
+            test.assertTrue(layout.verify(pairs))
+            lower, upper = _random_bounds(300 + case, 2 * staged, device)
+            flat, template = _launch_both(pairs, layout, lower, upper)
+            test.assertGreater(flat[1], 0)
+            _assert_same_candidates(test, device, flat, template, pairs.shape[0])
+
+
+def test_static_pairs_filtered_without_body_flags(test, device):
+    """Drop static-static pairs when shape bodies are given without body flags, as the flat kernel does."""
+    record, shape_count = _synthetic(11, worlds=6, world_shapes=20, template_specs=((3, 60), (2, 30)), global_pairs=3)
+    pairs = wp.array(record.replay(), dtype=wp.vec2i, device=device)
+    layout = BroadPhaseExplicitTemplates(record, device=device)
+    test.assertTrue(layout.verify(pairs))
+    # Every box overlaps every other one, and every other shape (globals included) is static.
+    lower = wp.zeros(shape_count, dtype=wp.vec3, device=device)
+    upper = wp.array(np.ones((shape_count, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    bodies = np.arange(shape_count, dtype=np.int32)
+    bodies[::2] = -1
+    shape_body = wp.array(bodies, dtype=wp.int32, device=device)
+    for include in (True, False):
+        with test.subTest(include=include):
+            flat, template = _launch_both(pairs, layout, lower, upper, shape_body=shape_body, include=include)
+            if include:
+                test.assertEqual(flat[1], pairs.shape[0])
+            else:
+                # Not vacuous: the static-static rule drops pairs without body flags.
+                test.assertLess(flat[1], pairs.shape[0])
+            _assert_same_candidates(test, device, flat, template, pairs.shape[0])
 
 
 def test_verification_rejects_a_changed_list(test, device):
@@ -576,9 +609,13 @@ def test_pipeline_immovable_filter_matches_flat(test, device):
         with test.subTest(global_order=global_order):
             templated = _pipeline(model, "1", include_static_kinematic_pairs=False)
             flat = _pipeline(model, "0", include_static_kinematic_pairs=False)
+            unfiltered = _pipeline(model, "0")
             templated_contacts = _contacts(templated, model, state)
             flat_contacts = _contacts(flat, model, state)
+            _contacts(unfiltered, model, state)
             count = int(flat.broad_phase_pair_count.numpy()[0])
+            # Not vacuous: the fixture's static and kinematic shapes overlap.
+            test.assertLess(count, int(unfiltered.broad_phase_pair_count.numpy()[0]))
             test.assertEqual(int(templated.broad_phase_pair_count.numpy()[0]), count)
             templated_pairs = templated.broad_phase_shape_pairs.numpy()
             flat_pairs = flat.broad_phase_shape_pairs.numpy()
@@ -669,7 +706,8 @@ class TestBroadPhaseTemplates(unittest.TestCase):
 devices = get_test_devices(mode="basic")
 for _name, _function in (
     ("test_synthetic_templates_match_flat_kernel", test_synthetic_templates_match_flat_kernel),
-    ("test_layout_shapes_launches", test_layout_shapes_launches),
+    ("test_layout_shapes_match_flat_kernel", test_layout_shapes_match_flat_kernel),
+    ("test_static_pairs_filtered_without_body_flags", test_static_pairs_filtered_without_body_flags),
     ("test_verification_rejects_a_changed_list", test_verification_rejects_a_changed_list),
     ("test_pipeline_templates_match_flat_contacts", test_pipeline_templates_match_flat_contacts),
     ("test_pipeline_immovable_filter_matches_flat", test_pipeline_immovable_filter_matches_flat),
