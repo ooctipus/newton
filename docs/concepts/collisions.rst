@@ -750,9 +750,12 @@ global ground and a robot base replicated into each world.
 Neither shape of such a pair can move, so its contacts have no dynamics in a solver that gives
 welded bodies no degrees of freedom; :class:`~newton.solvers.SolverFeatherPGS` discards them
 anyway. Dropping them in the broad phase removes their contact generation and solver bookkeeping.
-Solvers that resolve such joints as constraints no longer see these contacts either, and contact
-sensors no longer report them. With ``include_static_kinematic_pairs=False``, a welded body also
-counts as static for that filter, so its pairs with kinematic shapes are dropped as well.
+The remaining contacts may be renumbered, and on CUDA FeatherPGS can then reserve their rows in
+another order; with few PGS iterations, its results then differ as they do under any change of
+contact order. Solvers that resolve such joints as constraints no longer see these contacts
+either, and contact sensors no longer report them. With ``include_static_kinematic_pairs=False``,
+a welded body also counts as static for that filter, so its pairs with kinematic shapes are
+dropped as well.
 
 ``get_collision_selection()["immobile_pairs"]`` records the choice and the welded bodies,
 immobile shapes and dropped pairs. Pass ``include_immobile_pairs=True``, or set
