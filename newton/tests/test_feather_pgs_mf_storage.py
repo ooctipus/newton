@@ -683,14 +683,18 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
                     tangents = host["world_row_type"] == PGS_CONSTRAINT_TYPE_FRICTION
                     self.assertFalse(np.array_equal(impulses, host["world_impulses"]), name)
                     self.assertTrue(np.any(impulses[tangents] != 0.0), name)
+                    eager = [{output: _host(bank[output]) for output in outputs} for bank in banks]
             with wp.ScopedCapture(device=device) as capture:
                 run(launches[0])
+            # NaN in both banks: a graph that replayed nothing, or only the copies, cannot give the eager bits.
+            for bank in banks:
+                for output in outputs:
+                    bank[output].fill_(float("nan"))
             wp.capture_launch(capture.graph)
             with self.subTest(case=name, graph=True):
-                for output in outputs:
-                    np.testing.assert_array_equal(
-                        banks[1][output].numpy().view(np.uint32), banks[0][output].numpy().view(np.uint32)
-                    )
+                for bank, expected in zip(banks, eager, strict=True):
+                    for output in outputs:
+                        np.testing.assert_array_equal(_bits(_host(bank[output])), _bits(expected[output]), output)
 
     def _replay_solver_launches(self, model, options):
         """Build a solver and replay every MF-GS launch of four steps through its streamed twin.
@@ -841,13 +845,20 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
                         run()
                         for name in outputs:
                             np.testing.assert_array_equal(variants[0][1][name].numpy(), variants[1][1][name].numpy())
+                        if phase == 0:
+                            eager = [{name: _host(bound[name]) for name in outputs} for _, bound in variants]
                     for _, bound in variants:
                         bound["row_phase"] = 0
                     with wp.ScopedCapture(device=device) as capture:
                         run()
+                    # NaN in both variants: a graph that replayed nothing cannot give the eager bits.
+                    for _, bound in variants:
+                        for name in outputs:
+                            bound[name].fill_(float("nan"))
                     wp.capture_launch(capture.graph)
-                    for name in outputs:
-                        np.testing.assert_array_equal(variants[0][1][name].numpy(), variants[1][1][name].numpy())
+                    for (_, bound), expected in zip(variants, eager, strict=True):
+                        for name in outputs:
+                            np.testing.assert_array_equal(_bits(_host(bound[name])), _bits(expected[name]), name)
 
 
 if __name__ == "__main__":
