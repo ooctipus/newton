@@ -9,6 +9,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.sim.contacts import contact_frame_write
 from newton.solvers import SolverMuJoCo
 
 
@@ -148,6 +149,34 @@ class TestMuJoCoContactCapacity(unittest.TestCase):
             contacts.contact_generation.assign(contacts.contact_generation.numpy() + 1)
             wp.capture_launch(capture.graph)
         self.assertTrue(all(solver.contact_capacity_status().values()))
+
+
+class TestMuJoCoContactFrameWrites(unittest.TestCase):
+    def test_update_contacts_notes_a_frame_write_of_its_output(self):
+        """Note a frame write of the published contacts on every update_contacts(), which rewrites them in place.
+
+        The conversion keeps the published buffer's contact generation, so only
+        the note tells consumers that reuse work derived from one contact frame
+        across captured steps (FeatherPGS patch friction) that the frame changed.
+        """
+        model, solver, state, pipeline, contacts = _fixture(mj_capacity=4)
+        solver.step(state, model.state(), model.control(), contacts, 1.0 / 240.0)
+        source = contact_frame_write(contacts.contact_generation)
+        published = pipeline.contacts()
+        generation = published.contact_generation.numpy().copy()
+        self.assertIsNone(contact_frame_write(published.contact_generation))
+        ticks = []
+        for _ in range(2):
+            solver.update_contacts(published, state)
+            write = contact_frame_write(published.contact_generation)
+            self.assertIsNotNone(write, "update_contacts() must note its write")
+            self.assertIsNone(write.scope, "an eager write has no capture scope")
+            ticks.append(write.tick)
+        self.assertLess(source.tick, ticks[0])
+        self.assertLess(ticks[0], ticks[1], "every update rewrites the frame")
+        self.assertGreater(int(published.rigid_contact_count.numpy()[0]), 0, "the spheres must touch the ground")
+        np.testing.assert_array_equal(published.contact_generation.numpy(), generation, "the generation stays")
+        self.assertEqual(contact_frame_write(contacts.contact_generation), source, "the source contacts are only read")
 
 
 if __name__ == "__main__":

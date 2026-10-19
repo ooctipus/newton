@@ -70,7 +70,10 @@ def note_contact_frame_write(generation: wp.array) -> ContactFrameWrite:
 
     Every Newton writer of a contact stream notes its writes here, keyed by the
     stream's ``contact_generation`` array: :meth:`newton.CollisionPipeline.collide`,
-    :meth:`Contacts.clear` and the contact filters of the coupled solvers.
+    :meth:`Contacts.clear` (also where a converter such as Kamino's clears its
+    output first), :meth:`newton.solvers.SolverMuJoCo.update_contacts` and the
+    contact filters of the coupled solvers. Code outside Newton that rewrites a
+    contact stream in place notes nothing; it calls :meth:`Contacts.clear` first.
     Consumers that reuse work derived from one frame across captured steps
     (FeatherPGS patch friction) compare ticks to learn whether the host issued
     a write since. Captured writes repeat on every replay, so a tick says only

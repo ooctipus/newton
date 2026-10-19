@@ -33,6 +33,7 @@ from ...sim import (
 )
 from ...sim.articulation import eval_articulation_fk, eval_fk
 from ...sim.contacts import GENERATION_SENTINEL as _GENERATION_SENTINEL
+from ...sim.contacts import note_contact_frame_write
 from ...sim.graph_coloring import color_graph, plot_graph
 from ...utils import topological_sort
 from ...utils.benchmark import event_scope
@@ -5205,6 +5206,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 f"rigid_contact_max={mj_data.naconmax}."
             )
 
+        # The conversion rewrites the count, shapes, points and normals in place,
+        # without a new contact generation.
+        generation = getattr(contacts, "contact_generation", None)
+        if generation is not None:
+            note_contact_frame_write(generation)
         wp.launch(
             self._convert_mjw_contacts_to_newton_kernel,
             dim=mj_data.naconmax,
