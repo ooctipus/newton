@@ -3380,10 +3380,10 @@ class SolverFeatherPGS(SolverBase):
         the plan the row build dispatches on), local, paired and sparse responses,
         the sweep kernels per route and tier, what drives them and the matrix-free
         sweep's shared-memory storage (``sweep.mf_gs_storage``), resolved worlds,
-        publication, velocity limits and the lane width of their prescale, free bodies,
-        the friction law and the
-        grouped-dynamics kernels, each with a reason; a size whose response the
-        grouped kernel solves reports ``hinv_jt_kernel`` ``"grouped"``. The
+        publication, velocity limits and the lane width of their prescale, free
+        bodies, the friction law and the grouped-dynamics kernels, each with a
+        reason; a size whose response the grouped kernel solves reports
+        ``hinv_jt_kernel`` ``"grouped"``. The
         row builders (``contact_rows.builder_by_dof``) are those of the dense
         contact rows built outside the sweep: the parallel tiers build keyed rows'
         direct rows in the sweep (``direct_rows``), the free-body matrix-free and
