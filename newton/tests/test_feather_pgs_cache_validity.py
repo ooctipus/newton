@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Keep held-tree caches valid across host calls that change none of their inputs."""
+"""Keep held-tree caches valid across host calls and state copies that change none of their inputs."""
 
+import contextlib
 import functools
 import os
 import unittest
@@ -42,13 +43,22 @@ def _group_worlds(solver, owner):
     return [art_to_world[group.sparse.plan.group_to_art.numpy()] for group in _groups(owner)]
 
 
+def _group_articulations(owner):
+    """Every cache group's articulations, one row per group (a forest group owns several), aligned with :func:`_generations`."""
+    rows = []
+    for group in _groups(owner):
+        forest = getattr(group.sparse, "forest_arts", None)
+        rows.append(np.asarray(forest) if forest is not None else group.sparse.plan.group_to_art.numpy()[:, None])
+    return rows
+
+
 def _fixed_root(model, world):
     """The fixed root joint of ``world``'s arm."""
     roots = (model.joint_parent.numpy() == -1) & (model.joint_type.numpy() == int(newton.JointType.FIXED))
     return int(np.flatnonzero(roots & (model.joint_world.numpy() == world))[0])
 
 
-def _mixed_solver(model, *, forest=False, owner=True):
+def _mixed_solver(model, *, forest=False, owner=True, **options):
     """A dense-route solver with the mixed held-tree owner, or with ordinary dynamics when ``owner`` is False."""
     environment = {
         "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": str(int(owner)),
@@ -56,15 +66,16 @@ def _mixed_solver(model, *, forest=False, owner=True):
         "FEATHER_PGS_TREE_FOREST": str(int(forest)),
         **ONE_TREE_PER_BLOCK,
     }
+    settings = {
+        "pgs_mode": "matrix_free",
+        "pgs_iterations": 8,
+        "enable_joint_limits": True,
+        "update_mass_matrix_interval": 2,
+        "friction_anchor_beta": 0.0,
+        **options,
+    }
     with patch.dict(os.environ, environment):
-        return SolverFeatherPGS(
-            model,
-            pgs_mode="matrix_free",
-            pgs_iterations=8,
-            enable_joint_limits=True,
-            update_mass_matrix_interval=2,
-            friction_anchor_beta=0.0,
-        )
+        return SolverFeatherPGS(model, **settings)
 
 
 def _owned_case(name, device):
@@ -83,13 +94,15 @@ def _owned_case(name, device):
 class _Rollout:
     """Ping-pong one solver's states over sorted contacts, as a captured Isaac Lab physics step does.
 
-    Rollouts of separate solver instances compare within 2e-6 (rtol 0), the bound the repository's
-    other cross-instance tests use. Their held-tree lane width is pinned (``ONE_TREE_PER_BLOCK``);
-    what can remain between instances is the order of float atomic accumulations.
+    With ``copy_back`` the input bank stays the same object and each step copies the output bank
+    back into it, as Isaac Lab does after an odd substep count. Rollouts of separate solver
+    instances compare within 2e-6 (rtol 0), the bound the repository's other cross-instance tests
+    use. Their held-tree lane width is pinned (``ONE_TREE_PER_BLOCK``); what can remain between
+    instances is the order of float atomic accumulations.
     """
 
-    def __init__(self, model, solver):
-        self.model, self.solver = model, solver
+    def __init__(self, model, solver, *, copy_back=False):
+        self.model, self.solver, self.copy_back = model, solver, copy_back
         self.pipeline = newton.CollisionPipeline(model, deterministic=True)
         self.contacts = self.pipeline.contacts()
         self.control = model.control()
@@ -107,7 +120,10 @@ class _Rollout:
         self.pipeline.collide(self.states[0], self.contacts)
         self.states[0].clear_forces()
         self.solver.step(self.states[0], self.states[1], self.control, self.contacts, DT)
-        self.states.reverse()
+        if self.copy_back:
+            self.states[0].assign(self.states[1])
+        else:
+            self.states.reverse()
 
     def block(self):
         """Two steps: the states return to their objects, as in an even-substep captured graph."""
@@ -313,6 +329,232 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 0)
         for group in owner.groups:
             np.testing.assert_array_equal(group.geometry_valid.numpy(), 0)
+
+
+def _recorded_launches(kinds=("launch_tiled",)):
+    """Patch the given Warp launch functions to record their kernels and inputs without running them."""
+    launched = []
+
+    def record(kernel, *args, inputs=(), **kwargs):
+        launched.append((kernel, list(inputs), kwargs))
+
+    stack = contextlib.ExitStack()
+    for kind in kinds:
+        stack.enter_context(patch.object(wp, kind, record))
+    return stack, launched
+
+
+def _cpu_owner(*, motion_velocity=False):
+    """A CPU solver with a mixed held-tree owner installed, as cached_dynamics installs one on CUDA.
+
+    ``motion_velocity`` builds the owner of a velocity-limit solver (whose matrix-free mode CPU
+    lacks): its groups read prescaled velocities.
+    """
+    model = _build(wp.get_device("cpu"), worlds=2)
+    solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+    solver.enable_joint_velocity_limits = motion_velocity
+    owner = MixedTreeKineticState(solver)
+    solver._tree_kinetic_state = owner
+    solver._fk_id_cache_enabled = True
+    states = [model.state(), model.state()]
+    solver._last_step_dt = DT
+    return model, solver, owner, states, solver._prepare_augmented_state(states[0], states[1], model.control())
+
+
+class TestFeatherPGSInputBank(unittest.TestCase):
+    def test_bank_comparing_owner_keeps_validity_on_the_host(self):
+        """Skip the host's input-identity invalidation for an owner that compares input banks.
+
+        The step and an episode reset leave current validity to the owner's device comparison
+        and the step hands the owner its output bank. An owner that validates by identity alone
+        (a motion-velocity layout) is still invalidated when the input is not the last output.
+        """
+        model, solver, _, states, augmented = _cpu_owner()
+        calls = []
+        for bank_compare in (True, False):
+            with self.subTest(bank_compare=bank_compare):
+                solver._tree_kinetic_state = SimpleNamespace(
+                    bank_compare=bank_compare,
+                    begin=lambda *args, **kwargs: calls.append(kwargs),
+                    invalidate=lambda world_mask=None: None,
+                )
+                expected = int(bank_compare)
+                solver._fk_id_cache_valid.fill_(1)
+                solver._fk_id_cache_source_state = states[1]
+                solver._stage1_fk_id(states[0], augmented, states[1])
+                np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), expected)
+                self.assertIs(calls[-1].get("state_out"), states[1])
+                solver._fk_id_cache_valid.fill_(1)
+                solver._fk_id_cache_source_state = states[1]
+                none = wp.zeros(model.world_count, dtype=wp.bool, device=model.device)
+                solver.reset(states[0], none)
+                np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), expected)
+
+    def test_comparison_pass_runs_when_the_stamps_name_the_output_bank(self):
+        """Launch the bank comparison only when the last finish published into the step's output bank.
+
+        That is the copy-back pattern: the finish wrote ``s1`` and the next step reads ``s0``, a copy
+        of it. A ping-pong step reads the bank the finish wrote, so it needs no comparison, and an
+        owner of a motion-velocity layout never compares.
+        """
+        _, _, owner, (s0, s1), augmented = _cpu_owner()
+        self.assertTrue(owner.bank_compare)
+        banks = {group.bank_kernel for group in owner.groups}
+        repairs = {group.repair_kernel for group in owner.groups}
+        self.assertEqual(len(banks), len(owner.groups))
+        self.assertFalse(banks & repairs)
+
+        def launches(call):
+            """The held-tree launches of ``call``: True for a comparison pass, False for a repair."""
+            stack, records = _recorded_launches()
+            with stack:
+                call()
+            return [kernel in banks for kernel, _, _ in records if kernel in banks or kernel in repairs]
+
+        def begin(state_in, state_out=None):
+            return launches(lambda: owner.begin(state_in, augmented, state_in.joint_qd, DT, False, state_out=state_out))
+
+        def finish(state_in, state_out):
+            launches(lambda: owner.finish(state_in, augmented, state_out, DT, False))
+
+        repair, compared = [False] * len(owner.groups), [True, False] * len(owner.groups)
+        self.assertEqual(begin(s0, s1), repair)  # nothing published yet
+        finish(s0, s1)
+        self.assertEqual(begin(s0, s1), compared)  # copy-back: the finish published s1, the step reads s0
+        self.assertEqual(begin(s0, s1), repair)  # the repair stamped s0
+        finish(s0, s1)
+        self.assertEqual(begin(s1, s0), repair)  # ping-pong: the step reads the bank the finish wrote
+        finish(s0, s1)
+        self.assertEqual(begin(s0), repair)  # without the output bank, identity alone decides
+        motion = _cpu_owner(motion_velocity=True)[2]
+        self.assertFalse(motion.bank_compare)
+        self.assertTrue(all(group.bank_kernel is None for group in motion.groups))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
+    def test_cuda_copied_input_bank_repairs_nothing(self):
+        """Keep every group's cache when each step copies its output bank back into its input bank.
+
+        After the first step a steady copy-back rollout adds one generation per step (the finish),
+        for every owner kind: the comparison pass finds the copied words and the repair exits. A
+        second rollout invalidates every group before each step and repairs twice as often. The
+        trajectories agree with each other and with a ping-pong rollout.
+        """
+        device = wp.get_device("cuda:0")
+        steps = 6
+        for name in ("mixed", "forest", "sparse"):
+            with self.subTest(owner=name):
+                finals = {}
+                for mode, per_step in (("copy_back", 1), ("forced", 2), ("ping_pong", 1)):
+                    model, solver, owner = self._owned(name, device)
+                    rollout = _Rollout(model, solver, copy_back=mode != "ping_pong")
+                    rollout.step()
+                    before = _generations(owner)
+                    for _ in range(steps):
+                        if mode == "forced":
+                            solver._fk_id_cache_valid.zero_()
+                        rollout.step()
+                    for start, end in zip(before, _generations(owner), strict=True):
+                        np.testing.assert_array_equal(end - start, per_step * steps, err_msg=mode)
+                    finals[mode] = {field: getattr(rollout.states[0], field).numpy() for field in STATE_FIELDS}
+                for reference in ("forced", "ping_pong"):
+                    for field in STATE_FIELDS:
+                        np.testing.assert_allclose(
+                            finals["copy_back"][field],
+                            finals[reference][field],
+                            rtol=0.0,
+                            atol=2e-6,
+                            err_msg=f"{field} against the {reference} rollout",
+                        )
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
+    def test_cuda_written_copy_repairs_its_world(self):
+        """Repair exactly the world whose copied input coordinates were written in place without a notification.
+
+        The comparison finds the changed words, so that world recomputes from the written state, as
+        a forced repair of every world does; the other worlds keep their caches.
+        """
+        device = wp.get_device("cuda:0")
+        for name in ("mixed", "sparse"):
+            with self.subTest(owner=name):
+                finals = []
+                for forced in (False, True):
+                    model, solver, owner = self._owned(name, device)
+                    rollout = _Rollout(model, solver, copy_back=True)
+                    rollout.block()
+                    # The first revolute joint of world 1: one group owns its articulation.
+                    revolute = (model.joint_type.numpy() == int(newton.JointType.REVOLUTE)) & (
+                        model.joint_world.numpy() == 1
+                    )
+                    joint = int(np.flatnonzero(revolute)[0])
+                    q = rollout.states[0].joint_q.numpy()
+                    q[model.joint_q_start.numpy()[joint]] += np.float32(0.05)
+                    rollout.states[0].joint_q.assign(q)
+                    if forced:
+                        solver._fk_id_cache_valid.zero_()
+                    before = _generations(owner)
+                    rollout.step()
+                    written = model.joint_articulation.numpy()[joint]
+                    for start, end, arts in zip(before, _generations(owner), _group_articulations(owner), strict=True):
+                        repaired = np.ones(len(arts), dtype=bool) if forced else np.any(arts == written, axis=1)
+                        # The finish adds one; a repair adds one more.
+                        np.testing.assert_array_equal(end - start, 1 + repaired, err_msg=f"{forced=}")
+                    rollout.block()
+                    finals.append({field: getattr(rollout.states[0], field).numpy() for field in STATE_FIELDS})
+                for field in STATE_FIELDS:
+                    np.testing.assert_allclose(finals[0][field], finals[1][field], rtol=0.0, atol=2e-6, err_msg=field)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
+    def test_cuda_captured_copy_back_matches_eager(self):
+        """Replay a captured copy-back step (collide, step, copy) and match eager stepping, repairing nothing.
+
+        The comparison pass is part of the graph, so each replay compares the copied bank again.
+        """
+        device = wp.get_device("cuda:0")
+        finals = []
+        for captured in (False, True):
+            model, solver, owner = self._owned("sparse", device)
+            rollout = _Rollout(model, solver, copy_back=True)
+            rollout.step()
+            advance = rollout.step
+            if captured:
+                # Capture records the step without running it.
+                with wp.ScopedCapture(device=device) as capture:
+                    rollout.step()
+                advance = functools.partial(wp.capture_launch, capture.graph)
+            before = _generations(owner)
+            for _ in range(5):
+                advance()
+            for start, end in zip(before, _generations(owner), strict=True):
+                np.testing.assert_array_equal(end - start, 5, err_msg=f"{captured=}")
+            finals.append({field: getattr(rollout.states[0], field).numpy() for field in STATE_FIELDS})
+        for field in STATE_FIELDS:
+            np.testing.assert_allclose(finals[1][field], finals[0][field], rtol=0.0, atol=2e-6, err_msg=field)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
+    def test_cuda_velocity_limit_layouts_validate_by_identity(self):
+        """Repair every group after a copy-back under joint velocity limits, whose repair reads prescaled velocities."""
+        model = _build(wp.get_device("cuda:0"), worlds=4, speed_limit=0.8)
+        solver = _mixed_solver(model, enable_joint_velocity_limits=True)
+        owner = solver._tree_kinetic_state
+        self.assertIsNotNone(owner)
+        self.assertFalse(owner.bank_compare)
+        rollout = _Rollout(model, solver, copy_back=True)
+        rollout.step()
+        before = _generations(owner)
+        for _ in range(3):
+            rollout.step()
+        for start, end in zip(before, _generations(owner), strict=True):
+            np.testing.assert_array_equal(end - start, 6)
+
+    @staticmethod
+    def _owned(name, device):
+        model, solver = _owned_case(name, device)
+        owner = solver._tree_kinetic_state
+        if owner is None:
+            raise AssertionError(f"The {name} fixture must admit a held-tree owner")
+        if name == "forest" and not (len(owner.groups) == 1 and owner.groups[0].layout.forest):
+            raise AssertionError(owner.forest_reason)
+        return model, solver, owner
 
 
 def _mass_matrices(solver):

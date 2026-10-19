@@ -559,8 +559,6 @@ class MixedTreeKineticState:
                 chain_scan_default=False,
                 complete=False,
                 response="diagonal" if operator.diagonal else "cholesky",
-                # Copied-state reuse requires fixed scalar coordinates.
-                copy_reuse=not operator.free_root and not solver.enable_joint_velocity_limits,
                 reference=self.reference,
                 clocked=self.clocked,
             )
@@ -568,7 +566,9 @@ class MixedTreeKineticState:
             self.groups.append(group)
         # The existing solver lifecycle delegates factor refresh to this binding.
         self.sparse = self
-        self.copy_reuse = all(group.copy_reuse for group in self.groups)
+        # Every group compares input banks (fixed and free roots alike) unless the
+        # solver prescales velocities; see TreeKineticState.
+        self.bank_compare = all(group.bank_compare for group in self.groups)
 
     def _coverage_arrays(self):
         solver, model = self.solver, self.solver.model
@@ -612,10 +612,10 @@ class MixedTreeKineticState:
         for group in self.groups:
             group.invalidate(world_mask)
 
-    def begin(self, state, augmented, velocity, dt, refresh):
-        """Repair every current component before any factor or force consumer."""
+    def begin(self, state, augmented, velocity, dt, refresh, *, state_out=None):
+        """Repair every current component before any factor or force consumer (see :meth:`TreeKineticState.begin`)."""
         for group in self.groups:
-            group.begin(state, augmented, velocity, dt, refresh)
+            group.begin(state, augmented, velocity, dt, refresh, state_out=state_out)
 
     def refresh(self, augmented):
         """Preserve independent factor masks and numerical representations."""

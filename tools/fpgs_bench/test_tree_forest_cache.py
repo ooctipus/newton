@@ -168,9 +168,21 @@ class TestTreeForestCache(unittest.TestCase):
                 bank = model.state()
                 for name in native.STATE_FIELDS:
                     wp.copy(getattr(bank, name), getattr(output, name))
+                # Identity alone does not cover a copy: every group repairs.
                 generation = owner.data.generation.numpy().copy()
                 owner.begin(bank, augmented, bank.joint_qd, dt, False)
                 np.testing.assert_array_equal(owner.data.generation.numpy(), generation + 1)
+                # Comparing the copy with the bank the finish published keeps every cache,
+                # except under prescaled motion, which validates by identity.
+                solver.v_out.assign(solver.v_hat)
+                owner.finish(bank, augmented, output, dt, False)
+                copy = model.state()
+                for name in native.STATE_FIELDS:
+                    wp.copy(getattr(copy, name), getattr(output, name))
+                generation = owner.data.generation.numpy().copy()
+                owner.begin(copy, augmented, copy.joint_qd, dt, False, state_out=output)
+                np.testing.assert_array_equal(owner.data.generation.numpy(), generation + int(motion))
+                bank = copy
                 if device.startswith("cuda"):
                     with wp.ScopedCapture(device=device) as capture:
                         owner.invalidate(mask)

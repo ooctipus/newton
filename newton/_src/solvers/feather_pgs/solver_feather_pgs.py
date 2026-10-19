@@ -3786,7 +3786,7 @@ class SolverFeatherPGS(SolverBase):
             self._fk_id_cache_enabled
             and self._fk_id_cache_source_state is not None
             and state is not self._fk_id_cache_source_state
-            and not getattr(getattr(self, "_tree_kinetic_state", None), "copy_reuse", False)
+            and not getattr(getattr(self, "_tree_kinetic_state", None), "bank_compare", False)
         ):
             self._fk_id_cache_valid.zero_()
             self._fk_id_cache_source_state = state
@@ -11888,9 +11888,9 @@ class SolverFeatherPGS(SolverBase):
                 if self._step % 2 == 0:
                     self._fk_id_cache_valid.zero_()
             elif _DEBUG_CACHE_MODE != "nozero" and not getattr(
-                getattr(self, "_tree_kinetic_state", None), "copy_reuse", False
+                getattr(self, "_tree_kinetic_state", None), "bank_compare", False
             ):
-                # Copy-aware owners validate changed state banks on the device.
+                # Owners that compare input banks validate a changed bank on the device.
                 if self._fk_id_cache_source_state is not None and state_in is not self._fk_id_cache_source_state:
                     self._fk_id_cache_valid.zero_()
             self._fk_id_cache_source_state = state_in
@@ -11914,7 +11914,9 @@ class SolverFeatherPGS(SolverBase):
 
         refresh_composite = (self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update
         if getattr(self, "_tree_kinetic_state", None) is not None:
-            self._tree_kinetic_state.begin(state_in, state_aug, stage3_qd, self._last_step_dt, refresh_composite)
+            self._tree_kinetic_state.begin(
+                state_in, state_aug, stage3_qd, self._last_step_dt, refresh_composite, state_out=state_out
+            )
             return None, stage3_qd
         parallel_global_refresh = refresh_composite and self._global_inertia_stream is not None
         if self._fused_k1:

@@ -66,6 +66,11 @@ def dfs_intervals(parent):
     return np.asarray(order, np.int32), end
 
 
+def _bank_pointers(state):
+    """The pointers a cache stamp records for a state bank: its coordinates and velocities."""
+    return state.joint_q.ptr, state.joint_qd.ptr
+
+
 def kernel_switches():
     """Read the tree kernels' comparison and instrumentation switches, once per owner.
 
@@ -86,7 +91,15 @@ def kernel_switches():
 
 
 class TreeKineticState:
-    """Own one current cache with device state-bank tags and a separate held W."""
+    """Own one current cache with device state-bank tags and a separate held W.
+
+    A repair proves each group's cache by the input bank's identity (the bank
+    the last finish or repair stamped) or, outside motion-velocity layouts
+    (:attr:`bank_compare`), by its content: when the stamps name the step's
+    output bank instead, as after a caller copies the output bank back into
+    the input bank, a comparison pass before the repair moves the stamp of
+    every group whose two banks hold the same words to the input bank.
+    """
 
     def __init__(
         self,
@@ -96,7 +109,6 @@ class TreeKineticState:
         chain_scan_default=None,
         complete=True,
         response="sparse",
-        copy_reuse=False,
         reference=None,
         clocked=None,
     ):
@@ -113,9 +125,9 @@ class TreeKineticState:
         self.complete = complete
         host = sparse_owner.host
         self.layout, parent, depth = make_plan(model, sparse_owner, complete=complete)
-        if copy_reuse and (self.layout.root_dofs or self.motion_velocity):
-            raise ValueError("Copied-state reuse requires fixed scalar coordinates and ordinary motion")
-        self.copy_reuse = copy_reuse
+        # Motion-velocity layouts keep identity validation: their repair reads the
+        # prescaled velocity, and the solver keeps its host identity check for them.
+        self.bank_compare = not self.motion_velocity
         self.group_count = sparse_owner.plan.group_to_art.size
         # Kernel-selecting switches: a composite owner passes the values it read
         # for all of its groups; a direct construction reads them here.
@@ -171,6 +183,12 @@ class TreeKineticState:
             root_slot[group] = root_lookup.get(start, -1)
             for dof in range(self.layout.root_dofs, dofs):
                 q_index[group, dof] = q_starts[start + dof_joint[dof]] + dof_offset[dof]
+        # Each group's coordinates are one contiguous range, from its first joint's.
+        first_joint = starts[group_to_art]
+        coordinates = q_starts[first_joint + bodies] - q_starts[first_joint]
+        if np.any(coordinates != coordinates[0]):
+            raise ValueError("Tree kinetic state requires one coordinate count per group")
+        self.bank_coordinates = int(coordinates[0])
         if chain_scan_default is None:
             chain_scan_default = True
         self.chain_scan_requested = os.environ.get("FEATHER_PGS_TREE_CHAIN_SCAN", str(int(chain_scan_default))) == "1"
@@ -278,11 +296,6 @@ class TreeKineticState:
         self.data.geometry_generation = wp.full(groups, -1, dtype=wp.int64, device=device)
         self.data.source_q = wp.zeros(groups, dtype=wp.uint64, device=device)
         self.data.source_qd = wp.zeros(groups, dtype=wp.uint64, device=device)
-        if copy_reuse:
-            self.data.snapshot_q = wp.empty((groups, dofs), dtype=float, device=device)
-            self.data.snapshot_qd = wp.empty((groups, dofs), dtype=float, device=device)
-            self.data.snapshot_body_q = wp.empty((groups, bodies), dtype=wp.transform, device=device)
-            self.data.snapshot_body_qd = wp.empty((groups, bodies), dtype=wp.spatial_vector, device=device)
         self.data.status = wp.zeros(groups, dtype=int, device=device)
         self.data.current_valid.zero_()
         self.bias = self.data.bias
@@ -292,6 +305,10 @@ class TreeKineticState:
         self._body_velocity = getattr(sparse_owner, "requires_body_velocity", False)
         self._response = response
         self.lane_timing = {}
+        # Pointers of the bank every current group is stamped with after the last
+        # finish (its output bank) or repair (its input bank), as the host knows it.
+        # It only chooses launches; the kernels check each group's own stamp.
+        self._published = None
         self._bind_kernels()
         if not self.chain_scan:
             self._choose_lanes()
@@ -314,17 +331,20 @@ class TreeKineticState:
             layout=layout,
             body_velocity=self._body_velocity,
             motion_velocity=self.motion_velocity,
-            copy_reuse=self.copy_reuse,
             reference=self.reference,
             clocked=self.clocked,
             host=on_cpu,
+        )
+        self.bank_kernel = (
+            native.get_bank_kernel(self.chain_scan, layout=layout, coordinates=self.bank_coordinates)
+            if self.bank_compare
+            else None
         )
         self.finish_kernel = native.get_state_kernel(
             True,
             self.chain_scan,
             layout=layout,
             body_velocity=self._body_velocity,
-            copy_reuse=self.copy_reuse,
             reference=self.reference,
             clocked=self.clocked,
             host=on_cpu,
@@ -490,11 +510,52 @@ class TreeKineticState:
         """Bind live current and next-state publication descriptors."""
         return cached_state_binding.publication(self.solver, state_in, state_aug, state_out, dt)
 
-    def begin(self, state_in, state_aug, stage3_qd, dt, global_refresh):
-        """Repair current caches or late-request geometry before any factor read."""
+    def _bank(self, state, state_in):
+        """Bind the bank a repair compares ``state_in`` with: same device, contiguous, same shapes."""
+        from .tree_kinetic_state import StateBank  # noqa: PLC0415
+
+        bank = StateBank()
+        for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
+            value, reference = getattr(state, name), getattr(state_in, name)
+            if value.device != reference.device or not value.is_contiguous or value.shape != reference.shape:
+                raise RuntimeError("Tree kinetic bank comparison requires a contiguous state of the same model")
+            setattr(bank, name, value)
+        return bank
+
+    def begin(self, state_in, state_aug, stage3_qd, dt, global_refresh, *, state_out=None):
+        """Repair current caches or late-request geometry before any factor read.
+
+        Args:
+            state_in: The step's input bank, which the repair publishes into.
+            state_aug: The solver's augmented state.
+            stage3_qd: The predictor velocity (the prescaled velocity of a motion-velocity layout).
+            dt: The step duration [s].
+            global_refresh: Whether this step refreshes every group's geometry.
+            state_out: The step's output bank. A group whose cache the last finish
+                published into it keeps that cache when ``state_in`` holds the same
+                words (see :func:`~.tree_kinetic_state.get_bank_kernel`). ``None``
+                validates by identity alone.
+        """
         self._validate_call(state_in, state_aug, dt)
         binding = self._validate_motion(state_in, state_aug, stage3_qd)
         data = self._publication(state_in, state_aug, state_in, dt)
+        device = self.solver.model.device
+        source = _bank_pointers(state_in)
+        if (
+            self.bank_compare
+            and state_out is not None
+            and self._published == _bank_pointers(state_out)
+            and source != self._published
+        ):
+            # The stamps name the output bank: an odd substep count copied it
+            # back into the input bank, or the caller passes a copy of it.
+            wp.launch_tiled(
+                self.bank_kernel,
+                dim=[self.launch_count],
+                inputs=[self.sparse.plan, self.plan, data, self.data, self._bank(state_out, state_in)],
+                block_dim=self.block_dim,
+                device=device,
+            )
         arguments = [
             self.sparse.plan,
             self.plan,
@@ -510,8 +571,9 @@ class TreeKineticState:
             dim=[self.launch_count],
             inputs=arguments,
             block_dim=self.block_dim,
-            device=self.solver.model.device,
+            device=device,
         )
+        self._published = source
         self._motion_binding = binding
 
     def _validate_motion(self, state, state_aug, velocity):
@@ -593,3 +655,4 @@ class TreeKineticState:
             block_dim=self.block_dim,
             device=self.solver.model.device,
         )
+        self._published = _bank_pointers(state_out)

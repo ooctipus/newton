@@ -13,6 +13,7 @@ import warp as wp
 from ...sim import BodyFlags
 from . import cached_force, response_operator, sparse_factor, tree_chain_scan
 from .cached_state import StateOperands, StateStages, make_body_terms, make_state_kernel
+from .publication_data import PublicationData
 from .tree_kinetic_layout import REFERENCE_LAYOUT, TreeLayout
 
 
@@ -63,11 +64,17 @@ class KineticData:
     status: wp.array[int]
     source_q: wp.array[wp.uint64]
     source_qd: wp.array[wp.uint64]
-    snapshot_q: wp.array2d[float]
-    snapshot_qd: wp.array2d[float]
-    snapshot_body_q: wp.array2d[wp.transform]
-    snapshot_body_qd: wp.array2d[wp.spatial_vector]
     stage_clocks: wp.array2d[wp.int64]
+
+
+@wp.struct
+class StateBank:
+    """The generalized and public body state of one state bank, read word for word."""
+
+    joint_q: wp.array[float]
+    joint_qd: wp.array[float]
+    body_q: wp.array[wp.transform]
+    body_qd: wp.array[wp.spatial_vector]
 
 
 @wp.struct
@@ -200,79 +207,58 @@ def _same_source(cache: KineticData, group: int, q: wp.array[float], qd: wp.arra
 def _stamp_source(cache: KineticData, group: int, q: wp.array[float], qd: wp.array[float]): ...
 
 
-@functools.cache
-def _copy_binding(dofs, bodies, plan_type, layout):
-    """Compare fixed scalar coordinates on a changed bank inside its repair block."""
-    lanes = layout.render(_THREADS)
-
-    match_source = (
-        lanes
-        + r"""
+_BANK_MATCHES = r"""
     bool equal=true;
-    for(int local=lane;local<$DOFS;local+=stride) {
-        const int slot=group*$DOFS+local;
-        equal&=q.data[plan.q_index.data[slot]]==cache.snapshot_q.data[slot];
-        equal&=qd.data[first+local]==cache.snapshot_qd.data[slot];
+    const unsigned* a=reinterpret_cast<const unsigned*>(q.data+first_q);
+    const unsigned* b=reinterpret_cast<const unsigned*>(bank.joint_q.data+first_q);
+    for(int k=lane;k<$COORDINATES;k+=stride)equal&=a[k]==b[k];
+    a=reinterpret_cast<const unsigned*>(qd.data+first_dof);
+    b=reinterpret_cast<const unsigned*>(bank.joint_qd.data+first_dof);
+    for(int k=lane;k<$DOFS;k+=stride)equal&=a[k]==b[k];
+    for(int k=lane;k<7*$BODIES;k+=stride) {
+        const int body=children.data[first_joint+k/7];
+        equal&=reinterpret_cast<const unsigned*>(body_q.data+body)[k%7]==
+            reinterpret_cast<const unsigned*>(bank.body_q.data+body)[k%7];
     }
-    for(int local=lane;local<$BODIES;local+=stride) {
-        const int slot=group*$BODIES+local,body=children.data[first_joint+local];
-        for(int k=0;k<7;++k)equal&=body_q.data[body][k]==cache.snapshot_body_q.data[slot][k];
-        for(int k=0;k<6;++k)equal&=body_qd.data[body][k]==cache.snapshot_body_qd.data[slot][k];
+    for(int k=lane;k<6*$BODIES;k+=stride) {
+        const int body=children.data[first_joint+k/6];
+        equal&=reinterpret_cast<const unsigned*>(body_qd.data+body)[k%6]==
+            reinterpret_cast<const unsigned*>(bank.body_qd.data+body)[k%6];
     }
 #if defined(__CUDA_ARCH__)
     return $ALL equal);
 #else
     return equal?1:0;
 #endif
-""".replace("$DOFS", str(dofs)).replace("$BODIES", str(bodies))
-    )
-    match_source = layout.render(match_source)
+"""
 
-    @wp.func_native(match_source)
+
+@functools.cache
+def _bank_binding(coordinates, layout):
+    """Compare a group's input bank with the bank its cache was published into, word for word.
+
+    A group's coordinates (free-root positions and quaternions included), its
+    velocities and its bodies' public poses and twists are compared as 32-bit
+    words: equal banks are bitwise identical inputs, so the cache published
+    from one is the cache a repair would compute from the other. The group's
+    lanes stride the words and vote.
+    """
+    source = _BANK_MATCHES.replace("$COORDINATES", str(coordinates))
+
+    @wp.func_native(layout.render(_THREADS + source))
     def matches(
-        plan: plan_type,
-        cache: KineticData,
-        group: int,
-        first: int,
+        bank: StateBank,
+        first_q: int,
+        first_dof: int,
+        first_joint: int,
         q: wp.array[float],
         qd: wp.array[float],
         children: wp.array[int],
-        first_joint: int,
         body_q: wp.array[wp.transform],
         body_qd: wp.array[wp.spatial_vector],
     ) -> int: ...
 
-    store_source = (
-        lanes
-        + r"""
-    for(int local=lane;local<$DOFS;local+=stride) {
-        const int slot=group*$DOFS+local;
-        cache.snapshot_q.data[slot]=q.data[plan.q_index.data[slot]];
-        cache.snapshot_qd.data[slot]=qd.data[first+local];
-    }
-    for(int local=lane;local<$BODIES;local+=stride) {
-        const int slot=group*$BODIES+local,body=children.data[first_joint+local];
-        cache.snapshot_body_q.data[slot]=body_q.data[body];
-        cache.snapshot_body_qd.data[slot]=body_qd.data[body];
-    }
-""".replace("$DOFS", str(dofs)).replace("$BODIES", str(bodies))
-    )
-
-    @wp.func_native(store_source)
-    def store(
-        plan: plan_type,
-        cache: KineticData,
-        group: int,
-        first: int,
-        q: wp.array[float],
-        qd: wp.array[float],
-        children: wp.array[int],
-        first_joint: int,
-        body_q: wp.array[wp.transform],
-        body_qd: wp.array[wp.spatial_vector],
-    ): ...
-
-    return matches, store
+    return matches
 
 
 @wp.func_native("float* s=reinterpret_cast<float*>(address);for(int k=0;k<7;++k)s[7*body+k]=pose[k];")
@@ -890,7 +876,6 @@ def get_state_kernel(
     layout: TreeLayout = REFERENCE_LAYOUT,
     body_velocity: bool = False,
     motion_velocity: bool = False,
-    copy_reuse: bool = False,
     reference: bool = False,
     clocked: bool = False,
     host: bool = False,
@@ -903,8 +888,6 @@ def get_state_kernel(
     """
     if finish and motion_velocity:
         raise ValueError("Alternate motion velocity is a repair-only contract")
-    if copy_reuse and (layout.root_dofs or motion_velocity):
-        raise ValueError("Copied-state reuse requires fixed scalar coordinates and ordinary motion")
     h = get_helpers(layout, chain_scan, body_velocity, reference=reference, clocked=clocked, host=host)
     release = _keep_static if host else _release
     plan_type = h.plan_type
@@ -927,16 +910,6 @@ def get_state_kernel(
     motion_setup = "motion_changed = _different_motion(data.joint_qd, motion_qd, ds, dofs)\n" if motion_velocity else ""
     motion_reuse = "        and motion_changed == 0\n" if motion_velocity else ""
     motion_bind = "qd = motion_qd" if motion_velocity else ""
-    copy_setup, copy_store, copy_rebind = "", "", ""
-    if copy_reuse:
-        _copy_matches, _copy_store = _copy_binding(dofs, bodies, plan_type, layout)
-        copy_setup = """    if cache.current_valid[art] != 0 and source_matches == 0:
-        source_matches = _copy_matches(plan, cache, group, ds, data.joint_q, data.joint_qd, data.joint_child, js, data.body_q, data.body_qd)
-"""
-        copy_rebind = """        if lane == 0:
-            _stamp_source(cache, group, data.joint_q, data.joint_qd)
-"""
-        copy_store = "_copy_store(plan, cache, group, ds, q, qd, data.joint_child, js, data.body_q, data.body_qd)\n"
     motion_clock = ["pass"] * 4
     if clocked:
         motion_clock = [f"clock_m{k} = _clock()" for k in range(4)]
@@ -976,7 +949,6 @@ if not wp.static(finish):
         for root in range(1, wp.static(roots)):
             refresh = int(refresh != 0 or requests[plan.arts[group, root]] != 0)
     source_matches = _same_source(cache, group, data.joint_q, data.joint_qd)
-{copy_setup}\
     if (
         valid != 0
         and source_matches != 0
@@ -988,7 +960,6 @@ if not wp.static(finish):
             )
         )
     ):
-{copy_rebind}\
         return
 if lane == 0:
     cache.current_valid[art] = 0
@@ -1089,9 +1060,7 @@ _sync()
 """,
         collect="""
 collect(address, group, p, plan, cache, refresh)
-"""
-        + copy_store
-        + """
+
 if lane == 0:
 """
         + indent(stamp, "    "),
@@ -1103,8 +1072,6 @@ if lane == 0:
         name += f"_l{layout.lanes}"
     if chain_scan:
         name += "_chain"
-    if copy_reuse:
-        name += "_copies"
     signature = "p: sparse_factor.SparsePlan, plan: plan_type, data: PublicationData, cache: KineticData, requests: wp.array[int], global_refresh: int"
     if motion_velocity:
         name += "_motion"
@@ -1118,6 +1085,73 @@ if lane == 0:
         finish=finish,
         clocked=clocked,
     )
+
+
+@functools.cache
+def get_bank_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFERENCE_LAYOUT, coordinates: int = 1):
+    """Restamp the valid groups whose input bank repeats the bank their cache was published into.
+
+    A group qualifies when its cache is valid and stamped with the ``bank``
+    argument (the step's output bank, into which the last finish published)
+    rather than with the input bank. If the two banks hold the same words
+    (see :func:`_bank_binding`), the group's stamp moves to the input bank, so
+    the repair that follows takes its early exit. Every other group is left
+    alone. A separate pass keeps the repair kernels unchanged: comparing inside
+    them raised their register counts (sm_120: 80 to 151 on a 13-body chain).
+    """
+    plan_type = tree_chain_scan.ChainPlan if chain_scan else KineticPlan
+    _lanes, _, _, _ = _thread_helpers(layout)
+    matches = _bank_binding(coordinates, layout)
+    pack, roots, forest = layout.pack, len(layout.roots), layout.forest
+
+    def bank_pass(
+        p: sparse_factor.SparsePlan,
+        plan: plan_type,
+        data: PublicationData,
+        cache: KineticData,
+        bank: StateBank,
+    ):
+        block, logical_lane = wp.tid()
+        lanes = _lanes()
+        lane, stride = lanes[0], lanes[1]
+        if stride == 1 and logical_lane != 0:
+            return
+        group = block * wp.static(pack) + lanes[2]
+        art = p.group_to_art[group]
+        valid = cache.current_valid[art]
+        if wp.static(forest):
+            for root in range(1, wp.static(roots)):
+                valid = wp.min(valid, cache.current_valid[plan.arts[group, root]])
+        if valid == 0:
+            return
+        if _same_source(cache, group, data.joint_q, data.joint_qd) != 0:
+            return
+        if _same_source(cache, group, bank.joint_q, bank.joint_qd) == 0:
+            return
+        js = p.art_joint_start[art]
+        equal = matches(
+            bank,
+            data.joint_q_start[js],
+            p.art_dof_start[art],
+            js,
+            data.joint_q,
+            data.joint_qd,
+            data.joint_child,
+            data.body_q,
+            data.body_qd,
+        )
+        if equal != 0 and lane == 0:
+            _stamp_source(cache, group, data.joint_q, data.joint_qd)
+
+    name = f"tree_kinetic_bank{layout.bodies}"
+    if forest:
+        name += f"_forest{roots}"
+    if pack > 1:
+        name += f"_l{layout.lanes}"
+    if chain_scan:
+        name += "_chain"
+    bank_pass.__name__ = bank_pass.__qualname__ = name
+    return wp.kernel(module="unique", enable_backward=False)(bank_pass)
 
 
 @functools.cache

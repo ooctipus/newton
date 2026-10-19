@@ -515,7 +515,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
                     model, owner=True, friction_anchor_beta=beta, attrs=recipe
                 )
                 self.assertIsInstance(owner, MixedTreeKineticState)
-                self.assertFalse(owner.copy_reuse)
+                self.assertFalse(owner.bank_compare)
                 self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
                 np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
                 np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)

@@ -267,7 +267,9 @@ def _tree_group(group) -> dict:
         "chain_scan": bool(group.chain_scan),
         "chain_scan_requested": bool(group.chain_scan_requested),
         "response": group._response,
-        "copy_reuse": bool(group.copy_reuse),
+        # "content": a repair whose input bank is not the bank the cache was published into
+        # compares the two banks word for word; "identity": the bank's pointers alone.
+        "input_validation": "content" if group.bank_compare else "identity",
         "motion_velocity": bool(group.motion_velocity),
         "publishes_twists": bool(group.publishes_twists),
         # Several admissible widths are timed once at construction (measurements.held_tree_lane_timing_us);

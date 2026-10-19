@@ -176,25 +176,50 @@ def _run_state_trajectory(model, solver, num_steps, *, invalidate_fk_each_step):
 class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "FK/ID reuse requires CUDA")
     def test_split_fk_id_cache_does_not_alias_active_step_state(self):
-        """Keep split-mode cached dynamics isolated from active solve scratch."""
-        model = _build_floating_model("cuda:0")
-        solver = SolverFeatherPGS(model, update_mass_matrix_interval=2, pgs_mode="split")
-        state_in = _make_floating_state(model)
-        state_aug = solver._prepare_augmented_state(state_in, model.state(), model.control())
-        cache = solver._fk_id_cache
+        """Validate split-mode cached dynamics by input content, with no private snapshot of the solve.
 
-        active_cache_pairs = (
-            (state_aug.body_q_com, cache.body_q_com),
-            (state_aug.joint_S_s, cache.joint_S_s),
-            (state_aug.body_I_s, cache.body_I_s),
-            (solver._body_inertia_terms, cache.body_inertia_terms),
-            (state_aug.body_v_s, cache.body_v_s),
-            (state_aug.body_f_s, cache.body_f_s),
-            (state_aug.body_a_s, cache.body_a_s),
-            (solver.articulation_origin, cache.articulation_origin),
-        )
-        for active, cached in active_cache_pairs:
-            self.assertNotEqual(active.ptr, cached.ptr)
+        The held-tree owner publishes its caches in place: a step whose input bank is a copy of the
+        bank the last step published compares the two and keeps every cache, and a copy with one
+        changed world repairs that world alone. Both match a rollout that recomputes every step.
+        """
+        trajectories = []
+        for forced in (False, True):
+            model = _build_floating_model("cuda:0", num_worlds=3)
+            solver = SolverFeatherPGS(model, update_mass_matrix_interval=2, pgs_mode="split")
+            owner = solver._tree_kinetic_state
+            self.assertIsNotNone(owner)
+            self.assertIsNone(solver._fk_id_cache)
+            self.assertFalse(solver._fk_id_cache_uses_snapshot)
+            self.assertTrue(owner.bank_compare)
+            groups = list(getattr(owner, "groups", [owner]))
+            state_in, state_out = _make_floating_state(model), model.state()
+            control, contacts = model.control(), model.contacts()
+            hinge = (model.joint_type.numpy() == int(newton.JointType.REVOLUTE)) & (model.joint_world.numpy() == 1)
+            hinge_dof = model.joint_qd_start.numpy()[np.flatnonzero(hinge)[0]]
+            history = []
+            for step in range(8):
+                if step == 4:
+                    # Change world 1's hinge in the copied input bank, without a notification.
+                    qd = state_in.joint_qd.numpy()
+                    qd[hinge_dof] += 0.25
+                    state_in.joint_qd.assign(qd)
+                if forced:
+                    solver._fk_id_cache_valid.zero_()
+                before = [group.data.generation.numpy().copy() for group in groups]
+                solver.step(state_in, state_out, control, contacts, DT)
+                state_in.assign(state_out)
+                if step and not forced:
+                    for group, start in zip(groups, before, strict=True):
+                        worlds = solver.art_to_world.numpy()[group.sparse.plan.group_to_art.numpy()]
+                        # One finish per step; only the written world repairs as well.
+                        np.testing.assert_array_equal(
+                            group.data.generation.numpy() - start, 1 + ((worlds == 1) & (step == 4))
+                        )
+                history.append({name: getattr(state_in, name).numpy().copy() for name in ("joint_q", "joint_qd")})
+            trajectories.append(history)
+        for cached, recomputed in zip(*trajectories, strict=True):
+            for name in cached:
+                np.testing.assert_allclose(cached[name], recomputed[name], rtol=0.0, atol=2.0e-6, err_msg=name)
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free PGS requires CUDA")
     def test_matrix_free_fk_id_cache_keeps_zero_copy_path(self):

@@ -222,7 +222,8 @@ class TestMixedTreeCache(unittest.TestCase):
             for key in ("joint_q", "joint_qd", "body_q", "body_qd", "body_f"):
                 wp.copy(getattr(bank, key), getattr(output, key))
             generation = [group.data.generation.numpy().copy() for group in owner.groups]
-            owner.begin(bank, aug, bank.joint_qd, DT, False)
+            # The copy holds the words of the bank the caches were stamped with: no group repairs.
+            owner.begin(bank, aug, bank.joint_qd, DT, False, state_out=output)
             for group, before in zip(owner.groups, generation, strict=False):
                 np.testing.assert_array_equal(group.data.generation.numpy(), before)
             solver.mass_update_mask.zero_()

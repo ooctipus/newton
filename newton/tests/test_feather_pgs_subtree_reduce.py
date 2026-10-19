@@ -126,7 +126,6 @@ def _finish(group, reference):
         group.chain_scan,
         layout=group.layout,
         body_velocity=group._body_velocity,
-        copy_reuse=group.copy_reuse,
         reference=reference,
         clocked=group.clocked,
     )

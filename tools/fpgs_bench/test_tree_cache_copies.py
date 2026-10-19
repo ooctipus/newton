@@ -41,7 +41,8 @@ class TestTreeCacheCopies(unittest.TestCase):
         bank = copy_state(model, output)
         before = generations(owner)
         geometry = [group.geometric.numpy().copy() for group in owner.groups]
-        owner.begin(bank, augmented, bank.joint_qd, DT, True)
+        # The caches were published into ``output``; its exact copy keeps them.
+        owner.begin(bank, augmented, bank.joint_qd, DT, True, state_out=output)
         for group, previous, mass in zip(owner.groups, before, geometry, strict=True):
             np.testing.assert_array_equal(group.data.generation.numpy(), previous)
             np.testing.assert_array_equal(group.geometric.numpy(), mass)
@@ -59,7 +60,7 @@ class TestTreeCacheCopies(unittest.TestCase):
             values[body, 0] += np.float32(0.03)
             field.assign(values)
             before = generations(owner)
-            owner.begin(partial, augmented, partial.joint_qd, DT, True)
+            owner.begin(partial, augmented, partial.joint_qd, DT, True, state_out=bank)
             for group, previous in zip(owner.groups, before, strict=True):
                 expected = previous.copy()
                 if group is target:
@@ -84,7 +85,7 @@ class TestTreeCacheCopies(unittest.TestCase):
             values[index] += np.float32(0.025)
             field.assign(values)
             before = generations(owner)
-            owner.begin(changed, augmented, changed.joint_qd, DT, True)
+            owner.begin(changed, augmented, changed.joint_qd, DT, True, state_out=bank)
             for group, previous in zip(owner.groups, before, strict=True):
                 expected = previous.copy()
                 if group is target:
@@ -111,7 +112,7 @@ class TestTreeCacheCopies(unittest.TestCase):
         requests[target.sparse.plan.group_to_art.numpy()[0]] = 1
         solver._mass_update_requested.assign(requests)
         before = generations(owner)
-        owner.begin(bank, augmented, bank.joint_qd, DT, False)
+        owner.begin(bank, augmented, bank.joint_qd, DT, False, state_out=output)
         for group, previous in zip(owner.groups, before, strict=True):
             expected = previous.copy()
             if group is target:
