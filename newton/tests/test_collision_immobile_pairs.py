@@ -851,6 +851,62 @@ def test_fixed_base_arm_steps_match(test, device):
                 _check_arm_steps(test, model, law, beta, device)
 
 
+def _arm_trajectory(test, model, flag, law, friction_anchor_beta, steps=60):
+    """Free-run the arm scene as applications step it, with the immobile-pair flag at ``flag``.
+
+    Two states take turns as input and output, which FeatherPGS's caches follow, and the contacts
+    keep the order in which the pipeline lists them.
+
+    Returns:
+        The joint coordinates and velocities after each step, and the number of contacts in all,
+        between two immobile shapes and between the arm and the cube, summed over the steps.
+    """
+    roles = _arm_shape_roles(model)
+    solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=friction_anchor_beta)
+    test.assertEqual(solver.get_path_selection()["routes"]["friction"]["law"], law)
+    pipeline = _pipeline(model, flag)
+    contacts = pipeline.contacts()
+    control = model.control()
+    state_0, state_1 = model.state(), model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+    trajectory, counts = [], {"all": 0, "immobile": 0, "arm_cube": 0}
+    for _ in range(steps):
+        pipeline.collide(state_0, contacts)
+        ends = _contact_roles(contacts, roles)
+        counts["all"] += ends.shape[1]
+        counts["immobile"] += int(np.count_nonzero(ends[1] <= 0))
+        counts["arm_cube"] += int(np.count_nonzero((ends[0] == 1) & (ends[1] == 2)))
+        state_0.clear_forces()
+        solver.step(state_0, state_1, control, contacts, 1.0 / 120.0)
+        state_0, state_1 = state_1, state_0
+        trajectory.append(np.concatenate((state_0.joint_q.numpy(), state_0.joint_qd.numpy())))
+    return np.asarray(trajectory), counts
+
+
+def test_fixed_base_arm_trajectories_match(test, device):
+    """Free-run FeatherPGS bitwise alike without the base's ground contacts, on CPU.
+
+    Both runs step as applications do, with two states in turn and the contacts of the default
+    and the opt-out pipeline in their own order, the dropped contacts among the others. CPU
+    kernels run in order, so the remaining contacts reserve their rows in the same order. CUDA
+    reserves rows with atomics and can order them otherwise; test_fixed_base_arm_steps_match
+    covers it. The base is rooted by a fixed joint and by a D6 joint without axes.
+    """
+    for root in ("fixed", "locked_d6"):
+        model = _arm_scene(device, locked_d6=root == "locked_d6")
+        for law, beta in (("point", 0.0), ("patch", 0.2)):
+            with test.subTest(root=root, friction=law):
+                expected, listed = _arm_trajectory(test, model, "0", law, beta)
+                actual, counts = _arm_trajectory(test, model, None, law, beta)
+                # The base rests in the ground and the arm presses the cube; only the base's
+                # ground contacts are dropped.
+                test.assertGreater(listed["immobile"], 0)
+                test.assertGreater(listed["arm_cube"], 0)
+                test.assertEqual(counts, {**listed, "all": listed["all"] - listed["immobile"], "immobile": 0})
+                test.assertTrue(np.all(np.isfinite(actual)))
+                np.testing.assert_array_equal(actual, expected)
+
+
 class TestCollisionImmobilePairs(unittest.TestCase):
     pass
 
@@ -884,6 +940,13 @@ for name, function in (
     ("test_fixed_base_arm_steps_match", test_fixed_base_arm_steps_match),
 ):
     add_function_test(TestCollisionImmobilePairs, name, function, devices=devices)
+# CUDA can reserve the rows of renumbered contacts in another order.
+add_function_test(
+    TestCollisionImmobilePairs,
+    "test_fixed_base_arm_trajectories_match",
+    test_fixed_base_arm_trajectories_match,
+    devices=[device for device in devices if device.is_cpu],
+)
 
 
 if __name__ == "__main__":
