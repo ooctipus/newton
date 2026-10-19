@@ -8,6 +8,7 @@ and sorted candidate sets are compared with :class:`BroadPhaseExplicit` on every
 device; on CPU, where both run serially in list order, the arrays must be equal.
 """
 
+import functools
 import itertools
 import json
 import os
@@ -557,6 +558,18 @@ def _kernel_record(pipeline):
     return pipeline.get_collision_selection()["narrow_phase"]["broad_phase_kernel"]
 
 
+def _launched(run):
+    """Call ``run()`` and count the template and flat explicit broad-phase launches it makes (both still run)."""
+    with (
+        mock.patch.object(
+            BroadPhaseExplicitTemplates, "launch", autospec=True, side_effect=BroadPhaseExplicitTemplates.launch
+        ) as templates,
+        mock.patch.object(BroadPhaseExplicit, "launch", autospec=True, side_effect=BroadPhaseExplicit.launch) as flat,
+    ):
+        result = run()
+    return result, {"templates": templates.call_count, "flat": flat.call_count}
+
+
 def _global_order_models(test, device):
     """Yield (global order, model, posed state); global shapes after the worlds make the kernel swap pairs."""
     for global_order in _GLOBAL_ORDERS:
@@ -580,8 +593,10 @@ def test_pipeline_templates_match_flat_contacts(test, device):
             test.assertEqual(record["source"], "environment")
             test.assertEqual(record["templates"]["global_pairs"], 1)
             test.assertEqual(_kernel_record(flat)["kernel"], "flat_pairs")
-            templated_contacts = _contacts(templated, model, state)
-            flat_contacts = _contacts(flat, model, state)
+            templated_contacts, launches = _launched(functools.partial(_contacts, templated, model, state))
+            test.assertEqual(launches, {"templates": 1, "flat": 0})
+            flat_contacts, launches = _launched(functools.partial(_contacts, flat, model, state))
+            test.assertEqual(launches, {"templates": 0, "flat": 1})
             count = int(flat.broad_phase_pair_count.numpy()[0])
             test.assertGreater(count, 0)
             test.assertEqual(int(templated.broad_phase_pair_count.numpy()[0]), count)
@@ -610,7 +625,8 @@ def test_pipeline_immovable_filter_matches_flat(test, device):
             templated = _pipeline(model, "1", include_static_kinematic_pairs=False)
             flat = _pipeline(model, "0", include_static_kinematic_pairs=False)
             unfiltered = _pipeline(model, "0")
-            templated_contacts = _contacts(templated, model, state)
+            templated_contacts, launches = _launched(functools.partial(_contacts, templated, model, state))
+            test.assertEqual(launches, {"templates": 1, "flat": 0})
             flat_contacts = _contacts(flat, model, state)
             _contacts(unfiltered, model, state)
             count = int(flat.broad_phase_pair_count.numpy()[0])
@@ -652,6 +668,58 @@ class TestBroadPhaseTemplateSelection(unittest.TestCase):
         self.assertEqual(record["templates"]["templates"], 3)
         self.assertIsNone(_kernel_record(_pipeline(model, "1", broad_phase="nxn")))
 
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+        with self.subTest(case="prebuilt broad phase"):
+            # An expert pipeline launches its own broad phase, even over the model-built list.
+            narrow_phase = _pipeline(model, "0").narrow_phase
+            expert = _pipeline(model, "1", broad_phase=BroadPhaseExplicit(), narrow_phase=narrow_phase)
+            record = _kernel_record(expert)
+            self.assertEqual(record["kernel"], "flat_pairs")
+            self.assertIn("prebuilt broad phase", record["reason"])
+            _, launches = _launched(functools.partial(_contacts, expert, model, state))
+            self.assertEqual(launches, {"templates": 0, "flat": 1})
+        with (
+            self.subTest(case="staging capacity"),
+            mock.patch.object(BroadPhaseExplicitTemplates, "MAX_STAGED_SHAPES", 4),
+        ):
+            # Templates that reference more shapes than a world can stage keep the flat kernel.
+            record = _kernel_record(_pipeline(model, "1"))
+            self.assertEqual(record["kernel"], "flat_pairs")
+            self.assertIn("the template kernel stages at most 4", record["reason"])
+            self.assertIsNotNone(record["templates"])
+
+    def test_automatic_route_matches_flat_kernel(self):
+        """Admit large templates with the flag unset, launch them in collide() and match the flat kernel."""
+        model = _finalize(_replicated_builder(), "cpu")
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+        # The fixture is far below the automatic thresholds; lower them to take the default route.
+        with (
+            mock.patch.object(BroadPhaseExplicitTemplates, "AUTO_MIN_PAIRS", 1),
+            mock.patch.object(BroadPhaseExplicitTemplates, "AUTO_MIN_PAIRS_PER_WORLD", 1),
+        ):
+            automatic = _pipeline(model, None)
+        record = _kernel_record(automatic)
+        self.assertEqual(record["kernel"], "world_templates")
+        self.assertEqual(record["source"], "automatic")
+        self.assertIn("Automatic: large world templates", record["reason"])
+        contacts, launches = _launched(functools.partial(_contacts, automatic, model, state))
+        self.assertEqual(launches, {"templates": 1, "flat": 0})
+        flat = _pipeline(model, "0")
+        flat_contacts = _contacts(flat, model, state)
+        count = int(flat.broad_phase_pair_count.numpy()[0])
+        self.assertGreater(count, 0)
+        self.assertEqual(int(automatic.broad_phase_pair_count.numpy()[0]), count)
+        # Serial CPU runs keep list order: the arrays match.
+        np.testing.assert_array_equal(
+            automatic.broad_phase_shape_pairs.numpy()[:count], flat.broad_phase_shape_pairs.numpy()[:count]
+        )
+        for name in _CONTACT_ARRAYS:
+            np.testing.assert_array_equal(
+                getattr(contacts, name).numpy(), getattr(flat_contacts, name).numpy(), err_msg=name
+            )
+
     def test_changed_list_keeps_the_flat_kernel(self):
         """Fall back when the model-built list was changed in place after finalization."""
         model = _finalize(_replicated_builder(), "cpu")
@@ -677,26 +745,46 @@ class TestBroadPhaseTemplateSelection(unittest.TestCase):
             _pipeline(model, "auto")
 
 
+def _capture_collide(pipeline, state, contacts):
+    """Capture one ``collide()`` in a CUDA graph (modules must be loaded) and return the graph."""
+    with wp.ScopedCapture(device=pipeline.device, force_module_load=False) as capture:
+        pipeline.collide(state, contacts)
+    return capture.graph
+
+
+def _replay_matches_flat(test, graph, templated, contacts, flat, state):
+    """Replay ``graph`` into cleared outputs, compare with ``flat`` run eagerly on ``state``; return the count."""
+    flat_contacts = _contacts(flat, flat.model, state)
+    count = int(flat.broad_phase_pair_count.numpy()[0])
+    templated.broad_phase_shape_pairs.zero_()
+    templated.broad_phase_pair_count.zero_()
+    for _ in range(3):
+        wp.capture_launch(graph)
+    test.assertEqual(int(templated.broad_phase_pair_count.numpy()[0]), count)
+    np.testing.assert_array_equal(
+        _sorted_codes(templated.broad_phase_shape_pairs.numpy(), count, count),
+        _sorted_codes(flat.broad_phase_shape_pairs.numpy(), count, count),
+    )
+    np.testing.assert_array_equal(_contact_rows(contacts), _contact_rows(flat_contacts))
+    return count
+
+
 def test_graph_replays_template_broad_phase(test, device):
-    """Capture the template broad phase in a CUDA graph and replay the flat kernel's candidates."""
+    """Capture the template broad phase in a CUDA graph and replay the flat kernel's candidates on live state."""
     for global_order, model, state in _global_order_models(test, device):
         with test.subTest(global_order=global_order):
             templated = _pipeline(model, "1")
             flat = _pipeline(model, "0")
             test.assertEqual(_kernel_record(templated)["kernel"], "world_templates")
-            flat_contacts = _contacts(flat, model, state)
-            count = int(flat.broad_phase_pair_count.numpy()[0])
             contacts = _contacts(templated, model, state)  # load modules before capture
-            with wp.ScopedCapture(device=device, force_module_load=False) as capture:
-                templated.collide(state, contacts)
-            for _ in range(3):
-                wp.capture_launch(capture.graph)
-            test.assertEqual(int(templated.broad_phase_pair_count.numpy()[0]), count)
-            np.testing.assert_array_equal(
-                _sorted_codes(templated.broad_phase_shape_pairs.numpy(), count, count),
-                _sorted_codes(flat.broad_phase_shape_pairs.numpy(), count, count),
-            )
-            np.testing.assert_array_equal(_contact_rows(contacts), _contact_rows(flat_contacts))
+            graph, launches = _launched(functools.partial(_capture_collide, templated, state, contacts))
+            test.assertEqual(launches, {"templates": 1, "flat": 0})
+            count = _replay_matches_flat(test, graph, templated, contacts, flat, state)
+            # Lift world 4 clear of the global box and its static shape: the replay must read the new poses.
+            body_q = state.body_q.numpy()
+            body_q[model.body_world.numpy() == 4, 2] += 3.0
+            state.body_q.assign(body_q)
+            test.assertLess(_replay_matches_flat(test, graph, templated, contacts, flat, state), count)
 
 
 class TestBroadPhaseTemplates(unittest.TestCase):
