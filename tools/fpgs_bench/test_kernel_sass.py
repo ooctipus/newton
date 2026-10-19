@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Check the SASS record's branch resolution, listing normalization and comparison."""
+"""Check the SASS record's branch resolution, listing parsing, occupancy model and comparison."""
 
 import contextlib
 import io
@@ -10,12 +10,43 @@ import unittest
 from tools.fpgs_bench import kernel_sass as sass
 
 
-def _record(**kernels):
-    return {"kernels": kernels}
+def _record(arch=120, **kernels):
+    return {"arch": arch, "kernels": kernels}
 
 
-def _row(reg=80, digest="s", cpu="c"):
-    return {"reg": reg, "stack": 72, "shared": 3600, "local": 0, "instructions": 100, "sass": digest, "cpu_twin": cpu}
+def _row(reg=80, digest="s", cpu="c", shared=3600, block_dim=32, local=0):
+    return {
+        "reg": reg,
+        "stack": 72,
+        "shared": shared,
+        "local": local,
+        "instructions": 100,
+        "sass": digest,
+        "cpu_twin": cpu,
+        "block_dim": block_dim,
+    }
+
+
+# Two kernels of one module, as cuobjdump lists them.
+_USAGE = """Resource usage:
+ Common:
+  GLOBAL:147 CONSTANT[3]:5720
+ Function first_0123abcd_cuda_kernel_forward:
+  REG:40 STACK:0 SHARED:1152 LOCAL:0 CONSTANT[0]:976 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function second_89abcdef_cuda_kernel_forward:
+  REG:86 STACK:72 SHARED:2880 LOCAL:8 CONSTANT[0]:976 TEXTURE:0 SURFACE:0 SAMPLER:0
+"""
+_SASS = """
+\tcode for sm_120
+\t\tFunction : second_89abcdef_cuda_kernel_forward
+\t.headerflags\t@"EF_CUDA_SM120 EF_CUDA_VIRTUAL_SM(EF_CUDA_SM120)"
+        /*0000*/                   LDC R1, c[0x0][0x37c] ;                /* 0x0000df00ff017b82 */
+        /*0010*/                   EXIT ;                                 /* 0x000000000000794d */
+\t\t..........
+
+\t\tFunction : first_0123abcd_cuda_kernel_forward
+        /*0000*/                   MOV R2, 0x1 ;                          /* 0x0000000100027802 */
+"""
 
 
 class TestKernelSass(unittest.TestCase):
@@ -59,24 +90,65 @@ class TestKernelSass(unittest.TestCase):
         self.assertEqual(sass.sass_instructions(listing), ["LDC R1, c[0x0][0x37c]", "CALL.REL KERNEL_forward"])
 
     def test_parse_usage(self):
-        """Read registers, stack, shared and local memory of the kernel function."""
+        """Read registers, stack, shared and local memory of one function, and refuse a listing of several."""
         usage = " Function k_cuda_kernel_forward:\n  REG:80 STACK:72 SHARED:3600 LOCAL:0 CONSTANT[2]:36"
         self.assertEqual(sass.parse_usage(usage), {"reg": 80, "stack": 72, "shared": 3600, "local": 0})
+        with self.assertRaises(ValueError):
+            sass.parse_usage(_USAGE)
 
-    def test_compare_flags_register_granules(self):
-        """Report changed SASS, resources and CPU twins, and flag a register count crossing a granule."""
-        parent = _record(same=_row(), within=_row(78), across=_row(80), twin=_row(), gone=_row())
-        child = _record(same=_row(), within=_row(74, "t"), across=_row(82, "t"), twin=_row(cpu="d"), new=_row())
+    def test_listings_split_by_function(self):
+        """Credit each kernel of a module with its own resources and instructions, whatever the listing order."""
+        usage, listing = sass.function_sections(_USAGE), sass.function_sections(_SASS)
+        self.assertEqual(sorted(usage), ["first_0123abcd_cuda_kernel_forward", "second_89abcdef_cuda_kernel_forward"])
+        self.assertEqual(sorted(listing), sorted(usage))
+        second = "second_89abcdef_cuda_kernel_forward"
+        self.assertEqual(sass.parse_usage(usage[second]), {"reg": 86, "stack": 72, "shared": 2880, "local": 8})
+        self.assertEqual(sass.sass_instructions(listing[second]), ["LDC R1, c[0x0][0x37c]", "EXIT"])
+        self.assertEqual(sass.sass_instructions(listing["first_0123abcd_cuda_kernel_forward"]), ["MOV R2, 0x1"])
+
+    def test_resident_blocks(self):
+        """Count resident blocks per SM from registers, shared memory, block size and the architecture's limits."""
+        # A 72-register one-warp kernel: the block limit binds on sm_120, registers (7 warps per
+        # sub-partition) on sm_103; at 80 registers both keep 24 (6 warps per sub-partition).
+        self.assertEqual(sass.resident_blocks(72, 2704, 32, 120), 24)
+        self.assertEqual(sass.resident_blocks(72, 2704, 32, 103), 28)
+        self.assertEqual(sass.resident_blocks(80, 2704, 32, 103), 24)
+        # 86 registers allocate 88: 5 warps per sub-partition.
+        self.assertEqual(sass.resident_blocks(86, 2880, 32, 120), 20)
+        # Shared memory binds: 6928 bytes allocate 7040, 14 of them in 100 KB.
+        self.assertEqual(sass.resident_blocks(80, 6928, 32, 120), 14)
+        # A two-warp block: 12 by registers, 11 by shared memory.
+        self.assertEqual(sass.resident_blocks(79, 9024, 64, 120), 11)
+
+    def test_compare_reports_granule_direction_and_resident_blocks(self):
+        """Report changed SASS, resources and CPU twins with each granule crossing's direction and blocks per SM."""
+        parent = _record(same=_row(), within=_row(78), up=_row(72), down=_row(91), twin=_row(), gone=_row())
+        child = _record(
+            same=_row(), within=_row(74, "t"), up=_row(78, "t"), down=_row(79, "t"), twin=_row(cpu="d"), new=_row()
+        )
         result = sass.compare(parent, child)
-        self.assertEqual(sorted(result["changed"]), ["across", "twin", "within"])
-        self.assertFalse(result["changed"]["within"]["granule"])
-        self.assertTrue(result["changed"]["across"]["granule"])
+        self.assertEqual(sorted(result["changed"]), ["down", "twin", "up", "within"])
+        self.assertIsNone(result["changed"]["within"]["granule"])
+        self.assertEqual(result["changed"]["up"]["granule"], "up")
+        self.assertEqual(result["changed"]["down"]["granule"], "down")
+        self.assertEqual(result["changed"]["up"]["blocks"], (24, 24))
+        self.assertEqual(result["changed"]["down"]["blocks"], (20, 24))
         self.assertEqual(result["changed"]["twin"], {"cpu_twin": ("c", "d")})
         self.assertEqual((result["added"], result["removed"]), (["new"], ["gone"]))
         with contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(sass.report(parent, child), 1)
             self.assertEqual(sass.report(parent, _record(**parent["kernels"])), 0)
-        self.assertIn("REGISTER GRANULE CROSSED", output.getvalue())
+        self.assertIn("granule up, blocks/SM 24->24", output.getvalue())
+        self.assertIn("granule down, blocks/SM 20->24", output.getvalue())
+        self.assertNotIn("REGRESSION", output.getvalue())
+
+    def test_report_fails_kernels_that_lose_resident_blocks_or_spill(self):
+        """Exit 2 when a kernel keeps fewer blocks resident or spills more to local memory."""
+        parent = _record(103, kernel=_row(72, shared=4752))
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(sass.report(parent, _record(103, kernel=_row(80, "t", shared=4752))), 2)
+            self.assertEqual(sass.report(parent, _record(103, kernel=_row(72, "t", shared=4752, local=16))), 2)
+        self.assertIn("blocks/SM 28->24, REGRESSION", output.getvalue())
 
 
 if __name__ == "__main__":
