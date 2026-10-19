@@ -16,6 +16,43 @@ _MFGS_TILE_SHARED_STORAGE_BYTES = 128
 _MFGS_STATIC_SHARED_MAX_BYTES = 48 * 1024
 
 
+class _MFGSMetadataFootprint(NamedTuple):
+    """Shared memory of resident MF-GS row metadata and the decision it implies [B].
+
+    ``metadata_bytes`` counts the per-row metadata arrays; ``total_bytes`` is what
+    the block would declare with them resident (tile storage, world velocity,
+    dense and MF impulses and metadata). ``resident`` applies the compact-shape
+    rule of :func:`_mfgs_metadata_footprint` to both.
+    """
+
+    resident: bool
+    metadata_bytes: int
+    total_bytes: int
+
+
+def _mfgs_metadata_footprint(
+    max_constraints: int,
+    mf_max_constraints: int,
+    max_world_dofs: int,
+    max_shared_memory: int,
+    *,
+    has_drive_rows: bool,
+    fuse_vel_limits: bool,
+) -> _MFGSMetadataFootprint:
+    """Measure resident MF-GS metadata and decide whether compact solver shapes keep it.
+
+    Resident row metadata removes repeated global loads across PGS iterations,
+    but larger shapes lose more throughput from the resulting occupancy drop.
+    Keep at most one 4-KiB metadata working set resident and stream larger sets.
+    """
+    metadata_arrays = 4 + 4 * int(has_drive_rows) + int(fuse_vel_limits)
+    metadata_bytes = 4 * max_constraints * metadata_arrays
+    base_shared_bytes = 4 * (max_world_dofs + max_constraints + mf_max_constraints)
+    total_bytes = _MFGS_TILE_SHARED_STORAGE_BYTES + base_shared_bytes + metadata_bytes
+    resident = metadata_bytes <= _MFGS_RESIDENT_METADATA_MAX_BYTES and total_bytes <= max_shared_memory
+    return _MFGSMetadataFootprint(resident, metadata_bytes, total_bytes)
+
+
 def _use_resident_mfgs_metadata(
     max_constraints: int,
     mf_max_constraints: int,
@@ -25,17 +62,15 @@ def _use_resident_mfgs_metadata(
     has_drive_rows: bool,
     fuse_vel_limits: bool,
 ) -> bool:
-    """Select resident MF-GS metadata for compact solver shapes.
-
-    Resident row metadata removes repeated global loads across PGS iterations,
-    but larger shapes lose more throughput from the resulting occupancy drop.
-    Keep at most one 4-KiB metadata working set resident and stream larger sets.
-    """
-    metadata_arrays = 4 + 4 * int(has_drive_rows) + int(fuse_vel_limits)
-    metadata_bytes = 4 * max_constraints * metadata_arrays
-    base_shared_bytes = 4 * (max_world_dofs + max_constraints + mf_max_constraints)
-    total_shared_bytes = _MFGS_TILE_SHARED_STORAGE_BYTES + base_shared_bytes + metadata_bytes
-    return metadata_bytes <= _MFGS_RESIDENT_METADATA_MAX_BYTES and total_shared_bytes <= max_shared_memory
+    """Select resident MF-GS metadata for compact solver shapes (see :func:`_mfgs_metadata_footprint`)."""
+    return _mfgs_metadata_footprint(
+        max_constraints,
+        mf_max_constraints,
+        max_world_dofs,
+        max_shared_memory,
+        has_drive_rows=has_drive_rows,
+        fuse_vel_limits=fuse_vel_limits,
+    ).resident
 
 
 class _MFGSStorage(NamedTuple):
@@ -78,10 +113,7 @@ def _select_mfgs_storage(
     Both storage classes hold identical values, so results are bitwise
     identical. Without the launch shape the packed metadata streams with the rest.
     """
-    metadata_arrays = 4 + 4 * int(has_drive_rows) + int(fuse_vel_limits)
-    metadata_bytes = 4 * max_constraints * metadata_arrays
-    metadata_budget = _MFGS_RESIDENT_METADATA_MAX_BYTES
-    shared_metadata = _use_resident_mfgs_metadata(
+    footprint = _mfgs_metadata_footprint(
         max_constraints,
         mf_max_constraints,
         max_world_dofs,
@@ -89,22 +121,19 @@ def _select_mfgs_storage(
         has_drive_rows=has_drive_rows,
         fuse_vel_limits=fuse_vel_limits,
     )
+    shared_metadata = footprint.resident
+    metadata_budget = _MFGS_RESIDENT_METADATA_MAX_BYTES
     if shared_metadata:
-        reason = f"Row metadata is resident: {metadata_bytes} bytes fit the {metadata_budget}-byte budget."
-    elif metadata_bytes > metadata_budget:
-        reason = f"Row metadata streams: {metadata_bytes} bytes exceed the {metadata_budget}-byte budget."
+        reason = f"Row metadata is resident: {footprint.metadata_bytes} bytes fit the {metadata_budget}-byte budget."
+    elif footprint.metadata_bytes > metadata_budget:
+        reason = f"Row metadata streams: {footprint.metadata_bytes} bytes exceed the {metadata_budget}-byte budget."
     else:
-        resident_bytes = (
-            _MFGS_TILE_SHARED_STORAGE_BYTES
-            + 4 * (max_world_dofs + max_constraints + mf_max_constraints)
-            + metadata_bytes
-        )
         reason = (
-            f"Row metadata streams: resident, the block would need {resident_bytes} bytes of shared memory; "
+            f"Row metadata streams: resident, the block would need {footprint.total_bytes} bytes of shared memory; "
             f"the device exposes {max_shared_memory}."
         )
-    metadata_arrays = metadata_arrays if shared_metadata else 0
-    fixed_bytes = _MFGS_TILE_SHARED_STORAGE_BYTES + 4 * (max_world_dofs + max_constraints * (1 + metadata_arrays))
+    metadata_bytes = footprint.metadata_bytes if shared_metadata else 0
+    fixed_bytes = _MFGS_TILE_SHARED_STORAGE_BYTES + 4 * (max_world_dofs + max_constraints) + metadata_bytes
     if fixed_bytes > max_shared_memory:
         raise ValueError(
             f"MF-GS world velocity and dense state require {fixed_bytes} bytes of shared memory "

@@ -13,6 +13,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import execution_plan
 from newton._src.solvers.feather_pgs import solver_feather_pgs as fpgs
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -222,6 +223,23 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
         self.assertEqual(fpgs._select_mfgs_storage(1024, 4096, 29, required - 1, **options)[:2], (False, True))
         with self.assertRaisesRegex(ValueError, "MF-GS.*shared memory"):
             fpgs._select_mfgs_storage(256, 37248, 26000, 101376, **options)
+
+    def test_metadata_reasons_report_the_footprint_they_compared(self):
+        """Report the metadata and block bytes the residency decision compared, for each outcome."""
+        options = {"has_drive_rows": False, "fuse_vel_limits": False}
+        cases = (
+            ((192, 64, 29), 101376, "Row metadata is resident: {metadata} bytes fit the 4096-byte budget."),
+            ((1024, 4096, 604), 101376, "Row metadata streams: {metadata} bytes exceed the 4096-byte budget."),
+            ((192, 64, 29), 4096, "the block would need {total} bytes of shared memory; the device exposes 4096."),
+        )
+        for shape, shared_memory, text in cases:
+            with self.subTest(shape=shape, shared_memory=shared_memory):
+                footprint = execution_plan._mfgs_metadata_footprint(*shape, shared_memory, **options)
+                storage = fpgs._select_mfgs_storage(*shape, shared_memory, **options)
+                self.assertEqual(storage.shared_metadata, footprint.resident)
+                self.assertIn(
+                    text.format(metadata=footprint.metadata_bytes, total=footprint.total_bytes), storage.reason
+                )
 
     def test_single_wave_launches_keep_row_types_and_parents_resident(self):
         """Keep packed row metadata resident only for grids of one block per SM within 48 KiB of static memory."""
