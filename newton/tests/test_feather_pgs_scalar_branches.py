@@ -39,6 +39,13 @@ DROPPED_FIELDS = ("body_q_com", "body_v_s", "body_a_s", "body_f_s", "body_I_s", 
 # tolerances (FMA contraction); the arm leaves the serial route for the held owner's float order.
 KEY_BOUND = {"rtol": 3.0e-5, "atol": 5.0e-6}
 ARM_BOUND = {"rtol": 1.0e-4, "atol": 1.0e-4}
+# Coordinates of the fixtures' arm. A star of as many leaves shares the arm's size group, which is
+# then not diagonal: the recipe refuses its prismatic linear state and no scalar plan exists.
+ARM_DOFS = 6
+# Leaves of the CUDA owner fixtures: the key presses, the small stars and the keyboard-shaped worlds.
+PRESS_LEAVES = 7
+STAR_LEAVES = 12
+KEYBOARD_LEAVES = 108
 
 
 def build_branch_model(
@@ -906,6 +913,19 @@ class TestScalarBranchRule(unittest.TestCase):
         self.assertEqual(kinds.shape, (2, 108))
         self.assertTrue(np.all(kinds == int(newton.JointType.PRISMATIC)))
 
+    def test_owner_fixtures_give_the_keys_their_own_group(self):
+        """Give the keys of every CUDA owner fixture a diagonal-mass size group apart from the arm's."""
+        for leaves in (PRESS_LEAVES, STAR_LEAVES, KEYBOARD_LEAVES):
+            with self.subTest(leaves=leaves):
+                model = build_branch_model(worlds=2, leaves=leaves, shapes=True)
+                solver = SolverFeatherPGS(model, pgs_mode="split", enable_joint_limits=True)
+                self.assertEqual(sorted(solver.size_groups), sorted((leaves, ARM_DOFS)))
+                self.assertEqual(set(solver._diagonal_mass_sizes), {leaves})
+        # An arm-sized star joins the arm's group: no diagonal-mass size is left to admit.
+        model = build_branch_model(worlds=2, leaves=ARM_DOFS, shapes=True)
+        solver = SolverFeatherPGS(model, pgs_mode="split", enable_joint_limits=True)
+        self.assertEqual((solver.size_groups, set(solver._diagonal_mass_sizes)), ([ARM_DOFS], set()))
+
     def test_other_topologies_are_declined(self):
         """Decline chains, multi-coordinate leaves, welded descendants and roots that move."""
         for variant, words in (
@@ -1220,6 +1240,25 @@ class TestScalarBranchOwner(unittest.TestCase):
         solver.joint_tau.assign(tau)
         solver.aug_row_K.assign(stiffness)
 
+    def _assert_routes(self, head, scalar):
+        """Require the routes an A/B compares: the head's prismatic linear state and the scalar owner.
+
+        The keys must form their own size group: an arm-sized star would share
+        the arm's group, which the recipe cannot run (see
+        ``test_owner_fixtures_give_the_keys_their_own_group``).
+        """
+        self.assertIsNone(head._tree_kinetic_state)
+        self.assertTrue(head._prismatic_linear_state)
+        owner = scalar._tree_kinetic_state
+        self.assertIsInstance(owner, MixedTreeKineticState)
+        self.assertIsInstance(owner.scalar, sb.ScalarBranchState)
+        self.assertIs(owner.scalar.predictor_kernel, sb.predict_prismatic_branches)
+        self.assertNotEqual(owner.scalar.size, ARM_DOFS)
+        self.assertEqual(sorted(group.sparse.size for group in owner.groups), sorted((ARM_DOFS, owner.scalar.size)))
+        self.assertIsNone(scalar._prismatic_publication)
+        self.assertFalse(scalar._prismatic_linear_state)
+        return owner
+
     def test_owner_matches_the_prismatic_route(self):
         """Own 108-key worlds as scalar branches beside a held arm and track the prismatic linear state route.
 
@@ -1233,22 +1272,14 @@ class TestScalarBranchOwner(unittest.TestCase):
         on the route reads them.
         """
         device = wp.get_device("cuda:0")
-        model = build_branch_model(device, worlds=4, leaves=108, shapes=True)
+        model = build_branch_model(device, worlds=4, leaves=KEYBOARD_LEAVES, shapes=True)
         layout = _Layout(model)
         starts, child = model.articulation_start.numpy(), model.joint_child.numpy()
         floors = [int(child[starts[a] + 1 + k]) for a in layout.branches for k in (0, 17, 53, 107)]
         model.rigid_contact_max = len(floors)
         solvers = [recipe_solver(model, scalar=False), recipe_solver(model, scalar=True)]
         head, scalar = solvers
-        self.assertIsNone(head._tree_kinetic_state)
-        self.assertTrue(head._prismatic_linear_state)
-        owner = scalar._tree_kinetic_state
-        self.assertIsInstance(owner, MixedTreeKineticState)
-        self.assertIsInstance(owner.scalar, sb.ScalarBranchState)
-        self.assertEqual(sorted(group.sparse.size for group in owner.groups), [6, 108])
-        self.assertIsNone(scalar._prismatic_publication)
-        self.assertFalse(scalar._prismatic_linear_state)
-        self.assertIs(owner.scalar.predictor_kernel, sb.predict_prismatic_branches)
+        owner = self._assert_routes(head, scalar)
         self._poison(scalar, layout.key_bodies, layout.key_dofs)
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
@@ -1368,7 +1399,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         the branches' 1.77 M of keyboard-shaped worlds included.
         """
         device = wp.get_device("cuda:0")
-        model = build_branch_model(device, worlds=2, leaves=12, shapes=True)
+        model = build_branch_model(device, worlds=2, leaves=STAR_LEAVES, shapes=True)
         model.rigid_contact_max = 1
         solver = recipe_solver(model, scalar=True)
         states, control = [model.state(), model.state()], model.control()
@@ -1387,7 +1418,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         kernels = [kernel for kernel, _dim in launched]
         self.assertNotIn(solver_module._prepare_augmented_joint_drives_by_dof, kernels)
         dims = [dim for kernel, dim in launched if kernel is sb.prepare_listed_augmented_drives]
-        self.assertEqual(dims, [model.joint_dof_count - 12 * model.world_count])
+        self.assertEqual(dims, [model.joint_dof_count - STAR_LEAVES * model.world_count])
         self.assertTrue(np.isfinite(states[1].joint_q.numpy()).all())
 
     def test_key_press_follows_the_drive_law(self):
@@ -1401,7 +1432,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         values and compared with both routes, which also match each other.
         """
         device = wp.get_device("cuda:0")
-        model = build_branch_model(device, worlds=2, leaves=6, shapes=True)
+        model = build_branch_model(device, worlds=2, leaves=PRESS_LEAVES, shapes=True)
         layout = _Layout(model)
         lower, upper = model.joint_limit_lower.numpy(), model.joint_limit_upper.numpy()
         lower[layout.key_dofs], upper[layout.key_dofs] = -0.5, 0.5
@@ -1411,7 +1442,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         model.joint_qd.zero_()
         model.rigid_contact_max = 1
         solvers = [recipe_solver(model, scalar=False), recipe_solver(model, scalar=True)]
-        self.assertIsNotNone(solvers[1]._tree_kinetic_state.scalar)
+        self._assert_routes(*solvers)
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
         contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]
@@ -1477,12 +1508,13 @@ class TestScalarBranchOwner(unittest.TestCase):
         contact response would miss it by orders of magnitude.
         """
         device = wp.get_device("cuda:0")
-        model = build_branch_model(device, worlds=2, leaves=12, shapes=True)
+        model = build_branch_model(device, worlds=2, leaves=STAR_LEAVES, shapes=True)
         layout = _Layout(model)
         keys = layout.key_leaves.reshape(model.world_count, -1)[:, 4]
         pairs = [(int(tip), int(key)) for tip, key in zip(layout.arm_tips, keys, strict=True)]
         model.rigid_contact_max = len(pairs)
         solvers = [recipe_solver(model, scalar=False), recipe_solver(model, scalar=True)]
+        self._assert_routes(*solvers)
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
         contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]
@@ -1523,7 +1555,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         physics tolerance.
         """
         device = wp.get_device("cuda:0")
-        model = build_branch_model(device, worlds=2, leaves=12, kinds=("prismatic", "revolute"), shapes=True)
+        model = build_branch_model(device, worlds=2, leaves=STAR_LEAVES, kinds=("prismatic", "revolute"), shapes=True)
         layout = _Layout(model)
         starts, child = model.articulation_start.numpy(), model.joint_child.numpy()
         # Even leaves are prismatic and odd ones revolute.
@@ -1601,7 +1633,7 @@ class TestScalarBranchOwner(unittest.TestCase):
     def test_route_record_names_the_scalar_group(self):
         """Record the scalar group, its precedence over the prismatic opt-ins, and its decline without an owner."""
         device = wp.get_device("cuda:0")
-        model = build_branch_model(device, worlds=2, leaves=12, shapes=True)
+        model = build_branch_model(device, worlds=2, leaves=STAR_LEAVES, shapes=True)
         model.rigid_contact_max = 1
         record = recipe_solver(model, scalar=True).get_path_selection()
         json.dumps(record, allow_nan=False)
@@ -1612,10 +1644,10 @@ class TestScalarBranchOwner(unittest.TestCase):
         groups = {group["operator"]: group for group in held["groups"]}
         self.assertEqual(set(groups), {"TreeHeldOperator", "ScalarBranchState"})
         self.assertEqual(
-            (groups["ScalarBranchState"]["dofs"], groups["ScalarBranchState"]["kinds"]), (12, ["prismatic"])
+            (groups["ScalarBranchState"]["dofs"], groups["ScalarBranchState"]["kinds"]), (STAR_LEAVES, ["prismatic"])
         )
         self.assertEqual(groups["ScalarBranchState"]["kernels"]["predict"], sb.predict_prismatic_branches.key)
-        self.assertEqual(groups["TreeHeldOperator"]["dofs"], 6)
+        self.assertEqual(groups["TreeHeldOperator"]["dofs"], ARM_DOFS)
         self.assertEqual(len(record["measurements"]["held_tree_lane_timing_us"]), 2)
         self.assertEqual((publication["owner"], publication["prismatic_publication"]), ("cached", False))
         self.assertFalse(publication["prismatic_linear_state"])
