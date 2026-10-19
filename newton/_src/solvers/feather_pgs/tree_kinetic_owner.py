@@ -120,6 +120,10 @@ def listed_repair_blocks(device):
     return _LISTED_BLOCKS_PER_SM * int(device.sm_count)
 
 
+# Threads per block of a classification launch, one per repair block it lists.
+# tools/fpgs_bench/kernel_sass.py compiles the classification at this block.
+_CLASSIFY_BLOCK_DIM = 64
+
 # Listed grids of blocks a one-pass repair must exceed to be classified. Up to two
 # grids the one-pass launch's early exits cost about what the classified repair's
 # three or four launches do (head: 8.4-9.6 us for a current 8192-block packed repair,
@@ -728,7 +732,7 @@ class TreeKineticState:
                 self.classify_kernel,
                 dim=self.launch_count,
                 inputs=[*arguments, bank, self._repair_blocks, self._compare_blocks, self._list_counts],
-                block_dim=64,
+                block_dim=_CLASSIFY_BLOCK_DIM,
                 device=device,
             )
             if compare:

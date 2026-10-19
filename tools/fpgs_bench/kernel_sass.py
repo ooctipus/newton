@@ -26,8 +26,10 @@ whose JIT is another ptxas release can assign other registers.
 A held-tree kernel compiles at the block its owner launches: 32 threads, or 64
 for a tree of more than 32 bodies (``TreeLayout.block``; a chain plan whose
 padded chains need a second warp also launches 64, which no grid layout
-models). Other kernels compile at their module's block size. Warp sizes some
-static shared memory by the block, so other block sizes give other binaries.
+models), and a classification, one thread per repair block, at the owner's
+classification block (:func:`classify_block`, 64 threads). Other kernels
+compile at their module's block size. Warp sizes some static shared memory by
+the block, so other block sizes give other binaries.
 
 ``diff`` compares two records. Identical SASS is identical machine code: the
 change cannot alter speed or results. Otherwise the report lists the resource
@@ -290,15 +292,28 @@ def cpu_twin_digest(kernel) -> str:
     return identity.digest(identity.normalize(source, (kernel.hash.hex()[:8],), functions))
 
 
+def classify_block() -> int:
+    """Threads per block of a held-tree classification launch, one thread per repair block, as the owner launches it.
+
+    Checkouts that predate the owner's constant launch it at 64 threads too.
+    """
+    from newton._src.solvers.feather_pgs import tree_kinetic_owner  # noqa: PLC0415
+
+    return getattr(tree_kinetic_owner, "_CLASSIFY_BLOCK_DIM", 64)
+
+
 def launch_blocks(families):
     """Return ``{label: threads per block}`` for the inventory kernels whose launch block is known.
 
-    Every held-tree kernel launches ``TreeLayout.block`` threads per block.
+    A held-tree classification launches :func:`classify_block` threads per
+    block; every other held-tree kernel launches ``TreeLayout.block``.
     """
     blocks = {}
     if "held_tree" in families:
+        classify = classify_block()
         for name, _, args, kwargs in identity.held_tree_calls():
-            blocks[identity.label(name, args, kwargs)] = identity._value(kwargs["layout"]).block
+            block = classify if name.endswith(".get_classify_kernel") else identity._value(kwargs["layout"]).block
+            blocks[identity.label(name, args, kwargs)] = block
     return blocks
 
 
