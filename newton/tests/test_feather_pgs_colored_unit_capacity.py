@@ -100,7 +100,13 @@ def _unit_impulses(model: newton.Model, solver: SolverFeatherPGS, contacts: newt
 
 
 def _assert_mixed_topology(test: unittest.TestCase, solver: SolverFeatherPGS, contacts: newton.Contacts) -> None:
-    """Assert two staged units and two overflow units form the complete ordering."""
+    """Assert every mixed unit is colored and owns contiguous rows in color order.
+
+    The coloring keeps its unit state in global scratch, so no unit spills into the
+    serial tail for lack of staging space. The four spheres share no body, so all
+    four units, one three-row friction unit and three one-row units, take color 0
+    in contact-index order, and their six rows fill the row capacity without gaps.
+    """
     count = int(contacts.rigid_contact_count.numpy()[0])
     test.assertEqual(count, CONTACT_COUNT)
     paths = solver.contact_path.numpy()[:count]
@@ -110,22 +116,25 @@ def _assert_mixed_topology(test: unittest.TestCase, solver: SolverFeatherPGS, co
     test.assertEqual(int(solver.propagation_constraint_count.numpy()[0]), ROW_CAPACITY)
     test.assertEqual(int(solver.color_world_unit_cursor.numpy()[0]), CONTACT_COUNT)
 
+    # Entry -2 starts the serial tail and entry -1 holds the unit total.
     offsets = solver.color_world_offsets.numpy().reshape(solver.world_count, -1)[0]
     bucket_counts = np.diff(offsets)
     test.assertEqual(int(offsets[-1]), CONTACT_COUNT)
-    test.assertEqual(int(offsets[-2]), 2)
-    test.assertEqual(int(bucket_counts[0]), 2)
-    np.testing.assert_array_equal(bucket_counts[1:-1], np.zeros_like(bucket_counts[1:-1]))
-    test.assertEqual(int(bucket_counts[-1]), 2)
+    test.assertEqual(int(offsets[-2]), CONTACT_COUNT)
+    test.assertEqual(int(bucket_counts[0]), CONTACT_COUNT)
+    np.testing.assert_array_equal(bucket_counts[1:], np.zeros_like(bucket_counts[1:]))
 
     ordered = solver.color_unit_sorted.numpy()[:CONTACT_COUNT]
-    test.assertEqual(sorted(ordered.tolist()), list(range(CONTACT_COUNT)))
+    test.assertEqual(ordered.tolist(), list(range(CONTACT_COUNT)))
+    slots = solver.contact_slot.numpy()[:count]
+    starts = np.cumsum(lengths[ordered]) - lengths[ordered]
+    np.testing.assert_array_equal(slots[ordered], starts)
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "propagation-colored requires CUDA")
 class TestFeatherPGSColoredUnitCapacity(unittest.TestCase):
     def test_mixed_gap_matches_serial_propagation(self):
-        """Match impulses, body velocity, and a short trajectory with overflow units."""
+        """Match impulses, body velocity, and a short trajectory with mixed one- and three-row units."""
         device = "cuda:0"
         model = _build_mixed_gap_model(device)
         colored = _make_solver(model, "propagation-colored")
