@@ -11,7 +11,9 @@ after ``s`` sweeps. The kernel tests replay a solve at every sweep budget and
 check the counts against that rule; the solver tests check that every route's
 readout leaves the trajectory bitwise unchanged and counts each world-solve
 once: in the slot of the sweep that solved it, or, for a world without rows
-that the matrix-free sweeps do not enter, as skipped.
+that the matrix-free sweeps do not enter, as skipped. On the propagation
+contact route, whose propagation sweeps carry no counters, a world whose rows
+are all propagation rows is solved, not skipped.
 
 ``pgs_velocity_change_tolerance`` stops a solve earlier, after the first sweep
 whose velocity-scaled changes fit the tolerance. Before that sweep it runs
@@ -622,6 +624,30 @@ def _policy_routes():
     return (_local_route(), _paired_route(), _matrix_free_route(), _incremental_route())
 
 
+def _propagation_route():
+    """Floating chains on the propagation contact route: two rest their base sphere on the ground, two fly.
+
+    The propagation sweeps solve the articulated contacts, so the resting worlds' rows are all
+    propagation rows; without joint limits or free rigid bodies the flying worlds have no rows.
+    """
+    from newton.tests.test_feather_pgs_propagation_free_root_warp import _make_floating_chain_world  # noqa: PLC0415
+
+    scene = newton.ModelBuilder()
+    for base_z in (0.099, 2.0, 0.099, 2.0):
+        scene.add_world(_make_floating_chain_world(base_z=base_z, contact_sphere="base"))
+    scene.add_ground_plane()
+    return {
+        "model": scene.finalize(device="cuda:0"),
+        "options": {
+            "pgs_mode": "matrix_free",
+            "articulated_contact_response": "propagation",
+            "propagation_cached_response": False,
+            "pgs_warmstart": False,
+            "mf_warmstart": False,
+        },
+    }
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "Native Gauss-Seidel sweeps run on CUDA")
 class TestSolveReadoutRoutes(unittest.TestCase):
     """Every counted route leaves the trajectory unchanged and counts its world-solves."""
@@ -820,6 +846,36 @@ class TestSolveReadoutRoutes(unittest.TestCase):
                 self.assertEqual(_skipped(summary, solve_pass), rowless)
                 self.assertEqual(slot["solves"] + rowless, steps * route["model"].world_count)
                 self.assertEqual(len(slot["sweeps"]), budget + 1)
+
+    def test_propagation_rows_are_solved_not_skipped(self):
+        """Count as skipped only the worlds without rows of any family on the propagation contact route.
+
+        The uncounted propagation sweeps solve the articulated contacts there, so a resting world,
+        whose rows are all propagation rows, is solved at every launch of the route's row phases;
+        a flying world, which has no rows, is skipped at each of them.
+        """
+        route = _propagation_route()
+        (solver,) = self._solvers(route, [{"pgs_solve_readout": "sweeps"}])
+        self.assertTrue(solver._propagation_contacts_enabled())
+        record = solver._solve_readout
+        count_skipped = record.count_skipped
+        launches = {"rowless": 0, "propagation_only": 0}
+
+        def counting(dense, free, *, propagation_constraint_count=None):
+            # The row counts every sweep of this launch sees, read from the solver itself.
+            without = (dense.numpy() == 0) & (free.numpy() == 0)
+            propagation = solver.propagation_constraint_count.numpy()
+            launches["rowless"] += int(np.count_nonzero(without & (propagation == 0)))
+            launches["propagation_only"] += int(np.count_nonzero(without & (propagation > 0)))
+            count_skipped(dense, free, propagation_constraint_count=propagation_constraint_count)
+
+        with mock.patch.object(record, "count_skipped", counting):
+            for _ in self._steps(route, [solver], 4):
+                pass
+        self.assertGreater(launches["propagation_only"], 0)
+        self.assertGreater(launches["rowless"], 0)
+        summary = solver.get_path_selection()["measurements"]["solve_readout"]
+        self.assertEqual(_skipped(summary), launches["rowless"])
 
     def test_trace_changes_no_result_and_records_every_solve(self):
         """Trace the local, paired and matrix-free sweeps unchanged, once per solve and grid tolerance."""

@@ -593,24 +593,27 @@ class TestSolveReadoutRecord(unittest.TestCase):
         self.assertEqual((velocity_slot["budget"], velocity_slot["solves"], velocity_slot["exhausted"]), (2, 2, 2))
 
     def test_worlds_without_rows_count_as_skipped_per_pass(self):
-        """Count, per pass, one skipped solve per launch of every world without dense or matrix-free rows.
+        """Count, per pass, one skipped solve per launch of every world without dense, matrix-free or propagation rows.
 
         The matrix-free sweeps return before their first sweep for such a world, so no slot records
-        it; a world's solves are its slots' solves plus its skipped ones.
+        it; a world's solves are its slots' solves plus its skipped ones. On the propagation contact
+        routes the propagation sweeps solve a world whose rows are all propagation rows, so it is not
+        skipped; a route without propagation rows passes no counts of them.
         """
         record = SolveReadoutRecord(SWEEPS)
         counted = SimpleNamespace(key="counted_kernel", _fpgs_solve_readout="sweeps")
-        record.register(counted, "mf_gs_incremental", world_count=3, budget=4, device="cpu", velocity_budget=2)
-        record.register_skipped(world_count=3, device="cpu", velocity_budget=2)
-        # World 0 holds dense rows and world 2 matrix-free rows; world 1 has none.
-        dense = wp.array([4, 0, 0], dtype=wp.int32, device="cpu")
-        free = wp.array([0, 0, 2], dtype=wp.int32, device="cpu")
+        record.register(counted, "mf_gs_incremental", world_count=4, budget=4, device="cpu", velocity_budget=2)
+        record.register_skipped(world_count=4, device="cpu", velocity_budget=2)
+        # World 0 holds dense rows, world 2 matrix-free rows and world 3 propagation rows; world 1 has none.
+        dense = wp.array([4, 0, 0, 0], dtype=wp.int32, device="cpu")
+        free = wp.array([0, 0, 2, 0], dtype=wp.int32, device="cpu")
+        propagation = wp.array([0, 0, 0, 3], dtype=wp.int32, device="cpu")
         for _ in range(2):
-            record.count_skipped(dense, free)
+            record.count_skipped(dense, free, propagation_constraint_count=propagation)
         with record.velocity_pass():
-            record.count_skipped(dense, free)
+            record.count_skipped(dense, free, propagation_constraint_count=propagation)
         # A second registration keeps the counters.
-        record.register_skipped(world_count=3, device="cpu")
+        record.register_skipped(world_count=4, device="cpu")
         summary = record.summary()
         self.assertEqual(
             summary["skipped"],
@@ -618,6 +621,9 @@ class TestSolveReadoutRecord(unittest.TestCase):
         )
         self.assertEqual([slot["solves"] for slot in summary["slots"]], [0, 0])
         json.dumps(summary, allow_nan=False)
+        # Without propagation rows world 3 has no rows either.
+        record.count_skipped(dense, free)
+        self.assertEqual(record.summary()["skipped"][0], {"pass": "position", "solves": 4, "worlds": 2})
 
     def test_skip_counters_need_a_readout_and_a_registering_route(self):
         """Count no skipped solve without a readout, or on a route that registered no skip counters."""

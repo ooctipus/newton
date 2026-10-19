@@ -9301,8 +9301,13 @@ class SolverFeatherPGS(SolverBase):
                         indent=2,
                     )
                 print(f"[fpgs-capture] wrote {_base}.npz/.json", flush=True)
-            # Under a readout, count the worlds without rows, which every sweep below returns from.
-            self._solve_readout.count_skipped(self.constraint_count, self.mf_constraint_count)
+            # Under a readout, count the worlds without rows of any family, which no sweep enters. The
+            # propagation counts are None unless the propagation sweeps solve the articulated contacts.
+            self._solve_readout.count_skipped(
+                self.constraint_count,
+                self.mf_constraint_count,
+                propagation_constraint_count=self.propagation_constraint_count,
+            )
             launch_local = bool(
                 (
                     self._pgs_solve_local_internal_kernels
