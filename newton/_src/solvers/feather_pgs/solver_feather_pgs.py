@@ -304,9 +304,10 @@ _FUSED_PUBLISH = os.environ.get("FEATHER_PGS_FUSED_PUBLISH", "0") == "1"
 # Experimental Stage 7 producer partition, leaving all solve/mass budgets intact.
 _PRISMATIC_PUBLICATION = os.environ.get("FEATHER_PGS_PRISMATIC_PUBLICATION", "0") == "1"
 _PRISMATIC_LINEAR_STATE = os.environ.get("FEATHER_PGS_PRISMATIC_LINEAR_STATE", "0") == "1"
-# Experimental scalar branches of the held-tree owner (scalar_branches.py); where
-# admitted they take precedence over the two prismatic opt-ins above.
-_SCALAR_BRANCHES = os.environ.get("FEATHER_PGS_SCALAR_BRANCHES", "0") == "1"
+# Scalar branches of the held-tree owner (scalar_branches.py), on by default
+# (FEATHER_PGS_SCALAR_BRANCHES=0 opts out); where admitted they take precedence
+# over the two prismatic opt-ins above.
+_SCALAR_BRANCHES = os.environ.get("FEATHER_PGS_SCALAR_BRANCHES", "1") != "0"
 _COMPACT_CONTACT_BOUNDARY = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_BOUNDARY", "0") == "1"
 _COMPACT_CONTACT_ORDERING = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_ORDERING", "0") == "1"
 _DEBUG_CACHE = os.environ.get("FEATHER_PGS_DEBUG_CACHE") == "1"
@@ -1429,6 +1430,10 @@ class SolverFeatherPGS(SolverBase):
                 environment settings; ``auto`` retains those settings when present. Mixed held
                 factors require ``on`` or their legacy opt-in. Explicit dense kernels disable auto
                 and conflict with ``on``. Factor refresh intervals and numerical budgets are unchanged.
+                Where the held-tree owner is admitted, a diagonal-mass group of world-fixed roots over
+                one-coordinate prismatic or revolute leaves runs as its scalar branches by default,
+                superseding the prismatic publication opt-ins (``FEATHER_PGS_SCALAR_BRANCHES=0`` opts
+                out); :meth:`get_path_selection` reports it under ``routes.held_tree.scalar_branches``.
             contact_torsion_radius: Experimental effective spin radius [m], zero disables.
                 Explicit material/footprint assumption: for uniform pressure on a disk
                 of radius R, the effective radius is 2*R/3. Does not consume the generic

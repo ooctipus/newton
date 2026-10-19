@@ -275,7 +275,8 @@ def _held_tree(solver) -> dict:
         "reason": solver._cached_dynamics_selection_reason,
         "layout_reason": getattr(owner, "forest_reason", None),
         # Whether a diagonal-mass group of world-fixed roots over one-coordinate
-        # leaves runs as scalar branches (FEATHER_PGS_SCALAR_BRANCHES=1).
+        # leaves runs as scalar branches (by default; FEATHER_PGS_SCALAR_BRANCHES=0
+        # opts out).
         "scalar_branches": {
             "enabled": getattr(owner, "scalar", None) is not None,
             "reason": getattr(solver, "_scalar_branches_reason", None),
