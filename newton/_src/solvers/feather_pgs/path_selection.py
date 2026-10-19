@@ -769,6 +769,9 @@ def _tiers(solver) -> dict | None:
             else "per_row",
             # The last-word velocity-limit pass after the final sweep (mf_gs_parallel_linked_velocity_limit_pass).
             "velocity_limit_pass": all(getattr(kernel, "_fpgs_velocity_limit_pass", False) for kernel in kernels),
+            # The tiers accumulate joint velocity-limit rows whatever the serial sweeps' law
+            # (routes.velocity_limits.law), so the two can differ in the worlds the tiers own.
+            "velocity_limit_law": _tier_velocity_limit_law(solver, kernels),
             "nesterov": bool(solver.mf_gs_parallel_nesterov),
             "matrix_free": bool(solver.mf_gs_parallel_matrix_free),
             # The largest tier budget; each tier records its own. Point tiers sweep mf_gs_parallel_sweeps, linked
@@ -787,7 +790,20 @@ def _tiers(solver) -> dict | None:
                 for (rows, min_rows), kernel in zip(solver._par_tiers, kernels, strict=False)
             ],
         }
-    return {"family": "incremental", "tiers": [{"kernel": _key(kernel)} for kernel in kernels]}
+    return {
+        "family": "incremental",
+        # The incremental tiers are built with the serial sweeps' law.
+        "velocity_limit_law": _tier_velocity_limit_law(solver, kernels),
+        "tiers": [{"kernel": _key(kernel)} for kernel in kernels],
+    }
+
+
+def _tier_velocity_limit_law(solver, kernels) -> str | None:
+    # The law the built tier kernels give joint velocity-limit rows; one construction call builds every tier with
+    # it. None where no such row can exist. The tiers serve dense rows only, so free-body limits never reach them.
+    if not solver.enable_joint_velocity_limits or np.isinf(solver.velocity_limit_activation_fraction):
+        return None
+    return kernels[0]._fpgs_velocity_limit_law
 
 
 def _resolved_worlds(solver) -> dict:

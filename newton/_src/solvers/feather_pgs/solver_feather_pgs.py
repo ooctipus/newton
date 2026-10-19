@@ -1710,8 +1710,10 @@ class SolverFeatherPGS(SolverBase):
                 stateless clamp that ``get_path_selection()`` reports under
                 ``routes.velocity_limits.free_body_sweep_law``. The environment variable
                 ``FEATHER_PGS_VELOCITY_LIMIT_LAW`` overrides the argument.
-                ``get_path_selection()`` reports the law the sweeps apply under
-                ``routes.velocity_limits.law``. Experimental. Defaults to ``"stateless"``.
+                ``get_path_selection()`` reports the law the serial sweeps apply under
+                ``routes.velocity_limits.law``, and the parallel tiers' law, accumulated under either
+                argument, under ``routes.sweep.tiers.velocity_limit_law``. Experimental. Defaults to
+                ``"stateless"``.
             mf_gs_incremental_rows (int, optional): Row budget of the incremental-residual
                 matrix-free Gauss-Seidel kernel. Worlds with only dense articulated rows and at
                 most this many rows solve through a shared-memory response block instead of
@@ -1725,10 +1727,10 @@ class SolverFeatherPGS(SolverBase):
                 sweeps or 128 for matrix-free sweeps, and rounded down to a multiple of four. Under persistent
                 patch friction each tangent pair projects on its patch's pooled normal load with one isotropic
                 step, the serial pair solve's friction law; ``FEATHER_PGS_PATCH_PARALLEL_ROWS=0`` keeps patch
-                friction on the serial kernels. The tiers accumulate joint velocity-limit rows. The worlds they
-                decline keep the serial sweep and its ``velocity_limit_law``, ``"stateless"`` by default, so tier
-                and serial worlds share one fixed point under ``velocity_limit_law="accumulated"`` or without
-                joint velocity limits.
+                friction on the serial kernels. The tiers accumulate joint velocity-limit rows
+                (``routes.sweep.tiers.velocity_limit_law``). The worlds they decline keep the serial sweep and its
+                ``velocity_limit_law``, ``"stateless"`` by default, so tier and serial worlds share one fixed point
+                under ``velocity_limit_law="accumulated"`` or without joint velocity limits.
             mf_gs_parallel_sweeps (int, optional): Maximum number of parallel sweeps per launch (early exit when no
                 impulse changes). Independent of ``pgs_iterations``; preserve the sweep allowance when comparing
                 execution speed, and validate convergence separately. The tiers that serve persistent patch
@@ -16383,9 +16385,11 @@ class SolverFeatherPGS(SolverBase):
         return [_auto_linked_sweeps(rows, self.pgs_iterations, sweeps) for rows, _ in tiers], "auto", reason
 
     def _velocity_limit_sweep_law(self) -> tuple[str | None, str]:
-        """Return the law the matrix-free sweep kernels give velocity-limit rows, and why.
+        """Return the law the serial matrix-free sweep kernels give velocity-limit rows, and why.
 
-        Recorded as ``routes.velocity_limits.law``. Split mode has no joint velocity-limit
+        Recorded as ``routes.velocity_limits.law``; the parallel tiers accumulate joint
+        velocity-limit rows whatever this law (``routes.sweep.tiers.velocity_limit_law``).
+        Split mode has no joint velocity-limit
         rows and no matrix-free velocity-limit pass, so it applies neither law (``None``);
         ``routes.velocity_limits.free_body_sweep_law`` records the stateless law of its
         free-body sweep. The ``physx_grasp`` schedule keeps PhysX's
@@ -28102,7 +28106,9 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
         name += "_local_fallback"
     pgs_solve_mf_gs_incremental_template.__name__ = name
     pgs_solve_mf_gs_incremental_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_incremental_template)
+    kernel = wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_incremental_template)
+    kernel._fpgs_velocity_limit_law = velocity_limit_law  # recorded as routes.sweep.tiers.velocity_limit_law
+    return kernel
 
 
 # mf_gs_parallel_linked_sweeps="auto": the budget grows with the serial sweep's iteration count, whose accuracy the
@@ -29233,6 +29239,8 @@ def _get_pgs_solve_parallel_kernel(
     kernel._fpgs_linked_rows = bool(linked_rows)  # recorded as routes.sweep.tiers.linked_rows
     kernel._fpgs_pair_step = pair_step  # recorded as routes.sweep.tiers.pair_step
     kernel._fpgs_velocity_limit_pass = velocity_limit_pass  # recorded as routes.sweep.tiers.velocity_limit_pass
+    # Velocity-limit rows are unilateral rows here (kind 0), whatever the serial sweeps' velocity_limit_law.
+    kernel._fpgs_velocity_limit_law = "accumulated"  # recorded as routes.sweep.tiers.velocity_limit_law
     kernel._fpgs_sweeps = NSWEEPS  # recorded as routes.sweep.tiers.tiers[i].sweeps
     return kernel
 

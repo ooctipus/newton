@@ -1196,8 +1196,15 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 self.assertEqual("clamps them statelessly" in reason, rows and not shared, reason)
 
     def test_route_record_reads_the_built_tiers(self):
-        """Record the tiers' ring-pooled projection and sweep budgets from the kernels built, not from the law."""
-        for anchors, linked in itertools.product((False, True), repeat=2):
+        """Record the tiers' ring-pooled projection, sweep budgets and limit law from the kernels built, not the law.
+
+        The parallel tiers accumulate joint velocity-limit rows whatever ``velocity_limit_law``
+        gives the serial sweeps, so the record names the accumulated law wherever such rows
+        can exist (``enable_joint_velocity_limits`` with a finite activation fraction) and
+        ``None`` elsewhere. The incremental tiers record the serial sweeps' law they were
+        built with.
+        """
+        for anchors, linked, limits in itertools.product((False, True), repeat=3):
             options = {"matrix_free": True, "linked_rows": linked}
             kernels = [
                 source._get_pgs_solve_parallel_kernel(
@@ -1214,20 +1221,39 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 _ink_sizes=None,
                 _keyed_rows=None,
                 _friction_anchors_enabled=anchors,
+                enable_joint_velocity_limits=limits,
+                velocity_limit_activation_fraction=0.0,
                 mf_gs_parallel_nesterov=True,
                 mf_gs_parallel_matrix_free=True,
                 mf_gs_parallel_sweeps=24,
                 mf_gs_parallel_tol=0.0,
             )
-            with self.subTest(anchors=anchors, linked=linked):
+            with self.subTest(anchors=anchors, linked=linked, limits=limits):
                 tiers = path_selection._tiers(probe)
                 self.assertEqual(tiers["linked_rows"], linked)
                 self.assertEqual(tiers["tiers"][0]["kernel"].endswith("_linked_iso"), linked)
                 self.assertEqual(tiers["pair_step"], "isotropic" if linked else "per_row")
                 self.assertEqual([tier["sweeps"] for tier in tiers["tiers"]], [24, 34])
                 self.assertEqual((tiers["sweeps"], tiers["sweeps_rule"]), (34, "auto"))
+                self.assertEqual(tiers["velocity_limit_law"], "accumulated" if limits else None)
                 # The applied linked budget is the largest built linked tier's; point tiers apply none.
                 self.assertEqual(path_selection._EFFECTIVE["mf_gs_parallel_linked_sweeps"](probe), 34 if linked else 0)
+                # An infinite activation fraction reserves no velocity-limit row.
+                probe.velocity_limit_activation_fraction = float("inf")
+                self.assertIsNone(path_selection._tiers(probe)["velocity_limit_law"])
+        for law in ("stateless", "accumulated"):
+            kernel = source._get_pgs_solve_mf_gs_incremental_kernel(
+                _CAPACITY, 32, _DOFS, "120", incremental_rows=32, velocity_limit_law=law
+            )
+            probe = SimpleNamespace(
+                _pgs_solve_mf_gs_incremental_kernels=[kernel],
+                _ink_rows=0,
+                enable_joint_velocity_limits=True,
+                velocity_limit_activation_fraction=0.0,
+            )
+            with self.subTest(family="incremental", law=law):
+                tiers = path_selection._tiers(probe)
+                self.assertEqual((tiers["family"], tiers["velocity_limit_law"]), ("incremental", law))
 
     def test_in_sweep_world_rows_serve_point_friction_only(self):
         """Build contact rows inside the sweep only under point friction, the law that builder writes.
@@ -2249,9 +2275,11 @@ class TestPatchParallelPhysics(unittest.TestCase):
         serial route of ``FEATHER_PGS_PATCH_PARALLEL_ROWS=0`` lands, to float order.
         The tiers accumulate velocity-limit rows, as the accumulated serial sweep
         does; on this step that law converges more than 1e-4 away (1.1e-3 in a
-        float64 reference), and a 32-row tier that owns the world lands there.
-        Converged settings (2000 iterations and sweeps, tolerance 0) make the law,
-        not the budget, decide. Without the default the solver builds no tier.
+        float64 reference), and a 32-row tier that owns the world lands there. The
+        route record names that law (``routes.sweep.tiers.velocity_limit_law``) beside
+        the serial sweeps' (``routes.velocity_limits.law``). Converged settings (2000
+        iterations and sweeps, tolerance 0) make the law, not the budget, decide.
+        Without the default the solver builds no tier.
         """
         model = _limited_hand("cuda:0")
         torques = np.array([0.03, 0.006, -0.005, 0.0002, 0.008, -0.007, 0.001], np.float32)
@@ -2283,6 +2311,10 @@ class TestPatchParallelPhysics(unittest.TestCase):
             self.assertTrue(all(key.endswith("_linked_iso") for key in keys), keys)
         routes = arms["declined"].get_path_selection()["routes"]
         self.assertEqual(routes["velocity_limits"]["law"], "stateless")
+        # Beside the serial sweeps' stateless law the record names the law of the tier-owned worlds.
+        for name in ("declined", "owned"):
+            tiers = arms[name].get_path_selection()["routes"]["sweep"]["tiers"]
+            self.assertEqual(tiers["velocity_limit_law"], "accumulated", name)
         self.assertNotIn("_vacc", routes["sweep"]["mf_gs"])
         self.assertIn("_vacc", arms["accumulated"].get_path_selection()["routes"]["sweep"]["mf_gs"])
         reason = routes["friction"]["parallel_rows"]["reason"]
