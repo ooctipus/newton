@@ -227,7 +227,7 @@ class TestTreeKernelSwitches(unittest.TestCase):
                     self.assertIsNot(getattr(clocked, kernel), getattr(default, kernel))
 
     def test_cpu_owner_publishes_forward_kinematics(self):
-        """Repair a CPU owner's caches and publish the poses and twists forward kinematics gives.
+        """Repair and finish a CPU owner's trees and publish the poses and twists forward kinematics gives.
 
         Warp's CPU JIT links no malloc or free, so an owner on the CPU builds its
         repair and finish kernels with static scratch; the CUDA form stays the
@@ -237,11 +237,13 @@ class TestTreeKernelSwitches(unittest.TestCase):
         solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
         owner = MixedTreeKineticState(solver)
         self.assertTrue(owner.groups)
+        dt = 1.0 / 240.0
         state, expected = model.state(), model.state()
         joint_q, joint_qd = model.joint_q.numpy(), np.zeros(model.joint_dof_count, np.float32)
         q_start, qd_start = model.joint_q_start.numpy(), model.joint_qd_start.numpy()
+        revolute = np.flatnonzero(model.joint_type.numpy() == int(newton.JointType.REVOLUTE))
         rng = np.random.default_rng(29)
-        for joint in np.flatnonzero(model.joint_type.numpy() == int(newton.JointType.REVOLUTE)):
+        for joint in revolute:
             joint_q[q_start[joint]] += rng.uniform(-0.6, 0.6)
             joint_qd[qd_start[joint]] = rng.uniform(-1.0, 1.0)
         state.joint_q.assign(joint_q)
@@ -249,22 +251,44 @@ class TestTreeKernelSwitches(unittest.TestCase):
         newton.eval_fk(model, state.joint_q, state.joint_qd, expected)
         augmented = solver._prepare_augmented_state(state, model.state(), model.control())
         self.assertGreater(np.max(np.abs(state.body_q.numpy() - expected.body_q.numpy())), 1e-2)
-        owner.begin(state, augmented, state.joint_qd, 1.0 / 240.0, True)
+        owner.begin(state, augmented, state.joint_qd, dt, True)
         np.testing.assert_allclose(state.body_q.numpy(), expected.body_q.numpy(), atol=2e-6)
         np.testing.assert_allclose(state.body_qd.numpy(), expected.body_qd.numpy(), atol=2e-5)
+        # Finish integrates a solved velocity once and publishes every coordinate and body of the next state.
+        velocity = rng.uniform(-1.0, 1.0, model.joint_dof_count).astype(np.float32)
+        solver.v_out.assign(velocity)
+        output = model.state()
+        for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
+            array = getattr(output, name)
+            array.assign(np.full(array.numpy().shape, np.nan, np.float32))
+        owner.finish(state, augmented, output, dt, False)
+        for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
+            self.assertTrue(np.isfinite(getattr(output, name).numpy()).all(), name)
+        coordinates, dofs = q_start[revolute], qd_start[revolute]
+        np.testing.assert_allclose(output.joint_qd.numpy()[dofs], velocity[dofs], atol=1e-6)
+        np.testing.assert_allclose(
+            output.joint_q.numpy()[coordinates], joint_q[coordinates] + dt * velocity[dofs], atol=1e-6
+        )
+        published = model.state()
+        newton.eval_fk(model, output.joint_q, output.joint_qd, published)
+        np.testing.assert_allclose(output.body_q.numpy(), published.body_q.numpy(), atol=2e-6)
+        np.testing.assert_allclose(output.body_qd.numpy(), published.body_qd.numpy(), atol=2e-5)
         for group in owner.groups:
             np.testing.assert_array_equal(group.data.status.numpy(), 0)
-            default = tree_kinetic_state.get_state_kernel(
-                False,
-                group.chain_scan,
-                layout=group.layout,
-                body_velocity=group._body_velocity,
-                motion_velocity=group.motion_velocity,
-                copy_reuse=group.copy_reuse,
-                reference=group.reference,
-                clocked=group.clocked,
+            options = {
+                "layout": group.layout,
+                "body_velocity": group._body_velocity,
+                "copy_reuse": group.copy_reuse,
+                "reference": group.reference,
+                "clocked": group.clocked,
+            }
+            repair = tree_kinetic_state.get_state_kernel(
+                False, group.chain_scan, motion_velocity=group.motion_velocity, **options
             )
-            self.assertIsNot(group.repair_kernel, default)
+            self.assertIsNot(group.repair_kernel, repair)
+            self.assertIsNot(
+                group.finish_kernel, tree_kinetic_state.get_state_kernel(True, group.chain_scan, **options)
+            )
 
 
 if __name__ == "__main__":
