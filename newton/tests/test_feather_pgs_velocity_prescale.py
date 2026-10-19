@@ -492,16 +492,30 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
 
     def test_launch_covers_complete_warps(self):
         """Size lane groups by the mean articulation, capped at a warp, and launch complete CUDA warps."""
-        self.assertEqual(_velocity_prescale_launch(np.array([0], dtype=np.int32), cuda=True), (1, 0))
-        self.assertEqual(_velocity_prescale_launch(np.array([0, 21, 22, 43, 44]), cuda=False), (1, 4))
+
+        def launch(starts, *, cuda):
+            # The articulations end at the last joint.
+            return _velocity_prescale_launch(np.asarray(starts), joint_count=int(starts[-1]), cuda=cuda)
+
+        self.assertEqual(launch(np.array([0], dtype=np.int32), cuda=True), (1, 0))
+        self.assertEqual(launch([0, 21, 22, 43, 44], cuda=False), (1, 4))
         # A 21-joint and a one-joint articulation average 11 joints.
-        self.assertEqual(_velocity_prescale_launch(np.array([0, 21, 22, 43, 44]), cuda=True), (16, 64))
-        self.assertEqual(_velocity_prescale_launch(np.array([0, 8, 16, 24]), cuda=True), (8, 32))
-        self.assertEqual(_velocity_prescale_launch(np.array([2, 2, 3]), cuda=True), (1, 32))
-        self.assertEqual(_velocity_prescale_launch(np.array([0, 100, 200]), cuda=True), (32, 64))
-        lanes, threads = _velocity_prescale_launch(np.arange(0, 1001, 10), cuda=True)
+        self.assertEqual(launch([0, 21, 22, 43, 44], cuda=True), (16, 64))
+        self.assertEqual(launch([0, 8, 16, 24], cuda=True), (8, 32))
+        self.assertEqual(launch([2, 2, 3], cuda=True), (1, 32))
+        self.assertEqual(launch([0, 100, 200], cuda=True), (32, 64))
+        lanes, threads = launch(np.arange(0, 1001, 10), cuda=True)
         self.assertEqual((lanes, threads % 32), (16, 0))
         self.assertGreaterEqual(threads, 100 * lanes)
+
+    def test_launch_requires_articulations_to_end_at_the_last_joint(self):
+        """Reject joints past the last articulation, whose DOFs no lane would write."""
+        self.assertEqual(_velocity_prescale_launch(np.array([0, 4, 7]), joint_count=7, cuda=True), (4, 32))
+        # Without articulations the launcher copies every DOF.
+        self.assertEqual(_velocity_prescale_launch(np.array([0]), joint_count=7, cuda=True), (1, 0))
+        for cuda in (False, True):
+            with self.subTest(cuda=cuda), self.assertRaisesRegex(ValueError, "articulation_start"):
+                _velocity_prescale_launch(np.array([0, 4, 7]), joint_count=9, cuda=cuda)
 
     def test_launcher_writes_every_dof_without_a_copy(self):
         """Write each DOF of a solver model's work velocity in one launch, bit for bit like the serial prescale."""
@@ -512,7 +526,11 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
                 solver = SolverFeatherPGS(model, use_parallel_streams=False)
                 self.assertEqual(
                     (solver._velocity_prescale_lanes, solver._velocity_prescale_threads),
-                    _velocity_prescale_launch(model.articulation_start.numpy(), cuda=wp.get_device(device).is_cuda),
+                    _velocity_prescale_launch(
+                        model.articulation_start.numpy(),
+                        joint_count=model.joint_count,
+                        cuda=wp.get_device(device).is_cuda,
+                    ),
                 )
                 joint_qd = (np.random.default_rng(3).normal(size=model.joint_dof_count) * 3.0).astype(np.float32)
                 state = model.state()
@@ -544,7 +562,9 @@ class TestFeatherPGSVelocityPrescale(unittest.TestCase):
                     )
                     # The fused clamp skips driven DOFs; only physx_pgs drives allocate drive rows.
                     self.assertEqual(solver._vel_limit_skip_driven, int(drive_mode == "physx_pgs"))
-                    lanes, threads = _velocity_prescale_launch(model.articulation_start.numpy(), cuda=True)
+                    lanes, threads = _velocity_prescale_launch(
+                        model.articulation_start.numpy(), joint_count=model.joint_count, cuda=True
+                    )
                     self.assertEqual(
                         (solver._velocity_prescale_lanes, solver._velocity_prescale_threads), (lanes, threads)
                     )

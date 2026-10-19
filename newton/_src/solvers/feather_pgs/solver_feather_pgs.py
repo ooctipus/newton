@@ -648,7 +648,7 @@ def _warn_constraint_row_overflow(
             )
 
 
-def _velocity_prescale_launch(articulation_start: np.ndarray, *, cuda: bool) -> tuple[int, int]:
+def _velocity_prescale_launch(articulation_start: np.ndarray, *, joint_count: int, cuda: bool) -> tuple[int, int]:
     """Return the lanes per articulation and the thread count of the joint velocity prescale.
 
     A lane group as wide as the mean articulation's joint count, rounded up to a
@@ -656,10 +656,19 @@ def _velocity_prescale_launch(articulation_start: np.ndarray, *, cuda: bool) -> 
     strided pass while many articulations share the device; larger ones take a
     few passes. CUDA launches cover complete warps. CPU threads cannot exchange
     values, so a CPU launch runs one lane per articulation.
+
+    Raises:
+        ValueError: If the last articulation does not end at ``joint_count``. The
+            prescale writes no DOF of a joint past it.
     """
     count = len(articulation_start) - 1
     if count <= 0:
         return 1, 0
+    if int(articulation_start[-1]) != joint_count:
+        raise ValueError(
+            "SolverFeatherPGS requires Model.articulation_start to end with the joint count "
+            f"{joint_count}, got {int(articulation_start[-1])}; ModelBuilder.finalize() writes this sentinel."
+        )
     if not cuda:
         return 1, count
     mean_joints = (int(articulation_start[-1]) - int(articulation_start[0])) / count
@@ -5871,7 +5880,7 @@ class SolverFeatherPGS(SolverBase):
             self.qd_work = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             # The joint velocity prescale writes every DOF of qd_work (see _launch_velocity_prescale).
             self._velocity_prescale_lanes, self._velocity_prescale_threads = _velocity_prescale_launch(
-                model.articulation_start.numpy(), cuda=model.device.is_cuda
+                model.articulation_start.numpy(), joint_count=model.joint_count, cuda=model.device.is_cuda
             )
             self.v_mf_accum = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
             self.v_out_snap = wp.zeros_like(model.joint_qd, requires_grad=model.requires_grad)
