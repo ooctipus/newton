@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -178,42 +179,51 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
     def test_split_fk_id_cache_does_not_alias_active_step_state(self):
         """Validate split-mode cached dynamics by input content, with no private snapshot of the solve.
 
-        The held-tree owner publishes its caches in place: a step whose input bank is a copy of the
-        bank the last step published compares the two and keeps every cache, and a copy with one
-        changed world repairs that world alone. Both match a rollout that recomputes every step.
+        A split-mode solver keeps no copy of its FK/ID cache (the snapshot is an opt-in bisection
+        aid). Its held-tree owner, here over a fixed-base arm and a free box per world, publishes
+        the caches in place: a step whose input bank is a copy of the bank the last step published
+        compares the two and keeps every cache, and a copy with one written arm repairs that arm's
+        group alone. Both match a rollout that recomputes every step.
         """
+        from newton.tests.test_feather_pgs_mixed_tree_free_body import _build  # noqa: PLC0415
+
         trajectories = []
         for forced in (False, True):
-            model = _build_floating_model("cuda:0", num_worlds=3)
-            solver = SolverFeatherPGS(model, update_mass_matrix_interval=2, pgs_mode="split")
+            model = _build("cuda:0", worlds=3)
+            with mock.patch.dict(
+                os.environ, {"FEATHER_PGS_MIXED_TREE_KINETIC_STATE": "1", "FEATHER_PGS_TREE_KINETIC_STATE": "0"}
+            ):
+                solver = SolverFeatherPGS(
+                    model, update_mass_matrix_interval=2, pgs_mode="split", friction_anchor_beta=0.0
+                )
             owner = solver._tree_kinetic_state
             self.assertIsNotNone(owner)
             self.assertIsNone(solver._fk_id_cache)
             self.assertFalse(solver._fk_id_cache_uses_snapshot)
             self.assertTrue(owner.bank_compare)
-            groups = list(getattr(owner, "groups", [owner]))
-            state_in, state_out = _make_floating_state(model), model.state()
+            state_in, state_out = model.state(), model.state()
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
             control, contacts = model.control(), model.contacts()
-            hinge = (model.joint_type.numpy() == int(newton.JointType.REVOLUTE)) & (model.joint_world.numpy() == 1)
-            hinge_dof = model.joint_qd_start.numpy()[np.flatnonzero(hinge)[0]]
+            revolute = (model.joint_type.numpy() == int(newton.JointType.REVOLUTE)) & (model.joint_world.numpy() == 1)
+            joint = int(np.flatnonzero(revolute)[0])
             history = []
             for step in range(8):
                 if step == 4:
-                    # Change world 1's hinge in the copied input bank, without a notification.
+                    # Change world 1's first arm joint in the copied input bank, without a notification.
                     qd = state_in.joint_qd.numpy()
-                    qd[hinge_dof] += 0.25
+                    qd[model.joint_qd_start.numpy()[joint]] += 0.25
                     state_in.joint_qd.assign(qd)
                 if forced:
                     solver._fk_id_cache_valid.zero_()
-                before = [group.data.generation.numpy().copy() for group in groups]
+                before = [group.data.generation.numpy().copy() for group in owner.groups]
                 solver.step(state_in, state_out, control, contacts, DT)
                 state_in.assign(state_out)
                 if step and not forced:
-                    for group, start in zip(groups, before, strict=True):
-                        worlds = solver.art_to_world.numpy()[group.sparse.plan.group_to_art.numpy()]
-                        # One finish per step; only the written world repairs as well.
+                    for group, start in zip(owner.groups, before, strict=True):
+                        written = group.sparse.plan.group_to_art.numpy() == model.joint_articulation.numpy()[joint]
+                        # One finish per step; only the written arm's group repairs as well.
                         np.testing.assert_array_equal(
-                            group.data.generation.numpy() - start, 1 + ((worlds == 1) & (step == 4))
+                            group.data.generation.numpy() - start, 1 + (written & (step == 4))
                         )
                 history.append({name: getattr(state_in, name).numpy().copy() for name in ("joint_q", "joint_qd")})
             trajectories.append(history)
