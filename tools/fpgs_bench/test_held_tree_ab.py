@@ -10,7 +10,7 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import warp as wp
@@ -162,6 +162,26 @@ class TestHeldTreeAB(unittest.TestCase):
                 self.assertEqual(
                     {_form(key) for key in launched}, {"finish", "predict", "motion"} if motion else ordinary
                 )
+
+    def test_mixed_scenes_request_no_scalar_branches(self):
+        """Build every mixed scene's solver with scalar branches off, so that its owner composes tree groups only.
+
+        A scalar-branch group holds no tree layout or cache data, so a record could not describe or
+        drive it; ``check_owner_launches`` of the scalar-branch tests checks its launches instead.
+        """
+        from newton._src.solvers.feather_pgs import scalar_branches  # noqa: PLC0415
+
+        plan = Mock(wraps=scalar_branches.plan_scalar_branches)
+        environment = {name: value for name, value in os.environ.items() if not name.startswith("FEATHER_PGS_")}
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, environment, clear=True),
+            contextlib.redirect_stdout(io.StringIO()),
+            patch.object(scalar_branches, "plan_scalar_branches", plan),
+        ):
+            records = ab.record(Path(directory) / "record.npz", scenes=("cabinet", "forest-cabinet"))
+        self.assertEqual([call.kwargs for call in plan.call_args_list], [{"requested": False}] * 2)
+        self.assertEqual({name.split("/")[0] for name in records}, {"mixed-cabinet", "mixed-forest-cabinet"})
 
     def test_worlds_set_the_mixed_scenes_world_count(self):
         """Build the mixed scenes over the requested world count; the single trees keep their fixtures' two."""

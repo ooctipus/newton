@@ -39,6 +39,12 @@ prints its groups' widths. ``--scene`` records only the named scenes.
 ``--poison`` fills freed device memory with a value before each scene, so a
 read of an array no kernel wrote shows in both arms' records.
 
+Scalar-branch groups (``scalar_branches.py``) hold no tree layout and are not
+recorded: the mixed scenes build their solvers with
+``FEATHER_PGS_SCALAR_BRANCHES=0``, so every scene composes tree groups, and
+``check_owner_launches`` of ``newton/tests/test_feather_pgs_scalar_branches.py``
+checks the launches of a scalar group and of the tree group beside it instead.
+
 Run with the import-time switches (``FEATHER_PGS_*``) unset::
 
     python tools/fpgs_bench/held_tree_ab.py record child.npz --device cuda:0
@@ -371,7 +377,9 @@ class Recorder:
                 continue
             self.poison_heap()
             model = _build(wp.get_device(self.device), worlds=self.worlds, **options)
-            solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
+            # Every scene stays on tree groups: a scalar-branch group holds no tree layout or cache data.
+            with _environment(FEATHER_PGS_SCALAR_BRANCHES=0):
+                solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
             # Velocity limits are solved by matrix-free sweeps; the owner's motion contract reads only the flag.
             solver.enable_joint_velocity_limits = owner_options.get("motion", False)
             supported = mixed_tree_kinetic.supported
