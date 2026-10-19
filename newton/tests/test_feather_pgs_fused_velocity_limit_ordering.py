@@ -77,6 +77,7 @@ class TestFeatherPGSFusedVelocityLimitOrdering(unittest.TestCase):
         articulated_contact_response: str,
         velocity_limit_law: str = "stateless",
         routes: list | None = None,
+        velocity_limits: bool = True,
     ) -> float:
         model = _build_arm_and_box_model(device="cuda:0")
 
@@ -96,7 +97,7 @@ class TestFeatherPGSFusedVelocityLimitOrdering(unittest.TestCase):
             pgs_mode="matrix_free",
             drive_mode="physx_pgs",
             articulated_contact_response=articulated_contact_response,
-            enable_joint_velocity_limits=True,
+            enable_joint_velocity_limits=velocity_limits,
             fuse_joint_velocity_limits=fuse,
             enable_contact_friction=False,
             # Deliberately under-converged (franka-class training configs run
@@ -131,6 +132,20 @@ class TestFeatherPGSFusedVelocityLimitOrdering(unittest.TestCase):
             max_arm_speed = max(max_arm_speed, float(abs(state_0.joint_qd.numpy()[0])))
         wp.synchronize()
         return max_arm_speed
+
+    @unittest.skipUnless(wp.is_cuda_available(), "matrix-free FPGS requires CUDA")
+    def test_impact_drives_an_unlimited_arm_past_the_limit(self):
+        """Drive the arm at least twice past the limit when no velocity limit acts, so the limit tests bind.
+
+        Every other test here holds the limit through the impact, which an impact
+        that never reached the limit would pass vacuously. A CPU split solver
+        (augmented drives, 8 iterations) carries the unlimited arm to 6.3 times
+        the limit.
+        """
+        speed = self._max_arm_speed_over_impact(
+            fuse=False, articulated_contact_response="immediate", velocity_limits=False
+        )
+        self.assertGreater(speed, 2.0 * QDOT_MAX)
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free FPGS requires CUDA")
     def test_dedicated_rows_hold_limit_through_impact(self):
