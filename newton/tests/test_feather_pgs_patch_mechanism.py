@@ -3413,6 +3413,26 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         self.assertFalse(twin.solver.constraint_capacity_status()["patch_frames"])
         twin.solver.check_constraint_capacity()
 
+    def test_frame_status_is_read_only_with_frame_reuse(self):
+        """Copy the patch frame status to the host only where frame reuse can set it.
+
+        Under FEATHER_PGS_PATCH_FRAME_REUSE=0 no build keeps its pairs, so status
+        reads and checks copy no fifth integer and report the flag clear.
+        """
+        for reuse in (None, "0"):
+            with self.subTest(reuse=reuse):
+                with _flags(reuse=reuse, nodes=None):
+                    solver = SolverFeatherPGS(_arm_over_box(wp.get_device("cpu"), worlds=2))
+                real, calls = solver._friction_patches.frame_status, []
+                solver._friction_patches.frame_status = SimpleNamespace(
+                    numpy=lambda real=real, calls=calls: calls.append("read") or real.numpy(),
+                    zero_=lambda real=real, calls=calls: calls.append("clear") or real.zero_(),
+                )
+                status = solver.constraint_capacity_status(clear=True)
+                solver.check_constraint_capacity()
+                self.assertFalse(status["patch_frames"])
+                self.assertEqual(calls, ["read", "clear", "read"] if reuse is None else [])
+
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
     def test_solver_graphs_reuse_sorted_frames(self):
         """Replay collide and substep graphs bitwise as eager always-sort steps, sorting once per graph or per change.

@@ -11519,12 +11519,14 @@ class SolverFeatherPGS(SolverBase):
         ``contact_generation`` or contact count changed since the previous
         captured step of the same graph without a write Newton noted (such as
         a collision pass or :meth:`~newton.Contacts.clear`), and which was
-        solved without patch friction rows (see ``friction_anchor_beta``).
-        Flags remain set across later successful steps and :meth:`reset` calls.
+        solved without patch friction rows (see ``friction_anchor_beta``); only
+        patch frame reuse sets it. Flags remain set across later successful
+        steps and :meth:`reset` calls.
 
         Call outside CUDA graph capture, on the solver's execution stream or
-        after explicitly joining that stream. This copies five integers to the
-        host. Graph replays update the same device flags without host reads.
+        after explicitly joining that stream. This copies four integers to the
+        host, and a fifth with patch frame reuse. Graph replays update the same
+        device flags without host reads.
 
         Args:
             clear: Clear the flags after reading, returning their previous
@@ -11539,7 +11541,7 @@ class SolverFeatherPGS(SolverBase):
             raise RuntimeError("Constraint capacity status must be read outside CUDA graph capture")
         values = self._constraint_capacity_status.numpy()
         result = dict(zip(("dense", "matrix_free", "propagation", "contacts"), map(bool, values), strict=True))
-        frame_status = getattr(self._friction_patches, "frame_status", None)
+        frame_status = self._patch_frame_status()
         result["patch_frames"] = frame_status is not None and bool(frame_status.numpy()[0])
         if clear:
             self._constraint_capacity_status.zero_()
@@ -11567,7 +11569,7 @@ class SolverFeatherPGS(SolverBase):
                 f"FeatherPGS constraint/contact capacity exceeded in worlds {worlds[:16].tolist()}"
                 f" ({worlds.size} invalid worlds); increase capacities and reset before accepting transitions."
             )
-        frame_status = getattr(self._friction_patches, "frame_status", None)
+        frame_status = self._patch_frame_status()
         if frame_status is not None and frame_status.numpy()[0]:
             raise RuntimeError(
                 "FeatherPGS solved captured steps without patch friction: their contact generation or count changed "
@@ -11575,6 +11577,15 @@ class SolverFeatherPGS(SolverBase):
                 "Call Contacts.clear() before rewriting contacts between captured steps, or set "
                 "FEATHER_PGS_PATCH_FRAME_REUSE=0; constraint_capacity_status(clear=True) clears the flag."
             )
+
+    def _patch_frame_status(self):
+        """Return the device flag of patch frames left empty by a stale reuse, or ``None`` when none can be.
+
+        Only a build that keeps its pairs through frame reuse sets the flag, so
+        without frame reuse the host reads it never.
+        """
+        patches = self._friction_patches
+        return patches.frame_status if patches.reuse_frames else None
 
     def constraint_row_watermarks(self) -> dict:
         """Return the opt-in constraint/contact row high-water marks.
