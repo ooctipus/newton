@@ -10,10 +10,12 @@ revolute leaves. ``TestGripperContactBound`` checks the CUDA arm-key press
 bound on ordinary dynamics, the law both CUDA routes integrate.
 """
 
+import contextlib
 import dataclasses
 import json
 import os
 import unittest
+import warnings
 from unittest import mock
 
 import numpy as np
@@ -1333,12 +1335,59 @@ class TestScalarBranchRule(unittest.TestCase):
             mock.patch.object(sb, "plan_scalar_branches", return_value=admitted),
             mock.patch("newton._src.solvers.feather_pgs.cached_dynamics.install", install),
             mock.patch.object(solver_module, "_PRISMATIC_PUBLICATION", True),
+            mock.patch.object(sb, "_WARNED_SUPERSEDED", set()),
+            self.assertWarnsRegex(UserWarning, "^Ignoring FEATHER_PGS_PRISMATIC_PUBLICATION: "),
         ):
             solver = SolverFeatherPGS(model, pgs_mode="split")
         self.assertIs(solver._scalar_branches, admitted[0])
         self.assertEqual(solver._scalar_branches_reason, admitted[1])
         self.assertIsNone(solver._prismatic_publication)
         self.assertFalse(solver._prismatic_linear_state)
+
+    def test_admitted_branches_warn_about_the_prismatic_opt_ins(self):
+        """Warn once per process about each prismatic opt-in that taken scalar branches leave selecting nothing.
+
+        Recipes set the opt-ins, and recipes are Isaac Lab's to edit, so they are warned about,
+        not rejected, and the warning names the way back. A plan the owner declines builds the
+        opt-ins and warns about nothing, nor does a solver without them. CPU installs no owner,
+        so the install is replaced by one that takes the plan.
+        """
+        model = build_branch_model(worlds=2)
+        admitted = self._admitted(model)
+
+        def install(solver):
+            solver._tree_kinetic_state = mock.Mock(scalar=object(), bank_compare=False)
+            solver._cached_dynamics_selection_reason = "A test owner takes the branches."
+
+        def notices(publication, linear_state, *, taken=True):
+            """The superseded opt-ins' warnings of one construction."""
+            with (
+                mock.patch.object(solver_module, "_PRISMATIC_PUBLICATION", publication),
+                mock.patch.object(solver_module, "_PRISMATIC_LINEAR_STATE", linear_state),
+                mock.patch.object(sb, "plan_scalar_branches", return_value=admitted),
+                mock.patch("newton._src.solvers.feather_pgs.cached_dynamics.install", install)
+                if taken
+                else contextlib.nullcontext(),
+                warnings.catch_warnings(record=True) as caught,
+            ):
+                warnings.simplefilter("always")
+                solver = SolverFeatherPGS(model, pgs_mode="split")
+            self.assertEqual(solver._scalar_branches is not None, taken)
+            return [str(warning.message) for warning in caught if "scalar branches supersede" in str(warning.message)]
+
+        both = "FEATHER_PGS_PRISMATIC_PUBLICATION and FEATHER_PGS_PRISMATIC_LINEAR_STATE"
+        with mock.patch.object(sb, "_WARNED_SUPERSEDED", set()):
+            (message,) = notices(True, True)
+            self.assertTrue(message.startswith(f"Ignoring {both}: "), message)
+            self.assertIn("Set FEATHER_PGS_SCALAR_BRANCHES=0 to keep the prismatic route.", message)
+            self.assertEqual(notices(True, True), [])
+        with mock.patch.object(sb, "_WARNED_SUPERSEDED", set()):
+            self.assertEqual(notices(False, False), [])
+            self.assertEqual(notices(True, False, taken=False), [])
+            (message,) = notices(True, False)
+            self.assertTrue(message.startswith("Ignoring FEATHER_PGS_PRISMATIC_PUBLICATION: "), message)
+            (message,) = notices(True, True)
+            self.assertTrue(message.startswith("Ignoring FEATHER_PGS_PRISMATIC_LINEAR_STATE: "), message)
 
     def test_declined_branches_restore_the_prismatic_opt_ins(self):
         """Drop an admitted plan the held-tree owner does not take and build the prismatic opt-ins as without it.

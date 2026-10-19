@@ -786,6 +786,32 @@ def plan_scalar_branches(solver, *, requested: bool) -> tuple[ScalarBranchPlan |
     return plan, reason
 
 
+_WARNED_SUPERSEDED: set[str] = set()
+"""Prismatic opt-ins that :func:`superseded_notice` has reported in this process."""
+
+
+def superseded_notice(names) -> str | None:
+    """Return a warning naming the prismatic opt-ins in ``names`` that scalar branches leave selecting nothing.
+
+    A solver whose held-tree owner takes the scalar branches builds neither
+    the prismatic publication plan nor the linear state those opt-ins request.
+    Recipes set them, and recipes are not Newton's to edit, so they are
+    warned about, once per name and process, rather than rejected.
+
+    Returns:
+        The warning text, or ``None`` when every name was reported before.
+    """
+    names = [name for name in names if name not in _WARNED_SUPERSEDED]
+    if not names:
+        return None
+    _WARNED_SUPERSEDED.update(names)
+    return (
+        f"Ignoring {' and '.join(names)}: scalar branches supersede the prismatic route on this solver "
+        "(get_path_selection() reports routes.held_tree.scalar_branches). Set FEATHER_PGS_SCALAR_BRANCHES=0 "
+        "to keep the prismatic route."
+    )
+
+
 class ScalarBranchState:
     """Own one size group of scalar branches with the held-tree owner's group interface.
 

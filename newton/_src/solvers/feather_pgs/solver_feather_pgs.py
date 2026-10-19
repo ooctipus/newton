@@ -3391,6 +3391,20 @@ class SolverFeatherPGS(SolverBase):
                     "A cached owner without scalar branches took these worlds: "
                     f"{self._cached_dynamics_selection_reason}"
                 )
+        if self._scalar_branches is not None:
+            # The prismatic opt-ins a recipe sets now select nothing: say so once per process.
+            from .scalar_branches import superseded_notice  # noqa: PLC0415
+
+            notice = superseded_notice(
+                name
+                for name, requested in (
+                    ("FEATHER_PGS_PRISMATIC_PUBLICATION", _PRISMATIC_PUBLICATION),
+                    ("FEATHER_PGS_PRISMATIC_LINEAR_STATE", _PRISMATIC_LINEAR_STATE),
+                )
+                if requested
+            )
+            if notice is not None:
+                warnings.warn(notice, UserWarning, stacklevel=_CONSTRUCTOR_CALLER)
         self._unread_mass_sizes = self._unread_mass_matrix_sizes()
         # Decide the fused publication now: its host checks must not run inside
         # a later graph capture of the first step.
