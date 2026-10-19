@@ -16,6 +16,7 @@ from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
 from newton._src.solvers.feather_pgs.tree_kinetic_state import get_classify_kernel, get_state_kernel
 from newton.tests import test_feather_pgs_sparse_split as split
+from newton.tests import test_feather_pgs_tree_stages as stages
 from tools.fpgs_bench.public_state_oracle import physical_mass
 from tools.fpgs_bench.test_tree_kinetic_state import fixture as tree_fixture
 
@@ -57,7 +58,9 @@ class TestPrescaledTreeContract(unittest.TestCase):
         Owners keep the one-pass repair of a motion-velocity layout, which repairs on every step, so
         no owner launches a classified repair of an alternate motion: the classification takes no
         motion velocity (its arguments are the repair's operands, the comparison bank, the two block
-        lists and their counts) and the listed repair refuses one.
+        lists and their counts), and the listed repair refuses one. The listed repair keeps the
+        launch ABI every finish and repair shares, motion input included, and its generated code
+        reads that input nowhere.
         """
         layout = TreeLayout(4, 3, 6, 3, 2, 0, (2, 1, 0))
         classify = get_classify_kernel(layout=layout)
@@ -77,7 +80,10 @@ class TestPrescaledTreeContract(unittest.TestCase):
             ],
         )
         listed = get_state_kernel(False, layout=layout, listed=True)
-        self.assertNotIn("motion_qd", [arg.label for arg in listed.adj.args])
+        labels = [arg.label for arg in listed.adj.args]
+        self.assertEqual(labels[6:], ["motion_qd", "repair_blocks", "repair_count", "bank"])
+        wp.init()
+        self.assertEqual(stages._input_uses(listed), [])
         with self.assertRaisesRegex(ValueError, "ordinary motion"):
             get_state_kernel(False, layout=layout, motion_velocity=True, listed=True)
 
