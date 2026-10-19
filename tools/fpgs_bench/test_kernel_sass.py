@@ -168,6 +168,26 @@ class TestKernelSass(unittest.TestCase):
         ]
         self.assertEqual(sorted(classified), sorted(ordinary))
 
+    def test_scalar_branch_kernels_compile_at_their_launch_blocks(self):
+        """Compile the scalar-branch repair at the group's repair block and its other kernels at their module's.
+
+        The held-tree owner's scalar-branch group has no layout, so its kernels are in the pins family: the
+        repair launches one warp per articulation in blocks of four, the predict, finish and listed drive
+        kernels at Warp's default block.
+        """
+        from newton._src.solvers.feather_pgs import scalar_branches  # noqa: PLC0415
+
+        kernels, rejected = sass.identity.inventory(("pins",), ("scalar_branches.",))
+        self.assertEqual(rejected, {})
+        blocks = {
+            key: block for keys, block in sass._module_groups(kernels, sass.launch_blocks(("pins",))) for key in keys
+        }
+        self.assertEqual(len(blocks), 6)
+        self.assertEqual(blocks.pop("scalar_branches.repair_scalar_branches"), 128)
+        self.assertEqual(scalar_branches._REPAIR_BLOCK_DIM, 128)
+        self.assertEqual(set(blocks.values()), {256})
+        self.assertNotIn("scalar_branches.repair_scalar_branches", sass.launch_blocks(("held_tree",)))
+
     def test_report_fails_kernels_that_lose_resident_blocks_or_spill(self):
         """Exit 2 when a kernel keeps fewer blocks resident or spills more to local memory."""
         parent = _record(103, kernel=_row(72, shared=4752))

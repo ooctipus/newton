@@ -27,9 +27,13 @@ A held-tree kernel compiles at the block its owner launches: 32 threads, or 64
 for a tree of more than 32 bodies (``TreeLayout.block``; a chain plan whose
 padded chains need a second warp also launches 64, which no grid layout
 models), and a classification, one thread per repair block, at the owner's
-classification block (:func:`classify_block`, 64 threads). Other kernels
-compile at their module's block size. Warp sizes some static shared memory by
-the block, so other block sizes give other binaries.
+classification block (:func:`classify_block`, 64 threads). The held-tree
+owner's scalar-branch group has no layout: its kernels are module-level kernels
+of ``scalar_branches`` in the pins family (``--family pins --select
+scalar_branches.``), and its repair compiles at the block the group launches it
+with (:func:`scalar_branch_blocks`, 128 threads). Other kernels compile at
+their module's block size. Warp sizes some static shared memory by the block,
+so other block sizes give other binaries.
 
 ``diff`` compares two records. Identical SASS is identical machine code: the
 change cannot alter speed or results. Otherwise the report lists the resource
@@ -302,11 +306,28 @@ def classify_block() -> int:
     return getattr(tree_kinetic_owner, "_CLASSIFY_BLOCK_DIM", 64)
 
 
+def scalar_branch_blocks() -> dict:
+    """Return ``{label: threads per block}`` of the scalar-branch kernels that do not launch at their module's block.
+
+    The held-tree owner's scalar-branch group launches its repair one warp per
+    articulation, four per block (``scalar_branches._REPAIR_BLOCK_DIM``); its
+    predict, finish and listed drive kernels launch at their module's block.
+    Checkouts that predate scalar branches have none.
+    """
+    try:
+        from newton._src.solvers.feather_pgs import scalar_branches  # noqa: PLC0415
+    except ImportError:
+        return {}
+    return {"scalar_branches.repair_scalar_branches": scalar_branches._REPAIR_BLOCK_DIM}
+
+
 def launch_blocks(families):
     """Return ``{label: threads per block}`` for the inventory kernels whose launch block is known.
 
     A held-tree classification launches :func:`classify_block` threads per
-    block; every other held-tree kernel launches ``TreeLayout.block``.
+    block; every other held-tree kernel launches ``TreeLayout.block``. In the
+    pins family, the scalar-branch repair launches at
+    :func:`scalar_branch_blocks`'s block.
     """
     blocks = {}
     if "held_tree" in families:
@@ -314,6 +335,8 @@ def launch_blocks(families):
         for name, _, args, kwargs in identity.held_tree_calls():
             block = classify if name.endswith(".get_classify_kernel") else identity._value(kwargs["layout"]).block
             blocks[identity.label(name, args, kwargs)] = block
+    if "pins" in families:
+        blocks.update(scalar_branch_blocks())
     return blocks
 
 

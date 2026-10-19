@@ -58,6 +58,10 @@ from .tree_kinetic_owner import _NUMERIC_FLAGS
 
 # Lanes of the repair launch: one warp per articulation, so a valid cache exits per warp.
 _REPAIR_LANES = wp.constant(32)
+# Threads per block of the repair launch, four articulations per block; the predict,
+# finish and listed drive launches take Warp's default block. tools/fpgs_bench/kernel_sass.py
+# compiles the repair at this block.
+_REPAIR_BLOCK_DIM = 128
 
 # Topology arrays the plan and the kernels' index arithmetic rely on.
 _TOPOLOGY_FIELDS = (
@@ -932,7 +936,7 @@ class ScalarBranchState:
                 state_in.joint_q,
             ],
             outputs=[state_in.body_q, state_aug.joint_S_s, solver.articulation_origin],
-            block_dim=128,
+            block_dim=_REPAIR_BLOCK_DIM,
             device=model.device,
         )
 

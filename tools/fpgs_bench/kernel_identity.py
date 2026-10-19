@@ -28,10 +28,12 @@ record removes all three: it renames functions by build order within the
 kernel, builds each kernel as a fresh process would, and runs with
 ``PYTHONHASHSEED=0``.
 
-The inventory is the point-stream pin inventory, the factory variants those
-pins do not reach (:func:`factory_calls`), a held-tree layout grid
-(:func:`held_tree_calls`) and a census of every flag combination of the sweep
-factories that vote an exit (:func:`census_calls`), recorded by hash only.
+The inventory is the point-stream pin inventory (every module-level kernel of
+the FeatherPGS package, the held-tree owner's scalar-branch group included, and
+the pinned factory calls), the factory variants those pins do not reach
+(:func:`factory_calls`), a held-tree layout grid of the factory-built tree
+kernels (:func:`held_tree_calls`) and a census of every flag combination of the
+sweep factories that vote an exit (:func:`census_calls`), recorded by hash only.
 Nothing is compiled and no device is needed; a full record takes about a
 minute and a half on the CPU, the census about a minute of it.
 
@@ -430,6 +432,9 @@ def held_tree_calls():
     only layouts of ordinary motion; a motion-velocity layout keeps its
     one-pass repair at any size. The switched layouts add the comparison
     forms, the stage clocks and the repair and finish without body velocity.
+    A scalar-branch group of the held-tree owner has no layout: its repair,
+    predict, finish and listed drive kernels are module-level kernels of
+    ``scalar_branches``, which the pins family records.
     """
     from newton._src.solvers.feather_pgs import tree_kinetic_state as native  # noqa: PLC0415
 

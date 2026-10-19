@@ -198,6 +198,29 @@ class TestKernelIdentity(unittest.TestCase):
         self.assertEqual(rows[key]["hash"], identity.digest(json.dumps(dataclasses.astuple(source))))
         self.assertTrue(any("held_policy=held_policy" in key for key in rows))
 
+    def test_scalar_branch_kernels_are_recorded_with_the_pins(self):
+        """Record every kernel of the held-tree owner's scalar-branch group in the pins family.
+
+        They are module-level kernels without a tree layout, so the held-tree
+        layout grid builds none of them; the point-stream pin inventory holds
+        them, and an identity diff compares their generated code there.
+        """
+        from newton._src.solvers.feather_pgs import scalar_branches  # noqa: PLC0415
+
+        kernels, rejected = identity.inventory(("pins",), ("scalar_branches.",))
+        self.assertEqual(rejected, {})
+        names = (
+            "finish_prismatic_branches",
+            "finish_scalar_branches",
+            "predict_prismatic_branches",
+            "predict_scalar_branches",
+            "prepare_listed_augmented_drives",
+            "repair_scalar_branches",
+        )
+        self.assertEqual(sorted(kernels), [f"scalar_branches.{name}" for name in names])
+        for name in names:
+            self.assertEqual(kernels[f"scalar_branches.{name}"], ("pins", getattr(scalar_branches, name)))
+
     def test_label_names_calls_like_the_pins(self):
         """Label calls with positional values, sorted keywords and named layouts."""
         layout = identity.Named("chain9", object())
