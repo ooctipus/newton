@@ -7819,10 +7819,21 @@ class SolverFeatherPGS(SolverBase):
                     )
                 self._pgs_solve_mf_gs_incremental_kernel = self._pgs_solve_mf_gs_incremental_kernels[0]
 
+        # The row builder allocates free-body velocity-limit rows for free rigid bodies with registered speed
+        # limits, unless an infinite activation fraction disables velocity limits; the split free-body sweep
+        # compiles their law wherever they can exist.
+        self._free_body_velocity_limit_rows = bool(
+            self._has_free_rigid_bodies
+            and self._has_rigid_body_velocity_limits
+            and not np.isinf(self.velocity_limit_activation_fraction)
+        )
         self._pgs_solve_mf_kernel = None
         if model.device.is_cuda and hasattr(self, "max_mf_bodies") and self.mf_max_constraints > 0:
             self._pgs_solve_mf_kernel = _get_pgs_solve_mf_kernel(
-                self.mf_max_constraints, self.max_mf_bodies, device_arch
+                self.mf_max_constraints,
+                self.max_mf_bodies,
+                device_arch,
+                has_velocity_limit_rows=self._free_body_velocity_limit_rows,
             )
 
         self._pgs_solve_propagation_kernel = None
@@ -20084,16 +20095,38 @@ def _get_pgs_solve_streaming_kernel(max_constraints: int, device_arch: str, pgs_
 
 
 @cache
-def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device_arch: str) -> "wp.Kernel":
+def _get_pgs_solve_mf_kernel(
+    mf_max_constraints: int, max_mf_bodies: int, device_arch: str, *, has_velocity_limit_rows: bool = False
+) -> "wp.Kernel":
     """Matrix-free PGS with body velocities and impulses in shared memory.
 
     Uses one warp (32 threads) per world. Body velocities and impulses live
     in shared memory for the duration of all PGS iterations, eliminating
     global memory round-trips. J, MiJt, eff_mass_inv, and rhs are read
     from global memory per constraint (read-only, cache-friendly sequential access).
+
+    ``has_velocity_limit_rows`` compiles the free-body velocity-limit law of
+    :func:`pgs_solve_mf_loop`: a ``PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT`` row
+    pushes only while its limit is violated (``J v + rhs < 0``), by the whole
+    unrelaxed correction, and stores that correction instead of an accumulated
+    impulse. The rows occupy the tail of each world's rows, so they keep the
+    last word of every iteration, as in the fused MF-GS kernel's final
+    velocity-limit pass. Without the flag such a row is relaxed as a bilateral
+    row, which drives every limited axis onto its limit; the variant without it
+    keeps its historical generated code for solvers that cannot allocate these rows.
     """
     MF_MAX_C = mf_max_constraints
     MAX_BODIES = max_mf_bodies
+    velocity_limit_projection = (
+        f"""
+                if (row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)}) {{
+                    // Stateless clamp: only a violated limit pushes, and the row keeps that correction.
+                    delta_impulse = (jv + rhs_i) < 0.0f ? delta : 0.0f;
+                    new_impulse = delta_impulse;
+                }}"""
+        if has_velocity_limit_rows
+        else ""
+    )
 
     snippet = f"""
 #if defined(__CUDA_ARCH__)
@@ -20263,7 +20296,7 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
                     }}
                 }}
 
-                float delta_impulse = new_impulse - old_impulse;
+                float delta_impulse = new_impulse - old_impulse;{velocity_limit_projection}
                 s_impulse[i] = new_impulse;
 
                 // Apply velocity correction: v += MiJt * delta_impulse
@@ -20391,6 +20424,8 @@ def _get_pgs_solve_mf_kernel(mf_max_constraints: int, max_mf_bodies: int, device
         )
 
     name = f"pgs_solve_mf_{mf_max_constraints}_{max_mf_bodies}"
+    if has_velocity_limit_rows:
+        name += "_vlim"
     pgs_solve_mf_template.__name__ = name
     pgs_solve_mf_template.__qualname__ = name
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_template)
