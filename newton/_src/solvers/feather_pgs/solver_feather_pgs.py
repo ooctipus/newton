@@ -7819,12 +7819,13 @@ class SolverFeatherPGS(SolverBase):
                     )
                 self._pgs_solve_mf_gs_incremental_kernel = self._pgs_solve_mf_gs_incremental_kernels[0]
 
-        # The row builder allocates free-body velocity-limit rows for free rigid bodies with registered speed
-        # limits, unless an infinite activation fraction disables velocity limits; the split free-body sweep
-        # compiles their law wherever they can exist.
-        self._free_body_velocity_limit_rows = bool(
+        # The gate of the row builder (_stage4_build_rows): it allocates free-body velocity-limit rows into
+        # rigid_velocity_limit_slot when free rigid bodies exist, and an infinite activation fraction reserves
+        # none. The split free-body sweep compiles their law wherever the builder can allocate them, even when
+        # every registered limit is infinite and no row is built.
+        self._has_free_body_velocity_limit_rows = bool(
             self._has_free_rigid_bodies
-            and self._has_rigid_body_velocity_limits
+            and getattr(self, "rigid_velocity_limit_slot", None) is not None
             and not np.isinf(self.velocity_limit_activation_fraction)
         )
         self._pgs_solve_mf_kernel = None
@@ -7833,7 +7834,7 @@ class SolverFeatherPGS(SolverBase):
                 self.mf_max_constraints,
                 self.max_mf_bodies,
                 device_arch,
-                has_velocity_limit_rows=self._free_body_velocity_limit_rows,
+                has_velocity_limit_rows=self._has_free_body_velocity_limit_rows,
             )
 
         self._pgs_solve_propagation_kernel = None

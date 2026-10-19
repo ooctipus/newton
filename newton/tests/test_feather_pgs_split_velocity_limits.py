@@ -26,6 +26,8 @@ DT = 1.0 / 60.0
 LINEAR_LIMIT = 2.0
 ANGULAR_LIMIT = 3.0
 LIMITS = np.array([LINEAR_LIMIT] * 3 + [ANGULAR_LIMIT] * 3)
+# Registered speed attributes that limit nothing [m/s, rad/s].
+INFINITE_LIMITS = (float("inf"), float("inf"))
 # A 1 kg box with a spherical inertia: its axes decouple and free flight keeps its angular velocity.
 MASS = 1.0
 INERTIA = 0.1
@@ -50,7 +52,9 @@ SWEEP_LINEAR = ((3.0, -2.5, 1.0), (-1.0, 0.5, -2.0), (0.0, 4.0, -7.0))
 SWEEP_ANGULAR = ((-3.5, 0.0, 2.9), (5.0, -1.0, -3.0), (0.2, -6.0, 3.1))
 
 
-def _free_boxes(device, worlds, *, articulated=False, limits=True, fraction=0.0, wrenches=None):
+def _free_boxes(
+    device, worlds, *, articulated=False, limits=(LINEAR_LIMIT, ANGULAR_LIMIT), fraction=0.0, wrenches=None
+):
     """One free box per world, in split mode, launched at ``worlds`` (linear, angular) velocities.
 
     Args:
@@ -58,18 +62,16 @@ def _free_boxes(device, worlds, *, articulated=False, limits=True, fraction=0.0,
         worlds: Initial (linear [m/s], angular [rad/s]) velocity of each world's box.
         articulated: Add a one-joint arm to every world, so the split driver interleaves the dense and the
             free-body sweeps.
-        limits: Register the rigid-body speed limits; without them the box is unlimited.
+        limits: (linear [m/s], angular [rad/s]) speed limits of every box; None leaves the speed attributes
+            unregistered.
         fraction: The solver's ``velocity_limit_activation_fraction``.
         wrenches: Velocity change [m/s, rad/s] that a constant body wrench adds over one step, per world.
     """
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    if limits:
+    attributes = None
+    if limits is not None:
         SolverFeatherPGS.register_custom_attributes(builder)
-    attributes = (
-        {"rigid_body_max_linear_velocity": LINEAR_LIMIT, "rigid_body_max_angular_velocity": ANGULAR_LIMIT}
-        if limits
-        else None
-    )
+        attributes = {"rigid_body_max_linear_velocity": limits[0], "rigid_body_max_angular_velocity": limits[1]}
     boxes = []
     for world in range(len(worlds)):
         builder.begin_world()
@@ -258,24 +260,49 @@ class _SplitVelocityLimitChecks:
                 )
                 np.testing.assert_allclose(speeds, [[LINEAR_LIMIT, ANGULAR_LIMIT]] * len(PAST), rtol=RTOL)
 
+    def test_route_records_the_velocity_limit_sweep(self):
+        """Record the stateless free-body law, and on CUDA its ``_vlim`` sweep, wherever limit rows can exist."""
+        world = [((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))]
+        for name, options, law, words in (
+            ("limits", {}, "stateless", "unrelaxed correction"),
+            ("infinite_limits", {"limits": INFINITE_LIMITS}, "stateless", "unrelaxed correction"),
+            ("unregistered", {"limits": None}, None, "not registered"),
+            ("never_activated", {"fraction": float("inf")}, None, "fraction=inf"),
+        ):
+            with self.subTest(name):
+                solver = _free_boxes(self.device, world, **options).solver
+                routes = solver.get_path_selection()["routes"]
+                self.assertEqual(routes["velocity_limits"]["free_body_sweep_law"], law)
+                self.assertIn(words, routes["velocity_limits"]["free_body_sweep_law_reason"])
+                key = routes["sweep"]["free_body_matrix_free"]
+                if self.device == "cpu":
+                    self.assertEqual(key, "pgs_solve_mf_loop")
+                else:
+                    suffix = "_vlim" if law else ""
+                    self.assertEqual(key, f"pgs_solve_mf_{solver.mf_max_constraints}_{solver.max_mf_bodies}{suffix}")
+
 
 class TestSplitFreeBodyVelocityLimits(_SplitVelocityLimitChecks, unittest.TestCase):
     device = "cpu"
 
-    def test_sweep_compiles_the_law_where_rows_can_exist(self):
-        """Select the velocity-limit sweep exactly where the row builder can allocate free-body limit rows."""
+    def test_sweep_compiles_the_law_wherever_rows_can_exist(self):
+        """Select the velocity-limit sweep wherever the row builder can allocate free-body limit rows.
+
+        The selection follows the builder's structure, not the limits: registered but infinite limits
+        select it although no row is built, and an infinite activation fraction declines it.
+        """
         world = [((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))]
-        for name, options, expected in (
-            ("limits", {}, True),
-            ("unregistered", {"limits": False}, False),
-            ("never_activated", {"fraction": float("inf")}, False),
+        for name, options, selected, built in (
+            ("limits", {}, True, True),
+            ("infinite_limits", {"limits": INFINITE_LIMITS}, True, False),
+            ("unregistered", {"limits": None}, False, False),
+            ("never_activated", {"fraction": float("inf")}, False, False),
         ):
             with self.subTest(name):
                 run = _free_boxes(self.device, world, **options)
-                self.assertEqual(run.solver._free_body_velocity_limit_rows, expected)
+                self.assertEqual(run.solver._has_free_body_velocity_limit_rows, selected)
                 _step(run)
-                count = int(run.solver.mf_constraint_count.numpy().sum())
-                self.assertEqual(count > 0, expected)
+                self.assertEqual(int(run.solver.mf_constraint_count.numpy().sum()) > 0, built)
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
@@ -301,15 +328,6 @@ class TestSplitFreeBodyVelocityLimitsCUDA(_SplitVelocityLimitChecks, unittest.Te
                 )
                 for _ in range(3):
                     _assert_on_limit_scale(_step(cuda), _step(cpu))
-
-    def test_route_records_the_velocity_limit_sweep(self):
-        """Name the velocity-limit sweep in the route record only where free-body limit rows can exist."""
-        world = [((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))]
-        for options, suffix in (({}, "_vlim"), ({"limits": False}, ""), ({"fraction": float("inf")}, "")):
-            with self.subTest(**options):
-                solver = _free_boxes(self.device, world, **options).solver
-                key = solver.get_path_selection()["routes"]["sweep"]["free_body_matrix_free"]
-                self.assertEqual(key, f"pgs_solve_mf_{solver.mf_max_constraints}_{solver.max_mf_bodies}{suffix}")
 
 
 if __name__ == "__main__":

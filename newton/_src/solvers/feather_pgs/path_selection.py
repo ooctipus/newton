@@ -822,6 +822,7 @@ def _velocity_limits(solver) -> dict:
     matrix_free = solver.pgs_mode == "matrix_free"
     model = solver.model
     prescale = solver.enable_joint_velocity_limits and model.joint_count > 0 and model.articulation_count > 0
+    free_body_law, free_body_law_reason = _split_free_body_velocity_limit_law(solver)
     return {
         "joint": joint,
         "reason": reason,
@@ -830,14 +831,33 @@ def _velocity_limits(solver) -> dict:
         "activation_fraction": json_value(solver.velocity_limit_activation_fraction),
         "rigid_body_limits": limits,
         # Mirrors _allocate_mf_buffers and the row allocation of _stage4_build_rows (both modes),
-        # and _clamp_rigid_velocity_limits for free articulation roots.
+        # and _clamp_rigid_velocity_limits for free articulation roots. At an infinite activation
+        # fraction the allocator still launches but reserves no row.
         "free_body_rows": bool(limits and solver._free_rigid_body_count > 0),
+        # The law of split mode's free-body sweep (sweep.free_body_matrix_free) for these rows.
+        "free_body_sweep_law": free_body_law,
+        "free_body_sweep_law_reason": free_body_law_reason,
         "root_clamp": bool(
             limits
             and solver._has_root_free
             and not (matrix_free and getattr(solver, "rigid_velocity_limit_slot", None) is not None)
         ),
     }
+
+
+def _split_free_body_velocity_limit_law(solver) -> tuple[str | None, str]:
+    # Mirrors the free_body_matrix_free sweep of _sweep and the kernel selection of _init_tiled_kernels.
+    if solver.pgs_mode == "matrix_free" or solver._sparse_split or not solver._has_free_rigid_bodies:
+        return None, "No split free-body sweep: matrix-free mode, native sparse split rows or no free rigid bodies."
+    if solver._has_free_body_velocity_limit_rows:
+        return "stateless", (
+            "A violated free-body velocity-limit row pushes by its whole, unrelaxed correction and keeps that "
+            "correction instead of an accumulated impulse; the rows end every iteration. The CPU loop applies "
+            "this law and CUDA builds the _vlim sweep for it."
+        )
+    if solver._has_rigid_body_velocity_limits:
+        return None, "velocity_limit_activation_fraction=inf reserves no free-body velocity-limit row."
+    return None, "No free-body velocity-limit rows: the rigid-body speed attributes are not registered."
 
 
 def _free_rigid_bodies(solver) -> dict:
