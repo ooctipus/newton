@@ -1787,10 +1787,11 @@ class CollisionPipeline:
                 them. ``False`` drops them. ``True`` keeps them, as before: for
                 solvers that resolve fixed joints as constraints and respond to
                 such contacts, and for contact sensors that should report them.
-                The immobile set is computed at construction; after changing
+                The immobile set is computed at construction; code that changes
                 :attr:`~newton.Model.body_flags` or
-                :attr:`~newton.Model.joint_enabled`, call
-                :meth:`notify_model_changed`.
+                :attr:`~newton.Model.joint_enabled` at runtime must also call
+                :meth:`notify_model_changed`, or a body released from a fixed
+                joint keeps no contacts with static shapes.
             sdf_hydroelastic_config: Configuration for hydroelastic collision
                 handling. Defaults to None.
             shape_pairs_max: Override for the broad-phase candidate-pair

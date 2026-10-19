@@ -749,19 +749,26 @@ Neither shape of such a pair can move, so its contacts have no dynamics in a sol
 welded bodies no degrees of freedom; :class:`~newton.solvers.SolverFeatherPGS` discards them
 anyway. Dropping them in the broad phase removes their contact generation and solver bookkeeping.
 Solvers that resolve fixed joints as constraints no longer see these contacts either, and contact
-sensors no longer report them.
+sensors no longer report them. With ``include_static_kinematic_pairs=False``, a welded body also
+counts as static for that filter, so its pairs with kinematic shapes are dropped as well.
 
 ``get_collision_selection()["immobile_pairs"]`` records the choice and the welded bodies,
 immobile shapes and dropped pairs. Pass ``include_immobile_pairs=True``, or set
-``NEWTON_BROAD_PHASE_IMMOBILE_FILTER=0`` before construction, to keep these pairs. The immobile set
-is computed at construction; after changing :attr:`~Model.body_flags` or
-:attr:`~Model.joint_enabled`, notify the pipeline as well as the solver:
+``NEWTON_BROAD_PHASE_IMMOBILE_FILTER=0`` before construction, to keep these pairs.
+
+The immobile set is computed at construction. Code that changes :attr:`~Model.joint_enabled` or
+:attr:`~Model.body_flags` at runtime must notify the pipeline as well as the solver; otherwise a
+body released from a fixed joint keeps no contacts with static shapes and falls through them:
 
 .. code-block:: python
 
-    model.body_flags.assign(flags)
-    solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
-    pipeline.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+    model.joint_enabled.assign(enabled)  # disables the fixed joint that welds a body
+    solver.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+    pipeline.notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+
+``ModelFlags.JOINT_PROPERTIES`` makes the pipeline copy the joint enables from the device, and
+``ModelFlags.BODY_PROPERTIES`` the body flags; other joint and body edits, such as joint
+coordinates or transforms, need no pipeline notification.
 
 .. _Collision Pipeline Details:
 
