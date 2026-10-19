@@ -98,12 +98,16 @@ def _select_mfgs_storage(
     fuse_vel_limits: bool,
     block_count: int | None = None,
     sm_count: int | None = None,
+    force_stream_mf_impulses: bool = False,
 ) -> _MFGSStorage:
     """Select metadata and impulse storage without changing row capacity or order.
 
     Stream MF impulses only when they cannot fit alongside the shared world
     velocity and dense state. This is a construction-time capacity fallback,
     not a claim that global storage is faster for resident-sized workloads.
+    ``force_stream_mf_impulses`` streams them regardless, as the solver's
+    ``FEATHER_PGS_MFGS_STREAM_LAMBDA`` reference override requests; the
+    row-metadata budget below then counts them as streamed.
 
     Streamed metadata keeps the packed dense row types and parents resident
     when the launch grid of ``block_count`` blocks holds at most one block per
@@ -143,6 +147,9 @@ def _select_mfgs_storage(
     stream_mf_impulses = impulse_bytes > max_shared_memory
     if stream_mf_impulses:
         reason += f" MF impulses stream: {impulse_bytes} bytes exceed the device's {max_shared_memory}."
+    elif force_stream_mf_impulses:
+        stream_mf_impulses = True
+        reason += " MF impulses stream on request (FEATHER_PGS_MFGS_STREAM_LAMBDA)."
     resident_row_metadata = False
     if not shared_metadata:
         static_bytes = fixed_bytes + 4 * max_constraints + (0 if stream_mf_impulses else 4 * mf_max_constraints)

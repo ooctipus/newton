@@ -7473,7 +7473,18 @@ class SolverFeatherPGS(SolverBase):
             has_drive_rows = self.drive_mode == "physx_pgs"
             # The grid _launch_matrix_free_gs_solve launches: one block per world, or the general-world queue's.
             general_blocks = self._local_general_solver_blocks if self._local_internal_fast_path else self.world_count
-            storage = _MFGSStorage(False, False, False, "Without CUDA no shared-memory storage applies.")
+            # Preserve the explicit diagnostic override without hiding it in a
+            # cached factory: storage is part of the kernel specialization key.
+            # The selection sizes the resident row metadata with its choice.
+            force_stream_mf_impulses = os.environ.get("FEATHER_PGS_MFGS_STREAM_LAMBDA", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            storage = _MFGSStorage(
+                False, force_stream_mf_impulses, False, "Without CUDA no shared-memory storage applies."
+            )
             if model.device.is_cuda:
                 storage = _select_mfgs_storage(
                     self.dense_max_constraints,
@@ -7484,13 +7495,8 @@ class SolverFeatherPGS(SolverBase):
                     fuse_vel_limits=self.fuse_joint_velocity_limits,
                     block_count=int(general_blocks),
                     sm_count=int(model.device.sm_count),
+                    force_stream_mf_impulses=force_stream_mf_impulses,
                 )
-            # Preserve the explicit diagnostic override without hiding it in a
-            # cached factory: storage is part of the kernel specialization key.
-            stream_override = os.environ.get("FEATHER_PGS_MFGS_STREAM_LAMBDA", "").strip().lower()
-            if stream_override in ("1", "true", "yes", "on") and not storage.stream_mf_impulses:
-                stream_reason = storage.reason + " FEATHER_PGS_MFGS_STREAM_LAMBDA streams MF impulses."
-                storage = storage._replace(stream_mf_impulses=True, reason=stream_reason)
             self._mfgs_storage = storage
             use_rb = (
                 self.mf_gs_response_block_rows > 0

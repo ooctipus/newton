@@ -5,6 +5,7 @@
 
 import inspect
 import itertools
+import os
 import re
 import unittest
 from unittest import mock
@@ -245,8 +246,10 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
         """Keep packed row metadata resident only for grids of one block per SM within 48 KiB of static memory."""
         options = {"has_drive_rows": False, "fuse_vel_limits": False}
 
-        def select(shape, shared_memory, blocks, sms=188):
-            return fpgs._select_mfgs_storage(*shape, shared_memory, **options, block_count=blocks, sm_count=sms)
+        def select(shape, shared_memory, blocks, sms=188, **request):
+            return fpgs._select_mfgs_storage(
+                *shape, shared_memory, **options, block_count=blocks, sm_count=sms, **request
+            )
 
         large = (2304, 2304, 75)
         # 128 worlds, one block each, on 188 SMs: velocities, dense and MF impulses and the packed
@@ -276,6 +279,17 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
         self.assertIn("8380 <= 49152", storage.reason)
         # Resident MF impulses do not: 22528 of them hold the block at 98492 bytes.
         self.assertEqual(select((256, 22528, 1551), 101376, 32)[:3], (False, False, False))
+        # Streaming them on request takes their bytes out of the block before the budget is checked.
+        storage = select((256, 22528, 1551), 101376, 32, force_stream_mf_impulses=True)
+        self.assertEqual(storage[:3], (False, True, True))
+        self.assertIn("MF impulses stream on request (FEATHER_PGS_MFGS_STREAM_LAMBDA)", storage.reason)
+        self.assertIn("8380 <= 49152", storage.reason)
+        # The request changes nothing where capacity streams them already, or where nothing is resident to free.
+        for shape, blocks in (((256, 37248, 1551), 32), ((2304, 2304, 75), 16384)):
+            with self.subTest(shape=shape, blocks=blocks):
+                requested = select(shape, 101376, blocks, force_stream_mf_impulses=True)
+                self.assertTrue(requested.stream_mf_impulses)
+                self.assertEqual(requested.resident_row_metadata, select(shape, 101376, blocks).resident_row_metadata)
         # Resident metadata already holds the packed rows; an unknown launch shape keeps them streamed.
         storage = select((192, 64, 22), 101376, 16384)
         self.assertEqual(storage[:3], (True, False, False))
@@ -821,6 +835,47 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
         self.assertNotIn("_smeta", declined._pgs_solve_mf_gs_kernel.key)
         self.assertEqual((storage["metadata"], storage["row_types_and_parents"]), ("streamed", "streamed"))
         self.assertIn("2-block grid exceeds one block per SM (1 SMs)", storage["reason"])
+
+    def test_solver_sizes_row_metadata_with_requested_streamed_impulses(self):
+        """Take requested streamed MF impulses out of the block before keeping row types and parents resident.
+
+        With 12288 matrix-free rows resident, the two-world block would declare more than 48 KiB of
+        static shared memory and keeps its row types and parents streamed. Requested through
+        ``FEATHER_PGS_MFGS_STREAM_LAMBDA``, the impulses stream instead and the remaining block keeps
+        the row types and parents resident.
+        """
+        device = wp.get_device("cuda:0")
+        model = _three_size_model(device)
+        options = {
+            "pgs_mode": "matrix_free",
+            "dense_max_constraints": 320,
+            "mf_max_constraints": 12288,
+            "mf_gs_incremental_rows": 0,
+            "sparse_mass_matrix": "off",
+        }
+        solvers = {}
+        for request in ("0", "1"):
+            with mock.patch.dict(os.environ, {"FEATHER_PGS_MFGS_STREAM_LAMBDA": request}):
+                solvers[request] = fpgs.SolverFeatherPGS(model, **options)
+        dofs = solvers["0"].max_world_dofs
+        if 128 + 4 * (dofs + 320 + 12288) > device.max_shared_memory_per_block:
+            self.skipTest("The device streams these MF impulses by capacity")
+        records = {request: solver.get_path_selection()["routes"]["sweep"] for request, solver in solvers.items()}
+        self.assertEqual(
+            (records["0"]["mf_gs_storage"]["mf_impulses"], records["0"]["mf_gs_storage"]["row_types_and_parents"]),
+            ("resident", "streamed"),
+        )
+        self.assertIn(f"declare {128 + 4 * (dofs + 2 * 320 + 12288)} bytes", records["0"]["mf_gs_storage"]["reason"])
+        self.assertNotIn("_smeta", records["0"]["mf_gs"])
+        self.assertNotIn("_glambda", records["0"]["mf_gs"])
+        self.assertEqual(
+            (records["1"]["mf_gs_storage"]["mf_impulses"], records["1"]["mf_gs_storage"]["row_types_and_parents"]),
+            ("streamed", "resident"),
+        )
+        reason = records["1"]["mf_gs_storage"]["reason"]
+        self.assertIn("MF impulses stream on request (FEATHER_PGS_MFGS_STREAM_LAMBDA)", reason)
+        self.assertIn(f"declares {128 + 4 * (dofs + 2 * 320)} <= 49152 bytes", reason)
+        self.assertIn("_gmeta_smeta_glambda", records["1"]["mf_gs"])
 
     def test_streamed_impulses_match_resident_with_friction_and_limits(self):
         """Match mixed contact triples, warm impulses, limits and graph replay exactly."""
