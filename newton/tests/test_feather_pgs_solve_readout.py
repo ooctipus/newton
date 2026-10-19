@@ -467,6 +467,8 @@ def _sparse_route():
         "options": {"pgs_mode": "split", "sparse_mass_matrix": "on", "friction_anchor_beta": 0.0},
         "contacts": contacts,
         "labels": {"sparse_pgs"},
+        "owners": ({"sparse_pgs"},),
+        "solving": {"sparse_pgs"},
         "prepare": prepare,
     }
 
@@ -491,12 +493,17 @@ def _diagonal_route():
             "enable_joint_limits": True,
         },
         "labels": {"sparse_diagonal"},
+        "owners": ({"sparse_diagonal"},),
+        "solving": {"sparse_diagonal"},
         "prepare": prepare,
     }
 
 
-def _mixed_route(hinv_jt_kernel, dofs, labels):
-    """An arm struck by a sliding free box: local owners under ``par_row``, the paired factor sweep for 23 DOFs."""
+def _mixed_route(hinv_jt_kernel, dofs, labels, *, owners, solving):
+    """An arm struck by a sliding free box: local owners under ``par_row``, the paired factor sweep for 23 DOFs.
+
+    Its one world always holds the arm's mimic row, so one owner solves it at every solve.
+    """
     from newton.tests.test_feather_pgs_response_diagonal import _build_mixed_response_model  # noqa: PLC0415
 
     def prepare(solver, state):
@@ -517,12 +524,18 @@ def _mixed_route(hinv_jt_kernel, dofs, labels):
         },
         "overrides": {"hinv_jt_kernel": hinv_jt_kernel},
         "labels": labels,
+        "owners": owners,
+        "solving": solving,
         "prepare": prepare,
     }
 
 
 def _matrix_free_route():
-    """Contacting tripods beside free spheres: matrix-free Gauss-Seidel and its incremental tier."""
+    """Contacting tripods beside free spheres: the matrix-free Gauss-Seidel sweep owns their worlds.
+
+    The spheres' ground contacts are matrix-free rows, which the incremental tier leaves to the
+    general sweep (``_incremental_route`` covers the tier).
+    """
     from newton.tests.test_feather_pgs_sparse_solver import _build_model  # noqa: PLC0415
 
     return {
@@ -536,6 +549,8 @@ def _matrix_free_route():
             "mf_max_constraints": 64,
         },
         "labels": {"mf_gs", "mf_gs_incremental"},
+        "owners": ({"mf_gs", "mf_gs_incremental"},),
+        "solving": {"mf_gs"},
     }
 
 
@@ -558,16 +573,33 @@ def _incremental_route():
             "mf_max_constraints": 64,
         },
         "labels": {"mf_gs_incremental"},
+        "owners": ({"mf_gs_incremental"},),
+        "solving": {"mf_gs_incremental"},
     }
 
 
-def _policy_routes():
-    """The routes whose local, paired and incremental sweeps compile the velocity law and trace."""
-    return (
-        _mixed_route("par_row", 13, {"local_internal", "local_pair", "local_residual", "mf_gs"}),
-        _mixed_route("auto", 23, {"paired_factor"}),
-        _matrix_free_route(),
+_LOCAL = {"local_internal", "local_pair", "local_residual"}
+
+
+def _local_route():
+    """The mixed arm under ``par_row``: local owners claim the world, the paired owner while the box touches it."""
+    return _mixed_route(
+        "par_row",
+        13,
+        {*_LOCAL, "mf_gs"},
+        owners=({*_LOCAL, "mf_gs", "mf_gs_incremental"},),
+        solving={"local_pair"},
     )
+
+
+def _paired_route():
+    """The mixed arm with 23 DOFs: the paired factor sweep owns the world, which has no matrix-free rows."""
+    return _mixed_route("auto", 23, {"paired_factor"}, owners=({"paired_factor", "mf_gs"},), solving={"paired_factor"})
+
+
+def _policy_routes():
+    """The routes whose local, paired, matrix-free and incremental sweeps compile the velocity law and trace."""
+    return (_local_route(), _paired_route(), _matrix_free_route(), _incremental_route())
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "Native Gauss-Seidel sweeps run on CUDA")
@@ -641,8 +673,19 @@ class TestSolveReadoutRoutes(unittest.TestCase):
                 self.assertEqual(slot["sweeps"][0], 0)
                 self.assertLessEqual(slot["exhausted"], slot["sweeps"][BUDGET])
                 self.assertLessEqual(slot["worlds"], model.world_count)
-        self.assertGreater(sum(slot["solves"] for slot in summary["slots"]), 0)
+        self._assert_owned(route, summary, steps)
         return counted, summary, model
+
+    def _assert_owned(self, route, summary, steps):
+        """Check that one kernel of each owner group solved every world at every step, and each solving label ran."""
+        world_count = route["model"].world_count
+        for owners in route["owners"]:
+            with self.subTest(owners=sorted(owners)):
+                solves = sum(slot["solves"] for slot in summary["slots"] if slot["route"] in owners)
+                self.assertEqual(solves, steps * world_count)
+        for label in route["solving"]:
+            with self.subTest(solving=label):
+                self.assertGreater(sum(slot["solves"] for slot in summary["slots"] if slot["route"] == label), 0)
 
     def test_sparse_route_counts_every_world_once_per_solve(self):
         """Count each world once per solve on the sparse route, eagerly and under graph replay."""
@@ -668,18 +711,22 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         self.assertEqual(slot["solves"], 4 * model.world_count)
 
     def test_local_route_counts_without_changing_results(self):
-        """Count the local owners' sweeps without changing the trajectory."""
-        self._lockstep(_mixed_route("par_row", 13, {"local_internal", "local_pair", "local_residual", "mf_gs"}))
+        """Count the local owners' sweeps without changing the trajectory, every world-solve once."""
+        self._lockstep(_local_route())
 
     def test_paired_route_counts_without_changing_results(self):
-        """Count the paired factor sweep without changing the trajectory."""
-        solver, summary, _ = self._lockstep(_mixed_route("auto", 23, {"paired_factor"}))
+        """Count the paired factor sweep without changing the trajectory, every world-solve once."""
+        solver, _, _ = self._lockstep(_paired_route())
         self.assertIsNotNone(solver._paired_factor_solve_kernel)
-        self.assertGreater(sum(slot["solves"] for slot in summary["slots"] if slot["route"] == "paired_factor"), 0)
 
     def test_matrix_free_route_counts_without_changing_results(self):
-        """Count the matrix-free Gauss-Seidel sweep and its incremental tier without changing the trajectory."""
+        """Count the matrix-free Gauss-Seidel sweep without changing the trajectory, every world-solve once."""
         self._lockstep(_matrix_free_route())
+
+    def test_incremental_route_counts_without_changing_results(self):
+        """Count the incremental tier's sweeps without changing the trajectory, every world at every solve."""
+        solver, _, _ = self._lockstep(_incremental_route())
+        self.assertTrue(solver._pgs_solve_mf_gs_incremental_kernels)
 
     def test_declined_trace_counts_without_it_and_warns(self):
         """Warn about, record and count without the trace a sweep variant that cannot trace.
@@ -755,7 +802,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
                     for name in STATE_FIELDS:
                         self.assertTrue(np.isfinite(getattr(state, name).numpy()).all(), f"{name} at step {step}")
                 summary = solver.get_path_selection()["measurements"]["solve_readout"]
-                self.assertGreater(sum(slot["solves"] for slot in summary["slots"]), 0)
+                self._assert_owned(route, summary, 4)
 
 
 if __name__ == "__main__":
