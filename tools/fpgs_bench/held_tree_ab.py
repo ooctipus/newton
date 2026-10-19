@@ -8,19 +8,25 @@ and chain-scan schedules with fixed and free roots and ordinary or prescaled
 repair motion, and per-size and forest groups with a free body, a
 diagonal-mass family, mimic rows, velocity limits and stage clocks. It drives
 each through two steps of begin, predict, finish and a repeated begin; then
-two steps whose caller copies the published bank back into the input bank,
-one coordinate changed, so that the repair compares the two banks, first in
-the one-pass repair and then classified on a one-block grid (classification,
-comparison pass and listed repair); then an invalidated begin. After each
-call it stores every array of the publication the kernels received and of
-the owner's caches, with the state, response and spring arrays around them.
-``compare`` lists the arrays that differ bitwise; stage clocks (cycle counts)
-and the cached state-bank pointers are not compared.
+two steps whose caller copies the published bank back into the input bank, one
+coordinate changed, so that the repair compares the two banks, first in the
+one-pass repair and then classified on a one-block grid (classification,
+comparison pass and listed repair); then an invalidated begin. After each call
+it stores every array of the publication the kernels received and of the
+owner's caches, with the state, response and spring arrays around them, and
+the held-tree kernels the call launched, in launch order
+(``<call>/launched``). Each scene also stores its groups' layouts
+(``<scene>/layout``: bodies, lanes, trees per block, forest, chain scan, bank
+comparison and alternate motion per group). ``compare`` lists the arrays that
+differ bitwise, so both arms must also have launched the same kernels on the
+same layouts; stage clocks (cycle counts) and the cached state-bank pointers
+are not compared.
 
 On CPU, owners build their kernels with static scratch and no release, as
 this Warp's CPU JIT cannot resolve ``malloc`` and ``free``. Lane packing
 defaults to one tree per block, so construction times no lane width;
-``--lane-pack 16`` packs the small trees and skips the wider ones.
+``--lane-pack 16`` packs the small trees and skips the wider ones. Each scene
+prints its groups' widths. ``--scene`` records only the named scenes.
 ``--poison`` fills freed device memory with a value before each scene, so a
 read of an array no kernel wrote shows in both arms' records.
 
@@ -48,6 +54,8 @@ _POINTERS = ("source_q", "source_qd")
 _CLOCKS = ".stage_clocks"
 # Augmented arrays the kernels write in part: zeroed so that both arms compare kernel writes only.
 _PARTIAL = ("body_q_com", "joint_S_s", "body_v_s", "body_a_s", "body_f_s", "body_I_s", "joint_qdd", "joint_tau")
+# Key prefix of every held-tree kernel: finishes, repairs, predictors, classifications and comparison passes.
+_HELD_TREE = "tree_kinetic_"
 # Mixed scenes: (_build options, owner options, one forest group per world).
 MIXED_SCENES = {
     "arm-box": ({}, {}, False),
@@ -91,23 +99,89 @@ def _environment(**values):
                 os.environ[name] = value
 
 
-class Recorder:
-    """Drive held-tree owners and keep the arrays their kernels can write after each call."""
+def single_scene_names():
+    """Tags of the single-tree scenes, in recording order."""
+    return [
+        f"{'prescaled' if motion else 'single'}-floating{int(floating)}-chains{int(chains)}"
+        for motion in (False, True)
+        for floating in (False, True)
+        for chains in (False, True)
+    ]
 
-    def __init__(self, device, poison=0.0):
-        from newton._src.solvers.feather_pgs import tree_kinetic_owner  # noqa: PLC0415
+
+def _describe(groups):
+    """One line naming each group's bodies, lane width and kernel forms."""
+    parts = []
+    for group in groups:
+        layout = group.layout
+        forms = [
+            name
+            for name, present in (
+                ("forest", layout.forest),
+                ("chain scan", group.chain_scan),
+                ("compares banks", group.bank_compare),
+                ("alternate motion", group.motion_velocity),
+            )
+            if present
+        ]
+        parts.append(f"{layout.bodies} bodies on {layout.lanes} lanes" + (f" ({', '.join(forms)})" if forms else ""))
+    return "; ".join(parts)
+
+
+class Recorder:
+    """Drive held-tree owners and keep the arrays their kernels can write after each call.
+
+    Args:
+        device: The Warp device the scenes are built on.
+        poison: The value left in freed device memory before each scene (0: none).
+        scenes: The scenes to record, by single-tree tag or mixed scene name (``None``: every scene).
+    """
+
+    def __init__(self, device, poison=0.0, *, scenes=None):
         from newton._src.solvers.feather_pgs import tree_kinetic_state as native  # noqa: PLC0415
 
-        self.device, self.poison, self.records, self.published = device, poison, {}, []
+        self.device, self.poison = device, poison
+        self.scenes = None if scenes is None else set(scenes)
+        self.records, self.published, self.launched = {}, [], []
         self.native = native
-        publication = tree_kinetic_owner.TreeKineticState._publication
 
-        def capture(owner, *args):
-            data = publication(owner, *args)
+    def selected(self, name):
+        """Whether to record the scene ``name``."""
+        return self.scenes is None or name in self.scenes
+
+    @contextlib.contextmanager
+    def hooks(self):
+        """Keep the publications the owners bind and the held-tree kernels they launch; restore both after."""
+        import warp as wp  # noqa: PLC0415
+
+        from newton._src.solvers.feather_pgs import tree_kinetic_owner  # noqa: PLC0415
+
+        owner = tree_kinetic_owner.TreeKineticState
+        publication = owner._publication
+        launches = {name: getattr(wp, name) for name in ("launch", "launch_tiled")}
+
+        def capture(state_owner, *args):
+            data = publication(state_owner, *args)
             self.published.append(data)
             return data
 
-        tree_kinetic_owner.TreeKineticState._publication = capture
+        def logged(launch):
+            def launch_and_log(kernel, *args, **kwargs):
+                if kernel.key.startswith(_HELD_TREE):
+                    self.launched.append(kernel.key)
+                return launch(kernel, *args, **kwargs)
+
+            return launch_and_log
+
+        owner._publication = capture
+        for name, launch in launches.items():
+            setattr(wp, name, logged(launch))
+        try:
+            yield self
+        finally:
+            owner._publication = publication
+            for name, launch in launches.items():
+                setattr(wp, name, launch)
 
     def _struct_arrays(self, instance, struct, prefix):
         import warp as wp  # noqa: PLC0415
@@ -118,6 +192,8 @@ class Recorder:
                 yield f"{prefix}.{name}", value
 
     def snapshot(self, tag, groups, extra):
+        import numpy as np  # noqa: PLC0415
+
         from newton._src.solvers.feather_pgs.publication_data import PublicationData  # noqa: PLC0415
 
         arrays = dict(extra)
@@ -127,7 +203,9 @@ class Recorder:
             arrays.update(self._struct_arrays(group.data, self.native.KineticData, f"cache{index}"))
         for name, array in arrays.items():
             self.records[f"{tag}/{name}"] = array.numpy().copy()
+        self.records[f"{tag}/launched"] = np.array(self.launched, dtype=str)
         self.published.clear()
+        self.launched.clear()
 
     def poison_heap(self):
         """Leave freed blocks of the poison value for the next scene's arrays to reuse."""
@@ -145,6 +223,24 @@ class Recorder:
 
         import newton  # noqa: PLC0415
 
+        print(f"{tag}: {_describe(groups)}", flush=True)
+        self.records[f"{tag}/layout"] = np.array(
+            [
+                (
+                    group.layout.bodies,
+                    group.layout.lanes,
+                    group.layout.pack,
+                    group.layout.forest,
+                    group.chain_scan,
+                    group.bank_compare,
+                    group.motion_velocity,
+                )
+                for group in groups
+            ],
+            dtype=np.int64,
+        )
+        # Launches at construction are not this scene's calls.
+        self.launched.clear()
         rng = np.random.default_rng(zlib.crc32(tag.encode()))
         state, output, control = model.state(), model.state(), model.control()
         state.joint_qd.assign(rng.uniform(-0.4, 0.4, model.joint_dof_count).astype(np.float32))
@@ -232,10 +328,13 @@ class Recorder:
         from tools.fpgs_bench import test_tree_kinetic_state as single  # noqa: PLC0415
         from tools.fpgs_bench import test_tree_prescaled_state as prescaled  # noqa: PLC0415
 
+        names = iter(single_scene_names())
         for module, motion in ((single, False), (prescaled, True)):
             for floating in (False, True):
                 for chains in (False, True):
-                    tag = f"{'prescaled' if motion else 'single'}-floating{int(floating)}-chains{int(chains)}"
+                    tag = next(names)
+                    if not self.selected(tag):
+                        continue
                     self.poison_heap()
                     with _environment(FEATHER_PGS_TREE_CHAIN_SCAN=int(chains)):
                         try:
@@ -243,7 +342,6 @@ class Recorder:
                         except ValueError as error:
                             print(f"skipped {tag}: {error}", flush=True)
                             continue
-                        print(tag, owner.layout.bodies, owner.chain_scan, owner.motion_velocity, flush=True)
                         self.drive(tag, model, solver, owner, [owner], operator.refresh, motion=motion)
 
     def mixed_scenes(self):
@@ -255,6 +353,8 @@ class Recorder:
         from newton.tests.test_feather_pgs_mixed_tree_free_body import _build  # noqa: PLC0415
 
         for tag, (options, owner_options, forest) in MIXED_SCENES.items():
+            if not self.selected(tag):
+                continue
             self.poison_heap()
             model = _build(wp.get_device(self.device), worlds=2, **options)
             solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
@@ -279,19 +379,27 @@ class Recorder:
             if forest and not any(group.layout.forest for group in owner.groups):
                 print(f"skipped {tag}: no forest group", flush=True)
                 continue
-            groups = [
-                (g.layout.bodies, g.layout.lanes, g.layout.forest, g.bank_compare, g.motion_velocity)
-                for g in owner.groups
-            ]
-            print(tag, groups, flush=True)
             motion = any(group.motion_velocity for group in owner.groups)
             self.drive(f"mixed-{tag}", model, solver, owner, owner.groups, owner.refresh, motion=motion)
 
 
-def record(path, *, root=None, device="cpu", lane_pack=0, poison=0.0):
+def record(path, *, root=None, device="cpu", lane_pack=0, poison=0.0, scenes=None):
+    """Record the scenes' arrays to ``path`` (see the module docstring) and return them.
+
+    Args:
+        path: The ``.npz`` file to write.
+        root: The Newton checkout to import (default: the one holding this script).
+        device: The Warp device.
+        lane_pack: ``FEATHER_PGS_TREE_LANE_PACK``: 0 for one tree per block, or a fixed lane width.
+        poison: The value left in freed device memory before each scene (0: none).
+        scenes: The scenes to record, by single-tree tag or mixed scene name (default: every scene).
+    """
     switches = sorted(name for name in os.environ if name.startswith("FEATHER_PGS_"))
     if switches:
         raise SystemExit(f"Unset the import-time switches: {', '.join(switches)}")
+    unknown = sorted(set(scenes or ()) - set(single_scene_names()) - set(MIXED_SCENES))
+    if unknown:
+        raise SystemExit(f"Unknown scenes: {', '.join(unknown)}")
     # One tree per block, or one fixed width: construction times no lane width. The
     # scenes build their own owners; the solvers build none.
     with _environment(FEATHER_PGS_TREE_LANE_PACK=lane_pack, FEATHER_PGS_TREE_KINETIC_STATE=0):
@@ -299,10 +407,14 @@ def record(path, *, root=None, device="cpu", lane_pack=0, poison=0.0):
         import numpy as np  # noqa: PLC0415
         import warp as wp  # noqa: PLC0415
 
-        wp.config.log_level = wp.LOG_WARNING
-        recorder = Recorder(device, poison)
-        recorder.single_scenes()
-        recorder.mixed_scenes()
+        log_level, wp.config.log_level = wp.config.log_level, wp.LOG_WARNING
+        recorder = Recorder(device, poison, scenes=scenes)
+        try:
+            with recorder.hooks():
+                recorder.single_scenes()
+                recorder.mixed_scenes()
+        finally:
+            wp.config.log_level = log_level
     np.savez_compressed(path, **recorder.records)
     print(f"Recorded {len(recorder.records)} arrays: {path}")
     return recorder.records
@@ -333,6 +445,11 @@ def report(parent, child):
         if a.shape == b.shape and a.dtype.kind == "f" and b.dtype.kind == "f":
             gap = np.abs(a.astype(np.float64) - b.astype(np.float64))
             print(f"  {name}: max abs {np.nanmax(gap) if np.isfinite(gap).any() else float('nan'):.3e}")
+        elif a.dtype.kind == "U" and b.dtype.kind == "U":
+            # Launched kernels: name the launches one arm made and the other did not.
+            print(
+                f"  {name}: {sorted(set(a.tolist()) - set(b.tolist()))} against {sorted(set(b.tolist()) - set(a.tolist()))}"
+            )
         else:
             print(f"  {name}: {a.dtype}{a.shape} against {b.dtype}{b.shape}")
     for label, names in (("only in parent", only_parent), ("only in child", only_child)):
@@ -353,6 +470,13 @@ def main(argv=None):
         "--lane-pack", type=int, default=0, choices=(0, 4, 8, 16, 32), help="FEATHER_PGS_TREE_LANE_PACK (default 0)"
     )
     record_parser.add_argument("--poison", type=float, default=0.0, help="value left in freed memory before each scene")
+    record_parser.add_argument(
+        "--scene",
+        action="append",
+        dest="scenes",
+        metavar="NAME",
+        help="record only this scene (a single-tree tag or a mixed scene name); repeatable",
+    )
     compare_parser = commands.add_parser("compare", help="compare two records bitwise")
     compare_parser.add_argument("parent")
     compare_parser.add_argument("child")
@@ -364,6 +488,7 @@ def main(argv=None):
             device=arguments.device,
             lane_pack=arguments.lane_pack,
             poison=arguments.poison,
+            scenes=arguments.scenes,
         )
         return 0
     import numpy as np  # noqa: PLC0415
