@@ -3537,13 +3537,14 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
 
         By default each graph sorts its first build and keeps the second, without
         a conditional node; under the opt-in nodes the first build sorts only a
-        changed frame. A probe captured between the builds shows on every replay
-        which of them sorted (:class:`_SortProbe`).
+        changed frame, and under FEATHER_PGS_PATCH_FRAME_REUSE=0 with the nodes
+        both builds branch on a node. A probe captured between the builds shows
+        on every replay which of them sorted (:class:`_SortProbe`).
         """
-        for nodes in _node_modes():
-            with self.subTest(nodes=nodes):
+        for reuse, nodes in _graph_modes():
+            with self.subTest(reuse=reuse, nodes=nodes):
                 rng = np.random.default_rng(6)
-                graph = _graph_twin(nodes, jaws=True)
+                graph = _graph_twin(nodes, reuse=reuse, jaws=True)
                 eager = _SolverTwin("cuda:0", reuse=False, nodes=False, jaws=True)
                 # The memset stream forked at each step's end must stay valid across a node's capture pause.
                 self.assertIsNotNone(graph.solver._memset_stream, "the jaws double-buffer their mass matrices")
@@ -3565,9 +3566,10 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
                         probe.check(1)
                     captured[name] = capture.graph
                     self.assertEqual(_conditional_node_count(capture.graph) > 0, nodes == "1", name)
-                first = "sort" if nodes is None else "node"
-                self.assertEqual(outcomes, [first, "keep"] * 3)
-                self.assertEqual(len(sorts), 3, "each graph records the sort of its first build only")
+                expected = _graph_outcomes(reuse, nodes)
+                self.assertEqual(outcomes, expected * 3)
+                # A sorting build records its sort, and a node its body; a kept build records none.
+                self.assertEqual(len(sorts), 3 * (2 - expected.count("keep")), "sorts the graphs record")
                 for index, event in enumerate(_SOLVER_PLAN):
                     context = f"pair {index} {event}"
                     stream = _change((graph, eager), event, rng)
@@ -3687,23 +3689,28 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         replay without a collision pass while their anchors are stored; they collide
         again, are thrown up and land again. A second eager twin is an A/A control:
         the graph must match bitwise for as long as the eager twins do, which must
-        cover every transition. The boxes' 128 contact slots take the live sort,
-        which needs no node to skip empty frames.
+        cover every transition. With frame reuse the boxes' 128 contact slots take
+        the live sort, which needs no node to skip empty frames; under
+        FEATHER_PGS_PATCH_FRAME_REUSE=0 with the nodes, a node skips them around the
+        radix sort on every captured build.
         """
-        for nodes in _node_modes():
-            with self.subTest(nodes=nodes):
-                graph = _graph_twin(nodes, boxes=True, radix=False)
-                self.assertTrue(graph.patches.live_sort)
+        for reuse, nodes in _graph_modes():
+            with self.subTest(reuse=reuse, nodes=nodes):
+                graph = _graph_twin(nodes, reuse=reuse, boxes=True, radix=False)
+                self.assertEqual(graph.patches.live_sort, reuse is None)
                 eager, control = (_SolverTwin("cuda:0", reuse=False, nodes=False, boxes=True) for _ in range(2))
                 twins = (graph, eager, control)
                 for twin in twins:
                     twin.pair(collide=True)
                 captured = {}
+                outcomes = _admitted_modes(graph.patches)
                 for collide in (True, False):
                     with _capture_without_nodes(nodes) as capture:
                         graph.solver.seed_double_buffer_events()
                         graph.pair(collide=collide)
                     captured[collide] = capture.graph
+                    self.assertEqual(_conditional_node_count(capture.graph) > 0, nodes == "1")
+                self.assertEqual(outcomes, _graph_outcomes(reuse, nodes) * 2)
                 live, cleared = [], None
                 for replay in range(120):
                     collide = replay != 40
@@ -3907,16 +3914,35 @@ def _node_modes():
     return (None, "1") if wp.is_conditional_graph_supported() else (None,)
 
 
-def _graph_twin(nodes, *, radix=True, **options):
-    """Return a CUDA twin with default frame reuse under the nodes flag ``nodes``, to capture graphs of.
+def _graph_modes():
+    """The (FEATHER_PGS_PATCH_FRAME_REUSE, FEATHER_PGS_PATCH_CONDITIONAL_NODES) values a CUDA graph test runs.
+
+    The default, the opt-in nodes with frame reuse, and where nodes work also
+    the opt-out with the nodes, which puts a node on every captured build.
+    """
+    return tuple((None, nodes) for nodes in _node_modes()) + (
+        (("0", "1"),) if wp.is_conditional_graph_supported() else ()
+    )
+
+
+def _graph_outcomes(reuse, nodes):
+    """The admission outcomes of a graph's two builds under the flags ``reuse`` and ``nodes``."""
+    first = "node" if nodes == "1" else "sort"
+    return [first, "keep" if reuse is None else first]
+
+
+def _graph_twin(nodes, *, reuse=None, radix=True, **options):
+    """Return a CUDA twin under the nodes flag ``nodes`` and the frame reuse flag ``reuse``, to capture graphs of.
 
     ``radix`` keeps the radix sort, whose poisoned scratch half shows whether a
     replay sorted (:func:`_poison_sort_scratch`).
     """
     with _nodes_flag(nodes):
-        twin = _SolverTwin("cuda:0", **options)
-    if not twin.patches.reuse_frames or twin.patches.conditional_nodes != (nodes == "1"):
-        raise AssertionError(f"the twin must reuse frames, with conditional nodes only under =1 (flag {nodes!r})")
+        twin = _SolverTwin("cuda:0", reuse=reuse is None, **options)
+    if twin.patches.reuse_frames != (reuse is None) or twin.patches.conditional_nodes != (nodes == "1"):
+        raise AssertionError(
+            f"the twin must reuse frames unless =0 and take conditional nodes only under =1 (flags {reuse!r}, {nodes!r})"
+        )
     if radix:
         twin.patches.live_sort = False
     return twin
