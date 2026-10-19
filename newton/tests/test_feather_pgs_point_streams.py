@@ -213,6 +213,66 @@ def _keyed_last_word_calls():
         yield (_keyed_layout(velocity_limits=True), 128, 32, 22, _ARCH), {**kwargs, "velocity_limit_pass": True}
 
 
+def _readout_calls():
+    """Opt-in sweep readouts of the suite's counted sweeps: ``(name, factory, args, kwargs, patch_only)``.
+
+    ``pgs_solve_readout="sweeps"`` builds these variants of the sparse, sparse-diagonal,
+    matrix-free Gauss-Seidel, paired factor, local-packet and incremental sweeps.
+    """
+    from newton._src.solvers.feather_pgs import row_packets, sparse_pgs  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy  # noqa: PLC0415
+
+    readout = {"solve_policy": SolvePolicy(readout="sweeps")}
+    name = "solver_feather_pgs."
+    triplets = {"active_rows": True, "use_support_table": True, "contact_triplets": True}
+    factory = sparse_pgs._get_pgs_solve_sparse_kernel.__wrapped__
+    for size in ((112, 18, 12), (128, 25, 16), (256, 18, 12)):
+        yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, size, {**triplets, **readout}, False
+        yield (
+            "sparse_pgs._get_pgs_solve_sparse_kernel",
+            factory,
+            size,
+            {**triplets, "linked_rows": True, **readout},
+            True,
+        )
+    factory = solver._get_pgs_solve_sparse_diagonal_kernel.__wrapped__
+    for schedule, patch_only in (("contact_triples", False), ("contact_units", True)):
+        kwargs = {schedule: True, "speculative_contact_batches": True, **readout}
+        yield name + "_get_pgs_solve_sparse_diagonal_kernel", factory, (1024, 114, 6, _ARCH), kwargs, patch_only
+    factory = solver._get_pgs_solve_mf_gs_kernel.__wrapped__
+    no_drives = {"has_drive_rows": False, "has_dense_velocity_limit_rows": False}
+    for args, kwargs in (
+        ((192, 64, 22, _ARCH), {"has_drive_rows": False}),
+        ((192, 64, 29, _ARCH), {**no_drives, "factor_coordinates": True, "independent_components": True}),
+        ((192, 64, 15, _ARCH), {**no_drives, "skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
+    ):
+        yield name + "_get_pgs_solve_mf_gs_kernel", factory, args, {**kwargs, **readout}, False
+    factory = solver._get_pgs_solve_paired_factor_kernel.__wrapped__
+    for units in (False, True):
+        kwargs = {"contact_units": True, **readout} if units else readout
+        yield name + "_get_pgs_solve_paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, False, True), kwargs, units
+    packets = row_packets.get_local_factory.__wrapped__(9, 6, 40)
+    pair = {"paired_dof_count": 6, "persistent_queue": True, "warps_per_block": 2, "dense_response_matrix": True}
+    for args, kwargs in (
+        (
+            (192, 9, 9, _ARCH),
+            {"lanes_per_world": 8, "contact_capable": False, "warps_per_block": 2, "dense_response_matrix": True},
+        ),
+        ((192, 20, 9, _ARCH), pair),
+        ((192, 40, 9, _ARCH), {**pair, "mf_max_constraints": 64, "local_mf_max_constraints": 12}),
+    ):
+        yield "row_packets.get_local_factory(9, 6, 40)", packets, args, {**kwargs, **readout}, False
+    factory = solver._get_pgs_solve_mf_gs_incremental_kernel.__wrapped__
+    yield (
+        name + "_get_pgs_solve_mf_gs_incremental_kernel",
+        factory,
+        (64, 32, 12, _ARCH),
+        {"incremental_rows": 32, **readout},
+        False,
+    )
+
+
 def _patch_only_factory_labels():
     """Labels of the factory-built kernels only patch friction launches."""
     for name, args, kwargs in _linked_tier_calls():
@@ -228,6 +288,9 @@ def _patch_only_factory_labels():
             yield _label("solver_feather_pgs._get_pgs_solve_sparse_diagonal_kernel", args, kwargs)
     for args, kwargs in _keyed_last_word_calls():
         yield _label("keyed_rows.get_parallel_factory", args, kwargs)
+    for name, _, args, kwargs, patch_only in _readout_calls():
+        if patch_only:
+            yield _label(name, args, kwargs)
 
 
 _PATCH_ONLY |= frozenset(_patch_only_factory_labels())
@@ -654,6 +717,7 @@ def _factory_kernels():
         _spliced_sweep_calls(),
         _suite_shape_calls(),
         _keyed_row_calls(),
+        ((name, factory, args, kwargs) for name, factory, args, kwargs, _ in _readout_calls()),
     ):
         try:
             kernel = factory(*args, **kwargs)

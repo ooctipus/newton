@@ -15,6 +15,8 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
+from .row_inputs import make_row_kernel
+from .solve_policy import EXACT_POLICY, SolvePolicy, sweep_exit
 from .sparse_mass_matrix import _SparseRowSupport
 from .velocity_limit_law import accumulated_impulse, accumulated_update, check_velocity_limit_law
 
@@ -39,6 +41,7 @@ def _get_pgs_solve_sparse_kernel(
     warm_start: bool = False,
     linked_rows: bool = False,
     velocity_limit_law: str = "stateless",
+    solve_policy: SolvePolicy = EXACT_POLICY,
 ) -> wp.Kernel:
     """Build a CUDA sweep over factored articulations and physical free bodies.
 
@@ -104,6 +107,9 @@ def _get_pgs_solve_sparse_kernel(
     every solve with zero impulse, so warm starting still seeds none of them.
     The stateless default keeps the generated source byte-identical, and a
     sweep without velocity-limit rows ignores the law.
+
+    ``solve_policy`` compiles the sweep's stopping rule and readout
+    (:mod:`solve_policy`); a readout appends its operand after ``support``.
     """
     M, D, S = int(max_constraints), int(max_world_dofs), int(max_row_dofs)
     F = int(mf_max_constraints)
@@ -615,9 +621,12 @@ def _get_pgs_solve_sparse_kernel(
             }}
             __syncwarp(MASK);
 """
-    sweep_finish = """
-        if (global_iteration >= friction_start_iteration && __ballot_sync(MASK, changed != 0) == 0u) break;
-"""
+    sweep_finish = "\n" + sweep_exit(
+        solve_policy,
+        "        if (global_iteration >= friction_start_iteration && __ballot_sync(MASK, changed != 0) == 0u) break;\n",
+        gate="global_iteration >= friction_start_iteration",
+        quiet="__ballot_sync(MASK, changed != 0) == 0u",
+    )
     friction = FRICTION_PAIR
     if contact_triplets:
         triplet_setup, triplet_update = _contact_triplet_code(
@@ -663,7 +672,7 @@ def _get_pgs_solve_sparse_kernel(
 {writeback}
 #endif
 """,
-        preludes=(friction,),
+        preludes=(friction, *solve_policy.preludes),
         lead="",
     )
 
@@ -789,6 +798,13 @@ def _get_pgs_solve_sparse_kernel(
         suffix += "_local_factors"
     if warm_start:
         suffix += "_warm_start"
+    if solve_policy.counts:
+        name = f"pgs_solve_sparse_{M}_{D}_{S}_{F}_{P}{suffix}{solve_policy.suffix}"
+        kernel = make_row_kernel(
+            name, snippet, solve_native.func, solve_policy.arguments, dispatch="tiles", groups=W, lanes=L
+        )
+        kernel._fpgs_solve_readout = True
+        return kernel
     solve.__name__ = f"pgs_solve_sparse_{M}_{D}_{S}_{F}_{P}{suffix}"
     solve.__qualname__ = solve.__name__
     return wp.kernel(enable_backward=False, module="unique")(solve)

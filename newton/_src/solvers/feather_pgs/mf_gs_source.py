@@ -21,6 +21,7 @@ from .row_metadata import (
     _mf_parent_expression,
     _validate_dense_metadata_encoding,
 )
+from .solve_policy import EXACT_POLICY, SolvePolicy, sweep_exit
 from .velocity_limit_law import accumulated_update, check_velocity_limit_law
 
 # The dense-tile variant owns one fixed row phase; any other launch is a device error, never a different phase.
@@ -65,6 +66,7 @@ def get_source(
     shared_arena: bool = False,
     cpu_body: str = "",
     velocity_limit_law: str = "stateless",
+    solve_policy: SolvePolicy = EXACT_POLICY,
 ) -> GeneratedSource:
     """Build the shared recurrence with explicit physical or held bindings.
 
@@ -75,6 +77,9 @@ def get_source(
     (:mod:`.velocity_limit_law`): the end-of-iteration dense and matrix-free passes and
     the dense rows of a velocity-limit row phase. The stateless law keeps the source
     byte-identical.
+
+    ``solve_policy`` compiles the sweep's stopping rule and readout; a readout
+    needs the physical bindings and the per-world phases of the plain kernel.
     """
     if resident_row_metadata and shared_metadata:
         raise ValueError("resident_row_metadata applies to streamed metadata (shared_metadata=False)")
@@ -108,6 +113,8 @@ def get_source(
         raise ValueError("factor coordinates require the paired augmented-drive contact solve")
     if independent_components and not factor_coordinates:
         raise ValueError("Independent components require the paired factor-coordinate solve")
+    if solve_policy.counts and (held_policy is not None or shared_arena or dense_support_tiles):
+        raise ValueError("A solve readout requires the physical bindings without dense support tiles")
     _validate_dense_metadata_encoding(max_constraints)
     M_D = max_constraints
     M_MF = mf_max_constraints
@@ -1556,6 +1563,17 @@ def get_source(
         // is a fixed point, so subsequent sweeps are redundant.
 """
 
+    sweep_end = sweep_exit(
+        solve_policy,
+        """        if (global_iter >= friction_start_iteration) {
+            unsigned changed = __ballot_sync(MASK, iteration_changed != 0);
+            if (changed == 0u) break;
+        }
+""",
+        gate="global_iter >= friction_start_iteration",
+        quiet="__ballot_sync(MASK, iteration_changed != 0) == 0u",
+        iteration="iter",
+    )
     snippet = f"""    const unsigned MASK = 0xFFFFFFFF;
     int lane = threadIdx.x;{held_entry}
 
@@ -1732,11 +1750,7 @@ def get_source(
             __syncwarp();
         }}
 
-{mf_phase}        if (global_iter >= friction_start_iteration) {{
-            unsigned changed = __ballot_sync(MASK, iteration_changed != 0);
-            if (changed == 0u) break;
-        }}
-    }}
+{mf_phase}{sweep_end}    }}
 
     // ═══════════════════════════════════════════════════════
     // STORE PHASE
@@ -1934,5 +1948,5 @@ def get_source(
                 snippet = snippet.replace(old, new)
         entry = (_DENSE_TILE_ENTRY,)
 
-    snippet = cuda_native(snippet, preludes=(*entry, FRICTION_PAIR))
+    snippet = cuda_native(snippet, preludes=(*entry, FRICTION_PAIR, *solve_policy.preludes))
     return GeneratedSource(snippet, mf_phase if held_policy is not None else None, arena_offset if shared_arena else 0)

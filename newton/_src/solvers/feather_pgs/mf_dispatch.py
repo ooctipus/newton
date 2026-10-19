@@ -94,11 +94,16 @@ def make_native(source, *, name="pgs_solve_mf_gs_native", extra=None):
     return wp.func_native(source)(_compile(declaration, namespace)[name])
 
 
-def make_dispatch(native):
-    """Bind the world-queue dispatch around the complete native recurrence."""
+def make_dispatch(native, *, extra=None):
+    """Bind the world-queue dispatch around the complete native recurrence.
+
+    ``extra`` appends the same private operands as :func:`make_native` to the
+    dispatch and forwards them to the native call.
+    """
+    extra = {} if extra is None else extra
     name = "pgs_solve_mf_gs_template"
-    signature = _signature(_QUEUE_ARGUMENTS + _NATIVE_ARGUMENTS[1:], {})
-    arguments = [name for name, _ in _NATIVE_ARGUMENTS]
+    signature = _signature(_QUEUE_ARGUMENTS + _NATIVE_ARGUMENTS[1:], extra)
+    arguments = [name for name, _ in _NATIVE_ARGUMENTS] + list(extra)
     dispatch = "pgs_solve_mf_gs_native(" + ", ".join(arguments) + ")"
     body = (
         "candidate, _lane = wp.tid()\n"
@@ -114,4 +119,5 @@ def make_dispatch(native):
     closure = {"pgs_solve_mf_gs_native": native}
     declaration = "def " + name + "(" + signature + "):\n" + indent(body, "    ")
     source = "def _bind(" + ", ".join(closure) + "):\n" + indent(declaration, "    ") + "    return " + name + "\n"
-    return _compile(source, dict(globals()))["_bind"](**closure)
+    namespace = dict(globals(), **{annotation.__name__: annotation for annotation in extra.values()})
+    return _compile(source, namespace)["_bind"](**closure)

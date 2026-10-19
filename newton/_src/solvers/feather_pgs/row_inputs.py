@@ -85,7 +85,10 @@ def make_row_kernel(name, snippet, signature, arguments=(), *, dispatch, groups=
 
     ``signature`` is an annotation-only declaration of the base native ABI.
     Ordinary consumers retain exactly that ABI. The launch schedules below
-    match the existing disjoint local queues and parallel world queue.
+    match the existing disjoint local queues and parallel world queue, and the
+    native sweeps' world tiles (``groups`` worlds of ``lanes`` lanes per block,
+    guarded by a leading ``world_count``) and one world per block, whose
+    first native operand is the world.
     """
     params = [(key, value.annotation) for key, value in inspect.signature(signature).parameters.items()]
     for operand in arguments:
@@ -105,6 +108,14 @@ def make_row_kernel(name, snippet, signature, arguments=(), *, dispatch, groups=
             f"candidate = candidate * {groups} + lane // {lanes}\n"
             f"while candidate < candidate_count:\n    {call}\n    candidate += candidate_grid_stride"
         )
+    elif dispatch in ("tiles", "worlds"):
+        if params[0][0] != "world":
+            raise ValueError(f"{dispatch} dispatch requires the world as the first native operand")
+        if dispatch == "tiles":
+            launch = [("world_count", int), *launch]
+            body = f"block, lane = wp.tid()\nworld = block * {groups} + lane // {lanes}\nif world < world_count:\n    {call}"
+        else:
+            body = f"world, _lane = wp.tid()\n{call}"
     elif dispatch == "parallel":
         launch = [
             ("general_world_count", wp.array[int]),

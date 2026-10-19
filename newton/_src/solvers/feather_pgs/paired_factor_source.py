@@ -11,6 +11,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
+from .solve_policy import EXACT_POLICY, SolvePolicy, sweep_exit
 
 
 def _physical_entry(D, P, S, independent_components):
@@ -201,6 +202,7 @@ def get_source(
     contact_triples=False,
     independent_components=False,
     contact_units=False,
+    solve_policy: SolvePolicy = EXACT_POLICY,
 ):
     """Build the physical-coordinate paired recurrence source.
 
@@ -214,6 +216,8 @@ def get_source(
     from the row it names as parent. Patch contacts are units of one row, or
     three when they own an anchor, so the walk visits the general branch's
     rows in its order and with its arithmetic.
+
+    ``solve_policy`` compiles the sweep's stopping rule and readout.
     """
     if M <= 0 or P <= 0 or S <= 0 or P + S != D or D > 32:
         raise ValueError("paired factor source requires positive capacity and two components spanning at most 32 DOFs")
@@ -508,6 +512,15 @@ def get_source(
         }}
         }}
 """
+    sweep_end = sweep_exit(
+        solve_policy,
+        """        const unsigned changed = __ballot_sync(MASK, iteration_changed != 0);
+        if (global_iter >= friction_start_iteration && changed == 0u) break;
+""",
+        gate="global_iter >= friction_start_iteration",
+        quiet="__ballot_sync(MASK, iteration_changed != 0) == 0u",
+        iteration="iter",
+    )
     body = f"""{storage}    constexpr unsigned MASK = 0xffffffffu;
     const int lane = threadIdx.x & 31;
 {world_slot}
@@ -530,10 +543,8 @@ def get_source(
         int iteration_changed = 0;
 
 {sweep}
-        const unsigned changed = __ballot_sync(MASK, iteration_changed != 0);
-        if (global_iter >= friction_start_iteration && changed == 0u) break;
-    }}
+{sweep_end}    }}
 
 {exit_code}    for (int i = lane; i < m; i += 32) world_impulses.data[off + i] = s_lam[i];
 """
-    return cuda_native(body + "#endif\n", preludes=(FRICTION_PAIR,))
+    return cuda_native(body + "#endif\n", preludes=(FRICTION_PAIR, *solve_policy.preludes))

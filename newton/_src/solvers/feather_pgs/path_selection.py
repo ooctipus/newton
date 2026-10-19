@@ -4,8 +4,11 @@
 """Host-only records of the construction-time routes and applied options of SolverFeatherPGS.
 
 Every function here reads host attributes only: no device array is read, no
-kernel is launched and nothing synchronizes. Values are JSON-compliant:
-non-finite floats become ``"inf"``, ``"-inf"`` or ``"nan"`` and tuples become lists.
+kernel is launched and nothing synchronizes. The one exception is
+:func:`measurement_selection` under an enabled solve readout
+(``pgs_solve_readout``), which reads the readout's device counters. Values are
+JSON-compliant: non-finite floats become ``"inf"``, ``"-inf"`` or ``"nan"`` and
+tuples become lists.
 """
 
 import copy
@@ -161,6 +164,8 @@ _EFFECTIVE = {
     "velocity_limit_law": lambda solver: solver._velocity_limit_sweep_law()[0],
     # The largest budget of the built linked (patch) tiers; 0 without them.
     "mf_gs_parallel_linked_sweeps": _linked_tier_sweeps,
+    # A readout applies only where a sweep kernel carries its counters.
+    "pgs_solve_readout": lambda solver: solver.pgs_solve_readout if solver._solve_readout.kernels else "off",
 }
 
 
@@ -244,15 +249,24 @@ def route_selection(solver) -> dict:
 
 
 def measurement_selection(solver) -> dict:
-    """Construction-time timings, kept out of the routes so that runs of one configuration compare equal."""
+    """Measured values, kept out of the routes so that runs of one configuration compare equal.
+
+    ``held_tree_lane_timing_us`` holds the construction-time lane timings. With
+    ``pgs_solve_readout`` on, ``solve_readout`` summarizes the sweep counters
+    (:meth:`SolveReadoutRecord.summary`); reading them synchronizes the device.
+    The counters accumulate, so a window is the difference of two records.
+    """
     _, groups = _held_tree_groups(solver)
-    return {
+    record = {
         # Aligned with routes.held_tree.groups; empty for a group whose lane width was not timed.
         "held_tree_lane_timing_us": [
             {str(int(lanes)): round(float(seconds) * 1.0e6, 3) for lanes, seconds in group.lane_timing.items()}
             for group in groups
         ],
     }
+    if solver._solve_readout.kernels:
+        record["solve_readout"] = json_value(solver._solve_readout.summary())
+    return record
 
 
 def _held_tree_groups(solver) -> tuple:
@@ -772,7 +786,7 @@ def _sweep(solver, source) -> dict:
             "residual": _keys_by_size(solver._pgs_solve_local_residual_kernels),
         }
     multiblock = solver._mf_multiblock
-    return {
+    record = {
         "route": route,
         "reason": reason,
         "driver": driver,
@@ -794,6 +808,44 @@ def _sweep(solver, source) -> dict:
         "dense": dense,
         "free_body_matrix_free": free_body,
         "propagation": propagation,
+    }
+    record["readout"] = _readout(solver, record)
+    return record
+
+
+def _sweep_kernels(record) -> set:
+    """Every sweep kernel key a sweep record names."""
+    keys = {record[name] for name in ("sparse", "sparse_diagonal", "paired_factor", "mf_gs", "free_body_matrix_free")}
+    keys.update(tier["kernel"] for tier in (record["tiers"] or {}).get("tiers", ()))
+    for owner in ("internal", "pair", "residual"):
+        keys.update((record["local"] or {}).get(owner, {}).values())
+    keys.update((record["dense"] or {}).get("kernels", ()))
+    keys.update(value for key, value in (record["propagation"] or {}).items() if key not in ("mode", "cached_response"))
+    keys.discard(None)
+    return keys
+
+
+def _readout(solver, record) -> dict:
+    """Which sweep kernels of the route count their sweeps under ``pgs_solve_readout``, and why the others do not."""
+    counted = solver._solve_readout.kernels
+    uncounted = sorted(_sweep_kernels(record) - counted.keys())
+    if record["response_block"]:
+        uncounted.append("response_block")
+    if solver.pgs_solve_readout == "off":
+        reason = "pgs_solve_readout is off."
+    elif not counted:
+        reason = (
+            "No sweep of this route carries counters: fixed-iteration, Jacobi-tier and response-block sweeps do not."
+        )
+    elif record["driver"] in ("direct", "contact_then_internal"):
+        reason = "Each launch of a counted kernel solves its worlds; uncounted sweeps carry no counters."
+    else:
+        reason = f"The {record['driver']} driver runs part of a solve per launch, so counts are per launch."
+    return {
+        "mode": solver.pgs_solve_readout if counted else "off",
+        "counted": dict(sorted(counted.items())),
+        "uncounted": uncounted if counted else [],
+        "reason": reason,
     }
 
 

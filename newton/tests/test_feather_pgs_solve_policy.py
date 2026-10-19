@@ -1,0 +1,260 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""Compile the Gauss-Seidel stopping rule and its readout as one frozen solve policy.
+
+These host tests build kernels and records without a GPU. The default policy
+must build exactly the kernels built before policies existed; the
+point-stream pins check that on the whole inventory, and the tests here check
+it on one call of every factory that takes a policy.
+"""
+
+import dataclasses
+import inspect
+import json
+import unittest
+from types import SimpleNamespace
+
+import numpy as np
+import warp as wp
+
+import newton
+from newton._src.solvers.feather_pgs import mf_dispatch, mf_gs_source, paired_factor_source, row_packets
+from newton._src.solvers.feather_pgs import solver_feather_pgs as solver
+from newton._src.solvers.feather_pgs.device_preludes import ARCHITECTURE_GUARD
+from newton._src.solvers.feather_pgs.row_inputs import make_row_kernel
+from newton._src.solvers.feather_pgs.solve_policy import (
+    EXACT_POLICY,
+    SWEEP_READOUT,
+    SolvePolicy,
+    SolveReadout,
+    SolveReadoutRecord,
+    sweep_exit,
+)
+from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel
+from newton.solvers import SolverFeatherPGS
+from newton.tests.test_feather_pgs_native_prelude import _native_snippets
+from newton.tests.test_feather_pgs_point_streams import _kernel_hash
+
+SWEEPS = SolvePolicy(readout="sweeps")
+
+
+def _factory_calls():
+    """One call of every sweep factory that takes a policy: ``(name, factory, args, kwargs)``."""
+    packets = row_packets.get_local_factory.__wrapped__(9, 6, 40)
+    return (
+        (
+            "sparse",
+            _get_pgs_solve_sparse_kernel.__wrapped__,
+            (48, 18, 12),
+            {"active_rows": True, "use_support_table": True, "contact_triplets": True},
+        ),
+        ("sparse_lanes", _get_pgs_solve_sparse_kernel.__wrapped__, (16, 6, 6), {"lanes_per_world": 8}),
+        (
+            "mf_gs",
+            solver._get_pgs_solve_mf_gs_kernel.__wrapped__,
+            (64, 32, 12, "120"),
+            {"has_drive_rows": False},
+        ),
+        (
+            "paired",
+            solver._get_pgs_solve_paired_factor_kernel.__wrapped__,
+            (192, 29, 23, 6, "120", False, True),
+            {"contact_units": True},
+        ),
+        (
+            "local",
+            solver._get_pgs_solve_local_owned_kernel.__wrapped__,
+            (192, 9, 9, "120"),
+            {"lanes_per_world": 8, "contact_capable": False, "warps_per_block": 2, "dense_response_matrix": True},
+        ),
+        (
+            "packets",
+            packets,
+            (192, 20, 9, "120"),
+            {"paired_dof_count": 6, "persistent_queue": True, "dense_response_matrix": True},
+        ),
+        (
+            "sparse_diagonal",
+            solver._get_pgs_solve_sparse_diagonal_kernel.__wrapped__,
+            (64, 10, 9, "120"),
+            {"speculative_contact_batches": True, "contact_units": True},
+        ),
+        (
+            "incremental",
+            solver._get_pgs_solve_mf_gs_incremental_kernel.__wrapped__,
+            (64, 32, 12, "120"),
+            {"incremental_rows": 32},
+        ),
+    )
+
+
+class TestSolvePolicy(unittest.TestCase):
+    """The frozen policy, its emitters and the factories that take it."""
+
+    def test_policy_is_frozen_hashable_and_validated(self):
+        """Freeze the policy, compare it by value and reject an unknown readout."""
+        self.assertEqual(SolvePolicy(), EXACT_POLICY)
+        self.assertEqual(SolvePolicy(readout="sweeps"), SWEEPS)
+        self.assertEqual(hash(SolvePolicy(readout="sweeps")), hash(SWEEPS))
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            SWEEPS.readout = "off"
+        with self.assertRaisesRegex(ValueError, "readout"):
+            SolvePolicy(readout="every_sweep")
+        self.assertEqual(
+            (EXACT_POLICY.counts, EXACT_POLICY.suffix, EXACT_POLICY.preludes, EXACT_POLICY.operands),
+            (False, "", (), {}),
+        )
+        self.assertEqual(
+            (SWEEPS.suffix, SWEEPS.preludes, SWEEPS.operands), ("_sweeps", (SWEEP_READOUT,), {"readout": SolveReadout})
+        )
+
+    def test_equal_policies_share_cached_kernels(self):
+        """Return one cached kernel for equal policies, and another for a different policy."""
+        first = _get_pgs_solve_sparse_kernel(16, 6, 4, solve_policy=SolvePolicy(readout="sweeps"))
+        second = _get_pgs_solve_sparse_kernel(16, 6, 4, solve_policy=SolvePolicy(readout="sweeps"))
+        self.assertIs(first, second)
+        self.assertIsNot(first, _get_pgs_solve_sparse_kernel(16, 6, 4))
+
+    def test_policy_and_readout_options_are_keyword_only(self):
+        """Take the policy and the solver's readout option by keyword only, defaulting to the exact law."""
+        parameters = inspect.signature(SolverFeatherPGS).parameters["pgs_solve_readout"]
+        self.assertEqual((parameters.kind, parameters.default), (inspect.Parameter.KEYWORD_ONLY, "off"))
+        factories = [(name, factory) for name, factory, _, _ in _factory_calls()]
+        factories += [("mf_gs_source", mf_gs_source.get_source), ("paired_source", paired_factor_source.get_source)]
+        for name, factory in factories:
+            with self.subTest(factory=name):
+                parameter = inspect.signature(factory).parameters["solve_policy"]
+                self.assertEqual(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+                self.assertIs(parameter.default, EXACT_POLICY)
+
+    def test_exact_policy_builds_the_kernels_of_a_policy_less_call(self):
+        """Build the same Warp content hash, hence the same binary, with the exact policy passed or omitted."""
+        for name, factory, args, kwargs in _factory_calls():
+            with self.subTest(factory=name):
+                kernel = factory(*args, **kwargs)
+                self.assertEqual(
+                    _kernel_hash(factory(*args, solve_policy=EXACT_POLICY, **kwargs)), _kernel_hash(kernel)
+                )
+                self.assertFalse(getattr(kernel, "_fpgs_solve_readout", False))
+                self.assertNotIn("solve_readout_sweeps", "".join(_native_snippets(kernel)))
+
+    def test_readout_appends_one_operand_prelude_and_exit_record(self):
+        """Append the readout operand last, declare its prelude after the law and record every solve once."""
+        for name, factory, args, kwargs in _factory_calls():
+            with self.subTest(factory=name):
+                exact = factory(*args, **kwargs)
+                kernel = factory(*args, solve_policy=SWEEPS, **kwargs)
+                self.assertEqual(kernel.key, exact.key + "_sweeps")
+                self.assertTrue(kernel._fpgs_solve_readout)
+                labels = [argument.label for argument in kernel.adj.args]
+                self.assertEqual(labels, [argument.label for argument in exact.adj.args] + ["readout"])
+                self.assertIs(kernel.adj.args[-1].type, SolveReadout)
+                snippets = {snippet for snippet in _native_snippets(kernel) if "solve_readout_sweeps" in snippet}
+                self.assertEqual(len(snippets), 1)
+                (snippet,) = snippets
+                self.assertEqual(snippet.count(ARCHITECTURE_GUARD), 1)
+                # The readout helper follows the friction law, and each sweep records at its one exit.
+                if "friction_pair" in snippet:
+                    self.assertLess(snippet.index("friction_pair"), snippet.index(SWEEP_READOUT.source))
+                body = snippet.split(SWEEP_READOUT.source, 1)[1]
+                self.assertEqual(body.count("solve_readout_sweeps("), 1)
+                self.assertEqual(body.count("if (sweep_stop) break;"), 1)
+
+    def test_sweep_exit_keeps_the_exact_exit_text(self):
+        """Return a sweep's own exit verbatim without a readout, and a recorded exit with one."""
+        exact = "        if (__ballot_sync(MASK, changed != 0) == 0u) break;\n"
+        self.assertIs(sweep_exit(EXACT_POLICY, exact, quiet="unused"), exact)
+        counted = sweep_exit(
+            SWEEPS, exact, quiet="done", gate="open", world="w", iteration="k", iterations="n", lane="l"
+        )
+        self.assertIn("const bool sweep_stop = open && done;", counted)
+        self.assertIn("if (l == 0 && (sweep_stop || k + 1 == n))", counted)
+        self.assertIn("solve_readout_sweeps(w, k + 1, sweep_stop);", counted)
+
+    def test_readout_rejects_unbound_or_tiled_matrix_free_variants(self):
+        """Refuse a readout where the matrix-free generator has no physical sweep exit to record."""
+        for options in ({"dense_support_tiles": True}, {"shared_arena": True}):
+            with self.subTest(options=options), self.assertRaisesRegex(ValueError, "readout"):
+                mf_gs_source.get_source(64, 32, 12, "120", solve_policy=SWEEPS, **options)
+
+    def test_world_dispatch_requires_the_world_first(self):
+        """Reject the world dispatches of generated kernels unless the native's first operand is the world."""
+
+        def signature(candidate: int, value: wp.array[float]): ...
+
+        for dispatch in ("tiles", "worlds"):
+            with self.subTest(dispatch=dispatch), self.assertRaisesRegex(ValueError, "world"):
+                make_row_kernel("bad_dispatch", "", signature, dispatch=dispatch)
+
+    def test_dispatch_operands_extend_the_native_abi(self):
+        """Append private operands to the matrix-free dispatch exactly as to its native declaration."""
+        native = mf_dispatch.make_native("", extra={"readout": SolveReadout})
+        dispatch = mf_dispatch.make_dispatch(native, extra={"readout": SolveReadout})
+        names = list(inspect.signature(dispatch).parameters)
+        self.assertEqual(names[-2:], ["v_out", "readout"])
+        plain = mf_dispatch.make_dispatch(mf_dispatch.make_native(""))
+        self.assertEqual(list(inspect.signature(plain).parameters), names[:-1])
+
+
+class TestSolveReadoutRecord(unittest.TestCase):
+    """Host summaries of readout counters."""
+
+    def test_record_allocates_slots_and_summarizes_counts(self):
+        """Allocate counters for readout kernels only and summarize their cumulative histogram."""
+        record = SolveReadoutRecord(SWEEPS)
+        counted = SimpleNamespace(key="counted_kernel", _fpgs_solve_readout=True)
+        plain = SimpleNamespace(key="plain_kernel")
+        record.register(counted, "sparse_pgs", world_count=3, budget=4, device="cpu")
+        record.register(plain, "mf_gs", world_count=3, budget=4, device="cpu")
+        record.register(None, "paired_factor", world_count=3, budget=4, device="cpu")
+        self.assertEqual(record.kernels, {"counted_kernel": "sparse_pgs"})
+        self.assertEqual(record.operands(plain), [])
+        (operand,) = record.operands(counted)
+        self.assertEqual(operand.sweeps.shape, (5, 3))
+        # World 0: two solves of four sweeps, one of them without stopping; world 1: one solve of two; world 2: none.
+        sweeps = np.zeros((5, 3), dtype=np.int32)
+        sweeps[4, 0], sweeps[2, 1] = 2, 1
+        operand.sweeps.assign(sweeps)
+        operand.exhausted.assign(np.array([1, 0, 0], dtype=np.int32))
+        (summary,) = record.summary()["slots"]
+        self.assertEqual(summary["sweeps"], [0, 0, 1, 0, 2])
+        self.assertEqual((summary["solves"], summary["exhausted"], summary["budget"], summary["worlds"]), (3, 1, 4, 2))
+        self.assertAlmostEqual(summary["full_budget_fraction"], 2.0 / 3.0)
+        self.assertAlmostEqual(summary["mean_sweeps"], 10.0 / 3.0)
+        self.assertEqual(summary["world_mean_sweeps"]["p50"], 3.0)
+        json.dumps(record.summary(), allow_nan=False)
+
+
+class TestSolverReadoutOption(unittest.TestCase):
+    """The solver option and its records on a CPU model, where no native sweep is built."""
+
+    @staticmethod
+    def _model():
+        builder = newton.ModelBuilder()
+        body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        builder.add_articulation([builder.add_joint_revolute(-1, body)])
+        return builder.finalize(device="cpu")
+
+    def test_invalid_readout_raises(self):
+        """Reject an unknown readout at construction."""
+        with self.assertRaisesRegex(ValueError, "pgs_solve_readout"):
+            SolverFeatherPGS(self._model(), pgs_solve_readout="every_sweep")
+
+    def test_records_name_the_readout_and_its_kernels(self):
+        """Record the requested readout, an off applied value without counted sweeps, and no measurement."""
+        model = self._model()
+        for requested in ("off", "sweeps"):
+            with self.subTest(requested=requested):
+                selection = SolverFeatherPGS(model, pgs_solve_readout=requested).get_path_selection()
+                json.dumps(selection, allow_nan=False)
+                option = selection["options"]["pgs_solve_readout"]
+                self.assertEqual((option["requested"], option["applied"], option["default"]), (requested, "off", "off"))
+                readout = selection["routes"]["sweep"]["readout"]
+                self.assertEqual((readout["mode"], readout["counted"], readout["uncounted"]), ("off", {}, []))
+                self.assertIn("off" if requested == "off" else "No sweep", readout["reason"])
+                self.assertNotIn("solve_readout", selection["measurements"])
+
+
+if __name__ == "__main__":
+    unittest.main()
