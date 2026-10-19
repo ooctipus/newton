@@ -35,6 +35,8 @@ DT = 1.0 / 240.0
 GRAVITY = (0.7, -1.2, -9.1)
 # Fields the scalar family stops writing for its bodies; no consumer on its route reads them.
 DROPPED_FIELDS = ("body_q_com", "body_v_s", "body_a_s", "body_f_s", "body_I_s", "_body_inertia_terms")
+# Fields the held owner writes only for free bodies, not for a fixed-base arm (it publishes body_v_s).
+ARM_DROPPED_FIELDS = ("body_q_com", "body_a_s", "body_f_s", "body_I_s", "_body_inertia_terms")
 # CUDA bounds against the prismatic linear state route: the keys' are that route's own A/B
 # tolerances (FMA contraction); the arm leaves the serial route for the held owner's float order.
 KEY_BOUND = {"rtol": 3.0e-5, "atol": 5.0e-6}
@@ -1262,20 +1264,25 @@ def _key_law(model, leaves, dofs, axes, q, qd, steps, push=None):
 
 @unittest.skipUnless(wp.is_cuda_available(), "Scalar branches run on the CUDA held-tree owner")
 class TestScalarBranchOwner(unittest.TestCase):
-    def _poison(self, solver, bodies, dofs):
-        """Fill what the scalar family neither writes nor reads with NaN for its bodies and DOFs.
+    def _poison(self, solver, layout):
+        """Fill what the scalar owner neither writes nor reads with NaN.
 
-        That is the FK/ID fields of its bodies, and the drive stiffness and
-        forces of its DOFs, which its predict evaluates itself.
+        For the keys: the FK/ID fields the scalar family stops writing, and the
+        drive stiffness and forces its predict evaluates itself. For the arm:
+        the FK/ID fields the head's serial route writes and the held owner does
+        not for a fixed-base tree.
         """
-        for name in DROPPED_FIELDS:
-            array = getattr(solver, name)
-            values = array.numpy()
-            values[bodies] = np.nan
-            array.assign(values)
+        for names, bodies in ((DROPPED_FIELDS, layout.key_bodies), (ARM_DROPPED_FIELDS, layout.arm_bodies)):
+            for name in names:
+                array = getattr(solver, name)
+                values = array.numpy()
+                values[bodies] = np.nan
+                array.assign(values)
         tau, stiffness = solver.joint_tau.numpy(), solver.aug_row_K.numpy()
-        tau[dofs] = np.nan
-        stiffness[solver._augmented_drive_row_by_dof.numpy()[dofs]] = np.nan
+        tau[layout.key_dofs] = np.nan
+        rows = solver._augmented_drive_row_by_dof.numpy()[layout.key_dofs]
+        # A coordinate without a drive row (-1) must not poison the last row, which is an arm's.
+        stiffness[rows[rows >= 0]] = np.nan
         solver.joint_tau.assign(tau)
         solver.aug_row_K.assign(stiffness)
 
@@ -1307,8 +1314,9 @@ class TestScalarBranchOwner(unittest.TestCase):
         through the mass cadence, an inertial and drive notification, a masked
         reset after a coordinate write, a root re-pose and captured graphs with
         masked and full resets; the arm moves to the held owner's float order.
-        The FK/ID fields the family stops writing hold NaN for its bodies
-        throughout, so nothing on the route reads them.
+        The FK/ID fields that neither the family writes for the keys nor the
+        held owner for the arm hold NaN throughout, so nothing on the route
+        reads them.
         """
         device = wp.get_device("cuda:0")
         model = build_branch_model(device, worlds=4, leaves=KEYBOARD_LEAVES, shapes=True)
@@ -1319,7 +1327,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         solvers = [recipe_solver(model, scalar=False), recipe_solver(model, scalar=True)]
         head, scalar = solvers
         owner = self._assert_routes(head, scalar)
-        self._poison(scalar, layout.key_bodies, layout.key_dofs)
+        self._poison(scalar, layout)
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
         contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]
@@ -1431,7 +1439,7 @@ class TestScalarBranchOwner(unittest.TestCase):
             mask.assign(np.asarray(reset, dtype=np.bool_))
             inputs(replay + 11)
             write_coordinates(reset)
-            self._poison(scalar, layout.key_bodies, layout.key_dofs)
+            self._poison(scalar, layout)
             for graph in graphs:
                 wp.capture_launch(graph)
             compare(f"replay {replay}")
