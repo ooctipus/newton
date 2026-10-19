@@ -1225,7 +1225,7 @@ def run_live_sort_cases(test, device, capacities, extra_counts=()):
 class TestPatchLiveSort(unittest.TestCase):
     def test_live_sort_matches_stable_argsort_and_radix_sort(self):
         """Sort the live prefix exactly as a stable sort, from no contacts, which no slot sees, through merges."""
-        run_live_sort_cases(self, "cpu", (2047, 3000, 4096, 10000, friction_patches._CHUNK_SORT_CAPACITY))
+        run_live_sort_cases(self, "cpu", (128, 2047, 3000, 4096, 10000, friction_patches._CHUNK_SORT_CAPACITY))
 
     def test_capacity_thresholds_select_the_live_sort(self):
         """Sort only the live prefix up to the small capacity threshold and from the large one on, while keys fit."""
@@ -1264,8 +1264,9 @@ class TestPatchLiveSort(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "the device sort needs CUDA")
     def test_live_sort_matches_on_the_device(self):
-        """Sort live prefixes on the device, up to hundreds of chunks and nine merges."""
-        run_live_sort_cases(self, "cuda:0", (3000, 10000, 1_000_000), (300_000,))
+        """Sort live prefixes on the device, from capacities below one chunk to hundreds of chunks and nine merges."""
+        capacities = (128, 3000, 10000, friction_patches._CHUNK_SORT_CAPACITY, 1_000_000)
+        run_live_sort_cases(self, "cuda:0", capacities, (300_000,))
 
     @unittest.skipUnless(wp.is_cuda_available(), "multi-block grids need CUDA")
     def test_live_sort_builds_match_on_many_blocks(self):
@@ -2809,8 +2810,13 @@ class TestPatchFrameModes(unittest.TestCase):
                 assert_same_state(recording, plain, f"{context} store", records=False)
         self.assertGreater(kept, 0, "substeps must reuse live pairs")
 
-    def test_keep_mode_writes_no_live_pair_slot(self):
-        """Leave the pair keys and indices of a recorded frame's live slots unwritten."""
+    def test_keep_mode_preserves_the_sorted_pairs_of_live_slots(self):
+        """Preserve the pair keys and indices that a recorded frame's live slots hold.
+
+        Values cannot tell a keep that never writes these slots from one that
+        reads and restores them, which costs about 50 us per kept build at
+        keyboard scale; the GPU probe's keep-mode prepare time gates that.
+        """
         scene = _Scene("cpu", 44)
         _, patches = _recording_pair(scene, 128)
         scene.active[:] = True
@@ -4164,12 +4170,12 @@ class TestPatchCapturedFrameReuse(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
     def test_collision_pass_graphs_step_as_the_always_sort_chain_on_the_device(self):
         """Replay collision-pass graphs on CUDA bitwise as eager always-sort steps, with one sort per pass."""
-        run_captured_collision_passes(self, "cuda:0", replays=30)
+        run_captured_collision_passes(self, "cuda:0", replays=100)
 
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
     def test_graphs_without_a_collision_pass_sort_their_first_build_on_the_device(self):
         """Sort the first build of a CUDA substep graph each replay and keep the second, bitwise as eager steps."""
-        run_captured_steps_without_a_collision_pass(self, "cuda:0", replays=30)
+        run_captured_steps_without_a_collision_pass(self, "cuda:0", replays=100)
 
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
     def test_unnoted_contact_writes_between_captured_steps_are_reported_on_the_device(self):
@@ -4179,7 +4185,7 @@ class TestPatchCapturedFrameReuse(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
     def test_coupled_entry_filters_start_new_frames_on_the_device(self):
         """Sort after each coupled entry filter pass in a CUDA graph and keep the pairs on later substeps."""
-        run_captured_entry_filter(self, "cuda:0", replays=30)
+        run_captured_entry_filter(self, "cuda:0", replays=100)
 
 
 if __name__ == "__main__":

@@ -725,6 +725,9 @@ def _merge_rounds(live: int):
     return rounds
 
 
+# Below _SORT_CHUNK // 2 contact slots a chunk's tile reaches past the 2 * capacity
+# keys and indices: those capacities rely on wp.tile_store's bounds check, which
+# drops the stores past the arrays' end. They only hold padding past the live slots.
 @wp.kernel(enable_backward=False)
 def _sort_chunks(
     slot_keys: wp.array[wp.int64],
