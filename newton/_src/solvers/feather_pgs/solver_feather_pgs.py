@@ -1742,8 +1742,8 @@ class SolverFeatherPGS(SolverBase):
                 each linked tier serving up to ``R`` rows ``ceil(15/4 * pgs_iterations * sqrt(R / 32))`` sweeps,
                 at least ``mf_gs_parallel_sweeps`` and at most 128 unless ``mf_gs_parallel_sweeps`` is larger,
                 from ``pgs_iterations`` at construction: the serial sweep's iteration count sets the accuracy to
-                match, and larger worlds converge more slowly. The factor brings every tier's worlds to the serial
-                sweep's accuracy on two contact-rich patch-friction workloads.
+                match, and larger worlds converge more slowly. The factor is fit so that every tier's worlds reach
+                the serial sweep's accuracy on two contact-rich patch-friction workloads.
                 Every world still exits early once its impulses change by less than ``mf_gs_parallel_tol``.
                 The environment variable ``FEATHER_PGS_PATCH_PARALLEL_SWEEPS`` (a positive count or ``auto``)
                 overrides the argument. ``get_path_selection()`` reports each tier's budget under
@@ -28109,10 +28109,12 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
 # passes where more rows couple through one body. The factor, in eighths, is the smallest that brings every tier's
 # worlds to the serial sweep's accuracy on two contact-rich patch-friction workloads (12 and 8 iterations): per row
 # bucket, the p90 energy-norm velocity error against a converged reference over the serial route's, 95% CI upper
-# bound at most 1 (per-world errors measured at fixed caps, interpolated between them). The serial sweep is most
-# accurate on small worlds, so the 12-iteration workload's 32-row tier sets it: 3 left those worlds at 1.57x the
-# serial error and 29/8 at 0.92x (CI upper 1.01); 15/4 gives 0.89x (0.97), its larger tiers 0.41x and 0.55x, and the
-# 8-iteration workload's tiers 0.18x and 0.51x. A fraction keeps the budget in exact integer arithmetic.
+# bound at most 1. The ratios below are interpolated from one probe's fixed caps (each world's error log-linear
+# between them), not measured at the auto budgets, and its 97-128-row tier held too few worlds to evaluate. The
+# serial sweep is most accurate on small worlds, so the 12-iteration workload's 32-row tier sets the factor: 3 left
+# those worlds at 1.38x the serial error measured (1.57x interpolated) and 29/8 at 0.92x (CI upper 1.01); 15/4 gives
+# 0.89x (0.97), its larger tiers 0.41x and 0.55x, and the 8-iteration workload's tiers 0.18x and 0.51x, where 24 and
+# 31 sweeps would reach parity. A fraction keeps the budget in exact integer arithmetic.
 _LINKED_SWEEPS_PER_ITERATION = Fraction(15, 4)
 _LINKED_SWEEPS_CAP = 128
 
