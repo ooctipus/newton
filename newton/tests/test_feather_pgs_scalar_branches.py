@@ -20,6 +20,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import kernels as fk
+from newton._src.solvers.feather_pgs import path_selection
 from newton._src.solvers.feather_pgs import scalar_branches as sb
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.device_proof import DeviceProof
@@ -1020,6 +1021,64 @@ class TestScalarBranchRule(unittest.TestCase):
         self.assertIn("Scalar branches own", forced.forest_reason)
         self.assertEqual(len(forced.groups), 2)
 
+    def test_tree_groups_beside_scalar_branches_validate_by_identity(self):
+        """Bind and launch no input-bank comparison beside scalar branches, and record identity validation.
+
+        The scalar group holds no bank stamps, so its owner validates a changed
+        input bank by identity: the solver invalidates every cache of the owner,
+        and the arm's tree group could only compare words whose cache was
+        discarded. After a finish into ``s1`` a step that reads ``s0`` (a copy
+        of ``s1`` after an odd substep count) launches the arm's ordinary repair
+        and the scalar repair. Without scalar branches the same solver's tree
+        groups compare that bank and record content validation. Launches are
+        recorded, not run.
+        """
+        model = build_branch_model(worlds=2)
+        solver = cpu_solver(model, 7)
+        solver._scalar_branches, _reason = sb.plan_scalar_branches(solver, requested=True)
+        owners = {"scalar": MixedTreeKineticState(solver)}
+        with mock.patch.object(solver, "_scalar_branches", None):
+            owners["plain"] = MixedTreeKineticState(solver)
+        s0, s1 = model.state(), model.state()
+        solver._last_step_dt = DT
+        augmented = solver._prepare_augmented_state(s0, s1, model.control())
+        kinds = {}
+        for owner in owners.values():
+            for group in owner.groups:
+                kinds.update({group.repair_kernel: "repair", getattr(group, "bank_repair_kernel", None): "compare"})
+        kinds.pop(None, None)
+
+        def launches(call):
+            launched = []
+
+            def record(kernel, *args, **kwargs):
+                launched.append(kernel)
+
+            with mock.patch.multiple(wp, launch=record, launch_tiled=record):
+                call()
+            return [kinds[kernel] for kernel in launched if kernel in kinds]
+
+        expected = {
+            "scalar": (False, "identity", ["repair", "repair"]),
+            "plain": (True, "content", ["compare", "compare"]),
+        }
+        for name, owner in owners.items():
+            compare, validation, copy_back = expected[name]
+            with self.subTest(owner=name):
+                self.assertEqual(owner.bank_compare, compare)
+                for group in owner.groups:
+                    record = path_selection._tree_group(group)
+                    self.assertEqual(record["input_validation"], validation)
+                    self.assertEqual(group.bank_compare, compare)
+                    # Nothing that compares is bound where nothing may compare.
+                    bound = {key for key in ("bank", "bank_repair") if record["kernels"][key] is not None}
+                    self.assertEqual(bound, {"bank_repair"} if compare else set())
+                launches(lambda owner=owner: owner.finish(s0, augmented, s1, DT, False))
+                self.assertEqual(
+                    launches(lambda owner=owner: owner.begin(s0, augmented, s0.joint_qd, DT, False, state_out=s1)),
+                    copy_back,
+                )
+
     def test_owner_proves_the_scalar_topology_through_its_tree_groups(self):
         """Validate a notification with the owner's and the arm group's proofs alone, and still refuse new topology.
 
@@ -1076,7 +1135,7 @@ class TestScalarBranchRule(unittest.TestCase):
         admitted = self._admitted(model)
 
         def install(solver):
-            solver._tree_kinetic_state = mock.Mock(scalar=object(), copy_reuse=False)
+            solver._tree_kinetic_state = mock.Mock(scalar=object(), bank_compare=False)
             solver._cached_dynamics_selection_reason = "A test owner takes the branches."
 
         with (

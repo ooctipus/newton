@@ -574,6 +574,10 @@ class MixedTreeKineticState:
                 clocked=self.clocked,
                 skip=skip,
                 classify=classify,
+                # Scalar branches hold no bank stamps, so beside them a changed input bank
+                # invalidates every cache of the owner (bank_compare below), and a tree group
+                # that compared would compare words whose cache was already discarded.
+                compare_banks=scalar is None,
             )
             operator.kinetic_state = group
             self.groups.append(group)
@@ -592,8 +596,8 @@ class MixedTreeKineticState:
         self.sparse = self
         # Every tree group compares input banks (fixed and free roots alike) and skips
         # captured repairs unless the solver prescales velocities; see TreeKineticState.
-        # Scalar branches do neither, and the solver then validates a changed input
-        # bank by identity for the whole owner.
+        # Beside scalar branches, which do neither, every group validates a changed
+        # input bank by identity, and the solver invalidates the whole owner.
         self.bank_compare = all(group.bank_compare for group in self.groups)
         self.skip_captured_repairs = all(group.skip_captured_repairs for group in self.groups)
 

@@ -148,6 +148,10 @@ class TreeKineticState:
     A classified repair compares in a pass of its own over the blocks its
     classification lists for comparison; a one-pass repair compares inside
     its blocks (a second repair kernel, launched only by repairs that compare).
+    An owner that composes a group validated by identity alone passes
+    ``compare_banks=False``: the solver then invalidates every cache of the
+    owner on a changed input bank, so no comparison could keep one, and none
+    is bound or launched.
 
     The host chooses the launch from the bank it expects the stamps to name.
     It knows that bank eagerly once a repair or finish ran, and inside a graph
@@ -196,6 +200,7 @@ class TreeKineticState:
         clocked=None,
         skip=None,
         classify=None,
+        compare_banks=True,
     ):
         from . import tree_kinetic_state as native  # noqa: PLC0415
 
@@ -212,7 +217,7 @@ class TreeKineticState:
         self.layout, parent, depth = make_plan(model, sparse_owner, complete=complete)
         # Motion-velocity layouts keep identity validation: their repair reads the
         # prescaled velocity, and the solver keeps its host identity check for them.
-        self.bank_compare = not self.motion_velocity
+        self.bank_compare = bool(compare_banks) and not self.motion_velocity
         switches = launch_switches()
         skip = switches[0] if skip is None else skip
         classify = switches[1] if classify is None else classify
