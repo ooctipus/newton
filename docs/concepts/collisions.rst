@@ -724,12 +724,44 @@ The resulting filter pairs are stored in :attr:`~Model.shape_collision_filter_pa
     # Newton automatically imports UsdPhysics collision filtering
     builder = newton.ModelBuilder()
     builder.add_usd("scene.usda")
-    
+
     # Collision groups and filter pairs are now populated:
     # - shape_collision_group: integer IDs mapped from UsdPhysicsCollisionGroup
     # - shape_collision_filter_pairs: pairs from physics:filteredPairs relationships
-    
+
     model = builder.finalize()
+
+.. _Immobile Pairs:
+
+Structurally Immobile Pairs
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+By default, :class:`~CollisionPipeline` drops candidate pairs whose shapes are both
+*structurally immobile*: static shapes (``body=-1``) and the shapes of bodies welded to the world.
+A body is welded when it is dynamic and every joint that names it as the child is an enabled fixed
+joint from the world or from another welded body, like the base link of a fixed-base robot and
+anything fixed to it. Kinematic bodies can move, so neither they nor the bodies welded to them are
+immobile, and their pairs are kept. The filter applies in every broad phase mode, also to pairs
+that come from different builders, such as a global ground and a robot base replicated into
+each world.
+
+Neither shape of such a pair can move, so its contacts have no dynamics in a solver that gives
+welded bodies no degrees of freedom; :class:`~newton.solvers.SolverFeatherPGS` discards them
+anyway. Dropping them in the broad phase removes their contact generation and solver bookkeeping.
+Solvers that resolve fixed joints as constraints no longer see these contacts either, and contact
+sensors no longer report them.
+
+``get_collision_selection()["immobile_pairs"]`` records the choice and the welded bodies,
+immobile shapes and dropped pairs. Pass ``include_immobile_pairs=True``, or set
+``NEWTON_BROAD_PHASE_IMMOBILE_FILTER=0`` before construction, to keep these pairs. The immobile set
+is computed at construction; after changing :attr:`~Model.body_flags` or
+:attr:`~Model.joint_enabled`, notify the pipeline as well as the solver:
+
+.. code-block:: python
+
+    model.body_flags.assign(flags)
+    solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+    pipeline.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
 
 .. _Collision Pipeline Details:
 
