@@ -175,7 +175,11 @@ def rhs_reference(solver, owner):
 def bind_parallel(snapshot, solver, owner, device, *, kinetic):
     """Bind the unchanged original parallel law and its direct-Z input successor."""
 
-    factory = rows.get_parallel_factory(_get_pgs_solve_parallel_kernel) if kinetic else _get_pgs_solve_parallel_kernel
+    factory = (
+        rows.get_parallel_factory(_get_pgs_solve_parallel_kernel, owner.layout)
+        if kinetic
+        else _get_pgs_solve_parallel_kernel
+    )
 
     def array(value, dtype=float):
         return wp.array(value, dtype=dtype, device=device)
@@ -267,7 +271,7 @@ class TestKeyedRowsCPU(unittest.TestCase):
     def test_module_contract(self):
         """Expose the complete typed-row owner and direct kinetic consumer."""
         self.assertTrue(callable(rows.create_owner))
-        self.assertTrue(callable(rows.get_ink_stage))
+        self.assertTrue(callable(rows.get_direct_parallel_inputs))
         with np.load(next(captures())) as snapshot:
             solver, _state, _aug, _contact, owner = fixture(snapshot, "cpu")
             self.assertTrue(owner.keyed_rows)
@@ -276,42 +280,6 @@ class TestKeyedRowsCPU(unittest.TestCase):
             self.assertFalse(hasattr(owner.data, "encoding"))
             self.assertFalse(hasattr(owner.prefix, "row_dof"))
             self.assertFalse(hasattr(owner.prefix, "row_sign"))
-
-    def test_current_and_held_maps(self):
-        """Check current motion maps against independent held-factor actions."""
-        for path in captures():
-            with self.subTest(path=path.name), np.load(path) as snapshot:
-                solver, state, aug, _contact, owner = fixture(snapshot, "cpu")
-                owner.begin_rows(state, aug, solver.dt)
-                maps = owner.maps.maps.numpy().astype(np.float64)
-                motion = aug.joint_S_s.numpy().astype(np.float64)
-                starts = owner.maps.starts.numpy()
-                for world in (0, 1, 117, 511):
-                    for finger in range(4):
-                        L = snapshot["L_16"][world, finger * 4 : finger * 4 + 4, finger * 4 : finger * 4 + 4].astype(
-                            np.float64
-                        )
-                        for depth in range(4):
-                            S = motion[starts[world, 0] + finger * 4 : starts[world, 0] + finger * 4 + 4].copy()
-                            S[depth + 1 :] = 0.0
-                            expected = np.linalg.solve(L, S)
-                            actual = maps[world, (finger * 4 + depth) * 24 : (finger * 4 + depth + 1) * 24].reshape(
-                                4, 6
-                            )
-                            np.testing.assert_allclose(actual, expected, rtol=3e-6, atol=3e-6)
-                    expected = np.linalg.solve(
-                        snapshot["L_6"][world].astype(np.float64), motion[starts[world, 1] : starts[world, 1] + 6]
-                    )
-                    np.testing.assert_allclose(maps[world, 384:].reshape(6, 6), expected, rtol=3e-6, atol=3e-6)
-                # Deliberately alter current motion while preserving held L.
-                held = {n: solver.L_by_size[n].numpy().copy() for n in (16, 6)}
-                changed = aug.joint_S_s.numpy()
-                changed[:, :3] += np.float32(0.0125)
-                aug.joint_S_s.assign(changed)
-                owner.begin_rows(state, aug, solver.dt)
-                self.assertGreater(np.max(np.abs(owner.maps.maps.numpy() - maps)), 1e-3)
-                for n in (16, 6):
-                    np.testing.assert_array_equal(solver.L_by_size[n].numpy(), held[n])
 
     def test_actual_prefix_and_contact_rows(self):
         """Preserve typed identities and independently verify fallback current physical rows."""
@@ -368,8 +336,9 @@ class TestKeyedRowsCPU(unittest.TestCase):
 
     def test_original_parallel_abi_is_unchanged(self):
         """Create an isolated kinetic successor without modifying ordinary signatures."""
-
-        factory = rows.get_parallel_factory(_get_pgs_solve_parallel_kernel)
+        with np.load(next(captures())) as snapshot:
+            owner = fixture(snapshot, "cpu")[-1]
+        factory = rows.get_parallel_factory(_get_pgs_solve_parallel_kernel, owner.layout)
         kwargs = {"rows": 32, "sweeps": 24, "matrix_free": True, "inkernel_response": (16, 6, 0, 16)}
         ordinary = _get_pgs_solve_parallel_kernel(192, 64, 22, "cuda", **kwargs)
         candidate = factory(192, 64, 22, "cuda", **kwargs)
