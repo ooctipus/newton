@@ -194,7 +194,7 @@ class TestKeyedRowIntegration(unittest.TestCase):
                 for case in (ordinary, keyed):
                     kernels = case[1]._pgs_solve_mf_gs_incremental_kernels
                     self.assertTrue(kernels)
-                    self.assertTrue(all(kernel.key.endswith("_linked") for kernel in kernels))
+                    self.assertTrue(all(kernel.key.endswith("_linked_iso") for kernel in kernels))
                 linked = False
                 for _ in range(8):
                     _step(ordinary)

@@ -230,7 +230,7 @@ class TestAllegroKineticLifecycleCUDA(unittest.TestCase):
         for solver in (original, candidate):
             keys = [kernel.key for kernel in solver._pgs_solve_mf_gs_incremental_kernels]
             self.assertTrue(keys)
-            self.assertTrue(all(key.endswith("_linked") == linked for key in keys), keys)
+            self.assertTrue(all(key.endswith("_linked_iso") == linked for key in keys), keys)
         self.assertEqual(candidate._keyed_rows.data.rowkeys.shape, (1, candidate.dense_max_constraints))
         self.assertFalse(hasattr(candidate._keyed_rows.data, "coefficients"))
         self.assertFalse(hasattr(candidate._keyed_rows.data, "encoding"))
