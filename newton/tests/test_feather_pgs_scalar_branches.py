@@ -52,9 +52,12 @@ IMPULSE_BOUND = {"rtol": KEY_BOUND["rtol"], "atol": 1.0e-8}
 # the scalar route's own run-to-run spread. Their other term, twice the ordinary solver's distance
 # from a held law, measures this very move, so it cannot bound it.
 ARM_FLOOR = 1.0e-5
-# The arm-key press (_press_key_with_tip, _gripper_switch): float32 spacings of the contact's world
-# position that two float orders of the tip's and the key's poses may leave between two routes (one
-# per body and route).
+# The arm-key press (_press_key_with_tip, _gripper_switch). The pose floor is the first step's
+# response at the frictionless position-correction gain pgs_beta / (D dt) to four float32 spacings
+# of the tips' extent, one per body and route. The friction cone scales that gain (on the CPU twin
+# by 1.40 in the loaded world and 0.86 in the other), so the floor admits about three spacings, and
+# only while the contact stays penetrating: it starts three spacings deep, and a shift beyond that
+# turns the row speculative and steepens the response toward five times the gain.
 GRIPPER_POSE_SPACINGS = 4
 # The fraction of the head route's iteration-budget error (its distance from the converged
 # reference) a route switch may move the contact impulses by: five times CUDA's 2% (9.4e-6 N s,
@@ -2101,11 +2104,15 @@ class TestScalarBranchOwner(unittest.TestCase):
           head's within the keys' FMA bound.
         - The first step starts both routes from one state. They differ by the float order of the
           tip's and the key's poses, about one float32 spacing of the contact's world position each,
-          which the contact's position correction turns into ``pgs_beta / (D dt)`` times that
-          displacement: 1.6 N s/m, 1e-7 N s per spacing of 0.5 m. The first impulses must agree
-          within the response to four spacings, the pose floor. Measured on CUDA: 6.8e-8 and
-          4.2e-8 N s, which a 3e-8 m shift of the tip's witness (one spacing of its 0.3 m height)
-          reproduces on the CPU twin (``TestGripperContactBound``: 6.9e-8 and 4.2e-8).
+          which the contact's position correction turns into impulse at ``pgs_beta / (D dt)``
+          without friction: 1.6 N s/m, 1e-7 N s per spacing of 0.5 m. The first impulses must agree
+          within the pose floor, that gain's response to four spacings. On the CPU twin the friction
+          cone scales the gain by 1.40 and 0.86 while the contact stays penetrating (it starts three
+          spacings deep), so the floor admits about three spacings. Measured on CUDA: 6.8e-8 and
+          4.2e-8 N s, 0.17 and 0.11 of the floor. The response is linear: on the CPU twin a 3e-8 m
+          shift of the tip's witness (one spacing of 0.3 m) gives 6.9e-8 and 4.2e-8 N s, and
+          ``TestGripperContactBound``'s one-spacing shift of the 0.5 m extent (6e-8 m) gives 1.4e-7
+          and 8.4e-8 N s (0.35 and 0.21 of the floor).
         - Later steps inherit a friction history that eight sweeps leave unconverged: on the CPU
           twin the loaded world's key slides at the friction cone for four steps and then sticks
           1e-5 m deeper inside it, where the same head solver at ``GRIPPER_REFERENCE_ITERATIONS``
