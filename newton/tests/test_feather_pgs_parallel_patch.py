@@ -1779,7 +1779,10 @@ class TestPatchParallelRoutes(unittest.TestCase):
         Opted out, patch friction keeps the route it had before the tiers learned the
         ring: the serial sweep, or the incremental tier that the constructor's default
         ``mf_gs_incremental_rows=32`` requests and an admitted parallel tier replaces.
-        Point friction builds its tiers whatever the switch says.
+        Point friction builds its tiers whatever the switch says. With the option
+        omitted, the linked tier sweeps the ``"auto"`` budget, ``ceil(15/4 * 8)`` = 30
+        sweeps for 32 rows at eight iterations, and the point tier keeps
+        ``mf_gs_parallel_sweeps``.
         """
         model = standing_model()
         options = {"sparse_mass_matrix": "auto", "cached_dynamics": "auto"}
@@ -1801,9 +1804,12 @@ class TestPatchParallelRoutes(unittest.TestCase):
             keys = [kernel.key for kernel in solver._pgs_solve_mf_gs_incremental_kernels]
             self.assertTrue(keys)
             self.assertTrue(all(key.endswith("_linked_iso") == linked for key in keys), keys)
+            sweeps, rule = (30, "auto") if linked else (24, "mf_gs_parallel_sweeps")
+            self.assertTrue(all(f"_sweeps{sweeps}_" in key for key in keys), keys)
             tiers = solver.get_path_selection()["routes"]["sweep"]["tiers"]
             self.assertEqual((tiers["family"], tiers["linked_rows"]), ("parallel", linked))
             self.assertEqual(tiers["pair_step"], "isotropic" if linked else "per_row")
+            self.assertEqual((tiers["sweeps"], tiers["sweeps_rule"]), (sweeps, rule))
         # Opted out, patch friction keeps the serial route it had before the tiers learned the ring.
         self.assertEqual(opted_out._ink_rows, 0)
         self.assertEqual(opted_out._pgs_solve_mf_gs_incremental_kernels, [])
