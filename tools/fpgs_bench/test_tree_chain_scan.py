@@ -15,8 +15,9 @@ from newton._src.solvers.feather_pgs import tree_chain_scan, tree_kinetic_state
 def _reduce_wrenches(address: wp.uint64, plan: tree_chain_scan.ChainPlan): ...
 
 
-# The owner's per-tree storage mallocs on CPU, which this Warp's CPU JIT cannot
-# resolve; the reduction only needs a scratch address, so pass the test's own.
+# The default (CUDA) form of the tree storage mallocs on CPU, which this Warp's
+# CPU JIT cannot resolve; the reduction only needs a scratch address, so pass
+# the test's own.
 @wp.func_native("return reinterpret_cast<uint64_t>(scratch.data);")
 def _scratch_address(scratch: wp.array[float]) -> wp.uint64: ...
 

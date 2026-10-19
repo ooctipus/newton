@@ -178,6 +178,8 @@ def _thread_helpers(layout):
 _lanes, _sync, _sub, _different_motion = _thread_helpers(REFERENCE_LAYOUT)
 
 
+# The default form's release (see _STORAGE_SOURCE): its free never links on
+# the CPU and is kept verbatim for the CUDA tree kernels' content hashes.
 @wp.func_native(r"""
 #if !defined(__CUDA_ARCH__)
     free(reinterpret_cast<void*>(address));
@@ -667,6 +669,12 @@ _EXTERNAL_REDUCE = r"""    if(nonzero)for(int level=$LAST_PARENT;level>=0;--leve
 """
 
 
+# The default form, which CUDA owners launch, keeps the scratch in shared
+# memory. Its CPU branch never links: Warp's CPU JIT links only a curated C
+# runtime subset, without malloc and free. That branch and the free in
+# _release stay verbatim because this text is part of every CUDA tree kernel's
+# content hash (its kernel-cache key). An owner on the CPU builds the
+# host=True form below.
 _STORAGE_SOURCE = r"""
 #if defined(__CUDA_ARCH__)
     $STATE_SCRATCH_DECL
@@ -675,10 +683,11 @@ _STORAGE_SOURCE = r"""
 #endif
 """
 
-# Warp's CPU JIT links only a curated C runtime subset, without malloc and
-# free, so the heap form above has no CPU kernel. An owner on the CPU builds
-# this form instead: a CPU launch runs its blocks one after another on the
-# launching thread, and each block is done with the scratch before the next.
+# The host=True form keeps the CPU scratch in static storage: a CPU launch runs
+# its blocks one after another on the launching thread, and each block is done
+# with the scratch before the next. Concurrent CPU launches of one kernel from
+# several threads would share it (the JIT has no thread-local storage); only
+# direct-construction tests build CPU owners.
 _HOST_STORAGE_SOURCE = r"""
 #if defined(__CUDA_ARCH__)
     $STATE_SCRATCH_DECL
