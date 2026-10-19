@@ -35,6 +35,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     compute_world_contact_bias,
+    prescale_joint_velocity_limits,
 )
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton.solvers import SolverFeatherPGS
@@ -415,6 +416,68 @@ def split_world_case(solver, world=0):
     return case, velocity + Y.T @ solver.impulses.numpy()[world, :count].astype(np.float64)
 
 
+def prescaled_joint_velocity(model):
+    """The model's joint velocity after the pre-solve prescale of a step with joint velocity limits.
+
+    With ``enable_joint_velocity_limits`` the solver scales each articulation's
+    velocity by one ratio, the smallest ``limit / |qd|`` over its DOFs (PhysX's
+    ``maxJointVelocity`` ratio), and predicts the step's velocity from the
+    result. Split mode, which builds this module's CPU rows, has no velocity
+    limits and predicts from the unscaled velocity. The launch takes the
+    solver's lanes and thread count (``_velocity_prescale_launch``).
+    """
+    lanes, threads = source._velocity_prescale_launch(
+        model.articulation_start.numpy(), joint_count=model.joint_count, cuda=model.device.is_cuda
+    )
+    qd = wp.clone(model.joint_qd)
+    wp.launch(
+        prescale_joint_velocity_limits,
+        dim=threads,
+        inputs=[
+            model.articulation_count,
+            lanes,
+            model.articulation_start,
+            model.joint_type,
+            model.joint_child,
+            model.joint_qd_start,
+            model.joint_dof_dim,
+            model.joint_velocity_limit,
+            model.body_flags,
+            wp.full(1, -1, dtype=wp.int32, device=model.device),  # drive slots: unread without the fused clamp
+            0,
+            model.joint_qd,
+        ],
+        outputs=[qd],
+        device=model.device,
+    )
+    return qd.numpy()
+
+
+def with_velocity_limit_rows(case, mass_matrix, limits, cfm):
+    """``case`` with every DOF's lower and upper velocity-limit rows appended, as the matrix-free builder writes them.
+
+    The rows ``J = +e_d`` and ``J = -e_d`` hold ``limit + J v >= 0`` without
+    bias and clamp at zero like contact rows; ``mass_matrix`` is the joint-space
+    mass matrix of the case's columns.
+    """
+    J = np.repeat(np.eye(len(limits)), 2, axis=0) * np.tile((1.0, -1.0), len(limits))[:, None]
+    count = len(J)
+    limited = dict(case)
+    limited["J"] = np.vstack((case["J"], J))
+    limited["Y"] = np.vstack((case["Y"], np.linalg.solve(mass_matrix, J.T).T))
+    limited["cfm"] = np.concatenate((np.broadcast_to(case["cfm"], len(case["J"])), np.full(count, cfm)))
+    limited["diag"] = np.einsum("ij,ij->i", limited["J"], limited["Y"]) + limited["cfm"]
+    limited["kinds"] = np.concatenate((case["kinds"], np.zeros(count, np.int32)))
+    limited["types"] = np.concatenate(
+        (case["types"], np.full(count, PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT, np.int32))
+    )
+    limited["parents"] = np.concatenate((case["parents"], np.full(count, -1, np.int32)))
+    limited["mu"] = np.concatenate((case["mu"], np.zeros(count)))
+    limited["rhs"] = np.concatenate((case["rhs"], np.repeat(np.asarray(limits, np.float64), 2)))
+    limited["impulses"] = np.concatenate((case["impulses"], np.zeros(count)))
+    return limited
+
+
 def friction_alignment(impulses, velocity):
     """Cosine between a pair's tangent impulse and the negated tangential velocity it leaves (1: maximal dissipation)."""
     friction, slip = impulses[1:3], velocity[:2]
@@ -787,6 +850,37 @@ class TestParallelPatchReference(unittest.TestCase):
                     case, sweeps=2000, linked=True, velocity_limit_pass=True, **options
                 )
                 np.testing.assert_allclose(unchanged, converged, atol=1.0e-12)
+
+    def test_last_word_holds_a_pushed_sphere_at_its_limit(self):
+        """Hold a sphere the step pushes past its limit: two sweeps hold it only with the last word, 2000 either way.
+
+        The rows are the first step of :func:`_pushed_sphere` as a CPU split solver
+        builds them, started from the prescaled velocity the matrix-free route
+        predicts from, with every DOF's velocity-limit rows added as the matrix-free
+        builder writes them (split mode has neither). Two sweeps of the matrix-free
+        linked tier (the float64 reference) leave the sphere 43 % past its limit;
+        the pass holds it to 1e-5 (1.7e-6 past: the regularized diagonal's share).
+        A sphere that starts past its limit cannot show this: the prescale puts it
+        on the limit before the solve, and two sweeps leave it 0.9 % under.
+        TestPatchParallelRoutes runs the solver's tiers on this sphere.
+        """
+        model = _pushed_sphere("cpu")
+        limits = model.joint_velocity_limit.numpy().astype(np.float64)
+        model.joint_qd.assign(prescaled_joint_velocity(model))  # what the matrix-free route predicts from
+        solver = SolverFeatherPGS(model, friction_anchor_beta=0.2, sparse_mass_matrix="off", cached_dynamics="off")
+        _rollout(model, solver, 1)
+        (size,) = solver.size_groups
+        mass_matrix = solver.H_by_size[size].numpy()[0].astype(np.float64)
+        case = with_velocity_limit_rows(split_world_case(solver)[0], mass_matrix, limits, solver.pgs_cfm)
+        options = {"matrix_free": True, "inkernel": False, "exact": False, "nesterov": True, "tol": 0.0, "linked": True}
+        speeds = {}
+        for sweeps, last_word in itertools.product((2, 2000), (False, True)):
+            _, velocity = parallel_sweep_reference(case, sweeps=sweeps, velocity_limit_pass=last_word, **options)
+            speeds[sweeps, last_word] = float(np.max(np.abs(velocity[:2])))
+        limit = float(limits[0])
+        self.assertGreater(speeds[2, False], 1.05 * limit, f"two sweeps already hold the limit: {speeds}")
+        for key in ((2, True), (2000, False), (2000, True)):
+            self.assertLessEqual(speeds[key], limit * (1.0 + 1.0e-5), (key, speeds))
 
 
 class _RowsBuilt(Exception):
@@ -1559,6 +1653,25 @@ def _sliding_sphere(device, axes, masses, speed, *, mu=0.5):
     qd[: len(speed)] = speed
     model.joint_q.assign(q)
     model.joint_qd.assign(qd)
+    return model
+
+
+def _pushed_sphere(device, *, limit=0.5, dt=1.0 / 240.0):
+    """A resting sphere on x, y and z joints limited to ``limit``; a constant force on x adds ``2 * limit`` each step.
+
+    A step with joint velocity limits first scales a starting velocity past the
+    limits back onto them (:func:`prescaled_joint_velocity`), so a sphere that
+    starts past its limit reaches the solve within it. From rest, or from the
+    limit, the ratio is 1: the force on the first joint, which carries the whole
+    chain, takes the x velocity past the limit within each step of ``dt``, and
+    only the solve's limit rows can take it out.
+    """
+    masses = (3.0, 0.01, 1.0)
+    model = _sliding_sphere(device, (newton.Axis.X, newton.Axis.Y, newton.Axis.Z), masses, (0.0, 0.0))
+    model.joint_velocity_limit.assign(np.full(model.joint_dof_count, limit, np.float32))
+    force = np.zeros(model.joint_dof_count, np.float32)
+    force[0] = sum(masses) * 2.0 * limit / dt
+    model.joint_f.assign(force)
     return model
 
 
