@@ -1100,6 +1100,31 @@ def test_zero_selected_blocks_replay_holds_no_buffers(test, device):
             test.assertEqual(launch.call_count, 1)
 
 
+def test_zero_selected_blocks_launches_directly_for_warp_debugging(test, device):
+    """Launch the clear through warp.launch on every call while a Warp debugging aid is on.
+
+    Printed launches and CUDA error checks happen in warp.launch, and a recorded launch
+    keeps the module build it was recorded with, so replays would skip them, and the
+    checks of a debug or floating-point-checking build. ``warp.launch`` is mocked, so
+    no debug build is compiled.
+    """
+    blocks = wp.zeros((4, 6, 2), dtype=float, device=device)
+    mask = wp.array([True, False, True, False], dtype=bool, device=device)
+    aids = {"none": ("print_launches", False), "debug mode": ("mode", "debug")}
+    aids.update({name: (name, True) for name in ("verify_fp", "print_launches", "verify_cuda")})
+    for aid, (setting, value) in aids.items():
+        with (
+            test.subTest(aid=aid),
+            mock.patch.dict(_clear_replays, clear=True),
+            mock.patch.object(wp.config, setting, value),
+            mock.patch.object(wp, "launch") as launch,
+        ):
+            for _ in range(2):
+                _launch_zero_selected_blocks(blocks, mask, 4, device)
+            recorded = [call.kwargs.get("record_cmd", False) for call in launch.call_args_list]
+            test.assertEqual(recorded, [True] if aid == "none" else [False, False])
+
+
 def test_zero_selected_blocks_replay_cache_takes_concurrent_records(test, device):
     """Keep the replay cache bounded and consistent when two threads record clears at once.
 
@@ -1782,6 +1807,12 @@ add_function_test(
     TestJacobianMassMatrix,
     "test_zero_selected_blocks_replay_holds_no_buffers",
     test_zero_selected_blocks_replay_holds_no_buffers,
+    devices=devices,
+)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_zero_selected_blocks_launches_directly_for_warp_debugging",
+    test_zero_selected_blocks_launches_directly_for_warp_debugging,
     devices=devices,
 )
 add_function_test(

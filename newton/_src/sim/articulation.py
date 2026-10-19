@@ -1258,6 +1258,14 @@ _clear_replays: dict[tuple, wp.Launch] = {}
 _clear_replays_lock = threading.Lock()
 """Serializes changes to :data:`_clear_replays`; lookups read it without the lock."""
 
+_warp_config = vars(wp.config)
+"""Warp's live configuration values.
+
+Reading them here skips the Python attribute hook of :mod:`warp.config`, which costs
+about 0.1 us per read: the four reads of a replayed clear would add 30% to its host
+time on the CPU.
+"""
+
 
 def _unowned_view(array: wp.array, dtype=None, shape: tuple[int, ...] | None = None) -> wp.array:
     """Return a view of ``array``'s memory that does not keep the memory alive.
@@ -1326,7 +1334,10 @@ def _launch_zero_selected_blocks(
     the same argument values, as :func:`warp.launch` would pack them. Packing costs
     more host time than the clear takes on a small model, where it would make the
     clear slower than the whole-buffer memset it replaces. A capture records its own
-    launches.
+    launches. So does a call while a Warp debugging aid is on: printed launches and
+    CUDA error checks happen in :func:`warp.launch`, and a recorded launch keeps the
+    module build it was recorded with, so a replay would also skip the checks of a
+    debug or floating-point-checking build.
 
     No launch is recorded on a :class:`warp.Tape`, so a backward pass sees the clear
     as it saw the ``J.zero_()`` it replaces: not at all.
@@ -1334,7 +1345,14 @@ def _launch_zero_selected_blocks(
     block_size = blocks.shape[1] * blocks.shape[2]
     if block_size == 0 or articulation_count == 0:
         return
-    if not (isinstance(blocks, wp.array) and isinstance(mask, wp.array)) or device.is_capturing:
+    if (
+        not (isinstance(blocks, wp.array) and isinstance(mask, wp.array))
+        or device.is_capturing
+        or _warp_config["mode"] == "debug"
+        or _warp_config["verify_fp"]
+        or _warp_config["print_launches"]
+        or _warp_config["verify_cuda"]
+    ):
         kernel, dim, inputs, outputs = _clear_launch_arguments(blocks, mask, articulation_count)
         wp.launch(kernel, dim=dim, inputs=inputs, outputs=outputs, device=device, record_tape=False)
         return
