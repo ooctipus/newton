@@ -42,13 +42,16 @@ _ADMISSION = re.compile(r"admit_\d+\(")
 
 
 def _kernels(layout):
-    """The finish and every repair form: ordinary, alternate-motion, listed (with each motion) and bank-comparing."""
+    """The finish and every repair form: ordinary, alternate-motion, listed and bank-comparing.
+
+    The listed and bank-comparing repairs are contracts of ordinary motion: owners keep the one-pass
+    repair of a motion-velocity layout.
+    """
     state = tree_kinetic_state.get_state_kernel
     yield "finish", state(True, layout=layout)
     yield "repair", state(False, layout=layout)
     yield "repair_motion", state(False, layout=layout, motion_velocity=True)
     yield "repair_listed", state(False, layout=layout, listed=True)
-    yield "repair_listed_motion", state(False, layout=layout, motion_velocity=True, listed=True)
     # A group's coordinate count: a free root's quaternion takes one more than its three rotation velocities.
     yield "repair_banked", state(False, layout=layout, bank_coordinates=layout.dofs + layout.free_roots)
 
@@ -144,23 +147,33 @@ class TestTreeKineticStages(unittest.TestCase):
                 self.assertEqual(labels["finish"][6:], ["motion_qd", "repair_blocks", "repair_count", "bank"])
 
     def test_only_the_alternate_motion_repair_reads_the_motion_input(self):
-        """Generate no use of the motion input but its hand-off to admission, except in the alternate-motion repairs."""
+        """Generate no use of the motion input but its hand-off to admission, except in the alternate-motion repair."""
         wp.init()
         for layout in _LAYOUTS:
             for name, kernel in _kernels(layout):
                 with self.subTest(layout=layout.bodies, kernel=name):
                     uses = _input_uses(kernel)
-                    if name in ("repair_motion", "repair_listed_motion"):
+                    if name == "repair_motion":
                         self.assertTrue(any("different_motion" in use for use in uses), uses)
                     else:
                         self.assertEqual(uses, [])
 
+    def test_listed_and_comparing_repairs_refuse_an_alternate_motion(self):
+        """Build no listed or bank-comparing repair of an alternate motion, which no owner launches."""
+        state = tree_kinetic_state.get_state_kernel
+        for layout in _LAYOUTS:
+            with self.subTest(layout=layout.bodies):
+                with self.assertRaisesRegex(ValueError, "ordinary motion"):
+                    state(False, layout=layout, motion_velocity=True, listed=True)
+                with self.assertRaisesRegex(ValueError, "ordinary motion"):
+                    state(False, layout=layout, motion_velocity=True, bank_coordinates=layout.dofs + layout.free_roots)
+
     def test_only_listed_and_comparing_repairs_read_their_inputs(self):
-        """Read the block list only in the listed repairs and the bank only in the repair that compares banks."""
+        """Read the block list only in the listed repair and the bank only in the repair that compares banks."""
         wp.init()
         readers = {
-            "repair_blocks": ("repair_listed", "repair_listed_motion"),
-            "repair_count": ("repair_listed", "repair_listed_motion"),
+            "repair_blocks": ("repair_listed",),
+            "repair_count": ("repair_listed",),
             "bank": ("repair_banked",),
         }
         for layout in _LAYOUTS:
