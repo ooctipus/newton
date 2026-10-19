@@ -636,8 +636,9 @@ def _pushed_arm(device, limit):
     return model
 
 
-# Matrix-free routes that sweep dense velocity-limit rows (sparse factors and the propagation schedules are
-# covered by test_feather_pgs_sparse_velocity_limits and test_feather_pgs_fused_velocity_limit_ordering).
+# Matrix-free routes that sweep dense velocity-limit rows. Sparse factors and the propagation schedules roll out in
+# test_feather_pgs_sparse_velocity_limits and test_feather_pgs_fused_velocity_limit_ordering; the chain tests above
+# run the propagation full-iteration kernel and every response-block sweep class on their own.
 _DENSE_ROUTES = {
     "mf_gs": {"mf_gs_incremental_rows": 0},
     "incremental": {"mf_gs_incremental_rows": 32},

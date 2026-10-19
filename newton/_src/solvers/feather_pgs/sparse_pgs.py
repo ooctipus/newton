@@ -53,8 +53,7 @@ def _get_pgs_solve_sparse_kernel(
     adds a final articulated limit pass to each sweep, whose unrelaxed
     corrections under ``velocity_limit_law`` accumulate in the factor delta.
     It requires full ordered rows and no independent free-body response.
-    Seeded patch impulses
-    retain the ordinary delta semantics.
+    Seeded patch impulses retain the ordinary delta semantics.
     Independent free-body rows follow the articulated rows in every sweep,
     retaining their own response, capacity, friction law, and impulse buffer.
     ``active_rows`` selects point-contact normal/limit rows at sweep entry,
