@@ -9,7 +9,10 @@ barrel cylinders and ellipsoids (generic fallback), boxes hovering above every
 cell under them and boxes covering many cells.
 """
 
+import ast
+import copy
 import ctypes
+import inspect
 import os
 import unittest
 from unittest.mock import patch
@@ -19,6 +22,7 @@ import warp as wp
 
 import newton
 from newton._src.core.environment_flags import NEWTON_FLAGS
+from newton._src.geometry import heightfield_cells, heightfield_geometric, heightfield_lanes
 from newton._src.geometry.heightfield_geometric import PairProjection
 from newton._src.geometry.heightfield_lanes import CellWindow
 from newton._src.geometry.narrow_phase import NarrowPhase
@@ -77,6 +81,115 @@ def stream(narrow):
 def multiset(triples):
     """Sort (heightfield, shape, triangle) triples: equal results mean equal per-pair triangle multisets."""
     return triples[np.lexsort(triples.T[::-1])] if len(triples) else triples
+
+
+def function_source(module, name):
+    """Return the (possibly nested) function definition of this name in the module's source."""
+    tree = ast.parse(inspect.getsource(module))
+    return next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == name)
+
+
+class _Rename(ast.NodeTransformer):
+    """Rename variables; with ``inline``, also substitute earlier assignments and write vec3(x) as vec3(x, x, x)."""
+
+    def __init__(self, names, inline=None):
+        self.names, self.inline = names, inline
+
+    def visit_Name(self, node):
+        if self.inline is not None and node.id in self.inline:
+            return copy.deepcopy(self.inline[node.id])
+        return ast.Name(id=self.names.get(node.id, node.id), ctx=node.ctx)
+
+    def visit_Call(self, node):
+        node = self.generic_visit(node)
+        if self.inline is not None and ast.unparse(node.func) == "wp.vec3" and len(node.args) == 1:
+            node.args = [copy.deepcopy(node.args[0]) for _ in range(3)]
+        return node
+
+
+def statements_until(function, last, names=None):
+    """Return the function's leading assignments, up to the one that assigns ``last``, with variables renamed."""
+    found = []
+    for statement in function.body:
+        if isinstance(statement, ast.Assign):
+            found.append(ast.dump(_Rename(names or {}).visit(copy.deepcopy(statement))))
+            if any(isinstance(t, ast.Name) and t.id == last for t in statement.targets):
+                return found
+    raise AssertionError(f"{function.name} never assigns {last}")
+
+
+def dataflow(statements, outputs, names=None):
+    """Return each output's expression with every earlier assignment substituted, as AST dumps."""
+    values = {}
+    for statement in statements:
+        if not isinstance(statement, ast.Assign):
+            continue
+        target, value = statement.targets[0], statement.value
+        pairs = zip(target.elts, value.elts, strict=True) if isinstance(target, ast.Tuple) else ((target, value),)
+        for name, expression in pairs:
+            if isinstance(name, ast.Name):  # Field stores into the window struct are not intermediates.
+                values[name.id] = _Rename(names or {}, dict(values)).visit(copy.deepcopy(expression))
+    return [ast.dump(values[output]) for output in outputs]
+
+
+def boundary_model(device):
+    """One tilted, turned box over a plateau of a translated, turned heightfield.
+
+    The plateau top lies at world height 0, where a float32 step of the body's
+    height is a fraction of an ulp of the bounds in the heightfield frame. A corner
+    spike keeps the heightfield's broad-phase box above the shape and a low corner
+    keeps its height range wide; the box stays over plateau cells.
+    """
+    heights = np.full((7, 7), 0.35, dtype=np.float32)
+    heights[0, 0], heights[-1, -1] = 1.0, 0.0
+    builder = newton.ModelBuilder()
+    cfg = builder.ShapeConfig(margin=0.0025, gap=0.01)
+    terrain = newton.Heightfield(data=heights, nrow=7, ncol=7, hx=0.3, hy=0.3)
+    pose = wp.transform((0.3, -0.2, -0.35), wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 0.2))
+    builder.add_shape_heightfield(heightfield=terrain, xform=pose, cfg=cfg)
+    turn = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 0.5) * wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.15)
+    body = builder.add_body(xform=wp.transform_multiply(pose, wp.transform((0.02, 0.05, 0.5), turn)))
+    builder.add_shape_box(body=body, hx=0.07, hy=0.04, hz=0.03, cfg=cfg)
+    return builder.finalize(device=device)
+
+
+def height(bits):
+    """Return the float32 with this bit pattern."""
+    return np.int32(bits).view(np.float32)
+
+
+def emitted_at(owner, state, poses, z):
+    """Collide with the body at this float32 world height and return the emitted triangles."""
+    current = poses.copy()
+    current[0, 2] = z
+    state.body_q.assign(current)
+    owner.collide(state, owner.contacts())
+    # The broad phase keeps the pair at every height, so only the midphase decides.
+    assert int(owner.narrow_phase.shape_pairs_mesh_count.numpy()[0]) == 1
+    return set(map(tuple, stream(owner.narrow_phase)[0].tolist()))
+
+
+def emits_triangle(owner, state, poses, triangle=None):
+    """Return a height predicate: whether the owner emits this triangle, or any triangle when None."""
+
+    def holds(z):
+        triangles = emitted_at(owner, state, poses, z)
+        return bool(triangles) if triangle is None else triangle in triangles
+
+    return holds
+
+
+def last_height(holds, low, high):
+    """Bisect positive float32 heights: the bit pattern of the highest one at which ``holds`` is still true."""
+    low_bits, high_bits = (int(np.float32(z).view(np.int32)) for z in (low, high))
+    assert holds(height(low_bits)) and not holds(height(high_bits))
+    while high_bits - low_bits > 1:
+        middle = (low_bits + high_bits) // 2
+        if holds(height(middle)):
+            low_bits = middle
+        else:
+            high_bits = middle
+    return low_bits
 
 
 def deferred_stored(narrow):
@@ -304,6 +417,127 @@ class TestHeightfieldLaneMidphase(unittest.TestCase):
     def test_current_geometry_cuda(self):
         """Follow geometry edits and non-finite corners inside a replayed CUDA graph in both lane passes."""
         self.check_current_geometry("cuda:0")
+
+    def test_window_source_matches_original_midphases(self):
+        """Pin the lane window and cell vertices to the original cell and geometric midphases' source.
+
+        The lane passes run the original per-cell tests on a window that
+        ``_cell_window`` rebuilds; any drift between the copies would change which
+        cells a pair tests. The statements up to ``padding`` must equal the
+        original cell midphase's after renaming its shape indices (it alone also
+        assigns ``cols``), and the window bounds, height bound and padding must
+        equal the original geometric midphase's expressions after substituting
+        every intermediate variable.
+        """
+        window = function_source(heightfield_lanes, "_cell_window")
+        cell = function_source(heightfield_cells, "_heightfield_cell_midphase")
+        geometric = function_source(heightfield_geometric, "_geometric_midphase")
+        shapes = {"hfield_shape": "a", "other_shape": "b"}
+        expected = statements_until(cell, "padding", shapes)
+        cols = ast.dump(ast.parse("cols = hfd.ncol - 1").body[0])
+        self.assertEqual(expected.count(cols), 1)
+        expected.remove(cols)
+        self.assertEqual(statements_until(window, "padding"), expected)
+
+        outputs = ("col_min", "col_max", "row_min", "row_max", "aabb_lower", "padding")
+        arrays = {
+            "transforms": "shape_transform",
+            "lower": "shape_collision_aabb_lower",
+            "upper": "shape_collision_aabb_upper",
+            "data": "shape_data",
+            "gaps": "shape_gap",
+        }
+        lane_window = dataflow(window.body, outputs)
+        self.assertEqual(dataflow(cell.body, outputs, shapes), lane_window)
+        self.assertEqual(
+            dataflow(geometric.body, ("cmin", "cmax", "rmin", "rmax", "lo", "padding"), arrays), lane_window
+        )
+
+        # Cell vertices and spacing: the geometric midphase's loop body against _cell_survivors and both lane kernels.
+        loop = geometric.body[-1].body[0].body
+        vertices = ("v0", "v10", "v11", "v01")
+        self.assertEqual(
+            dataflow(function_source(heightfield_lanes, "_cell_survivors").body, vertices),
+            dataflow(loop, vertices, {"r": "row", "c": "col"}),
+        )
+        spacing = ("dx", "dy", "height_range")
+
+        def assigning(statements):
+            # Only the spacing statements: the kernels look hfd up per pair, the original takes it as an argument.
+            return [
+                statement
+                for statement in statements
+                if isinstance(statement, ast.Assign)
+                and {node.id for node in ast.walk(statement.targets[0]) if isinstance(node, ast.Name)} & set(spacing)
+            ]
+
+        expected = dataflow(assigning(geometric.body), spacing)
+        for name in ("heightfield_pairs", "heightfield_lanes"):
+            kernel = function_source(heightfield_lanes, name)
+            body = next(node for node in kernel.body if isinstance(node, ast.For)).body
+            self.assertEqual(dataflow(assigning(body), spacing), expected)
+
+    def check_window_boundaries(self, device):
+        """Match the original midphase within a few ulps of a cell height bound and of a separating-axis bound.
+
+        Bisection over the body's float32 height finds the highest height at which
+        the original cell midphase still emits a triangle, where the shape's
+        lower bound meets ``top + padding + 16 ulp * |top|`` of a cell. On the
+        geometric route it finds the highest height at which the original
+        midphase emits one triangle that its enclosing-box test separates just
+        above, while the cell midphase keeps that triangle's cell on both sides.
+        Over 24 float32 steps of the body's height on each side of each bound,
+        about 3 to 6 ulps of the bound in the heightfield frame, the lane midphase
+        with the device's schedule and with the window deferred to pass 2 must
+        emit the same triangles and raw contacts. On CUDA this checks that the
+        separately compiled passes round the bounds as the original kernel does.
+        """
+        model = boundary_model(device)
+        state = model.state()
+        poses = state.body_q.numpy().copy()
+        # The box penetrates the plateau at height 0 and clears every cell at 0.25 m.
+        low, high = 0.0, 0.25
+        cell_original = pipeline(model, "cell", False)
+        cell_bound = last_height(emits_triangle(cell_original, state, poses), low, high)
+        for route in ("cell", "geometric"):
+            with self.subTest(device=device, route=route):
+                original = pipeline(model, route, False)
+                device_schedule, deferred = pipeline(model, route, True), pipeline(model, route, True)
+                deferred.narrow_phase._set_lane_schedule(0, 4)
+                bound, triangle = cell_bound, None
+                if route == "geometric":
+                    # Just below the cell bound every window cell passes the height test; pick a triangle
+                    # that the enclosing-box test separates there but keeps 4 cm lower.
+                    above, below = height(cell_bound) - 0.0005, height(cell_bound) - 0.04
+                    kept = emitted_at(cell_original, state, poses, above)
+                    separated = kept - emitted_at(original, state, poses, above)
+                    candidates = sorted(separated & emitted_at(original, state, poses, below))
+                    self.assertTrue(candidates)
+                    triangle = candidates[0]
+                    bound = last_height(emits_triangle(original, state, poses, triangle), below, above)
+                    for offset in (0, 1):
+                        self.assertIn(triangle, emitted_at(cell_original, state, poses, height(bound + offset)))
+                holds = emits_triangle(original, state, poses, triangle)
+                self.assertTrue(holds(height(bound)))
+                self.assertFalse(holds(height(bound + 1)))
+                # A body step is 1/8 to 1/4 ulp of the bounds: this scans about 3-6 bound ulps on each side.
+                for offset in range(-24, 25):
+                    with self.subTest(steps=offset):
+                        z = height(bound + offset)
+                        emitted_at(original, state, poses, z)
+                        for owner in (device_schedule, deferred):
+                            emitted_at(owner, state, poses, z)
+                            self.assert_same_stream(original, owner, ordered=False)
+                        self.assertEqual(deferred_stored(deferred.narrow_phase), 1)
+
+    def test_window_boundaries_cpu(self):
+        """Match the original midphase at ulp-level cell and separating-axis bounds on CPU."""
+        self.check_window_boundaries("cpu")
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
+    def test_window_boundaries_cuda(self):
+        """Match the original midphase at ulp-level bounds on CUDA, where each pass is compiled separately."""
+        self.check_window_boundaries("cuda:0")
 
     def test_deferred_storage_overflow_cpu(self):
         """Walk pairs in place once the deferred storage is full."""

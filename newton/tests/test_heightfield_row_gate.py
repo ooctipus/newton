@@ -144,14 +144,14 @@ def raw_buffer(narrow):
     reducer = narrow.global_contact_reducer
     count = int(reducer.contact_count.numpy()[0])
     assert 0 <= count < reducer.capacity
-    rows = slice(1, count + 1)
+
+    def bits(array):
+        values = array.numpy()[1 : count + 1]
+        return values.view(np.uint32).reshape(count, int(np.prod(values.shape[1:], dtype=int)))
+
     return np.concatenate(
-        (
-            reducer.shape_pairs.numpy()[rows].view(np.uint32).reshape(count, -1),
-            reducer.contact_fingerprints.numpy()[rows].view(np.uint32).reshape(count, -1),
-            reducer.position_depth.numpy()[rows].view(np.uint32).reshape(count, -1),
-            reducer.normal.numpy()[rows].view(np.uint32).reshape(count, -1),
-        ),
+        [bits(array) for array in (reducer.shape_pairs, reducer.contact_fingerprints, reducer.position_depth)]
+        + [bits(reducer.normal)],
         axis=1,
     )
 

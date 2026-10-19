@@ -127,8 +127,10 @@ def _cell_window(
     """Build the original midphase range and height bound.
 
     The statements up to ``padding`` repeat ``_heightfield_cell_midphase``'s range
-    construction, which the geometric midphase also uses, so every cell sees the
-    same bound in both midphases.
+    construction statement for statement; ``_geometric_midphase`` computes the
+    same window with identical arithmetic under other names. Every cell therefore
+    sees the bound of the midphase it replaces. test_heightfield_lane_midphase
+    pins both copies.
     """
     X_hfield_ws = shape_transform[a]
     X_other_ws = shape_transform[b]
