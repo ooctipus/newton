@@ -17,7 +17,8 @@ whose velocity-scaled changes fit the tolerance. Before that sweep it runs
 exactly the exact-law sweeps, so its outputs equal the exact law's at that
 budget, and the trace of an exact solve predicts that sweep for every grid
 tolerance. On the solver routes the trace changes no result and records every
-solve once per grid tolerance, and a tolerance reaches every counted sweep.
+solve once per grid tolerance, and a tolerance compiled into every counted
+sweep keeps the trajectory near the exact law's in no more sweeps.
 """
 
 import unittest
@@ -784,25 +785,58 @@ class TestSolveReadoutRoutes(unittest.TestCase):
                         self.assertEqual(sum(trace["reasons"].values()), slot["solves"])
                         self.assertEqual(sum(kind["count"] for kind in trace["final_change"].values()), slot["solves"])
 
-    def test_tolerance_reaches_every_counted_sweep(self):
-        """Compile a velocity tolerance into every counted local, paired and matrix-free sweep, and step on it."""
+    def test_tolerance_stays_near_the_exact_law_in_fewer_sweeps(self):
+        """Step every policy route under a velocity tolerance beside the exact law: near it, in no more sweeps.
+
+        From one state on shared contacts, a 1e-3 tolerance compiled into every counted sweep must keep
+        every joint velocity within 1e-2 of the exact law's over 12 steps, count every world-solve once,
+        execute no more sweeps than the exact law on the route (and per route label whose solve count
+        matches), and fewer on at least one route.
+        """
+        steps, tolerance = 12, 1.0e-3
+        savings = {}
         for route in _policy_routes():
-            with self.subTest(labels=sorted(route["labels"])):
-                variant = {"pgs_solve_readout": "sweeps", "pgs_velocity_change_tolerance": 1.0e-3}
+            name = "+".join(sorted(route["labels"]))
+            with self.subTest(route=name):
+                variants = [
+                    {"pgs_solve_readout": "sweeps"},
+                    {"pgs_solve_readout": "sweeps", "pgs_velocity_change_tolerance": tolerance},
+                ]
                 with warnings.catch_warnings():
                     # A route's fixed-iteration sweeps keep their own law, about which the solver may warn.
                     warnings.simplefilter("ignore", UserWarning)
-                    (solver,) = self._solvers(route, [variant])
-                counted = solver._solve_readout.kernels
+                    exact, loose = self._solvers(route, variants)
+                counted = loose._solve_readout.kernels
                 self.assertTrue(set(counted.values()) & route["labels"], counted)
-                law = solver.get_path_selection()["routes"]["sweep"]["exit_law"]
+                law = loose.get_path_selection()["routes"]["sweep"]["exit_law"]
                 self.assertEqual((law["law"], law["declined"]), ("velocity", {}))
                 self.assertEqual(set(law["honored"]), set(counted))
-                for step, (state,) in self._steps(route, [solver], steps=4):
-                    for name in STATE_FIELDS:
-                        self.assertTrue(np.isfinite(getattr(state, name).numpy()).all(), f"{name} at step {step}")
-                summary = solver.get_path_selection()["measurements"]["solve_readout"]
-                self._assert_owned(route, summary, 4)
+                deviation = 0.0
+                for step, (exact_state, loose_state) in self._steps(route, [exact, loose], steps):
+                    for field in STATE_FIELDS:
+                        self.assertTrue(np.isfinite(getattr(loose_state, field).numpy()).all(), f"{field} at {step}")
+                    difference = loose_state.joint_qd.numpy() - exact_state.joint_qd.numpy()
+                    deviation = max(deviation, float(np.abs(difference).max()))
+                self.assertLess(deviation, 1.0e-2)
+                totals = []
+                for solver in (exact, loose):
+                    summary = solver.get_path_selection()["measurements"]["solve_readout"]
+                    self._assert_owned(route, summary, steps)
+                    by_label = {}
+                    for slot in summary["slots"]:
+                        solves, sweeps = by_label.get(slot["route"], (0, 0))
+                        executed = sum(count * sweep for sweep, count in enumerate(slot["sweeps"]))
+                        by_label[slot["route"]] = (solves + slot["solves"], sweeps + executed)
+                    totals.append(by_label)
+                exact_totals, loose_totals = totals
+                for label, (solves, sweeps) in loose_totals.items():
+                    if solves and exact_totals.get(label, (0, 0))[0] == solves:
+                        self.assertLessEqual(sweeps, exact_totals[label][1], label)
+                savings[name] = sum(sweeps for _, sweeps in exact_totals.values()) - sum(
+                    sweeps for _, sweeps in loose_totals.values()
+                )
+                self.assertGreaterEqual(savings[name], 0)
+        self.assertTrue(any(saving > 0 for saving in savings.values()), savings)
 
 
 if __name__ == "__main__":
