@@ -1799,18 +1799,21 @@ class TestPatchParallelRoutes(unittest.TestCase):
     def test_limited_linked_tiers_take_the_last_word_on_request(self):
         """Build the last-word pass into velocity-limited linked tiers only on request, record it, and hold the limit.
 
-        A sphere whose joints are limited to 0.5 starts sliding at 1.0. Only the
-        pass promises the limit: a tier without it ends wherever its sweep budget
-        or tolerance stops it, so at the default budget (24 sweeps to a tolerance
-        of 1e-4) whether it holds the limit to 1e-5 turns on the sweep at which it
-        exits. Truncated to two sweeps (tolerance 0), the tier without the pass
-        must leave the sphere at least 5 % past its limit, or the fixture cannot
-        show what the pass does (the float64 reference on the first step's rows:
-        44 %); the pass holds it to 1e-5.
+        A constant joint force pushes a resting sphere, whose joints are limited to
+        0.5, by twice its limit within every step (:func:`_pushed_sphere`): without
+        limit rows two steps carry it past twice the limit. A sphere that starts past
+        its limit cannot show the pass, because the pre-solve prescale puts it on the
+        limit and its limit rows never bind. Only the pass promises the limit: a tier
+        without it stops where its budget or tolerance leaves it (24 sweeps to 1e-4:
+        1.9e-5 past after the first step in the float64 reference), while the pass
+        holds it to 1e-5. Truncated to two sweeps (tolerance 0), the tier without the
+        pass must leave the sphere at least 5 % past its limit, or the fixture cannot
+        show what the pass does, and the pass must hold it to 1e-5 (the reference on
+        the CPU rows of test_last_word_holds_a_pushed_sphere_at_its_limit: 43.5 % and
+        1.7e-6 past).
         """
         limit = 0.5
-        model = _sliding_sphere("cuda:0", (newton.Axis.X, newton.Axis.Y, newton.Axis.Z), (3.0, 0.01, 1.0), (1.0, 1.0))
-        model.joint_velocity_limit.assign(np.full(model.joint_dof_count, limit, np.float32))
+        model = _pushed_sphere("cuda:0", limit=limit)
         built = {}
         with patch.dict(os.environ, {_SWITCH: "1"}):
             for limits, requested in itertools.product((False, True), repeat=2):
@@ -1843,10 +1846,14 @@ class TestPatchParallelRoutes(unittest.TestCase):
                 self.assertEqual(selected["routes"]["sweep"]["tiers"]["velocity_limit_pass"], last_word)
                 self.assertEqual(selected["options"]["mf_gs_parallel_linked_velocity_limit_pass"]["applied"], last_word)
                 state, _ = _rollout(model, solver, 2)
+                _assert_tier_owned(self, solver, 32)
                 for name in _STATE_FIELDS:
                     self.assertTrue(np.isfinite(getattr(state, name).numpy()).all(), name)
-                if last_word:
-                    self.assertLessEqual(float(np.max(np.abs(state.joint_qd.numpy()[:2]))), limit * (1.0 + 1.0e-5))
+                speed = float(np.max(np.abs(state.joint_qd.numpy()[:2])))
+                if not limits:
+                    self.assertGreater(speed, 2.0 * limit, "the push must carry an unlimited sphere past its limit")
+                elif requested:
+                    self.assertLessEqual(speed, limit * (1.0 + 1.0e-5))
         speeds = {}
         for requested, solver in truncated.items():
             keys = [kernel.key for kernel in solver._pgs_solve_mf_gs_incremental_kernels]
