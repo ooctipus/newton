@@ -38,6 +38,8 @@ DROPPED_FIELDS = ("body_q_com", "body_v_s", "body_a_s", "body_f_s", "body_I_s", 
 # CUDA bounds against the prismatic linear state route: the keys' are that route's own A/B
 # tolerances (FMA contraction); the arm leaves the serial route for the held owner's float order.
 KEY_BOUND = {"rtol": 3.0e-5, "atol": 5.0e-6}
+# Key-only contact impulses [N·s] (1e-4 to 1e-2 per step in these tests) at the keys' relative bound.
+IMPULSE_BOUND = {"rtol": KEY_BOUND["rtol"], "atol": 1.0e-8}
 ARM_BOUND = {"rtol": 1.0e-4, "atol": 1.0e-4}
 # Coordinates of the fixtures' arm. A star of as many leaves shares the arm's size group, which is
 # then not diagonal: the recipe refuses its prismatic linear state and no scalar plan exists.
@@ -1221,6 +1223,43 @@ def _close(test, expected, actual, index, tag, *, rtol, atol):
     np.testing.assert_allclose(actual, expected, rtol=rtol, atol=atol, err_msg=tag)
 
 
+def _normal_impulses(test, solver, count):
+    """The solved normal impulse [N·s] of each of the first ``count`` contacts, in contact order."""
+    world, slot = solver.contact_world.numpy()[:count], solver.contact_slot.numpy()[:count]
+    test.assertTrue(np.all(slot >= 0), "every held contact owns a row")
+    return solver.impulses.numpy()[world, slot].astype(np.float64)
+
+
+def _key_law(model, leaves, dofs, axes, q, qd, steps, push=None):
+    """Integrate keys by their scalar law in float64 and return their coordinates after each step.
+
+    Without contacts or active limits a prismatic key of mass ``m`` and unit
+    motion axis ``S`` on a fixed root follows the implicit drive of zero targets
+    with its passive spring and damping and gravity along the axis:
+    ``(m |S|^2 + armature + ke dt^2 + kd dt) (qd' - qd) / dt = m S.g + push
+    + spring (ref - q) - damping qd - (ke (q + dt qd) + kd qd)``, then
+    ``q' = q + dt qd'``. ``push(step)`` gives a step's external generalized force.
+    """
+    m = model.body_mass.numpy()[leaves].astype(np.float64)
+    ke = model.joint_target_ke.numpy()[dofs].astype(np.float64)
+    kd = model.joint_target_kd.numpy()[dofs].astype(np.float64)
+    spring = model.joint_spring_stiffness.numpy()[dofs].astype(np.float64)
+    reference = model.joint_spring_ref.numpy()[dofs].astype(np.float64)
+    damping = model.joint_damping.numpy()[dofs].astype(np.float64)
+    armature = model.joint_armature.numpy()[dofs].astype(np.float64)
+    inertia = m * np.sum(axes * axes, axis=1) + armature + ke * DT * DT + kd * DT
+    weight = m * (axes @ model.gravity.numpy()[0].astype(np.float64))
+    q, qd = np.array(q, dtype=np.float64), np.array(qd, dtype=np.float64)
+    coordinates = []
+    for step in range(steps):
+        force = 0.0 if push is None else push(step)
+        drive = -(ke * (q + DT * qd) + kd * qd)
+        qd = qd + DT * (weight + force + spring * (reference - q) - damping * qd + drive) / inertia
+        q = q + DT * qd
+        coordinates.append(q.copy())
+    return np.asarray(coordinates)
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "Scalar branches run on the CUDA held-tree owner")
 class TestScalarBranchOwner(unittest.TestCase):
     def _poison(self, solver, bodies, dofs):
@@ -1263,13 +1302,13 @@ class TestScalarBranchOwner(unittest.TestCase):
         """Own 108-key worlds as scalar branches beside a held arm and track the prismatic linear state route.
 
         The held-tree plan caps a group at 64 bodies, so the recipe's route had no
-        owner for this keyboard-shaped model. Keys stay within the FMA bound of
-        the prismatic linear state route through floor contacts, the mass
-        cadence, an inertial and drive notification, a masked reset after a
-        coordinate write, a root re-pose and captured graphs with masked and full
-        resets; the arm moves to the held owner's float order. The FK/ID fields
-        the family stops writing hold NaN for its bodies throughout, so nothing
-        on the route reads them.
+        owner for this keyboard-shaped model. Keys and their floor-contact
+        impulses stay within the FMA bound of the prismatic linear state route
+        through the mass cadence, an inertial and drive notification, a masked
+        reset after a coordinate write, a root re-pose and captured graphs with
+        masked and full resets; the arm moves to the held owner's float order.
+        The FK/ID fields the family stops writing hold NaN for its bodies
+        throughout, so nothing on the route reads them.
         """
         device = wp.get_device("cuda:0")
         model = build_branch_model(device, worlds=4, leaves=KEYBOARD_LEAVES, shapes=True)
@@ -1340,11 +1379,16 @@ class TestScalarBranchOwner(unittest.TestCase):
                 f"{tag} minv",
                 **KEY_BOUND,
             )
+            # The floor contacts are key-only rows: their impulses follow the head's within FMA contraction.
+            impulses = [_normal_impulses(self, solver, len(floors)) for solver in solvers]
+            np.testing.assert_allclose(impulses[1], impulses[0], err_msg=f"{tag} impulses", **IMPULSE_BOUND)
+            loads.append(float(impulses[0].max()))
             for solver in solvers:
                 solver.check_constraint_capacity()
                 self.assertGreater(int(solver.constraint_count.numpy().sum()), 0)
             self.assertEqual(int(sum(int(group.status.numpy().sum()) for group in owner.groups[:-1])), 0)
 
+        loads = []
         mask = wp.array([True] + [False] * (worlds - 1), dtype=wp.bool, device=device)
         for step in range(10):
             inputs(step + 1)
@@ -1391,6 +1435,8 @@ class TestScalarBranchOwner(unittest.TestCase):
             for graph in graphs:
                 wp.capture_launch(graph)
             compare(f"replay {replay}")
+        # The comparison is not vacuous: the floors carried the keys.
+        self.assertGreater(max(loads), 0.0)
 
     def test_drive_kernel_covers_only_the_other_dofs(self):
         """Launch the drive preparation over the DOFs outside the branches only; the branches fold theirs.
@@ -1472,33 +1518,112 @@ class TestScalarBranchOwner(unittest.TestCase):
                 )
         travel = np.asarray(travel, dtype=np.float64)
         np.testing.assert_allclose(travel[1], travel[0], rtol=1.0e-5, atol=1.0e-8)
-        # The same discrete law in float64.
-        dofs = layout.key_dofs
-        m = model.body_mass.numpy()[layout.key_leaves].astype(np.float64)
-        ke = model.joint_target_ke.numpy()[dofs].astype(np.float64)
-        kd = model.joint_target_kd.numpy()[dofs].astype(np.float64)
-        spring = model.joint_spring_stiffness.numpy()[dofs].astype(np.float64)
-        reference = model.joint_spring_ref.numpy()[dofs].astype(np.float64)
-        damping = model.joint_damping.numpy()[dofs].astype(np.float64)
-        inertia = (
-            m * np.sum(axes * axes, axis=1)
-            + model.joint_armature.numpy()[dofs].astype(np.float64)
-            + ke * DT * DT
-            + kd * DT
+        # The same discrete law in float64; the press is the force's projection on each axis.
+        pressing = -1.5 * np.linalg.norm(axes, axis=1)
+        rest = np.zeros(len(layout.key_dofs))
+        expected = _key_law(
+            model,
+            layout.key_leaves,
+            layout.key_dofs,
+            axes,
+            rest,
+            rest,
+            press + release,
+            push=lambda step: pressing if 0 < step <= press else 0.0,
         )
-        weight = m * (axes @ model.gravity.numpy()[0].astype(np.float64))
-        q, qd = np.zeros(len(dofs)), np.zeros(len(dofs))
-        expected = []
-        for step in range(press + release):
-            pressing = -1.5 * np.linalg.norm(axes, axis=1) if 0 < step <= press else 0.0
-            drive = -(ke * (q + DT * qd) + kd * qd)
-            qd = qd + DT * (weight + pressing + spring * (reference - q) - damping * qd + drive) / inertia
-            q = q + DT * qd
-            expected.append(q.copy())
-        expected = np.asarray(expected)
         self.assertGreater(float(np.abs(expected).max()), 2.0e-3)
         for index in range(2):
             np.testing.assert_allclose(travel[index], expected, rtol=1.0e-4, atol=2.0e-6)
+
+    def test_pusher_press_matches_the_prismatic_route(self):
+        """Press a key with a kinematic pusher: travel and impulses follow the head, the spring-back the key law.
+
+        The pusher is a frictionless world contact above one key per world; its
+        witness descends at constant speed, holds and then leaves. The contact is
+        key-only (one sparse coordinate), so both routes solve the same row from
+        the same motion axis, origin and inverse mass and differ by FMA
+        contraction alone: travel and normal impulses within 1e-5 relative. Once
+        the pusher leaves, each key springs back by its scalar law, integrated in
+        float64 from the state it was released in.
+        """
+        device = wp.get_device("cuda:0")
+        model = build_branch_model(device, worlds=2, leaves=PRESS_LEAVES, shapes=True)
+        layout = _Layout(model)
+        worlds = model.world_count
+        lower, upper = model.joint_limit_lower.numpy(), model.joint_limit_upper.numpy()
+        lower[layout.key_dofs], upper[layout.key_dofs] = -0.5, 0.5
+        model.joint_limit_lower.assign(lower)
+        model.joint_limit_upper.assign(upper)
+        model.joint_q.zero_()
+        model.joint_qd.zero_()
+        # Frictionless keys: the pusher's normal impulse alone moves a key along its axis.
+        mu = model.shape_material_mu.numpy()
+        mu[np.isin(model.shape_body.numpy(), layout.key_leaves)] = 0.0
+        model.shape_material_mu.assign(mu)
+        model.rigid_contact_max = worlds
+        solvers = [recipe_solver(model, scalar=False), recipe_solver(model, scalar=True)]
+        self._assert_routes(*solvers)
+        states = [[model.state(), model.state()] for _ in solvers]
+        controls = [model.control() for _ in solvers]
+        contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]
+        for control, contact, pair in zip(controls, contacts, states, strict=True):
+            control.joint_target_q.zero_()
+            control.joint_target_qd.zero_()
+            contact.rigid_contact_count.zero_()
+            newton.eval_fk(model, pair[0].joint_q, pair[0].joint_qd, pair[0])
+
+        def advance():
+            for index, solver in enumerate(solvers):
+                current, following = states[index]
+                current.clear_forces()
+                solver.step(current, following, controls[index], contacts[index], DT)
+                states[index] = [following, current]
+
+        # A free step publishes the motion axes; the pusher presses the key closest to vertical.
+        advance()
+        axes = solvers[1].joint_S_s.numpy()[layout.key_dofs, :3].astype(np.float64)
+        np.testing.assert_allclose(solvers[0].joint_S_s.numpy()[layout.key_dofs, :3], axes, rtol=1.0e-6, atol=1.0e-7)
+        key = int(np.argmax(np.abs(axes[:PRESS_LEAVES, 2])))
+        self.assertGreater(abs(axes[key, 2]), 0.5)
+        pressed = layout.key_leaves.reshape(worlds, -1)[:, key]
+        coordinates = layout.key_coordinates.reshape(worlds, -1)[:, key]
+        dofs = layout.key_dofs.reshape(worlds, -1)[:, key]
+        # Both routes see one pusher: zero gap at the head's key, its normal from the key up to the pusher.
+        for contact in contacts:
+            install_held_contacts(model, states[0][0], contact, [(int(body), -1) for body in pressed])
+            contact.rigid_contact_normal.assign(np.tile(np.array([0.0, 0.0, 1.0], np.float32), (worlds, 1)))
+        top = contacts[0].rigid_contact_point1.numpy().copy()
+        rate, descend, hold, release = 1.0e-4, 16, 8, 40
+        travel, impulses = [[], []], [[], []]
+        for step in range(descend + hold):
+            depth = rate * min(step + 1, descend)
+            for contact in contacts:
+                contact.rigid_contact_point1.assign(top - np.array([0.0, 0.0, depth], np.float32))
+            advance()
+            for index, solver in enumerate(solvers):
+                impulses[index].append(_normal_impulses(self, solver, worlds))
+                travel[index].append(states[index][0].joint_q.numpy()[coordinates].copy())
+        released = [(state[0].joint_q.numpy()[coordinates], state[0].joint_qd.numpy()[dofs]) for state in states]
+        for contact in contacts:
+            contact.rigid_contact_count.zero_()
+        spring = [[], []]
+        for _step in range(release):
+            advance()
+            for index in range(2):
+                spring[index].append(states[index][0].joint_q.numpy()[coordinates].copy())
+        travel, impulses, spring = (np.asarray(values, dtype=np.float64) for values in (travel, impulses, spring))
+        for values in (travel, impulses, spring):
+            self.assertTrue(np.all(np.isfinite(values)))
+        # The pusher holds each key against its drive, deeper than the key sags under gravity.
+        self.assertTrue(np.all(impulses[:, descend:] > 0.0))
+        self.assertTrue(np.all(np.abs(travel[:, -1]) > 1.0e-3))
+        np.testing.assert_allclose(impulses[1], impulses[0], rtol=1.0e-5, atol=1.0e-9)
+        np.testing.assert_allclose(travel[1], travel[0], rtol=1.0e-5, atol=1.0e-9)
+        np.testing.assert_allclose(spring[1], spring[0], rtol=1.0e-5, atol=1.0e-9)
+        pressed_axes = axes.reshape(worlds, -1, 3)[:, key]
+        for index in range(2):
+            expected = _key_law(model, pressed, dofs, pressed_axes, *released[index], release)
+            np.testing.assert_allclose(spring[index], expected, rtol=1.0e-4, atol=1.0e-7)
 
     def test_gripper_contact_matches_the_prismatic_route(self):
         """Press a key with the arm's tip through a contact: key travel and impulses track the head route.
