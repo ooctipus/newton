@@ -329,11 +329,18 @@ class TestVelocityExitLaw(unittest.TestCase):
             self.assertEqual(kernel._fpgs_solve_readout, "sweeps")
 
     def test_active_rows_wait_for_violated_rows_under_a_tolerance(self):
-        """Stop an active-row sparse sweep under a tolerance only after a scan bounds every unvisited violation."""
+        """Stop an active-row sparse sweep under a tolerance only after a scan bounds every unvisited violation.
+
+        The bound is the velocity change a visit would make, the violation times the relaxation factor, in
+        the law and in the trace alike.
+        """
         kernel = _get_pgs_solve_sparse_kernel.__wrapped__(48, 18, 12, active_rows=True, solve_policy=VELOCITY)
         snippet = _policy_snippet(self, kernel, "0.001f")
         self.assertIn("if (sweep_stop) {", snippet)
         self.assertIn("sweep_stop = sweep_violation <= 0.001f;", snippet)
+        traced = _get_pgs_solve_sparse_kernel.__wrapped__(48, 18, 12, active_rows=True, solve_policy=TRACE)
+        for text in (snippet, _policy_snippet(self, traced, "solve_trace_sweep(")):
+            self.assertTrue("? omega * fmaxf(-residual, 0.0f) :" in text, "the unvisited-row bound ignores omega")
         full = _get_pgs_solve_sparse_kernel.__wrapped__(48, 18, 12, solve_policy=VELOCITY)
         self.assertNotIn("sweep_violation", _policy_snippet(self, full, "0.001f"))
         exact = _get_pgs_solve_sparse_kernel.__wrapped__(48, 18, 12, active_rows=True, solve_policy=SWEEPS)

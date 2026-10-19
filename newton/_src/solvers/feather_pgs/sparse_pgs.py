@@ -111,8 +111,9 @@ def _get_pgs_solve_sparse_kernel(
     ``solve_policy`` compiles the sweep's stopping rule and readout
     (:mod:`solve_policy`); a readout appends its operand after ``support``.
     Under a velocity tolerance an active-row sweep also bounds, before it
-    stops, the violation of every zero-impulse unilateral row, which its scan
-    may have left unvisited.
+    stops, the velocity change a visit would make to every zero-impulse
+    unilateral row (its violation times ``omega``), which its scan may have
+    left unvisited.
     """
     M, D, S = int(max_constraints), int(max_world_dofs), int(max_row_dofs)
     F = int(mf_max_constraints)
@@ -653,7 +654,7 @@ def _get_pgs_solve_sparse_kernel(
     violation = None
     if active_rows:
         # Rows unselected at sweep entry are not visited: a zero-impulse unilateral row's violation
-        # is the velocity change its visit would make, so a tolerance also bounds it.
+        # times omega is the velocity change its visit would make, so a tolerance also bounds it.
         violation = (
             f"""float sweep_violation = 0.0f;
 int sweep_violation_kind = -1;
@@ -668,7 +669,7 @@ for (int first = 0; first < count; first += 32) {{
             if (index >= 0) dot += row_factor.data[row_base + row * {S} + entry] * delta[index];
         }}
         const float residual = dot + rhs[row];
-        const float excess = isfinite(residual) ? fmaxf(-residual, 0.0f) : __int_as_float(0x7f800000);
+        const float excess = isfinite(residual) ? omega * fmaxf(-residual, 0.0f) : __int_as_float(0x7f800000);
         if (excess > sweep_violation) {{
             sweep_violation = excess;
             sweep_violation_kind = kind;

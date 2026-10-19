@@ -377,22 +377,36 @@ class TestSolveReadoutKernels(unittest.TestCase):
                                 np.testing.assert_array_equal(actual_array, expected_array)
 
     def test_active_rows_wait_for_a_violated_unvisited_row(self):
-        """Keep sweeping while a row the active scan skipped is violated beyond the tolerance."""
+        """Keep sweeping while the visit of a row the active scan skipped would change it beyond the tolerance.
+
+        The first sweep visits only the first row: its velocity-scaled change is ``omega`` and it leaves
+        the second row violated by ``3 * omega - 0.5``, which a visit would change by ``omega`` times
+        that. At ``omega = 1`` that is 2.5, beyond a tolerance of 1.5, so the world sweeps on. At
+        ``omega = 0.5`` it is 0.5, within a tolerance of 0.75, so the world stops after the first sweep,
+        although the second row's violation itself (1) exceeds the tolerance.
+        """
         device = wp.get_device("cuda:0")
-        case = _SparseCase(device, _violation_problem(), {"active_rows": True}, 0, 0, 1.0)
-        outputs = []
-        for budget in range(BUDGET + 1):
-            case.run(case.kernel(), budget)
-            outputs.append(case.read())
-        # The first sweep changes only the first row, by 1 in velocity, and leaves the second violated by 2.5.
-        first = outputs[1][0][1] - outputs[0][0][1]
-        np.testing.assert_allclose(np.abs(first) * np.array([1.0, 10.0]), [1.0, 0.0], rtol=1.0e-5)
-        operand = _readout(device, case.worlds)
-        case.run(case.kernel(SolvePolicy(readout="sweeps", velocity_change_tolerance=1.5)), BUDGET, operand)
-        executed = int(np.flatnonzero(operand.sweeps.numpy()[:, 0])[0])
-        self.assertGreater(executed, 1)
-        for actual_array, expected_array in zip(case.read()[0], outputs[executed][0], strict=True):
-            np.testing.assert_array_equal(actual_array, expected_array)
+        rows = _violation_problem()[2]
+        for omega, tolerance, violation in ((1.0, 1.5, 2.5), (0.5, 0.75, 1.0)):
+            with self.subTest(omega=omega):
+                case = _SparseCase(device, _violation_problem(), {"active_rows": True}, 0, 0, omega)
+                outputs = []
+                for budget in range(BUDGET + 1):
+                    case.run(case.kernel(), budget)
+                    outputs.append(case.read())
+                delta, impulses = outputs[1][0]
+                np.testing.assert_allclose(impulses * np.array([1.0, 10.0]), [omega, 0.0], rtol=1.0e-5)
+                np.testing.assert_allclose(rows[1] @ delta + 0.5, -violation, rtol=1.0e-5)
+                operand = _readout(device, case.worlds)
+                policy = SolvePolicy(readout="sweeps", velocity_change_tolerance=tolerance)
+                case.run(case.kernel(policy), BUDGET, operand)
+                executed = int(np.flatnonzero(operand.sweeps.numpy()[:, 0])[0])
+                if omega * violation > tolerance:
+                    self.assertGreater(executed, 1)
+                else:
+                    self.assertEqual(executed, 1)
+                for actual_array, expected_array in zip(case.read()[0], outputs[executed][0], strict=True):
+                    np.testing.assert_array_equal(actual_array, expected_array)
 
     def test_local_counts_sweeps_to_the_stationary_exit(self):
         """Count only the owned world's sweeps to its first stationary sweep, with bitwise outputs."""

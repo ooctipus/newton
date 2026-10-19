@@ -13,9 +13,19 @@ policies existed.
 one: a row is quiet when its impulse change times its effective-mass
 diagonal, ``|dlambda| * A_ii`` (the change of the row's own velocity), is at
 most the tolerance. Sweeps that visit only rows selected at sweep entry also
-require every zero-impulse unilateral row to be violated by at most the
-tolerance, the change its visit would make. At zero tolerance the emitters
-return each sweep's own exact text.
+require the change a visit would make to every zero-impulse unilateral row,
+its violation times the relaxation factor, to be at most the tolerance. At
+zero tolerance the emitters return each sweep's own exact text.
+
+Without the native sparse sweeps' run-time impulse tolerances
+(``pgs_change_tolerance`` and ``pgs_relative_change_tolerance``) a solve
+under the velocity law runs the exact law's sweeps and stops at or before the
+sweep where the exact law stops, so its outputs are the exact law's at that
+sweep, and the trace of an exact solve predicts that sweep for every
+tolerance of its grid. The impulse tolerances let the exact law stop with
+nonzero changes: the trace records changes without that slack, so it no
+longer predicts the stop, and the unvisited-row bound, which has no slack,
+can add sweeps.
 
 With ``readout="sweeps"`` each sweep also counts, per world, how many sweeps
 every solve executed; ``readout="trace"`` adds, per solve, the sweep at which
@@ -241,7 +251,8 @@ def vote(
     Under the exact law without trace the sweep's own vote is returned
     unchanged. A positive tolerance votes when some term's velocity-scaled
     change exceeds it; the sweep keeps applying every nonzero change to the
-    velocity. The trace records each term's velocity-scaled change.
+    velocity. The trace records each term's velocity-scaled change, without
+    the term's slack.
 
     Args:
         policy: The sweep's solve policy.
@@ -303,9 +314,11 @@ def sweep_exit(
         gate: Condition under which a quiet sweep may stop the world (delayed friction), or ``None``.
         violation: For sweeps that visit only rows selected at sweep entry,
             ``(code, value, kind)``: warp-uniform statements that set the float
-            ``value`` to the largest violation of a zero-impulse unilateral row
-            and the int ``kind`` to its constraint type. A positive tolerance
-            stops only when ``value`` is within it; the exact law implies it.
+            ``value`` to the largest velocity change a visit of a zero-impulse
+            unilateral row would make (its violation times the relaxation
+            factor) and the int ``kind`` to that row's constraint type. A
+            positive tolerance stops only when ``value`` is within it; without
+            run-time impulse tolerances the exact law implies it.
         world: World index expression.
         iteration: Zero-based sweep index within this launch.
         iterations: Sweep budget of this launch.

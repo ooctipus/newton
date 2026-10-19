@@ -1835,7 +1835,9 @@ class SolverFeatherPGS(SolverBase):
                 and whether it stopped before its budget; ``"trace"`` adds, per solve, the sweep at
                 which each velocity tolerance from 1e-7 to 1e-1 [m/s or rad/s] would have stopped it,
                 its exit reason, and the largest velocity-scaled change of its final sweep with that
-                row's kind. ``get_path_selection()`` summarizes them under
+                row's kind; it records changes without the impulse slack of ``pgs_change_tolerance``
+                and ``pgs_relative_change_tolerance``, so its stops predict runs with both at zero.
+                ``get_path_selection()`` summarizes them under
                 ``measurements["solve_readout"]``, which synchronizes the device once. Neither
                 readout changes a computed value. The sparse, sparse-diagonal, matrix-free
                 Gauss-Seidel, paired factor, local and incremental sweeps count; the others run
@@ -1844,9 +1846,12 @@ class SolverFeatherPGS(SolverBase):
                 Gauss-Seidel sweeps [m/s or rad/s]. A sweep stops a world once no row's impulse change
                 times its effective-mass diagonal, ``|dlambda| * A_ii`` (the change of the row's own
                 velocity), exceeds the tolerance; sweeps that visit only the rows selected at sweep
-                entry also require every zero-impulse unilateral row to be violated by at most the
-                tolerance. On native sparse sweeps it adds to ``pgs_change_tolerance`` and
-                ``pgs_relative_change_tolerance``. Zero keeps the exact stationary-sweep exit. The
+                entry also require the change a visit would make to every zero-impulse unilateral row,
+                its violation times ``pgs_omega``, to be at most the tolerance. On native sparse sweeps
+                it adds to ``pgs_change_tolerance`` and ``pgs_relative_change_tolerance``. With both of
+                those at zero, a solve runs the exact law's sweeps and stops at or before the sweep
+                where the exact law stops; with either positive, the unvisited-row bound has no impulse
+                slack and can add sweeps. Zero keeps the exact stationary-sweep exit. The
                 sweeps that ``pgs_solve_readout`` counts honor it, except the matrix-free sweep under
                 non-default friction modes or contact torsion; fixed-iteration and parallel sweeps and
                 launch-per-iteration drivers do not (``routes.sweep.exit_law``, with a warning).
