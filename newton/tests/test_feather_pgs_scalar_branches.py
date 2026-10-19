@@ -13,18 +13,15 @@ bound on ordinary dynamics, the law both CUDA routes integrate.
 import dataclasses
 import json
 import os
-import subprocess
-import sys
 import unittest
-from pathlib import Path
 from unittest import mock
 
 import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import environment_flags, path_selection
 from newton._src.solvers.feather_pgs import kernels as fk
+from newton._src.solvers.feather_pgs import path_selection
 from newton._src.solvers.feather_pgs import scalar_branches as sb
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.device_proof import DeviceProof
@@ -1102,10 +1099,7 @@ class TestScalarBranchRule(unittest.TestCase):
         """Report the request, the diagonal group and each decline of the solver or its model, with its reason."""
         model = build_branch_model(worlds=2)
         solver = cpu_solver(model, 7)
-        self.assertIn("Off: FEATHER_PGS_SCALAR_BRANCHES=0", sb.plan_scalar_branches(solver, requested=False)[1])
-        self.assertIn(
-            "(default; FEATHER_PGS_SCALAR_BRANCHES=0 opts out)", sb.plan_scalar_branches(solver, requested=True)[1]
-        )
+        self.assertIn("Off: FEATHER_PGS_SCALAR_BRANCHES=1", sb.plan_scalar_branches(solver, requested=False)[1])
         with mock.patch.object(solver, "_compact_diagonal_mass_size", None):
             plan, reason = sb.plan_scalar_branches(solver, requested=True)
             self.assertIsNone(plan)
@@ -1283,40 +1277,6 @@ class TestScalarBranchRule(unittest.TestCase):
         # The tree layout's packing fields hold no value for a group without a tree layout.
         self.assertEqual((scalar["trees_per_block"], scalar["block_dim"]), (None, None))
         self.assertIsInstance(tree["trees_per_block"], int)
-
-    def test_scalar_branches_are_on_unless_opted_out(self):
-        """Request scalar branches when FEATHER_PGS_SCALAR_BRANCHES is unset or 1, and not when it is 0.
-
-        The solver reads the flag at import, so each value is read by a fresh interpreter that imports
-        the same Newton; the registry declares the flag a default-on policy whose ``=0`` opts out.
-        """
-        flag = environment_flags.FLAGS["FEATHER_PGS_SCALAR_BRANCHES"]
-        self.assertEqual(flag.kind, "policy")
-        self.assertTrue(flag.meaning.startswith("=0 ") and flag.meaning.endswith("(default on)."), flag.meaning)
-        code = (
-            "from newton._src.solvers.feather_pgs import solver_feather_pgs as module; "
-            "print('requested', module._SCALAR_BRANCHES)"
-        )
-        environment = {
-            name: value for name, value in os.environ.items() if not name.startswith(environment_flags.PREFIXES)
-        }
-        # The interpreter's working directory leads sys.path, so the child imports this Newton.
-        root = Path(newton.__file__).resolve().parents[1]
-        for value, requested in ((None, True), ("0", False), ("1", True)):
-            with self.subTest(value=value):
-                switch = {} if value is None else {"FEATHER_PGS_SCALAR_BRANCHES": value}
-                result = subprocess.run(
-                    [sys.executable, "-c", code],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                    cwd=root,
-                    env={**environment, **switch},
-                )
-                lines = [line for line in result.stdout.splitlines() if line.startswith("requested ")]
-                self.assertEqual(lines, [f"requested {requested}"], result.stderr[-2000:])
-        if "FEATHER_PGS_SCALAR_BRANCHES" not in os.environ:
-            self.assertTrue(solver_module._SCALAR_BRANCHES)
 
     def test_cpu_route_record_reports_the_rule(self):
         """Report scalar branches as off on CPU, where no diagonal-mass group shares a sparse-diagonal response."""
@@ -2430,7 +2390,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         head = recipe_solver(model, scalar=False).get_path_selection()["routes"]
         self.assertIsNone(head["held_tree"]["owner"])
         self.assertFalse(head["held_tree"]["scalar_branches"]["enabled"])
-        self.assertIn("Off: FEATHER_PGS_SCALAR_BRANCHES=0", head["held_tree"]["scalar_branches"]["reason"])
+        self.assertIn("Off: FEATHER_PGS_SCALAR_BRANCHES=1", head["held_tree"]["scalar_branches"]["reason"])
         self.assertTrue(head["publication"]["prismatic_linear_state"])
         # Without the held-tree owner the branches stay on ordinary dynamics with the recipe's opt-ins:
         # every route is the one of the same solver built without the flag, apart from the reason.

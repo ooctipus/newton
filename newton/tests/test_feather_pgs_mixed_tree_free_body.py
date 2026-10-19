@@ -3,7 +3,6 @@
 
 """The generic mixed-tree cache owner covers fixed-base arms together with free rigid bodies."""
 
-import contextlib
 import os
 import unittest
 from unittest.mock import patch
@@ -12,7 +11,6 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import assert_history_close
@@ -254,14 +252,11 @@ def _rollout(
     friction_anchor_beta=0.0,
     pgs_iterations=None,
     observe=None,
-    scalar=None,
 ):
     """Roll out a scene and return the solver, its owner, the body pose trajectory and the final twists.
 
     ``pgs_iterations`` defaults to :data:`PATCH_PARITY_ITERATIONS` under patch friction and to 8
-    otherwise. ``observe`` is called after every step with the solver and its contacts. ``scalar``
-    pins ``FEATHER_PGS_SCALAR_BRANCHES``, which the solver reads at import; ``None`` keeps the default
-    (on), under which the cabinet's drawers run as scalar branches of the held-tree owner.
+    otherwise. ``observe`` is called after every step with the solver and its contacts.
     """
     if pgs_iterations is None:
         pgs_iterations = PATCH_PARITY_ITERATIONS if friction_anchor_beta > 0.0 else 8
@@ -273,10 +268,7 @@ def _rollout(
     forest = getattr(_rollout, "forest", False)
     if forest is not None:
         env["FEATHER_PGS_TREE_FOREST"] = str(int(forest))
-    scalar_switch = (
-        contextlib.nullcontext() if scalar is None else patch.object(solver_module, "_SCALAR_BRANCHES", scalar)
-    )
-    with patch.dict(os.environ, env), scalar_switch:
+    with patch.dict(os.environ, env):
         solver = SolverFeatherPGS(
             model,
             pgs_mode=pgs_mode,
@@ -438,12 +430,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
 
     def test_forest_is_the_default_with_a_prescribed_root(self):
-        """Unset, the forest is taken for a world with a prescribed root and no diagonal family.
-
-        A cabinet world keeps per-size groups: by default its drawers run as scalar branches, which
-        no forest spans, and with FEATHER_PGS_SCALAR_BRANCHES=0 the forest would apply their diagonal
-        family at a loss.
-        """
+        """Unset, the forest is taken for a world with a prescribed root and no diagonal family."""
         _rollout.forest = None
         try:
             _solver, owner, _cached, _qd = _rollout(
@@ -452,13 +439,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
             self.assertEqual(len(owner.groups), 1)
             self.assertEqual(owner.groups[0].layout.root_families, (3, 6, 0))
             _solver, owner, _cached, _qd = _rollout(_build(wp.get_device("cuda:0"), cabinet=True), owner=True, steps=2)
-            self.assertEqual(
-                [type(group).__name__ for group in owner.groups], ["TreeKineticState", "ScalarBranchState"]
-            )
-            _solver, owner, _cached, _qd = _rollout(
-                _build(wp.get_device("cuda:0"), cabinet=True), owner=True, steps=2, scalar=False
-            )
-            self.assertEqual([type(group).__name__ for group in owner.groups], ["TreeKineticState"] * 2)
+            self.assertEqual(len(owner.groups), 2)
             _solver, owner, _cached, _qd = _rollout(_build(wp.get_device("cuda:0")), owner=True, steps=2)
             self.assertEqual(len(owner.groups), 2)
         finally:
@@ -509,12 +490,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         self.assertTrue(np.all(final[:, 0, 2] > 0.2))
 
     def test_forest_group_carries_a_diagonal_family(self):
-        """A world of an arm and a two-drawer cabinet (Franka cabinet's class) is one forest group with a diagonal family.
-
-        The drawers run as scalar branches by default (see
-        :meth:`test_scalar_branches_own_the_cabinet_drawers`), which no forest spans, so the forest
-        takes them with FEATHER_PGS_SCALAR_BRANCHES=0.
-        """
+        """A world of an arm and a two-drawer cabinet (Franka cabinet's class) is one forest group with a diagonal family."""
         for beta in (0.0, 0.2):
             with self.subTest(friction_anchor_beta=beta):
                 model = _build(wp.get_device("cuda:0"), cabinet=True)
@@ -523,9 +499,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
                 self.assertEqual(plain_solver._compact_diagonal_mass_size, 2)
                 _rollout.forest = True
                 try:
-                    owner_solver, owner, cached, cached_qd = _rollout(
-                        model, owner=True, friction_anchor_beta=beta, scalar=False
-                    )
+                    owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, friction_anchor_beta=beta)
                 finally:
                     _rollout.forest = False
                 self.assertIsInstance(owner, MixedTreeKineticState)
@@ -541,43 +515,6 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
                 q = owner_solver.joint_q_trajectory.reshape(len(cached), model.world_count, -1)
                 self.assertLess(float(q[:, :, 3:5].min()), -0.02)
                 self.assertLessEqual(float(q[-1, :, 3:5].max()), 1.0e-3)
-                self._assert_patch_history(plain_solver, owner_solver, loaded=False)
-
-    def test_scalar_branches_own_the_cabinet_drawers(self):
-        """Run the cabinet's drawers as scalar branches beside the arm's tree group by default; track the ordinary route.
-
-        The drawers hang from a world-fixed root on one-coordinate prismatic joints, the
-        diagonal-mass class the scalar rule admits, so the owner runs them one thread per
-        coordinate instead of as a held diagonal family, and the arm's tree group beside them
-        validates input banks by identity. Poses and twists stay within the per-size and forest
-        owners' bounds of ordinary dynamics.
-        """
-        from newton._src.solvers.feather_pgs.scalar_branches import ScalarBranchState  # noqa: PLC0415
-
-        for beta in (0.0, 0.2):
-            with self.subTest(friction_anchor_beta=beta):
-                model = _build(wp.get_device("cuda:0"), cabinet=True)
-                plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False, friction_anchor_beta=beta)
-                self.assertIsNone(plain_owner)
-                self.assertIsNone(plain_solver._scalar_branches)
-                owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, friction_anchor_beta=beta)
-                self.assertIsInstance(owner, MixedTreeKineticState)
-                self.assertIsInstance(owner.scalar, ScalarBranchState)
-                self.assertIs(owner_solver._scalar_branches, owner.scalar.plan)
-                self.assertEqual([group.sparse.size for group in owner.groups], [3, 2])
-                self.assertFalse(owner.bank_compare)
-                held = owner_solver.get_path_selection()["routes"]["held_tree"]
-                self.assertTrue(held["scalar_branches"]["enabled"])
-                self.assertEqual([group["input_validation"] for group in held["groups"]], ["identity"] * 2)
-                self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
-                np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
-                np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
-                np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
-                # The drawers slid out before their drives pulled them back to the closed limit.
-                q = owner_solver.joint_q_trajectory.reshape(len(cached), model.world_count, -1)
-                self.assertLess(float(q[:, :, 3:5].min()), -0.02)
-                self.assertLessEqual(float(q[-1, :, 3:5].max()), 1.0e-3)
-                self.assertEqual(int(owner.groups[0].status.numpy().sum()), 0)
                 self._assert_patch_history(plain_solver, owner_solver, loaded=False)
 
     def test_joint_velocity_limits_are_owned(self):

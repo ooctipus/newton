@@ -9,11 +9,8 @@ inertia, and every leaf is a scalar system: on a fixed root the velocity
 product of a one-coordinate body projects to zero on its own axis, and the
 leaf's pose, motion axis and body velocity follow from its coordinate and the
 model frames alone. This module evaluates such a size group with one thread per
-coordinate and no tree plan, so no body or coordinate cap applies. By default the
-held-tree owner composes it in place of a tree group (``mixed_tree_kinetic.py``)
-wherever :func:`plan_scalar_branches` admits the group;
-``FEATHER_PGS_SCALAR_BRANCHES=0`` keeps the group on a tree group or on ordinary
-dynamics, with the prismatic opt-ins where they are set:
+coordinate and no tree plan, so no body or coordinate cap applies. The held-tree
+owner composes it in place of a tree group (``mixed_tree_kinetic.py``):
 
 * ``begin`` publishes the input state of articulations whose cache is invalid:
   the root pose, the articulation origin, and each leaf's pose and motion axis.
@@ -747,7 +744,7 @@ def plan_scalar_branches(solver, *, requested: bool) -> tuple[ScalarBranchPlan |
     if size is None:
         return None, "No diagonal-mass group shares the sparse-diagonal response."
     if not requested:
-        return None, "Off: FEATHER_PGS_SCALAR_BRANCHES=0 keeps the diagonal-mass group out of scalar branches."
+        return None, "Off: FEATHER_PGS_SCALAR_BRANCHES=1 opts the diagonal-mass group into scalar branches."
     model = solver.model
     if model.requires_grad or model.particle_count:
         return None, "Scalar branches exclude gradients and particles."
@@ -783,8 +780,8 @@ def plan_scalar_branches(solver, *, requested: bool) -> tuple[ScalarBranchPlan |
     )
     reason = (
         f"Admitted: {plan.group_count} world-fixed roots of {plan.size} one-coordinate {' and '.join(present)} "
-        "leaves run as scalar branches (default; FEATHER_PGS_SCALAR_BRANCHES=0 opts out); they supersede "
-        "FEATHER_PGS_PRISMATIC_PUBLICATION and FEATHER_PGS_PRISMATIC_LINEAR_STATE for these articulations."
+        "leaves run as scalar branches; they supersede FEATHER_PGS_PRISMATIC_PUBLICATION and "
+        "FEATHER_PGS_PRISMATIC_LINEAR_STATE for these articulations."
     )
     return plan, reason
 
