@@ -54,11 +54,16 @@ IMPULSE_BOUND = {"rtol": KEY_BOUND["rtol"], "atol": 1.0e-8}
 ARM_FLOOR = 1.0e-5
 # The arm-key press (_press_key_with_tip, _gripper_switch): float32 spacings of the contact's world
 # position that two float orders of the tip's and the key's poses may leave between two routes (one
-# per body and route), the fraction of the head route's iteration-budget error a route switch may
-# move the contact impulses by, and the sweeps of the converged reference (the CPU twin converges
-# by 256).
+# per body and route).
 GRIPPER_POSE_SPACINGS = 4
+# The fraction of the head route's iteration-budget error (its distance from the converged
+# reference) a route switch may move the contact impulses by: five times CUDA's 2% (9.4e-6 N s,
+# against the CPU twin's 4.8e-4 N s budget). TestGripperContactBound pins it on the CPU twin between
+# about 0.03, which an ARM_FLOOR-sized difference of the arm's coordinates needs, and 0.16, above
+# which a doubled drive stiffness passes in the loaded world.
 GRIPPER_BUDGET_FRACTION = 0.1
+# Sweeps of the converged reference: on the CPU twin 256 sweeps come within 1.7e-8 N s of it, and
+# 1024 and 2048 match it bitwise.
 GRIPPER_REFERENCE_ITERATIONS = 512
 # Coordinates of the fixtures' arm. A star of as many leaves shares the arm's size group, which is
 # then not diagonal: the recipe refuses its prismatic linear state and no scalar plan exists.
@@ -310,6 +315,9 @@ class _Layout:
         self.key_dofs = np.concatenate([qd_start[joints] for joints in leaves])
         self.key_bodies = np.concatenate([child[starts[a] : starts[a + 1]] for a in self.branches])
         self.key_leaves = np.concatenate([child[joints] for joints in leaves])
+        self.arm_coordinates = np.concatenate(
+            [np.arange(q_start[starts[a]], q_start[starts[a + 1]]) for a in self.arms]
+        )
         self.arm_dofs = np.concatenate([np.arange(qd_start[starts[a]], qd_start[starts[a + 1]]) for a in self.arms])
         self.arm_bodies = np.concatenate([child[starts[a] : starts[a + 1]] for a in self.arms])
         self.arm_tips = child[starts[self.arms + 1] - 1]
@@ -1571,12 +1579,26 @@ def _assert_gripper_switch(test, head, other, reference, *, beta, dt):
 
 
 class TestGripperContactBound(unittest.TestCase):
-    """The arm-key press bound of the CUDA A/B on ordinary dynamics, the law both CUDA routes integrate."""
+    """The arm-key press bound of the CUDA A/B on ordinary dynamics, the law both CUDA routes integrate.
 
-    def _press(self, *, iterations=8, shift=0.0, defect=None):
-        """Press keys on CPU ordinary dynamics (split mode), optionally with a defect in the keys' response."""
+    Each test holds one stand-in against the head's eight sweeps and the converged reference:
+    another float order of the tip's pose, the held owner's distance from ordinary dynamics in
+    the arm, or a defect of the keys' response.
+    """
+
+    def _press(self, *, iterations=8, shift=0.0, arm_seed=None, defect=None):
+        """Press keys on CPU ordinary dynamics (split mode).
+
+        ``arm_seed`` moves every arm coordinate by ``ARM_FLOOR``, with signs drawn from that seed;
+        ``defect`` changes the keys' response.
+        """
         model = build_branch_model(worlds=2, leaves=STAR_LEAVES, shapes=True)
         layout = _Layout(model)
+        if arm_seed is not None:
+            signs = np.random.default_rng(arm_seed).choice([-1.0, 1.0], len(layout.arm_coordinates))
+            q = model.joint_q.numpy()
+            q[layout.arm_coordinates] += (ARM_FLOOR * signs).astype(np.float32)
+            model.joint_q.assign(q)
         if defect == "double_stiffness":
             # The keys' inverse mass counts the drive stiffness K = ke dt^2 + kd dt twice.
             armature = model.joint_armature.numpy()
@@ -1592,33 +1614,64 @@ class TestGripperContactBound(unittest.TestCase):
         solver = recipe_solver(model, scalar=False, prismatic=False, pgs_mode="split", pgs_iterations=iterations)
         return solver, _press_key_with_tip(self, model, layout, solver, shift=shift)
 
-    def test_bound_admits_float_order_and_refuses_defects(self):
-        """Admit a one-spacing displacement of the tip under the press bound and refuse defects in the keys' response.
-
-        Shifting the tip's contact witness by one float32 spacing of its largest coordinate along
-        the normal stands in for another float order of its pose: the first impulses move by the
-        contact's position-correction gain ``pgs_beta / (D dt)`` times the shift, within a factor of
-        two (the friction cone's coupling sets the factor), and every bound of
-        ``test_gripper_contact_matches_the_prismatic_route`` holds. An inverse mass that counts the
-        drive stiffness twice, or keys without drives, stand in for defects of the scalar family:
-        their contact rows' diagonal moves by tens of percent, their first impulses miss the pose
-        floor by more than tenfold, and the budget bound fails.
-        """
+    def _head_and_reference(self):
+        """The head's press at eight sweeps, the converged reference's, ``pgs_beta`` and the loaded world."""
         solver, head = self._press()
         _, reference = self._press(iterations=GRIPPER_REFERENCE_ITERATIONS)
+        return head, reference, solver.pgs_beta, int(np.argmax(np.abs(head["impulses"]).max(axis=0)))
+
+    def test_bound_admits_a_pose_shift(self):
+        """Admit a one-spacing shift of the tip's contact witness, another float order of its pose.
+
+        The first impulses move linearly with the shift, at the contact's position-correction gain
+        ``pgs_beta / (D dt)`` scaled by the friction cone (1.40 and 0.86), within a factor of two of
+        that gain, and every bound of ``test_gripper_contact_matches_the_prismatic_route`` holds
+        (0.35 and 0.21 of the pose floor). The loaded world's later impulses move by 3.7 times the
+        floor alone: the bound needs its budget term.
+        """
+        head, reference, beta, loaded = self._head_and_reference()
         spacing = float(np.spacing(np.float32(head["extent"])))
         _, shifted = self._press(shift=spacing)
-        gain = solver.pgs_beta / (head["diagonal"] * DT)
+        gain = beta / (head["diagonal"] * DT)
         moved = head["impulses"][0] - shifted["impulses"][0]
         self.assertTrue(np.all((moved >= 0.5 * gain * spacing) & (moved <= 2.0 * gain * spacing)), moved)
-        _assert_gripper_switch(self, head, shifted, reference, beta=solver.pgs_beta, dt=DT)
+        _assert_gripper_switch(self, head, shifted, reference, beta=beta, dt=DT)
+        switch = _gripper_switch(head, shifted, reference, beta=beta, dt=DT)
+        self.assertGreater(switch["switch"][loaded], switch["floor"][loaded], switch)
+
+    def test_bound_admits_the_held_arm_floor(self):
+        """Admit the held owner's documented distance from ordinary dynamics in the arm: ``ARM_FLOOR`` per coordinate.
+
+        Moving every arm coordinate by ``ARM_FLOOR`` (1e-5 rad, four sign draws) moves the upright
+        tip sideways, perpendicular to the contact normal, so the first impulses move by at most
+        0.11 of the pose floor, but the friction history moves the loaded world's later impulses by
+        7.8e-6 to 1.4e-5 N s, CUDA's size: 20 to 35 times the floor alone and up to 0.28 of the
+        bound, which admits them for any ``GRIPPER_BUDGET_FRACTION`` above about 0.03.
+        """
+        head, reference, beta, loaded = self._head_and_reference()
+        for seed in range(4):
+            with self.subTest(seed=seed):
+                _, moved = self._press(arm_seed=seed)
+                _assert_gripper_switch(self, head, moved, reference, beta=beta, dt=DT)
+                switch = _gripper_switch(head, moved, reference, beta=beta, dt=DT)
+                self.assertGreater(switch["switch"][loaded], switch["floor"][loaded], switch)
+
+    def test_bound_refuses_defects(self):
+        """Refuse defects of the keys' response in every world, which holds ``GRIPPER_BUDGET_FRACTION`` below 0.16.
+
+        An inverse mass that counts the drive stiffness twice, or keys without drives, stand in for
+        defects of the scalar family: their contact rows' diagonal moves by tens of percent, their
+        first impulses miss the pose floor by more than tenfold, and every world's impulses miss the
+        budget bound, the doubled stiffness's by 1.6 times in the loaded world.
+        """
+        head, reference, beta, _ = self._head_and_reference()
         for defect in ("double_stiffness", "no_drive"):
             with self.subTest(defect=defect):
                 _, broken = self._press(defect=defect)
                 self.assertTrue(np.all(np.abs(broken["diagonal"] / head["diagonal"] - 1.0) > 0.1), broken["diagonal"])
-                switch = _gripper_switch(head, broken, reference, beta=solver.pgs_beta, dt=DT)
+                switch = _gripper_switch(head, broken, reference, beta=beta, dt=DT)
                 self.assertTrue(np.all(switch["first"] > 10.0 * switch["floor"]), switch)
-                self.assertTrue(np.any(switch["switch"] > switch["bound"]), switch)
+                self.assertTrue(np.all(switch["switch"] > switch["bound"]), switch)
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "Scalar branches run on the CUDA held-tree owner")
@@ -2058,17 +2111,21 @@ class TestScalarBranchOwner(unittest.TestCase):
           1e-5 m deeper inside it, where the same head solver at ``GRIPPER_REFERENCE_ITERATIONS``
           sweeps holds it in place at the cone, and its normal impulse ends about 10% (4.8e-4 N s)
           short of that converged run. The history amplifies the first difference (CUDA: 9.4e-6
-          N s, 2% of that error; a one-spacing shift on the CPU twin: 0.3%). Every step's impulses
-          must agree within a tenth of the head's distance from the converged run plus the pose
-          floor, which also keeps the scalar route within the head's own distance from the
-          converged run, up to that tenth. The converged run must stay within a quarter of the
-          head's impulse at every step, so a broken reference cannot widen the bound.
+          N s, 2% of that error if CUDA's matches; a one-spacing shift on the CPU twin: 0.3%). Every
+          step's impulses must agree within ``GRIPPER_BUDGET_FRACTION`` (a tenth) of the head's
+          distance from the converged run plus the pose floor, so the scalar route stays within 1.1
+          times the head's distance from that run plus the floor. On the CPU twin an
+          ``ARM_FLOOR``-sized difference of the arm's coordinates, the held owner's documented
+          distance from ordinary dynamics, moves the loaded world's impulses by up to 1.4e-5 N s,
+          0.28 of the bound. The converged run must stay within a quarter of the head's impulse at
+          every step, so a broken reference cannot widen the bound.
         - The key's travel moves far less (under 7e-8 m for a one-spacing shift on the CPU twin,
           against the budget's 1e-5 m) and keeps a 1e-3 relative bound.
 
         A defect in the scalar family's response misses these by orders of magnitude: on the CPU
-        twin an inverse mass that counts the drive stiffness twice moves the diagonal by 29% and the
-        first impulses by 135 and 620 times the pose floor, and keys without drives carry no load.
+        twin an inverse mass that counts the drive stiffness twice moves the diagonal by 29%, the
+        first impulses by 135 and 620 times the pose floor and the later ones by 1.6 and 620 times
+        the bound, and keys without drives carry no load.
         """
         device = wp.get_device("cuda:0")
         model = build_branch_model(device, worlds=2, leaves=STAR_LEAVES, shapes=True)
