@@ -540,66 +540,111 @@ def _arm_scene(device):
     return scene.finalize(device=device)
 
 
-def _arm_trajectory(model, *, flag, friction_anchor_beta, steps=60):
-    """Step the arm scene; return its joint trajectory, base-ground and arm-cube contact counts and friction law."""
-    solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=friction_anchor_beta)
-    law = solver.get_path_selection()["routes"]["friction"]["law"]
-    # Deterministic contacts keep the remaining contacts in one order on CUDA as well.
-    pipeline = _pipeline(model, flag, deterministic=model.device.is_cuda)
-    contacts = pipeline.contacts()
-    state_0, state_1 = model.state(), model.state()
-    control = model.control()
-    newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
-    shape_body = model.shape_body.numpy()
-    trajectory, static_contacts, arm_contacts = [], 0, 0
-    for _ in range(steps):
-        pipeline.collide(state_0, contacts)
-        count = int(contacts.rigid_contact_count.numpy()[0])
-        bodies = (
-            shape_body[contacts.rigid_contact_shape0.numpy()[:count]],
-            shape_body[contacts.rigid_contact_shape1.numpy()[:count]],
-        )
-        # Body 0 of each world is the welded base, body 1 the arm and body 2 the cube.
-        local = [np.where(body < 0, -1, body % 3) for body in bodies]
-        static_contacts += int(
-            np.count_nonzero(((local[0] == -1) & (local[1] == 0)) | ((local[0] == 0) & (local[1] == -1)))
-        )
-        arm_contacts += int(np.count_nonzero(((local[0] == 1) & (local[1] == 2)) | ((local[0] == 2) & (local[1] == 1))))
-        state_0.clear_forces()
-        solver.step(state_0, state_1, control, contacts, 1.0 / 120.0)
-        state_0, state_1 = state_1, state_0
-        trajectory.append(np.concatenate((state_0.joint_q.numpy(), state_0.joint_qd.numpy())))
-    return np.asarray(trajectory), static_contacts, arm_contacts, law
+# What the narrow phase computes per contact; thread ids are left out, they follow the candidate list.
+_CONTACT_GEOMETRY = ("shape0", "shape1", "point0", "point1", "offset0", "offset1", "normal", "margin0", "margin1")
+
+
+def _per_contact_arrays(contacts):
+    """Return every per-contact array of ``contacts``."""
+    return [
+        array
+        for name, array in vars(contacts).items()
+        if name.startswith("rigid_contact_")
+        and isinstance(array, wp.array)
+        and array.shape == (contacts.rigid_contact_max,)
+    ]
+
+
+def _list_immobile_contacts_last(contacts, immobile):
+    """Stably move the contacts between two ``immobile`` shapes behind the others; return how many others."""
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    shapes = (contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count])
+    dropped = immobile[shapes[0]] & immobile[shapes[1]]
+    order = np.concatenate((np.flatnonzero(~dropped), np.flatnonzero(dropped)))
+    for array in _per_contact_arrays(contacts):
+        values = array.numpy().copy()
+        values[:count] = values[order]
+        array.assign(values)
+    return count - int(np.count_nonzero(dropped))
 
 
 def test_fixed_base_arm_trajectories_match(test, device):
     """Step FeatherPGS alike without the base's ground contacts, under point and patch friction.
 
-    CPU kernels run serially, so the remaining contacts keep their order and the trajectories
-    are bitwise equal there. CUDA reserves contact rows with per-world atomics, whose order can
-    follow the dropped contacts, so on CUDA they agree within ten times the spread of two
-    identical runs.
+    Both runs start every step from the same state. FeatherPGS reserves a world's contact rows with
+    atomics, which CUDA serves in warp order, so the dropped contacts must not move the others:
+    listed in place, they push world 1's last arm-cube contacts into a second warp, which CUDA
+    served first, and 12 PGS iterations then end up to 1.2e-2 rad/s apart (a CPU run with that row
+    order reproduces the difference). The reference lists them last instead, so that every other
+    contact keeps its index. Contacts and rows then agree exactly, and states bitwise on CPU and
+    within 1e-5 on CUDA, where only the accumulation order of floating-point atomics may differ.
     """
     model = _arm_scene(device)
+    shape_body = model.shape_body.numpy()
+    # Body 0 of each world is the welded base, body 1 the arm and body 2 the cube.
+    local = np.where(shape_body < 0, -1, shape_body % 3)
+    immobile = local <= 0
+    control = model.control()
     for law, beta in (("point", 0.0), ("patch", 0.2)):
         with test.subTest(friction=law):
-            reference, reference_static, reference_arm, reference_law = _arm_trajectory(
-                model, flag="0", friction_anchor_beta=beta
+            solvers = [newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=beta) for _ in range(2)]
+            test.assertEqual(
+                [solver.get_path_selection()["routes"]["friction"]["law"] for solver in solvers], [law] * 2
             )
-            trajectory, static, arm, selected_law = _arm_trajectory(model, flag=None, friction_anchor_beta=beta)
-            test.assertEqual((reference_law, selected_law), (law, law))
+            # Sorted contacts compare element by element: the reference keeps the base's ground pairs.
+            pipelines = (_pipeline(model, "0", deterministic=True), _pipeline(model, None, deterministic=True))
+            reference, contacts = (pipeline.contacts() for pipeline in pipelines)
+            state = model.state()
+            newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+            # Every step gets new states, kept alive so that no address recurs: a solver must not
+            # take a copied input for its own last output.
+            states = [state]
+            dropped_contacts = arm_contacts = 0
+            for _ in range(60):
+                pipelines[0].collide(state, reference)
+                pipelines[1].collide(state, contacts)
+                listed = int(reference.rigid_contact_count.numpy()[0])
+                kept = _list_immobile_contacts_last(reference, immobile)
+                count = int(contacts.rigid_contact_count.numpy()[0])
+                test.assertEqual(count, kept)
+                for name in _CONTACT_GEOMETRY:
+                    np.testing.assert_array_equal(
+                        getattr(contacts, f"rigid_contact_{name}").numpy()[:count],
+                        getattr(reference, f"rigid_contact_{name}").numpy()[:kept],
+                    )
+                dropped_contacts += listed - kept
+                shapes = np.stack(
+                    (contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count])
+                )
+                ends = np.sort(local[shapes], axis=0)
+                arm_contacts += int(np.count_nonzero((ends[0] == 1) & (ends[1] == 2)))
+                outputs = []
+                for solver, buffer in zip(solvers, (reference, contacts), strict=True):
+                    state_in, state_out = model.state(), model.state()
+                    state_in.assign(state)
+                    state_in.clear_forces()
+                    solver.step(state_in, state_out, control, buffer, 1.0 / 120.0)
+                    states += [state_in, state_out]
+                    outputs.append(state_out)
+                # FeatherPGS gives the base's ground contacts no row and every other contact the same rows.
+                paths = [solver.contact_path.numpy().copy() for solver in solvers]
+                needed = [solver.contact_slots_needed.numpy().copy() for solver in solvers]
+                np.testing.assert_array_equal(paths[0][kept:listed], -1)
+                np.testing.assert_array_equal(paths[1][:count], paths[0][:kept])
+                rows = paths[0][:kept] >= 0
+                np.testing.assert_array_equal(needed[1][:count][rows], needed[0][:kept][rows])
+                expected, actual = (
+                    np.concatenate((output.joint_q.numpy(), output.joint_qd.numpy())) for output in outputs
+                )
+                test.assertTrue(np.all(np.isfinite(actual)))
+                if wp.get_device(device).is_cpu:
+                    np.testing.assert_array_equal(actual, expected)
+                else:
+                    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-5)
+                state = outputs[0]
             # The base rests in the ground and the arm presses the cube.
-            test.assertGreater(reference_static, 0)
-            test.assertEqual(static, 0)
-            test.assertGreater(arm, 0)
-            test.assertEqual(arm, reference_arm)
-            test.assertTrue(np.all(np.isfinite(trajectory)))
-            if wp.get_device(device).is_cpu:
-                np.testing.assert_array_equal(trajectory, reference)
-            else:
-                repeat = _arm_trajectory(model, flag="0", friction_anchor_beta=beta)[0]
-                spread = float(np.max(np.abs(repeat - reference)))
-                np.testing.assert_allclose(trajectory, reference, rtol=0.0, atol=max(1.0e-5, 10.0 * spread))
+            test.assertGreater(dropped_contacts, 0)
+            test.assertGreater(arm_contacts, 0)
 
 
 class TestCollisionImmobilePairs(unittest.TestCase):
