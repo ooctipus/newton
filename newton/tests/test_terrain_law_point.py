@@ -340,11 +340,11 @@ def test_point_rows_match_the_float64_law(test, device):
     strips: every float64 row has a float32 row that matches it or carries its constraint (no pair loses a support),
     every float32 row matches or carries a float64 row but those whose deciding predicate lies within
     :data:`~newton.tests.terrain_law_test_utils.DECISION_BAND` of its threshold (at most 2% of the rows here, where
-    half the placements sit exactly on seams; 0.2-0.5% over 600 placements per terrain), and every pair's deepest core
-    distance agrees within 10 um. Carried rows (at most 5%; 1.9% on the mosaic over 600 placements) lie on the same
-    plane at the same core distance: lying capsules' axis rows at the noisy flat tile's tiny creases, decided within
-    the band, and an axis-edge row on an edge nearly parallel to the axis, whose closest point is ill-conditioned along
-    it.
+    half the placements sit exactly on seams; 0.2-0.9% at 600 placements per terrain), and every pair's deepest core
+    distance agrees within 10 um. Carried rows (at most 5%; up to 2.1% on the mosaic at 600 placements) lie on the
+    same plane at the same core distance: lying capsules' axis rows at the noisy flat tile's tiny creases, decided
+    within the band, and an axis-edge row on an edge nearly parallel to the axis, whose closest point is ill-conditioned
+    along it.
     """
     rng = np.random.default_rng(21)
     strip = np.round(rng.uniform(0.0, 0.1, size=(21, 2001)) / 0.005) * 0.005
