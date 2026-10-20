@@ -351,12 +351,14 @@ class TestContactUnitPoint(unittest.TestCase):
                 np.testing.assert_allclose(out[:3], expected, atol=1.0e-6)
 
     def test_press_coupled_slides_are_found(self):
-        """Find and keep the slides of a contact that separates at zero impulse and has no stick.
+        """Keep the slides of a contact that separates at zero impulse and has no stick.
 
         Its friction presses the normal down, so ``S0 = -b_n / W_nn`` is negative: the problem has take-off and two
         slides, outside the bracket ``[0, |c| (1 + mu |g|) / (mu S0) - e2]`` of the slide root, which needs ``S0 > 0``.
-        Held on one of them, the unit's friction lies on its disk's boundary and resumes that root, which the bracket
-        ``(0, |c| (1 + mu |g|) / (mu |S0|) - e2)`` of either sign holds; from no impulse the contact takes off.
+        Held on one of them, the unit's friction lies on its disk's boundary and resumes that root, which the interval
+        ``(0, |c| (1 + mu |g|) / (mu |S0|) - e2)`` of either sign holds; from no impulse the contact takes off. Both
+        slides' gains (+35 and -29) ask for the split step, which keeps a held slide as the exact solve does
+        (test_press_slide_of_modest_gain_is_resumed_exactly resumes one without it).
         """
         W = np.array([[1.0, -0.7, -0.9], [-0.7, 0.69, 0.63], [-0.9, 0.63, 2.11]])
         b = np.array([0.02, -0.4, -0.2])
@@ -392,6 +394,69 @@ class TestContactUnitPoint(unittest.TestCase):
         self.assertGreater(abs(held - x[0]), 1.0e-3)
         self.assertAlmostEqual(out[0], held, delta=1.0e-6)
         self.assertLessEqual(np.linalg.norm(out[1:3]), mu * out[0] * (1.0 + 1.0e-6))
+
+    def test_press_slide_of_modest_gain_is_resumed_exactly(self):
+        """Land a contact on the press slide its friction holds where that slide's gain needs no split step.
+
+        A contact that separates at zero impulse (``S0 = -0.015``) with take-off and two press slides: the slide of the
+        larger load answers the contact's approach with ``dS/dS0`` 4.2, inside (0, 8], the other with -5.6. From a
+        friction turned 0.02 rad off the first on its disk, the unit resumes that root and takes it exactly (in one
+        visit, alpha included), where a fixed branch order with take-off first would take off.
+        """
+        W = np.array([[1.0, -0.45, -0.67], [-0.45, 0.33, 0.43], [-0.67, 0.43, 0.91]])
+        b = np.array([0.015, -0.39, -0.42])
+        mu = 1.5
+        slides = slide_solutions(W, b, mu)
+        self.assertEqual(len(slides), 2)
+        alpha, x = slides[0]
+        self.assertLess(point_residual(W, b, mu, x), 1.0e-9)
+        turn = 0.02
+        f = np.array([[np.cos(turn), -np.sin(turn)], [np.sin(turn), np.cos(turn)]]) @ x[1:]
+        out = solve_points(point_problem(W, b, mu, current=(x[0], *f)))[0]
+        self.assertLess(point_residual(W, b, mu, out[:3]), 1.0e-6)
+        np.testing.assert_allclose(out[:3], x, atol=1.0e-6)
+        self.assertAlmostEqual(out[3], alpha, delta=1.0e-4 * alpha)
+
+    def test_anchor_takes_the_press_slide_of_the_larger_load(self):
+        """Load an anchor whose take-off fails and whose only solution is a slide its friction presses down.
+
+        The anchor's ring keeps a load L = 0.051, and its contact separates at zero impulse by more than that load:
+        ``S0 = L - b_n / W_nn = -0.0116``. Take-off's friction on the disk of radius mu L presses the normal into
+        approach (1.6e-4 m/s) and the stick slips. Of the two roots of ``h(alpha) = |s| + mu g.s - mu S0`` only the one
+        of the larger load (alpha 0.54, gain +15) has a non-negative normal impulse; the other (alpha 11.4) needs
+        -4.2e-4. ``F = a1 a2 (mu S - |s|)`` is concave in alpha for S0 <= 0, so Newton from alpha = 0 rises to that
+        root: from no impulse and from take-off's friction (whose own root is the other one) one visit lands on the
+        slide, and later visits keep it.
+        """
+        W = np.array(
+            [
+                [2.7354809530120803, 0.278969786500897, -3.233829999291128],
+                [0.278969786500897, 2.964162397028676, -2.486211359531349],
+                [-3.233829999291128, -2.486211359531349, 7.820506984830272],
+            ]
+        )
+        b = np.array([0.1705121931231807, -0.44202325604938025, -0.9747788111417576])
+        mu = 1.3695186502120757
+        ring_load = 0.050773526454896224
+        self.assertLess(ring_load - b[0] / W[0, 0], 0.0)
+        take_off = np.array([0.0, *take_off_friction(W, b, mu, ring_load)])
+        self.assertLess(b[0] + W[0, 1:] @ take_off[1:], -1.0e-4)
+        slides = slide_solutions(W, b, mu, ring_load=ring_load)
+        self.assertEqual(len(slides), 2)
+        (alpha, x), (_, other) = slides
+        self.assertLess(other[0], 0.0)
+        self.assertLess(point_residual(W, b, mu, x, ring_load=ring_load), 1.0e-9)
+        np.testing.assert_allclose(x, [0.29494, 0.33815, 0.33139], atol=1.0e-5)
+        for name, start in (("no impulse", np.zeros(3)), ("take-off", take_off)):
+            with self.subTest(start=name):
+                current, root = start, -1.0
+                for _ in range(8):
+                    out = solve_points(point_problem(W, b, mu, ring_load=ring_load, alpha=root, current=current))[0]
+                    self.assertLess(point_residual(W, b, mu, out[:3], ring_load=ring_load), 1.0e-5)
+                    # Within h's 2e-6 tolerance amplified by the slide's gain (15): not the other root.
+                    np.testing.assert_allclose(out[:3], x, atol=1.0e-4)
+                    current, root = out[:3], out[3]
+                self.assertAlmostEqual(root, alpha, delta=1.0e-3 * alpha)
 
     def test_resumed_root_keeps_a_solved_slide(self):
         """Keep a slide that solves its contact's problem, where a root from scratch stops at the evaluation cap.
@@ -459,18 +524,22 @@ def exact_stick(W, b):
     return np.linalg.solve(np.asarray(W, np.float64), -np.asarray(b, np.float64))
 
 
-def slide_solutions(W, b, mu):
-    """Every slide of one point contact, ``[(alpha, x)]`` by increasing alpha (float64, either sign of ``S0``).
+def slide_solutions(W, b, mu, ring_load=0.0):
+    """Every slide root of one point contact or anchor, ``[(alpha, x)]`` by increasing alpha (float64, either sign of
+    ``S0``).
 
-    The slides are the roots of ``h(alpha) = |s| + mu g.s - mu S0`` with ``s = (A + alpha I)^-1 c``, all inside
-    ``(0, |c| (1 + mu |g|) / (mu |S0|) - e2)``: a dense scan brackets them and bisection refines them.
+    The slides are the roots of ``h(alpha) = |s| + mu g.s - mu S0`` with ``s = (A + alpha I)^-1 c`` and
+    ``S0 = ring_load - b_n / W_nn``, all inside ``(0, |c| (1 + mu |g|) / (mu |S0|) - e2)``: a dense scan brackets them
+    and bisection refines them. An anchor's root solves its problem only where its normal impulse ``x[0]`` is not
+    negative.
     """
     W = np.asarray(W, np.float64)
+    b = np.asarray(b, np.float64)
     w = W[0, 1:]
     A = W[1:, 1:] - np.outer(w, w) / W[0, 0]
     c = b[1:] - b[0] / W[0, 0] * w
     g = -w / W[0, 0]
-    S0 = -b[0] / W[0, 0]
+    S0 = ring_load - b[0] / W[0, 0]
     high = np.linalg.norm(c) * (1.0 + mu * np.linalg.norm(g)) / (mu * abs(S0)) - np.linalg.eigvalsh(A)[0]
 
     def h(alpha):
@@ -492,6 +561,23 @@ def slide_solutions(W, b, mu):
         s = np.linalg.solve(A + alpha * np.eye(2), c)
         slides.append((alpha, np.array([(w @ s - b[0]) / W[0, 0], *(-s)])))
     return slides
+
+
+def take_off_friction(W, b, mu, ring_load):
+    """An anchor's take-off friction: the minimizer of ``f W_T f / 2 + b_T f`` on the disk of radius ``mu L`` (float64)."""
+    WT = np.asarray(W, np.float64)[1:, 1:]
+    bT = np.asarray(b, np.float64)[1:]
+    radius = mu * ring_load
+    f = -np.linalg.solve(WT, bT)
+    if np.linalg.norm(f) <= radius:
+        return f
+    lo, hi = 0.0, 1.0
+    while np.linalg.norm(np.linalg.solve(WT + hi * np.eye(2), bT)) > radius:
+        hi *= 2.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if np.linalg.norm(np.linalg.solve(WT + mid * np.eye(2), bT)) > radius else (lo, mid)
+    return -np.linalg.solve(WT + hi * np.eye(2), bT)
 
 
 class TestContactUnitLatch(unittest.TestCase):
