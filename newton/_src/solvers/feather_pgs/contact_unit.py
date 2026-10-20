@@ -9,10 +9,20 @@ rows and the tangent pairs of at most two anchors, whose disk radius is the
 anchor's coefficient times the ring's total normal impulse) or a frictionless
 ring. A Gauss-Seidel visit of a unit solves the unit's local complementarity
 problem with every other impulse held (non-smooth Gauss-Seidel, Jourdan, Alart
-and Jean 1998), in a fixed branch order:
+and Jean 1998). Every solution of the whole problem solves each unit's problem,
+so the visit returns the unit's impulses whenever they solve it, also where the
+problem has several solutions (a sliding contact whose friction presses its
+normal down, a Painleve-type non-uniqueness): the visit keeps the branch the
+unit holds.
 
 * take-off: no normal impulse, the friction of an anchor whose ring keeps a load
-  ``L`` on the disk of radius ``mu * L``;
+  ``L`` on the disk of radius ``mu * L``; an unloaded unit tries it first, a
+  loaded unit after its loaded branches, keeping whichever of the two solutions
+  lies nearer its impulses in the W-norm;
+* the friction's own slide root: a friction on its disk's boundary resumes it
+  first, by Newton on ``h(alpha) = |s| + mu g.s - mu S0`` from the root it
+  implies, inside ``(0, |c| (1 + mu |g|) / (mu |S0|) - e_min)``, which holds
+  every root also where the friction presses the normal (``S0 <= 0``);
 * stick: the Schur complement of the normal row, ``A = W_TT - w w^T / W_nn``,
   solved in its eigenbasis;
 * slide: Daviet's single-unknown root (Daviet, Bertails-Descoubes and Boissieux
@@ -22,13 +32,22 @@ and Jean 1998), in a fixed branch order:
   in the bracket; a Schur complement that vanishes (a rank-one block) takes the
   closed-form root.
 
-The friction is finally clamped to the disk of the final load, so the result is
-exactly feasible. A ring unit solves its normals by an active set over their
-proximally regularized block, then each anchor by the point routine on the
-friction Schur complement (two alternations for two anchors). The alternation
-latch relaxes a unit whose load change keeps reversing, which every fixed point
-of the exact sweep survives: a unit whose exact solution equals its impulses
-does not move for any relaxation factor.
+A resumed root's load answers the contact's approach (``S0``) with
+``dS/dS0 = (d|s|/dalpha) / h'``: negative where ``h`` rises through zero (the
+middle one of several slides) and large where the friction's pressing nearly
+balances the normal stiffness. The exact solve repels the sweep from such a
+solution, so where that response is negative or above
+:data:`CONTACT_UNIT_SPLIT_GAIN` times the normal row's own, the unit takes its
+normal with the friction held, then the friction on that load's disk: the same
+solution, approached with the normal row's response. The friction is finally
+clamped to the disk of the final load, so the result is exactly feasible.
+
+A ring unit solves its normals by an active set over their proximally
+regularized block, from its loaded members, then each anchor by the point
+routine on the friction Schur complement from its current friction (two
+alternations for two anchors). The alternation latch relaxes a unit whose load change keeps reversing, which
+every fixed point of the exact sweep survives: a unit whose exact solution
+equals its impulses does not move for any relaxation factor.
 
 The law is written once, as C++ text. :func:`get_unit_source` binds backend
 intrinsics around it: the CUDA binding is the device prelude
@@ -52,6 +71,9 @@ CONTACT_UNIT_RING_PASSES = 2
 """Alternations of the two anchors of a ring unit."""
 CONTACT_UNIT_PROXIMAL = 1.0e-4
 """Proximal weight of a ring's normal block: SPD in float32 for coplanar faces, the same fixed point."""
+CONTACT_UNIT_SPLIT_GAIN = 8.0
+"""Largest load response of a resumed slide to the contact's approach, relative to the normal row's own, that keeps
+the exact solve; a larger or negative one takes the normal with the friction held, then the friction."""
 
 # The block a ring unit reads and writes, per world: its row-major Delassus block (12 x 12), the residuals with its
 # own impulses removed, its impulses, the solution and the two anchors' slide roots.
@@ -63,8 +85,10 @@ RING_ALPHA = 180
 RING_BLOCK_SIZE = 192
 
 _UNIT = Template(r"""
-    struct ContactUnitRoot { float s0, s1, alpha; int evaluations; };
-    // mode: 1 stick, 2 slide, 3 no load to slide on.
+    // split: the root's load answers the contact's approach with the wrong sign or above ${gain} times the normal
+    // row's own response, so the exact solve repels the sweep from it.
+    struct ContactUnitRoot { float s0, s1, alpha; int evaluations, split; };
+    // mode: 1 stick, 2 slide, 3 no load to slide on, 4 slide whose exact solve repels the sweep.
     struct ContactUnitFriction { float friction0, friction1, alpha; int evaluations, mode; };
     struct ContactUnitSolution { float normal, friction0, friction1, alpha; int evaluations; };
     struct ContactUnitLatch { float weight, factor, change; };
@@ -102,7 +126,7 @@ _UNIT = Template(r"""
             const float ng = ${sqrt}(gx * gx + gy * gy);
             float lo = 0.0f;
             float hi = ${max}(nc * (1.0f + mu * ng) * target - e2, 0.0f) * 1.000001f + 1.0e-30f;
-            ContactUnitRoot out{0.0f, 0.0f, 0.0f, 0};
+            ContactUnitRoot out{0.0f, 0.0f, 0.0f, 0, 0};
             float x = -1.0f;
             if (e1 == 0.0f) {
                 const float ee = (e1 * cx * cx + e2 * cy * cy) / ${max}(nc * nc, 1.0e-30f);
@@ -163,10 +187,55 @@ _UNIT = Template(r"""
             return out;
         }
 
+        // The slide root of the current friction: Newton on h(alpha) = |s| + mu g.s - mu S0, the friction's excess
+        // over its disk, from the root that friction implies, without a bracket, inside (0, |c| (1 + mu |g|) /
+        // (mu |S0|) - e2), which holds every root for either sign of S0 (the friction presses the normal where
+        // S0 < 0). Converged within 2e-6 of the terms of h, which stay well-scaled when the pressing friction carries
+        // most of the load. alpha -1 when no root is met within cap evaluations. The root's load S = |s| / mu answers
+        // S0 with dS/dS0 = (d|s|/dalpha) / h': negative where h rises (the middle one of several slides), large
+        // where the friction's pressing nearly balances the normal stiffness.
+        static ${noinline} ContactUnitRoot resume(float e1, float e2, float cx, float cy, float gx, float gy, float S0,
+                                                  float mu, float start, int cap) {
+            const float load = mu * S0;
+            const float nc = ${sqrt}(cx * cx + cy * cy);
+            const float ng = ${sqrt}(gx * gx + gy * gy);
+            const float hi = ${max}(nc * (1.0f + mu * ng) / ${abs}(load) - e2, 0.0f) * 1.000001f + 1.0e-30f;
+            ContactUnitRoot out{0.0f, 0.0f, -1.0f, 0, 0};
+            float x = start;
+            for (int it = 0; it < cap; ++it) {
+                if (!(x > 0.0f && x < hi)) break;
+                const float ix = 1.0f / (e1 + x);
+                const float iy = 1.0f / (e2 + x);
+                const float sx = cx * ix;
+                const float sy = cy * iy;
+                out.evaluations += 1;
+                const float ns = ${sqrt}(sx * sx + sy * sy);
+                if (!(ns > 0.0f)) break;
+                const float gs = mu * (gx * sx + gy * sy);
+                const float h = ns + gs - load;
+                const float dns = -(sx * sx * ix + sy * sy * iy) / ns;
+                const float dh = dns - mu * (gx * sx * ix + gy * sy * iy);
+                if (${abs}(h) <= 2.0e-6f * (ns + ${abs}(gs))) {
+                    out.s0 = sx;
+                    out.s1 = sy;
+                    out.alpha = x;
+                    const float gain = dns / dh;
+                    if (dh > 0.0f || gain > ${gain}f) out.split = 1;
+                    return out;
+                }
+                if (!(dh != 0.0f)) break;
+                x = x - h / dh;
+            }
+            return out;
+        }
+
         // Friction of one anchor on its Schur complement A = [[a, c12], [c12, d]] with residual c and load
-        // S(f) = S0 + g.f: stick when its load stays at least Smin, else slide. No friction without a coefficient.
+        // S(f) = S0 + g.f, current friction (f1, f2) on its current load: a current friction on its disk's boundary
+        // resumes its slide root first, so a problem with several solutions keeps the one the unit holds; else
+        // stick when its load stays at least Smin, else slide. No friction without a coefficient.
         static ${inline} ContactUnitFriction friction(float a, float c12, float d, float c1, float c2, float S0,
-                                                     float g1, float g2, float mu, float alpha0, int cap, float Smin) {
+                                                     float g1, float g2, float mu, float alpha0, int cap, float Smin,
+                                                     float f1, float f2, float load) {
             ContactUnitFriction out{0.0f, 0.0f, 0.0f, 1, 1};
             if (!(mu > 0.0f)) return out;
             float e1, e2, vx, vy;
@@ -175,6 +244,24 @@ _UNIT = Template(r"""
             const float cy = -vy * c1 + vx * c2;
             const float gx = vx * g1 + vy * g2;
             const float gy = -vy * g1 + vx * g2;
+            const float px = -(vx * f1 + vy * f2);
+            const float py = vy * f1 - vx * f2;
+            const float np2 = px * px + py * py;
+            const float Rc = 0.99999f * mu * load;
+            if (np2 > 0.0f && load > 0.0f && np2 >= Rc * Rc && S0 != 0.0f) {
+                // Its root: (A + alpha I) s = c along s, the velocity c - A s parallel to s.
+                const float start = (px * (cx - e1 * px) + py * (cy - e2 * py)) / np2;
+                const ContactUnitRoot root = resume(e1, e2, cx, cy, gx, gy, S0, mu, start, cap);
+                out.evaluations += root.evaluations;
+                if (root.alpha > 0.0f) {
+                    out.friction0 = -(vx * root.s0 - vy * root.s1);
+                    out.friction1 = -(vy * root.s0 + vx * root.s1);
+                    out.alpha = root.alpha;
+                    out.mode = 2;
+                    if (root.split != 0) out.mode = 4;
+                    return out;
+                }
+            }
             if (e2 > 0.0f) {
                 const float sx = cx / e1;
                 const float sy = cy / e2;
@@ -209,19 +296,30 @@ _UNIT = Template(r"""
             return out;
         }
 
+        // The squared W-norm of (d0, d1, d2) over the 3x3 block [[wnn, wn1, wn2], [wn1, w11, w12], [wn2, w12, w22]].
+        static ${inline} float wnorm(float wnn, float w11, float w12, float w22, float wn1, float wn2, float d0,
+                                     float d1, float d2) {
+            return wnn * d0 * d0 + w11 * d1 * d1 + w22 * d2 * d2 + 2.0f * (wn1 * d0 * d1 + wn2 * d0 * d2 + w12 * d1 * d2);
+        }
+
         // One contact (or one patch anchor whose ring keeps the load L of its other normals) against its 3x3 block
-        // [[wnn, wn1, wn2], [wn1, w11, w12], [wn2, w12, w22]] with residual b at zero own impulse. The returned
-        // alpha is the slide root, -1 for take-off and stick.
+        // [[wnn, wn1, wn2], [wn1, w11, w12], [wn2, w12, w22]] with residual b at zero own impulse and current
+        // impulses (on, of1, of2). An unloaded unit takes off first; a loaded one solves its loaded branches first
+        // (its slide root, else stick, else slide) and, where take-off solves its problem too, keeps whichever
+        // solution lies nearer its impulses in the W-norm. The solve returns the current impulses whenever they solve
+        // the problem. The returned alpha is the slide root, -1 for take-off and stick.
         static ${inline} ContactUnitSolution solve(float wnn, float w11, float w12, float w22, float wn1, float wn2,
-                                                  float bn, float b1, float b2, float mu, float L, float alpha0, int cap) {
+                                                  float bn, float b1, float b2, float mu, float L, float alpha0, int cap,
+                                                  float on, float of1, float of2) {
             ContactUnitSolution out{0.0f, 0.0f, 0.0f, -1.0f, 0};
             float tfx = 0.0f;
             float tfy = 0.0f;
             int takeoff = 0;
-            if (bn >= 0.0f) {
+            const float load = on + L;
+            if (bn >= 0.0f && !(on > 0.0f)) {
                 if (L > 0.0f) {
                     const ContactUnitFriction tf = friction(w11, w12, w22, b1, b2, L, 0.0f, 0.0f, mu,
-                                                            -1.0f, cap, L);
+                                                            -1.0f, cap, L, of1, of2, load);
                     tfx = tf.friction0;
                     tfy = tf.friction1;
                     takeoff = 1;
@@ -235,9 +333,33 @@ _UNIT = Template(r"""
             const float inv = 1.0f / wnn;
             const ContactUnitFriction r = friction(w11 - wn1 * wn1 * inv, w12 - wn1 * wn2 * inv, w22 - wn2 * wn2 * inv,
                                                    b1 - bn * inv * wn1, b2 - bn * inv * wn2, -bn * inv + L, -wn1 * inv,
-                                                   -wn2 * inv, mu, alpha0, cap, L);
+                                                   -wn2 * inv, mu, alpha0, cap, L, of1, of2, load);
             out.evaluations = r.evaluations;
-            if (r.mode == 1 || r.mode == 2) {
+            int found = 0;
+            if (r.mode == 4) {
+                // A slide whose load answers the contact's approach with the wrong sign, or many times the normal row
+                // alone, repels an exact solve: take the normal with the current friction held, then the friction on
+                // that load's disk. A solution stays put, as under the exact solve.
+                const float xs = ${max}((-bn - wn1 * of1 - wn2 * of2) * inv, 0.0f);
+                const ContactUnitFriction q = friction(w11, w12, w22, b1 + wn1 * xs, b2 + wn2 * xs, xs + L, 0.0f, 0.0f,
+                                                       mu, -1.0f, cap, xs + L, of1, of2, load);
+                out.evaluations += q.evaluations;
+                const float R = mu * (xs + L);
+                float g1 = q.friction0;
+                float g2 = q.friction1;
+                const float ng = ${sqrt}(g1 * g1 + g2 * g2);
+                if (ng > R) {
+                    float sc = 0.0f;
+                    if (ng > 0.0f) sc = R / ng;
+                    g1 *= sc;
+                    g2 *= sc;
+                }
+                out.normal = xs;
+                out.friction0 = g1;
+                out.friction1 = g2;
+                out.alpha = r.alpha;
+                found = 1;
+            } else if (r.mode == 1 || r.mode == 2) {
                 const float xn = (-bn - wn1 * r.friction0 - wn2 * r.friction1) * inv;
                 if (xn >= 0.0f) {
                     const float R = mu * (xn + L);
@@ -254,12 +376,35 @@ _UNIT = Template(r"""
                     out.friction0 = f1;
                     out.friction1 = f2;
                     if (r.mode == 2) out.alpha = r.alpha;
-                    return out;
+                    found = 1;
                 }
+            }
+            if (found != 0) {
+                if (bn >= 0.0f && on > 0.0f) {
+                    // Take-off may solve this problem too (friction pressing the normal): keep the nearer solution.
+                    if (L > 0.0f) {
+                        const ContactUnitFriction tf = friction(w11, w12, w22, b1, b2, L, 0.0f, 0.0f, mu, -1.0f, cap,
+                                                                L, of1, of2, load);
+                        tfx = tf.friction0;
+                        tfy = tf.friction1;
+                    }
+                    if (bn + wn1 * tfx + wn2 * tfy >= 0.0f) {
+                        const float dl = wnorm(wnn, w11, w12, w22, wn1, wn2, out.normal - on, out.friction0 - of1,
+                                               out.friction1 - of2);
+                        const float dt = wnorm(wnn, w11, w12, w22, wn1, wn2, -on, tfx - of1, tfy - of2);
+                        if (dt < dl) {
+                            out.normal = 0.0f;
+                            out.friction0 = tfx;
+                            out.friction1 = tfy;
+                            out.alpha = -1.0f;
+                        }
+                    }
+                }
+                return out;
             }
             if (L > 0.0f && takeoff == 0) {
                 const ContactUnitFriction tf = friction(w11, w12, w22, b1, b2, L, 0.0f, 0.0f, mu,
-                                                        -1.0f, cap, L);
+                                                        -1.0f, cap, L, of1, of2, load);
                 tfx = tf.friction0;
                 tfy = tf.friction1;
             }
@@ -350,6 +495,9 @@ _UNIT = Template(r"""
                 act[best] = 1;
             }
             for (int f = 0; f < nF; ++f) F[f] = old[k + f];
+            // The ring's current load, on whose disks its anchors' current friction lies.
+            float held = 0.0f;
+            for (int i = 0; i < k; ++i) held += old[i];
             float vscale = 1.0e-4f;
             for (int i = 0; i < k; ++i) vscale = ${max}(vscale, ${abs}(B[i]));
             for (int outer = 0; outer < 3 * 8 + 3; ++outer) {
@@ -450,9 +598,10 @@ _UNIT = Template(r"""
                             if (jj == 1) muj = mu1;
                             const ContactUnitFriction r = friction(ASC[f0 * 4 + f0], ASC[f0 * 4 + f0 + 1],
                                                                    ASC[(f0 + 1) * 4 + f0 + 1], c1, c2, s0j, GS[f0],
-                                                                   GS[f0 + 1], muj, alpha[jj], cap, 0.0f);
+                                                                   GS[f0 + 1], muj, alpha[jj], cap, 0.0f, F[f0],
+                                                                   F[f0 + 1], held);
                             evaluations += r.evaluations;
-                            if (r.mode == 2) alpha[jj] = r.alpha;
+                            if (r.mode == 2 || r.mode == 4) alpha[jj] = r.alpha;
                             F[f0] = r.friction0;
                             F[f0 + 1] = r.friction1;
                         }
@@ -550,7 +699,7 @@ def get_unit_source(*, cpu: bool = False) -> str:
             "min": "fminf",
             "abs": "fabsf",
         }
-    return _UNIT.substitute(bindings)
+    return _UNIT.substitute(bindings, gain=repr(CONTACT_UNIT_SPLIT_GAIN))
 
 
 CONTACT_UNIT = DevicePrelude("contact_unit", get_unit_source())
@@ -567,7 +716,7 @@ root evaluations."""
     _CPU_UNIT
     + r"""
     const ContactUnitSolution s = ContactUnit::solve(w_nn, w_t0, w_t01, w_t1, w_nt0, w_nt1, b_n, b_t0, b_t1, mu,
-                                                     ring_load, alpha, cap);
+                                                     ring_load, alpha, cap, x_n, x_t0, x_t1);
     wp::vec_t<5, wp::float32> out;
     out.c[0] = s.normal;
     out.c[1] = s.friction0;
@@ -591,12 +740,19 @@ def contact_unit_solve(
     ring_load: float,
     alpha: float,
     cap: int,
+    x_n: float,
+    x_t0: float,
+    x_t1: float,
 ) -> ContactUnitPoint:
     """Solve one point contact, or one patch anchor with its ring's other load held, against its 3x3 block.
 
     The block is ``[[w_nn, w_nt0, w_nt1], [w_nt0, w_t0, w_t01], [w_nt1, w_t01, w_t1]]``; ``b`` is the residual
-    of the unit's rows with its own impulses removed. Take-off keeps an anchor's friction on the disk of radius
-    ``mu * ring_load``; ``alpha`` warm-starts the slide root when it lies in the bracket.
+    of the unit's rows with its own impulses removed and ``x`` its current impulses. Take-off keeps an anchor's
+    friction on the disk of radius ``mu * ring_load``; ``alpha`` warm-starts the slide root when it lies in the
+    bracket. The current impulses are returned whenever they solve the unit's problem, also where that problem has
+    several solutions: an unloaded unit takes off first, a loaded one solves its loaded branches first and keeps the
+    nearer (in the W-norm) of that solution and take-off, and a current friction on its disk's boundary first
+    resumes its own slide root.
 
     Returns:
         The normal impulse, the two friction impulses, the slide root (-1 for take-off and stick) and the root

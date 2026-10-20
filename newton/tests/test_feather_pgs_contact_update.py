@@ -73,7 +73,7 @@ W0_ALTERNATING = np.array([-0.38, -0.44, -0.26, -0.09, -0.24, -0.15])
 # and friction law (test_sweeps_from_a_reference_leave_only_the_recorded_ones).
 _LEFT_REFERENCES = {
     "sequential": {"point": {2114}, "patch": {2549}},
-    "unit": {"point": {276, 308, 1477, 1677, 2053, 2069}, "patch": {260, 276, 1647, 1663, 1677}},
+    "unit": {"point": set(), "patch": set()},
 }
 
 
@@ -438,22 +438,6 @@ def residuals(system, lam):
     return r, w
 
 
-def first_moved_unit(system, lam, tolerance):
-    """The rows, normals and anchor count of the first contact unit (in sweep order) that moved from the reference."""
-    rtype, parent = system["rtype"], system["parent"]
-    seen = set()
-    for n in np.flatnonzero(rtype == CONTACT):
-        if n in seen:
-            continue
-        normals = sorted(ring_of(system, int(n)))
-        seen.update(normals)
-        pairs = [r + 1 for r in normals if r + 2 < len(rtype) and rtype[r + 1] == FRICTION and parent[r + 1] == r]
-        rows = normals + [x for p in pairs for x in (p, p + 1)]
-        if np.abs(lam[rows] - system["lam_ref"][rows]).max() >= tolerance:
-            return rows, normals, len(pairs)
-    return None, None, 0
-
-
 def group_loads(system, lam):
     normals = np.flatnonzero(system["rtype"] == CONTACT)
     return np.bincount(system["group"][normals], weights=lam[normals], minlength=int(system["group"].max()) + 1)
@@ -774,63 +758,48 @@ class TestContactUpdateReplica(unittest.TestCase):
                 with self.subTest(law=law, system=system["source"]):
                     self.assertLess(np.abs(lam - system["lam_ref"]).max(), 1.0e-5 * np.abs(system["lam_ref"]).max())
 
-    def test_unit_sweep_leaves_a_reference_only_for_another_local_solution(self):
-        """Move a certified reference in one unit sweep only to another solution of the moved unit's own problem.
+    def test_reference_is_a_fixed_point_of_the_unit_sweep(self):
+        """Keep every certified reference in one unit sweep, to 1e-5 of its largest impulse, with point units.
 
-        The unit sweep solves each unit's local problem in a fixed branch order (take-off, else stick, else slide).
-        Where that problem has several solutions (a sliding contact whose friction presses its normal down also
-        admits take-off or a stick), one sweep leaves a reference built on another branch. The first unit it moves
-        sees the reference itself. A point unit lands on another exact solution of its local problem when its slide
-        root converges within the evaluation cap; a root the cap stops short lands off it by its own residual (none
-        of these references; 12 point and 4 patch references of the bench). A ring unit's split among dependent
-        normals, proximal step and two-anchor alternation are transient, and its sweeps return to a solution. This
-        is a local check: test_sweeps_from_a_reference_leave_only_the_recorded_ones records whether the whole
-        iteration returns.
-        """
-        for law in self.systems:
-            tight = self.tight(law)
-            start = [s["lam_ref"] for s in tight]
-            for system, lam in zip(tight, World(tight).sweep(1, "unit", start=start), strict=True):
-                reference = system["lam_ref"]
-                tolerance = 1.0e-5 * np.abs(reference).max()
-                if np.abs(lam - reference).max() < tolerance:
-                    continue
-                with self.subTest(law=law, system=system["source"]):
-                    rows, normals, _ = first_moved_unit(system, lam, tolerance)
-                    self.assertIsNotNone(rows)
-                    if len(normals) == 1:
-                        state = reference.copy()
-                        state[rows] = lam[rows]
-                        self.assertLessEqual(residuals(system, reference)[0][rows].max(), 1.0e-5)
-                        self.assertLessEqual(residuals(system, state)[0][rows].max(), 1.0e-5)
-                    else:
-                        later = World([system]).sweep(32, "unit", start=[reference])[0]
-                        self.assertLessEqual(residuals(system, later)[0].max(), 1.0e-5)
-
-    def test_sweeps_from_a_reference_leave_only_the_recorded_ones(self):
-        """Leave exactly the recorded certified references within 256 sweeps started from them, under each update.
-
-        DESIGN's fixed-point guard asks one sweep to keep a certified reference and the sweeps to stay there. One
-        sequential sweep keeps every reference, but its period-two cycle repels two of them (point 2114, patch 2549)
-        within 256 sweeps. One unit sweep moves 6 of the 12 point and 7 of the 14 patch references and returns from
-        the two rings within 32 sweeps. The other 11 are sliding contacts whose friction presses their normal down
-        (kappa 1.03 to 1.46): the unit takes off the 8 whose normal separates at zero impulse and sticks the 3 that a
-        stick also solves, and the sweeps stay 2.7e-3 to 0.12 m/s from a solution after 512 sweeps. Skipping
-        take-off for a loaded unit (the block design's continuity rule) sticks 6 of the 8 instead and leaves the
-        other 2 taking off, since their slide, loaded only by that pressing, lies outside the solve's bracket; the
-        sets do not change. On 1,500 bench systems per law of the same replica set, 256 sweeps from certified
-        references leave 11 of 1,376 point and 21 of 1,112 patch ones under the unit sweep with or without that rule
-        (5 and 4 under the sequential sweep), while from a cold start the unit sweep leaves fewer unconverged at 256
-        sweeps (129 against 208 point, 55 against 151 patch). Keeping a sliding unit on its slide is an open
-        decision; a change of the law that alters these sets fails here and must record its measured sets.
+        Every solution of the whole problem solves each unit's problem, so the unit returns the impulses it holds where
+        that problem has several solutions: sliding contacts whose friction presses their normal down (kappa 1.03 to
+        1.46) also admit take-off or a stick, and a branch order of take-off, stick, slide left 6 of the 12 point and 5
+        of the 14 patch references here. The slide roots of these contacts, which a negative ``S0 = -b_n / W_nn``
+        puts outside the bracket of a positive one, and roots the evaluation cap stops short from scratch, are resumed
+        from the held friction. Patch regions run as anchor units (patch Stage A), point solves with their ring's
+        other load held.
         """
         for law in self.systems:
             tight = self.tight(law)
             world = World(tight)
-            for update in ("sequential", "unit"):
-                later = world.sweep(256, update, start=[s["lam_ref"] for s in tight])
+            start = [s["lam_ref"] for s in tight]
+            for ring_units in (0,) if law == "patch" else (1,):
+                after = world.sweep(1, "unit", start=start, ring_units=ring_units)
+                for system, lam in zip(tight, after, strict=True):
+                    with self.subTest(law=law, ring_units=ring_units, system=system["source"]):
+                        reference = system["lam_ref"]
+                        self.assertLess(np.abs(lam - reference).max(), 1.0e-5 * np.abs(reference).max())
+
+    def test_sweeps_from_a_reference_leave_only_the_recorded_ones(self):
+        """Leave exactly the recorded certified references within 256 sweeps started from them, under each update.
+
+        One sequential sweep keeps every reference, but its period-two cycle repels two of them (point 2114, patch
+        2549) within 256 sweeps. The unit sweeps keep every reference, also where a unit's problem has several
+        solutions (test_reference_is_a_fixed_point_of_the_unit_sweep), and stay there. A slide whose load answers the
+        contact's approach with the wrong sign (the middle one of several slides) or more than 8 times its normal
+        row's own response repels an exact solve: without the normal-then-friction step such a unit takes, 256 sweeps
+        leave point 276, 308, 2053, 2069 and 1477 (the last one by its gain) and patch 260, 276, 1647 and 1663. On
+        1,500 bench systems per law of the same replica set, 256 unit sweeps from certified references leave 0 of
+        1,376 point and 1 of 1,112 patch ones (5 and 4 under the sequential sweep). Patch rings also run as anchor
+        units. A change of the law that alters these sets fails here and must record its measured sets.
+        """
+        for law in self.systems:
+            tight = self.tight(law)
+            world = World(tight)
+            for update, ring_units in self.updates(law):
+                later = world.sweep(256, update, start=[s["lam_ref"] for s in tight], ring_units=ring_units)
                 left = {s["source"] for s, lam in zip(tight, later, strict=True) if residuals(s, lam)[0].max() > 1.0e-3}
-                with self.subTest(law=law, update=update):
+                with self.subTest(law=law, update=update, ring_units=ring_units):
                     self.assertEqual(left, _LEFT_REFERENCES[update][law])
 
     def test_stationary_states_solve_the_ncp(self):
@@ -864,7 +833,8 @@ class TestContactUpdateSolveState(unittest.TestCase):
         One launch of 8 or 64 sweeps equals as many one-sweep launches that continue it (iteration_offset 1, 2,
         ...), as the interleaved split driver launches them, bitwise; a new solve equals a fresh one whatever the
         previous solve left. Restarting the solve at every launch, as the prototype harness did, changes the
-        result of most stored systems.
+        result of 13 and 14 of the 27 stored systems at 8 and 64 sweeps: their latches restart, and the slide roots
+        that a held friction does not resume.
         """
         systems = replica_systems("point") + replica_systems("patch")
         fresh = {sweeps: World(systems).sweep(sweeps, "unit") for sweeps in (8, 64)}
@@ -878,7 +848,7 @@ class TestContactUpdateSolveState(unittest.TestCase):
                     np.testing.assert_array_equal(continued[k][-1], fresh[sweeps][k])
                     np.testing.assert_array_equal(again[k], fresh[sweeps][k])
             changed = sum(not np.array_equal(h[-1], lam) for h, lam in zip(restarted, fresh[sweeps], strict=True))
-            self.assertGreater(changed, len(systems) // 2)
+            self.assertGreaterEqual(changed, len(systems) // 3)
 
     def test_free_body_unit_state_lasts_one_solve(self):
         """Continue and clear the free-body unit sweep's state as the loop sweep's, on two contacts that alternate.

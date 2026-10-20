@@ -8,7 +8,10 @@ These are the ``"unit"`` variants of the loop sweeps :func:`~.kernels.pgs_solve_
 rows): one thread sweeps one world in the same forward row order. A contact
 unit (:mod:`.contact_unit`) is visited at its first row, where all of its rows
 take the unit's exact local solution against the residuals of the same
-impulses; its other rows are not visited again in that sweep. Rows outside
+impulses; its other rows are not visited again in that sweep. The local solve
+sees the unit's current impulses and returns them whenever they solve its
+problem, so every solution of the whole problem is a fixed point of the
+sweeps. Rows outside
 units, frictionless point normals, and every row while friction has not
 started (``friction_start_iteration``), keep the ``"sequential"`` update of the
 original sweep. A unit's exact solution ignores ``pgs_omega``; only its
@@ -241,6 +244,9 @@ def _dense_point_unit(
         ring_load,
         unit_state[world, n, _STATE_ALPHA],
         _CAP,
+        o_n,
+        o_t0,
+        o_t1,
     )
     if solution[3] > 0.0:
         unit_state[world, n, _STATE_ALPHA] = solution[3]
@@ -752,6 +758,9 @@ def _mf_point_unit(
         ring_load,
         unit_state[world, n, _STATE_ALPHA],
         _CAP,
+        o_n,
+        o_t0,
+        o_t1,
     )
     if solution[3] > 0.0:
         unit_state[world, n, _STATE_ALPHA] = solution[3]

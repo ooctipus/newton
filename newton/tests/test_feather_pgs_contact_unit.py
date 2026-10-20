@@ -21,7 +21,8 @@ from newton._src.solvers.feather_pgs.device_preludes import cuda_native
 
 wp.init()
 
-_POINT_FIELDS = 13  # w_nn, w_t0, w_t01, w_t1, w_nt0, w_nt1, b_n, b_t0, b_t1, mu, ring_load, alpha, cap
+# w_nn, w_t0, w_t01, w_t1, w_nt0, w_nt1, b_n, b_t0, b_t1, mu, ring_load, alpha, cap, x_n, x_t0, x_t1
+_POINT_FIELDS = 16
 _CPU = "cpu"
 
 
@@ -42,6 +43,9 @@ def _solve_points(problems: wp.array2d[float], out: wp.array2d[float]):
         problems[i, 10],
         problems[i, 11],
         int(problems[i, 12]),
+        problems[i, 13],
+        problems[i, 14],
+        problems[i, 15],
     )
     for j in range(5):
         out[i, j] = r[j]
@@ -79,9 +83,9 @@ def _solve_ring(
 
 
 _NATIVE_BODY = r"""
-    const float* p = problems.data + i * 13;
+    const float* p = problems.data + i * 16;
     const ContactUnitSolution s = ContactUnit::solve(p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10],
-                                                     p[11], static_cast<int>(p[12]));
+                                                     p[11], static_cast<int>(p[12]), p[13], p[14], p[15]);
     float* o = out.data + i * 5;
     o[0] = s.normal;
     o[1] = s.friction0;
@@ -111,10 +115,12 @@ def solve_points(problems, device=_CPU):
     return out.numpy().astype(np.float64)
 
 
-def point_problem(W, b, mu, ring_load=0.0, alpha=-1.0, cap=contact_unit.CONTACT_UNIT_NEWTON_CAP):
-    """Pack a symmetric 3x3 block [normal, t0, t1] and its residual into one problem row."""
+def point_problem(
+    W, b, mu, ring_load=0.0, alpha=-1.0, cap=contact_unit.CONTACT_UNIT_NEWTON_CAP, current=(0.0, 0.0, 0.0)
+):
+    """Pack a symmetric 3x3 block [normal, t0, t1], its residual and the unit's current impulses into a problem row."""
     W = np.asarray(W, np.float64)
-    return [W[0, 0], W[1, 1], W[1, 2], W[2, 2], W[0, 1], W[0, 2], b[0], b[1], b[2], mu, ring_load, alpha, cap]
+    return [W[0, 0], W[1, 1], W[1, 2], W[2, 2], W[0, 1], W[0, 2], b[0], b[1], b[2], mu, ring_load, alpha, cap, *current]
 
 
 def disk_projection(f, radius):
@@ -306,24 +312,101 @@ class TestContactUnitPoint(unittest.TestCase):
             checked += 1
         self.assertGreater(checked, 150)
 
-    def test_non_unique_problem_takes_the_first_branch(self):
-        """Take off where the contact's own problem also has a loaded stick and a loaded slide.
+    def test_non_unique_problem_keeps_the_current_branch(self):
+        """Keep each of the three solutions of a contact whose friction presses its normal down.
 
-        Friction that presses the normal down, with ``mu w.u / W_nn`` 1.5 here, lets a contact that separates at
-        zero impulse hold load as well: this problem has three exact solutions. The solve takes the first of
-        take-off, stick and slide, so a state built on another branch is not kept by a unit sweep.
+        With ``mu w.u / W_nn`` 1.5, a contact that separates at zero impulse can hold load as well: take-off, a stick
+        and a slide all solve its problem. Every solution of the whole problem solves each unit's problem, so the solve
+        returns the solution the unit holds: take-off from no impulse, the stick from the stick, the slide from the
+        slide.
         """
         W = np.array([[1.0, 1.5, 0.0], [1.5, 3.0, 0.0], [0.0, 0.0, 3.0]])
         b = np.array([0.1, 0.5, 0.0])
         mu = 1.0
-        take_off = np.zeros(3)
+        solutions = {
+            "take-off": np.zeros(3),
+            "stick": np.array([0.6, -0.35 / 0.75, 0.0]),
+            "slide": np.array([0.2, -0.2, 0.0]),
+        }
+        for branch, x in solutions.items():
+            with self.subTest(branch=branch):
+                self.assertLess(point_residual(W, b, mu, x), 1.0e-12)
+                out = solve_points(point_problem(W, b, mu, current=x))[0]
+                np.testing.assert_allclose(out[:3], x, atol=1.0e-6)
+
+    def test_loaded_unit_keeps_the_nearer_solution(self):
+        """Take the solution nearer a loaded contact's impulses where its problem also admits take-off.
+
+        The three-solution contact of test_non_unique_problem_keeps_the_current_branch, held at impulses that solve
+        nothing: a small load just inside the cone, nearer take-off than its stick, takes off; a load near the stick
+        sticks. A fixed order of either branch would leave one of them on the farther solution.
+        """
+        W = np.array([[1.0, 1.5, 0.0], [1.5, 3.0, 0.0], [0.0, 0.0, 3.0]])
+        b = np.array([0.1, 0.5, 0.0])
+        mu = 1.0
         stick = np.array([0.6, -0.35 / 0.75, 0.0])
-        slide = np.array([0.2, -0.2, 0.0])
-        for x in (take_off, stick, slide):
-            self.assertLess(point_residual(W, b, mu, x), 1.0e-12)
-        out = solve_points(point_problem(W, b, mu))[0]
-        np.testing.assert_array_equal(out[:3], take_off)
-        self.assertEqual(out[3], -1.0)
+        for current, expected in (((0.05, -0.04, 0.0), np.zeros(3)), ((0.55, -0.43, 0.0), stick)):
+            with self.subTest(current=current):
+                out = solve_points(point_problem(W, b, mu, current=current))[0]
+                np.testing.assert_allclose(out[:3], expected, atol=1.0e-6)
+
+    def test_press_coupled_slides_are_found(self):
+        """Find and keep the slides of a contact that separates at zero impulse and has no stick.
+
+        Its friction presses the normal down, so ``S0 = -b_n / W_nn`` is negative: the problem has take-off and two
+        slides, outside the bracket ``[0, |c| (1 + mu |g|) / (mu S0) - e2]`` of the slide root, which needs ``S0 > 0``.
+        Held on one of them, the unit's friction lies on its disk's boundary and resumes that root, which the bracket
+        ``(0, |c| (1 + mu |g|) / (mu |S0|) - e2)`` of either sign holds; from no impulse the contact takes off.
+        """
+        W = np.array([[1.0, -0.7, -0.9], [-0.7, 0.69, 0.63], [-0.9, 0.63, 2.11]])
+        b = np.array([0.02, -0.4, -0.2])
+        mu = 1.2
+        slides = slide_solutions(W, b, mu)
+        self.assertEqual(len(slides), 2)
+        self.assertLess(-b[0] / W[0, 0], 0.0)
+        self.assertGreater(point_residual(W, b, mu, exact_stick(W, b)), 1.0e-3)
+        np.testing.assert_array_equal(solve_points(point_problem(W, b, mu))[0][:3], 0.0)
+        for alpha, x in slides:
+            with self.subTest(alpha=alpha):
+                self.assertLess(point_residual(W, b, mu, x), 1.0e-9)
+                out = solve_points(point_problem(W, b, mu, current=x))[0]
+                np.testing.assert_allclose(out[:3], x, atol=1.0e-6)
+                self.assertAlmostEqual(out[3], alpha, delta=1.0e-4 * alpha)
+
+    def test_split_slide_takes_the_normal_with_its_friction_held(self):
+        """Step a slide whose load answers the contact's approach with the wrong sign by its normal row, friction held.
+
+        The pressed contact's second slide is the middle root of its problem: its load falls as the contact approaches
+        (``dS/dS0`` about -29), and an exact solve repels the sweep from it. From a friction turned off that slide on
+        its disk, the unit takes the normal impulse that stops its normal row with that friction held, then the
+        friction on that load's disk; the exact solve would return the slide itself.
+        """
+        W = np.array([[1.0, -0.7, -0.9], [-0.7, 0.69, 0.63], [-0.9, 0.63, 2.11]])
+        b = np.array([0.02, -0.4, -0.2])
+        mu = 1.2
+        _, x = slide_solutions(W, b, mu)[1]
+        turn = 0.05
+        f = np.array([[np.cos(turn), -np.sin(turn)], [np.sin(turn), np.cos(turn)]]) @ x[1:]
+        out = solve_points(point_problem(W, b, mu, current=(x[0], *f)))[0]
+        held = (-b[0] - W[0, 1:] @ f) / W[0, 0]
+        self.assertGreater(abs(held - x[0]), 1.0e-3)
+        self.assertAlmostEqual(out[0], held, delta=1.0e-6)
+        self.assertLessEqual(np.linalg.norm(out[1:3]), mu * out[0] * (1.0 + 1.0e-6))
+
+    def test_resumed_root_keeps_a_solved_slide(self):
+        """Keep a slide that solves its contact's problem, where a root from scratch stops at the evaluation cap.
+
+        The strongly lifting contact of test_capped_root_resumes_from_its_warm_start needs 11 Newton evaluations from
+        the isotropic estimate, and the cap leaves it 0.05 m/s from a solution. Held at its solution, the friction
+        resumes its own root, which the first evaluations meet, and the unit stays put.
+        """
+        W = np.array([[0.48623, -0.6174, -0.33833], [-0.6174, 6.20362, 0.46554], [-0.33833, 0.46554, 0.92675]])
+        b = np.array([-0.12804, -1.34818, 0.27253])
+        mu = 0.9
+        exact = exact_contact(W, b, mu)
+        out = solve_points(point_problem(W, b, mu, current=exact))[0]
+        np.testing.assert_allclose(out[:3], exact, rtol=1.0e-5, atol=1.0e-7)
+        self.assertLessEqual(out[4], 3)
 
     def test_capped_root_resumes_from_its_warm_start(self):
         """Resume a slide root that the 8-evaluation cap stopped short from its last iterate on the next visit.
@@ -369,6 +452,46 @@ def exact_contact(W, b, mu):
             lo, hi = (mid, hi) if solve(mid)[1] > 0.0 else (lo, mid)
         s = solve(hi)[0]
     return np.array([(w @ s - b[0]) / W[0, 0], *(-s)])
+
+
+def exact_stick(W, b):
+    """The stick of one point contact: zero velocity on all three rows (float64)."""
+    return np.linalg.solve(np.asarray(W, np.float64), -np.asarray(b, np.float64))
+
+
+def slide_solutions(W, b, mu):
+    """Every slide of one point contact, ``[(alpha, x)]`` by increasing alpha (float64, either sign of ``S0``).
+
+    The slides are the roots of ``h(alpha) = |s| + mu g.s - mu S0`` with ``s = (A + alpha I)^-1 c``, all inside
+    ``(0, |c| (1 + mu |g|) / (mu |S0|) - e2)``: a dense scan brackets them and bisection refines them.
+    """
+    W = np.asarray(W, np.float64)
+    w = W[0, 1:]
+    A = W[1:, 1:] - np.outer(w, w) / W[0, 0]
+    c = b[1:] - b[0] / W[0, 0] * w
+    g = -w / W[0, 0]
+    S0 = -b[0] / W[0, 0]
+    high = np.linalg.norm(c) * (1.0 + mu * np.linalg.norm(g)) / (mu * abs(S0)) - np.linalg.eigvalsh(A)[0]
+
+    def h(alpha):
+        s = np.linalg.solve(A + alpha * np.eye(2), c)
+        return np.linalg.norm(s) + mu * g @ s - mu * S0
+
+    grid = np.geomspace(1.0e-9 * high, high, 20000)
+    values = np.array([h(alpha) for alpha in grid])
+    slides = []
+    for i in np.flatnonzero(np.sign(values[:-1]) != np.sign(values[1:])):
+        lo, hi, flo = grid[i], grid[i + 1], values[i]
+        for _ in range(200):
+            mid = 0.5 * (lo + hi)
+            if np.sign(h(mid)) == np.sign(flo):
+                lo = mid
+            else:
+                hi = mid
+        alpha = 0.5 * (lo + hi)
+        s = np.linalg.solve(A + alpha * np.eye(2), c)
+        slides.append((alpha, np.array([(w @ s - b[0]) / W[0, 0], *(-s)])))
+    return slides
 
 
 class TestContactUnitLatch(unittest.TestCase):
@@ -597,6 +720,49 @@ class TestContactUnitCuda(unittest.TestCase):
                 radius = problems[capped, 9] * (normal + problems[capped, 10])
                 self.assertTrue(np.all(normal >= 0.0))
                 self.assertTrue(np.all(np.hypot(twin[capped, 1], twin[capped, 2]) <= radius * (1.0 + 1.0e-5)))
+
+    def test_cuda_prelude_keeps_held_solutions(self):
+        """Keep, with the CUDA prelude and binding, the solutions the CPU binding finds, held as current impulses.
+
+        Each problem is solved on the CPU from no impulse, then solved again from that solution on both devices:
+        the held friction resumes its own slide root (or takes the normal-then-friction step), which the CPU returns
+        unchanged to within 2.5 cond(W) 2^-23 of its largest component (measured). The CUDA solve must return it
+        within the twin bound of test_cuda_prelude_matches_the_cpu_binding. Slide roots the cap stopped short are
+        left out.
+        """
+        rng = np.random.default_rng(23)
+        rows = []
+        for _ in range(4000):
+            W = random_block(rng, coupling=rng.uniform(0.0, 2.0))
+            b = np.array([rng.normal(), *rng.normal(size=2) * rng.uniform(0.1, 5.0)])
+            rows.append(point_problem(W, b, rng.uniform(0.1, 1.2)))
+        rows = np.asarray(rows, np.float32)
+        first = solve_points(rows)
+        converged = first[:, 4] < 1 + contact_unit.CONTACT_UNIT_NEWTON_CAP
+        held = rows[converged].copy()
+        held[:, 13:16] = first[converged, :3]
+        cpu = solve_points(held)
+        problems = held.astype(np.float64)
+        blocks = np.stack(
+            [
+                np.stack([problems[:, 0], problems[:, 4], problems[:, 5]], axis=1),
+                np.stack([problems[:, 4], problems[:, 1], problems[:, 2]], axis=1),
+                np.stack([problems[:, 5], problems[:, 2], problems[:, 3]], axis=1),
+            ],
+            axis=1,
+        )
+        bound = 50.0 * np.linalg.cond(blocks) * 2.0**-23 + 1.0e-5
+        scale = np.maximum(np.abs(cpu[:, :3]).max(axis=1), 1.0e-6)
+        self.assertTrue(np.all(np.abs(cpu[:, :3] - problems[:, 13:16]).max(axis=1) / scale <= bound))
+        device = "cuda:0"
+        out = wp.zeros((len(held), 5), dtype=float, device=device)
+        wp.launch(
+            _solve_points_native, dim=len(held), inputs=[wp.array(held, dtype=float, device=device), out], device=device
+        )
+        for name, twin in (("prelude", out.numpy().astype(np.float64)), ("binding", solve_points(held, device=device))):
+            with self.subTest(twin=name):
+                deviation = np.abs(twin[:, :3] - cpu[:, :3]).max(axis=1) / scale
+                self.assertTrue(np.all(deviation <= bound), np.argmax(deviation - bound))
 
 
 if __name__ == "__main__":
