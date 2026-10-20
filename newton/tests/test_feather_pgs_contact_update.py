@@ -23,12 +23,19 @@ disk of its ring's load, in velocity units.
 
 import os
 import unittest
+import warnings
+from contextlib import contextmanager
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import contact_unit, contact_unit_sweeps
+import newton
+from newton._src.solvers.feather_pgs import contact_unit, contact_unit_sweeps, environment_flags, path_selection
 from newton._src.solvers.feather_pgs import kernels as K
+from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_row_builders import launched_kernels
 
 wp.init()
 
@@ -46,6 +53,15 @@ _TAGS = ("zero_end", "census", "cone", "replica79")
 # (approaching at 0.141 m/s, sliding along -t2) and mu 1, with lift coupling mu |W_nt| / W_nn = 1.0.
 W_AUDIT = np.array([[0.1729, 0.0492, 0.1662], [0.0492, 0.3586, 0.0685], [0.1662, 0.0685, 0.2116]])
 W0_AUDIT = np.array([-0.14089, -0.2, -1.0])
+
+
+@contextmanager
+def _without_solver_environment():
+    """Remove every FEATHER_PGS_ and IL_NEWTON_FPGS_ variable for the block."""
+    with mock.patch.dict(os.environ):
+        for name in [name for name in os.environ if name.startswith(environment_flags.PREFIXES)]:
+            del os.environ[name]
+        yield
 
 
 # -- systems ----------------------------------------------------------------------------------------------------
@@ -665,6 +681,184 @@ class TestContactUpdateReplica(unittest.TestCase):
                             self.assertLessEqual(residuals(system, history[-1])[0].max(), 1.0e-4)
 
 
+def _free_box_model(**builder):
+    """A one-joint arm and a free box resting on the ground in one CPU world."""
+    model = newton.ModelBuilder()
+    body = model.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+    model.add_articulation([model.add_joint_revolute(-1, body)])
+    free = model.add_body(xform=wp.transform((0.0, 0.0, 0.098), wp.quat_identity()))
+    model.add_shape_box(free, hx=0.1, hy=0.1, hz=0.1)
+    model.add_ground_plane()
+    return model.finalize(device="cpu", **builder)
+
+
+def _step(solver, model, steps):
+    state, after = model.state(), model.state()
+    control = model.control()
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    for _ in range(steps):
+        pipeline.collide(state, contacts)
+        solver.step(state, after, control, contacts, 1.0 / 240.0)
+        state, after = after, state
+    return state
+
+
+class TestContactUpdateSolver(unittest.TestCase):
+    """The ``contact_update`` option, its environment override, route record and launches."""
+
+    def test_sequential_is_the_unchanged_law(self):
+        """Run the unchanged sequential kernels for the default and an explicit or environment "sequential" law."""
+        states = []
+        with _without_solver_environment():
+            for options, environment in (
+                ({}, {}),
+                ({"contact_update": "sequential"}, {}),
+                ({}, {"FEATHER_PGS_CONTACT_UPDATE": "sequential"}),
+            ):
+                with mock.patch.dict(os.environ, environment):
+                    model = _free_box_model()
+                    solver = SolverFeatherPGS(model, pgs_iterations=8, **options)
+                sweep = solver.get_path_selection()["routes"]["sweep"]
+                self.assertEqual(sweep["dense"], {"kernels": ["pgs_solve_loop"]})
+                self.assertEqual(sweep["free_body_matrix_free"], "pgs_solve_mf_loop")
+                self.assertEqual(sweep["contact_update"]["law"], "sequential")
+                with launched_kernels() as keys:
+                    states.append(_step(solver, model, 20))
+                self.assertIn("pgs_solve_loop", keys)
+                self.assertNotIn("pgs_solve_loop_unit", keys)
+                self.assertNotIn("pgs_solve_mf_loop_unit", keys)
+        for state in states[1:]:
+            for name in ("body_q", "body_qd", "joint_q", "joint_qd"):
+                np.testing.assert_array_equal(getattr(state, name).numpy(), getattr(states[0], name).numpy())
+
+    def test_sequential_dispatch_runs_the_unchanged_kernel_on_stored_systems(self):
+        """Dispatch "sequential" to pgs_solve_loop, bitwise, and "unit" to pgs_solve_loop_unit on stored systems."""
+        systems = replica_systems("point") + replica_systems("patch")
+        world = World(systems)
+        for update, expected in (("sequential", world.sweep(8, "sequential")), ("unit", world.sweep(8, "unit"))):
+            impulses = wp.zeros((len(systems), world.D), dtype=float, device=_CPU)
+            unit = update == "unit"
+            stub = SimpleNamespace(
+                _dense_contact_unit=unit,
+                world_count=len(systems),
+                constraint_count=world.w_count,
+                dense_max_constraints=world.D,
+                diag=world.w["diag"],
+                C=world.w_C,
+                rhs=world.w["rhs"],
+                impulses=impulses,
+                pgs_iterations=8,
+                pgs_omega=1.0,
+                row_type=world.w_rtype,
+                row_parent=world.w_parent,
+                row_mu=world.w["mu"],
+                _pgs_friction_start_iteration=0,
+                _pgs_iteration_offset=0,
+                _contact_unit_patch="ring",
+                _dense_unit_state=world.state,
+                _dense_unit_rows=world.rows,
+                _dense_unit_block=world.block,
+                model=SimpleNamespace(device=wp.get_device(_CPU)),
+            )
+            with launched_kernels() as keys:
+                SolverFeatherPGS._stage5_pgs_solve_world_loop(stub)
+            self.assertEqual(keys, ["pgs_solve_loop_unit" if unit else "pgs_solve_loop"])
+            out = impulses.numpy()
+            for k, lam in enumerate(expected):
+                with self.subTest(update=update, system=k):
+                    np.testing.assert_array_equal(out[k, : len(lam)].astype(np.float64), lam)
+
+    def test_unit_option_runs_the_unit_loop_sweeps(self):
+        """Run both CPU loop sweeps' unit variants for contact_update="unit", from the argument or the environment."""
+        with _without_solver_environment():
+            for options, environment in (
+                ({"contact_update": "unit"}, {}),
+                ({}, {"FEATHER_PGS_CONTACT_UPDATE": "unit"}),
+            ):
+                with self.subTest(options=options), mock.patch.dict(os.environ, environment):
+                    model = _free_box_model()
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error")
+                        solver = SolverFeatherPGS(model, pgs_iterations=8, **options)
+                    selected = solver.get_path_selection()
+                    sweep = selected["routes"]["sweep"]
+                    self.assertEqual(sweep["dense"], {"kernels": ["pgs_solve_loop_unit"]})
+                    self.assertEqual(sweep["free_body_matrix_free"], "pgs_solve_mf_loop_unit")
+                    self.assertEqual(
+                        sweep["contact_update"],
+                        {
+                            "requested": "unit",
+                            "law": "unit",
+                            "unit": ["pgs_solve_loop_unit", "pgs_solve_mf_loop_unit"],
+                            "sequential": [],
+                            "patch_units": "ring",
+                            "reason": sweep["contact_update"]["reason"],
+                        },
+                    )
+                    option = selected["options"]["contact_update"]
+                    self.assertEqual(option["applied"], "unit")
+                    self.assertEqual(option["source"], "environment" if environment else "argument")
+                    with launched_kernels() as keys:
+                        state = _step(solver, model, 20)
+                    # The arm and the box share a world: one-iteration dense and free-body launches interleave.
+                    self.assertEqual(keys.count("pgs_solve_loop_unit"), 20 * 8)
+                    self.assertEqual(keys.count("pgs_solve_mf_loop_unit"), 20 * 8)
+                    self.assertNotIn("pgs_solve_loop", keys)
+                    self.assertTrue(np.all(np.isfinite(state.body_q.numpy())))
+                    # The box rests on the ground.
+                    self.assertAlmostEqual(float(state.body_q.numpy()[1, 2]), 0.1, delta=2.0e-3)
+
+    def test_invalid_contact_update_raises(self):
+        """Reject a contact update other than "sequential" or "unit", from the argument or the environment."""
+        with _without_solver_environment():
+            with self.assertRaisesRegex(ValueError, "contact_update must be one of"):
+                SolverFeatherPGS(_free_box_model(), contact_update="block")
+            with mock.patch.dict(os.environ, {"FEATHER_PGS_CONTACT_UPDATE": "exact"}):
+                with self.assertRaisesRegex(ValueError, "FEATHER_PGS_CONTACT_UPDATE must be one of"):
+                    SolverFeatherPGS(_free_box_model())
+
+    def test_sweeps_without_units_keep_the_sequential_law_and_warn(self):
+        """Record the sweeps of a "unit" request that keep the sequential law, and warn once with them."""
+        sweep = {
+            "contact_update": {
+                "requested": "unit",
+                "law": "unit",
+                "unit": ["pgs_solve_loop_unit"],
+                "sequential": ["pgs_solve_mf_cuda"],
+                "patch_units": "ring",
+                "reason": "Only the loop sweeps solve contact units.",
+            }
+        }
+        messages = path_selection.contact_update_warnings(sweep)
+        self.assertEqual(len(messages), 1)
+        self.assertIn("pgs_solve_mf_cuda", messages[0])
+        sweep["contact_update"]["sequential"] = []
+        self.assertEqual(path_selection.contact_update_warnings(sweep), [])
+        sweep["contact_update"].update(requested="sequential", sequential=["pgs_solve_mf_cuda"])
+        self.assertEqual(path_selection.contact_update_warnings(sweep), [])
+
+    def test_patch_unit_switch_selects_anchor_units(self):
+        """Launch the anchor-unit form of patch regions when the internal switch says so."""
+        with _without_solver_environment():
+            model = _free_box_model()
+            solver = SolverFeatherPGS(model, pgs_iterations=8, contact_update="unit")
+        solver._contact_unit_patch = "anchor"
+        self.assertEqual(solver.get_path_selection()["routes"]["sweep"]["contact_update"]["patch_units"], "anchor")
+        launches = []
+        launch = wp.launch
+
+        def record(kernel, *args, **kwargs):
+            if getattr(kernel, "key", None) in ("pgs_solve_loop_unit", "pgs_solve_mf_loop_unit"):
+                launches.append(kwargs["inputs"][-4])
+            return launch(kernel, *args, **kwargs)
+
+        with mock.patch.object(wp, "launch", record):
+            _step(solver, model, 2)
+        self.assertTrue(launches)
+        self.assertEqual(set(launches), {0})
+
+
 @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
 class TestContactUpdateCuda(unittest.TestCase):
     def test_cuda_loop_sweep_matches_cpu(self):
@@ -687,6 +881,28 @@ class TestContactUpdateCuda(unittest.TestCase):
                     lam = World([system], device="cuda:0").sweep(sweeps, "unit")[0]
                     self.assertAlmostEqual(lam[normals].sum(), load, delta=1.0e-4)
                     self.assertGreaterEqual(residuals(system, lam)[1][normals].min(), -1.0e-5)
+
+    def test_cuda_routes_without_units_keep_the_sequential_law(self):
+        """Keep the sequential law on CUDA sweeps without units, record them and warn; the loop sweep runs units."""
+        with _without_solver_environment():
+            builder = newton.ModelBuilder()
+            body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+            builder.add_articulation([builder.add_joint_revolute(-1, body)])
+            builder.add_shape_sphere(body, radius=0.1)
+            builder.add_ground_plane()
+            model = builder.finalize(device="cuda:0")
+            with self.assertWarnsRegex(UserWarning, "contact_update='unit' applies only to some sweeps"):
+                tiled = SolverFeatherPGS(model, contact_update="unit", pgs_kernel="tiled_row")
+            update = tiled.get_path_selection()["routes"]["sweep"]["contact_update"]
+            self.assertEqual(update["law"], "sequential")
+            self.assertTrue(update["sequential"])
+            with warnings.catch_warnings(record=True) as recorded:
+                warnings.simplefilter("always")
+                loop = SolverFeatherPGS(model, contact_update="unit", pgs_kernel="loop")
+            self.assertFalse([w for w in recorded if "contact_update" in str(w.message)])
+            update = loop.get_path_selection()["routes"]["sweep"]["contact_update"]
+            self.assertEqual(update["unit"], ["pgs_solve_loop_unit"])
+            self.assertEqual(update["sequential"], [])
 
 
 if __name__ == "__main__":

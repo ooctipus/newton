@@ -62,6 +62,13 @@ from .contact_torsion import (
     prepare_torsion_velocity_pass,
     validate_torsion_step,
 )
+from .contact_unit import RING_BLOCK_SIZE
+from .contact_unit_sweeps import (
+    CONTACT_UNIT_STATE_FIELDS,
+    check_contact_update,
+    pgs_solve_loop_unit,
+    pgs_solve_mf_loop_unit,
+)
 from .device_preludes import cuda_native
 from .friction import FRICTION_PAIR
 from .friction_patches import (
@@ -230,6 +237,7 @@ from .kernels import (
 )
 from .path_selection import (
     applied_options,
+    contact_update_warnings,
     grouped_response,
     measurement_selection,
     options_selection,
@@ -1394,6 +1402,7 @@ class SolverFeatherPGS(SolverBase):
         mf_gs_response_block_rows: int = 0,
         mf_gs_response_block_lane_rows: int = 16,
         velocity_limit_law: Literal["stateless", "accumulated"] = "stateless",
+        contact_update: Literal["sequential", "unit"] = "sequential",
         grouped_dynamics: bool = False,
         lazy_kinematics: bool = False,
         bilateral_preelimination_include_mimics: bool = True,
@@ -1733,6 +1742,25 @@ class SolverFeatherPGS(SolverBase):
                 ``routes.velocity_limits.law``, and the parallel tiers' law, accumulated under either
                 argument, under ``routes.sweep.tiers.velocity_limit_law``. Experimental. Defaults to
                 ``"stateless"``.
+            contact_update (str, optional): How a Gauss-Seidel sweep updates a contact. ``"sequential"``
+                steps a contact's normal row against the friction of its previous update, then solves its
+                friction pair at the held normal load. ``"unit"`` solves each contact unit exactly against its
+                own Delassus block, with every other impulse held: a point contact's normal and friction
+                together (take-off, else stick, else Daviet's single-unknown slide root), a patch region's ring
+                normals and anchor pairs as one unit, a ring of more than 8 normals or 2 anchors as anchor units
+                with the other members' load held. A unit whose load change keeps reversing is relaxed toward
+                its exact solution, which keeps the fixed points of the exact sweep. The contact law is that of
+                ``"sequential"``; ``"unit"`` removes the error the normal step leaves against stale friction,
+                which cycles with period two for a sliding contact whose friction lifts its normal (zero normal
+                impulse on an approaching contact at the end of a solve). Where a unit's own problem has several
+                solutions (a sliding contact whose friction presses its normal down), the unit takes the first
+                of take-off, stick and slide. A unit's exact solution does not use ``pgs_omega``; rows outside
+                units keep the sequential update. Only the loop sweeps implement
+                ``"unit"``: the dense ``pgs_kernel="loop"`` sweep of split mode on any device and the split
+                free-body sweep on CPU. Every other sweep keeps ``"sequential"``; ``get_path_selection()``
+                records which sweep runs which law under ``routes.sweep.contact_update``, and construction warns
+                when a requested ``"unit"`` reaches only some sweeps. ``FEATHER_PGS_CONTACT_UPDATE`` overrides
+                the argument. Experimental. Defaults to ``"sequential"``.
             mf_gs_incremental_rows (int, optional): Row budget of the incremental-residual
                 matrix-free Gauss-Seidel kernel. Worlds with only dense articulated rows and at
                 most this many rows solve through a shared-memory response block instead of
@@ -2378,6 +2406,14 @@ class SolverFeatherPGS(SolverBase):
             if environment_law
             else velocity_limit_law
         )
+        # FEATHER_PGS_CONTACT_UPDATE overrides the argument, so recipes select the contact update without code changes.
+        check_contact_update(contact_update)
+        environment_update = os.environ.get("FEATHER_PGS_CONTACT_UPDATE")
+        self.contact_update = (
+            check_contact_update(environment_update, source="FEATHER_PGS_CONTACT_UPDATE")
+            if environment_update
+            else contact_update
+        )
         # FEATHER_PGS_PATCH_PARALLEL_SWEEPS overrides the argument, so recipes set the linked tiers' budget.
         requested_linked_sweeps = _linked_sweeps_request(mf_gs_parallel_linked_sweeps, "mf_gs_parallel_linked_sweeps")
         environment_linked_sweeps = os.environ.get("FEATHER_PGS_PATCH_PARALLEL_SWEEPS")
@@ -2397,6 +2433,7 @@ class SolverFeatherPGS(SolverBase):
                 ("pgs_warmstart", self.pgs_warmstart != (bool(pgs_warmstart) or bool(mf_warmstart))),
                 ("pgs_warmstart_decay", self.pgs_warmstart_decay != argument_decay),
                 ("velocity_limit_law", self.velocity_limit_law != velocity_limit_law),
+                ("contact_update", self.contact_update != contact_update),
                 ("mf_gs_parallel_linked_sweeps", self.mf_gs_parallel_linked_sweeps != requested_linked_sweeps),
             )
             if changed
@@ -3612,11 +3649,50 @@ class SolverFeatherPGS(SolverBase):
                 stage_velocities=True,
                 velocity_limit_law=self._velocity_limit_kernel_law(),
             )
+        self._setup_contact_update(model)
         # Record the applied options once; get_path_selection() returns detached copies.
         self._applied_options = applied_options(self, SolverFeatherPGS.__init__, requested_options)
         if self.pgs_velocity_change_tolerance > 0.0 or self.pgs_solve_readout == "trace":
             for message in policy_warnings(route_selection(self)["sweep"]):
                 warnings.warn(message, stacklevel=2)
+        if self.contact_update != "sequential":
+            for message in contact_update_warnings(route_selection(self)["sweep"]):
+                warnings.warn(message, UserWarning, stacklevel=_CONSTRUCTOR_CALLER)
+
+    def _setup_contact_update(self, model):
+        """Select the sweeps that solve contact units exactly and allocate their per-world unit storage.
+
+        ``contact_update="unit"`` reaches the loop sweeps only: the dense loop sweep of split mode on
+        any device and, on CPU, the split free-body loop sweep (CUDA builds a native free-body sweep).
+        Every other sweep keeps the sequential law (``routes.sweep.contact_update``). ``_contact_unit_patch`` is an
+        internal switch for A/B runs: ``"ring"`` solves a patch region as one ring unit, ``"anchor"``
+        each anchor as a 3x3 unit with the ring's other load held; launches read it.
+        """
+        dense_split = self.pgs_mode != "matrix_free" and not self._sparse_split
+        unit = self.contact_update == "unit"
+        self._dense_contact_unit = bool(unit and dense_split and self.pgs_kernel == "loop")
+        self._free_body_contact_unit = bool(
+            unit
+            and dense_split
+            and self._has_free_rigid_bodies
+            and model.device.is_cpu
+            and self.friction_mode == "current"
+        )
+        self._contact_unit_patch = "ring"
+        self._dense_unit_state = self._dense_unit_rows = self._dense_unit_block = None
+        self._mf_unit_state = self._mf_unit_rows = self._mf_unit_block = None
+        device = model.device
+        worlds = self.world_count
+        if self._dense_contact_unit:
+            capacity = self.dense_max_constraints
+            self._dense_unit_state = wp.zeros((worlds, capacity, CONTACT_UNIT_STATE_FIELDS), dtype=float, device=device)
+            self._dense_unit_rows = wp.zeros((worlds, capacity), dtype=int, device=device)
+            self._dense_unit_block = wp.zeros(worlds * RING_BLOCK_SIZE, dtype=float, device=device)
+        if self._free_body_contact_unit:
+            capacity = self.mf_max_constraints
+            self._mf_unit_state = wp.zeros((worlds, capacity, CONTACT_UNIT_STATE_FIELDS), dtype=float, device=device)
+            self._mf_unit_rows = wp.zeros((worlds, capacity), dtype=int, device=device)
+            self._mf_unit_block = wp.zeros(worlds * RING_BLOCK_SIZE, dtype=float, device=device)
 
     def get_path_selection(self) -> dict:
         """Return requested choices, active plans and selection reasons.
@@ -17227,6 +17303,32 @@ class SolverFeatherPGS(SolverBase):
             )
 
     def _stage5_pgs_solve_world_loop(self):
+        if self._dense_contact_unit:
+            wp.launch(
+                pgs_solve_loop_unit,
+                dim=self.world_count,
+                inputs=[
+                    self.constraint_count,
+                    self.dense_max_constraints,
+                    self.diag,
+                    self.C,
+                    self.rhs,
+                    self.impulses,
+                    self.pgs_iterations,
+                    self.pgs_omega,
+                    self.row_type,
+                    self.row_parent,
+                    self.row_mu,
+                    self._pgs_friction_start_iteration,
+                    self._pgs_iteration_offset,
+                    int(self._contact_unit_patch == "ring"),
+                    self._dense_unit_state,
+                    self._dense_unit_rows,
+                    self._dense_unit_block,
+                ],
+                device=self.model.device,
+            )
+            return
         wp.launch(
             pgs_solve_loop,
             dim=self.world_count,
@@ -17599,6 +17701,42 @@ class SolverFeatherPGS(SolverBase):
                     int(iteration_offset),
                 ],
                 block_dim=32,
+                device=model.device,
+            )
+        elif self._free_body_contact_unit:
+            wp.launch(
+                pgs_solve_mf_loop_unit,
+                dim=self.world_count,
+                inputs=[
+                    self.mf_constraint_count,
+                    self.mf_body_a,
+                    self.mf_body_b,
+                    self.mf_MiJt_a,
+                    self.mf_MiJt_b,
+                    self.mf_J_a,
+                    self.mf_J_b,
+                    self.mf_eff_mass_inv,
+                    self.mf_rhs,
+                    self.mf_row_type,
+                    self.mf_row_parent,
+                    self.mf_row_mu,
+                    self.mf_row_w,
+                    self.body_to_articulation,
+                    self.articulation_dof_start,
+                    iterations,
+                    self.pgs_omega,
+                    int(self._regularization_enabled),
+                    int(friction_start_iteration),
+                    int(iteration_offset),
+                    int(self._contact_unit_patch == "ring"),
+                    self._mf_unit_state,
+                    self._mf_unit_rows,
+                    self._mf_unit_block,
+                ],
+                outputs=[
+                    self.mf_impulses,
+                    self.v_out,
+                ],
                 device=model.device,
             )
         else:

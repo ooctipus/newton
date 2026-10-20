@@ -169,6 +169,10 @@ _EFFECTIVE = {
     "pgs_velocity_change_tolerance": lambda solver: (
         solver.pgs_velocity_change_tolerance if solver._solve_policy_honored else 0.0
     ),
+    # "unit" where some sweep solves contact units exactly (routes.sweep.contact_update), else "sequential".
+    "contact_update": lambda solver: (
+        "unit" if solver._dense_contact_unit or solver._free_body_contact_unit else "sequential"
+    ),
 }
 
 
@@ -755,10 +759,16 @@ def _sweep(solver, source) -> dict:
         elif solver.pgs_kernel == "streaming":
             dense = {"kernels": [_key(solver._pgs_solve_streaming_kernel)]}
         else:
-            dense = {"kernels": [_key(source.pgs_solve_loop)]}
+            loop = source.pgs_solve_loop_unit if solver._dense_contact_unit else source.pgs_solve_loop
+            dense = {"kernels": [_key(loop)]}
     free_body = None
     if dense_split and solver._has_free_rigid_bodies:
-        free_body = _key(solver._pgs_solve_mf_kernel if solver.model.device.is_cuda else source.pgs_solve_mf_loop)
+        if solver.model.device.is_cuda:
+            free_body = _key(solver._pgs_solve_mf_kernel)
+        else:
+            free_body = _key(
+                source.pgs_solve_mf_loop_unit if solver._free_body_contact_unit else source.pgs_solve_mf_loop
+            )
     mf_meta_pack = None
     if solver.pgs_mode == "matrix_free":
         # Mirrors _pack_mf_meta: only free rigid bodies produce matrix-free rows.
@@ -814,6 +824,7 @@ def _sweep(solver, source) -> dict:
     }
     record["readout"] = _readout(solver, record)
     record["exit_law"] = _exit_law(solver, record)
+    record["contact_update"] = _contact_update(solver, record)
     return record
 
 
@@ -967,6 +978,56 @@ def _exit_law(solver, record) -> dict:
         "driver_honors": driver_honors,
         "reason": reason,
     }
+
+
+def _contact_update(solver, record) -> dict:
+    """Which sweep kernels of the route solve contact units exactly (``contact_update="unit"``), and why not the others."""
+    unit = []
+    if solver._dense_contact_unit:
+        unit.append(record["dense"]["kernels"][0])
+    if solver._free_body_contact_unit:
+        unit.append(record["free_body_matrix_free"])
+    requested = solver.contact_update
+    sequential = []
+    if requested == "unit":
+        sequential = sorted(_sweep_kernels(solver, record) - set(unit)) + _flagged_owners(record)
+    if requested == "sequential":
+        reason = (
+            "contact_update is 'sequential': a sweep steps each contact's normal row, then solves its friction pair "
+            "at the held normal load."
+        )
+    elif not sequential:
+        reason = "Every sweep of this route solves each contact unit exactly against its own Delassus block."
+    else:
+        reason = (
+            "Only the loop sweeps solve contact units: the dense loop sweep of split mode (pgs_kernel='loop') on any "
+            "device and the split free-body sweep on CPU. The other sweeps keep the sequential law."
+        )
+    return {
+        "requested": requested,
+        "law": "unit" if unit else "sequential",
+        # Sweep kernels that solve contact units, and those that keep the sequential law under a "unit" request.
+        "unit": unit,
+        "sequential": sequential,
+        # How the unit sweeps solve a patch region: one ring unit, or anchor units with the ring's other load held.
+        "patch_units": solver._contact_unit_patch if unit else None,
+        "reason": reason,
+    }
+
+
+def contact_update_warnings(sweep) -> list[str]:
+    """Return a warning when a requested ``contact_update="unit"`` reaches only some sweeps of a sweep record.
+
+    Args:
+        sweep: The ``routes.sweep`` record of :func:`route_selection`.
+    """
+    update = sweep["contact_update"]
+    if update["requested"] != "unit" or not update["sequential"]:
+        return []
+    return [
+        f"contact_update='unit' applies only to some sweeps of this solver: {update['reason']} "
+        f"Sequential: {update['sequential']}."
+    ]
 
 
 def policy_warnings(sweep) -> list[str]:
