@@ -40,8 +40,8 @@ import numpy as np
 import warp as wp
 
 from .terrain_contacts import (
-    TERRAIN_LANE_CLASSES,
     TERRAIN_LANE_THREAD,
+    TERRAIN_LANE_TILE,
     TERRAIN_PARTNER_BOX,
     TERRAIN_PARTNER_CLASSES,
     TERRAIN_PARTNER_CYLINDER,
@@ -85,7 +85,27 @@ TERRAIN_LAW_KERNELS: dict[int, tuple[str, str, str, str | None]] = {
 The module is imported only when the class is listed. The one-thread kernel runs over the class's one-thread lane
 segment, the tiled one over its tiled segment; the full-finish kernel, when the class has one, runs after them over
 the whole class (both segments, which the table keeps contiguous) and finishes the pairs they marked
-:data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_FULL`."""
+:data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_FULL`.
+
+A class's module and kernels follow one protocol (the helpers live in :mod:`~newton._src.geometry.terrain_law`):
+
+* The module compiles without floating-point contraction (``wp.set_module_options({"fuse_fp": False})``), so that the
+  CPU and CUDA round every float32 operation alike and decide every predicate boundary on the same bits: a CPU test or
+  census then counts what the GPU does.
+* A pair that has no row (stale features, the pair policy, a window off the heightfield, the tile-max exit) is
+  recorded by ``terrain_pair_exit``.
+* While its window is walked, a pair may use its ``K`` slots as scratch, in the window frame. The point kernels hold
+  up to ``K - 2`` distinct rows there, merged as the finish merges (``terrain_hold_row``), and keep the best exit of
+  each core end inside the solid in the last two slots (with both ends outside, the last slot holds the capsule
+  axis's deepest crossing for its G3); an exit is read before a row may land in its slot.
+* When the finish keeps the held rows as they are (no plane group of three, ``terrain_plane_group_of_three``; at most
+  ``K`` rows; the candidates fit the finish's list), the kernel writes them in the world frame (``terrain_store_row``)
+  with the pair's count and state. Otherwise it defers the pair (``terrain_defer_pair``), and the class's full-finish
+  kernel walks it again into the full candidate list and runs ``terrain_finish``.
+"""
+
+TERRAIN_LANE_NAMES = {TERRAIN_LANE_THREAD: "thread", TERRAIN_LANE_TILE: "tiled"}
+"""Names of the pair table's lane classes, by id (the table orders a class's pairs by lane class id)."""
 
 TERRAIN_PAIR_STATES = {
     "tile_exit": int(TERRAIN_PAIR_TILE_EXIT),
@@ -165,10 +185,14 @@ class TerrainLawShadow:
         for partner_class in self.classes:
             module_name, thread_name, tiled_name, full_name = TERRAIN_LAW_KERNELS[partner_class]
             module = importlib.import_module(module_name)
-            kernels = (getattr(module, thread_name), getattr(module, tiled_name))
+            kernels = {
+                TERRAIN_LANE_THREAD: getattr(module, thread_name),
+                TERRAIN_LANE_TILE: getattr(module, tiled_name),
+            }
             rows = TERRAIN_PARTNER_ROWS[partner_class]
             class_begin, class_slot = None, slot
-            for lane in range(TERRAIN_LANE_CLASSES):
+            # Lane classes in table order (by id): a class's segments are contiguous and its slots follow them.
+            for lane in sorted(TERRAIN_LANE_NAMES):
                 begin, end = self.table.segment(partner_class, lane)
                 if end > begin:
                     self._launches.append((kernels[lane], lane, begin, end - begin, slot))
@@ -306,7 +330,7 @@ class TerrainLawShadow:
             if partner_class not in self.classes:
                 continue
             per_lane = {}
-            for lane, name in ((0, "thread"), (1, "tiled")):
+            for lane, name in TERRAIN_LANE_NAMES.items():
                 begin, end = self.table.segment(partner_class, lane)
                 per_lane[name] = end - begin
             pairs[terrain_law_class_name(partner_class)] = per_lane

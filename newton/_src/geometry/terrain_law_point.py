@@ -79,7 +79,6 @@ from .terrain_law import (
     TERRAIN_FEATURE_VERTEX,
     TERRAIN_FLAT_EPS,
     TERRAIN_PAIR_FILTERED,
-    TERRAIN_PAIR_FULL,
     TERRAIN_PAIR_OUTSIDE,
     TERRAIN_PAIR_STALE,
     TERRAIN_PAIR_TILE_EXIT,
@@ -96,6 +95,7 @@ from .terrain_law import (
     terrain_box_cells,
     terrain_claims,
     terrain_crease_class,
+    terrain_defer_pair,
     terrain_edge_kind,
     terrain_edge_sides,
     terrain_eps,
@@ -106,14 +106,15 @@ from .terrain_law import (
     terrain_finish,
     terrain_finish_state,
     terrain_height,
+    terrain_hold_row,
     terrain_interior_vertex,
     terrain_locate,
+    terrain_pair_exit,
     terrain_plane,
+    terrain_plane_group_of_three,
     terrain_planes,
     terrain_point_below_cached,
     terrain_report,
-    terrain_rows_coincide,
-    terrain_rows_same_plane,
     terrain_store_row,
     terrain_tile_exit,
     terrain_vertex_edge_value,
@@ -795,15 +796,6 @@ def _exit_row(
 
 
 @wp.func
-def _pair_exit(out: TerrainLawRows, pair: int, state: int):
-    """Record a pair that has no row (``state``), raising ``terrain_stale`` for stale features."""
-    out.count[pair] = 0
-    out.state[pair] = state
-    if state == TERRAIN_PAIR_STALE:
-        terrain_report(out.status, out.overflow, 0, False)
-
-
-@wp.func
 def _wide(cells: wp.vec4i) -> int:
     if cells[1] - cells[0] + 1 >= _WIDE or cells[3] - cells[2] + 1 >= _WIDE:
         return TERRAIN_PAIR_WIDE
@@ -821,17 +813,8 @@ _HELD = wp.constant(6)
 
 @wp.func
 def _hold(out: TerrainLawRows, slot: int, held: int, claim: _Claim, eps: float, limit: int) -> int:
-    """Add a row to a pair's held rows, as the finish's merge does: a row that coincides with a held one is dropped
-    (the first in window order stays); past ``limit`` held rows a distinct row is only counted."""
-    for h in range(wp.min(held, limit)):
-        if terrain_rows_coincide(out.q[slot + h], out.n[slot + h], claim.q, claim.n, eps):
-            return held
-    if held < limit:
-        out.q[slot + held] = claim.q
-        out.n[slot + held] = claim.n
-        out.d[slot + held] = claim.d
-        out.feature[slot + held] = claim.feature
-    return held + 1
+    """Hold a claim's row (:func:`~newton._src.geometry.terrain_law.terrain_hold_row`)."""
+    return terrain_hold_row(out, slot, held, claim.q, claim.n, claim.d, claim.feature, eps, limit)
 
 
 @wp.func
@@ -873,29 +856,6 @@ def _axis_exit_held(out: TerrainLawRows, slot: int, held: int) -> bool:
     for h in range(held):
         if (out.feature[slot + h] & 7) == _SLOT_AXIS and out.d[slot + h] < 0.0:
             return True
-    return False
-
-
-@wp.func
-def _plane_group_of_three(out: TerrainLawRows, slot: int, held: int, eps: float) -> bool:
-    """Whether three of a pair's held rows share a plane group, as the finish groups them (its first row of a plane
-    represents it, :func:`~newton._src.geometry.terrain_law.terrain_rows_same_plane`)."""
-    representatives = int(0)
-    sizes = int(0)
-    for i in range(held):
-        qi = out.q[slot + i]
-        ni = out.n[slot + i]
-        group = i
-        for j in range(i):
-            if (representatives >> j) & 1 != 0:
-                if terrain_rows_same_plane(qi, ni, out.q[slot + j], out.n[slot + j], eps):
-                    group = j
-                    break
-        if group == i:
-            representatives = representatives | (1 << i)
-        if ((sizes >> (4 * group)) & 15) >= 2:
-            return True
-        sizes = sizes + (1 << (4 * group))
     return False
 
 
@@ -950,12 +910,10 @@ def _close_pair(
                 if claim.kind != 0:
                     candidates += 1
                     held = _hold(out, slot, held, claim, core.eps, _ROWS)
-        full = held > _ROWS or candidates > _CANDIDATES or _plane_group_of_three(out, slot, held, core.eps)
+        full = held > _ROWS or candidates > _CANDIDATES or terrain_plane_group_of_three(out, slot, held, core.eps)
     if full:
         # Left to terrain_point_rows_full, which writes every slot of the pair.
-        out.count[pair] = 0
-        out.state[pair] = state | TERRAIN_PAIR_FULL
-        out.deferred[out.deferred_first[_CLASS] + wp.atomic_add(out.deferred_count, _CLASS, 1)] = pair
+        terrain_defer_pair(out, _CLASS, pair, state)
         return
     for h in range(held):
         terrain_store_row(
@@ -987,7 +945,7 @@ def terrain_point_rows(
     slot = slot_begin + i * _ROWS
     state, frame, heightfield, cells, a, b, segment, reach = _pair_setup(inputs, data, pair)
     if state != 0:
-        _pair_exit(out, pair, state)
+        terrain_pair_exit(out, pair, state)
         return
     r1 = cells[1]
     c1 = cells[3]
@@ -1051,7 +1009,7 @@ def terrain_point_rows_tiled(
     if state != 0:
         # Every lane reads the same pair: the exit is uniform.
         if lane == 0:
-            _pair_exit(out, pair, state)
+            terrain_pair_exit(out, pair, state)
         return
     r0 = cells[0]
     r1 = cells[1]
