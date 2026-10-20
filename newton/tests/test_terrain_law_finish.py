@@ -8,6 +8,7 @@ import unittest
 import numpy as np
 import warp as wp
 
+import newton
 from newton._src.geometry.contact_data import make_contact_sort_key
 from newton._src.geometry.narrow_phase import verify_narrow_phase_buffers
 from newton._src.geometry.terrain_law import (
@@ -56,6 +57,11 @@ def _finish(
     for j in range(count):
         order[i, j] = rows.feature[selected[j]]
     terrain_report(status, overflow, flag, True)
+
+
+@wp.kernel(enable_backward=False)
+def _report(status: wp.array[wp.int32], overflow: wp.array[wp.int32], flags: int, current: int):
+    terrain_report(status, overflow, flags, current != 0)
 
 
 @wp.kernel(enable_backward=False)
@@ -286,6 +292,26 @@ def test_feature_ids_fit_the_sort_key(test, device):
     np.testing.assert_array_equal(keys.numpy() & 0x7FFFFF, ids)
 
 
+def test_terrain_report_raises_at_the_capacity_check(test, device):
+    """Raise at the narrow phase's capacity check, by name, after a terrain pair overflows or reads stale features."""
+    builder = newton.ModelBuilder()
+    builder.add_shape_sphere(builder.add_body(), radius=0.1)
+    narrow = newton.CollisionPipeline(builder.finalize(device=device), verify_buffers=True).narrow_phase
+    overflow = wp.zeros(2, dtype=wp.int32, device=device)
+    for flags, current, name in (
+        (int(TERRAIN_FINISH_ROW_OVERFLOW), 1, "terrain_rows"),
+        (int(TERRAIN_FINISH_CANDIDATE_OVERFLOW), 1, "terrain_rows"),
+        (0, 0, "terrain_stale"),
+    ):
+        with test.subTest(name=name, flags=flags):
+            narrow.buffer_capacity_status(clear=True)
+            narrow.check_buffer_capacity()
+            wp.launch(_report, dim=1, inputs=[narrow._buffer_capacity_status, overflow, flags, current], device=device)
+            test.assertEqual([key for key, value in narrow.buffer_capacity_status().items() if value], [name])
+            with test.assertRaisesRegex(RuntimeError, name):
+                narrow.check_buffer_capacity()
+
+
 class TestTerrainLawFinish(unittest.TestCase):
     pass
 
@@ -295,6 +321,7 @@ for _name, _func in (
     ("test_finish_matches_reference", test_finish_matches_reference),
     ("test_finish_overflow_keeps_supports", test_finish_overflow_keeps_supports),
     ("test_feature_ids_fit_the_sort_key", test_feature_ids_fit_the_sort_key),
+    ("test_terrain_report_raises_at_the_capacity_check", test_terrain_report_raises_at_the_capacity_check),
 ):
     add_function_test(TestTerrainLawFinish, _name, _func, devices=devices)
 

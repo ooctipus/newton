@@ -4336,6 +4336,9 @@ class NarrowPhase:
         matching. ``reduction_hash_load`` is a load warning,
         not proof that contacts were lost. Other flags identify exceeded buffers
         or failed reducer insertions. No flag is an estimate of required capacity.
+        ``terrain_rows`` (a terrain-law pair overflowed its candidates or rows)
+        and ``terrain_stale`` (terrain features older than the heights were read)
+        are set by the terrain law's kernels, which no route runs yet.
         """
         if not self.verify_buffers:
             raise RuntimeError("Narrow-phase capacity status requires verify_buffers=True throughout the run")
@@ -4356,6 +4359,8 @@ class NarrowPhase:
             "contacts",
             "reduction_hash_load",
             "reduction_hash_insert",
+            "terrain_rows",
+            "terrain_stale",
         )
         result = {name: bool(mask & (1 << bit)) for bit, name in enumerate(names)}
         if self._heightfield_pair_csr:

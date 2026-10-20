@@ -41,7 +41,8 @@ The per-pair finish (:func:`terrain_finish`) merges coincident rows, drops the r
 group imply (the lower convex hull of tangent position and distance, residual ``1e-6 m``), keeps at most four rows
 per plane group (deepest, farthest, largest triangle, largest quadrilateral) and at most ``row_limit`` rows per
 pair, each group's deepest row first and then its extremes; an overflow sets a sticky bit of the narrow phase's
-buffer status word, which ``verify_narrow_phase_buffers`` keeps.
+buffer status word, which ``verify_narrow_phase_buffers`` keeps and ``NarrowPhase.check_buffer_capacity`` raises
+on (``terrain_rows``; stale features: ``terrain_stale``).
 """
 
 from __future__ import annotations
@@ -117,9 +118,11 @@ TERRAIN_FINISH_CANDIDATE_OVERFLOW = wp.constant(1)
 TERRAIN_FINISH_ROW_OVERFLOW = wp.constant(2)
 """Finish flag: more rows survived than the pair's row limit."""
 TERRAIN_STATUS_ROWS = wp.constant(1 << 13)
-"""Sticky bit of the narrow phase's buffer status word: a terrain pair overflowed its candidates or rows."""
+"""Sticky bit of the narrow phase's buffer status word (``terrain_rows``): a terrain pair overflowed its candidates
+or rows."""
 TERRAIN_STATUS_STALE = wp.constant(1 << 14)
-"""Sticky bit of the narrow phase's buffer status word: terrain features older than the heights were read."""
+"""Sticky bit of the narrow phase's buffer status word (``terrain_stale``): terrain features older than the heights
+were read."""
 
 TerrainRowsVec3 = wp.types.matrix(shape=(TERRAIN_ROW_CANDIDATES, 3), dtype=wp.float32)
 TerrainRowsFloat = wp.types.vector(length=TERRAIN_ROW_CANDIDATES, dtype=wp.float32)

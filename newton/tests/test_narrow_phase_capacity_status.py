@@ -12,7 +12,7 @@ import newton
 from newton._src.geometry.narrow_phase import verify_narrow_phase_buffers
 from newton.tests.unittest_utils import StdOutCapture
 
-NAMES = (
+VERIFIER_NAMES = (
     "broad_phase",
     "split_query",
     "gjk",
@@ -27,6 +27,9 @@ NAMES = (
     "reduction_hash_load",
     "reduction_hash_insert",
 )
+TERRAIN_NAMES = ("terrain_rows", "terrain_stale")
+"""Bits 13 and 14, which the terrain law's kernels set."""
+NAMES = VERIFIER_NAMES + TERRAIN_NAMES
 
 
 def make_pipeline(device="cpu", *, verify=True, capacity=1):
@@ -76,7 +79,7 @@ class TestNarrowPhaseCapacityStatus(unittest.TestCase):
         capture = StdOutCapture()
         capture.begin()
         try:
-            for bit, name in enumerate(NAMES):
+            for bit, name in enumerate(VERIFIER_NAMES):
                 with self.subTest(name=name):
                     narrow.buffer_capacity_status(clear=True)
                     if bit < 11:
@@ -95,6 +98,20 @@ class TestNarrowPhaseCapacityStatus(unittest.TestCase):
                     self.assertTrue(narrow.buffer_capacity_status()[name])
         finally:
             capture.end()
+
+    def test_terrain_bits_are_named_and_raise(self):
+        """Report the terrain law's sticky bits by name and raise on each at the capacity check."""
+        _, pipeline = make_pipeline()
+        narrow = pipeline.narrow_phase
+        for bit, name in zip((13, 14), TERRAIN_NAMES, strict=True):
+            with self.subTest(name=name):
+                narrow.buffer_capacity_status(clear=True)
+                narrow._buffer_capacity_status.assign([1 << bit])
+                self.assertEqual(narrow.buffer_capacity_status(), {key: key == name for key in NAMES})
+                with self.assertRaisesRegex(RuntimeError, name):
+                    narrow.check_buffer_capacity()
+        narrow.buffer_capacity_status(clear=True)
+        narrow.check_buffer_capacity()
 
     def test_disabled_split_and_absent_mesh_storage_are_not_failures(self):
         _, pipeline = make_pipeline()
