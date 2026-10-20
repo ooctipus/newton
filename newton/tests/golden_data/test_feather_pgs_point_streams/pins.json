@@ -15,6 +15,8 @@
   "contact_torsion_device._gather": "ed8e305efa4d267209eb4ed4ee81630b2acb053e6674f0766adc013d17fdb9ea",
   "contact_torsion_device._group_world": "a74e53a8b298a9af9f810f1e57f2c145585b82e1c790ad2bdba8d1141f744af4",
   "contact_torsion_device._jacobians": "9341b297011506fbc3316a099e832832d7dfa8a33a0cd7a738a67a31a08bd9f2",
+  "contact_unit_sweeps.pgs_solve_loop_unit": "5aedadb27342b2ef839355bed519518080bc81ad1593320a5c43a30e648f4f3b",
+  "contact_unit_sweeps.pgs_solve_mf_loop_unit": "1868d19c7473092c48c72aeb787dd4fedfaf627b5e3104fe20ad331b38bf61a2",
   "device_proof._checksum_words": "539d4dfaf5523eb00eac977262740ec66706aa1a166614751c756013a3e15d62",
   "free_body_gyro.correct_free_body_gyroscopic_predictor": "b12f0164d5a1d93a35a31c74e6e6909a21f05a54faedca55bb6a0e16cc279c33",
   "friction_patches._arange": "edb4523f6b383526e5286b572acdb79ba0b36d30fafbbf0b64cc04e8b256a01f",
