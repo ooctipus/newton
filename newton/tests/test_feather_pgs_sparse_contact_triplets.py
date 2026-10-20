@@ -41,6 +41,17 @@ def factory(capacity, dofs, width, *, candidate=True, active=True, linked=False)
     )
 
 
+def pair_metric(a, c, d):
+    """Return the paired law's tangent eigenbasis ``(largest, smallest, vx, vy)``, relative to ``max(a, d)``."""
+    scale = max(a, d, 1.0e-20)
+    a, c, d = a / scale, c / scale, d / scale
+    largest = 0.5 * (a + d + np.sqrt((a - d) ** 2 + 4.0 * c * c))
+    smallest = max((a * d - c * c) / largest, 0.0) if largest > 0.0 else 0.0
+    vx, vy = (largest - d, c) if a >= d else (c, largest - a)
+    norm = np.hypot(vx, vy)
+    return (largest, smallest, vx / norm, vy / norm) if norm > 0.0 else (largest, smallest, 1.0, 0.0)
+
+
 def fixture(*, offset=0, activity=None, seeded=False, omega=1.0, delay=0, iteration_offset=0, linked=False):
     """Retain the independent physical-coordinate oracle, including its factor."""
     dofs, width = (3, 3) if activity is not None else (18, 12)

@@ -3,10 +3,12 @@
 
 """Build contact responses in the sparse mass factor's coordinates."""
 
+import textwrap
 from functools import cache
 
 import warp as wp
 
+from .friction import _PAIR_METRIC
 from .friction_patches import FrictionPatches
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -48,6 +50,52 @@ class SparseContactRows:
     rhs: wp.array2d[float]
 
 
+CONTACT_RECORD_FLOATS = 8
+"""Floats of a contact triplet's block record: ``W_nt1, W_nt2, W_t1t2, 1/W_nn``, then the pair
+law's tangent eigenbasis ``largest, smallest, vx, vy`` relative to the larger tangent diagonal."""
+CONTACT_RING_FLOATS = 4
+"""Floats a linked sparse sweep appends to each record: the anchor's other ring members, as int bits."""
+
+
+def _insert_once(text: str, anchor: str, addition: str, *, replace: bool = False) -> str:
+    """Return ``text`` with ``addition`` after (or, with ``replace``, instead of) its one ``anchor``."""
+    if text.count(anchor) != 1:
+        raise RuntimeError(f"expected one occurrence of {anchor!r}")
+    return text.replace(anchor, addition if replace else anchor + addition)
+
+
+# The contact block record of a full triplet (CONTACT_RECORD_FLOATS): the cross terms
+# and inverse normal diagonal, then the pair law's metric of the tangent block, formed from the
+# diagonals as written. Lane sums meet in the same tree as the norms.
+_CONTACT_RECORD_SOURCE = """
+    if (row_count == 3) {
+#if defined(__CUDA_ARCH__)
+        for (int shift = $LANES / 2; shift > 0; shift >>= 1) {
+            cross.c[0] += __shfl_down_sync(MASK, cross.c[0], shift, $LANES);
+            cross.c[1] += __shfl_down_sync(MASK, cross.c[1], shift, $LANES);
+            cross.c[2] += __shfl_down_sync(MASK, cross.c[2], shift, $LANES);
+        }
+#endif
+        if (lane == 0) {
+            float* record = row_free_response.data
+                + (world * row_free_response.shape[1] + slot / 3) * row_free_response.shape[2];
+            record[0] = cross.c[0];
+            record[1] = cross.c[1];
+            record[2] = cross.c[2];
+            record[3] = 1.0f / (norm.c[0] + cfm);
+            float a = norm.c[1] + cfm, c = cross.c[2], d = norm.c[2] + cfm;
+            {
+$PAIR_METRIC
+                record[4] = largest;
+                record[5] = smallest;
+                record[6] = vx;
+                record[7] = vy;
+            }
+        }
+    }
+"""
+
+
 @cache
 def _get_sparse_contact_response_kernel(
     dof_count: int,
@@ -56,6 +104,7 @@ def _get_sparse_contact_response_kernel(
     warps_per_block: int = 4,
     prepare_rows: bool = False,
     use_support_table: bool = False,
+    contact_records: bool = False,
 ) -> wp.Kernel:
     """Project contact rows with a lane group per contact and no global Jacobian.
 
@@ -71,6 +120,17 @@ def _get_sparse_contact_response_kernel(
     repeating its DOF indices. The caller admits one factored articulation
     per world, at offset zero, with no physical free-body response.
 
+    ``contact_records`` also writes each full contact triplet's block record
+    for the sparse sweep's single-stage transaction (see
+    :data:`CONTACT_RECORD_FLOATS`): the lane groups accumulate the
+    three cross products with the norms, and one lane forms ``W_nt1, W_nt2,
+    W_t1t2, 1/W_nn`` and the friction pair's tangent eigenbasis from the
+    diagonals it writes. The record of the triplet at normal row ``slot`` is
+    row ``slot // 3`` of world ``world`` in ``row_free_response``, which the
+    support table's routes leave unused; it has shape ``(world_count,
+    max_constraints // 3, width)`` with ``width >= 8``. It requires
+    ``prepare_rows`` and ``use_support_table``.
+
     All input/output arrays must be contiguous for the native flat accesses.
     Launch total_num_workers * lanes_per_contact threads in blocks of
     warps_per_block * 32. The CPU implementation uses one lane per group.
@@ -78,6 +138,8 @@ def _get_sparse_contact_response_kernel(
     n, lanes, warps = int(dof_count), int(lanes_per_contact), int(warps_per_block)
     if not 1 <= n <= 64 or lanes not in (8, 16, 32) or not 1 <= warps <= 32:
         raise ValueError("Invalid sparse contact dimensions or lane group")
+    if contact_records and not (prepare_rows and use_support_table):
+        raise ValueError("Contact records require prepared rows and the row support table")
     groups = warps * 32 // lanes
     scratch_size = max(n, 6) + 6
     geometry_size = 27 if prepare_rows else 0
@@ -329,6 +391,39 @@ def _get_sparse_contact_response_kernel(
         }
     }
 """
+    if contact_records:
+        # Records ride in row_free_response: the support table's routes admit no free-body
+        # response, so its free branch writes no responses there, only the cross products.
+        snippet = _insert_once(snippet, "    auto norm = wp::vec3(0.0f);\n", "    auto cross = wp::vec3(0.0f);\n")
+        snippet = _insert_once(
+            snippet,
+            "                    row_free_response.data[(row_offset + row) * row_free_response.shape[2]"
+            " + count + node] = response.c[row];\n",
+            "",
+            replace=True,
+        )
+        snippet = _insert_once(
+            snippet,
+            "                    norm.c[row] += value * response.c[row];\n                }\n",
+            """                if (row_count == 3) {
+                    cross.c[0] += jacobian[node] * response.c[1];
+                    cross.c[1] += jacobian[node] * response.c[2];
+                    cross.c[2] += jacobian[$PLANE + node] * response.c[2];
+                }
+""",
+        )
+        snippet = _insert_once(
+            snippet,
+            "                    norm.c[row] += value.c[row] * value.c[row];\n                }\n",
+            """                if (row_count == 3) {
+                    cross.c[0] += value.c[0] * value.c[1];
+                    cross.c[1] += value.c[0] * value.c[2];
+                    cross.c[2] += value.c[1] * value.c[2];
+                }
+""",
+        )
+        metric = textwrap.indent(_PAIR_METRIC.substitute(max_call="wp::max"), "        ")
+        snippet += _CONTACT_RECORD_SOURCE.replace("$PAIR_METRIC", metric.rstrip("\n"))
     snippet = (
         snippet.replace(
             "$SPARSE_PROJECTION",
@@ -615,6 +710,8 @@ def _get_sparse_contact_response_kernel(
         contact_kernel.__name__ += "_prepared"
     if use_support_table:
         contact_kernel.__name__ += "_support_table"
+    if contact_records:
+        contact_kernel.__name__ += "_contact_records"
     contact_kernel.__qualname__ = contact_kernel.__name__
     return wp.kernel(enable_backward=False, module="unique")(contact_kernel)
 

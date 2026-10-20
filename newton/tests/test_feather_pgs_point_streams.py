@@ -379,6 +379,10 @@ def _sparse_contact_calls():
     for dofs, prepare, table in itertools.product((8, 18), (False, True), (False, True)):
         kwargs = {"prepare_rows": prepare, "use_support_table": table}
         yield "sparse_contact._get_sparse_contact_response_kernel", factory, (dofs,), kwargs
+    # The triplet records of the single-stage transaction, which both laws can select.
+    for dofs in (8, 18, 25):
+        kwargs = {"prepare_rows": True, "use_support_table": True, "contact_records": True}
+        yield "sparse_contact._get_sparse_contact_response_kernel", factory, (dofs,), kwargs
 
 
 def _solver_factory_calls():
