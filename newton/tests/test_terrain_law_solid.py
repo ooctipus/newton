@@ -494,6 +494,112 @@ def test_solid_rows_are_complete_and_free_of_ghosts(test, device):
 
 
 # ----------------------------------------------------------------------------------------------------------------
+# minimal and complete on rough terrain and at a concave crease (the symptom bench's g_thin and c_crease20, as rows)
+# ----------------------------------------------------------------------------------------------------------------
+
+
+def _thin_rods(device, seed=11):
+    """Thin rods lying on a rough tile (the symptom bench's g_thin): radii 10 and 20 mm, half heights 62.5 and 150 mm,
+    any yaw, resting 0.2-2 mm into their margin shells on 5 mm steps of 0.1 m cells."""
+    rng = np.random.default_rng(seed)
+    heights = np.round(rng.uniform(0.0, 0.1, (33, 33)) / 0.005) * 0.005
+    hf = tu.reference_surface(tu.heightfield_model(heights, 1.6, 1.6, device="cpu"))
+    bodies = []
+    for k in range(16):
+        dims = {"radius": (0.01, 0.02)[k % 2], "half_height": (0.0625, 0.15)[(k // 2) % 2]}
+        x, y = rng.uniform(-1.1, 1.1, 2)
+        q = _quat_mul(_axis_angle((0.0, 0.0, 1.0), rng.uniform(0.0, 6.3)), LYING)
+        lo, hi = ref.make_core("cylinder", dims, np.r_[x, y, 0.0, q]).aabb()
+        z0 = _top_under(hf, lo, hi, 0.0) - lo[2]
+        separation = su.refined_separation(hf, ref.make_core("cylinder", dims, np.r_[x, y, z0, q]))
+        z = z0 - separation + 2.0 * su.MARGIN - rng.uniform(0.0002, 0.002)
+        bodies.append(("cylinder", dims, _f32_pose(np.r_[x, y, z, q])))
+    model, hfield, shapes = su.solid_scene(heights, 1.6, 1.6, bodies, device=device)
+    return hf, model, hfield, shapes, bodies
+
+
+def _crease_bodies(device, seed=11):
+    """Solids resting in a 20 deg concave crease (the symptom bench's c_crease20: a flat floor meets a planar slope at
+    a cell boundary, 5 cm cells): boxes, cylinders, a toe and a cone, upright and leaning 10 and 20 deg toward the
+    slope, yawed 0, 4 or 17 deg, each 0.2-2 mm into the margin shells of both half-spaces."""
+    rng = np.random.default_rng(seed)
+    th, z0 = np.radians(20.0), 0.2
+    x = np.linspace(-1.0, 1.0, 41)
+    heights = np.tile(np.where(x < 0.0, z0 + np.minimum(np.tan(th) * -x, 0.35), z0), (65, 1))
+    hf = tu.reference_surface(tu.heightfield_model(heights, 1.0, 1.6, device="cpu"))
+    floor = np.array([0.0, 0.0, 1.0])
+    slope = np.array([np.sin(th), 0.0, np.cos(th)])
+    kinds = (
+        ("box", BOX),
+        ("box", {"half": (0.05, 0.09, 0.03)}),
+        ("cylinder", CYLINDER),
+        ("cylinder", {"radius": 0.06, "half_height": 0.03}),
+        ("cylinder", TOE),
+        ("cone", CONE),
+    )
+    bodies = []
+    for k in range(18):
+        kind, dims = kinds[k % len(kinds)]
+        lean = np.radians((0.0, 10.0, 20.0)[k // len(kinds)])
+        yaw = np.radians(rng.choice([0.0, 4.0, 17.0]))
+        q = _quat_mul(_axis_angle((0.0, 1.0, 0.0), -lean), _axis_angle((0.0, 0.0, 1.0), yaw))
+        core = ref.make_core(kind, dims, np.r_[0.0, 0.0, 0.0, q])
+        # the translation (x, z) that sets the core's distance to both planes (through (0, 0, z0)) in the margins
+        gap_floor, gap_slope = 2.0 * su.MARGIN - rng.uniform(0.0002, 0.002, size=2)
+        z = gap_floor - (float(floor @ core.lowest(floor)) - z0)
+        x = (gap_slope - (float(slope @ core.lowest(slope)) - slope[2] * z0) - slope[2] * z) / slope[0]
+        bodies.append((kind, dims, _f32_pose(np.r_[x, -1.35 + 2.7 * k / 17, z, q])))
+    model, hfield, shapes = su.solid_scene(heights, 1.0, 1.6, bodies, device=device)
+    return hf, model, hfield, shapes, bodies
+
+
+def _duplicates(rows) -> int:
+    """Near-duplicate row pairs: core points within 1 mm and normals within 2 deg (the symptom bench's dup metric)."""
+    count = 0
+    for a in range(len(rows)):
+        qa, na, da = tu.row_qnd(rows[a])
+        for b in range(a + 1, len(rows)):
+            qb, nb, db = tu.row_qnd(rows[b])
+            if np.linalg.norm(qa + da * na - qb - db * nb) < 1.0e-3 and tu.angle_between(na, nb) < np.radians(2.0):
+                count += 1
+    return count
+
+
+def _support_violations(hf, rows, shapes, bodies) -> dict:
+    """Per body against the float64 law and exact geometry: rows other than the law's, near-duplicates beyond the
+    law's own (at a concave crease the law keeps a point's two half-space rows, 20 deg apart: not duplicates), ghost
+    normals and incomplete bodies (:func:`_exact_violations`)."""
+    differ, duplicates = [], []
+    for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
+        law = su.law_rows(hf, kind, dims, pose)
+        got = rows.get(shape, [])
+        missing, extra, deepest = su.compare_solid_rows(law, got)
+        if missing or extra or deepest > 1.0e-5:
+            differ.append((kind, pose.tolist(), [repr(m) for m in missing], extra, deepest))
+        if _duplicates(got) > _duplicates(law):
+            duplicates.append((kind, pose.tolist(), _duplicates(got), _duplicates(law)))
+    incomplete, ghosts = _exact_violations(hf, rows, shapes, bodies)
+    return {"differ": differ, "duplicates": duplicates, "ghosts": ghosts, "incomplete": incomplete}
+
+
+def test_thin_rods_and_crease_bodies_keep_their_supports(test, device):
+    """Give thin rods on rough terrain and solids in a concave crease the float64 law's rows: no ghost normal, no
+    near-duplicate the law lacks, the deepest row at the exact separation.
+
+    The symptom bench's g_thin and c_crease20 as rows (DESIGN 6.1, Track 3's must-fail-first cases). Today's route
+    loses 10 of the 16 rods' supports and adds a ghost row, and in the crease loses 7 of 18 bodies' supports with 12
+    ghost rows and a duplicate.
+    """
+    for name, scene in (("g_thin", _thin_rods), ("c_crease20", _crease_bodies)):
+        with test.subTest(case=name):
+            hf, model, _hfield, shapes, bodies = scene(device)
+            pipeline, _contacts, _state = _collide(model, shadow=True)
+            violations = _support_violations(hf, tu.shadow_rows(pipeline), shapes, bodies)
+            test.assertEqual(violations, {"differ": [], "duplicates": [], "ghosts": [], "incomplete": []})
+            test.assertGreater(sum(len(v) for v in tu.shadow_rows(pipeline).values()), 3 * len(bodies))
+
+
+# ----------------------------------------------------------------------------------------------------------------
 # complete: cylinders through one exposed cell (the exact LP reference's per-cell cases) and buried lying cylinders
 # ----------------------------------------------------------------------------------------------------------------
 
@@ -1185,6 +1291,18 @@ class TestTerrainLawSolid(unittest.TestCase):
         self.assertGreater(sum(v for k, v in found.items() if k.endswith("incomplete")), 5, msg=found)
         self.assertGreater(sum(v for k, v in found.items() if k.endswith("ghosts")), 5, msg=found)
 
+    def test_today_route_fails_thin_rods_and_creases_cpu(self):
+        """Lose thin rods' and crease bodies' supports today, and add ghost normals and duplicates there."""
+        found = {}
+        for name, scene in (("g_thin", _thin_rods), ("c_crease20", _crease_bodies)):
+            hf, model, hfield, shapes, bodies = scene("cpu")
+            _pipeline, contacts, state = _collide(model, shadow=False)
+            violations = _support_violations(hf, tu.contact_rows(model, state, contacts, hfield), shapes, bodies)
+            for key in ("duplicates", "ghosts", "incomplete"):
+                found[f"{name} {key}"] = len(violations[key])
+        self.assertGreater(found["g_thin incomplete"], 5, msg=found)
+        self.assertGreater(found["c_crease20 incomplete"] + found["c_crease20 ghosts"], 5, msg=found)
+
     def test_barrel_cylinders_are_left_out_cpu(self):
         """Give a barrel cylinder (a hull-class shape with no core in the law yet) no row and say why."""
         builder = newton.ModelBuilder()
@@ -1226,6 +1344,7 @@ for _name, _func in (
         test_solid_rows_are_minimal_on_a_vertex_without_margins,
     ),
     ("test_solid_rows_are_complete_and_free_of_ghosts", test_solid_rows_are_complete_and_free_of_ghosts),
+    ("test_thin_rods_and_crease_bodies_keep_their_supports", test_thin_rods_and_crease_bodies_keep_their_supports),
     ("test_exposed_cell_rows_follow_the_law", test_exposed_cell_rows_follow_the_law),
     ("test_buried_solids_follow_the_law", test_buried_solids_follow_the_law),
     ("test_recovery_rows_have_distinct_feature_ids", test_recovery_rows_have_distinct_feature_ids),
