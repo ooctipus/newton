@@ -18,7 +18,8 @@ surface feature:
 * R: solid cores below the surface with no row: up to four of their deepest boundary points (G3).
 * C: optional concave anticipation of a moving core.
 * The finish: coincident rows merged, rows implied by the others of their plane group dropped (the lower convex
-  hull of tangent position and distance), at most four rows per plane group.
+  hull of tangent position and distance), at most four rows per plane group and, given a row limit, at most that
+  many per pair (every group's deepest row first, then its extremes).
 
 This is a port of the design study's float64 prototype with three changes, each measured on the CPU:
 
@@ -62,6 +63,14 @@ vertex's normal cone.
 """
 IMPLIED_RESIDUAL = 1.0e-6
 """A row no deeper than this below the lower hull of its plane group's other rows is implied [m]."""
+GROUP_NORMAL = 1.0e-5
+"""Largest normal difference within a plane group (with ``GROUP_OFFSET``)."""
+GROUP_OFFSET = 1.0e-6
+"""Largest distance of a row's terrain point from its plane group's plane [m].
+
+Planes closer than the implication residual are one plane at the finish's resolution; the float32 finish uses
+four predicate bands, 0.4-1.5 um on windows of 0.1-0.4 m.
+"""
 
 EPS_PRED = 1.0e-12
 """Predicate band [m]: a value within it counts as on the boundary."""
@@ -1021,6 +1030,8 @@ class Stats:
         self.convex_edges = self.convex_verts = 0
         self.face_tests = self.edge_solves = self.vertex_solves = 0
         self.emitted = self.merged = self.implied = self.reduced = 0
+        self.limited = 0
+        """Rows dropped by the per-pair row limit."""
 
 
 def _outward_edge_normals(hf, t):
@@ -1607,15 +1618,39 @@ def _closest_point(core, v):
 # ----------------------------------------------------------------------------------------------------------------
 
 
-def finish(rows, *, stats=None, max_per_group=4, implied="lower_hull"):
-    """Merge coincident rows, drop rows implied within their plane group, keep at most ``max_per_group`` per group.
+def finish(
+    rows,
+    *,
+    stats=None,
+    max_per_group=4,
+    row_limit=None,
+    implied="lower_hull",
+    group_normal=GROUP_NORMAL,
+    group_offset=GROUP_OFFSET,
+):
+    """The per-pair finish: merge, implied rows, ``max_per_group`` rows per plane group, ``row_limit`` per pair.
+
+    1. Coincident rows (terrain points within ``EPS_MERGE_P``, normals within ``EPS_MERGE_N``) merge into the
+       first in feature order.
+    2. Plane groups form in feature order: a row joins the first group whose first row's normal lies within
+       ``group_normal`` of its own and whose plane lies within ``group_offset`` of its terrain point.
+    3. A group drops the rows the others imply (see ``implied``).
+    4. A group keeps at most ``max_per_group`` rows by :func:`group_ranks`.
+    5. With ``row_limit``, a pair keeps at most that many rows: every group's rank-0 row (its deepest) first,
+       then the rank-1 rows (the farthest), and so on; within a rank the deepest first, ties in feature order.
 
     Args:
         rows: Rows of one pair in feature order.
         stats: Optional counters.
         max_per_group: Rows kept per plane group.
+        row_limit: Rows kept per pair, or ``None`` for no limit.
         implied: ``"lower_hull"`` (rows on or above the lower hull of the others' (tangent position, distance))
             or ``"hull3d"`` (the prototype: core point inside the others' 3-D hull and not deeper).
+        group_normal: Largest normal difference within a plane group.
+        group_offset: Largest distance [m] of a row's terrain point from its group's plane.
+
+    Returns:
+        The kept rows in feature order.
     """
     kept = []
     for ct in rows:
@@ -1624,26 +1659,77 @@ def finish(rows, *, stats=None, max_per_group=4, implied="lower_hull"):
                 stats.merged += 1
             continue
         kept.append(ct)
-    groups = {}
+    groups = []
     for ct in kept:
-        groups.setdefault(plane_group(ct), []).append(ct)
-    final = []
-    for members in groups.values():
+        for members in groups:
+            first = members[0]
+            if (
+                np.linalg.norm(ct.n - first.n) <= group_normal
+                and abs(float(first.n @ (ct.q - first.q))) <= group_offset
+            ):
+                members.append(ct)
+                break
+        else:
+            groups.append([ct])
+    ranked = []
+    for members in groups:
         group = _drop_implied(members, stats, implied)
-        if len(group) > max_per_group:
-            idx = reduce4([ct.k for ct in group], [ct.d for ct in group], group[0].n)[:max_per_group]
-            if stats:
-                stats.reduced += len(group) - len(idx)
-            group = [group[i] for i in idx]
-        final.extend(group)
+        order, chosen = group_ranks(group, normal=members[0].n)
+        keep = order if len(group) <= max_per_group else order[: min(chosen, max_per_group)]
+        if stats:
+            stats.reduced += len(group) - len(keep)
+        ranked.extend((rank, group[i]) for rank, i in enumerate(keep))
+    position = {id(ct): i for i, ct in enumerate(rows)}
+    if row_limit is not None and len(ranked) > row_limit:
+        ranked.sort(key=lambda item: (item[0], item[1].d, position[id(item[1])]))
+        if stats:
+            stats.limited += len(ranked) - row_limit
+        ranked = ranked[:row_limit]
+    final = sorted((ct for _rank, ct in ranked), key=lambda ct: position[id(ct)])
     if stats:
         stats.emitted += len(final)
     return final
 
 
-def plane_group(ct):
-    """Rows on one terrain plane with one normal: (normal, plane offset) rounded."""
-    return (tuple(np.round(ct.n, 7)), round(float(ct.n @ ct.q), 8))
+def group_ranks(group, *, normal=None):
+    """Rank the rows of one plane group, in tangent positions on its plane; ties in feature order.
+
+    Returns ``(order, chosen)``: rank 0 is the deepest row, rank 1 the farthest from it, rank 2 the one spanning
+    the largest triangle with those two and rank 3 the one adding the most area (more than 1e-15) outside that
+    triangle; these ``chosen`` rows come first, the others after them in feature order (a group of at most four
+    rows keeps them all, in this order). ``normal`` is the group's normal, by default its first row's.
+    """
+    n = group[0].n if normal is None else normal
+    P = np.array([ct.k - float(ct.k @ n) * n for ct in group]).reshape(-1, 3)
+    rest = list(range(len(group)))
+    if not rest:
+        return [], 0
+    order = [min(rest, key=lambda i: (group[i].d, i))]
+    rest.remove(order[0])
+    p0 = P[order[0]]
+    if rest:
+        order.append(max(rest, key=lambda i: (float(np.linalg.norm(P[i] - p0)), -i)))
+        rest.remove(order[1])
+    if rest:
+        p1 = P[order[1]]
+        order.append(max(rest, key=lambda i: (abs(float(np.cross(p1 - p0, P[i] - p0) @ n)), -i)))
+        rest.remove(order[2])
+    if rest:
+        tri = [P[i] for i in order]
+        best, pick = 1.0e-15, None
+        for j in rest:
+            gain = 0.0
+            for a, b, c in ((0, 1, 2), (1, 2, 0), (2, 0, 1)):
+                side_c = float(np.cross(tri[b] - tri[a], tri[c] - tri[a]) @ n)
+                side_j = float(np.cross(tri[b] - tri[a], P[j] - tri[a]) @ n)
+                if side_c * side_j < 0.0:
+                    gain = max(gain, abs(side_j))
+            if gain > best:
+                best, pick = gain, j
+        if pick is not None:
+            order.append(pick)
+            rest.remove(pick)
+    return order + rest, len(order)
 
 
 def _drop_implied(g, stats, implied):

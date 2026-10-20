@@ -187,65 +187,66 @@ def test_finish_matches_reference(test, device):
     test.assertGreater(reduced, 20)
 
 
-def _overflow_expected(rows, row_limit):
-    """The overflow rule, independently: every group's deepest row first, then its farthest, triangle, quadrilateral."""
-    groups = {}
-    for i, row in enumerate(rows):
-        groups.setdefault(ref.plane_group(row), []).append(i)
-    ranked = []
-    for members in groups.values():
-        order = ref.reduce4([rows[i].k for i in members], [rows[i].d for i in members], rows[members[0]].n)
-        if len(members) <= 4:
-            order = _rank4(rows, members)
-        for rank, local in enumerate(order[:4]):
-            ranked.append((rank, rows[members[local]].d, members[local]))
-    ranked.sort()
-    return sorted(i for _rank, _d, i in ranked[:row_limit])
+def test_plane_groups_form_by_tolerance(test, device):
+    """Group rows of one plane whose offsets straddle a rounding boundary, and drop the row the others imply.
+
+    Two rows at depth 10 mm and one between them at 12 mm on one plane, the middle one 2e-13 m higher: a
+    grouping by rounded offsets (8 decimals) split them and kept all three.
+    """
+    n = np.array([0.0, 0.0, 1.0])
+    rows = []
+    for x, depth, z in ((0.0, 0.01, 0.1234567849999), (0.1, 0.01, 0.1234567849999), (0.05, 0.012, 0.1234567850001)):
+        q = np.array([x, 0.0, z])
+        rows.append(ref.Row(q, q + depth * n, n.copy(), depth, None))
+    kept, _flags, _status, _overflow = _run(device, [rows], 8)
+    test.assertEqual(kept[0], [0, 1])
+    test.assertEqual([next(i for i, r in enumerate(rows) if r is e) for e in ref.finish(rows)], [0, 1])
 
 
-def _rank4(rows, members):
-    """The order reduce4 would give a group of at most four rows (it returns them unordered)."""
-    n = rows[members[0]].n
-    P = np.array([rows[i].k - (rows[i].k @ n) * n for i in members])
-    h = np.array([rows[i].d for i in members])
-    i0 = int(np.argmin(h))
-    rest = [j for j in range(len(members)) if j != i0]
-    if not rest:
-        return [i0]
-    i1 = max(rest, key=lambda j: (np.linalg.norm(P[j] - P[i0]), -j))
-    rest = [j for j in rest if j != i1]
-    if not rest:
-        return [i0, i1]
-    i2 = max(rest, key=lambda j: (abs(np.cross(P[i1] - P[i0], P[j] - P[i0]) @ n), -j))
-    return [i0, i1, i2] + [j for j in rest if j != i2]
+def _corner_rows(rng, groups, corners):
+    """Rows of one pair: ``groups`` plane groups of ``corners`` corners of a convex polygon each (none implied)."""
+    rows = []
+    for _group in range(groups):
+        n = rng.normal(size=3)
+        n[2] = abs(n[2]) + 1.0
+        n /= np.linalg.norm(n)
+        e1, e2 = _frame(n)
+        origin = rng.uniform(-0.3, 0.3, size=3)
+        angles = np.sort(rng.uniform(0.0, 2.0 * np.pi, size=corners))
+        for a in angles:
+            q = origin + 0.08 * (np.cos(a) * e1 + np.sin(a) * e2)
+            dd = float(rng.uniform(-0.004, 0.01))
+            rows.append(ref.Row(q, q + dd * n, n.copy(), dd, None))
+    order = rng.permutation(len(rows))
+    return [rows[i] for i in order]
 
 
 def test_finish_overflow_keeps_supports(test, device):
-    """On overflow keep every plane group's deepest row first, then its extremes, and raise a sticky status bit."""
+    """On overflow keep every plane group's deepest row first, then its extremes, and raise a sticky status bit.
+
+    Five groups of four rows against a limit of 16, and four groups of six rows (each capped to four) against a
+    limit of 12; the float64 finish's row limit selects the same rows.
+    """
     rng = np.random.default_rng(9)
-    row_sets = []
-    for _ in range(40):
-        rows = []
-        for _group in range(5):
-            n = rng.normal(size=3)
-            n[2] = abs(n[2]) + 1.0
-            n /= np.linalg.norm(n)
-            e1, e2 = _frame(n)
-            origin = rng.uniform(-0.3, 0.3, size=3)
-            # four corners of a convex quadrilateral: none implied
-            angles = np.sort(rng.uniform(0.0, 2.0 * np.pi, size=4))
-            for a in angles:
-                q = origin + 0.08 * (np.cos(a) * e1 + np.sin(a) * e2)
-                dd = float(rng.uniform(-0.004, 0.01))
-                rows.append(ref.Row(q, q + dd * n, n.copy(), dd, None))
-        row_sets.append(rows)
-    kept, flags, status, overflow = _run(device, row_sets, 16)
-    for rows, got, flag in zip(row_sets, kept, flags, strict=True):
-        test.assertEqual(len(got), 16)
-        test.assertEqual(flag, int(TERRAIN_FINISH_ROW_OVERFLOW))
-        test.assertEqual(got, _overflow_expected(rows, 16))
-    test.assertEqual(int(status.numpy()[0]), int(TERRAIN_STATUS_ROWS))
-    test.assertEqual(overflow.numpy().tolist(), [40, 0])
+    for groups, corners, row_limit in ((5, 4, 16), (4, 6, 12)):
+        row_sets = [_corner_rows(rng, groups, corners) for _ in range(40)]
+        kept, flags, status, overflow = _run(device, row_sets, row_limit)
+        for rows, got, flag in zip(row_sets, kept, flags, strict=True):
+            stats = ref.Stats()
+            expected = ref.finish(rows, stats=stats, row_limit=row_limit)
+            test.assertEqual(len(got), row_limit)
+            test.assertEqual(flag, int(TERRAIN_FINISH_ROW_OVERFLOW))
+            test.assertEqual(got, sorted(next(i for i, r in enumerate(rows) if r is e) for e in expected))
+            test.assertEqual(stats.limited, groups * min(corners, 4) - row_limit)
+            # Every group keeps its deepest row.
+            deepest = {}
+            for i, r in enumerate(rows):
+                key = tuple(np.round(r.n, 9))
+                if key not in deepest or r.d < rows[deepest[key]].d:
+                    deepest[key] = i
+            test.assertTrue(set(deepest.values()) <= set(got))
+        test.assertEqual(int(status.numpy()[0]), int(TERRAIN_STATUS_ROWS))
+        test.assertEqual(overflow.numpy().tolist(), [40, 0])
     # The buffer verifier starts from the status word and keeps the bit.
     zero = wp.zeros(1, dtype=wp.int32, device=device)
     active = wp.zeros(2, dtype=wp.int32, device=device)
@@ -320,6 +321,7 @@ devices = get_test_devices()
 for _name, _func in (
     ("test_finish_matches_reference", test_finish_matches_reference),
     ("test_finish_overflow_keeps_supports", test_finish_overflow_keeps_supports),
+    ("test_plane_groups_form_by_tolerance", test_plane_groups_form_by_tolerance),
     ("test_feature_ids_fit_the_sort_key", test_feature_ids_fit_the_sort_key),
     ("test_terrain_report_raises_at_the_capacity_check", test_terrain_report_raises_at_the_capacity_check),
 ):
