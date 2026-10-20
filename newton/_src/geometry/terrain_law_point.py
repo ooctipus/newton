@@ -159,6 +159,12 @@ _CANDIDATES = wp.constant(TERRAIN_ROW_CANDIDATES)
 _MASK_VERTICES = wp.constant(TERRAIN_POINT_MASK_VERTICES)
 _ITEMS = wp.constant(TERRAIN_POINT_ITEMS)
 _SPHERE_ITEMS = wp.constant(6)
+_END_A_ITEMS = wp.constant(0x003F)
+"""Items 0-5 (:func:`_point_item`): the sphere centre's or capsule end ``a``'s."""
+_END_B_ITEMS = wp.constant(0x0FC0)
+"""Items 6-11: capsule end ``b``'s."""
+_AXIS_ITEMS = wp.constant(0xF000)
+"""Items 12-15: the capsule axis's."""
 _CAPSULE = wp.constant(int(GeoType.CAPSULE))
 _WIDE = wp.constant(TERRAIN_WINDOW_WIDE)
 _EPS32 = wp.constant(TERRAIN_EPS32)
@@ -676,22 +682,11 @@ def _cell_margins(window: TerrainWindow, core: _PointCore) -> wp.vec3:
 
 
 @wp.func
-def _vertex_dropped(
+def _vertex_box(
     data: TerrainFeatureData, window: TerrainWindow, core: _PointCore, margins: wp.vec3, r: int, c: int
-) -> bool:
-    """Whether no feature vertex ``(r, c)`` owns can yield a row, so that the walk passes the vertex by.
-
-    The features lie in the vertex's cell (its faces and diagonal, its x- and y-edges, itself), and a row's terrain
-    point in the box of the cell's vertices (those in the grid), widened in xy by ``margins`` (a face's point may lie
-    off its triangle within the band, :func:`_cell_margins`) and in z by how far a cluster plane may leave the
-    vertices there (the cluster tolerance, steepened by the cell's slope, and the plane over the xy widening), all
-    four times over plus the band. A row of a core point outside the solid has its core point within the reach of
-    its terrain point, so a core farther than the reach from the box yields none: a sphere centre by its 3-D distance,
-    a capsule by height alone (every vertex below the core's lowest point by more than the reach). Neither applies
-    while a core point lies inside the solid (its exits are not bounded by the reach).
-    """
-    if core.skip == 0:
-        return False
+) -> wp.vec3:
+    """The heights of the box vertex ``(r, c)``'s rows lie in (see :func:`_vertex_dropped`): its cell's lowest and
+    highest vertex (those in the grid), window frame, and how far a row's terrain point may leave them, ``zm``."""
     surface = window.surface
     zlo = float(1.0e30)
     zhi = float(-1.0e30)
@@ -705,15 +700,74 @@ def _vertex_dropped(
                 zhi = wp.max(zhi, z)
     slope = (zhi - zlo + 2.0 * _FLAT) * margins[2] + 1.0
     zm = 4.0 * (_FLAT * slope + (margins[0] + margins[1]) * slope) + _FOOTPRINT_BANDS * core.eps
-    if core.segment != 0:
-        return zhi + zm < core.low
-    k = core.a
+    return wp.vec3(zlo, zhi, zm)
+
+
+@wp.func
+def _far_from_box(
+    window: TerrainWindow, core: _PointCore, margins: wp.vec3, r: int, c: int, box: wp.vec3, k: wp.vec3
+) -> bool:
+    """Whether core point ``k`` lies farther than the reach from vertex ``(r, c)``'s box (:func:`_vertex_box`), widened
+    in xy by ``margins``."""
+    surface = window.surface
     x = k[0] - float(c - window.c0) * surface.dx
     y = k[1] - float(r - window.r0) * surface.dy
     ox = wp.max(wp.max(-margins[0] - x, x - surface.dx - margins[0]), 0.0)
     oy = wp.max(wp.max(-margins[1] - y, y - surface.dy - margins[1]), 0.0)
-    oz = wp.max(wp.max(zlo - zm - k[2], k[2] - zhi - zm), 0.0)
+    oz = wp.max(wp.max(box[0] - box[2] - k[2], k[2] - box[1] - box[2]), 0.0)
     return ox * ox + oy * oy + oz * oz > core.reach * core.reach
+
+
+@wp.func
+def _vertex_dropped(
+    data: TerrainFeatureData, window: TerrainWindow, core: _PointCore, margins: wp.vec3, r: int, c: int
+) -> bool:
+    """Whether no feature vertex ``(r, c)`` owns can yield a row, so that the walk passes the vertex by.
+
+    The features lie in the vertex's cell (its faces and diagonal, its x- and y-edges, itself), and a row's terrain
+    point in the box of the cell's vertices (those in the grid), widened in xy by ``margins`` (a face's point may lie
+    off its triangle within the band, :func:`_cell_margins`) and in z by how far a cluster plane may leave the
+    vertices there (the cluster tolerance, steepened by the cell's slope, and the plane over the xy widening), all
+    four times over plus the band (:func:`_vertex_box`). A row of a core point outside the solid has its core point
+    within the reach of its terrain point, so a core farther than the reach from the box yields none: a sphere centre
+    by its 3-D distance, a capsule by height alone (every vertex below the core's lowest point by more than the
+    reach; :func:`_kept_items` drops a far end's items too). Neither applies while a core point lies inside the solid
+    (its exits are not bounded by the reach).
+    """
+    if core.skip == 0:
+        return False
+    box = _vertex_box(data, window, core, margins, r, c)
+    if core.segment != 0:
+        return box[1] + box[2] < core.low
+    return _far_from_box(window, core, margins, r, c, box, core.a)
+
+
+@wp.func
+def _kept_items(
+    data: TerrainFeatureData, window: TerrainWindow, core: _PointCore, margins: wp.vec3, r: int, c: int
+) -> int:
+    """The items of window vertex ``(r, c)`` that can yield anything, a bit per item (:func:`_point_item`'s numbers).
+
+    None of a vertex the drop passes by (:func:`_vertex_dropped`). Of a capsule's kept vertex, with both ends outside
+    the solid, its axis's items and the items of each end within the reach of the vertex's box: an end's rows, like a
+    sphere centre's, have their terrain points within the reach of the end (an axis point's exit, below a ridge, is
+    not bounded by the reach, so the axis keeps its items).
+    """
+    if core.skip == 0:
+        return (1 << _vertex_items(core)) - 1
+    box = _vertex_box(data, window, core, margins, r, c)
+    if core.segment == 0:
+        if _far_from_box(window, core, margins, r, c, box, core.a):
+            return 0
+        return _END_A_ITEMS
+    if box[1] + box[2] < core.low:
+        return 0
+    m = _AXIS_ITEMS
+    if not _far_from_box(window, core, margins, r, c, box, core.a):
+        m = m | _END_A_ITEMS
+    if not _far_from_box(window, core, margins, r, c, box, core.b):
+        m = m | _END_B_ITEMS
+    return m
 
 
 _MASK_BITS = wp.constant(31)
@@ -1067,9 +1121,9 @@ def _walk_segment(
     slot: int,
     cells: wp.vec4i,
 ):
-    """A capsule's walk: every item (both ends and the axis) of every window vertex the drop keeps, in window order,
-    into the pair's slots (see :func:`terrain_point_rows`). Returns the plane cache, the rows held and the
-    candidates."""
+    """A capsule's walk: the items (both ends' and the axis's) each window vertex the drop keeps can yield anything at
+    (:func:`_kept_items`), in window order, into the pair's slots (see :func:`terrain_point_rows`). Returns the plane
+    cache, the rows held and the candidates."""
     r0 = cells[0]
     r1 = cells[1]
     c0 = cells[2]
@@ -1086,9 +1140,13 @@ def _walk_segment(
         while m != 0 and held <= _HELD:
             v = word * _MASK_BITS + _lowest_bit(m)
             m = m & (m - 1)
+            r = r0 + v // width
+            c = c0 + v % width
+            kept = _kept_items(data, window, core, margins, r, c)
             for item in range(_ITEMS):
-                planes, claim = _point_item(data, window, planes, core, r0 + v // width, c0 + v % width, r1, c1, item)
-                held, candidates = _walk_claim(out, slot, held, candidates, claim, core.eps)
+                if ((kept >> item) & 1) != 0:
+                    planes, claim = _point_item(data, window, planes, core, r, c, r1, c1, item)
+                    held, candidates = _walk_claim(out, slot, held, candidates, claim, core.eps)
     return planes, held, candidates
 
 
@@ -1149,11 +1207,12 @@ def _vertex_marks(
     c1: int,
     items: int,
 ):
-    """Bit ``item`` for every item of window vertex ``(r, c)`` whose claim is not nothing (none for a vertex the drop
-    passes by), and the updated plane cache."""
+    """Bit ``item`` for every item of window vertex ``(r, c)`` whose claim is not nothing, of the items it can yield
+    anything at all (:func:`_kept_items`), and the updated plane cache."""
     m = int(0)
-    if not _vertex_dropped(data, window, core, margins, r, c):
-        for item in range(items):
+    kept = _kept_items(data, window, core, margins, r, c)
+    for item in range(items):
+        if ((kept >> item) & 1) != 0:
             planes, claim = _point_item(data, window, planes, core, r, c, r1, c1, item)
             if claim.kind != 0:
                 m = m | (1 << item)
@@ -1254,8 +1313,8 @@ def _tiled_pair(
             if masked:
                 if ((marked[v // 32] >> (v % 32)) & 1) != 0:
                     m = wp.tile_extract(marks, v)
-            elif not _vertex_dropped(data, window, core, margins, r0 + v // width, c0 + v % width):
-                m = (1 << items) - 1
+            else:
+                m = _kept_items(data, window, core, margins, r0 + v // width, c0 + v % width)
             if m != 0:
                 for item in range(items):
                     if ((m >> item) & 1) != 0:
@@ -1387,8 +1446,8 @@ def _finish_deferred(
             if masked:
                 if ((marked[v // 32] >> (v % 32)) & 1) != 0:
                     m = wp.tile_extract(marks, v)
-            elif not _vertex_dropped(data, window, core, margins, r0 + v // width, c0 + v % width):
-                m = (1 << items) - 1
+            else:
+                m = _kept_items(data, window, core, margins, r0 + v // width, c0 + v % width)
             if m != 0:
                 for item in range(items):
                     if ((m >> item) & 1) != 0:
