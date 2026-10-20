@@ -11,6 +11,8 @@ that the predicates claim every support the float64 oracle (:mod:`newton.tests.t
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import numpy as np
 import warp as wp
 
@@ -601,45 +603,71 @@ def band_decided(hf: ref.ReferenceHeightfield, q, k, *, band: float = DECISION_B
             far = [v for v in vb if all(np.linalg.norm(v - w) > 1e-12 for w in hf.tri_verts(ta))]
             if far and abs(float(n @ (far[0] - a))) <= band:
                 return True
-    # a vertex's Voronoi boundary
+    # a vertex's Voronoi boundary: the test's largest value within the band of zero
     u = (q[0] + hf.hx) / hf.dx
     v = (q[1] + hf.hy) / hf.dy
     c, r = int(np.rint(u)), int(np.rint(v))
     if abs(u - c) * hf.dx <= band and abs(v - r) * hf.dy <= band and hf.ring(r, c) is not None:
         vertex = hf.V(r, c)
         values = [float((k - vertex) @ (hf.V(*w) - vertex) / np.linalg.norm(hf.V(*w) - vertex)) for w in hf.ring(r, c)]
-        if max(values) >= -band:
+        if abs(max(values)) <= band:
             return True
     return False
 
 
+def carries_half_space(row, got, *, angle_tol: float = 1.0e-3, tol: float = 1.0e-5) -> bool:
+    """Whether a row of ``got`` carries ``row``'s constraint: normal within ``angle_tol``, terrain point on its plane
+    (``|n . dq|``) and core distance within ``tol``."""
+    q, n, d = row_qnd(row)
+    return any(
+        angle_between(gn, n) <= angle_tol and abs(float(n @ (gq - q))) <= tol and abs(gd - d) <= tol
+        for gq, gn, gd in (row_qnd(g) for g in got)
+    )
+
+
+class RowComparison(NamedTuple):
+    """The float32 rows of one pair against its float64 rows (:func:`compare_rows`)."""
+
+    missing: list
+    """Float64 rows no float32 row matches or carries (defects)."""
+    extra: list
+    """Float32 rows no float64 row matches, not decided within the band (defects)."""
+    covered: int
+    """Unmatched rows whose constraint a row of the other side carries (:func:`carries_half_space`): the same plane and
+    core distance with the terrain point elsewhere on it, as an edge's closest point on a line nearly parallel to the
+    axis lands."""
+    tolerated: int
+    """Float32 rows no float64 row matches or carries, decided within the band (:func:`band_decided`)."""
+    deepest: float
+    """Difference of the deepest core distances [m] (``inf`` when only float64 has rows)."""
+
+
 def compare_rows(
     hf: ref.ReferenceHeightfield, expected, got, *, frame_tol: float = 1.0e-5, band: float = DECISION_BAND
-):
+) -> RowComparison:
     """Compare float32 rows with float64 rows of one pair (heightfield-local frame).
 
-    Rows match with terrain points within ``frame_tol``, normals within 1e-3 rad and core distances within 10 um.
-    Returns ``(missing, extra, tolerated, deepest)``: unmatched float64 rows and float32 rows not decided within the
-    band (both defects), the count of unmatched rows decided within it, and the difference of the deepest core
-    distances (0 when either side has none).
+    Rows match with terrain points within ``frame_tol``, normals within 1e-3 rad and core distances within 10 um. An
+    unmatched row is a defect unless a row of the other side carries its constraint, or (a float32 row) it was decided
+    within the band. A pair with float64 rows and no float32 row misses them all.
     """
     missing = missing_rows(expected, got, q_tol=frame_tol, angle_tol=1.0e-3, d_tol=1.0e-5)
     extra = missing_rows(got, expected, q_tol=frame_tol, angle_tol=1.0e-3, d_tol=1.0e-5)
+    defects_missing = [row for row in missing if not carries_half_space(row, got)]
+    defects_extra = []
+    covered = len(missing) - len(defects_missing)
     tolerated = 0
-    defects_missing, defects_extra = [], []
-    for row in missing:
-        q, n, d = row_qnd(row)
-        if band_decided(hf, q, q + d * n, band=band):
-            tolerated += 1
-        else:
-            defects_missing.append(row)
     for row in extra:
         q, n, d = row_qnd(row)
-        if band_decided(hf, q, q + d * n, band=band):
+        if carries_half_space(row, expected):
+            covered += 1
+        elif band_decided(hf, q, q + d * n, band=band):
             tolerated += 1
         else:
             defects_extra.append(row)
     deepest = 0.0
     if expected and got:
         deepest = abs(min(row_qnd(r)[2] for r in expected) - min(row_qnd(g)[2] for g in got))
-    return defects_missing, defects_extra, tolerated, deepest
+    elif expected:
+        deepest = float("inf")
+    return RowComparison(defects_missing, defects_extra, covered, tolerated, deepest)

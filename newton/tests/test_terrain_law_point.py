@@ -261,10 +261,14 @@ def test_point_rows_match_the_float64_law(test, device):
     """Reproduce the float64 law's rows in float32 at seams up to 100 m out, but for decisions within the band.
 
     Spheres and capsules snapped onto grid lines, vertices and diagonals of a suite-like mosaic and of 200 m rough
-    strips: no float64 row is missed, no float32 row is extra, except rows whose deciding predicate lies within
-    :data:`~newton.tests.terrain_law_test_utils.DECISION_BAND` of its threshold (at most 5% of the rows here, where
-    half the placements sit exactly on seams; 0.4-1.2% over 600 placements per terrain), and every
-    pair's deepest core distance agrees within 10 um.
+    strips: every float64 row has a float32 row that matches it or carries its constraint (no pair loses a support),
+    every float32 row matches or carries a float64 row but those whose deciding predicate lies within
+    :data:`~newton.tests.terrain_law_test_utils.DECISION_BAND` of its threshold (at most 2% of the rows here, where
+    half the placements sit exactly on seams; 0.2-0.5% over 600 placements per terrain), and every pair's deepest core
+    distance agrees within 10 um. Carried rows (at most 5%; 1.9% on the mosaic over 600 placements) lie on the same
+    plane at the same core distance: lying capsules' axis rows at the noisy flat tile's tiny creases, decided within
+    the band, and an axis-edge row on an edge nearly parallel to the axis, whose closest point is ill-conditioned along
+    it.
     """
     rng = np.random.default_rng(21)
     strip = np.round(rng.uniform(0.0, 0.1, size=(21, 2001)) / 0.005) * 0.005
@@ -280,20 +284,22 @@ def test_point_rows_match_the_float64_law(test, device):
             model, _hfield, shapes = tu.body_scene(heights, hx, hy, bodies, device=device)
             pipeline, _contacts, _state = _collide(model, shadow=True)
             rows = tu.shadow_rows(pipeline)
-            totals = {"f64": 0, "tolerated": 0}
+            totals = {"f64": 0, "covered": 0, "tolerated": 0}
             defects = []
             for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
                 law = _law_rows(hf, kind, dims, pose)
                 got = rows.get(shape, [])
                 frame_tol = 1.0e-5 + 2.0e-7 * float(np.abs(pose[:2]).max())
-                missing, extra, tolerated, deepest = tu.compare_rows(hf, law, got, frame_tol=frame_tol)
+                result = tu.compare_rows(hf, law, got, frame_tol=frame_tol)
                 totals["f64"] += len(law)
-                totals["tolerated"] += tolerated
-                if missing or extra or deepest > 1.0e-5:
-                    defects.append((kind, pose.tolist(), missing, extra, deepest))
+                totals["covered"] += result.covered
+                totals["tolerated"] += result.tolerated
+                if result.missing or result.extra or result.deepest > 1.0e-5:
+                    defects.append((kind, pose.tolist(), result))
             test.assertEqual(defects, [])
             test.assertGreater(totals["f64"], len(bodies))
-            test.assertLessEqual(totals["tolerated"], 0.05 * totals["f64"], msg=totals)
+            test.assertLessEqual(totals["covered"], 0.05 * totals["f64"], msg=totals)
+            test.assertLessEqual(totals["tolerated"], 0.02 * totals["f64"], msg=totals)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -667,6 +673,37 @@ class TestTerrainLawPoint(unittest.TestCase):
             )
         self.assertTrue(any(v.startswith("sphere") for v in missed["rough"] + missed["pits"]), msg=missed)
         self.assertTrue(all(missed.values()), msg={k: len(v) for k, v in missed.items()})
+
+    def test_comparison_flags_lost_rows_cpu(self):
+        """Count a lost support as missed in the float32 against float64 comparison, at seams too.
+
+        A float64 row is tolerated as unmatched only when a float32 row carries its constraint; a pair whose float32
+        rows are gone, or lack one row, fails however close to a seam its supports lie.
+        """
+        rng = np.random.default_rng(21)
+        heights = tu.suite_like_heights(rng, 64, 64)
+        hf = tu.reference_surface(tu.heightfield_model(heights, 3.2, 3.2, device="cpu"))
+        pairs = 0
+        for fx, fy in ((0.0, 0.0), (0.0, 0.37), (0.41, 0.0), (0.3, 0.3), (0.37, 0.61)):
+            for _ in range(40):
+                j, i = int(rng.integers(5, hf.cols - 5)), int(rng.integers(5, hf.rows - 5))
+                x, y = -hf.hx + (j + fx) * hf.dx, -hf.hy + (i + fy) * hf.dy
+                z = hf.height(x, y) + R31 + rng.uniform(-0.003, 0.012)
+                pose = np.array([x, y, z, 0.0, 0.0, 0.0, 1.0], np.float32).astype(np.float64)
+                law = _law_rows(hf, "sphere", {"radius": R31}, pose)
+                if not law:
+                    continue
+                pairs += 1
+                lost = tu.compare_rows(hf, law, [])
+                self.assertEqual(len(lost.missing), len(law))
+                self.assertEqual(lost.deepest, float("inf"))
+                got = [(row.q, row.n, row.d) for row in law]
+                self.assertEqual(tu.compare_rows(hf, law, got).missing, [])
+                for drop in range(len(got)):
+                    others = got[:drop] + got[drop + 1 :]
+                    if not tu.carries_half_space(law[drop], others):
+                        self.assertEqual(len(tu.compare_rows(hf, law, others).missing), 1)
+        self.assertGreater(pairs, 150)
 
     def test_point_kernels_compile_without_contraction_cpu(self):
         """Compile the point-core kernels to PTX without fused multiply-adds (NVRTC, any host).
