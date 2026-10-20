@@ -1,0 +1,153 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""The terrain law's kernels for flat-capped cylinders and cones (rules F, E, V and R of the law for solid cores).
+
+The kernels have the per-type signature ``(begin, slot_begin, inputs, data, out, solids)``
+(:class:`~newton._src.geometry.terrain_law.TerrainPairInputs`, :class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData`):
+:func:`terrain_cylinder_rows` runs one thread per pair (windows of up to 16 cells), :func:`terrain_cylinder_rows_tiled` ``wp.block_dim()`` lanes per pair
+(longer windows: the lanes mark the window vertices that yield a row, the first lane walks those in window order and
+finishes the pair, which gives it the one-thread kernel's rows), and :func:`terrain_cylinder_rows_full` the pairs the other two deferred
+(more distinct rows than the class's 16 slots). The walk, the rules and the finish are
+:mod:`~newton._src.geometry.terrain_law_solid`'s; the module is compiled without floating-point contraction, so the
+CPU decides every boundary as the GPU does.
+"""
+
+from __future__ import annotations
+
+import warp as wp
+
+from .terrain_contacts import TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_ROWS
+from .terrain_law import TerrainFeatureData, TerrainLawRows, TerrainPairInputs
+from .terrain_law_cores import TerrainCylinderCore
+from .terrain_law_solid import (
+    TERRAIN_SOLID_MASK_WORDS,
+    TerrainSolidData,
+    solid_mark,
+    solid_pair_exit,
+    solid_pair_read,
+    solid_pair_window,
+    solid_replay,
+    solid_rows_full,
+    solid_rows_thread,
+    solid_unsupported,
+)
+from .types import GeoType
+
+_CONE = wp.constant(int(GeoType.CONE))
+
+# Every float32 operation rounds as on the CPU (see the module docstring).
+wp.set_module_options({"fuse_fp": False})
+
+TERRAIN_CYLINDER_ROWS = TERRAIN_PARTNER_ROWS[TERRAIN_PARTNER_CYLINDER]
+"""Rows a pair of the class keeps (its slots): 16."""
+
+_ROWS = wp.constant(TERRAIN_CYLINDER_ROWS)
+_CLASS = wp.constant(TERRAIN_PARTNER_CYLINDER)
+_MASK_WORDS = wp.constant(TERRAIN_SOLID_MASK_WORDS)
+
+_Mask = wp.types.vector(length=TERRAIN_SOLID_MASK_WORDS, dtype=wp.int32)
+
+
+@wp.func
+def _core(local: wp.transform, size: wp.vec4, kind: int, partner: int, solids: TerrainSolidData):
+    """The pair's cylinder or cone in the heightfield frame (centre, axis, radius, half height)."""
+    core = TerrainCylinderCore()
+    core.c = wp.transform_get_translation(local)
+    core.a = wp.normalize(wp.quat_rotate(wp.transform_get_rotation(local), wp.vec3(0.0, 0.0, 1.0)))
+    core.r = size[0]
+    core.h = size[1]
+    core.cone = int(kind == _CONE)
+    return True, core
+
+
+@wp.kernel(enable_backward=False)
+def terrain_cylinder_rows(
+    begin: int,
+    slot_begin: int,
+    inputs: TerrainPairInputs,
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+    solids: TerrainSolidData,
+):
+    """The law's rows of the class's pairs, one thread per pair."""
+    i = wp.tid()
+    pair = begin + i
+    state, frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
+    if state != 0:
+        solid_pair_exit(out, pair, state)
+        return
+    supported, core = _core(local, size, inputs.shape_type[partner], partner, solids)
+    if not supported:
+        solid_unsupported(out, pair)
+        return
+    solid_rows_thread(core, data, out, pair, slot_begin + i * _ROWS, _ROWS, _CLASS, frame, heightfield, reach)
+
+
+@wp.kernel(enable_backward=False)
+def terrain_cylinder_rows_tiled(
+    begin: int,
+    slot_begin: int,
+    inputs: TerrainPairInputs,
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+    solids: TerrainSolidData,
+):
+    """The law's rows of the class's pairs with long windows, ``wp.block_dim()`` lanes per pair."""
+    i, lane = wp.tid()
+    lanes = wp.block_dim()
+    pair = begin + i
+    state, frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
+    if state != 0:
+        # every lane reads the same pair: the exit is uniform
+        if lane == 0:
+            solid_pair_exit(out, pair, state)
+        return
+    supported, core = _core(local, size, inputs.shape_type[partner], partner, solids)
+    if not supported:
+        if lane == 0:
+            solid_unsupported(out, pair)
+        return
+    state, cells, window, core, setup = solid_pair_window(core, data, heightfield, reach)
+    if state != 0:
+        if lane == 0:
+            solid_pair_exit(out, pair, state)
+        return
+    width = cells[3] - cells[2] + 2
+    vertices = (cells[1] - cells[0] + 2) * width
+    words = (vertices + 31) // 32
+    marked = _Mask()
+    if words <= _MASK_WORDS:
+        marked = solid_mark(core, data, window, setup, cells, lane, lanes)
+        # lanes mark disjoint vertices, so a sum of their words is their union
+        for word in range(words):
+            marked[word] = wp.tile_extract(wp.tile_sum(wp.tile(marked[word])), 0)
+    if lane != 0:
+        return
+    solid_replay(
+        core, data, out, window, setup, cells, marked, words, pair, slot_begin + i * _ROWS, _ROWS, _CLASS, frame
+    )
+
+
+@wp.kernel(enable_backward=False)
+def terrain_cylinder_rows_full(
+    begin: int,
+    slot_begin: int,
+    inputs: TerrainPairInputs,
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+    solids: TerrainSolidData,
+):
+    """Finish the class's deferred pairs: thread ``j`` walks the ``j``-th deferred pair again into its scratch list
+    (one per deferred pair, :data:`~newton._src.geometry.terrain_law.TERRAIN_ROW_CANDIDATES` rows), runs the finish
+    and writes the kept rows; the order is free, a pair's rows depend on the pair alone."""
+    entry = wp.tid()
+    if entry >= out.deferred_count[_CLASS]:
+        return
+    pair = out.deferred[begin + entry]
+    i = pair - begin
+    _state, frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
+    _supported, core = _core(local, size, inputs.shape_type[partner], partner, solids)
+    solid_rows_full(
+        core, data, out, solids, entry, pair, slot_begin + i * _ROWS, _ROWS, _CLASS, frame, heightfield, reach
+    )
