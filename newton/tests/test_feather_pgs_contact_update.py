@@ -812,15 +812,17 @@ class TestContactUpdateReplica(unittest.TestCase):
 
         DESIGN's fixed-point guard asks one sweep to keep a certified reference and the sweeps to stay there. One
         sequential sweep keeps every reference, but its period-two cycle repels two of them (point 2114, patch 2549)
-        within 256 sweeps. One unit sweep moves 6 of the 12 point and 7 of the 14 patch references to another
-        solution of a non-unique local problem; it returns from the two rings within 32 sweeps and not from the
-        other 11, which stay 2.7e-3 to 0.12 m/s from a solution after 512 sweeps. On 1,500 bench systems per law of
-        the same replica set, one unit sweep moves 16 of 1,376 certified point and 93 of 1,112 patch references and
-        256 sweeps leave 11 and 20 of them (one sequential sweep moves 0 and 1, which return), while from a cold
-        start fewer stay unconverged at 256 sweeps than under the sequential sweep (129 against 208 point, 55
-        against 151 patch). Keeping a loaded unit on its loaded branch while that branch still solves its local
-        problem (a continuity rule) is an open decision; a change of the law that alters these sets fails here and
-        must record its measured sets.
+        within 256 sweeps. One unit sweep moves 6 of the 12 point and 7 of the 14 patch references and returns from
+        the two rings within 32 sweeps. The other 11 are sliding contacts whose friction presses their normal down
+        (kappa 1.03 to 1.46): the unit takes off the 8 whose normal separates at zero impulse and sticks the 3 that a
+        stick also solves, and the sweeps stay 2.7e-3 to 0.12 m/s from a solution after 512 sweeps. Skipping
+        take-off for a loaded unit (the block design's continuity rule) sticks 6 of the 8 instead and leaves the
+        other 2 taking off, since their slide, loaded only by that pressing, lies outside the solve's bracket; the
+        sets do not change. On 1,500 bench systems per law of the same replica set, 256 sweeps from certified
+        references leave 11 of 1,376 point and 21 of 1,112 patch ones under the unit sweep with or without that rule
+        (5 and 4 under the sequential sweep), while from a cold start the unit sweep leaves fewer unconverged at 256
+        sweeps (129 against 208 point, 55 against 151 patch). Keeping a sliding unit on its slide is an open
+        decision; a change of the law that alters these sets fails here and must record its measured sets.
         """
         for law in self.systems:
             tight = self.tight(law)
