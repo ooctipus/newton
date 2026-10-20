@@ -3,13 +3,14 @@
 
 """Check the terrain law's point-core kernels (spheres and capsules), run in shadow beside today's terrain route.
 
-The same checks run on today's contacts and on the law's shadow rows: today's contacts fail them, the shadow rows
-pass. Measured at this tree's parent (6d9c648b, default terrain flags):
+The same checks run on today's contacts (as expected failures) and on the law's shadow rows: today's contacts fail
+them, the shadow rows pass. Measured when these tests were written (default terrain flags):
 
 * minimal: spheres resting at flat seams get 2.58 rows and 0.92 ghost normals each today, lying capsules 3.92 rows
   and 1.08 ghosts, where the plane has one row per sphere and one per capsule end;
-* complete: today misses 13 of the 24 end supports of the lying capsules, and on rough and pitted terrain the
-  supports of spheres and capsules the float64 law finds (5 of 40 rough spheres lose one).
+* complete: today misses 13 of the 24 end supports of the lying capsules, and on rough, pitted and stepped terrain
+  supports of spheres and capsules the float64 law finds (9 of 20 spheres and 15 of 20 capsules on the rough tile
+  lose one).
 
 The float32 rows equal the float64 law's (:mod:`newton.tests.terrain_law_reference`) on seam-adversarial
 placements up to 100 m out, but for decisions within the predicates' band
@@ -109,20 +110,27 @@ def _flat_seams():
     return bodies, expected
 
 
-def _minimal_violations(rows, shapes, expected) -> list[str]:
-    """Rows that are not the plane's: a wrong count, a plane row missing, or a ghost normal (over 1 deg off)."""
-    violations = []
+def _minimal_violations(rows, shapes, expected, *, d_tol: float | None = 1.0e-5) -> dict[str, list[str]]:
+    """Rows that are not the plane's, by kind: ``count`` (a wrong number of rows), ``missing`` (a plane row missing:
+    terrain point within 10 um, normal within 1e-4 rad and, given ``d_tol``, core distance within it) and ``ghost``
+    (a normal over 1 deg off the plane's)."""
+    violations = {"count": [], "missing": [], "ghost": []}
     for i, (shape, plane) in enumerate(zip(shapes, expected, strict=True)):
         got = rows.get(shape, [])
         if len(got) != len(plane):
-            violations.append(f"body {i}: {len(got)} rows, the plane has {len(plane)}")
-        missing = tu.missing_rows(plane, got, q_tol=1.0e-5, angle_tol=1.0e-4, d_tol=1.0e-5)
+            violations["count"].append(f"body {i}: {len(got)} rows, the plane has {len(plane)}")
+        missing = tu.missing_rows(plane, got, q_tol=1.0e-5, angle_tol=1.0e-4, d_tol=d_tol)
         if missing:
-            violations.append(f"body {i}: {len(missing)} plane rows missing")
+            violations["missing"].append(f"body {i}: {len(missing)} plane rows missing")
         ghosts = sum(1 for g in got if tu.angle_between(g[1], (0.0, 0.0, 1.0)) > GHOST_ANGLE)
         if ghosts:
-            violations.append(f"body {i}: {ghosts} ghost normals")
+            violations["ghost"].append(f"body {i}: {ghosts} ghost normals")
     return violations
+
+
+def _assert_minimal(test, violations):
+    for kind in ("count", "missing", "ghost"):
+        test.assertEqual(violations[kind], [], msg=kind)
 
 
 def test_point_rows_are_minimal_at_flat_seams(test, device):
@@ -130,7 +138,53 @@ def test_point_rows_are_minimal_at_flat_seams(test, device):
     bodies, expected = _flat_seams()
     model, _hfield, shapes = tu.body_scene(np.zeros((21, 21)), 1.0, 1.0, bodies, device=device)
     pipeline, _contacts, _state = _collide(model, shadow=True)
-    test.assertEqual(_minimal_violations(tu.shadow_rows(pipeline), shapes, expected), [])
+    _assert_minimal(test, _minimal_violations(tu.shadow_rows(pipeline), shapes, expected))
+
+
+NOISY_FLAT_HEIGHT = 0.05
+"""Mean height [m] of :func:`_noisy_flat_seams`' tile."""
+
+
+def _noisy_flat_seams():
+    """Spheres and lying capsules at the seams of a noisy flat tile (+-1.4 um, as the recorded suite terrain's flat
+    border), with the plane's rows; returns ``(heights, bodies, expected)``."""
+    rng = np.random.default_rng(8)
+    heights = NOISY_FLAT_HEIGHT + rng.integers(-6, 7, size=(41, 41)) * 2.4e-7
+    sites = [(0.0, 0.0), (0.05, 0.0), (0.0, 0.05), (0.05, 0.05), (0.0005, 0.0003), (0.033, 0.067)]
+    bodies, expected = [], []
+    for _ in range(4):
+        for fx, fy in sites:
+            j, i = rng.integers(4, 36, size=2)
+            x, y = -2.0 + j * 0.1 + fx, -2.0 + i * 0.1 + fy
+            z = NOISY_FLAT_HEIGHT + R31 + 2 * tu.SCENE_MARGIN - 0.0005
+            bodies.append(("sphere", {"radius": R31}, np.array([x, y, z, 0.0, 0.0, 0.0, 1.0])))
+            expected.append([(np.array([x, y, NOISY_FLAT_HEIGHT]), np.array([0.0, 0.0, 1.0]), z - NOISY_FLAT_HEIGHT)])
+            yaw = np.radians(float(rng.choice([0.0, 30.0, 45.0, 90.0])))
+            q = _quat_mul(_axis_angle((0.0, 0.0, 1.0), yaw), LYING)
+            bodies.append(("capsule", {"radius": R31, "half_height": 0.08}, np.array([x, y, z, *q])))
+            axis = np.array([np.cos(yaw), np.sin(yaw), 0.0])
+            ends = [np.array([x, y, NOISY_FLAT_HEIGHT]) + s * 0.08 * axis for s in (1.0, -1.0)]
+            expected.append([(e, np.array([0.0, 0.0, 1.0]), z - NOISY_FLAT_HEIGHT) for e in ends])
+    return heights, bodies, expected
+
+
+def test_point_rows_have_the_plane_at_noisy_flat_seams(test, device):
+    """Give spheres and lying capsules at the seams of a noisy flat tile the plane's rows, with no ghost normal.
+
+    Both the shadow rows and the float64 law's; their count is a known failure
+    (:meth:`TestTerrainLawPoint.test_point_rows_are_minimal_at_noisy_flat_seams_cpu`).
+    """
+    heights, bodies, expected = _noisy_flat_seams()
+    model, _hfield, shapes = tu.body_scene(heights, 2.0, 2.0, bodies, device=device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    violations = _minimal_violations(tu.shadow_rows(pipeline), shapes, expected)
+    test.assertEqual(violations["missing"], [])
+    test.assertEqual(violations["ghost"], [])
+    hf = tu.reference_surface(tu.heightfield_model(heights, 2.0, 2.0, device="cpu"))
+    rows = {i: [(r.q, r.n, r.d) for r in _law_rows(hf, *body)] for i, body in enumerate(bodies)}
+    violations = _minimal_violations(rows, range(len(bodies)), expected)
+    test.assertEqual(violations["missing"], [])
+    test.assertEqual(violations["ghost"], [])
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -630,49 +684,62 @@ def test_tiled_kernel_matches_one_thread_kernel(test, device):
 
 
 class TestTerrainLawPoint(unittest.TestCase):
-    def test_today_route_is_not_minimal_at_flat_seams_cpu(self):
-        """Duplicate and tilt today's rows of spheres and capsules at flat seams (the defect the law removes).
+    # Today's terrain route is held to the shadow rows' checks and fails them (the defects the law removes). Each
+    # expected failure turns into an unexpected success once the law writes these contacts (Tracks 2 and 7): remove
+    # them then.
 
-        Measured at 6d9c648b: 2.58 rows and 0.92 ghost normals per sphere, 3.92 rows and 1.08 ghosts per capsule.
+    @unittest.expectedFailure
+    def test_today_route_is_minimal_at_flat_seams_cpu(self):
+        """Give today's spheres and capsules at flat seams the plane's rows only, as the shadow rows have them.
+
+        Today's rows are compared on terrain point and normal (:func:`terrain_law_test_utils.contact_rows`). When this
+        test was written today gave 2.58 rows and 0.92 ghost normals per sphere, 3.92 rows and 1.08 ghosts per
+        lying capsule, and lacked 13 of the 24 capsule end rows.
         """
         bodies, expected = _flat_seams()
         model, hfield, shapes = tu.body_scene(np.zeros((21, 21)), 1.0, 1.0, bodies, device="cpu")
         _pipeline, contacts, state = _collide(model, shadow=False)
         rows = tu.contact_rows(model, state, contacts, hfield)
-        violations = _minimal_violations(rows, shapes, expected)
-        spheres = len(SITES) * 2
-        per_sphere = sum(len(rows.get(s, [])) for s in shapes[:spheres]) / spheres
-        ghosts = sum(
-            1
-            for s in shapes[:spheres]
-            for g in rows.get(s, [])
-            if tu.angle_between(g[1], (0.0, 0.0, 1.0)) > GHOST_ANGLE
-        )
-        self.assertGreater(per_sphere, 2.0)
-        self.assertGreater(ghosts, 5)
-        self.assertGreater(len(violations), 20)
+        _assert_minimal(self, _minimal_violations(rows, shapes, expected, d_tol=None))
 
-    def test_today_route_misses_point_supports_cpu(self):
-        """Miss supports of the float64 law today: lying capsules' ends at flat seams, spheres on rough terrain."""
-        bodies, expected = _flat_seams()
-        model, hfield, shapes = tu.body_scene(np.zeros((21, 21)), 1.0, 1.0, bodies, device="cpu")
-        _pipeline, contacts, state = _collide(model, shadow=False)
-        rows = tu.contact_rows(model, state, contacts, hfield)
-        capsule_ends = [
-            row
-            for shape, plane in zip(shapes, expected, strict=True)
-            if len(plane) == 2
-            for row in tu.missing_rows(plane, rows.get(shape, []), q_tol=1.0e-4, angle_tol=np.radians(1.0))
-        ]
-        self.assertGreater(len(capsule_ends), 5)
-        missed = {}
-        for name, hf, terrain, hfield, terrain_shapes, terrain_bodies in _rough_scenes("cpu", 20):
+    @unittest.expectedFailure
+    def test_today_route_is_complete_cpu(self):
+        """Keep every float64-law support on rough, pitted and stepped terrain in today's contacts, as the shadow does.
+
+        When this test was written today missed supports on every terrain: 9 of the 20 spheres and 15 of the 20
+        capsules on the rough tile lost one, 1 and 15 on the pits, 0 and 9 on the stairs.
+        """
+        for _name, hf, terrain, hfield, shapes, bodies in _rough_scenes("cpu", 20):
             _pipeline, contacts, state = _collide(terrain, shadow=False)
-            missed[name] = _incomplete(
-                hf, tu.contact_rows(terrain, state, contacts, hfield), terrain_shapes, terrain_bodies
-            )
-        self.assertTrue(any(v.startswith("sphere") for v in missed["rough"] + missed["pits"]), msg=missed)
-        self.assertTrue(all(missed.values()), msg={k: len(v) for k, v in missed.items()})
+            self.assertEqual(_incomplete(hf, tu.contact_rows(terrain, state, contacts, hfield), shapes, bodies), [])
+
+    @unittest.expectedFailure
+    def test_point_rows_are_minimal_at_noisy_flat_seams_cpu(self):
+        """Give spheres and lying capsules at the seams of a noisy flat tile the plane's rows only (a known failure).
+
+        The tile carries +-1.4 um of height noise, as the recorded suite terrain's flat border: the law's plane
+        clusters break it into near-coplanar pieces, and a body over a seam gets near-duplicate rows (normals 18-34 urad
+        and terrain points 0.8-1.7 um apart, beyond the finish's merge of 4 bands and its 1e-5 plane groups). When this
+        test was written the shadow gave these bodies 1.17 rows per sphere and 2.67 per capsule (the plane's 1 and 2).
+        A merge distance of about the cluster tolerance would remove them; their rows are complete and without ghosts
+        (:func:`test_point_rows_have_the_plane_at_noisy_flat_seams`).
+        """
+        heights, bodies, expected = _noisy_flat_seams()
+        model, _hfield, shapes = tu.body_scene(heights, 2.0, 2.0, bodies, device="cpu")
+        pipeline, _contacts, _state = _collide(model, shadow=True)
+        self.assertEqual(_minimal_violations(tu.shadow_rows(pipeline), shapes, expected)["count"], [])
+
+    @unittest.expectedFailure
+    def test_law_rows_are_minimal_at_noisy_flat_seams_cpu(self):
+        """Give the float64 law's rows at the noisy flat tile's seams the plane's rows only (a known failure).
+
+        The same near-duplicates as the shadow rows' (:meth:`test_point_rows_are_minimal_at_noisy_flat_seams_cpu`), in
+        the law itself: 1.08 rows per sphere and 2.63 per capsule when this test was written.
+        """
+        heights, bodies, expected = _noisy_flat_seams()
+        hf = tu.reference_surface(tu.heightfield_model(heights, 2.0, 2.0, device="cpu"))
+        rows = {i: [(r.q, r.n, r.d) for r in _law_rows(hf, *body)] for i, body in enumerate(bodies)}
+        self.assertEqual(_minimal_violations(rows, range(len(bodies)), expected)["count"], [])
 
     def test_comparison_flags_lost_rows_cpu(self):
         """Count a lost support as missed in the float32 against float64 comparison, at seams too.
@@ -728,6 +795,7 @@ for _name, _func in (
     ("test_point_rows_are_complete", test_point_rows_are_complete),
     ("test_point_rows_match_the_float64_law", test_point_rows_match_the_float64_law),
     ("test_buried_cores_exit_by_the_minimum_translation", test_buried_cores_exit_by_the_minimum_translation),
+    ("test_point_rows_have_the_plane_at_noisy_flat_seams", test_point_rows_have_the_plane_at_noisy_flat_seams),
     ("test_capsule_axis_exits_over_a_ridge", test_capsule_axis_exits_over_a_ridge),
     ("test_capsule_axis_inside_without_exit_gets_recovery", test_capsule_axis_inside_without_exit_gets_recovery),
     ("test_point_rows_point_up_on_steep_terrain", test_point_rows_point_up_on_steep_terrain),

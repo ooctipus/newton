@@ -437,8 +437,10 @@ def shadow_rows(pipeline) -> dict[int, list]:
 def contact_rows(model, state, contacts, heightfield: int) -> dict[int, list]:
     """Today's contacts of a heightfield per partner shape: ``[(q, n, d)]``, world frame, float64.
 
-    ``q`` is the contact's terrain point, ``n`` its normal from the terrain to the partner and ``d`` its core
-    distance (the margins and the partner's rounding radius taken out), as the law's rows have them.
+    ``q`` is the contact's terrain point, ``n`` its normal from the terrain to the partner and ``d = n . (k - q)``
+    with ``k`` its partner point. Today's narrow phase puts that point within about 0.1 mm of the partner's core (a
+    sphere's centre, a point of a capsule's axis), so ``d`` approximates the law's core distance to that much only:
+    compare today's rows with the law's on ``q`` and ``n``.
     """
     count = int(contacts.rigid_contact_count.numpy()[0])
     shape0 = contacts.rigid_contact_shape0.numpy()[:count]
@@ -446,11 +448,8 @@ def contact_rows(model, state, contacts, heightfield: int) -> dict[int, list]:
     point0 = contacts.rigid_contact_point0.numpy()[:count].astype(np.float64)
     point1 = contacts.rigid_contact_point1.numpy()[:count].astype(np.float64)
     normal = contacts.rigid_contact_normal.numpy()[:count].astype(np.float64)
-    margin0 = contacts.rigid_contact_margin0.numpy()[:count].astype(np.float64)
-    margin1 = contacts.rigid_contact_margin1.numpy()[:count].astype(np.float64)
     body_q = state.body_q.numpy().astype(np.float64)
     shape_body = model.shape_body.numpy()
-    shape_margin = model.shape_margin.numpy().astype(np.float64)
 
     def world(shape, p):
         body = shape_body[shape]
@@ -462,13 +461,12 @@ def contact_rows(model, state, contacts, heightfield: int) -> dict[int, list]:
     for i in range(count):
         a, b = int(shape0[i]), int(shape1[i])
         if a == heightfield:
-            partner, q, k, n, offset = b, world(a, point0[i]), world(b, point1[i]), normal[i], margin1[i]
+            partner, q, k, n = b, world(a, point0[i]), world(b, point1[i]), normal[i]
         elif b == heightfield:
-            partner, q, k, n, offset = a, world(b, point1[i]), world(a, point0[i]), -normal[i], margin0[i]
+            partner, q, k, n = a, world(b, point1[i]), world(a, point0[i]), -normal[i]
         else:
             continue
-        radius = offset - shape_margin[partner]
-        out.setdefault(partner, []).append((q, n, float(n @ (k - q)) - radius))
+        out.setdefault(partner, []).append((q, n, float(n @ (k - q))))
     return out
 
 
