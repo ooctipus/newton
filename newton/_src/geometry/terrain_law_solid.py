@@ -125,8 +125,10 @@ TERRAIN_SOLID_ARC_SAMPLES = 9
 TERRAIN_SOLID_BISECTION = 22
 """Bisection steps of rule E's ``theta*`` search between the best sample's neighbours (on the derivative's sign):
 an eighth of the arc and 22 halvings resolve ``theta*`` to ``2^-24`` of the arc."""
-TERRAIN_SOLID_ARC_END = 1.0e-7
-"""A ``theta*`` within this of an arc's end [rad] is at the end (the float64 law's)."""
+TERRAIN_SOLID_ARC_END = 1.0e-5
+"""A ``theta*`` within this of an arc's end [rad] is at the end (DESIGN 1.4; the float64 law's): far above the float32
+rounding of ``theta*`` (about 1e-7 rad), so that a body resting flat on a crease's face takes the end in float32 and
+float64 alike."""
 TERRAIN_SOLID_MASK_WORDS = 8
 """Words of the tiled kernels' productive-vertex mask: windows of up to 256 vertices (larger: the first lane walks)."""
 TERRAIN_SOLID_FULL_THREADS = 256
@@ -546,7 +548,7 @@ def _solid_edge(
     nst, sigma, end = _theta_star(core, n_a, n_b, v0, sigma_a, sigma_b, pair.eps)
     if sigma > pair.reach:
         return planes, sink
-    # within an arc-end tolerance of an end, the end's reference feature (the float64 law's 1e-7 rad)
+    # within the arc-end tolerance of an end, the end's reference feature (G1)
     interior = end == 0 and wp.length(nst - n_a) > _ARC_END and wp.length(nst - n_b) > _ARC_END
     e2 = wp.cross(nst, dh)
     found = bool(False)

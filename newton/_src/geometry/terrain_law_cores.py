@@ -17,8 +17,8 @@ One struct per partner class, each with overloads of the same functions, which t
 
 Every definition is the float64 law's (``newton/tests/terrain_law_reference.py``), in float32: the plane manifolds are
 Newton's analytic plane queries (a box's four deepest corners, the cylinder's deepest rim point with a tripod or the
-rolling points, a hull's most opposed face with its deepest vertex reduced to four by area, an ellipsoid's support
-point); a cone's mirrors the cylinder's with its base as the only cap. Ties are broken as the float64 law breaks them
+rolling points, a hull's face through its deepest vertex most opposed to the normal with that vertex, reduced to four
+by area, an ellipsoid's support point); a cone's mirrors the cylinder's with its base as the only cap. Ties are broken as the float64 law breaks them
 (lowest index first), and boundary decisions are closed by the caller's tolerances.
 """
 
@@ -1174,22 +1174,26 @@ def core_slope(core: TerrainHullCore, n: wp.vec3, dn: wp.vec3, p0: wp.vec3, side
 
 
 @wp.func
-def _hull_reference_face(core: TerrainHullCore, n: wp.vec3) -> int:
-    """The face most opposed to ``n`` (global index; the first in face order within the tie band)."""
-    score = float(_HUGE)
-    for f in range(core.face_begin, core.face_begin + core.face_count):
-        score = wp.min(score, wp.dot(_hull_face_normal(core, f), n))
-    for f in range(core.face_begin, core.face_begin + core.face_count):
-        if wp.dot(_hull_face_normal(core, f), n) <= score + _TIE:
+def _hull_vertex_face(core: TerrainHullCore, vertex: int, n: wp.vec3) -> int:
+    """The face through point ``vertex`` most opposed to ``n`` (global indices; of the faces within the tie band of
+    the most opposed, the first in face order): the Gauss map's cell of the vertex, read from its incident faces. -1
+    when the point lies on no face (inside the hull)."""
+    best = float(-_HUGE)
+    for j in range(core.table.vertex_face_begin[vertex], core.table.vertex_face_begin[vertex + 1]):
+        best = wp.max(best, -wp.dot(_hull_face_normal(core, core.table.vertex_faces[j]), n))
+    for j in range(core.table.vertex_face_begin[vertex], core.table.vertex_face_begin[vertex + 1]):
+        f = core.table.vertex_faces[j]
+        if -wp.dot(_hull_face_normal(core, f), n) >= best - _TIE:
             return f
-    return core.face_begin
+    return -1
 
 
 @wp.func
 def core_manifold(core: TerrainHullCore, n: wp.vec3, a: wp.vec3, reach: float) -> tuple[int, _Mat43, wp.vec4]:
-    """Rule F's plane manifold: a hull's most opposed face with its deepest vertex, within ``reach``, reduced to four
-    by area (deepest, farthest, largest triangle, largest quadrilateral) and ordered by depth (then index); an
-    ellipsoid's support point."""
+    """Rule F's plane manifold: a hull's reference face (the face through its deepest vertex most opposed to ``n``,
+    DESIGN 1.2, the face rule E's G1 crossings use) with that vertex, within ``reach``, reduced to four by area
+    (deepest, farthest, largest triangle, largest quadrilateral) and ordered by depth (then index); an ellipsoid's
+    support point."""
     points = _Mat43()
     depth = wp.vec4(_HUGE)
     if core.ellipsoid != 0:
@@ -1202,14 +1206,17 @@ def core_manifold(core: TerrainHullCore, n: wp.vec3, a: wp.vec3, reach: float) -
         points[0, 2] = k[2]
         depth[0] = h
         return 1, points, depth
-    face = _hull_reference_face(core, n)
     deepest = _hull_deepest(core, n)
+    face = _hull_vertex_face(core, deepest, n)
     # the candidates in index order: the face's vertices and the deepest vertex, within reach
     cand = _FaceList()
     count = int(0)
     inserted = bool(False)
-    begin = core.table.face_begin[face]
-    end = wp.min(core.table.face_begin[face + 1], begin + _FACE_CAP)
+    begin = int(0)
+    end = int(0)
+    if face >= 0:
+        begin = core.table.face_begin[face]
+        end = wp.min(core.table.face_begin[face + 1], begin + _FACE_CAP)
     for j in range(begin, end):
         i = core.table.face_vertices[j]
         if not inserted and deepest <= i:
@@ -1372,16 +1379,7 @@ def core_reference_crossing(
     that vertex), crossed with the crease's line when it straddles it; an ellipsoid's single point never does."""
     if core.ellipsoid != 0:
         return False, _crossing()
-    deepest = _hull_deepest(core, n)
-    best = float(-_HUGE)
-    for j in range(core.table.vertex_face_begin[deepest], core.table.vertex_face_begin[deepest + 1]):
-        best = wp.max(best, -wp.dot(_hull_face_normal(core, core.table.vertex_faces[j]), n))
-    face = int(-1)
-    for j in range(core.table.vertex_face_begin[deepest], core.table.vertex_face_begin[deepest + 1]):
-        f = core.table.vertex_faces[j]
-        if -wp.dot(_hull_face_normal(core, f), n) >= best - _TIE:
-            face = f
-            break
+    face = _hull_vertex_face(core, _hull_deepest(core, n), n)
     if face < 0:
         return False, _crossing()
     begin = core.table.face_begin[face]

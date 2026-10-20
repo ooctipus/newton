@@ -77,7 +77,9 @@ EPS_PRED = 1.0e-12
 """Predicate band [m]: a value within it counts as on the boundary."""
 EPS_MERGE_P = 1.0e-7
 EPS_MERGE_N = 1.0e-6
-EPS_THETA = 1.0e-7
+EPS_THETA = 1.0e-5
+"""Arc-end tolerance of rule E [rad] (DESIGN 1.4): a ``theta*`` within it of an arc's end takes the end's reference
+feature (G1)."""
 CYLINDER_FLAT_MODE_COS = math.cos(math.radians(22.5))
 TIE = 1.0e-6
 """Tie band of the plane manifolds' and reference features' discrete choices (DESIGN 1.4): of candidates within
@@ -932,13 +934,16 @@ class Hull(Polytope):
         return float(np.linalg.norm(self.verts - self.c, axis=1).max())
 
     def plane_manifold(self, n, a, D):
-        """The reference face (most opposed to n) and the deepest vertex, within reach, reduced to 4 by area, deepest
-        first (ties within the band in index order)."""
+        """The reference face (DESIGN 1.2: the face through the deepest vertex most opposed to n, the face G1's
+        crossings use) and the deepest vertex, within reach, reduced to 4 by area, deepest first (ties within the band
+        in index order)."""
         band = TIE * self.radius()
         h = (self.verts - a) @ n
-        ref = first_within(self.fnormals @ n, TIE)
-        cand = set(self.faces[ref])
-        cand.add(first_within(h, band))
+        deepest = first_within(h, band)
+        through = [q for q, f in enumerate(self.faces) if deepest in f]
+        cand = {deepest}
+        if through:
+            cand.update(self.faces[through[first_within(self.fnormals[through] @ n, TIE)]])
         idx = sorted(i for i in cand if h[i] <= D)
         if not idx:
             return []
