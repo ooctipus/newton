@@ -748,7 +748,8 @@ class TerrainFeatures:
     :meth:`data`. Edited heights are reported with :meth:`mark_elevations_changed` and absorbed by
     :meth:`rebuild_terrain_features`; until then the version stamps differ and a kernel that checks them
     (:func:`~newton._src.geometry.terrain_law.terrain_features_current`) reports stale data instead of
-    reading it.
+    reading it. So does a kernel given a struct from :meth:`data` that predates a rebuild which reallocated the
+    plane records.
 
     Args:
         model: A finalized model. Its heightfield elevations are read in place, never copied.
@@ -811,7 +812,8 @@ class TerrainFeatures:
             self._infos if count else [TerrainSurfaceInfo()], dtype=TerrainSurfaceInfo, device=self.device
         )
         self.layout_version = 0
-        """Incremented whenever a rebuild reallocates the plane records: fetch :meth:`data` again."""
+        """Incremented whenever a build reallocates the plane records: fetch :meth:`data` again."""
+        self._layout = wp.zeros(1, dtype=wp.int32, device=self.device)
         self.cluster_build_seconds = 0.0
         """Host time spent building clusters so far [s] (device synchronized)."""
         self.cluster_scratch_bytes = 0
@@ -823,7 +825,13 @@ class TerrainFeatures:
 
     # ---- queries ---------------------------------------------------------------------------------------------
     def data(self) -> TerrainFeatureData:
-        """Return the arrays the law's kernels read (fetch again when :attr:`layout_version` changes)."""
+        """Return the arrays the law's kernels read.
+
+        A rebuild that reallocates the plane records (:attr:`layout_version` changes) leaves a struct fetched
+        before it, or baked into a captured graph, pointing at the old records: kernels that check
+        :func:`~newton._src.geometry.terrain_law.terrain_features_current` then report stale features instead of
+        reading them. Fetch the struct again, and capture again, after such a rebuild.
+        """
         data = TerrainFeatureData()
         data.elevations = self.model.heightfield_elevations
         data.clusters = self.clusters
@@ -832,6 +840,8 @@ class TerrainFeatures:
         data.surfaces = self._surfaces
         data.elevation_version = self.elevation_version
         data.feature_version = self.feature_version
+        data.layout = self.layout_version
+        data.layout_version = self._layout
         return data
 
     def surface(self, shape: int) -> TerrainSurfaceInfo:
@@ -849,7 +859,7 @@ class TerrainFeatures:
             "planes": self.planes.capacity,
             "tile_max": self.tile_max.capacity,
             "surfaces": self._surfaces.capacity,
-            "versions": self.elevation_version.capacity + self.feature_version.capacity,
+            "versions": self.elevation_version.capacity + self.feature_version.capacity + self._layout.capacity,
         }
 
     def check_current(self) -> None:
@@ -1090,6 +1100,8 @@ class TerrainFeatures:
                 offset += capacity[h]
             self._plane_capacity = capacity
             self.layout_version += 1
+            # Structs fetched before now point at the old records and read as stale on the device.
+            self._layout.fill_(self.layout_version)
         for h, item in enumerate(built):
             if item is not None and item[1]:
                 wp.copy(self.planes, item[0], dest_offset=self._infos[h].plane_offset, count=item[1])

@@ -203,6 +203,10 @@ class TerrainFeatureData:
     """Version of the heights of every heightfield, bumped by every reported edit."""
     feature_version: wp.array[wp.int32]
     """Version of the heights the clusters and the mip were built from."""
+    layout: int
+    """Layout of the plane records this struct points at (the features' layout version when it was fetched)."""
+    layout_version: wp.array[wp.int32]
+    """The features' current layout (one entry), bumped whenever a rebuild reallocates the plane records."""
 
 
 @wp.struct
@@ -747,8 +751,15 @@ def terrain_tile_bound(data: TerrainFeatureData, surface: TerrainSurfaceInfo, ti
 
 @wp.func
 def terrain_features_current(data: TerrainFeatureData, heightfield: int) -> bool:
-    """Return whether a heightfield's clusters and mip were built from its current heights."""
-    return data.feature_version[heightfield] == data.elevation_version[heightfield]
+    """Return whether a heightfield's clusters and mip were built from its current heights, and ``data`` is current.
+
+    A struct fetched before a rebuild that reallocated the plane records (one baked into a captured graph, say)
+    still points at the old records while the cluster ids index the new ones; it reads as stale.
+    """
+    return (
+        data.feature_version[heightfield] == data.elevation_version[heightfield]
+        and data.layout_version[0] == data.layout
+    )
 
 
 @wp.func

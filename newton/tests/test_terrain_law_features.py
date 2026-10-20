@@ -316,6 +316,34 @@ def test_stale_features_are_reported(test, device):
     test.assertEqual(int(status.numpy()[0]), 0)
 
 
+def test_reallocated_plane_records_are_reported(test, device):
+    """Report a struct that predates a rebuild which reallocated the plane records as stale, not current.
+
+    A flat heightfield has one plane record; an edit into 2 x 2-cell treads of distinct heights outgrows the
+    record capacity, so the rebuild moves the records to a new array while the cluster ids index into it. A struct
+    fetched earlier (one baked into a captured graph) still points at the old array.
+    """
+    model = tu.heightfield_model(np.zeros((65, 65)), 3.2, 3.2, device=device, min_z=0.0, max_z=1.0)
+    features = TerrainFeatures(model)
+    shape = features.heightfield_shapes[0]
+    before, layout = features.data(), features.layout_version
+    r, c = np.meshgrid(np.arange(65), np.arange(65), indexing="ij")
+    treads = ((r // 2) * 7 + (c // 2) * 3) % 50 / 50.0
+    model.heightfield_elevations.assign(treads.reshape(-1).astype(np.float32))
+    features.mark_elevations_changed(shape)
+    features.rebuild_terrain_features(shape)
+    test.assertGreater(features.layout_version, layout)
+    test.assertGreater(features.plane_count(shape), 1000)
+    _assert_equals_fresh_build(test, features, model)
+    status = wp.zeros(1, dtype=wp.int32, device=device)
+    overflow = wp.zeros(2, dtype=wp.int32, device=device)
+    wp.launch(_stale_check, dim=1, inputs=[before, 0, status, overflow], device=device)
+    test.assertEqual(int(status.numpy()[0]), int(TERRAIN_STATUS_STALE))
+    status.zero_()
+    wp.launch(_stale_check, dim=1, inputs=[features.data(), 0, status, overflow], device=device)
+    test.assertEqual(int(status.numpy()[0]), 0)
+
+
 class TestTerrainLawFeatures(unittest.TestCase):
     def test_build_and_decode_compile_without_contraction_cpu(self):
         """Compile the height decode and the cluster build to PTX without fused multiply-adds (NVRTC, any host).
@@ -369,6 +397,7 @@ for _name, _func in (
     ("test_rebuild_after_edit_equals_fresh_build", test_rebuild_after_edit_equals_fresh_build),
     ("test_rebuild_covers_every_reported_edit", test_rebuild_covers_every_reported_edit),
     ("test_stale_features_are_reported", test_stale_features_are_reported),
+    ("test_reallocated_plane_records_are_reported", test_reallocated_plane_records_are_reported),
 ):
     add_function_test(TestTerrainLawFeatures, _name, _func, devices=devices)
 
