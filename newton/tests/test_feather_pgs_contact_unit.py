@@ -417,6 +417,24 @@ class TestContactUnitPoint(unittest.TestCase):
         np.testing.assert_allclose(out[:3], x, atol=1.0e-6)
         self.assertAlmostEqual(out[3], alpha, delta=1.0e-4 * alpha)
 
+    def test_split_step_keeps_an_approaching_contact_loaded(self):
+        """Take a held slide's exact root where the split step's normal, its friction held, would unload the contact.
+
+        An approaching contact (b_n = -0.33) held on its disk with a friction that lifts it: the normal row with that
+        friction held stops at a negative impulse. The resumed root's gain (-3.0) asks for the split step, which would
+        clamp that normal to zero and leave no friction on the zero disk, ending the visit with no normal impulse on an
+        approaching contact. The unit takes the resumed slide exactly instead.
+        """
+        W = np.array([[6.874394, 9.478862, 5.949638], [9.478862, 13.434784, 9.527018], [5.949638, 9.527018, 11.05692]])
+        b = np.array([-0.332735, -0.168355, -1.152068])
+        mu = 1.352162
+        held = np.array([0.041357, 0.036364, 0.042483])
+        self.assertLess(-b[0] - W[0, 1:] @ held[1:], 0.0)
+        out = solve_points(point_problem(W, b, mu, current=held))[0]
+        self.assertGreater(out[0], 0.0)
+        self.assertGreater(out[3], 0.0)
+        self.assertLess(point_residual(W, b, mu, out[:3]), 1.0e-6)
+
     def test_anchor_takes_the_press_slide_of_the_larger_load(self):
         """Load an anchor whose take-off fails and whose only solution is a slide its friction presses down.
 

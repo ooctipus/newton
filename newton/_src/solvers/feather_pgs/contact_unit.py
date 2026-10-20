@@ -52,9 +52,12 @@ exact solve repels the sweep from such a solution, so where that response is
 negative or above
 :data:`CONTACT_UNIT_SPLIT_GAIN` times the normal row's own, the unit takes its
 normal with the friction held, then the friction on that load's disk: the same
-solution, approached with the normal row's response. A root whose normal impulse
-is negative is not taken. The friction is finally clamped to the disk of the
-final load, so the result is exactly feasible.
+solution, approached with the normal row's response, if the unit is loaded. A
+root whose normal impulse is negative (an anchor's load below ``L``), or a held
+friction under which the normal row would stop at a negative impulse, takes the
+exact solve instead, so the step never unloads an approaching contact. The
+friction is finally clamped to the disk of the final load, so the result is
+exactly feasible.
 
 A ring unit solves its normals by an active set over their proximally
 regularized block, from its loaded members, then each anchor by the point
@@ -412,12 +415,13 @@ _UNIT = Template(r"""
             out.evaluations = r.evaluations;
             int found = 0;
             const float xn = (-bn - wn1 * r.friction0 - wn2 * r.friction1) * inv;
-            if (r.mode == 4 && xn >= 0.0f) {
-                // A slide whose load answers the contact's approach with the wrong sign, or many times the normal row
-                // alone, repels an exact solve: take the normal with the current friction held, then the friction on
-                // that load's disk. A solution stays put, as under the exact solve. A root whose normal impulse is
-                // negative solves nothing and is not taken.
-                const float xs = ${max}((-bn - wn1 * of1 - wn2 * of2) * inv, 0.0f);
+            const float held = -bn - wn1 * of1 - wn2 * of2;
+            if (r.mode == 4 && on > 0.0f && xn >= 0.0f && held > 0.0f) {
+                // A held slide whose load answers the contact's approach with the wrong sign, or more than 8 times the
+                // normal row alone, takes the normal with its current friction held, then the friction on that load's
+                // disk: the normal row's own response. A solution stays put, as under the exact solve. A root whose
+                // normal impulse is negative, or a held friction that would unload the normal, takes the exact solve.
+                const float xs = held * inv;
                 const ContactUnitFriction q = friction(w11, w12, w22, b1 + wn1 * xs, b2 + wn2 * xs, xs + L, 0.0f, 0.0f,
                                                        mu, -1.0f, cap, xs + L, of1, of2, load, 0);
                 out.evaluations += q.evaluations;
