@@ -54,6 +54,7 @@ from newton._src.geometry.terrain_law import (
     terrain_planes,
     terrain_window,
     terrain_window_extent,
+    terrain_window_point,
     terrain_window_vertex,
 )
 from newton._src.geometry.terrain_shadow import (
@@ -643,19 +644,21 @@ def _launch_segment(shadow, model, pipeline, lane, begin, count, out, *, kernel=
     device = model.device
     args = [begin, 0, _pair_inputs(shadow, model, pipeline), shadow.features.data(), out]
     out.deferred_count.zero_()
+    block = terrain_law_block_dim(device)
     if lane == TERRAIN_LANE_THREAD:
         work = terrain_pair_work(device, begin + count, 0)
-        wp.launch(kernel or terrain_law_point.terrain_point_rows, dim=count, inputs=[*args, work], device=device)
+        kernel = kernel or terrain_law_point.terrain_point_rows
+        wp.launch(kernel, dim=count, inputs=[*args, work], block_dim=block, device=device)
     else:
         work = terrain_pair_work(device, begin, count)
         if blocks is not None:
             work.blocks = blocks
-        wp.launch(terrain_law_point.terrain_point_rows, dim=count, inputs=[*args, work], device=device)
+        wp.launch(terrain_law_point.terrain_point_rows, dim=count, inputs=[*args, work], block_dim=block, device=device)
         wp.launch_tiled(
             terrain_law_point.terrain_point_rows_tiled,
             dim=work.blocks,
             inputs=[*args, work],
-            block_dim=terrain_law_block_dim(device),
+            block_dim=block,
             device=device,
         )
     _launch_full(shadow, model, pipeline, begin, out)
@@ -927,9 +930,15 @@ def _plain_point_rows(
     r1 = cells[1]
     c1 = cells[3]
     window = terrain_window(data, heightfield, cells[0], cells[2])
-    eps = terrain_eps(terrain_window_extent(data, window, r1, c1, terrain_law_point._core_extent(window, a, b)))
+    ka = terrain_window_point(window, a)
+    kb = terrain_window_point(window, b)
+    extent = wp.max(
+        wp.max(wp.max(wp.abs(ka[0]), wp.abs(ka[1])), wp.abs(ka[2])),
+        wp.max(wp.max(wp.abs(kb[0]), wp.abs(kb[1])), wp.abs(kb[2])),
+    )
+    eps = terrain_eps(terrain_window_extent(data, window, r1, c1, extent))
     planes = terrain_planes()
-    planes, core = terrain_law_point._pair_core(data, window, planes, a, b, segment, reach, eps)
+    planes, core = terrain_law_point._pair_core(data, window, planes, ka, kb, segment, reach, eps)
     terrain_law_point._open_pair(out, slot)
     held = int(0)
     candidates = int(0)

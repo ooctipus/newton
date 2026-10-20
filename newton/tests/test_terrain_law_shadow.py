@@ -375,6 +375,35 @@ def test_tiled_pairs_that_exit_are_not_queued(test, device):
     test.assertEqual(tiled_launches, [(min(12, TERRAIN_LAW_TILE_BLOCKS), terrain_law_block_dim(device))])
 
 
+def test_shadow_launches_take_one_block_size(test, device):
+    """Launch every kernel of the shadow with one block size, so that the point module builds once per device.
+
+    Warp builds a module once per block size it is launched with: the one-thread kernel took Warp's default 256-thread
+    blocks while the tiled kernels took their lanes, two builds of the module on every device. Every launch now takes
+    ``terrain_law_block_dim`` (one warp on CUDA, where the one-thread kernel's warps then also spread evenly over the
+    SMs; one on the CPU).
+    """
+    model = _tiled_scene(device)
+    pipeline = tu.shadow_pipeline(model, **PIPELINE)
+    blocks = {}
+    launch, launch_tiled = wp.launch, wp.launch_tiled
+
+    def recorder(original):
+        def record(kernel, *args, **kwargs):
+            if kernel.module.name == terrain_law_point.__name__:
+                blocks.setdefault(kernel.key, set()).add(kwargs.get("block_dim"))
+            return original(kernel, *args, **kwargs)
+
+        return record
+
+    with patch.object(wp, "launch", recorder(launch)), patch.object(wp, "launch_tiled", recorder(launch_tiled)):
+        _contacts(pipeline, model)
+    test.assertEqual(
+        sorted(blocks), ["terrain_point_rows", "terrain_point_rows_full", "terrain_point_rows_tiled"], msg=blocks
+    )
+    test.assertEqual(set().union(*blocks.values()), {terrain_law_block_dim(device)}, msg=blocks)
+
+
 class TestTerrainLawShadow(unittest.TestCase):
     def test_flag_values_cpu(self):
         """Parse the flag's partner classes: names, ``all``, blanks; refuse unknown names and classes without kernels."""
@@ -475,6 +504,7 @@ for _name, _func in (
     ("test_shadow_follows_the_pair_policy", test_shadow_follows_the_pair_policy),
     ("test_high_cores_leave_at_the_tile_max", test_high_cores_leave_at_the_tile_max),
     ("test_tiled_pairs_that_exit_are_not_queued", test_tiled_pairs_that_exit_are_not_queued),
+    ("test_shadow_launches_take_one_block_size", test_shadow_launches_take_one_block_size),
 ):
     add_function_test(TestTerrainLawShadow, _name, _func, devices=devices)
 add_function_test(

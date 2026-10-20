@@ -73,7 +73,8 @@ from .terrain_law import (
 )
 
 TERRAIN_LAW_BLOCK = 32
-"""Lanes per pair of a tiled kernel (one warp): its launch's block size on CUDA (the CPU runs one lane per pair)."""
+"""Threads per block of every terrain-law launch on CUDA: lanes per pair of the tiled kernels (one warp), and the
+one-thread kernel's block (several blocks per SM, so that its warps spread evenly), one module build per device."""
 TERRAIN_LAW_TILE_BLOCKS = 2048
 """Blocks of a tiled launch at most, whatever the class's size: one per queued pair up to this many (about one
 resident wave of one-warp blocks on a 188-SM GPU), more queued pairs taking turns."""
@@ -116,8 +117,8 @@ def terrain_pair_work(device, first: int, pairs: int, *, count: wp.array | None 
 
 
 def terrain_law_block_dim(device) -> int:
-    """Return the block size of a tiled launch on ``device``: :data:`TERRAIN_LAW_BLOCK` lanes on CUDA, one on the CPU
-    (where ``wp.launch_tiled`` runs one lane per pair whatever it is given)."""
+    """Return the block size of every terrain-law launch on ``device``: :data:`TERRAIN_LAW_BLOCK` on CUDA, one on the
+    CPU (where ``wp.launch_tiled`` runs one lane per pair whatever it is given, and one size builds the module once)."""
     return TERRAIN_LAW_BLOCK if wp.get_device(device).is_cuda else 1
 
 
@@ -180,12 +181,13 @@ TERRAIN_LAW_KERNELS: dict[int, tuple[str, str, str, str | None]] = {
 """Per partner class: the module, its one-thread and tiled kernels, and its full-finish kernel or ``None``.
 
 The module is imported only when the class is listed. The one-thread kernel runs over both lane segments of the class
-and the tiled one over the queued pairs of its tiled segment, each with the class's :class:`TerrainPairWork` as
-sixth argument (``begin`` and ``slot_begin`` are the class's first pair and slot for the one-thread kernel, the
-tiled segment's for the tiled one). The full-finish kernel, when the class has one, runs after them and finishes the
-pairs they marked :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_FULL`: ``wp.launch_tiled`` with
+and the tiled one over the queued pairs of its tiled segment, each with the class's :class:`TerrainPairWork` as sixth
+argument (``begin`` and ``slot_begin`` are the class's first pair and slot for the one-thread kernel, the tiled
+segment's for the tiled one). The full-finish kernel, when the class has one, runs after them and finishes the pairs
+they marked :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_FULL`: ``wp.launch_tiled`` with
 :data:`TERRAIN_LAW_FULL_BLOCKS` blocks of :data:`TERRAIN_LAW_BLOCK` lanes whatever the class's size, striding over its
-deferred list, and a :class:`TerrainFinishScratch` as sixth argument (``begin`` and ``slot_begin`` are the class's), so that an empty list costs one near-empty launch.
+deferred list, and a :class:`TerrainFinishScratch` as sixth argument (``begin`` and ``slot_begin`` are the class's), so
+that an empty list costs one near-empty launch.
 
 A class's module and kernels follow one protocol (the helpers live in :mod:`~newton._src.geometry.terrain_law`):
 
@@ -385,7 +387,7 @@ class TerrainLawShadow:
         for kind, kernel, dim, begin, slot, extra in self._launches:
             args = [begin, slot, inputs, data, self._out, extra]
             if kind == "thread":
-                wp.launch(kernel, dim=dim, inputs=args, device=self.device, record_tape=False)
+                wp.launch(kernel, dim=dim, inputs=args, block_dim=block, device=self.device, record_tape=False)
             else:
                 wp.launch_tiled(kernel, dim=dim, inputs=args, block_dim=block, device=self.device, record_tape=False)
 
