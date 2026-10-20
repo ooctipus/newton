@@ -43,6 +43,7 @@ sub 0 = (p00, p10, p11) and sub 1 = (p00, p11, p01); triangle id = 2 * (r * cols
 
 from __future__ import annotations
 
+import functools
 import math
 
 import numpy as np
@@ -78,6 +79,24 @@ EPS_MERGE_P = 1.0e-7
 EPS_MERGE_N = 1.0e-6
 EPS_THETA = 1.0e-7
 CYLINDER_FLAT_MODE_COS = math.cos(math.radians(22.5))
+TIE = 1.0e-6
+"""Tie band of the plane manifolds' and reference features' discrete choices (DESIGN 1.4): of candidates within
+``TIE`` times the core's bounding radius in height (or distance; area: its square), or within ``TIE`` in a normal's
+score, the first in index order wins. Two of them are ties by construction: a rolling cylinder's two cap-rim side
+points lie at one height, and a lying cylinder's caps face the plane equally."""
+HULL_FACE_TOL = 1.0e-6
+"""A hull's vertices within this of a face's plane lie on that face [m] (hulls under 1 m; local frame).
+
+Mesh vertices are float32: the vertices of one planar face lie within about 1e-8 m of its plane, and a tighter test
+splits the face into slivers (a sole's flat bottom into triangles).
+"""
+LIFT_SLACK = 1.0e-8
+"""How far a line may miss a core and still graze it [m] (rule E's lifts).
+
+An interior ``theta*`` puts the crease line exactly through the core's support point; at a support edge sharper than
+a right angle (a cone's base rim or apex, a sharp hull vertex) the line along ``n(theta*)`` only touches the core
+there, and the golden-section ``theta*`` places it within about 1e-9 m. A tighter test drops that support.
+"""
 
 RING = ((0, 1), (1, 1), (1, 0), (0, -1), (-1, -1), (-1, 0))
 """One-ring neighbour offsets (dr, dc) of a vertex, counter-clockwise."""
@@ -629,21 +648,31 @@ def quat_matrix(q):
     return np.stack([quat_rotate(q, e) for e in np.eye(3)], 1)
 
 
-def reduce4(points, heights, normal):
+def first_within(values, band, *, largest=False):
+    """The first index whose value lies within ``band`` of the smallest (or largest) value."""
+    v = np.asarray(values, np.float64)
+    if largest:
+        return int(np.flatnonzero(v >= v.max() - band)[0])
+    return int(np.flatnonzero(v <= v.min() + band)[0])
+
+
+def reduce4(points, heights, normal, *, tie=0.0):
     """Indices of at most 4 points: the deepest, the farthest from it, the largest triangle, then the point adding
-    the most area outside that triangle (areas in the plane normal to ``normal``). Lowest index wins ties."""
+    the most area outside that triangle (areas in the plane normal to ``normal``). The first in index order within
+    ``tie`` (a length; areas within its square times... the largest area's scale) of the best wins."""
     n = len(points)
     if n <= 4:
         return list(range(n))
     P = np.asarray(points, np.float64)
     P = P - np.outer(P @ normal, normal)
     h = np.asarray(heights, np.float64)
-    i0 = int(np.argmin(h))
-    i1 = int(np.argmax(np.linalg.norm(P - P[i0], axis=1)))
+    i0 = first_within(h, tie)
+    i1 = first_within(np.linalg.norm(P - P[i0], axis=1), tie, largest=True)
     a2 = np.abs(np.cross(P[i1] - P[i0], P - P[i0]) @ normal)
-    i2 = int(np.argmax(a2))
-    best, i3 = 1e-15, None
+    scale = max(float(np.linalg.norm(P[i1] - P[i0])), 1.0e-12)
+    i2 = first_within(a2, tie * scale, largest=True)
     tri = (i0, i1, i2)
+    gains = np.zeros(n)
     for j in range(n):
         if j in tri:
             continue
@@ -653,14 +682,31 @@ def reduce4(points, heights, normal):
             side_j = np.cross(P[b] - P[a], P[j] - P[a]) @ normal
             if side_c * side_j < 0:
                 gain = max(gain, abs(side_j))
-        if gain > best:
-            best, i3 = gain, j
+        gains[j] = gain
+    i3 = None
+    if gains.max() > 1e-15:
+        i3 = int(np.flatnonzero(gains >= max(gains.max() - tie * scale, 1e-15 * (1 + 1e-12)))[0])
     out = [i0, i1, i2] + ([i3] if i3 is not None else [])
     return list(dict.fromkeys(out))
 
 
+def _order_by_depth(indices, h, band):
+    """Indices deepest first: an index passes an earlier one only when deeper by more than ``band``."""
+    out = []
+    for i in sorted(indices):
+        pos = len(out)
+        while pos > 0 and h[out[pos - 1]] > h[i] + band:
+            pos -= 1
+        out.insert(pos, i)
+    return out
+
+
 def convex_hull_faces(verts, *, tol: float = 1.0e-9):
-    """Faces of the convex hull of ``verts``: vertex index lists and outward unit normals (brute force, small sets)."""
+    """Faces of the convex hull of ``verts``: vertex index lists and outward unit normals (brute force, small sets).
+
+    A face is a plane through three vertices with every vertex on one side (within ``tol`` times the vertices' extent,
+    at least 1 m); its vertices are those within that of the plane, and planes with the same vertices are one face.
+    """
     V = np.asarray(verts, np.float64)
     n = len(V)
     faces = {}
@@ -680,9 +726,9 @@ def convex_hull_faces(verts, *, tol: float = 1.0e-9):
                     normal, s = -normal, -s
                 else:
                     continue
-                key = (*np.round(normal, 7).tolist(), round(float(normal @ V[i]), 7))
+                key = tuple(int(m) for m in np.flatnonzero(np.abs(s) <= tol * scale))
                 if key not in faces:
-                    faces[key] = (normal, sorted(int(m) for m in np.flatnonzero(np.abs(s) <= tol * scale)))
+                    faces[key] = (normal, list(key))
     normals = [f[0] for f in faces.values()]
     lists = [f[1] for f in faces.values()]
     return lists, normals
@@ -761,7 +807,7 @@ class Polytope(Core):
             denom = f_n @ n
             num = f_d - f_n @ u
             if abs(denom) < 1e-14:
-                if num < -1e-12:
+                if num < -LIFT_SLACK:
                     return None
                 continue
             t = num / denom
@@ -769,7 +815,7 @@ class Polytope(Core):
                 t_hi = min(t_hi, t)
             else:
                 t_lo = max(t_lo, t)
-        if t_lo > t_hi + 1e-12 or not np.isfinite(t_lo):
+        if t_lo > t_hi + LIFT_SLACK or not np.isfinite(t_lo):
             return None
         return u + t_lo * n, t_lo
 
@@ -848,14 +894,26 @@ class Box(Polytope):
         super().__init__(corners, faces, normals)
 
     def plane_manifold(self, n, a, D):
-        """Newton's plane-box manifold: up to 4 deepest corners within reach."""
+        """Newton's plane-box manifold: up to 4 deepest corners within reach, deepest first; a corner passes a kept one
+        only when deeper by more than the tie band (else corner order holds)."""
+        band = TIE * float(np.linalg.norm(self.half))
         kept = []
         for i in range(8):
             h = float(n @ (self.verts[i] - a))
-            if h <= D:
-                kept.append((h, i))
-        kept.sort(key=lambda x: (x[0], x[1]))
-        return [(self.verts[i].copy(), h) for h, i in kept[:4]]
+            if h > D:
+                continue
+            pos = len(kept)
+            while pos > 0 and kept[pos - 1][0] > h + band:
+                pos -= 1
+            kept.insert(pos, (h, i))
+            del kept[4:]
+        return [(self.verts[i].copy(), h) for h, i in kept]
+
+
+@functools.lru_cache(maxsize=64)
+def _local_hull_faces(data: bytes, shape: tuple):
+    """:func:`convex_hull_faces` of local hull vertices (memoized: poses of one hull share them)."""
+    return convex_hull_faces(np.frombuffer(data, np.float64).reshape(shape), tol=HULL_FACE_TOL)
 
 
 class Hull(Polytope):
@@ -864,21 +922,28 @@ class Hull(Polytope):
     def __init__(self, c, rot, verts_local):
         self.c = np.asarray(c, np.float64)
         self.R = np.asarray(rot, np.float64)
-        v = self.c + np.asarray(verts_local, np.float64) @ self.R.T
-        faces, normals = convex_hull_faces(v)
-        super().__init__(v, faces, normals)
+        local = np.asarray(verts_local, np.float64)
+        # Faces from the local vertices: the decision does not depend on where the hull is.
+        faces, normals = _local_hull_faces(local.tobytes(), local.shape)
+        super().__init__(self.c + local @ self.R.T, faces, [self.R @ nn for nn in normals])
+
+    def radius(self):
+        """The largest distance of a vertex from the centre (the tie band's scale)."""
+        return float(np.linalg.norm(self.verts - self.c, axis=1).max())
 
     def plane_manifold(self, n, a, D):
-        """The reference face (most opposed to n) and the deepest vertex, within reach, reduced to 4 by area."""
+        """The reference face (most opposed to n) and the deepest vertex, within reach, reduced to 4 by area, deepest
+        first (ties within the band in index order)."""
+        band = TIE * self.radius()
         h = (self.verts - a) @ n
-        ref = int(np.argmin(self.fnormals @ n))
+        ref = first_within(self.fnormals @ n, TIE)
         cand = set(self.faces[ref])
-        cand.add(int(np.argmin(h)))
+        cand.add(first_within(h, band))
         idx = sorted(i for i in cand if h[i] <= D)
         if not idx:
             return []
-        keep = reduce4(self.verts[idx], h[idx], n)
-        sel = sorted((idx[k] for k in keep), key=lambda i: (h[i], i))
+        keep = reduce4(self.verts[idx], h[idx], n, tie=band)
+        sel = _order_by_depth([idx[k] for k in keep], h, band)
         return [(self.verts[i].copy(), float(h[i])) for i in sel]
 
 
@@ -910,7 +975,7 @@ class Cylinder(Core):
         """Newton's plane-cylinder manifold (deepest rim point plus a tripod or the rolling points) within reach."""
         axis = self.axis.copy()
         dot_na = n @ axis
-        if dot_na > 0.0:
+        if dot_na > TIE:
             axis = -axis
             dot_na = -dot_na
         cap = self.c + axis * self.h
@@ -944,7 +1009,7 @@ class Cylinder(Core):
             if np.sum((p - pts[0]) ** 2) > merge:
                 pts.append(p)
             pp, pm = cap + v, cap - v
-            p = pp if n @ (pp - a) <= n @ (pm - a) else pm
+            p = pm if n @ (pm - a) < n @ (pp - a) - TIE * self.r else pp
             if len(pts) < 4 and np.sum((p - pts[0]) ** 2) > merge:
                 pts.append(p)
         out = []
@@ -962,7 +1027,7 @@ class Cylinder(Core):
         dn = n @ ax
         dw = w @ ax
         if abs(dn) < 1e-14:
-            if abs(dw) > self.h:
+            if abs(dw) > self.h + LIFT_SLACK:
                 return None
         else:
             t1, t2 = (-self.h - dw) / dn, (self.h - dw) / dn
@@ -973,24 +1038,265 @@ class Cylinder(Core):
         B = 2.0 * (wp_ @ npp)
         C = wp_ @ wp_ - self.r * self.r
         if A < 1e-14:
-            if C > 0:
+            if C > 2.0 * self.r * LIFT_SLACK:
                 return None
         else:
+            # disc / (4 A) = r^2 - rho^2 for a line at distance rho from the axis: a graze within the slack counts
             disc = B * B - 4 * A * C
             if disc < 0:
-                return None
+                if disc / (4.0 * A) < -2.0 * self.r * LIFT_SLACK:
+                    return None
+                disc = 0.0
             sq = math.sqrt(disc)
             t1, t2 = (-B - sq) / (2 * A), (-B + sq) / (2 * A)
             t_lo, t_hi = max(t_lo, t1), min(t_hi, t2)
-        if t_lo > t_hi + 1e-12 or not np.isfinite(t_lo):
+        if t_lo > t_hi + LIFT_SLACK or not np.isfinite(t_lo):
             return None
         return u + t_lo * n, t_lo
 
 
+def _disk_basis(axis):
+    """Two unit vectors spanning the plane normal to ``axis`` (x unless the axis is within 26 deg of x, then y)."""
+    ref = np.array([1.0, 0.0, 0.0]) if abs(axis[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = ref - axis * float(axis @ ref)
+    u /= np.linalg.norm(u)
+    return u, np.cross(axis, u)
+
+
+class Cone(Core):
+    """A cone: apex at ``c + h axis``, base disk of radius ``r`` centred at ``c - h axis`` (Newton's convention).
+
+    Its plane manifold mirrors the cylinder's with the base as the only cap: within 22.5 deg of base-down the deepest
+    base rim point plus the fixed base tripod; otherwise the two ends of the lowest generator (the base rim point
+    under the plane's normal and the apex), the lower one first.
+    """
+
+    kind = "cone"
+
+    def __init__(self, c, axis, radius, half_height):
+        self.c = np.asarray(c, np.float64)
+        self.axis = np.asarray(axis, np.float64) / np.linalg.norm(axis)
+        self.r = float(radius)
+        self.h = float(half_height)
+        self.apex = self.c + self.h * self.axis
+        self.base = self.c - self.h * self.axis
+
+    def _perp(self, n):
+        """The base-plane direction of the rim point lowest along ``n`` (a fixed one when the base is level)."""
+        ax = self.axis
+        perp = -n + ax * float(n @ ax)
+        ln = float(perp @ perp)
+        if ln > 1e-10:
+            return perp / math.sqrt(ln)
+        return _disk_basis(-ax)[0]
+
+    def generator(self, n):
+        """The base rim point under ``n`` and the apex: the lowest generator's ends."""
+        return self.base + self.r * self._perp(n), self.apex.copy()
+
+    def _band(self):
+        return TIE * math.hypot(self.r, self.h)
+
+    def lowest(self, n):
+        g, p = self.generator(n)
+        return p if float(n @ p) < float(n @ g) - self._band() else g
+
+    def aabb(self):
+        ext = self.r * np.sqrt(np.maximum(0.0, 1.0 - self.axis * self.axis))
+        return np.minimum(self.base - ext, self.apex), np.maximum(self.base + ext, self.apex)
+
+    def plane_manifold(self, n, a, D):
+        ax = self.axis
+        g, p = self.generator(n)
+        merge = (0.01 * max(self.r, self.h)) ** 2
+        if float(n @ ax) >= CYLINDER_FLAT_MODE_COS:
+            down = -ax
+            u, v = _disk_basis(down)
+            u, v = u * self.r, v * self.r
+            pts = [g]
+            for q in (self.base + u, self.base - 0.5 * u + 0.8660254 * v, self.base - 0.5 * u - 0.8660254 * v):
+                if len(pts) < 4 and np.sum((q - pts[0]) ** 2) > merge:
+                    pts.append(q)
+        else:
+            first, second = (p, g) if float(n @ p) < float(n @ g) - self._band() else (g, p)
+            pts = [first]
+            if np.sum((second - first) ** 2) > merge:
+                pts.append(second)
+        out = []
+        for q in pts:
+            hh = float(n @ (q - a))
+            if hh <= D:
+                out.append((q.copy(), hh))
+        return out
+
+    def lift(self, u, n):
+        """Entry of the line u + t n into the solid cone (smallest t)."""
+        ax = self.axis
+        w = u - self.apex
+        # z(t) = a . (x(t) - apex) in [-2h, 0]; |P x|^2 <= k^2 z^2 with k = r / (2 h)
+        k2 = (self.r / (2.0 * self.h)) ** 2
+        dz, wz = float(n @ ax), float(w @ ax)
+        t_lo, t_hi = -np.inf, np.inf
+        if abs(dz) < 1e-14:
+            if wz > LIFT_SLACK or wz < -2.0 * self.h - LIFT_SLACK:
+                return None
+        else:
+            t1, t2 = (-2.0 * self.h - wz) / dz, (0.0 - wz) / dz
+            t_lo, t_hi = max(t_lo, min(t1, t2)), min(t_hi, max(t1, t2))
+        wp_ = w - wz * ax
+        np_ = n - dz * ax
+        A = float(np_ @ np_) - k2 * dz * dz
+        B = 2.0 * (float(wp_ @ np_) - k2 * wz * dz)
+        C = float(wp_ @ wp_) - k2 * wz * wz
+        # The lower nappe: within the slab z <= 0 the quadratic's solution set is one interval.
+        if abs(A) < 1e-14:
+            if abs(B) < 1e-14:
+                if C > 2.0 * self.r * LIFT_SLACK:
+                    return None
+            elif B > 0.0:
+                t_hi = min(t_hi, -C / B)
+            else:
+                t_lo = max(t_lo, -C / B)
+        else:
+            disc = B * B - 4.0 * A * C
+            if A > 0.0 and disc < 0.0 and disc / (4.0 * A) >= -2.0 * self.r * LIFT_SLACK:
+                disc = 0.0
+            if disc < 0.0:
+                if A > 0.0:
+                    return None
+            else:
+                sq = math.sqrt(disc)
+                r1, r2 = sorted(((-B - sq) / (2.0 * A), (-B + sq) / (2.0 * A)))
+                if A > 0.0:
+                    t_lo, t_hi = max(t_lo, r1), min(t_hi, r2)
+                elif dz > 0.0:
+                    # A line steeper than the wall leaves the lower nappe at r1 (and enters the upper one at r2).
+                    t_hi = min(t_hi, r1)
+                else:
+                    t_lo = max(t_lo, r2)
+        if t_lo > t_hi + LIFT_SLACK or not np.isfinite(t_lo):
+            return None
+        return u + t_lo * n, t_lo
+
+    def contains(self, x):
+        z = float((x - self.apex) @ self.axis)
+        rho = float(np.linalg.norm((x - self.apex) - z * self.axis))
+        return -2.0 * self.h <= z <= 0.0 and rho <= self.r * (-z) / (2.0 * self.h)
+
+
+class Ellipsoid(Core):
+    """An ellipsoid of semi-axes ``s`` (local x, y, z) centred at ``c`` with rotation ``rot``; its plane manifold is
+    its support point (Newton's analytic plane query)."""
+
+    kind = "ellipsoid"
+
+    def __init__(self, c, rot, semi):
+        self.c = np.asarray(c, np.float64)
+        self.R = np.asarray(rot, np.float64)
+        self.s = np.asarray(semi, np.float64)
+
+    def lowest(self, n):
+        m = self.R.T @ n
+        y = -(self.s**2) * m / math.sqrt(float(np.sum((self.s * m) ** 2)))
+        return self.c + self.R @ y
+
+    def aabb(self):
+        ext = np.sqrt(np.sum((self.R * self.s[None, :]) ** 2, axis=1))
+        return self.c - ext, self.c + ext
+
+    def plane_manifold(self, n, a, D):
+        k = self.lowest(n)
+        h = float(n @ (k - a))
+        return [(k, h)] if h <= D else []
+
+    def lift(self, u, n):
+        y0 = (self.R.T @ (u - self.c)) / self.s
+        dy = (self.R.T @ n) / self.s
+        A = float(dy @ dy)
+        B = 2.0 * float(y0 @ dy)
+        C = float(y0 @ y0) - 1.0
+        disc = B * B - 4.0 * A * C
+        if disc < 0.0:
+            if disc / (4.0 * A) < -2.0 * LIFT_SLACK / float(self.s.max()):
+                return None
+            disc = 0.0
+        t = (-B - math.sqrt(disc)) / (2.0 * A)
+        return u + t * n, t
+
+    def contains(self, x):
+        y = (self.R.T @ (x - self.c)) / self.s
+        return float(y @ y) <= 1.0
+
+    def boundary_nearest(self, x):
+        """The boundary point nearest ``x`` (inside or outside), from the secular equation (float64 bisection).
+
+        The stationary points are ``x_i = s_i^2 y_i / (s_i^2 + t)`` with ``sum((s_i y_i / (s_i^2 + t))^2) = 1``; the
+        nearest one has ``t > 0`` outside and ``t`` in ``(-min s^2, 0]`` inside. An interior point on the smallest
+        axis's plane may instead be nearest to the points ``t = -min s^2`` off that plane.
+        """
+        y = self.R.T @ (x - self.c)
+        s2 = self.s**2
+
+        def residual(t):
+            return float(np.sum((self.s * y / (t + s2)) ** 2)) - 1.0
+
+        inside = float(np.sum((y / self.s) ** 2)) <= 1.0
+        if inside:
+            a, b = -float(s2.min()), 0.0
+            a = a + 1e-15 * max(1.0, abs(a))
+        else:
+            a, b = 0.0, float(np.linalg.norm(y) * self.s.max()) + 1e-12
+        candidates = []
+        if residual(a) >= 0.0:
+            for _ in range(200):
+                mid = 0.5 * (a + b)
+                if residual(mid) > 0.0:
+                    a = mid
+                else:
+                    b = mid
+            t = 0.5 * (a + b)
+            candidates.append(s2 * y / (t + s2))
+        if inside:
+            k = int(np.argmin(s2))
+            others = [j for j in range(3) if j != k]
+            if all(abs(s2[j] - s2[k]) > 1e-15 for j in others):
+                xs = np.zeros(3)
+                for j in others:
+                    xs[j] = s2[j] * y[j] / (s2[j] - s2[k])
+                rest = 1.0 - sum((xs[j] / self.s[j]) ** 2 for j in others)
+                if rest >= 0.0:
+                    for sign in (1.0, -1.0):
+                        cand = xs.copy()
+                        cand[k] = sign * self.s[k] * math.sqrt(rest)
+                        candidates.append(cand)
+        if not candidates:
+            # Equal smallest axes with the point on their plane: the minimum translation over dense directions.
+            i = np.arange(4096) + 0.5
+            phi = np.arccos(1.0 - 2.0 * i / 4096)
+            theta = math.pi * (1.0 + 5.0**0.5) * i
+            d = np.stack([np.cos(theta) * np.sin(phi), np.sin(theta) * np.sin(phi), np.cos(phi)], 1)
+            support = np.sqrt(np.sum((d * self.s) ** 2, axis=1))
+            j = int(np.argmin(support - d @ y))
+            candidates.append(s2 * d[j] / support[j])
+        best = min(candidates, key=lambda cand: float(np.linalg.norm(cand - y)))
+        return self.c + self.R @ best
+
+    def outward_normal(self, p):
+        g = (self.R.T @ (p - self.c)) / self.s**2
+        g = self.R @ g
+        return g / np.linalg.norm(g)
+
+
 def make_core(kind: str, dims: dict, pose_local, *, verts=None) -> Core:
-    """A core in the heightfield-local frame: ``pose_local`` = (px, py, pz, qx, qy, qz, qw)."""
+    """A core in the heightfield-local frame: ``pose_local`` = (px, py, pz, qx, qy, qz, qw).
+
+    ``dims``: sphere ``radius``; capsule, cylinder and cone ``radius`` and ``half_height``; box ``half``; ellipsoid
+    ``semi`` (semi-axes); hull ``verts`` (its local vertices, scale applied).
+    """
     p = np.asarray(pose_local[:3], np.float64)
-    R = quat_matrix(np.asarray(pose_local[3:7], np.float64))
+    q = np.asarray(pose_local[3:7], np.float64)
+    # A float32 pose's quaternion is unit only to about 6e-8; a polytope's face normals must stay its corners' planes.
+    R = quat_matrix(q / np.linalg.norm(q))
     z = R[:, 2]
     if kind == "sphere":
         return Sphere(p, dims["radius"])
@@ -1000,8 +1306,12 @@ def make_core(kind: str, dims: dict, pose_local, *, verts=None) -> Core:
         return Box(p, R, dims["half"])
     if kind == "cylinder":
         return Cylinder(p, z, dims["radius"], dims["half_height"])
+    if kind == "cone":
+        return Cone(p, z, dims["radius"], dims["half_height"])
+    if kind == "ellipsoid":
+        return Ellipsoid(p, R, dims["semi"])
     if kind == "hull":
-        return Hull(p, R, verts)
+        return Hull(p, R, dims["verts"] if verts is None else verts)
     raise ValueError(kind)
 
 
@@ -1169,10 +1479,31 @@ def _recovery_row(hf, p, feat):
     return Row(p - d * n, p.copy(), n.copy(), d, feat)
 
 
+def solid_recovery_points(core):
+    """The boundary points G3 tries for a solid core: polytope vertices; a cylinder's 16 rim points per cap; a cone's
+    16 base rim points and its apex; an ellipsoid's 14 points on its local axes and diagonals."""
+    if hasattr(core, "verts"):
+        return core.verts
+    th = np.linspace(0.0, 2.0 * np.pi, 16, endpoint=False)
+    if core.kind == "ellipsoid":
+        local = [np.array([sx, 0.0, 0.0]) for sx in (1.0, -1.0)]
+        local += [np.array([0.0, sy, 0.0]) for sy in (1.0, -1.0)]
+        local += [np.array([0.0, 0.0, sz]) for sz in (1.0, -1.0)]
+        third = 1.0 / math.sqrt(3.0)
+        local += [np.array([sx, sy, sz]) * third for sx in (1.0, -1.0) for sy in (1.0, -1.0) for sz in (1.0, -1.0)]
+        return np.stack([core.c + core.R @ (core.s * p) for p in local])
+    ax = core.axis
+    u, w = _disk_basis(ax)
+    ring = core.r * (np.outer(np.cos(th), u) + np.outer(np.sin(th), w))
+    if core.kind == "cone":
+        return np.concatenate([core.base + ring, core.apex[None, :]])
+    return np.concatenate([core.c + core.h * ax + ring, core.c - core.h * ax + ring])
+
+
 def _solid_recovery(hf, core, *, kmax=4):
     """G3 for solid cores with no row: up to 4 of the core's deepest boundary points below the surface."""
-    if hasattr(core, "verts"):
-        pts = core.verts
+    if hasattr(core, "verts") or core.kind in ("cone", "ellipsoid"):
+        pts = solid_recovery_points(core)
     else:
         ax = core.axis
         ref = np.array([1.0, 0.0, 0.0]) if abs(ax[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
@@ -1271,7 +1602,12 @@ def capsule_law(hf, core, D, window, *, stats=None):
 
 
 def _sigma(core, n, x0):
+    """The core's separation from x0 along n, ``min n . (k - x0)`` (exact: a cone's lowest point without its tie
+    band), and that point."""
     k = core.lowest(n)
+    if core.kind == "cone":
+        g, p = core.generator(n)
+        k = p if float(n @ p) < float(n @ g) else g
     return float(n @ (k - x0)), k
 
 
@@ -1312,10 +1648,25 @@ def _maximize_arc(core, nA, m, theta_ab, x0, *, samples=9, iters=40):
 
 def _support_feature(core, n, band):
     """The core's flat support feature along -n within ``band``: ('pts', P) for a polytope's face, edge or vertex
-    or a cylinder's lowest point or generator, ('disk', centre, axis, r) for a cylinder cap within the band."""
+    or a cylinder's lowest point or generator, ('disk', centre, axis, r) for a cylinder cap within the band.
+
+    A cone's is its base disk (base down within the band), the lowest generator (both ends within the band) or its
+    lowest point; an ellipsoid's is its support point."""
     if hasattr(core, "verts"):
         h = core.verts @ n
         return ("pts", core.verts[h <= h.min() + band])
+    if core.kind == "ellipsoid":
+        return ("pts", core.lowest(n)[None, :])
+    if core.kind == "cone":
+        ax = core.axis
+        tilt = math.sqrt(max(0.0, 1.0 - float(n @ ax) ** 2))
+        if float(n @ ax) > 0.0 and 2.0 * core.r * tilt <= band:
+            return ("disk", core.base.copy(), ax, core.r)
+        g, p = core.generator(n)
+        k0, k1 = (p, g) if float(n @ p) < float(n @ g) - core._band() else (g, p)
+        if float(n @ (k1 - k0)) <= band:
+            return ("pts", np.stack([k0, k1]))
+        return ("pts", k0[None, :])
     ax = core.axis
     k0 = core.lowest(n)
     s = -1.0 if n @ ax > 0 else 1.0
@@ -1334,14 +1685,21 @@ def _reference_feature(core, n):
     generator."""
     if hasattr(core, "verts"):
         h = core.verts @ n
-        deepest = int(np.argmin(h))
-        best, k = -np.inf, -1
-        for q, f in enumerate(core.faces):
-            if deepest in f:
-                sc = -float(core.fnormals[q] @ n)
-                if sc > best:
-                    best, k = sc, q
+        radius = float(np.linalg.norm(core.verts - core.c, axis=1).max())
+        deepest = first_within(h, TIE * radius)
+        through = [q for q, f in enumerate(core.faces) if deepest in f]
+        k = through[first_within([-float(core.fnormals[q] @ n) for q in through], TIE, largest=True)]
         return ("pts", core.verts[core.faces[k]])
+    if core.kind == "ellipsoid":
+        return ("pts", core.lowest(n)[None, :])
+    if core.kind == "cone":
+        # The base within the flat mode, else the lowest generator (the apex alone when the axis is along n).
+        if float(n @ core.axis) >= CYLINDER_FLAT_MODE_COS:
+            return ("disk", core.base.copy(), core.axis, core.r)
+        perp = -n + core.axis * float(n @ core.axis)
+        if float(np.linalg.norm(perp)) < 1e-12:
+            return ("pts", core.apex[None, :])
+        return ("pts", np.stack(core.generator(n)))
     axis = core.axis if float(n @ core.axis) < 0.0 else -core.axis
     cap = core.c + core.h * axis
     if -float(n @ axis) >= CYLINDER_FLAT_MODE_COS:
@@ -1357,12 +1715,33 @@ def _reference_feature(core, n):
 def _feature_interval(feat, v0, e1, e2, tol, *, need_straddle=False):
     """Interval of the edge-line coordinate x (along e1 from v0) where the feature, projected along n = e1 x e2,
     meets the line y = 0; None when it misses (or, with need_straddle, when it does not cross the line)."""
+    crossing = _feature_crossing(feat, v0, e1, e2, tol, need_straddle=need_straddle)
+    return None if crossing is None else crossing[:2]
+
+
+def _feature_crossing(feat, v0, e1, e2, tol, *, need_straddle=False):
+    """:func:`_feature_interval` with a feature point over each end: ``(lo, hi, k_lo, k_hi)`` or None.
+
+    A point set's ends are the extreme ones among its points within ``tol`` of the line and the crossings of the
+    line by the chords between its points on either side (the line meets their convex hull in that interval); a
+    disk's are its rim points over the ends."""
     if feat[0] == "pts":
         S = feat[1]
         P = np.stack([(S - v0) @ e1, (S - v0) @ e2], 1)
         if need_straddle and not (P[:, 1].min() < -1e-9 and P[:, 1].max() > 1e-9):
             return None
-        return _hull_line_interval(hull2d(P), tol)
+        ends = [(float(P[i, 0]), S[i]) for i in range(len(S)) if abs(P[i, 1]) <= tol]
+        for i in range(len(S)):
+            for j in range(i + 1, len(S)):
+                ya, yb = P[i, 1], P[j, 1]
+                if (ya < -tol and yb > tol) or (ya > tol and yb < -tol):
+                    f = ya / (ya - yb)
+                    ends.append((float(P[i, 0] + f * (P[j, 0] - P[i, 0])), S[i] + f * (S[j] - S[i])))
+        if not ends:
+            return None
+        lo = min(ends, key=lambda end: end[0])
+        hi = max(ends, key=lambda end: end[0])
+        return lo[0], hi[0], lo[1].copy(), hi[1].copy()
     _kind, C, axis, r = feat
     ref = np.array([1.0, 0.0, 0.0]) if abs(axis[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
     u = ref - axis * float(axis @ ref)
@@ -1375,15 +1754,18 @@ def _feature_interval(feat, v0, e1, e2, tol, *, need_straddle=False):
         if abs(yc) > tol or need_straddle:
             return None
         ext = r * math.hypot(float(u @ e1), float(w @ e1))
-        return (xc - ext, xc + ext)
+        along = (u * float(u @ e1) + w * float(w @ e1)) / max(ext / r, 1e-300)
+        return xc - ext, xc + ext, C - r * along, C + r * along
     if abs(yc) > R + tol:
         return None
     if need_straddle and abs(yc) >= R - 1e-9:
         return None
     phi = math.atan2(B_, A_)
     dl = math.acos(max(-1.0, min(1.0, -yc / R)))
-    xs = [xc + r * (math.cos(th) * float(u @ e1) + math.sin(th) * float(w @ e1)) for th in (phi + dl, phi - dl)]
-    return (min(xs), max(xs))
+    rim = [C + r * (math.cos(th) * u + math.sin(th) * w) for th in (phi + dl, phi - dl)]
+    xs = [float((k - v0) @ e1) for k in rim]
+    i_lo, i_hi = (0, 1) if xs[0] <= xs[1] else (1, 0)
+    return xs[i_lo], xs[i_hi], rim[i_lo], rim[i_hi]
 
 
 def hull2d(P):
@@ -1405,29 +1787,6 @@ def hull2d(P):
             upper.pop()
         upper.append(p)
     return np.asarray(lower[:-1] + upper[:-1], np.float64)
-
-
-def _hull_line_interval(H, tol):
-    """Interval of x where the 2-D convex polygon H meets the line y = 0 (None if it misses)."""
-    if len(H) == 0:
-        return None
-    if len(H) == 1:
-        return (H[0, 0], H[0, 0]) if abs(H[0, 1]) <= tol else None
-    xs = []
-    m = len(H)
-    for i in range(m):
-        a, b = H[i], H[(i + 1) % m] if m > 2 else H[1 - i]
-        ya, yb = a[1], b[1]
-        if abs(ya) <= tol:
-            xs.append(a[0])
-        if (ya < -tol and yb > tol) or (ya > tol and yb < -tol):
-            s = ya / (ya - yb)
-            xs.append(a[0] + s * (b[0] - a[0]))
-        if m == 2 and i == 1:
-            break
-    if not xs:
-        return None
-    return min(xs), max(xs)
 
 
 def solid_law(hf, core, D, window, *, stats=None, flat_band=None):
@@ -1507,7 +1866,7 @@ def solid_law(hf, core, D, window, *, stats=None, flat_band=None):
         e1, e2 = dh, np.cross(nst, dh)
         # G1: interior theta*: the flat support feature along -n(theta*); arc end: the reference feature
         feat = _support_feature(core, nst, band) if interior else _reference_feature(core, nst)
-        iv = _feature_interval(feat, v0, e1, e2, 1e-7 + 1e-6 * size, need_straddle=not interior)
+        iv = _feature_crossing(feat, v0, e1, e2, 1e-7 + 1e-6 * size, need_straddle=not interior)
         xs = []
         if iv is not None:
             x0, x1 = max(iv[0], 0.0), min(iv[1], L)
@@ -1520,13 +1879,18 @@ def solid_law(hf, core, D, window, *, stats=None, flat_band=None):
         grp = ("E", e[0], er, ec, round(th, 9)) if interior else ("P", ta if th < 0.5 * th_ab else tb)
         for x in xs:
             u = v0 + x * dh
+            # The feature's chord over the interval lies in the core on the line, so the lift is no deeper than its
+            # point over u; at an end, where the line can only touch the core, that point is the lift (a tangent
+            # lift that rounding made miss, or carried past the chord, is the chord's point).
+            lo, hi, k_lo, k_hi = iv
+            k = k_lo if x == lo else k_hi if x == hi else k_lo + ((x - lo) / (hi - lo)) * (k_hi - k_lo)
+            tt = float(nst @ (k - u))
             hit = core.lift(u, nst)
-            if hit is None:
-                continue
-            k, tt = hit
+            if hit is not None and hit[1] <= tt + LIFT_SLACK:
+                tt = hit[1]
             if tt > D:
                 continue
-            out.append(Row(u, k, nst.copy(), tt, ("E", e[0], er, ec, round(x / L, 6)), group=grp))
+            out.append(Row(u, u + tt * nst, nst.copy(), tt, ("E", e[0], er, ec, round(x / L, 6)), group=grp))
     # ---- vertex features -------------------------------------------------------------------------------------
     for r, c in verts:
         ring = hf.ring(r, c)
@@ -1586,6 +1950,24 @@ def _nearest(core, v):
             return -f, v + d_cap * f, -d_cap
         f = rad / lr
         return -f, v + d_side * f, -d_side
+    if core.kind == "cone":
+        # The base plane or the lateral surface, whichever is nearer (both feet lie on the boundary from inside).
+        w = v - core.apex
+        z = float(w @ core.axis)
+        rad = w - z * core.axis
+        lr = float(np.linalg.norm(rad))
+        d_base = z + 2.0 * core.h
+        slant = math.hypot(core.r, 2.0 * core.h)
+        d_side = (2.0 * core.h * lr + core.r * z) / -slant
+        if d_base <= d_side:
+            return core.axis.copy(), v - d_base * core.axis, -d_base
+        radial = rad / lr if lr > 1e-12 else _disk_basis(core.axis)[0]
+        f = (2.0 * core.h * radial + core.r * core.axis) / slant
+        return -f, v + d_side * f, -d_side
+    if core.kind == "ellipsoid":
+        k = core.boundary_nearest(v)
+        f = core.outward_normal(k)
+        return -f, k, -float(np.linalg.norm(k - v))
     return None
 
 
@@ -1610,6 +1992,23 @@ def _closest_point(core, v):
         return p
     if core.kind == "hull":
         return core.closest(v)
+    if core.kind == "cone":
+        if core.contains(v):
+            return None
+        # The nearest point of the meridian section (a triangle: apex, base rim, opposite base rim) in its plane.
+        w = v - core.apex
+        z = float(w @ core.axis)
+        rad = w - z * core.axis
+        lr = float(np.linalg.norm(rad))
+        radial = rad / lr if lr > 1e-12 else _disk_basis(core.axis)[0]
+        p = np.array([lr, z, 0.0])
+        apex2, rim2, far2 = np.zeros(3), np.array([core.r, -2.0 * core.h, 0.0]), np.array([-core.r, -2.0 * core.h, 0.0])
+        q = _closest_on_tri(p, apex2, rim2, far2)
+        return core.apex + q[1] * core.axis + q[0] * radial
+    if core.kind == "ellipsoid":
+        if core.contains(v):
+            return None
+        return core.boundary_nearest(v)
     return None
 
 
