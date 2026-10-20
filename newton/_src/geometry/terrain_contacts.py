@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Static data of the per-pair terrain contact law: plane clusters, tile-max mip and version stamps.
+"""Static data of the per-pair terrain contact law: surface features and the terrain pair table.
 
 :class:`TerrainFeatures` builds, for every heightfield of a model, the per-triangle plane clusters (with the
 plane records of clusters of several triangles), the tile-max mip and the version stamps; the law's kernels read
-them through :class:`~newton._src.geometry.terrain_law.TerrainFeatureData`. Nothing routes contacts through the
-law yet: building the features changes no contact.
+them through :class:`~newton._src.geometry.terrain_law.TerrainFeatureData`. :class:`TerrainPairTable` lists every
+(heightfield, convex partner) pair the collision filter admits, grouped into one contiguous segment per partner
+class and lane class. Nothing routes contacts through the law yet: building either object changes no contact.
 
 Plane clusters are built by Warp kernels on the model's device, round by round over the triangles not yet
 assigned:
@@ -51,6 +52,25 @@ from .types import GeoType
 TERRAIN_CLUSTER_ROUNDS = 8
 """Rounds of the cluster build; triangles still unassigned afterwards are clusters of their own."""
 
+TERRAIN_PARTNER_POINT = 0
+"""Partner class of point and segment cores: spheres and capsules."""
+TERRAIN_PARTNER_BOX = 1
+"""Partner class of boxes."""
+TERRAIN_PARTNER_CYLINDER = 2
+"""Partner class of flat-capped cylinders and cones."""
+TERRAIN_PARTNER_HULL = 3
+"""Partner class of the support-function cores: convex meshes, ellipsoids and barrel cylinders."""
+TERRAIN_PARTNER_CLASSES = 4
+TERRAIN_PARTNER_ROWS = (8, 16, 16, 24)
+"""Rows one pair of each partner class may write (the measured per-pair maxima with headroom)."""
+
+TERRAIN_LANE_THREAD = 0
+"""Lane class of pairs whose largest window holds at most :data:`TERRAIN_LANE_CELLS` cells: one thread per pair."""
+TERRAIN_LANE_TILE = 1
+"""Lane class of larger windows: :data:`TERRAIN_TILE_LANES` lanes per pair."""
+TERRAIN_LANE_CLASSES = 2
+TERRAIN_LANE_CELLS = 16
+TERRAIN_TILE_LANES = 16
 
 _FLAT_EPS = wp.constant(TERRAIN_FLAT_EPS)
 _INT_MAX = wp.constant(2147483647)
@@ -1074,3 +1094,192 @@ class TerrainFeatures:
             device=self.device,
             record_tape=False,
         )
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# terrain pair table
+# ----------------------------------------------------------------------------------------------------------------
+
+
+def heightfield_pair_table(
+    shape_types: np.ndarray,
+    shape_world: np.ndarray | None,
+    colliding: np.ndarray,
+    *,
+    explicit_pairs: np.ndarray | None = None,
+) -> np.ndarray:
+    """Return every ``(heightfield, partner)`` shape pair that can reach the terrain midphase, once.
+
+    The terrain midphase receives the pairs of exactly one heightfield and a partner other than a triangle
+    mesh. With an explicit pair list those are its pairs of that kind, in either order. Otherwise the broad
+    phase generates them from the colliding shapes, so the table holds every colliding heightfield with every
+    colliding partner of a compatible world (the same world, or either shape global), a superset of what it
+    can generate.
+
+    Args:
+        shape_types: Geometry type of every shape.
+        shape_world: World of every shape (-1 for global shapes), or ``None`` for a single world.
+        colliding: Whether every shape takes part in shape-shape collision.
+        explicit_pairs: The explicit broad phase's shape pairs, or ``None``.
+
+    Returns:
+        Unique ``(heightfield, partner)`` rows, sorted.
+    """
+    shape_types = np.asarray(shape_types)
+    hfield, mesh = int(GeoType.HFIELD), int(GeoType.MESH)
+    if explicit_pairs is not None:
+        pairs = np.asarray(explicit_pairs, dtype=np.int64).reshape(-1, 2)
+        pairs = pairs[np.all((pairs >= 0) & (pairs < len(shape_types)), axis=1)]
+        first, second = shape_types[pairs[:, 0]], shape_types[pairs[:, 1]]
+        partner = np.where(first == hfield, second, first)
+        pairs = pairs[((first == hfield) != (second == hfield)) & (partner != mesh)]
+        swap = shape_types[pairs[:, 0]] != hfield
+        table = np.where(swap[:, None], pairs[:, ::-1], pairs)
+    else:
+        colliding = np.asarray(colliding, dtype=bool)
+        heightfields = np.flatnonzero(colliding & (shape_types == hfield))
+        partners = np.flatnonzero(colliding & (shape_types != hfield) & (shape_types != mesh))
+        world = np.full(len(shape_types), -1, np.int64) if shape_world is None else np.asarray(shape_world)
+        pieces = [_cross(heightfields[world[heightfields] < 0], partners)]
+        local = heightfields[world[heightfields] >= 0]
+        pieces.append(_cross(local, partners[world[partners] < 0]))
+        # Each world's heightfields with the partners of the same world.
+        order = np.argsort(world[partners], kind="stable")
+        sorted_partners, sorted_worlds = partners[order], world[partners][order]
+        begin = np.searchsorted(sorted_worlds, world[local], side="left")
+        lengths = np.searchsorted(sorted_worlds, world[local], side="right") - begin
+        starts = np.repeat(begin - (np.cumsum(lengths) - lengths), lengths)
+        positions = starts + np.arange(int(lengths.sum()))
+        pieces.append(np.stack([np.repeat(local, lengths), sorted_partners[positions]], axis=1))
+        table = np.concatenate(pieces)
+    return np.unique(np.asarray(table, dtype=np.int64).reshape(-1, 2), axis=0).astype(np.int32)
+
+
+def _cross(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    """Every pair of an element of ``first`` with an element of ``second``, as rows."""
+    return np.stack([np.repeat(first, len(second)), np.tile(second, len(first))], axis=1).reshape(-1, 2)
+
+
+def terrain_partner_classes(shape_type: np.ndarray, shape_scale: np.ndarray) -> np.ndarray:
+    """Return the law's partner class of every shape (-1 when the law has none: meshes, planes, heightfields).
+
+    Flat-capped cylinders take the cylinder class; a barrel cylinder (a nonzero barrel radius in ``scale[2]``)
+    takes the support-function class with hulls and ellipsoids.
+
+    Args:
+        shape_type: Geometry type of every shape.
+        shape_scale: Scale of every shape, ``(shape_count, 3)``.
+
+    Returns:
+        The partner class of every shape, int32.
+    """
+    kind = np.asarray(shape_type)
+    barrel = np.asarray(shape_scale, dtype=np.float64).reshape(-1, 3)[:, 2] != 0.0
+    cylinder = kind == int(GeoType.CYLINDER)
+    result = np.full(len(kind), -1, np.int32)
+    result[(kind == int(GeoType.SPHERE)) | (kind == int(GeoType.CAPSULE))] = TERRAIN_PARTNER_POINT
+    result[kind == int(GeoType.BOX)] = TERRAIN_PARTNER_BOX
+    result[(cylinder & ~barrel) | (kind == int(GeoType.CONE))] = TERRAIN_PARTNER_CYLINDER
+    result[(cylinder & barrel) | (kind == int(GeoType.CONVEX_MESH)) | (kind == int(GeoType.ELLIPSOID))] = (
+        TERRAIN_PARTNER_HULL
+    )
+    return result
+
+
+def terrain_window_cells(radius, reach, dx, dy) -> np.ndarray:
+    """Return the cells of the largest window a partner can need: its bounding sphere plus reach, any alignment.
+
+    Takes scalars or arrays of equal shape [m]; computes in float64.
+    """
+    extent = 2.0 * (np.asarray(radius, np.float64) + np.asarray(reach, np.float64))
+    return (np.ceil(extent / dx) + 1.0) * (np.ceil(extent / dy) + 1.0)
+
+
+class TerrainPairTable:
+    """The static (heightfield, partner) pairs of the terrain law, one contiguous segment per partner and lane class.
+
+    Pairs come from the model's collision filter (:attr:`~newton.Model.shape_contact_pairs`, or the colliding
+    shapes of compatible worlds when the model has no pair list), restricted to partners the law has a class
+    for, and are sorted by (partner class, lane class, world, heightfield, partner). A pair's lane class follows
+    from its largest window over all orientations (bounding radius plus margins and gaps, on its heightfield's
+    cells) at construction.
+
+    Args:
+        model: A finalized model.
+    """
+
+    def __init__(self, model):
+        self.device = model.device
+        count = model.shape_count
+        types = model.shape_type.numpy() if count else np.zeros(0, np.int32)
+        worlds = model.shape_world.numpy() if count else np.zeros(0, np.int32)
+        flags = model.shape_flags.numpy() if count else np.zeros(0, np.int32)
+        from .flags import ShapeFlags  # noqa: PLC0415
+
+        colliding = (flags & int(ShapeFlags.COLLIDE_SHAPES)) != 0
+        explicit = None
+        if getattr(model, "shape_contact_pairs", None) is not None and getattr(model, "shape_contact_pair_count", 0):
+            explicit = model.shape_contact_pairs.numpy().reshape(-1, 2)
+        pairs = (
+            heightfield_pair_table(types, worlds, colliding, explicit_pairs=explicit)
+            if count
+            else np.zeros((0, 2), np.int32)
+        )
+        scale = model.shape_scale.numpy() if count else np.zeros((0, 3), np.float32)
+        partner_class = terrain_partner_classes(types, scale)[pairs[:, 1]]
+        pairs = pairs[partner_class >= 0]
+        partner_class = partner_class[partner_class >= 0]
+        lane = np.zeros(len(pairs), np.int32)
+        world = np.zeros(len(pairs), np.int32)
+        if len(pairs):
+            first, second = pairs[:, 0], pairs[:, 1]
+            margin = model.shape_margin.numpy()
+            gap = model.shape_gap.numpy()
+            layout = model.heightfield_data.numpy()[model.shape_heightfield_index.numpy()[first]]
+            dx = 2.0 * layout["hx"].astype(np.float64) / (layout["ncol"].astype(np.int64) - 1)
+            dy = 2.0 * layout["hy"].astype(np.float64) / (layout["nrow"].astype(np.int64) - 1)
+            reach = margin[first] + margin[second] + gap[first] + gap[second]
+            cells = terrain_window_cells(model.shape_collision_radius.numpy()[second], reach, dx, dy)
+            lane = np.where(cells <= TERRAIN_LANE_CELLS, TERRAIN_LANE_THREAD, TERRAIN_LANE_TILE).astype(np.int32)
+            world = np.where(worlds[second] >= 0, worlds[second], worlds[first]).astype(np.int32)
+        order = np.lexsort((pairs[:, 1], pairs[:, 0], world, lane, partner_class))
+        self.pairs_host = pairs[order].astype(np.int32).reshape(-1, 2)
+        """``(heightfield, partner)`` shape pairs in table order, int32 ``(pair_count, 2)`` (host)."""
+        self.partner_class = partner_class[order]
+        """Partner class of every pair, int32 (host)."""
+        self.lane_class = lane[order]
+        """Lane class of every pair, int32 (host)."""
+        self.world = world[order]
+        """World of every pair (the partner's, or the heightfield's for a global partner), int32 (host)."""
+        segment = self.partner_class * TERRAIN_LANE_CLASSES + self.lane_class
+        segments = TERRAIN_PARTNER_CLASSES * TERRAIN_LANE_CLASSES
+        sizes = np.bincount(segment, minlength=segments) if len(segment) else np.zeros(segments, np.int64)
+        self.segment_offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
+        """First pair of every (partner class, lane class) segment, and the pair count last (host)."""
+        rows = np.repeat(np.asarray(TERRAIN_PARTNER_ROWS, np.int64), TERRAIN_LANE_CLASSES)
+        self.slot_offsets = np.concatenate([[0], np.cumsum(sizes * rows)]).astype(np.int64)
+        """First output slot of every segment in the static layout, and the slot count last (host)."""
+        self.slot_count = int(self.slot_offsets[-1])
+        """Output slots of the static layout: every pair times its class's row limit."""
+        self.pairs = wp.array(
+            self.pairs_host if len(self.pairs_host) else np.zeros((1, 2), np.int32), dtype=wp.vec2i, device=self.device
+        )
+        """The pairs on the model's device (one unused pair when the table is empty)."""
+        self.pair_count = len(self.pairs_host)
+        """Pairs in the table."""
+
+    def segment(self, partner_class: int, lane_class: int) -> tuple[int, int]:
+        """Return the ``[begin, end)`` pair range of one partner class and lane class."""
+        s = partner_class * TERRAIN_LANE_CLASSES + lane_class
+        return int(self.segment_offsets[s]), int(self.segment_offsets[s + 1])
+
+    def slots(self, pair: int) -> tuple[int, int]:
+        """Return the ``[begin, end)`` output slot range of a pair in the static layout (pairs times rows per pair)."""
+        s = int(np.searchsorted(self.segment_offsets, pair, side="right")) - 1
+        rows = TERRAIN_PARTNER_ROWS[s // TERRAIN_LANE_CLASSES]
+        begin = int(self.slot_offsets[s]) + (pair - int(self.segment_offsets[s])) * rows
+        return begin, begin + rows
+
+    def memory_bytes(self) -> dict[str, int]:
+        """Return the device bytes the table holds."""
+        return {"pairs": self.pairs.capacity}
