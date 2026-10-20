@@ -305,8 +305,9 @@ NEWTON_FLAGS = declare(
         "NEWTON_TERRAIN_LAW_SHADOW",
         "diagnostic",
         _COLLIDE,
-        "Partner classes (point, box, cylinder, hull or all) whose terrain-law kernels run beside the terrain route "
-        "into a side buffer nothing reads; unset runs none.",
+        "Partner classes whose terrain-law kernels run beside the terrain route into a side buffer nothing reads: "
+        "point (spheres and capsules) or all; box, cylinder and hull once their kernels land (naming a class "
+        "without a kernel raises). Unset runs none.",
     ),
     EnvironmentFlag(
         "NEWTON_ASSET_DIR",

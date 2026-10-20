@@ -32,10 +32,11 @@ edges dropped on cluster ids) and the vertex; then
 :func:`~newton._src.geometry.terrain_law.terrain_finish` with at most :data:`TERRAIN_POINT_ROWS` rows. Each feature
 is rejected on geometry before its canonical values are read: a face whose projection lies off its cell
 (:func:`_off_cell`, conservative), an edge whose slab misses the core point or whose closest point is out of reach
-(exact) before its class and planes. On the recorded anymald feet (4,096 pairs) the drop keeps 4.0 of a window's
+(exact) before its class and planes. On 4,096 recorded quadruped foot spheres the drop keeps 4.0 of a window's
 11.7 vertices; per pair, 2.3 of the 7.7 front-facing faces within reach get to their canonical values, and of 12.1
-edges 3.4 are creases and 1.0 gets to its planes. The rows are bit for bit those of the walk without the drop and
-the rejects. A window's cluster planes are evaluated once (:class:`~newton._src.geometry.terrain_law.TerrainPlanes`).
+edges 3.4 are creases and 1.0 gets to its planes. The rows are bit for bit those of the walk without the drop, the
+vertex mask and the off-cell reject (the point-kernel tests check it). A window's cluster planes are evaluated once
+(:class:`~newton._src.geometry.terrain_law.TerrainPlanes`).
 
 The window is walked vertex by vertex: vertex ``(r, c)`` owns the features :func:`_point_item` lists (its cell's
 faces and diagonal, its x- and y-edges, itself), each evaluated for the sphere centre or for both capsule ends and
@@ -44,8 +45,9 @@ the axis. An item yields at most one row (:class:`_Claim`).
 Thread mapping (the pair table's lane classes): :func:`terrain_point_rows` runs one thread per pair; it first marks
 the window's vertices the drop keeps in a bit mask and then walks the marked ones in window order, so that a warp's
 lanes evaluate their k-th kept vertices together instead of one window position that most lanes drop (a model of
-the warps' issued instructions on the recorded feet, per-stage SASS counts weighted by what any lane of a warp
-runs: -24% on anymald, -27% on go2 against walking every window position). :func:`terrain_point_rows_tiled` runs
+the warps' issued instructions on recorded quadruped foot spheres, per-stage SASS counts weighted by what any lane of
+a warp runs: -24% and -27% on two suite scenes against walking every window position).
+:func:`terrain_point_rows_tiled` runs
 :data:`~newton._src.geometry.terrain_contacts.TERRAIN_TILE_LANES` lanes per pair (``wp.launch_tiled``) for windows
 of more cells: the lanes split the window's heights and vertices, mark the vertices whose items yield anything, and
 the first lane evaluates those in window order, so a pair gets the rows the one-thread kernel gives it. Both hold a

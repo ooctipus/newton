@@ -4,7 +4,8 @@
 """Run the terrain law beside the narrow phase, into a side buffer that nothing in the step reads (shadow mode).
 
 ``NEWTON_TERRAIN_LAW_SHADOW`` lists partner classes (``point``: spheres and capsules; ``box``; ``cylinder``:
-cylinders and cones; ``hull``: convex hulls and ellipsoids; or ``all``), empty by default. With classes listed, a
+cylinders and cones; ``hull``: convex hulls and ellipsoids; or ``all``, every class with a kernel), empty by default.
+Only ``point`` has kernels yet; naming a class without one raises. With classes listed, a
 collision pipeline builds :class:`TerrainLawShadow` once, at construction: the terrain features
 (:class:`~newton._src.geometry.terrain_contacts.TerrainFeatures`), the static pair table
 (:class:`~newton._src.geometry.terrain_contacts.TerrainPairTable`, from the pipeline's pairs) and per listed pair a
