@@ -150,7 +150,7 @@ def audit_system(copies, law):
 
 
 def sticking_system():
-    """The audit block's normal with a small tangential residual, which the contact's friction holds still."""
+    """The audit block's normal with a small tangential residual: it sticks, down to a row weight of 0.5."""
     L = np.linalg.cholesky(W_AUDIT)
     return contact_system([L[0]], [W0_AUDIT[0]], anchors={0: (L[1], L[2], -0.01, 0.02)}, ring=False)
 
