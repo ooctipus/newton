@@ -17,8 +17,10 @@ placements up to 100 m out, but for decisions within the predicates' band
 (:func:`~newton.tests.terrain_law_test_utils.band_decided`).
 """
 
+import functools
 import glob
 import os
+import re
 import tempfile
 import unittest
 
@@ -54,6 +56,7 @@ from newton._src.geometry.terrain_law import (
     terrain_window_extent,
     terrain_window_vertex,
 )
+from newton._src.geometry.terrain_shadow import TERRAIN_LAW_FULL_THREADS, terrain_finish_scratch
 from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_test_utils as tu
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -609,8 +612,8 @@ def test_point_rows_point_up_on_steep_terrain(test, device):
 # ----------------------------------------------------------------------------------------------------------------
 
 
-def _launch_segment(shadow, model, pipeline, kernel, lane, begin, count, out):
-    """Run one walk kernel over table pairs ``[begin, begin + count)`` into ``out``, then the full-finish kernel."""
+def _pair_inputs(shadow, model, pipeline):
+    """The shadow's per-collide pair inputs, from the pipeline's current shape transforms."""
     inputs = TerrainPairInputs()
     inputs.pairs = shadow.table.pairs
     inputs.shape_type = model.shape_type
@@ -621,30 +624,26 @@ def _launch_segment(shadow, model, pipeline, kernel, lane, begin, count, out):
     inputs.shape_body = model.shape_body
     inputs.body_flags = model.body_flags
     inputs.include_static_kinematic_pairs = 1
-    args = [begin, 0, inputs, shadow.features.data(), out]
+    return inputs
+
+
+def _launch_segment(shadow, model, pipeline, kernel, lane, begin, count, out):
+    """Run one walk kernel over table pairs ``[begin, begin + count)`` into ``out``, then the full-finish kernel."""
+    args = [begin, 0, _pair_inputs(shadow, model, pipeline), shadow.features.data(), out]
     out.deferred_count.zero_()
     if lane == TERRAIN_LANE_THREAD:
         wp.launch(kernel, dim=count, inputs=args, device=model.device)
     else:
         wp.launch_tiled(kernel, dim=count, inputs=args, block_dim=16, device=model.device)
-    wp.launch(terrain_law_point.terrain_point_rows_full, dim=count, inputs=args, device=model.device)
+    _launch_full(shadow, model, pipeline, begin, out)
 
 
-def _launch_full(shadow, model, pipeline, begin, count, out):
-    """Run the full-finish kernel over the pairs of ``out``'s deferred list (``deferred_count``) from table pair
-    ``begin``."""
-    inputs = TerrainPairInputs()
-    inputs.pairs = shadow.table.pairs
-    inputs.shape_type = model.shape_type
-    inputs.shape_transform = pipeline.geom_transform
-    inputs.shape_data = pipeline.geom_data
-    inputs.shape_gap = model.shape_gap
-    inputs.shape_heightfield_index = model.shape_heightfield_index
-    inputs.shape_body = model.shape_body
-    inputs.body_flags = model.body_flags
-    inputs.include_static_kinematic_pairs = 1
-    args = [begin, 0, inputs, shadow.features.data(), out]
-    wp.launch(terrain_law_point.terrain_point_rows_full, dim=count, inputs=args, device=model.device)
+def _launch_full(shadow, model, pipeline, begin, out, threads=TERRAIN_LAW_FULL_THREADS):
+    """Run the full-finish kernel, with ``threads`` threads, over the pairs of ``out``'s deferred list
+    (``deferred_count``) from table pair ``begin``."""
+    scratch = terrain_finish_scratch(model.device, threads)
+    args = [begin, 0, _pair_inputs(shadow, model, pipeline), shadow.features.data(), out, scratch]
+    wp.launch(terrain_law_point.terrain_point_rows_full, dim=threads, inputs=args, device=model.device)
 
 
 def _side_buffer(begin, count, pair_count, device):
@@ -966,7 +965,8 @@ def test_rejects_keep_the_plain_walk_rows(test, device):
     pair the same way. On rough, pitted, stepped, seam-adversarial, buried and ridge scenes the count, state, q, n, d
     and feature of every pair agree bit for bit; so do those of the full-finish kernel (which walks with the drop and
     runs the finish) run on every walked pair, which also checks that the walks write a pair's rows as the finish keeps
-    them.
+    them. The full-finish kernel runs with fewer threads than deferred pairs, as its fixed grid does when many pairs
+    are deferred: each thread finishes several pairs in turn, through the same scratch.
     """
     walked = 0
     for name, model, bodies in _reject_scenes(device):
@@ -982,11 +982,11 @@ def test_rejects_keep_the_plain_walk_rows(test, device):
                 out = _side_buffer(begin, count, shadow.table.pair_count, device)
                 _launch_segment(shadow, model, pipeline, kernel, TERRAIN_LANE_THREAD, begin, count, out)
                 results[label] = out
-            # The full-finish kernel on every pair.
+            # The full-finish kernel on every pair, seven threads taking the pairs in turn.
             full = _side_buffer(begin, count, shadow.table.pair_count, device)
             full.deferred.assign(np.arange(shadow.table.pair_count, dtype=np.int32))
             full.deferred_count.assign(np.full(4, count, np.int32))
-            _launch_full(shadow, model, pipeline, begin, count, full)
+            _launch_full(shadow, model, pipeline, begin, full, threads=7)
             kernel = {f: getattr(results["kernel"], f).numpy() for f in ("count", "state", "q", "n", "d", "feature")}
             plain = {f: getattr(results["plain"], f).numpy() for f in ("count", "state", "q", "n", "d", "feature")}
             finished = {f: getattr(full, f).numpy() for f in ("count", "state", "q", "n", "d", "feature")}
@@ -1008,6 +1008,20 @@ def test_rejects_keep_the_plain_walk_rows(test, device):
                 for f in ("q", "n", "d", "feature"):
                     np.testing.assert_array_equal(kernel[f][rows], finished[f][rows], err_msg=f"{name} pair {i} {f}")
     test.assertGreater(walked, 200)
+
+
+@functools.cache
+def _point_ptx() -> str | None:
+    """The point module's PTX for sm_86 (NVRTC, any host), or ``None`` where NVRTC cannot compile for it."""
+    if 86 not in wp.get_cuda_supported_archs():
+        return None
+    with tempfile.TemporaryDirectory() as directory:
+        wp.compile_aot_module(terrain_law_point, arch=86, module_dir=directory, use_ptx=True)
+        paths = glob.glob(os.path.join(directory, "*.ptx"))
+        if len(paths) != 1:
+            raise RuntimeError(f"expected one PTX file, got {paths}")
+        with open(paths[0], encoding="latin-1") as f:
+            return f.read()
 
 
 class TestTerrainLawPoint(unittest.TestCase):
@@ -1104,16 +1118,32 @@ class TestTerrainLawPoint(unittest.TestCase):
 
         Every float32 operation then rounds as on the CPU, so the CPU decides every boundary as the GPU does.
         """
-        if 86 not in wp.get_cuda_supported_archs():
+        ptx = _point_ptx()
+        if ptx is None:
             self.skipTest("NVRTC cannot compile for sm_86 here")
-        with tempfile.TemporaryDirectory() as directory:
-            wp.compile_aot_module(terrain_law_point, arch=86, module_dir=directory, use_ptx=True)
-            paths = glob.glob(os.path.join(directory, "*.ptx"))
-            self.assertEqual(len(paths), 1)
-            with open(paths[0], encoding="latin-1") as f:
-                ptx = f.read()
         self.assertEqual(ptx.count("fma.rn"), 0)
         self.assertGreater(ptx.count("mul.rn.f32"), 100)
+
+    def test_full_finish_keeps_its_candidates_off_the_stack_cpu(self):
+        """Keep the full-finish kernel's per-thread local frame under 6 KB (its PTX local depot, sm_86, NVRTC).
+
+        The driver reserves local memory for the largest stack a context launches, for every thread the device can
+        hold (about 289,000 on a 188-SM GPU), launched or not. The kernel's candidate list and the finish's input live
+        in global scratch (:class:`~newton._src.geometry.terrain_shadow.TerrainFinishScratch`), and its walk and close
+        read rows there, not from copies of the list on the stack: the depot was 8,584 bytes before (10,088 bytes of
+        sm_120 stack, measured at +2.5 GB of device memory) and is 4,352 now; what remains is the finish's own.
+        """
+        ptx = _point_ptx()
+        if ptx is None:
+            self.skipTest("NVRTC cannot compile for sm_86 here")
+        depots = {}
+        for entry in re.finditer(r"\.entry (\w+)\(", ptx):
+            body = ptx[entry.end() : ptx.find("\n}\n", entry.end())]
+            depot = re.search(r"__local_depot\d+\[(\d+)\]", body)
+            depots[entry.group(1)] = int(depot.group(1)) if depot else 0
+        full = [size for name, size in depots.items() if name.startswith("terrain_point_rows_full_")]
+        self.assertEqual(len(full), 1, msg=depots)
+        self.assertLess(full[0], 6144, msg=depots)
 
 
 devices = get_test_devices()

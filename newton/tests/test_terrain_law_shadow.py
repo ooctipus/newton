@@ -17,6 +17,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.geometry import terrain_law_point
 from newton._src.geometry.terrain_contacts import (
     TERRAIN_LANE_THREAD,
     TERRAIN_LANE_TILE,
@@ -30,7 +31,7 @@ from newton._src.geometry.terrain_law import (
     TERRAIN_PAIR_TILE_EXIT,
 )
 from newton._src.geometry.terrain_law_point import TERRAIN_POINT_ROWS
-from newton._src.geometry.terrain_shadow import TERRAIN_LAW_KERNELS, parse_terrain_law_shadow
+from newton._src.geometry.terrain_shadow import TERRAIN_LAW_FULL_THREADS, TERRAIN_LAW_KERNELS, parse_terrain_law_shadow
 from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_test_utils as tu
 from newton.tests.unittest_utils import (
@@ -347,6 +348,30 @@ class TestTerrainLawShadow(unittest.TestCase):
         record = pipeline.get_collision_selection()["heightfield"]["law_shadow"]
         self.assertEqual(record, {"enabled": False, "reason": "Off: NEWTON_TERRAIN_LAW_SHADOW lists no partner class."})
         self.assertNotIn("NEWTON_TERRAIN_LAW_SHADOW", pipeline.get_collision_selection()["environment"]["applied"])
+
+    def test_full_finish_launch_is_a_fixed_grid_cpu(self):
+        """Launch the full-finish kernel with a fixed grid whatever the class's size, striding over the deferred list.
+
+        The deferred pairs are found on the device, during the collide; a grid of ``TERRAIN_LAW_FULL_THREADS`` threads
+        with its global scratch takes them in turn, so that a collide with nothing deferred costs one near-empty
+        launch instead of one thread per pair of the class (each of which, before, initialized the finish's locals).
+        """
+        model, _terrain = _mixed_scene("cpu")
+        pipeline = tu.shadow_pipeline(model, **PIPELINE)
+        shadow = pipeline._terrain_law_shadow
+        dims = []
+        launch = wp.launch
+
+        def record(kernel, *args, **kwargs):
+            if kernel is terrain_law_point.terrain_point_rows_full:
+                dims.append(kwargs["dim"])
+            return launch(kernel, *args, **kwargs)
+
+        with patch.object(wp, "launch", record):
+            _contacts(pipeline, model)
+        self.assertEqual(dims, [TERRAIN_LAW_FULL_THREADS])
+        self.assertLess(sum(shadow.describe()["pairs"]["point"].values()), TERRAIN_LAW_FULL_THREADS)
+        self.assertGreater(shadow.describe()["bytes"]["finish_scratch"], 0)
 
     def test_route_record_cpu(self):
         """Record the shadow's classes, pairs per lane class and memory in the collision selection."""

@@ -55,12 +55,15 @@ pair's distinct rows in its own slots (up to six, merged as the finish merges) a
 when the finish keeps them as they are: no plane group holds three of them (the finish's implied-row and per-group
 steps act on larger groups), they fit the eight slots and the candidates fit the finish's list. That is every
 recorded pair of the suite's rough scenes; any other pair is appended to a deferred list, and
-:func:`terrain_point_rows_full`, launched after them, walks it again into the full candidate list and runs the
-finish. Inlined into the walks, the finish took every thread to 255 registers and a 10 KB stack on sm_120; apart,
-the one-thread walk takes 128 registers (launch bounds of two 256-thread blocks per SM) and a 104-byte stack, the
-tiled walk 156 registers, and only deferred pairs, in full warps, pay for the finish. All three have the per-type
-kernel signature ``(begin, slot_begin, inputs, data, out)`` of
-:class:`~newton._src.geometry.terrain_law.TerrainPairInputs`.
+:func:`terrain_point_rows_full`, launched after them with a fixed grid that strides over the list, walks each pair
+again into the full candidate list and runs the finish. Inlined into the walks, the finish took every thread to 255
+registers and a 10 KB stack on sm_120; apart, the one-thread walk takes 128 registers (launch bounds of two
+256-thread blocks per SM) and a 152-byte stack, the tiled walk 164 registers, and only deferred pairs pay for the
+finish. The full-finish kernel keeps the candidate list and the finish's input in global scratch
+(:class:`~newton._src.geometry.terrain_shadow.TerrainFinishScratch`), so that its stack, which sets the driver's
+local-memory reservation for every thread the device holds, is the finish's own frame: 6.0 KB on sm_120 (10.1 KB
+with the list on the stack). The kernels take the per-type kernel arguments ``(begin, slot_begin, inputs, data,
+out)`` of :class:`~newton._src.geometry.terrain_law.TerrainPairInputs`, the full-finish kernel its scratch too.
 
 The module is compiled without floating-point contraction, as the cluster build is: every float32 operation
 rounds as on the CPU, so CPU tests decide every boundary, and a CPU census counts every row, as the GPU does.
@@ -91,7 +94,6 @@ from .terrain_law import (
     TerrainLawRows,
     TerrainPairInputs,
     TerrainPlanes,
-    TerrainRows,
     TerrainWindow,
     terrain_beyond,
     terrain_box_cells,
@@ -126,6 +128,7 @@ from .terrain_law import (
     terrain_window_point,
     terrain_window_vertex,
 )
+from .terrain_shadow import TerrainFinishScratch
 from .types import GeoType
 
 # Every float32 operation rounds as on the CPU (see the module docstring).
@@ -1061,23 +1064,53 @@ def terrain_point_rows_tiled(
     _close_pair(out, pair, slot, _wide(cells), held, candidates, data, window, planes, core, frame)
 
 
-@wp.kernel(enable_backward=False)
-def terrain_point_rows_full(
-    begin: int, slot_begin: int, inputs: TerrainPairInputs, data: TerrainFeatureData, out: TerrainLawRows
-):
-    """Finish the sphere and capsule pairs the other two kernels deferred (a plane group of three rows, more rows than
-    the slots, or more candidates than the list).
+@wp.func
+def _finish_candidate(scratch: TerrainFinishScratch, base: int, count: int, dropped: int, claim: _Claim):
+    """Append a claim's row to a full-finish thread's candidates (from ``base``; counted as dropped when full)."""
+    if count < _CANDIDATES:
+        scratch.q[base + count] = claim.q
+        scratch.k[base + count] = claim.k
+        scratch.n[base + count] = claim.n
+        scratch.d[base + count] = claim.d
+        scratch.feature[base + count] = claim.feature
+        return count + 1, dropped
+    return count, dropped + 1
 
-    Launched after them with one thread per pair of the point class; thread ``j`` takes the ``j``-th pair they
-    appended to the deferred list (the order is free: a pair's rows depend on the pair alone), so that the few
-    deferred pairs run in full warps. One thread walks the pair's window again into the full candidate list and runs
-    the law's finish (:func:`~newton._src.geometry.terrain_law.terrain_finish`: merge, implied rows, four rows per
-    plane group, at most :data:`TERRAIN_POINT_ROWS` rows, each group's deepest first on overflow).
+
+@wp.func
+def _finish_input(scratch: TerrainFinishScratch, thread: int, count: int, dropped: int):
+    """Copy a full-finish thread's candidates into its :class:`~newton._src.geometry.terrain_law.TerrainRows` record,
+    the finish's input (entries past ``count``, never read, keep earlier pairs' values)."""
+    base = thread * _CANDIDATES
+    scratch.rows[thread].count = count
+    scratch.rows[thread].dropped = dropped
+    for row in range(count):
+        q = scratch.q[base + row]
+        k = scratch.k[base + row]
+        n = scratch.n[base + row]
+        for j in range(3):
+            scratch.rows[thread].q[row, j] = q[j]
+            scratch.rows[thread].k[row, j] = k[j]
+            scratch.rows[thread].n[row, j] = n[j]
+        scratch.rows[thread].d[row] = scratch.d[base + row]
+        scratch.rows[thread].feature[row] = scratch.feature[base + row]
+
+
+@wp.func
+def _finish_deferred(
+    begin: int,
+    slot_begin: int,
+    inputs: TerrainPairInputs,
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+    scratch: TerrainFinishScratch,
+    thread: int,
+    pair: int,
+):
+    """Walk a deferred pair's window into the full candidate list (``thread``'s scratch) and run the law's finish.
+
+    In a function of its own, so that only a thread with a pair initializes the finish's locals.
     """
-    entry = wp.tid()
-    if entry >= out.deferred_count[_CLASS]:
-        return
-    pair = out.deferred[begin + entry]
     i = pair - begin
     _state, frame, heightfield, cells, a, b, segment, reach = _pair_setup(inputs, data, pair)
     r1 = cells[1]
@@ -1086,7 +1119,9 @@ def terrain_point_rows_full(
     eps = terrain_eps(terrain_window_extent(data, window, r1, c1, _core_extent(window, a, b)))
     planes = terrain_planes()
     planes, core = _pair_core(data, window, planes, a, b, segment, reach, eps)
-    rows = TerrainRows()
+    base = thread * _CANDIDATES
+    count = int(0)
+    dropped = int(0)
     exit_a = _Claim()
     exit_b = _Claim()
     items = _vertex_items(core)
@@ -1104,17 +1139,7 @@ def terrain_point_rows_full(
                     # With both ends outside: the axis's deepest crossing under a crease (_WITNESS).
                     exit_b = claim
                 elif claim.kind == _ROW:
-                    n = rows.count
-                    if n < _CANDIDATES:
-                        for j in range(3):
-                            rows.q[n, j] = claim.q[j]
-                            rows.k[n, j] = claim.k[j]
-                            rows.n[n, j] = claim.n[j]
-                        rows.d[n] = claim.d
-                        rows.feature[n] = claim.feature
-                        rows.count = n + 1
-                    else:
-                        rows.dropped = rows.dropped + 1
+                    count, dropped = _finish_candidate(scratch, base, count, dropped, claim)
     # G2 and G3: one exit per end inside the solid, after the window's rows.
     for end in range(2):
         if (end == 0 and core.below_a != 0) or (end == 1 and core.segment != 0 and core.below_b != 0):
@@ -1129,52 +1154,52 @@ def terrain_point_rows_full(
             else:
                 planes, claim = _exit_row(data, window, planes, k, end)
             if claim.kind != 0:
-                n = rows.count
-                if n < _CANDIDATES:
-                    for j in range(3):
-                        rows.q[n, j] = claim.q[j]
-                        rows.k[n, j] = claim.k[j]
-                        rows.n[n, j] = claim.n[j]
-                    rows.d[n] = claim.d
-                    rows.feature[n] = claim.feature
-                    rows.count = n + 1
-                else:
-                    rows.dropped = rows.dropped + 1
+                count, dropped = _finish_candidate(scratch, base, count, dropped, claim)
     # G3 for the axis interior: both ends outside, no axis exit, a crossing of the axis under a crease.
     witness = exit_b
     if core.segment != 0 and core.below_a == 0 and core.below_b == 0 and witness.kind != 0:
         axis_exit = bool(False)
-        for row in range(rows.count):
-            if (rows.feature[row] & 7) == _SLOT_AXIS and rows.d[row] < 0.0:
+        for row in range(count):
+            if (scratch.feature[base + row] & 7) == _SLOT_AXIS and scratch.d[base + row] < 0.0:
                 axis_exit = True
         if not axis_exit:
             planes, claim = _axis_recovery(data, window, planes, witness.q, witness.feature)
             if claim.kind != 0:
-                n = rows.count
-                if n < _CANDIDATES:
-                    for j in range(3):
-                        rows.q[n, j] = claim.q[j]
-                        rows.k[n, j] = claim.k[j]
-                        rows.n[n, j] = claim.n[j]
-                    rows.d[n] = claim.d
-                    rows.feature[n] = claim.feature
-                    rows.count = n + 1
-                else:
-                    rows.dropped = rows.dropped + 1
-    order, kept, flags = terrain_finish(rows, eps, _ROWS)
+                count, dropped = _finish_candidate(scratch, base, count, dropped, claim)
+    _finish_input(scratch, thread, count, dropped)
+    order, kept, flags = terrain_finish(scratch.rows[thread], eps, _ROWS)
     slot = slot_begin + i * _ROWS
     for kept_row in range(kept):
-        row = order[kept_row]
+        row = base + order[kept_row]
         terrain_store_row(
-            out,
-            slot + kept_row,
-            wp.vec3(rows.q[row, 0], rows.q[row, 1], rows.q[row, 2]),
-            wp.vec3(rows.n[row, 0], rows.n[row, 1], rows.n[row, 2]),
-            rows.d[row],
-            rows.feature[row],
-            window,
-            frame,
+            out, slot + kept_row, scratch.q[row], scratch.n[row], scratch.d[row], scratch.feature[row], window, frame
         )
     out.count[pair] = kept
     out.state[pair] = _wide(cells) | terrain_finish_state(flags)
     terrain_report(out.status, out.overflow, flags, True)
+
+
+@wp.kernel(enable_backward=False)
+def terrain_point_rows_full(
+    begin: int,
+    slot_begin: int,
+    inputs: TerrainPairInputs,
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+    scratch: TerrainFinishScratch,
+):
+    """Finish the sphere and capsule pairs the other two kernels deferred (a plane group of three rows, more rows than
+    the slots, or more candidates than the list).
+
+    Launched after them with :attr:`~newton._src.geometry.terrain_shadow.TerrainFinishScratch.threads` threads,
+    whatever the class's size: thread ``t`` takes the deferred pairs ``t``, ``t + threads``, ... (the order is free: a
+    pair's rows depend on the pair alone), so that an empty list costs a near-empty launch. One thread walks the
+    pair's window again into the full candidate list, in its scratch, and runs the law's finish
+    (:func:`~newton._src.geometry.terrain_law.terrain_finish`: merge, implied rows, four rows per plane group, at most
+    :data:`TERRAIN_POINT_ROWS` rows, each group's deepest first on overflow).
+    """
+    thread = wp.tid()
+    if thread >= scratch.threads:
+        return
+    for entry in range(thread, out.deferred_count[_CLASS], scratch.threads):
+        _finish_deferred(begin, slot_begin, inputs, data, out, scratch, thread, out.deferred[begin + entry])
