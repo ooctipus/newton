@@ -435,6 +435,24 @@ class TestContactUnitPoint(unittest.TestCase):
         self.assertGreater(out[3], 0.0)
         self.assertLess(point_residual(W, b, mu, out[:3]), 1.0e-6)
 
+    def test_unloaded_anchor_keeps_its_lifted_take_off(self):
+        """Keep an anchor's take-off where the friction its ring's load allows lifts a contact that approaches.
+
+        The anchor approaches at zero impulse (b_n = -0.59), but take-off's friction on the disk of radius mu L lifts
+        it (v_n = +0.015): held there, take-off solves its problem, as do a stick and a slide. The unit holds take-off,
+        so it takes off first whatever the sign of b_n.
+        """
+        W = np.array([[2.517729, 5.557, 1.210257], [5.557, 16.253022, -0.14214], [1.210257, -0.14214, 2.672388]])
+        b = np.array([-0.593628, -3.56885, 1.638922])
+        mu = 0.76469
+        ring_load = 0.613851
+        held = np.array([0.0, *take_off_friction(W, b, mu, ring_load)])
+        self.assertLess(point_residual(W, b, mu, held, ring_load=ring_load), 1.0e-9)
+        self.assertGreater(b[0] + W[0, 1:] @ held[1:], 0.01)
+        out = solve_points(point_problem(W, b, mu, ring_load=ring_load, current=held))[0]
+        np.testing.assert_allclose(out[:3], held, atol=1.0e-6)
+        self.assertEqual(out[3], -1.0)
+
     def test_anchor_takes_the_press_slide_of_the_larger_load(self):
         """Load an anchor whose take-off fails and whose only solution is a slide its friction presses down.
 

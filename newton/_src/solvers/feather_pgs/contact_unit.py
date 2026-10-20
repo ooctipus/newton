@@ -16,9 +16,11 @@ normal down, a Painleve-type non-uniqueness): the visit keeps the branch the
 unit holds.
 
 * take-off: no normal impulse, the friction of an anchor whose ring keeps a load
-  ``L`` on the disk of radius ``mu * L``; an unloaded unit tries it first, a
-  loaded unit after its loaded branches, keeping whichever of the two solutions
-  lies nearer its impulses in the W-norm;
+  ``L`` on the disk of radius ``mu * L``; an unloaded unit tries it first where
+  it may solve the problem (a contact that separates at zero impulse, or an
+  anchor holding friction, which its ring's load may let lift it), a loaded unit
+  after its loaded branches, keeping whichever of the two solutions lies nearer
+  its impulses in the W-norm;
 * the friction's own slide root: a friction on its disk's boundary resumes it
   first, by Newton on ``h(alpha) = |s| + mu g.s - mu S0`` from the root it
   implies. Every root lies in ``(0, |c| (1 + mu |g|) / (mu |S0|) - e_min)`` for
@@ -394,8 +396,9 @@ _UNIT = Template(r"""
             int takeoff = 0;
             const float load = on + L;
             const int unloaded = !(on > 0.0f);
-            // Take-off's friction, where take-off may solve the problem: a contact that separates at zero impulse.
-            if (L > 0.0f && bn >= 0.0f) {
+            // Take-off's friction, where take-off may solve the problem: a contact that separates at zero impulse, and
+            // an unloaded anchor holding friction, whose ring's load lets that friction lift it.
+            if (L > 0.0f && (bn >= 0.0f || (unloaded != 0 && (of1 != 0.0f || of2 != 0.0f)))) {
                 const ContactUnitFriction tf = friction(w11, w12, w22, b1, b2, L, 0.0f, 0.0f, mu, -1.0f, cap, L, of1,
                                                         of2, load, 0);
                 tfx = tf.friction0;
