@@ -49,30 +49,35 @@ unit holds.
 A resumed root's load answers the contact's approach (``S0``) with
 ``dS/dS0 = (d|s|/dalpha) / h'``: negative where ``h`` rises through zero (the
 middle one of several slides, and every press slide of the smaller load) and
-large where the friction's pressing nearly balances the normal stiffness. The
-exact solve repels the sweep from such a solution, so where that response is
-negative or above
-:data:`CONTACT_UNIT_SPLIT_GAIN` times the normal row's own, the unit takes its
-normal with the friction held, then the friction on that load's disk: the same
-solution, approached with the normal row's response, if the unit is loaded. A
-root whose normal impulse is negative (an anchor's load below ``L``), or a held
-friction under which the normal row would stop at a negative impulse, takes the
-exact solve instead, so the step never unloads an approaching contact. The
-friction is finally clamped to the disk of the final load, so the result is
-exactly feasible.
+large where the friction's pressing nearly balances the normal stiffness. Where
+that response is negative or above :data:`CONTACT_UNIT_SPLIT_GAIN` times the
+normal row's own, a loaded unit that holds the slide (its friction within
+:data:`CONTACT_UNIT_SPLIT_HOLD` of the root's) takes its normal with the
+friction held, then the friction on that load's disk, if that normal is
+loaded: the normal row's own response. A held solution stays put, as under the
+exact solve. The step stabilizes sweeps whose exact solves the coupling of units
+drives away from such a slide; a lone unit inside the hold nears a slide of gain
+``G`` by ``1 - 1/G`` per visit, to within the friction routine's tolerance
+amplified by ``G``, and leaves a slide of negative gain by ``1 + 1/|G|`` until
+the exact solve returns it. The friction is finally clamped to the disk of the
+final load, so the result is exactly feasible.
 
 A ring unit solves its normals by an active set over their proximally
 regularized block, from its loaded members, then each anchor by the point
 routine on the friction Schur complement from its current friction (two
-alternations for two anchors; a ring takes no press slide); a basis that loses a
-member restarts the anchors from their current friction. A member that depends
-on the basis and whose velocity agrees with the basis members' to within
-``1e-5`` of the ring's velocity scale holds its load: the velocities do not fix
-the split among such members, which the proximal step would move by their
-residuals over its weight. The alternation latch relaxes a unit whose load
-change keeps reversing, which every fixed point of the exact sweep survives: a
-unit whose exact solution equals its impulses does not move for any relaxation
-factor.
+alternations for two anchors; a ring takes no split step and no press slide);
+a basis that loses a member restarts the anchors from their current friction. A
+member that depends on the basis and whose velocity agrees with the basis
+members' to within ``1e-5`` of the ring's velocity scale holds its load: the
+velocities do not fix the split among such members, which the proximal step
+would move by their residuals over its weight. A ring therefore settles with
+such a member up to ``1e-5`` of its velocity scale from the basis velocities,
+and the split stays where it was: the fourth corner of a rigid planar face keeps
+its load (none from a cold start), so the face rests on three corners wherever
+they carry it, one of the solutions of the indeterminate problem. The
+alternation latch relaxes a unit whose load change keeps reversing, which every
+fixed point of the exact sweep survives: a unit whose exact solution equals its
+impulses does not move for any relaxation factor.
 
 The law is written once, as C++ text. :func:`get_unit_source` binds backend
 intrinsics around it: the CUDA binding is the device prelude
@@ -97,8 +102,11 @@ CONTACT_UNIT_RING_PASSES = 2
 CONTACT_UNIT_PROXIMAL = 1.0e-4
 """Proximal weight of a ring's normal block: SPD in float32 for coplanar faces, the same fixed point."""
 CONTACT_UNIT_SPLIT_GAIN = 8.0
-"""Largest load response of a resumed slide to the contact's approach, relative to the normal row's own, that keeps
-the exact solve; a larger or negative one takes the normal with the friction held, then the friction."""
+"""Largest load response of a held slide to the contact's approach, relative to the normal row's own, that keeps the
+exact solve; a larger or negative one takes the normal with the friction held, then the friction."""
+CONTACT_UNIT_SPLIT_HOLD = 1.0e-3
+"""Largest distance of a unit's friction from its resumed slide root, relative to the root's, at which the unit holds
+that slide: only a held slide takes the split step, any other friction the exact solve."""
 
 # The block a ring unit reads and writes, per world: its row-major Delassus block (12 x 12), the residuals with its
 # own impulses removed, its impulses, the solution and the two anchors' slide roots.
@@ -111,9 +119,9 @@ RING_BLOCK_SIZE = 192
 
 _UNIT = Template(r"""
     // split: the root's load answers the contact's approach with the wrong sign or above ${gain} times the normal
-    // row's own response, so the exact solve repels the sweep from it.
+    // row's own response, where the coupling of units can drive exact solves away from it.
     struct ContactUnitRoot { float s0, s1, alpha; int evaluations, split; };
-    // mode: 1 stick, 2 slide, 3 no load to slide on, 4 slide whose exact solve repels the sweep.
+    // mode: 1 stick, 2 slide, 3 no load to slide on, 4 held slide of such a gain (the split step).
     struct ContactUnitFriction { float friction0, friction1, alpha; int evaluations, mode; };
     struct ContactUnitSolution { float normal, friction0, friction1, alpha; int evaluations; };
     struct ContactUnitLatch { float weight, factor, change; };
@@ -323,7 +331,12 @@ _UNIT = Template(r"""
                     out.friction1 = -(vy * root.s0 + vx * root.s1);
                     out.alpha = root.alpha;
                     out.mode = 2;
-                    if (root.split != 0) out.mode = 4;
+                    // The split step is for a slide the unit holds: its friction within ${hold} of the root's.
+                    const float hx = root.s0 - px;
+                    const float hy = root.s1 - py;
+                    if (root.split != 0 && hx * hx + hy * hy <= ${hold2}f * (root.s0 * root.s0 + root.s1 * root.s1)) {
+                        out.mode = 4;
+                    }
                     return out;
                 }
             }
@@ -385,7 +398,8 @@ _UNIT = Template(r"""
         // solves its loaded branches first (its slide root, else stick, else slide) and, where take-off solves its
         // problem too, keeps whichever solution lies nearer its impulses in the W-norm. Where take-off does not solve
         // it and the friction must press the normal to carry load (S0 <= 0), the loaded branches include the press
-        // slide of the larger load. The solve returns the current impulses whenever they solve the problem. The
+        // slide of the larger load. The solve returns the current impulses whenever they solve the problem (a held
+        // slide whose load answers S0 with a gain outside (0, 8] takes the split step, which keeps it as well). The
         // returned alpha is the slide root, -1 for take-off and stick.
         static ${inline} ContactUnitSolution solve(float wnn, float w11, float w12, float w22, float wn1, float wn2,
                                                   float bn, float b1, float b2, float mu, float L, float alpha0, int cap,
@@ -422,8 +436,10 @@ _UNIT = Template(r"""
             if (r.mode == 4 && on > 0.0f && xn >= 0.0f && held > 0.0f) {
                 // A held slide whose load answers the contact's approach with the wrong sign, or more than 8 times the
                 // normal row alone, takes the normal with its current friction held, then the friction on that load's
-                // disk: the normal row's own response. A solution stays put, as under the exact solve. A root whose
-                // normal impulse is negative, or a held friction that would unload the normal, takes the exact solve.
+                // disk: the normal row's own response, which stabilizes a sweep whose exact solves the coupling of
+                // units drives away from such a slide. A solution stays put, as under the exact solve; a lone unit
+                // nears the slide by 1 - 1/gain per visit and leaves a slide of negative gain. A root whose normal
+                // impulse is negative, or a held friction that would unload the normal, takes the exact solve.
                 const float xs = held * inv;
                 const ContactUnitFriction q = friction(w11, w12, w22, b1 + wn1 * xs, b2 + wn2 * xs, xs + L, 0.0f, 0.0f,
                                                        mu, -1.0f, cap, xs + L, of1, of2, load, 0);
@@ -481,7 +497,6 @@ _UNIT = Template(r"""
                 tfx = tf.friction0;
                 tfy = tf.friction1;
             }
-
             out.friction0 = tfx;
             out.friction1 = tfy;
             return out;
@@ -798,7 +813,13 @@ def get_unit_source(*, cpu: bool = False) -> str:
             "min": "fminf",
             "abs": "fabsf",
         }
-    return _UNIT.substitute(bindings, gain=repr(CONTACT_UNIT_SPLIT_GAIN))
+    # Float literals for the C++ text (``8.0f``, ``1e-06f``), whatever the constants' Python types.
+    return _UNIT.substitute(
+        bindings,
+        gain=repr(float(CONTACT_UNIT_SPLIT_GAIN)),
+        hold=f"{float(CONTACT_UNIT_SPLIT_HOLD):g}",
+        hold2=f"{float(CONTACT_UNIT_SPLIT_HOLD) ** 2:.6g}",
+    )
 
 
 CONTACT_UNIT = DevicePrelude("contact_unit", get_unit_source())
@@ -851,8 +872,9 @@ def contact_unit_solve(
     bracket. The current impulses are returned whenever they solve the unit's problem, also where that problem has
     several solutions: an unloaded unit takes off first where take-off solves its problem, a loaded one solves its
     loaded branches first and keeps the nearer (in the W-norm) of that solution and take-off, and a current friction
-    on its disk's boundary first resumes its own slide root. An anchor whose take-off fails where its friction must
-    press its normal to carry load takes the press slide of the larger load.
+    on its disk's boundary first resumes its own slide root (a held slide whose gain asks for it takes the split
+    step, which keeps it as well). An anchor whose take-off fails where its friction must press its normal to carry
+    load takes the press slide of the larger load.
 
     Returns:
         The normal impulse, the two friction impulses, the slide root (-1 for take-off and stick) and the root

@@ -376,24 +376,32 @@ class TestContactUnitPoint(unittest.TestCase):
                 self.assertAlmostEqual(out[3], alpha, delta=1.0e-4 * alpha)
 
     def test_split_slide_takes_the_normal_with_its_friction_held(self):
-        """Step a slide whose load answers the contact's approach with the wrong sign by its normal row, friction held.
+        """Step a held slide whose load answers the contact's approach with the wrong sign by its normal row.
 
         The pressed contact's second slide is the middle root of its problem: its load falls as the contact approaches
-        (``dS/dS0`` about -29), and an exact solve repels the sweep from it. From a friction turned off that slide on
-        its disk, the unit takes the normal impulse that stops its normal row with that friction held, then the
-        friction on that load's disk; the exact solve would return the slide itself.
+        (``dS/dS0`` about -29). Held on it, a friction within CONTACT_UNIT_SPLIT_HOLD (1e-3) of the slide's (turned by
+        5e-4 rad on its disk) takes the normal impulse that stops its normal row with that friction held, then the
+        friction on that load's disk; the exact solve would return the slide itself. A friction turned beyond the hold
+        (0.05 rad) holds no slide and takes the exact solve.
         """
         W = np.array([[1.0, -0.7, -0.9], [-0.7, 0.69, 0.63], [-0.9, 0.63, 2.11]])
         b = np.array([0.02, -0.4, -0.2])
         mu = 1.2
-        _, x = slide_solutions(W, b, mu)[1]
-        turn = 0.05
-        f = np.array([[np.cos(turn), -np.sin(turn)], [np.sin(turn), np.cos(turn)]]) @ x[1:]
-        out = solve_points(point_problem(W, b, mu, current=(x[0], *f)))[0]
-        held = (-b[0] - W[0, 1:] @ f) / W[0, 0]
-        self.assertGreater(abs(held - x[0]), 1.0e-3)
-        self.assertAlmostEqual(out[0], held, delta=1.0e-6)
-        self.assertLessEqual(np.linalg.norm(out[1:3]), mu * out[0] * (1.0 + 1.0e-6))
+        alpha, x = slide_solutions(W, b, mu)[1]
+        for turn, split in ((5.0e-4, True), (0.05, False)):
+            f = np.array([[np.cos(turn), -np.sin(turn)], [np.sin(turn), np.cos(turn)]]) @ x[1:]
+            with self.subTest(turn=turn):
+                out = solve_points(point_problem(W, b, mu, current=(x[0], *f)))[0]
+                held = (-b[0] - W[0, 1:] @ f) / W[0, 0]
+                self.assertGreater(abs(held - x[0]), 1.0e-5)
+                self.assertLessEqual(np.linalg.norm(out[1:3]), mu * out[0] * (1.0 + 1.0e-6))
+                if split:
+                    self.assertAlmostEqual(out[0], held, delta=1.0e-7)
+                else:
+                    # The root converges within 2e-6 of h's terms, which its gain (29) amplifies in the impulses.
+                    self.assertLess(point_residual(W, b, mu, out[:3]), 1.0e-6)
+                    np.testing.assert_allclose(out[:3], x, atol=1.0e-4)
+                    self.assertAlmostEqual(out[3], alpha, delta=1.0e-3 * alpha)
 
     def test_press_slide_of_modest_gain_is_resumed_exactly(self):
         """Land a contact on the press slide its friction holds where that slide's gain needs no split step.

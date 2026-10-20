@@ -37,6 +37,7 @@ from newton._src.solvers.feather_pgs import contact_unit, contact_unit_sweeps, e
 from newton._src.solvers.feather_pgs import kernels as K
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_row_builders import launched_kernels
+from newton.tests.test_feather_pgs_contact_unit import slide_solutions
 
 wp.init()
 
@@ -68,6 +69,12 @@ J_ALTERNATING = np.array(
     ]
 )
 W0_ALTERNATING = np.array([-0.38, -0.44, -0.26, -0.09, -0.24, -0.15])
+
+# A point contact whose friction presses its normal down: it separates at zero impulse (S0 = -0.02) and has take-off
+# and two press slides, whose loads answer its approach with dS/dS0 = +35 (the larger load) and -29.
+W_PRESSED = np.array([[1.0, -0.7, -0.9], [-0.7, 0.69, 0.63], [-0.9, 0.63, 2.11]])
+B_PRESSED = np.array([0.02, -0.4, -0.2])
+MU_PRESSED = 1.2
 
 # The certified references that 256 sweeps started from them leave above an NCP residual of 1e-3 m/s, by update
 # and friction law (test_sweeps_from_a_reference_leave_only_the_recorded_ones).
@@ -131,6 +138,20 @@ def contact_system(normals, rhs, *, anchors, mu=1.0, dofs=3, ring=True):
         "parent": np.asarray(parent, np.int32),
         "mu": np.asarray(mus, np.float64),
         "group": np.where(np.asarray(rtype) == CONTACT, 0, -1),
+    }
+
+
+def point_unit_system(W, b, mu):
+    """One point contact from its 3x3 block (normal, tangent, tangent), its residual at zero impulse and coefficient."""
+    W = np.asarray(W, np.float64)
+    return {
+        "C": W,
+        "diag": np.diag(W).copy(),
+        "rhs": np.asarray(b, np.float64),
+        "rtype": np.array([CONTACT, FRICTION, FRICTION], np.int32),
+        "parent": np.array([-1, 0, 0], np.int32),
+        "mu": np.array([0.0, mu, mu]),
+        "group": np.array([0, -1, -1]),
     }
 
 
@@ -766,9 +787,10 @@ class TestContactUpdateReplica(unittest.TestCase):
         1.46) also admit take-off or a stick, and a branch order of take-off, stick, slide left 6 of the 12 point and 7
         of the 14 patch references here. The slide roots of these contacts, which a negative ``S0 = -b_n / W_nn``
         puts outside the bracket of a positive one, and roots the evaluation cap stops short from scratch, are resumed
-        from the held friction; a ring's coinciding normals (patch 2549, whose velocities agree to 8e-6 m/s) keep
-        their split, and a ring's anchors restart from their held friction after a wrong first basis (patch 1781).
-        Patch rings also run as anchor units (patch Stage A).
+        from the held friction (a held slide of gain outside (0, 8] takes the split step, which keeps it); a ring's
+        coinciding normals (patch 2549, whose velocities agree to 8e-6 m/s) keep their split, and a ring's anchors
+        restart from their held friction after a wrong first basis (patch 1781). Patch rings also run as anchor units
+        (patch Stage A).
         """
         for law in self.systems:
             tight = self.tight(law)
@@ -786,13 +808,16 @@ class TestContactUpdateReplica(unittest.TestCase):
 
         One sequential sweep keeps every reference, but its period-two cycle repels two of them (point 2114, patch
         2549) within 256 sweeps. The unit sweeps keep every reference, also where a unit's problem has several
-        solutions (test_reference_is_a_fixed_point_of_the_unit_sweep), and stay there. A slide whose load answers the
-        contact's approach with the wrong sign (the middle one of several slides) or more than 8 times its normal
-        row's own response repels an exact solve: without the normal-then-friction step such a unit takes, 256 sweeps
-        leave point 276, 308, 2053, 2069 and 1477 (the last one by its gain) and patch 260, 276, 1647 and 1663. On
-        1,500 bench systems per law of the same replica set, 256 unit sweeps from certified references leave 0 of
-        1,376 point and 1 of 1,112 patch ones (5 and 4 under the sequential sweep). Patch rings also run as anchor
-        units. A change of the law that alters these sets fails here and must record its measured sets.
+        solutions (test_reference_is_a_fixed_point_of_the_unit_sweep), and stay there. Exact solves of a slide whose
+        load answers the contact's approach with the wrong sign (the middle one of several slides) or more than 8
+        times its normal row's own response are driven away from it by the coupling of units: without the split step
+        a unit holding such a slide takes, 256 sweeps leave point 276, 308, 2053, 2069 and 1477 (the last one by its
+        gain) and patch 260, 276, 1647 and 1663; with that step only for frictions within 1e-4 of the slide instead of
+        1e-3, point 1477; only where the held friction is the root to its convergence tolerance, point 276 and 1477 and
+        patch 260, 1647 and 1663. On 1,500 bench systems per law of the same replica set, 256 unit sweeps from
+        certified references leave 0 of 1,376 point and 1 of 1,112 patch ones (5 and 4 under the sequential sweep).
+        Patch rings also run as anchor units. A change of the law that alters these sets fails here and must record
+        its measured sets.
         """
         for law in self.systems:
             tight = self.tight(law)
@@ -823,6 +848,42 @@ class TestContactUpdateReplica(unittest.TestCase):
                             self.assertLessEqual(residuals(system, history[-1])[0].max(), 1.0e-4)
                 with self.subTest(law=law, update=update, ring_units=ring_units):
                     self.assertGreaterEqual(stationary, 5)
+
+
+class TestContactUpdateSplitStep(unittest.TestCase):
+    """The split step of a held slide whose gain lies outside (0, 8], in the loop sweep of one contact."""
+
+    def test_lone_unit_lands_on_its_press_slides_and_stays(self):
+        """Land a lone contact on its press slides in one sweep; inside the hold, step by the normal row's response.
+
+        The pressed contact held on either press slide with its friction turned on its disk. Beyond the hold of
+        CONTACT_UNIT_SPLIT_HOLD (1e-3 of the slide's friction; a 0.02 rad turn) the exact solve lands on the slide in
+        one sweep (NCP below 1e-6). Inside it (2e-4 rad) the unit holds the slide, whose gain asks for the split step:
+        a lone unit then follows the normal row's response, nearing the slide of gain +35 by about 1 - 1/35 per sweep
+        (0.85 over 7 sweeps measured) and leaving the one of gain -29 by about 1 + 1/29 (1.23 over 7), until an exact
+        solve returns it. Every start stays within NCP 1e-5 of a solution for 256 sweeps.
+        """
+        system = point_unit_system(W_PRESSED, B_PRESSED, MU_PRESSED)
+        slides = slide_solutions(W_PRESSED, B_PRESSED, MU_PRESSED)
+        self.assertEqual(len(slides), 2)
+        for k, (_, x) in enumerate(slides):
+            for turn in (0.02, 2.0e-4):
+                rotation = np.array([[np.cos(turn), -np.sin(turn)], [np.sin(turn), np.cos(turn)]])
+                start = np.array([x[0], *(rotation @ x[1:])])
+                history = World([system]).sweep(256, "unit", start=[start], snapshots=True)[0]
+                distance = np.abs(history - x).max(axis=1)
+                ncp = np.array([residuals(system, lam)[0].max() for lam in history])
+                with self.subTest(slide=k, turn=turn):
+                    self.assertLess(ncp.max(), 1.0e-5)
+                    if turn > contact_unit.CONTACT_UNIT_SPLIT_HOLD:
+                        self.assertLess(ncp[0], 1.0e-6)
+                        self.assertLess(distance[0], 0.01 * np.abs(start - x).max())
+                    else:
+                        ratio = distance[7] / distance[0]
+                        if k == 0:
+                            self.assertTrue(0.7 < ratio < 0.95, ratio)
+                        else:
+                            self.assertTrue(1.1 < ratio < 1.4, ratio)
 
 
 class TestContactUpdateSolveState(unittest.TestCase):
