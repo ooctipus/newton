@@ -690,11 +690,11 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
             ({}, False, False, True, True, True, "1", False, "velocity-limit"),
             ({"_has_free_rigid_bodies": True}, False, False, False, True, True, "1", False, "free-body"),
             ({}, True, False, False, False, True, "1", False, "support table"),
-            ({}, True, False, False, True, False, "1", False, "shared memory"),
+            ({}, True, False, False, True, False, "1", False, "room for the triplet transaction"),
             ({}, True, False, False, True, True, "0", False, "opt-in"),
             # Point friction keeps its rule: triplets need the active-row scan.
             ({"_friction_anchors_enabled": False}, False, False, False, True, True, "1", False, "active-row scan"),
-            ({"_friction_anchors_enabled": False}, True, False, False, True, True, "1", True, "registers."),
+            ({"_friction_anchors_enabled": False}, True, False, False, True, True, "1", True, "point contacts fuse"),
         )
         for changes, active, split, velocity, table, fits, flag, admitted, phrase in cases:
             probe = SimpleNamespace(

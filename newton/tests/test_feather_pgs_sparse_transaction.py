@@ -274,7 +274,7 @@ class TestSingleStageTransaction(unittest.TestCase):
         Point friction keeps the staged transaction unless asked; either law reaches either form.
         """
         for capacity, blocks in product((256, 192, 128, 96, 48), (16, 14)):
-            bounds = contact_transaction_launch_bounds(capacity, blocks)
+            bounds = contact_transaction_launch_bounds(capacity, transaction_blocks=blocks)
             self.assertEqual(bounds, (64, 12 if capacity > 128 else blocks))
             with self.subTest(capacity=capacity, blocks=blocks):
                 kernels = {
@@ -304,6 +304,9 @@ class TestSingleStageTransaction(unittest.TestCase):
         for options in ({"contact_transaction": "fused"}, {"transaction_blocks": 12}):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 _get_pgs_solve_sparse_kernel(64, 18, 12, **TRIPLETS, **options)
+        # The block request is an option, so it is keyword-only.
+        with self.assertRaises(TypeError):
+            contact_transaction_launch_bounds(96, 14)
 
     def test_single_stage_sweep_reduces_once_from_records_cpu(self):
         """Reduce three residuals once from the record, without the staged metric cache, its capacity or walk.

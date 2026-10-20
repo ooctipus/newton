@@ -30,7 +30,7 @@ CONTACT_TRANSACTION_BLOCKS = (16, 14)
 """Minimum resident blocks a single-stage sweep of at most 128 rows may request; 16 is the default."""
 
 
-def contact_transaction_launch_bounds(max_constraints: int, transaction_blocks: int = 16) -> tuple[int, int]:
+def contact_transaction_launch_bounds(max_constraints: int, *, transaction_blocks: int = 16) -> tuple[int, int]:
     """Return the launch bounds of a single-stage triplet sweep: 64 threads, minimum blocks per SM.
 
     Above 128 rows, shared memory admits 12 blocks of two worlds; at or below,
@@ -177,7 +177,7 @@ def _get_pgs_solve_sparse_kernel(
         raise ValueError("sparse warm starting requires no independent free-body rows")
     if contact_transaction not in CONTACT_TRANSACTIONS:
         raise ValueError(f"contact_transaction must be one of {CONTACT_TRANSACTIONS}")
-    launch_bounds = contact_transaction_launch_bounds(M, transaction_blocks)
+    launch_bounds = contact_transaction_launch_bounds(M, transaction_blocks=transaction_blocks)
     # Only a sweep that can hold velocity-limit rows has a law to choose; the others share one variant.
     accumulated_limits = check_velocity_limit_law(velocity_limit_law) == "accumulated" and bool(velocity_limits or F)
     index_read = (

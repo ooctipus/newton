@@ -5822,7 +5822,7 @@ class SolverFeatherPGS(SolverBase):
                 blocks = self._sparse_transaction_request[1]
                 transaction_options["transaction_blocks"] = blocks
                 self._sparse_contact_transaction_launch_bounds = contact_transaction_launch_bounds(
-                    self.dense_max_constraints, blocks
+                    self.dense_max_constraints, transaction_blocks=blocks
                 )
                 # Static storage for graph capture: the builder writes the records of each step's
                 # triplets; linked sweeps add each anchor's ring members once per call.
@@ -6008,7 +6008,7 @@ class SolverFeatherPGS(SolverBase):
             split_candidate: Whether split mode sweeps the sparse rows.
             velocity_candidate: Whether the sweep carries joint velocity-limit rows.
             use_support_table: Whether rows read the shared support table.
-            fits: Whether the metric cache fits the row capacity and shared memory.
+            fits: Whether the selected triplet transaction fits the row capacity and shared memory.
         """
         if os.environ.get("FEATHER_PGS_SPARSE_CONTACT_TRIPLETS", "0") != "1":
             return False, "Off: FEATHER_PGS_SPARSE_CONTACT_TRIPLETS is an opt-in."
@@ -6021,14 +6021,14 @@ class SolverFeatherPGS(SolverBase):
         if not use_support_table:
             return False, "Requested, but triplets need the row support table."
         if not fits:
-            return False, "Requested, but row capacity or shared memory leaves no triplet cache."
+            return False, "Requested, but row capacity or shared memory leaves no room for the triplet transaction."
+        # contact_transaction_reason records how the admitted triplets update.
         if self._friction_anchors_enabled:
             sweep = "active-row scan" if active_rows else "full ordered sweep"
-            return True, (
-                f"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1: tangent metrics stay in registers; patch anchor units "
-                f"pool their ring loads in the {sweep}."
-            )
-        return True, "FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1: tangent metrics stay in registers."
+            where = f"patch anchor units pool their ring loads in the {sweep}"
+        else:
+            where = "point contacts fuse in the active-row scan"
+        return True, f"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1: {where}."
 
     def _request_sparse_contact_transaction(self) -> tuple[str, str]:
         """Return the transaction admitted contact triplets take (``"single"`` or ``"staged"``), and why.
