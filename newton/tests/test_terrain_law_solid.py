@@ -13,8 +13,8 @@ pass. Measured on this tree with the shadow unset (today's terrain route as the 
 * complete: 18 of 40 buried lying cylinders on rough terrain keep no contact, or one shallower than their deepest
   point, and 4 of 40 cylinders through an exposed cell (the per-cell cases of the cylinder query's exact LP
   reference) get none as deep as theirs;
-* exact geometry: random poses of every solid kind on rough, pitted and stepped terrain get rows shallower than their
-  separation (21 of 126 poses) or with normals outside the surface's normal cone (25 ghost rows).
+* exact geometry: random poses of every solid kind on rough, pitted and stepped terrain get a deepest row other than
+  their exact separation (34 of 126 poses) or rows with normals outside the surface's normal cone (25 ghost rows).
 
 The float32 rows equal the float64 law's (:mod:`newton.tests.terrain_law_reference`) on seam-adversarial placements
 up to 100 m out, but for rows the other side implies (:func:`~newton.tests.terrain_law_solid_utils.compare_solid_rows`).
@@ -436,18 +436,33 @@ def _exact_poses(rng, hf, count):
     return bodies
 
 
-def _exact_violations(hf, rows, shapes, bodies, *, step=0.003):
-    """Incomplete pairs (the deepest row shallower than a boundary sample's signed surface distance, when one lies
-    within the reach) and ghost rows (normal over 1 deg outside the surface's normal cone at the terrain point)."""
+SEPARATED_TOL = 5.0e-5
+"""A separated core's deepest row equals its exact separation within this [m] (DESIGN's check_solid)."""
+PENETRATING_TOL = 2.0e-5
+"""A penetrating core's deepest row is at least as deep as its deepest point, within this [m]."""
+
+
+def _exact_violations(hf, rows, shapes, bodies):
+    """Incomplete pairs and ghost rows against exact geometry (DESIGN's check_solid).
+
+    Against the core's exact separation ``s`` (:func:`~newton.tests.terrain_law_solid_utils.refined_separation`)
+    when within the reach: separated, the deepest row must equal ``s`` (:data:`SEPARATED_TOL`; a deeper row is
+    stricter than the surface); penetrating, it must be at least as deep (:data:`PENETRATING_TOL`). A ghost row's
+    normal lies over 1 deg outside the surface's normal cone at its terrain point.
+    """
     incomplete, ghosts = [], []
     for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
         core = ref.make_core(kind, dims, pose)
         got = rows.get(shape, [])
-        separation = su.sampled_separation(hf, core, step=step)
+        separation = su.refined_separation(hf, core)
         if separation <= su.REACH - 1.0e-4:
             deepest = min((g[2] for g in got), default=np.inf)
-            if deepest > separation + 2.0e-5:
-                incomplete.append(f"{kind} at {np.round(pose[:3], 4).tolist()}: {deepest} > {separation}")
+            if separation > 0.0:
+                bad = abs(deepest - separation) > SEPARATED_TOL
+            else:
+                bad = deepest > separation + PENETRATING_TOL
+            if bad:
+                incomplete.append(f"{kind} at {np.round(pose[:3], 4).tolist()}: {deepest} against {separation}")
         for g in got:
             angle = su.normal_cone_angle(hf, g[0], g[1])
             if np.isfinite(angle) and angle > GHOST_ANGLE:
@@ -465,9 +480,10 @@ def _exact_scenes(device, count):
 
 
 def test_solid_rows_are_complete_and_free_of_ghosts(test, device):
-    """Keep every solid's deepest row at least as deep as its boundary's signed distance to the surface (when within
-    reach), and every normal inside the surface's normal cone (check_solid): boxes, cylinders, cones, ellipsoids, a
-    bevelled sole and a random hull on rough, pitted and stepped terrain."""
+    """Give every solid within reach a deepest row equal to its exact separation (as deep as its deepest point when
+    penetrating), and every normal inside the surface's normal cone (check_solid): boxes, cylinders, cones,
+    ellipsoids, a bevelled sole and a random hull on rough, pitted and stepped terrain, the lowest point 5 mm into to
+    25 mm above the terrain."""
     for name, hf, model, _hfield, shapes, bodies in _exact_scenes(device, 6):
         with test.subTest(terrain=name):
             pipeline, _contacts, _state = _collide(model, shadow=True)

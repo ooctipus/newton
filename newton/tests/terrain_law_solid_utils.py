@@ -333,6 +333,118 @@ def sampled_separation(hf: ref.ReferenceHeightfield, core, *, step=0.002) -> flo
     return float(signed_surface_distance(hf, boundary_samples(core, step)).min())
 
 
+def _fan_patch(a, b, c):
+    """Triangle ``abc`` over the unit square (``u + v > 1`` folded back), its sides' lengths as the patch's scales."""
+
+    def fn(u, v):
+        fold = u + v > 1.0
+        uu = np.where(fold, 1.0 - u, u)
+        vv = np.where(fold, 1.0 - v, v)
+        return a[None] + uu[:, None] * (b - a)[None] + vv[:, None] * (c - a)[None]
+
+    return fn, float(np.linalg.norm(b - a)), float(np.linalg.norm(c - a))
+
+
+def boundary_patches(core) -> list:
+    """A core's boundary as parametric patches over the unit square: ``(fn, su, sv)``, ``fn(u, v)`` the points (world)
+    and ``su``, ``sv`` the lengths the parameters span [m]. Their union is the boundary, edges and vertices included."""
+    kind = core.kind
+    patches = []
+    if kind in ("box", "hull"):
+        verts = core.verts
+        for face, normal in zip(core.faces, core.fnormals, strict=True):
+            loop = verts[face]
+            centre = loop.mean(axis=0)
+            e1 = loop[0] - centre
+            e1 = e1 / max(float(np.linalg.norm(e1)), 1.0e-12)
+            e2 = np.cross(normal, e1)
+            loop = loop[np.argsort(np.arctan2((loop - centre) @ e2, (loop - centre) @ e1))]
+            for i in range(len(loop)):
+                patches.append(_fan_patch(centre, loop[i], loop[(i + 1) % len(loop)]))
+        return patches
+    if kind == "ellipsoid":
+
+        def shell(u, v):
+            th, ph = np.pi * u, 2.0 * np.pi * v
+            unit = np.stack([np.sin(th) * np.cos(ph), np.sin(th) * np.sin(ph), np.cos(th)], -1)
+            return core.c + (unit * core.s) @ core.R.T
+
+        smax = float(core.s.max())
+        return [(shell, np.pi * smax, 2.0 * np.pi * smax)]
+    ax = core.axis
+    w1, w2 = ref._disk_basis(ax)
+
+    def ring(u):
+        th = 2.0 * np.pi * u
+        return np.cos(th)[:, None] * w1[None] + np.sin(th)[:, None] * w2[None]
+
+    if kind == "cylinder":
+        patches.append(
+            (
+                lambda u, v: core.c + ((2.0 * v - 1.0) * core.h)[:, None] * ax + core.r * ring(u),
+                2 * np.pi * core.r,
+                2 * core.h,
+            )
+        )
+        for sign in (-1.0, 1.0):
+            patches.append(
+                (
+                    lambda u, v, sign=sign: core.c + sign * core.h * ax + (core.r * v)[:, None] * ring(u),
+                    2 * np.pi * core.r,
+                    core.r,
+                )
+            )
+        return patches
+    # cone: the lateral surface from the base rim (v = 0) to the apex (v = 1), and the base disk
+    slant = math.hypot(core.r, 2.0 * core.h)
+    patches.append(
+        (
+            lambda u, v: core.base + v[:, None] * (core.apex - core.base) + ((1.0 - v) * core.r)[:, None] * ring(u),
+            2 * np.pi * core.r,
+            slant,
+        )
+    )
+    patches.append((lambda u, v: core.base + (core.r * v)[:, None] * ring(u), 2 * np.pi * core.r, core.r))
+    return patches
+
+
+def refined_separation(hf: ref.ReferenceHeightfield, core, *, step=0.003, levels=3) -> float:
+    """A core's exact signed separation from the surface (minus the deepest point's depth when penetrating), within
+    about a micrometre: the boundary patches (:func:`boundary_patches`) sampled about ``step`` apart, then each patch
+    that can hold the minimum refined around its four best samples on 9 x 9 grids, each level a quarter of the last
+    one's span (as the symptom bench's exact separation does)."""
+    patches = []
+    best = math.inf
+    for fn, su, sv in boundary_patches(core):
+        nu, nv = int(np.ceil(su / step)) + 1, int(np.ceil(sv / step)) + 1
+        u, v = np.meshgrid(_grid(nu), _grid(nv), indexing="ij")
+        u, v = u.ravel(), v.ravel()
+        patches.append((fn, u, v, 1.0 / (nu - 1), 1.0 / (nv - 1)))
+    values = signed_surface_distance(hf, np.concatenate([fn(u, v) for fn, u, v, _du, _dv in patches]))
+    best = float(values.min())
+    first = 0
+    g = np.linspace(-1.0, 1.0, 9)
+    for fn, u, v, du, dv in patches:
+        pruned = values[first : first + len(u)]
+        first += len(u)
+        # a patch whose samples all lie more than its spacing above the best cannot hold a lower point
+        if pruned.min() > best + step:
+            continue
+        order = np.argsort(pruned)[:4]
+        exact = signed_surface_distance(hf, fn(u[order], v[order]), prune=False)
+        best = min(best, float(exact.min()))
+        cu, cv = u[order], v[order]
+        for level in range(levels):
+            span_u, span_v = du / (4.0**level), dv / (4.0**level)
+            uu = np.clip(cu[:, None, None] + g[None, :, None] * span_u, 0.0, 1.0).repeat(9, axis=2).reshape(-1)
+            vv = np.clip(cv[:, None, None] + g[None, None, :] * span_v, 0.0, 1.0).repeat(9, axis=1).reshape(-1)
+            vals = signed_surface_distance(hf, fn(uu, vv), prune=False)
+            best = min(best, float(vals.min()))
+            keep = np.argsort(vals)[:4]
+            cu, cv = uu[keep], vv[keep]
+    return best
+
+
 def _nnls(A, b, *, iterations=200):
     """Non-negative least squares (Lawson-Hanson active set) for small dense problems."""
     m = A.shape[1]
