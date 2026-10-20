@@ -792,6 +792,10 @@ def test_tiled_kernel_matches_one_thread_kernel(test, device):
 # the kernels' rejects against the plain walk
 # ----------------------------------------------------------------------------------------------------------------
 
+# The plain walk compiles here, with the point module's functions it calls: without contraction, as that module
+# compiles, so that it rounds as the kernels do on CUDA too.
+wp.set_module_options({"fuse_fp": False})
+
 _Claim = terrain_law_point._Claim
 _PLAIN_ROWS = wp.constant(terrain_law_point.TERRAIN_POINT_ROWS)
 _PLAIN_HELD = wp.constant(int(terrain_law_point._HELD))
