@@ -136,6 +136,12 @@ FLAGS = declare(
         "Multiplier of the contact-build thread budget (default 1).",
     ),
     _flag(
+        "FEATHER_PGS_CONTACT_UPDATE",
+        "policy",
+        _SOLVER,
+        "sequential or unit overrides the contact_update argument (unset: the argument).",
+    ),
+    _flag(
         "FEATHER_PGS_DEBUG_CACHE",
         "diagnostic",
         _SOLVER,
