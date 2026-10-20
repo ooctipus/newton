@@ -19,6 +19,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION as FRICTION,
 )
+from newton._src.solvers.feather_pgs.sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
 from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel
 from newton.solvers import SolverFeatherPGS
@@ -27,9 +28,11 @@ from newton.tests.test_feather_pgs_sparse_research_admission import _branched_mo
 from newton.tests.test_feather_pgs_sparse_solver import _build_model, _make_solver
 
 CANDIDATE_OPTIONS = {"contact_triplets": True}
+# Both triplet transactions of the paired law: the staged one and the single-stage one.
+TRANSACTIONS = ("staged", "single")
 
 
-def factory(capacity, dofs, width, *, candidate=True, active=True, linked=False):
+def factory(capacity, dofs, width, *, candidate=True, active=True, linked=False, transaction="auto"):
     return _get_pgs_solve_sparse_kernel(
         capacity,
         dofs,
@@ -37,7 +40,7 @@ def factory(capacity, dofs, width, *, candidate=True, active=True, linked=False)
         active_rows=active,
         use_support_table=True,
         linked_rows=linked,
-        **(CANDIDATE_OPTIONS if candidate else {}),
+        **({**CANDIDATE_OPTIONS, "contact_transaction": transaction} if candidate else {}),
     )
 
 
@@ -50,6 +53,33 @@ def pair_metric(a, c, d):
     vx, vy = (largest - d, c) if a >= d else (c, largest - a)
     norm = np.hypot(vx, vy)
     return (largest, smallest, vx / norm, vy / norm) if norm > 0.0 else (largest, smallest, 1.0, 0.0)
+
+
+def contact_records(data, *, linked=False):
+    """Return the block records the sparse contact builder writes for every contact triplet of ``data``.
+
+    The single-stage transaction reads them; the ring members of a linked sweep are its own.
+    """
+    worlds, capacity, _ = data["row_factor"].shape
+    dofs = data["reference_factor_delta"].shape[1]
+    records = np.zeros((worlds, capacity // 3, CONTACT_RECORD_FLOATS + CONTACT_RING_FLOATS * linked), np.float32)
+    for world, count in enumerate(data["world_constraint_count"]):
+        kinds = data["row_type"][world]
+        for row in range(int(count) - 2):
+            if (kinds[row], kinds[row + 1], kinds[row + 2]) != (CONTACT, FRICTION, FRICTION):
+                continue
+            rows = np.zeros((3, dofs))
+            for k in range(3):
+                indices = data["support_class_dof"][data["support_row_class"][world, row + k]]
+                valid = indices >= 0
+                rows[k, indices[valid]] = data["row_factor"][world, row + k, valid]
+            block = rows @ rows.T
+            diagonal = data["diagonal"][world, row : row + 3].astype(np.float64)
+            # A normal without a positive diagonal keeps the ordinary update; its record is never read.
+            inverse = 1.0 / diagonal[0] if diagonal[0] > 0.0 else 0.0
+            records[world, row // 3, :4] = (block[0, 1], block[0, 2], block[1, 2], inverse)
+            records[world, row // 3, 4:8] = pair_metric(diagonal[1], block[1, 2], diagonal[2])
+    return records
 
 
 def fixture(*, offset=0, activity=None, seeded=False, omega=1.0, delay=0, iteration_offset=0, linked=False):
@@ -130,14 +160,28 @@ def fixture(*, offset=0, activity=None, seeded=False, omega=1.0, delay=0, iterat
 
 
 class DeviceSolve:
-    """One ABI adapter shared by synthetic and preserved actual-input tests."""
+    """One ABI adapter shared by synthetic and preserved actual-input tests.
 
-    def __init__(self, data, *, candidate, device="cuda:0", active=True, linked=False):
+    A single-stage triplet kernel also reads the triplets' block records
+    (:func:`contact_records`), which follow the scalar inputs.
+    """
+
+    def __init__(self, data, *, candidate, device="cuda:0", active=True, linked=False, transaction="auto"):
         self.device = wp.get_device(device)
         self.data = data
+        self.linked = linked
         self.worlds, self.capacity, self.width = data["row_factor"].shape
         self.dofs = data["reference_factor_delta"].shape[1]
-        self.kernel = factory(self.capacity, self.dofs, self.width, candidate=candidate, active=active, linked=linked)
+        self.kernel = factory(
+            self.capacity,
+            self.dofs,
+            self.width,
+            candidate=candidate,
+            active=active,
+            linked=linked,
+            transaction=transaction,
+        )
+        self.records = None
 
         def array(value, dtype=float):
             return wp.array(value, dtype=dtype, device=self.device)
@@ -182,6 +226,19 @@ class DeviceSolve:
             int(data["friction_start_iteration"]),
             int(data["iteration_offset"]),
         ]
+        if "contact_records" in self.kernel.adj.arg_types:
+            self.records = array(contact_records(data, linked=self.linked))
+            self.inputs.append(self.records)
+
+    @property
+    def single_stage(self):
+        """Whether the kernel takes the single-stage triplet transaction."""
+        return self.records is not None
+
+    def rebuild_records(self, data):
+        """Write the records of changed rows, as the contact builder does each step."""
+        if self.records is not None:
+            self.records.assign(contact_records(data, linked=self.linked))
 
     def launch(self):
         wp.launch_tiled(
@@ -412,7 +469,7 @@ class TestSparseContactTriplets(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires root-owned CUDA lease")
     def test_eight_sweep_physical_reference_cuda(self):
-        """Preserve the ordered physical solve across contact activation and friction cases."""
+        """Preserve the ordered physical solve across contact activation and friction cases, in both transactions."""
         cases = (
             [{"offset": value, "seeded": True} for value in (0, 29, 30, 184)]
             + [
@@ -428,10 +485,12 @@ class TestSparseContactTriplets(unittest.TestCase):
             + [{"omega": value, "seeded": True} for value in (0.0, 0.7, 1.2, -0.5)]
             + [{"delay": 3, "iteration_offset": value, "seeded": True} for value in (0, 1, 4)]
         )
-        for settings in cases:
-            with self.subTest(settings=settings):
+        for settings, transaction in product(cases, TRANSACTIONS):
+            with self.subTest(settings=settings, transaction=transaction):
                 data, physical = fixture(**settings)
-                control, candidate = DeviceSolve(data, candidate=False), DeviceSolve(data, candidate=True)
+                control = DeviceSolve(data, candidate=False)
+                candidate = DeviceSolve(data, candidate=True, transaction=transaction)
+                self.assertEqual(candidate.single_stage, transaction == "single")
                 control.launch()
                 candidate.launch()
                 result = candidate.result()
@@ -502,22 +561,28 @@ class TestSparseContactTriplets(unittest.TestCase):
             "expected_velocity": velocity,
             "expected_impulse": impulses,
         }
-        control, candidate = DeviceSolve(data, candidate=False), DeviceSolve(data, candidate=True)
+        control = DeviceSolve(data, candidate=False)
         control.launch()
-        candidate.launch()
-        assert_output(self, data, *candidate.result(), physical=physical, reference=control.result())
+        for transaction in TRANSACTIONS:
+            with self.subTest(transaction=transaction):
+                candidate = DeviceSolve(data, candidate=True, transaction=transaction)
+                candidate.launch()
+                assert_output(self, data, *candidate.result(), physical=physical, reference=control.result())
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires root-owned CUDA lease")
     def test_finite_fallback_and_distinct_live_worlds_cuda(self):
-        """Keep legal fallback rows and isolate each world's cached metric."""
-        for mode in (
-            "two_live_slots",
-            "zero_normal_diag",
-            "negative_normal_diag",
-            "tail_normal",
-            "different_normal_support",
+        """Keep legal fallback rows and isolate each world's cached metric, in both transactions."""
+        for mode, transaction in product(
+            (
+                "two_live_slots",
+                "zero_normal_diag",
+                "negative_normal_diag",
+                "tail_normal",
+                "different_normal_support",
+            ),
+            TRANSACTIONS,
         ):
-            with self.subTest(mode=mode):
+            with self.subTest(mode=mode, transaction=transaction):
                 data, _ = fixture(seeded=True)
                 count = int(data["world_constraint_count"][0])
                 # Both warps of block0 must be live and physically different.
@@ -545,16 +610,23 @@ class TestSparseContactTriplets(unittest.TestCase):
                     data["row_factor"][:, 1, -1] = 0.0
                     data["diagonal"][:, 1] = np.sum(data["row_factor"][:, 1] ** 2, axis=1) + 1e-6
                     self.assertTrue(np.all(data["support_row_class"][:, 2:4] == 0))
-                control, candidate = DeviceSolve(data, candidate=False), DeviceSolve(data, candidate=True)
+                control = DeviceSolve(data, candidate=False)
+                candidate = DeviceSolve(data, candidate=True, transaction=transaction)
                 control.launch()
                 candidate.launch()
                 assert_output(self, data, *candidate.result(), reference=control.result())
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires root-owned CUDA lease")
     def test_graph_empty_regrow_changed_metric_cuda(self):
-        """Reset cached metrics as captured buffers change count, response and CFM."""
+        """Reset cached metrics or rewrite records as captured buffers change count, response and CFM."""
+        for transaction in TRANSACTIONS:
+            with self.subTest(transaction=transaction):
+                self._check_graph_empty_regrow(transaction)
+
+    def _check_graph_empty_regrow(self, transaction):
         data, _ = fixture(offset=30, seeded=True)
-        control, candidate = DeviceSolve(data, candidate=False), DeviceSolve(data, candidate=True)
+        control = DeviceSolve(data, candidate=False)
+        candidate = DeviceSolve(data, candidate=True, transaction=transaction)
         control.launch()
         candidate.launch()
         with wp.ScopedCapture(device=candidate.device) as captured:
@@ -575,6 +647,8 @@ class TestSparseContactTriplets(unittest.TestCase):
                     (8, "row_incident"),
                 ):
                     runner.inputs[slot].assign(data[key])
+                # The contact builder rewrites the records with the rows each step.
+                runner.rebuild_records(data)
                 runner.reset_impulses()
             control.launch()
             wp.capture_launch(captured.graph)
@@ -585,7 +659,10 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
     """Fuse patch anchor units, pooling their ring loads, in the linked active and full sweeps."""
 
     def test_linked_factory_cpu(self):
-        """Admit ring-linked normals to the transaction in either sweep, and keep point variants unlinked."""
+        """Admit ring-linked normals to the transaction in either sweep, and keep point variants unlinked.
+
+        The staged transaction is the default; the single-stage one is reachable on request.
+        """
         options = {"use_support_table": True, "contact_triplets": True}
         active = _get_pgs_solve_sparse_kernel(192, 12, 12, active_rows=True, linked_rows=True, **options)
         full = _get_pgs_solve_sparse_kernel(192, 12, 12, linked_rows=True, **options)
@@ -593,6 +670,9 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
         self.assertTrue(active.key.endswith("_active_support_table_contact_triplets_linked"))
         self.assertTrue(full.key.endswith("_0_0_support_table_contact_triplets_linked"))
         self.assertTrue(point.key.endswith("_active_support_table_contact_triplets"))
+        options["contact_transaction"] = "single"
+        single = _get_pgs_solve_sparse_kernel(192, 12, 12, active_rows=True, linked_rows=True, **options)
+        self.assertTrue(single.key.endswith("_active_support_table_contact_triplets_single12_linked"))
         # Point friction fuses only in the active sweep, and nothing fuses without support tables.
         for unfused in ({"use_support_table": True}, {"active_rows": True, "linked_rows": True}):
             with self.subTest(options=unfused):
@@ -639,7 +719,7 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_linked_triplets_equal_linked_sweeps_bitwise_cuda(self):
-        """Match the same linked sweep without triplets bitwise, and the ring-pooled physical reference.
+        """Match the same linked sweep without triplets bitwise (staged) or to rounding (single), and the reference.
 
         Self-loops, two- and three-member rings, four- and six-member rings loaded only
         through their last member, a four-member loaded ring whose sliding anchors' radii
@@ -650,7 +730,9 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
         the full sweep. The six-member rings catch a fused radius, in either sweep, or a
         pair selection that stops after up to five members. A relative change tolerance
         ends sweeps early on the same decisions: the normal bounds its change by its new
-        impulse and the pair by its new first tangent, as their ordinary updates do.
+        impulse and the pair by its new first tangent, as their ordinary updates do. The
+        single-stage transaction rounds differently, so under the tolerance it may stop a
+        sweep apart; its impulses must then still act through their own responses.
         """
         settings = (
             {},
@@ -660,28 +742,37 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
             {"seeded": True, "omega": -0.5},
         )
         early_exits = 0
-        for (name, layout), pad, options, active, relative in product(
-            _LINKED_LAYOUTS.items(), (0, 30), settings, (True, False), (0.0, 0.05)
+        for (name, layout), pad, options, active, relative, transaction in product(
+            _LINKED_LAYOUTS.items(), (0, 30), settings, (True, False), (0.0, 0.05), TRANSACTIONS
         ):
-            with self.subTest(layout=name, pad=pad, active=active, relative=relative, **options):
+            with self.subTest(
+                layout=name, pad=pad, active=active, relative=relative, transaction=transaction, **options
+            ):
                 data, physical = linked_fixture(layout, pad=pad, active=active, **options)
                 data["relative_change_tolerance"] = relative
                 control = DeviceSolve(data, candidate=False, active=active, linked=True)
-                candidate = DeviceSolve(data, candidate=True, active=active, linked=True)
-                self.assertIn("_contact_triplets_linked", candidate.kernel.key)
+                candidate = DeviceSolve(data, candidate=True, active=active, linked=True, transaction=transaction)
+                self.assertIn("_contact_triplets", candidate.kernel.key)
+                self.assertTrue(candidate.kernel.key.endswith("_linked"))
+                self.assertEqual(candidate.single_stage, transaction == "single")
                 self.assertNotIn("_contact_triplets", control.kernel.key)
                 control.launch()
                 candidate.launch()
                 delta, impulses = candidate.result()
-                np.testing.assert_array_equal(delta, control.result()[0])
-                np.testing.assert_array_equal(impulses, control.result()[1])
+                if transaction == "staged":
+                    np.testing.assert_array_equal(delta, control.result()[0])
+                    np.testing.assert_array_equal(impulses, control.result()[1])
+                elif not relative:
+                    assert_output(self, data, delta, impulses, reference=control.result())
                 if relative:
                     # The eight-sweep oracle does not apply once the tolerance ends a solve early.
-                    every_sweep = DeviceSolve(
-                        {**data, "relative_change_tolerance": 0.0}, candidate=False, active=active, linked=True
-                    )
-                    every_sweep.launch()
-                    early_exits += not np.array_equal(every_sweep.result()[1], impulses)
+                    if transaction == "staged":
+                        every_sweep = DeviceSolve(
+                            {**data, "relative_change_tolerance": 0.0}, candidate=False, active=active, linked=True
+                        )
+                        every_sweep.launch()
+                        early_exits += not np.array_equal(every_sweep.result()[1], impulses)
+                    assert_output(self, data, delta, impulses)
                     continue
                 # The oracle pools each ring as the ordinary update does; a fused radius
                 # without the ring would leave it.

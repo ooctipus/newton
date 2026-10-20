@@ -3,6 +3,7 @@
 
 """Ordered PGS over ancestor-sparse, mass-whitened constraint rows."""
 
+import textwrap
 from functools import cache
 
 import warp as wp
@@ -15,13 +16,31 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
-from .row_inputs import make_row_kernel
+from .row_inputs import RowArgument, make_row_kernel
 from .solve_policy import EXACT_POLICY, SolvePolicy, sweep_exit, vote
+from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport
 from .velocity_limit_law import accumulated_impulse, accumulated_update, check_velocity_limit_law
 
 _SPARSE_CONTACT_METRIC_CACHE_SIZE = 12
 _SPARSE_LOCAL_WORKSPACE_BYTES = 8 * 1024
+CONTACT_TRANSACTIONS = ("auto", "single", "staged")
+"""Triplet transactions of the sparse sweep; ``auto`` is each law's default, ``staged``."""
+
+
+def contact_transaction_launch_bounds(max_constraints: int, transaction_blocks: int = 16) -> tuple[int, int]:
+    """Return the launch bounds of a single-stage triplet sweep: 64 threads, minimum blocks per SM.
+
+    Above 128 rows, shared memory admits 12 blocks of two worlds; at or below,
+    ``transaction_blocks`` (14 or 16) sets the register budget.
+
+    Args:
+        max_constraints: Row capacity per world.
+        transaction_blocks: Minimum resident blocks requested at or below 128 rows.
+    """
+    if transaction_blocks not in (14, 16):
+        raise ValueError("transaction_blocks must be 14 or 16")
+    return 64, 12 if int(max_constraints) > 128 else int(transaction_blocks)
 
 
 @cache
@@ -42,6 +61,8 @@ def _get_pgs_solve_sparse_kernel(
     linked_rows: bool = False,
     velocity_limit_law: str = "stateless",
     solve_policy: SolvePolicy = EXACT_POLICY,
+    contact_transaction: str = "auto",
+    transaction_blocks: int = 16,
 ) -> wp.Kernel:
     """Build a CUDA sweep over factored articulations and physical free bodies.
 
@@ -85,6 +106,24 @@ def _get_pgs_solve_sparse_kernel(
     the active or the full sweep: its radius pools the ring from the new
     normal on, in the order the ordinary pair update pools it, and its early
     exit tests each change as the ordinary updates do.
+
+    ``contact_transaction`` selects how an admitted triplet updates under that
+    law. ``"staged"`` is the transaction above: the normal's load and
+    reduction, then its tangents', with the metric cache. ``"single"`` loads
+    the three rows, the triplet's record and its friction coefficient in one
+    group and reduces the three residuals together. The record, which the
+    sparse contact builder writes (``contact_records``, see
+    :data:`~.sparse_contact.CONTACT_RECORD_FLOATS`), supplies ``1/W_nn`` for the normal step,
+    ``W_nt`` to move the tangent residuals by the normal change, and the
+    pair's eigenbasis; there is no metric cache or capacity. Its iterates
+    differ from ``"staged"`` by rounding only. With ``linked_rows`` one pass
+    per call stores each anchor's other ring members in its record, and a
+    visit pools the ring from them; rings of more than four members keep
+    the walk. ``"auto"`` selects ``"staged"``. The kernel
+    then takes ``contact_records`` of shape ``(world_count, max_constraints
+    // 3, CONTACT_RECORD_FLOATS (+ CONTACT_RING_FLOATS when linked))`` after
+    ``iteration_offset`` and launch bounds from
+    :func:`contact_transaction_launch_bounds` with ``transaction_blocks``.
 
     Small complete articulated sweeps may use 8 or 16 lanes per world, as in
     the local response/solve owner. Launch with ``ceil(world_count / (64 /
@@ -133,6 +172,9 @@ def _get_pgs_solve_sparse_kernel(
         raise ValueError("local factor storage requires a small complete articulated sweep")
     if warm_start and F:
         raise ValueError("sparse warm starting requires no independent free-body rows")
+    if contact_transaction not in CONTACT_TRANSACTIONS:
+        raise ValueError(f"contact_transaction must be one of {CONTACT_TRANSACTIONS}")
+    launch_bounds = contact_transaction_launch_bounds(M, transaction_blocks)
     # Only a sweep that can hold velocity-limit rows has a law to choose; the others share one variant.
     accumulated_limits = check_velocity_limit_law(velocity_limit_law) == "accumulated" and bool(velocity_limits or F)
     index_read = (
@@ -171,6 +213,10 @@ def _get_pgs_solve_sparse_kernel(
     # Linked triplets pool the ring as the pair update does, so they fuse in either sweep.
     contact_triplets = bool(contact_triplets) and (active_rows or bool(linked_rows)) and use_support_table and M >= 3
     linked_rows = bool(linked_rows) and (active_rows or contact_triplets)
+    # Both friction laws keep the staged transaction by default.
+    if contact_transaction == "auto":
+        contact_transaction = "staged"
+    single_stage = contact_triplets and contact_transaction == "single"
     active_storage = active_initialize = active_scan = ""
     row_loop = "        for (int row = 0; row < count; ++row) {"
     row_loop_end = "        }"
@@ -695,8 +741,17 @@ for (int offset = 16; offset > 0; offset >>= 1) {{
         violation=violation,
         lanes=L,
     )
-    friction = FRICTION_PAIR
-    if contact_triplets:
+    laws = (FRICTION_PAIR,)
+    if single_stage:
+        triplet_setup, triplet_update = _single_stage_triplet_code(
+            M, S, Q, contact_type, friction_type, linked=linked_rows, active=active_rows, solve_policy=solve_policy
+        )
+        setup += triplet_setup
+        active_scan += "\n        int consumed_tangent = -1;\n"
+        # Rows the transaction declines keep the ordinary update and its own pair metric.
+        row_update = triplet_update + row_update
+        laws = (FRICTION_PAIR, FRICTION_PAIR_CACHED)
+    elif contact_triplets:
         triplet_setup, triplet_update = _contact_triplet_code(
             M, S, Q, contact_type, friction_type, linked=linked_rows, active=active_rows, solve_policy=solve_policy
         )
@@ -717,7 +772,7 @@ for (int offset = 16; offset > 0; offset >>= 1) {{
             "pair = friction_pair_cached(metric_slot, denominator,",
         )
         row_update = triplet_update + row_update
-        friction = FRICTION_PAIR_CACHED
+        laws = (FRICTION_PAIR_CACHED,)
     writeback = f"""
     for (int d = lane; d < {D}; d += {L}) factor_velocity_delta.data[world * {D} + d] = delta[d];
     for (int i = lane; i < count; i += {L}) world_impulses.data[offset + i] = impulse[i];
@@ -740,7 +795,7 @@ for (int offset = 16; offset > 0; offset >>= 1) {{
 {writeback}
 #endif
 """,
-        preludes=(friction, *solve_policy.preludes),
+        preludes=(*laws, *solve_policy.preludes),
         lead="",
     )
 
@@ -854,6 +909,9 @@ for (int offset = 16; offset > 0; offset >>= 1) {{
         suffix += "_support_table"
     if contact_triplets:
         suffix += "_contact_triplets"
+    if single_stage:
+        # The minimum resident blocks of the launch bounds tell the A/B variants apart.
+        suffix += f"_single{launch_bounds[1]}"
     if linked_rows:
         suffix += "_linked"
     if velocity_limits:
@@ -866,6 +924,22 @@ for (int offset = 16; offset > 0; offset >>= 1) {{
         suffix += "_local_factors"
     if warm_start:
         suffix += "_warm_start"
+    if single_stage:
+        name = f"pgs_solve_sparse_{M}_{D}_{S}_{F}_{P}{suffix}{solve_policy.suffix}"
+        records = RowArgument("contact_records", wp.array3d[float], after="iteration_offset")
+        kernel = make_row_kernel(
+            name,
+            snippet,
+            solve_native.func,
+            (records, *solve_policy.arguments),
+            dispatch="tiles",
+            groups=W,
+            lanes=L,
+            launch_bounds=launch_bounds,
+        )
+        if solve_policy.counts:
+            kernel._fpgs_solve_readout = solve_policy.readout
+        return kernel
     if solve_policy.counts:
         name = f"pgs_solve_sparse_{M}_{D}_{S}_{F}_{P}{suffix}{solve_policy.suffix}"
         kernel = make_row_kernel(
@@ -907,12 +981,6 @@ def _contact_triplet_code(
     selected_guard = "\n                && ((selected_words[(row + 1) / 32] >> ((row + 1) & 31)) & 1u) != 0u"
     selected_guard = selected_guard if active else ""
     ring_load, load = "", "new_normal"
-    tangent_state = "float tangent_change = 0.0f, sibling_change = 0.0f;"
-    tangent_keep = ""
-    change_test = """                    if (!(fabsf(normal_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal)
-                          && fabsf(tangent_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal)
-                          && fabsf(sibling_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal))) changed = 1;"""
-    normal_slack = tangent_slack = "change_tolerance + relative_change_tolerance * fabsf(new_normal)"
     if linked:
         ring_load = """
                 float load = new_normal;
@@ -920,27 +988,8 @@ def _contact_triplet_code(
                      next = world_row_parent.data[offset + next])
                     load += impulse[next];"""
         load = "load"
-        tangent_state = "float tangent_change = 0.0f, sibling_change = 0.0f, tangent_value = 0.0f;"
-        tangent_keep = "\n                    tangent_value = new_tangent;"
-        # Rows r and r + 1 bound their changes by their own new impulses, the pair by its first tangent.
-        change_test = """                    if (normal_change != 0.0f
-                        && !(fabsf(normal_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal)))
-                        changed = 1;
-                    if ((tangent_change != 0.0f || sibling_change != 0.0f)
-                        && !(fabsf(tangent_change) <= change_tolerance + relative_change_tolerance * fabsf(tangent_value)
-                             && fabsf(sibling_change) <= change_tolerance + relative_change_tolerance * fabsf(tangent_value)))
-                        changed = 1;"""
-        tangent_slack = "change_tolerance + relative_change_tolerance * fabsf(tangent_value)"
-    change_test = vote(
-        solve_policy,
-        change_test,
-        flag="changed",
-        terms=(
-            ("normal_change", "diagonal[row]", str(contact_type)),
-            ("tangent_change", "diagonal[tangent]", str(friction_type)),
-            ("sibling_change", "diagonal[sibling]", str(friction_type)),
-        ),
-        slack=(normal_slack, tangent_slack, tangent_slack),
+    tangent_state, tangent_keep, change_test = _triplet_change_vote(
+        contact_type, friction_type, linked=linked, solve_policy=solve_policy
     )
     setup = f"""
     __shared__ float metric_storage[{2 * cache_size * 5}];
@@ -1081,6 +1130,235 @@ def _contact_triplet_code(
                 consumed_tangent = tangent;
                 __syncwarp(MASK);
                 continue;
+            }}
+"""
+    return setup, update
+
+
+def _triplet_change_vote(
+    contact_type: int, friction_type: int, *, linked: bool, solve_policy: SolvePolicy
+) -> tuple[str, str, str]:
+    """Return a triplet transaction's tangent state, its first-tangent capture and its change vote.
+
+    Unlinked transactions bound every change by the new normal. Linked ones bound
+    the normal's change by its new impulse and the pair's by its new first
+    tangent, as their ordinary updates do, so the early exit matches under a
+    relative change tolerance too.
+    """
+    tangent_state = "float tangent_change = 0.0f, sibling_change = 0.0f;"
+    tangent_keep = ""
+    change_test = """                    if (!(fabsf(normal_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal)
+                          && fabsf(tangent_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal)
+                          && fabsf(sibling_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal))) changed = 1;"""
+    normal_slack = tangent_slack = "change_tolerance + relative_change_tolerance * fabsf(new_normal)"
+    if linked:
+        tangent_state = "float tangent_change = 0.0f, sibling_change = 0.0f, tangent_value = 0.0f;"
+        tangent_keep = "\n                    tangent_value = new_tangent;"
+        # Rows r and r + 1 bound their changes by their own new impulses, the pair by its first tangent.
+        change_test = """                    if (normal_change != 0.0f
+                        && !(fabsf(normal_change) <= change_tolerance + relative_change_tolerance * fabsf(new_normal)))
+                        changed = 1;
+                    if ((tangent_change != 0.0f || sibling_change != 0.0f)
+                        && !(fabsf(tangent_change) <= change_tolerance + relative_change_tolerance * fabsf(tangent_value)
+                             && fabsf(sibling_change) <= change_tolerance + relative_change_tolerance * fabsf(tangent_value)))
+                        changed = 1;"""
+        tangent_slack = "change_tolerance + relative_change_tolerance * fabsf(tangent_value)"
+    change_test = vote(
+        solve_policy,
+        change_test,
+        flag="changed",
+        terms=(
+            ("normal_change", "diagonal[row]", str(contact_type)),
+            ("tangent_change", "diagonal[tangent]", str(friction_type)),
+            ("sibling_change", "diagonal[sibling]", str(friction_type)),
+        ),
+        slack=(normal_slack, tangent_slack, tangent_slack),
+    )
+    return tangent_state, tangent_keep, change_test
+
+
+def _single_stage_triplet_code(
+    M: int,
+    S: int,
+    Q: int,
+    contact_type: int,
+    friction_type: int,
+    *,
+    linked: bool = False,
+    active: bool = True,
+    solve_policy: SolvePolicy = EXACT_POLICY,
+) -> tuple[str, str]:
+    """Native additions for the single-stage triplet transaction under the paired friction law.
+
+    A contact normal followed by its two tangents in shared metadata issues one
+    load group: the three rows' guards, coordinates and responses, the triplet's
+    record and its friction coefficient. One interleaved reduction gives the
+    three residuals. The normal takes its relaxed step with the record's
+    ``1/W_nn``; the pair then solves at the new load, its residuals moved by the
+    normal change through the record's ``W_nt`` and its eigenbasis read from the
+    record. The ordinary update keeps any row whose global guards decline.
+
+    With ``linked`` a pass at sweep entry stores each anchor's other ring
+    members, at most three, behind its record in the order the pair update
+    pools them, and a visit sums their shared impulses; a longer ring is marked
+    ``-1`` and keeps the walk. ``active`` fuses selected rows of the active-row
+    scan; otherwise the transaction runs inside the full ordered sweep.
+    ``solve_policy`` compiles the change vote.
+    """
+    width = CONTACT_RECORD_FLOATS + (CONTACT_RING_FLOATS if linked else 0)
+    record = f"contact_records.data + (static_cast<size_t>(world) * contact_records.shape[1] + {{row}} / 3) * {width}"
+    entry_guard = "select_active && " if active else ""
+    selected_guard = "\n                    & (((selected_words[(row + 1) / 32] >> ((row + 1) & 31)) & 1u) != 0u)"
+    selected_guard = selected_guard if active else ""
+    tangent_state, tangent_keep, change_test = _triplet_change_vote(
+        contact_type, friction_type, linked=linked, solve_policy=solve_policy
+    )
+    # The shared vote sits one block deeper here.
+    tangent_keep = tangent_keep.replace("\n", "\n    ")
+    change_test = textwrap.indent(change_test, "    ")
+    setup = ""
+    normal_parent, unlinked_guard, ring_read = "", " && normal_parent < 0", ""
+    load = "new_normal"
+    if linked:
+        setup = f"""
+    // Each anchor's other ring members, at most three, in the order the pair update pools
+    // them; -1 marks a longer ring, which keeps the walk. Visits read them with the record.
+    for (int normal = lane; normal + 2 < count; normal += 32) {{
+        if (type[normal] != {contact_type} || type[normal + 1] != {friction_type}
+            || type[normal + 2] != {friction_type}) continue;
+        const int first = world_row_parent.data[offset + normal];
+        int second = -1, third = -1, others = 0;
+        if (first >= 0 && first != normal) {{
+            others = 1;
+            second = world_row_parent.data[offset + first];
+            if (second >= 0 && second != normal) {{
+                others = 2;
+                third = world_row_parent.data[offset + second];
+                if (third >= 0 && third != normal) {{
+                    const int fourth = world_row_parent.data[offset + third];
+                    others = fourth >= 0 && fourth != normal ? -1 : 3;
+                }}
+            }}
+        }}
+        *reinterpret_cast<int4*>({record.format(row="normal")} + {CONTACT_RECORD_FLOATS})
+            = make_int4(first, second, third, others);
+    }}
+    __syncwarp(MASK);
+"""
+        normal_parent, unlinked_guard = "", ""
+        ring_read = f"""
+                    const int4 ring = *reinterpret_cast<const int4*>(record + {CONTACT_RECORD_FLOATS});"""
+        load = "load"
+    else:
+        normal_parent = """
+                const int normal_parent = world_row_parent.data[offset + row];"""
+    ring_load = ""
+    if linked:
+        ring_load = """
+                    // The ring pools as the pair update walks it, from the new normal on.
+                    float load = new_normal;
+                    if (ring.w >= 0) {
+                        if (ring.w > 0) load += impulse[ring.x];
+                        if (ring.w > 1) load += impulse[ring.y];
+                        if (ring.w > 2) load += impulse[ring.z];
+                    } else {
+                        for (int next = world_row_parent.data[offset + row]; next >= 0 && next != row;
+                             next = world_row_parent.data[offset + next])
+                            load += impulse[next];
+                    }"""
+    update = f"""
+            if (row == consumed_tangent) continue;
+            // Shared metadata first, read together: a contact normal with its two tangents.
+            if ({entry_guard}row + 2 < count && global_iteration >= friction_start_iteration
+                && ((type[row] == {contact_type}) & (type[row + 1] == {friction_type}) & (type[row + 2] == {friction_type})
+                    & (isfinite(diagonal[row]) != 0) & (diagonal[row] > 0.0f){selected_guard})) {{
+                const int tangent = row + 1, sibling = row + 2;
+                // The guards load together; the rows, the record and the coordinate indices
+                // then load together.
+                const int row_class = support.row_class.data[offset + row];
+                const int tangent_class = support.row_class.data[offset + tangent];
+                const int sibling_class = support.row_class.data[offset + sibling];
+                const int tangent_parent = world_row_parent.data[offset + tangent];
+                const int sibling_parent = world_row_parent.data[offset + sibling];{normal_parent}
+                if (tangent_parent == row && sibling_parent == row && tangent_class == sibling_class
+                    && row_class == tangent_class{unlinked_guard}) {{
+                    const float* record = {record.format(row="row")};
+                    const float4 coupling = *reinterpret_cast<const float4*>(record);
+                    const float4 basis = *reinterpret_cast<const float4*>(record + 4);{ring_read}
+                    const float mu = world_row_mu.data[offset + tangent];
+                    int indices[{Q}];
+                    float velocities[{Q}], normal_responses[{Q}];
+                    float tangent_responses[{Q}], sibling_responses[{Q}];
+                    float normal_dot = 0.0f, tangent_dot = 0.0f, sibling_dot = 0.0f;
+                    #pragma unroll
+                    for (int q = 0; q < {Q}; ++q) {{
+                        const int entry = lane + q * 32;
+                        const bool stored = entry < {S};
+                        const float normal_entry = stored ? row_factor.data[row_base + row * {S} + entry] : 0.0f;
+                        const float tangent_entry = stored ? row_factor.data[row_base + tangent * {S} + entry] : 0.0f;
+                        const float sibling_entry = stored ? row_factor.data[row_base + sibling * {S} + entry] : 0.0f;
+                        const int index = stored ? support.class_dof.data[row_class * {S} + entry] : -1;
+                        indices[q] = index;
+                        normal_responses[q] = index >= 0 ? normal_entry : 0.0f;
+                        tangent_responses[q] = index >= 0 ? tangent_entry : 0.0f;
+                        sibling_responses[q] = index >= 0 ? sibling_entry : 0.0f;
+                        velocities[q] = index >= 0 ? delta[index] : 0.0f;
+                        if (index >= 0) {{
+                            normal_dot += normal_responses[q] * velocities[q];
+                            tangent_dot += tangent_responses[q] * velocities[q];
+                            sibling_dot += sibling_responses[q] * velocities[q];
+                        }}
+                    }}
+                    for (int shift = 16; shift > 0; shift >>= 1) {{
+                        normal_dot += __shfl_down_sync(MASK, normal_dot, shift, 32);
+                        tangent_dot += __shfl_down_sync(MASK, tangent_dot, shift, 32);
+                        sibling_dot += __shfl_down_sync(MASK, sibling_dot, shift, 32);
+                    }}
+                    const float normal_residual = __shfl_sync(MASK, normal_dot, 0, 32) + rhs[row];
+                    const float tangent_residual = __shfl_sync(MASK, tangent_dot, 0, 32) + rhs[tangent];
+                    const float sibling_residual = __shfl_sync(MASK, sibling_dot, 0, 32) + rhs[sibling];
+                    const float old_normal = impulse[row];
+                    const float new_normal = fmaxf(old_normal - omega * normal_residual * coupling.w, 0.0f);
+                    const float normal_change = new_normal - old_normal;{ring_load}
+                    const float radius = fmaxf(mu * {load}, 0.0f);
+                    const float old_tangent = impulse[tangent], old_sibling = impulse[sibling];
+                    {tangent_state}
+                    if (lane == 0) impulse[row] = new_normal;
+                    if (!(radius == 0.0f && old_tangent == 0.0f && old_sibling == 0.0f)) {{
+                        float2 pair = make_float2(0.0f, 0.0f);
+                        if (radius > 0.0f) {{
+                            // W_nt moves the tangent residuals by the normal change. The eigenbasis
+                            // is relative to the larger tangent diagonal, as the pair law scales it.
+                            const FrictionPairMetric metric{{fmaxf(fmaxf(diagonal[tangent], diagonal[sibling]), 1.0e-20f),
+                                basis.x, basis.y, basis.z, basis.w}};
+                            pair = friction_pair_from_metric(metric, tangent_residual + coupling.x * normal_change,
+                                sibling_residual + coupling.y * normal_change, old_tangent, old_sibling, radius, omega);
+                        }}
+                        const float magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
+                        const float projection = magnitude > radius ? radius / magnitude : 1.0f;
+                        const float new_tangent = pair.x * projection, new_sibling = pair.y * projection;
+                        tangent_change = new_tangent - old_tangent;
+                        sibling_change = new_sibling - old_sibling;{tangent_keep}
+                        if (lane == 0) {{ impulse[tangent] = new_tangent; impulse[sibling] = new_sibling; }}
+                    }}
+                    if (normal_change != 0.0f || tangent_change != 0.0f || sibling_change != 0.0f) {{
+{change_test}
+                        // The staged transaction's order: normal, then sibling, then first tangent.
+                        #pragma unroll
+                        for (int q = 0; q < {Q}; ++q) {{
+                            if (indices[q] >= 0) {{
+                                float value = velocities[q];
+                                if (normal_change != 0.0f) value += normal_responses[q] * normal_change;
+                                if (sibling_change != 0.0f) value += sibling_responses[q] * sibling_change;
+                                if (tangent_change != 0.0f) value += tangent_responses[q] * tangent_change;
+                                delta[indices[q]] = value;
+                            }}
+                        }}
+                    }}
+                    consumed_tangent = tangent;
+                    __syncwarp(MASK);
+                    continue;
+                }}
             }}
 """
     return setup, update

@@ -80,7 +80,7 @@ class ParallelRowInputs:
     physical_row: str | None = None
 
 
-def make_row_kernel(name, snippet, signature, arguments=(), *, dispatch, groups=1, lanes=32):
+def make_row_kernel(name, snippet, signature, arguments=(), *, dispatch, groups=1, lanes=32, launch_bounds=None):
     """Generate a typed native function and one explicit launch wrapper.
 
     ``signature`` is an annotation-only declaration of the base native ABI.
@@ -88,7 +88,8 @@ def make_row_kernel(name, snippet, signature, arguments=(), *, dispatch, groups=
     match the existing disjoint local queues and parallel world queue, and the
     native sweeps' world tiles (``groups`` worlds of ``lanes`` lanes per block,
     guarded by a leading ``world_count``) and one world per block, whose
-    first native operand is the world.
+    first native operand is the world. ``launch_bounds`` is the CUDA
+    ``(threads, minimum blocks per SM)`` pair of the kernel, or ``None``.
     """
     params = [(key, value.annotation) for key, value in inspect.signature(signature).parameters.items()]
     for operand in arguments:
@@ -152,6 +153,6 @@ def make_row_kernel(name, snippet, signature, arguments=(), *, dispatch, groups=
     exec(compile(source, filename, "exec"), namespace)
     template = namespace["kernel_template"]
     template.__name__ = template.__qualname__ = name
-    kernel = wp.kernel(enable_backward=False, module="unique")(template)
+    kernel = wp.kernel(enable_backward=False, module="unique", launch_bounds=launch_bounds)(template)
     kernel._fpgs_row_native_source = snippet
     return kernel

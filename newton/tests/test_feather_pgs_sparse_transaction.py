@@ -1,22 +1,87 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Check the block records the sparse contact builder writes for a single-stage contact transaction."""
+"""Check the single-stage sparse contact transaction: its block records, its kernels and their twins.
+
+The transaction applies the paired friction law of the staged transaction, so its CUDA
+twins match the staged sweep and the physical reference to rounding, not bitwise.
+"""
 
 import unittest
+from itertools import product
 
 import numpy as np
 import warp as wp
 
+from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
+from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
 from newton._src.solvers.feather_pgs.kernels import populate_world_J_for_compact_size
 from newton._src.solvers.feather_pgs.sparse_contact import (
     CONTACT_RECORD_FLOATS,
+    CONTACT_RING_FLOATS,
     SparseContactRows,
     _get_sparse_contact_response_kernel,
 )
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupportPlan
+from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel, contact_transaction_launch_bounds
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplets
+from newton.tests.test_feather_pgs_native_prelude import _native_snippets
 from newton.tests.test_feather_pgs_sparse_contacts import _fixture
+from newton.tests.test_feather_pgs_sparse_pgs import _sweep
+
+TRIPLETS = {"active_rows": True, "use_support_table": True, "contact_triplets": True}
+# Row capacities of the suite's two launch-bound families: 12 blocks above 128 rows, 16 at or below.
+CAPACITIES = (256, 96)
+
+
+def _snippet(kernel):
+    """Return the sweep body a sparse sweep kernel compiles."""
+    return getattr(kernel, "_fpgs_row_native_source", None) or max(_native_snippets(kernel), key=len)
+
+
+def _resized(data, capacity):
+    """Return a DeviceSolve fixture re-padded to another row capacity."""
+    if int(np.max(data["world_constraint_count"])) > capacity:
+        raise ValueError("the fixture's rows exceed the capacity")
+    resized = dict(data)
+    for key in (
+        "rhs_bias",
+        "diagonal",
+        "initial_impulses",
+        "row_factor",
+        "row_incident",
+        "row_type",
+        "row_parent",
+        "row_mu",
+        "support_row_class",
+    ):
+        value = data[key]
+        rows = min(capacity, value.shape[1])
+        resized[key] = np.zeros((value.shape[0], capacity, *value.shape[2:]), value.dtype)
+        resized[key][:, :rows] = value[:, :rows]
+    return resized
+
+
+def _assert_twins(test, data, single, staged, *, rtol=1.0e-5):
+    """Match the staged transaction's velocity delta and live impulses to ``rtol`` of each array's magnitude."""
+    counts = data["world_constraint_count"]
+    live = np.arange(staged[1].shape[1])[None] < counts[:, None]
+    for name, actual, expected in (
+        ("delta", single[0], staged[0]),
+        ("impulses", single[1][live], staged[1][live]),
+    ):
+        test.assertTrue(np.isfinite(actual).all(), name)
+        magnitude = float(np.max(np.abs(expected), initial=0.0))
+        np.testing.assert_allclose(actual, expected, rtol=rtol, atol=rtol * magnitude, err_msg=name)
+
+
+def _ring_members(parents, normal):
+    """Return the other normals of ``normal``'s ring in the order the pair update pools them."""
+    members, row = [], int(parents[normal])
+    while row >= 0 and row != normal:
+        members.append(row)
+        row = int(parents[row])
+    return members
 
 
 class TestContactRecordBuilder(unittest.TestCase):
@@ -188,6 +253,235 @@ class TestContactRecordBuilder(unittest.TestCase):
                 _get_sparse_contact_response_kernel(6, contact_records=True, **options)
         kernel = _get_sparse_contact_response_kernel(6, prepare_rows=True, use_support_table=True, contact_records=True)
         self.assertTrue(kernel.key.endswith("_prepared_support_table_contact_records"))
+
+
+class TestSingleStageTransaction(unittest.TestCase):
+    """The single-stage transaction's factory, sweep body, request and route record."""
+
+    def test_factory_resolves_the_law_default_and_launch_bounds_cpu(self):
+        """Take the single-stage transaction on request, with per-shape launch bounds and records.
+
+        Both laws keep the staged transaction by default; either law reaches either form.
+        """
+        for capacity, blocks in product((256, 192, 128, 96, 48), (16, 14)):
+            bounds = contact_transaction_launch_bounds(capacity, blocks)
+            self.assertEqual(bounds, (64, 12 if capacity > 128 else blocks))
+            with self.subTest(capacity=capacity, blocks=blocks):
+                kernels = {
+                    (law, transaction): _get_pgs_solve_sparse_kernel(
+                        capacity,
+                        18,
+                        12,
+                        linked_rows=law == "patch",
+                        contact_transaction=transaction,
+                        transaction_blocks=blocks,
+                        **TRIPLETS,
+                    )
+                    for law, transaction in product(("patch", "point"), ("auto", "single", "staged"))
+                }
+                for (law, transaction), kernel in kernels.items():
+                    single = transaction == "single"
+                    linked = "_linked" if law == "patch" else ""
+                    suffix = f"_contact_triplets_single{bounds[1]}{linked}" if single else f"_contact_triplets{linked}"
+                    self.assertTrue(kernel.key.endswith(suffix), kernel.key)
+                    self.assertEqual(kernel.options.get("launch_bounds"), bounds if single else None)
+                    names = list(kernel.adj.arg_types)
+                    self.assertEqual("contact_records" in names, single)
+                    if single:
+                        # The records follow the scalar inputs, before the outputs.
+                        self.assertEqual(names[names.index("iteration_offset") + 1], "contact_records")
+                self.assertIs(kernels[("patch", "auto")], kernels[("patch", "auto")])
+        for options in ({"contact_transaction": "fused"}, {"transaction_blocks": 12}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                _get_pgs_solve_sparse_kernel(64, 18, 12, **TRIPLETS, **options)
+
+    def test_single_stage_sweep_reduces_once_from_records_cpu(self):
+        """Reduce three residuals once from the record, without the staged metric cache, its capacity or walk.
+
+        The staged sweep keeps its cache, its map and its second reduction; only rings of
+        more than four members walk their parents on a visit.
+        """
+        for linked in (False, True):
+            with self.subTest(linked=linked):
+                single = _snippet(
+                    _get_pgs_solve_sparse_kernel(
+                        256, 18, 12, linked_rows=linked, contact_transaction="single", **TRIPLETS
+                    )
+                )
+                staged = _snippet(
+                    _get_pgs_solve_sparse_kernel(
+                        256, 18, 12, linked_rows=linked, contact_transaction="staged", **TRIPLETS
+                    )
+                )
+                for text in (
+                    "metric_storage",
+                    "metric_map",
+                    "metric_count",
+                    "friction_pair_cached(",
+                    "contact_metric_slot(",
+                ):
+                    self.assertIn(text, staged)
+                    self.assertNotIn(text, single)
+                width = CONTACT_RECORD_FLOATS + CONTACT_RING_FLOATS * linked
+                self.assertIn(f"normal / 3) * {width}" if linked else f"row / 3) * {width}", single)
+                start = single.index("if (row == consumed_tangent) continue;")
+                transaction = single[start : single.index("consumed_tangent = tangent;", start)]
+                # One interleaved reduction of the three residuals, and no other.
+                self.assertEqual(transaction.count("__shfl_down_sync"), 3)
+                self.assertEqual(transaction.count("for (int shift = 16; shift > 0; shift >>= 1)"), 1)
+                self.assertIn(
+                    "friction_pair_from_metric(metric, tangent_residual + coupling.x * normal_change", transaction
+                )
+                self.assertIn("normal_residual * coupling.w", transaction)
+                self.assertEqual("normal_parent < 0" in transaction, not linked)
+                # Linked visits pool listed members and walk only rings longer than four members.
+                self.assertEqual("ring.w >= 0" in transaction, linked)
+                self.assertEqual("make_int4(first, second, third, others)" in single, linked)
+                self.assertEqual(transaction.count("world_row_parent.data[offset + next]"), int(linked))
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "The sparse sweep requires CUDA")
+class TestSingleStageTwins(unittest.TestCase):
+    """CUDA twins of the single-stage transaction: the staged sweep and the physical reference, to rounding."""
+
+    def _twins(self, data, *, linked=False, active=True):
+        """Launch the single-stage and staged transactions on ``data``; return both results and the single solve."""
+        single = triplets.DeviceSolve(data, candidate=True, active=active, linked=linked, transaction="single")
+        staged = triplets.DeviceSolve(data, candidate=True, active=active, linked=linked, transaction="staged")
+        self.assertTrue(single.single_stage)
+        self.assertFalse(staged.single_stage)
+        single.launch()
+        staged.launch()
+        return single.result(), staged.result(), single
+
+    def test_point_triplets_match_staged_and_reference_cuda(self):
+        """Solve the point-law fixtures as the staged transaction and the physical reference do, at both bounds."""
+        cases = (
+            [{"offset": value, "seeded": True} for value in (0, 29, 30)]
+            + [{"activity": value} for value in ("late_activation", "deferred_activation", "seeded_retraction")]
+            + [{"omega": value, "seeded": True} for value in (0.0, 0.7, 1.2, -0.5)]
+            + [{"delay": 3, "iteration_offset": value, "seeded": True} for value in (0, 1, 4)]
+        )
+        for settings, capacity in product(cases, CAPACITIES):
+            with self.subTest(capacity=capacity, **settings):
+                data, physical = triplets.fixture(**settings)
+                data = _resized(data, capacity)
+                single, staged, _ = self._twins(data)
+                _assert_twins(self, data, single, staged)
+                triplets.assert_output(self, data, *single, physical=physical)
+
+    def test_near_singular_tangents_match_the_reference_cuda(self):
+        """Solve a nearly rank-one tangent block to the reference tolerance; rounding is amplified there."""
+        data, physical = triplets.fixture(activity="near_singular")
+        for capacity in CAPACITIES:
+            with self.subTest(capacity=capacity):
+                resized = _resized(data, capacity)
+                single, staged, _ = self._twins(resized)
+                triplets.assert_output(self, resized, *single, physical=physical, reference=staged)
+
+    def test_patch_rings_match_staged_and_reference_cuda(self):
+        """Pool rings of one to six members, listed or walked, in the linked active scan and the full sweep."""
+        settings = ({}, {"seeded": True, "omega": 0.7}, {"seeded": True, "delay": 3, "iteration_offset": 1})
+        for (name, layout), pad, options, active, capacity in product(
+            triplets._LINKED_LAYOUTS.items(), (0, 30), settings, (True, False), CAPACITIES
+        ):
+            with self.subTest(layout=name, pad=pad, active=active, capacity=capacity, **options):
+                data, physical = triplets.linked_fixture(layout, pad=pad, active=active, **options)
+                data = _resized(data, capacity)
+                single, staged, _ = self._twins(data, linked=True, active=active)
+                _assert_twins(self, data, single, staged)
+                triplets.assert_output(self, data, *single, physical=physical)
+
+    def test_ring_members_follow_the_pooling_walk_cuda(self):
+        """List up to three other members of each anchor's ring in walk order, and mark longer rings to walk.
+
+        Rings of one to six members load anchors whose radii pool the whole ring, so a
+        missing, repeated or reordered member changes the impulses beyond rounding.
+        """
+        for name in (
+            "self_loop",
+            "two_member_ring",
+            "three_member_ring",
+            "far_ring",
+            "loaded_ring",
+            "long_loaded_ring",
+        ):
+            for capacity, active in product(CAPACITIES, (True, False)):
+                with self.subTest(layout=name, capacity=capacity, active=active):
+                    data, physical = triplets.linked_fixture(triplets._LINKED_LAYOUTS[name], pad=30, active=active)
+                    data = _resized(data, capacity)
+                    single, staged, solve = self._twins(data, linked=True, active=active)
+                    _assert_twins(self, data, single, staged)
+                    triplets.assert_output(self, data, *single, physical=physical)
+                    rings = solve.records.numpy()[..., CONTACT_RECORD_FLOATS:].view(np.int32)
+                    for world, count in enumerate(data["world_constraint_count"]):
+                        kinds, parents = data["row_type"][world], data["row_parent"][world]
+                        for row in range(int(count) - 2):
+                            if (kinds[row], kinds[row + 1], kinds[row + 2]) != (CONTACT, FRICTION, FRICTION):
+                                continue
+                            members = _ring_members(parents, row)
+                            ring = rings[world, row // 3]
+                            listed = len(members) if len(members) <= 3 else -1
+                            self.assertEqual(int(ring[3]), listed)
+                            self.assertEqual(list(ring[: max(listed, 0)]), members[: max(listed, 0)])
+
+    def test_more_triplets_than_the_staged_cache_cuda(self):
+        """Solve 17 loaded triplets in one world, beyond the staged cache's 12, from their records."""
+        pairs = 17
+        dofs = pairs * 3
+        indices = np.arange(dofs, dtype=np.int32).reshape(pairs, 3)
+        z = np.zeros((dofs, dofs), dtype=np.float32)
+        bias = np.zeros(dofs, dtype=np.float32)
+        kinds = np.tile(np.array([CONTACT, FRICTION, FRICTION], np.int32), pairs)
+        parents = np.full(dofs, -1, dtype=np.int32)
+        mu = np.zeros(dofs, dtype=np.float32)
+        for pair in range(pairs):
+            row = pair * 3
+            z[row, row] = 1.0 + 0.01 * pair
+            z[row + 1, row : row + 3] = (0.11, 0.6 + 0.08 * pair, 0.13)
+            z[row + 2, row : row + 3] = (-0.07, 0.19, 1.8 - 0.05 * pair)
+            bias[row : row + 3] = (-0.2 - 0.01 * pair, 0.4, 0.7 - 0.02 * pair)
+            parents[row + 1 : row + 3] = row
+            mu[row + 1 : row + 3] = 0.4 + 0.005 * pair
+        diag = np.sum(z * z, axis=1) + 0.01
+        initial = np.zeros(dofs, dtype=np.float32)
+        velocity, impulses = _sweep(z, z, initial, bias, diag, kinds, parents, mu, initial, active_rows=True)
+        self.assertEqual(np.count_nonzero(impulses[::3] > 0), pairs)
+        physical = {
+            "factor": np.eye(dofs),
+            "initial": initial,
+            "expected_velocity": velocity,
+            "expected_impulse": impulses,
+        }
+        for capacity in CAPACITIES:
+            with self.subTest(capacity=capacity):
+
+                def padded(values, capacity=capacity):
+                    result = np.zeros((3, capacity, *values.shape[1:]), dtype=values.dtype)
+                    result[:, :dofs] = values
+                    return result
+
+                data = {
+                    "world_constraint_count": np.array([dofs, 0, dofs], np.int32),
+                    "rhs_bias": padded(bias),
+                    "diagonal": padded(diag),
+                    "initial_impulses": padded(initial),
+                    "row_factor": padded(np.stack([z[row, indices[row // 3]] for row in range(dofs)])),
+                    "row_incident": padded(initial),
+                    "row_type": padded(kinds),
+                    "row_parent": padded(parents),
+                    "row_mu": padded(mu),
+                    "support_row_class": padded(np.repeat(np.arange(pairs, dtype=np.int32), 3)),
+                    "support_class_dof": indices,
+                    "iterations": np.array(8),
+                    "omega": np.array(1.0),
+                    "friction_start_iteration": np.array(0),
+                    "iteration_offset": np.array(0),
+                    "reference_factor_delta": np.zeros((3, dofs), dtype=np.float32),
+                }
+                single, staged, _ = self._twins(data)
+                _assert_twins(self, data, single, staged)
+                triplets.assert_output(self, data, *single, physical=physical)
 
 
 if __name__ == "__main__":
