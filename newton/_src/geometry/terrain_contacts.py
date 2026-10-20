@@ -40,6 +40,7 @@ never per step; the law's per-pair kernels belong in a module of their own.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 
 import numpy as np
 import warp as wp
@@ -1138,20 +1139,27 @@ def heightfield_pair_table(
     colliding: np.ndarray,
     *,
     explicit_pairs: np.ndarray | None = None,
+    shape_collision_group: np.ndarray | None = None,
+    filter_mask: Callable[[np.ndarray], np.ndarray] | None = None,
 ) -> np.ndarray:
-    """Return every ``(heightfield, partner)`` shape pair that can reach the terrain midphase, once.
+    """Return every ``(heightfield, partner)`` shape pair the collision filter admits, once.
 
-    The terrain midphase receives the pairs of exactly one heightfield and a partner other than a triangle
-    mesh. With an explicit pair list those are its pairs of that kind, in either order. Otherwise the broad
-    phase generates them from the colliding shapes, so the table holds every colliding heightfield with every
-    colliding partner of a compatible world (the same world, or either shape global), a superset of what it
-    can generate.
+    The pairs are those of exactly one heightfield and a partner other than a triangle mesh. With an explicit
+    pair list (an empty one included) they are its pairs of that kind, in either order. Otherwise the filter is
+    applied here as the model builder applies it: every colliding heightfield with every colliding partner of a
+    compatible world (the same world, or either shape global) whose collision groups interact and that no filter
+    pair excludes.
 
     Args:
         shape_types: Geometry type of every shape.
         shape_world: World of every shape (-1 for global shapes), or ``None`` for a single world.
         colliding: Whether every shape takes part in shape-shape collision.
-        explicit_pairs: The explicit broad phase's shape pairs, or ``None``.
+        explicit_pairs: The model's admitted shape pairs, or ``None`` to apply the filter here.
+        shape_collision_group: Collision group of every shape, or ``None`` when every group interacts. Unused
+            with ``explicit_pairs``.
+        filter_mask: Returns, for ``(pair_count, 2)`` shape pairs, which ones a filter pair excludes
+            (:meth:`~newton.Model.shape_collision_filter_mask`), or ``None`` without filter pairs. Unused with
+            ``explicit_pairs``.
 
     Returns:
         Unique ``(heightfield, partner)`` rows, sorted.
@@ -1183,7 +1191,21 @@ def heightfield_pair_table(
         positions = starts + np.arange(int(lengths.sum()))
         pieces.append(np.stack([np.repeat(local, lengths), sorted_partners[positions]], axis=1))
         table = np.concatenate(pieces)
+        if shape_collision_group is not None:
+            group = np.asarray(shape_collision_group, dtype=np.int64)
+            table = table[_groups_interact(group[table[:, 0]], group[table[:, 1]])]
+        if filter_mask is not None and len(table):
+            table = table[~np.asarray(filter_mask(table), dtype=bool)]
     return np.unique(np.asarray(table, dtype=np.int64).reshape(-1, 2), axis=0).astype(np.int32)
+
+
+def _groups_interact(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Whether shapes of collision groups ``a`` and ``b`` collide, elementwise (as the broad phase decides).
+
+    Group 0 collides with nothing, a positive group with itself and the negative groups, a negative group with
+    every group but itself.
+    """
+    return (a != 0) & (b != 0) & (((a > 0) & ((a == b) | (b < 0))) | ((a < 0) & (a != b)))
 
 
 def _cross(first: np.ndarray, second: np.ndarray) -> np.ndarray:
@@ -1229,11 +1251,12 @@ def terrain_window_cells(radius, reach, dx, dy) -> np.ndarray:
 class TerrainPairTable:
     """The static (heightfield, partner) pairs of the terrain law, one contiguous segment per partner and lane class.
 
-    Pairs come from the model's collision filter (:attr:`~newton.Model.shape_contact_pairs`, or the colliding
-    shapes of compatible worlds when the model has no pair list), restricted to partners the law has a class
-    for, and are sorted by (partner class, lane class, world, heightfield, partner). A pair's lane class follows
-    from its largest window over all orientations (bounding radius plus margins and gaps, on its heightfield's
-    cells) at construction.
+    Pairs are exactly those the model's collision filter admits, since the law's pairs bypass the broad phase:
+    the model's pair list (:attr:`~newton.Model.shape_contact_pairs`; an empty list gives an empty table) or,
+    when the model has none, the same filter applied here (worlds, collision groups, filter pairs). They are
+    restricted to partners the law has a class for and sorted by (partner class, lane class, world, heightfield,
+    partner). A pair's lane class follows from its largest window over all orientations (bounding radius plus
+    margins and gaps, on its heightfield's cells) at construction.
 
     Args:
         model: A finalized model.
@@ -1248,14 +1271,20 @@ class TerrainPairTable:
         from .flags import ShapeFlags  # noqa: PLC0415
 
         colliding = (flags & int(ShapeFlags.COLLIDE_SHAPES)) != 0
-        explicit = None
-        if getattr(model, "shape_contact_pairs", None) is not None and getattr(model, "shape_contact_pair_count", 0):
-            explicit = model.shape_contact_pairs.numpy().reshape(-1, 2)
-        pairs = (
-            heightfield_pair_table(types, worlds, colliding, explicit_pairs=explicit)
-            if count
-            else np.zeros((0, 2), np.int32)
-        )
+        listed = getattr(model, "shape_contact_pairs", None)
+        if not count:
+            pairs = np.zeros((0, 2), np.int32)
+        elif listed is not None:
+            explicit = listed.numpy().reshape(-1, 2)[: int(model.shape_contact_pair_count)]
+            pairs = heightfield_pair_table(types, worlds, colliding, explicit_pairs=explicit)
+        else:
+            pairs = heightfield_pair_table(
+                types,
+                worlds,
+                colliding,
+                shape_collision_group=model.shape_collision_group.numpy(),
+                filter_mask=model.shape_collision_filter_mask,
+            )
         scale = model.shape_scale.numpy() if count else np.zeros((0, 3), np.float32)
         partner_class = terrain_partner_classes(types, scale)[pairs[:, 1]]
         pairs = pairs[partner_class >= 0]

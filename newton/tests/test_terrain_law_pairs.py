@@ -58,8 +58,12 @@ def _cube():
     return newton.Mesh(vertices=vertices, indices=np.asarray(faces, np.int32).ravel())
 
 
-def _scene(device, worlds=3):
-    """A global heightfield (0.1 m cells) and, per world, one partner of every kind plus excluded ones."""
+def _scene(device, *, worlds=3):
+    """A global heightfield (0.1 m cells) and, per world, one partner of every kind plus excluded ones.
+
+    Excluded per world: a triangle mesh, a sphere that takes no part in shape collision, one in collision group
+    2 (the heightfield is in group 1) and one filtered against the heightfield.
+    """
     builder = newton.ModelBuilder()
     cfg = builder.ShapeConfig(margin=0.01, gap=0.01)
     terrain = newton.Heightfield(data=np.zeros((21, 21), np.float32), nrow=21, ncol=21, hx=1.0, hy=1.0)
@@ -85,6 +89,11 @@ def _scene(device, worlds=3):
             kinds[shape] = (kind, w)
         excluded.append(builder.add_shape_mesh(body, mesh=cube, cfg=cfg))
         excluded.append(builder.add_shape_sphere(body, radius=0.03, cfg=builder.ShapeConfig(has_shape_collision=False)))
+        excluded.append(
+            builder.add_shape_sphere(
+                body, radius=0.03, cfg=builder.ShapeConfig(margin=0.01, gap=0.01, collision_group=2)
+            )
+        )
         filtered = builder.add_shape_sphere(body, radius=0.03, cfg=cfg)
         builder.add_shape_collision_filter_pair(heightfield, filtered)
         excluded.append(filtered)
@@ -144,17 +153,32 @@ def test_pair_table_from_the_collision_filter(test, device):
 
 
 def test_pair_table_without_a_pair_list(test, device):
-    """Without the model's pair list, take every colliding partner of a compatible world (a superset)."""
-    model, _heightfield, _kinds, excluded = _scene(device)
+    """Without the model's pair list, apply the same filter: worlds, collision groups and filter pairs.
+
+    The law's pairs bypass the broad phase, so a superset would make contacts the filter excludes.
+    """
+    model, heightfield, kinds, excluded = _scene(device)
     with_list = TerrainPairTable(model)
     model.shape_contact_pairs = None
     model.shape_contact_pair_count = 0
     without = TerrainPairTable(model)
-    listed = {tuple(p) for p in with_list.pairs_host.tolist()}
-    crossed = {tuple(p) for p in without.pairs_host.tolist()}
-    test.assertTrue(listed < crossed)
-    # Only the filtered spheres (a filter pair the cross product cannot see) are added.
-    test.assertEqual({b for _a, b in crossed - listed}, set(excluded[2::3]))
+    np.testing.assert_array_equal(without.pairs_host, with_list.pairs_host)
+    test.assertEqual({tuple(p) for p in without.pairs_host.tolist()}, {(heightfield, s) for s in kinds})
+    test.assertFalse(set(without.pairs_host[:, 1].tolist()) & set(excluded))
+
+
+def test_pair_table_of_a_filtered_heightfield_is_empty(test, device):
+    """Give no pair to a heightfield whose every partner is filtered: the model's pair list is empty, not absent."""
+    builder = newton.ModelBuilder()
+    terrain = newton.Heightfield(data=np.zeros((5, 5), np.float32), nrow=5, ncol=5, hx=0.2, hy=0.2)
+    heightfield = builder.add_shape_heightfield(heightfield=terrain)
+    sphere = builder.add_shape_sphere(builder.add_body(), radius=0.03)
+    builder.add_shape_collision_filter_pair(heightfield, sphere)
+    model = builder.finalize(device=device)
+    test.assertEqual(model.shape_contact_pair_count, 0)
+    table = TerrainPairTable(model)
+    test.assertEqual(table.pair_count, 0)
+    test.assertEqual(table.slot_count, 0)
 
 
 class TestTerrainLawPairs(unittest.TestCase):
@@ -181,6 +205,12 @@ add_function_test(
 )
 add_function_test(
     TestTerrainLawPairs, "test_pair_table_without_a_pair_list", test_pair_table_without_a_pair_list, devices=devices
+)
+add_function_test(
+    TestTerrainLawPairs,
+    "test_pair_table_of_a_filtered_heightfield_is_empty",
+    test_pair_table_of_a_filtered_heightfield_is_empty,
+    devices=devices,
 )
 
 
