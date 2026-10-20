@@ -945,20 +945,40 @@ def _side_buffer(begin, count, rows, pair_count, device):
     return out
 
 
+TILE_LARGE = (
+    ("box", {"half": (0.6, 0.3, 0.02)}),
+    ("cylinder", {"radius": 0.05, "half_height": 0.6}),
+    ("cone", {"radius": 0.4, "half_height": 0.05}),
+    ("ellipsoid", {"semi": (0.6, 0.3, 0.05)}),
+)
+"""Solids whose windows hold more vertices (over 256 on 5 cm cells) than the tiled kernels' marks cover."""
+
+
 def _tile_scene(rng, device):
-    """Solids whose windows exceed 16 cells (5 cm cells) over rough terrain, every class."""
+    """Solids whose windows exceed 16 cells (5 cm cells) over rough terrain, every class, and of every class one whose
+    window exceeds 256 vertices (:data:`TILE_LARGE`): ``(heightfield, model, shapes, bodies)``."""
     n = 49
     heights = np.round(rng.uniform(0.0, 0.08, (n, n)) / 0.005) * 0.005
     hf = tu.reference_surface(tu.heightfield_model(heights, 1.2, 1.2, device="cpu"))
     bodies = []
-    for i in range(36):
-        kind, dims = _solid_kinds(rng)[i % 7]
-        x, y = rng.uniform(-0.9, 0.9, 2)
-        q = _random_quat(rng)
+    for i in range(36 + len(TILE_LARGE)):
+        kind, dims = _solid_kinds(rng)[i % 7] if i < 36 else TILE_LARGE[i - 36]
+        x, y = rng.uniform(-0.9, 0.9, 2) if i < 36 else rng.uniform(-0.3, 0.3, 2)
+        q = _random_quat(rng) if i < 36 else _random_quat(rng, np.radians(2.0))
+        if i >= 36 and kind == "cylinder":
+            q = _quat_mul(_axis_angle((0.0, 0.0, 1.0), np.pi / 4.0), LYING)
         lo, hi = ref.make_core(kind, dims, np.r_[x, y, 0.0, q]).aabb()
         z = _top_under(hf, lo, hi) - lo[2] + rng.uniform(-0.004, 0.01)
         bodies.append((kind, dims, _f32_pose(np.r_[x, y, z, q])))
-    return su.solid_scene(heights, 1.2, 1.2, bodies, device=device)
+    model, _hfield, shapes = su.solid_scene(heights, 1.2, 1.2, bodies, device=device)
+    return hf, model, shapes, bodies
+
+
+def _window_vertices(hf, kind, dims, pose) -> int:
+    """Vertices of a solid pair's window: its core's bounds widened by the reach, in cells."""
+    lo, hi = ref.make_core(kind, dims, pose).aabb()
+    r0, r1, c0, c1 = hf.cells_in_box(lo[:2] - su.REACH, hi[:2] + su.REACH)
+    return (r1 - r0 + 2) * (c1 - c0 + 2)
 
 
 def _pair_inputs(model, pipeline) -> TerrainPairInputs:
@@ -977,10 +997,20 @@ def _pair_inputs(model, pipeline) -> TerrainPairInputs:
 
 
 def test_tiled_kernels_match_one_thread_kernels(test, device):
-    """Give a solid pair the same rows, bit for bit, whether one thread or a tile of lanes walks its window."""
-    model, _hfield, _shapes = _tile_scene(np.random.default_rng(37), device)
+    """Give a solid pair the same rows, bit for bit, whether one thread or a tile of lanes walks its window.
+
+    Windows of up to 256 vertices are marked by the lanes and replayed by the first; larger ones (one solid per class
+    here) are walked by the first lane alone. The CPU runs one lane.
+    """
+    hf, model, shapes, bodies = _tile_scene(np.random.default_rng(37), device)
     pipeline, _contacts, _state = _collide(model, shadow=True)
     shadow = pipeline._terrain_law_shadow
+    table = shadow.table
+    shape_class = {int(p[1]): int(c) for p, c in zip(table.pairs_host, table.partner_class, strict=True)}
+    large = {
+        shape_class[shape] for shape, body in zip(shapes, bodies, strict=True) if _window_vertices(hf, *body) > 256
+    }
+    test.assertEqual(large, {TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_HULL})
     inputs = _pair_inputs(model, pipeline)
     walked = 0
     for partner_class, (module, thread, tiled, full) in _SOLID_KERNELS.items():
