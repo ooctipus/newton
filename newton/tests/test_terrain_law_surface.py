@@ -55,6 +55,8 @@ CYLINDER = {"radius": 0.05, "half_height": 0.04}
 PENETRATION = 0.001
 REACH = 0.04
 """Margins and gaps of the pair [m]."""
+WINDOW_BAND = 8.0 * float(np.finfo(np.float32).eps) * 0.4
+"""The closed predicates' band of a 0.4 m window [m] (:func:`terrain_eps`)."""
 
 
 @wp.kernel(enable_backward=False)
@@ -528,7 +530,44 @@ def test_seam_adversarial_placements_are_watertight(test, device):
     test.assertEqual(misses, [], msg=f"{len(misses)} of {supports} supports missed")
 
 
+def test_plane_distances_stay_window_precise_on_large_clusters(test, device):
+    """Keep float32 plane distances far inside the band on a 16 m planar slope that is one cluster.
+
+    The cluster's plane record is anchored at its lowest-id vertex, up to 16 m from a window. Read at that anchor,
+    the plane carried the float32 rounding of the anchor's distance into every distance: up to 1.6 um off,
+    against a band of 0.38 um for these windows.
+    """
+    count = 161
+    x = np.arange(count) * 0.1
+    X, Y = np.meshgrid(x, x)
+    half = 0.05 * (count - 1)
+    model = tu.heightfield_model(0.4 * (X + 0.5 * Y), half, half, device=device)
+    features = TerrainFeatures(model)
+    hf = tu.reference_surface(model)
+    test.assertEqual(features.plane_count(0), 1)
+    test.assertEqual(len(np.unique(features.clusters.numpy())), 1)
+    rng = np.random.default_rng(17)
+    points = []
+    for _ in range(400):
+        px, py = rng.uniform(-half + 0.2, half - 0.2, size=2)
+        points.append((px, py, hf.height(px, py) + rng.uniform(-0.002, 0.002)))
+    points = np.asarray(points, np.float32).astype(np.float64)
+    worst = 0.0
+    for p, claimed in zip(points, tu.face_claims(features, 0, points), strict=True):
+        test.assertTrue(claimed, msg=f"{p} unclaimed")
+        n, a = hf.plane(hf.locate(p[0], p[1]))
+        for _cluster, _q, _n, d in claimed:
+            worst = max(worst, abs(d - float(n @ (p - a))))
+    test.assertLess(worst, 0.25 * WINDOW_BAND, msg=f"worst {worst * 1e6:.3f} um")
+
+
 devices = get_test_devices()
+add_function_test(
+    TestTerrainLawSurface,
+    "test_plane_distances_stay_window_precise_on_large_clusters",
+    test_plane_distances_stay_window_precise_on_large_clusters,
+    devices=devices,
+)
 add_function_test(
     TestTerrainLawSurface, "test_seam_placements_keep_support", test_seam_placements_keep_support, devices=devices
 )

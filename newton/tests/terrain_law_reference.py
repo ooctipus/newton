@@ -135,7 +135,7 @@ def build_reference_clusters(Z: np.ndarray, dx: float, dy: float, *, flat_eps: f
 
     Round by round, the triangles not yet assigned form components over the flat edges (an edge is flat when
     the far vertex of one side lies within ``flat_eps`` of the other side's plane). Each component has three
-    candidate planes: the extreme plane (through its lowest vertex ``a``, the vertex ``b`` farthest from ``a`` and
+    candidate planes: the extreme plane (through its lowest-id vertex ``a``, the vertex ``b`` farthest from ``a`` and
     the vertex ``c`` spanning the largest triangle with them, in grid units) and the level plane (horizontal),
     each with its offset centred on the component's residual range, and the seed plane (its lowest-id
     triangle's). A component whose vertices all lie within ``flat_eps`` of its extreme or level plane is one

@@ -176,7 +176,7 @@ class TerrainClusterPlane:
     """The plane of a cluster of several triangles: ``z = z(anchor) + offset + gx (x - x_a) + gy (y - y_a)``."""
 
     anchor: int
-    """Vertex id ``r * ncol + c`` the plane is anchored at."""
+    """Vertex id ``r * ncol + c`` the plane is anchored at: the cluster's lowest-id vertex, often far from a window."""
     gx: float
     """Plane gradient along x."""
     gy: float
@@ -377,8 +377,10 @@ def terrain_cluster_plane(
 ) -> tuple[wp.vec3, wp.vec3]:
     """Return the unit upward normal and a point of the plane of a triangle's cluster, in the window frame.
 
-    A cluster of several triangles reads its plane record; a triangle alone uses its own plane, from edge
-    vectors of integer index differences.
+    A cluster of several triangles reads its plane record and evaluates the plane over the window's reference
+    vertex, in float64 from exact grid steps, so the point is window-local however far the cluster's anchor (its
+    lowest-id vertex) lies: a point at a far anchor would carry the float32 rounding of that distance into every
+    plane distance. A triangle alone uses its own plane, from edge vectors of integer index differences.
     """
     surface = window.surface
     cluster = terrain_cluster(data, surface, r, c, sub)
@@ -387,7 +389,16 @@ def terrain_cluster_plane(
         ra = plane.anchor // surface.ncol
         ca = plane.anchor - ra * surface.ncol
         n = wp.normalize(wp.vec3(-plane.gx, -plane.gy, 1.0))
-        return n, terrain_window_vertex(data, window, ra, ca) + wp.vec3(0.0, 0.0, plane.offset)
+        # z(anchor) + offset + g . (reference - anchor) - z_ref; a gradient times a grid step count is exact.
+        dx = wp.float64(2.0) * wp.float64(surface.hx) / wp.float64(surface.ncol - 1)
+        dy = wp.float64(2.0) * wp.float64(surface.hy) / wp.float64(surface.nrow - 1)
+        z = (
+            (wp.float64(terrain_height(data, surface, ra, ca)) - wp.float64(window.z_ref))
+            + wp.float64(plane.offset)
+            + wp.float64(plane.gx) * wp.float64(window.c0 - ca) * dx
+            + wp.float64(plane.gy) * wp.float64(window.r0 - ra) * dy
+        )
+        return n, wp.vec3(0.0, 0.0, wp.float32(z))
     a, b, d = terrain_triangle_vertices(r, c, sub)
     za = terrain_height(data, surface, a[0], a[1])
     e1 = wp.vec3(

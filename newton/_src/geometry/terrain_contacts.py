@@ -13,7 +13,7 @@ Plane clusters are built by Warp kernels on the model's device, round by round o
 assigned:
 
 1. Components over the flat edges (the far vertex of one side within ``1 um`` of the other side's plane).
-2. Three candidate planes per component: the extreme plane through its lowest vertex ``a``, the vertex ``b``
+2. Three candidate planes per component: the extreme plane through its lowest-id vertex ``a``, the vertex ``b``
    farthest from ``a`` and the vertex ``c`` spanning the largest triangle with them (grid units, lowest id on
    ties), and the level (horizontal) plane, each with its offset centred on the component's residual range; and
    the seed plane of its lowest-id triangle.
@@ -278,7 +278,7 @@ def _cluster_reset_roots(
 def _cluster_extreme_a(grid: _Grid, active: wp.array[wp.int32], parent: wp.array[wp.int32], va: wp.array[wp.int32]):
     t = wp.tid()
     if active[t] != 0:
-        # The lowest vertex of a triangle is its p00.
+        # The lowest-id vertex of a triangle is its p00.
         wp.atomic_min(va, parent[t], _triangle_vertex(grid, t, 0))
 
 
