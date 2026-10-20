@@ -61,6 +61,7 @@ from .terrain_law import (
     TERRAIN_PAIR_ROW_OVERFLOW,
     TERRAIN_PAIR_STALE,
     TERRAIN_PAIR_TILE_EXIT,
+    TERRAIN_PAIR_UNSUPPORTED,
     TERRAIN_PAIR_WIDE,
     TerrainLawRows,
     TerrainPairInputs,
@@ -120,7 +121,7 @@ TERRAIN_PAIR_STATES = {
     "row_overflow": int(TERRAIN_PAIR_ROW_OVERFLOW),
     "candidate_overflow": int(TERRAIN_PAIR_CANDIDATE_OVERFLOW),
     "wide": int(TERRAIN_PAIR_WIDE),
-    "unsupported": 256,  # terrain_law_solid.TERRAIN_PAIR_UNSUPPORTED (a shape of a solid class with no core yet)
+    "unsupported": int(TERRAIN_PAIR_UNSUPPORTED),
 }
 """Names of the ``TERRAIN_PAIR_*`` state bits."""
 

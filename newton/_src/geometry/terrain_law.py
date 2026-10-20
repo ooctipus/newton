@@ -145,6 +145,8 @@ TERRAIN_PAIR_WIDE = wp.constant(64)
 TERRAIN_PAIR_FULL = wp.constant(128)
 """Pair state, transient: the finish may drop some of the pair's distinct rows, and the pair awaits its type's full
 finish kernel."""
+TERRAIN_PAIR_UNSUPPORTED = wp.constant(256)
+"""Pair state: the partner's shape has no core in the law yet (a barrel cylinder in the hull class; no row)."""
 TERRAIN_WINDOW_WIDE = 64
 """Cells across a window from which feature ids are no longer unique."""
 TERRAIN_PLANE_CACHE = 4
@@ -317,7 +319,8 @@ class TerrainPlanes:
 class TerrainPairInputs:
     """What the law's per-type kernels read of a pair besides the terrain: its shapes and the pipeline's pair policy.
 
-    Every per-type kernel takes ``(begin, slot_begin, inputs, data, out)``: it handles pairs ``begin + i`` of the
+    Every per-type kernel takes ``(begin, slot_begin, inputs, data, out)``, the solid classes' with a sixth argument,
+    their :class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData`: it handles pairs ``begin + i`` of the
     static pair table (:class:`~newton._src.geometry.terrain_contacts.TerrainPairTable`) and writes pair
     ``begin + i``'s rows to slots ``slot_begin + i * K``, ``K`` its partner class's row limit.
     """

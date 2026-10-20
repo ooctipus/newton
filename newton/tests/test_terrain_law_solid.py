@@ -41,6 +41,7 @@ from newton._src.geometry.terrain_contacts import (
 )
 from newton._src.geometry.terrain_law import (
     TERRAIN_PAIR_ROW_OVERFLOW,
+    TERRAIN_PAIR_UNSUPPORTED,
     TERRAIN_ROW_CANDIDATES,
     TerrainLawRows,
     TerrainPairInputs,
@@ -902,7 +903,7 @@ class TestTerrainLawSolid(unittest.TestCase):
         pipeline, _contacts, _state = _collide(model, shadow=True)
         rows = pipeline._terrain_law_shadow.rows()
         self.assertEqual(int(rows["count"][0]), 0)
-        self.assertEqual(int(rows["state"][0]), 256)
+        self.assertEqual(int(rows["state"][0]), int(TERRAIN_PAIR_UNSUPPORTED))
 
     def test_solid_kernels_compile_without_contraction_cpu(self):
         """Compile the solid classes' kernels to PTX without fused multiply-adds (NVRTC, any host).

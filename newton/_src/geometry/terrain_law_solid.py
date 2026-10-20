@@ -62,6 +62,7 @@ from .terrain_law import (
     TERRAIN_PAIR_OUTSIDE,
     TERRAIN_PAIR_STALE,
     TERRAIN_PAIR_TILE_EXIT,
+    TERRAIN_PAIR_UNSUPPORTED,
     TERRAIN_PAIR_WIDE,
     TERRAIN_ROW_CANDIDATES,
     TERRAIN_VERTEX_SPAN,
@@ -129,8 +130,6 @@ TERRAIN_SOLID_SCRATCH_MIN = 256
 TERRAIN_HULL_FACE_TOL = 1.0e-6
 """A hull's points within this of a face's plane lie on that face [m] (hulls under 1 m; their local frame): a planar
 face of a float32 mesh stays one face (its points lie within about 1e-8 m of its plane)."""
-TERRAIN_PAIR_UNSUPPORTED = 256
-"""Pair state: the partner's shape has no core in the law yet (a barrel cylinder; no row)."""
 
 _BISECTION = wp.constant(TERRAIN_SOLID_BISECTION)
 _ArcNormals = wp.types.matrix(shape=(TERRAIN_SOLID_ARC_SAMPLES, 3), dtype=wp.float32)
@@ -141,7 +140,6 @@ _EPS32 = wp.constant(TERRAIN_EPS32)
 _HUGE = wp.constant(3.0e38)
 _MASK_WORDS = wp.constant(TERRAIN_SOLID_MASK_WORDS)
 _ITEMS = wp.constant(6)
-_UNSUPPORTED = wp.constant(TERRAIN_PAIR_UNSUPPORTED)
 _NORMAL_SAME = wp.constant(TERRAIN_NORMAL_SAME)
 _VERTEX_SPAN = wp.constant(TERRAIN_VERTEX_SPAN)
 
@@ -1089,7 +1087,7 @@ def solid_replay(
 def solid_unsupported(out: TerrainLawRows, pair_index: int):
     """Record a pair whose partner has no core in the law (no row)."""
     out.count[pair_index] = 0
-    out.state[pair_index] = _UNSUPPORTED
+    out.state[pair_index] = TERRAIN_PAIR_UNSUPPORTED
 
 
 # ----------------------------------------------------------------------------------------------------------------
