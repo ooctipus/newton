@@ -57,6 +57,8 @@ REACH = 0.04
 """Margins and gaps of the pair [m]."""
 WINDOW_BAND = 8.0 * float(np.finfo(np.float32).eps) * 0.4
 """The closed predicates' band of a 0.4 m window [m] (:func:`terrain_eps`)."""
+CANONICAL_BAND = 8.0 * float(np.finfo(np.float32).eps) * 1.0
+"""The band the canonical-value kernel sets (``terrain_eps(1.0)``) [m]."""
 
 
 @wp.kernel(enable_backward=False)
@@ -332,79 +334,89 @@ class TestTerrainLawSurface(unittest.TestCase):
                 else:
                     self.assertGreaterEqual(len(support), 3, msg=f"upright cylinder at {label}")
 
-    def test_window_frame_has_no_cracks_cpu(self):
-        """Compute a vertex shared by neighbouring cells identically in the window-local frame.
 
-        Today's per-cell frame places the same vertex up to 9.5 um apart in neighbouring cells; the window
-        frame derives every vertex from integer index differences, so all cells of a window read one value.
-        """
-        heights, hx, hy = _strip("x")
-        model = tu.heightfield_model(heights, hx, hy, device="cpu")
-        features = TerrainFeatures(model)
-        gx, _gy = _frame_gaps(model, "x")
-        line = int(np.argmax(np.abs(gx)))
-        self.assertGreater(abs(gx[line]), 9.0e-6)
-        # Face values of the two cells meeting at that line, read for points on it: exact negatives inside one
-        # cluster, and the edge's own values equal the faces'.
-        r = SHORT_COUNT // 2
-        row = model.heightfield_data.numpy()[0]
-        x = np.float32(-np.float32(row["hx"]) + np.float32(line) * np.float32(0.1))
-        edges = [(r, line, 1), (r, line, 1), (r, line - 1, 2), (r, line, 0)]
-        points = [(x, -0.03, 0.02), (x, 0.05, -0.01), (x - 0.05, 0.05, 0.0), (x + 0.03, 0.0, 0.1)]
-        faces, values, _planes = self._canonical(features, edges, points)
-        for (fa, fb), v in zip(faces, values, strict=True):
-            self.assertEqual(fa, v[0])
-            self.assertEqual(fb, v[1])
-            self.assertEqual(fa, -fb)
+def _canonical(features, edges, points):
+    device = features.device
+    n = len(edges)
+    faces = wp.zeros(n, dtype=wp.vec2, device=device)
+    values = wp.zeros(n, dtype=wp.vec4, device=device)
+    planes = wp.zeros(n, dtype=wp.vec2, device=device)
+    wp.launch(
+        _canonical_values,
+        dim=n,
+        inputs=[
+            features.data(),
+            wp.array(np.asarray(edges, np.int32), dtype=wp.vec3i, device=device),
+            wp.array(np.asarray(points, np.float32), dtype=wp.vec3, device=device),
+        ],
+        outputs=[faces, values, planes],
+        device=device,
+    )
+    return faces.numpy(), values.numpy(), planes.numpy()
 
-    def test_canonical_values_on_rough_terrain_cpu(self):
-        """Read one value on both sides of every boundary: face and edge share ``s``, a cluster negates it."""
-        rng = np.random.default_rng(5)
-        heights = tu.suite_like_heights(rng, 64, 64)
-        model = tu.heightfield_model(heights, 3.2, 3.2, device="cpu")
-        features = TerrainFeatures(model)
-        hf = tu.reference_surface(model)
-        clusters = ref.cluster_ids(hf.cluster)
-        edges, points, same = [], [], []
-        for _ in range(600):
-            r, c = (int(v) for v in rng.integers(1, 63, size=2))
-            which = int(rng.integers(0, 3))
-            a = {0: (r - 1, c, 1), 1: (r, c - 1, 0), 2: (r, c, 0)}[which]
-            b = {0: (r, c, 0), 1: (r, c, 1), 2: (r, c, 1)}[which]
-            v0 = hf.V(r, c)
-            v1 = hf.V(*{0: (r, c + 1), 1: (r + 1, c), 2: (r + 1, c + 1)}[which])
-            p = v0 + rng.uniform(-0.2, 1.2) * (v1 - v0) + np.array([0.0, 0.0, rng.uniform(-0.02, 0.05)])
-            edges.append((r, c, which))
-            points.append(p)
-            same.append(clusters[hf.tri_id(*a)] == clusters[hf.tri_id(*b)])
-        faces, values, _planes = self._canonical(features, edges, points)
-        for (fa, fb), v, flat in zip(faces, values, same, strict=True):
-            self.assertEqual(fa, v[0])
-            self.assertEqual(fb, v[1])
-            if flat:
-                self.assertEqual(fa, -fb)
-        self.assertGreater(sum(same), 50)
-        self.assertLess(sum(same), len(same) - 50)
 
-    @staticmethod
-    def _canonical(features, edges, points):
-        device = features.device
-        n = len(edges)
-        faces = wp.zeros(n, dtype=wp.vec2, device=device)
-        values = wp.zeros(n, dtype=wp.vec4, device=device)
-        planes = wp.zeros(n, dtype=wp.vec2, device=device)
-        wp.launch(
-            _canonical_values,
-            dim=n,
-            inputs=[
-                features.data(),
-                wp.array(np.asarray(edges, np.int32), dtype=wp.vec3i, device=device),
-                wp.array(np.asarray(points, np.float32), dtype=wp.vec3, device=device),
-            ],
-            outputs=[faces, values, planes],
-            device=device,
-        )
-        return faces.numpy(), values.numpy(), planes.numpy()
+def _assert_canonical(test, device, faces, values, same):
+    """Face and edge read one value at an edge, negated across it inside one cluster.
+
+    Bit for bit on the CPU. CUDA's default contraction may fuse the call sites differently; the values must then
+    agree within a quarter of the band (:func:`terrain_eps`), so a closed claim on either side covers the other's.
+    """
+    tolerance = 0.0 if device.is_cpu else 0.25 * CANONICAL_BAND
+    for (fa, fb), v, flat in zip(faces, values, same, strict=True):
+        test.assertLessEqual(abs(float(fa) - float(v[0])), tolerance)
+        test.assertLessEqual(abs(float(fb) - float(v[1])), tolerance)
+        if flat:
+            test.assertLessEqual(abs(float(fa) + float(fb)), tolerance)
+
+
+def test_window_frame_has_no_cracks(test, device):
+    """Compute a vertex shared by neighbouring cells identically in the window-local frame.
+
+    Today's per-cell frame places the same vertex up to 9.5 um apart in neighbouring cells; the window frame
+    derives every vertex from integer index differences, so all cells of a window read one value. The face values
+    of the two cells meeting at the worst line, read for points on it, are exact negatives inside one cluster, and
+    the edge's own values equal the faces' (on CUDA, within a quarter of the band).
+    """
+    heights, hx, hy = _strip("x")
+    model = tu.heightfield_model(heights, hx, hy, device=device)
+    features = TerrainFeatures(model)
+    # The worst crack of today's per-cell frame, as the CPU computes it.
+    gx, _gy = _frame_gaps(tu.heightfield_model(heights, hx, hy, device="cpu"), "x")
+    line = int(np.argmax(np.abs(gx)))
+    test.assertGreater(abs(gx[line]), 9.0e-6)
+    r = SHORT_COUNT // 2
+    row = model.heightfield_data.numpy()[0]
+    x = np.float32(-np.float32(row["hx"]) + np.float32(line) * np.float32(0.1))
+    edges = [(r, line, 1), (r, line, 1), (r, line - 1, 2), (r, line, 0)]
+    points = [(x, -0.03, 0.02), (x, 0.05, -0.01), (x - 0.05, 0.05, 0.0), (x + 0.03, 0.0, 0.1)]
+    faces, values, _planes = _canonical(features, edges, points)
+    _assert_canonical(test, device, faces, values, [True] * len(edges))
+
+
+def test_canonical_values_on_rough_terrain(test, device):
+    """Read one value on both sides of every boundary: face and edge share ``s``, a cluster negates it."""
+    rng = np.random.default_rng(5)
+    heights = tu.suite_like_heights(rng, 64, 64)
+    model = tu.heightfield_model(heights, 3.2, 3.2, device=device)
+    features = TerrainFeatures(model)
+    hf = tu.reference_surface(model)
+    clusters = ref.cluster_ids(hf.cluster)
+    edges, points, same = [], [], []
+    for _ in range(600):
+        r, c = (int(v) for v in rng.integers(1, 63, size=2))
+        which = int(rng.integers(0, 3))
+        a = {0: (r - 1, c, 1), 1: (r, c - 1, 0), 2: (r, c, 0)}[which]
+        b = {0: (r, c, 0), 1: (r, c, 1), 2: (r, c, 1)}[which]
+        v0 = hf.V(r, c)
+        v1 = hf.V(*{0: (r, c + 1), 1: (r + 1, c), 2: (r + 1, c + 1)}[which])
+        p = v0 + rng.uniform(-0.2, 1.2) * (v1 - v0) + np.array([0.0, 0.0, rng.uniform(-0.02, 0.05)])
+        edges.append((r, c, which))
+        points.append(p)
+        same.append(clusters[hf.tri_id(*a)] == clusters[hf.tri_id(*b)])
+    faces, values, _planes = _canonical(features, edges, points)
+    _assert_canonical(test, device, faces, values, same)
+    test.assertGreater(sum(same), 50)
+    test.assertLess(sum(same), len(same) - 50)
 
 
 def _rough_strip(rng, long_axis):
@@ -562,6 +574,15 @@ def test_plane_distances_stay_window_precise_on_large_clusters(test, device):
 
 
 devices = get_test_devices()
+add_function_test(
+    TestTerrainLawSurface, "test_window_frame_has_no_cracks", test_window_frame_has_no_cracks, devices=devices
+)
+add_function_test(
+    TestTerrainLawSurface,
+    "test_canonical_values_on_rough_terrain",
+    test_canonical_values_on_rough_terrain,
+    devices=devices,
+)
 add_function_test(
     TestTerrainLawSurface,
     "test_plane_distances_stay_window_precise_on_large_clusters",
