@@ -33,20 +33,14 @@ from newton._src.geometry.terrain_law_point import TERRAIN_POINT_ROWS
 from newton._src.geometry.terrain_shadow import TERRAIN_LAW_KERNELS, parse_terrain_law_shadow
 from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_test_utils as tu
-from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
+from newton.tests.unittest_utils import (
+    add_function_test,
+    get_cuda_test_devices,
+    get_test_devices,
+    scoped_capture_after_gc,
+)
 
 PIPELINE = {"rigid_contact_max": 1 << 14, "max_triangle_pairs": 1 << 16}
-CONTACT_FIELDS = (
-    "rigid_contact_shape0",
-    "rigid_contact_shape1",
-    "rigid_contact_point0",
-    "rigid_contact_point1",
-    "rigid_contact_offset0",
-    "rigid_contact_offset1",
-    "rigid_contact_normal",
-    "rigid_contact_margin0",
-    "rigid_contact_margin1",
-)
 
 
 def _mixed_scene(device):
@@ -88,17 +82,15 @@ def _contacts(pipeline, model, state=None):
 
 
 def _contact_arrays(contacts) -> dict:
+    """Every ``rigid_contact_*`` array of a :class:`newton.Contacts`, the per-contact ones cut to the contact count."""
     count = int(contacts.rigid_contact_count.numpy()[0])
-    return {name: getattr(contacts, name).numpy()[:count] for name in CONTACT_FIELDS} | {"count": count}
-
-
-def _sorted_rows(arrays) -> np.ndarray:
-    """Contacts as rows of their bits, sorted (CUDA writes them in atomic order)."""
-    columns = [
-        np.ascontiguousarray(arrays[name]).view(np.int32).reshape(arrays["count"], -1) for name in CONTACT_FIELDS
-    ]
-    rows = np.concatenate(columns, axis=1) if arrays["count"] else np.zeros((0, 1), np.int32)
-    return rows[np.lexsort(rows.T[::-1])] if len(rows) else rows
+    out = {"count": count}
+    for name in sorted(vars(contacts)):
+        array = getattr(contacts, name)
+        if name.startswith("rigid_contact_") and isinstance(array, wp.array):
+            values = array.numpy()
+            out[name] = values[:count] if values.shape[0] == contacts.rigid_contact_max else values
+    return out
 
 
 def _unset():
@@ -108,46 +100,75 @@ def _unset():
 
 
 def test_shadow_keeps_contacts_bitwise(test, device):
-    """Write today's contacts bit for bit with the shadow running beside the terrain route."""
+    """Write today's contacts bit for bit with the shadow running beside the terrain route.
+
+    Every ``rigid_contact_*`` array is compared in place. On CUDA both pipelines are deterministic: by default the
+    global reducer breaks score ties by atomic order, so two pipelines without the shadow could already differ.
+    """
     model, _terrain = _mixed_scene(device)
-    with _unset():
-        today = newton.CollisionPipeline(model, **PIPELINE)
-    shadow = tu.shadow_pipeline(model, **PIPELINE)
-    test.assertIsNone(today._terrain_law_shadow)
-    test.assertIsNotNone(shadow._terrain_law_shadow)
     state = model.state()
-    a = _contact_arrays(_contacts(today, model, state))
-    b = _contact_arrays(_contacts(shadow, model, state))
-    test.assertGreater(a["count"], 20)
-    test.assertEqual(a["count"], b["count"])
-    if device.is_cpu:
-        for name in CONTACT_FIELDS:
-            np.testing.assert_array_equal(a[name], b[name], err_msg=name)
-    else:
-        np.testing.assert_array_equal(_sorted_rows(a), _sorted_rows(b))
-    rows = shadow._terrain_law_shadow.rows()
-    test.assertGreater(int(rows["count"].sum()), 0)
+    for deterministic in (False, True) if device.is_cpu else (True,):
+        with test.subTest(deterministic=deterministic):
+            with _unset():
+                today = newton.CollisionPipeline(model, deterministic=deterministic, **PIPELINE)
+            shadow = tu.shadow_pipeline(model, deterministic=deterministic, **PIPELINE)
+            test.assertIsNone(today._terrain_law_shadow)
+            test.assertIsNotNone(shadow._terrain_law_shadow)
+            a = _contact_arrays(_contacts(today, model, state))
+            b = _contact_arrays(_contacts(shadow, model, state))
+            test.assertGreater(a["count"], 20)
+            test.assertEqual(sorted(a), sorted(b))
+            test.assertGreater(len(a), 12)
+            for name, values in a.items():
+                np.testing.assert_array_equal(values, b[name], err_msg=name)
+            test.assertGreater(int(shadow._terrain_law_shadow.rows()["count"].sum()), 0)
 
 
 def test_shadow_runs_under_graph_capture(test, device):
-    """Capture the shadow with the collide in a CUDA graph and replay it to the rows of an uncaptured collide."""
+    """Capture the shadow with the collide in a CUDA graph and replay it to the rows of an uncaptured collide.
+
+    The shadow's launches are also captured alone with the device's memory pool off, so that an allocation inside
+    them raises instead of becoming a graph allocation node.
+    """
     model, _terrain = _mixed_scene(device)
     pipeline = tu.shadow_pipeline(model, **PIPELINE)
+    shadow = pipeline._terrain_law_shadow
     state = model.state()
     contacts = pipeline.contacts()
     pipeline.collide(state, contacts)
-    expected = pipeline._terrain_law_shadow.rows()
+    expected = shadow.rows()
     # Move the bodies, so that the replay must recompute the rows.
     moved = model.state()
     q = moved.body_q.numpy()
     q[:, 2] += 0.5
     moved.body_q.assign(q)
     pipeline.collide(moved, contacts)
-    test.assertEqual(int(pipeline._terrain_law_shadow.rows()["count"].sum()), 0)
-    with wp.ScopedCapture(device=device) as capture:
+    test.assertEqual(int(shadow.rows()["count"].sum()), 0)
+    with scoped_capture_after_gc(device=device) as capture:
         pipeline.collide(state, contacts)
     wp.capture_launch(capture.graph)
-    replayed = pipeline._terrain_law_shadow.rows()
+    replayed = shadow.rows()
+    for name in ("count", "state", "q", "n", "d", "feature"):
+        np.testing.assert_array_equal(replayed[name], expected[name], err_msg=name)
+    # The shadow alone without a memory pool; its replay recomputes rows forgotten after an uncaptured collide.
+    pooled = wp.is_mempool_enabled(device)
+    wp.set_mempool_enabled(device, False)
+    try:
+        with scoped_capture_after_gc(device=device) as capture:
+            shadow.launch(
+                pipeline.geom_transform,
+                pipeline.geom_data,
+                shape_type=model.shape_type,
+                shape_gap=model.shape_gap,
+                shape_heightfield_index=model.shape_heightfield_index,
+                **pipeline._broad_phase_pair_filter(model),
+            )
+    finally:
+        wp.set_mempool_enabled(device, pooled)
+    pipeline.collide(state, contacts)
+    shadow._out.count.zero_()
+    wp.capture_launch(capture.graph)
+    replayed = shadow.rows()
     for name in ("count", "state", "q", "n", "d", "feature"):
         np.testing.assert_array_equal(replayed[name], expected[name], err_msg=name)
 
