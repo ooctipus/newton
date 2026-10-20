@@ -134,6 +134,12 @@ def audit_system(copies, law):
     return contact_system(normals, [W0_AUDIT[0]] * copies, anchors=anchors)
 
 
+def sticking_system():
+    """The audit block's normal with a small tangential residual, which the contact's friction holds still."""
+    L = np.linalg.cholesky(W_AUDIT)
+    return contact_system([L[0]], [W0_AUDIT[0]], anchors={0: (L[1], L[2], -0.01, 0.02)}, ring=False)
+
+
 def concatenate(systems):
     """Systems on one shared body as one system: rows stacked, Delassus from the stacked Jacobian."""
     offsets = np.cumsum([0] + [len(s["rhs"]) for s in systems])
@@ -295,53 +301,75 @@ class World:
         return [out[k, : self.count[k]] for k in range(len(self.systems))]
 
 
-def sweep_free_body(system, iterations, update, ring_units=1):
-    """Sweep a system as the free-body rows of one body (identity mass, rows over its first coordinates)."""
-    J = system["J"]
-    m, dofs = J.shape
-    J6 = np.zeros((1, m, 6), np.float32)
-    J6[0, :, :dofs] = J
-    v = np.zeros(6, np.float32)
-    # The body's velocity gives each row its residual at zero impulse (the rows carry no bias).
-    v[:dofs] = np.linalg.lstsq(J, system["rhs"], rcond=None)[0]
-    impulses = wp.zeros((1, m), dtype=float, device=_CPU)
-    velocity = wp.array(v, dtype=float, device=_CPU)
-    arrays = [
-        wp.array([m], dtype=int, device=_CPU),
-        wp.zeros((1, m), dtype=int, device=_CPU),
-        wp.full((1, m), -1, dtype=int, device=_CPU),
-        wp.array(J6, dtype=float, device=_CPU),
-        wp.zeros((1, m, 6), dtype=float, device=_CPU),
-        wp.array(J6, dtype=float, device=_CPU),
-        wp.zeros((1, m, 6), dtype=float, device=_CPU),
-        wp.array((1.0 / np.einsum("ij,ij->i", J, J))[None].astype(np.float32), dtype=float, device=_CPU),
-        wp.zeros((1, m), dtype=float, device=_CPU),
-        wp.array(system["rtype"][None], dtype=int, device=_CPU),
-        wp.array(system["parent"][None], dtype=int, device=_CPU),
-        wp.array(system["mu"][None].astype(np.float32), dtype=float, device=_CPU),
-        wp.ones((1, m), dtype=float, device=_CPU),
-        wp.array([0], dtype=int, device=_CPU),
-        wp.array([0], dtype=int, device=_CPU),
-        iterations,
-        1.0,
-        0,
-    ]
-    if update == "unit":
-        inputs = [
-            *arrays,
-            0,
-            0,
-            ring_units,
-            wp.zeros((1, m, contact_unit_sweeps.CONTACT_UNIT_STATE_FIELDS), dtype=float, device=_CPU),
+class FreeBody:
+    """A system as the free-body rows of one body (identity mass, rows over its first coordinates).
+
+    Swept by the free-body kernel each law launches; the unit sweep's storage persists across sweeps, as the
+    solver keeps it.
+    """
+
+    def __init__(self, system):
+        self.system = system
+        J = system["J"]
+        self.m = m = J.shape[0]
+        J6 = np.zeros((1, m, 6), np.float32)
+        J6[0, :, : J.shape[1]] = J
+        # The body's velocity gives each row its residual at zero impulse (the rows carry no bias).
+        self.velocity = np.zeros(6, np.float32)
+        self.velocity[: J.shape[1]] = np.linalg.lstsq(J, system["rhs"], rcond=None)[0]
+        self.arrays = [
+            wp.array([m], dtype=int, device=_CPU),
             wp.zeros((1, m), dtype=int, device=_CPU),
-            wp.zeros(contact_unit.RING_BLOCK_SIZE, dtype=float, device=_CPU),
+            wp.full((1, m), -1, dtype=int, device=_CPU),
+            wp.array(J6, dtype=float, device=_CPU),
+            wp.zeros((1, m, 6), dtype=float, device=_CPU),
+            wp.array(J6, dtype=float, device=_CPU),
+            wp.zeros((1, m, 6), dtype=float, device=_CPU),
+            wp.array((1.0 / np.einsum("ij,ij->i", J, J))[None].astype(np.float32), dtype=float, device=_CPU),
+            wp.zeros((1, m), dtype=float, device=_CPU),
+            wp.array(system["rtype"][None], dtype=int, device=_CPU),
+            wp.array(system["parent"][None], dtype=int, device=_CPU),
+            wp.array(system["mu"][None].astype(np.float32), dtype=float, device=_CPU),
         ]
-        kernel = contact_unit_sweeps.pgs_solve_mf_loop_unit
-    else:
-        inputs = [*arrays, int(K.FRICTION_MODE_CURRENT), 0, 0]
-        kernel = K.pgs_solve_mf_loop
-    wp.launch(kernel, dim=1, inputs=inputs, outputs=[impulses, velocity], device=_CPU)
-    return impulses.numpy()[0].astype(np.float64)
+        self.state = wp.zeros((1, m, contact_unit_sweeps.CONTACT_UNIT_STATE_FIELDS), dtype=float, device=_CPU)
+        self.rows = wp.zeros((1, m), dtype=int, device=_CPU)
+        self.block = wp.zeros(contact_unit.RING_BLOCK_SIZE, dtype=float, device=_CPU)
+
+    def sweep(self, iterations, update, *, ring_units=1, row_weight=1.0, offsets=None):
+        """Sweep from zero impulses ``iterations`` times under one contact update and return the impulses.
+
+        Args:
+            iterations: Sweeps of the solve.
+            update: ``"sequential"`` or ``"unit"``.
+            ring_units: 1 solves a patch ring as one ring unit, 0 as anchor units.
+            row_weight: Contact rows' regularization weight ``1 / (1 + g)``; below 1 the sweeps regularize them.
+            offsets: The ``iteration_offset`` of each launch of one sweep; ``None`` launches every sweep at once.
+        """
+        weights = np.where(self.system["rtype"] == CONTACT, row_weight, 1.0)[None].astype(np.float32)
+        arrays = [
+            *self.arrays,
+            wp.array(weights, dtype=float, device=_CPU),
+            wp.array([0], dtype=int, device=_CPU),
+            wp.array([0], dtype=int, device=_CPU),
+        ]
+        impulses = wp.zeros((1, self.m), dtype=float, device=_CPU)
+        velocity = wp.array(self.velocity, dtype=float, device=_CPU)
+        regularize = int(row_weight < 1.0)
+        launches = [(iterations, 0)] if offsets is None else [(1, int(offset)) for offset in offsets]
+        for count, offset in launches:
+            if update == "unit":
+                inputs = [*arrays, count, 1.0, regularize, 0, offset, ring_units, self.state, self.rows, self.block]
+                kernel = contact_unit_sweeps.pgs_solve_mf_loop_unit
+            else:
+                inputs = [*arrays, count, 1.0, regularize, int(K.FRICTION_MODE_CURRENT), 0, offset]
+                kernel = K.pgs_solve_mf_loop
+            wp.launch(kernel, dim=1, inputs=inputs, outputs=[impulses, velocity], device=_CPU)
+        return impulses.numpy()[0].astype(np.float64)
+
+
+def sweep_free_body(system, iterations, update, **options):
+    """Sweep a system as the free-body rows of one body with fresh unit storage (see :meth:`FreeBody.sweep`)."""
+    return FreeBody(system).sweep(iterations, update, **options)
 
 
 # -- metrics ----------------------------------------------------------------------------------------------------
@@ -483,6 +511,11 @@ class TestContactUpdateAuditBlock(unittest.TestCase):
             ("patch2", 3),
         )
 
+    @staticmethod
+    def forms(law):
+        """The unit sweep's forms of a law's rings: ring units (1) and, for patch rings, anchor units (0, Stage A)."""
+        return (1,) if law == "point" else (1, 0)
+
     def check(self, system, lam):
         normals = np.flatnonzero(system["rtype"] == CONTACT)
         _, w = residuals(system, lam)
@@ -490,21 +523,55 @@ class TestContactUpdateAuditBlock(unittest.TestCase):
         self.assertGreaterEqual(w[normals].min(), -1.0e-5)
 
     def test_unit_loop_holds_the_audit_block(self):
-        """Hold the audit block's exact load with no approach at 8 and 9 sweeps, for 1-3 copies under both laws."""
+        """Hold the audit block's exact load with no approach at 8 and 9 sweeps, for 1-3 copies under both laws.
+
+        Patch rings run as ring units and as anchor units (patch Stage A).
+        """
         self.assertAlmostEqual(self.load, 0.40878, places=4)
         for law, copies in self.cases():
             system = audit_system(copies, law)
-            for sweeps in (8, 9):
-                with self.subTest(law=law, copies=copies, sweeps=sweeps):
-                    self.check(system, World([system]).sweep(sweeps, "unit")[0])
+            for ring_units in self.forms(law):
+                for sweeps in (8, 9):
+                    with self.subTest(law=law, copies=copies, ring_units=ring_units, sweeps=sweeps):
+                        self.check(system, World([system]).sweep(sweeps, "unit", ring_units=ring_units)[0])
 
     def test_unit_free_body_loop_holds_the_audit_block(self):
-        """Hold the audit block's exact load in the free-body loop sweep, for 1-3 copies under both laws."""
+        """Hold the audit block's exact load in the free-body loop sweep, for 1-3 copies under both laws.
+
+        Patch rings run as ring units and as anchor units (patch Stage A).
+        """
         for law, copies in self.cases():
             system = audit_system(copies, law)
-            for sweeps in (8, 9):
-                with self.subTest(law=law, copies=copies, sweeps=sweeps):
-                    self.check(system, sweep_free_body(system, sweeps, "unit"))
+            for ring_units in self.forms(law):
+                for sweeps in (8, 9):
+                    with self.subTest(law=law, copies=copies, ring_units=ring_units, sweeps=sweeps):
+                        self.check(system, sweep_free_body(system, sweeps, "unit", ring_units=ring_units))
+
+    def test_unit_free_body_loop_solves_the_regularized_law(self):
+        """Solve regularized contact normals in the free-body loop sweep to the sequential w-form update's loads.
+
+        A contact row of weight ``w = 1 / (1 + g)`` comes to rest where ``min(d lambda_n, v_n + (1/w - 1) d
+        lambda_n) = 0``, ``d`` its diagonal; the unit solves its normal against ``d / w``, the same law. Without the
+        weight it would converge to the rigid loads instead (the audit block's 0.4088 against 0.136-0.401 at these
+        weights). The unit sweep is checked after 512 sweeps; the sequential w-form, which needs up to 2048 on
+        three copies of the sliding ring at weight 0.9, after 2048.
+        """
+        systems = [("stick", 1, sticking_system())] + [(law, n, audit_system(n, law)) for law, n in self.cases()]
+        for law, copies, system in systems:
+            normals = np.flatnonzero(system["rtype"] == CONTACT)
+            pairs = pairs_of(system)
+            d = system["diag"]
+            for weight in (0.9, 0.5, 0.2):
+                sequential = sweep_free_body(system, 2048, "sequential", row_weight=weight)
+                for ring_units in self.forms(law):
+                    with self.subTest(law=law, copies=copies, weight=weight, ring_units=ring_units):
+                        lam = sweep_free_body(system, 512, "unit", ring_units=ring_units, row_weight=weight)
+                        residual, v = residuals(system, lam)
+                        regularized = np.minimum(d * lam, v + (1.0 / weight - 1.0) * d * lam)[normals]
+                        self.assertLessEqual(np.abs(regularized).max(), 1.0e-6)
+                        self.assertLessEqual(residual[pairs].max(), 1.0e-6)
+                        load = sequential[normals].sum()
+                        self.assertAlmostEqual(lam[normals].sum(), load, delta=1.0e-4 * load)
 
     def test_sequential_loop_cycles_on_the_audit_block(self):
         """Keep the sequential law's period-two cycle: 0.043 then 0.772 at 8 and 9 sweeps, approaching at 0.126 m/s."""
@@ -591,21 +658,27 @@ class TestContactUpdateReplica(unittest.TestCase):
         return [*forms, ("unit", 0)] if law == "patch" else forms
 
     def test_zero_normal_events_recover(self):
-        """Recover every group the sequential sweep leaves unloaded and approaching at 8 sweeps."""
+        """Recover every group the sequential sweep leaves unloaded and approaching at 8 sweeps.
+
+        Patch rings run as ring units and as anchor units (patch Stage A).
+        """
         cases = list(self.tagged("zero_end"))
         self.assertEqual(len(cases), 7)
         world = World([system for _, system in cases])
         sequential = world.sweep(8, "sequential")
-        unit = world.sweep(8, "unit")
-        for (law, system), before, after in zip(cases, sequential, unit, strict=True):
-            with self.subTest(law=law, system=system["source"]):
-                events = zero_normal_groups(system, before)
-                self.assertGreater(len(events), 0)
-                self.assertEqual(len(zero_normal_groups(system, after)), 0)
-                _, w = residuals(system, after)
-                self.assertLessEqual(np.maximum(-w[system["rtype"] == CONTACT], 0.0).max(), 1.0e-3)
-                reference = group_loads(system, system["lam_ref"])[events]
-                np.testing.assert_allclose(group_loads(system, after)[events], reference, rtol=0.02)
+        for ring_units in (1, 0):
+            unit = world.sweep(8, "unit", ring_units=ring_units)
+            for (law, system), before, after in zip(cases, sequential, unit, strict=True):
+                if law == "point" and ring_units == 0:
+                    continue
+                with self.subTest(law=law, system=system["source"], ring_units=ring_units):
+                    events = zero_normal_groups(system, before)
+                    self.assertGreater(len(events), 0)
+                    self.assertEqual(len(zero_normal_groups(system, after)), 0)
+                    _, w = residuals(system, after)
+                    self.assertLessEqual(np.maximum(-w[system["rtype"] == CONTACT], 0.0).max(), 1.0e-3)
+                    reference = group_loads(system, system["lam_ref"])[events]
+                    np.testing.assert_allclose(group_loads(system, after)[events], reference, rtol=0.02)
 
     def test_replica_79_converges_in_both_orders(self):
         """Converge the cross-contact case of replica 79 to NCP 1e-3 in 256 sweeps, under both laws and orders."""
@@ -636,18 +709,28 @@ class TestContactUpdateReplica(unittest.TestCase):
                 self.assertLessEqual(counts["unit"], counts["sequential"])
 
     def test_ring_friction_inside_final_disk(self):
-        """End every patch sweep with each anchor's friction inside mu_a times its ring's final load."""
+        """End every patch sweep's ring units with each anchor's friction inside mu_a times its ring's final load.
+
+        Anchor units (patch Stage A) hold each anchor's friction on the load the other members had at its visit,
+        so they keep the sequential law's defect, at no more than its count of pairs (4 against 4 here).
+        """
         systems = self.systems["patch"]
         world = World(systems)
-        outside = {}
-        for update in ("sequential", "unit"):
-            outside[update] = 0
-            for system, lam in zip(systems, world.sweep(8, update), strict=True):
+        outside, impulses = {}, {}
+        for name, update, ring_units in (("sequential", "sequential", 1), ("ring", "unit", 1), ("anchor", "unit", 0)):
+            outside[name] = 0
+            impulses[name] = world.sweep(8, update, ring_units=ring_units)
+            for system, lam in zip(systems, impulses[name], strict=True):
                 for p in pairs_of(system):
                     load = lam[ring_of(system, int(system["parent"][p]))].sum()
-                    outside[update] += np.hypot(lam[p], lam[p + 1]) > system["mu"][p] * load + 1.0e-6
+                    outside[name] += np.hypot(lam[p], lam[p + 1]) > system["mu"][p] * load + 1.0e-6
         self.assertGreater(outside["sequential"], 0)
-        self.assertEqual(outside["unit"], 0)
+        self.assertEqual(outside["ring"], 0)
+        self.assertLessEqual(outside["anchor"], outside["sequential"])
+        # The forms are different laws on multi-member rings, so the switch reaches the sweep.
+        self.assertTrue(
+            any(not np.array_equal(a, b) for a, b in zip(impulses["ring"], impulses["anchor"], strict=True))
+        )
 
     def test_reference_is_a_fixed_point_of_the_sequential_sweep(self):
         """Keep every certified reference in one sequential sweep, to 1e-5 of its largest impulse.
