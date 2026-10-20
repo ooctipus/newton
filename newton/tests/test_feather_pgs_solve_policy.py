@@ -163,9 +163,10 @@ def _vote_census():
 
     The axes follow the exit-voting factories' census in ``tools/fpgs_bench/kernel_identity.py`` at one
     shape each, crossed with the factories' other options that rewrite their sweeps: the velocity-limit
-    law of the sparse, matrix-free and incremental sweeps and the matrix-free sweep's resident row
-    metadata. The matrix-free sweep keeps the current friction law without torsion or dense tiles, the
-    variants that compile the velocity law; the census pins the others' text unchanged.
+    law of the sparse, matrix-free and incremental sweeps, the sparse sweep's triplet transaction and
+    the matrix-free sweep's resident row metadata. The matrix-free sweep keeps the current friction law
+    without torsion or dense tiles, the variants that compile the velocity law; the census pins the
+    others' text unchanged.
     """
     laws = _axis("velocity_limit_law", VELOCITY_LIMIT_LAWS)
     local = (
@@ -191,6 +192,7 @@ def _vote_census():
                 _axis("local_factors"),
                 _axis("warm_start"),
                 _axis("linked_rows"),
+                _axis("contact_transaction", ("auto", "single", "staged")),
                 laws,
             ),
         ),
@@ -493,7 +495,7 @@ class TestVelocityExitLaw(unittest.TestCase):
         self.assertEqual(
             checked,
             {
-                "sparse": 96,
+                "sparse": 288,
                 "sparse_lanes": 32,
                 "mf_gs": 1344,
                 "paired": 6,

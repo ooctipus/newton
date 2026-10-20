@@ -96,6 +96,15 @@ _PATCH_ONLY = frozenset(
         "linked_rows=True, use_support_table=True, warm_start=False)",
         "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, contact_triplets=True, "
         "linked_rows=True, use_support_table=True, warm_start=True)",
+        # The same triplets in the staged transaction (FEATHER_PGS_SPARSE_TRANSACTION=staged).
+        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=False, contact_transaction='staged', "
+        "contact_triplets=True, linked_rows=True, use_support_table=True, warm_start=False)",
+        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=False, contact_transaction='staged', "
+        "contact_triplets=True, linked_rows=True, use_support_table=True, warm_start=True)",
+        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, contact_transaction='staged', "
+        "contact_triplets=True, linked_rows=True, use_support_table=True, warm_start=False)",
+        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, contact_transaction='staged', "
+        "contact_triplets=True, linked_rows=True, use_support_table=True, warm_start=True)",
         # Paired factor sweeps over patch contact units.
         "solver_feather_pgs._get_pgs_solve_paired_factor_kernel(192, 29, 23, 6, '120', False, False, "
         "contact_units=True)",
@@ -194,6 +203,16 @@ def _suite_sparse_sweeps():
         ((80, 18, 18), triplets),
     ):
         yield size, {**kwargs, "linked_rows": True}, True
+    # Triplet transactions beside each law's default (FEATHER_PGS_SPARSE_TRANSACTION): point
+    # friction's single-stage opt-in and patch friction's staged one, and the 14-block launch
+    # bounds of single-stage sweeps at 128 rows or fewer (FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS).
+    for size in ((112, 18, 12), (128, 25, 16), (256, 18, 12), (48, 18, 18), (48, 25, 16), (72, 18, 12), (80, 18, 18)):
+        single = {**triplets, "contact_transaction": "single"}
+        yield size, single, False
+        yield size, {**triplets, "linked_rows": True, "contact_transaction": "staged"}, True
+        if size[0] <= 128:
+            yield size, {**single, "transaction_blocks": 14}, False
+            yield size, {**triplets, "linked_rows": True, "transaction_blocks": 14}, True
 
 
 def _suite_diagonal_sweeps():
@@ -236,6 +255,11 @@ def _readout_calls():
             {**triplets, "linked_rows": True, **readout},
             True,
         )
+        # Point friction's single-stage opt-in and patch friction's staged one count their sweeps too.
+        single = {**triplets, "contact_transaction": "single", **readout}
+        yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, size, single, False
+        staged = {**triplets, "linked_rows": True, "contact_transaction": "staged", **readout}
+        yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, size, staged, True
     factory = solver._get_pgs_solve_sparse_diagonal_kernel.__wrapped__
     for schedule, patch_only in (("contact_triples", False), ("contact_units", True)):
         kwargs = {schedule: True, "speculative_contact_batches": True, **readout}
@@ -370,6 +394,9 @@ def _linked_sweep_calls():
             "linked_rows": True,
         }
         yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, (48, 18, 12), kwargs
+        # Patch friction's default is the single-stage transaction; pin the staged one beside it.
+        staged = {**kwargs, "contact_transaction": "staged"}
+        yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, (48, 18, 12), staged
 
 
 def _sparse_contact_calls():
@@ -378,6 +405,10 @@ def _sparse_contact_calls():
     factory = _get_sparse_contact_response_kernel.__wrapped__
     for dofs, prepare, table in itertools.product((8, 18), (False, True), (False, True)):
         kwargs = {"prepare_rows": prepare, "use_support_table": table}
+        yield "sparse_contact._get_sparse_contact_response_kernel", factory, (dofs,), kwargs
+    # The triplet records of the single-stage transaction, which both laws can select.
+    for dofs in (8, 18, 25):
+        kwargs = {"prepare_rows": True, "use_support_table": True, "contact_records": True}
         yield "sparse_contact._get_sparse_contact_response_kernel", factory, (dofs,), kwargs
 
 
@@ -880,6 +911,9 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
             "velocity_limits=True",
             "warm_start=True",
             "linked_rows=True",
+            "contact_transaction='single'",
+            "contact_transaction='staged'",
+            "transaction_blocks=14",
         ):
             with self.subTest(flag=flag):
                 self.assertTrue(any(flag in name for name in sparse))
