@@ -10,11 +10,10 @@ unit (:mod:`.contact_unit`) is visited at its first row, where all of its rows
 take the unit's exact local solution against the residuals of the same
 impulses; its other rows are not visited again in that sweep. The local solve
 sees the unit's current impulses and returns them whenever they solve its
-problem, so every solution of the whole problem is a fixed point of the
-sweeps. Rows outside
-units, frictionless point normals, and every row while friction has not
-started (``friction_start_iteration``), keep the ``"sequential"`` update of the
-original sweep. A unit's exact solution ignores ``pgs_omega``; only its
+problem, so every solution of the whole problem is a fixed point of the sweeps.
+Rows outside units, frictionless point normals, and every row while friction
+has not started (``friction_start_iteration``), keep the ``"sequential"`` update
+of the original sweep. A unit's exact solution ignores ``pgs_omega``; only its
 alternation latch relaxes it.
 
 Units of a patch region:

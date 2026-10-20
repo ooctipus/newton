@@ -896,7 +896,7 @@ class TestContactUpdateSolveState(unittest.TestCase):
         ...), as the interleaved split driver launches them, bitwise; a new solve equals a fresh one whatever the
         previous solve left. Restarting the solve at every launch, as the prototype harness did, changes the
         result of 13 and 14 of the 27 stored systems at 8 and 64 sweeps: their latches restart, and the slide roots
-        that a held friction does not resume.
+        that a held friction does not resume. A change of the state's semantics that changes fewer fails here.
         """
         systems = replica_systems("point") + replica_systems("patch")
         fresh = {sweeps: World(systems).sweep(sweeps, "unit") for sweeps in (8, 64)}
@@ -910,7 +910,7 @@ class TestContactUpdateSolveState(unittest.TestCase):
                     np.testing.assert_array_equal(continued[k][-1], fresh[sweeps][k])
                     np.testing.assert_array_equal(again[k], fresh[sweeps][k])
             changed = sum(not np.array_equal(h[-1], lam) for h, lam in zip(restarted, fresh[sweeps], strict=True))
-            self.assertGreaterEqual(changed, len(systems) // 3)
+            self.assertGreaterEqual(changed, {8: 13, 64: 14}[sweeps])
 
     def test_free_body_unit_state_lasts_one_solve(self):
         """Continue and clear the free-body unit sweep's state as the loop sweep's, on two contacts that alternate.
@@ -1134,10 +1134,13 @@ class TestContactUpdateCuda(unittest.TestCase):
                     self.assertLessEqual(np.abs(difference).max(), 1.0e-5 * np.abs(system["rhs"]).max())
 
     def test_cuda_reference_is_a_fixed_point_of_the_unit_sweep(self):
-        """Keep every certified reference in one CUDA unit loop sweep, to 1e-5 of its largest impulse.
+        """Keep every certified reference in one CUDA unit loop sweep, to 1e-5 of its largest impulse plus its residual.
 
-        The CUDA twin of test_reference_is_a_fixed_point_of_the_unit_sweep, in both ring forms; the CPU sweep moves
-        none of them by more than 8.4e-6 (patch 2549, which corrects its own 7.8e-6 m/s residual).
+        The CUDA twin of test_reference_is_a_fixed_point_of_the_unit_sweep, in both ring forms. An exact unit solve
+        corrects the reference's own residual, which the device's rounding moves: on the CPU patch 2549 moves 8.3e-6
+        of its largest impulse, correcting its 7.8e-6 m/s residual, 0.83 of the flat 1e-5 bound. Each reference may
+        therefore also move by its residual over its smallest contact-row diagonal (3.1e-5 of 2549's largest impulse,
+        below 2e-5 for every other).
         """
         for law in ("point", "patch"):
             tight = [s for s in replica_systems(law) if residuals(s, s["lam_ref"])[0].max() <= 1.0e-5]
@@ -1147,7 +1150,9 @@ class TestContactUpdateCuda(unittest.TestCase):
                 for system, lam in zip(tight, after, strict=True):
                     with self.subTest(law=law, ring_units=ring_units, system=system["source"]):
                         reference = system["lam_ref"]
-                        self.assertLess(np.abs(lam - reference).max(), 1.0e-5 * np.abs(reference).max())
+                        contact = (system["rtype"] == CONTACT) | (system["rtype"] == FRICTION)
+                        own = residuals(system, reference)[0].max() / system["diag"][contact].min()
+                        self.assertLess(np.abs(lam - reference).max(), 1.0e-5 * np.abs(reference).max() + own)
 
     def test_cuda_audit_block_holds_in_the_loop_sweep(self):
         """Hold the audit block's exact load with the CUDA unit loop sweep at 8 and 9 sweeps, in each ring form."""

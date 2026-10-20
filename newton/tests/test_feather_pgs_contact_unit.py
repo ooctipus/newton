@@ -502,6 +502,21 @@ class TestContactUnitPoint(unittest.TestCase):
                     current, root = out[:3], out[3]
                 self.assertAlmostEqual(root, alpha, delta=1.0e-3 * alpha)
 
+    def test_held_solutions_are_returned(self):
+        """Return a point or anchor unit's impulses unchanged whenever they solve its problem.
+
+        Each random problem (held_cases) is solved from no impulse, then again from that solution: the held friction
+        resumes its own slide root (or takes the split step, which keeps it), and a stick and take-off are found as
+        they are. The second solve must return the first within the twin bound of
+        test_cuda_prelude_matches_the_cpu_binding.
+        """
+        for anchors in (False, True):
+            held, second, bound, scale = held_cases(anchors)
+            with self.subTest(anchors=anchors):
+                self.assertGreater(len(held), 3500)
+                deviation = np.abs(second[:, :3] - held[:, 13:16].astype(np.float64)).max(axis=1) / scale
+                self.assertTrue(np.all(deviation <= bound), np.argmax(deviation - bound))
+
     def test_resumed_root_keeps_a_solved_slide(self):
         """Keep a slide that solves its contact's problem, where a root from scratch stops at the evaluation cap.
 
@@ -634,6 +649,40 @@ def slide_solutions(W, b, mu, ring_load=0.0):
         s = np.linalg.solve(A + alpha * np.eye(2), c)
         slides.append((alpha, np.array([(w @ s - b[0]) / W[0, 0], *(-s)])))
     return slides
+
+
+def held_cases(anchors, seed=23, count=4000):
+    """Random point (or anchor) problems solved from no impulse, held at that solution and solved again on the CPU.
+
+    Returns the held rows (current impulses: the first solution; rows whose first slide root the evaluation cap
+    stopped are left out), the second solve, each row's bound ``50 cond(W) 2^-23 + 1e-5`` (the twin bound of
+    test_cuda_prelude_matches_the_cpu_binding) and its scale, the largest component of the second solve.
+    """
+    rng = np.random.default_rng(seed)
+    rows = []
+    for _ in range(count):
+        W = random_block(rng, coupling=rng.uniform(0.0, 2.0))
+        b = np.array([rng.normal(), *rng.normal(size=2) * rng.uniform(0.1, 5.0)])
+        ring_load = rng.uniform(0.05, 1.0) if anchors else 0.0
+        rows.append(point_problem(W, b, rng.uniform(0.1, 1.2), ring_load=ring_load))
+    rows = np.asarray(rows, np.float32)
+    first = solve_points(rows)
+    converged = first[:, 4] < 1 + contact_unit.CONTACT_UNIT_NEWTON_CAP
+    held = rows[converged].copy()
+    held[:, 13:16] = first[converged, :3]
+    second = solve_points(held)
+    problems = held.astype(np.float64)
+    blocks = np.stack(
+        [
+            np.stack([problems[:, 0], problems[:, 4], problems[:, 5]], axis=1),
+            np.stack([problems[:, 4], problems[:, 1], problems[:, 2]], axis=1),
+            np.stack([problems[:, 5], problems[:, 2], problems[:, 3]], axis=1),
+        ],
+        axis=1,
+    )
+    bound = 50.0 * np.linalg.cond(blocks) * 2.0**-23 + 1.0e-5
+    scale = np.maximum(np.abs(second[:, :3]).max(axis=1), 1.0e-6)
+    return held, second, bound, scale
 
 
 def take_off_friction(W, b, mu, ring_load):
@@ -906,45 +955,25 @@ class TestContactUnitCuda(unittest.TestCase):
     def test_cuda_prelude_keeps_held_solutions(self):
         """Keep, with the CUDA prelude and binding, the solutions the CPU binding finds, held as current impulses.
 
-        Each problem is solved on the CPU from no impulse, then solved again from that solution on both devices:
-        the held friction resumes its own slide root (or takes the normal-then-friction step), which the CPU returns
-        unchanged to within 2.5 cond(W) 2^-23 of its largest component (measured). The CUDA solve must return it
-        within the twin bound of test_cuda_prelude_matches_the_cpu_binding. Slide roots the cap stopped short are
-        left out.
+        The held point and anchor problems of test_held_solutions_are_returned, solved again on the device: each
+        solve must return the CPU's second solve (its held impulses, within the same bound) within the twin bound of
+        test_cuda_prelude_matches_the_cpu_binding.
         """
-        rng = np.random.default_rng(23)
-        rows = []
-        for _ in range(4000):
-            W = random_block(rng, coupling=rng.uniform(0.0, 2.0))
-            b = np.array([rng.normal(), *rng.normal(size=2) * rng.uniform(0.1, 5.0)])
-            rows.append(point_problem(W, b, rng.uniform(0.1, 1.2)))
-        rows = np.asarray(rows, np.float32)
-        first = solve_points(rows)
-        converged = first[:, 4] < 1 + contact_unit.CONTACT_UNIT_NEWTON_CAP
-        held = rows[converged].copy()
-        held[:, 13:16] = first[converged, :3]
-        cpu = solve_points(held)
-        problems = held.astype(np.float64)
-        blocks = np.stack(
-            [
-                np.stack([problems[:, 0], problems[:, 4], problems[:, 5]], axis=1),
-                np.stack([problems[:, 4], problems[:, 1], problems[:, 2]], axis=1),
-                np.stack([problems[:, 5], problems[:, 2], problems[:, 3]], axis=1),
-            ],
-            axis=1,
-        )
-        bound = 50.0 * np.linalg.cond(blocks) * 2.0**-23 + 1.0e-5
-        scale = np.maximum(np.abs(cpu[:, :3]).max(axis=1), 1.0e-6)
-        self.assertTrue(np.all(np.abs(cpu[:, :3] - problems[:, 13:16]).max(axis=1) / scale <= bound))
         device = "cuda:0"
-        out = wp.zeros((len(held), 5), dtype=float, device=device)
-        wp.launch(
-            _solve_points_native, dim=len(held), inputs=[wp.array(held, dtype=float, device=device), out], device=device
-        )
-        for name, twin in (("prelude", out.numpy().astype(np.float64)), ("binding", solve_points(held, device=device))):
-            with self.subTest(twin=name):
-                deviation = np.abs(twin[:, :3] - cpu[:, :3]).max(axis=1) / scale
-                self.assertTrue(np.all(deviation <= bound), np.argmax(deviation - bound))
+        for anchors in (False, True):
+            held, cpu, bound, scale = held_cases(anchors)
+            out = wp.zeros((len(held), 5), dtype=float, device=device)
+            wp.launch(
+                _solve_points_native,
+                dim=len(held),
+                inputs=[wp.array(held, dtype=float, device=device), out],
+                device=device,
+            )
+            twins = (("prelude", out.numpy().astype(np.float64)), ("binding", solve_points(held, device=device)))
+            for name, twin in twins:
+                with self.subTest(anchors=anchors, twin=name):
+                    deviation = np.abs(twin[:, :3] - cpu[:, :3]).max(axis=1) / scale
+                    self.assertTrue(np.all(deviation <= bound), np.argmax(deviation - bound))
 
 
 if __name__ == "__main__":
