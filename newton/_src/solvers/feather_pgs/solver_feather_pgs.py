@@ -6033,8 +6033,9 @@ class SolverFeatherPGS(SolverBase):
         the sparse contact builder writes, and reduces its three residuals together; the
         staged one reduces the normal, then the tangents, and caches tangent metrics in
         shared memory. Both apply the paired friction law, so iterates differ by rounding
-        only. Both friction laws take the staged one by default;
-        ``FEATHER_PGS_SPARSE_TRANSACTION`` (``auto``, ``single`` or ``staged``) selects.
+        only. Patch friction (``friction_anchor_beta > 0``) takes the single-stage one by
+        default and point friction the staged one; ``FEATHER_PGS_SPARSE_TRANSACTION``
+        (``auto``, ``single`` or ``staged``) overrides both.
         """
         request = os.environ.get("FEATHER_PGS_SPARSE_TRANSACTION", "auto") or "auto"
         if request not in ("auto", "single", "staged"):
@@ -6046,8 +6047,13 @@ class SolverFeatherPGS(SolverBase):
                 "FEATHER_PGS_SPARSE_TRANSACTION=staged: the normal's reduction, then the tangents', with the metric "
                 "cache."
             )
+        if self._friction_anchors_enabled:
+            return "single", (
+                "Patch friction (friction_anchor_beta > 0) takes the single-stage transaction by default "
+                "(FEATHER_PGS_SPARSE_TRANSACTION=staged keeps the staged one)."
+            )
         return "staged", (
-            "Both friction laws keep the staged transaction by default (FEATHER_PGS_SPARSE_TRANSACTION=single opts in)."
+            "Point friction keeps the staged transaction by default (FEATHER_PGS_SPARSE_TRANSACTION=single opts in)."
         )
 
     @staticmethod

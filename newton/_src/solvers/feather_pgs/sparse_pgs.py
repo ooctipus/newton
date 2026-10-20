@@ -25,7 +25,7 @@ from .velocity_limit_law import accumulated_impulse, accumulated_update, check_v
 _SPARSE_CONTACT_METRIC_CACHE_SIZE = 12
 _SPARSE_LOCAL_WORKSPACE_BYTES = 8 * 1024
 CONTACT_TRANSACTIONS = ("auto", "single", "staged")
-"""Triplet transactions of the sparse sweep; ``auto`` is each law's default, ``staged``."""
+"""Triplet transactions of the sparse sweep; ``auto`` is ``single`` for linked rows, else ``staged``."""
 
 
 def contact_transaction_launch_bounds(max_constraints: int, transaction_blocks: int = 16) -> tuple[int, int]:
@@ -119,7 +119,7 @@ def _get_pgs_solve_sparse_kernel(
     differ from ``"staged"`` by rounding only. With ``linked_rows`` one pass
     per call stores each anchor's other ring members in its record, and a
     visit pools the ring from them; rings of more than four members keep
-    the walk. ``"auto"`` selects ``"staged"``. The kernel
+    the walk. ``"auto"`` selects ``"single"`` for linked rows. The kernel
     then takes ``contact_records`` of shape ``(world_count, max_constraints
     // 3, CONTACT_RECORD_FLOATS (+ CONTACT_RING_FLOATS when linked))`` after
     ``iteration_offset`` and launch bounds from
@@ -213,9 +213,9 @@ def _get_pgs_solve_sparse_kernel(
     # Linked triplets pool the ring as the pair update does, so they fuse in either sweep.
     contact_triplets = bool(contact_triplets) and (active_rows or bool(linked_rows)) and use_support_table and M >= 3
     linked_rows = bool(linked_rows) and (active_rows or contact_triplets)
-    # Both friction laws keep the staged transaction by default.
+    # Patch friction takes the single-stage transaction by default; point friction keeps the staged one.
     if contact_transaction == "auto":
-        contact_transaction = "staged"
+        contact_transaction = "single" if linked_rows else "staged"
     single_stage = contact_triplets and contact_transaction == "single"
     active_storage = active_initialize = active_scan = ""
     row_loop = "        for (int row = 0; row < count; ++row) {"

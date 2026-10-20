@@ -268,9 +268,9 @@ class TestSingleStageTransaction(unittest.TestCase):
     """The single-stage transaction's factory, sweep body, request and route record."""
 
     def test_factory_resolves_the_law_default_and_launch_bounds_cpu(self):
-        """Take the single-stage transaction on request, with per-shape launch bounds and records.
+        """Take the single-stage transaction for linked rows by default, with per-shape launch bounds and records.
 
-        Both laws keep the staged transaction by default; either law reaches either form.
+        Point friction keeps the staged transaction unless asked; either law reaches either form.
         """
         for capacity, blocks in product((256, 192, 128, 96, 48), (16, 14)):
             bounds = contact_transaction_launch_bounds(capacity, blocks)
@@ -289,7 +289,7 @@ class TestSingleStageTransaction(unittest.TestCase):
                     for law, transaction in product(("patch", "point"), ("auto", "single", "staged"))
                 }
                 for (law, transaction), kernel in kernels.items():
-                    single = transaction == "single"
+                    single = transaction == "single" or (transaction == "auto" and law == "patch")
                     linked = "_linked" if law == "patch" else ""
                     suffix = f"_contact_triplets_single{bounds[1]}{linked}" if single else f"_contact_triplets{linked}"
                     self.assertTrue(kernel.key.endswith(suffix), kernel.key)
@@ -349,14 +349,14 @@ class TestSingleStageTransaction(unittest.TestCase):
                 self.assertEqual(transaction.count("world_row_parent.data[offset + next]"), int(linked))
 
     def test_request_follows_the_law_and_the_flag_cpu(self):
-        """Keep the staged transaction for both laws unless the flag selects the single-stage one."""
+        """Give patch friction the single-stage transaction and point friction the staged one unless the flag says."""
         for environment, patch, expected, phrase in (
-            ({}, True, "staged", "by default"),
-            ({}, False, "staged", "by default"),
-            ({"FEATHER_PGS_SPARSE_TRANSACTION": "auto"}, True, "staged", "by default"),
+            ({}, True, "single", "Patch friction"),
+            ({}, False, "staged", "Point friction"),
+            ({"FEATHER_PGS_SPARSE_TRANSACTION": "auto"}, True, "single", "by default"),
             ({"FEATHER_PGS_SPARSE_TRANSACTION": "staged"}, True, "staged", "=staged"),
             ({"FEATHER_PGS_SPARSE_TRANSACTION": "single"}, False, "single", "=single"),
-            ({"FEATHER_PGS_SPARSE_TRANSACTION": ""}, False, "staged", "by default"),
+            ({"FEATHER_PGS_SPARSE_TRANSACTION": ""}, False, "staged", "Point friction"),
         ):
             with (
                 self.subTest(environment=environment, patch=patch),

@@ -624,7 +624,8 @@ FLAGS = declare(
         "policy",
         _SOLVER,
         "Transaction of fused sparse contact triplets: single (one load group and reduction, per-triplet records) or "
-        "staged (normal, then tangents, metric cache); auto (default) is staged for both friction laws.",
+        "staged (normal, then tangents, metric cache); auto (default) is single for patch and staged for point "
+        "friction.",
     ),
     _flag(
         "FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS",

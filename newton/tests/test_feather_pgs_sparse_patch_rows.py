@@ -232,18 +232,24 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
                 np.testing.assert_array_equal(value_on, value_off)
 
     def test_switched_off_patch_sweep_with_fused_triplets_is_bitwise(self):
-        """Step the switched-off full patch sweep bitwise whether or not it fuses anchor triplets.
+        """Step the switched-off full patch sweep bitwise whether or not it fuses anchor triplets in the staged form.
 
         With ``FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1``, the suite recipe,
         ``FEATHER_PGS_PATCH_ACTIVE_ROWS=0`` keeps the full ordered sweep but fuses its
         anchor units; the previous kernel needs the triplet flag off as well. A resting
-        and a sliding biped world must step identically either way.
+        and a sliding biped world must step identically either way under the staged
+        transaction (``FEATHER_PGS_SPARSE_TRANSACTION=staged``); the single-stage default
+        rounds differently (test_feather_pgs_sparse_transaction).
         """
         model = standing_model("cuda:0", worlds=2)
         options = {"dense_max_constraints": 96, "pgs_iterations": 8, "enable_joint_limits": False}
         solvers = {}
         for triplets in ("1", "0"):
-            environment = {"FEATHER_PGS_PATCH_ACTIVE_ROWS": "0", "FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": triplets}
+            environment = {
+                "FEATHER_PGS_PATCH_ACTIVE_ROWS": "0",
+                "FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": triplets,
+                "FEATHER_PGS_SPARSE_TRANSACTION": "staged",
+            }
             with mock.patch.dict(os.environ, environment):
                 solvers[triplets] = _make_solver(model, True, **options)
         self.assertTrue(

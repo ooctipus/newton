@@ -661,18 +661,18 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
     def test_linked_factory_cpu(self):
         """Admit ring-linked normals to the transaction in either sweep, and keep point variants unlinked.
 
-        The staged transaction is the default; the single-stage one is reachable on request.
+        Patch friction takes the single-stage transaction by default; the staged one stays reachable.
         """
         options = {"use_support_table": True, "contact_triplets": True}
         active = _get_pgs_solve_sparse_kernel(192, 12, 12, active_rows=True, linked_rows=True, **options)
         full = _get_pgs_solve_sparse_kernel(192, 12, 12, linked_rows=True, **options)
         point = _get_pgs_solve_sparse_kernel(192, 12, 12, active_rows=True, **options)
-        self.assertTrue(active.key.endswith("_active_support_table_contact_triplets_linked"))
-        self.assertTrue(full.key.endswith("_0_0_support_table_contact_triplets_linked"))
+        self.assertTrue(active.key.endswith("_active_support_table_contact_triplets_single12_linked"))
+        self.assertTrue(full.key.endswith("_0_0_support_table_contact_triplets_single12_linked"))
         self.assertTrue(point.key.endswith("_active_support_table_contact_triplets"))
-        options["contact_transaction"] = "single"
-        single = _get_pgs_solve_sparse_kernel(192, 12, 12, active_rows=True, linked_rows=True, **options)
-        self.assertTrue(single.key.endswith("_active_support_table_contact_triplets_single12_linked"))
+        options["contact_transaction"] = "staged"
+        staged = _get_pgs_solve_sparse_kernel(192, 12, 12, active_rows=True, linked_rows=True, **options)
+        self.assertTrue(staged.key.endswith("_active_support_table_contact_triplets_linked"))
         # Point friction fuses only in the active sweep, and nothing fuses without support tables.
         for unfused in ({"use_support_table": True}, {"active_rows": True, "linked_rows": True}):
             with self.subTest(options=unfused):
@@ -785,10 +785,14 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
         """Build the linked triplet sweep the patch policy selects, and keep a small world's packed sweep."""
         model = _branched_model(4, 3, "cuda:0")
         for environment, suffix in (
-            ({"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1"}, "_active_support_table_contact_triplets_linked"),
+            ({"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1"}, "_active_support_table_contact_triplets_single12_linked"),
+            (
+                {"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1", "FEATHER_PGS_SPARSE_TRANSACTION": "staged"},
+                "_active_support_table_contact_triplets_linked",
+            ),
             (
                 {"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1", "FEATHER_PGS_PATCH_ACTIVE_ROWS": "0"},
-                "_0_0_support_table_contact_triplets_linked",
+                "_0_0_support_table_contact_triplets_single12_linked",
             ),
             ({"FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "0"}, "_active_support_table_linked"),
             ({"FEATHER_PGS_PATCH_ACTIVE_ROWS": "0"}, "_0_0_support_table"),
