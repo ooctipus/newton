@@ -4,15 +4,19 @@
 """Check the terrain law's static surface features: plane clusters, edge classes, vertex features, mip, rebuild.
 
 The Warp cluster build must reproduce the float64 reference (:mod:`newton.tests.terrain_law_reference`) exactly,
-keep a planar slope decoded in float32 in one cluster, and give after an edit and a rebuild exactly what a fresh
-build gives; stale features must be reported, not read.
+on every device, keep a planar slope decoded in float32 in one cluster, and give after an edit and a rebuild
+exactly what a fresh build gives; stale features must be reported, not read.
 """
 
+import glob
+import os
+import tempfile
 import unittest
 
 import numpy as np
 import warp as wp
 
+from newton._src.geometry import terrain_contacts
 from newton._src.geometry.narrow_phase import verify_narrow_phase_buffers
 from newton._src.geometry.terrain_contacts import TerrainFeatures
 from newton._src.geometry.terrain_law import (
@@ -23,6 +27,7 @@ from newton._src.geometry.terrain_law import (
     TERRAIN_STATUS_STALE,
     TERRAIN_TILE_CELLS,
     TerrainFeatureData,
+    terrain_decode,
     terrain_features_current,
     terrain_report,
     terrain_tile_bound,
@@ -48,6 +53,39 @@ def _stale_check(data: TerrainFeatureData, heightfield: int, status: wp.array[wp
 def _tile_bounds(data: TerrainFeatureData, heightfield: int, out: wp.array2d[float]):
     i, j = wp.tid()
     out[i, j] = terrain_tile_bound(data, data.surfaces[heightfield], i, j)
+
+
+# A module of its own with Warp's default contraction, so that its PTX can be checked alone.
+@wp.kernel(enable_backward=False, module="unique")
+def _decode_heights(elevations: wp.array[wp.float32], min_z: float, max_z: float, out: wp.array[wp.float32]):
+    i = wp.tid()
+    out[i] = terrain_decode(min_z, max_z, elevations[i])
+
+
+def test_height_decode_rounds_like_the_cpu(test, device):
+    """Decode heights with each float32 operation rounded once, as the CPU decode and the float64 reference do.
+
+    The elevations are drawn where one fused multiply-add rounds differently from the product and the sum
+    rounded apart (CUDA's default contraction fused them even through a float64 round trip).
+    """
+    rng = np.random.default_rng(10)
+    elevations = rng.uniform(0.0625, 1.0, 4096).astype(np.float32)
+    min_z, max_z = np.float32(-1.5), np.float32(0.9)
+    out = wp.zeros(len(elevations), dtype=wp.float32, device=device)
+    wp.launch(
+        _decode_heights,
+        dim=len(elevations),
+        inputs=[wp.array(elevations, dtype=wp.float32, device=device), float(min_z), float(max_z)],
+        outputs=[out],
+        device=device,
+    )
+    expected = ref.decode_heights(elevations, 1, len(elevations), float(min_z), float(max_z)).reshape(-1)
+    np.testing.assert_array_equal(out.numpy().astype(np.float64), expected)
+    # The premise: the product of two float32 values is exact in float64 and, with min_z = -1.5 and elevations of
+    # at least 1/16, so is its sum with min_z; one rounding to float32 is the fused value.
+    span = np.float64(np.float32(max_z - min_z))
+    fused = (elevations.astype(np.float64) * span + np.float64(min_z)).astype(np.float32)
+    test.assertGreater(np.count_nonzero(fused.astype(np.float64) != expected), 500)
 
 
 def _planar_slope(n: int, kind: str):
@@ -251,6 +289,30 @@ def test_stale_features_are_reported(test, device):
 
 
 class TestTerrainLawFeatures(unittest.TestCase):
+    def test_build_and_decode_compile_without_contraction_cpu(self):
+        """Compile the height decode and the cluster build to PTX without fused multiply-adds (NVRTC, any host).
+
+        CUDA's default contraction fuses a float32 product and sum into one rounding, even through a float64 round
+        trip, which the compiler narrows back to float32: the decode must not fuse in a module that contracts,
+        and the build module must not fuse at all, so that a build gives the CPU's bits on every device.
+        """
+        if 86 not in wp.get_cuda_supported_archs():
+            self.skipTest("NVRTC cannot compile for sm_86 here")
+        with tempfile.TemporaryDirectory() as directory:
+            wp.compile_aot_module(_decode_heights.module, arch=86, module_dir=directory, use_ptx=True)
+            wp.compile_aot_module(terrain_contacts, arch=86, module_dir=directory, use_ptx=True)
+            ptx = {}
+            for path in glob.glob(os.path.join(directory, "*.ptx")):
+                with open(path, encoding="latin-1") as f:
+                    ptx["build" if "terrain_contacts" in os.path.basename(path) else "decode"] = f.read()
+        self.assertEqual(sorted(ptx), ["build", "decode"])
+        counts = {(name, op): text.count(op) for name, text in ptx.items() for op in ("fma.rn", "mul.rn", "add.rn")}
+        self.assertEqual(counts["decode", "fma.rn"], 0, msg=counts)
+        self.assertGreater(counts["decode", "mul.rn"], 0, msg=counts)
+        self.assertGreater(counts["decode", "add.rn"], 0, msg=counts)
+        self.assertEqual(counts["build", "fma.rn"], 0, msg=counts)
+        self.assertGreater(counts["build", "mul.rn"], 0, msg=counts)
+
     def test_region_and_shape_arguments_cpu(self):
         """Refuse a shape that is no heightfield and a region outside the grid."""
         model = tu.heightfield_model(np.zeros((5, 5)), 0.2, 0.2, device="cpu")
@@ -267,6 +329,7 @@ class TestTerrainLawFeatures(unittest.TestCase):
 
 devices = get_test_devices()
 for _name, _func in (
+    ("test_height_decode_rounds_like_the_cpu", test_height_decode_rounds_like_the_cpu),
     ("test_planar_slope_is_one_cluster", test_planar_slope_is_one_cluster),
     ("test_clusters_match_reference", test_clusters_match_reference),
     ("test_edge_classes_and_vertex_features_match_reference", test_edge_classes_and_vertex_features_match_reference),

@@ -16,13 +16,16 @@ Surface model:
   several cells is bit-identical in all of them (the narrow phase's per-cell frame ``x1 = x0 + dx`` leaves cracks
   of up to 9.5 um on a 200 m terrain). The window's origin is the exact grid position in float64 and a core
   point enters the frame rounded once, so its position against the grid is exact to a float32 rounding of a
-  window-sized number (a float32 origin rounds by up to 4 um 100 m out). Heights are decoded exactly as the
-  narrow phase decodes them on the CPU (float32 ``min_z + e * (max_z - min_z)``), on every device: the decode
-  goes through float64 so that no fused multiply-add changes a vertex between kernels.
+  window-sized number (a float32 origin rounds by up to 4 um 100 m out). Heights are decoded as the narrow
+  phase decodes them on the CPU (float32 ``min_z + e * (max_z - min_z)``, each operation rounded once), on
+  every device and in every kernel (:func:`terrain_decode` uses explicitly rounded operations, which no
+  floating-point contraction fuses).
 * Canonical edge functions. The face test of a triangle at an edge and the edge's own test read one value
   ``s = (k - v0) . m`` (``m`` the triangle's in-plane outward normal at the edge, ``v0`` the edge's lower vertex),
   and the edge's slab test and the vertex's Voronoi test read one value ``(k - v) . (w - v)``. Both sides of every
-  boundary therefore decide on the same bits.
+  boundary therefore decide on the same bits on the CPU, and on CUDA in kernels compiled without contraction.
+  Under CUDA's default contraction two call sites of one function may be fused differently; their values then
+  differ by a few float32 ulps of the window extent, well inside the closed band below.
 * Closed predicates. Every side claims its region up to ``eps = 8 eps32 max(window extent, 0.1 m)`` beyond its
   boundary, so every support is claimed at least once in float32; two inclusive claims of one constraint coincide
   and the per-pair finish merges them (``4 eps`` in position, ``1e-3`` in normal).
@@ -247,16 +250,23 @@ class TerrainRows:
 # ----------------------------------------------------------------------------------------------------------------
 
 
-@wp.func
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+return __fadd_rn(min_z, __fmul_rn(elevation, __fsub_rn(max_z, min_z)));
+#else
+volatile float span = max_z - min_z;
+volatile float scaled = elevation * span;
+return min_z + scaled;
+#endif
+""")
 def terrain_decode(min_z: float, max_z: float, elevation: float) -> float:
-    """Return ``min_z + elevation * (max_z - min_z)`` rounded exactly as the CPU float32 decode rounds it.
+    """Return ``min_z + elevation * (max_z - min_z)`` in float32, each operation rounded once, on every device.
 
-    Every product and sum of float32 values below is exact in float64, so each cast rounds once, as the
-    unfused float32 operation does; no fused multiply-add can change the result on any device.
+    This is the narrow phase's CPU decode. CUDA's default contraction would fuse the product and the sum into
+    one rounding (and does so even through a float64 round trip, which the compiler narrows back to float32),
+    so the CUDA path uses explicitly rounded intrinsics, which are never fused.
     """
-    span = wp.float32(wp.float64(max_z) - wp.float64(min_z))
-    scaled = wp.float32(wp.float64(elevation) * wp.float64(span))
-    return wp.float32(wp.float64(min_z) + wp.float64(scaled))
+    ...
 
 
 @wp.func

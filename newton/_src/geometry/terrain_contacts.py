@@ -27,9 +27,14 @@ so it cannot carry a large cluster on its own: a 12.7 m planar 12 deg slope deco
 clusters under the plane of the lowest-id triangle, and cropping the recorded suite terrain by three rows and
 seven columns split its flat border (decoded heights within 2.9 um) into over a million clusters; with these
 candidates the slope is one cluster and the suite terrain has 539,984 clusters (539,982 cropped). Gradients and
-residuals are rounded to float32 before every comparison, so the partition does not depend on the device's
-floating-point contraction. A cluster is named after its lowest triangle; its id is the dense index of its
-plane record, or ``-(1 + triangle id)`` for a triangle alone.
+residuals are rounded to float32 before every comparison, as the float64 reference rounds them. A cluster is
+named after its lowest triangle; its id is the dense index of its plane record, or ``-(1 + triangle id)`` for a
+triangle alone.
+
+This module's kernels are compiled without floating-point contraction (``fuse_fp=False``) and the heights are
+decoded with explicitly rounded operations, so every operation of a build rounds as it does on the CPU: the
+ids, plane records and mip are the same bits on every device. The build runs at construction and after edits,
+never per step; the law's per-pair kernels belong in a module of their own.
 """
 
 from __future__ import annotations
@@ -48,6 +53,10 @@ from .terrain_law import (
     terrain_decode,
 )
 from .types import GeoType
+
+# CUDA would otherwise fuse the build's float64 products and sums (fma.rn.f64) where the CPU and the float64
+# reference round each one, and a float32 rounding of a residual or gradient could then flip.
+wp.set_module_options({"fuse_fp": False})
 
 TERRAIN_CLUSTER_ROUNDS = 8
 """Rounds of the cluster build; triangles still unassigned afterwards are clusters of their own."""
