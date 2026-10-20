@@ -732,6 +732,15 @@ def _cluster_bytes(count: int) -> int:
     return count * (14 * 4 + 4 * 4 + 2 * 8 + 16)
 
 
+def _merge_regions(a, b):
+    """Bounding box of two vertex regions ``(row_begin, row_end, col_begin, col_end)``, either of them ``None``."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return (min(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), max(a[3], b[3]))
+
+
 class TerrainFeatures:
     """Plane clusters, tile-max mip and version stamps of every heightfield of a model.
 
@@ -865,11 +874,7 @@ class TerrainFeatures:
                 for the whole heightfield.
         """
         h = self._heightfield(shape)
-        region = self._region(h, region)
-        old = self._dirty[h]
-        if old is not None:
-            region = (min(old[0], region[0]), max(old[1], region[1]), min(old[2], region[2]), max(old[3], region[3]))
-        self._dirty[h] = region
+        self._dirty[h] = _merge_regions(self._dirty[h], self._region(h, region))
         wp.launch(_bump_version, dim=1, inputs=[self.elevation_version, h], device=self.device, record_tape=False)
 
     def rebuild_terrain_features(self, shape: int, *, region: tuple[int, int, int, int] | None = None) -> None:
@@ -877,20 +882,20 @@ class TerrainFeatures:
 
         The clusters of the whole heightfield are rebuilt, so the result equals a fresh build: a cluster's plane
         and membership depend on its lowest triangle and extreme vertices, which an edit may move far from the
-        edited cells. The mip is rebuilt for the tiles over ``region``.
+        edited cells. The mip is rebuilt for the tiles over the bounding box of ``region`` and of every region
+        reported since the last rebuild, so that no tile is marked current over stale heights.
 
         Args:
             shape: The heightfield's shape index.
-            region: Edited vertices as ``(row_begin, row_end, col_begin, col_end)`` (ends exclusive); ``None``
-                takes the regions reported since the last rebuild, or the whole heightfield.
+            region: Edited vertices as ``(row_begin, row_end, col_begin, col_end)`` (ends exclusive), added to the
+                regions reported since the last rebuild; with neither, the whole heightfield.
         """
         h = self._heightfield(shape)
         if self.device.is_capturing:
             raise RuntimeError("Terrain features must be rebuilt outside graph capture")
+        region = _merge_regions(self._dirty[h], None if region is None else self._region(h, region))
         if region is None:
-            region = self._dirty[h] if self._dirty[h] is not None else self._region(h, None)
-        else:
-            region = self._region(h, region)
+            region = self._region(h, None)
         built = [None] * self.heightfield_count
         built[h] = self._build_clusters(h)
         self._place_planes(built)

@@ -249,18 +249,46 @@ def test_rebuild_after_edit_equals_fresh_build(test, device):
             features.check_current()
         features.rebuild_terrain_features(shape)
         features.check_current()
-        fresh = TerrainFeatures(model)
-        np.testing.assert_array_equal(features.clusters.numpy(), fresh.clusters.numpy())
-        np.testing.assert_array_equal(features.tile_max.numpy(), fresh.tile_max.numpy())
-        for s in features.heightfield_shapes:
-            a, b = features.surface(s), fresh.surface(s)
-            test.assertEqual(features.plane_count(s), fresh.plane_count(s))
-            np.testing.assert_array_equal(
-                features.planes.numpy()[a.plane_offset : a.plane_offset + features.plane_count(s)],
-                fresh.planes.numpy()[b.plane_offset : b.plane_offset + fresh.plane_count(s)],
-            )
+        _assert_equals_fresh_build(test, features, model)
         _assert_matches_reference(test, features, model, heightfield=1, shape=shape)
     np.testing.assert_array_equal(features.clusters.numpy()[: 2 * 40 * 40], before_first)
+
+
+def _assert_equals_fresh_build(test, features, model):
+    fresh = TerrainFeatures(model)
+    np.testing.assert_array_equal(features.clusters.numpy(), fresh.clusters.numpy())
+    np.testing.assert_array_equal(features.tile_max.numpy(), fresh.tile_max.numpy())
+    for s in features.heightfield_shapes:
+        a, b = features.surface(s), fresh.surface(s)
+        test.assertEqual(features.plane_count(s), fresh.plane_count(s))
+        np.testing.assert_array_equal(
+            features.planes.numpy()[a.plane_offset : a.plane_offset + features.plane_count(s)],
+            fresh.planes.numpy()[b.plane_offset : b.plane_offset + fresh.plane_count(s)],
+        )
+
+
+def test_rebuild_covers_every_reported_edit(test, device):
+    """Rebuild every edit reported since the last rebuild, also when the rebuild names another region.
+
+    A patch raised to the top of the height range and reported, then another patch lowered and reported, then a
+    rebuild given only the second region: the tiles over the first patch must not keep their old maxima while the
+    version stamps say current (a pair's tile-max exit would drop every pair over it).
+    """
+    rng = np.random.default_rng(16)
+    model = tu.heightfield_model(tu.suite_like_heights(rng, 64, 64), 3.2, 3.2, device=device)
+    features = TerrainFeatures(model)
+    shape = features.heightfield_shapes[0]
+    info = features.surface(shape)
+    elevations = model.heightfield_elevations.numpy()
+    grid = elevations[: info.nrow * info.ncol].reshape(info.nrow, info.ncol).copy()
+    for region, value in (((4, 9, 4, 9), 1.0), ((40, 45, 40, 45), 0.0)):
+        r0, r1, c0, c1 = region
+        grid[r0:r1, c0:c1] = value
+        model.heightfield_elevations.assign(grid.reshape(-1).astype(np.float32))
+        features.mark_elevations_changed(shape, region=region)
+    features.rebuild_terrain_features(shape, region=(40, 45, 40, 45))
+    features.check_current()
+    _assert_equals_fresh_build(test, features, model)
 
 
 def test_stale_features_are_reported(test, device):
@@ -339,6 +367,7 @@ for _name, _func in (
     ("test_edge_classes_and_vertex_features_match_reference", test_edge_classes_and_vertex_features_match_reference),
     ("test_tile_max_bounds_every_height", test_tile_max_bounds_every_height),
     ("test_rebuild_after_edit_equals_fresh_build", test_rebuild_after_edit_equals_fresh_build),
+    ("test_rebuild_covers_every_reported_edit", test_rebuild_covers_every_reported_edit),
     ("test_stale_features_are_reported", test_stale_features_are_reported),
 ):
     add_function_test(TestTerrainLawFeatures, _name, _func, devices=devices)
