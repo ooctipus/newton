@@ -11,8 +11,9 @@ solve each contact unit exactly against its own block (take-off, else stick,
 else the slide root) and relax a unit whose load keeps reversing.
 
 The cases run the sweep kernels the solver launches for each law on
-synthesized blocks (the audit block of the cycle, an oversize patch ring) and
-on stored legged-robot replica systems of the CPU contact bench
+synthesized blocks (the audit block of the cycle, an oversize patch ring, two
+contacts of one free body whose loads alternate) and on stored legged-robot
+replica systems of the CPU contact bench
 (``golden_data/test_feather_pgs_contact_update/replica_systems.npz``: certified
 references, upper triangles of the Delassus matrices, chosen for zero-normal
 events, a 128-sweep cycle census, friction outside its final disk and the
@@ -53,6 +54,20 @@ _TAGS = ("zero_end", "census", "cone", "replica79")
 # (approaching at 0.141 m/s, sliding along -t2) and mu 1, with lift coupling mu |W_nt| / W_nn = 1.0.
 W_AUDIT = np.array([[0.1729, 0.0492, 0.1662], [0.0492, 0.3586, 0.0685], [0.1662, 0.0685, 0.2116]])
 W0_AUDIT = np.array([-0.14089, -0.2, -1.0])
+
+# Two sliding point contacts of one free body (rows over its 6 coordinates, identity mass) whose loads reverse
+# between visits, so the alternation latch relaxes them within 8 sweeps: normal, tangent, tangent per contact.
+J_ALTERNATING = np.array(
+    [
+        [-0.25, -1.43, -0.19, -0.02, 1.69, 0.62],
+        [-1.53, 2.03, -0.4, -0.88, 1.47, -0.05],
+        [-0.37, 0.22, 0.84, 0.99, -1.38, 2.0],
+        [0.95, -0.38, -0.82, -0.97, 0.12, -0.65],
+        [-0.76, 0.81, 0.36, -0.39, 0.73, 1.37],
+        [-1.09, -0.6, 0.94, 0.72, 0.23, 1.16],
+    ]
+)
+W0_ALTERNATING = np.array([-0.38, -0.44, -0.26, -0.09, -0.24, -0.15])
 
 # The certified references that 256 sweeps started from them leave above an NCP residual of 1e-3 m/s, by update
 # and friction law (test_sweeps_from_a_reference_leave_only_the_recorded_ones).
@@ -138,6 +153,18 @@ def sticking_system():
     """The audit block's normal with a small tangential residual, which the contact's friction holds still."""
     L = np.linalg.cholesky(W_AUDIT)
     return contact_system([L[0]], [W0_AUDIT[0]], anchors={0: (L[1], L[2], -0.01, 0.02)}, ring=False)
+
+
+def alternating_system():
+    """Two sliding point contacts (mu 0.65) of one free body whose loads reverse between visits."""
+    J, b = J_ALTERNATING, W0_ALTERNATING
+    contacts = [
+        contact_system(
+            [J[n]], [b[n]], anchors={0: (J[n + 1], J[n + 2], b[n + 1], b[n + 2])}, mu=0.65, dofs=6, ring=False
+        )
+        for n in (0, 3)
+    ]
+    return concatenate(contacts)
 
 
 def concatenate(systems):
@@ -254,18 +281,21 @@ class World:
         self.rows = wp.zeros((W, D), dtype=int, device=device)
         self.block = wp.zeros(W * contact_unit.RING_BLOCK_SIZE, dtype=float, device=device)
 
-    def sweep(self, iterations, update, *, start=None, snapshots=False, ring_units=1):
+    def sweep(self, iterations, update, *, start=None, snapshots=False, ring_units=1, restart=False):
         """Sweep every system ``iterations`` times from ``start`` (cold by default) under one contact update.
 
         Returns the impulses per system, or with ``snapshots`` the impulses after every sweep (one launch per
-        sweep that continues the solve, as the interleaved split driver launches).
+        sweep that continues the solve, as the interleaved split driver launches). With ``restart`` each of those
+        launches starts a new solve (``iteration_offset`` 0), which clears the unit sweep's latches and slide roots.
         """
         lam = np.zeros((len(self.systems), self.D), np.float32)
         if start is not None:
             for k, s in enumerate(start):
                 lam[k, : len(s)] = s
         impulses = wp.array(lam, dtype=float, device=self.device)
-        launches = [(iterations, 0)] if not snapshots else [(1, it) for it in range(iterations)]
+        launches = [(iterations, 0)]
+        if snapshots:
+            launches = [(1, 0 if restart else it) for it in range(iterations)]
         history = []
         for count, offset in launches:
             common = [
@@ -821,6 +851,50 @@ class TestContactUpdateReplica(unittest.TestCase):
                             self.assertLessEqual(residuals(system, history[-1])[0].max(), 1.0e-4)
                 with self.subTest(law=law, update=update, ring_units=ring_units):
                     self.assertGreaterEqual(stationary, 5)
+
+
+class TestContactUpdateSolveState(unittest.TestCase):
+    """The unit sweeps' latches and slide roots last one solve: a launch at iteration_offset 0 clears them."""
+
+    def test_loop_unit_state_lasts_one_solve(self):
+        """Continue a solve's unit state across one-sweep launches and clear it when a new solve starts.
+
+        One launch of 8 or 64 sweeps equals as many one-sweep launches that continue it (iteration_offset 1, 2,
+        ...), as the interleaved split driver launches them, bitwise; a new solve equals a fresh one whatever the
+        previous solve left. Restarting the solve at every launch, as the prototype harness did, changes the
+        result of most stored systems.
+        """
+        systems = replica_systems("point") + replica_systems("patch")
+        fresh = {sweeps: World(systems).sweep(sweeps, "unit") for sweeps in (8, 64)}
+        world = World(systems)
+        for sweeps in (8, 64):
+            continued = world.sweep(sweeps, "unit", snapshots=True)
+            restarted = world.sweep(sweeps, "unit", snapshots=True, restart=True)
+            again = world.sweep(sweeps, "unit")
+            for k, system in enumerate(systems):
+                with self.subTest(sweeps=sweeps, system=system["source"]):
+                    np.testing.assert_array_equal(continued[k][-1], fresh[sweeps][k])
+                    np.testing.assert_array_equal(again[k], fresh[sweeps][k])
+            changed = sum(not np.array_equal(h[-1], lam) for h, lam in zip(restarted, fresh[sweeps], strict=True))
+            self.assertGreater(changed, len(systems) // 2)
+
+    def test_free_body_unit_state_lasts_one_solve(self):
+        """Continue and clear the free-body unit sweep's state as the loop sweep's, on two contacts that alternate.
+
+        The two contacts' loads reverse between visits, so their latches relax them: restarting the solve at every
+        launch moves their loads by 5% after 8 sweeps.
+        """
+        system = alternating_system()
+        body = FreeBody(system)
+        normals = np.flatnonzero(system["rtype"] == CONTACT)
+        for sweeps in (8, 64):
+            single = sweep_free_body(system, sweeps, "unit")
+            with self.subTest(sweeps=sweeps):
+                np.testing.assert_array_equal(body.sweep(sweeps, "unit", offsets=range(sweeps)), single)
+                np.testing.assert_array_equal(body.sweep(sweeps, "unit"), single)
+                restarted = body.sweep(sweeps, "unit", offsets=[0] * sweeps)
+                if sweeps == 8:
+                    self.assertGreater(np.abs(restarted[normals] - single[normals]).max(), 0.01 * single[normals].max())
 
 
 def _free_box_model(**builder):
