@@ -59,6 +59,7 @@ from .terrain_law import (
     TERRAIN_FEATURE_FACE,
     TERRAIN_FEATURE_RECOVERY,
     TERRAIN_FEATURE_VERTEX,
+    TERRAIN_FLAT_EPS,
     TERRAIN_NORMAL_SAME,
     TERRAIN_PAIR_FILTERED,
     TERRAIN_PAIR_FULL,
@@ -141,6 +142,7 @@ _ARC_END = wp.constant(TERRAIN_SOLID_ARC_END)
 _CANDIDATES = wp.constant(TERRAIN_ROW_CANDIDATES)
 _WIDE = wp.constant(TERRAIN_WINDOW_WIDE)
 _EPS32 = wp.constant(TERRAIN_EPS32)
+_FLAT = wp.constant(TERRAIN_FLAT_EPS)
 _HUGE = wp.constant(3.0e38)
 _MASK_WORDS = wp.constant(TERRAIN_SOLID_MASK_WORDS)
 _ITEMS = wp.constant(6)
@@ -211,7 +213,8 @@ class _Pair:
     straddle: float
     """How far a reference feature must reach past a crease's line to straddle it [m]."""
     low: float
-    """The core's lowest point minus the reach, lowered by its rounding [m]: features below it give no row."""
+    """The core's lowest point minus the reach, lowered by its rounding and the cluster tolerance [m]: a feature
+    whose highest vertex lies below it gives no row."""
     sphere_c: wp.vec3
     sphere_r: float
 
@@ -349,7 +352,8 @@ def _solid_face(
         wp.max(_vertex_z(data, window, vb[0], vb[1]), _vertex_z(data, window, vd[0], vd[1])),
     )
     if top < pair.low:
-        # (never the emitter: a supported point's footprint lies in it, within the reach below the core)
+        # Never the emitter: a supported point's terrain point lies on the cluster plane over this triangle, at most
+        # TERRAIN_FLAT_EPS above its highest vertex, and within the reach below the core's lowest point.
         return planes, emitters, sink
     planes, n, a = terrain_plane(data, window, planes, r, c, sub)
     if core_sigma(core, n, a) > pair.reach:
@@ -799,9 +803,12 @@ def solid_pair_window(core: Any, data: TerrainFeatureData, heightfield: int, rea
     pair = _Pair()
     if cells[1] < cells[0] or cells[3] < cells[2]:
         return TERRAIN_PAIR_OUTSIDE, cells, window, core, pair
-    # the lowest point minus the reach, lowered by its own float32 rounding: the exit never drops a row
+    # The lowest point minus the reach, lowered by its own float32 rounding and by the cluster tolerance (a face row's
+    # terrain point lies on its cluster plane, up to TERRAIN_FLAT_EPS above its triangle's highest vertex): the exit
+    # drops no row but one whose terrain point rounding carries off its triangle on a steep face, and then only within
+    # that of the reach limit.
     low = lo[2] - reach
-    low = low - 4.0 * _EPS32 * (wp.abs(lo[2]) + reach)
+    low = low - 4.0 * _EPS32 * (wp.abs(lo[2]) + reach) - _FLAT
     if terrain_tile_exit(data, surface, cells[0], cells[1], cells[2], cells[3], low):
         return TERRAIN_PAIR_TILE_EXIT, cells, window, core, pair
     window = terrain_window(data, heightfield, cells[0], cells[2])
@@ -821,7 +828,7 @@ def solid_pair_window(core: Any, data: TerrainFeatureData, heightfield: int, rea
     pair.band = wp.max(1.0e-4, 1.0e-3 * size)
     pair.tol = wp.max(1.0e-7 + 1.0e-6 * size, eps)
     pair.straddle = eps
-    pair.low = lo[2] - reach - 4.0 * _EPS32 * (wp.abs(lo[2]) + reach) - eps
+    pair.low = lo[2] - reach - 4.0 * _EPS32 * (wp.abs(lo[2]) + reach) - eps - _FLAT
     sphere_c, sphere_r = core_sphere(core)
     pair.sphere_c = sphere_c
     pair.sphere_r = sphere_r
