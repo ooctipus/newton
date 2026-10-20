@@ -15,7 +15,9 @@ it runs inside CUDA graph capture. Today's route still produces every contact; t
 
 The per-type kernels share one signature, ``(begin, slot_begin, inputs, data, out)``
 (:class:`~newton._src.geometry.terrain_law.TerrainPairInputs`, :class:`~newton._src.geometry.terrain_law.TerrainFeatureData`,
-:class:`~newton._src.geometry.terrain_law.TerrainLawRows`): a kernel launched over ``count`` pairs handles table
+:class:`~newton._src.geometry.terrain_law.TerrainLawRows`), the solid classes' with a sixth argument, their
+:class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData` (hull tables, the full kernels' scratch rows; built
+once when a solid class is listed): a kernel launched over ``count`` pairs handles table
 pairs ``begin + i`` and writes their rows to slots ``slot_begin + i * K``, ``K`` its class's row limit
 (:data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_ROWS`), their row counts and ``TERRAIN_PAIR_*``
 states. The one-thread kernel of a class takes pairs whose windows hold at most
@@ -79,6 +81,24 @@ TERRAIN_LAW_KERNELS: dict[int, tuple[str, str, str, str | None]] = {
         "terrain_point_rows_tiled",
         "terrain_point_rows_full",
     ),
+    TERRAIN_PARTNER_BOX: (
+        "newton._src.geometry.terrain_law_box",
+        "terrain_box_rows",
+        "terrain_box_rows_tiled",
+        "terrain_box_rows_full",
+    ),
+    TERRAIN_PARTNER_CYLINDER: (
+        "newton._src.geometry.terrain_law_cylinder",
+        "terrain_cylinder_rows",
+        "terrain_cylinder_rows_tiled",
+        "terrain_cylinder_rows_full",
+    ),
+    TERRAIN_PARTNER_HULL: (
+        "newton._src.geometry.terrain_law_hull",
+        "terrain_hull_rows",
+        "terrain_hull_rows_tiled",
+        "terrain_hull_rows_full",
+    ),
 }
 """Per partner class: the module, its one-thread and tiled kernels, and its full-finish kernel or ``None``.
 
@@ -86,6 +106,11 @@ The module is imported only when the class is listed. The one-thread kernel runs
 segment, the tiled one over its tiled segment; the full-finish kernel, when the class has one, runs after them over
 the whole class (both segments, which the table keeps contiguous) and finishes the pairs they marked
 :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_FULL`."""
+
+TERRAIN_LAW_SOLID_CLASSES = (TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_HULL)
+"""Partner classes whose kernels take a sixth argument, the solid classes' data
+(:class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData`: hull tables and the full kernels' scratch rows),
+built once when one of them is listed."""
 
 TERRAIN_PAIR_STATES = {
     "tile_exit": int(TERRAIN_PAIR_TILE_EXIT),
@@ -95,6 +120,7 @@ TERRAIN_PAIR_STATES = {
     "row_overflow": int(TERRAIN_PAIR_ROW_OVERFLOW),
     "candidate_overflow": int(TERRAIN_PAIR_CANDIDATE_OVERFLOW),
     "wide": int(TERRAIN_PAIR_WIDE),
+    "unsupported": 256,  # terrain_law_solid.TERRAIN_PAIR_UNSUPPORTED (a shape of a solid class with no core yet)
 }
 """Names of the ``TERRAIN_PAIR_*`` state bits."""
 
@@ -162,22 +188,28 @@ class TerrainLawShadow:
         self._launches = []
         slot_first = np.full(self.table.pair_count, -1, np.int64)
         slot = 0
+        solid_pairs = []
         for partner_class in self.classes:
             module_name, thread_name, tiled_name, full_name = TERRAIN_LAW_KERNELS[partner_class]
             module = importlib.import_module(module_name)
             kernels = (getattr(module, thread_name), getattr(module, tiled_name))
             rows = TERRAIN_PARTNER_ROWS[partner_class]
+            solid = partner_class in TERRAIN_LAW_SOLID_CLASSES
             class_begin, class_slot = None, slot
             for lane in range(TERRAIN_LANE_CLASSES):
                 begin, end = self.table.segment(partner_class, lane)
                 if end > begin:
-                    self._launches.append((kernels[lane], lane, begin, end - begin, slot))
+                    self._launches.append((kernels[lane], lane, begin, end - begin, slot, solid))
                     slot_first[begin:end] = slot + rows * np.arange(end - begin)
                     slot += rows * (end - begin)
                     class_begin = begin if class_begin is None else class_begin
             if full_name is not None and class_begin is not None:
                 count = (slot - class_slot) // rows
-                self._launches.append((getattr(module, full_name), TERRAIN_LANE_THREAD, class_begin, count, class_slot))
+                self._launches.append(
+                    (getattr(module, full_name), TERRAIN_LANE_THREAD, class_begin, count, class_slot, solid)
+                )
+                if solid:
+                    solid_pairs.append((class_begin, count))
         self.slot_count = slot
         """Row slots of the side buffer: every listed pair times its class's row limit."""
         self.features = TerrainFeatures(model) if self._launches else None
@@ -203,6 +235,14 @@ class TerrainLawShadow:
         )
         out.deferred_count = wp.zeros(TERRAIN_PARTNER_CLASSES, dtype=wp.int32, device=device)
         self._out = out
+        self._solids = None
+        if solid_pairs:
+            solid = importlib.import_module("newton._src.geometry.terrain_law_solid")
+            partners = np.concatenate([self.table.pairs_host[b : b + c, 1] for b, c in solid_pairs])
+            # Deferred pairs are rare (more distinct rows than the slots): the scratch holds a sixteenth of the largest
+            # solid class's pairs; pairs past it keep the rows their slots hold, flagged as a candidate overflow.
+            scratch = max(solid.TERRAIN_SOLID_SCRATCH_MIN, max(c for _b, c in solid_pairs) // 16)
+            self._solids = solid.terrain_solid_data(model, partners, scratch)
         self._no_body_flags = wp.empty(0, dtype=wp.int32, device=device)
         self.build_seconds = time.perf_counter() - started
         """Host time of the construction [s]: features, pair table, kernel modules imported and buffers."""
@@ -247,8 +287,10 @@ class TerrainLawShadow:
         inputs.include_static_kinematic_pairs = int(bool(include_static_kinematic_pairs))
         data = self.features.data()
         self._out.deferred_count.zero_()
-        for kernel, lane, begin, count, slot in self._launches:
+        for kernel, lane, begin, count, slot, solid in self._launches:
             args = [begin, slot, inputs, data, self._out]
+            if solid:
+                args.append(self._solids)
             if lane == TERRAIN_LANE_THREAD:
                 wp.launch(kernel, dim=count, inputs=args, device=self.device, record_tape=False)
             else:
@@ -315,6 +357,31 @@ class TerrainLawShadow:
             array.capacity
             for array in (out.q, out.n, out.d, out.feature, out.count, out.state, out.overflow, out.deferred)
         )
+        solid = 0
+        if self._solids is not None:
+            hulls = self._solids.hulls
+            solid = sum(
+                array.capacity
+                for array in (
+                    self._solids.scratch_q,
+                    self._solids.scratch_n,
+                    self._solids.scratch_d,
+                    self._solids.scratch_feature,
+                    hulls.points,
+                    hulls.planes,
+                    hulls.face_vertices,
+                    hulls.face_begin,
+                    hulls.vertex_faces,
+                    hulls.vertex_face_begin,
+                    hulls.neighbors,
+                    hulls.neighbor_begin,
+                    hulls.triangles,
+                    hulls.hull_points,
+                    hulls.hull_faces,
+                    hulls.hull_triangles,
+                    hulls.shape_hull,
+                )
+            )
         return {
             "classes": [terrain_law_class_name(c) for c in self.classes],
             "pairs": pairs,
@@ -322,6 +389,7 @@ class TerrainLawShadow:
             "slots": self.slot_count,
             "bytes": {
                 "side_buffer": int(side),
+                "solid_data": int(solid),
                 "pair_table": int(self.table.memory_bytes()["pairs"]),
                 "features": 0 if self.features is None else int(sum(self.features.memory_bytes().values())),
             },
