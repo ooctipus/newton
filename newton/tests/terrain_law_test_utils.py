@@ -492,3 +492,125 @@ def missing_rows(expected, got, *, q_tol: float, angle_tol: float, d_tol: float 
         ):
             missing.append(row)
     return missing
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# float32 against float64: decisions within the predicates' band
+# ----------------------------------------------------------------------------------------------------------------
+
+DECISION_BAND = 2.0e-6
+"""Margin [m] within which a float32 boundary decision may differ from the float64 one (two bands of a 1 m window)."""
+
+
+def _seam_edges(hf: ref.ReferenceHeightfield, q, tol: float) -> list:
+    """Grid edges ``(kind, r, c)`` (``"H"``, ``"V"``, ``"D"`` as the reference names them) whose segment passes within
+    ``tol`` of ``q``'s footprint."""
+    u = (q[0] + hf.hx) / hf.dx
+    v = (q[1] + hf.hy) / hf.dy
+    out = []
+    c, r = int(np.floor(u)), int(np.floor(v))
+    for rr in (r - 1, r, r + 1):
+        for cc in (c - 1, c, c + 1):
+            # H edge (rr, cc)-(rr, cc + 1), V edge (rr, cc)-(rr + 1, cc), D edge (rr, cc)-(rr + 1, cc + 1)
+            for kind, (dr, dc) in (("H", (0, 1)), ("V", (1, 0)), ("D", (1, 1))):
+                if not (hf.valid_vertex(rr, cc) and hf.valid_vertex(rr + dr, cc + dc)):
+                    continue
+                a = np.array([cc * hf.dx, rr * hf.dy])
+                b = np.array([(cc + dc) * hf.dx, (rr + dr) * hf.dy])
+                p = np.array([u * hf.dx, v * hf.dy])
+                t = np.clip((p - a) @ (b - a) / ((b - a) @ (b - a)), 0.0, 1.0)
+                if np.linalg.norm(a + t * (b - a) - p) <= tol:
+                    out.append((kind, rr, cc))
+    return out
+
+
+def _edge_triangles(hf: ref.ReferenceHeightfield, kind: str, r: int, c: int):
+    """The two triangles of a reference edge (None outside the grid), as ``window_features`` lists them."""
+    if kind == "H":
+        return (hf.tri_id(r - 1, c, 1) if hf.valid_cell(r - 1, c) else None), (
+            hf.tri_id(r, c, 0) if hf.valid_cell(r, c) else None
+        )
+    if kind == "V":
+        return (hf.tri_id(r, c - 1, 0) if hf.valid_cell(r, c - 1) else None), (
+            hf.tri_id(r, c, 1) if hf.valid_cell(r, c) else None
+        )
+    return hf.tri_id(r, c, 0), hf.tri_id(r, c, 1)
+
+
+def _face_values(hf: ref.ReferenceHeightfield, t: int, k) -> list:
+    """Float64 face values ``s = (k - a) . m`` of triangle ``t``'s three edges for point ``k``."""
+    vs = hf.tri_verts(t)
+    n, _ = hf.plane(t)
+    out = []
+    for i in range(3):
+        a, b, w = vs[i], vs[(i + 1) % 3], vs[(i + 2) % 3]
+        m = np.cross(b - a, n)
+        if m @ (w - a) > 0.0:
+            m = -m
+        out.append(float((k - a) @ (m / np.linalg.norm(m))))
+    return out
+
+
+def band_decided(hf: ref.ReferenceHeightfield, q, k, *, band: float = DECISION_BAND) -> bool:
+    """Whether a row (terrain point ``q``, core point ``k``, heightfield-local) was decided within ``band``.
+
+    True when the row's terrain point lies on a seam and a float64 predicate deciding a feature there is within
+    ``band`` of its threshold: a face's value at that edge (a face claim, or an edge claim beyond its faces), an
+    edge's class (a crease within ``band`` of flat) or the vertex's Voronoi test. Rows decided within the band
+    may be claimed in float32 and not in float64, or the reverse; any other difference is a defect.
+    """
+    q = np.asarray(q, np.float64)
+    k = np.asarray(k, np.float64)
+    for kind, r, c in _seam_edges(hf, q, band):
+        ta, tb = _edge_triangles(hf, kind, r, c)
+        for t in (ta, tb):
+            if t is not None and min(abs(s) for s in _face_values(hf, t, k)) <= band:
+                return True
+        if ta is not None and tb is not None:
+            n, a = hf.plane(ta)
+            vb = hf.tri_verts(tb)
+            far = [v for v in vb if all(np.linalg.norm(v - w) > 1e-12 for w in hf.tri_verts(ta))]
+            if far and abs(float(n @ (far[0] - a))) <= band:
+                return True
+    # a vertex's Voronoi boundary
+    u = (q[0] + hf.hx) / hf.dx
+    v = (q[1] + hf.hy) / hf.dy
+    c, r = int(np.rint(u)), int(np.rint(v))
+    if abs(u - c) * hf.dx <= band and abs(v - r) * hf.dy <= band and hf.ring(r, c) is not None:
+        vertex = hf.V(r, c)
+        values = [float((k - vertex) @ (hf.V(*w) - vertex) / np.linalg.norm(hf.V(*w) - vertex)) for w in hf.ring(r, c)]
+        if max(values) >= -band:
+            return True
+    return False
+
+
+def compare_rows(
+    hf: ref.ReferenceHeightfield, expected, got, *, frame_tol: float = 1.0e-5, band: float = DECISION_BAND
+):
+    """Compare float32 rows with float64 rows of one pair (heightfield-local frame).
+
+    Rows match with terrain points within ``frame_tol``, normals within 1e-3 rad and core distances within 10 um.
+    Returns ``(missing, extra, tolerated, deepest)``: unmatched float64 rows and float32 rows not decided within the
+    band (both defects), the count of unmatched rows decided within it, and the difference of the deepest core
+    distances (0 when either side has none).
+    """
+    missing = missing_rows(expected, got, q_tol=frame_tol, angle_tol=1.0e-3, d_tol=1.0e-5)
+    extra = missing_rows(got, expected, q_tol=frame_tol, angle_tol=1.0e-3, d_tol=1.0e-5)
+    tolerated = 0
+    defects_missing, defects_extra = [], []
+    for row in missing:
+        q, n, d = row_qnd(row)
+        if band_decided(hf, q, q + d * n, band=band):
+            tolerated += 1
+        else:
+            defects_missing.append(row)
+    for row in extra:
+        q, n, d = row_qnd(row)
+        if band_decided(hf, q, q + d * n, band=band):
+            tolerated += 1
+        else:
+            defects_extra.append(row)
+    deepest = 0.0
+    if expected and got:
+        deepest = abs(min(row_qnd(r)[2] for r in expected) - min(row_qnd(g)[2] for g in got))
+    return defects_missing, defects_extra, tolerated, deepest
