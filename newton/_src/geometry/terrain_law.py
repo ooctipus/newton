@@ -1409,6 +1409,287 @@ def terrain_finish(rows: TerrainRows, eps: float, row_limit: int) -> tuple[Terra
     return order, kept, flags
 
 
+@wp.func
+def _slot_k(q: wp.array[wp.vec3], n: wp.array[wp.vec3], d: wp.array[float], i: int) -> wp.vec3:
+    """A held row's core point ``q + d n`` (the row's definition)."""
+    return q[i] + d[i] * n[i]
+
+
+@wp.func
+def _slot_member(alive: int, group: TerrainRowsInt, i: int, g: int) -> bool:
+    return ((alive >> i) & 1) != 0 and group[i] == g
+
+
+@wp.func
+def _slot_lower_hull_value(
+    q: wp.array[wp.vec3],
+    n: wp.array[wp.vec3],
+    d: wp.array[float],
+    base: int,
+    count: int,
+    alive: int,
+    group: TerrainRowsInt,
+    g: int,
+    skip: int,
+    e1: wp.vec3,
+    e2: wp.vec3,
+    point: wp.vec2,
+    eps: float,
+) -> tuple[bool, float]:
+    """:func:`_lower_hull_value` over the members of plane group ``g`` but ``skip``, read in place."""
+    found = bool(False)
+    best = float(0.0)
+    tolerance = _MERGE_SCALE * eps
+    for a in range(count):
+        if a == skip or not _slot_member(alive, group, a, g):
+            continue
+        ka = _slot_k(q, n, d, base + a)
+        pa = wp.vec2(wp.dot(ka, e1), wp.dot(ka, e2))
+        da = d[base + a]
+        if wp.length(point - pa) <= tolerance:
+            if not found or da < best:
+                best = da
+                found = True
+        for b in range(a + 1, count):
+            if b == skip or not _slot_member(alive, group, b, g):
+                continue
+            kb = _slot_k(q, n, d, base + b)
+            pb = wp.vec2(wp.dot(kb, e1), wp.dot(kb, e2))
+            db = d[base + b]
+            ab = pb - pa
+            length2 = wp.dot(ab, ab)
+            if length2 > 0.0:
+                s = wp.dot(point - pa, ab) / length2
+                perpendicular = wp.abs(_cross2(ab, point - pa)) / wp.sqrt(length2)
+                if s >= -_BARYCENTRIC_TOLERANCE and s <= 1.0 + _BARYCENTRIC_TOLERANCE and perpendicular <= tolerance:
+                    value = da + s * (db - da)
+                    if not found or value < best:
+                        best = value
+                        found = True
+            for c in range(b + 1, count):
+                if c == skip or not _slot_member(alive, group, c, g):
+                    continue
+                kc = _slot_k(q, n, d, base + c)
+                pc = wp.vec2(wp.dot(kc, e1), wp.dot(kc, e2))
+                det = _cross2(pb - pa, pc - pa)
+                scale = wp.length(pb - pa) * wp.length(pc - pa)
+                if wp.abs(det) > _BARYCENTRIC_TOLERANCE * scale and scale > 0.0:
+                    beta = _cross2(point - pa, pc - pa) / det
+                    gamma = _cross2(pb - pa, point - pa) / det
+                    if (
+                        beta >= -_BARYCENTRIC_TOLERANCE
+                        and gamma >= -_BARYCENTRIC_TOLERANCE
+                        and beta + gamma <= 1.0 + _BARYCENTRIC_TOLERANCE
+                    ):
+                        value = da + beta * (db - da) + gamma * (d[base + c] - da)
+                        if not found or value < best:
+                            best = value
+                            found = True
+    return found, best
+
+
+@wp.func
+def terrain_finish_slots(
+    q: wp.array[wp.vec3],
+    n: wp.array[wp.vec3],
+    d: wp.array[float],
+    base: int,
+    count: int,
+    dropped: int,
+    eps: float,
+    row_limit: int,
+) -> tuple[int, int, int]:
+    """:func:`terrain_finish` in place: on ``count`` candidates held at ``[base, base + count)`` of row arrays.
+
+    A candidate's core point is ``q + d n``, so ``terrain_finish`` of a :class:`TerrainRows` holding the same rows with
+    ``k = q + d n`` keeps the same rows, bit for bit: the steps, their order, ties and float32 operations are the same;
+    only the candidates stay where they are (no by-value copy of the 32-candidate struct, of its group lists or of
+    their tangent coordinates, which are recomputed where read). ``dropped`` is nonzero when candidates were refused
+    for the list's size (:data:`TERRAIN_FINISH_CANDIDATE_OVERFLOW`).
+
+    Returns ``(keep, kept, flags)``: bit ``i`` of ``keep`` marks candidate ``i`` kept (kept rows in candidate order),
+    their count, and the finish flags.
+    """
+    count = wp.min(count, _CANDIDATES)
+    flags = int(0)
+    if dropped > 0:
+        flags = flags | TERRAIN_FINISH_CANDIDATE_OVERFLOW
+    alive = int(0)
+    group = TerrainRowsInt()
+    rank = TerrainRowsInt()
+    # 1. coincident rows: the first in feature order stays
+    for i in range(count):
+        qi = q[base + i]
+        ni = n[base + i]
+        survives = bool(True)
+        for j in range(i):
+            if ((alive >> j) & 1) != 0 and terrain_rows_coincide(q[base + j], n[base + j], qi, ni, eps):
+                survives = False
+                break
+        if survives:
+            alive = alive | (1 << i)
+    # 2. plane groups: the first row of a plane represents it
+    for i in range(count):
+        group[i] = -1
+        if ((alive >> i) & 1) == 0:
+            continue
+        qi = q[base + i]
+        ni = n[base + i]
+        group[i] = i
+        for j in range(i):
+            if ((alive >> j) & 1) != 0 and group[j] == j:
+                if terrain_rows_same_plane(qi, ni, q[base + j], n[base + j], eps):
+                    group[i] = j
+                    break
+    # 3. implied rows, the shallowest first, one at a time
+    for g in range(count):
+        if ((alive >> g) & 1) == 0 or group[g] != g:
+            continue
+        e1, e2 = _tangent_frame(n[base + g])
+        changed = bool(True)
+        while changed:
+            changed = False
+            size = int(0)
+            for i in range(count):
+                if _slot_member(alive, group, i, g):
+                    size += 1
+            if size < 3:
+                break
+            tested = int(0)
+            for _pass in range(size):
+                pick = int(-1)
+                for i in range(count):
+                    if _slot_member(alive, group, i, g) and ((tested >> i) & 1) == 0:
+                        if pick < 0 or d[base + i] > d[base + pick]:
+                            pick = i
+                tested = tested | (1 << pick)
+                kj = _slot_k(q, n, d, base + pick)
+                found, value = _slot_lower_hull_value(
+                    q, n, d, base, count, alive, group, g, pick, e1, e2, wp.vec2(wp.dot(kj, e1), wp.dot(kj, e2)), eps
+                )
+                if found and d[base + pick] >= value - _IMPLIED_RESIDUAL:
+                    alive = alive & ~(1 << pick)
+                    changed = True
+                    break
+    # 4. at most four rows per group: deepest, farthest, largest triangle, largest quadrilateral
+    for i in range(count):
+        rank[i] = 4
+    total = int(0)
+    for g in range(count):
+        # A group keeps its first row's id even when that row was implied.
+        if group[g] != g:
+            continue
+        size = int(0)
+        for i in range(count):
+            if _slot_member(alive, group, i, g):
+                size += 1
+        if size == 0:
+            continue
+        ng = n[base + g]
+        i0 = int(-1)
+        for i in range(count):
+            if _slot_member(alive, group, i, g):
+                if i0 < 0 or d[base + i] < d[base + i0]:
+                    i0 = i
+        p0 = _slot_k(q, n, d, base + i0)
+        p0 = p0 - wp.dot(p0, ng) * ng
+        rank[i0] = 0
+        total += 1
+        i1 = int(-1)
+        far = float(-1.0)
+        for j in range(count):
+            if not _slot_member(alive, group, j, g) or rank[j] == 0:
+                continue
+            pj = _slot_k(q, n, d, base + j)
+            distance = wp.length(pj - wp.dot(pj, ng) * ng - p0)
+            if distance > far:
+                far = distance
+                i1 = j
+        if i1 < 0:
+            continue
+        rank[i1] = 1
+        total += 1
+        p1 = _slot_k(q, n, d, base + i1)
+        p1 = p1 - wp.dot(p1, ng) * ng
+        i2 = int(-1)
+        largest = float(-1.0)
+        for j in range(count):
+            if not _slot_member(alive, group, j, g) or rank[j] <= 1:
+                continue
+            pj = _slot_k(q, n, d, base + j)
+            area = wp.abs(wp.dot(wp.cross(p1 - p0, pj - wp.dot(pj, ng) * ng - p0), ng))
+            if area > largest:
+                largest = area
+                i2 = j
+        if i2 < 0:
+            continue
+        rank[i2] = 2
+        total += 1
+        p2 = _slot_k(q, n, d, base + i2)
+        p2 = p2 - wp.dot(p2, ng) * ng
+        i3 = int(-1)
+        gain_best = float(1.0e-15)
+        for j in range(count):
+            if not _slot_member(alive, group, j, g) or rank[j] <= 2:
+                continue
+            pj = _slot_k(q, n, d, base + j)
+            pj = pj - wp.dot(pj, ng) * ng
+            gain = float(0.0)
+            for side in range(3):
+                pa = p0
+                pb = p1
+                pc = p2
+                if side == 1:
+                    pa = p1
+                    pb = p2
+                    pc = p0
+                elif side == 2:
+                    pa = p2
+                    pb = p0
+                    pc = p1
+                side_c = wp.dot(wp.cross(pb - pa, pc - pa), ng)
+                side_j = wp.dot(wp.cross(pb - pa, pj - pa), ng)
+                if side_c * side_j < 0.0:
+                    gain = wp.max(gain, wp.abs(side_j))
+            if gain > gain_best:
+                gain_best = gain
+                i3 = j
+        if i3 >= 0:
+            rank[i3] = 3
+            total += 1
+        if size <= _GROUP_ROWS:
+            # A group of at most four rows keeps them all.
+            for j in range(count):
+                if _slot_member(alive, group, j, g) and rank[j] == _GROUP_ROWS:
+                    rank[j] = _GROUP_ROWS - 1
+                    total += 1
+    # 5. at most row_limit rows: the groups' deepest rows first, then their extremes
+    keep = int(0)
+    if total <= row_limit:
+        for i in range(count):
+            if ((alive >> i) & 1) != 0 and rank[i] < _GROUP_ROWS:
+                keep = keep | (1 << i)
+    else:
+        flags = flags | TERRAIN_FINISH_ROW_OVERFLOW
+        taken = int(0)
+        for level in range(_GROUP_ROWS):
+            while taken < row_limit:
+                pick = int(-1)
+                for i in range(count):
+                    if ((alive >> i) & 1) != 0 and rank[i] == level and ((keep >> i) & 1) == 0:
+                        if pick < 0 or d[base + i] < d[base + pick]:
+                            pick = i
+                if pick < 0:
+                    break
+                keep = keep | (1 << pick)
+                taken += 1
+    kept = int(0)
+    for i in range(count):
+        if ((keep >> i) & 1) != 0:
+            kept += 1
+    return keep, kept, flags
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # per-pair output
 # ----------------------------------------------------------------------------------------------------------------
