@@ -175,16 +175,21 @@ def _find(parent: wp.array[wp.int32], x: int) -> int:
 
 @wp.func
 def _union(parent: wp.array[wp.int32], a: int, b: int):
-    while True:
-        ra = _find(parent, a)
-        rb = _find(parent, b)
-        if ra == rb:
-            return
+    ra = _find(parent, a)
+    rb = _find(parent, b)
+    while ra != rb:
         lo = wp.min(ra, rb)
         hi = wp.max(ra, rb)
         # Hook the higher root under the lower one: every root is its component's lowest id.
-        if wp.atomic_cas(parent, hi, hi, lo) == hi:
+        old = wp.atomic_cas(parent, hi, hi, lo)
+        if old == hi:
             return
+        # Another thread hooked hi first. Continue from its parent as the atomic returned it (lower than hi, so the
+        # loop ends) rather than from a plain reread, which a non-coherent cache may serve stale on CUDA.
+        if ra == hi:
+            ra = old
+        else:
+            rb = old
 
 
 @wp.kernel(enable_backward=False)
