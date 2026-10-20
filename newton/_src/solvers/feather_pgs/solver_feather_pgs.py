@@ -287,6 +287,8 @@ from .sparse_mass_matrix import (
 from .sparse_pgs import (
     _SPARSE_CONTACT_METRIC_CACHE_SIZE,
     _SPARSE_LOCAL_WORKSPACE_BYTES,
+    CONTACT_TRANSACTION_BLOCKS,
+    CONTACT_TRANSACTIONS,
     _get_pgs_solve_sparse_kernel,
     contact_transaction_launch_bounds,
 )
@@ -2389,6 +2391,8 @@ class SolverFeatherPGS(SolverBase):
             if environment_linked_sweeps
             else requested_linked_sweeps
         )
+        # The sparse triplet transaction's flags, checked on every route; the sparse route applies them.
+        self._sparse_transaction_request = self._sparse_transaction_flags()
         # Options whose effective value an IL_NEWTON_FPGS_* alias or a FEATHER_PGS_* override changed;
         # get_path_selection() reports their source as "environment".
         argument_decay = requested_pgs_decay if pgs_warmstart or not mf_warmstart else float(mf_warmstart_decay)
@@ -5815,7 +5819,7 @@ class SolverFeatherPGS(SolverBase):
             self._sparse_contact_transaction_reason = transaction_reason
             transaction_options["contact_transaction"] = transaction
             if transaction == "single":
-                blocks = self._sparse_transaction_blocks()
+                blocks = self._sparse_transaction_request[1]
                 transaction_options["transaction_blocks"] = blocks
                 self._sparse_contact_transaction_launch_bounds = contact_transaction_launch_bounds(
                     self.dense_max_constraints, blocks
@@ -6035,11 +6039,9 @@ class SolverFeatherPGS(SolverBase):
         shared memory. Both apply the paired friction law, so iterates differ by rounding
         only. Patch friction (``friction_anchor_beta > 0``) takes the single-stage one by
         default and point friction the staged one; ``FEATHER_PGS_SPARSE_TRANSACTION``
-        (``auto``, ``single`` or ``staged``) overrides both.
+        (``auto``, ``single`` or ``staged``, see :meth:`_sparse_transaction_flags`) overrides both.
         """
-        request = os.environ.get("FEATHER_PGS_SPARSE_TRANSACTION", "auto") or "auto"
-        if request not in ("auto", "single", "staged"):
-            raise ValueError("FEATHER_PGS_SPARSE_TRANSACTION must be auto, single or staged")
+        request = self._sparse_transaction_request[0]
         if request == "single":
             return "single", "FEATHER_PGS_SPARSE_TRANSACTION=single: one load group and one reduction per triplet."
         if request == "staged":
@@ -6057,16 +6059,28 @@ class SolverFeatherPGS(SolverBase):
         )
 
     @staticmethod
-    def _sparse_transaction_blocks() -> int:
-        """Return the minimum resident blocks the single-stage sweep requests at or below 128 rows (14 or 16).
+    def _sparse_transaction_flags() -> tuple[str, int]:
+        """Return the triplet transaction and single-stage minimum blocks that the environment requests.
 
-        ``FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS`` selects 14 (a 72-register budget) instead of the
-        default 16 (64 registers); above 128 rows the launch bounds request 12 blocks.
+        ``FEATHER_PGS_SPARSE_TRANSACTION`` is one of :data:`~.sparse_pgs.CONTACT_TRANSACTIONS`
+        (default ``auto``). ``FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS`` is one of
+        :data:`~.sparse_pgs.CONTACT_TRANSACTION_BLOCKS`: the minimum resident blocks a
+        single-stage sweep of at most 128 rows requests, 16 (default, a 64-register budget) or
+        14 (72 registers); above 128 rows its launch bounds request 12. Every construction
+        checks both, so an invalid value raises on every route.
         """
+        transaction = os.environ.get("FEATHER_PGS_SPARSE_TRANSACTION", "auto") or "auto"
+        if transaction not in CONTACT_TRANSACTIONS:
+            raise ValueError(
+                f"FEATHER_PGS_SPARSE_TRANSACTION must be one of {', '.join(CONTACT_TRANSACTIONS)}, got {transaction!r}"
+            )
         blocks = os.environ.get("FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS", "16") or "16"
-        if blocks not in ("14", "16"):
-            raise ValueError("FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS must be 14 or 16")
-        return int(blocks)
+        allowed = tuple(str(value) for value in CONTACT_TRANSACTION_BLOCKS)
+        if blocks not in allowed:
+            raise ValueError(
+                f"FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS must be one of {', '.join(allowed)}, got {blocks!r}"
+            )
+        return transaction, int(blocks)
 
     def _build_body_maps(self, model):
         if not model.body_count or not model.articulation_count:

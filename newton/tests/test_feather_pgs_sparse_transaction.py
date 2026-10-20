@@ -374,13 +374,16 @@ class TestSingleStageTransaction(unittest.TestCase):
                 self.subTest(environment=environment, patch=patch),
                 mock.patch.dict(os.environ, environment, clear=True),
             ):
-                probe = SimpleNamespace(_friction_anchors_enabled=patch)
+                probe = SimpleNamespace(
+                    _friction_anchors_enabled=patch,
+                    _sparse_transaction_request=SolverFeatherPGS._sparse_transaction_flags(),
+                )
                 transaction, reason = SolverFeatherPGS._request_sparse_contact_transaction(probe)
                 self.assertEqual(transaction, expected)
                 self.assertIn(phrase, reason)
         for environment, blocks in (({}, 16), ({"FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS": "14"}, 14)):
             with mock.patch.dict(os.environ, environment, clear=True):
-                self.assertEqual(SolverFeatherPGS._sparse_transaction_blocks(), blocks)
+                self.assertEqual(SolverFeatherPGS._sparse_transaction_flags(), ("auto", blocks))
         for name, value in (
             ("FEATHER_PGS_SPARSE_TRANSACTION", "fused"),
             ("FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS", "12"),
@@ -390,10 +393,24 @@ class TestSingleStageTransaction(unittest.TestCase):
                 mock.patch.dict(os.environ, {name: value}, clear=True),
                 self.assertRaisesRegex(ValueError, name),
             ):
-                SolverFeatherPGS._request_sparse_contact_transaction(SimpleNamespace(_friction_anchors_enabled=True))
-                SolverFeatherPGS._sparse_transaction_blocks()
-        for name in ("FEATHER_PGS_SPARSE_TRANSACTION", "FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS"):
-            self.assertEqual(environment_flags.FLAGS[name].kind, "policy")
+                SolverFeatherPGS._sparse_transaction_flags()
+        # =staged turns the patch default off; 14 blocks opts into a non-default launch bound.
+        self.assertEqual(environment_flags.FLAGS["FEATHER_PGS_SPARSE_TRANSACTION"].kind, "policy")
+        self.assertEqual(environment_flags.FLAGS["FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS"].kind, "experiment")
+
+    def test_invalid_flags_raise_on_every_route_cpu(self):
+        """Reject an invalid transaction flag at construction, also where no sparse sweep runs."""
+        model = _cpu_model()
+        for name, value in (
+            ("FEATHER_PGS_SPARSE_TRANSACTION", "fused"),
+            ("FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS", "12"),
+        ):
+            with (
+                self.subTest(name=name),
+                mock.patch.dict(os.environ, {name: value}),
+                self.assertRaisesRegex(ValueError, name),
+            ):
+                SolverFeatherPGS(model)
 
     def test_route_record_names_no_transaction_without_sparse_factors_cpu(self):
         """Record the transaction fields of the sparse route even where the route is not selected."""

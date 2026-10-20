@@ -26,20 +26,23 @@ _SPARSE_CONTACT_METRIC_CACHE_SIZE = 12
 _SPARSE_LOCAL_WORKSPACE_BYTES = 8 * 1024
 CONTACT_TRANSACTIONS = ("auto", "single", "staged")
 """Triplet transactions of the sparse sweep; ``auto`` is ``single`` for linked rows, else ``staged``."""
+CONTACT_TRANSACTION_BLOCKS = (16, 14)
+"""Minimum resident blocks a single-stage sweep of at most 128 rows may request; 16 is the default."""
 
 
 def contact_transaction_launch_bounds(max_constraints: int, transaction_blocks: int = 16) -> tuple[int, int]:
     """Return the launch bounds of a single-stage triplet sweep: 64 threads, minimum blocks per SM.
 
     Above 128 rows, shared memory admits 12 blocks of two worlds; at or below,
-    ``transaction_blocks`` (14 or 16) sets the register budget.
+    ``transaction_blocks`` (one of :data:`CONTACT_TRANSACTION_BLOCKS`) sets the
+    register budget.
 
     Args:
         max_constraints: Row capacity per world.
         transaction_blocks: Minimum resident blocks requested at or below 128 rows.
     """
-    if transaction_blocks not in (14, 16):
-        raise ValueError("transaction_blocks must be 14 or 16")
+    if transaction_blocks not in CONTACT_TRANSACTION_BLOCKS:
+        raise ValueError(f"transaction_blocks must be one of {CONTACT_TRANSACTION_BLOCKS}")
     return 64, 12 if int(max_constraints) > 128 else int(transaction_blocks)
 
 

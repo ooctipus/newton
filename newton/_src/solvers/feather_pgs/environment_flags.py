@@ -629,7 +629,7 @@ FLAGS = declare(
     ),
     _flag(
         "FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS",
-        "policy",
+        "experiment",
         _SOLVER,
         "Minimum blocks per SM of the single-stage sparse transaction at 128 rows or fewer: 16 (default) or 14.",
     ),
