@@ -1752,16 +1752,17 @@ class SolverFeatherPGS(SolverBase):
                 its exact solution, which keeps the fixed points of the exact sweep. The contact law is that of
                 ``"sequential"``; ``"unit"`` removes the error the normal step leaves against stale friction,
                 which cycles with period two for a sliding contact whose friction lifts its normal (zero normal
-                impulse on an approaching contact at the end of a solve). Where a unit's own problem has several
-                solutions (a sliding contact whose friction presses its normal down), the unit takes the first
-                of take-off, stick and slide, so the sweeps can leave a solution built on another branch and not
-                return to it. A unit's exact solution does not use ``pgs_omega``; rows outside
-                units keep the sequential update. Only the loop sweeps implement
-                ``"unit"``: the dense ``pgs_kernel="loop"`` sweep of split mode on any device and the split
-                free-body sweep on CPU. Every other sweep keeps ``"sequential"``; ``get_path_selection()``
-                records which sweep runs which law under ``routes.sweep.contact_update``, and construction warns
-                when a requested ``"unit"`` reaches only some sweeps. ``FEATHER_PGS_CONTACT_UPDATE`` overrides
-                the argument. Experimental. Defaults to ``"sequential"``.
+                impulse on an approaching contact at the end of a solve). Every solution of the whole problem
+                is a fixed point of the unit sweeps: where a unit's own problem has several solutions (a sliding
+                contact whose friction presses its normal down), the unit keeps the one it holds, and a slide
+                whose load answers the contact's approach with the wrong sign, or many times its normal row's
+                own response, takes its normal with the friction held, then the friction. A unit's exact
+                solution does not use ``pgs_omega``; rows outside units keep the sequential update. Only the
+                loop sweeps implement ``"unit"``: the dense ``pgs_kernel="loop"`` sweep of split mode on any
+                device and the split free-body sweep on CPU. Every other sweep keeps ``"sequential"``;
+                ``get_path_selection()`` records which sweep runs which law under ``routes.sweep.contact_update``,
+                and construction warns when a requested ``"unit"`` reaches only some sweeps.
+                ``FEATHER_PGS_CONTACT_UPDATE`` overrides the argument. Experimental. Defaults to ``"sequential"``.
             mf_gs_incremental_rows (int, optional): Row budget of the incremental-residual
                 matrix-free Gauss-Seidel kernel. Worlds with only dense articulated rows and at
                 most this many rows solve through a shared-memory response block instead of
