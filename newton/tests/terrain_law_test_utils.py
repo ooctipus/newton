@@ -353,3 +353,117 @@ def feature_queries(features: TerrainFeatures, heightfield: int, queries, *, dir
 
 def angle_deg(a, b) -> float:
     return float(np.degrees(np.arccos(np.clip(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)), -1.0, 1.0))))
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# scenes and the rows a collision pipeline produces
+# ----------------------------------------------------------------------------------------------------------------
+
+SCENE_MARGIN = 0.01
+"""Margin of every shape of :func:`body_scene` [m] (the suite's)."""
+SCENE_GAP = 0.01
+"""Contact gap of every shape of :func:`body_scene` [m] (the suite's)."""
+
+
+def body_scene(heights, hx, hy, bodies, *, device, margin=SCENE_MARGIN, gap=SCENE_GAP):
+    """A heightfield at the origin and bodies, each alone in a world over it, as the suite's robots are.
+
+    Args:
+        heights: Heights ``(nrow, ncol)`` [m].
+        hx: Half-extent along x [m].
+        hy: Half-extent along y [m].
+        bodies: ``(kind, dims, pose)`` per body: ``"sphere"`` (``radius``) or ``"capsule"`` (``radius``,
+            ``half_height``), pose ``(px, py, pz, qx, qy, qz, qw)``.
+        device: Model device.
+        margin: Margin of every shape [m].
+        gap: Contact gap of every shape [m].
+
+    Returns:
+        ``(model, heightfield shape, partner shapes)``.
+    """
+    builder = newton.ModelBuilder()
+    cfg = builder.ShapeConfig(margin=margin, gap=gap)
+    data = np.asarray(heights, np.float32)
+    terrain = newton.Heightfield(data=data, nrow=data.shape[0], ncol=data.shape[1], hx=hx, hy=hy)
+    heightfield = builder.add_shape_heightfield(heightfield=terrain, cfg=cfg)
+    shapes = []
+    for kind, dims, pose in bodies:
+        builder.begin_world()
+        p = np.asarray(pose, np.float64)
+        body = builder.add_body(xform=wp.transform(wp.vec3(*p[:3]), wp.quat(*p[3:7])))
+        if kind == "sphere":
+            shapes.append(builder.add_shape_sphere(body, radius=dims["radius"], cfg=cfg))
+        elif kind == "capsule":
+            shapes.append(
+                builder.add_shape_capsule(body, radius=dims["radius"], half_height=dims["half_height"], cfg=cfg)
+            )
+        else:
+            raise ValueError(kind)
+        builder.end_world()
+    return builder.finalize(device=device), heightfield, shapes
+
+
+def contact_rows(model, state, contacts, heightfield: int) -> dict[int, list]:
+    """Today's contacts of a heightfield per partner shape: ``[(q, n, d)]``, world frame, float64.
+
+    ``q`` is the contact's terrain point, ``n`` its normal from the terrain to the partner and ``d`` its core
+    distance (the margins and the partner's rounding radius taken out), as the law's rows have them.
+    """
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    shape0 = contacts.rigid_contact_shape0.numpy()[:count]
+    shape1 = contacts.rigid_contact_shape1.numpy()[:count]
+    point0 = contacts.rigid_contact_point0.numpy()[:count].astype(np.float64)
+    point1 = contacts.rigid_contact_point1.numpy()[:count].astype(np.float64)
+    normal = contacts.rigid_contact_normal.numpy()[:count].astype(np.float64)
+    margin0 = contacts.rigid_contact_margin0.numpy()[:count].astype(np.float64)
+    margin1 = contacts.rigid_contact_margin1.numpy()[:count].astype(np.float64)
+    body_q = state.body_q.numpy().astype(np.float64)
+    shape_body = model.shape_body.numpy()
+    shape_margin = model.shape_margin.numpy().astype(np.float64)
+
+    def world(shape, p):
+        body = shape_body[shape]
+        if body < 0:
+            return p
+        return body_q[body, :3] + ref.quat_rotate(body_q[body, 3:7], p)
+
+    out = {}
+    for i in range(count):
+        a, b = int(shape0[i]), int(shape1[i])
+        if a == heightfield:
+            partner, q, k, n, offset = b, world(a, point0[i]), world(b, point1[i]), normal[i], margin1[i]
+        elif b == heightfield:
+            partner, q, k, n, offset = a, world(b, point1[i]), world(a, point0[i]), -normal[i], margin0[i]
+        else:
+            continue
+        radius = offset - shape_margin[partner]
+        out.setdefault(partner, []).append((q, n, float(n @ (k - q)) - radius))
+    return out
+
+
+def angle_between(a, b) -> float:
+    """Angle between two directions [rad]."""
+    a = np.asarray(a, np.float64)
+    b = np.asarray(b, np.float64)
+    return float(np.arccos(np.clip(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)), -1.0, 1.0)))
+
+
+def row_qnd(row) -> tuple:
+    """``(q, n, d)`` of a reference row or of a ``(q, n, d, ...)`` tuple."""
+    return (row.q, row.n, row.d) if hasattr(row, "q") else tuple(row[:3])
+
+
+def missing_rows(expected, got, *, q_tol: float, angle_tol: float, d_tol: float | None = None) -> list:
+    """The rows of ``expected`` that no row of ``got`` matches (reference rows or ``(q, n, d, ...)`` tuples)."""
+    candidates = [row_qnd(g) for g in got]
+    missing = []
+    for row in expected:
+        q, n, d = row_qnd(row)
+        if not any(
+            np.linalg.norm(gq - q) <= q_tol
+            and angle_between(gn, n) <= angle_tol
+            and (d_tol is None or abs(gd - d) <= d_tol)
+            for gq, gn, gd in candidates
+        ):
+            missing.append(row)
+    return missing
