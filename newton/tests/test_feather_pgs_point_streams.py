@@ -96,6 +96,15 @@ _PATCH_ONLY = frozenset(
         "linked_rows=True, use_support_table=True, warm_start=False)",
         "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, contact_triplets=True, "
         "linked_rows=True, use_support_table=True, warm_start=True)",
+        # The same triplets in the staged transaction (FEATHER_PGS_SPARSE_TRANSACTION=staged).
+        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=False, contact_transaction='staged', "
+        "contact_triplets=True, linked_rows=True, use_support_table=True, warm_start=False)",
+        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=False, contact_transaction='staged', "
+        "contact_triplets=True, linked_rows=True, use_support_table=True, warm_start=True)",
+        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, contact_transaction='staged', "
+        "contact_triplets=True, linked_rows=True, use_support_table=True, warm_start=False)",
+        "sparse_pgs._get_pgs_solve_sparse_kernel(48, 18, 12, active_rows=True, contact_transaction='staged', "
+        "contact_triplets=True, linked_rows=True, use_support_table=True, warm_start=True)",
         # Paired factor sweeps over patch contact units.
         "solver_feather_pgs._get_pgs_solve_paired_factor_kernel(192, 29, 23, 6, '120', False, False, "
         "contact_units=True)",
@@ -246,9 +255,11 @@ def _readout_calls():
             {**triplets, "linked_rows": True, **readout},
             True,
         )
-        # Point friction's single-stage opt-in counts its sweeps too.
+        # Point friction's single-stage opt-in and patch friction's staged one count their sweeps too.
         single = {**triplets, "contact_transaction": "single", **readout}
         yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, size, single, False
+        staged = {**triplets, "linked_rows": True, "contact_transaction": "staged", **readout}
+        yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, size, staged, True
     factory = solver._get_pgs_solve_sparse_diagonal_kernel.__wrapped__
     for schedule, patch_only in (("contact_triples", False), ("contact_units", True)):
         kwargs = {schedule: True, "speculative_contact_batches": True, **readout}
@@ -383,6 +394,9 @@ def _linked_sweep_calls():
             "linked_rows": True,
         }
         yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, (48, 18, 12), kwargs
+        # Patch friction's default is the single-stage transaction; pin the staged one beside it.
+        staged = {**kwargs, "contact_transaction": "staged"}
+        yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, (48, 18, 12), staged
 
 
 def _sparse_contact_calls():
