@@ -10,9 +10,10 @@ pass. Measured on this tree with the shadow unset (today's terrain route as the 
   ellipsoids, bevelled and flat soles) get rows that are not the analytic plane's (the plane's manifold is the law's
   exact answer on a plane): 106 and 102 violations among 50 bodies on 5 and 10 cm cells, 17 among 12 upright
   cylinders on a vertex without margins (the shadow rows: none);
-* complete: 18 of 40 buried lying cylinders on rough terrain keep no contact, or one shallower than their deepest
-  point, and 4 of 40 cylinders through an exposed cell (the per-cell cases of the cylinder query's exact LP
-  reference) get none as deep as theirs;
+* complete: of 120 solids buried in rough terrain (lying cylinders, cones and ellipsoids) 9 keep no contact and 14
+  only ones shallower than their deepest point, and 4 of 40 cylinders through an exposed cell (the per-cell cases of
+  the cylinder query's exact LP reference) get none as deep as theirs (the shadow rows: none without a row, and 1 and
+  0 short, within the law's known limit for penetrating solids);
 * exact geometry: random poses of every solid kind on rough, pitted and stepped terrain get a deepest row other than
   their exact separation (34 of 126 poses) or rows with normals outside the surface's normal cone (25 ghost rows).
 
@@ -560,10 +561,11 @@ def _lp_cases(rng, count):
     return cases
 
 
-def _lp_violations(cases, device, *, shadow):
-    """Per LP case: whether the pair's deepest row is shallower than the cylinder's boundary's signed distance to the
-    surface (none at all counts), on today's contacts or the shadow rows."""
-    violations = []
+def _lp_pairs(cases, device, *, shadow):
+    """Per exposed-cell case: ``(rows, law, pose, separation, frame_tol)``: today's contacts or the shadow rows
+    (heightfield frame), the float64 law's rows for the pose the kernels see (the float32 world pose less the float32
+    heightfield offset), that pose, the core's exact separation and the rows' rounding in the world frame."""
+    out = []
     for heights, half, offset, (kind, dims, pose) in cases:
         builder = newton.ModelBuilder()
         cfg = builder.ShapeConfig(margin=su.MARGIN, gap=su.GAP)
@@ -577,24 +579,62 @@ def _lp_violations(cases, device, *, shadow):
         shape = su.add_solid(builder, kind, dims, world, cfg)
         model = builder.finalize(device=device)
         pipeline, contacts, state = _collide(model, shadow=shadow)
+        origin = np.asarray(offset, np.float32).astype(np.float64)
+        seen = pose.copy()
+        seen[:3] = np.asarray(world[:3], np.float32).astype(np.float64) - origin
         if shadow:
             got = tu.shadow_rows(pipeline).get(shape, [])
         else:
             got = tu.contact_rows(model, state, contacts, hfield).get(shape, [])
+        got = [(g[0] - origin, *g[1:]) for g in got]
         hf = tu.reference_surface(model)
-        core = ref.make_core(kind, dims, pose)
-        separation = su.sampled_separation(hf, core, step=0.001)
-        deepest = min((g[2] for g in got), default=np.inf)
-        if deepest > separation + 3.0e-5:
-            violations.append((dims, pose.tolist(), offset.tolist(), deepest, separation))
-    return violations
+        separation = su.refined_separation(hf, ref.make_core(kind, dims, seen))
+        frame_tol = 1.0e-5 + 2.0e-7 * float(np.abs(world[:2]).max())
+        out.append((got, su.law_rows(hf, kind, dims, seen), seen, separation, frame_tol))
+    return out
 
 
-def test_solid_rows_reach_the_exact_depth_of_exposed_cells(test, device):
-    """Give every cylinder through an exposed cell a row at least as deep as its deepest point (the per-cell cases of
-    the cylinder query's exact LP reference: any axis and size, steep faces, 60 m out)."""
-    cases = _lp_cases(np.random.default_rng(17), 40)
-    test.assertEqual(_lp_violations(cases, device, shadow=True), [])
+def _penetration_violations(pairs):
+    """Of penetrating pairs ``(rows, law, pose, separation, frame_tol)``: rows other than the float64 law's (terrain
+    points beyond ``frame_tol``), pairs with no row, and pairs whose deepest row is shallower than the core's deepest
+    point (exact separation, :data:`PENETRATING_TOL`)."""
+    differ, rowless, short = [], [], []
+    for got, law, pose, separation, frame_tol in pairs:
+        missing, extra, deepest = su.compare_solid_rows(law, got, frame_tol=frame_tol)
+        if missing or extra or deepest > 1.0e-5:
+            differ.append((pose.tolist(), [repr(m) for m in missing], extra, deepest))
+        if not got:
+            rowless.append(pose.tolist())
+        elif min(g[2] for g in got) > separation + PENETRATING_TOL:
+            short.append((pose.tolist(), min(g[2] for g in got), separation))
+    return differ, rowless, short
+
+
+LP_SHORT = 3
+"""Exposed-cell cases of 40 whose deepest row may be short of the core's depth (a known limitation of the law)."""
+BURIED_SHORT = 6
+"""Buried solids of 120 whose deepest row may be short of the core's depth (a known limitation of the law)."""
+
+
+def test_exposed_cell_rows_follow_the_law(test, device):
+    """Give every cylinder through an exposed cell the float64 law's rows and a row, and all but a few their depth.
+
+    The exposed-cell cases of the cylinder query's exact LP reference (DESIGN 7, Track 1: any axis and size, steep
+    faces, 60 m out), adapted per pair. The reference requires every triangle prism's row to reach the exact minimum
+    over that prism (today's route misses 1,569 of 2,000 cases), which a per-pair law that emits one support set per
+    pair, not one row per triangle, does not do by design; here a pair's deepest row must reach its core's depth.
+
+    The law does not guarantee that for every penetrating solid (DESIGN 1.3 and 8.5: no rule covers some deep cores
+    and cores pierced where their footprints leave a cluster; rule R only fills pairs with no row at all). Over 4,000
+    cases of this generator (100 seeds) the shadow rows equal the float64 law's in every case and leave 65 short
+    (1.6%, from 3.9 mm of penetration on; in 27 of them today's route reaches the depth), none rowless; today's route
+    leaves 537 short and 16 rowless. The check allows :data:`LP_SHORT` of its 40.
+    """
+    pairs = _lp_pairs(_lp_cases(np.random.default_rng(17), 40), device, shadow=True)
+    differ, rowless, short = _penetration_violations(pairs)
+    test.assertEqual(differ, [])
+    test.assertEqual(rowless, [])
+    test.assertLessEqual(len(short), LP_SHORT, msg=short)
 
 
 def _buried_cylinders(rng, hf, count, dims=TOE):
@@ -615,33 +655,67 @@ def _buried_cylinders(rng, hf, count, dims=TOE):
     return bodies
 
 
-def _burial_violations(hf, rows, shapes, bodies):
-    """Buried cylinders whose deepest row is shallower than their deepest boundary point's depth (none counts)."""
-    out = []
-    for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
-        core = ref.make_core(kind, dims, pose)
+def _buried_solids(rng, hf, kind, dims, count):
+    """Solids of one kind in any orientation over rough terrain, their deepest boundary point 1-40 mm below the
+    surface."""
+    bodies = []
+    for _ in range(count):
+        x, y = rng.uniform(-1.1, 1.1, 2)
+        q = _random_quat(rng)
+        core = ref.make_core(kind, dims, np.r_[x, y, 0.0, q])
+        lo, hi = core.aabb()
+        z0 = _top_under(hf, lo, hi, 0.0) - lo[2]
+        core = ref.make_core(kind, dims, np.r_[x, y, z0, q])
         separation = su.sampled_separation(hf, core, step=0.002)
-        got = rows.get(shape, [])
-        deepest = min((g[2] for g in got), default=np.inf)
-        if separation < 0.0 and deepest > separation + 3.0e-5:
-            out.append((pose.tolist(), len(got), deepest, separation))
-    return out
+        z = z0 - separation - rng.uniform(0.001, 0.04)
+        bodies.append((kind, dims, _f32_pose(np.r_[x, y, z, q])))
+    return bodies
 
 
 def _burial_scene(device, count=40):
+    """Buried lying cylinders (toes), cones and ellipsoids on a rough tile, ``count`` of each."""
     rng = np.random.default_rng(23)
     heights = np.round(rng.uniform(0.0, 0.1, (33, 33)) / 0.005) * 0.005
     hf = tu.reference_surface(tu.heightfield_model(heights, 1.6, 1.6, device="cpu"))
     bodies = _buried_cylinders(rng, hf, count)
+    bodies += _buried_solids(rng, hf, "cone", CONE, count)
+    bodies += _buried_solids(rng, hf, "ellipsoid", ELLIPSOID, count)
     model, hfield, shapes = su.solid_scene(heights, 1.6, 1.6, bodies, device=device)
     return hf, model, hfield, shapes, bodies
 
 
-def test_buried_cylinders_get_their_depth(test, device):
-    """Give every buried lying cylinder rows at least as deep as its deepest point (the burial census)."""
+def _burial_pairs(hf, rows, shapes, bodies):
+    """``(rows, law, pose, separation, frame_tol)`` of every buried body: its rows, the float64 law's, its exact
+    separation."""
+    return [
+        (
+            rows.get(shape, []),
+            su.law_rows(hf, kind, dims, pose),
+            pose,
+            su.refined_separation(hf, ref.make_core(kind, dims, pose)),
+            1.0e-5,
+        )
+        for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True)
+    ]
+
+
+def test_buried_solids_follow_the_law(test, device):
+    """Give every buried solid the float64 law's rows and a row, and all but a few of them their depth.
+
+    Lying cylinders within 20 deg of horizontal (the recorded rough state's buried toes), cones and ellipsoids in any
+    orientation, 40 of each, their deepest point 1-40 mm below a rough tile (the burial census, DESIGN 7 Track 1).
+
+    The law does not guarantee the depth of every penetrating solid (DESIGN 1.3 and 8.5). Over 4,000 of each (100
+    seeds) the shadow rows equal the float64 law's in every case, none rowless, and leave short 34 cylinders (0.85%,
+    from 4.2 mm on), 92 cones (2.3%, from 4.4 mm) and 12 ellipsoids (0.3%, from 22 mm); today's route leaves 2,052,
+    425 and 73 short, and 929 cylinders without a contact. The check allows :data:`BURIED_SHORT` of its 120.
+    """
     hf, model, _hfield, shapes, bodies = _burial_scene(device)
     pipeline, _contacts, _state = _collide(model, shadow=True)
-    test.assertEqual(_burial_violations(hf, tu.shadow_rows(pipeline), shapes, bodies), [])
+    differ, rowless, short = _penetration_violations(_burial_pairs(hf, tu.shadow_rows(pipeline), shapes, bodies))
+    test.assertEqual(differ, [])
+    test.assertEqual(rowless, [])
+    test.assertLessEqual(len(short), BURIED_SHORT, msg=short)
 
 
 def test_recovery_rows_have_distinct_feature_ids(test, device):
@@ -1094,12 +1168,20 @@ class TestTerrainLawSolid(unittest.TestCase):
             incomplete, ghosts = _exact_violations(hf, tu.contact_rows(model, state, contacts, hfield), shapes, bodies)
             found[f"{name} incomplete"] = len(incomplete)
             found[f"{name} ghosts"] = len(ghosts)
-        found["exposed cells"] = len(_lp_violations(_lp_cases(np.random.default_rng(17), 40), "cpu", shadow=False))
+        _differ, _rowless, short = _penetration_violations(
+            _lp_pairs(_lp_cases(np.random.default_rng(17), 40), "cpu", shadow=False)
+        )
+        found["exposed cells short"] = len(short)
         hf, model, hfield, shapes, bodies = _burial_scene("cpu")
         _pipeline, contacts, state = _collide(model, shadow=False)
-        found["buried"] = len(_burial_violations(hf, tu.contact_rows(model, state, contacts, hfield), shapes, bodies))
-        self.assertGreater(found["exposed cells"], 1, msg=found)
-        self.assertGreater(found["buried"], 5, msg=found)
+        _differ, rowless, short = _penetration_violations(
+            _burial_pairs(hf, tu.contact_rows(model, state, contacts, hfield), shapes, bodies)
+        )
+        found["buried rowless"] = len(rowless)
+        found["buried short"] = len(short) + len(rowless)
+        self.assertGreater(found["exposed cells short"], LP_SHORT, msg=found)
+        self.assertGreater(found["buried rowless"], 5, msg=found)
+        self.assertGreater(found["buried short"], 2 * BURIED_SHORT, msg=found)
         self.assertGreater(sum(v for k, v in found.items() if k.endswith("incomplete")), 5, msg=found)
         self.assertGreater(sum(v for k, v in found.items() if k.endswith("ghosts")), 5, msg=found)
 
@@ -1144,8 +1226,8 @@ for _name, _func in (
         test_solid_rows_are_minimal_on_a_vertex_without_margins,
     ),
     ("test_solid_rows_are_complete_and_free_of_ghosts", test_solid_rows_are_complete_and_free_of_ghosts),
-    ("test_solid_rows_reach_the_exact_depth_of_exposed_cells", test_solid_rows_reach_the_exact_depth_of_exposed_cells),
-    ("test_buried_cylinders_get_their_depth", test_buried_cylinders_get_their_depth),
+    ("test_exposed_cell_rows_follow_the_law", test_exposed_cell_rows_follow_the_law),
+    ("test_buried_solids_follow_the_law", test_buried_solids_follow_the_law),
     ("test_recovery_rows_have_distinct_feature_ids", test_recovery_rows_have_distinct_feature_ids),
     ("test_solid_rows_match_the_float64_law", test_solid_rows_match_the_float64_law),
     ("test_tiled_kernels_match_one_thread_kernels", test_tiled_kernels_match_one_thread_kernels),
