@@ -5,9 +5,10 @@
 
 The kernels have the per-type signature ``(begin, slot_begin, inputs, data, out, solids)``
 (:class:`~newton._src.geometry.terrain_law.TerrainPairInputs`, :class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData`):
-:func:`terrain_cylinder_rows` runs one thread per pair (windows of up to 16 cells), :func:`terrain_cylinder_rows_tiled` ``wp.block_dim()`` lanes per pair
-(longer windows: the lanes mark the window vertices that yield a row, the first lane walks those in window order and
-finishes the pair, which gives it the one-thread kernel's rows), and :func:`terrain_cylinder_rows_full` the pairs the other two deferred
+:func:`terrain_cylinder_rows` runs one thread per pair (windows of up to 16 cells), :func:`terrain_cylinder_rows_tiled`
+``wp.block_dim()`` lanes per pair (longer windows: the lanes mark the window vertices that yield a row, the first lane
+walks those in window order and finishes the pair, which gives it the one-thread kernel's rows), and
+:func:`terrain_cylinder_rows_full`, on a fixed grid striding over the class's deferred list, the pairs the other two deferred
 (more distinct rows than the class's 16 slots). The walk, the rules and the finish are
 :mod:`~newton._src.geometry.terrain_law_solid`'s; the module is compiled without floating-point contraction, so the
 CPU decides every boundary as the GPU does.
@@ -138,16 +139,19 @@ def terrain_cylinder_rows_full(
     out: TerrainLawRows,
     solids: TerrainSolidData,
 ):
-    """Finish the class's deferred pairs: thread ``j`` walks the ``j``-th deferred pair again into its scratch list
-    (one per deferred pair, :data:`~newton._src.geometry.terrain_law.TERRAIN_ROW_CANDIDATES` rows), runs the finish
-    and writes the kept rows; the order is free, a pair's rows depend on the pair alone."""
-    entry = wp.tid()
-    if entry >= out.deferred_count[_CLASS]:
+    """Finish the class's deferred pairs (``begin`` and ``slot_begin`` are the class's first pair and slot): its
+    ``solids.full_threads`` threads stride over the class's deferred list, and each walks its pairs again, one at a
+    time, into its own scratch list (:data:`~newton._src.geometry.terrain_law.TERRAIN_ROW_CANDIDATES` rows), runs the
+    finish and writes the kept rows. A pair's rows depend on the pair alone: not on the order of the deferral, the
+    number of deferred pairs or the thread that finishes it."""
+    thread = wp.tid()
+    if thread >= solids.full_threads:
         return
-    pair = out.deferred[begin + entry]
-    i = pair - begin
-    _state, frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
-    _supported, core = _core(local, size, inputs.shape_type[partner], partner, solids)
-    solid_rows_full(
-        core, data, out, solids, entry, pair, slot_begin + i * _ROWS, _ROWS, _CLASS, frame, heightfield, reach
-    )
+    for entry in range(thread, out.deferred_count[_CLASS], solids.full_threads):
+        pair = out.deferred[begin + entry]
+        i = pair - begin
+        _state, frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
+        _supported, core = _core(local, size, inputs.shape_type[partner], partner, solids)
+        solid_rows_full(
+            core, data, out, solids, thread, pair, slot_begin + i * _ROWS, _ROWS, _CLASS, frame, heightfield, reach
+        )

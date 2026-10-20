@@ -104,9 +104,11 @@ TERRAIN_LAW_KERNELS: dict[int, tuple[str, str, str, str | None]] = {
 """Per partner class: the module, its one-thread and tiled kernels, and its full-finish kernel or ``None``.
 
 The module is imported only when the class is listed. The one-thread kernel runs over the class's one-thread lane
-segment, the tiled one over its tiled segment; the full-finish kernel, when the class has one, runs after them over
-the whole class (both segments, which the table keeps contiguous) and finishes the pairs they marked
-:data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_FULL`."""
+segment, the tiled one over its tiled segment; the full-finish kernel, when the class has one, runs after them and
+finishes the pairs they marked :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_FULL`: the point class's over
+the whole class (both segments, which the table keeps contiguous), a solid class's on a fixed grid of
+:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_FULL_THREADS` threads that strides over the class's
+deferred list (``begin`` and ``slot_begin`` are the class's first pair and slot)."""
 
 TERRAIN_LAW_SOLID_CLASSES = (TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_HULL)
 """Partner classes whose kernels take a sixth argument, the solid classes' data
@@ -190,12 +192,15 @@ class TerrainLawShadow:
         slot_first = np.full(self.table.pair_count, -1, np.int64)
         slot = 0
         solid_pairs = []
+        solid_module = None
         for partner_class in self.classes:
             module_name, thread_name, tiled_name, full_name = TERRAIN_LAW_KERNELS[partner_class]
             module = importlib.import_module(module_name)
             kernels = (getattr(module, thread_name), getattr(module, tiled_name))
             rows = TERRAIN_PARTNER_ROWS[partner_class]
             solid = partner_class in TERRAIN_LAW_SOLID_CLASSES
+            if solid and solid_module is None:
+                solid_module = importlib.import_module("newton._src.geometry.terrain_law_solid")
             class_begin, class_slot = None, slot
             for lane in range(TERRAIN_LANE_CLASSES):
                 begin, end = self.table.segment(partner_class, lane)
@@ -206,8 +211,10 @@ class TerrainLawShadow:
                     class_begin = begin if class_begin is None else class_begin
             if full_name is not None and class_begin is not None:
                 count = (slot - class_slot) // rows
+                # A solid class's full kernel is a fixed grid striding over the class's deferred list.
+                threads = solid_module.TERRAIN_SOLID_FULL_THREADS if solid else count
                 self._launches.append(
-                    (getattr(module, full_name), TERRAIN_LANE_THREAD, class_begin, count, class_slot, solid)
+                    (getattr(module, full_name), TERRAIN_LANE_THREAD, class_begin, threads, class_slot, solid)
                 )
                 if solid:
                     solid_pairs.append((class_begin, count))
@@ -238,12 +245,9 @@ class TerrainLawShadow:
         self._out = out
         self._solids = None
         if solid_pairs:
-            solid = importlib.import_module("newton._src.geometry.terrain_law_solid")
             partners = np.concatenate([self.table.pairs_host[b : b + c, 1] for b, c in solid_pairs])
-            # Deferred pairs are rare (more distinct rows than the slots): the scratch holds a sixteenth of the largest
-            # solid class's pairs; pairs past it keep the rows their slots hold, flagged as a candidate overflow.
-            scratch = max(solid.TERRAIN_SOLID_SCRATCH_MIN, max(c for _b, c in solid_pairs) // 16)
-            self._solids = solid.terrain_solid_data(model, partners, scratch)
+            # One scratch list per thread of the full kernels' grid, which the solid classes' launches share in turn.
+            self._solids = solid_module.terrain_solid_data(model, partners)
         self._no_body_flags = wp.empty(0, dtype=wp.int32, device=device)
         self.build_seconds = time.perf_counter() - started
         """Host time of the construction [s]: features, pair table, kernel modules imported and buffers."""

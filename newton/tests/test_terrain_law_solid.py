@@ -30,7 +30,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.geometry import terrain_law_box, terrain_law_cylinder, terrain_law_hull
+from newton._src.geometry import terrain_law_box, terrain_law_cylinder, terrain_law_hull, terrain_law_solid
 from newton._src.geometry.terrain_contacts import (
     TERRAIN_LANE_THREAD,
     TERRAIN_LANE_TILE,
@@ -40,6 +40,7 @@ from newton._src.geometry.terrain_contacts import (
     TERRAIN_PARTNER_ROWS,
 )
 from newton._src.geometry.terrain_law import (
+    TERRAIN_PAIR_CANDIDATE_OVERFLOW,
     TERRAIN_PAIR_ROW_OVERFLOW,
     TERRAIN_PAIR_UNSUPPORTED,
     TERRAIN_ROW_CANDIDATES,
@@ -740,13 +741,10 @@ def _tile_scene(rng, device):
     return su.solid_scene(heights, 1.2, 1.2, bodies, device=device)
 
 
-def test_tiled_kernels_match_one_thread_kernels(test, device):
-    """Give a solid pair the same rows, bit for bit, whether one thread or a tile of lanes walks its window."""
-    model, _hfield, _shapes = _tile_scene(np.random.default_rng(37), device)
-    pipeline, _contacts, _state = _collide(model, shadow=True)
-    shadow = pipeline._terrain_law_shadow
+def _pair_inputs(model, pipeline) -> TerrainPairInputs:
+    """The pair inputs of a shadow pipeline's last collide (its pair table and shape transforms)."""
     inputs = TerrainPairInputs()
-    inputs.pairs = shadow.table.pairs
+    inputs.pairs = pipeline._terrain_law_shadow.table.pairs
     inputs.shape_type = model.shape_type
     inputs.shape_transform = pipeline.geom_transform
     inputs.shape_data = pipeline.geom_data
@@ -755,6 +753,15 @@ def test_tiled_kernels_match_one_thread_kernels(test, device):
     inputs.shape_body = model.shape_body
     inputs.body_flags = model.body_flags
     inputs.include_static_kinematic_pairs = 1
+    return inputs
+
+
+def test_tiled_kernels_match_one_thread_kernels(test, device):
+    """Give a solid pair the same rows, bit for bit, whether one thread or a tile of lanes walks its window."""
+    model, _hfield, _shapes = _tile_scene(np.random.default_rng(37), device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    shadow = pipeline._terrain_law_shadow
+    inputs = _pair_inputs(model, pipeline)
     walked = 0
     for partner_class, (module, thread, tiled, full) in _SOLID_KERNELS.items():
         begin, end = shadow.table.segment(partner_class, TERRAIN_LANE_TILE)
@@ -771,7 +778,7 @@ def test_tiled_kernels_match_one_thread_kernels(test, device):
                 wp.launch(kernel, dim=end - begin, inputs=args, device=device)
             else:
                 wp.launch_tiled(kernel, dim=end - begin, inputs=args, block_dim=16, device=device)
-            wp.launch(getattr(module, full), dim=end - begin, inputs=args, device=device)
+            wp.launch(getattr(module, full), dim=shadow._solids.full_threads, inputs=args, device=device)
             outputs.append(out)
         one, lanes = outputs
         for name in ("count", "state", "q", "n", "d", "feature"):
@@ -780,20 +787,31 @@ def test_tiled_kernels_match_one_thread_kernels(test, device):
     test.assertGreater(walked, 20)
 
 
+def _ridge_boxes(device, half, ys):
+    """Long boxes lying across ridges of different heights (every ridge in reach its own plane group), one per world:
+    ``(heightfield, model, shapes, bodies)``. With half extents ``(0.9, 0.05, 0.02)`` a box has more distinct rows
+    (28) than the box class's 16 slots; with ``(0.9, 0.15, 0.02)``, more (46) than a scratch list's 32."""
+    rng = np.random.default_rng(2)
+    heights = np.zeros((41, 41))
+    heights[:, 1::2] = rng.uniform(0.02, 0.035, size=41)[1::2]
+    hf = tu.reference_surface(tu.heightfield_model(heights, 2.0, 2.0, device="cpu"))
+    dims = {"half": half}
+    top = max(hf.height(x, 0.05) for x in np.linspace(-0.95, 0.95, 400))
+    bodies = [
+        ("box", dims, _f32_pose([0.0, y, top + half[2] + 0.002, 0.0, 0.0, np.sin(0.01), np.cos(0.01)])) for y in ys
+    ]
+    model, _hfield, shapes = su.solid_scene(heights, 2.0, 2.0, bodies, device=device)
+    return hf, model, shapes, bodies
+
+
 def test_row_overflow_keeps_each_plane_deepest(test, device):
     """Keep a box's supports first when its rows overflow its slots, and raise ``terrain_rows``.
 
     A long box lies across ridges of different heights (every ridge in reach its own plane group): more rows than the
     box class's 16 slots. The kept rows are the float64 finish's under the same row limit.
     """
-    rng = np.random.default_rng(2)
-    heights = np.zeros((41, 41))
-    heights[:, 1::2] = rng.uniform(0.02, 0.035, size=41)[1::2]
-    hf = tu.reference_surface(tu.heightfield_model(heights, 2.0, 2.0, device="cpu"))
-    dims = {"half": (0.9, 0.05, 0.02)}
-    top = max(hf.height(x, 0.05) for x in np.linspace(-0.95, 0.95, 400))
-    pose = _f32_pose([0.0, 0.05, top + 0.02 + 0.002, 0.0, 0.0, np.sin(0.01), np.cos(0.01)])
-    model, _hfield, shapes = su.solid_scene(heights, 2.0, 2.0, [("box", dims, pose)], device=device)
+    hf, model, shapes, bodies = _ridge_boxes(device, (0.9, 0.05, 0.02), (0.05,))
+    _kind, dims, pose = bodies[0]
     pipeline, _contacts, _state = _collide(model, shadow=True)
     rows = pipeline._terrain_law_shadow.rows()
     limit = terrain_law_box.TERRAIN_BOX_ROWS
@@ -806,6 +824,73 @@ def test_row_overflow_keeps_each_plane_deepest(test, device):
     got = tu.shadow_rows(pipeline)[shapes[0]]
     missing, extra, _deepest = su.compare_solid_rows(limited, got)
     test.assertEqual((missing, extra), ([], []))
+
+
+def test_deferred_pairs_keep_their_rows_beyond_the_grid(test, device):
+    """Finish every deferred pair from its own rows, however many defer: one full-kernel thread for three boxes.
+
+    Three long boxes overflow the box class's slots and defer; a full kernel of one thread walks them again one after
+    the other, each into the thread's scratch list. Every box keeps the float64 finish's rows under the row limit, as
+    with the shadow's own grid, bit for bit, and none is flagged as a candidate overflow.
+    """
+    hf, model, _shapes, bodies = _ridge_boxes(device, (0.9, 0.05, 0.02), (-0.55, 0.0, 0.55))
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    shadow = pipeline._terrain_law_shadow
+    expected = shadow.rows()
+    test.assertTrue(np.all(expected["state"] & int(TERRAIN_PAIR_ROW_OVERFLOW)))
+    inputs = _pair_inputs(model, pipeline)
+    solids = terrain_law_solid.terrain_solid_data(model, shadow.table.pairs_host[:, 1], full_threads=1)
+    rows = TERRAIN_PARTNER_ROWS[TERRAIN_PARTNER_BOX]
+    begin, end = shadow.table.segment(TERRAIN_PARTNER_BOX, TERRAIN_LANE_TILE)
+    test.assertEqual(end - begin, len(bodies))
+    out = _side_buffer(begin, end - begin, rows, shadow.table.pair_count, device)
+    args = [begin, 0, inputs, shadow.features.data(), out, solids]
+    wp.launch_tiled(terrain_law_box.terrain_box_rows_tiled, dim=end - begin, inputs=args, block_dim=16, device=device)
+    test.assertEqual(int(out.deferred_count.numpy()[TERRAIN_PARTNER_BOX]), len(bodies))
+    wp.launch(terrain_law_box.terrain_box_rows_full, dim=1, inputs=args, device=device)
+    count = out.count.numpy()
+    state = out.state.numpy()
+    q, n, d = out.q.numpy(), out.n.numpy(), out.d.numpy()
+    for i, (_kind, dims, pose) in enumerate(bodies):
+        with test.subTest(box=i):
+            test.assertEqual(int(state[begin + i]), int(expected["state"][i]))
+            test.assertEqual(int(state[begin + i]) & int(TERRAIN_PAIR_CANDIDATE_OVERFLOW), 0)
+            got = [
+                (q[s].astype(np.float64), n[s].astype(np.float64), float(d[s]))
+                for s in range(i * rows, i * rows + count[begin + i])
+            ]
+            first = int(np.sum(expected["count"][:i]))
+            np.testing.assert_array_equal(np.array([g[2] for g in got]), expected["d"][first : first + len(got)])
+            limited = su.law_rows(hf, "box", dims, pose, row_limit=rows)
+            missing, extra, _deepest = su.compare_solid_rows(limited, got)
+            test.assertEqual((missing, extra), ([], []))
+
+
+def test_candidate_overflow_keeps_the_first_rows_flagged(test, device):
+    """Keep a pair's first distinct candidates in window order when they overflow a scratch list, and flag it.
+
+    A wide box across ridges has more distinct candidates (46) than a deferred pair's scratch list (32): it keeps the
+    first 32 in window order, flags a candidate and a row overflow and raises ``terrain_rows``; every row it keeps
+    is one of the float64 law's.
+    """
+    hf, model, shapes, bodies = _ridge_boxes(device, (0.9, 0.15, 0.02), (0.05,))
+    _kind, dims, pose = bodies[0]
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    shadow = pipeline._terrain_law_shadow
+    rows = shadow.rows()
+    overflow = int(TERRAIN_PAIR_ROW_OVERFLOW) | int(TERRAIN_PAIR_CANDIDATE_OVERFLOW)
+    test.assertEqual(int(rows["state"][0]) & overflow, overflow)
+    test.assertEqual(int(rows["count"][0]), terrain_law_box.TERRAIN_BOX_ROWS)
+    test.assertEqual(shadow.overflow_counts(), (1, 1))
+    status = pipeline.narrow_phase.buffer_capacity_status()
+    test.assertEqual([k for k, v in status.items() if v], ["terrain_rows"])
+    core = ref.make_core("box", dims, pose)
+    lo, hi = core.aabb()
+    window = hf.window_features(hf.cells_in_box(lo[:2] - su.REACH, hi[:2] + su.REACH))
+    candidates = ref.solid_law(hf, core, su.REACH, window)
+    test.assertGreater(len(candidates), 2 * TERRAIN_ROW_CANDIDATES)
+    got = tu.shadow_rows(pipeline)[shapes[0]]
+    test.assertEqual(tu.missing_rows(got, candidates, q_tol=1.0e-5, angle_tol=1.0e-3, d_tol=1.0e-5), [])
 
 
 def test_shadow_keeps_contacts_bitwise_with_every_class(test, device):
@@ -937,6 +1022,8 @@ for _name, _func in (
     ("test_solid_rows_match_the_float64_law", test_solid_rows_match_the_float64_law),
     ("test_tiled_kernels_match_one_thread_kernels", test_tiled_kernels_match_one_thread_kernels),
     ("test_row_overflow_keeps_each_plane_deepest", test_row_overflow_keeps_each_plane_deepest),
+    ("test_deferred_pairs_keep_their_rows_beyond_the_grid", test_deferred_pairs_keep_their_rows_beyond_the_grid),
+    ("test_candidate_overflow_keeps_the_first_rows_flagged", test_candidate_overflow_keeps_the_first_rows_flagged),
     ("test_shadow_keeps_contacts_bitwise_with_every_class", test_shadow_keeps_contacts_bitwise_with_every_class),
 ):
     add_function_test(TestTerrainLawSolid, _name, _func, devices=devices)

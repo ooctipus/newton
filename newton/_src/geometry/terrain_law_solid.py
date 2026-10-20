@@ -34,11 +34,14 @@ Rows are held in the pair's own slots (window frame) as the finish merges them: 
 dropped, the first in window order staying. The finish runs in place on the held rows
 (:func:`~newton._src.geometry.terrain_law.terrain_finish_slots`, a row's core point being ``q + d n``), and the kept
 rows are rewritten in the world frame at the front of the slots. A pair with more distinct candidates than its slots
-is left to its class's full kernel, which walks it again into a scratch list of
-:data:`~newton._src.geometry.terrain_law.TERRAIN_ROW_CANDIDATES` rows (one per deferred pair, for a bounded number of
-deferred pairs). The kernels themselves (one module per partner class) build the class's core and call the generic
-bodies here; every module that compiles them disables floating-point contraction, so the CPU decides every boundary
-as the GPU does.
+is left to its class's full kernel: a fixed grid of :data:`TERRAIN_SOLID_FULL_THREADS` threads strides over the
+class's deferred list, and each thread walks its pairs again, one at a time, into its own scratch list of
+:data:`~newton._src.geometry.terrain_law.TERRAIN_ROW_CANDIDATES` rows. Every deferred pair is thus finished from its
+own candidates, whatever the number of deferred pairs, the order of the deferral or the thread that finishes it; a pair
+with more distinct candidates than the scratch list keeps the first in window order and is flagged (a candidate
+overflow, as the point class's finish flags it). The kernels themselves (one module per partner class) build the
+class's core and call the generic bodies here; every module that compiles them disables floating-point contraction,
+so the CPU decides every boundary as the GPU does.
 """
 
 from __future__ import annotations
@@ -125,8 +128,9 @@ TERRAIN_SOLID_ARC_END = 1.0e-7
 """A ``theta*`` within this of an arc's end [rad] is at the end (the float64 law's)."""
 TERRAIN_SOLID_MASK_WORDS = 8
 """Words of the tiled kernels' productive-vertex mask: windows of up to 256 vertices (larger: the first lane walks)."""
-TERRAIN_SOLID_SCRATCH_MIN = 256
-"""Fewest deferred pairs the full kernels' scratch holds; it holds a sixteenth of the largest class's pairs above."""
+TERRAIN_SOLID_FULL_THREADS = 256
+"""Threads of a solid class's full kernel, whatever the class's size: they stride over its deferred list, each with
+its own scratch list (an empty list costs one near-empty launch)."""
 TERRAIN_HULL_FACE_TOL = 1.0e-6
 """A hull's points within this of a face's plane lie on that face [m] (hulls under 1 m; their local frame): a planar
 face of a float32 mesh stays one face (its points lie within about 1e-8 m of its plane)."""
@@ -155,12 +159,13 @@ class TerrainSolidData:
     hulls: TerrainHullTable
     """The hulls of the hull class (empty for the other classes)."""
     scratch_q: wp.array[wp.vec3]
-    """Scratch rows of deferred pairs: :data:`TERRAIN_ROW_CANDIDATES` per deferred pair (window frame)."""
+    """Scratch rows of the full kernels: thread ``t`` holds a deferred pair's candidates at
+    ``[t K, (t + 1) K)``, ``K`` :data:`TERRAIN_ROW_CANDIDATES` (window frame)."""
     scratch_n: wp.array[wp.vec3]
     scratch_d: wp.array[float]
     scratch_feature: wp.array[wp.int32]
-    scratch_pairs: int
-    """Deferred pairs the scratch holds."""
+    full_threads: int
+    """Threads of the full kernels' launch (their stride over a deferred list), each with its scratch list."""
 
 
 @wp.struct
@@ -913,7 +918,7 @@ def solid_close(
                 pair_index
             )
             return
-        # past the scratch's deferred pairs: the rows the slots hold, flagged
+        # more distinct candidates than the scratch list: the first in window order, flagged
         sink.held = sink.capacity
         dropped = 1
     if sink.raw == 0:
@@ -967,7 +972,7 @@ def solid_rows_full(
     data: TerrainFeatureData,
     out: TerrainLawRows,
     solids: TerrainSolidData,
-    entry: int,
+    thread: int,
     pair_index: int,
     slot: int,
     row_limit: int,
@@ -976,15 +981,11 @@ def solid_rows_full(
     heightfield: int,
     reach: float,
 ):
-    """A deferred pair walked again into its scratch list (entry ``entry`` of the deferred list), finished and written
-    to its output slots; past the scratch's pairs, into its own slots with the overflow flagged."""
+    """A deferred pair walked again into thread ``thread``'s scratch list, finished and written to its output slots."""
     _state, cells, window, core, pair = solid_pair_window(core, data, heightfield, reach)
     planes = terrain_planes()
-    sink = solid_sink(slot, row_limit, pair.eps, 0)
-    store = solid_out_store(out)
-    if entry < solids.scratch_pairs:
-        sink = solid_sink(entry * _CANDIDATES, _CANDIDATES, pair.eps, 0)
-        store = solid_scratch_store(solids)
+    sink = solid_sink(thread * _CANDIDATES, _CANDIDATES, pair.eps, 0)
+    store = solid_scratch_store(solids)
     planes, sink = solid_walk(core, data, window, planes, pair, sink, store, cells)
     solid_close(
         core, data, window, planes, pair, sink, store, out, pair_index, slot, row_limit, partner_class, frame, cells, 0
@@ -1205,9 +1206,12 @@ def build_hull_table(meshes: list[np.ndarray], shape_hull: np.ndarray, device) -
     return table
 
 
-def terrain_solid_data(model, partners: np.ndarray, scratch_pairs: int) -> TerrainSolidData:
+def terrain_solid_data(
+    model, partners: np.ndarray, *, full_threads: int = TERRAIN_SOLID_FULL_THREADS
+) -> TerrainSolidData:
     """The solid classes' data for a model: the hull table of the convex-mesh partners in ``partners`` (shape
-    indices) and a scratch list of :data:`TERRAIN_ROW_CANDIDATES` rows for ``scratch_pairs`` deferred pairs."""
+    indices) and, per thread of the full kernels' grid of ``full_threads``, a scratch list of
+    :data:`TERRAIN_ROW_CANDIDATES` rows."""
     from .types import GeoType  # noqa: PLC0415
 
     device = model.device
@@ -1225,10 +1229,12 @@ def terrain_solid_data(model, partners: np.ndarray, scratch_pairs: int) -> Terra
         shape_hull[s] = index_of[key]
     solids = TerrainSolidData()
     solids.hulls = build_hull_table(meshes, shape_hull, device)
-    slots = max(int(scratch_pairs), 1) * TERRAIN_ROW_CANDIDATES
+    if full_threads < 1:
+        raise ValueError(f"The full kernels need at least one thread, got {full_threads}")
+    slots = int(full_threads) * TERRAIN_ROW_CANDIDATES
     solids.scratch_q = wp.zeros(slots, dtype=wp.vec3, device=device)
     solids.scratch_n = wp.zeros(slots, dtype=wp.vec3, device=device)
     solids.scratch_d = wp.zeros(slots, dtype=wp.float32, device=device)
     solids.scratch_feature = wp.zeros(slots, dtype=wp.int32, device=device)
-    solids.scratch_pairs = int(scratch_pairs)
+    solids.full_threads = int(full_threads)
     return solids
