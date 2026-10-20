@@ -40,6 +40,7 @@ from newton._src.geometry.terrain_contacts import (
     TERRAIN_PARTNER_ROWS,
 )
 from newton._src.geometry.terrain_law import (
+    TERRAIN_FEATURE_RECOVERY,
     TERRAIN_PAIR_CANDIDATE_OVERFLOW,
     TERRAIN_PAIR_ROW_OVERFLOW,
     TERRAIN_PAIR_UNSUPPORTED,
@@ -622,6 +623,24 @@ def test_buried_cylinders_get_their_depth(test, device):
     test.assertEqual(_burial_violations(hf, tu.shadow_rows(pipeline), shapes, bodies), [])
 
 
+def test_recovery_rows_have_distinct_feature_ids(test, device):
+    """Give a buried pair's recovery rows distinct feature ids (contact matching keys on them).
+
+    An ellipsoid lies 3 cm deep in a valley of a sawtooth terrain (56 deg faces, every edge a crease): only rule R
+    gives it rows, two of them from boundary points 0 and 8 under one triangle, whose indices are equal in the
+    feature id's three-bit point slot.
+    """
+    x = np.linspace(-1.6, 1.6, 33)
+    heights = np.tile(np.abs(((x + 1.6) % 0.2) - 0.1) * 1.5, (33, 1))
+    pose = _f32_pose([0.992, 0.1249, 0.1397, 0.4019, -0.4489, -0.7217, -0.3407])
+    model, _hfield, shapes = su.solid_scene(heights, 1.6, 1.6, [("ellipsoid", ELLIPSOID, pose)], device=device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    features = [g[3] for g in tu.shadow_rows(pipeline)[shapes[0]]]
+    recovery = [f for f in features if (f >> 5) & 3 == int(TERRAIN_FEATURE_RECOVERY)]
+    test.assertGreaterEqual(len(recovery), 2)
+    test.assertEqual(len(set(features)), len(features), msg=features)
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # float32 against float64
 # ----------------------------------------------------------------------------------------------------------------
@@ -1019,6 +1038,7 @@ for _name, _func in (
     ("test_solid_rows_are_complete_and_free_of_ghosts", test_solid_rows_are_complete_and_free_of_ghosts),
     ("test_solid_rows_reach_the_exact_depth_of_exposed_cells", test_solid_rows_reach_the_exact_depth_of_exposed_cells),
     ("test_buried_cylinders_get_their_depth", test_buried_cylinders_get_their_depth),
+    ("test_recovery_rows_have_distinct_feature_ids", test_recovery_rows_have_distinct_feature_ids),
     ("test_solid_rows_match_the_float64_law", test_solid_rows_match_the_float64_law),
     ("test_tiled_kernels_match_one_thread_kernels", test_tiled_kernels_match_one_thread_kernels),
     ("test_row_overflow_keeps_each_plane_deepest", test_row_overflow_keeps_each_plane_deepest),

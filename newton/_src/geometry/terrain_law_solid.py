@@ -714,11 +714,15 @@ def solid_recovery(
     core: Any, data: TerrainFeatureData, window: TerrainWindow, planes: TerrainPlanes, sink: _Sink, store: _Store
 ) -> tuple[TerrainPlanes, _Sink]:
     """Rule R (G3): up to four of the core's boundary points below the surface, deepest first (then in order), each
-    against the face vertically above it with that plane's normal and depth."""
+    against the face vertically above it with that plane's normal and depth.
+
+    A row's feature id takes the pick's rank (0-3) as its point slot, unique within the pair: a boundary point's index
+    (up to 32 for a cylinder) would wrap in the slot's three bits.
+    """
     count = core_recovery_count(core)
     previous_d = float(-_HUGE)
     previous = int(-1)
-    for _pick in range(4):
+    for pick in range(4):
         best = int(-1)
         best_d = float(0.0)
         for i in range(count):
@@ -742,7 +746,7 @@ def solid_recovery(
         t = terrain_locate(window, x[0], x[1])
         planes, n, a = terrain_plane(data, window, planes, t[0], t[1], t[2])
         sink = _offer(
-            store, sink, x - best_d * n, n, best_d, terrain_feature_id(t[0], t[1], TERRAIN_FEATURE_RECOVERY, t[2], best)
+            store, sink, x - best_d * n, n, best_d, terrain_feature_id(t[0], t[1], TERRAIN_FEATURE_RECOVERY, t[2], pick)
         )
         previous_d = best_d
         previous = best
