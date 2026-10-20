@@ -7,12 +7,17 @@ The transaction applies the paired friction law of the staged transaction, so it
 twins match the staged sweep and the physical reference to rounding, not bitwise.
 """
 
+import os
 import unittest
 from itertools import product
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import warp as wp
 
+import newton
+from newton._src.solvers.feather_pgs import environment_flags
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
 from newton._src.solvers.feather_pgs.kernels import populate_world_J_for_compact_size
@@ -24,10 +29,14 @@ from newton._src.solvers.feather_pgs.sparse_contact import (
 )
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupportPlan
 from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel, contact_transaction_launch_bounds
+from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplets
+from newton.tests.feather_pgs_patch_parity import standing_model
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
+from newton.tests.test_feather_pgs_path_selection import _cpu_model
 from newton.tests.test_feather_pgs_sparse_contacts import _fixture
 from newton.tests.test_feather_pgs_sparse_pgs import _sweep
+from newton.tests.test_feather_pgs_sparse_solver import _make_solver
 
 TRIPLETS = {"active_rows": True, "use_support_table": True, "contact_triplets": True}
 # Row capacities of the suite's two launch-bound families: 12 blocks above 128 rows, 16 at or below.
@@ -339,6 +348,49 @@ class TestSingleStageTransaction(unittest.TestCase):
                 self.assertEqual("make_int4(first, second, third, others)" in single, linked)
                 self.assertEqual(transaction.count("world_row_parent.data[offset + next]"), int(linked))
 
+    def test_request_follows_the_law_and_the_flag_cpu(self):
+        """Keep the staged transaction for both laws unless the flag selects the single-stage one."""
+        for environment, patch, expected, phrase in (
+            ({}, True, "staged", "by default"),
+            ({}, False, "staged", "by default"),
+            ({"FEATHER_PGS_SPARSE_TRANSACTION": "auto"}, True, "staged", "by default"),
+            ({"FEATHER_PGS_SPARSE_TRANSACTION": "staged"}, True, "staged", "=staged"),
+            ({"FEATHER_PGS_SPARSE_TRANSACTION": "single"}, False, "single", "=single"),
+            ({"FEATHER_PGS_SPARSE_TRANSACTION": ""}, False, "staged", "by default"),
+        ):
+            with (
+                self.subTest(environment=environment, patch=patch),
+                mock.patch.dict(os.environ, environment, clear=True),
+            ):
+                probe = SimpleNamespace(_friction_anchors_enabled=patch)
+                transaction, reason = SolverFeatherPGS._request_sparse_contact_transaction(probe)
+                self.assertEqual(transaction, expected)
+                self.assertIn(phrase, reason)
+        for environment, blocks in (({}, 16), ({"FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS": "14"}, 14)):
+            with mock.patch.dict(os.environ, environment, clear=True):
+                self.assertEqual(SolverFeatherPGS._sparse_transaction_blocks(), blocks)
+        for name, value in (
+            ("FEATHER_PGS_SPARSE_TRANSACTION", "fused"),
+            ("FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS", "12"),
+        ):
+            with (
+                self.subTest(name=name),
+                mock.patch.dict(os.environ, {name: value}, clear=True),
+                self.assertRaisesRegex(ValueError, name),
+            ):
+                SolverFeatherPGS._request_sparse_contact_transaction(SimpleNamespace(_friction_anchors_enabled=True))
+                SolverFeatherPGS._sparse_transaction_blocks()
+        for name in ("FEATHER_PGS_SPARSE_TRANSACTION", "FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS"):
+            self.assertEqual(environment_flags.FLAGS[name].kind, "policy")
+
+    def test_route_record_names_no_transaction_without_sparse_factors_cpu(self):
+        """Record the transaction fields of the sparse route even where the route is not selected."""
+        solver = SolverFeatherPGS(_cpu_model())
+        record = solver.get_path_selection()["routes"]["sparse_mass_matrix"]
+        self.assertIsNone(record["contact_transaction"])
+        self.assertIsNone(record["contact_transaction_launch_bounds"])
+        self.assertEqual(record["contact_transaction_reason"], "Native sparse factors are not selected.")
+
 
 @unittest.skipUnless(wp.is_cuda_available(), "The sparse sweep requires CUDA")
 class TestSingleStageTwins(unittest.TestCase):
@@ -482,6 +534,73 @@ class TestSingleStageTwins(unittest.TestCase):
                 single, staged, _ = self._twins(data)
                 _assert_twins(self, data, single, staged)
                 triplets.assert_output(self, data, *single, physical=physical)
+
+    def test_solver_steps_match_the_staged_transaction_cuda(self):
+        """Build records in the contact builder and step with them as the staged transaction steps, both laws.
+
+        One solve from the same state matches the staged sweep's impulses to rounding, through
+        the builder's records; a resting and a sliding biped then keep the same trajectory,
+        within bounds that leave room for rounding to grow through contact switches.
+        """
+        model = standing_model("cuda:0", worlds=2)
+        for law in ("patch", "point"):
+            solvers = {}
+            for transaction in ("single", "staged"):
+                environment = {
+                    "FEATHER_PGS_SPARSE_CONTACT_TRIPLETS": "1",
+                    "FEATHER_PGS_SPARSE_TRANSACTION": transaction,
+                }
+                options = {"dense_max_constraints": 96, "pgs_iterations": 8, "enable_joint_limits": False}
+                if law == "point":
+                    options["friction_anchor_beta"] = 0.0
+                with mock.patch.dict(os.environ, environment):
+                    solvers[transaction] = _make_solver(model, True, **options)
+            with self.subTest(law=law):
+                single, staged = solvers["single"], solvers["staged"]
+                self.assertEqual(single._sparse_contact_transaction, "single")
+                self.assertEqual(staged._sparse_contact_transaction, "staged")
+                self.assertIn("_contact_triplets_single16", single._pgs_solve_sparse_kernel.key)
+                self.assertIn("_contact_records", single._sparse_contact_response_kernel.key)
+                self.assertNotIn("_contact_records", staged._sparse_contact_response_kernel.key)
+                width = CONTACT_RECORD_FLOATS + CONTACT_RING_FLOATS * (law == "patch")
+                self.assertEqual(single._sparse_contact_records.shape, (model.world_count, 32, width))
+                self.assertIsNone(staged._sparse_contact_records)
+                record = single.get_path_selection()["routes"]["sparse_mass_matrix"]
+                self.assertEqual(record["contact_transaction"], "single")
+                self.assertEqual(record["contact_transaction_launch_bounds"], [64, 16])
+                trajectories = {name: self._rollout(solver, model) for name, solver in solvers.items()}
+                (first_single, *_), (first_staged, *_) = trajectories["single"], trajectories["staged"]
+                magnitude = float(np.max(np.abs(first_staged)))
+                self.assertGreater(magnitude, 0.0)
+                np.testing.assert_allclose(first_single, first_staged, rtol=1e-4, atol=1e-4 * magnitude)
+                for (_, q_single, qd_single), (_, q_staged, qd_staged) in zip(
+                    trajectories["single"][1:], trajectories["staged"][1:], strict=True
+                ):
+                    self.assertTrue(np.isfinite(q_single).all() and np.isfinite(qd_single).all())
+                    np.testing.assert_allclose(q_single, q_staged, atol=1e-3)
+                    np.testing.assert_allclose(qd_single, qd_staged, atol=5e-2)
+
+    @staticmethod
+    def _rollout(solver, model, *, steps=20, dt=1.0 / 400.0):
+        """Step a resting world and a sliding world; return the first solve's impulses and each step's state."""
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
+        contacts, control = pipeline.contacts(), model.control()
+        state, output = model.state(), model.state()
+        qd = state.joint_qd.numpy()
+        qd[model.joint_qd_start.numpy()[model.articulation_start.numpy()[1]]] = 0.6
+        state.joint_qd.assign(qd)
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        trajectory = []
+        for step in range(steps):
+            pipeline.collide(state, contacts)
+            solver.step(state, output, control, contacts, dt)
+            state.assign(output)
+            if step == 0:
+                counts = solver.constraint_count.numpy()
+                impulses = solver.impulses.numpy()
+                first = np.concatenate([impulses[world, :count] for world, count in enumerate(counts)])
+            trajectory.append((first, state.body_q.numpy().copy(), state.body_qd.numpy().copy()))
+        return trajectory
 
 
 if __name__ == "__main__":

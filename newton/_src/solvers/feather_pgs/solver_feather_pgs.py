@@ -265,6 +265,8 @@ from .solve_policy import (
     vote,
 )
 from .sparse_contact import (
+    CONTACT_RECORD_FLOATS,
+    CONTACT_RING_FLOATS,
     SparseContactRows,
     _get_sparse_contact_response_kernel,
     apply_sparse_contact_restitution,
@@ -286,6 +288,7 @@ from .sparse_pgs import (
     _SPARSE_CONTACT_METRIC_CACHE_SIZE,
     _SPARSE_LOCAL_WORKSPACE_BYTES,
     _get_pgs_solve_sparse_kernel,
+    contact_transaction_launch_bounds,
 )
 from .velocity_limit_law import accumulated_update, check_velocity_limit_law, velocity_limit_law_suffix
 
@@ -5491,6 +5494,11 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_active_rows = False
         self._sparse_active_rows_reason = "Native sparse factors are not selected."
         self._sparse_contact_triplets_reason = "Native sparse factors are not selected."
+        # The admitted triplets' transaction ("single" or "staged"), its launch bounds and records.
+        self._sparse_contact_transaction = None
+        self._sparse_contact_transaction_reason = "Native sparse factors are not selected."
+        self._sparse_contact_transaction_launch_bounds = None
+        self._sparse_contact_records = None
         self._sparse_max_row_support = None
         sparse_choice = getattr(self, "sparse_mass_matrix", "auto")
         if sparse_choice == "off":
@@ -5781,14 +5789,19 @@ class SolverFeatherPGS(SolverBase):
         # Reuse the local solver's small-world packing without changing this
         # owner's row representation, sweep policy or velocity-limit phase.
         self._sparse_solve_lanes = small_world_lanes if small_world_lanes and not active_rows else 32
-        # The opt-in transaction retains a bounded set of five-scalar tangent
-        # metrics, with one signed-byte map entry per possible full triplet.
-        # Larger capacities keep the ordinary sparse owner at its launch bound.
         triplet_capacity = self.dense_max_constraints // 3
-        metric_cache_size = min(_SPARSE_CONTACT_METRIC_CACHE_SIZE, triplet_capacity)
-        # Include Warp's tiled base and align the two maps before their counters.
-        metric_map_bytes = (2 * triplet_capacity + 3) // 4 * 4
-        triplet_shared_bytes = 256 + 40 * metric_cache_size + metric_map_bytes + 8
+        transaction, transaction_reason = self._request_sparse_contact_transaction()
+        if transaction == "single":
+            # Per-triplet records in global memory replace the metric cache: Warp's tiled base only.
+            triplet_shared_bytes = 256
+        else:
+            # The staged transaction retains a bounded set of five-scalar tangent
+            # metrics, with one signed-byte map entry per possible full triplet.
+            # Larger capacities keep the ordinary sparse owner at its launch bound.
+            metric_cache_size = min(_SPARSE_CONTACT_METRIC_CACHE_SIZE, triplet_capacity)
+            # Include Warp's tiled base and align the two maps before their counters.
+            metric_map_bytes = (2 * triplet_capacity + 3) // 4 * 4
+            triplet_shared_bytes = 256 + 40 * metric_cache_size + metric_map_bytes + 8
         self._sparse_contact_triplets, self._sparse_contact_triplets_reason = self._admit_sparse_contact_triplets(
             active_rows=active_rows,
             split_candidate=split_candidate,
@@ -5796,6 +5809,25 @@ class SolverFeatherPGS(SolverBase):
             use_support_table=use_support_table,
             fits=triplet_capacity > 0 and solve_shared_bytes + triplet_shared_bytes <= shared_limit,
         )
+        transaction_options = {}
+        if self._sparse_contact_triplets:
+            self._sparse_contact_transaction = transaction
+            self._sparse_contact_transaction_reason = transaction_reason
+            transaction_options["contact_transaction"] = transaction
+            if transaction == "single":
+                blocks = self._sparse_transaction_blocks()
+                transaction_options["transaction_blocks"] = blocks
+                self._sparse_contact_transaction_launch_bounds = contact_transaction_launch_bounds(
+                    self.dense_max_constraints, blocks
+                )
+                # Static storage for graph capture: the builder writes the records of each step's
+                # triplets; linked sweeps add each anchor's ring members once per call.
+                width = CONTACT_RECORD_FLOATS + (CONTACT_RING_FLOATS if self._friction_anchors_enabled else 0)
+                self._sparse_contact_records = wp.zeros(
+                    (self.world_count, triplet_capacity, width), dtype=wp.float32, device=model.device
+                )
+        else:
+            self._sparse_contact_transaction_reason = "No contact triplets are admitted."
         index_shape = (1, 1, 1) if use_support_table else shape
         self._sparse_row_dof = wp.empty(index_shape, dtype=wp.int32, device=model.device)
         self._sparse_row_factor = wp.empty(shape, dtype=wp.float32, device=model.device)
@@ -5823,6 +5855,7 @@ class SolverFeatherPGS(SolverBase):
             lanes_per_contact=self._sparse_contact_lanes,
             prepare_rows=self._sparse_prepare_contacts,
             use_support_table=use_support_table,
+            **({"contact_records": True} if self._sparse_contact_records is not None else {}),
         )
         local_factor_bytes = 4 * (64 // self._sparse_solve_lanes) * self.dense_max_constraints * self.max_world_dofs
         # Large resident workspaces regressed whole-step timing in measured
@@ -5850,6 +5883,7 @@ class SolverFeatherPGS(SolverBase):
             warm_start=self.pgs_warmstart,
             linked_rows=self._friction_anchors_enabled,
             velocity_limit_law=self._velocity_limit_kernel_law(),
+            **transaction_options,
         )
 
     def _sweep_kernel(self, route: str, factory, *args, **kwargs):
@@ -5958,10 +5992,12 @@ class SolverFeatherPGS(SolverBase):
         Point friction fuses them in the active-row scan. Patch friction fuses its anchor
         units, pooling their ring loads as the ordinary pair update does, in the active
         scan or else in the full ordered sweep; split, velocity-limit, free-body and
-        packed small-world sweeps keep ordinary updates. The patch transaction is bitwise
-        equal to the same sweep without it. The point transaction is too, unless
-        ``pgs_relative_change_tolerance > 0``: its early exit bounds the tangent changes
-        by the new normal impulse instead of the new tangent impulse.
+        packed small-world sweeps keep ordinary updates. The staged patch transaction is
+        bitwise equal to the same sweep without it. The staged point transaction is too,
+        unless ``pgs_relative_change_tolerance > 0``: its early exit bounds the tangent
+        changes by the new normal impulse instead of the new tangent impulse. The
+        single-stage transaction (:meth:`_request_sparse_contact_transaction`) differs
+        from the staged one by rounding only.
 
         Args:
             active_rows: Whether the sweep selects its rows at sweep entry.
@@ -5989,6 +6025,42 @@ class SolverFeatherPGS(SolverBase):
                 f"pool their ring loads in the {sweep}."
             )
         return True, "FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1: tangent metrics stay in registers."
+
+    def _request_sparse_contact_transaction(self) -> tuple[str, str]:
+        """Return the transaction admitted contact triplets take (``"single"`` or ``"staged"``), and why.
+
+        The single-stage transaction loads a triplet's rows with its block record, which
+        the sparse contact builder writes, and reduces its three residuals together; the
+        staged one reduces the normal, then the tangents, and caches tangent metrics in
+        shared memory. Both apply the paired friction law, so iterates differ by rounding
+        only. Both friction laws take the staged one by default;
+        ``FEATHER_PGS_SPARSE_TRANSACTION`` (``auto``, ``single`` or ``staged``) selects.
+        """
+        request = os.environ.get("FEATHER_PGS_SPARSE_TRANSACTION", "auto") or "auto"
+        if request not in ("auto", "single", "staged"):
+            raise ValueError("FEATHER_PGS_SPARSE_TRANSACTION must be auto, single or staged")
+        if request == "single":
+            return "single", "FEATHER_PGS_SPARSE_TRANSACTION=single: one load group and one reduction per triplet."
+        if request == "staged":
+            return "staged", (
+                "FEATHER_PGS_SPARSE_TRANSACTION=staged: the normal's reduction, then the tangents', with the metric "
+                "cache."
+            )
+        return "staged", (
+            "Both friction laws keep the staged transaction by default (FEATHER_PGS_SPARSE_TRANSACTION=single opts in)."
+        )
+
+    @staticmethod
+    def _sparse_transaction_blocks() -> int:
+        """Return the minimum resident blocks the single-stage sweep requests at or below 128 rows (14 or 16).
+
+        ``FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS`` selects 14 (a 72-register budget) instead of the
+        default 16 (64 registers); above 128 rows the launch bounds request 12 blocks.
+        """
+        blocks = os.environ.get("FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS", "16") or "16"
+        if blocks not in ("14", "16"):
+            raise ValueError("FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS must be 14 or 16")
+        return int(blocks)
 
     def _build_body_maps(self, model):
         if not model.body_count or not model.articulation_count:
@@ -9133,6 +9205,8 @@ class SolverFeatherPGS(SolverBase):
                     self.pgs_relative_change_tolerance,
                     int(friction_start_iteration),
                     int(iteration_offset),
+                    # The single-stage transaction reads the triplets' block records.
+                    *(() if self._sparse_contact_records is None else (self._sparse_contact_records,)),
                 ],
                 outputs=[
                     self._sparse_factor_velocity_delta,
@@ -14766,7 +14840,11 @@ class SolverFeatherPGS(SolverBase):
                             outputs=[
                                 self._sparse_row_dof,
                                 self._sparse_row_factor,
-                                self._sparse_row_free_response,
+                                # The record builder writes the triplet records in the free-response
+                                # slot, which the support table's routes leave unused.
+                                self._sparse_row_free_response
+                                if self._sparse_contact_records is None
+                                else self._sparse_contact_records,
                                 self._sparse_row_incident,
                                 self.diag,
                                 self._sparse_row_support,

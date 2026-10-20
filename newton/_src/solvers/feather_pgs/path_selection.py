@@ -59,7 +59,8 @@ _PATCH_ROUTE_PRECEDENCE = (
     " they admit, own their rows and may select patch rows at sweep entry (sparse_mass_matrix.active_rows,"
     " FEATHER_PGS_PATCH_ACTIVE_ROWS). Where native sparse factors admit contact triplets"
     " (sparse_mass_matrix.contact_triplets, FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1), they fuse patch anchor units,"
-    " pooling each ring's normal loads, in the linked active scan and in the full ordered sweep."
+    " pooling each ring's normal loads, in the linked active scan and in the full ordered sweep, in the transaction"
+    " that sparse_mass_matrix.contact_transaction records (FEATHER_PGS_SPARSE_TRANSACTION)."
     " On the dense route an admitted paired factor sweep"
     " (paired_response.factor_coordinates) excludes the parallel tiers, keyed_rows and local_packets, even a tier"
     " whose request declined sparse factors, and walks patch contact units (paired_response.contact_units) unless"
@@ -666,6 +667,11 @@ def _sparse_mass_matrix(solver) -> dict:
         "support_table": bool(solver._sparse_row_support.enabled),
         "contact_triplets": bool(solver._sparse_contact_triplets),
         "contact_triplets_reason": solver._sparse_contact_triplets_reason,
+        # The admitted triplets' transaction: "single" (one load group and reduction, per-triplet
+        # records) or "staged" (normal, then tangents, metric cache); None without triplets.
+        "contact_transaction": solver._sparse_contact_transaction,
+        "contact_transaction_reason": solver._sparse_contact_transaction_reason,
+        "contact_transaction_launch_bounds": json_value(solver._sparse_contact_transaction_launch_bounds),
     }
     if size is not None:
         record.update(
