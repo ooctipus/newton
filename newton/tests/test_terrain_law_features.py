@@ -166,8 +166,8 @@ def test_edge_classes_and_vertex_features_match_reference(test, device):
 
     On the CPU every decision matches. Under CUDA's default contraction the decisions within float32 resolution
     of their threshold may differ: a crease whose far vertex lies within 0.1 um of the other cluster's plane (the
-    fixture has creases between level clusters at 0 um), or a triple product within a factor of two of the span.
-    Either class or ownership there moves no row by more than that.
+    fixture has 26, three of them at exactly 0), or a triple product within a factor of two of the span. Either
+    class or ownership there moves no row by more than that.
     """
     rng = np.random.default_rng(3)
     heights = tu.suite_like_heights(rng, 64, 64)
