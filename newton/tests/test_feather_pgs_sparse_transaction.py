@@ -97,8 +97,14 @@ def _ring_members(parents, normal):
 class TestContactRecordBuilder(unittest.TestCase):
     """The sparse contact builder writes each contact triplet's block record beside its rows."""
 
-    def _build(self, device, records, shared, friction_shared, patch):
-        """Run the prepared support-table builder on the two-branch fixture; return its outputs."""
+    def _build(
+        self, device, records, shared, friction_shared, patch, *, lanes=8, workers=1, width=CONTACT_RECORD_FLOATS
+    ):
+        """Run the prepared support-table builder on the two-branch fixture; return its outputs.
+
+        ``lanes`` per contact and ``workers`` lane groups share the three contacts; ``width`` is
+        the record stride, wider for a linked sweep's ring members.
+        """
 
         def array(value, dtype=float):
             return wp.array(value, dtype=dtype, device=device)
@@ -165,18 +171,18 @@ class TestContactRecordBuilder(unittest.TestCase):
         options = {"prepare_rows": True, "use_support_table": True}
         if records:
             options["contact_records"] = True
-        record = full((1, 3, CONTACT_RECORD_FLOATS), -7.0)
+        record = full((1, 3, width), -7.0)
         outputs = {
             "row_factor": full((1, 9, 6), -9.0),
             "incident": full((1, 9), -9.0),
             "diagonal": full((1, 9), -9.0),
         }
         wp.launch(
-            _get_sparse_contact_response_kernel(6, **options),
-            dim=8,
+            _get_sparse_contact_response_kernel(6, lanes_per_contact=lanes, **options),
+            dim=workers * lanes,
             inputs=[
                 f["count"],
-                1,
+                workers,
                 *geometry,
                 f["world"],
                 f["slot"],
@@ -222,16 +228,17 @@ class TestContactRecordBuilder(unittest.TestCase):
         results["rhs"] = rows.rhs.numpy()
         return results, record.numpy(), expected, float(rows.cfm)
 
-    def test_records_hold_each_triplets_block_cpu(self):
-        """Write W_nt1, W_nt2, W_t1t2, 1/W_nn and the pair law's tangent eigenbasis for every full triplet.
-
-        Contacts at rows 0 and 3 carry three rows, records 0 and 1; the one-row contact at
-        row 6 writes nothing. The rows the builder writes are those of the plain builder.
-        """
-        for shared, friction_shared, patch in ((0, 0, 0), (0, 1, 0), (1, 0, 0), (0, 0, 1), (1, 1, 1)):
-            with self.subTest(shared=shared, friction_shared=friction_shared, patch=patch):
-                results, record, expected, cfm = self._build("cpu", True, shared, friction_shared, patch)
-                plain, _, _, _ = self._build("cpu", False, shared, friction_shared, patch)
+    def _check_records(self, device, *, lanes=8, workers=1):
+        """Check the records of the two full triplets against NumPy blocks, and the rows against the plain builder."""
+        cases = ((0, 0, 0), (0, 1, 0), (1, 0, 0), (0, 0, 1), (1, 1, 1))
+        widths = (CONTACT_RECORD_FLOATS, CONTACT_RECORD_FLOATS + CONTACT_RING_FLOATS)
+        for (shared, friction_shared, patch), width in product(cases, widths):
+            with self.subTest(shared=shared, friction_shared=friction_shared, patch=patch, width=width):
+                options = {"lanes": lanes, "workers": workers}
+                results, record, expected, cfm = self._build(
+                    device, True, shared, friction_shared, patch, width=width, **options
+                )
+                plain, _, _, _ = self._build(device, False, shared, friction_shared, patch, **options)
                 for name, value in results.items():
                     np.testing.assert_array_equal(value, plain[name], err_msg=name)
                 for triplet, row in ((0, 0), (1, 3)):
@@ -255,6 +262,28 @@ class TestContactRecordBuilder(unittest.TestCase):
                     np.testing.assert_allclose(tangents @ (vx, vy), largest * np.array((vx, vy)), atol=2e-6)
                     self.assertGreater(abs(block[0, 1]) + abs(block[0, 2]), 1e-3)
                 np.testing.assert_array_equal(record[0, 2], -7.0)
+                # The builder leaves a linked sweep's ring members to the sweep.
+                np.testing.assert_array_equal(record[0, :, CONTACT_RECORD_FLOATS:], -7.0)
+
+    def test_records_hold_each_triplets_block_cpu(self):
+        """Write W_nt1, W_nt2, W_t1t2, 1/W_nn and the pair law's tangent eigenbasis for every full triplet.
+
+        Contacts at rows 0 and 3 carry three rows, records 0 and 1; the one-row contact at
+        row 6 writes nothing. The rows the builder writes are those of the plain builder.
+        """
+        self._check_records("cpu")
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Cooperative contact construction requires CUDA")
+    def test_records_hold_each_triplets_block_cuda(self):
+        """Reduce the cross terms in each lane group and write every record as the CPU builder does.
+
+        On CUDA the lanes of a contact's group reduce the three cross products with shuffles and
+        lane 0 writes the record; the rows stay bitwise those of the plain CUDA builder, across
+        group widths and grid strides.
+        """
+        for lanes, workers in ((8, 1), (8, 2), (16, 2), (32, 2)):
+            with self.subTest(lanes=lanes, workers=workers):
+                self._check_records("cuda:0", lanes=lanes, workers=workers)
 
     def test_records_require_prepared_support_rows_cpu(self):
         """Build records only beside prepared rows with the support table, whose routes leave the slot free."""
@@ -567,12 +596,56 @@ class TestSingleStageTwins(unittest.TestCase):
                 _assert_twins(self, data, single, staged)
                 triplets.assert_output(self, data, *single, physical=physical)
 
+    def test_fused_visits_step_the_normal_with_the_record_cuda(self):
+        """Step a fused normal with its record's ``1/W_nn``: zeroed, it holds the normal where staged moves it.
+
+        A triplet the single-stage guards decline takes the ordinary update, whose sweep equals
+        the staged one bit for bit, so matching the staged twin cannot show that the fused branch
+        ran. Zeroing ``1/W_nn`` in the record of one loaded triplet holds that normal at its initial
+        impulse through every sweep, which only the fused branch can do, for point triplets and
+        linked anchors in the active scan and the full sweep.
+        """
+        fixtures = [("point", True, triplets.fixture(offset=30, seeded=True)[0])]
+        for active in (True, False):
+            layout = triplets._LINKED_LAYOUTS["loaded_ring"]
+            fixtures.append(("patch", active, triplets.linked_fixture(layout, pad=30, seeded=True, active=active)[0]))
+        for (law, active, fixture), capacity in product(fixtures, CAPACITIES):
+            with self.subTest(law=law, active=active, capacity=capacity):
+                data = _resized(fixture, capacity)
+                linked = law == "patch"
+                options = {"candidate": True, "active": active, "linked": linked}
+                staged = triplets.DeviceSolve(data, transaction="staged", **options)
+                staged.launch()
+                initial = data["initial_impulses"]
+                moved = np.abs(staged.result()[1] - initial)
+                kinds, parents = data["row_type"][0], data["row_parent"][0]
+                loaded = [
+                    row
+                    for row in range(int(data["world_constraint_count"][0]) - 2)
+                    if (kinds[row], kinds[row + 1], kinds[row + 2]) == (CONTACT, FRICTION, FRICTION)
+                    and parents[row + 1] == parents[row + 2] == row
+                    and moved[0, row] > 1.0e-3
+                ]
+                self.assertTrue(loaded)
+                row = loaded[0]
+                single = triplets.DeviceSolve(data, transaction="single", **options)
+                records = single.records.numpy()
+                records[:, row // 3, 3] = 0.0
+                single.records.assign(records)
+                single.launch()
+                impulses = single.result()[1]
+                live = np.flatnonzero(data["world_constraint_count"])
+                np.testing.assert_array_equal(impulses[live, row], initial[live, row])
+                self.assertTrue(np.all(moved[live, row] > 1.0e-3))
+
     def test_solver_steps_match_the_staged_transaction_cuda(self):
         """Build records in the contact builder and step with them as the staged transaction steps, both laws.
 
         One solve from the same state matches the staged sweep's impulses to rounding, through
         the builder's records; a resting and a sliding biped then keep the same trajectory,
-        within bounds that leave room for rounding to grow through contact switches.
+        within bounds that leave room for rounding to grow through contact switches. The first
+        solve must also differ from the staged one in some bit: the ordinary updates of declined
+        triplets equal the staged sweep's, so a bitwise match would mean nothing was fused.
         """
         model = standing_model("cuda:0", worlds=2)
         for law in ("patch", "point"):
@@ -601,10 +674,12 @@ class TestSingleStageTwins(unittest.TestCase):
                 self.assertEqual(record["contact_transaction"], "single")
                 self.assertEqual(record["contact_transaction_launch_bounds"], [64, 16])
                 trajectories = {name: self._rollout(solver, model) for name, solver in solvers.items()}
-                (first_single, *_), (first_staged, *_) = trajectories["single"], trajectories["staged"]
+                # Each step holds (first solve's impulses, body_q, body_qd).
+                first_single, first_staged = trajectories["single"][0][0], trajectories["staged"][0][0]
                 magnitude = float(np.max(np.abs(first_staged)))
                 self.assertGreater(magnitude, 0.0)
                 np.testing.assert_allclose(first_single, first_staged, rtol=1e-4, atol=1e-4 * magnitude)
+                self.assertFalse(np.array_equal(first_single, first_staged))
                 for (_, q_single, qd_single), (_, q_staged, qd_staged) in zip(
                     trajectories["single"][1:], trajectories["staged"][1:], strict=True
                 ):
