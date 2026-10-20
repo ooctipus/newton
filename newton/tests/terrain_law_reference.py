@@ -642,7 +642,7 @@ def reduce4(points, heights, normal):
     return list(dict.fromkeys(out))
 
 
-def convex_hull_faces(verts, tol: float = 1.0e-9):
+def convex_hull_faces(verts, *, tol: float = 1.0e-9):
     """Faces of the convex hull of ``verts``: vertex index lists and outward unit normals (brute force, small sets)."""
     V = np.asarray(verts, np.float64)
     n = len(V)
@@ -789,7 +789,7 @@ class Polytope(Core):
         return self._edges
 
 
-def _in_face(points, normal, p, tol=1e-12):
+def _in_face(points, normal, p, *, tol=1e-12):
     """Whether p (on the face plane) lies in the convex polygon of ``points``."""
     e1 = points[1] - points[0] if len(points) > 1 else np.array([1.0, 0.0, 0.0])
     e1 = e1 - (e1 @ normal) * normal
@@ -970,7 +970,7 @@ class Cylinder(Core):
         return u + t_lo * n, t_lo
 
 
-def make_core(kind: str, dims: dict, pose_local, verts=None) -> Core:
+def make_core(kind: str, dims: dict, pose_local, *, verts=None) -> Core:
     """A core in the heightfield-local frame: ``pose_local`` = (px, py, pz, qx, qy, qz, qw)."""
     p = np.asarray(pose_local[:3], np.float64)
     R = quat_matrix(np.asarray(pose_local[3:7], np.float64))
@@ -998,7 +998,7 @@ class Row:
 
     __slots__ = ("d", "feat", "group", "k", "n", "q")
 
-    def __init__(self, q, k, n, d, feat, group=None):
+    def __init__(self, q, k, n, d, feat, *, group=None):
         self.q, self.k, self.n, self.d, self.feat, self.group = q, k, n, float(d), feat, group
 
     def __repr__(self):
@@ -1055,7 +1055,7 @@ class PointLaw:
         m, a = self.m[t][key]
         return float((p - a) @ m)
 
-    def minima(self, p, D, tag, stats=None):
+    def minima(self, p, D, tag, *, stats=None):
         hf = self.hf
         out = []
         below = _below_surface(hf, p)
@@ -1150,7 +1150,7 @@ def _recovery_row(hf, p, feat):
     return Row(p - d * n, p.copy(), n.copy(), d, feat)
 
 
-def _solid_recovery(hf, core, kmax=4):
+def _solid_recovery(hf, core, *, kmax=4):
     """G3 for solid cores with no row: up to 4 of the core's deepest boundary points below the surface."""
     if hasattr(core, "verts"):
         pts = core.verts
@@ -1190,15 +1190,15 @@ def _closest_seg_seg(p0, p1, q0, q1):
     return float(s), float(t)
 
 
-def sphere_law(hf, core, D, window, stats=None):
+def sphere_law(hf, core, D, window, *, stats=None):
     tris, edges, verts = window
-    return PointLaw(hf, tris, edges, verts).minima(core.c, D, "c", stats)
+    return PointLaw(hf, tris, edges, verts).minima(core.c, D, "c", stats=stats)
 
 
-def capsule_law(hf, core, D, window, stats=None):
+def capsule_law(hf, core, D, window, *, stats=None):
     tris, edges, verts = window
     law = PointLaw(hf, tris, edges, verts)
-    out = law.minima(core.a, D, "a", stats) + law.minima(core.b, D, "b", stats)
+    out = law.minima(core.a, D, "a", stats=stats) + law.minima(core.b, D, "b", stats=stats)
     a, b = core.a, core.b
     ab = b - a
     # axis-interior minima against edges
@@ -1256,7 +1256,7 @@ def _sigma(core, n, x0):
     return float(n @ (k - x0)), k
 
 
-def _maximize_arc(core, nA, m, theta_ab, x0, samples=9, iters=40):
+def _maximize_arc(core, nA, m, theta_ab, x0, *, samples=9, iters=40):
     """argmax over theta in [0, theta_ab] of sigma(n(theta)), n(theta) = cos nA + sin m (coarse scan + golden)."""
     thetas = np.linspace(0.0, theta_ab, samples)
     vals = [_sigma(core, math.cos(t) * nA + math.sin(t) * m, x0)[0] for t in thetas]
@@ -1335,7 +1335,7 @@ def _reference_feature(core, n):
     return ("pts", np.stack([core.c - axis * core.h + perp * core.r, core.c + axis * core.h + perp * core.r]))
 
 
-def _feature_interval(feat, v0, e1, e2, tol, need_straddle=False):
+def _feature_interval(feat, v0, e1, e2, tol, *, need_straddle=False):
     """Interval of the edge-line coordinate x (along e1 from v0) where the feature, projected along n = e1 x e2,
     meets the line y = 0; None when it misses (or, with need_straddle, when it does not cross the line)."""
     if feat[0] == "pts":
@@ -1411,7 +1411,7 @@ def _hull_line_interval(H, tol):
     return min(xs), max(xs)
 
 
-def solid_law(hf, core, D, window, stats=None, flat_band=None):
+def solid_law(hf, core, D, window, *, stats=None, flat_band=None):
     tris, edges, verts = window
     out = []
     size = float(np.linalg.norm(core.aabb()[1] - core.aabb()[0]))
@@ -1599,7 +1599,7 @@ def _closest_point(core, v):
 # ----------------------------------------------------------------------------------------------------------------
 
 
-def finish(rows, stats=None, max_per_group=4, implied="lower_hull"):
+def finish(rows, *, stats=None, max_per_group=4, implied="lower_hull"):
     """Merge coincident rows, drop rows implied within their plane group, keep at most ``max_per_group`` per group.
 
     Args:
@@ -1664,7 +1664,7 @@ def _drop_implied(g, stats, implied):
     return g
 
 
-def lower_hull_value(P, d, p, n, tol=1e-9):
+def lower_hull_value(P, d, p, n, *, tol=1e-9):
     """Lowest convex interpolation of d at p's tangent position over the others' tangent positions (None outside)."""
     e1 = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
     e1 = e1 - (e1 @ n) * n
@@ -1701,7 +1701,7 @@ def lower_hull_value(P, d, p, n, tol=1e-9):
     return best
 
 
-def _convex_interp3(P, d, p, tol=1e-9, res=1e-7):
+def _convex_interp3(P, d, p, *, tol=1e-9, res=1e-7):
     """Lowest convex interpolation of d at p over segments or triangles of the 3-D points P that contain p."""
     best = None
     m = len(P)
@@ -1783,7 +1783,7 @@ def _concave_neighbours(hf, t):
     return out
 
 
-def anticipate(hf, core, D, window, motion, stats=None):
+def anticipate(hf, core, D, window, motion, *, stats=None):
     """C: face rows a moving core will need before the next collision, at concave creases only."""
     tris = window[0]
     out = []
@@ -1824,7 +1824,7 @@ def anticipate(hf, core, D, window, motion, stats=None):
     return out
 
 
-def pair_rows(hf: ReferenceHeightfield, core: Core, D: float, stats=None, motion=None, implied="lower_hull"):
+def pair_rows(hf: ReferenceHeightfield, core: Core, D: float, *, stats=None, motion=None, implied="lower_hull"):
     """The law's rows of one pair. ``D``: reach on the core distance (rounding radius + margins + gaps).
 
     ``motion`` optionally maps a core point to its predicted displacement over the collision interval (rule C).
@@ -1839,13 +1839,13 @@ def pair_rows(hf: ReferenceHeightfield, core: Core, D: float, stats=None, motion
         stats.edges += len(window[1])
         stats.verts += len(window[2])
     if core.kind == "sphere":
-        raw = sphere_law(hf, core, D, window, stats)
+        raw = sphere_law(hf, core, D, window, stats=stats)
     elif core.kind == "capsule":
-        raw = capsule_law(hf, core, D, window, stats)
+        raw = capsule_law(hf, core, D, window, stats=stats)
     else:
-        raw = solid_law(hf, core, D, window, stats)
+        raw = solid_law(hf, core, D, window, stats=stats)
         if not raw:
             raw = _solid_recovery(hf, core)
     if motion is not None:
-        raw = raw + anticipate(hf, core, D, window, motion, stats)
-    return finish(raw, stats, implied=implied)
+        raw = raw + anticipate(hf, core, D, window, motion, stats=stats)
+    return finish(raw, stats=stats, implied=implied)

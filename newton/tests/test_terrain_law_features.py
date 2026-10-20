@@ -101,8 +101,8 @@ def _planar_slope(n: int, kind: str):
     }[kind]
 
 
-def _assert_matches_reference(test, features, model, heightfield=0, shape=0):
-    hf = tu.reference_surface(model, heightfield)
+def _assert_matches_reference(test, features, model, *, heightfield=0, shape=0):
+    hf = tu.reference_surface(model, heightfield=heightfield)
     ids = ref.cluster_ids(hf.cluster)
     info = features.surface(shape)
     got = features.clusters.numpy()[info.triangle_offset : info.triangle_offset + len(ids)]
@@ -244,7 +244,7 @@ def test_rebuild_after_edit_equals_fresh_build(test, device):
         grid[r0:r1, c0:c1] = change(grid[r0:r1, c0:c1])
         elevations[info.data_offset : info.data_offset + info.nrow * info.ncol] = grid.reshape(-1)
         model.heightfield_elevations.assign(elevations)
-        features.mark_elevations_changed(shape, region)
+        features.mark_elevations_changed(shape, region=region)
         with test.assertRaises(RuntimeError):
             features.check_current()
         features.rebuild_terrain_features(shape)
@@ -320,8 +320,12 @@ class TestTerrainLawFeatures(unittest.TestCase):
         with self.assertRaises(ValueError):
             features.rebuild_terrain_features(7)
         with self.assertRaises(ValueError):
-            features.mark_elevations_changed(0, (0, 6, 0, 2))
-        features.mark_elevations_changed(0, (1, 3, 1, 3))
+            features.mark_elevations_changed(0, region=(0, 6, 0, 2))
+        with self.assertRaises(TypeError):
+            features.mark_elevations_changed(0, (1, 3, 1, 3))
+        with self.assertRaises(TypeError):
+            features.rebuild_terrain_features(0, (1, 3, 1, 3))
+        features.mark_elevations_changed(0, region=(1, 3, 1, 3))
         features.rebuild_terrain_features(0)
         features.check_current()
         self.assertEqual(features.memory_bytes()["clusters"], 2 * 4 * 4 * 4)

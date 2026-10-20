@@ -113,13 +113,13 @@ class TestTerrainLawReference(unittest.TestCase):
             for _ in range(60):
                 q = rng.normal(size=4)
                 q /= np.linalg.norm(q)
-                core = ref.make_core(kind, dims, np.array([*rng.uniform(-1.0, 1.0, size=2), 0.0, *q]), mesh)
+                core = ref.make_core(kind, dims, np.array([*rng.uniform(-1.0, 1.0, size=2), 0.0, *q]), verts=mesh)
                 lo, _hi = core.aabb()
                 core = ref.make_core(
                     kind,
                     dims,
                     np.array([*core.aabb()[0][:2] * 0 + core.c[:2], -lo[2] + rng.uniform(-0.004, 0.02), *q]),
-                    mesh,
+                    verts=mesh,
                 )
                 reach = core.r_eff + 0.04
                 rows = ref.pair_rows(hf, core, reach)

@@ -168,7 +168,7 @@ def test_finish_matches_reference(test, device):
     implied = merged = reduced = 0
     for rows, got, flag in zip(row_sets, kept, flags, strict=True):
         stats = ref.Stats()
-        expected = ref.finish(rows, stats)
+        expected = ref.finish(rows, stats=stats)
         implied += stats.implied
         merged += stats.merged
         reduced += stats.reduced

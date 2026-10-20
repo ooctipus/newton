@@ -856,7 +856,7 @@ class TerrainFeatures:
             raise RuntimeError(f"Terrain features are older than the heights of heightfield shapes {stale}")
 
     # ---- edits -----------------------------------------------------------------------------------------------
-    def mark_elevations_changed(self, shape: int, region: tuple[int, int, int, int] | None = None) -> None:
+    def mark_elevations_changed(self, shape: int, *, region: tuple[int, int, int, int] | None = None) -> None:
         """Report edited heights of a heightfield shape; its features are stale until rebuilt.
 
         Args:
@@ -872,7 +872,7 @@ class TerrainFeatures:
         self._dirty[h] = region
         wp.launch(_bump_version, dim=1, inputs=[self.elevation_version, h], device=self.device, record_tape=False)
 
-    def rebuild_terrain_features(self, shape: int, region: tuple[int, int, int, int] | None = None) -> None:
+    def rebuild_terrain_features(self, shape: int, *, region: tuple[int, int, int, int] | None = None) -> None:
         """Rebuild a heightfield shape's clusters and mip after its heights changed, and mark them current.
 
         The clusters of the whole heightfield are rebuilt, so the result equals a fresh build: a cluster's plane

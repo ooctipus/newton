@@ -70,7 +70,7 @@ def heightfield_model(heights, hx, hy, *, device, min_z=None, max_z=None, extra=
     return builder.finalize(device=device)
 
 
-def reference_surface(model, heightfield: int = 0) -> ref.ReferenceHeightfield:
+def reference_surface(model, *, heightfield: int = 0) -> ref.ReferenceHeightfield:
     """The float64 oracle's surface of heightfield index ``heightfield`` of a model (narrow-phase decode)."""
     row = model.heightfield_data.numpy()[heightfield]
     nrow, ncol, offset = int(row["nrow"]), int(row["ncol"]), int(row["data_offset"])
@@ -326,7 +326,7 @@ def face_claims(features: TerrainFeatures, heightfield: int, points):
     ]
 
 
-def feature_queries(features: TerrainFeatures, heightfield: int, queries, directions=None):
+def feature_queries(features: TerrainFeatures, heightfield: int, queries, *, directions=None):
     """Per ``(r, c, which)``: (edge class, vertex feature 0/1, direction in the vertex's cone 0/1)."""
     device = features.device
     queries = np.asarray(queries, np.int32).reshape(-1, 3)

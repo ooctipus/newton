@@ -518,7 +518,7 @@ def test_seam_adversarial_placements_are_watertight(test, device):
             ):
                 misses.append(("cylinder face", long_axis, row, claimed))
         if queries:
-            answers = tu.feature_queries(features, 0, queries, [row.n for row in query_rows])
+            answers = tu.feature_queries(features, 0, queries, directions=[row.n for row in query_rows])
             for row, (kind, feature, cone) in zip(query_rows, answers, strict=True):
                 if row.feat[0] == "E" and kind != TERRAIN_EDGE_CONVEX:
                     misses.append(("cylinder edge class", long_axis, row, kind))
