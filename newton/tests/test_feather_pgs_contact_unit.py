@@ -306,6 +306,25 @@ class TestContactUnitPoint(unittest.TestCase):
             checked += 1
         self.assertGreater(checked, 150)
 
+    def test_non_unique_problem_takes_the_first_branch(self):
+        """Take off where the contact's own problem also has a loaded stick and a loaded slide.
+
+        Friction that presses the normal down, with ``mu w.u / W_nn`` 1.5 here, lets a contact that separates at
+        zero impulse hold load as well: this problem has three exact solutions. The solve takes the first of
+        take-off, stick and slide, so a state built on another branch is not kept by a unit sweep.
+        """
+        W = np.array([[1.0, 1.5, 0.0], [1.5, 3.0, 0.0], [0.0, 0.0, 3.0]])
+        b = np.array([0.1, 0.5, 0.0])
+        mu = 1.0
+        take_off = np.zeros(3)
+        stick = np.array([0.6, -0.35 / 0.75, 0.0])
+        slide = np.array([0.2, -0.2, 0.0])
+        for x in (take_off, stick, slide):
+            self.assertLess(point_residual(W, b, mu, x), 1.0e-12)
+        out = solve_points(point_problem(W, b, mu))[0]
+        np.testing.assert_array_equal(out[:3], take_off)
+        self.assertEqual(out[3], -1.0)
+
     def test_capped_root_resumes_from_its_warm_start(self):
         """Resume a slide root that the 8-evaluation cap stopped short from its last iterate on the next visit.
 

@@ -12,7 +12,7 @@ else the slide root) and relax a unit whose load keeps reversing.
 
 The cases run the sweep kernels the solver launches for each law on
 synthesized blocks (the audit block of the cycle, an oversize patch ring) and
-on stored ANYmal-replica systems of the CPU contact bench
+on stored legged-robot replica systems of the CPU contact bench
 (``golden_data/test_feather_pgs_contact_update/replica_systems.npz``: certified
 references, upper triangles of the Delassus matrices, chosen for zero-normal
 events, a 128-sweep cycle census, friction outside its final disk and the
@@ -53,6 +53,13 @@ _TAGS = ("zero_end", "census", "cone", "replica79")
 # (approaching at 0.141 m/s, sliding along -t2) and mu 1, with lift coupling mu |W_nt| / W_nn = 1.0.
 W_AUDIT = np.array([[0.1729, 0.0492, 0.1662], [0.0492, 0.3586, 0.0685], [0.1662, 0.0685, 0.2116]])
 W0_AUDIT = np.array([-0.14089, -0.2, -1.0])
+
+# The certified references that 256 sweeps started from them leave above an NCP residual of 1e-3 m/s, by update
+# and friction law (test_sweeps_from_a_reference_leave_only_the_recorded_ones).
+_LEFT_REFERENCES = {
+    "sequential": {"point": {2114}, "patch": {2549}},
+    "unit": {"point": {276, 308, 1477, 1677, 2053, 2069}, "patch": {260, 276, 1647, 1663, 1677}},
+}
 
 
 @contextmanager
@@ -558,7 +565,7 @@ class TestContactUpdateOversize(unittest.TestCase):
 
 
 class TestContactUpdateReplica(unittest.TestCase):
-    """Stored ANYmal-replica systems with certified references."""
+    """Stored legged-robot replica systems with certified references."""
 
     @classmethod
     def setUpClass(cls):
@@ -569,6 +576,19 @@ class TestContactUpdateReplica(unittest.TestCase):
             for system in systems:
                 if tag in system["tags"]:
                     yield law, system
+
+    def tight(self, law):
+        """The systems of a law whose reference is certified to 1e-5 m/s: all but one of the stored ones."""
+        systems = self.systems[law]
+        tight = [s for s in systems if residuals(s, s["lam_ref"])[0].max() <= 1.0e-5]
+        self.assertGreaterEqual(len(tight), len(systems) - 1)
+        return tight
+
+    @staticmethod
+    def updates(law):
+        """The contact updates and ring forms a law's systems run under: (update, ring_units)."""
+        forms = [("sequential", 1), ("unit", 1)]
+        return [*forms, ("unit", 0)] if law == "patch" else forms
 
     def test_zero_normal_events_recover(self):
         """Recover every group the sequential sweep leaves unloaded and approaching at 8 sweeps."""
@@ -629,33 +649,40 @@ class TestContactUpdateReplica(unittest.TestCase):
         self.assertGreater(outside["sequential"], 0)
         self.assertEqual(outside["unit"], 0)
 
-    def test_reference_is_a_fixed_point(self):
-        """Keep a certified reference in one sweep, except where a unit's own problem has another solution.
+    def test_reference_is_a_fixed_point_of_the_sequential_sweep(self):
+        """Keep every certified reference in one sequential sweep, to 1e-5 of its largest impulse.
 
-        References certified to 1e-5 m/s are used; a looser one moves under either law by its residual. The
-        sequential sweep moves no impulse by 1e-5 of the largest. The unit sweep solves each unit's local problem
-        in a fixed branch order (take-off, else stick, else slide), so where that problem has several solutions
-        (a sliding contact whose friction presses its normal down also admits take-off or a stick) it can leave a
-        reference built on another branch. The first unit a sweep moves sees the reference itself: a point unit
-        must move from one exact solution of its local problem to another. A ring unit's split among dependent
-        normals, proximal step and two-anchor alternation are transient: the sweeps return to a solution.
+        References certified to 1e-5 m/s are used; a looser one moves under either law by its residual.
         """
-        moved = 0
-        for law, systems in self.systems.items():
-            tight = [s for s in systems if residuals(s, s["lam_ref"])[0].max() <= 1.0e-5]
-            self.assertGreaterEqual(len(tight), len(systems) - 1)
-            world = World(tight)
+        for law in self.systems:
+            tight = self.tight(law)
             start = [s["lam_ref"] for s in tight]
-            for system, lam in zip(tight, world.sweep(1, "sequential", start=start), strict=True):
-                with self.subTest(law=law, update="sequential", system=system["source"]):
+            for system, lam in zip(tight, World(tight).sweep(1, "sequential", start=start), strict=True):
+                with self.subTest(law=law, system=system["source"]):
                     self.assertLess(np.abs(lam - system["lam_ref"]).max(), 1.0e-5 * np.abs(system["lam_ref"]).max())
-            for system, lam in zip(tight, world.sweep(1, "unit", start=start), strict=True):
+
+    def test_unit_sweep_leaves_a_reference_only_for_another_local_solution(self):
+        """Move a certified reference in one unit sweep only to another solution of the moved unit's own problem.
+
+        The unit sweep solves each unit's local problem in a fixed branch order (take-off, else stick, else slide).
+        Where that problem has several solutions (a sliding contact whose friction presses its normal down also
+        admits take-off or a stick), one sweep leaves a reference built on another branch. The first unit it moves
+        sees the reference itself. A point unit lands on another exact solution of its local problem when its slide
+        root converges within the evaluation cap; a root the cap stops short lands off it by its own residual (none
+        of these references; 12 point and 4 patch references of the bench). A ring unit's split among dependent
+        normals, proximal step and two-anchor alternation are transient, and its sweeps return to a solution. This
+        is a local check: test_sweeps_from_a_reference_leave_only_the_recorded_ones records whether the whole
+        iteration returns.
+        """
+        for law in self.systems:
+            tight = self.tight(law)
+            start = [s["lam_ref"] for s in tight]
+            for system, lam in zip(tight, World(tight).sweep(1, "unit", start=start), strict=True):
                 reference = system["lam_ref"]
                 tolerance = 1.0e-5 * np.abs(reference).max()
                 if np.abs(lam - reference).max() < tolerance:
                     continue
-                moved += 1
-                with self.subTest(law=law, update="unit", system=system["source"]):
+                with self.subTest(law=law, system=system["source"]):
                     rows, normals, _ = first_moved_unit(system, lam, tolerance)
                     self.assertIsNotNone(rows)
                     if len(normals) == 1:
@@ -666,19 +693,51 @@ class TestContactUpdateReplica(unittest.TestCase):
                     else:
                         later = World([system]).sweep(32, "unit", start=[reference])[0]
                         self.assertLessEqual(residuals(system, later)[0].max(), 1.0e-5)
-        self.assertGreater(moved, 0)
+
+    def test_sweeps_from_a_reference_leave_only_the_recorded_ones(self):
+        """Leave exactly the recorded certified references within 256 sweeps started from them, under each update.
+
+        DESIGN's fixed-point guard asks one sweep to keep a certified reference and the sweeps to stay there. One
+        sequential sweep keeps every reference, but its period-two cycle repels two of them (point 2114, patch 2549)
+        within 256 sweeps. One unit sweep moves 6 of the 12 point and 7 of the 14 patch references to another
+        solution of a non-unique local problem; it returns from the two rings within 32 sweeps and not from the
+        other 11, which stay 2.7e-3 to 0.12 m/s from a solution after 512 sweeps. On 1,500 bench systems per law of
+        the same replica set, one unit sweep moves 16 of 1,376 certified point and 93 of 1,112 patch references and
+        256 sweeps leave 11 and 20 of them (one sequential sweep moves 0 and 1, which return), while from a cold
+        start fewer stay unconverged at 256 sweeps than under the sequential sweep (129 against 208 point, 55
+        against 151 patch). Keeping a loaded unit on its loaded branch while that branch still solves its local
+        problem (a continuity rule) is an open decision; a change of the law that alters these sets fails here and
+        must record its measured sets.
+        """
+        for law in self.systems:
+            tight = self.tight(law)
+            world = World(tight)
+            for update in ("sequential", "unit"):
+                later = world.sweep(256, update, start=[s["lam_ref"] for s in tight])
+                left = {s["source"] for s, lam in zip(tight, later, strict=True) if residuals(s, lam)[0].max() > 1.0e-3}
+                with self.subTest(law=law, update=update):
+                    self.assertEqual(left, _LEFT_REFERENCES[update][law])
 
     def test_stationary_states_solve_the_ncp(self):
-        """Leave no stationary state after 256 sweeps that is not a solution (NCP above 1e-4), under both laws."""
+        """Leave no stationary state after 256 sweeps that is not a solution (NCP above 1e-4), under each update.
+
+        A state is stationary when its last sweep moves no impulse by more than 1e-6 of the largest: the float32
+        resolution of a sweep and the census's bound for a fixed state. Patch rings also run as anchor units
+        (patch Stage A). At least 5 systems are stationary per law and update (5 to 8 measured).
+        """
         for law, systems in self.systems.items():
             world = World(systems)
-            for update in ("sequential", "unit"):
-                histories = world.sweep(256, update, snapshots=True)
+            for update, ring_units in self.updates(law):
+                histories = world.sweep(256, update, snapshots=True, ring_units=ring_units)
+                stationary = 0
                 for system, history in zip(systems, histories, strict=True):
                     scale = max(np.abs(history[-1]).max(), 1.0e-12)
-                    if np.abs(history[-1] - history[-2]).max() <= 1.0e-7 * scale:
-                        with self.subTest(law=law, update=update, system=system["source"]):
+                    if np.abs(history[-1] - history[-2]).max() <= 1.0e-6 * scale:
+                        stationary += 1
+                        with self.subTest(law=law, update=update, ring_units=ring_units, system=system["source"]):
                             self.assertLessEqual(residuals(system, history[-1])[0].max(), 1.0e-4)
+                with self.subTest(law=law, update=update, ring_units=ring_units):
+                    self.assertGreaterEqual(stationary, 5)
 
 
 def _free_box_model(**builder):

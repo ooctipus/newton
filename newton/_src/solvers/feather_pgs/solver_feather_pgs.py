@@ -1754,7 +1754,8 @@ class SolverFeatherPGS(SolverBase):
                 which cycles with period two for a sliding contact whose friction lifts its normal (zero normal
                 impulse on an approaching contact at the end of a solve). Where a unit's own problem has several
                 solutions (a sliding contact whose friction presses its normal down), the unit takes the first
-                of take-off, stick and slide. A unit's exact solution does not use ``pgs_omega``; rows outside
+                of take-off, stick and slide, so the sweeps can leave a solution built on another branch and not
+                return to it. A unit's exact solution does not use ``pgs_omega``; rows outside
                 units keep the sequential update. Only the loop sweeps implement
                 ``"unit"``: the dense ``pgs_kernel="loop"`` sweep of split mode on any device and the split
                 free-body sweep on CPU. Every other sweep keeps ``"sequential"``; ``get_path_selection()``
