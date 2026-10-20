@@ -161,7 +161,9 @@ _SLOT_AXIS = wp.constant(2)
 _ROW = wp.constant(1)
 _EXIT_A = wp.constant(2)
 _EXIT_B = wp.constant(3)
-_WITNESS = wp.constant(4)
+_WITNESS = _EXIT_B
+"""An axis crossing under a crease shares end ``b``'s exit kind, slot and keep-the-largest rule: it arises only with both
+ends outside the solid, when end ``b`` has no exit (one walk branch less, which cost the tiled kernel 75 registers)."""
 
 _Mask = wp.types.vector(length=TERRAIN_POINT_MASK_WORDS, dtype=wp.int32)
 
@@ -195,8 +197,9 @@ class _Claim:
     """What one item yields: nothing, a row, an exit candidate of an end inside the solid, or an axis crossing."""
 
     kind: int
-    """0 nothing, 1 a row, 2 or 3 an exit candidate of end ``a`` or ``b``, 4 a crossing of the axis below a crease
-    (:func:`_axis_witness`: ``k`` the axis point, ``d`` its depth, ``feature`` the crease)."""
+    """0 nothing, 1 a row, 2 or 3 an exit candidate of end ``a`` or ``b``; with both ends outside the solid, 3 is a
+    crossing of the axis under a crease instead (:func:`_axis_witness`: ``q`` the axis point, ``d`` its depth,
+    ``feature`` the crease)."""
     q: wp.vec3
     k: wp.vec3
     n: wp.vec3
@@ -458,7 +461,7 @@ def _axis_witness(
     depth = (v0[2] + t * d2[2]) - (a[2] + s * d1[2])
     if depth > 0.0:
         claim.kind = _WITNESS
-        claim.k = a + s * d1
+        claim.q = a + s * d1
         claim.d = depth
         claim.feature = (r * window.surface.ncol + c) * 3 + which
     return claim
@@ -810,7 +813,7 @@ def _wide(cells: wp.vec4i) -> int:
 # A pair's slots hold, while its window is walked, its distinct rows (slots 0-5) and the best exit of each end inside
 # the solid (slots 6 and 7, feature -1 for none), in the window frame: rows are rare against the features walked, so
 # this keeps them out of the registers every feature evaluation needs. With both ends outside, slot 7 holds the axis's
-# deepest crossing under a crease instead (_offer_witness), for the axis interior's G3.
+# deepest crossing under a crease instead (_WITNESS), for the axis interior's G3.
 _EXIT_SLOT = wp.constant(6)
 _WITNESS_SLOT = wp.constant(7)
 _HELD = wp.constant(6)
@@ -834,24 +837,13 @@ def _offer_exit(out: TerrainLawRows, slot: int, end: int, claim: _Claim):
 
 
 @wp.func
-def _offer_witness(out: TerrainLawRows, slot: int, claim: _Claim):
-    """Keep the axis's deepest crossing under a crease (ties: the first in window order), for its G3."""
-    s = slot + _WITNESS_SLOT
-    if out.feature[s] < 0 or claim.d > out.d[s]:
-        out.q[s] = claim.k
-        out.d[s] = claim.d
-        out.feature[s] = claim.feature
-
-
-@wp.func
 def _walk_claim(out: TerrainLawRows, slot: int, held: int, candidates: int, claim: _Claim, eps: float):
-    """Take one item's claim: hold a row (counting the finish's candidates), offer an exit or an axis crossing."""
+    """Take one item's claim: hold a row (counting the finish's candidates), or offer an exit (or, in end ``b``'s slot
+    with both ends outside, the axis's crossing: the deepest is kept)."""
     if claim.kind == _ROW:
         return _hold(out, slot, held, claim, eps, _HELD), candidates + 1
     if claim.kind == _EXIT_A or claim.kind == _EXIT_B:
         _offer_exit(out, slot, claim.kind - _EXIT_A, claim)
-    elif claim.kind == _WITNESS:
-        _offer_witness(out, slot, claim)
     return held, candidates
 
 
@@ -1097,7 +1089,6 @@ def terrain_point_rows_full(
     rows = TerrainRows()
     exit_a = _Claim()
     exit_b = _Claim()
-    witness = _Claim()
     items = _vertex_items(core)
     margins = _cell_margins(window, core)
     for r in range(cells[0], r1 + 2):
@@ -1110,9 +1101,8 @@ def terrain_point_rows_full(
                 if claim.kind == _EXIT_A and (exit_a.kind == 0 or claim.d > exit_a.d):
                     exit_a = claim
                 elif claim.kind == _EXIT_B and (exit_b.kind == 0 or claim.d > exit_b.d):
+                    # With both ends outside: the axis's deepest crossing under a crease (_WITNESS).
                     exit_b = claim
-                elif claim.kind == _WITNESS and (witness.kind == 0 or claim.d > witness.d):
-                    witness = claim
                 elif claim.kind == _ROW:
                     n = rows.count
                     if n < _CANDIDATES:
@@ -1151,13 +1141,14 @@ def terrain_point_rows_full(
                 else:
                     rows.dropped = rows.dropped + 1
     # G3 for the axis interior: both ends outside, no axis exit, a crossing of the axis under a crease.
-    if witness.kind != 0:
+    witness = exit_b
+    if core.segment != 0 and core.below_a == 0 and core.below_b == 0 and witness.kind != 0:
         axis_exit = bool(False)
         for row in range(rows.count):
             if (rows.feature[row] & 7) == _SLOT_AXIS and rows.d[row] < 0.0:
                 axis_exit = True
         if not axis_exit:
-            planes, claim = _axis_recovery(data, window, planes, witness.k, witness.feature)
+            planes, claim = _axis_recovery(data, window, planes, witness.q, witness.feature)
             if claim.kind != 0:
                 n = rows.count
                 if n < _CANDIDATES:
