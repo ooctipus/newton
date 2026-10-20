@@ -11,7 +11,9 @@ exactly what a fresh build gives; stale features must be reported, not read.
 import glob
 import os
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
@@ -60,6 +62,67 @@ def _tile_bounds(data: TerrainFeatureData, heightfield: int, out: wp.array2d[flo
 def _decode_heights(elevations: wp.array[wp.float32], min_z: float, max_z: float, out: wp.array[wp.float32]):
     i = wp.tid()
     out[i] = terrain_decode(min_z, max_z, elevations[i])
+
+
+@wp.kernel(enable_backward=False)
+def _count_every_parent(active: wp.array[wp.int32], parent: wp.array[wp.int32], counts: wp.array[wp.int32]):
+    wp.atomic_add(counts, 1, 1)
+
+
+class _StaleParents:
+    """The parent array of a replayed launch whose threads run one after another.
+
+    A thread replayed stale loads the parents as the launch found them, apart from its own stores, as on CUDA a
+    load issued before another thread's store (or served from a non-coherent cache) may; every store lands in
+    replay order.
+    """
+
+    def __init__(self, parent):
+        self.values = list(parent)
+        self._initial = list(parent)
+        self.own = None
+
+    def __getitem__(self, i):
+        if self.own is None:
+            return self.values[i]
+        return self.own.get(i, self._initial[i])
+
+    def __setitem__(self, i, value):
+        if self.own is not None:
+            self.own[i] = value
+        self.values[i] = value
+
+
+def _python_kernel(kernel):
+    """Return a kernel's own Python body as ``body(t, *args)``: its Warp functions run as Python, ``wp.tid()`` is t."""
+    thread = [0]
+
+    class ThreadScope:
+        def __getattr__(self, name):
+            return getattr(wp, name)
+
+        def tid(self):
+            return thread[0]
+
+    scope = {k: v.func if isinstance(v, wp.Function) else v for k, v in kernel.func.__globals__.items()}
+    scope["wp"] = ThreadScope()
+    function = types.FunctionType(kernel.func.__code__, scope)
+
+    def body(t, *args):
+        thread[0] = t
+        function(*args)
+
+    return body
+
+
+def _replay_compress(body, parent, order, stale):
+    """Replay a compression of ``parent`` (every triangle active), thread by thread in ``order``."""
+    memory = _StaleParents(parent)
+    active = [1] * len(parent)
+    for t in order:
+        memory.own = {} if t in stale else None
+        body(t, active, memory)
+    return memory.values
 
 
 def test_height_decode_rounds_like_the_cpu(test, device):
@@ -159,6 +222,29 @@ def test_clusters_match_reference(test, device):
         again = TerrainFeatures(model)
         np.testing.assert_array_equal(again.clusters.numpy(), features.clusters.numpy())
         np.testing.assert_array_equal(again.planes.numpy(), features.planes.numpy())
+
+
+def test_compression_check_counts_non_root_parents(test, device):
+    """Count the active triangles under a non-root parent, which every round of a build checks, and raise on any.
+
+    The count is read with the round's existing readback; a build whose check counts any triangle raises instead of
+    returning clusters split over non-root ids.
+    """
+    # 1 and 2 under the root 0, 3 under the non-root 2, 4 inactive, 5 alone, 8 under the non-root 7.
+    parent = wp.array([0, 0, 0, 2, 3, 5, 6, 6, 7], dtype=wp.int32, device=device)
+    active = wp.array([1, 1, 1, 1, 0, 1, 1, 1, 1], dtype=wp.int32, device=device)
+    counts = wp.zeros(2, dtype=wp.int32, device=device)
+    wp.launch(terrain_contacts._cluster_check_roots, dim=9, inputs=[active, parent, counts], device=device)
+    test.assertEqual(counts.numpy().tolist(), [0, 2])
+    wp.launch(terrain_contacts._cluster_compress, dim=9, inputs=[active, parent], device=device)
+    np.testing.assert_array_equal(parent.numpy(), [0, 0, 0, 0, 3, 5, 6, 6, 6])
+    counts.zero_()
+    wp.launch(terrain_contacts._cluster_check_roots, dim=9, inputs=[active, parent, counts], device=device)
+    test.assertEqual(counts.numpy().tolist(), [0, 0])
+    model = tu.heightfield_model(np.zeros((3, 3)), 0.1, 0.1, device=device, min_z=0.0, max_z=1.0)
+    with mock.patch.object(terrain_contacts, "_cluster_check_roots", _count_every_parent):
+        with test.assertRaisesRegex(RuntimeError, "not their component's root"):
+            TerrainFeatures(model)
 
 
 def test_edge_classes_and_vertex_features_match_reference(test, device):
@@ -417,6 +503,44 @@ class TestTerrainLawFeatures(unittest.TestCase):
         self.assertEqual(counts["build", "fma.rn"], 0, msg=counts)
         self.assertGreater(counts["build", "mul.rn"], 0, msg=counts)
 
+    def test_compression_leaves_roots_in_any_thread_order_cpu(self):
+        """Replay the cluster compression in adversarial thread orders: every parent it stores is a root.
+
+        With path halving, the compression stored into other triangles' slots, and on CUDA a halving store computed
+        from a triangle's old parent landed after that triangle's thread stored its root, leaving a non-root parent
+        (53 to 88 triangles of a 12 deg slope). Warp's CPU backend runs the threads one after another in id order,
+        so no CPU build shows it. The replay runs the kernel's own Python body thread by thread in any order, each
+        thread's loads current or as the launch found them.
+        """
+        compress = _python_kernel(terrain_contacts._cluster_compress)
+
+        def halving(t, active, parent):
+            # The compression as it was: the union pass's find, which halves paths.
+            if active[t] != 0:
+                parent[t] = terrain_contacts._find.func(parent, t)
+
+        chain = [0, 0, 1, 2, 3, 4, 5]
+        # Thread 4 stores its root, then thread 6, whose loads predate that store, halves slot 4 back to 2.
+        self.assertEqual(_replay_compress(halving, chain, range(7), stale={6}), [0, 0, 0, 0, 2, 0, 0])
+        self.assertEqual(_replay_compress(compress, chain, range(7), stale={6}), [0] * 7)
+        rng = np.random.default_rng(12)
+        forest = [int(rng.integers(0, t + 1)) for t in range(40)]
+        roots = []
+        for t in range(40):
+            root = t
+            while forest[root] != root:
+                root = forest[root]
+            roots.append(root)
+        broken = 0
+        for _ in range(300):
+            order = rng.permutation(40).tolist()
+            stale = set(np.flatnonzero(rng.random(40) < 0.5).tolist())
+            self.assertEqual(_replay_compress(compress, forest, order, stale), roots)
+            old = _replay_compress(halving, forest, order, stale)
+            broken += any(old[old[t]] != old[t] for t in range(40))
+        # The premise: these orders break the halving compression.
+        self.assertGreater(broken, 30)
+
     def test_region_and_shape_arguments_cpu(self):
         """Refuse a shape that is no heightfield and a region outside the grid."""
         model = tu.heightfield_model(np.zeros((5, 5)), 0.2, 0.2, device="cpu")
@@ -440,6 +564,7 @@ for _name, _func in (
     ("test_height_decode_rounds_like_the_cpu", test_height_decode_rounds_like_the_cpu),
     ("test_planar_slope_is_one_cluster", test_planar_slope_is_one_cluster),
     ("test_clusters_match_reference", test_clusters_match_reference),
+    ("test_compression_check_counts_non_root_parents", test_compression_check_counts_non_root_parents),
     ("test_edge_classes_and_vertex_features_match_reference", test_edge_classes_and_vertex_features_match_reference),
     ("test_weak_convex_vertex_keeps_its_support", test_weak_convex_vertex_keeps_its_support),
     ("test_tile_max_bounds_every_height", test_tile_max_bounds_every_height),
