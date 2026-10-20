@@ -163,15 +163,28 @@ def _flat_edge(grid: _Grid, triangle: int, far: int) -> bool:
 
 @wp.func
 def _find(parent: wp.array[wp.int32], x: int) -> int:
+    """Root of ``x``'s tree as the union pass sees it, halving the path on the way (union pass only)."""
     while True:
         p = parent[x]
         if p == x:
             return x
         grand = parent[p]
         if grand != p:
-            # Path halving: a node only ever points further up its own tree.
+            # Path halving stores into other triangles' slots. In the union pass that is safe: a node only ever
+            # points further up its own tree (a store computed from an older parent still points at an ancestor),
+            # and nothing reads a parent as final there. A pass that stores final parents must not halve.
             parent[x] = grand
         x = grand
+
+
+@wp.func
+def _root(parent: wp.array[wp.int32], x: int) -> int:
+    """Root of ``x``'s tree, by loads alone: parents only point to lower ids, so the walk ends at the root."""
+    p = parent[x]
+    while p != x:
+        x = p
+        p = parent[x]
+    return x
 
 
 @wp.func
@@ -235,9 +248,26 @@ def _cluster_union(grid: _Grid, active: wp.array[wp.int32], parent: wp.array[wp.
 
 @wp.kernel(enable_backward=False)
 def _cluster_compress(active: wp.array[wp.int32], parent: wp.array[wp.int32]):
+    """Point every active triangle at its component's root, storing into its own slot only.
+
+    A load of another triangle's slot returns its parent from the union pass or the root its own thread stored;
+    either leads to the root. A path-halving store into another triangle's slot, computed from its old parent,
+    could land after that triangle's thread stored the root (it did on CUDA) and leave a non-root parent, which
+    splits a component's statistics over several ids and indexes scratch that no root reset.
+    """
     t = wp.tid()
     if active[t] != 0:
-        parent[t] = _find(parent, t)
+        parent[t] = _root(parent, t)
+
+
+@wp.kernel(enable_backward=False)
+def _cluster_check_roots(active: wp.array[wp.int32], parent: wp.array[wp.int32], counts: wp.array[wp.int32]):
+    """Count in ``counts[1]`` the active triangles whose parent is not a root after compression (none, unless raced)."""
+    t = wp.tid()
+    if active[t] != 0:
+        p = parent[t]
+        if parent[p] != p:
+            wp.atomic_add(counts, 1, 1)
 
 
 @wp.kernel(enable_backward=False)
@@ -599,8 +629,9 @@ def _cluster_assign(
     name: wp.array[wp.int32],
     label: wp.array[wp.int32],
     records: wp.array[TerrainClusterPlane],
-    remaining: wp.array[wp.int32],
+    counts: wp.array[wp.int32],
 ):
+    """Assign the triangles their component's chosen plane claims; count the others in ``counts[0]``."""
     t = wp.tid()
     if active[t] == 0:
         return
@@ -617,7 +648,7 @@ def _cluster_assign(
         count_h[root],
     )
     if (member[t] & plane) == 0:
-        wp.atomic_add(remaining, 0, 1)
+        wp.atomic_add(counts, 0, 1)
         return
     cluster = name[root]
     label[t] = cluster
@@ -730,7 +761,8 @@ class _ClusterScratch:
         self.gradient = wp.empty(count, dtype=wp.vec2, device=device)
         self.seed_gradient = wp.empty(count, dtype=wp.vec2, device=device)
         self.records = wp.empty(count, dtype=TerrainClusterPlane, device=device)
-        self.remaining = wp.zeros(1, dtype=wp.int32, device=device)
+        # Per round: triangles left unassigned, and triangles under a non-root parent after compression.
+        self.counts = wp.zeros(2, dtype=wp.int32, device=device)
 
 
 def _cluster_bytes(count: int) -> int:
@@ -963,9 +995,11 @@ class TerrainFeatures:
 
         launch(_cluster_init, count, [s.active, s.label])
         for _round in range(TERRAIN_CLUSTER_ROUNDS):
+            s.counts.zero_()
             launch(_cluster_parents, count, [s.parent])
             launch(_cluster_union, cells, [grid, s.active, s.parent])
             launch(_cluster_compress, count, [s.active, s.parent])
+            launch(_cluster_check_roots, count, [s.active, s.parent, s.counts])
             launch(
                 _cluster_reset_roots,
                 count,
@@ -1041,7 +1075,6 @@ class TerrainFeatures:
                     s.name,
                 ],
             )
-            s.remaining.zero_()
             launch(
                 _cluster_assign,
                 count,
@@ -1064,10 +1097,16 @@ class TerrainFeatures:
                     s.name,
                     s.label,
                     s.records,
-                    s.remaining,
+                    s.counts,
                 ],
             )
-            if int(s.remaining.numpy()[0]) == 0:
+            remaining, misparented = (int(n) for n in s.counts.numpy())
+            if misparented:
+                raise RuntimeError(
+                    f"The cluster build of heightfield shape {self.heightfield_shapes[h]} left {misparented} "
+                    f"triangles under a parent that is not their component's root on {device}"
+                )
+            if remaining == 0:
                 break
         size = s.parent
         size.zero_()
