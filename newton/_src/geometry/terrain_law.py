@@ -1,18 +1,35 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared float32 primitives of the per-pair terrain contact law: static surface data, row layout, per-pair finish.
+"""Shared float32 primitives of the per-pair terrain contact law.
 
 The law emits the support set of one (heightfield, convex shape) pair directly: one row per local minimum of the
 core-to-surface distance within the writer's reach, plus the corners of flat support regions, each owned by one
 surface feature (a plane cluster, a crease edge or a vertex). This module holds what every per-type kernel shares;
-the static data they read is built by :mod:`terrain_contacts`. Nothing routes contacts through the law yet.
+the kernels themselves and the static data they read live in :mod:`terrain_contacts`. Nothing routes contacts
+through the law yet.
 
-Heights are decoded exactly as the narrow phase decodes them on the CPU (float32 ``min_z + e * (max_z - min_z)``),
-on every device: the decode goes through float64 so that no fused multiply-add changes a vertex between kernels.
-Every triangle of a plane cluster uses the cluster's plane (:class:`TerrainClusterPlane`), a triangle alone its own
-plane; the tile-max mip bounds the heights of every 8 x 8 cells, and version stamps tell features built from older
-heights apart (:func:`terrain_features_current`).
+Surface model:
+
+* Window-local frame. A pair works in the frame of one window vertex ``(r0, c0)``: vertex ``(r, c)`` lies at
+  ``((c - c0) dx, (r - r0) dy, z(r, c) - z_ref)``, computed from integer index differences, so a vertex shared by
+  several cells is bit-identical in all of them (the narrow phase's per-cell frame ``x1 = x0 + dx`` leaves cracks
+  of up to 9.5 um on a 200 m terrain). The window's origin is the exact grid position in float64 and a core
+  point enters the frame rounded once, so its position against the grid is exact to a float32 rounding of a
+  window-sized number (a float32 origin rounds by up to 4 um 100 m out). Heights are decoded exactly as the
+  narrow phase decodes them on the CPU (float32 ``min_z + e * (max_z - min_z)``), on every device: the decode
+  goes through float64 so that no fused multiply-add changes a vertex between kernels.
+* Canonical edge functions. The face test of a triangle at an edge and the edge's own test read one value
+  ``s = (k - v0) . m`` (``m`` the triangle's in-plane outward normal at the edge, ``v0`` the edge's lower vertex),
+  and the edge's slab test and the vertex's Voronoi test read one value ``(k - v) . (w - v)``. Both sides of every
+  boundary therefore decide on the same bits.
+* Closed predicates. Every side claims its region up to ``eps = 8 eps32 max(window extent, 0.1 m)`` beyond its
+  boundary, so every support is claimed at least once in float32; two inclusive claims of one constraint coincide
+  and the per-pair finish merges them (``4 eps`` in position, ``1e-3`` in normal).
+* Plane clusters (built by :class:`~newton._src.geometry.terrain_contacts.TerrainFeatures`): every triangle of a
+  cluster uses the cluster's plane, a cluster of one triangle its own plane. Edge classes (flat inside a cluster,
+  else convex or concave) and vertex features (incident cluster normals spanning 3-D) follow from the cluster ids
+  and the heights.
 
 Rows carry a window-local feature id in the 23-bit ``sort_sub_key`` of the contact contract (19 bits:
 ``r mod 64``, ``c mod 64``, kind, sub-feature, point slot), unique within any window under 64 cells across.
@@ -36,6 +53,10 @@ TERRAIN_FLAT_EPS = 1.0e-6
 """Plane-cluster membership tolerance [m], absolute: every vertex of a cluster lies within it of the cluster plane."""
 TERRAIN_EPS32 = 1.1920928955078125e-7
 """Float32 machine epsilon."""
+TERRAIN_EPS_FACTOR = 8.0
+"""Closed-predicate band in float32 epsilons of the window extent."""
+TERRAIN_EPS_MIN_EXTENT = 0.1
+"""Smallest window extent [m] the predicate band scales with."""
 TERRAIN_MERGE_SCALE = 4.0
 """Rows closer than this many predicate bands (with normals within :data:`TERRAIN_MERGE_NORMAL`) coincide."""
 TERRAIN_MERGE_NORMAL = 1.0e-3
@@ -46,6 +67,12 @@ TERRAIN_IMPLIED_RESIDUAL = 1.0e-6
 """A row no deeper than this below the lower hull of its plane group's other rows is implied [m]."""
 TERRAIN_BARYCENTRIC_TOLERANCE = 1.0e-5
 """Relative tolerance of the tangent-position containment of implied rows."""
+TERRAIN_NORMAL_SAME = 1.0e-5
+"""Unit normals closer than this are one direction (vertex features)."""
+TERRAIN_VERTEX_SPAN = 1.0e-6
+"""A vertex is a feature when three of its incident cluster normals have a triple product above this."""
+TERRAIN_CONE_BAND = 1.0e-6
+"""Relative band of the closed normal-cone test ``n . (w - v) <= band |w - v|``."""
 TERRAIN_GROUP_ROWS = 4
 """Rows kept per plane group."""
 TERRAIN_ROW_CANDIDATES = 32
@@ -53,6 +80,14 @@ TERRAIN_ROW_CANDIDATES = 32
 TERRAIN_TILE_CELLS = 8
 """Cells per side of a tile of the tile-max mip."""
 
+TERRAIN_EDGE_FLAT = wp.constant(0)
+"""Edge class: both triangles in one plane cluster."""
+TERRAIN_EDGE_CONVEX = wp.constant(1)
+"""Edge class: a ridge between two clusters."""
+TERRAIN_EDGE_CONCAVE = wp.constant(2)
+"""Edge class: a valley between two clusters."""
+TERRAIN_EDGE_BORDER = wp.constant(3)
+"""Edge class: on the heightfield's border."""
 
 TERRAIN_EDGE_X = wp.constant(0)
 """Edge ``(r, c)-(r, c + 1)``, between cell ``(r - 1, c)`` sub 1 and cell ``(r, c)`` sub 0."""
@@ -83,11 +118,16 @@ TerrainRowsInt = wp.types.vector(length=TERRAIN_ROW_CANDIDATES, dtype=wp.int32)
 
 _CANDIDATES = wp.constant(TERRAIN_ROW_CANDIDATES)
 _EPS32 = wp.constant(TERRAIN_EPS32)
+_EPS_FACTOR = wp.constant(TERRAIN_EPS_FACTOR)
+_EPS_MIN_EXTENT = wp.constant(TERRAIN_EPS_MIN_EXTENT)
 _MERGE_SCALE = wp.constant(TERRAIN_MERGE_SCALE)
 _MERGE_NORMAL = wp.constant(TERRAIN_MERGE_NORMAL)
 _GROUP_NORMAL = wp.constant(TERRAIN_GROUP_NORMAL)
 _IMPLIED_RESIDUAL = wp.constant(TERRAIN_IMPLIED_RESIDUAL)
 _BARYCENTRIC_TOLERANCE = wp.constant(TERRAIN_BARYCENTRIC_TOLERANCE)
+_NORMAL_SAME = wp.constant(TERRAIN_NORMAL_SAME)
+_VERTEX_SPAN = wp.constant(TERRAIN_VERTEX_SPAN)
+_CONE_BAND = wp.constant(TERRAIN_CONE_BAND)
 _GROUP_ROWS = wp.constant(TERRAIN_GROUP_ROWS)
 
 
@@ -163,6 +203,26 @@ class TerrainFeatureData:
 
 
 @wp.struct
+class TerrainWindow:
+    """The window-local frame of one pair."""
+
+    surface: TerrainSurfaceInfo
+    """The heightfield's layout."""
+    heightfield: int
+    """Heightfield index."""
+    r0: int
+    """Row of the window's reference vertex."""
+    c0: int
+    """Column of the window's reference vertex."""
+    z_ref: float
+    """Decoded height of the reference vertex [m]."""
+    origin: wp.vec3d
+    """Heightfield-local position of the reference vertex at height ``z_ref`` [m], in float64."""
+    eps: float
+    """Closed-predicate band [m] (see :func:`terrain_eps`)."""
+
+
+@wp.struct
 class TerrainRows:
     """Candidate rows of one pair, in feature order (window frame)."""
 
@@ -206,15 +266,461 @@ def terrain_height(data: TerrainFeatureData, surface: TerrainSurfaceInfo, r: int
     return terrain_decode(surface.min_z, surface.max_z, e)
 
 
+@wp.func
+def terrain_eps(extent: float) -> float:
+    """Return the closed-predicate band for a window whose frame coordinates stay within ``extent`` [m].
+
+    ``extent`` must bound the magnitude of every window-frame coordinate a predicate reads: the core point and
+    the window's vertices, heights relative to the reference vertex included.
+    """
+    return _EPS_FACTOR * _EPS32 * wp.max(extent, _EPS_MIN_EXTENT)
+
+
+@wp.func
+def terrain_window(data: TerrainFeatureData, heightfield: int, r0: int, c0: int) -> TerrainWindow:
+    """Return the window frame of reference vertex ``(r0, c0)`` of a heightfield (band unset, see :func:`terrain_eps`).
+
+    The origin is the exact grid position ``(-hx + c0 dx, -hy + r0 dy)`` in float64: in float32 it would round
+    by up to 4 um on a 200 m terrain and shift every core point against the grid by as much.
+    """
+    window = TerrainWindow()
+    surface = data.surfaces[heightfield]
+    window.surface = surface
+    window.heightfield = heightfield
+    window.r0 = r0
+    window.c0 = c0
+    window.z_ref = terrain_height(data, surface, r0, c0)
+    hx = wp.float64(surface.hx)
+    hy = wp.float64(surface.hy)
+    window.origin = wp.vec3d(
+        -hx + wp.float64(c0) * (wp.float64(2.0) * hx / wp.float64(surface.ncol - 1)),
+        -hy + wp.float64(r0) * (wp.float64(2.0) * hy / wp.float64(surface.nrow - 1)),
+        wp.float64(window.z_ref),
+    )
+    window.eps = 0.0
+    return window
+
+
+@wp.func
+def terrain_window_point(window: TerrainWindow, p: wp.vec3) -> wp.vec3:
+    """Return heightfield-local point ``p`` in the window frame, rounded once (from float64)."""
+    return wp.vec3(
+        wp.float32(wp.float64(p[0]) - window.origin[0]),
+        wp.float32(wp.float64(p[1]) - window.origin[1]),
+        wp.float32(wp.float64(p[2]) - window.origin[2]),
+    )
+
+
+@wp.func
+def terrain_window_to_local(window: TerrainWindow, k: wp.vec3) -> wp.vec3:
+    """Return window-frame point ``k`` in the heightfield-local frame, rounded once (from float64)."""
+    return wp.vec3(
+        wp.float32(wp.float64(k[0]) + window.origin[0]),
+        wp.float32(wp.float64(k[1]) + window.origin[1]),
+        wp.float32(wp.float64(k[2]) + window.origin[2]),
+    )
+
+
+@wp.func
+def terrain_window_vertex(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int) -> wp.vec3:
+    """Return vertex ``(r, c)`` in the window frame, from integer index differences."""
+    z = terrain_height(data, window.surface, r, c) - window.z_ref
+    return wp.vec3(float(c - window.c0) * window.surface.dx, float(r - window.r0) * window.surface.dy, z)
+
+
+@wp.func
+def terrain_valid_cell(surface: TerrainSurfaceInfo, r: int, c: int) -> bool:
+    """Return whether cell ``(r, c)`` exists."""
+    return r >= 0 and c >= 0 and r < surface.nrow - 1 and c < surface.ncol - 1
+
+
+@wp.func
+def terrain_triangle_vertices(r: int, c: int, sub: int) -> tuple[wp.vec2i, wp.vec2i, wp.vec2i]:
+    """Return the vertices ``(row, column)`` of triangle ``sub`` of cell ``(r, c)`` in Newton's order.
+
+    Sub 0 is ``(p00, p10, p11)`` and sub 1 is ``(p00, p11, p01)``, with ``p10 = (r, c + 1)``.
+    """
+    if sub == 0:
+        return wp.vec2i(r, c), wp.vec2i(r, c + 1), wp.vec2i(r + 1, c + 1)
+    return wp.vec2i(r, c), wp.vec2i(r + 1, c + 1), wp.vec2i(r + 1, c)
+
+
+@wp.func
+def terrain_triangle_id(surface: TerrainSurfaceInfo, r: int, c: int, sub: int) -> int:
+    """Return the local triangle id ``2 * (r * cols + c) + sub`` (the contact fingerprints' numbering)."""
+    return 2 * (r * (surface.ncol - 1) + c) + sub
+
+
+@wp.func
+def terrain_cluster(data: TerrainFeatureData, surface: TerrainSurfaceInfo, r: int, c: int, sub: int) -> int:
+    """Return the cluster id of triangle ``sub`` of cell ``(r, c)`` (equal ids: one cluster)."""
+    return data.clusters[surface.triangle_offset + terrain_triangle_id(surface, r, c, sub)]
+
+
+@wp.func
+def terrain_cluster_plane(
+    data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, sub: int
+) -> tuple[wp.vec3, wp.vec3]:
+    """Return the unit upward normal and a point of the plane of a triangle's cluster, in the window frame.
+
+    A cluster of several triangles reads its plane record; a triangle alone uses its own plane, from edge
+    vectors of integer index differences.
+    """
+    surface = window.surface
+    cluster = terrain_cluster(data, surface, r, c, sub)
+    if cluster >= 0:
+        plane = data.planes[surface.plane_offset + cluster]
+        ra = plane.anchor // surface.ncol
+        ca = plane.anchor - ra * surface.ncol
+        n = wp.normalize(wp.vec3(-plane.gx, -plane.gy, 1.0))
+        return n, terrain_window_vertex(data, window, ra, ca) + wp.vec3(0.0, 0.0, plane.offset)
+    a, b, d = terrain_triangle_vertices(r, c, sub)
+    za = terrain_height(data, surface, a[0], a[1])
+    e1 = wp.vec3(
+        float(b[1] - a[1]) * surface.dx,
+        float(b[0] - a[0]) * surface.dy,
+        terrain_height(data, surface, b[0], b[1]) - za,
+    )
+    e2 = wp.vec3(
+        float(d[1] - a[1]) * surface.dx,
+        float(d[0] - a[0]) * surface.dy,
+        terrain_height(data, surface, d[0], d[1]) - za,
+    )
+    n = wp.normalize(wp.cross(e1, e2))
+    if n[2] < 0.0:
+        n = -n
+    return n, terrain_window_vertex(data, window, a[0], a[1])
+
+
 # ----------------------------------------------------------------------------------------------------------------
-# coincident rows
+# canonical edge functions and closed predicates
 # ----------------------------------------------------------------------------------------------------------------
+
+
+@wp.func
+def terrain_face_edge_value(k: wp.vec3, v0: wp.vec3, v1: wp.vec3, n: wp.vec3, w: wp.vec3) -> float:
+    """Return ``s = (k - v0) . m``, ``m`` the in-plane outward normal of a triangle at its edge ``v0 v1``.
+
+    ``n`` is the triangle's (cluster) plane normal and ``w`` its third vertex. ``v0`` must be the edge's lower
+    vertex: the triangles on both sides of an edge then read the same ``cross(v1 - v0, n)``, and inside one
+    cluster their values are exact negatives.
+    """
+    m = wp.cross(v1 - v0, n)
+    if wp.dot(m, w - v0) > 0.0:
+        m = -m
+    return wp.dot(k - v0, wp.normalize(m))
+
+
+@wp.func
+def terrain_vertex_edge_value(k: wp.vec3, v: wp.vec3, w: wp.vec3) -> float:
+    """Return ``(k - v) . (w - v)``: the value vertex ``v``'s Voronoi test and edge ``v w``'s slab test share."""
+    return wp.dot(k - v, w - v)
+
+
+@wp.func
+def terrain_claims(value: float, band: float) -> bool:
+    """Return whether a region bounded by ``value <= 0`` claims ``value`` (closed by ``band``)."""
+    return value <= band
+
+
+@wp.func
+def terrain_beyond(value: float, band: float) -> bool:
+    """Return whether the region beyond a boundary ``value > 0`` claims ``value`` (closed by ``band``)."""
+    return value > -band
 
 
 @wp.func
 def terrain_rows_coincide(q_a: wp.vec3, n_a: wp.vec3, q_b: wp.vec3, n_b: wp.vec3, eps: float) -> bool:
     """Return whether two rows are one constraint: terrain points within ``4 eps``, normals within ``1e-3``."""
     return wp.length(q_a - q_b) <= _MERGE_SCALE * eps and wp.length(n_a - n_b) <= _MERGE_NORMAL
+
+
+@wp.func
+def terrain_face_values(
+    data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, sub: int, n: wp.vec3, k: wp.vec3
+) -> wp.vec3:
+    """Return the canonical edge values of a triangle for point ``k`` (plane normal ``n``).
+
+    Components follow the triangle's edges ``(p0, p1)``, ``(p1, p2)``, ``(p2, p0)``; ``k`` projects into the
+    triangle when all three are at most zero.
+    """
+    a, b, d = terrain_triangle_vertices(r, c, sub)
+    pa = terrain_window_vertex(data, window, a[0], a[1])
+    pb = terrain_window_vertex(data, window, b[0], b[1])
+    pd = terrain_window_vertex(data, window, d[0], d[1])
+    # Each edge with its lower vertex first: sub 0 (p00, p10), (p10, p11), (p00, p11); sub 1 (p00, p11),
+    # (p01, p11), (p00, p01).
+    s0 = terrain_face_edge_value(k, pa, pb, n, pd)
+    s1 = float(0.0)
+    if sub == 0:
+        s1 = terrain_face_edge_value(k, pb, pd, n, pa)
+    else:
+        s1 = terrain_face_edge_value(k, pd, pb, n, pa)
+    s2 = terrain_face_edge_value(k, pa, pd, n, pb)
+    return wp.vec3(s0, s1, s2)
+
+
+@wp.func
+def terrain_edge_sides(r: int, c: int, which: int) -> tuple[wp.vec2i, wp.vec2i, wp.vec3i, wp.vec3i, wp.vec2i, wp.vec2i]:
+    """Return an edge's lower and upper vertex, its two triangles ``(r, c, sub)`` and their third vertices."""
+    if which == 0:
+        return (
+            wp.vec2i(r, c),
+            wp.vec2i(r, c + 1),
+            wp.vec3i(r - 1, c, 1),
+            wp.vec3i(r, c, 0),
+            wp.vec2i(r - 1, c),
+            wp.vec2i(r + 1, c + 1),
+        )
+    if which == 1:
+        return (
+            wp.vec2i(r, c),
+            wp.vec2i(r + 1, c),
+            wp.vec3i(r, c - 1, 0),
+            wp.vec3i(r, c, 1),
+            wp.vec2i(r, c - 1),
+            wp.vec2i(r + 1, c + 1),
+        )
+    return (
+        wp.vec2i(r, c),
+        wp.vec2i(r + 1, c + 1),
+        wp.vec3i(r, c, 0),
+        wp.vec3i(r, c, 1),
+        wp.vec2i(r, c + 1),
+        wp.vec2i(r + 1, c),
+    )
+
+
+@wp.func
+def terrain_edge_class(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, which: int) -> int:
+    """Return the class of edge ``which`` of vertex ``(r, c)``: flat inside one cluster, else convex or concave.
+
+    The far vertex of the second triangle above the first triangle's cluster plane makes a valley (concave);
+    two different clusters always meet at a crease, however small.
+    """
+    _v0, _v1, ta, tb, _wa, wb = terrain_edge_sides(r, c, which)
+    surface = window.surface
+    if not terrain_valid_cell(surface, ta[0], ta[1]) or not terrain_valid_cell(surface, tb[0], tb[1]):
+        return TERRAIN_EDGE_BORDER
+    if terrain_cluster(data, surface, ta[0], ta[1], ta[2]) == terrain_cluster(data, surface, tb[0], tb[1], tb[2]):
+        return TERRAIN_EDGE_FLAT
+    n, a = terrain_cluster_plane(data, window, ta[0], ta[1], ta[2])
+    if wp.dot(n, terrain_window_vertex(data, window, wb[0], wb[1]) - a) > 0.0:
+        return TERRAIN_EDGE_CONCAVE
+    return TERRAIN_EDGE_CONVEX
+
+
+@wp.func
+def terrain_ring_vertex(r: int, c: int, j: int) -> wp.vec2i:
+    """Return one-ring neighbour ``j`` (0..5, counter-clockwise) of vertex ``(r, c)``."""
+    if j == 0:
+        return wp.vec2i(r, c + 1)
+    if j == 1:
+        return wp.vec2i(r + 1, c + 1)
+    if j == 2:
+        return wp.vec2i(r + 1, c)
+    if j == 3:
+        return wp.vec2i(r, c - 1)
+    if j == 4:
+        return wp.vec2i(r - 1, c - 1)
+    return wp.vec2i(r - 1, c)
+
+
+@wp.func
+def terrain_incident_triangle(r: int, c: int, j: int) -> wp.vec3i:
+    """Return incident triangle ``j`` (0..5) of vertex ``(r, c)`` as ``(row, column, sub)``, matching the ring."""
+    if j == 0:
+        return wp.vec3i(r, c, 0)
+    if j == 1:
+        return wp.vec3i(r, c, 1)
+    if j == 2:
+        return wp.vec3i(r, c - 1, 0)
+    if j == 3:
+        return wp.vec3i(r - 1, c - 1, 1)
+    if j == 4:
+        return wp.vec3i(r - 1, c - 1, 0)
+    return wp.vec3i(r - 1, c, 1)
+
+
+@wp.func
+def terrain_interior_vertex(surface: TerrainSurfaceInfo, r: int, c: int) -> bool:
+    """Return whether vertex ``(r, c)`` has a full one-ring."""
+    return r >= 1 and c >= 1 and r < surface.nrow - 1 and c < surface.ncol - 1
+
+
+_RingNormals = wp.types.matrix(shape=(6, 3), dtype=wp.float32)
+
+
+@wp.func
+def _ring_normal(normals: _RingNormals, i: int) -> wp.vec3:
+    return wp.vec3(normals[i, 0], normals[i, 1], normals[i, 2])
+
+
+@wp.func
+def terrain_vertex_feature(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int) -> bool:
+    """Return whether vertex ``(r, c)`` is a feature of its own: its incident cluster normals span 3-D.
+
+    Normals closer than :data:`TERRAIN_NORMAL_SAME` are one direction; three distinct directions span 3-D when
+    their triple product exceeds :data:`TERRAIN_VERTEX_SPAN`.
+    """
+    surface = window.surface
+    if not terrain_interior_vertex(surface, r, c):
+        return False
+    normals = _RingNormals()
+    count = int(0)
+    for j in range(6):
+        t = terrain_incident_triangle(r, c, j)
+        n, _a = terrain_cluster_plane(data, window, t[0], t[1], t[2])
+        fresh = bool(True)
+        for i in range(count):
+            if wp.length(n - _ring_normal(normals, i)) <= _NORMAL_SAME:
+                fresh = False
+        if fresh:
+            normals[count, 0] = n[0]
+            normals[count, 1] = n[1]
+            normals[count, 2] = n[2]
+            count += 1
+    for i in range(count):
+        ni = _ring_normal(normals, i)
+        for j in range(i + 1, count):
+            nj = _ring_normal(normals, j)
+            for k in range(j + 1, count):
+                if wp.abs(wp.dot(ni, wp.cross(nj, _ring_normal(normals, k)))) > _VERTEX_SPAN:
+                    return True
+    return False
+
+
+@wp.func
+def terrain_vertex_in_cone(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, n: wp.vec3) -> bool:
+    """Return whether direction ``n`` lies in vertex ``(r, c)``'s normal cone (closed): ``n . (w - v) <= 0``."""
+    v = terrain_window_vertex(data, window, r, c)
+    for j in range(6):
+        w = terrain_ring_vertex(r, c, j)
+        e = terrain_window_vertex(data, window, w[0], w[1]) - v
+        if wp.dot(n, e) > _CONE_BAND * wp.length(e):
+            return False
+    return True
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# point claims (the predicates of a point core: sphere centre, capsule end, a solid's manifold point)
+# ----------------------------------------------------------------------------------------------------------------
+
+
+@wp.func
+def terrain_face_point(
+    data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, sub: int, k: wp.vec3
+) -> tuple[bool, wp.vec3, wp.vec3, float]:
+    """Return whether a triangle claims point ``k``'s projection on its cluster plane, and the row.
+
+    Returns ``(claims, q, n, d)``: the projection ``q`` lies in the triangle up to the band, ``n`` is the
+    cluster normal and ``d = n . (k - q)``. Reach and facing are left to the caller.
+    """
+    n, a = terrain_cluster_plane(data, window, r, c, sub)
+    s = terrain_face_values(data, window, r, c, sub, n, k)
+    claims = terrain_claims(s[0], window.eps) and terrain_claims(s[1], window.eps) and terrain_claims(s[2], window.eps)
+    d = wp.dot(n, k - a)
+    return claims, k - d * n, n, d
+
+
+@wp.func
+def terrain_edge_values(
+    data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, which: int, k: wp.vec3
+) -> wp.vec4:
+    """Return an edge's predicate values for point ``k``: ``(s_a, s_b, w_0, w_1)``.
+
+    ``s_a`` and ``s_b`` are the values the two faces read at this edge (:func:`terrain_face_values`), ``w_0``
+    and ``w_1`` the values the edge's end vertices read for each other (:func:`terrain_vertex_edge_value`).
+    The edge must have both triangles.
+    """
+    v0i, v1i, ta, tb, wa, wb = terrain_edge_sides(r, c, which)
+    v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
+    v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
+    na, _pa = terrain_cluster_plane(data, window, ta[0], ta[1], ta[2])
+    nb, _pb = terrain_cluster_plane(data, window, tb[0], tb[1], tb[2])
+    sa = terrain_face_edge_value(k, v0, v1, na, terrain_window_vertex(data, window, wa[0], wa[1]))
+    sb = terrain_face_edge_value(k, v0, v1, nb, terrain_window_vertex(data, window, wb[0], wb[1]))
+    return wp.vec4(sa, sb, terrain_vertex_edge_value(k, v0, v1), terrain_vertex_edge_value(k, v1, v0))
+
+
+@wp.func
+def terrain_edge_point(
+    data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, which: int, k: wp.vec3
+) -> tuple[bool, wp.vec3]:
+    """Return whether an edge claims point ``k`` (beyond both faces, inside the edge's slab), and the closest point.
+
+    The face values are the ones :func:`terrain_face_point` reads; a border edge claims nothing. Edge classes
+    are left to the caller.
+    """
+    v0i, v1i, ta, tb, _wa, _wb = terrain_edge_sides(r, c, which)
+    surface = window.surface
+    if not terrain_valid_cell(surface, ta[0], ta[1]) or not terrain_valid_cell(surface, tb[0], tb[1]):
+        return False, wp.vec3(0.0)
+    values = terrain_edge_values(data, window, r, c, which, k)
+    v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
+    u = terrain_window_vertex(data, window, v1i[0], v1i[1]) - v0
+    length = wp.length(u)
+    eps = window.eps
+    claims = (
+        terrain_beyond(values[0], eps)
+        and terrain_beyond(values[1], eps)
+        and terrain_beyond(values[2], eps * length)
+        and terrain_beyond(values[3], eps * length)
+    )
+    t = wp.clamp(values[2] / wp.dot(u, u), 0.0, 1.0)
+    return claims, v0 + t * u
+
+
+@wp.func
+def terrain_vertex_point(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, k: wp.vec3) -> bool:
+    """Return whether vertex ``(r, c)`` claims point ``k``: ``(k - v) . (w - v) <= 0`` for its whole one-ring."""
+    if not terrain_interior_vertex(window.surface, r, c):
+        return False
+    v = terrain_window_vertex(data, window, r, c)
+    for j in range(6):
+        wi = terrain_ring_vertex(r, c, j)
+        w = terrain_window_vertex(data, window, wi[0], wi[1])
+        if not terrain_claims(terrain_vertex_edge_value(k, v, w), window.eps * wp.length(w - v)):
+            return False
+    return True
+
+
+@wp.func
+def terrain_locate(window: TerrainWindow, x: float, y: float) -> wp.vec3i:
+    """Return the triangle ``(row, column, sub)`` under window-frame point ``(x, y)`` (half-open partition).
+
+    Points on the heightfield's far border belong to its last cells; outside the footprint the row is -1.
+    """
+    surface = window.surface
+    u = x / surface.dx
+    v = y / surface.dy
+    fc = wp.floor(u)
+    fr = wp.floor(v)
+    c = window.c0 + int(fc)
+    r = window.r0 + int(fr)
+    fx = u - fc
+    fy = v - fr
+    if c == surface.ncol - 1 and fx == 0.0:
+        c -= 1
+        fx = 1.0
+    if r == surface.nrow - 1 and fy == 0.0:
+        r -= 1
+        fy = 1.0
+    if not terrain_valid_cell(surface, r, c):
+        return wp.vec3i(-1, -1, -1)
+    if fx >= fy:
+        return wp.vec3i(r, c, 0)
+    return wp.vec3i(r, c, 1)
+
+
+@wp.func
+def terrain_point_below(data: TerrainFeatureData, window: TerrainWindow, k: wp.vec3) -> bool:
+    """Return whether window-frame point ``k`` lies below the surface (its cluster plane under it)."""
+    t = terrain_locate(window, k[0], k[1])
+    if t[0] < 0:
+        return False
+    n, a = terrain_cluster_plane(data, window, t[0], t[1], t[2])
+    return k[2] < a[2] - (n[0] * (k[0] - a[0]) + n[1] * (k[1] - a[1])) / n[2]
 
 
 # ----------------------------------------------------------------------------------------------------------------

@@ -16,6 +16,10 @@ import warp as wp
 from newton._src.geometry.narrow_phase import verify_narrow_phase_buffers
 from newton._src.geometry.terrain_contacts import TerrainFeatures
 from newton._src.geometry.terrain_law import (
+    TERRAIN_EDGE_BORDER,
+    TERRAIN_EDGE_CONCAVE,
+    TERRAIN_EDGE_CONVEX,
+    TERRAIN_EDGE_FLAT,
     TERRAIN_STATUS_STALE,
     TERRAIN_TILE_CELLS,
     TerrainFeatureData,
@@ -26,6 +30,13 @@ from newton._src.geometry.terrain_law import (
 from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_test_utils as tu
 from newton.tests.unittest_utils import add_function_test, get_test_devices
+
+_CLASSES = {
+    "flat": TERRAIN_EDGE_FLAT,
+    "convex": TERRAIN_EDGE_CONVEX,
+    "concave": TERRAIN_EDGE_CONCAVE,
+    "border": TERRAIN_EDGE_BORDER,
+}
 
 
 @wp.kernel(enable_backward=False)
@@ -110,6 +121,39 @@ def test_clusters_match_reference(test, device):
         again = TerrainFeatures(model)
         np.testing.assert_array_equal(again.clusters.numpy(), features.clusters.numpy())
         np.testing.assert_array_equal(again.planes.numpy(), features.planes.numpy())
+
+
+def test_edge_classes_and_vertex_features_match_reference(test, device):
+    """Derive every edge class and vertex feature in float32 on demand as the float64 reference does."""
+    rng = np.random.default_rng(3)
+    heights = tu.suite_like_heights(rng, 64, 64)
+    model = tu.heightfield_model(heights, 3.2, 3.2, device=device)
+    features = TerrainFeatures(model)
+    hf = tu.reference_surface(model)
+    queries, expected_class, expected_feature = [], [], []
+    for r in range(hf.nrow):
+        for c in range(hf.ncol):
+            for which, kind in enumerate(("H", "V", "D")):
+                if (
+                    (kind == "H" and c >= hf.cols)
+                    or (kind == "V" and r >= hf.rows)
+                    or (kind == "D" and (r >= hf.rows or c >= hf.cols))
+                ):
+                    continue
+                window = hf.window_features(
+                    (min(r, hf.rows - 1), min(r, hf.rows - 1), min(c, hf.cols - 1), min(c, hf.cols - 1))
+                )
+                edge = next(e for e in window[1] if e[0] == kind and e[1] == r and e[2] == c)
+                queries.append((r, c, which))
+                expected_class.append(_CLASSES[hf.edge_class(edge)])
+                expected_feature.append(int(hf.vertex_feature(r, c)))
+    answers = tu.feature_queries(features, 0, queries)
+    np.testing.assert_array_equal(answers[:, 0], np.asarray(expected_class))
+    np.testing.assert_array_equal(answers[:, 1], np.asarray(expected_feature))
+    test.assertGreater(sum(k == TERRAIN_EDGE_CONVEX for k in expected_class), 1000)
+    test.assertGreater(sum(k == TERRAIN_EDGE_CONCAVE for k in expected_class), 1000)
+    test.assertGreater(sum(k == TERRAIN_EDGE_FLAT for k in expected_class), 1000)
+    test.assertGreater(sum(expected_feature), 500)
 
 
 def test_tile_max_bounds_every_height(test, device):
@@ -225,6 +269,7 @@ devices = get_test_devices()
 for _name, _func in (
     ("test_planar_slope_is_one_cluster", test_planar_slope_is_one_cluster),
     ("test_clusters_match_reference", test_clusters_match_reference),
+    ("test_edge_classes_and_vertex_features_match_reference", test_edge_classes_and_vertex_features_match_reference),
     ("test_tile_max_bounds_every_height", test_tile_max_bounds_every_height),
     ("test_rebuild_after_edit_equals_fresh_build", test_rebuild_after_edit_equals_fresh_build),
     ("test_stale_features_are_reported", test_stale_features_are_reported),
