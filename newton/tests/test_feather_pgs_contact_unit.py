@@ -536,6 +536,35 @@ class TestContactUnitPoint(unittest.TestCase):
         self.assertLess(point_residual(W, b, mu, second[:3]), 1.0e-6)
         np.testing.assert_allclose(second[:3], exact_contact(W, b, mu), rtol=1.0e-5)
 
+    def test_capped_root_continues_past_take_off(self):
+        """Continue an anchor's slide root that the evaluation cap stopped at a negative normal impulse.
+
+        The anchor approaches at zero impulse (b_n = -0.63), and its only solution is a slide whose load lies just above
+        its ring's (x_n = 0.0073). From no impulse its root needs 12 Newton evaluations; the cap of 8 stops at an
+        iterate whose normal is negative, so the visit takes off, approaching. It still returns that root, and the next
+        visit, warm-started from it, lands on the slide; restarting the root at every visit would never reach it.
+        """
+        W = np.array(
+            [
+                [9.179831899827652, 8.078154448882666, -1.2893206523309355],
+                [8.078154448882666, 7.89547730293111, 1.6313318695099932],
+                [-1.2893206523309355, 1.6313318695099932, 10.316197814840054],
+            ]
+        )
+        b = np.array([-0.6257287010721538, 0.8976471649428763, 5.426978646485735])
+        mu = 1.3456649585502143
+        ring_load = 0.3787200967565892
+        ((alpha, x),) = slide_solutions(W, b, mu, ring_load=ring_load)
+        self.assertGreater(x[0], 0.0)
+        first = solve_points(point_problem(W, b, mu, ring_load=ring_load))[0]
+        self.assertEqual(first[0], 0.0)
+        self.assertEqual(first[4], 1 + contact_unit.CONTACT_UNIT_NEWTON_CAP)
+        self.assertGreater(first[3], 0.0)
+        second = solve_points(point_problem(W, b, mu, ring_load=ring_load, alpha=first[3], current=first[:3]))[0]
+        self.assertLess(point_residual(W, b, mu, second[:3], ring_load=ring_load), 1.0e-6)
+        np.testing.assert_allclose(second[:3], x, atol=1.0e-4)
+        self.assertAlmostEqual(second[3], alpha, delta=1.0e-3 * alpha)
+
 
 def exact_contact(W, b, mu):
     """The exact solution of one isolated point contact in float64 (take-off, stick, or the slide root by bisection)."""

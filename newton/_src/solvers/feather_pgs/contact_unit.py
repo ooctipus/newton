@@ -400,7 +400,8 @@ _UNIT = Template(r"""
         // it and the friction must press the normal to carry load (S0 <= 0), the loaded branches include the press
         // slide of the larger load. The solve returns the current impulses whenever they solve the problem (a held
         // slide whose load answers S0 with a gain outside (0, 8] takes the split step, which keeps it as well). The
-        // returned alpha is the slide root, -1 for take-off and stick.
+        // returned alpha is the slide root, also where its normal came out negative and the unit takes off, so that
+        // the next visit continues a root the evaluation cap stopped short; -1 for take-off and stick.
         static ${inline} ContactUnitSolution solve(float wnn, float w11, float w12, float w22, float wn1, float wn2,
                                                   float bn, float b1, float b2, float mu, float L, float alpha0, int cap,
                                                   float on, float of1, float of2) {
@@ -499,6 +500,7 @@ _UNIT = Template(r"""
             }
             out.friction0 = tfx;
             out.friction1 = tfy;
+            if (r.mode == 2) out.alpha = r.alpha;
             return out;
         }
 
@@ -877,8 +879,8 @@ def contact_unit_solve(
     load takes the press slide of the larger load.
 
     Returns:
-        The normal impulse, the two friction impulses, the slide root (-1 for take-off and stick) and the root
-        evaluations.
+        The normal impulse, the two friction impulses, the slide root (also where its normal came out negative and
+        the unit takes off, for the next visit to continue; -1 for take-off and stick) and the root evaluations.
     """
     ...
 
