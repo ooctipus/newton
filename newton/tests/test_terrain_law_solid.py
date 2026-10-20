@@ -115,6 +115,10 @@ def _f32_pose(pose):
 # the finish in place
 # ----------------------------------------------------------------------------------------------------------------
 
+# Both finishes compile here: without contraction, as the solid modules compile them, so that the bitwise comparison
+# holds in the mode the kernels run in on CUDA too.
+wp.set_module_options({"fuse_fp": False})
+
 
 @wp.kernel(enable_backward=False)
 def _finish_both(
