@@ -722,9 +722,12 @@ def _pair_setup(inputs: TerrainPairInputs, data: TerrainFeatureData, pair: int):
     cells = terrain_box_cells(surface, lo[0] - reach, lo[1] - reach, hi[0] + reach, hi[1] + reach)
     if cells[1] < cells[0] or cells[3] < cells[2]:
         return TERRAIN_PAIR_OUTSIDE, frame, heightfield, cells, a, b, segment, reach
-    # The lowest point minus the reach, lowered by its own float32 rounding: the exit never drops a row.
+    # The lowest point minus the reach, lowered by its own float32 rounding and by the cluster tolerance (a face row's
+    # terrain point lies on its cluster plane, up to TERRAIN_FLAT_EPS above its triangle's highest vertex). The exit
+    # drops no row but one claimed within the band beyond its triangle, where a steep face's plane may rise a band times
+    # its slope higher, and then only within that of the reach limit.
     low = lo[2] - reach
-    low = low - 4.0 * _EPS32 * (wp.abs(lo[2]) + reach)
+    low = low - 4.0 * _EPS32 * (wp.abs(lo[2]) + reach) - _FLAT
     if terrain_tile_exit(data, surface, cells[0], cells[1], cells[2], cells[3], low):
         return TERRAIN_PAIR_TILE_EXIT, frame, heightfield, cells, a, b, segment, reach
     return 0, frame, heightfield, cells, a, b, segment, reach
