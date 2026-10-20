@@ -145,10 +145,10 @@ class TerrainFinishScratch:
     feature: wp.array[wp.int32]
     """Feature id of every candidate."""
     rows: wp.array[TerrainRows]
-    """Per thread, the finish's input (:func:`~newton._src.geometry.terrain_law.terrain_finish`)."""
+    """Per block, the finish's input (:func:`~newton._src.geometry.terrain_law.terrain_finish`)."""
 
 
-def terrain_finish_scratch(device, blocks: int = TERRAIN_LAW_FULL_BLOCKS) -> TerrainFinishScratch:
+def terrain_finish_scratch(device, *, blocks: int = TERRAIN_LAW_FULL_BLOCKS) -> TerrainFinishScratch:
     """Allocate the :class:`TerrainFinishScratch` of a full-finish launch of ``blocks`` blocks."""
     scratch = TerrainFinishScratch()
     scratch.blocks = blocks

@@ -667,7 +667,7 @@ def _launch_segment(shadow, model, pipeline, lane, begin, count, out, *, kernel=
 def _launch_full(shadow, model, pipeline, begin, out, blocks=TERRAIN_LAW_FULL_BLOCKS):
     """Run the full-finish kernel, with ``blocks`` blocks, over the pairs of ``out``'s deferred list
     (``deferred_count``) from table pair ``begin``."""
-    scratch = terrain_finish_scratch(model.device, blocks)
+    scratch = terrain_finish_scratch(model.device, blocks=blocks)
     args = [begin, 0, _pair_inputs(shadow, model, pipeline), shadow.features.data(), out, scratch]
     wp.launch_tiled(
         terrain_law_point.terrain_point_rows_full,
