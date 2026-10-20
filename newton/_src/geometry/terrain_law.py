@@ -72,8 +72,14 @@ TERRAIN_BARYCENTRIC_TOLERANCE = 1.0e-5
 """Relative tolerance of the tangent-position containment of implied rows."""
 TERRAIN_NORMAL_SAME = 1.0e-5
 """Unit normals closer than this are one direction (vertex features)."""
-TERRAIN_VERTEX_SPAN = 1.0e-6
-"""A vertex is a feature when three of its incident cluster normals have a triple product above this."""
+TERRAIN_VERTEX_SPAN = 1.0e-10
+"""A vertex is a feature when three of its incident cluster normals have a triple product above this.
+
+The square of :data:`TERRAIN_NORMAL_SAME`: a normal cone at least that wide both ways is a feature. A support whose
+normal lies inside a cone that is not a feature misses the faces and edges by at most the cone's width times the
+reach (0.4 um at 4 cm). At 1e-6, 7,685 more vertices of the recorded suite terrain were not features, 1,800 of them
+convex; a box, cylinder or toe whose support sat over one of those lost that support in 84-87% of poses.
+"""
 TERRAIN_CONE_BAND = 1.0e-6
 """Relative band of the closed normal-cone test ``n . (w - v) <= band |w - v|``."""
 TERRAIN_GROUP_ROWS = 4
@@ -586,7 +592,8 @@ def terrain_vertex_feature(data: TerrainFeatureData, window: TerrainWindow, r: i
     """Return whether vertex ``(r, c)`` is a feature of its own: its incident cluster normals span 3-D.
 
     Normals closer than :data:`TERRAIN_NORMAL_SAME` are one direction; three distinct directions span 3-D when
-    their triple product exceeds :data:`TERRAIN_VERTEX_SPAN`.
+    their triple product exceeds :data:`TERRAIN_VERTEX_SPAN`. The product is taken of their differences, which
+    float32 resolves to about 1e-13 for normals close together (the plain product only to about 1e-7).
     """
     surface = window.surface
     if not terrain_interior_vertex(surface, r, c):
@@ -608,9 +615,9 @@ def terrain_vertex_feature(data: TerrainFeatureData, window: TerrainWindow, r: i
     for i in range(count):
         ni = _ring_normal(normals, i)
         for j in range(i + 1, count):
-            nj = _ring_normal(normals, j)
+            dj = _ring_normal(normals, j) - ni
             for k in range(j + 1, count):
-                if wp.abs(wp.dot(ni, wp.cross(nj, _ring_normal(normals, k)))) > _VERTEX_SPAN:
+                if wp.abs(wp.dot(ni, wp.cross(dj, _ring_normal(normals, k) - ni))) > _VERTEX_SPAN:
                     return True
     return False
 

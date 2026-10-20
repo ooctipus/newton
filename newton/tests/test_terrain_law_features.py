@@ -162,15 +162,22 @@ def test_clusters_match_reference(test, device):
 
 
 def test_edge_classes_and_vertex_features_match_reference(test, device):
-    """Derive every edge class and vertex feature in float32 on demand as the float64 reference does."""
+    """Derive every edge class and vertex feature in float32 on demand as the float64 reference does.
+
+    On the CPU every decision matches. Under CUDA's default contraction the decisions within float32 resolution
+    of their threshold may differ: a crease whose far vertex lies within 0.1 um of the other cluster's plane (the
+    fixture has creases between level clusters at 0 um), or a triple product within a factor of two of the span.
+    Either class or ownership there moves no row by more than that.
+    """
     rng = np.random.default_rng(3)
     heights = tu.suite_like_heights(rng, 64, 64)
     model = tu.heightfield_model(heights, 3.2, 3.2, device=device)
     features = TerrainFeatures(model)
     hf = tu.reference_surface(model)
-    queries, expected_class, expected_feature = [], [], []
+    queries, expected_class, expected_feature, clear = [], [], [], []
     for r in range(hf.nrow):
         for c in range(hf.ncol):
+            span = hf.vertex_span(r, c)
             for which, kind in enumerate(("H", "V", "D")):
                 if (
                     (kind == "H" and c >= hf.cols)
@@ -184,14 +191,55 @@ def test_edge_classes_and_vertex_features_match_reference(test, device):
                 edge = next(e for e in window[1] if e[0] == kind and e[1] == r and e[2] == c)
                 queries.append((r, c, which))
                 expected_class.append(_CLASSES[hf.edge_class(edge)])
-                expected_feature.append(int(hf.vertex_feature(r, c)))
+                expected_feature.append(int(span > ref.VERTEX_SPAN))
+                margin = np.inf
+                if expected_class[-1] in (TERRAIN_EDGE_CONVEX, TERRAIN_EDGE_CONCAVE):
+                    n, a = hf.plane(edge[5])
+                    margin = abs(float(n @ (hf.V(*edge[8]) - a)))
+                clear.append(margin >= 1.0e-7 and not 0.5 * ref.VERTEX_SPAN < span < 2.0 * ref.VERTEX_SPAN)
     answers = tu.feature_queries(features, 0, queries)
-    np.testing.assert_array_equal(answers[:, 0], np.asarray(expected_class))
-    np.testing.assert_array_equal(answers[:, 1], np.asarray(expected_feature))
-    test.assertGreater(sum(k == TERRAIN_EDGE_CONVEX for k in expected_class), 1000)
-    test.assertGreater(sum(k == TERRAIN_EDGE_CONCAVE for k in expected_class), 1000)
-    test.assertGreater(sum(k == TERRAIN_EDGE_FLAT for k in expected_class), 1000)
-    test.assertGreater(sum(expected_feature), 500)
+    expected_class = np.asarray(expected_class)
+    expected_feature = np.asarray(expected_feature)
+    clear = np.asarray(clear)
+    test.assertLess(np.count_nonzero(~clear), 0.03 * len(clear))
+    if device.is_cpu:
+        clear[:] = True
+    np.testing.assert_array_equal(answers[clear, 0], expected_class[clear])
+    np.testing.assert_array_equal(answers[clear, 1], expected_feature[clear])
+    test.assertGreater(np.count_nonzero(expected_class == TERRAIN_EDGE_CONVEX), 1000)
+    test.assertGreater(np.count_nonzero(expected_class == TERRAIN_EDGE_CONCAVE), 1000)
+    test.assertGreater(np.count_nonzero(expected_class == TERRAIN_EDGE_FLAT), 1000)
+    test.assertGreater(np.count_nonzero(expected_feature), 500)
+
+
+def test_weak_convex_vertex_keeps_its_support(test, device):
+    """Keep the support of a box corner over a convex vertex whose incident normals lie 3e-4 rad apart.
+
+    The apex of a shallow pyramid has a normal cone 6e-4 rad wide and a triple product of about 4e-7. No face or
+    edge claims a support whose normal lies inside that cone, so the vertex must be a feature in float64 and in
+    float32. At a span of 1e-6 it was not, and a box corner 5 mm above it had no row there.
+    """
+    slope = 3.0e-4
+    x = (np.arange(9) - 4) * 0.1
+    X, Y = np.meshgrid(x, x)
+    model = tu.heightfield_model(0.05 - slope * (np.abs(X) + np.abs(Y)), 0.4, 0.4, device=device)
+    features = TerrainFeatures(model)
+    hf = tu.reference_surface(model)
+    test.assertTrue(hf.vertex_feature(4, 4))
+    test.assertLess(hf.vertex_span(4, 4), 1.0e-6)
+    up = np.array([0.0, 0.0, 1.0])
+    answers = tu.feature_queries(features, 0, [(4, 4, 0)], directions=[up])
+    test.assertEqual(answers[0, 1:].tolist(), [1, 1])
+    q = np.asarray(wp.quat_from_axis_angle(wp.normalize(wp.vec3(1.0, 2.0, 3.0)), 0.7), np.float64)
+    dims = {"half": (0.08, 0.06, 0.04)}
+    corner = ref.make_core("box", dims, np.array([0.0, 0.0, 0.0, *q])).lowest(up)
+    gap = 0.005
+    core = ref.make_core("box", dims, np.array([*(hf.V(4, 4) + gap * up - corner), *q]))
+    rows = ref.pair_rows(hf, core, 0.04)
+    deepest = min(rows, key=lambda row: row.d)
+    test.assertAlmostEqual(deepest.d, gap, delta=1.0e-9)
+    test.assertLess(float(np.linalg.norm(deepest.q - hf.V(4, 4))), 1.0e-9)
+    test.assertEqual(deepest.feat, ("V", 4, 4))
 
 
 def test_tile_max_bounds_every_height(test, device):
@@ -393,6 +441,7 @@ for _name, _func in (
     ("test_planar_slope_is_one_cluster", test_planar_slope_is_one_cluster),
     ("test_clusters_match_reference", test_clusters_match_reference),
     ("test_edge_classes_and_vertex_features_match_reference", test_edge_classes_and_vertex_features_match_reference),
+    ("test_weak_convex_vertex_keeps_its_support", test_weak_convex_vertex_keeps_its_support),
     ("test_tile_max_bounds_every_height", test_tile_max_bounds_every_height),
     ("test_rebuild_after_edit_equals_fresh_build", test_rebuild_after_edit_equals_fresh_build),
     ("test_rebuild_covers_every_reported_edit", test_rebuild_covers_every_reported_edit),

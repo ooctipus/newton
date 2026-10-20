@@ -20,7 +20,7 @@ surface feature:
 * The finish: coincident rows merged, rows implied by the others of their plane group dropped (the lower convex
   hull of tangent position and distance), at most four rows per plane group.
 
-This is a port of the design study's float64 prototype with four changes, each measured on the CPU:
+This is a port of the design study's float64 prototype with three changes, each measured on the CPU:
 
 * Plane clusters use robust planes. A cluster is grown over the flat edges as before, but a component whose
   vertices all lie within ``FLAT_EPS`` of the plane through three extreme vertices, or of a horizontal plane,
@@ -31,8 +31,6 @@ This is a port of the design study's float64 prototype with four changes, each m
   the recorded suite terrain by three rows and seven columns split its flat border into over a million clusters
   (1,562,181 in all, against 566,737 uncropped); with robust planes both crops have 539,984 +- 2.
 * Edge classes follow the cluster ids alone: two clusters always meet at a crease.
-* A vertex is a feature when three of its incident cluster normals have a triple product above
-  ``VERTEX_SPAN = 1e-6`` (the prototype: 1e-10), the resolution of that product in float32.
 * Rows of a plane group are implied when they lie on or above the lower convex hull of (tangent position,
   distance) of the others, within ``IMPLIED_RESIDUAL``; the prototype also required them to lie inside the 3-D
   hull of the others' core points.
@@ -54,8 +52,14 @@ CLUSTER_ROUNDS = 8
 """Rounds of the cluster build; triangles still unassigned afterwards are clusters of their own."""
 NORMAL_SAME = 1.0e-5
 """Unit normals closer than this are one direction (vertex features)."""
-VERTEX_SPAN = 1.0e-6
-"""A vertex is a feature when some three incident cluster normals have a triple product above this."""
+VERTEX_SPAN = 1.0e-10
+"""A vertex is a feature when some three incident cluster normals have a triple product above this.
+
+The prototype's value, ``NORMAL_SAME`` squared. At 1e-6 (the float32 resolution of the plain triple product), 7,685
+more vertices of the recorded suite terrain were not features, 1,800 of them convex, and solids whose support sat
+over one of those lost it in 84-87% of poses: no face or edge claims a support whose normal lies strictly inside a
+vertex's normal cone.
+"""
 IMPLIED_RESIDUAL = 1.0e-6
 """A row no deeper than this below the lower hull of its plane group's other rows is implied [m]."""
 
@@ -574,25 +578,29 @@ class ReferenceHeightfield:
             self.tri_id(r - 1, c, 1),
         ]
 
+    def vertex_span(self, r, c):
+        """The largest triple product of three distinct incident cluster normals of vertex (r, c), 0 at the border."""
+        if self.ring(r, c) is None:
+            return 0.0
+        return largest_triple_product([self.plane(t)[0] for t in self.incident_triangles(r, c)])
+
     def vertex_feature(self, r, c):
         """Whether vertex (r, c) is a feature of its own: its incident cluster normals span 3-D."""
-        if self.ring(r, c) is None:
-            return False
-        return spans3([self.plane(t)[0] for t in self.incident_triangles(r, c)])
+        return self.vertex_span(r, c) > VERTEX_SPAN
 
 
-def spans3(normals) -> bool:
-    """Whether unit normals span 3-D: three distinct directions with a triple product above ``VERTEX_SPAN``."""
+def largest_triple_product(normals) -> float:
+    """The largest |det| of three distinct unit normals (closer than ``NORMAL_SAME`` is one direction), else 0."""
     uniq = []
     for nn in normals:
         if all(np.linalg.norm(nn - u) > NORMAL_SAME for u in uniq):
             uniq.append(nn)
+    best = 0.0
     for i in range(len(uniq)):
         for j in range(i + 1, len(uniq)):
             for k in range(j + 1, len(uniq)):
-                if abs(np.linalg.det(np.stack([uniq[i], uniq[j], uniq[k]]))) > VERTEX_SPAN:
-                    return True
-    return False
+                best = max(best, abs(float(np.linalg.det(np.stack([uniq[i], uniq[j], uniq[k]])))))
+    return best
 
 
 # ----------------------------------------------------------------------------------------------------------------
