@@ -65,8 +65,8 @@ that strides over the list, marks each pair's window as the tiled kernel does, w
 full candidate list and runs the finish.
 
 Inlined into the walks, the finish took every thread to 255 registers and a 10 KB stack on sm_120. Apart, the one-thread
-kernel takes 128 registers (its launch bounds: 16 blocks of 32 threads per SM) and a 168-byte stack (a sphere's walk
-alone would need 140 registers), the tiled kernel 166 registers and a 32-byte stack, and only deferred pairs pay for the
+kernel takes 128 registers (its launch bounds: 16 blocks of 32 threads per SM) and a 176-byte stack (a sphere's walk
+alone would need 140 registers), the tiled kernel 226 registers and a 32-byte stack, and only deferred pairs pay for the
 finish. The full-finish kernel keeps the candidate list and the finish's input in global scratch
 (:class:`~newton._src.geometry.terrain_shadow.TerrainFinishScratch`), so that its stack, which sets the driver's
 local-memory reservation for every thread the device holds, is the finish's own frame: 6.0 KB (10.1 KB with the list on
