@@ -356,7 +356,7 @@ def angle_deg(a, b) -> float:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# scenes and the rows a collision pipeline produces
+# scenes and the rows a collision pipeline produces: today's contacts and the law's shadow rows
 # ----------------------------------------------------------------------------------------------------------------
 
 SCENE_MARGIN = 0.01
@@ -401,6 +401,31 @@ def body_scene(heights, hx, hy, bodies, *, device, margin=SCENE_MARGIN, gap=SCEN
             raise ValueError(kind)
         builder.end_world()
     return builder.finalize(device=device), heightfield, shapes
+
+
+def shadow_pipeline(model, *, classes: str = "point", **kwargs):
+    """A collision pipeline built with ``NEWTON_TERRAIN_LAW_SHADOW=classes`` (keyword arguments pass through)."""
+    import os  # noqa: PLC0415
+    from unittest.mock import patch  # noqa: PLC0415
+
+    with patch.dict(os.environ, {"NEWTON_TERRAIN_LAW_SHADOW": classes}):
+        return newton.CollisionPipeline(model, **kwargs)
+
+
+def shadow_rows(pipeline) -> dict[int, list]:
+    """The law's shadow rows of the last collide per partner shape: ``[(q, n, d, feature)]``, world frame, float64."""
+    rows = pipeline._terrain_law_shadow.rows()
+    out = {int(p[1]): [] for p in rows["pairs"]}
+    for j, i in enumerate(rows["row_pair"]):
+        out[int(rows["pairs"][i][1])].append(
+            (
+                rows["q"][j].astype(np.float64),
+                rows["n"][j].astype(np.float64),
+                float(rows["d"][j]),
+                int(rows["feature"][j]),
+            )
+        )
+    return out
 
 
 def contact_rows(model, state, contacts, heightfield: int) -> dict[int, list]:

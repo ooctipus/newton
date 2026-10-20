@@ -1260,9 +1260,11 @@ class TerrainPairTable:
 
     Args:
         model: A finalized model.
+        pairs: Shape pairs to take instead of the model's list (a collision pipeline's explicit pairs), as an
+            array of ``(shape, shape)`` rows or a Warp array of ``vec2i``; the heightfield pairs among them are kept.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, *, pairs=None):
         self.device = model.device
         count = model.shape_count
         types = model.shape_type.numpy() if count else np.zeros(0, np.int32)
@@ -1272,8 +1274,12 @@ class TerrainPairTable:
 
         colliding = (flags & int(ShapeFlags.COLLIDE_SHAPES)) != 0
         listed = getattr(model, "shape_contact_pairs", None)
+        explicit = pairs
         if not count:
             pairs = np.zeros((0, 2), np.int32)
+        elif explicit is not None:
+            explicit = explicit.numpy() if hasattr(explicit, "numpy") else np.asarray(explicit)
+            pairs = heightfield_pair_table(types, worlds, colliding, explicit_pairs=explicit.reshape(-1, 2))
         elif listed is not None:
             explicit = listed.numpy().reshape(-1, 2)[: int(model.shape_contact_pair_count)]
             pairs = heightfield_pair_table(types, worlds, colliding, explicit_pairs=explicit)

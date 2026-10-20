@@ -302,6 +302,13 @@ NEWTON_FLAGS = declare(
         "A non-empty value marks a documentation build, which the viewer treats as Sphinx.",
     ),
     EnvironmentFlag(
+        "NEWTON_TERRAIN_LAW_SHADOW",
+        "diagnostic",
+        _COLLIDE,
+        "Partner classes (point, box, cylinder, hull or all) whose terrain-law kernels run beside the terrain route "
+        "into a side buffer nothing reads; unset runs none.",
+    ),
+    EnvironmentFlag(
         "NEWTON_ASSET_DIR",
         "policy",
         ("isaaclab.utils.assets",),
