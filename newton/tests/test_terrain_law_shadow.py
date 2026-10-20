@@ -21,6 +21,8 @@ from newton._src.geometry.terrain_contacts import (
     TERRAIN_LANE_THREAD,
     TERRAIN_LANE_TILE,
     TERRAIN_PARTNER_BOX,
+    TERRAIN_PARTNER_CYLINDER,
+    TERRAIN_PARTNER_HULL,
     TERRAIN_PARTNER_POINT,
 )
 from newton._src.geometry.terrain_law import (
@@ -30,8 +32,10 @@ from newton._src.geometry.terrain_law import (
     TERRAIN_PAIR_TILE_EXIT,
 )
 from newton._src.geometry.terrain_law_point import TERRAIN_POINT_ROWS
+from newton._src.geometry.terrain_law_solid import TERRAIN_SOLID_FULL_THREADS
 from newton._src.geometry.terrain_shadow import TERRAIN_LAW_KERNELS, parse_terrain_law_shadow
 from newton.tests import terrain_law_reference as ref
+from newton.tests import terrain_law_solid_utils as su
 from newton.tests import terrain_law_test_utils as tu
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
@@ -308,11 +312,16 @@ class TestTerrainLawShadow(unittest.TestCase):
         self.assertEqual(parse_terrain_law_shadow("point"), (TERRAIN_PARTNER_POINT,))
         self.assertEqual(parse_terrain_law_shadow("point, point"), (TERRAIN_PARTNER_POINT,))
         self.assertEqual(parse_terrain_law_shadow("all"), tuple(sorted(TERRAIN_LAW_KERNELS)))
+        self.assertEqual(
+            parse_terrain_law_shadow("hull, box,cylinder"),
+            (TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_HULL),
+        )
+        self.assertEqual(
+            parse_terrain_law_shadow("all"),
+            (TERRAIN_PARTNER_POINT, TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_HULL),
+        )
         with self.assertRaisesRegex(ValueError, "unknown partner class 'sphere'"):
             parse_terrain_law_shadow("sphere")
-        if TERRAIN_PARTNER_BOX not in TERRAIN_LAW_KERNELS:
-            with self.assertRaisesRegex(ValueError, "no kernel for 'box'"):
-                parse_terrain_law_shadow("point,box")
         model, _terrain = _mixed_scene("cpu")
         with patch.dict(os.environ, {"NEWTON_TERRAIN_LAW_SHADOW": "spheres"}), self.assertRaises(ValueError):
             newton.CollisionPipeline(model, **PIPELINE)
@@ -363,6 +372,59 @@ class TestTerrainLawShadow(unittest.TestCase):
         self.assertEqual(
             boxes.get_collision_selection()["heightfield"]["law_shadow"],
             {"enabled": False, "reason": "No heightfield pair has a partner of the listed classes."},
+        )
+
+    def test_route_record_of_solid_classes_cpu(self):
+        """Record the solid classes' pairs per lane class, launches, data, full-kernel grid and coreless pairs."""
+        rng = np.random.default_rng(8)
+        heights = np.round(rng.uniform(0.0, 0.05, (17, 17)) / 0.005) * 0.005
+        bodies = [
+            ("box", {"half": (0.05, 0.04, 0.03)}, [-0.4, -0.4, 0.2, 0.0, 0.0, 0.0, 1.0]),
+            ("box", {"half": (0.5, 0.04, 0.03)}, [0.0, -0.4, 0.2, 0.0, 0.0, 0.0, 1.0]),
+            ("cylinder", {"radius": 0.03, "half_height": 0.04}, [0.4, -0.4, 0.2, 0.0, 0.0, 0.0, 1.0]),
+            ("cone", {"radius": 0.03, "half_height": 0.04}, [-0.4, 0.0, 0.2, 0.0, 0.0, 0.0, 1.0]),
+            ("ellipsoid", {"semi": (0.05, 0.04, 0.03)}, [0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 1.0]),
+            ("hull", {"verts": su.sole_vertices()}, [0.4, 0.0, 0.2, 0.0, 0.0, 0.0, 1.0]),
+        ]
+        model, _terrain, _shapes = su.solid_scene(heights, 0.8, 0.8, bodies, device="cpu")
+        builder = newton.ModelBuilder()
+        cfg = builder.ShapeConfig(margin=0.01, gap=0.01)
+        terrain = newton.Heightfield(data=np.zeros((9, 9), np.float32), nrow=9, ncol=9, hx=0.4, hy=0.4)
+        builder.add_shape_heightfield(heightfield=terrain, cfg=cfg)
+        builder.add_shape_box(builder.add_body(xform=wp.transform(wp.vec3(-0.2, 0.0, 0.05))), hx=0.03, hy=0.03, hz=0.03)
+        barrel = builder.add_body(xform=wp.transform(wp.vec3(0.2, 0.0, 0.05)))
+        builder.add_shape(body=barrel, type=newton.GeoType.CYLINDER, scale=wp.vec3(0.03, 0.04, 0.2), cfg=cfg)
+        for scene, unsupported in ((model, 0), (builder.finalize(device="cpu"), 1)):
+            pipeline = tu.shadow_pipeline(scene, classes="box,cylinder,hull", **PIPELINE)
+            record = pipeline.get_collision_selection()["heightfield"]["law_shadow"]
+            self.assertTrue(record["enabled"])
+            self.assertEqual(record["classes"], ["box", "cylinder", "hull"])
+            table = pipeline._terrain_law_shadow.table
+            launches = 0
+            for partner_class, name in (
+                (TERRAIN_PARTNER_BOX, "box"),
+                (TERRAIN_PARTNER_CYLINDER, "cylinder"),
+                (TERRAIN_PARTNER_HULL, "hull"),
+            ):
+                lanes = {}
+                for lane, lane_name in ((TERRAIN_LANE_THREAD, "thread"), (TERRAIN_LANE_TILE, "tiled")):
+                    begin, end = table.segment(partner_class, lane)
+                    lanes[lane_name] = end - begin
+                self.assertEqual(record["pairs"][name], lanes)
+                # one walk per lane segment with pairs, and the class's full kernel
+                launches += sum(1 for v in lanes.values() if v) + int(sum(lanes.values()) > 0)
+            self.assertEqual(record["launches"], launches)
+            self.assertEqual(record["full_threads"], TERRAIN_SOLID_FULL_THREADS)
+            self.assertEqual(record["unsupported_pairs"], unsupported)
+            self.assertGreater(record["bytes"]["solid_data"], 0)
+        # both lane classes of the box class are in the first scene
+        self.assertTrue(
+            all(
+                v > 0
+                for v in tu.shadow_pipeline(model, classes="box", **PIPELINE)
+                .get_collision_selection()["heightfield"]["law_shadow"]["pairs"]["box"]
+                .values()
+            )
         )
 
 

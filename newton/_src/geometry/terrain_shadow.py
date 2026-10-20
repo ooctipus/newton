@@ -244,10 +244,15 @@ class TerrainLawShadow:
         out.deferred_count = wp.zeros(TERRAIN_PARTNER_CLASSES, dtype=wp.int32, device=device)
         self._out = out
         self._solids = None
+        self._unsupported_pairs = 0
         if solid_pairs:
             partners = np.concatenate([self.table.pairs_host[b : b + c, 1] for b, c in solid_pairs])
             # One scratch list per thread of the full kernels' grid, which the solid classes' launches share in turn.
             self._solids = solid_module.terrain_solid_data(model, partners)
+            classes = np.concatenate([self.table.partner_class[b : b + c] for b, c in solid_pairs])
+            self._unsupported_pairs = int(
+                np.count_nonzero(solid_module.terrain_solid_unsupported(classes, model.shape_type.numpy()[partners]))
+            )
         self._no_body_flags = wp.empty(0, dtype=wp.int32, device=device)
         self.build_seconds = time.perf_counter() - started
         """Host time of the construction [s]: features, pair table, kernel modules imported and buffers."""
@@ -347,7 +352,8 @@ class TerrainLawShadow:
         return rows, candidates
 
     def describe(self) -> dict:
-        """Return a host-only record of the shadow: classes, pairs and launches per lane class, memory."""
+        """Return a host-only record of the shadow: classes, pairs per lane class, launches, memory, and with a solid
+        class listed the threads of the full kernels' grid and the pairs whose partner has no core yet (no row)."""
         pairs = {}
         for partner_class in range(TERRAIN_PARTNER_CLASSES):
             if partner_class not in self.classes:
@@ -387,10 +393,14 @@ class TerrainLawShadow:
                     hulls.shape_hull,
                 )
             )
+        solids = {}
+        if self._solids is not None:
+            solids = {"full_threads": int(self._solids.full_threads), "unsupported_pairs": self._unsupported_pairs}
         return {
             "classes": [terrain_law_class_name(c) for c in self.classes],
             "pairs": pairs,
             "launches": len(self._launches),
+            **solids,
             "slots": self.slot_count,
             "bytes": {
                 "side_buffer": int(side),

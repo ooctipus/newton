@@ -1206,6 +1206,24 @@ def build_hull_table(meshes: list[np.ndarray], shape_hull: np.ndarray, device) -
     return table
 
 
+def terrain_solid_unsupported(partner_class: np.ndarray, shape_type: np.ndarray) -> np.ndarray:
+    """Whether solid partners have no core in the law yet (their pairs get no row and state
+    :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_UNSUPPORTED`): in the hull class, a shape that is neither a
+    convex hull nor an ellipsoid (a barrel cylinder).
+
+    Args:
+        partner_class: Partner class of every partner
+            (:func:`~newton._src.geometry.terrain_contacts.terrain_partner_classes`).
+        shape_type: Geometry type of every partner.
+    """
+    from .terrain_contacts import TERRAIN_PARTNER_HULL  # noqa: PLC0415
+    from .types import GeoType  # noqa: PLC0415
+
+    kind = np.asarray(shape_type)
+    cored = (kind == int(GeoType.CONVEX_MESH)) | (kind == int(GeoType.ELLIPSOID))
+    return (np.asarray(partner_class) == TERRAIN_PARTNER_HULL) & ~cored
+
+
 def terrain_solid_data(
     model, partners: np.ndarray, *, full_threads: int = TERRAIN_SOLID_FULL_THREADS
 ) -> TerrainSolidData:
