@@ -32,7 +32,11 @@ from newton._src.geometry.terrain_law import (
     TERRAIN_PAIR_TILE_EXIT,
 )
 from newton._src.geometry.terrain_law_point import TERRAIN_POINT_ROWS
-from newton._src.geometry.terrain_law_solid import TERRAIN_SOLID_FULL_THREADS
+from newton._src.geometry.terrain_law_solid import (
+    TERRAIN_SOLID_FULL_THREADS,
+    TERRAIN_SOLID_THREAD_VERTICES,
+    TERRAIN_SOLID_TILE_BLOCKS,
+)
 from newton._src.geometry.terrain_shadow import TERRAIN_LAW_KERNELS, parse_terrain_law_shadow
 from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_solid_utils as su
@@ -375,7 +379,8 @@ class TestTerrainLawShadow(unittest.TestCase):
         )
 
     def test_route_record_of_solid_classes_cpu(self):
-        """Record the solid classes' pairs per lane class, launches, data, full-kernel grid and coreless pairs."""
+        """Record the solid classes' pairs per lane class, launches, data, lane choice, kernel grids and coreless
+        pairs."""
         rng = np.random.default_rng(8)
         heights = np.round(rng.uniform(0.0, 0.05, (17, 17)) / 0.005) * 0.005
         bodies = [
@@ -411,9 +416,13 @@ class TestTerrainLawShadow(unittest.TestCase):
                     begin, end = table.segment(partner_class, lane)
                     lanes[lane_name] = end - begin
                 self.assertEqual(record["pairs"][name], lanes)
-                # one walk per lane segment with pairs, and the class's full kernel
-                launches += sum(1 for v in lanes.values() if v) + int(sum(lanes.values()) > 0)
+                # with pairs: the one-thread kernel over the class, the tiled grid when the class has tiled-lane
+                # partners (only their windows can exceed the one-thread kernel's), and the full kernel
+                if sum(lanes.values()):
+                    launches += 2 + int(lanes["tiled"] > 0)
             self.assertEqual(record["launches"], launches)
+            self.assertEqual(record["thread_vertices"], TERRAIN_SOLID_THREAD_VERTICES)
+            self.assertEqual(record["tile_blocks"], TERRAIN_SOLID_TILE_BLOCKS)
             self.assertEqual(record["full_threads"], TERRAIN_SOLID_FULL_THREADS)
             self.assertEqual(record["unsupported_pairs"], unsupported)
             self.assertGreater(record["bytes"]["solid_data"], 0)

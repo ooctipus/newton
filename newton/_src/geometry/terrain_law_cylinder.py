@@ -5,10 +5,12 @@
 
 The kernels have the per-type signature ``(begin, slot_begin, inputs, data, out, solids)``
 (:class:`~newton._src.geometry.terrain_law.TerrainPairInputs`, :class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData`):
-:func:`terrain_cylinder_rows` runs one thread per pair (windows of up to 16 cells), :func:`terrain_cylinder_rows_tiled`
-``wp.block_dim()`` lanes per pair (longer windows: the lanes mark the window vertices that yield a row, the first lane
-walks those in window order and finishes the pair, which gives it the one-thread kernel's rows), and
-:func:`terrain_cylinder_rows_full`, on a fixed grid striding over the class's deferred list, the pairs the other two deferred
+:func:`terrain_cylinder_rows` runs one thread per pair over the whole class and lists the pairs whose windows (as the
+pose gives them) hold more than :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_THREAD_VERTICES`
+vertices, :func:`terrain_cylinder_rows_tiled` runs ``wp.block_dim()`` lanes per listed pair on a fixed grid striding over
+the list (the lanes mark the window vertices that yield a row, the first lane walks those in window order and finishes
+the pair, which gives it the one-thread kernel's rows), and :func:`terrain_cylinder_rows_full`, on a fixed grid striding
+over the class's deferred list, the pairs the other two deferred
 (more distinct rows than the class's 16 slots). The walk, the rules and the finish are
 :mod:`~newton._src.geometry.terrain_law_solid`'s; the module is compiled without floating-point contraction, so the
 CPU decides every boundary as the GPU does.
@@ -71,7 +73,8 @@ def terrain_cylinder_rows(
     out: TerrainLawRows,
     solids: TerrainSolidData,
 ):
-    """The law's rows of the class's pairs, one thread per pair."""
+    """The law's rows of the class's pairs, one thread per pair; a window of more than ``solids.thread_vertices``
+    vertices is listed for the tiled kernel."""
     i = wp.tid()
     pair = begin + i
     state, frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
@@ -82,7 +85,7 @@ def terrain_cylinder_rows(
     if not supported:
         solid_unsupported(out, pair)
         return
-    solid_rows_thread(core, data, out, pair, slot_begin + i * _ROWS, _ROWS, _CLASS, frame, heightfield, reach)
+    solid_rows_thread(core, data, out, solids, pair, slot_begin + i * _ROWS, _ROWS, _CLASS, frame, heightfield, reach)
 
 
 @wp.kernel(enable_backward=False)
@@ -94,40 +97,43 @@ def terrain_cylinder_rows_tiled(
     out: TerrainLawRows,
     solids: TerrainSolidData,
 ):
-    """The law's rows of the class's pairs with long windows, ``wp.block_dim()`` lanes per pair."""
-    i, lane = wp.tid()
+    """The class's pairs the one-thread kernel listed for their large windows, ``wp.block_dim()`` lanes per pair
+    (``begin`` and ``slot_begin`` are the class's first pair and slot): the grid's ``solids.tile_blocks`` blocks stride
+    over the list; a block's lanes mark the window vertices that yield a row, and its first lane walks those in window
+    order and finishes the pair, which gives it the one-thread walk's rows."""
+    block, lane = wp.tid()
     lanes = wp.block_dim()
-    pair = begin + i
-    state, frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
-    if state != 0:
-        # every lane reads the same pair: the exit is uniform
+    for entry in range(block, solids.wide_count[_CLASS], solids.tile_blocks):
+        # every lane reads the same pair; the one-thread kernel found it current, cored and in its window
+        pair = solids.wide[begin + entry]
+        _state, frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
+        _supported, core = _core(local, size, inputs.shape_type[partner], partner, solids)
+        _state, cells, window, core, setup = solid_pair_window(core, data, heightfield, reach)
+        width = cells[3] - cells[2] + 2
+        vertices = (cells[1] - cells[0] + 2) * width
+        words = (vertices + 31) // 32
+        marked = _Mask()
+        if words <= _MASK_WORDS:
+            marked = solid_mark(core, data, window, setup, cells, lane, lanes)
+            # lanes mark disjoint vertices, so a sum of their words is their union
+            for word in range(words):
+                marked[word] = wp.tile_extract(wp.tile_sum(wp.tile(marked[word])), 0)
         if lane == 0:
-            solid_pair_exit(out, pair, state)
-        return
-    supported, core = _core(local, size, inputs.shape_type[partner], partner, solids)
-    if not supported:
-        if lane == 0:
-            solid_unsupported(out, pair)
-        return
-    state, cells, window, core, setup = solid_pair_window(core, data, heightfield, reach)
-    if state != 0:
-        if lane == 0:
-            solid_pair_exit(out, pair, state)
-        return
-    width = cells[3] - cells[2] + 2
-    vertices = (cells[1] - cells[0] + 2) * width
-    words = (vertices + 31) // 32
-    marked = _Mask()
-    if words <= _MASK_WORDS:
-        marked = solid_mark(core, data, window, setup, cells, lane, lanes)
-        # lanes mark disjoint vertices, so a sum of their words is their union
-        for word in range(words):
-            marked[word] = wp.tile_extract(wp.tile_sum(wp.tile(marked[word])), 0)
-    if lane != 0:
-        return
-    solid_replay(
-        core, data, out, window, setup, cells, marked, words, pair, slot_begin + i * _ROWS, _ROWS, _CLASS, frame
-    )
+            solid_replay(
+                core,
+                data,
+                out,
+                window,
+                setup,
+                cells,
+                marked,
+                words,
+                pair,
+                slot_begin + (pair - begin) * _ROWS,
+                _ROWS,
+                _CLASS,
+                frame,
+            )
 
 
 @wp.kernel(enable_backward=False)

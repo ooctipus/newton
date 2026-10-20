@@ -134,6 +134,14 @@ TERRAIN_SOLID_MASK_WORDS = 8
 TERRAIN_SOLID_FULL_THREADS = 256
 """Threads of a solid class's full kernel, whatever the class's size: they stride over its deferred list, each with
 its own scratch list (an empty list costs one near-empty launch)."""
+TERRAIN_SOLID_THREAD_VERTICES = 64
+"""Window vertices up to which one thread walks a solid pair (its window as the pose gives it, at run time); a larger
+window goes to the class's tiled kernel. The pair table's lane classes bound a partner's window over every
+orientation, and most solids of a tiled lane walk far smaller windows (a lying cylinder: about 24 vertices), which a
+warp of one-thread pairs walks at full width while a 16-lane tile per pair holds half a warp and replays its marks
+serially."""
+TERRAIN_SOLID_TILE_BLOCKS = 1024
+"""Most blocks of a solid class's tiled kernel: its grid strides over the class's list of large windows."""
 TERRAIN_HULL_FACE_TOL = 1.0e-6
 """A hull's points within this of a face's plane lie on that face [m] (hulls under 1 m; their local frame): a planar
 face of a float32 mesh stays one face (its points lie within about 1e-8 m of its plane)."""
@@ -170,6 +178,16 @@ class TerrainSolidData:
     scratch_feature: wp.array[wp.int32]
     full_threads: int
     """Threads of the full kernels' launch (their stride over a deferred list), each with its scratch list."""
+    wide: wp.array[wp.int32]
+    """Pairs whose windows hold more than ``thread_vertices`` vertices, for the tiled kernels: partner class ``c``'s
+    list starts at its first pair (``deferred_first[c]`` of the rows) and holds ``wide_count[c]`` pairs, appended
+    in any order."""
+    wide_count: wp.array[wp.int32]
+    """Per partner class: the pairs in its list of large windows (zeroed before every launch)."""
+    thread_vertices: int
+    """Window vertices up to which the one-thread kernels walk a pair; 0: they walk every window."""
+    tile_blocks: int
+    """Blocks of the tiled kernels' launch: their stride over a list of large windows."""
 
 
 @wp.struct
@@ -957,6 +975,7 @@ def solid_rows_thread(
     core: Any,
     data: TerrainFeatureData,
     out: TerrainLawRows,
+    solids: TerrainSolidData,
     pair_index: int,
     slot: int,
     row_limit: int,
@@ -965,11 +984,17 @@ def solid_rows_thread(
     heightfield: int,
     reach: float,
 ):
-    """One thread's walk of a pair whose core is built (heightfield frame): window, walk, close."""
+    """One thread's walk of a pair whose core is built (heightfield frame): window, walk, close; a window of more
+    than ``solids.thread_vertices`` vertices is listed for the class's tiled kernel instead."""
     state, cells, window, core, pair = solid_pair_window(core, data, heightfield, reach)
     if state != 0:
         solid_pair_exit(out, pair_index, state)
         return
+    if solids.thread_vertices > 0:
+        if (cells[1] - cells[0] + 2) * (cells[3] - cells[2] + 2) > solids.thread_vertices:
+            entry = wp.atomic_add(solids.wide_count, partner_class, 1)
+            solids.wide[out.deferred_first[partner_class] + entry] = pair_index
+            return
     planes = terrain_planes()
     sink = solid_sink(slot, row_limit, pair.eps, 0)
     store = solid_out_store(out)
@@ -1238,11 +1263,19 @@ def terrain_solid_unsupported(partner_class: np.ndarray, shape_type: np.ndarray)
 
 
 def terrain_solid_data(
-    model, partners: np.ndarray, *, full_threads: int = TERRAIN_SOLID_FULL_THREADS
+    model,
+    partners: np.ndarray,
+    *,
+    pair_count: int | None = None,
+    full_threads: int = TERRAIN_SOLID_FULL_THREADS,
+    thread_vertices: int = TERRAIN_SOLID_THREAD_VERTICES,
+    tile_blocks: int = TERRAIN_SOLID_TILE_BLOCKS,
 ) -> TerrainSolidData:
     """The solid classes' data for a model: the hull table of the convex-mesh partners in ``partners`` (shape
-    indices) and, per thread of the full kernels' grid of ``full_threads``, a scratch list of
-    :data:`TERRAIN_ROW_CANDIDATES` rows."""
+    indices), per thread of the full kernels' grid of ``full_threads`` a scratch list of
+    :data:`TERRAIN_ROW_CANDIDATES` rows, and the lists of large windows of a pair table of ``pair_count`` pairs
+    (default: ``len(partners)``) that the one-thread kernels hand to the tiled kernels' ``tile_blocks`` blocks
+    (``thread_vertices`` 0: the one-thread kernels walk every window)."""
     from .types import GeoType  # noqa: PLC0415
 
     device = model.device
@@ -1268,4 +1301,13 @@ def terrain_solid_data(
     solids.scratch_d = wp.zeros(slots, dtype=wp.float32, device=device)
     solids.scratch_feature = wp.zeros(slots, dtype=wp.int32, device=device)
     solids.full_threads = int(full_threads)
+    if tile_blocks < 1:
+        raise ValueError(f"The tiled kernels need at least one block, got {tile_blocks}")
+    pairs = len(partners) if pair_count is None else int(pair_count)
+    solids.wide = wp.zeros(max(pairs, 1), dtype=wp.int32, device=device)
+    from .terrain_contacts import TERRAIN_PARTNER_CLASSES  # noqa: PLC0415
+
+    solids.wide_count = wp.zeros(TERRAIN_PARTNER_CLASSES, dtype=wp.int32, device=device)
+    solids.thread_vertices = int(thread_vertices)
+    solids.tile_blocks = int(tile_blocks)
     return solids

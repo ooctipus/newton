@@ -997,10 +997,14 @@ def _pair_inputs(model, pipeline) -> TerrainPairInputs:
 
 
 def test_tiled_kernels_match_one_thread_kernels(test, device):
-    """Give a solid pair the same rows, bit for bit, whether one thread or a tile of lanes walks its window.
+    """Give a solid pair the same rows, bit for bit, whether one thread or a tile of lanes walks its window, and so
+    whichever lane the shadow's run-time choice takes.
 
+    One arm walks every pair of the classes' tiled segments in one thread; the other lists every walking pair for the
+    tiled kernel (``thread_vertices`` 1) and runs it on a grid of 3 blocks, so that blocks stride over the list.
     Windows of up to 256 vertices are marked by the lanes and replayed by the first; larger ones (one solid per class
-    here) are walked by the first lane alone. The CPU runs one lane.
+    here) are walked by the first lane alone. The shadow's own rows (windows over 64 vertices tiled, the others in
+    one thread) are those rows too. The CPU runs one lane.
     """
     hf, model, shapes, bodies = _tile_scene(np.random.default_rng(37), device)
     pipeline, _contacts, _state = _collide(model, shadow=True)
@@ -1011,29 +1015,46 @@ def test_tiled_kernels_match_one_thread_kernels(test, device):
         shape_class[shape] for shape, body in zip(shapes, bodies, strict=True) if _window_vertices(hf, *body) > 256
     }
     test.assertEqual(large, {TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_HULL})
+    # the shadow's run-time choice took both lanes in every class
+    listed = shadow._solids.wide_count.numpy()
+    test.assertTrue(all(listed[c] > 0 for c in _SOLID_KERNELS), msg=listed)
+    expected = shadow.rows()
+    first_row = np.concatenate([[0], np.cumsum(expected["count"])])
     inputs = _pair_inputs(model, pipeline)
+    partners = table.pairs_host[:, 1]
     walked = 0
     for partner_class, (module, thread, tiled, full) in _SOLID_KERNELS.items():
-        begin, end = shadow.table.segment(partner_class, TERRAIN_LANE_TILE)
+        begin, end = table.segment(partner_class, TERRAIN_LANE_TILE)
         test.assertGreater(end - begin, 0)
         rows = TERRAIN_PARTNER_ROWS[partner_class]
         outputs = []
-        for kernel, lane in (
-            (getattr(module, thread), TERRAIN_LANE_THREAD),
-            (getattr(module, tiled), TERRAIN_LANE_TILE),
-        ):
-            out = _side_buffer(begin, end - begin, rows, shadow.table.pair_count, device)
-            args = [begin, 0, inputs, shadow.features.data(), out, shadow._solids]
-            if lane == TERRAIN_LANE_THREAD:
-                wp.launch(kernel, dim=end - begin, inputs=args, device=device)
-            else:
-                wp.launch_tiled(kernel, dim=end - begin, inputs=args, block_dim=16, device=device)
-            wp.launch(getattr(module, full), dim=shadow._solids.full_threads, inputs=args, device=device)
+        for thread_vertices in (0, 1):
+            solids = terrain_law_solid.terrain_solid_data(
+                model, partners, full_threads=3, thread_vertices=thread_vertices, tile_blocks=3
+            )
+            out = _side_buffer(begin, end - begin, rows, table.pair_count, device)
+            args = [begin, 0, inputs, shadow.features.data(), out, solids]
+            wp.launch(getattr(module, thread), dim=end - begin, inputs=args, device=device)
+            if thread_vertices:
+                test.assertGreater(int(solids.wide_count.numpy()[partner_class]), 3)
+                wp.launch_tiled(getattr(module, tiled), dim=3, inputs=args, block_dim=16, device=device)
+            wp.launch(getattr(module, full), dim=3, inputs=args, device=device)
             outputs.append(out)
         one, lanes = outputs
         for name in ("count", "state", "q", "n", "d", "feature"):
             np.testing.assert_array_equal(getattr(one, name).numpy(), getattr(lanes, name).numpy(), err_msg=name)
-        walked += int(one.count.numpy().sum())
+        # the shadow's rows of the segment: the same, pair by pair
+        count = one.count.numpy()[begin:end]
+        np.testing.assert_array_equal(expected["count"][begin:end], count)
+        np.testing.assert_array_equal(expected["state"][begin:end], one.state.numpy()[begin:end])
+        for name in ("q", "n", "d", "feature"):
+            got = getattr(one, name).numpy()
+            for i in range(end - begin):
+                a = first_row[begin + i]
+                np.testing.assert_array_equal(
+                    expected[name][a : a + count[i]], got[i * rows : i * rows + count[i]], err_msg=name
+                )
+        walked += int(count.sum())
     test.assertGreater(walked, 20)
 
 
@@ -1089,13 +1110,15 @@ def test_deferred_pairs_keep_their_rows_beyond_the_grid(test, device):
     expected = shadow.rows()
     test.assertTrue(np.all(expected["state"] & int(TERRAIN_PAIR_ROW_OVERFLOW)))
     inputs = _pair_inputs(model, pipeline)
-    solids = terrain_law_solid.terrain_solid_data(model, shadow.table.pairs_host[:, 1], full_threads=1)
+    solids = terrain_law_solid.terrain_solid_data(
+        model, shadow.table.pairs_host[:, 1], full_threads=1, thread_vertices=0
+    )
     rows = TERRAIN_PARTNER_ROWS[TERRAIN_PARTNER_BOX]
     begin, end = shadow.table.segment(TERRAIN_PARTNER_BOX, TERRAIN_LANE_TILE)
     test.assertEqual(end - begin, len(bodies))
     out = _side_buffer(begin, end - begin, rows, shadow.table.pair_count, device)
     args = [begin, 0, inputs, shadow.features.data(), out, solids]
-    wp.launch_tiled(terrain_law_box.terrain_box_rows_tiled, dim=end - begin, inputs=args, block_dim=16, device=device)
+    wp.launch(terrain_law_box.terrain_box_rows, dim=end - begin, inputs=args, device=device)
     test.assertEqual(int(out.deferred_count.numpy()[TERRAIN_PARTNER_BOX]), len(bodies))
     wp.launch(terrain_law_box.terrain_box_rows_full, dim=1, inputs=args, device=device)
     count = out.count.numpy()
@@ -1167,14 +1190,20 @@ def _capture_scene(device):
         lo, _hi = ref.make_core(kind, dims, np.r_[x, y, 0.0, q]).aabb()
         bodies.append((kind, dims, _f32_pose(np.r_[x, y, top - lo[2] - 0.002, q])))
     bodies.append(("box", {"half": (0.9, 0.05, 0.02)}, _f32_pose([0.0, 1.4, top + 0.02 + 0.002, 0.0, 0.0, 0.005, 1.0])))
+    # windows of more than the one-thread kernels' 64 vertices, which the tiled kernels walk
+    for kind, dims in (("box", {"half": (0.5, 0.4, 0.03)}), ("ellipsoid", {"semi": (0.5, 0.4, 0.06)})):
+        lo, _hi = ref.make_core(kind, dims, np.r_[0.0, -1.2, 0.0, 0.0, 0.0, 0.0, 1.0]).aabb()
+        x = -0.9 if kind == "box" else 0.9
+        bodies.append((kind, dims, _f32_pose([x, -1.2, top - lo[2] - 0.002, 0.0, 0.0, 0.0, 1.0])))
     return su.solid_scene(heights, 2.0, 2.0, bodies, device=device)
 
 
 def test_solid_shadow_runs_under_graph_capture(test, device):
     """Capture the solid classes' shadow with the collide in a CUDA graph and replay it to an uncaptured collide's rows.
 
-    Every solid class and both lane classes run (one-thread and tiled kernels, the tiles' mark sums), and one pair
-    defers to its class's full kernel, whose grid reads the deferred count the capture zeroes. The shadow's launches
+    Every solid class runs, with both lane classes of the pair table; a box and an ellipsoid whose windows exceed the
+    one-thread kernels' 64 vertices go to the tiled kernels (the list and its count the capture zeroes, the tiles'
+    mark sums), and a long box defers to its class's full kernel, whose grid reads the deferred count. The shadow's launches
     are also captured alone with the device's memory pool off, so that an allocation inside them raises instead of
     becoming a graph allocation node.
     """
@@ -1191,7 +1220,11 @@ def test_solid_shadow_runs_under_graph_capture(test, device):
     pipeline.collide(state, contacts)
     expected = shadow.rows()
     test.assertTrue(np.all(expected["count"] > 0), msg=expected["count"])
-    test.assertEqual(int(np.count_nonzero(expected["state"] & int(TERRAIN_PAIR_ROW_OVERFLOW))), 1)
+    test.assertGreaterEqual(int(np.count_nonzero(expected["state"] & int(TERRAIN_PAIR_ROW_OVERFLOW))), 1)
+    # the tiled kernels walk the windows over 64 vertices (a box and an ellipsoid)
+    listed = shadow._solids.wide_count.numpy()
+    test.assertGreater(int(listed[TERRAIN_PARTNER_BOX]), 0)
+    test.assertGreater(int(listed[TERRAIN_PARTNER_HULL]), 0)
     # Move the bodies, so that the replay must recompute the rows.
     moved = model.state()
     q = moved.body_q.numpy()
