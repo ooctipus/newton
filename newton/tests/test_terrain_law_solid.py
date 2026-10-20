@@ -55,7 +55,12 @@ from newton._src.geometry.terrain_law import (
 from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_solid_utils as su
 from newton.tests import terrain_law_test_utils as tu
-from newton.tests.unittest_utils import add_function_test, get_test_devices
+from newton.tests.unittest_utils import (
+    add_function_test,
+    get_cuda_test_devices,
+    get_test_devices,
+    scoped_capture_after_gc,
+)
 
 PIPELINE = {"rigid_contact_max": 1 << 15, "max_triangle_pairs": 1 << 17}
 SUITE_ROUTE = {
@@ -912,6 +917,93 @@ def test_candidate_overflow_keeps_the_first_rows_flagged(test, device):
     test.assertEqual(tu.missing_rows(got, candidates, q_tol=1.0e-5, angle_tol=1.0e-3, d_tol=1.0e-5), [])
 
 
+def _capture_scene(device):
+    """Every solid kind on ridges of different heights, in both lane classes (small solids one thread per pair, long
+    ones a tile of lanes), and a long box whose rows overflow its slots (its class's full kernel finishes it)."""
+    rng = np.random.default_rng(2)
+    heights = np.zeros((41, 41))
+    heights[:, 1::2] = rng.uniform(0.02, 0.035, size=41)[1::2]
+    top = float(heights.max())
+    small = (("box", BOX), ("cylinder", CYLINDER), ("cone", CONE), ("ellipsoid", ELLIPSOID))
+    large = (
+        ("box", {"half": (0.3, 0.06, 0.04)}),
+        ("cylinder", {"radius": 0.05, "half_height": 0.3}),
+        ("cone", {"radius": 0.25, "half_height": 0.1}),
+        ("ellipsoid", {"semi": (0.3, 0.06, 0.04)}),
+        ("hull", {"verts": su.sole_vertices()}),
+    )
+    bodies = []
+    for i, (kind, dims) in enumerate(small + large):
+        q = _random_quat(rng, np.radians(rng.uniform(0.0, 10.0)))
+        if kind == "cylinder" and dims["half_height"] > 0.1:
+            q = _quat_mul(_axis_angle((0.0, 0.0, 1.0), 0.3), LYING)
+        x, y = -1.5 + 0.33 * i, rng.uniform(-1.0, 1.0)
+        lo, _hi = ref.make_core(kind, dims, np.r_[x, y, 0.0, q]).aabb()
+        bodies.append((kind, dims, _f32_pose(np.r_[x, y, top - lo[2] - 0.002, q])))
+    bodies.append(("box", {"half": (0.9, 0.05, 0.02)}, _f32_pose([0.0, 1.4, top + 0.02 + 0.002, 0.0, 0.0, 0.005, 1.0])))
+    return su.solid_scene(heights, 2.0, 2.0, bodies, device=device)
+
+
+def test_solid_shadow_runs_under_graph_capture(test, device):
+    """Capture the solid classes' shadow with the collide in a CUDA graph and replay it to an uncaptured collide's rows.
+
+    Every solid class and both lane classes run (one-thread and tiled kernels, the tiles' mark sums), and one pair
+    defers to its class's full kernel, whose grid reads the deferred count the capture zeroes. The shadow's launches
+    are also captured alone with the device's memory pool off, so that an allocation inside them raises instead of
+    becoming a graph allocation node.
+    """
+    model, _hfield, _shapes = _capture_scene(device)
+    pipeline = tu.shadow_pipeline(model, classes="all", **PIPELINE)
+    shadow = pipeline._terrain_law_shadow
+    table = shadow.table
+    for partner_class in (TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_HULL):
+        for lane in (TERRAIN_LANE_THREAD, TERRAIN_LANE_TILE):
+            begin, end = table.segment(partner_class, lane)
+            test.assertGreater(end - begin, 0, msg=(partner_class, lane))
+    state = model.state()
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)
+    expected = shadow.rows()
+    test.assertTrue(np.all(expected["count"] > 0), msg=expected["count"])
+    test.assertEqual(int(np.count_nonzero(expected["state"] & int(TERRAIN_PAIR_ROW_OVERFLOW))), 1)
+    # Move the bodies, so that the replay must recompute the rows.
+    moved = model.state()
+    q = moved.body_q.numpy()
+    q[:, 2] += 0.5
+    moved.body_q.assign(q)
+    pipeline.collide(moved, contacts)
+    test.assertEqual(int(shadow.rows()["count"].sum()), 0)
+    with scoped_capture_after_gc(device=device) as capture:
+        pipeline.collide(state, contacts)
+    wp.capture_launch(capture.graph)
+    replayed = shadow.rows()
+    for name in ("count", "state", "q", "n", "d", "feature"):
+        np.testing.assert_array_equal(replayed[name], expected[name], err_msg=name)
+    # The shadow alone without a memory pool; its replay recomputes rows forgotten after an uncaptured collide.
+    pooled = wp.is_mempool_enabled(device)
+    wp.set_mempool_enabled(device, False)
+    try:
+        with scoped_capture_after_gc(device=device) as capture:
+            shadow.launch(
+                pipeline.geom_transform,
+                pipeline.geom_data,
+                shape_type=model.shape_type,
+                shape_gap=model.shape_gap,
+                shape_heightfield_index=model.shape_heightfield_index,
+                **pipeline._broad_phase_pair_filter(model),
+            )
+    finally:
+        wp.set_mempool_enabled(device, pooled)
+    pipeline.collide(moved, contacts)
+    test.assertEqual(int(shadow.rows()["count"].sum()), 0)
+    pipeline.collide(state, contacts)
+    shadow._out.count.zero_()
+    wp.capture_launch(capture.graph)
+    replayed = shadow.rows()
+    for name in ("count", "state", "q", "n", "d", "feature"):
+        np.testing.assert_array_equal(replayed[name], expected[name], err_msg=name)
+
+
 def test_shadow_keeps_contacts_bitwise_with_every_class(test, device):
     """Write today's contacts bit for bit with every class's kernels running beside the terrain route (the default
     route and the suite's)."""
@@ -1047,6 +1139,12 @@ for _name, _func in (
     ("test_shadow_keeps_contacts_bitwise_with_every_class", test_shadow_keeps_contacts_bitwise_with_every_class),
 ):
     add_function_test(TestTerrainLawSolid, _name, _func, devices=devices)
+add_function_test(
+    TestTerrainLawSolid,
+    "test_solid_shadow_runs_under_graph_capture",
+    test_solid_shadow_runs_under_graph_capture,
+    devices=get_cuda_test_devices(),
+)
 
 
 if __name__ == "__main__":
