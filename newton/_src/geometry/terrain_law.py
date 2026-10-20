@@ -1,12 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared float32 primitives of the per-pair terrain contact law: the row layout and the per-pair finish.
+"""Shared float32 primitives of the per-pair terrain contact law: static surface data, row layout, per-pair finish.
 
 The law emits the support set of one (heightfield, convex shape) pair directly: one row per local minimum of the
 core-to-surface distance within the writer's reach, plus the corners of flat support regions, each owned by one
-surface feature (a plane cluster, a crease edge or a vertex). This module holds what every per-type kernel shares.
-Nothing routes contacts through the law yet.
+surface feature (a plane cluster, a crease edge or a vertex). This module holds what every per-type kernel shares;
+the static data they read is built by :mod:`terrain_contacts`. Nothing routes contacts through the law yet.
+
+Heights are decoded exactly as the narrow phase decodes them on the CPU (float32 ``min_z + e * (max_z - min_z)``),
+on every device: the decode goes through float64 so that no fused multiply-add changes a vertex between kernels.
+Every triangle of a plane cluster uses the cluster's plane (:class:`TerrainClusterPlane`), a triangle alone its own
+plane; the tile-max mip bounds the heights of every 8 x 8 cells, and version stamps tell features built from older
+heights apart (:func:`terrain_features_current`).
 
 Rows carry a window-local feature id in the 23-bit ``sort_sub_key`` of the contact contract (19 bits:
 ``r mod 64``, ``c mod 64``, kind, sub-feature, point slot), unique within any window under 64 cells across.
@@ -26,6 +32,10 @@ import warp as wp
 # tolerances and layout
 # ----------------------------------------------------------------------------------------------------------------
 
+TERRAIN_FLAT_EPS = 1.0e-6
+"""Plane-cluster membership tolerance [m], absolute: every vertex of a cluster lies within it of the cluster plane."""
+TERRAIN_EPS32 = 1.1920928955078125e-7
+"""Float32 machine epsilon."""
 TERRAIN_MERGE_SCALE = 4.0
 """Rows closer than this many predicate bands (with normals within :data:`TERRAIN_MERGE_NORMAL`) coincide."""
 TERRAIN_MERGE_NORMAL = 1.0e-3
@@ -40,6 +50,9 @@ TERRAIN_GROUP_ROWS = 4
 """Rows kept per plane group."""
 TERRAIN_ROW_CANDIDATES = 32
 """Candidate rows one pair's finish holds."""
+TERRAIN_TILE_CELLS = 8
+"""Cells per side of a tile of the tile-max mip."""
+
 
 TERRAIN_EDGE_X = wp.constant(0)
 """Edge ``(r, c)-(r, c + 1)``, between cell ``(r - 1, c)`` sub 1 and cell ``(r, c)`` sub 0."""
@@ -69,6 +82,7 @@ TerrainRowsFloat = wp.types.vector(length=TERRAIN_ROW_CANDIDATES, dtype=wp.float
 TerrainRowsInt = wp.types.vector(length=TERRAIN_ROW_CANDIDATES, dtype=wp.int32)
 
 _CANDIDATES = wp.constant(TERRAIN_ROW_CANDIDATES)
+_EPS32 = wp.constant(TERRAIN_EPS32)
 _MERGE_SCALE = wp.constant(TERRAIN_MERGE_SCALE)
 _MERGE_NORMAL = wp.constant(TERRAIN_MERGE_NORMAL)
 _GROUP_NORMAL = wp.constant(TERRAIN_GROUP_NORMAL)
@@ -78,8 +92,74 @@ _GROUP_ROWS = wp.constant(TERRAIN_GROUP_ROWS)
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# candidate rows
+# static data as the kernels see it
 # ----------------------------------------------------------------------------------------------------------------
+
+
+@wp.struct
+class TerrainSurfaceInfo:
+    """One heightfield's layout in the law's static arrays."""
+
+    data_offset: int
+    """First elevation of the heightfield in the model's concatenated elevations."""
+    nrow: int
+    """Vertex rows."""
+    ncol: int
+    """Vertex columns."""
+    hx: float
+    """Half-extent along x [m], scale applied."""
+    hy: float
+    """Half-extent along y [m], scale applied."""
+    min_z: float
+    """Height of elevation 0 [m], scale applied."""
+    max_z: float
+    """Height of elevation 1 [m], scale applied."""
+    dx: float
+    """Cell size along x [m] (float32 ``2 hx / (ncol - 1)``, as the narrow phase computes it)."""
+    dy: float
+    """Cell size along y [m]."""
+    triangle_offset: int
+    """First cluster id of the heightfield."""
+    plane_offset: int
+    """First cluster plane record of the heightfield."""
+    tile_offset: int
+    """First tile-max value of the heightfield."""
+    tile_cols: int
+    """Tiles per tile row."""
+
+
+@wp.struct
+class TerrainClusterPlane:
+    """The plane of a cluster of several triangles: ``z = z(anchor) + offset + gx (x - x_a) + gy (y - y_a)``."""
+
+    anchor: int
+    """Vertex id ``r * ncol + c`` the plane is anchored at."""
+    gx: float
+    """Plane gradient along x."""
+    gy: float
+    """Plane gradient along y."""
+    offset: float
+    """Plane height above the anchor vertex [m]."""
+
+
+@wp.struct
+class TerrainFeatureData:
+    """Everything the law's kernels read about the terrain (all heightfields of a model)."""
+
+    elevations: wp.array[wp.float32]
+    """The model's concatenated normalized elevations."""
+    clusters: wp.array[wp.int32]
+    """Per triangle: the dense index of its cluster's plane record, or ``-(1 + local triangle id)`` alone."""
+    planes: wp.array[TerrainClusterPlane]
+    """Plane records of the clusters of several triangles."""
+    tile_max: wp.array[wp.float32]
+    """Per tile of 8 x 8 cells: the largest decoded height of its vertices [m]."""
+    surfaces: wp.array[TerrainSurfaceInfo]
+    """Layout of every heightfield, by heightfield index."""
+    elevation_version: wp.array[wp.int32]
+    """Version of the heights of every heightfield, bumped by every reported edit."""
+    feature_version: wp.array[wp.int32]
+    """Version of the heights the clusters and the mip were built from."""
 
 
 @wp.struct
@@ -103,6 +183,30 @@ class TerrainRows:
 
 
 # ----------------------------------------------------------------------------------------------------------------
+# heights and the window-local frame
+# ----------------------------------------------------------------------------------------------------------------
+
+
+@wp.func
+def terrain_decode(min_z: float, max_z: float, elevation: float) -> float:
+    """Return ``min_z + elevation * (max_z - min_z)`` rounded exactly as the CPU float32 decode rounds it.
+
+    Every product and sum of float32 values below is exact in float64, so each cast rounds once, as the
+    unfused float32 operation does; no fused multiply-add can change the result on any device.
+    """
+    span = wp.float32(wp.float64(max_z) - wp.float64(min_z))
+    scaled = wp.float32(wp.float64(elevation) * wp.float64(span))
+    return wp.float32(wp.float64(min_z) + wp.float64(scaled))
+
+
+@wp.func
+def terrain_height(data: TerrainFeatureData, surface: TerrainSurfaceInfo, r: int, c: int) -> float:
+    """Return the decoded height of vertex ``(r, c)`` [m] (heightfield-local)."""
+    e = data.elevations[surface.data_offset + r * surface.ncol + c]
+    return terrain_decode(surface.min_z, surface.max_z, e)
+
+
+# ----------------------------------------------------------------------------------------------------------------
 # coincident rows
 # ----------------------------------------------------------------------------------------------------------------
 
@@ -114,8 +218,21 @@ def terrain_rows_coincide(q_a: wp.vec3, n_a: wp.vec3, q_b: wp.vec3, n_b: wp.vec3
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# sticky status
+# tile-max mip and version stamps
 # ----------------------------------------------------------------------------------------------------------------
+
+
+@wp.func
+def terrain_tile_bound(data: TerrainFeatureData, surface: TerrainSurfaceInfo, tile_r: int, tile_c: int) -> float:
+    """Return an upper bound of every height of a tile [m]: its maximum plus four float32 ulps of slack."""
+    value = data.tile_max[surface.tile_offset + tile_r * surface.tile_cols + tile_c]
+    return value + 4.0 * _EPS32 * wp.max(wp.abs(value), 1.0e-3)
+
+
+@wp.func
+def terrain_features_current(data: TerrainFeatureData, heightfield: int) -> bool:
+    """Return whether a heightfield's clusters and mip were built from its current heights."""
+    return data.feature_version[heightfield] == data.elevation_version[heightfield]
 
 
 @wp.func
