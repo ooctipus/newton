@@ -1105,6 +1105,10 @@ class PointLaw:
             if ta is None or tb is None:
                 continue
             key = tuple(sorted((i0, i1)))
+            if not below and self.cls.get(key) == "concave":
+                # A valley's minima outside the solid are its faces'; beyond both faces lies below its line, where
+                # the normal from the edge would leave the faces' cone (a ghost pushing the core down).
+                continue
             sa = self.face_pred(ta, key, p)
             sb = self.face_pred(tb, key, p)
             if not (sa > EPS_PRED and sb > EPS_PRED):
