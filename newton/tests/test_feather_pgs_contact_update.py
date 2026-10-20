@@ -1078,25 +1078,38 @@ class TestContactUpdateSolver(unittest.TestCase):
 @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
 class TestContactUpdateCuda(unittest.TestCase):
     def test_cuda_loop_sweep_matches_cpu(self):
-        """Sweep the stored systems with the unit loop kernel on CUDA as on CPU, to 1e-5 of the largest impulse."""
+        """Sweep the stored systems with the unit loop kernel on CUDA to the CPU's row velocities, within 1e-5.
+
+        The row velocities ``C lambda + rhs`` after 8 sweeps, in one launch and in one-sweep launches that continue
+        the solve, are compared to 1e-5 of each system's largest residual at zero impulse. They are unique where the
+        impulses are not: two dependent ring normals (patch 2549) and two anchors' friction (patch 1309) split their
+        load by rounding, by up to 1e-2 relative when the CPU's inputs change by one ulp, while the velocities of
+        every stored system then move by at most 6e-7 of that scale. Before treating a failure as a defect, check
+        whether a unit took another branch at a near-tie on one device.
+        """
         systems = replica_systems("point") + replica_systems("patch")
-        cpu = World(systems).sweep(8, "unit")
-        cuda = World(systems, device="cuda:0").sweep(8, "unit")
-        for k, (a, b) in enumerate(zip(cpu, cuda, strict=True)):
-            with self.subTest(system=k):
-                self.assertLessEqual(np.abs(a - b).max(), 1.0e-5 * max(np.abs(a).max(), 1.0e-6))
+        for snapshots in (False, True):
+            cpu = World(systems).sweep(8, "unit", snapshots=snapshots)
+            cuda = World(systems, device="cuda:0").sweep(8, "unit", snapshots=snapshots)
+            if snapshots:
+                cpu, cuda = [history[-1] for history in cpu], [history[-1] for history in cuda]
+            for system, on_cpu, on_cuda in zip(systems, cpu, cuda, strict=True):
+                with self.subTest(system=system["source"], snapshots=snapshots):
+                    difference = system["C"] @ (on_cuda - on_cpu)
+                    self.assertLessEqual(np.abs(difference).max(), 1.0e-5 * np.abs(system["rhs"]).max())
 
     def test_cuda_audit_block_holds_in_the_loop_sweep(self):
-        """Hold the audit block's exact load with the CUDA unit loop sweep at 8 and 9 sweeps."""
+        """Hold the audit block's exact load with the CUDA unit loop sweep at 8 and 9 sweeps, in each ring form."""
         load = exact_point_contact(W_AUDIT, W0_AUDIT, 1.0)[0]
         for law, copies in (("point", 2), ("patch1", 3), ("patch2", 2)):
             system = audit_system(copies, law)
             normals = np.flatnonzero(system["rtype"] == CONTACT)
-            for sweeps in (8, 9):
-                with self.subTest(law=law, copies=copies, sweeps=sweeps):
-                    lam = World([system], device="cuda:0").sweep(sweeps, "unit")[0]
-                    self.assertAlmostEqual(lam[normals].sum(), load, delta=1.0e-4)
-                    self.assertGreaterEqual(residuals(system, lam)[1][normals].min(), -1.0e-5)
+            for ring_units in TestContactUpdateAuditBlock.forms(law):
+                for sweeps in (8, 9):
+                    with self.subTest(law=law, copies=copies, ring_units=ring_units, sweeps=sweeps):
+                        lam = World([system], device="cuda:0").sweep(sweeps, "unit", ring_units=ring_units)[0]
+                        self.assertAlmostEqual(lam[normals].sum(), load, delta=1.0e-4)
+                        self.assertGreaterEqual(residuals(system, lam)[1][normals].min(), -1.0e-5)
 
     def test_cuda_routes_without_units_keep_the_sequential_law(self):
         """Keep the sequential law on CUDA sweeps without units, record them and warn; the loop sweep runs units."""

@@ -552,7 +552,14 @@ class TestContactUnitRing(unittest.TestCase):
 @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
 class TestContactUnitCuda(unittest.TestCase):
     def test_cuda_prelude_matches_the_cpu_binding(self):
-        """Solve point problems with the CUDA prelude as the CPU binding does, to float32 rounding."""
+        """Solve point problems with the CUDA prelude and the CUDA binding as the CPU binding does, to rounding.
+
+        A solution's float32 rounding error grows with its block's condition number, up to 1000 here: when its
+        inputs change by one ulp, the CPU binding's own solution moves by at most 6 cond(W) 2^-23 of its largest
+        component (median 3e-7). Each solve must agree within 50 cond(W) 2^-23 + 1e-5, and half of them within
+        2e-6. A slide root that the evaluation cap stops (1% of these problems) is an unconverged iterate whose
+        bracket steps can differ by rounding, so only its feasibility is checked.
+        """
         rng = np.random.default_rng(17)
         rows = []
         for _ in range(4000):
@@ -566,12 +573,30 @@ class TestContactUnitCuda(unittest.TestCase):
         wp.launch(
             _solve_points_native, dim=len(rows), inputs=[wp.array(rows, dtype=float, device=device), out], device=device
         )
-        cuda = out.numpy().astype(np.float64)
-        scale = np.maximum(np.abs(cpu[:, :3]).max(axis=1, keepdims=True), 1.0e-6)
-        self.assertLess(np.quantile(np.abs(cuda[:, :3] - cpu[:, :3]) / scale, 0.99), 1.0e-5)
-        self.assertLess(np.max(np.abs(cuda[:, :3] - cpu[:, :3]) / scale), 1.0e-3)
-        cuda_twin = solve_points(rows, device=device)
-        self.assertLess(np.max(np.abs(cuda_twin[:, :3] - cpu[:, :3]) / scale), 1.0e-3)
+        problems = rows.astype(np.float64)
+        blocks = np.stack(
+            [
+                np.stack([problems[:, 0], problems[:, 4], problems[:, 5]], axis=1),
+                np.stack([problems[:, 4], problems[:, 1], problems[:, 2]], axis=1),
+                np.stack([problems[:, 5], problems[:, 2], problems[:, 3]], axis=1),
+            ],
+            axis=1,
+        )
+        bound = 50.0 * np.linalg.cond(blocks) * 2.0**-23 + 1.0e-5
+        capped = cpu[:, 4] >= 1 + contact_unit.CONTACT_UNIT_NEWTON_CAP
+        self.assertLess(capped.sum(), 0.05 * len(rows))
+        scale = np.maximum(np.abs(cpu[:, :3]).max(axis=1), 1.0e-6)
+        for name, twin in (("prelude", out.numpy().astype(np.float64)), ("binding", solve_points(rows, device=device))):
+            with self.subTest(twin=name):
+                self.assertTrue(np.all(np.isfinite(twin)))
+                deviation = np.abs(twin[:, :3] - cpu[:, :3]).max(axis=1) / scale
+                converged = ~capped
+                self.assertTrue(np.all(deviation[converged] <= bound[converged]), np.argmax(deviation - bound))
+                self.assertLess(np.median(deviation[converged]), 2.0e-6)
+                normal = twin[capped, 0]
+                radius = problems[capped, 9] * (normal + problems[capped, 10])
+                self.assertTrue(np.all(normal >= 0.0))
+                self.assertTrue(np.all(np.hypot(twin[capped, 1], twin[capped, 2]) <= radius * (1.0 + 1.0e-5)))
 
 
 if __name__ == "__main__":
