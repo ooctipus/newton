@@ -375,21 +375,23 @@ def _surface_distance(hf, p, radius):
 
 
 def test_buried_cores_exit_by_the_minimum_translation(test, device):
-    """Give a buried sphere one row, its exact minimum translation; give a buried capsule end one exit (G2, G3).
+    """Give every buried core point one exit, its exact minimum translation when that exit lies in its window (G2, G3).
 
-    Sphere centres 3-60 mm inside rough, pitted and stepped terrain: one row, its depth the exact distance from the
-    centre to the surface within 10 um (the rows push by exactly the minimum translation, as the float64 law does);
-    no buried core is left without a row.
+    Sphere centres and lying capsules 3-60 mm inside rough, pitted and stepped terrain. A sphere gets one row; a buried
+    sphere centre or capsule end gets exactly one row whose core point it is, an exit. When the exact distance from it
+    to the surface is within the reach (its closest surface point then lies in its window), the exit's depth is that
+    distance within 10 um, the minimum translation (G2); otherwise it is the face above it (G3). Every exit equals the
+    float64 law's, and no buried core is left without a row.
     """
     rng = np.random.default_rng(12)
+    checked = {"exact": 0, "law": 0}
     for name, heights in _rough_terrains(rng).items():
         with test.subTest(terrain=name):
             hf = tu.reference_surface(tu.heightfield_model(heights, 1.6, 1.6, device="cpu"))
-            bodies, depths = [], []
+            bodies = []
             for i in range(40):
                 kind = "sphere" if i % 2 == 0 else "capsule"
-                r = R31
-                dims = {"radius": r} if kind == "sphere" else {"radius": r, "half_height": 0.08}
+                dims = {"radius": R31} if kind == "sphere" else {"radius": R31, "half_height": 0.08}
                 x, y = rng.uniform(-1.2, 1.2, 2)
                 depth = float(rng.choice([0.003, 0.01, 0.03, 0.06]))
                 q = np.array([0.0, 0.0, 0.0, 1.0])
@@ -397,23 +399,34 @@ def test_buried_cores_exit_by_the_minimum_translation(test, device):
                     q = _quat_mul(_axis_angle((0.0, 0.0, 1.0), rng.uniform(0.0, 2.0 * np.pi)), LYING)
                 z = hf.height(x, y) - depth
                 bodies.append((kind, dims, np.array([x, y, z, *q], np.float32).astype(np.float64)))
-                depths.append(depth)
             model, _hfield, shapes = tu.body_scene(heights, 1.6, 1.6, bodies, device=device)
             pipeline, _contacts, _state = _collide(model, shadow=True)
             rows = tu.shadow_rows(pipeline)
             for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
                 got = rows.get(shape, [])
-                test.assertTrue(got, msg=f"{kind} at {pose[:3].tolist()} has no row")
-                if kind != "sphere":
-                    continue
-                test.assertEqual(len(got), 1, msg=f"sphere at {pose[:3].tolist()}: {got}")
-                exact, _closest = _surface_distance(hf, pose[:3], dims["radius"] + REACH)
+                where = f"{kind} at {pose[:3].tolist()}"
+                test.assertTrue(got, msg=f"{where} has no row")
+                if kind == "sphere":
+                    test.assertEqual(len(got), 1, msg=f"{where}: {got}")
+                core = ref.make_core(kind, dims, pose)
+                reach = dims["radius"] + REACH
                 law = _law_rows(hf, kind, dims, pose)
-                test.assertEqual(len(law), 1)
-                test.assertAlmostEqual(got[0][2], law[0].d, delta=1.0e-5)
-                if exact < dims["radius"] + REACH - 0.05:
-                    # The exit lies well inside the window: G2 takes it, the minimum translation.
-                    test.assertAlmostEqual(-got[0][2], exact, delta=1.0e-5, msg=f"sphere at {pose[:3].tolist()}")
+                for point in (core.c,) if kind == "sphere" else (core.a, core.b):
+                    if not ref._below_surface(hf, point):
+                        continue
+                    exits = [
+                        row for row in got if row[2] < 0.0 and np.linalg.norm(row[0] + row[2] * row[1] - point) < 1e-5
+                    ]
+                    test.assertEqual(len(exits), 1, msg=f"{where}, core point {point.tolist()}: {got}")
+                    law_exits = [row for row in law if row.d < 0.0 and np.linalg.norm(row.k - point) < 1e-9]
+                    test.assertEqual(len(law_exits), 1, msg=f"{where}: {law}")
+                    test.assertAlmostEqual(exits[0][2], law_exits[0].d, delta=1.0e-5, msg=where)
+                    checked["law"] += 1
+                    exact, _closest = _surface_distance(hf, point, reach)
+                    if exact <= reach:
+                        test.assertAlmostEqual(-exits[0][2], exact, delta=1.0e-5, msg=f"{where}: {point.tolist()}")
+                        checked["exact"] += 1
+    test.assertGreater(checked["exact"], 60, msg=checked)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -613,11 +626,22 @@ def _side_buffer(begin, count, pair_count, device):
     return out
 
 
+MARKED_BIT_31 = (
+    (0.8063436150550842, -0.8646434545516968, 0.34505870938301086),
+    (-0.3956831395626068, 0.1805560439825058, 0.33991286158561707),
+    (-0.7925142645835876, -0.43028581142425537, 0.3399025499820709),
+)
+"""Centres of 0.25 m spheres on :func:`_tile_scenes`' rough tile whose rows include one owned by the window vertex of
+index 31: bit 31, the sign bit, of the tiled kernel's first mask word."""
+
+
 def _tile_scenes(rng):
-    """Scenes whose pairs all take the tiled kernel (windows over 16 cells): ``(heights, half extent, bodies)``.
+    """Scenes whose pairs all take the tiled kernel (windows over 16 cells): ``(name, heights, half extent, bodies)``.
 
     Large spheres and long capsules rest on rough terrain; long capsules lie across ridges of one height, whose ridge
-    rows share a plane, so that the finish may drop some of them (the full kernel's pairs).
+    rows share a plane, so that the finish may drop some of them (the full kernel's pairs); spheres whose rows mark
+    bit 31 of a mask word (:data:`MARKED_BIT_31`); a sphere and a capsule whose windows hold over 256 vertices, which
+    the tiled kernel's first lane walks unmasked.
     """
     heights = _rough_terrains(rng)["rough"]
     hf = tu.reference_surface(tu.heightfield_model(heights, 1.6, 1.6, device="cpu"))
@@ -647,38 +671,80 @@ def _tile_scenes(rng):
         x, y = rng.uniform(-0.6, 0.6, 2)
         z = 0.03 + dims["radius"] + rng.uniform(0.0, 0.005)
         lying.append(("capsule", dims, np.array([x, y, z, *q], np.float32).astype(np.float64)))
-    return [(heights, 1.6, bodies), (ridges, 2.0, lying)]
+    marked = [("sphere", {"radius": 0.25}, np.array([*c, 0.0, 0.0, 0.0, 1.0])) for c in MARKED_BIT_31]
+    diagonal = _quat_mul(_axis_angle((0.0, 0.0, 1.0), np.pi / 4.0), LYING)
+    wide = [
+        ("sphere", {"radius": 0.8}, np.array([0.0, 0.0, hf.height(0.0, 0.0) + 0.81, 0.0, 0.0, 0.0, 1.0])),
+        ("capsule", {"radius": 0.05}, np.array([0.1, -0.1, 0.15, *diagonal])),
+    ]
+    wide[1][1]["half_height"] = 1.0
+    return [
+        ("rough", heights, 1.6, bodies),
+        ("ridges", ridges, 2.0, lying),
+        ("marked bit 31", heights, 1.6, marked),
+        ("unmasked", heights, 1.6, wide),
+    ]
+
+
+def _owner_vertex_indices(hf, rows, bodies, shapes):
+    """Per body, the window index ``(r - r0) * (c1 - c0 + 2) + (c - c0)`` of the vertex owning each of its walked
+    rows (recovery rows, added after the walk, excluded), and its window's vertex count."""
+    out = []
+    for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
+        core = ref.make_core(kind, dims, pose)
+        r0, r1, c0, c1 = tu.window_cells(hf, core, dims["radius"] + REACH)
+        width = c1 - c0 + 2
+        owners = []
+        for _q, _n, _d, feature in rows.get(shape, []):
+            if (feature >> 5) & 3 == int(TERRAIN_FEATURE_RECOVERY):
+                continue
+            r = r0 + (((feature >> 13) & 63) - r0) % 64
+            c = c0 + (((feature >> 7) & 63) - c0) % 64
+            owners.append((r - r0) * width + (c - c0))
+        out.append((owners, (r1 - r0 + 2) * width))
+    return out
 
 
 def test_tiled_kernel_matches_one_thread_kernel(test, device):
     """Give a pair the same rows, bit for bit, whether one thread or a tile of lanes evaluates its window.
 
     Both kernels evaluate the same table segment of tile-lane pairs (:func:`_tile_scenes`), the full kernel after
-    them; some pairs go through the full kernel.
+    them; some pairs go through the full kernel. On the CPU Warp runs ``wp.launch_tiled`` with one lane per pair
+    (``block_dim`` 1), so the CPU run checks one lane's walk, its masked and unmasked paths and bit 31 of a mask word;
+    the 16-lane path (the window extent's ``tile_max``, the union of the lanes' mask words by ``tile_sum`` and the
+    lanes' striding) runs on CUDA only, in this test's CUDA variant.
     """
     deferred = 0
-    for heights, extent, bodies in _tile_scenes(np.random.default_rng(4)):
-        model, _hfield, _shapes = tu.body_scene(heights, extent, extent, bodies, device=device)
-        pipeline, _contacts, _state = _collide(model, shadow=True)
-        shadow = pipeline._terrain_law_shadow
-        begin, end = shadow.table.segment(TERRAIN_PARTNER_POINT, TERRAIN_LANE_TILE)
-        test.assertEqual(end - begin, len(bodies))
-        outputs = []
-        for kernel, lane in (
-            (terrain_law_point.terrain_point_rows, TERRAIN_LANE_THREAD),
-            (terrain_law_point.terrain_point_rows_tiled, TERRAIN_LANE_TILE),
-        ):
-            out = _side_buffer(begin, end - begin, shadow.table.pair_count, device)
-            _launch_segment(shadow, model, pipeline, kernel, lane, begin, end - begin, out)
-            outputs.append(out)
-        one, tiled = outputs
-        np.testing.assert_array_equal(one.count.numpy(), tiled.count.numpy())
-        np.testing.assert_array_equal(one.state.numpy(), tiled.state.numpy())
-        test.assertGreater(int(one.count.numpy().sum()), len(bodies))
-        test.assertEqual(int(one.deferred_count.numpy()[0]), int(tiled.deferred_count.numpy()[0]))
-        deferred += int(one.deferred_count.numpy()[0])
-        for name in ("q", "n", "d", "feature"):
-            np.testing.assert_array_equal(getattr(one, name).numpy(), getattr(tiled, name).numpy(), err_msg=name)
+    for name, heights, extent, bodies in _tile_scenes(np.random.default_rng(4)):
+        with test.subTest(scene=name):
+            model, _hfield, shapes = tu.body_scene(heights, extent, extent, bodies, device=device)
+            pipeline, _contacts, _state = _collide(model, shadow=True)
+            shadow = pipeline._terrain_law_shadow
+            begin, end = shadow.table.segment(TERRAIN_PARTNER_POINT, TERRAIN_LANE_TILE)
+            test.assertEqual(end - begin, len(bodies))
+            outputs = []
+            for kernel, lane in (
+                (terrain_law_point.terrain_point_rows, TERRAIN_LANE_THREAD),
+                (terrain_law_point.terrain_point_rows_tiled, TERRAIN_LANE_TILE),
+            ):
+                out = _side_buffer(begin, end - begin, shadow.table.pair_count, device)
+                _launch_segment(shadow, model, pipeline, kernel, lane, begin, end - begin, out)
+                outputs.append(out)
+            one, tiled = outputs
+            np.testing.assert_array_equal(one.count.numpy(), tiled.count.numpy())
+            np.testing.assert_array_equal(one.state.numpy(), tiled.state.numpy())
+            test.assertGreaterEqual(int(one.count.numpy().sum()), len(bodies))
+            test.assertEqual(int(one.deferred_count.numpy()[0]), int(tiled.deferred_count.numpy()[0]))
+            deferred += int(one.deferred_count.numpy()[0])
+            for array in ("q", "n", "d", "feature"):
+                np.testing.assert_array_equal(getattr(one, array).numpy(), getattr(tiled, array).numpy(), err_msg=array)
+            hf = tu.reference_surface(tu.heightfield_model(heights, extent, extent, device="cpu"))
+            owners = _owner_vertex_indices(hf, tu.shadow_rows(pipeline), bodies, shapes)
+            if name == "marked bit 31":
+                # The scene covers what it is for: a row of every body owned by window vertex 31.
+                test.assertTrue(all(31 in rows for rows, _vertices in owners), msg=owners)
+            elif name == "unmasked":
+                test.assertTrue(all(vertices > 256 and rows for rows, vertices in owners), msg=owners)
     # Both paths finished pairs in the full kernel too.
     test.assertGreater(deferred, 0)
 

@@ -506,21 +506,33 @@ DECISION_BAND = 2.0e-6
 """Margin [m] within which a float32 boundary decision may differ from the float64 one (two bands of a 1 m window)."""
 
 
-def kernel_band(hf: ref.ReferenceHeightfield, core, reach: float) -> float:
-    """The closed-predicate band [m] the float32 kernels use for a pair's window (heightfield-local core).
+def core_ends(core) -> list:
+    """A reference core's points: a sphere's centre, a capsule's two ends."""
+    return [core.a, core.b] if hasattr(core, "a") else [core.c]
 
-    The window of ``terrain_box_cells`` (the core's ends widened by ``reach``, cell coordinates widened by
-    ``TERRAIN_CELL_WIDEN``) and the extent of ``terrain_window_extent``: the core's ends in the window frame, the
-    window's size and its heights about its reference vertex. Four of these bands are the float32 finish's plane-group
-    offset, which a float64 comparison passes to :func:`terrain_law_reference.finish` (``group_offset``).
-    """
-    ends = [core.a, core.b] if hasattr(core, "a") else [core.c]
+
+def window_cells(hf: ref.ReferenceHeightfield, core, reach: float) -> tuple[int, int, int, int]:
+    """The cells ``(r0, r1, c0, c1)`` of a point-core pair's window as ``terrain_box_cells`` takes them: the core's
+    ends widened by ``reach``, cell coordinates widened by ``TERRAIN_CELL_WIDEN``."""
+    ends = core_ends(core)
     lo = np.min(ends, axis=0) - reach
     hi = np.max(ends, axis=0) + reach
     c0 = max(int(np.floor((lo[0] + hf.hx) / hf.dx - TERRAIN_CELL_WIDEN)), 0)
     c1 = min(int(np.floor((hi[0] + hf.hx) / hf.dx + TERRAIN_CELL_WIDEN)), hf.cols - 1)
     r0 = max(int(np.floor((lo[1] + hf.hy) / hf.dy - TERRAIN_CELL_WIDEN)), 0)
     r1 = min(int(np.floor((hi[1] + hf.hy) / hf.dy + TERRAIN_CELL_WIDEN)), hf.rows - 1)
+    return r0, r1, c0, c1
+
+
+def kernel_band(hf: ref.ReferenceHeightfield, core, reach: float) -> float:
+    """The closed-predicate band [m] the float32 kernels use for a pair's window (heightfield-local core).
+
+    The window of :func:`window_cells` and the extent of ``terrain_window_extent``: the core's ends in the window
+    frame, the window's size and its heights about its reference vertex. Four of these bands are the float32 finish's
+    plane-group offset, which a float64 comparison passes to :func:`terrain_law_reference.finish` (``group_offset``).
+    """
+    ends = core_ends(core)
+    r0, r1, c0, c1 = window_cells(hf, core, reach)
     origin = hf.V(r0, c0)
     extent = max(
         (c1 + 1 - c0) * hf.dx,
