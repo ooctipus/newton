@@ -30,9 +30,29 @@ from newton._src.geometry import terrain_law_point
 from newton._src.geometry.terrain_contacts import TERRAIN_LANE_THREAD, TERRAIN_LANE_TILE, TERRAIN_PARTNER_POINT
 from newton._src.geometry.terrain_law import (
     TERRAIN_FEATURE_EDGE,
+    TERRAIN_FEATURE_FACE,
     TERRAIN_FEATURE_RECOVERY,
+    TERRAIN_PAIR_FILTERED,
+    TERRAIN_PAIR_OUTSIDE,
+    TERRAIN_PAIR_STALE,
+    TERRAIN_PAIR_TILE_EXIT,
+    TerrainFeatureData,
     TerrainLawRows,
     TerrainPairInputs,
+    TerrainPlanes,
+    TerrainWindow,
+    terrain_claims,
+    terrain_edge_kind,
+    terrain_edge_sides,
+    terrain_eps,
+    terrain_face_values,
+    terrain_feature_id,
+    terrain_pair_exit,
+    terrain_plane,
+    terrain_planes,
+    terrain_window,
+    terrain_window_extent,
+    terrain_window_vertex,
 )
 from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_test_utils as tu
@@ -54,6 +74,8 @@ SITES = {
 CAPSULE_SITES = {"vertex": (0.0, 0.0), "edge": (0.05, 0.0005), "interior": (0.033, 0.067)}
 PIPELINE = {"rigid_contact_max": 1 << 15, "max_triangle_pairs": 1 << 17}
 GHOST_ANGLE = np.radians(1.0)
+EXITS = int(TERRAIN_PAIR_TILE_EXIT | TERRAIN_PAIR_STALE | TERRAIN_PAIR_FILTERED | TERRAIN_PAIR_OUTSIDE)
+"""Pair states of a pair that leaves before its window is walked."""
 
 
 def _quat_mul(a, b):
@@ -608,6 +630,23 @@ def _launch_segment(shadow, model, pipeline, kernel, lane, begin, count, out):
     wp.launch(terrain_law_point.terrain_point_rows_full, dim=count, inputs=args, device=model.device)
 
 
+def _launch_full(shadow, model, pipeline, begin, count, out):
+    """Run the full-finish kernel over the pairs of ``out``'s deferred list (``deferred_count``) from table pair
+    ``begin``."""
+    inputs = TerrainPairInputs()
+    inputs.pairs = shadow.table.pairs
+    inputs.shape_type = model.shape_type
+    inputs.shape_transform = pipeline.geom_transform
+    inputs.shape_data = pipeline.geom_data
+    inputs.shape_gap = model.shape_gap
+    inputs.shape_heightfield_index = model.shape_heightfield_index
+    inputs.shape_body = model.shape_body
+    inputs.body_flags = model.body_flags
+    inputs.include_static_kinematic_pairs = 1
+    args = [begin, 0, inputs, shadow.features.data(), out]
+    wp.launch(terrain_law_point.terrain_point_rows_full, dim=count, inputs=args, device=model.device)
+
+
 def _side_buffer(begin, count, pair_count, device):
     """A side buffer for ``count`` pairs from table pair ``begin`` (slots from 0), deferred list from ``begin``."""
     out = TerrainLawRows()
@@ -749,6 +788,224 @@ def test_tiled_kernel_matches_one_thread_kernel(test, device):
     test.assertGreater(deferred, 0)
 
 
+# ----------------------------------------------------------------------------------------------------------------
+# the kernels' rejects against the plain walk
+# ----------------------------------------------------------------------------------------------------------------
+
+_Claim = terrain_law_point._Claim
+_PLAIN_ROWS = wp.constant(terrain_law_point.TERRAIN_POINT_ROWS)
+_PLAIN_HELD = wp.constant(int(terrain_law_point._HELD))
+
+
+@wp.func
+def _plain_end_face(
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    core: terrain_law_point._PointCore,
+    end: int,
+    k: wp.vec3,
+    below: int,
+    r: int,
+    c: int,
+    sub: int,
+    n: wp.vec3,
+    a: wp.vec3,
+) -> _Claim:
+    """``terrain_law_point._end_face`` without its off-cell reject."""
+    d = wp.dot(n, k - a)
+    if d > core.reach:
+        return _Claim()
+    if below != 0:
+        if d > core.eps:
+            return _Claim()
+    elif d < -core.eps:
+        return _Claim()
+    q = k - d * n
+    s = terrain_face_values(data, window, r, c, sub, n, k)
+    if not (terrain_claims(s[0], core.eps) and terrain_claims(s[1], core.eps) and terrain_claims(s[2], core.eps)):
+        return _Claim()
+    feature = terrain_feature_id(r, c, TERRAIN_FEATURE_FACE, sub, end)
+    return terrain_law_point._offer(end, below, q, k, n, d, core.reach, feature)
+
+
+@wp.func
+def _plain_point_item(
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    core: terrain_law_point._PointCore,
+    r: int,
+    c: int,
+    r1: int,
+    c1: int,
+    item: int,
+):
+    """``terrain_law_point._point_item`` with :func:`_plain_end_face`."""
+    end = item // 6
+    feature = item - 6 * end
+    if end == 2:
+        feature = item - 10
+    k = core.a
+    below = core.below_a
+    if end == 1:
+        k = core.b
+        below = core.below_b
+    inside = r <= r1 and c <= c1
+    if feature < 2:
+        if not inside:
+            return planes, _Claim()
+        planes, n, a = terrain_plane(data, window, planes, r, c, feature)
+        return planes, _plain_end_face(data, window, core, end, k, below, r, c, feature, n, a)
+    if feature == 5:
+        if end == 2:
+            return terrain_law_point._axis_vertex(data, window, planes, core, r, c)
+        return planes, terrain_law_point._end_vertex(data, window, core, end, k, below, r, c)
+    which = feature - 2
+    if (which == 0 and c > c1) or (which == 1 and r > r1) or (which == 2 and not inside):
+        return planes, _Claim()
+    if terrain_edge_kind(data, window.surface, r, c, which) >= 0:
+        return planes, _Claim()
+    v0i, v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
+    v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
+    v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
+    if end == 2:
+        return terrain_law_point._axis_edge(data, window, planes, core, r, c, which, v0, v1)
+    return terrain_law_point._end_edge(data, window, planes, core, end, k, below, r, c, which, v0, v1)
+
+
+@wp.kernel(enable_backward=False)
+def _plain_point_rows(
+    begin: int, slot_begin: int, inputs: TerrainPairInputs, data: TerrainFeatureData, out: TerrainLawRows
+):
+    """``terrain_point_rows`` without its rejects: every item of every window vertex in window order (no vertex
+    drop, no vertex mask, no off-cell face reject), then the same close."""
+    i = wp.tid()
+    pair = begin + i
+    slot = slot_begin + i * _PLAIN_ROWS
+    state, frame, heightfield, cells, a, b, segment, reach = terrain_law_point._pair_setup(inputs, data, pair)
+    if state != 0:
+        terrain_pair_exit(out, pair, state)
+        return
+    r1 = cells[1]
+    c1 = cells[3]
+    window = terrain_window(data, heightfield, cells[0], cells[2])
+    eps = terrain_eps(terrain_window_extent(data, window, r1, c1, terrain_law_point._core_extent(window, a, b)))
+    planes = terrain_planes()
+    planes, core = terrain_law_point._pair_core(data, window, planes, a, b, segment, reach, eps)
+    terrain_law_point._open_pair(out, slot)
+    held = int(0)
+    candidates = int(0)
+    items = terrain_law_point._vertex_items(core)
+    for r in range(cells[0], r1 + 2):
+        for c in range(cells[2], c1 + 2):
+            if held <= _PLAIN_HELD:
+                for item in range(items):
+                    planes, claim = _plain_point_item(data, window, planes, core, r, c, r1, c1, item)
+                    held, candidates = terrain_law_point._walk_claim(out, slot, held, candidates, claim, eps)
+    terrain_law_point._close_pair(
+        out, pair, slot, terrain_law_point._wide(cells), held, candidates, data, window, planes, core, frame
+    )
+
+
+def _reject_scenes(device):
+    """Scenes for :func:`test_rejects_keep_the_plain_walk_rows`: ``(name, model, bodies)``."""
+    for name, _hf, model, _hfield, _shapes, bodies in _rough_scenes(device, 20):
+        yield name, model, bodies
+    rng = np.random.default_rng(23)
+    mosaic = tu.suite_like_heights(rng, 64, 64)
+    hf = tu.reference_surface(tu.heightfield_model(mosaic, 3.2, 3.2, device="cpu"))
+    bodies = _adversarial(rng, hf, 60, "sphere") + _adversarial(rng, hf, 60, "capsule")
+    yield "seams", tu.body_scene(mosaic, 3.2, 3.2, bodies, device=device)[0], bodies
+    rough = _rough_terrains(rng)["rough"]
+    hf = tu.reference_surface(tu.heightfield_model(rough, 1.6, 1.6, device="cpu"))
+    bodies = []
+    for i in range(40):
+        kind = "sphere" if i % 2 == 0 else "capsule"
+        dims = {"radius": R31} if kind == "sphere" else {"radius": R31, "half_height": 0.08}
+        x, y = rng.uniform(-1.2, 1.2, 2)
+        q = np.array([0.0, 0.0, 0.0, 1.0])
+        if kind == "capsule":
+            q = _quat_mul(_axis_angle((0.0, 0.0, 1.0), rng.uniform(0.0, 2.0 * np.pi)), LYING)
+        z = hf.height(x, y) - float(rng.choice([0.003, 0.01, 0.03, 0.06]))
+        bodies.append((kind, dims, np.array([x, y, z, *q], np.float32).astype(np.float64)))
+    yield "buried", tu.body_scene(rough, 1.6, 1.6, bodies, device=device)[0], bodies
+    bodies = _ridge_capsules()
+    yield "ridge", tu.body_scene(_ridge_terrain(), 1.0, 1.0, bodies, device=device)[0], bodies
+    # Rows at the admission limit: the lowest point 28-40 mm (the reach beyond the radius) above the terrain.
+    bodies = []
+    for i in range(80):
+        kind = "sphere" if i % 2 == 0 else "capsule"
+        r = R31 if i % 4 < 2 else R22
+        dims = {"radius": r} if kind == "sphere" else {"radius": r, "half_height": 0.08}
+        x, y = rng.uniform(-1.2, 1.2, 2)
+        q = np.array([0.0, 0.0, 0.0, 1.0])
+        if kind == "capsule":
+            tilt = _axis_angle((1.0, 0.0, 0.0), rng.uniform(0.0, 0.4))
+            q = _quat_mul(_axis_angle((0.0, 0.0, 1.0), rng.uniform(0.0, 2.0 * np.pi)), _quat_mul(tilt, LYING))
+        lo, hi = ref.make_core(kind, dims, np.r_[x, y, 0.0, q]).aabb()
+        top = max(
+            hf.height(xx, yy)
+            for xx in np.linspace(lo[0] - r, hi[0] + r, 7)
+            for yy in np.linspace(lo[1] - r, hi[1] + r, 7)
+        )
+        z = top - lo[2] + r + rng.uniform(0.028, REACH)
+        bodies.append((kind, dims, np.array([x, y, z, *q], np.float32).astype(np.float64)))
+    yield "reach", tu.body_scene(rough, 1.6, 1.6, bodies, device=device)[0], bodies
+
+
+def test_rejects_keep_the_plain_walk_rows(test, device):
+    """Give every pair, bit for bit, the rows of the walk over every window vertex without the kernels' rejects.
+
+    The one-thread kernel drops the vertices whose features lie out of reach (``_vertex_dropped``), walks a bit mask of
+    the rest, and refuses a face whose projection lies off its cell (``_off_cell``) before its canonical values; the
+    plain walk (:func:`_plain_point_rows`) evaluates every item of every window vertex in window order and closes the
+    pair the same way. On rough, pitted, stepped, seam-adversarial, buried and ridge scenes the count, state, q, n, d
+    and feature of every pair agree bit for bit; so do those of the full-finish kernel (which walks with the drop and
+    runs the finish) run on every walked pair, which also checks that the walks write a pair's rows as the finish keeps
+    them.
+    """
+    walked = 0
+    for name, model, bodies in _reject_scenes(device):
+        with test.subTest(scene=name):
+            pipeline, _contacts, _state = _collide(model, shadow=True)
+            shadow = pipeline._terrain_law_shadow
+            begin = shadow.table.segment(TERRAIN_PARTNER_POINT, TERRAIN_LANE_THREAD)[0]
+            end = shadow.table.segment(TERRAIN_PARTNER_POINT, TERRAIN_LANE_TILE)[1]
+            count = end - begin
+            test.assertEqual(count, len(bodies))
+            results = {}
+            for label, kernel in (("kernel", terrain_law_point.terrain_point_rows), ("plain", _plain_point_rows)):
+                out = _side_buffer(begin, count, shadow.table.pair_count, device)
+                _launch_segment(shadow, model, pipeline, kernel, TERRAIN_LANE_THREAD, begin, count, out)
+                results[label] = out
+            # The full-finish kernel on every pair.
+            full = _side_buffer(begin, count, shadow.table.pair_count, device)
+            full.deferred.assign(np.arange(shadow.table.pair_count, dtype=np.int32))
+            full.deferred_count.assign(np.full(4, count, np.int32))
+            _launch_full(shadow, model, pipeline, begin, count, full)
+            kernel = {f: getattr(results["kernel"], f).numpy() for f in ("count", "state", "q", "n", "d", "feature")}
+            plain = {f: getattr(results["plain"], f).numpy() for f in ("count", "state", "q", "n", "d", "feature")}
+            finished = {f: getattr(full, f).numpy() for f in ("count", "state", "q", "n", "d", "feature")}
+            np.testing.assert_array_equal(kernel["count"], plain["count"])
+            np.testing.assert_array_equal(kernel["state"], plain["state"])
+            for i in range(count):
+                pair = begin + i
+                rows = slice(
+                    i * terrain_law_point.TERRAIN_POINT_ROWS,
+                    i * terrain_law_point.TERRAIN_POINT_ROWS + int(kernel["count"][pair]),
+                )
+                for f in ("q", "n", "d", "feature"):
+                    np.testing.assert_array_equal(kernel[f][rows], plain[f][rows], err_msg=f"{name} pair {i} {f}")
+                if kernel["state"][pair] & EXITS:
+                    continue
+                walked += 1
+                test.assertEqual(kernel["count"][pair], finished["count"][pair], msg=f"{name} pair {i}")
+                test.assertEqual(kernel["state"][pair], finished["state"][pair], msg=f"{name} pair {i}")
+                for f in ("q", "n", "d", "feature"):
+                    np.testing.assert_array_equal(kernel[f][rows], finished[f][rows], err_msg=f"{name} pair {i} {f}")
+    test.assertGreater(walked, 200)
+
+
 class TestTerrainLawPoint(unittest.TestCase):
     # Today's terrain route is held to the shadow rows' checks and fails them (the defects the law removes). Each
     # expected failure turns into an unexpected success once the law writes these contacts (Tracks 2 and 7): remove
@@ -866,6 +1123,7 @@ for _name, _func in (
     ("test_capsule_axis_inside_without_exit_gets_recovery", test_capsule_axis_inside_without_exit_gets_recovery),
     ("test_point_rows_point_up_on_steep_terrain", test_point_rows_point_up_on_steep_terrain),
     ("test_tiled_kernel_matches_one_thread_kernel", test_tiled_kernel_matches_one_thread_kernel),
+    ("test_rejects_keep_the_plain_walk_rows", test_rejects_keep_the_plain_walk_rows),
 ):
     add_function_test(TestTerrainLawPoint, _name, _func, devices=devices)
 
