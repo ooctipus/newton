@@ -5,9 +5,13 @@
 
 The law emits the support set of one (heightfield, convex shape) pair directly: one row per local minimum of the
 core-to-surface distance within the writer's reach, plus the corners of flat support regions, each owned by one
-surface feature (a plane cluster, a crease edge or a vertex). This module holds what every per-type kernel shares;
-the kernels themselves and the static data they read live in :mod:`terrain_contacts`. Nothing routes contacts
-through the law yet.
+surface feature (a plane cluster, a crease edge or a vertex). This module holds what every per-type kernel shares:
+the surface predicates, the per-pair window (:func:`terrain_box_cells`, :func:`terrain_tile_exit`,
+:func:`terrain_window_extent`), a window's cache of cluster planes (:class:`TerrainPlanes`), the finish, and the
+per-pair inputs and side buffer of the shadow route (:class:`TerrainPairInputs`, :class:`TerrainLawRows`). The static
+data live in :mod:`terrain_contacts`, the per-type kernels in modules of their own (``terrain_law_<type>``), and
+:mod:`terrain_shadow` runs them beside the narrow phase without feeding any contact (``NEWTON_TERRAIN_LAW_SHADOW``).
+Nothing routes contacts through the law yet.
 
 Surface model:
 
@@ -124,11 +128,37 @@ TERRAIN_STATUS_STALE = wp.constant(1 << 14)
 """Sticky bit of the narrow phase's buffer status word (``terrain_stale``): terrain features older than the heights
 were read."""
 
+TERRAIN_PAIR_TILE_EXIT = wp.constant(1)
+"""Pair state: the core lies above every tile-max block under its window by more than its reach (no row)."""
+TERRAIN_PAIR_STALE = wp.constant(2)
+"""Pair state: the heightfield's features are older than its heights (no row; ``terrain_stale`` is raised)."""
+TERRAIN_PAIR_FILTERED = wp.constant(4)
+"""Pair state: the pipeline's immovable-pair policy drops the pair (no row)."""
+TERRAIN_PAIR_OUTSIDE = wp.constant(8)
+"""Pair state: the core's window misses the heightfield's footprint (no row)."""
+TERRAIN_PAIR_ROW_OVERFLOW = wp.constant(16)
+"""Pair state: more rows survived the finish than the pair's row limit (``terrain_rows`` is raised)."""
+TERRAIN_PAIR_CANDIDATE_OVERFLOW = wp.constant(32)
+"""Pair state: the pair produced more candidates than :data:`TERRAIN_ROW_CANDIDATES` (``terrain_rows`` is raised)."""
+TERRAIN_PAIR_WIDE = wp.constant(64)
+"""Pair state: the window spans 64 cells or more, so feature ids may repeat within it (rows are still emitted)."""
+TERRAIN_PAIR_FULL = wp.constant(128)
+"""Pair state, transient: the finish may drop some of the pair's distinct rows, and the pair awaits its type's full
+finish kernel."""
+TERRAIN_WINDOW_WIDE = 64
+"""Cells across a window from which feature ids are no longer unique."""
+TERRAIN_PLANE_CACHE = 4
+"""Cluster planes a window's cache holds (:class:`TerrainPlanes`)."""
+TERRAIN_CELL_WIDEN = 1.0e-3
+"""Widening of a footprint box's float32 cell coordinates [cells], so that rounding never drops a touched cell."""
+
 TerrainRowsVec3 = wp.types.matrix(shape=(TERRAIN_ROW_CANDIDATES, 3), dtype=wp.float32)
 TerrainRowsFloat = wp.types.vector(length=TERRAIN_ROW_CANDIDATES, dtype=wp.float32)
 TerrainRowsInt = wp.types.vector(length=TERRAIN_ROW_CANDIDATES, dtype=wp.int32)
 
 _CANDIDATES = wp.constant(TERRAIN_ROW_CANDIDATES)
+_CELL_WIDEN = wp.constant(TERRAIN_CELL_WIDEN)
+_TILE_SIDE = wp.constant(TERRAIN_TILE_CELLS)
 _EPS32 = wp.constant(TERRAIN_EPS32)
 _EPS_FACTOR = wp.constant(TERRAIN_EPS_FACTOR)
 _EPS_MIN_EXTENT = wp.constant(TERRAIN_EPS_MIN_EXTENT)
@@ -256,6 +286,93 @@ class TerrainRows:
     """Core distances ``n . (k - q)`` [m]."""
     feature: TerrainRowsInt
     """Feature ids (:func:`terrain_feature_id`)."""
+
+
+@wp.struct
+class TerrainPlanes:
+    """A window's cache of the planes of clusters of several triangles (see :func:`terrain_plane`).
+
+    Evaluating such a plane over the window's reference vertex takes about ten float64 operations, which some GPUs
+    run at 1/64 of the float32 rate; a window reads each cluster's plane many times (its faces, both sides of its
+    edges, the point-below test), so it evaluates it once. A cached plane has the bits of a fresh evaluation. The
+    :data:`TERRAIN_PLANE_CACHE` entries are named fields, not an indexed array, so that the cache can stay in
+    registers.
+    """
+
+    id0: int
+    """Cluster id (plane record index) of entry 0 (-1: empty)."""
+    id1: int
+    id2: int
+    id3: int
+    plane0: wp.vec4
+    """Entry 0: the unit upward normal and the plane's height over the window's reference vertex [m]."""
+    plane1: wp.vec4
+    plane2: wp.vec4
+    plane3: wp.vec4
+    next: int
+    """Entry the next miss replaces (round robin)."""
+
+
+@wp.struct
+class TerrainPairInputs:
+    """What the law's per-type kernels read of a pair besides the terrain: its shapes and the pipeline's pair policy.
+
+    Every per-type kernel takes ``(begin, slot_begin, inputs, data, out)``: it handles pairs ``begin + i`` of the
+    static pair table (:class:`~newton._src.geometry.terrain_contacts.TerrainPairTable`) and writes pair
+    ``begin + i``'s rows to slots ``slot_begin + i * K``, ``K`` its partner class's row limit.
+    """
+
+    pairs: wp.array[wp.vec2i]
+    """``(heightfield shape, partner shape)`` of every pair, in table order."""
+    shape_type: wp.array[wp.int32]
+    """Geometry type of every shape."""
+    shape_transform: wp.array[wp.transform]
+    """World transform of every shape (the collision pipeline's per-collide shape transforms)."""
+    shape_data: wp.array[wp.vec4]
+    """Per shape: scale ``xyz`` (sphere and capsule radius in ``x``, capsule half-height in ``y``) and margin ``w``."""
+    shape_gap: wp.array[float]
+    """Contact gap of every shape [m]."""
+    shape_heightfield_index: wp.array[wp.int32]
+    """Heightfield index of every heightfield shape."""
+    shape_body: wp.array[int]
+    """The broad phase's immovable-pair test: body of every shape (immobile shapes as static)."""
+    body_flags: wp.array[int]
+    """The broad phase's immovable-pair test: body flags (empty: dynamic and kinematic bodies are not told apart)."""
+    include_static_kinematic_pairs: int
+    """The broad phase's immovable-pair test: nonzero keeps pairs of two immovable shapes."""
+
+
+@wp.struct
+class TerrainLawRows:
+    """The rows the law's per-type kernels write: per pair a static range of slots, its row count and its state.
+
+    Rows are in the world frame: ``q`` on the terrain, ``n`` the unit normal from the terrain to the partner and
+    ``d = n . (k - q)`` the core distance, so that the partner's core point is ``q + d n``.
+    """
+
+    q: wp.array[wp.vec3]
+    """Terrain point of every slot [m]."""
+    n: wp.array[wp.vec3]
+    """Unit normal of every slot, from the terrain to the partner."""
+    d: wp.array[float]
+    """Core distance of every slot [m] (negative: the core point lies inside the solid)."""
+    feature: wp.array[wp.int32]
+    """Window-local feature id of every slot (:func:`terrain_feature_id`)."""
+    count: wp.array[wp.int32]
+    """Rows of every pair."""
+    state: wp.array[wp.int32]
+    """``TERRAIN_PAIR_*`` bits of every pair."""
+    status: wp.array[wp.int32]
+    """The narrow phase's sticky buffer status word (``terrain_rows``, ``terrain_stale``)."""
+    overflow: wp.array[wp.int32]
+    """Pairs whose rows (``[0]``) and candidates (``[1]``) overflowed, accumulated over collides."""
+    deferred: wp.array[wp.int32]
+    """Pairs a type's walks left to its full-finish kernel (:data:`TERRAIN_PAIR_FULL`): partner class ``c``'s list
+    starts at ``deferred_first[c]`` and holds ``deferred_count[c]`` pairs, appended in any order."""
+    deferred_first: wp.array[wp.int32]
+    """Per partner class: the start of its deferred list (its first pair in the table)."""
+    deferred_count: wp.array[wp.int32]
+    """Per partner class: the pairs in its deferred list (zeroed before every launch)."""
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -426,6 +543,62 @@ def terrain_cluster_plane(
     return n, terrain_window_vertex(data, window, a[0], a[1])
 
 
+@wp.func
+def terrain_planes() -> TerrainPlanes:
+    """Return an empty plane cache for a window."""
+    planes = TerrainPlanes()
+    planes.id0 = -1
+    planes.id1 = -1
+    planes.id2 = -1
+    planes.id3 = -1
+    return planes
+
+
+@wp.func
+def terrain_plane(
+    data: TerrainFeatureData, window: TerrainWindow, planes: TerrainPlanes, r: int, c: int, sub: int
+) -> tuple[TerrainPlanes, wp.vec3, wp.vec3]:
+    """Return :func:`terrain_cluster_plane` of a triangle, evaluating a cluster of several triangles once per window.
+
+    Returns the updated cache (:func:`terrain_planes`), the plane's unit upward normal and a point of it (window
+    frame). A triangle alone is evaluated afresh (float32 only); a cluster's plane is read from the cache when held,
+    with the bits of a fresh evaluation.
+    """
+    cluster = terrain_cluster(data, window.surface, r, c, sub)
+    if cluster >= 0:
+        held = wp.vec4(0.0)
+        found = bool(True)
+        if planes.id0 == cluster:
+            held = planes.plane0
+        elif planes.id1 == cluster:
+            held = planes.plane1
+        elif planes.id2 == cluster:
+            held = planes.plane2
+        elif planes.id3 == cluster:
+            held = planes.plane3
+        else:
+            found = False
+        if found:
+            return planes, wp.vec3(held[0], held[1], held[2]), wp.vec3(0.0, 0.0, held[3])
+    n, a = terrain_cluster_plane(data, window, r, c, sub)
+    if cluster >= 0:
+        entry = wp.vec4(n[0], n[1], n[2], a[2])
+        if planes.next == 0:
+            planes.id0 = cluster
+            planes.plane0 = entry
+        elif planes.next == 1:
+            planes.id1 = cluster
+            planes.plane1 = entry
+        elif planes.next == 2:
+            planes.id2 = cluster
+            planes.plane2 = entry
+        else:
+            planes.id3 = cluster
+            planes.plane3 = entry
+        planes.next = (planes.next + 1) % 4
+    return planes, n, a
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # canonical edge functions and closed predicates
 # ----------------------------------------------------------------------------------------------------------------
@@ -467,6 +640,13 @@ def terrain_beyond(value: float, band: float) -> bool:
 def terrain_rows_coincide(q_a: wp.vec3, n_a: wp.vec3, q_b: wp.vec3, n_b: wp.vec3, eps: float) -> bool:
     """Return whether two rows are one constraint: terrain points within ``4 eps``, normals within ``1e-3``."""
     return wp.length(q_a - q_b) <= _MERGE_SCALE * eps and wp.length(n_a - n_b) <= _MERGE_NORMAL
+
+
+@wp.func
+def terrain_rows_same_plane(q_a: wp.vec3, n_a: wp.vec3, q_b: wp.vec3, n_b: wp.vec3, eps: float) -> bool:
+    """Return whether row ``a`` lies in row ``b``'s plane (the finish's plane groups): normals within
+    :data:`TERRAIN_GROUP_NORMAL`, ``a``'s terrain point within ``4 eps`` of ``b``'s plane."""
+    return wp.length(n_a - n_b) <= _GROUP_NORMAL and wp.abs(wp.dot(n_b, q_a - q_b)) <= _MERGE_SCALE * eps
 
 
 @wp.func
@@ -526,22 +706,48 @@ def terrain_edge_sides(r: int, c: int, which: int) -> tuple[wp.vec2i, wp.vec2i, 
 
 
 @wp.func
+def terrain_edge_kind(data: TerrainFeatureData, surface: TerrainSurfaceInfo, r: int, c: int, which: int) -> int:
+    """Return :data:`TERRAIN_EDGE_BORDER` or :data:`TERRAIN_EDGE_FLAT` of edge ``which`` of vertex ``(r, c)``, else -1.
+
+    Decided from the cluster ids alone; a crease (-1) needs its first triangle's plane
+    (:func:`terrain_crease_class`).
+    """
+    _v0, _v1, ta, tb, _wa, _wb = terrain_edge_sides(r, c, which)
+    if not terrain_valid_cell(surface, ta[0], ta[1]) or not terrain_valid_cell(surface, tb[0], tb[1]):
+        return TERRAIN_EDGE_BORDER
+    if terrain_cluster(data, surface, ta[0], ta[1], ta[2]) == terrain_cluster(data, surface, tb[0], tb[1], tb[2]):
+        return TERRAIN_EDGE_FLAT
+    return -1
+
+
+@wp.func
+def terrain_crease_class(
+    data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, which: int, n: wp.vec3, a: wp.vec3
+) -> int:
+    """Return whether crease ``which`` of vertex ``(r, c)`` is concave or convex, given its first triangle's plane.
+
+    The far vertex of the second triangle above the first triangle's cluster plane (normal ``n`` through ``a``)
+    makes a valley (concave).
+    """
+    _v0, _v1, _ta, _tb, _wa, wb = terrain_edge_sides(r, c, which)
+    if wp.dot(n, terrain_window_vertex(data, window, wb[0], wb[1]) - a) > 0.0:
+        return TERRAIN_EDGE_CONCAVE
+    return TERRAIN_EDGE_CONVEX
+
+
+@wp.func
 def terrain_edge_class(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, which: int) -> int:
     """Return the class of edge ``which`` of vertex ``(r, c)``: flat inside one cluster, else convex or concave.
 
     The far vertex of the second triangle above the first triangle's cluster plane makes a valley (concave);
     two different clusters always meet at a crease, however small.
     """
-    _v0, _v1, ta, tb, _wa, wb = terrain_edge_sides(r, c, which)
-    surface = window.surface
-    if not terrain_valid_cell(surface, ta[0], ta[1]) or not terrain_valid_cell(surface, tb[0], tb[1]):
-        return TERRAIN_EDGE_BORDER
-    if terrain_cluster(data, surface, ta[0], ta[1], ta[2]) == terrain_cluster(data, surface, tb[0], tb[1], tb[2]):
-        return TERRAIN_EDGE_FLAT
+    kind = terrain_edge_kind(data, window.surface, r, c, which)
+    if kind >= 0:
+        return kind
+    _v0, _v1, ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
     n, a = terrain_cluster_plane(data, window, ta[0], ta[1], ta[2])
-    if wp.dot(n, terrain_window_vertex(data, window, wb[0], wb[1]) - a) > 0.0:
-        return TERRAIN_EDGE_CONCAVE
-    return TERRAIN_EDGE_CONVEX
+    return terrain_crease_class(data, window, r, c, which, n, a)
 
 
 @wp.func
@@ -756,6 +962,74 @@ def terrain_point_below(data: TerrainFeatureData, window: TerrainWindow, k: wp.v
         return False
     n, a = terrain_cluster_plane(data, window, t[0], t[1], t[2])
     return k[2] < a[2] - (n[0] * (k[0] - a[0]) + n[1] * (k[1] - a[1])) / n[2]
+
+
+@wp.func
+def terrain_point_below_cached(
+    data: TerrainFeatureData, window: TerrainWindow, planes: TerrainPlanes, k: wp.vec3
+) -> tuple[TerrainPlanes, bool]:
+    """Return :func:`terrain_point_below` through a window's plane cache (and the updated cache)."""
+    t = terrain_locate(window, k[0], k[1])
+    if t[0] < 0:
+        return planes, False
+    planes, n, a = terrain_plane(data, window, planes, t[0], t[1], t[2])
+    return planes, k[2] < a[2] - (n[0] * (k[0] - a[0]) + n[1] * (k[1] - a[1])) / n[2]
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# per-pair window
+# ----------------------------------------------------------------------------------------------------------------
+
+
+@wp.func
+def terrain_box_cells(surface: TerrainSurfaceInfo, x0: float, y0: float, x1: float, y1: float) -> wp.vec4i:
+    """Return the cells ``(r0, r1, c0, c1)`` a heightfield-local footprint box ``[x0, x1] x [y0, y1]`` touches.
+
+    Clamped to the grid; the box misses the heightfield when ``r1 < r0`` or ``c1 < c0``. The float32 cell
+    coordinates are widened by :data:`TERRAIN_CELL_WIDEN` cells, so that their rounding never drops a cell the box
+    touches (a box edge that close to a grid line may take one more row or column).
+    """
+    cols = float(surface.ncol - 1)
+    rows = float(surface.nrow - 1)
+    u0 = wp.clamp((x0 + surface.hx) / surface.dx - _CELL_WIDEN, -1.0, cols + 1.0)
+    u1 = wp.clamp((x1 + surface.hx) / surface.dx + _CELL_WIDEN, -1.0, cols + 1.0)
+    v0 = wp.clamp((y0 + surface.hy) / surface.dy - _CELL_WIDEN, -1.0, rows + 1.0)
+    v1 = wp.clamp((y1 + surface.hy) / surface.dy + _CELL_WIDEN, -1.0, rows + 1.0)
+    c0 = wp.max(int(wp.floor(u0)), 0)
+    c1 = wp.min(int(wp.floor(u1)), surface.ncol - 2)
+    r0 = wp.max(int(wp.floor(v0)), 0)
+    r1 = wp.min(int(wp.floor(v1)), surface.nrow - 2)
+    return wp.vec4i(r0, r1, c0, c1)
+
+
+@wp.func
+def terrain_tile_exit(
+    data: TerrainFeatureData, surface: TerrainSurfaceInfo, r0: int, r1: int, c0: int, c1: int, low: float
+) -> bool:
+    """Return whether every height under cells ``[r0, r1] x [c0, c1]`` lies below ``low`` [m, heightfield-local].
+
+    Reads the tile-max mip blocks under the cells (:func:`terrain_tile_bound`). With ``low`` a core's lowest point
+    minus its reach, the pair has no row: every terrain point under its window is farther than the reach.
+    """
+    for tr in range(r0 // _TILE_SIDE, r1 // _TILE_SIDE + 1):
+        for tc in range(c0 // _TILE_SIDE, c1 // _TILE_SIDE + 1):
+            if terrain_tile_bound(data, surface, tr, tc) >= low:
+                return False
+    return True
+
+
+@wp.func
+def terrain_window_extent(data: TerrainFeatureData, window: TerrainWindow, r1: int, c1: int, extent: float) -> float:
+    """Return the largest coordinate magnitude of a window's frame: ``extent`` (the core's), its size, its heights.
+
+    The window spans cells ``[window.r0, r1] x [window.c0, c1]``; the result is what :func:`terrain_eps` takes.
+    """
+    surface = window.surface
+    extent = wp.max(extent, wp.max(float(c1 + 1 - window.c0) * surface.dx, float(r1 + 1 - window.r0) * surface.dy))
+    for r in range(window.r0, r1 + 2):
+        for c in range(window.c0, c1 + 2):
+            extent = wp.max(extent, wp.abs(terrain_height(data, surface, r, c) - window.z_ref))
+    return extent
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -979,10 +1253,7 @@ def terrain_finish(rows: TerrainRows, eps: float, row_limit: int) -> tuple[Terra
         group[i] = i
         for j in range(i):
             if alive[j] != 0 and group[j] == j:
-                nj = terrain_row_n(rows, j)
-                if wp.length(ni - nj) <= _GROUP_NORMAL and wp.abs(wp.dot(nj, qi - terrain_row_q(rows, j))) <= (
-                    _MERGE_SCALE * eps
-                ):
+                if terrain_rows_same_plane(qi, ni, terrain_row_q(rows, j), terrain_row_n(rows, j), eps):
                     group[i] = j
                     break
     # 3. implied rows, the shallowest first, one at a time
@@ -1136,3 +1407,40 @@ def terrain_finish(rows: TerrainRows, eps: float, row_limit: int) -> tuple[Terra
             order[kept] = i
             kept += 1
     return order, kept, flags
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# per-pair output
+# ----------------------------------------------------------------------------------------------------------------
+
+
+@wp.func
+def terrain_store_row(
+    out: TerrainLawRows,
+    slot: int,
+    q: wp.vec3,
+    n: wp.vec3,
+    d: float,
+    feature: int,
+    window: TerrainWindow,
+    frame: wp.transform,
+):
+    """Write one kept row (window frame) to a slot, in the world frame.
+
+    ``frame`` is the heightfield's world transform; the terrain point leaves the window frame rounded once.
+    """
+    out.q[slot] = wp.transform_point(frame, terrain_window_to_local(window, q))
+    out.n[slot] = wp.transform_vector(frame, n)
+    out.d[slot] = d
+    out.feature[slot] = feature
+
+
+@wp.func
+def terrain_finish_state(flags: int) -> int:
+    """Return the ``TERRAIN_PAIR_*`` bits of a pair's finish flags."""
+    state = int(0)
+    if (flags & TERRAIN_FINISH_ROW_OVERFLOW) != 0:
+        state = state | TERRAIN_PAIR_ROW_OVERFLOW
+    if (flags & TERRAIN_FINISH_CANDIDATE_OVERFLOW) != 0:
+        state = state | TERRAIN_PAIR_CANDIDATE_OVERFLOW
+    return state
