@@ -759,21 +759,22 @@ class TestContactUpdateReplica(unittest.TestCase):
                     self.assertLess(np.abs(lam - system["lam_ref"]).max(), 1.0e-5 * np.abs(system["lam_ref"]).max())
 
     def test_reference_is_a_fixed_point_of_the_unit_sweep(self):
-        """Keep every certified reference in one unit sweep, to 1e-5 of its largest impulse, with point units.
+        """Keep every certified reference in one unit sweep, to 1e-5 of its largest impulse, in both ring forms.
 
         Every solution of the whole problem solves each unit's problem, so the unit returns the impulses it holds where
         that problem has several solutions: sliding contacts whose friction presses their normal down (kappa 1.03 to
-        1.46) also admit take-off or a stick, and a branch order of take-off, stick, slide left 6 of the 12 point and 5
+        1.46) also admit take-off or a stick, and a branch order of take-off, stick, slide left 6 of the 12 point and 7
         of the 14 patch references here. The slide roots of these contacts, which a negative ``S0 = -b_n / W_nn``
         puts outside the bracket of a positive one, and roots the evaluation cap stops short from scratch, are resumed
-        from the held friction. Patch regions run as anchor units (patch Stage A), point solves with their ring's
-        other load held.
+        from the held friction; a ring's coinciding normals (patch 2549, whose velocities agree to 8e-6 m/s) keep
+        their split, and a ring's anchors restart from their held friction after a wrong first basis (patch 1781).
+        Patch rings also run as anchor units (patch Stage A).
         """
         for law in self.systems:
             tight = self.tight(law)
             world = World(tight)
             start = [s["lam_ref"] for s in tight]
-            for ring_units in (0,) if law == "patch" else (1,):
+            for ring_units in (1, 0) if law == "patch" else (1,):
                 after = world.sweep(1, "unit", start=start, ring_units=ring_units)
                 for system, lam in zip(tight, after, strict=True):
                     with self.subTest(law=law, ring_units=ring_units, system=system["source"]):
@@ -1060,15 +1061,32 @@ class TestContactUpdateCuda(unittest.TestCase):
         whether a unit took another branch at a near-tie on one device.
         """
         systems = replica_systems("point") + replica_systems("patch")
-        for snapshots in (False, True):
-            cpu = World(systems).sweep(8, "unit", snapshots=snapshots)
-            cuda = World(systems, device="cuda:0").sweep(8, "unit", snapshots=snapshots)
+        references = [s["lam_ref"] for s in systems]
+        for snapshots, start in ((False, None), (True, None), (False, references)):
+            cpu = World(systems).sweep(8, "unit", snapshots=snapshots, start=start)
+            cuda = World(systems, device="cuda:0").sweep(8, "unit", snapshots=snapshots, start=start)
             if snapshots:
                 cpu, cuda = [history[-1] for history in cpu], [history[-1] for history in cuda]
             for system, on_cpu, on_cuda in zip(systems, cpu, cuda, strict=True):
-                with self.subTest(system=system["source"], snapshots=snapshots):
+                with self.subTest(system=system["source"], snapshots=snapshots, reference=start is not None):
                     difference = system["C"] @ (on_cuda - on_cpu)
                     self.assertLessEqual(np.abs(difference).max(), 1.0e-5 * np.abs(system["rhs"]).max())
+
+    def test_cuda_reference_is_a_fixed_point_of_the_unit_sweep(self):
+        """Keep every certified reference in one CUDA unit loop sweep, to 1e-5 of its largest impulse.
+
+        The CUDA twin of test_reference_is_a_fixed_point_of_the_unit_sweep, in both ring forms; the CPU sweep moves
+        none of them by more than 8.4e-6 (patch 2549, which corrects its own 7.8e-6 m/s residual).
+        """
+        for law in ("point", "patch"):
+            tight = [s for s in replica_systems(law) if residuals(s, s["lam_ref"])[0].max() <= 1.0e-5]
+            world = World(tight, device="cuda:0")
+            for ring_units in (1, 0) if law == "patch" else (1,):
+                after = world.sweep(1, "unit", start=[s["lam_ref"] for s in tight], ring_units=ring_units)
+                for system, lam in zip(tight, after, strict=True):
+                    with self.subTest(law=law, ring_units=ring_units, system=system["source"]):
+                        reference = system["lam_ref"]
+                        self.assertLess(np.abs(lam - reference).max(), 1.0e-5 * np.abs(reference).max())
 
     def test_cuda_audit_block_holds_in_the_loop_sweep(self):
         """Hold the audit block's exact load with the CUDA unit loop sweep at 8 and 9 sweeps, in each ring form."""

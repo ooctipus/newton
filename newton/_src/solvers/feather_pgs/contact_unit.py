@@ -45,7 +45,12 @@ clamped to the disk of the final load, so the result is exactly feasible.
 A ring unit solves its normals by an active set over their proximally
 regularized block, from its loaded members, then each anchor by the point
 routine on the friction Schur complement from its current friction (two
-alternations for two anchors). The alternation latch relaxes a unit whose load change keeps reversing, which
+alternations for two anchors); a basis that loses a member restarts the anchors
+from their current friction. A member that depends on the basis and whose
+velocity agrees with the basis members' to within ``1e-5`` of the ring's
+velocity scale holds its load: the velocities do not fix the split among such
+members, which the proximal step would move by their residuals over its weight.
+The alternation latch relaxes a unit whose load change keeps reversing, which
 every fixed point of the exact sweep survives: a unit whose exact solution
 equals its impulses does not move for any relaxation factor.
 
@@ -465,6 +470,9 @@ _UNIT = Template(r"""
             float GS[4];
             float F[4];
             float XB[8];
+            float EX[8];
+            float RV[8];
+            float ZR[8];
             int evaluations = 0;
             // Proximal term on the normals: W_NN + eps D and b_N - eps D old, the same fixed point.
             float eps = 0.0f;
@@ -495,9 +503,15 @@ _UNIT = Template(r"""
                 act[best] = 1;
             }
             for (int f = 0; f < nF; ++f) F[f] = old[k + f];
-            // The ring's current load, on whose disks its anchors' current friction lies.
+            // The ring's current load, on whose disks its anchors' current friction lies, and its normals' current
+            // velocities.
             float held = 0.0f;
-            for (int i = 0; i < k; ++i) held += old[i];
+            for (int i = 0; i < k; ++i) {
+                held += old[i];
+                float v = b[i];
+                for (int c = 0; c < nu; ++c) v += W[i * nu + c] * old[c];
+                RV[i] = v;
+            }
             float vscale = 1.0e-4f;
             for (int i = 0; i < k; ++i) vscale = ${max}(vscale, ${abs}(B[i]));
             for (int outer = 0; outer < 3 * 8 + 3; ++outer) {
@@ -528,9 +542,22 @@ _UNIT = Template(r"""
                         LC[na * 8 + j] = v;
                         piv -= v * v;
                     }
+                    // A normal that depends on the basis and whose current velocity agrees with the basis normals' to
+                    // within 1e-5 of the ring's velocity scale holds its load: the velocities do not fix the split
+                    // among such normals, which a proximal step would move by the rounding of their residuals over
+                    // eps. Its weight stands in for the proximal term, so the fixed point is the same.
+                    float lag = RV[best];
+                    for (int j = 0; j < na; ++j) lag -= LC[na * 8 + j] * ZR[j];
+                    float extra = 0.0f;
+                    if (piv < 1.0e-3f * W[best * nu + best] && ${abs}(lag) <= 1.0e-5f * vscale) {
+                        extra = 1.0e6f * W[best * nu + best];
+                    }
+                    piv += extra;
                     if (piv > 1.0e-7f * W[best * nu + best]) {
                         LC[na * 8 + na] = ${sqrt}(piv);
+                        ZR[na] = lag / LC[na * 8 + na];
                         bas[na] = best;
+                        EX[na] = extra;
                         na += 1;
                     } else {
                         act[best] = -1;
@@ -552,7 +579,7 @@ _UNIT = Template(r"""
                     continue;
                 }
                 // y = K b_B, z = K 1 and XM = K W_BF with K the inverse of the basis block.
-                for (int j = 0; j < na; ++j) TMP[j] = B[bas[j]];
+                for (int j = 0; j < na; ++j) TMP[j] = B[bas[j]] - EX[j] * old[bas[j]];
                 cholesky_solve(LC, na, TMP, Y);
                 for (int j = 0; j < na; ++j) TMP[j] = 1.0f;
                 cholesky_solve(LC, na, TMP, Z);
@@ -627,7 +654,10 @@ _UNIT = Template(r"""
                 for (int j = 0; j < na; ++j) x[bas[j]] = ${max}(XB[j], 0.0f);
                 for (int f = 0; f < nF; ++f) x[k + f] = F[f];
                 if (neg >= 0) {
+                    // A basis that loses a normal was wrong: the next one solves its anchors from their current
+                    // friction, which a solution keeps.
                     act[bas[neg]] = -1;
+                    for (int f = 0; f < nF; ++f) F[f] = old[k + f];
                     continue;
                 }
                 // An inactive normal must not approach.

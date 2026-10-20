@@ -659,6 +659,29 @@ class TestContactUnitRing(unittest.TestCase):
         x = solve_ring(W, np.array([0.1, 0.2, 1.0, -1.0]), np.zeros(4), 2, 1, 0.5, visits=1)
         np.testing.assert_array_equal(x, 0.0)
 
+    def test_coinciding_normals_keep_a_split_their_velocities_leave_open(self):
+        """Keep the split of two coinciding normals whose velocities agree to rounding; move one they decide.
+
+        Two contacts at one corner share a normal row, so the velocities fix only their total load. A split whose two
+        velocities agree to within 1e-5 of the ring's velocity scale stays as it is, where the proximal step alone
+        would move it by their difference over its weight eps = 1e-4 (2% of the load here). Where the velocities
+        differ beyond that, the normal that approaches faster takes the load over.
+        """
+        W = box_face([(0.1, 0.05), (0.1, 0.05)], anchors=(0,)) + 1.0e-6 * np.eye(4)
+        for gap, kept in ((2.0e-7, True), (1.0e-3, False)):
+            b = np.array([-0.05, -0.05 + gap, 0.002, -0.001])
+            total = exact_contact(W[np.ix_([0, 2, 3], [0, 2, 3])], b[[0, 2, 3]], 0.5)
+            old = np.array([0.6 * total[0], 0.4 * total[0], total[1], total[2]])
+            with self.subTest(gap=gap):
+                # One visit leaves the proximal residual (test_one_visit_keeps_the_proximal_residual_only).
+                x = solve_ring(W, b, old, 2, 1, 0.5, visits=1)
+                ring_check(self, W, b, x, 2, 1, (0.5,), tolerance=1.0e-3)
+                self.assertAlmostEqual(x[:2].sum(), total[0], delta=1.0e-4 * total[0])
+                if kept:
+                    np.testing.assert_allclose(x, old, atol=1.0e-6 * total[0])
+                else:
+                    self.assertLess(x[1], 0.5 * old[1])
+
     def test_one_visit_keeps_the_proximal_residual_only(self):
         """Leave a normal's velocity at -eps W_ii (x_i - old_i) after one visit: the proximal term, no other error."""
         corners = [(-0.1, -0.05), (0.1, -0.05), (0.0, 0.05)]
