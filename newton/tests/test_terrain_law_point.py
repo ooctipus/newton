@@ -57,7 +57,7 @@ from newton._src.geometry.terrain_law import (
     terrain_window_vertex,
 )
 from newton._src.geometry.terrain_shadow import (
-    TERRAIN_LAW_FULL_THREADS,
+    TERRAIN_LAW_FULL_BLOCKS,
     TerrainPairWork,
     terrain_finish_scratch,
     terrain_law_block_dim,
@@ -661,12 +661,18 @@ def _launch_segment(shadow, model, pipeline, lane, begin, count, out, *, kernel=
     _launch_full(shadow, model, pipeline, begin, out)
 
 
-def _launch_full(shadow, model, pipeline, begin, out, threads=TERRAIN_LAW_FULL_THREADS):
-    """Run the full-finish kernel, with ``threads`` threads, over the pairs of ``out``'s deferred list
+def _launch_full(shadow, model, pipeline, begin, out, blocks=TERRAIN_LAW_FULL_BLOCKS):
+    """Run the full-finish kernel, with ``blocks`` blocks, over the pairs of ``out``'s deferred list
     (``deferred_count``) from table pair ``begin``."""
-    scratch = terrain_finish_scratch(model.device, threads)
+    scratch = terrain_finish_scratch(model.device, blocks)
     args = [begin, 0, _pair_inputs(shadow, model, pipeline), shadow.features.data(), out, scratch]
-    wp.launch(terrain_law_point.terrain_point_rows_full, dim=threads, inputs=args, device=model.device)
+    wp.launch_tiled(
+        terrain_law_point.terrain_point_rows_full,
+        dim=blocks,
+        inputs=args,
+        block_dim=terrain_law_block_dim(model.device),
+        device=model.device,
+    )
 
 
 def _side_buffer(begin, count, pair_count, device):
@@ -994,8 +1000,8 @@ def test_rejects_keep_the_plain_walk_rows(test, device):
     pair the same way. On rough, pitted, stepped, seam-adversarial, buried and ridge scenes the count, state, q, n, d
     and feature of every pair agree bit for bit; so do those of the full-finish kernel (which walks with the drop and
     runs the finish) run on every walked pair, which also checks that the walks write a pair's rows as the finish keeps
-    them. The full-finish kernel runs with fewer threads than deferred pairs, as its fixed grid does when many pairs
-    are deferred: each thread finishes several pairs in turn, through the same scratch.
+    them. The full-finish kernel runs with fewer blocks than deferred pairs, as its fixed grid does when many pairs
+    are deferred: each block finishes several pairs in turn, through the same scratch.
     """
     walked = 0
     for name, model, bodies in _reject_scenes(device):
@@ -1011,11 +1017,11 @@ def test_rejects_keep_the_plain_walk_rows(test, device):
                 out = _side_buffer(begin, count, shadow.table.pair_count, device)
                 _launch_segment(shadow, model, pipeline, TERRAIN_LANE_THREAD, begin, count, out, kernel=kernel)
                 results[label] = out
-            # The full-finish kernel on every pair, seven threads taking the pairs in turn.
+            # The full-finish kernel on every pair, seven blocks taking the pairs in turn.
             full = _side_buffer(begin, count, shadow.table.pair_count, device)
             full.deferred.assign(np.arange(shadow.table.pair_count, dtype=np.int32))
             full.deferred_count.assign(np.full(4, count, np.int32))
-            _launch_full(shadow, model, pipeline, begin, full, threads=7)
+            _launch_full(shadow, model, pipeline, begin, full, blocks=7)
             kernel = {f: getattr(results["kernel"], f).numpy() for f in ("count", "state", "q", "n", "d", "feature")}
             plain = {f: getattr(results["plain"], f).numpy() for f in ("count", "state", "q", "n", "d", "feature")}
             finished = {f: getattr(full, f).numpy() for f in ("count", "state", "q", "n", "d", "feature")}
@@ -1160,7 +1166,7 @@ class TestTerrainLawPoint(unittest.TestCase):
         hold (about 289,000 on a 188-SM GPU), launched or not. The kernel's candidate list and the finish's input live
         in global scratch (:class:`~newton._src.geometry.terrain_shadow.TerrainFinishScratch`), and its walk and close
         read rows there, not from copies of the list on the stack: the depot was 8,584 bytes before (10,088 bytes of
-        sm_120 stack, measured at +2.5 GB of device memory) and is 4,352 now; what remains is the finish's own.
+        sm_120 stack, measured at +2.5 GB of device memory) and under 4.5 KB since; what remains is the finish's own.
         """
         ptx = _point_ptx()
         if ptx is None:

@@ -77,8 +77,9 @@ TERRAIN_LAW_BLOCK = 32
 TERRAIN_LAW_TILE_BLOCKS = 2048
 """Blocks of a tiled launch at most, whatever the class's size: one per queued pair up to this many (about one
 resident wave of one-warp blocks on a 188-SM GPU), more queued pairs taking turns."""
-TERRAIN_LAW_FULL_THREADS = 256
-"""Threads of a full-finish launch, whatever the class's size: they stride over its deferred list."""
+TERRAIN_LAW_FULL_BLOCKS = 64
+"""Blocks of a full-finish launch (:data:`TERRAIN_LAW_BLOCK` lanes each), whatever the class's size: they take the
+class's deferred pairs in turn."""
 
 
 @wp.struct
@@ -122,16 +123,16 @@ def terrain_law_block_dim(device) -> int:
 
 @wp.struct
 class TerrainFinishScratch:
-    """Global scratch of a full-finish launch: per thread, the candidate rows of the pair it finishes.
+    """Global scratch of a full-finish launch: per block, the candidate rows of the pair it finishes.
 
-    Thread ``t`` holds candidate ``j`` at ``t * TERRAIN_ROW_CANDIDATES + j`` of ``q``, ``k``, ``n``, ``d`` and
+    Block ``b`` holds candidate ``j`` at ``b * TERRAIN_ROW_CANDIDATES + j`` of ``q``, ``k``, ``n``, ``d`` and
     ``feature`` (window frame; the fields of :class:`~newton._src.geometry.terrain_law.TerrainRows`) and the finish's
-    input at ``rows[t]``, off the per-thread stack: the largest stack a context launches sets the driver's
+    input at ``rows[b]``, off the per-thread stack: the largest stack a context launches sets the driver's
     local-memory reservation for every thread the device can hold.
     """
 
-    threads: int
-    """Threads of the launch: its grid stride over the deferred list."""
+    blocks: int
+    """Blocks of the launch: its grid stride over the deferred list."""
     q: wp.array[wp.vec3]
     """Terrain point of every candidate [m]."""
     k: wp.array[wp.vec3]
@@ -146,17 +147,17 @@ class TerrainFinishScratch:
     """Per thread, the finish's input (:func:`~newton._src.geometry.terrain_law.terrain_finish`)."""
 
 
-def terrain_finish_scratch(device, threads: int = TERRAIN_LAW_FULL_THREADS) -> TerrainFinishScratch:
-    """Allocate the :class:`TerrainFinishScratch` of a full-finish launch of ``threads`` threads."""
+def terrain_finish_scratch(device, blocks: int = TERRAIN_LAW_FULL_BLOCKS) -> TerrainFinishScratch:
+    """Allocate the :class:`TerrainFinishScratch` of a full-finish launch of ``blocks`` blocks."""
     scratch = TerrainFinishScratch()
-    scratch.threads = threads
-    candidates = threads * TERRAIN_ROW_CANDIDATES
+    scratch.blocks = blocks
+    candidates = blocks * TERRAIN_ROW_CANDIDATES
     scratch.q = wp.zeros(candidates, dtype=wp.vec3, device=device)
     scratch.k = wp.zeros(candidates, dtype=wp.vec3, device=device)
     scratch.n = wp.zeros(candidates, dtype=wp.vec3, device=device)
     scratch.d = wp.zeros(candidates, dtype=wp.float32, device=device)
     scratch.feature = wp.zeros(candidates, dtype=wp.int32, device=device)
-    scratch.rows = wp.zeros(threads, dtype=TerrainRows, device=device)
+    scratch.rows = wp.zeros(blocks, dtype=TerrainRows, device=device)
     return scratch
 
 
@@ -182,9 +183,9 @@ The module is imported only when the class is listed. The one-thread kernel runs
 and the tiled one over the queued pairs of its tiled segment, each with the class's :class:`TerrainPairWork` as
 sixth argument (``begin`` and ``slot_begin`` are the class's first pair and slot for the one-thread kernel, the
 tiled segment's for the tiled one). The full-finish kernel, when the class has one, runs after them and finishes the
-pairs they marked :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_FULL`: with :data:`TERRAIN_LAW_FULL_THREADS`
-threads whatever the class's size, striding over its deferred list, and a :class:`TerrainFinishScratch` as sixth
-argument (``begin`` and ``slot_begin`` are the class's), so that an empty list costs one near-empty launch.
+pairs they marked :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_FULL`: ``wp.launch_tiled`` with
+:data:`TERRAIN_LAW_FULL_BLOCKS` blocks of :data:`TERRAIN_LAW_BLOCK` lanes whatever the class's size, striding over its
+deferred list, and a :class:`TerrainFinishScratch` as sixth argument (``begin`` and ``slot_begin`` are the class's), so that an empty list costs one near-empty launch.
 
 A class's module and kernels follow one protocol (the helpers live in :mod:`~newton._src.geometry.terrain_law`):
 
@@ -310,7 +311,7 @@ class TerrainLawShadow:
             if full_name is not None:
                 # A fixed grid over the class's deferred list (the pairs are found on the device, in any order).
                 scratch = terrain_finish_scratch(device)
-                self._launches.append(("full", getattr(module, full_name), scratch.threads, begin, slot, scratch))
+                self._launches.append(("full", getattr(module, full_name), scratch.blocks, begin, slot, scratch))
             slot += rows * (end - begin)
         self.slot_count = slot
         """Row slots of the side buffer: every listed pair times its class's row limit."""
@@ -383,10 +384,10 @@ class TerrainLawShadow:
         block = terrain_law_block_dim(self.device)
         for kind, kernel, dim, begin, slot, extra in self._launches:
             args = [begin, slot, inputs, data, self._out, extra]
-            if kind == "tiled":
-                wp.launch_tiled(kernel, dim=dim, inputs=args, block_dim=block, device=self.device, record_tape=False)
-            else:
+            if kind == "thread":
                 wp.launch(kernel, dim=dim, inputs=args, device=self.device, record_tape=False)
+            else:
+                wp.launch_tiled(kernel, dim=dim, inputs=args, block_dim=block, device=self.device, record_tape=False)
 
     # ---- host reads --------------------------------------------------------------------------------------------
     def rows(self) -> dict[str, np.ndarray]:

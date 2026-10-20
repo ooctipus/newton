@@ -32,7 +32,7 @@ from newton._src.geometry.terrain_law import (
 )
 from newton._src.geometry.terrain_law_point import TERRAIN_POINT_ROWS
 from newton._src.geometry.terrain_shadow import (
-    TERRAIN_LAW_FULL_THREADS,
+    TERRAIN_LAW_FULL_BLOCKS,
     TERRAIN_LAW_KERNELS,
     TERRAIN_LAW_TILE_BLOCKS,
     parse_terrain_law_shadow,
@@ -406,25 +406,25 @@ class TestTerrainLawShadow(unittest.TestCase):
     def test_full_finish_launch_is_a_fixed_grid_cpu(self):
         """Launch the full-finish kernel with a fixed grid whatever the class's size, striding over the deferred list.
 
-        The deferred pairs are found on the device, during the collide; a grid of ``TERRAIN_LAW_FULL_THREADS`` threads
-        with its global scratch takes them in turn, so that a collide with nothing deferred costs one near-empty
+        The deferred pairs are found on the device, during the collide; ``TERRAIN_LAW_FULL_BLOCKS`` blocks of lanes
+        with their global scratch take them in turn, so that a collide with nothing deferred costs one near-empty
         launch instead of one thread per pair of the class (each of which, before, initialized the finish's locals).
         """
         model, _terrain = _mixed_scene("cpu")
         pipeline = tu.shadow_pipeline(model, **PIPELINE)
         shadow = pipeline._terrain_law_shadow
-        dims = []
-        launch = wp.launch
+        launches = []
+        launch_tiled = wp.launch_tiled
 
         def record(kernel, *args, **kwargs):
             if kernel is terrain_law_point.terrain_point_rows_full:
-                dims.append(kwargs["dim"])
-            return launch(kernel, *args, **kwargs)
+                launches.append((kwargs["dim"], kwargs["block_dim"]))
+            return launch_tiled(kernel, *args, **kwargs)
 
-        with patch.object(wp, "launch", record):
+        with patch.object(wp, "launch_tiled", record):
             _contacts(pipeline, model)
-        self.assertEqual(dims, [TERRAIN_LAW_FULL_THREADS])
-        self.assertLess(sum(shadow.describe()["pairs"]["point"].values()), TERRAIN_LAW_FULL_THREADS)
+        self.assertEqual(launches, [(TERRAIN_LAW_FULL_BLOCKS, terrain_law_block_dim("cpu"))])
+        self.assertNotEqual(sum(shadow.describe()["pairs"]["point"].values()), TERRAIN_LAW_FULL_BLOCKS)
         self.assertGreater(shadow.describe()["bytes"]["finish_scratch"], 0)
 
     def test_route_record_cpu(self):
