@@ -17,9 +17,13 @@ import warp as wp
 import newton
 from newton._src.geometry.terrain_contacts import TerrainFeatures
 from newton._src.geometry.terrain_law import (
+    TERRAIN_CELL_WIDEN,
     TERRAIN_EDGE_BORDER,
     TERRAIN_EDGE_CONCAVE,
     TERRAIN_EDGE_FLAT,
+    TERRAIN_EPS32,
+    TERRAIN_EPS_FACTOR,
+    TERRAIN_EPS_MIN_EXTENT,
     TERRAIN_FEATURE_EDGE,
     TERRAIN_FEATURE_FACE,
     TERRAIN_FEATURE_VERTEX,
@@ -500,6 +504,31 @@ def missing_rows(expected, got, *, q_tol: float, angle_tol: float, d_tol: float 
 
 DECISION_BAND = 2.0e-6
 """Margin [m] within which a float32 boundary decision may differ from the float64 one (two bands of a 1 m window)."""
+
+
+def kernel_band(hf: ref.ReferenceHeightfield, core, reach: float) -> float:
+    """The closed-predicate band [m] the float32 kernels use for a pair's window (heightfield-local core).
+
+    The window of ``terrain_box_cells`` (the core's ends widened by ``reach``, cell coordinates widened by
+    ``TERRAIN_CELL_WIDEN``) and the extent of ``terrain_window_extent``: the core's ends in the window frame, the
+    window's size and its heights about its reference vertex. Four of these bands are the float32 finish's plane-group
+    offset, which a float64 comparison passes to :func:`terrain_law_reference.finish` (``group_offset``).
+    """
+    ends = [core.a, core.b] if hasattr(core, "a") else [core.c]
+    lo = np.min(ends, axis=0) - reach
+    hi = np.max(ends, axis=0) + reach
+    c0 = max(int(np.floor((lo[0] + hf.hx) / hf.dx - TERRAIN_CELL_WIDEN)), 0)
+    c1 = min(int(np.floor((hi[0] + hf.hx) / hf.dx + TERRAIN_CELL_WIDEN)), hf.cols - 1)
+    r0 = max(int(np.floor((lo[1] + hf.hy) / hf.dy - TERRAIN_CELL_WIDEN)), 0)
+    r1 = min(int(np.floor((hi[1] + hf.hy) / hf.dy + TERRAIN_CELL_WIDEN)), hf.rows - 1)
+    origin = hf.V(r0, c0)
+    extent = max(
+        (c1 + 1 - c0) * hf.dx,
+        (r1 + 1 - r0) * hf.dy,
+        float(np.abs(hf.Z[r0 : r1 + 2, c0 : c1 + 2] - origin[2]).max()),
+        *(float(np.abs(np.asarray(p) - origin).max()) for p in ends),
+    )
+    return TERRAIN_EPS_FACTOR * TERRAIN_EPS32 * max(extent, TERRAIN_EPS_MIN_EXTENT)
 
 
 def _seam_edges(hf: ref.ReferenceHeightfield, q, tol: float) -> list:

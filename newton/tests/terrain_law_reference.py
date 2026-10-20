@@ -1918,10 +1918,20 @@ def anticipate(hf, core, D, window, motion, *, stats=None):
     return out
 
 
-def pair_rows(hf: ReferenceHeightfield, core: Core, D: float, *, stats=None, motion=None, implied="lower_hull"):
+def pair_rows(
+    hf: ReferenceHeightfield,
+    core: Core,
+    D: float,
+    *,
+    stats=None,
+    motion=None,
+    implied="lower_hull",
+    group_offset=GROUP_OFFSET,
+):
     """The law's rows of one pair. ``D``: reach on the core distance (rounding radius + margins + gaps).
 
-    ``motion`` optionally maps a core point to its predicted displacement over the collision interval (rule C).
+    ``motion`` optionally maps a core point to its predicted displacement over the collision interval (rule C);
+    ``group_offset`` is the finish's (:func:`finish`; a comparison with the float32 kernels passes their four bands).
     """
     lo, hi = core.aabb()
     box = hf.cells_in_box(lo[:2] - D, hi[:2] + D)
@@ -1942,4 +1952,4 @@ def pair_rows(hf: ReferenceHeightfield, core: Core, D: float, *, stats=None, mot
             raw = _solid_recovery(hf, core)
     if motion is not None:
         raw = raw + anticipate(hf, core, D, window, motion, stats=stats)
-    return finish(raw, stats=stats, implied=implied)
+    return finish(raw, stats=stats, implied=implied, group_offset=group_offset)

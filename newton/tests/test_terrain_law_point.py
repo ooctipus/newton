@@ -175,11 +175,18 @@ def _placements(rng, hf, count):
     return bodies
 
 
+def _law_rows(hf, kind, dims, pose):
+    """The float64 law's rows of a pair, its plane groups at the float32 finish's offset (four kernel bands)."""
+    core = ref.make_core(kind, dims, pose)
+    reach = dims["radius"] + REACH
+    return ref.pair_rows(hf, core, reach, group_offset=4.0 * tu.kernel_band(hf, core, reach))
+
+
 def _incomplete(hf, rows, shapes, bodies) -> list[str]:
     """The float64 law's supports that no row has (terrain point within 0.1 mm, normal within 1 deg)."""
     violations = []
     for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
-        law = ref.pair_rows(hf, ref.make_core(kind, dims, pose), dims["radius"] + REACH)
+        law = _law_rows(hf, kind, dims, pose)
         missing = tu.missing_rows(law, rows.get(shape, []), q_tol=1.0e-4, angle_tol=np.radians(1.0))
         violations.extend(f"{kind} at {np.round(pose[:3], 4).tolist()}: {row}" for row in missing)
     return violations
@@ -271,7 +278,7 @@ def test_point_rows_match_the_float64_law(test, device):
             totals = {"f64": 0, "tolerated": 0}
             defects = []
             for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
-                law = ref.pair_rows(hf, ref.make_core(kind, dims, pose), dims["radius"] + REACH)
+                law = _law_rows(hf, kind, dims, pose)
                 got = rows.get(shape, [])
                 frame_tol = 1.0e-5 + 2.0e-7 * float(np.abs(pose[:2]).max())
                 missing, extra, tolerated, deepest = tu.compare_rows(hf, law, got, frame_tol=frame_tol)
@@ -336,7 +343,7 @@ def test_buried_cores_exit_by_the_minimum_translation(test, device):
                     continue
                 test.assertEqual(len(got), 1, msg=f"sphere at {pose[:3].tolist()}: {got}")
                 exact, _closest = _surface_distance(hf, pose[:3], dims["radius"] + REACH)
-                law = ref.pair_rows(hf, ref.make_core(kind, dims, pose), dims["radius"] + REACH)
+                law = _law_rows(hf, kind, dims, pose)
                 test.assertEqual(len(law), 1)
                 test.assertAlmostEqual(got[0][2], law[0].d, delta=1.0e-5)
                 if exact < dims["radius"] + REACH - 0.05:

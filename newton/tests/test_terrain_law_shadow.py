@@ -214,7 +214,8 @@ def test_row_overflow_raises_terrain_rows(test, device):
     unlimited = ref.pair_rows(hf, core, dims["radius"] + 0.04)
     test.assertGreater(len(unlimited), TERRAIN_POINT_ROWS)
     raw = ref.capsule_law(hf, core, dims["radius"] + 0.04, hf.window_features(hf.cells_in_box(*_box(core, 0.07))))
-    limited = ref.finish(raw, row_limit=TERRAIN_POINT_ROWS)
+    band = tu.kernel_band(hf, core, dims["radius"] + 0.04)
+    limited = ref.finish(raw, row_limit=TERRAIN_POINT_ROWS, group_offset=4.0 * band)
     got = tu.shadow_rows(pipeline)[shapes[0]]
     test.assertEqual(tu.missing_rows(limited, got, q_tol=1.0e-5, angle_tol=1.0e-3, d_tol=1.0e-5), [])
 
