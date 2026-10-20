@@ -42,15 +42,18 @@ The window is walked vertex by vertex: vertex ``(r, c)`` owns the features :func
 faces and diagonal, its x- and y-edges, itself), each evaluated for the sphere centre or for both capsule ends and
 the axis. An item yields at most one row (:class:`_Claim`).
 
-Thread mapping (the pair table's lane classes): :func:`terrain_point_rows` runs one thread per pair; it first marks
-the window's vertices the drop keeps in a bit mask and then walks the marked ones in window order, so that a warp's
-lanes evaluate their k-th kept vertices together instead of one window position that most lanes drop (a model of
-the warps' issued instructions on recorded quadruped foot spheres, per-stage SASS counts weighted by what any lane of
-a warp runs: -24% and -27% on two suite scenes against walking every window position).
-:func:`terrain_point_rows_tiled` runs
-:data:`~newton._src.geometry.terrain_contacts.TERRAIN_TILE_LANES` lanes per pair (``wp.launch_tiled``) for windows
-of more cells: the lanes split the window's heights and vertices, mark the vertices whose items yield anything, and
-the first lane evaluates those in window order, so a pair gets the rows the one-thread kernel gives it. Both hold a
+Thread mapping (the pair table's lane classes): :func:`terrain_point_rows` runs one thread per pair of the class; for
+a pair whose window holds at most 16 cells it first marks the window's vertices the drop keeps in a bit mask and then
+walks the marked ones in window order, so that a warp's lanes evaluate their k-th kept vertices together instead of
+one window position that most lanes drop (a model of the warps' issued instructions on recorded quadruped foot
+spheres, per-stage SASS counts weighted by what any lane of a warp runs: -24% and -27% on two suite scenes against
+walking every window position). A pair with a larger window it only takes through the whole-pair rejects, the
+tile-max exit above all (97% of the recorded suite's such pairs), and queues the rest
+(:class:`~newton._src.geometry.terrain_shadow.TerrainPairWork`): :func:`terrain_point_rows_tiled`, a fixed grid of
+:data:`~newton._src.geometry.terrain_shadow.TERRAIN_LAW_BLOCK` lanes per pair (``wp.launch_tiled``), takes the
+queued pairs in turn, so that a pair that leaves at the tile max never occupies a tile. The lanes split the window's
+heights and vertices, mark the vertices whose items yield anything, and the first lane evaluates those in window
+order, so a pair gets the rows the one-thread kernel gives it. Both hold a
 pair's distinct rows in its own slots (up to six, merged as the finish merges) and its ends' exits, and write them
 when the finish keeps them as they are: no plane group holds three of them (the finish's implied-row and per-group
 steps act on larger groups), they fit the eight slots and the candidates fit the finish's list. That is every
@@ -63,7 +66,8 @@ finish. The full-finish kernel keeps the candidate list and the finish's input i
 (:class:`~newton._src.geometry.terrain_shadow.TerrainFinishScratch`), so that its stack, which sets the driver's
 local-memory reservation for every thread the device holds, is the finish's own frame: 6.0 KB on sm_120 (10.1 KB
 with the list on the stack). The kernels take the per-type kernel arguments ``(begin, slot_begin, inputs, data,
-out)`` of :class:`~newton._src.geometry.terrain_law.TerrainPairInputs`, the full-finish kernel its scratch too.
+out)`` of :class:`~newton._src.geometry.terrain_law.TerrainPairInputs` and a launch argument: the walks the class's
+work list, the full-finish kernel its scratch.
 
 The module is compiled without floating-point contraction, as the cluster build is: every float32 operation
 rounds as on the CPU, so CPU tests decide every boundary, and a CPU census counts every row, as the GPU does.
@@ -128,7 +132,7 @@ from .terrain_law import (
     terrain_window_point,
     terrain_window_vertex,
 )
-from .terrain_shadow import TerrainFinishScratch
+from .terrain_shadow import TerrainFinishScratch, TerrainPairWork
 from .types import GeoType
 
 # Every float32 operation rounds as on the CPU (see the module docstring).
@@ -932,13 +936,20 @@ def _open_pair(out: TerrainLawRows, slot: int):
 
 @wp.kernel(enable_backward=False, launch_bounds=(256, 2))
 def terrain_point_rows(
-    begin: int, slot_begin: int, inputs: TerrainPairInputs, data: TerrainFeatureData, out: TerrainLawRows
+    begin: int,
+    slot_begin: int,
+    inputs: TerrainPairInputs,
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+    work: TerrainPairWork,
 ):
-    """The law's rows of sphere and capsule pairs, one thread per pair (windows of up to 16 cells).
+    """The law's rows of sphere and capsule pairs, one thread per pair: it walks the windows of up to 16 cells and
+    queues the larger ones for :func:`terrain_point_rows_tiled`.
 
-    A pair holds its distinct rows in its slots and writes them when the finish would keep them as they are; any
-    other pair is left to :func:`terrain_point_rows_full` (the finish's candidate list and code would otherwise cost
-    every thread their registers and stack).
+    A walked pair holds its distinct rows in its slots and writes them when the finish would keep them as they are;
+    any other pair is left to :func:`terrain_point_rows_full` (the finish's candidate list and code would otherwise
+    cost every thread their registers and stack). A pair from ``work.first`` on (the tiled segment) leaves here
+    through the whole-pair rejects, or is queued in ``work`` to be walked by a tile of lanes.
     """
     i = wp.tid()
     pair = begin + i
@@ -946,6 +957,10 @@ def terrain_point_rows(
     state, frame, heightfield, cells, a, b, segment, reach = _pair_setup(inputs, data, pair)
     if state != 0:
         terrain_pair_exit(out, pair, state)
+        return
+    if pair >= work.first:
+        # A larger window that the rejects keep: a tile of lanes walks it.
+        work.pairs[wp.atomic_add(work.count, 0, 1)] = pair
         return
     r1 = cells[1]
     c1 = cells[3]
@@ -991,23 +1006,23 @@ def terrain_point_rows(
     _close_pair(out, pair, slot, _wide(cells), held, candidates, data, window, planes, core, frame)
 
 
-@wp.kernel(enable_backward=False)
-def terrain_point_rows_tiled(
-    begin: int, slot_begin: int, inputs: TerrainPairInputs, data: TerrainFeatureData, out: TerrainLawRows
+@wp.func
+def _tiled_pair(
+    begin: int,
+    slot_begin: int,
+    inputs: TerrainPairInputs,
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+    pair: int,
+    lane: int,
 ):
-    """The law's rows of sphere and capsule pairs with long windows, ``wp.block_dim()`` lanes per pair.
-
-    The lanes split the window's heights (its band) and its vertices, marking those whose items yield a row or an
-    exit; the first lane evaluates the marked ones in window order, which gives a pair the rows (or the deferral)
-    :func:`terrain_point_rows` gives it.
-    """
-    i, lane = wp.tid()
+    """Walk one pair's window with the block's lanes (see :func:`terrain_point_rows_tiled`); every lane returns
+    together, ready for the next pair."""
     lanes = wp.block_dim()
-    pair = begin + i
-    slot = slot_begin + i * _ROWS
+    slot = slot_begin + (pair - begin) * _ROWS
     state, frame, heightfield, cells, a, b, segment, reach = _pair_setup(inputs, data, pair)
     if state != 0:
-        # Every lane reads the same pair: the exit is uniform.
+        # A queued pair passed these rejects in the one-thread kernel; every lane reads the same pair regardless.
         if lane == 0:
             terrain_pair_exit(out, pair, state)
         return
@@ -1044,24 +1059,45 @@ def terrain_point_rows_tiled(
         # Lanes mark disjoint vertices, so a sum of their words is their union.
         for word in range(words):
             marked[word] = wp.tile_extract(wp.tile_sum(wp.tile(marked[word])), 0)
-    if lane != 0:
-        return
-    _open_pair(out, slot)
-    held = int(0)
-    candidates = int(0)
-    for v in range(vertices):
-        if held > _HELD:
-            break
-        if words <= _MASK_WORDS and (marked[v // 32] & (1 << (v % 32))) == 0:
-            continue
-        r = r0 + v // width
-        c = c0 + v % width
-        if _vertex_dropped(data, window, core, margins, r, c):
-            continue
-        for item in range(items):
-            planes, claim = _point_item(data, window, planes, core, r, c, r1, c1, item)
-            held, candidates = _walk_claim(out, slot, held, candidates, claim, eps)
-    _close_pair(out, pair, slot, _wide(cells), held, candidates, data, window, planes, core, frame)
+    if lane == 0:
+        _open_pair(out, slot)
+        held = int(0)
+        candidates = int(0)
+        for v in range(vertices):
+            if held > _HELD:
+                break
+            if words <= _MASK_WORDS and (marked[v // 32] & (1 << (v % 32))) == 0:
+                continue
+            r = r0 + v // width
+            c = c0 + v % width
+            if _vertex_dropped(data, window, core, margins, r, c):
+                continue
+            for item in range(items):
+                planes, claim = _point_item(data, window, planes, core, r, c, r1, c1, item)
+                held, candidates = _walk_claim(out, slot, held, candidates, claim, eps)
+        _close_pair(out, pair, slot, _wide(cells), held, candidates, data, window, planes, core, frame)
+
+
+@wp.kernel(enable_backward=False)
+def terrain_point_rows_tiled(
+    begin: int,
+    slot_begin: int,
+    inputs: TerrainPairInputs,
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+    work: TerrainPairWork,
+):
+    """The law's rows of the sphere and capsule pairs with long windows that the one-thread kernel queued,
+    ``wp.block_dim()`` lanes per pair.
+
+    Launched with ``work.blocks`` blocks whatever the segment's size: block ``b`` takes the queued pairs ``b``,
+    ``b + blocks``, ... For each, the lanes split the window's heights (its band) and its vertices, marking those
+    whose items yield a row or an exit; the first lane evaluates the marked ones in window order, which gives a pair
+    the rows (or the deferral) :func:`terrain_point_rows` gives it.
+    """
+    block, lane = wp.tid()
+    for entry in range(block, work.count[0], work.blocks):
+        _tiled_pair(begin, slot_begin, inputs, data, out, work.pairs[entry], lane)
 
 
 @wp.func

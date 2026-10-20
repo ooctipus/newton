@@ -31,7 +31,13 @@ from newton._src.geometry.terrain_law import (
     TERRAIN_PAIR_TILE_EXIT,
 )
 from newton._src.geometry.terrain_law_point import TERRAIN_POINT_ROWS
-from newton._src.geometry.terrain_shadow import TERRAIN_LAW_FULL_THREADS, TERRAIN_LAW_KERNELS, parse_terrain_law_shadow
+from newton._src.geometry.terrain_shadow import (
+    TERRAIN_LAW_FULL_THREADS,
+    TERRAIN_LAW_KERNELS,
+    TERRAIN_LAW_TILE_BLOCKS,
+    parse_terrain_law_shadow,
+    terrain_law_block_dim,
+)
 from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_test_utils as tu
 from newton.tests.unittest_utils import (
@@ -321,6 +327,54 @@ def test_high_cores_leave_at_the_tile_max(test, device):
     test.assertTrue(np.all(rows["state"] == int(TERRAIN_PAIR_TILE_EXIT)))
 
 
+def _tiled_scene(device):
+    """Large spheres and long capsules (windows of more than 16 cells) on rough terrain, every second one 1 m above it."""
+    rng = np.random.default_rng(9)
+    heights = np.round(rng.uniform(0.0, 0.1, (33, 33)) / 0.005) * 0.005
+    lying = np.array([0.0, np.sin(np.pi / 4.0), 0.0, np.cos(np.pi / 4.0)])
+    bodies = []
+    for i in range(12):
+        x, y = rng.uniform(-1.0, 1.0, 2)
+        lift = 1.0 if i % 2 else 0.0
+        if i % 4 < 2:
+            bodies.append(("sphere", {"radius": 0.25}, np.array([x, y, 0.35 + lift, 0.0, 0.0, 0.0, 1.0])))
+        else:
+            bodies.append(("capsule", {"radius": 0.06, "half_height": 0.3}, np.array([x, y, 0.16 + lift, *lying])))
+    return tu.body_scene(heights, 1.6, 1.6, bodies, device=device)[0]
+
+
+def test_tiled_pairs_that_exit_are_not_queued(test, device):
+    """Queue for the tiled kernel exactly the larger-window pairs that pass the whole-pair rejects.
+
+    The one-thread kernel takes every pair of the class through the rejects. A larger-window pair that leaves (here at
+    the tile max, high above the terrain) is recorded there and never occupies a tile of lanes; the tiled kernel's
+    fixed grid of blocks takes the queued pairs in turn.
+    """
+    model = _tiled_scene(device)
+    pipeline = tu.shadow_pipeline(model, **PIPELINE)
+    shadow = pipeline._terrain_law_shadow
+    tiled_launches = []
+    launch_tiled = wp.launch_tiled
+
+    def record(kernel, *args, **kwargs):
+        if kernel is terrain_law_point.terrain_point_rows_tiled:
+            tiled_launches.append((kwargs["dim"], kwargs["block_dim"]))
+        return launch_tiled(kernel, *args, **kwargs)
+
+    with patch.object(wp, "launch_tiled", record):
+        _contacts(pipeline, model)
+    rows = shadow.rows()
+    tiled = rows["lane_class"] == TERRAIN_LANE_TILE
+    left = (rows["state"] & int(TERRAIN_PAIR_TILE_EXIT)) != 0
+    test.assertEqual(int(tiled.sum()), 12)
+    test.assertEqual(int((tiled & left).sum()), 6)
+    test.assertGreater(int(rows["count"][tiled & ~left].sum()), 0)
+    work = next(extra for kind, *_launch, extra in shadow._launches if kind == "thread")
+    queued = work.pairs.numpy()[: int(work.count.numpy()[0])]
+    np.testing.assert_array_equal(np.sort(queued), shadow._listed[tiled & ~left])
+    test.assertEqual(tiled_launches, [(min(12, TERRAIN_LAW_TILE_BLOCKS), terrain_law_block_dim(device))])
+
+
 class TestTerrainLawShadow(unittest.TestCase):
     def test_flag_values_cpu(self):
         """Parse the flag's partner classes: names, ``all``, blanks; refuse unknown names and classes without kernels."""
@@ -389,8 +443,9 @@ class TestTerrainLawShadow(unittest.TestCase):
         self.assertEqual(record["pairs"], {"point": lanes})
         self.assertEqual(sum(lanes.values()), 12)
         self.assertEqual(record["slots"], 12 * TERRAIN_POINT_ROWS)
-        # One walk per lane segment, and the class's full-finish kernel.
-        self.assertEqual(record["launches"], sum(1 for v in lanes.values() if v) + 1)
+        # The one-thread kernel over the class, the tiled kernel over its queue when it has a tiled segment, and the
+        # class's full-finish kernel.
+        self.assertEqual(record["launches"], 2 + int(lanes["tiled"] > 0))
         self.assertEqual(selection["environment"]["applied"]["NEWTON_TERRAIN_LAW_SHADOW"], "point")
         # Without heightfield pairs the flag builds nothing.
         builder = newton.ModelBuilder()
@@ -419,6 +474,7 @@ for _name, _func in (
     ("test_row_overflow_raises_terrain_rows", test_row_overflow_raises_terrain_rows),
     ("test_shadow_follows_the_pair_policy", test_shadow_follows_the_pair_policy),
     ("test_high_cores_leave_at_the_tile_max", test_high_cores_leave_at_the_tile_max),
+    ("test_tiled_pairs_that_exit_are_not_queued", test_tiled_pairs_that_exit_are_not_queued),
 ):
     add_function_test(TestTerrainLawShadow, _name, _func, devices=devices)
 add_function_test(

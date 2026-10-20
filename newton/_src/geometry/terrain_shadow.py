@@ -9,20 +9,26 @@ Only ``point`` has kernels yet; naming a class without one raises. With classes 
 collision pipeline builds :class:`TerrainLawShadow` once, at construction: the terrain features
 (:class:`~newton._src.geometry.terrain_contacts.TerrainFeatures`), the static pair table
 (:class:`~newton._src.geometry.terrain_contacts.TerrainPairTable`, from the pipeline's pairs) and per listed pair a
-static range of row slots. Every collide then launches, after today's terrain route, one kernel per listed class and
-lane class over its table segment, with dimensions fixed at construction: no host read, no allocation, no scan, so
-it runs inside CUDA graph capture. Today's route still produces every contact; the shadow's rows are read only by
-:meth:`TerrainLawShadow.rows`.
+static range of row slots. Every collide then launches, after today's terrain route, three kernels per listed class
+with dimensions fixed at construction: no host read, no allocation, no scan, so it runs inside CUDA graph capture.
+Today's route still produces every contact; the shadow's rows are read only by :meth:`TerrainLawShadow.rows`.
 
-The per-type kernels share one signature, ``(begin, slot_begin, inputs, data, out)``
+The per-type kernels take ``(begin, slot_begin, inputs, data, out)``
 (:class:`~newton._src.geometry.terrain_law.TerrainPairInputs`, :class:`~newton._src.geometry.terrain_law.TerrainFeatureData`,
-:class:`~newton._src.geometry.terrain_law.TerrainLawRows`): a kernel launched over ``count`` pairs handles table
-pairs ``begin + i`` and writes their rows to slots ``slot_begin + i * K``, ``K`` its class's row limit
-(:data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_ROWS`), their row counts and ``TERRAIN_PAIR_*``
-states. The one-thread kernel of a class takes pairs whose windows hold at most
-:data:`~newton._src.geometry.terrain_contacts.TERRAIN_LANE_CELLS` cells; the tiled one is launched with
-``wp.launch_tiled`` and :data:`~newton._src.geometry.terrain_contacts.TERRAIN_TILE_LANES` lanes per pair.
-:data:`TERRAIN_LAW_KERNELS` names them per class; a class without an entry has no kernel yet.
+:class:`~newton._src.geometry.terrain_law.TerrainLawRows`) and a launch argument: table pair ``begin + i`` writes its
+rows to slots ``slot_begin + i * K``, ``K`` its class's row limit
+(:data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_ROWS`), its row count and ``TERRAIN_PAIR_*`` state.
+Per class (:data:`TERRAIN_LAW_KERNELS` names the kernels; a class without an entry has no kernel yet):
+
+1. The one-thread kernel, one thread per pair of the class (both lane classes: the table keeps them contiguous), with
+   the class's :class:`TerrainPairWork`. It walks the pairs whose windows hold at most
+   :data:`~newton._src.geometry.terrain_contacts.TERRAIN_LANE_CELLS` cells; a pair with a larger window it only takes
+   through the whole-pair rejects (stale features, the pair policy, a window off the heightfield, the tile-max exit),
+   and queues it in the work list when it reaches its window.
+2. The tiled kernel, ``wp.launch_tiled`` with :data:`TERRAIN_LAW_BLOCK` lanes per pair and the work list's fixed grid
+   (:attr:`TerrainPairWork.blocks` blocks), which strides over the queued pairs: a pair that leaves at the tile max
+   never occupies a tile.
+3. The full-finish kernel (:data:`TERRAIN_LAW_KERNELS`).
 
 The kernels apply the pipeline's pair policy: the table holds the pairs its collision filter admits (worlds,
 collision groups, filter pairs, or its explicit pair list), and each kernel drops the pairs its broad phase's
@@ -49,7 +55,6 @@ from .terrain_contacts import (
     TERRAIN_PARTNER_HULL,
     TERRAIN_PARTNER_POINT,
     TERRAIN_PARTNER_ROWS,
-    TERRAIN_TILE_LANES,
     TerrainFeatures,
     TerrainPairTable,
 )
@@ -67,8 +72,52 @@ from .terrain_law import (
     TerrainRows,
 )
 
+TERRAIN_LAW_BLOCK = 32
+"""Lanes per pair of a tiled kernel (one warp): its launch's block size on CUDA (the CPU runs one lane per pair)."""
+TERRAIN_LAW_TILE_BLOCKS = 2048
+"""Blocks of a tiled launch at most, whatever the class's size: one per queued pair up to this many (about one
+resident wave of one-warp blocks on a 188-SM GPU), more queued pairs taking turns."""
 TERRAIN_LAW_FULL_THREADS = 256
 """Threads of a full-finish launch, whatever the class's size: they stride over its deferred list."""
+
+
+@wp.struct
+class TerrainPairWork:
+    """A partner class's pairs with larger windows that reach their windows, which its one-thread kernel queues for its
+    tiled kernel, in any order (a pair's rows depend on the pair alone)."""
+
+    first: int
+    """First table pair of the class's tiled segment: the one-thread kernel walks the pairs before it and queues
+    those from it on."""
+    pairs: wp.array[wp.int32]
+    """The queued table pairs, room for every pair of the tiled segment."""
+    count: wp.array[wp.int32]
+    """The queued pairs (one entry, zeroed before every launch)."""
+    blocks: int
+    """Blocks of the tiled launch: block ``b`` takes the queued pairs ``b``, ``b + blocks``, ..."""
+
+
+def terrain_pair_work(device, first: int, pairs: int, *, count: wp.array | None = None) -> TerrainPairWork:
+    """Allocate the :class:`TerrainPairWork` of a tiled segment of ``pairs`` pairs from table pair ``first``.
+
+    Args:
+        device: The device.
+        first: First table pair of the tiled segment; the one-thread kernel walks the pairs before it.
+        pairs: Pairs of the tiled segment.
+        count: The one-entry counter of queued pairs (zeroed before every launch), or ``None`` for one of its own.
+    """
+    work = TerrainPairWork()
+    work.first = first
+    work.pairs = wp.zeros(max(pairs, 1), dtype=wp.int32, device=device)
+    work.count = count if count is not None else wp.zeros(1, dtype=wp.int32, device=device)
+    work.blocks = max(min(pairs, TERRAIN_LAW_TILE_BLOCKS), 1)
+    return work
+
+
+def terrain_law_block_dim(device) -> int:
+    """Return the block size of a tiled launch on ``device``: :data:`TERRAIN_LAW_BLOCK` lanes on CUDA, one on the CPU
+    (where ``wp.launch_tiled`` runs one lane per pair whatever it is given)."""
+    return TERRAIN_LAW_BLOCK if wp.get_device(device).is_cuda else 1
 
 
 @wp.struct
@@ -129,12 +178,13 @@ TERRAIN_LAW_KERNELS: dict[int, tuple[str, str, str, str | None]] = {
 }
 """Per partner class: the module, its one-thread and tiled kernels, and its full-finish kernel or ``None``.
 
-The module is imported only when the class is listed. The one-thread kernel runs over the class's one-thread lane
-segment, the tiled one over its tiled segment; the full-finish kernel, when the class has one, runs after them and
-finishes the pairs they marked :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_FULL`: with
-:data:`TERRAIN_LAW_FULL_THREADS` threads whatever the class's size, striding over its deferred list, and a
-:class:`TerrainFinishScratch` as its sixth argument (``begin`` and ``slot_begin`` are the class's first pair and
-slot: its two segments are contiguous), so that an empty list costs one near-empty launch.
+The module is imported only when the class is listed. The one-thread kernel runs over both lane segments of the class
+and the tiled one over the queued pairs of its tiled segment, each with the class's :class:`TerrainPairWork` as
+sixth argument (``begin`` and ``slot_begin`` are the class's first pair and slot for the one-thread kernel, the
+tiled segment's for the tiled one). The full-finish kernel, when the class has one, runs after them and finishes the
+pairs they marked :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_FULL`: with :data:`TERRAIN_LAW_FULL_THREADS`
+threads whatever the class's size, striding over its deferred list, and a :class:`TerrainFinishScratch` as sixth
+argument (``begin`` and ``slot_begin`` are the class's), so that an empty list costs one near-empty launch.
 
 A class's module and kernels follow one protocol (the helpers live in :mod:`~newton._src.geometry.terrain_law`):
 
@@ -208,10 +258,10 @@ class TerrainLawShadow:
     """The terrain law's kernels for some partner classes, run after the narrow phase into a side buffer.
 
     Built once, outside graph capture: the terrain features, the pair table, the side buffer (per listed pair
-    ``K`` slots of a terrain point, a normal, a core distance and a feature id, plus a row count and a state) and per
-    class with a full-finish kernel its :class:`TerrainFinishScratch`. :meth:`launch` then runs one kernel per listed
-    class and lane class, and the class's full-finish kernel, with dimensions fixed here; the narrow phase's contacts
-    are untouched.
+    ``K`` slots of a terrain point, a normal, a core distance and a feature id, plus a row count and a state), per
+    class its :class:`TerrainPairWork` and, with a full-finish kernel, its :class:`TerrainFinishScratch`.
+    :meth:`launch` then runs each class's kernels with dimensions fixed here; the narrow phase's contacts are
+    untouched.
 
     Args:
         model: A finalized model.
@@ -232,29 +282,36 @@ class TerrainLawShadow:
         self._launches = []
         slot_first = np.full(self.table.pair_count, -1, np.int64)
         slot = 0
+        device = self.device
+        # Per class its deferred pairs, then per class its queued pairs: zeroed by one memset before every launch.
+        self._counters = wp.zeros(2 * TERRAIN_PARTNER_CLASSES, dtype=wp.int32, device=device)
         for partner_class in self.classes:
             module_name, thread_name, tiled_name, full_name = TERRAIN_LAW_KERNELS[partner_class]
             module = importlib.import_module(module_name)
-            kernels = {
-                TERRAIN_LANE_THREAD: getattr(module, thread_name),
-                TERRAIN_LANE_TILE: getattr(module, tiled_name),
-            }
             rows = TERRAIN_PARTNER_ROWS[partner_class]
-            class_begin, class_slot = None, slot
-            # Lane classes in table order (by id): a class's segments are contiguous and its slots follow them.
-            for lane in sorted(TERRAIN_LANE_NAMES):
-                begin, end = self.table.segment(partner_class, lane)
-                if end > begin:
-                    self._launches.append((kernels[lane], lane, begin, end - begin, slot, None))
-                    slot_first[begin:end] = slot + rows * np.arange(end - begin)
-                    slot += rows * (end - begin)
-                    class_begin = begin if class_begin is None else class_begin
-            if full_name is not None and class_begin is not None:
-                # A fixed grid over the class's deferred list (the pairs are found on the device, in any order).
-                scratch = terrain_finish_scratch(self.device)
+            # The class's lane segments are contiguous in the table (lane classes by id); its slots follow them.
+            begin = self.table.segment(partner_class, TERRAIN_LANE_THREAD)[0]
+            tiled_begin, end = self.table.segment(partner_class, TERRAIN_LANE_TILE)
+            if end == begin:
+                continue
+            slot_first[begin:end] = slot + rows * np.arange(end - begin)
+            counter = TERRAIN_PARTNER_CLASSES + partner_class
+            work = terrain_pair_work(
+                device, tiled_begin, end - tiled_begin, count=self._counters[counter : counter + 1]
+            )
+            # One thread per pair of the class: it walks the small windows and queues the larger ones it does not
+            # reject whole, which the tiled kernel's fixed grid then takes in turn.
+            self._launches.append(("thread", getattr(module, thread_name), end - begin, begin, slot, work))
+            if end > tiled_begin:
+                tiled_slot = slot + rows * (tiled_begin - begin)
                 self._launches.append(
-                    (getattr(module, full_name), None, class_begin, scratch.threads, class_slot, scratch)
+                    ("tiled", getattr(module, tiled_name), work.blocks, tiled_begin, tiled_slot, work)
                 )
+            if full_name is not None:
+                # A fixed grid over the class's deferred list (the pairs are found on the device, in any order).
+                scratch = terrain_finish_scratch(device)
+                self._launches.append(("full", getattr(module, full_name), scratch.threads, begin, slot, scratch))
+            slot += rows * (end - begin)
         self.slot_count = slot
         """Row slots of the side buffer: every listed pair times its class's row limit."""
         self.features = TerrainFeatures(model) if self._launches else None
@@ -262,7 +319,6 @@ class TerrainLawShadow:
         outside capture."""
         self._slot_first = slot_first
         self._listed = np.flatnonzero(slot_first >= 0)
-        device = self.device
         out = TerrainLawRows()
         slots = max(slot, 1)
         pair_count = max(self.table.pair_count, 1)
@@ -278,7 +334,7 @@ class TerrainLawShadow:
         out.deferred_first = wp.array(
             [self.table.segment(c, 0)[0] for c in range(TERRAIN_PARTNER_CLASSES)], dtype=wp.int32, device=device
         )
-        out.deferred_count = wp.zeros(TERRAIN_PARTNER_CLASSES, dtype=wp.int32, device=device)
+        out.deferred_count = self._counters[:TERRAIN_PARTNER_CLASSES]
         self._out = out
         self._no_body_flags = wp.empty(0, dtype=wp.int32, device=device)
         self.build_seconds = time.perf_counter() - started
@@ -323,17 +379,14 @@ class TerrainLawShadow:
         inputs.body_flags = body_flags if body_flags is not None else self._no_body_flags
         inputs.include_static_kinematic_pairs = int(bool(include_static_kinematic_pairs))
         data = self.features.data()
-        self._out.deferred_count.zero_()
-        for kernel, lane, begin, count, slot, scratch in self._launches:
-            args = [begin, slot, inputs, data, self._out]
-            if lane is None:
-                wp.launch(kernel, dim=count, inputs=[*args, scratch], device=self.device, record_tape=False)
-            elif lane == TERRAIN_LANE_THREAD:
-                wp.launch(kernel, dim=count, inputs=args, device=self.device, record_tape=False)
+        self._counters.zero_()
+        block = terrain_law_block_dim(self.device)
+        for kind, kernel, dim, begin, slot, extra in self._launches:
+            args = [begin, slot, inputs, data, self._out, extra]
+            if kind == "tiled":
+                wp.launch_tiled(kernel, dim=dim, inputs=args, block_dim=block, device=self.device, record_tape=False)
             else:
-                wp.launch_tiled(
-                    kernel, dim=count, inputs=args, block_dim=TERRAIN_TILE_LANES, device=self.device, record_tape=False
-                )
+                wp.launch(kernel, dim=dim, inputs=args, device=self.device, record_tape=False)
 
     # ---- host reads --------------------------------------------------------------------------------------------
     def rows(self) -> dict[str, np.ndarray]:
@@ -396,16 +449,18 @@ class TerrainLawShadow:
         )
         scratch = sum(
             sum(array.capacity for array in (s.q, s.k, s.n, s.d, s.feature, s.rows))
-            for *_launch, s in self._launches
-            if s is not None
+            for kind, *_launch, s in self._launches
+            if kind == "full"
         )
+        work = sum(w.pairs.capacity for kind, *_launch, w in self._launches if kind == "thread")
         return {
             "classes": [terrain_law_class_name(c) for c in self.classes],
             "pairs": pairs,
             "launches": len(self._launches),
             "slots": self.slot_count,
             "bytes": {
-                "side_buffer": int(side),
+                "side_buffer": int(side + self._counters.capacity),
+                "work_lists": int(work),
                 "finish_scratch": int(scratch),
                 "pair_table": int(self.table.memory_bytes()["pairs"]),
                 "features": 0 if self.features is None else int(sum(self.features.memory_bytes().values())),

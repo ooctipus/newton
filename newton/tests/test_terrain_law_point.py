@@ -56,7 +56,13 @@ from newton._src.geometry.terrain_law import (
     terrain_window_extent,
     terrain_window_vertex,
 )
-from newton._src.geometry.terrain_shadow import TERRAIN_LAW_FULL_THREADS, terrain_finish_scratch
+from newton._src.geometry.terrain_shadow import (
+    TERRAIN_LAW_FULL_THREADS,
+    TerrainPairWork,
+    terrain_finish_scratch,
+    terrain_law_block_dim,
+    terrain_pair_work,
+)
 from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_test_utils as tu
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -627,14 +633,31 @@ def _pair_inputs(shadow, model, pipeline):
     return inputs
 
 
-def _launch_segment(shadow, model, pipeline, kernel, lane, begin, count, out):
-    """Run one walk kernel over table pairs ``[begin, begin + count)`` into ``out``, then the full-finish kernel."""
+def _launch_segment(shadow, model, pipeline, lane, begin, count, out, *, kernel=None, blocks=None):
+    """Walk table pairs ``[begin, begin + count)`` into ``out``, then run the full-finish kernel.
+
+    With ``lane`` the one-thread class, the one-thread kernel (or ``kernel``, of its signature) walks every pair; with
+    the tiled class, it queues them past the whole-pair rejects and the tiled kernel takes the queue, with ``blocks``
+    blocks (the work list's own when ``None``).
+    """
+    device = model.device
     args = [begin, 0, _pair_inputs(shadow, model, pipeline), shadow.features.data(), out]
     out.deferred_count.zero_()
     if lane == TERRAIN_LANE_THREAD:
-        wp.launch(kernel, dim=count, inputs=args, device=model.device)
+        work = terrain_pair_work(device, begin + count, 0)
+        wp.launch(kernel or terrain_law_point.terrain_point_rows, dim=count, inputs=[*args, work], device=device)
     else:
-        wp.launch_tiled(kernel, dim=count, inputs=args, block_dim=16, device=model.device)
+        work = terrain_pair_work(device, begin, count)
+        if blocks is not None:
+            work.blocks = blocks
+        wp.launch(terrain_law_point.terrain_point_rows, dim=count, inputs=[*args, work], device=device)
+        wp.launch_tiled(
+            terrain_law_point.terrain_point_rows_tiled,
+            dim=work.blocks,
+            inputs=[*args, work],
+            block_dim=terrain_law_block_dim(device),
+            device=device,
+        )
     _launch_full(shadow, model, pipeline, begin, out)
 
 
@@ -747,10 +770,11 @@ def test_tiled_kernel_matches_one_thread_kernel(test, device):
     """Give a pair the same rows, bit for bit, whether one thread or a tile of lanes evaluates its window.
 
     Both kernels evaluate the same table segment of tile-lane pairs (:func:`_tile_scenes`), the full kernel after
-    them; some pairs go through the full kernel. On the CPU Warp runs ``wp.launch_tiled`` with one lane per pair
-    (``block_dim`` 1), so the CPU run checks one lane's walk, its masked and unmasked paths and bit 31 of a mask word;
-    the 16-lane path (the window extent's ``tile_max``, the union of the lanes' mask words by ``tile_sum`` and the
-    lanes' striding) runs on CUDA only, in this test's CUDA variant.
+    them; some pairs go through the full kernel. The tiled kernel takes the pairs the one-thread kernel queues: with
+    a block per pair, and with three blocks that take the queue in turn. On the CPU Warp runs ``wp.launch_tiled`` with
+    one lane per pair (``block_dim`` 1), so the CPU run checks one lane's walk, its masked and unmasked paths, bit 31
+    of a mask word and the blocks' turns; the 32-lane path (the window extent's ``tile_max``, the union of the lanes'
+    mask words by ``tile_sum`` and the lanes' striding) runs on CUDA only, in this test's CUDA variant.
     """
     deferred = 0
     for name, heights, extent, bodies in _tile_scenes(np.random.default_rng(4)):
@@ -761,21 +785,21 @@ def test_tiled_kernel_matches_one_thread_kernel(test, device):
             begin, end = shadow.table.segment(TERRAIN_PARTNER_POINT, TERRAIN_LANE_TILE)
             test.assertEqual(end - begin, len(bodies))
             outputs = []
-            for kernel, lane in (
-                (terrain_law_point.terrain_point_rows, TERRAIN_LANE_THREAD),
-                (terrain_law_point.terrain_point_rows_tiled, TERRAIN_LANE_TILE),
-            ):
+            for lane, blocks in ((TERRAIN_LANE_THREAD, None), (TERRAIN_LANE_TILE, None), (TERRAIN_LANE_TILE, 3)):
                 out = _side_buffer(begin, end - begin, shadow.table.pair_count, device)
-                _launch_segment(shadow, model, pipeline, kernel, lane, begin, end - begin, out)
+                _launch_segment(shadow, model, pipeline, lane, begin, end - begin, out, blocks=blocks)
                 outputs.append(out)
-            one, tiled = outputs
-            np.testing.assert_array_equal(one.count.numpy(), tiled.count.numpy())
-            np.testing.assert_array_equal(one.state.numpy(), tiled.state.numpy())
+            one = outputs[0]
             test.assertGreaterEqual(int(one.count.numpy().sum()), len(bodies))
-            test.assertEqual(int(one.deferred_count.numpy()[0]), int(tiled.deferred_count.numpy()[0]))
             deferred += int(one.deferred_count.numpy()[0])
-            for array in ("q", "n", "d", "feature"):
-                np.testing.assert_array_equal(getattr(one, array).numpy(), getattr(tiled, array).numpy(), err_msg=array)
+            for tiled in outputs[1:]:
+                np.testing.assert_array_equal(one.count.numpy(), tiled.count.numpy())
+                np.testing.assert_array_equal(one.state.numpy(), tiled.state.numpy())
+                test.assertEqual(int(one.deferred_count.numpy()[0]), int(tiled.deferred_count.numpy()[0]))
+                for array in ("q", "n", "d", "feature"):
+                    np.testing.assert_array_equal(
+                        getattr(one, array).numpy(), getattr(tiled, array).numpy(), err_msg=array
+                    )
             hf = tu.reference_surface(tu.heightfield_model(heights, extent, extent, device="cpu"))
             owners = _owner_vertex_indices(hf, tu.shadow_rows(pipeline), bodies, shapes)
             if name == "marked bit 31":
@@ -878,10 +902,15 @@ def _plain_point_item(
 
 @wp.kernel(enable_backward=False)
 def _plain_point_rows(
-    begin: int, slot_begin: int, inputs: TerrainPairInputs, data: TerrainFeatureData, out: TerrainLawRows
+    begin: int,
+    slot_begin: int,
+    inputs: TerrainPairInputs,
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+    work: TerrainPairWork,
 ):
     """``terrain_point_rows`` without its rejects: every item of every window vertex in window order (no vertex
-    drop, no vertex mask, no off-cell face reject), then the same close."""
+    drop, no vertex mask, no off-cell face reject), then the same close; every pair is walked (``work`` unused)."""
     i = wp.tid()
     pair = begin + i
     slot = slot_begin + i * _PLAIN_ROWS
@@ -980,7 +1009,7 @@ def test_rejects_keep_the_plain_walk_rows(test, device):
             results = {}
             for label, kernel in (("kernel", terrain_law_point.terrain_point_rows), ("plain", _plain_point_rows)):
                 out = _side_buffer(begin, count, shadow.table.pair_count, device)
-                _launch_segment(shadow, model, pipeline, kernel, TERRAIN_LANE_THREAD, begin, count, out)
+                _launch_segment(shadow, model, pipeline, TERRAIN_LANE_THREAD, begin, count, out, kernel=kernel)
                 results[label] = out
             # The full-finish kernel on every pair, seven threads taking the pairs in turn.
             full = _side_buffer(begin, count, shadow.table.pair_count, device)
