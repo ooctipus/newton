@@ -42,6 +42,9 @@ from newton.tests.test_feather_pgs_sparse_solver import _make_solver
 TRIPLETS = {"active_rows": True, "use_support_table": True, "contact_triplets": True}
 # Row capacities of the suite's two launch-bound families: 12 blocks above 128 rows, 16 at or below.
 CAPACITIES = (256, 96)
+# Row capacities with the minimum blocks a single-stage sweep requests: the 14-block variant
+# (FEATHER_PGS_SPARSE_TRANSACTION_BLOCKS=14) compiles to another register budget at 128 rows or fewer.
+SHAPES = ((256, 16), (96, 16), (96, 14))
 
 
 def _snippet(kernel):
@@ -457,29 +460,34 @@ class TestSingleStageTransaction(unittest.TestCase):
 class TestSingleStageTwins(unittest.TestCase):
     """CUDA twins of the single-stage transaction: the staged sweep and the physical reference, to rounding."""
 
-    def _twins(self, data, *, linked=False, active=True):
-        """Launch the single-stage and staged transactions on ``data``; return both results and the single solve."""
-        single = triplets.DeviceSolve(data, candidate=True, active=active, linked=linked, transaction="single")
-        staged = triplets.DeviceSolve(data, candidate=True, active=active, linked=linked, transaction="staged")
+    def _twins(self, data, *, linked=False, active=True, blocks=16):
+        """Launch the single-stage and staged transactions on ``data``; return both results and the single solve.
+
+        ``blocks`` is the single-stage sweep's block request, which applies at 128 rows or fewer.
+        """
+        options = {"candidate": True, "active": active, "linked": linked}
+        single = triplets.DeviceSolve(data, transaction="single", blocks=blocks, **options)
+        staged = triplets.DeviceSolve(data, transaction="staged", **options)
         self.assertTrue(single.single_stage)
         self.assertFalse(staged.single_stage)
+        self.assertIn(f"_single{12 if single.capacity > 128 else blocks}", single.kernel.key)
         single.launch()
         staged.launch()
         return single.result(), staged.result(), single
 
     def test_point_triplets_match_staged_and_reference_cuda(self):
-        """Solve the point-law fixtures as the staged transaction and the physical reference do, at both bounds."""
+        """Solve the point-law fixtures as the staged transaction and the physical reference do, at every bound."""
         cases = (
             [{"offset": value, "seeded": True} for value in (0, 29, 30)]
             + [{"activity": value} for value in ("late_activation", "deferred_activation", "seeded_retraction")]
             + [{"omega": value, "seeded": True} for value in (0.0, 0.7, 1.2, -0.5)]
             + [{"delay": 3, "iteration_offset": value, "seeded": True} for value in (0, 1, 4)]
         )
-        for settings, capacity in product(cases, CAPACITIES):
-            with self.subTest(capacity=capacity, **settings):
+        for settings, (capacity, blocks) in product(cases, SHAPES):
+            with self.subTest(capacity=capacity, blocks=blocks, **settings):
                 data, physical = triplets.fixture(**settings)
                 data = _resized(data, capacity)
-                single, staged, _ = self._twins(data)
+                single, staged, _ = self._twins(data, blocks=blocks)
                 _assert_twins(self, data, single, staged)
                 triplets.assert_output(self, data, *single, physical=physical)
 
@@ -495,13 +503,13 @@ class TestSingleStageTwins(unittest.TestCase):
     def test_patch_rings_match_staged_and_reference_cuda(self):
         """Pool rings of one to six members, listed or walked, in the linked active scan and the full sweep."""
         settings = ({}, {"seeded": True, "omega": 0.7}, {"seeded": True, "delay": 3, "iteration_offset": 1})
-        for (name, layout), pad, options, active, capacity in product(
-            triplets._LINKED_LAYOUTS.items(), (0, 30), settings, (True, False), CAPACITIES
+        for (name, layout), pad, options, active, (capacity, blocks) in product(
+            triplets._LINKED_LAYOUTS.items(), (0, 30), settings, (True, False), SHAPES
         ):
-            with self.subTest(layout=name, pad=pad, active=active, capacity=capacity, **options):
+            with self.subTest(layout=name, pad=pad, active=active, capacity=capacity, blocks=blocks, **options):
                 data, physical = triplets.linked_fixture(layout, pad=pad, active=active, **options)
                 data = _resized(data, capacity)
-                single, staged, _ = self._twins(data, linked=True, active=active)
+                single, staged, _ = self._twins(data, linked=True, active=active, blocks=blocks)
                 _assert_twins(self, data, single, staged)
                 triplets.assert_output(self, data, *single, physical=physical)
 
@@ -596,6 +604,119 @@ class TestSingleStageTwins(unittest.TestCase):
                 _assert_twins(self, data, single, staged)
                 triplets.assert_output(self, data, *single, physical=physical)
 
+    def test_more_linked_anchors_than_the_staged_cache_cuda(self):
+        """Pool 17 loaded anchors of self-loop and two-member rings in one world, beyond the staged cache's 12.
+
+        Each ring owns its coordinates, so its anchor's block couples the normal and the tangents
+        while rings stay independent. Odd anchors share their ring with a second loaded normal on
+        a fourth coordinate, whose impulse joins the anchor's radius; every anchor slides, so a
+        ring list or a record that missed an anchor past the twelfth would leave the ring-pooled
+        physical sweep.
+        """
+        anchors = 17
+        dofs = 3 * anchors + anchors // 2
+        # Each ring's coordinates in one support class, padded to the two-member rings' four.
+        indices = np.full((anchors, 4), -1, dtype=np.int32)
+        kinds, parents, mu, bias, rows, units = [], [], [], [], [], []
+        first = 0
+        for anchor in range(anchors):
+            ring = 4 if anchor % 2 else 3
+            indices[anchor, :ring] = np.arange(first, first + ring)
+            normal, columns = len(kinds), slice(first, first + 3)
+            block = np.zeros((4, dofs))
+            block[0, columns] = (1.0 + 0.01 * anchor, 0.0, 0.0)
+            block[1, columns] = (0.11, 0.6 + 0.08 * anchor, 0.13)
+            block[2, columns] = (-0.07, 0.19, 1.8 - 0.05 * anchor)
+            kinds += [CONTACT, FRICTION, FRICTION]
+            parents += [normal, normal, normal]
+            mu += [0.0, 0.4 + 0.005 * anchor, 0.4 + 0.005 * anchor]
+            bias += [-0.2 - 0.01 * anchor, 0.4, 0.7 - 0.02 * anchor]
+            rows += list(block[:3])
+            units += [anchor] * 3
+            if anchor % 2:
+                # A second loaded normal of the anchor's ring.
+                block[3, first : first + 4] = (0.3, 0.1, 0.0, 1.0)
+                parents[normal] = normal + 3
+                kinds.append(CONTACT)
+                parents.append(normal)
+                mu.append(0.0)
+                bias.append(-0.2)
+                rows.append(block[3])
+                units.append(anchor)
+            first += ring
+        self.assertEqual(first, dofs)
+        count = len(kinds)
+        kinds, parents = np.array(kinds, np.int32), np.array(parents, np.int32)
+        z = np.array(rows, np.float32)
+        bias, mu = np.array(bias, np.float32), np.array(mu, np.float32)
+        diag = np.sum(z.astype(np.float64) ** 2, axis=1).astype(np.float32) + np.float32(0.01)
+        normals = np.flatnonzero(kinds == CONTACT)
+        anchor_rows = normals[kinds[np.minimum(normals + 1, count - 1)] == FRICTION]
+        self.assertEqual(len(anchor_rows), anchors)
+        oracle = {}
+        for active in (True, False):
+            velocity, impulses = _sweep(
+                z,
+                z,
+                np.zeros(dofs),
+                bias,
+                diag,
+                kinds,
+                parents,
+                mu,
+                np.zeros(count),
+                active_rows=active,
+                linked_rows=True,
+            )
+            # Every normal holds load and every anchor slides on its pooled radius.
+            self.assertTrue(np.all(impulses[normals] > 0.0))
+            for row in anchor_rows:
+                radius = mu[row + 1] * (impulses[row] + impulses[parents[row]] * (parents[row] != row))
+                self.assertAlmostEqual(float(np.hypot(*impulses[row + 1 : row + 3])), float(radius), places=5)
+            oracle[active] = {
+                "factor": np.eye(dofs),
+                "initial": np.zeros(dofs),
+                "expected_velocity": velocity,
+                "expected_impulse": impulses,
+            }
+        factor = np.stack(
+            [np.where(indices[unit] >= 0, z[row, indices[unit]], 0.0) for row, unit in enumerate(units)]
+        ).astype(np.float32)
+        for (capacity, blocks), active in product(SHAPES, (True, False)):
+            with self.subTest(capacity=capacity, blocks=blocks, active=active):
+
+                def padded(values, capacity=capacity):
+                    result = np.zeros((3, capacity, *values.shape[1:]), dtype=values.dtype)
+                    result[:, :count] = values
+                    return result
+
+                data = {
+                    "world_constraint_count": np.array([count, 0, count], np.int32),
+                    "rhs_bias": padded(bias),
+                    "diagonal": padded(diag),
+                    "initial_impulses": padded(np.zeros(count, np.float32)),
+                    "row_factor": padded(factor),
+                    "row_incident": padded(np.zeros(count, np.float32)),
+                    "row_type": padded(kinds),
+                    "row_parent": padded(parents),
+                    "row_mu": padded(mu),
+                    "support_row_class": padded(np.array(units, np.int32)),
+                    "support_class_dof": indices,
+                    "iterations": np.array(8),
+                    "omega": np.array(1.0),
+                    "friction_start_iteration": np.array(0),
+                    "iteration_offset": np.array(0),
+                    "reference_factor_delta": np.zeros((3, dofs), dtype=np.float32),
+                }
+                single, staged, solve = self._twins(data, linked=True, active=active, blocks=blocks)
+                _assert_twins(self, data, single, staged)
+                triplets.assert_output(self, data, *single, physical=oracle[active])
+                rings = solve.records.numpy()[..., CONTACT_RECORD_FLOATS:].view(np.int32)
+                for row in anchor_rows:
+                    members = _ring_members(parents, row)
+                    self.assertEqual(list(rings[0, row // 3, : len(members)]), members)
+                    self.assertEqual(int(rings[0, row // 3, 3]), len(members))
+
     def test_fused_visits_step_the_normal_with_the_record_cuda(self):
         """Step a fused normal with its record's ``1/W_nn``: zeroed, it holds the normal where staged moves it.
 
@@ -609,8 +730,8 @@ class TestSingleStageTwins(unittest.TestCase):
         for active in (True, False):
             layout = triplets._LINKED_LAYOUTS["loaded_ring"]
             fixtures.append(("patch", active, triplets.linked_fixture(layout, pad=30, seeded=True, active=active)[0]))
-        for (law, active, fixture), capacity in product(fixtures, CAPACITIES):
-            with self.subTest(law=law, active=active, capacity=capacity):
+        for (law, active, fixture), (capacity, blocks) in product(fixtures, SHAPES):
+            with self.subTest(law=law, active=active, capacity=capacity, blocks=blocks):
                 data = _resized(fixture, capacity)
                 linked = law == "patch"
                 options = {"candidate": True, "active": active, "linked": linked}
@@ -628,7 +749,7 @@ class TestSingleStageTwins(unittest.TestCase):
                 ]
                 self.assertTrue(loaded)
                 row = loaded[0]
-                single = triplets.DeviceSolve(data, transaction="single", **options)
+                single = triplets.DeviceSolve(data, transaction="single", blocks=blocks, **options)
                 records = single.records.numpy()
                 records[:, row // 3, 3] = 0.0
                 single.records.assign(records)

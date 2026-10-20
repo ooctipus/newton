@@ -32,7 +32,11 @@ CANDIDATE_OPTIONS = {"contact_triplets": True}
 TRANSACTIONS = ("staged", "single")
 
 
-def factory(capacity, dofs, width, *, candidate=True, active=True, linked=False, transaction="auto"):
+def factory(capacity, dofs, width, *, candidate=True, active=True, linked=False, transaction="auto", blocks=16):
+    """Return the sparse sweep of the triplet tests; ``blocks`` is a single-stage sweep's block request."""
+    options = {**CANDIDATE_OPTIONS, "contact_transaction": transaction} if candidate else {}
+    if candidate and blocks != 16:
+        options["transaction_blocks"] = blocks
     return _get_pgs_solve_sparse_kernel(
         capacity,
         dofs,
@@ -40,7 +44,7 @@ def factory(capacity, dofs, width, *, candidate=True, active=True, linked=False,
         active_rows=active,
         use_support_table=True,
         linked_rows=linked,
-        **({**CANDIDATE_OPTIONS, "contact_transaction": transaction} if candidate else {}),
+        **options,
     )
 
 
@@ -166,7 +170,7 @@ class DeviceSolve:
     (:func:`contact_records`), which follow the scalar inputs.
     """
 
-    def __init__(self, data, *, candidate, device="cuda:0", active=True, linked=False, transaction="auto"):
+    def __init__(self, data, *, candidate, device="cuda:0", active=True, linked=False, transaction="auto", blocks=16):
         self.device = wp.get_device(device)
         self.data = data
         self.linked = linked
@@ -180,6 +184,7 @@ class DeviceSolve:
             active=active,
             linked=linked,
             transaction=transaction,
+            blocks=blocks,
         )
         self.records = None
 
