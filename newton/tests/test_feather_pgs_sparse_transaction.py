@@ -8,6 +8,7 @@ twins match the staged sweep and the physical reference to rounding, not bitwise
 """
 
 import os
+import re
 import unittest
 from itertools import product
 from types import SimpleNamespace
@@ -308,7 +309,8 @@ class TestSingleStageTransaction(unittest.TestCase):
         """Reduce three residuals once from the record, without the staged metric cache, its capacity or walk.
 
         The staged sweep keeps its cache, its map and its second reduction; only rings of
-        more than four members walk their parents on a visit.
+        more than four members walk their parents on a visit. Lane 0 writes the impulses
+        every lane read only after a warp barrier.
         """
         for linked in (False, True):
             with self.subTest(linked=linked):
@@ -347,6 +349,16 @@ class TestSingleStageTransaction(unittest.TestCase):
                 self.assertEqual("ring.w >= 0" in transaction, linked)
                 self.assertEqual("make_int4(first, second, third, others)" in single, linked)
                 self.assertEqual(transaction.count("world_row_parent.data[offset + next]"), int(linked))
+                # Every lane reads the visit's impulses with its rows, before the reduction, and a
+                # warp barrier orders all reads before lane 0's first write: shuffles order
+                # execution, not memory.
+                self.assertIn("__syncwarp(MASK);", transaction)
+                reduction = transaction.index("__shfl_down_sync")
+                barrier = transaction.index("__syncwarp(MASK);")
+                self.assertLess(transaction.index("old_tangent = impulse[tangent]"), reduction)
+                self.assertLess(transaction.index("old_normal = impulse[row]"), reduction)
+                self.assertLess(barrier, transaction.index("if (lane == 0) impulse[row] = new_normal;"))
+                self.assertEqual(re.findall(r"impulse\[[^\]]+\](?!\s*=[^=])", transaction[barrier:]), [])
 
     def test_request_follows_the_law_and_the_flag_cpu(self):
         """Give patch friction the single-stage transaction and point friction the staged one unless the flag says."""

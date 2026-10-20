@@ -1192,11 +1192,13 @@ def _single_stage_triplet_code(
 
     A contact normal followed by its two tangents in shared metadata issues one
     load group: the three rows' guards, coordinates and responses, the triplet's
-    record and its friction coefficient. One interleaved reduction gives the
+    record and its friction coefficient, with the shared impulses, right-hand
+    sides and tangent diagonals of the visit. One interleaved reduction gives the
     three residuals. The normal takes its relaxed step with the record's
     ``1/W_nn``; the pair then solves at the new load, its residuals moved by the
     normal change through the record's ``W_nt`` and its eigenbasis read from the
-    record. The ordinary update keeps any row whose global guards decline.
+    record. Lane 0 writes the three impulses after a warp barrier, since every
+    lane read them. The ordinary update keeps any row whose global guards decline.
 
     With ``linked`` a pass at sweep entry stores each anchor's other ring
     members, at most three, behind its record in the order the pair update
@@ -1309,28 +1311,33 @@ def _single_stage_triplet_code(
                             sibling_dot += sibling_responses[q] * velocities[q];
                         }}
                     }}
+                    // The shared values of the visit load with the rows, off the reduction's chain.
+                    const float old_normal = impulse[row];
+                    const float old_tangent = impulse[tangent], old_sibling = impulse[sibling];
+                    const float normal_rhs = rhs[row], tangent_rhs = rhs[tangent], sibling_rhs = rhs[sibling];
+                    const float tangent_scale = fmaxf(fmaxf(diagonal[tangent], diagonal[sibling]), 1.0e-20f);
                     for (int shift = 16; shift > 0; shift >>= 1) {{
                         normal_dot += __shfl_down_sync(MASK, normal_dot, shift, 32);
                         tangent_dot += __shfl_down_sync(MASK, tangent_dot, shift, 32);
                         sibling_dot += __shfl_down_sync(MASK, sibling_dot, shift, 32);
                     }}
-                    const float normal_residual = __shfl_sync(MASK, normal_dot, 0, 32) + rhs[row];
-                    const float tangent_residual = __shfl_sync(MASK, tangent_dot, 0, 32) + rhs[tangent];
-                    const float sibling_residual = __shfl_sync(MASK, sibling_dot, 0, 32) + rhs[sibling];
-                    const float old_normal = impulse[row];
+                    const float normal_residual = __shfl_sync(MASK, normal_dot, 0, 32) + normal_rhs;
+                    const float tangent_residual = __shfl_sync(MASK, tangent_dot, 0, 32) + tangent_rhs;
+                    const float sibling_residual = __shfl_sync(MASK, sibling_dot, 0, 32) + sibling_rhs;
                     const float new_normal = fmaxf(old_normal - omega * normal_residual * coupling.w, 0.0f);
                     const float normal_change = new_normal - old_normal;{ring_load}
                     const float radius = fmaxf(mu * {load}, 0.0f);
-                    const float old_tangent = impulse[tangent], old_sibling = impulse[sibling];
                     {tangent_state}
+                    // Shuffles order execution, not memory: every lane has read the three
+                    // impulses before lane 0 writes them.
+                    __syncwarp(MASK);
                     if (lane == 0) impulse[row] = new_normal;
                     if (!(radius == 0.0f && old_tangent == 0.0f && old_sibling == 0.0f)) {{
                         float2 pair = make_float2(0.0f, 0.0f);
                         if (radius > 0.0f) {{
                             // W_nt moves the tangent residuals by the normal change. The eigenbasis
                             // is relative to the larger tangent diagonal, as the pair law scales it.
-                            const FrictionPairMetric metric{{fmaxf(fmaxf(diagonal[tangent], diagonal[sibling]), 1.0e-20f),
-                                basis.x, basis.y, basis.z, basis.w}};
+                            const FrictionPairMetric metric{{tangent_scale, basis.x, basis.y, basis.z, basis.w}};
                             pair = friction_pair_from_metric(metric, tangent_residual + coupling.x * normal_change,
                                 sibling_residual + coupling.y * normal_change, old_tangent, old_sibling, radius, omega);
                         }}
