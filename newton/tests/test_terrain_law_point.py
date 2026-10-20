@@ -27,7 +27,12 @@ import warp as wp
 import newton
 from newton._src.geometry import terrain_law_point
 from newton._src.geometry.terrain_contacts import TERRAIN_LANE_THREAD, TERRAIN_LANE_TILE, TERRAIN_PARTNER_POINT
-from newton._src.geometry.terrain_law import TerrainLawRows, TerrainPairInputs
+from newton._src.geometry.terrain_law import (
+    TERRAIN_FEATURE_EDGE,
+    TERRAIN_FEATURE_RECOVERY,
+    TerrainLawRows,
+    TerrainPairInputs,
+)
 from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_test_utils as tu
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -352,6 +357,159 @@ def test_buried_cores_exit_by_the_minimum_translation(test, device):
 
 
 # ----------------------------------------------------------------------------------------------------------------
+# a capsule's axis inside the solid with both ends outside
+# ----------------------------------------------------------------------------------------------------------------
+
+RIDGE_HEIGHT = 0.2
+"""Crest height [m] of :func:`_ridge_terrain`."""
+RIDGE_SLOPE = 2.0
+"""Slope of the ridge's faces (63.4 deg): its normals span +-atan(2) from vertical."""
+
+
+def _ridge_terrain():
+    """A flat 0.1 m grid with one raised vertex column: a ridge along y at x = 0, its faces one cell wide."""
+    heights = np.zeros((21, 21))
+    heights[:, 10] = RIDGE_HEIGHT
+    return heights
+
+
+def _ridge_translation(a, b):
+    """The exact minimum translation of segment ``ab`` out of the ridge (its wedge of two half-spaces), and its
+    direction.
+
+    Along a direction ``u`` of the ridge's normal arc the wedge's support is the crest, so freeing the segment takes
+    ``u . apex - min(u . a, u . b)``, a maximum of two sinusoids of the arc angle; outside the arc the wedge is
+    unbounded. The minimum lies where the two are equal (``u`` normal to the segment, if in the arc) or at an arc end.
+    """
+    half = np.arctan(RIDGE_SLOPE)
+    candidates = [np.array([np.sin(t), 0.0, np.cos(t)]) for t in (-half, half)]
+    w = (b - a)[[0, 2]]
+    u = np.array([-w[1], 0.0, w[0]]) / np.linalg.norm(w)
+    u = -u if u[2] < 0.0 else u
+    if abs(np.arctan2(u[0], u[2])) <= half:
+        candidates.append(u)
+    apex = np.array([0.0, 0.0, RIDGE_HEIGHT])
+    lifts = [float(u @ apex - min(u @ a, u @ b)) for u in candidates]
+    i = int(np.argmin(lifts))
+    return lifts[i], candidates[i]
+
+
+def _ridge_capsules():
+    """Capsules across the ridge, their axis 2-50 mm below the crest and both ends outside the solid."""
+    bodies = []
+    for depth in (0.002, 0.005, 0.02, 0.05):
+        for yaw, tilt in ((0.0, 0.0), (20.0, 0.0), (0.0, 4.0), (25.0, -3.0)):
+            q = _quat_mul(
+                _axis_angle((0.0, 0.0, 1.0), np.radians(yaw)),
+                _quat_mul(_axis_angle((0.0, 1.0, 0.0), np.radians(tilt)), LYING),
+            )
+            pose = np.array([0.0, 0.05, RIDGE_HEIGHT - depth, *q], np.float32).astype(np.float64)
+            bodies.append(("capsule", {"radius": 0.03, "half_height": 0.15}, pose))
+    return bodies
+
+
+def test_capsule_axis_exits_over_a_ridge(test, device):
+    """Give a capsule whose axis passes below a ridge one exit, the segment's exact minimum translation.
+
+    Both ends lie outside the solid, so neither has an exit (G2); the axis interior, inside, exits over the crease:
+    one row with the normal from the axis to the crease and the distance of the two lines, which is the smallest
+    lift over the ridge's normal arc that frees the segment (:func:`_ridge_translation`). A point exit of the deepest
+    axis point through either face would push the capsule sideways by less than it needs.
+    """
+    heights = _ridge_terrain()
+    hf = tu.reference_surface(tu.heightfield_model(heights, 1.0, 1.0, device="cpu"))
+    bodies = _ridge_capsules()
+    model, _hfield, shapes = tu.body_scene(heights, 1.0, 1.0, bodies, device=device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    rows = tu.shadow_rows(pipeline)
+    for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
+        core = ref.make_core(kind, dims, pose)
+        for end in (core.a, core.b):
+            test.assertFalse(ref._below_surface(hf, end))
+        translation, direction = _ridge_translation(core.a, core.b)
+        got = rows.get(shape, [])
+        with test.subTest(pose=np.round(pose[:3], 4).tolist()):
+            test.assertEqual(len(got), 1, msg=got)
+            _q, n, d, feature = got[0]
+            test.assertEqual((feature >> 5) & 3, int(TERRAIN_FEATURE_EDGE))
+            test.assertAlmostEqual(-d, translation, delta=1.0e-5)
+            test.assertLess(tu.angle_between(n, direction), 1.0e-3)
+            law = _law_rows(hf, kind, dims, pose)
+            test.assertEqual(len(law), 1)
+            test.assertAlmostEqual(law[0].d, -translation, delta=1.0e-6)
+
+
+def test_capsule_axis_inside_without_exit_gets_recovery(test, device):
+    """Give an axis inside the solid with no exit the face over its deepest crossing under a crease (G3).
+
+    The axis descends 40 deg across a ridge of 63 deg faces, 10 mm below the crest where its footprint crosses it.
+    The point of the axis closest to the crest lies outside the solid, above a face, so no exit lifts it over the
+    crease; the axis interior gets the plane of the crest's first triangle at its crossing, its normal and depth.
+    """
+    heights = _ridge_terrain()
+    hf = tu.reference_surface(tu.heightfield_model(heights, 1.0, 1.0, device="cpu"))
+    depth = 0.01
+    q = _axis_angle((0.0, 1.0, 0.0), np.radians(90.0 + 40.0))
+    pose = np.array([0.0, 0.05, RIDGE_HEIGHT - depth, *q], np.float32).astype(np.float64)
+    dims = {"radius": 0.02, "half_height": 0.13}
+    model, _hfield, shapes = tu.body_scene(heights, 1.0, 1.0, [("capsule", dims, pose)], device=device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    got = tu.shadow_rows(pipeline).get(shapes[0], [])
+    core = ref.make_core("capsule", dims, pose)
+    for end in (core.a, core.b):
+        test.assertFalse(ref._below_surface(hf, end))
+    exits = [row for row in got if row[2] < 0.0]
+    test.assertEqual(len(exits), 1, msg=got)
+    _q, n, d, feature = exits[0]
+    test.assertEqual((feature >> 5) & 3, int(TERRAIN_FEATURE_RECOVERY))
+    # The crest's first triangle is the face on its -x side; the crossing lies `depth` below the crest.
+    face = np.array([-RIDGE_SLOPE, 0.0, 1.0]) / np.sqrt(1.0 + RIDGE_SLOPE**2)
+    crossing = core.a + (0.0 - core.a[0]) / (core.b[0] - core.a[0]) * (core.b - core.a)
+    test.assertLess(tu.angle_between(n, face), 1.0e-3)
+    test.assertAlmostEqual(d, float(face @ (crossing - np.array([0.0, 0.0, RIDGE_HEIGHT]))), delta=1.0e-5)
+    law = [row for row in _law_rows(hf, "capsule", dims, pose) if row.d < 0.0]
+    test.assertEqual(len(law), 1)
+    test.assertAlmostEqual(law[0].d, d, delta=1.0e-6)
+
+
+def test_point_rows_point_up_on_steep_terrain(test, device):
+    """Give spheres and capsules on steep, spiky terrain only rows whose normal points up.
+
+    Every outward normal of a heightfield lies in a cone spanned by its faces' upward normals, and an exit points
+    from the core point to its closest surface point across a valley or a face, or (an axis) to a ridge's crease
+    within its arc. An axis point inside the solid but beyond both faces of a ridge lies above the ridge, where an
+    exit to its crease would point down and push the capsule in.
+    """
+    rng = np.random.default_rng(5)
+    heights = np.round(rng.uniform(0.0, 0.25, (33, 33)) / 0.01) * 0.01
+    hf = tu.reference_surface(tu.heightfield_model(heights, 1.6, 1.6, device="cpu"))
+    bodies = []
+    for i in range(600):
+        kind = "sphere" if i % 2 == 0 else "capsule"
+        dims = {"radius": 0.03} if kind == "sphere" else {"radius": 0.03, "half_height": 0.08}
+        x, y = rng.uniform(-1.3, 1.3, 2)
+        q = np.array([0.0, 0.0, 0.0, 1.0])
+        if kind == "capsule":
+            q = _quat_mul(_axis_angle((0.0, 0.0, 1.0), rng.uniform(0.0, 2.0 * np.pi)), LYING)
+        z = hf.height(x, y) + rng.uniform(-0.05, 0.08)
+        bodies.append((kind, dims, np.array([x, y, z, *q], np.float32).astype(np.float64)))
+    model, _hfield, shapes = tu.body_scene(heights, 1.6, 1.6, bodies, device=device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    rows = tu.shadow_rows(pipeline)
+    down = [
+        (kind, pose[:3].tolist(), row[1].tolist(), row[2])
+        for shape, (kind, _dims, pose) in zip(shapes, bodies, strict=True)
+        for row in rows.get(shape, [])
+        if row[1][2] <= 0.0
+    ]
+    test.assertEqual(down, [])
+    test.assertGreater(sum(len(v) for v in rows.values()), len(bodies))
+    for kind, dims, pose in bodies[1::10]:
+        for row in _law_rows(hf, kind, dims, pose):
+            test.assertGreater(row.n[2], 0.0, msg=f"{kind} at {pose[:3].tolist()}: {row}")
+
+
+# ----------------------------------------------------------------------------------------------------------------
 # the tiled kernel
 # ----------------------------------------------------------------------------------------------------------------
 
@@ -533,6 +691,9 @@ for _name, _func in (
     ("test_point_rows_are_complete", test_point_rows_are_complete),
     ("test_point_rows_match_the_float64_law", test_point_rows_match_the_float64_law),
     ("test_buried_cores_exit_by_the_minimum_translation", test_buried_cores_exit_by_the_minimum_translation),
+    ("test_capsule_axis_exits_over_a_ridge", test_capsule_axis_exits_over_a_ridge),
+    ("test_capsule_axis_inside_without_exit_gets_recovery", test_capsule_axis_inside_without_exit_gets_recovery),
+    ("test_point_rows_point_up_on_steep_terrain", test_point_rows_point_up_on_steep_terrain),
     ("test_tiled_kernel_matches_one_thread_kernel", test_tiled_kernel_matches_one_thread_kernel),
 ):
     add_function_test(TestTerrainLawPoint, _name, _func, devices=devices)

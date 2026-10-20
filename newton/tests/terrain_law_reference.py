@@ -9,7 +9,9 @@ surface feature:
 
 * P: point and segment cores (sphere centre, capsule ends and axis interior): face, crease-edge and vertex minima
   under one shared set of predicate values; G2 keeps one exit for a core point inside the solid, G3 the face
-  vertically above it when no exit lies in the window.
+  vertically above it when no exit lies in the window. An axis passing below a ridge exits over it (the segment's
+  minimum translation), and an axis inside the solid with no exit gets G3 at its deepest crossing under a crease
+  (:func:`capsule_law`).
 * F: solid cores against plane clusters: the analytic plane manifold of the core against the cluster plane,
   emitted once per cluster by the triangle holding the first supported point.
 * E: solid cores against convex creases: the maximiser of the separation over the crease's normal arc, then the
@@ -1218,37 +1220,86 @@ def sphere_law(hf, core, D, window, *, stats=None):
     return PointLaw(hf, tris, edges, verts).minima(core.c, D, "c", stats=stats)
 
 
+EDGE_ORDER = {"H": 0, "V": 1, "D": 2}
+"""Window edge kinds in the kernels' walk order (a vertex's x-edge, y-edge, diagonal)."""
+
+
+def _footprint_crossing(a, b, v0, v1):
+    """Parameters ``(s, t)`` where segment ``ab``'s footprint (xy) crosses segment ``v0 v1``'s, or None."""
+    d1 = (b - a)[:2]
+    d2 = (v1 - v0)[:2]
+    den = float(d1[0] * d2[1] - d1[1] * d2[0])
+    if den == 0.0:
+        return None
+    r = (v0 - a)[:2]
+    s = float(r[0] * d2[1] - r[1] * d2[0]) / den
+    t = float(r[0] * d1[1] - r[1] * d1[0]) / den
+    if not (0.0 <= s <= 1.0 and 0.0 <= t <= 1.0):
+        return None
+    return s, t
+
+
 def capsule_law(hf, core, D, window, *, stats=None):
+    """The rows of a segment core: its ends as point cores (G2, G3) and its axis interior.
+
+    The axis interior's rows are the closest points of the axis and a crease (both segment parameters inside) or a
+    vertex, the normal from the surface toward the axis point in the feature's normal cone:
+
+    * outside the solid: at a ridge (convex crease) beyond both faces, at a vertex in its Voronoi region;
+    * inside it (an exit): below a ridge within both faces, so that the normal from the axis point to the crease
+      lies in the ridge's arc and the exit lifts the axis over the crease, the segment's minimum translation out of
+      the ridge (a point exit through a face would push the segment sideways); at a valley (concave crease) beyond
+      both faces and at a pit vertex in its Voronoi region, the axis point's closest surface point.
+
+    G3 for the axis interior: with both ends outside and no axis exit, the deepest crossing of the axis's footprint
+    under a crease (ties to the first in the kernels' walk order) gets the plane of the crease's first triangle,
+    its normal and depth.
+    """
     tris, edges, verts = window
     law = PointLaw(hf, tris, edges, verts)
     out = law.minima(core.a, D, "a", stats=stats) + law.minima(core.b, D, "b", stats=stats)
     a, b = core.a, core.b
     ab = b - a
-    # axis-interior minima against edges
+    axis = []
+    ends_outside = not _below_surface(hf, a) and not _below_surface(hf, b)
+    witness = None
+    # axis-interior minima and exits against creases
     for e in edges:
-        _k, _r, _c, i0, i1, ta, tb, _oa, _ob = e
+        kind, r, c, i0, i1, ta, tb, _oa, _ob = e
         if ta is None or tb is None:
             continue
+        cls = hf.edge_class(e)
+        if cls == "flat":
+            continue
         v0, v1 = hf.V(*i0), hf.V(*i1)
+        row = None
         st = _closest_seg_seg(a, b, v0, v1)
-        if st is None:
-            continue
-        s, t = st
-        if not (0.0 < s < 1.0 and 0.0 < t < 1.0):
-            continue
-        p = a + s * ab
-        key = tuple(sorted((i0, i1)))
-        if not (law.face_pred(ta, key, p) > 0.0 and law.face_pred(tb, key, p) > 0.0):
-            continue
-        q = v0 + t * (v1 - v0)
-        dist = float(np.linalg.norm(p - q))
-        if dist < 1e-12:
-            continue
-        below = _below_surface(hf, p)
-        n, d = ((q - p) / dist, -dist) if below else ((p - q) / dist, dist)
-        if d > D:
-            continue
-        out.append(Row(q, p, n, d, ("s", "E", e[0], e[1], e[2])))
+        if st is not None and 0.0 < st[0] < 1.0 and 0.0 < st[1] < 1.0:
+            s, t = st
+            p = a + s * ab
+            q = v0 + t * (v1 - v0)
+            key = tuple(sorted((i0, i1)))
+            sa, sb = law.face_pred(ta, key, p), law.face_pred(tb, key, p)
+            dist = float(np.linalg.norm(p - q))
+            if dist >= 1e-12:
+                if _below_surface(hf, p):
+                    claims = (sa > 0.0 and sb > 0.0) if cls == "concave" else (sa < 0.0 and sb < 0.0)
+                    n, d = (q - p) / dist, -dist
+                else:
+                    claims = cls == "convex" and sa > 0.0 and sb > 0.0
+                    n, d = (p - q) / dist, dist
+                if claims and d <= D:
+                    row = Row(q, p, n, d, ("s", "E", e[0], e[1], e[2]))
+        if row is not None:
+            axis.append(row)
+        elif ends_outside:
+            crossing = _footprint_crossing(a, b, v0, v1)
+            if crossing is not None:
+                s, t = crossing
+                depth = float((v0[2] + t * (v1[2] - v0[2])) - (a[2] + s * ab[2]))
+                order = (r, c, EDGE_ORDER[kind])
+                if depth > 0.0 and (witness is None or (-depth, order) < (-witness[0], witness[1])):
+                    witness = (depth, order, a + s * ab, ta)
     # axis-interior minima against vertices
     L2 = float(ab @ ab)
     for r, c in verts:
@@ -1270,8 +1321,14 @@ def capsule_law(hf, core, D, window, *, stats=None):
         n, d = (-w / dist, -dist) if below else (w / dist, dist)
         if d > D:
             continue
-        out.append(Row(v, p, n, d, ("s", "V", r, c)))
-    return out
+        axis.append(Row(v, p, n, d, ("s", "V", r, c)))
+    if witness is not None and not any(row.d < 0.0 for row in axis):
+        _depth, _order, p, ta = witness
+        n, pa = hf.plane(ta)
+        d = float(n @ (p - pa))
+        if d < 0.0:
+            axis.append(Row(p - d * n, p.copy(), n.copy(), d, ("s", "R", ta)))
+    return out + axis
 
 
 def _sigma(core, n, x0):
