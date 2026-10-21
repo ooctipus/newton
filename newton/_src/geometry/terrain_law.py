@@ -1335,7 +1335,7 @@ def _slot_member(alive: int, group: _MaskInts, i: int, g: int) -> bool:
 
 
 @wp.func
-def _slot_lower_hull_value(
+def _slot_implied(
     q: wp.array[wp.vec3],
     n: wp.array[wp.vec3],
     d: wp.array[float],
@@ -1349,12 +1349,13 @@ def _slot_lower_hull_value(
     e2: wp.vec3,
     point: wp.vec2,
     eps: float,
-) -> tuple[bool, float]:
-    """The lowest convex interpolation of the distances of plane group ``g``'s members but ``skip`` at a tangent
-    position (their core points' tangent coordinates): members within ``4 eps`` of the position coincide with it; a
-    position on a segment or in a triangle of members interpolates their distances."""
-    found = bool(False)
-    best = float(0.0)
+) -> bool:
+    """Whether the other members of plane group ``g`` imply member ``skip`` at its tangent position: whether the lowest
+    convex interpolation of their distances there (members within ``4 eps`` of the position coincide with it; a
+    position on a segment or in a triangle of members interpolates their distances) reaches its distance within
+    :data:`TERRAIN_IMPLIED_RESIDUAL`. It stops at the first interpolation that does: the lowest one does exactly when
+    one does (a rounded subtraction keeps order)."""
+    limit = d[base + skip]
     tolerance = _MERGE_SCALE * eps
     for a in range(count):
         if a == skip or not _slot_member(alive, group, a, g):
@@ -1363,9 +1364,8 @@ def _slot_lower_hull_value(
         pa = wp.vec2(wp.dot(ka, e1), wp.dot(ka, e2))
         da = d[base + a]
         if wp.length(point - pa) <= tolerance:
-            if not found or da < best:
-                best = da
-                found = True
+            if limit >= da - _IMPLIED_RESIDUAL:
+                return True
         for b in range(a + 1, count):
             if b == skip or not _slot_member(alive, group, b, g):
                 continue
@@ -1378,10 +1378,8 @@ def _slot_lower_hull_value(
                 s = wp.dot(point - pa, ab) / length2
                 perpendicular = wp.abs(_cross2(ab, point - pa)) / wp.sqrt(length2)
                 if s >= -_BARYCENTRIC_TOLERANCE and s <= 1.0 + _BARYCENTRIC_TOLERANCE and perpendicular <= tolerance:
-                    value = da + s * (db - da)
-                    if not found or value < best:
-                        best = value
-                        found = True
+                    if limit >= (da + s * (db - da)) - _IMPLIED_RESIDUAL:
+                        return True
             for c in range(b + 1, count):
                 if c == skip or not _slot_member(alive, group, c, g):
                     continue
@@ -1398,10 +1396,9 @@ def _slot_lower_hull_value(
                         and beta + gamma <= 1.0 + _BARYCENTRIC_TOLERANCE
                     ):
                         value = da + beta * (db - da) + gamma * (d[base + c] - da)
-                        if not found or value < best:
-                            best = value
-                            found = True
-    return found, best
+                        if limit >= value - _IMPLIED_RESIDUAL:
+                            return True
+    return False
 
 
 @wp.func
@@ -1453,36 +1450,33 @@ def terrain_finish_slots(
                 if terrain_rows_same_plane(qi, ni, q[base + j], n[base + j], eps):
                     group[i] = j
                     break
-    # 3. implied rows, the shallowest first, one at a time
+    # 3. implied rows, the shallowest first, one at a time. One pass in that order drops what testing again from the
+    # shallowest after every drop would: a drop removes interpolation candidates, so it only raises the lower hull of
+    # a group's other rows, and no row found not implied before a drop is implied after it.
     for g in range(count):
         if ((alive >> g) & 1) == 0 or group[g] != g:
             continue
         e1, e2 = _tangent_frame(n[base + g])
-        changed = bool(True)
-        while changed:
-            changed = False
-            size = int(0)
+        size = int(0)
+        for i in range(count):
+            if _slot_member(alive, group, i, g):
+                size += 1
+        tested = int(0)
+        while size >= 3:
+            pick = int(-1)
             for i in range(count):
-                if _slot_member(alive, group, i, g):
-                    size += 1
-            if size < 3:
+                if _slot_member(alive, group, i, g) and ((tested >> i) & 1) == 0:
+                    if pick < 0 or d[base + i] > d[base + pick]:
+                        pick = i
+            if pick < 0:
                 break
-            tested = int(0)
-            for _pass in range(size):
-                pick = int(-1)
-                for i in range(count):
-                    if _slot_member(alive, group, i, g) and ((tested >> i) & 1) == 0:
-                        if pick < 0 or d[base + i] > d[base + pick]:
-                            pick = i
-                tested = tested | (1 << pick)
-                kj = _slot_k(q, n, d, base + pick)
-                found, value = _slot_lower_hull_value(
-                    q, n, d, base, count, alive, group, g, pick, e1, e2, wp.vec2(wp.dot(kj, e1), wp.dot(kj, e2)), eps
-                )
-                if found and d[base + pick] >= value - _IMPLIED_RESIDUAL:
-                    alive = alive & ~(1 << pick)
-                    changed = True
-                    break
+            tested = tested | (1 << pick)
+            kj = _slot_k(q, n, d, base + pick)
+            if _slot_implied(
+                q, n, d, base, count, alive, group, g, pick, e1, e2, wp.vec2(wp.dot(kj, e1), wp.dot(kj, e2)), eps
+            ):
+                alive = alive & ~(1 << pick)
+                size -= 1
     # 4. at most four rows per group: deepest, farthest, largest triangle, largest quadrilateral
     for i in range(count):
         rank[i] = 4
@@ -1584,7 +1578,7 @@ def _list_member(scratch: TerrainFinishScratch, i: int, g: int) -> bool:
 
 
 @wp.func
-def _list_lower_hull_value(
+def _list_implied(
     scratch: TerrainFinishScratch,
     base: int,
     count: int,
@@ -1594,10 +1588,9 @@ def _list_lower_hull_value(
     e2: wp.vec3,
     point: wp.vec2,
     eps: float,
-) -> tuple[bool, float]:
-    """:func:`_slot_lower_hull_value` over a full-finish block's candidates (their core points read, not rebuilt)."""
-    found = bool(False)
-    best = float(0.0)
+) -> bool:
+    """:func:`_slot_implied` over a full-finish block's candidates (their core points read, not rebuilt)."""
+    limit = scratch.d[base + skip]
     tolerance = _MERGE_SCALE * eps
     for a in range(count):
         if a == skip or not _list_member(scratch, base + a, g):
@@ -1606,9 +1599,8 @@ def _list_lower_hull_value(
         pa = wp.vec2(wp.dot(ka, e1), wp.dot(ka, e2))
         da = scratch.d[base + a]
         if wp.length(point - pa) <= tolerance:
-            if not found or da < best:
-                best = da
-                found = True
+            if limit >= da - _IMPLIED_RESIDUAL:
+                return True
         for b in range(a + 1, count):
             if b == skip or not _list_member(scratch, base + b, g):
                 continue
@@ -1621,10 +1613,8 @@ def _list_lower_hull_value(
                 s = wp.dot(point - pa, ab) / length2
                 perpendicular = wp.abs(_cross2(ab, point - pa)) / wp.sqrt(length2)
                 if s >= -_BARYCENTRIC_TOLERANCE and s <= 1.0 + _BARYCENTRIC_TOLERANCE and perpendicular <= tolerance:
-                    value = da + s * (db - da)
-                    if not found or value < best:
-                        best = value
-                        found = True
+                    if limit >= (da + s * (db - da)) - _IMPLIED_RESIDUAL:
+                        return True
             for c in range(b + 1, count):
                 if c == skip or not _list_member(scratch, base + c, g):
                     continue
@@ -1641,10 +1631,9 @@ def _list_lower_hull_value(
                         and beta + gamma <= 1.0 + _BARYCENTRIC_TOLERANCE
                     ):
                         value = da + beta * (db - da) + gamma * (scratch.d[base + c] - da)
-                        if not found or value < best:
-                            best = value
-                            found = True
-    return found, best
+                        if limit >= value - _IMPLIED_RESIDUAL:
+                            return True
+    return False
 
 
 @wp.func
@@ -1683,37 +1672,30 @@ def terrain_finish_list(scratch: TerrainFinishScratch, base: int, count: int, ep
                 if terrain_rows_same_plane(qi, ni, scratch.q[base + j], scratch.n[base + j], eps):
                     scratch.group[base + i] = j
                     break
-    # 3. implied rows, the shallowest first, one at a time
+    # 3. implied rows, the shallowest first, one at a time, in one pass (see terrain_finish_slots)
     for g in range(count):
         if scratch.alive[base + g] == 0 or scratch.group[base + g] != g:
             continue
         e1, e2 = _tangent_frame(scratch.n[base + g])
-        changed = bool(True)
-        while changed:
-            changed = False
-            size = int(0)
+        size = int(0)
+        for i in range(count):
+            if _list_member(scratch, base + i, g):
+                size += 1
+        for i in range(count):
+            scratch.mark[base + i] = 0
+        while size >= 3:
+            pick = int(-1)
             for i in range(count):
-                if _list_member(scratch, base + i, g):
-                    size += 1
-            if size < 3:
+                if _list_member(scratch, base + i, g) and scratch.mark[base + i] == 0:
+                    if pick < 0 or scratch.d[base + i] > scratch.d[base + pick]:
+                        pick = i
+            if pick < 0:
                 break
-            for i in range(count):
-                scratch.mark[base + i] = 0
-            for _pass in range(size):
-                pick = int(-1)
-                for i in range(count):
-                    if _list_member(scratch, base + i, g) and scratch.mark[base + i] == 0:
-                        if pick < 0 or scratch.d[base + i] > scratch.d[base + pick]:
-                            pick = i
-                scratch.mark[base + pick] = 1
-                kj = scratch.k[base + pick]
-                found, value = _list_lower_hull_value(
-                    scratch, base, count, g, pick, e1, e2, wp.vec2(wp.dot(kj, e1), wp.dot(kj, e2)), eps
-                )
-                if found and scratch.d[base + pick] >= value - _IMPLIED_RESIDUAL:
-                    scratch.alive[base + pick] = 0
-                    changed = True
-                    break
+            scratch.mark[base + pick] = 1
+            kj = scratch.k[base + pick]
+            if _list_implied(scratch, base, count, g, pick, e1, e2, wp.vec2(wp.dot(kj, e1), wp.dot(kj, e2)), eps):
+                scratch.alive[base + pick] = 0
+                size -= 1
     # 4. at most four rows per group: deepest, farthest, largest triangle, largest quadrilateral
     for i in range(count):
         scratch.rank[base + i] = 4

@@ -2537,29 +2537,65 @@ def group_ranks(group, *, normal=None):
 
 
 def _drop_implied(g, stats, implied):
+    """Drop a plane group's rows its other rows imply, the shallowest first, one at a time: in one pass, which drops
+    what testing again from the shallowest after every drop would (a drop only raises the others' lower hull)."""
     if len(g) < 3:
         return g
-    g = list(g)
-    changed = True
-    while changed and len(g) >= 3:
-        changed = False
-        K = np.array([ct.k for ct in g])
-        d = np.array([ct.d for ct in g])
-        for j in sorted(range(len(g)), key=lambda i: (-d[i], i)):
-            others = [i for i in range(len(g)) if i != j]
-            if implied == "hull3d":
-                val = _convex_interp3(K[others], d[others], K[j])
-                drop = val is not None and d[j] >= val - 1e-9
-            else:
-                val = lower_hull_value(K[others], d[others], K[j], g[0].n)
-                drop = val is not None and d[j] >= val - IMPLIED_RESIDUAL
-            if drop:
-                if stats:
-                    stats.implied += 1
-                g.pop(j)
-                changed = True
-                break
-    return g
+    K = np.array([ct.k for ct in g])
+    d = np.array([ct.d for ct in g])
+    alive = [True] * len(g)
+    size = len(g)
+    for j in sorted(range(len(g)), key=lambda i: (-d[i], i)):
+        if size < 3:
+            break
+        others = [i for i in range(len(g)) if i != j and alive[i]]
+        if implied == "hull3d":
+            val = _convex_interp3(K[others], d[others], K[j])
+            drop = val is not None and d[j] >= val - 1e-9
+        else:
+            drop = lower_hull_reaches(K[others], d[others], K[j], g[0].n, d[j], IMPLIED_RESIDUAL)
+        if drop:
+            if stats:
+                stats.implied += 1
+            alive[j] = False
+            size -= 1
+    return [ct for ct, keep in zip(g, alive, strict=True) if keep]
+
+
+def lower_hull_reaches(P, d, p, n, depth, residual, *, tol=1e-9):
+    """Whether ``depth >= lower_hull_value(P, d, p, n) - residual`` (:func:`lower_hull_value`): the first interpolation
+    that reaches ``depth`` decides it, as the lowest would (a rounded subtraction keeps order)."""
+    e1 = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    e1 = e1 - (e1 @ n) * n
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(n, e1)
+    U = np.stack([P @ e1, P @ e2], 1) if len(P) else np.zeros((0, 2))
+    u = np.array([p @ e1, p @ e2])
+    m = len(U)
+    for i in range(m):
+        if np.linalg.norm(U[i] - u) <= tol and depth >= d[i] - residual:
+            return True
+        for j in range(i + 1, m):
+            a, b = U[i], U[j]
+            ab = b - a
+            L2 = float(ab @ ab)
+            if L2 < 1e-20:
+                continue
+            s = float((u - a) @ ab) / L2
+            perp = abs(ab[0] * (u - a)[1] - ab[1] * (u - a)[0]) / math.sqrt(L2)
+            if -tol <= s <= 1 + tol and perp <= tol and depth >= (d[i] + s * (d[j] - d[i])) - residual:
+                return True
+            for k in range(j + 1, m):
+                c = U[k]
+                T = np.stack([b - a, c - a], 1)
+                det = T[0, 0] * T[1, 1] - T[0, 1] * T[1, 0]
+                if abs(det) < 1e-18:
+                    continue
+                uv = np.linalg.solve(T, u - a)
+                if uv[0] >= -tol and uv[1] >= -tol and uv[0] + uv[1] <= 1 + tol:
+                    if depth >= (d[i] + uv[0] * (d[j] - d[i]) + uv[1] * (d[k] - d[i])) - residual:
+                        return True
+    return False
 
 
 def lower_hull_value(P, d, p, n, *, tol=1e-9):

@@ -1508,6 +1508,40 @@ def test_wide_box_keeps_every_support(test, device):
     test.assertEqual((missing, extra), ([], []))
 
 
+def test_large_plane_group_follows_the_law(test, device):
+    """Give a box over a lattice of equal-height pillars the float64 law's rows: one plane group of over 100 rows.
+
+    A flat box 2 mm above one-cell pillars every third cell (5 cm cells): every pillar top under it gives rule F rows
+    in one plane, a plane group of 169 candidates, which the finish's implied-row step takes whole (no candidate count
+    bounds it). The step runs in one pass, the shallowest row first, and each test stops at the first interpolation of
+    the other rows that implies it: the same rows as testing again after every drop and taking the lowest
+    interpolation, and on the CPU 0.01 s of a collide here instead of 0.12 s.
+    """
+    n = 61
+    r = np.arange(n)
+    heights = np.where((r[:, None] % 3 != 0) & (r[None, :] % 3 != 0), 0.05, 0.0)
+    hf = tu.reference_surface(tu.heightfield_model(heights, 1.5, 1.5, device="cpu"))
+    bodies = [
+        ("box", {"half": (half, half, 0.02)}, _f32_pose(np.r_[0.013, 0.007, 0.05 + 0.02 + 0.002, 0.0, 0.0, 0.0, 1.0]))
+        for half in (0.2, 0.45)
+    ]
+    model, _hfield, shapes = su.solid_scene(heights, 1.5, 1.5, bodies, device=device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    rows = tu.shadow_rows(pipeline)
+    for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
+        with test.subTest(half=dims["half"][0]):
+            core = ref.make_core(kind, dims, pose)
+            lo, hi = core.aabb()
+            window = hf.window_features(hf.cells_in_box(lo[:2] - su.REACH, hi[:2] + su.REACH))
+            candidates = ref.solid_law(hf, core, su.REACH, window)
+            if dims["half"][0] > 0.4:
+                test.assertGreater(len(candidates), 100)
+            missing, extra, deepest = su.compare_solid_rows(su.law_rows(hf, kind, dims, pose), rows[shape])
+            test.assertEqual((missing, extra), ([], []))
+            test.assertLess(deepest, 1.0e-5)
+    test.assertFalse(any(pipeline.narrow_phase.buffer_capacity_status().values()))
+
+
 def test_window_past_its_bound_is_flagged(test, device):
     """Flag a pair whose window gives more distinct candidates than its full-finish scratch holds, and raise.
 
@@ -1947,6 +1981,7 @@ for _name, _func in (
     ("test_long_box_keeps_every_support", test_long_box_keeps_every_support),
     ("test_deferred_pairs_keep_their_rows_beyond_the_grid", test_deferred_pairs_keep_their_rows_beyond_the_grid),
     ("test_wide_box_keeps_every_support", test_wide_box_keeps_every_support),
+    ("test_large_plane_group_follows_the_law", test_large_plane_group_follows_the_law),
     ("test_window_past_its_bound_is_flagged", test_window_past_its_bound_is_flagged),
     ("test_solid_launches_share_the_point_grids", test_solid_launches_share_the_point_grids),
     ("test_solid_fixed_grids_take_each_pair_once", test_solid_fixed_grids_take_each_pair_once),
