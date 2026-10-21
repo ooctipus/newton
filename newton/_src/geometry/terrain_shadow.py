@@ -419,6 +419,8 @@ class TerrainLawShadow:
         missing = [c for c in self.classes if c not in TERRAIN_LAW_KERNELS]
         if missing:
             raise ValueError(f"The terrain law has no kernel for partner classes {missing}")
+        if job_scale is not None and not (np.isfinite(float(job_scale)) and float(job_scale) > 0.0):
+            raise ValueError(f"The terrain law's job capacities need a positive finite factor, not {job_scale!r}")
         self.table = TerrainPairTable(model, pairs=pairs)
         """The static (heightfield, partner) pair table."""
         self.job_scale = 1.0 if job_scale is None else float(job_scale)

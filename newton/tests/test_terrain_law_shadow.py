@@ -49,6 +49,7 @@ from newton._src.geometry.terrain_law_solid import (
 from newton._src.geometry.terrain_shadow import (
     TERRAIN_LAW_KERNELS,
     TERRAIN_LAW_SPILL_SHARE,
+    TerrainLawShadow,
     parse_terrain_law_shadow,
     parse_terrain_law_shadow_jobs,
     parse_terrain_law_shadow_rows,
@@ -523,6 +524,10 @@ class TestTerrainLawShadow(unittest.TestCase):
                 parse_terrain_law_shadow_jobs(value)
         with patch.dict(os.environ, {"NEWTON_TERRAIN_LAW_SHADOW_JOBS": "0"}), self.assertRaises(ValueError):
             tu.shadow_pipeline(model, **PIPELINE)
+        # The shadow's own option takes the same factors: none of these would size a list.
+        for value in (0, -1.0, float("inf"), float("nan")):
+            with self.subTest(job_scale=value), self.assertRaisesRegex(ValueError, "positive finite factor"):
+                TerrainLawShadow(model, (TERRAIN_PARTNER_BOX,), job_scale=value)
 
     def test_spill_overflow_raises_terrain_rows_cpu(self):
         """Raise ``terrain_rows`` when the spill region, sized at the scene level, has no room for a pair's rows, and
