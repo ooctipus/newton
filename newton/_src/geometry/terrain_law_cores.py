@@ -15,7 +15,7 @@ One struct per partner class, each with overloads of the same functions, which t
   or the minimum translation from inside) and :func:`core_recovery_point` (rule R's boundary points);
 * rule X's candidate deepest points: :func:`core_exit_point` (tried as they are: corners, hull points, a cone's
   apex), :func:`core_support_point` (the ends of the lowest generator along a normal) and :func:`core_far_point`
-  (per rim, or an ellipsoid's, the point farthest from a terrain vertex);
+  (the local maxima of the distance from a terrain vertex: per rim its farthest point, an ellipsoid's one or two);
 * :func:`core_bounds` (axis-aligned bounds) and :func:`core_sphere` (a bounding sphere).
 
 Every definition is the float64 law's (``newton/tests/terrain_law_reference.py``), in float32: the plane manifolds are
@@ -598,13 +598,14 @@ def core_exit_point(core: TerrainBoxCore, i: int) -> wp.vec3:
 
 @wp.func
 def core_far_count(core: TerrainBoxCore) -> int:
-    """Points rule X takes per window vertex (the farthest from it on a curved extreme set): none for a box."""
+    """Points rule X takes per window vertex (the local maxima of the distance from it on a curved extreme set): none
+    for a box."""
     return 0
 
 
 @wp.func
-def core_far_point(core: TerrainBoxCore, i: int, v: wp.vec3) -> wp.vec3:
-    return core.c
+def core_far_point(core: TerrainBoxCore, i: int, v: wp.vec3) -> tuple[bool, wp.vec3]:
+    return False, core.c
 
 
 @wp.func
@@ -1109,17 +1110,18 @@ def core_far_count(core: TerrainCylinderCore) -> int:
 
 
 @wp.func
-def core_far_point(core: TerrainCylinderCore, i: int, v: wp.vec3) -> wp.vec3:
-    """The point of rim ``i`` farthest from ``v`` (a fixed one when ``v`` lies on the axis's line)."""
+def core_far_point(core: TerrainCylinderCore, i: int, v: wp.vec3) -> tuple[bool, wp.vec3]:
+    """The point of rim ``i`` farthest from ``v`` (a fixed one when ``v`` lies on the axis's line): a circle's only
+    local maximum of the distance."""
     centre = core.c - core.h * core.a
     if core.cone == 0 and i == 0:
         centre = core.c + core.h * core.a
     w = _radial(centre - v, core.a)
     length = wp.length(w)
     if length > 1.0e-12:
-        return centre + (core.r / length) * w
+        return True, centre + (core.r / length) * w
     u, _w = _disk_basis(core.a)
-    return centre + core.r * u
+    return True, centre + core.r * u
 
 
 @wp.func
@@ -1715,17 +1717,55 @@ def core_exit_point(core: TerrainHullCore, i: int) -> wp.vec3:
 
 @wp.func
 def core_far_count(core: TerrainHullCore) -> int:
-    """Points rule X takes per window vertex: an ellipsoid's farthest from it (none for a hull)."""
+    """Points rule X takes per window vertex: an ellipsoid's local maxima of the distance from it, at most two (none
+    for a hull)."""
     if core.ellipsoid != 0:
-        return 1
+        return 2
     return 0
 
 
 @wp.func
-def core_far_point(core: TerrainHullCore, i: int, v: wp.vec3) -> wp.vec3:
-    """An ellipsoid's point farthest from ``v``: ``x_i = s_i^2 y_i / (s_i^2 - mu)`` with the secular equation's root
-    ``mu`` above the largest squared semi-axis (bisected a fixed number of steps); the end of the longest axis (the
-    first of equal ones) when ``v`` lies on that axis's plane."""
+def _secular(s: wp.vec3, y: wp.vec3, rel: wp.vec3, t: float, side: float) -> wp.vec2:
+    """An ellipsoid's secular function at ``mu = s_max^2 + side t`` (``rel`` holds ``s_i^2 - s_max^2``): ``(sum g_i^2,
+    sum g_i^2 / gap_i)`` with ``gap_i = s_i^2 - mu`` and ``g_i = s_i y_i / gap_i``, the second a half of its derivative
+    in ``mu``; an axis with ``y_i = 0`` adds no term (no pole)."""
+    f = float(0.0)
+    slope = float(0.0)
+    for i in range(3):
+        if y[i] != 0.0:
+            gap = rel[i] - side * t
+            g = (s[i] * y[i]) / gap
+            f = f + g * g
+            slope = slope + (g * g) / gap
+    return wp.vec2(f, slope)
+
+
+@wp.func
+def _secular_point(s: wp.vec3, y: wp.vec3, rel: wp.vec3, t: float, side: float) -> wp.vec3:
+    """The stationary point ``x_i = s_i^2 y_i / (s_i^2 - mu)`` at ``mu = s_max^2 + side t`` (local frame), projected
+    radially onto the ellipsoid, so that a root's float32 rounding moves it along the surface, not off it."""
+    x = wp.vec3(0.0)
+    for i in range(3):
+        if y[i] != 0.0:
+            x[i] = (s[i] * s[i] * y[i]) / (rel[i] - side * t)
+    q = wp.cw_div(x, s)
+    return x / wp.sqrt(wp.dot(q, q))
+
+
+@wp.func
+def core_far_point(core: TerrainHullCore, i: int, v: wp.vec3) -> tuple[bool, wp.vec3]:
+    """An ellipsoid's local maximum ``i`` of the distance from ``v`` (``False`` for none), from the secular equation
+    ``sum_i s_i^2 y_i^2 / (s_i^2 - mu)^2 = 1`` (``y`` is ``v`` in the local frame, ``x_i = s_i^2 y_i / (s_i^2 -
+    mu)``). Its restricted Hessian is ``diag(1 - mu / s_i^2)`` on the tangent plane, negative definite exactly where
+    ``mu`` exceeds the largest ``s_i^2`` (maximum 0, the global one: the root above it) or lies between the two largest
+    with the secular function rising (maximum 1, the near end of an elongated ellipsoid: that interval's larger root,
+    where the function is convex, falling to its minimum and rising again). Both are bisected on ``t``, the root's
+    distance from the largest ``s_i^2``, a fixed number of steps: the minimum on the sign of the derivative, then the
+    root; each point is projected radially onto the surface. Maximum 0 is the end of the longest axis (the first of
+    equal ones) when ``v`` lies on that axis's plane; maximum 1 needs two distinct largest semi-axes and ``v`` off
+    that plane."""
+    if core.ellipsoid == 0:
+        return False, core.c
     y = wp.transpose(core.rot) @ (v - core.c)
     s = core.s
     s2 = wp.cw_mul(s, s)
@@ -1734,21 +1774,50 @@ def core_far_point(core: TerrainHullCore, i: int, v: wp.vec3) -> wp.vec3:
         j = 1
     if s2[2] > s2[j]:
         j = 2
-    if wp.abs(y[j]) <= 1.0e-12 * s[j]:
-        local = wp.vec3(0.0)
-        local[j] = s[j]
-        return core.c + core.rot @ local
-    lo = s2[j]
-    hi = s2[j] + s[j] * wp.length(y)
+    rel = s2 - wp.vec3(s2[j])
+    if i == 0:
+        if wp.abs(y[j]) <= 1.0e-12 * s[j]:
+            local = wp.vec3(0.0)
+            local[j] = s[j]
+            return True, core.c + core.rot @ local
+        lo = float(0.0)
+        hi = float(s[j] * wp.length(y))
+        for _step in range(_ELLIPSOID_STEPS):
+            t = 0.5 * (lo + hi)
+            if _secular(s, y, rel, t, 1.0)[0] > 1.0:
+                lo = t
+            else:
+                hi = t
+        return True, core.c + core.rot @ _secular_point(s, y, rel, 0.5 * (lo + hi), 1.0)
+    # the middle semi-axis: the larger of the other two
+    m = (j + 1) % 3
+    if s2[(j + 2) % 3] > s2[m]:
+        m = (j + 2) % 3
+    width = -rel[m]
+    if width <= 0.0 or y[j] == 0.0:
+        return False, core.c
+    # the secular function's minimum between the two largest poles: t from 0 (mu at s_max^2) to width (s_mid^2)
+    lo = float(0.0)
+    hi = float(width)
     for _step in range(_ELLIPSOID_STEPS):
-        mu = 0.5 * (lo + hi)
-        g = wp.cw_div(wp.cw_mul(s, y), s2 - wp.vec3(mu))
-        if wp.dot(g, g) > 1.0:
-            lo = mu
+        t = 0.5 * (lo + hi)
+        if _secular(s, y, rel, t, -1.0)[1] < 0.0:
+            hi = t
         else:
-            hi = mu
-    mu = 0.5 * (lo + hi)
-    return core.c + core.rot @ wp.cw_div(wp.cw_mul(s2, y), s2 - wp.vec3(mu))
+            lo = t
+    bottom = 0.5 * (lo + hi)
+    if _secular(s, y, rel, bottom, -1.0)[0] >= 1.0:
+        return False, core.c
+    # its larger root: between the largest pole and the minimum
+    lo = float(0.0)
+    hi = float(bottom)
+    for _step in range(_ELLIPSOID_STEPS):
+        t = 0.5 * (lo + hi)
+        if _secular(s, y, rel, t, -1.0)[0] < 1.0:
+            hi = t
+        else:
+            lo = t
+    return True, core.c + core.rot @ _secular_point(s, y, rel, 0.5 * (lo + hi), -1.0)
 
 
 @wp.func

@@ -27,7 +27,8 @@ two faces and diagonal, its x- and y-edges and itself) and offers the rows of th
   :data:`TERRAIN_SOLID_EXIT_MARGIN` (:func:`solid_exits`). A deepest point whose closest surface point is unique is a
   local maximum of its distance to that one feature: rule F's support for a face, else an extreme point of the core,
   which the candidates hold (a box's corners, a hull's points, a cone's apex; per valley the core's support points at
-  the local minima of ``sigma`` over its normal arc; per vertex each rim's point farthest from it, an ellipsoid's).
+  the local minima of ``sigma`` over its normal arc; per vertex the local maxima of the distance from it: each rim's
+  farthest point, an ellipsoid's farthest point and the near end of an elongated one).
   A deepest point equally far from two or more surface points (a tie) can lie inside a core face, where no candidate
   is: there X takes the deepest candidate's exit, which may fall short of the core's depth.
 
@@ -972,7 +973,7 @@ def solid_exits(
     a vertex. The candidates, in the float64 law's order: the core's points tried as they are (a box's corners, a
     hull's points, a cone's apex; :func:`~newton._src.geometry.terrain_law_cores.core_exit_point`), then, window
     vertex by window vertex, each valley's (:func:`_exit_valley`) and, at an interior vertex above the core's lowest
-    point, each rim's point farthest from it (an ellipsoid's;
+    point, the local maxima of the distance from it (each rim's farthest point, an ellipsoid's one or two;
     :func:`~newton._src.geometry.terrain_law_cores.core_far_point`). A candidate is tried when its bound (the exit
     bound, or its distance to the feature that proposed it, the smaller) passes the threshold (:class:`_Exit`); a pair
     whose core lies wholly above its window's highest vertex has none.
@@ -1014,8 +1015,8 @@ def solid_exits(
                 if v[2] <= low:
                     continue
                 for i in range(far):
-                    x = core_far_point(core, i, v)
-                    if x[2] >= v[2]:
+                    has, x = core_far_point(core, i, v)
+                    if not has or x[2] >= v[2]:
                         # closest to the vertex only below it
                         continue
                     planes, bound = _exit_bound(data, window, planes, x)

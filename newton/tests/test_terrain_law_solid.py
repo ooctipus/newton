@@ -885,6 +885,56 @@ def test_valley_cores_reach_their_depth(test, device):
             test.assertLessEqual(su.normal_cone_angle(hf, exits[0][0], exits[0][1]), GHOST_ANGLE)
 
 
+NEEDLES = (
+    ({"semi": (0.03, 0.025, 0.12)}, (-2.88e-05, 0.0017035, 0.05, -0.0035235, 0.0199778, -0.0137802, 0.9996992)),
+    ({"semi": (0.02, 0.02, 0.1)}, (0.000511, -0.0001721, 0.04, -0.0067381, -0.0060868, 0.0250489, 0.999645)),
+    ({"semi": (0.01, 0.01, 0.1)}, (0.0002699, 0.0012358, 0.03, -0.0199863, -0.0199853, 0.0342181, 0.9990146)),
+    ({"semi": (0.015, 0.01, 0.15)}, (-0.0009437, -0.0014296, 0.08, 0.0191654, 0.0038809, 0.0439472, 0.9988425)),
+    ({"semi": (0.02, 0.02, 0.1)}, (0.0, 0.0005, 0.04, 0.0, 0.0, 0.0, 1.0)),
+)
+"""Elongated ellipsoids standing in a one-vertex pit 50 mm deep (5 cm cells), their lower ends 10 to 20 mm below the
+pit's vertex, which lies inside them."""
+
+
+def _needle_bodies(device):
+    """A flat terrain with one vertex 50 mm low and the needles of :data:`NEEDLES` standing in it."""
+    heights = np.zeros((41, 41))
+    heights[20, 20] = -0.05
+    hf = tu.reference_surface(tu.heightfield_model(heights, 1.0, 1.0, device="cpu"))
+    bodies = [("ellipsoid", dims, _f32_pose(np.asarray(pose, np.float64))) for dims, pose in NEEDLES]
+    model, hfield, shapes = su.solid_scene(heights, 1.0, 1.0, bodies, device=device)
+    return hf, model, hfield, shapes, bodies
+
+
+def test_needle_cores_reach_their_depth(test, device):
+    """Give elongated ellipsoids standing in a pit a row as deep as their lower ends, the float64 law's rows.
+
+    The pit's vertex lies inside each needle, whose lower end is its deepest point, closest to that vertex alone. The
+    end is a local maximum of the distance from the vertex, not the farthest point (the upper end, above the surface):
+    rule X takes both, an ellipsoid's every local maximum of the distance from a terrain vertex. With the farthest point
+    alone the law stopped 0.1 to 0.45 mm short, on a valley's support point.
+    """
+    hf, model, _hfield, shapes, bodies = _needle_bodies(device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    rows = tu.shadow_rows(pipeline)
+    pit = hf.V(20, 20)
+    for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
+        with test.subTest(semi=dims["semi"]):
+            got = rows.get(shape, [])
+            law = su.law_rows(hf, kind, dims, pose)
+            missing, extra, deepest = su.compare_solid_rows(law, got)
+            test.assertEqual((missing, extra), ([], []))
+            test.assertLess(deepest, 1.0e-5)
+            separation = su.refined_separation(hf, ref.make_core(kind, dims, pose))
+            test.assertLess(separation, -0.009)
+            test.assertLessEqual(min(g[2] for g in got), separation + PENETRATING_TOL)
+            exits = [g for g in got if su.is_exit_row(g)]
+            test.assertEqual(len(exits), 1)
+            # the lower end's exit is the pit's vertex
+            test.assertLess(float(np.linalg.norm(exits[0][0] - pit)), 1.0e-6)
+            test.assertLessEqual(su.normal_cone_angle(hf, exits[0][0], exits[0][1]), GHOST_ANGLE)
+
+
 def test_recovery_rows_have_distinct_feature_ids(test, device):
     """Give a buried pair's recovery rows distinct feature ids (contact matching keys on them).
 
@@ -1655,6 +1705,7 @@ for _name, _func in (
     ("test_exposed_cell_rows_follow_the_law", test_exposed_cell_rows_follow_the_law),
     ("test_buried_solids_follow_the_law", test_buried_solids_follow_the_law),
     ("test_valley_cores_reach_their_depth", test_valley_cores_reach_their_depth),
+    ("test_needle_cores_reach_their_depth", test_needle_cores_reach_their_depth),
     ("test_recovery_rows_have_distinct_feature_ids", test_recovery_rows_have_distinct_feature_ids),
     ("test_solid_rows_match_the_float64_law", test_solid_rows_match_the_float64_law),
     ("test_tiled_kernels_match_one_thread_kernels", test_tiled_kernels_match_one_thread_kernels),

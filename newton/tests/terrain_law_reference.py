@@ -1604,25 +1604,64 @@ def _rims(core):
 
 
 def _farthest_on_ellipsoid(core, v, *, steps=200):
-    """The ellipsoid point farthest from ``v`` (secular equation ``x_i = s_i^2 y_i / (s_i^2 - mu)``, ``mu`` above the
-    largest ``s_i^2``, by bisection); the end of the longest axis away from ``v`` when ``v`` lies on its plane."""
+    """The ellipsoid's local maxima of the distance from ``v``: one or two points.
+
+    With ``y`` the vertex in the local frame, the stationary points are ``x_i = s_i^2 y_i / (s_i^2 - mu)`` at the roots
+    of the secular function ``F(mu) = sum_i s_i^2 y_i^2 / (s_i^2 - mu)^2``, ``F = 1``. On the tangent plane the
+    distance's Hessian is ``diag(1 - mu / s_i^2)``, which is negative definite exactly at the root above the largest
+    ``s_i^2`` (the farthest point) and at a root between the two largest where ``F`` rises (``F'`` is twice the
+    Hessian's inverse quadratic form of the surface normal): ``F`` is convex there, so that root is the larger of the
+    interval's two, which exist when ``F``'s minimum lies below 1 (the near end of an elongated ellipsoid around a
+    vertex inside it). Both are bisected on the root's distance ``t`` from the largest ``s_i^2`` (the minimum on the
+    sign of ``F'`` first), and each point is projected radially onto the surface. The farthest point is the end of the
+    longest axis (the first of equal ones) when ``v`` lies on that axis's plane.
+    """
     y = core.R.T @ (v - core.c)
-    s2 = core.s**2
-    big = float(s2.max())
+    s = core.s
+    s2 = s**2
     j = int(np.argmax(s2))
-    if abs(y[j]) <= 1.0e-12 * float(core.s.max()):
+    rel = s2 - s2[j]
+
+    def secular(t, side):
+        f = slope = 0.0
+        for i in range(3):
+            if y[i] != 0.0:
+                gap = rel[i] - side * t
+                g = s[i] * y[i] / gap
+                f += g * g
+                slope += g * g / gap
+        return f, slope
+
+    def point(t, side):
+        x = np.array([s2[i] * y[i] / (rel[i] - side * t) if y[i] != 0.0 else 0.0 for i in range(3)])
+        return core.c + core.R @ (x / math.sqrt(float(np.sum((x / s) ** 2))))
+
+    out = []
+    if abs(y[j]) <= 1.0e-12 * float(s[j]):
         local = np.zeros(3)
-        local[j] = core.s[j]
-        return core.c + core.R @ local
-    lo, hi = big, big + float(core.s.max()) * float(np.linalg.norm(y)) + 1.0e-12
-    for _ in range(steps):
-        mid = 0.5 * (lo + hi)
-        if float(np.sum((core.s * y / (s2 - mid)) ** 2)) > 1.0:
-            lo = mid
-        else:
-            hi = mid
-    mu = 0.5 * (lo + hi)
-    return core.c + core.R @ (s2 * y / (s2 - mu))
+        local[j] = s[j]
+        out.append(core.c + core.R @ local)
+    else:
+        lo, hi = 0.0, float(s[j]) * float(np.linalg.norm(y))
+        for _ in range(steps):
+            t = 0.5 * (lo + hi)
+            lo, hi = (t, hi) if secular(t, 1.0)[0] > 1.0 else (lo, t)
+        out.append(point(0.5 * (lo + hi), 1.0))
+    m = (j + 1) % 3 if s2[(j + 1) % 3] >= s2[(j + 2) % 3] else (j + 2) % 3
+    width = -float(rel[m])
+    if width > 0.0 and y[j] != 0.0:
+        lo, hi = 0.0, width
+        for _ in range(steps):
+            t = 0.5 * (lo + hi)
+            lo, hi = (lo, t) if secular(t, -1.0)[1] < 0.0 else (t, hi)
+        bottom = 0.5 * (lo + hi)
+        if secular(bottom, -1.0)[0] < 1.0:
+            lo, hi = 0.0, bottom
+            for _ in range(steps):
+                t = 0.5 * (lo + hi)
+                lo, hi = (lo, t) if secular(t, -1.0)[0] < 1.0 else (t, hi)
+            out.append(point(0.5 * (lo + hi), -1.0))
+    return out
 
 
 def _exit_bound(hf, x):
@@ -1678,10 +1717,10 @@ def _valley_arc(hf, e):
 
 
 def _farthest_rim_points(core, v):
-    """Per rim (a cylinder's top then bottom cap, a cone's base) its point farthest from ``v``; an ellipsoid's
-    farthest point."""
+    """The core's local maxima of the distance from ``v``: per rim (a cylinder's top then bottom cap, a cone's base)
+    its point farthest from ``v``, an ellipsoid's one or two (:func:`_farthest_on_ellipsoid`)."""
     if core.kind == "ellipsoid":
-        return [_farthest_on_ellipsoid(core, v)]
+        return _farthest_on_ellipsoid(core, v)
     out = []
     for centre, axis, radius in _rims(core):
         w = centre - v
@@ -1703,8 +1742,9 @@ def exit_rule(hf, core, D, window, rows, *, stats=None):
     * every point of a box or hull, a cone's apex;
     * walking the window vertex by vertex, per valley edge (concave crease; x-, y- then diagonal edge) the core's
       support points (both ends of a lowest generator) at the local minima of ``sigma`` over the valley's normal arc
-      (:func:`_arc_angles`): the core's deepest points in the wedge below the valley; per interior vertex the point
-      of each rim (cylinder, cone) or of the ellipsoid farthest from it.
+      (:func:`_arc_angles`): the core's deepest points in the wedge below the valley; per interior vertex the core's
+      local maxima of the distance from it (:func:`_farthest_rim_points`: each rim's farthest point, an ellipsoid's
+      one or two).
 
     A candidate is tried when its bound (:func:`_exit_bound`, or its distance to the feature that proposed it, the
     smaller) exceeds the pair's depth plus the margin and the best exit found, and still does when lowered to its
