@@ -9,8 +9,10 @@ Only ``point`` has kernels yet; naming a class without one raises. With classes 
 collision pipeline builds :class:`TerrainLawShadow` once, at construction: the terrain features
 (:class:`~newton._src.geometry.terrain_contacts.TerrainFeatures`), the static pair table
 (:class:`~newton._src.geometry.terrain_contacts.TerrainPairTable`, from the pipeline's pairs) and per listed pair a
-static range of row slots. Every collide then launches, after today's terrain route, three kernels per listed class
-with dimensions fixed at construction: no host read, no allocation, no scan, so it runs inside CUDA graph capture.
+static range of row slots. Every collide then launches, after today's terrain route, up to three kernels per listed
+class (the tiled kernel only for a class with a tiled segment) with dimensions fixed at construction
+(:meth:`TerrainLawShadow.describe` records them): no host read, no allocation, no scan, so it runs inside CUDA graph
+capture.
 Today's route still produces every contact; the shadow's rows are read only by :meth:`TerrainLawShadow.rows`.
 
 The per-type kernels take ``(begin, slot_begin, inputs, data, out)``
@@ -283,6 +285,8 @@ class TerrainLawShadow:
         self.table = TerrainPairTable(model, pairs=pairs)
         """The static (heightfield, partner) pair table."""
         self._launches = []
+        self._launch_shapes = {}
+        block = terrain_law_block_dim(model.device)
         slot_first = np.full(self.table.pair_count, -1, np.int64)
         slot = 0
         device = self.device
@@ -305,15 +309,19 @@ class TerrainLawShadow:
             # One thread per pair of the class: it walks the small windows and queues the larger ones it does not
             # reject whole, which the tiled kernel's fixed grid then takes in turn.
             self._launches.append(("thread", getattr(module, thread_name), end - begin, begin, slot, work))
+            shapes = {"block_dim": block, "thread_dim": end - begin, "tiled_blocks": 0, "full_blocks": 0}
             if end > tiled_begin:
                 tiled_slot = slot + rows * (tiled_begin - begin)
                 self._launches.append(
                     ("tiled", getattr(module, tiled_name), work.blocks, tiled_begin, tiled_slot, work)
                 )
+                shapes["tiled_blocks"] = work.blocks
             if full_name is not None:
                 # A fixed grid over the class's deferred list (the pairs are found on the device, in any order).
                 scratch = terrain_finish_scratch(device)
                 self._launches.append(("full", getattr(module, full_name), scratch.blocks, begin, slot, scratch))
+                shapes["full_blocks"] = scratch.blocks
+            self._launch_shapes[terrain_law_class_name(partner_class)] = shapes
             slot += rows * (end - begin)
         self.slot_count = slot
         """Row slots of the side buffer: every listed pair times its class's row limit."""
@@ -435,7 +443,12 @@ class TerrainLawShadow:
         return rows, candidates
 
     def describe(self) -> dict:
-        """Return a host-only record of the shadow: classes, pairs and launches per lane class, memory."""
+        """Return a host-only record of the shadow: classes, pairs per lane class, launches, memory.
+
+        ``launch_shapes`` holds, per class with pairs, the dimensions fixed at construction: ``block_dim`` (every
+        launch's), ``thread_dim`` (the one-thread kernel's threads, one per pair of the class), ``tiled_blocks`` and
+        ``full_blocks`` (the tiled and full-finish kernels' grids, 0 for a kernel the class does not launch).
+        """
         pairs = {}
         for partner_class in range(TERRAIN_PARTNER_CLASSES):
             if partner_class not in self.classes:
@@ -460,6 +473,7 @@ class TerrainLawShadow:
             "classes": [terrain_law_class_name(c) for c in self.classes],
             "pairs": pairs,
             "launches": len(self._launches),
+            "launch_shapes": {name: dict(shapes) for name, shapes in self._launch_shapes.items()},
             "slots": self.slot_count,
             "bytes": {
                 "side_buffer": int(side + self._counters.capacity),

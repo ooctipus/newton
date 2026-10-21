@@ -457,7 +457,7 @@ class TestTerrainLawShadow(unittest.TestCase):
         self.assertGreater(shadow.describe()["bytes"]["finish_scratch"], 0)
 
     def test_route_record_cpu(self):
-        """Record the shadow's classes, pairs per lane class and memory in the collision selection."""
+        """Record the shadow's classes, pairs per lane class, launch shapes and memory in the collision selection."""
         model, _terrain = _mixed_scene("cpu")
         pipeline = tu.shadow_pipeline(model, **PIPELINE)
         selection = pipeline.get_collision_selection()
@@ -473,8 +473,19 @@ class TestTerrainLawShadow(unittest.TestCase):
         self.assertEqual(sum(lanes.values()), 12)
         self.assertEqual(record["slots"], 12 * TERRAIN_POINT_ROWS)
         # The one-thread kernel over the class, the tiled kernel over its queue when it has a tiled segment, and the
-        # class's full-finish kernel.
+        # class's full-finish kernel, with the dimensions fixed at construction.
         self.assertEqual(record["launches"], 2 + int(lanes["tiled"] > 0))
+        self.assertEqual(
+            record["launch_shapes"],
+            {
+                "point": {
+                    "block_dim": terrain_law_block_dim("cpu"),
+                    "thread_dim": 12,
+                    "tiled_blocks": min(lanes["tiled"], TERRAIN_LAW_TILE_BLOCKS),
+                    "full_blocks": TERRAIN_LAW_FULL_BLOCKS,
+                }
+            },
+        )
         self.assertEqual(selection["environment"]["applied"]["NEWTON_TERRAIN_LAW_SHADOW"], "point")
         # Without heightfield pairs the flag builds nothing.
         builder = newton.ModelBuilder()
