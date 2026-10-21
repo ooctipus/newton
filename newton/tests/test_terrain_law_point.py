@@ -34,6 +34,7 @@ from newton._src.geometry.terrain_law import (
     TERRAIN_FEATURE_EDGE,
     TERRAIN_FEATURE_FACE,
     TERRAIN_FEATURE_RECOVERY,
+    TERRAIN_LAW_FULL_BLOCKS,
     TERRAIN_PAIR_FILTERED,
     TERRAIN_PAIR_OUTSIDE,
     TERRAIN_PAIR_ROW_OVERFLOW,
@@ -43,6 +44,7 @@ from newton._src.geometry.terrain_law import (
     TerrainFeatureData,
     TerrainLawRows,
     TerrainPairInputs,
+    TerrainPairWork,
     TerrainPlanes,
     TerrainRows,
     TerrainWindow,
@@ -53,8 +55,11 @@ from newton._src.geometry.terrain_law import (
     terrain_face_values,
     terrain_feature_id,
     terrain_finish,
+    terrain_finish_scratch,
     terrain_finish_state,
+    terrain_law_block_dim,
     terrain_pair_exit,
+    terrain_pair_work,
     terrain_plane,
     terrain_planes,
     terrain_report,
@@ -63,13 +68,6 @@ from newton._src.geometry.terrain_law import (
     terrain_window_extent,
     terrain_window_point,
     terrain_window_vertex,
-)
-from newton._src.geometry.terrain_shadow import (
-    TERRAIN_LAW_FULL_BLOCKS,
-    TerrainPairWork,
-    terrain_finish_scratch,
-    terrain_law_block_dim,
-    terrain_pair_work,
 )
 from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_test_utils as tu
@@ -1710,7 +1708,7 @@ class TestTerrainLawPoint(unittest.TestCase):
 
         The driver reserves local memory for the largest stack a context launches, for every thread the device can
         hold (about 289,000 on a 188-SM GPU), launched or not. The kernel's candidate list and the finish's input live
-        in global scratch (:class:`~newton._src.geometry.terrain_shadow.TerrainFinishScratch`), and its walk and close
+        in global scratch (:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`), and its walk and close
         read rows there, not from copies of the list on the stack: the depot was 8,584 bytes before (10,088 bytes of
         sm_120 stack, measured at +2.5 GB of device memory) and under 4.5 KB since; what remains is the finish's own.
         """

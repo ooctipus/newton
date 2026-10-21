@@ -43,7 +43,7 @@ faces and diagonal, its x- and y-edges, itself), each evaluated for the sphere c
 the axis. An item yields at most one row (:class:`_Claim`).
 
 Thread mapping (the pair table's lane classes): :func:`terrain_point_rows` runs one thread per pair of the class, in
-blocks of :data:`~newton._src.geometry.terrain_shadow.TERRAIN_LAW_BLOCK` (so that its warps spread evenly over the SMs).
+blocks of :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK` (so that its warps spread evenly over the SMs).
 For a pair whose window holds at most 16 cells it marks a word of window vertices the drop keeps in a bit mask and then
 walks the marked ones in window order, so that a warp's lanes evaluate their k-th kept vertices together instead of one
 window position that most lanes drop (a model of the warps' issued instructions on recorded quadruped foot spheres,
@@ -52,8 +52,8 @@ window position). A sphere walks its centre's six items in code of its own (:fun
 is 12,300 SASS instructions on sm_120, of the capsule's walk (:func:`_walk_segment`, every item) alone 27,700), so that
 a warp of spheres never runs the capsule's. A pair with a larger window the kernel only takes through the whole-pair
 rejects, the tile-max exit above all (97% of the recorded suite's such pairs), and queues the rest
-(:class:`~newton._src.geometry.terrain_shadow.TerrainPairWork`): :func:`terrain_point_rows_tiled`, a fixed grid of
-:data:`~newton._src.geometry.terrain_shadow.TERRAIN_LAW_BLOCK` lanes per pair (``wp.launch_tiled``), takes the queued
+(:class:`~newton._src.geometry.terrain_law.TerrainPairWork`): :func:`terrain_point_rows_tiled`, a fixed grid of
+:data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK` lanes per pair (``wp.launch_tiled``), takes the queued
 pairs in turn, so that a pair that leaves at the tile max never occupies a tile. The lanes split the window's heights
 and vertices and mark, per vertex, the items that yield anything; the first lane evaluates those items in window order,
 so a pair gets the rows the one-thread kernel gives it. Both hold a pair's distinct rows in its own slots (up to six,
@@ -68,7 +68,7 @@ Inlined into the walks, the finish took every thread to 255 registers and a 10 K
 kernel takes 128 registers (its launch bounds: 16 blocks of 32 threads per SM) and a 176-byte stack (a sphere's walk
 alone would need 140 registers), the tiled kernel 226 registers and a 32-byte stack, and only deferred pairs pay for the
 finish. The full-finish kernel keeps the candidate list and the finish's input in global scratch
-(:class:`~newton._src.geometry.terrain_shadow.TerrainFinishScratch`), so that its stack, which sets the driver's
+(:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`), so that its stack, which sets the driver's
 local-memory reservation for every thread the device holds, is the finish's own frame: 6.0 KB (10.1 KB with the list on
 the stack). The kernels take the per-type kernel arguments ``(begin, slot_begin, inputs, data, out)`` of
 :class:`~newton._src.geometry.terrain_law.TerrainPairInputs` and a launch argument: the walks the class's work list, the
@@ -92,6 +92,7 @@ from .terrain_law import (
     TERRAIN_FEATURE_RECOVERY,
     TERRAIN_FEATURE_VERTEX,
     TERRAIN_FLAT_EPS,
+    TERRAIN_LAW_BLOCK,
     TERRAIN_PAIR_FILTERED,
     TERRAIN_PAIR_OUTSIDE,
     TERRAIN_PAIR_STALE,
@@ -100,8 +101,10 @@ from .terrain_law import (
     TERRAIN_ROW_CANDIDATES,
     TERRAIN_WINDOW_WIDE,
     TerrainFeatureData,
+    TerrainFinishScratch,
     TerrainLawRows,
     TerrainPairInputs,
+    TerrainPairWork,
     TerrainPlanes,
     TerrainWindow,
     terrain_beyond,
@@ -137,10 +140,6 @@ from .terrain_law import (
     terrain_window_point,
     terrain_window_vertex,
 )
-
-# The launch structs live beside the launcher for now; terrain_shadow imports this module lazily, by name
-# (TERRAIN_LAW_KERNELS), and must keep doing so: a module-level import of it there would be an import cycle.
-from .terrain_shadow import TERRAIN_LAW_BLOCK, TerrainFinishScratch, TerrainPairWork
 from .types import GeoType
 
 # Every float32 operation rounds as on the CPU (see the module docstring).
@@ -1171,8 +1170,8 @@ def terrain_point_rows(
     through the whole-pair rejects, or is queued in ``work`` to be walked by a tile of lanes.
 
     Launch: ``wp.launch`` with one thread per pair and ``block_dim``
-    :func:`~newton._src.geometry.terrain_shadow.terrain_law_block_dim` (on CUDA
-    :data:`~newton._src.geometry.terrain_shadow.TERRAIN_LAW_BLOCK`; the launch bounds refuse larger blocks).
+    :func:`~newton._src.geometry.terrain_law.terrain_law_block_dim` (on CUDA
+    :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK`; the launch bounds refuse larger blocks).
     """
     i = wp.tid()
     pair = begin + i
@@ -1354,7 +1353,7 @@ def terrain_point_rows_tiled(
     the rows (or the deferral) :func:`terrain_point_rows` gives it.
 
     Launch: ``wp.launch_tiled`` with ``dim=work.blocks`` and ``block_dim``
-    :func:`~newton._src.geometry.terrain_shadow.terrain_law_block_dim`. A block past ``work.blocks`` returns at once
+    :func:`~newton._src.geometry.terrain_law.terrain_law_block_dim`. A block past ``work.blocks`` returns at once
     (it would take queued pairs a second time); with fewer blocks the missing blocks' pairs would get no rows.
     """
     block, lane = wp.tid()
@@ -1538,7 +1537,7 @@ def terrain_point_rows_full(
     """Finish the sphere and capsule pairs the other two kernels deferred (a plane group of three rows, more rows than
     the slots, or more candidates than the list), ``wp.block_dim()`` lanes per pair.
 
-    Launched after them with :attr:`~newton._src.geometry.terrain_shadow.TerrainFinishScratch.blocks` blocks
+    Launched after them with :attr:`~newton._src.geometry.terrain_law.TerrainFinishScratch.blocks` blocks
     (``wp.launch_tiled``), whatever the class's size: block ``b`` takes the deferred pairs ``b``, ``b + blocks``, ...
     (the order is free: a pair's rows depend on the pair alone), so that an empty list costs a near-empty launch. The
     lanes mark the pair's window as the tiled kernel's do; the first lane walks the marked items again into the full
@@ -1547,7 +1546,7 @@ def terrain_point_rows_full(
     :data:`TERRAIN_POINT_ROWS` rows, each group's deepest first on overflow).
 
     Launch: ``wp.launch_tiled`` with ``dim=scratch.blocks`` and ``block_dim``
-    :func:`~newton._src.geometry.terrain_shadow.terrain_law_block_dim`. A block past ``scratch.blocks`` returns at
+    :func:`~newton._src.geometry.terrain_law.terrain_law_block_dim`. A block past ``scratch.blocks`` returns at
     once (it has no scratch, and would finish deferred pairs a second time); with fewer blocks the missing blocks'
     pairs would keep no rows.
     """

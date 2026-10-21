@@ -27,10 +27,13 @@ from newton._src.geometry.terrain_contacts import (
     TERRAIN_PARTNER_POINT,
 )
 from newton._src.geometry.terrain_law import (
+    TERRAIN_LAW_FULL_BLOCKS,
+    TERRAIN_LAW_TILE_BLOCKS,
     TERRAIN_PAIR_FILTERED,
     TERRAIN_PAIR_ROW_OVERFLOW,
     TERRAIN_PAIR_STALE,
     TERRAIN_PAIR_TILE_EXIT,
+    terrain_law_block_dim,
 )
 from newton._src.geometry.terrain_law_point import TERRAIN_POINT_ROWS
 from newton._src.geometry.terrain_law_solid import (
@@ -38,13 +41,7 @@ from newton._src.geometry.terrain_law_solid import (
     TERRAIN_SOLID_THREAD_VERTICES,
     TERRAIN_SOLID_TILE_BLOCKS,
 )
-from newton._src.geometry.terrain_shadow import (
-    TERRAIN_LAW_FULL_BLOCKS,
-    TERRAIN_LAW_KERNELS,
-    TERRAIN_LAW_TILE_BLOCKS,
-    parse_terrain_law_shadow,
-    terrain_law_block_dim,
-)
+from newton._src.geometry.terrain_shadow import TERRAIN_LAW_KERNELS, parse_terrain_law_shadow
 from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_solid_utils as su
 from newton.tests import terrain_law_test_utils as tu

@@ -8,8 +8,9 @@ core-to-surface distance within the writer's reach, plus the corners of flat sup
 surface feature (a plane cluster, a crease edge or a vertex). This module holds what every per-type kernel shares:
 the surface predicates, the per-pair window (:func:`terrain_box_cells`, :func:`terrain_tile_exit`,
 :func:`terrain_window_extent`), a window's cache of cluster planes (:class:`TerrainPlanes`), the finish, the
-per-pair inputs and side buffer of the shadow route (:class:`TerrainPairInputs`, :class:`TerrainLawRows`) and the
-per-pair output protocol (:func:`terrain_pair_exit`, :func:`terrain_hold_row`, :func:`terrain_plane_group_of_three`,
+per-pair inputs and side buffer of the shadow route (:class:`TerrainPairInputs`, :class:`TerrainLawRows`), the
+launch arguments of its fixed grids (:class:`TerrainPairWork`, :class:`TerrainFinishScratch`) and the per-pair output
+protocol (:func:`terrain_pair_exit`, :func:`terrain_hold_row`, :func:`terrain_plane_group_of_three`,
 :func:`terrain_defer_pair`, :func:`terrain_store_row`). The static
 data live in :mod:`terrain_contacts`, the per-type kernels in modules of their own (``terrain_law_<type>``), and
 :mod:`terrain_shadow` runs them beside the narrow phase without feeding any contact (``NEWTON_TERRAIN_LAW_SHADOW``).
@@ -378,6 +379,100 @@ class TerrainLawRows:
     """Per partner class: the start of its deferred list (its first pair in the table)."""
     deferred_count: wp.array[wp.int32]
     """Per partner class: the pairs in its deferred list (zeroed before every launch)."""
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# launches of the per-type kernels: block size, the tiled kernels' work list, the full-finish kernels' scratch
+# ----------------------------------------------------------------------------------------------------------------
+
+TERRAIN_LAW_BLOCK = 32
+"""Threads per block of every terrain-law launch on CUDA: lanes per pair of the tiled kernels (one warp), and the
+one-thread kernel's block (several blocks per SM, so that its warps spread evenly), one module build per device."""
+TERRAIN_LAW_TILE_BLOCKS = 2048
+"""Blocks of a tiled launch at most, whatever the class's size: one per queued pair up to this many (about one
+resident wave of one-warp blocks on a 188-SM GPU), more queued pairs taking turns."""
+TERRAIN_LAW_FULL_BLOCKS = 64
+"""Blocks of a full-finish launch (:data:`TERRAIN_LAW_BLOCK` lanes each), whatever the class's size: they take the
+class's deferred pairs in turn."""
+
+
+@wp.struct
+class TerrainPairWork:
+    """A partner class's pairs with larger windows that reach their windows, which its one-thread kernel queues for its
+    tiled kernel, in any order (a pair's rows depend on the pair alone)."""
+
+    first: int
+    """First table pair of the class's tiled segment: the one-thread kernel walks the pairs before it and queues
+    those from it on."""
+    pairs: wp.array[wp.int32]
+    """The queued table pairs, room for every pair of the tiled segment."""
+    count: wp.array[wp.int32]
+    """The queued pairs (one entry, zeroed before every launch)."""
+    blocks: int
+    """Blocks of the tiled launch: block ``b`` takes the queued pairs ``b``, ``b + blocks``, ..."""
+
+
+def terrain_pair_work(device, first: int, pairs: int, *, count: wp.array | None = None) -> TerrainPairWork:
+    """Allocate the :class:`TerrainPairWork` of a tiled segment of ``pairs`` pairs from table pair ``first``.
+
+    Args:
+        device: The device.
+        first: First table pair of the tiled segment; the one-thread kernel walks the pairs before it.
+        pairs: Pairs of the tiled segment.
+        count: The one-entry counter of queued pairs (zeroed before every launch), or ``None`` for one of its own.
+    """
+    work = TerrainPairWork()
+    work.first = first
+    work.pairs = wp.zeros(max(pairs, 1), dtype=wp.int32, device=device)
+    work.count = count if count is not None else wp.zeros(1, dtype=wp.int32, device=device)
+    work.blocks = max(min(pairs, TERRAIN_LAW_TILE_BLOCKS), 1)
+    return work
+
+
+def terrain_law_block_dim(device) -> int:
+    """Return the block size of every terrain-law launch on ``device``: :data:`TERRAIN_LAW_BLOCK` on CUDA, one on the
+    CPU (where ``wp.launch_tiled`` runs one lane per pair whatever it is given, and one size builds the module once)."""
+    return TERRAIN_LAW_BLOCK if wp.get_device(device).is_cuda else 1
+
+
+@wp.struct
+class TerrainFinishScratch:
+    """Global scratch of a full-finish launch: per block, the candidate rows of the pair it finishes.
+
+    Block ``b`` holds candidate ``j`` at ``b * TERRAIN_ROW_CANDIDATES + j`` of ``q``, ``k``, ``n``, ``d`` and
+    ``feature`` (window frame; the fields of :class:`~newton._src.geometry.terrain_law.TerrainRows`) and the finish's
+    input at ``rows[b]``, off the per-thread stack: the largest stack a context launches sets the driver's
+    local-memory reservation for every thread the device can hold.
+    """
+
+    blocks: int
+    """Blocks of the launch: its grid stride over the deferred list."""
+    q: wp.array[wp.vec3]
+    """Terrain point of every candidate [m]."""
+    k: wp.array[wp.vec3]
+    """Core point of every candidate [m]."""
+    n: wp.array[wp.vec3]
+    """Unit normal of every candidate."""
+    d: wp.array[float]
+    """Core distance of every candidate [m]."""
+    feature: wp.array[wp.int32]
+    """Feature id of every candidate."""
+    rows: wp.array[TerrainRows]
+    """Per block, the finish's input (:func:`~newton._src.geometry.terrain_law.terrain_finish`)."""
+
+
+def terrain_finish_scratch(device, *, blocks: int = TERRAIN_LAW_FULL_BLOCKS) -> TerrainFinishScratch:
+    """Allocate the :class:`TerrainFinishScratch` of a full-finish launch of ``blocks`` blocks."""
+    scratch = TerrainFinishScratch()
+    scratch.blocks = blocks
+    candidates = blocks * TERRAIN_ROW_CANDIDATES
+    scratch.q = wp.zeros(candidates, dtype=wp.vec3, device=device)
+    scratch.k = wp.zeros(candidates, dtype=wp.vec3, device=device)
+    scratch.n = wp.zeros(candidates, dtype=wp.vec3, device=device)
+    scratch.d = wp.zeros(candidates, dtype=wp.float32, device=device)
+    scratch.feature = wp.zeros(candidates, dtype=wp.int32, device=device)
+    scratch.rows = wp.zeros(blocks, dtype=TerrainRows, device=device)
+    return scratch
 
 
 # ----------------------------------------------------------------------------------------------------------------
