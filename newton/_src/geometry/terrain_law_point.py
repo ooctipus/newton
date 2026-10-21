@@ -1166,6 +1166,10 @@ def terrain_point_rows(
     any other pair is left to :func:`terrain_point_rows_full` (the finish's candidate list and code would otherwise
     cost every thread their registers and stack). A pair from ``work.first`` on (the tiled segment) leaves here
     through the whole-pair rejects, or is queued in ``work`` to be walked by a tile of lanes.
+
+    Launch: ``wp.launch`` with one thread per pair and ``block_dim``
+    :func:`~newton._src.geometry.terrain_shadow.terrain_law_block_dim` (on CUDA
+    :data:`~newton._src.geometry.terrain_shadow.TERRAIN_LAW_BLOCK`; the launch bounds refuse larger blocks).
     """
     i = wp.tid()
     pair = begin + i
@@ -1342,8 +1346,14 @@ def terrain_point_rows_tiled(
     ``b + blocks``, ... For each, the lanes split the window's heights (its band) and its vertices, marking those
     whose items yield a row or an exit; the first lane evaluates the marked ones in window order, which gives a pair
     the rows (or the deferral) :func:`terrain_point_rows` gives it.
+
+    Launch: ``wp.launch_tiled`` with ``dim=work.blocks`` and ``block_dim``
+    :func:`~newton._src.geometry.terrain_shadow.terrain_law_block_dim`. A block past ``work.blocks`` returns at once
+    (it would take queued pairs a second time); with fewer blocks the missing blocks' pairs would get no rows.
     """
     block, lane = wp.tid()
+    if block >= work.blocks:
+        return
     for entry in range(block, work.count[0], work.blocks):
         _tiled_pair(begin, slot_begin, inputs, data, out, work.pairs[entry], lane)
 
@@ -1528,7 +1538,14 @@ def terrain_point_rows_full(
     candidate list, in the block's scratch, and runs the law's finish
     (:func:`~newton._src.geometry.terrain_law.terrain_finish`: merge, implied rows, four rows per plane group, at most
     :data:`TERRAIN_POINT_ROWS` rows, each group's deepest first on overflow).
+
+    Launch: ``wp.launch_tiled`` with ``dim=scratch.blocks`` and ``block_dim``
+    :func:`~newton._src.geometry.terrain_shadow.terrain_law_block_dim`. A block past ``scratch.blocks`` returns at
+    once (it has no scratch, and would finish deferred pairs a second time); with fewer blocks the missing blocks'
+    pairs would keep no rows.
     """
     block, lane = wp.tid()
+    if block >= scratch.blocks:
+        return
     for entry in range(block, out.deferred_count[_CLASS], scratch.blocks):
         _finish_deferred(begin, slot_begin, inputs, data, out, scratch, block, lane, out.deferred[begin + entry])

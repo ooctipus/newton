@@ -1400,6 +1400,74 @@ def test_deferred_pairs_keep_the_plain_finish_rows(test, device):
         _assert_same_rows(production, cpu, begin, count, f"{device} against cpu")
 
 
+def test_fixed_grids_take_each_pair_once(test, device):
+    """Take every queued and every deferred pair once, even in a launch with more blocks than the grid.
+
+    The tiled and full-finish kernels stride over their lists by the grids fixed in the work list and in the finish
+    scratch (``work.blocks``, ``scratch.blocks``); a block past that grid returns at once. Launched with three blocks
+    more (and scratch room for them), the tiled kernel would otherwise take queued pairs twice, deferring them twice,
+    and the full-finish kernel would finish deferred pairs twice, counting their row overflow twice.
+    """
+    heights, extent, bodies = _deferring_scene(np.random.default_rng(77))
+    model = tu.body_scene(heights, extent, extent, bodies, device=device)[0]
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    shadow = pipeline._terrain_law_shadow
+    begin = shadow.table.segment(TERRAIN_PARTNER_POINT, TERRAIN_LANE_THREAD)[0]
+    tiled_begin, end = shadow.table.segment(TERRAIN_PARTNER_POINT, TERRAIN_LANE_TILE)
+    count = end - begin
+    args = [_pair_inputs(shadow, model, pipeline), shadow.features.data()]
+    block = terrain_law_block_dim(device)
+    blocks = 2
+    results = []
+    for extra in (0, 3):
+        out = _side_buffer(begin, count, shadow.table.pair_count, device)
+        # Room for pairs deferred more than once, so that blocks past the grid fail the counts below instead of
+        # writing past the deferred list.
+        out.deferred = wp.zeros(4 * shadow.table.pair_count, dtype=wp.int32, device=device)
+        work = terrain_pair_work(device, tiled_begin, end - tiled_begin)
+        work.blocks = blocks
+        thread_args = [begin, 0, *args, out, work]
+        wp.launch(terrain_law_point.terrain_point_rows, dim=count, inputs=thread_args, block_dim=block, device=device)
+        tiled_args = [tiled_begin, (tiled_begin - begin) * terrain_law_point.TERRAIN_POINT_ROWS, *args, out, work]
+        wp.launch_tiled(
+            terrain_law_point.terrain_point_rows_tiled,
+            dim=blocks + extra,
+            inputs=tiled_args,
+            block_dim=block,
+            device=device,
+        )
+        deferred = int(out.deferred_count.numpy()[TERRAIN_PARTNER_POINT])
+        # The deferred list in table order, so that the entries each block takes do not depend on the device.
+        listed = out.deferred.numpy()
+        listed[begin : begin + deferred] = np.sort(listed[begin : begin + deferred])
+        out.deferred.assign(listed)
+        scratch = terrain_finish_scratch(device, blocks=blocks + extra)
+        scratch.blocks = blocks
+        wp.launch_tiled(
+            terrain_law_point.terrain_point_rows_full,
+            dim=blocks + extra,
+            inputs=[begin, 0, *args, out, scratch],
+            block_dim=block,
+            device=device,
+        )
+        rows = _host_rows(out)
+        rows["queued"] = int(work.count.numpy()[0])
+        rows["overflow"] = int(out.overflow.numpy()[0])
+        results.append(rows)
+    grid, wider = results
+    # Not vacuous: more queued pairs defer than the grid has blocks (so that some are taken past its first blocks),
+    # and deferred pairs past its first blocks overflow.
+    listed = grid["deferred_pairs"]
+    test.assertGreater(int(np.count_nonzero(listed >= tiled_begin)), blocks)
+    overflowing = (grid["state"][listed] & int(TERRAIN_PAIR_ROW_OVERFLOW)) != 0
+    test.assertGreater(int(np.count_nonzero(overflowing[blocks:])), 0)
+    test.assertEqual(wider["queued"], grid["queued"])
+    test.assertEqual(wider["deferred"], grid["deferred"])
+    test.assertEqual(wider["overflow"], grid["overflow"])
+    test.assertEqual(grid["overflow"], int(np.count_nonzero(overflowing)))
+    _assert_same_rows(wider, grid, begin, count, "three blocks more")
+
+
 @wp.kernel(enable_backward=False)
 def _vertex_item_masks(inputs: TerrainPairInputs, data: TerrainFeatureData, pair: int, masks: wp.array2d[wp.int32]):
     """Per window vertex ``v`` of table pair ``pair`` (window order; rows past the window get -1): its row and column,
@@ -1671,6 +1739,7 @@ for _name, _func in (
     ("test_tiled_kernel_matches_one_thread_kernel", test_tiled_kernel_matches_one_thread_kernel),
     ("test_rejects_keep_the_plain_walk_rows", test_rejects_keep_the_plain_walk_rows),
     ("test_deferred_pairs_keep_the_plain_finish_rows", test_deferred_pairs_keep_the_plain_finish_rows),
+    ("test_fixed_grids_take_each_pair_once", test_fixed_grids_take_each_pair_once),
     ("test_kept_items_drop_far_core_ends", test_kept_items_drop_far_core_ends),
 ):
     add_function_test(TestTerrainLawPoint, _name, _func, devices=devices)
