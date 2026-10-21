@@ -57,10 +57,10 @@ jobs and the solid classes' :class:`~newton._src.geometry.terrain_law_solid.Terr
 4. The close, the job threads over the live pairs: a pair's candidates held in window order (the walk's held rows),
    then rule R's kernel over the pairs without a row, and the finish, or for a core reaching below its window's
    highest vertex rule X's items.
-5. Rule X's items (a core point, or a window vertex that can give a candidate) and valleys, the job threads again: they
-   list the candidates whose bounds pass the pair's target; then the exit kernel, one thread per pair of the class
-   (its exit list's room), runs rule X's passes over the listed candidates (exact: any other candidate is a no-op in
-   both passes) and finishes the pair.
+5. Rule X's items (a core point, or a window vertex that can give a candidate), valleys and the listed candidates'
+   near-bound descents, the job threads again: they list the candidates whose bounds pass the pair's target; then the
+   exit kernel, one thread per pair of the class (its exit list's room), runs rule X's passes over the listed
+   candidates (exact: any other candidate is a no-op in both passes) and finishes the pair.
 6. The full-finish kernel (below).
 
 The full-finish kernel of a class, ``wp.launch_tiled`` on the fixed grid of its
@@ -128,6 +128,9 @@ TERRAIN_LAW_CLASS_NAMES = {
 
 
 def _solid_launches(name: str) -> tuple[tuple[str, str], ...]:
+    """A solid class's launches, ``(kind, kernel)`` in order: those of
+    :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LAUNCHES`, named here so that the solid modules are
+    imported only when a solid class is listed."""
     kernels = (
         "rows",
         "scan",
@@ -140,10 +143,11 @@ def _solid_launches(name: str) -> tuple[tuple[str, str], ...]:
         "recovery",
         "xitems",
         "xvalleys",
+        "xdescents",
         "exit",
         "full",
     )
-    kinds = ("pairs", "jobs", "jobs", "jobs", "jobs", "jobs", "jobs", "jobs", "jobs", "jobs", "jobs", "pairs", "full")
+    kinds = ("pairs", *("jobs",) * 11, "pairs", "full")
     return tuple(
         (kind, f"terrain_{name}_rows" if kernel == "rows" else f"terrain_{name}_rows_{kernel}")
         for kind, kernel in zip(kinds, kernels, strict=True)
@@ -266,9 +270,10 @@ TERRAIN_LAW_SPILL_SHARE = 256
 pair's bound (:meth:`TerrainLawShadow.default_spill_rows`): the worst case of one pair in 256 at once. On the recorded
 suite scenes (16,384 worlds) that is 11 to 25% of the walk slots, while at most one pair spilled (30 rows)."""
 
-TERRAIN_LAW_JOB_COUNTERS = 10
-"""Counters of a solid class's jobs: its six job lists, its candidate pool, its live pairs, its pairs left to rule R and
-its scan's runs (:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_COUNTERS`)."""
+TERRAIN_LAW_JOB_COUNTERS = 11
+"""Counters of a solid class's jobs: its six job lists, its candidate pool, its live pairs, its pairs left to rule R,
+its scan's runs and its listed rule X candidates' descents
+(:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_COUNTERS`)."""
 
 TERRAIN_LAW_JOB_NAMES = (
     "faces",
@@ -281,6 +286,7 @@ TERRAIN_LAW_JOB_NAMES = (
     "live",
     "recovery",
     "scans",
+    "xdescents",
 )
 """Names of a solid class's job counters, in order (:meth:`TerrainLawShadow.job_counts`)."""
 
@@ -472,7 +478,7 @@ class TerrainLawShadow:
                     counts=self._counters[offset : offset + TERRAIN_LAW_JOB_COUNTERS],
                 )
                 self._jobs[partner_class] = jobs
-                names = (*solid_module.TERRAIN_SOLID_JOB_LISTS, "candidates", "scans")
+                names = (*solid_module.TERRAIN_SOLID_JOB_LISTS, "candidates", "scans", "xdescents")
                 # the live and rule R lists hold every pair of the class: no check
                 for name in names:
                     capacities[offset - _JOBS + TERRAIN_LAW_JOB_NAMES.index(name)] = capacity[name]

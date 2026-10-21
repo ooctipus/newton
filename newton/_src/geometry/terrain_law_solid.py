@@ -81,9 +81,11 @@ pairs' features at once instead of one pair's whole window, and no thread walks 
    its rows held, to rule X, with one item per core point and window vertex that can give a candidate listed.
 4. Rule X's items (:func:`solid_xitem_job`: a core point, or a window vertex that can give a candidate) and valleys
    (:func:`solid_xvalley_job`), the job threads: each lists the candidates whose bounds pass the pair's target, the
-   test the rule's passes open with, so that the exit kernel (:func:`solid_exit_pair`, one thread per pair left to it)
-   runs the rule's passes over the listed candidates alone (:func:`solid_exits`, :func:`_exit_listed`): any other
-   candidate is a no-op in both passes, and the rows are the passes' over every candidate.
+   test the rule's passes open with, and a descent kernel takes each listed candidate's near-bound descent
+   (:func:`solid_xdescent_job`), so that the exit kernel (:func:`solid_exit_pair`, one thread per pair left to it)
+   runs the rule's passes over the listed candidates alone (:func:`solid_exits`, :func:`_exit_listed`) and searches
+   their exits: any other candidate is a no-op in both passes, and the rows are the passes' over every candidate. A
+   pair some of whose rule X work found no room is left to the full-finish kernel.
 
 The kernels follow the per-pair output protocol of :mod:`~newton._src.geometry.terrain_law`: a pair with no row is
 recorded by :func:`~newton._src.geometry.terrain_law.terrain_pair_exit`, and rows are held in the pair's own walk slots
@@ -292,6 +294,7 @@ _CANDIDATES = wp.constant(6)
 _LIVE = wp.constant(7)
 _RECOVER = wp.constant(8)
 _SCANS = wp.constant(9)
+_XDESCENTS = wp.constant(10)
 _INT_MAX = wp.constant(2147483647)
 
 _Mat43 = wp.types.matrix(shape=(4, 3), dtype=wp.float32)
@@ -300,9 +303,9 @@ _ArcValues = wp.types.vector(length=TERRAIN_SOLID_ARC_SAMPLES, dtype=wp.float32)
 _Seen = wp.types.vector(length=TERRAIN_SOLID_SEEN, dtype=wp.int32)
 _Sorted = wp.types.vector(length=TERRAIN_SOLID_SORTED, dtype=wp.int32)
 
-TERRAIN_SOLID_COUNTERS = len(TERRAIN_SOLID_JOB_LISTS) + 4
+TERRAIN_SOLID_COUNTERS = len(TERRAIN_SOLID_JOB_LISTS) + 5
 """Counters of a solid class's jobs: one per job list, then the candidate pool's, the live pairs', the pairs left to
-rule R and the scan jobs' (zeroed before every launch)."""
+rule R, the scan jobs' and the listed rule X candidates' descents (zeroed before every launch)."""
 
 
 @wp.struct
@@ -432,8 +435,8 @@ class TerrainSolidJobs:
     """The closed pairs without a row, left to rule R (class pair indices, in any order)."""
     counts: wp.array[wp.int32]
     """Entries asked for per job list (:data:`TERRAIN_SOLID_JOB_LISTS`), then the candidates asked for, the live pairs,
-    the pairs left to rule R and the scan jobs (:data:`TERRAIN_SOLID_COUNTERS`, zeroed before every launch; past a
-    list's capacity, the entries that found no room)."""
+    the pairs left to rule R, the scan jobs and the descents (:data:`TERRAIN_SOLID_COUNTERS`, zeroed before every
+    launch; past a list's capacity, the entries that found no room)."""
     threads: int
     """Threads of the job kernels' launches: each strides over its list."""
     q: wp.array[wp.vec3]
@@ -453,14 +456,22 @@ class TerrainSolidJobs:
     target: wp.array[float]
     """Per class pair left to rule X: the depth its exit must pass (its deepest row's, plus
     :data:`TERRAIN_SOLID_EXIT_MARGIN`)."""
+    descent: wp.array[wp.vec4]
+    """Per listed rule X candidate in the candidate pool: its bound after each block of :func:`_near_bound`'s
+    descent, the last repeated (:func:`_near_descent`), taken by :func:`solid_xdescent_job` so that the exit kernel's
+    passes need not."""
+    xdescents: wp.array[wp.vec2i]
+    """The listed rule X candidates whose descents :func:`solid_xdescent_job` takes: ``(class pair, pool entry)``
+    (room for every entry of the candidate pool)."""
     xhead: wp.array[wp.int32]
     """Per class pair left to rule X: its first listed candidate in the candidate pool (-1: none). Rule X's jobs list
-    the candidates whose bounds pass the pair's target there: the candidate point in ``q``, its bound in ``d``, its key
-    in ``key``, and for a valley's its valley's first key in ``feature`` (-1 for another's) and the valley's gate
-    (its height over the core's lowest point, its arc's lower normal ``z``) in ``n``."""
+    the candidates whose bounds pass the pair's target there: the candidate point in ``q``, its bound in ``d`` and its
+    descent's in ``descent``, its key in ``key``, and for a valley's its valley's first key in ``feature`` (-1 for
+    another's) and the valley's gate (its height over the core's lowest point, its arc's lower normal ``z``) in
+    ``n``."""
     xall: wp.array[wp.int32]
-    """Per class pair left to rule X: nonzero when some of its rule X work found no room, so that its exit kernel takes
-    every candidate of its window."""
+    """Per class pair left to rule X: nonzero when some of its rule X work found no room, so that its exit kernel
+    leaves it to the class's full-finish kernel, which walks it again and takes every candidate of its window."""
 
 
 @wp.struct
@@ -1271,6 +1282,46 @@ def _exit_bound(
 
 
 @wp.func
+def _near_block(data: TerrainFeatureData, window: TerrainWindow, x: wp.vec3, r: int, c: int) -> tuple[float, wp.vec3i]:
+    """``x``'s distance to the triangles of the 3 x 3 cells around cell ``(r, c)`` (within the heightfield), and the
+    nearest triangle."""
+    surface = window.surface
+    near = wp.vec3i(-1, -1, -1)
+    nearest = float(_HUGE)
+    for rr in range(wp.max(r - 1, 0), wp.min(r + 1, surface.nrow - 2) + 1):
+        for cc in range(wp.max(c - 1, 0), wp.min(c + 1, surface.ncol - 2) + 1):
+            for sub in range(2):
+                va, vb, vd = terrain_triangle_vertices(rr, cc, sub)
+                k = closest_on_triangle(
+                    x,
+                    terrain_window_vertex(data, window, va[0], va[1]),
+                    terrain_window_vertex(data, window, vb[0], vb[1]),
+                    terrain_window_vertex(data, window, vd[0], vd[1]),
+                )
+                distance = wp.length(x - k)
+                if distance < nearest:
+                    nearest = distance
+                    near = wp.vec3i(rr, cc, sub)
+    return nearest, near
+
+
+@wp.func
+def _near_next(data: TerrainFeatureData, window: TerrainWindow, x: wp.vec3, near: wp.vec3i) -> wp.vec3i:
+    """The cell under ``x``'s projection onto the plane of triangle ``near`` (``(-1, -1, -1)`` off the
+    heightfield): the next block's centre."""
+    va, vb, vd = terrain_triangle_vertices(near[0], near[1], near[2])
+    a = terrain_window_vertex(data, window, va[0], va[1])
+    n = wp.normalize(
+        wp.cross(
+            terrain_window_vertex(data, window, vb[0], vb[1]) - a,
+            terrain_window_vertex(data, window, vd[0], vd[1]) - a,
+        )
+    )
+    q = x - wp.dot(x - a, n) * n
+    return terrain_locate(window, q[0], q[1])
+
+
+@wp.func
 def _near_bound(data: TerrainFeatureData, window: TerrainWindow, x: wp.vec3, bound: float, stop: float) -> float:
     """``bound`` lowered to ``x``'s distance to the triangles of the 3 x 3 cells around the one under it, then around
     the cell under ``x``'s projection onto the plane of the block's nearest triangle, while that cell moves and the
@@ -1278,47 +1329,55 @@ def _near_bound(data: TerrainFeatureData, window: TerrainWindow, x: wp.vec3, bou
     toward ``x``'s closest surface point, whose distance every block's is at least (on a planar stretch the second
     block holds it). The second stage of rule X's bound, before an exit search; it decides which exits are searched,
     never the exit kept."""
-    surface = window.surface
     t = terrain_locate(window, x[0], x[1])
     if t[0] < 0:
         return bound
     r = t[0]
     c = t[1]
     for _step in range(_DESCENT):
-        near = wp.vec3i(-1, -1, -1)
-        nearest = float(_HUGE)
-        for rr in range(wp.max(r - 1, 0), wp.min(r + 1, surface.nrow - 2) + 1):
-            for cc in range(wp.max(c - 1, 0), wp.min(c + 1, surface.ncol - 2) + 1):
-                for sub in range(2):
-                    va, vb, vd = terrain_triangle_vertices(rr, cc, sub)
-                    k = closest_on_triangle(
-                        x,
-                        terrain_window_vertex(data, window, va[0], va[1]),
-                        terrain_window_vertex(data, window, vb[0], vb[1]),
-                        terrain_window_vertex(data, window, vd[0], vd[1]),
-                    )
-                    distance = wp.length(x - k)
-                    if distance < nearest:
-                        nearest = distance
-                        near = wp.vec3i(rr, cc, sub)
+        nearest, near = _near_block(data, window, x, r, c)
         bound = wp.min(bound, nearest)
         if bound <= stop:
             break
-        va, vb, vd = terrain_triangle_vertices(near[0], near[1], near[2])
-        a = terrain_window_vertex(data, window, va[0], va[1])
-        n = wp.normalize(
-            wp.cross(
-                terrain_window_vertex(data, window, vb[0], vb[1]) - a,
-                terrain_window_vertex(data, window, vd[0], vd[1]) - a,
-            )
-        )
-        q = x - wp.dot(x - a, n) * n
-        s = terrain_locate(window, q[0], q[1])
+        s = _near_next(data, window, x, near)
         if s[0] < 0 or (s[0] == r and s[1] == c):
             break
         r = s[0]
         c = s[1]
     return bound
+
+
+@wp.func
+def _near_descent(data: TerrainFeatureData, window: TerrainWindow, x: wp.vec3, bound: float) -> wp.vec4:
+    """:func:`_near_bound`'s bound after each block of its whole descent, the last repeated: its bound at any stop
+    is the first of them no greater than the stop, else the last (:func:`_near_stop`), bit for bit."""
+    steps = wp.vec4(bound)
+    t = terrain_locate(window, x[0], x[1])
+    if t[0] < 0:
+        return steps
+    r = t[0]
+    c = t[1]
+    for step in range(_DESCENT):
+        nearest, near = _near_block(data, window, x, r, c)
+        bound = wp.min(bound, nearest)
+        for k in range(step, _DESCENT):
+            steps[k] = bound
+        s = _near_next(data, window, x, near)
+        if s[0] < 0 or (s[0] == r and s[1] == c):
+            break
+        r = s[0]
+        c = s[1]
+    return steps
+
+
+@wp.func
+def _near_stop(steps: wp.vec4, stop: float) -> float:
+    """A listed candidate's bound lowered by :func:`_near_bound` at ``stop``, from its descent's bounds
+    (:func:`_near_descent`)."""
+    for k in range(_DESCENT):
+        if steps[k] <= stop:
+            return steps[k]
+    return steps[_DESCENT - 1]
 
 
 @wp.func
@@ -1401,7 +1460,16 @@ def _exit_open(best: _Exit, key: int, bound: float, scale: float) -> bool:
 
 
 @wp.func
-def _exit_try(
+def _exit_stop(best: _Exit) -> float:
+    """The bound a candidate's must pass at the pass's state: in the first pass the target or the second largest
+    bound, in the second the threshold."""
+    if best.walk == 0:
+        return wp.max(best.target, best.second)
+    return best.threshold
+
+
+@wp.func
+def _exit_lowered(
     data: TerrainFeatureData,
     window: TerrainWindow,
     planes: TerrainPlanes,
@@ -1412,15 +1480,9 @@ def _exit_try(
     bound: float,
     key: int,
 ) -> tuple[TerrainPlanes, _Exit]:
-    """Take candidate ``x`` of bound ``bound`` (key ``key``) while its bound, and still once lowered by
-    :func:`_near_bound`, can matter (:func:`_exit_open`): in the first pass it joins the two largest bounds (the
-    first in window order on ties), in the second its exit is searched (:func:`_exit_take`)."""
-    if not _exit_open(best, key, bound, 1.0):
-        return planes, best
-    stop = best.threshold
-    if best.walk == 0:
-        stop = wp.max(best.target, best.second)
-    bound = _near_bound(data, window, x, bound, stop)
+    """Take candidate ``x`` of bound ``bound`` (key ``key``), lowered by :func:`_near_bound`, while it can matter
+    (:func:`_exit_open`): in the first pass it joins the two largest bounds (the first in window order on ties), in
+    the second its exit is searched (:func:`_exit_take`)."""
     if not _exit_open(best, key, bound, 1.0):
         return planes, best
     if best.walk != 0:
@@ -1433,6 +1495,47 @@ def _exit_try(
     else:
         best.second = bound
     return planes, best
+
+
+@wp.func
+def _exit_try(
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    pair: _Pair,
+    cells: wp.vec4i,
+    best: _Exit,
+    x: wp.vec3,
+    bound: float,
+    key: int,
+) -> tuple[TerrainPlanes, _Exit]:
+    """Take candidate ``x`` of bound ``bound`` (key ``key``) while its bound, and still once lowered by
+    :func:`_near_bound`, can matter (:func:`_exit_open`, :func:`_exit_lowered`)."""
+    if not _exit_open(best, key, bound, 1.0):
+        return planes, best
+    bound = _near_bound(data, window, x, bound, _exit_stop(best))
+    return _exit_lowered(data, window, planes, pair, cells, best, x, bound, key)
+
+
+@wp.func
+def _exit_try_listed(
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    pair: _Pair,
+    cells: wp.vec4i,
+    best: _Exit,
+    x: wp.vec3,
+    bound: float,
+    steps: wp.vec4,
+    key: int,
+) -> tuple[TerrainPlanes, _Exit]:
+    """:func:`_exit_try` for a listed candidate, its descent's bounds ``steps`` taken by its job
+    (:func:`_near_descent`, :func:`_near_stop`): the same bounds, bit for bit."""
+    if not _exit_open(best, key, bound, 1.0):
+        return planes, best
+    bound = _near_stop(steps, _exit_stop(best))
+    return _exit_lowered(data, window, planes, pair, cells, best, x, bound, key)
 
 
 @wp.func
@@ -1574,9 +1677,12 @@ def _x_list(
 ) -> int:
     """List a rule X candidate of class pair ``i`` whose bound passes its target (:attr:`TerrainSolidJobs.xhead`):
     point ``x``, bound ``bound``, key ``key``; for a valley's, its valley's first key ``valley`` and the valley's gate
-    (``gate`` over ``scale``; ``valley`` -1 for another's). 0 when the pool had no room."""
+    (``gate`` over ``scale``; ``valley`` -1 for another's); and its descent for :func:`solid_xdescent_job`. 0 when the
+    pool had no room."""
     entry = wp.atomic_add(jobs.counts, _CANDIDATES, 1)
     if entry >= jobs.key.shape[0]:
+        return 0
+    if _job_append(jobs, _XDESCENTS, jobs.xdescents, wp.vec2i(i, entry)) == 0:
         return 0
     jobs.q[entry] = x
     jobs.d[entry] = bound
@@ -1627,8 +1733,57 @@ def _exit_listed(
                 passing = _exit_open(best, first, gate[0], gate[1])
             if not passing:
                 continue
-        planes, best = _exit_try(data, window, planes, pair, cells, best, jobs.q[entry], jobs.d[entry], key)
+        planes, best = _exit_try_listed(
+            data, window, planes, pair, cells, best, jobs.q[entry], jobs.d[entry], jobs.descent[entry], key
+        )
     return planes, best
+
+
+@wp.struct
+class _EveryCandidate:
+    """Rule X's passes over every candidate of the window (:func:`_exit_candidates`): the full-finish kernel's."""
+
+    low: float
+    """The core's lowest point [m, window frame]."""
+
+
+@wp.struct
+class _ListedCandidates:
+    """Rule X's passes over class pair ``row``'s listed candidates (:func:`_exit_listed`): the exit kernel's."""
+
+    row: int
+
+
+@wp.func
+def _exit_pass(
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    pair: _Pair,
+    cells: wp.vec4i,
+    best: _Exit,
+    jobs: TerrainSolidJobs,
+    how: _ListedCandidates,
+) -> tuple[TerrainPlanes, _Exit]:
+    """One pass over class pair ``how.row``'s listed candidates (:func:`_exit_listed`)."""
+    return _exit_listed(data, window, planes, pair, cells, best, jobs, how.row)
+
+
+@wp.func
+def _exit_pass(
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    pair: _Pair,
+    cells: wp.vec4i,
+    best: _Exit,
+    jobs: TerrainSolidJobs,
+    how: _EveryCandidate,
+) -> tuple[TerrainPlanes, _Exit]:
+    """One pass over every candidate of the window (:func:`_exit_candidates`)."""
+    return _exit_candidates(core, data, window, planes, pair, cells, best, how.low)
 
 
 @wp.func
@@ -1641,17 +1796,11 @@ def _exit_candidates(
     cells: wp.vec4i,
     best: _Exit,
     low: float,
-    jobs: TerrainSolidJobs,
-    row: int,
-    listed: int,
 ) -> tuple[TerrainPlanes, _Exit]:
     """One pass over rule X's candidates in window order (:func:`solid_exits`), each with its key: the core's points
     tried as they are first (keys 0 to their count), then per window vertex (keys from its window index times
     :data:`TERRAIN_SOLID_EXIT_SLOTS`) its valleys' support points (18 keys per edge) and its local maxima of the
-    distance (from key 54). With ``listed`` nonzero, class pair ``row``'s listed candidates only
-    (:func:`_exit_listed`): the others are no-ops in both passes."""
-    if listed != 0:
-        return _exit_listed(data, window, planes, pair, cells, best, jobs, row)
+    distance (from key 54)."""
     r0 = cells[0]
     r1 = cells[1]
     c0 = cells[2]
@@ -1704,15 +1853,15 @@ def solid_exits(
     cells: wp.vec4i,
     work: wp.array[wp.int32],
     jobs: TerrainSolidJobs,
-    row: int,
-    listed: int,
+    how: Any,
 ) -> tuple[TerrainPlanes, _Sink]:
     """Rule X: the exit of the deepest of the core's candidate boundary points, offered when it lies deeper than every
     row the pair holds by more than :data:`TERRAIN_SOLID_EXIT_MARGIN` (point slot :data:`TERRAIN_SOLID_EXIT_SLOT`);
-    its exit searches and the window vertices they covered are added to ``work``. With ``listed`` nonzero, the passes
-    take class pair ``row``'s listed candidates (rule X's items and valleys, :func:`solid_xitem_job`), those whose
-    bounds pass the target: any other is a no-op in both passes, so the rows are those of the passes over every
-    candidate (a listed pair's core reaches below its window's highest vertex: the gate below holds).
+    its exit searches and the window vertices they covered are added to ``work``. ``how`` picks the passes' candidates
+    at compile time: every candidate of the window (:class:`_EveryCandidate`, the full-finish kernel's) or class pair
+    ``row``'s listed ones (:class:`_ListedCandidates`, the exit kernel's: rule X's items and valleys,
+    :func:`solid_xitem_job`, those whose bounds pass the target; any other is a no-op in both passes, so the rows are
+    those of the passes over every candidate).
 
     A deepest boundary point whose closest surface point is unique is a local maximum of its distance to that one
     feature: a support point of rule F's plane manifold for a face, an extreme point of the core for a valley edge or
@@ -1726,15 +1875,8 @@ def solid_exits(
     largest bounds above the pair's depth and the largest's exit is searched first; a second pass searches the exits
     of the candidates that can still beat it (or tie it from earlier in window order) only when the second largest
     bound can. Each exit search covers the cells within the candidate's bound (:func:`_exit_take`), not the window:
-    its cost depends on the candidate's depth, not the window's size. A pair whose core lies wholly above its window's
-    highest vertex has no candidate (``pair.top``).
+    its cost depends on the candidate's depth, not the window's size.
     """
-    low = float(0.0)
-    if listed == 0:
-        lo, _hi = core_bounds(core)
-        low = lo[2]
-        if low >= pair.top:
-            return planes, sink
     deepest = float(0.0)
     for h in range(wp.min(sink.held, sink.capacity)):
         deepest = wp.max(deepest, -store.d[sink.slot + h])
@@ -1744,20 +1886,17 @@ def solid_exits(
     best.first = best.target
     best.second = best.target
     best.first_key = -1
-    for walk in range(2):
-        if walk == 1:
-            if best.first <= best.target:
-                break
-            planes, best = _exit_take(data, window, planes, pair, cells, best, best.first_x, best.first, best.first_key)
-            # The second pass only when another candidate's bound can beat the exit found, or tie it from earlier in
-            # window order (every other candidate of the largest bound comes later; an exit no deeper than the target
-            # is never offered).
-            beat = best.second > best.threshold
-            tie = best.second == best.threshold and best.threshold < best.first and best.threshold > best.target
-            if not (beat or tie):
-                break
+    planes, best = _exit_pass(core, data, window, planes, pair, cells, best, jobs, how)
+    if best.first > best.target:
+        planes, best = _exit_take(data, window, planes, pair, cells, best, best.first_x, best.first, best.first_key)
+        # The second pass only when another candidate's bound can beat the exit found, or tie it from earlier in
+        # window order (every other candidate of the largest bound comes later; an exit no deeper than the target is
+        # never offered).
+        beat = best.second > best.threshold
+        tie = best.second == best.threshold and best.threshold < best.first and best.threshold > best.target
+        if beat or tie:
             best.walk = 1
-        planes, best = _exit_candidates(core, data, window, planes, pair, cells, best, low, jobs, row, listed)
+            planes, best = _exit_pass(core, data, window, planes, pair, cells, best, jobs, how)
     if best.searches > 0:
         wp.atomic_add(work, 0, best.searches)
         wp.atomic_add(work, 1, best.cells)
@@ -1993,7 +2132,12 @@ def solid_close_full(
     store = solid_scratch_store(scratch)
     if sink.raw == 0:
         planes, sink = solid_recovery(core, data, window, planes, sink, store)
-    planes, sink = solid_exits(core, data, window, planes, pair, sink, store, cells, work, jobs, 0, 0)
+    # Rule X can give a row only to a core whose lowest point lies below its window's highest vertex.
+    lo, _hi = core_bounds(core)
+    if lo[2] < pair.top:
+        every = _EveryCandidate()
+        every.low = lo[2]
+        planes, sink = solid_exits(core, data, window, planes, pair, sink, store, cells, work, jobs, every)
     flags = int(0)
     if sink.held > sink.capacity:
         sink.held = sink.capacity
@@ -2590,8 +2734,18 @@ def solid_xvalley_job(core: Any, data: TerrainFeatureData, jobs: TerrainSolidJob
                 continue
             planes, bound = _valley_bound(data, window, planes, x, v0, e, length2)
             if bound > target:
-                if _x_list(jobs, i, x, bound, key + 2 * k + s, key, top - low, wp.min(n_a[2], n_b[2])) == 0:
+                gate = top - low
+                scale = wp.min(n_a[2], n_b[2])
+                if _x_list(jobs, i, x, bound, key + 2 * k + s, key, gate, scale) == 0:
                     jobs.xall[i] = 1
+
+
+@wp.func
+def solid_xdescent_job(data: TerrainFeatureData, jobs: TerrainSolidJobs, i: int, entry: int):
+    """The near bound's descent of class pair ``i``'s listed rule X candidate at pool entry ``entry``
+    (:func:`_near_descent`), for the exit kernel's passes."""
+    _record, window = solid_job_window(data, jobs, i)
+    jobs.descent[entry] = _near_descent(data, window, jobs.q[entry], jobs.d[entry])
 
 
 @wp.func
@@ -2609,22 +2763,24 @@ def solid_exit_pair(
     frame: wp.transform,
 ):
     """Rule X for a pair its close left to the class's exit kernel, its rows held in its walk slots from ``slot``
-    (``out.count`` of them): the deepest exit over its listed candidates (:func:`solid_exits`; every candidate when
-    some of its rule X work found no room), then the finish (:func:`solid_finish`): the rows of a walk that ran rule X
-    itself."""
+    (``out.count`` of them): the deepest exit over its listed candidates (:func:`solid_exits`), then the finish
+    (:func:`solid_finish`): the rows of a walk that ran rule X itself. A pair some of whose rule X work found no room
+    is left to the class's full-finish kernel, which walks it again and takes every candidate."""
+    if jobs.xall[i] != 0:
+        terrain_defer_pair(out, partner_class, pair_index, out.state[pair_index] & TERRAIN_PAIR_WIDE)
+        return
     record, window = solid_job_window(data, jobs, i)
     pair = record.pair
     planes = terrain_planes()
     sink = solid_sink(slot, walk_slots, pair.eps)
     sink.held = out.count[pair_index]
     sink.raw = sink.held
-    listed = int(1)
-    if jobs.xall[i] != 0:
-        listed = 0
     # with no listed candidate both passes are no-ops
-    if listed == 0 or jobs.xhead[i] >= 0:
+    if jobs.xhead[i] >= 0:
+        listed = _ListedCandidates()
+        listed.row = i
         planes, sink = solid_exits(
-            core, data, window, planes, pair, sink, out, record.cells, solids.exit_work, jobs, i, listed
+            core, data, window, planes, pair, sink, out, record.cells, solids.exit_work, jobs, listed
         )
     solid_finish(window, pair, sink, out, pair_index, partner_class, frame, record.cells)
 
@@ -2652,6 +2808,7 @@ TERRAIN_SOLID_LAUNCHES = (
     ("jobs", "recovery"),
     ("jobs", "xitems"),
     ("jobs", "xvalleys"),
+    ("jobs", "xdescents"),
     ("pairs", "exit"),
     ("full", "full"),
 )
@@ -2923,6 +3080,21 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
             i = job[0] - begin
             solid_xvalley_job(wp.static(load_core)(jobs, i, solids), data, jobs, i, job[1])
 
+    def xdescents(
+        begin: int,
+        slot_begin: int,
+        inputs: TerrainPairInputs,
+        data: TerrainFeatureData,
+        out: TerrainLawRows,
+        jobs: TerrainSolidJobs,
+        solids: TerrainSolidData,
+    ):
+        """Rule X's listed candidates' near-bound descents, one per thread at a time (:func:`solid_xdescent_job`)."""
+        t = wp.tid()
+        for entry in range(t, wp.min(jobs.counts[_XDESCENTS], jobs.xdescents.shape[0]), jobs.threads):
+            job = jobs.xdescents[entry]
+            solid_xdescent_job(data, jobs, job[0], job[1])
+
     def exit_(
         begin: int,
         slot_begin: int,
@@ -3007,6 +3179,7 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         ("recovery", recovery),
         ("xitems", xitems),
         ("xvalleys", xvalleys),
+        ("xdescents", xdescents),
         ("exit", exit_),
         ("full", full),
     ):
@@ -3266,6 +3439,8 @@ def terrain_solid_job_capacities(
     default = (int(np.max(candidates)) if len(v) else 0) + walk_slots * len(v) // TERRAIN_SOLID_CANDIDATE_SHARE
     default = max(default, min(total, TERRAIN_SOLID_POOL_FLOOR))
     capacities["candidates"] = max(1, int(np.ceil(scale * default)))
+    # the listed rule X candidates' descents: one per pool entry at most
+    capacities["xdescents"] = capacities["candidates"]
     # the scan's runs: every pair's at its largest window, exact (a window past its bound takes the full finish)
     capacities["scans"] = max(1, int(np.sum(-(-v // TERRAIN_SOLID_SCAN_VERTICES))))
     return capacities
@@ -3329,6 +3504,8 @@ def terrain_solid_jobs(
     jobs.feature = wp.zeros(pool, dtype=wp.int32, device=device)
     jobs.key = wp.zeros(pool, dtype=wp.int32, device=device)
     jobs.next = wp.zeros(pool, dtype=wp.int32, device=device)
+    jobs.descent = wp.zeros(pool, dtype=wp.vec4, device=device)
+    jobs.xdescents = wp.zeros(max(int(capacities["xdescents"]), 1), dtype=wp.vec2i, device=device)
     jobs.head = wp.full(room, -1, dtype=wp.int32, device=device)
     jobs.target = wp.zeros(room, dtype=wp.float32, device=device)
     jobs.xhead = wp.full(room, -1, dtype=wp.int32, device=device)
@@ -3360,6 +3537,8 @@ def terrain_solid_jobs_bytes(jobs: TerrainSolidJobs) -> int:
         jobs.feature,
         jobs.key,
         jobs.next,
+        jobs.descent,
+        jobs.xdescents,
         jobs.head,
         jobs.target,
         jobs.xhead,

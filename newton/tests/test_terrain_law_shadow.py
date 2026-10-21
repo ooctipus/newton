@@ -748,7 +748,7 @@ class TestTerrainLawShadow(unittest.TestCase):
                     capacities = terrain_solid_job_capacities(
                         table.vertices[begin:end], points, takes, table.candidates[begin:end], walk
                     )
-                    names = (*TERRAIN_SOLID_JOB_LISTS, "candidates", "scans")
+                    names = (*TERRAIN_SOLID_JOB_LISTS, "candidates", "scans", "xdescents")
                     self.assertEqual(sorted(capacities), sorted(names))
                     # the scan's jobs: every pair's runs of window vertices at its largest window
                     scans = int(np.sum(-(-table.vertices[begin:end].astype(np.int64) // TERRAIN_SOLID_SCAN_VERTICES)))

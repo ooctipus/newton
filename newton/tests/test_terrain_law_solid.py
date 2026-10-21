@@ -1154,8 +1154,11 @@ _LIST_OF_KERNEL = {
     "recovery": "recover",
     "xitems": "xitems",
     "xvalleys": "xvalleys",
+    "xdescents": "xdescents",
 }
-"""The list each job kernel strides over (:class:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs`)."""
+"""The list each job kernel that first takes a list strides over
+(:class:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs`; the creases kernel takes the thetas kernel's list
+entry by entry, its results kept per entry)."""
 _COUNTER_OF_LIST = {name: k for k, name in enumerate(TERRAIN_LAW_JOB_NAMES)}
 _COUNTER_OF_LIST.update(
     {"live": TERRAIN_LAW_JOB_NAMES.index("live"), "recover": TERRAIN_LAW_JOB_NAMES.index("recovery")}
@@ -1347,13 +1350,14 @@ def _valley_large(device):
 
 
 def test_rule_x_lists_give_the_full_passes(test, device):
-    """Give a solid pair the same rule X row and rows, bit for bit, whether its exit kernel takes its listed candidates,
-    every candidate of its window, or the full-finish kernel walks it again and runs rule X itself.
+    """Give a solid pair the same rule X row and rows, bit for bit, whether its exit kernel takes its listed candidates
+    or the full-finish kernel walks it again and runs rule X over every candidate of its window.
 
     Long solids sunk along a valley, each deepest along its line (only an exit reaches it): a cylinder, ellipsoids and
-    a box. Rule X's item and valley jobs list the candidates whose bounds pass the pair's target, and the exit kernel
-    runs the rule's passes over those alone (any other is a no-op in both passes); with room for one item and one
-    valley, a pair's lists lack room and its exit kernel takes every candidate of its window.
+    a box. Rule X's item and valley jobs list the candidates whose bounds pass the pair's target with their near
+    bounds' descents, and the exit kernel runs the rule's passes over those alone (any other is a no-op in both
+    passes). With room for one item and one valley, a pair's lists lack room and it is left to the full-finish kernel;
+    every pair walked by it alone gives the same rows too.
     """
     hf, model, shapes, bodies = _valley_large(device)
     pipeline, _contacts, _state = _collide(model, shadow=True)
@@ -1380,10 +1384,11 @@ def test_rule_x_lists_give_the_full_passes(test, device):
                 pipeline, model, partner_class, jobs=_class_jobs(model, shadow, partner_class, xitems=1, xvalleys=1)
             )
             test.assertTrue(np.any(every.xall.numpy()))
+            test.assertGreater(int(every_out.deferred_count.numpy()[partner_class]), 0)
             test.assertGreater(int(solids.exit_work.numpy()[0]), 0)
             full_out, _jobs, _solids = _run_class(pipeline, model, partner_class, full=True)
             _assert_same_rows(test, shadow._out, listed_out, pairs, "the shadow's launch")
-            _assert_same_rows(test, listed_out, every_out, pairs, "every candidate")
+            _assert_same_rows(test, listed_out, every_out, pairs, "lists without room")
             _assert_same_rows(test, listed_out, full_out, pairs, "the full walk")
             features = np.concatenate([_pair_rows(listed_out, p)["feature"] for p in pairs])
             test.assertEqual(int(np.sum((features & 7) == 7)), sum(shape_class[s] == partner_class for s in shapes))
