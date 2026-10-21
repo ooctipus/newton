@@ -746,15 +746,46 @@ def test_exposed_cell_rows_follow_the_law(test, device):
     Rule X exits the core's deepest candidate point (its rims' points farthest from the valleys and vertices under
     them), so a pair reaches its depth unless its deepest point is a tie: equally far from two or more surface points,
     inside a cap or the side (DESIGN 1.3 and 8.5). Over 4,000 cases of this generator (100 seeds) the shadow rows
-    equal the float64 law's in all but one case (a decision within float32 resolution, as at 1cf34769) and leave 5
-    short, all ties, by at most 0.45 mm, none rowless; at 1cf34769 the law left 74 short (by up to 161 mm). Today's
-    route leaves 526 short. The check allows :data:`LP_SHORT` of its 40.
+    equal the float64 law's in all but one case (a decision within float32 resolution, as without rule X) and leave 4
+    short, all ties, by at most 0.45 mm, none rowless; without rule X the law left 74 short (by up to 161 mm). Today's
+    route leaves 526 short. The check allows :data:`LP_SHORT` of its 40 (none of this seed's needs rule X; see
+    :func:`test_exposed_cell_exits_reach_their_depth`).
     """
     pairs = _lp_pairs(_lp_cases(np.random.default_rng(17), 40), device, shadow=True)
     differ, rowless, short = _penetration_violations(pairs)
     test.assertEqual(differ, [])
     test.assertEqual(rowless, [])
     test.assertLessEqual(len(short), LP_SHORT, msg=short)
+
+
+LP_EXITS = ((49, 7), (74, 33), (54, 28), (2, 12), (0, 23), (10, 0), (90, 4))
+"""Exposed-cell cases (seed, index of :func:`_lp_cases`) whose deepest row only rule X gives, from 160 down to 5 mm
+deeper than the other rules' rows. In the first the deepest point's closest surface point lies outside the pair's
+window, two cell rows past it (a rod 166 mm deep under a 60 degree face, its reach 40 mm)."""
+
+
+def test_exposed_cell_exits_reach_their_depth(test, device):
+    """Give cylinders through an exposed cell whose depth only rule X reaches an exit row, the float64 law's rows and
+    their depth.
+
+    Deep rods through steep cells (:data:`LP_EXITS`), from the generator of
+    :func:`test_exposed_cell_rows_follow_the_law`: each exit is the point law's over the cells within the deepest
+    candidate's bound, inside the pair's window or not (the first case's lies outside it). Without rule X these pairs
+    stop 5 to 160 mm short; with an exit searched only inside the window the first stops 0.3 mm short, on a farther
+    minimum.
+    """
+    cases = []
+    for seed, index in LP_EXITS:
+        cases.append(_lp_cases(np.random.default_rng(seed), index + 1)[index])
+    pairs = _lp_pairs(cases, device, shadow=True)
+    differ, rowless, short = _penetration_violations(pairs)
+    test.assertEqual(differ, [])
+    test.assertEqual(rowless, [])
+    test.assertEqual(short, [])
+    for (seed, index), (got, law, _pose, _separation, _frame_tol) in zip(LP_EXITS, pairs, strict=True):
+        with test.subTest(case=(seed, index)):
+            test.assertEqual(sum(1 for g in got if su.is_exit_row(g)), 1)
+            test.assertEqual(sum(1 for r in law if su.is_exit_row(r)), 1)
 
 
 def _buried_cylinders(rng, hf, count, dims=TOE):
@@ -1703,6 +1734,7 @@ for _name, _func in (
     ("test_solid_rows_are_complete_and_free_of_ghosts", test_solid_rows_are_complete_and_free_of_ghosts),
     ("test_thin_rods_and_crease_bodies_keep_their_supports", test_thin_rods_and_crease_bodies_keep_their_supports),
     ("test_exposed_cell_rows_follow_the_law", test_exposed_cell_rows_follow_the_law),
+    ("test_exposed_cell_exits_reach_their_depth", test_exposed_cell_exits_reach_their_depth),
     ("test_buried_solids_follow_the_law", test_buried_solids_follow_the_law),
     ("test_valley_cores_reach_their_depth", test_valley_cores_reach_their_depth),
     ("test_needle_cores_reach_their_depth", test_needle_cores_reach_their_depth),

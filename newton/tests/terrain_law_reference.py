@@ -1682,18 +1682,51 @@ def _exit_bound(hf, x):
     return float(np.linalg.norm(x - _closest_on_tri(x, *hf.tri_verts(t))))
 
 
-def _near_bound(hf, x, cells, bound):
-    """``bound`` lowered to ``x``'s distance to the triangles of the cells around the one under it (3 x 3, within the
-    window's cells ``(r0, r1, c0, c1)``): the second stage of rule X's bound, before an exit walk."""
+EXIT_DESCENT = 4
+"""Blocks of 3 x 3 cells rule X's near bound visits at most per candidate (:func:`_near_bound`)."""
+
+
+def _near_bound(hf, x, bound, stop):
+    """``bound`` lowered to ``x``'s distance to the triangles of the 3 x 3 cells around the one under it, then around
+    the cell under ``x``'s projection onto the plane of the block's nearest triangle, while that cell moves and the
+    bound exceeds ``stop`` (at most :data:`EXIT_DESCENT` blocks, within the heightfield): the second stage of rule X's
+    bound, before an exit search. A bound only decides which exits are searched, never the exit kept."""
     t = hf.locate(x[0], x[1])
+    if t is None:
+        return bound
     r, c, _sub = hf.tri_rc(t)
-    r0, r1, c0, c1 = cells
-    for rr in range(max(r - 1, r0), min(r + 1, r1) + 1):
-        for cc in range(max(c - 1, c0), min(c + 1, c1) + 1):
-            for sub in (0, 1):
-                k = _closest_on_tri(x, *hf.tri_verts(hf.tri_id(rr, cc, sub)))
-                bound = min(bound, float(np.linalg.norm(x - k)))
+    for _ in range(EXIT_DESCENT):
+        near, nearest = None, math.inf
+        for rr in range(max(r - 1, 0), min(r + 1, hf.rows - 1) + 1):
+            for cc in range(max(c - 1, 0), min(c + 1, hf.cols - 1) + 1):
+                for sub in (0, 1):
+                    k = _closest_on_tri(x, *hf.tri_verts(hf.tri_id(rr, cc, sub)))
+                    distance = float(np.linalg.norm(x - k))
+                    if distance < nearest:
+                        nearest, near = distance, hf.tri_id(rr, cc, sub)
+        bound = min(bound, nearest)
+        if bound <= stop:
+            break
+        a, b, c3 = hf.tri_verts(near)
+        n = np.cross(b - a, c3 - a)
+        n /= np.linalg.norm(n)
+        q = x - float((x - a) @ n) * n
+        s = hf.locate(q[0], q[1])
+        if s is None or hf.tri_rc(s)[:2] == (r, c):
+            break
+        r, c, _sub = hf.tri_rc(s)
     return bound
+
+
+def _exit_minima(hf, x, D, bound):
+    """The point law's exit of ``x`` (:class:`PointLaw`, G2 or G3) over the cells within ``bound`` of it (widened a
+    little), clamped to the heightfield: ``x``'s closest surface point lies there when ``bound`` is at least its
+    distance, so the exit is the one a search of the whole heightfield finds."""
+    reach = bound + 1.0e-5
+    box = hf.cells_in_box(x[:2] - reach, x[:2] + reach)
+    if box is None:
+        return []
+    return [r for r in PointLaw(hf, *hf.window_features(box)).minima(x, D, "x") if r.d <= EPS_PRED]
 
 
 def _valley_arc(hf, e):
@@ -1746,14 +1779,17 @@ def exit_rule(hf, core, D, window, rows, *, stats=None):
       local maxima of the distance from it (:func:`_farthest_rim_points`: each rim's farthest point, an ellipsoid's
       one or two).
 
-    A candidate is tried when its bound (:func:`_exit_bound`, or its distance to the feature that proposed it, the
-    smaller) exceeds the pair's depth plus the margin and the best exit found, and still does when lowered to its
-    distance to the triangles around it (:func:`_near_bound`); its exit is the point law's over the pair's window
-    (:class:`PointLaw`). A valley is skipped where no core point in the wedge below it can lie that deep: within the
-    wedge a point's distance to the edge is at most its height under the edge's higher end over the smaller normal
-    ``z``. A candidate is closest to its valley or vertex only below it: one no lower is left out. The deepest boundary
-    point is found unless it is a tie: equally far from two or more surface points (then it can lie inside a core
-    face, where no candidate is). Returns ``[]`` or the row.
+    The rule keeps the deepest candidate exit, the first in window order on ties: the point law's exit (G2, or G3) of
+    the candidate over the cells within its bound (:func:`_exit_minima`), where its closest surface point lies, inside
+    the window or not. A candidate's bound is :func:`_exit_bound` or its distance to the feature that proposed it, the
+    smaller, lowered by :func:`_near_bound`; the exits are searched largest bound first while a bound can still beat
+    the pair's depth plus the margin and the best exit found (or tie it from earlier in window order). The bounds
+    decide which exits are searched, never the exit kept, so the kernels may search them in another order. A valley
+    is skipped where no core point in the wedge below it can lie deeper than the pair's depth: within the wedge a
+    point's distance to the edge is at most its height under the edge's higher end over the smaller normal ``z``. A
+    candidate is closest to its valley or vertex only below it: one no lower is left out. The deepest boundary point is
+    found unless it is a tie: equally far from two or more surface points (then it can lie inside a core face, where
+    no candidate is). Returns ``[]`` or the row.
     """
     _tris, edges, verts = window
     lo, _hi = core.aabb()
@@ -1761,37 +1797,27 @@ def exit_rule(hf, core, D, window, rows, *, stats=None):
     if not verts or lowz >= max(hf.V(r, c)[2] for r, c in verts):
         return []
     target = max(-min((r.d for r in rows), default=0.0), 0.0) + EXIT_MARGIN
-    law = PointLaw(hf, *window)
-    state = {"threshold": target, "best": None}
+    # the candidates in window order (their keys), with their bounds above the target
+    candidates = []
 
-    rows_ = [rc[0] for rc in verts]
-    cols_ = [rc[1] for rc in verts]
-    cells = (min(rows_), max(rows_) - 1, min(cols_), max(cols_) - 1)
-
-    def consider(x, bound):
-        if bound is None or bound <= state["threshold"]:
-            return
-        if _near_bound(hf, x, cells, bound) <= state["threshold"]:
-            return
-        if stats:
-            stats.vertex_solves += 1
-        found = [r for r in law.minima(x, D, "x") if r.d <= EPS_PRED]
-        if not found:
-            return
-        ex = found[-1]
-        if state["best"] is None or ex.d < state["best"].d:
-            state["best"] = ex
-            state["threshold"] = max(target, -ex.d)
+    def add(x, bound):
+        key = len(candidates)
+        if bound is not None and bound > target:
+            bound = _near_bound(hf, x, bound, target)
+        candidates.append((key, x, bound))
 
     def bound_by(x, extra):
         b = _exit_bound(hf, x)
         return None if b is None else min(b, extra)
 
+    rows_ = [rc[0] for rc in verts]
+    cols_ = [rc[1] for rc in verts]
+    cells = (min(rows_), max(rows_) - 1, min(cols_), max(cols_) - 1)
     if hasattr(core, "verts"):
         for x in core.verts:
-            consider(x, _exit_bound(hf, x))
+            add(x, _exit_bound(hf, x))
     elif core.kind == "cone":
-        consider(core.apex, _exit_bound(hf, core.apex))
+        add(core.apex, _exit_bound(hf, core.apex))
     if not hasattr(core, "verts"):
         r0, r1, c0, c1 = cells
         by_key = {(e[0], e[1], e[2]): e for e in edges}
@@ -1809,7 +1835,7 @@ def exit_rule(hf, core, D, window, rows, *, stats=None):
                     if arc is None:
                         continue
                     v0, v1, n_a, n_b, m, th_ab = arc
-                    if top - lowz <= state["threshold"] * min(n_a[2], n_b[2]):
+                    if top - lowz <= target * min(n_a[2], n_b[2]):
                         continue
                     u = v1 - v0
                     for t in _arc_angles(core, n_a, m, th_ab, v0):
@@ -1818,7 +1844,7 @@ def exit_rule(hf, core, D, window, rows, *, stats=None):
                             if x[2] >= top:
                                 continue
                             s = float(np.clip((x - v0) @ u / (u @ u), 0.0, 1.0))
-                            consider(x, bound_by(x, float(np.linalg.norm(x - (v0 + s * u)))))
+                            add(x, bound_by(x, float(np.linalg.norm(x - (v0 + s * u)))))
                 if hf.ring(r, c) is None:
                     continue
                 v = hf.V(r, c)
@@ -1827,8 +1853,24 @@ def exit_rule(hf, core, D, window, rows, *, stats=None):
                 for x in _farthest_rim_points(core, v):
                     if x[2] >= v[2]:
                         continue
-                    consider(x, bound_by(x, float(np.linalg.norm(x - v))))
-    best = state["best"]
+                    add(x, bound_by(x, float(np.linalg.norm(x - v))))
+    # the exits, largest bound first: one whose bound cannot beat the best exit (nor tie it from earlier in window
+    # order) cannot change it
+    best, best_key, threshold = None, -1, target
+    for key, x, bound in sorted((c for c in candidates if c[2] is not None), key=lambda c: (-c[2], c[0])):
+        if bound < threshold or (bound == threshold and (best is None or key > best_key)):
+            if bound < threshold:
+                break
+            continue
+        if stats:
+            stats.vertex_solves += 1
+        found = _exit_minima(hf, x, D, bound)
+        if not found:
+            continue
+        ex = found[-1]
+        if best is None or ex.d < best.d or (ex.d == best.d and key < best_key):
+            best, best_key = ex, key
+            threshold = max(target, -ex.d)
     if best is None or -best.d <= target:
         return []
     return [Row(best.q, best.k, best.n, best.d, ("X", *best.feat[1:]))]
