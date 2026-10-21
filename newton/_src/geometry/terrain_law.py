@@ -402,8 +402,10 @@ class TerrainPairWork:
     tiled kernel, in any order (a pair's rows depend on the pair alone)."""
 
     first: int
-    """First table pair of the class's tiled segment: the one-thread kernel walks the pairs before it and queues
-    those from it on."""
+    """First table pair of the class's tiled segment: the one-thread kernel walks the pairs before it; of those from it
+    on it queues the ones that reach their windows (the point class), or those whose windows, as their poses give
+    them, it leaves to the tiled kernel (a solid class: over
+    :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_THREAD_VERTICES` vertices)."""
     pairs: wp.array[wp.int32]
     """The queued table pairs, room for every pair of the tiled segment."""
     count: wp.array[wp.int32]
@@ -442,7 +444,9 @@ class TerrainFinishScratch:
     Block ``b`` holds candidate ``j`` at ``b * TERRAIN_ROW_CANDIDATES + j`` of ``q``, ``k``, ``n``, ``d`` and
     ``feature`` (window frame; the fields of :class:`~newton._src.geometry.terrain_law.TerrainRows`) and the finish's
     input at ``rows[b]``, off the per-thread stack: the largest stack a context launches sets the driver's
-    local-memory reservation for every thread the device can hold.
+    local-memory reservation for every thread the device can hold. The solid classes' full kernels hold a pair's
+    distinct rows in ``q``, ``n``, ``d`` and ``feature`` and run the finish in place on them
+    (:func:`terrain_finish_slots`, a row's core point being ``q + d n``); they leave ``k`` and ``rows`` unused.
     """
 
     blocks: int

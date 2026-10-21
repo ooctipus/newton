@@ -36,11 +36,12 @@ recorded by :func:`~newton._src.geometry.terrain_law.terrain_pair_exit`, and row
 coinciding with a held one is dropped, the first in window order staying. The finish runs in place on the held rows
 (:func:`~newton._src.geometry.terrain_law.terrain_finish_slots`, a row's core point being ``q + d n``), and the kept
 rows are rewritten in the world frame at the front of the slots. A pair with more distinct candidates than its slots
-is left to its class's full kernel (:func:`~newton._src.geometry.terrain_law.terrain_defer_pair`): a fixed grid of
-:data:`TERRAIN_SOLID_FULL_THREADS` threads strides over the
-class's deferred list, and each thread walks its pairs again, one at a time, into its own scratch list of
-:data:`~newton._src.geometry.terrain_law.TERRAIN_ROW_CANDIDATES` rows. Every deferred pair is thus finished from its
-own candidates, whatever the number of deferred pairs, the order of the deferral or the thread that finishes it; a pair
+is left to its class's full kernel (:func:`~newton._src.geometry.terrain_law.terrain_defer_pair`): the shadow's fixed
+full-finish grid (:data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_FULL_BLOCKS` blocks) strides over the class's
+deferred list, and each block's first lane walks its pairs again, one at a time, into the block's scratch list of
+:data:`~newton._src.geometry.terrain_law.TERRAIN_ROW_CANDIDATES` rows
+(:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`). Every deferred pair is thus finished from its own
+candidates, whatever the number of deferred pairs, the order of the deferral or the block that finishes it; a pair
 with more distinct candidates than the scratch list keeps the first in window order and is flagged (a candidate
 overflow, as the point class's finish flags it). The kernels themselves (one module per partner class) build the
 class's core and call the generic bodies here; every module that compiles them disables floating-point contraction,
@@ -74,8 +75,10 @@ from .terrain_law import (
     TERRAIN_VERTEX_SPAN,
     TERRAIN_WINDOW_WIDE,
     TerrainFeatureData,
+    TerrainFinishScratch,
     TerrainLawRows,
     TerrainPairInputs,
+    TerrainPairWork,
     TerrainPlanes,
     TerrainWindow,
     terrain_box_cells,
@@ -135,17 +138,13 @@ rounding of ``theta*`` (about 1e-7 rad), so that a body resting flat on a crease
 float64 alike."""
 TERRAIN_SOLID_MASK_WORDS = 8
 """Words of the tiled kernels' productive-vertex mask: windows of up to 256 vertices (larger: the first lane walks)."""
-TERRAIN_SOLID_FULL_THREADS = 256
-"""Threads of a solid class's full kernel, whatever the class's size: they stride over its deferred list, each with
-its own scratch list (an empty list costs one near-empty launch)."""
 TERRAIN_SOLID_THREAD_VERTICES = 64
 """Window vertices up to which one thread walks a solid pair (its window as the pose gives it, at run time); a larger
-window goes to the class's tiled kernel. The pair table's lane classes bound a partner's window over every
-orientation, and most solids of a tiled lane walk far smaller windows (a lying cylinder: about 24 vertices), which a
-warp of one-thread pairs walks at full width while a 16-lane tile per pair holds half a warp and replays its marks
+window of a tiled-lane pair goes to the class's tiled kernel (queued in its
+:class:`~newton._src.geometry.terrain_law.TerrainPairWork`). The pair table's lane classes bound a partner's window
+over every orientation, and most solids of a tiled lane walk far smaller windows (a lying cylinder: about 24
+vertices), which a warp of one-thread pairs walks at full width while a tile of lanes per pair replays its marks
 serially."""
-TERRAIN_SOLID_TILE_BLOCKS = 1024
-"""Most blocks of a solid class's tiled kernel: its grid strides over the class's list of large windows."""
 TERRAIN_HULL_FACE_TOL = 1.0e-6
 """A hull's points within this of a face's plane lie on that face [m] (hulls under 1 m; their local frame): a planar
 face of a float32 mesh stays one face (its points lie within about 1e-8 m of its plane)."""
@@ -169,29 +168,13 @@ _RingNormals = wp.types.matrix(shape=(6, 3), dtype=wp.float32)
 
 @wp.struct
 class TerrainSolidData:
-    """What the solid classes' kernels read besides the pair inputs and the terrain: hull tables and the full kernels'
-    scratch rows."""
+    """What the solid classes' kernels read besides the pair inputs, the terrain and their launch argument (the work
+    list or the full finish's scratch): hull tables and the one-thread kernels' lane choice."""
 
     hulls: TerrainHullTable
     """The hulls of the hull class (empty for the other classes)."""
-    scratch_q: wp.array[wp.vec3]
-    """Scratch rows of the full kernels: thread ``t`` holds a deferred pair's candidates at
-    ``[t K, (t + 1) K)``, ``K`` :data:`TERRAIN_ROW_CANDIDATES` (window frame)."""
-    scratch_n: wp.array[wp.vec3]
-    scratch_d: wp.array[float]
-    scratch_feature: wp.array[wp.int32]
-    full_threads: int
-    """Threads of the full kernels' launch (their stride over a deferred list), each with its scratch list."""
-    wide: wp.array[wp.int32]
-    """Pairs whose windows hold more than ``thread_vertices`` vertices, for the tiled kernels: partner class ``c``'s
-    list starts at its first pair (``deferred_first[c]`` of the rows) and holds ``wide_count[c]`` pairs, appended
-    in any order."""
-    wide_count: wp.array[wp.int32]
-    """Per partner class: the pairs in its list of large windows (zeroed before every launch)."""
     thread_vertices: int
     """Window vertices up to which the one-thread kernels walk a pair; 0: they walk every window."""
-    tile_blocks: int
-    """Blocks of the tiled kernels' launch: their stride over a list of large windows."""
 
 
 @wp.struct
@@ -859,13 +842,14 @@ def solid_sink(slot: int, capacity: int, eps: float, probe: int) -> _Sink:
 
 
 @wp.func
-def solid_scratch_store(solids: TerrainSolidData) -> TerrainLawRows:
-    """The full kernels' scratch rows as a store of held rows (its row fields only)."""
+def solid_scratch_store(scratch: TerrainFinishScratch) -> TerrainLawRows:
+    """A full-finish launch's scratch rows as a store of held rows (its row fields only; the in-place finish reads a
+    row's core point as ``q + d n``)."""
     store = TerrainLawRows()
-    store.q = solids.scratch_q
-    store.n = solids.scratch_n
-    store.d = solids.scratch_d
-    store.feature = solids.scratch_feature
+    store.q = scratch.q
+    store.n = scratch.n
+    store.d = scratch.d
+    store.feature = scratch.feature
     return store
 
 
@@ -944,6 +928,7 @@ def solid_rows_thread(
     core: Any,
     data: TerrainFeatureData,
     out: TerrainLawRows,
+    work: TerrainPairWork,
     solids: TerrainSolidData,
     pair_index: int,
     slot: int,
@@ -953,16 +938,16 @@ def solid_rows_thread(
     heightfield: int,
     reach: float,
 ):
-    """One thread's walk of a pair whose core is built (heightfield frame): window, walk, close; a window of more
-    than ``solids.thread_vertices`` vertices is listed for the class's tiled kernel instead."""
+    """One thread's walk of a pair whose core is built (heightfield frame): window, walk, close; a pair from
+    ``work.first`` on (the tiled segment) whose window holds more than ``solids.thread_vertices`` vertices is queued in
+    ``work`` for the class's tiled kernel instead."""
     state, cells, window, core, pair = solid_pair_window(core, data, heightfield, reach)
     if state != 0:
         terrain_pair_exit(out, pair_index, state)
         return
-    if solids.thread_vertices > 0:
+    if solids.thread_vertices > 0 and pair_index >= work.first:
         if (cells[1] - cells[0] + 2) * (cells[3] - cells[2] + 2) > solids.thread_vertices:
-            entry = wp.atomic_add(solids.wide_count, partner_class, 1)
-            solids.wide[out.deferred_first[partner_class] + entry] = pair_index
+            work.pairs[wp.atomic_add(work.count, 0, 1)] = pair_index
             return
     planes = terrain_planes()
     sink = solid_sink(slot, row_limit, pair.eps, 0)
@@ -977,8 +962,8 @@ def solid_rows_full(
     core: Any,
     data: TerrainFeatureData,
     out: TerrainLawRows,
-    solids: TerrainSolidData,
-    thread: int,
+    scratch: TerrainFinishScratch,
+    block: int,
     pair_index: int,
     slot: int,
     row_limit: int,
@@ -987,11 +972,11 @@ def solid_rows_full(
     heightfield: int,
     reach: float,
 ):
-    """A deferred pair walked again into thread ``thread``'s scratch list, finished and written to its output slots."""
+    """A deferred pair walked again into block ``block``'s scratch list, finished and written to its output slots."""
     _state, cells, window, core, pair = solid_pair_window(core, data, heightfield, reach)
     planes = terrain_planes()
-    sink = solid_sink(thread * _CANDIDATES, _CANDIDATES, pair.eps, 0)
-    store = solid_scratch_store(solids)
+    sink = solid_sink(block * _CANDIDATES, _CANDIDATES, pair.eps, 0)
+    store = solid_scratch_store(scratch)
     planes, sink = solid_walk(core, data, window, planes, pair, sink, store, cells)
     solid_close(
         core, data, window, planes, pair, sink, store, out, pair_index, slot, row_limit, partner_class, frame, cells, 0
@@ -1233,16 +1218,13 @@ def terrain_solid_data(
     model,
     partners: np.ndarray,
     *,
-    pair_count: int | None = None,
-    full_threads: int = TERRAIN_SOLID_FULL_THREADS,
     thread_vertices: int = TERRAIN_SOLID_THREAD_VERTICES,
-    tile_blocks: int = TERRAIN_SOLID_TILE_BLOCKS,
 ) -> TerrainSolidData:
     """The solid classes' data for a model: the hull table of the convex-mesh partners in ``partners`` (shape
-    indices), per thread of the full kernels' grid of ``full_threads`` a scratch list of
-    :data:`TERRAIN_ROW_CANDIDATES` rows, and the lists of large windows of a pair table of ``pair_count`` pairs
-    (default: ``len(partners)``) that the one-thread kernels hand to the tiled kernels' ``tile_blocks`` blocks
-    (``thread_vertices`` 0: the one-thread kernels walk every window)."""
+    indices) and the one-thread kernels' lane choice (``thread_vertices`` 0: they walk every window). Their launch
+    arguments, the work lists and the full finish's scratch, are the shadow's
+    (:func:`~newton._src.geometry.terrain_law.terrain_pair_work`,
+    :func:`~newton._src.geometry.terrain_law.terrain_finish_scratch`)."""
     from .types import GeoType  # noqa: PLC0415
 
     device = model.device
@@ -1260,21 +1242,5 @@ def terrain_solid_data(
         shape_hull[s] = index_of[key]
     solids = TerrainSolidData()
     solids.hulls = build_hull_table(meshes, shape_hull, device)
-    if full_threads < 1:
-        raise ValueError(f"The full kernels need at least one thread, got {full_threads}")
-    slots = int(full_threads) * TERRAIN_ROW_CANDIDATES
-    solids.scratch_q = wp.zeros(slots, dtype=wp.vec3, device=device)
-    solids.scratch_n = wp.zeros(slots, dtype=wp.vec3, device=device)
-    solids.scratch_d = wp.zeros(slots, dtype=wp.float32, device=device)
-    solids.scratch_feature = wp.zeros(slots, dtype=wp.int32, device=device)
-    solids.full_threads = int(full_threads)
-    if tile_blocks < 1:
-        raise ValueError(f"The tiled kernels need at least one block, got {tile_blocks}")
-    pairs = len(partners) if pair_count is None else int(pair_count)
-    solids.wide = wp.zeros(max(pairs, 1), dtype=wp.int32, device=device)
-    from .terrain_contacts import TERRAIN_PARTNER_CLASSES  # noqa: PLC0415
-
-    solids.wide_count = wp.zeros(TERRAIN_PARTNER_CLASSES, dtype=wp.int32, device=device)
     solids.thread_vertices = int(thread_vertices)
-    solids.tile_blocks = int(tile_blocks)
     return solids

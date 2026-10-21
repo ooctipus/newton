@@ -15,29 +15,30 @@ capture.
 Today's route still produces every contact; the shadow's rows are read only by :meth:`TerrainLawShadow.rows`.
 
 The per-type kernels take ``(begin, slot_begin, inputs, data, out)``
-(:class:`~newton._src.geometry.terrain_law.TerrainPairInputs`, :class:`~newton._src.geometry.terrain_law.TerrainFeatureData`,
-:class:`~newton._src.geometry.terrain_law.TerrainLawRows`) and a sixth argument: table pair ``begin + i`` writes its
-rows to slots ``slot_begin + i * K``, ``K`` its class's row limit
-(:data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_ROWS`), its row count and ``TERRAIN_PAIR_*`` state.
-:data:`TERRAIN_LAW_KERNELS` names the kernels per class (a class without an entry has no kernel yet). The point
-class's take a launch argument as sixth:
+(:class:`~newton._src.geometry.terrain_law.TerrainPairInputs`,
+:class:`~newton._src.geometry.terrain_law.TerrainFeatureData`,
+:class:`~newton._src.geometry.terrain_law.TerrainLawRows`) and a launch argument, the solid classes' also their
+:class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData` (hull tables and the one-thread kernels' lane choice;
+built once when a solid class is listed): table pair ``begin + i`` writes its rows to slots ``slot_begin + i * K``,
+``K`` its class's row limit (:data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_ROWS`), its row count and
+``TERRAIN_PAIR_*`` state. :data:`TERRAIN_LAW_KERNELS` names the kernels per class (a class without an entry has no
+kernel yet). Every class launches them alike, in blocks of
+:func:`~newton._src.geometry.terrain_law.terrain_law_block_dim` threads:
 
 1. The one-thread kernel, one thread per pair of the class (both lane classes: the table keeps them contiguous), with
    the class's :class:`~newton._src.geometry.terrain_law.TerrainPairWork`. It walks the pairs whose windows hold at
-   most :data:`~newton._src.geometry.terrain_contacts.TERRAIN_LANE_CELLS` cells; a pair with a larger window it only
-   takes through the whole-pair rejects (stale features, the pair policy, a window off the heightfield, the tile-max
-   exit), and queues it in the work list when it reaches its window.
+   most :data:`~newton._src.geometry.terrain_contacts.TERRAIN_LANE_CELLS` cells over every orientation; a pair with a
+   larger window it takes through the whole-pair rejects (stale features, the pair policy, a window off the
+   heightfield, the tile-max exit), and when it reaches its window queues it in the work list: the point class every
+   such pair, a solid class those whose windows, as their poses give them, hold more than
+   :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_THREAD_VERTICES` vertices (it walks the others).
 2. The tiled kernel, ``wp.launch_tiled`` with :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK` lanes per
    pair and the work list's fixed grid (:attr:`~newton._src.geometry.terrain_law.TerrainPairWork.blocks` blocks),
    which strides over the queued pairs: a pair that leaves at the tile max never occupies a tile.
-3. The full-finish kernel (:data:`TERRAIN_LAW_KERNELS`).
-
-The solid classes' take their :class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData` as sixth (hull
-tables, the full kernels' scratch rows and the lists of large windows; built once when a solid class is listed). A
-solid class's one-thread kernel takes all its pairs and lists those whose windows, as their poses give them, hold more
-than :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_THREAD_VERTICES` vertices for its tiled kernel, a
-fixed grid of :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_TILE_BLOCKS` tiles of
-:data:`~newton._src.geometry.terrain_contacts.TERRAIN_TILE_LANES` lanes striding over the list.
+3. The full-finish kernel, ``wp.launch_tiled`` on the fixed grid of its
+   :class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`
+   (:data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_FULL_BLOCKS` blocks), which strides over the class's deferred
+   list.
 
 The kernels apply the pipeline's pair policy: the table holds the pairs its collision filter admits (worlds,
 collision groups, filter pairs, or its explicit pair list), and each kernel drops the pairs its broad phase's
@@ -64,7 +65,6 @@ from .terrain_contacts import (
     TERRAIN_PARTNER_HULL,
     TERRAIN_PARTNER_POINT,
     TERRAIN_PARTNER_ROWS,
-    TERRAIN_TILE_LANES,
     TerrainFeatures,
     TerrainPairTable,
 )
@@ -120,21 +120,18 @@ TERRAIN_LAW_KERNELS: dict[int, tuple[str, str, str, str | None]] = {
 }
 """Per partner class: the module, its one-thread and tiled kernels, and its full-finish kernel or ``None``.
 
-The module is imported only when the class is listed. The point class's one-thread kernel runs over both lane
-segments of the class and its tiled one over the queued pairs of its tiled segment, each with the class's
+The module is imported only when the class is listed. Every class's kernels take one launch mechanism, with
+dimensions fixed at construction. The one-thread kernel runs over both lane segments of the class and the tiled one
+over the queued pairs of its tiled segment, each with the class's
 :class:`~newton._src.geometry.terrain_law.TerrainPairWork` as sixth argument (``begin`` and ``slot_begin`` are the
-class's first pair and slot for the one-thread kernel, the tiled segment's for the tiled one). Its full-finish kernel
-runs after them and finishes the pairs they marked :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_FULL`:
-``wp.launch_tiled`` with :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_FULL_BLOCKS` blocks of
+class's first pair and slot for the one-thread kernel, the tiled segment's for the tiled one). The full-finish kernel,
+when the class has one, runs after them and finishes the pairs they marked
+:data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_FULL`: ``wp.launch_tiled`` with
+:data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_FULL_BLOCKS` blocks of
 :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK` lanes whatever the class's size, striding over its
 deferred list, and a :class:`~newton._src.geometry.terrain_law.TerrainFinishScratch` as sixth argument (``begin`` and
-``slot_begin`` are the class's), so that an empty list costs one near-empty launch.
-
-A solid class's one-thread kernel runs over the whole class and its tiled one on a fixed grid over the windows the
-first listed as large; its full-finish kernel, on a fixed grid of
-:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_FULL_THREADS` threads, strides over the class's deferred
-list. Each takes the class's first pair and slot as ``begin`` and ``slot_begin`` and the
-:class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData` as sixth argument.
+``slot_begin`` are the class's), so that an empty list costs one near-empty launch. A solid class's kernels take the
+solid classes' data as seventh argument (:data:`TERRAIN_LAW_SOLID_CLASSES`).
 
 A class's module and kernels follow one protocol (the helpers live in :mod:`~newton._src.geometry.terrain_law`):
 
@@ -157,9 +154,9 @@ A class's module and kernels follow one protocol (the helpers live in :mod:`~new
 """
 
 TERRAIN_LAW_SOLID_CLASSES = (TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_HULL)
-"""Partner classes whose kernels take a sixth argument, the solid classes' data
-(:class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData`: hull tables, the full kernels' scratch rows and the
-lists of large windows), built once when one of them is listed."""
+"""Partner classes whose kernels take a seventh argument, the solid classes' data
+(:class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData`: hull tables and the one-thread kernels' lane
+choice), built once when one of them is listed."""
 
 TERRAIN_LANE_NAMES = {TERRAIN_LANE_THREAD: "thread", TERRAIN_LANE_TILE: "tiled"}
 """Names of the pair table's lane classes, by id (the table orders a class's pairs by lane class id)."""
@@ -217,11 +214,11 @@ class TerrainLawShadow:
     """The terrain law's kernels for some partner classes, run after the narrow phase into a side buffer.
 
     Built once, outside graph capture: the terrain features, the pair table, the side buffer (per listed pair
-    ``K`` slots of a terrain point, a normal, a core distance and a feature id, plus a row count and a state), for the
-    point class its :class:`~newton._src.geometry.terrain_law.TerrainPairWork` and its
-    :class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`, and with a solid class listed the
-    solid classes' data (:class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData`). :meth:`launch` then runs
-    each class's kernels with dimensions fixed here; the narrow phase's contacts are untouched.
+    ``K`` slots of a terrain point, a normal, a core distance and a feature id, plus a row count and a state), per
+    class its :class:`~newton._src.geometry.terrain_law.TerrainPairWork` and, with a full-finish kernel, its
+    :class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`, and with a solid class listed the solid classes'
+    data (:class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData`). :meth:`launch` then runs each class's
+    kernels with dimensions fixed here; the narrow phase's contacts are untouched.
 
     Args:
         model: A finalized model.
@@ -259,41 +256,31 @@ class TerrainLawShadow:
             if end == begin:
                 continue
             slot_first[begin:end] = slot + rows * np.arange(end - begin)
-            if partner_class in TERRAIN_LAW_SOLID_CLASSES:
+            # A solid class's kernels also take the solid classes' data (built below, once).
+            solid = partner_class in TERRAIN_LAW_SOLID_CLASSES
+            if solid:
                 if solid_module is None:
                     solid_module = importlib.import_module("newton._src.geometry.terrain_law_solid")
-                # One thread per pair over the whole class; the windows the pose makes large go to the tiled kernel's
-                # fixed grid (only a tiled-lane partner's can be), the deferred pairs to the full kernel's. Their
-                # sixth argument, the solid classes' data, is built below.
-                self._launches.append(("solid_thread", getattr(module, thread_name), end - begin, begin, slot, None))
-                if end > tiled_begin:
-                    blocks = solid_module.TERRAIN_SOLID_TILE_BLOCKS
-                    self._launches.append(("solid_tiled", getattr(module, tiled_name), blocks, begin, slot, None))
-                if full_name is not None:
-                    # A fixed grid striding over the class's deferred list.
-                    threads = solid_module.TERRAIN_SOLID_FULL_THREADS
-                    self._launches.append(("solid_full", getattr(module, full_name), threads, begin, slot, None))
                 solid_pairs.append((begin, end - begin))
-                slot += rows * (end - begin)
-                continue
             counter = TERRAIN_PARTNER_CLASSES + partner_class
             work = terrain_pair_work(
                 device, tiled_begin, end - tiled_begin, count=self._counters[counter : counter + 1]
             )
             # One thread per pair of the class: it walks the small windows and queues the larger ones it does not
-            # reject whole, which the tiled kernel's fixed grid then takes in turn.
-            self._launches.append(("thread", getattr(module, thread_name), end - begin, begin, slot, work))
+            # reject whole (a solid class: those its pose makes large), which the tiled kernel's fixed grid then takes
+            # in turn.
+            self._launches.append(("thread", getattr(module, thread_name), end - begin, begin, slot, solid, work))
             shapes = {"block_dim": block, "thread_dim": end - begin, "tiled_blocks": 0, "full_blocks": 0}
             if end > tiled_begin:
                 tiled_slot = slot + rows * (tiled_begin - begin)
                 self._launches.append(
-                    ("tiled", getattr(module, tiled_name), work.blocks, tiled_begin, tiled_slot, work)
+                    ("tiled", getattr(module, tiled_name), work.blocks, tiled_begin, tiled_slot, solid, work)
                 )
                 shapes["tiled_blocks"] = work.blocks
             if full_name is not None:
                 # A fixed grid over the class's deferred list (the pairs are found on the device, in any order).
                 scratch = terrain_finish_scratch(device)
-                self._launches.append(("full", getattr(module, full_name), scratch.blocks, begin, slot, scratch))
+                self._launches.append(("full", getattr(module, full_name), scratch.blocks, begin, slot, solid, scratch))
                 shapes["full_blocks"] = scratch.blocks
             self._launch_shapes[terrain_law_class_name(partner_class)] = shapes
             slot += rows * (end - begin)
@@ -325,17 +312,11 @@ class TerrainLawShadow:
         self._unsupported_pairs = 0
         if solid_pairs:
             partners = np.concatenate([self.table.pairs_host[b : b + c, 1] for b, c in solid_pairs])
-            # One scratch list per thread of the full kernels' grid and one list of large windows per class, which the
-            # solid classes' launches share in turn.
-            self._solids = solid_module.terrain_solid_data(model, partners, pair_count=self.table.pair_count)
+            self._solids = solid_module.terrain_solid_data(model, partners)
             classes = np.concatenate([self.table.partner_class[b : b + c] for b, c in solid_pairs])
             self._unsupported_pairs = int(
                 np.count_nonzero(solid_module.terrain_solid_unsupported(classes, model.shape_type.numpy()[partners]))
             )
-            self._launches = [
-                (kind, kernel, dim, begin, slot, self._solids if kind.startswith("solid_") else extra)
-                for kind, kernel, dim, begin, slot, extra in self._launches
-            ]
         self._no_body_flags = wp.empty(0, dtype=wp.int32, device=device)
         self.build_seconds = time.perf_counter() - started
         """Host time of the construction [s]: features, pair table, kernel modules imported and buffers."""
@@ -380,19 +361,13 @@ class TerrainLawShadow:
         inputs.include_static_kinematic_pairs = int(bool(include_static_kinematic_pairs))
         data = self.features.data()
         self._counters.zero_()
-        if self._solids is not None:
-            self._solids.wide_count.zero_()
         block = terrain_law_block_dim(self.device)
-        for kind, kernel, dim, begin, slot, extra in self._launches:
+        for kind, kernel, dim, begin, slot, solid, extra in self._launches:
             args = [begin, slot, inputs, data, self._out, extra]
+            if solid:
+                args.append(self._solids)
             if kind == "thread":
                 wp.launch(kernel, dim=dim, inputs=args, block_dim=block, device=self.device, record_tape=False)
-            elif kind in ("solid_thread", "solid_full"):
-                wp.launch(kernel, dim=dim, inputs=args, device=self.device, record_tape=False)
-            elif kind == "solid_tiled":
-                wp.launch_tiled(
-                    kernel, dim=dim, inputs=args, block_dim=TERRAIN_TILE_LANES, device=self.device, record_tape=False
-                )
             else:
                 wp.launch_tiled(kernel, dim=dim, inputs=args, block_dim=block, device=self.device, record_tape=False)
 
@@ -441,10 +416,10 @@ class TerrainLawShadow:
 
     def describe(self) -> dict:
         """Return a host-only record of the shadow: classes, pairs per lane class, launches, memory, and with a solid
-        class listed the solid classes' lane choice, the threads of their full kernels' grid and the pairs whose partner
-        has no core yet (no row).
+        class listed the one-thread kernels' lane choice (``thread_vertices``) and the pairs whose partner has no core
+        yet (``unsupported_pairs``, no row).
 
-        ``launch_shapes`` holds, per point class with pairs, the dimensions fixed at construction: ``block_dim`` (every
+        ``launch_shapes`` holds, per class with pairs, the dimensions fixed at construction: ``block_dim`` (every
         launch's), ``thread_dim`` (the one-thread kernel's threads, one per pair of the class), ``tiled_blocks`` and
         ``full_blocks`` (the tiled and full-finish kernels' grids, 0 for a kernel the class does not launch).
         """
@@ -474,10 +449,6 @@ class TerrainLawShadow:
             solid = sum(
                 array.capacity
                 for array in (
-                    self._solids.scratch_q,
-                    self._solids.scratch_n,
-                    self._solids.scratch_d,
-                    self._solids.scratch_feature,
                     hulls.points,
                     hulls.planes,
                     hulls.face_vertices,
@@ -497,8 +468,6 @@ class TerrainLawShadow:
         if self._solids is not None:
             solids = {
                 "thread_vertices": int(self._solids.thread_vertices),
-                "tile_blocks": int(self._solids.tile_blocks),
-                "full_threads": int(self._solids.full_threads),
                 "unsupported_pairs": self._unsupported_pairs,
             }
         return {

@@ -3,17 +3,20 @@
 
 """The terrain law's kernels for flat-capped cylinders and cones (rules F, E, V and R of the law for solid cores).
 
-The kernels have the per-type signature ``(begin, slot_begin, inputs, data, out, solids)``
-(:class:`~newton._src.geometry.terrain_law.TerrainPairInputs`, :class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData`):
-:func:`terrain_cylinder_rows` runs one thread per pair over the whole class and lists the pairs whose windows (as the
-pose gives them) hold more than :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_THREAD_VERTICES`
-vertices, :func:`terrain_cylinder_rows_tiled` runs ``wp.block_dim()`` lanes per listed pair on a fixed grid striding over
-the list (the lanes mark the window vertices that yield a row, the first lane walks those in window order and finishes
-the pair, which gives it the one-thread kernel's rows), and :func:`terrain_cylinder_rows_full`, on a fixed grid striding
-over the class's deferred list, the pairs the other two deferred
-(more distinct rows than the class's 16 slots). The walk, the rules and the finish are
-:mod:`~newton._src.geometry.terrain_law_solid`'s; the module is compiled without floating-point contraction, so the
-CPU decides every boundary as the GPU does.
+The kernels take the per-type arguments ``(begin, slot_begin, inputs, data, out)``
+(:class:`~newton._src.geometry.terrain_law.TerrainPairInputs`), their launch argument and the solid classes' data
+(:class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData`), on the shadow's shared launches
+(:data:`~newton._src.geometry.terrain_shadow.TERRAIN_LAW_KERNELS`): :func:`terrain_cylinder_rows` runs one thread per
+pair over the whole class and queues the tiled-lane pairs whose windows (as the pose gives them) hold more than
+:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_THREAD_VERTICES` vertices in its
+:class:`~newton._src.geometry.terrain_law.TerrainPairWork`, :func:`terrain_cylinder_rows_tiled` runs ``wp.block_dim()``
+lanes per queued pair on the work list's fixed grid (the lanes mark the window vertices that yield a row, the first lane
+walks those in window order and finishes the pair, which gives it the one-thread kernel's rows), and
+:func:`terrain_cylinder_rows_full`, on the fixed full-finish grid of its
+:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch` striding over the class's deferred list, the pairs the
+other two deferred (more distinct rows than the class's 16 slots). The walk, the rules and the finish are
+:mod:`~newton._src.geometry.terrain_law_solid`'s; the module is compiled without floating-point contraction, so the CPU
+decides every boundary as the GPU does.
 """
 
 from __future__ import annotations
@@ -21,7 +24,14 @@ from __future__ import annotations
 import warp as wp
 
 from .terrain_contacts import TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_ROWS
-from .terrain_law import TerrainFeatureData, TerrainLawRows, TerrainPairInputs, terrain_pair_exit
+from .terrain_law import (
+    TerrainFeatureData,
+    TerrainFinishScratch,
+    TerrainLawRows,
+    TerrainPairInputs,
+    TerrainPairWork,
+    terrain_pair_exit,
+)
 from .terrain_law_cores import TerrainCylinderCore
 from .terrain_law_solid import (
     TERRAIN_SOLID_MASK_WORDS,
@@ -70,10 +80,16 @@ def terrain_cylinder_rows(
     inputs: TerrainPairInputs,
     data: TerrainFeatureData,
     out: TerrainLawRows,
+    work: TerrainPairWork,
     solids: TerrainSolidData,
 ):
-    """The law's rows of the class's pairs, one thread per pair; a window of more than ``solids.thread_vertices``
-    vertices is listed for the tiled kernel."""
+    """The law's rows of the class's pairs, one thread per pair (``begin`` and ``slot_begin`` are the class's first
+    pair and slot); a pair from ``work.first`` on whose window holds more than ``solids.thread_vertices`` vertices is
+    queued in ``work`` for the tiled kernel.
+
+    Launch: ``wp.launch`` with one thread per pair of the class and ``block_dim``
+    :func:`~newton._src.geometry.terrain_law.terrain_law_block_dim`.
+    """
     i = wp.tid()
     pair = begin + i
     state, frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
@@ -84,7 +100,9 @@ def terrain_cylinder_rows(
     if not supported:
         solid_unsupported(out, pair)
         return
-    solid_rows_thread(core, data, out, solids, pair, slot_begin + i * _ROWS, _ROWS, _CLASS, frame, heightfield, reach)
+    solid_rows_thread(
+        core, data, out, work, solids, pair, slot_begin + i * _ROWS, _ROWS, _CLASS, frame, heightfield, reach
+    )
 
 
 @wp.kernel(enable_backward=False)
@@ -94,17 +112,25 @@ def terrain_cylinder_rows_tiled(
     inputs: TerrainPairInputs,
     data: TerrainFeatureData,
     out: TerrainLawRows,
+    work: TerrainPairWork,
     solids: TerrainSolidData,
 ):
-    """The class's pairs the one-thread kernel listed for their large windows, ``wp.block_dim()`` lanes per pair
-    (``begin`` and ``slot_begin`` are the class's first pair and slot): the grid's ``solids.tile_blocks`` blocks stride
-    over the list; a block's lanes mark the window vertices that yield a row, and its first lane walks those in window
-    order and finishes the pair, which gives it the one-thread walk's rows."""
+    """The class's pairs the one-thread kernel queued for their large windows, ``wp.block_dim()`` lanes per pair
+    (``begin`` and ``slot_begin`` are the tiled segment's first pair and slot): the grid's ``work.blocks`` blocks
+    stride over the queue; a block's lanes mark the window vertices that yield a row, and its first lane walks those in
+    window order and finishes the pair, which gives it the one-thread walk's rows.
+
+    Launch: ``wp.launch_tiled`` with ``dim=work.blocks`` and ``block_dim``
+    :func:`~newton._src.geometry.terrain_law.terrain_law_block_dim`. A block past ``work.blocks`` returns at once (it
+    would take queued pairs a second time); with fewer blocks the missing blocks' pairs would get no rows.
+    """
     block, lane = wp.tid()
+    if block >= work.blocks:
+        return
     lanes = wp.block_dim()
-    for entry in range(block, solids.wide_count[_CLASS], solids.tile_blocks):
+    for entry in range(block, work.count[0], work.blocks):
         # every lane reads the same pair; the one-thread kernel found it current, cored and in its window
-        pair = solids.wide[begin + entry]
+        pair = work.pairs[entry]
         _state, frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
         _supported, core = _core(local, size, inputs.shape_type[partner], partner, solids)
         _state, cells, window, core, setup = solid_pair_window(core, data, heightfield, reach)
@@ -142,21 +168,28 @@ def terrain_cylinder_rows_full(
     inputs: TerrainPairInputs,
     data: TerrainFeatureData,
     out: TerrainLawRows,
+    scratch: TerrainFinishScratch,
     solids: TerrainSolidData,
 ):
-    """Finish the class's deferred pairs (``begin`` and ``slot_begin`` are the class's first pair and slot): its
-    ``solids.full_threads`` threads stride over the class's deferred list, and each walks its pairs again, one at a
-    time, into its own scratch list (:data:`~newton._src.geometry.terrain_law.TERRAIN_ROW_CANDIDATES` rows), runs the
-    finish and writes the kept rows. A pair's rows depend on the pair alone: not on the order of the deferral, the
-    number of deferred pairs or the thread that finishes it."""
-    thread = wp.tid()
-    if thread >= solids.full_threads:
+    """Finish the class's deferred pairs (``begin`` and ``slot_begin`` are the class's first pair and slot): the grid's
+    ``scratch.blocks`` blocks stride over the class's deferred list, and each block's first lane walks its pairs again,
+    one at a time, into the block's scratch list (:data:`~newton._src.geometry.terrain_law.TERRAIN_ROW_CANDIDATES`
+    rows), runs the finish and writes the kept rows. A pair's rows depend on the pair alone: not on the order of the
+    deferral, the number of deferred pairs or the block that finishes it.
+
+    Launch: ``wp.launch_tiled`` with ``dim=scratch.blocks`` and ``block_dim``
+    :func:`~newton._src.geometry.terrain_law.terrain_law_block_dim`. A block past ``scratch.blocks`` returns at once
+    (it has no scratch, and would finish deferred pairs a second time); with fewer blocks the missing blocks' pairs
+    would keep no rows.
+    """
+    block, lane = wp.tid()
+    if block >= scratch.blocks or lane != 0:
         return
-    for entry in range(thread, out.deferred_count[_CLASS], solids.full_threads):
+    for entry in range(block, out.deferred_count[_CLASS], scratch.blocks):
         pair = out.deferred[begin + entry]
         i = pair - begin
         _state, frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
         _supported, core = _core(local, size, inputs.shape_type[partner], partner, solids)
         solid_rows_full(
-            core, data, out, solids, thread, pair, slot_begin + i * _ROWS, _ROWS, _CLASS, frame, heightfield, reach
+            core, data, out, scratch, block, pair, slot_begin + i * _ROWS, _ROWS, _CLASS, frame, heightfield, reach
         )

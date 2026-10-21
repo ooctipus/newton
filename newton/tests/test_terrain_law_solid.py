@@ -42,15 +42,24 @@ from newton._src.geometry.terrain_contacts import (
 )
 from newton._src.geometry.terrain_law import (
     TERRAIN_FEATURE_RECOVERY,
+    TERRAIN_LAW_FULL_BLOCKS,
+    TERRAIN_LAW_TILE_BLOCKS,
     TERRAIN_PAIR_CANDIDATE_OVERFLOW,
+    TERRAIN_PAIR_FILTERED,
+    TERRAIN_PAIR_OUTSIDE,
     TERRAIN_PAIR_ROW_OVERFLOW,
+    TERRAIN_PAIR_STALE,
+    TERRAIN_PAIR_TILE_EXIT,
     TERRAIN_PAIR_UNSUPPORTED,
     TERRAIN_ROW_CANDIDATES,
     TerrainLawRows,
     TerrainPairInputs,
     TerrainRows,
     terrain_finish,
+    terrain_finish_scratch,
     terrain_finish_slots,
+    terrain_law_block_dim,
+    terrain_pair_work,
     terrain_rows_push,
 )
 from newton.tests import terrain_law_reference as ref
@@ -981,6 +990,13 @@ def _window_vertices(hf, kind, dims, pose) -> int:
     return (r1 - r0 + 2) * (c1 - c0 + 2)
 
 
+def _queued(shadow, partner_class) -> np.ndarray:
+    """The pairs a shadow's last launch queued for a solid class's tiled kernel (its one-thread launch's work list)."""
+    module, thread, _tiled, _full = _SOLID_KERNELS[partner_class]
+    work = next(extra for _kind, kernel, *_launch, extra in shadow._launches if kernel is getattr(module, thread))
+    return work.pairs.numpy()[: int(work.count.numpy()[0])]
+
+
 def _pair_inputs(model, pipeline) -> TerrainPairInputs:
     """The pair inputs of a shadow pipeline's last collide (its pair table and shape transforms)."""
     inputs = TerrainPairInputs()
@@ -1000,11 +1016,12 @@ def test_tiled_kernels_match_one_thread_kernels(test, device):
     """Give a solid pair the same rows, bit for bit, whether one thread or a tile of lanes walks its window, and so
     whichever lane the shadow's run-time choice takes.
 
-    One arm walks every pair of the classes' tiled segments in one thread; the other lists every walking pair for the
-    tiled kernel (``thread_vertices`` 1) and runs it on a grid of 3 blocks, so that blocks stride over the list.
-    Windows of up to 256 vertices are marked by the lanes and replayed by the first; larger ones (one solid per class
-    here) are walked by the first lane alone. The shadow's own rows (windows over 64 vertices tiled, the others in
-    one thread) are those rows too. The CPU runs one lane.
+    One arm walks every pair of the classes' tiled segments in one thread; the other queues every walking pair for the
+    tiled kernel (``thread_vertices`` 1) and runs it on a grid of 3 blocks, so that blocks stride over the queue, the
+    full-finish kernel on 3 blocks too. Windows of up to 256 vertices are marked by the lanes and replayed by the
+    first; larger ones (one solid per class here) are walked by the first lane alone. The shadow's own rows (windows
+    over 64 vertices tiled, the others in one thread) are those rows too. Every launch takes the shadow's block size;
+    the CPU runs one lane.
     """
     hf, model, shapes, bodies = _tile_scene(np.random.default_rng(37), device)
     pipeline, _contacts, _state = _collide(model, shadow=True)
@@ -1016,8 +1033,8 @@ def test_tiled_kernels_match_one_thread_kernels(test, device):
     }
     test.assertEqual(large, {TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_HULL})
     # the shadow's run-time choice took both lanes in every class
-    listed = shadow._solids.wide_count.numpy()
-    test.assertTrue(all(listed[c] > 0 for c in _SOLID_KERNELS), msg=listed)
+    queued = {c: len(_queued(shadow, c)) for c in _SOLID_KERNELS}
+    test.assertTrue(all(v > 0 for v in queued.values()), msg=queued)
     expected = shadow.rows()
     first_row = np.concatenate([[0], np.cumsum(expected["count"])])
     inputs = _pair_inputs(model, pipeline)
@@ -1028,17 +1045,20 @@ def test_tiled_kernels_match_one_thread_kernels(test, device):
         test.assertGreater(end - begin, 0)
         rows = TERRAIN_PARTNER_ROWS[partner_class]
         outputs = []
+        block = terrain_law_block_dim(device)
         for thread_vertices in (0, 1):
-            solids = terrain_law_solid.terrain_solid_data(
-                model, partners, full_threads=3, thread_vertices=thread_vertices, tile_blocks=3
-            )
+            solids = terrain_law_solid.terrain_solid_data(model, partners, thread_vertices=thread_vertices)
             out = _side_buffer(begin, end - begin, rows, table.pair_count, device)
-            args = [begin, 0, inputs, shadow.features.data(), out, solids]
-            wp.launch(getattr(module, thread), dim=end - begin, inputs=args, device=device)
+            work = terrain_pair_work(device, begin, end - begin)
+            work.blocks = 3
+            scratch = terrain_finish_scratch(device, blocks=3)
+            walk = [begin, 0, inputs, shadow.features.data(), out, work, solids]
+            wp.launch(getattr(module, thread), dim=end - begin, inputs=walk, block_dim=block, device=device)
             if thread_vertices:
-                test.assertGreater(int(solids.wide_count.numpy()[partner_class]), 3)
-                wp.launch_tiled(getattr(module, tiled), dim=3, inputs=args, block_dim=16, device=device)
-            wp.launch(getattr(module, full), dim=3, inputs=args, device=device)
+                test.assertGreater(int(work.count.numpy()[0]), 3)
+                wp.launch_tiled(getattr(module, tiled), dim=work.blocks, inputs=walk, block_dim=block, device=device)
+            finish = [begin, 0, inputs, shadow.features.data(), out, scratch, solids]
+            wp.launch_tiled(getattr(module, full), dim=scratch.blocks, inputs=finish, block_dim=block, device=device)
             outputs.append(out)
         one, lanes = outputs
         for name in ("count", "state", "q", "n", "d", "feature"):
@@ -1098,10 +1118,10 @@ def test_row_overflow_keeps_each_plane_deepest(test, device):
 
 
 def test_deferred_pairs_keep_their_rows_beyond_the_grid(test, device):
-    """Finish every deferred pair from its own rows, however many defer: one full-kernel thread for three boxes.
+    """Finish every deferred pair from its own rows, however many defer: one full-finish block for three boxes.
 
-    Three long boxes overflow the box class's slots and defer; a full kernel of one thread walks them again one after
-    the other, each into the thread's scratch list. Every box keeps the float64 finish's rows under the row limit, as
+    Three long boxes overflow the box class's slots and defer; a full kernel of one block walks them again one after
+    the other, each into the block's scratch list. Every box keeps the float64 finish's rows under the row limit, as
     with the shadow's own grid, bit for bit, and none is flagged as a candidate overflow.
     """
     hf, model, _shapes, bodies = _ridge_boxes(device, (0.9, 0.05, 0.02), (-0.55, 0.0, 0.55))
@@ -1110,17 +1130,19 @@ def test_deferred_pairs_keep_their_rows_beyond_the_grid(test, device):
     expected = shadow.rows()
     test.assertTrue(np.all(expected["state"] & int(TERRAIN_PAIR_ROW_OVERFLOW)))
     inputs = _pair_inputs(model, pipeline)
-    solids = terrain_law_solid.terrain_solid_data(
-        model, shadow.table.pairs_host[:, 1], full_threads=1, thread_vertices=0
-    )
+    solids = terrain_law_solid.terrain_solid_data(model, shadow.table.pairs_host[:, 1], thread_vertices=0)
     rows = TERRAIN_PARTNER_ROWS[TERRAIN_PARTNER_BOX]
     begin, end = shadow.table.segment(TERRAIN_PARTNER_BOX, TERRAIN_LANE_TILE)
     test.assertEqual(end - begin, len(bodies))
     out = _side_buffer(begin, end - begin, rows, shadow.table.pair_count, device)
-    args = [begin, 0, inputs, shadow.features.data(), out, solids]
-    wp.launch(terrain_law_box.terrain_box_rows, dim=end - begin, inputs=args, device=device)
+    block = terrain_law_block_dim(device)
+    work = terrain_pair_work(device, begin, end - begin)
+    walk = [begin, 0, inputs, shadow.features.data(), out, work, solids]
+    wp.launch(terrain_law_box.terrain_box_rows, dim=end - begin, inputs=walk, block_dim=block, device=device)
     test.assertEqual(int(out.deferred_count.numpy()[TERRAIN_PARTNER_BOX]), len(bodies))
-    wp.launch(terrain_law_box.terrain_box_rows_full, dim=1, inputs=args, device=device)
+    scratch = terrain_finish_scratch(device, blocks=1)
+    finish = [begin, 0, inputs, shadow.features.data(), out, scratch, solids]
+    wp.launch_tiled(terrain_law_box.terrain_box_rows_full, dim=1, inputs=finish, block_dim=block, device=device)
     count = out.count.numpy()
     state = out.state.numpy()
     q, n, d = out.q.numpy(), out.n.numpy(), out.d.numpy()
@@ -1202,7 +1224,7 @@ def test_solid_shadow_runs_under_graph_capture(test, device):
     """Capture the solid classes' shadow with the collide in a CUDA graph and replay it to an uncaptured collide's rows.
 
     Every solid class runs, with both lane classes of the pair table; a box and an ellipsoid whose windows exceed the
-    one-thread kernels' 64 vertices go to the tiled kernels (the list and its count the capture zeroes, the tiles'
+    one-thread kernels' 64 vertices go to the tiled kernels (the queue and its count the capture zeroes, the tiles'
     mark sums), and a long box defers to its class's full kernel, whose grid reads the deferred count. The shadow's launches
     are also captured alone with the device's memory pool off, so that an allocation inside them raises instead of
     becoming a graph allocation node.
@@ -1222,9 +1244,8 @@ def test_solid_shadow_runs_under_graph_capture(test, device):
     test.assertTrue(np.all(expected["count"] > 0), msg=expected["count"])
     test.assertGreaterEqual(int(np.count_nonzero(expected["state"] & int(TERRAIN_PAIR_ROW_OVERFLOW))), 1)
     # the tiled kernels walk the windows over 64 vertices (a box and an ellipsoid)
-    listed = shadow._solids.wide_count.numpy()
-    test.assertGreater(int(listed[TERRAIN_PARTNER_BOX]), 0)
-    test.assertGreater(int(listed[TERRAIN_PARTNER_HULL]), 0)
+    test.assertGreater(len(_queued(shadow, TERRAIN_PARTNER_BOX)), 0)
+    test.assertGreater(len(_queued(shadow, TERRAIN_PARTNER_HULL)), 0)
     # Move the bodies, so that the replay must recompute the rows.
     moved = model.state()
     q = moved.body_q.numpy()
@@ -1261,6 +1282,126 @@ def test_solid_shadow_runs_under_graph_capture(test, device):
     replayed = shadow.rows()
     for name in ("count", "state", "q", "n", "d", "feature"):
         np.testing.assert_array_equal(replayed[name], expected[name], err_msg=name)
+
+
+def test_solid_launches_share_the_point_grids(test, device):
+    """Launch every solid kernel on the shadow's shared mechanism, as the point class's: one block size, the one-thread
+    kernel over the class, the tiled kernel on its work list's fixed grid, the full-finish kernel on the fixed grid of
+    its scratch.
+
+    Every solid class has pairs of both lane classes here, windows over the one-thread kernel's 64 vertices (a box and
+    an ellipsoid) and a deferring box. The one-thread kernel queues exactly once each pair it leaves to the tiled
+    kernel, every one a tiled-lane pair past the whole-pair rejects.
+    """
+    model, _hfield, _shapes = _capture_scene(device)
+    pipeline = tu.shadow_pipeline(model, classes="all", **PIPELINE)
+    shadow = pipeline._terrain_law_shadow
+    table = shadow.table
+    launched = {}
+    launch, launch_tiled = wp.launch, wp.launch_tiled
+    modules = {module.__name__ for module, *_names in _SOLID_KERNELS.values()}
+
+    def recorder(original, how):
+        def record(kernel, *args, **kwargs):
+            if kernel.module.name in modules:
+                launched.setdefault(kernel.key, []).append((how, kwargs["dim"], kwargs.get("block_dim")))
+            return original(kernel, *args, **kwargs)
+
+        return record
+
+    with patch.object(wp, "launch", recorder(launch, "launch")):
+        with patch.object(wp, "launch_tiled", recorder(launch_tiled, "tiled")):
+            pipeline.collide(model.state(), pipeline.contacts())
+    block = terrain_law_block_dim(device)
+    rows = shadow.rows()
+    exits = int(TERRAIN_PAIR_TILE_EXIT | TERRAIN_PAIR_STALE | TERRAIN_PAIR_FILTERED | TERRAIN_PAIR_OUTSIDE)
+    exits |= int(TERRAIN_PAIR_UNSUPPORTED)
+    for partner_class, (module, thread, tiled, full) in _SOLID_KERNELS.items():
+        begin = table.segment(partner_class, TERRAIN_LANE_THREAD)[0]
+        tiled_begin, end = table.segment(partner_class, TERRAIN_LANE_TILE)
+        test.assertGreater(tiled_begin, begin)
+        test.assertGreater(end, tiled_begin)
+        test.assertEqual(launched[getattr(module, thread).key], [("launch", end - begin, block)])
+        tiled_blocks = min(end - tiled_begin, TERRAIN_LAW_TILE_BLOCKS)
+        test.assertEqual(launched[getattr(module, tiled).key], [("tiled", tiled_blocks, block)])
+        test.assertEqual(launched[getattr(module, full).key], [("tiled", TERRAIN_LAW_FULL_BLOCKS, block)])
+        queued = _queued(shadow, partner_class)
+        test.assertEqual(len(np.unique(queued)), len(queued))
+        test.assertTrue(np.all((queued >= tiled_begin) & (queued < end)), msg=queued)
+        state = rows["state"][np.searchsorted(shadow._listed, queued)]
+        test.assertFalse(np.any(state & exits), msg=state)
+    test.assertGreater(len(_queued(shadow, TERRAIN_PARTNER_BOX)), 0)
+    test.assertGreater(len(_queued(shadow, TERRAIN_PARTNER_HULL)), 0)
+    test.assertGreater(int(shadow._out.deferred_count.numpy()[TERRAIN_PARTNER_BOX]), 0)
+
+
+def test_solid_fixed_grids_take_each_pair_once(test, device):
+    """Take every queued and every deferred solid pair once, even in a launch with more blocks than the grid.
+
+    The solid tiled and full-finish kernels stride over their lists by the grids fixed in the work list and in the
+    finish scratch (``work.blocks``, ``scratch.blocks``); a block past that grid returns at once. Long boxes lie across
+    ridges: their windows exceed the one-thread kernel's vertices (queued) and their rows the box class's slots
+    (deferred). Launched with three blocks more (and scratch room for them), the tiled kernel would otherwise take
+    queued pairs twice, deferring them twice, and the full-finish kernel would finish deferred pairs twice, counting
+    their row overflow twice.
+    """
+    _hf, model, _shapes, bodies = _ridge_boxes(device, (0.9, 0.05, 0.02), (-0.75, -0.45, -0.15, 0.15, 0.45, 0.75))
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    shadow = pipeline._terrain_law_shadow
+    table = shadow.table
+    begin = table.segment(TERRAIN_PARTNER_BOX, TERRAIN_LANE_THREAD)[0]
+    tiled_begin, end = table.segment(TERRAIN_PARTNER_BOX, TERRAIN_LANE_TILE)
+    test.assertEqual(end - tiled_begin, len(bodies))
+    rows = TERRAIN_PARTNER_ROWS[TERRAIN_PARTNER_BOX]
+    inputs = _pair_inputs(model, pipeline)
+    data = shadow.features.data()
+    solids = terrain_law_solid.terrain_solid_data(model, table.pairs_host[:, 1])
+    block = terrain_law_block_dim(device)
+    blocks = 2
+    results = []
+    for extra in (0, 3):
+        out = _side_buffer(begin, end - begin, rows, table.pair_count, device)
+        # Room for pairs deferred more than once, so that blocks past the grid fail the counts below instead of
+        # writing past the deferred list.
+        out.deferred = wp.zeros(4 * table.pair_count, dtype=wp.int32, device=device)
+        work = terrain_pair_work(device, tiled_begin, end - tiled_begin)
+        work.blocks = blocks
+        walk = [begin, 0, inputs, data, out, work, solids]
+        wp.launch(terrain_law_box.terrain_box_rows, dim=end - begin, inputs=walk, block_dim=block, device=device)
+        walk[:2] = [tiled_begin, (tiled_begin - begin) * rows]
+        wp.launch_tiled(
+            terrain_law_box.terrain_box_rows_tiled, dim=blocks + extra, inputs=walk, block_dim=block, device=device
+        )
+        deferred = int(out.deferred_count.numpy()[TERRAIN_PARTNER_BOX])
+        # The deferred list in table order, so that the entries each block takes do not depend on the device.
+        listed = out.deferred.numpy()
+        listed[begin : begin + deferred] = np.sort(listed[begin : begin + deferred])
+        out.deferred.assign(listed)
+        scratch = terrain_finish_scratch(device, blocks=blocks + extra)
+        scratch.blocks = blocks
+        finish = [begin, 0, inputs, data, out, scratch, solids]
+        wp.launch_tiled(
+            terrain_law_box.terrain_box_rows_full, dim=blocks + extra, inputs=finish, block_dim=block, device=device
+        )
+        results.append(
+            {
+                "queued": int(work.count.numpy()[0]),
+                "deferred": deferred,
+                "overflow": out.overflow.numpy().tolist(),
+                **{name: getattr(out, name).numpy() for name in ("count", "state", "q", "n", "d", "feature")},
+            }
+        )
+    grid, wider = results
+    # Not vacuous: more pairs are queued and deferred than the grid has blocks, and every deferred pair overflows.
+    test.assertEqual(grid["queued"], len(bodies))
+    test.assertEqual(grid["deferred"], len(bodies))
+    test.assertGreater(grid["deferred"], blocks)
+    test.assertEqual(grid["overflow"], [len(bodies), 0])
+    for name in ("queued", "deferred", "overflow"):
+        test.assertEqual(wider[name], grid[name], msg=name)
+    for name in ("count", "state", "q", "n", "d", "feature"):
+        np.testing.assert_array_equal(wider[name], grid[name], err_msg=name)
+    test.assertTrue(np.all(grid["state"][tiled_begin:end] & int(TERRAIN_PAIR_ROW_OVERFLOW)))
 
 
 def test_shadow_keeps_contacts_bitwise_with_every_class(test, device):
@@ -1416,6 +1557,8 @@ for _name, _func in (
     ("test_row_overflow_keeps_each_plane_deepest", test_row_overflow_keeps_each_plane_deepest),
     ("test_deferred_pairs_keep_their_rows_beyond_the_grid", test_deferred_pairs_keep_their_rows_beyond_the_grid),
     ("test_candidate_overflow_keeps_the_first_rows_flagged", test_candidate_overflow_keeps_the_first_rows_flagged),
+    ("test_solid_launches_share_the_point_grids", test_solid_launches_share_the_point_grids),
+    ("test_solid_fixed_grids_take_each_pair_once", test_solid_fixed_grids_take_each_pair_once),
     ("test_shadow_keeps_contacts_bitwise_with_every_class", test_shadow_keeps_contacts_bitwise_with_every_class),
 ):
     add_function_test(TestTerrainLawSolid, _name, _func, devices=devices)

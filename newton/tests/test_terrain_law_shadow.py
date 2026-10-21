@@ -36,11 +36,7 @@ from newton._src.geometry.terrain_law import (
     terrain_law_block_dim,
 )
 from newton._src.geometry.terrain_law_point import TERRAIN_POINT_ROWS
-from newton._src.geometry.terrain_law_solid import (
-    TERRAIN_SOLID_FULL_THREADS,
-    TERRAIN_SOLID_THREAD_VERTICES,
-    TERRAIN_SOLID_TILE_BLOCKS,
-)
+from newton._src.geometry.terrain_law_solid import TERRAIN_SOLID_THREAD_VERTICES
 from newton._src.geometry.terrain_shadow import TERRAIN_LAW_KERNELS, parse_terrain_law_shadow
 from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_solid_utils as su
@@ -518,7 +514,7 @@ class TestTerrainLawShadow(unittest.TestCase):
 
     def test_route_record_of_solid_classes_cpu(self):
         """Record the solid classes' pairs per lane class, launches, data, lane choice, kernel grids and coreless
-        pairs."""
+        pairs: the grids are the point class's (one block size, the work list's tiled grid, the full-finish grid)."""
         rng = np.random.default_rng(8)
         heights = np.round(rng.uniform(0.0, 0.05, (17, 17)) / 0.005) * 0.005
         bodies = [
@@ -558,12 +554,21 @@ class TestTerrainLawShadow(unittest.TestCase):
                 # partners (only their windows can exceed the one-thread kernel's), and the full kernel
                 if sum(lanes.values()):
                     launches += 2 + int(lanes["tiled"] > 0)
+                    self.assertEqual(
+                        record["launch_shapes"][name],
+                        {
+                            "block_dim": terrain_law_block_dim("cpu"),
+                            "thread_dim": sum(lanes.values()),
+                            "tiled_blocks": min(lanes["tiled"], TERRAIN_LAW_TILE_BLOCKS),
+                            "full_blocks": TERRAIN_LAW_FULL_BLOCKS,
+                        },
+                    )
             self.assertEqual(record["launches"], launches)
             self.assertEqual(record["thread_vertices"], TERRAIN_SOLID_THREAD_VERTICES)
-            self.assertEqual(record["tile_blocks"], TERRAIN_SOLID_TILE_BLOCKS)
-            self.assertEqual(record["full_threads"], TERRAIN_SOLID_FULL_THREADS)
             self.assertEqual(record["unsupported_pairs"], unsupported)
             self.assertGreater(record["bytes"]["solid_data"], 0)
+            self.assertGreater(record["bytes"]["work_lists"], 0)
+            self.assertGreater(record["bytes"]["finish_scratch"], 0)
         # both lane classes of the box class are in the first scene
         self.assertTrue(
             all(
