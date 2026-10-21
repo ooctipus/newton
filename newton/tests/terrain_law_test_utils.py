@@ -11,6 +11,8 @@ that the predicates claim every support the float64 oracle (:mod:`newton.tests.t
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import numpy as np
 import warp as wp
 
@@ -435,8 +437,10 @@ def shadow_rows(pipeline) -> dict[int, list]:
 def contact_rows(model, state, contacts, heightfield: int) -> dict[int, list]:
     """Today's contacts of a heightfield per partner shape: ``[(q, n, d)]``, world frame, float64.
 
-    ``q`` is the contact's terrain point, ``n`` its normal from the terrain to the partner and ``d`` its core
-    distance (the margins and the partner's rounding radius taken out), as the law's rows have them.
+    ``q`` is the contact's terrain point, ``n`` its normal from the terrain to the partner and ``d = n . (k - q)``
+    with ``k`` its partner point. Today's narrow phase puts that point within about 0.1 mm of the partner's core (a
+    sphere's centre, a point of a capsule's axis), so ``d`` approximates the law's core distance to that much only:
+    compare today's rows with the law's on ``q`` and ``n``.
     """
     count = int(contacts.rigid_contact_count.numpy()[0])
     shape0 = contacts.rigid_contact_shape0.numpy()[:count]
@@ -444,11 +448,8 @@ def contact_rows(model, state, contacts, heightfield: int) -> dict[int, list]:
     point0 = contacts.rigid_contact_point0.numpy()[:count].astype(np.float64)
     point1 = contacts.rigid_contact_point1.numpy()[:count].astype(np.float64)
     normal = contacts.rigid_contact_normal.numpy()[:count].astype(np.float64)
-    margin0 = contacts.rigid_contact_margin0.numpy()[:count].astype(np.float64)
-    margin1 = contacts.rigid_contact_margin1.numpy()[:count].astype(np.float64)
     body_q = state.body_q.numpy().astype(np.float64)
     shape_body = model.shape_body.numpy()
-    shape_margin = model.shape_margin.numpy().astype(np.float64)
 
     def world(shape, p):
         body = shape_body[shape]
@@ -460,13 +461,12 @@ def contact_rows(model, state, contacts, heightfield: int) -> dict[int, list]:
     for i in range(count):
         a, b = int(shape0[i]), int(shape1[i])
         if a == heightfield:
-            partner, q, k, n, offset = b, world(a, point0[i]), world(b, point1[i]), normal[i], margin1[i]
+            partner, q, k, n = b, world(a, point0[i]), world(b, point1[i]), normal[i]
         elif b == heightfield:
-            partner, q, k, n, offset = a, world(b, point1[i]), world(a, point0[i]), -normal[i], margin0[i]
+            partner, q, k, n = a, world(b, point1[i]), world(a, point0[i]), -normal[i]
         else:
             continue
-        radius = offset - shape_margin[partner]
-        out.setdefault(partner, []).append((q, n, float(n @ (k - q)) - radius))
+        out.setdefault(partner, []).append((q, n, float(n @ (k - q))))
     return out
 
 
@@ -506,21 +506,33 @@ DECISION_BAND = 2.0e-6
 """Margin [m] within which a float32 boundary decision may differ from the float64 one (two bands of a 1 m window)."""
 
 
-def kernel_band(hf: ref.ReferenceHeightfield, core, reach: float) -> float:
-    """The closed-predicate band [m] the float32 kernels use for a pair's window (heightfield-local core).
+def core_ends(core) -> list:
+    """A reference core's points: a sphere's centre, a capsule's two ends."""
+    return [core.a, core.b] if hasattr(core, "a") else [core.c]
 
-    The window of ``terrain_box_cells`` (the core's ends widened by ``reach``, cell coordinates widened by
-    ``TERRAIN_CELL_WIDEN``) and the extent of ``terrain_window_extent``: the core's ends in the window frame, the
-    window's size and its heights about its reference vertex. Four of these bands are the float32 finish's plane-group
-    offset, which a float64 comparison passes to :func:`terrain_law_reference.finish` (``group_offset``).
-    """
-    ends = [core.a, core.b] if hasattr(core, "a") else [core.c]
+
+def window_cells(hf: ref.ReferenceHeightfield, core, reach: float) -> tuple[int, int, int, int]:
+    """The cells ``(r0, r1, c0, c1)`` of a point-core pair's window as ``terrain_box_cells`` takes them: the core's
+    ends widened by ``reach``, cell coordinates widened by ``TERRAIN_CELL_WIDEN``."""
+    ends = core_ends(core)
     lo = np.min(ends, axis=0) - reach
     hi = np.max(ends, axis=0) + reach
     c0 = max(int(np.floor((lo[0] + hf.hx) / hf.dx - TERRAIN_CELL_WIDEN)), 0)
     c1 = min(int(np.floor((hi[0] + hf.hx) / hf.dx + TERRAIN_CELL_WIDEN)), hf.cols - 1)
     r0 = max(int(np.floor((lo[1] + hf.hy) / hf.dy - TERRAIN_CELL_WIDEN)), 0)
     r1 = min(int(np.floor((hi[1] + hf.hy) / hf.dy + TERRAIN_CELL_WIDEN)), hf.rows - 1)
+    return r0, r1, c0, c1
+
+
+def kernel_band(hf: ref.ReferenceHeightfield, core, reach: float) -> float:
+    """The closed-predicate band [m] the float32 kernels use for a pair's window (heightfield-local core).
+
+    The window of :func:`window_cells` and the extent of ``terrain_window_extent``: the core's ends in the window
+    frame, the window's size and its heights about its reference vertex. Four of these bands are the float32 finish's
+    plane-group offset, which a float64 comparison passes to :func:`terrain_law_reference.finish` (``group_offset``).
+    """
+    ends = core_ends(core)
+    r0, r1, c0, c1 = window_cells(hf, core, reach)
     origin = hf.V(r0, c0)
     extent = max(
         (c1 + 1 - c0) * hf.dx,
@@ -601,45 +613,71 @@ def band_decided(hf: ref.ReferenceHeightfield, q, k, *, band: float = DECISION_B
             far = [v for v in vb if all(np.linalg.norm(v - w) > 1e-12 for w in hf.tri_verts(ta))]
             if far and abs(float(n @ (far[0] - a))) <= band:
                 return True
-    # a vertex's Voronoi boundary
+    # a vertex's Voronoi boundary: the test's largest value within the band of zero
     u = (q[0] + hf.hx) / hf.dx
     v = (q[1] + hf.hy) / hf.dy
     c, r = int(np.rint(u)), int(np.rint(v))
     if abs(u - c) * hf.dx <= band and abs(v - r) * hf.dy <= band and hf.ring(r, c) is not None:
         vertex = hf.V(r, c)
         values = [float((k - vertex) @ (hf.V(*w) - vertex) / np.linalg.norm(hf.V(*w) - vertex)) for w in hf.ring(r, c)]
-        if max(values) >= -band:
+        if abs(max(values)) <= band:
             return True
     return False
 
 
+def carries_half_space(row, got, *, angle_tol: float = 1.0e-3, tol: float = 1.0e-5) -> bool:
+    """Whether a row of ``got`` carries ``row``'s constraint: normal within ``angle_tol``, terrain point on its plane
+    (``|n . dq|``) and core distance within ``tol``."""
+    q, n, d = row_qnd(row)
+    return any(
+        angle_between(gn, n) <= angle_tol and abs(float(n @ (gq - q))) <= tol and abs(gd - d) <= tol
+        for gq, gn, gd in (row_qnd(g) for g in got)
+    )
+
+
+class RowComparison(NamedTuple):
+    """The float32 rows of one pair against its float64 rows (:func:`compare_rows`)."""
+
+    missing: list
+    """Float64 rows no float32 row matches or carries (defects)."""
+    extra: list
+    """Float32 rows no float64 row matches, not decided within the band (defects)."""
+    covered: int
+    """Unmatched rows whose constraint a row of the other side carries (:func:`carries_half_space`): the same plane and
+    core distance with the terrain point elsewhere on it, as an edge's closest point on a line nearly parallel to the
+    axis lands."""
+    tolerated: int
+    """Float32 rows no float64 row matches or carries, decided within the band (:func:`band_decided`)."""
+    deepest: float
+    """Difference of the deepest core distances [m] (``inf`` when only float64 has rows)."""
+
+
 def compare_rows(
     hf: ref.ReferenceHeightfield, expected, got, *, frame_tol: float = 1.0e-5, band: float = DECISION_BAND
-):
+) -> RowComparison:
     """Compare float32 rows with float64 rows of one pair (heightfield-local frame).
 
-    Rows match with terrain points within ``frame_tol``, normals within 1e-3 rad and core distances within 10 um.
-    Returns ``(missing, extra, tolerated, deepest)``: unmatched float64 rows and float32 rows not decided within the
-    band (both defects), the count of unmatched rows decided within it, and the difference of the deepest core
-    distances (0 when either side has none).
+    Rows match with terrain points within ``frame_tol``, normals within 1e-3 rad and core distances within 10 um. An
+    unmatched row is a defect unless a row of the other side carries its constraint, or (a float32 row) it was decided
+    within the band. A pair with float64 rows and no float32 row misses them all.
     """
     missing = missing_rows(expected, got, q_tol=frame_tol, angle_tol=1.0e-3, d_tol=1.0e-5)
     extra = missing_rows(got, expected, q_tol=frame_tol, angle_tol=1.0e-3, d_tol=1.0e-5)
+    defects_missing = [row for row in missing if not carries_half_space(row, got)]
+    defects_extra = []
+    covered = len(missing) - len(defects_missing)
     tolerated = 0
-    defects_missing, defects_extra = [], []
-    for row in missing:
-        q, n, d = row_qnd(row)
-        if band_decided(hf, q, q + d * n, band=band):
-            tolerated += 1
-        else:
-            defects_missing.append(row)
     for row in extra:
         q, n, d = row_qnd(row)
-        if band_decided(hf, q, q + d * n, band=band):
+        if carries_half_space(row, expected):
+            covered += 1
+        elif band_decided(hf, q, q + d * n, band=band):
             tolerated += 1
         else:
             defects_extra.append(row)
     deepest = 0.0
     if expected and got:
         deepest = abs(min(row_qnd(r)[2] for r in expected) - min(row_qnd(g)[2] for g in got))
-    return defects_missing, defects_extra, tolerated, deepest
+    elif expected:
+        deepest = float("inf")
+    return RowComparison(defects_missing, defects_extra, covered, tolerated, deepest)

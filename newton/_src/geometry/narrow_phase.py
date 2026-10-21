@@ -4338,7 +4338,8 @@ class NarrowPhase:
         or failed reducer insertions. No flag is an estimate of required capacity.
         ``terrain_rows`` (a terrain-law pair overflowed its candidates or rows)
         and ``terrain_stale`` (terrain features older than the heights were read)
-        are set by the terrain law's kernels, which no route runs yet.
+        are set by the terrain law's kernels, which today run only in shadow
+        (``NEWTON_TERRAIN_LAW_SHADOW``), beside the terrain route.
         """
         if not self.verify_buffers:
             raise RuntimeError("Narrow-phase capacity status requires verify_buffers=True throughout the run")

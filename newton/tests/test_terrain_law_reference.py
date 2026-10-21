@@ -97,6 +97,27 @@ class TestTerrainLawReference(unittest.TestCase):
             checked += len(minima)
         self.assertGreater(checked, 300)
 
+    def test_point_rows_point_up_on_steep_terrain(self):
+        """Give spheres over steep terrain no row whose normal points down (none at a valley edge from outside).
+
+        Every normal of a heightfield's rows lies in a feature's cone spanned by its faces' upward normals, or, for a
+        core inside the solid, points from it to its closest surface point across a valley or a face. A sphere
+        outside the solid but below a valley's line, beside the valley over lower ground, lies beyond both of its
+        faces; the valley's edge is no support there (its normal would leave the faces' cone and push the sphere down).
+        """
+        rng = np.random.default_rng(5)
+        Z = np.round(rng.uniform(0.0, 0.25, (33, 33)) / 0.01) * 0.01
+        e = ((Z - Z.min()) / (Z.max() - Z.min())).astype(np.float32)
+        hf = ref.ReferenceHeightfield(ref.decode_heights(e, 33, 33, float(Z.min()), float(Z.max())), 1.6, 1.6)
+        rows = 0
+        for _ in range(1000):
+            x, y = rng.uniform(-1.3, 1.3, 2)
+            p = np.array([x, y, hf.height(x, y) + rng.uniform(-0.05, 0.08)])
+            for row in ref.pair_rows(hf, ref.Sphere(p, 0.03), 0.07):
+                self.assertGreater(row.n[2], 0.0, msg=f"{p}: {row}")
+                rows += 1
+        self.assertGreater(rows, 1000)
+
     def test_solid_rows_on_a_plane_are_the_plane_manifold(self):
         """On a flat heightfield, emit exactly the analytic plane manifold of every core."""
         rng = np.random.default_rng(13)

@@ -13,12 +13,16 @@ radius plus both margins and both gaps, the contact writer's admission limit), o
   the edge and inside the edge's slab;
 * vertex: the core point lies in the vertex's Voronoi region;
 * capsule interior: the axis point closest to a crease edge (both segment parameters inside), and the axis point
-  over a vertex in its Voronoi region.
+  over a vertex in its Voronoi region. An axis point inside the solid below a ridge exits over it: within both
+  faces the normal from it to the crease lies in the ridge's arc, and lifting the axis along it by the distance is
+  the segment's minimum translation out of the ridge (a point exit through either face would push it sideways).
 
 Every boundary is decided by one canonical value that both sides read, closed by the window's band
 (:func:`~newton._src.geometry.terrain_law.terrain_eps`); duplicates of one constraint merge in the finish. A core
 point inside the solid keeps one exit, the one with the smallest translation (G2); with no exit in its window it
-gets the face vertically above it, with that plane's normal and depth (G3). Concave anticipation (rule C) is off.
+gets the face vertically above it, with that plane's normal and depth (G3). The axis interior gets G3 too: with
+both ends outside the solid and no axis exit, the deepest crossing of the axis's footprint under a crease gets the
+plane of the crease's first triangle (:func:`_axis_witness`). Concave anticipation (rule C) is off.
 
 Work per pair, cheapest rejects first: the tile-max exit (the core's lowest point lies above every 8 x 8-cell mip
 block under its window by more than ``D``); the vertex drop (:func:`_vertex_dropped`: the core lies farther than
@@ -28,33 +32,47 @@ edges dropped on cluster ids) and the vertex; then
 :func:`~newton._src.geometry.terrain_law.terrain_finish` with at most :data:`TERRAIN_POINT_ROWS` rows. Each feature
 is rejected on geometry before its canonical values are read: a face whose projection lies off its cell
 (:func:`_off_cell`, conservative), an edge whose slab misses the core point or whose closest point is out of reach
-(exact) before its class and planes. On the recorded anymald feet (4,096 pairs) the drop keeps 4.0 of a window's
+(exact) before its class and planes. On 4,096 recorded quadruped foot spheres the drop keeps 4.0 of a window's
 11.7 vertices; per pair, 2.3 of the 7.7 front-facing faces within reach get to their canonical values, and of 12.1
-edges 3.4 are creases and 1.0 gets to its planes. The rows are bit for bit those of the walk without the drop and
-the rejects. A window's cluster planes are evaluated once (:class:`~newton._src.geometry.terrain_law.TerrainPlanes`).
+edges 3.4 are creases and 1.0 gets to its planes. The rows are bit for bit those of the walk without the drop, the
+vertex mask and the off-cell reject (the point-kernel tests check it). A window's cluster planes are evaluated once
+(:class:`~newton._src.geometry.terrain_law.TerrainPlanes`).
 
 The window is walked vertex by vertex: vertex ``(r, c)`` owns the features :func:`_point_item` lists (its cell's
 faces and diagonal, its x- and y-edges, itself), each evaluated for the sphere centre or for both capsule ends and
 the axis. An item yields at most one row (:class:`_Claim`).
 
-Thread mapping (the pair table's lane classes): :func:`terrain_point_rows` runs one thread per pair; it first marks
-the window's vertices the drop keeps in a bit mask and then walks the marked ones in window order, so that a warp's
-lanes evaluate their k-th kept vertices together instead of one window position that most lanes drop (a model of
-the warps' issued instructions on the recorded feet, per-stage SASS counts weighted by what any lane of a warp
-runs: -24% on anymald, -27% on go2 against walking every window position). :func:`terrain_point_rows_tiled` runs
-:data:`~newton._src.geometry.terrain_contacts.TERRAIN_TILE_LANES` lanes per pair (``wp.launch_tiled``) for windows
-of more cells: the lanes split the window's heights and vertices, mark the vertices whose items yield anything, and
-the first lane evaluates those in window order, so a pair gets the rows the one-thread kernel gives it. Both hold a
-pair's distinct rows in its own slots (up to six, merged as the finish merges) and its ends' exits, and write them
-when the finish keeps them as they are: no plane group holds three of them (the finish's implied-row and per-group
-steps act on larger groups), they fit the eight slots and the candidates fit the finish's list. That is every
-recorded pair of the suite's rough scenes; any other pair is appended to a deferred list, and
-:func:`terrain_point_rows_full`, launched after them, walks it again into the full candidate list and runs the
-finish. Inlined into the walks, the finish took every thread to 255 registers and a 10 KB stack on sm_120; apart,
-the one-thread walk takes 128 registers (launch bounds of two 256-thread blocks per SM) and a 104-byte stack, the
-tiled walk 156 registers, and only deferred pairs, in full warps, pay for the finish. All three have the per-type
-kernel signature ``(begin, slot_begin, inputs, data, out)`` of
-:class:`~newton._src.geometry.terrain_law.TerrainPairInputs`.
+Thread mapping (the pair table's lane classes): :func:`terrain_point_rows` runs one thread per pair of the class, in
+blocks of :data:`~newton._src.geometry.terrain_shadow.TERRAIN_LAW_BLOCK` (so that its warps spread evenly over the SMs).
+For a pair whose window holds at most 16 cells it marks a word of window vertices the drop keeps in a bit mask and then
+walks the marked ones in window order, so that a warp's lanes evaluate their k-th kept vertices together instead of one
+window position that most lanes drop (a model of the warps' issued instructions on recorded quadruped foot spheres,
+per-stage SASS counts weighted by what any lane of a warp runs: -24% and -27% on two suite scenes against walking every
+window position). A sphere walks its centre's six items in code of its own (:func:`_walk_sphere`; a kernel of it alone
+is 12,300 SASS instructions on sm_120, of the capsule's walk (:func:`_walk_segment`, every item) alone 27,700), so that
+a warp of spheres never runs the capsule's. A pair with a larger window the kernel only takes through the whole-pair
+rejects, the tile-max exit above all (97% of the recorded suite's such pairs), and queues the rest
+(:class:`~newton._src.geometry.terrain_shadow.TerrainPairWork`): :func:`terrain_point_rows_tiled`, a fixed grid of
+:data:`~newton._src.geometry.terrain_shadow.TERRAIN_LAW_BLOCK` lanes per pair (``wp.launch_tiled``), takes the queued
+pairs in turn, so that a pair that leaves at the tile max never occupies a tile. The lanes split the window's heights
+and vertices and mark, per vertex, the items that yield anything; the first lane evaluates those items in window order,
+so a pair gets the rows the one-thread kernel gives it. Both hold a pair's distinct rows in its own slots (up to six,
+merged as the finish merges) and its ends' exits, and write them when the finish keeps them as they are: no plane group
+holds three of them (the finish's implied-row and per-group steps act on larger groups), they fit the eight slots and
+the candidates fit the finish's list. That is every recorded pair of the suite's rough scenes; any other pair is
+appended to a deferred list, and :func:`terrain_point_rows_full`, launched after them with a fixed grid of lane blocks
+that strides over the list, marks each pair's window as the tiled kernel does, walks the marked items again into the
+full candidate list and runs the finish.
+
+Inlined into the walks, the finish took every thread to 255 registers and a 10 KB stack on sm_120. Apart, the one-thread
+kernel takes 128 registers (its launch bounds: 16 blocks of 32 threads per SM) and a 176-byte stack (a sphere's walk
+alone would need 140 registers), the tiled kernel 226 registers and a 32-byte stack, and only deferred pairs pay for the
+finish. The full-finish kernel keeps the candidate list and the finish's input in global scratch
+(:class:`~newton._src.geometry.terrain_shadow.TerrainFinishScratch`), so that its stack, which sets the driver's
+local-memory reservation for every thread the device holds, is the finish's own frame: 6.0 KB (10.1 KB with the list on
+the stack). The kernels take the per-type kernel arguments ``(begin, slot_begin, inputs, data, out)`` of
+:class:`~newton._src.geometry.terrain_law.TerrainPairInputs` and a launch argument: the walks the class's work list, the
+full-finish kernel its scratch.
 
 The module is compiled without floating-point contraction, as the cluster build is: every float32 operation
 rounds as on the CPU, so CPU tests decide every boundary, and a CPU census counts every row, as the GPU does.
@@ -75,7 +93,6 @@ from .terrain_law import (
     TERRAIN_FEATURE_VERTEX,
     TERRAIN_FLAT_EPS,
     TERRAIN_PAIR_FILTERED,
-    TERRAIN_PAIR_FULL,
     TERRAIN_PAIR_OUTSIDE,
     TERRAIN_PAIR_STALE,
     TERRAIN_PAIR_TILE_EXIT,
@@ -86,12 +103,12 @@ from .terrain_law import (
     TerrainLawRows,
     TerrainPairInputs,
     TerrainPlanes,
-    TerrainRows,
     TerrainWindow,
     terrain_beyond,
     terrain_box_cells,
     terrain_claims,
     terrain_crease_class,
+    terrain_defer_pair,
     terrain_edge_kind,
     terrain_edge_sides,
     terrain_eps,
@@ -102,14 +119,15 @@ from .terrain_law import (
     terrain_finish,
     terrain_finish_state,
     terrain_height,
+    terrain_hold_row,
     terrain_interior_vertex,
     terrain_locate,
+    terrain_pair_exit,
     terrain_plane,
+    terrain_plane_group_of_three,
     terrain_planes,
     terrain_point_below_cached,
     terrain_report,
-    terrain_rows_coincide,
-    terrain_rows_same_plane,
     terrain_store_row,
     terrain_tile_exit,
     terrain_vertex_edge_value,
@@ -119,6 +137,10 @@ from .terrain_law import (
     terrain_window_point,
     terrain_window_vertex,
 )
+
+# The launch structs live beside the launcher for now; terrain_shadow imports this module lazily, by name
+# (TERRAIN_LAW_KERNELS), and must keep doing so: a module-level import of it there would be an import cycle.
+from .terrain_shadow import TERRAIN_LAW_BLOCK, TerrainFinishScratch, TerrainPairWork
 from .types import GeoType
 
 # Every float32 operation rounds as on the CPU (see the module docstring).
@@ -127,17 +149,25 @@ wp.set_module_options({"fuse_fp": False})
 TERRAIN_POINT_ROWS = TERRAIN_PARTNER_ROWS[TERRAIN_PARTNER_POINT]
 """Rows a sphere or capsule pair keeps (the point class's row limit, the slots per pair): 8."""
 TERRAIN_POINT_MASK_WORDS = 8
-"""Words of the tiled kernel's productive-vertex mask: windows of up to 256 vertices; larger windows are walked by
+"""Words of the tiled kernels' productive-vertex mask: windows of up to 256 vertices; larger windows are walked by
 the first lane alone."""
+TERRAIN_POINT_MASK_VERTICES = 32 * TERRAIN_POINT_MASK_WORDS
+"""Window vertices the tiled kernels mark (each vertex's productive items, in shared memory)."""
 TERRAIN_POINT_ITEMS = 16
 """Items a window vertex owns for a capsule (:func:`_point_item`); a sphere's are the first six."""
 
 _ROWS = wp.constant(TERRAIN_POINT_ROWS)
 _CLASS = wp.constant(TERRAIN_PARTNER_POINT)
 _CANDIDATES = wp.constant(TERRAIN_ROW_CANDIDATES)
-_MASK_WORDS = wp.constant(TERRAIN_POINT_MASK_WORDS)
+_MASK_VERTICES = wp.constant(TERRAIN_POINT_MASK_VERTICES)
 _ITEMS = wp.constant(TERRAIN_POINT_ITEMS)
 _SPHERE_ITEMS = wp.constant(6)
+_END_A_ITEMS = wp.constant(0x003F)
+"""Items 0-5 (:func:`_point_item`): the sphere centre's or capsule end ``a``'s."""
+_END_B_ITEMS = wp.constant(0x0FC0)
+"""Items 6-11: capsule end ``b``'s."""
+_AXIS_ITEMS = wp.constant(0xF000)
+"""Items 12-15: the capsule axis's."""
 _CAPSULE = wp.constant(int(GeoType.CAPSULE))
 _WIDE = wp.constant(TERRAIN_WINDOW_WIDE)
 _EPS32 = wp.constant(TERRAIN_EPS32)
@@ -154,6 +184,9 @@ _SLOT_AXIS = wp.constant(2)
 _ROW = wp.constant(1)
 _EXIT_A = wp.constant(2)
 _EXIT_B = wp.constant(3)
+_WITNESS = _EXIT_B
+"""An axis crossing under a crease shares end ``b``'s exit kind, slot and keep-the-largest rule: it arises only with both
+ends outside the solid, when end ``b`` has no exit (one walk branch less, which cost the tiled kernel 75 registers)."""
 
 _Mask = wp.types.vector(length=TERRAIN_POINT_MASK_WORDS, dtype=wp.int32)
 
@@ -184,10 +217,12 @@ class _PointCore:
 
 @wp.struct
 class _Claim:
-    """What one item yields: nothing, a row, or an exit candidate of an end inside the solid."""
+    """What one item yields: nothing, a row, an exit candidate of an end inside the solid, or an axis crossing."""
 
     kind: int
-    """0 nothing, 1 a row, 2 or 3 an exit candidate of end ``a`` or ``b``."""
+    """0 nothing, 1 a row, 2 or 3 an exit candidate of end ``a`` or ``b``; with both ends outside the solid, 3 is a
+    crossing of the axis under a crease instead (:func:`_axis_witness`: ``q`` the axis point, ``d`` its depth,
+    ``feature`` the crease)."""
     q: wp.vec3
     k: wp.vec3
     n: wp.vec3
@@ -356,7 +391,7 @@ def _end_vertex(
 
 
 @wp.func
-def _axis_edge(
+def _axis_crease(
     data: TerrainFeatureData,
     window: TerrainWindow,
     planes: TerrainPlanes,
@@ -367,9 +402,13 @@ def _axis_edge(
     v0: wp.vec3,
     v1: wp.vec3,
 ) -> tuple[TerrainPlanes, _Claim]:
-    """The axis point closest to a crease edge, both segment parameters inside, beyond both faces at the edge.
+    """The axis point closest to a crease edge, both segment parameters inside, with the normal from the crease toward
+    it (outside the solid) or from it to the crease (inside) in the crease's normal cone.
 
-    For a crease (:func:`_point_item` drops flat and border edges).
+    Outside the solid a ridge claims it beyond both faces at the edge. Inside it a valley claims it beyond both faces
+    (the edge is its closest surface point), and a ridge within both faces: the axis passes below the ridge, and the
+    exit lifts it over the crease by the distance of the two lines, the segment's minimum translation out of the
+    ridge. For a crease (:func:`_point_item` drops flat and border edges).
     """
     d2 = v1 - v0
     d1 = core.b - core.a
@@ -397,21 +436,102 @@ def _axis_edge(
         return planes, _Claim()
     _v0, _v1, ta, tb, wa, wb = terrain_edge_sides(r, c, which)
     planes, na, pa = terrain_plane(data, window, planes, ta[0], ta[1], ta[2])
-    if not below and terrain_crease_class(data, window, r, c, which, na, pa) == TERRAIN_EDGE_CONCAVE:
+    concave = terrain_crease_class(data, window, r, c, which, na, pa) == TERRAIN_EDGE_CONCAVE
+    if not below and concave:
         return planes, _Claim()
     planes, nb, _pb = terrain_plane(data, window, planes, tb[0], tb[1], tb[2])
     sa = terrain_face_edge_value(p, v0, v1, na, terrain_window_vertex(data, window, wa[0], wa[1]))
     sb = terrain_face_edge_value(p, v0, v1, nb, terrain_window_vertex(data, window, wb[0], wb[1]))
-    if not (terrain_beyond(sa, core.eps) and terrain_beyond(sb, core.eps)):
+    if below and not concave:
+        # Below a ridge: the normal from the axis point to the crease lies in the ridge's arc (within both faces).
+        if not (terrain_claims(sa, core.eps) and terrain_claims(sb, core.eps)):
+            return planes, _Claim()
+    elif not (terrain_beyond(sa, core.eps) and terrain_beyond(sb, core.eps)):
         return planes, _Claim()
     n = w / dist
     d = dist
     if below:
         n = -n
         d = -dist
-    # An axis row is never an exit (G2 holds for the ends).
+    # Every axis row is a row, never an end's exit candidate (G2 holds for the ends).
     feature = terrain_feature_id(r, c, TERRAIN_FEATURE_EDGE, which, _SLOT_AXIS)
     return planes, _offer(0, 0, q, p, n, d, core.reach, feature)
+
+
+@wp.func
+def _axis_witness(
+    window: TerrainWindow, core: _PointCore, r: int, c: int, which: int, v0: wp.vec3, v1: wp.vec3
+) -> _Claim:
+    """Where the axis's footprint crosses under crease ``which`` of vertex ``(r, c)``: the axis point there and its
+    depth below the crease (the edge's height there minus the axis's), a candidate for the axis interior's G3.
+
+    The axis's vertical depth is piecewise linear along it, with its interior maxima where the footprint crosses a
+    ridge, so the deepest such crossing is the axis interior's deepest point.
+    """
+    claim = _Claim()
+    a = core.a
+    d1 = core.b - a
+    d2 = v1 - v0
+    den = d1[0] * d2[1] - d1[1] * d2[0]
+    if den == 0.0:
+        return claim
+    rx = v0[0] - a[0]
+    ry = v0[1] - a[1]
+    s = (rx * d2[1] - ry * d2[0]) / den
+    t = (rx * d1[1] - ry * d1[0]) / den
+    if s < 0.0 or s > 1.0 or t < 0.0 or t > 1.0:
+        return claim
+    depth = (v0[2] + t * d2[2]) - (a[2] + s * d1[2])
+    if depth > 0.0:
+        claim.kind = _WITNESS
+        claim.q = a + s * d1
+        claim.d = depth
+        claim.feature = (r * window.surface.ncol + c) * 3 + which
+    return claim
+
+
+@wp.func
+def _axis_edge(
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    core: _PointCore,
+    r: int,
+    c: int,
+    which: int,
+    v0: wp.vec3,
+    v1: wp.vec3,
+) -> tuple[TerrainPlanes, _Claim]:
+    """The axis's claim at a crease (:func:`_axis_crease`); without one, and with both ends outside the solid, the
+    axis's crossing under the crease (:func:`_axis_witness`)."""
+    planes, claim = _axis_crease(data, window, planes, core, r, c, which, v0, v1)
+    if claim.kind == 0 and core.below_a == 0 and core.below_b == 0:
+        claim = _axis_witness(window, core, r, c, which, v0, v1)
+    return planes, claim
+
+
+@wp.func
+def _axis_recovery(
+    data: TerrainFeatureData, window: TerrainWindow, planes: TerrainPlanes, p: wp.vec3, crease: int
+) -> tuple[TerrainPlanes, _Claim]:
+    """G3 for the axis interior: the plane of the first triangle of ``crease`` (:func:`_axis_witness`'s id) under
+    axis point ``p``, its normal and depth."""
+    which = crease % 3
+    vertex = crease // 3
+    r = vertex // window.surface.ncol
+    c = vertex - r * window.surface.ncol
+    _v0, _v1, ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
+    planes, n, a = terrain_plane(data, window, planes, ta[0], ta[1], ta[2])
+    d = wp.dot(n, p - a)
+    claim = _Claim()
+    if d < 0.0:
+        claim.kind = _ROW
+        claim.q = p - d * n
+        claim.k = p
+        claim.n = n
+        claim.d = d
+        claim.feature = terrain_feature_id(ta[0], ta[1], TERRAIN_FEATURE_RECOVERY, ta[2], _SLOT_AXIS)
+    return planes, claim
 
 
 @wp.func
@@ -450,6 +570,70 @@ def _axis_vertex(
 
 
 @wp.func
+def _end_item(
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    core: _PointCore,
+    end: int,
+    k: wp.vec3,
+    below: int,
+    r: int,
+    c: int,
+    r1: int,
+    c1: int,
+    feature: int,
+) -> tuple[TerrainPlanes, _Claim]:
+    """Evaluate feature ``feature`` of window vertex ``(r, c)`` for core end ``end`` at ``k`` (``below``: inside the
+    solid): the face of sub 0 or 1, the x-, y- or diagonal edge, or the vertex (0-5; see :func:`_point_item`)."""
+    inside = r <= r1 and c <= c1
+    if feature < 2:
+        if not inside:
+            return planes, _Claim()
+        planes, n, a = terrain_plane(data, window, planes, r, c, feature)
+        return planes, _end_face(data, window, core, end, k, below, r, c, feature, n, a)
+    if feature == 5:
+        return planes, _end_vertex(data, window, core, end, k, below, r, c)
+    which = feature - 2
+    if (which == 0 and c > c1) or (which == 1 and r > r1) or (which == 2 and not inside):
+        return planes, _Claim()
+    if terrain_edge_kind(data, window.surface, r, c, which) >= 0:
+        # Flat inside one cluster, or on the heightfield's border: no edge minimum (decided from cluster ids).
+        return planes, _Claim()
+    v0i, v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
+    v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
+    v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
+    return _end_edge(data, window, planes, core, end, k, below, r, c, which, v0, v1)
+
+
+@wp.func
+def _axis_item(
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    core: _PointCore,
+    r: int,
+    c: int,
+    r1: int,
+    c1: int,
+    feature: int,
+) -> tuple[TerrainPlanes, _Claim]:
+    """Evaluate feature ``feature`` of window vertex ``(r, c)`` for the capsule's axis: the x-, y- or diagonal edge or
+    the vertex (2-5, numbered as :func:`_end_item` numbers them)."""
+    if feature == 5:
+        return _axis_vertex(data, window, planes, core, r, c)
+    which = feature - 2
+    if (which == 0 and c > c1) or (which == 1 and r > r1) or (which == 2 and not (r <= r1 and c <= c1)):
+        return planes, _Claim()
+    if terrain_edge_kind(data, window.surface, r, c, which) >= 0:
+        return planes, _Claim()
+    v0i, v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
+    v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
+    v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
+    return _axis_edge(data, window, planes, core, r, c, which, v0, v1)
+
+
+@wp.func
 def _point_item(
     data: TerrainFeatureData,
     window: TerrainWindow,
@@ -465,40 +649,19 @@ def _point_item(
 
     Vertex ``(r, c)`` owns its cell's two faces and diagonal (inside the window), its x-edge (``c <= c1``), its
     y-edge (``r <= r1``) and itself, so that every feature of the window is visited once. Items 0-5 are the face of
-    sub 0, sub 1, the x-edge, the y-edge, the diagonal and the vertex for the sphere centre or capsule end ``a``,
-    items 6-11 the same for end ``b``, items 12-15 the edges and the vertex for the capsule's axis.
+    sub 0, sub 1, the x-edge, the y-edge, the diagonal and the vertex for the sphere centre or capsule end ``a``
+    (:func:`_end_item`), items 6-11 the same for end ``b``, items 12-15 the edges and the vertex for the capsule's
+    axis (:func:`_axis_item`).
     """
-    end = item // 6
-    feature = item - 6 * end
-    if end == 2:
-        feature = item - 10
-    k = core.a
-    below = core.below_a
-    if end == 1:
-        k = core.b
-        below = core.below_b
-    inside = r <= r1 and c <= c1
-    if feature < 2:
-        if not inside:
-            return planes, _Claim()
-        planes, n, a = terrain_plane(data, window, planes, r, c, feature)
-        return planes, _end_face(data, window, core, end, k, below, r, c, feature, n, a)
-    if feature == 5:
-        if end == 2:
-            return _axis_vertex(data, window, planes, core, r, c)
-        return planes, _end_vertex(data, window, core, end, k, below, r, c)
-    which = feature - 2
-    if (which == 0 and c > c1) or (which == 1 and r > r1) or (which == 2 and not inside):
-        return planes, _Claim()
-    if terrain_edge_kind(data, window.surface, r, c, which) >= 0:
-        # Flat inside one cluster, or on the heightfield's border: no edge minimum (decided from cluster ids).
-        return planes, _Claim()
-    v0i, v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
-    v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
-    v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
-    if end == 2:
-        return _axis_edge(data, window, planes, core, r, c, which, v0, v1)
-    return _end_edge(data, window, planes, core, end, k, below, r, c, which, v0, v1)
+    if item < 12:
+        end = item // 6
+        k = core.a
+        below = core.below_a
+        if end == 1:
+            k = core.b
+            below = core.below_b
+        return _end_item(data, window, planes, core, end, k, below, r, c, r1, c1, item - 6 * end)
+    return _axis_item(data, window, planes, core, r, c, r1, c1, item - 10)
 
 
 @wp.func
@@ -522,22 +685,11 @@ def _cell_margins(window: TerrainWindow, core: _PointCore) -> wp.vec3:
 
 
 @wp.func
-def _vertex_dropped(
+def _vertex_box(
     data: TerrainFeatureData, window: TerrainWindow, core: _PointCore, margins: wp.vec3, r: int, c: int
-) -> bool:
-    """Whether no feature vertex ``(r, c)`` owns can yield a row, so that the walk passes the vertex by.
-
-    The features lie in the vertex's cell (its faces and diagonal, its x- and y-edges, itself), and a row's terrain
-    point in the box of the cell's vertices (those in the grid), widened in xy by ``margins`` (a face's point may lie
-    off its triangle within the band, :func:`_cell_margins`) and in z by how far a cluster plane may leave the
-    vertices there (the cluster tolerance, steepened by the cell's slope, and the plane over the xy widening), all
-    four times over plus the band. A row of a core point outside the solid has its core point within the reach of
-    its terrain point, so a core farther than the reach from the box yields none: a sphere centre by its 3-D distance,
-    a capsule by height alone (every vertex below the core's lowest point by more than the reach). Neither applies
-    while a core point lies inside the solid (its exits are not bounded by the reach).
-    """
-    if core.skip == 0:
-        return False
+) -> wp.vec3:
+    """The heights of the box vertex ``(r, c)``'s rows lie in (see :func:`_vertex_dropped`): its cell's lowest and
+    highest vertex (those in the grid), window frame, and how far a row's terrain point may leave them, ``zm``."""
     surface = window.surface
     zlo = float(1.0e30)
     zhi = float(-1.0e30)
@@ -551,15 +703,74 @@ def _vertex_dropped(
                 zhi = wp.max(zhi, z)
     slope = (zhi - zlo + 2.0 * _FLAT) * margins[2] + 1.0
     zm = 4.0 * (_FLAT * slope + (margins[0] + margins[1]) * slope) + _FOOTPRINT_BANDS * core.eps
-    if core.segment != 0:
-        return zhi + zm < core.low
-    k = core.a
+    return wp.vec3(zlo, zhi, zm)
+
+
+@wp.func
+def _far_from_box(
+    window: TerrainWindow, core: _PointCore, margins: wp.vec3, r: int, c: int, box: wp.vec3, k: wp.vec3
+) -> bool:
+    """Whether core point ``k`` lies farther than the reach from vertex ``(r, c)``'s box (:func:`_vertex_box`), widened
+    in xy by ``margins``."""
+    surface = window.surface
     x = k[0] - float(c - window.c0) * surface.dx
     y = k[1] - float(r - window.r0) * surface.dy
     ox = wp.max(wp.max(-margins[0] - x, x - surface.dx - margins[0]), 0.0)
     oy = wp.max(wp.max(-margins[1] - y, y - surface.dy - margins[1]), 0.0)
-    oz = wp.max(wp.max(zlo - zm - k[2], k[2] - zhi - zm), 0.0)
+    oz = wp.max(wp.max(box[0] - box[2] - k[2], k[2] - box[1] - box[2]), 0.0)
     return ox * ox + oy * oy + oz * oz > core.reach * core.reach
+
+
+@wp.func
+def _vertex_dropped(
+    data: TerrainFeatureData, window: TerrainWindow, core: _PointCore, margins: wp.vec3, r: int, c: int
+) -> bool:
+    """Whether no feature vertex ``(r, c)`` owns can yield a row, so that the walk passes the vertex by.
+
+    The features lie in the vertex's cell (its faces and diagonal, its x- and y-edges, itself), and a row's terrain
+    point in the box of the cell's vertices (those in the grid), widened in xy by ``margins`` (a face's point may lie
+    off its triangle within the band, :func:`_cell_margins`) and in z by how far a cluster plane may leave the
+    vertices there (the cluster tolerance, steepened by the cell's slope, and the plane over the xy widening), all
+    four times over plus the band (:func:`_vertex_box`). A row of a core point outside the solid has its core point
+    within the reach of its terrain point, so a core farther than the reach from the box yields none: a sphere centre
+    by its 3-D distance, a capsule by height alone (every vertex below the core's lowest point by more than the
+    reach; :func:`_kept_items` drops a far end's items too). Neither applies while a core point lies inside the solid
+    (its exits are not bounded by the reach).
+    """
+    if core.skip == 0:
+        return False
+    box = _vertex_box(data, window, core, margins, r, c)
+    if core.segment != 0:
+        return box[1] + box[2] < core.low
+    return _far_from_box(window, core, margins, r, c, box, core.a)
+
+
+@wp.func
+def _kept_items(
+    data: TerrainFeatureData, window: TerrainWindow, core: _PointCore, margins: wp.vec3, r: int, c: int
+) -> int:
+    """The items of window vertex ``(r, c)`` that can yield anything, a bit per item (:func:`_point_item`'s numbers).
+
+    None of a vertex the drop passes by (:func:`_vertex_dropped`). Of a capsule's kept vertex, with both ends outside
+    the solid, its axis's items and the items of each end within the reach of the vertex's box: an end's rows, like a
+    sphere centre's, have their terrain points within the reach of the end (an axis point's exit, below a ridge, is
+    not bounded by the reach, so the axis keeps its items).
+    """
+    if core.skip == 0:
+        return (1 << _vertex_items(core)) - 1
+    box = _vertex_box(data, window, core, margins, r, c)
+    if core.segment == 0:
+        if _far_from_box(window, core, margins, r, c, box, core.a):
+            return 0
+        return _END_A_ITEMS
+    if box[1] + box[2] < core.low:
+        return 0
+    m = _AXIS_ITEMS
+    if not _far_from_box(window, core, margins, r, c, box, core.a):
+        m = m | _END_A_ITEMS
+    if not _far_from_box(window, core, margins, r, c, box, core.b):
+        m = m | _END_B_ITEMS
+    return m
 
 
 _MASK_BITS = wp.constant(31)
@@ -630,12 +841,34 @@ def _pair_setup(inputs: TerrainPairInputs, data: TerrainFeatureData, pair: int):
     cells = terrain_box_cells(surface, lo[0] - reach, lo[1] - reach, hi[0] + reach, hi[1] + reach)
     if cells[1] < cells[0] or cells[3] < cells[2]:
         return TERRAIN_PAIR_OUTSIDE, frame, heightfield, cells, a, b, segment, reach
-    # The lowest point minus the reach, lowered by its own float32 rounding: the exit never drops a row.
+    # The lowest point minus the reach, lowered by its own float32 rounding and by the cluster tolerance (a face row's
+    # terrain point lies on its cluster plane, up to TERRAIN_FLAT_EPS above its triangle's highest vertex). The exit
+    # drops no row but one claimed within the band beyond its triangle, where a steep face's plane may rise a band times
+    # its slope higher, and then only within that of the reach limit.
     low = lo[2] - reach
-    low = low - 4.0 * _EPS32 * (wp.abs(lo[2]) + reach)
+    low = low - 4.0 * _EPS32 * (wp.abs(lo[2]) + reach) - _FLAT
     if terrain_tile_exit(data, surface, cells[0], cells[1], cells[2], cells[3], low):
         return TERRAIN_PAIR_TILE_EXIT, frame, heightfield, cells, a, b, segment, reach
     return 0, frame, heightfield, cells, a, b, segment, reach
+
+
+@wp.func
+def _window_points(window: TerrainWindow, a: wp.vec3, b: wp.vec3, segment: int):
+    """A core's ends in the window frame, each rounded once from float64 (a sphere's centre converted once)."""
+    ka = terrain_window_point(window, a)
+    kb = ka
+    if segment != 0:
+        kb = terrain_window_point(window, b)
+    return ka, kb
+
+
+@wp.func
+def _point_extent(ka: wp.vec3, kb: wp.vec3) -> float:
+    """The largest coordinate magnitude of a core's ends in the window frame (part of the window's band)."""
+    return wp.max(
+        wp.max(wp.max(wp.abs(ka[0]), wp.abs(ka[1])), wp.abs(ka[2])),
+        wp.max(wp.max(wp.abs(kb[0]), wp.abs(kb[1])), wp.abs(kb[2])),
+    )
 
 
 @wp.func
@@ -643,16 +876,16 @@ def _pair_core(
     data: TerrainFeatureData,
     window: TerrainWindow,
     planes: TerrainPlanes,
-    a: wp.vec3,
-    b: wp.vec3,
+    ka: wp.vec3,
+    kb: wp.vec3,
     segment: int,
     reach: float,
     eps: float,
 ) -> tuple[TerrainPlanes, _PointCore]:
-    """The core in the window frame, with its inside tests and cell-skip level."""
+    """The core from its ends in the window frame (:func:`_window_points`), with its inside tests and drop level."""
     core = _PointCore()
-    core.a = terrain_window_point(window, a)
-    core.b = terrain_window_point(window, b)
+    core.a = ka
+    core.b = kb
     core.segment = segment
     core.reach = reach
     core.eps = eps
@@ -669,16 +902,6 @@ def _pair_core(
         core.skip = 0
     core.low = wp.min(core.a[2], core.b[2]) - reach
     return planes, core
-
-
-@wp.func
-def _core_extent(window: TerrainWindow, a: wp.vec3, b: wp.vec3) -> float:
-    ka = terrain_window_point(window, a)
-    kb = terrain_window_point(window, b)
-    return wp.max(
-        wp.max(wp.max(wp.abs(ka[0]), wp.abs(ka[1])), wp.abs(ka[2])),
-        wp.max(wp.max(wp.abs(kb[0]), wp.abs(kb[1])), wp.abs(kb[2])),
-    )
 
 
 @wp.func
@@ -704,15 +927,6 @@ def _exit_row(
 
 
 @wp.func
-def _pair_exit(out: TerrainLawRows, pair: int, state: int):
-    """Record a pair that has no row (``state``), raising ``terrain_stale`` for stale features."""
-    out.count[pair] = 0
-    out.state[pair] = state
-    if state == TERRAIN_PAIR_STALE:
-        terrain_report(out.status, out.overflow, 0, False)
-
-
-@wp.func
 def _wide(cells: wp.vec4i) -> int:
     if cells[1] - cells[0] + 1 >= _WIDE or cells[3] - cells[2] + 1 >= _WIDE:
         return TERRAIN_PAIR_WIDE
@@ -721,24 +935,17 @@ def _wide(cells: wp.vec4i) -> int:
 
 # A pair's slots hold, while its window is walked, its distinct rows (slots 0-5) and the best exit of each end inside
 # the solid (slots 6 and 7, feature -1 for none), in the window frame: rows are rare against the features walked, so
-# this keeps them out of the registers every feature evaluation needs.
+# this keeps them out of the registers every feature evaluation needs. With both ends outside, slot 7 holds the axis's
+# deepest crossing under a crease instead (_WITNESS), for the axis interior's G3.
 _EXIT_SLOT = wp.constant(6)
+_WITNESS_SLOT = wp.constant(7)
 _HELD = wp.constant(6)
 
 
 @wp.func
 def _hold(out: TerrainLawRows, slot: int, held: int, claim: _Claim, eps: float, limit: int) -> int:
-    """Add a row to a pair's held rows, as the finish's merge does: a row that coincides with a held one is dropped
-    (the first in window order stays); past ``limit`` held rows a distinct row is only counted."""
-    for h in range(wp.min(held, limit)):
-        if terrain_rows_coincide(out.q[slot + h], out.n[slot + h], claim.q, claim.n, eps):
-            return held
-    if held < limit:
-        out.q[slot + held] = claim.q
-        out.n[slot + held] = claim.n
-        out.d[slot + held] = claim.d
-        out.feature[slot + held] = claim.feature
-    return held + 1
+    """Hold a claim's row (:func:`~newton._src.geometry.terrain_law.terrain_hold_row`)."""
+    return terrain_hold_row(out, slot, held, claim.q, claim.n, claim.d, claim.feature, eps, limit)
 
 
 @wp.func
@@ -754,7 +961,8 @@ def _offer_exit(out: TerrainLawRows, slot: int, end: int, claim: _Claim):
 
 @wp.func
 def _walk_claim(out: TerrainLawRows, slot: int, held: int, candidates: int, claim: _Claim, eps: float):
-    """Take one item's claim: hold a row (counting the finish's candidates), or offer an exit."""
+    """Take one item's claim: hold a row (counting the finish's candidates), or offer an exit (or, in end ``b``'s slot
+    with both ends outside, the axis's crossing: the deepest is kept)."""
     if claim.kind == _ROW:
         return _hold(out, slot, held, claim, eps, _HELD), candidates + 1
     if claim.kind == _EXIT_A or claim.kind == _EXIT_B:
@@ -763,25 +971,11 @@ def _walk_claim(out: TerrainLawRows, slot: int, held: int, candidates: int, clai
 
 
 @wp.func
-def _plane_group_of_three(out: TerrainLawRows, slot: int, held: int, eps: float) -> bool:
-    """Whether three of a pair's held rows share a plane group, as the finish groups them (its first row of a plane
-    represents it, :func:`~newton._src.geometry.terrain_law.terrain_rows_same_plane`)."""
-    representatives = int(0)
-    sizes = int(0)
-    for i in range(held):
-        qi = out.q[slot + i]
-        ni = out.n[slot + i]
-        group = i
-        for j in range(i):
-            if (representatives >> j) & 1 != 0:
-                if terrain_rows_same_plane(qi, ni, out.q[slot + j], out.n[slot + j], eps):
-                    group = j
-                    break
-        if group == i:
-            representatives = representatives | (1 << i)
-        if ((sizes >> (4 * group)) & 15) >= 2:
+def _axis_exit_held(out: TerrainLawRows, slot: int, held: int) -> bool:
+    """Whether a pair's held rows include an exit of its axis interior (an axis row inside the solid)."""
+    for h in range(held):
+        if (out.feature[slot + h] & 7) == _SLOT_AXIS and out.d[slot + h] < 0.0:
             return True
-        sizes = sizes + (1 << (4 * group))
     return False
 
 
@@ -799,7 +993,8 @@ def _close_pair(
     core: _PointCore,
     frame: wp.transform,
 ):
-    """Add the ends' exits (G2, G3), then write the held rows in the world frame, or defer the pair to the finish.
+    """Add the ends' exits (G2, G3) and the axis interior's G3, then write the held rows in the world frame, or defer
+    the pair to the finish.
 
     The finish keeps a pair's distinct rows as they are when no plane group holds three of them (its implied-row
     and per-group steps act on larger groups), they fit the pair's :data:`TERRAIN_POINT_ROWS` slots and its
@@ -827,12 +1022,18 @@ def _close_pair(
                 if claim.kind != 0:
                     candidates += 1
                     held = _hold(out, slot, held, claim, core.eps, _ROWS)
-        full = held > _ROWS or candidates > _CANDIDATES or _plane_group_of_three(out, slot, held, core.eps)
+        if core.segment != 0 and core.below_a == 0 and core.below_b == 0:
+            # G3 for the axis interior: read before its row lands (at most in slot 6, the ends adding none).
+            s = slot + _WITNESS_SLOT
+            if out.feature[s] >= 0 and not _axis_exit_held(out, slot, held):
+                planes, claim = _axis_recovery(data, window, planes, out.q[s], out.feature[s])
+                if claim.kind != 0:
+                    candidates += 1
+                    held = _hold(out, slot, held, claim, core.eps, _ROWS)
+        full = held > _ROWS or candidates > _CANDIDATES or terrain_plane_group_of_three(out, slot, held, core.eps)
     if full:
         # Left to terrain_point_rows_full, which writes every slot of the pair.
-        out.count[pair] = 0
-        out.state[pair] = state | TERRAIN_PAIR_FULL
-        out.deferred[out.deferred_first[_CLASS] + wp.atomic_add(out.deferred_count, _CLASS, 1)] = pair
+        terrain_defer_pair(out, _CLASS, pair, state)
         return
     for h in range(held):
         terrain_store_row(
@@ -849,232 +1050,509 @@ def _open_pair(out: TerrainLawRows, slot: int):
     out.feature[slot + _EXIT_SLOT + 1] = -1
 
 
-@wp.kernel(enable_backward=False, launch_bounds=(256, 2))
-def terrain_point_rows(
-    begin: int, slot_begin: int, inputs: TerrainPairInputs, data: TerrainFeatureData, out: TerrainLawRows
-):
-    """The law's rows of sphere and capsule pairs, one thread per pair (windows of up to 16 cells).
-
-    A pair holds its distinct rows in its slots and writes them when the finish would keep them as they are; any
-    other pair is left to :func:`terrain_point_rows_full` (the finish's candidate list and code would otherwise cost
-    every thread their registers and stack).
-    """
-    i = wp.tid()
-    pair = begin + i
-    slot = slot_begin + i * _ROWS
-    state, frame, heightfield, cells, a, b, segment, reach = _pair_setup(inputs, data, pair)
-    if state != 0:
-        _pair_exit(out, pair, state)
-        return
-    r1 = cells[1]
-    c1 = cells[3]
-    window = terrain_window(data, heightfield, cells[0], cells[2])
-    eps = terrain_eps(terrain_window_extent(data, window, r1, c1, _core_extent(window, a, b)))
-    planes = terrain_planes()
-    planes, core = _pair_core(data, window, planes, a, b, segment, reach, eps)
-    _open_pair(out, slot)
-    held = int(0)
-    candidates = int(0)
-    items = _vertex_items(core)
-    # The vertices to walk as bit masks first, so that a warp's lanes walk their k-th vertices together rather than
-    # one window position, which most lanes would pass by. Vertices past two words (none for windows of 16 cells)
-    # are walked after them.
+@wp.func
+def _kept_word(
+    data: TerrainFeatureData, window: TerrainWindow, core: _PointCore, margins: wp.vec3, cells: wp.vec4i, word: int
+) -> int:
+    """The window vertices of mask word ``word`` (window indices from ``31 word``, one bit each) the drop keeps."""
     r0 = cells[0]
     c0 = cells[2]
+    width = cells[3] + 2 - c0
+    vertices = (cells[1] + 2 - r0) * width
+    first = word * _MASK_BITS
+    m = int(0)
+    for v in range(first, wp.min(vertices, first + _MASK_BITS)):
+        if not _vertex_dropped(data, window, core, margins, r0 + v // width, c0 + v % width):
+            m = m | (1 << (v - first))
+    return m
+
+
+@wp.func
+def _walk_sphere(
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    core: _PointCore,
+    out: TerrainLawRows,
+    slot: int,
+    cells: wp.vec4i,
+):
+    """A sphere's walk: its centre's six items of every window vertex the drop keeps, in window order, into the pair's
+    slots (see :func:`terrain_point_rows`). Returns the plane cache, the distinct rows held and the candidates."""
+    r0 = cells[0]
+    r1 = cells[1]
+    c0 = cells[2]
+    c1 = cells[3]
     width = c1 + 2 - c0
     vertices = (r1 + 2 - r0) * width
     margins = _cell_margins(window, core)
-    low_word = int(0)
-    high_word = int(0)
-    for v in range(wp.min(vertices, 2 * _MASK_BITS)):
-        if not _vertex_dropped(data, window, core, margins, r0 + v // width, c0 + v % width):
-            if v < _MASK_BITS:
-                low_word = low_word | (1 << v)
-            else:
-                high_word = high_word | (1 << (v - _MASK_BITS))
-    for word in range(2):
-        m = low_word
-        if word == 1:
-            m = high_word
+    held = int(0)
+    candidates = int(0)
+    for word in range((vertices + _MASK_BITS - 1) // _MASK_BITS):
+        if held > _HELD:
+            break
+        m = _kept_word(data, window, core, margins, cells, word)
         while m != 0 and held <= _HELD:
             v = word * _MASK_BITS + _lowest_bit(m)
             m = m & (m - 1)
-            for item in range(items):
-                planes, claim = _point_item(data, window, planes, core, r0 + v // width, c0 + v % width, r1, c1, item)
-                held, candidates = _walk_claim(out, slot, held, candidates, claim, eps)
-    for v in range(2 * _MASK_BITS, vertices):
-        if held <= _HELD and not _vertex_dropped(data, window, core, margins, r0 + v // width, c0 + v % width):
-            for item in range(items):
-                planes, claim = _point_item(data, window, planes, core, r0 + v // width, c0 + v % width, r1, c1, item)
-                held, candidates = _walk_claim(out, slot, held, candidates, claim, eps)
-    _close_pair(out, pair, slot, _wide(cells), held, candidates, data, window, planes, core, frame)
+            for feature in range(_SPHERE_ITEMS):
+                planes, claim = _end_item(
+                    data,
+                    window,
+                    planes,
+                    core,
+                    0,
+                    core.a,
+                    core.below_a,
+                    r0 + v // width,
+                    c0 + v % width,
+                    r1,
+                    c1,
+                    feature,
+                )
+                held, candidates = _walk_claim(out, slot, held, candidates, claim, core.eps)
+    return planes, held, candidates
 
 
-@wp.kernel(enable_backward=False)
-def terrain_point_rows_tiled(
-    begin: int, slot_begin: int, inputs: TerrainPairInputs, data: TerrainFeatureData, out: TerrainLawRows
+@wp.func
+def _walk_segment(
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    core: _PointCore,
+    out: TerrainLawRows,
+    slot: int,
+    cells: wp.vec4i,
 ):
-    """The law's rows of sphere and capsule pairs with long windows, ``wp.block_dim()`` lanes per pair.
-
-    The lanes split the window's heights (its band) and its vertices, marking those whose items yield a row or an
-    exit; the first lane evaluates the marked ones in window order, which gives a pair the rows (or the deferral)
-    :func:`terrain_point_rows` gives it.
-    """
-    i, lane = wp.tid()
-    lanes = wp.block_dim()
-    pair = begin + i
-    slot = slot_begin + i * _ROWS
-    state, frame, heightfield, cells, a, b, segment, reach = _pair_setup(inputs, data, pair)
-    if state != 0:
-        # Every lane reads the same pair: the exit is uniform.
-        if lane == 0:
-            _pair_exit(out, pair, state)
-        return
+    """A capsule's walk: the items (both ends' and the axis's) each window vertex the drop keeps can yield anything at
+    (:func:`_kept_items`), in window order, into the pair's slots (see :func:`terrain_point_rows`). Returns the plane
+    cache, the rows held and the candidates."""
     r0 = cells[0]
     r1 = cells[1]
     c0 = cells[2]
     c1 = cells[3]
+    width = c1 + 2 - c0
+    vertices = (r1 + 2 - r0) * width
+    margins = _cell_margins(window, core)
+    held = int(0)
+    candidates = int(0)
+    for word in range((vertices + _MASK_BITS - 1) // _MASK_BITS):
+        if held > _HELD:
+            break
+        m = _kept_word(data, window, core, margins, cells, word)
+        while m != 0 and held <= _HELD:
+            v = word * _MASK_BITS + _lowest_bit(m)
+            m = m & (m - 1)
+            r = r0 + v // width
+            c = c0 + v % width
+            kept = _kept_items(data, window, core, margins, r, c)
+            for item in range(_ITEMS):
+                if ((kept >> item) & 1) != 0:
+                    planes, claim = _point_item(data, window, planes, core, r, c, r1, c1, item)
+                    held, candidates = _walk_claim(out, slot, held, candidates, claim, core.eps)
+    return planes, held, candidates
+
+
+@wp.kernel(enable_backward=False, launch_bounds=(TERRAIN_LAW_BLOCK, 16))
+def terrain_point_rows(
+    begin: int,
+    slot_begin: int,
+    inputs: TerrainPairInputs,
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+    work: TerrainPairWork,
+):
+    """The law's rows of sphere and capsule pairs, one thread per pair: it walks the windows of up to 16 cells and
+    queues the larger ones for :func:`terrain_point_rows_tiled`.
+
+    A walked pair holds its distinct rows in its slots and writes them when the finish would keep them as they are;
+    any other pair is left to :func:`terrain_point_rows_full` (the finish's candidate list and code would otherwise
+    cost every thread their registers and stack). A pair from ``work.first`` on (the tiled segment) leaves here
+    through the whole-pair rejects, or is queued in ``work`` to be walked by a tile of lanes.
+
+    Launch: ``wp.launch`` with one thread per pair and ``block_dim``
+    :func:`~newton._src.geometry.terrain_shadow.terrain_law_block_dim` (on CUDA
+    :data:`~newton._src.geometry.terrain_shadow.TERRAIN_LAW_BLOCK`; the launch bounds refuse larger blocks).
+    """
+    i = wp.tid()
+    pair = begin + i
+    state, frame, heightfield, cells, a, b, segment, reach = _pair_setup(inputs, data, pair)
+    if state != 0:
+        terrain_pair_exit(out, pair, state)
+        return
+    if pair >= work.first:
+        # A larger window that the rejects keep: a tile of lanes walks it.
+        work.pairs[wp.atomic_add(work.count, 0, 1)] = pair
+        return
+    slot = slot_begin + i * _ROWS
+    window = terrain_window(data, heightfield, cells[0], cells[2])
+    ka, kb = _window_points(window, a, b, segment)
+    eps = terrain_eps(terrain_window_extent(data, window, cells[1], cells[3], _point_extent(ka, kb)))
+    planes = terrain_planes()
+    planes, core = _pair_core(data, window, planes, ka, kb, segment, reach, eps)
+    _open_pair(out, slot)
+    held = int(0)
+    candidates = int(0)
+    # A sphere walks its centre's items alone, in code of its own: its warps never run the capsule's.
+    if segment == 0:
+        planes, held, candidates = _walk_sphere(data, window, planes, core, out, slot, cells)
+    else:
+        planes, held, candidates = _walk_segment(data, window, planes, core, out, slot, cells)
+    _close_pair(out, pair, slot, _wide(cells), held, candidates, data, window, planes, core, frame)
+
+
+@wp.func
+def _vertex_marks(
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    core: _PointCore,
+    margins: wp.vec3,
+    r: int,
+    c: int,
+    r1: int,
+    c1: int,
+    items: int,
+):
+    """Bit ``item`` for every item of window vertex ``(r, c)`` whose claim is not nothing, of the items it can yield
+    anything at all (:func:`_kept_items`), and the updated plane cache."""
+    m = int(0)
+    kept = _kept_items(data, window, core, margins, r, c)
+    for item in range(items):
+        if ((kept >> item) & 1) != 0:
+            planes, claim = _point_item(data, window, planes, core, r, c, r1, c1, item)
+            if claim.kind != 0:
+                m = m | (1 << item)
+    return planes, m
+
+
+@wp.func
+def _tiled_window(inputs: TerrainPairInputs, data: TerrainFeatureData, pair: int, lane: int, lanes: int):
+    """A pair's whole-pair state and, past the rejects, its window, plane cache and core, the block's lanes splitting
+    the window's heights for its band (every lane returns the same values).
+
+    Returns ``(state, frame, cells, window, planes, core)``; past a reject (``state`` nonzero) only the state and the
+    cells are set.
+    """
+    state, frame, heightfield, cells, a, b, segment, reach = _pair_setup(inputs, data, pair)
+    window = TerrainWindow()
+    planes = terrain_planes()
+    core = _PointCore()
+    if state != 0:
+        return state, frame, cells, window, planes, core
+    r0 = cells[0]
+    c0 = cells[2]
     window = terrain_window(data, heightfield, r0, c0)
-    width = c1 - c0 + 2
-    vertices = (r1 - r0 + 2) * width
+    width = cells[3] - c0 + 2
+    vertices = (cells[1] - r0 + 2) * width
     surface = window.surface
     extent = float(0.0)
     for v in range(lane, vertices, lanes):
         extent = wp.max(extent, wp.abs(terrain_height(data, surface, r0 + v // width, c0 + v % width) - window.z_ref))
     extent = wp.tile_extract(wp.tile_max(wp.tile(extent)), 0)
-    size = wp.max(float(c1 + 1 - c0) * surface.dx, float(r1 + 1 - r0) * surface.dy)
-    eps = terrain_eps(wp.max(wp.max(extent, size), _core_extent(window, a, b)))
-    planes = terrain_planes()
-    planes, core = _pair_core(data, window, planes, a, b, segment, reach, eps)
+    size = wp.max(float(cells[3] + 1 - c0) * surface.dx, float(cells[1] + 1 - r0) * surface.dy)
+    ka, kb = _window_points(window, a, b, segment)
+    eps = terrain_eps(wp.max(wp.max(extent, size), _point_extent(ka, kb)))
+    planes, core = _pair_core(data, window, planes, ka, kb, segment, reach, eps)
+    return state, frame, cells, window, planes, core
+
+
+@wp.func
+def _tiled_pair(
+    begin: int,
+    slot_begin: int,
+    inputs: TerrainPairInputs,
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+    pair: int,
+    lane: int,
+):
+    """Walk one pair's window with the block's lanes (see :func:`terrain_point_rows_tiled`); every lane returns
+    together, ready for the next pair."""
+    lanes = wp.block_dim()
+    slot = slot_begin + (pair - begin) * _ROWS
+    state, frame, cells, window, planes, core = _tiled_window(inputs, data, pair, lane, lanes)
+    if state != 0:
+        # A queued pair passed these rejects in the one-thread kernel; every lane reads the same pair regardless.
+        if lane == 0:
+            terrain_pair_exit(out, pair, state)
+        return
+    r0 = cells[0]
+    r1 = cells[1]
+    c0 = cells[2]
+    c1 = cells[3]
+    width = c1 - c0 + 2
+    vertices = (r1 - r0 + 2) * width
     items = _vertex_items(core)
     margins = _cell_margins(window, core)
-    words = (vertices + 31) // 32
+    masked = vertices <= _MASK_VERTICES
+    # This marking and the first lane's loop below have a twin in _finish_deferred: edit both. They cannot share a
+    # wp.func, which would take the tile; with one, a wp.compile_aot_module of this module in the process left its
+    # built CPU kernels unfindable (Warp 1.17.0.dev20260807).
+    marks = wp.tile_zeros(shape=_MASK_VERTICES, dtype=wp.int32, storage="shared")
     marked = _Mask()
-    if words <= _MASK_WORDS:
-        for v in range(lane, vertices, lanes):
-            r = r0 + v // width
-            c = c0 + v % width
-            if _vertex_dropped(data, window, core, margins, r, c):
-                continue
-            for item in range(items):
-                planes, claim = _point_item(data, window, planes, core, r, c, r1, c1, item)
-                if claim.kind != 0:
+    if masked:
+        # The lanes split the vertices: per vertex its items that yield anything (in ``marks``), and as bit words
+        # the vertices with any.
+        for start in range(0, vertices, lanes):
+            v = start + lane
+            m = int(0)
+            if v < vertices:
+                planes, m = _vertex_marks(
+                    data, window, planes, core, margins, r0 + v // width, c0 + v % width, r1, c1, items
+                )
+                if m != 0:
                     marked[v // 32] = marked[v // 32] | (1 << (v % 32))
+            wp.tile_scatter_masked(marks, wp.min(v, _MASK_VERTICES - 1), m, v < vertices)
         # Lanes mark disjoint vertices, so a sum of their words is their union.
-        for word in range(words):
+        for word in range((vertices + 31) // 32):
             marked[word] = wp.tile_extract(wp.tile_sum(wp.tile(marked[word])), 0)
-    if lane != 0:
+    if lane == 0:
+        # The marked items in window order: the nonzero claims the one-thread walk takes, in its order.
+        _open_pair(out, slot)
+        held = int(0)
+        candidates = int(0)
+        v = int(0)
+        while v < vertices and held <= _HELD:
+            if masked:
+                if marked[v // 32] == 0:
+                    v = (v // 32 + 1) * 32
+                    continue
+            # The items to evaluate: the vertex's marks in a marked window, else every item of a kept vertex.
+            m = int(0)
+            if masked:
+                if ((marked[v // 32] >> (v % 32)) & 1) != 0:
+                    m = wp.tile_extract(marks, v)
+            else:
+                m = _kept_items(data, window, core, margins, r0 + v // width, c0 + v % width)
+            if m != 0:
+                for item in range(items):
+                    if ((m >> item) & 1) != 0:
+                        planes, claim = _point_item(
+                            data, window, planes, core, r0 + v // width, c0 + v % width, r1, c1, item
+                        )
+                        held, candidates = _walk_claim(out, slot, held, candidates, claim, core.eps)
+            v += 1
+        _close_pair(out, pair, slot, _wide(cells), held, candidates, data, window, planes, core, frame)
+
+
+@wp.kernel(enable_backward=False)
+def terrain_point_rows_tiled(
+    begin: int,
+    slot_begin: int,
+    inputs: TerrainPairInputs,
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+    work: TerrainPairWork,
+):
+    """The law's rows of the sphere and capsule pairs with long windows that the one-thread kernel queued,
+    ``wp.block_dim()`` lanes per pair.
+
+    Launched with ``work.blocks`` blocks whatever the segment's size: block ``b`` takes the queued pairs ``b``,
+    ``b + blocks``, ... For each, the lanes split the window's heights (its band) and its vertices, marking those
+    whose items yield a row or an exit; the first lane evaluates the marked ones in window order, which gives a pair
+    the rows (or the deferral) :func:`terrain_point_rows` gives it.
+
+    Launch: ``wp.launch_tiled`` with ``dim=work.blocks`` and ``block_dim``
+    :func:`~newton._src.geometry.terrain_shadow.terrain_law_block_dim`. A block past ``work.blocks`` returns at once
+    (it would take queued pairs a second time); with fewer blocks the missing blocks' pairs would get no rows.
+    """
+    block, lane = wp.tid()
+    if block >= work.blocks:
         return
-    _open_pair(out, slot)
-    held = int(0)
-    candidates = int(0)
-    for v in range(vertices):
-        if held > _HELD:
-            break
-        if words <= _MASK_WORDS and (marked[v // 32] & (1 << (v % 32))) == 0:
-            continue
-        r = r0 + v // width
-        c = c0 + v % width
-        if _vertex_dropped(data, window, core, margins, r, c):
-            continue
-        for item in range(items):
-            planes, claim = _point_item(data, window, planes, core, r, c, r1, c1, item)
-            held, candidates = _walk_claim(out, slot, held, candidates, claim, eps)
-    _close_pair(out, pair, slot, _wide(cells), held, candidates, data, window, planes, core, frame)
+    for entry in range(block, work.count[0], work.blocks):
+        _tiled_pair(begin, slot_begin, inputs, data, out, work.pairs[entry], lane)
+
+
+@wp.func
+def _finish_candidate(scratch: TerrainFinishScratch, base: int, count: int, dropped: int, claim: _Claim):
+    """Append a claim's row to a full-finish block's candidates (from ``base``; counted as dropped when full)."""
+    if count < _CANDIDATES:
+        scratch.q[base + count] = claim.q
+        scratch.k[base + count] = claim.k
+        scratch.n[base + count] = claim.n
+        scratch.d[base + count] = claim.d
+        scratch.feature[base + count] = claim.feature
+        return count + 1, dropped
+    return count, dropped + 1
+
+
+@wp.func
+def _finish_input(scratch: TerrainFinishScratch, block: int, count: int, dropped: int):
+    """Copy a full-finish block's candidates into its :class:`~newton._src.geometry.terrain_law.TerrainRows` record,
+    the finish's input (entries past ``count``, never read, keep earlier pairs' values)."""
+    base = block * _CANDIDATES
+    scratch.rows[block].count = count
+    scratch.rows[block].dropped = dropped
+    for row in range(count):
+        q = scratch.q[base + row]
+        k = scratch.k[base + row]
+        n = scratch.n[base + row]
+        for j in range(3):
+            scratch.rows[block].q[row, j] = q[j]
+            scratch.rows[block].k[row, j] = k[j]
+            scratch.rows[block].n[row, j] = n[j]
+        scratch.rows[block].d[row] = scratch.d[base + row]
+        scratch.rows[block].feature[row] = scratch.feature[base + row]
+
+
+@wp.func
+def _finish_deferred(
+    begin: int,
+    slot_begin: int,
+    inputs: TerrainPairInputs,
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+    scratch: TerrainFinishScratch,
+    block: int,
+    lane: int,
+    pair: int,
+):
+    """Walk a deferred pair's window into the full candidate list (``block``'s scratch) with the block's lanes, and
+    run the law's finish on the first lane (see :func:`terrain_point_rows_full`); every lane returns together."""
+    lanes = wp.block_dim()
+    state, frame, cells, window, planes, core = _tiled_window(inputs, data, pair, lane, lanes)
+    if state != 0:
+        # A deferred pair passed these rejects in its walk; every lane reads the same pair regardless.
+        if lane == 0:
+            terrain_pair_exit(out, pair, state)
+        return
+    r0 = cells[0]
+    r1 = cells[1]
+    c0 = cells[2]
+    c1 = cells[3]
+    width = c1 - c0 + 2
+    vertices = (r1 - r0 + 2) * width
+    items = _vertex_items(core)
+    margins = _cell_margins(window, core)
+    masked = vertices <= _MASK_VERTICES
+    # This marking and the first lane's loop below are _tiled_pair's, which cannot be shared (see there): edit both.
+    marks = wp.tile_zeros(shape=_MASK_VERTICES, dtype=wp.int32, storage="shared")
+    marked = _Mask()
+    if masked:
+        # The lanes split the vertices: per vertex its items that yield anything (in ``marks``), and as bit words
+        # the vertices with any.
+        for start in range(0, vertices, lanes):
+            v = start + lane
+            m = int(0)
+            if v < vertices:
+                planes, m = _vertex_marks(
+                    data, window, planes, core, margins, r0 + v // width, c0 + v % width, r1, c1, items
+                )
+                if m != 0:
+                    marked[v // 32] = marked[v // 32] | (1 << (v % 32))
+            wp.tile_scatter_masked(marks, wp.min(v, _MASK_VERTICES - 1), m, v < vertices)
+        # Lanes mark disjoint vertices, so a sum of their words is their union.
+        for word in range((vertices + 31) // 32):
+            marked[word] = wp.tile_extract(wp.tile_sum(wp.tile(marked[word])), 0)
+    if lane == 0:
+        base = block * _CANDIDATES
+        count = int(0)
+        dropped = int(0)
+        exit_a = _Claim()
+        exit_b = _Claim()
+        # The marked items in window order: the nonzero claims of a walk over every vertex the drop keeps.
+        v = int(0)
+        while v < vertices:
+            if masked:
+                if marked[v // 32] == 0:
+                    v = (v // 32 + 1) * 32
+                    continue
+            # The items to evaluate: the vertex's marks in a marked window, else every item of a kept vertex.
+            m = int(0)
+            if masked:
+                if ((marked[v // 32] >> (v % 32)) & 1) != 0:
+                    m = wp.tile_extract(marks, v)
+            else:
+                m = _kept_items(data, window, core, margins, r0 + v // width, c0 + v % width)
+            if m != 0:
+                for item in range(items):
+                    if ((m >> item) & 1) != 0:
+                        planes, claim = _point_item(
+                            data, window, planes, core, r0 + v // width, c0 + v % width, r1, c1, item
+                        )
+                        # G2: an end's exit with the smallest translation, the first in window order on ties.
+                        if claim.kind == _EXIT_A and (exit_a.kind == 0 or claim.d > exit_a.d):
+                            exit_a = claim
+                        elif claim.kind == _EXIT_B and (exit_b.kind == 0 or claim.d > exit_b.d):
+                            # With both ends outside: the axis's deepest crossing under a crease (_WITNESS).
+                            exit_b = claim
+                        elif claim.kind == _ROW:
+                            count, dropped = _finish_candidate(scratch, base, count, dropped, claim)
+            v += 1
+        # G2 and G3: one exit per end inside the solid, after the window's rows.
+        for end in range(2):
+            if (end == 0 and core.below_a != 0) or (end == 1 and core.segment != 0 and core.below_b != 0):
+                claim = exit_a
+                k = core.a
+                if end == 1:
+                    claim = exit_b
+                    k = core.b
+                if claim.kind != 0:
+                    claim.kind = _ROW
+                    claim.k = k
+                else:
+                    planes, claim = _exit_row(data, window, planes, k, end)
+                if claim.kind != 0:
+                    count, dropped = _finish_candidate(scratch, base, count, dropped, claim)
+        # G3 for the axis interior: both ends outside, no axis exit, a crossing of the axis under a crease.
+        witness = exit_b
+        if core.segment != 0 and core.below_a == 0 and core.below_b == 0 and witness.kind != 0:
+            axis_exit = bool(False)
+            for row in range(count):
+                if (scratch.feature[base + row] & 7) == _SLOT_AXIS and scratch.d[base + row] < 0.0:
+                    axis_exit = True
+            if not axis_exit:
+                planes, claim = _axis_recovery(data, window, planes, witness.q, witness.feature)
+                if claim.kind != 0:
+                    count, dropped = _finish_candidate(scratch, base, count, dropped, claim)
+        _finish_input(scratch, block, count, dropped)
+        order, kept, flags = terrain_finish(scratch.rows[block], core.eps, _ROWS)
+        slot = slot_begin + (pair - begin) * _ROWS
+        for kept_row in range(kept):
+            row = base + order[kept_row]
+            terrain_store_row(
+                out,
+                slot + kept_row,
+                scratch.q[row],
+                scratch.n[row],
+                scratch.d[row],
+                scratch.feature[row],
+                window,
+                frame,
+            )
+        out.count[pair] = kept
+        out.state[pair] = _wide(cells) | terrain_finish_state(flags)
+        terrain_report(out.status, out.overflow, flags, True)
 
 
 @wp.kernel(enable_backward=False)
 def terrain_point_rows_full(
-    begin: int, slot_begin: int, inputs: TerrainPairInputs, data: TerrainFeatureData, out: TerrainLawRows
+    begin: int,
+    slot_begin: int,
+    inputs: TerrainPairInputs,
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+    scratch: TerrainFinishScratch,
 ):
     """Finish the sphere and capsule pairs the other two kernels deferred (a plane group of three rows, more rows than
-    the slots, or more candidates than the list).
+    the slots, or more candidates than the list), ``wp.block_dim()`` lanes per pair.
 
-    Launched after them with one thread per pair of the point class; thread ``j`` takes the ``j``-th pair they
-    appended to the deferred list (the order is free: a pair's rows depend on the pair alone), so that the few
-    deferred pairs run in full warps. One thread walks the pair's window again into the full candidate list and runs
-    the law's finish (:func:`~newton._src.geometry.terrain_law.terrain_finish`: merge, implied rows, four rows per
-    plane group, at most :data:`TERRAIN_POINT_ROWS` rows, each group's deepest first on overflow).
+    Launched after them with :attr:`~newton._src.geometry.terrain_shadow.TerrainFinishScratch.blocks` blocks
+    (``wp.launch_tiled``), whatever the class's size: block ``b`` takes the deferred pairs ``b``, ``b + blocks``, ...
+    (the order is free: a pair's rows depend on the pair alone), so that an empty list costs a near-empty launch. The
+    lanes mark the pair's window as the tiled kernel's do; the first lane walks the marked items again into the full
+    candidate list, in the block's scratch, and runs the law's finish
+    (:func:`~newton._src.geometry.terrain_law.terrain_finish`: merge, implied rows, four rows per plane group, at most
+    :data:`TERRAIN_POINT_ROWS` rows, each group's deepest first on overflow).
+
+    Launch: ``wp.launch_tiled`` with ``dim=scratch.blocks`` and ``block_dim``
+    :func:`~newton._src.geometry.terrain_shadow.terrain_law_block_dim`. A block past ``scratch.blocks`` returns at
+    once (it has no scratch, and would finish deferred pairs a second time); with fewer blocks the missing blocks'
+    pairs would keep no rows.
     """
-    entry = wp.tid()
-    if entry >= out.deferred_count[_CLASS]:
+    block, lane = wp.tid()
+    if block >= scratch.blocks:
         return
-    pair = out.deferred[begin + entry]
-    i = pair - begin
-    _state, frame, heightfield, cells, a, b, segment, reach = _pair_setup(inputs, data, pair)
-    r1 = cells[1]
-    c1 = cells[3]
-    window = terrain_window(data, heightfield, cells[0], cells[2])
-    eps = terrain_eps(terrain_window_extent(data, window, r1, c1, _core_extent(window, a, b)))
-    planes = terrain_planes()
-    planes, core = _pair_core(data, window, planes, a, b, segment, reach, eps)
-    rows = TerrainRows()
-    exit_a = _Claim()
-    exit_b = _Claim()
-    items = _vertex_items(core)
-    margins = _cell_margins(window, core)
-    for r in range(cells[0], r1 + 2):
-        for c in range(cells[2], c1 + 2):
-            if _vertex_dropped(data, window, core, margins, r, c):
-                continue
-            for item in range(items):
-                planes, claim = _point_item(data, window, planes, core, r, c, r1, c1, item)
-                # G2: an end's exit with the smallest translation, the first in window order on ties.
-                if claim.kind == _EXIT_A and (exit_a.kind == 0 or claim.d > exit_a.d):
-                    exit_a = claim
-                elif claim.kind == _EXIT_B and (exit_b.kind == 0 or claim.d > exit_b.d):
-                    exit_b = claim
-                elif claim.kind == _ROW:
-                    n = rows.count
-                    if n < _CANDIDATES:
-                        for j in range(3):
-                            rows.q[n, j] = claim.q[j]
-                            rows.k[n, j] = claim.k[j]
-                            rows.n[n, j] = claim.n[j]
-                        rows.d[n] = claim.d
-                        rows.feature[n] = claim.feature
-                        rows.count = n + 1
-                    else:
-                        rows.dropped = rows.dropped + 1
-    # G2 and G3: one exit per end inside the solid, after the window's rows.
-    for end in range(2):
-        if (end == 0 and core.below_a != 0) or (end == 1 and core.segment != 0 and core.below_b != 0):
-            claim = exit_a
-            k = core.a
-            if end == 1:
-                claim = exit_b
-                k = core.b
-            if claim.kind != 0:
-                claim.kind = _ROW
-                claim.k = k
-            else:
-                planes, claim = _exit_row(data, window, planes, k, end)
-            if claim.kind != 0:
-                n = rows.count
-                if n < _CANDIDATES:
-                    for j in range(3):
-                        rows.q[n, j] = claim.q[j]
-                        rows.k[n, j] = claim.k[j]
-                        rows.n[n, j] = claim.n[j]
-                    rows.d[n] = claim.d
-                    rows.feature[n] = claim.feature
-                    rows.count = n + 1
-                else:
-                    rows.dropped = rows.dropped + 1
-    order, kept, flags = terrain_finish(rows, eps, _ROWS)
-    slot = slot_begin + i * _ROWS
-    for kept_row in range(kept):
-        row = order[kept_row]
-        terrain_store_row(
-            out,
-            slot + kept_row,
-            wp.vec3(rows.q[row, 0], rows.q[row, 1], rows.q[row, 2]),
-            wp.vec3(rows.n[row, 0], rows.n[row, 1], rows.n[row, 2]),
-            rows.d[row],
-            rows.feature[row],
-            window,
-            frame,
-        )
-    out.count[pair] = kept
-    out.state[pair] = _wide(cells) | terrain_finish_state(flags)
-    terrain_report(out.status, out.overflow, flags, True)
+    for entry in range(block, out.deferred_count[_CLASS], scratch.blocks):
+        _finish_deferred(begin, slot_begin, inputs, data, out, scratch, block, lane, out.deferred[begin + entry])

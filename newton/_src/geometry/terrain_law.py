@@ -7,8 +7,10 @@ The law emits the support set of one (heightfield, convex shape) pair directly: 
 core-to-surface distance within the writer's reach, plus the corners of flat support regions, each owned by one
 surface feature (a plane cluster, a crease edge or a vertex). This module holds what every per-type kernel shares:
 the surface predicates, the per-pair window (:func:`terrain_box_cells`, :func:`terrain_tile_exit`,
-:func:`terrain_window_extent`), a window's cache of cluster planes (:class:`TerrainPlanes`), the finish, and the
-per-pair inputs and side buffer of the shadow route (:class:`TerrainPairInputs`, :class:`TerrainLawRows`). The static
+:func:`terrain_window_extent`), a window's cache of cluster planes (:class:`TerrainPlanes`), the finish, the
+per-pair inputs and side buffer of the shadow route (:class:`TerrainPairInputs`, :class:`TerrainLawRows`) and the
+per-pair output protocol (:func:`terrain_pair_exit`, :func:`terrain_hold_row`, :func:`terrain_plane_group_of_three`,
+:func:`terrain_defer_pair`, :func:`terrain_store_row`). The static
 data live in :mod:`terrain_contacts`, the per-type kernels in modules of their own (``terrain_law_<type>``), and
 :mod:`terrain_shadow` runs them beside the narrow phase without feeding any contact (``NEWTON_TERRAIN_LAW_SHADOW``).
 Nothing routes contacts through the law yet.
@@ -1694,8 +1696,83 @@ def terrain_finish_slots(
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# per-pair output
+# per-pair output: the protocol every per-type kernel follows (see terrain_shadow.TERRAIN_LAW_KERNELS)
 # ----------------------------------------------------------------------------------------------------------------
+
+
+@wp.func
+def terrain_pair_exit(out: TerrainLawRows, pair: int, state: int):
+    """Record a pair that has no row, with its ``TERRAIN_PAIR_*`` bits, raising ``terrain_stale`` for stale features.
+
+    Every per-type kernel's early exit (:data:`TERRAIN_PAIR_STALE`, :data:`TERRAIN_PAIR_FILTERED`,
+    :data:`TERRAIN_PAIR_OUTSIDE`, :data:`TERRAIN_PAIR_TILE_EXIT`).
+    """
+    out.count[pair] = 0
+    out.state[pair] = state
+    if state == TERRAIN_PAIR_STALE:
+        terrain_report(out.status, out.overflow, 0, False)
+
+
+@wp.func
+def terrain_hold_row(
+    out: TerrainLawRows,
+    slot: int,
+    held: int,
+    q: wp.vec3,
+    n: wp.vec3,
+    d: float,
+    feature: int,
+    eps: float,
+    limit: int,
+) -> int:
+    """Add a row (window frame) to the distinct rows a pair holds in its slots from ``slot``, as the finish merges.
+
+    A row that coincides with a held one (:func:`terrain_rows_coincide`) is dropped, the first in walk order staying;
+    past ``limit`` held rows a distinct row is only counted. Returns the new number of distinct rows, which a kernel
+    compares with its limit to tell whether the finish could keep the rows as they are.
+    """
+    for h in range(wp.min(held, limit)):
+        if terrain_rows_coincide(out.q[slot + h], out.n[slot + h], q, n, eps):
+            return held
+    if held < limit:
+        out.q[slot + held] = q
+        out.n[slot + held] = n
+        out.d[slot + held] = d
+        out.feature[slot + held] = feature
+    return held + 1
+
+
+@wp.func
+def terrain_plane_group_of_three(out: TerrainLawRows, slot: int, held: int, eps: float) -> bool:
+    """Whether three of a pair's held rows share a plane group, as the finish groups them (its first row of a plane
+    represents it, :func:`terrain_rows_same_plane`): only such a group can lose rows to the finish's implied-row and
+    per-group steps."""
+    representatives = int(0)
+    sizes = int(0)
+    for i in range(held):
+        qi = out.q[slot + i]
+        ni = out.n[slot + i]
+        group = i
+        for j in range(i):
+            if (representatives >> j) & 1 != 0:
+                if terrain_rows_same_plane(qi, ni, out.q[slot + j], out.n[slot + j], eps):
+                    group = j
+                    break
+        if group == i:
+            representatives = representatives | (1 << i)
+        if ((sizes >> (4 * group)) & 15) >= 2:
+            return True
+        sizes = sizes + (1 << (4 * group))
+    return False
+
+
+@wp.func
+def terrain_defer_pair(out: TerrainLawRows, partner_class: int, pair: int, state: int):
+    """Leave a pair to its partner class's full-finish kernel: no row yet, :data:`TERRAIN_PAIR_FULL` added to
+    ``state``, and the pair appended to the class's deferred list (in any order; a pair's rows depend on it alone)."""
+    out.count[pair] = 0
+    out.state[pair] = state | TERRAIN_PAIR_FULL
+    out.deferred[out.deferred_first[partner_class] + wp.atomic_add(out.deferred_count, partner_class, 1)] = pair
 
 
 @wp.func

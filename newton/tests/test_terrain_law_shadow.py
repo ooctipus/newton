@@ -17,6 +17,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.geometry import terrain_law_point
 from newton._src.geometry.terrain_contacts import (
     TERRAIN_LANE_THREAD,
     TERRAIN_LANE_TILE,
@@ -37,24 +38,24 @@ from newton._src.geometry.terrain_law_solid import (
     TERRAIN_SOLID_THREAD_VERTICES,
     TERRAIN_SOLID_TILE_BLOCKS,
 )
-from newton._src.geometry.terrain_shadow import TERRAIN_LAW_KERNELS, parse_terrain_law_shadow
+from newton._src.geometry.terrain_shadow import (
+    TERRAIN_LAW_FULL_BLOCKS,
+    TERRAIN_LAW_KERNELS,
+    TERRAIN_LAW_TILE_BLOCKS,
+    parse_terrain_law_shadow,
+    terrain_law_block_dim,
+)
 from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_solid_utils as su
 from newton.tests import terrain_law_test_utils as tu
-from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
+from newton.tests.unittest_utils import (
+    add_function_test,
+    get_cuda_test_devices,
+    get_test_devices,
+    scoped_capture_after_gc,
+)
 
 PIPELINE = {"rigid_contact_max": 1 << 14, "max_triangle_pairs": 1 << 16}
-CONTACT_FIELDS = (
-    "rigid_contact_shape0",
-    "rigid_contact_shape1",
-    "rigid_contact_point0",
-    "rigid_contact_point1",
-    "rigid_contact_offset0",
-    "rigid_contact_offset1",
-    "rigid_contact_normal",
-    "rigid_contact_margin0",
-    "rigid_contact_margin1",
-)
 
 
 def _mixed_scene(device):
@@ -96,17 +97,15 @@ def _contacts(pipeline, model, state=None):
 
 
 def _contact_arrays(contacts) -> dict:
+    """Every ``rigid_contact_*`` array of a :class:`newton.Contacts`, the per-contact ones cut to the contact count."""
     count = int(contacts.rigid_contact_count.numpy()[0])
-    return {name: getattr(contacts, name).numpy()[:count] for name in CONTACT_FIELDS} | {"count": count}
-
-
-def _sorted_rows(arrays) -> np.ndarray:
-    """Contacts as rows of their bits, sorted (CUDA writes them in atomic order)."""
-    columns = [
-        np.ascontiguousarray(arrays[name]).view(np.int32).reshape(arrays["count"], -1) for name in CONTACT_FIELDS
-    ]
-    rows = np.concatenate(columns, axis=1) if arrays["count"] else np.zeros((0, 1), np.int32)
-    return rows[np.lexsort(rows.T[::-1])] if len(rows) else rows
+    out = {"count": count}
+    for name in sorted(vars(contacts)):
+        array = getattr(contacts, name)
+        if name.startswith("rigid_contact_") and isinstance(array, wp.array):
+            values = array.numpy()
+            out[name] = values[:count] if values.shape[0] == contacts.rigid_contact_max else values
+    return out
 
 
 def _unset():
@@ -116,46 +115,75 @@ def _unset():
 
 
 def test_shadow_keeps_contacts_bitwise(test, device):
-    """Write today's contacts bit for bit with the shadow running beside the terrain route."""
+    """Write today's contacts bit for bit with the shadow running beside the terrain route.
+
+    Every ``rigid_contact_*`` array is compared in place. On CUDA both pipelines are deterministic: by default the
+    global reducer breaks score ties by atomic order, so two pipelines without the shadow could already differ.
+    """
     model, _terrain = _mixed_scene(device)
-    with _unset():
-        today = newton.CollisionPipeline(model, **PIPELINE)
-    shadow = tu.shadow_pipeline(model, **PIPELINE)
-    test.assertIsNone(today._terrain_law_shadow)
-    test.assertIsNotNone(shadow._terrain_law_shadow)
     state = model.state()
-    a = _contact_arrays(_contacts(today, model, state))
-    b = _contact_arrays(_contacts(shadow, model, state))
-    test.assertGreater(a["count"], 20)
-    test.assertEqual(a["count"], b["count"])
-    if device.is_cpu:
-        for name in CONTACT_FIELDS:
-            np.testing.assert_array_equal(a[name], b[name], err_msg=name)
-    else:
-        np.testing.assert_array_equal(_sorted_rows(a), _sorted_rows(b))
-    rows = shadow._terrain_law_shadow.rows()
-    test.assertGreater(int(rows["count"].sum()), 0)
+    for deterministic in (False, True) if device.is_cpu else (True,):
+        with test.subTest(deterministic=deterministic):
+            with _unset():
+                today = newton.CollisionPipeline(model, deterministic=deterministic, **PIPELINE)
+            shadow = tu.shadow_pipeline(model, deterministic=deterministic, **PIPELINE)
+            test.assertIsNone(today._terrain_law_shadow)
+            test.assertIsNotNone(shadow._terrain_law_shadow)
+            a = _contact_arrays(_contacts(today, model, state))
+            b = _contact_arrays(_contacts(shadow, model, state))
+            test.assertGreater(a["count"], 20)
+            test.assertEqual(sorted(a), sorted(b))
+            test.assertGreater(len(a), 12)
+            for name, values in a.items():
+                np.testing.assert_array_equal(values, b[name], err_msg=name)
+            test.assertGreater(int(shadow._terrain_law_shadow.rows()["count"].sum()), 0)
 
 
 def test_shadow_runs_under_graph_capture(test, device):
-    """Capture the shadow with the collide in a CUDA graph and replay it to the rows of an uncaptured collide."""
+    """Capture the shadow with the collide in a CUDA graph and replay it to the rows of an uncaptured collide.
+
+    The shadow's launches are also captured alone with the device's memory pool off, so that an allocation inside
+    them raises instead of becoming a graph allocation node.
+    """
     model, _terrain = _mixed_scene(device)
     pipeline = tu.shadow_pipeline(model, **PIPELINE)
+    shadow = pipeline._terrain_law_shadow
     state = model.state()
     contacts = pipeline.contacts()
     pipeline.collide(state, contacts)
-    expected = pipeline._terrain_law_shadow.rows()
+    expected = shadow.rows()
     # Move the bodies, so that the replay must recompute the rows.
     moved = model.state()
     q = moved.body_q.numpy()
     q[:, 2] += 0.5
     moved.body_q.assign(q)
     pipeline.collide(moved, contacts)
-    test.assertEqual(int(pipeline._terrain_law_shadow.rows()["count"].sum()), 0)
-    with wp.ScopedCapture(device=device) as capture:
+    test.assertEqual(int(shadow.rows()["count"].sum()), 0)
+    with scoped_capture_after_gc(device=device) as capture:
         pipeline.collide(state, contacts)
     wp.capture_launch(capture.graph)
-    replayed = pipeline._terrain_law_shadow.rows()
+    replayed = shadow.rows()
+    for name in ("count", "state", "q", "n", "d", "feature"):
+        np.testing.assert_array_equal(replayed[name], expected[name], err_msg=name)
+    # The shadow alone without a memory pool; its replay recomputes rows forgotten after an uncaptured collide.
+    pooled = wp.is_mempool_enabled(device)
+    wp.set_mempool_enabled(device, False)
+    try:
+        with scoped_capture_after_gc(device=device) as capture:
+            shadow.launch(
+                pipeline.geom_transform,
+                pipeline.geom_data,
+                shape_type=model.shape_type,
+                shape_gap=model.shape_gap,
+                shape_heightfield_index=model.shape_heightfield_index,
+                **pipeline._broad_phase_pair_filter(model),
+            )
+    finally:
+        wp.set_mempool_enabled(device, pooled)
+    pipeline.collide(state, contacts)
+    shadow._out.count.zero_()
+    wp.capture_launch(capture.graph)
+    replayed = shadow.rows()
     for name in ("count", "state", "q", "n", "d", "feature"):
         np.testing.assert_array_equal(replayed[name], expected[name], err_msg=name)
 
@@ -307,6 +335,83 @@ def test_high_cores_leave_at_the_tile_max(test, device):
     test.assertTrue(np.all(rows["state"] == int(TERRAIN_PAIR_TILE_EXIT)))
 
 
+def _tiled_scene(device):
+    """Large spheres and long capsules (windows of more than 16 cells) on rough terrain, every second one 1 m above it."""
+    rng = np.random.default_rng(9)
+    heights = np.round(rng.uniform(0.0, 0.1, (33, 33)) / 0.005) * 0.005
+    lying = np.array([0.0, np.sin(np.pi / 4.0), 0.0, np.cos(np.pi / 4.0)])
+    bodies = []
+    for i in range(12):
+        x, y = rng.uniform(-1.0, 1.0, 2)
+        lift = 1.0 if i % 2 else 0.0
+        if i % 4 < 2:
+            bodies.append(("sphere", {"radius": 0.25}, np.array([x, y, 0.35 + lift, 0.0, 0.0, 0.0, 1.0])))
+        else:
+            bodies.append(("capsule", {"radius": 0.06, "half_height": 0.3}, np.array([x, y, 0.16 + lift, *lying])))
+    return tu.body_scene(heights, 1.6, 1.6, bodies, device=device)[0]
+
+
+def test_tiled_pairs_that_exit_are_not_queued(test, device):
+    """Queue for the tiled kernel exactly the larger-window pairs that pass the whole-pair rejects.
+
+    The one-thread kernel takes every pair of the class through the rejects. A larger-window pair that leaves (here at
+    the tile max, high above the terrain) is recorded there and never occupies a tile of lanes; the tiled kernel's
+    fixed grid of blocks takes the queued pairs in turn.
+    """
+    model = _tiled_scene(device)
+    pipeline = tu.shadow_pipeline(model, **PIPELINE)
+    shadow = pipeline._terrain_law_shadow
+    tiled_launches = []
+    launch_tiled = wp.launch_tiled
+
+    def record(kernel, *args, **kwargs):
+        if kernel is terrain_law_point.terrain_point_rows_tiled:
+            tiled_launches.append((kwargs["dim"], kwargs["block_dim"]))
+        return launch_tiled(kernel, *args, **kwargs)
+
+    with patch.object(wp, "launch_tiled", record):
+        _contacts(pipeline, model)
+    rows = shadow.rows()
+    tiled = rows["lane_class"] == TERRAIN_LANE_TILE
+    left = (rows["state"] & int(TERRAIN_PAIR_TILE_EXIT)) != 0
+    test.assertEqual(int(tiled.sum()), 12)
+    test.assertEqual(int((tiled & left).sum()), 6)
+    test.assertGreater(int(rows["count"][tiled & ~left].sum()), 0)
+    work = next(extra for kind, *_launch, extra in shadow._launches if kind == "thread")
+    queued = work.pairs.numpy()[: int(work.count.numpy()[0])]
+    np.testing.assert_array_equal(np.sort(queued), shadow._listed[tiled & ~left])
+    test.assertEqual(tiled_launches, [(min(12, TERRAIN_LAW_TILE_BLOCKS), terrain_law_block_dim(device))])
+
+
+def test_shadow_launches_take_one_block_size(test, device):
+    """Launch every kernel of the shadow with one block size, so that the point module builds once per device.
+
+    Warp builds a module once per block size it is launched with: the one-thread kernel took Warp's default 256-thread
+    blocks while the tiled kernels took their lanes, two builds of the module on every device. Every launch now takes
+    ``terrain_law_block_dim`` (one warp on CUDA, where the one-thread kernel's warps then also spread evenly over the
+    SMs; one on the CPU).
+    """
+    model = _tiled_scene(device)
+    pipeline = tu.shadow_pipeline(model, **PIPELINE)
+    blocks = {}
+    launch, launch_tiled = wp.launch, wp.launch_tiled
+
+    def recorder(original):
+        def record(kernel, *args, **kwargs):
+            if kernel.module.name == terrain_law_point.__name__:
+                blocks.setdefault(kernel.key, set()).add(kwargs.get("block_dim"))
+            return original(kernel, *args, **kwargs)
+
+        return record
+
+    with patch.object(wp, "launch", recorder(launch)), patch.object(wp, "launch_tiled", recorder(launch_tiled)):
+        _contacts(pipeline, model)
+    test.assertEqual(
+        sorted(blocks), ["terrain_point_rows", "terrain_point_rows_full", "terrain_point_rows_tiled"], msg=blocks
+    )
+    test.assertEqual(set().union(*blocks.values()), {terrain_law_block_dim(device)}, msg=blocks)
+
+
 class TestTerrainLawShadow(unittest.TestCase):
     def test_flag_values_cpu(self):
         """Parse the flag's partner classes: names, ``all``, blanks; refuse unknown names and classes without kernels."""
@@ -340,8 +445,32 @@ class TestTerrainLawShadow(unittest.TestCase):
         self.assertEqual(record, {"enabled": False, "reason": "Off: NEWTON_TERRAIN_LAW_SHADOW lists no partner class."})
         self.assertNotIn("NEWTON_TERRAIN_LAW_SHADOW", pipeline.get_collision_selection()["environment"]["applied"])
 
+    def test_full_finish_launch_is_a_fixed_grid_cpu(self):
+        """Launch the full-finish kernel with a fixed grid whatever the class's size, striding over the deferred list.
+
+        The deferred pairs are found on the device, during the collide; ``TERRAIN_LAW_FULL_BLOCKS`` blocks of lanes
+        with their global scratch take them in turn, so that a collide with nothing deferred costs one near-empty
+        launch instead of one thread per pair of the class (each of which, before, initialized the finish's locals).
+        """
+        model, _terrain = _mixed_scene("cpu")
+        pipeline = tu.shadow_pipeline(model, **PIPELINE)
+        shadow = pipeline._terrain_law_shadow
+        launches = []
+        launch_tiled = wp.launch_tiled
+
+        def record(kernel, *args, **kwargs):
+            if kernel is terrain_law_point.terrain_point_rows_full:
+                launches.append((kwargs["dim"], kwargs["block_dim"]))
+            return launch_tiled(kernel, *args, **kwargs)
+
+        with patch.object(wp, "launch_tiled", record):
+            _contacts(pipeline, model)
+        self.assertEqual(launches, [(TERRAIN_LAW_FULL_BLOCKS, terrain_law_block_dim("cpu"))])
+        self.assertNotEqual(sum(shadow.describe()["pairs"]["point"].values()), TERRAIN_LAW_FULL_BLOCKS)
+        self.assertGreater(shadow.describe()["bytes"]["finish_scratch"], 0)
+
     def test_route_record_cpu(self):
-        """Record the shadow's classes, pairs per lane class and memory in the collision selection."""
+        """Record the shadow's classes, pairs per lane class, launch shapes and memory in the collision selection."""
         model, _terrain = _mixed_scene("cpu")
         pipeline = tu.shadow_pipeline(model, **PIPELINE)
         selection = pipeline.get_collision_selection()
@@ -356,8 +485,20 @@ class TestTerrainLawShadow(unittest.TestCase):
         self.assertEqual(record["pairs"], {"point": lanes})
         self.assertEqual(sum(lanes.values()), 12)
         self.assertEqual(record["slots"], 12 * TERRAIN_POINT_ROWS)
-        # One walk per lane segment, and the class's full-finish kernel.
-        self.assertEqual(record["launches"], sum(1 for v in lanes.values() if v) + 1)
+        # The one-thread kernel over the class, the tiled kernel over its queue when it has a tiled segment, and the
+        # class's full-finish kernel, with the dimensions fixed at construction.
+        self.assertEqual(record["launches"], 2 + int(lanes["tiled"] > 0))
+        self.assertEqual(
+            record["launch_shapes"],
+            {
+                "point": {
+                    "block_dim": terrain_law_block_dim("cpu"),
+                    "thread_dim": 12,
+                    "tiled_blocks": min(lanes["tiled"], TERRAIN_LAW_TILE_BLOCKS),
+                    "full_blocks": TERRAIN_LAW_FULL_BLOCKS,
+                }
+            },
+        )
         self.assertEqual(selection["environment"]["applied"]["NEWTON_TERRAIN_LAW_SHADOW"], "point")
         # Without heightfield pairs the flag builds nothing.
         builder = newton.ModelBuilder()
@@ -444,6 +585,8 @@ for _name, _func in (
     ("test_row_overflow_raises_terrain_rows", test_row_overflow_raises_terrain_rows),
     ("test_shadow_follows_the_pair_policy", test_shadow_follows_the_pair_policy),
     ("test_high_cores_leave_at_the_tile_max", test_high_cores_leave_at_the_tile_max),
+    ("test_tiled_pairs_that_exit_are_not_queued", test_tiled_pairs_that_exit_are_not_queued),
+    ("test_shadow_launches_take_one_block_size", test_shadow_launches_take_one_block_size),
 ):
     add_function_test(TestTerrainLawShadow, _name, _func, devices=devices)
 add_function_test(
