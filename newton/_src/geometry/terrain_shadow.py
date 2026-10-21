@@ -152,7 +152,11 @@ def _solid_launches(name: str) -> tuple[tuple[str, str], ...]:
         "settle",
         "full",
     )
-    kinds = ("pairs", *("jobs",) * 11, "pairs", "pairs", "full")
+    pair_jobs = ("close", "recovery", "exit", "settle")
+    kinds = tuple(
+        "pairs" if kernel == "rows" else "full" if kernel == "full" else "pair_jobs" if kernel in pair_jobs else "jobs"
+        for kernel in kernels
+    )
     return tuple(
         (kind, f"terrain_{name}_rows" if kernel == "rows" else f"terrain_{name}_rows_{kernel}")
         for kind, kernel in zip(kinds, kernels, strict=True)
@@ -179,10 +183,13 @@ The module is imported only when the class is listed. Launch kinds, every one wi
   segment's (the point class's large windows);
 * ``pairs``: one thread per pair of the class, with the class's
   :class:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs` and the solid classes'
-  :class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData` (a solid class's whole-pair rejects, exit and
-  settle kernels);
+  :class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData` (a solid class's whole-pair rejects);
 * ``jobs``: the class's job threads (:attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.threads`), the same
-  arguments (a solid class's scan, job, close and rule R kernels, each striding over its list);
+  arguments (a solid class's scan and job kernels, each striding over its list; a job kernel whose list has no room by
+  construction is not launched, :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LIST_OF_KERNEL`);
+* ``pair_jobs``: the same over a list of the class's pairs, with at most one thread per pair
+  (:attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.pair_threads`: a solid class's close, rule R, exit
+  and settle kernels);
 * ``full``: ``wp.launch_tiled`` with :func:`~newton._src.geometry.terrain_law.terrain_finish_blocks` blocks of
   :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK` lanes whatever the class's size, striding over its
   deferred list, and a :class:`~newton._src.geometry.terrain_law.TerrainFinishScratch` as sixth argument (a solid
@@ -497,6 +504,9 @@ class TerrainLawShadow:
         if any(c in TERRAIN_LAW_SOLID_CLASSES for c in self.classes):
             solid_module = importlib.import_module("newton._src.geometry.terrain_law_solid")
             assert solid_module.TERRAIN_SOLID_COUNTERS == TERRAIN_LAW_JOB_COUNTERS
+            assert [kind for kind, _kernel in _solid_launches("box")] == [
+                kind for kind, _kernel in solid_module.TERRAIN_SOLID_LAUNCHES
+            ]
             assert (
                 TERRAIN_LAW_JOB_NAMES[: len(solid_module.TERRAIN_SOLID_JOB_LISTS)]
                 == solid_module.TERRAIN_SOLID_JOB_LISTS
@@ -541,11 +551,21 @@ class TerrainLawShadow:
                 # the live and rule R lists hold every pair of the class: no check
                 for name in names:
                     capacities[offset - _JOBS + TERRAIN_LAW_JOB_NAMES.index(name)] = capacity[name]
+                skipped = []
+                prefix = f"terrain_{terrain_law_class_name(partner_class)}_rows_"
                 for kind, kernel_name in launches:
                     kernel = getattr(module, kernel_name)
                     if kind == "pairs":
                         self._launches.append(("thread", kernel, end - begin, begin, slot, (jobs, True)))
+                    elif kind == "pair_jobs":
+                        self._launches.append(("thread", kernel, jobs.pair_threads, begin, slot, (jobs, True)))
                     elif kind == "jobs":
+                        # a list none of the class's pairs can fill: no launch
+                        short = kernel_name.removeprefix(prefix)
+                        listed = solid_module.TERRAIN_SOLID_LIST_OF_KERNEL.get(short)
+                        if listed is not None and capacity[listed] == 0:
+                            skipped.append(short)
+                            continue
                         self._launches.append(("thread", kernel, jobs.threads, begin, slot, (jobs, True)))
                     else:
                         self._launches.append(("tiled", kernel, scratch.blocks, begin, slot, (scratch, True, jobs)))
@@ -553,7 +573,9 @@ class TerrainLawShadow:
                     {
                         "pair_dim": end - begin,
                         "job_threads": jobs.threads,
+                        "pair_job_threads": jobs.pair_threads,
                         "jobs": {name: int(capacity[name]) for name in names},
+                        "skipped": skipped,
                     }
                 )
             else:
@@ -791,10 +813,12 @@ class TerrainLawShadow:
         its blocks, each sized for the class's largest pair, would exceed
         :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_FULL_SCRATCH_BYTES`); for the point class ``thread_dim``
         (the one-thread kernel's threads, one per pair of the class) and ``tiled_blocks`` (the tiled kernel's grid, 0
-        without a tiled segment); for a solid class ``pair_dim`` (its whole-pair rejects', exit and settle kernels'
-        threads, one per pair of the class), ``job_threads`` (its scan, job, close and rule R kernels' threads) and
-        ``jobs`` (the entries of its job lists, its candidate pool and its scan's runs). ``slots`` and ``spill_rows``
-        are the side buffer's walk slots and spill rows.
+        without a tiled segment); for a solid class ``pair_dim`` (its whole-pair rejects' threads, one per pair of the
+        class), ``job_threads`` (its scan and job kernels' threads), ``pair_job_threads`` (its close, rule R, exit and
+        settle kernels' threads, at most one per pair of the class), ``jobs`` (the entries
+        of its job lists, its candidate pool's rows, its scan's runs and rule X's candidates) and ``skipped`` (its job
+        kernels not launched: their lists have no room, none of its pairs can list an entry). ``slots`` and
+        ``spill_rows`` are the side buffer's walk slots and spill rows.
         """
         pairs = {}
         for partner_class in range(TERRAIN_PARTNER_CLASSES):

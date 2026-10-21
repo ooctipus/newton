@@ -452,6 +452,10 @@ class TerrainSolidJobs:
     room)."""
     threads: int
     """Threads of the job kernels' launches: each strides over its list."""
+    pair_threads: int
+    """Threads of the launches that stride over lists of the class's pairs (the close, rule R's, the exit and the settle
+    kernels: the live pairs, the pairs without a row, the pairs left to rule X): the job threads, at most the class's
+    pairs."""
     q: wp.array[wp.vec3]
     """The candidate pool: terrain point of every candidate [m, window frame]. Its first entries hold the jobs' rows
     (:func:`_offer`), its last ``descent.shape[0]`` rule X's listed candidates (:func:`_x_list`), each region with its
@@ -3022,19 +3026,34 @@ TERRAIN_SOLID_LAUNCHES = (
     ("jobs", "thetas"),
     ("jobs", "creases"),
     ("jobs", "vertices"),
-    ("jobs", "close"),
-    ("jobs", "recovery"),
+    ("pair_jobs", "close"),
+    ("pair_jobs", "recovery"),
     ("jobs", "xitems"),
     ("jobs", "xvalleys"),
     ("jobs", "xdescents"),
-    ("pairs", "exit"),
-    ("pairs", "settle"),
+    ("pair_jobs", "exit"),
+    ("pair_jobs", "settle"),
     ("full", "full"),
 )
 """A solid class's launches in order, by kind and kernel (:func:`solid_kernels`): ``pairs`` one thread per pair of the
 class, ``jobs`` the class's job threads (:attr:`TerrainSolidJobs.threads`, striding over a list; a thread past them
-returns at once, so that a larger launch takes no entry twice), ``full`` the full-finish grid
-(:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`, ``wp.launch_tiled``)."""
+returns at once, so that a larger launch takes no entry twice), ``pair_jobs`` the same over a list of the class's pairs
+with at most one thread per pair (:attr:`TerrainSolidJobs.pair_threads`), ``full`` the full-finish grid
+(:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`, ``wp.launch_tiled``). A job kernel whose list has no
+room by construction (:func:`terrain_solid_job_capacities`: none of the class's pairs can list an entry, as rule X's
+valleys of a class without vertex candidates) is not launched (:data:`TERRAIN_SOLID_LIST_OF_KERNEL`)."""
+TERRAIN_SOLID_LIST_OF_KERNEL = {
+    "faces": "faces",
+    "edges": "edges",
+    "thetas": "thetas",
+    "creases": "thetas",
+    "vertices": "vertices",
+    "xitems": "xitems",
+    "xvalleys": "xvalleys",
+    "xdescents": "xdescents",
+}
+"""The job kernels that take a sized list (:func:`terrain_solid_job_capacities`), by the list they take: a kernel whose
+list has no room is not launched."""
 
 
 def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, save_core, load_core, module: str) -> dict:
@@ -3233,9 +3252,9 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         """The close, one live pair per thread at a time: a scanned pair's rows held in window order, then its finish,
         its rule X's items or rule R's list (:func:`solid_close_jobs`); a pair the scan deferred is passed by."""
         t = wp.tid()
-        if t >= jobs.threads:
+        if t >= jobs.pair_threads:
             return
-        for entry in range(t, jobs.counts[_LIVE], jobs.threads):
+        for entry in range(t, jobs.counts[_LIVE], jobs.pair_threads):
             i = jobs.live[entry]
             pair = begin + i
             if (out.state[pair] & TERRAIN_PAIR_JOBS) != 0:
@@ -3265,9 +3284,9 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         """Rule R, one closed pair without a row per thread at a time, then its finish or its rule X's items
         (:func:`solid_recover_pair`)."""
         t = wp.tid()
-        if t >= jobs.threads:
+        if t >= jobs.pair_threads:
             return
-        for entry in range(t, jobs.counts[_RECOVER], jobs.threads):
+        for entry in range(t, jobs.counts[_RECOVER], jobs.pair_threads):
             i = jobs.recover[entry]
             pair = begin + i
             solid_recover_pair(
@@ -3345,27 +3364,27 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         jobs: TerrainSolidJobs,
         solids: TerrainSolidData,
     ):
-        """Rule X, one thread per pair of the class (the room of its exit list): a listed pair's deepest exit over its
-        listed candidates (:func:`solid_exit_pair`); a thread past the list's count returns at once."""
+        """Rule X, one pair of the class's exit list per thread at a time (the job threads stride over it): a listed
+        pair's deepest exit over its listed candidates (:func:`solid_exit_pair`)."""
         t = wp.tid()
-        if t >= solids.exit_count[class_]:
+        if t >= jobs.pair_threads:
             return
-        pair = solids.exits[out.deferred_first[class_] + t]
-        i = pair - begin
-        frame = inputs.shape_transform[inputs.pairs[pair][0]]
-        solid_exit_pair(
-            wp.static(load_core)(jobs, i, solids),
-            data,
-            out,
-            jobs,
-            solids,
-            pair,
-            i,
-            slot_begin + i * rows_,
-            rows_,
-            class_,
-            frame,
-        )
+        for entry in range(t, solids.exit_count[class_], jobs.pair_threads):
+            pair = solids.exits[out.deferred_first[class_] + entry]
+            i = pair - begin
+            solid_exit_pair(
+                wp.static(load_core)(jobs, i, solids),
+                data,
+                out,
+                jobs,
+                solids,
+                pair,
+                i,
+                slot_begin + i * rows_,
+                rows_,
+                class_,
+                inputs.shape_transform[inputs.pairs[pair][0]],
+            )
 
     def settle(
         begin: int,
@@ -3376,15 +3395,25 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         jobs: TerrainSolidJobs,
         solids: TerrainSolidData,
     ):
-        """The finish of the pairs left to rule X, one thread per pair of the class (the room of its exit list)
-        (:func:`solid_settle_pair`); a thread past the list's count returns at once."""
+        """The finish of the pairs left to rule X, one pair of the class's exit list per thread at a time (the job threads
+        stride over it, :func:`solid_settle_pair`)."""
         t = wp.tid()
-        if t >= solids.exit_count[class_]:
+        if t >= jobs.pair_threads:
             return
-        pair = solids.exits[out.deferred_first[class_] + t]
-        i = pair - begin
-        frame = inputs.shape_transform[inputs.pairs[pair][0]]
-        solid_settle_pair(data, out, jobs, pair, i, slot_begin + i * rows_, rows_, class_, frame)
+        for entry in range(t, solids.exit_count[class_], jobs.pair_threads):
+            pair = solids.exits[out.deferred_first[class_] + entry]
+            i = pair - begin
+            solid_settle_pair(
+                data,
+                out,
+                jobs,
+                pair,
+                i,
+                slot_begin + i * rows_,
+                rows_,
+                class_,
+                inputs.shape_transform[inputs.pairs[pair][0]],
+            )
 
     def full(
         begin: int,
@@ -3718,7 +3747,8 @@ def terrain_solid_job_capacities(
         total = int(bound.sum())
         default = (int(bound.max()) + -(-total // share)) if len(bound) else 0
         default = max(default, min(total, TERRAIN_SOLID_JOB_FLOOR))
-        capacities[name] = max(1, int(np.ceil(scale * default)))
+        # a list none of the pairs can fill has no room (its kernel is not launched)
+        capacities[name] = max(1, int(np.ceil(scale * default))) if total > 0 else 0
     # a pair's pool entries: up to eight rows (its key's point slots) per listed face, crease and vertex
     total = int(np.sum(48 * v))
     default = (int(np.max(candidates)) if len(v) else 0) + walk_slots * len(v) // TERRAIN_SOLID_CANDIDATE_SHARE
@@ -3787,6 +3817,7 @@ def terrain_solid_jobs(
     longest = max(int(capacities[name]) for name in (*TERRAIN_SOLID_JOB_LISTS, "scans"))
     threads = TERRAIN_SOLID_JOB_THREADS if wp.get_device(device).is_cuda else TERRAIN_SOLID_JOB_THREADS_CPU
     jobs.threads = max(1, min(threads, longest))
+    jobs.pair_threads = max(1, min(jobs.threads, room))
     exits = max(int(capacities["xdescents"]), 1)
     pool = max(int(capacities["candidates"]), 1) + exits
     jobs.q = wp.zeros(pool, dtype=wp.vec3, device=device)

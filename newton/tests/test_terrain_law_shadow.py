@@ -42,6 +42,7 @@ from newton._src.geometry.terrain_law_solid import (
     TERRAIN_SOLID_JOB_LISTS,
     TERRAIN_SOLID_JOB_THREADS_CPU,
     TERRAIN_SOLID_LAUNCHES,
+    TERRAIN_SOLID_LIST_OF_KERNEL,
     TERRAIN_SOLID_SCAN_VERTICES,
     terrain_solid_exit_items,
     terrain_solid_job_capacities,
@@ -745,9 +746,10 @@ class TestTerrainLawShadow(unittest.TestCase):
 
     def test_route_record_of_solid_classes_cpu(self):
         """Record the solid classes' pairs per lane class, launches, data, job scale, kernel grids, job capacities and
-        coreless pairs: one block size, one thread per pair for the whole-pair rejects and the exit kernel, the job
-        threads for the others, the full-finish grid, and job lists and a candidate pool sized from the pairs' own
-        bounds, the scan's jobs exactly."""
+        coreless pairs: one block size, one thread per pair for the whole-pair rejects, the job threads for the others,
+        the full-finish grid, and job lists and a candidate pool sized from the pairs' own bounds, the scan's jobs
+        exactly; no launch of a job kernel whose list none of the class's pairs can fill (rule X's valleys of boxes and
+        hulls)."""
         rng = np.random.default_rng(8)
         heights = np.round(rng.uniform(0.0, 0.05, (17, 17)) / 0.005) * 0.005
         bodies = [
@@ -788,7 +790,6 @@ class TestTerrainLawShadow(unittest.TestCase):
                 # items, valleys and exit kernel, full kernel)
                 count = sum(lanes.values())
                 if count:
-                    launches += len(TERRAIN_SOLID_LAUNCHES)
                     begin = table.segment(partner_class, TERRAIN_LANE_THREAD)[0]
                     end = begin + count
                     candidates = int(table.candidates[begin:end].max())
@@ -803,13 +804,22 @@ class TestTerrainLawShadow(unittest.TestCase):
                     scans = int(np.sum(-(-table.vertices[begin:end].astype(np.int64) // TERRAIN_SOLID_SCAN_VERTICES)))
                     self.assertEqual(capacities["scans"], scans)
                     longest = max(capacities[n] for n in (*TERRAIN_SOLID_JOB_LISTS, "scans"))
+                    skipped = [k for k, n in TERRAIN_SOLID_LIST_OF_KERNEL.items() if capacities[n] == 0]
+                    # rule X's valleys only for a class some of whose pairs take candidates at window vertices
+                    # (cylinders and cones, ellipsoids): never for boxes
+                    self.assertEqual(skipped, ["xvalleys"] if not np.any(takes) else [])
+                    if name == "box":
+                        self.assertEqual(skipped, ["xvalleys"])
+                    launches += len(TERRAIN_SOLID_LAUNCHES) - len(skipped)
                     self.assertEqual(
                         record["launch_shapes"][name],
                         {
                             "block_dim": terrain_law_block_dim("cpu"),
                             "pair_dim": count,
                             "job_threads": min(TERRAIN_SOLID_JOB_THREADS_CPU, longest),
+                            "pair_job_threads": min(TERRAIN_SOLID_JOB_THREADS_CPU, longest, count),
                             "jobs": capacities,
+                            "skipped": skipped,
                             "full_blocks": terrain_finish_blocks(candidates),
                             "full_candidates": candidates,
                             "full_limited": False,

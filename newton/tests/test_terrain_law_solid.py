@@ -1301,6 +1301,7 @@ def _class_jobs(model, shadow, partner_class, *, threads=None, **capacities):
     jobs = terrain_law_solid.terrain_solid_jobs(model.device, partner_class, begin, end - begin, sizes)
     if threads is not None:
         jobs.threads = int(threads)
+        jobs.pair_threads = min(int(threads), end - begin)
     return jobs
 
 
@@ -1375,7 +1376,9 @@ def _run_class(
             inputs = [*args, scratch, solids, jobs]
             wp.launch_tiled(kernel, dim=grid + extra_blocks, inputs=inputs, block_dim=block, device=device)
         else:
-            dim = end - begin if kind == "pairs" else jobs.threads + extra_threads
+            dim = {"pairs": end - begin, "jobs": jobs.threads, "pair_jobs": jobs.pair_threads}[kind]
+            if kind != "pairs":
+                dim += extra_threads
             wp.launch(kernel, dim=dim, inputs=[*args, jobs, solids], block_dim=block, device=device)
     return out, jobs, solids
 
@@ -1930,9 +1933,11 @@ def test_solid_shadow_runs_under_graph_capture(test, device):
 
 def test_solid_launches_take_fixed_grids(test, device):
     """Launch every solid kernel with the dimensions fixed at construction, as the route record holds them: one block
-    size; the whole-pair rejects and the exit kernel one thread per pair of the class; the scan, the job kernels, the
-    close and rule R's kernel the class's job threads, each striding over its list; the full-finish kernel the fixed
-    grid of its scratch.
+    size; the whole-pair rejects one thread per pair of the class; the scan and the job kernels the class's job threads,
+    each striding over its list, but for a job kernel whose list none of the class's pairs can fill (not launched: rule
+    X's valleys of the box class); the close, rule R's kernel and rule X's exit and settle kernels, which stride over
+    lists of the class's pairs, the job threads up to one per pair; the full-finish kernel the fixed grid of its
+    scratch.
 
     Every solid class has pairs here, windows of several scan jobs (a box and an ellipsoid) and a deferring box. The
     live list holds every pair past the whole-pair rejects once.
@@ -1965,11 +1970,20 @@ def test_solid_launches_take_fixed_grids(test, device):
             record = shapes[name]
             test.assertEqual(record["pair_dim"], end - begin)
             test.assertEqual(record["job_threads"], jobs.threads)
+            test.assertEqual(record["pair_job_threads"], min(jobs.threads, end - begin))
+            test.assertEqual(record["skipped"], ["xvalleys"] if partner_class == TERRAIN_PARTNER_BOX else [])
             for kind, kernel_name in TERRAIN_SOLID_LAUNCHES:
-                dim = {"pairs": ("launch", end - begin), "jobs": ("launch", jobs.threads)}.get(kind)
+                key = _kernel(partner_class, kernel_name).key
+                if kernel_name in record["skipped"]:
+                    test.assertNotIn(key, launched)
+                    continue
+                dim = {
+                    "pairs": ("launch", end - begin),
+                    "jobs": ("launch", jobs.threads),
+                    "pair_jobs": ("launch", jobs.pair_threads),
+                }.get(kind)
                 if dim is None:
                     dim = ("tiled", record["full_blocks"])
-                key = _kernel(partner_class, kernel_name).key
                 test.assertEqual(launched[key], [(*dim, block)], msg=key)
             counts = shadow.job_counts()[name]
             live = jobs.live.numpy()[: counts["live"]] + begin
@@ -2057,7 +2071,8 @@ def test_job_overflow_takes_the_full_walk(test, device):
     for name in ("box", "cylinder", "hull"):
         capacities = record["launch_shapes"][name]["jobs"]
         lists = {k: v for k, v in capacities.items() if k != "scans"}
-        test.assertEqual(lists, dict.fromkeys(lists, 1))
+        # one entry each, but rule X's valleys of the box class, which none of its pairs can list (no room, no launch)
+        test.assertEqual(lists, {k: int(name != "box" or k != "xvalleys") for k in lists})
         counts = shadow.job_counts()[name]
         test.assertGreater(counts["faces"], 1)
     test.assertIn("Terrain-law box class: its rule F face job list overflowed", message)
