@@ -39,12 +39,17 @@ times the core's bounding radius in height or distance (area: times a length of 
 score, the first in index order wins, as in the float64 law. Two are ties by construction: a rolling cylinder's two
 cap-rim side points lie at one height, and a lying cylinder's caps face a plane equally."""
 TERRAIN_HULL_FACE_VERTICES = 64
+TERRAIN_HULL_BAND_POINTS = 32
+"""Points of a hull's flat support feature (within the flatness band of its lowest along a crease's normal) that rule
+E's crossing lists to pair them; a feature of more points takes every point's pairs from the whole hull (the same
+pairs, in the same order)."""
 """Vertices of one hull face the plane manifold takes (a larger face is truncated in index order)."""
 
 _FLAT_COS = wp.constant(CYLINDER_FLAT_MODE_COS)
 _TIE = wp.constant(TERRAIN_SOLID_TIE)
 _HUGE = wp.constant(3.0e38)
 _FACE_CAP = wp.constant(TERRAIN_HULL_FACE_VERTICES)
+_BAND_POINTS = wp.constant(TERRAIN_HULL_BAND_POINTS)
 _TRIPOD_S = wp.constant(0.8660254)
 _ALIGN = wp.constant(1.0e-10)
 """Squared length below which a cylinder's or cone's radial direction is degenerate (the axis along the normal)."""
@@ -62,6 +67,7 @@ _ELLIPSOID_STEPS = wp.constant(48)
 _Vec4i = wp.types.vector(length=4, dtype=wp.int32)
 _Mat43 = wp.types.matrix(shape=(4, 3), dtype=wp.float32)
 _FaceList = wp.types.vector(length=TERRAIN_HULL_FACE_VERTICES + 1, dtype=wp.int32)
+_BandPoints = wp.types.vector(length=TERRAIN_HULL_BAND_POINTS, dtype=wp.int32)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1472,6 +1478,25 @@ def core_flat_crossing(
     for i in range(core.point_begin, core.point_begin + core.point_count):
         low = wp.min(low, wp.dot(core.table.points[i], dir_local))
     crossing = _crossing()
+    # The points within the band, in mesh order: the feature's points and segments are theirs alone, so a list of them
+    # takes the pairs below in the same order with one pass over the hull instead of one per point.
+    members = _BandPoints()
+    count = int(0)
+    for i in range(core.point_begin, core.point_begin + core.point_count):
+        if wp.dot(core.table.points[i], dir_local) <= low + band:
+            if count < _BAND_POINTS:
+                members[count] = i
+            count += 1
+    if count <= _BAND_POINTS:
+        for j in range(count):
+            pi = _hull_point(core, members[j])
+            xi = wp.dot(pi - v0, e1)
+            yi = wp.dot(pi - v0, e2)
+            crossing = _cross_point(crossing, xi, yi, pi, tol)
+            for l in range(j + 1, count):
+                pl = _hull_point(core, members[l])
+                crossing = _cross_segment(crossing, xi, yi, pi, wp.dot(pl - v0, e1), wp.dot(pl - v0, e2), pl, tol)
+        return crossing.lo <= crossing.hi, crossing
     for i in range(core.point_begin, core.point_begin + core.point_count):
         if wp.dot(core.table.points[i], dir_local) > low + band:
             continue
