@@ -75,12 +75,18 @@ TERRAIN_PARTNER_ROWS = (8, 16, 16, 24)
 """Rows one pair of each partner class may write (the measured per-pair maxima with headroom)."""
 
 TERRAIN_LANE_THREAD = 0
-"""Lane class of pairs whose largest window holds at most :data:`TERRAIN_LANE_CELLS` cells: one thread per pair."""
+"""Lane class of pairs whose largest window holds at most :data:`TERRAIN_LANE_CELLS` cells: the class's one-thread
+kernel walks them."""
 TERRAIN_LANE_TILE = 1
-"""Lane class of larger windows: :data:`TERRAIN_TILE_LANES` lanes per pair."""
+"""Lane class of larger windows: the class's one-thread kernel takes such a pair through the whole-pair rejects and,
+when it reaches its window, queues it for the class's tiled kernel, a tile of
+:data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK` lanes per pair (a solid class's only when its window, as
+the pose gives it, holds more than :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_THREAD_VERTICES`
+vertices; it walks the others in one thread)."""
 TERRAIN_LANE_CLASSES = 2
 TERRAIN_LANE_CELLS = 16
-TERRAIN_TILE_LANES = 16
+"""Cells of a partner's largest window (:func:`terrain_window_cells`) up to which its pairs are of
+:data:`TERRAIN_LANE_THREAD`."""
 
 _FLAT_EPS = wp.constant(TERRAIN_FLAT_EPS)
 _INT_MAX = wp.constant(2147483647)

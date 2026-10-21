@@ -322,10 +322,13 @@ class TerrainPlanes:
 class TerrainPairInputs:
     """What the law's per-type kernels read of a pair besides the terrain: its shapes and the pipeline's pair policy.
 
-    Every per-type kernel takes ``(begin, slot_begin, inputs, data, out)``, the solid classes' with a sixth argument,
-    their :class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData`: it handles pairs ``begin + i`` of the
-    static pair table (:class:`~newton._src.geometry.terrain_contacts.TerrainPairTable`) and writes pair
-    ``begin + i``'s rows to slots ``slot_begin + i * K``, ``K`` its partner class's row limit.
+    Every per-type kernel takes ``(begin, slot_begin, inputs, data, out)`` and a launch argument (its class's
+    :class:`TerrainPairWork` for the one-thread and tiled kernels, a :class:`TerrainFinishScratch` for the full-finish
+    kernel), a solid class's kernel also the solid classes'
+    :class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData` (see
+    :data:`~newton._src.geometry.terrain_shadow.TERRAIN_LAW_KERNELS`): pair ``begin + i`` of the static pair table
+    (:class:`~newton._src.geometry.terrain_contacts.TerrainPairTable`) writes its rows to slots
+    ``slot_begin + i * K``, ``K`` its partner class's row limit.
     """
 
     pairs: wp.array[wp.vec2i]
