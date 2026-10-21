@@ -67,8 +67,8 @@ The full-finish kernel of a class, ``wp.launch_tiled`` on the fixed grid of its
 :class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`
 (:func:`~newton._src.geometry.terrain_law.terrain_finish_blocks` blocks, each holding every distinct candidate a window
 of the class can give), strides over the class's deferred list: pairs with more distinct rows than their walk slots,
-and solid pairs whose work found no room in a job list or the candidate pool (the job check prints the entries asked
-for against the room).
+and solid pairs whose work found no room in a job list or the candidate pool (they raise the narrow phase's sticky
+``terrain_jobs`` bit, and the job check prints the entries asked for against the room, by list and class).
 
 The kernels apply the pipeline's pair policy: the table holds the pairs its collision filter admits (worlds,
 collision groups, filter pairs, or its explicit pair list), and each kernel drops the pairs its broad phase's
@@ -77,7 +77,11 @@ the heights (an edit reported with ``mark_elevations_changed`` and not yet rebui
 narrow phase's sticky ``terrain_stale`` bit; a pair whose rows the spill region has no room for keeps the first of
 them by priority in its walk slots (each plane group's deepest first) and raises ``terrain_rows`` (the spill check
 prints the rows asked for against the region's), as does a pair whose window outgrew the bound its shape data gave at
-construction; ``NarrowPhase.check_buffer_capacity`` raises on either.
+construction; a solid pair whose work found no room in its class's job lists raises ``terrain_jobs`` (its rows are
+unchanged, the full-finish kernel takes it); ``NarrowPhase.check_buffer_capacity`` raises on each.
+
+A solid class's kernels pass 4.2 to 4.7 KB of launch arguments (its jobs and the solid classes' data by value): CUDA
+launches them on Volta or newer GPUs with a CUDA 12.1 or newer driver (older drivers take at most 4 KB).
 """
 
 from __future__ import annotations
@@ -293,6 +297,9 @@ TERRAIN_LAW_JOB_NAMES = (
 """Names of a solid class's job counters, in order (:meth:`TerrainLawShadow.job_counts`)."""
 
 _JOB_COUNTERS = wp.constant(TERRAIN_LAW_JOB_COUNTERS)
+_JOB_SCANS = wp.constant(TERRAIN_LAW_JOB_NAMES.index("scans"))
+_BOX = wp.constant(TERRAIN_PARTNER_BOX)
+_CYLINDER = wp.constant(TERRAIN_PARTNER_CYLINDER)
 
 _DEFERRED = 0
 """Offset of the per-class deferred-pair counters in the shadow's counters."""
@@ -312,13 +319,48 @@ _COUNTERS = _JOBS + TERRAIN_PARTNER_CLASSES * TERRAIN_LAW_JOB_COUNTERS
 """The shadow's counters, all zeroed by one memset before every launch."""
 
 
+@wp.func
+def _print_solid_class(partner_class: int):
+    """Print a solid class's ``NEWTON_TERRAIN_LAW_SHADOW`` name (no newline)."""
+    if partner_class == _BOX:
+        wp.printf("box")
+    elif partner_class == _CYLINDER:
+        wp.printf("cylinder")
+    else:
+        wp.printf("hull")
+
+
+@wp.func
+def _print_job_list(k: int):
+    """Print the name of a solid class's job counter ``k`` (:data:`TERRAIN_LAW_JOB_NAMES`) that has a room (no
+    newline)."""
+    if k == wp.static(TERRAIN_LAW_JOB_NAMES.index("faces")):
+        wp.printf("rule F face job list")
+    elif k == wp.static(TERRAIN_LAW_JOB_NAMES.index("edges")):
+        wp.printf("rule E edge job list")
+    elif k == wp.static(TERRAIN_LAW_JOB_NAMES.index("thetas")):
+        wp.printf("rule E crease (theta*) job list")
+    elif k == wp.static(TERRAIN_LAW_JOB_NAMES.index("vertices")):
+        wp.printf("rule V vertex job list")
+    elif k == wp.static(TERRAIN_LAW_JOB_NAMES.index("xitems")):
+        wp.printf("rule X item list")
+    elif k == wp.static(TERRAIN_LAW_JOB_NAMES.index("xvalleys")):
+        wp.printf("rule X valley list")
+    elif k == wp.static(TERRAIN_LAW_JOB_NAMES.index("candidates")):
+        wp.printf("candidate pool")
+    else:
+        wp.printf("rule X candidate region")
+
+
 @wp.kernel(enable_backward=False)
 def terrain_law_spill_check(
     counters: wp.array[wp.int32], spilled: int, spill: int, jobs: int, capacities: wp.array[wp.int32]
 ):
     """After a launch: warn when the spill region overflowed, with the spill rows asked for against its rows (the pairs
     that found no room have raised ``terrain_rows``), and when a solid class's job list or candidate pool overflowed,
-    with the entries asked for against its room (the pairs that found none took the full-finish kernel)."""
+    with the entries asked for against its room, by class and list (the pairs that found none took the full-finish
+    kernel, their rows unchanged, and raised ``terrain_jobs``). The scan's runs are sized exactly from the pairs'
+    windows: they overflow only when a window outgrew the bound its shape data gave at construction."""
     if counters[spilled] > spill:
         wp.printf(
             "Warning: Terrain-law spill region overflowed %d > %d. Set NEWTON_TERRAIN_LAW_SHADOW_ROWS to at least the "
@@ -328,14 +370,27 @@ def terrain_law_spill_check(
         )
     for k in range(capacities.shape[0]):
         if capacities[k] > 0 and counters[jobs + k] > capacities[k]:
-            wp.printf(
-                "Warning: Terrain-law job list %d of partner class %d overflowed %d > %d: those pairs took the "
-                "full-finish kernel. Raise NEWTON_TERRAIN_LAW_SHADOW_JOBS (a factor on every job list).\n",
-                k % _JOB_COUNTERS,
-                k // _JOB_COUNTERS,
-                counters[jobs + k],
-                capacities[k],
-            )
+            kind = k % _JOB_COUNTERS
+            wp.printf("Warning: Terrain-law ")
+            _print_solid_class(k // _JOB_COUNTERS)
+            if kind == _JOB_SCANS:
+                wp.printf(
+                    " class: its scan's runs overflowed %d > %d: windows outgrew the bounds their shapes gave when the "
+                    "collision pipeline was built (those pairs took the full-finish kernel). Rebuild the collision "
+                    "pipeline.\n",
+                    counters[jobs + k],
+                    capacities[k],
+                )
+            else:
+                wp.printf(" class: its ")
+                _print_job_list(kind)
+                wp.printf(
+                    " overflowed %d > %d: those pairs took the full-finish kernel (rows unchanged, slower). Raise "
+                    "NEWTON_TERRAIN_LAW_SHADOW_JOBS, a factor on every job list's room, by at least the first number "
+                    "over the second.\n",
+                    counters[jobs + k],
+                    capacities[k],
+                )
 
 
 def parse_terrain_law_shadow_rows(value: str | None) -> int | None:
@@ -680,13 +735,15 @@ class TerrainLawShadow:
             "feature": feature,
         }
 
-    def overflow_counts(self) -> tuple[int, int]:
-        """Return the pairs whose rows found no room in the spill region and whose windows outgrew their full-finish
-        scratch, summed over every launch so far."""
+    def overflow_counts(self) -> tuple[int, int, int]:
+        """Return the pairs whose rows found no room in the spill region (``terrain_rows``), whose windows outgrew their
+        full-finish scratch (``terrain_rows``) and whose work found no room in their solid class's job lists or
+        candidate pool (``terrain_jobs``: the full-finish kernel took them, their rows unchanged), summed over every
+        launch so far."""
         if self.device.is_capturing:
             raise RuntimeError("Terrain-law shadow counters must be read outside graph capture")
-        rows, candidates = (int(v) for v in self._out.overflow.numpy())
-        return rows, candidates
+        rows, candidates, jobs = (int(v) for v in self._out.overflow.numpy())
+        return rows, candidates, jobs
 
     def exit_work(self) -> tuple[int, int]:
         """Return rule X's exit searches of the last launch and the window vertices they covered (0 without a solid

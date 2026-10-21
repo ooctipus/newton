@@ -47,12 +47,15 @@ from newton._src.geometry.terrain_law_solid import (
     terrain_solid_job_capacities,
 )
 from newton._src.geometry.terrain_shadow import (
+    TERRAIN_LAW_JOB_COUNTERS,
+    TERRAIN_LAW_JOB_NAMES,
     TERRAIN_LAW_KERNELS,
     TERRAIN_LAW_SPILL_SHARE,
     TerrainLawShadow,
     parse_terrain_law_shadow,
     parse_terrain_law_shadow_jobs,
     parse_terrain_law_shadow_rows,
+    terrain_law_spill_check,
 )
 from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_solid_utils as su
@@ -273,7 +276,7 @@ def test_long_capsule_keeps_every_support(test, device):
     test.assertEqual(int(rows["state"][0]), 0)
     test.assertEqual(shadow.rows_spilled(), len(unlimited))
     test.assertFalse(any(pipeline.narrow_phase.buffer_capacity_status().values()))
-    test.assertEqual(shadow.overflow_counts(), (0, 0))
+    test.assertEqual(shadow.overflow_counts(), (0, 0, 0))
     _assert_law_rows(test, unlimited, tu.shadow_rows(pipeline)[shapes[0]], "capsule")
 
 
@@ -529,6 +532,47 @@ class TestTerrainLawShadow(unittest.TestCase):
             with self.subTest(job_scale=value), self.assertRaisesRegex(ValueError, "positive finite factor"):
                 TerrainLawShadow(model, (TERRAIN_PARTNER_BOX,), job_scale=value)
 
+    def test_job_check_names_lists_and_classes_cpu(self):
+        """Warn of a solid class's job list without room by the class's and the list's names, with the entries asked
+        for against the room and the factor to raise, and of the scan's runs by the window bound they hold (a pipeline
+        to rebuild); stay silent within the room."""
+        jobs = 4
+        overflowing = {
+            (TERRAIN_PARTNER_BOX, "faces"): (9, 5),
+            (TERRAIN_PARTNER_CYLINDER, "candidates"): (70, 64),
+            (TERRAIN_PARTNER_CYLINDER, "xdescents"): (3, 2),
+            (TERRAIN_PARTNER_HULL, "scans"): (12, 11),
+        }
+        capacities = np.zeros(4 * TERRAIN_LAW_JOB_COUNTERS, np.int32)
+        counters = np.zeros(jobs + len(capacities), np.int32)
+        for (partner_class, name), (asked, room) in overflowing.items():
+            k = partner_class * TERRAIN_LAW_JOB_COUNTERS + TERRAIN_LAW_JOB_NAMES.index(name)
+            capacities[k], counters[jobs + k] = room, asked
+        # within the room: no warning
+        k = TERRAIN_PARTNER_HULL * TERRAIN_LAW_JOB_COUNTERS + TERRAIN_LAW_JOB_NAMES.index("edges")
+        capacities[k], counters[jobs + k] = 8, 8
+        capture = StdOutCapture()
+        capture.begin()
+        try:
+            wp.launch(
+                terrain_law_spill_check,
+                dim=1,
+                inputs=[wp.array(counters, dtype=wp.int32), 0, 1, jobs, wp.array(capacities, dtype=wp.int32)],
+                device="cpu",
+            )
+            wp.synchronize()
+        finally:
+            message = capture.end()
+        lines = [line for line in message.splitlines() if line.startswith("Warning: Terrain-law")]
+        self.assertEqual(len(lines), len(overflowing), msg=message)
+        self.assertIn("Terrain-law box class: its rule F face job list overflowed 9 > 5", message)
+        self.assertIn("Terrain-law cylinder class: its candidate pool overflowed 70 > 64", message)
+        self.assertIn("Terrain-law cylinder class: its rule X candidate region overflowed 3 > 2", message)
+        self.assertIn("Raise NEWTON_TERRAIN_LAW_SHADOW_JOBS", message)
+        self.assertIn("Terrain-law hull class: its scan's runs overflowed 12 > 11", message)
+        self.assertIn("Rebuild the collision pipeline", message)
+        self.assertNotIn("edge job list", message)
+
     def test_spill_overflow_raises_terrain_rows_cpu(self):
         """Raise ``terrain_rows`` when the spill region, sized at the scene level, has no room for a pair's rows, and
         keep the pair's first rows by priority in its walk slots.
@@ -559,7 +603,7 @@ class TestTerrainLawShadow(unittest.TestCase):
         self.assertLess(int(shadow._out.first.numpy()[shadow._listed[0]]), shadow.slot_count)
         deepest = sorted(law, key=lambda r: r.d)[:TERRAIN_POINT_WALK_SLOTS]
         _assert_law_rows(self, deepest, tu.shadow_rows(pipeline)[shapes[0]], "sphere")
-        self.assertEqual(shadow.overflow_counts(), (1, 0))
+        self.assertEqual(shadow.overflow_counts(), (1, 0, 0))
         self.assertEqual(shadow.rows_spilled(), 9)
         with self.assertRaisesRegex(RuntimeError, "terrain_rows"):
             pipeline.narrow_phase.check_buffer_capacity()
@@ -598,7 +642,7 @@ class TestTerrainLawShadow(unittest.TestCase):
         self.assertEqual(rows["count"].tolist(), [TERRAIN_POINT_WALK_SLOTS, 10])
         self.assertEqual(rows["state"].tolist(), [int(TERRAIN_PAIR_ROW_OVERFLOW), 0])
         self.assertEqual(shadow.rows_spilled(), 22)
-        self.assertEqual(shadow.overflow_counts(), (1, 0))
+        self.assertEqual(shadow.overflow_counts(), (1, 0, 0))
         got = tu.shadow_rows(pipeline)
         _assert_law_rows(self, laws[1], got[shapes[1]], "the capsule that fits")
         self.assertEqual(len(got[shapes[0]]), TERRAIN_POINT_WALK_SLOTS)

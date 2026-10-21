@@ -4338,8 +4338,11 @@ class NarrowPhase:
         or failed reducer insertions. No flag is an estimate of required capacity.
         ``terrain_rows`` (the terrain law's spill region overflowed, see
         ``NEWTON_TERRAIN_LAW_SHADOW_ROWS``, or a pair's window outgrew the bound
-        its shape data gave at construction) and ``terrain_stale`` (terrain
-        features older than the heights were read) are set by the terrain law's
+        its shape data gave at construction), ``terrain_stale`` (terrain
+        features older than the heights were read) and ``terrain_jobs`` (a
+        solid class's job lists or candidate pool had no room for a pair's
+        work, see ``NEWTON_TERRAIN_LAW_SHADOW_JOBS``: the pair's rows are
+        unchanged, taken by a slower path) are set by the terrain law's
         kernels, which today run only in shadow (``NEWTON_TERRAIN_LAW_SHADOW``),
         beside the terrain route.
         """
@@ -4364,6 +4367,7 @@ class NarrowPhase:
             "reduction_hash_insert",
             "terrain_rows",
             "terrain_stale",
+            "terrain_jobs",
         )
         result = {name: bool(mask & (1 << bit)) for bit, name in enumerate(names)}
         if self._heightfield_pair_csr:

@@ -1677,7 +1677,7 @@ def test_long_box_keeps_its_first_rows_without_room(test, device):
     slots = terrain_law_box.TERRAIN_BOX_WALK_SLOTS
     test.assertEqual(int(rows["count"][0]), slots)
     test.assertEqual(int(rows["state"][0]), int(TERRAIN_PAIR_ROW_OVERFLOW))
-    test.assertEqual(shadow.overflow_counts(), (1, 0))
+    test.assertEqual(shadow.overflow_counts(), (1, 0, 0))
     test.assertEqual(shadow.rows_spilled(), 20)
     test.assertTrue(pipeline.narrow_phase.buffer_capacity_status()["terrain_rows"])
     got = tu.shadow_rows(pipeline)[shapes[0]]
@@ -1747,7 +1747,7 @@ def test_wide_box_keeps_every_support(test, device):
     test.assertEqual(len(law), 22)
     test.assertEqual(int(rows["count"][0]), len(law))
     test.assertEqual(int(rows["state"][0]), 0)
-    test.assertEqual(shadow.overflow_counts(), (0, 0))
+    test.assertEqual(shadow.overflow_counts(), (0, 0, 0))
     test.assertFalse(any(pipeline.narrow_phase.buffer_capacity_status().values()))
     missing, extra, _deepest = su.compare_solid_rows(law, tu.shadow_rows(pipeline)[shapes[0]])
     test.assertEqual((missing, extra), ([], []))
@@ -1804,7 +1804,7 @@ def test_window_past_its_bound_is_flagged(test, device):
     test.assertEqual(int(out.deferred_count.numpy()[TERRAIN_PARTNER_BOX]), 1)
     state = int(out.state.numpy()[begin])
     test.assertEqual(state & int(TERRAIN_PAIR_CANDIDATE_OVERFLOW), int(TERRAIN_PAIR_CANDIDATE_OVERFLOW))
-    test.assertEqual(out.overflow.numpy().tolist(), [0, 1])
+    test.assertEqual(out.overflow.numpy().tolist(), [0, 1, 0])
     test.assertNotEqual(int(out.status.numpy()[0]), 0)
     core = ref.make_core("box", dims, pose)
     lo, hi = core.aabb()
@@ -1900,7 +1900,7 @@ def test_solid_shadow_runs_under_graph_capture(test, device):
         for name in ("count", "state", "q", "n", "d", "feature"):
             np.testing.assert_array_equal(replayed[name], expected[name], err_msg=name)
         test.assertEqual(shadow.rows_spilled(), need)
-        test.assertEqual(shadow.overflow_counts(), (0, 0))
+        test.assertEqual(shadow.overflow_counts(), (0, 0, 0))
         test.assertEqual(shadow.job_counts(), counts)
     test.assertFalse(any(pipeline.narrow_phase.buffer_capacity_status().values()))
     # The shadow alone without a memory pool; its replay recomputes rows forgotten after an uncaptured collide.
@@ -2017,7 +2017,7 @@ def test_job_grids_take_each_entry_once(test, device):
     # Not vacuous: more pairs are deferred than the grid has blocks, and every deferred pair has more rows than its
     # walk slots (spill rows).
     test.assertEqual(grid["deferred"], len(bodies))
-    test.assertEqual(grid["overflow"], [0, 0])
+    test.assertEqual(grid["overflow"], [0, 0, 0])
     count = grid["out"].count.numpy()[begin:end]
     test.assertTrue(np.all(count > rows))
     test.assertEqual(grid["spilled"], int(count.sum()))
@@ -2029,14 +2029,15 @@ def test_job_grids_take_each_entry_once(test, device):
 
 def test_job_overflow_takes_the_full_walk(test, device):
     """Keep every pair's rows, bit for bit, when its class's job lists, candidate pool or scan jobs have no room for its
-    work, and warn with the entries asked for.
+    work, count those pairs, raise ``terrain_jobs`` and warn with the entries asked for, by class and list.
 
     ``NEWTON_TERRAIN_LAW_SHADOW_JOBS`` scales the solid classes' job lists and candidate pools, sized at the scene level
     from the pairs' own bounds: at 1e-6 each holds one entry. A pair whose work finds no room is left to its class's
-    full-finish kernel, which walks it again; the job check prints the entries asked for against the room, and no
-    capacity flag is raised (no row is lost). The scan's jobs, sized from every pair's bound on its window, lack room
-    only for a window its shape data no longer bounds: with room for one, the other pairs are deferred from the
-    whole-pair rejects on, before their scan.
+    full-finish kernel, which walks it again; it is counted (the shadow's third overflow count) and raises the narrow
+    phase's sticky ``terrain_jobs`` bit, which the capacity check raises on, as ``rigid_contact_max`` does for
+    contacts, though no row is lost; the job check prints the entries asked for against the room. The scan's jobs,
+    sized from every pair's bound on its window, lack room only for a window its shape data no longer bounds: with room
+    for one, the other pairs are deferred from the whole-pair rejects on, before their scan.
     """
     model, _hfield, _shapes = _capture_scene(device)
     pipeline, _contacts, _state = _collide(model, shadow=True)
@@ -2059,14 +2060,24 @@ def test_job_overflow_takes_the_full_walk(test, device):
         test.assertEqual(lists, dict.fromkeys(lists, 1))
         counts = shadow.job_counts()[name]
         test.assertGreater(counts["faces"], 1)
-    test.assertIn("Terrain-law job list 0 of partner class 1 overflowed", message)
+    test.assertIn("Terrain-law box class: its rule F face job list overflowed", message)
+    test.assertIn("Terrain-law hull class: its rule E edge job list overflowed", message)
     rows = shadow.rows()
     for name in ("count", "state", "q", "n", "d", "feature"):
         np.testing.assert_array_equal(rows[name], expected[name], err_msg=name)
     test.assertGreater(int(shadow._out.deferred_count.numpy()[TERRAIN_PARTNER_CYLINDER]), 1)
-    # the pairs that lost work are walked again
+    # the pairs that lost work are walked again, counted and flagged
     test.assertGreater(shadow.job_counts()["cylinder"]["walks"], 1)
-    test.assertFalse(any(small.narrow_phase.buffer_capacity_status().values()))
+    rows_lost, candidates_lost, jobs_lost = shadow.overflow_counts()
+    test.assertEqual((rows_lost, candidates_lost), (0, 0))
+    test.assertGreater(jobs_lost, 1)
+    test.assertLessEqual(jobs_lost, sum(int(v) for v in shadow._out.deferred_count.numpy()[1:]))
+    test.assertEqual([k for k, v in small.narrow_phase.buffer_capacity_status().items() if v], ["terrain_jobs"])
+    with test.assertRaisesRegex(RuntimeError, "terrain_jobs"):
+        small.narrow_phase.check_buffer_capacity()
+    # the default lists have room for every pair's work
+    pipeline.narrow_phase.check_buffer_capacity()
+    test.assertEqual(pipeline._terrain_law_shadow.overflow_counts(), (0, 0, 0))
     # room for one scan job
     table = pipeline._terrain_law_shadow.table
     for partner_class in _SOLID_MODULES:

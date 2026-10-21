@@ -137,6 +137,7 @@ from .terrain_law import (
     TERRAIN_PAIR_TILE_EXIT,
     TERRAIN_PAIR_UNSUPPORTED,
     TERRAIN_PAIR_WIDE,
+    TERRAIN_STATUS_JOBS,
     TERRAIN_VERTEX_SPAN,
     TERRAIN_WINDOW_WIDE,
     TerrainFeatureData,
@@ -403,7 +404,8 @@ class TerrainSolidJobs:
     Every list and the pool have fixed capacities (:func:`terrain_solid_jobs`); their counters (``counts``) are zeroed
     before every launch. Entries are appended in any order, and every row carries its place in window order (its key),
     so that a pair's rows depend on the pair alone. A pair whose work finds no room is left to its class's full-finish
-    kernel, which walks it again; rule X's items or valleys without room replay their pair's whole rule X.
+    kernel, which walks it again (rule X's items, valleys or candidates without room: it takes every candidate of the
+    window), and raises the narrow phase's ``terrain_jobs`` (:func:`_jobs_overflowed`).
     """
 
     first: int
@@ -2513,6 +2515,16 @@ def _job_sink(i: int, item: int, eps: float) -> _Sink:
 
 
 @wp.func
+def _jobs_overflowed(out: TerrainLawRows):
+    """Record a pair some of whose work found no room in its class's job lists or candidate pool (it takes the
+    full-finish kernel, its rows unchanged): the narrow phase's sticky ``terrain_jobs`` bit
+    (:data:`~newton._src.geometry.terrain_law.TERRAIN_STATUS_JOBS`) and the side buffer's job overflow counter
+    (``overflow[2]``, accumulated over collides)."""
+    wp.atomic_or(out.status, 0, TERRAIN_STATUS_JOBS)
+    wp.atomic_add(out.overflow, 2, 1)
+
+
+@wp.func
 def _job_lost(out: TerrainLawRows, pair_index: int, lost: int):
     """A job that lost a row (no room in the candidate pool, or for a crease in the list of creases): its pair goes to
     the full-finish kernel (:data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_INCOMPLETE`)."""
@@ -2782,6 +2794,7 @@ def solid_close_jobs(
         # some of its work found no room (its record may be missing: a window past its bound lists no first run), so
         # that the full-finish kernel walks it again
         terrain_defer_pair(out, partner_class, pair_index, state & (TERRAIN_PAIR_WIDE | TERRAIN_PAIR_INCOMPLETE))
+        _jobs_overflowed(out)
         return
     record, window = solid_job_window(data, jobs, i)
     cells = record.cells
@@ -2947,6 +2960,7 @@ def solid_exit_pair(
     class's full-finish kernel, which walks it again and takes every candidate."""
     if jobs.xall[i] != 0:
         terrain_defer_pair(out, partner_class, pair_index, out.state[pair_index] & TERRAIN_PAIR_WIDE)
+        _jobs_overflowed(out)
         return
     # with no listed candidate both passes are no-ops
     if jobs.xhead[i] < 0:
@@ -3671,8 +3685,12 @@ def terrain_solid_job_capacities(
     items over :data:`TERRAIN_SOLID_EXIT_SHARE`; at least the sum of every pair's bound up to
     :data:`TERRAIN_SOLID_JOB_FLOOR` (:data:`TERRAIN_SOLID_POOL_FLOOR` for the pool's rows), so that a scene with few
     pairs never lacks room; each times ``scale``. The scan's runs (``scans``) are exact: every pair's at its largest
-    window (:data:`TERRAIN_SOLID_SCAN_VERTICES` vertices each). Every list and region is a scene-level buffer: a pair
-    whose work finds no room takes its class's full-finish kernel (its rows unchanged).
+    window (:data:`TERRAIN_SOLID_SCAN_VERTICES` vertices each). Every list and region is a scene-level buffer, as
+    ``rigid_contact_max`` sizes contacts: a pair whose work finds no room takes its class's full-finish kernel (its rows
+    unchanged, at a slower path's cost), raises the narrow phase's ``terrain_jobs`` and is counted
+    (:meth:`~newton._src.geometry.terrain_shadow.TerrainLawShadow.overflow_counts`), and the job check prints the
+    entries asked for against the room. The shares are defaults with room to spare on the recorded suite states
+    (16,384 worlds): there the most used list holds 43% of its room, rule X's region 4%.
 
     Args:
         vertices: Per pair, the bound on its window's vertices

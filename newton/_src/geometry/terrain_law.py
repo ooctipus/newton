@@ -54,7 +54,7 @@ give, :class:`TerrainFinishScratch`). A pair's rows live in its walk slots, or w
 sized at the scene level (:class:`TerrainLawRows`). A spill region too small for a collide's rows, or a window larger
 than the one its pair's shape data gave at construction, sets a sticky bit of the narrow phase's buffer status word,
 which ``verify_narrow_phase_buffers`` keeps and ``NarrowPhase.check_buffer_capacity`` raises on (``terrain_rows``;
-stale features: ``terrain_stale``).
+stale features: ``terrain_stale``; a solid class's job lists without room for a pair's work: ``terrain_jobs``).
 """
 
 from __future__ import annotations
@@ -138,6 +138,10 @@ or a pair's window outgrew the bound its shape data gave at construction."""
 TERRAIN_STATUS_STALE = wp.constant(1 << 14)
 """Sticky bit of the narrow phase's buffer status word (``terrain_stale``): terrain features older than the heights
 were read."""
+TERRAIN_STATUS_JOBS = wp.constant(1 << 15)
+"""Sticky bit of the narrow phase's buffer status word (``terrain_jobs``): a solid class's job lists or candidate pool
+(scene-level buffers) had no room for some of a pair's work, so that its full-finish kernel took the pair (its rows
+unchanged, at a slower path's cost)."""
 
 TERRAIN_PAIR_TILE_EXIT = wp.constant(1)
 """Pair state: the core lies above every tile-max block under its window by more than its reach (no row)."""
@@ -391,10 +395,11 @@ class TerrainLawRows:
     state: wp.array[wp.int32]
     """``TERRAIN_PAIR_*`` bits of every pair."""
     status: wp.array[wp.int32]
-    """The narrow phase's sticky buffer status word (``terrain_rows``, ``terrain_stale``)."""
+    """The narrow phase's sticky buffer status word (``terrain_rows``, ``terrain_stale``, ``terrain_jobs``)."""
     overflow: wp.array[wp.int32]
-    """Pairs whose rows found no room in the spill region (``[0]``) and whose windows outgrew their full-finish scratch
-    (``[1]``), accumulated over collides."""
+    """Pairs whose rows found no room in the spill region (``[0]``), whose windows outgrew their full-finish scratch
+    (``[1]``) and whose work found no room in their solid class's job lists or candidate pool (``[2]``), accumulated
+    over collides."""
     deferred: wp.array[wp.int32]
     """Pairs a type's walks left to its full-finish kernel (:data:`TERRAIN_PAIR_FULL`): partner class ``c``'s list
     starts at ``deferred_first[c]`` and holds ``deferred_count[c]`` pairs, appended in any order."""
@@ -579,7 +584,7 @@ def terrain_law_rows(
     out.count = wp.zeros(pairs, dtype=wp.int32, device=device)
     out.state = wp.zeros(pairs, dtype=wp.int32, device=device)
     out.status = status if status is not None else wp.zeros(1, dtype=wp.int32, device=device)
-    out.overflow = wp.zeros(2, dtype=wp.int32, device=device)
+    out.overflow = wp.zeros(3, dtype=wp.int32, device=device)
     out.deferred = wp.zeros(pairs, dtype=wp.int32, device=device)
     out.deferred_first = wp.array(np.asarray(deferred_first, np.int32), dtype=wp.int32, device=device)
     out.deferred_count = (

@@ -315,7 +315,8 @@ NEWTON_FLAGS = declare(
         _COLLIDE,
         "A positive factor on the terrain-law shadow's solid-class job lists and candidate pools, scene-level buffers "
         "sized from the listed pairs' own bounds (default 1); a pair whose work finds no room takes the slower "
-        "full-finish kernel. Read only with NEWTON_TERRAIN_LAW_SHADOW set.",
+        "full-finish kernel (its rows unchanged) and raises the narrow phase's terrain_jobs status. Read only with "
+        "NEWTON_TERRAIN_LAW_SHADOW set.",
     ),
     EnvironmentFlag(
         "NEWTON_TERRAIN_LAW_SHADOW_ROWS",
