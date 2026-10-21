@@ -41,6 +41,7 @@ from newton._src.geometry.terrain_law_point import TERRAIN_POINT_WALK_SLOTS
 from newton._src.geometry.terrain_law_solid import TERRAIN_SOLID_THREAD_VERTICES
 from newton._src.geometry.terrain_shadow import (
     TERRAIN_LAW_KERNELS,
+    TERRAIN_LAW_SPILL_SHARE,
     parse_terrain_law_shadow,
     parse_terrain_law_shadow_rows,
 )
@@ -140,7 +141,7 @@ def test_shadow_keeps_contacts_bitwise(test, device):
 
 
 def test_shadow_runs_under_graph_capture(test, device):
-    """Capture the shadow with the collide in a CUDA graph and replay it to the rows of an uncaptured collide.
+    """Capture the shadow with the collide in a CUDA graph and replay it, twice, to the rows of an uncaptured collide.
 
     The shadow's launches are also captured alone with the device's memory pool off, so that an allocation inside
     them raises instead of becoming a graph allocation node.
@@ -152,6 +153,7 @@ def test_shadow_runs_under_graph_capture(test, device):
     contacts = pipeline.contacts()
     pipeline.collide(state, contacts)
     expected = shadow.rows()
+    spilled = shadow.rows_spilled()
     # Move the bodies, so that the replay must recompute the rows.
     moved = model.state()
     q = moved.body_q.numpy()
@@ -161,10 +163,12 @@ def test_shadow_runs_under_graph_capture(test, device):
     test.assertEqual(int(shadow.rows()["count"].sum()), 0)
     with scoped_capture_after_gc(device=device) as capture:
         pipeline.collide(state, contacts)
-    wp.capture_launch(capture.graph)
-    replayed = shadow.rows()
-    for name in ("count", "state", "q", "n", "d", "feature"):
-        np.testing.assert_array_equal(replayed[name], expected[name], err_msg=name)
+    for _replay in range(2):
+        wp.capture_launch(capture.graph)
+        replayed = shadow.rows()
+        for name in ("count", "state", "q", "n", "d", "feature"):
+            np.testing.assert_array_equal(replayed[name], expected[name], err_msg=name)
+        test.assertEqual(shadow.rows_spilled(), spilled)
     # The shadow alone without a memory pool; its replay recomputes rows forgotten after an uncaptured collide.
     pooled = wp.is_mempool_enabled(device)
     wp.set_mempool_enabled(device, False)
@@ -502,11 +506,14 @@ class TestTerrainLawShadow(unittest.TestCase):
             tu.shadow_pipeline(model, **PIPELINE)
 
     def test_spill_overflow_raises_terrain_rows_cpu(self):
-        """Raise ``terrain_rows`` when the spill region, sized at the scene level, has no room for a pair's rows.
+        """Raise ``terrain_rows`` when the spill region, sized at the scene level, has no room for a pair's rows, and
+        keep the pair's first rows by priority in its walk slots.
 
         The captured sphere's nine rows exceed its walk slots: with ``NEWTON_TERRAIN_LAW_SHADOW_ROWS=8`` the spill region
-        is one row short, the pair gets no row and a ``TERRAIN_PAIR_ROW_OVERFLOW`` state, the check warns with the rows asked
-        for against the region's, and the capacity check raises; with 9 the rows fit.
+        is one row short, the pair keeps eight of its rows (every plane group's deepest first, the law's eight deepest
+        here, every row its own plane) in its walk slots with a ``TERRAIN_PAIR_ROW_OVERFLOW`` state, the check warns
+        with the rows asked for against the region's, and the capacity check raises; with 9 the rows fit. (Before, the
+        pair kept no row.)
         """
         model, shapes, law = _captured_sphere("cpu")
         with patch.dict(os.environ, {"NEWTON_TERRAIN_LAW_SHADOW_ROWS": "8"}):
@@ -523,8 +530,11 @@ class TestTerrainLawShadow(unittest.TestCase):
         finally:
             message = capture.end()
         self.assertIn("Terrain-law spill region overflowed 9 > 8", message)
-        self.assertEqual(int(rows["count"][0]), 0)
+        self.assertEqual(int(rows["count"][0]), TERRAIN_POINT_WALK_SLOTS)
         self.assertEqual(int(rows["state"][0]), int(TERRAIN_PAIR_ROW_OVERFLOW))
+        self.assertLess(int(shadow._out.first.numpy()[shadow._listed[0]]), shadow.slot_count)
+        deepest = sorted(law, key=lambda r: r.d)[:TERRAIN_POINT_WALK_SLOTS]
+        _assert_law_rows(self, deepest, tu.shadow_rows(pipeline)[shapes[0]], "sphere")
         self.assertEqual(shadow.overflow_counts(), (1, 0))
         self.assertEqual(shadow.rows_spilled(), 9)
         with self.assertRaisesRegex(RuntimeError, "terrain_rows"):
@@ -534,6 +544,41 @@ class TestTerrainLawShadow(unittest.TestCase):
         _contacts(pipeline, model)
         pipeline.narrow_phase.check_buffer_capacity()
         _assert_law_rows(self, law, tu.shadow_rows(pipeline)[shapes[0]], "sphere")
+
+    def test_spill_room_goes_to_pairs_that_fit_cpu(self):
+        """Give a later pair whose rows fit the room an earlier, larger pair found too small for its own.
+
+        Two capsules across ridges defer: the first has 12 rows, the second 10, and the spill region holds 10. The
+        first finds no room (it keeps its eight walk slots' worth, flagged) and reserves nothing, so the second keeps
+        all its rows: whichever asks first, the rows asked for are 22. (Before, the failed reservation took the room
+        too, and the second pair kept no row either.)
+        """
+        rng = np.random.default_rng(2)
+        heights = _corrugated(rng)
+        hf = tu.reference_surface(tu.heightfield_model(heights, 2.0, 2.0, device="cpu"))
+        lying = np.array([0.0, np.sin(np.pi / 4), 0.0, np.cos(np.pi / 4)])
+        bodies, laws = [], []
+        for half_height, y in ((0.8, 0.05), (0.9, 0.35)):
+            dims = {"radius": 0.03, "half_height": half_height}
+            top = max(hf.height(x, y) for x in np.linspace(-0.95, 0.95, 400))
+            pose = np.array([0.0, y, top + 0.03 + 0.002, *lying], np.float32).astype(np.float64)
+            bodies.append(("capsule", dims, pose))
+            laws.append(ref.pair_rows(hf, ref.make_core("capsule", dims, pose), dims["radius"] + 0.04))
+        self.assertEqual([len(law) for law in laws], [12, 10])
+        model, _terrain, shapes = tu.body_scene(heights, 2.0, 2.0, bodies, device="cpu")
+        with patch.dict(os.environ, {"NEWTON_TERRAIN_LAW_SHADOW_ROWS": "10"}):
+            pipeline = tu.shadow_pipeline(model, **PIPELINE)
+        _contacts(pipeline, model)
+        shadow = pipeline._terrain_law_shadow
+        rows = shadow.rows()
+        self.assertEqual(rows["count"].tolist(), [TERRAIN_POINT_WALK_SLOTS, 10])
+        self.assertEqual(rows["state"].tolist(), [int(TERRAIN_PAIR_ROW_OVERFLOW), 0])
+        self.assertEqual(shadow.rows_spilled(), 22)
+        self.assertEqual(shadow.overflow_counts(), (1, 0))
+        got = tu.shadow_rows(pipeline)
+        _assert_law_rows(self, laws[1], got[shapes[1]], "the capsule that fits")
+        self.assertEqual(len(got[shapes[0]]), TERRAIN_POINT_WALK_SLOTS)
+        self.assertEqual(tu.missing_rows(got[shapes[0]], laws[0], q_tol=1.0e-5, angle_tol=1.0e-3, d_tol=1.0e-5), [])
 
     def test_unset_flag_builds_nothing_cpu(self):
         """Build no terrain features, table or buffer without the flag, and record why in the route record."""
@@ -588,10 +633,11 @@ class TestTerrainLawShadow(unittest.TestCase):
         self.assertEqual(record["pairs"], {"point": lanes})
         self.assertEqual(sum(lanes.values()), 12)
         self.assertEqual(record["slots"], 12 * TERRAIN_POINT_WALK_SLOTS)
-        # The spill region: as many rows as the walk slots, at least the most candidates any one pair can give.
+        # The spill region: from the pairs' own bounds on their rows, the largest and a share of their sum.
         begin = table.segment(TERRAIN_PARTNER_POINT, TERRAIN_LANE_THREAD)[0]
-        candidates = int(table.candidates[begin : begin + 12].max())
-        self.assertEqual(record["spill_rows"], max(12 * TERRAIN_POINT_WALK_SLOTS, candidates))
+        bounds = table.candidates[begin : begin + 12]
+        candidates = int(bounds.max())
+        self.assertEqual(record["spill_rows"], candidates + -(-int(bounds.sum()) // TERRAIN_LAW_SPILL_SHARE))
         # The one-thread kernel over the class, the tiled kernel over its queue when it has a tiled segment, the
         # class's full-finish kernel and the spill check, with the dimensions fixed at construction.
         self.assertEqual(record["launches"], 3 + int(lanes["tiled"] > 0))
@@ -605,6 +651,7 @@ class TestTerrainLawShadow(unittest.TestCase):
                     "exit_dim": 0,
                     "full_blocks": terrain_finish_blocks(candidates),
                     "full_candidates": candidates,
+                    "full_limited": False,
                     "walk_slots": TERRAIN_POINT_WALK_SLOTS,
                 }
             },
@@ -684,6 +731,7 @@ class TestTerrainLawShadow(unittest.TestCase):
                             "exit_dim": sum(lanes.values()),
                             "full_blocks": terrain_finish_blocks(candidates),
                             "full_candidates": candidates,
+                            "full_limited": False,
                             "walk_slots": int(TERRAIN_PARTNER_WALK_SLOTS[partner_class]),
                         },
                     )

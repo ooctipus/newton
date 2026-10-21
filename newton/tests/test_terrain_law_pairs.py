@@ -27,7 +27,9 @@ from newton._src.geometry.terrain_contacts import (
     heightfield_pair_table,
     terrain_window_vertices,
 )
-from newton._src.geometry.terrain_law import TERRAIN_CELL_WIDEN
+from newton._src.geometry.terrain_law import TERRAIN_CELL_WIDEN, TERRAIN_FINISH_MASK_ROWS
+from newton._src.geometry.types import GeoType
+from newton._src.geometry.utils import compute_shape_radius
 from newton.tests import terrain_law_reference as ref
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
@@ -152,7 +154,6 @@ def test_pair_table_from_the_collision_filter(test, device):
             test.assertTrue(np.all(table.lane_class[segment] == lane))
             test.assertTrue(np.all(np.diff(table.world[segment]) >= 0))
             test.assertEqual(end - begin, int(np.sum((table.partner_class == partner) & (table.lane_class == lane))))
-            test.assertTrue(np.all(table.walk_slots[segment] == TERRAIN_PARTNER_WALK_SLOTS[partner]))
     # Every pair's bound on its candidates: its largest window's vertices (21 x 21 at most) times the rows a vertex's
     # features give its partner, and the rows added after the walk.
     for i, b in enumerate(pairs[:, 1]):
@@ -209,12 +210,19 @@ def test_window_bound_holds_for_every_pose(test, device):
 
     The full-finish kernels' scratch holds the candidates such a window can give, so this bound is what makes them
     complete. Random positions (on cell lines and off them, 60 m from the origin of a 200 m grid, where float32 cell
-    coordinates round coarsest) and orientations of every kind, each window taken as the kernels take it: the core's
-    bounds (its axis-aligned box or its ends) widened by the reach.
+    coordinates round coarsest) and orientations of every kind, a convex hull off its shape's origin among them (its
+    radius half its local box's diagonal, the model's), each window taken as the kernels take it: the core's bounds
+    (its axis-aligned box or its ends) widened by the reach. The sampling checks the argument of
+    :func:`~newton._src.geometry.terrain_contacts.terrain_window_vertices`, which holds for every pose: a core lies in
+    a ball of its radius, so its box spans at most twice the radius along each axis.
     """
     rng = np.random.default_rng(5)
     # a 200 m grid of 0.1 m cells: its layout is all a window reads
     hf = SimpleNamespace(hx=100.0, hy=100.0, dx=0.1, dy=0.1, rows=2000, cols=2000)
+    # a hull whose points lie off its shape's origin: its radius is half its local box's diagonal, not centred there
+    blob = rng.normal(size=(24, 3))
+    blob = blob / np.linalg.norm(blob, axis=1, keepdims=True) * np.array([0.09, 0.05, 0.03])
+    blob = (blob + np.array([0.12, -0.07, 0.05])).astype(np.float32).astype(np.float64)
     shapes = (
         ("sphere", {"radius": 0.25}),
         ("capsule", {"radius": 0.12, "half_height": 0.35}),
@@ -222,17 +230,23 @@ def test_window_bound_holds_for_every_pose(test, device):
         ("cylinder", {"radius": 0.0175, "half_height": 0.1979}),
         ("cone", {"radius": 0.07, "half_height": 0.0816}),
         ("ellipsoid", {"semi": (0.12, 0.22, 0.29)}),
+        ("hull", {"verts": blob}),
     )
     reach = 0.04
     for kind, dims in shapes:
-        radius = {
-            "sphere": dims.get("radius", 0.0),
-            "capsule": dims.get("radius", 0.0) + dims.get("half_height", 0.0),
-            "box": float(np.linalg.norm(dims.get("half", (0.0, 0.0, 0.0)))),
-            "cylinder": dims.get("radius", 0.0) + dims.get("half_height", 0.0),
-            "cone": dims.get("radius", 0.0) + dims.get("half_height", 0.0),
-            "ellipsoid": max(dims.get("semi", (0.0,))),
-        }[kind]
+        if kind == "hull":
+            radius = compute_shape_radius(int(GeoType.CONVEX_MESH), (1.0, 1.0, 1.0), SimpleNamespace(vertices=blob))
+            # the points lie off the origin by more than the radius's slack would hide
+            test.assertGreater(float(np.linalg.norm(blob, axis=1).max()), radius)
+        else:
+            radius = {
+                "sphere": dims.get("radius", 0.0),
+                "capsule": dims.get("radius", 0.0) + dims.get("half_height", 0.0),
+                "box": float(np.linalg.norm(dims.get("half", (0.0, 0.0, 0.0)))),
+                "cylinder": dims.get("radius", 0.0) + dims.get("half_height", 0.0),
+                "cone": dims.get("radius", 0.0) + dims.get("half_height", 0.0),
+                "ellipsoid": max(dims.get("semi", (0.0,))),
+            }[kind]
         bound = int(terrain_window_vertices(radius, reach, hf.dx, hf.dy, 2001, 2001))
         side = math.floor(2.0 * (radius + reach) / hf.dx) + 4
         test.assertEqual(bound, side * side)
@@ -262,6 +276,11 @@ def test_window_bound_holds_for_every_pose(test, device):
 
 
 class TestTerrainLawPairs(unittest.TestCase):
+    def test_walk_slots_fit_the_in_place_finish(self):
+        """Give every partner class no more walk slots than the in-place finish of a walk takes (its masks' bits)."""
+        self.assertLessEqual(max(TERRAIN_PARTNER_WALK_SLOTS), TERRAIN_FINISH_MASK_ROWS)
+        self.assertEqual(len(TERRAIN_PARTNER_WALK_SLOTS), TERRAIN_PARTNER_CLASSES)
+
     def test_heightfield_pair_table_explicit_pairs(self):
         """Orient explicit pairs heightfield-first and drop meshes, non-heightfield and two-heightfield pairs."""
         hfield, mesh, sphere, box = (

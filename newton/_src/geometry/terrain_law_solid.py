@@ -91,6 +91,7 @@ from .terrain_law import (
     TERRAIN_FEATURE_RECOVERY,
     TERRAIN_FEATURE_VERTEX,
     TERRAIN_FINISH_CANDIDATE_OVERFLOW,
+    TERRAIN_FINISH_ROW_OVERFLOW,
     TERRAIN_FLAT_EPS,
     TERRAIN_NORMAL_SAME,
     TERRAIN_PAIR_EXIT,
@@ -119,6 +120,7 @@ from .terrain_law import (
     terrain_feature_id,
     terrain_features_current,
     terrain_finish_list,
+    terrain_finish_overflow,
     terrain_finish_slots,
     terrain_finish_state,
     terrain_height,
@@ -1507,7 +1509,9 @@ def solid_close_full(
 ):
     """Finish a deferred pair walked into a full-finish block's scratch (``sink.slot``): add the recovery rows when it
     has none and rule X's exit (its searches counted in ``work``), run the finish on every distinct candidate and write
-    the kept rows (world frame) to its walk slots from ``slot`` when they fit, else to rows of the spill region.
+    the kept rows (world frame) to its walk slots from ``slot`` when they fit, else to rows of the spill region, or,
+    when that has no room left, the first of them by priority to its walk slots (flagged
+    :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_ROW_OVERFLOW`).
 
     The scratch holds every candidate a window of the class can give; a pair with more has a window its shape data no
     longer bounds (changed since construction): it keeps the first in window order and is flagged."""
@@ -1525,19 +1529,24 @@ def solid_close_full(
         scratch.k[s] = scratch.q[s] + scratch.d[s] * scratch.n[s]
     kept = terrain_finish_list(scratch, sink.slot, sink.held, pair.eps)
     if kept > walk_slots:
-        slot = terrain_spill_rows(out, pair_index, kept)
-    if slot >= 0:
-        written = int(0)
-        for i in range(sink.held):
-            s = sink.slot + i
-            if scratch.mark[s] != 0:
-                terrain_store_row(
-                    out, slot + written, scratch.q[s], scratch.n[s], scratch.d[s], scratch.feature[s], window, frame
-                )
-                written += 1
-        out.first[pair_index] = slot
-        out.count[pair_index] = kept
-        out.state[pair_index] = _wide(cells) | terrain_finish_state(flags)
+        first = terrain_spill_rows(out, kept)
+        if first >= 0:
+            slot = first
+        else:
+            # no room left: the finish's first rows by priority, in the pair's own walk slots
+            kept = terrain_finish_overflow(scratch, sink.slot, sink.held, walk_slots)
+            flags = flags | TERRAIN_FINISH_ROW_OVERFLOW
+    written = int(0)
+    for i in range(sink.held):
+        s = sink.slot + i
+        if scratch.mark[s] != 0:
+            terrain_store_row(
+                out, slot + written, scratch.q[s], scratch.n[s], scratch.d[s], scratch.feature[s], window, frame
+            )
+            written += 1
+    out.first[pair_index] = slot
+    out.count[pair_index] = kept
+    out.state[pair_index] = _wide(cells) | terrain_finish_state(flags)
     terrain_report(out.status, out.overflow, flags, True)
 
 

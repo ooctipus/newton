@@ -347,12 +347,14 @@ class TerrainLawRows:
     """The rows the law's per-type kernels write: per pair a static range of walk slots, then one spill region, and
     per pair its first row, row count and state.
 
-    A pair's rows are rows ``first`` to ``first + count``. A pair that walks its window holds its distinct rows in its
-    walk slots (window frame), and when they are its rows, they are rewritten at the front in the world frame. A pair
-    with more rows than its walk slots is finished by its class's full-finish kernel, which writes them to rows of the
-    spill region it reserves (:func:`terrain_spill_rows`): its rows are bounded by its window, not by its slots.
-    Reservations take spill rows in the order the pairs reach them, so a pair's rows depend on the pair alone, their
-    place in the spill region does not.
+    A pair's rows are rows ``first`` to ``first + count``: read them per pair, through ``first`` and ``count``. A pair
+    that walks its window holds its distinct rows in its walk slots (window frame), and when they are its rows, they
+    are rewritten at the front in the world frame. A pair with more rows than its walk slots is finished by its class's
+    full-finish kernel, which writes all of them to rows of the spill region it reserves (:func:`terrain_spill_rows`):
+    its rows are bounded by its window, not by its slots. Reservations take spill rows in the order the pairs reach
+    them (the launch's order, which varies between runs on a GPU), so a pair's rows depend on the pair alone, their
+    place in the spill region does not. A pair that finds no room keeps its finish's first rows by priority in its walk
+    slots and is flagged (:func:`terrain_finish_overflow`).
 
     Rows are in the world frame: ``q`` on the terrain, ``n`` the unit normal from the terrain to the partner and
     ``d = n . (k - q)`` the core distance, so that the partner's core point is ``q + d n``.
@@ -371,8 +373,11 @@ class TerrainLawRows:
     capacity: int
     """Rows in all: the walk slots and the spill region."""
     spilled: wp.array[wp.int32]
-    """Spill rows asked for since the launch began (one entry, zeroed before every launch): past the spill region a
-    pair's rows find no room."""
+    """Spill rows asked for since the launch began (one entry, zeroed before every launch), room found or not: the
+    spill region a launch needs."""
+    reserved: wp.array[wp.int32]
+    """Spill rows reserved since the launch began (one entry, zeroed before every launch), at most the spill region's:
+    a reservation that does not fit takes none, so that a later, smaller one still can."""
     first: wp.array[wp.int32]
     """First row of every pair's rows (-1: none)."""
     count: wp.array[wp.int32]
@@ -536,6 +541,7 @@ def terrain_law_rows(
     *,
     status: wp.array | None = None,
     spilled: wp.array | None = None,
+    reserved: wp.array | None = None,
     deferred_count: wp.array | None = None,
 ) -> TerrainLawRows:
     """Allocate a :class:`TerrainLawRows`: ``slots`` walk slots, a spill region of ``spill`` rows and per-pair arrays
@@ -550,6 +556,8 @@ def terrain_law_rows(
         status: The narrow phase's sticky buffer status word, or ``None`` for one of its own.
         spilled: The one-entry counter of spill rows asked for (zeroed before every launch), or ``None`` for one of its
             own.
+        reserved: The one-entry counter of spill rows reserved (zeroed before every launch), or ``None`` for one of
+            its own.
         deferred_count: The per-class counters of deferred pairs (zeroed before every launch), or ``None`` for its own.
     """
     out = TerrainLawRows()
@@ -562,6 +570,7 @@ def terrain_law_rows(
     out.slots = int(slots)
     out.capacity = int(slots) + int(spill)
     out.spilled = spilled if spilled is not None else wp.zeros(1, dtype=wp.int32, device=device)
+    out.reserved = reserved if reserved is not None else wp.zeros(1, dtype=wp.int32, device=device)
     out.first = wp.full(pairs, -1, dtype=wp.int32, device=device)
     out.count = wp.zeros(pairs, dtype=wp.int32, device=device)
     out.state = wp.zeros(pairs, dtype=wp.int32, device=device)
@@ -1822,21 +1831,50 @@ def terrain_pair_exit(out: TerrainLawRows, pair: int, state: int):
 
 
 @wp.func
-def terrain_spill_rows(out: TerrainLawRows, pair: int, rows: int) -> int:
-    """Reserve ``rows`` consecutive rows of the spill region for a pair whose rows exceed its walk slots, and record
-    them as its own (``out.first``).
+def terrain_spill_rows(out: TerrainLawRows, rows: int) -> int:
+    """Reserve ``rows`` consecutive rows of the spill region for a pair whose rows exceed its walk slots.
 
-    Returns the first reserved row, or -1 when the spill region has no room left: the pair then keeps no row, with
-    state :data:`TERRAIN_PAIR_ROW_OVERFLOW`, and ``terrain_rows`` is raised. Rows are taken in the order the pairs ask,
-    so their place depends on the launch, not their values.
+    Returns the first reserved row, or -1 when the spill region has no room left for them: then nothing is reserved
+    (a compare-and-swap takes the rows only when they fit, so that a later, smaller pair still can), and the caller
+    keeps the pair's first rows in its walk slots (:func:`terrain_finish_overflow`). The rows asked for are counted
+    either way (``out.spilled``: the region a launch needs). Rows are taken in the order the pairs ask, so their
+    place, and which pairs find room when the region is too small, depend on the launch; a pair's rows do not.
     """
-    first = out.slots + wp.atomic_add(out.spilled, 0, rows)
-    if first + rows > out.capacity:
-        terrain_pair_exit(out, pair, TERRAIN_PAIR_ROW_OVERFLOW)
-        terrain_report(out.status, out.overflow, TERRAIN_FINISH_ROW_OVERFLOW, True)
-        return -1
-    out.first[pair] = first
-    return first
+    wp.atomic_add(out.spilled, 0, rows)
+    room = out.capacity - out.slots
+    taken = out.reserved[0]
+    while taken + rows <= room:
+        seen = wp.atomic_cas(out.reserved, 0, taken, taken + rows)
+        if seen == taken:
+            return out.slots + taken
+        taken = seen
+    return -1
+
+
+@wp.func
+def terrain_finish_overflow(scratch: TerrainFinishScratch, base: int, count: int, limit: int) -> int:
+    """Keep at most ``limit`` of a full finish's kept candidates (``scratch.mark`` 1 at the kept ones, on return at
+    the ones still kept), when the spill region has no room for them all: each plane group's deepest row first
+    (rank 0), then each group's farthest, largest-triangle and largest-quadrilateral rows (ranks 1 to 3), the deepest
+    first within a rank, ties to the earlier candidate. Returns the count kept."""
+    taken = int(0)
+    for level in range(_GROUP_ROWS):
+        while taken < limit:
+            pick = int(-1)
+            for i in range(count):
+                if scratch.mark[base + i] == 1 and scratch.rank[base + i] == level:
+                    if pick < 0 or scratch.d[base + i] < scratch.d[base + pick]:
+                        pick = i
+            if pick < 0:
+                break
+            scratch.mark[base + pick] = 2
+            taken += 1
+    for i in range(count):
+        keep = int(0)
+        if scratch.mark[base + i] == 2:
+            keep = 1
+        scratch.mark[base + i] = keep
+    return taken
 
 
 @wp.func

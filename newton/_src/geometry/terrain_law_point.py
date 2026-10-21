@@ -93,6 +93,7 @@ from .terrain_law import (
     TERRAIN_FEATURE_RECOVERY,
     TERRAIN_FEATURE_VERTEX,
     TERRAIN_FINISH_CANDIDATE_OVERFLOW,
+    TERRAIN_FINISH_ROW_OVERFLOW,
     TERRAIN_FLAT_EPS,
     TERRAIN_LAW_BLOCK,
     TERRAIN_PAIR_FILTERED,
@@ -121,6 +122,7 @@ from .terrain_law import (
     terrain_feature_id,
     terrain_features_current,
     terrain_finish_list,
+    terrain_finish_overflow,
     terrain_finish_state,
     terrain_height,
     terrain_hold_candidate,
@@ -1524,28 +1526,33 @@ def _finish_deferred(
             flags = TERRAIN_FINISH_CANDIDATE_OVERFLOW
             count = scratch.capacity
         kept = terrain_finish_list(scratch, base, count, core.eps)
-        # The kept rows in the pair's walk slots when they fit, else in rows of the spill region.
+        # The kept rows in the pair's walk slots when they fit, else in rows of the spill region, else (no room left)
+        # the first of them by priority in its walk slots.
         slot = slot_begin + (pair - begin) * _ROWS
         if kept > _ROWS:
-            slot = terrain_spill_rows(out, pair, kept)
-        if slot >= 0:
-            written = int(0)
-            for i in range(count):
-                if scratch.mark[base + i] != 0:
-                    terrain_store_row(
-                        out,
-                        slot + written,
-                        scratch.q[base + i],
-                        scratch.n[base + i],
-                        scratch.d[base + i],
-                        scratch.feature[base + i],
-                        window,
-                        frame,
-                    )
-                    written += 1
-            out.first[pair] = slot
-            out.count[pair] = kept
-            out.state[pair] = _wide(cells) | terrain_finish_state(flags)
+            first = terrain_spill_rows(out, kept)
+            if first >= 0:
+                slot = first
+            else:
+                kept = terrain_finish_overflow(scratch, base, count, _ROWS)
+                flags = flags | TERRAIN_FINISH_ROW_OVERFLOW
+        written = int(0)
+        for i in range(count):
+            if scratch.mark[base + i] != 0:
+                terrain_store_row(
+                    out,
+                    slot + written,
+                    scratch.q[base + i],
+                    scratch.n[base + i],
+                    scratch.d[base + i],
+                    scratch.feature[base + i],
+                    window,
+                    frame,
+                )
+                written += 1
+        out.first[pair] = slot
+        out.count[pair] = kept
+        out.state[pair] = _wide(cells) | terrain_finish_state(flags)
         terrain_report(out.status, out.overflow, flags, True)
 
 

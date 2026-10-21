@@ -72,13 +72,13 @@ TERRAIN_PARTNER_HULL = 3
 """Partner class of the support-function cores: convex meshes, ellipsoids and barrel cylinders."""
 TERRAIN_PARTNER_CLASSES = 4
 TERRAIN_PARTNER_WALK_SLOTS = (8, 16, 16, 24)
-"""Walk slots of a pair of each partner class in the law's side buffer: its walk holds its distinct rows there and,
-when the finish keeps them as they are (or, for a solid, when they fit), writes its rows there. A pair with more
-distinct rows is finished by its class's full-finish kernel, which holds every candidate its window can give
-(:func:`terrain_pair_candidates`) and writes rows beyond the slots to the side buffer's spill region: the slots bound
-no row, they choose which kernel finishes a pair. Of the recorded suite states' walking pairs (16,384 worlds, warm and
-after a run), the walks finish all but a hull pair with 30 rows; the in-place finish of a walk takes up to 32 rows
-(:data:`~newton._src.geometry.terrain_law.TERRAIN_FINISH_MASK_ROWS`)."""
+"""Walk slots of a pair of each partner class in the law's side buffer, the fast path's layout: its walk holds its
+distinct rows there and, when the finish keeps them as they are (or, for a solid, when they fit), writes its rows
+there. A pair with more distinct rows is finished by its class's full-finish kernel, which holds every candidate its
+window can give (:func:`terrain_pair_candidates`) and writes all its rows to the side buffer's spill region: the slots
+bound no row, they choose which kernel finishes a pair and where its rows go. Of the recorded suite states' walking
+pairs (16,384 worlds, warm and after a run), the walks finish all but a hull pair with 30 rows. Each fits the in-place
+finish of a walk, which takes up to :data:`~newton._src.geometry.terrain_law.TERRAIN_FINISH_MASK_ROWS` rows (32)."""
 TERRAIN_WALK_ROWS_PER_VERTEX = (6, 16, 15)
 """Rows a window vertex's features can give a pair at most: a sphere's centre (its two faces, three edges and itself,
 one row each), a capsule (both ends' six, the axis's four), a solid (its two faces' plane manifolds of four points
@@ -1420,8 +1420,6 @@ class TerrainPairTable:
         """World of every pair (the partner's, or the heightfield's for a global partner), int32 (host)."""
         self.candidates = candidates[order]
         """Bound on every pair's distinct candidates, any pose (:func:`terrain_pair_candidates`), int64 (host)."""
-        self.walk_slots = np.asarray(TERRAIN_PARTNER_WALK_SLOTS, np.int64)[self.partner_class]
-        """Row slots every pair reserves when it walks its window (:data:`TERRAIN_PARTNER_WALK_SLOTS`), int64 (host)."""
         segment = self.partner_class * TERRAIN_LANE_CLASSES + self.lane_class
         segments = TERRAIN_PARTNER_CLASSES * TERRAIN_LANE_CLASSES
         sizes = np.bincount(segment, minlength=segments) if len(segment) else np.zeros(segments, np.int64)

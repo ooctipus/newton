@@ -8,10 +8,11 @@ cylinders and cones; ``hull``: convex hulls and ellipsoids; or ``all``, every cl
 With classes listed, a collision pipeline builds :class:`TerrainLawShadow` once, at construction: the terrain features
 (:class:`~newton._src.geometry.terrain_contacts.TerrainFeatures`), the static pair table
 (:class:`~newton._src.geometry.terrain_contacts.TerrainPairTable`, from the pipeline's pairs), per listed pair a static
-range of walk slots (:data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_WALK_SLOTS`) and one spill region
-for the rows of pairs that have more (:class:`~newton._src.geometry.terrain_law.TerrainLawRows`), sized at the scene
-level: by default as many rows as the walk slots of every listed pair, and at least the most candidates any one pair can
-give; ``NEWTON_TERRAIN_LAW_SHADOW_ROWS`` sets it. Every collide then launches, after today's terrain route, up to four
+range of walk slots (:data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_WALK_SLOTS`, the fast path's
+layout, which bounds no row) and one spill region for all the rows of pairs that have more
+(:class:`~newton._src.geometry.terrain_law.TerrainLawRows`), sized at the scene level, as ``rigid_contact_max`` sizes
+contacts: by default from the listed pairs' own bounds on their rows (:meth:`TerrainLawShadow.default_spill_rows`);
+``NEWTON_TERRAIN_LAW_SHADOW_ROWS`` sets it. Every collide then launches, after today's terrain route, up to four
 kernels per listed class (the tiled kernel only for a class with a tiled segment, the exit kernel only for a solid
 class) and a check of the spill region, with dimensions fixed at construction (:meth:`TerrainLawShadow.describe`
 records them): no host read, no allocation, no scan, so it runs inside CUDA graph capture.
@@ -22,10 +23,10 @@ The per-type kernels take ``(begin, slot_begin, inputs, data, out)``
 :class:`~newton._src.geometry.terrain_law.TerrainFeatureData`,
 :class:`~newton._src.geometry.terrain_law.TerrainLawRows`) and a launch argument, the solid classes' also their
 :class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData` (hull tables, the one-thread kernels' lane choice
-and rule X's exit lists; built once when a solid class is listed): table pair ``begin + i`` walks its window in its walk slots
-``slot_begin + i * K``, ``K`` its class's walk slots, and writes its rows there, or when they are more, to rows of the
-spill region; its first row, row count and ``TERRAIN_PAIR_*`` state. :data:`TERRAIN_LAW_KERNELS` names the kernels per
-class (a class without an entry has no kernel yet). Every class launches them alike, in blocks of
+and rule X's exit lists; built once when a solid class is listed): table pair ``begin + i`` walks its window in its
+walk slots ``slot_begin + i * K``, ``K`` its class's walk slots, and writes its rows there, or when they are more, to
+rows of the spill region; its first row, row count and ``TERRAIN_PAIR_*`` state. :data:`TERRAIN_LAW_KERNELS` names the
+kernels per class (a class without an entry has no kernel yet). Every class launches them alike, in blocks of
 :func:`~newton._src.geometry.terrain_law.terrain_law_block_dim` threads:
 
 1. The one-thread kernel, one thread per pair of the class (both lane classes: the table keeps them contiguous), with
@@ -49,9 +50,10 @@ The kernels apply the pipeline's pair policy: the table holds the pairs its coll
 collision groups, filter pairs, or its explicit pair list), and each kernel drops the pairs its broad phase's
 immovable-pair test drops (``include_immobile_pairs``, ``include_static_kinematic_pairs``). Features older than
 the heights (an edit reported with ``mark_elevations_changed`` and not yet rebuilt) give no row and raise the
-narrow phase's sticky ``terrain_stale`` bit; a pair whose rows the spill region has no room for gets no row and raises
-``terrain_rows`` (the spill check prints the rows asked for against the region's), as does a pair whose window outgrew
-the bound its shape data gave at construction; ``NarrowPhase.check_buffer_capacity`` raises on either.
+narrow phase's sticky ``terrain_stale`` bit; a pair whose rows the spill region has no room for keeps the first of
+them by priority in its walk slots (each plane group's deepest first) and raises ``terrain_rows`` (the spill check
+prints the rows asked for against the region's), as does a pair whose window outgrew the bound its shape data gave at
+construction; ``NarrowPhase.check_buffer_capacity`` raises on either.
 """
 
 from __future__ import annotations
@@ -76,6 +78,7 @@ from .terrain_contacts import (
 )
 from .terrain_law import (
     TERRAIN_FINISH_ROW_BYTES,
+    TERRAIN_LAW_FULL_BLOCKS,
     TERRAIN_PAIR_CANDIDATE_OVERFLOW,
     TERRAIN_PAIR_FILTERED,
     TERRAIN_PAIR_OUTSIDE,
@@ -164,13 +167,14 @@ A class's module and kernels follow one protocol (the helpers live in :mod:`~new
   beyond that (for the solid kernels: more distinct rows than ``K``) is deferred (``terrain_defer_pair``), and the
   class's full-finish kernel walks it again into its distinct candidates (``terrain_hold_candidate``), runs the finish
   on all of them (``terrain_finish_list``) and writes every row it keeps, in the pair's walk slots when they fit, else
-  in rows of the spill region it reserves (``terrain_spill_rows``; no room: no row, ``terrain_rows``).
+  in rows of the spill region it reserves (``terrain_spill_rows``; no room: the first ``K`` of them by priority in
+  the walk slots, ``terrain_finish_overflow``, state ``TERRAIN_PAIR_ROW_OVERFLOW``, ``terrain_rows``).
 """
 
 TERRAIN_LAW_SOLID_CLASSES = (TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_HULL)
 """Partner classes whose kernels take a seventh argument, the solid classes' data
-(:class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData`: hull tables and the one-thread kernels' lane
-choice), built once when one of them is listed."""
+(:class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData`: hull tables, the one-thread kernels' lane
+choice and rule X's exit lists), built once when one of them is listed."""
 
 TERRAIN_LANE_NAMES = {TERRAIN_LANE_THREAD: "thread", TERRAIN_LANE_TILE: "tiled"}
 """Names of the pair table's lane classes, by id (the table orders a class's pairs by lane class id)."""
@@ -224,13 +228,20 @@ def parse_terrain_law_shadow(value: str | None) -> tuple[int, ...]:
     return tuple(sorted(classes))
 
 
+TERRAIN_LAW_SPILL_SHARE = 256
+"""The default spill region holds the sum of the listed pairs' bounds on their rows over this, beyond the largest
+pair's bound (:meth:`TerrainLawShadow.default_spill_rows`): the worst case of one pair in 256 at once. On the recorded
+suite scenes (16,384 worlds) that is 11 to 25% of the walk slots, while at most one pair spilled (30 rows)."""
+
 _DEFERRED = 0
 """Offset of the per-class deferred-pair counters in the shadow's counters."""
 _QUEUED = TERRAIN_PARTNER_CLASSES
 """Offset of the per-class tiled-queue counters."""
 _SPILLED = 2 * TERRAIN_PARTNER_CLASSES
 """Offset of the spill rows asked for."""
-_EXITS = _SPILLED + 1
+_RESERVED = _SPILLED + 1
+"""Offset of the spill rows reserved."""
+_EXITS = _RESERVED + 1
 """Offset of the per-class counters of the pairs left to rule X's exit kernels."""
 _EXIT_WORK = _EXITS + TERRAIN_PARTNER_CLASSES
 """Offset of rule X's exit searches and the window vertices they covered."""
@@ -288,8 +299,8 @@ class TerrainLawShadow:
         classes: Partner classes to run (:func:`parse_terrain_law_shadow`); each must have a kernel.
         pairs: The collision pipeline's explicit shape pairs, or ``None`` for the model's filter.
         status: The narrow phase's sticky buffer status word, or ``None`` for one of the shadow's own.
-        spill_rows: Rows of the spill region, or ``None`` for as many as the walk slots of every listed pair, and at
-            least the most distinct candidates any one listed pair can give.
+        spill_rows: Rows of the spill region, or ``None`` for :meth:`default_spill_rows` (from the listed pairs'
+            bounds on their rows).
     """
 
     def __init__(self, model, classes, *, pairs=None, status: wp.array | None = None, spill_rows: int | None = None):
@@ -307,8 +318,9 @@ class TerrainLawShadow:
         slot_first = np.full(self.table.pair_count, -1, np.int64)
         slot = 0
         device = self.device
-        # Per class its deferred pairs, per class its queued pairs, the spill rows asked for, per class its pairs left
-        # to rule X, and rule X's exit searches and their window vertices: zeroed by one memset before every launch.
+        # Per class its deferred pairs, per class its queued pairs, the spill rows asked for and reserved, per class its
+        # pairs left to rule X, and rule X's exit searches and their window vertices: zeroed by one memset before every
+        # launch.
         self._counters = wp.zeros(_COUNTERS, dtype=wp.int32, device=device)
         solid_pairs = []
         solid_module = None
@@ -343,6 +355,7 @@ class TerrainLawShadow:
                 "exit_dim": 0,
                 "full_blocks": 0,
                 "full_candidates": 0,
+                "full_limited": False,
                 "walk_slots": walk,
             }
             if end > tiled_begin:
@@ -363,6 +376,9 @@ class TerrainLawShadow:
                 self._launches.append(("full", getattr(module, full_name), scratch.blocks, begin, slot, solid, scratch))
                 shapes["full_blocks"] = scratch.blocks
                 shapes["full_candidates"] = scratch.capacity
+                # A class whose largest pair's window can give many candidates takes fewer blocks, its scratch kept
+                # near TERRAIN_LAW_FULL_SCRATCH_BYTES: the rare deferred path's parallelism, never a row.
+                shapes["full_limited"] = scratch.blocks < TERRAIN_LAW_FULL_BLOCKS
             self._launch_shapes[terrain_law_class_name(partner_class)] = shapes
             slot += walk * (end - begin)
         self.slot_count = slot
@@ -384,6 +400,7 @@ class TerrainLawShadow:
             [self.table.segment(c, 0)[0] for c in range(TERRAIN_PARTNER_CLASSES)],
             status=status,
             spilled=self._counters[_SPILLED : _SPILLED + 1],
+            reserved=self._counters[_RESERVED : _RESERVED + 1],
             deferred_count=self._counters[_DEFERRED : _DEFERRED + TERRAIN_PARTNER_CLASSES],
         )
         self._solids = None
@@ -406,12 +423,17 @@ class TerrainLawShadow:
         """Host time of the construction [s]: features, pair table, kernel modules imported and buffers."""
 
     def default_spill_rows(self) -> int:
-        """Return the spill region's rows by default: as many as the walk slots of every listed pair (a scene overflows
-        it only when its pairs' rows beyond their slots outnumber all its walk slots), and at least the most distinct
-        candidates any one listed pair can give (so that no single pair's rows overflow it)."""
+        """Return the spill region's rows by default, from the listed pairs' own bounds on their rows
+        (:func:`~newton._src.geometry.terrain_contacts.terrain_pair_candidates`, from each pair's shape extent, reach
+        and cells): the largest pair's bound, so that every single pair fits, and
+        :data:`TERRAIN_LAW_SPILL_SHARE` of the sum of every pair's, the rows the scene's pairs could ask for together
+        at most. A pair spills only with more rows than its walk slots; one that finds no room keeps the first of its
+        rows by priority in its walk slots and raises ``terrain_rows``, and the spill check prints the rows the launch
+        asked for, which ``NEWTON_TERRAIN_LAW_SHADOW_ROWS`` sets."""
         if not len(self._listed):
             return 0
-        return max(self.slot_count, int(self.table.candidates[self._listed].max()))
+        bounds = self.table.candidates[self._listed]
+        return int(bounds.max()) + -(-int(bounds.sum()) // TERRAIN_LAW_SPILL_SHARE)
 
     # ---- per collide -------------------------------------------------------------------------------------------
     def launch(
@@ -539,8 +561,11 @@ class TerrainLawShadow:
         one-thread kernel's threads, one per pair of the class), ``tiled_blocks`` (the tiled kernel's grid),
         ``exit_dim`` (a solid class's exit kernel's threads, one per pair of the class) and ``full_blocks`` (the
         full-finish kernel's grid), each 0 for a kernel the class does not launch, ``full_candidates`` (the distinct
-        candidates a full-finish block holds: the most any pair of the class can give) and ``walk_slots`` (a pair's
-        walk slots). ``slots`` and ``spill_rows`` are the side buffer's walk slots and spill rows.
+        candidates a full-finish block holds: the most any pair of the class can give), ``full_limited`` (whether the
+        full-finish grid has fewer than :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_FULL_BLOCKS` blocks: its
+        blocks, each sized for the class's largest pair, would exceed
+        :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_FULL_SCRATCH_BYTES`) and ``walk_slots`` (a pair's walk
+        slots). ``slots`` and ``spill_rows`` are the side buffer's walk slots and spill rows.
         """
         pairs = {}
         for partner_class in range(TERRAIN_PARTNER_CLASSES):

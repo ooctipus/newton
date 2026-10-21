@@ -313,9 +313,9 @@ NEWTON_FLAGS = declare(
         "NEWTON_TERRAIN_LAW_SHADOW_ROWS",
         "diagnostic",
         _COLLIDE,
-        "Rows of the terrain-law shadow's scene-level spill region, for pairs with more rows than their walk slots "
-        "(default: as many as every listed pair's walk slots, and at least the most candidates one pair can give); "
-        "read only with NEWTON_TERRAIN_LAW_SHADOW set.",
+        "Rows of the terrain-law shadow's scene-level spill region, which holds the rows of pairs with more rows than "
+        "their walk slots (default: from the listed pairs' own bounds on their rows); read only with "
+        "NEWTON_TERRAIN_LAW_SHADOW set.",
     ),
     EnvironmentFlag(
         "NEWTON_ASSET_DIR",

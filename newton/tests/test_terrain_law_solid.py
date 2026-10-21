@@ -47,6 +47,7 @@ from newton._src.geometry.terrain_law import (
     TERRAIN_PAIR_CANDIDATE_OVERFLOW,
     TERRAIN_PAIR_FILTERED,
     TERRAIN_PAIR_OUTSIDE,
+    TERRAIN_PAIR_ROW_OVERFLOW,
     TERRAIN_PAIR_STALE,
     TERRAIN_PAIR_TILE_EXIT,
     TERRAIN_PAIR_UNSUPPORTED,
@@ -63,6 +64,7 @@ from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_solid_utils as su
 from newton.tests import terrain_law_test_utils as tu
 from newton.tests.unittest_utils import (
+    StdOutCapture,
     add_function_test,
     get_cuda_test_devices,
     get_test_devices,
@@ -1395,6 +1397,47 @@ def test_long_box_keeps_every_support(test, device):
     test.assertEqual((missing, extra), ([], []))
 
 
+def test_long_box_keeps_its_first_rows_without_room(test, device):
+    """Keep a box's first rows by priority in its walk slots, flagged, when the spill region has no room for all.
+
+    The long box's 20 rows exceed the box class's 16 walk slots, and a spill region of 19 rows cannot hold them: the
+    full finish keeps 16 in the box's own walk slots, every plane group's deepest row first (the deepest first), then
+    the groups' farthest ones, flags a row overflow and raises ``terrain_rows``. (Before, the pair kept no row.)
+    """
+    hf, model, shapes, bodies = _ridge_boxes(device, (0.9, 0.05, 0.02), (0.05,))
+    _kind, dims, pose = bodies[0]
+    capture = StdOutCapture()
+    capture.begin()
+    try:
+        with patch.dict(os.environ, {"NEWTON_TERRAIN_LAW_SHADOW_ROWS": "19"}):
+            pipeline, _contacts, _state = _collide(model, shadow=True)
+        # flush the device's printf before the capture ends
+        wp.synchronize()
+    finally:
+        message = capture.end()
+    test.assertIn("Terrain-law spill region overflowed 20 > 19", message)
+    shadow = pipeline._terrain_law_shadow
+    rows = shadow.rows()
+    law = su.law_rows(hf, "box", dims, pose)
+    test.assertEqual(len(law), 20)
+    slots = terrain_law_box.TERRAIN_BOX_WALK_SLOTS
+    test.assertEqual(int(rows["count"][0]), slots)
+    test.assertEqual(int(rows["state"][0]), int(TERRAIN_PAIR_ROW_OVERFLOW))
+    test.assertEqual(shadow.overflow_counts(), (1, 0))
+    test.assertEqual(shadow.rows_spilled(), 20)
+    test.assertTrue(pipeline.narrow_phase.buffer_capacity_status()["terrain_rows"])
+    got = tu.shadow_rows(pipeline)[shapes[0]]
+    test.assertEqual(tu.missing_rows(got, law, q_tol=1.0e-5, angle_tol=1.0e-3, d_tol=1.0e-5), [])
+    # every plane group of the law keeps its deepest row
+    groups = {}
+    for r in law:
+        key = (*np.round(r.n, 4).tolist(), round(float(r.n @ r.q), 4))
+        groups.setdefault(key, []).append(r)
+    deepest = [min(group, key=lambda r: r.d) for group in groups.values()]
+    test.assertLessEqual(len(deepest), slots)
+    test.assertEqual(tu.missing_rows(deepest, got, q_tol=1.0e-5, angle_tol=1.0e-3, d_tol=1.0e-5), [])
+
+
 def test_deferred_pairs_keep_their_rows_beyond_the_grid(test, device):
     """Finish every deferred pair from its own rows, however many defer: one full-finish block for three boxes.
 
@@ -1539,17 +1582,26 @@ def _capture_scene(device):
 
 
 def test_solid_shadow_runs_under_graph_capture(test, device):
-    """Capture the solid classes' shadow with the collide in a CUDA graph and replay it to an uncaptured collide's rows.
+    """Capture the solid classes' shadow with the collide in a CUDA graph and replay it, again and again, to an
+    uncaptured collide's rows.
 
     Every solid class runs, with both lane classes of the pair table; a box and an ellipsoid whose windows exceed the
     one-thread kernels' 64 vertices go to the tiled kernels (the queue and its count the capture zeroes, the tiles'
-    mark sums), and a long box defers to its class's full kernel, whose grid reads the deferred count. The shadow's launches
-    are also captured alone with the device's memory pool off, so that an allocation inside them raises instead of
-    becoming a graph allocation node.
+    mark sums), pairs reaching below their windows' highest vertices go to the exit kernels (their lists' counts), and
+    a long box defers to its class's full kernel, whose grid reads the deferred count, and spills. The spill region
+    holds exactly the rows the scene asks for, so that a replay that did not zero the spill counters would find no
+    room on its second run. The shadow's launches are also captured alone with the device's memory pool off, so that
+    an allocation inside them raises instead of becoming a graph allocation node.
     """
     model, _hfield, _shapes = _capture_scene(device)
-    pipeline = tu.shadow_pipeline(model, classes="all", **PIPELINE)
+    probe = tu.shadow_pipeline(model, classes="all", **PIPELINE)
+    probe.collide(model.state(), probe.contacts())
+    need = probe._terrain_law_shadow.rows_spilled()
+    test.assertGreater(need, 0)
+    with patch.dict(os.environ, {"NEWTON_TERRAIN_LAW_SHADOW_ROWS": str(need)}):
+        pipeline = tu.shadow_pipeline(model, classes="all", **PIPELINE)
     shadow = pipeline._terrain_law_shadow
+    test.assertEqual(shadow.spill_rows, need)
     table = shadow.table
     for partner_class in (TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_HULL):
         for lane in (TERRAIN_LANE_THREAD, TERRAIN_LANE_TILE):
@@ -1575,10 +1627,14 @@ def test_solid_shadow_runs_under_graph_capture(test, device):
     test.assertEqual(int(shadow.rows()["count"].sum()), 0)
     with scoped_capture_after_gc(device=device) as capture:
         pipeline.collide(state, contacts)
-    wp.capture_launch(capture.graph)
-    replayed = shadow.rows()
-    for name in ("count", "state", "q", "n", "d", "feature"):
-        np.testing.assert_array_equal(replayed[name], expected[name], err_msg=name)
+    for _replay in range(3):
+        wp.capture_launch(capture.graph)
+        replayed = shadow.rows()
+        for name in ("count", "state", "q", "n", "d", "feature"):
+            np.testing.assert_array_equal(replayed[name], expected[name], err_msg=name)
+        test.assertEqual(shadow.rows_spilled(), need)
+        test.assertEqual(shadow.overflow_counts(), (0, 0))
+    test.assertFalse(any(pipeline.narrow_phase.buffer_capacity_status().values()))
     # The shadow alone without a memory pool; its replay recomputes rows forgotten after an uncaptured collide.
     pooled = wp.is_mempool_enabled(device)
     wp.set_mempool_enabled(device, False)
@@ -1897,6 +1953,14 @@ for _name, _func in (
     ("test_shadow_keeps_contacts_bitwise_with_every_class", test_shadow_keeps_contacts_bitwise_with_every_class),
 ):
     add_function_test(TestTerrainLawSolid, _name, _func, devices=devices)
+# The spill check's warning is the expected output; the test captures it itself.
+add_function_test(
+    TestTerrainLawSolid,
+    "test_long_box_keeps_its_first_rows_without_room",
+    test_long_box_keeps_its_first_rows_without_room,
+    devices=devices,
+    check_output=False,
+)
 add_function_test(
     TestTerrainLawSolid,
     "test_solid_shadow_runs_under_graph_capture",

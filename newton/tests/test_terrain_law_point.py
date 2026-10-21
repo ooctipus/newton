@@ -35,6 +35,7 @@ from newton._src.geometry.terrain_law import (
     TERRAIN_FEATURE_FACE,
     TERRAIN_FEATURE_RECOVERY,
     TERRAIN_FINISH_CANDIDATE_OVERFLOW,
+    TERRAIN_FINISH_ROW_OVERFLOW,
     TERRAIN_PAIR_FILTERED,
     TERRAIN_PAIR_OUTSIDE,
     TERRAIN_PAIR_STALE,
@@ -53,6 +54,7 @@ from newton._src.geometry.terrain_law import (
     terrain_face_values,
     terrain_feature_id,
     terrain_finish_list,
+    terrain_finish_overflow,
     terrain_finish_scratch,
     terrain_finish_state,
     terrain_law_block_dim,
@@ -1178,25 +1180,29 @@ def _plain_point_rows_full(
     kept = terrain_finish_list(scratch, base, count, eps)
     slot = slot_begin + (pair - begin) * _PLAIN_ROWS
     if kept > _PLAIN_ROWS:
-        slot = terrain_spill_rows(out, pair, kept)
-    if slot >= 0:
-        written = int(0)
-        for row in range(count):
-            if scratch.mark[base + row] != 0:
-                terrain_store_row(
-                    out,
-                    slot + written,
-                    scratch.q[base + row],
-                    scratch.n[base + row],
-                    scratch.d[base + row],
-                    scratch.feature[base + row],
-                    window,
-                    frame,
-                )
-                written += 1
-        out.first[pair] = slot
-        out.count[pair] = kept
-        out.state[pair] = terrain_law_point._wide(cells) | terrain_finish_state(flags)
+        first = terrain_spill_rows(out, kept)
+        if first >= 0:
+            slot = first
+        else:
+            kept = terrain_finish_overflow(scratch, base, count, _PLAIN_ROWS)
+            flags = flags | TERRAIN_FINISH_ROW_OVERFLOW
+    written = int(0)
+    for row in range(count):
+        if scratch.mark[base + row] != 0:
+            terrain_store_row(
+                out,
+                slot + written,
+                scratch.q[base + row],
+                scratch.n[base + row],
+                scratch.d[base + row],
+                scratch.feature[base + row],
+                window,
+                frame,
+            )
+            written += 1
+    out.first[pair] = slot
+    out.count[pair] = kept
+    out.state[pair] = terrain_law_point._wide(cells) | terrain_finish_state(flags)
     terrain_report(out.status, out.overflow, flags, True)
 
 
