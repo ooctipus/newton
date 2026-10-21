@@ -814,14 +814,23 @@ MARKED_BIT_31 = (
 """Centres of 0.25 m spheres on :func:`_tile_scenes`' rough tile whose rows include one owned by the window vertex of
 index 31: bit 31, the sign bit, of the tiled kernel's first mask word."""
 
+AFTER_EMPTY_WORD = (
+    (0.8946513533592224, -0.5399307012557983, 0.34645599126815796),
+    (0.8948346972465515, 0.07594582438468933, 0.3388945758342743),
+)
+"""Centres of 0.25 m spheres on :func:`_tile_scenes`' rough tile whose window vertices 0-31 yield nothing and whose
+vertex 32 yields: the tiled kernels' first lane skips the empty first mask word onto a marked vertex (2 of 600 random
+placements)."""
+
 
 def _tile_scenes(rng):
     """Scenes whose pairs all take the tiled kernel (windows over 16 cells): ``(name, heights, half extent, bodies)``.
 
     Large spheres and long capsules rest on rough terrain; long capsules lie across ridges of one height, whose ridge
     rows share a plane, so that the finish may drop some of them (the full kernel's pairs); spheres whose rows mark
-    bit 31 of a mask word (:data:`MARKED_BIT_31`); a sphere and a capsule whose windows hold over 256 vertices, which
-    the tiled kernel's first lane walks unmasked.
+    bit 31 of a mask word (:data:`MARKED_BIT_31`) and spheres whose first mask word is empty and whose next word's first
+    vertex yields (:data:`AFTER_EMPTY_WORD`); a sphere and a capsule whose windows hold over 256 vertices, which the
+    tiled kernel's first lane walks unmasked.
     """
     heights = _rough_terrains(rng)["rough"]
     hf = tu.reference_surface(tu.heightfield_model(heights, 1.6, 1.6, device="cpu"))
@@ -852,6 +861,7 @@ def _tile_scenes(rng):
         z = 0.03 + dims["radius"] + rng.uniform(0.0, 0.005)
         lying.append(("capsule", dims, np.array([x, y, z, *q], np.float32).astype(np.float64)))
     marked = [("sphere", {"radius": 0.25}, np.array([*c, 0.0, 0.0, 0.0, 1.0])) for c in MARKED_BIT_31]
+    skipped = [("sphere", {"radius": 0.25}, np.array([*c, 0.0, 0.0, 0.0, 1.0])) for c in AFTER_EMPTY_WORD]
     diagonal = _quat_mul(_axis_angle((0.0, 0.0, 1.0), np.pi / 4.0), LYING)
     wide = [
         ("sphere", {"radius": 0.8}, np.array([0.0, 0.0, hf.height(0.0, 0.0) + 0.81, 0.0, 0.0, 0.0, 1.0])),
@@ -862,6 +872,7 @@ def _tile_scenes(rng):
         ("rough", heights, 1.6, bodies),
         ("ridges", ridges, 2.0, lying),
         ("marked bit 31", heights, 1.6, marked),
+        ("after an empty word", heights, 1.6, skipped),
         ("unmasked", heights, 1.6, wide),
     ]
 
@@ -890,10 +901,12 @@ def test_tiled_kernel_matches_one_thread_kernel(test, device):
 
     Both kernels evaluate the same table segment of tile-lane pairs (:func:`_tile_scenes`), the full kernel after
     them; some pairs go through the full kernel. The tiled kernel takes the pairs the one-thread kernel queues: with
-    a block per pair, and with three blocks that take the queue in turn. On the CPU Warp runs ``wp.launch_tiled`` with
-    one lane per pair (``block_dim`` 1), so the CPU run checks one lane's walk, its masked and unmasked paths, bit 31
-    of a mask word and the blocks' turns; the 32-lane path (the window extent's ``tile_max``, the union of the lanes'
-    mask words by ``tile_sum`` and the lanes' striding) runs on CUDA only, in this test's CUDA variant.
+    a block per pair, and with three blocks that take the queue in turn. The full-finish kernel, which marks and walks
+    a window as the tiled kernel does, also runs on every pair (seven blocks taking them in turn) and gives each walked
+    pair its walk's rows. On the CPU Warp runs ``wp.launch_tiled`` with one lane per pair (``block_dim`` 1), so the CPU
+    run checks one lane's walk, its masked and unmasked paths, bit 31 of a mask word, the skip of an empty mask word
+    onto a marked vertex and the blocks' turns; the 32-lane path (the window extent's ``tile_max``, the union of the
+    lanes' mask words by ``tile_sum`` and the lanes' striding) runs on CUDA only, in this test's CUDA variant.
     """
     deferred = 0
     for name, heights, extent, bodies in _tile_scenes(np.random.default_rng(4)):
@@ -919,11 +932,18 @@ def test_tiled_kernel_matches_one_thread_kernel(test, device):
                     np.testing.assert_array_equal(
                         getattr(one, array).numpy(), getattr(tiled, array).numpy(), err_msg=array
                     )
+            finished = _full_on_every_pair(shadow, model, pipeline, begin, end - begin)
+            _assert_full_rows(test, _host_rows(one), finished, begin, end - begin, name)
             hf = tu.reference_surface(tu.heightfield_model(heights, extent, extent, device="cpu"))
             owners = _owner_vertex_indices(hf, tu.shadow_rows(pipeline), bodies, shapes)
             if name == "marked bit 31":
                 # The scene covers what it is for: a row of every body owned by window vertex 31.
                 test.assertTrue(all(31 in rows for rows, _vertices in owners), msg=owners)
+            elif name == "after an empty word":
+                # Every body's window vertices 0-31 yield nothing and its vertex 32 yields (the kernels' own marks).
+                for shape in shapes:
+                    marks = _window_masks(shadow, model, pipeline, shape)[:, 3]
+                    test.assertTrue(len(marks) <= 256 and not marks[:32].any() and marks[32] != 0, msg=marks)
             elif name == "unmasked":
                 test.assertTrue(all(vertices > 256 and rows for rows, vertices in owners), msg=owners)
     # Both paths finished pairs in the full kernel too.
