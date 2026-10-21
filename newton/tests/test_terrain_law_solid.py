@@ -39,6 +39,7 @@ from newton._src.geometry.terrain_contacts import (
     TERRAIN_PARTNER_CYLINDER,
     TERRAIN_PARTNER_HULL,
     TERRAIN_PARTNER_WALK_SLOTS,
+    TerrainFeatures,
 )
 from newton._src.geometry.terrain_law import (
     TERRAIN_FEATURE_RECOVERY,
@@ -50,15 +51,22 @@ from newton._src.geometry.terrain_law import (
     TERRAIN_PAIR_STALE,
     TERRAIN_PAIR_TILE_EXIT,
     TERRAIN_PAIR_UNSUPPORTED,
+    TerrainFeatureData,
     TerrainFinishScratch,
+    TerrainLawRows,
     TerrainPairInputs,
+    terrain_eps,
     terrain_finish_list,
     terrain_finish_scratch,
     terrain_finish_slots,
     terrain_law_block_dim,
     terrain_law_rows,
+    terrain_planes,
+    terrain_window,
+    terrain_window_point,
 )
-from newton._src.geometry.terrain_law_solid import TERRAIN_SOLID_LAUNCHES
+from newton._src.geometry.terrain_law_cores import TerrainBoxCore, TerrainCylinderCore
+from newton._src.geometry.terrain_law_solid import TERRAIN_SOLID_LAUNCHES, solid_recovery, solid_sink
 from newton._src.geometry.terrain_shadow import TERRAIN_LAW_JOB_NAMES
 from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_solid_utils as su
@@ -984,6 +992,106 @@ def test_recovery_rows_have_distinct_feature_ids(test, device):
     recovery = [f for f in features if (f >> 5) & 3 == int(TERRAIN_FEATURE_RECOVERY)]
     test.assertGreaterEqual(len(recovery), 2)
     test.assertEqual(len(set(features)), len(features), msg=features)
+
+
+@wp.kernel(enable_backward=False)
+def _recovery_rows(
+    data: TerrainFeatureData,
+    boxes: wp.array[TerrainBoxCore],
+    cylinders: wp.array[TerrainCylinderCore],
+    reference: wp.vec2i,
+    out: TerrainLawRows,
+    held: wp.array[int],
+):
+    """Rule R's rows of cores given in the heightfield frame, in the window of reference vertex ``reference``: thread
+    ``i`` takes box ``i``, then the cylinders, its rows held in the eight slots from ``8 i``."""
+    i = wp.tid()
+    window = terrain_window(data, 0, reference[0], reference[1])
+    window.eps = terrain_eps(1.0)
+    planes = terrain_planes()
+    sink = solid_sink(8 * i, 8, window.eps)
+    if i < boxes.shape[0]:
+        box = boxes[i]
+        box.c = terrain_window_point(window, box.c)
+        planes, sink = solid_recovery(box, data, window, planes, sink, out)
+    else:
+        cylinder = cylinders[i - boxes.shape[0]]
+        cylinder.c = terrain_window_point(window, cylinder.c)
+        planes, sink = solid_recovery(cylinder, data, window, planes, sink, out)
+    held[i] = sink.held
+
+
+def test_recovery_picks_follow_depth_then_index(test, device):
+    """Pick rule R's four deepest boundary points in (depth, index) order when their depths tie: the lowest indices
+    first, rank by rank.
+
+    A level box and an upright cylinder buried under flat terrain: the box's four bottom corners and the cylinder's 16
+    bottom rim points lie equally deep, bit for bit in float32. Rule R's one-pass selection keeps the picks of four
+    passes that each take the deepest point not yet taken, the first in index order on ties: the box's corners 0 to 3
+    and the cylinder's rim points 16 to 19 (its bottom cap's first), each row's rank (its feature id's point slot)
+    following the index. A selection that put a later point before equally deep kept ones would pick the cylinder's
+    last four rim points and reverse the ranks.
+    """
+    n = 17
+    model = tu.heightfield_model(np.zeros((n, n)), 0.4, 0.4, device=device)
+    features = TerrainFeatures(model)
+    box = TerrainBoxCore()
+    box.c = wp.vec3(0.013, -0.021, -0.07)
+    box.rot = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    box.h = wp.vec3(0.08, 0.06, 0.04)
+    cylinder = TerrainCylinderCore()
+    cylinder.c = wp.vec3(-0.017, 0.029, -0.06)
+    cylinder.a = wp.vec3(0.0, 0.0, 1.0)
+    cylinder.r = 0.05
+    cylinder.h = 0.04
+    cylinder.cone = 0
+    reference = (4, 4)
+    out = terrain_law_rows(device, 2, 16, 0, [0] * 4)
+    held = wp.zeros(2, dtype=int, device=device)
+    wp.launch(
+        _recovery_rows,
+        dim=2,
+        inputs=[
+            features.data(),
+            wp.array([box], dtype=TerrainBoxCore, device=device),
+            wp.array([cylinder], dtype=TerrainCylinderCore, device=device),
+            wp.vec2i(*reference),
+        ],
+        outputs=[out, held],
+        device=device,
+    )
+    # the window frame's origin: the reference vertex (heights 0)
+    origin = np.array([-0.4 + reference[1] * 0.05, -0.4 + reference[0] * 0.05, 0.0])
+    angles = np.arange(16) * (2.0 * np.pi / 16.0)
+    rim = np.stack([np.cos(angles), np.sin(angles)], axis=1) * cylinder.r
+    corners = np.array([[(-1, 1)[(i >> k) & 1] * box.h[k] for k in range(3)] for i in range(8)])
+    points = {
+        "box": (np.array(box.c) + corners, 0),
+        "cylinder": (
+            np.concatenate([np.array(cylinder.c) + np.c_[rim, np.full(16, s * cylinder.h)] for s in (1, -1)]),
+            1,
+        ),
+    }
+    q, nn, d, feature = (getattr(out, name).numpy() for name in ("q", "n", "d", "feature"))
+    for name, (local, i) in points.items():
+        with test.subTest(core=name):
+            test.assertEqual(int(held.numpy()[i]), 4)
+            rows = slice(8 * i, 8 * i + 4)
+            # the four rows' depths tie, bit for bit
+            test.assertEqual(len(np.unique(d[rows])), 1, msg=d[rows])
+            np.testing.assert_array_equal(nn[rows], np.tile([0.0, 0.0, 1.0], (4, 1)))
+            np.testing.assert_array_equal((feature[rows] >> 5) & 3, int(TERRAIN_FEATURE_RECOVERY))
+            # each row's boundary point (its core point, q + d n) and rank (its point slot)
+            frame = local - origin
+            core = q[rows].astype(np.float64) + d[rows, None].astype(np.float64) * nn[rows]
+            gaps = np.linalg.norm(frame[None, :, :] - core[:, None, :], axis=2)
+            picked = np.argmin(gaps, axis=1).tolist()
+            test.assertLess(float(gaps.min(axis=1).max()), 1.0e-6)
+            ranks = (feature[rows] & 7).tolist()
+            # four passes, each the deepest point not yet taken, the first in index order on ties
+            depth = local[:, 2]
+            expected = sorted(range(len(depth)), key=lambda k: (depth[k], k))[:4]
+            test.assertEqual([picked[ranks.index(rank)] for rank in range(4)], expected)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -2050,6 +2158,7 @@ for _name, _func in (
     ("test_valley_cores_reach_their_depth", test_valley_cores_reach_their_depth),
     ("test_needle_cores_reach_their_depth", test_needle_cores_reach_their_depth),
     ("test_recovery_rows_have_distinct_feature_ids", test_recovery_rows_have_distinct_feature_ids),
+    ("test_recovery_picks_follow_depth_then_index", test_recovery_picks_follow_depth_then_index),
     ("test_solid_rows_match_the_float64_law", test_solid_rows_match_the_float64_law),
     ("test_job_pipeline_rows_are_the_walks", test_job_pipeline_rows_are_the_walks),
     ("test_rule_x_lists_give_the_full_passes", test_rule_x_lists_give_the_full_passes),
