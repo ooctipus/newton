@@ -60,7 +60,7 @@ jobs and the solid classes' :class:`~newton._src.geometry.terrain_law_solid.Terr
 5. Rule X's items (a core point, or a window vertex that can give a candidate), valleys and the listed candidates'
    near-bound descents, the job threads again: they list the candidates whose bounds pass the pair's target; then the
    exit kernel, one thread per pair of the class (its exit list's room), runs rule X's passes over the listed
-   candidates (exact: any other candidate is a no-op in both passes) and finishes the pair.
+   candidates (exact: any other candidate is a no-op in both passes), and the settle kernel finishes the pair.
 6. The full-finish kernel (below).
 
 The full-finish kernel of a class, ``wp.launch_tiled`` on the fixed grid of its
@@ -145,9 +145,10 @@ def _solid_launches(name: str) -> tuple[tuple[str, str], ...]:
         "xvalleys",
         "xdescents",
         "exit",
+        "settle",
         "full",
     )
-    kinds = ("pairs", *("jobs",) * 11, "pairs", "full")
+    kinds = ("pairs", *("jobs",) * 11, "pairs", "pairs", "full")
     return tuple(
         (kind, f"terrain_{name}_rows" if kernel == "rows" else f"terrain_{name}_rows_{kernel}")
         for kind, kernel in zip(kinds, kernels, strict=True)
@@ -174,8 +175,8 @@ The module is imported only when the class is listed. Launch kinds, every one wi
   segment's (the point class's large windows);
 * ``pairs``: one thread per pair of the class, with the class's
   :class:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs` and the solid classes'
-  :class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData` (a solid class's whole-pair rejects and exit
-  kernel);
+  :class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData` (a solid class's whole-pair rejects, exit and
+  settle kernels);
 * ``jobs``: the class's job threads (:attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.threads`), the same
   arguments (a solid class's scan, job, close and rule R kernels, each striding over its list);
 * ``full``: ``wp.launch_tiled`` with :func:`~newton._src.geometry.terrain_law.terrain_finish_blocks` blocks of
@@ -729,10 +730,10 @@ class TerrainLawShadow:
         its blocks, each sized for the class's largest pair, would exceed
         :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_FULL_SCRATCH_BYTES`); for the point class ``thread_dim``
         (the one-thread kernel's threads, one per pair of the class) and ``tiled_blocks`` (the tiled kernel's grid, 0
-        without a tiled segment); for a solid class ``pair_dim`` (its whole-pair rejects' and exit kernel's threads,
-        one per pair of the class), ``job_threads`` (its scan, job, close and rule R kernels' threads) and ``jobs``
-        (the entries of its job lists, its candidate pool and its scan's runs). ``slots`` and ``spill_rows`` are the
-        side buffer's walk slots and spill rows.
+        without a tiled segment); for a solid class ``pair_dim`` (its whole-pair rejects', exit and settle kernels'
+        threads, one per pair of the class), ``job_threads`` (its scan, job, close and rule R kernels' threads) and
+        ``jobs`` (the entries of its job lists, its candidate pool and its scan's runs). ``slots`` and ``spill_rows``
+        are the side buffer's walk slots and spill rows.
         """
         pairs = {}
         for partner_class in range(TERRAIN_PARTNER_CLASSES):

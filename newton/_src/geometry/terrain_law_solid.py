@@ -85,7 +85,8 @@ pairs' features at once instead of one pair's whole window, and no thread walks 
    (:func:`solid_xdescent_job`), so that the exit kernel (:func:`solid_exit_pair`, one thread per pair left to it)
    runs the rule's passes over the listed candidates alone (:func:`solid_exits`, :func:`_exit_listed`) and searches
    their exits: any other candidate is a no-op in both passes, and the rows are the passes' over every candidate. A
-   pair some of whose rule X work found no room is left to the full-finish kernel.
+   pair some of whose rule X work found no room is left to the full-finish kernel. The settle kernel
+   (:func:`solid_settle_pair`) then finishes the pairs left to rule X, apart from the exit searches.
 
 The kernels follow the per-pair output protocol of :mod:`~newton._src.geometry.terrain_law`: a pair with no row is
 recorded by :func:`~newton._src.geometry.terrain_law.terrain_pair_exit`, and rows are held in the pair's own walk slots
@@ -2763,11 +2764,14 @@ def solid_exit_pair(
     frame: wp.transform,
 ):
     """Rule X for a pair its close left to the class's exit kernel, its rows held in its walk slots from ``slot``
-    (``out.count`` of them): the deepest exit over its listed candidates (:func:`solid_exits`), then the finish
-    (:func:`solid_finish`): the rows of a walk that ran rule X itself. A pair some of whose rule X work found no room
-    is left to the class's full-finish kernel, which walks it again and takes every candidate."""
+    (``out.count`` of them): the deepest exit over its listed candidates (:func:`solid_exits`), held with its rows for
+    the settle kernel (:func:`solid_settle_pair`). A pair some of whose rule X work found no room is left to the
+    class's full-finish kernel, which walks it again and takes every candidate."""
     if jobs.xall[i] != 0:
         terrain_defer_pair(out, partner_class, pair_index, out.state[pair_index] & TERRAIN_PAIR_WIDE)
+        return
+    # with no listed candidate both passes are no-ops
+    if jobs.xhead[i] < 0:
         return
     record, window = solid_job_window(data, jobs, i)
     pair = record.pair
@@ -2775,14 +2779,36 @@ def solid_exit_pair(
     sink = solid_sink(slot, walk_slots, pair.eps)
     sink.held = out.count[pair_index]
     sink.raw = sink.held
-    # with no listed candidate both passes are no-ops
-    if jobs.xhead[i] >= 0:
-        listed = _ListedCandidates()
-        listed.row = i
-        planes, sink = solid_exits(
-            core, data, window, planes, pair, sink, out, record.cells, solids.exit_work, jobs, listed
-        )
-    solid_finish(window, pair, sink, out, pair_index, partner_class, frame, record.cells)
+    listed = _ListedCandidates()
+    listed.row = i
+    planes, sink = solid_exits(
+        core, data, window, planes, pair, sink, out, record.cells, solids.exit_work, jobs, listed
+    )
+    out.count[pair_index] = sink.held
+
+
+@wp.func
+def solid_settle_pair(
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+    jobs: TerrainSolidJobs,
+    pair_index: int,
+    i: int,
+    slot: int,
+    walk_slots: int,
+    partner_class: int,
+    frame: wp.transform,
+):
+    """The finish of a pair the exit kernel kept (:func:`solid_exit_pair`; one it left to the full-finish kernel no
+    longer carries :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_EXIT`): its held rows, rule X's included,
+    finished in place (:func:`solid_finish`), the rows of a walk that ran rule X itself."""
+    if (out.state[pair_index] & TERRAIN_PAIR_EXIT) == 0:
+        return
+    record, window = solid_job_window(data, jobs, i)
+    sink = solid_sink(slot, walk_slots, record.pair.eps)
+    sink.held = out.count[pair_index]
+    sink.raw = sink.held
+    solid_finish(window, record.pair, sink, out, pair_index, partner_class, frame, record.cells)
 
 
 @wp.func
@@ -2810,6 +2836,7 @@ TERRAIN_SOLID_LAUNCHES = (
     ("jobs", "xvalleys"),
     ("jobs", "xdescents"),
     ("pairs", "exit"),
+    ("pairs", "settle"),
     ("full", "full"),
 )
 """A solid class's launches in order, by kind and kernel (:func:`solid_kernels`): ``pairs`` one thread per pair of the
@@ -3105,7 +3132,7 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         solids: TerrainSolidData,
     ):
         """Rule X, one thread per pair of the class (the room of its exit list): a listed pair's deepest exit over its
-        listed candidates and its finish (:func:`solid_exit_pair`); a thread past the list's count returns at once."""
+        listed candidates (:func:`solid_exit_pair`); a thread past the list's count returns at once."""
         t = wp.tid()
         if t >= solids.exit_count[class_]:
             return
@@ -3125,6 +3152,25 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
             class_,
             frame,
         )
+
+    def settle(
+        begin: int,
+        slot_begin: int,
+        inputs: TerrainPairInputs,
+        data: TerrainFeatureData,
+        out: TerrainLawRows,
+        jobs: TerrainSolidJobs,
+        solids: TerrainSolidData,
+    ):
+        """The finish of the pairs left to rule X, one thread per pair of the class (the room of its exit list)
+        (:func:`solid_settle_pair`); a thread past the list's count returns at once."""
+        t = wp.tid()
+        if t >= solids.exit_count[class_]:
+            return
+        pair = solids.exits[out.deferred_first[class_] + t]
+        i = pair - begin
+        frame = inputs.shape_transform[inputs.pairs[pair][0]]
+        solid_settle_pair(data, out, jobs, pair, i, slot_begin + i * rows_, rows_, class_, frame)
 
     def full(
         begin: int,
@@ -3181,6 +3227,7 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         ("xvalleys", xvalleys),
         ("xdescents", xdescents),
         ("exit", exit_),
+        ("settle", settle),
         ("full", full),
     ):
         key = f"terrain_{name}_rows" if kernel_name == "rows" else f"terrain_{name}_rows_{kernel_name}"
