@@ -1750,6 +1750,27 @@ def _x_list(
     return 1
 
 
+@wp.struct
+class _EveryCandidate:
+    """Rule X's passes over every candidate of the window (:func:`_exit_candidates`): the full-finish kernel's."""
+
+    low: float
+    """The core's lowest point [m, window frame]."""
+
+
+@wp.struct
+class _ListedCandidates:
+    """Rule X's passes over class pair ``row``'s listed candidates (:func:`_exit_listed`): the exit kernel's, with the
+    first :data:`TERRAIN_SOLID_SORTED` of them in key order (:func:`_keys_after`, one walk of the list), all of them
+    unless ``more``."""
+
+    row: int
+    keys: _Sorted
+    entries: _Sorted
+    count: int
+    more: bool
+
+
 @wp.func
 def _exit_listed(
     data: TerrainFeatureData,
@@ -1759,20 +1780,23 @@ def _exit_listed(
     cells: wp.vec4i,
     best: _Exit,
     jobs: TerrainSolidJobs,
-    row: int,
+    how: _ListedCandidates,
 ) -> tuple[TerrainPlanes, _Exit]:
-    """One pass of rule X over class pair ``row``'s listed candidates (:attr:`TerrainSolidJobs.xhead`) in key order,
-    as :func:`_exit_candidates` takes them: a valley's gate (:func:`_exit_open`) at its first listed candidate, which
-    takes or skips the valley's candidates. A candidate left off the list has a bound no higher than the target, and
-    a valley off it a gate closed at the target and at every later threshold: both are no-ops in either pass, and
-    the state at a listed candidate is the full pass's. The list is taken in chunks of keys sorted in registers
-    (:func:`_keys_after`)."""
+    """One pass of rule X over class pair ``how.row``'s listed candidates (:attr:`TerrainSolidJobs.xhead`) in key
+    order, as :func:`_exit_candidates` takes them: a valley's gate (:func:`_exit_open`) at its first listed candidate,
+    which takes or skips the valley's candidates. A candidate left off the list has a bound no higher than the target,
+    and a valley off it a gate closed at the target and at every later threshold: both are no-ops in either pass, and
+    the state at a listed candidate is the full pass's. Both passes take the first :data:`TERRAIN_SOLID_SORTED` keys
+    the exit kernel sorted in registers (``how``, one walk of the list), all of them unless ``how.more``; a longer
+    list's later keys are taken in chunks of as many (:func:`_keys_after`), one walk of it per chunk."""
+    keys = how.keys
+    entries = how.entries
+    count = how.count
+    more = how.more
     last = int(-1)
     valley = int(-1)
     passing = bool(True)
-    more = bool(True)
-    while more:
-        keys, entries, count, more = _keys_after(jobs.key, jobs.next, jobs.xhead[row], last)
+    while True:
         for j in range(count):
             key = keys[j]
             if key == last:
@@ -1799,22 +1823,10 @@ def _exit_listed(
                 jobs.descent[entry - _pool_rows(jobs)],
                 key,
             )
+        if not more:
+            break
+        keys, entries, count, more = _keys_after(jobs.key, jobs.next, jobs.xhead[how.row], last)
     return planes, best
-
-
-@wp.struct
-class _EveryCandidate:
-    """Rule X's passes over every candidate of the window (:func:`_exit_candidates`): the full-finish kernel's."""
-
-    low: float
-    """The core's lowest point [m, window frame]."""
-
-
-@wp.struct
-class _ListedCandidates:
-    """Rule X's passes over class pair ``row``'s listed candidates (:func:`_exit_listed`): the exit kernel's."""
-
-    row: int
 
 
 @wp.func
@@ -1830,7 +1842,7 @@ def _exit_pass(
     how: _ListedCandidates,
 ) -> tuple[TerrainPlanes, _Exit]:
     """One pass over class pair ``how.row``'s listed candidates (:func:`_exit_listed`)."""
-    return _exit_listed(data, window, planes, pair, cells, best, jobs, how.row)
+    return _exit_listed(data, window, planes, pair, cells, best, jobs, how)
 
 
 @wp.func
@@ -2664,20 +2676,41 @@ def _hold_candidates(
     """Hold class pair ``i``'s candidates in its walk slots from ``slot`` in window order (by key), as the walk offers
     them (:func:`~newton._src.geometry.terrain_law.terrain_hold_row`, at most ``limit``): ``(held, raw)``, its
     distinct rows and its offers. Candidates of one key (a cluster listed twice) are one offer; the list's order (its
-    jobs') never matters. The list is taken in chunks of :data:`TERRAIN_SOLID_SORTED` keys sorted in registers
-    (:func:`_keys_after`), one walk of it per chunk."""
+    jobs') never matters. One walk of the list sorts up to :data:`TERRAIN_SOLID_SORTED` candidates in registers; a
+    longer list is taken in chunks of that many keys (:func:`_keys_after`), one walk of it per chunk."""
+    keys = _Sorted()
+    entries = _Sorted()
+    count = int(0)
+    entry = jobs.head[i]
+    while entry >= 0:
+        if count < _SORTED:
+            key = jobs.key[entry]
+            j = count
+            while j > 0 and keys[j - 1] > key:
+                keys[j] = keys[j - 1]
+                entries[j] = entries[j - 1]
+                j -= 1
+            keys[j] = key
+            entries[j] = entry
+        count += 1
+        entry = jobs.next[entry]
     held = int(0)
     raw = int(0)
     last = int(-1)
-    more = bool(True)
-    while more:
-        keys, entries, count, more = _keys_after(jobs.key, jobs.next, jobs.head[i], last)
+    # past the registers, the first walk's keys are the list's first ones, not its smallest: take it in chunks
+    more = count > _SORTED
+    if more:
+        count = 0
+    while True:
         for j in range(count):
             if keys[j] == last:
                 continue
             last = keys[j]
             raw += 1
             held = _hold_candidate(out, jobs, entries[j], slot, held, eps, limit)
+        if not more:
+            break
+        keys, entries, count, more = _keys_after(jobs.key, jobs.next, jobs.head[i], last)
     return held, raw
 
 
@@ -2977,6 +3010,12 @@ def solid_exit_pair(
     sink.raw = sink.held
     listed = _ListedCandidates()
     listed.row = i
+    # the listed candidates sorted once for both passes (all of them unless more)
+    keys, entries, count, more = _keys_after(jobs.key, jobs.next, jobs.xhead[i], -1)
+    listed.keys = keys
+    listed.entries = entries
+    listed.count = count
+    listed.more = more
     planes, sink = solid_exits(
         core, data, window, planes, pair, sink, out, record.cells, solids.exit_work, jobs, listed
     )
