@@ -159,8 +159,10 @@ def implied_by(row, others, *, normal_tol=1.0e-4, plane_tol=5.0e-6, d_tol=5.0e-6
     return value is not None and value <= d + d_tol
 
 
-EXIT_POINT_TOL = 1.0e-3
-"""How far [m] the terrain points of a float32 and a float64 rule X row may lie apart within their common plane."""
+EXIT_POINT_TOL = 1.0e-4
+"""How far [m] the terrain points of a float32 and a float64 rule X row may lie apart within their common plane: a
+flat maximum places the exited point only to the square root of the float32 precision (at most 31 um over Track 1b's
+four generators, 100 seeds each, 60 m out; 0.1 um near the origin)."""
 
 
 def is_exit_row(row) -> bool:
@@ -189,8 +191,8 @@ def compare_solid_rows(law, got, *, frame_tol=1.0e-5, angle_tol=1.0e-3, d_tol=1.
     flat support, its ties decided by rounding) is no difference. Rule X's rows (:func:`is_exit_row`) match on their
     half-space: normal, distance and plane offset as above, their terrain points within :data:`EXIT_POINT_TOL` in the
     plane (they exit the core's deepest point, which a flat maximum places to the square root of the float32
-    precision: about 30 um on a 60 mm rim). Returns ``(missing, extra, deepest)``: unmatched float64 rows, unmatched
-    float32 rows and the difference of the deepest distances (infinite when one side has rows and the other none).
+    precision). Returns ``(missing, extra, deepest)``: unmatched float64 rows, unmatched float32 rows and the
+    difference of the deepest distances (infinite when one side has rows and the other none).
     """
     exits64 = [r for r in law if is_exit_row(r)]
     exits32 = [g for g in got if is_exit_row(g)]

@@ -241,8 +241,8 @@ def test_long_capsule_keeps_every_support(test, device):
 
     A long capsule lies across ridges of different heights: each ridge in reach is a support (its own plane), more
     than the point class's eight walk slots. Its class's full-finish kernel finishes it and writes its rows to the side
-    buffer's spill region; the walk slots bound no row. (1cf34769 kept eight of the ten, each plane's deepest first,
-    and raised ``terrain_rows``.)
+    buffer's spill region; the walk slots bound no row. (With a per-class limit of eight rows the law kept eight of
+    the ten, each plane's deepest first, and raised ``terrain_rows``.)
     """
     rng = np.random.default_rng(2)
     heights = _corrugated(rng)
@@ -287,8 +287,9 @@ CAPTURED_PATCH = (
     )
     * 1.0e-3
 )
-"""Heights [m] of the rough terrain (0.1 m cells) under a 0.25 m sphere whose shadow rows overflowed on the GPU in the
-suite's cassie-rough runs (the overflow probe's capture, at x -35.63, y 19.58 of the recorded terrain)."""
+"""Heights [m] of the rough terrain (0.1 m cells) under a 0.25 m sphere whose shadow rows overflowed a per-class row
+limit on the GPU in a recorded rough-terrain run (an overflow probe's capture, at x -35.63, y 19.58 of the recorded
+terrain)."""
 CAPTURED_CENTRE = (-0.55 + 0.573985, -0.55 + 0.58171, 0.300879)
 """The sphere's centre over :data:`CAPTURED_PATCH` (half extent 0.55 m), 2.5-3.3 cm above its nine supports."""
 
@@ -304,9 +305,9 @@ def _captured_sphere(device):
 def test_sphere_keeps_every_support_over_rough_terrain(test, device):
     """Keep all nine supports of a 0.25 m sphere hovering over rough terrain, as the float64 law gives them.
 
-    The pose the GPU overflow probe captured in the suite's cassie-rough runs: every support a different feature and
-    plane, all within reach, one more than the point class's eight walk slots. (1cf34769 kept eight, flagged a row
-    overflow and raised ``terrain_rows``, which failed every cassie perf run with the shadow on.)
+    A pose a GPU overflow probe captured in a recorded rough-terrain run: every support a different feature and plane,
+    all within reach, one more than the point class's eight walk slots. (With a per-class limit of eight rows the law
+    kept eight, flagged a row overflow and raised ``terrain_rows``, which failed every such run with the shadow on.)
     """
     model, shapes, law = _captured_sphere(device)
     test.assertEqual(len(law), 9)

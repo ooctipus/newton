@@ -11,10 +11,11 @@ two faces and diagonal, its x- and y-edges and itself) and offers the rows of th
   (:func:`~newton._src.geometry.terrain_law_cores.core_manifold`); a manifold point is supported when its footprint
   along the normal lies in a triangle of the cluster and it is front-facing, and the triangle holding the first
   supported point emits every supported point (one emission per plane);
-* E, convex creases: ``theta* = argmax sigma(theta)`` over the crease's normal arc, the float64 law's search: nine
-  equally spaced normals, then a bisection on the sign of the derivative between the best one's neighbours
+* E, convex creases: ``theta* = argmax sigma(theta)`` over the crease's normal arc: nine equally spaced normals, then
+  a bisection on the sign of the derivative between the best one's neighbours
   (:func:`~newton._src.geometry.terrain_law_cores.core_slope`, closed form for boxes and cylinders, the support
-  function for hulls; 22 steps); inside the arc, the core's flat support feature within the band
+  function for hulls; 22 steps; the float64 law brackets the same samples and refines by golden section on
+  ``sigma``); inside the arc, the core's flat support feature within the band
   ``beta = max(0.1 mm, 1e-3 size)``, at an arc end its reference feature (G1); the interval where it meets the
   crease's line emits its ends lifted onto the core (no deeper than the feature's chord over them), ends on vertex
   features left to the vertex;
@@ -488,12 +489,13 @@ def _theta_star(
     """``argmax sigma(n)`` over the crease's normal arc from ``n_a`` to ``n_b`` (less than a half turn): ``(n*,
     sigma(n*), end)`` with ``end`` 1 or 2 at the arc's start or end, 0 inside.
 
-    The float64 law's search, for the same answer where ``sigma`` has several maxima (a core through the crease's
-    sides, ``sigma < 0``, can turn ``sigma`` convex): a scan of nine equally spaced normals, then a bisection on the
-    sign of the derivative between the best one's neighbours (22 steps, the same count for every lane; the lowest
-    support point decides, so a kink is found where two support points cross), then the arc's ends and the
-    best sample where they are higher. Within ``tie`` of the refined maximum (float32 cannot order such values: a
-    maximum within about 1e-3 rad of an end), an end wins where ``sigma`` does not rise from it into the arc.
+    The float64 law's samples and bracket, for the same answer where ``sigma`` has several maxima (a core through the
+    crease's sides, ``sigma < 0``, can turn ``sigma`` convex): a scan of nine equally spaced normals, then a bisection
+    on the sign of the derivative between the best one's neighbours (the float64 law: golden section on ``sigma``;
+    here 22 steps, the same count for every lane; the lowest support point decides, so a kink is found where two
+    support points cross), then the arc's ends and the best sample where they are higher. Within ``tie`` of the
+    refined maximum (float32 cannot order such values: a maximum within about 1e-3 rad of an end), an end wins where
+    ``sigma`` does not rise from it into the arc.
     """
     samples = _arc_samples(n_a, n_b)
     best = int(0)
@@ -1066,10 +1068,11 @@ def _exit_valley(
 
     The search: nine equally spaced normals; each no higher than its neighbours (the first of a run of equal ones)
     refined between them by bisection on the sign of the derivative (rule E's 22 steps), the sample kept where the
-    refinement ends higher (the float64 law's search, :func:`newton.tests.terrain_law_reference._arc_angles`, in
-    float64 and to its precision). Skipped where no core point in the wedge can matter (:func:`_exit_open`): within it
-    a point's distance to the edge is at most its height under the edge's higher end over the arc's smaller normal
-    ``z`` (``low`` is the core's lowest height).
+    refinement ends higher. The float64 law (:func:`newton.tests.terrain_law_reference._arc_angles`) brackets the same
+    samples but refines by golden section on ``sigma`` (60 steps): both find a bracket's minimum when it holds one, and
+    could stop at different ones where ``sigma`` has two within an eighth of the arc of a sample. Skipped where no core
+    point in the wedge can matter (:func:`_exit_open`): within it a point's distance to the edge is at most its height
+    under the edge's higher end over the arc's smaller normal ``z`` (``low`` is the core's lowest height).
     """
     surface = window.surface
     if terrain_edge_kind(data, surface, r, c, which) >= 0:

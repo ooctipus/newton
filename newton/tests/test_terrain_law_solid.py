@@ -860,7 +860,7 @@ def test_buried_solids_follow_the_law(test, device):
 
     The law reaches a pair's depth unless its deepest point is a tie (rule X; DESIGN 1.3 and 8.5). Over 4,000 of each
     (100 seeds) the shadow rows equal the float64 law's in every case, none rowless, and leave short 7 cylinders (by
-    at most 3.4 mm), 14 cones (16 mm) and 6 ellipsoids (16 mm), all ties; at 1cf34769 the law left 32, 106 and 16
+    at most 3.4 mm), 14 cones (16 mm) and 6 ellipsoids (16 mm), all ties; without rule X the law left 32, 106 and 16
     short. Today's route leaves 2,088, 345 and 11 short. The check allows :data:`BURIED_SHORT` of its 120.
     """
     hf, model, _hfield, shapes, bodies = _burial_scene(device)
@@ -896,7 +896,7 @@ def test_valley_cores_reach_their_depth(test, device):
     """Give solids sunk into a valley a row as deep as their deepest point, the float64 law's rows and no ghost.
 
     Each deepest point lies in the wedge below the valley's line and is closest to it (a cylinder's or a cone's rim,
-    a box's corner, a cone's apex, an ellipsoid's support point): no rule but X reaches it. At 1cf34769 their deepest
+    a box's corner, a cone's apex, an ellipsoid's support point): no rule but X reaches it. Without rule X their deepest
     rows were the walls' plane depths of their recovery points (rule R), short by up to 13% of the depth.
     """
     hf, model, _hfield, shapes, bodies = _valley_bodies(device)
@@ -1381,7 +1381,7 @@ def test_long_box_keeps_every_support(test, device):
 
     A long box lies across ridges of different heights (every ridge in reach its own plane group): 20 rows, more than
     the box class's 16 walk slots. Its class's full-finish kernel finishes it and writes them to the spill region.
-    (1cf34769 kept 16, each plane's deepest first, and raised ``terrain_rows``.)
+    (With a per-class limit of 16 rows the law kept 16, each plane's deepest first, and raised ``terrain_rows``.)
     """
     hf, model, shapes, bodies = _ridge_boxes(device, (0.9, 0.05, 0.02), (0.05,))
     _kind, dims, pose = bodies[0]
@@ -1487,7 +1487,8 @@ def test_wide_box_keeps_every_support(test, device):
 
     A wide box across ridges has 48 distinct candidates: its class's full-finish kernel holds them all (its scratch
     holds every candidate a window of the class can give) and keeps the float64 law's 22 rows, raising nothing.
-    (1cf34769 kept the first 32 candidates in window order, kept 16 rows, and flagged a candidate and a row overflow.)
+    (With a list of 32 candidates the law kept the first 32 in window order, then 16 rows, and flagged a candidate and
+    a row overflow.)
     """
     hf, model, shapes, bodies = _ridge_boxes(device, (0.9, 0.15, 0.02), (0.05,))
     _kind, dims, pose = bodies[0]
