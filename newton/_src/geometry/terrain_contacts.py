@@ -71,8 +71,21 @@ TERRAIN_PARTNER_CYLINDER = 2
 TERRAIN_PARTNER_HULL = 3
 """Partner class of the support-function cores: convex meshes, ellipsoids and barrel cylinders."""
 TERRAIN_PARTNER_CLASSES = 4
-TERRAIN_PARTNER_ROWS = (8, 16, 16, 24)
-"""Rows one pair of each partner class may write (the measured per-pair maxima with headroom)."""
+TERRAIN_PARTNER_WALK_SLOTS = (8, 16, 16, 24)
+"""Walk slots of a pair of each partner class in the law's side buffer: its walk holds its distinct rows there and,
+when the finish keeps them as they are (or, for a solid, when they fit), writes its rows there. A pair with more
+distinct rows is finished by its class's full-finish kernel, which holds every candidate its window can give
+(:func:`terrain_pair_candidates`) and writes rows beyond the slots to the side buffer's spill region: the slots bound
+no row, they choose which kernel finishes a pair. Of the recorded suite states' walking pairs (16,384 worlds, warm and
+after a run), the walks finish all but a hull pair with 30 rows; the in-place finish of a walk takes up to 32 rows
+(:data:`~newton._src.geometry.terrain_law.TERRAIN_FINISH_MASK_ROWS`)."""
+TERRAIN_WALK_ROWS_PER_VERTEX = (6, 16, 15)
+"""Rows a window vertex's features can give a pair at most: a sphere's centre (its two faces, three edges and itself,
+one row each), a capsule (both ends' six, the axis's four), a solid (its two faces' plane manifolds of four points
+each, its three edges' interval ends, itself)."""
+TERRAIN_WALK_ROWS_PER_PAIR = (1, 3, 4)
+"""Rows a pair can gain after its walk at most: a sphere's exit, a capsule's two ends' exits and its axis's recovery,
+a solid's four recovery rows."""
 
 TERRAIN_LANE_THREAD = 0
 """Lane class of pairs whose largest window holds at most :data:`TERRAIN_LANE_CELLS` cells: the class's one-thread
@@ -1293,6 +1306,44 @@ def terrain_window_cells(radius, reach, dx, dy) -> np.ndarray:
     return (np.ceil(extent / dx) + 1.0) * (np.ceil(extent / dy) + 1.0)
 
 
+def terrain_window_vertices(radius, reach, dx, dy, nrow, ncol) -> np.ndarray:
+    """Return a bound on the vertices of a pair's window, any pose: its bounding sphere plus reach on the grid.
+
+    A window spans the cells a box of extent ``e = 2 (radius + reach)`` touches, widened by
+    :data:`~newton._src.geometry.terrain_law.TERRAIN_CELL_WIDEN` cells per side and its float32 cell coordinates
+    rounded: at most ``floor(e / dx) + 3`` cells along x (``ceil(e / dx + 0.003) + 1``), so at most
+    ``floor(e / dx) + 4`` vertex columns, and no more than the heightfield's. Takes scalars or arrays of equal shape
+    [m]; computes in float64.
+    """
+    extent = 2.0 * (np.asarray(radius, np.float64) + np.asarray(reach, np.float64))
+    columns = np.minimum(np.floor(extent / np.asarray(dx, np.float64)) + 4.0, np.asarray(ncol, np.float64))
+    rows = np.minimum(np.floor(extent / np.asarray(dy, np.float64)) + 4.0, np.asarray(nrow, np.float64))
+    return (columns * rows).astype(np.int64)
+
+
+def terrain_pair_candidates(shape_type, vertices) -> np.ndarray:
+    """Return the most distinct candidates a pair's walk can give its finish: every feature of each of its window's
+    ``vertices`` (:func:`terrain_window_vertices`) giving its partner's most rows
+    (:data:`TERRAIN_WALK_ROWS_PER_VERTEX`), and the rows added after the walk (:data:`TERRAIN_WALK_ROWS_PER_PAIR`).
+
+    The walks visit every feature of a window once (a window vertex owns its cell's faces and diagonal, its x- and
+    y-edges and itself), and each feature gives a partner at most the rows counted there, so no window can give more:
+    a full-finish block that holds this many holds every candidate of the pair.
+
+    Args:
+        shape_type: Geometry type of every partner.
+        vertices: The bound on every partner's window vertices.
+    """
+    kind = np.asarray(shape_type)
+    per_vertex = np.full(kind.shape, TERRAIN_WALK_ROWS_PER_VERTEX[2], np.int64)
+    per_pair = np.full(kind.shape, TERRAIN_WALK_ROWS_PER_PAIR[2], np.int64)
+    sphere = kind == int(GeoType.SPHERE)
+    capsule = kind == int(GeoType.CAPSULE)
+    per_vertex[sphere], per_pair[sphere] = TERRAIN_WALK_ROWS_PER_VERTEX[0], TERRAIN_WALK_ROWS_PER_PAIR[0]
+    per_vertex[capsule], per_pair[capsule] = TERRAIN_WALK_ROWS_PER_VERTEX[1], TERRAIN_WALK_ROWS_PER_PAIR[1]
+    return per_vertex * np.asarray(vertices, np.int64) + per_pair
+
+
 class TerrainPairTable:
     """The static (heightfield, partner) pairs of the terrain law, one contiguous segment per partner and lane class.
 
@@ -1300,8 +1351,8 @@ class TerrainPairTable:
     the model's pair list (:attr:`~newton.Model.shape_contact_pairs`; an empty list gives an empty table) or,
     when the model has none, the same filter applied here (worlds, collision groups, filter pairs). They are
     restricted to partners the law has a class for and sorted by (partner class, lane class, world, heightfield,
-    partner). A pair's lane class follows from its largest window over all orientations (bounding radius plus
-    margins and gaps, on its heightfield's cells) at construction.
+    partner). A pair's lane class and its bound on candidates (:func:`terrain_pair_candidates`) follow from its largest
+    window over all orientations (bounding radius plus margins and gaps, on its heightfield's cells) at construction.
 
     Args:
         model: A finalized model.
@@ -1342,17 +1393,22 @@ class TerrainPairTable:
         partner_class = partner_class[partner_class >= 0]
         lane = np.zeros(len(pairs), np.int32)
         world = np.zeros(len(pairs), np.int32)
+        candidates = np.zeros(len(pairs), np.int64)
         if len(pairs):
             first, second = pairs[:, 0], pairs[:, 1]
             margin = model.shape_margin.numpy()
             gap = model.shape_gap.numpy()
             layout = model.heightfield_data.numpy()[model.shape_heightfield_index.numpy()[first]]
-            dx = 2.0 * layout["hx"].astype(np.float64) / (layout["ncol"].astype(np.int64) - 1)
-            dy = 2.0 * layout["hy"].astype(np.float64) / (layout["nrow"].astype(np.int64) - 1)
+            nrow, ncol = layout["nrow"].astype(np.int64), layout["ncol"].astype(np.int64)
+            dx = 2.0 * layout["hx"].astype(np.float64) / (ncol - 1)
+            dy = 2.0 * layout["hy"].astype(np.float64) / (nrow - 1)
             reach = margin[first] + margin[second] + gap[first] + gap[second]
-            cells = terrain_window_cells(model.shape_collision_radius.numpy()[second], reach, dx, dy)
+            radius = model.shape_collision_radius.numpy()[second]
+            cells = terrain_window_cells(radius, reach, dx, dy)
             lane = np.where(cells <= TERRAIN_LANE_CELLS, TERRAIN_LANE_THREAD, TERRAIN_LANE_TILE).astype(np.int32)
             world = np.where(worlds[second] >= 0, worlds[second], worlds[first]).astype(np.int32)
+            vertices = terrain_window_vertices(radius, reach, dx, dy, nrow, ncol)
+            candidates = terrain_pair_candidates(types[second], vertices)
         order = np.lexsort((pairs[:, 1], pairs[:, 0], world, lane, partner_class))
         self.pairs_host = pairs[order].astype(np.int32).reshape(-1, 2)
         """``(heightfield, partner)`` shape pairs in table order, int32 ``(pair_count, 2)`` (host)."""
@@ -1362,16 +1418,15 @@ class TerrainPairTable:
         """Lane class of every pair, int32 (host)."""
         self.world = world[order]
         """World of every pair (the partner's, or the heightfield's for a global partner), int32 (host)."""
+        self.candidates = candidates[order]
+        """Bound on every pair's distinct candidates, any pose (:func:`terrain_pair_candidates`), int64 (host)."""
+        self.walk_slots = np.asarray(TERRAIN_PARTNER_WALK_SLOTS, np.int64)[self.partner_class]
+        """Row slots every pair reserves when it walks its window (:data:`TERRAIN_PARTNER_WALK_SLOTS`), int64 (host)."""
         segment = self.partner_class * TERRAIN_LANE_CLASSES + self.lane_class
         segments = TERRAIN_PARTNER_CLASSES * TERRAIN_LANE_CLASSES
         sizes = np.bincount(segment, minlength=segments) if len(segment) else np.zeros(segments, np.int64)
         self.segment_offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
         """First pair of every (partner class, lane class) segment, and the pair count last (host)."""
-        rows = np.repeat(np.asarray(TERRAIN_PARTNER_ROWS, np.int64), TERRAIN_LANE_CLASSES)
-        self.slot_offsets = np.concatenate([[0], np.cumsum(sizes * rows)]).astype(np.int64)
-        """First output slot of every segment in the static layout, and the slot count last (host)."""
-        self.slot_count = int(self.slot_offsets[-1])
-        """Output slots of the static layout: every pair times its class's row limit."""
         self.pairs = wp.array(
             self.pairs_host if len(self.pairs_host) else np.zeros((1, 2), np.int32), dtype=wp.vec2i, device=self.device
         )
@@ -1383,13 +1438,6 @@ class TerrainPairTable:
         """Return the ``[begin, end)`` pair range of one partner class and lane class."""
         s = partner_class * TERRAIN_LANE_CLASSES + lane_class
         return int(self.segment_offsets[s]), int(self.segment_offsets[s + 1])
-
-    def slots(self, pair: int) -> tuple[int, int]:
-        """Return the ``[begin, end)`` output slot range of a pair in the static layout (pairs times rows per pair)."""
-        s = int(np.searchsorted(self.segment_offsets, pair, side="right")) - 1
-        rows = TERRAIN_PARTNER_ROWS[s // TERRAIN_LANE_CLASSES]
-        begin = int(self.slot_offsets[s]) + (pair - int(self.segment_offsets[s])) * rows
-        return begin, begin + rows
 
     def memory_bytes(self) -> dict[str, int]:
         """Return the device bytes the table holds."""

@@ -30,18 +30,16 @@ from newton._src.geometry.terrain_law import (
     TERRAIN_FEATURE_FACE,
     TERRAIN_FEATURE_VERTEX,
     TerrainFeatureData,
-    TerrainRows,
+    TerrainFinishScratch,
     terrain_cluster,
     terrain_edge_class,
     terrain_edge_point,
     terrain_eps,
     terrain_face_point,
     terrain_feature_id,
-    terrain_finish,
+    terrain_finish_list,
+    terrain_finish_scratch,
     terrain_point_below,
-    terrain_row_n,
-    terrain_row_q,
-    terrain_rows_push,
     terrain_vertex_feature,
     terrain_vertex_in_cone,
     terrain_vertex_point,
@@ -52,8 +50,6 @@ from newton._src.geometry.terrain_law import (
 )
 from newton.tests import terrain_law_reference as ref
 
-POINT_ROWS = 8
-"""Rows a point-core pair keeps (the law's limit for spheres and capsules)."""
 CLAIMS = 16
 """Face claims recorded per point."""
 
@@ -125,20 +121,35 @@ def _window_cells(data: TerrainFeatureData, heightfield: int, p: wp.vec3, reach:
     return wp.vec4i(r0, r1, c0, c1)
 
 
+@wp.func
+def _push(scratch: TerrainFinishScratch, base: int, count: int, q: wp.vec3, k: wp.vec3, n: wp.vec3, d: float, f: int):
+    """Append a candidate to a point's list in the finish scratch (raw: the finish merges coincident ones)."""
+    if count < scratch.capacity:
+        scratch.q[base + count] = q
+        scratch.k[base + count] = k
+        scratch.n[base + count] = n
+        scratch.d[base + count] = d
+        scratch.feature[base + count] = f
+    return count + 1
+
+
 @wp.kernel(enable_backward=False)
 def _point_rows_kernel(
     data: TerrainFeatureData,
     heightfield: int,
     points: wp.array[wp.vec3],
     reach: wp.array[float],
+    scratch: TerrainFinishScratch,
     out_count: wp.array[int],
     out_q: wp.array2d[wp.vec3],
     out_n: wp.array2d[wp.vec3],
     out_d: wp.array2d[float],
     out_feature: wp.array2d[int],
 ):
-    """The point-core rows of the law from the float32 predicates (faces, crease edges, vertices; no G2/G3)."""
+    """The point-core rows of the law from the float32 predicates (faces, crease edges, vertices; no G2/G3), every
+    candidate into the point's list of the finish scratch, then the law's finish."""
     i = wp.tid()
+    base = i * scratch.capacity
     p = points[i]
     D = reach[i]
     box = _window_cells(data, heightfield, p, D)
@@ -156,13 +167,15 @@ def _point_rows_kernel(
     window.eps = terrain_eps(extent)
     eps = window.eps
     below = terrain_point_below(data, window, k)
-    rows = TerrainRows()
+    count = int(0)
     for r in range(r0, r1 + 1):
         for c in range(c0, c1 + 1):
             for sub in range(2):
                 claims, q, n, d = terrain_face_point(data, window, r, c, sub, k)
                 if claims and d <= D and not ((d > eps and below) or (d < -eps and not below)):
-                    rows = terrain_rows_push(rows, q, k, n, d, terrain_feature_id(r, c, TERRAIN_FEATURE_FACE, sub, 0))
+                    count = _push(
+                        scratch, base, count, q, k, n, d, terrain_feature_id(r, c, TERRAIN_FEATURE_FACE, sub, 0)
+                    )
     for r in range(r0, r1 + 2):
         for c in range(c0, c1 + 2):
             for which in range(3):
@@ -186,8 +199,8 @@ def _point_rows_kernel(
                         n = -n
                         d = -dist
                     if d <= D:
-                        rows = terrain_rows_push(
-                            rows, q, k, n, d, terrain_feature_id(r, c, TERRAIN_FEATURE_EDGE, which, 0)
+                        count = _push(
+                            scratch, base, count, q, k, n, d, terrain_feature_id(r, c, TERRAIN_FEATURE_EDGE, which, 0)
                         )
             if terrain_vertex_point(data, window, r, c, k):
                 v = terrain_window_vertex(data, window, r, c)
@@ -199,17 +212,20 @@ def _point_rows_kernel(
                         n = -n
                         d = -dist
                     if d <= D:
-                        rows = terrain_rows_push(
-                            rows, v, k, n, d, terrain_feature_id(r, c, TERRAIN_FEATURE_VERTEX, 0, 0)
+                        count = _push(
+                            scratch, base, count, v, k, n, d, terrain_feature_id(r, c, TERRAIN_FEATURE_VERTEX, 0, 0)
                         )
-    order, kept, _flags = terrain_finish(rows, eps, POINT_ROWS)
+    count = wp.min(count, scratch.capacity)
+    kept = terrain_finish_list(scratch, base, count, eps)
     out_count[i] = kept
-    for j in range(kept):
-        row = order[j]
-        out_q[i, j] = terrain_window_to_local(window, terrain_row_q(rows, row))
-        out_n[i, j] = terrain_row_n(rows, row)
-        out_d[i, j] = rows.d[row]
-        out_feature[i, j] = rows.feature[row]
+    j = int(0)
+    for row in range(count):
+        if scratch.mark[base + row] != 0:
+            out_q[i, j] = terrain_window_to_local(window, scratch.q[base + row])
+            out_n[i, j] = scratch.n[base + row]
+            out_d[i, j] = scratch.d[base + row]
+            out_feature[i, j] = scratch.feature[base + row]
+            j += 1
 
 
 @wp.kernel(enable_backward=False)
@@ -278,11 +294,16 @@ def point_rows(features: TerrainFeatures, heightfield: int, points, reach):
     points = np.asarray(points, np.float32).reshape(-1, 3)
     n = len(points)
     reach = np.broadcast_to(np.asarray(reach, np.float32), (n,)).copy()
+    # every feature of the window once: six per vertex of a window of at most 2 D / cell + 2 cells a side
+    surface = features.data().surfaces.numpy()[heightfield]
+    cells = int(np.floor(2.0 * float(reach.max()) / min(float(surface["dx"]), float(surface["dy"])))) + 2
+    candidates = 6 * (cells + 1) ** 2
+    scratch = terrain_finish_scratch(device, candidates, blocks=n)
     out_count = wp.zeros(n, dtype=int, device=device)
-    out_q = wp.zeros((n, POINT_ROWS), dtype=wp.vec3, device=device)
-    out_n = wp.zeros((n, POINT_ROWS), dtype=wp.vec3, device=device)
-    out_d = wp.zeros((n, POINT_ROWS), dtype=float, device=device)
-    out_f = wp.zeros((n, POINT_ROWS), dtype=int, device=device)
+    out_q = wp.zeros((n, candidates), dtype=wp.vec3, device=device)
+    out_n = wp.zeros((n, candidates), dtype=wp.vec3, device=device)
+    out_d = wp.zeros((n, candidates), dtype=float, device=device)
+    out_f = wp.zeros((n, candidates), dtype=int, device=device)
     wp.launch(
         _point_rows_kernel,
         dim=n,
@@ -291,6 +312,7 @@ def point_rows(features: TerrainFeatures, heightfield: int, points, reach):
             heightfield,
             wp.array(points, dtype=wp.vec3, device=device),
             wp.array(reach, dtype=float, device=device),
+            scratch,
         ],
         outputs=[out_count, out_q, out_n, out_d, out_f],
         device=device,

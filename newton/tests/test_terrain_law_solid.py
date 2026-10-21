@@ -38,29 +38,26 @@ from newton._src.geometry.terrain_contacts import (
     TERRAIN_PARTNER_BOX,
     TERRAIN_PARTNER_CYLINDER,
     TERRAIN_PARTNER_HULL,
-    TERRAIN_PARTNER_ROWS,
+    TERRAIN_PARTNER_WALK_SLOTS,
 )
 from newton._src.geometry.terrain_law import (
     TERRAIN_FEATURE_RECOVERY,
-    TERRAIN_LAW_FULL_BLOCKS,
+    TERRAIN_FINISH_MASK_ROWS,
     TERRAIN_LAW_TILE_BLOCKS,
     TERRAIN_PAIR_CANDIDATE_OVERFLOW,
     TERRAIN_PAIR_FILTERED,
     TERRAIN_PAIR_OUTSIDE,
-    TERRAIN_PAIR_ROW_OVERFLOW,
     TERRAIN_PAIR_STALE,
     TERRAIN_PAIR_TILE_EXIT,
     TERRAIN_PAIR_UNSUPPORTED,
-    TERRAIN_ROW_CANDIDATES,
-    TerrainLawRows,
+    TerrainFinishScratch,
     TerrainPairInputs,
-    TerrainRows,
-    terrain_finish,
+    terrain_finish_list,
     terrain_finish_scratch,
     terrain_finish_slots,
     terrain_law_block_dim,
+    terrain_law_rows,
     terrain_pair_work,
-    terrain_rows_push,
 )
 from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_solid_utils as su
@@ -144,44 +141,40 @@ def _finish_both(
     n: wp.array[wp.vec3],
     d: wp.array[float],
     counts: wp.array[int],
+    prefixes: wp.array[int],
     eps: wp.array[float],
-    limits: wp.array[int],
-    by_value: wp.array2d[int],
-    in_place: wp.array2d[int],
+    scratch: TerrainFinishScratch,
+    in_slots: wp.array2d[int],
+    in_list: wp.array2d[int],
 ):
-    """Per list: ``terrain_finish`` of a by-value list (core points ``q + d n``) and ``terrain_finish_slots`` in place."""
+    """Per list of rows at ``40 i``: ``terrain_finish_slots`` in place (its masks take the first ``prefixes[i]``, at
+    most 32) and ``terrain_finish_list`` on all of them (core points ``q + d n``, in the list's block of a scratch),
+    each as per-row keep flags and the kept count last."""
     i = wp.tid()
     base = i * 40
     count = counts[i]
-    rows = TerrainRows()
+    keep, kept = terrain_finish_slots(q, n, d, base, prefixes[i], eps[i])
+    for j in range(prefixes[i]):
+        in_slots[i, j] = (keep >> j) & 1
+    in_slots[i, 40] = kept
+    block = i * scratch.capacity
     for j in range(count):
         s = base + j
-        rows = terrain_rows_push(rows, q[s], q[s] + d[s] * n[s], n[s], d[s], j)
-    order, kept, flags = terrain_finish(rows, eps[i], limits[i])
-    mask = int(0)
-    for j in range(kept):
-        mask = mask | (1 << order[j])
-    by_value[i, 0] = mask
-    by_value[i, 1] = kept
-    by_value[i, 2] = flags
-    keep, kept2, flags2 = terrain_finish_slots(
-        q,
-        n,
-        d,
-        base,
-        wp.min(count, TERRAIN_ROW_CANDIDATES),
-        wp.max(count - TERRAIN_ROW_CANDIDATES, 0),
-        eps[i],
-        limits[i],
-    )
-    in_place[i, 0] = keep
-    in_place[i, 1] = kept2
-    in_place[i, 2] = flags2
+        scratch.q[block + j] = q[s]
+        scratch.k[block + j] = q[s] + d[s] * n[s]
+        scratch.n[block + j] = n[s]
+        scratch.d[block + j] = d[s]
+        scratch.feature[block + j] = j
+    in_list[i, 40] = terrain_finish_list(scratch, block, count, eps[i])
+    for j in range(count):
+        in_list[i, j] = scratch.mark[block + j]
 
 
 def _candidate_lists(rng, count):
     """Candidate lists that exercise every step of the finish: coincident rows, several plane groups, implied rows
-    (inside or on the lower hull of their group), groups of more than four rows, row and candidate overflows."""
+    (inside or on the lower hull of their group), groups of more than four rows, and lists of more rows than the
+    in-place finish's masks hold (copies of a shorter list). Returns ``(rows, prefix)`` per list: the list and how many
+    of its first rows are distinct (the rest copies)."""
     lists = []
     for i in range(count):
         rows = []
@@ -215,17 +208,21 @@ def _candidate_lists(rng, count):
                     rows.append((q + rng.uniform(-1e-7, 1e-7, size=3), normal, dist))
         order = rng.permutation(len(rows))
         rows = [rows[k] for k in order]
+        prefix = len(rows)
         if i % 17 == 0:
             rows = (rows * 6)[:36]
-        lists.append(rows)
+        lists.append((rows, min(prefix, len(rows))))
     return lists
 
 
 def test_finish_in_place_equals_finish(test, device):
-    """Keep the same rows, bit for bit, with the finish in place as with the by-value finish.
+    """Keep the same rows, bit for bit, with the finish in a walk's slots as with the finish on a full-finish scratch,
+    and finish any number of candidates there.
 
-    Lists with coincident rows, several plane groups, implied rows, groups of more than four rows, row limits of 2
-    to 16 (row overflow) and lists of more than :data:`TERRAIN_ROW_CANDIDATES` candidates.
+    Lists with coincident rows, several plane groups, implied rows and groups of more than four rows; lists of more
+    rows than the in-place finish's masks hold (:data:`TERRAIN_FINISH_MASK_ROWS`) are copies of a shorter list, whose
+    copies merge into their first occurrence: the scratch finish keeps the rows the in-place finish keeps of the
+    shorter list.
     """
     rng = np.random.default_rng(31)
     lists = _candidate_lists(rng, 400)
@@ -233,16 +230,18 @@ def test_finish_in_place_equals_finish(test, device):
     n = np.zeros((len(lists) * 40, 3), np.float32)
     d = np.zeros(len(lists) * 40, np.float32)
     counts = np.zeros(len(lists), np.int32)
-    for i, rows in enumerate(lists):
+    prefixes = np.zeros(len(lists), np.int32)
+    for i, (rows, prefix) in enumerate(lists):
         counts[i] = len(rows)
+        prefixes[i] = prefix
         for j, (qq, nn, dd) in enumerate(rows):
             q[i * 40 + j] = qq
             n[i * 40 + j] = nn
             d[i * 40 + j] = dd
+    test.assertTrue(np.all(prefixes <= TERRAIN_FINISH_MASK_ROWS))
     eps = np.full(len(lists), 8.0 * 1.1920928955078125e-7 * 0.2, np.float32)
-    limits = rng.choice([2, 4, 8, 16], size=len(lists)).astype(np.int32)
-    by_value = wp.zeros((len(lists), 3), dtype=int, device=device)
-    in_place = wp.zeros((len(lists), 3), dtype=int, device=device)
+    in_slots = wp.zeros((len(lists), 41), dtype=int, device=device)
+    in_list = wp.zeros((len(lists), 41), dtype=int, device=device)
     wp.launch(
         _finish_both,
         dim=len(lists),
@@ -251,19 +250,22 @@ def test_finish_in_place_equals_finish(test, device):
             wp.array(n, dtype=wp.vec3, device=device),
             wp.array(d, dtype=float, device=device),
             wp.array(counts, dtype=int, device=device),
+            wp.array(prefixes, dtype=int, device=device),
             wp.array(eps, dtype=float, device=device),
-            wp.array(limits, dtype=int, device=device),
+            terrain_finish_scratch(device, 40, blocks=len(lists)),
         ],
-        outputs=[by_value, in_place],
+        outputs=[in_slots, in_list],
         device=device,
     )
-    a = by_value.numpy()
-    b = in_place.numpy()
-    np.testing.assert_array_equal(a, b)
-    # every step acted somewhere: rows dropped, row and candidate overflows flagged
-    test.assertGreater(int(np.sum(a[:, 1] < np.minimum(counts, TERRAIN_ROW_CANDIDATES))), 100)
-    test.assertGreater(int(np.sum((a[:, 2] & 2) != 0)), 10)
-    test.assertGreater(int(np.sum((a[:, 2] & 1) != 0)), 5)
+    a = in_slots.numpy()
+    b = in_list.numpy()
+    np.testing.assert_array_equal(a[:, 40], b[:, 40])
+    for i in range(len(lists)):
+        np.testing.assert_array_equal(a[i, : prefixes[i]], b[i, : prefixes[i]], err_msg=f"list {i}")
+        test.assertFalse(np.any(b[i, prefixes[i] : counts[i]]), msg=f"list {i}: a copy kept")
+    # every step acted somewhere: rows dropped, and lists longer than the masks
+    test.assertGreater(int(np.sum(b[:, 40] < counts)), 100)
+    test.assertGreater(int(np.sum(counts > TERRAIN_FINISH_MASK_ROWS)), 5)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -938,20 +940,22 @@ _SOLID_KERNELS = {
 
 
 def _side_buffer(begin, count, rows, pair_count, device):
-    out = TerrainLawRows()
+    """A side buffer for ``count`` pairs from table pair ``begin`` with ``rows`` walk slots each (from 0), then a spill
+    region of as many rows (at least 4096), deferred lists from ``begin``."""
     slots = count * rows
-    out.q = wp.zeros(slots, dtype=wp.vec3, device=device)
-    out.n = wp.zeros(slots, dtype=wp.vec3, device=device)
-    out.d = wp.zeros(slots, dtype=float, device=device)
-    out.feature = wp.zeros(slots, dtype=wp.int32, device=device)
-    out.count = wp.zeros(pair_count, dtype=wp.int32, device=device)
-    out.state = wp.zeros(pair_count, dtype=wp.int32, device=device)
-    out.status = wp.zeros(1, dtype=wp.int32, device=device)
-    out.overflow = wp.zeros(2, dtype=wp.int32, device=device)
-    out.deferred = wp.zeros(pair_count, dtype=wp.int32, device=device)
-    out.deferred_first = wp.full(4, begin, dtype=wp.int32, device=device)
-    out.deferred_count = wp.zeros(4, dtype=wp.int32, device=device)
-    return out
+    return terrain_law_rows(device, pair_count, slots, max(slots, 4096), [begin] * 4)
+
+
+def _pair_rows(out, pair: int) -> dict:
+    """A table pair's rows in a side buffer (its walk slots or its spill rows), host arrays."""
+    first, count = int(out.first.numpy()[pair]), int(out.count.numpy()[pair])
+    return {name: getattr(out, name).numpy()[first : first + count] for name in ("q", "n", "d", "feature")}
+
+
+def _full_candidates(shadow, partner_class) -> int:
+    """The distinct candidates a full-finish block of a solid class holds (the most any of its pairs can give)."""
+    name = {TERRAIN_PARTNER_BOX: "box", TERRAIN_PARTNER_CYLINDER: "cylinder", TERRAIN_PARTNER_HULL: "hull"}
+    return shadow.describe()["launch_shapes"][name[partner_class]]["full_candidates"]
 
 
 TILE_LARGE = (
@@ -1043,7 +1047,7 @@ def test_tiled_kernels_match_one_thread_kernels(test, device):
     for partner_class, (module, thread, tiled, full) in _SOLID_KERNELS.items():
         begin, end = table.segment(partner_class, TERRAIN_LANE_TILE)
         test.assertGreater(end - begin, 0)
-        rows = TERRAIN_PARTNER_ROWS[partner_class]
+        rows = TERRAIN_PARTNER_WALK_SLOTS[partner_class]
         outputs = []
         block = terrain_law_block_dim(device)
         for thread_vertices in (0, 1):
@@ -1051,7 +1055,7 @@ def test_tiled_kernels_match_one_thread_kernels(test, device):
             out = _side_buffer(begin, end - begin, rows, table.pair_count, device)
             work = terrain_pair_work(device, begin, end - begin)
             work.blocks = 3
-            scratch = terrain_finish_scratch(device, blocks=3)
+            scratch = terrain_finish_scratch(device, _full_candidates(shadow, partner_class), blocks=3)
             walk = [begin, 0, inputs, shadow.features.data(), out, work, solids]
             wp.launch(getattr(module, thread), dim=end - begin, inputs=walk, block_dim=block, device=device)
             if thread_vertices:
@@ -1061,27 +1065,27 @@ def test_tiled_kernels_match_one_thread_kernels(test, device):
             wp.launch_tiled(getattr(module, full), dim=scratch.blocks, inputs=finish, block_dim=block, device=device)
             outputs.append(out)
         one, lanes = outputs
-        for name in ("count", "state", "q", "n", "d", "feature"):
+        for name in ("count", "state"):
             np.testing.assert_array_equal(getattr(one, name).numpy(), getattr(lanes, name).numpy(), err_msg=name)
-        # the shadow's rows of the segment: the same, pair by pair
+        # the shadow's rows of the segment: the same, pair by pair, wherever each side keeps them
         count = one.count.numpy()[begin:end]
         np.testing.assert_array_equal(expected["count"][begin:end], count)
         np.testing.assert_array_equal(expected["state"][begin:end], one.state.numpy()[begin:end])
-        for name in ("q", "n", "d", "feature"):
-            got = getattr(one, name).numpy()
-            for i in range(end - begin):
-                a = first_row[begin + i]
-                np.testing.assert_array_equal(
-                    expected[name][a : a + count[i]], got[i * rows : i * rows + count[i]], err_msg=name
-                )
+        for i in range(end - begin):
+            a = first_row[begin + i]
+            got, other = _pair_rows(one, begin + i), _pair_rows(lanes, begin + i)
+            for name in ("q", "n", "d", "feature"):
+                np.testing.assert_array_equal(expected[name][a : a + count[i]], got[name], err_msg=name)
+                np.testing.assert_array_equal(other[name], got[name], err_msg=name)
         walked += int(count.sum())
     test.assertGreater(walked, 20)
 
 
 def _ridge_boxes(device, half, ys):
     """Long boxes lying across ridges of different heights (every ridge in reach its own plane group), one per world:
-    ``(heightfield, model, shapes, bodies)``. With half extents ``(0.9, 0.05, 0.02)`` a box has more distinct rows
-    (28) than the box class's 16 slots; with ``(0.9, 0.15, 0.02)``, more (46) than a scratch list's 32."""
+    ``(heightfield, model, shapes, bodies)``. With half extents ``(0.9, 0.05, 0.02)`` a box has more distinct
+    candidates (28) and rows (20) than the box class's 16 walk slots; with ``(0.9, 0.15, 0.02)``, more distinct
+    candidates (48) than a full-finish list held before (32)."""
     rng = np.random.default_rng(2)
     heights = np.zeros((41, 41))
     heights[:, 1::2] = rng.uniform(0.02, 0.035, size=41)[1::2]
@@ -1095,43 +1099,43 @@ def _ridge_boxes(device, half, ys):
     return hf, model, shapes, bodies
 
 
-def test_row_overflow_keeps_each_plane_deepest(test, device):
-    """Keep a box's supports first when its rows overflow its slots, and raise ``terrain_rows``.
+def test_long_box_keeps_every_support(test, device):
+    """Keep every support of a box with more rows than its walk slots, as the float64 law gives them, raising nothing.
 
-    A long box lies across ridges of different heights (every ridge in reach its own plane group): more rows than the
-    box class's 16 slots. The kept rows are the float64 finish's under the same row limit.
+    A long box lies across ridges of different heights (every ridge in reach its own plane group): 20 rows, more than
+    the box class's 16 walk slots. Its class's full-finish kernel finishes it and writes them to the spill region.
+    (1cf34769 kept 16, each plane's deepest first, and raised ``terrain_rows``.)
     """
     hf, model, shapes, bodies = _ridge_boxes(device, (0.9, 0.05, 0.02), (0.05,))
     _kind, dims, pose = bodies[0]
     pipeline, _contacts, _state = _collide(model, shadow=True)
     rows = pipeline._terrain_law_shadow.rows()
-    limit = terrain_law_box.TERRAIN_BOX_ROWS
-    test.assertEqual(int(rows["count"][0]), limit)
-    test.assertEqual(int(rows["state"][0]) & int(TERRAIN_PAIR_ROW_OVERFLOW), int(TERRAIN_PAIR_ROW_OVERFLOW))
-    status = pipeline.narrow_phase.buffer_capacity_status()
-    test.assertEqual([k for k, v in status.items() if v], ["terrain_rows"])
-    test.assertGreater(len(su.law_rows(hf, "box", dims, pose)), limit)
-    limited = su.law_rows(hf, "box", dims, pose, row_limit=limit)
-    got = tu.shadow_rows(pipeline)[shapes[0]]
-    missing, extra, _deepest = su.compare_solid_rows(limited, got)
+    law = su.law_rows(hf, "box", dims, pose)
+    test.assertEqual(len(law), 20)
+    test.assertGreater(len(law), terrain_law_box.TERRAIN_BOX_WALK_SLOTS)
+    test.assertEqual(int(rows["count"][0]), len(law))
+    test.assertEqual(int(rows["state"][0]), 0)
+    test.assertFalse(any(pipeline.narrow_phase.buffer_capacity_status().values()))
+    missing, extra, _deepest = su.compare_solid_rows(law, tu.shadow_rows(pipeline)[shapes[0]])
     test.assertEqual((missing, extra), ([], []))
 
 
 def test_deferred_pairs_keep_their_rows_beyond_the_grid(test, device):
     """Finish every deferred pair from its own rows, however many defer: one full-finish block for three boxes.
 
-    Three long boxes overflow the box class's slots and defer; a full kernel of one block walks them again one after
-    the other, each into the block's scratch list. Every box keeps the float64 finish's rows under the row limit, as
-    with the shadow's own grid, bit for bit, and none is flagged as a candidate overflow.
+    Three long boxes have more rows than the box class's walk slots and defer; a full kernel of one block walks them
+    again one after the other, each into the block's scratch. Every box keeps the float64 law's rows, as with the
+    shadow's own grid, bit for bit, none flagged, each in rows of the spill region.
     """
     hf, model, _shapes, bodies = _ridge_boxes(device, (0.9, 0.05, 0.02), (-0.55, 0.0, 0.55))
     pipeline, _contacts, _state = _collide(model, shadow=True)
     shadow = pipeline._terrain_law_shadow
     expected = shadow.rows()
-    test.assertTrue(np.all(expected["state"] & int(TERRAIN_PAIR_ROW_OVERFLOW)))
+    test.assertTrue(np.all(expected["count"] > terrain_law_box.TERRAIN_BOX_WALK_SLOTS))
+    test.assertTrue(np.all(expected["state"] == 0))
     inputs = _pair_inputs(model, pipeline)
     solids = terrain_law_solid.terrain_solid_data(model, shadow.table.pairs_host[:, 1], thread_vertices=0)
-    rows = TERRAIN_PARTNER_ROWS[TERRAIN_PARTNER_BOX]
+    rows = TERRAIN_PARTNER_WALK_SLOTS[TERRAIN_PARTNER_BOX]
     begin, end = shadow.table.segment(TERRAIN_PARTNER_BOX, TERRAIN_LANE_TILE)
     test.assertEqual(end - begin, len(bodies))
     out = _side_buffer(begin, end - begin, rows, shadow.table.pair_count, device)
@@ -1140,51 +1144,90 @@ def test_deferred_pairs_keep_their_rows_beyond_the_grid(test, device):
     walk = [begin, 0, inputs, shadow.features.data(), out, work, solids]
     wp.launch(terrain_law_box.terrain_box_rows, dim=end - begin, inputs=walk, block_dim=block, device=device)
     test.assertEqual(int(out.deferred_count.numpy()[TERRAIN_PARTNER_BOX]), len(bodies))
-    scratch = terrain_finish_scratch(device, blocks=1)
+    scratch = terrain_finish_scratch(device, _full_candidates(shadow, TERRAIN_PARTNER_BOX), blocks=1)
     finish = [begin, 0, inputs, shadow.features.data(), out, scratch, solids]
     wp.launch_tiled(terrain_law_box.terrain_box_rows_full, dim=1, inputs=finish, block_dim=block, device=device)
-    count = out.count.numpy()
     state = out.state.numpy()
-    q, n, d = out.q.numpy(), out.n.numpy(), out.d.numpy()
+    test.assertEqual(int(out.spilled.numpy()[0]), int(expected["count"].sum()))
     for i, (_kind, dims, pose) in enumerate(bodies):
         with test.subTest(box=i):
             test.assertEqual(int(state[begin + i]), int(expected["state"][i]))
-            test.assertEqual(int(state[begin + i]) & int(TERRAIN_PAIR_CANDIDATE_OVERFLOW), 0)
+            test.assertGreaterEqual(int(out.first.numpy()[begin + i]), out.slots)
+            mine = _pair_rows(out, begin + i)
             got = [
-                (q[s].astype(np.float64), n[s].astype(np.float64), float(d[s]))
-                for s in range(i * rows, i * rows + count[begin + i])
+                (q.astype(np.float64), n.astype(np.float64), float(d))
+                for q, n, d in zip(mine["q"], mine["n"], mine["d"], strict=True)
             ]
             first = int(np.sum(expected["count"][:i]))
-            np.testing.assert_array_equal(np.array([g[2] for g in got]), expected["d"][first : first + len(got)])
-            limited = su.law_rows(hf, "box", dims, pose, row_limit=rows)
-            missing, extra, _deepest = su.compare_solid_rows(limited, got)
+            np.testing.assert_array_equal(mine["d"], expected["d"][first : first + len(got)])
+            missing, extra, _deepest = su.compare_solid_rows(su.law_rows(hf, "box", dims, pose), got)
             test.assertEqual((missing, extra), ([], []))
 
 
-def test_candidate_overflow_keeps_the_first_rows_flagged(test, device):
-    """Keep a pair's first distinct candidates in window order when they overflow a scratch list, and flag it.
+def test_wide_box_keeps_every_support(test, device):
+    """Keep every support of a pair whose distinct candidates outnumber what a full-finish list held before (32).
 
-    A wide box across ridges has more distinct candidates (46) than a deferred pair's scratch list (32): it keeps the
-    first 32 in window order, flags a candidate and a row overflow and raises ``terrain_rows``; every row it keeps
-    is one of the float64 law's.
+    A wide box across ridges has 48 distinct candidates: its class's full-finish kernel holds them all (its scratch
+    holds every candidate a window of the class can give) and keeps the float64 law's 22 rows, raising nothing.
+    (1cf34769 kept the first 32 candidates in window order, kept 16 rows, and flagged a candidate and a row overflow.)
     """
     hf, model, shapes, bodies = _ridge_boxes(device, (0.9, 0.15, 0.02), (0.05,))
     _kind, dims, pose = bodies[0]
     pipeline, _contacts, _state = _collide(model, shadow=True)
     shadow = pipeline._terrain_law_shadow
     rows = shadow.rows()
-    overflow = int(TERRAIN_PAIR_ROW_OVERFLOW) | int(TERRAIN_PAIR_CANDIDATE_OVERFLOW)
-    test.assertEqual(int(rows["state"][0]) & overflow, overflow)
-    test.assertEqual(int(rows["count"][0]), terrain_law_box.TERRAIN_BOX_ROWS)
-    test.assertEqual(shadow.overflow_counts(), (1, 1))
-    status = pipeline.narrow_phase.buffer_capacity_status()
-    test.assertEqual([k for k, v in status.items() if v], ["terrain_rows"])
     core = ref.make_core("box", dims, pose)
     lo, hi = core.aabb()
     window = hf.window_features(hf.cells_in_box(lo[:2] - su.REACH, hi[:2] + su.REACH))
-    candidates = ref.solid_law(hf, core, su.REACH, window)
-    test.assertGreater(len(candidates), 2 * TERRAIN_ROW_CANDIDATES)
-    got = tu.shadow_rows(pipeline)[shapes[0]]
+    test.assertGreater(len(ref.solid_law(hf, core, su.REACH, window)), 64)
+    law = su.law_rows(hf, "box", dims, pose)
+    test.assertEqual(len(law), 22)
+    test.assertEqual(int(rows["count"][0]), len(law))
+    test.assertEqual(int(rows["state"][0]), 0)
+    test.assertEqual(shadow.overflow_counts(), (0, 0))
+    test.assertFalse(any(pipeline.narrow_phase.buffer_capacity_status().values()))
+    missing, extra, _deepest = su.compare_solid_rows(law, tu.shadow_rows(pipeline)[shapes[0]])
+    test.assertEqual((missing, extra), ([], []))
+
+
+def test_window_past_its_bound_is_flagged(test, device):
+    """Flag a pair whose window gives more distinct candidates than its full-finish scratch holds, and raise.
+
+    Only a window its shape data no longer bounds can: the scratch holds every candidate a window of the class can give
+    as the shapes were at construction. A scratch made smaller than the wide box's 48 candidates stands for such a
+    window: the pair keeps the first 32 in window order, is flagged :data:`TERRAIN_PAIR_CANDIDATE_OVERFLOW`, counts a
+    candidate overflow and raises ``terrain_rows``; every row it keeps is one of the float64 law's candidates.
+    """
+    hf, model, _shapes, bodies = _ridge_boxes(device, (0.9, 0.15, 0.02), (0.05,))
+    _kind, dims, pose = bodies[0]
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    shadow = pipeline._terrain_law_shadow
+    inputs = _pair_inputs(model, pipeline)
+    solids = terrain_law_solid.terrain_solid_data(model, shadow.table.pairs_host[:, 1], thread_vertices=0)
+    rows = TERRAIN_PARTNER_WALK_SLOTS[TERRAIN_PARTNER_BOX]
+    begin, end = shadow.table.segment(TERRAIN_PARTNER_BOX, TERRAIN_LANE_TILE)
+    out = _side_buffer(begin, end - begin, rows, shadow.table.pair_count, device)
+    block = terrain_law_block_dim(device)
+    walk = [begin, 0, inputs, shadow.features.data(), out, terrain_pair_work(device, begin, end - begin), solids]
+    wp.launch(terrain_law_box.terrain_box_rows, dim=end - begin, inputs=walk, block_dim=block, device=device)
+    scratch = terrain_finish_scratch(device, 32, blocks=1)
+    finish = [begin, 0, inputs, shadow.features.data(), out, scratch, solids]
+    wp.launch_tiled(terrain_law_box.terrain_box_rows_full, dim=1, inputs=finish, block_dim=block, device=device)
+    state = int(out.state.numpy()[begin])
+    test.assertEqual(state & int(TERRAIN_PAIR_CANDIDATE_OVERFLOW), int(TERRAIN_PAIR_CANDIDATE_OVERFLOW))
+    test.assertEqual(out.overflow.numpy().tolist(), [0, 1])
+    test.assertNotEqual(int(out.status.numpy()[0]), 0)
+    core = ref.make_core("box", dims, pose)
+    lo, hi = core.aabb()
+    candidates = ref.solid_law(
+        hf, core, su.REACH, hf.window_features(hf.cells_in_box(lo[:2] - su.REACH, hi[:2] + su.REACH))
+    )
+    mine = _pair_rows(out, begin)
+    got = [
+        (q.astype(np.float64), n.astype(np.float64), float(d))
+        for q, n, d in zip(mine["q"], mine["n"], mine["d"], strict=True)
+    ]
+    test.assertGreater(len(got), 0)
     test.assertEqual(tu.missing_rows(got, candidates, q_tol=1.0e-5, angle_tol=1.0e-3, d_tol=1.0e-5), [])
 
 
@@ -1242,7 +1285,9 @@ def test_solid_shadow_runs_under_graph_capture(test, device):
     pipeline.collide(state, contacts)
     expected = shadow.rows()
     test.assertTrue(np.all(expected["count"] > 0), msg=expected["count"])
-    test.assertGreaterEqual(int(np.count_nonzero(expected["state"] & int(TERRAIN_PAIR_ROW_OVERFLOW))), 1)
+    # the long box's rows exceed its walk slots: the full kernel writes them to the spill region
+    test.assertGreaterEqual(shadow.rows_spilled(), int(expected["count"].max()))
+    test.assertTrue(np.all(expected["state"] & 48 == 0))
     # the tiled kernels walk the windows over 64 vertices (a box and an ellipsoid)
     test.assertGreater(len(_queued(shadow, TERRAIN_PARTNER_BOX)), 0)
     test.assertGreater(len(_queued(shadow, TERRAIN_PARTNER_HULL)), 0)
@@ -1324,7 +1369,8 @@ def test_solid_launches_share_the_point_grids(test, device):
         test.assertEqual(launched[getattr(module, thread).key], [("launch", end - begin, block)])
         tiled_blocks = min(end - tiled_begin, TERRAIN_LAW_TILE_BLOCKS)
         test.assertEqual(launched[getattr(module, tiled).key], [("tiled", tiled_blocks, block)])
-        test.assertEqual(launched[getattr(module, full).key], [("tiled", TERRAIN_LAW_FULL_BLOCKS, block)])
+        full_blocks = shadow.describe()["launch_shapes"][module.__name__.rsplit("_", 1)[1]]["full_blocks"]
+        test.assertEqual(launched[getattr(module, full).key], [("tiled", full_blocks, block)])
         queued = _queued(shadow, partner_class)
         test.assertEqual(len(np.unique(queued)), len(queued))
         test.assertTrue(np.all((queued >= tiled_begin) & (queued < end)), msg=queued)
@@ -1352,7 +1398,7 @@ def test_solid_fixed_grids_take_each_pair_once(test, device):
     begin = table.segment(TERRAIN_PARTNER_BOX, TERRAIN_LANE_THREAD)[0]
     tiled_begin, end = table.segment(TERRAIN_PARTNER_BOX, TERRAIN_LANE_TILE)
     test.assertEqual(end - tiled_begin, len(bodies))
-    rows = TERRAIN_PARTNER_ROWS[TERRAIN_PARTNER_BOX]
+    rows = TERRAIN_PARTNER_WALK_SLOTS[TERRAIN_PARTNER_BOX]
     inputs = _pair_inputs(model, pipeline)
     data = shadow.features.data()
     solids = terrain_law_solid.terrain_solid_data(model, table.pairs_host[:, 1])
@@ -1377,7 +1423,7 @@ def test_solid_fixed_grids_take_each_pair_once(test, device):
         listed = out.deferred.numpy()
         listed[begin : begin + deferred] = np.sort(listed[begin : begin + deferred])
         out.deferred.assign(listed)
-        scratch = terrain_finish_scratch(device, blocks=blocks + extra)
+        scratch = terrain_finish_scratch(device, _full_candidates(shadow, TERRAIN_PARTNER_BOX), blocks=blocks + extra)
         scratch.blocks = blocks
         finish = [begin, 0, inputs, data, out, scratch, solids]
         wp.launch_tiled(
@@ -1388,20 +1434,27 @@ def test_solid_fixed_grids_take_each_pair_once(test, device):
                 "queued": int(work.count.numpy()[0]),
                 "deferred": deferred,
                 "overflow": out.overflow.numpy().tolist(),
-                **{name: getattr(out, name).numpy() for name in ("count", "state", "q", "n", "d", "feature")},
+                "spilled": int(out.spilled.numpy()[0]),
+                **{name: getattr(out, name).numpy() for name in ("count", "state")},
+                "rows": [_pair_rows(out, pair) for pair in range(tiled_begin, end)],
             }
         )
     grid, wider = results
-    # Not vacuous: more pairs are queued and deferred than the grid has blocks, and every deferred pair overflows.
+    # Not vacuous: more pairs are queued and deferred than the grid has blocks, and every deferred pair has more rows
+    # than its walk slots (spill rows).
     test.assertEqual(grid["queued"], len(bodies))
     test.assertEqual(grid["deferred"], len(bodies))
     test.assertGreater(grid["deferred"], blocks)
-    test.assertEqual(grid["overflow"], [len(bodies), 0])
-    for name in ("queued", "deferred", "overflow"):
+    test.assertEqual(grid["overflow"], [0, 0])
+    test.assertTrue(np.all(grid["count"][tiled_begin:end] > rows))
+    test.assertEqual(grid["spilled"], int(grid["count"][tiled_begin:end].sum()))
+    for name in ("queued", "deferred", "overflow", "spilled"):
         test.assertEqual(wider[name], grid[name], msg=name)
-    for name in ("count", "state", "q", "n", "d", "feature"):
+    for name in ("count", "state"):
         np.testing.assert_array_equal(wider[name], grid[name], err_msg=name)
-    test.assertTrue(np.all(grid["state"][tiled_begin:end] & int(TERRAIN_PAIR_ROW_OVERFLOW)))
+    for a, b in zip(wider["rows"], grid["rows"], strict=True):
+        for name in ("q", "n", "d", "feature"):
+            np.testing.assert_array_equal(a[name], b[name], err_msg=name)
 
 
 def test_shadow_keeps_contacts_bitwise_with_every_class(test, device):
@@ -1554,9 +1607,10 @@ for _name, _func in (
     ("test_recovery_rows_have_distinct_feature_ids", test_recovery_rows_have_distinct_feature_ids),
     ("test_solid_rows_match_the_float64_law", test_solid_rows_match_the_float64_law),
     ("test_tiled_kernels_match_one_thread_kernels", test_tiled_kernels_match_one_thread_kernels),
-    ("test_row_overflow_keeps_each_plane_deepest", test_row_overflow_keeps_each_plane_deepest),
+    ("test_long_box_keeps_every_support", test_long_box_keeps_every_support),
     ("test_deferred_pairs_keep_their_rows_beyond_the_grid", test_deferred_pairs_keep_their_rows_beyond_the_grid),
-    ("test_candidate_overflow_keeps_the_first_rows_flagged", test_candidate_overflow_keeps_the_first_rows_flagged),
+    ("test_wide_box_keeps_every_support", test_wide_box_keeps_every_support),
+    ("test_window_past_its_bound_is_flagged", test_window_past_its_bound_is_flagged),
     ("test_solid_launches_share_the_point_grids", test_solid_launches_share_the_point_grids),
     ("test_solid_fixed_grids_take_each_pair_once", test_solid_fixed_grids_take_each_pair_once),
     ("test_shadow_keeps_contacts_bitwise_with_every_class", test_shadow_keeps_contacts_bitwise_with_every_class),

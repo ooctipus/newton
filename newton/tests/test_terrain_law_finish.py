@@ -1,7 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Check the terrain law's shared per-pair finish and its output layout (feature ids, overflow flags)."""
+"""Check the terrain law's shared per-pair finish and its output layout (feature ids, overflow flags).
+
+The finish keeps every row the law selects: no count bounds a pair's rows, and it takes any number of candidates
+(:func:`~newton._src.geometry.terrain_law.terrain_finish_list`, its state in a full-finish scratch).
+"""
 
 import unittest
 
@@ -15,14 +19,13 @@ from newton._src.geometry.terrain_law import (
     TERRAIN_FEATURE_BITS,
     TERRAIN_FINISH_CANDIDATE_OVERFLOW,
     TERRAIN_FINISH_ROW_OVERFLOW,
-    TERRAIN_ROW_CANDIDATES,
     TERRAIN_STATUS_ROWS,
-    TerrainRows,
+    TerrainFinishScratch,
     terrain_feature_id,
     terrain_feature_parts,
-    terrain_finish,
+    terrain_finish_list,
+    terrain_finish_scratch,
     terrain_report,
-    terrain_rows_push,
 )
 from newton.tests import terrain_law_reference as ref
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -40,23 +43,26 @@ def _finish(
     d: wp.array2d[float],
     counts: wp.array[int],
     eps: float,
-    row_limit: int,
+    scratch: TerrainFinishScratch,
     order: wp.array2d[int],
     kept: wp.array[int],
-    flags: wp.array[int],
-    status: wp.array[wp.int32],
-    overflow: wp.array[wp.int32],
 ):
+    """Per list: the candidates into its block of a finish scratch (feature id: the candidate's index), the finish,
+    and the kept candidates' indices in candidate order."""
     i = wp.tid()
-    rows = TerrainRows()
+    base = i * scratch.capacity
     for j in range(counts[i]):
-        rows = terrain_rows_push(rows, q[i, j], k[i, j], n[i, j], d[i, j], j)
-    selected, count, flag = terrain_finish(rows, eps, row_limit)
-    kept[i] = count
-    flags[i] = flag
-    for j in range(count):
-        order[i, j] = rows.feature[selected[j]]
-    terrain_report(status, overflow, flag, True)
+        scratch.q[base + j] = q[i, j]
+        scratch.k[base + j] = k[i, j]
+        scratch.n[base + j] = n[i, j]
+        scratch.d[base + j] = d[i, j]
+        scratch.feature[base + j] = j
+    kept[i] = terrain_finish_list(scratch, base, counts[i], eps)
+    written = int(0)
+    for j in range(counts[i]):
+        if scratch.mark[base + j] != 0:
+            order[i, written] = scratch.feature[base + j]
+            written += 1
 
 
 @wp.kernel(enable_backward=False)
@@ -130,7 +136,7 @@ def _random_rows(rng):
     return [rows[i] for i in order]
 
 
-def _run(device, row_sets, row_limit):
+def _run(device, row_sets):
     count = len(row_sets)
     q = np.zeros((count, MAX_ROWS, 3), np.float32)
     k = np.zeros_like(q)
@@ -141,11 +147,8 @@ def _run(device, row_sets, row_limit):
         counts[i] = len(rows)
         for j, row in enumerate(rows):
             q[i, j], k[i, j], n[i, j], d[i, j] = row.q, row.k, row.n, row.d
-    order = wp.zeros((count, TERRAIN_ROW_CANDIDATES), dtype=int, device=device)
+    order = wp.zeros((count, MAX_ROWS), dtype=int, device=device)
     kept = wp.zeros(count, dtype=int, device=device)
-    flags = wp.zeros(count, dtype=int, device=device)
-    status = wp.zeros(1, dtype=wp.int32, device=device)
-    overflow = wp.zeros(2, dtype=wp.int32, device=device)
     wp.launch(
         _finish,
         dim=count,
@@ -156,30 +159,29 @@ def _run(device, row_sets, row_limit):
             wp.array(d, dtype=float, device=device),
             wp.array(counts, dtype=int, device=device),
             EPS,
-            row_limit,
+            terrain_finish_scratch(device, MAX_ROWS, blocks=count),
         ],
-        outputs=[order, kept, flags, status, overflow],
+        outputs=[order, kept],
         device=device,
     )
     kept = kept.numpy()
     order = order.numpy()
-    return [order[i, : kept[i]].tolist() for i in range(count)], flags.numpy(), status, overflow
+    return [order[i, : kept[i]].tolist() for i in range(count)]
 
 
 def test_finish_matches_reference(test, device):
     """Keep the rows the float64 finish keeps: coincident rows merged, implied rows dropped, four per plane group."""
     rng = np.random.default_rng(8)
     row_sets = [_random_rows(rng) for _ in range(300)]
-    kept, flags, _status, _overflow = _run(device, row_sets, 32)
+    kept = _run(device, row_sets)
     implied = merged = reduced = 0
-    for rows, got, flag in zip(row_sets, kept, flags, strict=True):
+    for rows, got in zip(row_sets, kept, strict=True):
         stats = ref.Stats()
         expected = ref.finish(rows, stats=stats)
         implied += stats.implied
         merged += stats.merged
         reduced += stats.reduced
         test.assertEqual(sorted(got), sorted(next(i for i, r in enumerate(rows) if r is e) for e in expected))
-        test.assertEqual(flag, 0)
         test.assertEqual(got, sorted(got))
     # The cases exercise every rule.
     test.assertGreater(implied, 50)
@@ -198,7 +200,7 @@ def test_plane_groups_form_by_tolerance(test, device):
     for x, depth, z in ((0.0, 0.01, 0.1234567849999), (0.1, 0.01, 0.1234567849999), (0.05, 0.012, 0.1234567850001)):
         q = np.array([x, 0.0, z])
         rows.append(ref.Row(q, q + depth * n, n.copy(), depth, None))
-    kept, _flags, _status, _overflow = _run(device, [rows], 8)
+    kept = _run(device, [rows])
     test.assertEqual(kept[0], [0, 1])
     test.assertEqual([next(i for i, r in enumerate(rows) if r is e) for e in ref.finish(rows)], [0, 1])
 
@@ -221,48 +223,29 @@ def _corner_rows(rng, groups, corners):
     return [rows[i] for i in order]
 
 
-def test_finish_overflow_keeps_supports(test, device):
-    """On overflow keep every plane group's deepest row first, then its extremes, and raise a sticky status bit.
+def test_finish_keeps_every_plane_group(test, device):
+    """Keep every plane group's rows, four at most per group, however many groups and candidates a pair has.
 
-    Five groups of four rows against a limit of 16, and four groups of six rows (each capped to four) against a
-    limit of 12; the float64 finish's row limit selects the same rows.
+    Five groups of four rows (20 rows) and four groups of six rows (each reduced to four, 16 rows): the float64
+    finish keeps the same rows. No count bounds a pair's rows: the finish once kept 16 and 12 of them, each group's
+    deepest first, and flagged the rest. A line of 40 equal-depth points (more candidates than its list once held)
+    keeps its two ends.
     """
     rng = np.random.default_rng(9)
-    for groups, corners, row_limit in ((5, 4, 16), (4, 6, 12)):
+    for groups, corners in ((5, 4), (4, 6)):
         row_sets = [_corner_rows(rng, groups, corners) for _ in range(40)]
-        kept, flags, status, overflow = _run(device, row_sets, row_limit)
-        for rows, got, flag in zip(row_sets, kept, flags, strict=True):
+        kept = _run(device, row_sets)
+        for rows, got in zip(row_sets, kept, strict=True):
             stats = ref.Stats()
-            expected = ref.finish(rows, stats=stats, row_limit=row_limit)
-            test.assertEqual(len(got), row_limit)
-            test.assertEqual(flag, int(TERRAIN_FINISH_ROW_OVERFLOW))
+            expected = ref.finish(rows, stats=stats)
+            test.assertEqual(len(got), groups * min(corners, 4))
             test.assertEqual(got, sorted(next(i for i, r in enumerate(rows) if r is e) for e in expected))
-            test.assertEqual(stats.limited, groups * min(corners, 4) - row_limit)
-            # Every group keeps its deepest row.
-            deepest = {}
-            for i, r in enumerate(rows):
-                key = tuple(np.round(r.n, 9))
-                if key not in deepest or r.d < rows[deepest[key]].d:
-                    deepest[key] = i
-            test.assertTrue(set(deepest.values()) <= set(got))
-        test.assertEqual(int(status.numpy()[0]), int(TERRAIN_STATUS_ROWS))
-        test.assertEqual(overflow.numpy().tolist(), [40, 0])
-    # The buffer verifier starts from the status word and keeps the bit.
-    zero = wp.zeros(1, dtype=wp.int32, device=device)
-    active = wp.zeros(2, dtype=wp.int32, device=device)
-    args = [zero, 1, zero, -1, zero, 1, zero, -1, zero, -1, zero, 1, zero, 1, zero, 1, zero, 1, zero, 1, zero, 1]
-    wp.launch(verify_narrow_phase_buffers, dim=1, inputs=[*args, active, 0, zero, 80, status], device=device)
-    test.assertEqual(int(status.numpy()[0]), int(TERRAIN_STATUS_ROWS))
-    # More candidates than the finish holds: the extra ones are counted and flagged.
+            test.assertEqual(stats.limited, 0)
     many = [
         ref.Row(np.array([0.01 * i, 0.0, 0.0]), np.array([0.01 * i, 0.0, 0.02]), np.array([0.0, 0.0, 1.0]), 0.02, None)
         for i in range(40)
     ]
-    kept, flags, status, overflow = _run(device, [many], 8)
-    test.assertEqual(flags[0], int(TERRAIN_FINISH_CANDIDATE_OVERFLOW))
-    test.assertEqual(overflow.numpy().tolist(), [0, 1])
-    # A line of equal-depth points keeps its two ends.
-    test.assertEqual(kept[0], [0, TERRAIN_ROW_CANDIDATES - 1])
+    test.assertEqual(_run(device, [many])[0], [0, 39])
 
 
 def test_feature_ids_fit_the_sort_key(test, device):
@@ -294,7 +277,8 @@ def test_feature_ids_fit_the_sort_key(test, device):
 
 
 def test_terrain_report_raises_at_the_capacity_check(test, device):
-    """Raise at the narrow phase's capacity check, by name, after a terrain pair overflows or reads stale features."""
+    """Raise at the narrow phase's capacity check, by name, after a terrain pair's rows find no room in the spill
+    region, its window outgrows its scratch or it reads stale features; the buffer verifier keeps the bit."""
     builder = newton.ModelBuilder()
     builder.add_shape_sphere(builder.add_body(), radius=0.1)
     narrow = newton.CollisionPipeline(builder.finalize(device=device), verify_buffers=True).narrow_phase
@@ -311,6 +295,14 @@ def test_terrain_report_raises_at_the_capacity_check(test, device):
             test.assertEqual([key for key, value in narrow.buffer_capacity_status().items() if value], [name])
             with test.assertRaisesRegex(RuntimeError, name):
                 narrow.check_buffer_capacity()
+    test.assertEqual(overflow.numpy().tolist(), [1, 1])
+    # The buffer verifier starts from the status word and keeps the bit.
+    status = wp.array([int(TERRAIN_STATUS_ROWS)], dtype=wp.int32, device=device)
+    zero = wp.zeros(1, dtype=wp.int32, device=device)
+    active = wp.zeros(2, dtype=wp.int32, device=device)
+    args = [zero, 1, zero, -1, zero, 1, zero, -1, zero, -1, zero, 1, zero, 1, zero, 1, zero, 1, zero, 1, zero, 1]
+    wp.launch(verify_narrow_phase_buffers, dim=1, inputs=[*args, active, 0, zero, 80, status], device=device)
+    test.assertEqual(int(status.numpy()[0]), int(TERRAIN_STATUS_ROWS))
 
 
 class TestTerrainLawFinish(unittest.TestCase):
@@ -320,7 +312,7 @@ class TestTerrainLawFinish(unittest.TestCase):
 devices = get_test_devices()
 for _name, _func in (
     ("test_finish_matches_reference", test_finish_matches_reference),
-    ("test_finish_overflow_keeps_supports", test_finish_overflow_keeps_supports),
+    ("test_finish_keeps_every_plane_group", test_finish_keeps_every_plane_group),
     ("test_plane_groups_form_by_tolerance", test_plane_groups_form_by_tolerance),
     ("test_feature_ids_fit_the_sort_key", test_feature_ids_fit_the_sort_key),
     ("test_terrain_report_raises_at_the_capacity_check", test_terrain_report_raises_at_the_capacity_check),

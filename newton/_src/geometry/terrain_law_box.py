@@ -14,7 +14,7 @@ per queued pair on the work list's fixed grid (the lanes mark the window vertice
 those in window order and finishes the pair, which gives it the one-thread kernel's rows), and
 :func:`terrain_box_rows_full`, on the fixed full-finish grid of its
 :class:`~newton._src.geometry.terrain_law.TerrainFinishScratch` striding over the class's deferred list, the pairs the
-other two deferred (more distinct rows than the class's 16 slots). The walk, the rules and the finish are
+other two deferred (more distinct rows than the class's 16 walk slots). The walk, the rules and the finish are
 :mod:`~newton._src.geometry.terrain_law_solid`'s; the module is compiled without floating-point contraction, so the CPU
 decides every boundary as the GPU does.
 """
@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import warp as wp
 
-from .terrain_contacts import TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_ROWS
+from .terrain_contacts import TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_WALK_SLOTS
 from .terrain_law import (
     TerrainFeatureData,
     TerrainFinishScratch,
@@ -48,10 +48,10 @@ from .terrain_law_solid import (
 # Every float32 operation rounds as on the CPU (see the module docstring).
 wp.set_module_options({"fuse_fp": False})
 
-TERRAIN_BOX_ROWS = TERRAIN_PARTNER_ROWS[TERRAIN_PARTNER_BOX]
-"""Rows a pair of the class keeps (its slots): 16."""
+TERRAIN_BOX_WALK_SLOTS = TERRAIN_PARTNER_WALK_SLOTS[TERRAIN_PARTNER_BOX]
+"""Walk slots of a pair of the class: its distinct rows while it walks its window, and its rows when they fit: 16."""
 
-_ROWS = wp.constant(TERRAIN_BOX_ROWS)
+_ROWS = wp.constant(TERRAIN_BOX_WALK_SLOTS)
 _CLASS = wp.constant(TERRAIN_PARTNER_BOX)
 _MASK_WORDS = wp.constant(TERRAIN_SOLID_MASK_WORDS)
 
@@ -79,8 +79,8 @@ def terrain_box_rows(
     solids: TerrainSolidData,
 ):
     """The law's rows of the class's pairs, one thread per pair (``begin`` and ``slot_begin`` are the class's first
-    pair and slot); a pair from ``work.first`` on whose window holds more than ``solids.thread_vertices`` vertices is
-    queued in ``work`` for the tiled kernel.
+    pair and walk slot); a pair from ``work.first`` on whose window holds more than ``solids.thread_vertices`` vertices
+    is queued in ``work`` for the tiled kernel.
 
     Launch: ``wp.launch`` with one thread per pair of the class and ``block_dim``
     :func:`~newton._src.geometry.terrain_law.terrain_law_block_dim`.
@@ -111,7 +111,7 @@ def terrain_box_rows_tiled(
     solids: TerrainSolidData,
 ):
     """The class's pairs the one-thread kernel queued for their large windows, ``wp.block_dim()`` lanes per pair
-    (``begin`` and ``slot_begin`` are the tiled segment's first pair and slot): the grid's ``work.blocks`` blocks
+    (``begin`` and ``slot_begin`` are the tiled segment's first pair and walk slot): the grid's ``work.blocks`` blocks
     stride over the queue; a block's lanes mark the window vertices that yield a row, and its first lane walks those in
     window order and finishes the pair, which gives it the one-thread walk's rows.
 
@@ -166,11 +166,12 @@ def terrain_box_rows_full(
     scratch: TerrainFinishScratch,
     solids: TerrainSolidData,
 ):
-    """Finish the class's deferred pairs (``begin`` and ``slot_begin`` are the class's first pair and slot): the grid's
-    ``scratch.blocks`` blocks stride over the class's deferred list, and each block's first lane walks its pairs again,
-    one at a time, into the block's scratch list (:data:`~newton._src.geometry.terrain_law.TERRAIN_ROW_CANDIDATES`
-    rows), runs the finish and writes the kept rows. A pair's rows depend on the pair alone: not on the order of the
-    deferral, the number of deferred pairs or the block that finishes it.
+    """Finish the class's deferred pairs (``begin`` and ``slot_begin`` are the class's first pair and walk slot): the
+    grid's ``scratch.blocks`` blocks stride over the class's deferred list, and each block's first lane walks its pairs
+    again, one at a time, into the block's scratch (every distinct candidate a window of the class can give), runs the
+    finish and writes every row it keeps, in the pair's walk slots when they fit, else in rows of the spill region. A
+    pair's rows depend on the pair alone: not on the order of the deferral, the number of deferred pairs or the block
+    that finishes it.
 
     Launch: ``wp.launch_tiled`` with ``dim=scratch.blocks`` and ``block_dim``
     :func:`~newton._src.geometry.terrain_law.terrain_law_block_dim`. A block past ``scratch.blocks`` returns at once
@@ -185,6 +186,4 @@ def terrain_box_rows_full(
         i = pair - begin
         _state, frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
         _supported, core = _core(local, size, inputs.shape_type[partner], partner, solids)
-        solid_rows_full(
-            core, data, out, scratch, block, pair, slot_begin + i * _ROWS, _ROWS, _CLASS, frame, heightfield, reach
-        )
+        solid_rows_full(core, data, out, scratch, block, pair, slot_begin + i * _ROWS, _ROWS, frame, heightfield, reach)

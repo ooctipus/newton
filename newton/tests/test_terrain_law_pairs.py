@@ -1,10 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Check the terrain law's static pair table: filter, partner classes, lane classes, segments and output slots."""
+"""Check the terrain law's static pair table: filter, partner classes, lane classes, segments, walk slots and the
+bounds on every pair's window and candidates."""
 
 import math
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import warp as wp
@@ -20,10 +22,13 @@ from newton._src.geometry.terrain_contacts import (
     TERRAIN_PARTNER_CYLINDER,
     TERRAIN_PARTNER_HULL,
     TERRAIN_PARTNER_POINT,
-    TERRAIN_PARTNER_ROWS,
+    TERRAIN_PARTNER_WALK_SLOTS,
     TerrainPairTable,
     heightfield_pair_table,
+    terrain_window_vertices,
 )
+from newton._src.geometry.terrain_law import TERRAIN_CELL_WIDEN
+from newton.tests import terrain_law_reference as ref
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 _CLASS = {
@@ -107,6 +112,11 @@ def _window_cells(radius, reach, cell):
     return side * side
 
 
+_ROWS_PER_VERTEX = {"sphere": (6, 1), "big_sphere": (6, 1), "capsule": (16, 3)}
+"""Rows a window vertex's features give a point core at most, and the rows its ends' exits and its axis's recovery
+add (any other partner: a solid's 15 per vertex and 4 recovery rows)."""
+
+
 def test_pair_table_from_the_collision_filter(test, device):
     """List every (heightfield, convex partner) pair the filter admits, by partner class, lane class and world."""
     model, heightfield, kinds, excluded = _scene(device)
@@ -134,7 +144,6 @@ def test_pair_table_from_the_collision_filter(test, device):
     # Sorted by (partner class, lane class, world): every segment is one contiguous range.
     key = table.partner_class * TERRAIN_LANE_CLASSES + table.lane_class
     test.assertTrue(np.all(np.diff(key) >= 0))
-    rows_total = 0
     for partner in range(TERRAIN_PARTNER_CLASSES):
         for lane in range(TERRAIN_LANE_CLASSES):
             begin, end = table.segment(partner, lane)
@@ -143,12 +152,14 @@ def test_pair_table_from_the_collision_filter(test, device):
             test.assertTrue(np.all(table.lane_class[segment] == lane))
             test.assertTrue(np.all(np.diff(table.world[segment]) >= 0))
             test.assertEqual(end - begin, int(np.sum((table.partner_class == partner) & (table.lane_class == lane))))
-            for pair in range(begin, end):
-                slots = table.slots(pair)
-                test.assertEqual(slots[0], rows_total)
-                test.assertEqual(slots[1] - slots[0], TERRAIN_PARTNER_ROWS[partner])
-                rows_total = slots[1]
-    test.assertEqual(table.slot_count, rows_total)
+            test.assertTrue(np.all(table.walk_slots[segment] == TERRAIN_PARTNER_WALK_SLOTS[partner]))
+    # Every pair's bound on its candidates: its largest window's vertices (21 x 21 at most) times the rows a vertex's
+    # features give its partner, and the rows added after the walk.
+    for i, b in enumerate(pairs[:, 1]):
+        kind = kinds[int(b)][0]
+        side = min(math.floor(2.0 * (radius[b] + 0.04) / 0.1) + 4, 21)
+        per_vertex, per_pair = _ROWS_PER_VERTEX.get(kind, (15, 4))
+        test.assertEqual(table.candidates[i], per_vertex * side * side + per_pair, msg=kind)
     test.assertEqual(table.memory_bytes()["pairs"], 8 * len(kinds))
 
 
@@ -178,7 +189,76 @@ def test_pair_table_of_a_filtered_heightfield_is_empty(test, device):
     test.assertEqual(model.shape_contact_pair_count, 0)
     table = TerrainPairTable(model)
     test.assertEqual(table.pair_count, 0)
-    test.assertEqual(table.slot_count, 0)
+    test.assertEqual(len(table.candidates), 0)
+
+
+def _box_cells(hf, lo, hi):
+    """The cells ``terrain_box_cells`` gives a footprint box (float32 cell coordinates widened by
+    ``TERRAIN_CELL_WIDEN`` cells, clamped to the grid)."""
+    u0 = np.float32((np.float32(lo[0]) + np.float32(hf.hx)) / np.float32(hf.dx)) - np.float32(TERRAIN_CELL_WIDEN)
+    u1 = np.float32((np.float32(hi[0]) + np.float32(hf.hx)) / np.float32(hf.dx)) + np.float32(TERRAIN_CELL_WIDEN)
+    v0 = np.float32((np.float32(lo[1]) + np.float32(hf.hy)) / np.float32(hf.dy)) - np.float32(TERRAIN_CELL_WIDEN)
+    v1 = np.float32((np.float32(hi[1]) + np.float32(hf.hy)) / np.float32(hf.dy)) + np.float32(TERRAIN_CELL_WIDEN)
+    c0, c1 = max(int(np.floor(u0)), 0), min(int(np.floor(u1)), hf.cols - 1)
+    r0, r1 = max(int(np.floor(v0)), 0), min(int(np.floor(v1)), hf.rows - 1)
+    return r0, r1, c0, c1
+
+
+def test_window_bound_holds_for_every_pose(test, device):
+    """Bound every pair's window, whatever its pose, by the vertices its shape extent, reach and cells give.
+
+    The full-finish kernels' scratch holds the candidates such a window can give, so this bound is what makes them
+    complete. Random positions (on cell lines and off them, 60 m from the origin of a 200 m grid, where float32 cell
+    coordinates round coarsest) and orientations of every kind, each window taken as the kernels take it: the core's
+    bounds (its axis-aligned box or its ends) widened by the reach.
+    """
+    rng = np.random.default_rng(5)
+    # a 200 m grid of 0.1 m cells: its layout is all a window reads
+    hf = SimpleNamespace(hx=100.0, hy=100.0, dx=0.1, dy=0.1, rows=2000, cols=2000)
+    shapes = (
+        ("sphere", {"radius": 0.25}),
+        ("capsule", {"radius": 0.12, "half_height": 0.35}),
+        ("box", {"half": (0.0465, 0.0315, 0.1425)}),
+        ("cylinder", {"radius": 0.0175, "half_height": 0.1979}),
+        ("cone", {"radius": 0.07, "half_height": 0.0816}),
+        ("ellipsoid", {"semi": (0.12, 0.22, 0.29)}),
+    )
+    reach = 0.04
+    for kind, dims in shapes:
+        radius = {
+            "sphere": dims.get("radius", 0.0),
+            "capsule": dims.get("radius", 0.0) + dims.get("half_height", 0.0),
+            "box": float(np.linalg.norm(dims.get("half", (0.0, 0.0, 0.0)))),
+            "cylinder": dims.get("radius", 0.0) + dims.get("half_height", 0.0),
+            "cone": dims.get("radius", 0.0) + dims.get("half_height", 0.0),
+            "ellipsoid": max(dims.get("semi", (0.0,))),
+        }[kind]
+        bound = int(terrain_window_vertices(radius, reach, hf.dx, hf.dy, 2001, 2001))
+        side = math.floor(2.0 * (radius + reach) / hf.dx) + 4
+        test.assertEqual(bound, side * side)
+        largest = 0
+        widest = 0
+        for _ in range(2000):
+            x, y = rng.uniform(-60.0, 60.0, 2)
+            if rng.uniform() < 0.3:
+                x = np.round(x / hf.dx) * hf.dx + rng.choice([0.0, 1e-6, -1e-6])
+            q = rng.normal(size=4)
+            q /= np.linalg.norm(q)
+            core = ref.make_core(kind, dims, np.r_[x, y, 0.1, q])
+            if kind in ("sphere", "capsule"):
+                ends = [core.a, core.b] if kind == "capsule" else [core.c]
+                lo = np.min(ends, axis=0) - (dims["radius"] + reach)
+                hi = np.max(ends, axis=0) + (dims["radius"] + reach)
+            else:
+                lo, hi = core.aabb()
+                lo, hi = lo - reach, hi + reach
+            r0, r1, c0, c1 = _box_cells(hf, lo, hi)
+            largest = max(largest, (r1 - r0 + 2) * (c1 - c0 + 2))
+            widest = max(widest, r1 - r0 + 2, c1 - c0 + 2)
+        test.assertLessEqual(largest, bound, msg=kind)
+        test.assertLessEqual(widest, side, msg=kind)
+        # Not vacuous: windows come within two vertices of the bound's side.
+        test.assertGreaterEqual(widest, side - 2, msg=(kind, widest, side))
 
 
 class TestTerrainLawPairs(unittest.TestCase):
@@ -211,6 +291,12 @@ add_function_test(
     "test_pair_table_of_a_filtered_heightfield_is_empty",
     test_pair_table_of_a_filtered_heightfield_is_empty,
     devices=devices,
+)
+add_function_test(
+    TestTerrainLawPairs,
+    "test_window_bound_holds_for_every_pose",
+    test_window_bound_holds_for_every_pose,
+    devices=["cpu"],
 )
 
 

@@ -34,19 +34,17 @@ from newton._src.geometry.terrain_law import (
     TERRAIN_FEATURE_EDGE,
     TERRAIN_FEATURE_FACE,
     TERRAIN_FEATURE_RECOVERY,
-    TERRAIN_LAW_FULL_BLOCKS,
+    TERRAIN_FINISH_CANDIDATE_OVERFLOW,
     TERRAIN_PAIR_FILTERED,
     TERRAIN_PAIR_OUTSIDE,
-    TERRAIN_PAIR_ROW_OVERFLOW,
     TERRAIN_PAIR_STALE,
     TERRAIN_PAIR_TILE_EXIT,
-    TERRAIN_ROW_CANDIDATES,
     TerrainFeatureData,
+    TerrainFinishScratch,
     TerrainLawRows,
     TerrainPairInputs,
     TerrainPairWork,
     TerrainPlanes,
-    TerrainRows,
     TerrainWindow,
     terrain_claims,
     terrain_edge_kind,
@@ -54,15 +52,17 @@ from newton._src.geometry.terrain_law import (
     terrain_eps,
     terrain_face_values,
     terrain_feature_id,
-    terrain_finish,
+    terrain_finish_list,
     terrain_finish_scratch,
     terrain_finish_state,
     terrain_law_block_dim,
+    terrain_law_rows,
     terrain_pair_exit,
     terrain_pair_work,
     terrain_plane,
     terrain_planes,
     terrain_report,
+    terrain_spill_rows,
     terrain_store_row,
     terrain_window,
     terrain_window_extent,
@@ -690,14 +690,19 @@ def _launch_segment(shadow, model, pipeline, lane, begin, count, out, *, kernel=
         _launch_full(shadow, model, pipeline, begin, out)
 
 
-def _launch_full(shadow, model, pipeline, begin, out, *, blocks=TERRAIN_LAW_FULL_BLOCKS):
-    """Run the full-finish kernel, with ``blocks`` blocks, over the pairs of ``out``'s deferred list
-    (``deferred_count``) from table pair ``begin``."""
-    scratch = terrain_finish_scratch(model.device, blocks=blocks)
+def _candidates(shadow) -> int:
+    """The distinct candidates a full-finish block of the point class holds (the most any of its pairs can give)."""
+    return shadow.describe()["launch_shapes"]["point"]["full_candidates"]
+
+
+def _launch_full(shadow, model, pipeline, begin, out, *, blocks=None):
+    """Run the full-finish kernel, with ``blocks`` blocks (the shadow's grid when ``None``), over the pairs of
+    ``out``'s deferred list (``deferred_count``) from table pair ``begin``."""
+    scratch = terrain_finish_scratch(model.device, _candidates(shadow), blocks=blocks)
     args = [begin, 0, _pair_inputs(shadow, model, pipeline), shadow.features.data(), out, scratch]
     wp.launch_tiled(
         terrain_law_point.terrain_point_rows_full,
-        dim=blocks,
+        dim=scratch.blocks,
         inputs=args,
         block_dim=terrain_law_block_dim(model.device),
         device=model.device,
@@ -705,32 +710,30 @@ def _launch_full(shadow, model, pipeline, begin, out, *, blocks=TERRAIN_LAW_FULL
 
 
 def _side_buffer(begin, count, pair_count, device):
-    """A side buffer for ``count`` pairs from table pair ``begin`` (slots from 0), deferred list from ``begin``."""
-    out = TerrainLawRows()
-    slots = count * terrain_law_point.TERRAIN_POINT_ROWS
-    out.q = wp.zeros(slots, dtype=wp.vec3, device=device)
-    out.n = wp.zeros(slots, dtype=wp.vec3, device=device)
-    out.d = wp.zeros(slots, dtype=float, device=device)
-    out.feature = wp.zeros(slots, dtype=wp.int32, device=device)
-    out.count = wp.zeros(pair_count, dtype=wp.int32, device=device)
-    out.state = wp.zeros(pair_count, dtype=wp.int32, device=device)
-    out.status = wp.zeros(1, dtype=wp.int32, device=device)
-    out.overflow = wp.zeros(2, dtype=wp.int32, device=device)
-    out.deferred = wp.zeros(pair_count, dtype=wp.int32, device=device)
-    out.deferred_first = wp.full(4, begin, dtype=wp.int32, device=device)
-    out.deferred_count = wp.zeros(4, dtype=wp.int32, device=device)
-    return out
+    """A side buffer for ``count`` pairs from table pair ``begin`` (walk slots from 0, then a spill region of as many
+    rows), deferred list from ``begin``."""
+    slots = count * terrain_law_point.TERRAIN_POINT_WALK_SLOTS
+    return terrain_law_rows(device, pair_count, slots, max(slots, 4096), [begin] * 4)
 
 
 def _host_rows(out) -> dict:
-    """A side buffer's per-pair counts and states and its slots' rows (host arrays), and its point class's deferred
-    pairs: how many (``deferred``) and which (``deferred_pairs``, in list order)."""
-    rows = {f: getattr(out, f).numpy() for f in ("count", "state", "q", "n", "d", "feature")}
+    """A side buffer's per-pair first rows, counts and states and its rows (host arrays), its spill rows asked for
+    (``spilled``), and its point class's deferred pairs: how many (``deferred``) and which (``deferred_pairs``, in
+    list order)."""
+    rows = {f: getattr(out, f).numpy() for f in ("first", "count", "state", "q", "n", "d", "feature")}
     deferred = int(out.deferred_count.numpy()[TERRAIN_PARTNER_POINT])
     first = int(out.deferred_first.numpy()[TERRAIN_PARTNER_POINT])
     rows["deferred"] = deferred
     rows["deferred_pairs"] = out.deferred.numpy()[first : first + deferred]
+    rows["slots"] = out.slots
+    rows["spilled"] = int(out.spilled.numpy()[0])
     return rows
+
+
+def _pair_rows(rows: dict, pair: int) -> slice:
+    """The rows of a table pair in a side buffer (:func:`_host_rows`): its walk slots or its spill rows."""
+    first = int(rows["first"][pair])
+    return slice(first, first + int(rows["count"][pair]))
 
 
 def _bits(values: np.ndarray) -> np.ndarray:
@@ -740,17 +743,16 @@ def _bits(values: np.ndarray) -> np.ndarray:
 
 
 def _assert_same_rows(a: dict, b: dict, begin: int, count: int, what: str):
-    """Assert that two side buffers (:func:`_host_rows`) give table pairs ``[begin, begin + count)``, whose slots start
-    at 0, the same count, state and rows, bit for bit."""
+    """Assert that two side buffers (:func:`_host_rows`) give table pairs ``[begin, begin + count)`` the same count,
+    state and rows, bit for bit, wherever each keeps them (walk slots or spill rows, which take the order the pairs are
+    finished in)."""
     pairs = slice(begin, begin + count)
     np.testing.assert_array_equal(a["count"][pairs], b["count"][pairs], err_msg=f"{what}: count")
     np.testing.assert_array_equal(a["state"][pairs], b["state"][pairs], err_msg=f"{what}: state")
     for i in range(count):
-        rows = slice(
-            i * terrain_law_point.TERRAIN_POINT_ROWS, i * terrain_law_point.TERRAIN_POINT_ROWS + a["count"][begin + i]
-        )
+        rows_a, rows_b = _pair_rows(a, begin + i), _pair_rows(b, begin + i)
         for f in ("q", "n", "d", "feature"):
-            np.testing.assert_array_equal(_bits(a[f][rows]), _bits(b[f][rows]), err_msg=f"{what}: pair {i} {f}")
+            np.testing.assert_array_equal(_bits(a[f][rows_a]), _bits(b[f][rows_b]), err_msg=f"{what}: pair {i} {f}")
 
 
 def _full_on_every_pair(shadow, model, pipeline, begin, count) -> dict:
@@ -773,15 +775,12 @@ def _assert_full_rows(test, walked: dict, finished: dict, begin: int, count: int
         if walked["state"][pair] & EXITS:
             continue
         compared += 1
-        rows = slice(
-            i * terrain_law_point.TERRAIN_POINT_ROWS,
-            i * terrain_law_point.TERRAIN_POINT_ROWS + int(walked["count"][pair]),
-        )
         test.assertEqual(walked["count"][pair], finished["count"][pair], msg=f"{what} pair {i}")
         test.assertEqual(walked["state"][pair], finished["state"][pair], msg=f"{what} pair {i}")
+        rows_walked, rows_finished = _pair_rows(walked, pair), _pair_rows(finished, pair)
         for f in ("q", "n", "d", "feature"):
             np.testing.assert_array_equal(
-                _bits(walked[f][rows]), _bits(finished[f][rows]), err_msg=f"{what} pair {i} {f}"
+                _bits(walked[f][rows_walked]), _bits(finished[f][rows_finished]), err_msg=f"{what} pair {i} {f}"
             )
     return compared
 
@@ -923,13 +922,8 @@ def test_tiled_kernel_matches_one_thread_kernel(test, device):
             test.assertGreaterEqual(int(one.count.numpy().sum()), len(bodies))
             deferred += int(one.deferred_count.numpy()[0])
             for tiled in outputs[1:]:
-                np.testing.assert_array_equal(one.count.numpy(), tiled.count.numpy())
-                np.testing.assert_array_equal(one.state.numpy(), tiled.state.numpy())
                 test.assertEqual(int(one.deferred_count.numpy()[0]), int(tiled.deferred_count.numpy()[0]))
-                for array in ("q", "n", "d", "feature"):
-                    np.testing.assert_array_equal(
-                        getattr(one, array).numpy(), getattr(tiled, array).numpy(), err_msg=array
-                    )
+                _assert_same_rows(_host_rows(one), _host_rows(tiled), begin, end - begin, f"{name}: tiled")
             finished = _full_on_every_pair(shadow, model, pipeline, begin, end - begin)
             _assert_full_rows(test, _host_rows(one), finished, begin, end - begin, name)
             hf = tu.reference_surface(tu.heightfield_model(heights, extent, extent, device="cpu"))
@@ -957,7 +951,7 @@ def test_tiled_kernel_matches_one_thread_kernel(test, device):
 wp.set_module_options({"fuse_fp": False})
 
 _Claim = terrain_law_point._Claim
-_PLAIN_ROWS = wp.constant(terrain_law_point.TERRAIN_POINT_ROWS)
+_PLAIN_ROWS = wp.constant(terrain_law_point.TERRAIN_POINT_WALK_SLOTS)
 _PLAIN_HELD = wp.constant(int(terrain_law_point._HELD))
 
 
@@ -1069,21 +1063,19 @@ def _plain_point_rows(
     planes, core = terrain_law_point._pair_core(data, window, planes, ka, kb, segment, reach, eps)
     terrain_law_point._open_pair(out, slot)
     held = int(0)
-    candidates = int(0)
     items = terrain_law_point._vertex_items(core)
     for r in range(cells[0], r1 + 2):
         for c in range(cells[2], c1 + 2):
             if held <= _PLAIN_HELD:
                 for item in range(items):
                     planes, claim = _plain_point_item(data, window, planes, core, r, c, r1, c1, item)
-                    held, candidates = terrain_law_point._walk_claim(out, slot, held, candidates, claim, eps)
+                    held = terrain_law_point._walk_claim(out, slot, held, claim, eps)
     terrain_law_point._close_pair(
-        out, pair, slot, terrain_law_point._wide(cells), held, candidates, data, window, planes, core, frame
+        out, pair, slot, terrain_law_point._wide(cells), held, data, window, planes, core, frame
     )
 
 
 _PLAIN_CLASS = wp.constant(TERRAIN_PARTNER_POINT)
-_PLAIN_CANDIDATES = wp.constant(TERRAIN_ROW_CANDIDATES)
 _PLAIN_ROW = wp.constant(int(terrain_law_point._ROW))
 _PLAIN_EXIT_A = wp.constant(int(terrain_law_point._EXIT_A))
 _PLAIN_EXIT_B = wp.constant(int(terrain_law_point._EXIT_B))
@@ -1091,21 +1083,16 @@ _PLAIN_SLOT_AXIS = wp.constant(int(terrain_law_point._SLOT_AXIS))
 
 
 @wp.func
-def _plain_candidate(rows: TerrainRows, claim: _Claim) -> TerrainRows:
-    """A pair's candidate list with a claim's row appended (counted as dropped when the list is full)."""
-    out = rows
-    n = out.count
-    if n < _PLAIN_CANDIDATES:
-        for j in range(3):
-            out.q[n, j] = claim.q[j]
-            out.k[n, j] = claim.k[j]
-            out.n[n, j] = claim.n[j]
-        out.d[n] = claim.d
-        out.feature[n] = claim.feature
-        out.count = n + 1
-    else:
-        out.dropped = out.dropped + 1
-    return out
+def _plain_candidate(scratch: TerrainFinishScratch, base: int, count: int, claim: _Claim) -> int:
+    """A pair's raw candidate list with a claim's row appended (counted past the list, which the bound on a pair's
+    candidates makes room for)."""
+    if count < scratch.capacity:
+        scratch.q[base + count] = claim.q
+        scratch.k[base + count] = claim.k
+        scratch.n[base + count] = claim.n
+        scratch.d[base + count] = claim.d
+        scratch.feature[base + count] = claim.feature
+    return count + 1
 
 
 @wp.kernel(enable_backward=False)
@@ -1115,17 +1102,20 @@ def _plain_point_rows_full(
     inputs: TerrainPairInputs,
     data: TerrainFeatureData,
     out: TerrainLawRows,
+    scratch: TerrainFinishScratch,
 ):
     """The full finish of the pairs a walk deferred, as the plain walk takes them: ``terrain_point_rows_full`` as one
-    thread per deferred pair (its form before the fixed grid), without the kernels' rejects, marks and scratch.
+    thread per deferred pair (its form before the fixed grid), without the kernels' rejects and marks, and with every
+    raw candidate held (the finish merges them, where the kernel merges them as it holds them).
 
     Every item of every window vertex in window order (:func:`_plain_point_item`: no vertex drop, no item marks, no
-    off-cell face reject) goes into a local candidate list, then the ends' exits (G2, G3) and the axis interior's G3,
-    then the law's finish (``terrain_finish``).
+    off-cell face reject) goes into the entry's candidate list, then the ends' exits (G2, G3) and the axis interior's
+    G3, then the law's finish (``terrain_finish_list``); rows beyond the walk slots go to the spill region.
     """
     entry = wp.tid()
     if entry >= out.deferred_count[_PLAIN_CLASS]:
         return
+    base = entry * scratch.capacity
     pair = out.deferred[out.deferred_first[_PLAIN_CLASS] + entry]
     _state, frame, heightfield, cells, a, b, segment, reach = terrain_law_point._pair_setup(inputs, data, pair)
     r1 = cells[1]
@@ -1140,7 +1130,7 @@ def _plain_point_rows_full(
     eps = terrain_eps(terrain_window_extent(data, window, r1, c1, extent))
     planes = terrain_planes()
     planes, core = terrain_law_point._pair_core(data, window, planes, ka, kb, segment, reach, eps)
-    rows = TerrainRows()
+    count = int(0)
     exit_a = _Claim()
     exit_b = _Claim()
     items = terrain_law_point._vertex_items(core)
@@ -1155,7 +1145,7 @@ def _plain_point_rows_full(
                     # With both ends outside: the axis's deepest crossing under a crease.
                     exit_b = claim
                 elif claim.kind == _PLAIN_ROW:
-                    rows = _plain_candidate(rows, claim)
+                    count = _plain_candidate(scratch, base, count, claim)
     # G2 and G3: one exit per end inside the solid, after the window's rows.
     for end in range(2):
         if (end == 0 and core.below_a != 0) or (end == 1 and core.segment != 0 and core.below_b != 0):
@@ -1170,40 +1160,51 @@ def _plain_point_rows_full(
             else:
                 planes, claim = terrain_law_point._exit_row(data, window, planes, k, end)
             if claim.kind != 0:
-                rows = _plain_candidate(rows, claim)
+                count = _plain_candidate(scratch, base, count, claim)
     # G3 for the axis interior: both ends outside, no axis exit, a crossing of the axis under a crease.
     if core.segment != 0 and core.below_a == 0 and core.below_b == 0 and exit_b.kind != 0:
         axis_exit = bool(False)
-        for row in range(rows.count):
-            if (rows.feature[row] & 7) == _PLAIN_SLOT_AXIS and rows.d[row] < 0.0:
+        for row in range(wp.min(count, scratch.capacity)):
+            if (scratch.feature[base + row] & 7) == _PLAIN_SLOT_AXIS and scratch.d[base + row] < 0.0:
                 axis_exit = True
         if not axis_exit:
             planes, claim = terrain_law_point._axis_recovery(data, window, planes, exit_b.q, exit_b.feature)
             if claim.kind != 0:
-                rows = _plain_candidate(rows, claim)
-    order, kept, flags = terrain_finish(rows, eps, _PLAIN_ROWS)
+                count = _plain_candidate(scratch, base, count, claim)
+    flags = int(0)
+    if count > scratch.capacity:
+        flags = TERRAIN_FINISH_CANDIDATE_OVERFLOW
+        count = scratch.capacity
+    kept = terrain_finish_list(scratch, base, count, eps)
     slot = slot_begin + (pair - begin) * _PLAIN_ROWS
-    for kept_row in range(kept):
-        row = order[kept_row]
-        terrain_store_row(
-            out,
-            slot + kept_row,
-            wp.vec3(rows.q[row, 0], rows.q[row, 1], rows.q[row, 2]),
-            wp.vec3(rows.n[row, 0], rows.n[row, 1], rows.n[row, 2]),
-            rows.d[row],
-            rows.feature[row],
-            window,
-            frame,
-        )
-    out.count[pair] = kept
-    out.state[pair] = terrain_law_point._wide(cells) | terrain_finish_state(flags)
+    if kept > _PLAIN_ROWS:
+        slot = terrain_spill_rows(out, pair, kept)
+    if slot >= 0:
+        written = int(0)
+        for row in range(count):
+            if scratch.mark[base + row] != 0:
+                terrain_store_row(
+                    out,
+                    slot + written,
+                    scratch.q[base + row],
+                    scratch.n[base + row],
+                    scratch.d[base + row],
+                    scratch.feature[base + row],
+                    window,
+                    frame,
+                )
+                written += 1
+        out.first[pair] = slot
+        out.count[pair] = kept
+        out.state[pair] = terrain_law_point._wide(cells) | terrain_finish_state(flags)
     terrain_report(out.status, out.overflow, flags, True)
 
 
 def _launch_plain_full(shadow, model, pipeline, begin, count, out):
     """Run the plain full finish (:func:`_plain_point_rows_full`) over ``out``'s deferred list, one thread per entry
-    (at most ``count``), from table pair ``begin``."""
-    args = [begin, 0, _pair_inputs(shadow, model, pipeline), shadow.features.data(), out]
+    (at most ``count``, each with a candidate list of the class's bound), from table pair ``begin``."""
+    scratch = terrain_finish_scratch(model.device, _candidates(shadow), blocks=count)
+    args = [begin, 0, _pair_inputs(shadow, model, pipeline), shadow.features.data(), out, scratch]
     wp.launch(
         _plain_point_rows_full,
         dim=count,
@@ -1368,12 +1369,12 @@ def _deferring_rows(heights, extent, bodies, device):
 def test_deferred_pairs_keep_the_plain_finish_rows(test, device):
     """Give the pairs the walks defer the rows of the plain walk's own full finish, bit for bit.
 
-    A walk defers a pair whose rows the finish may change (a plane group of three rows, more rows than the slots,
-    more candidates than the list) to the full-finish kernel, whose fixed grid of lane blocks marks the window's
-    productive items, walks them on the first lane into global scratch and runs the finish on its block's record.
-    The production launches (the shadow's own) are compared with the plain walk and its full finish
-    (:func:`_plain_point_rows_full`: one thread per deferred pair, every item of every window vertex, a local candidate
-    list) on a scene that defers dozens of pairs (:func:`_deferring_scene`), some overflowing their slots, some with
+    A walk defers a pair whose rows the finish may change (a plane group of three rows, more rows than the walk slots)
+    to the full-finish kernel, whose fixed grid of lane blocks marks the window's productive items, walks them on the
+    first lane into its block's distinct candidates and runs the finish on them. The production launches (the
+    shadow's own) are compared with the plain walk and its full finish (:func:`_plain_point_rows_full`: one thread per
+    deferred pair, every item of every window vertex, every raw candidate held) on a scene that defers dozens of pairs
+    (:func:`_deferring_scene`), some with more rows than their walk slots (written to the spill region), some with
     windows the full-finish kernel walks unmasked. On CUDA the rows also equal a CPU run's, bit for bit (there the
     lanes split the windows, mark the items and take their union, where the CPU's one lane walks alone).
     """
@@ -1381,12 +1382,14 @@ def test_deferred_pairs_keep_the_plain_finish_rows(test, device):
     production, plain, begin, count = _deferring_rows(heights, extent, bodies, device)
     test.assertEqual(count, len(bodies))
     _assert_same_rows(production, plain, begin, count, "production against plain")
-    # Not vacuous: dozens of deferred pairs (both sides defer the same ones), some overflowing their slots, and some
-    # with windows of more than 256 vertices.
+    # Not vacuous: dozens of deferred pairs (both sides defer the same ones), some with more rows than their walk slots,
+    # and some with windows of more than 256 vertices.
     test.assertGreater(production["deferred"], 20)
     test.assertEqual(production["deferred"], plain["deferred"])
-    states = production["state"][begin : begin + count]
-    test.assertGreater(int(np.count_nonzero(states & int(TERRAIN_PAIR_ROW_OVERFLOW))), 2)
+    counts = production["count"][begin : begin + count]
+    test.assertGreater(int(np.count_nonzero(counts > terrain_law_point.TERRAIN_POINT_WALK_SLOTS)), 2)
+    test.assertEqual(production["spilled"], int(counts[counts > terrain_law_point.TERRAIN_POINT_WALK_SLOTS].sum()))
+    test.assertEqual(int(np.count_nonzero(production["state"][begin : begin + count] & 48)), 0)
     hf = tu.reference_surface(tu.heightfield_model(heights, extent, extent, device="cpu"))
     unmasked = 0
     for pair in production["deferred_pairs"]:
@@ -1405,7 +1408,7 @@ def test_fixed_grids_take_each_pair_once(test, device):
     The tiled and full-finish kernels stride over their lists by the grids fixed in the work list and in the finish
     scratch (``work.blocks``, ``scratch.blocks``); a block past that grid returns at once. Launched with three blocks
     more (and scratch room for them), the tiled kernel would otherwise take queued pairs twice, deferring them twice,
-    and the full-finish kernel would finish deferred pairs twice, counting their row overflow twice.
+    and the full-finish kernel would finish deferred pairs twice, reserving their spill rows twice.
     """
     heights, extent, bodies = _deferring_scene(np.random.default_rng(77))
     model = tu.body_scene(heights, extent, extent, bodies, device=device)[0]
@@ -1427,7 +1430,7 @@ def test_fixed_grids_take_each_pair_once(test, device):
         work.blocks = blocks
         thread_args = [begin, 0, *args, out, work]
         wp.launch(terrain_law_point.terrain_point_rows, dim=count, inputs=thread_args, block_dim=block, device=device)
-        tiled_args = [tiled_begin, (tiled_begin - begin) * terrain_law_point.TERRAIN_POINT_ROWS, *args, out, work]
+        tiled_args = [tiled_begin, (tiled_begin - begin) * terrain_law_point.TERRAIN_POINT_WALK_SLOTS, *args, out, work]
         wp.launch_tiled(
             terrain_law_point.terrain_point_rows_tiled,
             dim=blocks + extra,
@@ -1440,7 +1443,7 @@ def test_fixed_grids_take_each_pair_once(test, device):
         listed = out.deferred.numpy()
         listed[begin : begin + deferred] = np.sort(listed[begin : begin + deferred])
         out.deferred.assign(listed)
-        scratch = terrain_finish_scratch(device, blocks=blocks + extra)
+        scratch = terrain_finish_scratch(device, _candidates(shadow), blocks=blocks + extra)
         scratch.blocks = blocks
         wp.launch_tiled(
             terrain_law_point.terrain_point_rows_full,
@@ -1451,19 +1454,18 @@ def test_fixed_grids_take_each_pair_once(test, device):
         )
         rows = _host_rows(out)
         rows["queued"] = int(work.count.numpy()[0])
-        rows["overflow"] = int(out.overflow.numpy()[0])
         results.append(rows)
     grid, wider = results
     # Not vacuous: more queued pairs defer than the grid has blocks (so that some are taken past its first blocks),
-    # and deferred pairs past its first blocks overflow.
+    # and deferred pairs past its first blocks have more rows than their walk slots (spill rows).
     listed = grid["deferred_pairs"]
     test.assertGreater(int(np.count_nonzero(listed >= tiled_begin)), blocks)
-    overflowing = (grid["state"][listed] & int(TERRAIN_PAIR_ROW_OVERFLOW)) != 0
-    test.assertGreater(int(np.count_nonzero(overflowing[blocks:])), 0)
+    spilling = grid["count"][listed] > terrain_law_point.TERRAIN_POINT_WALK_SLOTS
+    test.assertGreater(int(np.count_nonzero(spilling[blocks:])), 0)
     test.assertEqual(wider["queued"], grid["queued"])
     test.assertEqual(wider["deferred"], grid["deferred"])
-    test.assertEqual(wider["overflow"], grid["overflow"])
-    test.assertEqual(grid["overflow"], int(np.count_nonzero(overflowing)))
+    test.assertEqual(wider["spilled"], grid["spilled"])
+    test.assertEqual(grid["spilled"], int(grid["count"][listed][spilling].sum()))
     _assert_same_rows(wider, grid, begin, count, "three blocks more")
 
 
@@ -1704,13 +1706,14 @@ class TestTerrainLawPoint(unittest.TestCase):
         self.assertGreater(ptx.count("mul.rn.f32"), 100)
 
     def test_full_finish_keeps_its_candidates_off_the_stack_cpu(self):
-        """Keep the full-finish kernel's per-thread local frame under 6 KB (its PTX local depot, sm_86, NVRTC).
+        """Keep the full-finish kernel's per-thread local frame under 512 bytes (its PTX local depot, sm_86, NVRTC).
 
         The driver reserves local memory for the largest stack a context launches, for every thread the device can
-        hold (about 289,000 on a 188-SM GPU), launched or not. The kernel's candidate list and the finish's input live
-        in global scratch (:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`), and its walk and close
-        read rows there, not from copies of the list on the stack: the depot was 8,584 bytes before (10,088 bytes of
-        sm_120 stack, measured at +2.5 GB of device memory) and under 4.5 KB since; what remains is the finish's own.
+        hold (about 289,000 on a 188-SM GPU), launched or not. The kernel's candidates and the finish's state live in
+        global scratch (:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`,
+        :func:`~newton._src.geometry.terrain_law.terrain_finish_list`): the depot was 8,584 bytes with the candidate
+        list on the stack (10,088 bytes of sm_120 stack, measured at +2.5 GB of device memory), then under 4.5 KB with
+        the finish's 32-candidate frame (5,960 bytes of sm_120 stack, 1,342 MiB), 32 bytes of sm_120 stack since.
         """
         ptx = _point_ptx()
         if ptx is None:
@@ -1722,7 +1725,7 @@ class TestTerrainLawPoint(unittest.TestCase):
             depots[entry.group(1)] = int(depot.group(1)) if depot else 0
         full = [size for name, size in depots.items() if name.startswith("terrain_point_rows_full_")]
         self.assertEqual(len(full), 1, msg=depots)
-        self.assertLess(full[0], 6144, msg=depots)
+        self.assertLess(full[0], 512, msg=depots)
 
 
 devices = get_test_devices()

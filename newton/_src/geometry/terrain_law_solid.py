@@ -31,21 +31,22 @@ from the core) and by its arc ends' support values before the search, a vertex b
 call before its feature test and nearest point.
 
 The kernels follow the per-pair output protocol of :mod:`~newton._src.geometry.terrain_law`: a pair with no row is
-recorded by :func:`~newton._src.geometry.terrain_law.terrain_pair_exit`, and rows are held in the pair's own slots
-(window frame) as the finish merges them (:func:`~newton._src.geometry.terrain_law.terrain_hold_row`): a row
+recorded by :func:`~newton._src.geometry.terrain_law.terrain_pair_exit`, and rows are held in the pair's own walk
+slots (window frame) as the finish merges them (:func:`~newton._src.geometry.terrain_law.terrain_hold_row`): a row
 coinciding with a held one is dropped, the first in window order staying. The finish runs in place on the held rows
 (:func:`~newton._src.geometry.terrain_law.terrain_finish_slots`, a row's core point being ``q + d n``), and the kept
 rows are rewritten in the world frame at the front of the slots. A pair with more distinct candidates than its slots
 is left to its class's full kernel (:func:`~newton._src.geometry.terrain_law.terrain_defer_pair`): the shadow's fixed
-full-finish grid (:data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_FULL_BLOCKS` blocks) strides over the class's
-deferred list, and each block's first lane walks its pairs again, one at a time, into the block's scratch list of
-:data:`~newton._src.geometry.terrain_law.TERRAIN_ROW_CANDIDATES` rows
-(:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`). Every deferred pair is thus finished from its own
-candidates, whatever the number of deferred pairs, the order of the deferral or the block that finishes it; a pair
-with more distinct candidates than the scratch list keeps the first in window order and is flagged (a candidate
-overflow, as the point class's finish flags it). The kernels themselves (one module per partner class) build the
-class's core and call the generic bodies here; every module that compiles them disables floating-point contraction,
-so the CPU decides every boundary as the GPU does.
+full-finish grid strides over the class's deferred list, and each block's first lane walks its pairs again, one at a
+time, into the block's scratch (:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`), which holds every
+distinct candidate a window of the class can give
+(:func:`~newton._src.geometry.terrain_contacts.terrain_pair_candidates`). The finish runs on all of them
+(:func:`~newton._src.geometry.terrain_law.terrain_finish_list`) and every row it keeps is written, in the pair's walk
+slots when they fit, else in rows of the spill region it reserves
+(:func:`~newton._src.geometry.terrain_law.terrain_spill_rows`). Every deferred pair is thus finished from its own candidates, whatever
+the number of deferred pairs, the order of the deferral or the block that finishes it. The kernels themselves (one
+module per partner class) build the class's core and call the generic bodies here; every module that compiles them
+disables floating-point contraction, so the CPU decides every boundary as the GPU does.
 """
 
 from __future__ import annotations
@@ -63,6 +64,7 @@ from .terrain_law import (
     TERRAIN_FEATURE_FACE,
     TERRAIN_FEATURE_RECOVERY,
     TERRAIN_FEATURE_VERTEX,
+    TERRAIN_FINISH_CANDIDATE_OVERFLOW,
     TERRAIN_FLAT_EPS,
     TERRAIN_NORMAL_SAME,
     TERRAIN_PAIR_FILTERED,
@@ -71,7 +73,6 @@ from .terrain_law import (
     TERRAIN_PAIR_TILE_EXIT,
     TERRAIN_PAIR_UNSUPPORTED,
     TERRAIN_PAIR_WIDE,
-    TERRAIN_ROW_CANDIDATES,
     TERRAIN_VERTEX_SPAN,
     TERRAIN_WINDOW_WIDE,
     TerrainFeatureData,
@@ -90,6 +91,7 @@ from .terrain_law import (
     terrain_eps,
     terrain_feature_id,
     terrain_features_current,
+    terrain_finish_list,
     terrain_finish_slots,
     terrain_finish_state,
     terrain_height,
@@ -102,6 +104,7 @@ from .terrain_law import (
     terrain_planes,
     terrain_point_below_cached,
     terrain_report,
+    terrain_spill_rows,
     terrain_store_row,
     terrain_tile_exit,
     terrain_triangle_vertices,
@@ -152,7 +155,6 @@ face of a float32 mesh stays one face (its points lie within about 1e-8 m of its
 _BISECTION = wp.constant(TERRAIN_SOLID_BISECTION)
 _ArcNormals = wp.types.matrix(shape=(TERRAIN_SOLID_ARC_SAMPLES, 3), dtype=wp.float32)
 _ARC_END = wp.constant(TERRAIN_SOLID_ARC_END)
-_CANDIDATES = wp.constant(TERRAIN_ROW_CANDIDATES)
 _WIDE = wp.constant(TERRAIN_WINDOW_WIDE)
 _EPS32 = wp.constant(TERRAIN_EPS32)
 _FLAT = wp.constant(TERRAIN_FLAT_EPS)
@@ -885,41 +887,79 @@ def solid_close(
     planes: TerrainPlanes,
     pair: _Pair,
     sink: _Sink,
-    store: TerrainLawRows,
     out: TerrainLawRows,
     pair_index: int,
-    out_slot: int,
-    row_limit: int,
     partner_class: int,
     frame: wp.transform,
     cells: wp.vec4i,
-    deferrable: int,
 ):
-    """Finish a walked pair: defer it when its distinct rows overflow its slots, else add the recovery rows when it
-    has none, run the finish in place and write the kept rows (world frame) to the pair's output slots."""
-    dropped = int(0)
+    """Finish a walked pair in its walk slots (``sink.slot``): defer it when its distinct rows overflow them, else add
+    the recovery rows when it has none, run the finish in place and write the kept rows (world frame) at the front of
+    its slots."""
     if sink.held > sink.capacity:
-        if deferrable != 0:
-            terrain_defer_pair(out, partner_class, pair_index, _wide(cells))
-            return
-        # more distinct candidates than the scratch list: the first in window order, flagged
-        sink.held = sink.capacity
-        dropped = 1
+        terrain_defer_pair(out, partner_class, pair_index, _wide(cells))
+        return
     if sink.raw == 0:
-        planes, sink = solid_recovery(core, data, window, planes, sink, store)
-    keep, kept, flags = terrain_finish_slots(
-        store.q, store.n, store.d, sink.slot, sink.held, dropped, pair.eps, row_limit
-    )
+        planes, sink = solid_recovery(core, data, window, planes, sink, out)
+    keep, kept = terrain_finish_slots(out.q, out.n, out.d, sink.slot, sink.held, pair.eps)
     written = int(0)
     for i in range(sink.held):
         if ((keep >> i) & 1) != 0:
             s = sink.slot + i
-            terrain_store_row(
-                out, out_slot + written, store.q[s], store.n[s], store.d[s], store.feature[s], window, frame
-            )
+            terrain_store_row(out, sink.slot + written, out.q[s], out.n[s], out.d[s], out.feature[s], window, frame)
             written += 1
+    out.first[pair_index] = sink.slot
     out.count[pair_index] = kept
-    out.state[pair_index] = _wide(cells) | terrain_finish_state(flags)
+    out.state[pair_index] = _wide(cells)
+
+
+@wp.func
+def solid_close_full(
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    pair: _Pair,
+    sink: _Sink,
+    scratch: TerrainFinishScratch,
+    out: TerrainLawRows,
+    pair_index: int,
+    slot: int,
+    walk_slots: int,
+    frame: wp.transform,
+    cells: wp.vec4i,
+):
+    """Finish a deferred pair walked into a full-finish block's scratch (``sink.slot``): add the recovery rows when it
+    has none, run the finish on every distinct candidate and write the kept rows (world frame) to its walk slots from
+    ``slot`` when they fit, else to rows of the spill region.
+
+    The scratch holds every candidate a window of the class can give; a pair with more has a window its shape data no
+    longer bounds (changed since construction): it keeps the first in window order and is flagged."""
+    flags = int(0)
+    if sink.held > sink.capacity:
+        sink.held = sink.capacity
+        flags = TERRAIN_FINISH_CANDIDATE_OVERFLOW
+    if sink.raw == 0:
+        planes, sink = solid_recovery(core, data, window, planes, sink, solid_scratch_store(scratch))
+    for i in range(sink.held):
+        s = sink.slot + i
+        # a row's core point, as the in-place finish of a walk reads it
+        scratch.k[s] = scratch.q[s] + scratch.d[s] * scratch.n[s]
+    kept = terrain_finish_list(scratch, sink.slot, sink.held, pair.eps)
+    if kept > walk_slots:
+        slot = terrain_spill_rows(out, pair_index, kept)
+    if slot >= 0:
+        written = int(0)
+        for i in range(sink.held):
+            s = sink.slot + i
+            if scratch.mark[s] != 0:
+                terrain_store_row(
+                    out, slot + written, scratch.q[s], scratch.n[s], scratch.d[s], scratch.feature[s], window, frame
+                )
+                written += 1
+        out.first[pair_index] = slot
+        out.count[pair_index] = kept
+        out.state[pair_index] = _wide(cells) | terrain_finish_state(flags)
     terrain_report(out.status, out.overflow, flags, True)
 
 
@@ -932,15 +972,15 @@ def solid_rows_thread(
     solids: TerrainSolidData,
     pair_index: int,
     slot: int,
-    row_limit: int,
+    walk_slots: int,
     partner_class: int,
     frame: wp.transform,
     heightfield: int,
     reach: float,
 ):
-    """One thread's walk of a pair whose core is built (heightfield frame): window, walk, close; a pair from
-    ``work.first`` on (the tiled segment) whose window holds more than ``solids.thread_vertices`` vertices is queued in
-    ``work`` for the class's tiled kernel instead."""
+    """One thread's walk of a pair whose core is built (heightfield frame) in its walk slots from ``slot``: window,
+    walk, close; a pair from ``work.first`` on (the tiled segment) whose window holds more than
+    ``solids.thread_vertices`` vertices is queued in ``work`` for the class's tiled kernel instead."""
     state, cells, window, core, pair = solid_pair_window(core, data, heightfield, reach)
     if state != 0:
         terrain_pair_exit(out, pair_index, state)
@@ -950,11 +990,9 @@ def solid_rows_thread(
             work.pairs[wp.atomic_add(work.count, 0, 1)] = pair_index
             return
     planes = terrain_planes()
-    sink = solid_sink(slot, row_limit, pair.eps, 0)
+    sink = solid_sink(slot, walk_slots, pair.eps, 0)
     planes, sink = solid_walk(core, data, window, planes, pair, sink, out, cells)
-    solid_close(
-        core, data, window, planes, pair, sink, out, out, pair_index, slot, row_limit, partner_class, frame, cells, 1
-    )
+    solid_close(core, data, window, planes, pair, sink, out, pair_index, partner_class, frame, cells)
 
 
 @wp.func
@@ -966,21 +1004,18 @@ def solid_rows_full(
     block: int,
     pair_index: int,
     slot: int,
-    row_limit: int,
-    partner_class: int,
+    walk_slots: int,
     frame: wp.transform,
     heightfield: int,
     reach: float,
 ):
-    """A deferred pair walked again into block ``block``'s scratch list, finished and written to its output slots."""
+    """A deferred pair walked again into block ``block``'s scratch, finished and written (:func:`solid_close_full`;
+    its walk slots from ``slot``)."""
     _state, cells, window, core, pair = solid_pair_window(core, data, heightfield, reach)
     planes = terrain_planes()
-    sink = solid_sink(block * _CANDIDATES, _CANDIDATES, pair.eps, 0)
-    store = solid_scratch_store(scratch)
-    planes, sink = solid_walk(core, data, window, planes, pair, sink, store, cells)
-    solid_close(
-        core, data, window, planes, pair, sink, store, out, pair_index, slot, row_limit, partner_class, frame, cells, 0
-    )
+    sink = solid_sink(block * scratch.capacity, scratch.capacity, pair.eps, 0)
+    planes, sink = solid_walk(core, data, window, planes, pair, sink, solid_scratch_store(scratch), cells)
+    solid_close_full(core, data, window, planes, pair, sink, scratch, out, pair_index, slot, walk_slots, frame, cells)
 
 
 @wp.func
@@ -1037,15 +1072,16 @@ def solid_replay(
     words: int,
     pair_index: int,
     slot: int,
-    row_limit: int,
+    walk_slots: int,
     partner_class: int,
     frame: wp.transform,
 ):
     """The tiled kernels' first lane: the marked vertices' items in window order (every vertex when the window is too
-    large to mark), then the pair's close: the rows the one-thread walk gives the pair."""
+    large to mark) in the pair's walk slots from ``slot``, then the pair's close: the rows the one-thread walk gives
+    the pair."""
     planes = terrain_planes()
     emitters = _emitters()
-    sink = solid_sink(slot, row_limit, pair.eps, 0)
+    sink = solid_sink(slot, walk_slots, pair.eps, 0)
     r0 = cells[0]
     c0 = cells[2]
     width = cells[3] - c0 + 2
@@ -1069,9 +1105,7 @@ def solid_replay(
                 cells[3],
                 item,
             )
-    solid_close(
-        core, data, window, planes, pair, sink, out, out, pair_index, slot, row_limit, partner_class, frame, cells, 1
-    )
+    solid_close(core, data, window, planes, pair, sink, out, pair_index, partner_class, frame, cells)
 
 
 @wp.func
