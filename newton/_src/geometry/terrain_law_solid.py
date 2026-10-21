@@ -30,11 +30,14 @@ of reach only where the edge rises nowhere above the core's lowest point: a row 
 from the core) and by its arc ends' support values before the search, a vertex by the bounding sphere and one support
 call before its feature test and nearest point.
 
-Rows are held in the pair's own slots (window frame) as the finish merges them: a row coinciding with a held one is
-dropped, the first in window order staying. The finish runs in place on the held rows
+The kernels follow the per-pair output protocol of :mod:`~newton._src.geometry.terrain_law`: a pair with no row is
+recorded by :func:`~newton._src.geometry.terrain_law.terrain_pair_exit`, and rows are held in the pair's own slots
+(window frame) as the finish merges them (:func:`~newton._src.geometry.terrain_law.terrain_hold_row`): a row
+coinciding with a held one is dropped, the first in window order staying. The finish runs in place on the held rows
 (:func:`~newton._src.geometry.terrain_law.terrain_finish_slots`, a row's core point being ``q + d n``), and the kept
 rows are rewritten in the world frame at the front of the slots. A pair with more distinct candidates than its slots
-is left to its class's full kernel: a fixed grid of :data:`TERRAIN_SOLID_FULL_THREADS` threads strides over the
+is left to its class's full kernel (:func:`~newton._src.geometry.terrain_law.terrain_defer_pair`): a fixed grid of
+:data:`TERRAIN_SOLID_FULL_THREADS` threads strides over the
 class's deferred list, and each thread walks its pairs again, one at a time, into its own scratch list of
 :data:`~newton._src.geometry.terrain_law.TERRAIN_ROW_CANDIDATES` rows. Every deferred pair is thus finished from its
 own candidates, whatever the number of deferred pairs, the order of the deferral or the thread that finishes it; a pair
@@ -62,7 +65,6 @@ from .terrain_law import (
     TERRAIN_FLAT_EPS,
     TERRAIN_NORMAL_SAME,
     TERRAIN_PAIR_FILTERED,
-    TERRAIN_PAIR_FULL,
     TERRAIN_PAIR_OUTSIDE,
     TERRAIN_PAIR_STALE,
     TERRAIN_PAIR_TILE_EXIT,
@@ -79,6 +81,7 @@ from .terrain_law import (
     terrain_box_cells,
     terrain_cluster,
     terrain_crease_class,
+    terrain_defer_pair,
     terrain_edge_kind,
     terrain_edge_sides,
     terrain_eps,
@@ -87,14 +90,15 @@ from .terrain_law import (
     terrain_finish_slots,
     terrain_finish_state,
     terrain_height,
+    terrain_hold_row,
     terrain_incident_triangle,
     terrain_interior_vertex,
     terrain_locate,
+    terrain_pair_exit,
     terrain_plane,
     terrain_planes,
     terrain_point_below_cached,
     terrain_report,
-    terrain_rows_coincide,
     terrain_store_row,
     terrain_tile_exit,
     terrain_triangle_vertices,
@@ -188,16 +192,6 @@ class TerrainSolidData:
     """Window vertices up to which the one-thread kernels walk a pair; 0: they walk every window."""
     tile_blocks: int
     """Blocks of the tiled kernels' launch: their stride over a list of large windows."""
-
-
-@wp.struct
-class _Store:
-    """Where a walk holds a pair's rows (window frame)."""
-
-    q: wp.array[wp.vec3]
-    n: wp.array[wp.vec3]
-    d: wp.array[float]
-    feature: wp.array[wp.int32]
 
 
 @wp.struct
@@ -306,8 +300,9 @@ def _emitter_store(cache: _Emitters, cluster: int, emitter: wp.vec3i) -> _Emitte
 
 
 @wp.func
-def _offer(store: _Store, sink: _Sink, q: wp.vec3, n: wp.vec3, d: float, feature: int) -> _Sink:
-    """Offer a row: count it while probing; else hold it unless it coincides with a held row (the finish's merge).
+def _offer(store: TerrainLawRows, sink: _Sink, q: wp.vec3, n: wp.vec3, d: float, feature: int) -> _Sink:
+    """Offer a row: count it while probing; else hold it unless it coincides with a held row, as the finish merges
+    (:func:`~newton._src.geometry.terrain_law.terrain_hold_row` on the sink's slots of ``store``).
 
     The capacity bounds the distinct rows, not the offers: a crease's interval ends shared by the next crease merge
     before they count (a pair keeps every distinct candidate its slots or its scratch list hold).
@@ -316,16 +311,7 @@ def _offer(store: _Store, sink: _Sink, q: wp.vec3, n: wp.vec3, d: float, feature
         sink.hits = sink.hits + 1
         return sink
     sink.raw = sink.raw + 1
-    for h in range(wp.min(sink.held, sink.capacity)):
-        if terrain_rows_coincide(store.q[sink.slot + h], store.n[sink.slot + h], q, n, sink.eps):
-            return sink
-    if sink.held < sink.capacity:
-        s = sink.slot + sink.held
-        store.q[s] = q
-        store.n[s] = n
-        store.d[s] = d
-        store.feature[s] = feature
-    sink.held = sink.held + 1
+    sink.held = terrain_hold_row(store, sink.slot, sink.held, q, n, d, feature, sink.eps, sink.capacity)
     return sink
 
 
@@ -348,7 +334,7 @@ def _solid_face(
     emitters: _Emitters,
     pair: _Pair,
     sink: _Sink,
-    store: _Store,
+    store: TerrainLawRows,
     r: int,
     c: int,
     sub: int,
@@ -508,7 +494,7 @@ def _solid_edge(
     planes: TerrainPlanes,
     pair: _Pair,
     sink: _Sink,
-    store: _Store,
+    store: TerrainLawRows,
     r: int,
     c: int,
     which: int,
@@ -629,7 +615,7 @@ def _solid_vertex(
     planes: TerrainPlanes,
     pair: _Pair,
     sink: _Sink,
-    store: _Store,
+    store: TerrainLawRows,
     r: int,
     c: int,
 ) -> tuple[TerrainPlanes, _Sink]:
@@ -705,7 +691,7 @@ def solid_item(
     emitters: _Emitters,
     pair: _Pair,
     sink: _Sink,
-    store: _Store,
+    store: TerrainLawRows,
     r: int,
     c: int,
     r1: int,
@@ -731,7 +717,12 @@ def solid_item(
 
 @wp.func
 def solid_recovery(
-    core: Any, data: TerrainFeatureData, window: TerrainWindow, planes: TerrainPlanes, sink: _Sink, store: _Store
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    sink: _Sink,
+    store: TerrainLawRows,
 ) -> tuple[TerrainPlanes, _Sink]:
     """Rule R (G3): up to four of the core's boundary points below the surface, deepest first (then in order), each
     against the face vertically above it with that plane's normal and depth.
@@ -806,15 +797,6 @@ def solid_pair_read(inputs: TerrainPairInputs, data: TerrainFeatureData, pair: i
 
 
 @wp.func
-def solid_pair_exit(out: TerrainLawRows, pair: int, state: int):
-    """Record a pair with no row (``state``), raising ``terrain_stale`` for stale features."""
-    out.count[pair] = 0
-    out.state[pair] = state
-    if state == TERRAIN_PAIR_STALE:
-        terrain_report(out.status, out.overflow, 0, False)
-
-
-@wp.func
 def solid_pair_window(core: Any, data: TerrainFeatureData, heightfield: int, reach: float):
     """The pair's window: ``(state, cells, window, core, pair)`` with the core moved into the window frame.
 
@@ -877,18 +859,9 @@ def solid_sink(slot: int, capacity: int, eps: float, probe: int) -> _Sink:
 
 
 @wp.func
-def solid_out_store(out: TerrainLawRows) -> _Store:
-    store = _Store()
-    store.q = out.q
-    store.n = out.n
-    store.d = out.d
-    store.feature = out.feature
-    return store
-
-
-@wp.func
-def solid_scratch_store(solids: TerrainSolidData) -> _Store:
-    store = _Store()
+def solid_scratch_store(solids: TerrainSolidData) -> TerrainLawRows:
+    """The full kernels' scratch rows as a store of held rows (its row fields only)."""
+    store = TerrainLawRows()
     store.q = solids.scratch_q
     store.n = solids.scratch_n
     store.d = solids.scratch_d
@@ -904,7 +877,7 @@ def solid_walk(
     planes: TerrainPlanes,
     pair: _Pair,
     sink: _Sink,
-    store: _Store,
+    store: TerrainLawRows,
     cells: wp.vec4i,
 ) -> tuple[TerrainPlanes, _Sink]:
     """Walk the window's features in window order (vertex by vertex, its items in order)."""
@@ -928,7 +901,7 @@ def solid_close(
     planes: TerrainPlanes,
     pair: _Pair,
     sink: _Sink,
-    store: _Store,
+    store: TerrainLawRows,
     out: TerrainLawRows,
     pair_index: int,
     out_slot: int,
@@ -943,11 +916,7 @@ def solid_close(
     dropped = int(0)
     if sink.held > sink.capacity:
         if deferrable != 0:
-            out.count[pair_index] = 0
-            out.state[pair_index] = _wide(cells) | TERRAIN_PAIR_FULL
-            out.deferred[out.deferred_first[partner_class] + wp.atomic_add(out.deferred_count, partner_class, 1)] = (
-                pair_index
-            )
+            terrain_defer_pair(out, partner_class, pair_index, _wide(cells))
             return
         # more distinct candidates than the scratch list: the first in window order, flagged
         sink.held = sink.capacity
@@ -988,7 +957,7 @@ def solid_rows_thread(
     than ``solids.thread_vertices`` vertices is listed for the class's tiled kernel instead."""
     state, cells, window, core, pair = solid_pair_window(core, data, heightfield, reach)
     if state != 0:
-        solid_pair_exit(out, pair_index, state)
+        terrain_pair_exit(out, pair_index, state)
         return
     if solids.thread_vertices > 0:
         if (cells[1] - cells[0] + 2) * (cells[3] - cells[2] + 2) > solids.thread_vertices:
@@ -997,10 +966,9 @@ def solid_rows_thread(
             return
     planes = terrain_planes()
     sink = solid_sink(slot, row_limit, pair.eps, 0)
-    store = solid_out_store(out)
-    planes, sink = solid_walk(core, data, window, planes, pair, sink, store, cells)
+    planes, sink = solid_walk(core, data, window, planes, pair, sink, out, cells)
     solid_close(
-        core, data, window, planes, pair, sink, store, out, pair_index, slot, row_limit, partner_class, frame, cells, 1
+        core, data, window, planes, pair, sink, out, out, pair_index, slot, row_limit, partner_class, frame, cells, 1
     )
 
 
@@ -1043,7 +1011,7 @@ def solid_mark(
     """The tiled kernels' marking pass: this lane's productive window vertices (windows of up to 256 vertices)."""
     planes = terrain_planes()
     emitters = _emitters()
-    store = _Store()
+    store = TerrainLawRows()
     marked = _Mask()
     r0 = cells[0]
     c0 = cells[2]
@@ -1093,7 +1061,6 @@ def solid_replay(
     planes = terrain_planes()
     emitters = _emitters()
     sink = solid_sink(slot, row_limit, pair.eps, 0)
-    store = solid_out_store(out)
     r0 = cells[0]
     c0 = cells[2]
     width = cells[3] - c0 + 2
@@ -1110,7 +1077,7 @@ def solid_replay(
                 emitters,
                 pair,
                 sink,
-                store,
+                out,
                 r0 + v // width,
                 c0 + v % width,
                 cells[1],
@@ -1118,15 +1085,15 @@ def solid_replay(
                 item,
             )
     solid_close(
-        core, data, window, planes, pair, sink, store, out, pair_index, slot, row_limit, partner_class, frame, cells, 1
+        core, data, window, planes, pair, sink, out, out, pair_index, slot, row_limit, partner_class, frame, cells, 1
     )
 
 
 @wp.func
 def solid_unsupported(out: TerrainLawRows, pair_index: int):
-    """Record a pair whose partner has no core in the law (no row)."""
-    out.count[pair_index] = 0
-    out.state[pair_index] = TERRAIN_PAIR_UNSUPPORTED
+    """Record a pair whose partner has no core in the law (no row,
+    :func:`~newton._src.geometry.terrain_law.terrain_pair_exit`)."""
+    terrain_pair_exit(out, pair_index, TERRAIN_PAIR_UNSUPPORTED)
 
 
 # ----------------------------------------------------------------------------------------------------------------

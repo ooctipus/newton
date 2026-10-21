@@ -21,13 +21,12 @@ from __future__ import annotations
 import warp as wp
 
 from .terrain_contacts import TERRAIN_PARTNER_HULL, TERRAIN_PARTNER_ROWS
-from .terrain_law import TerrainFeatureData, TerrainLawRows, TerrainPairInputs
+from .terrain_law import TerrainFeatureData, TerrainLawRows, TerrainPairInputs, terrain_pair_exit
 from .terrain_law_cores import TerrainHullCore
 from .terrain_law_solid import (
     TERRAIN_SOLID_MASK_WORDS,
     TerrainSolidData,
     solid_mark,
-    solid_pair_exit,
     solid_pair_read,
     solid_pair_window,
     solid_replay,
@@ -111,7 +110,7 @@ def terrain_hull_rows(
     pair = begin + i
     state, frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
     if state != 0:
-        solid_pair_exit(out, pair, state)
+        terrain_pair_exit(out, pair, state)
         return
     supported, core = _core(local, size, inputs.shape_type[partner], partner, solids)
     if not supported:
