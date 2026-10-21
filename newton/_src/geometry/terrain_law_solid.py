@@ -69,7 +69,9 @@ pairs' features at once instead of one pair's whole window, and no thread walks 
    V's vertices (:func:`_vertex_cheap`), each survivor listed for its job kernel.
 2. The job kernels, a fixed grid striding over each list: :func:`solid_face_job`, :func:`solid_edge_job` (its crease
    tests, :func:`_edge_arc`; a crease whose arc can hold a row is listed for ``theta*``), :func:`solid_theta_job`
-   (``theta*``, the crossing and its ends, :func:`_edge_rows`) and :func:`solid_vertex_job` (:func:`_vertex_rows`).
+   (``theta*``, :func:`_edge_theta`, kept per listed crease), :func:`solid_crease_job` (the crossing at ``theta*``
+   and its ends, :func:`_edge_rows_at`; apart, so that the search runs in a lean kernel) and :func:`solid_vertex_job`
+   (:func:`_vertex_rows`).
    A job adds its rows to the class's candidate pool, each with its place in window order (its key: its item's index,
    window vertex times six plus its item, times eight plus its point slot), the row the walk would offer there.
 3. The close (:func:`solid_close_jobs`), one thread per live pair: the pair's candidates held in its walk slots in key
@@ -410,6 +412,10 @@ class TerrainSolidJobs:
     edge)."""
     thetas: wp.array[wp.vec2i]
     """Rule E's creases whose normal arcs can hold a row, for ``theta*``: ``(table pair, item)`` as the edges'."""
+    theta_n: wp.array[wp.vec3]
+    """Per entry of :attr:`thetas`: its crease's ``theta*`` (:func:`_edge_theta`), for :func:`solid_crease_job`."""
+    theta_kind: wp.array[wp.int32]
+    """Per entry of :attr:`thetas`: its ``theta*``'s kind (:func:`_edge_theta`: -1 no row, 0 an arc end, 1 inside)."""
     vertices: wp.array[wp.vec2i]
     """Rule V's jobs: ``(table pair, item)``, ``item`` its window vertex times six plus 5."""
     xitems: wp.array[wp.vec2i]
@@ -876,8 +882,58 @@ def _edge_rows(
     sigma_b: float,
 ) -> tuple[TerrainPlanes, _Sink]:
     """Rule E's rows of a crease past :func:`_edge_arc` (its normal arc ``n_a`` to ``n_b``, its ends' support values
-    ``sigma_a`` and ``sigma_b``): ``theta*``, the crossing of the core's flat support feature (interior) or reference
-    feature (arc end) with the crease's line, and its ends lifted onto the core."""
+    ``sigma_a`` and ``sigma_b``): ``theta*`` (:func:`_edge_theta`) and the rows at it (:func:`_edge_rows_at`)."""
+    nst, kind = _edge_theta(core, data, window, pair, r, c, which, n_a, n_b, sigma_a, sigma_b)
+    if kind < 0:
+        return planes, sink
+    return _edge_rows_at(core, data, window, planes, pair, sink, store, r, c, which, nst, kind)
+
+
+@wp.func
+def _edge_theta(
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    pair: _Pair,
+    r: int,
+    c: int,
+    which: int,
+    n_a: wp.vec3,
+    n_b: wp.vec3,
+    sigma_a: float,
+    sigma_b: float,
+) -> tuple[wp.vec3, int]:
+    """A crease's ``theta*`` (:func:`_theta_star`): ``(n*, kind)``, ``kind`` -1 when the core's support there lies
+    beyond the reach (no row), 1 inside the arc, 0 at an arc end (within :data:`TERRAIN_SOLID_ARC_END` of one: its
+    reference feature, G1)."""
+    v0i, _v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
+    v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
+    nst, sigma, end = _theta_star(core, n_a, n_b, v0, sigma_a, sigma_b, pair.eps)
+    if sigma > pair.reach:
+        return nst, -1
+    if end == 0 and wp.length(nst - n_a) > _ARC_END and wp.length(nst - n_b) > _ARC_END:
+        return nst, 1
+    return nst, 0
+
+
+@wp.func
+def _edge_rows_at(
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    pair: _Pair,
+    sink: _Sink,
+    store: Any,
+    r: int,
+    c: int,
+    which: int,
+    nst: wp.vec3,
+    kind: int,
+) -> tuple[TerrainPlanes, _Sink]:
+    """Rule E's rows of a crease at its ``theta*`` ``nst`` (``kind`` from :func:`_edge_theta`): the crossing of the
+    core's flat support feature (inside the arc) or reference feature (an arc end) with the crease's line, and its
+    ends lifted onto the core."""
     v0i, v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
     v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
     v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
@@ -885,11 +941,7 @@ def _edge_rows(
     length2 = wp.dot(e, e)
     length = wp.sqrt(length2)
     dh = e / length
-    nst, sigma, end = _theta_star(core, n_a, n_b, v0, sigma_a, sigma_b, pair.eps)
-    if sigma > pair.reach:
-        return planes, sink
-    # within the arc-end tolerance of an end, the end's reference feature (G1)
-    interior = end == 0 and wp.length(nst - n_a) > _ARC_END and wp.length(nst - n_b) > _ARC_END
+    interior = kind == 1
     e2 = wp.cross(nst, dh)
     found = bool(False)
     crossing = TerrainCrossing()
@@ -2193,11 +2245,10 @@ def solid_edge_job(
 
 
 @wp.func
-def solid_theta_job(
-    core: Any, data: TerrainFeatureData, out: TerrainLawRows, jobs: TerrainSolidJobs, pair_index: int, i: int, item: int
-):
-    """Rule E's rows of a crease whose arc can hold a row: its arc again (:func:`_edge_arc`, the edge job's, bit for
-    bit), ``theta*``, the crossing and its ends (:func:`_edge_rows`)."""
+def solid_theta_job(core: Any, data: TerrainFeatureData, jobs: TerrainSolidJobs, i: int, item: int, entry: int):
+    """Rule E's ``theta*`` of a crease whose arc can hold a row (entry ``entry`` of :attr:`TerrainSolidJobs.thetas`):
+    its arc again (:func:`_edge_arc`, the edge job's, bit for bit) and :func:`_edge_theta`, kept for
+    :func:`solid_crease_job`."""
     record, window = solid_job_window(data, jobs, i)
     pair = record.pair
     vertex = item // _ITEMS
@@ -2205,9 +2256,36 @@ def solid_theta_job(
     rc = _job_vertex(record.cells, vertex)
     planes = terrain_planes()
     planes, _ok, n_a, n_b, sigma_a, sigma_b = _edge_arc(core, data, window, planes, pair, rc[0], rc[1], which)
+    nst, kind = _edge_theta(core, data, window, pair, rc[0], rc[1], which, n_a, n_b, sigma_a, sigma_b)
+    jobs.theta_n[entry] = nst
+    jobs.theta_kind[entry] = kind
+
+
+@wp.func
+def solid_crease_job(
+    core: Any,
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+    jobs: TerrainSolidJobs,
+    pair_index: int,
+    i: int,
+    item: int,
+    entry: int,
+):
+    """Rule E's rows of a crease at its ``theta*`` (entry ``entry`` of :attr:`TerrainSolidJobs.thetas`,
+    :func:`solid_theta_job`'s): the crossing and its ends (:func:`_edge_rows_at`)."""
+    kind = jobs.theta_kind[entry]
+    if kind < 0:
+        return
+    record, window = solid_job_window(data, jobs, i)
+    pair = record.pair
+    vertex = item // _ITEMS
+    which = item - vertex * _ITEMS - 2
+    rc = _job_vertex(record.cells, vertex)
+    planes = terrain_planes()
     sink = _job_sink(i, item, pair.eps)
-    planes, sink = _edge_rows(
-        core, data, window, planes, pair, sink, jobs, rc[0], rc[1], which, n_a, n_b, sigma_a, sigma_b
+    planes, sink = _edge_rows_at(
+        core, data, window, planes, pair, sink, jobs, rc[0], rc[1], which, jobs.theta_n[entry], kind
     )
     _job_lost(out, pair_index, sink.lost)
 
@@ -2568,6 +2646,7 @@ TERRAIN_SOLID_LAUNCHES = (
     ("jobs", "faces"),
     ("jobs", "edges"),
     ("jobs", "thetas"),
+    ("jobs", "creases"),
     ("jobs", "vertices"),
     ("jobs", "close"),
     ("jobs", "recovery"),
@@ -2714,12 +2793,28 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         jobs: TerrainSolidJobs,
         solids: TerrainSolidData,
     ):
-        """Rule E's rows, one listed crease per thread at a time (:func:`solid_theta_job`)."""
+        """Rule E's ``theta*``, one listed crease per thread at a time (:func:`solid_theta_job`)."""
         t = wp.tid()
         for entry in range(t, wp.min(jobs.counts[_THETAS], jobs.thetas.shape[0]), jobs.threads):
             job = jobs.thetas[entry]
             i = job[0] - begin
-            solid_theta_job(wp.static(load_core)(jobs, i, solids), data, out, jobs, job[0], i, job[1])
+            solid_theta_job(wp.static(load_core)(jobs, i, solids), data, jobs, i, job[1], entry)
+
+    def creases(
+        begin: int,
+        slot_begin: int,
+        inputs: TerrainPairInputs,
+        data: TerrainFeatureData,
+        out: TerrainLawRows,
+        jobs: TerrainSolidJobs,
+        solids: TerrainSolidData,
+    ):
+        """Rule E's rows, one listed crease per thread at a time, at its ``theta*`` (:func:`solid_crease_job`)."""
+        t = wp.tid()
+        for entry in range(t, wp.min(jobs.counts[_THETAS], jobs.thetas.shape[0]), jobs.threads):
+            job = jobs.thetas[entry]
+            i = job[0] - begin
+            solid_crease_job(wp.static(load_core)(jobs, i, solids), data, out, jobs, job[0], i, job[1], entry)
 
     def vertices(
         begin: int,
@@ -2906,6 +3001,7 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         ("faces", faces),
         ("edges", edges),
         ("thetas", thetas),
+        ("creases", creases),
         ("vertices", vertices),
         ("close", close),
         ("recovery", recovery),
@@ -3217,6 +3313,8 @@ def terrain_solid_jobs(
         setattr(jobs, name, wp.zeros(room if own.get(int(partner_class)) == name else 1, dtype=dtype, device=device))
     for name in TERRAIN_SOLID_JOB_LISTS:
         setattr(jobs, name, wp.zeros(max(int(capacities[name]), 1), dtype=wp.vec2i, device=device))
+    jobs.theta_n = wp.zeros(max(int(capacities["thetas"]), 1), dtype=wp.vec3, device=device)
+    jobs.theta_kind = wp.zeros(max(int(capacities["thetas"]), 1), dtype=wp.int32, device=device)
     jobs.live = wp.zeros(room, dtype=wp.int32, device=device)
     jobs.scans = wp.zeros(max(int(capacities["scans"]), 1), dtype=wp.vec2i, device=device)
     jobs.recover = wp.zeros(room, dtype=wp.int32, device=device)
@@ -3248,6 +3346,8 @@ def terrain_solid_jobs_bytes(jobs: TerrainSolidJobs) -> int:
         jobs.faces,
         jobs.edges,
         jobs.thetas,
+        jobs.theta_n,
+        jobs.theta_kind,
         jobs.vertices,
         jobs.xitems,
         jobs.xvalleys,

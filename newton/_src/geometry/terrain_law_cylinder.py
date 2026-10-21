@@ -7,9 +7,9 @@ The kernels are :func:`~newton._src.geometry.terrain_law_solid.solid_kernels`'s 
 :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LAUNCHES` (:mod:`~newton._src.geometry.terrain_shadow`):
 :func:`terrain_cylinder_rows` (the whole-pair rejects, one thread per pair), the scan
 :func:`terrain_cylinder_rows_scan`, the job kernels :func:`terrain_cylinder_rows_faces`,
-:func:`terrain_cylinder_rows_edges`, :func:`terrain_cylinder_rows_thetas` and :func:`terrain_cylinder_rows_vertices`
-(one thread per listed feature), the close :func:`terrain_cylinder_rows_close` and rule R's
-:func:`terrain_cylinder_rows_recovery`, rule X's :func:`terrain_cylinder_rows_xitems`,
+:func:`terrain_cylinder_rows_edges`, :func:`terrain_cylinder_rows_thetas`, :func:`terrain_cylinder_rows_creases` and
+:func:`terrain_cylinder_rows_vertices` (one thread per listed feature), the close :func:`terrain_cylinder_rows_close`
+and rule R's :func:`terrain_cylinder_rows_recovery`, rule X's :func:`terrain_cylinder_rows_xitems`,
 :func:`terrain_cylinder_rows_xvalleys` and :func:`terrain_cylinder_rows_exit`, and last
 :func:`terrain_cylinder_rows_full`, which walks the pairs the others deferred (more distinct rows than the class's 16
 walk slots, or no room for their work). The walk, the rules and the finish are
@@ -67,6 +67,7 @@ terrain_cylinder_rows_scan = _KERNELS["scan"]
 terrain_cylinder_rows_faces = _KERNELS["faces"]
 terrain_cylinder_rows_edges = _KERNELS["edges"]
 terrain_cylinder_rows_thetas = _KERNELS["thetas"]
+terrain_cylinder_rows_creases = _KERNELS["creases"]
 terrain_cylinder_rows_vertices = _KERNELS["vertices"]
 terrain_cylinder_rows_close = _KERNELS["close"]
 terrain_cylinder_rows_recovery = _KERNELS["recovery"]

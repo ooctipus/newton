@@ -6,11 +6,12 @@
 The kernels are :func:`~newton._src.geometry.terrain_law_solid.solid_kernels`'s for the class, launched in the order of
 :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LAUNCHES` (:mod:`~newton._src.geometry.terrain_shadow`):
 :func:`terrain_hull_rows` (the whole-pair rejects, one thread per pair), the scan :func:`terrain_hull_rows_scan`, the
-job kernels :func:`terrain_hull_rows_faces`, :func:`terrain_hull_rows_edges`, :func:`terrain_hull_rows_thetas` and
-:func:`terrain_hull_rows_vertices` (one thread per listed feature), the close :func:`terrain_hull_rows_close` and rule
-R's :func:`terrain_hull_rows_recovery`, rule X's :func:`terrain_hull_rows_xitems`, :func:`terrain_hull_rows_xvalleys`
-and :func:`terrain_hull_rows_exit`, and last :func:`terrain_hull_rows_full`, which walks the pairs the others deferred
-(more distinct rows than the class's 24 walk slots, or no room for their work). The walk, the rules and the finish are
+job kernels :func:`terrain_hull_rows_faces`, :func:`terrain_hull_rows_edges`, :func:`terrain_hull_rows_thetas`,
+:func:`terrain_hull_rows_creases` and :func:`terrain_hull_rows_vertices` (one thread per listed feature), the close
+:func:`terrain_hull_rows_close` and rule R's :func:`terrain_hull_rows_recovery`, rule X's
+:func:`terrain_hull_rows_xitems`, :func:`terrain_hull_rows_xvalleys` and :func:`terrain_hull_rows_exit`, and last
+:func:`terrain_hull_rows_full`, which walks the pairs the others deferred (more distinct rows than the class's 24 walk
+slots, or no room for their work). The walk, the rules and the finish are
 :mod:`~newton._src.geometry.terrain_law_solid`'s; the module is compiled without floating-point contraction, so the CPU
 decides every boundary as the GPU does.
 """
@@ -123,6 +124,7 @@ terrain_hull_rows_scan = _KERNELS["scan"]
 terrain_hull_rows_faces = _KERNELS["faces"]
 terrain_hull_rows_edges = _KERNELS["edges"]
 terrain_hull_rows_thetas = _KERNELS["thetas"]
+terrain_hull_rows_creases = _KERNELS["creases"]
 terrain_hull_rows_vertices = _KERNELS["vertices"]
 terrain_hull_rows_close = _KERNELS["close"]
 terrain_hull_rows_recovery = _KERNELS["recovery"]

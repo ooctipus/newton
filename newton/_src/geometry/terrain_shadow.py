@@ -52,7 +52,7 @@ jobs and the solid classes' :class:`~newton._src.geometry.terrain_law_solid.Terr
 2. The scan, a fixed grid of the class's job threads striding over the runs: a run's features through their cheapest
    rejects, the survivors listed (rule F's faces, one per cluster plane and run; rule E's edges; rule V's vertices).
 3. The job kernels, the job threads striding over a list: faces, edges (whose creases with an arc that can hold a row
-   are listed for ``theta*``), the creases' ``theta*`` and rows, vertices. A job's rows go to the class's candidate
+   are listed for ``theta*``), the creases' ``theta*``, their rows, vertices. A job's rows go to the class's candidate
    pool with their place in window order.
 4. The close, the job threads over the live pairs: a pair's candidates held in window order (the walk's held rows),
    then rule R's kernel over the pairs without a row, and the finish, or for a core reaching below its window's
@@ -134,6 +134,7 @@ def _solid_launches(name: str) -> tuple[tuple[str, str], ...]:
         "faces",
         "edges",
         "thetas",
+        "creases",
         "vertices",
         "close",
         "recovery",
@@ -142,7 +143,7 @@ def _solid_launches(name: str) -> tuple[tuple[str, str], ...]:
         "exit",
         "full",
     )
-    kinds = ("pairs", "jobs", "jobs", "jobs", "jobs", "jobs", "jobs", "jobs", "jobs", "jobs", "pairs", "full")
+    kinds = ("pairs", "jobs", "jobs", "jobs", "jobs", "jobs", "jobs", "jobs", "jobs", "jobs", "jobs", "pairs", "full")
     return tuple(
         (kind, f"terrain_{name}_rows" if kernel == "rows" else f"terrain_{name}_rows_{kernel}")
         for kind, kernel in zip(kinds, kernels, strict=True)
