@@ -297,6 +297,7 @@ _LIVE = wp.constant(7)
 _RECOVER = wp.constant(8)
 _SCANS = wp.constant(9)
 _XDESCENTS = wp.constant(10)
+_WALKS = wp.constant(11)
 
 _Mat43 = wp.types.matrix(shape=(4, 3), dtype=wp.float32)
 _RingNormals = wp.types.matrix(shape=(6, 3), dtype=wp.float32)
@@ -304,9 +305,10 @@ _ArcValues = wp.types.vector(length=TERRAIN_SOLID_ARC_SAMPLES, dtype=wp.float32)
 _Seen = wp.types.vector(length=TERRAIN_SOLID_SEEN, dtype=wp.int32)
 _Sorted = wp.types.vector(length=TERRAIN_SOLID_SORTED, dtype=wp.int32)
 
-TERRAIN_SOLID_COUNTERS = len(TERRAIN_SOLID_JOB_LISTS) + 5
+TERRAIN_SOLID_COUNTERS = len(TERRAIN_SOLID_JOB_LISTS) + 6
 """Counters of a solid class's jobs: one per job list, then the candidate pool's, the live pairs', the pairs left to
-rule R, the scan jobs' and the listed rule X candidates' descents (zeroed before every launch)."""
+rule R, the scan jobs', the listed rule X candidates' descents and the deferred pairs the full-finish kernel walked
+again (zeroed before every launch)."""
 
 
 @wp.struct
@@ -436,8 +438,9 @@ class TerrainSolidJobs:
     """The closed pairs without a row, left to rule R (class pair indices, in any order)."""
     counts: wp.array[wp.int32]
     """Entries asked for per job list (:data:`TERRAIN_SOLID_JOB_LISTS`), then the candidates asked for, the live pairs,
-    the pairs left to rule R, the scan jobs and the descents (:data:`TERRAIN_SOLID_COUNTERS`, zeroed before every
-    launch; past a list's capacity, the entries that found no room)."""
+    the pairs left to rule R, the scan jobs, the descents and the deferred pairs walked again
+    (:data:`TERRAIN_SOLID_COUNTERS`, zeroed before every launch; past a list's capacity, the entries that found no
+    room)."""
     threads: int
     """Threads of the job kernels' launches: each strides over its list."""
     q: wp.array[wp.vec3]
@@ -2216,8 +2219,9 @@ def solid_rows_full(
     heightfield: int,
     reach: float,
 ):
-    """A deferred pair walked again into block ``block``'s scratch, finished and written (:func:`solid_close_full`;
-    its walk slots from ``slot``)."""
+    """A deferred pair some of whose work found no room, walked again into block ``block``'s scratch (counted in its
+    class's walks), finished and written (:func:`solid_close_full`; its walk slots from ``slot``)."""
+    wp.atomic_add(jobs.counts, _WALKS, 1)
     _state, cells, window, core, pair = solid_pair_window(core, data, heightfield, reach)
     planes = terrain_planes()
     sink = solid_sink(block * scratch.capacity, scratch.capacity, pair.eps)
@@ -2238,6 +2242,52 @@ def solid_rows_full(
         walk_slots,
         frame,
         cells,
+    )
+
+
+@wp.func
+def solid_rows_pooled(
+    core: Any,
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+    scratch: TerrainFinishScratch,
+    solids: TerrainSolidData,
+    jobs: TerrainSolidJobs,
+    block: int,
+    pair_index: int,
+    i: int,
+    slot: int,
+    walk_slots: int,
+    frame: wp.transform,
+):
+    """A deferred pair every job of which found room (class pair ``i``: more distinct rows than its walk slots, or
+    rule X's lists without room), finished from block ``block``'s scratch and written (:func:`solid_close_full`; its
+    walk slots from ``slot``): its candidates come from the candidate pool, held in window order as the walk offers
+    them (:func:`_hold_candidates`, the walk's held rows bit for bit), not from a second walk of its window; ``core``
+    and its record are the scan's (window frame)."""
+    record, window = solid_job_window(data, jobs, i)
+    pair = record.pair
+    store = solid_scratch_store(scratch)
+    sink = solid_sink(block * scratch.capacity, scratch.capacity, pair.eps)
+    held, raw = _hold_candidates(store, jobs, i, sink.slot, sink.capacity, pair.eps)
+    sink.held = held
+    sink.raw = raw
+    solid_close_full(
+        core,
+        data,
+        window,
+        terrain_planes(),
+        pair,
+        sink,
+        scratch,
+        out,
+        solids.exit_work,
+        jobs,
+        pair_index,
+        slot,
+        walk_slots,
+        frame,
+        record.cells,
     )
 
 
@@ -2706,8 +2756,9 @@ def solid_close_jobs(
     (:func:`solid_recover_pair`, its list); any other is settled (:func:`_solid_settle`)."""
     state = out.state[pair_index]
     if (state & TERRAIN_PAIR_INCOMPLETE) != 0:
-        # its record may be missing (a window past its bound lists no first run)
-        terrain_defer_pair(out, partner_class, pair_index, state & TERRAIN_PAIR_WIDE)
+        # some of its work found no room (its record may be missing: a window past its bound lists no first run), so
+        # that the full-finish kernel walks it again
+        terrain_defer_pair(out, partner_class, pair_index, state & (TERRAIN_PAIR_WIDE | TERRAIN_PAIR_INCOMPLETE))
         return
     record, window = solid_job_window(data, jobs, i)
     cells = record.cells
@@ -3309,17 +3360,35 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         jobs: TerrainSolidJobs,
     ):
         """Finish the class's deferred pairs: the grid's ``scratch.blocks`` blocks stride over the class's deferred
-        list, and each block's first lane walks its pairs again, one at a time, into the block's scratch (every
-        distinct candidate a window of the class can give), runs rules R and X and the finish and writes every row it
-        keeps, in the pair's walk slots when they fit, else in rows of the spill region (:func:`solid_rows_full`). A
-        pair's rows depend on the pair alone: not on the order of the deferral, the number of deferred pairs or the
-        block that finishes it. ``wp.launch_tiled`` with ``dim=scratch.blocks``; a block past it returns at once."""
+        list, and each block's first lane takes its pairs one at a time into the block's scratch (every distinct
+        candidate a window of the class can give): a pair every job of which found room from the candidate pool
+        (:func:`solid_rows_pooled`), any other by walking its window again (:func:`solid_rows_full`); it runs rules R
+        and X and the finish and writes every row it keeps, in the pair's walk slots when they fit, else in rows of the
+        spill region. A pair's rows depend on the pair alone: not on the order of the deferral, the number of deferred
+        pairs or the block that finishes it. ``wp.launch_tiled`` with ``dim=scratch.blocks``; a block past it returns
+        at once."""
         block, lane = wp.tid()
         if block >= scratch.blocks or lane != 0:
             return
         for entry in range(block, out.deferred_count[class_], scratch.blocks):
             pair = out.deferred[begin + entry]
             i = pair - begin
+            if (out.state[pair] & TERRAIN_PAIR_INCOMPLETE) == 0:
+                solid_rows_pooled(
+                    wp.static(load_core)(jobs, i, solids),
+                    data,
+                    out,
+                    scratch,
+                    solids,
+                    jobs,
+                    block,
+                    pair,
+                    i,
+                    slot_begin + i * rows_,
+                    rows_,
+                    inputs.shape_transform[inputs.pairs[pair][0]],
+                )
+                continue
             _state, frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
             _supported, core = wp.static(make_core)(local, size, inputs.shape_type[partner], partner, solids)
             solid_rows_full(

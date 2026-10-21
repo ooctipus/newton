@@ -46,6 +46,7 @@ from newton._src.geometry.terrain_law import (
     TERRAIN_FINISH_MASK_ROWS,
     TERRAIN_PAIR_CANDIDATE_OVERFLOW,
     TERRAIN_PAIR_FILTERED,
+    TERRAIN_PAIR_INCOMPLETE,
     TERRAIN_PAIR_OUTSIDE,
     TERRAIN_PAIR_ROW_OVERFLOW,
     TERRAIN_PAIR_STALE,
@@ -1331,7 +1332,7 @@ def _run_class(
     shadow pipeline's last collide into a side buffer of their own (:func:`_side_buffer`), with ``jobs`` (by default
     sized as the shadow's), every list reversed before its kernel takes it with ``reverse``, up to the launch ``until``
     (not run). With ``full``, every pair the shadow did not reject whole goes straight to the full-finish kernel, which
-    walks it. The full-finish kernel's grid holds ``blocks`` blocks (by default the shadow's) of ``candidates``
+    walks it (as a pair some of whose work found no room). The full-finish kernel's grid holds ``blocks`` blocks (by default the shadow's) of ``candidates``
     candidates (by default the class's bound), launched with ``extra_blocks`` more; the job kernels are launched with
     ``extra_threads`` threads more than the jobs' grid. Returns ``(out, jobs, solids)``."""
     shadow = pipeline._terrain_law_shadow
@@ -1361,6 +1362,9 @@ def _run_class(
         counts = out.deferred_count.numpy()
         counts[partner_class] = len(walked)
         out.deferred_count.assign(counts)
+        state = out.state.numpy()
+        state[walked] = int(TERRAIN_PAIR_INCOMPLETE)
+        out.state.assign(state)
         launches = launches[-1:]
     for kind, name in launches:
         if name == until:
@@ -1422,16 +1426,19 @@ def test_job_pipeline_rows_are_the_walks(test, device):
             pairs = np.arange(begin, end)
             jobs_out, jobs, _solids = _run_class(pipeline, model, partner_class)
             counts = _counts(jobs)
-            # windows of several scan jobs; pairs the jobs finished (not deferred), some by rule X
+            # windows of several scan jobs; pairs the jobs finished (not deferred), some by rule X; a deferred pair is
+            # finished from its candidates, not walked again
             test.assertGreater(counts["scans"], counts["live"])
             test.assertLess(int(jobs_out.deferred_count.numpy()[partner_class]), counts["live"])
+            test.assertEqual(counts["walks"], 0)
             reversed_out, reversed_jobs, _solids = _run_class(
                 pipeline, model, partner_class, jobs=_class_jobs(model, shadow, partner_class, threads=1), reverse=True
             )
             pool = counts["candidates"]
             test.assertEqual(_counts(reversed_jobs)["candidates"], pool)
             test.assertFalse(np.array_equal(jobs.key.numpy()[:pool], reversed_jobs.key.numpy()[:pool]))
-            full_out, _jobs, _solids = _run_class(pipeline, model, partner_class, full=True)
+            full_out, full_jobs, _solids = _run_class(pipeline, model, partner_class, full=True)
+            test.assertEqual(_counts(full_jobs)["walks"], int(full_out.deferred_count.numpy()[partner_class]))
             _assert_same_rows(test, shadow._out, jobs_out, pairs, "the shadow's launch")
             _assert_same_rows(test, jobs_out, reversed_out, pairs, "the lists reversed")
             _assert_same_rows(test, jobs_out, full_out, pairs, "the full walk")
@@ -1616,13 +1623,17 @@ def test_long_box_keeps_every_support(test, device):
     """Keep every support of a box with more rows than its walk slots, as the float64 law gives them, raising nothing.
 
     A long box lies across ridges of different heights (every ridge in reach its own plane group): 20 rows, more than
-    the box class's 16 walk slots. Its class's full-finish kernel finishes it and writes them to the spill region.
-    (With a per-class limit of 16 rows the law kept 16, each plane's deepest first, and raised ``terrain_rows``.)
+    the box class's 16 walk slots. Its class's full-finish kernel finishes it from its candidates in the candidate pool,
+    without walking its window again (every job of it found room), and writes them to the spill region. (With a
+    per-class limit of 16 rows the law kept 16, each plane's deepest first, and raised ``terrain_rows``.)
     """
     hf, model, shapes, bodies = _ridge_boxes(device, (0.9, 0.05, 0.02), (0.05,))
     _kind, dims, pose = bodies[0]
     pipeline, _contacts, _state = _collide(model, shadow=True)
-    rows = pipeline._terrain_law_shadow.rows()
+    shadow = pipeline._terrain_law_shadow
+    rows = shadow.rows()
+    test.assertEqual(int(shadow._out.deferred_count.numpy()[TERRAIN_PARTNER_BOX]), 1)
+    test.assertEqual(shadow.job_counts()["box"]["walks"], 0)
     law = su.law_rows(hf, "box", dims, pose)
     test.assertEqual(len(law), 20)
     test.assertGreater(len(law), terrain_law_box.TERRAIN_BOX_WALK_SLOTS)
@@ -2046,6 +2057,8 @@ def test_job_overflow_takes_the_full_walk(test, device):
     for name in ("count", "state", "q", "n", "d", "feature"):
         np.testing.assert_array_equal(rows[name], expected[name], err_msg=name)
     test.assertGreater(int(shadow._out.deferred_count.numpy()[TERRAIN_PARTNER_CYLINDER]), 1)
+    # the pairs that lost work are walked again
+    test.assertGreater(shadow.job_counts()["cylinder"]["walks"], 1)
     test.assertFalse(any(small.narrow_phase.buffer_capacity_status().values()))
     # room for one scan job
     table = pipeline._terrain_law_shadow.table

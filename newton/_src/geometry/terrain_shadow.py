@@ -271,9 +271,9 @@ TERRAIN_LAW_SPILL_SHARE = 256
 pair's bound (:meth:`TerrainLawShadow.default_spill_rows`): the worst case of one pair in 256 at once. On the recorded
 suite scenes (16,384 worlds) that is 11 to 25% of the walk slots, while at most one pair spilled (30 rows)."""
 
-TERRAIN_LAW_JOB_COUNTERS = 11
+TERRAIN_LAW_JOB_COUNTERS = 12
 """Counters of a solid class's jobs: its six job lists, its candidate pool, its live pairs, its pairs left to rule R,
-its scan's runs and its listed rule X candidates' descents
+its scan's runs, its listed rule X candidates' descents and its deferred pairs walked again
 (:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_COUNTERS`)."""
 
 TERRAIN_LAW_JOB_NAMES = (
@@ -288,6 +288,7 @@ TERRAIN_LAW_JOB_NAMES = (
     "recovery",
     "scans",
     "xdescents",
+    "walks",
 )
 """Names of a solid class's job counters, in order (:meth:`TerrainLawShadow.job_counts`)."""
 
@@ -698,8 +699,9 @@ class TerrainLawShadow:
     def job_counts(self) -> dict[str, dict[str, int]]:
         """Return, per listed solid class with pairs, the entries its last launch asked of every job list, of its
         candidate pool and of its scan's runs (past a capacity, :meth:`describe`'s ``launch_shapes``: entries without
-        room, whose pairs took the full-finish kernel), its live pairs and its pairs left to rule R, by
-        :data:`TERRAIN_LAW_JOB_NAMES`."""
+        room, whose pairs took the full-finish kernel), its live pairs, its pairs left to rule R and its deferred pairs
+        whose windows the full-finish kernel walked again (``walks``: those some of whose work found no room; it
+        finishes the others from their candidates), by :data:`TERRAIN_LAW_JOB_NAMES`."""
         if self.device.is_capturing:
             raise RuntimeError("Terrain-law shadow counters must be read outside graph capture")
         if not self._jobs:
