@@ -46,6 +46,7 @@ import numpy as np
 import warp as wp
 
 from .terrain_law import (
+    TERRAIN_FINE_CELLS,
     TERRAIN_FLAT_EPS,
     TERRAIN_TILE_CELLS,
     TerrainClusterPlane,
@@ -106,7 +107,6 @@ TERRAIN_LANE_CELLS = 16
 _FLAT_EPS = wp.constant(TERRAIN_FLAT_EPS)
 _INT_MAX = wp.constant(2147483647)
 _FLOAT_MAX = wp.constant(3.402823466e38)
-_TILE_CELLS = wp.constant(TERRAIN_TILE_CELLS)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -733,20 +733,21 @@ def _cluster_write(
 
 
 @wp.kernel(enable_backward=False)
-def _tile_max(
-    grid: _Grid, tile_r0: int, tile_c0: int, tile_cols: int, tile_offset: int, tile_max: wp.array[wp.float32]
+def _block_max(
+    grid: _Grid, side: int, block_r0: int, block_c0: int, block_cols: int, block_offset: int, out: wp.array[wp.float32]
 ):
+    """The largest decoded height of the vertices of every block of ``side`` x ``side`` cells (a mip level)."""
     i, j = wp.tid()
-    tr = tile_r0 + i
-    tc = tile_c0 + j
-    r_end = wp.min((tr + 1) * _TILE_CELLS, grid.nrow - 1)
-    c_end = wp.min((tc + 1) * _TILE_CELLS, grid.ncol - 1)
+    br = block_r0 + i
+    bc = block_c0 + j
+    r_end = wp.min((br + 1) * side, grid.nrow - 1)
+    c_end = wp.min((bc + 1) * side, grid.ncol - 1)
     value = float(-_FLOAT_MAX)
-    for r in range(tr * _TILE_CELLS, r_end + 1):
-        for c in range(tc * _TILE_CELLS, c_end + 1):
+    for r in range(br * side, r_end + 1):
+        for c in range(bc * side, c_end + 1):
             e = grid.elevations[grid.data_offset + r * grid.ncol + c]
             value = wp.max(value, terrain_decode(grid.min_z, grid.max_z, e))
-    tile_max[tile_offset + tr * tile_cols + tc] = value
+    out[block_offset + br * block_cols + bc] = value
 
 
 @wp.kernel(enable_backward=False)
@@ -838,7 +839,9 @@ class TerrainFeatures:
         infos = []
         triangle_offset = 0
         tile_offset = 0
+        fine_offset = 0
         self._tiles = []
+        self._fines = []
         for h in range(count):
             row = layouts[h]
             nrow, ncol = int(row["nrow"]), int(row["ncol"])
@@ -854,6 +857,9 @@ class TerrainFeatures:
             tile_rows = -(-(nrow - 1) // TERRAIN_TILE_CELLS)
             tile_cols = -(-(ncol - 1) // TERRAIN_TILE_CELLS)
             self._tiles.append((tile_rows, tile_cols))
+            fine_rows = -(-(nrow - 1) // TERRAIN_FINE_CELLS)
+            fine_cols = -(-(ncol - 1) // TERRAIN_FINE_CELLS)
+            self._fines.append((fine_rows, fine_cols))
             info = TerrainSurfaceInfo()
             info.data_offset = grid.data_offset
             info.nrow, info.ncol = nrow, ncol
@@ -865,12 +871,16 @@ class TerrainFeatures:
             info.plane_offset = 0
             info.tile_offset = tile_offset
             info.tile_cols = tile_cols
+            info.fine_offset = fine_offset
+            info.fine_cols = fine_cols
             infos.append(info)
             triangle_offset += 2 * (nrow - 1) * (ncol - 1)
             tile_offset += tile_rows * tile_cols
+            fine_offset += fine_rows * fine_cols
         self._infos = infos
         self.clusters = wp.zeros(max(triangle_offset, 1), dtype=wp.int32, device=self.device)
         self.tile_max = wp.zeros(max(tile_offset, 1), dtype=wp.float32, device=self.device)
+        self.fine_max = wp.zeros(max(fine_offset, 1), dtype=wp.float32, device=self.device)
         self.vertex_bits = wp.zeros(
             max(model.heightfield_elevations.shape[0] if count else 0, 1), dtype=wp.uint8, device=self.device
         )
@@ -895,6 +905,7 @@ class TerrainFeatures:
         for h in range(count):
             self._build_vertex_bits(h)
             self._build_tiles(h, 0, self._tiles[h][0], 0, self._tiles[h][1])
+            self._build_fines(h, 0, self._fines[h][0], 0, self._fines[h][1])
 
     # ---- queries ---------------------------------------------------------------------------------------------
     def data(self) -> TerrainFeatureData:
@@ -910,6 +921,7 @@ class TerrainFeatures:
         data.clusters = self.clusters
         data.planes = self.planes
         data.tile_max = self.tile_max
+        data.fine_max = self.fine_max
         data.vertex_bits = self.vertex_bits
         data.surfaces = self._surfaces
         data.elevation_version = self.elevation_version
@@ -932,6 +944,7 @@ class TerrainFeatures:
             "clusters": self.clusters.capacity,
             "planes": self.planes.capacity,
             "tile_max": self.tile_max.capacity,
+            "fine_max": self.fine_max.capacity,
             "vertex_bits": self.vertex_bits.capacity,
             "surfaces": self._surfaces.capacity,
             "versions": self.elevation_version.capacity + self.feature_version.capacity + self._layout.capacity,
@@ -994,6 +1007,11 @@ class TerrainFeatures:
         tc0 = max(c0 - 1, 0) // TERRAIN_TILE_CELLS
         tc1 = min(max(c1 - 1, 0), cols - 1) // TERRAIN_TILE_CELLS + 1
         self._build_tiles(h, tr0, tr1, tc0, tc1)
+        fr0 = max(r0 - 1, 0) // TERRAIN_FINE_CELLS
+        fr1 = min(max(r1 - 1, 0), rows - 1) // TERRAIN_FINE_CELLS + 1
+        fc0 = max(c0 - 1, 0) // TERRAIN_FINE_CELLS
+        fc1 = min(max(c1 - 1, 0), cols - 1) // TERRAIN_FINE_CELLS + 1
+        self._build_fines(h, fr0, fr1, fc0, fc1)
         self._dirty[h] = None
         wp.launch(
             _copy_version,
@@ -1208,9 +1226,21 @@ class TerrainFeatures:
             return
         info = self._infos[h]
         wp.launch(
-            _tile_max,
+            _block_max,
             dim=(tr1 - tr0, tc1 - tc0),
-            inputs=[self._grids[h], tr0, tc0, info.tile_cols, info.tile_offset, self.tile_max],
+            inputs=[self._grids[h], TERRAIN_TILE_CELLS, tr0, tc0, info.tile_cols, info.tile_offset, self.tile_max],
+            device=self.device,
+            record_tape=False,
+        )
+
+    def _build_fines(self, h: int, fr0: int, fr1: int, fc0: int, fc1: int) -> None:
+        if fr1 <= fr0 or fc1 <= fc0:
+            return
+        info = self._infos[h]
+        wp.launch(
+            _block_max,
+            dim=(fr1 - fr0, fc1 - fc0),
+            inputs=[self._grids[h], TERRAIN_FINE_CELLS, fr0, fc0, info.fine_cols, info.fine_offset, self.fine_max],
             device=self.device,
             record_tape=False,
         )

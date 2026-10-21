@@ -105,6 +105,13 @@ TERRAIN_FINISH_MASK_ROWS = 32
 partner class's walk slots fit it; the full-finish kernels finish any number (:func:`terrain_finish_list`)."""
 TERRAIN_TILE_CELLS = 8
 """Cells per side of a tile of the tile-max mip."""
+TERRAIN_FINE_CELLS = 2
+"""Cells per side of a block of the fine height mip: the window exit of a pair that the tiles keep
+(:func:`terrain_tile_exit`)."""
+TERRAIN_FINE_MARGIN = 1.0e-5
+"""Height [m] by which every fine block under a window must lie below a pair's ``low`` for the fine exit: a feature
+within it of the reach limit still reaches the pair's own rejects, which decide it as they did without the fine
+exit."""
 
 TERRAIN_EDGE_FLAT = wp.constant(0)
 """Edge class: both triangles in one plane cluster."""
@@ -197,6 +204,8 @@ _MaskFloats = wp.types.vector(length=TERRAIN_FINISH_MASK_ROWS, dtype=wp.float32)
 _MASK_ROWS = wp.constant(TERRAIN_FINISH_MASK_ROWS)
 _CELL_WIDEN = wp.constant(TERRAIN_CELL_WIDEN)
 _TILE_SIDE = wp.constant(TERRAIN_TILE_CELLS)
+_FINE_SIDE = wp.constant(TERRAIN_FINE_CELLS)
+_FINE_MARGIN = wp.constant(TERRAIN_FINE_MARGIN)
 _EPS32 = wp.constant(TERRAIN_EPS32)
 _EPS_FACTOR = wp.constant(TERRAIN_EPS_FACTOR)
 _EPS_MIN_EXTENT = wp.constant(TERRAIN_EPS_MIN_EXTENT)
@@ -246,6 +255,10 @@ class TerrainSurfaceInfo:
     """First tile-max value of the heightfield."""
     tile_cols: int
     """Tiles per tile row."""
+    fine_offset: int
+    """First fine-mip value of the heightfield."""
+    fine_cols: int
+    """Fine blocks per fine row."""
 
 
 @wp.struct
@@ -274,6 +287,8 @@ class TerrainFeatureData:
     """Plane records of the clusters of several triangles."""
     tile_max: wp.array[wp.float32]
     """Per tile of 8 x 8 cells: the largest decoded height of its vertices [m]."""
+    fine_max: wp.array[wp.float32]
+    """Per block of 2 x 2 cells: the largest decoded height of its vertices [m]."""
     vertex_bits: wp.array[wp.uint8]
     """Per vertex, indexed as the elevations: the kinds of the three edges it owns and whether it is a vertex feature
     (:func:`terrain_vertex_bits_of_clusters`), static data of the clusters and heights read by
@@ -1287,18 +1302,41 @@ def terrain_box_cells(surface: TerrainSurfaceInfo, x0: float, y0: float, x1: flo
 
 
 @wp.func
+def terrain_fine_bound(data: TerrainFeatureData, surface: TerrainSurfaceInfo, fine_r: int, fine_c: int) -> float:
+    """Return an upper bound of every height of a fine block [m]: its maximum plus four float32 ulps of slack."""
+    value = data.fine_max[surface.fine_offset + fine_r * surface.fine_cols + fine_c]
+    return value + 4.0 * _EPS32 * wp.max(wp.abs(value), 1.0e-3)
+
+
+@wp.func
+def terrain_fine_exit(
+    data: TerrainFeatureData, surface: TerrainSurfaceInfo, r0: int, r1: int, c0: int, c1: int, low: float
+) -> bool:
+    """Return whether every height under cells ``[r0, r1] x [c0, c1]`` lies below ``low`` [m, heightfield-local], from
+    the fine mip's blocks under the cells (:func:`terrain_fine_bound`)."""
+    for fr in range(r0 // _FINE_SIDE, r1 // _FINE_SIDE + 1):
+        for fc in range(c0 // _FINE_SIDE, c1 // _FINE_SIDE + 1):
+            if terrain_fine_bound(data, surface, fr, fc) >= low:
+                return False
+    return True
+
+
+@wp.func
 def terrain_tile_exit(
     data: TerrainFeatureData, surface: TerrainSurfaceInfo, r0: int, r1: int, c0: int, c1: int, low: float
 ) -> bool:
     """Return whether every height under cells ``[r0, r1] x [c0, c1]`` lies below ``low`` [m, heightfield-local].
 
-    Reads the tile-max mip blocks under the cells (:func:`terrain_tile_bound`). With ``low`` a core's lowest point
-    minus its reach, the pair has no row: every terrain point under its window is farther than the reach.
+    Reads the tile-max mip blocks under the cells (:func:`terrain_tile_bound`), and when a tile reaches ``low``, the
+    fine mip's 2 x 2-cell blocks under the cells against ``low`` minus :data:`TERRAIN_FINE_MARGIN`
+    (:func:`terrain_fine_exit`): a tile spans 8 x 8 cells, so a core above its own window often sits under a tile some
+    far cell of which rises past it. With ``low`` a core's lowest point minus its reach, the pair has no row: every
+    terrain point under its window is farther than the reach.
     """
     for tr in range(r0 // _TILE_SIDE, r1 // _TILE_SIDE + 1):
         for tc in range(c0 // _TILE_SIDE, c1 // _TILE_SIDE + 1):
             if terrain_tile_bound(data, surface, tr, tc) >= low:
-                return False
+                return terrain_fine_exit(data, surface, r0, r1, c0, c1, low - _FINE_MARGIN)
     return True
 
 

@@ -1120,12 +1120,13 @@ def test_recovery_rows_have_distinct_feature_ids(test, device):
 def test_hovering_core_skips_rule_r(test, device):
     """Leave a core without a candidate that clears its window's highest vertex without a row, not listed for rule R.
 
-    A box hovers 2 cm beyond its reach over flat ground, in a tile whose maximum is a spike outside its window: the
-    tile-max exit keeps the pair, and its scan lists nothing. Rule R can give it no row (every point of the core lies
-    above the surface), so its close leaves it without one instead of listing it for rule R's kernel.
+    A box hovers 2 cm beyond its reach over flat ground, next to a spike outside its window but in a fine mip block
+    under it: the tile-max and fine exits keep the pair, and its scan lists nothing. Rule R can give it no row (every
+    point of the core lies above the surface), so its close leaves it without one instead of listing it for rule R's
+    kernel.
     """
     heights = np.zeros((33, 33))
-    heights[7, 7] = 0.5
+    heights[3, 6] = 0.5
     lift = BOX["half"][2] + su.REACH + 0.02
     pose = _f32_pose([-1.3, -1.3, lift, 0.0, 0.0, 0.0, 1.0])
     model, _hfield, _shapes = su.solid_scene(heights, 1.6, 1.6, [("box", BOX, pose)], device=device)
@@ -1136,6 +1137,24 @@ def test_hovering_core_skips_rule_r(test, device):
     test.assertEqual(counts["live"], 1)
     test.assertEqual(counts["candidates"], 0)
     test.assertEqual(counts["recovery"], 0)
+    test.assertEqual(int(shadow.rows()["count"].sum()), 0)
+
+
+def test_hovering_core_leaves_at_the_fine_mip(test, device):
+    """Reject a core whose window lies below it by more than its reach at the fine mip, though its tile rises past it.
+
+    A box hovers 2 cm beyond its reach over flat ground; a spike in the same 8 x 8-cell tile but four cells from its
+    window keeps the tile-max exit from taking it. The fine mip's 2 x 2-cell blocks under its window do: the pair
+    never goes live (no scan, no close).
+    """
+    heights = np.zeros((33, 33))
+    heights[7, 7] = 0.5
+    lift = BOX["half"][2] + su.REACH + 0.02
+    pose = _f32_pose([-1.3, -1.3, lift, 0.0, 0.0, 0.0, 1.0])
+    model, _hfield, _shapes = su.solid_scene(heights, 1.6, 1.6, [("box", BOX, pose)], device=device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    shadow = pipeline._terrain_law_shadow
+    test.assertEqual(shadow.job_counts()["box"]["live"], 0)
     test.assertEqual(int(shadow.rows()["count"].sum()), 0)
 
 
@@ -2409,6 +2428,7 @@ for _name, _func in (
     ("test_needle_cores_reach_their_depth", test_needle_cores_reach_their_depth),
     ("test_recovery_rows_have_distinct_feature_ids", test_recovery_rows_have_distinct_feature_ids),
     ("test_hovering_core_skips_rule_r", test_hovering_core_skips_rule_r),
+    ("test_hovering_core_leaves_at_the_fine_mip", test_hovering_core_leaves_at_the_fine_mip),
     ("test_recovery_picks_follow_depth_then_index", test_recovery_picks_follow_depth_then_index),
     ("test_solid_rows_match_the_float64_law", test_solid_rows_match_the_float64_law),
     ("test_job_pipeline_rows_are_the_walks", test_job_pipeline_rows_are_the_walks),

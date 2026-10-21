@@ -26,12 +26,14 @@ from newton._src.geometry.terrain_law import (
     TERRAIN_EDGE_CONCAVE,
     TERRAIN_EDGE_CONVEX,
     TERRAIN_EDGE_FLAT,
+    TERRAIN_FINE_CELLS,
     TERRAIN_STATUS_STALE,
     TERRAIN_TILE_CELLS,
     TERRAIN_VERTEX_FEATURE_BIT,
     TerrainFeatureData,
     terrain_decode,
     terrain_features_current,
+    terrain_fine_bound,
     terrain_report,
     terrain_tile_bound,
     terrain_vertex_bits_of_clusters,
@@ -58,6 +60,12 @@ def _stale_check(data: TerrainFeatureData, heightfield: int, status: wp.array[wp
 def _tile_bounds(data: TerrainFeatureData, heightfield: int, out: wp.array2d[float]):
     i, j = wp.tid()
     out[i, j] = terrain_tile_bound(data, data.surfaces[heightfield], i, j)
+
+
+@wp.kernel(enable_backward=False)
+def _fine_bounds(data: TerrainFeatureData, heightfield: int, out: wp.array2d[float]):
+    i, j = wp.tid()
+    out[i, j] = terrain_fine_bound(data, data.surfaces[heightfield], i, j)
 
 
 # A module of its own with Warp's default contraction, so that its PTX can be checked alone.
@@ -332,7 +340,8 @@ def test_weak_convex_vertex_keeps_its_support(test, device):
 
 
 def test_tile_max_bounds_every_height(test, device):
-    """Hold the largest decoded height of every 8 x 8 cell tile, and a bound above every height of the tile."""
+    """Hold the largest decoded height of every 8 x 8 cell tile and of every 2 x 2 cell block of the fine mip, and a
+    bound above every height of each."""
     rng = np.random.default_rng(4)
     heights = tu.suite_like_heights(rng, 70, 45)
     model = tu.heightfield_model(heights, 2.25, 3.5, device=device)
@@ -349,6 +358,19 @@ def test_tile_max_bounds_every_height(test, device):
     for i in range(tile_rows):
         for j in range(tile_cols):
             block = hf.Z[i * 8 : min(i * 8 + 8, hf.rows) + 1, j * 8 : min(j * 8 + 8, hf.cols) + 1]
+            test.assertEqual(np.float32(got[i, j]), np.float32(block.max()))
+            test.assertGreater(bounds[i, j], block.max())
+    # the fine mip: every 2 x 2 cell block
+    fine_rows = -(-hf.rows // TERRAIN_FINE_CELLS)
+    fine_cols = -(-hf.cols // TERRAIN_FINE_CELLS)
+    test.assertEqual(info.fine_cols, fine_cols)
+    got = features.fine_max.numpy()[: fine_rows * fine_cols].reshape(fine_rows, fine_cols)
+    bounds = wp.zeros((fine_rows, fine_cols), dtype=float, device=device)
+    wp.launch(_fine_bounds, dim=(fine_rows, fine_cols), inputs=[features.data(), 0], outputs=[bounds], device=device)
+    bounds = bounds.numpy()
+    for i in range(fine_rows):
+        for j in range(fine_cols):
+            block = hf.Z[i * 2 : min(i * 2 + 2, hf.rows) + 1, j * 2 : min(j * 2 + 2, hf.cols) + 1]
             test.assertEqual(np.float32(got[i, j]), np.float32(block.max()))
             test.assertGreater(bounds[i, j], block.max())
 
@@ -425,6 +447,7 @@ def _assert_equals_fresh_build(test, features, model):
     fresh = TerrainFeatures(model)
     np.testing.assert_array_equal(features.clusters.numpy(), fresh.clusters.numpy())
     np.testing.assert_array_equal(features.tile_max.numpy(), fresh.tile_max.numpy())
+    np.testing.assert_array_equal(features.fine_max.numpy(), fresh.fine_max.numpy())
     np.testing.assert_array_equal(features.vertex_bits.numpy(), fresh.vertex_bits.numpy())
     for s in features.heightfield_shapes:
         a, b = features.surface(s), fresh.surface(s)
