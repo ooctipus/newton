@@ -2236,6 +2236,38 @@ def _job_append(jobs: TerrainSolidJobs, kind: int, entries: wp.array[wp.vec2i], 
 
 
 @wp.func
+def _job_reserve(jobs: TerrainSolidJobs, kind: int, entries: wp.array[wp.vec2i], count: int) -> tuple[int, int]:
+    """Reserve ``count`` consecutive entries of a list (kind ``kind`` of :data:`TERRAIN_SOLID_JOB_LISTS`) with one
+    atomic: ``(first, kept)``, ``kept`` 0 when some of them found no room (they are still counted)."""
+    if count == 0:
+        return 0, 1
+    first = wp.atomic_add(jobs.counts, kind, count)
+    if first + count > entries.shape[0]:
+        return first, 0
+    return first, 1
+
+
+@wp.func
+def _job_put(entries: wp.array[wp.vec2i], entry: int, job: wp.vec2i) -> int:
+    """Write a reserved job (:func:`_job_reserve`) where its list has room; returns the next entry."""
+    if entry < entries.shape[0]:
+        entries[entry] = job
+    return entry + 1
+
+
+@wp.func
+def _bit(mask: wp.uint32, v: int) -> bool:
+    """Whether bit ``v`` (0-31) of a mask is set."""
+    return ((mask >> wp.uint32(v)) & wp.uint32(1)) != wp.uint32(0)
+
+
+@wp.func
+def _with_bit(mask: wp.uint32, v: int) -> wp.uint32:
+    """A mask with bit ``v`` (0-31) set."""
+    return mask | (wp.uint32(1) << wp.uint32(v))
+
+
+@wp.func
 def solid_scan(
     core: Any,
     data: TerrainFeatureData,
@@ -2251,11 +2283,13 @@ def solid_scan(
 ):
     """Run ``run`` of a live pair's scan (class pair ``i``; the window vertices ``[run, run + 1)`` times
     :data:`TERRAIN_SOLID_SCAN_VERTICES` in window order): the first run keeps the pair's core and record; each passes
-    its vertices' features in window order through the cheapest rejects of their rules and appends every survivor to
-    its job list: rule F's faces (:func:`_face_top`; of a cluster of several triangles, the first that passes, its
+    its vertices' features in window order through the cheapest rejects of their rules and lists every survivor for its
+    job kernel: rule F's faces (:func:`_face_top`; of a cluster of several triangles, the first that passes, its
     cluster's manifold and emitting triangle being its cluster's alone), rule E's edges (:func:`_edge_cheap`) and rule
-    V's vertices (:func:`_vertex_cheap`). A job without room flags the pair
-    :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_INCOMPLETE` (its close then defers it)."""
+    V's vertices (:func:`_vertex_cheap`). The run marks its survivors in one bit per vertex and item, then reserves
+    each list's entries with one atomic and writes them in window order (:func:`_job_reserve`): consecutive entries of a
+    list are one run's, so that the threads of a job kernel's warp take one pair's features. A job without room flags
+    the pair :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_INCOMPLETE` (its close then defers it)."""
     if run == 0:
         record = TerrainSolidRecord()
         record.cells = cells
@@ -2272,16 +2306,26 @@ def solid_scan(
     width = c1 + 2 - c0
     first = run * _SCAN_VERTICES
     last = wp.min(first + _SCAN_VERTICES, (r1 + 2 - r0) * width)
-    kept = int(1)
     seen = _Seen()
     for k in range(_SEEN):
         seen[k] = -1
     oldest = int(0)
+    # the survivors: bit v of a mask for the run's vertex first + v (a face of triangle 0 or 1, an x-, y- or diagonal
+    # edge, the vertex)
+    face0 = wp.uint32(0)
+    face1 = wp.uint32(0)
+    edge0 = wp.uint32(0)
+    edge1 = wp.uint32(0)
+    edge2 = wp.uint32(0)
+    point = wp.uint32(0)
+    faces = int(0)
+    edges = int(0)
+    points = int(0)
     for vertex in range(first, last):
+        v = vertex - first
         row = vertex // width
         r = r0 + row
         c = c0 + vertex - row * width
-        item = vertex * _ITEMS
         inside = r <= r1 and c <= c1
         if inside:
             for sub in range(2):
@@ -2298,14 +2342,50 @@ def solid_scan(
                 if cluster >= 0:
                     seen[oldest] = cluster
                     oldest = (oldest + 1) % _SEEN
-                kept = kept & _job_append(jobs, _FACES, jobs.faces, wp.vec2i(pair_index, item + sub))
+                if sub == 0:
+                    face0 = _with_bit(face0, v)
+                else:
+                    face1 = _with_bit(face1, v)
+                faces += 1
         for which in range(3):
             if (which == 0 and c > c1) or (which == 1 and r > r1) or (which == 2 and not inside):
                 continue
             if _edge_cheap(data, window, pair, r, c, which):
-                kept = kept & _job_append(jobs, _EDGES, jobs.edges, wp.vec2i(pair_index, item + 2 + which))
+                if which == 0:
+                    edge0 = _with_bit(edge0, v)
+                elif which == 1:
+                    edge1 = _with_bit(edge1, v)
+                else:
+                    edge2 = _with_bit(edge2, v)
+                edges += 1
         if _vertex_cheap(core, data, window, pair, r, c):
-            kept = kept & _job_append(jobs, _VERTICES, jobs.vertices, wp.vec2i(pair_index, item + 5))
+            point = _with_bit(point, v)
+            points += 1
+    entry, kept = _job_reserve(jobs, _FACES, jobs.faces, faces)
+    if faces > 0:
+        for v in range(last - first):
+            item = (first + v) * _ITEMS
+            if _bit(face0, v):
+                entry = _job_put(jobs.faces, entry, wp.vec2i(pair_index, item))
+            if _bit(face1, v):
+                entry = _job_put(jobs.faces, entry, wp.vec2i(pair_index, item + 1))
+    entry, room = _job_reserve(jobs, _EDGES, jobs.edges, edges)
+    kept = kept & room
+    if edges > 0:
+        for v in range(last - first):
+            item = (first + v) * _ITEMS
+            if _bit(edge0, v):
+                entry = _job_put(jobs.edges, entry, wp.vec2i(pair_index, item + 2))
+            if _bit(edge1, v):
+                entry = _job_put(jobs.edges, entry, wp.vec2i(pair_index, item + 3))
+            if _bit(edge2, v):
+                entry = _job_put(jobs.edges, entry, wp.vec2i(pair_index, item + 4))
+    entry, room = _job_reserve(jobs, _VERTICES, jobs.vertices, points)
+    kept = kept & room
+    if points > 0:
+        for v in range(last - first):
+            if _bit(point, v):
+                entry = _job_put(jobs.vertices, entry, wp.vec2i(pair_index, (first + v) * _ITEMS + 5))
     if kept == 0:
         wp.atomic_or(out.state, pair_index, TERRAIN_PAIR_INCOMPLETE)
 
@@ -2528,7 +2608,9 @@ def _xjobs_open(
     row's depth plus :data:`TERRAIN_SOLID_EXIT_MARGIN`, as :func:`solid_exits` takes it), its candidate list cleared,
     and its items listed for :func:`solid_xitem_job`: every core point, and every window vertex that can give a
     candidate (when its core takes candidates at window vertices: a valley needs an edge rising above the core's
-    lowest point, a local maximum of the distance a vertex above it). Items without room take every candidate."""
+    lowest point, a local maximum of the distance a vertex above it), in window order, each run of
+    :data:`TERRAIN_SOLID_SCAN_VERTICES` window vertices reserving its items with one atomic (:func:`_job_reserve`).
+    Items without room take every candidate."""
     deepest = float(0.0)
     for h in range(wp.min(sink.held, sink.capacity)):
         deepest = wp.max(deepest, -out.d[sink.slot + h])
@@ -2536,26 +2618,38 @@ def _xjobs_open(
     jobs.xhead[i] = -1
     jobs.xall[i] = 0
     cells = record.cells
-    kept = int(1)
-    for j in range(core_exit_count(core)):
-        kept = kept & _job_append(jobs, _XITEMS, jobs.xitems, wp.vec2i(pair_index, -1 - j))
+    points = core_exit_count(core)
+    entry, kept = _job_reserve(jobs, _XITEMS, jobs.xitems, points)
+    for j in range(points):
+        entry = _job_put(jobs.xitems, entry, wp.vec2i(pair_index, -1 - j))
     vertices = int(0)
     if core_support_count(core) > 0 or core_far_count(core) > 0:
         vertices = (cells[1] - cells[0] + 2) * (cells[3] + 2 - cells[2])
     low = record.low
-    for v in range(vertices):
-        rc = _job_vertex(cells, v)
-        r = rc[0]
-        c = rc[1]
-        above = _vertex_z(data, window, r, c) > low
-        if c <= cells[3]:
-            above = above or _vertex_z(data, window, r, c + 1) > low
-        if r <= cells[1]:
-            above = above or _vertex_z(data, window, r + 1, c) > low
-        if r <= cells[1] and c <= cells[3]:
-            above = above or _vertex_z(data, window, r + 1, c + 1) > low
-        if above:
-            kept = kept & _job_append(jobs, _XITEMS, jobs.xitems, wp.vec2i(pair_index, v))
+    for start in range(0, vertices, _SCAN_VERTICES):
+        stop = wp.min(start + _SCAN_VERTICES, vertices)
+        listed = wp.uint32(0)
+        count = int(0)
+        for v in range(start, stop):
+            rc = _job_vertex(cells, v)
+            r = rc[0]
+            c = rc[1]
+            above = _vertex_z(data, window, r, c) > low
+            if c <= cells[3]:
+                above = above or _vertex_z(data, window, r, c + 1) > low
+            if r <= cells[1]:
+                above = above or _vertex_z(data, window, r + 1, c) > low
+            if r <= cells[1] and c <= cells[3]:
+                above = above or _vertex_z(data, window, r + 1, c + 1) > low
+            if above:
+                listed = _with_bit(listed, v - start)
+                count += 1
+        entry, room = _job_reserve(jobs, _XITEMS, jobs.xitems, count)
+        kept = kept & room
+        if count > 0:
+            for v in range(start, stop):
+                if _bit(listed, v - start):
+                    entry = _job_put(jobs.xitems, entry, wp.vec2i(pair_index, v))
     if kept == 0:
         jobs.xall[i] = 1
 
@@ -2681,6 +2775,8 @@ def solid_xitem_job(core: Any, data: TerrainFeatureData, jobs: TerrainSolidJobs,
     r = rc[0]
     c = rc[1]
     inside = r <= cells[1] and c <= cells[3]
+    valleys = wp.uint32(0)
+    count = int(0)
     for which in range(3):
         if (which == 0 and c > cells[3]) or (which == 1 and r > cells[1]) or (which == 2 and not inside):
             continue
@@ -2691,8 +2787,15 @@ def solid_xitem_job(core: Any, data: TerrainFeatureData, jobs: TerrainSolidJobs,
         # stays below every later threshold (a nonpositive scale makes the gate pass, as here).
         if top - low < target * wp.min(n_a[2], n_b[2]):
             continue
-        if _job_append(jobs, _XVALLEYS, jobs.xvalleys, wp.vec2i(i + jobs.first, 3 * item + which)) == 0:
-            jobs.xall[i] = 1
+        valleys = _with_bit(valleys, which)
+        count += 1
+    # the item's valleys reserved at once (:func:`_job_reserve`)
+    entry, kept = _job_reserve(jobs, _XVALLEYS, jobs.xvalleys, count)
+    if kept == 0:
+        jobs.xall[i] = 1
+    for which in range(3):
+        if _bit(valleys, which):
+            entry = _job_put(jobs.xvalleys, entry, wp.vec2i(i + jobs.first, 3 * item + which))
     if far == 0 or not terrain_interior_vertex(window.surface, r, c):
         return
     v = terrain_window_vertex(data, window, r, c)

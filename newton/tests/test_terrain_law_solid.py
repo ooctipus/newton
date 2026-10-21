@@ -1439,6 +1439,59 @@ def test_job_pipeline_rows_are_the_walks(test, device):
     test.assertGreater(walked, 20)
 
 
+def _runs_of(entries, run_of):
+    """The blocks of consecutive list entries that share a run (``run_of``: an entry's run key), as ``(run, items)``."""
+    blocks = []
+    for pair, item in entries.tolist():
+        run = run_of(pair, item)
+        if blocks and blocks[-1][0] == run:
+            blocks[-1][1].append(item)
+        else:
+            blocks.append((run, [item]))
+    return blocks
+
+
+def test_job_lists_hold_each_run_together(test, device):
+    """List a scan run's survivors, a pair's rule X items per run of window vertices and an item's valleys as one
+    block of consecutive entries each, in window order, whatever order the threads append in.
+
+    Each scan run, rule X's opening of each run of its pair's window vertices and each rule X item reserve their
+    entries of a list with one atomic and write them in window order, so that a warp of a job kernel takes one pair's
+    features (its record, core and heights). Solids of every class over rough terrain, of every class one whose window
+    takes several scan runs: no run's entries are split or out of order in the faces, edges, vertices, rule X item and
+    valley lists. (Appending entry by entry, the lanes of a CUDA warp interleave their runs' entries.)
+    """
+    _hf, model, _shapes, _bodies = _window_scene(np.random.default_rng(37), device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    scan = terrain_law_solid.TERRAIN_SOLID_SCAN_VERTICES
+    checked = {}
+    for partner_class in _SOLID_MODULES:
+        with test.subTest(partner_class=partner_class):
+            _out, jobs, _solids = _run_class(pipeline, model, partner_class, until="xdescents")
+            counts = _counts(jobs)
+            lists = {
+                # a scan run: its pair's window vertices [k, k + 1) times the run length (six items per vertex)
+                "faces": lambda pair, item: (pair, item // 6 // scan),
+                "edges": lambda pair, item: (pair, item // 6 // scan),
+                "vertices": lambda pair, item: (pair, item // 6 // scan),
+                # rule X's items: the core's points together, then each run of window vertices
+                "xitems": lambda pair, item: (pair, -1 if item < 0 else item // scan),
+                # an item's valleys: window vertex times three plus the edge
+                "xvalleys": lambda pair, item: (pair, item // 3),
+            }
+            for name, run_of in lists.items():
+                entries = getattr(jobs, name).numpy()[: counts[name]]
+                blocks = _runs_of(entries, run_of)
+                runs = [run for run, _items in blocks]
+                test.assertEqual(len(runs), len(set(runs)), msg=f"{name}: a run's entries are split")
+                for run, items in blocks:
+                    order = sorted(items, key=lambda item: (item >= 0, -item if item < 0 else item))
+                    test.assertEqual(items, order, msg=f"{name}: run {run} out of window order")
+                checked[name] = checked.get(name, 0) + len(blocks)
+    # not vacuous: every list holds runs, a scan list runs from pairs of several runs
+    test.assertTrue(all(count > 1 for count in checked.values()), msg=checked)
+
+
 def _valley_large(device):
     """Long solids sunk along a V-valley (30 deg walls meeting along y at x = 0, 5 cm cells), each deepest along the
     valley's line, which only rule X reaches (axes 5 mm below it, a box's edge 20 mm): windows of over 64 vertices and
@@ -2161,6 +2214,7 @@ for _name, _func in (
     ("test_recovery_picks_follow_depth_then_index", test_recovery_picks_follow_depth_then_index),
     ("test_solid_rows_match_the_float64_law", test_solid_rows_match_the_float64_law),
     ("test_job_pipeline_rows_are_the_walks", test_job_pipeline_rows_are_the_walks),
+    ("test_job_lists_hold_each_run_together", test_job_lists_hold_each_run_together),
     ("test_rule_x_lists_give_the_full_passes", test_rule_x_lists_give_the_full_passes),
     ("test_exit_work_stays_bounded", test_exit_work_stays_bounded),
     ("test_long_box_keeps_every_support", test_long_box_keeps_every_support),
