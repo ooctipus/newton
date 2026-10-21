@@ -9,10 +9,10 @@ The kernels are :func:`~newton._src.geometry.terrain_law_solid.solid_kernels`'s 
 kernels :func:`terrain_box_rows_faces`, :func:`terrain_box_rows_edges`, :func:`terrain_box_rows_thetas`,
 :func:`terrain_box_rows_creases` and :func:`terrain_box_rows_vertices` (one thread per listed feature), the close
 :func:`terrain_box_rows_close` and rule R's :func:`terrain_box_rows_recovery`, rule X's :func:`terrain_box_rows_xitems`,
-:func:`terrain_box_rows_xvalleys`, :func:`terrain_box_rows_xdescents`, :func:`terrain_box_rows_exit` and
-:func:`terrain_box_rows_settle`, and last the pairs the others deferred: :func:`terrain_box_rows_pooled` finishes those
-with more distinct rows than the class's 16 walk slots from their pooled candidates, :func:`terrain_box_rows_full` walks
-those whose work found no room. The walk, the rules and the finish are
+:func:`terrain_box_rows_xvalleys`, :func:`terrain_box_rows_xdescents`, :func:`terrain_box_rows_exit` and the finish
+kernel :func:`terrain_box_rows_finish`, and last the pairs the others deferred: :func:`terrain_box_rows_pooled` finishes
+those with more distinct rows than the class's 16 walk slots from their pooled candidates, :func:`terrain_box_rows_full`
+walks those whose work found no room. The walk, the rules and the finish are
 :mod:`~newton._src.geometry.terrain_law_solid`'s; the module is compiled without floating-point contraction, so the CPU
 decides every boundary as the GPU does.
 """
@@ -68,6 +68,6 @@ terrain_box_rows_xitems = _KERNELS["xitems"]
 terrain_box_rows_xvalleys = _KERNELS["xvalleys"]
 terrain_box_rows_xdescents = _KERNELS["xdescents"]
 terrain_box_rows_exit = _KERNELS["exit"]
-terrain_box_rows_settle = _KERNELS["settle"]
+terrain_box_rows_finish = _KERNELS["finish"]
 terrain_box_rows_pooled = _KERNELS["pooled"]
 terrain_box_rows_full = _KERNELS["full"]

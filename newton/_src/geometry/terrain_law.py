@@ -49,12 +49,14 @@ The per-pair finish merges coincident rows, drops the rows the others of their p
 hull of tangent position and distance, residual ``1e-6 m``) and keeps at most four rows per plane group (deepest,
 farthest, largest triangle, largest quadrilateral): every row it keeps is a support, and no count bounds them. It
 runs in place, on a walking pair's own slots (:func:`terrain_finish_slots`, up to :data:`TERRAIN_FINISH_MASK_ROWS`
-rows) or on a full-finish block's scratch (:func:`terrain_finish_list`, every distinct candidate a pair's window can
-give, :class:`TerrainFinishScratch`). A pair's rows live in its walk slots, or when they are more, in a spill region
-sized at the scene level (:class:`TerrainLawRows`). A spill region too small for a collide's rows, or a window larger
-than the one its pair's shape data gave at construction, sets a sticky bit of the narrow phase's buffer status word,
-which ``verify_narrow_phase_buffers`` keeps and ``NarrowPhase.check_buffer_capacity`` raises on (``terrain_rows``;
-stale features: ``terrain_stale``; a solid class's job lists without room for a pair's work: ``terrain_jobs``).
+rows; :func:`terrain_finish_slots_lanes` with a block's lanes splitting the implied-row tests), or on a full-finish
+block's scratch (:func:`terrain_finish_list`, every distinct candidate a pair's window can give,
+:class:`TerrainFinishScratch`); all three keep the same rows, bit for bit. A pair's rows live in its walk slots, or
+when they are more, in a spill region sized at the scene level (:class:`TerrainLawRows`). A spill region too small
+for a collide's rows, or a window larger than the one its pair's shape data gave at construction, sets a sticky bit
+of the narrow phase's buffer status word, which ``verify_narrow_phase_buffers`` keeps and
+``NarrowPhase.check_buffer_capacity`` raises on (``terrain_rows``; stale features: ``terrain_stale``; a solid class's
+job lists without room for a pair's work: ``terrain_jobs``).
 """
 
 from __future__ import annotations
@@ -172,6 +174,9 @@ kernel takes their rows."""
 TERRAIN_PAIR_INCOMPLETE = wp.constant(2048)
 """Pair state, transient: a job list or the candidate pool of a solid pair's class had no room for some of its work, so
 its close kernel leaves it to the class's full-finish kernel, which walks it again."""
+TERRAIN_PAIR_HELD = wp.constant(4096)
+"""Pair state, transient: a solid pair holds its rows in its walk slots (window frame, ``count`` of them) for its
+class's finish kernel."""
 TERRAIN_WINDOW_WIDE = 64
 """Cells across a window from which feature ids are no longer unique."""
 TERRAIN_PLANE_CACHE = 4
@@ -180,6 +185,7 @@ TERRAIN_CELL_WIDEN = 1.0e-3
 """Widening of a footprint box's float32 cell coordinates [cells], so that rounding never drops a touched cell."""
 
 _MaskInts = wp.types.vector(length=TERRAIN_FINISH_MASK_ROWS, dtype=wp.int32)
+_MaskFloats = wp.types.vector(length=TERRAIN_FINISH_MASK_ROWS, dtype=wp.float32)
 
 _MASK_ROWS = wp.constant(TERRAIN_FINISH_MASK_ROWS)
 _CELL_WIDEN = wp.constant(TERRAIN_CELL_WIDEN)
@@ -1344,43 +1350,52 @@ def _slot_member(alive: int, group: _MaskInts, i: int, g: int) -> bool:
 
 
 @wp.func
-def _slot_implied(
-    q: wp.array[wp.vec3],
-    n: wp.array[wp.vec3],
-    d: wp.array[float],
-    base: int,
-    count: int,
-    alive: int,
-    group: _MaskInts,
-    g: int,
+def _staged_implied(
+    px: _MaskFloats,
+    py: _MaskFloats,
+    pd: _MaskFloats,
+    members: int,
+    live: int,
     skip: int,
-    e1: wp.vec3,
-    e2: wp.vec3,
-    point: wp.vec2,
     eps: float,
+    lane: int,
+    lanes: int,
 ) -> bool:
-    """Whether the other members of plane group ``g`` imply member ``skip`` at its tangent position: whether the lowest
-    convex interpolation of their distances there (members within ``4 eps`` of the position coincide with it; a
-    position on a segment or in a triangle of members interpolates their distances) reaches its distance within
-    :data:`TERRAIN_IMPLIED_RESIDUAL`. It stops at the first interpolation that does: the lowest one does exactly when
-    one does (a rounded subtraction keeps order)."""
-    limit = d[base + skip]
+    """Whether the other live members of a plane group imply member ``skip`` at its tangent position, from this lane's
+    share of the tests: whether the lowest convex interpolation of their distances there (members within ``4 eps`` of
+    the position coincide with it; a position on a segment or in a triangle of members interpolates their distances)
+    reaches its distance within :data:`TERRAIN_IMPLIED_RESIDUAL`. The group's ``members`` are staged in member order
+    (row order): tangent positions ``(px, py)`` of their core points and distances ``pd``, live where ``live`` has
+    their bit.
+
+    The tests are the points and segments of the other live members, each segment with its triangles (a third member
+    after it); lane ``lane`` of ``lanes`` takes every ``lanes``-th of them in that order, so that the lanes' answers
+    ORed are the answer of one lane taking all. A lane stops at the first interpolation that reaches the distance: the
+    lowest one does exactly when one does (a rounded subtraction keeps order)."""
+    point = wp.vec2(px[skip], py[skip])
+    limit = pd[skip]
     tolerance = _MERGE_SCALE * eps
-    for a in range(count):
-        if a == skip or not _slot_member(alive, group, a, g):
+    test = int(0)
+    for a in range(members):
+        if a == skip or ((live >> a) & 1) == 0:
             continue
-        ka = _slot_k(q, n, d, base + a)
-        pa = wp.vec2(wp.dot(ka, e1), wp.dot(ka, e2))
-        da = d[base + a]
-        if wp.length(point - pa) <= tolerance:
-            if limit >= da - _IMPLIED_RESIDUAL:
-                return True
-        for b in range(a + 1, count):
-            if b == skip or not _slot_member(alive, group, b, g):
+        pa = wp.vec2(px[a], py[a])
+        da = pd[a]
+        # test (a, a): the point alone; tests (a, b): the segment and its triangles
+        for b in range(a, members):
+            if b != a and (b == skip or ((live >> b) & 1) == 0):
                 continue
-            kb = _slot_k(q, n, d, base + b)
-            pb = wp.vec2(wp.dot(kb, e1), wp.dot(kb, e2))
-            db = d[base + b]
+            mine = test % lanes == lane
+            test += 1
+            if not mine:
+                continue
+            if b == a:
+                if wp.length(point - pa) <= tolerance:
+                    if limit >= da - _IMPLIED_RESIDUAL:
+                        return True
+                continue
+            pb = wp.vec2(px[b], py[b])
+            db = pd[b]
             ab = pb - pa
             length2 = wp.dot(ab, ab)
             if length2 > 0.0:
@@ -1389,11 +1404,10 @@ def _slot_implied(
                 if s >= -_BARYCENTRIC_TOLERANCE and s <= 1.0 + _BARYCENTRIC_TOLERANCE and perpendicular <= tolerance:
                     if limit >= (da + s * (db - da)) - _IMPLIED_RESIDUAL:
                         return True
-            for c in range(b + 1, count):
-                if c == skip or not _slot_member(alive, group, c, g):
+            for c in range(b + 1, members):
+                if c == skip or ((live >> c) & 1) == 0:
                     continue
-                kc = _slot_k(q, n, d, base + c)
-                pc = wp.vec2(wp.dot(kc, e1), wp.dot(kc, e2))
+                pc = wp.vec2(px[c], py[c])
                 det = _cross2(pb - pa, pc - pa)
                 scale = wp.length(pb - pa) * wp.length(pc - pa)
                 if wp.abs(det) > _BARYCENTRIC_TOLERANCE * scale and scale > 0.0:
@@ -1404,7 +1418,7 @@ def _slot_implied(
                         and gamma >= -_BARYCENTRIC_TOLERANCE
                         and beta + gamma <= 1.0 + _BARYCENTRIC_TOLERANCE
                     ):
-                        value = da + beta * (db - da) + gamma * (d[base + c] - da)
+                        value = da + beta * (db - da) + gamma * (pd[c] - da)
                         if limit >= value - _IMPLIED_RESIDUAL:
                             return True
     return False
@@ -1418,6 +1432,8 @@ def terrain_finish_slots(
     base: int,
     count: int,
     eps: float,
+    lane: int,
+    lanes: int,
 ) -> tuple[int, int]:
     """The law's finish of a walking pair's held rows in place: ``count`` rows (at most
     :data:`TERRAIN_FINISH_MASK_ROWS`) at ``[base, base + count)`` of row arrays, in feature order.
@@ -1428,6 +1444,11 @@ def terrain_finish_slots(
     residual :data:`TERRAIN_IMPLIED_RESIDUAL`); a group keeps at most four rows: its deepest, the farthest from it, the
     one spanning the largest triangle with them and the one adding the most area. Ties are broken by row order, never
     by memory order. :func:`terrain_finish_list` is the same finish on any number of candidates, bit for bit.
+
+    ``lanes`` threads may run it together on one pair (lane ``lane``, ``lanes`` the block's size; one thread passes
+    ``0, 1``): every lane runs every step and returns the same values, but the implied-row test of a row, the finish's
+    cost (up to every triangle of its group's members), is split among the lanes and their answers ORed across the
+    block (:func:`_staged_implied`). With ``lanes > 1`` every lane of the block must call it with the same rows.
 
     Returns ``(keep, kept)``: bit ``i`` of ``keep`` marks row ``i`` kept (kept rows in row order), and their count.
     """
@@ -1461,7 +1482,11 @@ def terrain_finish_slots(
                     break
     # 3. implied rows, the shallowest first, one at a time. One pass in that order drops what testing again from the
     # shallowest after every drop would: a drop removes interpolation candidates, so it only raises the lower hull of
-    # a group's other rows, and no row found not implied before a drop is implied after it.
+    # a group's other rows, and no row found not implied before a drop is implied after it. A group's members are
+    # staged once (tangent position of the core point, distance), in row order.
+    px = _MaskFloats()
+    py = _MaskFloats()
+    pd = _MaskFloats()
     for g in range(count):
         if ((alive >> g) & 1) == 0 or group[g] != g:
             continue
@@ -1469,22 +1494,33 @@ def terrain_finish_slots(
         size = int(0)
         for i in range(count):
             if _slot_member(alive, group, i, g):
+                k = _slot_k(q, n, d, base + i)
+                px[size] = wp.dot(k, e1)
+                py[size] = wp.dot(k, e2)
+                pd[size] = d[base + i]
+                rank[size] = i
                 size += 1
+        members = size
+        live = int(0)
+        for s in range(members):
+            live = live | (1 << s)
         tested = int(0)
         while size >= 3:
             pick = int(-1)
-            for i in range(count):
-                if _slot_member(alive, group, i, g) and ((tested >> i) & 1) == 0:
-                    if pick < 0 or d[base + i] > d[base + pick]:
-                        pick = i
+            for s in range(members):
+                if ((live >> s) & 1) != 0 and ((tested >> s) & 1) == 0:
+                    if pick < 0 or pd[s] > pd[pick]:
+                        pick = s
             if pick < 0:
                 break
             tested = tested | (1 << pick)
-            kj = _slot_k(q, n, d, base + pick)
-            if _slot_implied(
-                q, n, d, base, count, alive, group, g, pick, e1, e2, wp.vec2(wp.dot(kj, e1), wp.dot(kj, e2)), eps
-            ):
-                alive = alive & ~(1 << pick)
+            implied = _staged_implied(px, py, pd, members, live, pick, eps, lane, lanes)
+            if lanes > 1:
+                # every lane holds the same group: OR their shares across the block
+                implied = wp.tile_extract(wp.tile_max(wp.tile(int(implied))), 0) != 0
+            if implied:
+                live = live & ~(1 << pick)
+                alive = alive & ~(1 << rank[pick])
                 size -= 1
     # 4. at most four rows per group: deepest, farthest, largest triangle, largest quadrilateral
     for i in range(count):

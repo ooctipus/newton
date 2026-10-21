@@ -165,7 +165,7 @@ def _finish_both(
     i = wp.tid()
     base = i * 40
     count = counts[i]
-    keep, kept = terrain_finish_slots(q, n, d, base, prefixes[i], eps[i])
+    keep, kept = terrain_finish_slots(q, n, d, base, prefixes[i], eps[i], 0, 1)
     for j in range(prefixes[i]):
         in_slots[i, j] = (keep >> j) & 1
     in_slots[i, 40] = kept
@@ -278,6 +278,127 @@ def test_finish_in_place_equals_finish(test, device):
     # every step acted somewhere: rows dropped, and lists longer than the masks
     test.assertGreater(int(np.sum(b[:, 40] < counts)), 100)
     test.assertGreater(int(np.sum(counts > TERRAIN_FINISH_MASK_ROWS)), 5)
+
+
+@wp.kernel(enable_backward=False)
+def _finish_lanes(
+    q: wp.array[wp.vec3],
+    n: wp.array[wp.vec3],
+    d: wp.array[float],
+    prefixes: wp.array[int],
+    eps: wp.array[float],
+    one_lane: wp.array2d[int],
+    lanes: wp.array2d[int],
+):
+    """Per list of rows at ``40 i``, one block: ``terrain_finish_slots`` by the first lane alone (``0, 1``), then by
+    the block's lanes together, each as per-row keep flags and the kept count last."""
+    i, lane = wp.tid()
+    base = i * 40
+    if lane == 0:
+        keep, kept = terrain_finish_slots(q, n, d, base, prefixes[i], eps[i], 0, 1)
+        for j in range(prefixes[i]):
+            one_lane[i, j] = (keep >> j) & 1
+        one_lane[i, 40] = kept
+    keep, kept = terrain_finish_slots(q, n, d, base, prefixes[i], eps[i], lane, wp.block_dim())
+    if lane == 0:
+        for j in range(prefixes[i]):
+            lanes[i, j] = (keep >> j) & 1
+        lanes[i, 40] = kept
+
+
+def _large_group_lists(rng, count):
+    """Candidate lists dominated by one plane group of 9-24 rows, as a flat sole's rows with its crossings at creases
+    give: corners of a rectangle, points on its edges and inside, most on the sole's plane (implied when inside), some
+    deeper or shallower, plus a few rows of other groups."""
+    lists = []
+    for _i in range(count):
+        rows = []
+        normal = rng.normal(size=3) * np.array([0.2, 0.2, 1.0])
+        normal[2] = abs(normal[2]) + 0.5
+        normal /= np.linalg.norm(normal)
+        e1 = np.cross(normal, [1.0, 0.0, 0.0])
+        e1 /= np.linalg.norm(e1)
+        e2 = np.cross(normal, e1)
+        origin = rng.uniform(-0.05, 0.05, size=3)
+        tilt = rng.uniform(-0.05, 0.05, size=2) * rng.choice([0.0, 1.0])
+        half = rng.uniform(0.02, 0.08, size=2)
+        size = int(rng.integers(9, 25))
+        for j in range(size):
+            if j < 4:
+                u, v = (-half[0] if j in (0, 3) else half[0]), (-half[1] if j < 2 else half[1])
+            elif rng.uniform() < 0.5:
+                side = int(rng.integers(0, 4))
+                t = rng.uniform()
+                corners = [(-half[0], -half[1]), (half[0], -half[1]), (half[0], half[1]), (-half[0], half[1])]
+                a, b = corners[side], corners[(side + 1) % 4]
+                u, v = a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])
+            else:
+                u, v = rng.uniform(-1.0, 1.0, size=2) * half
+            dist = 0.01 + tilt[0] * u + tilt[1] * v
+            if rng.uniform() < 0.2:
+                dist += rng.uniform(-0.002, 0.003)
+            rows.append((origin + u * e1 + v * e2, normal, dist))
+        for _k in range(int(rng.integers(0, 5))):
+            other = rng.normal(size=3)
+            other[2] = abs(other[2]) + 0.3
+            other /= np.linalg.norm(other)
+            rows.append((rng.uniform(-0.05, 0.05, size=3), other, float(rng.uniform(0.0, 0.02))))
+        order = rng.permutation(len(rows))
+        rows = [rows[k] for k in order][:TERRAIN_FINISH_MASK_ROWS]
+        lists.append((rows, len(rows)))
+    return lists
+
+
+def test_finish_lanes_keep_one_lanes_rows(test, device):
+    """Keep the same rows, bit for bit, with a block's lanes splitting the finish's implied-row tests as with one lane
+    taking them all: the lanes OR their shares, each test the same float32 operations.
+
+    The candidate lists of :func:`test_finish_in_place_equals_finish` (up to the masks' rows) and lists dominated by one
+    plane group of 9-24 rows, whose implied-row tests cost the most. On the CPU a block is one lane.
+    """
+    rng = np.random.default_rng(47)
+    lists = [
+        entry
+        for entry in _candidate_lists(rng, 300)
+        if entry[1] == len(entry[0]) and entry[1] <= TERRAIN_FINISH_MASK_ROWS
+    ]
+    lists += _large_group_lists(rng, 300)
+    q = np.zeros((len(lists) * 40, 3), np.float32)
+    n = np.zeros((len(lists) * 40, 3), np.float32)
+    d = np.zeros(len(lists) * 40, np.float32)
+    prefixes = np.zeros(len(lists), np.int32)
+    for i, (rows, prefix) in enumerate(lists):
+        prefixes[i] = prefix
+        for j, (qq, nn, dd) in enumerate(rows):
+            q[i * 40 + j] = qq
+            n[i * 40 + j] = nn
+            d[i * 40 + j] = dd
+    test.assertTrue(np.all(prefixes <= TERRAIN_FINISH_MASK_ROWS))
+    eps = np.full(len(lists), 8.0 * 1.1920928955078125e-7 * 0.2, np.float32)
+    one_lane = wp.zeros((len(lists), 41), dtype=int, device=device)
+    lanes = wp.zeros((len(lists), 41), dtype=int, device=device)
+    wp.launch_tiled(
+        _finish_lanes,
+        dim=len(lists),
+        inputs=[
+            wp.array(q, dtype=wp.vec3, device=device),
+            wp.array(n, dtype=wp.vec3, device=device),
+            wp.array(d, dtype=float, device=device),
+            wp.array(prefixes, dtype=int, device=device),
+            wp.array(eps, dtype=float, device=device),
+        ],
+        outputs=[one_lane, lanes],
+        block_dim=terrain_law_block_dim(device),
+        device=device,
+    )
+    a = one_lane.numpy()
+    b = lanes.numpy()
+    for i in range(len(lists)):
+        np.testing.assert_array_equal(b[i, : prefixes[i]], a[i, : prefixes[i]], err_msg=f"list {i}")
+        test.assertEqual(b[i, 40], a[i, 40], msg=f"list {i}")
+    # the large groups lose rows to the implied-row tests and the group caps
+    large = slice(len(lists) - 300, len(lists))
+    test.assertGreater(int(np.sum(a[large, 40] < prefixes[large])), 250)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1376,6 +1497,9 @@ def _run_class(
         if kind == "full":
             inputs = [*args, scratch, solids, jobs]
             wp.launch_tiled(kernel, dim=grid + extra_blocks, inputs=inputs, block_dim=block, device=device)
+        elif kind == "pair_tiles":
+            dim = jobs.finish_blocks + extra_blocks
+            wp.launch_tiled(kernel, dim=dim, inputs=[*args, jobs, solids], block_dim=block, device=device)
         else:
             dim = {"pairs": end - begin, "jobs": jobs.threads, "pair_jobs": jobs.pair_threads}[kind]
             if kind != "pairs":
@@ -1936,9 +2060,9 @@ def test_solid_launches_take_fixed_grids(test, device):
     """Launch every solid kernel with the dimensions fixed at construction, as the route record holds them: one block
     size; the whole-pair rejects one thread per pair of the class; the scan and the job kernels the class's job threads,
     each striding over its list, but for a job kernel whose list none of the class's pairs can fill (not launched: rule
-    X's valleys of the box class); the close, rule R's kernel and rule X's exit and settle kernels, which stride over
-    lists of the class's pairs, the job threads up to one per pair; the full-finish kernel the fixed grid of its
-    scratch.
+    X's valleys of the box class); the close, rule R's kernel and rule X's exit kernel, which stride over lists of the
+    class's pairs, the job threads up to one per pair; the finish kernel, blocks of lanes striding over the live pairs,
+    up to one block per pair; the full-finish kernel the fixed grid of its scratch.
 
     Every solid class has pairs here, windows of several scan jobs (a box and an ellipsoid) and a deferring box. The
     live list holds every pair past the whole-pair rejects once.
@@ -1972,6 +2096,8 @@ def test_solid_launches_take_fixed_grids(test, device):
             test.assertEqual(record["pair_dim"], end - begin)
             test.assertEqual(record["job_threads"], jobs.threads)
             test.assertEqual(record["pair_job_threads"], min(jobs.threads, end - begin))
+            test.assertEqual(record["finish_blocks"], jobs.finish_blocks)
+            test.assertLessEqual(jobs.finish_blocks, end - begin)
             test.assertEqual(record["skipped"], ["xvalleys"] if partner_class == TERRAIN_PARTNER_BOX else [])
             for kind, kernel_name in TERRAIN_SOLID_LAUNCHES:
                 key = _kernel(partner_class, kernel_name).key
@@ -1982,6 +2108,7 @@ def test_solid_launches_take_fixed_grids(test, device):
                     "pairs": ("launch", end - begin),
                     "jobs": ("launch", jobs.threads),
                     "pair_jobs": ("launch", jobs.pair_threads),
+                    "pair_tiles": ("tiled", jobs.finish_blocks),
                 }.get(kind)
                 if dim is None:
                     dim = ("tiled", record["full_blocks"])
@@ -2245,6 +2372,7 @@ class TestTerrainLawSolid(unittest.TestCase):
 devices = get_test_devices()
 for _name, _func in (
     ("test_finish_in_place_equals_finish", test_finish_in_place_equals_finish),
+    ("test_finish_lanes_keep_one_lanes_rows", test_finish_lanes_keep_one_lanes_rows),
     ("test_solid_rows_are_minimal_at_flat_seams", test_solid_rows_are_minimal_at_flat_seams),
     (
         "test_solid_rows_are_minimal_on_a_vertex_without_margins",

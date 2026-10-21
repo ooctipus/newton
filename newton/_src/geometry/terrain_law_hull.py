@@ -10,11 +10,11 @@ job kernels :func:`terrain_hull_rows_faces`, :func:`terrain_hull_rows_edges`, :f
 :func:`terrain_hull_rows_creases` and :func:`terrain_hull_rows_vertices` (one thread per listed feature), the close
 :func:`terrain_hull_rows_close` and rule R's :func:`terrain_hull_rows_recovery`, rule X's
 :func:`terrain_hull_rows_xitems`, :func:`terrain_hull_rows_xvalleys`, :func:`terrain_hull_rows_xdescents`,
-:func:`terrain_hull_rows_exit` and :func:`terrain_hull_rows_settle`, and last the pairs the others deferred:
-:func:`terrain_hull_rows_pooled` finishes those with more distinct rows than the class's 24 walk slots from their pooled
-candidates, :func:`terrain_hull_rows_full` walks those whose work found no room. The
-walk, the rules and the finish are :mod:`~newton._src.geometry.terrain_law_solid`'s; the module is compiled without
-floating-point contraction, so the CPU decides every boundary as the GPU does.
+:func:`terrain_hull_rows_exit` and the finish kernel :func:`terrain_hull_rows_finish`, and last the pairs the others
+deferred: :func:`terrain_hull_rows_pooled` finishes those with more distinct rows than the class's 24 walk slots from
+their pooled candidates, :func:`terrain_hull_rows_full` walks those whose work found no room. The walk, the rules and
+the finish are :mod:`~newton._src.geometry.terrain_law_solid`'s; the module is compiled without floating-point
+contraction, so the CPU decides every boundary as the GPU does.
 """
 
 from __future__ import annotations
@@ -133,6 +133,6 @@ terrain_hull_rows_xitems = _KERNELS["xitems"]
 terrain_hull_rows_xvalleys = _KERNELS["xvalleys"]
 terrain_hull_rows_xdescents = _KERNELS["xdescents"]
 terrain_hull_rows_exit = _KERNELS["exit"]
-terrain_hull_rows_settle = _KERNELS["settle"]
+terrain_hull_rows_finish = _KERNELS["finish"]
 terrain_hull_rows_pooled = _KERNELS["pooled"]
 terrain_hull_rows_full = _KERNELS["full"]

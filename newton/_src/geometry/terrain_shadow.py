@@ -55,13 +55,15 @@ jobs and the solid classes' :class:`~newton._src.geometry.terrain_law_solid.Terr
    are listed for ``theta*``), the creases' ``theta*``, their rows, vertices. A job's rows go to the class's candidate
    pool with their place in window order.
 4. The close, the job threads over the live pairs: a pair's candidates held in window order (the walk's held rows),
-   then rule R's kernel over the pairs without a row, and the finish, or for a core reaching below its window's
-   highest vertex rule X's items.
+   then rule R's kernel over the pairs without a row; a pair holds its rows for the finish kernel, or for a core
+   reaching below its window's highest vertex lists rule X's items.
 5. Rule X's items (a core point, or a window vertex that can give a candidate), valleys and the listed candidates'
    near-bound descents, the job threads again: they list the candidates whose bounds pass the pair's target; then the
    exit kernel, one thread per pair of the class (its exit list's room), runs rule X's passes over the listed
-   candidates (exact: any other candidate is a no-op in both passes), and the settle kernel finishes the pair.
-6. The full-finish kernel (below).
+   candidates (exact: any other candidate is a no-op in both passes).
+6. The finish kernel, a block of lanes per pair over the live pairs: the finish of every pair holding its rows or
+   kept by the exit kernel, the lanes splitting its implied-row tests.
+7. The full-finish kernel (below).
 
 The full-finish kernel of a class, ``wp.launch_tiled`` on the fixed grid of its
 :class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`
@@ -149,16 +151,18 @@ def _solid_launches(name: str) -> tuple[tuple[str, str], ...]:
         "xvalleys",
         "xdescents",
         "exit",
-        "settle",
+        "finish",
         "pooled",
         "full",
     )
-    pair_jobs = ("close", "recovery", "exit", "settle")
+    pair_jobs = ("close", "recovery", "exit")
     kinds = tuple(
         "pairs"
         if kernel == "rows"
         else "full"
         if kernel in ("pooled", "full")
+        else "pair_tiles"
+        if kernel == "finish"
         else "pair_jobs"
         if kernel in pair_jobs
         else "jobs"
@@ -195,8 +199,12 @@ The module is imported only when the class is listed. Launch kinds, every one wi
   arguments (a solid class's scan and job kernels, each striding over its list; a job kernel whose list has no room by
   construction is not launched, :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LIST_OF_KERNEL`);
 * ``pair_jobs``: the same over a list of the class's pairs, with at most one thread per pair
-  (:attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.pair_threads`: a solid class's close, rule R, exit
-  and settle kernels);
+  (:attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.pair_threads`: a solid class's close, rule R and
+  exit kernels);
+* ``pair_tiles``: ``wp.launch_tiled`` with
+  :attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.finish_blocks` blocks of
+  :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK` lanes, a pair per block at a time over the class's live
+  pairs, the same arguments (a solid class's finish kernel);
 * ``full``: ``wp.launch_tiled`` with :func:`~newton._src.geometry.terrain_law.terrain_finish_blocks` blocks of
   :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK` lanes whatever the class's size, striding over its
   deferred list, and a :class:`~newton._src.geometry.terrain_law.TerrainFinishScratch` as sixth argument (a solid
@@ -566,6 +574,8 @@ class TerrainLawShadow:
                         self._launches.append(("thread", kernel, end - begin, begin, slot, (jobs, True)))
                     elif kind == "pair_jobs":
                         self._launches.append(("thread", kernel, jobs.pair_threads, begin, slot, (jobs, True)))
+                    elif kind == "pair_tiles":
+                        self._launches.append(("tiled", kernel, jobs.finish_blocks, begin, slot, (jobs, True)))
                     elif kind == "jobs":
                         # a list none of the class's pairs can fill: no launch
                         short = kernel_name.removeprefix(prefix)
@@ -581,6 +591,7 @@ class TerrainLawShadow:
                         "pair_dim": end - begin,
                         "job_threads": jobs.threads,
                         "pair_job_threads": jobs.pair_threads,
+                        "finish_blocks": jobs.finish_blocks,
                         "jobs": {name: int(capacity[name]) for name in names},
                         "skipped": skipped,
                     }
@@ -821,8 +832,9 @@ class TerrainLawShadow:
         :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_FULL_SCRATCH_BYTES`); for the point class ``thread_dim``
         (the one-thread kernel's threads, one per pair of the class) and ``tiled_blocks`` (the tiled kernel's grid, 0
         without a tiled segment); for a solid class ``pair_dim`` (its whole-pair rejects' threads, one per pair of the
-        class), ``job_threads`` (its scan and job kernels' threads), ``pair_job_threads`` (its close, rule R, exit and
-        settle kernels' threads, at most one per pair of the class), ``jobs`` (the entries
+        class), ``job_threads`` (its scan and job kernels' threads), ``pair_job_threads`` (its close, rule R and exit
+        kernels' threads, at most one per pair of the class), ``finish_blocks`` (its finish kernel's grid), ``jobs``
+        (the entries
         of its job lists, its candidate pool's rows, its scan's runs and rule X's candidates) and ``skipped`` (its job
         kernels not launched: their lists have no room, none of its pairs can list an entry). ``slots`` and
         ``spill_rows`` are the side buffer's walk slots and spill rows.

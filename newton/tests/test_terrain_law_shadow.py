@@ -818,6 +818,7 @@ class TestTerrainLawShadow(unittest.TestCase):
                             "pair_dim": count,
                             "job_threads": min(TERRAIN_SOLID_JOB_THREADS_CPU, longest),
                             "pair_job_threads": min(TERRAIN_SOLID_JOB_THREADS_CPU, longest, count),
+                            "finish_blocks": min(TERRAIN_SOLID_JOB_THREADS_CPU, count),
                             "jobs": capacities,
                             "skipped": skipped,
                             "full_blocks": terrain_finish_blocks(candidates),
