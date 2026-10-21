@@ -46,6 +46,7 @@ from newton._src.geometry.terrain_law import (
     TERRAIN_FINISH_MASK_ROWS,
     TERRAIN_PAIR_CANDIDATE_OVERFLOW,
     TERRAIN_PAIR_FILTERED,
+    TERRAIN_PAIR_FULL,
     TERRAIN_PAIR_INCOMPLETE,
     TERRAIN_PAIR_OUTSIDE,
     TERRAIN_PAIR_ROW_OVERFLOW,
@@ -1363,7 +1364,7 @@ def _run_class(
         counts[partner_class] = len(walked)
         out.deferred_count.assign(counts)
         state = out.state.numpy()
-        state[walked] = int(TERRAIN_PAIR_INCOMPLETE)
+        state[walked] = int(TERRAIN_PAIR_INCOMPLETE | TERRAIN_PAIR_FULL)
         out.state.assign(state)
         launches = launches[-1:]
     for kind, name in launches:

@@ -85,8 +85,9 @@ pairs' features at once instead of one pair's whole window, and no thread walks 
    (:func:`solid_xdescent_job`), so that the exit kernel (:func:`solid_exit_pair`, one thread per pair left to it)
    runs the rule's passes over the listed candidates alone (:func:`solid_exits`, :func:`_exit_listed`) and searches
    their exits: any other candidate is a no-op in both passes, and the rows are the passes' over every candidate. A
-   pair some of whose rule X work found no room is left to the full-finish kernel. The settle kernel
-   (:func:`solid_settle_pair`) then finishes the pairs left to rule X, apart from the exit searches.
+   pair some of whose rule X work found no room is left to the full-finish kernels, which run rule X over every
+   candidate. The settle kernel (:func:`solid_settle_pair`) then finishes the pairs left to rule X, apart from the exit
+   searches.
 
 The kernels follow the per-pair output protocol of :mod:`~newton._src.geometry.terrain_law`: a pair with no row is
 recorded by :func:`~newton._src.geometry.terrain_law.terrain_pair_exit`, and rows are held in the pair's own walk slots
@@ -95,12 +96,14 @@ with a held one is dropped, the first in window order staying. The finish runs i
 (:func:`~newton._src.geometry.terrain_law.terrain_finish_slots`, a row's core point being ``q + d n``), and the kept
 rows are rewritten in the world frame at the front of the slots. A pair with more distinct candidates than its slots,
 or whose work found no room in a job list or the candidate pool (scene-level buffers sized from the pairs' bounds,
-:func:`terrain_solid_job_capacities`), is left to its class's full kernel
-(:func:`~newton._src.geometry.terrain_law.terrain_defer_pair`): the shadow's fixed full-finish grid strides over the
-class's deferred list, and each block's first lane walks its pairs again, one at a time (:func:`solid_walk`), into the
-block's scratch (:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`), which holds every distinct candidate
-a window of the class can give (:func:`~newton._src.geometry.terrain_contacts.terrain_pair_candidates`). The finish
-runs on all of them (:func:`~newton._src.geometry.terrain_law.terrain_finish_list`) and every row it keeps is written,
+:func:`terrain_solid_job_capacities`), is left to its class's full-finish kernels
+(:func:`~newton._src.geometry.terrain_law.terrain_defer_pair`): two launches on the shadow's fixed full-finish grid
+stride over the class's deferred list, each block's first lane taking its pairs one at a time into the block's scratch
+(:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`), which holds every distinct candidate a window of the
+class can give (:func:`~newton._src.geometry.terrain_contacts.terrain_pair_candidates`): the pooled kernel holds a pair
+every job of which found room from its candidates in the pool, in window order (:func:`solid_pooled`), and the
+full-finish kernel walks the others again (:func:`solid_rows_full`, :func:`solid_walk`). The finish runs on all of
+them (:func:`~newton._src.geometry.terrain_law.terrain_finish_list`) and every row it keeps is written,
 in the pair's walk slots when they fit, else in rows of the spill region it reserves
 (:func:`~newton._src.geometry.terrain_law.terrain_spill_rows`). Every pair is thus finished from its own candidates,
 whatever the order of the jobs, the number of deferred pairs, the order of the deferral or the block that finishes it.
@@ -130,6 +133,7 @@ from .terrain_law import (
     TERRAIN_NORMAL_SAME,
     TERRAIN_PAIR_EXIT,
     TERRAIN_PAIR_FILTERED,
+    TERRAIN_PAIR_FULL,
     TERRAIN_PAIR_INCOMPLETE,
     TERRAIN_PAIR_JOBS,
     TERRAIN_PAIR_OUTSIDE,
@@ -256,8 +260,9 @@ TERRAIN_SOLID_SCAN_VERTICES = 32
 window is scanned by several threads, so that no thread scans a large window alone. A cluster plane met by two runs is
 listed twice; its rows, the same at the same place in window order, merge in the close."""
 TERRAIN_SOLID_SORTED = 32
-"""Keys of a pair's pool list sorted in registers per walk of the list (:func:`_keys_after`): the close and the exit
-kernel take a list of ``n`` candidates in key order in ``ceil(n / 32)`` walks."""
+"""Keys of a pair's pool list sorted in registers per walk of the list: the close (:func:`_hold_candidates`) and the
+exit kernel (:func:`_exit_listed`) take a list of ``n`` candidates in key order in ``ceil(n / 32)`` walks, each keeping
+the smallest keys past the last one taken (a full chunk drops its largest, which a later walk takes)."""
 TERRAIN_HULL_FACE_TOL = 1.0e-6
 """A hull's points within this of a face's plane lie on that face [m] (hulls under 1 m; their local frame): a planar
 face of a float32 mesh stays one face (its points lie within about 1e-8 m of its plane)."""
@@ -489,7 +494,7 @@ class TerrainSolidJobs:
     ``n``."""
     xall: wp.array[wp.int32]
     """Per class pair left to rule X: nonzero when some of its rule X work found no room, so that its exit kernel
-    leaves it to the class's full-finish kernel, which walks it again and takes every candidate of its window."""
+    leaves it to the class's full-finish kernels, which take every candidate of its window."""
 
 
 @wp.struct
@@ -1696,39 +1701,6 @@ def _valley_bound(
 
 
 @wp.func
-def _keys_after(
-    key: wp.array[wp.int32], link: wp.array[wp.int32], head: int, last: int
-) -> tuple[_Sorted, _Sorted, int, bool]:
-    """The up to :data:`TERRAIN_SOLID_SORTED` smallest keys greater than ``last`` of a pool list (from entry ``head``,
-    linked by ``link``), sorted in registers (equal keys in list order), with their entries: ``(keys, entries, count,
-    more)``, ``more`` when the list holds keys greater than ``last`` beyond them. One walk of the list per call, so that
-    a pair's list in key order takes one walk per :data:`TERRAIN_SOLID_SORTED` keys, not one per key."""
-    keys = _Sorted()
-    entries = _Sorted()
-    count = int(0)
-    more = bool(False)
-    entry = head
-    while entry >= 0:
-        k = key[entry]
-        if k > last:
-            if count < _SORTED or k < keys[_SORTED - 1]:
-                # a full chunk drops its largest key, which a later call takes
-                more = more or count == _SORTED
-                j = wp.min(count, _SORTED - 1)
-                while j > 0 and keys[j - 1] > k:
-                    keys[j] = keys[j - 1]
-                    entries[j] = entries[j - 1]
-                    j -= 1
-                keys[j] = k
-                entries[j] = entry
-                count = wp.min(count + 1, _SORTED)
-            else:
-                more = True
-        entry = link[entry]
-    return keys, entries, count, more
-
-
-@wp.func
 def _x_list(
     jobs: TerrainSolidJobs, i: int, x: wp.vec3, bound: float, key: int, valley: int, gate: float, scale: float
 ) -> int:
@@ -1760,15 +1732,9 @@ class _EveryCandidate:
 
 @wp.struct
 class _ListedCandidates:
-    """Rule X's passes over class pair ``row``'s listed candidates (:func:`_exit_listed`): the exit kernel's, with the
-    first :data:`TERRAIN_SOLID_SORTED` of them in key order (:func:`_keys_after`, one walk of the list), all of them
-    unless ``more``."""
+    """Rule X's passes over class pair ``row``'s listed candidates (:func:`_exit_listed`): the exit kernel's."""
 
     row: int
-    keys: _Sorted
-    entries: _Sorted
-    count: int
-    more: bool
 
 
 @wp.func
@@ -1786,17 +1752,35 @@ def _exit_listed(
     order, as :func:`_exit_candidates` takes them: a valley's gate (:func:`_exit_open`) at its first listed candidate,
     which takes or skips the valley's candidates. A candidate left off the list has a bound no higher than the target,
     and a valley off it a gate closed at the target and at every later threshold: both are no-ops in either pass, and
-    the state at a listed candidate is the full pass's. Both passes take the first :data:`TERRAIN_SOLID_SORTED` keys
-    the exit kernel sorted in registers (``how``, one walk of the list), all of them unless ``how.more``; a longer
-    list's later keys are taken in chunks of as many (:func:`_keys_after`), one walk of it per chunk."""
-    keys = how.keys
-    entries = how.entries
-    count = how.count
-    more = how.more
+    the state at a listed candidate is the full pass's. The list is taken in chunks of :data:`TERRAIN_SOLID_SORTED` keys
+    sorted in registers, one walk of it per chunk (:data:`TERRAIN_SOLID_SORTED`): one walk per pass on the recorded
+    states."""
+    keys = _Sorted()
+    entries = _Sorted()
     last = int(-1)
     valley = int(-1)
     passing = bool(True)
-    while True:
+    more = bool(True)
+    while more:
+        count = int(0)
+        more = bool(False)
+        e = jobs.xhead[how.row]
+        while e >= 0:
+            k = jobs.key[e]
+            if k > last:
+                if count < _SORTED or k < keys[_SORTED - 1]:
+                    more = more or count == _SORTED
+                    j = wp.min(count, _SORTED - 1)
+                    while j > 0 and keys[j - 1] > k:
+                        keys[j] = keys[j - 1]
+                        entries[j] = entries[j - 1]
+                        j -= 1
+                    keys[j] = k
+                    entries[j] = e
+                    count = wp.min(count + 1, _SORTED)
+                else:
+                    more = True
+            e = jobs.next[e]
         for j in range(count):
             key = keys[j]
             if key == last:
@@ -1823,9 +1807,6 @@ def _exit_listed(
                 jobs.descent[entry - _pool_rows(jobs)],
                 key,
             )
-        if not more:
-            break
-        keys, entries, count, more = _keys_after(jobs.key, jobs.next, jobs.xhead[how.row], last)
     return planes, best
 
 
@@ -2260,8 +2241,9 @@ def solid_rows_full(
     heightfield: int,
     reach: float,
 ):
-    """A deferred pair some of whose work found no room, walked again into block ``block``'s scratch (counted in its
-    class's walks), finished and written (:func:`solid_close_full`; its walk slots from ``slot``)."""
+    """A deferred pair some of whose work found no room (``core`` in the heightfield frame), walked again into block
+    ``block``'s scratch (counted in its class's walks), finished and written (:func:`solid_close_full`; its walk slots
+    from ``slot``)."""
     wp.atomic_add(jobs.counts, _WALKS, 1)
     _state, cells, window, core, pair = solid_pair_window(core, data, heightfield, reach)
     planes = terrain_planes()
@@ -2287,49 +2269,25 @@ def solid_rows_full(
 
 
 @wp.func
-def solid_rows_pooled(
-    core: Any,
+def solid_pooled(
     data: TerrainFeatureData,
-    out: TerrainLawRows,
     scratch: TerrainFinishScratch,
-    solids: TerrainSolidData,
     jobs: TerrainSolidJobs,
     block: int,
-    pair_index: int,
     i: int,
-    slot: int,
-    walk_slots: int,
-    frame: wp.transform,
-):
+) -> tuple[bool, TerrainWindow, _Pair, wp.vec4i, _Sink]:
     """A deferred pair every job of which found room (class pair ``i``: more distinct rows than its walk slots, or
-    rule X's lists without room), finished from block ``block``'s scratch and written (:func:`solid_close_full`; its
-    walk slots from ``slot``): its candidates come from the candidate pool, held in window order as the walk offers
-    them (:func:`_hold_candidates`, the walk's held rows bit for bit), not from a second walk of its window; ``core``
-    and its record are the scan's (window frame)."""
+    rule X's lists without room), its candidates held into block ``block``'s scratch from the candidate pool in window
+    order as the walk offers them (:func:`_hold_pooled`, the walk's held rows bit for bit), not by a second walk of its
+    window: ``(pooled, window, pair, cells, sink)`` for :func:`solid_close_full` (its kept core is the scan's, window
+    frame). ``pooled`` is ``False`` for a pair whose list holds more entries than the block (its window past the bound
+    of its shape data at construction): it is walked instead."""
     record, window = solid_job_window(data, jobs, i)
-    pair = record.pair
-    store = solid_scratch_store(scratch)
-    sink = solid_sink(block * scratch.capacity, scratch.capacity, pair.eps)
-    held, raw = _hold_candidates(store, jobs, i, sink.slot, sink.capacity, pair.eps)
+    sink = solid_sink(block * scratch.capacity, scratch.capacity, record.pair.eps)
+    pooled, held, raw = _hold_pooled(solid_scratch_store(scratch), scratch, jobs, i, sink.slot, record.pair.eps)
     sink.held = held
     sink.raw = raw
-    solid_close_full(
-        core,
-        data,
-        window,
-        terrain_planes(),
-        pair,
-        sink,
-        scratch,
-        out,
-        solids.exit_work,
-        jobs,
-        pair_index,
-        slot,
-        walk_slots,
-        frame,
-        record.cells,
-    )
+    return pooled, window, record.pair, record.cells, sink
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -2676,42 +2634,83 @@ def _hold_candidates(
     """Hold class pair ``i``'s candidates in its walk slots from ``slot`` in window order (by key), as the walk offers
     them (:func:`~newton._src.geometry.terrain_law.terrain_hold_row`, at most ``limit``): ``(held, raw)``, its
     distinct rows and its offers. Candidates of one key (a cluster listed twice) are one offer; the list's order (its
-    jobs') never matters. One walk of the list sorts up to :data:`TERRAIN_SOLID_SORTED` candidates in registers; a
-    longer list is taken in chunks of that many keys (:func:`_keys_after`), one walk of it per chunk."""
+    jobs') never matters. The list is taken in chunks of :data:`TERRAIN_SOLID_SORTED` keys sorted in registers, one walk
+    of it per chunk (:data:`TERRAIN_SOLID_SORTED`): one walk on the recorded states."""
     keys = _Sorted()
     entries = _Sorted()
-    count = int(0)
-    entry = jobs.head[i]
-    while entry >= 0:
-        if count < _SORTED:
-            key = jobs.key[entry]
-            j = count
-            while j > 0 and keys[j - 1] > key:
-                keys[j] = keys[j - 1]
-                entries[j] = entries[j - 1]
-                j -= 1
-            keys[j] = key
-            entries[j] = entry
-        count += 1
-        entry = jobs.next[entry]
     held = int(0)
     raw = int(0)
     last = int(-1)
-    # past the registers, the first walk's keys are the list's first ones, not its smallest: take it in chunks
-    more = count > _SORTED
-    if more:
-        count = 0
-    while True:
+    more = bool(True)
+    while more:
+        count = int(0)
+        more = bool(False)
+        entry = jobs.head[i]
+        while entry >= 0:
+            key = jobs.key[entry]
+            if key > last:
+                if count < _SORTED or key < keys[_SORTED - 1]:
+                    more = more or count == _SORTED
+                    j = wp.min(count, _SORTED - 1)
+                    while j > 0 and keys[j - 1] > key:
+                        keys[j] = keys[j - 1]
+                        entries[j] = entries[j - 1]
+                        j -= 1
+                    keys[j] = key
+                    entries[j] = entry
+                    count = wp.min(count + 1, _SORTED)
+                else:
+                    more = True
+            entry = jobs.next[entry]
         for j in range(count):
             if keys[j] == last:
                 continue
             last = keys[j]
             raw += 1
             held = _hold_candidate(out, jobs, entries[j], slot, held, eps, limit)
-        if not more:
-            break
-        keys, entries, count, more = _keys_after(jobs.key, jobs.next, jobs.head[i], last)
     return held, raw
+
+
+@wp.func
+def _hold_pooled(
+    store: TerrainLawRows,
+    scratch: TerrainFinishScratch,
+    jobs: TerrainSolidJobs,
+    i: int,
+    base: int,
+    eps: float,
+) -> tuple[bool, int, int]:
+    """:func:`_hold_candidates` into a full-finish block's scratch from ``base`` (its distinct rows held in ``store``,
+    the scratch's rows): ``(pooled, held, raw)``. The pair's list is sorted by key (equal keys in list order) in the
+    block's finish state arrays, free until its finish (``group`` the keys, ``rank`` the entries), not on the stack;
+    ``pooled`` is ``False`` for a list of more entries than the block holds (nothing held: walk the pair instead)."""
+    count = int(0)
+    entry = jobs.head[i]
+    while entry >= 0:
+        if count < scratch.capacity:
+            key = jobs.key[entry]
+            j = count
+            while j > 0 and scratch.group[base + j - 1] > key:
+                scratch.group[base + j] = scratch.group[base + j - 1]
+                scratch.rank[base + j] = scratch.rank[base + j - 1]
+                j -= 1
+            scratch.group[base + j] = key
+            scratch.rank[base + j] = entry
+        count += 1
+        entry = jobs.next[entry]
+    if count > scratch.capacity:
+        return False, 0, 0
+    held = int(0)
+    raw = int(0)
+    last = int(-1)
+    for j in range(count):
+        key = scratch.group[base + j]
+        if key == last:
+            continue
+        last = key
+        raw += 1
+        held = _hold_candidate(store, jobs, scratch.rank[base + j], base, held, eps, scratch.capacity)
+    return True, held, raw
 
 
 @wp.func
@@ -2994,7 +2993,7 @@ def solid_exit_pair(
     """Rule X for a pair its close left to the class's exit kernel, its rows held in its walk slots from ``slot``
     (``out.count`` of them): the deepest exit over its listed candidates (:func:`solid_exits`), held with its rows for
     the settle kernel (:func:`solid_settle_pair`). A pair some of whose rule X work found no room is left to the
-    class's full-finish kernel, which walks it again and takes every candidate."""
+    class's full-finish kernels (its candidates all pooled: the pooled kernel), which take every candidate."""
     if jobs.xall[i] != 0:
         terrain_defer_pair(out, partner_class, pair_index, out.state[pair_index] & TERRAIN_PAIR_WIDE)
         _jobs_overflowed(out)
@@ -3010,12 +3009,6 @@ def solid_exit_pair(
     sink.raw = sink.held
     listed = _ListedCandidates()
     listed.row = i
-    # the listed candidates sorted once for both passes (all of them unless more)
-    keys, entries, count, more = _keys_after(jobs.key, jobs.next, jobs.xhead[i], -1)
-    listed.keys = keys
-    listed.entries = entries
-    listed.count = count
-    listed.more = more
     planes, sink = solid_exits(
         core, data, window, planes, pair, sink, out, record.cells, solids.exit_work, jobs, listed
     )
@@ -3072,6 +3065,7 @@ TERRAIN_SOLID_LAUNCHES = (
     ("jobs", "xdescents"),
     ("pair_jobs", "exit"),
     ("pair_jobs", "settle"),
+    ("full", "pooled"),
     ("full", "full"),
 )
 """A solid class's launches in order, by kind and kernel (:func:`solid_kernels`): ``pairs`` one thread per pair of the
@@ -3464,36 +3458,23 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         solids: TerrainSolidData,
         jobs: TerrainSolidJobs,
     ):
-        """Finish the class's deferred pairs: the grid's ``scratch.blocks`` blocks stride over the class's deferred
-        list, and each block's first lane takes its pairs one at a time into the block's scratch (every distinct
-        candidate a window of the class can give): a pair every job of which found room from the candidate pool
-        (:func:`solid_rows_pooled`), any other by walking its window again (:func:`solid_rows_full`); it runs rules R
-        and X and the finish and writes every row it keeps, in the pair's walk slots when they fit, else in rows of the
-        spill region. A pair's rows depend on the pair alone: not on the order of the deferral, the number of deferred
-        pairs or the block that finishes it. ``wp.launch_tiled`` with ``dim=scratch.blocks``; a block past it returns
-        at once."""
+        """Finish the class's deferred pairs some of whose work found no room, and those the pooled kernel could not hold
+        (both still carry :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_FULL`): the grid's ``scratch.blocks``
+        blocks stride over the class's deferred list, and each block's first lane walks its pairs again, one at a time,
+        into the block's scratch (every distinct candidate a window of the class can give, :func:`solid_rows_full`), runs
+        rules R and X and the finish and writes every row it keeps, in the pair's walk slots when they fit, else in rows
+        of the spill region (:func:`solid_close_full`). A pair's rows depend on the pair alone: not on the order of the
+        deferral, the number of deferred pairs or the block that finishes it. ``wp.launch_tiled`` with
+        ``dim=scratch.blocks``; a block past it returns at once."""
         block, lane = wp.tid()
         if block >= scratch.blocks or lane != 0:
             return
         for entry in range(block, out.deferred_count[class_], scratch.blocks):
             pair = out.deferred[begin + entry]
-            i = pair - begin
-            if (out.state[pair] & TERRAIN_PAIR_INCOMPLETE) == 0:
-                solid_rows_pooled(
-                    wp.static(load_core)(jobs, i, solids),
-                    data,
-                    out,
-                    scratch,
-                    solids,
-                    jobs,
-                    block,
-                    pair,
-                    i,
-                    slot_begin + i * rows_,
-                    rows_,
-                    inputs.shape_transform[inputs.pairs[pair][0]],
-                )
+            if (out.state[pair] & TERRAIN_PAIR_FULL) == 0:
+                # the pooled kernel finished it
                 continue
+            i = pair - begin
             _state, frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
             _supported, core = wp.static(make_core)(local, size, inputs.shape_type[partner], partner, solids)
             solid_rows_full(
@@ -3512,6 +3493,55 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
                 reach,
             )
 
+    def pooled(
+        begin: int,
+        slot_begin: int,
+        inputs: TerrainPairInputs,
+        data: TerrainFeatureData,
+        out: TerrainLawRows,
+        scratch: TerrainFinishScratch,
+        solids: TerrainSolidData,
+        jobs: TerrainSolidJobs,
+    ):
+        """Finish the class's deferred pairs every job of which found room (more distinct rows than their walk slots,
+        or rule X's lists without room) from their candidates in the candidate pool, not by a second walk of their
+        windows (:func:`solid_pooled`), before the full-finish kernel walks the others: the full-finish grid strides
+        over the class's deferred list, each block's first lane taking its pairs one at a time into the block's
+        scratch, and runs rules R and X and the finish and writes the rows (:func:`solid_close_full`), as the walk
+        would. A pair whose list holds more entries than a block is marked
+        :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_INCOMPLETE` for the full-finish kernel. A kernel of its
+        own, so that neither kernel holds both paths' state. ``wp.launch_tiled`` with ``dim=scratch.blocks``; a block
+        past it returns at once."""
+        block, lane = wp.tid()
+        if block >= scratch.blocks or lane != 0:
+            return
+        for entry in range(block, out.deferred_count[class_], scratch.blocks):
+            pair = out.deferred[begin + entry]
+            if (out.state[pair] & TERRAIN_PAIR_INCOMPLETE) != 0:
+                continue
+            i = pair - begin
+            found, window, setup, cells, sink = solid_pooled(data, scratch, jobs, block, i)
+            if not found:
+                wp.atomic_or(out.state, pair, TERRAIN_PAIR_INCOMPLETE)
+                continue
+            solid_close_full(
+                wp.static(load_core)(jobs, i, solids),
+                data,
+                window,
+                terrain_planes(),
+                setup,
+                sink,
+                scratch,
+                out,
+                solids.exit_work,
+                jobs,
+                pair,
+                slot_begin + i * rows_,
+                rows_,
+                inputs.shape_transform[inputs.pairs[pair][0]],
+                cells,
+            )
+
     kernels = {}
     for kernel_name, function in (
         ("rows", rows),
@@ -3528,6 +3558,7 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         ("xdescents", xdescents),
         ("exit", exit_),
         ("settle", settle),
+        ("pooled", pooled),
         ("full", full),
     ):
         key = f"terrain_{name}_rows" if kernel_name == "rows" else f"terrain_{name}_rows_{kernel_name}"

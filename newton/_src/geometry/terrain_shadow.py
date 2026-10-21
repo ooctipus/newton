@@ -150,11 +150,18 @@ def _solid_launches(name: str) -> tuple[tuple[str, str], ...]:
         "xdescents",
         "exit",
         "settle",
+        "pooled",
         "full",
     )
     pair_jobs = ("close", "recovery", "exit", "settle")
     kinds = tuple(
-        "pairs" if kernel == "rows" else "full" if kernel == "full" else "pair_jobs" if kernel in pair_jobs else "jobs"
+        "pairs"
+        if kernel == "rows"
+        else "full"
+        if kernel in ("pooled", "full")
+        else "pair_jobs"
+        if kernel in pair_jobs
+        else "jobs"
         for kernel in kernels
     )
     return tuple(
