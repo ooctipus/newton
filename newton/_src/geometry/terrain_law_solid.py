@@ -243,7 +243,7 @@ list."""
 TERRAIN_SOLID_JOB_THREADS_CPU = 4
 """Threads of a job kernel's launch on the CPU, which runs a launch's threads one after another: a few, so that each
 job's cost is the job's (they still stride over the list)."""
-TERRAIN_SOLID_SCAN_VERTICES = 64
+TERRAIN_SOLID_SCAN_VERTICES = 32
 """Window vertices one scan job takes at most (a window's vertices in window order, in runs of this many): a large
 window is scanned by several threads, so that no thread scans a large window alone. A cluster plane met by two runs is
 listed twice; its rows, the same at the same place in window order, merge in the close."""
