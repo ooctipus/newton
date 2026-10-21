@@ -248,7 +248,8 @@ TERRAIN_SOLID_SCAN_VERTICES = 32
 window is scanned by several threads, so that no thread scans a large window alone. A cluster plane met by two runs is
 listed twice; its rows, the same at the same place in window order, merge in the close."""
 TERRAIN_SOLID_SORTED = 32
-"""Candidates of one pair the close sorts in registers; a pair with more takes them by repeated selection."""
+"""Keys of a pair's pool list sorted in registers per walk of the list (:func:`_keys_after`): the close and the exit
+kernel take a list of ``n`` candidates in key order in ``ceil(n / 32)`` walks."""
 TERRAIN_HULL_FACE_TOL = 1.0e-6
 """A hull's points within this of a face's plane lie on that face [m] (hulls under 1 m; their local frame): a planar
 face of a float32 mesh stays one face (its points lie within about 1e-8 m of its plane)."""
@@ -296,7 +297,6 @@ _LIVE = wp.constant(7)
 _RECOVER = wp.constant(8)
 _SCANS = wp.constant(9)
 _XDESCENTS = wp.constant(10)
-_INT_MAX = wp.constant(2147483647)
 
 _Mat43 = wp.types.matrix(shape=(4, 3), dtype=wp.float32)
 _RingNormals = wp.types.matrix(shape=(6, 3), dtype=wp.float32)
@@ -1673,6 +1673,39 @@ def _valley_bound(
 
 
 @wp.func
+def _keys_after(
+    key: wp.array[wp.int32], link: wp.array[wp.int32], head: int, last: int
+) -> tuple[_Sorted, _Sorted, int, bool]:
+    """The up to :data:`TERRAIN_SOLID_SORTED` smallest keys greater than ``last`` of a pool list (from entry ``head``,
+    linked by ``link``), sorted in registers (equal keys in list order), with their entries: ``(keys, entries, count,
+    more)``, ``more`` when the list holds keys greater than ``last`` beyond them. One walk of the list per call, so that
+    a pair's list in key order takes one walk per :data:`TERRAIN_SOLID_SORTED` keys, not one per key."""
+    keys = _Sorted()
+    entries = _Sorted()
+    count = int(0)
+    more = bool(False)
+    entry = head
+    while entry >= 0:
+        k = key[entry]
+        if k > last:
+            if count < _SORTED or k < keys[_SORTED - 1]:
+                # a full chunk drops its largest key, which a later call takes
+                more = more or count == _SORTED
+                j = wp.min(count, _SORTED - 1)
+                while j > 0 and keys[j - 1] > k:
+                    keys[j] = keys[j - 1]
+                    entries[j] = entries[j - 1]
+                    j -= 1
+                keys[j] = k
+                entries[j] = entry
+                count = wp.min(count + 1, _SORTED)
+            else:
+                more = True
+        entry = link[entry]
+    return keys, entries, count, more
+
+
+@wp.func
 def _x_list(
     jobs: TerrainSolidJobs, i: int, x: wp.vec3, bound: float, key: int, valley: int, gate: float, scale: float
 ) -> int:
@@ -1709,34 +1742,31 @@ def _exit_listed(
     as :func:`_exit_candidates` takes them: a valley's gate (:func:`_exit_open`) at its first listed candidate, which
     takes or skips the valley's candidates. A candidate left off the list has a bound no higher than the target, and
     a valley off it a gate closed at the target and at every later threshold: both are no-ops in either pass, and
-    the state at a listed candidate is the full pass's."""
+    the state at a listed candidate is the full pass's. The list is taken in chunks of keys sorted in registers
+    (:func:`_keys_after`)."""
     last = int(-1)
     valley = int(-1)
     passing = bool(True)
-    while True:
-        entry = int(-1)
-        key = int(_INT_MAX)
-        e = jobs.xhead[row]
-        while e >= 0:
-            k = jobs.key[e]
-            if k > last and k < key:
-                key = k
-                entry = e
-            e = jobs.next[e]
-        if entry < 0:
-            break
-        last = key
-        first = jobs.feature[entry]
-        if first >= 0:
-            if first != valley:
-                valley = first
-                gate = jobs.n[entry]
-                passing = _exit_open(best, first, gate[0], gate[1])
-            if not passing:
+    more = bool(True)
+    while more:
+        keys, entries, count, more = _keys_after(jobs.key, jobs.next, jobs.xhead[row], last)
+        for j in range(count):
+            key = keys[j]
+            if key == last:
                 continue
-        planes, best = _exit_try_listed(
-            data, window, planes, pair, cells, best, jobs.q[entry], jobs.d[entry], jobs.descent[entry], key
-        )
+            last = key
+            entry = entries[j]
+            first = jobs.feature[entry]
+            if first >= 0:
+                if first != valley:
+                    valley = first
+                    gate = jobs.n[entry]
+                    passing = _exit_open(best, first, gate[0], gate[1])
+                if not passing:
+                    continue
+            planes, best = _exit_try_listed(
+                data, window, planes, pair, cells, best, jobs.q[entry], jobs.d[entry], jobs.descent[entry], key
+            )
     return planes, best
 
 
@@ -2545,50 +2575,20 @@ def _hold_candidates(
     """Hold class pair ``i``'s candidates in its walk slots from ``slot`` in window order (by key), as the walk offers
     them (:func:`~newton._src.geometry.terrain_law.terrain_hold_row`, at most ``limit``): ``(held, raw)``, its
     distinct rows and its offers. Candidates of one key (a cluster listed twice) are one offer; the list's order (its
-    jobs') never matters. Up to :data:`TERRAIN_SOLID_SORTED` candidates are sorted in registers, more taken by
-    repeated selection."""
-    keys = _Sorted()
-    entries = _Sorted()
-    count = int(0)
-    entry = jobs.head[i]
-    while entry >= 0:
-        if count < _SORTED:
-            key = jobs.key[entry]
-            j = count
-            while j > 0 and keys[j - 1] > key:
-                keys[j] = keys[j - 1]
-                entries[j] = entries[j - 1]
-                j -= 1
-            keys[j] = key
-            entries[j] = entry
-        count += 1
-        entry = jobs.next[entry]
+    jobs') never matters. The list is taken in chunks of :data:`TERRAIN_SOLID_SORTED` keys sorted in registers
+    (:func:`_keys_after`), one walk of it per chunk."""
     held = int(0)
     raw = int(0)
     last = int(-1)
-    if count <= _SORTED:
+    more = bool(True)
+    while more:
+        keys, entries, count, more = _keys_after(jobs.key, jobs.next, jobs.head[i], last)
         for j in range(count):
             if keys[j] == last:
                 continue
             last = keys[j]
             raw += 1
             held = _hold_candidate(out, jobs, entries[j], slot, held, eps, limit)
-        return held, raw
-    while True:
-        best = int(-1)
-        best_key = int(_INT_MAX)
-        entry = jobs.head[i]
-        while entry >= 0:
-            key = jobs.key[entry]
-            if key > last and key < best_key:
-                best_key = key
-                best = entry
-            entry = jobs.next[entry]
-        if best < 0:
-            break
-        last = best_key
-        raw += 1
-        held = _hold_candidate(out, jobs, best, slot, held, eps, limit)
     return held, raw
 
 
