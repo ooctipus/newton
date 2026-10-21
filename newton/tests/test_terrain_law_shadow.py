@@ -558,7 +558,13 @@ class TestTerrainLawShadow(unittest.TestCase):
             wp.launch(
                 terrain_law_spill_check,
                 dim=1,
-                inputs=[wp.array(counters, dtype=wp.int32), 0, 1, jobs, wp.array(capacities, dtype=wp.int32)],
+                inputs=[
+                    wp.array(counters, dtype=wp.int32, device="cpu"),
+                    0,
+                    1,
+                    jobs,
+                    wp.array(capacities, dtype=wp.int32, device="cpu"),
+                ],
                 device="cpu",
             )
             wp.synchronize()
