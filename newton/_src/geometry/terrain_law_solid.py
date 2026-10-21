@@ -266,6 +266,11 @@ TERRAIN_SOLID_FINISH_BLOCKS = TERRAIN_SOLID_JOB_THREADS // TERRAIN_LAW_BLOCK
 """Blocks of the finish kernel's launch on CUDA at most (fewer with fewer pairs): the job threads' worth of
 :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK`-lane blocks, each finishing one pair at a time with its
 lanes and striding over the class's live pairs."""
+TERRAIN_SOLID_RECOVERY_CLEAR = 1.0e-4
+"""Height [m] by which a core without a candidate must clear its window's highest vertex for its close to leave it
+without a row instead of listing it for rule R: every core point then lies above the plane of the face under it (a
+cluster plane lies within :data:`~newton._src.geometry.terrain_law.TERRAIN_FLAT_EPS` of its triangles' vertices) by
+far more than the float32 rounding of its plane distance, so rule R would find none of them below the surface."""
 TERRAIN_SOLID_SCAN_VERTICES = 32
 """Window vertices one scan job takes at most (a window's vertices in window order, in runs of this many): a large
 window is scanned by several threads, so that no thread scans a large window alone. A cluster plane met by two runs is
@@ -309,6 +314,7 @@ _CELL_WIDEN = wp.constant(TERRAIN_CELL_WIDEN)
 _SEEN = wp.constant(TERRAIN_SOLID_SEEN)
 _SORTED = wp.constant(TERRAIN_SOLID_SORTED)
 _SCAN_VERTICES = wp.constant(TERRAIN_SOLID_SCAN_VERTICES)
+_RECOVERY_CLEAR = wp.constant(TERRAIN_SOLID_RECOVERY_CLEAR)
 _KEY_SLOTS = wp.constant(8)
 _FACES = wp.constant(0)
 _EDGES = wp.constant(1)
@@ -2867,6 +2873,13 @@ def solid_close_jobs(
         terrain_defer_pair(out, partner_class, pair_index, _wide(cells))
         return
     if sink.raw == 0:
+        if record.low > pair.top + _RECOVERY_CLEAR:
+            # The core lies above every vertex of its window: rule R finds none of its points below the surface, and
+            # rule X needs a core below the window's highest vertex, so the pair keeps no row.
+            out.first[pair_index] = slot
+            out.count[pair_index] = 0
+            out.state[pair_index] = _wide(cells)
+            return
         # the recovery list holds every pair of the class at most
         jobs.recover[wp.atomic_add(jobs.counts, _RECOVER, 1)] = i
         return
