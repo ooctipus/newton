@@ -38,11 +38,19 @@ from newton._src.geometry.terrain_law import (
     terrain_law_block_dim,
 )
 from newton._src.geometry.terrain_law_point import TERRAIN_POINT_WALK_SLOTS
-from newton._src.geometry.terrain_law_solid import TERRAIN_SOLID_THREAD_VERTICES
+from newton._src.geometry.terrain_law_solid import (
+    TERRAIN_SOLID_JOB_LISTS,
+    TERRAIN_SOLID_JOB_THREADS_CPU,
+    TERRAIN_SOLID_LAUNCHES,
+    TERRAIN_SOLID_SCAN_VERTICES,
+    terrain_solid_exit_items,
+    terrain_solid_job_capacities,
+)
 from newton._src.geometry.terrain_shadow import (
     TERRAIN_LAW_KERNELS,
     TERRAIN_LAW_SPILL_SHARE,
     parse_terrain_law_shadow,
+    parse_terrain_law_shadow_jobs,
     parse_terrain_law_shadow_rows,
 )
 from newton.tests import terrain_law_reference as ref
@@ -438,7 +446,7 @@ def test_tiled_pairs_that_exit_are_not_queued(test, device):
     test.assertEqual(int(tiled.sum()), 12)
     test.assertEqual(int((tiled & left).sum()), 6)
     test.assertGreater(int(rows["count"][tiled & ~left].sum()), 0)
-    work = next(extra for kind, *_launch, extra in shadow._launches if kind == "thread")
+    work = next(extra[0] for kind, *_launch, extra in shadow._launches if kind == "thread" and not extra[1])
     queued = work.pairs.numpy()[: int(work.count.numpy()[0])]
     np.testing.assert_array_equal(np.sort(queued), shadow._listed[tiled & ~left])
     test.assertEqual(tiled_launches, [(min(12, TERRAIN_LAW_TILE_BLOCKS), terrain_law_block_dim(device))])
@@ -504,6 +512,16 @@ class TestTerrainLawShadow(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "NEWTON_TERRAIN_LAW_SHADOW_ROWS"):
                 parse_terrain_law_shadow_rows(value)
         with patch.dict(os.environ, {"NEWTON_TERRAIN_LAW_SHADOW_ROWS": "-3"}), self.assertRaises(ValueError):
+            tu.shadow_pipeline(model, **PIPELINE)
+        # The solid classes' job capacities: a positive factor, blank for the default.
+        self.assertIsNone(parse_terrain_law_shadow_jobs(None))
+        self.assertIsNone(parse_terrain_law_shadow_jobs(" "))
+        self.assertEqual(parse_terrain_law_shadow_jobs("2"), 2.0)
+        self.assertEqual(parse_terrain_law_shadow_jobs(" 0.5 "), 0.5)
+        for value in ("0", "-1", "inf", "nan", "many"):
+            with self.assertRaisesRegex(ValueError, "NEWTON_TERRAIN_LAW_SHADOW_JOBS"):
+                parse_terrain_law_shadow_jobs(value)
+        with patch.dict(os.environ, {"NEWTON_TERRAIN_LAW_SHADOW_JOBS": "0"}), self.assertRaises(ValueError):
             tu.shadow_pipeline(model, **PIPELINE)
 
     def test_spill_overflow_raises_terrain_rows_cpu(self):
@@ -649,7 +667,6 @@ class TestTerrainLawShadow(unittest.TestCase):
                     "block_dim": terrain_law_block_dim("cpu"),
                     "thread_dim": 12,
                     "tiled_blocks": min(lanes["tiled"], TERRAIN_LAW_TILE_BLOCKS),
-                    "exit_dim": 0,
                     "full_blocks": terrain_finish_blocks(candidates),
                     "full_candidates": candidates,
                     "full_limited": False,
@@ -678,8 +695,10 @@ class TestTerrainLawShadow(unittest.TestCase):
         )
 
     def test_route_record_of_solid_classes_cpu(self):
-        """Record the solid classes' pairs per lane class, launches, data, lane choice, kernel grids and coreless
-        pairs: the grids are the point class's (one block size, the work list's tiled grid, the full-finish grid)."""
+        """Record the solid classes' pairs per lane class, launches, data, job scale, kernel grids, job capacities and
+        coreless pairs: one block size, one thread per pair for the whole-pair rejects and the exit kernel, the job
+        threads for the others, the full-finish grid, and job lists and a candidate pool sized from the pairs' own
+        bounds, the scan's jobs exactly."""
         rng = np.random.default_rng(8)
         heights = np.round(rng.uniform(0.0, 0.05, (17, 17)) / 0.005) * 0.005
         bodies = [
@@ -716,31 +735,44 @@ class TestTerrainLawShadow(unittest.TestCase):
                     begin, end = table.segment(partner_class, lane)
                     lanes[lane_name] = end - begin
                 self.assertEqual(record["pairs"][name], lanes)
-                # with pairs: the one-thread kernel over the class, the tiled grid when the class has tiled-lane
-                # partners (only their windows can exceed the one-thread kernel's), the exit kernel (rule X) over the
-                # class and the full kernel
-                if sum(lanes.values()):
-                    launches += 3 + int(lanes["tiled"] > 0)
+                # with pairs: the class's launches (whole-pair rejects, scan, job kernels, close, rule R, rule X's
+                # items, valleys and exit kernel, full kernel)
+                count = sum(lanes.values())
+                if count:
+                    launches += len(TERRAIN_SOLID_LAUNCHES)
                     begin = table.segment(partner_class, TERRAIN_LANE_THREAD)[0]
-                    candidates = int(table.candidates[begin : begin + sum(lanes.values())].max())
+                    end = begin + count
+                    candidates = int(table.candidates[begin:end].max())
+                    walk = int(TERRAIN_PARTNER_WALK_SLOTS[partner_class])
+                    points, takes = terrain_solid_exit_items(scene, table.pairs_host[begin:end, 1])
+                    capacities = terrain_solid_job_capacities(
+                        table.vertices[begin:end], points, takes, table.candidates[begin:end], walk
+                    )
+                    names = (*TERRAIN_SOLID_JOB_LISTS, "candidates", "scans")
+                    self.assertEqual(sorted(capacities), sorted(names))
+                    # the scan's jobs: every pair's runs of window vertices at its largest window
+                    scans = int(np.sum(-(-table.vertices[begin:end].astype(np.int64) // TERRAIN_SOLID_SCAN_VERTICES)))
+                    self.assertEqual(capacities["scans"], scans)
+                    longest = max(capacities[n] for n in (*TERRAIN_SOLID_JOB_LISTS, "scans"))
                     self.assertEqual(
                         record["launch_shapes"][name],
                         {
                             "block_dim": terrain_law_block_dim("cpu"),
-                            "thread_dim": sum(lanes.values()),
-                            "tiled_blocks": min(lanes["tiled"], TERRAIN_LAW_TILE_BLOCKS),
-                            "exit_dim": sum(lanes.values()),
+                            "pair_dim": count,
+                            "job_threads": min(TERRAIN_SOLID_JOB_THREADS_CPU, longest),
+                            "jobs": capacities,
                             "full_blocks": terrain_finish_blocks(candidates),
                             "full_candidates": candidates,
                             "full_limited": False,
-                            "walk_slots": int(TERRAIN_PARTNER_WALK_SLOTS[partner_class]),
+                            "walk_slots": walk,
                         },
                     )
             self.assertEqual(record["launches"], launches)
-            self.assertEqual(record["thread_vertices"], TERRAIN_SOLID_THREAD_VERTICES)
+            self.assertEqual(record["job_scale"], 1.0)
             self.assertEqual(record["unsupported_pairs"], unsupported)
             self.assertGreater(record["bytes"]["solid_data"], 0)
-            self.assertGreater(record["bytes"]["work_lists"], 0)
+            self.assertGreater(record["bytes"]["jobs"], 0)
+            self.assertEqual(record["bytes"]["work_lists"], 0)
             self.assertGreater(record["bytes"]["finish_scratch"], 0)
         # both lane classes of the box class are in the first scene
         self.assertTrue(

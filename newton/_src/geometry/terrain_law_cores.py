@@ -148,6 +148,24 @@ class TerrainHullCore:
     table: TerrainHullTable
 
 
+@wp.struct
+class TerrainHullCoreRecord:
+    """A :class:`TerrainHullCore` without its table: how a hull pair's scan keeps its core for its job kernels."""
+
+    c: wp.vec3
+    rot: wp.mat33
+    s: wp.vec3
+    ellipsoid: int
+    point_begin: int
+    point_count: int
+    face_begin: int
+    face_count: int
+    triangle_begin: int
+    triangle_count: int
+    radius: float
+    start: int
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # shared helpers: crossings of a feature with a crease's line
 # ----------------------------------------------------------------------------------------------------------------

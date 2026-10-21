@@ -2011,15 +2011,19 @@ class CollisionPipeline:
         self._terrain_law_shadow = None
         self._terrain_law_shadow_reason = None
         terrain_law_spill_rows = None
+        terrain_law_job_scale = None
         if terrain_law_shadow.strip():
             from ..geometry.terrain_shadow import (  # noqa: PLC0415
                 parse_terrain_law_shadow,
+                parse_terrain_law_shadow_jobs,
                 parse_terrain_law_shadow_rows,
             )
 
             terrain_law_classes = parse_terrain_law_shadow(terrain_law_shadow)
             # The rows of its scene-level spill region (default: TerrainLawShadow.default_spill_rows()).
             terrain_law_spill_rows = parse_terrain_law_shadow_rows(os.environ.get("NEWTON_TERRAIN_LAW_SHADOW_ROWS", ""))
+            # The factor on its solid classes' job capacities (default 1: terrain_solid_job_capacities()).
+            terrain_law_job_scale = parse_terrain_law_shadow_jobs(os.environ.get("NEWTON_TERRAIN_LAW_SHADOW_JOBS", ""))
         else:
             terrain_law_classes = ()
 
@@ -2715,6 +2719,7 @@ class CollisionPipeline:
                 pairs=self.shape_pairs_filtered if self.broad_phase_mode == "explicit" else None,
                 status=self.narrow_phase._buffer_capacity_status,
                 spill_rows=terrain_law_spill_rows,
+                job_scale=terrain_law_job_scale,
             )
             if shadow.features is None:
                 self._terrain_law_shadow_reason = "No heightfield pair has a partner of the listed classes."

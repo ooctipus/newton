@@ -1393,6 +1393,7 @@ class TerrainPairTable:
         partner_class = partner_class[partner_class >= 0]
         lane = np.zeros(len(pairs), np.int32)
         world = np.zeros(len(pairs), np.int32)
+        vertices = np.zeros(len(pairs), np.int64)
         candidates = np.zeros(len(pairs), np.int64)
         if len(pairs):
             first, second = pairs[:, 0], pairs[:, 1]
@@ -1418,6 +1419,8 @@ class TerrainPairTable:
         """Lane class of every pair, int32 (host)."""
         self.world = world[order]
         """World of every pair (the partner's, or the heightfield's for a global partner), int32 (host)."""
+        self.vertices = vertices[order]
+        """Bound on every pair's window vertices, any pose (:func:`terrain_window_vertices`), int64 (host)."""
         self.candidates = candidates[order]
         """Bound on every pair's distinct candidates, any pose (:func:`terrain_pair_candidates`), int64 (host)."""
         segment = self.partner_class * TERRAIN_LANE_CLASSES + self.lane_class

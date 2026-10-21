@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The terrain law's per-pair walk for solid cores: boxes, cylinders and cones, convex hulls and ellipsoids.
+"""The terrain law for solid cores (boxes, cylinders and cones, convex hulls and ellipsoids): its rules, and the kernels
+that run them on a class's pairs.
 
 A solid core has no rounding radius; its reach ``D`` is both margins and both gaps (the contact writer's admission
-limit). Per pair the walk visits every surface feature of the window once (window vertex ``(r, c)`` owns its cell's
-two faces and diagonal, its x- and y-edges and itself) and offers the rows of the law's rules for solids:
+limit). Per pair the law visits every surface feature of the window once (window vertex ``(r, c)`` owns its cell's
+two faces and diagonal, its x- and y-edges and itself) and offers the rows of the law's rules for solids, in window
+order:
 
 * F, faces: the analytic plane manifold of the core against the triangle's cluster plane
   (:func:`~newton._src.geometry.terrain_law_cores.core_manifold`); a manifold point is supported when its footprint
@@ -43,12 +45,10 @@ of reach only where the edge rises nowhere above the core's lowest point: a row 
 from the core) and by its arc ends' support values before the search, a vertex by the bounding sphere and one support
 call before its feature test and nearest point.
 
-Rule X runs after the walk (and rule R), only for a core reaching below its window's highest vertex (read in the pass
-that sets the window's band): the walk leaves such a pair, its rows held in its walk slots, to its class's exit kernel
-(:func:`solid_close`, :func:`solid_rows_exit`), so that rule X's work runs on warps of its own, off the walks' registers
-and stacks; a deferred pair's full finish runs it itself. A candidate's bound is its depth below the plane of the face
-under it when its projection stays in that face's cluster, else its distance to that triangle, or its distance to the
-feature that proposed it, the smallest, lowered by a descent over blocks of 3 x 3 cells toward its closest surface point
+Rule X runs after the walk's rows (and rule R), only for a core reaching below its window's highest vertex (read in
+the pass that sets the window's band). A candidate's bound is its depth below the plane of the face under it when its
+projection stays in that face's cluster, else its distance to that triangle, or its distance to the feature that
+proposed it, the smallest, lowered by a descent over blocks of 3 x 3 cells toward its closest surface point
 (:func:`_near_bound`). A first pass over the candidates takes the two largest bounds above the pair's depth, and the
 largest's exit is searched; a second pass searches the exits of the candidates that can still beat it (or tie it from
 earlier in window order) only when the second largest bound can; a valley is skipped where the wedge below it cannot
@@ -56,23 +56,51 @@ hold such a point. An exit search covers the cells within its candidate's bound,
 candidate's depth, not the window's size: a pair's rule X work is its candidates' (a few per window vertex for
 cylinders, cones and ellipsoids, a box's or hull's points) and, on buried solids under rough slopes, one exit search.
 
+The kernels (:func:`solid_kernels`, one module per partner class, in the order of :data:`TERRAIN_SOLID_LAUNCHES`) take
+the shape of today's terrain route: a cheap scan that lists the features that survive the cheapest rejects, one thread
+per listed feature, and a per-pair close that holds their rows in window order, so that a warp runs one rule on many
+pairs' features at once instead of one pair's whole window, and no thread walks a large window alone:
+
+1. The whole-pair rejects, one thread per pair; a pair past them is listed live, its window in runs of
+   :data:`TERRAIN_SOLID_SCAN_VERTICES` window vertices. The scan (:func:`solid_scan`), one thread per run: the
+   window, the core kept for the jobs (:class:`TerrainSolidJobs`, first run), and the run's features through their
+   cheapest rejects in window order: rule F's faces (one per cluster plane and run: its manifold, support tests and
+   emitting triangle are its cluster's alone, :func:`_face_support`), rule E's edges (:func:`_edge_cheap`) and rule
+   V's vertices (:func:`_vertex_cheap`), each survivor listed for its job kernel.
+2. The job kernels, a fixed grid striding over each list: :func:`solid_face_job`, :func:`solid_edge_job` (its crease
+   tests, :func:`_edge_arc`; a crease whose arc can hold a row is listed for ``theta*``), :func:`solid_theta_job`
+   (``theta*``, the crossing and its ends, :func:`_edge_rows`) and :func:`solid_vertex_job` (:func:`_vertex_rows`).
+   A job adds its rows to the class's candidate pool, each with its place in window order (its key: its item's index,
+   window vertex times six plus its item, times eight plus its point slot), the row the walk would offer there.
+3. The close (:func:`solid_close_jobs`), one thread per live pair: the pair's candidates held in its walk slots in key
+   order (:func:`~newton._src.geometry.terrain_law.terrain_hold_row`, the walk's held rows bit for bit, however the
+   jobs ran; a candidate listed twice is one offer), then rule R's kernel for a pair without a row
+   (:func:`solid_recover_pair`), and the finish; a pair whose core reaches below its window's highest vertex is left,
+   its rows held, to rule X, with one item per core point and window vertex that can give a candidate listed.
+4. Rule X's items (:func:`solid_xitem_job`: a core point, or a window vertex that can give a candidate) and valleys
+   (:func:`solid_xvalley_job`), the job threads: each lists the candidates whose bounds pass the pair's target, the
+   test the rule's passes open with, so that the exit kernel (:func:`solid_exit_pair`, one thread per pair left to it)
+   runs the rule's passes over the listed candidates alone (:func:`solid_exits`, :func:`_exit_listed`): any other
+   candidate is a no-op in both passes, and the rows are the passes' over every candidate.
+
 The kernels follow the per-pair output protocol of :mod:`~newton._src.geometry.terrain_law`: a pair with no row is
 recorded by :func:`~newton._src.geometry.terrain_law.terrain_pair_exit`, and rows are held in the pair's own walk slots
 (window frame) as the finish merges them (:func:`~newton._src.geometry.terrain_law.terrain_hold_row`): a row coinciding
 with a held one is dropped, the first in window order staying. The finish runs in place on the held rows
 (:func:`~newton._src.geometry.terrain_law.terrain_finish_slots`, a row's core point being ``q + d n``), and the kept
-rows are rewritten in the world frame at the front of the slots. A pair with more distinct candidates than its slots is
-left to its class's full kernel (:func:`~newton._src.geometry.terrain_law.terrain_defer_pair`): the shadow's fixed
-full-finish grid strides over the class's deferred list, and each block's first lane walks its pairs again, one at a
-time, into the block's scratch (:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`), which holds every
-distinct candidate a window of the class can give
-(:func:`~newton._src.geometry.terrain_contacts.terrain_pair_candidates`). The finish runs on all of them
-(:func:`~newton._src.geometry.terrain_law.terrain_finish_list`) and every row it keeps is written, in the pair's walk
-slots when they fit, else in rows of the spill region it reserves
-(:func:`~newton._src.geometry.terrain_law.terrain_spill_rows`). Every deferred pair is thus finished from its own
-candidates, whatever the number of deferred pairs, the order of the deferral or the block that finishes it. The kernels
-themselves (one module per partner class) build the class's core and call the generic bodies here; every module that
-compiles them disables floating-point contraction, so the CPU decides every boundary as the GPU does.
+rows are rewritten in the world frame at the front of the slots. A pair with more distinct candidates than its slots,
+or whose work found no room in a job list or the candidate pool (scene-level buffers sized from the pairs' bounds,
+:func:`terrain_solid_job_capacities`), is left to its class's full kernel
+(:func:`~newton._src.geometry.terrain_law.terrain_defer_pair`): the shadow's fixed full-finish grid strides over the
+class's deferred list, and each block's first lane walks its pairs again, one at a time (:func:`solid_walk`), into the
+block's scratch (:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`), which holds every distinct candidate
+a window of the class can give (:func:`~newton._src.geometry.terrain_contacts.terrain_pair_candidates`). The finish
+runs on all of them (:func:`~newton._src.geometry.terrain_law.terrain_finish_list`) and every row it keeps is written,
+in the pair's walk slots when they fit, else in rows of the spill region it reserves
+(:func:`~newton._src.geometry.terrain_law.terrain_spill_rows`). Every pair is thus finished from its own candidates,
+whatever the order of the jobs, the number of deferred pairs, the order of the deferral or the block that finishes it.
+Every module that compiles the kernels disables floating-point contraction, so the CPU decides every boundary as the GPU
+does.
 """
 
 from __future__ import annotations
@@ -97,6 +125,8 @@ from .terrain_law import (
     TERRAIN_NORMAL_SAME,
     TERRAIN_PAIR_EXIT,
     TERRAIN_PAIR_FILTERED,
+    TERRAIN_PAIR_INCOMPLETE,
+    TERRAIN_PAIR_JOBS,
     TERRAIN_PAIR_OUTSIDE,
     TERRAIN_PAIR_STALE,
     TERRAIN_PAIR_TILE_EXIT,
@@ -108,7 +138,6 @@ from .terrain_law import (
     TerrainFinishScratch,
     TerrainLawRows,
     TerrainPairInputs,
-    TerrainPairWork,
     TerrainPlanes,
     TerrainWindow,
     terrain_box_cells,
@@ -144,7 +173,10 @@ from .terrain_law import (
     terrain_window_vertex,
 )
 from .terrain_law_cores import (
+    TerrainBoxCore,
     TerrainCrossing,
+    TerrainCylinderCore,
+    TerrainHullCoreRecord,
     TerrainHullTable,
     closest_on_triangle,
     core_bounds,
@@ -176,15 +208,42 @@ TERRAIN_SOLID_ARC_END = 1.0e-5
 """A ``theta*`` within this of an arc's end [rad] is at the end (DESIGN 1.4; the float64 law's): far above the float32
 rounding of ``theta*`` (about 1e-7 rad), so that a body resting flat on a crease's face takes the end in float32 and
 float64 alike."""
-TERRAIN_SOLID_MASK_WORDS = 8
-"""Words of the tiled kernels' productive-vertex mask: windows of up to 256 vertices (larger: the first lane walks)."""
-TERRAIN_SOLID_THREAD_VERTICES = 64
-"""Window vertices up to which one thread walks a solid pair (its window as the pose gives it, at run time); a larger
-window of a tiled-lane pair goes to the class's tiled kernel (queued in its
-:class:`~newton._src.geometry.terrain_law.TerrainPairWork`). The pair table's lane classes bound a partner's window
-over every orientation, and most solids of a tiled lane walk far smaller windows (a lying cylinder: about 24
-vertices), which a warp of one-thread pairs walks at full width while a tile of lanes per pair replays its marks
-serially."""
+TERRAIN_SOLID_SEEN = 8
+"""Clusters of several triangles a scan job remembers (round robin): it lists the first face of each it meets for
+rule F, whose emitting triangle and rows are its cluster's alone. A cluster forgotten and met again, or met by another
+of the pair's scan jobs, is listed again; its rows, the same and at the same place in window order, merge in the
+close."""
+TERRAIN_SOLID_JOB_LISTS = ("faces", "edges", "thetas", "vertices", "xitems", "xvalleys")
+"""The job lists of a solid class, in their counters' order (the candidate pool's counter follows): rule F's faces, rule
+E's edges, rule E's creases whose arcs can hold a row (``theta*``), rule V's vertices, rule X's items (a core point and
+a window vertex each) and rule X's valleys."""
+TERRAIN_SOLID_JOB_SHARES = (8, 16, 32, 8, 4, 32)
+"""Per job list (:data:`TERRAIN_SOLID_JOB_LISTS`), the share of its pairs' bounds it holds by default
+(:func:`terrain_solid_job_capacities`): the largest pair's bound plus the sum of every pair's bound over this. A pair's
+bound on a list is its window's features of the list's kind at most (two faces, three edges or one vertex per window
+vertex, :func:`~newton._src.geometry.terrain_contacts.terrain_window_vertices`; rule X's items: its window's vertices
+or its core's points, the more)."""
+TERRAIN_SOLID_CANDIDATE_SHARE = 4
+"""The candidate pool of a solid class holds, by default, its pairs' walk slots over this, plus the largest pair's bound
+on its candidates (:func:`~newton._src.geometry.terrain_contacts.terrain_pair_candidates`)."""
+TERRAIN_SOLID_JOB_FLOOR = 1 << 14
+"""Entries a solid class's job list holds by default at least, or all its pairs' bounds when they sum to less: the work
+of a scene with few pairs always finds room (16,384 entries, 128 KiB)."""
+TERRAIN_SOLID_POOL_FLOOR = 1 << 16
+"""Entries a solid class's candidate pool holds by default at least, or all its pairs' bounds when they sum to less
+(65,536 entries, 2.5 MiB)."""
+TERRAIN_SOLID_JOB_THREADS = 1 << 17
+"""Threads of a job kernel's launch on CUDA at most (fewer with a smaller list): a fixed grid that strides over its
+list."""
+TERRAIN_SOLID_JOB_THREADS_CPU = 4
+"""Threads of a job kernel's launch on the CPU, which runs a launch's threads one after another: a few, so that each
+job's cost is the job's (they still stride over the list)."""
+TERRAIN_SOLID_SCAN_VERTICES = 64
+"""Window vertices one scan job takes at most (a window's vertices in window order, in runs of this many): a large
+window is scanned by several threads, so that no thread scans a large window alone. A cluster plane met by two runs is
+listed twice; its rows, the same at the same place in window order, merge in the close."""
+TERRAIN_SOLID_SORTED = 32
+"""Candidates of one pair the close sorts in registers; a pair with more takes them by repeated selection."""
 TERRAIN_HULL_FACE_TOL = 1.0e-6
 """A hull's points within this of a face's plane lie on that face [m] (hulls under 1 m; their local frame): a planar
 face of a float32 mesh stays one face (its points lie within about 1e-8 m of its plane)."""
@@ -209,7 +268,6 @@ _WIDE = wp.constant(TERRAIN_WINDOW_WIDE)
 _EPS32 = wp.constant(TERRAIN_EPS32)
 _FLAT = wp.constant(TERRAIN_FLAT_EPS)
 _HUGE = wp.constant(3.0e38)
-_MASK_WORDS = wp.constant(TERRAIN_SOLID_MASK_WORDS)
 _ITEMS = wp.constant(6)
 _NORMAL_SAME = wp.constant(TERRAIN_NORMAL_SAME)
 _VERTEX_SPAN = wp.constant(TERRAIN_VERTEX_SPAN)
@@ -218,25 +276,44 @@ _EXIT_SLOT = wp.constant(TERRAIN_SOLID_EXIT_SLOT)
 _DESCENT = wp.constant(TERRAIN_SOLID_EXIT_DESCENT)
 _EXIT_SLOTS = wp.constant(TERRAIN_SOLID_EXIT_SLOTS)
 _CELL_WIDEN = wp.constant(TERRAIN_CELL_WIDEN)
+_SEEN = wp.constant(TERRAIN_SOLID_SEEN)
+_SORTED = wp.constant(TERRAIN_SOLID_SORTED)
+_SCAN_VERTICES = wp.constant(TERRAIN_SOLID_SCAN_VERTICES)
+_KEY_SLOTS = wp.constant(8)
+_FACES = wp.constant(0)
+_EDGES = wp.constant(1)
+_THETAS = wp.constant(2)
+_VERTICES = wp.constant(3)
+_XITEMS = wp.constant(4)
+_XVALLEYS = wp.constant(5)
+_CANDIDATES = wp.constant(6)
+_LIVE = wp.constant(7)
+_RECOVER = wp.constant(8)
+_SCANS = wp.constant(9)
+_INT_MAX = wp.constant(2147483647)
 
-_Mask = wp.types.vector(length=TERRAIN_SOLID_MASK_WORDS, dtype=wp.int32)
+_Mat43 = wp.types.matrix(shape=(4, 3), dtype=wp.float32)
 _RingNormals = wp.types.matrix(shape=(6, 3), dtype=wp.float32)
 _ArcValues = wp.types.vector(length=TERRAIN_SOLID_ARC_SAMPLES, dtype=wp.float32)
+_Seen = wp.types.vector(length=TERRAIN_SOLID_SEEN, dtype=wp.int32)
+_Sorted = wp.types.vector(length=TERRAIN_SOLID_SORTED, dtype=wp.int32)
+
+TERRAIN_SOLID_COUNTERS = len(TERRAIN_SOLID_JOB_LISTS) + 4
+"""Counters of a solid class's jobs: one per job list, then the candidate pool's, the live pairs', the pairs left to
+rule R and the scan jobs' (zeroed before every launch)."""
 
 
 @wp.struct
 class TerrainSolidData:
-    """What the solid classes' kernels read besides the pair inputs, the terrain and their launch argument (the work
-    list or the full finish's scratch): hull tables, the one-thread kernels' lane choice and rule X's list."""
+    """What the solid classes' kernels read besides the pair inputs, the terrain and their launch arguments (their
+    class's jobs, the full finish's scratch): hull tables and rule X's lists."""
 
     hulls: TerrainHullTable
     """The hulls of the hull class (empty for the other classes)."""
-    thread_vertices: int
-    """Window vertices up to which the one-thread kernels walk a pair; 0: they walk every window."""
     exits: wp.array[wp.int32]
-    """The walked pairs left to their class's exit kernel (rule X; :func:`solid_close`): partner class ``c``'s list
-    starts at the side buffer's ``deferred_first[c]`` (its first pair in the table) and holds ``exit_count[c]`` pairs,
-    appended in any order (a pair's rows depend on it alone)."""
+    """The walked pairs left to their class's exit kernel (rule X; :func:`solid_close_jobs`): partner class ``c``'s
+    list starts at the side buffer's ``deferred_first[c]`` (its first pair in the table) and holds ``exit_count[c]``
+    pairs, appended in any order (a pair's rows depend on it alone)."""
     exit_count: wp.array[wp.int32]
     """Per partner class: the pairs in its exit list (zeroed before every launch)."""
     exit_work: wp.array[wp.int32]
@@ -245,22 +322,23 @@ class TerrainSolidData:
 
 @wp.struct
 class _Sink:
-    """A pair's held rows while its window is walked."""
+    """A pair's held rows while its window is walked, or a job's rows on their way to its class's candidate pool."""
 
     slot: int
-    """First slot of the pair's store."""
+    """First slot of the pair's store; a job's: its pair's index in its class."""
     capacity: int
     """Slots of the store."""
     held: int
     """Distinct rows offered (held while within the capacity)."""
     raw: int
     """Rows offered, coincident ones included."""
-    hits: int
-    """Rows offered while probing (the tiled kernels' marking pass)."""
-    probe: int
-    """1: count rows, hold none."""
     eps: float
     """The window's closed-predicate band [m]."""
+    key: int
+    """A job's place in window order: its item's index (window vertex times six plus its item) times eight; a row's
+    key adds its point slot."""
+    lost: int
+    """1 when the candidate pool had no room for a job's row."""
 
 
 @wp.struct
@@ -286,6 +364,97 @@ class _Pair:
     top: float
     """The window's highest vertex [m, window frame]: a core whose lowest point lies no lower has no rule X
     candidate."""
+
+
+@wp.struct
+class TerrainSolidRecord:
+    """What a solid pair's scan leaves for its job kernels: its window's cells and heightfield and its window-frame
+    quantities (its core, window frame shift included, is in its class's core records)."""
+
+    cells: wp.vec4i
+    """The window's cells ``(r0, r1, c0, c1)``."""
+    heightfield: int
+    """The pair's heightfield index."""
+    pair: _Pair
+    """The pair's window-frame quantities."""
+    low: float
+    """The core's lowest point [m, window frame] (its bounds' in the window frame, as rule X takes them)."""
+
+
+@wp.struct
+class TerrainSolidJobs:
+    """A solid class's jobs: the scan's runs and records, the job lists, the candidate pool and rule X's lists.
+
+    Every list and the pool have fixed capacities (:func:`terrain_solid_jobs`); their counters (``counts``) are zeroed
+    before every launch. Entries are appended in any order, and every row carries its place in window order (its key),
+    so that a pair's rows depend on the pair alone. A pair whose work finds no room is left to its class's full-finish
+    kernel, which walks it again; rule X's items or valleys without room replay their pair's whole rule X.
+    """
+
+    first: int
+    """The class's first table pair: pair ``first + i`` is the class's pair ``i``."""
+    records: wp.array[TerrainSolidRecord]
+    """Per class pair: its scan's record."""
+    box_cores: wp.array[TerrainBoxCore]
+    """Per class pair of the box class: its core, window frame (one unused entry for another class)."""
+    cylinder_cores: wp.array[TerrainCylinderCore]
+    """Per class pair of the cylinder class: its core, window frame (one unused entry for another class)."""
+    hull_cores: wp.array[TerrainHullCoreRecord]
+    """Per class pair of the hull class: its core without its table, window frame (one unused entry for another
+    class)."""
+    faces: wp.array[wp.vec2i]
+    """Rule F's jobs: ``(table pair, item)``, ``item`` its window vertex times six plus the face's triangle (0 or 1),
+    one per cluster plane a scan job meets (:data:`TERRAIN_SOLID_SEEN`) and per triangle alone."""
+    edges: wp.array[wp.vec2i]
+    """Rule E's jobs: ``(table pair, item)``, ``item`` its window vertex times six plus 2, 3 or 4 (x-, y-, diagonal
+    edge)."""
+    thetas: wp.array[wp.vec2i]
+    """Rule E's creases whose normal arcs can hold a row, for ``theta*``: ``(table pair, item)`` as the edges'."""
+    vertices: wp.array[wp.vec2i]
+    """Rule V's jobs: ``(table pair, item)``, ``item`` its window vertex times six plus 5."""
+    xitems: wp.array[wp.vec2i]
+    """Rule X's items: ``(table pair, item)``, ``item`` a window vertex whose valleys or local maxima of the distance
+    can give a candidate, or ``-1 - j`` for the core's point ``j``."""
+    xvalleys: wp.array[wp.vec2i]
+    """Rule X's valleys: ``(table pair, item)``, ``item`` its window vertex times three plus its edge."""
+    live: wp.array[wp.int32]
+    """The class pairs past the whole-pair rejects (class pair indices, in any order): the close's."""
+    scans: wp.array[wp.vec2i]
+    """The scan's jobs: ``(class pair, run)``, run ``k`` the window vertices ``[k, k + 1)`` times
+    :data:`TERRAIN_SOLID_SCAN_VERTICES` of the pair's window (room for every pair's runs at its largest window)."""
+    recover: wp.array[wp.int32]
+    """The closed pairs without a row, left to rule R (class pair indices, in any order)."""
+    counts: wp.array[wp.int32]
+    """Entries asked for per job list (:data:`TERRAIN_SOLID_JOB_LISTS`), then the candidates asked for, the live pairs,
+    the pairs left to rule R and the scan jobs (:data:`TERRAIN_SOLID_COUNTERS`, zeroed before every launch; past a
+    list's capacity, the entries that found no room)."""
+    threads: int
+    """Threads of the job kernels' launches: each strides over its list."""
+    q: wp.array[wp.vec3]
+    """The candidate pool: terrain point of every candidate [m, window frame]."""
+    n: wp.array[wp.vec3]
+    """Unit normal of every candidate."""
+    d: wp.array[float]
+    """Core distance of every candidate [m]."""
+    feature: wp.array[wp.int32]
+    """Feature id of every candidate."""
+    key: wp.array[wp.int32]
+    """Place in window order of every candidate: its item's index times eight plus its point slot."""
+    next: wp.array[wp.int32]
+    """The next candidate of the same pair (-1: none)."""
+    head: wp.array[wp.int32]
+    """Per class pair: its first candidate (-1: none)."""
+    target: wp.array[float]
+    """Per class pair left to rule X: the depth its exit must pass (its deepest row's, plus
+    :data:`TERRAIN_SOLID_EXIT_MARGIN`)."""
+    xhead: wp.array[wp.int32]
+    """Per class pair left to rule X: its first listed candidate in the candidate pool (-1: none). Rule X's jobs list
+    the candidates whose bounds pass the pair's target there: the candidate point in ``q``, its bound in ``d``, its key
+    in ``key``, and for a valley's its valley's first key in ``feature`` (-1 for another's) and the valley's gate
+    (its height over the core's lowest point, its arc's lower normal ``z``) in ``n``."""
+    xall: wp.array[wp.int32]
+    """Per class pair left to rule X: nonzero when some of its rule X work found no room, so that its exit kernel takes
+    every candidate of its window."""
 
 
 @wp.struct
@@ -356,17 +525,33 @@ def _emitter_store(cache: _Emitters, cluster: int, emitter: wp.vec3i) -> _Emitte
 
 @wp.func
 def _offer(store: TerrainLawRows, sink: _Sink, q: wp.vec3, n: wp.vec3, d: float, feature: int) -> _Sink:
-    """Offer a row: count it while probing; else hold it unless it coincides with a held row, as the finish merges
+    """Offer a row: hold it unless it coincides with a held row, as the finish merges
     (:func:`~newton._src.geometry.terrain_law.terrain_hold_row` on the sink's slots of ``store``).
 
     The capacity bounds the distinct rows, not the offers: a crease's interval ends shared by the next crease merge
     before they count (a pair keeps every distinct candidate its slots or its scratch list hold).
     """
-    if sink.probe != 0:
-        sink.hits = sink.hits + 1
-        return sink
     sink.raw = sink.raw + 1
     sink.held = terrain_hold_row(store, sink.slot, sink.held, q, n, d, feature, sink.eps, sink.capacity)
+    return sink
+
+
+@wp.func
+def _offer(store: TerrainSolidJobs, sink: _Sink, q: wp.vec3, n: wp.vec3, d: float, feature: int) -> _Sink:
+    """Offer a job's row: add it to the candidate pool, in its pair's list (``sink.slot``), with its place in window
+    order (``sink.key`` plus its point slot); the close holds them in that order (:func:`solid_close_jobs`). With no
+    room left, the row is lost and ``sink.lost`` set (the close then leaves the pair to the full-finish kernel)."""
+    sink.raw = sink.raw + 1
+    entry = wp.atomic_add(store.counts, _CANDIDATES, 1)
+    if entry >= store.key.shape[0]:
+        sink.lost = 1
+        return sink
+    store.q[entry] = q
+    store.n[entry] = n
+    store.d[entry] = d
+    store.feature[entry] = feature
+    store.key[entry] = sink.key + (feature & 7)
+    store.next[entry] = wp.atomic_exch(store.head, sink.slot, entry)
     return sink
 
 
@@ -381,49 +566,41 @@ def _vertex_z(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int) -
 
 
 @wp.func
-def _solid_face(
+def _face_top(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, sub: int) -> float:
+    """The highest vertex of triangle ``sub`` of cell ``(r, c)`` [m, window frame]: a face whose highest vertex lies
+    below the pair's ``low`` gives no row (rule F's cheapest reject)."""
+    va, vb, vd = terrain_triangle_vertices(r, c, sub)
+    return wp.max(
+        _vertex_z(data, window, va[0], va[1]),
+        wp.max(_vertex_z(data, window, vb[0], vb[1]), _vertex_z(data, window, vd[0], vd[1])),
+    )
+
+
+@wp.func
+def _face_support(
     core: Any,
     data: TerrainFeatureData,
     window: TerrainWindow,
     planes: TerrainPlanes,
-    emitters: _Emitters,
     pair: _Pair,
-    sink: _Sink,
-    store: TerrainLawRows,
     r: int,
     c: int,
     sub: int,
-) -> tuple[TerrainPlanes, _Emitters, _Sink]:
-    """Rule F for triangle ``sub`` of cell ``(r, c)``: emit the cluster plane's supported manifold points when this
-    triangle holds the first one.
+    cluster: int,
+) -> tuple[TerrainPlanes, int, wp.vec3i, int, _Mat43, wp.vec4, wp.vec3]:
+    """Rule F's manifold of the cluster plane of triangle ``sub`` of cell ``(r, c)`` (cluster id ``cluster``):
+    ``(planes, supported, first, count, points, depth, n)``, ``supported`` the bits of the supported manifold points
+    and ``first`` the triangle holding the first of them (``(-1, -1, -1)`` for none, or a plane beyond the reach).
 
-    A cluster's manifold, support tests and emitting triangle are the same for every one of its triangles: the first
-    of them evaluated records the emitter (:class:`_Emitters`), and the others pass by.
-    """
+    A function of the cluster alone: every triangle of a cluster evaluates its plane, manifold and support tests alike,
+    so whichever of them computes it names the same emitting triangle and rows."""
     surface = window.surface
-    cluster = terrain_cluster(data, surface, r, c, sub)
-    cached = bool(False)
-    if cluster >= 0:
-        cached, emitter = _emitter_lookup(emitters, cluster)
-        if cached and (emitter[0] != r or emitter[1] != c or emitter[2] != sub):
-            return planes, emitters, sink
-    va, vb, vd = terrain_triangle_vertices(r, c, sub)
-    top = wp.max(
-        _vertex_z(data, window, va[0], va[1]),
-        wp.max(_vertex_z(data, window, vb[0], vb[1]), _vertex_z(data, window, vd[0], vd[1])),
-    )
-    if top < pair.low:
-        # Never the emitter: a supported point's terrain point lies on the cluster plane over this triangle, at most
-        # TERRAIN_FLAT_EPS above its highest vertex, and within the reach below the core's lowest point.
-        return planes, emitters, sink
+    first = wp.vec3i(-1, -1, -1)
     planes, n, a = terrain_plane(data, window, planes, r, c, sub)
     if core_sigma(core, n, a) > pair.reach:
-        if cluster >= 0 and not cached:
-            emitters = _emitter_store(emitters, cluster, wp.vec3i(-1, -1, -1))
-        return planes, emitters, sink
+        return planes, 0, first, 0, _Mat43(), wp.vec4(0.0), n
     count, points, depth = core_manifold(core, n, a, pair.reach)
     supported = int(0)
-    first = wp.vec3i(-1, -1, -1)
     for j in range(count):
         k = wp.vec3(points[j, 0], points[j, 1], points[j, 2])
         h = depth[j]
@@ -441,16 +618,74 @@ def _solid_face(
         supported = supported | (1 << j)
         if first[0] < 0:
             first = t
-    if cluster >= 0 and not cached:
-        emitters = _emitter_store(emitters, cluster, first)
-    if supported == 0 or first[0] != r or first[1] != c or first[2] != sub:
-        return planes, emitters, sink
+    return planes, supported, first, count, points, depth, n
+
+
+@wp.func
+def _face_offer(
+    store: Any,
+    sink: _Sink,
+    supported: int,
+    count: int,
+    points: _Mat43,
+    depth: wp.vec4,
+    n: wp.vec3,
+    emitter: wp.vec3i,
+) -> _Sink:
+    """Offer rule F's supported manifold points, emitted by triangle ``emitter``."""
     for j in range(count):
         if ((supported >> j) & 1) != 0:
             k = wp.vec3(points[j, 0], points[j, 1], points[j, 2])
             sink = _offer(
-                store, sink, k - depth[j] * n, n, depth[j], terrain_feature_id(r, c, TERRAIN_FEATURE_FACE, sub, j)
+                store,
+                sink,
+                k - depth[j] * n,
+                n,
+                depth[j],
+                terrain_feature_id(emitter[0], emitter[1], TERRAIN_FEATURE_FACE, emitter[2], j),
             )
+    return sink
+
+
+@wp.func
+def _solid_face(
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    emitters: _Emitters,
+    pair: _Pair,
+    sink: _Sink,
+    store: Any,
+    r: int,
+    c: int,
+    sub: int,
+) -> tuple[TerrainPlanes, _Emitters, _Sink]:
+    """Rule F for triangle ``sub`` of cell ``(r, c)``: emit the cluster plane's supported manifold points when this
+    triangle holds the first one.
+
+    A cluster's manifold, support tests and emitting triangle are the same for every one of its triangles: the first
+    of them evaluated records the emitter (:class:`_Emitters`), and the others pass by.
+    """
+    surface = window.surface
+    cluster = terrain_cluster(data, surface, r, c, sub)
+    cached = bool(False)
+    if cluster >= 0:
+        cached, emitter = _emitter_lookup(emitters, cluster)
+        if cached and (emitter[0] != r or emitter[1] != c or emitter[2] != sub):
+            return planes, emitters, sink
+    if _face_top(data, window, r, c, sub) < pair.low:
+        # Never the emitter: a supported point's terrain point lies on the cluster plane over this triangle, at most
+        # TERRAIN_FLAT_EPS above its highest vertex, and within the reach below the core's lowest point.
+        return planes, emitters, sink
+    planes, supported, first, count, points, depth, n = _face_support(
+        core, data, window, planes, pair, r, c, sub, cluster
+    )
+    if cluster >= 0 and not cached:
+        emitters = _emitter_store(emitters, cluster, first)
+    if supported == 0 or first[0] != r or first[1] != c or first[2] != sub:
+        return planes, emitters, sink
+    sink = _face_offer(store, sink, supported, count, points, depth, n, first)
     return planes, emitters, sink
 
 
@@ -543,30 +778,19 @@ def _theta_star(
 
 
 @wp.func
-def _solid_edge(
-    core: Any,
-    data: TerrainFeatureData,
-    window: TerrainWindow,
-    planes: TerrainPlanes,
-    pair: _Pair,
-    sink: _Sink,
-    store: TerrainLawRows,
-    r: int,
-    c: int,
-    which: int,
-) -> tuple[TerrainPlanes, _Sink]:
-    """Rule E for edge ``which`` of vertex ``(r, c)``: a convex crease's rows where the core's flat support feature
-    (interior ``theta*``) or reference feature (arc end) crosses the crease's line."""
+def _edge_cheap(data: TerrainFeatureData, window: TerrainWindow, pair: _Pair, r: int, c: int, which: int) -> bool:
+    """Rule E's cheapest rejects of edge ``which`` of vertex ``(r, c)``, from its vertices and the core's sphere alone:
+    ``False`` for an edge that gives no row (not a crease, below the core, the sphere off the crease's segment)."""
     surface = window.surface
     if terrain_edge_kind(data, surface, r, c, which) >= 0:
         # flat inside one cluster, or on the border: no crease
-        return planes, sink
-    v0i, v1i, ta, tb, _wa, _wb = terrain_edge_sides(r, c, which)
+        return False
+    v0i, v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
     v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
     v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
     top = wp.max(v0[2], v1[2])
     if top < pair.low:
-        return planes, sink
+        return False
     e = v1 - v0
     length2 = wp.dot(e, e)
     length = wp.sqrt(length2)
@@ -576,35 +800,91 @@ def _solid_edge(
     # within its radius of the crease's segment along the crease, and across the line for some normal of the arc.
     along = wp.dot(toward, dh)
     if along < -pair.sphere_r - pair.eps or along > length + pair.sphere_r + pair.eps:
-        return planes, sink
+        return False
     if top <= pair.low + pair.reach:
         # Nowhere above the core's lowest point, the crease holds no row deeper than the reach (whose terrain point
         # lies above the core along its normal), so one out of reach holds none.
         closest = wp.clamp(wp.dot(toward, e) / length2, 0.0, 1.0)
         if wp.length(v0 + closest * e - pair.sphere_c) - pair.sphere_r > pair.reach:
-            return planes, sink
+            return False
+    return True
+
+
+@wp.func
+def _edge_arc(
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    pair: _Pair,
+    r: int,
+    c: int,
+    which: int,
+) -> tuple[TerrainPlanes, bool, wp.vec3, wp.vec3, float, float]:
+    """Rule E's crease tests of edge ``which`` of vertex ``(r, c)`` past :func:`_edge_cheap`: ``(planes, ok, n_a,
+    n_b, sigma_a, sigma_b)``, ``ok`` for a convex crease whose normal arc (``n_a`` to ``n_b``) can hold a row within
+    reach (its ends' support values ``sigma_a`` and ``sigma_b``)."""
+    v0i, v1i, ta, tb, _wa, _wb = terrain_edge_sides(r, c, which)
+    v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
+    v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
+    e = v1 - v0
+    length2 = wp.dot(e, e)
+    length = wp.sqrt(length2)
+    dh = e / length
+    toward = pair.sphere_c - v0
+    no = wp.vec3(0.0)
     planes, na, pa = terrain_plane(data, window, planes, ta[0], ta[1], ta[2])
     if terrain_crease_class(data, window, r, c, which, na, pa) == TERRAIN_EDGE_CONCAVE:
-        return planes, sink
+        return planes, False, no, no, 0.0, 0.0
     planes, nb, _pb = terrain_plane(data, window, planes, tb[0], tb[1], tb[2])
     # the normal arc, exactly perpendicular to the edge
     n_a = wp.normalize(na - wp.dot(na, dh) * dh)
     n_b = wp.normalize(nb - wp.dot(nb, dh) * dh)
     if wp.length(n_b - n_a) < 1.0e-9:
-        return planes, sink
+        return planes, False, no, no, 0.0, 0.0
     # The centre's offset across the line at normal n is dh . (n x (c - v0)), a sinusoid along the arc (less than a
     # half turn): beyond the radius at both ends with one sign, it is beyond it on the whole arc.
     across_a = wp.dot(dh, wp.cross(n_a, toward))
     across_b = wp.dot(dh, wp.cross(n_b, toward))
     if across_a * across_b > 0.0 and wp.min(wp.abs(across_a), wp.abs(across_b)) > pair.sphere_r + pair.eps:
-        return planes, sink
+        return planes, False, no, no, 0.0, 0.0
     # the core lies in its sphere: sigma(n) >= n . (c - v0) - radius (a bound cheaper than sigma)
     if wp.max(wp.dot(n_a, toward), wp.dot(n_b, toward)) - pair.sphere_r > pair.reach:
-        return planes, sink
+        return planes, False, no, no, 0.0, 0.0
     sigma_a = core_sigma(core, n_a, v0)
     sigma_b = core_sigma(core, n_b, v0)
     if wp.max(sigma_a, sigma_b) > pair.reach:
-        return planes, sink
+        return planes, False, no, no, 0.0, 0.0
+    return planes, True, n_a, n_b, sigma_a, sigma_b
+
+
+@wp.func
+def _edge_rows(
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    pair: _Pair,
+    sink: _Sink,
+    store: Any,
+    r: int,
+    c: int,
+    which: int,
+    n_a: wp.vec3,
+    n_b: wp.vec3,
+    sigma_a: float,
+    sigma_b: float,
+) -> tuple[TerrainPlanes, _Sink]:
+    """Rule E's rows of a crease past :func:`_edge_arc` (its normal arc ``n_a`` to ``n_b``, its ends' support values
+    ``sigma_a`` and ``sigma_b``): ``theta*``, the crossing of the core's flat support feature (interior) or reference
+    feature (arc end) with the crease's line, and its ends lifted onto the core."""
+    v0i, v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
+    v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
+    v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
+    e = v1 - v0
+    length2 = wp.dot(e, e)
+    length = wp.sqrt(length2)
+    dh = e / length
     nst, sigma, end = _theta_star(core, n_a, n_b, v0, sigma_a, sigma_b, pair.eps)
     if sigma > pair.reach:
         return planes, sink
@@ -664,34 +944,65 @@ def _solid_edge(
 
 
 @wp.func
-def _solid_vertex(
+def _solid_edge(
     core: Any,
     data: TerrainFeatureData,
     window: TerrainWindow,
     planes: TerrainPlanes,
     pair: _Pair,
     sink: _Sink,
-    store: TerrainLawRows,
+    store: Any,
     r: int,
     c: int,
+    which: int,
 ) -> tuple[TerrainPlanes, _Sink]:
-    """Rule V for vertex ``(r, c)``: a vertex feature whose normal cone holds the direction to the core's nearest
-    point (or its minimum translation) emits a row within reach."""
-    if not terrain_interior_vertex(window.surface, r, c):
+    """Rule E for edge ``which`` of vertex ``(r, c)``: a convex crease's rows where the core's flat support feature
+    (interior ``theta*``) or reference feature (arc end) crosses the crease's line."""
+    if not _edge_cheap(data, window, pair, r, c, which):
         return planes, sink
+    planes, ok, n_a, n_b, sigma_a, sigma_b = _edge_arc(core, data, window, planes, pair, r, c, which)
+    if not ok:
+        return planes, sink
+    return _edge_rows(core, data, window, planes, pair, sink, store, r, c, which, n_a, n_b, sigma_a, sigma_b)
+
+
+@wp.func
+def _vertex_cheap(core: Any, data: TerrainFeatureData, window: TerrainWindow, pair: _Pair, r: int, c: int) -> bool:
+    """Rule V's rejects of vertex ``(r, c)`` before its feature test: ``False`` for a vertex that gives no row (on
+    the border, below the core, out of the reach of its sphere or of its support plane facing the vertex)."""
+    if not terrain_interior_vertex(window.surface, r, c):
+        return False
     v = terrain_window_vertex(data, window, r, c)
     if v[2] < pair.low:
-        return planes, sink
+        return False
     toward = pair.sphere_c - v
     distance = wp.length(toward)
     if distance - pair.sphere_r > pair.reach:
-        return planes, sink
+        return False
     if distance > 0.0 and core_sigma(core, toward / distance, v) > pair.reach:
         # the core's support plane facing the vertex lies beyond the reach, and so does the core
-        return planes, sink
+        return False
+    return True
+
+
+@wp.func
+def _vertex_rows(
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    pair: _Pair,
+    sink: _Sink,
+    store: Any,
+    r: int,
+    c: int,
+) -> tuple[TerrainPlanes, _Sink]:
+    """Rule V's row of a vertex past :func:`_vertex_cheap`: a vertex feature whose normal cone holds the direction to
+    the core's nearest point (or its minimum translation), within reach."""
     planes, feature = _vertex_feature(data, window, planes, r, c)
     if not feature:
         return planes, sink
+    v = terrain_window_vertex(data, window, r, c)
     ok, nst, _k, d = core_nearest(core, v)
     if not ok or d > pair.reach:
         return planes, sink
@@ -699,6 +1010,25 @@ def _solid_vertex(
         return planes, sink
     sink = _offer(store, sink, v, nst, d, terrain_feature_id(r, c, TERRAIN_FEATURE_VERTEX, 0, 0))
     return planes, sink
+
+
+@wp.func
+def _solid_vertex(
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    pair: _Pair,
+    sink: _Sink,
+    store: Any,
+    r: int,
+    c: int,
+) -> tuple[TerrainPlanes, _Sink]:
+    """Rule V for vertex ``(r, c)``: a vertex feature whose normal cone holds the direction to the core's nearest
+    point (or its minimum translation) emits a row within reach."""
+    if not _vertex_cheap(core, data, window, pair, r, c):
+        return planes, sink
+    return _vertex_rows(core, data, window, planes, pair, sink, store, r, c)
 
 
 @wp.func
@@ -1080,18 +1410,46 @@ def _exit_valley(
     point in the wedge can matter (:func:`_exit_open`): within it a point's distance to the edge is at most its height
     under the edge's higher end over the arc's smaller normal ``z`` (``low`` is the core's lowest height).
     """
-    surface = window.surface
-    if terrain_edge_kind(data, surface, r, c, which) >= 0:
+    planes, ok, v0, e, length2, n_a, n_b, top = _valley_arc(data, window, planes, low, r, c, which)
+    if not ok:
         return planes, best
+    if not _exit_open(best, key, top - low, wp.min(n_a[2], n_b[2])):
+        return planes, best
+    samples, values, axis = _valley_samples(core, v0, n_a, n_b)
+    for i in range(9):
+        if not _valley_minimum(values, i):
+            continue
+        nst = _valley_refine(core, samples, values, axis, v0, i)
+        for j in range(core_support_count(core)):
+            x = core_support_point(core, nst, j)
+            if x[2] >= top:
+                # closest to the valley only below its line
+                continue
+            planes, bound = _valley_bound(data, window, planes, x, v0, e, length2)
+            planes, best = _exit_try(data, window, planes, pair, cells, best, x, bound, key + 2 * i + j)
+    return planes, best
+
+
+@wp.func
+def _valley_arc(
+    data: TerrainFeatureData, window: TerrainWindow, planes: TerrainPlanes, low: float, r: int, c: int, which: int
+) -> tuple[TerrainPlanes, bool, wp.vec3, wp.vec3, float, wp.vec3, wp.vec3, float]:
+    """Rule X at edge ``which`` of vertex ``(r, c)``, before its gate: ``(planes, ok, v0, e, length2, n_a, n_b, top)``,
+    ``ok`` for a valley (concave crease) rising above the core's lowest height ``low``, its lower vertex ``v0``, its
+    vector ``e`` (squared length ``length2``), its normal arc ``n_a`` to ``n_b`` and its higher end's height ``top``."""
+    surface = window.surface
+    no = wp.vec3(0.0)
+    if terrain_edge_kind(data, surface, r, c, which) >= 0:
+        return planes, False, no, no, 0.0, no, no, 0.0
     v0i, v1i, ta, tb, _wa, _wb = terrain_edge_sides(r, c, which)
     v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
     v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
     top = wp.max(v0[2], v1[2])
     if top <= low:
-        return planes, best
+        return planes, False, no, no, 0.0, no, no, 0.0
     planes, na, pa = terrain_plane(data, window, planes, ta[0], ta[1], ta[2])
     if terrain_crease_class(data, window, r, c, which, na, pa) != TERRAIN_EDGE_CONCAVE:
-        return planes, best
+        return planes, False, no, no, 0.0, no, no, 0.0
     planes, nb, _pb = terrain_plane(data, window, planes, tb[0], tb[1], tb[2])
     e = v1 - v0
     length2 = wp.dot(e, e)
@@ -1100,38 +1458,124 @@ def _exit_valley(
     n_a = wp.normalize(na - wp.dot(na, dh) * dh)
     n_b = wp.normalize(nb - wp.dot(nb, dh) * dh)
     if wp.length(n_b - n_a) < 1.0e-9:
-        return planes, best
-    if not _exit_open(best, key, top - low, wp.min(n_a[2], n_b[2])):
-        return planes, best
+        return planes, False, no, no, 0.0, no, no, 0.0
+    return planes, True, v0, e, length2, n_a, n_b, top
+
+
+@wp.func
+def _valley_samples(core: Any, v0: wp.vec3, n_a: wp.vec3, n_b: wp.vec3) -> tuple[_ArcNormals, _ArcValues, wp.vec3]:
+    """A valley's nine equally spaced normals, ``sigma`` at each, and the axis its arc turns about."""
     samples = _arc_samples(n_a, n_b)
     values = _ArcValues()
     for i in range(9):
         values[i] = core_sigma(core, _arc_sample(samples, i), v0)
     axis = wp.normalize(wp.cross(n_a, n_b))
-    for i in range(9):
-        if (i > 0 and values[i] >= values[i - 1]) or (i < 8 and values[i] > values[i + 1]):
-            continue
-        lo = _arc_sample(samples, wp.max(i - 1, 0))
-        hi = _arc_sample(samples, wp.min(i + 1, 8))
-        for _step in range(_BISECTION):
-            mid = wp.normalize(lo + hi)
-            if core_slope(core, mid, wp.cross(axis, mid), v0, 1.0) < 0.0:
-                lo = mid
-            else:
-                hi = mid
-        nst = wp.normalize(lo + hi)
-        if core_sigma(core, nst, v0) > values[i]:
-            nst = _arc_sample(samples, i)
-        for j in range(core_support_count(core)):
-            x = core_support_point(core, nst, j)
-            if x[2] >= top:
-                # closest to the valley only below its line
+    return samples, values, axis
+
+
+@wp.func
+def _valley_minimum(values: _ArcValues, i: int) -> bool:
+    """Whether sample ``i`` is no higher than its neighbours (the first of a run of equal ones)."""
+    return not ((i > 0 and values[i] >= values[i - 1]) or (i < 8 and values[i] > values[i + 1]))
+
+
+@wp.func
+def _valley_refine(core: Any, samples: _ArcNormals, values: _ArcValues, axis: wp.vec3, v0: wp.vec3, i: int) -> wp.vec3:
+    """Sample ``i``'s local minimum of ``sigma`` refined between its neighbours by bisection on the sign of the
+    derivative (rule E's 22 steps), the sample kept where the refinement ends higher."""
+    lo = _arc_sample(samples, wp.max(i - 1, 0))
+    hi = _arc_sample(samples, wp.min(i + 1, 8))
+    for _step in range(_BISECTION):
+        mid = wp.normalize(lo + hi)
+        if core_slope(core, mid, wp.cross(axis, mid), v0, 1.0) < 0.0:
+            lo = mid
+        else:
+            hi = mid
+    nst = wp.normalize(lo + hi)
+    if core_sigma(core, nst, v0) > values[i]:
+        nst = _arc_sample(samples, i)
+    return nst
+
+
+@wp.func
+def _valley_bound(
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    x: wp.vec3,
+    v0: wp.vec3,
+    e: wp.vec3,
+    length2: float,
+) -> tuple[TerrainPlanes, float]:
+    """A valley candidate's bound: its exit bound, or its distance to the valley's edge (from ``v0`` along ``e``),
+    the smaller."""
+    planes, bound = _exit_bound(data, window, planes, x)
+    if bound > 0.0:
+        s = wp.clamp(wp.dot(x - v0, e) / length2, 0.0, 1.0)
+        bound = wp.min(bound, wp.length(x - (v0 + s * e)))
+    return planes, bound
+
+
+@wp.func
+def _x_list(
+    jobs: TerrainSolidJobs, i: int, x: wp.vec3, bound: float, key: int, valley: int, gate: float, scale: float
+) -> int:
+    """List a rule X candidate of class pair ``i`` whose bound passes its target (:attr:`TerrainSolidJobs.xhead`):
+    point ``x``, bound ``bound``, key ``key``; for a valley's, its valley's first key ``valley`` and the valley's gate
+    (``gate`` over ``scale``; ``valley`` -1 for another's). 0 when the pool had no room."""
+    entry = wp.atomic_add(jobs.counts, _CANDIDATES, 1)
+    if entry >= jobs.key.shape[0]:
+        return 0
+    jobs.q[entry] = x
+    jobs.d[entry] = bound
+    jobs.n[entry] = wp.vec3(gate, scale, 0.0)
+    jobs.feature[entry] = valley
+    jobs.key[entry] = key
+    jobs.next[entry] = wp.atomic_exch(jobs.xhead, i, entry)
+    return 1
+
+
+@wp.func
+def _exit_listed(
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    pair: _Pair,
+    cells: wp.vec4i,
+    best: _Exit,
+    jobs: TerrainSolidJobs,
+    row: int,
+) -> tuple[TerrainPlanes, _Exit]:
+    """One pass of rule X over class pair ``row``'s listed candidates (:attr:`TerrainSolidJobs.xhead`) in key order,
+    as :func:`_exit_candidates` takes them: a valley's gate (:func:`_exit_open`) at its first listed candidate, which
+    takes or skips the valley's candidates. A candidate left off the list has a bound no higher than the target, and
+    a valley off it a gate closed at the target and at every later threshold: both are no-ops in either pass, and
+    the state at a listed candidate is the full pass's."""
+    last = int(-1)
+    valley = int(-1)
+    passing = bool(True)
+    while True:
+        entry = int(-1)
+        key = int(_INT_MAX)
+        e = jobs.xhead[row]
+        while e >= 0:
+            k = jobs.key[e]
+            if k > last and k < key:
+                key = k
+                entry = e
+            e = jobs.next[e]
+        if entry < 0:
+            break
+        last = key
+        first = jobs.feature[entry]
+        if first >= 0:
+            if first != valley:
+                valley = first
+                gate = jobs.n[entry]
+                passing = _exit_open(best, first, gate[0], gate[1])
+            if not passing:
                 continue
-            planes, bound = _exit_bound(data, window, planes, x)
-            if bound > 0.0:
-                s = wp.clamp(wp.dot(x - v0, e) / length2, 0.0, 1.0)
-                bound = wp.min(bound, wp.length(x - (v0 + s * e)))
-            planes, best = _exit_try(data, window, planes, pair, cells, best, x, bound, key + 2 * i + j)
+        planes, best = _exit_try(data, window, planes, pair, cells, best, jobs.q[entry], jobs.d[entry], key)
     return planes, best
 
 
@@ -1145,11 +1589,17 @@ def _exit_candidates(
     cells: wp.vec4i,
     best: _Exit,
     low: float,
+    jobs: TerrainSolidJobs,
+    row: int,
+    listed: int,
 ) -> tuple[TerrainPlanes, _Exit]:
     """One pass over rule X's candidates in window order (:func:`solid_exits`), each with its key: the core's points
     tried as they are first (keys 0 to their count), then per window vertex (keys from its window index times
     :data:`TERRAIN_SOLID_EXIT_SLOTS`) its valleys' support points (18 keys per edge) and its local maxima of the
-    distance (from key 54)."""
+    distance (from key 54). With ``listed`` nonzero, class pair ``row``'s listed candidates only
+    (:func:`_exit_listed`): the others are no-ops in both passes."""
+    if listed != 0:
+        return _exit_listed(data, window, planes, pair, cells, best, jobs, row)
     r0 = cells[0]
     r1 = cells[1]
     c0 = cells[2]
@@ -1201,10 +1651,16 @@ def solid_exits(
     store: TerrainLawRows,
     cells: wp.vec4i,
     work: wp.array[wp.int32],
+    jobs: TerrainSolidJobs,
+    row: int,
+    listed: int,
 ) -> tuple[TerrainPlanes, _Sink]:
     """Rule X: the exit of the deepest of the core's candidate boundary points, offered when it lies deeper than every
     row the pair holds by more than :data:`TERRAIN_SOLID_EXIT_MARGIN` (point slot :data:`TERRAIN_SOLID_EXIT_SLOT`);
-    its exit searches and the window vertices they covered are added to ``work``.
+    its exit searches and the window vertices they covered are added to ``work``. With ``listed`` nonzero, the passes
+    take class pair ``row``'s listed candidates (rule X's items and valleys, :func:`solid_xitem_job`), those whose
+    bounds pass the target: any other is a no-op in both passes, so the rows are those of the passes over every
+    candidate (a listed pair's core reaches below its window's highest vertex: the gate below holds).
 
     A deepest boundary point whose closest surface point is unique is a local maximum of its distance to that one
     feature: a support point of rule F's plane manifold for a face, an extreme point of the core for a valley edge or
@@ -1221,10 +1677,12 @@ def solid_exits(
     its cost depends on the candidate's depth, not the window's size. A pair whose core lies wholly above its window's
     highest vertex has no candidate (``pair.top``).
     """
-    lo, _hi = core_bounds(core)
-    low = lo[2]
-    if low >= pair.top:
-        return planes, sink
+    low = float(0.0)
+    if listed == 0:
+        lo, _hi = core_bounds(core)
+        low = lo[2]
+        if low >= pair.top:
+            return planes, sink
     deepest = float(0.0)
     for h in range(wp.min(sink.held, sink.capacity)):
         deepest = wp.max(deepest, -store.d[sink.slot + h])
@@ -1247,7 +1705,7 @@ def solid_exits(
             if not (beat or tie):
                 break
             best.walk = 1
-        planes, best = _exit_candidates(core, data, window, planes, pair, cells, best, low)
+        planes, best = _exit_candidates(core, data, window, planes, pair, cells, best, low, jobs, row, listed)
     if best.searches > 0:
         wp.atomic_add(work, 0, best.searches)
         wp.atomic_add(work, 1, best.cells)
@@ -1307,18 +1765,14 @@ def _window_extent_top(
 
 
 @wp.func
-def solid_pair_window(core: Any, data: TerrainFeatureData, heightfield: int, reach: float):
-    """The pair's window: ``(state, cells, window, core, pair)`` with the core moved into the window frame.
-
-    ``state`` is nonzero when the window misses the heightfield or the tile-max exit applies.
-    """
+def solid_pair_cells(core: Any, data: TerrainFeatureData, heightfield: int, reach: float):
+    """The pair's window cells and its whole-window rejects: ``(state, cells, lo, hi)``, the core's bounds
+    (heightfield frame) and ``state`` nonzero when the window misses the heightfield or the tile-max exit applies."""
     surface = data.surfaces[heightfield]
     lo, hi = core_bounds(core)
     cells = terrain_box_cells(surface, lo[0] - reach, lo[1] - reach, hi[0] + reach, hi[1] + reach)
-    window = TerrainWindow()
-    pair = _Pair()
     if cells[1] < cells[0] or cells[3] < cells[2]:
-        return TERRAIN_PAIR_OUTSIDE, cells, window, core, pair
+        return TERRAIN_PAIR_OUTSIDE, cells, lo, hi
     # The lowest point minus the reach, lowered by its own float32 rounding and by the cluster tolerance (a face row's
     # terrain point lies on its cluster plane, up to TERRAIN_FLAT_EPS above its triangle's highest vertex): the exit
     # drops no row but one whose terrain point rounding carries off its triangle on a steep face, and then only within
@@ -1326,7 +1780,17 @@ def solid_pair_window(core: Any, data: TerrainFeatureData, heightfield: int, rea
     low = lo[2] - reach
     low = low - 4.0 * _EPS32 * (wp.abs(lo[2]) + reach) - _FLAT
     if terrain_tile_exit(data, surface, cells[0], cells[1], cells[2], cells[3], low):
-        return TERRAIN_PAIR_TILE_EXIT, cells, window, core, pair
+        return TERRAIN_PAIR_TILE_EXIT, cells, lo, hi
+    return 0, cells, lo, hi
+
+
+@wp.func
+def solid_pair_frame(
+    core: Any, data: TerrainFeatureData, heightfield: int, cells: wp.vec4i, lo: wp.vec3, hi: wp.vec3, reach: float
+):
+    """A pair's window frame past its rejects (:func:`solid_pair_cells`, its cells and the core's bounds ``lo`` and
+    ``hi``): ``(window, core, pair)`` with the core moved into the window frame."""
+    pair = _Pair()
     window = terrain_window(data, heightfield, cells[0], cells[2])
     centre = core.c
     core.c = terrain_window_point(window, centre)
@@ -1351,6 +1815,19 @@ def solid_pair_window(core: Any, data: TerrainFeatureData, heightfield: int, rea
     sphere_c, sphere_r = core_sphere(core)
     pair.sphere_c = sphere_c
     pair.sphere_r = sphere_r
+    return window, core, pair
+
+
+@wp.func
+def solid_pair_window(core: Any, data: TerrainFeatureData, heightfield: int, reach: float):
+    """The pair's window: ``(state, cells, window, core, pair)`` with the core moved into the window frame.
+
+    ``state`` is nonzero when the window misses the heightfield or the tile-max exit applies.
+    """
+    state, cells, lo, hi = solid_pair_cells(core, data, heightfield, reach)
+    if state != 0:
+        return state, cells, TerrainWindow(), core, _Pair()
+    window, core, pair = solid_pair_frame(core, data, heightfield, cells, lo, hi, reach)
     return 0, cells, window, core, pair
 
 
@@ -1362,12 +1839,11 @@ def _wide(cells: wp.vec4i) -> int:
 
 
 @wp.func
-def solid_sink(slot: int, capacity: int, eps: float, probe: int) -> _Sink:
+def solid_sink(slot: int, capacity: int, eps: float) -> _Sink:
     sink = _Sink()
     sink.slot = slot
     sink.capacity = capacity
     sink.eps = eps
-    sink.probe = probe
     return sink
 
 
@@ -1394,7 +1870,8 @@ def solid_walk(
     store: TerrainLawRows,
     cells: wp.vec4i,
 ) -> tuple[TerrainPlanes, _Sink]:
-    """Walk the window's features in window order (vertex by vertex, its items in order)."""
+    """Walk the window's features in window order (vertex by vertex, its items in order): the full finish's walk of a
+    deferred pair, in one thread."""
     r1 = cells[1]
     c1 = cells[3]
     emitters = _emitters()
@@ -1436,74 +1913,6 @@ def solid_finish(
 
 
 @wp.func
-def _exit_gate(core: Any, pair: _Pair) -> bool:
-    """Whether rule X can give a pair a row: its core's lowest point lies below its window's highest vertex."""
-    lo, _hi = core_bounds(core)
-    return lo[2] < pair.top
-
-
-@wp.func
-def solid_close(
-    core: Any,
-    data: TerrainFeatureData,
-    window: TerrainWindow,
-    planes: TerrainPlanes,
-    pair: _Pair,
-    sink: _Sink,
-    out: TerrainLawRows,
-    solids: TerrainSolidData,
-    pair_index: int,
-    partner_class: int,
-    frame: wp.transform,
-    cells: wp.vec4i,
-):
-    """Close a walked pair in its walk slots (``sink.slot``): defer it when its distinct rows overflow them, else add
-    the recovery rows when it has none; a pair whose core reaches below its window's highest vertex is left, its rows
-    held (count in ``out.count``, state :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_EXIT`), to its class's
-    exit kernel (rule X, :func:`solid_rows_exit`), any other finished here (:func:`solid_finish`). Rule X's work thus
-    stays off the walks: their warps, registers and stacks."""
-    if sink.held > sink.capacity:
-        terrain_defer_pair(out, partner_class, pair_index, _wide(cells))
-        return
-    if sink.raw == 0:
-        planes, sink = solid_recovery(core, data, window, planes, sink, out)
-    if _exit_gate(core, pair):
-        out.first[pair_index] = sink.slot
-        out.count[pair_index] = sink.held
-        out.state[pair_index] = _wide(cells) | TERRAIN_PAIR_EXIT
-        entry = wp.atomic_add(solids.exit_count, partner_class, 1)
-        solids.exits[out.deferred_first[partner_class] + entry] = pair_index
-        return
-    solid_finish(window, pair, sink, out, pair_index, partner_class, frame, cells)
-
-
-@wp.func
-def solid_rows_exit(
-    core: Any,
-    data: TerrainFeatureData,
-    out: TerrainLawRows,
-    solids: TerrainSolidData,
-    pair_index: int,
-    slot: int,
-    walk_slots: int,
-    partner_class: int,
-    frame: wp.transform,
-    heightfield: int,
-    reach: float,
-):
-    """Rule X for a pair its walk left to the class's exit kernel, its rows held in its walk slots from ``slot``
-    (``out.count`` of them): its window again (the walk's, bit for bit), the deepest exit (:func:`solid_exits`), then
-    the finish (:func:`solid_finish`), which gives the pair the rows a walk that ran rule X itself would."""
-    _state, cells, window, core, pair = solid_pair_window(core, data, heightfield, reach)
-    planes = terrain_planes()
-    sink = solid_sink(slot, walk_slots, pair.eps, 0)
-    sink.held = out.count[pair_index]
-    sink.raw = sink.held
-    planes, sink = solid_exits(core, data, window, planes, pair, sink, out, cells, solids.exit_work)
-    solid_finish(window, pair, sink, out, pair_index, partner_class, frame, cells)
-
-
-@wp.func
 def solid_close_full(
     core: Any,
     data: TerrainFeatureData,
@@ -1514,6 +1923,7 @@ def solid_close_full(
     scratch: TerrainFinishScratch,
     out: TerrainLawRows,
     work: wp.array[wp.int32],
+    jobs: TerrainSolidJobs,
     pair_index: int,
     slot: int,
     walk_slots: int,
@@ -1521,17 +1931,17 @@ def solid_close_full(
     cells: wp.vec4i,
 ):
     """Finish a deferred pair walked into a full-finish block's scratch (``sink.slot``): add the recovery rows when it
-    has none and rule X's exit (its searches counted in ``work``), run the finish on every distinct candidate and write
-    the kept rows (world frame) to its walk slots from ``slot`` when they fit, else to rows of the spill region, or,
-    when that has no room left, the first of them by priority to its walk slots (flagged
-    :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_ROW_OVERFLOW`).
+    has none and rule X's exit over every candidate (its searches counted in ``work``; ``jobs`` unread), run the
+    finish on every distinct candidate and write the kept rows (world frame) to its walk slots from ``slot`` when they
+    fit, else to rows of the spill region, or, when that has no room left, the first of them by priority to its walk
+    slots (flagged :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_ROW_OVERFLOW`).
 
     The scratch holds every candidate a window of the class can give; a pair with more has a window its shape data no
     longer bounds (changed since construction): it keeps the first in window order and is flagged."""
     store = solid_scratch_store(scratch)
     if sink.raw == 0:
         planes, sink = solid_recovery(core, data, window, planes, sink, store)
-    planes, sink = solid_exits(core, data, window, planes, pair, sink, store, cells, work)
+    planes, sink = solid_exits(core, data, window, planes, pair, sink, store, cells, work, jobs, 0, 0)
     flags = int(0)
     if sink.held > sink.capacity:
         sink.held = sink.capacity
@@ -1564,44 +1974,13 @@ def solid_close_full(
 
 
 @wp.func
-def solid_rows_thread(
-    core: Any,
-    data: TerrainFeatureData,
-    out: TerrainLawRows,
-    work: TerrainPairWork,
-    solids: TerrainSolidData,
-    pair_index: int,
-    slot: int,
-    walk_slots: int,
-    partner_class: int,
-    frame: wp.transform,
-    heightfield: int,
-    reach: float,
-):
-    """One thread's walk of a pair whose core is built (heightfield frame) in its walk slots from ``slot``: window,
-    walk, close; a pair from ``work.first`` on (the tiled segment) whose window holds more than
-    ``solids.thread_vertices`` vertices is queued in ``work`` for the class's tiled kernel instead."""
-    state, cells, window, core, pair = solid_pair_window(core, data, heightfield, reach)
-    if state != 0:
-        terrain_pair_exit(out, pair_index, state)
-        return
-    if solids.thread_vertices > 0 and pair_index >= work.first:
-        if (cells[1] - cells[0] + 2) * (cells[3] - cells[2] + 2) > solids.thread_vertices:
-            work.pairs[wp.atomic_add(work.count, 0, 1)] = pair_index
-            return
-    planes = terrain_planes()
-    sink = solid_sink(slot, walk_slots, pair.eps, 0)
-    planes, sink = solid_walk(core, data, window, planes, pair, sink, out, cells)
-    solid_close(core, data, window, planes, pair, sink, out, solids, pair_index, partner_class, frame, cells)
-
-
-@wp.func
 def solid_rows_full(
     core: Any,
     data: TerrainFeatureData,
     out: TerrainLawRows,
     scratch: TerrainFinishScratch,
     solids: TerrainSolidData,
+    jobs: TerrainSolidJobs,
     block: int,
     pair_index: int,
     slot: int,
@@ -1614,7 +1993,7 @@ def solid_rows_full(
     its walk slots from ``slot``)."""
     _state, cells, window, core, pair = solid_pair_window(core, data, heightfield, reach)
     planes = terrain_planes()
-    sink = solid_sink(block * scratch.capacity, scratch.capacity, pair.eps, 0)
+    sink = solid_sink(block * scratch.capacity, scratch.capacity, pair.eps)
     planes, sink = solid_walk(core, data, window, planes, pair, sink, solid_scratch_store(scratch), cells)
     solid_close_full(
         core,
@@ -1626,6 +2005,7 @@ def solid_rows_full(
         scratch,
         out,
         solids.exit_work,
+        jobs,
         pair_index,
         slot,
         walk_slots,
@@ -1634,95 +2014,541 @@ def solid_rows_full(
     )
 
 
+# ----------------------------------------------------------------------------------------------------------------
+# the job pipeline: a scan per pair, a thread per listed feature, a close per pair, rule X's items and valleys
+# ----------------------------------------------------------------------------------------------------------------
+
+
 @wp.func
-def solid_mark(
+def _job_vertex(cells: wp.vec4i, vertex: int) -> wp.vec2i:
+    """Window vertex ``vertex`` (window order: row by row from ``(r0, c0)``) of a window of cells ``cells``, as
+    ``(r, c)``."""
+    width = cells[3] + 2 - cells[2]
+    row = vertex // width
+    return wp.vec2i(cells[0] + row, cells[2] + vertex - row * width)
+
+
+@wp.func
+def _job_append(jobs: TerrainSolidJobs, kind: int, entries: wp.array[wp.vec2i], job: wp.vec2i) -> int:
+    """Append a job to a list (kind ``kind`` of :data:`TERRAIN_SOLID_JOB_LISTS`): 0 when it found no room."""
+    entry = wp.atomic_add(jobs.counts, kind, 1)
+    if entry < entries.shape[0]:
+        entries[entry] = job
+        return 1
+    return 0
+
+
+@wp.func
+def solid_scan(
     core: Any,
     data: TerrainFeatureData,
     window: TerrainWindow,
     pair: _Pair,
     cells: wp.vec4i,
-    lane: int,
-    lanes: int,
-) -> _Mask:
-    """The tiled kernels' marking pass: this lane's productive window vertices (windows of up to 256 vertices)."""
-    planes = terrain_planes()
-    emitters = _emitters()
-    store = TerrainLawRows()
-    marked = _Mask()
+    heightfield: int,
+    out: TerrainLawRows,
+    jobs: TerrainSolidJobs,
+    pair_index: int,
+    i: int,
+    run: int,
+):
+    """Run ``run`` of a live pair's scan (class pair ``i``; the window vertices ``[run, run + 1)`` times
+    :data:`TERRAIN_SOLID_SCAN_VERTICES` in window order): the first run keeps the pair's core and record; each passes
+    its vertices' features in window order through the cheapest rejects of their rules and appends every survivor to
+    its job list: rule F's faces (:func:`_face_top`; of a cluster of several triangles, the first that passes, its
+    cluster's manifold and emitting triangle being its cluster's alone), rule E's edges (:func:`_edge_cheap`) and rule
+    V's vertices (:func:`_vertex_cheap`). A job without room flags the pair
+    :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_INCOMPLETE` (its close then defers it)."""
+    if run == 0:
+        record = TerrainSolidRecord()
+        record.cells = cells
+        record.heightfield = heightfield
+        record.pair = pair
+        lo, _hi = core_bounds(core)
+        record.low = lo[2]
+        jobs.records[i] = record
+    surface = window.surface
     r0 = cells[0]
+    r1 = cells[1]
     c0 = cells[2]
-    width = cells[3] - c0 + 2
-    vertices = (cells[1] - r0 + 2) * width
-    for v in range(lane, vertices, lanes):
-        sink = solid_sink(0, 0, pair.eps, 1)
-        for item in range(_ITEMS):
-            planes, emitters, sink = solid_item(
-                core,
-                data,
-                window,
-                planes,
-                emitters,
-                pair,
-                sink,
-                store,
-                r0 + v // width,
-                c0 + v % width,
-                cells[1],
-                cells[3],
-                item,
-            )
-        if sink.hits > 0:
-            marked[v // 32] = marked[v // 32] | (1 << (v % 32))
-    return marked
+    c1 = cells[3]
+    width = c1 + 2 - c0
+    first = run * _SCAN_VERTICES
+    last = wp.min(first + _SCAN_VERTICES, (r1 + 2 - r0) * width)
+    kept = int(1)
+    seen = _Seen()
+    for k in range(_SEEN):
+        seen[k] = -1
+    oldest = int(0)
+    for vertex in range(first, last):
+        row = vertex // width
+        r = r0 + row
+        c = c0 + vertex - row * width
+        item = vertex * _ITEMS
+        inside = r <= r1 and c <= c1
+        if inside:
+            for sub in range(2):
+                cluster = terrain_cluster(data, surface, r, c, sub)
+                known = bool(False)
+                if cluster >= 0:
+                    for k in range(_SEEN):
+                        if seen[k] == cluster:
+                            known = True
+                if known:
+                    continue
+                if _face_top(data, window, r, c, sub) < pair.low:
+                    continue
+                if cluster >= 0:
+                    seen[oldest] = cluster
+                    oldest = (oldest + 1) % _SEEN
+                kept = kept & _job_append(jobs, _FACES, jobs.faces, wp.vec2i(pair_index, item + sub))
+        for which in range(3):
+            if (which == 0 and c > c1) or (which == 1 and r > r1) or (which == 2 and not inside):
+                continue
+            if _edge_cheap(data, window, pair, r, c, which):
+                kept = kept & _job_append(jobs, _EDGES, jobs.edges, wp.vec2i(pair_index, item + 2 + which))
+        if _vertex_cheap(core, data, window, pair, r, c):
+            kept = kept & _job_append(jobs, _VERTICES, jobs.vertices, wp.vec2i(pair_index, item + 5))
+    if kept == 0:
+        wp.atomic_or(out.state, pair_index, TERRAIN_PAIR_INCOMPLETE)
 
 
 @wp.func
-def solid_replay(
+def solid_job_window(
+    data: TerrainFeatureData, jobs: TerrainSolidJobs, i: int
+) -> tuple[TerrainSolidRecord, TerrainWindow]:
+    """Class pair ``i``'s scan record and window frame (the scan's, bit for bit)."""
+    record = jobs.records[i]
+    return record, terrain_window(data, record.heightfield, record.cells[0], record.cells[2])
+
+
+@wp.func
+def _job_sink(i: int, item: int, eps: float) -> _Sink:
+    """The sink of a job of class pair ``i`` on item ``item`` (its window vertex times six plus its item)."""
+    sink = _Sink()
+    sink.slot = i
+    sink.key = item * _KEY_SLOTS
+    sink.eps = eps
+    return sink
+
+
+@wp.func
+def _job_lost(out: TerrainLawRows, pair_index: int, lost: int):
+    """A job that lost a row (no room in the candidate pool, or for a crease in the list of creases): its pair goes to
+    the full-finish kernel (:data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_INCOMPLETE`)."""
+    if lost != 0:
+        wp.atomic_or(out.state, pair_index, TERRAIN_PAIR_INCOMPLETE)
+
+
+@wp.func
+def solid_face_job(
+    core: Any, data: TerrainFeatureData, out: TerrainLawRows, jobs: TerrainSolidJobs, pair_index: int, i: int, item: int
+):
+    """Rule F for the cluster of a listed face: its manifold, support tests and emitting triangle
+    (:func:`_face_support`), and its rows, at the emitting triangle's place in window order, when the walk would emit
+    them there: the triangle lies in the window and its highest vertex is not below the pair's ``low``."""
+    record, window = solid_job_window(data, jobs, i)
+    cells = record.cells
+    pair = record.pair
+    vertex = item // _ITEMS
+    sub = item - vertex * _ITEMS
+    rc = _job_vertex(cells, vertex)
+    cluster = terrain_cluster(data, window.surface, rc[0], rc[1], sub)
+    planes = terrain_planes()
+    planes, supported, first, count, points, depth, n = _face_support(
+        core, data, window, planes, pair, rc[0], rc[1], sub, cluster
+    )
+    if supported == 0:
+        return
+    if first[0] < cells[0] or first[0] > cells[1] or first[1] < cells[2] or first[1] > cells[3]:
+        return
+    if _face_top(data, window, first[0], first[1], first[2]) < pair.low:
+        return
+    width = cells[3] + 2 - cells[2]
+    sink = _job_sink(i, ((first[0] - cells[0]) * width + first[1] - cells[2]) * _ITEMS + first[2], pair.eps)
+    sink = _face_offer(jobs, sink, supported, count, points, depth, n, first)
+    _job_lost(out, pair_index, sink.lost)
+
+
+@wp.func
+def solid_edge_job(
+    core: Any, data: TerrainFeatureData, out: TerrainLawRows, jobs: TerrainSolidJobs, pair_index: int, i: int, item: int
+):
+    """Rule E's crease tests of a listed edge (:func:`_edge_arc`); a convex crease whose arc can hold a row within
+    reach is listed for ``theta*`` (:func:`solid_theta_job`)."""
+    record, window = solid_job_window(data, jobs, i)
+    vertex = item // _ITEMS
+    rc = _job_vertex(record.cells, vertex)
+    planes = terrain_planes()
+    planes, ok, _n_a, _n_b, _sigma_a, _sigma_b = _edge_arc(
+        core, data, window, planes, record.pair, rc[0], rc[1], item - vertex * _ITEMS - 2
+    )
+    if not ok:
+        return
+    entry = wp.atomic_add(jobs.counts, _THETAS, 1)
+    if entry < jobs.thetas.shape[0]:
+        jobs.thetas[entry] = wp.vec2i(pair_index, item)
+    else:
+        _job_lost(out, pair_index, 1)
+
+
+@wp.func
+def solid_theta_job(
+    core: Any, data: TerrainFeatureData, out: TerrainLawRows, jobs: TerrainSolidJobs, pair_index: int, i: int, item: int
+):
+    """Rule E's rows of a crease whose arc can hold a row: its arc again (:func:`_edge_arc`, the edge job's, bit for
+    bit), ``theta*``, the crossing and its ends (:func:`_edge_rows`)."""
+    record, window = solid_job_window(data, jobs, i)
+    pair = record.pair
+    vertex = item // _ITEMS
+    which = item - vertex * _ITEMS - 2
+    rc = _job_vertex(record.cells, vertex)
+    planes = terrain_planes()
+    planes, _ok, n_a, n_b, sigma_a, sigma_b = _edge_arc(core, data, window, planes, pair, rc[0], rc[1], which)
+    sink = _job_sink(i, item, pair.eps)
+    planes, sink = _edge_rows(
+        core, data, window, planes, pair, sink, jobs, rc[0], rc[1], which, n_a, n_b, sigma_a, sigma_b
+    )
+    _job_lost(out, pair_index, sink.lost)
+
+
+@wp.func
+def solid_vertex_job(
+    core: Any, data: TerrainFeatureData, out: TerrainLawRows, jobs: TerrainSolidJobs, pair_index: int, i: int, item: int
+):
+    """Rule V's row of a listed vertex (:func:`_vertex_rows`)."""
+    record, window = solid_job_window(data, jobs, i)
+    pair = record.pair
+    rc = _job_vertex(record.cells, item // _ITEMS)
+    planes = terrain_planes()
+    sink = _job_sink(i, item, pair.eps)
+    planes, sink = _vertex_rows(core, data, window, planes, pair, sink, jobs, rc[0], rc[1])
+    _job_lost(out, pair_index, sink.lost)
+
+
+@wp.func
+def _hold_candidate(
+    out: TerrainLawRows, jobs: TerrainSolidJobs, entry: int, slot: int, held: int, eps: float, limit: int
+) -> int:
+    return terrain_hold_row(
+        out, slot, held, jobs.q[entry], jobs.n[entry], jobs.d[entry], jobs.feature[entry], eps, limit
+    )
+
+
+@wp.func
+def _hold_candidates(
+    out: TerrainLawRows, jobs: TerrainSolidJobs, i: int, slot: int, limit: int, eps: float
+) -> tuple[int, int]:
+    """Hold class pair ``i``'s candidates in its walk slots from ``slot`` in window order (by key), as the walk offers
+    them (:func:`~newton._src.geometry.terrain_law.terrain_hold_row`, at most ``limit``): ``(held, raw)``, its
+    distinct rows and its offers. Candidates of one key (a cluster listed twice) are one offer; the list's order (its
+    jobs') never matters. Up to :data:`TERRAIN_SOLID_SORTED` candidates are sorted in registers, more taken by
+    repeated selection."""
+    keys = _Sorted()
+    entries = _Sorted()
+    count = int(0)
+    entry = jobs.head[i]
+    while entry >= 0:
+        if count < _SORTED:
+            key = jobs.key[entry]
+            j = count
+            while j > 0 and keys[j - 1] > key:
+                keys[j] = keys[j - 1]
+                entries[j] = entries[j - 1]
+                j -= 1
+            keys[j] = key
+            entries[j] = entry
+        count += 1
+        entry = jobs.next[entry]
+    held = int(0)
+    raw = int(0)
+    last = int(-1)
+    if count <= _SORTED:
+        for j in range(count):
+            if keys[j] == last:
+                continue
+            last = keys[j]
+            raw += 1
+            held = _hold_candidate(out, jobs, entries[j], slot, held, eps, limit)
+        return held, raw
+    while True:
+        best = int(-1)
+        best_key = int(_INT_MAX)
+        entry = jobs.head[i]
+        while entry >= 0:
+            key = jobs.key[entry]
+            if key > last and key < best_key:
+                best_key = key
+                best = entry
+            entry = jobs.next[entry]
+        if best < 0:
+            break
+        last = best_key
+        raw += 1
+        held = _hold_candidate(out, jobs, best, slot, held, eps, limit)
+    return held, raw
+
+
+@wp.func
+def _xjobs_open(
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    record: TerrainSolidRecord,
+    out: TerrainLawRows,
+    jobs: TerrainSolidJobs,
+    sink: _Sink,
+    pair_index: int,
+    i: int,
+):
+    """Open rule X for class pair ``i`` (left to its class's exit kernel, its rows held): its target (its deepest
+    row's depth plus :data:`TERRAIN_SOLID_EXIT_MARGIN`, as :func:`solid_exits` takes it), its candidate list cleared,
+    and its items listed for :func:`solid_xitem_job`: every core point, and every window vertex that can give a
+    candidate (when its core takes candidates at window vertices: a valley needs an edge rising above the core's
+    lowest point, a local maximum of the distance a vertex above it). Items without room take every candidate."""
+    deepest = float(0.0)
+    for h in range(wp.min(sink.held, sink.capacity)):
+        deepest = wp.max(deepest, -out.d[sink.slot + h])
+    jobs.target[i] = deepest + _EXIT_MARGIN
+    jobs.xhead[i] = -1
+    jobs.xall[i] = 0
+    cells = record.cells
+    kept = int(1)
+    for j in range(core_exit_count(core)):
+        kept = kept & _job_append(jobs, _XITEMS, jobs.xitems, wp.vec2i(pair_index, -1 - j))
+    vertices = int(0)
+    if core_support_count(core) > 0 or core_far_count(core) > 0:
+        vertices = (cells[1] - cells[0] + 2) * (cells[3] + 2 - cells[2])
+    low = record.low
+    for v in range(vertices):
+        rc = _job_vertex(cells, v)
+        r = rc[0]
+        c = rc[1]
+        above = _vertex_z(data, window, r, c) > low
+        if c <= cells[3]:
+            above = above or _vertex_z(data, window, r, c + 1) > low
+        if r <= cells[1]:
+            above = above or _vertex_z(data, window, r + 1, c) > low
+        if r <= cells[1] and c <= cells[3]:
+            above = above or _vertex_z(data, window, r + 1, c + 1) > low
+        if above:
+            kept = kept & _job_append(jobs, _XITEMS, jobs.xitems, wp.vec2i(pair_index, v))
+    if kept == 0:
+        jobs.xall[i] = 1
+
+
+@wp.func
+def _solid_settle(
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    record: TerrainSolidRecord,
+    sink: _Sink,
+    out: TerrainLawRows,
+    jobs: TerrainSolidJobs,
+    solids: TerrainSolidData,
+    pair_index: int,
+    i: int,
+    partner_class: int,
+    frame: wp.transform,
+):
+    """A closed pair with its rows held (rule R's included): left to rule X (count in ``out.count``, state
+    :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_EXIT`, its items listed, :func:`_xjobs_open`) when its core
+    reaches below its window's highest vertex, else finished (:func:`solid_finish`)."""
+    cells = record.cells
+    pair = record.pair
+    # Rule X can give a row only to a core whose lowest point lies below its window's highest vertex.
+    if record.low < pair.top:
+        out.first[pair_index] = sink.slot
+        out.count[pair_index] = sink.held
+        out.state[pair_index] = _wide(cells) | TERRAIN_PAIR_EXIT
+        entry = wp.atomic_add(solids.exit_count, partner_class, 1)
+        solids.exits[out.deferred_first[partner_class] + entry] = pair_index
+        _xjobs_open(core, data, window, record, out, jobs, sink, pair_index, i)
+        return
+    solid_finish(window, pair, sink, out, pair_index, partner_class, frame, cells)
+
+
+@wp.func
+def solid_close_jobs(
     core: Any,
     data: TerrainFeatureData,
     out: TerrainLawRows,
-    window: TerrainWindow,
-    pair: _Pair,
-    cells: wp.vec4i,
-    marked: _Mask,
-    words: int,
+    jobs: TerrainSolidJobs,
     solids: TerrainSolidData,
     pair_index: int,
+    i: int,
     slot: int,
     walk_slots: int,
     partner_class: int,
     frame: wp.transform,
 ):
-    """The tiled kernels' first lane: the marked vertices' items in window order (every vertex when the window is too
-    large to mark) in the pair's walk slots from ``slot``, then the pair's close: the rows (or the deferral, or the
-    exit list) the one-thread walk gives the pair."""
+    """Close a scanned pair (class pair ``i``, its walk slots from ``slot``): its candidates held in window order
+    (:func:`_hold_candidates`), which gives it the walk's held rows. A pair that lost work, or holds more distinct rows
+    than its slots, is left to the class's full-finish kernel; a pair without a row to rule R
+    (:func:`solid_recover_pair`, its list); any other is settled (:func:`_solid_settle`)."""
+    state = out.state[pair_index]
+    if (state & TERRAIN_PAIR_INCOMPLETE) != 0:
+        # its record may be missing (a window past its bound lists no first run)
+        terrain_defer_pair(out, partner_class, pair_index, state & TERRAIN_PAIR_WIDE)
+        return
+    record, window = solid_job_window(data, jobs, i)
+    cells = record.cells
+    pair = record.pair
+    held, raw = _hold_candidates(out, jobs, i, slot, walk_slots, pair.eps)
+    sink = solid_sink(slot, walk_slots, pair.eps)
+    sink.held = held
+    sink.raw = raw
+    if sink.held > sink.capacity:
+        terrain_defer_pair(out, partner_class, pair_index, _wide(cells))
+        return
+    if sink.raw == 0:
+        # the recovery list holds every pair of the class at most
+        jobs.recover[wp.atomic_add(jobs.counts, _RECOVER, 1)] = i
+        return
+    _solid_settle(core, data, window, record, sink, out, jobs, solids, pair_index, i, partner_class, frame)
+
+
+@wp.func
+def solid_recover_pair(
+    core: Any,
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+    jobs: TerrainSolidJobs,
+    solids: TerrainSolidData,
+    pair_index: int,
+    i: int,
+    slot: int,
+    walk_slots: int,
+    partner_class: int,
+    frame: wp.transform,
+):
+    """Rule R for a closed pair without a row (class pair ``i``, its walk slots from ``slot``), then its settling
+    (:func:`_solid_settle`)."""
+    record, window = solid_job_window(data, jobs, i)
+    sink = solid_sink(slot, walk_slots, record.pair.eps)
     planes = terrain_planes()
-    emitters = _emitters()
-    sink = solid_sink(slot, walk_slots, pair.eps, 0)
-    r0 = cells[0]
-    c0 = cells[2]
-    width = cells[3] - c0 + 2
-    vertices = (cells[1] - r0 + 2) * width
-    for v in range(vertices):
-        if words <= _MASK_WORDS and (marked[v // 32] & (1 << (v % 32))) == 0:
+    planes, sink = solid_recovery(core, data, window, planes, sink, out)
+    _solid_settle(core, data, window, record, sink, out, jobs, solids, pair_index, i, partner_class, frame)
+
+
+@wp.func
+def solid_xitem_job(core: Any, data: TerrainFeatureData, jobs: TerrainSolidJobs, i: int, item: int):
+    """Rule X's item ``item`` of class pair ``i`` (:attr:`TerrainSolidJobs.xitems`): a core point, or a window
+    vertex's valleys and local maxima of the distance, at the target: a candidate whose bound passes it is listed
+    (:attr:`TerrainSolidJobs.xhead`; the test rule X's passes open with, :func:`_exit_open`, before any candidate is
+    taken); a valley whose gate passes it goes to :func:`solid_xvalley_job`. Work without room takes every candidate
+    (:attr:`TerrainSolidJobs.xall`)."""
+    record, window = solid_job_window(data, jobs, i)
+    cells = record.cells
+    target = jobs.target[i]
+    planes = terrain_planes()
+    if item < 0:
+        j = -1 - item
+        x = core_exit_point(core, j)
+        planes, bound = _exit_bound(data, window, planes, x)
+        if bound > target:
+            if _x_list(jobs, i, x, bound, j, -1, 0.0, 0.0) == 0:
+                jobs.xall[i] = 1
+        return
+    low = record.low
+    far = core_far_count(core)
+    base = core_exit_count(core) + item * _EXIT_SLOTS
+    rc = _job_vertex(cells, item)
+    r = rc[0]
+    c = rc[1]
+    inside = r <= cells[1] and c <= cells[3]
+    for which in range(3):
+        if (which == 0 and c > cells[3]) or (which == 1 and r > cells[1]) or (which == 2 and not inside):
             continue
-        for item in range(_ITEMS):
-            planes, emitters, sink = solid_item(
-                core,
-                data,
-                window,
-                planes,
-                emitters,
-                pair,
-                sink,
-                out,
-                r0 + v // width,
-                c0 + v % width,
-                cells[1],
-                cells[3],
-                item,
-            )
-    solid_close(core, data, window, planes, pair, sink, out, solids, pair_index, partner_class, frame, cells)
+        planes, ok, _v0, _e, _length2, n_a, n_b, top = _valley_arc(data, window, planes, low, r, c, which)
+        if not ok:
+            continue
+        # The valley's gate (_exit_open) at the lowest threshold either pass can take, the target: a valley below it
+        # stays below every later threshold (a nonpositive scale makes the gate pass, as here).
+        if top - low < target * wp.min(n_a[2], n_b[2]):
+            continue
+        if _job_append(jobs, _XVALLEYS, jobs.xvalleys, wp.vec2i(i + jobs.first, 3 * item + which)) == 0:
+            jobs.xall[i] = 1
+    if far == 0 or not terrain_interior_vertex(window.surface, r, c):
+        return
+    v = terrain_window_vertex(data, window, r, c)
+    if v[2] <= low:
+        return
+    for f in range(far):
+        has, x = core_far_point(core, f, v)
+        if not has or x[2] >= v[2]:
+            continue
+        planes, bound = _exit_bound(data, window, planes, x)
+        if bound > 0.0:
+            bound = wp.min(bound, wp.length(x - v))
+        if bound > target:
+            if _x_list(jobs, i, x, bound, base + 54 + f, -1, 0.0, 0.0) == 0:
+                jobs.xall[i] = 1
+
+
+@wp.func
+def solid_xvalley_job(core: Any, data: TerrainFeatureData, jobs: TerrainSolidJobs, i: int, item: int):
+    """Rule X at a listed valley of class pair ``i`` (``item``: its window vertex times three plus its edge): the
+    core's support points at the local minima of ``sigma`` over its arc (:func:`_exit_valley`'s); one whose bound
+    passes the target is listed with the valley's gate (:func:`_x_list`)."""
+    record, window = solid_job_window(data, jobs, i)
+    vertex = item // 3
+    which = item - 3 * vertex
+    rc = _job_vertex(record.cells, vertex)
+    target = jobs.target[i]
+    low = record.low
+    key = core_exit_count(core) + vertex * _EXIT_SLOTS + 18 * which
+    planes = terrain_planes()
+    planes, _ok, v0, e, length2, n_a, n_b, top = _valley_arc(data, window, planes, low, rc[0], rc[1], which)
+    samples, values, axis = _valley_samples(core, v0, n_a, n_b)
+    for k in range(9):
+        if not _valley_minimum(values, k):
+            continue
+        nst = _valley_refine(core, samples, values, axis, v0, k)
+        for s in range(core_support_count(core)):
+            x = core_support_point(core, nst, s)
+            if x[2] >= top:
+                continue
+            planes, bound = _valley_bound(data, window, planes, x, v0, e, length2)
+            if bound > target:
+                if _x_list(jobs, i, x, bound, key + 2 * k + s, key, top - low, wp.min(n_a[2], n_b[2])) == 0:
+                    jobs.xall[i] = 1
+
+
+@wp.func
+def solid_exit_pair(
+    core: Any,
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+    jobs: TerrainSolidJobs,
+    solids: TerrainSolidData,
+    pair_index: int,
+    i: int,
+    slot: int,
+    walk_slots: int,
+    partner_class: int,
+    frame: wp.transform,
+):
+    """Rule X for a pair its close left to the class's exit kernel, its rows held in its walk slots from ``slot``
+    (``out.count`` of them): the deepest exit over its listed candidates (:func:`solid_exits`; every candidate when
+    some of its rule X work found no room), then the finish (:func:`solid_finish`): the rows of a walk that ran rule X
+    itself."""
+    record, window = solid_job_window(data, jobs, i)
+    pair = record.pair
+    planes = terrain_planes()
+    sink = solid_sink(slot, walk_slots, pair.eps)
+    sink.held = out.count[pair_index]
+    sink.raw = sink.held
+    listed = int(1)
+    if jobs.xall[i] != 0:
+        listed = 0
+    # with no listed candidate both passes are no-ops
+    if listed == 0 or jobs.xhead[i] >= 0:
+        planes, sink = solid_exits(
+            core, data, window, planes, pair, sink, out, record.cells, solids.exit_work, jobs, i, listed
+        )
+    solid_finish(window, pair, sink, out, pair_index, partner_class, frame, record.cells)
 
 
 @wp.func
@@ -1730,6 +2556,369 @@ def solid_unsupported(out: TerrainLawRows, pair_index: int):
     """Record a pair whose partner has no core in the law (no row,
     :func:`~newton._src.geometry.terrain_law.terrain_pair_exit`)."""
     terrain_pair_exit(out, pair_index, TERRAIN_PAIR_UNSUPPORTED)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# the kernels of one solid class
+# ----------------------------------------------------------------------------------------------------------------
+
+TERRAIN_SOLID_LAUNCHES = (
+    ("pairs", "rows"),
+    ("jobs", "scan"),
+    ("jobs", "faces"),
+    ("jobs", "edges"),
+    ("jobs", "thetas"),
+    ("jobs", "vertices"),
+    ("jobs", "close"),
+    ("jobs", "recovery"),
+    ("jobs", "xitems"),
+    ("jobs", "xvalleys"),
+    ("pairs", "exit"),
+    ("full", "full"),
+)
+"""A solid class's launches in order, by kind and kernel (:func:`solid_kernels`): ``pairs`` one thread per pair of the
+class, ``jobs`` the class's job threads (:attr:`TerrainSolidJobs.threads`, striding over a list), ``full`` the
+full-finish grid (:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`, ``wp.launch_tiled``)."""
+
+
+def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, save_core, load_core, module: str) -> dict:
+    """Build one solid class's kernels in module ``module`` (whose options, contraction off, they take), named
+    ``terrain_<name>_rows`` (the scan) and ``terrain_<name>_rows_<kernel>`` for the others of
+    :data:`TERRAIN_SOLID_LAUNCHES`.
+
+    Every kernel takes ``(begin, slot_begin, inputs, data, out)`` and the class's
+    :class:`TerrainSolidJobs` and the solid classes' :class:`TerrainSolidData` (the full-finish kernel: its
+    :class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`, the data, then the jobs): table pair ``begin + i``
+    is the class's pair ``i``, its walk slots ``slot_begin + i * walk_slots``.
+
+    Args:
+        name: The class's name in kernel names.
+        partner_class: The class (``TERRAIN_PARTNER_*``).
+        walk_slots: Walk slots of a pair of the class.
+        make_core: ``wp.func`` ``(local, size, kind, partner, solids) -> (supported, core)``: a pair's core in the
+            heightfield frame.
+        save_core: ``wp.func`` ``(jobs, i, core)``: keep class pair ``i``'s core (window frame) for its jobs.
+        load_core: ``wp.func`` ``(jobs, i, solids) -> core``: class pair ``i``'s kept core.
+        module: The module the kernels join.
+    """
+    rows_ = wp.constant(walk_slots)
+    class_ = wp.constant(partner_class)
+
+    def rows(
+        begin: int,
+        slot_begin: int,
+        inputs: TerrainPairInputs,
+        data: TerrainFeatureData,
+        out: TerrainLawRows,
+        jobs: TerrainSolidJobs,
+        solids: TerrainSolidData,
+    ):
+        """The whole-pair rejects, one thread per pair of the class (stale features, the pair policy, a partner without
+        a core, a window off the heightfield, the tile-max exit): a pair past them is listed live
+        (:attr:`TerrainSolidJobs.live`) for the close, its window's runs for the scan
+        (:attr:`TerrainSolidJobs.scans`), and takes state :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_JOBS`;
+        any other is recorded with no row."""
+        i = wp.tid()
+        pair = begin + i
+        state, _frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
+        if state != 0:
+            terrain_pair_exit(out, pair, state)
+            return
+        supported, core = wp.static(make_core)(local, size, inputs.shape_type[partner], partner, solids)
+        if not supported:
+            solid_unsupported(out, pair)
+            return
+        state, cells, _lo, _hi = solid_pair_cells(core, data, heightfield, reach)
+        if state != 0:
+            terrain_pair_exit(out, pair, state)
+            return
+        out.first[pair] = -1
+        out.count[pair] = 0
+        out.state[pair] = _wide(cells) | TERRAIN_PAIR_JOBS
+        jobs.head[i] = -1
+        # the live list holds every pair of the class at most
+        jobs.live[wp.atomic_add(jobs.counts, _LIVE, 1)] = i
+        vertices = (cells[1] - cells[0] + 2) * (cells[3] - cells[2] + 2)
+        runs = (vertices + _SCAN_VERTICES - 1) // _SCAN_VERTICES
+        first = wp.atomic_add(jobs.counts, _SCANS, runs)
+        for k in range(runs):
+            if first + k < jobs.scans.shape[0]:
+                jobs.scans[first + k] = wp.vec2i(i, k)
+            else:
+                # a window larger than its shape data bounded at construction: the full-finish kernel walks it
+                out.state[pair] = _wide(cells) | TERRAIN_PAIR_JOBS | TERRAIN_PAIR_INCOMPLETE
+
+    def scan(
+        begin: int,
+        slot_begin: int,
+        inputs: TerrainPairInputs,
+        data: TerrainFeatureData,
+        out: TerrainLawRows,
+        jobs: TerrainSolidJobs,
+        solids: TerrainSolidData,
+    ):
+        """The scan, one run of a live pair's window per thread at a time: its window frame, its core kept (first run)
+        and the run's features through their cheapest rejects, the survivors listed for the job kernels
+        (:func:`solid_scan`)."""
+        t = wp.tid()
+        for entry in range(t, wp.min(jobs.counts[_SCANS], jobs.scans.shape[0]), jobs.threads):
+            job = jobs.scans[entry]
+            i = job[0]
+            pair = begin + i
+            _state, _frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
+            _supported, core = wp.static(make_core)(local, size, inputs.shape_type[partner], partner, solids)
+            _state, cells, lo, hi = solid_pair_cells(core, data, heightfield, reach)
+            window, core, setup = solid_pair_frame(core, data, heightfield, cells, lo, hi, reach)
+            if job[1] == 0:
+                wp.static(save_core)(jobs, i, core)
+            solid_scan(core, data, window, setup, cells, heightfield, out, jobs, pair, i, job[1])
+
+    def faces(
+        begin: int,
+        slot_begin: int,
+        inputs: TerrainPairInputs,
+        data: TerrainFeatureData,
+        out: TerrainLawRows,
+        jobs: TerrainSolidJobs,
+        solids: TerrainSolidData,
+    ):
+        """Rule F, one listed face per thread at a time (the grid strides over the list, :func:`solid_face_job`)."""
+        t = wp.tid()
+        for entry in range(t, wp.min(jobs.counts[_FACES], jobs.faces.shape[0]), jobs.threads):
+            job = jobs.faces[entry]
+            i = job[0] - begin
+            solid_face_job(wp.static(load_core)(jobs, i, solids), data, out, jobs, job[0], i, job[1])
+
+    def edges(
+        begin: int,
+        slot_begin: int,
+        inputs: TerrainPairInputs,
+        data: TerrainFeatureData,
+        out: TerrainLawRows,
+        jobs: TerrainSolidJobs,
+        solids: TerrainSolidData,
+    ):
+        """Rule E's crease tests, one listed edge per thread at a time (:func:`solid_edge_job`)."""
+        t = wp.tid()
+        for entry in range(t, wp.min(jobs.counts[_EDGES], jobs.edges.shape[0]), jobs.threads):
+            job = jobs.edges[entry]
+            i = job[0] - begin
+            solid_edge_job(wp.static(load_core)(jobs, i, solids), data, out, jobs, job[0], i, job[1])
+
+    def thetas(
+        begin: int,
+        slot_begin: int,
+        inputs: TerrainPairInputs,
+        data: TerrainFeatureData,
+        out: TerrainLawRows,
+        jobs: TerrainSolidJobs,
+        solids: TerrainSolidData,
+    ):
+        """Rule E's rows, one listed crease per thread at a time (:func:`solid_theta_job`)."""
+        t = wp.tid()
+        for entry in range(t, wp.min(jobs.counts[_THETAS], jobs.thetas.shape[0]), jobs.threads):
+            job = jobs.thetas[entry]
+            i = job[0] - begin
+            solid_theta_job(wp.static(load_core)(jobs, i, solids), data, out, jobs, job[0], i, job[1])
+
+    def vertices(
+        begin: int,
+        slot_begin: int,
+        inputs: TerrainPairInputs,
+        data: TerrainFeatureData,
+        out: TerrainLawRows,
+        jobs: TerrainSolidJobs,
+        solids: TerrainSolidData,
+    ):
+        """Rule V, one listed vertex per thread at a time (:func:`solid_vertex_job`)."""
+        t = wp.tid()
+        for entry in range(t, wp.min(jobs.counts[_VERTICES], jobs.vertices.shape[0]), jobs.threads):
+            job = jobs.vertices[entry]
+            i = job[0] - begin
+            solid_vertex_job(wp.static(load_core)(jobs, i, solids), data, out, jobs, job[0], i, job[1])
+
+    def close(
+        begin: int,
+        slot_begin: int,
+        inputs: TerrainPairInputs,
+        data: TerrainFeatureData,
+        out: TerrainLawRows,
+        jobs: TerrainSolidJobs,
+        solids: TerrainSolidData,
+    ):
+        """The close, one live pair per thread at a time: a scanned pair's rows held in window order, then its finish,
+        its rule X's items or rule R's list (:func:`solid_close_jobs`); a pair the scan deferred is passed by."""
+        t = wp.tid()
+        for entry in range(t, jobs.counts[_LIVE], jobs.threads):
+            i = jobs.live[entry]
+            pair = begin + i
+            if (out.state[pair] & TERRAIN_PAIR_JOBS) != 0:
+                solid_close_jobs(
+                    wp.static(load_core)(jobs, i, solids),
+                    data,
+                    out,
+                    jobs,
+                    solids,
+                    pair,
+                    i,
+                    slot_begin + i * rows_,
+                    rows_,
+                    class_,
+                    inputs.shape_transform[inputs.pairs[pair][0]],
+                )
+
+    def recovery(
+        begin: int,
+        slot_begin: int,
+        inputs: TerrainPairInputs,
+        data: TerrainFeatureData,
+        out: TerrainLawRows,
+        jobs: TerrainSolidJobs,
+        solids: TerrainSolidData,
+    ):
+        """Rule R, one closed pair without a row per thread at a time, then its finish or its rule X's items
+        (:func:`solid_recover_pair`)."""
+        t = wp.tid()
+        for entry in range(t, jobs.counts[_RECOVER], jobs.threads):
+            i = jobs.recover[entry]
+            pair = begin + i
+            solid_recover_pair(
+                wp.static(load_core)(jobs, i, solids),
+                data,
+                out,
+                jobs,
+                solids,
+                pair,
+                i,
+                slot_begin + i * rows_,
+                rows_,
+                class_,
+                inputs.shape_transform[inputs.pairs[pair][0]],
+            )
+
+    def xitems(
+        begin: int,
+        slot_begin: int,
+        inputs: TerrainPairInputs,
+        data: TerrainFeatureData,
+        out: TerrainLawRows,
+        jobs: TerrainSolidJobs,
+        solids: TerrainSolidData,
+    ):
+        """Rule X's items, one per thread at a time: candidates and valleys (:func:`solid_xitem_job`)."""
+        t = wp.tid()
+        for entry in range(t, wp.min(jobs.counts[_XITEMS], jobs.xitems.shape[0]), jobs.threads):
+            job = jobs.xitems[entry]
+            i = job[0] - begin
+            solid_xitem_job(wp.static(load_core)(jobs, i, solids), data, jobs, i, job[1])
+
+    def xvalleys(
+        begin: int,
+        slot_begin: int,
+        inputs: TerrainPairInputs,
+        data: TerrainFeatureData,
+        out: TerrainLawRows,
+        jobs: TerrainSolidJobs,
+        solids: TerrainSolidData,
+    ):
+        """Rule X's valleys, one per thread at a time: candidates (:func:`solid_xvalley_job`)."""
+        t = wp.tid()
+        for entry in range(t, wp.min(jobs.counts[_XVALLEYS], jobs.xvalleys.shape[0]), jobs.threads):
+            job = jobs.xvalleys[entry]
+            i = job[0] - begin
+            solid_xvalley_job(wp.static(load_core)(jobs, i, solids), data, jobs, i, job[1])
+
+    def exit_(
+        begin: int,
+        slot_begin: int,
+        inputs: TerrainPairInputs,
+        data: TerrainFeatureData,
+        out: TerrainLawRows,
+        jobs: TerrainSolidJobs,
+        solids: TerrainSolidData,
+    ):
+        """Rule X, one thread per pair of the class (the room of its exit list): a listed pair's deepest exit over its
+        listed candidates and its finish (:func:`solid_exit_pair`); a thread past the list's count returns at once."""
+        t = wp.tid()
+        if t >= solids.exit_count[class_]:
+            return
+        pair = solids.exits[out.deferred_first[class_] + t]
+        i = pair - begin
+        frame = inputs.shape_transform[inputs.pairs[pair][0]]
+        solid_exit_pair(
+            wp.static(load_core)(jobs, i, solids),
+            data,
+            out,
+            jobs,
+            solids,
+            pair,
+            i,
+            slot_begin + i * rows_,
+            rows_,
+            class_,
+            frame,
+        )
+
+    def full(
+        begin: int,
+        slot_begin: int,
+        inputs: TerrainPairInputs,
+        data: TerrainFeatureData,
+        out: TerrainLawRows,
+        scratch: TerrainFinishScratch,
+        solids: TerrainSolidData,
+        jobs: TerrainSolidJobs,
+    ):
+        """Finish the class's deferred pairs: the grid's ``scratch.blocks`` blocks stride over the class's deferred
+        list, and each block's first lane walks its pairs again, one at a time, into the block's scratch (every
+        distinct candidate a window of the class can give), runs rules R and X and the finish and writes every row it
+        keeps, in the pair's walk slots when they fit, else in rows of the spill region (:func:`solid_rows_full`). A
+        pair's rows depend on the pair alone: not on the order of the deferral, the number of deferred pairs or the
+        block that finishes it. ``wp.launch_tiled`` with ``dim=scratch.blocks``; a block past it returns at once."""
+        block, lane = wp.tid()
+        if block >= scratch.blocks or lane != 0:
+            return
+        for entry in range(block, out.deferred_count[class_], scratch.blocks):
+            pair = out.deferred[begin + entry]
+            i = pair - begin
+            _state, frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
+            _supported, core = wp.static(make_core)(local, size, inputs.shape_type[partner], partner, solids)
+            solid_rows_full(
+                core,
+                data,
+                out,
+                scratch,
+                solids,
+                jobs,
+                block,
+                pair,
+                slot_begin + i * rows_,
+                rows_,
+                frame,
+                heightfield,
+                reach,
+            )
+
+    kernels = {}
+    for kernel_name, function in (
+        ("rows", rows),
+        ("scan", scan),
+        ("faces", faces),
+        ("edges", edges),
+        ("thetas", thetas),
+        ("vertices", vertices),
+        ("close", close),
+        ("recovery", recovery),
+        ("xitems", xitems),
+        ("xvalleys", xvalleys),
+        ("exit", exit_),
+        ("full", full),
+    ):
+        key = f"terrain_{name}_rows" if kernel_name == "rows" else f"terrain_{name}_rows_{kernel_name}"
+        function.__name__ = key
+        function.__qualname__ = key
+        kernels[kernel_name] = wp.kernel(function, enable_backward=False, module=module)
+    return kernels
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1869,21 +3058,17 @@ def terrain_solid_data(
     model,
     partners: np.ndarray,
     *,
-    thread_vertices: int = TERRAIN_SOLID_THREAD_VERTICES,
     pairs: int | None = None,
     exit_count: wp.array | None = None,
     exit_work: wp.array | None = None,
 ) -> TerrainSolidData:
     """The solid classes' data for a model: the hull table of the convex-mesh partners in ``partners`` (shape
-    indices), the one-thread kernels' lane choice (``thread_vertices`` 0: they walk every window) and rule X's exit
-    lists. Their launch arguments, the work lists and the full finish's scratch, are the shadow's
-    (:func:`~newton._src.geometry.terrain_law.terrain_pair_work`,
-    :func:`~newton._src.geometry.terrain_law.terrain_finish_scratch`).
+    indices) and rule X's exit lists. Their launch arguments, each class's jobs and the full finish's scratch, are the
+    shadow's (:func:`terrain_solid_jobs`, :func:`~newton._src.geometry.terrain_law.terrain_finish_scratch`).
 
     Args:
         model: A finalized model.
         partners: Partner shapes of the solid classes' pairs.
-        thread_vertices: Window vertices up to which the one-thread kernels walk a pair.
         pairs: Pairs of the table (the exit lists' room), or ``None`` for one per entry of ``partners``.
         exit_count: The four per-class counters of the exit lists (zeroed before every launch), or ``None`` for its
             own.
@@ -1906,9 +3091,178 @@ def terrain_solid_data(
         shape_hull[s] = index_of[key]
     solids = TerrainSolidData()
     solids.hulls = build_hull_table(meshes, shape_hull, device)
-    solids.thread_vertices = int(thread_vertices)
     room = len(partners) if pairs is None else int(pairs)
     solids.exits = wp.zeros(max(room, 1), dtype=wp.int32, device=device)
     solids.exit_count = exit_count if exit_count is not None else wp.zeros(4, dtype=wp.int32, device=device)
     solids.exit_work = exit_work if exit_work is not None else wp.zeros(2, dtype=wp.int32, device=device)
     return solids
+
+
+def terrain_solid_exit_items(model, partners: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per partner: rule X's core points (the candidates it tries as they are: a box's 8 corners, a hull's points, a
+    cone's apex) and whether its core takes candidates at window vertices (its valleys' support points and its local
+    maxima of the distance: cylinders, cones and ellipsoids).
+
+    Args:
+        model: A finalized model.
+        partners: Partner shapes.
+    """
+    from .types import GeoType  # noqa: PLC0415
+
+    partners = np.asarray(partners, np.int64)
+    types = model.shape_type.numpy()[partners] if len(partners) else np.zeros(0, np.int32)
+    points = np.zeros(len(partners), np.int64)
+    points[types == int(GeoType.BOX)] = 8
+    points[types == int(GeoType.CONE)] = 1
+    for k in np.flatnonzero(types == int(GeoType.CONVEX_MESH)):
+        points[k] = len(np.asarray(model.shape_source[int(partners[k])].vertices).reshape(-1, 3))
+    takes = (types == int(GeoType.CYLINDER)) | (types == int(GeoType.CONE)) | (types == int(GeoType.ELLIPSOID))
+    return points, takes
+
+
+def terrain_solid_job_capacities(
+    vertices: np.ndarray,
+    points: np.ndarray,
+    takes_vertices: np.ndarray,
+    candidates: np.ndarray,
+    walk_slots: int,
+    *,
+    scale: float = 1.0,
+) -> dict[str, int]:
+    """Return a solid class's job list capacities by default, from its pairs' own bounds: per list
+    (:data:`TERRAIN_SOLID_JOB_LISTS`) the largest pair's bound plus the sum of every pair's bound over the list's
+    share (:data:`TERRAIN_SOLID_JOB_SHARES`), and the candidate pool (``candidates``): the largest pair's bound on its
+    candidates plus the class's walk slots over :data:`TERRAIN_SOLID_CANDIDATE_SHARE`; at least the sum of every
+    pair's bound up to :data:`TERRAIN_SOLID_JOB_FLOOR` (:data:`TERRAIN_SOLID_POOL_FLOOR` for the pool), so that a
+    scene with few pairs never lacks room; each times ``scale``. The scan's runs (``scans``) are exact: every pair's at
+    its largest window (:data:`TERRAIN_SOLID_SCAN_VERTICES` vertices each).
+
+    Args:
+        vertices: Per pair, the bound on its window's vertices
+            (:func:`~newton._src.geometry.terrain_contacts.terrain_window_vertices`).
+        points: Per pair, its core's rule X points (:func:`terrain_solid_exit_items`).
+        takes_vertices: Per pair, whether its core takes rule X candidates at window vertices.
+        candidates: Per pair, the bound on its distinct candidates
+            (:func:`~newton._src.geometry.terrain_contacts.terrain_pair_candidates`).
+        walk_slots: Walk slots of a pair of the class.
+        scale: Factor on every capacity.
+    """
+    v = np.asarray(vertices, np.int64)
+    takes = np.asarray(takes_vertices, bool)
+    points = np.asarray(points, np.int64)
+    bounds = (
+        2 * v,
+        3 * v,
+        3 * v,
+        v,
+        points + np.where(takes, v, 0),
+        np.where(takes, 3 * v, 0),
+    )
+    capacities = {}
+    for name, bound, share in zip(TERRAIN_SOLID_JOB_LISTS, bounds, TERRAIN_SOLID_JOB_SHARES, strict=True):
+        total = int(bound.sum())
+        default = (int(bound.max()) + -(-total // share)) if len(bound) else 0
+        default = max(default, min(total, TERRAIN_SOLID_JOB_FLOOR))
+        capacities[name] = max(1, int(np.ceil(scale * default)))
+    # a pair's pool entries: up to eight rows (its key's point slots) per listed face, crease and vertex, and its rule X
+    # candidates (its core's points and, taking candidates at window vertices, their key slots)
+    total = int(np.sum(48 * v + points + np.where(takes, TERRAIN_SOLID_EXIT_SLOTS * v, 0)))
+    default = (int(np.max(candidates)) if len(v) else 0) + walk_slots * len(v) // TERRAIN_SOLID_CANDIDATE_SHARE
+    default = max(default, min(total, TERRAIN_SOLID_POOL_FLOOR))
+    capacities["candidates"] = max(1, int(np.ceil(scale * default)))
+    # the scan's runs: every pair's at its largest window, exact (a window past its bound takes the full finish)
+    capacities["scans"] = max(1, int(np.sum(-(-v // TERRAIN_SOLID_SCAN_VERTICES))))
+    return capacities
+
+
+def terrain_solid_jobs(
+    device,
+    partner_class: int,
+    first: int,
+    pairs: int,
+    capacities: dict[str, int],
+    *,
+    counts: wp.array | None = None,
+) -> TerrainSolidJobs:
+    """Allocate a solid class's :class:`TerrainSolidJobs`: per pair its record, core, candidate list heads and rule
+    X's target; the job lists, the scan's runs and the candidate pool with ``capacities``
+    (:func:`terrain_solid_job_capacities`); the job kernels' threads (:data:`TERRAIN_SOLID_JOB_THREADS` on CUDA,
+    :data:`TERRAIN_SOLID_JOB_THREADS_CPU` on the CPU, at most the longest list).
+
+    Args:
+        device: The device.
+        partner_class: The class (``TERRAIN_PARTNER_*``): which core records it keeps.
+        first: The class's first table pair.
+        pairs: Pairs of the class.
+        capacities: Entries of every job list, the scan's runs and the candidate pool.
+        counts: The class's :data:`TERRAIN_SOLID_COUNTERS` counters (zeroed before every launch), or ``None`` for its
+            own.
+    """
+    from .terrain_contacts import TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_HULL  # noqa: PLC0415
+
+    room = max(int(pairs), 1)
+    jobs = TerrainSolidJobs()
+    jobs.first = int(first)
+    jobs.records = wp.zeros(room, dtype=TerrainSolidRecord, device=device)
+    own = {
+        TERRAIN_PARTNER_BOX: "box_cores",
+        TERRAIN_PARTNER_CYLINDER: "cylinder_cores",
+        TERRAIN_PARTNER_HULL: "hull_cores",
+    }
+    for name, dtype in (
+        ("box_cores", TerrainBoxCore),
+        ("cylinder_cores", TerrainCylinderCore),
+        ("hull_cores", TerrainHullCoreRecord),
+    ):
+        setattr(jobs, name, wp.zeros(room if own.get(int(partner_class)) == name else 1, dtype=dtype, device=device))
+    for name in TERRAIN_SOLID_JOB_LISTS:
+        setattr(jobs, name, wp.zeros(max(int(capacities[name]), 1), dtype=wp.vec2i, device=device))
+    jobs.live = wp.zeros(room, dtype=wp.int32, device=device)
+    jobs.scans = wp.zeros(max(int(capacities["scans"]), 1), dtype=wp.vec2i, device=device)
+    jobs.recover = wp.zeros(room, dtype=wp.int32, device=device)
+    jobs.counts = counts if counts is not None else wp.zeros(TERRAIN_SOLID_COUNTERS, dtype=wp.int32, device=device)
+    longest = max(int(capacities[name]) for name in (*TERRAIN_SOLID_JOB_LISTS, "scans"))
+    threads = TERRAIN_SOLID_JOB_THREADS if wp.get_device(device).is_cuda else TERRAIN_SOLID_JOB_THREADS_CPU
+    jobs.threads = max(1, min(threads, longest))
+    pool = max(int(capacities["candidates"]), 1)
+    jobs.q = wp.zeros(pool, dtype=wp.vec3, device=device)
+    jobs.n = wp.zeros(pool, dtype=wp.vec3, device=device)
+    jobs.d = wp.zeros(pool, dtype=wp.float32, device=device)
+    jobs.feature = wp.zeros(pool, dtype=wp.int32, device=device)
+    jobs.key = wp.zeros(pool, dtype=wp.int32, device=device)
+    jobs.next = wp.zeros(pool, dtype=wp.int32, device=device)
+    jobs.head = wp.full(room, -1, dtype=wp.int32, device=device)
+    jobs.target = wp.zeros(room, dtype=wp.float32, device=device)
+    jobs.xhead = wp.full(room, -1, dtype=wp.int32, device=device)
+    jobs.xall = wp.zeros(room, dtype=wp.int32, device=device)
+    return jobs
+
+
+def terrain_solid_jobs_bytes(jobs: TerrainSolidJobs) -> int:
+    """Device bytes of a solid class's jobs."""
+    arrays = (
+        jobs.records,
+        jobs.box_cores,
+        jobs.cylinder_cores,
+        jobs.hull_cores,
+        jobs.faces,
+        jobs.edges,
+        jobs.thetas,
+        jobs.vertices,
+        jobs.xitems,
+        jobs.xvalleys,
+        jobs.live,
+        jobs.scans,
+        jobs.recover,
+        jobs.q,
+        jobs.n,
+        jobs.d,
+        jobs.feature,
+        jobs.key,
+        jobs.next,
+        jobs.head,
+        jobs.target,
+        jobs.xhead,
+        jobs.xall,
+    )
+    return int(sum(array.capacity for array in arrays))

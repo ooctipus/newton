@@ -162,6 +162,12 @@ TERRAIN_PAIR_UNSUPPORTED = wp.constant(256)
 """Pair state: the partner's shape has no core in the law yet (a barrel cylinder in the hull class; no row)."""
 TERRAIN_PAIR_EXIT = wp.constant(512)
 """Pair state, transient: the pair's walk holds its rows and left it to its solid class's exit kernel (rule X)."""
+TERRAIN_PAIR_JOBS = wp.constant(1024)
+"""Pair state, transient: a solid pair's scan listed its window's features for its class's job kernels, and its close
+kernel takes their rows."""
+TERRAIN_PAIR_INCOMPLETE = wp.constant(2048)
+"""Pair state, transient: a job list or the candidate pool of a solid pair's class had no room for some of its work, so
+its close kernel leaves it to the class's full-finish kernel, which walks it again."""
 TERRAIN_WINDOW_WIDE = 64
 """Cells across a window from which feature ids are no longer unique."""
 TERRAIN_PLANE_CACHE = 4
@@ -415,14 +421,12 @@ class's deferred pairs in turn."""
 
 @wp.struct
 class TerrainPairWork:
-    """A partner class's pairs with larger windows that reach their windows, which its one-thread kernel queues for its
+    """The point class's pairs with larger windows that reach their windows, which its one-thread kernel queues for its
     tiled kernel, in any order (a pair's rows depend on the pair alone)."""
 
     first: int
-    """First table pair of the class's tiled segment: the one-thread kernel walks the pairs before it; of those from it
-    on it queues the ones that reach their windows (the point class), or those whose windows, as their poses give
-    them, it leaves to the tiled kernel (a solid class: over
-    :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_THREAD_VERTICES` vertices)."""
+    """First table pair of the class's tiled segment: the one-thread kernel walks the pairs before it, and of those from
+    it on queues the ones that reach their windows."""
     pairs: wp.array[wp.int32]
     """The queued table pairs, room for every pair of the tiled segment."""
     count: wp.array[wp.int32]

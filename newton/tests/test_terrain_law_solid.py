@@ -43,7 +43,6 @@ from newton._src.geometry.terrain_contacts import (
 from newton._src.geometry.terrain_law import (
     TERRAIN_FEATURE_RECOVERY,
     TERRAIN_FINISH_MASK_ROWS,
-    TERRAIN_LAW_TILE_BLOCKS,
     TERRAIN_PAIR_CANDIDATE_OVERFLOW,
     TERRAIN_PAIR_FILTERED,
     TERRAIN_PAIR_OUTSIDE,
@@ -58,8 +57,9 @@ from newton._src.geometry.terrain_law import (
     terrain_finish_slots,
     terrain_law_block_dim,
     terrain_law_rows,
-    terrain_pair_work,
 )
+from newton._src.geometry.terrain_law_solid import TERRAIN_SOLID_LAUNCHES
+from newton._src.geometry.terrain_shadow import TERRAIN_LAW_JOB_NAMES
 from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_solid_utils as su
 from newton.tests import terrain_law_test_utils as tu
@@ -1057,32 +1057,8 @@ def test_solid_rows_match_the_float64_law(test, device):
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# the tiled kernels, row overflow, unsupported shapes and the shadow
+# the job pipeline, row overflow, unsupported shapes and the shadow
 # ----------------------------------------------------------------------------------------------------------------
-
-_SOLID_KERNELS = {
-    TERRAIN_PARTNER_BOX: (
-        terrain_law_box,
-        "terrain_box_rows",
-        "terrain_box_rows_tiled",
-        "terrain_box_rows_exit",
-        "terrain_box_rows_full",
-    ),
-    TERRAIN_PARTNER_CYLINDER: (
-        terrain_law_cylinder,
-        "terrain_cylinder_rows",
-        "terrain_cylinder_rows_tiled",
-        "terrain_cylinder_rows_exit",
-        "terrain_cylinder_rows_full",
-    ),
-    TERRAIN_PARTNER_HULL: (
-        terrain_law_hull,
-        "terrain_hull_rows",
-        "terrain_hull_rows_tiled",
-        "terrain_hull_rows_exit",
-        "terrain_hull_rows_full",
-    ),
-}
 
 
 def _side_buffer(begin, count, rows, pair_count, device):
@@ -1104,24 +1080,24 @@ def _full_candidates(shadow, partner_class) -> int:
     return shadow.describe()["launch_shapes"][name[partner_class]]["full_candidates"]
 
 
-TILE_LARGE = (
+LARGE_WINDOWS = (
     ("box", {"half": (0.6, 0.3, 0.02)}),
     ("cylinder", {"radius": 0.05, "half_height": 0.6}),
     ("cone", {"radius": 0.4, "half_height": 0.05}),
     ("ellipsoid", {"semi": (0.6, 0.3, 0.05)}),
 )
-"""Solids whose windows hold more vertices (over 256 on 5 cm cells) than the tiled kernels' marks cover."""
+"""Solids whose windows hold over 256 vertices on 5 cm cells (their scans take several jobs)."""
 
 
-def _tile_scene(rng, device):
+def _window_scene(rng, device):
     """Solids whose windows exceed 16 cells (5 cm cells) over rough terrain, every class, and of every class one whose
-    window exceeds 256 vertices (:data:`TILE_LARGE`): ``(heightfield, model, shapes, bodies)``."""
+    window exceeds 256 vertices (:data:`LARGE_WINDOWS`): ``(heightfield, model, shapes, bodies)``."""
     n = 49
     heights = np.round(rng.uniform(0.0, 0.08, (n, n)) / 0.005) * 0.005
     hf = tu.reference_surface(tu.heightfield_model(heights, 1.2, 1.2, device="cpu"))
     bodies = []
-    for i in range(36 + len(TILE_LARGE)):
-        kind, dims = _solid_kinds(rng)[i % 7] if i < 36 else TILE_LARGE[i - 36]
+    for i in range(36 + len(LARGE_WINDOWS)):
+        kind, dims = _solid_kinds(rng)[i % 7] if i < 36 else LARGE_WINDOWS[i - 36]
         x, y = rng.uniform(-0.9, 0.9, 2) if i < 36 else rng.uniform(-0.3, 0.3, 2)
         q = _random_quat(rng) if i < 36 else _random_quat(rng, np.radians(2.0))
         if i >= 36 and kind == "cylinder":
@@ -1140,13 +1116,6 @@ def _window_vertices(hf, kind, dims, pose) -> int:
     return (r1 - r0 + 2) * (c1 - c0 + 2)
 
 
-def _queued(shadow, partner_class) -> np.ndarray:
-    """The pairs a shadow's last launch queued for a solid class's tiled kernel (its one-thread launch's work list)."""
-    module, thread, _tiled, _exit, _full = _SOLID_KERNELS[partner_class]
-    work = next(extra for _kind, kernel, *_launch, extra in shadow._launches if kernel is getattr(module, thread))
-    return work.pairs.numpy()[: int(work.count.numpy()[0])]
-
-
 def _pair_inputs(model, pipeline) -> TerrainPairInputs:
     """The pair inputs of a shadow pipeline's last collide (its pair table and shape transforms)."""
     inputs = TerrainPairInputs()
@@ -1162,18 +1131,169 @@ def _pair_inputs(model, pipeline) -> TerrainPairInputs:
     return inputs
 
 
-def test_tiled_kernels_match_one_thread_kernels(test, device):
-    """Give a solid pair the same rows, bit for bit, whether one thread or a tile of lanes walks its window, and so
-    whichever lane the shadow's run-time choice takes.
+_SOLID_MODULES = {
+    TERRAIN_PARTNER_BOX: (terrain_law_box, "box"),
+    TERRAIN_PARTNER_CYLINDER: (terrain_law_cylinder, "cylinder"),
+    TERRAIN_PARTNER_HULL: (terrain_law_hull, "hull"),
+}
+_WHOLE_PAIR_EXITS = int(
+    TERRAIN_PAIR_TILE_EXIT
+    | TERRAIN_PAIR_STALE
+    | TERRAIN_PAIR_FILTERED
+    | TERRAIN_PAIR_OUTSIDE
+    | TERRAIN_PAIR_UNSUPPORTED
+)
+"""States of a pair the whole-pair rejects take (no row)."""
+_LIST_OF_KERNEL = {
+    "scan": "scans",
+    "faces": "faces",
+    "edges": "edges",
+    "thetas": "thetas",
+    "vertices": "vertices",
+    "close": "live",
+    "recovery": "recover",
+    "xitems": "xitems",
+    "xvalleys": "xvalleys",
+}
+"""The list each job kernel strides over (:class:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs`)."""
+_COUNTER_OF_LIST = {name: k for k, name in enumerate(TERRAIN_LAW_JOB_NAMES)}
+_COUNTER_OF_LIST.update(
+    {"live": TERRAIN_LAW_JOB_NAMES.index("live"), "recover": TERRAIN_LAW_JOB_NAMES.index("recovery")}
+)
 
-    One arm walks every pair of the classes' tiled segments in one thread; the other queues every walking pair for the
-    tiled kernel (``thread_vertices`` 1) and runs it on a grid of 3 blocks, so that blocks stride over the queue, the
-    full-finish kernel on 3 blocks too. Windows of up to 256 vertices are marked by the lanes and replayed by the
-    first; larger ones (one solid per class here) are walked by the first lane alone. The shadow's own rows (windows
-    over 64 vertices tiled, the others in one thread) are those rows too. Every launch takes the shadow's block size;
-    the CPU runs one lane.
+
+def _kernel(partner_class, name):
+    """A solid class's kernel ``name`` of :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LAUNCHES`."""
+    module, class_name = _SOLID_MODULES[partner_class]
+    return getattr(module, f"terrain_{class_name}_rows" + ("" if name == "rows" else f"_{name}"))
+
+
+def _class_pairs(table, partner_class) -> tuple[int, int]:
+    """A solid class's table pairs ``[begin, end)`` (both lane classes)."""
+    return table.segment(partner_class, TERRAIN_LANE_THREAD)[0], table.segment(partner_class, TERRAIN_LANE_TILE)[1]
+
+
+def _class_jobs(model, shadow, partner_class, *, threads=None, **capacities):
+    """A solid class's jobs, sized as the shadow sizes them but for ``capacities`` (entries per list), with ``threads``
+    job threads (by default the shadow's)."""
+    table = shadow.table
+    begin, end = _class_pairs(table, partner_class)
+    points, takes = terrain_law_solid.terrain_solid_exit_items(model, table.pairs_host[begin:end, 1])
+    sizes = terrain_law_solid.terrain_solid_job_capacities(
+        table.vertices[begin:end],
+        points,
+        takes,
+        table.candidates[begin:end],
+        int(TERRAIN_PARTNER_WALK_SLOTS[partner_class]),
+    )
+    sizes.update(capacities)
+    jobs = terrain_law_solid.terrain_solid_jobs(model.device, partner_class, begin, end - begin, sizes)
+    if threads is not None:
+        jobs.threads = int(threads)
+    return jobs
+
+
+def _reverse_list(jobs, name):
+    """Reverse the filled entries of job list ``name`` (the order its kernel takes them in)."""
+    entries = getattr(jobs, name)
+    count = min(int(jobs.counts.numpy()[_COUNTER_OF_LIST[name]]), entries.shape[0])
+    values = entries.numpy()
+    values[:count] = values[:count][::-1].copy()
+    entries.assign(values)
+
+
+def _run_class(
+    pipeline,
+    model,
+    partner_class,
+    *,
+    jobs=None,
+    reverse=False,
+    until=None,
+    full=False,
+    blocks=None,
+    extra_blocks=0,
+    candidates=None,
+):
+    """Run a solid class's launches (:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LAUNCHES`) for a
+    shadow pipeline's last collide into a side buffer of their own (:func:`_side_buffer`), with ``jobs`` (by default
+    sized as the shadow's), every list reversed before its kernel takes it with ``reverse``, up to the launch ``until``
+    (not run). With ``full``, every pair the shadow did not reject whole goes straight to the full-finish kernel, which
+    walks it. The full-finish kernel's grid holds ``blocks`` blocks (by default the shadow's) of ``candidates``
+    candidates (by default the class's bound), launched with ``extra_blocks`` more. Returns ``(out, jobs, solids)``."""
+    shadow = pipeline._terrain_law_shadow
+    table = shadow.table
+    device = model.device
+    begin, end = _class_pairs(table, partner_class)
+    if jobs is None:
+        jobs = _class_jobs(model, shadow, partner_class)
+    solids = terrain_law_solid.terrain_solid_data(model, table.pairs_host[:, 1], pairs=table.pair_count)
+    out = _side_buffer(begin, end - begin, TERRAIN_PARTNER_WALK_SLOTS[partner_class], table.pair_count, device)
+    capacity = _full_candidates(shadow, partner_class) if candidates is None else candidates
+    scratch = terrain_finish_scratch(device, capacity, blocks=blocks)
+    grid = scratch.blocks
+    if extra_blocks:
+        # room for the extra blocks, which must return at once
+        scratch = terrain_finish_scratch(device, capacity, blocks=grid + extra_blocks)
+        scratch.blocks = grid
+    args = [begin, 0, _pair_inputs(model, pipeline), shadow.features.data(), out]
+    block = terrain_law_block_dim(device)
+    launches = TERRAIN_SOLID_LAUNCHES
+    if full:
+        walked = np.arange(begin, end, dtype=np.int32)
+        walked = walked[(shadow._out.state.numpy()[begin:end] & _WHOLE_PAIR_EXITS) == 0]
+        deferred = out.deferred.numpy()
+        deferred[begin : begin + len(walked)] = walked
+        out.deferred.assign(deferred)
+        counts = out.deferred_count.numpy()
+        counts[partner_class] = len(walked)
+        out.deferred_count.assign(counts)
+        launches = launches[-1:]
+    for kind, name in launches:
+        if name == until:
+            break
+        if reverse and name in _LIST_OF_KERNEL:
+            _reverse_list(jobs, _LIST_OF_KERNEL[name])
+        kernel = _kernel(partner_class, name)
+        if kind == "full":
+            inputs = [*args, scratch, solids, jobs]
+            wp.launch_tiled(kernel, dim=grid + extra_blocks, inputs=inputs, block_dim=block, device=device)
+        else:
+            dim = end - begin if kind == "pairs" else jobs.threads
+            wp.launch(kernel, dim=dim, inputs=[*args, jobs, solids], block_dim=block, device=device)
+    return out, jobs, solids
+
+
+def _assert_same_rows(test, a, b, pairs, what):
+    """Assert two side buffers hold the same rows, bit for bit, for table pairs ``pairs``, wherever each keeps them."""
+    for name in ("count", "state"):
+        np.testing.assert_array_equal(
+            getattr(a, name).numpy()[pairs], getattr(b, name).numpy()[pairs], err_msg=f"{what}: {name}"
+        )
+    for pair in pairs:
+        x, y = _pair_rows(a, pair), _pair_rows(b, pair)
+        for name in ("q", "n", "d", "feature"):
+            np.testing.assert_array_equal(x[name], y[name], err_msg=f"{what}: pair {pair} {name}")
+
+
+def _counts(jobs) -> dict:
+    """A solid class's job counters by name (:data:`~newton._src.geometry.terrain_shadow.TERRAIN_LAW_JOB_NAMES`)."""
+    return dict(zip(TERRAIN_LAW_JOB_NAMES, (int(v) for v in jobs.counts.numpy()), strict=True))
+
+
+def test_job_pipeline_rows_are_the_walks(test, device):
+    """Give a solid pair the rows its window's walk gives, bit for bit, whatever order its jobs run in.
+
+    Solids of every class over rough terrain, among them of every class one whose window holds over 256 vertices (its
+    scan takes several jobs, :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_SCAN_VERTICES` window
+    vertices each). Three arms per class: its launches as the shadow runs them; the same with one job thread and every
+    list reversed before its kernel takes it (the scan's jobs, the features, the creases, the live pairs, the pairs left
+    to rule R, rule X's items and valleys), so that the candidate pool holds every pair's rows in another order; and
+    every pair walked again by the full-finish kernel alone, in window order. The close holds a pair's candidates by
+    their place in window order (a cluster plane two scan jobs list is one offer), so the arms agree with each other and
+    with the shadow's own rows.
     """
-    hf, model, shapes, bodies = _tile_scene(np.random.default_rng(37), device)
+    hf, model, shapes, bodies = _window_scene(np.random.default_rng(37), device)
     pipeline, _contacts, _state = _collide(model, shadow=True)
     shadow = pipeline._terrain_law_shadow
     table = shadow.table
@@ -1181,57 +1301,35 @@ def test_tiled_kernels_match_one_thread_kernels(test, device):
     large = {
         shape_class[shape] for shape, body in zip(shapes, bodies, strict=True) if _window_vertices(hf, *body) > 256
     }
-    test.assertEqual(large, {TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_HULL})
-    # the shadow's run-time choice took both lanes in every class
-    queued = {c: len(_queued(shadow, c)) for c in _SOLID_KERNELS}
-    test.assertTrue(all(v > 0 for v in queued.values()), msg=queued)
-    expected = shadow.rows()
-    first_row = np.concatenate([[0], np.cumsum(expected["count"])])
-    inputs = _pair_inputs(model, pipeline)
-    partners = table.pairs_host[:, 1]
+    test.assertEqual(large, set(_SOLID_MODULES))
     walked = 0
-    for partner_class, (module, thread, tiled, exit_, full) in _SOLID_KERNELS.items():
-        begin, end = table.segment(partner_class, TERRAIN_LANE_TILE)
-        test.assertGreater(end - begin, 0)
-        rows = TERRAIN_PARTNER_WALK_SLOTS[partner_class]
-        outputs = []
-        block = terrain_law_block_dim(device)
-        for thread_vertices in (0, 1):
-            solids = terrain_law_solid.terrain_solid_data(model, partners, thread_vertices=thread_vertices)
-            out = _side_buffer(begin, end - begin, rows, table.pair_count, device)
-            work = terrain_pair_work(device, begin, end - begin)
-            work.blocks = 3
-            scratch = terrain_finish_scratch(device, _full_candidates(shadow, partner_class), blocks=3)
-            walk = [begin, 0, inputs, shadow.features.data(), out, work, solids]
-            wp.launch(getattr(module, thread), dim=end - begin, inputs=walk, block_dim=block, device=device)
-            if thread_vertices:
-                test.assertGreater(int(work.count.numpy()[0]), 3)
-                wp.launch_tiled(getattr(module, tiled), dim=work.blocks, inputs=walk, block_dim=block, device=device)
-            wp.launch(getattr(module, exit_), dim=end - begin, inputs=walk, block_dim=block, device=device)
-            finish = [begin, 0, inputs, shadow.features.data(), out, scratch, solids]
-            wp.launch_tiled(getattr(module, full), dim=scratch.blocks, inputs=finish, block_dim=block, device=device)
-            outputs.append(out)
-        one, lanes = outputs
-        for name in ("count", "state"):
-            np.testing.assert_array_equal(getattr(one, name).numpy(), getattr(lanes, name).numpy(), err_msg=name)
-        # the shadow's rows of the segment: the same, pair by pair, wherever each side keeps them
-        count = one.count.numpy()[begin:end]
-        np.testing.assert_array_equal(expected["count"][begin:end], count)
-        np.testing.assert_array_equal(expected["state"][begin:end], one.state.numpy()[begin:end])
-        for i in range(end - begin):
-            a = first_row[begin + i]
-            got, other = _pair_rows(one, begin + i), _pair_rows(lanes, begin + i)
-            for name in ("q", "n", "d", "feature"):
-                np.testing.assert_array_equal(expected[name][a : a + count[i]], got[name], err_msg=name)
-                np.testing.assert_array_equal(other[name], got[name], err_msg=name)
-        walked += int(count.sum())
+    for partner_class in _SOLID_MODULES:
+        with test.subTest(partner_class=partner_class):
+            begin, end = _class_pairs(table, partner_class)
+            pairs = np.arange(begin, end)
+            jobs_out, jobs, _solids = _run_class(pipeline, model, partner_class)
+            counts = _counts(jobs)
+            # windows of several scan jobs; pairs the jobs finished (not deferred), some by rule X
+            test.assertGreater(counts["scans"], counts["live"])
+            test.assertLess(int(jobs_out.deferred_count.numpy()[partner_class]), counts["live"])
+            reversed_out, reversed_jobs, _solids = _run_class(
+                pipeline, model, partner_class, jobs=_class_jobs(model, shadow, partner_class, threads=1), reverse=True
+            )
+            pool = counts["candidates"]
+            test.assertEqual(_counts(reversed_jobs)["candidates"], pool)
+            test.assertFalse(np.array_equal(jobs.key.numpy()[:pool], reversed_jobs.key.numpy()[:pool]))
+            full_out, _jobs, _solids = _run_class(pipeline, model, partner_class, full=True)
+            _assert_same_rows(test, shadow._out, jobs_out, pairs, "the shadow's launch")
+            _assert_same_rows(test, jobs_out, reversed_out, pairs, "the lists reversed")
+            _assert_same_rows(test, jobs_out, full_out, pairs, "the full walk")
+            walked += int(jobs_out.count.numpy()[begin:end].sum())
     test.assertGreater(walked, 20)
 
 
 def _valley_large(device):
     """Long solids sunk along a V-valley (30 deg walls meeting along y at x = 0, 5 cm cells), each deepest along the
-    valley's line, which only rule X reaches (axes 5 mm below it, a box's edge 20 mm): windows of over 64 vertices (the
-    tiled kernels mark them) and over 256 (the first lane walks them alone)."""
+    valley's line, which only rule X reaches (axes 5 mm below it, a box's edge 20 mm): windows of over 64 vertices and
+    over 256 (their scans take several jobs)."""
     th = np.radians(30.0)
     x = np.linspace(-1.0, 1.0, 41)
     heights = np.tile(np.abs(x) * np.tan(th), (65, 1))
@@ -1248,14 +1346,14 @@ def _valley_large(device):
     return hf, model, shapes, bodies
 
 
-def test_exits_match_across_kernels(test, device):
-    """Give a solid pair the same rule X row and rows, bit for bit, whether its walk is one thread's, a tile of lanes'
-    (each followed by the class's exit kernel) or the full-finish kernel's (rule X inline).
+def test_rule_x_lists_give_the_full_passes(test, device):
+    """Give a solid pair the same rule X row and rows, bit for bit, whether its exit kernel takes its listed candidates,
+    every candidate of its window, or the full-finish kernel walks it again and runs rule X itself.
 
-    Long solids sunk along a valley, each deepest along its line (only an exit reaches it): a cylinder, ellipsoids
-    whose windows hold over 64 and over 256 vertices, and a box. One arm walks every pair in one thread, one queues
-    every pair for the tiled kernel (``thread_vertices`` 1, a grid of 3 blocks), both leaving their pairs to the exit
-    kernel; the third defers every pair to the full-finish kernel, which walks it again and runs rule X itself.
+    Long solids sunk along a valley, each deepest along its line (only an exit reaches it): a cylinder, ellipsoids and
+    a box. Rule X's item and valley jobs list the candidates whose bounds pass the pair's target, and the exit kernel
+    runs the rule's passes over those alone (any other is a no-op in both passes); with room for one item and one
+    valley, a pair's lists lack room and its exit kernel takes every candidate of its window.
     """
     hf, model, shapes, bodies = _valley_large(device)
     pipeline, _contacts, _state = _collide(model, shadow=True)
@@ -1265,60 +1363,30 @@ def test_exits_match_across_kernels(test, device):
     sizes = sorted(_window_vertices(hf, *body) for body in bodies)
     test.assertGreater(sizes[0], 64)
     test.assertGreater(sizes[-1], 256)
-    expected = shadow.rows()
-    first_row = np.concatenate([[0], np.cumsum(expected["count"])])
     exits = [g for shape in shapes for g in tu.shadow_rows(pipeline)[shape] if su.is_exit_row(g)]
     test.assertEqual(len(exits), len(bodies))
-    inputs = _pair_inputs(model, pipeline)
-    partners = table.pairs_host[:, 1]
-    block = terrain_law_block_dim(device)
     for partner_class in sorted({shape_class[s] for s in shapes}):
-        module, thread, tiled, exit_, full = _SOLID_KERNELS[partner_class]
-        begin, end = table.segment(partner_class, TERRAIN_LANE_TILE)
-        test.assertGreater(end - begin, 0)
-        rows = TERRAIN_PARTNER_WALK_SLOTS[partner_class]
-        outputs = []
-        for arm in ("thread", "tiled", "full"):
-            solids = terrain_law_solid.terrain_solid_data(model, partners, thread_vertices=int(arm == "tiled"))
-            out = _side_buffer(begin, end - begin, rows, table.pair_count, device)
-            work = terrain_pair_work(device, begin, end - begin)
-            work.blocks = 3
-            scratch = terrain_finish_scratch(device, _full_candidates(shadow, partner_class), blocks=3)
-            walk = [begin, 0, inputs, shadow.features.data(), out, work, solids]
-            if arm == "full":
-                deferred = out.deferred.numpy()
-                deferred[begin:end] = np.arange(begin, end)
-                out.deferred.assign(deferred)
-                counts = out.deferred_count.numpy()
-                counts[partner_class] = end - begin
-                out.deferred_count.assign(counts)
-            else:
-                wp.launch(getattr(module, thread), dim=end - begin, inputs=walk, block_dim=block, device=device)
-                if arm == "tiled":
-                    test.assertEqual(int(work.count.numpy()[0]), end - begin)
-                    wp.launch_tiled(
-                        getattr(module, tiled), dim=work.blocks, inputs=walk, block_dim=block, device=device
-                    )
-                test.assertGreater(int(solids.exit_count.numpy()[partner_class]), 0)
-                wp.launch(getattr(module, exit_), dim=end - begin, inputs=walk, block_dim=block, device=device)
-            finish = [begin, 0, inputs, shadow.features.data(), out, scratch, solids]
-            wp.launch_tiled(getattr(module, full), dim=scratch.blocks, inputs=finish, block_dim=block, device=device)
-            test.assertGreater(solids.exit_work.numpy()[0], 0)
-            outputs.append(out)
-        for name in ("count", "state"):
-            for other in outputs[1:]:
-                np.testing.assert_array_equal(
-                    getattr(outputs[0], name).numpy()[begin:end], getattr(other, name).numpy()[begin:end], err_msg=name
-                )
-        np.testing.assert_array_equal(expected["count"][begin:end], outputs[0].count.numpy()[begin:end])
-        for i in range(end - begin):
-            a = first_row[begin + i]
-            got = [_pair_rows(out, begin + i) for out in outputs]
-            for name in ("q", "n", "d", "feature"):
-                np.testing.assert_array_equal(expected[name][a : a + len(got[0][name])], got[0][name], err_msg=name)
-                for other in got[1:]:
-                    np.testing.assert_array_equal(other[name], got[0][name], err_msg=name)
-            test.assertEqual(int(np.sum((got[0]["feature"] & 7) == 7)), 1)
+        with test.subTest(partner_class=partner_class):
+            begin, end = _class_pairs(table, partner_class)
+            pairs = np.arange(begin, end)
+            listed_out, listed, solids = _run_class(pipeline, model, partner_class)
+            test.assertGreater(int(solids.exit_count.numpy()[partner_class]), 0)
+            test.assertGreater(int(solids.exit_work.numpy()[0]), 0)
+            # the listed passes: no pair's lists lacked room
+            test.assertFalse(np.any(listed.xall.numpy()))
+            heads = listed.xhead.numpy()
+            test.assertTrue(np.any(heads >= 0))
+            every_out, every, solids = _run_class(
+                pipeline, model, partner_class, jobs=_class_jobs(model, shadow, partner_class, xitems=1, xvalleys=1)
+            )
+            test.assertTrue(np.any(every.xall.numpy()))
+            test.assertGreater(int(solids.exit_work.numpy()[0]), 0)
+            full_out, _jobs, _solids = _run_class(pipeline, model, partner_class, full=True)
+            _assert_same_rows(test, shadow._out, listed_out, pairs, "the shadow's launch")
+            _assert_same_rows(test, listed_out, every_out, pairs, "every candidate")
+            _assert_same_rows(test, listed_out, full_out, pairs, "the full walk")
+            features = np.concatenate([_pair_rows(listed_out, p)["feature"] for p in pairs])
+            test.assertEqual(int(np.sum((features & 7) == 7)), sum(shape_class[s] == partner_class for s in shapes))
 
 
 def test_exit_work_stays_bounded(test, device):
@@ -1451,20 +1519,10 @@ def test_deferred_pairs_keep_their_rows_beyond_the_grid(test, device):
     expected = shadow.rows()
     test.assertTrue(np.all(expected["count"] > terrain_law_box.TERRAIN_BOX_WALK_SLOTS))
     test.assertTrue(np.all(expected["state"] == 0))
-    inputs = _pair_inputs(model, pipeline)
-    solids = terrain_law_solid.terrain_solid_data(model, shadow.table.pairs_host[:, 1], thread_vertices=0)
-    rows = TERRAIN_PARTNER_WALK_SLOTS[TERRAIN_PARTNER_BOX]
-    begin, end = shadow.table.segment(TERRAIN_PARTNER_BOX, TERRAIN_LANE_TILE)
+    begin, end = _class_pairs(shadow.table, TERRAIN_PARTNER_BOX)
     test.assertEqual(end - begin, len(bodies))
-    out = _side_buffer(begin, end - begin, rows, shadow.table.pair_count, device)
-    block = terrain_law_block_dim(device)
-    work = terrain_pair_work(device, begin, end - begin)
-    walk = [begin, 0, inputs, shadow.features.data(), out, work, solids]
-    wp.launch(terrain_law_box.terrain_box_rows, dim=end - begin, inputs=walk, block_dim=block, device=device)
+    out, _jobs, _solids = _run_class(pipeline, model, TERRAIN_PARTNER_BOX, blocks=1)
     test.assertEqual(int(out.deferred_count.numpy()[TERRAIN_PARTNER_BOX]), len(bodies))
-    scratch = terrain_finish_scratch(device, _full_candidates(shadow, TERRAIN_PARTNER_BOX), blocks=1)
-    finish = [begin, 0, inputs, shadow.features.data(), out, scratch, solids]
-    wp.launch_tiled(terrain_law_box.terrain_box_rows_full, dim=1, inputs=finish, block_dim=block, device=device)
     state = out.state.numpy()
     test.assertEqual(int(out.spilled.numpy()[0]), int(expected["count"].sum()))
     for i, (_kind, dims, pose) in enumerate(bodies):
@@ -1555,17 +1613,9 @@ def test_window_past_its_bound_is_flagged(test, device):
     _kind, dims, pose = bodies[0]
     pipeline, _contacts, _state = _collide(model, shadow=True)
     shadow = pipeline._terrain_law_shadow
-    inputs = _pair_inputs(model, pipeline)
-    solids = terrain_law_solid.terrain_solid_data(model, shadow.table.pairs_host[:, 1], thread_vertices=0)
-    rows = TERRAIN_PARTNER_WALK_SLOTS[TERRAIN_PARTNER_BOX]
-    begin, end = shadow.table.segment(TERRAIN_PARTNER_BOX, TERRAIN_LANE_TILE)
-    out = _side_buffer(begin, end - begin, rows, shadow.table.pair_count, device)
-    block = terrain_law_block_dim(device)
-    walk = [begin, 0, inputs, shadow.features.data(), out, terrain_pair_work(device, begin, end - begin), solids]
-    wp.launch(terrain_law_box.terrain_box_rows, dim=end - begin, inputs=walk, block_dim=block, device=device)
-    scratch = terrain_finish_scratch(device, 32, blocks=1)
-    finish = [begin, 0, inputs, shadow.features.data(), out, scratch, solids]
-    wp.launch_tiled(terrain_law_box.terrain_box_rows_full, dim=1, inputs=finish, block_dim=block, device=device)
+    begin, _end = _class_pairs(shadow.table, TERRAIN_PARTNER_BOX)
+    out, _jobs, _solids = _run_class(pipeline, model, TERRAIN_PARTNER_BOX, blocks=1, candidates=32)
+    test.assertEqual(int(out.deferred_count.numpy()[TERRAIN_PARTNER_BOX]), 1)
     state = int(out.state.numpy()[begin])
     test.assertEqual(state & int(TERRAIN_PAIR_CANDIDATE_OVERFLOW), int(TERRAIN_PAIR_CANDIDATE_OVERFLOW))
     test.assertEqual(out.overflow.numpy().tolist(), [0, 1])
@@ -1585,8 +1635,8 @@ def test_window_past_its_bound_is_flagged(test, device):
 
 
 def _capture_scene(device):
-    """Every solid kind on ridges of different heights, in both lane classes (small solids one thread per pair, long
-    ones a tile of lanes), and a long box whose rows overflow its slots (its class's full kernel finishes it)."""
+    """Every solid kind on ridges of different heights, small and long, a long box whose rows overflow its slots (its
+    class's full kernel finishes it), and a box and an ellipsoid whose windows take several scan jobs."""
     rng = np.random.default_rng(2)
     heights = np.zeros((41, 41))
     heights[:, 1::2] = rng.uniform(0.02, 0.035, size=41)[1::2]
@@ -1608,7 +1658,7 @@ def _capture_scene(device):
         lo, _hi = ref.make_core(kind, dims, np.r_[x, y, 0.0, q]).aabb()
         bodies.append((kind, dims, _f32_pose(np.r_[x, y, top - lo[2] - 0.002, q])))
     bodies.append(("box", {"half": (0.9, 0.05, 0.02)}, _f32_pose([0.0, 1.4, top + 0.02 + 0.002, 0.0, 0.0, 0.005, 1.0])))
-    # windows of more than the one-thread kernels' 64 vertices, which the tiled kernels walk
+    # windows of more than one scan job's vertices
     for kind, dims in (("box", {"half": (0.5, 0.4, 0.03)}), ("ellipsoid", {"semi": (0.5, 0.4, 0.06)})):
         lo, _hi = ref.make_core(kind, dims, np.r_[0.0, -1.2, 0.0, 0.0, 0.0, 0.0, 1.0]).aabb()
         x = -0.9 if kind == "box" else 0.9
@@ -1620,13 +1670,12 @@ def test_solid_shadow_runs_under_graph_capture(test, device):
     """Capture the solid classes' shadow with the collide in a CUDA graph and replay it, again and again, to an
     uncaptured collide's rows.
 
-    Every solid class runs, with both lane classes of the pair table; a box and an ellipsoid whose windows exceed the
-    one-thread kernels' 64 vertices go to the tiled kernels (the queue and its count the capture zeroes, the tiles'
-    mark sums), pairs reaching below their windows' highest vertices go to the exit kernels (their lists' counts), and
-    a long box defers to its class's full kernel, whose grid reads the deferred count, and spills. The spill region
-    holds exactly the rows the scene asks for, so that a replay that did not zero the spill counters would find no
-    room on its second run. The shadow's launches are also captured alone with the device's memory pool off, so that
-    an allocation inside them raises instead of becoming a graph allocation node.
+    Every solid class runs: windows of several scan jobs (a box and an ellipsoid), the job lists and the candidate pool
+    (their counters the capture zeroes), pairs reaching below their windows' highest vertices through rule X's lists and
+    exit kernels, and a long box deferred to its class's full kernel, whose grid reads the deferred count, and spilled.
+    The spill region holds exactly the rows the scene asks for, so that a replay that did not zero the spill counters
+    would find no room on its second run. The shadow's launches are also captured alone with the device's memory pool
+    off, so that an allocation inside them raises instead of becoming a graph allocation node.
     """
     model, _hfield, _shapes = _capture_scene(device)
     probe = tu.shadow_pipeline(model, classes="all", **PIPELINE)
@@ -1637,22 +1686,19 @@ def test_solid_shadow_runs_under_graph_capture(test, device):
         pipeline = tu.shadow_pipeline(model, classes="all", **PIPELINE)
     shadow = pipeline._terrain_law_shadow
     test.assertEqual(shadow.spill_rows, need)
-    table = shadow.table
-    for partner_class in (TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_HULL):
-        for lane in (TERRAIN_LANE_THREAD, TERRAIN_LANE_TILE):
-            begin, end = table.segment(partner_class, lane)
-            test.assertGreater(end - begin, 0, msg=(partner_class, lane))
     state = model.state()
     contacts = pipeline.contacts()
     pipeline.collide(state, contacts)
     expected = shadow.rows()
+    counts = shadow.job_counts()
     test.assertTrue(np.all(expected["count"] > 0), msg=expected["count"])
     # the long box's rows exceed its walk slots: the full kernel writes them to the spill region
     test.assertGreaterEqual(shadow.rows_spilled(), int(expected["count"].max()))
     test.assertTrue(np.all(expected["state"] & 48 == 0))
-    # the tiled kernels walk the windows over 64 vertices (a box and an ellipsoid)
-    test.assertGreater(len(_queued(shadow, TERRAIN_PARTNER_BOX)), 0)
-    test.assertGreater(len(_queued(shadow, TERRAIN_PARTNER_HULL)), 0)
+    # windows of several scan jobs (a box and an ellipsoid), and rule X's lists
+    test.assertGreater(counts["box"]["scans"], counts["box"]["live"])
+    test.assertGreater(counts["hull"]["scans"], counts["hull"]["live"])
+    test.assertGreater(sum(c["xitems"] for c in counts.values()), 0)
     # Move the bodies, so that the replay must recompute the rows.
     moved = model.state()
     q = moved.body_q.numpy()
@@ -1669,6 +1715,7 @@ def test_solid_shadow_runs_under_graph_capture(test, device):
             np.testing.assert_array_equal(replayed[name], expected[name], err_msg=name)
         test.assertEqual(shadow.rows_spilled(), need)
         test.assertEqual(shadow.overflow_counts(), (0, 0))
+        test.assertEqual(shadow.job_counts(), counts)
     test.assertFalse(any(pipeline.narrow_phase.buffer_capacity_status().values()))
     # The shadow alone without a memory pool; its replay recomputes rows forgotten after an uncaptured collide.
     pooled = wp.is_mempool_enabled(device)
@@ -1695,22 +1742,21 @@ def test_solid_shadow_runs_under_graph_capture(test, device):
         np.testing.assert_array_equal(replayed[name], expected[name], err_msg=name)
 
 
-def test_solid_launches_share_the_point_grids(test, device):
-    """Launch every solid kernel on the shadow's shared mechanism, as the point class's: one block size, the one-thread
-    kernel over the class, the tiled kernel on its work list's fixed grid, the exit kernel (rule X) over the class, the
-    full-finish kernel on the fixed grid of its scratch.
+def test_solid_launches_take_fixed_grids(test, device):
+    """Launch every solid kernel with the dimensions fixed at construction, as the route record holds them: one block
+    size; the whole-pair rejects and the exit kernel one thread per pair of the class; the scan, the job kernels, the
+    close and rule R's kernel the class's job threads, each striding over its list; the full-finish kernel the fixed
+    grid of its scratch.
 
-    Every solid class has pairs of both lane classes here, windows over the one-thread kernel's 64 vertices (a box and
-    an ellipsoid) and a deferring box. The one-thread kernel queues exactly once each pair it leaves to the tiled
-    kernel, every one a tiled-lane pair past the whole-pair rejects.
+    Every solid class has pairs here, windows of several scan jobs (a box and an ellipsoid) and a deferring box. The
+    live list holds every pair past the whole-pair rejects once.
     """
     model, _hfield, _shapes = _capture_scene(device)
     pipeline = tu.shadow_pipeline(model, classes="all", **PIPELINE)
     shadow = pipeline._terrain_law_shadow
-    table = shadow.table
     launched = {}
     launch, launch_tiled = wp.launch, wp.launch_tiled
-    modules = {module.__name__ for module, *_names in _SOLID_KERNELS.values()}
+    modules = {module.__name__ for module, _name in _SOLID_MODULES.values()}
 
     def recorder(original, how):
         def record(kernel, *args, **kwargs):
@@ -1724,104 +1770,123 @@ def test_solid_launches_share_the_point_grids(test, device):
         with patch.object(wp, "launch_tiled", recorder(launch_tiled, "tiled")):
             pipeline.collide(model.state(), pipeline.contacts())
     block = terrain_law_block_dim(device)
-    rows = shadow.rows()
-    exits = int(TERRAIN_PAIR_TILE_EXIT | TERRAIN_PAIR_STALE | TERRAIN_PAIR_FILTERED | TERRAIN_PAIR_OUTSIDE)
-    exits |= int(TERRAIN_PAIR_UNSUPPORTED)
-    for partner_class, (module, thread, tiled, exit_, full) in _SOLID_KERNELS.items():
-        begin = table.segment(partner_class, TERRAIN_LANE_THREAD)[0]
-        tiled_begin, end = table.segment(partner_class, TERRAIN_LANE_TILE)
-        test.assertGreater(tiled_begin, begin)
-        test.assertGreater(end, tiled_begin)
-        test.assertEqual(launched[getattr(module, thread).key], [("launch", end - begin, block)])
-        tiled_blocks = min(end - tiled_begin, TERRAIN_LAW_TILE_BLOCKS)
-        test.assertEqual(launched[getattr(module, tiled).key], [("tiled", tiled_blocks, block)])
-        test.assertEqual(launched[getattr(module, exit_).key], [("launch", end - begin, block)])
-        full_blocks = shadow.describe()["launch_shapes"][module.__name__.rsplit("_", 1)[1]]["full_blocks"]
-        test.assertEqual(launched[getattr(module, full).key], [("tiled", full_blocks, block)])
-        queued = _queued(shadow, partner_class)
-        test.assertEqual(len(np.unique(queued)), len(queued))
-        test.assertTrue(np.all((queued >= tiled_begin) & (queued < end)), msg=queued)
-        state = rows["state"][np.searchsorted(shadow._listed, queued)]
-        test.assertFalse(np.any(state & exits), msg=state)
-    test.assertGreater(len(_queued(shadow, TERRAIN_PARTNER_BOX)), 0)
-    test.assertGreater(len(_queued(shadow, TERRAIN_PARTNER_HULL)), 0)
+    shapes = shadow.describe()["launch_shapes"]
+    states = shadow._out.state.numpy()
+    for partner_class, (_module, name) in _SOLID_MODULES.items():
+        with test.subTest(partner_class=name):
+            begin, end = _class_pairs(shadow.table, partner_class)
+            jobs = shadow._jobs[partner_class]
+            record = shapes[name]
+            test.assertEqual(record["pair_dim"], end - begin)
+            test.assertEqual(record["job_threads"], jobs.threads)
+            for kind, kernel_name in TERRAIN_SOLID_LAUNCHES:
+                dim = {"pairs": ("launch", end - begin), "jobs": ("launch", jobs.threads)}.get(kind)
+                if dim is None:
+                    dim = ("tiled", record["full_blocks"])
+                key = _kernel(partner_class, kernel_name).key
+                test.assertEqual(launched[key], [(*dim, block)], msg=key)
+            counts = shadow.job_counts()[name]
+            live = jobs.live.numpy()[: counts["live"]] + begin
+            test.assertEqual(
+                sorted(live.tolist()), (begin + np.flatnonzero((states[begin:end] & _WHOLE_PAIR_EXITS) == 0)).tolist()
+            )
+    test.assertGreater(shadow.job_counts()["box"]["scans"], shadow.job_counts()["box"]["live"])
     test.assertGreater(int(shadow._out.deferred_count.numpy()[TERRAIN_PARTNER_BOX]), 0)
 
 
-def test_solid_fixed_grids_take_each_pair_once(test, device):
-    """Take every queued and every deferred solid pair once, even in a launch with more blocks than the grid.
+def test_job_grids_take_each_entry_once(test, device):
+    """Take every job and every deferred pair once, whatever the job kernels' grid, and with a full-finish launch of
+    more blocks than its grid.
 
-    The solid tiled and full-finish kernels stride over their lists by the grids fixed in the work list and in the
-    finish scratch (``work.blocks``, ``scratch.blocks``); a block past that grid returns at once. Long boxes lie across
-    ridges: their windows exceed the one-thread kernel's vertices (queued) and their rows the box class's slots
-    (deferred). Launched with three blocks more (and scratch room for them), the tiled kernel would otherwise take
-    queued pairs twice, deferring them twice, and the full-finish kernel would finish deferred pairs twice, counting
-    their row overflow twice.
+    The scan, job, close and rule R kernels stride over their lists by the class's job threads (``jobs.threads``, fixed
+    at construction); the full-finish kernel strides over the deferred list by its scratch's grid (``scratch.blocks``),
+    a block past it returning at once. Long boxes lie across ridges: their rows exceed the box class's walk slots
+    (deferred, spilled). One job thread, three and the shadow's give the same rows, as does a full-finish launch of
+    three blocks more than its grid of two, which would otherwise finish deferred pairs twice, counting their spill rows
+    twice.
     """
     _hf, model, _shapes, bodies = _ridge_boxes(device, (0.9, 0.05, 0.02), (-0.75, -0.45, -0.15, 0.15, 0.45, 0.75))
     pipeline, _contacts, _state = _collide(model, shadow=True)
     shadow = pipeline._terrain_law_shadow
-    table = shadow.table
-    begin = table.segment(TERRAIN_PARTNER_BOX, TERRAIN_LANE_THREAD)[0]
-    tiled_begin, end = table.segment(TERRAIN_PARTNER_BOX, TERRAIN_LANE_TILE)
-    test.assertEqual(end - tiled_begin, len(bodies))
+    begin, end = _class_pairs(shadow.table, TERRAIN_PARTNER_BOX)
+    test.assertEqual(end - begin, len(bodies))
     rows = TERRAIN_PARTNER_WALK_SLOTS[TERRAIN_PARTNER_BOX]
-    inputs = _pair_inputs(model, pipeline)
-    data = shadow.features.data()
-    solids = terrain_law_solid.terrain_solid_data(model, table.pairs_host[:, 1])
-    block = terrain_law_block_dim(device)
-    blocks = 2
     results = []
-    for extra in (0, 3):
-        out = _side_buffer(begin, end - begin, rows, table.pair_count, device)
-        # Room for pairs deferred more than once, so that blocks past the grid fail the counts below instead of
-        # writing past the deferred list.
-        out.deferred = wp.zeros(4 * table.pair_count, dtype=wp.int32, device=device)
-        work = terrain_pair_work(device, tiled_begin, end - tiled_begin)
-        work.blocks = blocks
-        walk = [begin, 0, inputs, data, out, work, solids]
-        wp.launch(terrain_law_box.terrain_box_rows, dim=end - begin, inputs=walk, block_dim=block, device=device)
-        walk[:2] = [tiled_begin, (tiled_begin - begin) * rows]
-        wp.launch_tiled(
-            terrain_law_box.terrain_box_rows_tiled, dim=blocks + extra, inputs=walk, block_dim=block, device=device
-        )
-        deferred = int(out.deferred_count.numpy()[TERRAIN_PARTNER_BOX])
-        # The deferred list in table order, so that the entries each block takes do not depend on the device.
-        listed = out.deferred.numpy()
-        listed[begin : begin + deferred] = np.sort(listed[begin : begin + deferred])
-        out.deferred.assign(listed)
-        scratch = terrain_finish_scratch(device, _full_candidates(shadow, TERRAIN_PARTNER_BOX), blocks=blocks + extra)
-        scratch.blocks = blocks
-        finish = [begin, 0, inputs, data, out, scratch, solids]
-        wp.launch_tiled(
-            terrain_law_box.terrain_box_rows_full, dim=blocks + extra, inputs=finish, block_dim=block, device=device
-        )
+    for threads, extra in ((None, 0), (1, 0), (3, 0), (None, 3)):
+        jobs = _class_jobs(model, shadow, TERRAIN_PARTNER_BOX, threads=threads)
+        out, jobs, _solids = _run_class(pipeline, model, TERRAIN_PARTNER_BOX, jobs=jobs, blocks=2, extra_blocks=extra)
         results.append(
             {
-                "queued": int(work.count.numpy()[0]),
-                "deferred": deferred,
+                "counts": _counts(jobs),
+                "deferred": int(out.deferred_count.numpy()[TERRAIN_PARTNER_BOX]),
                 "overflow": out.overflow.numpy().tolist(),
                 "spilled": int(out.spilled.numpy()[0]),
-                **{name: getattr(out, name).numpy() for name in ("count", "state")},
-                "rows": [_pair_rows(out, pair) for pair in range(tiled_begin, end)],
+                "out": out,
             }
         )
-    grid, wider = results
-    # Not vacuous: more pairs are queued and deferred than the grid has blocks, and every deferred pair has more rows
-    # than its walk slots (spill rows).
-    test.assertEqual(grid["queued"], len(bodies))
+    grid = results[0]
+    # Not vacuous: more pairs are deferred than the grid has blocks, and every deferred pair has more rows than its
+    # walk slots (spill rows).
     test.assertEqual(grid["deferred"], len(bodies))
-    test.assertGreater(grid["deferred"], blocks)
     test.assertEqual(grid["overflow"], [0, 0])
-    test.assertTrue(np.all(grid["count"][tiled_begin:end] > rows))
-    test.assertEqual(grid["spilled"], int(grid["count"][tiled_begin:end].sum()))
-    for name in ("queued", "deferred", "overflow", "spilled"):
-        test.assertEqual(wider[name], grid[name], msg=name)
-    for name in ("count", "state"):
-        np.testing.assert_array_equal(wider[name], grid[name], err_msg=name)
-    for a, b in zip(wider["rows"], grid["rows"], strict=True):
-        for name in ("q", "n", "d", "feature"):
-            np.testing.assert_array_equal(a[name], b[name], err_msg=name)
+    count = grid["out"].count.numpy()[begin:end]
+    test.assertTrue(np.all(count > rows))
+    test.assertEqual(grid["spilled"], int(count.sum()))
+    for other in results[1:]:
+        for name in ("counts", "deferred", "overflow", "spilled"):
+            test.assertEqual(other[name], grid[name], msg=name)
+        _assert_same_rows(test, grid["out"], other["out"], np.arange(begin, end), "another grid")
+
+
+def test_job_overflow_takes_the_full_walk(test, device):
+    """Keep every pair's rows, bit for bit, when its class's job lists, candidate pool or scan jobs have no room for its
+    work, and warn with the entries asked for.
+
+    ``NEWTON_TERRAIN_LAW_SHADOW_JOBS`` scales the solid classes' job lists and candidate pools, sized at the scene level
+    from the pairs' own bounds: at 1e-6 each holds one entry. A pair whose work finds no room is left to its class's
+    full-finish kernel, which walks it again; the job check prints the entries asked for against the room, and no
+    capacity flag is raised (no row is lost). The scan's jobs, sized from every pair's bound on its window, lack room
+    only for a window its shape data no longer bounds: with room for one, the other pairs are deferred from the
+    whole-pair rejects on, before their scan.
+    """
+    model, _hfield, _shapes = _capture_scene(device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    expected = pipeline._terrain_law_shadow.rows()
+    capture = StdOutCapture()
+    capture.begin()
+    try:
+        with patch.dict(os.environ, {"NEWTON_TERRAIN_LAW_SHADOW_JOBS": "1e-6"}):
+            small, _contacts, _state = _collide(model, shadow=True)
+        # flush the device's printf before the capture ends
+        wp.synchronize()
+    finally:
+        message = capture.end()
+    shadow = small._terrain_law_shadow
+    record = shadow.describe()
+    test.assertEqual(record["job_scale"], 1.0e-6)
+    for name in ("box", "cylinder", "hull"):
+        capacities = record["launch_shapes"][name]["jobs"]
+        lists = {k: v for k, v in capacities.items() if k != "scans"}
+        test.assertEqual(lists, dict.fromkeys(lists, 1))
+        counts = shadow.job_counts()[name]
+        test.assertGreater(counts["faces"], 1)
+    test.assertIn("Terrain-law job list 0 of partner class 1 overflowed", message)
+    rows = shadow.rows()
+    for name in ("count", "state", "q", "n", "d", "feature"):
+        np.testing.assert_array_equal(rows[name], expected[name], err_msg=name)
+    test.assertGreater(int(shadow._out.deferred_count.numpy()[TERRAIN_PARTNER_CYLINDER]), 1)
+    test.assertFalse(any(small.narrow_phase.buffer_capacity_status().values()))
+    # room for one scan job
+    table = pipeline._terrain_law_shadow.table
+    for partner_class in _SOLID_MODULES:
+        with test.subTest(partner_class=partner_class):
+            begin, end = _class_pairs(table, partner_class)
+            jobs = _class_jobs(model, pipeline._terrain_law_shadow, partner_class, scans=1)
+            out, jobs, _solids = _run_class(pipeline, model, partner_class, jobs=jobs)
+            counts = _counts(jobs)
+            test.assertGreater(counts["scans"], 1)
+            test.assertGreaterEqual(int(out.deferred_count.numpy()[partner_class]), counts["live"] - 1)
+            _assert_same_rows(test, pipeline._terrain_law_shadow._out, out, np.arange(begin, end), "one scan job")
 
 
 def test_shadow_keeps_contacts_bitwise_with_every_class(test, device):
@@ -1976,16 +2041,16 @@ for _name, _func in (
     ("test_needle_cores_reach_their_depth", test_needle_cores_reach_their_depth),
     ("test_recovery_rows_have_distinct_feature_ids", test_recovery_rows_have_distinct_feature_ids),
     ("test_solid_rows_match_the_float64_law", test_solid_rows_match_the_float64_law),
-    ("test_tiled_kernels_match_one_thread_kernels", test_tiled_kernels_match_one_thread_kernels),
-    ("test_exits_match_across_kernels", test_exits_match_across_kernels),
+    ("test_job_pipeline_rows_are_the_walks", test_job_pipeline_rows_are_the_walks),
+    ("test_rule_x_lists_give_the_full_passes", test_rule_x_lists_give_the_full_passes),
     ("test_exit_work_stays_bounded", test_exit_work_stays_bounded),
     ("test_long_box_keeps_every_support", test_long_box_keeps_every_support),
     ("test_deferred_pairs_keep_their_rows_beyond_the_grid", test_deferred_pairs_keep_their_rows_beyond_the_grid),
     ("test_wide_box_keeps_every_support", test_wide_box_keeps_every_support),
     ("test_large_plane_group_follows_the_law", test_large_plane_group_follows_the_law),
     ("test_window_past_its_bound_is_flagged", test_window_past_its_bound_is_flagged),
-    ("test_solid_launches_share_the_point_grids", test_solid_launches_share_the_point_grids),
-    ("test_solid_fixed_grids_take_each_pair_once", test_solid_fixed_grids_take_each_pair_once),
+    ("test_solid_launches_take_fixed_grids", test_solid_launches_take_fixed_grids),
+    ("test_job_grids_take_each_entry_once", test_job_grids_take_each_entry_once),
     ("test_shadow_keeps_contacts_bitwise_with_every_class", test_shadow_keeps_contacts_bitwise_with_every_class),
 ):
     add_function_test(TestTerrainLawSolid, _name, _func, devices=devices)
@@ -1994,6 +2059,14 @@ add_function_test(
     TestTerrainLawSolid,
     "test_long_box_keeps_its_first_rows_without_room",
     test_long_box_keeps_its_first_rows_without_room,
+    devices=devices,
+    check_output=False,
+)
+# The job check's warning is the expected output; the test captures it itself.
+add_function_test(
+    TestTerrainLawSolid,
+    "test_job_overflow_takes_the_full_walk",
+    test_job_overflow_takes_the_full_walk,
     devices=devices,
     check_output=False,
 )

@@ -801,7 +801,9 @@ def _production_rows(shadow, model, pipeline) -> dict:
         **pipeline._broad_phase_pair_filter(model),
     )
     rows = _host_rows(shadow._out)
-    rows["queued"] = sum(int(w.count.numpy()[0]) for kind, *_launch, w in shadow._launches if kind == "thread")
+    rows["queued"] = sum(
+        int(w[0].count.numpy()[0]) for kind, *_launch, w in shadow._launches if kind == "thread" and not w[1]
+    )
     return rows
 
 
