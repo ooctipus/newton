@@ -36,12 +36,15 @@ from newton._src.geometry.terrain_law import (
     TERRAIN_FEATURE_RECOVERY,
     TERRAIN_PAIR_FILTERED,
     TERRAIN_PAIR_OUTSIDE,
+    TERRAIN_PAIR_ROW_OVERFLOW,
     TERRAIN_PAIR_STALE,
     TERRAIN_PAIR_TILE_EXIT,
+    TERRAIN_ROW_CANDIDATES,
     TerrainFeatureData,
     TerrainLawRows,
     TerrainPairInputs,
     TerrainPlanes,
+    TerrainRows,
     TerrainWindow,
     terrain_claims,
     terrain_edge_kind,
@@ -49,9 +52,13 @@ from newton._src.geometry.terrain_law import (
     terrain_eps,
     terrain_face_values,
     terrain_feature_id,
+    terrain_finish,
+    terrain_finish_state,
     terrain_pair_exit,
     terrain_plane,
     terrain_planes,
+    terrain_report,
+    terrain_store_row,
     terrain_window,
     terrain_window_extent,
     terrain_window_point,
@@ -513,6 +520,22 @@ def _ridge_capsules():
     return bodies
 
 
+def _recovery_capsules():
+    """Capsules descending 30-50 deg across the ridge, their axis 5-20 mm below the crest where its footprint crosses
+    it and both ends outside the solid: no axis exit, the axis interior's G3 row instead
+    (:func:`test_capsule_axis_inside_without_exit_gets_recovery`)."""
+    bodies = []
+    for tilt in (30.0, 40.0, 50.0):
+        for depth in (0.005, 0.02):
+            for yaw in (0.0, -20.0):
+                q = _quat_mul(
+                    _axis_angle((0.0, 0.0, 1.0), np.radians(yaw)), _axis_angle((0.0, 1.0, 0.0), np.radians(90.0 + tilt))
+                )
+                pose = np.array([0.0, 0.05, RIDGE_HEIGHT - depth, *q], np.float32).astype(np.float64)
+                bodies.append(("capsule", {"radius": 0.02, "half_height": 0.13}, pose))
+    return bodies
+
+
 def test_capsule_axis_exits_over_a_ridge(test, device):
     """Give a capsule whose axis passes below a ridge one exit, the segment's exact minimum translation.
 
@@ -635,11 +658,13 @@ def _pair_inputs(shadow, model, pipeline):
 
 
 def _launch_segment(shadow, model, pipeline, lane, begin, count, out, *, kernel=None, blocks=None):
-    """Walk table pairs ``[begin, begin + count)`` into ``out``, then run the full-finish kernel.
+    """Walk table pairs ``[begin, begin + count)`` into ``out``, then finish the pairs the walk deferred.
 
     With ``lane`` the one-thread class, the one-thread kernel (or ``kernel``, of its signature) walks every pair; with
     the tiled class, it queues them past the whole-pair rejects and the tiled kernel takes the queue, with ``blocks``
-    blocks (the work list's own when ``None``).
+    blocks (the work list's own when ``None``). The full-finish kernel finishes the deferred pairs; after the plain
+    walk (:func:`_plain_point_rows`) the plain full finish does (:func:`_plain_point_rows_full`), so that the plain
+    side's deferred pairs are finished independently of the kernels' marks, scratch and grid too.
     """
     device = model.device
     args = [begin, 0, _pair_inputs(shadow, model, pipeline), shadow.features.data(), out]
@@ -661,10 +686,13 @@ def _launch_segment(shadow, model, pipeline, lane, begin, count, out, *, kernel=
             block_dim=block,
             device=device,
         )
-    _launch_full(shadow, model, pipeline, begin, out)
+    if kernel is _plain_point_rows:
+        _launch_plain_full(shadow, model, pipeline, begin, count, out)
+    else:
+        _launch_full(shadow, model, pipeline, begin, out)
 
 
-def _launch_full(shadow, model, pipeline, begin, out, blocks=TERRAIN_LAW_FULL_BLOCKS):
+def _launch_full(shadow, model, pipeline, begin, out, *, blocks=TERRAIN_LAW_FULL_BLOCKS):
     """Run the full-finish kernel, with ``blocks`` blocks, over the pairs of ``out``'s deferred list
     (``deferred_count``) from table pair ``begin``."""
     scratch = terrain_finish_scratch(model.device, blocks=blocks)
@@ -694,6 +722,88 @@ def _side_buffer(begin, count, pair_count, device):
     out.deferred_first = wp.full(4, begin, dtype=wp.int32, device=device)
     out.deferred_count = wp.zeros(4, dtype=wp.int32, device=device)
     return out
+
+
+def _host_rows(out) -> dict:
+    """A side buffer's per-pair counts and states and its slots' rows (host arrays), and its point class's deferred
+    pairs: how many (``deferred``) and which (``deferred_pairs``, in list order)."""
+    rows = {f: getattr(out, f).numpy() for f in ("count", "state", "q", "n", "d", "feature")}
+    deferred = int(out.deferred_count.numpy()[TERRAIN_PARTNER_POINT])
+    first = int(out.deferred_first.numpy()[TERRAIN_PARTNER_POINT])
+    rows["deferred"] = deferred
+    rows["deferred_pairs"] = out.deferred.numpy()[first : first + deferred]
+    return rows
+
+
+def _bits(values: np.ndarray) -> np.ndarray:
+    """The bits of an array: float32 values as uint32, so that equal means bit for bit (``-0.0`` is not ``0.0``)."""
+    values = np.ascontiguousarray(values)
+    return values.view(np.uint32) if values.dtype == np.float32 else values
+
+
+def _assert_same_rows(a: dict, b: dict, begin: int, count: int, what: str):
+    """Assert that two side buffers (:func:`_host_rows`) give table pairs ``[begin, begin + count)``, whose slots start
+    at 0, the same count, state and rows, bit for bit."""
+    pairs = slice(begin, begin + count)
+    np.testing.assert_array_equal(a["count"][pairs], b["count"][pairs], err_msg=f"{what}: count")
+    np.testing.assert_array_equal(a["state"][pairs], b["state"][pairs], err_msg=f"{what}: state")
+    for i in range(count):
+        rows = slice(
+            i * terrain_law_point.TERRAIN_POINT_ROWS, i * terrain_law_point.TERRAIN_POINT_ROWS + a["count"][begin + i]
+        )
+        for f in ("q", "n", "d", "feature"):
+            np.testing.assert_array_equal(_bits(a[f][rows]), _bits(b[f][rows]), err_msg=f"{what}: pair {i} {f}")
+
+
+def _full_on_every_pair(shadow, model, pipeline, begin, count) -> dict:
+    """Run the full-finish kernel on every one of table pairs ``[begin, begin + count)``, seven blocks taking them in
+    turn through the same scratch, and return its side buffer (:func:`_host_rows`)."""
+    full = _side_buffer(begin, count, shadow.table.pair_count, model.device)
+    full.deferred.assign(np.arange(shadow.table.pair_count, dtype=np.int32))
+    full.deferred_count.assign(np.full(4, count, np.int32))
+    _launch_full(shadow, model, pipeline, begin, full, blocks=7)
+    return _host_rows(full)
+
+
+def _assert_full_rows(test, walked: dict, finished: dict, begin: int, count: int, what: str) -> int:
+    """Assert that the full-finish kernel run on every pair (:func:`_full_on_every_pair`) gives each pair that reaches
+    its window the count, state and rows of its walk, bit for bit: so the walks write a pair's rows as the finish keeps
+    them. Returns the pairs compared."""
+    compared = 0
+    for i in range(count):
+        pair = begin + i
+        if walked["state"][pair] & EXITS:
+            continue
+        compared += 1
+        rows = slice(
+            i * terrain_law_point.TERRAIN_POINT_ROWS,
+            i * terrain_law_point.TERRAIN_POINT_ROWS + int(walked["count"][pair]),
+        )
+        test.assertEqual(walked["count"][pair], finished["count"][pair], msg=f"{what} pair {i}")
+        test.assertEqual(walked["state"][pair], finished["state"][pair], msg=f"{what} pair {i}")
+        for f in ("q", "n", "d", "feature"):
+            np.testing.assert_array_equal(
+                _bits(walked[f][rows]), _bits(finished[f][rows]), err_msg=f"{what} pair {i} {f}"
+            )
+    return compared
+
+
+def _production_rows(shadow, model, pipeline) -> dict:
+    """Launch the shadow as a collide does (:meth:`TerrainLawShadow.launch`, the production protocol: the one-thread
+    kernel over the class, queueing the tiled segment's pairs that pass the whole-pair rejects; the tiled kernel's
+    fixed grid over the queue; the full-finish kernel's fixed grid over the deferred list), and return its side
+    buffer (:func:`_host_rows`) and its queued pairs (``queued``)."""
+    shadow.launch(
+        pipeline.geom_transform,
+        pipeline.geom_data,
+        shape_type=model.shape_type,
+        shape_gap=model.shape_gap,
+        shape_heightfield_index=model.shape_heightfield_index,
+        **pipeline._broad_phase_pair_filter(model),
+    )
+    rows = _host_rows(shadow._out)
+    rows["queued"] = sum(int(w.count.numpy()[0]) for kind, *_launch, w in shadow._launches if kind == "thread")
+    return rows
 
 
 MARKED_BIT_31 = (
@@ -954,6 +1064,137 @@ def _plain_point_rows(
     )
 
 
+_PLAIN_CLASS = wp.constant(TERRAIN_PARTNER_POINT)
+_PLAIN_CANDIDATES = wp.constant(TERRAIN_ROW_CANDIDATES)
+_PLAIN_ROW = wp.constant(int(terrain_law_point._ROW))
+_PLAIN_EXIT_A = wp.constant(int(terrain_law_point._EXIT_A))
+_PLAIN_EXIT_B = wp.constant(int(terrain_law_point._EXIT_B))
+_PLAIN_SLOT_AXIS = wp.constant(int(terrain_law_point._SLOT_AXIS))
+
+
+@wp.func
+def _plain_candidate(rows: TerrainRows, claim: _Claim) -> TerrainRows:
+    """A pair's candidate list with a claim's row appended (counted as dropped when the list is full)."""
+    out = rows
+    n = out.count
+    if n < _PLAIN_CANDIDATES:
+        for j in range(3):
+            out.q[n, j] = claim.q[j]
+            out.k[n, j] = claim.k[j]
+            out.n[n, j] = claim.n[j]
+        out.d[n] = claim.d
+        out.feature[n] = claim.feature
+        out.count = n + 1
+    else:
+        out.dropped = out.dropped + 1
+    return out
+
+
+@wp.kernel(enable_backward=False)
+def _plain_point_rows_full(
+    begin: int,
+    slot_begin: int,
+    inputs: TerrainPairInputs,
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+):
+    """The full finish of the pairs a walk deferred, as the plain walk takes them: ``terrain_point_rows_full`` as one
+    thread per deferred pair (its form before the fixed grid), without the kernels' rejects, marks and scratch.
+
+    Every item of every window vertex in window order (:func:`_plain_point_item`: no vertex drop, no item marks, no
+    off-cell face reject) goes into a local candidate list, then the ends' exits (G2, G3) and the axis interior's G3,
+    then the law's finish (``terrain_finish``).
+    """
+    entry = wp.tid()
+    if entry >= out.deferred_count[_PLAIN_CLASS]:
+        return
+    pair = out.deferred[out.deferred_first[_PLAIN_CLASS] + entry]
+    _state, frame, heightfield, cells, a, b, segment, reach = terrain_law_point._pair_setup(inputs, data, pair)
+    r1 = cells[1]
+    c1 = cells[3]
+    window = terrain_window(data, heightfield, cells[0], cells[2])
+    ka = terrain_window_point(window, a)
+    kb = terrain_window_point(window, b)
+    extent = wp.max(
+        wp.max(wp.max(wp.abs(ka[0]), wp.abs(ka[1])), wp.abs(ka[2])),
+        wp.max(wp.max(wp.abs(kb[0]), wp.abs(kb[1])), wp.abs(kb[2])),
+    )
+    eps = terrain_eps(terrain_window_extent(data, window, r1, c1, extent))
+    planes = terrain_planes()
+    planes, core = terrain_law_point._pair_core(data, window, planes, ka, kb, segment, reach, eps)
+    rows = TerrainRows()
+    exit_a = _Claim()
+    exit_b = _Claim()
+    items = terrain_law_point._vertex_items(core)
+    for r in range(cells[0], r1 + 2):
+        for c in range(cells[2], c1 + 2):
+            for item in range(items):
+                planes, claim = _plain_point_item(data, window, planes, core, r, c, r1, c1, item)
+                # G2: an end's exit with the smallest translation, the first in window order on ties.
+                if claim.kind == _PLAIN_EXIT_A and (exit_a.kind == 0 or claim.d > exit_a.d):
+                    exit_a = claim
+                elif claim.kind == _PLAIN_EXIT_B and (exit_b.kind == 0 or claim.d > exit_b.d):
+                    # With both ends outside: the axis's deepest crossing under a crease.
+                    exit_b = claim
+                elif claim.kind == _PLAIN_ROW:
+                    rows = _plain_candidate(rows, claim)
+    # G2 and G3: one exit per end inside the solid, after the window's rows.
+    for end in range(2):
+        if (end == 0 and core.below_a != 0) or (end == 1 and core.segment != 0 and core.below_b != 0):
+            claim = exit_a
+            k = core.a
+            if end == 1:
+                claim = exit_b
+                k = core.b
+            if claim.kind != 0:
+                claim.kind = _PLAIN_ROW
+                claim.k = k
+            else:
+                planes, claim = terrain_law_point._exit_row(data, window, planes, k, end)
+            if claim.kind != 0:
+                rows = _plain_candidate(rows, claim)
+    # G3 for the axis interior: both ends outside, no axis exit, a crossing of the axis under a crease.
+    if core.segment != 0 and core.below_a == 0 and core.below_b == 0 and exit_b.kind != 0:
+        axis_exit = bool(False)
+        for row in range(rows.count):
+            if (rows.feature[row] & 7) == _PLAIN_SLOT_AXIS and rows.d[row] < 0.0:
+                axis_exit = True
+        if not axis_exit:
+            planes, claim = terrain_law_point._axis_recovery(data, window, planes, exit_b.q, exit_b.feature)
+            if claim.kind != 0:
+                rows = _plain_candidate(rows, claim)
+    order, kept, flags = terrain_finish(rows, eps, _PLAIN_ROWS)
+    slot = slot_begin + (pair - begin) * _PLAIN_ROWS
+    for kept_row in range(kept):
+        row = order[kept_row]
+        terrain_store_row(
+            out,
+            slot + kept_row,
+            wp.vec3(rows.q[row, 0], rows.q[row, 1], rows.q[row, 2]),
+            wp.vec3(rows.n[row, 0], rows.n[row, 1], rows.n[row, 2]),
+            rows.d[row],
+            rows.feature[row],
+            window,
+            frame,
+        )
+    out.count[pair] = kept
+    out.state[pair] = terrain_law_point._wide(cells) | terrain_finish_state(flags)
+    terrain_report(out.status, out.overflow, flags, True)
+
+
+def _launch_plain_full(shadow, model, pipeline, begin, count, out):
+    """Run the plain full finish (:func:`_plain_point_rows_full`) over ``out``'s deferred list, one thread per entry
+    (at most ``count``), from table pair ``begin``."""
+    args = [begin, 0, _pair_inputs(shadow, model, pipeline), shadow.features.data(), out]
+    wp.launch(
+        _plain_point_rows_full,
+        dim=count,
+        inputs=args,
+        block_dim=terrain_law_block_dim(model.device),
+        device=model.device,
+    )
+
+
 def _reject_scenes(device):
     """Scenes for :func:`test_rejects_keep_the_plain_walk_rows`: ``(name, model, bodies)``."""
     for name, _hf, model, _hfield, _shapes, bodies in _rough_scenes(device, 20):
@@ -978,6 +1219,8 @@ def _reject_scenes(device):
     yield "buried", tu.body_scene(rough, 1.6, 1.6, bodies, device=device)[0], bodies
     bodies = _ridge_capsules()
     yield "ridge", tu.body_scene(_ridge_terrain(), 1.0, 1.0, bodies, device=device)[0], bodies
+    bodies = _recovery_capsules()
+    yield "recovery", tu.body_scene(_ridge_terrain(), 1.0, 1.0, bodies, device=device)[0], bodies
     # Rows at the admission limit: the lowest point 28-40 mm (the reach beyond the radius) above the terrain.
     bodies = []
     for i in range(80):
@@ -1006,13 +1249,18 @@ def test_rejects_keep_the_plain_walk_rows(test, device):
     The one-thread kernel drops the vertices whose features lie out of reach (``_vertex_dropped``), walks a bit mask of
     the rest, and refuses a face whose projection lies off its cell (``_off_cell``) before its canonical values; the
     plain walk (:func:`_plain_point_rows`) evaluates every item of every window vertex in window order and closes the
-    pair the same way. On rough, pitted, stepped, seam-adversarial, buried and ridge scenes the count, state, q, n, d
-    and feature of every pair agree bit for bit; so do those of the full-finish kernel (which walks with the drop and
-    runs the finish) run on every walked pair, which also checks that the walks write a pair's rows as the finish keeps
-    them. The full-finish kernel runs with fewer blocks than deferred pairs, as its fixed grid does when many pairs
-    are deferred: each block finishes several pairs in turn, through the same scratch.
+    pair the same way, and finishes the pairs it defers the same way too (:func:`_plain_point_rows_full`). On rough,
+    pitted, stepped, seam-adversarial, buried, ridge, axis-recovery and reach-limit scenes the count, state, q, n, d and
+    feature of every pair agree bit for bit with the plain walk's: the one-thread kernel's walking every pair, and the
+    production launches' (the shadow's own: the larger windows queued for the tiled kernel, whose lanes mark the items
+    that yield anything, a capsule's far ends dropped, and whose first lane walks the marked items). So do those of the
+    full-finish kernel (which walks with the drop and runs the finish) run on every walked pair, which also checks that
+    the walks write a pair's rows as the finish keeps them. The full-finish kernel runs with fewer blocks than deferred
+    pairs, as its fixed grid does when many pairs are deferred: each block finishes several pairs in turn, through the
+    same scratch.
     """
     walked = 0
+    queued = 0
     for name, model, bodies in _reject_scenes(device):
         with test.subTest(scene=name):
             pipeline, _contacts, _state = _collide(model, shadow=True)
@@ -1025,33 +1273,111 @@ def test_rejects_keep_the_plain_walk_rows(test, device):
             for label, kernel in (("kernel", terrain_law_point.terrain_point_rows), ("plain", _plain_point_rows)):
                 out = _side_buffer(begin, count, shadow.table.pair_count, device)
                 _launch_segment(shadow, model, pipeline, TERRAIN_LANE_THREAD, begin, count, out, kernel=kernel)
-                results[label] = out
-            # The full-finish kernel on every pair, seven blocks taking the pairs in turn.
-            full = _side_buffer(begin, count, shadow.table.pair_count, device)
-            full.deferred.assign(np.arange(shadow.table.pair_count, dtype=np.int32))
-            full.deferred_count.assign(np.full(4, count, np.int32))
-            _launch_full(shadow, model, pipeline, begin, full, blocks=7)
-            kernel = {f: getattr(results["kernel"], f).numpy() for f in ("count", "state", "q", "n", "d", "feature")}
-            plain = {f: getattr(results["plain"], f).numpy() for f in ("count", "state", "q", "n", "d", "feature")}
-            finished = {f: getattr(full, f).numpy() for f in ("count", "state", "q", "n", "d", "feature")}
-            np.testing.assert_array_equal(kernel["count"], plain["count"])
-            np.testing.assert_array_equal(kernel["state"], plain["state"])
-            for i in range(count):
-                pair = begin + i
-                rows = slice(
-                    i * terrain_law_point.TERRAIN_POINT_ROWS,
-                    i * terrain_law_point.TERRAIN_POINT_ROWS + int(kernel["count"][pair]),
-                )
-                for f in ("q", "n", "d", "feature"):
-                    np.testing.assert_array_equal(kernel[f][rows], plain[f][rows], err_msg=f"{name} pair {i} {f}")
-                if kernel["state"][pair] & EXITS:
-                    continue
-                walked += 1
-                test.assertEqual(kernel["count"][pair], finished["count"][pair], msg=f"{name} pair {i}")
-                test.assertEqual(kernel["state"][pair], finished["state"][pair], msg=f"{name} pair {i}")
-                for f in ("q", "n", "d", "feature"):
-                    np.testing.assert_array_equal(kernel[f][rows], finished[f][rows], err_msg=f"{name} pair {i} {f}")
+                results[label] = _host_rows(out)
+            results["production"] = _production_rows(shadow, model, pipeline)
+            queued += results["production"]["queued"]
+            for label in ("kernel", "production"):
+                _assert_same_rows(results[label], results["plain"], begin, count, f"{name}: {label} against plain")
+            finished = _full_on_every_pair(shadow, model, pipeline, begin, count)
+            walked += _assert_full_rows(test, results["kernel"], finished, begin, count, name)
     test.assertGreater(walked, 200)
+    # The production launches walked larger windows in the tiled kernel: capsules and spheres of every scene.
+    test.assertGreater(queued, 80)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# the full finish of deferred pairs
+# ----------------------------------------------------------------------------------------------------------------
+
+
+RIDGE_CREST = 0.03
+"""Crest height [m] of :func:`_deferring_scene`'s ridges, between its raised rows."""
+
+
+def _deferring_scene(rng):
+    """A scene whose walks defer dozens of pairs to the full finish: ``(heights, half extent, bodies)``.
+
+    Ridges of one height every second column of 0.1 m cells, every fourth row raised 15 mm. Capsules 0.6-1.2 m long lie
+    across the ridges or at random yaws, and spheres of 0.05-0.25 m rest on them, their lowest points 3 cm below to 2 cm
+    above the crests (the raised rows poke into them): rows on several faces of one plane, rows of every ridge in
+    reach (more than the slots: they overflow) and exits. Six capsules 2 m long lie diagonally (windows of more than
+    256 vertices, which the tiled kernels walk unmasked), and three 2.4-3.6 m long lie across every ridge.
+    """
+    heights = np.zeros((41, 41))
+    heights[:, 1::2] = RIDGE_CREST
+    heights[::4, :] += 0.015
+
+    def lying(dims, x, y, yaw, offsets):
+        z = RIDGE_CREST + dims["radius"] + float(rng.choice(offsets))
+        q = _quat_mul(_axis_angle((0.0, 0.0, 1.0), yaw), LYING)
+        return "capsule", dims, np.array([x, y, z, *q], np.float32).astype(np.float64)
+
+    bodies = []
+    for i in range(72):
+        x, y = rng.uniform(-1.2, 1.2, 2)
+        if i % 3 == 2:
+            dims = {"radius": float(rng.choice([0.05, 0.12, 0.25]))}
+            z = RIDGE_CREST + 0.015 + dims["radius"] + float(rng.choice([-0.03, -0.01, 0.0, 0.005, 0.02]))
+            bodies.append(("sphere", dims, np.array([x, y, z, 0.0, 0.0, 0.0, 1.0], np.float32).astype(np.float64)))
+            continue
+        dims = {"radius": float(rng.choice([0.02, 0.03])), "half_height": float(rng.choice([0.3, 0.6]))}
+        yaw = rng.uniform(-0.5, 0.5) if i % 3 == 0 else rng.uniform(0.0, 2.0 * np.pi)
+        bodies.append(lying(dims, x, y, yaw, (-0.02, -0.005, 0.0, 0.003, 0.01, 0.02)))
+    for i in range(6):
+        yaw = np.pi / 4.0 + rng.uniform(-0.2, 0.2) + (np.pi / 2.0 if i % 2 else 0.0)
+        x, y = rng.uniform(-0.4, 0.4, 2)
+        bodies.append(lying({"radius": 0.03, "half_height": 1.0}, x, y, yaw, (-0.005, 0.0, 0.003)))
+    for half in (1.2, 1.5, 1.8):
+        bodies.append(lying({"radius": 0.03, "half_height": half}, 0.0, 0.05, rng.uniform(0.0, 0.3), (-0.005, 0.0)))
+    return heights, 2.0, bodies
+
+
+def _deferring_rows(heights, extent, bodies, device):
+    """A scene's point pairs through the production launches and through the plain walk and its full finish:
+    ``(production, plain, begin, count)``, the side buffers as :func:`_host_rows` and the class's table pairs."""
+    model = tu.body_scene(heights, extent, extent, bodies, device=device)[0]
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    shadow = pipeline._terrain_law_shadow
+    begin = shadow.table.segment(TERRAIN_PARTNER_POINT, TERRAIN_LANE_THREAD)[0]
+    count = shadow.table.segment(TERRAIN_PARTNER_POINT, TERRAIN_LANE_TILE)[1] - begin
+    production = _production_rows(shadow, model, pipeline)
+    plain = _side_buffer(begin, count, shadow.table.pair_count, device)
+    _launch_segment(shadow, model, pipeline, TERRAIN_LANE_THREAD, begin, count, plain, kernel=_plain_point_rows)
+    return production, _host_rows(plain), begin, count
+
+
+def test_deferred_pairs_keep_the_plain_finish_rows(test, device):
+    """Give the pairs the walks defer the rows of the plain walk's own full finish, bit for bit.
+
+    A walk defers a pair whose rows the finish may change (a plane group of three rows, more rows than the slots,
+    more candidates than the list) to the full-finish kernel, whose fixed grid of lane blocks marks the window's
+    productive items, walks them on the first lane into global scratch and runs the finish on its block's record.
+    The production launches (the shadow's own) are compared with the plain walk and its full finish
+    (:func:`_plain_point_rows_full`: one thread per deferred pair, every item of every window vertex, a local candidate
+    list) on a scene that defers dozens of pairs (:func:`_deferring_scene`), some overflowing their slots, some with
+    windows the full-finish kernel walks unmasked. On CUDA the rows also equal a CPU run's, bit for bit (there the
+    lanes split the windows, mark the items and take their union, where the CPU's one lane walks alone).
+    """
+    heights, extent, bodies = _deferring_scene(np.random.default_rng(77))
+    production, plain, begin, count = _deferring_rows(heights, extent, bodies, device)
+    test.assertEqual(count, len(bodies))
+    _assert_same_rows(production, plain, begin, count, "production against plain")
+    # Not vacuous: dozens of deferred pairs (both sides defer the same ones), some overflowing their slots, and some
+    # with windows of more than 256 vertices.
+    test.assertGreater(production["deferred"], 20)
+    test.assertEqual(production["deferred"], plain["deferred"])
+    states = production["state"][begin : begin + count]
+    test.assertGreater(int(np.count_nonzero(states & int(TERRAIN_PAIR_ROW_OVERFLOW))), 2)
+    hf = tu.reference_surface(tu.heightfield_model(heights, extent, extent, device="cpu"))
+    unmasked = 0
+    for pair in production["deferred_pairs"]:
+        kind, dims, pose = bodies[pair - begin]
+        r0, r1, c0, c1 = tu.window_cells(hf, ref.make_core(kind, dims, pose), dims["radius"] + REACH)
+        unmasked += (r1 - r0 + 2) * (c1 - c0 + 2) > terrain_law_point.TERRAIN_POINT_MASK_VERTICES
+    test.assertGreater(unmasked, 0)
+    if device.is_cuda:
+        cpu, _plain, _begin, _count = _deferring_rows(heights, extent, bodies, "cpu")
+        _assert_same_rows(production, cpu, begin, count, f"{device} against cpu")
 
 
 @functools.cache
@@ -1202,6 +1528,7 @@ for _name, _func in (
     ("test_point_rows_point_up_on_steep_terrain", test_point_rows_point_up_on_steep_terrain),
     ("test_tiled_kernel_matches_one_thread_kernel", test_tiled_kernel_matches_one_thread_kernel),
     ("test_rejects_keep_the_plain_walk_rows", test_rejects_keep_the_plain_walk_rows),
+    ("test_deferred_pairs_keep_the_plain_finish_rows", test_deferred_pairs_keep_the_plain_finish_rows),
 ):
     add_function_test(TestTerrainLawPoint, _name, _func, devices=devices)
 
