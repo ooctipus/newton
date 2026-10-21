@@ -28,11 +28,14 @@ from newton._src.geometry.terrain_law import (
     TERRAIN_EDGE_FLAT,
     TERRAIN_STATUS_STALE,
     TERRAIN_TILE_CELLS,
+    TERRAIN_VERTEX_FEATURE_BIT,
     TerrainFeatureData,
     terrain_decode,
     terrain_features_current,
     terrain_report,
     terrain_tile_bound,
+    terrain_vertex_bits_of_clusters,
+    terrain_window,
 )
 from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_test_utils as tu
@@ -350,6 +353,36 @@ def test_tile_max_bounds_every_height(test, device):
             test.assertGreater(bounds[i, j], block.max())
 
 
+@wp.kernel(enable_backward=False)
+def _bits_of_clusters(data: TerrainFeatureData, heightfield: int, out: wp.array2d[int]):
+    """Every vertex's bits as its clusters and heights give them, in the window of vertex (0, 0)."""
+    r, c = wp.tid()
+    out[r, c] = terrain_vertex_bits_of_clusters(data, terrain_window(data, heightfield, 0, 0), r, c)
+
+
+def test_vertex_bits_match_their_clusters(test, device):
+    """Record every vertex's edge kinds and feature bit as its clusters and heights give them, whatever the window.
+
+    The build computes a vertex's bits in its own window; here they are computed again in another (the feature test
+    reads cluster normals, which no window changes) and must be equal, bit for bit. Every edge code (crease, flat,
+    border) and both feature answers occur.
+    """
+    rng = np.random.default_rng(9)
+    heights = tu.suite_like_heights(rng, 64, 64)
+    model = tu.heightfield_model(heights, 3.2, 3.2, device=device)
+    features = TerrainFeatures(model)
+    info = features.surface(features.heightfield_shapes[0])
+    out = wp.zeros((info.nrow, info.ncol), dtype=int, device=device)
+    wp.launch(_bits_of_clusters, dim=(info.nrow, info.ncol), inputs=[features.data(), 0, out], device=device)
+    stored = features.vertex_bits.numpy()[info.data_offset : info.data_offset + info.nrow * info.ncol]
+    stored = stored.reshape(info.nrow, info.ncol).astype(np.int64)
+    np.testing.assert_array_equal(stored, out.numpy())
+    codes = np.concatenate([((stored >> (2 * which)) & 3).ravel() for which in range(3)])
+    test.assertEqual(set(np.unique(codes).tolist()), {0, 1, 2})
+    feature = (stored & int(TERRAIN_VERTEX_FEATURE_BIT)) != 0
+    test.assertTrue(np.any(feature) and not np.all(feature))
+
+
 def test_rebuild_after_edit_equals_fresh_build(test, device):
     """Report stale features after an edit, and rebuild them to exactly what a fresh build of the new heights gives.
 
@@ -392,6 +425,7 @@ def _assert_equals_fresh_build(test, features, model):
     fresh = TerrainFeatures(model)
     np.testing.assert_array_equal(features.clusters.numpy(), fresh.clusters.numpy())
     np.testing.assert_array_equal(features.tile_max.numpy(), fresh.tile_max.numpy())
+    np.testing.assert_array_equal(features.vertex_bits.numpy(), fresh.vertex_bits.numpy())
     for s in features.heightfield_shapes:
         a, b = features.surface(s), fresh.surface(s)
         test.assertEqual(features.plane_count(s), fresh.plane_count(s))
@@ -567,6 +601,7 @@ for _name, _func in (
     ("test_compression_check_counts_non_root_parents", test_compression_check_counts_non_root_parents),
     ("test_edge_classes_and_vertex_features_match_reference", test_edge_classes_and_vertex_features_match_reference),
     ("test_weak_convex_vertex_keeps_its_support", test_weak_convex_vertex_keeps_its_support),
+    ("test_vertex_bits_match_their_clusters", test_vertex_bits_match_their_clusters),
     ("test_tile_max_bounds_every_height", test_tile_max_bounds_every_height),
     ("test_rebuild_after_edit_equals_fresh_build", test_rebuild_after_edit_equals_fresh_build),
     ("test_rebuild_covers_every_reported_edit", test_rebuild_covers_every_reported_edit),

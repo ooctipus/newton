@@ -52,6 +52,8 @@ from .terrain_law import (
     TerrainFeatureData,
     TerrainSurfaceInfo,
     terrain_decode,
+    terrain_vertex_bits_of_clusters,
+    terrain_window,
 )
 from .types import GeoType
 
@@ -748,6 +750,16 @@ def _tile_max(
 
 
 @wp.kernel(enable_backward=False)
+def _vertex_bits(data: TerrainFeatureData, heightfield: int, bits: wp.array[wp.uint8]):
+    """Every vertex's bits of one heightfield (:func:`~newton._src.geometry.terrain_law.terrain_vertex_bits_of_clusters`,
+    from its clusters and heights, which ``data`` holds), one thread per vertex."""
+    r, c = wp.tid()
+    window = terrain_window(data, heightfield, r, c)
+    surface = window.surface
+    bits[surface.data_offset + r * surface.ncol + c] = wp.uint8(terrain_vertex_bits_of_clusters(data, window, r, c))
+
+
+@wp.kernel(enable_backward=False)
 def _bump_version(version: wp.array[wp.int32], index: int):
     version[index] = version[index] + 1
 
@@ -859,6 +871,9 @@ class TerrainFeatures:
         self._infos = infos
         self.clusters = wp.zeros(max(triangle_offset, 1), dtype=wp.int32, device=self.device)
         self.tile_max = wp.zeros(max(tile_offset, 1), dtype=wp.float32, device=self.device)
+        self.vertex_bits = wp.zeros(
+            max(model.heightfield_elevations.shape[0] if count else 0, 1), dtype=wp.uint8, device=self.device
+        )
         self.elevation_version = wp.zeros(max(count, 1), dtype=wp.int32, device=self.device)
         self.feature_version = wp.zeros(max(count, 1), dtype=wp.int32, device=self.device)
         self._dirty = [None] * count
@@ -878,6 +893,7 @@ class TerrainFeatures:
         built = [self._build_clusters(h) for h in range(count)]
         self._place_planes(built)
         for h in range(count):
+            self._build_vertex_bits(h)
             self._build_tiles(h, 0, self._tiles[h][0], 0, self._tiles[h][1])
 
     # ---- queries ---------------------------------------------------------------------------------------------
@@ -894,6 +910,7 @@ class TerrainFeatures:
         data.clusters = self.clusters
         data.planes = self.planes
         data.tile_max = self.tile_max
+        data.vertex_bits = self.vertex_bits
         data.surfaces = self._surfaces
         data.elevation_version = self.elevation_version
         data.feature_version = self.feature_version
@@ -915,6 +932,7 @@ class TerrainFeatures:
             "clusters": self.clusters.capacity,
             "planes": self.planes.capacity,
             "tile_max": self.tile_max.capacity,
+            "vertex_bits": self.vertex_bits.capacity,
             "surfaces": self._surfaces.capacity,
             "versions": self.elevation_version.capacity + self.feature_version.capacity + self._layout.capacity,
         }
@@ -966,6 +984,8 @@ class TerrainFeatures:
         built = [None] * self.heightfield_count
         built[h] = self._build_clusters(h)
         self._place_planes(built)
+        # every cluster may have changed: every vertex's bits
+        self._build_vertex_bits(h)
         r0, r1, c0, c1 = region
         info = self._infos[h]
         rows, cols = info.nrow - 1, info.ncol - 1
@@ -1172,6 +1192,16 @@ class TerrainFeatures:
         self._plane_counts = counts
         if self.heightfield_count:
             self._surfaces.assign(wp.array(self._infos, dtype=TerrainSurfaceInfo, device="cpu"))
+
+    def _build_vertex_bits(self, h: int) -> None:
+        info = self._infos[h]
+        wp.launch(
+            _vertex_bits,
+            dim=(info.nrow, info.ncol),
+            inputs=[self.data(), h, self.vertex_bits],
+            device=self.device,
+            record_tape=False,
+        )
 
     def _build_tiles(self, h: int, tr0: int, tr1: int, tc0: int, tc1: int) -> None:
         if tr1 <= tr0 or tc1 <= tc0:

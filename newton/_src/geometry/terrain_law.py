@@ -114,6 +114,13 @@ TERRAIN_EDGE_CONCAVE = wp.constant(2)
 """Edge class: a valley between two clusters."""
 TERRAIN_EDGE_BORDER = wp.constant(3)
 """Edge class: on the heightfield's border."""
+TERRAIN_VERTEX_EDGE_FLAT = wp.constant(1)
+"""Two-bit code of a flat edge in a vertex's bits (:attr:`TerrainFeatureData.vertex_bits`; edge ``which`` at bits
+``2 which`` and ``2 which + 1``, 0 for a crease)."""
+TERRAIN_VERTEX_EDGE_BORDER = wp.constant(2)
+"""Two-bit code of a border edge in a vertex's bits."""
+TERRAIN_VERTEX_FEATURE_BIT = wp.constant(64)
+"""Bit of a vertex feature in a vertex's bits (:func:`terrain_vertex_feature`)."""
 
 TERRAIN_EDGE_X = wp.constant(0)
 """Edge ``(r, c)-(r, c + 1)``, between cell ``(r - 1, c)`` sub 1 and cell ``(r, c)`` sub 0."""
@@ -267,6 +274,10 @@ class TerrainFeatureData:
     """Plane records of the clusters of several triangles."""
     tile_max: wp.array[wp.float32]
     """Per tile of 8 x 8 cells: the largest decoded height of its vertices [m]."""
+    vertex_bits: wp.array[wp.uint8]
+    """Per vertex, indexed as the elevations: the kinds of the three edges it owns and whether it is a vertex feature
+    (:func:`terrain_vertex_bits_of_clusters`), static data of the clusters and heights read by
+    :func:`terrain_edge_kind` and :func:`terrain_vertex_feature`."""
     surfaces: wp.array[TerrainSurfaceInfo]
     """Layout of every heightfield, by heightfield index."""
     elevation_version: wp.array[wp.int32]
@@ -930,17 +941,36 @@ def terrain_edge_sides(r: int, c: int, which: int) -> tuple[wp.vec2i, wp.vec2i, 
 
 
 @wp.func
-def terrain_edge_kind(data: TerrainFeatureData, surface: TerrainSurfaceInfo, r: int, c: int, which: int) -> int:
-    """Return :data:`TERRAIN_EDGE_BORDER` or :data:`TERRAIN_EDGE_FLAT` of edge ``which`` of vertex ``(r, c)``, else -1.
-
-    Decided from the cluster ids alone; a crease (-1) needs its first triangle's plane
-    (:func:`terrain_crease_class`).
-    """
+def _edge_kind_of_clusters(data: TerrainFeatureData, surface: TerrainSurfaceInfo, r: int, c: int, which: int) -> int:
+    """:func:`terrain_edge_kind` from the cluster ids (what the vertex bits record)."""
     _v0, _v1, ta, tb, _wa, _wb = terrain_edge_sides(r, c, which)
     if not terrain_valid_cell(surface, ta[0], ta[1]) or not terrain_valid_cell(surface, tb[0], tb[1]):
         return TERRAIN_EDGE_BORDER
     if terrain_cluster(data, surface, ta[0], ta[1], ta[2]) == terrain_cluster(data, surface, tb[0], tb[1], tb[2]):
         return TERRAIN_EDGE_FLAT
+    return -1
+
+
+@wp.func
+def terrain_vertex_bits(data: TerrainFeatureData, surface: TerrainSurfaceInfo, r: int, c: int) -> int:
+    """Return vertex ``(r, c)``'s bits (:attr:`TerrainFeatureData.vertex_bits`)."""
+    return int(data.vertex_bits[surface.data_offset + r * surface.ncol + c])
+
+
+@wp.func
+def terrain_edge_kind(data: TerrainFeatureData, surface: TerrainSurfaceInfo, r: int, c: int, which: int) -> int:
+    """Return :data:`TERRAIN_EDGE_BORDER` or :data:`TERRAIN_EDGE_FLAT` of edge ``which`` of vertex ``(r, c)``, else -1.
+
+    Decided from the cluster ids alone, as the vertex's bits record it; a crease (-1) needs its first triangle's plane
+    (:func:`terrain_crease_class`). A vertex off the grid decides it from the cluster ids directly.
+    """
+    if r < 0 or c < 0 or r >= surface.nrow or c >= surface.ncol:
+        return _edge_kind_of_clusters(data, surface, r, c, which)
+    code = (terrain_vertex_bits(data, surface, r, c) >> (2 * which)) & 3
+    if code == TERRAIN_VERTEX_EDGE_FLAT:
+        return TERRAIN_EDGE_FLAT
+    if code == TERRAIN_VERTEX_EDGE_BORDER:
+        return TERRAIN_EDGE_BORDER
     return -1
 
 
@@ -1021,13 +1051,10 @@ def _ring_normal(normals: _RingNormals, i: int) -> wp.vec3:
 
 
 @wp.func
-def terrain_vertex_feature(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int) -> bool:
-    """Return whether vertex ``(r, c)`` is a feature of its own: its incident cluster normals span 3-D.
-
-    Normals closer than :data:`TERRAIN_NORMAL_SAME` are one direction; three distinct directions span 3-D when
-    their triple product exceeds :data:`TERRAIN_VERTEX_SPAN`. The product is taken of their differences, which
-    float32 resolves to about 1e-13 for normals close together (the plain product only to about 1e-7).
-    """
+def _vertex_feature_of_planes(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int) -> bool:
+    """:func:`terrain_vertex_feature` from the incident clusters' planes (what the vertex bits record). The cluster
+    normals do not depend on the window: a cluster's from its gradient, a lone triangle's from edge vectors of integer
+    index differences and height differences."""
     surface = window.surface
     if not terrain_interior_vertex(surface, r, c):
         return False
@@ -1053,6 +1080,39 @@ def terrain_vertex_feature(data: TerrainFeatureData, window: TerrainWindow, r: i
                 if wp.abs(wp.dot(ni, wp.cross(dj, _ring_normal(normals, k) - ni))) > _VERTEX_SPAN:
                     return True
     return False
+
+
+@wp.func
+def terrain_vertex_bits_of_clusters(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int) -> int:
+    """Return vertex ``(r, c)``'s bits from the clusters and heights (:attr:`TerrainFeatureData.vertex_bits`): per
+    edge it owns (x-, y-, diagonal edge), two bits from bit ``2 which``: :data:`TERRAIN_VERTEX_EDGE_FLAT`,
+    :data:`TERRAIN_VERTEX_EDGE_BORDER` or 0 for a crease; and :data:`TERRAIN_VERTEX_FEATURE_BIT` for a vertex
+    feature."""
+    bits = int(0)
+    for which in range(3):
+        kind = _edge_kind_of_clusters(data, window.surface, r, c, which)
+        if kind == TERRAIN_EDGE_FLAT:
+            bits = bits | (TERRAIN_VERTEX_EDGE_FLAT << (2 * which))
+        elif kind == TERRAIN_EDGE_BORDER:
+            bits = bits | (TERRAIN_VERTEX_EDGE_BORDER << (2 * which))
+    if _vertex_feature_of_planes(data, window, r, c):
+        bits = bits | TERRAIN_VERTEX_FEATURE_BIT
+    return bits
+
+
+@wp.func
+def terrain_vertex_feature(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int) -> bool:
+    """Return whether vertex ``(r, c)`` is a feature of its own: its incident cluster normals span 3-D.
+
+    Normals closer than :data:`TERRAIN_NORMAL_SAME` are one direction; three distinct directions span 3-D when
+    their triple product exceeds :data:`TERRAIN_VERTEX_SPAN`. The product is taken of their differences, which
+    float32 resolves to about 1e-13 for normals close together (the plain product only to about 1e-7). Read from the
+    vertex's bits, built with the clusters (:func:`terrain_vertex_bits_of_clusters`); a vertex off the grid is none.
+    """
+    surface = window.surface
+    if r < 0 or c < 0 or r >= surface.nrow or c >= surface.ncol:
+        return False
+    return (terrain_vertex_bits(data, surface, r, c) & TERRAIN_VERTEX_FEATURE_BIT) != 0
 
 
 @wp.func

@@ -136,7 +136,6 @@ from .terrain_law import (
     TERRAIN_FINISH_ROW_OVERFLOW,
     TERRAIN_FLAT_EPS,
     TERRAIN_LAW_BLOCK,
-    TERRAIN_NORMAL_SAME,
     TERRAIN_PAIR_EXIT,
     TERRAIN_PAIR_FILTERED,
     TERRAIN_PAIR_FULL,
@@ -149,7 +148,6 @@ from .terrain_law import (
     TERRAIN_PAIR_UNSUPPORTED,
     TERRAIN_PAIR_WIDE,
     TERRAIN_STATUS_JOBS,
-    TERRAIN_VERTEX_SPAN,
     TERRAIN_WINDOW_WIDE,
     TerrainFeatureData,
     TerrainFinishScratch,
@@ -172,7 +170,6 @@ from .terrain_law import (
     terrain_finish_state,
     terrain_height,
     terrain_hold_row,
-    terrain_incident_triangle,
     terrain_interior_vertex,
     terrain_locate,
     terrain_pair_exit,
@@ -184,6 +181,7 @@ from .terrain_law import (
     terrain_store_row,
     terrain_tile_exit,
     terrain_triangle_vertices,
+    terrain_vertex_feature,
     terrain_vertex_in_cone,
     terrain_window,
     terrain_window_point,
@@ -304,8 +302,6 @@ _EPS32 = wp.constant(TERRAIN_EPS32)
 _FLAT = wp.constant(TERRAIN_FLAT_EPS)
 _HUGE = wp.constant(3.0e38)
 _ITEMS = wp.constant(6)
-_NORMAL_SAME = wp.constant(TERRAIN_NORMAL_SAME)
-_VERTEX_SPAN = wp.constant(TERRAIN_VERTEX_SPAN)
 _EXIT_MARGIN = wp.constant(TERRAIN_SOLID_EXIT_MARGIN)
 _EXIT_SLOT = wp.constant(TERRAIN_SOLID_EXIT_SLOT)
 _DESCENT = wp.constant(TERRAIN_SOLID_EXIT_DESCENT)
@@ -330,7 +326,6 @@ _XDESCENTS = wp.constant(10)
 _WALKS = wp.constant(11)
 
 _Mat43 = wp.types.matrix(shape=(4, 3), dtype=wp.float32)
-_RingNormals = wp.types.matrix(shape=(6, 3), dtype=wp.float32)
 _ArcValues = wp.types.vector(length=TERRAIN_SOLID_ARC_SAMPLES, dtype=wp.float32)
 _Seen = wp.types.vector(length=TERRAIN_SOLID_SEEN, dtype=wp.int32)
 _Sorted = wp.types.vector(length=TERRAIN_SOLID_SORTED, dtype=wp.int32)
@@ -1025,12 +1020,10 @@ def _edge_rows_at(
             x = x1
         # an interval end on a vertex feature belongs to that vertex
         if x <= 0.0:
-            planes, feature = _vertex_feature(data, window, planes, v0i[0], v0i[1])
-            if feature:
+            if terrain_vertex_feature(data, window, v0i[0], v0i[1]):
                 continue
         if x >= length:
-            planes, feature = _vertex_feature(data, window, planes, v1i[0], v1i[1])
-            if feature:
+            if terrain_vertex_feature(data, window, v1i[0], v1i[1]):
                 continue
         u = v0 + x * dh
         # The feature's chord over the interval lies in the core on the line, so the lift is no deeper than its
@@ -1079,9 +1072,10 @@ def _solid_edge(
 
 @wp.func
 def _vertex_cheap(core: Any, data: TerrainFeatureData, window: TerrainWindow, pair: _Pair, r: int, c: int) -> bool:
-    """Rule V's rejects of vertex ``(r, c)`` before its feature test: ``False`` for a vertex that gives no row (on
-    the border, below the core, out of the reach of its sphere or of its support plane facing the vertex)."""
-    if not terrain_interior_vertex(window.surface, r, c):
+    """Rule V's rejects of vertex ``(r, c)``: ``False`` for a vertex that gives no row (not a vertex feature, from its
+    bits: on the border or with incident normals that do not span 3-D; below the core; out of the reach of its sphere
+    or of its support plane facing the vertex)."""
+    if not terrain_vertex_feature(data, window, r, c):
         return False
     v = terrain_window_vertex(data, window, r, c)
     if v[2] < pair.low:
@@ -1108,11 +1102,8 @@ def _vertex_rows(
     r: int,
     c: int,
 ) -> tuple[TerrainPlanes, _Sink]:
-    """Rule V's row of a vertex past :func:`_vertex_cheap`: a vertex feature whose normal cone holds the direction to
+    """Rule V's row of a vertex past :func:`_vertex_cheap` (a vertex feature): its normal cone holds the direction to
     the core's nearest point (or its minimum translation), within reach."""
-    planes, feature = _vertex_feature(data, window, planes, r, c)
-    if not feature:
-        return planes, sink
     v = terrain_window_vertex(data, window, r, c)
     ok, nst, _k, d = core_nearest(core, v)
     if not ok or d > pair.reach:
@@ -1140,43 +1131,6 @@ def _solid_vertex(
     if not _vertex_cheap(core, data, window, pair, r, c):
         return planes, sink
     return _vertex_rows(core, data, window, planes, pair, sink, store, r, c)
-
-
-@wp.func
-def _ring_normal(normals: _RingNormals, i: int) -> wp.vec3:
-    return wp.vec3(normals[i, 0], normals[i, 1], normals[i, 2])
-
-
-@wp.func
-def _vertex_feature(
-    data: TerrainFeatureData, window: TerrainWindow, planes: TerrainPlanes, r: int, c: int
-) -> tuple[TerrainPlanes, bool]:
-    """:func:`~newton._src.geometry.terrain_law.terrain_vertex_feature` through the window's plane cache (the same
-    planes, bit for bit)."""
-    if not terrain_interior_vertex(window.surface, r, c):
-        return planes, False
-    normals = _RingNormals()
-    count = int(0)
-    for j in range(6):
-        t = terrain_incident_triangle(r, c, j)
-        planes, n, _a = terrain_plane(data, window, planes, t[0], t[1], t[2])
-        fresh = bool(True)
-        for i in range(count):
-            if wp.length(n - _ring_normal(normals, i)) <= _NORMAL_SAME:
-                fresh = False
-        if fresh:
-            normals[count, 0] = n[0]
-            normals[count, 1] = n[1]
-            normals[count, 2] = n[2]
-            count += 1
-    for i in range(count):
-        ni = _ring_normal(normals, i)
-        for j in range(i + 1, count):
-            dj = _ring_normal(normals, j) - ni
-            for k in range(j + 1, count):
-                if wp.abs(wp.dot(ni, wp.cross(dj, _ring_normal(normals, k) - ni))) > _VERTEX_SPAN:
-                    return planes, True
-    return planes, False
 
 
 @wp.func
