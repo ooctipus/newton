@@ -137,6 +137,9 @@ from .terrain_law import (
     terrain_window_point,
     terrain_window_vertex,
 )
+
+# The launch structs live beside the launcher for now; terrain_shadow imports this module lazily, by name
+# (TERRAIN_LAW_KERNELS), and must keep doing so: a module-level import of it there would be an import cycle.
 from .terrain_shadow import TERRAIN_LAW_BLOCK, TerrainFinishScratch, TerrainPairWork
 from .types import GeoType
 
@@ -1283,6 +1286,9 @@ def _tiled_pair(
     items = _vertex_items(core)
     margins = _cell_margins(window, core)
     masked = vertices <= _MASK_VERTICES
+    # This marking and the first lane's loop below have a twin in _finish_deferred: edit both. They cannot share a
+    # wp.func, which would take the tile; with one, a wp.compile_aot_module of this module in the process left its
+    # built CPU kernels unfindable (Warp 1.17.0.dev20260807).
     marks = wp.tile_zeros(shape=_MASK_VERTICES, dtype=wp.int32, storage="shared")
     marked = _Mask()
     if masked:
@@ -1420,6 +1426,7 @@ def _finish_deferred(
     items = _vertex_items(core)
     margins = _cell_margins(window, core)
     masked = vertices <= _MASK_VERTICES
+    # This marking and the first lane's loop below are _tiled_pair's, which cannot be shared (see there): edit both.
     marks = wp.tile_zeros(shape=_MASK_VERTICES, dtype=wp.int32, storage="shared")
     marked = _Mask()
     if masked:
