@@ -1380,6 +1380,128 @@ def test_deferred_pairs_keep_the_plain_finish_rows(test, device):
         _assert_same_rows(production, cpu, begin, count, f"{device} against cpu")
 
 
+@wp.kernel(enable_backward=False)
+def _vertex_item_masks(inputs: TerrainPairInputs, data: TerrainFeatureData, pair: int, masks: wp.array2d[wp.int32]):
+    """Per window vertex ``v`` of table pair ``pair`` (window order; rows past the window get -1): its row and column,
+    the items ``_kept_items`` keeps, the items ``_vertex_marks`` marks, the items whose claim is not nothing (every
+    item of the vertex evaluated by the plain walk's :func:`_plain_point_item`), and the pair's whole-pair state."""
+    v = wp.tid()
+    state, _frame, heightfield, cells, a, b, segment, reach = terrain_law_point._pair_setup(inputs, data, pair)
+    r0 = cells[0]
+    r1 = cells[1]
+    c0 = cells[2]
+    c1 = cells[3]
+    width = c1 + 2 - c0
+    if v >= (r1 + 2 - r0) * width:
+        masks[v, 0] = -1
+        return
+    window = terrain_window(data, heightfield, r0, c0)
+    ka, kb = terrain_law_point._window_points(window, a, b, segment)
+    eps = terrain_eps(terrain_window_extent(data, window, r1, c1, terrain_law_point._point_extent(ka, kb)))
+    planes = terrain_planes()
+    planes, core = terrain_law_point._pair_core(data, window, planes, ka, kb, segment, reach, eps)
+    margins = terrain_law_point._cell_margins(window, core)
+    r = r0 + v // width
+    c = c0 + v % width
+    items = terrain_law_point._vertex_items(core)
+    planes, marks = terrain_law_point._vertex_marks(data, window, planes, core, margins, r, c, r1, c1, items)
+    claims = int(0)
+    for item in range(items):
+        planes, claim = _plain_point_item(data, window, planes, core, r, c, r1, c1, item)
+        if claim.kind != 0:
+            claims = claims | (1 << item)
+    masks[v, 0] = r
+    masks[v, 1] = c
+    masks[v, 2] = terrain_law_point._kept_items(data, window, core, margins, r, c)
+    masks[v, 3] = marks
+    masks[v, 4] = claims
+    masks[v, 5] = state
+
+
+def _window_masks(shadow, model, pipeline, shape) -> np.ndarray:
+    """Per window vertex of the pair of partner ``shape``, in window order: ``(r, c, kept, marks, claims, state)`` of
+    :func:`_vertex_item_masks`."""
+    device = model.device
+    masks = wp.full((4096, 6), -1, dtype=wp.int32, device=device)
+    pair = shadow.table.pairs_host[:, 1].tolist().index(shape)
+    wp.launch(
+        _vertex_item_masks,
+        dim=masks.shape[0],
+        inputs=[_pair_inputs(shadow, model, pipeline), shadow.features.data(), pair, masks],
+        block_dim=terrain_law_block_dim(device),
+        device=device,
+    )
+    masks = masks.numpy()
+    return masks[masks[:, 0] >= 0]
+
+
+ITEM_CASES = {
+    # name: (kind, dims, pose, {cell containing (x, y): items kept}, every vertex's items or None)
+    "lying capsule": (
+        "capsule",
+        {"radius": 0.03, "half_height": 0.3},
+        (0.05, 0.05, 0.035, *LYING),
+        {(0.35, 0.05): 0xF03F, (-0.25, 0.05): 0xFFC0, (0.05, 0.05): 0xF000},
+        None,
+    ),
+    "short capsule": (
+        "capsule",
+        {"radius": 0.03, "half_height": 0.02},
+        (0.05, 0.05, 0.035, *LYING),
+        {(0.05, 0.05): 0xFFFF},
+        None,
+    ),
+    "capsule end inside": (
+        "capsule",
+        {"radius": 0.03, "half_height": 0.1},
+        (0.05, 0.05, 0.02, *_axis_angle((0.0, 1.0, 0.0), np.pi / 2.0 - np.arcsin(0.3))),
+        {},
+        0xFFFF,
+    ),
+    "sphere": (
+        "sphere",
+        {"radius": 0.25},
+        (0.05, 0.05, 0.255, 0.0, 0.0, 0.0, 1.0),
+        {(-0.25, -0.25): 0x0000, (0.05, 0.05): 0x003F},
+        None,
+    ),
+}
+"""Cores over a flat tile of 0.1 m cells (half extent 2 m) and the items ``_kept_items`` keeps at chosen vertices.
+
+The vertex owning the cell under a lying capsule's end ``a`` (local +z, world +x) keeps its axis's and end ``a``'s
+items, not end ``b``'s 0.6 m away; the cell under end ``b`` the reverse; the cell midway the axis's alone. Both ends of
+a short capsule are near (every item); with an end inside the solid (end ``b`` 1 cm below the tile) every vertex keeps
+every item, the reach bounding no exit. A sphere centre keeps its items at the cell under it and none at a window
+corner cell 0.35 m off in xy."""
+
+
+def test_kept_items_drop_far_core_ends(test, device):
+    """Keep at a window vertex exactly the items within reach of the core, and mark exactly the items that yield.
+
+    ``_kept_items`` passes by a capsule end's six items at a vertex whose box lies beyond the reach of the end (both
+    ends outside the solid), and every item of a vertex the drop passes by (:data:`ITEM_CASES`); ``_vertex_marks``
+    marks, of a vertex's kept items, those whose claim is not nothing, which must be every item whose claim is not
+    nothing (each evaluated by the plain walk's item, without the off-cell reject). A drop that kept every item or marks
+    that set every kept item would undo the walks' savings without changing a row.
+    """
+    bodies = [(kind, dims, np.asarray(pose, np.float64)) for kind, dims, pose, _cells, _every in ITEM_CASES.values()]
+    model, _hfield, shapes = tu.body_scene(np.zeros((41, 41)), 2.0, 2.0, bodies, device=device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    shadow = pipeline._terrain_law_shadow
+    for (name, (_kind, _dims, _pose, cells, every)), shape in zip(ITEM_CASES.items(), shapes, strict=True):
+        with test.subTest(case=name):
+            got = _window_masks(shadow, model, pipeline, shape)
+            test.assertTrue(np.all(got[:, 5] == 0), msg="the pair leaves before its window")
+            kept = {(int(r), int(c)): int(k) for r, c, k in got[:, :3]}
+            for (x, y), items in cells.items():
+                cell = (int(np.floor((y + 2.0) / 0.1)), int(np.floor((x + 2.0) / 0.1)))
+                test.assertEqual(hex(kept[cell]), hex(items), msg=f"cell {cell} under ({x}, {y})")
+            if every is not None:
+                test.assertEqual({hex(k) for k in kept.values()}, {hex(every)})
+            np.testing.assert_array_equal(got[:, 3], got[:, 4], err_msg="marks against the items that yield")
+            test.assertTrue(np.any(got[:, 3] != 0), msg="no vertex yields anything")
+
+
 @functools.cache
 def _point_ptx() -> str | None:
     """The point module's PTX for sm_86 (NVRTC, any host), or ``None`` where NVRTC cannot compile for it."""
@@ -1529,6 +1651,7 @@ for _name, _func in (
     ("test_tiled_kernel_matches_one_thread_kernel", test_tiled_kernel_matches_one_thread_kernel),
     ("test_rejects_keep_the_plain_walk_rows", test_rejects_keep_the_plain_walk_rows),
     ("test_deferred_pairs_keep_the_plain_finish_rows", test_deferred_pairs_keep_the_plain_finish_rows),
+    ("test_kept_items_drop_far_core_ends", test_kept_items_drop_far_core_ends),
 ):
     add_function_test(TestTerrainLawPoint, _name, _func, devices=devices)
 
