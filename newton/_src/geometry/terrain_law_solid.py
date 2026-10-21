@@ -2840,8 +2840,9 @@ TERRAIN_SOLID_LAUNCHES = (
     ("full", "full"),
 )
 """A solid class's launches in order, by kind and kernel (:func:`solid_kernels`): ``pairs`` one thread per pair of the
-class, ``jobs`` the class's job threads (:attr:`TerrainSolidJobs.threads`, striding over a list), ``full`` the
-full-finish grid (:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`, ``wp.launch_tiled``)."""
+class, ``jobs`` the class's job threads (:attr:`TerrainSolidJobs.threads`, striding over a list; a thread past them
+returns at once, so that a larger launch takes no entry twice), ``full`` the full-finish grid
+(:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`, ``wp.launch_tiled``)."""
 
 
 def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, save_core, load_core, module: str) -> dict:
@@ -2924,6 +2925,8 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         and the run's features through their cheapest rejects, the survivors listed for the job kernels
         (:func:`solid_scan`)."""
         t = wp.tid()
+        if t >= jobs.threads:
+            return
         for entry in range(t, wp.min(jobs.counts[_SCANS], jobs.scans.shape[0]), jobs.threads):
             job = jobs.scans[entry]
             i = job[0]
@@ -2947,6 +2950,8 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
     ):
         """Rule F, one listed face per thread at a time (the grid strides over the list, :func:`solid_face_job`)."""
         t = wp.tid()
+        if t >= jobs.threads:
+            return
         for entry in range(t, wp.min(jobs.counts[_FACES], jobs.faces.shape[0]), jobs.threads):
             job = jobs.faces[entry]
             i = job[0] - begin
@@ -2963,6 +2968,8 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
     ):
         """Rule E's crease tests, one listed edge per thread at a time (:func:`solid_edge_job`)."""
         t = wp.tid()
+        if t >= jobs.threads:
+            return
         for entry in range(t, wp.min(jobs.counts[_EDGES], jobs.edges.shape[0]), jobs.threads):
             job = jobs.edges[entry]
             i = job[0] - begin
@@ -2979,6 +2986,8 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
     ):
         """Rule E's ``theta*``, one listed crease per thread at a time (:func:`solid_theta_job`)."""
         t = wp.tid()
+        if t >= jobs.threads:
+            return
         for entry in range(t, wp.min(jobs.counts[_THETAS], jobs.thetas.shape[0]), jobs.threads):
             job = jobs.thetas[entry]
             i = job[0] - begin
@@ -2995,6 +3004,8 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
     ):
         """Rule E's rows, one listed crease per thread at a time, at its ``theta*`` (:func:`solid_crease_job`)."""
         t = wp.tid()
+        if t >= jobs.threads:
+            return
         for entry in range(t, wp.min(jobs.counts[_THETAS], jobs.thetas.shape[0]), jobs.threads):
             job = jobs.thetas[entry]
             i = job[0] - begin
@@ -3011,6 +3022,8 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
     ):
         """Rule V, one listed vertex per thread at a time (:func:`solid_vertex_job`)."""
         t = wp.tid()
+        if t >= jobs.threads:
+            return
         for entry in range(t, wp.min(jobs.counts[_VERTICES], jobs.vertices.shape[0]), jobs.threads):
             job = jobs.vertices[entry]
             i = job[0] - begin
@@ -3028,6 +3041,8 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         """The close, one live pair per thread at a time: a scanned pair's rows held in window order, then its finish,
         its rule X's items or rule R's list (:func:`solid_close_jobs`); a pair the scan deferred is passed by."""
         t = wp.tid()
+        if t >= jobs.threads:
+            return
         for entry in range(t, jobs.counts[_LIVE], jobs.threads):
             i = jobs.live[entry]
             pair = begin + i
@@ -3058,6 +3073,8 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         """Rule R, one closed pair without a row per thread at a time, then its finish or its rule X's items
         (:func:`solid_recover_pair`)."""
         t = wp.tid()
+        if t >= jobs.threads:
+            return
         for entry in range(t, jobs.counts[_RECOVER], jobs.threads):
             i = jobs.recover[entry]
             pair = begin + i
@@ -3086,6 +3103,8 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
     ):
         """Rule X's items, one per thread at a time: candidates and valleys (:func:`solid_xitem_job`)."""
         t = wp.tid()
+        if t >= jobs.threads:
+            return
         for entry in range(t, wp.min(jobs.counts[_XITEMS], jobs.xitems.shape[0]), jobs.threads):
             job = jobs.xitems[entry]
             i = job[0] - begin
@@ -3102,6 +3121,8 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
     ):
         """Rule X's valleys, one per thread at a time: candidates (:func:`solid_xvalley_job`)."""
         t = wp.tid()
+        if t >= jobs.threads:
+            return
         for entry in range(t, wp.min(jobs.counts[_XVALLEYS], jobs.xvalleys.shape[0]), jobs.threads):
             job = jobs.xvalleys[entry]
             i = job[0] - begin
@@ -3118,6 +3139,8 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
     ):
         """Rule X's listed candidates' near-bound descents, one per thread at a time (:func:`solid_xdescent_job`)."""
         t = wp.tid()
+        if t >= jobs.threads:
+            return
         for entry in range(t, wp.min(jobs.counts[_XDESCENTS], jobs.xdescents.shape[0]), jobs.threads):
             job = jobs.xdescents[entry]
             solid_xdescent_job(data, jobs, job[0], job[1])

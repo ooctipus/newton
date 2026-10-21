@@ -1216,6 +1216,7 @@ def _run_class(
     full=False,
     blocks=None,
     extra_blocks=0,
+    extra_threads=0,
     candidates=None,
 ):
     """Run a solid class's launches (:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LAUNCHES`) for a
@@ -1223,7 +1224,8 @@ def _run_class(
     sized as the shadow's), every list reversed before its kernel takes it with ``reverse``, up to the launch ``until``
     (not run). With ``full``, every pair the shadow did not reject whole goes straight to the full-finish kernel, which
     walks it. The full-finish kernel's grid holds ``blocks`` blocks (by default the shadow's) of ``candidates``
-    candidates (by default the class's bound), launched with ``extra_blocks`` more. Returns ``(out, jobs, solids)``."""
+    candidates (by default the class's bound), launched with ``extra_blocks`` more; the job kernels are launched with
+    ``extra_threads`` threads more than the jobs' grid. Returns ``(out, jobs, solids)``."""
     shadow = pipeline._terrain_law_shadow
     table = shadow.table
     device = model.device
@@ -1262,7 +1264,7 @@ def _run_class(
             inputs = [*args, scratch, solids, jobs]
             wp.launch_tiled(kernel, dim=grid + extra_blocks, inputs=inputs, block_dim=block, device=device)
         else:
-            dim = end - begin if kind == "pairs" else jobs.threads
+            dim = end - begin if kind == "pairs" else jobs.threads + extra_threads
             wp.launch(kernel, dim=dim, inputs=[*args, jobs, solids], block_dim=block, device=device)
     return out, jobs, solids
 
@@ -1800,15 +1802,16 @@ def test_solid_launches_take_fixed_grids(test, device):
 
 
 def test_job_grids_take_each_entry_once(test, device):
-    """Take every job and every deferred pair once, whatever the job kernels' grid, and with a full-finish launch of
-    more blocks than its grid.
+    """Take every job and every deferred pair once, whatever the job kernels' grid, and with launches of more threads
+    or blocks than their grids.
 
     The scan, job, close and rule R kernels stride over their lists by the class's job threads (``jobs.threads``, fixed
-    at construction); the full-finish kernel strides over the deferred list by its scratch's grid (``scratch.blocks``),
-    a block past it returning at once. Long boxes lie across ridges: their rows exceed the box class's walk slots
-    (deferred, spilled). One job thread, three and the shadow's give the same rows, as does a full-finish launch of
-    three blocks more than its grid of two, which would otherwise finish deferred pairs twice, counting their spill rows
-    twice.
+    at construction), a thread past them returning at once; the full-finish kernel strides over the deferred list by its
+    scratch's grid (``scratch.blocks``), a block past it returning at once. Long boxes lie across ridges: their rows
+    exceed the box class's walk slots (deferred, spilled). One job thread, three and the shadow's give the same rows, as
+    do job kernels launched with three threads more than the jobs' grid, which would otherwise take entries twice
+    (closing a pair twice), and a full-finish launch of three blocks more than its grid of two, which would otherwise
+    finish deferred pairs twice, counting their spill rows twice.
     """
     _hf, model, _shapes, bodies = _ridge_boxes(device, (0.9, 0.05, 0.02), (-0.75, -0.45, -0.15, 0.15, 0.45, 0.75))
     pipeline, _contacts, _state = _collide(model, shadow=True)
@@ -1817,9 +1820,11 @@ def test_job_grids_take_each_entry_once(test, device):
     test.assertEqual(end - begin, len(bodies))
     rows = TERRAIN_PARTNER_WALK_SLOTS[TERRAIN_PARTNER_BOX]
     results = []
-    for threads, extra in ((None, 0), (1, 0), (3, 0), (None, 3)):
+    for threads, extra, extra_threads in ((None, 0, 0), (1, 0, 0), (3, 0, 0), (None, 3, 0), (2, 0, 3)):
         jobs = _class_jobs(model, shadow, TERRAIN_PARTNER_BOX, threads=threads)
-        out, jobs, _solids = _run_class(pipeline, model, TERRAIN_PARTNER_BOX, jobs=jobs, blocks=2, extra_blocks=extra)
+        out, jobs, _solids = _run_class(
+            pipeline, model, TERRAIN_PARTNER_BOX, jobs=jobs, blocks=2, extra_blocks=extra, extra_threads=extra_threads
+        )
         results.append(
             {
                 "counts": _counts(jobs),
