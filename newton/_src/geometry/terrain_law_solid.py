@@ -237,6 +237,13 @@ of a scene with few pairs always finds room (16,384 entries, 128 KiB)."""
 TERRAIN_SOLID_POOL_FLOOR = 1 << 16
 """Entries a solid class's candidate pool holds by default at least, or all its pairs' bounds when they sum to less
 (65,536 entries, 2.5 MiB)."""
+TERRAIN_SOLID_EXIT_SHARE = 256
+"""Rule X's listed candidates of a solid class: by default the largest pair's bound on them (every rule X key of its
+window, :data:`TERRAIN_SOLID_EXIT_SLOTS` per window vertex) plus its pairs' rule X items over this (one candidate per
+item for one pair in 256 at once; the spill region's share, :data:`~newton._src.geometry.terrain_shadow.
+TERRAIN_LAW_SPILL_SHARE`), at least the class's keys up to :data:`TERRAIN_SOLID_JOB_FLOOR`. Only a pair whose core
+reaches below its window's highest vertex lists any, and only those deeper than every row it holds: the recorded suite
+states list at most 587 per class and collide."""
 TERRAIN_SOLID_JOB_THREADS = 1 << 17
 """Threads of a job kernel's launch on CUDA at most (fewer with a smaller list): a fixed grid that strides over its
 list."""
@@ -444,7 +451,9 @@ class TerrainSolidJobs:
     threads: int
     """Threads of the job kernels' launches: each strides over its list."""
     q: wp.array[wp.vec3]
-    """The candidate pool: terrain point of every candidate [m, window frame]."""
+    """The candidate pool: terrain point of every candidate [m, window frame]. Its first entries hold the jobs' rows
+    (:func:`_offer`), its last ``descent.shape[0]`` rule X's listed candidates (:func:`_x_list`), each region with its
+    own counter and room."""
     n: wp.array[wp.vec3]
     """Unit normal of every candidate."""
     d: wp.array[float]
@@ -461,12 +470,11 @@ class TerrainSolidJobs:
     """Per class pair left to rule X: the depth its exit must pass (its deepest row's, plus
     :data:`TERRAIN_SOLID_EXIT_MARGIN`)."""
     descent: wp.array[wp.vec4]
-    """Per listed rule X candidate in the candidate pool: its bound after each block of :func:`_near_bound`'s
-    descent, the last repeated (:func:`_near_descent`), taken by :func:`solid_xdescent_job` so that the exit kernel's
-    passes need not."""
-    xdescents: wp.array[wp.vec2i]
-    """The listed rule X candidates whose descents :func:`solid_xdescent_job` takes: ``(class pair, pool entry)``
-    (room for every entry of the candidate pool)."""
+    """Per listed rule X candidate ``k`` (pool entry :func:`_pool_rows` plus ``k``): its bound after each block of
+    :func:`_near_bound`'s descent, the last repeated (:func:`_near_descent`), taken by :func:`solid_xdescent_job` so
+    that the exit kernel's passes need not. Its length is the room of rule X's region of the pool."""
+    xpair: wp.array[wp.int32]
+    """Per listed rule X candidate ``k``: its class pair, whose window :func:`solid_xdescent_job` reads."""
     xhead: wp.array[wp.int32]
     """Per class pair left to rule X: its first listed candidate in the candidate pool (-1: none). Rule X's jobs list
     the candidates whose bounds pass the pair's target there: the candidate point in ``q``, its bound in ``d`` and its
@@ -558,13 +566,19 @@ def _offer(store: TerrainLawRows, sink: _Sink, q: wp.vec3, n: wp.vec3, d: float,
 
 
 @wp.func
+def _pool_rows(jobs: TerrainSolidJobs) -> int:
+    """The candidate pool's room for the jobs' rows: its entries but rule X's region (:attr:`TerrainSolidJobs.q`)."""
+    return jobs.key.shape[0] - jobs.descent.shape[0]
+
+
+@wp.func
 def _offer(store: TerrainSolidJobs, sink: _Sink, q: wp.vec3, n: wp.vec3, d: float, feature: int) -> _Sink:
     """Offer a job's row: add it to the candidate pool, in its pair's list (``sink.slot``), with its place in window
     order (``sink.key`` plus its point slot); the close holds them in that order (:func:`solid_close_jobs`). With no
     room left, the row is lost and ``sink.lost`` set (the close then leaves the pair to the full-finish kernel)."""
     sink.raw = sink.raw + 1
     entry = wp.atomic_add(store.counts, _CANDIDATES, 1)
-    if entry >= store.key.shape[0]:
+    if entry >= _pool_rows(store):
         sink.lost = 1
         return sink
     store.q[entry] = q
@@ -1712,15 +1726,15 @@ def _keys_after(
 def _x_list(
     jobs: TerrainSolidJobs, i: int, x: wp.vec3, bound: float, key: int, valley: int, gate: float, scale: float
 ) -> int:
-    """List a rule X candidate of class pair ``i`` whose bound passes its target (:attr:`TerrainSolidJobs.xhead`):
-    point ``x``, bound ``bound``, key ``key``; for a valley's, its valley's first key ``valley`` and the valley's gate
-    (``gate`` over ``scale``; ``valley`` -1 for another's); and its descent for :func:`solid_xdescent_job`. 0 when the
-    pool had no room."""
-    entry = wp.atomic_add(jobs.counts, _CANDIDATES, 1)
-    if entry >= jobs.key.shape[0]:
+    """List a rule X candidate of class pair ``i`` whose bound passes its target (:attr:`TerrainSolidJobs.xhead`), in
+    rule X's region of the candidate pool: point ``x``, bound ``bound``, key ``key``; for a valley's, its valley's
+    first key ``valley`` and the valley's gate (``gate`` over ``scale``; ``valley`` -1 for another's); and its pair for
+    its descent (:func:`solid_xdescent_job`). 0 when the region had no room."""
+    k = wp.atomic_add(jobs.counts, _XDESCENTS, 1)
+    if k >= jobs.descent.shape[0]:
         return 0
-    if _job_append(jobs, _XDESCENTS, jobs.xdescents, wp.vec2i(i, entry)) == 0:
-        return 0
+    entry = _pool_rows(jobs) + k
+    jobs.xpair[k] = i
     jobs.q[entry] = x
     jobs.d[entry] = bound
     jobs.n[entry] = wp.vec3(gate, scale, 0.0)
@@ -1768,7 +1782,16 @@ def _exit_listed(
                 if not passing:
                     continue
             planes, best = _exit_try_listed(
-                data, window, planes, pair, cells, best, jobs.q[entry], jobs.d[entry], jobs.descent[entry], key
+                data,
+                window,
+                planes,
+                pair,
+                cells,
+                best,
+                jobs.q[entry],
+                jobs.d[entry],
+                jobs.descent[entry - _pool_rows(jobs)],
+                key,
             )
     return planes, best
 
@@ -2896,11 +2919,12 @@ def solid_xvalley_job(core: Any, data: TerrainFeatureData, jobs: TerrainSolidJob
 
 
 @wp.func
-def solid_xdescent_job(data: TerrainFeatureData, jobs: TerrainSolidJobs, i: int, entry: int):
-    """The near bound's descent of class pair ``i``'s listed rule X candidate at pool entry ``entry``
-    (:func:`_near_descent`), for the exit kernel's passes."""
-    _record, window = solid_job_window(data, jobs, i)
-    jobs.descent[entry] = _near_descent(data, window, jobs.q[entry], jobs.d[entry])
+def solid_xdescent_job(data: TerrainFeatureData, jobs: TerrainSolidJobs, k: int):
+    """The near bound's descent of listed rule X candidate ``k`` (:func:`_near_descent`), for the exit kernel's
+    passes."""
+    _record, window = solid_job_window(data, jobs, jobs.xpair[k])
+    entry = _pool_rows(jobs) + k
+    jobs.descent[k] = _near_descent(data, window, jobs.q[entry], jobs.d[entry])
 
 
 @wp.func
@@ -3295,9 +3319,8 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         t = wp.tid()
         if t >= jobs.threads:
             return
-        for entry in range(t, wp.min(jobs.counts[_XDESCENTS], jobs.xdescents.shape[0]), jobs.threads):
-            job = jobs.xdescents[entry]
-            solid_xdescent_job(data, jobs, job[0], job[1])
+        for k in range(t, wp.min(jobs.counts[_XDESCENTS], jobs.descent.shape[0]), jobs.threads):
+            solid_xdescent_job(data, jobs, k)
 
     def exit_(
         begin: int,
@@ -3642,11 +3665,14 @@ def terrain_solid_job_capacities(
 ) -> dict[str, int]:
     """Return a solid class's job list capacities by default, from its pairs' own bounds: per list
     (:data:`TERRAIN_SOLID_JOB_LISTS`) the largest pair's bound plus the sum of every pair's bound over the list's
-    share (:data:`TERRAIN_SOLID_JOB_SHARES`), and the candidate pool (``candidates``): the largest pair's bound on its
-    candidates plus the class's walk slots over :data:`TERRAIN_SOLID_CANDIDATE_SHARE`; at least the sum of every
-    pair's bound up to :data:`TERRAIN_SOLID_JOB_FLOOR` (:data:`TERRAIN_SOLID_POOL_FLOOR` for the pool), so that a
-    scene with few pairs never lacks room; each times ``scale``. The scan's runs (``scans``) are exact: every pair's at
-    its largest window (:data:`TERRAIN_SOLID_SCAN_VERTICES` vertices each).
+    share (:data:`TERRAIN_SOLID_JOB_SHARES`), the candidate pool's rows (``candidates``): the largest pair's bound on
+    its candidates plus the class's walk slots over :data:`TERRAIN_SOLID_CANDIDATE_SHARE`, and rule X's listed
+    candidates (``xdescents``, the pool's region of their own): the largest pair's rule X keys plus its pairs' rule X
+    items over :data:`TERRAIN_SOLID_EXIT_SHARE`; at least the sum of every pair's bound up to
+    :data:`TERRAIN_SOLID_JOB_FLOOR` (:data:`TERRAIN_SOLID_POOL_FLOOR` for the pool's rows), so that a scene with few
+    pairs never lacks room; each times ``scale``. The scan's runs (``scans``) are exact: every pair's at its largest
+    window (:data:`TERRAIN_SOLID_SCAN_VERTICES` vertices each). Every list and region is a scene-level buffer: a pair
+    whose work finds no room takes its class's full-finish kernel (its rows unchanged).
 
     Args:
         vertices: Per pair, the bound on its window's vertices
@@ -3675,14 +3701,18 @@ def terrain_solid_job_capacities(
         default = (int(bound.max()) + -(-total // share)) if len(bound) else 0
         default = max(default, min(total, TERRAIN_SOLID_JOB_FLOOR))
         capacities[name] = max(1, int(np.ceil(scale * default)))
-    # a pair's pool entries: up to eight rows (its key's point slots) per listed face, crease and vertex, and its rule X
-    # candidates (its core's points and, taking candidates at window vertices, their key slots)
-    total = int(np.sum(48 * v + points + np.where(takes, TERRAIN_SOLID_EXIT_SLOTS * v, 0)))
+    # a pair's pool entries: up to eight rows (its key's point slots) per listed face, crease and vertex
+    total = int(np.sum(48 * v))
     default = (int(np.max(candidates)) if len(v) else 0) + walk_slots * len(v) // TERRAIN_SOLID_CANDIDATE_SHARE
     default = max(default, min(total, TERRAIN_SOLID_POOL_FLOOR))
     capacities["candidates"] = max(1, int(np.ceil(scale * default)))
-    # the listed rule X candidates' descents: one per pool entry at most
-    capacities["xdescents"] = capacities["candidates"]
+    # rule X's listed candidates, the pool's region of their own: every key of the largest pair's window (its core's
+    # points and, taking candidates at window vertices, their key slots), and one per item for one pair in 256
+    keys = points + np.where(takes, TERRAIN_SOLID_EXIT_SLOTS * v, 0)
+    items = points + np.where(takes, v, 0)
+    default = (int(keys.max()) + -(-int(items.sum()) // TERRAIN_SOLID_EXIT_SHARE)) if len(v) else 0
+    default = max(default, min(int(keys.sum()), TERRAIN_SOLID_JOB_FLOOR))
+    capacities["xdescents"] = max(1, int(np.ceil(scale * default)))
     # the scan's runs: every pair's at its largest window, exact (a window past its bound takes the full finish)
     capacities["scans"] = max(1, int(np.sum(-(-v // TERRAIN_SOLID_SCAN_VERTICES))))
     return capacities
@@ -3739,15 +3769,16 @@ def terrain_solid_jobs(
     longest = max(int(capacities[name]) for name in (*TERRAIN_SOLID_JOB_LISTS, "scans"))
     threads = TERRAIN_SOLID_JOB_THREADS if wp.get_device(device).is_cuda else TERRAIN_SOLID_JOB_THREADS_CPU
     jobs.threads = max(1, min(threads, longest))
-    pool = max(int(capacities["candidates"]), 1)
+    exits = max(int(capacities["xdescents"]), 1)
+    pool = max(int(capacities["candidates"]), 1) + exits
     jobs.q = wp.zeros(pool, dtype=wp.vec3, device=device)
     jobs.n = wp.zeros(pool, dtype=wp.vec3, device=device)
     jobs.d = wp.zeros(pool, dtype=wp.float32, device=device)
     jobs.feature = wp.zeros(pool, dtype=wp.int32, device=device)
     jobs.key = wp.zeros(pool, dtype=wp.int32, device=device)
     jobs.next = wp.zeros(pool, dtype=wp.int32, device=device)
-    jobs.descent = wp.zeros(pool, dtype=wp.vec4, device=device)
-    jobs.xdescents = wp.zeros(max(int(capacities["xdescents"]), 1), dtype=wp.vec2i, device=device)
+    jobs.descent = wp.zeros(exits, dtype=wp.vec4, device=device)
+    jobs.xpair = wp.zeros(exits, dtype=wp.int32, device=device)
     jobs.head = wp.full(room, -1, dtype=wp.int32, device=device)
     jobs.target = wp.zeros(room, dtype=wp.float32, device=device)
     jobs.xhead = wp.full(room, -1, dtype=wp.int32, device=device)
@@ -3780,7 +3811,7 @@ def terrain_solid_jobs_bytes(jobs: TerrainSolidJobs) -> int:
         jobs.key,
         jobs.next,
         jobs.descent,
-        jobs.xdescents,
+        jobs.xpair,
         jobs.head,
         jobs.target,
         jobs.xhead,
