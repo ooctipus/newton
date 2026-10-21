@@ -43,7 +43,9 @@ from the core) and by its arc ends' support values before the search, a vertex b
 call before its feature test and nearest point.
 
 Rule X runs after the walk (and rule R), only for a core reaching below its window's highest vertex (read in the
-pass that sets the window's band). A candidate's bound is its depth below the plane of the face under it when its
+pass that sets the window's band): the walk leaves such a pair, its rows held in its walk slots, to its class's exit
+kernel (:func:`solid_close`, :func:`solid_rows_exit`), so that rule X's work runs on warps of its own, off the walks'
+registers and stacks; a deferred pair's full finish runs it itself. A candidate's bound is its depth below the plane of the face under it when its
 projection stays in that face's cluster, else its distance to that triangle, or its distance to the feature that
 proposed it, the smallest, lowered by a descent over blocks of 3 x 3 cells toward its closest surface point
 (:func:`_near_bound`). A first pass over the candidates takes the two largest bounds above the pair's depth, and the
@@ -91,6 +93,7 @@ from .terrain_law import (
     TERRAIN_FINISH_CANDIDATE_OVERFLOW,
     TERRAIN_FLAT_EPS,
     TERRAIN_NORMAL_SAME,
+    TERRAIN_PAIR_EXIT,
     TERRAIN_PAIR_FILTERED,
     TERRAIN_PAIR_OUTSIDE,
     TERRAIN_PAIR_STALE,
@@ -220,12 +223,20 @@ _ArcValues = wp.types.vector(length=TERRAIN_SOLID_ARC_SAMPLES, dtype=wp.float32)
 @wp.struct
 class TerrainSolidData:
     """What the solid classes' kernels read besides the pair inputs, the terrain and their launch argument (the work
-    list or the full finish's scratch): hull tables and the one-thread kernels' lane choice."""
+    list or the full finish's scratch): hull tables, the one-thread kernels' lane choice and rule X's list."""
 
     hulls: TerrainHullTable
     """The hulls of the hull class (empty for the other classes)."""
     thread_vertices: int
     """Window vertices up to which the one-thread kernels walk a pair; 0: they walk every window."""
+    exits: wp.array[wp.int32]
+    """The walked pairs left to their class's exit kernel (rule X; :func:`solid_close`): partner class ``c``'s list
+    starts at the side buffer's ``deferred_first[c]`` (its first pair in the table) and holds ``exit_count[c]`` pairs,
+    appended in any order (a pair's rows depend on it alone)."""
+    exit_count: wp.array[wp.int32]
+    """Per partner class: the pairs in its exit list (zeroed before every launch)."""
+    exit_work: wp.array[wp.int32]
+    """Rule X's exit searches since the launch began (``[0]``) and the window vertices they covered (``[1]``)."""
 
 
 @wp.struct
@@ -829,6 +840,10 @@ class _Exit:
     first_x: wp.vec3
     second: float
     """The first pass's largest bound of every other candidate above ``target`` (``target`` for none)."""
+    searches: int
+    """Exit searches so far."""
+    cells: int
+    """Window vertices the exit searches covered so far."""
 
 
 @wp.func
@@ -967,6 +982,8 @@ def _exit_take(
     region = _exit_cells(window, x, radius)
     eps = _exit_eps(data, window, pair, cells, region)
     planes, found, q, n, d, feature = terrain_point_exit(data, window, planes, x, region, eps, pair.reach)
+    best.searches = best.searches + 1
+    best.cells = best.cells + (region[1] - region[0] + 2) * (region[3] - region[2] + 2)
     if found and (best.found == 0 or d < best.d or (d == best.d and key < best.key)):
         best.found = 1
         best.q = q
@@ -1172,9 +1189,11 @@ def solid_exits(
     sink: _Sink,
     store: TerrainLawRows,
     cells: wp.vec4i,
+    work: wp.array[wp.int32],
 ) -> tuple[TerrainPlanes, _Sink]:
     """Rule X: the exit of the deepest of the core's candidate boundary points, offered when it lies deeper than every
-    row the pair holds by more than :data:`TERRAIN_SOLID_EXIT_MARGIN` (point slot :data:`TERRAIN_SOLID_EXIT_SLOT`).
+    row the pair holds by more than :data:`TERRAIN_SOLID_EXIT_MARGIN` (point slot :data:`TERRAIN_SOLID_EXIT_SLOT`);
+    its exit searches and the window vertices they covered are added to ``work``.
 
     A deepest boundary point whose closest surface point is unique is a local maximum of its distance to that one
     feature: a support point of rule F's plane manifold for a face, an extreme point of the core for a valley edge or
@@ -1214,6 +1233,9 @@ def solid_exits(
                 break
             best.walk = 1
         planes, best = _exit_candidates(core, data, window, planes, pair, cells, best, low)
+    if best.searches > 0:
+        wp.atomic_add(work, 0, best.searches)
+        wp.atomic_add(work, 1, best.cells)
     if best.found != 0 and -best.d > best.target:
         feature = best.feature - (best.feature & 7) + _EXIT_SLOT
         sink = _offer(store, sink, best.q, best.n, best.d, feature)
@@ -1371,11 +1393,8 @@ def solid_walk(
 
 
 @wp.func
-def solid_close(
-    core: Any,
-    data: TerrainFeatureData,
+def solid_finish(
     window: TerrainWindow,
-    planes: TerrainPlanes,
     pair: _Pair,
     sink: _Sink,
     out: TerrainLawRows,
@@ -1384,15 +1403,8 @@ def solid_close(
     frame: wp.transform,
     cells: wp.vec4i,
 ):
-    """Finish a walked pair in its walk slots (``sink.slot``): defer it when its distinct rows overflow them, else add
-    the recovery rows when it has none, run the finish in place and write the kept rows (world frame) at the front of
-    its slots."""
-    if sink.held > sink.capacity:
-        terrain_defer_pair(out, partner_class, pair_index, _wide(cells))
-        return
-    if sink.raw == 0:
-        planes, sink = solid_recovery(core, data, window, planes, sink, out)
-    planes, sink = solid_exits(core, data, window, planes, pair, sink, out, cells)
+    """Finish a pair's held rows in its walk slots (``sink.slot``): defer it when its distinct rows overflow them, else
+    run the finish in place and write the kept rows (world frame) at the front of its slots."""
     if sink.held > sink.capacity:
         terrain_defer_pair(out, partner_class, pair_index, _wide(cells))
         return
@@ -1409,6 +1421,74 @@ def solid_close(
 
 
 @wp.func
+def _exit_gate(core: Any, pair: _Pair) -> bool:
+    """Whether rule X can give a pair a row: its core's lowest point lies below its window's highest vertex."""
+    lo, _hi = core_bounds(core)
+    return lo[2] < pair.top
+
+
+@wp.func
+def solid_close(
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    pair: _Pair,
+    sink: _Sink,
+    out: TerrainLawRows,
+    solids: TerrainSolidData,
+    pair_index: int,
+    partner_class: int,
+    frame: wp.transform,
+    cells: wp.vec4i,
+):
+    """Close a walked pair in its walk slots (``sink.slot``): defer it when its distinct rows overflow them, else add
+    the recovery rows when it has none; a pair whose core reaches below its window's highest vertex is left, its rows
+    held (count in ``out.count``, state :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_EXIT`), to its class's
+    exit kernel (rule X, :func:`solid_rows_exit`), any other finished here (:func:`solid_finish`). Rule X's work thus
+    stays off the walks: their warps, registers and stacks."""
+    if sink.held > sink.capacity:
+        terrain_defer_pair(out, partner_class, pair_index, _wide(cells))
+        return
+    if sink.raw == 0:
+        planes, sink = solid_recovery(core, data, window, planes, sink, out)
+    if _exit_gate(core, pair):
+        out.first[pair_index] = sink.slot
+        out.count[pair_index] = sink.held
+        out.state[pair_index] = _wide(cells) | TERRAIN_PAIR_EXIT
+        entry = wp.atomic_add(solids.exit_count, partner_class, 1)
+        solids.exits[out.deferred_first[partner_class] + entry] = pair_index
+        return
+    solid_finish(window, pair, sink, out, pair_index, partner_class, frame, cells)
+
+
+@wp.func
+def solid_rows_exit(
+    core: Any,
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+    solids: TerrainSolidData,
+    pair_index: int,
+    slot: int,
+    walk_slots: int,
+    partner_class: int,
+    frame: wp.transform,
+    heightfield: int,
+    reach: float,
+):
+    """Rule X for a pair its walk left to the class's exit kernel, its rows held in its walk slots from ``slot``
+    (``out.count`` of them): its window again (the walk's, bit for bit), the deepest exit (:func:`solid_exits`), then
+    the finish (:func:`solid_finish`), which gives the pair the rows a walk that ran rule X itself would."""
+    _state, cells, window, core, pair = solid_pair_window(core, data, heightfield, reach)
+    planes = terrain_planes()
+    sink = solid_sink(slot, walk_slots, pair.eps, 0)
+    sink.held = out.count[pair_index]
+    sink.raw = sink.held
+    planes, sink = solid_exits(core, data, window, planes, pair, sink, out, cells, solids.exit_work)
+    solid_finish(window, pair, sink, out, pair_index, partner_class, frame, cells)
+
+
+@wp.func
 def solid_close_full(
     core: Any,
     data: TerrainFeatureData,
@@ -1418,6 +1498,7 @@ def solid_close_full(
     sink: _Sink,
     scratch: TerrainFinishScratch,
     out: TerrainLawRows,
+    work: wp.array[wp.int32],
     pair_index: int,
     slot: int,
     walk_slots: int,
@@ -1425,15 +1506,15 @@ def solid_close_full(
     cells: wp.vec4i,
 ):
     """Finish a deferred pair walked into a full-finish block's scratch (``sink.slot``): add the recovery rows when it
-    has none, run the finish on every distinct candidate and write the kept rows (world frame) to its walk slots from
-    ``slot`` when they fit, else to rows of the spill region.
+    has none and rule X's exit (its searches counted in ``work``), run the finish on every distinct candidate and write
+    the kept rows (world frame) to its walk slots from ``slot`` when they fit, else to rows of the spill region.
 
     The scratch holds every candidate a window of the class can give; a pair with more has a window its shape data no
     longer bounds (changed since construction): it keeps the first in window order and is flagged."""
     store = solid_scratch_store(scratch)
     if sink.raw == 0:
         planes, sink = solid_recovery(core, data, window, planes, sink, store)
-    planes, sink = solid_exits(core, data, window, planes, pair, sink, store, cells)
+    planes, sink = solid_exits(core, data, window, planes, pair, sink, store, cells, work)
     flags = int(0)
     if sink.held > sink.capacity:
         sink.held = sink.capacity
@@ -1489,7 +1570,7 @@ def solid_rows_thread(
     planes = terrain_planes()
     sink = solid_sink(slot, walk_slots, pair.eps, 0)
     planes, sink = solid_walk(core, data, window, planes, pair, sink, out, cells)
-    solid_close(core, data, window, planes, pair, sink, out, pair_index, partner_class, frame, cells)
+    solid_close(core, data, window, planes, pair, sink, out, solids, pair_index, partner_class, frame, cells)
 
 
 @wp.func
@@ -1498,6 +1579,7 @@ def solid_rows_full(
     data: TerrainFeatureData,
     out: TerrainLawRows,
     scratch: TerrainFinishScratch,
+    solids: TerrainSolidData,
     block: int,
     pair_index: int,
     slot: int,
@@ -1512,7 +1594,22 @@ def solid_rows_full(
     planes = terrain_planes()
     sink = solid_sink(block * scratch.capacity, scratch.capacity, pair.eps, 0)
     planes, sink = solid_walk(core, data, window, planes, pair, sink, solid_scratch_store(scratch), cells)
-    solid_close_full(core, data, window, planes, pair, sink, scratch, out, pair_index, slot, walk_slots, frame, cells)
+    solid_close_full(
+        core,
+        data,
+        window,
+        planes,
+        pair,
+        sink,
+        scratch,
+        out,
+        solids.exit_work,
+        pair_index,
+        slot,
+        walk_slots,
+        frame,
+        cells,
+    )
 
 
 @wp.func
@@ -1567,6 +1664,7 @@ def solid_replay(
     cells: wp.vec4i,
     marked: _Mask,
     words: int,
+    solids: TerrainSolidData,
     pair_index: int,
     slot: int,
     walk_slots: int,
@@ -1574,8 +1672,8 @@ def solid_replay(
     frame: wp.transform,
 ):
     """The tiled kernels' first lane: the marked vertices' items in window order (every vertex when the window is too
-    large to mark) in the pair's walk slots from ``slot``, then the pair's close: the rows the one-thread walk gives
-    the pair."""
+    large to mark) in the pair's walk slots from ``slot``, then the pair's close: the rows (or the deferral, or the
+    exit list) the one-thread walk gives the pair."""
     planes = terrain_planes()
     emitters = _emitters()
     sink = solid_sink(slot, walk_slots, pair.eps, 0)
@@ -1602,7 +1700,7 @@ def solid_replay(
                 cells[3],
                 item,
             )
-    solid_close(core, data, window, planes, pair, sink, out, pair_index, partner_class, frame, cells)
+    solid_close(core, data, window, planes, pair, sink, out, solids, pair_index, partner_class, frame, cells)
 
 
 @wp.func
@@ -1750,12 +1848,25 @@ def terrain_solid_data(
     partners: np.ndarray,
     *,
     thread_vertices: int = TERRAIN_SOLID_THREAD_VERTICES,
+    pairs: int | None = None,
+    exit_count: wp.array | None = None,
+    exit_work: wp.array | None = None,
 ) -> TerrainSolidData:
     """The solid classes' data for a model: the hull table of the convex-mesh partners in ``partners`` (shape
-    indices) and the one-thread kernels' lane choice (``thread_vertices`` 0: they walk every window). Their launch
-    arguments, the work lists and the full finish's scratch, are the shadow's
+    indices), the one-thread kernels' lane choice (``thread_vertices`` 0: they walk every window) and rule X's exit
+    lists. Their launch arguments, the work lists and the full finish's scratch, are the shadow's
     (:func:`~newton._src.geometry.terrain_law.terrain_pair_work`,
-    :func:`~newton._src.geometry.terrain_law.terrain_finish_scratch`)."""
+    :func:`~newton._src.geometry.terrain_law.terrain_finish_scratch`).
+
+    Args:
+        model: A finalized model.
+        partners: Partner shapes of the solid classes' pairs.
+        thread_vertices: Window vertices up to which the one-thread kernels walk a pair.
+        pairs: Pairs of the table (the exit lists' room), or ``None`` for one per entry of ``partners``.
+        exit_count: The four per-class counters of the exit lists (zeroed before every launch), or ``None`` for its
+            own.
+        exit_work: The two counters of rule X's exit searches (zeroed before every launch), or ``None`` for its own.
+    """
     from .types import GeoType  # noqa: PLC0415
 
     device = model.device
@@ -1774,4 +1885,8 @@ def terrain_solid_data(
     solids = TerrainSolidData()
     solids.hulls = build_hull_table(meshes, shape_hull, device)
     solids.thread_vertices = int(thread_vertices)
+    room = len(partners) if pairs is None else int(pairs)
+    solids.exits = wp.zeros(max(room, 1), dtype=wp.int32, device=device)
+    solids.exit_count = exit_count if exit_count is not None else wp.zeros(4, dtype=wp.int32, device=device)
+    solids.exit_work = exit_work if exit_work is not None else wp.zeros(2, dtype=wp.int32, device=device)
     return solids

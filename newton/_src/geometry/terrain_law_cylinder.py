@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The terrain law's kernels for flat-capped cylinders and cones (rules F, E, V and R of the law for solid cores).
+"""The terrain law's kernels for flat-capped cylinders and cones (rules F, E, V, R and X of the law for solid cores).
 
 The kernels take the per-type arguments ``(begin, slot_begin, inputs, data, out)``
 (:class:`~newton._src.geometry.terrain_law.TerrainPairInputs`), their launch argument and the solid classes' data
@@ -9,12 +9,14 @@ The kernels take the per-type arguments ``(begin, slot_begin, inputs, data, out)
 (:data:`~newton._src.geometry.terrain_shadow.TERRAIN_LAW_KERNELS`): :func:`terrain_cylinder_rows` runs one thread per
 pair over the whole class and queues the tiled-lane pairs whose windows (as the pose gives them) hold more than
 :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_THREAD_VERTICES` vertices in its
-:class:`~newton._src.geometry.terrain_law.TerrainPairWork`, :func:`terrain_cylinder_rows_tiled` runs ``wp.block_dim()``
+:class:`~newton._src.geometry.terrain_law.TerrainPairWork`; :func:`terrain_cylinder_rows_tiled` runs ``wp.block_dim()``
 lanes per queued pair on the work list's fixed grid (the lanes mark the window vertices that yield a row, the first lane
-walks those in window order and finishes the pair, which gives it the one-thread kernel's rows), and
+walks those in window order and closes the pair, which gives it the one-thread kernel's rows);
+:func:`terrain_cylinder_rows_exit`, one thread per pair of the class, takes the pairs the walks left to rule X with
+their rows held (a core reaching below its window's highest vertex): their deepest exit and their finish; last,
 :func:`terrain_cylinder_rows_full`, on the fixed full-finish grid of its
 :class:`~newton._src.geometry.terrain_law.TerrainFinishScratch` striding over the class's deferred list, the pairs the
-other two deferred (more distinct rows than the class's 16 walk slots). The walk, the rules and the finish are
+others deferred (more distinct rows than the class's 16 walk slots). The walk, the rules and the finish are
 :mod:`~newton._src.geometry.terrain_law_solid`'s; the module is compiled without floating-point contraction, so the CPU
 decides every boundary as the GPU does.
 """
@@ -40,6 +42,7 @@ from .terrain_law_solid import (
     solid_pair_read,
     solid_pair_window,
     solid_replay,
+    solid_rows_exit,
     solid_rows_full,
     solid_rows_thread,
     solid_unsupported,
@@ -153,12 +156,43 @@ def terrain_cylinder_rows_tiled(
                 cells,
                 marked,
                 words,
+                solids,
                 pair,
                 slot_begin + (pair - begin) * _ROWS,
                 _ROWS,
                 _CLASS,
                 frame,
             )
+
+
+@wp.kernel(enable_backward=False)
+def terrain_cylinder_rows_exit(
+    begin: int,
+    slot_begin: int,
+    inputs: TerrainPairInputs,
+    data: TerrainFeatureData,
+    out: TerrainLawRows,
+    work: TerrainPairWork,
+    solids: TerrainSolidData,
+):
+    """Rule X for the class's pairs its walks left in its exit list (``solids.exits``), one thread per listed pair
+    (``begin`` and ``slot_begin`` are the class's first pair and walk slot; ``work`` is the one-thread kernel's, which
+    shares this signature): each pair's window again, its deepest exit and its finish, from the rows its walk held in
+    its walk slots; a pair whose rows then overflow its slots is deferred to the full-finish kernel.
+
+    Launch: ``wp.launch`` with one thread per pair of the class (the list's room) and ``block_dim``
+    :func:`~newton._src.geometry.terrain_law.terrain_law_block_dim`, after the class's walks and before its full-finish
+    kernel; a thread past the list's count returns at once.
+    """
+    i = wp.tid()
+    if i >= solids.exit_count[_CLASS]:
+        return
+    pair = solids.exits[out.deferred_first[_CLASS] + i]
+    _state, frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
+    _supported, core = _core(local, size, inputs.shape_type[partner], partner, solids)
+    solid_rows_exit(
+        core, data, out, solids, pair, slot_begin + (pair - begin) * _ROWS, _ROWS, _CLASS, frame, heightfield, reach
+    )
 
 
 @wp.kernel(enable_backward=False)
@@ -191,4 +225,6 @@ def terrain_cylinder_rows_full(
         i = pair - begin
         _state, frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
         _supported, core = _core(local, size, inputs.shape_type[partner], partner, solids)
-        solid_rows_full(core, data, out, scratch, block, pair, slot_begin + i * _ROWS, _ROWS, frame, heightfield, reach)
+        solid_rows_full(
+            core, data, out, scratch, solids, block, pair, slot_begin + i * _ROWS, _ROWS, frame, heightfield, reach
+        )

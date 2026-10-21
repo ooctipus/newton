@@ -1059,14 +1059,27 @@ def test_solid_rows_match_the_float64_law(test, device):
 # ----------------------------------------------------------------------------------------------------------------
 
 _SOLID_KERNELS = {
-    TERRAIN_PARTNER_BOX: (terrain_law_box, "terrain_box_rows", "terrain_box_rows_tiled", "terrain_box_rows_full"),
+    TERRAIN_PARTNER_BOX: (
+        terrain_law_box,
+        "terrain_box_rows",
+        "terrain_box_rows_tiled",
+        "terrain_box_rows_exit",
+        "terrain_box_rows_full",
+    ),
     TERRAIN_PARTNER_CYLINDER: (
         terrain_law_cylinder,
         "terrain_cylinder_rows",
         "terrain_cylinder_rows_tiled",
+        "terrain_cylinder_rows_exit",
         "terrain_cylinder_rows_full",
     ),
-    TERRAIN_PARTNER_HULL: (terrain_law_hull, "terrain_hull_rows", "terrain_hull_rows_tiled", "terrain_hull_rows_full"),
+    TERRAIN_PARTNER_HULL: (
+        terrain_law_hull,
+        "terrain_hull_rows",
+        "terrain_hull_rows_tiled",
+        "terrain_hull_rows_exit",
+        "terrain_hull_rows_full",
+    ),
 }
 
 
@@ -1127,7 +1140,7 @@ def _window_vertices(hf, kind, dims, pose) -> int:
 
 def _queued(shadow, partner_class) -> np.ndarray:
     """The pairs a shadow's last launch queued for a solid class's tiled kernel (its one-thread launch's work list)."""
-    module, thread, _tiled, _full = _SOLID_KERNELS[partner_class]
+    module, thread, _tiled, _exit, _full = _SOLID_KERNELS[partner_class]
     work = next(extra for _kind, kernel, *_launch, extra in shadow._launches if kernel is getattr(module, thread))
     return work.pairs.numpy()[: int(work.count.numpy()[0])]
 
@@ -1175,7 +1188,7 @@ def test_tiled_kernels_match_one_thread_kernels(test, device):
     inputs = _pair_inputs(model, pipeline)
     partners = table.pairs_host[:, 1]
     walked = 0
-    for partner_class, (module, thread, tiled, full) in _SOLID_KERNELS.items():
+    for partner_class, (module, thread, tiled, exit_, full) in _SOLID_KERNELS.items():
         begin, end = table.segment(partner_class, TERRAIN_LANE_TILE)
         test.assertGreater(end - begin, 0)
         rows = TERRAIN_PARTNER_WALK_SLOTS[partner_class]
@@ -1192,6 +1205,7 @@ def test_tiled_kernels_match_one_thread_kernels(test, device):
             if thread_vertices:
                 test.assertGreater(int(work.count.numpy()[0]), 3)
                 wp.launch_tiled(getattr(module, tiled), dim=work.blocks, inputs=walk, block_dim=block, device=device)
+            wp.launch(getattr(module, exit_), dim=end - begin, inputs=walk, block_dim=block, device=device)
             finish = [begin, 0, inputs, shadow.features.data(), out, scratch, solids]
             wp.launch_tiled(getattr(module, full), dim=scratch.blocks, inputs=finish, block_dim=block, device=device)
             outputs.append(out)
@@ -1210,6 +1224,136 @@ def test_tiled_kernels_match_one_thread_kernels(test, device):
                 np.testing.assert_array_equal(other[name], got[name], err_msg=name)
         walked += int(count.sum())
     test.assertGreater(walked, 20)
+
+
+def _valley_large(device):
+    """Long solids sunk along a V-valley (30 deg walls meeting along y at x = 0, 5 cm cells), each deepest along the
+    valley's line, which only rule X reaches (axes 5 mm below it, a box's edge 20 mm): windows of over 64 vertices (the
+    tiled kernels mark them) and over 256 (the first lane walks them alone)."""
+    th = np.radians(30.0)
+    x = np.linspace(-1.0, 1.0, 41)
+    heights = np.tile(np.abs(x) * np.tan(th), (65, 1))
+    hf = tu.reference_surface(tu.heightfield_model(heights, 1.0, 1.6, device="cpu"))
+    along = _axis_angle((1.0, 0.0, 0.0), -np.pi / 2.0)
+    diamond = _quat_mul(_axis_angle((0.0, 1.0, 0.0), np.pi / 4.0), _axis_angle((0.0, 0.0, 1.0), np.pi / 2.0))
+    bodies = [
+        ("cylinder", {"radius": 0.03, "half_height": 0.5}, _f32_pose(np.r_[0.0, -0.6137, -0.005, along])),
+        ("ellipsoid", {"semi": (0.03, 1.4, 0.03)}, _f32_pose(np.r_[0.0, 0.0113, -0.005, 0.0, 0.0, 0.0, 1.0])),
+        ("ellipsoid", {"semi": (0.03, 0.6, 0.03)}, _f32_pose(np.r_[0.0, -0.3, -0.005, 0.0, 0.0, 0.0, 1.0])),
+        ("box", {"half": (0.4, 0.03, 0.03)}, _f32_pose(np.r_[0.0, 0.5911, 0.03 * np.sqrt(2.0) - 0.02, diamond])),
+    ]
+    model, _hfield, shapes = su.solid_scene(heights, 1.0, 1.6, bodies, device=device)
+    return hf, model, shapes, bodies
+
+
+def test_exits_match_across_kernels(test, device):
+    """Give a solid pair the same rule X row and rows, bit for bit, whether its walk is one thread's, a tile of lanes'
+    (each followed by the class's exit kernel) or the full-finish kernel's (rule X inline).
+
+    Long solids sunk along a valley, each deepest along its line (only an exit reaches it): a cylinder, ellipsoids
+    whose windows hold over 64 and over 256 vertices, and a box. One arm walks every pair in one thread, one queues
+    every pair for the tiled kernel (``thread_vertices`` 1, a grid of 3 blocks), both leaving their pairs to the exit
+    kernel; the third defers every pair to the full-finish kernel, which walks it again and runs rule X itself.
+    """
+    hf, model, shapes, bodies = _valley_large(device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    shadow = pipeline._terrain_law_shadow
+    table = shadow.table
+    shape_class = {int(p[1]): int(c) for p, c in zip(table.pairs_host, table.partner_class, strict=True)}
+    sizes = sorted(_window_vertices(hf, *body) for body in bodies)
+    test.assertGreater(sizes[0], 64)
+    test.assertGreater(sizes[-1], 256)
+    expected = shadow.rows()
+    first_row = np.concatenate([[0], np.cumsum(expected["count"])])
+    exits = [g for shape in shapes for g in tu.shadow_rows(pipeline)[shape] if su.is_exit_row(g)]
+    test.assertEqual(len(exits), len(bodies))
+    inputs = _pair_inputs(model, pipeline)
+    partners = table.pairs_host[:, 1]
+    block = terrain_law_block_dim(device)
+    for partner_class in sorted({shape_class[s] for s in shapes}):
+        module, thread, tiled, exit_, full = _SOLID_KERNELS[partner_class]
+        begin, end = table.segment(partner_class, TERRAIN_LANE_TILE)
+        test.assertGreater(end - begin, 0)
+        rows = TERRAIN_PARTNER_WALK_SLOTS[partner_class]
+        outputs = []
+        for arm in ("thread", "tiled", "full"):
+            solids = terrain_law_solid.terrain_solid_data(model, partners, thread_vertices=int(arm == "tiled"))
+            out = _side_buffer(begin, end - begin, rows, table.pair_count, device)
+            work = terrain_pair_work(device, begin, end - begin)
+            work.blocks = 3
+            scratch = terrain_finish_scratch(device, _full_candidates(shadow, partner_class), blocks=3)
+            walk = [begin, 0, inputs, shadow.features.data(), out, work, solids]
+            if arm == "full":
+                deferred = out.deferred.numpy()
+                deferred[begin:end] = np.arange(begin, end)
+                out.deferred.assign(deferred)
+                counts = out.deferred_count.numpy()
+                counts[partner_class] = end - begin
+                out.deferred_count.assign(counts)
+            else:
+                wp.launch(getattr(module, thread), dim=end - begin, inputs=walk, block_dim=block, device=device)
+                if arm == "tiled":
+                    test.assertEqual(int(work.count.numpy()[0]), end - begin)
+                    wp.launch_tiled(
+                        getattr(module, tiled), dim=work.blocks, inputs=walk, block_dim=block, device=device
+                    )
+                test.assertGreater(int(solids.exit_count.numpy()[partner_class]), 0)
+                wp.launch(getattr(module, exit_), dim=end - begin, inputs=walk, block_dim=block, device=device)
+            finish = [begin, 0, inputs, shadow.features.data(), out, scratch, solids]
+            wp.launch_tiled(getattr(module, full), dim=scratch.blocks, inputs=finish, block_dim=block, device=device)
+            test.assertGreater(solids.exit_work.numpy()[0], 0)
+            outputs.append(out)
+        for name in ("count", "state"):
+            for other in outputs[1:]:
+                np.testing.assert_array_equal(
+                    getattr(outputs[0], name).numpy()[begin:end], getattr(other, name).numpy()[begin:end], err_msg=name
+                )
+        np.testing.assert_array_equal(expected["count"][begin:end], outputs[0].count.numpy()[begin:end])
+        for i in range(end - begin):
+            a = first_row[begin + i]
+            got = [_pair_rows(out, begin + i) for out in outputs]
+            for name in ("q", "n", "d", "feature"):
+                np.testing.assert_array_equal(expected[name][a : a + len(got[0][name])], got[0][name], err_msg=name)
+                for other in got[1:]:
+                    np.testing.assert_array_equal(other[name], got[0][name], err_msg=name)
+            test.assertEqual(int(np.sum((got[0]["feature"] & 7) == 7)), 1)
+
+
+def test_exit_work_stays_bounded(test, device):
+    """Search few exits for solids buried under a rough slope, over few cells, and keep the float64 law's rows.
+
+    Ellipsoids of 0.3 x 0.3 x 0.1 m and lying cylinders of 0.6 m buried 0.2 to 0.3 m under a 0.6 slope (0.05 m cells,
+    1 cm roughness): many candidates' closest surface points lie cells up the slope, outside the 3 x 3 cells around
+    them. Rule X's bounds descend along the closest triangles' planes to them, the largest bound is searched first and
+    each search covers the cells within its bound: here at most one exit search per pair, covering fewer vertices than
+    the pairs' windows. A walk of the whole window per candidate whose 3 x 3 bound passes took 50 to 170 walks per pair.
+    """
+    rng = np.random.default_rng(3)
+    xs = np.linspace(-2.0, 2.0, 81)
+    _grid_x, grid_y = np.meshgrid(xs, xs)
+    heights = 0.6 * (-grid_y) + rng.uniform(0.0, 0.01, grid_y.shape)
+    hf = tu.reference_surface(tu.heightfield_model(heights, 2.0, 2.0, device="cpu"))
+    bodies = []
+    for kind, dims in (("ellipsoid", {"semi": (0.3, 0.3, 0.1)}), ("cylinder", {"radius": 0.05, "half_height": 0.3})):
+        for _ in range(6):
+            q = _random_quat(rng)
+            if kind == "cylinder":
+                q = _quat_mul(_axis_angle((0.0, 0.0, 1.0), rng.uniform(-0.2, 0.2)), LYING)
+            x, y = rng.uniform(-0.5, 0.5, 2)
+            bodies.append((kind, dims, _f32_pose(np.r_[x, y, float(hf.height(x, y)) - rng.uniform(0.01, 0.05), q])))
+    model, _hfield, shapes = su.solid_scene(heights, 2.0, 2.0, bodies, device=device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    searches, vertices = pipeline._terrain_law_shadow.exit_work()
+    windows = sum(_window_vertices(hf, *body) for body in bodies)
+    test.assertGreater(searches, 0)
+    test.assertLessEqual(searches, len(bodies))
+    test.assertLess(vertices, windows)
+    rows = tu.shadow_rows(pipeline)
+    for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
+        with test.subTest(kind=kind, pose=pose.tolist()):
+            missing, extra, deepest = su.compare_solid_rows(su.law_rows(hf, kind, dims, pose), rows.get(shape, []))
+            test.assertEqual((missing, extra), ([], []))
+            test.assertLess(deepest, 1.0e-5)
 
 
 def _ridge_boxes(device, half, ys):
@@ -1462,8 +1606,8 @@ def test_solid_shadow_runs_under_graph_capture(test, device):
 
 def test_solid_launches_share_the_point_grids(test, device):
     """Launch every solid kernel on the shadow's shared mechanism, as the point class's: one block size, the one-thread
-    kernel over the class, the tiled kernel on its work list's fixed grid, the full-finish kernel on the fixed grid of
-    its scratch.
+    kernel over the class, the tiled kernel on its work list's fixed grid, the exit kernel (rule X) over the class, the
+    full-finish kernel on the fixed grid of its scratch.
 
     Every solid class has pairs of both lane classes here, windows over the one-thread kernel's 64 vertices (a box and
     an ellipsoid) and a deferring box. The one-thread kernel queues exactly once each pair it leaves to the tiled
@@ -1492,7 +1636,7 @@ def test_solid_launches_share_the_point_grids(test, device):
     rows = shadow.rows()
     exits = int(TERRAIN_PAIR_TILE_EXIT | TERRAIN_PAIR_STALE | TERRAIN_PAIR_FILTERED | TERRAIN_PAIR_OUTSIDE)
     exits |= int(TERRAIN_PAIR_UNSUPPORTED)
-    for partner_class, (module, thread, tiled, full) in _SOLID_KERNELS.items():
+    for partner_class, (module, thread, tiled, exit_, full) in _SOLID_KERNELS.items():
         begin = table.segment(partner_class, TERRAIN_LANE_THREAD)[0]
         tiled_begin, end = table.segment(partner_class, TERRAIN_LANE_TILE)
         test.assertGreater(tiled_begin, begin)
@@ -1500,6 +1644,7 @@ def test_solid_launches_share_the_point_grids(test, device):
         test.assertEqual(launched[getattr(module, thread).key], [("launch", end - begin, block)])
         tiled_blocks = min(end - tiled_begin, TERRAIN_LAW_TILE_BLOCKS)
         test.assertEqual(launched[getattr(module, tiled).key], [("tiled", tiled_blocks, block)])
+        test.assertEqual(launched[getattr(module, exit_).key], [("launch", end - begin, block)])
         full_blocks = shadow.describe()["launch_shapes"][module.__name__.rsplit("_", 1)[1]]["full_blocks"]
         test.assertEqual(launched[getattr(module, full).key], [("tiled", full_blocks, block)])
         queued = _queued(shadow, partner_class)
@@ -1741,6 +1886,8 @@ for _name, _func in (
     ("test_recovery_rows_have_distinct_feature_ids", test_recovery_rows_have_distinct_feature_ids),
     ("test_solid_rows_match_the_float64_law", test_solid_rows_match_the_float64_law),
     ("test_tiled_kernels_match_one_thread_kernels", test_tiled_kernels_match_one_thread_kernels),
+    ("test_exits_match_across_kernels", test_exits_match_across_kernels),
+    ("test_exit_work_stays_bounded", test_exit_work_stays_bounded),
     ("test_long_box_keeps_every_support", test_long_box_keeps_every_support),
     ("test_deferred_pairs_keep_their_rows_beyond_the_grid", test_deferred_pairs_keep_their_rows_beyond_the_grid),
     ("test_wide_box_keeps_every_support", test_wide_box_keeps_every_support),

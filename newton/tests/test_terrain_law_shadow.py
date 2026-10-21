@@ -592,9 +592,9 @@ class TestTerrainLawShadow(unittest.TestCase):
         begin = table.segment(TERRAIN_PARTNER_POINT, TERRAIN_LANE_THREAD)[0]
         candidates = int(table.candidates[begin : begin + 12].max())
         self.assertEqual(record["spill_rows"], max(12 * TERRAIN_POINT_WALK_SLOTS, candidates))
-        # The one-thread kernel over the class, the tiled kernel over its queue when it has a tiled segment, and the
-        # class's full-finish kernel, with the dimensions fixed at construction.
-        self.assertEqual(record["launches"], 2 + int(lanes["tiled"] > 0))
+        # The one-thread kernel over the class, the tiled kernel over its queue when it has a tiled segment, the
+        # class's full-finish kernel and the spill check, with the dimensions fixed at construction.
+        self.assertEqual(record["launches"], 3 + int(lanes["tiled"] > 0))
         self.assertEqual(
             record["launch_shapes"],
             {
@@ -602,6 +602,7 @@ class TestTerrainLawShadow(unittest.TestCase):
                     "block_dim": terrain_law_block_dim("cpu"),
                     "thread_dim": 12,
                     "tiled_blocks": min(lanes["tiled"], TERRAIN_LAW_TILE_BLOCKS),
+                    "exit_dim": 0,
                     "full_blocks": terrain_finish_blocks(candidates),
                     "full_candidates": candidates,
                     "walk_slots": TERRAIN_POINT_WALK_SLOTS,
@@ -655,7 +656,8 @@ class TestTerrainLawShadow(unittest.TestCase):
             self.assertTrue(record["enabled"])
             self.assertEqual(record["classes"], ["box", "cylinder", "hull"])
             table = pipeline._terrain_law_shadow.table
-            launches = 0
+            # the spill check
+            launches = 1
             for partner_class, name in (
                 (TERRAIN_PARTNER_BOX, "box"),
                 (TERRAIN_PARTNER_CYLINDER, "cylinder"),
@@ -667,9 +669,10 @@ class TestTerrainLawShadow(unittest.TestCase):
                     lanes[lane_name] = end - begin
                 self.assertEqual(record["pairs"][name], lanes)
                 # with pairs: the one-thread kernel over the class, the tiled grid when the class has tiled-lane
-                # partners (only their windows can exceed the one-thread kernel's), and the full kernel
+                # partners (only their windows can exceed the one-thread kernel's), the exit kernel (rule X) over the
+                # class and the full kernel
                 if sum(lanes.values()):
-                    launches += 2 + int(lanes["tiled"] > 0)
+                    launches += 3 + int(lanes["tiled"] > 0)
                     begin = table.segment(partner_class, TERRAIN_LANE_THREAD)[0]
                     candidates = int(table.candidates[begin : begin + sum(lanes.values())].max())
                     self.assertEqual(
@@ -678,6 +681,7 @@ class TestTerrainLawShadow(unittest.TestCase):
                             "block_dim": terrain_law_block_dim("cpu"),
                             "thread_dim": sum(lanes.values()),
                             "tiled_blocks": min(lanes["tiled"], TERRAIN_LAW_TILE_BLOCKS),
+                            "exit_dim": sum(lanes.values()),
                             "full_blocks": terrain_finish_blocks(candidates),
                             "full_candidates": candidates,
                             "walk_slots": int(TERRAIN_PARTNER_WALK_SLOTS[partner_class]),

@@ -160,6 +160,8 @@ TERRAIN_PAIR_FULL = wp.constant(128)
 finish kernel."""
 TERRAIN_PAIR_UNSUPPORTED = wp.constant(256)
 """Pair state: the partner's shape has no core in the law yet (a barrel cylinder in the hull class; no row)."""
+TERRAIN_PAIR_EXIT = wp.constant(512)
+"""Pair state, transient: the pair's walk holds its rows and left it to its solid class's exit kernel (rule X)."""
 TERRAIN_WINDOW_WIDE = 64
 """Cells across a window from which feature ids are no longer unique."""
 TERRAIN_PLANE_CACHE = 4
