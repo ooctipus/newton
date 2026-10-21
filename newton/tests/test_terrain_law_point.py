@@ -1318,10 +1318,11 @@ def _deferring_scene(rng):
     """A scene whose walks defer dozens of pairs to the full finish: ``(heights, half extent, bodies)``.
 
     Ridges of one height every second column of 0.1 m cells, every fourth row raised 15 mm. Capsules 0.6-1.2 m long lie
-    across the ridges or at random yaws, and spheres of 0.05-0.25 m rest on them, their lowest points 3 cm below to 2 cm
-    above the crests (the raised rows poke into them): rows on several faces of one plane, rows of every ridge in
-    reach (more than the slots: they overflow) and exits. Six capsules 2 m long lie diagonally (windows of more than
-    256 vertices, which the tiled kernels walk unmasked), and three 2.4-3.6 m long lie across every ridge.
+    across the ridges or at random yaws, their lowest points 2 cm below to 2 cm above the crests (the raised rows poke
+    into them), and spheres of 0.05-0.25 m lie 3 cm below to 2 cm above the raised rows' crests: rows on several faces
+    of one plane, rows of every ridge in reach (more than the slots: they overflow) and exits. Six capsules 2 m long
+    lie diagonally (windows of more than 256 vertices, which the tiled kernels walk unmasked), and three 2.4-3.6 m long
+    lie across every ridge.
     """
     heights = np.zeros((41, 41))
     heights[:, 1::2] = RIDGE_CREST
