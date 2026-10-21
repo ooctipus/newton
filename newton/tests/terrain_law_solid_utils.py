@@ -267,13 +267,18 @@ def signed_surface_distance(hf: ref.ReferenceHeightfield, points, *, reach=0.1, 
     """Signed Euclidean distance of points to the triangulated surface (negative below it), numpy.
 
     With ``prune``, only the points whose distance can be the smallest get an exact distance (the others get their
-    lower bound, the vertical gap times the steepest triangle's cosine): the minimum is exact.
+    lower bound, the vertical gap times the steepest triangle's cosine): the minimum is exact. The triangles searched
+    lie within ``reach`` of the points, or within their largest vertical gap where that is more (a point's closest
+    surface point lies no farther than the surface point above or below it).
     """
     points = np.asarray(points, np.float64).reshape(-1, 3)
+    gap = points[:, 2] - surface_height(hf, points[:, 0], points[:, 1])
+    finite = np.abs(gap[np.isfinite(gap)])
+    if finite.size:
+        reach = max(reach, float(finite.max()))
     v = _surface_triangles(hf, points.min(axis=0) - reach, points.max(axis=0) + reach)
     normals = np.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0])
     cos_steep = float(np.clip(np.abs(normals[:, 2] / np.linalg.norm(normals, axis=1)).min(), 0.05, 1.0))
-    gap = points[:, 2] - surface_height(hf, points[:, 0], points[:, 1])
     low = np.where(gap < 0.0, gap, gap * cos_steep)
     up = np.where(gap < 0.0, gap * cos_steep, gap)
     out = low.copy()
