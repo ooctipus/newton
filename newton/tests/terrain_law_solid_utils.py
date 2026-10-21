@@ -136,9 +136,11 @@ def law_rows(hf: ref.ReferenceHeightfield, kind, dims, pose, *, reach=REACH, row
     box = hf.cells_in_box(lo[:2] - reach, hi[:2] + reach)
     if box is None:
         return []
-    raw = ref.solid_law(hf, core, reach, hf.window_features(box))
+    window = hf.window_features(box)
+    raw = ref.solid_law(hf, core, reach, window)
     if not raw:
         raw = ref._solid_recovery(hf, core)
+    raw = raw + ref.exit_rule(hf, core, reach, window, raw)
     return ref.finish(raw, row_limit=row_limit, group_offset=4.0 * solid_kernel_band(hf, core, reach))
 
 
@@ -157,17 +159,50 @@ def implied_by(row, others, *, normal_tol=1.0e-4, plane_tol=5.0e-6, d_tol=5.0e-6
     return value is not None and value <= d + d_tol
 
 
+EXIT_POINT_TOL = 1.0e-3
+"""How far [m] the terrain points of a float32 and a float64 rule X row may lie apart within their common plane."""
+
+
+def is_exit_row(row) -> bool:
+    """Whether a row is rule X's: a float64 row tagged ``X``, a float32 row of point slot 7."""
+    if hasattr(row, "feat"):
+        return row.feat[0] == "X"
+    return len(row) > 3 and (int(row[3]) & 7) == 7
+
+
+def _exit_rows_match(a, b, *, frame_tol, angle_tol, d_tol) -> bool:
+    qa, na, da = tu.row_qnd(a)
+    qb, nb, db = tu.row_qnd(b)
+    return (
+        tu.angle_between(na, nb) <= angle_tol
+        and abs(da - db) <= d_tol
+        and abs(float(na @ (qb - qa))) <= frame_tol
+        and float(np.linalg.norm(qb - qa)) <= EXIT_POINT_TOL
+    )
+
+
 def compare_solid_rows(law, got, *, frame_tol=1.0e-5, angle_tol=1.0e-3, d_tol=1.0e-5):
     """Compare float32 rows with the float64 law's rows of one solid pair.
 
     Rows match with terrain points within ``frame_tol``, normals within ``angle_tol`` and distances within ``d_tol``;
     an unmatched row that the other side's rows imply (:func:`implied_by`: the finish kept an equivalent subset of a
-    flat support, its ties decided by rounding) is no difference. Returns ``(missing, extra, deepest)``: unmatched
-    float64 rows, unmatched float32 rows and the difference of the deepest distances (infinite when one side has rows
-    and the other none).
+    flat support, its ties decided by rounding) is no difference. Rule X's rows (:func:`is_exit_row`) match on their
+    half-space: normal, distance and plane offset as above, their terrain points within :data:`EXIT_POINT_TOL` in the
+    plane (they exit the core's deepest point, which a flat maximum places to the square root of the float32
+    precision: about 30 um on a 60 mm rim). Returns ``(missing, extra, deepest)``: unmatched float64 rows, unmatched
+    float32 rows and the difference of the deepest distances (infinite when one side has rows and the other none).
     """
-    missing = tu.missing_rows(law, got, q_tol=frame_tol, angle_tol=angle_tol, d_tol=d_tol)
-    extra = tu.missing_rows(got, law, q_tol=frame_tol, angle_tol=angle_tol, d_tol=d_tol)
+    exits64 = [r for r in law if is_exit_row(r)]
+    exits32 = [g for g in got if is_exit_row(g)]
+    tol = {"frame_tol": frame_tol, "angle_tol": angle_tol, "d_tol": d_tol}
+    missing = tu.missing_rows(
+        [r for r in law if not is_exit_row(r)], got, q_tol=frame_tol, angle_tol=angle_tol, d_tol=d_tol
+    )
+    extra = tu.missing_rows(
+        [g for g in got if not is_exit_row(g)], law, q_tol=frame_tol, angle_tol=angle_tol, d_tol=d_tol
+    )
+    missing += [r for r in exits64 if not any(_exit_rows_match(r, g, **tol) for g in exits32)]
+    extra += [g for g in exits32 if not any(_exit_rows_match(g, r, **tol) for r in exits64)]
     missing = [m for m in missing if not implied_by(m, got)]
     extra = [e for e in extra if not implied_by(e, law)]
     deepest = 0.0

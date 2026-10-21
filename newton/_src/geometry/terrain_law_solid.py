@@ -21,7 +21,15 @@ two faces and diagonal, its x- and y-edges and itself) and offers the rows of th
 * V, vertex features: the direction to the core's nearest point (or the minimum translation from inside) inside the
   vertex's normal cone, within reach;
 * R, recovery (G3): a pair with no row whose core lies below the surface gets up to four of the core's deepest
-  boundary points against the face vertically above them.
+  boundary points against the face vertically above them;
+* X, deepest exit: the exit (rule P's, a sphere centre's: the window's minimum with the smallest translation) of the
+  deepest of the core's candidate boundary points, when it lies deeper than every other row of the pair by more than
+  :data:`TERRAIN_SOLID_EXIT_MARGIN` (:func:`solid_exits`). A deepest point whose closest surface point is unique is a
+  local maximum of its distance to that one feature: rule F's support for a face, else an extreme point of the core,
+  which the candidates hold (a box's corners, a hull's points, a cone's apex; per valley the core's support points at
+  the local minima of ``sigma`` over its normal arc; per vertex each rim's point farthest from it, an ellipsoid's).
+  A deepest point equally far from two or more surface points (a tie) can lie inside a core face, where no candidate
+  is: there X takes the deepest candidate's exit, which may fall short of the core's depth.
 
 Rule C (concave anticipation) is off. Cheapest rejects first: the tile-max exit, a feature skipped when its highest
 vertex lies below the core's lowest point minus the reach, a face's plane rejected by one support call before its
@@ -29,6 +37,12 @@ manifold, an edge rejected by the core's bounding sphere (a row's line along its
 of reach only where the edge rises nowhere above the core's lowest point: a row deeper than the reach can stand far
 from the core) and by its arc ends' support values before the search, a vertex by the bounding sphere and one support
 call before its feature test and nearest point.
+
+Rule X runs after the walk (and rule R), only for a core reaching below its window's highest vertex: per candidate
+an exit walk of the window when its bound (its depth below the plane of the face under it when its projection stays in
+that face's cluster, else its distance to that triangle, or its distance to the feature that proposed it) passes the
+pair's depth and the best exit found, and still does lowered to its distance to the triangles of the 3 x 3 cells around
+it; a valley only where the wedge below it can hold a deeper core point.
 
 The kernels follow the per-pair output protocol of :mod:`~newton._src.geometry.terrain_law`: a pair with no row is
 recorded by :func:`~newton._src.geometry.terrain_law.terrain_pair_exit`, and rows are held in the pair's own walk
@@ -117,7 +131,12 @@ from .terrain_law import (
 from .terrain_law_cores import (
     TerrainCrossing,
     TerrainHullTable,
+    closest_on_triangle,
     core_bounds,
+    core_exit_count,
+    core_exit_point,
+    core_far_count,
+    core_far_point,
     core_flat_crossing,
     core_lift,
     core_manifold,
@@ -128,7 +147,10 @@ from .terrain_law_cores import (
     core_sigma,
     core_slope,
     core_sphere,
+    core_support_count,
+    core_support_point,
 )
+from .terrain_law_point import terrain_point_exit
 
 TERRAIN_SOLID_ARC_SAMPLES = 9
 """Equally spaced normals of rule E's coarse ``theta*`` scan, the arc's ends included (the float64 law's)."""
@@ -151,6 +173,11 @@ serially."""
 TERRAIN_HULL_FACE_TOL = 1.0e-6
 """A hull's points within this of a face's plane lie on that face [m] (hulls under 1 m; their local frame): a planar
 face of a float32 mesh stays one face (its points lie within about 1e-8 m of its plane)."""
+TERRAIN_SOLID_EXIT_MARGIN = 1.0e-5
+"""Rule X offers a pair's deepest exit only where it lies deeper than every other row of the pair by more than this
+[m] (the float64 law's): a pair whose rows reach its depth keeps them as they are."""
+TERRAIN_SOLID_EXIT_SLOT = 7
+"""Point slot of rule X's row in its feature id: no other solid rule uses it (F 0-3, E 0-1, V 0, R 0-3)."""
 
 _BISECTION = wp.constant(TERRAIN_SOLID_BISECTION)
 _ArcNormals = wp.types.matrix(shape=(TERRAIN_SOLID_ARC_SAMPLES, 3), dtype=wp.float32)
@@ -163,9 +190,12 @@ _MASK_WORDS = wp.constant(TERRAIN_SOLID_MASK_WORDS)
 _ITEMS = wp.constant(6)
 _NORMAL_SAME = wp.constant(TERRAIN_NORMAL_SAME)
 _VERTEX_SPAN = wp.constant(TERRAIN_VERTEX_SPAN)
+_EXIT_MARGIN = wp.constant(TERRAIN_SOLID_EXIT_MARGIN)
+_EXIT_SLOT = wp.constant(TERRAIN_SOLID_EXIT_SLOT)
 
 _Mask = wp.types.vector(length=TERRAIN_SOLID_MASK_WORDS, dtype=wp.int32)
 _RingNormals = wp.types.matrix(shape=(6, 3), dtype=wp.float32)
+_ArcValues = wp.types.vector(length=TERRAIN_SOLID_ARC_SAMPLES, dtype=wp.float32)
 
 
 @wp.struct
@@ -749,6 +779,255 @@ def solid_recovery(
     return planes, sink
 
 
+@wp.struct
+class _Exit:
+    """Rule X's search: the depth an exit must pass, the bound a candidate must pass and the best exit found."""
+
+    target: float
+    """The pair's deepest row's depth (0 for none deeper than the surface) plus :data:`TERRAIN_SOLID_EXIT_MARGIN`."""
+    threshold: float
+    """The larger of ``target`` and the best exit's depth: a candidate whose bound is no more cannot do better."""
+    found: int
+    q: wp.vec3
+    n: wp.vec3
+    d: float
+    feature: int
+
+
+@wp.func
+def _exit_bound(
+    data: TerrainFeatureData, window: TerrainWindow, planes: TerrainPlanes, x: wp.vec3
+) -> tuple[TerrainPlanes, float]:
+    """An upper bound of point ``x``'s exit translation, or -1 above the surface (the float64 law's): its depth below
+    the cluster plane of the triangle under it when its projection onto that plane stays in the cluster (a face
+    minimum), else its distance to that triangle."""
+    t = terrain_locate(window, x[0], x[1])
+    if t[0] < 0:
+        return planes, -1.0
+    planes, n, a = terrain_plane(data, window, planes, t[0], t[1], t[2])
+    d = wp.dot(n, x - a)
+    if d >= 0.0:
+        return planes, -1.0
+    q = x - d * n
+    s = terrain_locate(window, q[0], q[1])
+    if s[0] >= 0:
+        same = s[0] == t[0] and s[1] == t[1] and s[2] == t[2]
+        if not same:
+            cluster = terrain_cluster(data, window.surface, t[0], t[1], t[2])
+            same = cluster >= 0 and terrain_cluster(data, window.surface, s[0], s[1], s[2]) == cluster
+        if same:
+            return planes, -d
+    va, vb, vd = terrain_triangle_vertices(t[0], t[1], t[2])
+    k = closest_on_triangle(
+        x,
+        terrain_window_vertex(data, window, va[0], va[1]),
+        terrain_window_vertex(data, window, vb[0], vb[1]),
+        terrain_window_vertex(data, window, vd[0], vd[1]),
+    )
+    return planes, wp.length(x - k)
+
+
+@wp.func
+def _near_bound(data: TerrainFeatureData, window: TerrainWindow, cells: wp.vec4i, x: wp.vec3, bound: float) -> float:
+    """``bound`` lowered to ``x``'s distance to the triangles of the cells around the one under it (3 x 3, within the
+    window's cells): the second stage of rule X's bound, before an exit walk (the float64 law's)."""
+    t = terrain_locate(window, x[0], x[1])
+    for r in range(wp.max(t[0] - 1, cells[0]), wp.min(t[0] + 1, cells[1]) + 1):
+        for c in range(wp.max(t[1] - 1, cells[2]), wp.min(t[1] + 1, cells[3]) + 1):
+            for sub in range(2):
+                va, vb, vd = terrain_triangle_vertices(r, c, sub)
+                k = closest_on_triangle(
+                    x,
+                    terrain_window_vertex(data, window, va[0], va[1]),
+                    terrain_window_vertex(data, window, vb[0], vb[1]),
+                    terrain_window_vertex(data, window, vd[0], vd[1]),
+                )
+                bound = wp.min(bound, wp.length(x - k))
+    return bound
+
+
+@wp.func
+def _exit_try(
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    pair: _Pair,
+    cells: wp.vec4i,
+    best: _Exit,
+    x: wp.vec3,
+    bound: float,
+) -> tuple[TerrainPlanes, _Exit]:
+    """Try candidate ``x`` of bound ``bound``: its exit (:func:`~newton._src.geometry.terrain_law_point.terrain_point_exit`)
+    when the bound passes the threshold, and still does lowered by :func:`_near_bound`; kept when deeper than the best
+    (the first on ties)."""
+    if bound <= best.threshold:
+        return planes, best
+    if _near_bound(data, window, cells, x, bound) <= best.threshold:
+        return planes, best
+    planes, found, q, n, d, feature = terrain_point_exit(data, window, planes, x, cells, pair.eps, pair.reach)
+    if found and (best.found == 0 or d < best.d):
+        best.found = 1
+        best.q = q
+        best.n = n
+        best.d = d
+        best.feature = feature
+        best.threshold = wp.max(best.target, -d)
+    return planes, best
+
+
+@wp.func
+def _exit_valley(
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    pair: _Pair,
+    cells: wp.vec4i,
+    best: _Exit,
+    low: float,
+    r: int,
+    c: int,
+    which: int,
+) -> tuple[TerrainPlanes, _Exit]:
+    """Rule X at edge ``which`` of vertex ``(r, c)`` when it is a valley (concave crease): the core's support points at
+    the local minima of ``sigma`` over the valley's normal arc, the core's deepest points in the wedge below it.
+
+    The float64 law's search: nine equally spaced normals; each no higher than its neighbours (the first of a run of
+    equal ones) refined between them by bisection on the sign of the derivative (rule E's 22 steps), the sample kept
+    where the refinement ends higher. Skipped where no core point in the wedge can lie deeper than the threshold:
+    within it a point's distance to the edge is at most its height under the edge's higher end over the arc's
+    smaller normal ``z`` (``low`` is the core's lowest height).
+    """
+    surface = window.surface
+    if terrain_edge_kind(data, surface, r, c, which) >= 0:
+        return planes, best
+    v0i, v1i, ta, tb, _wa, _wb = terrain_edge_sides(r, c, which)
+    v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
+    v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
+    top = wp.max(v0[2], v1[2])
+    if top <= low:
+        return planes, best
+    planes, na, pa = terrain_plane(data, window, planes, ta[0], ta[1], ta[2])
+    if terrain_crease_class(data, window, r, c, which, na, pa) != TERRAIN_EDGE_CONCAVE:
+        return planes, best
+    planes, nb, _pb = terrain_plane(data, window, planes, tb[0], tb[1], tb[2])
+    e = v1 - v0
+    length2 = wp.dot(e, e)
+    dh = e / wp.sqrt(length2)
+    # the valley's normal arc, exactly perpendicular to the edge
+    n_a = wp.normalize(na - wp.dot(na, dh) * dh)
+    n_b = wp.normalize(nb - wp.dot(nb, dh) * dh)
+    if wp.length(n_b - n_a) < 1.0e-9:
+        return planes, best
+    if top - low <= best.threshold * wp.min(n_a[2], n_b[2]):
+        return planes, best
+    samples = _arc_samples(n_a, n_b)
+    values = _ArcValues()
+    for i in range(9):
+        values[i] = core_sigma(core, _arc_sample(samples, i), v0)
+    axis = wp.normalize(wp.cross(n_a, n_b))
+    for i in range(9):
+        if (i > 0 and values[i] >= values[i - 1]) or (i < 8 and values[i] > values[i + 1]):
+            continue
+        lo = _arc_sample(samples, wp.max(i - 1, 0))
+        hi = _arc_sample(samples, wp.min(i + 1, 8))
+        for _step in range(_BISECTION):
+            mid = wp.normalize(lo + hi)
+            if core_slope(core, mid, wp.cross(axis, mid), v0, 1.0) < 0.0:
+                lo = mid
+            else:
+                hi = mid
+        nst = wp.normalize(lo + hi)
+        if core_sigma(core, nst, v0) > values[i]:
+            nst = _arc_sample(samples, i)
+        for j in range(core_support_count(core)):
+            x = core_support_point(core, nst, j)
+            if x[2] >= top:
+                # closest to the valley only below its line
+                continue
+            planes, bound = _exit_bound(data, window, planes, x)
+            if bound > 0.0:
+                s = wp.clamp(wp.dot(x - v0, e) / length2, 0.0, 1.0)
+                bound = wp.min(bound, wp.length(x - (v0 + s * e)))
+            planes, best = _exit_try(data, window, planes, pair, cells, best, x, bound)
+    return planes, best
+
+
+@wp.func
+def solid_exits(
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    pair: _Pair,
+    sink: _Sink,
+    store: TerrainLawRows,
+    cells: wp.vec4i,
+) -> tuple[TerrainPlanes, _Sink]:
+    """Rule X: the exit of the deepest of the core's candidate boundary points, offered when it lies deeper than every
+    row the pair holds by more than :data:`TERRAIN_SOLID_EXIT_MARGIN` (point slot :data:`TERRAIN_SOLID_EXIT_SLOT`).
+
+    A deepest boundary point whose closest surface point is unique is a local maximum of its distance to that one
+    feature: a support point of rule F's plane manifold for a face, an extreme point of the core for a valley edge or
+    a vertex. The candidates, in the float64 law's order: the core's points tried as they are (a box's corners, a
+    hull's points, a cone's apex; :func:`~newton._src.geometry.terrain_law_cores.core_exit_point`), then, window
+    vertex by window vertex, each valley's (:func:`_exit_valley`) and, at an interior vertex above the core's lowest
+    point, each rim's point farthest from it (an ellipsoid's;
+    :func:`~newton._src.geometry.terrain_law_cores.core_far_point`). A candidate is tried when its bound (the exit
+    bound, or its distance to the feature that proposed it, the smaller) passes the threshold (:class:`_Exit`); a pair
+    whose core lies wholly above its window's highest vertex has none.
+    """
+    r0 = cells[0]
+    r1 = cells[1]
+    c0 = cells[2]
+    c1 = cells[3]
+    lo, _hi = core_bounds(core)
+    low = lo[2]
+    top = float(-_HUGE)
+    for r in range(r0, r1 + 2):
+        for c in range(c0, c1 + 2):
+            top = wp.max(top, _vertex_z(data, window, r, c))
+    if low >= top:
+        return planes, sink
+    deepest = float(0.0)
+    for h in range(wp.min(sink.held, sink.capacity)):
+        deepest = wp.max(deepest, -store.d[sink.slot + h])
+    best = _Exit()
+    best.target = deepest + _EXIT_MARGIN
+    best.threshold = best.target
+    for i in range(core_exit_count(core)):
+        x = core_exit_point(core, i)
+        planes, bound = _exit_bound(data, window, planes, x)
+        planes, best = _exit_try(data, window, planes, pair, cells, best, x, bound)
+    far = core_far_count(core)
+    if core_support_count(core) > 0 or far > 0:
+        for r in range(r0, r1 + 2):
+            for c in range(c0, c1 + 2):
+                inside = r <= r1 and c <= c1
+                for which in range(3):
+                    if (which == 0 and c > c1) or (which == 1 and r > r1) or (which == 2 and not inside):
+                        continue
+                    planes, best = _exit_valley(core, data, window, planes, pair, cells, best, low, r, c, which)
+                if far == 0 or not terrain_interior_vertex(window.surface, r, c):
+                    continue
+                v = terrain_window_vertex(data, window, r, c)
+                if v[2] <= low:
+                    continue
+                for i in range(far):
+                    x = core_far_point(core, i, v)
+                    if x[2] >= v[2]:
+                        # closest to the vertex only below it
+                        continue
+                    planes, bound = _exit_bound(data, window, planes, x)
+                    if bound > 0.0:
+                        bound = wp.min(bound, wp.length(x - v))
+                    planes, best = _exit_try(data, window, planes, pair, cells, best, x, bound)
+    if best.found != 0 and -best.d > best.target:
+        feature = best.feature - (best.feature & 7) + _EXIT_SLOT
+        sink = _offer(store, sink, best.q, best.n, best.d, feature)
+    return planes, sink
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # per pair
 # ----------------------------------------------------------------------------------------------------------------
@@ -901,6 +1180,10 @@ def solid_close(
         return
     if sink.raw == 0:
         planes, sink = solid_recovery(core, data, window, planes, sink, out)
+    planes, sink = solid_exits(core, data, window, planes, pair, sink, out, cells)
+    if sink.held > sink.capacity:
+        terrain_defer_pair(out, partner_class, pair_index, _wide(cells))
+        return
     keep, kept = terrain_finish_slots(out.q, out.n, out.d, sink.slot, sink.held, pair.eps)
     written = int(0)
     for i in range(sink.held):
@@ -935,12 +1218,14 @@ def solid_close_full(
 
     The scratch holds every candidate a window of the class can give; a pair with more has a window its shape data no
     longer bounds (changed since construction): it keeps the first in window order and is flagged."""
+    store = solid_scratch_store(scratch)
+    if sink.raw == 0:
+        planes, sink = solid_recovery(core, data, window, planes, sink, store)
+    planes, sink = solid_exits(core, data, window, planes, pair, sink, store, cells)
     flags = int(0)
     if sink.held > sink.capacity:
         sink.held = sink.capacity
         flags = TERRAIN_FINISH_CANDIDATE_OVERFLOW
-    if sink.raw == 0:
-        planes, sink = solid_recovery(core, data, window, planes, sink, solid_scratch_store(scratch))
     for i in range(sink.held):
         s = sink.slot + i
         # a row's core point, as the in-place finish of a walk reads it

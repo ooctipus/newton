@@ -83,9 +83,9 @@ TERRAIN_WALK_ROWS_PER_VERTEX = (6, 16, 15)
 """Rows a window vertex's features can give a pair at most: a sphere's centre (its two faces, three edges and itself,
 one row each), a capsule (both ends' six, the axis's four), a solid (its two faces' plane manifolds of four points
 each, its three edges' interval ends, itself)."""
-TERRAIN_WALK_ROWS_PER_PAIR = (1, 3, 4)
+TERRAIN_WALK_ROWS_PER_PAIR = (1, 3, 5)
 """Rows a pair can gain after its walk at most: a sphere's exit, a capsule's two ends' exits and its axis's recovery,
-a solid's four recovery rows."""
+a solid's four recovery rows and its deepest exit (rule X)."""
 
 TERRAIN_LANE_THREAD = 0
 """Lane class of pairs whose largest window holds at most :data:`TERRAIN_LANE_CELLS` cells: the class's one-thread

@@ -18,6 +18,8 @@ surface feature:
   core's flat support feature (interior) or its reference feature (arc end, G1) crossed with the edge.
 * V: solid cores against vertex features (vertices whose incident cluster normals span 3-D).
 * R: solid cores below the surface with no row: up to four of their deepest boundary points (G3).
+* X: solid cores below the surface: the exit (P's G2 or G3) of their deepest candidate boundary point, when deeper
+  than every other row (:func:`exit_rule`).
 * C: optional concave anticipation of a moving core.
 * The finish: coincident rows merged, rows implied by the others of their plane group dropped (the lower convex
   hull of tangent position and distance), at most four rows per plane group and, given a row limit, at most that
@@ -1537,6 +1539,261 @@ def _solid_recovery(hf, core, *, kmax=4):
     return [Row(x - d * n, x.copy(), n.copy(), d, ("R", i), group=("P", t)) for d, i, x, n, t in cands[:kmax]]
 
 
+EXIT_MARGIN = 1.0e-5
+"""Rule X offers a solid pair's deepest exit only where it lies deeper than every other row of the pair by more than
+this [m]: a pair whose rows reach its depth keeps them as they are."""
+EXIT_ARC_SAMPLES = 9
+"""Equally spaced normals of rule X's scan of a valley's normal arc, its ends included (rule E's count)."""
+
+
+def _arc_angles(core, n_a, m, theta_ab, x0):
+    """Angles of the local minima of ``sigma`` over the arc ``cos t n_a + sin t m``, ``t`` in ``[0, theta_ab]``: a scan
+    of :data:`EXIT_ARC_SAMPLES` equally spaced normals, then each sample no higher than its neighbours (the first of a
+    run of equal values) refined between them by golden section."""
+    count = EXIT_ARC_SAMPLES
+    thetas = [theta_ab * i / (count - 1) for i in range(count)]
+
+    def f(t):
+        return _sigma(core, math.cos(t) * n_a + math.sin(t) * m, x0)[0]
+
+    vals = [f(t) for t in thetas]
+    out = []
+    g = (math.sqrt(5.0) - 1.0) / 2.0
+    for i in range(count):
+        if (i > 0 and vals[i] >= vals[i - 1]) or (i < count - 1 and vals[i] > vals[i + 1]):
+            continue
+        lo, hi = thetas[max(i - 1, 0)], thetas[min(i + 1, count - 1)]
+        c = hi - g * (hi - lo)
+        d = lo + g * (hi - lo)
+        fc, fd = f(c), f(d)
+        for _ in range(60):
+            if fc < fd:
+                hi, d, fd = d, c, fc
+                c = hi - g * (hi - lo)
+                fc = f(c)
+            else:
+                lo, c, fc = c, d, fd
+                d = lo + g * (hi - lo)
+                fd = f(d)
+        t = 0.5 * (lo + hi)
+        out.append(t if f(t) <= vals[i] else thetas[i])
+    return out
+
+
+def _support_ends(core, n):
+    """The core's lowest point along ``n`` (``_sigma``'s) and, for a cylinder or cone, the other end of its lowest
+    generator (a support that ties along a generator holds both)."""
+    k = _sigma(core, n, np.zeros(3))[1]
+    if core.kind == "cylinder":
+        ax = core.axis
+        s = -1.0 if float(n @ ax) > 0.0 else 1.0
+        return [k, k - 2.0 * s * core.h * ax]
+    if core.kind == "cone":
+        g, p = core.generator(n)
+        return [g, p]
+    return [k]
+
+
+def _rims(core):
+    """A cylinder's two rim circles or a cone's base rim: ``(centre, axis, radius)``."""
+    if core.kind == "cylinder":
+        return [(core.c + core.h * core.axis, core.axis, core.r), (core.c - core.h * core.axis, core.axis, core.r)]
+    if core.kind == "cone":
+        return [(core.base, core.axis, core.r)]
+    return []
+
+
+def _farthest_on_ellipsoid(core, v, *, steps=200):
+    """The ellipsoid point farthest from ``v`` (secular equation ``x_i = s_i^2 y_i / (s_i^2 - mu)``, ``mu`` above the
+    largest ``s_i^2``, by bisection); the end of the longest axis away from ``v`` when ``v`` lies on its plane."""
+    y = core.R.T @ (v - core.c)
+    s2 = core.s**2
+    big = float(s2.max())
+    j = int(np.argmax(s2))
+    if abs(y[j]) <= 1.0e-12 * float(core.s.max()):
+        local = np.zeros(3)
+        local[j] = core.s[j]
+        return core.c + core.R @ local
+    lo, hi = big, big + float(core.s.max()) * float(np.linalg.norm(y)) + 1.0e-12
+    for _ in range(steps):
+        mid = 0.5 * (lo + hi)
+        if float(np.sum((core.s * y / (s2 - mid)) ** 2)) > 1.0:
+            lo = mid
+        else:
+            hi = mid
+    mu = 0.5 * (lo + hi)
+    return core.c + core.R @ (s2 * y / (s2 - mu))
+
+
+def _exit_bound(hf, x):
+    """An upper bound of point ``x``'s exit translation, or ``None`` above the surface: its depth below the cluster
+    plane of the triangle under it when its projection onto that plane stays in the cluster (a face minimum), else
+    its distance to that triangle."""
+    t = hf.locate(x[0], x[1])
+    if t is None:
+        return None
+    n, a = hf.plane(t)
+    d = float(n @ (x - a))
+    if d >= 0.0:
+        return None
+    q = x - d * n
+    s = hf.locate(q[0], q[1])
+    if s is not None and hf.same_cluster(t, s):
+        return -d
+    return float(np.linalg.norm(x - _closest_on_tri(x, *hf.tri_verts(t))))
+
+
+def _near_bound(hf, x, cells, bound):
+    """``bound`` lowered to ``x``'s distance to the triangles of the cells around the one under it (3 x 3, within the
+    window's cells ``(r0, r1, c0, c1)``): the second stage of rule X's bound, before an exit walk."""
+    t = hf.locate(x[0], x[1])
+    r, c, _sub = hf.tri_rc(t)
+    r0, r1, c0, c1 = cells
+    for rr in range(max(r - 1, r0), min(r + 1, r1) + 1):
+        for cc in range(max(c - 1, c0), min(c + 1, c1) + 1):
+            for sub in (0, 1):
+                k = _closest_on_tri(x, *hf.tri_verts(hf.tri_id(rr, cc, sub)))
+                bound = min(bound, float(np.linalg.norm(x - k)))
+    return bound
+
+
+def _valley_arc(hf, e):
+    """A valley's normal arc, exactly perpendicular to its edge: ``(v0, v1, n_a, m, theta_ab)``, or None."""
+    _k, _er, _ec, i0, i1, ta, tb, _oa, _ob = e
+    v0, v1 = hf.V(*i0), hf.V(*i1)
+    dvec = v1 - v0
+    dh = dvec / float(np.linalg.norm(dvec))
+    n_a = hf.plane(ta)[0]
+    n_b = hf.plane(tb)[0]
+    n_a = n_a - (n_a @ dh) * dh
+    n_a /= np.linalg.norm(n_a)
+    n_b = n_b - (n_b @ dh) * dh
+    n_b /= np.linalg.norm(n_b)
+    cosab = float(np.clip(n_a @ n_b, -1.0, 1.0))
+    th_ab = math.acos(cosab)
+    m = n_b - cosab * n_a
+    if th_ab < 1e-9 or np.linalg.norm(m) < 1e-12:
+        return None
+    return v0, v1, n_a, n_b, m / np.linalg.norm(m), th_ab
+
+
+def _farthest_rim_points(core, v):
+    """Per rim (a cylinder's top then bottom cap, a cone's base) its point farthest from ``v``; an ellipsoid's
+    farthest point."""
+    if core.kind == "ellipsoid":
+        return [_farthest_on_ellipsoid(core, v)]
+    out = []
+    for centre, axis, radius in _rims(core):
+        w = centre - v
+        w = w - float(w @ axis) * axis
+        lw = float(np.linalg.norm(w))
+        e = w / lw if lw > 1e-12 else _disk_basis(axis)[0]
+        out.append(centre + radius * e)
+    return out
+
+
+def exit_rule(hf, core, D, window, rows, *, stats=None):
+    """X: the exit (P's G2, or G3) of the deepest of a solid core's candidate boundary points, offered when it lies
+    deeper than every row of the pair by more than :data:`EXIT_MARGIN`.
+
+    A deepest boundary point whose closest surface point is unique is a local maximum of its distance to that one
+    feature over the core's boundary: for a face, a support point of rule F's plane manifold; for a valley edge or a
+    vertex, an extreme point of the core. The candidates, in the kernels' order:
+
+    * every point of a box or hull, a cone's apex;
+    * walking the window vertex by vertex, per valley edge (concave crease; x-, y- then diagonal edge) the core's
+      support points (both ends of a lowest generator) at the local minima of ``sigma`` over the valley's normal arc
+      (:func:`_arc_angles`): the core's deepest points in the wedge below the valley; per interior vertex the point
+      of each rim (cylinder, cone) or of the ellipsoid farthest from it.
+
+    A candidate is tried when its bound (:func:`_exit_bound`, or its distance to the feature that proposed it, the
+    smaller) exceeds the pair's depth plus the margin and the best exit found, and still does when lowered to its
+    distance to the triangles around it (:func:`_near_bound`); its exit is the point law's over the pair's window
+    (:class:`PointLaw`). A valley is skipped where no core point in the wedge below it can lie that deep: within the
+    wedge a point's distance to the edge is at most its height under the edge's higher end over the smaller normal
+    ``z``. A candidate is closest to its valley or vertex only below it: one no lower is left out. The deepest boundary
+    point is found unless it is a tie: equally far from two or more surface points (then it can lie inside a core
+    face, where no candidate is). Returns ``[]`` or the row.
+    """
+    _tris, edges, verts = window
+    lo, _hi = core.aabb()
+    lowz = float(lo[2])
+    if not verts or lowz >= max(hf.V(r, c)[2] for r, c in verts):
+        return []
+    target = max(-min((r.d for r in rows), default=0.0), 0.0) + EXIT_MARGIN
+    law = PointLaw(hf, *window)
+    state = {"threshold": target, "best": None}
+
+    rows_ = [rc[0] for rc in verts]
+    cols_ = [rc[1] for rc in verts]
+    cells = (min(rows_), max(rows_) - 1, min(cols_), max(cols_) - 1)
+
+    def consider(x, bound):
+        if bound is None or bound <= state["threshold"]:
+            return
+        if _near_bound(hf, x, cells, bound) <= state["threshold"]:
+            return
+        if stats:
+            stats.vertex_solves += 1
+        found = [r for r in law.minima(x, D, "x") if r.d <= EPS_PRED]
+        if not found:
+            return
+        ex = found[-1]
+        if state["best"] is None or ex.d < state["best"].d:
+            state["best"] = ex
+            state["threshold"] = max(target, -ex.d)
+
+    def bound_by(x, extra):
+        b = _exit_bound(hf, x)
+        return None if b is None else min(b, extra)
+
+    if hasattr(core, "verts"):
+        for x in core.verts:
+            consider(x, _exit_bound(hf, x))
+    elif core.kind == "cone":
+        consider(core.apex, _exit_bound(hf, core.apex))
+    if not hasattr(core, "verts"):
+        r0, r1, c0, c1 = cells
+        by_key = {(e[0], e[1], e[2]): e for e in edges}
+        for r in range(r0, r1 + 2):
+            for c in range(c0, c1 + 2):
+                for kind in ("H", "V", "D"):
+                    e = by_key.get((kind, r, c))
+                    if e is None or hf.edge_class(e) != "concave":
+                        continue
+                    v0, v1 = hf.V(*e[3]), hf.V(*e[4])
+                    top = max(v0[2], v1[2])
+                    if top <= lowz:
+                        continue
+                    arc = _valley_arc(hf, e)
+                    if arc is None:
+                        continue
+                    v0, v1, n_a, n_b, m, th_ab = arc
+                    if top - lowz <= state["threshold"] * min(n_a[2], n_b[2]):
+                        continue
+                    u = v1 - v0
+                    for t in _arc_angles(core, n_a, m, th_ab, v0):
+                        n = math.cos(t) * n_a + math.sin(t) * m
+                        for x in _support_ends(core, n):
+                            if x[2] >= top:
+                                continue
+                            s = float(np.clip((x - v0) @ u / (u @ u), 0.0, 1.0))
+                            consider(x, bound_by(x, float(np.linalg.norm(x - (v0 + s * u)))))
+                if hf.ring(r, c) is None:
+                    continue
+                v = hf.V(r, c)
+                if v[2] <= lowz:
+                    continue
+                for x in _farthest_rim_points(core, v):
+                    if x[2] >= v[2]:
+                        continue
+                    consider(x, bound_by(x, float(np.linalg.norm(x - v))))
+    best = state["best"]
+    if best is None or -best.d <= target:
+        return []
+    return [Row(best.q, best.k, best.n, best.d, ("X", *best.feat[1:]))]
+
+
 def _closest_seg_seg(p0, p1, q0, q1):
     """Parameters (s, t) of the closest points of segments p0p1 and q0q1 (None when parallel)."""
     d1, d2, r = p1 - p0, q1 - q0, p0 - q0
@@ -2415,6 +2672,7 @@ def pair_rows(
         raw = solid_law(hf, core, D, window, stats=stats)
         if not raw:
             raw = _solid_recovery(hf, core)
+        raw = raw + exit_rule(hf, core, D, window, raw, stats=stats)
     if motion is not None:
         raw = raw + anticipate(hf, core, D, window, motion, stats=stats)
     return finish(raw, stats=stats, implied=implied, group_offset=group_offset)

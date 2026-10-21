@@ -13,6 +13,9 @@ One struct per partner class, each with overloads of the same functions, which t
   feature (an interior ``theta*``) or its reference feature (an arc end, G1) meets a crease's line;
 * :func:`core_lift` (where a line enters the core), :func:`core_nearest` (rule V: the direction to the nearest point,
   or the minimum translation from inside) and :func:`core_recovery_point` (rule R's boundary points);
+* rule X's candidate deepest points: :func:`core_exit_point` (tried as they are: corners, hull points, a cone's
+  apex), :func:`core_support_point` (the ends of the lowest generator along a normal) and :func:`core_far_point`
+  (per rim, or an ellipsoid's, the point farthest from a terrain vertex);
 * :func:`core_bounds` (axis-aligned bounds) and :func:`core_sphere` (a bounding sphere).
 
 Every definition is the float64 law's (``newton/tests/terrain_law_reference.py``), in float32: the plane manifolds are
@@ -581,6 +584,41 @@ def core_recovery_point(core: TerrainBoxCore, i: int) -> wp.vec3:
     return _box_corner(core, i)
 
 
+@wp.func
+def core_exit_count(core: TerrainBoxCore) -> int:
+    """Boundary points rule X tries as they are: the corners."""
+    return 8
+
+
+@wp.func
+def core_exit_point(core: TerrainBoxCore, i: int) -> wp.vec3:
+    """Rule X's boundary point ``i``: the corners in order."""
+    return _box_corner(core, i)
+
+
+@wp.func
+def core_far_count(core: TerrainBoxCore) -> int:
+    """Points rule X takes per window vertex (the farthest from it on a curved extreme set): none for a box."""
+    return 0
+
+
+@wp.func
+def core_far_point(core: TerrainBoxCore, i: int, v: wp.vec3) -> wp.vec3:
+    return core.c
+
+
+@wp.func
+def core_support_count(core: TerrainBoxCore) -> int:
+    """Support points rule X takes per local minimum over a valley's normal arc: none for a box (its corners are
+    tried as they are)."""
+    return 0
+
+
+@wp.func
+def core_support_point(core: TerrainBoxCore, n: wp.vec3, j: int) -> wp.vec3:
+    return core_lowest(core, n)
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # cylinders and cones
 # ----------------------------------------------------------------------------------------------------------------
@@ -1048,6 +1086,64 @@ def core_recovery_point(core: TerrainCylinderCore, i: int) -> wp.vec3:
     return core.c - core.h * core.a + ring
 
 
+@wp.func
+def core_exit_count(core: TerrainCylinderCore) -> int:
+    """Boundary points rule X tries as they are: a cone's apex (a cylinder has none)."""
+    if core.cone != 0:
+        return 1
+    return 0
+
+
+@wp.func
+def core_exit_point(core: TerrainCylinderCore, i: int) -> wp.vec3:
+    """Rule X's boundary point: a cone's apex."""
+    return core.c + core.h * core.a
+
+
+@wp.func
+def core_far_count(core: TerrainCylinderCore) -> int:
+    """Rims rule X takes per window vertex: a cylinder's two (the top cap's first), a cone's base rim."""
+    if core.cone != 0:
+        return 1
+    return 2
+
+
+@wp.func
+def core_far_point(core: TerrainCylinderCore, i: int, v: wp.vec3) -> wp.vec3:
+    """The point of rim ``i`` farthest from ``v`` (a fixed one when ``v`` lies on the axis's line)."""
+    centre = core.c - core.h * core.a
+    if core.cone == 0 and i == 0:
+        centre = core.c + core.h * core.a
+    w = _radial(centre - v, core.a)
+    length = wp.length(w)
+    if length > 1.0e-12:
+        return centre + (core.r / length) * w
+    u, _w = _disk_basis(core.a)
+    return centre + core.r * u
+
+
+@wp.func
+def core_support_count(core: TerrainCylinderCore) -> int:
+    """Support points rule X takes per local minimum over a valley's normal arc: the lowest generator's two ends."""
+    return 2
+
+
+@wp.func
+def core_support_point(core: TerrainCylinderCore, n: wp.vec3, j: int) -> wp.vec3:
+    """End ``j`` of the core's lowest generator along ``n``: a cylinder's lowest point, then the generator's other end
+    (a support that ties along the generator holds both); a cone's base rim point under ``n``, then its apex."""
+    if core.cone != 0:
+        g, p = _cone_ends(core, n)
+        if j == 0:
+            return g
+        return p
+    k = core_lowest(core, n)
+    if j == 0:
+        return k
+    s = wp.where(wp.dot(n, core.a) > 0.0, -1.0, 1.0)
+    return k - (2.0 * s * core.h) * core.a
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # convex hulls and ellipsoids
 # ----------------------------------------------------------------------------------------------------------------
@@ -1497,7 +1593,8 @@ def _ellipsoid_nearest(core: TerrainHullCore, v: wp.vec3) -> tuple[bool, wp.vec3
 
 
 @wp.func
-def _closest_on_triangle(p: wp.vec3, a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.vec3:
+def closest_on_triangle(p: wp.vec3, a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.vec3:
+    """The point of triangle ``abc`` nearest ``p`` (Voronoi regions)."""
     ab = b - a
     ac = c - a
     ap = p - a
@@ -1557,7 +1654,7 @@ def core_nearest(core: TerrainHullCore, v: wp.vec3) -> tuple[bool, wp.vec3, wp.v
     dist2 = float(_HUGE)
     for j in range(core.triangle_begin, core.triangle_begin + core.triangle_count):
         tri = core.table.triangles[j]
-        q = _closest_on_triangle(
+        q = closest_on_triangle(
             pl,
             wp.cw_mul(core.table.points[tri[0]], core.s),
             wp.cw_mul(core.table.points[tri[1]], core.s),
@@ -1600,3 +1697,69 @@ def core_recovery_point(core: TerrainHullCore, i: int) -> wp.vec3:
             wp.where((j & 1) == 0, _THIRD, -_THIRD),
         )
     return core.c + core.rot @ wp.cw_mul(core.s, local)
+
+
+@wp.func
+def core_exit_count(core: TerrainHullCore) -> int:
+    """Boundary points rule X tries as they are: a hull's points (an ellipsoid has none)."""
+    if core.ellipsoid != 0:
+        return 0
+    return core.point_count
+
+
+@wp.func
+def core_exit_point(core: TerrainHullCore, i: int) -> wp.vec3:
+    """Rule X's boundary point ``i``: a hull's points in mesh order."""
+    return _hull_point(core, core.point_begin + i)
+
+
+@wp.func
+def core_far_count(core: TerrainHullCore) -> int:
+    """Points rule X takes per window vertex: an ellipsoid's farthest from it (none for a hull)."""
+    if core.ellipsoid != 0:
+        return 1
+    return 0
+
+
+@wp.func
+def core_far_point(core: TerrainHullCore, i: int, v: wp.vec3) -> wp.vec3:
+    """An ellipsoid's point farthest from ``v``: ``x_i = s_i^2 y_i / (s_i^2 - mu)`` with the secular equation's root
+    ``mu`` above the largest squared semi-axis (bisected a fixed number of steps); the end of the longest axis (the
+    first of equal ones) when ``v`` lies on that axis's plane."""
+    y = wp.transpose(core.rot) @ (v - core.c)
+    s = core.s
+    s2 = wp.cw_mul(s, s)
+    j = int(0)
+    if s2[1] > s2[j]:
+        j = 1
+    if s2[2] > s2[j]:
+        j = 2
+    if wp.abs(y[j]) <= 1.0e-12 * s[j]:
+        local = wp.vec3(0.0)
+        local[j] = s[j]
+        return core.c + core.rot @ local
+    lo = s2[j]
+    hi = s2[j] + s[j] * wp.length(y)
+    for _step in range(_ELLIPSOID_STEPS):
+        mu = 0.5 * (lo + hi)
+        g = wp.cw_div(wp.cw_mul(s, y), s2 - wp.vec3(mu))
+        if wp.dot(g, g) > 1.0:
+            lo = mu
+        else:
+            hi = mu
+    mu = 0.5 * (lo + hi)
+    return core.c + core.rot @ wp.cw_div(wp.cw_mul(s2, y), s2 - wp.vec3(mu))
+
+
+@wp.func
+def core_support_count(core: TerrainHullCore) -> int:
+    """Support points rule X takes per local minimum over a valley's normal arc: an ellipsoid's support point (none
+    for a hull, whose points are tried as they are)."""
+    if core.ellipsoid != 0:
+        return 1
+    return 0
+
+
+@wp.func
+def core_support_point(core: TerrainHullCore, n: wp.vec3, j: int) -> wp.vec3:
+    return core_lowest(core, n)

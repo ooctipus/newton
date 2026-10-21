@@ -114,7 +114,7 @@ def _window_cells(radius, reach, cell):
 
 _ROWS_PER_VERTEX = {"sphere": (6, 1), "big_sphere": (6, 1), "capsule": (16, 3)}
 """Rows a window vertex's features give a point core at most, and the rows its ends' exits and its axis's recovery
-add (any other partner: a solid's 15 per vertex and 4 recovery rows)."""
+add (any other partner: a solid's 15 per vertex, and 4 recovery rows and its deepest exit)."""
 
 
 def test_pair_table_from_the_collision_filter(test, device):
@@ -158,7 +158,7 @@ def test_pair_table_from_the_collision_filter(test, device):
     for i, b in enumerate(pairs[:, 1]):
         kind = kinds[int(b)][0]
         side = min(math.floor(2.0 * (radius[b] + 0.04) / 0.1) + 4, 21)
-        per_vertex, per_pair = _ROWS_PER_VERTEX.get(kind, (15, 4))
+        per_vertex, per_pair = _ROWS_PER_VERTEX.get(kind, (15, 5))
         test.assertEqual(table.candidates[i], per_vertex * side * side + per_pair, msg=kind)
     test.assertEqual(table.memory_bytes()["pairs"], 8 * len(kinds))
 

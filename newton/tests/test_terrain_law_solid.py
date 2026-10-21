@@ -727,10 +727,12 @@ def _penetration_violations(pairs):
     return differ, rowless, short
 
 
-LP_SHORT = 3
-"""Exposed-cell cases of 40 whose deepest row may be short of the core's depth (a known limitation of the law)."""
-BURIED_SHORT = 6
-"""Buried solids of 120 whose deepest row may be short of the core's depth (a known limitation of the law)."""
+LP_SHORT = 0
+"""Exposed-cell cases of 40 whose deepest row may be short of the core's depth: none of this seed's (the law leaves
+ties short, 5 of 4,000 cases of the generator)."""
+BURIED_SHORT = 0
+"""Buried solids of 120 whose deepest row may be short of the core's depth: none of this seed's (the law leaves ties
+short, 27 of 12,000 of the generators)."""
 
 
 def test_exposed_cell_rows_follow_the_law(test, device):
@@ -741,11 +743,12 @@ def test_exposed_cell_rows_follow_the_law(test, device):
     over that prism (today's route misses 1,569 of 2,000 cases), which a per-pair law that emits one support set per
     pair, not one row per triangle, does not do by design; here a pair's deepest row must reach its core's depth.
 
-    The law does not guarantee that for every penetrating solid (DESIGN 1.3 and 8.5: no rule covers some deep cores
-    and cores pierced where their footprints leave a cluster; rule R only fills pairs with no row at all). Over 4,000
-    cases of this generator (100 seeds) the shadow rows equal the float64 law's in every case and leave 65 short
-    (1.6%, from 3.9 mm of penetration on; in 27 of them today's route reaches the depth), none rowless; today's route
-    leaves 537 short and 16 rowless. The check allows :data:`LP_SHORT` of its 40.
+    Rule X exits the core's deepest candidate point (its rims' points farthest from the valleys and vertices under
+    them), so a pair reaches its depth unless its deepest point is a tie: equally far from two or more surface points,
+    inside a cap or the side (DESIGN 1.3 and 8.5). Over 4,000 cases of this generator (100 seeds) the shadow rows
+    equal the float64 law's in all but one case (a decision within float32 resolution, as at 1cf34769) and leave 5
+    short, all ties, by at most 0.45 mm, none rowless; at 1cf34769 the law left 74 short (by up to 161 mm). Today's
+    route leaves 526 short. The check allows :data:`LP_SHORT` of its 40.
     """
     pairs = _lp_pairs(_lp_cases(np.random.default_rng(17), 40), device, shadow=True)
     differ, rowless, short = _penetration_violations(pairs)
@@ -822,10 +825,10 @@ def test_buried_solids_follow_the_law(test, device):
     Lying cylinders within 20 deg of horizontal (the recorded rough state's buried toes), cones and ellipsoids in any
     orientation, 40 of each, their deepest point 1-40 mm below a rough tile (the burial census, DESIGN 7 Track 1).
 
-    The law does not guarantee the depth of every penetrating solid (DESIGN 1.3 and 8.5). Over 4,000 of each (100
-    seeds) the shadow rows equal the float64 law's in every case, none rowless, and leave short 34 cylinders (0.85%,
-    from 4.2 mm on), 92 cones (2.3%, from 4.4 mm) and 12 ellipsoids (0.3%, from 22 mm); today's route leaves 2,052,
-    425 and 73 short, and 929 cylinders without a contact. The check allows :data:`BURIED_SHORT` of its 120.
+    The law reaches a pair's depth unless its deepest point is a tie (rule X; DESIGN 1.3 and 8.5). Over 4,000 of each
+    (100 seeds) the shadow rows equal the float64 law's in every case, none rowless, and leave short 7 cylinders (by
+    at most 3.4 mm), 14 cones (16 mm) and 6 ellipsoids (16 mm), all ties; at 1cf34769 the law left 32, 106 and 16
+    short. Today's route leaves 2,088, 345 and 11 short. The check allows :data:`BURIED_SHORT` of its 120.
     """
     hf, model, _hfield, shapes, bodies = _burial_scene(device)
     pipeline, _contacts, _state = _collide(model, shadow=True)
@@ -833,6 +836,53 @@ def test_buried_solids_follow_the_law(test, device):
     test.assertEqual(differ, [])
     test.assertEqual(rowless, [])
     test.assertLessEqual(len(short), BURIED_SHORT, msg=short)
+
+
+def _valley_bodies(device):
+    """Solids sunk into a V-valley (30 deg walls meeting along y at x = 0, 5 cm cells), each with its deepest point in
+    the wedge below the valley's line, whose closest surface point it is: a lying cylinder and an ellipsoid along the
+    valley with their axes 5 mm below its line, a box with an edge down along it 20 mm deep and a cone apex down
+    10 mm deep. Rule F's supports there project across the valley onto the other wall."""
+    th = np.radians(30.0)
+    x = np.linspace(-1.0, 1.0, 41)
+    heights = np.tile(np.abs(x) * np.tan(th), (65, 1))
+    hf = tu.reference_surface(tu.heightfield_model(heights, 1.0, 1.6, device="cpu"))
+    along = _axis_angle((1.0, 0.0, 0.0), -np.pi / 2.0)
+    diamond = _quat_mul(_axis_angle((0.0, 1.0, 0.0), np.pi / 4.0), _axis_angle((0.0, 0.0, 1.0), np.pi / 2.0))
+    bodies = [
+        ("cylinder", TOE, _f32_pose(np.r_[0.0, -0.9137, -0.005, along])),
+        ("ellipsoid", {"semi": (0.03, 0.07, 0.03)}, _f32_pose(np.r_[0.0, -0.3113, -0.005, 0.0, 0.0, 0.0, 1.0])),
+        ("box", {"half": (0.08, 0.03, 0.03)}, _f32_pose(np.r_[0.0, 0.2911, 0.03 * np.sqrt(2.0) - 0.02, diamond])),
+        ("cone", CONE, _f32_pose(np.r_[0.0, 0.8871, -0.01 + CONE["half_height"], 1.0, 0.0, 0.0, 0.0])),
+    ]
+    model, hfield, shapes = su.solid_scene(heights, 1.0, 1.6, bodies, device=device)
+    return hf, model, hfield, shapes, bodies
+
+
+def test_valley_cores_reach_their_depth(test, device):
+    """Give solids sunk into a valley a row as deep as their deepest point, the float64 law's rows and no ghost.
+
+    Each deepest point lies in the wedge below the valley's line and is closest to it (a cylinder's or a cone's rim,
+    a box's corner, a cone's apex, an ellipsoid's support point): no rule but X reaches it. At 1cf34769 their deepest
+    rows were the walls' plane depths of their recovery points (rule R), short by up to 13% of the depth.
+    """
+    hf, model, _hfield, shapes, bodies = _valley_bodies(device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    rows = tu.shadow_rows(pipeline)
+    for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
+        with test.subTest(kind=kind):
+            got = rows.get(shape, [])
+            law = su.law_rows(hf, kind, dims, pose)
+            missing, extra, deepest = su.compare_solid_rows(law, got)
+            test.assertEqual((missing, extra), ([], []))
+            test.assertLess(deepest, 1.0e-5)
+            separation = su.refined_separation(hf, ref.make_core(kind, dims, pose))
+            test.assertLess(separation, -0.008)
+            test.assertLessEqual(min(g[2] for g in got), separation + PENETRATING_TOL)
+            exits = [g for g in got if su.is_exit_row(g)]
+            test.assertEqual(len(exits), 1)
+            # the exit's terrain point lies on the valley's line, its normal in the line's normal cone
+            test.assertLessEqual(su.normal_cone_angle(hf, exits[0][0], exits[0][1]), GHOST_ANGLE)
 
 
 def test_recovery_rows_have_distinct_feature_ids(test, device):
@@ -1604,6 +1654,7 @@ for _name, _func in (
     ("test_thin_rods_and_crease_bodies_keep_their_supports", test_thin_rods_and_crease_bodies_keep_their_supports),
     ("test_exposed_cell_rows_follow_the_law", test_exposed_cell_rows_follow_the_law),
     ("test_buried_solids_follow_the_law", test_buried_solids_follow_the_law),
+    ("test_valley_cores_reach_their_depth", test_valley_cores_reach_their_depth),
     ("test_recovery_rows_have_distinct_feature_ids", test_recovery_rows_have_distinct_feature_ids),
     ("test_solid_rows_match_the_float64_law", test_solid_rows_match_the_float64_law),
     ("test_tiled_kernels_match_one_thread_kernels", test_tiled_kernels_match_one_thread_kernels),
