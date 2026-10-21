@@ -158,9 +158,10 @@ A class's module and kernels follow one protocol (the helpers live in :mod:`~new
 * A pair that has no row (stale features, the pair policy, a window off the heightfield, the tile-max exit) is
   recorded by ``terrain_pair_exit``.
 * While its window is walked, a pair may use its ``K`` walk slots as scratch, in the window frame, its distinct rows
-  merged as the finish merges (``terrain_hold_row``). The point kernels hold up to ``K - 2`` there and keep the best exit of each core end
-  inside the solid in the last two slots (with both ends outside, the last slot holds the capsule axis's deepest
-  crossing for its G3); an exit is read before a row may land in its slot. The solid kernels hold up to ``K``.
+  merged as the finish merges (``terrain_hold_row``). The point kernels hold up to ``K - 2`` there and keep the best
+  exit of each core end inside the solid in the last two slots (with both ends outside, the last slot holds the
+  capsule axis's deepest crossing for its G3); an exit is read before a row may land in its slot. The solid kernels
+  hold up to ``K``.
 * When the finish keeps the held rows as they are (no plane group of three, ``terrain_plane_group_of_three``; at most
   ``K`` rows), the point kernels write them in the world frame (``terrain_store_row``) with the pair's count and state;
   the solid kernels run the finish in place on any held rows (``terrain_finish_slots``) and write the kept ones. A pair

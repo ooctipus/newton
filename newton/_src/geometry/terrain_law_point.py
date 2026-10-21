@@ -29,9 +29,9 @@ block under its window by more than ``D``); the vertex drop (:func:`_vertex_drop
 ``D`` from the box its vertex's features lie in, a sphere centre in 3-D, a capsule by height; off while a core point
 lies inside the solid); then per vertex its faces by projection, its crease edges in closed form (flat and border
 edges dropped on cluster ids) and the vertex; then the law's finish, which keeps every support (no count bounds a
-pair's rows). Each feature is rejected on geometry before its canonical values are read: a face whose projection lies off its cell
-(:func:`_off_cell`, conservative), an edge whose slab misses the core point or whose closest point is out of reach
-(exact) before its class and planes. On 4,096 recorded quadruped foot spheres the drop keeps 4.0 of a window's
+pair's rows). Each feature is rejected on geometry before its canonical values are read: a face whose projection lies
+off its cell (:func:`_off_cell`, conservative), an edge whose slab misses the core point or whose closest point is out
+of reach (exact) before its class and planes. On 4,096 recorded quadruped foot spheres the drop keeps 4.0 of a window's
 11.7 vertices; per pair, 2.3 of the 7.7 front-facing faces within reach get to their canonical values, and of 12.1
 edges 3.4 are creases and 1.0 gets to its planes. The rows are bit for bit those of the walk without the drop, the
 vertex mask and the off-cell reject (the point-kernel tests check it). A window's cluster planes are evaluated once
@@ -68,12 +68,12 @@ Inlined into the walks, the finish took every thread to 255 registers and a 10 K
 kernel takes 128 registers (its launch bounds: 16 blocks of 32 threads per SM) and a 184-byte stack (a sphere's walk
 alone would need 140 registers), the tiled kernel 226 registers and a 32-byte stack, and only deferred pairs pay for the
 finish. The full-finish kernel keeps the candidates and the finish's state in global scratch
-(:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`, :func:`~newton._src.geometry.terrain_law.terrain_finish_list`),
-so that its stack, which sets the driver's local-memory reservation for every thread the device holds, holds no
-candidate: 232 registers and a 32-byte stack (5,960 bytes, 1,342 MiB of reservation, with the finish's 32-candidate
-frame on it). The kernels take the per-type kernel arguments ``(begin, slot_begin, inputs, data, out)`` of
-:class:`~newton._src.geometry.terrain_law.TerrainPairInputs` and a launch argument: the walks the class's work list, the
-full-finish kernel its scratch.
+(:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`,
+:func:`~newton._src.geometry.terrain_law.terrain_finish_list`), so that its stack, which sets the driver's local-memory
+reservation for every thread the device holds, holds no candidate: 232 registers and a 32-byte stack (5,960 bytes, 1,342
+MiB of reservation, with the finish's 32-candidate frame on it). The kernels take the per-type kernel arguments
+``(begin, slot_begin, inputs, data, out)`` of :class:`~newton._src.geometry.terrain_law.TerrainPairInputs` and a launch
+argument: the walks the class's work list, the full-finish kernel its scratch.
 
 The module is compiled without floating-point contraction, as the cluster build is: every float32 operation
 rounds as on the CPU, so CPU tests decide every boundary, and a CPU census counts every row, as the GPU does.

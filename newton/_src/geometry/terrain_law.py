@@ -470,9 +470,9 @@ class TerrainFinishScratch:
 
     Block ``b`` holds candidate ``j`` at ``b * capacity + j``, off the per-thread stack: the largest stack a context
     launches sets the driver's local-memory reservation for every thread the device can hold. ``capacity`` bounds the
-    distinct candidates of every pair of the class (:func:`~newton._src.geometry.terrain_contacts.terrain_pair_candidates`
-    from each pair's shape extent, reach and cells at construction), so that the finish
-    (:func:`terrain_finish_list`) sees all of them.
+    distinct candidates of every pair of the class
+    (:func:`~newton._src.geometry.terrain_contacts.terrain_pair_candidates` from each pair's shape extent, reach and
+    cells at construction), so that the finish (:func:`terrain_finish_list`) sees all of them.
     """
 
     blocks: int

@@ -43,12 +43,12 @@ of reach only where the edge rises nowhere above the core's lowest point: a row 
 from the core) and by its arc ends' support values before the search, a vertex by the bounding sphere and one support
 call before its feature test and nearest point.
 
-Rule X runs after the walk (and rule R), only for a core reaching below its window's highest vertex (read in the
-pass that sets the window's band): the walk leaves such a pair, its rows held in its walk slots, to its class's exit
-kernel (:func:`solid_close`, :func:`solid_rows_exit`), so that rule X's work runs on warps of its own, off the walks'
-registers and stacks; a deferred pair's full finish runs it itself. A candidate's bound is its depth below the plane of the face under it when its
-projection stays in that face's cluster, else its distance to that triangle, or its distance to the feature that
-proposed it, the smallest, lowered by a descent over blocks of 3 x 3 cells toward its closest surface point
+Rule X runs after the walk (and rule R), only for a core reaching below its window's highest vertex (read in the pass
+that sets the window's band): the walk leaves such a pair, its rows held in its walk slots, to its class's exit kernel
+(:func:`solid_close`, :func:`solid_rows_exit`), so that rule X's work runs on warps of its own, off the walks' registers
+and stacks; a deferred pair's full finish runs it itself. A candidate's bound is its depth below the plane of the face
+under it when its projection stays in that face's cluster, else its distance to that triangle, or its distance to the
+feature that proposed it, the smallest, lowered by a descent over blocks of 3 x 3 cells toward its closest surface point
 (:func:`_near_bound`). A first pass over the candidates takes the two largest bounds above the pair's depth, and the
 largest's exit is searched; a second pass searches the exits of the candidates that can still beat it (or tie it from
 earlier in window order) only when the second largest bound can; a valley is skipped where the wedge below it cannot
@@ -57,22 +57,22 @@ candidate's depth, not the window's size: a pair's rule X work is its candidates
 cylinders, cones and ellipsoids, a box's or hull's points) and, on buried solids under rough slopes, one exit search.
 
 The kernels follow the per-pair output protocol of :mod:`~newton._src.geometry.terrain_law`: a pair with no row is
-recorded by :func:`~newton._src.geometry.terrain_law.terrain_pair_exit`, and rows are held in the pair's own walk
-slots (window frame) as the finish merges them (:func:`~newton._src.geometry.terrain_law.terrain_hold_row`): a row
-coinciding with a held one is dropped, the first in window order staying. The finish runs in place on the held rows
+recorded by :func:`~newton._src.geometry.terrain_law.terrain_pair_exit`, and rows are held in the pair's own walk slots
+(window frame) as the finish merges them (:func:`~newton._src.geometry.terrain_law.terrain_hold_row`): a row coinciding
+with a held one is dropped, the first in window order staying. The finish runs in place on the held rows
 (:func:`~newton._src.geometry.terrain_law.terrain_finish_slots`, a row's core point being ``q + d n``), and the kept
-rows are rewritten in the world frame at the front of the slots. A pair with more distinct candidates than its slots
-is left to its class's full kernel (:func:`~newton._src.geometry.terrain_law.terrain_defer_pair`): the shadow's fixed
+rows are rewritten in the world frame at the front of the slots. A pair with more distinct candidates than its slots is
+left to its class's full kernel (:func:`~newton._src.geometry.terrain_law.terrain_defer_pair`): the shadow's fixed
 full-finish grid strides over the class's deferred list, and each block's first lane walks its pairs again, one at a
 time, into the block's scratch (:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`), which holds every
 distinct candidate a window of the class can give
 (:func:`~newton._src.geometry.terrain_contacts.terrain_pair_candidates`). The finish runs on all of them
 (:func:`~newton._src.geometry.terrain_law.terrain_finish_list`) and every row it keeps is written, in the pair's walk
 slots when they fit, else in rows of the spill region it reserves
-(:func:`~newton._src.geometry.terrain_law.terrain_spill_rows`). Every deferred pair is thus finished from its own candidates, whatever
-the number of deferred pairs, the order of the deferral or the block that finishes it. The kernels themselves (one
-module per partner class) build the class's core and call the generic bodies here; every module that compiles them
-disables floating-point contraction, so the CPU decides every boundary as the GPU does.
+(:func:`~newton._src.geometry.terrain_law.terrain_spill_rows`). Every deferred pair is thus finished from its own
+candidates, whatever the number of deferred pairs, the order of the deferral or the block that finishes it. The kernels
+themselves (one module per partner class) build the class's core and call the generic bodies here; every module that
+compiles them disables floating-point contraction, so the CPU decides every boundary as the GPU does.
 """
 
 from __future__ import annotations
@@ -194,9 +194,10 @@ TERRAIN_SOLID_EXIT_MARGIN = 1.0e-5
 TERRAIN_SOLID_EXIT_SLOT = 7
 """Point slot of rule X's row in its feature id: no other solid rule uses it (F 0-3, E 0-1, V 0, R 0-3)."""
 TERRAIN_SOLID_EXIT_DESCENT = 4
-"""Blocks of 3 x 3 cells rule X's near bound visits at most per candidate, each centred on the cell of the closest
-point the last one found (:func:`_near_bound`): a descent toward the candidate's closest surface point, which only
-tightens the bound that decides whether its exit is searched."""
+"""Blocks of 3 x 3 cells rule X's near bound visits at most per candidate, each after the first centred on the cell
+under the candidate's projection onto the plane of the last block's nearest triangle (:func:`_near_bound`): a descent
+toward the candidate's closest surface point, which only tightens the bound that decides whether its exit is
+searched."""
 TERRAIN_SOLID_EXIT_SLOTS = 64
 """Candidate slots of one window vertex in rule X's candidate keys (window order): a valley's two support points at
 each of its nine arc samples, for its three edges (54), then the vertex's local maxima of the distance from it."""
@@ -1003,13 +1004,14 @@ def _exit_take(
 def _exit_open(best: _Exit, key: int, bound: float, scale: float) -> bool:
     """Whether candidates of bound ``bound / scale`` (``scale`` positive) from key ``key`` on can still matter: in the
     first pass, whether one can join the two largest bounds; in the second, whether one can beat the best exit, or tie
-    it from earlier in window order."""
+    it from earlier in window order (an exit deeper than the target: only such a one is offered)."""
     if best.walk == 0:
         return bound > wp.max(best.target, best.second) * scale
     if key == best.first_key:
         return False
     limit = best.threshold * scale
-    return bound > limit or (bound == limit and best.found != 0 and key < best.key)
+    tie = bound == limit and best.found != 0 and key < best.key and best.threshold > best.target
+    return bound > limit or tie
 
 
 @wp.func
@@ -1233,8 +1235,12 @@ def solid_exits(
             if best.first <= best.target:
                 break
             planes, best = _exit_take(data, window, planes, pair, cells, best, best.first_x, best.first, best.first_key)
-            # every other candidate of the largest bound comes later in window order: it cannot win a tie
-            if best.second < best.threshold or (best.second == best.threshold and best.threshold >= best.first):
+            # The second pass only when another candidate's bound can beat the exit found, or tie it from earlier in
+            # window order (every other candidate of the largest bound comes later; an exit no deeper than the target
+            # is never offered).
+            beat = best.second > best.threshold
+            tie = best.second == best.threshold and best.threshold < best.first and best.threshold > best.target
+            if not (beat or tie):
                 break
             best.walk = 1
         planes, best = _exit_candidates(core, data, window, planes, pair, cells, best, low)

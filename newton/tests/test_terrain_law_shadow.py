@@ -237,7 +237,7 @@ def _assert_law_rows(test, expected, got, what):
 
 
 def test_long_capsule_keeps_every_support(test, device):
-    """Keep every support of a pair with more rows than its walk slots, as the float64 law gives them, and raise nothing.
+    """Keep every support of a pair with more rows than its walk slots, as the float64 law gives them; raise nothing.
 
     A long capsule lies across ridges of different heights: each ridge in reach is a support (its own plane), more
     than the point class's eight walk slots. Its class's full-finish kernel finishes it and writes its rows to the side
@@ -510,11 +510,11 @@ class TestTerrainLawShadow(unittest.TestCase):
         """Raise ``terrain_rows`` when the spill region, sized at the scene level, has no room for a pair's rows, and
         keep the pair's first rows by priority in its walk slots.
 
-        The captured sphere's nine rows exceed its walk slots: with ``NEWTON_TERRAIN_LAW_SHADOW_ROWS=8`` the spill region
-        is one row short, the pair keeps eight of its rows (every plane group's deepest first, the law's eight deepest
-        here, every row its own plane) in its walk slots with a ``TERRAIN_PAIR_ROW_OVERFLOW`` state, the check warns
-        with the rows asked for against the region's, and the capacity check raises; with 9 the rows fit. (Before, the
-        pair kept no row.)
+        The captured sphere's nine rows exceed its walk slots: with ``NEWTON_TERRAIN_LAW_SHADOW_ROWS=8`` the spill
+        region is one row short, the pair keeps eight of its rows (every plane group's deepest first, the law's eight
+        deepest here, every row its own plane) in its walk slots with a ``TERRAIN_PAIR_ROW_OVERFLOW`` state, the check
+        warns with the rows asked for against the region's, and the capacity check raises; with 9 the rows fit.
+        (Before, the pair kept no row.)
         """
         model, shapes, law = _captured_sphere("cpu")
         with patch.dict(os.environ, {"NEWTON_TERRAIN_LAW_SHADOW_ROWS": "8"}):
