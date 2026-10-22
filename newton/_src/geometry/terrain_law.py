@@ -1620,18 +1620,18 @@ def terrain_finish_slots(
                 live = live & ~(1 << pick)
                 alive = alive & ~(1 << rank[pick])
                 size -= 1
-    # 4. at most four rows per group: deepest, farthest, largest triangle, largest quadrilateral
+    # 4. at most four rows per group: deepest, farthest, largest triangle, largest quadrilateral. A group of at most
+    # four rows keeps them all (its picks would rank every one), so that only larger groups pick.
+    sizes = _MaskInts()
     for i in range(count):
         rank[i] = 4
+        if ((alive >> i) & 1) != 0:
+            sizes[group[i]] = sizes[group[i]] + 1
     for g in range(count):
         # A group keeps its first row's id even when that row was implied.
         if group[g] != g:
             continue
-        size = int(0)
-        for i in range(count):
-            if _slot_member(alive, group, i, g):
-                size += 1
-        if size == 0:
+        if sizes[g] <= _GROUP_ROWS:
             continue
         ng = n[base + g]
         i0 = int(-1)
@@ -1701,17 +1701,13 @@ def terrain_finish_slots(
                 i3 = j
         if i3 >= 0:
             rank[i3] = 3
-        if size <= _GROUP_ROWS:
-            # A group of at most four rows keeps them all.
-            for j in range(count):
-                if _slot_member(alive, group, j, g) and rank[j] == _GROUP_ROWS:
-                    rank[j] = _GROUP_ROWS - 1
     keep = int(0)
     kept = int(0)
     for i in range(count):
-        if ((alive >> i) & 1) != 0 and rank[i] < _GROUP_ROWS:
-            keep = keep | (1 << i)
-            kept += 1
+        if ((alive >> i) & 1) != 0:
+            if rank[i] < _GROUP_ROWS or sizes[group[i]] <= _GROUP_ROWS:
+                keep = keep | (1 << i)
+                kept += 1
     return keep, kept
 
 
