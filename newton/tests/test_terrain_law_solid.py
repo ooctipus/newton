@@ -2108,15 +2108,16 @@ def test_large_plane_group_follows_the_law(test, device):
     test.assertFalse(any(pipeline.narrow_phase.buffer_capacity_status().values()))
 
 
-def test_plane_group_of_many_rows_takes_the_lanes(test, device):
-    """Finish a pair holding many rows with a block's lanes, one holding few in a plane group of three with one thread of
-    the small-pair finish kernel and one holding few others in place, all with the float64 law's rows.
+def test_plane_groups_finish_in_one_thread(test, device):
+    """Finish a pair holding many rows in a plane group and one holding few in a plane group of three with one thread of
+    the small-pair finish kernel, and one holding few others in place, all with the float64 law's rows.
 
     A flat box 2 mm above the pillar lattice of :func:`test_large_plane_group_follows_the_law`: 6 cm across it holds 15
-    candidates in one plane group (:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LANE_ROWS` or more),
-    which its close lists for the finish kernel and whose implied-row step drops 6; 3 cm across it holds 4 on four
-    planes, which its close writes as they are; 2 cm across over one pillar's top it holds its 4 corners on that plane,
-    which its close lists for the small-pair finish kernel.
+    candidates in one plane group, fewer than
+    :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LANE_ROWS`, which its close lists for the small-pair
+    finish kernel and whose implied-row step drops 6; 3 cm across it holds 4 on four planes, which its close writes as
+    they are; 2 cm across over one pillar's top it holds its 4 corners on that plane, which its close lists for the
+    small-pair finish kernel too. No pair takes the lanes.
     """
     n = 61
     r = np.arange(n)
@@ -2124,7 +2125,7 @@ def test_plane_group_of_many_rows_takes_the_lanes(test, device):
     hf = tu.reference_surface(tu.heightfield_model(heights, 1.5, 1.5, device="cpu"))
     # (half size, centre, pairs for the lanes, pairs for the small-pair finish); a pillar's top spans 5 cm about 0.075
     for half, centre, lanes, small in (
-        (0.06, (0.013, 0.007), 1, 0),
+        (0.06, (0.013, 0.007), 0, 1),
         (0.03, (0.013, 0.007), 0, 0),
         (0.01, (0.073, 0.077), 0, 1),
     ):
@@ -2136,10 +2137,10 @@ def test_plane_group_of_many_rows_takes_the_lanes(test, device):
             counts = pipeline._terrain_law_shadow.job_counts()["box"]
             test.assertEqual((counts["lanes"], counts["small"]), (lanes, small))
             rows = tu.shadow_rows(pipeline)[shapes[0]]
-            if lanes:
-                # the lanes' implied-row step dropped some of its candidates
+            if half == 0.06:
+                # the finish's implied-row step dropped some of its candidates
                 test.assertLess(len(rows), counts["candidates"])
-            if small:
+            elif small:
                 test.assertEqual(len(rows), 4)
             missing, extra, deepest = su.compare_solid_rows(su.law_rows(hf, "box", dims, pose), rows)
             test.assertEqual((missing, extra), ([], []))
@@ -2329,9 +2330,10 @@ def test_solid_launches_take_fixed_grids(test, device):
             test.assertEqual(record["pair_job_threads"], min(jobs.threads, end - begin))
             test.assertEqual(record["finish_blocks"], jobs.finish_blocks)
             test.assertLessEqual(jobs.finish_blocks, end - begin)
-            # rule X's valleys never for boxes, its gate never for hulls (core_exits_gated)
+            # rule X's valleys never for boxes, its gate never for hulls (core_exits_gated), the lanes' finish for no
+            # class (no class's walk slots hold the lane rows)
             expected = {TERRAIN_PARTNER_BOX: ["xvalleys"], TERRAIN_PARTNER_HULL: ["xbound"]}.get(partner_class, [])
-            test.assertEqual(record["skipped"], expected)
+            test.assertEqual(record["skipped"], [*expected, "finish"])
             for kind, kernel_name in TERRAIN_SOLID_LAUNCHES:
                 key = _kernel(partner_class, kernel_name).key
                 if kernel_name in record["skipped"]:
@@ -2633,7 +2635,7 @@ for _name, _func in (
     ("test_deferred_pairs_keep_their_rows_beyond_the_grid", test_deferred_pairs_keep_their_rows_beyond_the_grid),
     ("test_wide_box_keeps_every_support", test_wide_box_keeps_every_support),
     ("test_large_plane_group_follows_the_law", test_large_plane_group_follows_the_law),
-    ("test_plane_group_of_many_rows_takes_the_lanes", test_plane_group_of_many_rows_takes_the_lanes),
+    ("test_plane_groups_finish_in_one_thread", test_plane_groups_finish_in_one_thread),
     ("test_window_past_its_bound_is_flagged", test_window_past_its_bound_is_flagged),
     ("test_solid_launches_take_fixed_grids", test_solid_launches_take_fixed_grids),
     ("test_job_grids_take_each_entry_once", test_job_grids_take_each_entry_once),

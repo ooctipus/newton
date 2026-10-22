@@ -2202,9 +2202,10 @@ def terrain_hold_row(
 def terrain_plane_group_of_three(out: TerrainLawRows, slot: int, held: int, eps: float) -> bool:
     """Whether three of a pair's held rows share a plane group, as the finish groups them (its first row of a plane
     represents it, :func:`terrain_rows_same_plane`): only such a group can lose rows to the finish's implied-row and
-    per-group steps."""
+    per-group steps. Up to 32 held rows (a group's members counted in 4 bits, two 64-bit words)."""
     representatives = int(0)
-    sizes = int(0)
+    low = wp.int64(0)
+    high = wp.int64(0)
     for i in range(held):
         qi = out.q[slot + i]
         ni = out.n[slot + i]
@@ -2216,9 +2217,17 @@ def terrain_plane_group_of_three(out: TerrainLawRows, slot: int, held: int, eps:
                     break
         if group == i:
             representatives = representatives | (1 << i)
-        if ((sizes >> (4 * group)) & 15) >= 2:
-            return True
-        sizes = sizes + (1 << (4 * group))
+        # 4-bit member counts: groups 0-15 in the low word, 16-31 in the high one
+        if group < 16:
+            shift = wp.int64(4 * group)
+            if ((low >> shift) & wp.int64(15)) >= wp.int64(2):
+                return True
+            low = low + (wp.int64(1) << shift)
+        else:
+            shift = wp.int64(4 * (group - 16))
+            if ((high >> shift) & wp.int64(15)) >= wp.int64(2):
+                return True
+            high = high + (wp.int64(1) << shift)
     return False
 
 
