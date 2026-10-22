@@ -16,7 +16,10 @@ One struct per partner class, each with overloads of the same functions, which t
 * rule X's candidate deepest points: :func:`core_exit_point` (tried as they are: corners, hull points, a cone's
   apex), :func:`core_support_point` (the ends of the lowest generator along a normal) and :func:`core_far_point`
   (the local maxima of the distance from a terrain vertex: per rim its farthest point, an ellipsoid's one or two);
-* :func:`core_bounds` (axis-aligned bounds) and :func:`core_sphere` (a bounding sphere).
+* :func:`core_bounds` (axis-aligned bounds), :func:`core_sphere` (a bounding sphere), :func:`core_capsule` (a bounding
+  capsule: a box's longest axis, a cylinder's or cone's axis, a hull's or ellipsoid's bounding box's longest axis) and
+  :func:`core_sigma_bound` (a lower bound of :func:`core_sigma` in closed form: the value itself, or for a hull its
+  bounding box's).
 
 Every definition is the float64 law's (``newton/tests/terrain_law_reference.py``), in float32: the plane manifolds are
 Newton's analytic plane queries (a box's four deepest corners, the cylinder's deepest rim point with a tripod or the
@@ -151,6 +154,11 @@ class TerrainHullCore:
     """The largest distance of a point from the centre (scaled), or the largest semi-axis."""
     start: int
     """A hull's point lowest along the heightfield's up axis (global index): where support searches start."""
+    box_c: wp.vec3
+    """Centre of the core's bounding box in its frame (scaled; an ellipsoid's 0): the box ``c + rot (box_c + [-box_h,
+    box_h])`` contains the core (:func:`core_sigma_bound`, :func:`core_capsule`)."""
+    box_h: wp.vec3
+    """Half extents of the core's bounding box in its frame (scaled; an ellipsoid's semi-axes)."""
     table: TerrainHullTable
 
 
@@ -170,6 +178,8 @@ class TerrainHullCoreRecord:
     triangle_count: int
     radius: float
     start: int
+    box_c: wp.vec3
+    box_h: wp.vec3
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -397,6 +407,26 @@ def core_bounds(core: TerrainBoxCore) -> tuple[wp.vec3, wp.vec3]:
 def core_sphere(core: TerrainBoxCore) -> tuple[wp.vec3, float]:
     """A sphere containing the core: centre and radius."""
     return core.c, wp.length(core.h)
+
+
+@wp.func
+def core_sigma_bound(core: TerrainBoxCore, n: wp.vec3, p0: wp.vec3) -> float:
+    """A lower bound of :func:`core_sigma` in closed form (a box's: the value itself)."""
+    return core_sigma(core, n, p0)
+
+
+@wp.func
+def core_capsule(core: TerrainBoxCore) -> tuple[wp.vec3, wp.vec3, float]:
+    """A capsule containing the core: its axis's ends and radius (a box: its longest axis through the centre, the
+    radius its cross-section's half diagonal)."""
+    k = int(0)
+    if core.h[1] > core.h[k]:
+        k = 1
+    if core.h[2] > core.h[k]:
+        k = 2
+    axis = wp.vec3(core.rot[0, k], core.rot[1, k], core.rot[2, k]) * core.h[k]
+    radius = wp.sqrt(wp.max(wp.dot(core.h, core.h) - core.h[k] * core.h[k], 0.0))
+    return core.c - axis, core.c + axis, radius
 
 
 @wp.func
@@ -714,6 +744,18 @@ def core_bounds(core: TerrainCylinderCore) -> tuple[wp.vec3, wp.vec3]:
 @wp.func
 def core_sphere(core: TerrainCylinderCore) -> tuple[wp.vec3, float]:
     return core.c, wp.sqrt(core.r * core.r + core.h * core.h)
+
+
+@wp.func
+def core_sigma_bound(core: TerrainCylinderCore, n: wp.vec3, p0: wp.vec3) -> float:
+    """A lower bound of :func:`core_sigma` in closed form (a cylinder's or cone's: the value itself)."""
+    return core_sigma(core, n, p0)
+
+
+@wp.func
+def core_capsule(core: TerrainCylinderCore) -> tuple[wp.vec3, wp.vec3, float]:
+    """A capsule containing the core: its axis (a cone's from its base centre to its apex) and radius."""
+    return core.c - core.h * core.a, core.c + core.h * core.a, core.r
 
 
 @wp.func
@@ -1260,6 +1302,35 @@ def core_bounds(core: TerrainHullCore) -> tuple[wp.vec3, wp.vec3]:
 @wp.func
 def core_sphere(core: TerrainHullCore) -> tuple[wp.vec3, float]:
     return core.c, core.radius
+
+
+@wp.func
+def core_capsule(core: TerrainHullCore) -> tuple[wp.vec3, wp.vec3, float]:
+    """A capsule containing the core: its bounding box's longest axis through the box's centre, the radius the box's
+    cross-section's half diagonal."""
+    h = core.box_h
+    k = int(0)
+    if h[1] > h[k]:
+        k = 1
+    if h[2] > h[k]:
+        k = 2
+    centre = core.c + core.rot @ core.box_c
+    axis = wp.vec3(core.rot[0, k], core.rot[1, k], core.rot[2, k]) * h[k]
+    radius = wp.sqrt(wp.max(wp.dot(h, h) - h[k] * h[k], 0.0))
+    return centre - axis, centre + axis, radius
+
+
+@wp.func
+def core_sigma_bound(core: TerrainHullCore, n: wp.vec3, p0: wp.vec3) -> float:
+    """A lower bound of :func:`core_sigma` in closed form: an ellipsoid's value itself, a hull's its bounding box's
+    (``core.box_c``, ``core.box_h``), which contains it, so that no support search runs."""
+    if core.ellipsoid != 0:
+        return core_sigma(core, n, p0)
+    m = wp.transpose(core.rot) @ n
+    h = core.box_h
+    return wp.dot(n, core.c + core.rot @ core.box_c - p0) - (
+        h[0] * wp.abs(m[0]) + h[1] * wp.abs(m[1]) + h[2] * wp.abs(m[2])
+    )
 
 
 @wp.func

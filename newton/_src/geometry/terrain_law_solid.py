@@ -202,6 +202,7 @@ from .terrain_law_cores import (
     TerrainHullTable,
     closest_on_triangle,
     core_bounds,
+    core_capsule,
     core_exit_count,
     core_exit_point,
     core_far_count,
@@ -214,6 +215,7 @@ from .terrain_law_cores import (
     core_recovery_point,
     core_reference_crossing,
     core_sigma,
+    core_sigma_bound,
     core_sigma_near,
     core_slope,
     core_slope_near,
@@ -944,6 +946,90 @@ def _edge_arc(
 
 
 @wp.func
+def _edge_reach(
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    pair: _Pair,
+    r: int,
+    c: int,
+    which: int,
+    n_a: wp.vec3,
+    n_b: wp.vec3,
+) -> bool:
+    """Rule E's pre-bounds of a crease past its arc tests (:func:`_edge_arc`, its normal arc ``n_a`` to ``n_b``), from
+    closed-form lower bounds of the core's support values
+    (:func:`~newton._src.geometry.terrain_law_cores.core_sigma_bound`: the values themselves for boxes, cylinders,
+    cones and ellipsoids, a hull's bounding box's, so that no support search runs) before the ``theta*`` search:
+    ``False`` for a crease that holds no row at any normal of its arc.
+
+    Every row of a crease lies where a point of the core's support feature at ``theta*`` meets the crease's line, in
+    the plane through the line and ``theta*`` (within ``tol``; a reference feature at an arc end straddles it):
+
+    * along the crease, at ``x`` in ``[0, length]``, ``x`` the projection of core points on the edge's direction
+      ``dh`` (an interval end, or a point between two): a core whose extent along ``dh`` misses the segment by more than
+      the rounding of both holds none;
+    * across, at a core point ``k`` with ``e2 . (k - v0)`` within ``tol`` of 0, ``e2 = n x dh`` the normal of that plane:
+      every ``e2`` of the arc is a combination ``alpha e2_a + beta e2_b`` of its ends' with ``alpha, beta >= 0`` and
+      ``alpha + beta >= 1``, so a core lying beyond ``tol`` on one side of both ends' planes lies beyond it on that side
+      of every plane of the arc, and no point of it meets the line;
+    * both at once: such a point lies over the segment, within the radius of the core's capsule
+      (:func:`~newton._src.geometry.terrain_law_cores.core_capsule`) of a point of the capsule's axis over the segment
+      widened by that radius; that clipped axis lying beyond ``tol`` plus the radius on one side of both ends' planes
+      leaves no such point.
+
+    Each test is exact: it rejects only creases that the ``theta*`` search and the crossing (:func:`_edge_rows_at`)
+    would leave without a row, with every float32 rounding of both sides inside its margin.
+    """
+    v0i, v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
+    v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
+    v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
+    e = v1 - v0
+    length = wp.sqrt(wp.dot(e, e))
+    dh = e / length
+    # float32 rounding of the support values, the crossing's coordinates and the arc's normals: far below 4 bands
+    margin = pair.tol + 4.0 * pair.eps
+    if core_sigma_bound(core, dh, v0) > length + margin or core_sigma_bound(core, -dh, v0) > margin:
+        return False
+    e_a = wp.cross(n_a, dh)
+    e_b = wp.cross(n_b, dh)
+    if core_sigma_bound(core, e_a, v0) > margin and core_sigma_bound(core, e_b, v0) > margin:
+        return False
+    if core_sigma_bound(core, -e_a, v0) > margin and core_sigma_bound(core, -e_b, v0) > margin:
+        return False
+    p0, p1, radius = core_capsule(core)
+    x0 = wp.dot(p0 - v0, dh)
+    x1 = wp.dot(p1 - v0, dh)
+    lo = -radius - margin
+    hi = length + radius + margin
+    t0 = float(0.0)
+    t1 = float(1.0)
+    run = x1 - x0
+    if run > 0.0:
+        t0 = wp.max(t0, (lo - x0) / run)
+        t1 = wp.min(t1, (hi - x0) / run)
+    elif run < 0.0:
+        t0 = wp.max(t0, (hi - x0) / run)
+        t1 = wp.min(t1, (lo - x0) / run)
+    elif x0 < lo or x0 > hi:
+        return False
+    if t0 > t1:
+        return False
+    q0 = p0 + t0 * (p1 - p0) - v0
+    q1 = p0 + t1 * (p1 - p0) - v0
+    bound = margin + radius
+    ya0 = wp.dot(q0, e_a)
+    ya1 = wp.dot(q1, e_a)
+    yb0 = wp.dot(q0, e_b)
+    yb1 = wp.dot(q1, e_b)
+    if wp.min(ya0, ya1) > bound and wp.min(yb0, yb1) > bound:
+        return False
+    if wp.max(ya0, ya1) < -bound and wp.max(yb0, yb1) < -bound:
+        return False
+    return True
+
+
+@wp.func
 def _edge_rows(
     core: Any,
     data: TerrainFeatureData,
@@ -1090,7 +1176,7 @@ def _solid_edge(
     if not _edge_cheap(data, window, pair, r, c, which):
         return planes, sink
     planes, ok, n_a, n_b, sigma_a, sigma_b = _edge_arc(core, data, window, planes, pair, r, c, which)
-    if not ok:
+    if not ok or not _edge_reach(core, data, window, pair, r, c, which, n_a, n_b):
         return planes, sink
     return _edge_rows(core, data, window, planes, pair, sink, store, r, c, which, n_a, n_b, sigma_a, sigma_b)
 
@@ -2592,16 +2678,15 @@ def solid_face_job(
 def solid_edge_job(
     core: Any, data: TerrainFeatureData, out: TerrainLawRows, jobs: TerrainSolidJobs, pair_index: int, i: int, item: int
 ):
-    """Rule E's crease tests of a listed edge (:func:`_edge_arc`); a convex crease whose arc can hold a row within
-    reach is listed for ``theta*`` (:func:`solid_theta_job`)."""
+    """Rule E's crease tests of a listed edge (:func:`_edge_arc`) and its pre-bounds (:func:`_edge_reach`); a convex
+    crease whose arc can hold a row within reach is listed for ``theta*`` (:func:`solid_theta_job`)."""
     record, window = solid_job_window(data, jobs, i)
     vertex = item // _ITEMS
     rc = _job_vertex(record.cells, vertex)
+    which = item - vertex * _ITEMS - 2
     planes = terrain_planes()
-    planes, ok, _n_a, _n_b, _sigma_a, _sigma_b = _edge_arc(
-        core, data, window, planes, record.pair, rc[0], rc[1], item - vertex * _ITEMS - 2
-    )
-    if not ok:
+    planes, ok, n_a, n_b, _sigma_a, _sigma_b = _edge_arc(core, data, window, planes, record.pair, rc[0], rc[1], which)
+    if not ok or not _edge_reach(core, data, window, record.pair, rc[0], rc[1], which, n_a, n_b):
         return
     entry = wp.atomic_add(jobs.counts, _THETAS, 1)
     if entry < jobs.thetas.shape[0]:

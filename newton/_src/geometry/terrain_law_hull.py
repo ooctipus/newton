@@ -48,6 +48,8 @@ def _core(local: wp.transform, size: wp.vec4, kind: int, partner: int, solids: T
     if kind == _ELLIPSOID:
         core.ellipsoid = 1
         core.radius = wp.max(core.s[0], wp.max(core.s[1], core.s[2]))
+        core.box_c = wp.vec3(0.0)
+        core.box_h = core.s
         return True, core
     if kind != _CONVEX_MESH:
         return False, core
@@ -68,14 +70,23 @@ def _core(local: wp.transform, size: wp.vec4, kind: int, partner: int, solids: T
     radius = float(0.0)
     core.start = core.point_begin
     low = wp.dot(solids.hulls.points[core.point_begin], up)
+    # the bounding box in the core's frame, of the scaled points as the core's points take them
+    box_lo = wp.cw_mul(solids.hulls.points[core.point_begin], core.s)
+    box_hi = box_lo
     for i in range(core.point_begin, core.point_begin + core.point_count):
         p = solids.hulls.points[i]
-        radius = wp.max(radius, wp.length(wp.cw_mul(p, core.s)))
+        ps = wp.cw_mul(p, core.s)
+        radius = wp.max(radius, wp.length(ps))
+        box_lo = wp.min(box_lo, ps)
+        box_hi = wp.max(box_hi, ps)
         value = wp.dot(p, up)
         if value < low:
             low = value
             core.start = i
     core.radius = radius
+    # centre and half extents, the half extents rounded up so that the box holds every point in float32
+    core.box_c = 0.5 * (box_lo + box_hi)
+    core.box_h = 0.5 * (box_hi - box_lo) * (1.0 + 4.0 * 1.1920929e-07) + wp.vec3(1.0e-9)
     return True, core
 
 
@@ -95,6 +106,8 @@ def _core_save(jobs: TerrainSolidJobs, i: int, core: TerrainHullCore):
     record.triangle_count = core.triangle_count
     record.radius = core.radius
     record.start = core.start
+    record.box_c = core.box_c
+    record.box_h = core.box_h
     jobs.hull_cores[i] = record
 
 
@@ -115,6 +128,8 @@ def _core_load(jobs: TerrainSolidJobs, i: int, solids: TerrainSolidData) -> Terr
     core.triangle_count = record.triangle_count
     core.radius = record.radius
     core.start = record.start
+    core.box_c = record.box_c
+    core.box_h = record.box_h
     core.table = solids.hulls
     return core
 
