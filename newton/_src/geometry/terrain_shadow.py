@@ -18,8 +18,10 @@ scene level from its pairs' own bounds (:func:`~newton._src.geometry.terrain_law
 which ``NEWTON_TERRAIN_LAW_SHADOW_JOBS`` scales. Every collide then launches, after today's terrain route, each listed
 class's kernels (:data:`TERRAIN_LAW_KERNELS`) and a check of the spill region and the job lists, with dimensions fixed
 at construction (:meth:`TerrainLawShadow.describe` records them): no host read, no allocation, no scan, so it runs
-inside CUDA graph capture. Today's route still produces every contact; the shadow's rows are read only by
-:meth:`TerrainLawShadow.rows`.
+inside CUDA graph capture. In shadow, today's route still produces every contact and the rows are read only by
+:meth:`TerrainLawShadow.rows`. With ``NEWTON_TERRAIN_LAW`` listing classes instead, the same object writes the rows of
+its pairs as their contacts (:meth:`TerrainLawShadow.write_contacts`, :func:`terrain_law_contact_kernel`) and the
+narrow phase drops those pairs (:meth:`TerrainLawShadow.written_pairs`).
 
 The per-type kernels take ``(begin, slot_begin, inputs, data, out)``
 (:class:`~newton._src.geometry.terrain_law.TerrainPairInputs`,
@@ -90,10 +92,12 @@ from __future__ import annotations
 
 import importlib
 import time
+from typing import Any
 
 import numpy as np
 import warp as wp
 
+from .contact_data import ContactData
 from .terrain_contacts import (
     TERRAIN_LANE_THREAD,
     TERRAIN_LANE_TILE,
@@ -117,12 +121,14 @@ from .terrain_law import (
     TERRAIN_PAIR_TILE_EXIT,
     TERRAIN_PAIR_UNSUPPORTED,
     TERRAIN_PAIR_WIDE,
+    TerrainLawRows,
     TerrainPairInputs,
     terrain_finish_scratch,
     terrain_law_block_dim,
     terrain_law_rows,
     terrain_pair_work,
 )
+from .types import GeoType
 
 TERRAIN_LAW_CLASS_NAMES = {
     "point": TERRAIN_PARTNER_POINT,
@@ -261,12 +267,14 @@ def terrain_law_class_name(partner_class: int) -> str:
     return next(name for name, value in TERRAIN_LAW_CLASS_NAMES.items() if value == partner_class)
 
 
-def parse_terrain_law_shadow(value: str | None) -> tuple[int, ...]:
-    """Return the partner classes a ``NEWTON_TERRAIN_LAW_SHADOW`` value lists, sorted (empty for none).
+def parse_terrain_law_shadow(value: str | None, flag: str = "NEWTON_TERRAIN_LAW_SHADOW") -> tuple[int, ...]:
+    """Return the partner classes a ``NEWTON_TERRAIN_LAW_SHADOW`` (or ``NEWTON_TERRAIN_LAW``) value lists, sorted
+    (empty for none).
 
     Args:
         value: Comma-separated names of :data:`TERRAIN_LAW_CLASS_NAMES`, or ``all`` for every class with a
             kernel; ``None`` or blank for none.
+        flag: The variable's name, for the errors.
 
     Raises:
         ValueError: On an unknown name, or a named class without a kernel yet.
@@ -282,12 +290,12 @@ def parse_terrain_law_shadow(value: str | None) -> tuple[int, ...]:
             continue
         if name not in TERRAIN_LAW_CLASS_NAMES:
             raise ValueError(
-                f"NEWTON_TERRAIN_LAW_SHADOW names unknown partner class {name!r}; "
+                f"{flag} names unknown partner class {name!r}; "
                 f"use a comma-separated list of {sorted(TERRAIN_LAW_CLASS_NAMES)} or 'all'"
             )
         partner_class = TERRAIN_LAW_CLASS_NAMES[name]
         if partner_class not in TERRAIN_LAW_KERNELS:
-            raise ValueError(f"NEWTON_TERRAIN_LAW_SHADOW: the terrain law has no kernel for {name!r} yet")
+            raise ValueError(f"{flag}: the terrain law has no kernel for {name!r} yet")
         classes.add(partner_class)
     return tuple(sorted(classes))
 
@@ -414,6 +422,94 @@ def terrain_law_spill_check(
                     counters[jobs + k],
                     capacities[k],
                 )
+
+
+_CONTACT_KERNELS = {}
+
+_CONTACTS_OVERFLOWED = wp.constant(1024)
+"""The ``contacts`` bit of the narrow phase's buffer status word (``verify_narrow_phase_buffers``), which checks the
+contact buffer before the law writes."""
+
+
+def terrain_law_contact_kernel(writer_func: Any):
+    """Return the kernel that writes the law's rows as contacts through a contact writer (``NEWTON_TERRAIN_LAW``).
+
+    One thread per written pair (``written``, table indices): its rows pass the writer's gap admission (the surface
+    distance ``d - r`` beyond both margins within both gaps, ``r`` the radius of a sphere or capsule partner, else 0),
+    one reservation takes the admitted rows' contacts, and the writer writes each at its index. A contact's shape A is
+    the heightfield, its normal the row's (terrain to partner), its points the terrain point ``q`` and the partner's
+    core point ``q + d n`` (a sphere or capsule partner's ``radius_eff_b`` is ``r``) and its ``sort_sub_key`` the row's
+    window-local feature id.
+
+    Args:
+        writer_func: Contact writer ``(ContactData, writer_data, output_index)`` that writes at a given index
+            ``output_index >= 0`` without admission.
+    """
+    kernel = _CONTACT_KERNELS.get(writer_func)
+    if kernel is not None:
+        return kernel
+
+    @wp.kernel(enable_backward=False, module=f"terrain_law_contacts_{writer_func.key}")
+    def terrain_law_write_contacts(
+        written: wp.array[wp.int32],
+        pairs: wp.array[wp.vec2i],
+        rows: TerrainLawRows,
+        shape_type: wp.array[wp.int32],
+        shape_data: wp.array[wp.vec4],
+        writer_data: Any,
+    ):
+        pair = written[wp.tid()]
+        count = rows.count[pair]
+        if count <= 0:
+            return
+        first = rows.first[pair]
+        hfield = pairs[pair][0]
+        partner = pairs[pair][1]
+        radius = float(0.0)
+        kind = shape_type[partner]
+        if kind == GeoType.SPHERE or kind == GeoType.CAPSULE:
+            radius = shape_data[partner][0]
+        margin_a = shape_data[hfield][3]
+        margin_b = shape_data[partner][3]
+        gap = writer_data.shape_gap[hfield] + writer_data.shape_gap[partner]
+        admitted = int(0)
+        for i in range(count):
+            if rows.d[first + i] - radius - margin_a - margin_b <= gap:
+                admitted += 1
+        if admitted == 0:
+            return
+        index = wp.atomic_add(writer_data.contact_count, 0, admitted)
+        if index + admitted > writer_data.contact_max:
+            # The writer drops the contacts past the buffer; raise the narrow phase's contacts bit, warn once.
+            wp.atomic_or(rows.status, 0, _CONTACTS_OVERFLOWED)
+            if index <= writer_data.contact_max:
+                wp.printf(
+                    "Warning: Contact buffer overflowed by the terrain law's contacts: %d > %d.\n",
+                    index + admitted,
+                    writer_data.contact_max,
+                )
+        contact = ContactData()
+        contact.shape_a = hfield
+        contact.shape_b = partner
+        contact.radius_eff_a = 0.0
+        contact.radius_eff_b = radius
+        contact.margin_a = margin_a
+        contact.margin_b = margin_b
+        contact.gap_sum = gap
+        for i in range(count):
+            d = rows.d[first + i]
+            if d - radius - margin_a - margin_b > gap:
+                continue
+            n = rows.n[first + i]
+            contact.contact_normal_a_to_b = n
+            contact.contact_distance = d - radius
+            contact.contact_point_center = rows.q[first + i] + (0.5 * (d - radius)) * n
+            contact.sort_sub_key = rows.feature[first + i]
+            writer_func(contact, writer_data, index)
+            index += 1
+
+    _CONTACT_KERNELS[writer_func] = terrain_law_write_contacts
+    return terrain_law_write_contacts
 
 
 def parse_terrain_law_shadow_rows(value: str | None) -> int | None:
@@ -669,6 +765,28 @@ class TerrainLawShadow:
         self.build_seconds = time.perf_counter() - started
         """Host time of the construction [s]: features, pair table, kernel modules imported and buffers."""
 
+    def written_pairs(self, model) -> tuple[np.ndarray, np.ndarray]:
+        """Return what the law writes when it feeds the solver (``NEWTON_TERRAIN_LAW``): per shape, 1 for a partner
+        whose heightfield pairs it writes (else 0), and the table indices of those pairs.
+
+        Every listed pair is written but those whose partner has no core yet
+        (:data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_UNSUPPORTED`: in the hull class, a shape that is
+        neither a convex hull nor an ellipsoid), which stay with the terrain route.
+
+        Args:
+            model: The finalized model the law was built for.
+        """
+        listed = self._listed
+        partners = self.table.pairs_host[listed, 1].astype(np.int64)
+        written = np.ones(len(listed), bool)
+        if any(c in TERRAIN_LAW_SOLID_CLASSES for c in self.classes):
+            from .terrain_law_solid import terrain_solid_unsupported  # noqa: PLC0415
+
+            written = ~terrain_solid_unsupported(self.table.partner_class[listed], model.shape_type.numpy()[partners])
+        partner = np.zeros(model.shape_count, np.int32)
+        partner[partners[written]] = 1
+        return partner, listed[written].astype(np.int32)
+
     def default_spill_rows(self) -> int:
         """Return the spill region's rows by default, from the listed pairs' own bounds on their rows
         (:func:`~newton._src.geometry.terrain_contacts.terrain_pair_candidates`, from each pair's shape extent, reach
@@ -736,6 +854,29 @@ class TerrainLawShadow:
             terrain_law_spill_check,
             dim=1,
             inputs=[self._counters, _SPILLED, self.spill_rows, _JOBS, self._capacities],
+            device=self.device,
+            record_tape=False,
+        )
+
+    def write_contacts(
+        self, written: wp.array, shape_type: wp.array, shape_data: wp.array, writer_func: Any, writer_data: Any
+    ) -> None:
+        """Write the rows of the last :meth:`launch` as contacts (graph-capture safe), for the pairs
+        :meth:`written_pairs` returns (:func:`terrain_law_contact_kernel`).
+
+        Args:
+            written: Table indices of the pairs to write (int32).
+            shape_type: Geometry type of every shape.
+            shape_data: Per shape, scale ``xyz`` and margin ``w``, current for this collide.
+            writer_func: Contact writer that writes at a given index without admission.
+            writer_data: The writer's data (its contact counter, gaps and output arrays).
+        """
+        if written.shape[0] == 0:
+            return
+        wp.launch(
+            terrain_law_contact_kernel(writer_func),
+            dim=written.shape[0],
+            inputs=[written, self.table.pairs, self._out, shape_type, shape_data, writer_data],
             device=self.device,
             record_tape=False,
         )

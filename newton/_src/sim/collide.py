@@ -2006,20 +2006,33 @@ class CollisionPipeline:
             raise ValueError("coherent convex diagnostics require NEWTON_NARROW_PHASE_COHERENT_CONVEX=reject_only")
         if convex_cells == "1" and coherent_convex != "reject_only":
             raise ValueError("experimental convex cells require the complete rejection-only owner")
-        # Partner classes whose terrain-law kernels run in shadow, beside today's terrain route (none by default).
+        # Partner classes whose terrain-law kernels run in shadow, beside today's terrain route, or whose heightfield
+        # pairs the law writes instead of the terrain route (none by default; one of the two flags at most).
         terrain_law_shadow = os.environ.get("NEWTON_TERRAIN_LAW_SHADOW", "")
+        terrain_law_writes = os.environ.get("NEWTON_TERRAIN_LAW", "")
+        if terrain_law_shadow.strip() and terrain_law_writes.strip():
+            raise ValueError(
+                "NEWTON_TERRAIN_LAW and NEWTON_TERRAIN_LAW_SHADOW are both set; the law either writes its partners' "
+                "contacts or runs in shadow: unset one"
+            )
         self._terrain_law_shadow = None
         self._terrain_law_shadow_reason = None
+        self._terrain_law_writes = bool(terrain_law_writes.strip())
+        """Whether the law writes the contacts of its partners' heightfield pairs (``NEWTON_TERRAIN_LAW``)."""
+        self._terrain_law_listed = None
         terrain_law_spill_rows = None
         terrain_law_job_scale = None
-        if terrain_law_shadow.strip():
+        if terrain_law_shadow.strip() or terrain_law_writes.strip():
             from ..geometry.terrain_shadow import (  # noqa: PLC0415
                 parse_terrain_law_shadow,
                 parse_terrain_law_shadow_jobs,
                 parse_terrain_law_shadow_rows,
             )
 
-            terrain_law_classes = parse_terrain_law_shadow(terrain_law_shadow)
+            if self._terrain_law_writes:
+                terrain_law_classes = parse_terrain_law_shadow(terrain_law_writes, flag="NEWTON_TERRAIN_LAW")
+            else:
+                terrain_law_classes = parse_terrain_law_shadow(terrain_law_shadow)
             # The rows of its scene-level spill region (default: TerrainLawShadow.default_spill_rows()).
             terrain_law_spill_rows = parse_terrain_law_shadow_rows(os.environ.get("NEWTON_TERRAIN_LAW_SHADOW_ROWS", ""))
             # The factor on its solid classes' job capacities (default 1: terrain_solid_job_capacities()).
@@ -2705,12 +2718,17 @@ class CollisionPipeline:
         else:
             self._terrain_cells_reason = f"convex_collision={convex_collision!r} does not request terrain cells."
 
-        # The terrain law in shadow: built once here, outside capture; collide() launches it after the narrow phase.
+        # The terrain law, in shadow or writing its partners' contacts: built once here, outside capture; collide()
+        # launches it after the narrow phase.
         if not terrain_law_classes:
             self._terrain_law_shadow_reason = "Off: NEWTON_TERRAIN_LAW_SHADOW lists no partner class."
         elif not self.narrow_phase.has_heightfields:
             self._terrain_law_shadow_reason = "No heightfield pair: the listed classes have nothing to run on."
         else:
+            if self._terrain_law_writes and self._speculative_enabled:
+                raise ValueError(
+                    "NEWTON_TERRAIN_LAW does not write speculative contacts yet; unset it or speculative_config"
+                )
             from ..geometry.terrain_shadow import TerrainLawShadow  # noqa: PLC0415
 
             shadow = TerrainLawShadow(
@@ -2723,6 +2741,16 @@ class CollisionPipeline:
             )
             if shadow.features is None:
                 self._terrain_law_shadow_reason = "No heightfield pair has a partner of the listed classes."
+            elif self._terrain_law_writes:
+                self._terrain_law_shadow = shadow
+                partner, written = shadow.written_pairs(model)
+                self._terrain_law_listed = wp.array(written, dtype=wp.int32, device=device)
+                self.narrow_phase.set_terrain_law_partners(wp.array(partner, dtype=wp.int32, device=device))
+                self._terrain_law_shadow_reason = (
+                    "NEWTON_TERRAIN_LAW: the law writes the contacts of its partners' heightfield pairs after the "
+                    "narrow phase, and the terrain route drops those pairs; a partner without a core in the law keeps "
+                    "the terrain route."
+                )
             else:
                 self._terrain_law_shadow = shadow
                 self._terrain_law_shadow_reason = (
@@ -4131,7 +4159,7 @@ class CollisionPipeline:
         )
 
         if self._terrain_law_shadow is not None:
-            # Beside today's terrain route: rows into the shadow's side buffer, under the broad phase's pair policy.
+            # Beside today's terrain route: rows into the law's side buffer, under the broad phase's pair policy.
             self._terrain_law_shadow.launch(
                 self.geom_transform,
                 self.geom_data,
@@ -4140,6 +4168,11 @@ class CollisionPipeline:
                 shape_heightfield_index=model.shape_heightfield_index,
                 **pair_filter,
             )
+            if self._terrain_law_writes:
+                # The pairs the narrow phase dropped: their rows become contacts, before sorting and reduction.
+                self._terrain_law_shadow.write_contacts(
+                    self._terrain_law_listed, model.shape_type, self.geom_data, write_contact, writer_data
+                )
 
         reducer = self.narrow_phase.global_contact_reducer
         if reducer is not None:
