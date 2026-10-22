@@ -387,7 +387,7 @@ def test_vertex_bits_match_their_clusters(test, device):
 
     The build computes a vertex's bits in its own window; here they are computed again in another (the feature test
     reads cluster normals, which no window changes) and must be equal, bit for bit. Every edge code (crease, flat,
-    border) and both feature answers occur.
+    border, a crease concave in every window frame) and both feature answers occur.
     """
     rng = np.random.default_rng(9)
     heights = tu.suite_like_heights(rng, 64, 64)
@@ -400,7 +400,7 @@ def test_vertex_bits_match_their_clusters(test, device):
     stored = stored.reshape(info.nrow, info.ncol).astype(np.int64)
     np.testing.assert_array_equal(stored, out.numpy())
     codes = np.concatenate([((stored >> (2 * which)) & 3).ravel() for which in range(3)])
-    test.assertEqual(set(np.unique(codes).tolist()), {0, 1, 2})
+    test.assertEqual(set(np.unique(codes).tolist()), {0, 1, 2, 3})
     feature = (stored & int(TERRAIN_VERTEX_FEATURE_BIT)) != 0
     test.assertTrue(np.any(feature) and not np.all(feature))
 

@@ -165,6 +165,7 @@ from .terrain_law import (
     terrain_crease_class,
     terrain_defer_pair,
     terrain_edge_kind,
+    terrain_edge_open_crease,
     terrain_edge_sides,
     terrain_eps,
     terrain_feature_id,
@@ -865,9 +866,9 @@ def _theta_star(
 def _edge_cheap(data: TerrainFeatureData, window: TerrainWindow, pair: _Pair, r: int, c: int, which: int) -> bool:
     """Rule E's cheapest rejects of edge ``which`` of vertex ``(r, c)``, from its vertices and the core's sphere alone:
     ``False`` for an edge that gives no row (not a crease, below the core, the sphere off the crease's segment)."""
-    surface = window.surface
-    if terrain_edge_kind(data, surface, r, c, which) >= 0:
-        # flat inside one cluster, or on the border: no crease
+    if not terrain_edge_open_crease(data, window, r, c, which):
+        # flat inside one cluster, or on the border: no crease; or a valley in this window's frame by its static class,
+        # which the crease tests reject (:func:`_edge_arc`)
         return False
     v0i, v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
     v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
