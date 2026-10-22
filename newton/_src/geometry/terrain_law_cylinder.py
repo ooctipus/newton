@@ -9,9 +9,11 @@ The kernels are :func:`~newton._src.geometry.terrain_law_solid.solid_kernels`'s 
 :func:`terrain_cylinder_rows_scan`, the job kernels :func:`terrain_cylinder_rows_faces`,
 :func:`terrain_cylinder_rows_edges`, :func:`terrain_cylinder_rows_thetas`, :func:`terrain_cylinder_rows_creases` and
 :func:`terrain_cylinder_rows_vertices` (one thread per listed feature), the close :func:`terrain_cylinder_rows_close`
-and rule R's :func:`terrain_cylinder_rows_recovery`, rule X's :func:`terrain_cylinder_rows_xitems`,
-:func:`terrain_cylinder_rows_xvalleys`, :func:`terrain_cylinder_rows_xdescents`, :func:`terrain_cylinder_rows_exit` and
-the finish kernel :func:`terrain_cylinder_rows_finish`, and last the pairs the others deferred:
+and rule R's :func:`terrain_cylinder_rows_recovery`, rule X's gate :func:`terrain_cylinder_rows_xbound`,
+:func:`terrain_cylinder_rows_xitems`, :func:`terrain_cylinder_rows_xvalleys`, :func:`terrain_cylinder_rows_xdescents`,
+:func:`terrain_cylinder_rows_xlean` (the pairs without a listed candidate) and :func:`terrain_cylinder_rows_exit`, the
+finish kernels :func:`terrain_cylinder_rows_small` (one thread per pair of few rows with a plane group of three) and
+:func:`terrain_cylinder_rows_finish` (a block of lanes per pair of many), and last the pairs the others deferred:
 :func:`terrain_cylinder_rows_pooled` finishes those with more distinct rows than the class's 16 walk slots from their
 pooled candidates, :func:`terrain_cylinder_rows_full` walks those whose work found no room. The walk, the rules and the
 finish are :mod:`~newton._src.geometry.terrain_law_solid`'s; the module is compiled without floating-point contraction,
@@ -22,7 +24,7 @@ from __future__ import annotations
 
 import warp as wp
 
-from .terrain_contacts import TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_WALK_SLOTS
+from .terrain_contacts import TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_SCAN_RUN, TERRAIN_PARTNER_WALK_SLOTS
 from .terrain_law_cores import TerrainCylinderCore
 from .terrain_law_solid import TerrainSolidData, TerrainSolidJobs, solid_kernels
 from .types import GeoType
@@ -61,7 +63,14 @@ def _core_load(jobs: TerrainSolidJobs, i: int, solids: TerrainSolidData) -> Terr
 
 
 _KERNELS = solid_kernels(
-    "cylinder", TERRAIN_PARTNER_CYLINDER, TERRAIN_CYLINDER_WALK_SLOTS, _core, _core_save, _core_load, __name__
+    "cylinder",
+    TERRAIN_PARTNER_CYLINDER,
+    TERRAIN_CYLINDER_WALK_SLOTS,
+    TERRAIN_PARTNER_SCAN_RUN[TERRAIN_PARTNER_CYLINDER],
+    _core,
+    _core_save,
+    _core_load,
+    __name__,
 )
 terrain_cylinder_rows = _KERNELS["rows"]
 terrain_cylinder_rows_scan = _KERNELS["scan"]
@@ -72,10 +81,13 @@ terrain_cylinder_rows_creases = _KERNELS["creases"]
 terrain_cylinder_rows_vertices = _KERNELS["vertices"]
 terrain_cylinder_rows_close = _KERNELS["close"]
 terrain_cylinder_rows_recovery = _KERNELS["recovery"]
+terrain_cylinder_rows_xbound = _KERNELS["xbound"]
 terrain_cylinder_rows_xitems = _KERNELS["xitems"]
 terrain_cylinder_rows_xvalleys = _KERNELS["xvalleys"]
 terrain_cylinder_rows_xdescents = _KERNELS["xdescents"]
+terrain_cylinder_rows_xlean = _KERNELS["xlean"]
 terrain_cylinder_rows_exit = _KERNELS["exit"]
+terrain_cylinder_rows_small = _KERNELS["small"]
 terrain_cylinder_rows_finish = _KERNELS["finish"]
 terrain_cylinder_rows_pooled = _KERNELS["pooled"]
 terrain_cylinder_rows_full = _KERNELS["full"]

@@ -126,8 +126,23 @@ TERRAIN_VERTEX_EDGE_FLAT = wp.constant(1)
 ``2 which`` and ``2 which + 1``, 0 for a crease)."""
 TERRAIN_VERTEX_EDGE_BORDER = wp.constant(2)
 """Two-bit code of a border edge in a vertex's bits."""
+TERRAIN_VERTEX_EDGE_CONCAVE = wp.constant(3)
+"""Two-bit code of a crease in a vertex's bits that every window frame of :data:`TERRAIN_CREASE_STATIC_CELLS` cells
+classes concave (:func:`terrain_crease_class`): its far vertex lies above its first triangle's cluster plane by more
+than every float32 rounding such a frame can give that test (:func:`terrain_crease_static`); 0 for any other crease."""
+TERRAIN_CREASE_STATIC_CELLS = 64
+"""Window-frame offset [cells] up to which a crease's static class (:data:`TERRAIN_VERTEX_EDGE_CONCAVE`) holds: every
+point the class test reads lies within this many cells of the window's reference vertex."""
+TERRAIN_CREASE_STATIC_ROUNDING = 64.0
+"""Float32 epsilons of the window-frame magnitudes by which a crease's far vertex must clear its first triangle's
+cluster plane to be concave in every frame (:func:`terrain_crease_static`): over six times the rounding a frame's test
+can take."""
 TERRAIN_VERTEX_FEATURE_BIT = wp.constant(64)
 """Bit of a vertex feature in a vertex's bits (:func:`terrain_vertex_feature`)."""
+TERRAIN_VERTEX_CREASE_UNSURE_BIT = wp.constant(128)
+"""Bit of a vertex in its bits when some of its creases of code 0 is not convex in every window frame of
+:data:`TERRAIN_CREASE_STATIC_CELLS` cells (:func:`terrain_crease_static`): without it, every crease of code 0 of the
+vertex is convex in every such frame."""
 
 TERRAIN_EDGE_X = wp.constant(0)
 """Edge ``(r, c)-(r, c + 1)``, between cell ``(r - 1, c)`` sub 1 and cell ``(r, c)`` sub 0."""
@@ -217,6 +232,9 @@ _BARYCENTRIC_TOLERANCE = wp.constant(TERRAIN_BARYCENTRIC_TOLERANCE)
 _NORMAL_SAME = wp.constant(TERRAIN_NORMAL_SAME)
 _VERTEX_SPAN = wp.constant(TERRAIN_VERTEX_SPAN)
 _CONE_BAND = wp.constant(TERRAIN_CONE_BAND)
+_CREASE_CELLS = wp.constant(TERRAIN_CREASE_STATIC_CELLS)
+_CREASE_ROUNDING = wp.constant(TERRAIN_CREASE_STATIC_ROUNDING)
+_CREASE_FLAT = wp.constant(TERRAIN_FLAT_EPS)
 _GROUP_ROWS = wp.constant(TERRAIN_GROUP_ROWS)
 
 
@@ -247,6 +265,11 @@ class TerrainSurfaceInfo:
     """Cell size along x [m] (float32 ``2 hx / (ncol - 1)``, as the narrow phase computes it)."""
     dy: float
     """Cell size along y [m]."""
+    dx64: wp.float64
+    """Cell size along x [m] in float64: ``2 hx / (ncol - 1)`` from the float32 ``hx`` (the window origin's and the
+    cluster planes' grid step, computed once on the host, bit for bit the device's float64 division)."""
+    dy64: wp.float64
+    """Cell size along y [m] in float64: ``2 hy / (nrow - 1)`` from the float32 ``hy``."""
     triangle_offset: int
     """First cluster id of the heightfield."""
     plane_offset: int
@@ -683,8 +706,8 @@ def terrain_window(data: TerrainFeatureData, heightfield: int, r0: int, c0: int)
     hx = wp.float64(surface.hx)
     hy = wp.float64(surface.hy)
     window.origin = wp.vec3d(
-        -hx + wp.float64(c0) * (wp.float64(2.0) * hx / wp.float64(surface.ncol - 1)),
-        -hy + wp.float64(r0) * (wp.float64(2.0) * hy / wp.float64(surface.nrow - 1)),
+        -hx + wp.float64(c0) * surface.dx64,
+        -hy + wp.float64(r0) * surface.dy64,
         wp.float64(window.z_ref),
     )
     window.eps = 0.0
@@ -766,8 +789,8 @@ def terrain_cluster_plane(
         ca = plane.anchor - ra * surface.ncol
         n = wp.normalize(wp.vec3(-plane.gx, -plane.gy, 1.0))
         # z(anchor) + offset + g . (reference - anchor) - z_ref; a gradient times a grid step count is exact.
-        dx = wp.float64(2.0) * wp.float64(surface.hx) / wp.float64(surface.ncol - 1)
-        dy = wp.float64(2.0) * wp.float64(surface.hy) / wp.float64(surface.nrow - 1)
+        dx = surface.dx64
+        dy = surface.dy64
         z = (
             (wp.float64(terrain_height(data, surface, ra, ca)) - wp.float64(window.z_ref))
             + wp.float64(plane.offset)
@@ -1098,11 +1121,121 @@ def _vertex_feature_of_planes(data: TerrainFeatureData, window: TerrainWindow, r
 
 
 @wp.func
+def _grid_point64(surface: TerrainSurfaceInfo, z: float, r: int, c: int) -> wp.vec3d:
+    """Vertex ``(r, c)`` at height ``z`` on the exact grid (heightfield-local, float64)."""
+    dx = wp.float64(2.0) * wp.float64(surface.hx) / wp.float64(surface.ncol - 1)
+    dy = wp.float64(2.0) * wp.float64(surface.hy) / wp.float64(surface.nrow - 1)
+    return wp.vec3d(wp.float64(c) * dx, wp.float64(r) * dy, wp.float64(z))
+
+
+@wp.func
+def terrain_crease_static(data: TerrainFeatureData, surface: TerrainSurfaceInfo, r: int, c: int, which: int) -> int:
+    """Return crease ``which`` of vertex ``(r, c)``'s class in every window frame whose points it reads lie within
+    :data:`TERRAIN_CREASE_STATIC_CELLS` cells of the window's reference vertex: 1 concave in all of them (the static
+    class of :data:`TERRAIN_VERTEX_EDGE_CONCAVE`), -1 convex in all of them, 0 when frames may disagree.
+
+    :func:`terrain_crease_class` takes ``n . (w_b - a)`` in float32 in a window frame: ``n`` the unit normal of the
+    first triangle's cluster plane, ``a`` its point over the reference vertex (a lone triangle's first vertex), ``w_b``
+    the second triangle's far vertex. Its exact value, ``n_z`` times the height of ``w_b`` over the plane, is the same
+    in every frame and is taken here in float64. The frame's coordinates lie within ``W = (cells + 1) max(dx, dy)``
+    across, its heights within ``H = |max_z - min_z| + flat`` of the reference vertex's, and the plane's point over the
+    reference vertex within ``H + sqrt(2) s W`` (``s`` the plane's slope): every rounding of the frame's test (its
+    inputs, its normal's normalization, a lone triangle's normal from rounded edges, its differences, products and
+    sums) stays below ``20 eps32 (1 + s) (W + H)``. The far vertex must clear the plane by
+    :data:`TERRAIN_CREASE_STATIC_ROUNDING` ``eps32 2 (1 + s) (W + H)``, over six times that, above the plane for the
+    concave class, below it for the convex one (the frame's test classes a value of 0 convex)."""
+    _v0i, _v1i, ta, tb, _wa, wb = terrain_edge_sides(r, c, which)
+    if not terrain_valid_cell(surface, ta[0], ta[1]) or not terrain_valid_cell(surface, tb[0], tb[1]):
+        return 0
+    w = _grid_point64(surface, terrain_height(data, surface, wb[0], wb[1]), wb[0], wb[1])
+    cluster = terrain_cluster(data, surface, ta[0], ta[1], ta[2])
+    value = wp.float64(0.0)
+    slope = wp.float64(0.0)
+    if cluster >= 0:
+        plane = data.planes[surface.plane_offset + cluster]
+        ra = plane.anchor // surface.ncol
+        ca = plane.anchor - ra * surface.ncol
+        anchor = _grid_point64(surface, terrain_height(data, surface, ra, ca), ra, ca)
+        gx = wp.float64(plane.gx)
+        gy = wp.float64(plane.gy)
+        height = anchor[2] + wp.float64(plane.offset) + gx * (w[0] - anchor[0]) + gy * (w[1] - anchor[1])
+        norm = wp.sqrt(gx * gx + gy * gy + wp.float64(1.0))
+        value = (w[2] - height) / norm
+        slope = wp.sqrt(gx * gx + gy * gy)
+    else:
+        a, b, d = terrain_triangle_vertices(ta[0], ta[1], ta[2])
+        pa = _grid_point64(surface, terrain_height(data, surface, a[0], a[1]), a[0], a[1])
+        pb = _grid_point64(surface, terrain_height(data, surface, b[0], b[1]), b[0], b[1])
+        pd = _grid_point64(surface, terrain_height(data, surface, d[0], d[1]), d[0], d[1])
+        n = wp.cross(pb - pa, pd - pa)
+        if n[2] < wp.float64(0.0):
+            n = -n
+        length = wp.length(n)
+        if length <= wp.float64(0.0):
+            return 0
+        value = wp.dot(n, w - pa) / length
+        slope = wp.sqrt(n[0] * n[0] + n[1] * n[1]) / n[2]
+    cells = wp.float64(_CREASE_CELLS + 1)
+    span = cells * wp.max(wp.float64(surface.dx), wp.float64(surface.dy))
+    heights = wp.abs(wp.float64(surface.max_z) - wp.float64(surface.min_z)) + wp.float64(_CREASE_FLAT)
+    margin = (
+        wp.float64(_CREASE_ROUNDING)
+        * wp.float64(_EPS32)
+        * wp.float64(2.0)
+        * (wp.float64(1.0) + slope)
+        * (span + heights)
+    )
+    if value > margin:
+        return 1
+    if value < -margin:
+        return -1
+    return 0
+
+
+@wp.func
+def terrain_edge_open_crease(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, which: int) -> bool:
+    """Return whether edge ``which`` of window vertex ``(r, c)`` is a crease that may be convex in the window's frame:
+    not flat, not on the border (:func:`terrain_edge_kind`), and not of the static class
+    :data:`TERRAIN_VERTEX_EDGE_CONCAVE`, which every frame of :data:`TERRAIN_CREASE_STATIC_CELLS` cells classes concave
+    (:func:`terrain_crease_static`; farther from the reference vertex the frame's test decides). One read of the
+    vertex's bits."""
+    surface = window.surface
+    if r < 0 or c < 0 or r >= surface.nrow or c >= surface.ncol:
+        return terrain_edge_kind(data, surface, r, c, which) < 0
+    code = (terrain_vertex_bits(data, surface, r, c) >> (2 * which)) & 3
+    if code == TERRAIN_VERTEX_EDGE_CONCAVE:
+        return r - window.r0 > _CREASE_CELLS - 2 or c - window.c0 > _CREASE_CELLS - 2
+    return code == 0
+
+
+@wp.func
+def terrain_edge_open_valley(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, which: int) -> bool:
+    """Return whether edge ``which`` of window vertex ``(r, c)`` is a crease that may be concave in the window's frame:
+    not flat, not on the border (:func:`terrain_edge_kind`), and not a crease of code 0 at a vertex without
+    :data:`TERRAIN_VERTEX_CREASE_UNSURE_BIT`, which every frame of :data:`TERRAIN_CREASE_STATIC_CELLS` cells classes
+    convex (:func:`terrain_crease_static`; farther from the reference vertex the frame's test decides). One read of
+    the vertex's bits."""
+    surface = window.surface
+    if r < 0 or c < 0 or r >= surface.nrow or c >= surface.ncol:
+        return terrain_edge_kind(data, surface, r, c, which) < 0
+    bits = terrain_vertex_bits(data, surface, r, c)
+    code = (bits >> (2 * which)) & 3
+    if code == TERRAIN_VERTEX_EDGE_CONCAVE:
+        return True
+    if code != 0:
+        return False
+    if (bits & TERRAIN_VERTEX_CREASE_UNSURE_BIT) != 0:
+        return True
+    return r - window.r0 > _CREASE_CELLS - 2 or c - window.c0 > _CREASE_CELLS - 2
+
+
+@wp.func
 def terrain_vertex_bits_of_clusters(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int) -> int:
     """Return vertex ``(r, c)``'s bits from the clusters and heights (:attr:`TerrainFeatureData.vertex_bits`): per
     edge it owns (x-, y-, diagonal edge), two bits from bit ``2 which``: :data:`TERRAIN_VERTEX_EDGE_FLAT`,
-    :data:`TERRAIN_VERTEX_EDGE_BORDER` or 0 for a crease; and :data:`TERRAIN_VERTEX_FEATURE_BIT` for a vertex
-    feature."""
+    :data:`TERRAIN_VERTEX_EDGE_BORDER`, :data:`TERRAIN_VERTEX_EDGE_CONCAVE` (:func:`terrain_crease_static`) or 0 for
+    any other crease; :data:`TERRAIN_VERTEX_FEATURE_BIT` for a vertex feature; and
+    :data:`TERRAIN_VERTEX_CREASE_UNSURE_BIT` when a crease of code 0 is not convex in every frame."""
     bits = int(0)
     for which in range(3):
         kind = _edge_kind_of_clusters(data, window.surface, r, c, which)
@@ -1110,6 +1243,12 @@ def terrain_vertex_bits_of_clusters(data: TerrainFeatureData, window: TerrainWin
             bits = bits | (TERRAIN_VERTEX_EDGE_FLAT << (2 * which))
         elif kind == TERRAIN_EDGE_BORDER:
             bits = bits | (TERRAIN_VERTEX_EDGE_BORDER << (2 * which))
+        else:
+            static = terrain_crease_static(data, window.surface, r, c, which)
+            if static > 0:
+                bits = bits | (TERRAIN_VERTEX_EDGE_CONCAVE << (2 * which))
+            elif static == 0:
+                bits = bits | TERRAIN_VERTEX_CREASE_UNSURE_BIT
     if _vertex_feature_of_planes(data, window, r, c):
         bits = bits | TERRAIN_VERTEX_FEATURE_BIT
     return bits

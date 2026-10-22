@@ -82,6 +82,14 @@ window can give (:func:`terrain_pair_candidates`) and writes all its rows to the
 bound no row, they choose which kernel finishes a pair and where its rows go. Of the recorded suite states' walking
 pairs (16,384 worlds, warm and after a run), the walks finish all but a hull pair with 30 rows. Each fits the in-place
 finish of a walk, which takes up to :data:`~newton._src.geometry.terrain_law.TERRAIN_FINISH_MASK_ROWS` rows (32)."""
+TERRAIN_PARTNER_SCAN_RUN = (0, 8, 32, 8)
+"""Window vertices one scan job of a solid class takes (the point class has no scan): a solid pair's window is scanned
+in runs of this many vertices, one job each, at most
+:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_SCAN_VERTICES`. A shorter run lists the same features with
+more threads and repeats a run's setup (its core, record, window frame and list reservations) more often. Measured on
+the recorded after-run states (scan kernel per collide, runs of 32, 16 and 8 vertices): hulls 0.216, 0.134, 0.103 ms
+(h1) and 0.140, 0.091, 0.080 (g1); boxes 0.096, 0.069, 0.041 (anymald) and 0.093, 0.071, 0.043 (go2); cylinders 0.215,
+0.263, 0.331 (anymald), 0.083, 0.083, 0.082 (go2) and 0.067, 0.065, 0.058 (cassie)."""
 TERRAIN_WALK_ROWS_PER_VERTEX = (6, 16, 15)
 """Rows a window vertex's features can give a pair at most: a sphere's centre (its two faces, three edges and itself,
 one row each), a capsule (both ends' six, the axis's four), a solid (its two faces' plane manifolds of four points
@@ -867,6 +875,9 @@ class TerrainFeatures:
             info.min_z, info.max_z = grid.min_z, grid.max_z
             info.dx = float(np.float32(np.float32(2.0) * np.float32(hx) / np.float32(ncol - 1)))
             info.dy = float(np.float32(np.float32(2.0) * np.float32(hy) / np.float32(nrow - 1)))
+            # the device's float64 steps of the float32 half extents, bit for bit (IEEE float64 on both)
+            info.dx64 = float(np.float64(2.0) * np.float64(np.float32(hx)) / np.float64(ncol - 1))
+            info.dy64 = float(np.float64(2.0) * np.float64(np.float32(hy)) / np.float64(nrow - 1))
             info.triangle_offset = triangle_offset
             info.plane_offset = 0
             info.tile_offset = tile_offset
