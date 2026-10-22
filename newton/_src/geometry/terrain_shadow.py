@@ -882,9 +882,9 @@ class TerrainLawShadow:
                     hulls.neighbors,
                     hulls.neighbor_begin,
                     hulls.triangles,
-                    hulls.face_triangles,
                     hulls.hull_points,
                     hulls.hull_faces,
+                    hulls.hull_triangles,
                     hulls.shape_hull,
                     self._solids.exits,
                 )

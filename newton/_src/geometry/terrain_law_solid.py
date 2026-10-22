@@ -3727,11 +3727,12 @@ def build_hull_table(meshes: list[np.ndarray], shape_hull: np.ndarray, device) -
     """The hull table of ``meshes`` (each an ``(n, 3)`` array of unscaled local points) and the per-shape map."""
     points, planes, face_vertices, face_begin = [], [], [], [0]
     vertex_faces_per_point: list[list[int]] = []
-    triangles, face_triangles, hull_points, hull_faces_range = [], [0], [], []
+    triangles, hull_points, hull_faces_range, hull_triangles = [], [], [], []
     for mesh in meshes:
         p = np.asarray(mesh, np.float64).reshape(-1, 3)
         point_base = len(points)
         face_base = len(planes)
+        tri_base = len(triangles)
         lists, normals = hull_faces(p)
         incident = [[] for _ in range(len(p))]
         for f, (face, normal) in enumerate(zip(lists, normals, strict=True)):
@@ -3741,11 +3742,11 @@ def build_hull_table(meshes: list[np.ndarray], shape_hull: np.ndarray, device) -
             for i in face:
                 incident[i].append(face_base + f)
             triangles.extend(tuple(point_base + i for i in tri) for tri in _fan(face, p, normal))
-            face_triangles.append(len(triangles))
         points.extend(p.tolist())
         vertex_faces_per_point.extend(incident)
         hull_points.append((point_base, len(p)))
         hull_faces_range.append((face_base, len(lists)))
+        hull_triangles.append((tri_base, len(triangles) - tri_base))
     vertex_faces, vertex_face_begin = [], [0]
     for incident in vertex_faces_per_point:
         vertex_faces.extend(sorted(incident))
@@ -3772,10 +3773,12 @@ def build_hull_table(meshes: list[np.ndarray], shape_hull: np.ndarray, device) -
     table.neighbors = array(np.asarray(neighbors, np.int32), wp.int32, np.zeros(1, np.int32))
     table.neighbor_begin = array(np.asarray(neighbor_begin, np.int32), wp.int32, np.zeros(1, np.int32))
     table.triangles = array(np.asarray(triangles, np.int32).reshape(-1, 3), wp.vec3i, np.zeros((1, 3), np.int32))
-    table.face_triangles = array(np.asarray(face_triangles, np.int32), wp.int32, np.zeros(1, np.int32))
     table.hull_points = array(np.asarray(hull_points, np.int32).reshape(-1, 2), wp.vec2i, np.zeros((1, 2), np.int32))
     table.hull_faces = array(
         np.asarray(hull_faces_range, np.int32).reshape(-1, 2), wp.vec2i, np.zeros((1, 2), np.int32)
+    )
+    table.hull_triangles = array(
+        np.asarray(hull_triangles, np.int32).reshape(-1, 2), wp.vec2i, np.zeros((1, 2), np.int32)
     )
     table.shape_hull = array(np.asarray(shape_hull, np.int32), wp.int32, np.full(1, -1, np.int32))
     return table

@@ -44,19 +44,12 @@ TERRAIN_HULL_BAND_POINTS = 32
 """Points of a hull's flat support feature (within the flatness band of its lowest along a crease's normal) that rule
 E's crossing lists to pair them; a feature of more points takes every point's pairs from the whole hull (the same
 pairs, in the same order)."""
-TERRAIN_HULL_NEAREST_SLACK = 1.0e-5
-"""Rule V's allowance, times the hull's largest scale plus its radius plus the distance of the point from its centre
-[m], by which a face's triangles may come nearer to a point than the face's plane: its points lie within
-``TERRAIN_HULL_FACE_TOL`` (1e-6 m for hulls under 1 m, unscaled) of the plane, and float32 rounds the plane's distance
-and a triangle's nearest point within a few units in the last place of those lengths. A face whose plane lies
-farther than a nearest point found, by more than this, holds no nearer triangle (:func:`core_nearest`)."""
 
 _FLAT_COS = wp.constant(CYLINDER_FLAT_MODE_COS)
 _TIE = wp.constant(TERRAIN_SOLID_TIE)
 _HUGE = wp.constant(3.0e38)
 _FACE_CAP = wp.constant(TERRAIN_HULL_FACE_VERTICES)
 _BAND_POINTS = wp.constant(TERRAIN_HULL_BAND_POINTS)
-_NEAREST_SLACK = wp.constant(TERRAIN_HULL_NEAREST_SLACK)
 _TRIPOD_S = wp.constant(0.8660254)
 _ALIGN = wp.constant(1.0e-10)
 """Squared length below which a cylinder's or cone's radial direction is degenerate (the axis along the normal)."""
@@ -110,7 +103,7 @@ class TerrainHullTable:
     Points are the meshes' own vertices, unscaled, in mesh order (the narrow phase's support set); faces are the
     hull's planar faces, each with its vertex indices in increasing order; every point lists its incident faces in
     increasing order (the Gauss map's vertex cells) and the points it shares a face with (the hull's point graph,
-    which a support search descends); every face is fanned into triangles for nearest points, face by face.
+    which a support search descends); every face is fanned into triangles for nearest points.
     """
 
     points: wp.array[wp.vec3]
@@ -128,13 +121,13 @@ class TerrainHullTable:
     on."""
     neighbor_begin: wp.array[wp.int32]
     triangles: wp.array[wp.vec3i]
-    """Fan triangles of every face (point indices), face by face in face order."""
-    face_triangles: wp.array[wp.int32]
-    """Per face: its first fan triangle; face ``f``'s span ``face_triangles[f]`` to ``face_triangles[f + 1]``."""
+    """Fan triangles of every face (point indices)."""
     hull_points: wp.array[wp.vec2i]
     """Per hull: its first point and point count."""
     hull_faces: wp.array[wp.vec2i]
     """Per hull: its first face and face count."""
+    hull_triangles: wp.array[wp.vec2i]
+    """Per hull: its first triangle and triangle count."""
     shape_hull: wp.array[wp.int32]
     """Per shape: its hull's index in this table, or -1."""
 
@@ -152,6 +145,8 @@ class TerrainHullCore:
     point_count: int
     face_begin: int
     face_count: int
+    triangle_begin: int
+    triangle_count: int
     radius: float
     """The largest distance of a point from the centre (scaled), or the largest semi-axis."""
     start: int
@@ -171,6 +166,8 @@ class TerrainHullCoreRecord:
     point_count: int
     face_begin: int
     face_count: int
+    triangle_begin: int
+    triangle_count: int
     radius: float
     start: int
 
@@ -1734,33 +1731,9 @@ def closest_on_triangle(p: wp.vec3, a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.ve
 
 
 @wp.func
-def _face_nearest(core: TerrainHullCore, f: int, pl: wp.vec3, nearest: wp.vec3, dist2: float) -> tuple[wp.vec3, float]:
-    """The nearest point to ``pl`` (scaled local frame) and its squared distance over face ``f``'s triangles and the
-    point given: a triangle's replaces it when strictly nearer, so that the first nearest in triangle order is kept."""
-    for j in range(core.table.face_triangles[f], core.table.face_triangles[f + 1]):
-        tri = core.table.triangles[j]
-        q = closest_on_triangle(
-            pl,
-            wp.cw_mul(core.table.points[tri[0]], core.s),
-            wp.cw_mul(core.table.points[tri[1]], core.s),
-            wp.cw_mul(core.table.points[tri[2]], core.s),
-        )
-        d2 = wp.length_sq(q - pl)
-        if d2 < dist2:
-            dist2 = d2
-            nearest = q
-    return nearest, dist2
-
-
-@wp.func
 def core_nearest(core: TerrainHullCore, v: wp.vec3) -> tuple[bool, wp.vec3, wp.vec3, float]:
-    """Rule V: a hull's nearest point over its face triangles (the first nearest in triangle order), or the face of
-    least depth from inside; an ellipsoid's from its secular equation.
-
-    A face's triangles lie in its plane, so none is nearer than the plane, less :data:`TERRAIN_HULL_NEAREST_SLACK`'s
-    allowance: the most violated face's triangles give a first bound on the nearest distance, and the faces then run
-    in order, each passed by when its plane lies beyond that bound or the nearest point so far. Every triangle as near
-    as the nearest is still tested in order, so that the point is the one every triangle's test gives."""
+    """Rule V: a hull's nearest point over its face triangles (the same count for every pair of one hull), or the
+    face of least depth from inside; an ellipsoid's from its secular equation."""
     if core.ellipsoid != 0:
         return _ellipsoid_nearest(core, v)
     rt = wp.transpose(core.rot)
@@ -1782,17 +1755,20 @@ def core_nearest(core: TerrainHullCore, v: wp.vec3) -> tuple[bool, wp.vec3, wp.v
     if inside:
         fn = _hull_face_normal(core, face)
         return True, -fn, v + best * fn, -best
-    slack = _NEAREST_SLACK * (wp.max(core.s[0], wp.max(core.s[1], core.s[2])) + core.radius + wp.length(pl))
-    _first, bound = _face_nearest(core, face, pl, pl, _HUGE)
     nearest = pl
     dist2 = float(_HUGE)
-    for f in range(core.face_begin, core.face_begin + core.face_count):
-        p = core.table.planes[f]
-        nf = wp.vec3(p[0], p[1], p[2])
-        gap = wp.abs(p[3] - wp.dot(nf, xs)) / wp.length(wp.cw_div(nf, core.s)) - slack
-        if gap > 0.0 and gap * gap > wp.min(bound, dist2):
-            continue
-        nearest, dist2 = _face_nearest(core, f, pl, nearest, dist2)
+    for j in range(core.triangle_begin, core.triangle_begin + core.triangle_count):
+        tri = core.table.triangles[j]
+        q = closest_on_triangle(
+            pl,
+            wp.cw_mul(core.table.points[tri[0]], core.s),
+            wp.cw_mul(core.table.points[tri[1]], core.s),
+            wp.cw_mul(core.table.points[tri[2]], core.s),
+        )
+        d2 = wp.length_sq(q - pl)
+        if d2 < dist2:
+            dist2 = d2
+            nearest = q
     k = core.c + core.rot @ nearest
     dist = wp.length(k - v)
     if dist <= 0.0:
