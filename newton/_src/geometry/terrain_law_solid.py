@@ -209,7 +209,9 @@ from .terrain_law_cores import (
     core_recovery_point,
     core_reference_crossing,
     core_sigma,
+    core_sigma_near,
     core_slope,
+    core_slope_near,
     core_sphere,
     core_support_count,
     core_support_point,
@@ -804,7 +806,8 @@ def _theta_star(
     here 22 steps, the same count for every lane; the lowest support point decides, so a kink is found where two
     support points cross), then the arc's ends and the best sample where they are higher. Within ``tie`` of the
     refined maximum (float32 cannot order such values: a maximum within about 1e-3 rad of an end), an end wins where
-    ``sigma`` does not rise from it into the arc.
+    ``sigma`` does not rise from it into the arc. Each support search starts where the last one ended
+    (:func:`~newton._src.geometry.terrain_law_cores.core_sigma_near`): the normals move little from one to the next.
     """
     samples = _arc_samples(n_a, n_b)
     best = int(0)
@@ -812,7 +815,7 @@ def _theta_star(
     for i in range(1, 9):
         value = sigma_b
         if i < 8:
-            value = core_sigma(core, _arc_sample(samples, i), v0)
+            core, value = core_sigma_near(core, _arc_sample(samples, i), v0)
         if value > best_value:
             best = i
             best_value = value
@@ -822,12 +825,13 @@ def _theta_star(
     axis = wp.normalize(wp.cross(n_a, n_b))
     for _step in range(_BISECTION):
         mid = wp.normalize(lo + hi)
-        if core_slope(core, mid, wp.cross(axis, mid), v0, 1.0) > 0.0:
+        core, slope = core_slope_near(core, mid, wp.cross(axis, mid), v0, 1.0)
+        if slope > 0.0:
             lo = mid
         else:
             hi = mid
     nst = wp.normalize(lo + hi)
-    value = core_sigma(core, nst, v0)
+    core, value = core_sigma_near(core, nst, v0)
     end = int(0)
     if sigma_a > value + tie or (sigma_a >= value - tie and core_slope(core, n_a, wp.cross(axis, n_a), v0, 1.0) <= 0.0):
         nst = n_a

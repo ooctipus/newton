@@ -438,6 +438,20 @@ def core_slope(core: TerrainBoxCore, n: wp.vec3, dn: wp.vec3, p0: wp.vec3, side:
 
 
 @wp.func
+def core_sigma_near(core: TerrainBoxCore, n: wp.vec3, p0: wp.vec3) -> tuple[TerrainBoxCore, float]:
+    """:func:`core_sigma` in a search over nearby normals (closed form: nothing to keep)."""
+    return core, core_sigma(core, n, p0)
+
+
+@wp.func
+def core_slope_near(
+    core: TerrainBoxCore, n: wp.vec3, dn: wp.vec3, p0: wp.vec3, side: float
+) -> tuple[TerrainBoxCore, float]:
+    """:func:`core_slope` in a search over nearby normals (closed form: nothing to keep)."""
+    return core, core_slope(core, n, dn, p0, side)
+
+
+@wp.func
 def core_manifold(core: TerrainBoxCore, n: wp.vec3, a: wp.vec3, reach: float) -> tuple[int, _Mat43, wp.vec4]:
     """Rule F's plane manifold: the four deepest corners within ``reach`` of the plane ``(n, a)``, deepest first
     (ties within the band in corner order)."""
@@ -796,6 +810,20 @@ def _manifold_reach(count: int, points: _Mat43, n: wp.vec3, a: wp.vec3, reach: f
             depth[out] = h
             out += 1
     return out, kept, depth
+
+
+@wp.func
+def core_sigma_near(core: TerrainCylinderCore, n: wp.vec3, p0: wp.vec3) -> tuple[TerrainCylinderCore, float]:
+    """:func:`core_sigma` in a search over nearby normals (closed form: nothing to keep)."""
+    return core, core_sigma(core, n, p0)
+
+
+@wp.func
+def core_slope_near(
+    core: TerrainCylinderCore, n: wp.vec3, dn: wp.vec3, p0: wp.vec3, side: float
+) -> tuple[TerrainCylinderCore, float]:
+    """:func:`core_slope` in a search over nearby normals (closed form: nothing to keep)."""
+    return core, core_slope(core, n, dn, p0, side)
 
 
 @wp.func
@@ -1275,13 +1303,8 @@ def core_sigma(core: TerrainHullCore, n: wp.vec3, p0: wp.vec3) -> float:
 
 
 @wp.func
-def core_slope(core: TerrainHullCore, n: wp.vec3, dn: wp.vec3, p0: wp.vec3, side: float) -> float:
-    if core.ellipsoid != 0:
-        m = wp.transpose(core.rot) @ n
-        dm = wp.transpose(core.rot) @ dn
-        sm = wp.cw_mul(core.s, m)
-        sdm = wp.cw_mul(core.s, dm)
-        return wp.dot(dn, core.c - p0) - wp.dot(sm, sdm) / wp.length(sm)
+def _hull_slope(core: TerrainHullCore, n: wp.vec3, dn: wp.vec3, p0: wp.vec3, side: float) -> tuple[int, float]:
+    """A hull's :func:`core_slope` and its lowest point along ``n`` (global index)."""
     dir_local = wp.cw_mul(wp.transpose(core.rot) @ n, core.s)
     ddir_local = wp.cw_mul(wp.transpose(core.rot) @ dn, core.s)
     lowest, low = _hull_support(core, dir_local)
@@ -1295,7 +1318,44 @@ def core_slope(core: TerrainHullCore, n: wp.vec3, dn: wp.vec3, p0: wp.vec3, side
                 best = wp.min(best, d)
             else:
                 best = wp.max(best, d)
-    return wp.dot(dn, core.c - p0) + best
+    return lowest, wp.dot(dn, core.c - p0) + best
+
+
+@wp.func
+def core_slope(core: TerrainHullCore, n: wp.vec3, dn: wp.vec3, p0: wp.vec3, side: float) -> float:
+    if core.ellipsoid != 0:
+        m = wp.transpose(core.rot) @ n
+        dm = wp.transpose(core.rot) @ dn
+        sm = wp.cw_mul(core.s, m)
+        sdm = wp.cw_mul(core.s, dm)
+        return wp.dot(dn, core.c - p0) - wp.dot(sm, sdm) / wp.length(sm)
+    _lowest, slope = _hull_slope(core, n, dn, p0, side)
+    return slope
+
+
+@wp.func
+def core_sigma_near(core: TerrainHullCore, n: wp.vec3, p0: wp.vec3) -> tuple[TerrainHullCore, float]:
+    """:func:`core_sigma` in a search over nearby normals: a hull's support search starts at the point the last one
+    ended on (kept as the core's start), a step or none away for a nearby normal. The value is a search's from any
+    start: a descent ends at a point without a lower neighbour, on a convex hull the lowest (the points of a face
+    tied along the normal all neighbour each other)."""
+    if core.ellipsoid != 0:
+        return core, core_sigma(core, n, p0)
+    best, low = _hull_support(core, wp.cw_mul(wp.transpose(core.rot) @ n, core.s))
+    core.start = best
+    return core, wp.dot(n, core.c - p0) + low
+
+
+@wp.func
+def core_slope_near(
+    core: TerrainHullCore, n: wp.vec3, dn: wp.vec3, p0: wp.vec3, side: float
+) -> tuple[TerrainHullCore, float]:
+    """:func:`core_slope` in a search over nearby normals (:func:`core_sigma_near`)."""
+    if core.ellipsoid != 0:
+        return core, core_slope(core, n, dn, p0, side)
+    lowest, slope = _hull_slope(core, n, dn, p0, side)
+    core.start = lowest
+    return core, slope
 
 
 @wp.func
