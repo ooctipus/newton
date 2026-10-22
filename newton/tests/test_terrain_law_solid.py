@@ -2329,7 +2329,9 @@ def test_solid_launches_take_fixed_grids(test, device):
             test.assertEqual(record["pair_job_threads"], min(jobs.threads, end - begin))
             test.assertEqual(record["finish_blocks"], jobs.finish_blocks)
             test.assertLessEqual(jobs.finish_blocks, end - begin)
-            test.assertEqual(record["skipped"], ["xvalleys"] if partner_class == TERRAIN_PARTNER_BOX else [])
+            # rule X's valleys never for boxes, its gate never for hulls (core_exits_gated)
+            expected = {TERRAIN_PARTNER_BOX: ["xvalleys"], TERRAIN_PARTNER_HULL: ["xbound"]}.get(partner_class, [])
+            test.assertEqual(record["skipped"], expected)
             for kind, kernel_name in TERRAIN_SOLID_LAUNCHES:
                 key = _kernel(partner_class, kernel_name).key
                 if kernel_name in record["skipped"]:

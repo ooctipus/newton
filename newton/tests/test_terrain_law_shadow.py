@@ -822,6 +822,9 @@ class TestTerrainLawShadow(unittest.TestCase):
                     self.assertEqual(skipped, ["xvalleys"] if not np.any(takes) else [])
                     if name == "box":
                         self.assertEqual(skipped, ["xvalleys"])
+                    # rule X's gate bounds no hull's exits: never launched for hulls
+                    if name == "hull":
+                        skipped = ["xbound", *skipped]
                     launches += len(TERRAIN_SOLID_LAUNCHES) - len(skipped)
                     self.assertEqual(
                         record["launch_shapes"][name],

@@ -593,6 +593,10 @@ class TerrainLawShadow:
                         if listed is not None and capacity[listed] == 0:
                             skipped.append(short)
                             continue
+                        if short == "xbound" and partner_class == TERRAIN_PARTNER_HULL:
+                            # rule X's gate does not bound a hull's exits (core_exits_gated): its pairs are open at once
+                            skipped.append(short)
+                            continue
                         self._launches.append(("thread", kernel, jobs.threads, begin, slot, (jobs, True)))
                     else:
                         self._launches.append(("tiled", kernel, scratch.blocks, begin, slot, (scratch, True, jobs)))
