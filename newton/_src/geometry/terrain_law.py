@@ -100,9 +100,10 @@ TERRAIN_CONE_BAND = 1.0e-6
 """Relative band of the closed normal-cone test ``n . (w - v) <= band |w - v|``."""
 TERRAIN_GROUP_ROWS = 4
 """Rows kept per plane group."""
-TERRAIN_FINISH_MASK_ROWS = 32
-"""Rows the in-place finish of a walking pair (:func:`terrain_finish_slots`) takes: the bits of its masks. Every
-partner class's walk slots fit it; the full-finish kernels finish any number (:func:`terrain_finish_list`)."""
+TERRAIN_FINISH_MASK_ROWS = 24
+"""Rows the in-place finish of a walking pair (:func:`terrain_finish_slots`) takes: the length of its arrays, which every
+call zero-fills, so the largest class's walk slots (a hull's 24); the full-finish kernels finish any number
+(:func:`terrain_finish_list`)."""
 TERRAIN_TILE_CELLS = 8
 """Cells per side of a tile of the tile-max mip."""
 TERRAIN_FINE_CELLS = 2
