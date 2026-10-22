@@ -121,12 +121,13 @@ LYING = _axis_angle((0.0, 1.0, 0.0), np.pi / 2.0)
 """A cylinder's axis (local z) onto world x."""
 
 
-def _collide(model, *, shadow: bool, **kwargs):
-    """Collide once on today's route as the suite runs it (:data:`SUITE_ROUTE`), with every class in shadow or none."""
+def _collide(model, *, shadow: bool, rule_x: bool = True, **kwargs):
+    """Collide once on today's route as the suite runs it (:data:`SUITE_ROUTE`), with every class in shadow (rule X
+    run or not) or none."""
     options = dict(PIPELINE, **kwargs)
     with patch.dict(os.environ, SUITE_ROUTE):
         if shadow:
-            pipeline = tu.shadow_pipeline(model, classes="all", **options)
+            pipeline = tu.shadow_pipeline(model, classes="all", rule_x=rule_x, **options)
         else:
             pipeline = newton.CollisionPipeline(model, **options)
     contacts = pipeline.contacts()
@@ -1130,6 +1131,27 @@ def test_valley_cores_reach_their_depth(test, device):
             test.assertLessEqual(su.normal_cone_angle(hf, exits[0][0], exits[0][1]), GHOST_ANGLE)
 
 
+def test_rule_x_left_out_leaves_sunk_cores_to_the_other_rules(test, device):
+    """Leave rule X out when the law does not run it (the default): solids sunk into a valley, whose deepest points only
+    rule X reaches, get the float64 law's rows without it and no exit row, and no rule X kernel is launched."""
+    hf, model, _hfield, shapes, bodies = _valley_bodies(device)
+    pipeline, _contacts, _state = _collide(model, shadow=True, rule_x=False)
+    shadow = pipeline._terrain_law_shadow
+    test.assertFalse(shadow.rule_x)
+    rows = tu.shadow_rows(pipeline)
+    for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
+        with test.subTest(kind=kind):
+            got = rows.get(shape, [])
+            test.assertFalse(any(su.is_exit_row(g) for g in got))
+            missing, extra, deepest = su.compare_solid_rows(su.law_rows(hf, kind, dims, pose, rule_x=False), got)
+            test.assertEqual((missing, extra), ([], []))
+            test.assertLess(deepest, 1.0e-5)
+    for name, record in shadow.describe()["launch_shapes"].items():
+        if name != "point":
+            with test.subTest(partner_class=name):
+                test.assertTrue({"xitems", "xvalleys", "xdescents", "exit"} <= set(record["skipped"]))
+
+
 NEEDLES = (
     ({"semi": (0.03, 0.025, 0.12)}, (-2.88e-05, 0.0017035, 0.05, -0.0035235, 0.0199778, -0.0137802, 0.9996992)),
     ({"semi": (0.02, 0.02, 0.1)}, (0.000511, -0.0001721, 0.04, -0.0067381, -0.0060868, 0.0250489, 0.999645)),
@@ -1548,7 +1570,9 @@ def _class_jobs(model, shadow, partner_class, *, threads=None, **capacities):
         scan_run=int(TERRAIN_PARTNER_SCAN_RUN[partner_class]),
     )
     sizes.update(capacities)
-    jobs = terrain_law_solid.terrain_solid_jobs(model.device, partner_class, begin, end - begin, sizes)
+    jobs = terrain_law_solid.terrain_solid_jobs(
+        model.device, partner_class, begin, end - begin, sizes, rule_x=shadow.rule_x
+    )
     if threads is not None:
         jobs.threads = int(threads)
         jobs.pair_threads = min(int(threads), end - begin)
@@ -2631,6 +2655,10 @@ for _name, _func in (
     ("test_job_lists_hold_each_run_together", test_job_lists_hold_each_run_together),
     ("test_rule_x_lists_give_the_full_passes", test_rule_x_lists_give_the_full_passes),
     ("test_rule_x_gate_closes_cores_no_exit_can_reach", test_rule_x_gate_closes_cores_no_exit_can_reach),
+    (
+        "test_rule_x_left_out_leaves_sunk_cores_to_the_other_rules",
+        test_rule_x_left_out_leaves_sunk_cores_to_the_other_rules,
+    ),
     ("test_exit_work_stays_bounded", test_exit_work_stays_bounded),
     ("test_long_box_keeps_every_support", test_long_box_keeps_every_support),
     ("test_deferred_pairs_keep_their_rows_beyond_the_grid", test_deferred_pairs_keep_their_rows_beyond_the_grid),
