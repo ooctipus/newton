@@ -1956,6 +1956,36 @@ def test_large_plane_group_follows_the_law(test, device):
     test.assertFalse(any(pipeline.narrow_phase.buffer_capacity_status().values()))
 
 
+def test_plane_group_of_many_rows_takes_the_lanes(test, device):
+    """Finish a pair holding many rows with a block's lanes and one holding few in place, both with the float64 law's
+    rows.
+
+    A flat box 2 mm above the pillar lattice of :func:`test_large_plane_group_follows_the_law`: 6 cm across it holds 15
+    candidates in one plane group (:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LANE_ROWS` or more),
+    which its close lists for the finish kernel and whose implied-row step drops 6; 3 cm across it holds 4, finished by
+    the close itself.
+    """
+    n = 61
+    r = np.arange(n)
+    heights = np.where((r[:, None] % 3 != 0) & (r[None, :] % 3 != 0), 0.05, 0.0)
+    hf = tu.reference_surface(tu.heightfield_model(heights, 1.5, 1.5, device="cpu"))
+    for half, lanes in ((0.06, 1), (0.03, 0)):
+        with test.subTest(half=half):
+            dims = {"half": (half, half, 0.02)}
+            pose = _f32_pose(np.r_[0.013, 0.007, 0.05 + 0.02 + 0.002, 0.0, 0.0, 0.0, 1.0])
+            model, _hfield, shapes = su.solid_scene(heights, 1.5, 1.5, [("box", dims, pose)], device=device)
+            pipeline, _contacts, _state = _collide(model, shadow=True)
+            counts = pipeline._terrain_law_shadow.job_counts()["box"]
+            test.assertEqual(counts["lanes"], lanes)
+            rows = tu.shadow_rows(pipeline)[shapes[0]]
+            if lanes:
+                # the lanes' implied-row step dropped some of its candidates
+                test.assertLess(len(rows), counts["candidates"])
+            missing, extra, deepest = su.compare_solid_rows(su.law_rows(hf, "box", dims, pose), rows)
+            test.assertEqual((missing, extra), ([], []))
+            test.assertLess(deepest, 1.0e-5)
+
+
 def test_window_past_its_bound_is_flagged(test, device):
     """Flag a pair whose window gives more distinct candidates than its full-finish scratch holds, and raise.
 
@@ -2439,6 +2469,7 @@ for _name, _func in (
     ("test_deferred_pairs_keep_their_rows_beyond_the_grid", test_deferred_pairs_keep_their_rows_beyond_the_grid),
     ("test_wide_box_keeps_every_support", test_wide_box_keeps_every_support),
     ("test_large_plane_group_follows_the_law", test_large_plane_group_follows_the_law),
+    ("test_plane_group_of_many_rows_takes_the_lanes", test_plane_group_of_many_rows_takes_the_lanes),
     ("test_window_past_its_bound_is_flagged", test_window_past_its_bound_is_flagged),
     ("test_solid_launches_take_fixed_grids", test_solid_launches_take_fixed_grids),
     ("test_job_grids_take_each_entry_once", test_job_grids_take_each_entry_once),

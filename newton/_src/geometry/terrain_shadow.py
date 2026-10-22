@@ -297,10 +297,10 @@ TERRAIN_LAW_SPILL_SHARE = 256
 pair's bound (:meth:`TerrainLawShadow.default_spill_rows`): the worst case of one pair in 256 at once. On the recorded
 suite scenes (16,384 worlds) that is 11 to 25% of the walk slots, while at most one pair spilled (30 rows)."""
 
-TERRAIN_LAW_JOB_COUNTERS = 12
+TERRAIN_LAW_JOB_COUNTERS = 13
 """Counters of a solid class's jobs: its six job lists, its candidate pool, its live pairs, its pairs left to rule R,
-its scan's runs, its listed rule X candidates' descents and its deferred pairs walked again
-(:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_COUNTERS`)."""
+its scan's runs, its listed rule X candidates' descents, its deferred pairs walked again and its pairs finished by a
+block's lanes (:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_COUNTERS`)."""
 
 TERRAIN_LAW_JOB_NAMES = (
     "faces",
@@ -315,6 +315,7 @@ TERRAIN_LAW_JOB_NAMES = (
     "scans",
     "xdescents",
     "walks",
+    "lanes",
 )
 """Names of a solid class's job counters, in order (:meth:`TerrainLawShadow.job_counts`)."""
 
@@ -563,7 +564,7 @@ class TerrainLawShadow:
                 )
                 self._jobs[partner_class] = jobs
                 names = (*solid_module.TERRAIN_SOLID_JOB_LISTS, "candidates", "scans", "xdescents")
-                # the live and rule R lists hold every pair of the class: no check
+                # the live, rule R and lane lists hold every pair of the class: no check
                 for name in names:
                     capacities[offset - _JOBS + TERRAIN_LAW_JOB_NAMES.index(name)] = capacity[name]
                 skipped = []
