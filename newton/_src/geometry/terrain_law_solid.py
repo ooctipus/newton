@@ -151,12 +151,14 @@ from .terrain_law import (
     TERRAIN_PAIR_UNSUPPORTED,
     TERRAIN_PAIR_WIDE,
     TERRAIN_STATUS_JOBS,
+    TERRAIN_VERTEX_FEATURE_BIT,
     TERRAIN_WINDOW_WIDE,
     TerrainFeatureData,
     TerrainFinishScratch,
     TerrainLawRows,
     TerrainPairInputs,
     TerrainPlanes,
+    TerrainSurfaceInfo,
     TerrainWindow,
     terrain_box_cells,
     terrain_cluster,
@@ -184,6 +186,7 @@ from .terrain_law import (
     terrain_store_row,
     terrain_tile_exit,
     terrain_triangle_vertices,
+    terrain_vertex_bits,
     terrain_vertex_feature,
     terrain_vertex_in_cone,
     terrain_window,
@@ -2023,20 +2026,32 @@ def solid_pair_read(inputs: TerrainPairInputs, data: TerrainFeatureData, pair: i
 
 
 @wp.func
+def _vertex_quiet(data: TerrainFeatureData, surface: TerrainSurfaceInfo, r: int, c: int) -> bool:
+    """Whether window vertex ``(r, c)`` lists nothing for rules E and V in any window: its three edges are flat or on
+    the border (two-bit codes 1 or 2 of its bits, whose bits then differ) and it is no vertex feature."""
+    bits = terrain_vertex_bits(data, surface, r, c)
+    return ((bits ^ (bits >> 1)) & 21) == 21 and (bits & TERRAIN_VERTEX_FEATURE_BIT) == 0
+
+
+@wp.func
 def _window_extent_top(
     data: TerrainFeatureData, window: TerrainWindow, r1: int, c1: int, extent: float
-) -> tuple[float, float]:
+) -> tuple[float, float, bool]:
     """:func:`~newton._src.geometry.terrain_law.terrain_window_extent` (the same value, bit for bit) and, read in the
-    same pass, the window's highest vertex (window frame), which rule X's gate takes."""
+    same pass, the window's highest vertex (window frame), which rule X's gate takes, and whether every window vertex
+    is quiet (:func:`_vertex_quiet`, read until one is not)."""
     surface = window.surface
     extent = wp.max(extent, wp.max(float(c1 + 1 - window.c0) * surface.dx, float(r1 + 1 - window.r0) * surface.dy))
     top = float(-_HUGE)
+    quiet = bool(True)
     for r in range(window.r0, r1 + 2):
         for c in range(window.c0, c1 + 2):
             z = terrain_height(data, surface, r, c) - window.z_ref
             extent = wp.max(extent, wp.abs(z))
             top = wp.max(top, z)
-    return extent, top
+            if quiet:
+                quiet = _vertex_quiet(data, surface, r, c)
+    return extent, top, quiet
 
 
 @wp.func
@@ -2064,7 +2079,8 @@ def solid_pair_frame(
     core: Any, data: TerrainFeatureData, heightfield: int, cells: wp.vec4i, lo: wp.vec3, hi: wp.vec3, reach: float
 ):
     """A pair's window frame past its rejects (:func:`solid_pair_cells`, its cells and the core's bounds ``lo`` and
-    ``hi``): ``(window, core, pair)`` with the core moved into the window frame."""
+    ``hi``): ``(window, core, pair, quiet)`` with the core moved into the window frame, ``quiet`` when every window
+    vertex is quiet (:func:`_vertex_quiet`)."""
     pair = _Pair()
     window = terrain_window(data, heightfield, cells[0], cells[2])
     centre = core.c
@@ -2076,7 +2092,7 @@ def solid_pair_frame(
         wp.max(wp.max(wp.abs(lo[0]), wp.abs(lo[1])), wp.abs(lo[2])),
         wp.max(wp.max(wp.abs(hi[0]), wp.abs(hi[1])), wp.abs(hi[2])),
     )
-    extent, top = _window_extent_top(data, window, cells[1], cells[3], extent)
+    extent, top, quiet = _window_extent_top(data, window, cells[1], cells[3], extent)
     eps = terrain_eps(extent)
     size = wp.length(hi - lo)
     pair.extent = extent
@@ -2090,7 +2106,7 @@ def solid_pair_frame(
     sphere_c, sphere_r = core_sphere(core)
     pair.sphere_c = sphere_c
     pair.sphere_r = sphere_r
-    return window, core, pair
+    return window, core, pair, quiet
 
 
 @wp.func
@@ -2102,7 +2118,7 @@ def solid_pair_window(core: Any, data: TerrainFeatureData, heightfield: int, rea
     state, cells, lo, hi = solid_pair_cells(core, data, heightfield, reach)
     if state != 0:
         return state, cells, TerrainWindow(), core, _Pair()
-    window, core, pair = solid_pair_frame(core, data, heightfield, cells, lo, hi, reach)
+    window, core, pair, _quiet = solid_pair_frame(core, data, heightfield, cells, lo, hi, reach)
     return 0, cells, window, core, pair
 
 
@@ -3242,7 +3258,7 @@ def solid_kernels(
         if state != 0:
             terrain_pair_exit(out, pair, state)
             return
-        _window, core, setup = solid_pair_frame(core, data, heightfield, cells, lo, hi, reach)
+        _window, core, setup, quiet = solid_pair_frame(core, data, heightfield, cells, lo, hi, reach)
         wp.static(save_core)(jobs, i, core)
         record = TerrainSolidRecord()
         record.cells = cells
@@ -3257,6 +3273,16 @@ def solid_kernels(
         jobs.head[i] = -1
         # the live list holds every pair of the class at most
         jobs.live[wp.atomic_add(jobs.counts, _LIVE, 1)] = i
+        if quiet:
+            # A quiet window (:func:`_vertex_quiet`, every vertex): its edges list no crease and its vertices no
+            # feature, and its triangles, joined by flat edges, are one cluster, whose rows are its own. Its scan
+            # would list that cluster alone, once per run, when a triangle's highest vertex is not below the pair's
+            # low: when the window's highest vertex is not. One face job takes it (its first triangle; the cluster's
+            # rows at the same place in window order), and no run is scanned.
+            if setup.top >= setup.low:
+                if _job_append(jobs, _FACES, jobs.faces, wp.vec2i(pair, 0)) == 0:
+                    out.state[pair] = _wide(cells) | TERRAIN_PAIR_JOBS | TERRAIN_PAIR_INCOMPLETE
+            return
         vertices = (cells[1] - cells[0] + 2) * (cells[3] - cells[2] + 2)
         runs = (vertices + scan_ - 1) // scan_
         first = wp.atomic_add(jobs.counts, _SCANS, runs)
