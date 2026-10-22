@@ -221,7 +221,8 @@ def _candidate_lists(rng, count):
                     # an inclusive claim of the same constraint: a coincident row
                     rows.append((q + rng.uniform(-1e-7, 1e-7, size=3), normal, dist))
         order = rng.permutation(len(rows))
-        rows = [rows[k] for k in order]
+        # at most the in-place finish's rows (a walk holds at most its class's walk slots)
+        rows = [rows[k] for k in order][:TERRAIN_FINISH_MASK_ROWS]
         prefix = len(rows)
         if i % 17 == 0:
             rows = (rows * 6)[:36]

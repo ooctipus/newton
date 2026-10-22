@@ -81,7 +81,7 @@ there. A pair with more distinct rows is finished by its class's full-finish ker
 window can give (:func:`terrain_pair_candidates`) and writes all its rows to the side buffer's spill region: the slots
 bound no row, they choose which kernel finishes a pair and where its rows go. Of the recorded suite states' walking
 pairs (16,384 worlds, warm and after a run), the walks finish all but a hull pair with 30 rows. Each fits the in-place
-finish of a walk, which takes up to :data:`~newton._src.geometry.terrain_law.TERRAIN_FINISH_MASK_ROWS` rows (32)."""
+finish of a walk, which takes up to :data:`~newton._src.geometry.terrain_law.TERRAIN_FINISH_MASK_ROWS` rows (24)."""
 TERRAIN_PARTNER_SCAN_RUN = (0, 8, 32, 8)
 """Window vertices one scan job of a solid class takes (the point class has no scan): a solid pair's window is scanned
 in runs of this many vertices, one job each, at most
