@@ -327,6 +327,14 @@ NEWTON_FLAGS = declare(
         "NEWTON_TERRAIN_LAW_SHADOW or NEWTON_TERRAIN_LAW set.",
     ),
     EnvironmentFlag(
+        "NEWTON_TERRAIN_LAW_RULE_X",
+        "experiment",
+        _COLLIDE,
+        "1 runs the terrain law's rule X (a solid core's deepest exit, offered where it lies deeper than every other "
+        "row of its pair); unset or 0 leaves it out (default: on the law's own operating states it gave no row while "
+        "its kernels cost up to 0.9 ms per env step). Read only with NEWTON_TERRAIN_LAW_SHADOW or NEWTON_TERRAIN_LAW set.",
+    ),
+    EnvironmentFlag(
         "NEWTON_TERRAIN_LAW_SHADOW_ROWS",
         "diagnostic",
         _COLLIDE,

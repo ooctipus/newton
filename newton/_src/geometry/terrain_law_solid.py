@@ -78,11 +78,12 @@ pairs' features at once instead of one pair's whole window, and no thread walks 
 3. The close (:func:`solid_close_jobs`), one thread per live pair: the pair's candidates held in its walk slots in key
    order (:func:`~newton._src.geometry.terrain_law.terrain_hold_row`, the walk's held rows bit for bit, however the
    jobs ran; a candidate listed twice is one offer), then rule R's kernel for a pair without a row, a block of lanes
-   per pair splitting its core points (:func:`solid_recover_pair`); a pair whose core reaches below its window's
-   highest vertex is left, its rows held, to
-   rule X, with one item per core point and window vertex that can give a candidate listed, and any other is finished
-   (step 5).
-4. Rule X's items (:func:`solid_xitem_job`: a core point, or a window vertex that can give a candidate) and valleys
+   per pair splitting its core points (:func:`solid_recover_pair`); when the law runs rule X
+   (:attr:`TerrainSolidJobs.rule_x`, ``NEWTON_TERRAIN_LAW_RULE_X``; off by default), a pair whose core reaches below
+   its window's highest vertex is left, its rows held, to rule X, with one item per core point and window vertex that
+   can give a candidate listed, and any other is finished (step 5).
+4. Rule X, when the law runs it: its gate (:func:`solid_xbound_job`, an exit bound per cell), items
+   (:func:`solid_xitem_job`: a core point, or a window vertex that can give a candidate) and valleys
    (:func:`solid_xvalley_job`), the job threads: each lists the candidates whose bounds pass the pair's target, the
    test the rule's passes open with, and a descent kernel takes each listed candidate's near-bound descent
    (:func:`solid_xdescent_job`), so that the exit kernel (:func:`solid_exit_pair`, one thread per pair left to it)
@@ -90,11 +91,10 @@ pairs' features at once instead of one pair's whole window, and no thread walks 
    their exits: any other candidate is a no-op in both passes, and the rows are the passes' over every candidate. A
    pair some of whose rule X work found no room is left to the full-finish kernels, which run rule X over every
    candidate.
-5. The finish: a pair with fewer than :data:`TERRAIN_SOLID_LANE_ROWS` rows is finished in place by the thread that
-   holds it (its close, rule R's first lane or the exit kernel); a pair with more is listed for the finish kernel
-   (:func:`solid_finish_pair`), a block of lanes per pair splitting the finish's implied-row tests (its cost: up to
-   every triangle of a plane group's rows, for each of its rows), so that a pair with many rows no longer holds a
-   launch for as long as one thread takes to finish it.
+5. The finish: a pair whose held rows hold no plane group of three is written as it is by the thread that holds it
+   (its close, rule R's first lane or the exit kernel); any other is listed for the small-pair finish kernel, one
+   thread per pair (:func:`solid_finish_pair`). A block of lanes per pair (the finish kernel) would take a pair of
+   :data:`TERRAIN_SOLID_LANE_ROWS` rows, which no walk holds.
 
 The kernels follow the per-pair output protocol of :mod:`~newton._src.geometry.terrain_law`: a pair with no row is
 recorded by :func:`~newton._src.geometry.terrain_law.terrain_pair_exit`, and rows are held in the pair's own walk slots
@@ -554,6 +554,9 @@ class TerrainSolidJobs:
     under its footprint (:func:`solid_xbound_job`; always for a class whose exits are not gated,
     :func:`~newton._src.geometry.terrain_law_cores.core_exits_gated`). Rule X's items of a pair without it list
     nothing."""
+    rule_x: int
+    """Nonzero when the law runs rule X (``NEWTON_TERRAIN_LAW_RULE_X``); else every closed pair is finished by its close
+    or rule R's kernel, and rule X's kernels are not launched."""
 
 
 @wp.struct
@@ -2342,10 +2345,10 @@ def solid_close_full(
     cells: wp.vec4i,
 ):
     """Finish a deferred pair walked into a full-finish block's scratch (``sink.slot``): add the recovery rows when it
-    has none and rule X's exit over every candidate (its searches counted in ``work``; ``jobs`` unread), run the
-    finish on every distinct candidate and write the kept rows (world frame) to its walk slots from ``slot`` when they
-    fit, else to rows of the spill region, or, when that has no room left, the first of them by priority to its walk
-    slots (flagged :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_ROW_OVERFLOW`).
+    has none and, when the law runs rule X (``jobs.rule_x``), its exit over every candidate (its searches counted in
+    ``work``), run the finish on every distinct candidate and write the kept rows (world frame) to its walk slots from
+    ``slot`` when they fit, else to rows of the spill region, or, when that has no room left, the first of them by
+    priority to its walk slots (flagged :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_ROW_OVERFLOW`).
 
     The scratch holds every candidate a window of the class can give; a pair with more has a window its shape data no
     longer bounds (changed since construction): it keeps the first in window order and is flagged."""
@@ -2354,7 +2357,7 @@ def solid_close_full(
         planes, sink = solid_recovery(core, data, window, planes, sink, store, 0, 1)
     # Rule X can give a row only to a core whose lowest point lies below its window's highest vertex.
     lo, _hi = core_bounds(core)
-    if lo[2] < pair.top:
+    if jobs.rule_x != 0 and lo[2] < pair.top:
         every = _EveryCandidate()
         every.low = lo[2]
         planes, sink = solid_exits(core, data, window, planes, pair, sink, store, cells, work, jobs, every)
@@ -3033,7 +3036,7 @@ def _solid_settle(
     cells = record.cells
     pair = record.pair
     # Rule X can give a row only to a core whose lowest point lies below its window's highest vertex.
-    if record.low < pair.top:
+    if jobs.rule_x != 0 and record.low < pair.top:
         out.first[pair_index] = sink.slot
         out.count[pair_index] = sink.held
         out.state[pair_index] = _wide(cells) | TERRAIN_PAIR_EXIT
@@ -4404,6 +4407,7 @@ def terrain_solid_jobs(
     capacities: dict[str, int],
     *,
     counts: wp.array | None = None,
+    rule_x: bool = True,
 ) -> TerrainSolidJobs:
     """Allocate a solid class's :class:`TerrainSolidJobs`: per pair its record, core, candidate list heads and rule
     X's target; the job lists, the scan's runs and the candidate pool with ``capacities``
@@ -4418,6 +4422,7 @@ def terrain_solid_jobs(
         capacities: Entries of every job list, the scan's runs and the candidate pool.
         counts: The class's :data:`TERRAIN_SOLID_COUNTERS` counters (zeroed before every launch), or ``None`` for its
             own.
+        rule_x: Whether the class's close leaves pairs to rule X (:attr:`TerrainSolidJobs.rule_x`).
     """
     from .terrain_contacts import TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_HULL  # noqa: PLC0415
 
@@ -4467,6 +4472,7 @@ def terrain_solid_jobs(
     jobs.xhead = wp.full(room, -1, dtype=wp.int32, device=device)
     jobs.xall = wp.zeros(room, dtype=wp.int32, device=device)
     jobs.xhot = wp.zeros(room, dtype=wp.int32, device=device)
+    jobs.rule_x = int(bool(rule_x))
     return jobs
 
 

@@ -356,6 +356,8 @@ _JOBS = _EXIT_WORK + 2
 """Offset of the per-class job counters (:data:`TERRAIN_LAW_JOB_COUNTERS` per class)."""
 _COUNTERS = _JOBS + TERRAIN_PARTNER_CLASSES * TERRAIN_LAW_JOB_COUNTERS
 """The shadow's counters, all zeroed by one memset before every launch."""
+_RULE_X_KERNELS = ("xbound", "xitems", "xvalleys", "xdescents", "exit")
+"""A solid class's kernels of rule X, not launched when the law leaves it out (:attr:`TerrainLawShadow.rule_x`)."""
 
 
 @wp.func
@@ -563,6 +565,22 @@ def parse_terrain_law_shadow_jobs(value: str | None) -> float | None:
     return scale
 
 
+def parse_terrain_law_rule_x(value: str | None) -> bool:
+    """Return whether a ``NEWTON_TERRAIN_LAW_RULE_X`` value runs rule X (off by default).
+
+    Args:
+        value: ``1`` to run it, ``0`` to leave it out; ``None`` or blank for the default (out).
+
+    Raises:
+        ValueError: On any other value.
+    """
+    if value is None or not value.strip():
+        return False
+    if value.strip() not in ("0", "1"):
+        raise ValueError(f"NEWTON_TERRAIN_LAW_RULE_X must be 0 or 1, not {value!r}")
+    return value.strip() == "1"
+
+
 class TerrainLawShadow:
     """The terrain law's kernels for some partner classes, run after the narrow phase into a side buffer.
 
@@ -595,8 +613,10 @@ class TerrainLawShadow:
         status: wp.array | None = None,
         spill_rows: int | None = None,
         job_scale: float | None = None,
+        rule_x: bool = False,
     ):
         started = time.perf_counter()
+        self.rule_x = bool(rule_x)
         self.device = model.device
         self.classes = tuple(sorted(int(c) for c in classes))
         missing = [c for c in self.classes if c not in TERRAIN_LAW_KERNELS]
@@ -666,6 +686,7 @@ class TerrainLawShadow:
                     end - begin,
                     capacity,
                     counts=self._counters[offset : offset + TERRAIN_LAW_JOB_COUNTERS],
+                    rule_x=self.rule_x,
                 )
                 self._jobs[partner_class] = jobs
                 names = (*solid_module.TERRAIN_SOLID_JOB_LISTS, "candidates", "scans", "xdescents")
@@ -679,6 +700,10 @@ class TerrainLawShadow:
                     if kind == "pairs":
                         self._launches.append(("thread", kernel, end - begin, begin, slot, (jobs, True)))
                     elif kind == "pair_jobs":
+                        if kernel_name.removeprefix(prefix) in _RULE_X_KERNELS and not self.rule_x:
+                            # rule X left out: no pair is left to its exit kernel
+                            skipped.append(kernel_name.removeprefix(prefix))
+                            continue
                         self._launches.append(("thread", kernel, jobs.pair_threads, begin, slot, (jobs, True)))
                     elif kind == "pair_tiles":
                         if kernel_name == prefix + "finish" and walk < solid_module.TERRAIN_SOLID_LANE_ROWS:
@@ -691,6 +716,10 @@ class TerrainLawShadow:
                         short = kernel_name.removeprefix(prefix)
                         listed = solid_module.TERRAIN_SOLID_LIST_OF_KERNEL.get(short)
                         if listed is not None and capacity[listed] == 0:
+                            skipped.append(short)
+                            continue
+                        if short in _RULE_X_KERNELS and not self.rule_x:
+                            # rule X left out: its pairs are finished by their close
                             skipped.append(short)
                             continue
                         if short == "xbound" and partner_class == TERRAIN_PARTNER_HULL:
