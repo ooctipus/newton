@@ -27,8 +27,8 @@ VERIFIER_NAMES = (
     "reduction_hash_load",
     "reduction_hash_insert",
 )
-TERRAIN_NAMES = ("terrain_rows", "terrain_stale")
-"""Bits 13 and 14, which the terrain law's kernels set."""
+TERRAIN_NAMES = ("terrain_rows", "terrain_stale", "terrain_jobs")
+"""Bits 13 to 15, which the terrain law's kernels set."""
 NAMES = VERIFIER_NAMES + TERRAIN_NAMES
 
 
@@ -103,7 +103,7 @@ class TestNarrowPhaseCapacityStatus(unittest.TestCase):
         """Report the terrain law's sticky bits by name and raise on each at the capacity check."""
         _, pipeline = make_pipeline()
         narrow = pipeline.narrow_phase
-        for bit, name in zip((13, 14), TERRAIN_NAMES, strict=True):
+        for bit, name in zip((13, 14, 15), TERRAIN_NAMES, strict=True):
             with self.subTest(name=name):
                 narrow.buffer_capacity_status(clear=True)
                 narrow._buffer_capacity_status.assign([1 << bit])

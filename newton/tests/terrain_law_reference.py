@@ -9,13 +9,17 @@ surface feature:
 
 * P: point and segment cores (sphere centre, capsule ends and axis interior): face, crease-edge and vertex minima
   under one shared set of predicate values; G2 keeps one exit for a core point inside the solid, G3 the face
-  vertically above it when no exit lies in the window.
+  vertically above it when no exit lies in the window. An axis passing below a ridge exits over it (the segment's
+  minimum translation), and an axis inside the solid with no exit gets G3 at its deepest crossing under a crease
+  (:func:`capsule_law`).
 * F: solid cores against plane clusters: the analytic plane manifold of the core against the cluster plane,
   emitted once per cluster by the triangle holding the first supported point.
 * E: solid cores against convex creases: the maximiser of the separation over the crease's normal arc, then the
   core's flat support feature (interior) or its reference feature (arc end, G1) crossed with the edge.
 * V: solid cores against vertex features (vertices whose incident cluster normals span 3-D).
 * R: solid cores below the surface with no row: up to four of their deepest boundary points (G3).
+* X: solid cores below the surface: the exit (P's G2 or G3) of their deepest candidate boundary point, when deeper
+  than every other row (:func:`exit_rule`).
 * C: optional concave anticipation of a moving core.
 * The finish: coincident rows merged, rows implied by the others of their plane group dropped (the lower convex
   hull of tangent position and distance), at most four rows per plane group and, given a row limit, at most that
@@ -43,6 +47,7 @@ sub 0 = (p00, p10, p11) and sub 1 = (p00, p11, p01); triangle id = 2 * (r * cols
 
 from __future__ import annotations
 
+import functools
 import math
 
 import numpy as np
@@ -76,8 +81,28 @@ EPS_PRED = 1.0e-12
 """Predicate band [m]: a value within it counts as on the boundary."""
 EPS_MERGE_P = 1.0e-7
 EPS_MERGE_N = 1.0e-6
-EPS_THETA = 1.0e-7
+EPS_THETA = 1.0e-5
+"""Arc-end tolerance of rule E [rad] (DESIGN 1.4): a ``theta*`` within it of an arc's end takes the end's reference
+feature (G1)."""
 CYLINDER_FLAT_MODE_COS = math.cos(math.radians(22.5))
+TIE = 1.0e-6
+"""Tie band of the plane manifolds' and reference features' discrete choices (DESIGN 1.4): of candidates within
+``TIE`` times the core's bounding radius in height (or distance; area: its square), or within ``TIE`` in a normal's
+score, the first in index order wins. Two of them are ties by construction: a rolling cylinder's two cap-rim side
+points lie at one height, and a lying cylinder's caps face the plane equally."""
+HULL_FACE_TOL = 1.0e-6
+"""A hull's vertices within this of a face's plane lie on that face [m] (hulls under 1 m; local frame).
+
+Mesh vertices are float32: the vertices of one planar face lie within about 1e-8 m of its plane, and a tighter test
+splits the face into slivers (a sole's flat bottom into triangles).
+"""
+LIFT_SLACK = 1.0e-8
+"""How far a line may miss a core and still graze it [m] (rule E's lifts).
+
+An interior ``theta*`` puts the crease line exactly through the core's support point; at a support edge sharper than
+a right angle (a cone's base rim or apex, a sharp hull vertex) the line along ``n(theta*)`` only touches the core
+there, and the golden-section ``theta*`` places it within about 1e-9 m. A tighter test drops that support.
+"""
 
 RING = ((0, 1), (1, 1), (1, 0), (0, -1), (-1, -1), (-1, 0))
 """One-ring neighbour offsets (dr, dc) of a vertex, counter-clockwise."""
@@ -629,21 +654,31 @@ def quat_matrix(q):
     return np.stack([quat_rotate(q, e) for e in np.eye(3)], 1)
 
 
-def reduce4(points, heights, normal):
+def first_within(values, band, *, largest=False):
+    """The first index whose value lies within ``band`` of the smallest (or largest) value."""
+    v = np.asarray(values, np.float64)
+    if largest:
+        return int(np.flatnonzero(v >= v.max() - band)[0])
+    return int(np.flatnonzero(v <= v.min() + band)[0])
+
+
+def reduce4(points, heights, normal, *, tie=0.0):
     """Indices of at most 4 points: the deepest, the farthest from it, the largest triangle, then the point adding
-    the most area outside that triangle (areas in the plane normal to ``normal``). Lowest index wins ties."""
+    the most area outside that triangle (areas in the plane normal to ``normal``). The first in index order within
+    ``tie`` (a length; areas within its square times... the largest area's scale) of the best wins."""
     n = len(points)
     if n <= 4:
         return list(range(n))
     P = np.asarray(points, np.float64)
     P = P - np.outer(P @ normal, normal)
     h = np.asarray(heights, np.float64)
-    i0 = int(np.argmin(h))
-    i1 = int(np.argmax(np.linalg.norm(P - P[i0], axis=1)))
+    i0 = first_within(h, tie)
+    i1 = first_within(np.linalg.norm(P - P[i0], axis=1), tie, largest=True)
     a2 = np.abs(np.cross(P[i1] - P[i0], P - P[i0]) @ normal)
-    i2 = int(np.argmax(a2))
-    best, i3 = 1e-15, None
+    scale = max(float(np.linalg.norm(P[i1] - P[i0])), 1.0e-12)
+    i2 = first_within(a2, tie * scale, largest=True)
     tri = (i0, i1, i2)
+    gains = np.zeros(n)
     for j in range(n):
         if j in tri:
             continue
@@ -653,14 +688,31 @@ def reduce4(points, heights, normal):
             side_j = np.cross(P[b] - P[a], P[j] - P[a]) @ normal
             if side_c * side_j < 0:
                 gain = max(gain, abs(side_j))
-        if gain > best:
-            best, i3 = gain, j
+        gains[j] = gain
+    i3 = None
+    if gains.max() > 1e-15:
+        i3 = int(np.flatnonzero(gains >= max(gains.max() - tie * scale, 1e-15 * (1 + 1e-12)))[0])
     out = [i0, i1, i2] + ([i3] if i3 is not None else [])
     return list(dict.fromkeys(out))
 
 
+def _order_by_depth(indices, h, band):
+    """Indices deepest first: an index passes an earlier one only when deeper by more than ``band``."""
+    out = []
+    for i in sorted(indices):
+        pos = len(out)
+        while pos > 0 and h[out[pos - 1]] > h[i] + band:
+            pos -= 1
+        out.insert(pos, i)
+    return out
+
+
 def convex_hull_faces(verts, *, tol: float = 1.0e-9):
-    """Faces of the convex hull of ``verts``: vertex index lists and outward unit normals (brute force, small sets)."""
+    """Faces of the convex hull of ``verts``: vertex index lists and outward unit normals (brute force, small sets).
+
+    A face is a plane through three vertices with every vertex on one side (within ``tol`` times the vertices' extent,
+    at least 1 m); its vertices are those within that of the plane, and planes with the same vertices are one face.
+    """
     V = np.asarray(verts, np.float64)
     n = len(V)
     faces = {}
@@ -680,9 +732,9 @@ def convex_hull_faces(verts, *, tol: float = 1.0e-9):
                     normal, s = -normal, -s
                 else:
                     continue
-                key = (*np.round(normal, 7).tolist(), round(float(normal @ V[i]), 7))
+                key = tuple(int(m) for m in np.flatnonzero(np.abs(s) <= tol * scale))
                 if key not in faces:
-                    faces[key] = (normal, sorted(int(m) for m in np.flatnonzero(np.abs(s) <= tol * scale)))
+                    faces[key] = (normal, list(key))
     normals = [f[0] for f in faces.values()]
     lists = [f[1] for f in faces.values()]
     return lists, normals
@@ -761,7 +813,7 @@ class Polytope(Core):
             denom = f_n @ n
             num = f_d - f_n @ u
             if abs(denom) < 1e-14:
-                if num < -1e-12:
+                if num < -LIFT_SLACK:
                     return None
                 continue
             t = num / denom
@@ -769,7 +821,7 @@ class Polytope(Core):
                 t_hi = min(t_hi, t)
             else:
                 t_lo = max(t_lo, t)
-        if t_lo > t_hi + 1e-12 or not np.isfinite(t_lo):
+        if t_lo > t_hi + LIFT_SLACK or not np.isfinite(t_lo):
             return None
         return u + t_lo * n, t_lo
 
@@ -848,14 +900,26 @@ class Box(Polytope):
         super().__init__(corners, faces, normals)
 
     def plane_manifold(self, n, a, D):
-        """Newton's plane-box manifold: up to 4 deepest corners within reach."""
+        """Newton's plane-box manifold: up to 4 deepest corners within reach, deepest first; a corner passes a kept one
+        only when deeper by more than the tie band (else corner order holds)."""
+        band = TIE * float(np.linalg.norm(self.half))
         kept = []
         for i in range(8):
             h = float(n @ (self.verts[i] - a))
-            if h <= D:
-                kept.append((h, i))
-        kept.sort(key=lambda x: (x[0], x[1]))
-        return [(self.verts[i].copy(), h) for h, i in kept[:4]]
+            if h > D:
+                continue
+            pos = len(kept)
+            while pos > 0 and kept[pos - 1][0] > h + band:
+                pos -= 1
+            kept.insert(pos, (h, i))
+            del kept[4:]
+        return [(self.verts[i].copy(), h) for h, i in kept]
+
+
+@functools.lru_cache(maxsize=64)
+def _local_hull_faces(data: bytes, shape: tuple):
+    """:func:`convex_hull_faces` of local hull vertices (memoized: poses of one hull share them)."""
+    return convex_hull_faces(np.frombuffer(data, np.float64).reshape(shape), tol=HULL_FACE_TOL)
 
 
 class Hull(Polytope):
@@ -864,21 +928,31 @@ class Hull(Polytope):
     def __init__(self, c, rot, verts_local):
         self.c = np.asarray(c, np.float64)
         self.R = np.asarray(rot, np.float64)
-        v = self.c + np.asarray(verts_local, np.float64) @ self.R.T
-        faces, normals = convex_hull_faces(v)
-        super().__init__(v, faces, normals)
+        local = np.asarray(verts_local, np.float64)
+        # Faces from the local vertices: the decision does not depend on where the hull is.
+        faces, normals = _local_hull_faces(local.tobytes(), local.shape)
+        super().__init__(self.c + local @ self.R.T, faces, [self.R @ nn for nn in normals])
+
+    def radius(self):
+        """The largest distance of a vertex from the centre (the tie band's scale)."""
+        return float(np.linalg.norm(self.verts - self.c, axis=1).max())
 
     def plane_manifold(self, n, a, D):
-        """The reference face (most opposed to n) and the deepest vertex, within reach, reduced to 4 by area."""
+        """The reference face (DESIGN 1.2: the face through the deepest vertex most opposed to n, the face G1's
+        crossings use) and the deepest vertex, within reach, reduced to 4 by area, deepest first (ties within the band
+        in index order)."""
+        band = TIE * self.radius()
         h = (self.verts - a) @ n
-        ref = int(np.argmin(self.fnormals @ n))
-        cand = set(self.faces[ref])
-        cand.add(int(np.argmin(h)))
+        deepest = first_within(h, band)
+        through = [q for q, f in enumerate(self.faces) if deepest in f]
+        cand = {deepest}
+        if through:
+            cand.update(self.faces[through[first_within(self.fnormals[through] @ n, TIE)]])
         idx = sorted(i for i in cand if h[i] <= D)
         if not idx:
             return []
-        keep = reduce4(self.verts[idx], h[idx], n)
-        sel = sorted((idx[k] for k in keep), key=lambda i: (h[i], i))
+        keep = reduce4(self.verts[idx], h[idx], n, tie=band)
+        sel = _order_by_depth([idx[k] for k in keep], h, band)
         return [(self.verts[i].copy(), float(h[i])) for i in sel]
 
 
@@ -910,7 +984,7 @@ class Cylinder(Core):
         """Newton's plane-cylinder manifold (deepest rim point plus a tripod or the rolling points) within reach."""
         axis = self.axis.copy()
         dot_na = n @ axis
-        if dot_na > 0.0:
+        if dot_na > TIE:
             axis = -axis
             dot_na = -dot_na
         cap = self.c + axis * self.h
@@ -944,7 +1018,7 @@ class Cylinder(Core):
             if np.sum((p - pts[0]) ** 2) > merge:
                 pts.append(p)
             pp, pm = cap + v, cap - v
-            p = pp if n @ (pp - a) <= n @ (pm - a) else pm
+            p = pm if n @ (pm - a) < n @ (pp - a) - TIE * self.r else pp
             if len(pts) < 4 and np.sum((p - pts[0]) ** 2) > merge:
                 pts.append(p)
         out = []
@@ -962,7 +1036,7 @@ class Cylinder(Core):
         dn = n @ ax
         dw = w @ ax
         if abs(dn) < 1e-14:
-            if abs(dw) > self.h:
+            if abs(dw) > self.h + LIFT_SLACK:
                 return None
         else:
             t1, t2 = (-self.h - dw) / dn, (self.h - dw) / dn
@@ -973,24 +1047,265 @@ class Cylinder(Core):
         B = 2.0 * (wp_ @ npp)
         C = wp_ @ wp_ - self.r * self.r
         if A < 1e-14:
-            if C > 0:
+            if C > 2.0 * self.r * LIFT_SLACK:
                 return None
         else:
+            # disc / (4 A) = r^2 - rho^2 for a line at distance rho from the axis: a graze within the slack counts
             disc = B * B - 4 * A * C
             if disc < 0:
-                return None
+                if disc / (4.0 * A) < -2.0 * self.r * LIFT_SLACK:
+                    return None
+                disc = 0.0
             sq = math.sqrt(disc)
             t1, t2 = (-B - sq) / (2 * A), (-B + sq) / (2 * A)
             t_lo, t_hi = max(t_lo, t1), min(t_hi, t2)
-        if t_lo > t_hi + 1e-12 or not np.isfinite(t_lo):
+        if t_lo > t_hi + LIFT_SLACK or not np.isfinite(t_lo):
             return None
         return u + t_lo * n, t_lo
 
 
+def _disk_basis(axis):
+    """Two unit vectors spanning the plane normal to ``axis`` (x unless the axis is within 26 deg of x, then y)."""
+    ref = np.array([1.0, 0.0, 0.0]) if abs(axis[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = ref - axis * float(axis @ ref)
+    u /= np.linalg.norm(u)
+    return u, np.cross(axis, u)
+
+
+class Cone(Core):
+    """A cone: apex at ``c + h axis``, base disk of radius ``r`` centred at ``c - h axis`` (Newton's convention).
+
+    Its plane manifold mirrors the cylinder's with the base as the only cap: within 22.5 deg of base-down the deepest
+    base rim point plus the fixed base tripod; otherwise the two ends of the lowest generator (the base rim point
+    under the plane's normal and the apex), the lower one first.
+    """
+
+    kind = "cone"
+
+    def __init__(self, c, axis, radius, half_height):
+        self.c = np.asarray(c, np.float64)
+        self.axis = np.asarray(axis, np.float64) / np.linalg.norm(axis)
+        self.r = float(radius)
+        self.h = float(half_height)
+        self.apex = self.c + self.h * self.axis
+        self.base = self.c - self.h * self.axis
+
+    def _perp(self, n):
+        """The base-plane direction of the rim point lowest along ``n`` (a fixed one when the base is level)."""
+        ax = self.axis
+        perp = -n + ax * float(n @ ax)
+        ln = float(perp @ perp)
+        if ln > 1e-10:
+            return perp / math.sqrt(ln)
+        return _disk_basis(-ax)[0]
+
+    def generator(self, n):
+        """The base rim point under ``n`` and the apex: the lowest generator's ends."""
+        return self.base + self.r * self._perp(n), self.apex.copy()
+
+    def _band(self):
+        return TIE * math.hypot(self.r, self.h)
+
+    def lowest(self, n):
+        g, p = self.generator(n)
+        return p if float(n @ p) < float(n @ g) - self._band() else g
+
+    def aabb(self):
+        ext = self.r * np.sqrt(np.maximum(0.0, 1.0 - self.axis * self.axis))
+        return np.minimum(self.base - ext, self.apex), np.maximum(self.base + ext, self.apex)
+
+    def plane_manifold(self, n, a, D):
+        ax = self.axis
+        g, p = self.generator(n)
+        merge = (0.01 * max(self.r, self.h)) ** 2
+        if float(n @ ax) >= CYLINDER_FLAT_MODE_COS:
+            down = -ax
+            u, v = _disk_basis(down)
+            u, v = u * self.r, v * self.r
+            pts = [g]
+            for q in (self.base + u, self.base - 0.5 * u + 0.8660254 * v, self.base - 0.5 * u - 0.8660254 * v):
+                if len(pts) < 4 and np.sum((q - pts[0]) ** 2) > merge:
+                    pts.append(q)
+        else:
+            first, second = (p, g) if float(n @ p) < float(n @ g) - self._band() else (g, p)
+            pts = [first]
+            if np.sum((second - first) ** 2) > merge:
+                pts.append(second)
+        out = []
+        for q in pts:
+            hh = float(n @ (q - a))
+            if hh <= D:
+                out.append((q.copy(), hh))
+        return out
+
+    def lift(self, u, n):
+        """Entry of the line u + t n into the solid cone (smallest t)."""
+        ax = self.axis
+        w = u - self.apex
+        # z(t) = a . (x(t) - apex) in [-2h, 0]; |P x|^2 <= k^2 z^2 with k = r / (2 h)
+        k2 = (self.r / (2.0 * self.h)) ** 2
+        dz, wz = float(n @ ax), float(w @ ax)
+        t_lo, t_hi = -np.inf, np.inf
+        if abs(dz) < 1e-14:
+            if wz > LIFT_SLACK or wz < -2.0 * self.h - LIFT_SLACK:
+                return None
+        else:
+            t1, t2 = (-2.0 * self.h - wz) / dz, (0.0 - wz) / dz
+            t_lo, t_hi = max(t_lo, min(t1, t2)), min(t_hi, max(t1, t2))
+        wp_ = w - wz * ax
+        np_ = n - dz * ax
+        A = float(np_ @ np_) - k2 * dz * dz
+        B = 2.0 * (float(wp_ @ np_) - k2 * wz * dz)
+        C = float(wp_ @ wp_) - k2 * wz * wz
+        # The lower nappe: within the slab z <= 0 the quadratic's solution set is one interval.
+        if abs(A) < 1e-14:
+            if abs(B) < 1e-14:
+                if C > 2.0 * self.r * LIFT_SLACK:
+                    return None
+            elif B > 0.0:
+                t_hi = min(t_hi, -C / B)
+            else:
+                t_lo = max(t_lo, -C / B)
+        else:
+            disc = B * B - 4.0 * A * C
+            if A > 0.0 and disc < 0.0 and disc / (4.0 * A) >= -2.0 * self.r * LIFT_SLACK:
+                disc = 0.0
+            if disc < 0.0:
+                if A > 0.0:
+                    return None
+            else:
+                sq = math.sqrt(disc)
+                r1, r2 = sorted(((-B - sq) / (2.0 * A), (-B + sq) / (2.0 * A)))
+                if A > 0.0:
+                    t_lo, t_hi = max(t_lo, r1), min(t_hi, r2)
+                elif dz > 0.0:
+                    # A line steeper than the wall leaves the lower nappe at r1 (and enters the upper one at r2).
+                    t_hi = min(t_hi, r1)
+                else:
+                    t_lo = max(t_lo, r2)
+        if t_lo > t_hi + LIFT_SLACK or not np.isfinite(t_lo):
+            return None
+        return u + t_lo * n, t_lo
+
+    def contains(self, x):
+        z = float((x - self.apex) @ self.axis)
+        rho = float(np.linalg.norm((x - self.apex) - z * self.axis))
+        return -2.0 * self.h <= z <= 0.0 and rho <= self.r * (-z) / (2.0 * self.h)
+
+
+class Ellipsoid(Core):
+    """An ellipsoid of semi-axes ``s`` (local x, y, z) centred at ``c`` with rotation ``rot``; its plane manifold is
+    its support point (Newton's analytic plane query)."""
+
+    kind = "ellipsoid"
+
+    def __init__(self, c, rot, semi):
+        self.c = np.asarray(c, np.float64)
+        self.R = np.asarray(rot, np.float64)
+        self.s = np.asarray(semi, np.float64)
+
+    def lowest(self, n):
+        m = self.R.T @ n
+        y = -(self.s**2) * m / math.sqrt(float(np.sum((self.s * m) ** 2)))
+        return self.c + self.R @ y
+
+    def aabb(self):
+        ext = np.sqrt(np.sum((self.R * self.s[None, :]) ** 2, axis=1))
+        return self.c - ext, self.c + ext
+
+    def plane_manifold(self, n, a, D):
+        k = self.lowest(n)
+        h = float(n @ (k - a))
+        return [(k, h)] if h <= D else []
+
+    def lift(self, u, n):
+        y0 = (self.R.T @ (u - self.c)) / self.s
+        dy = (self.R.T @ n) / self.s
+        A = float(dy @ dy)
+        B = 2.0 * float(y0 @ dy)
+        C = float(y0 @ y0) - 1.0
+        disc = B * B - 4.0 * A * C
+        if disc < 0.0:
+            if disc / (4.0 * A) < -2.0 * LIFT_SLACK / float(self.s.max()):
+                return None
+            disc = 0.0
+        t = (-B - math.sqrt(disc)) / (2.0 * A)
+        return u + t * n, t
+
+    def contains(self, x):
+        y = (self.R.T @ (x - self.c)) / self.s
+        return float(y @ y) <= 1.0
+
+    def boundary_nearest(self, x):
+        """The boundary point nearest ``x`` (inside or outside), from the secular equation (float64 bisection).
+
+        The stationary points are ``x_i = s_i^2 y_i / (s_i^2 + t)`` with ``sum((s_i y_i / (s_i^2 + t))^2) = 1``; the
+        nearest one has ``t > 0`` outside and ``t`` in ``(-min s^2, 0]`` inside. An interior point on the smallest
+        axis's plane may instead be nearest to the points ``t = -min s^2`` off that plane.
+        """
+        y = self.R.T @ (x - self.c)
+        s2 = self.s**2
+
+        def residual(t):
+            return float(np.sum((self.s * y / (t + s2)) ** 2)) - 1.0
+
+        inside = float(np.sum((y / self.s) ** 2)) <= 1.0
+        if inside:
+            a, b = -float(s2.min()), 0.0
+            a = a + 1e-15 * max(1.0, abs(a))
+        else:
+            a, b = 0.0, float(np.linalg.norm(y) * self.s.max()) + 1e-12
+        candidates = []
+        if residual(a) >= 0.0:
+            for _ in range(200):
+                mid = 0.5 * (a + b)
+                if residual(mid) > 0.0:
+                    a = mid
+                else:
+                    b = mid
+            t = 0.5 * (a + b)
+            candidates.append(s2 * y / (t + s2))
+        if inside:
+            k = int(np.argmin(s2))
+            others = [j for j in range(3) if j != k]
+            if all(abs(s2[j] - s2[k]) > 1e-15 for j in others):
+                xs = np.zeros(3)
+                for j in others:
+                    xs[j] = s2[j] * y[j] / (s2[j] - s2[k])
+                rest = 1.0 - sum((xs[j] / self.s[j]) ** 2 for j in others)
+                if rest >= 0.0:
+                    for sign in (1.0, -1.0):
+                        cand = xs.copy()
+                        cand[k] = sign * self.s[k] * math.sqrt(rest)
+                        candidates.append(cand)
+        if not candidates:
+            # Equal smallest axes with the point on their plane: the minimum translation over dense directions.
+            i = np.arange(4096) + 0.5
+            phi = np.arccos(1.0 - 2.0 * i / 4096)
+            theta = math.pi * (1.0 + 5.0**0.5) * i
+            d = np.stack([np.cos(theta) * np.sin(phi), np.sin(theta) * np.sin(phi), np.cos(phi)], 1)
+            support = np.sqrt(np.sum((d * self.s) ** 2, axis=1))
+            j = int(np.argmin(support - d @ y))
+            candidates.append(s2 * d[j] / support[j])
+        best = min(candidates, key=lambda cand: float(np.linalg.norm(cand - y)))
+        return self.c + self.R @ best
+
+    def outward_normal(self, p):
+        g = (self.R.T @ (p - self.c)) / self.s**2
+        g = self.R @ g
+        return g / np.linalg.norm(g)
+
+
 def make_core(kind: str, dims: dict, pose_local, *, verts=None) -> Core:
-    """A core in the heightfield-local frame: ``pose_local`` = (px, py, pz, qx, qy, qz, qw)."""
+    """A core in the heightfield-local frame: ``pose_local`` = (px, py, pz, qx, qy, qz, qw).
+
+    ``dims``: sphere ``radius``; capsule, cylinder and cone ``radius`` and ``half_height``; box ``half``; ellipsoid
+    ``semi`` (semi-axes); hull ``verts`` (its local vertices, scale applied).
+    """
     p = np.asarray(pose_local[:3], np.float64)
-    R = quat_matrix(np.asarray(pose_local[3:7], np.float64))
+    q = np.asarray(pose_local[3:7], np.float64)
+    # A float32 pose's quaternion is unit only to about 6e-8; a polytope's face normals must stay its corners' planes.
+    R = quat_matrix(q / np.linalg.norm(q))
     z = R[:, 2]
     if kind == "sphere":
         return Sphere(p, dims["radius"])
@@ -1000,8 +1315,12 @@ def make_core(kind: str, dims: dict, pose_local, *, verts=None) -> Core:
         return Box(p, R, dims["half"])
     if kind == "cylinder":
         return Cylinder(p, z, dims["radius"], dims["half_height"])
+    if kind == "cone":
+        return Cone(p, z, dims["radius"], dims["half_height"])
+    if kind == "ellipsoid":
+        return Ellipsoid(p, R, dims["semi"])
     if kind == "hull":
-        return Hull(p, R, verts)
+        return Hull(p, R, dims["verts"] if verts is None else verts)
     raise ValueError(kind)
 
 
@@ -1105,6 +1424,10 @@ class PointLaw:
             if ta is None or tb is None:
                 continue
             key = tuple(sorted((i0, i1)))
+            if not below and self.cls.get(key) == "concave":
+                # A valley's minima outside the solid are its faces'; beyond both faces lies below its line, where
+                # the normal from the edge would leave the faces' cone (a ghost pushing the core down).
+                continue
             sa = self.face_pred(ta, key, p)
             sb = self.face_pred(tb, key, p)
             if not (sa > EPS_PRED and sb > EPS_PRED):
@@ -1169,10 +1492,31 @@ def _recovery_row(hf, p, feat):
     return Row(p - d * n, p.copy(), n.copy(), d, feat)
 
 
+def solid_recovery_points(core):
+    """The boundary points G3 tries for a solid core: polytope vertices; a cylinder's 16 rim points per cap; a cone's
+    16 base rim points and its apex; an ellipsoid's 14 points on its local axes and diagonals."""
+    if hasattr(core, "verts"):
+        return core.verts
+    th = np.linspace(0.0, 2.0 * np.pi, 16, endpoint=False)
+    if core.kind == "ellipsoid":
+        local = [np.array([sx, 0.0, 0.0]) for sx in (1.0, -1.0)]
+        local += [np.array([0.0, sy, 0.0]) for sy in (1.0, -1.0)]
+        local += [np.array([0.0, 0.0, sz]) for sz in (1.0, -1.0)]
+        third = 1.0 / math.sqrt(3.0)
+        local += [np.array([sx, sy, sz]) * third for sx in (1.0, -1.0) for sy in (1.0, -1.0) for sz in (1.0, -1.0)]
+        return np.stack([core.c + core.R @ (core.s * p) for p in local])
+    ax = core.axis
+    u, w = _disk_basis(ax)
+    ring = core.r * (np.outer(np.cos(th), u) + np.outer(np.sin(th), w))
+    if core.kind == "cone":
+        return np.concatenate([core.base + ring, core.apex[None, :]])
+    return np.concatenate([core.c + core.h * ax + ring, core.c - core.h * ax + ring])
+
+
 def _solid_recovery(hf, core, *, kmax=4):
     """G3 for solid cores with no row: up to 4 of the core's deepest boundary points below the surface."""
-    if hasattr(core, "verts"):
-        pts = core.verts
+    if hasattr(core, "verts") or core.kind in ("cone", "ellipsoid"):
+        pts = solid_recovery_points(core)
     else:
         ax = core.axis
         ref = np.array([1.0, 0.0, 0.0]) if abs(ax[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
@@ -1195,6 +1539,343 @@ def _solid_recovery(hf, core, *, kmax=4):
     return [Row(x - d * n, x.copy(), n.copy(), d, ("R", i), group=("P", t)) for d, i, x, n, t in cands[:kmax]]
 
 
+EXIT_MARGIN = 1.0e-5
+"""Rule X offers a solid pair's deepest exit only where it lies deeper than every other row of the pair by more than
+this [m]: a pair whose rows reach its depth keeps them as they are."""
+EXIT_ARC_SAMPLES = 9
+"""Equally spaced normals of rule X's scan of a valley's normal arc, its ends included (rule E's count)."""
+
+
+def _arc_angles(core, n_a, m, theta_ab, x0):
+    """Angles of the local minima of ``sigma`` over the arc ``cos t n_a + sin t m``, ``t`` in ``[0, theta_ab]``: a scan
+    of :data:`EXIT_ARC_SAMPLES` equally spaced normals, then each sample no higher than its neighbours (the first of a
+    run of equal values) refined between them by golden section."""
+    count = EXIT_ARC_SAMPLES
+    thetas = [theta_ab * i / (count - 1) for i in range(count)]
+
+    def f(t):
+        return _sigma(core, math.cos(t) * n_a + math.sin(t) * m, x0)[0]
+
+    vals = [f(t) for t in thetas]
+    out = []
+    g = (math.sqrt(5.0) - 1.0) / 2.0
+    for i in range(count):
+        if (i > 0 and vals[i] >= vals[i - 1]) or (i < count - 1 and vals[i] > vals[i + 1]):
+            continue
+        lo, hi = thetas[max(i - 1, 0)], thetas[min(i + 1, count - 1)]
+        c = hi - g * (hi - lo)
+        d = lo + g * (hi - lo)
+        fc, fd = f(c), f(d)
+        for _ in range(60):
+            if fc < fd:
+                hi, d, fd = d, c, fc
+                c = hi - g * (hi - lo)
+                fc = f(c)
+            else:
+                lo, c, fc = c, d, fd
+                d = lo + g * (hi - lo)
+                fd = f(d)
+        t = 0.5 * (lo + hi)
+        out.append(t if f(t) <= vals[i] else thetas[i])
+    return out
+
+
+def _support_ends(core, n):
+    """The core's lowest point along ``n`` (``_sigma``'s) and, for a cylinder or cone, the other end of its lowest
+    generator (a support that ties along a generator holds both)."""
+    k = _sigma(core, n, np.zeros(3))[1]
+    if core.kind == "cylinder":
+        ax = core.axis
+        s = -1.0 if float(n @ ax) > 0.0 else 1.0
+        return [k, k - 2.0 * s * core.h * ax]
+    if core.kind == "cone":
+        g, p = core.generator(n)
+        return [g, p]
+    return [k]
+
+
+def _rims(core):
+    """A cylinder's two rim circles or a cone's base rim: ``(centre, axis, radius)``."""
+    if core.kind == "cylinder":
+        return [(core.c + core.h * core.axis, core.axis, core.r), (core.c - core.h * core.axis, core.axis, core.r)]
+    if core.kind == "cone":
+        return [(core.base, core.axis, core.r)]
+    return []
+
+
+def _farthest_on_ellipsoid(core, v, *, steps=200):
+    """The ellipsoid's local maxima of the distance from ``v``: one or two points.
+
+    With ``y`` the vertex in the local frame, the stationary points are ``x_i = s_i^2 y_i / (s_i^2 - mu)`` at the roots
+    of the secular function ``F(mu) = sum_i s_i^2 y_i^2 / (s_i^2 - mu)^2``, ``F = 1``. On the tangent plane the
+    distance's Hessian is ``diag(1 - mu / s_i^2)``, which is negative definite exactly at the root above the largest
+    ``s_i^2`` (the farthest point) and at a root between the two largest where ``F`` rises (``F'`` is twice the
+    Hessian's inverse quadratic form of the surface normal): ``F`` is convex there, so that root is the larger of the
+    interval's two, which exist when ``F``'s minimum lies below 1 (the near end of an elongated ellipsoid around a
+    vertex inside it). Both are bisected on the root's distance ``t`` from the largest ``s_i^2`` (the minimum on the
+    sign of ``F'`` first), and each point is projected radially onto the surface. The farthest point is the end of the
+    longest axis (the first of equal ones) when ``v`` lies on that axis's plane.
+    """
+    y = core.R.T @ (v - core.c)
+    s = core.s
+    s2 = s**2
+    j = int(np.argmax(s2))
+    rel = s2 - s2[j]
+
+    def secular(t, side):
+        f = slope = 0.0
+        for i in range(3):
+            if y[i] != 0.0:
+                gap = rel[i] - side * t
+                g = s[i] * y[i] / gap
+                f += g * g
+                slope += g * g / gap
+        return f, slope
+
+    def point(t, side):
+        x = np.array([s2[i] * y[i] / (rel[i] - side * t) if y[i] != 0.0 else 0.0 for i in range(3)])
+        return core.c + core.R @ (x / math.sqrt(float(np.sum((x / s) ** 2))))
+
+    out = []
+    if abs(y[j]) <= 1.0e-12 * float(s[j]):
+        local = np.zeros(3)
+        local[j] = s[j]
+        out.append(core.c + core.R @ local)
+    else:
+        lo, hi = 0.0, float(s[j]) * float(np.linalg.norm(y))
+        for _ in range(steps):
+            t = 0.5 * (lo + hi)
+            lo, hi = (t, hi) if secular(t, 1.0)[0] > 1.0 else (lo, t)
+        out.append(point(0.5 * (lo + hi), 1.0))
+    m = (j + 1) % 3 if s2[(j + 1) % 3] >= s2[(j + 2) % 3] else (j + 2) % 3
+    width = -float(rel[m])
+    if width > 0.0 and y[j] != 0.0:
+        lo, hi = 0.0, width
+        for _ in range(steps):
+            t = 0.5 * (lo + hi)
+            lo, hi = (lo, t) if secular(t, -1.0)[1] < 0.0 else (t, hi)
+        bottom = 0.5 * (lo + hi)
+        if secular(bottom, -1.0)[0] < 1.0:
+            lo, hi = 0.0, bottom
+            for _ in range(steps):
+                t = 0.5 * (lo + hi)
+                lo, hi = (lo, t) if secular(t, -1.0)[0] < 1.0 else (t, hi)
+            out.append(point(0.5 * (lo + hi), -1.0))
+    return out
+
+
+def _exit_bound(hf, x):
+    """An upper bound of point ``x``'s exit translation, or ``None`` above the surface: its depth below the cluster
+    plane of the triangle under it when its projection onto that plane stays in the cluster (a face minimum), else
+    its distance to that triangle."""
+    t = hf.locate(x[0], x[1])
+    if t is None:
+        return None
+    n, a = hf.plane(t)
+    d = float(n @ (x - a))
+    if d >= 0.0:
+        return None
+    q = x - d * n
+    s = hf.locate(q[0], q[1])
+    if s is not None and hf.same_cluster(t, s):
+        return -d
+    return float(np.linalg.norm(x - _closest_on_tri(x, *hf.tri_verts(t))))
+
+
+EXIT_DESCENT = 4
+"""Blocks of 3 x 3 cells rule X's near bound visits at most per candidate (:func:`_near_bound`)."""
+
+
+def _near_bound(hf, x, bound, stop):
+    """``bound`` lowered to ``x``'s distance to the triangles of the 3 x 3 cells around the one under it, then around
+    the cell under ``x``'s projection onto the plane of the block's nearest triangle, while that cell moves and the
+    bound exceeds ``stop`` (at most :data:`EXIT_DESCENT` blocks, within the heightfield): the second stage of rule X's
+    bound, before an exit search. A bound only decides which exits are searched, never the exit kept."""
+    t = hf.locate(x[0], x[1])
+    if t is None:
+        return bound
+    r, c, _sub = hf.tri_rc(t)
+    for _ in range(EXIT_DESCENT):
+        near, nearest = None, math.inf
+        for rr in range(max(r - 1, 0), min(r + 1, hf.rows - 1) + 1):
+            for cc in range(max(c - 1, 0), min(c + 1, hf.cols - 1) + 1):
+                for sub in (0, 1):
+                    k = _closest_on_tri(x, *hf.tri_verts(hf.tri_id(rr, cc, sub)))
+                    distance = float(np.linalg.norm(x - k))
+                    if distance < nearest:
+                        nearest, near = distance, hf.tri_id(rr, cc, sub)
+        bound = min(bound, nearest)
+        if bound <= stop:
+            break
+        a, b, c3 = hf.tri_verts(near)
+        n = np.cross(b - a, c3 - a)
+        n /= np.linalg.norm(n)
+        q = x - float((x - a) @ n) * n
+        s = hf.locate(q[0], q[1])
+        if s is None or hf.tri_rc(s)[:2] == (r, c):
+            break
+        r, c, _sub = hf.tri_rc(s)
+    return bound
+
+
+def _exit_minima(hf, x, D, bound):
+    """The point law's exit of ``x`` (:class:`PointLaw`, G2 or G3) over the cells within ``bound`` of it (widened a
+    little), clamped to the heightfield: ``x``'s closest surface point lies there when ``bound`` is at least its
+    distance, so the exit is the one a search of the whole heightfield finds."""
+    reach = bound + 1.0e-5
+    box = hf.cells_in_box(x[:2] - reach, x[:2] + reach)
+    if box is None:
+        return []
+    return [r for r in PointLaw(hf, *hf.window_features(box)).minima(x, D, "x") if r.d <= EPS_PRED]
+
+
+def _valley_arc(hf, e):
+    """A valley's normal arc, exactly perpendicular to its edge: ``(v0, v1, n_a, m, theta_ab)``, or None."""
+    _k, _er, _ec, i0, i1, ta, tb, _oa, _ob = e
+    v0, v1 = hf.V(*i0), hf.V(*i1)
+    dvec = v1 - v0
+    dh = dvec / float(np.linalg.norm(dvec))
+    n_a = hf.plane(ta)[0]
+    n_b = hf.plane(tb)[0]
+    n_a = n_a - (n_a @ dh) * dh
+    n_a /= np.linalg.norm(n_a)
+    n_b = n_b - (n_b @ dh) * dh
+    n_b /= np.linalg.norm(n_b)
+    cosab = float(np.clip(n_a @ n_b, -1.0, 1.0))
+    th_ab = math.acos(cosab)
+    m = n_b - cosab * n_a
+    if th_ab < 1e-9 or np.linalg.norm(m) < 1e-12:
+        return None
+    return v0, v1, n_a, n_b, m / np.linalg.norm(m), th_ab
+
+
+def _farthest_rim_points(core, v):
+    """The core's local maxima of the distance from ``v``: per rim (a cylinder's top then bottom cap, a cone's base)
+    its point farthest from ``v``, an ellipsoid's one or two (:func:`_farthest_on_ellipsoid`)."""
+    if core.kind == "ellipsoid":
+        return _farthest_on_ellipsoid(core, v)
+    out = []
+    for centre, axis, radius in _rims(core):
+        w = centre - v
+        w = w - float(w @ axis) * axis
+        lw = float(np.linalg.norm(w))
+        e = w / lw if lw > 1e-12 else _disk_basis(axis)[0]
+        out.append(centre + radius * e)
+    return out
+
+
+def exit_rule(hf, core, D, window, rows, *, stats=None):
+    """X: the exit (P's G2, or G3) of the deepest of a solid core's candidate boundary points, offered when it lies
+    deeper than every row of the pair by more than :data:`EXIT_MARGIN`.
+
+    A deepest boundary point whose closest surface point is unique is a local maximum of its distance to that one
+    feature over the core's boundary: for a face, a support point of rule F's plane manifold; for a valley edge or a
+    vertex, an extreme point of the core. The candidates, in the kernels' order:
+
+    * every point of a box or hull, a cone's apex;
+    * walking the window vertex by vertex, per valley edge (concave crease; x-, y- then diagonal edge) the core's
+      support points (both ends of a lowest generator) at the local minima of ``sigma`` over the valley's normal arc
+      (:func:`_arc_angles`): the core's deepest points in the wedge below the valley; per interior vertex the core's
+      local maxima of the distance from it (:func:`_farthest_rim_points`: each rim's farthest point, an ellipsoid's
+      one or two).
+
+    The rule keeps the deepest candidate exit, the first in window order on ties: the point law's exit (G2, or G3) of
+    the candidate over the cells within its bound (:func:`_exit_minima`), where its closest surface point lies, inside
+    the window or not. A candidate's bound is :func:`_exit_bound` or its distance to the feature that proposed it, the
+    smaller, lowered by :func:`_near_bound`; the exits are searched largest bound first while a bound can still beat
+    the pair's depth plus the margin and the best exit found (or tie it from earlier in window order). The bounds
+    decide which exits are searched, never the exit kept, so the kernels may search them in another order. A valley
+    is skipped where no core point in the wedge below it can lie deeper than the pair's depth: within the wedge a
+    point's distance to the edge is at most its height under the edge's higher end over the smaller normal ``z``. A
+    candidate is closest to its valley or vertex only below it: one no lower is left out. The deepest boundary point is
+    found unless it is a tie: equally far from two or more surface points (then it can lie inside a core face, where
+    no candidate is). Returns ``[]`` or the row.
+    """
+    _tris, edges, verts = window
+    lo, _hi = core.aabb()
+    lowz = float(lo[2])
+    if not verts or lowz >= max(hf.V(r, c)[2] for r, c in verts):
+        return []
+    target = max(-min((r.d for r in rows), default=0.0), 0.0) + EXIT_MARGIN
+    # the candidates in window order (their keys), with their bounds above the target
+    candidates = []
+
+    def add(x, bound):
+        key = len(candidates)
+        if bound is not None and bound > target:
+            bound = _near_bound(hf, x, bound, target)
+        candidates.append((key, x, bound))
+
+    def bound_by(x, extra):
+        b = _exit_bound(hf, x)
+        return None if b is None else min(b, extra)
+
+    rows_ = [rc[0] for rc in verts]
+    cols_ = [rc[1] for rc in verts]
+    cells = (min(rows_), max(rows_) - 1, min(cols_), max(cols_) - 1)
+    if hasattr(core, "verts"):
+        for x in core.verts:
+            add(x, _exit_bound(hf, x))
+    elif core.kind == "cone":
+        add(core.apex, _exit_bound(hf, core.apex))
+    if not hasattr(core, "verts"):
+        r0, r1, c0, c1 = cells
+        by_key = {(e[0], e[1], e[2]): e for e in edges}
+        for r in range(r0, r1 + 2):
+            for c in range(c0, c1 + 2):
+                for kind in ("H", "V", "D"):
+                    e = by_key.get((kind, r, c))
+                    if e is None or hf.edge_class(e) != "concave":
+                        continue
+                    v0, v1 = hf.V(*e[3]), hf.V(*e[4])
+                    top = max(v0[2], v1[2])
+                    if top <= lowz:
+                        continue
+                    arc = _valley_arc(hf, e)
+                    if arc is None:
+                        continue
+                    v0, v1, n_a, n_b, m, th_ab = arc
+                    if top - lowz <= target * min(n_a[2], n_b[2]):
+                        continue
+                    u = v1 - v0
+                    for t in _arc_angles(core, n_a, m, th_ab, v0):
+                        n = math.cos(t) * n_a + math.sin(t) * m
+                        for x in _support_ends(core, n):
+                            if x[2] >= top:
+                                continue
+                            s = float(np.clip((x - v0) @ u / (u @ u), 0.0, 1.0))
+                            add(x, bound_by(x, float(np.linalg.norm(x - (v0 + s * u)))))
+                if hf.ring(r, c) is None:
+                    continue
+                v = hf.V(r, c)
+                if v[2] <= lowz:
+                    continue
+                for x in _farthest_rim_points(core, v):
+                    if x[2] >= v[2]:
+                        continue
+                    add(x, bound_by(x, float(np.linalg.norm(x - v))))
+    # the exits, largest bound first: one whose bound cannot beat the best exit (nor tie it from earlier in window
+    # order) cannot change it
+    best, best_key, threshold = None, -1, target
+    for key, x, bound in sorted((c for c in candidates if c[2] is not None), key=lambda c: (-c[2], c[0])):
+        if bound < threshold or (bound == threshold and (best is None or key > best_key)):
+            if bound < threshold:
+                break
+            continue
+        if stats:
+            stats.vertex_solves += 1
+        found = _exit_minima(hf, x, D, bound)
+        if not found:
+            continue
+        ex = found[-1]
+        if best is None or ex.d < best.d or (ex.d == best.d and key < best_key):
+            best, best_key = ex, key
+            threshold = max(target, -ex.d)
+    if best is None or -best.d <= target:
+        return []
+    return [Row(best.q, best.k, best.n, best.d, ("X", *best.feat[1:]))]
+
+
 def _closest_seg_seg(p0, p1, q0, q1):
     """Parameters (s, t) of the closest points of segments p0p1 and q0q1 (None when parallel)."""
     d1, d2, r = p1 - p0, q1 - q0, p0 - q0
@@ -1214,37 +1895,86 @@ def sphere_law(hf, core, D, window, *, stats=None):
     return PointLaw(hf, tris, edges, verts).minima(core.c, D, "c", stats=stats)
 
 
+EDGE_ORDER = {"H": 0, "V": 1, "D": 2}
+"""Window edge kinds in the kernels' walk order (a vertex's x-edge, y-edge, diagonal)."""
+
+
+def _footprint_crossing(a, b, v0, v1):
+    """Parameters ``(s, t)`` where segment ``ab``'s footprint (xy) crosses segment ``v0 v1``'s, or None."""
+    d1 = (b - a)[:2]
+    d2 = (v1 - v0)[:2]
+    den = float(d1[0] * d2[1] - d1[1] * d2[0])
+    if den == 0.0:
+        return None
+    r = (v0 - a)[:2]
+    s = float(r[0] * d2[1] - r[1] * d2[0]) / den
+    t = float(r[0] * d1[1] - r[1] * d1[0]) / den
+    if not (0.0 <= s <= 1.0 and 0.0 <= t <= 1.0):
+        return None
+    return s, t
+
+
 def capsule_law(hf, core, D, window, *, stats=None):
+    """The rows of a segment core: its ends as point cores (G2, G3) and its axis interior.
+
+    The axis interior's rows are the closest points of the axis and a crease (both segment parameters inside) or a
+    vertex, the normal from the surface toward the axis point in the feature's normal cone:
+
+    * outside the solid: at a ridge (convex crease) beyond both faces, at a vertex in its Voronoi region;
+    * inside it (an exit): below a ridge within both faces, so that the normal from the axis point to the crease
+      lies in the ridge's arc and the exit lifts the axis over the crease, the segment's minimum translation out of
+      the ridge (a point exit through a face would push the segment sideways); at a valley (concave crease) beyond
+      both faces and at a pit vertex in its Voronoi region, the axis point's closest surface point.
+
+    G3 for the axis interior: with both ends outside and no axis exit, the deepest crossing of the axis's footprint
+    under a crease (ties to the first in the kernels' walk order) gets the plane of the crease's first triangle,
+    its normal and depth.
+    """
     tris, edges, verts = window
     law = PointLaw(hf, tris, edges, verts)
     out = law.minima(core.a, D, "a", stats=stats) + law.minima(core.b, D, "b", stats=stats)
     a, b = core.a, core.b
     ab = b - a
-    # axis-interior minima against edges
+    axis = []
+    ends_outside = not _below_surface(hf, a) and not _below_surface(hf, b)
+    witness = None
+    # axis-interior minima and exits against creases
     for e in edges:
-        _k, _r, _c, i0, i1, ta, tb, _oa, _ob = e
+        kind, r, c, i0, i1, ta, tb, _oa, _ob = e
         if ta is None or tb is None:
             continue
+        cls = hf.edge_class(e)
+        if cls == "flat":
+            continue
         v0, v1 = hf.V(*i0), hf.V(*i1)
+        row = None
         st = _closest_seg_seg(a, b, v0, v1)
-        if st is None:
-            continue
-        s, t = st
-        if not (0.0 < s < 1.0 and 0.0 < t < 1.0):
-            continue
-        p = a + s * ab
-        key = tuple(sorted((i0, i1)))
-        if not (law.face_pred(ta, key, p) > 0.0 and law.face_pred(tb, key, p) > 0.0):
-            continue
-        q = v0 + t * (v1 - v0)
-        dist = float(np.linalg.norm(p - q))
-        if dist < 1e-12:
-            continue
-        below = _below_surface(hf, p)
-        n, d = ((q - p) / dist, -dist) if below else ((p - q) / dist, dist)
-        if d > D:
-            continue
-        out.append(Row(q, p, n, d, ("s", "E", e[0], e[1], e[2])))
+        if st is not None and 0.0 < st[0] < 1.0 and 0.0 < st[1] < 1.0:
+            s, t = st
+            p = a + s * ab
+            q = v0 + t * (v1 - v0)
+            key = tuple(sorted((i0, i1)))
+            sa, sb = law.face_pred(ta, key, p), law.face_pred(tb, key, p)
+            dist = float(np.linalg.norm(p - q))
+            if dist >= 1e-12:
+                if _below_surface(hf, p):
+                    claims = (sa > 0.0 and sb > 0.0) if cls == "concave" else (sa < 0.0 and sb < 0.0)
+                    n, d = (q - p) / dist, -dist
+                else:
+                    claims = cls == "convex" and sa > 0.0 and sb > 0.0
+                    n, d = (p - q) / dist, dist
+                if claims and d <= D:
+                    row = Row(q, p, n, d, ("s", "E", e[0], e[1], e[2]))
+        if row is not None:
+            axis.append(row)
+        elif ends_outside:
+            crossing = _footprint_crossing(a, b, v0, v1)
+            if crossing is not None:
+                s, t = crossing
+                depth = float((v0[2] + t * (v1[2] - v0[2])) - (a[2] + s * ab[2]))
+                order = (r, c, EDGE_ORDER[kind])
+                if depth > 0.0 and (witness is None or (-depth, order) < (-witness[0], witness[1])):
+                    witness = (depth, order, a + s * ab, ta)
     # axis-interior minima against vertices
     L2 = float(ab @ ab)
     for r, c in verts:
@@ -1266,12 +1996,23 @@ def capsule_law(hf, core, D, window, *, stats=None):
         n, d = (-w / dist, -dist) if below else (w / dist, dist)
         if d > D:
             continue
-        out.append(Row(v, p, n, d, ("s", "V", r, c)))
-    return out
+        axis.append(Row(v, p, n, d, ("s", "V", r, c)))
+    if witness is not None and not any(row.d < 0.0 for row in axis):
+        _depth, _order, p, ta = witness
+        n, pa = hf.plane(ta)
+        d = float(n @ (p - pa))
+        if d < 0.0:
+            axis.append(Row(p - d * n, p.copy(), n.copy(), d, ("s", "R", ta)))
+    return out + axis
 
 
 def _sigma(core, n, x0):
+    """The core's separation from x0 along n, ``min n . (k - x0)`` (exact: a cone's lowest point without its tie
+    band), and that point."""
     k = core.lowest(n)
+    if core.kind == "cone":
+        g, p = core.generator(n)
+        k = p if float(n @ p) < float(n @ g) else g
     return float(n @ (k - x0)), k
 
 
@@ -1312,10 +2053,25 @@ def _maximize_arc(core, nA, m, theta_ab, x0, *, samples=9, iters=40):
 
 def _support_feature(core, n, band):
     """The core's flat support feature along -n within ``band``: ('pts', P) for a polytope's face, edge or vertex
-    or a cylinder's lowest point or generator, ('disk', centre, axis, r) for a cylinder cap within the band."""
+    or a cylinder's lowest point or generator, ('disk', centre, axis, r) for a cylinder cap within the band.
+
+    A cone's is its base disk (base down within the band), the lowest generator (both ends within the band) or its
+    lowest point; an ellipsoid's is its support point."""
     if hasattr(core, "verts"):
         h = core.verts @ n
         return ("pts", core.verts[h <= h.min() + band])
+    if core.kind == "ellipsoid":
+        return ("pts", core.lowest(n)[None, :])
+    if core.kind == "cone":
+        ax = core.axis
+        tilt = math.sqrt(max(0.0, 1.0 - float(n @ ax) ** 2))
+        if float(n @ ax) > 0.0 and 2.0 * core.r * tilt <= band:
+            return ("disk", core.base.copy(), ax, core.r)
+        g, p = core.generator(n)
+        k0, k1 = (p, g) if float(n @ p) < float(n @ g) - core._band() else (g, p)
+        if float(n @ (k1 - k0)) <= band:
+            return ("pts", np.stack([k0, k1]))
+        return ("pts", k0[None, :])
     ax = core.axis
     k0 = core.lowest(n)
     s = -1.0 if n @ ax > 0 else 1.0
@@ -1334,14 +2090,21 @@ def _reference_feature(core, n):
     generator."""
     if hasattr(core, "verts"):
         h = core.verts @ n
-        deepest = int(np.argmin(h))
-        best, k = -np.inf, -1
-        for q, f in enumerate(core.faces):
-            if deepest in f:
-                sc = -float(core.fnormals[q] @ n)
-                if sc > best:
-                    best, k = sc, q
+        radius = float(np.linalg.norm(core.verts - core.c, axis=1).max())
+        deepest = first_within(h, TIE * radius)
+        through = [q for q, f in enumerate(core.faces) if deepest in f]
+        k = through[first_within([-float(core.fnormals[q] @ n) for q in through], TIE, largest=True)]
         return ("pts", core.verts[core.faces[k]])
+    if core.kind == "ellipsoid":
+        return ("pts", core.lowest(n)[None, :])
+    if core.kind == "cone":
+        # The base within the flat mode, else the lowest generator (the apex alone when the axis is along n).
+        if float(n @ core.axis) >= CYLINDER_FLAT_MODE_COS:
+            return ("disk", core.base.copy(), core.axis, core.r)
+        perp = -n + core.axis * float(n @ core.axis)
+        if float(np.linalg.norm(perp)) < 1e-12:
+            return ("pts", core.apex[None, :])
+        return ("pts", np.stack(core.generator(n)))
     axis = core.axis if float(n @ core.axis) < 0.0 else -core.axis
     cap = core.c + core.h * axis
     if -float(n @ axis) >= CYLINDER_FLAT_MODE_COS:
@@ -1357,12 +2120,33 @@ def _reference_feature(core, n):
 def _feature_interval(feat, v0, e1, e2, tol, *, need_straddle=False):
     """Interval of the edge-line coordinate x (along e1 from v0) where the feature, projected along n = e1 x e2,
     meets the line y = 0; None when it misses (or, with need_straddle, when it does not cross the line)."""
+    crossing = _feature_crossing(feat, v0, e1, e2, tol, need_straddle=need_straddle)
+    return None if crossing is None else crossing[:2]
+
+
+def _feature_crossing(feat, v0, e1, e2, tol, *, need_straddle=False):
+    """:func:`_feature_interval` with a feature point over each end: ``(lo, hi, k_lo, k_hi)`` or None.
+
+    A point set's ends are the extreme ones among its points within ``tol`` of the line and the crossings of the
+    line by the chords between its points on either side (the line meets their convex hull in that interval); a
+    disk's are its rim points over the ends."""
     if feat[0] == "pts":
         S = feat[1]
         P = np.stack([(S - v0) @ e1, (S - v0) @ e2], 1)
         if need_straddle and not (P[:, 1].min() < -1e-9 and P[:, 1].max() > 1e-9):
             return None
-        return _hull_line_interval(hull2d(P), tol)
+        ends = [(float(P[i, 0]), S[i]) for i in range(len(S)) if abs(P[i, 1]) <= tol]
+        for i in range(len(S)):
+            for j in range(i + 1, len(S)):
+                ya, yb = P[i, 1], P[j, 1]
+                if (ya < -tol and yb > tol) or (ya > tol and yb < -tol):
+                    f = ya / (ya - yb)
+                    ends.append((float(P[i, 0] + f * (P[j, 0] - P[i, 0])), S[i] + f * (S[j] - S[i])))
+        if not ends:
+            return None
+        lo = min(ends, key=lambda end: end[0])
+        hi = max(ends, key=lambda end: end[0])
+        return lo[0], hi[0], lo[1].copy(), hi[1].copy()
     _kind, C, axis, r = feat
     ref = np.array([1.0, 0.0, 0.0]) if abs(axis[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
     u = ref - axis * float(axis @ ref)
@@ -1375,15 +2159,18 @@ def _feature_interval(feat, v0, e1, e2, tol, *, need_straddle=False):
         if abs(yc) > tol or need_straddle:
             return None
         ext = r * math.hypot(float(u @ e1), float(w @ e1))
-        return (xc - ext, xc + ext)
+        along = (u * float(u @ e1) + w * float(w @ e1)) / max(ext / r, 1e-300)
+        return xc - ext, xc + ext, C - r * along, C + r * along
     if abs(yc) > R + tol:
         return None
     if need_straddle and abs(yc) >= R - 1e-9:
         return None
     phi = math.atan2(B_, A_)
     dl = math.acos(max(-1.0, min(1.0, -yc / R)))
-    xs = [xc + r * (math.cos(th) * float(u @ e1) + math.sin(th) * float(w @ e1)) for th in (phi + dl, phi - dl)]
-    return (min(xs), max(xs))
+    rim = [C + r * (math.cos(th) * u + math.sin(th) * w) for th in (phi + dl, phi - dl)]
+    xs = [float((k - v0) @ e1) for k in rim]
+    i_lo, i_hi = (0, 1) if xs[0] <= xs[1] else (1, 0)
+    return xs[i_lo], xs[i_hi], rim[i_lo], rim[i_hi]
 
 
 def hull2d(P):
@@ -1405,29 +2192,6 @@ def hull2d(P):
             upper.pop()
         upper.append(p)
     return np.asarray(lower[:-1] + upper[:-1], np.float64)
-
-
-def _hull_line_interval(H, tol):
-    """Interval of x where the 2-D convex polygon H meets the line y = 0 (None if it misses)."""
-    if len(H) == 0:
-        return None
-    if len(H) == 1:
-        return (H[0, 0], H[0, 0]) if abs(H[0, 1]) <= tol else None
-    xs = []
-    m = len(H)
-    for i in range(m):
-        a, b = H[i], H[(i + 1) % m] if m > 2 else H[1 - i]
-        ya, yb = a[1], b[1]
-        if abs(ya) <= tol:
-            xs.append(a[0])
-        if (ya < -tol and yb > tol) or (ya > tol and yb < -tol):
-            s = ya / (ya - yb)
-            xs.append(a[0] + s * (b[0] - a[0]))
-        if m == 2 and i == 1:
-            break
-    if not xs:
-        return None
-    return min(xs), max(xs)
 
 
 def solid_law(hf, core, D, window, *, stats=None, flat_band=None):
@@ -1507,7 +2271,7 @@ def solid_law(hf, core, D, window, *, stats=None, flat_band=None):
         e1, e2 = dh, np.cross(nst, dh)
         # G1: interior theta*: the flat support feature along -n(theta*); arc end: the reference feature
         feat = _support_feature(core, nst, band) if interior else _reference_feature(core, nst)
-        iv = _feature_interval(feat, v0, e1, e2, 1e-7 + 1e-6 * size, need_straddle=not interior)
+        iv = _feature_crossing(feat, v0, e1, e2, 1e-7 + 1e-6 * size, need_straddle=not interior)
         xs = []
         if iv is not None:
             x0, x1 = max(iv[0], 0.0), min(iv[1], L)
@@ -1520,13 +2284,18 @@ def solid_law(hf, core, D, window, *, stats=None, flat_band=None):
         grp = ("E", e[0], er, ec, round(th, 9)) if interior else ("P", ta if th < 0.5 * th_ab else tb)
         for x in xs:
             u = v0 + x * dh
+            # The feature's chord over the interval lies in the core on the line, so the lift is no deeper than its
+            # point over u; at an end, where the line can only touch the core, that point is the lift (a tangent
+            # lift that rounding made miss, or carried past the chord, is the chord's point).
+            lo, hi, k_lo, k_hi = iv
+            k = k_lo if x == lo else k_hi if x == hi else k_lo + ((x - lo) / (hi - lo)) * (k_hi - k_lo)
+            tt = float(nst @ (k - u))
             hit = core.lift(u, nst)
-            if hit is None:
-                continue
-            k, tt = hit
+            if hit is not None and hit[1] <= tt + LIFT_SLACK:
+                tt = hit[1]
             if tt > D:
                 continue
-            out.append(Row(u, k, nst.copy(), tt, ("E", e[0], er, ec, round(x / L, 6)), group=grp))
+            out.append(Row(u, u + tt * nst, nst.copy(), tt, ("E", e[0], er, ec, round(x / L, 6)), group=grp))
     # ---- vertex features -------------------------------------------------------------------------------------
     for r, c in verts:
         ring = hf.ring(r, c)
@@ -1586,6 +2355,24 @@ def _nearest(core, v):
             return -f, v + d_cap * f, -d_cap
         f = rad / lr
         return -f, v + d_side * f, -d_side
+    if core.kind == "cone":
+        # The base plane or the lateral surface, whichever is nearer (both feet lie on the boundary from inside).
+        w = v - core.apex
+        z = float(w @ core.axis)
+        rad = w - z * core.axis
+        lr = float(np.linalg.norm(rad))
+        d_base = z + 2.0 * core.h
+        slant = math.hypot(core.r, 2.0 * core.h)
+        d_side = (2.0 * core.h * lr + core.r * z) / -slant
+        if d_base <= d_side:
+            return core.axis.copy(), v - d_base * core.axis, -d_base
+        radial = rad / lr if lr > 1e-12 else _disk_basis(core.axis)[0]
+        f = (2.0 * core.h * radial + core.r * core.axis) / slant
+        return -f, v + d_side * f, -d_side
+    if core.kind == "ellipsoid":
+        k = core.boundary_nearest(v)
+        f = core.outward_normal(k)
+        return -f, k, -float(np.linalg.norm(k - v))
     return None
 
 
@@ -1610,6 +2397,23 @@ def _closest_point(core, v):
         return p
     if core.kind == "hull":
         return core.closest(v)
+    if core.kind == "cone":
+        if core.contains(v):
+            return None
+        # The nearest point of the meridian section (a triangle: apex, base rim, opposite base rim) in its plane.
+        w = v - core.apex
+        z = float(w @ core.axis)
+        rad = w - z * core.axis
+        lr = float(np.linalg.norm(rad))
+        radial = rad / lr if lr > 1e-12 else _disk_basis(core.axis)[0]
+        p = np.array([lr, z, 0.0])
+        apex2, rim2, far2 = np.zeros(3), np.array([core.r, -2.0 * core.h, 0.0]), np.array([-core.r, -2.0 * core.h, 0.0])
+        q = _closest_on_tri(p, apex2, rim2, far2)
+        return core.apex + q[1] * core.axis + q[0] * radial
+    if core.kind == "ellipsoid":
+        if core.contains(v):
+            return None
+        return core.boundary_nearest(v)
     return None
 
 
@@ -1733,29 +2537,65 @@ def group_ranks(group, *, normal=None):
 
 
 def _drop_implied(g, stats, implied):
+    """Drop a plane group's rows its other rows imply, the shallowest first, one at a time: in one pass, which drops
+    what testing again from the shallowest after every drop would (a drop only raises the others' lower hull)."""
     if len(g) < 3:
         return g
-    g = list(g)
-    changed = True
-    while changed and len(g) >= 3:
-        changed = False
-        K = np.array([ct.k for ct in g])
-        d = np.array([ct.d for ct in g])
-        for j in sorted(range(len(g)), key=lambda i: (-d[i], i)):
-            others = [i for i in range(len(g)) if i != j]
-            if implied == "hull3d":
-                val = _convex_interp3(K[others], d[others], K[j])
-                drop = val is not None and d[j] >= val - 1e-9
-            else:
-                val = lower_hull_value(K[others], d[others], K[j], g[0].n)
-                drop = val is not None and d[j] >= val - IMPLIED_RESIDUAL
-            if drop:
-                if stats:
-                    stats.implied += 1
-                g.pop(j)
-                changed = True
-                break
-    return g
+    K = np.array([ct.k for ct in g])
+    d = np.array([ct.d for ct in g])
+    alive = [True] * len(g)
+    size = len(g)
+    for j in sorted(range(len(g)), key=lambda i: (-d[i], i)):
+        if size < 3:
+            break
+        others = [i for i in range(len(g)) if i != j and alive[i]]
+        if implied == "hull3d":
+            val = _convex_interp3(K[others], d[others], K[j])
+            drop = val is not None and d[j] >= val - 1e-9
+        else:
+            drop = lower_hull_reaches(K[others], d[others], K[j], g[0].n, d[j], IMPLIED_RESIDUAL)
+        if drop:
+            if stats:
+                stats.implied += 1
+            alive[j] = False
+            size -= 1
+    return [ct for ct, keep in zip(g, alive, strict=True) if keep]
+
+
+def lower_hull_reaches(P, d, p, n, depth, residual, *, tol=1e-9):
+    """Whether ``depth >= lower_hull_value(P, d, p, n) - residual`` (:func:`lower_hull_value`): the first interpolation
+    that reaches ``depth`` decides it, as the lowest would (a rounded subtraction keeps order)."""
+    e1 = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    e1 = e1 - (e1 @ n) * n
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(n, e1)
+    U = np.stack([P @ e1, P @ e2], 1) if len(P) else np.zeros((0, 2))
+    u = np.array([p @ e1, p @ e2])
+    m = len(U)
+    for i in range(m):
+        if np.linalg.norm(U[i] - u) <= tol and depth >= d[i] - residual:
+            return True
+        for j in range(i + 1, m):
+            a, b = U[i], U[j]
+            ab = b - a
+            L2 = float(ab @ ab)
+            if L2 < 1e-20:
+                continue
+            s = float((u - a) @ ab) / L2
+            perp = abs(ab[0] * (u - a)[1] - ab[1] * (u - a)[0]) / math.sqrt(L2)
+            if -tol <= s <= 1 + tol and perp <= tol and depth >= (d[i] + s * (d[j] - d[i])) - residual:
+                return True
+            for k in range(j + 1, m):
+                c = U[k]
+                T = np.stack([b - a, c - a], 1)
+                det = T[0, 0] * T[1, 1] - T[0, 1] * T[1, 0]
+                if abs(det) < 1e-18:
+                    continue
+                uv = np.linalg.solve(T, u - a)
+                if uv[0] >= -tol and uv[1] >= -tol and uv[0] + uv[1] <= 1 + tol:
+                    if depth >= (d[i] + uv[0] * (d[j] - d[i]) + uv[1] * (d[k] - d[i])) - residual:
+                        return True
+    return False
 
 
 def lower_hull_value(P, d, p, n, *, tol=1e-9):
@@ -1918,10 +2758,20 @@ def anticipate(hf, core, D, window, motion, *, stats=None):
     return out
 
 
-def pair_rows(hf: ReferenceHeightfield, core: Core, D: float, *, stats=None, motion=None, implied="lower_hull"):
+def pair_rows(
+    hf: ReferenceHeightfield,
+    core: Core,
+    D: float,
+    *,
+    stats=None,
+    motion=None,
+    implied="lower_hull",
+    group_offset=GROUP_OFFSET,
+):
     """The law's rows of one pair. ``D``: reach on the core distance (rounding radius + margins + gaps).
 
-    ``motion`` optionally maps a core point to its predicted displacement over the collision interval (rule C).
+    ``motion`` optionally maps a core point to its predicted displacement over the collision interval (rule C);
+    ``group_offset`` is the finish's (:func:`finish`; a comparison with the float32 kernels passes their four bands).
     """
     lo, hi = core.aabb()
     box = hf.cells_in_box(lo[:2] - D, hi[:2] + D)
@@ -1940,6 +2790,7 @@ def pair_rows(hf: ReferenceHeightfield, core: Core, D: float, *, stats=None, mot
         raw = solid_law(hf, core, D, window, stats=stats)
         if not raw:
             raw = _solid_recovery(hf, core)
+        raw = raw + exit_rule(hf, core, D, window, raw, stats=stats)
     if motion is not None:
         raw = raw + anticipate(hf, core, D, window, motion, stats=stats)
-    return finish(raw, stats=stats, implied=implied)
+    return finish(raw, stats=stats, implied=implied, group_offset=group_offset)

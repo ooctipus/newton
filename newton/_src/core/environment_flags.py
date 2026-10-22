@@ -302,6 +302,31 @@ NEWTON_FLAGS = declare(
         "A non-empty value marks a documentation build, which the viewer treats as Sphinx.",
     ),
     EnvironmentFlag(
+        "NEWTON_TERRAIN_LAW_SHADOW",
+        "diagnostic",
+        _COLLIDE,
+        "Partner classes whose terrain-law kernels run beside the terrain route into a side buffer nothing reads: "
+        "point (spheres and capsules), box, cylinder (cylinders and cones), hull (convex hulls and ellipsoids) or "
+        "all. Unset runs none.",
+    ),
+    EnvironmentFlag(
+        "NEWTON_TERRAIN_LAW_SHADOW_JOBS",
+        "diagnostic",
+        _COLLIDE,
+        "A positive factor on the terrain-law shadow's solid-class job lists and candidate pools, scene-level buffers "
+        "sized from the listed pairs' own bounds (default 1); a pair whose work finds no room takes the slower "
+        "full-finish kernel (its rows unchanged) and raises the narrow phase's terrain_jobs status. Read only with "
+        "NEWTON_TERRAIN_LAW_SHADOW set.",
+    ),
+    EnvironmentFlag(
+        "NEWTON_TERRAIN_LAW_SHADOW_ROWS",
+        "diagnostic",
+        _COLLIDE,
+        "Rows of the terrain-law shadow's scene-level spill region, which holds the rows of pairs with more rows than "
+        "their walk slots (default: from the listed pairs' own bounds on their rows); read only with "
+        "NEWTON_TERRAIN_LAW_SHADOW set.",
+    ),
+    EnvironmentFlag(
         "NEWTON_ASSET_DIR",
         "policy",
         ("isaaclab.utils.assets",),

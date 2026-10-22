@@ -46,12 +46,15 @@ import numpy as np
 import warp as wp
 
 from .terrain_law import (
+    TERRAIN_FINE_CELLS,
     TERRAIN_FLAT_EPS,
     TERRAIN_TILE_CELLS,
     TerrainClusterPlane,
     TerrainFeatureData,
     TerrainSurfaceInfo,
     terrain_decode,
+    terrain_vertex_bits_of_clusters,
+    terrain_window,
 )
 from .types import GeoType
 
@@ -71,21 +74,47 @@ TERRAIN_PARTNER_CYLINDER = 2
 TERRAIN_PARTNER_HULL = 3
 """Partner class of the support-function cores: convex meshes, ellipsoids and barrel cylinders."""
 TERRAIN_PARTNER_CLASSES = 4
-TERRAIN_PARTNER_ROWS = (8, 16, 16, 24)
-"""Rows one pair of each partner class may write (the measured per-pair maxima with headroom)."""
+TERRAIN_PARTNER_WALK_SLOTS = (8, 16, 16, 24)
+"""Walk slots of a pair of each partner class in the law's side buffer, the fast path's layout: its walk holds its
+distinct rows there and, when the finish keeps them as they are (or, for a solid, when they fit), writes its rows
+there. A pair with more distinct rows is finished by its class's full-finish kernel, which holds every candidate its
+window can give (:func:`terrain_pair_candidates`) and writes all its rows to the side buffer's spill region: the slots
+bound no row, they choose which kernel finishes a pair and where its rows go. Of the recorded suite states' walking
+pairs (16,384 worlds, warm and after a run), the walks finish all but a hull pair with 30 rows. Each fits the in-place
+finish of a walk, which takes up to :data:`~newton._src.geometry.terrain_law.TERRAIN_FINISH_MASK_ROWS` rows (32)."""
+TERRAIN_PARTNER_SCAN_RUN = (0, 8, 32, 8)
+"""Window vertices one scan job of a solid class takes (the point class has no scan): a solid pair's window is scanned
+in runs of this many vertices, one job each, at most
+:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_SCAN_VERTICES`. A shorter run lists the same features with
+more threads and repeats a run's setup (its core, record, window frame and list reservations) more often. Measured on
+the recorded after-run states (scan kernel per collide, runs of 32, 16 and 8 vertices): hulls 0.216, 0.134, 0.103 ms
+(h1) and 0.140, 0.091, 0.080 (g1); boxes 0.096, 0.069, 0.041 (anymald) and 0.093, 0.071, 0.043 (go2); cylinders 0.215,
+0.263, 0.331 (anymald), 0.083, 0.083, 0.082 (go2) and 0.067, 0.065, 0.058 (cassie)."""
+TERRAIN_WALK_ROWS_PER_VERTEX = (6, 16, 15)
+"""Rows a window vertex's features can give a pair at most: a sphere's centre (its two faces, three edges and itself,
+one row each), a capsule (both ends' six, the axis's four), a solid (its two faces' plane manifolds of four points
+each, its three edges' interval ends, itself)."""
+TERRAIN_WALK_ROWS_PER_PAIR = (1, 3, 5)
+"""Rows a pair can gain after its walk at most: a sphere's exit, a capsule's two ends' exits and its axis's recovery,
+a solid's four recovery rows and its deepest exit (rule X)."""
 
 TERRAIN_LANE_THREAD = 0
-"""Lane class of pairs whose largest window holds at most :data:`TERRAIN_LANE_CELLS` cells: one thread per pair."""
+"""Lane class of pairs whose largest window holds at most :data:`TERRAIN_LANE_CELLS` cells: the class's one-thread
+kernel walks them."""
 TERRAIN_LANE_TILE = 1
-"""Lane class of larger windows: :data:`TERRAIN_TILE_LANES` lanes per pair."""
+"""Lane class of larger windows: the class's one-thread kernel takes such a pair through the whole-pair rejects and,
+when it reaches its window, queues it for the class's tiled kernel, a tile of
+:data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK` lanes per pair (a solid class's only when its window, as
+the pose gives it, holds more than :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_THREAD_VERTICES`
+vertices; it walks the others in one thread)."""
 TERRAIN_LANE_CLASSES = 2
 TERRAIN_LANE_CELLS = 16
-TERRAIN_TILE_LANES = 16
+"""Cells of a partner's largest window (:func:`terrain_window_cells`) up to which its pairs are of
+:data:`TERRAIN_LANE_THREAD`."""
 
 _FLAT_EPS = wp.constant(TERRAIN_FLAT_EPS)
 _INT_MAX = wp.constant(2147483647)
 _FLOAT_MAX = wp.constant(3.402823466e38)
-_TILE_CELLS = wp.constant(TERRAIN_TILE_CELLS)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -712,20 +741,31 @@ def _cluster_write(
 
 
 @wp.kernel(enable_backward=False)
-def _tile_max(
-    grid: _Grid, tile_r0: int, tile_c0: int, tile_cols: int, tile_offset: int, tile_max: wp.array[wp.float32]
+def _block_max(
+    grid: _Grid, side: int, block_r0: int, block_c0: int, block_cols: int, block_offset: int, out: wp.array[wp.float32]
 ):
+    """The largest decoded height of the vertices of every block of ``side`` x ``side`` cells (a mip level)."""
     i, j = wp.tid()
-    tr = tile_r0 + i
-    tc = tile_c0 + j
-    r_end = wp.min((tr + 1) * _TILE_CELLS, grid.nrow - 1)
-    c_end = wp.min((tc + 1) * _TILE_CELLS, grid.ncol - 1)
+    br = block_r0 + i
+    bc = block_c0 + j
+    r_end = wp.min((br + 1) * side, grid.nrow - 1)
+    c_end = wp.min((bc + 1) * side, grid.ncol - 1)
     value = float(-_FLOAT_MAX)
-    for r in range(tr * _TILE_CELLS, r_end + 1):
-        for c in range(tc * _TILE_CELLS, c_end + 1):
+    for r in range(br * side, r_end + 1):
+        for c in range(bc * side, c_end + 1):
             e = grid.elevations[grid.data_offset + r * grid.ncol + c]
             value = wp.max(value, terrain_decode(grid.min_z, grid.max_z, e))
-    tile_max[tile_offset + tr * tile_cols + tc] = value
+    out[block_offset + br * block_cols + bc] = value
+
+
+@wp.kernel(enable_backward=False)
+def _vertex_bits(data: TerrainFeatureData, heightfield: int, bits: wp.array[wp.uint8]):
+    """Every vertex's bits of one heightfield (:func:`~newton._src.geometry.terrain_law.terrain_vertex_bits_of_clusters`,
+    from its clusters and heights, which ``data`` holds), one thread per vertex."""
+    r, c = wp.tid()
+    window = terrain_window(data, heightfield, r, c)
+    surface = window.surface
+    bits[surface.data_offset + r * surface.ncol + c] = wp.uint8(terrain_vertex_bits_of_clusters(data, window, r, c))
 
 
 @wp.kernel(enable_backward=False)
@@ -807,7 +847,9 @@ class TerrainFeatures:
         infos = []
         triangle_offset = 0
         tile_offset = 0
+        fine_offset = 0
         self._tiles = []
+        self._fines = []
         for h in range(count):
             row = layouts[h]
             nrow, ncol = int(row["nrow"]), int(row["ncol"])
@@ -823,6 +865,9 @@ class TerrainFeatures:
             tile_rows = -(-(nrow - 1) // TERRAIN_TILE_CELLS)
             tile_cols = -(-(ncol - 1) // TERRAIN_TILE_CELLS)
             self._tiles.append((tile_rows, tile_cols))
+            fine_rows = -(-(nrow - 1) // TERRAIN_FINE_CELLS)
+            fine_cols = -(-(ncol - 1) // TERRAIN_FINE_CELLS)
+            self._fines.append((fine_rows, fine_cols))
             info = TerrainSurfaceInfo()
             info.data_offset = grid.data_offset
             info.nrow, info.ncol = nrow, ncol
@@ -834,12 +879,19 @@ class TerrainFeatures:
             info.plane_offset = 0
             info.tile_offset = tile_offset
             info.tile_cols = tile_cols
+            info.fine_offset = fine_offset
+            info.fine_cols = fine_cols
             infos.append(info)
             triangle_offset += 2 * (nrow - 1) * (ncol - 1)
             tile_offset += tile_rows * tile_cols
+            fine_offset += fine_rows * fine_cols
         self._infos = infos
         self.clusters = wp.zeros(max(triangle_offset, 1), dtype=wp.int32, device=self.device)
         self.tile_max = wp.zeros(max(tile_offset, 1), dtype=wp.float32, device=self.device)
+        self.fine_max = wp.zeros(max(fine_offset, 1), dtype=wp.float32, device=self.device)
+        self.vertex_bits = wp.zeros(
+            max(model.heightfield_elevations.shape[0] if count else 0, 1), dtype=wp.uint8, device=self.device
+        )
         self.elevation_version = wp.zeros(max(count, 1), dtype=wp.int32, device=self.device)
         self.feature_version = wp.zeros(max(count, 1), dtype=wp.int32, device=self.device)
         self._dirty = [None] * count
@@ -859,7 +911,9 @@ class TerrainFeatures:
         built = [self._build_clusters(h) for h in range(count)]
         self._place_planes(built)
         for h in range(count):
+            self._build_vertex_bits(h)
             self._build_tiles(h, 0, self._tiles[h][0], 0, self._tiles[h][1])
+            self._build_fines(h, 0, self._fines[h][0], 0, self._fines[h][1])
 
     # ---- queries ---------------------------------------------------------------------------------------------
     def data(self) -> TerrainFeatureData:
@@ -875,6 +929,8 @@ class TerrainFeatures:
         data.clusters = self.clusters
         data.planes = self.planes
         data.tile_max = self.tile_max
+        data.fine_max = self.fine_max
+        data.vertex_bits = self.vertex_bits
         data.surfaces = self._surfaces
         data.elevation_version = self.elevation_version
         data.feature_version = self.feature_version
@@ -896,6 +952,8 @@ class TerrainFeatures:
             "clusters": self.clusters.capacity,
             "planes": self.planes.capacity,
             "tile_max": self.tile_max.capacity,
+            "fine_max": self.fine_max.capacity,
+            "vertex_bits": self.vertex_bits.capacity,
             "surfaces": self._surfaces.capacity,
             "versions": self.elevation_version.capacity + self.feature_version.capacity + self._layout.capacity,
         }
@@ -947,6 +1005,8 @@ class TerrainFeatures:
         built = [None] * self.heightfield_count
         built[h] = self._build_clusters(h)
         self._place_planes(built)
+        # every cluster may have changed: every vertex's bits
+        self._build_vertex_bits(h)
         r0, r1, c0, c1 = region
         info = self._infos[h]
         rows, cols = info.nrow - 1, info.ncol - 1
@@ -955,6 +1015,11 @@ class TerrainFeatures:
         tc0 = max(c0 - 1, 0) // TERRAIN_TILE_CELLS
         tc1 = min(max(c1 - 1, 0), cols - 1) // TERRAIN_TILE_CELLS + 1
         self._build_tiles(h, tr0, tr1, tc0, tc1)
+        fr0 = max(r0 - 1, 0) // TERRAIN_FINE_CELLS
+        fr1 = min(max(r1 - 1, 0), rows - 1) // TERRAIN_FINE_CELLS + 1
+        fc0 = max(c0 - 1, 0) // TERRAIN_FINE_CELLS
+        fc1 = min(max(c1 - 1, 0), cols - 1) // TERRAIN_FINE_CELLS + 1
+        self._build_fines(h, fr0, fr1, fc0, fc1)
         self._dirty[h] = None
         wp.launch(
             _copy_version,
@@ -1154,14 +1219,36 @@ class TerrainFeatures:
         if self.heightfield_count:
             self._surfaces.assign(wp.array(self._infos, dtype=TerrainSurfaceInfo, device="cpu"))
 
+    def _build_vertex_bits(self, h: int) -> None:
+        info = self._infos[h]
+        wp.launch(
+            _vertex_bits,
+            dim=(info.nrow, info.ncol),
+            inputs=[self.data(), h, self.vertex_bits],
+            device=self.device,
+            record_tape=False,
+        )
+
     def _build_tiles(self, h: int, tr0: int, tr1: int, tc0: int, tc1: int) -> None:
         if tr1 <= tr0 or tc1 <= tc0:
             return
         info = self._infos[h]
         wp.launch(
-            _tile_max,
+            _block_max,
             dim=(tr1 - tr0, tc1 - tc0),
-            inputs=[self._grids[h], tr0, tc0, info.tile_cols, info.tile_offset, self.tile_max],
+            inputs=[self._grids[h], TERRAIN_TILE_CELLS, tr0, tc0, info.tile_cols, info.tile_offset, self.tile_max],
+            device=self.device,
+            record_tape=False,
+        )
+
+    def _build_fines(self, h: int, fr0: int, fr1: int, fc0: int, fc1: int) -> None:
+        if fr1 <= fr0 or fc1 <= fc0:
+            return
+        info = self._infos[h]
+        wp.launch(
+            _block_max,
+            dim=(fr1 - fr0, fc1 - fc0),
+            inputs=[self._grids[h], TERRAIN_FINE_CELLS, fr0, fc0, info.fine_cols, info.fine_offset, self.fine_max],
             device=self.device,
             record_tape=False,
         )
@@ -1287,6 +1374,44 @@ def terrain_window_cells(radius, reach, dx, dy) -> np.ndarray:
     return (np.ceil(extent / dx) + 1.0) * (np.ceil(extent / dy) + 1.0)
 
 
+def terrain_window_vertices(radius, reach, dx, dy, nrow, ncol) -> np.ndarray:
+    """Return a bound on the vertices of a pair's window, any pose: its bounding sphere plus reach on the grid.
+
+    A window spans the cells a box of extent ``e = 2 (radius + reach)`` touches, widened by
+    :data:`~newton._src.geometry.terrain_law.TERRAIN_CELL_WIDEN` cells per side and its float32 cell coordinates
+    rounded: at most ``floor(e / dx) + 3`` cells along x (``ceil(e / dx + 0.003) + 1``), so at most
+    ``floor(e / dx) + 4`` vertex columns, and no more than the heightfield's. Takes scalars or arrays of equal shape
+    [m]; computes in float64.
+    """
+    extent = 2.0 * (np.asarray(radius, np.float64) + np.asarray(reach, np.float64))
+    columns = np.minimum(np.floor(extent / np.asarray(dx, np.float64)) + 4.0, np.asarray(ncol, np.float64))
+    rows = np.minimum(np.floor(extent / np.asarray(dy, np.float64)) + 4.0, np.asarray(nrow, np.float64))
+    return (columns * rows).astype(np.int64)
+
+
+def terrain_pair_candidates(shape_type, vertices) -> np.ndarray:
+    """Return the most distinct candidates a pair's walk can give its finish: every feature of each of its window's
+    ``vertices`` (:func:`terrain_window_vertices`) giving its partner's most rows
+    (:data:`TERRAIN_WALK_ROWS_PER_VERTEX`), and the rows added after the walk (:data:`TERRAIN_WALK_ROWS_PER_PAIR`).
+
+    The walks visit every feature of a window once (a window vertex owns its cell's faces and diagonal, its x- and
+    y-edges and itself), and each feature gives a partner at most the rows counted there, so no window can give more:
+    a full-finish block that holds this many holds every candidate of the pair.
+
+    Args:
+        shape_type: Geometry type of every partner.
+        vertices: The bound on every partner's window vertices.
+    """
+    kind = np.asarray(shape_type)
+    per_vertex = np.full(kind.shape, TERRAIN_WALK_ROWS_PER_VERTEX[2], np.int64)
+    per_pair = np.full(kind.shape, TERRAIN_WALK_ROWS_PER_PAIR[2], np.int64)
+    sphere = kind == int(GeoType.SPHERE)
+    capsule = kind == int(GeoType.CAPSULE)
+    per_vertex[sphere], per_pair[sphere] = TERRAIN_WALK_ROWS_PER_VERTEX[0], TERRAIN_WALK_ROWS_PER_PAIR[0]
+    per_vertex[capsule], per_pair[capsule] = TERRAIN_WALK_ROWS_PER_VERTEX[1], TERRAIN_WALK_ROWS_PER_PAIR[1]
+    return per_vertex * np.asarray(vertices, np.int64) + per_pair
+
+
 class TerrainPairTable:
     """The static (heightfield, partner) pairs of the terrain law, one contiguous segment per partner and lane class.
 
@@ -1294,14 +1419,16 @@ class TerrainPairTable:
     the model's pair list (:attr:`~newton.Model.shape_contact_pairs`; an empty list gives an empty table) or,
     when the model has none, the same filter applied here (worlds, collision groups, filter pairs). They are
     restricted to partners the law has a class for and sorted by (partner class, lane class, world, heightfield,
-    partner). A pair's lane class follows from its largest window over all orientations (bounding radius plus
-    margins and gaps, on its heightfield's cells) at construction.
+    partner). A pair's lane class and its bound on candidates (:func:`terrain_pair_candidates`) follow from its largest
+    window over all orientations (bounding radius plus margins and gaps, on its heightfield's cells) at construction.
 
     Args:
         model: A finalized model.
+        pairs: Shape pairs to take instead of the model's list (a collision pipeline's explicit pairs), as an
+            array of ``(shape, shape)`` rows or a Warp array of ``vec2i``; the heightfield pairs among them are kept.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, *, pairs=None):
         self.device = model.device
         count = model.shape_count
         types = model.shape_type.numpy() if count else np.zeros(0, np.int32)
@@ -1311,8 +1438,12 @@ class TerrainPairTable:
 
         colliding = (flags & int(ShapeFlags.COLLIDE_SHAPES)) != 0
         listed = getattr(model, "shape_contact_pairs", None)
+        explicit = pairs
         if not count:
             pairs = np.zeros((0, 2), np.int32)
+        elif explicit is not None:
+            explicit = explicit.numpy() if hasattr(explicit, "numpy") else np.asarray(explicit)
+            pairs = heightfield_pair_table(types, worlds, colliding, explicit_pairs=explicit.reshape(-1, 2))
         elif listed is not None:
             explicit = listed.numpy().reshape(-1, 2)[: int(model.shape_contact_pair_count)]
             pairs = heightfield_pair_table(types, worlds, colliding, explicit_pairs=explicit)
@@ -1330,17 +1461,23 @@ class TerrainPairTable:
         partner_class = partner_class[partner_class >= 0]
         lane = np.zeros(len(pairs), np.int32)
         world = np.zeros(len(pairs), np.int32)
+        vertices = np.zeros(len(pairs), np.int64)
+        candidates = np.zeros(len(pairs), np.int64)
         if len(pairs):
             first, second = pairs[:, 0], pairs[:, 1]
             margin = model.shape_margin.numpy()
             gap = model.shape_gap.numpy()
             layout = model.heightfield_data.numpy()[model.shape_heightfield_index.numpy()[first]]
-            dx = 2.0 * layout["hx"].astype(np.float64) / (layout["ncol"].astype(np.int64) - 1)
-            dy = 2.0 * layout["hy"].astype(np.float64) / (layout["nrow"].astype(np.int64) - 1)
+            nrow, ncol = layout["nrow"].astype(np.int64), layout["ncol"].astype(np.int64)
+            dx = 2.0 * layout["hx"].astype(np.float64) / (ncol - 1)
+            dy = 2.0 * layout["hy"].astype(np.float64) / (nrow - 1)
             reach = margin[first] + margin[second] + gap[first] + gap[second]
-            cells = terrain_window_cells(model.shape_collision_radius.numpy()[second], reach, dx, dy)
+            radius = model.shape_collision_radius.numpy()[second]
+            cells = terrain_window_cells(radius, reach, dx, dy)
             lane = np.where(cells <= TERRAIN_LANE_CELLS, TERRAIN_LANE_THREAD, TERRAIN_LANE_TILE).astype(np.int32)
             world = np.where(worlds[second] >= 0, worlds[second], worlds[first]).astype(np.int32)
+            vertices = terrain_window_vertices(radius, reach, dx, dy, nrow, ncol)
+            candidates = terrain_pair_candidates(types[second], vertices)
         order = np.lexsort((pairs[:, 1], pairs[:, 0], world, lane, partner_class))
         self.pairs_host = pairs[order].astype(np.int32).reshape(-1, 2)
         """``(heightfield, partner)`` shape pairs in table order, int32 ``(pair_count, 2)`` (host)."""
@@ -1350,16 +1487,15 @@ class TerrainPairTable:
         """Lane class of every pair, int32 (host)."""
         self.world = world[order]
         """World of every pair (the partner's, or the heightfield's for a global partner), int32 (host)."""
+        self.vertices = vertices[order]
+        """Bound on every pair's window vertices, any pose (:func:`terrain_window_vertices`), int64 (host)."""
+        self.candidates = candidates[order]
+        """Bound on every pair's distinct candidates, any pose (:func:`terrain_pair_candidates`), int64 (host)."""
         segment = self.partner_class * TERRAIN_LANE_CLASSES + self.lane_class
         segments = TERRAIN_PARTNER_CLASSES * TERRAIN_LANE_CLASSES
         sizes = np.bincount(segment, minlength=segments) if len(segment) else np.zeros(segments, np.int64)
         self.segment_offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
         """First pair of every (partner class, lane class) segment, and the pair count last (host)."""
-        rows = np.repeat(np.asarray(TERRAIN_PARTNER_ROWS, np.int64), TERRAIN_LANE_CLASSES)
-        self.slot_offsets = np.concatenate([[0], np.cumsum(sizes * rows)]).astype(np.int64)
-        """First output slot of every segment in the static layout, and the slot count last (host)."""
-        self.slot_count = int(self.slot_offsets[-1])
-        """Output slots of the static layout: every pair times its class's row limit."""
         self.pairs = wp.array(
             self.pairs_host if len(self.pairs_host) else np.zeros((1, 2), np.int32), dtype=wp.vec2i, device=self.device
         )
@@ -1371,13 +1507,6 @@ class TerrainPairTable:
         """Return the ``[begin, end)`` pair range of one partner class and lane class."""
         s = partner_class * TERRAIN_LANE_CLASSES + lane_class
         return int(self.segment_offsets[s]), int(self.segment_offsets[s + 1])
-
-    def slots(self, pair: int) -> tuple[int, int]:
-        """Return the ``[begin, end)`` output slot range of a pair in the static layout (pairs times rows per pair)."""
-        s = int(np.searchsorted(self.segment_offsets, pair, side="right")) - 1
-        rows = TERRAIN_PARTNER_ROWS[s // TERRAIN_LANE_CLASSES]
-        begin = int(self.slot_offsets[s]) + (pair - int(self.segment_offsets[s])) * rows
-        return begin, begin + rows
 
     def memory_bytes(self) -> dict[str, int]:
         """Return the device bytes the table holds."""

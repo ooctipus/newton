@@ -2006,6 +2006,26 @@ class CollisionPipeline:
             raise ValueError("coherent convex diagnostics require NEWTON_NARROW_PHASE_COHERENT_CONVEX=reject_only")
         if convex_cells == "1" and coherent_convex != "reject_only":
             raise ValueError("experimental convex cells require the complete rejection-only owner")
+        # Partner classes whose terrain-law kernels run in shadow, beside today's terrain route (none by default).
+        terrain_law_shadow = os.environ.get("NEWTON_TERRAIN_LAW_SHADOW", "")
+        self._terrain_law_shadow = None
+        self._terrain_law_shadow_reason = None
+        terrain_law_spill_rows = None
+        terrain_law_job_scale = None
+        if terrain_law_shadow.strip():
+            from ..geometry.terrain_shadow import (  # noqa: PLC0415
+                parse_terrain_law_shadow,
+                parse_terrain_law_shadow_jobs,
+                parse_terrain_law_shadow_rows,
+            )
+
+            terrain_law_classes = parse_terrain_law_shadow(terrain_law_shadow)
+            # The rows of its scene-level spill region (default: TerrainLawShadow.default_spill_rows()).
+            terrain_law_spill_rows = parse_terrain_law_shadow_rows(os.environ.get("NEWTON_TERRAIN_LAW_SHADOW_ROWS", ""))
+            # The factor on its solid classes' job capacities (default 1: terrain_solid_job_capacities()).
+            terrain_law_job_scale = parse_terrain_law_shadow_jobs(os.environ.get("NEWTON_TERRAIN_LAW_SHADOW_JOBS", ""))
+        else:
+            terrain_law_classes = ()
 
         # Resolve rigid contact capacity with explicit > model > estimated precedence.
         model_rigid_contact_max = int(getattr(model, "rigid_contact_max", 0) or 0)
@@ -2685,6 +2705,31 @@ class CollisionPipeline:
         else:
             self._terrain_cells_reason = f"convex_collision={convex_collision!r} does not request terrain cells."
 
+        # The terrain law in shadow: built once here, outside capture; collide() launches it after the narrow phase.
+        if not terrain_law_classes:
+            self._terrain_law_shadow_reason = "Off: NEWTON_TERRAIN_LAW_SHADOW lists no partner class."
+        elif not self.narrow_phase.has_heightfields:
+            self._terrain_law_shadow_reason = "No heightfield pair: the listed classes have nothing to run on."
+        else:
+            from ..geometry.terrain_shadow import TerrainLawShadow  # noqa: PLC0415
+
+            shadow = TerrainLawShadow(
+                model,
+                terrain_law_classes,
+                pairs=self.shape_pairs_filtered if self.broad_phase_mode == "explicit" else None,
+                status=self.narrow_phase._buffer_capacity_status,
+                spill_rows=terrain_law_spill_rows,
+                job_scale=terrain_law_job_scale,
+            )
+            if shadow.features is None:
+                self._terrain_law_shadow_reason = "No heightfield pair has a partner of the listed classes."
+            else:
+                self._terrain_law_shadow = shadow
+                self._terrain_law_shadow_reason = (
+                    "NEWTON_TERRAIN_LAW_SHADOW: the law's kernels run after the narrow phase into a side buffer that "
+                    "nothing reads; today's terrain route writes every contact."
+                )
+
         # Built here (not in finalize) so models/tasks that never collide don't pay for it.
         # Host-side, so not graph-capture-safe -- construct the pipeline before any capture.
         self.soft_rigid_contact_pairs = _build_soft_particle_rigid_contact_pairs(model)
@@ -2877,8 +2922,10 @@ class CollisionPipeline:
         layout. ``heightfield`` (``None`` without heightfield collision)
         records the terrain midphase, the typed primitive table and its
         closed-form rows, the route convex-hull pairs take, the terrain
-        convex-cells owner and its chooser, and each opt-in terrain route with
-        its reason. ``environment`` records the ``NEWTON_*`` variables present at
+        convex-cells owner and its chooser, each opt-in terrain route with
+        its reason, and ``law_shadow``: whether the terrain law runs in shadow
+        (``NEWTON_TERRAIN_LAW_SHADOW``), its partner classes, pairs per lane
+        class and memory. ``environment`` records the ``NEWTON_*`` variables present at
         construction: ``applied`` maps declared names Newton reads to their
         values, ``overridden`` maps declared names whose value an explicit
         argument superseded to their unapplied, unvalidated values
@@ -3175,6 +3222,11 @@ class CollisionPipeline:
                         *common,
                     ),
                 ),
+            },
+            "law_shadow": {
+                "enabled": self._terrain_law_shadow is not None,
+                "reason": self._terrain_law_shadow_reason,
+                **({} if self._terrain_law_shadow is None else self._terrain_law_shadow.describe()),
             },
         }
 
@@ -4077,6 +4129,17 @@ class CollisionPipeline:
             max_speculative_extension=max_speculative_extension,
             device=self.device,
         )
+
+        if self._terrain_law_shadow is not None:
+            # Beside today's terrain route: rows into the shadow's side buffer, under the broad phase's pair policy.
+            self._terrain_law_shadow.launch(
+                self.geom_transform,
+                self.geom_data,
+                shape_type=model.shape_type,
+                shape_gap=model.shape_gap,
+                shape_heightfield_index=model.shape_heightfield_index,
+                **pair_filter,
+            )
 
         reducer = self.narrow_phase.global_contact_reducer
         if reducer is not None:

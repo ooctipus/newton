@@ -11,31 +11,35 @@ that the predicates claim every support the float64 oracle (:mod:`newton.tests.t
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import numpy as np
 import warp as wp
 
 import newton
 from newton._src.geometry.terrain_contacts import TerrainFeatures
 from newton._src.geometry.terrain_law import (
+    TERRAIN_CELL_WIDEN,
     TERRAIN_EDGE_BORDER,
     TERRAIN_EDGE_CONCAVE,
     TERRAIN_EDGE_FLAT,
+    TERRAIN_EPS32,
+    TERRAIN_EPS_FACTOR,
+    TERRAIN_EPS_MIN_EXTENT,
     TERRAIN_FEATURE_EDGE,
     TERRAIN_FEATURE_FACE,
     TERRAIN_FEATURE_VERTEX,
     TerrainFeatureData,
-    TerrainRows,
+    TerrainFinishScratch,
     terrain_cluster,
     terrain_edge_class,
     terrain_edge_point,
     terrain_eps,
     terrain_face_point,
     terrain_feature_id,
-    terrain_finish,
+    terrain_finish_list,
+    terrain_finish_scratch,
     terrain_point_below,
-    terrain_row_n,
-    terrain_row_q,
-    terrain_rows_push,
     terrain_vertex_feature,
     terrain_vertex_in_cone,
     terrain_vertex_point,
@@ -46,8 +50,6 @@ from newton._src.geometry.terrain_law import (
 )
 from newton.tests import terrain_law_reference as ref
 
-POINT_ROWS = 8
-"""Rows a point-core pair keeps (the law's limit for spheres and capsules)."""
 CLAIMS = 16
 """Face claims recorded per point."""
 
@@ -119,20 +121,35 @@ def _window_cells(data: TerrainFeatureData, heightfield: int, p: wp.vec3, reach:
     return wp.vec4i(r0, r1, c0, c1)
 
 
+@wp.func
+def _push(scratch: TerrainFinishScratch, base: int, count: int, q: wp.vec3, k: wp.vec3, n: wp.vec3, d: float, f: int):
+    """Append a candidate to a point's list in the finish scratch (raw: the finish merges coincident ones)."""
+    if count < scratch.capacity:
+        scratch.q[base + count] = q
+        scratch.k[base + count] = k
+        scratch.n[base + count] = n
+        scratch.d[base + count] = d
+        scratch.feature[base + count] = f
+    return count + 1
+
+
 @wp.kernel(enable_backward=False)
 def _point_rows_kernel(
     data: TerrainFeatureData,
     heightfield: int,
     points: wp.array[wp.vec3],
     reach: wp.array[float],
+    scratch: TerrainFinishScratch,
     out_count: wp.array[int],
     out_q: wp.array2d[wp.vec3],
     out_n: wp.array2d[wp.vec3],
     out_d: wp.array2d[float],
     out_feature: wp.array2d[int],
 ):
-    """The point-core rows of the law from the float32 predicates (faces, crease edges, vertices; no G2/G3)."""
+    """The point-core rows of the law from the float32 predicates (faces, crease edges, vertices; no G2/G3), every
+    candidate into the point's list of the finish scratch, then the law's finish."""
     i = wp.tid()
+    base = i * scratch.capacity
     p = points[i]
     D = reach[i]
     box = _window_cells(data, heightfield, p, D)
@@ -150,13 +167,15 @@ def _point_rows_kernel(
     window.eps = terrain_eps(extent)
     eps = window.eps
     below = terrain_point_below(data, window, k)
-    rows = TerrainRows()
+    count = int(0)
     for r in range(r0, r1 + 1):
         for c in range(c0, c1 + 1):
             for sub in range(2):
                 claims, q, n, d = terrain_face_point(data, window, r, c, sub, k)
                 if claims and d <= D and not ((d > eps and below) or (d < -eps and not below)):
-                    rows = terrain_rows_push(rows, q, k, n, d, terrain_feature_id(r, c, TERRAIN_FEATURE_FACE, sub, 0))
+                    count = _push(
+                        scratch, base, count, q, k, n, d, terrain_feature_id(r, c, TERRAIN_FEATURE_FACE, sub, 0)
+                    )
     for r in range(r0, r1 + 2):
         for c in range(c0, c1 + 2):
             for which in range(3):
@@ -180,8 +199,8 @@ def _point_rows_kernel(
                         n = -n
                         d = -dist
                     if d <= D:
-                        rows = terrain_rows_push(
-                            rows, q, k, n, d, terrain_feature_id(r, c, TERRAIN_FEATURE_EDGE, which, 0)
+                        count = _push(
+                            scratch, base, count, q, k, n, d, terrain_feature_id(r, c, TERRAIN_FEATURE_EDGE, which, 0)
                         )
             if terrain_vertex_point(data, window, r, c, k):
                 v = terrain_window_vertex(data, window, r, c)
@@ -193,17 +212,20 @@ def _point_rows_kernel(
                         n = -n
                         d = -dist
                     if d <= D:
-                        rows = terrain_rows_push(
-                            rows, v, k, n, d, terrain_feature_id(r, c, TERRAIN_FEATURE_VERTEX, 0, 0)
+                        count = _push(
+                            scratch, base, count, v, k, n, d, terrain_feature_id(r, c, TERRAIN_FEATURE_VERTEX, 0, 0)
                         )
-    order, kept, _flags = terrain_finish(rows, eps, POINT_ROWS)
+    count = wp.min(count, scratch.capacity)
+    kept = terrain_finish_list(scratch, base, count, eps)
     out_count[i] = kept
-    for j in range(kept):
-        row = order[j]
-        out_q[i, j] = terrain_window_to_local(window, terrain_row_q(rows, row))
-        out_n[i, j] = terrain_row_n(rows, row)
-        out_d[i, j] = rows.d[row]
-        out_feature[i, j] = rows.feature[row]
+    j = int(0)
+    for row in range(count):
+        if scratch.mark[base + row] != 0:
+            out_q[i, j] = terrain_window_to_local(window, scratch.q[base + row])
+            out_n[i, j] = scratch.n[base + row]
+            out_d[i, j] = scratch.d[base + row]
+            out_feature[i, j] = scratch.feature[base + row]
+            j += 1
 
 
 @wp.kernel(enable_backward=False)
@@ -272,11 +294,16 @@ def point_rows(features: TerrainFeatures, heightfield: int, points, reach):
     points = np.asarray(points, np.float32).reshape(-1, 3)
     n = len(points)
     reach = np.broadcast_to(np.asarray(reach, np.float32), (n,)).copy()
+    # every feature of the window once: six per vertex of a window of at most 2 D / cell + 2 cells a side
+    surface = features.data().surfaces.numpy()[heightfield]
+    cells = int(np.floor(2.0 * float(reach.max()) / min(float(surface["dx"]), float(surface["dy"])))) + 2
+    candidates = 6 * (cells + 1) ** 2
+    scratch = terrain_finish_scratch(device, candidates, blocks=n)
     out_count = wp.zeros(n, dtype=int, device=device)
-    out_q = wp.zeros((n, POINT_ROWS), dtype=wp.vec3, device=device)
-    out_n = wp.zeros((n, POINT_ROWS), dtype=wp.vec3, device=device)
-    out_d = wp.zeros((n, POINT_ROWS), dtype=float, device=device)
-    out_f = wp.zeros((n, POINT_ROWS), dtype=int, device=device)
+    out_q = wp.zeros((n, candidates), dtype=wp.vec3, device=device)
+    out_n = wp.zeros((n, candidates), dtype=wp.vec3, device=device)
+    out_d = wp.zeros((n, candidates), dtype=float, device=device)
+    out_f = wp.zeros((n, candidates), dtype=int, device=device)
     wp.launch(
         _point_rows_kernel,
         dim=n,
@@ -285,6 +312,7 @@ def point_rows(features: TerrainFeatures, heightfield: int, points, reach):
             heightfield,
             wp.array(points, dtype=wp.vec3, device=device),
             wp.array(reach, dtype=float, device=device),
+            scratch,
         ],
         outputs=[out_count, out_q, out_n, out_d, out_f],
         device=device,
@@ -353,3 +381,325 @@ def feature_queries(features: TerrainFeatures, heightfield: int, queries, *, dir
 
 def angle_deg(a, b) -> float:
     return float(np.degrees(np.arccos(np.clip(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)), -1.0, 1.0))))
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# scenes and the rows a collision pipeline produces: today's contacts and the law's shadow rows
+# ----------------------------------------------------------------------------------------------------------------
+
+SCENE_MARGIN = 0.01
+"""Margin of every shape of :func:`body_scene` [m] (the suite's)."""
+SCENE_GAP = 0.01
+"""Contact gap of every shape of :func:`body_scene` [m] (the suite's)."""
+
+
+def body_scene(heights, hx, hy, bodies, *, device, margin=SCENE_MARGIN, gap=SCENE_GAP):
+    """A heightfield at the origin and bodies, each alone in a world over it, as the suite's robots are.
+
+    Args:
+        heights: Heights ``(nrow, ncol)`` [m].
+        hx: Half-extent along x [m].
+        hy: Half-extent along y [m].
+        bodies: ``(kind, dims, pose)`` per body: ``"sphere"`` (``radius``) or ``"capsule"`` (``radius``,
+            ``half_height``), pose ``(px, py, pz, qx, qy, qz, qw)``.
+        device: Model device.
+        margin: Margin of every shape [m].
+        gap: Contact gap of every shape [m].
+
+    Returns:
+        ``(model, heightfield shape, partner shapes)``.
+    """
+    builder = newton.ModelBuilder()
+    cfg = builder.ShapeConfig(margin=margin, gap=gap)
+    data = np.asarray(heights, np.float32)
+    terrain = newton.Heightfield(data=data, nrow=data.shape[0], ncol=data.shape[1], hx=hx, hy=hy)
+    heightfield = builder.add_shape_heightfield(heightfield=terrain, cfg=cfg)
+    shapes = []
+    for kind, dims, pose in bodies:
+        builder.begin_world()
+        p = np.asarray(pose, np.float64)
+        body = builder.add_body(xform=wp.transform(wp.vec3(*p[:3]), wp.quat(*p[3:7])))
+        if kind == "sphere":
+            shapes.append(builder.add_shape_sphere(body, radius=dims["radius"], cfg=cfg))
+        elif kind == "capsule":
+            shapes.append(
+                builder.add_shape_capsule(body, radius=dims["radius"], half_height=dims["half_height"], cfg=cfg)
+            )
+        else:
+            raise ValueError(kind)
+        builder.end_world()
+    return builder.finalize(device=device), heightfield, shapes
+
+
+def shadow_pipeline(model, *, classes: str = "point", **kwargs):
+    """A collision pipeline built with ``NEWTON_TERRAIN_LAW_SHADOW=classes`` (keyword arguments pass through)."""
+    import os  # noqa: PLC0415
+    from unittest.mock import patch  # noqa: PLC0415
+
+    with patch.dict(os.environ, {"NEWTON_TERRAIN_LAW_SHADOW": classes}):
+        return newton.CollisionPipeline(model, **kwargs)
+
+
+def shadow_rows(pipeline) -> dict[int, list]:
+    """The law's shadow rows of the last collide per partner shape: ``[(q, n, d, feature)]``, world frame, float64."""
+    rows = pipeline._terrain_law_shadow.rows()
+    out = {int(p[1]): [] for p in rows["pairs"]}
+    for j, i in enumerate(rows["row_pair"]):
+        out[int(rows["pairs"][i][1])].append(
+            (
+                rows["q"][j].astype(np.float64),
+                rows["n"][j].astype(np.float64),
+                float(rows["d"][j]),
+                int(rows["feature"][j]),
+            )
+        )
+    return out
+
+
+def contact_rows(model, state, contacts, heightfield: int) -> dict[int, list]:
+    """Today's contacts of a heightfield per partner shape: ``[(q, n, d)]``, world frame, float64.
+
+    ``q`` is the contact's terrain point, ``n`` its normal from the terrain to the partner and ``d = n . (k - q)``
+    with ``k`` its partner point. Today's narrow phase puts that point within about 0.1 mm of the partner's core (a
+    sphere's centre, a point of a capsule's axis), so ``d`` approximates the law's core distance to that much only:
+    compare today's rows with the law's on ``q`` and ``n``.
+    """
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    shape0 = contacts.rigid_contact_shape0.numpy()[:count]
+    shape1 = contacts.rigid_contact_shape1.numpy()[:count]
+    point0 = contacts.rigid_contact_point0.numpy()[:count].astype(np.float64)
+    point1 = contacts.rigid_contact_point1.numpy()[:count].astype(np.float64)
+    normal = contacts.rigid_contact_normal.numpy()[:count].astype(np.float64)
+    body_q = state.body_q.numpy().astype(np.float64)
+    shape_body = model.shape_body.numpy()
+
+    def world(shape, p):
+        body = shape_body[shape]
+        if body < 0:
+            return p
+        return body_q[body, :3] + ref.quat_rotate(body_q[body, 3:7], p)
+
+    out = {}
+    for i in range(count):
+        a, b = int(shape0[i]), int(shape1[i])
+        if a == heightfield:
+            partner, q, k, n = b, world(a, point0[i]), world(b, point1[i]), normal[i]
+        elif b == heightfield:
+            partner, q, k, n = a, world(b, point1[i]), world(a, point0[i]), -normal[i]
+        else:
+            continue
+        out.setdefault(partner, []).append((q, n, float(n @ (k - q))))
+    return out
+
+
+def angle_between(a, b) -> float:
+    """Angle between two directions [rad]."""
+    a = np.asarray(a, np.float64)
+    b = np.asarray(b, np.float64)
+    return float(np.arccos(np.clip(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)), -1.0, 1.0)))
+
+
+def row_qnd(row) -> tuple:
+    """``(q, n, d)`` of a reference row or of a ``(q, n, d, ...)`` tuple."""
+    return (row.q, row.n, row.d) if hasattr(row, "q") else tuple(row[:3])
+
+
+def missing_rows(expected, got, *, q_tol: float, angle_tol: float, d_tol: float | None = None) -> list:
+    """The rows of ``expected`` that no row of ``got`` matches (reference rows or ``(q, n, d, ...)`` tuples)."""
+    candidates = [row_qnd(g) for g in got]
+    missing = []
+    for row in expected:
+        q, n, d = row_qnd(row)
+        if not any(
+            np.linalg.norm(gq - q) <= q_tol
+            and angle_between(gn, n) <= angle_tol
+            and (d_tol is None or abs(gd - d) <= d_tol)
+            for gq, gn, gd in candidates
+        ):
+            missing.append(row)
+    return missing
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# float32 against float64: decisions within the predicates' band
+# ----------------------------------------------------------------------------------------------------------------
+
+DECISION_BAND = 2.0e-6
+"""Margin [m] within which a float32 boundary decision may differ from the float64 one (two bands of a 1 m window)."""
+
+
+def core_ends(core) -> list:
+    """A reference core's points: a sphere's centre, a capsule's two ends."""
+    return [core.a, core.b] if hasattr(core, "a") else [core.c]
+
+
+def window_cells(hf: ref.ReferenceHeightfield, core, reach: float) -> tuple[int, int, int, int]:
+    """The cells ``(r0, r1, c0, c1)`` of a point-core pair's window as ``terrain_box_cells`` takes them: the core's
+    ends widened by ``reach``, cell coordinates widened by ``TERRAIN_CELL_WIDEN``."""
+    ends = core_ends(core)
+    lo = np.min(ends, axis=0) - reach
+    hi = np.max(ends, axis=0) + reach
+    c0 = max(int(np.floor((lo[0] + hf.hx) / hf.dx - TERRAIN_CELL_WIDEN)), 0)
+    c1 = min(int(np.floor((hi[0] + hf.hx) / hf.dx + TERRAIN_CELL_WIDEN)), hf.cols - 1)
+    r0 = max(int(np.floor((lo[1] + hf.hy) / hf.dy - TERRAIN_CELL_WIDEN)), 0)
+    r1 = min(int(np.floor((hi[1] + hf.hy) / hf.dy + TERRAIN_CELL_WIDEN)), hf.rows - 1)
+    return r0, r1, c0, c1
+
+
+def kernel_band(hf: ref.ReferenceHeightfield, core, reach: float) -> float:
+    """The closed-predicate band [m] the float32 kernels use for a pair's window (heightfield-local core).
+
+    The window of :func:`window_cells` and the extent of ``terrain_window_extent``: the core's ends in the window
+    frame, the window's size and its heights about its reference vertex. Four of these bands are the float32 finish's
+    plane-group offset, which a float64 comparison passes to :func:`terrain_law_reference.finish` (``group_offset``).
+    """
+    ends = core_ends(core)
+    r0, r1, c0, c1 = window_cells(hf, core, reach)
+    origin = hf.V(r0, c0)
+    extent = max(
+        (c1 + 1 - c0) * hf.dx,
+        (r1 + 1 - r0) * hf.dy,
+        float(np.abs(hf.Z[r0 : r1 + 2, c0 : c1 + 2] - origin[2]).max()),
+        *(float(np.abs(np.asarray(p) - origin).max()) for p in ends),
+    )
+    return TERRAIN_EPS_FACTOR * TERRAIN_EPS32 * max(extent, TERRAIN_EPS_MIN_EXTENT)
+
+
+def _seam_edges(hf: ref.ReferenceHeightfield, q, tol: float) -> list:
+    """Grid edges ``(kind, r, c)`` (``"H"``, ``"V"``, ``"D"`` as the reference names them) whose segment passes within
+    ``tol`` of ``q``'s footprint."""
+    u = (q[0] + hf.hx) / hf.dx
+    v = (q[1] + hf.hy) / hf.dy
+    out = []
+    c, r = int(np.floor(u)), int(np.floor(v))
+    for rr in (r - 1, r, r + 1):
+        for cc in (c - 1, c, c + 1):
+            # H edge (rr, cc)-(rr, cc + 1), V edge (rr, cc)-(rr + 1, cc), D edge (rr, cc)-(rr + 1, cc + 1)
+            for kind, (dr, dc) in (("H", (0, 1)), ("V", (1, 0)), ("D", (1, 1))):
+                if not (hf.valid_vertex(rr, cc) and hf.valid_vertex(rr + dr, cc + dc)):
+                    continue
+                a = np.array([cc * hf.dx, rr * hf.dy])
+                b = np.array([(cc + dc) * hf.dx, (rr + dr) * hf.dy])
+                p = np.array([u * hf.dx, v * hf.dy])
+                t = np.clip((p - a) @ (b - a) / ((b - a) @ (b - a)), 0.0, 1.0)
+                if np.linalg.norm(a + t * (b - a) - p) <= tol:
+                    out.append((kind, rr, cc))
+    return out
+
+
+def _edge_triangles(hf: ref.ReferenceHeightfield, kind: str, r: int, c: int):
+    """The two triangles of a reference edge (None outside the grid), as ``window_features`` lists them."""
+    if kind == "H":
+        return (hf.tri_id(r - 1, c, 1) if hf.valid_cell(r - 1, c) else None), (
+            hf.tri_id(r, c, 0) if hf.valid_cell(r, c) else None
+        )
+    if kind == "V":
+        return (hf.tri_id(r, c - 1, 0) if hf.valid_cell(r, c - 1) else None), (
+            hf.tri_id(r, c, 1) if hf.valid_cell(r, c) else None
+        )
+    return hf.tri_id(r, c, 0), hf.tri_id(r, c, 1)
+
+
+def _face_values(hf: ref.ReferenceHeightfield, t: int, k) -> list:
+    """Float64 face values ``s = (k - a) . m`` of triangle ``t``'s three edges for point ``k``."""
+    vs = hf.tri_verts(t)
+    n, _ = hf.plane(t)
+    out = []
+    for i in range(3):
+        a, b, w = vs[i], vs[(i + 1) % 3], vs[(i + 2) % 3]
+        m = np.cross(b - a, n)
+        if m @ (w - a) > 0.0:
+            m = -m
+        out.append(float((k - a) @ (m / np.linalg.norm(m))))
+    return out
+
+
+def band_decided(hf: ref.ReferenceHeightfield, q, k, *, band: float = DECISION_BAND) -> bool:
+    """Whether a row (terrain point ``q``, core point ``k``, heightfield-local) was decided within ``band``.
+
+    True when the row's terrain point lies on a seam and a float64 predicate deciding a feature there is within
+    ``band`` of its threshold: a face's value at that edge (a face claim, or an edge claim beyond its faces), an
+    edge's class (a crease within ``band`` of flat) or the vertex's Voronoi test. Rows decided within the band
+    may be claimed in float32 and not in float64, or the reverse; any other difference is a defect.
+    """
+    q = np.asarray(q, np.float64)
+    k = np.asarray(k, np.float64)
+    for kind, r, c in _seam_edges(hf, q, band):
+        ta, tb = _edge_triangles(hf, kind, r, c)
+        for t in (ta, tb):
+            if t is not None and min(abs(s) for s in _face_values(hf, t, k)) <= band:
+                return True
+        if ta is not None and tb is not None:
+            n, a = hf.plane(ta)
+            vb = hf.tri_verts(tb)
+            far = [v for v in vb if all(np.linalg.norm(v - w) > 1e-12 for w in hf.tri_verts(ta))]
+            if far and abs(float(n @ (far[0] - a))) <= band:
+                return True
+    # a vertex's Voronoi boundary: the test's largest value within the band of zero
+    u = (q[0] + hf.hx) / hf.dx
+    v = (q[1] + hf.hy) / hf.dy
+    c, r = int(np.rint(u)), int(np.rint(v))
+    if abs(u - c) * hf.dx <= band and abs(v - r) * hf.dy <= band and hf.ring(r, c) is not None:
+        vertex = hf.V(r, c)
+        values = [float((k - vertex) @ (hf.V(*w) - vertex) / np.linalg.norm(hf.V(*w) - vertex)) for w in hf.ring(r, c)]
+        if abs(max(values)) <= band:
+            return True
+    return False
+
+
+def carries_half_space(row, got, *, angle_tol: float = 1.0e-3, tol: float = 1.0e-5) -> bool:
+    """Whether a row of ``got`` carries ``row``'s constraint: normal within ``angle_tol``, terrain point on its plane
+    (``|n . dq|``) and core distance within ``tol``."""
+    q, n, d = row_qnd(row)
+    return any(
+        angle_between(gn, n) <= angle_tol and abs(float(n @ (gq - q))) <= tol and abs(gd - d) <= tol
+        for gq, gn, gd in (row_qnd(g) for g in got)
+    )
+
+
+class RowComparison(NamedTuple):
+    """The float32 rows of one pair against its float64 rows (:func:`compare_rows`)."""
+
+    missing: list
+    """Float64 rows no float32 row matches or carries (defects)."""
+    extra: list
+    """Float32 rows no float64 row matches, not decided within the band (defects)."""
+    covered: int
+    """Unmatched rows whose constraint a row of the other side carries (:func:`carries_half_space`): the same plane and
+    core distance with the terrain point elsewhere on it, as an edge's closest point on a line nearly parallel to the
+    axis lands."""
+    tolerated: int
+    """Float32 rows no float64 row matches or carries, decided within the band (:func:`band_decided`)."""
+    deepest: float
+    """Difference of the deepest core distances [m] (``inf`` when only float64 has rows)."""
+
+
+def compare_rows(
+    hf: ref.ReferenceHeightfield, expected, got, *, frame_tol: float = 1.0e-5, band: float = DECISION_BAND
+) -> RowComparison:
+    """Compare float32 rows with float64 rows of one pair (heightfield-local frame).
+
+    Rows match with terrain points within ``frame_tol``, normals within 1e-3 rad and core distances within 10 um. An
+    unmatched row is a defect unless a row of the other side carries its constraint, or (a float32 row) it was decided
+    within the band. A pair with float64 rows and no float32 row misses them all.
+    """
+    missing = missing_rows(expected, got, q_tol=frame_tol, angle_tol=1.0e-3, d_tol=1.0e-5)
+    extra = missing_rows(got, expected, q_tol=frame_tol, angle_tol=1.0e-3, d_tol=1.0e-5)
+    defects_missing = [row for row in missing if not carries_half_space(row, got)]
+    defects_extra = []
+    covered = len(missing) - len(defects_missing)
+    tolerated = 0
+    for row in extra:
+        q, n, d = row_qnd(row)
+        if carries_half_space(row, expected):
+            covered += 1
+        elif band_decided(hf, q, q + d * n, band=band):
+            tolerated += 1
+        else:
+            defects_extra.append(row)
+    deepest = 0.0
+    if expected and got:
+        deepest = abs(min(row_qnd(r)[2] for r in expected) - min(row_qnd(g)[2] for g in got))
+    elif expected:
+        deepest = float("inf")
+    return RowComparison(defects_missing, defects_extra, covered, tolerated, deepest)
