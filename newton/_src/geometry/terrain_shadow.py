@@ -63,9 +63,9 @@ jobs and the solid classes' :class:`~newton._src.geometry.terrain_law_solid.Terr
 5. Rule X's gate (per listed window vertex under the core's footprint: whether an exit over its cell can pass the
    pair's target), then the items of the pairs it opened (a core point, or a window vertex that can give a
    candidate), valleys and the listed candidates' near-bound descents, the job threads again: they list the candidates
-   whose bounds pass the pair's target; then a lean kernel finishes the pairs without a listed candidate and the exit
-   kernel, one thread per pair of the class (its exit list's room), runs rule X's passes over the listed candidates of
-   the others (exact: any other candidate is a no-op in both passes).
+   whose bounds pass the pair's target; then the exit kernel, one thread per pair of the class (its exit list's room),
+   runs rule X's passes over the listed candidates (exact: any other candidate is a no-op in both passes) and
+   finishes the pair.
 6. The finish kernels: one thread per pair over the pairs holding few rows with a plane group of three (the
    small-pair finish), and a block of lanes per pair over those holding many, the lanes splitting its implied-row
    tests.
@@ -162,14 +162,13 @@ def _solid_launches(name: str) -> tuple[tuple[str, str], ...]:
         "xitems",
         "xvalleys",
         "xdescents",
-        "xlean",
         "exit",
         "small",
         "finish",
         "pooled",
         "full",
     )
-    pair_jobs = ("close", "xlean", "exit", "small")
+    pair_jobs = ("close", "exit", "small")
     kinds = tuple(
         "pairs"
         if kernel == "rows"
@@ -213,8 +212,8 @@ The module is imported only when the class is listed. Launch kinds, every one wi
   arguments (a solid class's scan and job kernels, each striding over its list; a job kernel whose list has no room by
   construction is not launched, :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LIST_OF_KERNEL`);
 * ``pair_jobs``: the same over a list of the class's pairs, with at most one thread per pair
-  (:attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.pair_threads`: a solid class's close, rule X's
-  lean and exit kernels and the small-pair finish);
+  (:attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.pair_threads`: a solid class's close and exit
+  kernels and the small-pair finish);
 * ``pair_tiles``: ``wp.launch_tiled`` with
   :attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.finish_blocks` blocks of
   :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK` lanes, a pair per block at a time over a list of the

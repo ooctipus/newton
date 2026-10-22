@@ -3463,27 +3463,6 @@ def solid_exit_pair(
 
 
 @wp.func
-def solid_exit_lean(
-    data: TerrainFeatureData,
-    out: TerrainLawRows,
-    jobs: TerrainSolidJobs,
-    pair_index: int,
-    i: int,
-    slot: int,
-    walk_slots: int,
-    partner_class: int,
-    frame: wp.transform,
-):
-    """Rule X for a pair left to the class's exit kernel with no listed candidate, both of whose passes are then no-ops
-    (:func:`solid_exit_pair`): its held rows finished (:func:`_finish_or_lanes`), in a kernel without rule X's
-    search."""
-    record, window = solid_job_window(data, jobs, i)
-    _finish_or_lanes(
-        window, record, slot, out.count[pair_index], walk_slots, out, jobs, pair_index, i, partner_class, frame
-    )
-
-
-@wp.func
 def solid_finish_pair(
     data: TerrainFeatureData,
     out: TerrainLawRows,
@@ -3547,7 +3526,6 @@ TERRAIN_SOLID_LAUNCHES = (
     ("jobs", "xitems"),
     ("jobs", "xvalleys"),
     ("jobs", "xdescents"),
-    ("pair_jobs", "xlean"),
     ("pair_jobs", "exit"),
     ("pair_jobs", "small"),
     ("pair_tiles", "finish"),
@@ -3924,36 +3902,6 @@ def solid_kernels(
         for k in range(t, wp.min(jobs.counts[_XDESCENTS], jobs.descent.shape[0]), jobs.threads):
             solid_xdescent_job(data, jobs, k)
 
-    def xlean(
-        begin: int,
-        slot_begin: int,
-        inputs: TerrainPairInputs,
-        data: TerrainFeatureData,
-        out: TerrainLawRows,
-        jobs: TerrainSolidJobs,
-        solids: TerrainSolidData,
-    ):
-        """Rule X's pairs without a listed candidate, one pair of the class's exit list per thread at a time: their
-        held rows finished (:func:`solid_exit_lean`), so that the exit kernel's search runs only for the others."""
-        t = wp.tid()
-        if t >= jobs.pair_threads:
-            return
-        for entry in range(t, solids.exit_count[class_], jobs.pair_threads):
-            pair = solids.exits[out.deferred_first[class_] + entry]
-            i = pair - begin
-            if jobs.xall[i] == 0 and jobs.xhead[i] < 0:
-                solid_exit_lean(
-                    data,
-                    out,
-                    jobs,
-                    pair,
-                    i,
-                    slot_begin + i * rows_,
-                    rows_,
-                    class_,
-                    inputs.shape_transform[inputs.pairs[pair][0]],
-                )
-
     def exit_(
         begin: int,
         slot_begin: int,
@@ -3964,17 +3912,13 @@ def solid_kernels(
         solids: TerrainSolidData,
     ):
         """Rule X, one pair of the class's exit list per thread at a time (the job threads stride over it): a listed
-        pair's deepest exit over its listed candidates (:func:`solid_exit_pair`); a pair without one is the lean
-        kernel's."""
+        pair's deepest exit over its listed candidates (:func:`solid_exit_pair`)."""
         t = wp.tid()
         if t >= jobs.pair_threads:
             return
         for entry in range(t, solids.exit_count[class_], jobs.pair_threads):
             pair = solids.exits[out.deferred_first[class_] + entry]
             i = pair - begin
-            if jobs.xall[i] == 0 and jobs.xhead[i] < 0:
-                # finished by the lean kernel (no listed candidate)
-                continue
             solid_exit_pair(
                 wp.static(load_core)(jobs, i, solids),
                 data,
@@ -4165,7 +4109,6 @@ def solid_kernels(
         ("xitems", xitems),
         ("xvalleys", xvalleys),
         ("xdescents", xdescents),
-        ("xlean", xlean),
         ("exit", exit_),
         ("small", small),
         ("finish", finish),
