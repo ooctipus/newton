@@ -1532,6 +1532,7 @@ def terrain_finish_slots(
     eps: float,
     lane: int,
     lanes: int,
+    distinct: bool,
 ) -> tuple[int, int]:
     """The law's finish of a walking pair's held rows in place: ``count`` rows (at most
     :data:`TERRAIN_FINISH_MASK_ROWS`) at ``[base, base + count)`` of row arrays, in feature order.
@@ -1543,10 +1544,13 @@ def terrain_finish_slots(
     one spanning the largest triangle with them and the one adding the most area. Ties are broken by row order, never
     by memory order. :func:`terrain_finish_list` is the same finish on any number of candidates, bit for bit.
 
+    ``distinct`` rows have no coincident pair to merge (rows held with :func:`terrain_hold_row` at ``eps``: it drops a
+    row coinciding with a held one by the same test), so the first step is skipped.
+
     ``lanes`` threads may run it together on one pair (lane ``lane``, ``lanes`` the block's size; one thread passes
-    ``0, 1``): every lane runs every step and returns the same values, but the implied-row test of a row, the finish's
-    cost (up to every triangle of its group's members), is split among the lanes and their answers ORed across the
-    block (:func:`_staged_implied`). With ``lanes > 1`` every lane of the block must call it with the same rows.
+    ``0, 1``): every lane runs every step and returns the same values, but the implied-row test of a row (up to every
+    triangle of its group's members) is split among the lanes and their answers ORed across the block
+    (:func:`_staged_implied`). With ``lanes > 1`` every lane of the block must call it with the same rows.
 
     Returns ``(keep, kept)``: bit ``i`` of ``keep`` marks row ``i`` kept (kept rows in row order), and their count.
     """
@@ -1556,13 +1560,14 @@ def terrain_finish_slots(
     rank = _MaskInts()
     # 1. coincident rows: the first in feature order stays
     for i in range(count):
-        qi = q[base + i]
-        ni = n[base + i]
         survives = bool(True)
-        for j in range(i):
-            if ((alive >> j) & 1) != 0 and terrain_rows_coincide(q[base + j], n[base + j], qi, ni, eps):
-                survives = False
-                break
+        if not distinct:
+            qi = q[base + i]
+            ni = n[base + i]
+            for j in range(i):
+                if ((alive >> j) & 1) != 0 and terrain_rows_coincide(q[base + j], n[base + j], qi, ni, eps):
+                    survives = False
+                    break
         if survives:
             alive = alive | (1 << i)
     # 2. plane groups: the first row of a plane represents it

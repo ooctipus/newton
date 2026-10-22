@@ -2178,7 +2178,8 @@ def solid_finish(
         if lane == 0:
             terrain_defer_pair(out, partner_class, pair_index, _wide(cells))
         return
-    keep, kept = terrain_finish_slots(out.q, out.n, out.d, slot, held, pair.eps, lane, lanes)
+    # the held rows are distinct: every one was held with terrain_hold_row at the pair's eps
+    keep, kept = terrain_finish_slots(out.q, out.n, out.d, slot, held, pair.eps, lane, lanes, True)
     if lanes > 1:
         # the lanes agree on ``kept``; the reduction makes every lane's reads of the rows precede the writes below
         kept = wp.tile_extract(wp.tile_max(wp.tile(kept)), 0)

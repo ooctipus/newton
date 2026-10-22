@@ -61,6 +61,7 @@ from newton._src.geometry.terrain_law import (
     terrain_finish_list,
     terrain_finish_scratch,
     terrain_finish_slots,
+    terrain_hold_row,
     terrain_law_block_dim,
     terrain_law_rows,
     terrain_planes,
@@ -165,7 +166,7 @@ def _finish_both(
     i = wp.tid()
     base = i * 40
     count = counts[i]
-    keep, kept = terrain_finish_slots(q, n, d, base, prefixes[i], eps[i], 0, 1)
+    keep, kept = terrain_finish_slots(q, n, d, base, prefixes[i], eps[i], 0, 1, False)
     for j in range(prefixes[i]):
         in_slots[i, j] = (keep >> j) & 1
     in_slots[i, 40] = kept
@@ -281,6 +282,84 @@ def test_finish_in_place_equals_finish(test, device):
 
 
 @wp.kernel(enable_backward=False)
+def _finish_held(
+    q: wp.array[wp.vec3],
+    n: wp.array[wp.vec3],
+    d: wp.array[float],
+    counts: wp.array[int],
+    eps: wp.array[float],
+    out: TerrainLawRows,
+    merged: wp.array2d[int],
+    skipped: wp.array2d[int],
+):
+    """Per list of rows at ``40 i``: the rows held one by one as a pair holds its candidates (``terrain_hold_row``,
+    into ``out``'s slots from ``40 i``), then the in-place finish of the held rows with its coincidence step run and
+    skipped, each as per-row keep flags, the held count and the kept count last."""
+    i = wp.tid()
+    base = i * 40
+    held = int(0)
+    for j in range(counts[i]):
+        held = terrain_hold_row(out, base, held, q[base + j], n[base + j], d[base + j], j, eps[i], 32)
+    held = wp.min(held, 32)
+    keep, kept = terrain_finish_slots(out.q, out.n, out.d, base, held, eps[i], 0, 1, False)
+    for j in range(held):
+        merged[i, j] = (keep >> j) & 1
+    merged[i, 39] = held
+    merged[i, 40] = kept
+    keep, kept = terrain_finish_slots(out.q, out.n, out.d, base, held, eps[i], 0, 1, True)
+    for j in range(held):
+        skipped[i, j] = (keep >> j) & 1
+    skipped[i, 39] = held
+    skipped[i, 40] = kept
+
+
+def test_held_rows_need_no_coincidence_step(test, device):
+    """Keep the same rows, bit for bit, finishing held rows with the finish's coincidence step skipped (``distinct``,
+    as every solid pair's finish runs) as with it run: rows held with ``terrain_hold_row`` at the finish's ``eps``
+    include no coincident pair, its test dropping each row that coincides with a held one.
+
+    The finish's candidate lists (coincident rows, plane groups, implied rows, groups of more than four rows), held in
+    list order first.
+    """
+    rng = np.random.default_rng(59)
+    lists = _candidate_lists(rng, 400)
+    q = np.zeros((len(lists) * 40, 3), np.float32)
+    n = np.zeros((len(lists) * 40, 3), np.float32)
+    d = np.zeros(len(lists) * 40, np.float32)
+    counts = np.zeros(len(lists), np.int32)
+    for i, (rows, _prefix) in enumerate(lists):
+        counts[i] = len(rows)
+        for j, (qq, nn, dd) in enumerate(rows):
+            q[i * 40 + j] = qq
+            n[i * 40 + j] = nn
+            d[i * 40 + j] = dd
+    eps = np.full(len(lists), 8.0 * 1.1920928955078125e-7 * 0.2, np.float32)
+    out = terrain_law_rows(device, len(lists), len(lists) * 40, 0, [0] * 4)
+    merged = wp.zeros((len(lists), 41), dtype=int, device=device)
+    skipped = wp.zeros((len(lists), 41), dtype=int, device=device)
+    wp.launch(
+        _finish_held,
+        dim=len(lists),
+        inputs=[
+            wp.array(q, dtype=wp.vec3, device=device),
+            wp.array(n, dtype=wp.vec3, device=device),
+            wp.array(d, dtype=float, device=device),
+            wp.array(counts, dtype=int, device=device),
+            wp.array(eps, dtype=float, device=device),
+            out,
+        ],
+        outputs=[merged, skipped],
+        device=device,
+    )
+    a = merged.numpy()
+    b = skipped.numpy()
+    np.testing.assert_array_equal(a, b)
+    # the hold merged coincident rows, and the finish dropped rows of the held ones
+    test.assertGreater(int(np.sum(a[:, 39] < counts)), 30)
+    test.assertGreater(int(np.sum(a[:, 40] < a[:, 39])), 100)
+
+
+@wp.kernel(enable_backward=False)
 def _finish_lanes(
     q: wp.array[wp.vec3],
     n: wp.array[wp.vec3],
@@ -295,11 +374,11 @@ def _finish_lanes(
     i, lane = wp.tid()
     base = i * 40
     if lane == 0:
-        keep, kept = terrain_finish_slots(q, n, d, base, prefixes[i], eps[i], 0, 1)
+        keep, kept = terrain_finish_slots(q, n, d, base, prefixes[i], eps[i], 0, 1, False)
         for j in range(prefixes[i]):
             one_lane[i, j] = (keep >> j) & 1
         one_lane[i, 40] = kept
-    keep, kept = terrain_finish_slots(q, n, d, base, prefixes[i], eps[i], lane, wp.block_dim())
+    keep, kept = terrain_finish_slots(q, n, d, base, prefixes[i], eps[i], lane, wp.block_dim(), False)
     if lane == 0:
         for j in range(prefixes[i]):
             lanes[i, j] = (keep >> j) & 1
@@ -2448,6 +2527,7 @@ devices = get_test_devices()
 for _name, _func in (
     ("test_finish_in_place_equals_finish", test_finish_in_place_equals_finish),
     ("test_finish_lanes_keep_one_lanes_rows", test_finish_lanes_keep_one_lanes_rows),
+    ("test_held_rows_need_no_coincidence_step", test_held_rows_need_no_coincidence_step),
     ("test_solid_rows_are_minimal_at_flat_seams", test_solid_rows_are_minimal_at_flat_seams),
     (
         "test_solid_rows_are_minimal_on_a_vertex_without_margins",
