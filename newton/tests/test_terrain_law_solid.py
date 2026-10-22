@@ -1167,9 +1167,10 @@ def _recovery_rows(
     out: TerrainLawRows,
     held: wp.array[int],
 ):
-    """Rule R's rows of cores given in the heightfield frame, in the window of reference vertex ``reference``: thread
-    ``i`` takes box ``i``, then the cylinders, its rows held in the eight slots from ``8 i``."""
-    i = wp.tid()
+    """Rule R's rows of cores given in the heightfield frame, in the window of reference vertex ``reference``: block
+    ``i`` takes box ``i``, then the cylinders, its lanes splitting the core's points as rule R's kernel does (one lane
+    on the CPU), its rows held in the eight slots from ``8 i``."""
+    i, lane = wp.tid()
     window = terrain_window(data, 0, reference[0], reference[1])
     window.eps = terrain_eps(1.0)
     planes = terrain_planes()
@@ -1177,12 +1178,13 @@ def _recovery_rows(
     if i < boxes.shape[0]:
         box = boxes[i]
         box.c = terrain_window_point(window, box.c)
-        planes, sink = solid_recovery(box, data, window, planes, sink, out)
+        planes, sink = solid_recovery(box, data, window, planes, sink, out, lane, wp.block_dim())
     else:
         cylinder = cylinders[i - boxes.shape[0]]
         cylinder.c = terrain_window_point(window, cylinder.c)
-        planes, sink = solid_recovery(cylinder, data, window, planes, sink, out)
-    held[i] = sink.held
+        planes, sink = solid_recovery(cylinder, data, window, planes, sink, out, lane, wp.block_dim())
+    if lane == 0:
+        held[i] = sink.held
 
 
 def test_recovery_picks_follow_depth_then_index(test, device):
@@ -1194,7 +1196,8 @@ def test_recovery_picks_follow_depth_then_index(test, device):
     passes that each take the deepest point not yet taken, the first in index order on ties: the box's corners 0 to 3
     and the cylinder's rim points 16 to 19 (its bottom cap's first), each row's rank (its feature id's point slot)
     following the index. A selection that put a later point before equally deep kept ones would pick the cylinder's
-    last four rim points and reverse the ranks.
+    last four rim points and reverse the ranks. On CUDA the block's lanes split the points (the cylinder's 32 one per
+    lane) and merge their picks by block minima of depth, then index: the same picks in the same ranks.
     """
     n = 17
     model = tu.heightfield_model(np.zeros((n, n)), 0.4, 0.4, device=device)
@@ -1212,7 +1215,7 @@ def test_recovery_picks_follow_depth_then_index(test, device):
     reference = (4, 4)
     out = terrain_law_rows(device, 2, 16, 0, [0] * 4)
     held = wp.zeros(2, dtype=int, device=device)
-    wp.launch(
+    wp.launch_tiled(
         _recovery_rows,
         dim=2,
         inputs=[
@@ -1222,6 +1225,7 @@ def test_recovery_picks_follow_depth_then_index(test, device):
             wp.vec2i(*reference),
         ],
         outputs=[out, held],
+        block_dim=terrain_law_block_dim(device),
         device=device,
     )
     # the window frame's origin: the reference vertex (heights 0)

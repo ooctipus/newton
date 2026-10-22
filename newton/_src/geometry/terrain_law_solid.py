@@ -76,8 +76,9 @@ pairs' features at once instead of one pair's whole window, and no thread walks 
    window vertex times six plus its item, times eight plus its point slot), the row the walk would offer there.
 3. The close (:func:`solid_close_jobs`), one thread per live pair: the pair's candidates held in its walk slots in key
    order (:func:`~newton._src.geometry.terrain_law.terrain_hold_row`, the walk's held rows bit for bit, however the
-   jobs ran; a candidate listed twice is one offer), then rule R's kernel for a pair without a row
-   (:func:`solid_recover_pair`); a pair whose core reaches below its window's highest vertex is left, its rows held, to
+   jobs ran; a candidate listed twice is one offer), then rule R's kernel for a pair without a row, a block of lanes
+   per pair splitting its core points (:func:`solid_recover_pair`); a pair whose core reaches below its window's
+   highest vertex is left, its rows held, to
    rule X, with one item per core point and window vertex that can give a candidate listed, and any other is finished
    (step 5).
 4. Rule X's items (:func:`solid_xitem_job`: a core point, or a window vertex that can give a candidate) and valleys
@@ -89,7 +90,7 @@ pairs' features at once instead of one pair's whole window, and no thread walks 
    pair some of whose rule X work found no room is left to the full-finish kernels, which run rule X over every
    candidate.
 5. The finish: a pair with fewer than :data:`TERRAIN_SOLID_LANE_ROWS` rows is finished in place by the thread that
-   holds it (its close, rule R's kernel or the exit kernel); a pair with more is listed for the finish kernel
+   holds it (its close, rule R's first lane or the exit kernel); a pair with more is listed for the finish kernel
    (:func:`solid_finish_pair`), a block of lanes per pair splitting the finish's implied-row tests (its cost: up to
    every triangle of a plane group's rows, for each of its rows), so that a pair with many rows no longer holds a
    launch for as long as one thread takes to finish it.
@@ -262,9 +263,9 @@ TERRAIN_SOLID_JOB_THREADS_CPU = 4
 """Threads of a job kernel's launch on the CPU, which runs a launch's threads one after another: a few, so that each
 job's cost is the job's (they still stride over the list)."""
 TERRAIN_SOLID_FINISH_BLOCKS = TERRAIN_SOLID_JOB_THREADS // TERRAIN_LAW_BLOCK
-"""Blocks of the finish kernel's launch on CUDA at most (fewer with fewer pairs): the job threads' worth of
-:data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK`-lane blocks, each finishing one pair at a time with its
-lanes and striding over the class's live pairs."""
+"""Blocks of rule R's and the finish kernel's launches on CUDA at most (fewer with fewer pairs): the job threads' worth
+of :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK`-lane blocks, each taking one pair of its list at a time
+with its lanes."""
 TERRAIN_SOLID_RECOVERY_CLEAR = 1.0e-4
 """Height [m] by which a core without a candidate must clear its window's highest vertex for its close to leave it
 without a row instead of listing it for rule R: every core point then lies above the plane of the face under it (a
@@ -331,6 +332,7 @@ _SCANS = wp.constant(9)
 _XDESCENTS = wp.constant(10)
 _WALKS = wp.constant(11)
 _LANES = wp.constant(12)
+_NO_POINT = wp.constant(1 << 30)
 
 _Mat43 = wp.types.matrix(shape=(4, 3), dtype=wp.float32)
 _ArcValues = wp.types.vector(length=TERRAIN_SOLID_ARC_SAMPLES, dtype=wp.float32)
@@ -480,11 +482,12 @@ class TerrainSolidJobs:
     threads: int
     """Threads of the job kernels' launches: each strides over its list."""
     pair_threads: int
-    """Threads of the launches that stride over lists of the class's pairs (the close, rule R's and the exit kernels:
-    the live pairs, the pairs without a row, the pairs left to rule X): the job threads, at most the class's pairs."""
+    """Threads of the launches that stride over lists of the class's pairs (the close and the exit kernel: the live
+    pairs, the pairs left to rule X): the job threads, at most the class's pairs."""
     finish_blocks: int
-    """Blocks of the finish kernel's launch (``wp.launch_tiled``, a pair per block at a time striding over the live
-    pairs): :data:`TERRAIN_SOLID_FINISH_BLOCKS` on CUDA, the job threads on the CPU, at most the class's pairs."""
+    """Blocks of the launches that take a list of the class's pairs a pair per block at a time (``wp.launch_tiled``:
+    rule R's kernel over the pairs without a row, the finish kernel over the lane list):
+    :data:`TERRAIN_SOLID_FINISH_BLOCKS` on CUDA, the job threads on the CPU, at most the class's pairs."""
     q: wp.array[wp.vec3]
     """The candidate pool: terrain point of every candidate [m, window frame]. Its first entries hold the jobs' rows
     (:func:`_offer`), its last ``descent.shape[0]`` rule X's listed candidates (:func:`_x_list`), each region with its
@@ -1184,18 +1187,22 @@ def solid_recovery(
     planes: TerrainPlanes,
     sink: _Sink,
     store: TerrainLawRows,
+    lane: int,
+    lanes: int,
 ) -> tuple[TerrainPlanes, _Sink]:
     """Rule R (G3): up to four of the core's boundary points below the surface, deepest first (then in order), each
-    against the face vertically above it with that plane's normal and depth.
+    against the face vertically above it with that plane's normal and depth, by a block's ``lanes`` lanes (lane
+    ``lane``; one thread passes ``0, 1``).
 
-    One pass over the points keeps the first four in (depth, index) order, each point's depth taken once. A row's
-    feature id takes the pick's rank (0-3) as its point slot, unique within the pair: a boundary point's index (up to 32
-    for a cylinder) would wrap in the slot's three bits.
+    Each lane takes every ``lanes``-th point and keeps its first four in (depth, index) order, each point's depth taken
+    once; four block minima then pick the pair's first four in that order, and the first lane offers their rows. A
+    row's feature id takes the pick's rank (0-3) as its point slot, unique within the pair: a boundary point's index (up
+    to 32 for a cylinder) would wrap in the slot's three bits.
     """
     depth = wp.vec4(0.0)
     index = wp.vec4i(-1)
     kept = int(0)
-    for i in range(core_recovery_count(core)):
+    for i in range(lane, core_recovery_count(core), lanes):
         x = core_recovery_point(core, i)
         t = terrain_locate(window, x[0], x[1])
         if t[0] < 0:
@@ -1218,6 +1225,31 @@ def solid_recovery(
         depth[k] = d
         index[k] = i
         kept = wp.min(kept + 1, 4)
+    if lanes > 1:
+        # merge the lanes' lists: each round's least depth, then the least index at it (each index is one lane's)
+        mine = int(0)
+        picked = wp.vec4(0.0)
+        picks = wp.vec4i(-1)
+        count = int(0)
+        for _round in range(4):
+            d = float(_HUGE)
+            i = int(_NO_POINT)
+            if mine < kept:
+                d = depth[mine]
+                i = index[mine]
+            least = wp.tile_extract(wp.tile_min(wp.tile(d)), 0)
+            first = wp.tile_extract(wp.tile_min(wp.tile(wp.where(d == least, i, _NO_POINT))), 0)
+            if first != _NO_POINT:
+                if i == first:
+                    mine += 1
+                picked[count] = least
+                picks[count] = first
+                count += 1
+        depth = picked
+        index = picks
+        kept = count
+    if lane != 0:
+        return planes, sink
     for pick in range(kept):
         best_d = depth[pick]
         x = core_recovery_point(core, index[pick])
@@ -2182,7 +2214,7 @@ def solid_close_full(
     longer bounds (changed since construction): it keeps the first in window order and is flagged."""
     store = solid_scratch_store(scratch)
     if sink.raw == 0:
-        planes, sink = solid_recovery(core, data, window, planes, sink, store)
+        planes, sink = solid_recovery(core, data, window, planes, sink, store, 0, 1)
     # Rule X can give a row only to a core whose lowest point lies below its window's highest vertex.
     lo, _hi = core_bounds(core)
     if lo[2] < pair.top:
@@ -2895,14 +2927,17 @@ def solid_recover_pair(
     walk_slots: int,
     partner_class: int,
     frame: wp.transform,
+    lane: int,
+    lanes: int,
 ):
-    """Rule R for a closed pair without a row (class pair ``i``, its walk slots from ``slot``), then its settling
-    (:func:`_solid_settle`)."""
+    """Rule R for a closed pair without a row (class pair ``i``, its walk slots from ``slot``) by a block's ``lanes``
+    lanes (lane ``lane``, :func:`solid_recovery`), then its settling by the first lane (:func:`_solid_settle`)."""
     record, window = solid_job_window(data, jobs, i)
     sink = solid_sink(slot, walk_slots, record.pair.eps)
     planes = terrain_planes()
-    planes, sink = solid_recovery(core, data, window, planes, sink, out)
-    _solid_settle(core, data, window, record, sink, out, jobs, solids, pair_index, i, partner_class, frame)
+    planes, sink = solid_recovery(core, data, window, planes, sink, out, lane, lanes)
+    if lane == 0:
+        _solid_settle(core, data, window, record, sink, out, jobs, solids, pair_index, i, partner_class, frame)
 
 
 @wp.func
@@ -3108,7 +3143,7 @@ TERRAIN_SOLID_LAUNCHES = (
     ("jobs", "creases"),
     ("jobs", "vertices"),
     ("pair_jobs", "close"),
-    ("pair_jobs", "recovery"),
+    ("pair_tiles", "recovery"),
     ("jobs", "xitems"),
     ("jobs", "xvalleys"),
     ("jobs", "xdescents"),
@@ -3121,7 +3156,7 @@ TERRAIN_SOLID_LAUNCHES = (
 class, ``jobs`` the class's job threads (:attr:`TerrainSolidJobs.threads`, striding over a list; a thread past them
 returns at once, so that a larger launch takes no entry twice), ``pair_jobs`` the same over a list of the class's pairs
 with at most one thread per pair (:attr:`TerrainSolidJobs.pair_threads`), ``pair_tiles`` blocks of lanes striding over
-the class's live pairs, one pair per block at a time (:attr:`TerrainSolidJobs.finish_blocks`, ``wp.launch_tiled``),
+a list of the class's pairs, one pair per block at a time (:attr:`TerrainSolidJobs.finish_blocks`, ``wp.launch_tiled``),
 ``full`` the full-finish grid (:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`,
 ``wp.launch_tiled``). A job kernel whose list has no
 room by construction (:func:`terrain_solid_job_capacities`: none of the class's pairs can list an entry, as rule X's
@@ -3366,12 +3401,15 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         jobs: TerrainSolidJobs,
         solids: TerrainSolidData,
     ):
-        """Rule R, one closed pair without a row per thread at a time, its rows then held for the finish kernel or its
-        rule X's items listed (:func:`solid_recover_pair`)."""
-        t = wp.tid()
-        if t >= jobs.pair_threads:
+        """Rule R, ``wp.block_dim()`` lanes per closed pair without a row (the class's recovery list, block ``b`` its
+        pairs ``b``, ``b + finish_blocks``, ...; ``wp.launch_tiled`` with ``dim=jobs.finish_blocks``): the lanes split
+        the pair's core points, and the first lane offers its rows and finishes it, holds them for the finish kernel or
+        lists its rule X's items (:func:`solid_recover_pair`)."""
+        block, lane = wp.tid()
+        if block >= jobs.finish_blocks:
             return
-        for entry in range(t, jobs.counts[_RECOVER], jobs.pair_threads):
+        lanes = wp.block_dim()
+        for entry in range(block, jobs.counts[_RECOVER], jobs.finish_blocks):
             i = jobs.recover[entry]
             pair = begin + i
             solid_recover_pair(
@@ -3386,6 +3424,8 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
                 rows_,
                 class_,
                 inputs.shape_transform[inputs.pairs[pair][0]],
+                lane,
+                lanes,
             )
 
     def xitems(

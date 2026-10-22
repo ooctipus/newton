@@ -155,14 +155,14 @@ def _solid_launches(name: str) -> tuple[tuple[str, str], ...]:
         "pooled",
         "full",
     )
-    pair_jobs = ("close", "recovery", "exit")
+    pair_jobs = ("close", "exit")
     kinds = tuple(
         "pairs"
         if kernel == "rows"
         else "full"
         if kernel in ("pooled", "full")
         else "pair_tiles"
-        if kernel == "finish"
+        if kernel in ("recovery", "finish")
         else "pair_jobs"
         if kernel in pair_jobs
         else "jobs"
@@ -199,12 +199,12 @@ The module is imported only when the class is listed. Launch kinds, every one wi
   arguments (a solid class's scan and job kernels, each striding over its list; a job kernel whose list has no room by
   construction is not launched, :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LIST_OF_KERNEL`);
 * ``pair_jobs``: the same over a list of the class's pairs, with at most one thread per pair
-  (:attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.pair_threads`: a solid class's close, rule R and
-  exit kernels);
+  (:attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.pair_threads`: a solid class's close and exit
+  kernels);
 * ``pair_tiles``: ``wp.launch_tiled`` with
   :attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.finish_blocks` blocks of
-  :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK` lanes, a pair per block at a time over the class's live
-  pairs, the same arguments (a solid class's finish kernel);
+  :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK` lanes, a pair per block at a time over a list of the
+  class's pairs, the same arguments (a solid class's rule R and finish kernels);
 * ``full``: ``wp.launch_tiled`` with :func:`~newton._src.geometry.terrain_law.terrain_finish_blocks` blocks of
   :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK` lanes whatever the class's size, striding over its
   deferred list, and a :class:`~newton._src.geometry.terrain_law.TerrainFinishScratch` as sixth argument (a solid
