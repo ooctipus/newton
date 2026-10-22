@@ -67,8 +67,20 @@ from newton._src.geometry.terrain_law import (
     terrain_window,
     terrain_window_point,
 )
-from newton._src.geometry.terrain_law_cores import TerrainBoxCore, TerrainCylinderCore
-from newton._src.geometry.terrain_law_solid import TERRAIN_SOLID_LAUNCHES, solid_recovery, solid_sink
+from newton._src.geometry.terrain_law_cores import (
+    TerrainBoxCore,
+    TerrainCylinderCore,
+    TerrainHullCore,
+    TerrainHullTable,
+    closest_on_triangle,
+    core_nearest,
+)
+from newton._src.geometry.terrain_law_solid import (
+    TERRAIN_SOLID_LAUNCHES,
+    build_hull_table,
+    solid_recovery,
+    solid_sink,
+)
 from newton._src.geometry.terrain_shadow import TERRAIN_LAW_JOB_NAMES
 from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_solid_utils as su
@@ -1260,6 +1272,173 @@ def test_recovery_picks_follow_depth_then_index(test, device):
             depth = local[:, 2]
             expected = sorted(range(len(depth)), key=lambda k: (depth[k], k))[:4]
             test.assertEqual([picked[ranks.index(rank)] for rank in range(4)], expected)
+
+
+@wp.func
+def _nearest_every_triangle(core: TerrainHullCore, v: wp.vec3) -> tuple[bool, wp.vec3, wp.vec3, float]:
+    """A hull's nearest point (rule V) over every triangle of the hull in order, without passing any face by; from
+    inside, :func:`core_nearest`'s (no triangle is tested there)."""
+    pl = wp.transpose(core.rot) @ (v - core.c)
+    xs = wp.cw_div(pl, core.s)
+    inside = bool(True)
+    for f in range(core.face_begin, core.face_begin + core.face_count):
+        p = core.table.planes[f]
+        nf = wp.vec3(p[0], p[1], p[2])
+        if (p[3] - wp.dot(nf, xs)) / wp.length(wp.cw_div(nf, core.s)) < 0.0:
+            inside = False
+    if inside:
+        return core_nearest(core, v)
+    nearest = pl
+    dist2 = float(3.0e38)
+    first = core.table.face_triangles[core.face_begin]
+    for j in range(first, core.table.face_triangles[core.face_begin + core.face_count]):
+        tri = core.table.triangles[j]
+        q = closest_on_triangle(
+            pl,
+            wp.cw_mul(core.table.points[tri[0]], core.s),
+            wp.cw_mul(core.table.points[tri[1]], core.s),
+            wp.cw_mul(core.table.points[tri[2]], core.s),
+        )
+        d2 = wp.length_sq(q - pl)
+        if d2 < dist2:
+            dist2 = d2
+            nearest = q
+    k = core.c + core.rot @ nearest
+    dist = wp.length(k - v)
+    if dist <= 0.0:
+        return False, k, k, 0.0
+    return True, (k - v) / dist, k, dist
+
+
+@wp.func
+def _nearest_row(out: wp.array2d[float], i: int, ok: bool, n: wp.vec3, k: wp.vec3, d: float):
+    out[i, 0] = wp.where(ok, 1.0, 0.0)
+    for j in range(3):
+        out[i, 1 + j] = n[j]
+        out[i, 4 + j] = k[j]
+    out[i, 7] = d
+
+
+@wp.kernel(enable_backward=False)
+def _hull_nearest(
+    table: TerrainHullTable,
+    hull: wp.array[int],
+    pose: wp.array[wp.transform],
+    scale: wp.array[wp.vec3],
+    radius: wp.array[float],
+    v: wp.array[wp.vec3],
+    pruned: wp.array2d[float],
+    every: wp.array2d[float],
+):
+    """Query ``i``: the nearest point of hull ``hull[i]`` (posed and scaled) to ``v[i]``, by :func:`core_nearest`
+    and over every triangle."""
+    i = wp.tid()
+    core = TerrainHullCore()
+    core.c = wp.transform_get_translation(pose[i])
+    core.rot = wp.quat_to_matrix(wp.transform_get_rotation(pose[i]))
+    core.s = scale[i]
+    points = table.hull_points[hull[i]]
+    faces = table.hull_faces[hull[i]]
+    core.point_begin = points[0]
+    core.point_count = points[1]
+    core.face_begin = faces[0]
+    core.face_count = faces[1]
+    core.radius = radius[i]
+    core.start = points[0]
+    core.table = table
+    ok, n, k, d = core_nearest(core, v[i])
+    _nearest_row(pruned, i, ok, n, k, d)
+    ok, n, k, d = _nearest_every_triangle(core, v[i])
+    _nearest_row(every, i, ok, n, k, d)
+
+
+def _nearest_meshes(rng):
+    """A sole of 64 points on an ellipsoid (triangle faces, as h1's foot hull), a box of 26 grid points (faces of nine
+    coplanar points, each fanned into seven triangles), a tetrahedron and an octahedron."""
+    sphere = rng.normal(size=(64, 3))
+    sphere /= np.linalg.norm(sphere, axis=1, keepdims=True)
+    sole = sphere * np.array([0.12, 0.04, 0.04]) + np.array([0.055, 0.0, -0.03])
+    grid = np.array(
+        [(x, y, z) for x in (-1, 0, 1) for y in (-1, 0, 1) for z in (-1, 0, 1) if (x, y, z) != (0, 0, 0)], np.float64
+    ) * np.array([0.08, 0.06, 0.04])
+    tetra = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.0, 0.08, 0.0], [0.02, 0.03, 0.06]])
+    octa = np.array([[s * (k == j) for k in range(3)] for j in range(3) for s in (0.05, -0.05)], np.float64)
+    return [sole, grid, tetra, octa]
+
+
+def test_hull_nearest_passes_faces_by_without_changing_it(test, device):
+    """Take rule V's nearest point of a hull, bit for bit, with faces whose plane lies beyond a nearest point found
+    passed by, as over every triangle: the first nearest triangle in triangle order, on ties too.
+
+    Four hulls (a 64-point sole, a box of nine-point faces, a tetrahedron, an octahedron), posed and scaled (also
+    unevenly), against points around them (outside and inside, up to 2.5 radii out), near their vertices (1e-7 to
+    1e-2 m off) and near their faces (above, on and below a point of a face triangle, where triangles of one face tie).
+    """
+    rng = np.random.default_rng(53)
+    meshes = _nearest_meshes(rng)
+    table = build_hull_table(meshes, np.arange(len(meshes), dtype=np.int32), device)
+    triangles = table.triangles.numpy()
+    face_triangles = table.face_triangles.numpy()
+    hull_faces = table.hull_faces.numpy()
+    normals = table.planes.numpy()[:, :3]
+    hull, pose, scale, radius, v = [], [], [], [], []
+    for h, mesh in enumerate(meshes):
+        for _k in range(1500):
+            s = np.ones(3) if rng.random() < 0.5 else rng.uniform(0.5, 2.0, size=3)
+            q = rng.normal(size=4)
+            q /= np.linalg.norm(q)
+            c = rng.uniform(-0.5, 0.5, size=3)
+            x_, y_, z_, w_ = q
+            rot = np.array(
+                [
+                    [1 - 2 * (y_ * y_ + z_ * z_), 2 * (x_ * y_ - z_ * w_), 2 * (x_ * z_ + y_ * w_)],
+                    [2 * (x_ * y_ + z_ * w_), 1 - 2 * (x_ * x_ + z_ * z_), 2 * (y_ * z_ - x_ * w_)],
+                    [2 * (x_ * z_ - y_ * w_), 2 * (y_ * z_ + x_ * w_), 1 - 2 * (x_ * x_ + y_ * y_)],
+                ]
+            )
+            world = c + (mesh * s) @ rot.T
+            r = float(np.linalg.norm(mesh * s, axis=1).max())
+            kind = rng.integers(3)
+            if kind == 0:
+                u = rng.normal(size=3)
+                x = c + u / np.linalg.norm(u) * r * rng.uniform(0.0, 2.5)
+            elif kind == 1:
+                u = rng.normal(size=3)
+                x = world[rng.integers(len(mesh))] + u / np.linalg.norm(u) * 10.0 ** rng.uniform(-7.0, -2.0)
+            else:
+                f = hull_faces[h][0] + rng.integers(hull_faces[h][1])
+                tri = triangles[rng.integers(face_triangles[f], face_triangles[f + 1])]
+                w = rng.dirichlet(np.ones(3))
+                base = np.concatenate(meshes)[tri]
+                point = c + ((w @ base) * s) @ rot.T
+                n = (normals[f] / s) @ rot.T
+                x = point + n / np.linalg.norm(n) * rng.choice([0.0, 1.0e-6, 1.0e-3, -1.0e-4, 2.0e-2])
+            hull.append(h)
+            pose.append((*c, *q))
+            scale.append(s)
+            radius.append(r)
+            v.append(x)
+    count = len(v)
+    pruned = wp.zeros((count, 8), dtype=float, device=device)
+    every = wp.zeros((count, 8), dtype=float, device=device)
+    wp.launch(
+        _hull_nearest,
+        dim=count,
+        inputs=[
+            table,
+            wp.array(np.asarray(hull, np.int32), dtype=int, device=device),
+            wp.array(np.asarray(pose, np.float32), dtype=wp.transform, device=device),
+            wp.array(np.asarray(scale, np.float32), dtype=wp.vec3, device=device),
+            wp.array(np.asarray(radius, np.float32), dtype=float, device=device),
+            wp.array(np.asarray(v, np.float32), dtype=wp.vec3, device=device),
+        ],
+        outputs=[pruned, every],
+        device=device,
+    )
+    a, b = pruned.numpy(), every.numpy()
+    # most queries lie outside (a triangle's point), and the nearest points are found
+    test.assertGreater(int(np.count_nonzero(a[:, 0])), count // 2)
+    np.testing.assert_array_equal(a.view(np.int32), b.view(np.int32))
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -2464,6 +2643,7 @@ for _name, _func in (
     ("test_hovering_core_skips_rule_r", test_hovering_core_skips_rule_r),
     ("test_hovering_core_leaves_at_the_fine_mip", test_hovering_core_leaves_at_the_fine_mip),
     ("test_recovery_picks_follow_depth_then_index", test_recovery_picks_follow_depth_then_index),
+    ("test_hull_nearest_passes_faces_by_without_changing_it", test_hull_nearest_passes_faces_by_without_changing_it),
     ("test_solid_rows_match_the_float64_law", test_solid_rows_match_the_float64_law),
     ("test_job_pipeline_rows_are_the_walks", test_job_pipeline_rows_are_the_walks),
     ("test_job_lists_hold_each_run_together", test_job_lists_hold_each_run_together),

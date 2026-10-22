@@ -56,13 +56,10 @@ def _core(local: wp.transform, size: wp.vec4, kind: int, partner: int, solids: T
         return False, core
     points = solids.hulls.hull_points[hull]
     faces = solids.hulls.hull_faces[hull]
-    triangles = solids.hulls.hull_triangles[hull]
     core.point_begin = points[0]
     core.point_count = points[1]
     core.face_begin = faces[0]
     core.face_count = faces[1]
-    core.triangle_begin = triangles[0]
-    core.triangle_count = triangles[1]
     # the radius, and the point lowest along the heightfield's up axis (the support searches' start)
     up = wp.cw_mul(wp.vec3(core.rot[2, 0], core.rot[2, 1], core.rot[2, 2]), core.s)
     radius = float(0.0)
@@ -91,8 +88,6 @@ def _core_save(jobs: TerrainSolidJobs, i: int, core: TerrainHullCore):
     record.point_count = core.point_count
     record.face_begin = core.face_begin
     record.face_count = core.face_count
-    record.triangle_begin = core.triangle_begin
-    record.triangle_count = core.triangle_count
     record.radius = core.radius
     record.start = core.start
     jobs.hull_cores[i] = record
@@ -111,8 +106,6 @@ def _core_load(jobs: TerrainSolidJobs, i: int, solids: TerrainSolidData) -> Terr
     core.point_count = record.point_count
     core.face_begin = record.face_begin
     core.face_count = record.face_count
-    core.triangle_begin = record.triangle_begin
-    core.triangle_count = record.triangle_count
     core.radius = record.radius
     core.start = record.start
     core.table = solids.hulls
