@@ -11,8 +11,9 @@ kernels :func:`terrain_box_rows_faces`, :func:`terrain_box_rows_edges`, :func:`t
 :func:`terrain_box_rows_close` and rule R's :func:`terrain_box_rows_recovery`, rule X's gate
 :func:`terrain_box_rows_xbound`, :func:`terrain_box_rows_xitems`, :func:`terrain_box_rows_xvalleys`,
 :func:`terrain_box_rows_xdescents` and :func:`terrain_box_rows_exit`, the finish kernels :func:`terrain_box_rows_small`
-(one thread per pair of few rows with a plane group of three) and :func:`terrain_box_rows_finish` (a block of lanes per
-pair of many), and last the pairs the others deferred: :func:`terrain_box_rows_pooled` finishes those with more distinct
+(one thread per pair with a plane group of three) and :func:`terrain_box_rows_finish` (a block of lanes per pair of
+:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LANE_ROWS` rows, which no walking pair holds: not
+launched), and last the pairs the others deferred: :func:`terrain_box_rows_pooled` finishes those with more distinct
 rows than the class's 16 walk slots from their pooled candidates, :func:`terrain_box_rows_full` walks those whose work
 found no room. The walk, the rules and the finish are :mod:`~newton._src.geometry.terrain_law_solid`'s; the module is
 compiled without floating-point contraction, so the CPU decides every boundary as the GPU does.

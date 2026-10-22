@@ -283,10 +283,12 @@ TERRAIN_SOLID_RECOVERY_CLEAR = 1.0e-4
 without a row instead of listing it for rule R: every core point then lies above the plane of the face under it (a
 cluster plane lies within :data:`~newton._src.geometry.terrain_law.TERRAIN_FLAT_EPS` of its triangles' vertices) by
 far more than the float32 rounding of its plane distance, so rule R would find none of them below the surface."""
-TERRAIN_SOLID_LANE_ROWS = 8
-"""Held rows from which a pair's finish takes a block of lanes (the finish kernel); a pair with fewer is finished by the
-thread that holds it. A finish's cost grows with the cube of a plane group's rows per row; below this one thread is
-cheaper than a block's every lane staging the pair."""
+TERRAIN_SOLID_LANE_ROWS = 32
+"""Held rows from which a pair's finish takes a block of lanes (the finish kernel); a pair with fewer is written as it is
+or finished by one thread of the small-pair finish kernel. Above every class's walk slots, so that no walking pair takes
+the lanes and a class launches no finish kernel: on the law's own operating states one thread per pair (the block's
+every lane staging the pair, zero-filling its arrays, otherwise) was faster for every class, by 0.04 to 0.34 ms per env
+step."""
 TERRAIN_SOLID_SCAN_VERTICES = 32
 """Window vertices one scan job takes at most (the bits of a run's survivor masks; a class's run is
 :data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_SCAN_RUN`), and the window vertices of one run of rule

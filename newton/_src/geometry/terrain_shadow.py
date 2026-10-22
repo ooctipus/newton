@@ -66,9 +66,9 @@ jobs and the solid classes' :class:`~newton._src.geometry.terrain_law_solid.Terr
    whose bounds pass the pair's target; then the exit kernel, one thread per pair of the class (its exit list's room),
    runs rule X's passes over the listed candidates (exact: any other candidate is a no-op in both passes) and
    finishes the pair.
-6. The finish kernels: one thread per pair over the pairs holding few rows with a plane group of three (the
-   small-pair finish), and a block of lanes per pair over those holding many, the lanes splitting its implied-row
-   tests.
+6. The finish kernels: one thread per pair over the pairs with a plane group of three (the small-pair finish), and a
+   block of lanes per pair over those holding the lane rows, the lanes splitting its implied-row tests (not launched
+   while no class's walk slots hold them).
 7. The full-finish kernel (below).
 
 The full-finish kernel of a class, ``wp.launch_tiled`` on the fixed grid of its
@@ -681,12 +681,20 @@ class TerrainLawShadow:
                     elif kind == "pair_jobs":
                         self._launches.append(("thread", kernel, jobs.pair_threads, begin, slot, (jobs, True)))
                     elif kind == "pair_tiles":
+                        if kernel_name == prefix + "finish" and walk < solid_module.TERRAIN_SOLID_LANE_ROWS:
+                            # no walking pair holds the lane rows: its lane list stays empty
+                            skipped.append("finish")
+                            continue
                         self._launches.append(("tiled", kernel, jobs.finish_blocks, begin, slot, (jobs, True)))
                     elif kind == "jobs":
                         # a list none of the class's pairs can fill: no launch
                         short = kernel_name.removeprefix(prefix)
                         listed = solid_module.TERRAIN_SOLID_LIST_OF_KERNEL.get(short)
                         if listed is not None and capacity[listed] == 0:
+                            skipped.append(short)
+                            continue
+                        if short == "xbound" and partner_class == TERRAIN_PARTNER_HULL:
+                            # rule X's gate does not bound a hull's exits (core_exits_gated): its pairs are open at once
                             skipped.append(short)
                             continue
                         self._launches.append(("thread", kernel, jobs.threads, begin, slot, (jobs, True)))
