@@ -139,6 +139,10 @@ cluster plane to be concave in every frame (:func:`terrain_crease_static`): over
 can take."""
 TERRAIN_VERTEX_FEATURE_BIT = wp.constant(64)
 """Bit of a vertex feature in a vertex's bits (:func:`terrain_vertex_feature`)."""
+TERRAIN_VERTEX_CREASE_UNSURE_BIT = wp.constant(128)
+"""Bit of a vertex in its bits when some of its creases of code 0 is not convex in every window frame of
+:data:`TERRAIN_CREASE_STATIC_CELLS` cells (:func:`terrain_crease_static`): without it, every crease of code 0 of the
+vertex is convex in every such frame."""
 
 TERRAIN_EDGE_X = wp.constant(0)
 """Edge ``(r, c)-(r, c + 1)``, between cell ``(r - 1, c)`` sub 1 and cell ``(r, c)`` sub 0."""
@@ -1120,10 +1124,10 @@ def _grid_point64(surface: TerrainSurfaceInfo, z: float, r: int, c: int) -> wp.v
 
 
 @wp.func
-def terrain_crease_static(data: TerrainFeatureData, surface: TerrainSurfaceInfo, r: int, c: int, which: int) -> bool:
-    """Return whether crease ``which`` of vertex ``(r, c)`` is concave in every window frame whose points it reads lie
-    within :data:`TERRAIN_CREASE_STATIC_CELLS` cells of the window's reference vertex (the static class of
-    :data:`TERRAIN_VERTEX_EDGE_CONCAVE`).
+def terrain_crease_static(data: TerrainFeatureData, surface: TerrainSurfaceInfo, r: int, c: int, which: int) -> int:
+    """Return crease ``which`` of vertex ``(r, c)``'s class in every window frame whose points it reads lie within
+    :data:`TERRAIN_CREASE_STATIC_CELLS` cells of the window's reference vertex: 1 concave in all of them (the static
+    class of :data:`TERRAIN_VERTEX_EDGE_CONCAVE`), -1 convex in all of them, 0 when frames may disagree.
 
     :func:`terrain_crease_class` takes ``n . (w_b - a)`` in float32 in a window frame: ``n`` the unit normal of the
     first triangle's cluster plane, ``a`` its point over the reference vertex (a lone triangle's first vertex), ``w_b``
@@ -1133,10 +1137,11 @@ def terrain_crease_static(data: TerrainFeatureData, surface: TerrainSurfaceInfo,
     reference vertex within ``H + sqrt(2) s W`` (``s`` the plane's slope): every rounding of the frame's test (its
     inputs, its normal's normalization, a lone triangle's normal from rounded edges, its differences, products and
     sums) stays below ``20 eps32 (1 + s) (W + H)``. The far vertex must clear the plane by
-    :data:`TERRAIN_CREASE_STATIC_ROUNDING` ``eps32 2 (1 + s) (W + H)``, over six times that."""
+    :data:`TERRAIN_CREASE_STATIC_ROUNDING` ``eps32 2 (1 + s) (W + H)``, over six times that, above the plane for the
+    concave class, below it for the convex one (the frame's test classes a value of 0 convex)."""
     _v0i, _v1i, ta, tb, _wa, wb = terrain_edge_sides(r, c, which)
     if not terrain_valid_cell(surface, ta[0], ta[1]) or not terrain_valid_cell(surface, tb[0], tb[1]):
-        return False
+        return 0
     w = _grid_point64(surface, terrain_height(data, surface, wb[0], wb[1]), wb[0], wb[1])
     cluster = terrain_cluster(data, surface, ta[0], ta[1], ta[2])
     value = wp.float64(0.0)
@@ -1162,7 +1167,7 @@ def terrain_crease_static(data: TerrainFeatureData, surface: TerrainSurfaceInfo,
             n = -n
         length = wp.length(n)
         if length <= wp.float64(0.0):
-            return False
+            return 0
         value = wp.dot(n, w - pa) / length
         slope = wp.sqrt(n[0] * n[0] + n[1] * n[1]) / n[2]
     cells = wp.float64(_CREASE_CELLS + 1)
@@ -1175,7 +1180,11 @@ def terrain_crease_static(data: TerrainFeatureData, surface: TerrainSurfaceInfo,
         * (wp.float64(1.0) + slope)
         * (span + heights)
     )
-    return value > margin
+    if value > margin:
+        return 1
+    if value < -margin:
+        return -1
+    return 0
 
 
 @wp.func
@@ -1195,11 +1204,33 @@ def terrain_edge_open_crease(data: TerrainFeatureData, window: TerrainWindow, r:
 
 
 @wp.func
+def terrain_edge_open_valley(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, which: int) -> bool:
+    """Return whether edge ``which`` of window vertex ``(r, c)`` is a crease that may be concave in the window's frame:
+    not flat, not on the border (:func:`terrain_edge_kind`), and not a crease of code 0 at a vertex without
+    :data:`TERRAIN_VERTEX_CREASE_UNSURE_BIT`, which every frame of :data:`TERRAIN_CREASE_STATIC_CELLS` cells classes
+    convex (:func:`terrain_crease_static`; farther from the reference vertex the frame's test decides). One read of
+    the vertex's bits."""
+    surface = window.surface
+    if r < 0 or c < 0 or r >= surface.nrow or c >= surface.ncol:
+        return terrain_edge_kind(data, surface, r, c, which) < 0
+    bits = terrain_vertex_bits(data, surface, r, c)
+    code = (bits >> (2 * which)) & 3
+    if code == TERRAIN_VERTEX_EDGE_CONCAVE:
+        return True
+    if code != 0:
+        return False
+    if (bits & TERRAIN_VERTEX_CREASE_UNSURE_BIT) != 0:
+        return True
+    return r - window.r0 > _CREASE_CELLS - 2 or c - window.c0 > _CREASE_CELLS - 2
+
+
+@wp.func
 def terrain_vertex_bits_of_clusters(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int) -> int:
     """Return vertex ``(r, c)``'s bits from the clusters and heights (:attr:`TerrainFeatureData.vertex_bits`): per
     edge it owns (x-, y-, diagonal edge), two bits from bit ``2 which``: :data:`TERRAIN_VERTEX_EDGE_FLAT`,
     :data:`TERRAIN_VERTEX_EDGE_BORDER`, :data:`TERRAIN_VERTEX_EDGE_CONCAVE` (:func:`terrain_crease_static`) or 0 for
-    any other crease; and :data:`TERRAIN_VERTEX_FEATURE_BIT` for a vertex feature."""
+    any other crease; :data:`TERRAIN_VERTEX_FEATURE_BIT` for a vertex feature; and
+    :data:`TERRAIN_VERTEX_CREASE_UNSURE_BIT` when a crease of code 0 is not convex in every frame."""
     bits = int(0)
     for which in range(3):
         kind = _edge_kind_of_clusters(data, window.surface, r, c, which)
@@ -1207,8 +1238,12 @@ def terrain_vertex_bits_of_clusters(data: TerrainFeatureData, window: TerrainWin
             bits = bits | (TERRAIN_VERTEX_EDGE_FLAT << (2 * which))
         elif kind == TERRAIN_EDGE_BORDER:
             bits = bits | (TERRAIN_VERTEX_EDGE_BORDER << (2 * which))
-        elif terrain_crease_static(data, window.surface, r, c, which):
-            bits = bits | (TERRAIN_VERTEX_EDGE_CONCAVE << (2 * which))
+        else:
+            static = terrain_crease_static(data, window.surface, r, c, which)
+            if static > 0:
+                bits = bits | (TERRAIN_VERTEX_EDGE_CONCAVE << (2 * which))
+            elif static == 0:
+                bits = bits | TERRAIN_VERTEX_CREASE_UNSURE_BIT
     if _vertex_feature_of_planes(data, window, r, c):
         bits = bits | TERRAIN_VERTEX_FEATURE_BIT
     return bits

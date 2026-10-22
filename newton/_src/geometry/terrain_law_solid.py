@@ -164,8 +164,8 @@ from .terrain_law import (
     terrain_cluster,
     terrain_crease_class,
     terrain_defer_pair,
-    terrain_edge_kind,
     terrain_edge_open_crease,
+    terrain_edge_open_valley,
     terrain_edge_sides,
     terrain_eps,
     terrain_feature_id,
@@ -1739,9 +1739,9 @@ def _valley_arc(
     """Rule X at edge ``which`` of vertex ``(r, c)``, before its gate: ``(planes, ok, v0, e, length2, n_a, n_b, top)``,
     ``ok`` for a valley (concave crease) rising above the core's lowest height ``low``, its lower vertex ``v0``, its
     vector ``e`` (squared length ``length2``), its normal arc ``n_a`` to ``n_b`` and its higher end's height ``top``."""
-    surface = window.surface
     no = wp.vec3(0.0)
-    if terrain_edge_kind(data, surface, r, c, which) >= 0:
+    if not terrain_edge_open_valley(data, window, r, c, which):
+        # flat, on the border, or a ridge in this window's frame by its static class: no valley
         return planes, False, no, no, 0.0, no, no, 0.0
     v0i, v1i, ta, tb, _wa, _wb = terrain_edge_sides(r, c, which)
     v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
