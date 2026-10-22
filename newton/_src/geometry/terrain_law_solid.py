@@ -61,12 +61,12 @@ the shape of today's terrain route: a cheap scan that lists the features that su
 per listed feature, and a per-pair close that holds their rows in window order, so that a warp runs one rule on many
 pairs' features at once instead of one pair's whole window, and no thread walks a large window alone:
 
-1. The whole-pair rejects, one thread per pair; a pair past them is listed live, its window in runs of
-   :data:`TERRAIN_SOLID_SCAN_VERTICES` window vertices. The scan (:func:`solid_scan`), one thread per run: the
-   window, the core kept for the jobs (:class:`TerrainSolidJobs`, first run), and the run's features through their
-   cheapest rejects in window order: rule F's faces (one per cluster plane and run: its manifold, support tests and
-   emitting triangle are its cluster's alone, :func:`_face_support`), rule E's edges (:func:`_edge_cheap`) and rule
-   V's vertices (:func:`_vertex_cheap`), each survivor listed for its job kernel.
+1. The whole-pair rejects, one thread per pair; a pair past them keeps its core and window frame
+   (:class:`TerrainSolidRecord`) for the scan and the jobs and is listed live, its window in runs of
+   :data:`TERRAIN_SOLID_SCAN_VERTICES` window vertices. The scan (:func:`solid_scan`), one thread per run: the run's
+   features through their cheapest rejects in window order: rule F's faces (one per cluster plane and run: its
+   manifold, support tests and emitting triangle are its cluster's alone, :func:`_face_support`), rule E's edges
+   (:func:`_edge_cheap`) and rule V's vertices (:func:`_vertex_cheap`), each survivor listed for its job kernel.
 2. The job kernels, a fixed grid striding over each list: :func:`solid_face_job`, :func:`solid_edge_job` (its crease
    tests, :func:`_edge_arc`; a crease whose arc can hold a row is listed for ``theta*``), :func:`solid_theta_job`
    (``theta*``, :func:`_edge_theta`, kept per listed crease), :func:`solid_crease_job` (the crossing at ``theta*``
@@ -412,8 +412,8 @@ class _Pair:
 
 @wp.struct
 class TerrainSolidRecord:
-    """What a solid pair's scan leaves for its job kernels: its window's cells and heightfield and its window-frame
-    quantities (its core, window frame shift included, is in its class's core records)."""
+    """What a solid pair's whole-pair kernel keeps for its scan and job kernels: its window's cells and heightfield and
+    its window-frame quantities (its core, window frame shift included, is in its class's core records)."""
 
     cells: wp.vec4i
     """The window's cells ``(r0, r1, c0, c1)``."""
@@ -439,7 +439,7 @@ class TerrainSolidJobs:
     first: int
     """The class's first table pair: pair ``first + i`` is the class's pair ``i``."""
     records: wp.array[TerrainSolidRecord]
-    """Per class pair: its scan's record."""
+    """Per class pair: its record (a live pair's, from the whole-pair kernel)."""
     box_cores: wp.array[TerrainBoxCore]
     """Per class pair of the box class: its core, window frame (one unused entry for another class)."""
     cylinder_cores: wp.array[TerrainCylinderCore]
@@ -1088,23 +1088,27 @@ def _solid_edge(
 
 
 @wp.func
-def _vertex_cheap(core: Any, data: TerrainFeatureData, window: TerrainWindow, pair: _Pair, r: int, c: int) -> bool:
-    """Rule V's rejects of vertex ``(r, c)``: ``False`` for a vertex that gives no row (not a vertex feature, from its
-    bits: on the border or with incident normals that do not span 3-D; below the core; out of the reach of its sphere
-    or of its support plane facing the vertex)."""
+def _vertex_cheap(core: Any, data: TerrainFeatureData, window: TerrainWindow, pair: _Pair, r: int, c: int):
+    """Rule V's rejects of vertex ``(r, c)``: ``(core, listed)``, ``listed`` ``False`` for a vertex that gives no row
+    (not a vertex feature, from its bits: on the border or with incident normals that do not span 3-D; below the core;
+    out of the reach of its sphere or of its support plane facing the vertex). The core keeps its support search's end
+    for the next vertex's (:func:`~newton._src.geometry.terrain_law_cores.core_sigma_near`: a run's vertices lie near
+    each other)."""
     if not terrain_vertex_feature(data, window, r, c):
-        return False
+        return core, False
     v = terrain_window_vertex(data, window, r, c)
     if v[2] < pair.low:
-        return False
+        return core, False
     toward = pair.sphere_c - v
     distance = wp.length(toward)
     if distance - pair.sphere_r > pair.reach:
-        return False
-    if distance > 0.0 and core_sigma(core, toward / distance, v) > pair.reach:
-        # the core's support plane facing the vertex lies beyond the reach, and so does the core
-        return False
-    return True
+        return core, False
+    if distance > 0.0:
+        core, sigma = core_sigma_near(core, toward / distance, v)
+        if sigma > pair.reach:
+            # the core's support plane facing the vertex lies beyond the reach, and so does the core
+            return core, False
+    return core, True
 
 
 @wp.func
@@ -1145,7 +1149,8 @@ def _solid_vertex(
 ) -> tuple[TerrainPlanes, _Sink]:
     """Rule V for vertex ``(r, c)``: a vertex feature whose normal cone holds the direction to the core's nearest
     point (or its minimum translation) emits a row within reach."""
-    if not _vertex_cheap(core, data, window, pair, r, c):
+    _core, listed = _vertex_cheap(core, data, window, pair, r, c)
+    if not listed:
         return planes, sink
     return _vertex_rows(core, data, window, planes, pair, sink, store, r, c)
 
@@ -2382,32 +2387,23 @@ def solid_scan(
     core: Any,
     data: TerrainFeatureData,
     window: TerrainWindow,
-    pair: _Pair,
-    cells: wp.vec4i,
-    heightfield: int,
+    record: TerrainSolidRecord,
     out: TerrainLawRows,
     jobs: TerrainSolidJobs,
     pair_index: int,
     i: int,
     run: int,
 ):
-    """Run ``run`` of a live pair's scan (class pair ``i``; the window vertices ``[run, run + 1)`` times
-    :data:`TERRAIN_SOLID_SCAN_VERTICES` in window order): the first run keeps the pair's core and record; each passes
-    its vertices' features in window order through the cheapest rejects of their rules and lists every survivor for its
-    job kernel: rule F's faces (:func:`_face_top`; of a cluster of several triangles, the first that passes, its
+    """Run ``run`` of a live pair's scan (class pair ``i``, its kept core and record; the window vertices ``[run, run +
+    1)`` times :data:`TERRAIN_SOLID_SCAN_VERTICES` in window order): its vertices' features in window order through the
+    cheapest rejects of their rules, every survivor listed for its job kernel: rule F's faces (:func:`_face_top`; of a cluster of several triangles, the first that passes, its
     cluster's manifold and emitting triangle being its cluster's alone), rule E's edges (:func:`_edge_cheap`) and rule
     V's vertices (:func:`_vertex_cheap`). The run marks its survivors in one bit per vertex and item, then reserves
     each list's entries with one atomic and writes them in window order (:func:`_job_reserve`): consecutive entries of a
     list are one run's, so that the threads of a job kernel's warp take one pair's features. A job without room flags
     the pair :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_INCOMPLETE` (its close then defers it)."""
-    if run == 0:
-        record = TerrainSolidRecord()
-        record.cells = cells
-        record.heightfield = heightfield
-        record.pair = pair
-        lo, _hi = core_bounds(core)
-        record.low = lo[2]
-        jobs.records[i] = record
+    pair = record.pair
+    cells = record.cells
     surface = window.surface
     r0 = cells[0]
     r1 = cells[1]
@@ -2468,7 +2464,8 @@ def solid_scan(
                 else:
                     edge2 = _with_bit(edge2, v)
                 edges += 1
-        if _vertex_cheap(core, data, window, pair, r, c):
+        core, listed = _vertex_cheap(core, data, window, pair, r, c)
+        if listed:
             point = _with_bit(point, v)
             points += 1
     entry, kept = _job_reserve(jobs, _FACES, jobs.faces, faces)
@@ -3212,10 +3209,10 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         solids: TerrainSolidData,
     ):
         """The whole-pair rejects, one thread per pair of the class (stale features, the pair policy, a partner without
-        a core, a window off the heightfield, the tile-max exit): a pair past them is listed live
-        (:attr:`TerrainSolidJobs.live`) for the close, its window's runs for the scan
-        (:attr:`TerrainSolidJobs.scans`), and takes state :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_JOBS`;
-        any other is recorded with no row."""
+        a core, a window off the heightfield, the tile-max exit): a pair past them keeps its core and record (window
+        frame) for its scan and jobs, is listed live (:attr:`TerrainSolidJobs.live`) for the close, its window's runs
+        for the scan (:attr:`TerrainSolidJobs.scans`), and takes state
+        :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_JOBS`; any other is recorded with no row."""
         i = wp.tid()
         pair = begin + i
         state, _frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
@@ -3226,10 +3223,19 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         if not supported:
             solid_unsupported(out, pair)
             return
-        state, cells, _lo, _hi = solid_pair_cells(core, data, heightfield, reach)
+        state, cells, lo, hi = solid_pair_cells(core, data, heightfield, reach)
         if state != 0:
             terrain_pair_exit(out, pair, state)
             return
+        _window, core, setup = solid_pair_frame(core, data, heightfield, cells, lo, hi, reach)
+        wp.static(save_core)(jobs, i, core)
+        record = TerrainSolidRecord()
+        record.cells = cells
+        record.heightfield = heightfield
+        record.pair = setup
+        low, _high = core_bounds(core)
+        record.low = low[2]
+        jobs.records[i] = record
         out.first[pair] = -1
         out.count[pair] = 0
         out.state[pair] = _wide(cells) | TERRAIN_PAIR_JOBS
@@ -3255,23 +3261,17 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         jobs: TerrainSolidJobs,
         solids: TerrainSolidData,
     ):
-        """The scan, one run of a live pair's window per thread at a time: its window frame, its core kept (first run)
-        and the run's features through their cheapest rejects, the survivors listed for the job kernels
-        (:func:`solid_scan`)."""
+        """The scan, one run of a live pair's window per thread at a time: the run's features through their cheapest
+        rejects, the survivors listed for the job kernels (:func:`solid_scan`; the pair's core and record kept by the
+        whole-pair kernel)."""
         t = wp.tid()
         if t >= jobs.threads:
             return
         for entry in range(t, wp.min(jobs.counts[_SCANS], jobs.scans.shape[0]), jobs.threads):
             job = jobs.scans[entry]
             i = job[0]
-            pair = begin + i
-            _state, _frame, heightfield, local, partner, size, reach = solid_pair_read(inputs, data, pair)
-            _supported, core = wp.static(make_core)(local, size, inputs.shape_type[partner], partner, solids)
-            _state, cells, lo, hi = solid_pair_cells(core, data, heightfield, reach)
-            window, core, setup = solid_pair_frame(core, data, heightfield, cells, lo, hi, reach)
-            if job[1] == 0:
-                wp.static(save_core)(jobs, i, core)
-            solid_scan(core, data, window, setup, cells, heightfield, out, jobs, pair, i, job[1])
+            record, window = solid_job_window(data, jobs, i)
+            solid_scan(wp.static(load_core)(jobs, i, solids), data, window, record, out, jobs, begin + i, i, job[1])
 
     def faces(
         begin: int,
