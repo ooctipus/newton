@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import warp as wp
 
-from .terrain_contacts import TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_WALK_SLOTS
+from .terrain_contacts import TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_SCAN_RUN, TERRAIN_PARTNER_WALK_SLOTS
 from .terrain_law_cores import TerrainBoxCore
 from .terrain_law_solid import TerrainSolidData, TerrainSolidJobs, solid_kernels
 
@@ -54,7 +54,16 @@ def _core_load(jobs: TerrainSolidJobs, i: int, solids: TerrainSolidData) -> Terr
     return jobs.box_cores[i]
 
 
-_KERNELS = solid_kernels("box", TERRAIN_PARTNER_BOX, TERRAIN_BOX_WALK_SLOTS, _core, _core_save, _core_load, __name__)
+_KERNELS = solid_kernels(
+    "box",
+    TERRAIN_PARTNER_BOX,
+    TERRAIN_BOX_WALK_SLOTS,
+    TERRAIN_PARTNER_SCAN_RUN[TERRAIN_PARTNER_BOX],
+    _core,
+    _core_save,
+    _core_load,
+    __name__,
+)
 terrain_box_rows = _KERNELS["rows"]
 terrain_box_rows_scan = _KERNELS["scan"]
 terrain_box_rows_faces = _KERNELS["faces"]

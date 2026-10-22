@@ -47,8 +47,8 @@ in window order (:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LA
 jobs and the solid classes' :class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData`):
 
 1. The whole-pair rejects, one thread per pair of the class (stale features, the pair policy, a partner without a core,
-   a window off the heightfield, the tile-max exit): a pair past them is listed live, its window in runs of
-   :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_SCAN_VERTICES` window vertices.
+   a window off the heightfield, the tile-max exit): a pair past them is listed live, its window in runs of its class's
+   :data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_SCAN_RUN` window vertices.
 2. The scan, a fixed grid of the class's job threads striding over the runs: a run's features through their cheapest
    rejects, the survivors listed (rule F's faces, one per cluster plane and run; rule E's edges; rule V's vertices).
 3. The job kernels, the job threads striding over a list: faces, edges (whose creases with an arc that can hold a row
@@ -102,6 +102,7 @@ from .terrain_contacts import (
     TERRAIN_PARTNER_CYLINDER,
     TERRAIN_PARTNER_HULL,
     TERRAIN_PARTNER_POINT,
+    TERRAIN_PARTNER_SCAN_RUN,
     TERRAIN_PARTNER_WALK_SLOTS,
     TerrainFeatures,
     TerrainPairTable,
@@ -551,6 +552,7 @@ class TerrainLawShadow:
                     takes,
                     self.table.candidates[begin:end],
                     walk,
+                    scan_run=int(TERRAIN_PARTNER_SCAN_RUN[partner_class]),
                     scale=self.job_scale,
                 )
                 offset = _JOBS + TERRAIN_LAW_JOB_COUNTERS * partner_class

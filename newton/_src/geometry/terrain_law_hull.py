@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import warp as wp
 
-from .terrain_contacts import TERRAIN_PARTNER_HULL, TERRAIN_PARTNER_WALK_SLOTS
+from .terrain_contacts import TERRAIN_PARTNER_HULL, TERRAIN_PARTNER_SCAN_RUN, TERRAIN_PARTNER_WALK_SLOTS
 from .terrain_law_cores import TerrainHullCore, TerrainHullCoreRecord
 from .terrain_law_solid import TerrainSolidData, TerrainSolidJobs, solid_kernels
 from .types import GeoType
@@ -119,7 +119,16 @@ def _core_load(jobs: TerrainSolidJobs, i: int, solids: TerrainSolidData) -> Terr
     return core
 
 
-_KERNELS = solid_kernels("hull", TERRAIN_PARTNER_HULL, TERRAIN_HULL_WALK_SLOTS, _core, _core_save, _core_load, __name__)
+_KERNELS = solid_kernels(
+    "hull",
+    TERRAIN_PARTNER_HULL,
+    TERRAIN_HULL_WALK_SLOTS,
+    TERRAIN_PARTNER_SCAN_RUN[TERRAIN_PARTNER_HULL],
+    _core,
+    _core_save,
+    _core_load,
+    __name__,
+)
 terrain_hull_rows = _KERNELS["rows"]
 terrain_hull_rows_scan = _KERNELS["scan"]
 terrain_hull_rows_faces = _KERNELS["faces"]

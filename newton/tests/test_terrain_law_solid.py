@@ -38,6 +38,7 @@ from newton._src.geometry.terrain_contacts import (
     TERRAIN_PARTNER_BOX,
     TERRAIN_PARTNER_CYLINDER,
     TERRAIN_PARTNER_HULL,
+    TERRAIN_PARTNER_SCAN_RUN,
     TERRAIN_PARTNER_WALK_SLOTS,
     TerrainFeatures,
 )
@@ -1542,6 +1543,7 @@ def _class_jobs(model, shadow, partner_class, *, threads=None, **capacities):
         takes,
         table.candidates[begin:end],
         int(TERRAIN_PARTNER_WALK_SLOTS[partner_class]),
+        scan_run=int(TERRAIN_PARTNER_SCAN_RUN[partner_class]),
     )
     sizes.update(capacities)
     jobs = terrain_law_solid.terrain_solid_jobs(model.device, partner_class, begin, end - begin, sizes)
@@ -1653,8 +1655,8 @@ def test_job_pipeline_rows_are_the_walks(test, device):
     """Give a solid pair the rows its window's walk gives, bit for bit, whatever order its jobs run in.
 
     Solids of every class over rough terrain, among them of every class one whose window holds over 256 vertices (its
-    scan takes several jobs, :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_SCAN_VERTICES` window
-    vertices each). Three arms per class: its launches as the shadow runs them; the same with one job thread and every
+    scan takes several jobs, its class's :data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_SCAN_RUN`
+    window vertices each). Three arms per class: its launches as the shadow runs them; the same with one job thread and every
     list reversed before its kernel takes it (the scan's jobs, the features, the creases, the live pairs, the pairs left
     to rule R, rule X's items and valleys), so that the candidate pool holds every pair's rows in another order; and
     every pair walked again by the full-finish kernel alone, in window order. The close holds a pair's candidates by
@@ -1721,19 +1723,20 @@ def test_job_lists_hold_each_run_together(test, device):
     """
     _hf, model, _shapes, _bodies = _window_scene(np.random.default_rng(37), device)
     pipeline, _contacts, _state = _collide(model, shadow=True)
-    scan = terrain_law_solid.TERRAIN_SOLID_SCAN_VERTICES
+    item_run = terrain_law_solid.TERRAIN_SOLID_SCAN_VERTICES
     checked = {}
     for partner_class in _SOLID_MODULES:
+        scan = int(TERRAIN_PARTNER_SCAN_RUN[partner_class])
         with test.subTest(partner_class=partner_class):
             _out, jobs, _solids = _run_class(pipeline, model, partner_class, until="xdescents")
             counts = _counts(jobs)
             lists = {
                 # a scan run: its pair's window vertices [k, k + 1) times the run length (six items per vertex)
-                "faces": lambda pair, item: (pair, item // 6 // scan),
-                "edges": lambda pair, item: (pair, item // 6 // scan),
-                "vertices": lambda pair, item: (pair, item // 6 // scan),
+                "faces": lambda pair, item, scan=scan: (pair, item // 6 // scan),
+                "edges": lambda pair, item, scan=scan: (pair, item // 6 // scan),
+                "vertices": lambda pair, item, scan=scan: (pair, item // 6 // scan),
                 # rule X's items: the core's points together, then each run of window vertices
-                "xitems": lambda pair, item: (pair, -1 if item < 0 else item // scan),
+                "xitems": lambda pair, item: (pair, -1 if item < 0 else item // item_run),
                 # an item's valleys: window vertex times three plus the edge
                 "xvalleys": lambda pair, item: (pair, item // 3),
             }

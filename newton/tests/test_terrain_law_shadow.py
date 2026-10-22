@@ -26,6 +26,7 @@ from newton._src.geometry.terrain_contacts import (
     TERRAIN_PARTNER_CYLINDER,
     TERRAIN_PARTNER_HULL,
     TERRAIN_PARTNER_POINT,
+    TERRAIN_PARTNER_SCAN_RUN,
     TERRAIN_PARTNER_WALK_SLOTS,
 )
 from newton._src.geometry.terrain_law import (
@@ -43,7 +44,6 @@ from newton._src.geometry.terrain_law_solid import (
     TERRAIN_SOLID_JOB_THREADS_CPU,
     TERRAIN_SOLID_LAUNCHES,
     TERRAIN_SOLID_LIST_OF_KERNEL,
-    TERRAIN_SOLID_SCAN_VERTICES,
     terrain_solid_exit_items,
     terrain_solid_job_capacities,
 )
@@ -802,12 +802,18 @@ class TestTerrainLawShadow(unittest.TestCase):
                     walk = int(TERRAIN_PARTNER_WALK_SLOTS[partner_class])
                     points, takes = terrain_solid_exit_items(scene, table.pairs_host[begin:end, 1])
                     capacities = terrain_solid_job_capacities(
-                        table.vertices[begin:end], points, takes, table.candidates[begin:end], walk
+                        table.vertices[begin:end],
+                        points,
+                        takes,
+                        table.candidates[begin:end],
+                        walk,
+                        scan_run=int(TERRAIN_PARTNER_SCAN_RUN[partner_class]),
                     )
                     names = (*TERRAIN_SOLID_JOB_LISTS, "candidates", "scans", "xdescents")
                     self.assertEqual(sorted(capacities), sorted(names))
                     # the scan's jobs: every pair's runs of window vertices at its largest window
-                    scans = int(np.sum(-(-table.vertices[begin:end].astype(np.int64) // TERRAIN_SOLID_SCAN_VERTICES)))
+                    run = int(TERRAIN_PARTNER_SCAN_RUN[partner_class])
+                    scans = int(np.sum(-(-table.vertices[begin:end].astype(np.int64) // run)))
                     self.assertEqual(capacities["scans"], scans)
                     longest = max(capacities[n] for n in (*TERRAIN_SOLID_JOB_LISTS, "scans"))
                     skipped = [k for k, n in TERRAIN_SOLID_LIST_OF_KERNEL.items() if capacities[n] == 0]

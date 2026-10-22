@@ -62,8 +62,9 @@ per listed feature, and a per-pair close that holds their rows in window order, 
 pairs' features at once instead of one pair's whole window, and no thread walks a large window alone:
 
 1. The whole-pair rejects, one thread per pair; a pair past them keeps its core and window frame
-   (:class:`TerrainSolidRecord`) for the scan and the jobs and is listed live, its window in runs of
-   :data:`TERRAIN_SOLID_SCAN_VERTICES` window vertices. The scan (:func:`solid_scan`), one thread per run: the run's
+   (:class:`TerrainSolidRecord`) for the scan and the jobs and is listed live, its window in runs of its class's
+   :data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_SCAN_RUN` window vertices. The scan
+   (:func:`solid_scan`), one thread per run: the run's
    features through their cheapest rejects in window order: rule F's faces (one per cluster plane and run: its
    manifold, support tests and emitting triangle are its cluster's alone, :func:`_face_support`), rule E's edges
    (:func:`_edge_cheap`) and rule V's vertices (:func:`_vertex_cheap`), each survivor listed for its job kernel.
@@ -278,9 +279,11 @@ TERRAIN_SOLID_LANE_ROWS = 8
 thread that holds it. A finish's cost grows with the cube of a plane group's rows per row; below this one thread is
 cheaper than a block's every lane staging the pair."""
 TERRAIN_SOLID_SCAN_VERTICES = 32
-"""Window vertices one scan job takes at most (a window's vertices in window order, in runs of this many): a large
-window is scanned by several threads, so that no thread scans a large window alone. A cluster plane met by two runs is
-listed twice; its rows, the same at the same place in window order, merge in the close."""
+"""Window vertices one scan job takes at most (the bits of a run's survivor masks; a class's run is
+:data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_SCAN_RUN`), and the window vertices of one run of rule
+X's item listing (one reservation each): a large window is scanned by several threads, so that no thread scans a large
+window alone. A cluster plane met by two runs is listed twice; its rows, the same at the same place in window order,
+merge in the close."""
 TERRAIN_SOLID_SORTED = 32
 """Keys of a pair's pool list sorted in registers per walk of the list: the close (:func:`_hold_candidates`) and the
 exit kernel (:func:`_exit_listed`) take a list of ``n`` candidates in key order in ``ceil(n / 32)`` walks, each keeping
@@ -469,8 +472,9 @@ class TerrainSolidJobs:
     live: wp.array[wp.int32]
     """The class pairs past the whole-pair rejects (class pair indices, in any order): the close's."""
     scans: wp.array[wp.vec2i]
-    """The scan's jobs: ``(class pair, run)``, run ``k`` the window vertices ``[k, k + 1)`` times
-    :data:`TERRAIN_SOLID_SCAN_VERTICES` of the pair's window (room for every pair's runs at its largest window)."""
+    """The scan's jobs: ``(class pair, run)``, run ``k`` the window vertices ``[k, k + 1)`` times the class's
+    :data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_SCAN_RUN` of the pair's window (room for every pair's
+    runs at its largest window)."""
     recover: wp.array[wp.int32]
     """The closed pairs without a row, left to rule R (class pair indices, in any order)."""
     lanes: wp.array[wp.int32]
@@ -2394,9 +2398,11 @@ def solid_scan(
     pair_index: int,
     i: int,
     run: int,
+    run_vertices: int,
 ):
     """Run ``run`` of a live pair's scan (class pair ``i``, its kept core and record; the window vertices ``[run, run +
-    1)`` times :data:`TERRAIN_SOLID_SCAN_VERTICES` in window order): its vertices' features in window order through the
+    1)`` times ``run_vertices``, its class's run of at most :data:`TERRAIN_SOLID_SCAN_VERTICES`, in window order): its
+    vertices' features in window order through the
     cheapest rejects of their rules, every survivor listed for its job kernel: rule F's faces (:func:`_face_top`; of a cluster of several triangles, the first that passes, its
     cluster's manifold and emitting triangle being its cluster's alone), rule E's edges (:func:`_edge_cheap`) and rule
     V's vertices (:func:`_vertex_cheap`). The run marks its survivors in one bit per vertex and item, then reserves
@@ -2411,8 +2417,8 @@ def solid_scan(
     c0 = cells[2]
     c1 = cells[3]
     width = c1 + 2 - c0
-    first = run * _SCAN_VERTICES
-    last = wp.min(first + _SCAN_VERTICES, (r1 + 2 - r0) * width)
+    first = run * run_vertices
+    last = wp.min(first + run_vertices, (r1 + 2 - r0) * width)
     seen = _Seen()
     for k in range(_SEEN):
         seen[k] = -1
@@ -3177,7 +3183,9 @@ TERRAIN_SOLID_LIST_OF_KERNEL = {
 list has no room is not launched."""
 
 
-def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, save_core, load_core, module: str) -> dict:
+def solid_kernels(
+    name: str, partner_class: int, walk_slots: int, scan_run: int, make_core, save_core, load_core, module: str
+) -> dict:
     """Build one solid class's kernels in module ``module`` (whose options, contraction off, they take), named
     ``terrain_<name>_rows`` (the scan) and ``terrain_<name>_rows_<kernel>`` for the others of
     :data:`TERRAIN_SOLID_LAUNCHES`.
@@ -3191,14 +3199,20 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         name: The class's name in kernel names.
         partner_class: The class (``TERRAIN_PARTNER_*``).
         walk_slots: Walk slots of a pair of the class.
+        scan_run: Window vertices of one scan job of the class
+            (:data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_SCAN_RUN`), at most
+            :data:`TERRAIN_SOLID_SCAN_VERTICES`.
         make_core: ``wp.func`` ``(local, size, kind, partner, solids) -> (supported, core)``: a pair's core in the
             heightfield frame.
         save_core: ``wp.func`` ``(jobs, i, core)``: keep class pair ``i``'s core (window frame) for its jobs.
         load_core: ``wp.func`` ``(jobs, i, solids) -> core``: class pair ``i``'s kept core.
         module: The module the kernels join.
     """
+    if not 0 < scan_run <= TERRAIN_SOLID_SCAN_VERTICES:
+        raise ValueError(f"A scan run takes 1 to {TERRAIN_SOLID_SCAN_VERTICES} window vertices, not {scan_run}")
     rows_ = wp.constant(walk_slots)
     class_ = wp.constant(partner_class)
+    scan_ = wp.constant(scan_run)
 
     def rows(
         begin: int,
@@ -3244,7 +3258,7 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
         # the live list holds every pair of the class at most
         jobs.live[wp.atomic_add(jobs.counts, _LIVE, 1)] = i
         vertices = (cells[1] - cells[0] + 2) * (cells[3] - cells[2] + 2)
-        runs = (vertices + _SCAN_VERTICES - 1) // _SCAN_VERTICES
+        runs = (vertices + scan_ - 1) // scan_
         first = wp.atomic_add(jobs.counts, _SCANS, runs)
         for k in range(runs):
             if first + k < jobs.scans.shape[0]:
@@ -3272,7 +3286,9 @@ def solid_kernels(name: str, partner_class: int, walk_slots: int, make_core, sav
             job = jobs.scans[entry]
             i = job[0]
             record, window = solid_job_window(data, jobs, i)
-            solid_scan(wp.static(load_core)(jobs, i, solids), data, window, record, out, jobs, begin + i, i, job[1])
+            solid_scan(
+                wp.static(load_core)(jobs, i, solids), data, window, record, out, jobs, begin + i, i, job[1], scan_
+            )
 
     def faces(
         begin: int,
@@ -3876,6 +3892,7 @@ def terrain_solid_job_capacities(
     candidates: np.ndarray,
     walk_slots: int,
     *,
+    scan_run: int,
     scale: float = 1.0,
 ) -> dict[str, int]:
     """Return a solid class's job list capacities by default, from its pairs' own bounds: per list
@@ -3901,6 +3918,9 @@ def terrain_solid_job_capacities(
         candidates: Per pair, the bound on its distinct candidates
             (:func:`~newton._src.geometry.terrain_contacts.terrain_pair_candidates`).
         walk_slots: Walk slots of a pair of the class.
+        scan_run: Window vertices of one scan job of the class
+            (:data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_SCAN_RUN`): the scan's runs are sized
+            exactly from the pairs' windows.
         scale: Factor on every capacity.
     """
     v = np.asarray(vertices, np.int64)
@@ -3934,7 +3954,7 @@ def terrain_solid_job_capacities(
     default = max(default, min(int(keys.sum()), TERRAIN_SOLID_JOB_FLOOR))
     capacities["xdescents"] = max(1, int(np.ceil(scale * default)))
     # the scan's runs: every pair's at its largest window, exact (a window past its bound takes the full finish)
-    capacities["scans"] = max(1, int(np.sum(-(-v // TERRAIN_SOLID_SCAN_VERTICES))))
+    capacities["scans"] = max(1, int(np.sum(-(-v // int(scan_run)))))
     return capacities
 
 
