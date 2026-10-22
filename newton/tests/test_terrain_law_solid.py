@@ -1773,6 +1773,63 @@ def _valley_large(device):
     return hf, model, shapes, bodies
 
 
+def _slope_resting(device):
+    """Solids resting 0.5 mm deep on a planar 15 deg slope (rising along x, 5 cm cells), each flat on it: a box, a
+    cylinder lying across the slope and an ellipsoid. Every window's uphill vertices rise above its core's lowest
+    point, so the old gate sent every pair to rule X; on one plane no exit lies deeper than the face rows."""
+    th = np.radians(15.0)
+    x = np.linspace(-1.0, 1.0, 41)
+    heights = np.tile(x * np.tan(th), (65, 1))
+    n = np.array([-np.sin(th), 0.0, np.cos(th)])
+    tilt = _axis_angle((0.0, 1.0, 0.0), -th)
+    across = _quat_mul(tilt, _axis_angle((1.0, 0.0, 0.0), -np.pi / 2.0))
+    sink = 0.0005
+
+    def on_slope(x0, y0, up):
+        return np.r_[x0, y0, x0 * np.tan(th)] + n * (up - sink)
+
+    bodies = [
+        ("box", {"half": (0.1, 0.05, 0.03)}, _f32_pose(np.r_[on_slope(-0.2, -0.8, 0.03), tilt])),
+        ("cylinder", {"radius": 0.03, "half_height": 0.15}, _f32_pose(np.r_[on_slope(0.1, 0.0, 0.03), across])),
+        ("ellipsoid", {"semi": (0.08, 0.04, 0.03)}, _f32_pose(np.r_[on_slope(0.3, 0.8, 0.03), tilt])),
+    ]
+    model, _hfield, shapes = su.solid_scene(heights, 1.0, 1.6, bodies, device=device)
+    return model, shapes, bodies
+
+
+def test_rule_x_skips_cores_no_exit_can_reach(test, device):
+    """Leave rule X a closed pair only when an exit of its core can lie deeper than its rows.
+
+    Solids resting 0.5 mm deep on a planar slope: their lowest points lie below their windows' uphill vertices (the
+    old gate's test, which sent every one to rule X), but over every triangle under them the slope's plane lies at most
+    their sink above them, so no exit can beat their face rows and none is left to rule X. Their rows are bit for bit
+    those of the full-finish kernel, which runs rule X over every candidate of the window.
+    """
+    model, shapes, bodies = _slope_resting(device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    shadow = pipeline._terrain_law_shadow
+    table = shadow.table
+    shape_class = {int(p[1]): int(c) for p, c in zip(table.pairs_host, table.partner_class, strict=True)}
+    rows = tu.shadow_rows(pipeline)
+    for shape, (kind, _dims, _pose) in zip(shapes, bodies, strict=True):
+        with test.subTest(kind=kind):
+            got = rows[shape]
+            test.assertGreater(len(got), 0)
+            # the deepest row is the sink (the slope's plane), within float32
+            test.assertAlmostEqual(min(g[2] for g in got), -0.0005, delta=2.0e-6)
+    for partner_class in sorted({shape_class[s] for s in shapes}):
+        with test.subTest(partner_class=partner_class):
+            begin, end = _class_pairs(table, partner_class)
+            pairs = np.arange(begin, end)
+            listed_out, listed, solids = _run_class(pipeline, model, partner_class)
+            # the old gate held: every core's lowest point lies below its window's highest vertex
+            records = listed.records.numpy()[: end - begin]
+            test.assertTrue(np.all(records["low"] < records["pair"]["top"]), msg=records["low"])
+            test.assertEqual(int(solids.exit_count.numpy()[partner_class]), 0)
+            full_out, _jobs, _solids = _run_class(pipeline, model, partner_class, full=True)
+            _assert_same_rows(test, listed_out, full_out, pairs, "the full walk")
+
+
 def test_rule_x_lists_give_the_full_passes(test, device):
     """Give a solid pair the same rule X row and rows, bit for bit, whether its exit kernel takes its listed candidates
     or the full-finish kernel walks it again and runs rule X over every candidate of its window.
@@ -2551,6 +2608,7 @@ for _name, _func in (
     ("test_job_pipeline_rows_are_the_walks", test_job_pipeline_rows_are_the_walks),
     ("test_job_lists_hold_each_run_together", test_job_lists_hold_each_run_together),
     ("test_rule_x_lists_give_the_full_passes", test_rule_x_lists_give_the_full_passes),
+    ("test_rule_x_skips_cores_no_exit_can_reach", test_rule_x_skips_cores_no_exit_can_reach),
     ("test_exit_work_stays_bounded", test_exit_work_stays_bounded),
     ("test_long_box_keeps_every_support", test_long_box_keeps_every_support),
     ("test_deferred_pairs_keep_their_rows_beyond_the_grid", test_deferred_pairs_keep_their_rows_beyond_the_grid),

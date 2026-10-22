@@ -394,6 +394,14 @@ def core_bounds(core: TerrainBoxCore) -> tuple[wp.vec3, wp.vec3]:
 
 
 @wp.func
+def core_column(core: TerrainBoxCore, lo: wp.vec2, hi: wp.vec2) -> tuple[bool, TerrainBoxCore]:
+    """A core holding every point of the core over the box ``lo`` to ``hi`` in x and y, and whether there may be
+    one: rule X's bound over a terrain triangle (:func:`~newton._src.geometry.terrain_law_solid._exit_reachable`).
+    A box is kept whole."""
+    return True, core
+
+
+@wp.func
 def core_sphere(core: TerrainBoxCore) -> tuple[wp.vec3, float]:
     """A sphere containing the core: centre and radius."""
     return core.c, wp.length(core.h)
@@ -709,6 +717,41 @@ def core_bounds(core: TerrainCylinderCore) -> tuple[wp.vec3, wp.vec3]:
         return wp.min(base - ext, apex), wp.max(base + ext, apex)
     ext = ext + core.h * wp.vec3(wp.abs(a[0]), wp.abs(a[1]), wp.abs(a[2]))
     return core.c - ext, core.c + ext
+
+
+@wp.func
+def core_column(core: TerrainCylinderCore, lo: wp.vec2, hi: wp.vec2) -> tuple[bool, TerrainCylinderCore]:
+    """A cylinder's part whose axis points lie within its rim's reach in x and y of the box: the same cylinder over
+    the axis interval left, widened by 1e-5 m against rounding (none: no point lies over the box). A point at axis
+    parameter ``t`` lies within ``r sqrt(1 - a_k^2)`` of its axis point along axis ``k``. A cone is kept whole."""
+    if core.cone != 0:
+        return True, core
+    a = core.a
+    t0 = -core.h
+    t1 = core.h
+    for k in range(2):
+        ext = core.r * wp.sqrt(wp.max(0.0, 1.0 - a[k] * a[k]))
+        low = lo[k] - ext
+        high = hi[k] + ext
+        if wp.abs(a[k]) < 1.0e-12:
+            if core.c[k] < low or core.c[k] > high:
+                return False, core
+        else:
+            s0 = (low - core.c[k]) / a[k]
+            s1 = (high - core.c[k]) / a[k]
+            t0 = wp.max(t0, wp.min(s0, s1))
+            t1 = wp.min(t1, wp.max(s0, s1))
+    t0 = wp.max(t0 - 1.0e-5, -core.h)
+    t1 = wp.min(t1 + 1.0e-5, core.h)
+    if t0 > t1:
+        return False, core
+    part = TerrainCylinderCore()
+    part.c = core.c + (0.5 * (t0 + t1)) * a
+    part.a = a
+    part.r = core.r
+    part.h = 0.5 * (t1 - t0)
+    part.cone = 0
+    return True, part
 
 
 @wp.func
@@ -1255,6 +1298,12 @@ def core_bounds(core: TerrainHullCore) -> tuple[wp.vec3, wp.vec3]:
         lo = wp.min(lo, p)
         hi = wp.max(hi, p)
     return lo, hi
+
+
+@wp.func
+def core_column(core: TerrainHullCore, lo: wp.vec2, hi: wp.vec2) -> tuple[bool, TerrainHullCore]:
+    """A hull or an ellipsoid is kept whole."""
+    return True, core
 
 
 @wp.func
