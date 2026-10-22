@@ -58,11 +58,12 @@ jobs and the solid classes' :class:`~newton._src.geometry.terrain_law_solid.Terr
    then rule R's kernel over the pairs without a row; a pair's held rows are written as they are when the finish keeps
    them so (fewer than its class's lane rows, no plane group of three), else held for a finish kernel; a core reaching
    below its window's highest vertex lists rule X's items.
-5. Rule X's items (a core point, or a window vertex that can give a candidate), valleys and the listed candidates'
-   near-bound descents, the job threads again: they list the candidates whose bounds pass the pair's target; then a
-   lean kernel finishes the pairs without a listed candidate and the exit kernel, one thread per pair of the class
-   (its exit list's room), runs rule X's passes over the listed candidates of the others (exact: any other candidate
-   is a no-op in both passes).
+5. Rule X's gate (per listed window vertex under the core's footprint: whether an exit over its cell can pass the
+   pair's target), then the items of the pairs it opened (a core point, or a window vertex that can give a
+   candidate), valleys and the listed candidates' near-bound descents, the job threads again: they list the candidates
+   whose bounds pass the pair's target; then a lean kernel finishes the pairs without a listed candidate and the exit
+   kernel, one thread per pair of the class (its exit list's room), runs rule X's passes over the listed candidates of
+   the others (exact: any other candidate is a no-op in both passes).
 6. The finish kernels: one thread per pair over the pairs holding few rows with a plane group of three (the
    small-pair finish), and a block of lanes per pair over those holding many, the lanes splitting its implied-row
    tests.
@@ -151,6 +152,7 @@ def _solid_launches(name: str) -> tuple[tuple[str, str], ...]:
         "vertices",
         "close",
         "recovery",
+        "xbound",
         "xitems",
         "xvalleys",
         "xdescents",
