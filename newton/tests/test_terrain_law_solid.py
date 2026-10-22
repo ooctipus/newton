@@ -1510,6 +1510,7 @@ _LIST_OF_KERNEL = {
     "recovery": "recover",
     "xitems": "xitems",
     "xvalleys": "xvalleys",
+    "small": "small",
 }
 """The list each job kernel that first takes a list strides over
 (:class:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs`; the creases kernel takes the thetas kernel's list
@@ -2043,30 +2044,38 @@ def test_large_plane_group_follows_the_law(test, device):
 
 
 def test_plane_group_of_many_rows_takes_the_lanes(test, device):
-    """Finish a pair holding many rows with a block's lanes and one holding few in place, both with the float64 law's
-    rows.
+    """Finish a pair holding many rows with a block's lanes, one holding few in a plane group of three with one thread of
+    the small-pair finish kernel and one holding few others in place, all with the float64 law's rows.
 
     A flat box 2 mm above the pillar lattice of :func:`test_large_plane_group_follows_the_law`: 6 cm across it holds 15
     candidates in one plane group (:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LANE_ROWS` or more),
-    which its close lists for the finish kernel and whose implied-row step drops 6; 3 cm across it holds 4, finished by
-    the close itself.
+    which its close lists for the finish kernel and whose implied-row step drops 6; 3 cm across it holds 4 on four
+    planes, which its close writes as they are; 2 cm across over one pillar's top it holds its 4 corners on that plane,
+    which its close lists for the small-pair finish kernel.
     """
     n = 61
     r = np.arange(n)
     heights = np.where((r[:, None] % 3 != 0) & (r[None, :] % 3 != 0), 0.05, 0.0)
     hf = tu.reference_surface(tu.heightfield_model(heights, 1.5, 1.5, device="cpu"))
-    for half, lanes in ((0.06, 1), (0.03, 0)):
+    # (half size, centre, pairs for the lanes, pairs for the small-pair finish); a pillar's top spans 5 cm about 0.075
+    for half, centre, lanes, small in (
+        (0.06, (0.013, 0.007), 1, 0),
+        (0.03, (0.013, 0.007), 0, 0),
+        (0.01, (0.073, 0.077), 0, 1),
+    ):
         with test.subTest(half=half):
             dims = {"half": (half, half, 0.02)}
-            pose = _f32_pose(np.r_[0.013, 0.007, 0.05 + 0.02 + 0.002, 0.0, 0.0, 0.0, 1.0])
+            pose = _f32_pose(np.r_[centre[0], centre[1], 0.05 + 0.02 + 0.002, 0.0, 0.0, 0.0, 1.0])
             model, _hfield, shapes = su.solid_scene(heights, 1.5, 1.5, [("box", dims, pose)], device=device)
             pipeline, _contacts, _state = _collide(model, shadow=True)
             counts = pipeline._terrain_law_shadow.job_counts()["box"]
-            test.assertEqual(counts["lanes"], lanes)
+            test.assertEqual((counts["lanes"], counts["small"]), (lanes, small))
             rows = tu.shadow_rows(pipeline)[shapes[0]]
             if lanes:
                 # the lanes' implied-row step dropped some of its candidates
                 test.assertLess(len(rows), counts["candidates"])
+            if small:
+                test.assertEqual(len(rows), 4)
             missing, extra, deepest = su.compare_solid_rows(su.law_rows(hf, "box", dims, pose), rows)
             test.assertEqual((missing, extra), ([], []))
             test.assertLess(deepest, 1.0e-5)

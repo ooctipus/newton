@@ -180,6 +180,7 @@ from .terrain_law import (
     terrain_locate,
     terrain_pair_exit,
     terrain_plane,
+    terrain_plane_group_of_three,
     terrain_planes,
     terrain_point_below_cached,
     terrain_report,
@@ -290,6 +291,9 @@ TERRAIN_SOLID_SCAN_VERTICES = 32
 X's item listing (one reservation each): a large window is scanned by several threads, so that no thread scans a large
 window alone. A cluster plane met by two runs is listed twice; its rows, the same at the same place in window order,
 merge in the close."""
+TERRAIN_SOLID_FEW = 4
+"""Candidates of a pair the close sorts in registers (:func:`_hold_few`); a longer list is sorted in chunks of
+:data:`TERRAIN_SOLID_SORTED` on the stack."""
 TERRAIN_SOLID_SORTED = 32
 """Keys of a pair's pool list sorted in registers per walk of the list: the close (:func:`_hold_candidates`) and the
 exit kernel (:func:`_exit_listed`) take a list of ``n`` candidates in key order in ``ceil(n / 32)`` walks, each keeping
@@ -326,6 +330,8 @@ _EXIT_SLOTS = wp.constant(TERRAIN_SOLID_EXIT_SLOTS)
 _CELL_WIDEN = wp.constant(TERRAIN_CELL_WIDEN)
 _SEEN = wp.constant(TERRAIN_SOLID_SEEN)
 _SORTED = wp.constant(TERRAIN_SOLID_SORTED)
+_FEW = wp.constant(TERRAIN_SOLID_FEW)
+_NO_KEY = wp.constant(2147483647)
 _SCAN_VERTICES = wp.constant(TERRAIN_SOLID_SCAN_VERTICES)
 _RECOVERY_CLEAR = wp.constant(TERRAIN_SOLID_RECOVERY_CLEAR)
 _LANE_ROWS = wp.constant(TERRAIN_SOLID_LANE_ROWS)
@@ -343,6 +349,7 @@ _SCANS = wp.constant(9)
 _XDESCENTS = wp.constant(10)
 _WALKS = wp.constant(11)
 _LANES = wp.constant(12)
+_SMALL = wp.constant(13)
 _NO_POINT = wp.constant(1 << 30)
 
 _Mat43 = wp.types.matrix(shape=(4, 3), dtype=wp.float32)
@@ -350,10 +357,11 @@ _ArcValues = wp.types.vector(length=TERRAIN_SOLID_ARC_SAMPLES, dtype=wp.float32)
 _Seen = wp.types.vector(length=TERRAIN_SOLID_SEEN, dtype=wp.int32)
 _Sorted = wp.types.vector(length=TERRAIN_SOLID_SORTED, dtype=wp.int32)
 
-TERRAIN_SOLID_COUNTERS = len(TERRAIN_SOLID_JOB_LISTS) + 7
+TERRAIN_SOLID_COUNTERS = len(TERRAIN_SOLID_JOB_LISTS) + 8
 """Counters of a solid class's jobs: one per job list, then the candidate pool's, the live pairs', the pairs left to
 rule R, the scan jobs', the listed rule X candidates' descents, the deferred pairs the full-finish kernel walked
-again and the pairs given to the finish kernel's lanes (zeroed before every launch)."""
+again, the pairs given to the finish kernel's lanes and those given to the small-pair finish kernel (zeroed before
+every launch)."""
 
 
 @wp.struct
@@ -486,6 +494,9 @@ class TerrainSolidJobs:
     lanes: wp.array[wp.int32]
     """The closed pairs whose finish takes a block of lanes (:data:`TERRAIN_SOLID_LANE_ROWS` held rows or more; class
     pair indices, in any order)."""
+    small: wp.array[wp.int32]
+    """The closed pairs holding fewer than :data:`TERRAIN_SOLID_LANE_ROWS` rows with a plane group of three, whose finish
+    takes the small-pair finish kernel, one thread per pair (class pair indices, in any order)."""
     counts: wp.array[wp.int32]
     """Entries asked for per job list (:data:`TERRAIN_SOLID_JOB_LISTS`), then the candidates asked for, the live pairs,
     the pairs left to rule R, the scan jobs, the descents and the deferred pairs walked again
@@ -2765,14 +2776,92 @@ def _hold_candidate(
 
 
 @wp.func
+def _hold_few(
+    out: TerrainLawRows, jobs: TerrainSolidJobs, i: int, slot: int, limit: int, eps: float
+) -> tuple[bool, int, int]:
+    """:func:`_hold_candidates` of a list of at most :data:`TERRAIN_SOLID_FEW` candidates, its keys sorted in named
+    registers (no array on the stack, nothing to zero): ``(few, held, raw)``, ``few`` ``False`` (nothing read past the
+    list's fifth entry, nothing held) for a longer list. The same rows: one walk of the list, a stable insertion by
+    key (equal keys after the first in list order, as :func:`_hold_sorted` inserts them), then the first entry of
+    every distinct key held in key order."""
+    k0 = int(_NO_KEY)
+    k1 = int(_NO_KEY)
+    k2 = int(_NO_KEY)
+    k3 = int(_NO_KEY)
+    e0 = int(-1)
+    e1 = int(-1)
+    e2 = int(-1)
+    e3 = int(-1)
+    count = int(0)
+    entry = jobs.head[i]
+    while entry >= 0:
+        if count == _FEW:
+            return False, 0, 0
+        key = jobs.key[entry]
+        if key < k0:
+            k3 = k2
+            e3 = e2
+            k2 = k1
+            e2 = e1
+            k1 = k0
+            e1 = e0
+            k0 = key
+            e0 = entry
+        elif key < k1:
+            k3 = k2
+            e3 = e2
+            k2 = k1
+            e2 = e1
+            k1 = key
+            e1 = entry
+        elif key < k2:
+            k3 = k2
+            e3 = e2
+            k2 = key
+            e2 = entry
+        else:
+            k3 = key
+            e3 = entry
+        count += 1
+        entry = jobs.next[entry]
+    held = int(0)
+    raw = int(0)
+    if count > 0:
+        raw = 1
+        held = _hold_candidate(out, jobs, e0, slot, held, eps, limit)
+    if count > 1 and k1 != k0:
+        raw += 1
+        held = _hold_candidate(out, jobs, e1, slot, held, eps, limit)
+    if count > 2 and k2 != k1:
+        raw += 1
+        held = _hold_candidate(out, jobs, e2, slot, held, eps, limit)
+    if count > 3 and k3 != k2:
+        raw += 1
+        held = _hold_candidate(out, jobs, e3, slot, held, eps, limit)
+    return True, held, raw
+
+
+@wp.func
 def _hold_candidates(
     out: TerrainLawRows, jobs: TerrainSolidJobs, i: int, slot: int, limit: int, eps: float
 ) -> tuple[int, int]:
     """Hold class pair ``i``'s candidates in its walk slots from ``slot`` in window order (by key), as the walk offers
     them (:func:`~newton._src.geometry.terrain_law.terrain_hold_row`, at most ``limit``): ``(held, raw)``, its
     distinct rows and its offers. Candidates of one key (a cluster listed twice) are one offer; the list's order (its
-    jobs') never matters. The list is taken in chunks of :data:`TERRAIN_SOLID_SORTED` keys sorted in registers, one walk
-    of it per chunk (:data:`TERRAIN_SOLID_SORTED`): one walk on the recorded states."""
+    jobs') never matters. A list of at most :data:`TERRAIN_SOLID_FEW` candidates (most pairs' on the recorded states)
+    is sorted in registers (:func:`_hold_few`), a longer one in chunks on the stack (:func:`_hold_sorted`)."""
+    few, held, raw = _hold_few(out, jobs, i, slot, limit, eps)
+    if few:
+        return held, raw
+    return _hold_sorted(out, jobs, i, slot, limit, eps)
+
+
+@wp.func
+def _hold_sorted(
+    out: TerrainLawRows, jobs: TerrainSolidJobs, i: int, slot: int, limit: int, eps: float
+) -> tuple[int, int]:
+    """:func:`_hold_candidates` of any list: taken in chunks of :data:`TERRAIN_SOLID_SORTED` keys sorted in a stack
+    array, one walk of it per chunk (:data:`TERRAIN_SOLID_SORTED`): one walk on the recorded states."""
     keys = _Sorted()
     entries = _Sorted()
     held = int(0)
@@ -2947,6 +3036,27 @@ def _solid_settle(
 
 
 @wp.func
+def _store_held(
+    window: TerrainWindow,
+    cells: wp.vec4i,
+    slot: int,
+    held: int,
+    out: TerrainLawRows,
+    pair_index: int,
+    frame: wp.transform,
+):
+    """The finish of ``held`` distinct rows in a pair's walk slots from ``slot`` that hold no plane group of three:
+    it keeps every one in order (no group can lose a row to its implied-row or per-group steps), so that they are
+    written in the world frame in place, as :func:`solid_finish` writes them."""
+    for h in range(held):
+        s = slot + h
+        terrain_store_row(out, s, out.q[s], out.n[s], out.d[s], out.feature[s], window, frame)
+    out.first[pair_index] = slot
+    out.count[pair_index] = held
+    out.state[pair_index] = _wide(cells)
+
+
+@wp.func
 def _finish_or_lanes(
     window: TerrainWindow,
     record: TerrainSolidRecord,
@@ -2960,19 +3070,28 @@ def _finish_or_lanes(
     partner_class: int,
     frame: wp.transform,
 ):
-    """Finish a pair holding ``held`` rows in its walk slots from ``slot``: here, by this thread
-    (:func:`solid_finish`), when it holds fewer than :data:`TERRAIN_SOLID_LANE_ROWS`; else in the finish kernel by a
-    block's lanes (state :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_HELD`, the class's lane list)."""
-    if held < _LANE_ROWS or held > capacity:
-        solid_finish(
-            window, record.pair, slot, held, capacity, out, pair_index, partner_class, frame, record.cells, 0, 1
-        )
+    """Finish a pair holding ``held`` rows in its walk slots from ``slot``: here, by this thread, when it holds fewer
+    than :data:`TERRAIN_SOLID_LANE_ROWS` and no plane group of three
+    (:func:`~newton._src.geometry.terrain_law.terrain_plane_group_of_three`), which the finish keeps as they are: they
+    are written in the world frame in place (:func:`_store_held`); any other pair in the finish kernel by a block's
+    lanes (state :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_HELD`, the class's lane list), so that no
+    one-thread kernel holds the general finish's code and state."""
+    if held > capacity:
+        terrain_defer_pair(out, partner_class, pair_index, _wide(record.cells))
         return
+    small = held < _LANE_ROWS
+    if small:
+        if not terrain_plane_group_of_three(out, slot, held, record.pair.eps):
+            _store_held(window, record.cells, slot, held, out, pair_index, frame)
+            return
     out.first[pair_index] = slot
     out.count[pair_index] = held
     out.state[pair_index] = _wide(record.cells) | TERRAIN_PAIR_HELD
-    # the lane list holds every pair of the class at most
-    jobs.lanes[wp.atomic_add(jobs.counts, _LANES, 1)] = i
+    # the small and lane lists hold every pair of the class at most
+    if small:
+        jobs.small[wp.atomic_add(jobs.counts, _SMALL, 1)] = i
+    else:
+        jobs.lanes[wp.atomic_add(jobs.counts, _LANES, 1)] = i
 
 
 @wp.func
@@ -3258,6 +3377,7 @@ TERRAIN_SOLID_LAUNCHES = (
     ("jobs", "xvalleys"),
     ("jobs", "xdescents"),
     ("pair_jobs", "exit"),
+    ("pair_jobs", "small"),
     ("pair_tiles", "finish"),
     ("full", "pooled"),
     ("full", "full"),
@@ -3644,6 +3764,39 @@ def solid_kernels(
                 inputs.shape_transform[inputs.pairs[pair][0]],
             )
 
+    def small(
+        begin: int,
+        slot_begin: int,
+        inputs: TerrainPairInputs,
+        data: TerrainFeatureData,
+        out: TerrainLawRows,
+        jobs: TerrainSolidJobs,
+        solids: TerrainSolidData,
+    ):
+        """The finish of the class's pairs holding fewer than :data:`TERRAIN_SOLID_LANE_ROWS` rows with a plane group of
+        three (its small list, from its close, rule R and rule X's exit kernel), one pair per thread at a time, so that
+        a warp runs the general finish on as many pairs as it has lanes and no other kernel holds its code and stack
+        (:func:`solid_finish_pair` with one lane)."""
+        t = wp.tid()
+        if t >= jobs.pair_threads:
+            return
+        for entry in range(t, jobs.counts[_SMALL], jobs.pair_threads):
+            i = jobs.small[entry]
+            pair = begin + i
+            solid_finish_pair(
+                data,
+                out,
+                jobs,
+                pair,
+                i,
+                slot_begin + i * rows_,
+                rows_,
+                class_,
+                inputs.shape_transform[inputs.pairs[pair][0]],
+                0,
+                1,
+            )
+
     def finish(
         begin: int,
         slot_begin: int,
@@ -3787,6 +3940,7 @@ def solid_kernels(
         ("xvalleys", xvalleys),
         ("xdescents", xdescents),
         ("exit", exit_),
+        ("small", small),
         ("finish", finish),
         ("pooled", pooled),
         ("full", full),
@@ -4118,6 +4272,7 @@ def terrain_solid_jobs(
     jobs.scans = wp.zeros(max(int(capacities["scans"]), 1), dtype=wp.vec2i, device=device)
     jobs.recover = wp.zeros(room, dtype=wp.int32, device=device)
     jobs.lanes = wp.zeros(room, dtype=wp.int32, device=device)
+    jobs.small = wp.zeros(room, dtype=wp.int32, device=device)
     jobs.counts = counts if counts is not None else wp.zeros(TERRAIN_SOLID_COUNTERS, dtype=wp.int32, device=device)
     longest = max(int(capacities[name]) for name in (*TERRAIN_SOLID_JOB_LISTS, "scans"))
     cuda = wp.get_device(device).is_cuda
@@ -4161,6 +4316,7 @@ def terrain_solid_jobs_bytes(jobs: TerrainSolidJobs) -> int:
         jobs.scans,
         jobs.recover,
         jobs.lanes,
+        jobs.small,
         jobs.q,
         jobs.n,
         jobs.d,

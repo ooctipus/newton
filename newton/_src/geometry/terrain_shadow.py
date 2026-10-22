@@ -152,11 +152,12 @@ def _solid_launches(name: str) -> tuple[tuple[str, str], ...]:
         "xvalleys",
         "xdescents",
         "exit",
+        "small",
         "finish",
         "pooled",
         "full",
     )
-    pair_jobs = ("close", "exit")
+    pair_jobs = ("close", "exit", "small")
     kinds = tuple(
         "pairs"
         if kernel == "rows"
@@ -298,7 +299,7 @@ TERRAIN_LAW_SPILL_SHARE = 256
 pair's bound (:meth:`TerrainLawShadow.default_spill_rows`): the worst case of one pair in 256 at once. On the recorded
 suite scenes (16,384 worlds) that is 11 to 25% of the walk slots, while at most one pair spilled (30 rows)."""
 
-TERRAIN_LAW_JOB_COUNTERS = 13
+TERRAIN_LAW_JOB_COUNTERS = 14
 """Counters of a solid class's jobs: its six job lists, its candidate pool, its live pairs, its pairs left to rule R,
 its scan's runs, its listed rule X candidates' descents, its deferred pairs walked again and its pairs finished by a
 block's lanes (:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_COUNTERS`)."""
@@ -317,6 +318,7 @@ TERRAIN_LAW_JOB_NAMES = (
     "xdescents",
     "walks",
     "lanes",
+    "small",
 )
 """Names of a solid class's job counters, in order (:meth:`TerrainLawShadow.job_counts`)."""
 
