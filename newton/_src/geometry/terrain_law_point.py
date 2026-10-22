@@ -65,9 +65,9 @@ the finish on all of them (its scratch holds every candidate a window of the cla
 keeps: in the pair's walk slots when they fit, else in rows of the spill region.
 
 Inlined into the walks, the finish took every thread to 255 registers and a 10 KB stack on sm_120. Apart, the one-thread
-kernel takes 128 registers (its launch bounds: 16 blocks of 32 threads per SM) and a 184-byte stack (a sphere's walk
-alone would need 140 registers), the tiled kernel 226 registers and a 32-byte stack, and only deferred pairs pay for the
-finish. The full-finish kernel keeps the candidates and the finish's state in global scratch
+kernel takes 168 registers (its launch bounds: 12 blocks of 32 threads per SM) and a 40-byte stack (at 16 blocks its 128
+registers spilled a 184-byte stack, 10% slower on the law's own operating states), the tiled kernel 226 registers and a
+32-byte stack, and only deferred pairs pay for the finish. The full-finish kernel keeps the candidates and the finish's state in global scratch
 (:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`,
 :func:`~newton._src.geometry.terrain_law.terrain_finish_list`), so that its stack, which sets the driver's local-memory
 reservation for every thread the device holds, holds no candidate: 232 registers and a 32-byte stack (5,960 bytes, 1,342
@@ -1194,7 +1194,7 @@ def _walk_segment(
     return planes, held
 
 
-@wp.kernel(enable_backward=False, launch_bounds=(TERRAIN_LAW_BLOCK, 16))
+@wp.kernel(enable_backward=False, launch_bounds=(TERRAIN_LAW_BLOCK, 12))
 def terrain_point_rows(
     begin: int,
     slot_begin: int,
