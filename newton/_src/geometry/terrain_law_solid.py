@@ -157,7 +157,6 @@ from .terrain_law import (
     TerrainLawRows,
     TerrainPairInputs,
     TerrainPlanes,
-    TerrainSurfaceInfo,
     TerrainWindow,
     terrain_box_cells,
     terrain_cluster,
@@ -199,7 +198,6 @@ from .terrain_law_cores import (
     TerrainHullTable,
     closest_on_triangle,
     core_bounds,
-    core_column,
     core_exit_count,
     core_exit_point,
     core_far_count,
@@ -2813,112 +2811,6 @@ def _xjobs_open(
 
 
 @wp.func
-def _exit_reachable(
-    core: Any,
-    data: TerrainFeatureData,
-    window: TerrainWindow,
-    record: TerrainSolidRecord,
-    sink: _Sink,
-    out: TerrainLawRows,
-) -> bool:
-    """Whether rule X can offer a closed pair a row: whether an exit of its core can lie deeper than every row it holds
-    by more than :data:`TERRAIN_SOLID_EXIT_MARGIN` (:func:`solid_exits`' target). False only where none can, so that
-    rule X would be a no-op.
-
-    Every rule X candidate is a point of the core whose exit is its closest surface point; a candidate over no cell of
-    the heightfield has none. A candidate over a triangle of the cells under the core's footprint lies below the
-    triangle's plane (its cluster's, the law's surface there) by no more than the core's part over it
-    (:func:`~newton._src.geometry.terrain_law_cores.core_column`) does, ``delta`` along the plane's normal, and below
-    the triangle's highest vertex by no more than that part's lowest point. Its exit is no deeper than the surface
-    point straight above it: ``delta`` over the normal's ``z``, or that rise. Where the 3 x 3 cells around the
-    triangle are all of its cluster, the plane's point along the normal is a surface point too (its offset of ``delta``
-    times the normal's slope stays within a cell), so the exit is no deeper than ``delta`` itself. A triangle the
-    part's projection misses (one of its edges separates them in x and y) holds no candidate. Both bounds are widened
-    by the pair's band and the cluster tolerance (over the normal's ``z`` for the vertical one); the first triangle
-    whose bound passes the target decides."""
-    deepest = float(0.0)
-    for h in range(wp.min(sink.held, sink.capacity)):
-        deepest = wp.max(deepest, -out.d[sink.slot + h])
-    target = deepest + _EXIT_MARGIN
-    pair = record.pair
-    surface = window.surface
-    guard = 2.0 * _FLAT + 4.0 * pair.eps
-    lo, hi = core_bounds(core)
-    c0 = wp.max(window.c0 + int(wp.floor(lo[0] / surface.dx - _CELL_WIDEN)), 0)
-    c1 = wp.min(window.c0 + int(wp.floor(hi[0] / surface.dx + _CELL_WIDEN)), surface.ncol - 2)
-    r0 = wp.max(window.r0 + int(wp.floor(lo[1] / surface.dy - _CELL_WIDEN)), 0)
-    r1 = wp.min(window.r0 + int(wp.floor(hi[1] / surface.dy + _CELL_WIDEN)), surface.nrow - 2)
-    up = wp.vec3(0.0, 0.0, 1.0)
-    planes = terrain_planes()
-    for r in range(r0, r1 + 1):
-        for c in range(c0, c1 + 1):
-            for sub in range(2):
-                ia, ib, ic = terrain_triangle_vertices(r, c, sub)
-                va = terrain_window_vertex(data, window, ia[0], ia[1])
-                vb = terrain_window_vertex(data, window, ib[0], ib[1])
-                vc = terrain_window_vertex(data, window, ic[0], ic[1])
-                over, part = core_column(
-                    core,
-                    wp.vec2(wp.min(wp.min(va[0], vb[0]), vc[0]), wp.min(wp.min(va[1], vb[1]), vc[1])),
-                    wp.vec2(wp.max(wp.max(va[0], vb[0]), vc[0]), wp.max(wp.max(va[1], vb[1]), vc[1])),
-                )
-                if not over or _xy_apart(part, va, vb, vc):
-                    continue
-                planes, n, a = terrain_plane(data, window, planes, r, c, sub)
-                if n[2] <= 0.0:
-                    return True
-                delta = -core_sigma(part, n, a)
-                rise = wp.max(wp.max(va[2], vb[2]), vc[2]) - core_sigma(part, up, wp.vec3(0.0))
-                if wp.min(delta / n[2], rise) + guard / n[2] <= target:
-                    continue
-                slope = wp.sqrt(wp.max(1.0 - n[2] * n[2], 0.0))
-                if delta + guard > target or delta * slope > wp.min(surface.dx, surface.dy):
-                    return True
-                if not _cluster_around(data, surface, r, c, sub):
-                    return True
-    return False
-
-
-@wp.func
-def _cluster_around(data: TerrainFeatureData, surface: TerrainSurfaceInfo, r: int, c: int, sub: int) -> bool:
-    """Whether every triangle of the 3 x 3 cells around cell ``(r, c)`` lies in the cluster of its triangle ``sub``
-    (cells off the heightfield: no)."""
-    cluster = terrain_cluster(data, surface, r, c, sub)
-    if cluster < 0 or r < 1 or c < 1 or r > surface.nrow - 3 or c > surface.ncol - 3:
-        return False
-    for rr in range(r - 1, r + 2):
-        for cc in range(c - 1, c + 2):
-            for s2 in range(2):
-                if terrain_cluster(data, surface, rr, cc, s2) != cluster:
-                    return False
-    return True
-
-
-@wp.func
-def _xy_apart(core: Any, va: wp.vec3, vb: wp.vec3, vc: wp.vec3) -> bool:
-    """Whether an edge of the triangle ``va vb vc`` separates the core from it in x and y (the core wholly beyond the
-    edge's line, away from the third vertex)."""
-    for e in range(3):
-        p = va
-        q = vb
-        o = vc
-        if e == 1:
-            p = vb
-            q = vc
-            o = va
-        elif e == 2:
-            p = vc
-            q = va
-            o = vb
-        m = wp.vec3(q[1] - p[1], p[0] - q[0], 0.0)
-        if m[0] * (o[0] - p[0]) + m[1] * (o[1] - p[1]) > 0.0:
-            m = -m
-        if core_sigma(core, wp.normalize(m), p) > 0.0:
-            return True
-    return False
-
-
-@wp.func
 def _solid_settle(
     core: Any,
     data: TerrainFeatureData,
@@ -2935,12 +2827,11 @@ def _solid_settle(
 ):
     """A closed pair with its rows held (rule R's included): left to rule X (count in ``out.count``, state
     :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_EXIT`, its items listed, :func:`_xjobs_open`) when its core
-    reaches below its window's highest vertex and an exit can lie deeper than its rows (:func:`_exit_reachable`), else
-    finished (:func:`_finish_or_lanes`), as a pair rule X gives nothing is."""
+    reaches below its window's highest vertex, else finished (:func:`_finish_or_lanes`)."""
     cells = record.cells
     pair = record.pair
     # Rule X can give a row only to a core whose lowest point lies below its window's highest vertex.
-    if record.low < pair.top and _exit_reachable(core, data, window, record, sink, out):
+    if record.low < pair.top:
         out.first[pair_index] = sink.slot
         out.count[pair_index] = sink.held
         out.state[pair_index] = _wide(cells) | TERRAIN_PAIR_EXIT
