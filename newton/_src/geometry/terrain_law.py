@@ -265,6 +265,11 @@ class TerrainSurfaceInfo:
     """Cell size along x [m] (float32 ``2 hx / (ncol - 1)``, as the narrow phase computes it)."""
     dy: float
     """Cell size along y [m]."""
+    dx64: wp.float64
+    """Cell size along x [m] in float64: ``2 hx / (ncol - 1)`` from the float32 ``hx`` (the window origin's and the
+    cluster planes' grid step, computed once on the host, bit for bit the device's float64 division)."""
+    dy64: wp.float64
+    """Cell size along y [m] in float64: ``2 hy / (nrow - 1)`` from the float32 ``hy``."""
     triangle_offset: int
     """First cluster id of the heightfield."""
     plane_offset: int
@@ -701,8 +706,8 @@ def terrain_window(data: TerrainFeatureData, heightfield: int, r0: int, c0: int)
     hx = wp.float64(surface.hx)
     hy = wp.float64(surface.hy)
     window.origin = wp.vec3d(
-        -hx + wp.float64(c0) * (wp.float64(2.0) * hx / wp.float64(surface.ncol - 1)),
-        -hy + wp.float64(r0) * (wp.float64(2.0) * hy / wp.float64(surface.nrow - 1)),
+        -hx + wp.float64(c0) * surface.dx64,
+        -hy + wp.float64(r0) * surface.dy64,
         wp.float64(window.z_ref),
     )
     window.eps = 0.0
@@ -784,8 +789,8 @@ def terrain_cluster_plane(
         ca = plane.anchor - ra * surface.ncol
         n = wp.normalize(wp.vec3(-plane.gx, -plane.gy, 1.0))
         # z(anchor) + offset + g . (reference - anchor) - z_ref; a gradient times a grid step count is exact.
-        dx = wp.float64(2.0) * wp.float64(surface.hx) / wp.float64(surface.ncol - 1)
-        dy = wp.float64(2.0) * wp.float64(surface.hy) / wp.float64(surface.nrow - 1)
+        dx = surface.dx64
+        dy = surface.dy64
         z = (
             (wp.float64(terrain_height(data, surface, ra, ca)) - wp.float64(window.z_ref))
             + wp.float64(plane.offset)

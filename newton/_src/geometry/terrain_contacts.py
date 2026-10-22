@@ -875,6 +875,9 @@ class TerrainFeatures:
             info.min_z, info.max_z = grid.min_z, grid.max_z
             info.dx = float(np.float32(np.float32(2.0) * np.float32(hx) / np.float32(ncol - 1)))
             info.dy = float(np.float32(np.float32(2.0) * np.float32(hy) / np.float32(nrow - 1)))
+            # the device's float64 steps of the float32 half extents, bit for bit (IEEE float64 on both)
+            info.dx64 = float(np.float64(2.0) * np.float64(np.float32(hx)) / np.float64(ncol - 1))
+            info.dy64 = float(np.float64(2.0) * np.float64(np.float32(hy)) / np.float64(nrow - 1))
             info.triangle_offset = triangle_offset
             info.plane_offset = 0
             info.tile_offset = tile_offset
