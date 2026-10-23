@@ -81,9 +81,7 @@ from .friction_patches import (
 from .grouped_dynamics import (
     GroupedTopology,
     get_grouped_hinv_jt_kernel,
-    get_grouped_mass_kernel,
     grouped_tau,
-    grouped_tau_mass,
     template_fk_kinematics,
 )
 from .kernels import (
@@ -312,8 +310,6 @@ _FPGS_CAPTURE_PHASE = os.environ.get("FEATHER_PGS_CAPTURE_PHASE")  # None = any 
 _FPGS_CAPTURE_DIR = os.environ.get("FEATHER_PGS_CAPTURE_DIR", "/tmp/fpgs_capture")
 _GROUPED_CHECK = os.environ.get("FEATHER_PGS_CHECK_GROUPED") == "1"
 _GROUPED_FK_OFF = os.environ.get("FEATHER_PGS_GROUPED_FK") == "0"
-_GROUPED_TAU_MASS_ON = os.environ.get("FEATHER_PGS_GROUPED_TAU_MASS") == "1"
-_GROUPED_MASS_ON = os.environ.get("FEATHER_PGS_GROUPED_MASS") == "1"
 _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
 _FK_ID_CACHE_SNAPSHOT = os.environ.get("FEATHER_PGS_FK_CACHE_SNAPSHOT") == "1"
 # FEATHER_PGS_FUSED_PUBLISH=1 publishes each articulation of the general route
@@ -2520,10 +2516,6 @@ class SolverFeatherPGS(SolverBase):
         self.grouped_dynamics = bool(grouped_dynamics)
         self.lazy_kinematics = bool(lazy_kinematics)
         self._grouped_topology = None
-        self._grouped_tau_mass = False
-        self._grouped_mass = False
-        self._grouped_check_pending = None
-        self._grouped_check_pending_L = None
         self.rigid_body_max_linear_velocity = getattr(model, "rigid_body_max_linear_velocity", None)
         self.rigid_body_max_angular_velocity = getattr(model, "rigid_body_max_angular_velocity", None)
         self.rigid_body_max_depenetration_velocity = getattr(model, "rigid_body_max_depenetration_velocity", None)
@@ -7986,30 +7978,6 @@ class SolverFeatherPGS(SolverBase):
             self._body_fs_scratch = wp.zeros(int(model.body_count), dtype=wp.spatial_vector, device=model.device)
             self._grouped_kernels = {}
             self._grouped_dummy_diag = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
-            # Grouped tau and publication do not consume the factor representation.
-            # The mass-writing fusions below require dense factor storage.
-            # Fused inverse dynamics + composite inertia + CRBA + Cholesky: every size group must
-            # use the compact-terms composite path and the lower-schedule CRBA, none may be a
-            # free-body-inertia group.
-            self._grouped_tau_mass = bool(
-                self._sparse_mass_matrix_size is None
-                and self._parallel_composite_inertia
-                and self._composite_articulation_count == int(model.articulation_count)
-                and all(
-                    size in self._crba_source_dof_by_size
-                    and size in self._crba_dof_joint_offset_by_size
-                    and size not in self._free_body_inertia_sizes
-                    and size <= _FACTOR_DENSE_MAX_DOF
-                    for size in self.size_groups
-                )
-                and self._direct_branch_tau_kernel is None
-            )
-            # Both fused mass-matrix variants are correct but slower than the tiled CRBA/Cholesky
-            # on AnymalD (pure Warp 235 us, native 195 us per update launch against ~113 us);
-            # they stay opt-in (FEATHER_PGS_GROUPED_TAU_MASS=1 / FEATHER_PGS_GROUPED_MASS=1).
-            self._grouped_mass = self._grouped_tau_mass and _GROUPED_MASS_ON
-            if not _GROUPED_TAU_MASS_ON:
-                self._grouped_tau_mass = False
         # World class written by the response-block build kernel (0 = legacy sweep owns the world).
         self._rb_class = wp.zeros(max(int(self.world_count), 1), dtype=wp.int32, device=model.device)
         if (
@@ -12314,9 +12282,7 @@ class SolverFeatherPGS(SolverBase):
         if _DEBUG_CACHE_CMP and self._fk_id_cache_enabled:
             self._debug_compare_cache(state_in, state_aug, stage3_qd)
         global_inertia_ready = None
-        if parallel_global_refresh and (self._grouped_tau_mass or self._grouped_mass) and not _GROUPED_CHECK:
-            pass  # composite inertia is produced by a fused kernel
-        elif parallel_global_refresh:
+        if parallel_global_refresh:
             inertia_stream = self._global_inertia_stream
             inertia_stream.wait_event(wp.get_stream(model.device).record_event())
             with wp.ScopedStream(inertia_stream, sync_enter=False):
@@ -12582,88 +12548,6 @@ class SolverFeatherPGS(SolverBase):
         ]
         if self._direct_branch_tau_kernel is None:
             topo = self._grouped_topology
-            if topo is not None and self._grouped_tau_mass:
-                do_mass = 1 if ((self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update) else 0
-                check = _GROUPED_CHECK
-                ref = [wp.clone(state_aug.body_ft_s), wp.clone(state_aug.joint_tau)] if check else None
-                t = tau_inputs
-                for size in self.size_groups:
-                    n_arts = int(self.n_arts_by_size[size])
-                    if n_arts == 0:
-                        continue
-                    sched = self._crba_source_dof_by_size[size]
-                    apb = 32 // topo.lanes_per_articulation
-                    wp.launch_tiled(
-                        grouped_tau_mass,
-                        dim=[(n_arts + apb - 1) // apb],
-                        inputs=[
-                            topo.lanes_per_articulation,
-                            n_arts,
-                            topo.max_levels,
-                            do_mass,
-                            int(size),
-                            int(sched.shape[0]),
-                            1,
-                            topo.art_level_offsets,
-                            topo.level_joint_local,
-                            topo.children_offsets,
-                            topo.children,
-                            self.group_to_art[size],
-                            t[0],
-                            self.articulation_dof_start,
-                            t[2],
-                            t[3],
-                            t[4],
-                            t[6],
-                            t[7],
-                            t[8],
-                            t[9],
-                            t[10],
-                            t[11],
-                            t[12],
-                            t[13],
-                            t[14],
-                            t[15],
-                            t[16],
-                            t[17],
-                            t[18],
-                            t[19],
-                            t[20],
-                            t[21],
-                            int(add_to_existing),
-                            model.body_mass,
-                            self._body_inertia_terms,
-                            self.R_by_size[size],
-                            self._crba_dof_joint_offset_by_size[size],
-                            sched,
-                            self._augmented_drive_row_by_dof,
-                            self.aug_row_K,
-                        ],
-                        outputs=[
-                            state_aug.body_ft_s,
-                            self._body_fs_scratch,
-                            state_aug.joint_tau,
-                            self.body_I_c,
-                            self.L_by_size[size],
-                        ],
-                        block_dim=32,
-                        device=model.device,
-                    )
-                self._grouped_mass_done = bool(do_mass)
-                if check:
-                    fused_ic = wp.clone(self.body_I_c) if do_mass else None
-                    fused_L = {size: wp.clone(self.L_by_size[size]) for size in self.size_groups} if do_mass else None
-                    wp.launch(
-                        eval_rigid_tau_add if add_to_existing else eval_rigid_tau,
-                        dim=model.articulation_count,
-                        inputs=tau_inputs,
-                        outputs=ref,
-                        block_dim=self.serial_kernel_block_dim,
-                        device=model.device,
-                    )
-                    _report_grouped_check("tau(fused)", [state_aug.body_ft_s, state_aug.joint_tau], ref)
-                    self._grouped_check_pending = (fused_ic, fused_L)
-                return
             if topo is not None:
                 check = _GROUPED_CHECK
                 ref = [wp.clone(state_aug.body_ft_s), wp.clone(state_aug.joint_tau)] if check else None
@@ -13068,55 +12952,6 @@ class SolverFeatherPGS(SolverBase):
                         device=model.device,
                     )
                 continue
-            if self._grouped_tau_mass and global_flag and not _GROUPED_CHECK:
-                continue  # mass matrix factored by the fused inverse-dynamics kernel
-            if self._grouped_mass and global_flag:
-                key = ("mass", size)
-                kern = self._grouped_kernels.get(key)
-                if kern is None:
-                    kern = get_grouped_mass_kernel(int(size), int(self._grouped_topology.max_joints))
-                    self._grouped_kernels[key] = kern
-                n_arts = int(self.n_arts_by_size[size])
-                check = _GROUPED_CHECK
-                wpb = 4
-                wp.launch_tiled(
-                    kern,
-                    dim=[(n_arts + wpb - 1) // wpb],
-                    inputs=[
-                        wpb,
-                        n_arts,
-                        self.group_to_art[size],
-                        model.articulation_start,
-                        self.articulation_joint_end,
-                        model.joint_ancestor,
-                        model.joint_child,
-                        model.body_mass,
-                        self._body_inertia_terms,
-                        self.articulation_dof_start,
-                        state_aug.joint_S_s,
-                        self.R_by_size[size],
-                        self._crba_dof_joint_offset_by_size[size],
-                        self._crba_source_dof_by_size[size],
-                        1,
-                        self._augmented_drive_row_by_dof,
-                        self.aug_row_K,
-                        self.body_I_c,
-                        self.L_by_size[size],
-                    ],
-                    outputs=[],
-                    block_dim=32 * wpb,
-                    device=model.device,
-                )
-                if check:
-                    fused_ic = wp.clone(self.body_I_c)
-                    fused_L = wp.clone(self.L_by_size[size])
-                    # legacy composite (into body_I_c) then fall through to the legacy CRBA below
-                    self._launch_parallel_composite_inertia(state_aug.body_I_s, compact_terms=True)
-                    wp.synchronize_device(model.device)
-                    _report_grouped_check(f"composite_{size}(native)", [fused_ic], [self.body_I_c])
-                    self._grouped_check_pending_L = (size, fused_L)
-                else:
-                    continue
             fused_crba_cholesky_warp = self._crba_cholesky_warp_kernels_by_size[size]
             if fused_crba_cholesky_warp is not None:
                 wp.launch(
@@ -13220,37 +13055,6 @@ class SolverFeatherPGS(SolverBase):
         self._mass_update_requested.zero_()
 
         self._force_mass_update = False
-
-        pend_L = getattr(self, "_grouped_check_pending_L", None)
-        if _GROUPED_CHECK and pend_L is not None:
-            size, fused_L = pend_L
-            self._grouped_check_pending_L = None
-            a = fused_L.numpy().astype(np.float64)
-            b = self.L_by_size[size].numpy().astype(np.float64)
-            tri = np.tril(np.ones((a.shape[1], a.shape[2]), dtype=bool))
-            print(
-                f"[grouped-check] cholesky_{size}(native): lower max abs diff {np.nanmax(np.abs(a[:, tri] - b[:, tri])):.3e}, "
-                f"nan fused {int(np.isnan(a).sum())}, |L| max {np.nanmax(np.abs(b[:, tri])):.3e}, upper fused max {np.nanmax(np.abs(a[:, ~tri])):.3e}",
-                flush=True,
-            )
-        pending = getattr(self, "_grouped_check_pending", None)
-        if _GROUPED_CHECK and pending is not None:
-            fused_ic, fused_L = pending
-            self._grouped_check_pending = None
-            if fused_ic is not None:
-                _report_grouped_check("composite_inertia(fused)", [fused_ic], [self.body_I_c])
-                for size in self.size_groups:
-                    a = fused_L[size].numpy().astype(np.float64)
-                    b = self.L_by_size[size].numpy().astype(np.float64)
-                    tri = np.tril(np.ones((a.shape[1], a.shape[2]), dtype=bool))
-                    da = a[:, tri]
-                    db = b[:, tri]
-                    print(
-                        f"[grouped-check] cholesky_{size}(fused): lower max abs diff {np.nanmax(np.abs(da - db)):.3e}, "
-                        f"nan fused {int(np.isnan(a).sum())} legacy {int(np.isnan(b).sum())}, |L| max {np.nanmax(np.abs(db)):.3e}, "
-                        f"upper fused max {np.nanmax(np.abs(a[:, ~tri])):.3e} legacy {np.nanmax(np.abs(b[:, ~tri])):.3e}",
-                        flush=True,
-                    )
 
     def _stage2_factor(self, size: int):
         """The stage-2 factorization of one DOF size, or ``None`` when stage 2 has none to run.

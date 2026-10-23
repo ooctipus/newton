@@ -95,7 +95,6 @@ class TestFeatherPGSTreePlan(unittest.TestCase):
                         model=Mock(articulation_count=2),
                         _direct_branch_tau_kernel=None,
                         _grouped_topology=topology if grouped else None,
-                        _grouped_tau_mass=False,
                         _tree_plan=None,
                     )
                     state_in, state_aug, control = Mock(body_count=2), Mock(), Mock()

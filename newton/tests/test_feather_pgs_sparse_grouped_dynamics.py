@@ -39,12 +39,10 @@ def _case(grouped, *, free_count=0, friction_anchor_beta=0.0, environment=None):
 @unittest.skipUnless(wp.is_cuda_available(), "Sparse grouped dynamics requires CUDA")
 class TestSparseGroupedDynamics(unittest.TestCase):
     def assert_native_grouped(self, case):
-        """Require sparse storage and prohibit dense-factor-writing fusions."""
+        """Require sparse storage beside grouped dynamics and no dense factor."""
         solver = case[1]
         self.assertEqual(solver._sparse_mass_matrix_size, 9)
         self.assertIsNotNone(solver._grouped_topology)
-        self.assertFalse(solver._grouped_tau_mass)
-        self.assertFalse(solver._grouped_mass)
         self.assertEqual(solver.L_by_size[9].shape, (1, 1, 1))
 
     def assert_physics_close(self, first, second):

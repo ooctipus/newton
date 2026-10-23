@@ -238,18 +238,6 @@ FLAGS = declare(
         "Largest DOF size that uses the grouped response solve (default 32).",
     ),
     _flag(
-        "FEATHER_PGS_GROUPED_MASS",
-        "experiment",
-        _SOLVER,
-        "=1 with GROUPED_TAU_MASS also builds the mass matrix in the grouped kernel.",
-    ),
-    _flag(
-        "FEATHER_PGS_GROUPED_TAU_MASS",
-        "experiment",
-        _SOLVER,
-        "=1 fuses joint torques and mass-matrix assembly in the grouped kernel.",
-    ),
-    _flag(
         "FEATHER_PGS_GROUP_LANES",
         "policy",
         ("grouped_dynamics",),

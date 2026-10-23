@@ -1410,7 +1410,7 @@ def _grouped(solver, source) -> dict | None:
         # -1 when the template build failed; template kernels then stay off.
         "template_count": int(topology.template_count),
         "template_fk": bool(publishes and topology.template_count > 0 and not source._GROUPED_FK_OFF),
-        "tau": ("grouped_tau_mass" if solver._grouped_tau_mass else "grouped_tau") if tau else None,
+        "tau": "grouped_tau" if tau else None,
         "hinv_jt_by_dof": {
             str(int(size)): {
                 "grouped": grouped_response(solver, size),
@@ -1425,8 +1425,6 @@ def _dynamics(solver, source) -> dict:
     return {
         "grouped_topology": solver._grouped_topology is not None,
         "grouped": _grouped(solver, source),
-        "grouped_tau_mass": bool(solver._grouped_tau_mass),
-        "grouped_mass": bool(solver._grouped_mass),
         "parallel_tree": solver._tree_plan is not None,
         "compact_diagonal_mass_dofs": json_value(solver._compact_diagonal_mass_size),
         "diagonal_mass_dofs": sorted(int(size) for size in solver._diagonal_mass_sizes),
