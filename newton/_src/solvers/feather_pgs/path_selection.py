@@ -141,7 +141,8 @@ def _linked_tier_sweeps(solver) -> int:
 _EFFECTIVE = {
     "sparse_mass_matrix": lambda solver: "on" if solver._sparse_mass_matrix_size is not None else "off",
     "cached_dynamics": lambda solver: "on" if solver._tree_kinetic_state is not None else "off",
-    "parallel_tree": lambda solver: solver._tree_plan is not None,
+    # Deprecated: nothing builds a tree plan.
+    "parallel_tree": lambda solver: False,
     "grouped_dynamics": lambda solver: solver._grouped_response,
     # Nothing defers publication: the request only declines the resolved-world classifier.
     "lazy_kinematics": lambda solver: False,
@@ -1389,7 +1390,6 @@ def _grouped(solver, source) -> dict | None:
 def _dynamics(solver, source) -> dict:
     return {
         "grouped": _grouped(solver, source),
-        "parallel_tree": solver._tree_plan is not None,
         "compact_diagonal_mass_dofs": json_value(solver._compact_diagonal_mass_size),
         "diagonal_mass_dofs": sorted(int(size) for size in solver._diagonal_mass_sizes),
         "parallel_composite_inertia": bool(solver._parallel_composite_inertia),

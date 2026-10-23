@@ -6,6 +6,7 @@ import inspect
 import os
 import textwrap
 import unittest
+import warnings
 from unittest import mock
 
 import numpy as np
@@ -291,6 +292,45 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 kernel_module = getattr(feather_pgs_kernels, kernel_name).module.name
                 self.assertNotEqual(kernel_module, general_module)
                 self.assertEqual(kernel_module, f"{general_module}.{module_suffix}")
+
+    def test_torque_pass_runs_once(self):
+        """Dispatch exactly one torque pass, including accumulation into actuator torques."""
+        for add_to_existing in (False, True):
+            with self.subTest(add_to_existing=add_to_existing):
+                solver = mock.Mock(model=mock.Mock(articulation_count=2), _direct_branch_tau_kernel=None)
+                state_in, state_aug, control = mock.Mock(body_count=2), mock.Mock(), mock.Mock()
+                with (
+                    mock.patch.object(wp, "launch") as serial_launch,
+                    mock.patch.object(wp, "launch_tiled") as tiled_launch,
+                ):
+                    SolverFeatherPGS._launch_rigid_tau(
+                        solver, state_in, state_aug, control, add_to_existing=add_to_existing
+                    )
+                state_aug.body_ft_s.zero_.assert_called_once_with()
+                tiled_launch.assert_not_called()
+                serial_launch.assert_called_once()
+                expected = solver_module.eval_rigid_tau_add if add_to_existing else solver_module.eval_rigid_tau
+                self.assertIs(serial_launch.call_args.args[0], expected)
+
+    def test_parallel_tree_is_deprecated(self):
+        """Warn that parallel_tree has no effect, keep it keyword-only and build the default routes."""
+        parameter = inspect.signature(SolverFeatherPGS).parameters["parallel_tree"]
+        self.assertIs(parameter.default, False)
+        self.assertEqual(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+        with wp.ScopedDevice("cpu"):
+            model = _build_chain_model(num_links=3, num_worlds=1)
+        with self.assertWarnsRegex(DeprecationWarning, "^parallel_tree is deprecated and has no effect"):
+            solver = SolverFeatherPGS(model, parallel_tree=True)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            default = SolverFeatherPGS(model, parallel_tree=False)
+        self.assertFalse([warning for warning in caught if "parallel_tree" in str(warning.message)])
+        selected = solver.get_path_selection()
+        self.assertEqual(
+            selected["options"]["parallel_tree"],
+            {"applied": False, "requested": True, "default": False, "source": "argument"},
+        )
+        self.assertEqual(selected["routes"], default.get_path_selection()["routes"])
 
     def test_defaults_preserved(self):
         model = newton.ModelBuilder().finalize()
