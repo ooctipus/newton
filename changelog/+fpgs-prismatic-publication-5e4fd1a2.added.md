@@ -1,1 +1,0 @@
-Add a default-off experimental `FEATHER_PGS_PRISMATIC_PUBLICATION=1` Stage 7 producer for fixed-root scalar-prismatic stars in `SolverFeatherPGS`. It publishes current canonical body/cache fields in body-parallel work while retaining ordinary FK for other articulations and unchanged mass, integration, constraint, and iteration budgets.

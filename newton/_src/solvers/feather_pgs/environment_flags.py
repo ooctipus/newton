@@ -370,17 +370,15 @@ FLAGS = declare(
     ),
     _flag(
         "FEATHER_PGS_PRISMATIC_LINEAR_STATE",
-        "experiment",
-        _SOLVER,
-        "=1 keeps current linear state for fixed-root one-body prismatic branches; superseded where scalar "
-        "branches admit them, unless FEATHER_PGS_SCALAR_BRANCHES=0.",
+        "retired",
+        ("environment_flags",),
+        "Retired linear state of fixed-root one-body prismatic branches; ignored (scalar branches run them).",
     ),
     _flag(
         "FEATHER_PGS_PRISMATIC_PUBLICATION",
-        "experiment",
-        _SOLVER,
-        "=1 publishes fixed-root prismatic stars body-parallel; superseded where scalar branches admit them, "
-        "unless FEATHER_PGS_SCALAR_BRANCHES=0.",
+        "retired",
+        ("environment_flags",),
+        "Retired body-parallel publication of fixed-root prismatic stars; ignored (scalar branches run them).",
     ),
     _flag(
         "FEATHER_PGS_REGISTER_WHITENING",
@@ -429,8 +427,7 @@ FLAGS = declare(
         "policy",
         _SOLVER,
         "=0 keeps a diagonal-mass group of world-fixed roots over one-coordinate leaves out of the held-tree "
-        "owner's scalar branches, which run it, own the other articulations of its worlds and supersede the "
-        "prismatic opt-ins there (default on).",
+        "owner's scalar branches, which run it and own the other articulations of its worlds (default on).",
     ),
     _flag(
         "FEATHER_PGS_SHADOW_LEAN",
@@ -689,8 +686,9 @@ FLAGS = declare(
 # Retired names that Isaac Lab's benchmark recipes still set: the packed
 # sparse-factor route's selectors (480f0f44), the chain-scan and keyed-row
 # aliases (d35949d6), the selectors of removed research owners and of the
-# branch-Jacobi sweep (790f9782, aa2f332b), and the lane count of the removed
-# grouped kinematics and torque kernels. Nothing in Newton or Isaac Lab reads
+# branch-Jacobi sweep (790f9782, aa2f332b), the lane count of the removed
+# grouped kinematics and torque kernels, and the prismatic opt-ins that scalar
+# branches replaced. Nothing in Newton or Isaac Lab reads
 # them, and recipes are not Newton's to edit, so they are ignored rather than
 # rejected: the general route runs, the construction record lists them as retired
 # and the solver warns once per process.
@@ -706,6 +704,8 @@ IGNORED_RETIRED = frozenset(
         "FEATHER_PGS_LOCAL_ROW_PACKETS",
         "FEATHER_PGS_PACKED_TREE_KINETIC_STATE",
         "FEATHER_PGS_PAIRED_GENERAL_OVERLAP",
+        "FEATHER_PGS_PRISMATIC_LINEAR_STATE",
+        "FEATHER_PGS_PRISMATIC_PUBLICATION",
         "FEATHER_PGS_SIMPLE_WORLD_ZERO",
         "FEATHER_PGS_SPARSE_BRANCH_SWEEPS",
         "FEATHER_PGS_SPARSE_CONTACT_BLOCK",

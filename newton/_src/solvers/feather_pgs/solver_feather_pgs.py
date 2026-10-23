@@ -303,9 +303,6 @@ _FPGS_CAPTURE_COUNT = int(os.environ.get("FEATHER_PGS_CAPTURE_COUNT", "1"))  # c
 _FPGS_CAPTURE_PHASE = os.environ.get("FEATHER_PGS_CAPTURE_PHASE")  # None = any phase
 _FPGS_CAPTURE_DIR = os.environ.get("FEATHER_PGS_CAPTURE_DIR", "/tmp/fpgs_capture")
 _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
-# Experimental Stage 7 producer partition, leaving all solve/mass budgets intact.
-_PRISMATIC_PUBLICATION = os.environ.get("FEATHER_PGS_PRISMATIC_PUBLICATION", "0") == "1"
-_PRISMATIC_LINEAR_STATE = os.environ.get("FEATHER_PGS_PRISMATIC_LINEAR_STATE", "0") == "1"
 _COMPACT_CONTACT_BOUNDARY = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_BOUNDARY", "0") == "1"
 _COMPACT_CONTACT_ORDERING = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_ORDERING", "0") == "1"
 _ROWS_MASKED = os.environ.get("FEATHER_PGS_ROWS_MASKED") == "1"  # thread-per-(contact, dof) contact row build
@@ -1207,9 +1204,8 @@ class SolverFeatherPGS(SolverBase):
                 disable auto and conflict with ``on``. Factor refresh intervals and numerical budgets
                 are unchanged. Where the held-tree owner is admitted, a diagonal-mass group of
                 world-fixed roots over one-coordinate prismatic or revolute leaves runs as its scalar
-                branches by default, superseding the prismatic publication opt-ins
-                (``FEATHER_PGS_SCALAR_BRANCHES=0`` opts out); :meth:`get_path_selection` reports it
-                under ``routes.held_tree.scalar_branches``.
+                branches by default (``FEATHER_PGS_SCALAR_BRANCHES=0`` opts out);
+                :meth:`get_path_selection` reports it under ``routes.held_tree.scalar_branches``.
             contact_torsion_radius: Experimental effective spin radius [m], zero disables.
                 Explicit material/footprint assumption: for uniform pressure on a disk
                 of radius R, the effective radius is 2*R/3. Does not consume the generic
@@ -3171,22 +3167,16 @@ class SolverFeatherPGS(SolverBase):
 
             enable_device_torsion(self)
 
-        self._prismatic_publication = None
-        self._prismatic_linear_state = False
-        self._prismatic_linear_valid = None
         # Scalar branches take a diagonal-mass group of world-fixed roots over
         # one-coordinate leaves (scalar_branches.py), which the held-tree owner
-        # then publishes; the prismatic opt-ins serve the same articulations and
-        # give way. The owner is decided below; if it declines, they apply. The
-        # switch, on unless =0, is read here, at construction, like the
-        # environment record.
+        # then publishes. The owner is decided below; if it declines, ordinary
+        # dynamics runs the group. The switch, on unless =0, is read here, at
+        # construction, like the environment record.
         from .scalar_branches import plan_scalar_branches  # noqa: PLC0415
 
         self._scalar_branches, self._scalar_branches_reason = plan_scalar_branches(
             self, requested=os.environ.get("FEATHER_PGS_SCALAR_BRANCHES", "1") != "0"
         )
-        if self._scalar_branches is None:
-            self._configure_prismatic_publication()
 
         self._compact_contact_boundary = False
         # The compact producer writes the point and the patch row law; torsion and compliance keep ordinary rows.
@@ -3213,33 +3203,16 @@ class SolverFeatherPGS(SolverBase):
         if self._scalar_branches is not None and getattr(self._tree_kinetic_state, "scalar", None) is None:
             self._scalar_branches = None
             if self._tree_kinetic_state is None:
-                # Ordinary dynamics keeps the branches, with the opt-ins they superseded.
                 self._scalar_branches_reason = (
                     f"The held-tree owner did not take them ({self._cached_dynamics_selection_reason}); "
-                    "the prismatic opt-ins apply."
+                    "ordinary dynamics runs them."
                 )
-                self._configure_prismatic_publication()
             else:
-                # Every cached owner excludes the prismatic opt-ins (today no other owner admits
-                # a sparse-diagonal response, so this branch is defensive).
+                # Today no other cached owner admits a sparse-diagonal response, so this branch is defensive.
                 self._scalar_branches_reason = (
                     "A cached owner without scalar branches took these worlds: "
                     f"{self._cached_dynamics_selection_reason}"
                 )
-        if self._scalar_branches is not None:
-            # The prismatic opt-ins a recipe sets now select nothing: say so once per process.
-            from .scalar_branches import superseded_notice  # noqa: PLC0415
-
-            notice = superseded_notice(
-                name
-                for name, requested in (
-                    ("FEATHER_PGS_PRISMATIC_PUBLICATION", _PRISMATIC_PUBLICATION),
-                    ("FEATHER_PGS_PRISMATIC_LINEAR_STATE", _PRISMATIC_LINEAR_STATE),
-                )
-                if requested
-            )
-            if notice is not None:
-                warnings.warn(notice, UserWarning, stacklevel=_CONSTRUCTOR_CALLER)
         self._unread_mass_sizes = self._unread_mass_matrix_sizes()
 
         # Worlds whose every candidate row separates at the predictor skip row
@@ -3268,7 +3241,7 @@ class SolverFeatherPGS(SolverBase):
             # A predictor experiment independent of contact scheduling. The
             # effective six-DOF factor retains drive/armature contributions;
             # physical COM inertia supplies only the gyroscopic correction.
-            if model.requires_grad or self.L_by_size.get(6) is None or self._prismatic_linear_state:
+            if model.requires_grad or self.L_by_size.get(6) is None:
                 raise ValueError("Experimental implicit free-body gyro requires ordinary six-DOF mass factors")
             from .free_body_gyro import correct_free_body_gyroscopic_predictor  # noqa: PLC0415
 
@@ -3299,7 +3272,6 @@ class SolverFeatherPGS(SolverBase):
                 or self._paired_factor_coordinates
                 or self._sparse_diagonal_contact_solve
                 or self._sparse_mass_matrix_size is not None
-                or self._prismatic_linear_state
             ):
                 raise ValueError(
                     "Experimental MF multi-block PGS requires CUDA, interleaved matrix-free "
@@ -11866,13 +11838,9 @@ class SolverFeatherPGS(SolverBase):
             )
             return None, stage3_qd
         parallel_global_refresh = refresh_composite and self._global_inertia_stream is not None
-        if self._prismatic_linear_state:
-            # The shortened root producer stamps validity before the leaf
-            # pass. Preserve admission from before either producer runs.
-            wp.copy(self._prismatic_linear_valid, self._fk_id_cache_valid)
         fk_inputs = [
             model.articulation_start,
-            self._prismatic_publication.joint_end if self._prismatic_linear_state else self.articulation_joint_end,
+            self.articulation_joint_end,
             model.joint_type,
             model.joint_parent,
             model.joint_child,
@@ -11914,40 +11882,6 @@ class SolverFeatherPGS(SolverBase):
             block_dim=16,
             device=model.device,
         )
-        if self._prismatic_linear_state:
-            from .prismatic_linear_state import repair_prismatic_linear_state  # noqa: PLC0415
-
-            wp.launch(
-                repair_prismatic_linear_state,
-                dim=model.body_count,
-                inputs=[
-                    self._prismatic_publication.body_joint,
-                    self._prismatic_linear_valid,
-                    model.joint_parent,
-                    model.joint_q_start,
-                    model.joint_qd_start,
-                    state_in.joint_q,
-                    stage3_qd,
-                    model.joint_X_p,
-                    model.joint_X_c,
-                    self.body_X_com,
-                    model.joint_axis,
-                    self.body_to_articulation,
-                    model.body_mass,
-                    self.articulation_origin,
-                    model.gravity,
-                ],
-                outputs=[
-                    state_in.body_q,
-                    state_aug.body_q_com,
-                    state_aug.joint_S_s,
-                    state_aug.body_v_s,
-                    state_aug.body_a_s,
-                    state_aug.body_f_s,
-                ],
-                block_dim=128,
-                device=model.device,
-            )
         global_inertia_ready = None
         if parallel_global_refresh:
             inertia_stream = self._global_inertia_stream
@@ -16902,22 +16836,6 @@ class SolverFeatherPGS(SolverBase):
         """
         del state
 
-    def _configure_prismatic_publication(self) -> None:
-        """Build the opt-in prismatic Stage 7 producer and its linear state (``prismatic_*.py``)."""
-        model = self.model
-        if (
-            (_PRISMATIC_PUBLICATION or _PRISMATIC_LINEAR_STATE)
-            and not model.requires_grad
-            and not self.grouped_dynamics
-        ):
-            from .prismatic_publication import PrismaticPublicationPlan  # noqa: PLC0415
-
-            self._prismatic_publication = PrismaticPublicationPlan.build(model, self.articulation_joint_end)
-        if _PRISMATIC_LINEAR_STATE:
-            from .prismatic_linear_state import configure_linear_state  # noqa: PLC0415
-
-            configure_linear_state(self)
-
     def _stage7_update_kinematics(self, state_out: State, state_aug: State) -> None:
         """Publish kinematics and prepare reusable inverse dynamics for the next step."""
         model = self.model
@@ -16935,10 +16853,9 @@ class SolverFeatherPGS(SolverBase):
         body_a_s = state_aug.body_a_s
         next_refresh = ((self._step + 1) % self.update_mass_matrix_interval) == 0
         parallel_next_refresh = next_refresh and self._global_inertia_stream is not None
-        prismatic = self._prismatic_publication
         fk_inputs = [
             model.articulation_start,
-            prismatic.joint_end if prismatic is not None else self.articulation_joint_end,
+            self.articulation_joint_end,
             model.joint_type,
             model.joint_parent,
             model.joint_child,
@@ -16970,34 +16887,10 @@ class SolverFeatherPGS(SolverBase):
             block_dim=16,
             device=model.device,
         )
-        finalize_kernel = finalize_body_dynamics
-        finalize_prefix = []
-        if prismatic is not None:
-            from .prismatic_publication import finalize_prismatic_body_dynamics  # noqa: PLC0415
-
-            finalize_kernel = finalize_prismatic_body_dynamics
-            if self._prismatic_linear_state:
-                from .prismatic_linear_state import finalize_prismatic_linear_state  # noqa: PLC0415
-
-                finalize_kernel = finalize_prismatic_linear_state
-            finalize_prefix = [
-                prismatic.body_joint,
-                model.joint_parent,
-                model.joint_q_start,
-                model.joint_qd_start,
-                state_out.joint_q,
-                state_out.joint_qd,
-                model.joint_X_p,
-                model.joint_X_c,
-                self.body_X_com,
-                model.joint_axis,
-                joint_S_s,
-            ]
         wp.launch(
-            finalize_kernel,
+            finalize_body_dynamics,
             dim=model.body_count,
             inputs=[
-                *finalize_prefix,
                 self.body_to_articulation,
                 state_out.body_q,
                 body_q_com,
@@ -17181,14 +17074,8 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
 
 
 @cache
-def _get_direct_diagonal_inverse_mass_kernel(
-    n_dofs: int, device_arch: str, *, linear_state: bool = False
-) -> "wp.Kernel":
+def _get_direct_diagonal_inverse_mass_kernel(n_dofs: int, device_arch: str) -> "wp.Kernel":
     """Project one-body diagonal branches without materializing composite spatial inertia."""
-    if linear_state:
-        from .prismatic_linear_state import get_linear_inverse_mass_kernel  # noqa: PLC0415
-
-        return get_linear_inverse_mass_kernel(n_dofs)
     del device_arch
     N = int(n_dofs)
     if N <= 0:

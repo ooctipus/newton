@@ -1158,8 +1158,6 @@ def _publication(solver) -> dict:
         "owner": owner,
         "reason": reason,
         "fk_id_cache": cache,
-        "prismatic_publication": solver._prismatic_publication is not None,
-        "prismatic_linear_state": bool(solver._prismatic_linear_state),
     }
 
 

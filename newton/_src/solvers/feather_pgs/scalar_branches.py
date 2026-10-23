@@ -13,7 +13,7 @@ coordinate and no tree plan, so no body or coordinate cap applies. By default th
 held-tree owner composes it in place of a tree group (``mixed_tree_kinetic.py``)
 wherever :func:`plan_scalar_branches` admits the group;
 ``FEATHER_PGS_SCALAR_BRANCHES=0`` keeps the group on a tree group or on ordinary
-dynamics, with the prismatic opt-ins where they are set:
+dynamics:
 
 * ``begin`` publishes the input state of articulations whose cache is invalid:
   the root pose, the articulation origin, and each leaf's pose and motion axis.
@@ -25,10 +25,10 @@ dynamics, with the prismatic opt-ins where they are set:
   state: coordinates, root and leaf poses, motion axes, body velocities and the
   articulation origin.
 
-Prismatic leaves follow the prismatic linear state's law
-(``prismatic_linear_state.py``) operation for operation; revolute leaves follow
-ordinary dynamics without evaluating the velocity product, which is zero for
-them. The family never writes ``body_q_com``, ``body_v_s``, ``body_a_s``,
+Prismatic leaves follow the linear-state law of a one-body prismatic branch
+operation for operation (the scalar-branch tests keep that law as their
+oracle); revolute leaves follow ordinary dynamics without evaluating the
+velocity product, which is zero for them. The family never writes ``body_q_com``, ``body_v_s``, ``body_a_s``,
 ``body_f_s``, ``body_I_s`` or the compact inertia terms of its bodies, which no
 consumer on its route reads.
 
@@ -40,9 +40,9 @@ its axis, which the group's proof freezes, and on its child frame, which a
 notification may move; the new value then takes effect at the next refresh, as
 in a tree group's held factor. The inverse mass refreshes wherever the solver's
 mass mask selects (the update cadence plus the requests that resets and
-inertial, DOF and body notifications raise), as the prismatic linear state's
-does: that keeps prismatic leaves bitwise with that route and follows a
-changed step duration, which no notification announces. M6 timed prototype
+inertial, DOF and body notifications raise), as the linear-state law does:
+that keeps prismatic leaves bitwise with that law and follows a changed step
+duration, which no notification announces. M6 timed prototype
 predict and finish kernels at 489 us per substep with this cadence over 16384
 keyboard-sized worlds, against 500 us with a refresh on every substep.
 """
@@ -783,36 +783,9 @@ def plan_scalar_branches(solver, *, requested: bool) -> tuple[ScalarBranchPlan |
     )
     reason = (
         f"Admitted: {plan.group_count} world-fixed roots of {plan.size} one-coordinate {' and '.join(present)} "
-        "leaves run as scalar branches (default; FEATHER_PGS_SCALAR_BRANCHES=0 opts out); they supersede "
-        "FEATHER_PGS_PRISMATIC_PUBLICATION and FEATHER_PGS_PRISMATIC_LINEAR_STATE for these articulations."
+        "leaves run as scalar branches (default; FEATHER_PGS_SCALAR_BRANCHES=0 opts out)."
     )
     return plan, reason
-
-
-_WARNED_SUPERSEDED: set[str] = set()
-"""Prismatic opt-ins that :func:`superseded_notice` has reported in this process."""
-
-
-def superseded_notice(names) -> str | None:
-    """Return a warning naming the prismatic opt-ins in ``names`` that scalar branches leave selecting nothing.
-
-    A solver whose held-tree owner takes the scalar branches builds neither
-    the prismatic publication plan nor the linear state those opt-ins request.
-    Recipes set them, and recipes are not Newton's to edit, so they are
-    warned about, once per name and process, rather than rejected.
-
-    Returns:
-        The warning text, or ``None`` when every name was reported before.
-    """
-    names = [name for name in names if name not in _WARNED_SUPERSEDED]
-    if not names:
-        return None
-    _WARNED_SUPERSEDED.update(names)
-    return (
-        f"Ignoring {' and '.join(names)}: scalar branches supersede the prismatic route on this solver "
-        "(get_path_selection() reports routes.held_tree.scalar_branches). Set FEATHER_PGS_SCALAR_BRANCHES=0 "
-        "to keep the prismatic route."
-    )
 
 
 class ScalarBranchState:

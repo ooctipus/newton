@@ -35,7 +35,6 @@ def supported(solver):
         and solver._articulation_dynamics_stream is not None
         and not solver._debug_buffers_enabled
         and not solver._double_buffer
-        and getattr(solver, "_prismatic_publication", None) is None
     )
 
 

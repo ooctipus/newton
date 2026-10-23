@@ -58,8 +58,10 @@ RECIPES = {
         + ["NEWTON_NARROW_PHASE_PACKED_HEIGHTFIELD_PAIRS=1"],
         {"rigid_contact_max": 73728, "dense_max_constraints": 100, "max_triangle_pairs": 442368},
     ),
+    # The original keyboard recipe's prismatic opt-ins are retired; scalar
+    # branches run its keys.
     "keyboard-so101": (
-        flags("SPARSE_CONTACT_DIRECT", "PRISMATIC_PUBLICATION", "COMPACT_CONTACT_BOUNDARY", "PRISMATIC_LINEAR_STATE"),
+        flags("SPARSE_CONTACT_DIRECT", "COMPACT_CONTACT_BOUNDARY"),
         {"rigid_contact_max": 147456, "dense_max_constraints": 704},
     ),
     **{
