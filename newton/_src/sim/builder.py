@@ -9,7 +9,9 @@ import copy
 import ctypes
 import functools
 import inspect
+import itertools
 import math
+import operator
 import os
 import warnings
 import weakref
@@ -136,6 +138,109 @@ def _deduplicate_convex_collision_mesh(source: Mesh) -> Mesh:
         collision_mesh._collision_edges = collision_edges
 
     return collision_mesh
+
+
+def _array_data(values: Any, dtype: Any) -> Any:
+    """Prepare builder list data for ``wp.array(data, dtype=dtype)``.
+
+    NumPy coerces a list of Warp vectors, matrices or transforms (ctypes arrays),
+    of tuples, or of scalars other than plain ``int``/``float`` (integer enums,
+    Warp scalars) one element at a time, which dominates
+    :meth:`ModelBuilder.finalize` for large replicated scenes. Such a non-empty
+    list is converted in bulk for a ``float32`` or ``int32`` based ``dtype``, with
+    the same per-element conversion; any other input is returned unchanged for
+    ``wp.array`` to convert.
+
+    Args:
+        values: Builder list data.
+        dtype: Warp dtype of the target array.
+
+    Returns:
+        A NumPy array with the same contents ``wp.array`` would produce from
+        ``values``, or ``values`` itself.
+    """
+    if not isinstance(values, list) or not values:
+        return values
+    scalar_type = getattr(dtype, "_wp_scalar_type_", dtype)
+    if scalar_type is wp.float32:
+        np_dtype = np.float32
+        plain_type = float
+        is_scalar_type = wp.types.type_is_float
+    elif scalar_type is wp.int32:
+        np_dtype = np.int32
+        plain_type = int
+        is_scalar_type = wp.types.type_is_int
+    else:
+        return values
+    # Lists of plain numbers already convert quickly; skip scanning them.
+    if type(values[0]) in (int, float):
+        return values
+    value_types = set(map(type, values))
+    count = len(values)
+    try:
+        if len(value_types) == 1:
+            (value_type,) = value_types
+            if issubclass(value_type, ctypes.Array):
+                # Warp vector and matrix values store their scalars contiguously.
+                if value_type._type_ is not scalar_type._type_:
+                    return values
+                return np.frombuffer(b"".join(values), dtype=np_dtype).reshape(count, value_type._length_)
+            if value_type is tuple or value_type is list:
+                widths = set(map(len, values))
+                if len(widths) != 1:
+                    return values
+                (width,) = widths
+                flat = np.fromiter(itertools.chain.from_iterable(values), dtype=np_dtype, count=count * width)
+                return flat.reshape(count, width)
+        if value_types != {plain_type} and all(
+            issubclass(value_type, plain_type) or is_scalar_type(value_type) for value_type in value_types
+        ):
+            return np.fromiter(values, dtype=np_dtype, count=count)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return values
+
+
+_NUMPY_SCALAR_TYPES = {
+    wp.bool: np.bool_,
+    wp.int8: np.int8,
+    wp.uint8: np.uint8,
+    wp.int16: np.int16,
+    wp.uint16: np.uint16,
+    wp.int32: np.int32,
+    wp.uint32: np.uint32,
+    wp.int64: np.int64,
+    wp.uint64: np.uint64,
+    wp.float32: np.float32,
+    wp.float64: np.float64,
+}
+"""NumPy scalar type ``wp.array`` converts data of a Warp scalar type to."""
+
+
+def _not_none_mask(values: Sequence[Any]) -> np.ndarray:
+    """Return which entries of ``values`` are not ``None``, shape [len(values)]."""
+    return np.fromiter(map(operator.is_not, values, itertools.repeat(None)), dtype=bool, count=len(values))
+
+
+class _BuilderIndexArrays:
+    """``int32`` NumPy copies of builder index lists, shared within one finalize.
+
+    :meth:`ModelBuilder.finalize` and the validation and indexing passes it runs
+    read the same per-entity lists (worlds, flags, parents, start indices);
+    converting each list once avoids repeating the per-element conversion in
+    every pass. Consumers must not modify the returned arrays.
+    """
+
+    def __init__(self, builder: ModelBuilder):
+        self._builder = builder
+        self._arrays: dict[str, np.ndarray] = {}
+
+    def __getitem__(self, name: str) -> np.ndarray:
+        array = self._arrays.get(name)
+        if array is None:
+            array = np.asarray(_array_data(getattr(self._builder, name), wp.int32), dtype=np.int32)
+            self._arrays[name] = array
+        return array
 
 
 @dataclass(frozen=True)
@@ -1019,7 +1124,9 @@ class ModelBuilder:
 
             if isinstance(self.default, (list, tuple, np.ndarray)):
                 arr = [self.default] * count
-                return wp.array(arr, dtype=self.dtype, requires_grad=requires_grad, device=device)
+                return wp.array(
+                    _array_data(arr, self.dtype), dtype=self.dtype, requires_grad=requires_grad, device=device
+                )
 
             # Empty numeric custom attributes are common for registered solver
             # defaults. Let Warp fill the array directly instead of first
@@ -1043,9 +1150,18 @@ class ModelBuilder:
                 return self._build_default_array(count, device=device, requires_grad=requires_grad)
             elif self.is_custom_frequency:
                 # Custom frequency: vals is a list, replace None with defaults and pad/truncate as needed
-                arr = [val if val is not None else self.default for val in self.values]
+                arr = list(self.values[:count])  # Truncate if needed
+                if any(map(operator.is_, arr, itertools.repeat(None))):
+                    arr = [val if val is not None else self.default for val in arr]
                 arr = arr + [self.default] * max(0, count - len(arr))
-                arr = arr[:count]  # Truncate if needed
+            elif set(map(type, self.values)) == {int}:
+                # Enum frequency: vals is a dict keyed by entity index; fill gaps with defaults
+                arr = self._scatter_indexed_values(count) if self.dtype is not str else None
+                if arr is None:
+                    arr = [self.default] * count
+                    for i, val in self.values.items():
+                        if 0 <= i < count:
+                            arr[i] = val
             else:
                 # Enum frequency: vals is a dict, use get() to fill gaps with defaults
                 arr = [self.values.get(i, self.default) for i in range(count)]
@@ -1054,7 +1170,34 @@ class ModelBuilder:
             if self.dtype is str:
                 return arr
 
-            return wp.array(arr, dtype=self.dtype, requires_grad=requires_grad, device=device)
+            return wp.array(_array_data(arr, self.dtype), dtype=self.dtype, requires_grad=requires_grad, device=device)
+
+        def _scatter_indexed_values(self, count: int) -> np.ndarray | None:
+            """Convert dict values keyed by entity index into an array with defaults in the gaps.
+
+            Only the stored values and the default are converted, instead of a list
+            of ``count`` entries, with the same per-element conversion. Returns
+            ``None`` unless the dtype has a common NumPy scalar type and the values
+            and default convert to the same element shape.
+            """
+            np_dtype = _NUMPY_SCALAR_TYPES.get(getattr(self.dtype, "_wp_scalar_type_", self.dtype))
+            if np_dtype is None:
+                return None
+            indices = np.fromiter(self.values.keys(), dtype=np.int64, count=len(self.values))
+            in_range = (indices >= 0) & (indices < count)
+            values = list(itertools.compress(self.values.values(), in_range))
+            try:
+                values = np.asarray(_array_data(values, self.dtype), dtype=np_dtype)
+                default = np.asarray(_array_data([self.default], self.dtype), dtype=np_dtype)
+            except (TypeError, ValueError, OverflowError):
+                # Let wp.array report the conversion error of the full list.
+                return None
+            if values.shape[1:] != default.shape[1:]:
+                return None
+            data = np.empty((count, *default.shape[1:]), dtype=np_dtype)
+            data[:] = default
+            data[indices[in_range]] = values
+            return data
 
     @dataclass
     class CustomFrequency:
@@ -2560,7 +2703,9 @@ class ModelBuilder:
     joint_target_pos = RemovedAttribute("joint_target_q", removed_in="1.5")
     joint_target_vel = RemovedAttribute("joint_target_qd", removed_in="1.5")
 
-    def _project_target_q_to_dof(self) -> list[float]:
+    def _project_target_q_to_dof(
+        self, joint_dof_dim: np.ndarray | None = None, index_arrays: _BuilderIndexArrays | None = None
+    ) -> list[float]:
         """Drop the quat-w padding slot for FREE/BALL/DISTANCE joints to turn
         the coord-sized :attr:`joint_target_q` buffer into a DOF-shaped list.
 
@@ -2568,20 +2713,30 @@ class ModelBuilder:
         stores raw per-axis angles (extrinsic ZYX) in the first 3 quat slots
         and a placeholder ``1.0`` in the 4th — this method just slices the
         placeholder off to produce the legacy DOF-shaped ``Model.joint_target_q``.
+
+        Args:
+            joint_dof_dim: :attr:`joint_dof_dim` as an integer array, if already converted.
+            index_arrays: Shared ``int32`` conversions of the builder lists, if available.
         """
-        result: list[float] = []
-        for j, jtype in enumerate(self.joint_type):
-            q_start = self.joint_q_start[j]
-            if jtype == JointType.BALL:
-                result.extend(self.joint_target_q[q_start : q_start + 3])
-            elif jtype == JointType.FREE or jtype == JointType.DISTANCE:
-                result.extend(self.joint_target_q[q_start : q_start + 6])
-            elif jtype == JointType.FIXED:
-                pass
-            else:
-                num_lin, num_ang = self.joint_dof_dim[j]
-                result.extend(self.joint_target_q[q_start : q_start + num_lin + num_ang])
-        return result
+        if not self.joint_type:
+            return []
+        if index_arrays is None:
+            index_arrays = _BuilderIndexArrays(self)
+        if joint_dof_dim is None:
+            joint_dof_dim = np.asarray(_array_data(self.joint_dof_dim, wp.int32))
+        joint_type = index_arrays["joint_type"]
+        q_start = index_arrays["joint_q_start"].astype(np.int64)
+        # Coordinates kept per joint: all of them, except the quat-w slot of
+        # BALL/FREE/DISTANCE joints and everything of FIXED joints.
+        widths = joint_dof_dim.reshape(-1, 2).sum(axis=1, dtype=np.int64)
+        widths[joint_type == int(JointType.BALL)] = 3
+        widths[(joint_type == int(JointType.FREE)) | (joint_type == int(JointType.DISTANCE))] = 6
+        widths[joint_type == int(JointType.FIXED)] = 0
+        width_starts = np.cumsum(widths) - widths
+        coords = np.repeat(q_start - width_starts, widths) + np.arange(int(widths.sum()), dtype=np.int64)
+        # Slices of the coordinate list stop at its end.
+        coords = coords[coords < len(self.joint_target_q)]
+        return list(map(self.joint_target_q.__getitem__, coords.tolist()))
 
     @staticmethod
     def _quat_from_axis_targets(t_x: float, t_y: float, t_z: float) -> tuple[float, float, float, float]:
@@ -10457,7 +10612,7 @@ class ModelBuilder:
             target_max_min_color_ratio=target_max_min_color_ratio,
         )
 
-    def _validate_world_ordering(self):
+    def _validate_world_ordering(self, index_arrays: _BuilderIndexArrays | None = None):
         """Validate that world indices are monotonic, contiguous, and properly ordered.
 
         This method checks:
@@ -10466,27 +10621,31 @@ class ModelBuilder:
         3. Global entities (world -1) only appear at beginning or end of arrays
         4. All world indices are in valid range [-1, world_count-1]
 
+        Args:
+            index_arrays: Shared ``int32`` conversions of the builder lists, if available.
+
         Raises:
             ValueError: If any validation check fails.
         """
+        if index_arrays is None:
+            index_arrays = _BuilderIndexArrays(self)
         # List of all world arrays to validate
         world_arrays = [
-            ("particle_world", self.particle_world),
-            ("body_world", self.body_world),
-            ("shape_world", self.shape_world),
-            ("joint_world", self.joint_world),
-            ("articulation_world", self.articulation_world),
-            ("equality_constraint_world", self._eq_list("equality_constraint_world")),
-            ("constraint_mimic_world", self.constraint_mimic_world),
+            ("particle_world", index_arrays["particle_world"]),
+            ("body_world", index_arrays["body_world"]),
+            ("shape_world", index_arrays["shape_world"]),
+            ("joint_world", index_arrays["joint_world"]),
+            ("articulation_world", index_arrays["articulation_world"]),
+            ("equality_constraint_world", np.array(self._eq_list("equality_constraint_world"), dtype=np.int32)),
+            ("constraint_mimic_world", index_arrays["constraint_mimic_world"]),
         ]
 
-        all_world_indices = set()
+        # Which world indices occur in any array, for the contiguity check.
+        world_present = np.zeros(max(self.world_count, 0), dtype=bool)
 
-        for array_name, world_array in world_arrays:
-            if not world_array:
+        for array_name, arr in world_arrays:
+            if len(arr) == 0:
                 continue
-
-            arr = np.array(world_array, dtype=np.int32)
 
             # Check for invalid world indices (must be in range [-1, world_count-1])
             max_valid = self.world_count - 1
@@ -10502,23 +10661,15 @@ class ModelBuilder:
             # Find first and last occurrence of -1
             negative_indices = np.where(arr == -1)[0]
             if len(negative_indices) > 0:
-                # Check that all -1s form contiguous blocks at start and/or end
-                # Count -1s at the start
-                start_neg_count = 0
-                for i in range(len(arr)):
-                    if arr[i] == -1:
-                        start_neg_count += 1
-                    else:
-                        break
-
-                # Count -1s at the end (but only if they don't overlap with start)
-                end_neg_count = 0
-                if start_neg_count < len(arr):  # There are non-negative values after the start block
-                    for i in range(len(arr) - 1, -1, -1):
-                        if arr[i] == -1:
-                            end_neg_count += 1
-                        else:
-                            break
+                # Check that all -1s form contiguous blocks at start and/or end:
+                # count the -1s before the first and after the last world entity.
+                world_entities = np.flatnonzero(arr != -1)
+                if len(world_entities) == 0:
+                    start_neg_count = len(arr)
+                    end_neg_count = 0
+                else:
+                    start_neg_count = int(world_entities[0])
+                    end_neg_count = len(arr) - 1 - int(world_entities[-1])
 
                 expected_neg_count = start_neg_count + end_neg_count
                 actual_neg_count = len(negative_indices)
@@ -10547,21 +10698,19 @@ class ModelBuilder:
                             )
 
                 # Collect all non-negative world indices for contiguity check
-                all_world_indices.update(non_neg_values)
+                world_present[non_neg_values] = True
 
         # Check contiguity: all world indices should form a sequence 0, 1, 2, ..., n-1
-        if all_world_indices:
-            world_list = sorted(all_world_indices)
-            expected = list(range(world_list[-1] + 1))
+        present_worlds = np.flatnonzero(world_present)
+        if len(present_worlds) > 0 and len(present_worlds) != present_worlds[-1] + 1:
+            missing = np.flatnonzero(~world_present[: present_worlds[-1] + 1]).tolist()
+            world_list = list(present_worlds.astype(np.int32))
+            raise ValueError(
+                f"World indices are not contiguous. Missing world(s): {missing}. "
+                f"Found worlds: {world_list}. Worlds must form a continuous sequence starting from 0."
+            )
 
-            if world_list != expected:
-                missing = set(expected) - set(world_list)
-                raise ValueError(
-                    f"World indices are not contiguous. Missing world(s): {sorted(missing)}. "
-                    f"Found worlds: {world_list}. Worlds must form a continuous sequence starting from 0."
-                )
-
-    def _validate_joints(self):
+    def _validate_joints(self, index_arrays: _BuilderIndexArrays | None = None):
         """Validate that joints belong to an articulation, with two exceptions.
 
         Loop-closing joints are allowed when their child is already reachable through
@@ -10569,36 +10718,32 @@ class ModelBuilder:
         allowed without articulation metadata because supported solvers can consume
         them directly or provide a topology-specific fallback.
 
+        Args:
+            index_arrays: Shared ``int32`` conversions of the builder lists, if available.
+
         Raises:
             ValueError: If any validation check fails.
         """
         if self.joint_count > 0:
-            # First, find all bodies reachable via articulated joints
-            articulated_bodies = set()
-            articulated_bodies.add(-1)  # World is always reachable
-            for i, art in enumerate(self.joint_articulation):
-                if art >= 0:  # Joint is in an articulation
-                    parent = self.joint_parent[i]
-                    child = self.joint_child[i]
-                    articulated_bodies.add(parent)
-                    articulated_bodies.add(child)
+            if index_arrays is None:
+                index_arrays = _BuilderIndexArrays(self)
+            joint_articulation = index_arrays["joint_articulation"]
+            joint_parent = index_arrays["joint_parent"]
+            joint_child = index_arrays["joint_child"]
+
+            # First, find all bodies reachable via articulated joints; the world
+            # (-1) is always reachable.
+            articulated = joint_articulation >= 0
+            articulated_bodies = np.concatenate(([-1], joint_parent[articulated], joint_child[articulated]))
 
             # Now check for true orphan joints: non-articulated joints whose child
-            # is NOT reachable via other articulated joints
-            orphan_joints = []
-            for i, art in enumerate(self.joint_articulation):
-                if art < 0:  # Joint is not in an articulation
-                    parent = self.joint_parent[i]
-                    child = self.joint_child[i]
-                    if parent == -1:
-                        # Exception: a standalone world-root joint is valid without
-                        # articulation metadata. Supported solvers consume it directly
-                        # or provide a topology-specific fallback.
-                        continue
-                    if child not in articulated_bodies:
-                        # This is a true orphan - the child body has no articulated path
-                        orphan_joints.append(i)
-                    # else: this is a loop joint - child is already reachable, so it's allowed
+            # is NOT reachable via other articulated joints. A non-articulated
+            # child that is reachable closes a loop, which is allowed. A standalone
+            # world-root joint (parent -1) is valid without articulation metadata:
+            # supported solvers consume it directly or provide a topology-specific
+            # fallback.
+            orphan_mask = ~articulated & (joint_parent != -1) & ~np.isin(joint_child, articulated_bodies)
+            orphan_joints = np.flatnonzero(orphan_mask).tolist()
 
             if orphan_joints:
                 joint_labels = [self.joint_label[i] for i in orphan_joints[:5]]  # Show first 5
@@ -10608,7 +10753,7 @@ class ModelBuilder:
                     + ("..." if len(orphan_joints) > 5 else "")
                 )
 
-    def _validate_shapes(self) -> bool:
+    def _validate_shapes(self, index_arrays: _BuilderIndexArrays | None = None) -> bool:
         """Validate shape gaps for stable broad phase detection.
 
         Margin is an outward offset from a shape's surface [m], while broad phase uses
@@ -10619,6 +10764,9 @@ class ModelBuilder:
         This check only considers shapes that participate in collisions (with the
         `COLLIDE_SHAPES` or `COLLIDE_PARTICLES` flag).
 
+        Args:
+            index_arrays: Shared ``int32`` conversions of the builder lists, if available.
+
         Warns:
             UserWarning: If any colliding shape has ``gap < 0``.
 
@@ -10627,10 +10775,17 @@ class ModelBuilder:
         """
         collision_flags_mask = ShapeFlags.COLLIDE_SHAPES | ShapeFlags.COLLIDE_PARTICLES
         shapes_with_bad_gap = []
-        for i in range(self.shape_count):
-            # Skip shapes that don't participate in any collisions (e.g., sites, visual-only)
-            if not (self.shape_flags[i] & collision_flags_mask):
-                continue
+        # Only colliding shapes that are hydroelastic or have a negative (or
+        # non-numeric, which converts to NaN) gap need the checks below; skip
+        # shapes that don't participate in any collisions (e.g., sites, visual-only).
+        if index_arrays is None:
+            index_arrays = _BuilderIndexArrays(self)
+        shape_flags = index_arrays["shape_flags"][: self.shape_count]
+        shape_gap = np.asarray(self.shape_gap[: self.shape_count], dtype=np.float64)
+        checked_shapes = ((shape_flags & collision_flags_mask) != 0) & (
+            ((shape_flags & ShapeFlags.HYDROELASTIC) != 0) | ~(shape_gap >= 0.0)
+        )
+        for i in np.flatnonzero(checked_shapes).tolist():
             margin = self.shape_margin[i]
             gap = self.shape_gap[i]
             sdf_padding = self.shape_sdf_padding[i]
@@ -10693,7 +10848,7 @@ class ModelBuilder:
             )
         return len(shapes_with_bad_gap) == 0
 
-    def _validate_structure(self) -> None:
+    def _validate_structure(self, index_arrays: _BuilderIndexArrays | None = None) -> None:
         """Validate structural invariants of the model.
 
         This method performs consolidated validation of all structural constraints,
@@ -10706,9 +10861,14 @@ class ModelBuilder:
         - Start array monotonicity: joint_q_start, joint_qd_start, articulation_start, articulation_end
         - Array length consistency: per-DOF and per-coord arrays
 
+        Args:
+            index_arrays: Shared ``int32`` conversions of the builder lists, if available.
+
         Raises:
             ValueError: If any structural validation check fails.
         """
+        if index_arrays is None:
+            index_arrays = _BuilderIndexArrays(self)
         body_count = self.body_count
         joint_count = self.joint_count
 
@@ -10718,7 +10878,7 @@ class ModelBuilder:
         if len(self.body_flags) != body_count:
             raise ValueError(f"Invalid body_flags length: expected {body_count} entries, got {len(self.body_flags)}.")
         if body_count > 0:
-            body_flags = np.array(self.body_flags, dtype=np.int32)
+            body_flags = index_arrays["body_flags"]
             valid_mask = (body_flags == int(BodyFlags.DYNAMIC)) | (body_flags == int(BodyFlags.KINEMATIC))
             if not np.all(valid_mask):
                 idx = int(np.where(~valid_mask)[0][0])
@@ -10730,7 +10890,7 @@ class ModelBuilder:
 
         # Validate shape_body references: must be in [-1, body_count-1]
         if self.shape_count > 0:
-            shape_body = np.array(self.shape_body, dtype=np.int32)
+            shape_body = index_arrays["shape_body"]
             invalid_mask = (shape_body < -1) | (shape_body >= body_count)
             if np.any(invalid_mask):
                 invalid_indices = np.where(invalid_mask)[0]
@@ -10743,7 +10903,7 @@ class ModelBuilder:
 
         # Validate joint_parent references: must be in [-1, body_count-1]
         if joint_count > 0:
-            joint_parent = np.array(self.joint_parent, dtype=np.int32)
+            joint_parent = index_arrays["joint_parent"]
             invalid_mask = (joint_parent < -1) | (joint_parent >= body_count)
             if np.any(invalid_mask):
                 invalid_indices = np.where(invalid_mask)[0]
@@ -10755,7 +10915,7 @@ class ModelBuilder:
                 )
 
             # Validate joint_child references: must be in [0, body_count-1] (child cannot be world)
-            joint_child = np.array(self.joint_child, dtype=np.int32)
+            joint_child = index_arrays["joint_child"]
             invalid_mask = (joint_child < 0) | (joint_child >= body_count)
             if np.any(invalid_mask):
                 invalid_indices = np.where(invalid_mask)[0]
@@ -10834,7 +10994,7 @@ class ModelBuilder:
 
         # Validate start array monotonicity
         if joint_count > 0:
-            joint_q_start = np.array(self.joint_q_start, dtype=np.int32)
+            joint_q_start = index_arrays["joint_q_start"]
             if len(joint_q_start) > 1:
                 diffs = np.diff(joint_q_start)
                 if np.any(diffs < 0):
@@ -10844,7 +11004,7 @@ class ModelBuilder:
                         f"joint_q_start[{idx}]={joint_q_start[idx]} > joint_q_start[{idx + 1}]={joint_q_start[idx + 1]}."
                     )
 
-            joint_qd_start = np.array(self.joint_qd_start, dtype=np.int32)
+            joint_qd_start = index_arrays["joint_qd_start"]
             if len(joint_qd_start) > 1:
                 diffs = np.diff(joint_qd_start)
                 if np.any(diffs < 0):
@@ -10861,8 +11021,8 @@ class ModelBuilder:
                     f"Invalid articulation_end length: expected {articulation_count} entries, "
                     f"got {len(self.articulation_end)}."
                 )
-            articulation_start = np.array(self.articulation_start, dtype=np.int32)
-            articulation_end = np.array(self.articulation_end, dtype=np.int32)
+            articulation_start = index_arrays["articulation_start"]
+            articulation_end = index_arrays["articulation_end"]
             if len(articulation_start) > 1:
                 diffs = np.diff(articulation_start)
                 if np.any(diffs < 0):
@@ -10910,7 +11070,8 @@ class ModelBuilder:
                 source = np.asarray(values)
                 if np.iscomplexobj(source):
                     raise ValueError
-                array = np.asarray(values, dtype=np.int64)
+                # Integer sources convert exactly; check any other source's conversion.
+                array = source.astype(np.int64) if source.dtype.kind in "biu" else np.asarray(values, dtype=np.int64)
                 if not np.array_equal(source, array):
                     raise ValueError
             except (OverflowError, TypeError, ValueError) as exc:
@@ -11084,7 +11245,7 @@ class ModelBuilder:
 
         return all_ordered
 
-    def _build_world_starts(self):
+    def _build_world_starts(self, index_arrays: _BuilderIndexArrays | None = None):
         """
         Constructs the per-world entity start indices.
 
@@ -11111,24 +11272,47 @@ class ModelBuilder:
                 body_world = [-1, -1, 0, 0, ..., 1, 1, ..., N - 1, N - 1, ..., -1, -1, -1, ...]
                 body_world_start = [2, 15, 25, ..., 50, 60, 72]
                 #          world :  -1 |  0 |  1   ... |  N-1 | -1 |  total
+
+        Args:
+            index_arrays: Shared ``int32`` conversions of the builder lists, if available.
         """
+        if index_arrays is None:
+            index_arrays = _BuilderIndexArrays(self)
+        equality_constraint_world = self._eq_list("equality_constraint_world")
         # List of all world starts of entities
         world_entity_start_arrays = [
-            (self.particle_world_start, self.particle_count, self.particle_world, "particle"),
-            (self.body_world_start, self.body_count, self.body_world, "body"),
-            (self.shape_world_start, self.shape_count, self.shape_world, "shape"),
-            (self.joint_world_start, self.joint_count, self.joint_world, "joint"),
-            (self.articulation_world_start, self.articulation_count, self.articulation_world, "articulation"),
+            (
+                self.particle_world_start,
+                self.particle_count,
+                self.particle_world,
+                index_arrays["particle_world"],
+                "particle",
+            ),
+            (self.body_world_start, self.body_count, self.body_world, index_arrays["body_world"], "body"),
+            (self.shape_world_start, self.shape_count, self.shape_world, index_arrays["shape_world"], "shape"),
+            (self.joint_world_start, self.joint_count, self.joint_world, index_arrays["joint_world"], "joint"),
+            (
+                self.articulation_world_start,
+                self.articulation_count,
+                self.articulation_world,
+                index_arrays["articulation_world"],
+                "articulation",
+            ),
             (
                 self._equality_constraint_world_start,
                 self._equality_constraint_count,
-                self._eq_list("equality_constraint_world"),
+                equality_constraint_world,
+                np.asarray(equality_constraint_world, dtype=np.int32),
                 "equality constraint",
             ),
         ]
 
         def build_entity_start_array(
-            entity_count: int, entity_world: list[int], world_entity_start: list[int], name: str
+            entity_count: int,
+            entity_world: list[int],
+            entity_world_np: np.ndarray,
+            world_entity_start: list[int],
+            name: str,
         ):
             # Ensure that entity_world has length equal to entity_count
             if len(entity_world) != entity_count:
@@ -11150,7 +11334,6 @@ class ModelBuilder:
             world_entity_start[0] = front_global_entity_count
 
             # Compute per-world cumulative counts
-            entity_world_np = np.asarray(entity_world, dtype=np.int32)
             world_counts = np.bincount(entity_world_np[entity_world_np >= 0], minlength=self.world_count)
             for w in range(self.world_count):
                 world_entity_start[w + 1] = world_entity_start[w] + int(world_counts[w])
@@ -11159,9 +11342,9 @@ class ModelBuilder:
             world_entity_start[-1] = entity_count
 
         # Check that all world offset indices are cumulative and match counts
-        for world_start_array, total_count, entity_world_array, name in world_entity_start_arrays:
+        for world_start_array, total_count, entity_world_array, entity_world_np, name in world_entity_start_arrays:
             # First build the start lists by appending tail-end global and total entity counts
-            build_entity_start_array(total_count, entity_world_array, world_start_array, name)
+            build_entity_start_array(total_count, entity_world_array, entity_world_np, world_start_array, name)
 
             # Ensure the world_start array has length world_count + 2 (for global entities at start/end)
             expected_length = self.world_count + 2
@@ -11200,54 +11383,49 @@ class ModelBuilder:
 
         # List of world starts of joints spaces, i.e. coords/DOFs/constraints
         world_joint_space_start_arrays = [
-            (self.joint_dof_world_start, self.joint_qd_start, self.joint_dof_count, "joint DOF"),
-            (self.joint_coord_world_start, self.joint_q_start, self.joint_coord_count, "joint coordinate"),
-            (self.joint_constraint_world_start, self.joint_cts_start, self.joint_constraint_count, "joint constraint"),
+            (self.joint_dof_world_start, "joint_qd_start", self.joint_dof_count, "joint DOF"),
+            (self.joint_coord_world_start, "joint_q_start", self.joint_coord_count, "joint coordinate"),
+            (self.joint_constraint_world_start, "joint_cts_start", self.joint_constraint_count, "joint constraint"),
         ]
+        joint_world = index_arrays["joint_world"]
+        joint_in_world = joint_world >= 0
+        # Joints of the global entities at the front of the joint_world array
+        world_joints = np.flatnonzero(joint_world != -1)
+        front_global_joint_count = int(world_joints[0]) if len(world_joints) > 0 else len(joint_world)
 
         def build_joint_space_start_array(
-            space_count: int, joint_space_start: list[int], world_space_start: list[int], name: str
+            space_count: int, joint_space_start_name: str, world_space_start: list[int], name: str
         ):
             # Ensure that joint_space_start has length equal to self.joint_count
+            joint_space_start = getattr(self, joint_space_start_name)
             if len(joint_space_start) != self.joint_count:
                 raise ValueError(
                     f"Joint start array for {name}s has incorrect length: "
                     f"expected {self.joint_count}, found {len(joint_space_start)}."
                 )
 
-            # Initialize world_space_start with zeros
-            world_space_start.clear()
-            world_space_start.extend([0] * (self.world_count + 2))
-
-            # Extend joint_space_start with total count to enable computing per-world counts
-            joint_space_start_ext = copy.copy(joint_space_start)
-            joint_space_start_ext.append(space_count)
+            # Extend joint_space_start with total count to enable computing per-joint counts
+            joint_space_counts = np.diff(index_arrays[joint_space_start_name].astype(np.int64), append=space_count)
+            start = np.zeros(self.world_count + 2, dtype=np.int64)
 
             # Count global entities at the front of the entity_world array
-            front_global_space_count = 0
-            for j, w in enumerate(self.joint_world):
-                if w == -1:
-                    front_global_space_count += joint_space_start_ext[j + 1] - joint_space_start_ext[j]
-                else:
-                    break
+            start[0] = joint_space_counts[:front_global_joint_count].sum()
 
-            # Compute per-world cumulative joint space counts to initialize world_space_start
-            for j, w in enumerate(self.joint_world):
-                if w >= 0:
-                    world_space_start[w + 1] += joint_space_start_ext[j + 1] - joint_space_start_ext[j]
+            # Compute per-world joint space counts to initialize world_space_start
+            np.add.at(start, joint_world[joint_in_world] + 1, joint_space_counts[joint_in_world])
 
             # Convert per-world counts to cumulative start indices
-            world_space_start[0] += front_global_space_count
-            for w in range(self.world_count):
-                world_space_start[w + 1] += world_space_start[w]
+            start[: self.world_count + 1] = np.cumsum(start[: self.world_count + 1])
 
             # Add total (i.e. final) entity counts to the per-world start indices
-            world_space_start[-1] = space_count
+            world_space_start.clear()
+            world_space_start.extend(start[:-1].tolist())
+            world_space_start.append(space_count)
 
         # Check that all world offset indices are cumulative and match counts
-        for world_start_array, space_start_array, total_count, name in world_joint_space_start_arrays:
+        for world_start_array, space_start_name, total_count, name in world_joint_space_start_arrays:
             # First finalize the start array by appending tail-end global and total entity counts
-            build_joint_space_start_array(total_count, space_start_array, world_start_array, name)
+            build_joint_space_start_array(total_count, space_start_name, world_start_array, name)
 
             # Ensure the world_start array has length world_count + 2 (for global entities at start/end)
             expected_length = self.world_count + 2
@@ -11330,21 +11508,24 @@ class ModelBuilder:
         # ensure the world count is set correctly
         self.world_count = max(1, self.world_count)
 
+        # index lists read by several passes below, converted once
+        index_arrays = _BuilderIndexArrays(self)
+
         # validate world ordering and contiguity
         if not skip_all_validations and not skip_validation_worlds:
-            self._validate_world_ordering()
+            self._validate_world_ordering(index_arrays)
 
         # validate joints belong to an articulation
         if not skip_all_validations and not skip_validation_joints:
-            self._validate_joints()
+            self._validate_joints(index_arrays)
 
         # validate shapes have valid contact margins
         if not skip_all_validations and not skip_validation_shapes:
-            self._validate_shapes()
+            self._validate_shapes(index_arrays)
 
         # validate structural invariants (body/joint references, array lengths)
         if not skip_all_validations and not skip_validation_structure:
-            self._validate_structure()
+            self._validate_structure(index_arrays)
 
         # validate DFS topological joint ordering (opt-in, skipped by default)
         if not skip_all_validations and not skip_validation_joint_ordering:
@@ -11353,7 +11534,7 @@ class ModelBuilder:
         # construct world starts by ensuring they are cumulative and appending
         # tail-end global counts and sum total counts over the entire model.
         # This method also performs relevant validation checks on the start.
-        self._build_world_starts()
+        self._build_world_starts(index_arrays)
 
         # construct particle inv masses
         ms = np.array(self.particle_mass, dtype=np.float32)
@@ -11379,7 +11560,7 @@ class ModelBuilder:
             # particles
 
             # state (initial)
-            m.particle_q = wp.array(self.particle_q, dtype=wp.vec3, requires_grad=requires_grad)
+            m.particle_q = wp.array(_array_data(self.particle_q, wp.vec3), dtype=wp.vec3, requires_grad=requires_grad)
             m.particle_qd = wp.array(self.particle_qd, dtype=wp.vec3, requires_grad=requires_grad)
             m.particle_mass = wp.array(self.particle_mass, dtype=wp.float32, requires_grad=requires_grad)
             m.particle_inv_mass = wp.array(particle_inv_mass, dtype=wp.float32, requires_grad=requires_grad)
@@ -11405,34 +11586,32 @@ class ModelBuilder:
             # collision geometry
 
             m.shape_label = self.shape_label
-            m.shape_transform = wp.array(self.shape_transform, dtype=wp.transform, requires_grad=requires_grad)
-            m.shape_body = wp.array(self.shape_body, dtype=wp.int32)
-            m.shape_flags = wp.array(self.shape_flags, dtype=wp.int32)
+            m.shape_transform = wp.array(
+                _array_data(self.shape_transform, wp.transform), dtype=wp.transform, requires_grad=requires_grad
+            )
+            m.shape_body = wp.array(index_arrays["shape_body"], dtype=wp.int32)
+            shape_flags_np = index_arrays["shape_flags"]
+            m.shape_flags = wp.array(shape_flags_np, dtype=wp.int32)
             m.body_shapes = self.body_shapes
 
-            def _shape_requests_planar_sdf(shape_idx: int) -> bool:
-                """Whether a shape needs texture SDF data for planar-faced contact."""
-                if not (self.shape_flags[shape_idx] & ShapeFlags.COLLIDE_SHAPES):
-                    return False
-                stype = self.shape_type[shape_idx]
-                if stype in (GeoType.MESH, GeoType.CONVEX_MESH):
-                    src = self.shape_source[shape_idx]
-                    return src is not None and (
-                        getattr(src, "sdf", None) is not None
-                        or self.shape_sdf_max_resolution[shape_idx] is not None
-                        or self.shape_sdf_target_voxel_size[shape_idx] is not None
-                    )
-                return stype == GeoType.BOX and (
-                    self.shape_sdf_max_resolution[shape_idx] is not None
-                    or self.shape_sdf_target_voxel_size[shape_idx] is not None
-                    or bool(self.shape_flags[shape_idx] & ShapeFlags.HYDROELASTIC)
-                )
+            # Per-shape predicates shared by the passes below; each pass visits
+            # only the shapes these select instead of every shape.
+            shape_count = len(self.shape_type)
+            shape_type_np = index_arrays["shape_type"]
+            shape_is_box = shape_type_np == GeoType.BOX
+            shape_is_mesh = (shape_type_np == GeoType.MESH) | (shape_type_np == GeoType.CONVEX_MESH)
+            shape_collides = (shape_flags_np & ShapeFlags.COLLIDE_SHAPES) != 0
+            shape_is_hydroelastic = (shape_flags_np & ShapeFlags.HYDROELASTIC) != 0
+            shape_has_source = _not_none_mask(self.shape_source)
+            shape_sdf_requested = _not_none_mask(self.shape_sdf_max_resolution) | _not_none_mask(
+                self.shape_sdf_target_voxel_size
+            )
 
             generated_shape_sources = list(self.shape_source)
             deduplicated_convex_sources = {}
-            for shape_idx, shape_type in enumerate(self.shape_type):
+            for shape_idx in np.flatnonzero(shape_type_np == GeoType.CONVEX_MESH).tolist():
                 source = generated_shape_sources[shape_idx]
-                if shape_type != GeoType.CONVEX_MESH or not isinstance(source, Mesh):
+                if not isinstance(source, Mesh):
                     continue
                 source_identity = id(source)
                 if source_identity in deduplicated_convex_sources:
@@ -11443,41 +11622,43 @@ class ModelBuilder:
                 generated_shape_sources[shape_idx] = deduplicated_source
             generated_sdf_edge_meshes = []
             unit_box_edge_mesh = None
-            for shape_idx, shape_type in enumerate(self.shape_type):
-                if shape_type == GeoType.BOX and _shape_requests_planar_sdf(shape_idx):
-                    if unit_box_edge_mesh is None:
-                        # The edge mesh is intentionally unscaled; per-shape box
-                        # half-extents are still applied through shape_scale.
-                        unit_box_edge_mesh = Mesh.create_box(
-                            1.0,
-                            1.0,
-                            1.0,
-                            duplicate_vertices=False,
-                            compute_normals=False,
-                            compute_uvs=False,
-                            compute_inertia=False,
-                        )
-                        unit_box_edge_mesh._build_collision_edges(
-                            lower_angle_threshold_rad=1.0e-6,
-                            upper_angle_threshold_rad=math.pi,
-                            enable_box_absorption=False,
-                            half_normal=0.0,
-                            half_lateral=0.0,
-                        )
-                        generated_sdf_edge_meshes.append(unit_box_edge_mesh)
-                    generated_shape_sources[shape_idx] = unit_box_edge_mesh
+            # Colliding boxes with an SDF resolution, voxel size or hydroelastic flag
+            # need texture SDF data for planar-faced contact.
+            planar_sdf_boxes = shape_is_box & shape_collides & (shape_sdf_requested | shape_is_hydroelastic)
+            for shape_idx in np.flatnonzero(planar_sdf_boxes).tolist():
+                if unit_box_edge_mesh is None:
+                    # The edge mesh is intentionally unscaled; per-shape box
+                    # half-extents are still applied through shape_scale.
+                    unit_box_edge_mesh = Mesh.create_box(
+                        1.0,
+                        1.0,
+                        1.0,
+                        duplicate_vertices=False,
+                        compute_normals=False,
+                        compute_uvs=False,
+                        compute_inertia=False,
+                    )
+                    unit_box_edge_mesh._build_collision_edges(
+                        lower_angle_threshold_rad=1.0e-6,
+                        upper_angle_threshold_rad=math.pi,
+                        enable_box_absorption=False,
+                        half_normal=0.0,
+                        half_lateral=0.0,
+                    )
+                    generated_sdf_edge_meshes.append(unit_box_edge_mesh)
+                generated_shape_sources[shape_idx] = unit_box_edge_mesh
+            generated_has_source = _not_none_mask(generated_shape_sources)
 
             # build list of ids for geometry sources (meshes, sdfs, heightfields)
+            geo_source_shapes = list(itertools.compress(range(shape_count), generated_shape_sources))
             geo_sources = []
             finalized_geos = {}  # content hash -> finalized geometry
             finalized_geos_by_identity = {}  # object id -> finalized geometry
             gaussians = []
             heightfield_meshes = []
             mesh_keep_alive = []
-            for geo in generated_shape_sources:
-                if not geo:
-                    geo_sources.append(0)
-                    continue
+            for shape_idx in geo_source_shapes:
+                geo = generated_shape_sources[shape_idx]
 
                 # Replicated builders reuse geometry objects across worlds. Use
                 # identity for that fast path, but retain content hashes so distinct
@@ -11527,42 +11708,43 @@ class ModelBuilder:
                 finalized_geo = finalized_geos[geo_hash]
                 finalized_geos_by_identity[geo_identity] = finalized_geo
                 geo_sources.append(finalized_geo)
+            shape_source_ptr = np.zeros(shape_count, dtype=np.uint64)
+            if geo_source_shapes:
+                shape_source_ptr[geo_source_shapes] = np.asarray(geo_sources, dtype=np.uint64)
 
             # Mesh properties consumed by the collision kernels: watertightness
             # is checked once per unique collidable mesh (content-keyed like
             # finalized_geos above); visual-only shapes are skipped.
-            shape_mesh_properties = []
+            shape_mesh_properties = np.zeros(shape_count, dtype=np.int32)
             mesh_properties_by_geo_hash: dict[int, int] = {}
-            for shape_type, geo, shape_flags in zip(
-                self.shape_type, generated_shape_sources, self.shape_flags, strict=True
-            ):
-                mesh_properties = 0
-                is_collidable = bool(shape_flags & (ShapeFlags.COLLIDE_SHAPES | ShapeFlags.COLLIDE_PARTICLES))
-                if is_collidable and shape_type in (GeoType.MESH, GeoType.CONVEX_MESH) and isinstance(geo, Mesh):
+            shape_is_collidable = (shape_flags_np & (ShapeFlags.COLLIDE_SHAPES | ShapeFlags.COLLIDE_PARTICLES)) != 0
+            for shape_idx in np.flatnonzero(shape_is_collidable & shape_is_mesh).tolist():
+                geo = generated_shape_sources[shape_idx]
+                if isinstance(geo, Mesh):
                     mesh_properties = mesh_properties_by_geo_hash.get(hash(geo))
                     if mesh_properties is None:
                         mesh_properties = MeshProperties.WATERTIGHT if geo.is_watertight else 0
                         mesh_properties_by_geo_hash[hash(geo)] = mesh_properties
-                shape_mesh_properties.append(mesh_properties)
+                    shape_mesh_properties[shape_idx] = mesh_properties
 
-            m.shape_type = wp.array(self.shape_type, dtype=wp.int32)
-            m.shape_source_ptr = wp.array(geo_sources, dtype=wp.uint64)
+            m.shape_type = wp.array(shape_type_np, dtype=wp.int32)
+            m.shape_source_ptr = wp.array(shape_source_ptr, dtype=wp.uint64)
             m._shape_mesh_properties = wp.array(shape_mesh_properties, dtype=wp.int32, device=device)
             m.heightfield_meshes = heightfield_meshes
             m._mesh_keep_alive = mesh_keep_alive
             m._generated_sdf_edge_meshes = generated_sdf_edge_meshes
             m.gaussians_count = len(gaussians)
             m.gaussians_data = wp.array(gaussians, dtype=Gaussian.Data)
-            m.shape_scale = wp.array(self.shape_scale, dtype=wp.vec3, requires_grad=requires_grad)
+            m.shape_scale = wp.array(_array_data(self.shape_scale, wp.vec3), dtype=wp.vec3, requires_grad=requires_grad)
             m.shape_is_solid = wp.array(self.shape_is_solid, dtype=wp.bool)
             m.shape_margin = wp.array(self.shape_margin, dtype=wp.float32, requires_grad=requires_grad)
             m.shape_collision_radius = wp.array(
                 self.shape_collision_radius, dtype=wp.float32, requires_grad=requires_grad
             )
-            m.shape_world = wp.array(self.shape_world, dtype=wp.int32)
+            m.shape_world = wp.array(index_arrays["shape_world"], dtype=wp.int32)
 
             m.shape_source = self.shape_source  # used for rendering
-            m.shape_color = wp.array(self.shape_color, dtype=wp.vec3)
+            m.shape_color = wp.array(_array_data(self.shape_color, wp.vec3), dtype=wp.vec3)
 
             m.shape_material_ke = wp.array(self.shape_material_ke, dtype=wp.float32, requires_grad=requires_grad)
             m.shape_material_kd = wp.array(self.shape_material_kd, dtype=wp.float32, requires_grad=requires_grad)
@@ -11581,20 +11763,13 @@ class ModelBuilder:
             m.shape_material_kh = wp.array(self.shape_material_kh, dtype=wp.float32, requires_grad=requires_grad)
             m.shape_gap = wp.array(self.shape_gap, dtype=wp.float32, requires_grad=requires_grad)
 
-            m.shape_collision_group = wp.array(self.shape_collision_group, dtype=wp.int32)
+            m.shape_collision_group = wp.array(index_arrays["shape_collision_group"], dtype=wp.int32)
 
             # ---------------------
             # Compute local AABBs and voxel resolutions for contact reduction
-            local_aabb_lower = []
-            local_aabb_upper = []
-            voxel_resolution = []
             from ..geometry.contact_reduction import NUM_VOXEL_DEPTH_SLOTS  # noqa: PLC0415
 
             voxel_budget = NUM_VOXEL_DEPTH_SLOTS
-
-            # Cache per unique (shape_type, shape_params, margin) to avoid redundant AABB computation
-            # for instanced shapes (e.g., 256 robots sharing the same shape parameters)
-            shape_aabb_cache = {}
 
             def compute_voxel_resolution_from_aabb(aabb_lower, aabb_upper, voxel_budget):
                 """Compute voxel resolution from AABB with given budget."""
@@ -11625,17 +11800,25 @@ class ModelBuilder:
                 return nx, ny, nz
 
             site_display_size_attr = self.custom_attributes.get("mujoco:site_size_is_display")
+            # Compute each unique (shape_type, shape_params) entry once and gather the
+            # per-shape rows, avoiding redundant AABB computation for instanced shapes
+            # (e.g., 256 robots sharing the same shape parameters).
+            shape_aabb_cache = {}  # cache key -> index into shape_aabb_entries
+            shape_aabb_entries = []  # (aabb_lower, aabb_upper, voxel resolution)
+            shape_aabb_entry = []  # per shape
+            # Enum lookups hoisted out of the per-shape key computation.
+            mesh_type, convex_mesh_type, cylinder_type = GeoType.MESH, GeoType.CONVEX_MESH, GeoType.CYLINDER
             for _shape_idx, (shape_type, shape_src, shape_scale) in enumerate(
                 zip(self.shape_type, self.shape_source, self.shape_scale, strict=True)
             ):
-                site_size_is_display = bool(
+                site_size_is_display = shape_type == cylinder_type and bool(
                     site_display_size_attr
                     and site_display_size_attr.values.get(_shape_idx, site_display_size_attr.default)
                 )
                 # Create cache key based on shape type and parameters
-                if (shape_type == GeoType.MESH or shape_type == GeoType.CONVEX_MESH) and shape_src is not None:
+                if (shape_type == mesh_type or shape_type == convex_mesh_type) and shape_src is not None:
                     cache_key = (shape_type, id(shape_src), tuple(shape_scale))
-                elif shape_type == GeoType.CYLINDER and site_size_is_display:
+                elif site_size_is_display:
                     # MuJoCo cylinder sites may carry an unused third display-size component.
                     # It is not Newton's barrel radius and does not affect their bounds.
                     cache_key = (shape_type, (shape_scale[0], shape_scale[1], 0.0))
@@ -11643,9 +11826,8 @@ class ModelBuilder:
                     cache_key = (shape_type, tuple(shape_scale))
 
                 # Check cache first
-                if cache_key in shape_aabb_cache:
-                    aabb_lower, aabb_upper, nx, ny, nz = shape_aabb_cache[cache_key]
-                else:
+                entry = shape_aabb_cache.get(cache_key)
+                if entry is None:
                     # Compute AABB based on shape type
                     if shape_type == GeoType.MESH and shape_src is not None:
                         # Compute local AABB from mesh vertices
@@ -11732,49 +11914,49 @@ class ModelBuilder:
                         nx, ny, nz = 1, 1, 1
 
                     # Cache the result for reuse by identical shapes
-                    shape_aabb_cache[cache_key] = (aabb_lower, aabb_upper, nx, ny, nz)
+                    entry = shape_aabb_cache[cache_key] = len(shape_aabb_entries)
+                    shape_aabb_entries.append((aabb_lower, aabb_upper, [nx, ny, nz]))
 
-                local_aabb_lower.append(aabb_lower)
-                local_aabb_upper.append(aabb_upper)
-                voxel_resolution.append([nx, ny, nz])
+                shape_aabb_entry.append(entry)
 
-            m.shape_collision_aabb_lower = wp.array(local_aabb_lower, dtype=wp.vec3, device=device)
-            m.shape_collision_aabb_upper = wp.array(local_aabb_upper, dtype=wp.vec3, device=device)
-            m._shape_voxel_resolution = wp.array(voxel_resolution, dtype=wp.vec3i, device=device)
+            shape_aabb_entry = np.asarray(shape_aabb_entry, dtype=np.intp)
+            local_aabb_lower = np.asarray([entry[0] for entry in shape_aabb_entries], dtype=np.float32)
+            local_aabb_upper = np.asarray([entry[1] for entry in shape_aabb_entries], dtype=np.float32)
+            voxel_resolution = np.asarray([entry[2] for entry in shape_aabb_entries], dtype=np.int32)
+            m.shape_collision_aabb_lower = wp.array(local_aabb_lower[shape_aabb_entry], dtype=wp.vec3, device=device)
+            m.shape_collision_aabb_upper = wp.array(local_aabb_upper[shape_aabb_entry], dtype=wp.vec3, device=device)
+            m._shape_voxel_resolution = wp.array(voxel_resolution[shape_aabb_entry], dtype=wp.vec3i, device=device)
 
             # ---------------------
             # Compute and compact texture SDF resources (shared table + per-shape index indirection)
             current_device = wp.get_device(device)
             is_gpu = current_device.is_cuda
 
-            has_mesh_sdf = any(
-                stype in (GeoType.MESH, GeoType.CONVEX_MESH)
-                and ssrc is not None
-                and sflags & ShapeFlags.COLLIDE_SHAPES
-                and getattr(ssrc, "sdf", None) is not None
-                for stype, ssrc, sflags in zip(self.shape_type, self.shape_source, self.shape_flags, strict=True)
-            )
+            # Colliding mesh shapes whose source carries an SDF, checked once per
+            # (shared) source object.
+            colliding_mesh_shapes = np.flatnonzero(shape_is_mesh & shape_has_source & shape_collides)
+            source_has_sdf = {}
+            mesh_has_sdf = []
+            for shape_idx in colliding_mesh_shapes.tolist():
+                source = self.shape_source[shape_idx]
+                has_sdf = source_has_sdf.get(id(source))
+                if has_sdf is None:
+                    has_sdf = source_has_sdf[id(source)] = getattr(source, "sdf", None) is not None
+                mesh_has_sdf.append(has_sdf)
+            shape_mesh_has_sdf = np.zeros(shape_count, dtype=bool)
+            shape_mesh_has_sdf[colliding_mesh_shapes] = mesh_has_sdf
+
+            has_mesh_sdf = bool(shape_mesh_has_sdf.any())
             # Catch meshes whose SDF is still deferred (built during finalize) so
             # the CPU-runs-into-build_sdf path also raises here, not deeper down.
             has_deferred_mesh_sdf = any(
-                stype in (GeoType.MESH, GeoType.CONVEX_MESH, GeoType.BOX)
-                and ssrc is not None
-                and sflags & ShapeFlags.COLLIDE_SHAPES
-                and (stype == GeoType.BOX or getattr(ssrc, "sdf", None) is None)
-                and (smax is not None or svox is not None)
-                for stype, ssrc, sflags, smax, svox in zip(
-                    self.shape_type,
-                    generated_shape_sources,
-                    self.shape_flags,
-                    self.shape_sdf_max_resolution,
-                    self.shape_sdf_target_voxel_size,
-                    strict=True,
-                )
+                shape_type_np[shape_idx] == GeoType.BOX
+                or getattr(generated_shape_sources[shape_idx], "sdf", None) is None
+                for shape_idx in np.flatnonzero(
+                    (shape_is_mesh | shape_is_box) & generated_has_source & shape_collides & shape_sdf_requested
+                ).tolist()
             )
-            has_hydroelastic_shapes = any(
-                (sflags & ShapeFlags.HYDROELASTIC) and (sflags & ShapeFlags.COLLIDE_SHAPES)
-                for sflags in self.shape_flags
-            )
+            has_hydroelastic_shapes = bool(np.any(shape_is_hydroelastic & shape_collides))
             if (has_mesh_sdf or has_deferred_mesh_sdf or has_hydroelastic_shapes) and not is_gpu:
                 raise ValueError(
                     "Building texture SDFs requires a CUDA-capable GPU device. "
@@ -11800,7 +11982,7 @@ class ModelBuilder:
             compact_texture_sdf_coarse_textures = []
             compact_texture_sdf_subgrid_textures = []
             compact_texture_sdf_subgrid_start_slots = []
-            shape_sdf_index = [-1] * len(self.shape_type)
+            shape_sdf_index = np.full(shape_count, -1, dtype=np.int32)
             sdf_cache = {}
             # Deferred-mesh SDFs are built into a temporary Mesh clone keyed by
             # the parameter tuple. This avoids mutating the user's shared Mesh
@@ -11811,7 +11993,14 @@ class ModelBuilder:
             deferred_collision_edges_cache: dict[tuple, Any] = {}
             deferred_collision_edges: dict[int, Any] = {}
 
-            for i in range(len(self.shape_type)):
+            # Only colliding meshes with an attached or requested SDF, hydroelastic
+            # shapes and boxes with a requested SDF get texture SDF data.
+            texture_sdf_shapes = shape_collides & (
+                (shape_is_mesh & shape_has_source & (shape_mesh_has_sdf | shape_sdf_requested))
+                | shape_is_hydroelastic
+                | (shape_is_box & shape_sdf_requested)
+            )
+            for i in np.flatnonzero(texture_sdf_shapes).tolist():
                 shape_type = self.shape_type[i]
                 shape_src = self.shape_source[i]
                 shape_flags = self.shape_flags[i]
@@ -11963,25 +12152,16 @@ class ModelBuilder:
             # and cached per source mesh; eval_shape_sdf applies the shape scale at query time. Texture
             # SDFs are CUDA-only, so on CPU (or on any build failure) the SDF is left unprovisioned; a
             # full-surface CollisionPipeline then raises for that shape rather than silently degrading.
-            if any(
-                self.shape_force_sdf[i]
-                or self.shape_sdf_max_resolution[i] is not None
-                or self.shape_sdf_target_voxel_size[i] is not None
-                for i in range(len(self.shape_type))
-            ):
+            shape_full_surface_sdf = shape_sdf_requested | np.fromiter(
+                map(bool, self.shape_force_sdf), dtype=bool, count=len(self.shape_force_sdf)
+            )
+            if shape_full_surface_sdf.any():
                 wt_sdf_cache = {}
-                for i in range(len(self.shape_type)):
-                    if (
-                        shape_sdf_index[i] >= 0
-                        or self.shape_type[i] not in (GeoType.MESH, GeoType.CONVEX_MESH)
-                        or not (self.shape_flags[i] & ShapeFlags.COLLIDE_PARTICLES)
-                        or self.shape_source[i] is None
-                        or not (
-                            self.shape_force_sdf[i]
-                            or self.shape_sdf_max_resolution[i] is not None
-                            or self.shape_sdf_target_voxel_size[i] is not None
-                        )
-                    ):
+                shape_collides_particles = (shape_flags_np & ShapeFlags.COLLIDE_PARTICLES) != 0
+                for i in np.flatnonzero(
+                    shape_full_surface_sdf & shape_is_mesh & shape_collides_particles & shape_has_source
+                ).tolist():
+                    if shape_sdf_index[i] >= 0:
                         continue
                     src = self.shape_source[i]
                     sdf_padding_i = self.shape_sdf_padding[i]
@@ -12050,7 +12230,8 @@ class ModelBuilder:
 
             # ---------------------
             # heightfield collision data
-            hfield_count = sum(1 for t in self.shape_type if t == GeoType.HFIELD)
+            shape_is_hfield = shape_type_np == GeoType.HFIELD
+            hfield_count = int(np.count_nonzero(shape_is_hfield))
             m.heightfield_count = hfield_count
             if hfield_count > 1:
                 warnings.warn(
@@ -12062,34 +12243,32 @@ class ModelBuilder:
 
             compact_heightfield_data = []
             elevation_chunks = []
-            shape_heightfield_index = [-1] * len(self.shape_type)
+            shape_heightfield_index = np.full(shape_count, -1, dtype=np.int32)
             offset = 0
-            if hfield_count > 0:
-                for i in range(len(self.shape_type)):
-                    if self.shape_type[i] == GeoType.HFIELD and self.shape_source[i] is not None:
-                        hf = self.shape_source[i]
-                        hd = HeightfieldData()
-                        hd.data_offset = offset
-                        hd.nrow = hf.nrow
-                        hd.ncol = hf.ncol
-                        # Bake the per-instance scale into the extents so narrow-phase
-                        # collision (which reads from HeightfieldData) apply
-                        # scale consistently. ``abs`` on hx/hy because the
-                        # parallel-slab checks assume non-negative planar extents;
-                        # z uses raw multiplication so ``sz < 0`` inverts the surface
-                        # (``min_z > max_z`` already encodes an inverted heightfield).
-                        sx, sy, sz = self.shape_scale[i]
-                        hd.hx = abs(hf.hx * sx)
-                        hd.hy = abs(hf.hy * sy)
-                        hd.min_z = hf.min_z * sz
-                        hd.max_z = hf.max_z * sz
-                        shape_heightfield_index[i] = len(compact_heightfield_data)
-                        compact_heightfield_data.append(hd)
-                        elevation_chunks.append(hf.data.flatten())
-                        offset += hf.nrow * hf.ncol
+            for i in np.flatnonzero(shape_is_hfield & shape_has_source).tolist():
+                hf = self.shape_source[i]
+                hd = HeightfieldData()
+                hd.data_offset = offset
+                hd.nrow = hf.nrow
+                hd.ncol = hf.ncol
+                # Bake the per-instance scale into the extents so narrow-phase
+                # collision (which reads from HeightfieldData) apply
+                # scale consistently. ``abs`` on hx/hy because the
+                # parallel-slab checks assume non-negative planar extents;
+                # z uses raw multiplication so ``sz < 0`` inverts the surface
+                # (``min_z > max_z`` already encodes an inverted heightfield).
+                sx, sy, sz = self.shape_scale[i]
+                hd.hx = abs(hf.hx * sx)
+                hd.hy = abs(hf.hy * sy)
+                hd.min_z = hf.min_z * sz
+                hd.max_z = hf.max_z * sz
+                shape_heightfield_index[i] = len(compact_heightfield_data)
+                compact_heightfield_data.append(hd)
+                elevation_chunks.append(hf.data.flatten())
+                offset += hf.nrow * hf.ncol
 
             m.shape_heightfield_index = wp.array(
-                shape_heightfield_index if shape_heightfield_index else [-1],
+                shape_heightfield_index if shape_count > 0 else [-1],
                 dtype=wp.int32,
                 device=device,
             )
@@ -12107,75 +12286,76 @@ class ModelBuilder:
             # ---------------------
             # mesh edges (packed array + per-shape slice)
 
-            shape_edge_ranges = []
+            edge_shapes = np.flatnonzero((shape_is_mesh | shape_is_box) & generated_has_source & shape_collides)
+            shape_edge_ranges = []  # per shape in edge_shapes
             edge_chunks = []
             edge_center_chunks = []
             edge_half_chunks = []
             edge_offset = 0
             edge_cache = {}  # mesh python id → (start, count)
+            scale_cache = {}  # scale python id → (float32 scale, scale key)
 
-            for i in range(len(self.shape_type)):
-                if (
-                    self.shape_type[i] in (GeoType.MESH, GeoType.CONVEX_MESH, GeoType.BOX)
-                    and generated_shape_sources[i] is not None
-                    and (self.shape_flags[i] & ShapeFlags.COLLIDE_SHAPES)
-                ):
-                    mesh = generated_shape_sources[i]
-                    shape_scale = np.asarray(self.shape_scale[i], dtype=np.float32)
-                    scale_key = tuple(float(value) for value in shape_scale)
-                    deferred_edges = deferred_collision_edges.get(i)
-                    if deferred_edges is not None:
-                        mesh_key = ("deferred", id(deferred_edges), scale_key)
-                    else:
-                        mesh_key = (id(mesh), scale_key)
-                    if mesh_key in edge_cache:
-                        shape_edge_ranges.append(edge_cache[mesh_key])
-                    else:
-                        # ``Mesh.build_sdf()`` caches a simplified edge set on
-                        # the mesh for SDF-mesh contact generation; fall back
-                        # to the full edge list otherwise.
-                        if deferred_edges is not None:
-                            edges = deferred_edges
-                        elif mesh._collision_edges is not None:
-                            edges = mesh._collision_edges
-                        else:
-                            edges = mesh.edges  # lazily computed and cached on the Mesh
-                        start = edge_offset
-                        count = len(edges)
-                        edge_chunks.append(edges)
-                        if count > 0:
-                            vertices = np.asarray(mesh.vertices, dtype=np.float32) * shape_scale
-                            edge_v0 = vertices[edges[:, 0]]
-                            edge_v1 = vertices[edges[:, 1]]
-                            edge_halves = np.ascontiguousarray((edge_v1 - edge_v0) * 0.5, dtype=np.float32)
-                            edge_centers = np.ascontiguousarray((edge_v0 + edge_v1) * 0.5, dtype=np.float32)
-                            edge_radii = np.linalg.norm(edge_halves, axis=1, keepdims=True)
-                            canonical_edges = mesh._canonical_vertex_ids()[edges].reshape(-1)
-                            endpoint_indices = np.arange(2 * count, dtype=np.int64)
-                            first_endpoint = np.full(int(canonical_edges.max()) + 1, 2 * count, dtype=np.int64)
-                            np.minimum.at(first_endpoint, canonical_edges, endpoint_indices)
-                            owns_endpoint = (first_endpoint[canonical_edges] == endpoint_indices).reshape(-1, 2)
-                            # Zero remains the legacy "both endpoints owned" encoding.
-                            corner_ownership = (
-                                4.0 + owns_endpoint[:, 0].astype(np.float32) + 2.0 * owns_endpoint[:, 1]
-                            ).reshape(-1, 1)
-                            edge_center_chunks.append(
-                                np.ascontiguousarray(
-                                    np.concatenate((edge_centers, edge_radii), axis=1), dtype=np.float32
-                                )
-                            )
-                            edge_half_chunks.append(
-                                np.ascontiguousarray(np.concatenate((edge_halves, corner_ownership), axis=1))
-                            )
-                        edge_offset += count
-                        entry = (start, count)
-                        edge_cache[mesh_key] = entry
-                        shape_edge_ranges.append(entry)
+            for i in edge_shapes.tolist():
+                mesh = generated_shape_sources[i]
+                # Replicated shapes share scale objects; convert each one once.
+                scale = self.shape_scale[i]
+                cached_scale = scale_cache.get(id(scale))
+                if cached_scale is None:
+                    shape_scale = np.asarray(scale, dtype=np.float32)
+                    cached_scale = scale_cache[id(scale)] = (shape_scale, tuple(float(value) for value in shape_scale))
+                shape_scale, scale_key = cached_scale
+                deferred_edges = deferred_collision_edges.get(i)
+                if deferred_edges is not None:
+                    mesh_key = ("deferred", id(deferred_edges), scale_key)
                 else:
-                    shape_edge_ranges.append((-1, 0))
+                    mesh_key = (id(mesh), scale_key)
+                if mesh_key in edge_cache:
+                    shape_edge_ranges.append(edge_cache[mesh_key])
+                else:
+                    # ``Mesh.build_sdf()`` caches a simplified edge set on
+                    # the mesh for SDF-mesh contact generation; fall back
+                    # to the full edge list otherwise.
+                    if deferred_edges is not None:
+                        edges = deferred_edges
+                    elif mesh._collision_edges is not None:
+                        edges = mesh._collision_edges
+                    else:
+                        edges = mesh.edges  # lazily computed and cached on the Mesh
+                    start = edge_offset
+                    count = len(edges)
+                    edge_chunks.append(edges)
+                    if count > 0:
+                        vertices = np.asarray(mesh.vertices, dtype=np.float32) * shape_scale
+                        edge_v0 = vertices[edges[:, 0]]
+                        edge_v1 = vertices[edges[:, 1]]
+                        edge_halves = np.ascontiguousarray((edge_v1 - edge_v0) * 0.5, dtype=np.float32)
+                        edge_centers = np.ascontiguousarray((edge_v0 + edge_v1) * 0.5, dtype=np.float32)
+                        edge_radii = np.linalg.norm(edge_halves, axis=1, keepdims=True)
+                        canonical_edges = mesh._canonical_vertex_ids()[edges].reshape(-1)
+                        endpoint_indices = np.arange(2 * count, dtype=np.int64)
+                        first_endpoint = np.full(int(canonical_edges.max()) + 1, 2 * count, dtype=np.int64)
+                        np.minimum.at(first_endpoint, canonical_edges, endpoint_indices)
+                        owns_endpoint = (first_endpoint[canonical_edges] == endpoint_indices).reshape(-1, 2)
+                        # Zero remains the legacy "both endpoints owned" encoding.
+                        corner_ownership = (
+                            4.0 + owns_endpoint[:, 0].astype(np.float32) + 2.0 * owns_endpoint[:, 1]
+                        ).reshape(-1, 1)
+                        edge_center_chunks.append(
+                            np.ascontiguousarray(np.concatenate((edge_centers, edge_radii), axis=1), dtype=np.float32)
+                        )
+                        edge_half_chunks.append(
+                            np.ascontiguousarray(np.concatenate((edge_halves, corner_ownership), axis=1))
+                        )
+                    edge_offset += count
+                    entry = (start, count)
+                    edge_cache[mesh_key] = entry
+                    shape_edge_ranges.append(entry)
 
+            shape_edge_range = np.full((shape_count, 2), (-1, 0), dtype=np.int32)
+            if len(edge_shapes) > 0:
+                shape_edge_range[edge_shapes] = np.asarray(shape_edge_ranges, dtype=np.int32)
             m.shape_edge_range = wp.array(
-                shape_edge_ranges if shape_edge_ranges else [(-1, 0)],
+                shape_edge_range if shape_count > 0 else [(-1, 0)],
                 dtype=wp.vec2i,
                 device=device,
             )
@@ -12201,7 +12381,7 @@ class ModelBuilder:
             def _to_wp_array(data, dtype, requires_grad):
                 if len(data) == 0:
                     return None
-                return wp.array(data, dtype=dtype, requires_grad=requires_grad)
+                return wp.array(_array_data(data, dtype), dtype=dtype, requires_grad=requires_grad)
 
             m.spring_indices = _to_wp_array(self.spring_indices, wp.int32, requires_grad=False)
             m.spring_rest_length = _to_wp_array(self.spring_rest_length, wp.float32, requires_grad=requires_grad)
@@ -12221,7 +12401,8 @@ class ModelBuilder:
             # ---------------------
             # edges
 
-            m.edge_indices = _to_wp_array(self.edge_indices, wp.int32, requires_grad=False)
+            edge_indices_data = _array_data(self.edge_indices, wp.int32)
+            m.edge_indices = _to_wp_array(edge_indices_data, wp.int32, requires_grad=False)
             m.edge_rest_angle = _to_wp_array(self.edge_rest_angle, wp.float32, requires_grad=requires_grad)
             m.edge_rest_length = _to_wp_array(self.edge_rest_length, wp.float32, requires_grad=requires_grad)
             m.edge_bending_properties = _to_wp_array(
@@ -12231,7 +12412,7 @@ class ModelBuilder:
             # keep the builder's edge numbering (it stays aligned with the bending materials) and
             # derive the edge/triangle maps against the final triangles.
             edge_indices = (
-                np.array(self.edge_indices, dtype=np.int32).reshape(-1, 4)
+                np.array(edge_indices_data, dtype=np.int32).reshape(-1, 4)
                 if self.edge_indices
                 else np.empty((0, 4), dtype=np.int32)
             )
@@ -12314,15 +12495,21 @@ class ModelBuilder:
                     # Create arrays from corrected copies
                     m.body_mass = wp.array(corrected_mass, dtype=wp.float32, requires_grad=requires_grad)
                     m.body_inv_mass = wp.array(corrected_inv_mass, dtype=wp.float32, requires_grad=requires_grad)
-                    m.body_inertia = wp.array(corrected_inertia, dtype=wp.mat33, requires_grad=requires_grad)
-                    m.body_inv_inertia = wp.array(corrected_inv_inertia, dtype=wp.mat33, requires_grad=requires_grad)
+                    m.body_inertia = wp.array(
+                        _array_data(corrected_inertia, wp.mat33), dtype=wp.mat33, requires_grad=requires_grad
+                    )
+                    m.body_inv_inertia = wp.array(
+                        _array_data(corrected_inv_inertia, wp.mat33), dtype=wp.mat33, requires_grad=requires_grad
+                    )
                 else:
                     # Use fast Warp kernel validation
                     body_mass_array = wp.array(self.body_mass, dtype=wp.float32, requires_grad=requires_grad)
-                    body_inertia_array = wp.array(self.body_inertia, dtype=wp.mat33, requires_grad=requires_grad)
+                    body_inertia_array = wp.array(
+                        _array_data(self.body_inertia, wp.mat33), dtype=wp.mat33, requires_grad=requires_grad
+                    )
                     body_inv_mass_array = wp.array(self.body_inv_mass, dtype=wp.float32, requires_grad=requires_grad)
                     body_inv_inertia_array = wp.array(
-                        self.body_inv_inertia, dtype=wp.mat33, requires_grad=requires_grad
+                        _array_data(self.body_inv_inertia, wp.mat33), dtype=wp.mat33, requires_grad=requires_grad
                     )
                     correction_count = wp.zeros(1, dtype=wp.int32)
 
@@ -12365,12 +12552,14 @@ class ModelBuilder:
                 m.body_inertia = wp.array(self.body_inertia, dtype=wp.mat33, requires_grad=requires_grad)
                 m.body_inv_inertia = wp.array(self.body_inv_inertia, dtype=wp.mat33, requires_grad=requires_grad)
 
-            m.body_q = wp.array(self.body_q, dtype=wp.transform, requires_grad=requires_grad)
-            m.body_qd = wp.array(self.body_qd, dtype=wp.spatial_vector, requires_grad=requires_grad)
-            m.body_com = wp.array(self.body_com, dtype=wp.vec3, requires_grad=requires_grad)
+            m.body_q = wp.array(_array_data(self.body_q, wp.transform), dtype=wp.transform, requires_grad=requires_grad)
+            m.body_qd = wp.array(
+                _array_data(self.body_qd, wp.spatial_vector), dtype=wp.spatial_vector, requires_grad=requires_grad
+            )
+            m.body_com = wp.array(_array_data(self.body_com, wp.vec3), dtype=wp.vec3, requires_grad=requires_grad)
             m.body_label = self.body_label
-            m.body_flags = wp.array(self.body_flags, dtype=wp.int32)
-            m.body_world = wp.array(self.body_world, dtype=wp.int32)
+            m.body_flags = wp.array(index_arrays["body_flags"], dtype=wp.int32)
+            m.body_world = wp.array(index_arrays["body_world"], dtype=wp.int32)
 
             # body colors
             if self.body_color_groups:
@@ -12381,34 +12570,42 @@ class ModelBuilder:
                 m.body_color_groups = [wp.array(group, dtype=int) for group in self.body_color_groups]
 
             # joints
-            m._has_rod_joints = JointType.ROD in self.joint_type  # pyright: ignore[reportPrivateUsage]
-            m.joint_type = wp.array(self.joint_type, dtype=wp.int32)
-            m.joint_parent = wp.array(self.joint_parent, dtype=wp.int32)
-            m.joint_child = wp.array(self.joint_child, dtype=wp.int32)
-            m.joint_X_p = wp.array(self.joint_X_p, dtype=wp.transform, requires_grad=requires_grad)
-            m.joint_X_c = wp.array(self.joint_X_c, dtype=wp.transform, requires_grad=requires_grad)
-            m.joint_dof_dim = wp.array(np.array(self.joint_dof_dim), dtype=wp.int32, ndim=2)
-            m.joint_axis = wp.array(self.joint_axis, dtype=wp.vec3, requires_grad=requires_grad)
+            joint_type_np = index_arrays["joint_type"]
+            joint_parent_np = index_arrays["joint_parent"]
+            joint_child_np = index_arrays["joint_child"]
+            m._has_rod_joints = bool(np.any(joint_type_np == JointType.ROD))  # pyright: ignore[reportPrivateUsage]
+            m.joint_type = wp.array(joint_type_np, dtype=wp.int32)
+            m.joint_parent = wp.array(joint_parent_np, dtype=wp.int32)
+            m.joint_child = wp.array(joint_child_np, dtype=wp.int32)
+            m.joint_X_p = wp.array(
+                _array_data(self.joint_X_p, wp.transform), dtype=wp.transform, requires_grad=requires_grad
+            )
+            m.joint_X_c = wp.array(
+                _array_data(self.joint_X_c, wp.transform), dtype=wp.transform, requires_grad=requires_grad
+            )
+            joint_dof_dim_np = np.array(_array_data(self.joint_dof_dim, wp.int32))
+            m.joint_dof_dim = wp.array(joint_dof_dim_np, dtype=wp.int32, ndim=2)
+            m.joint_axis = wp.array(_array_data(self.joint_axis, wp.vec3), dtype=wp.vec3, requires_grad=requires_grad)
             m.joint_q = wp.array(self.joint_q, dtype=wp.float32, requires_grad=requires_grad)
             m.joint_qd = wp.array(self.joint_qd, dtype=wp.float32, requires_grad=requires_grad)
             m.joint_label = self.joint_label
-            m.joint_world = wp.array(self.joint_world, dtype=wp.int32)
-            # compute joint ancestors
-            child_to_joint = {}
-            for i, child in enumerate(self.joint_child):
-                # The first inbound joint defines the articulation tree. Later
-                # inbound joints close loops and must not replace that tree edge,
-                # otherwise ancestor walks can cycle indefinitely.
-                child_to_joint.setdefault(child, i)
-            parent_joint = []
-            for parent in self.joint_parent:
-                parent_joint.append(child_to_joint.get(parent, -1))
-            m.joint_ancestor = wp.array(parent_joint, dtype=wp.int32)
-            m.joint_articulation = wp.array(self.joint_articulation, dtype=wp.int32)
+            m.joint_world = wp.array(index_arrays["joint_world"], dtype=wp.int32)
+            # compute joint ancestors: the joint whose child is this joint's parent.
+            # The first inbound joint defines the articulation tree. Later
+            # inbound joints close loops and must not replace that tree edge,
+            # otherwise ancestor walks can cycle indefinitely.
+            child_bodies, tree_joints = np.unique(joint_child_np, return_index=True)
+            joint_ancestor = np.full(len(joint_parent_np), -1, dtype=np.int32)
+            if len(child_bodies) > 0:
+                slots = np.minimum(np.searchsorted(child_bodies, joint_parent_np), len(child_bodies) - 1)
+                has_ancestor = child_bodies[slots] == joint_parent_np
+                joint_ancestor[has_ancestor] = tree_joints[slots[has_ancestor]]
+            m.joint_ancestor = wp.array(joint_ancestor, dtype=wp.int32)
+            m.joint_articulation = wp.array(index_arrays["joint_articulation"], dtype=wp.int32)
 
             # dynamics properties
             m.joint_armature = wp.array(self.joint_armature, dtype=wp.float32, requires_grad=requires_grad)
-            m.joint_target_mode = wp.array(self.joint_target_mode, dtype=wp.int32)
+            m.joint_target_mode = wp.array(_array_data(self.joint_target_mode, wp.int32), dtype=wp.int32)
             m.joint_target_ke = wp.array(self.joint_target_ke, dtype=wp.float32, requires_grad=requires_grad)
             m.joint_target_kd = wp.array(self.joint_target_kd, dtype=wp.float32, requires_grad=requires_grad)
             m.joint_damping = wp.array(self.joint_damping, dtype=wp.float32, requires_grad=requires_grad)
@@ -12428,7 +12625,9 @@ class ModelBuilder:
                         DeprecationWarning,
                         stacklevel=2,
                     )
-                target_q_values = self._project_target_q_to_dof()
+                target_q_values = self._project_target_q_to_dof(
+                    joint_dof_dim=joint_dof_dim_np, index_arrays=index_arrays
+                )
             m.joint_target_q = wp.array(target_q_values, dtype=wp.float32, requires_grad=requires_grad)
             m.joint_target_qd = wp.array(self.joint_target_qd, dtype=wp.float32, requires_grad=requires_grad)
             m.joint_f = wp.array(self.joint_f, dtype=wp.float32, requires_grad=requires_grad)
@@ -12448,10 +12647,8 @@ class ModelBuilder:
             m.joint_enabled = wp.array(self.joint_enabled, dtype=wp.bool)
 
             # 'close' the start index arrays with a sentinel value
-            joint_q_start = copy.copy(self.joint_q_start)
-            joint_q_start.append(self.joint_coord_count)
-            joint_qd_start = copy.copy(self.joint_qd_start)
-            joint_qd_start.append(self.joint_dof_count)
+            joint_q_start = np.append(index_arrays["joint_q_start"], np.int32(self.joint_coord_count))
+            joint_qd_start = np.append(index_arrays["joint_qd_start"], np.int32(self.joint_dof_count))
             articulation_start = copy.copy(self.articulation_start)
             articulation_start.append(self.joint_count)
             articulation_end = copy.copy(self.articulation_end)
@@ -12459,16 +12656,14 @@ class ModelBuilder:
             # Compute max joints and dofs per articulation for IK/Jacobian kernel launches
             max_joints_per_articulation = 0
             max_dofs_per_articulation = 0
-            for art_idx in range(len(self.articulation_start)):
-                joint_start = articulation_start[art_idx]
-                joint_end = articulation_end[art_idx]
-                num_joints = joint_end - joint_start
-                max_joints_per_articulation = max(max_joints_per_articulation, num_joints)
-                # Compute dofs for this articulation
-                dof_start = joint_qd_start[joint_start]
-                dof_end = joint_qd_start[joint_end]
-                num_dofs = dof_end - dof_start
-                max_dofs_per_articulation = max(max_dofs_per_articulation, num_dofs)
+            if self.articulation_start:
+                art_joint_start = np.asarray(self.articulation_start, dtype=np.int64)
+                art_joint_end = np.asarray(articulation_end[: len(art_joint_start)], dtype=np.int64)
+                art_dof_start = np.asarray(joint_qd_start, dtype=np.int64)
+                max_joints_per_articulation = max(0, int((art_joint_end - art_joint_start).max()))
+                max_dofs_per_articulation = max(
+                    0, int((art_dof_start[art_joint_end] - art_dof_start[art_joint_start]).max())
+                )
 
             m.joint_q_start = wp.array(joint_q_start, dtype=wp.int32)
             m.joint_qd_start = wp.array(joint_qd_start, dtype=wp.int32)
@@ -12528,7 +12723,7 @@ class ModelBuilder:
 
             # The packed array was just installed on the model, so builder and
             # model filters are known to match without rebuilding it.
-            self._find_shape_contact_pairs(m, allow_filter_blocks=True)
+            self._find_shape_contact_pairs(m, allow_filter_blocks=True, index_arrays=index_arrays)
 
             # enable ground plane
             m.up_axis = self.up_axis
@@ -12781,40 +12976,51 @@ class ModelBuilder:
         """
         filter_pairs = self._shape_collision_filter_pairs
         chunks: list[np.ndarray] = []
+
+        def pack(pairs: Sequence[tuple[int, int]]) -> np.ndarray:
+            pairs = np.asarray(pairs, dtype=np.int64).reshape((-1, 2))
+            return _pack_shape_pair_codes(pairs[:, 0], pairs[:, 1])
+
+        def sorted_unique(codes: np.ndarray) -> np.ndarray:
+            # Sort + mask instead of np.unique: NumPy's hash-based unique for 1-D
+            # integers degrades badly on packed pair codes, and searchsorted needs
+            # the sorted order anyway. The stable sort (timsort) merges presorted
+            # runs, such as replayed templates, in near-linear time.
+            codes.sort(kind="stable")
+            if codes.shape[0] > 1:
+                distinct = codes[1:] != codes[:-1]
+                if not distinct.all():
+                    codes = codes[np.concatenate(([True], distinct))]
+            return codes
+
         if isinstance(filter_pairs, _BuilderShapeCollisionFilterPairs):
             explicit_pairs = tuple(self._iter_validated_shape_collision_filter_pairs(filter_pairs.explicit_pairs))
             if explicit_pairs:
-                chunks.append(np.asarray(explicit_pairs, dtype=np.int64).reshape((-1, 2)))
+                chunks.append(pack(explicit_pairs))
             blocks = filter_pairs.blocks
             self._validate_compact_shape_collision_filter_blocks(blocks)
-            # Replicated blocks share one local-pair template; replay each
-            # group of blocks as a single broadcast offset add.
+            # Replicated blocks share one local-pair template; pack each template
+            # once and replay each group of blocks as a single broadcast offset add.
+            # Offsetting both shapes of a pair by ``start`` adds
+            # ``start * (2**32 + 1)`` to its packed code.
             starts_by_template: dict[int, tuple[np.ndarray, list[int]]] = {}
             for block in blocks:
                 entry = starts_by_template.get(id(block.local_pairs))
                 if entry is None:
-                    template = np.asarray(block.local_pairs, dtype=np.int64).reshape((-1, 2))
-                    starts_by_template[id(block.local_pairs)] = (template, [block.shape_start])
+                    template_codes = sorted_unique(pack(block.local_pairs))
+                    starts_by_template[id(block.local_pairs)] = (template_codes, [block.shape_start])
                 else:
                     entry[1].append(block.shape_start)
-            for template, starts in starts_by_template.values():
-                offsets = np.asarray(starts, dtype=np.int64)
-                chunks.append((template[None, :, :] + offsets[:, None, None]).reshape((-1, 2)))
+            for template_codes, starts in starts_by_template.values():
+                offsets = np.asarray(starts, dtype=np.int64) * ((1 << 32) + 1)
+                chunks.append((offsets[:, None] + template_codes[None, :]).reshape(-1))
         else:
             pairs = tuple(self._iter_validated_shape_collision_filter_pairs(filter_pairs))
             if pairs:
-                chunks.append(np.asarray(pairs, dtype=np.int64).reshape((-1, 2)))
+                chunks.append(pack(pairs))
         if not chunks:
             return np.empty(0, dtype=np.int64)
-        all_pairs = np.concatenate(chunks, axis=0)
-        codes = _pack_shape_pair_codes(all_pairs[:, 0], all_pairs[:, 1])
-        # Sort + mask instead of np.unique: NumPy's hash-based unique for 1-D
-        # integers degrades badly on packed pair codes, and searchsorted needs
-        # the sorted order anyway.
-        codes.sort()
-        if codes.shape[0] > 1:
-            codes = codes[np.concatenate(([True], codes[1:] != codes[:-1]))]
-        return codes
+        return sorted_unique(np.concatenate(chunks))
 
     def _validate_compact_shape_collision_filter_blocks(self, compact_filter_blocks) -> None:
         shape_count = len(self.shape_type)
@@ -12875,7 +13081,9 @@ class ModelBuilder:
         # changed since finalization, so always query filters from the model.
         self._find_shape_contact_pairs(model, allow_filter_blocks=False)
 
-    def _find_shape_contact_pairs(self, model: Model, *, allow_filter_blocks: bool) -> None:
+    def _find_shape_contact_pairs(
+        self, model: Model, *, allow_filter_blocks: bool, index_arrays: _BuilderIndexArrays | None = None
+    ) -> None:
         filter_pairs = self._shape_collision_filter_pairs
         world_filter_blocks: tuple[_ShapeCollisionFilterBlock, ...] = ()
         explicit_filter_pairs: tuple[tuple[int, int], ...] = ()
@@ -12903,8 +13111,10 @@ class ModelBuilder:
         use_world_templates = (
             allow_filter_blocks and self.world_count > 0 and isinstance(filter_pairs, _BuilderShapeCollisionFilterPairs)
         )
+        if index_arrays is None:
+            index_arrays = _BuilderIndexArrays(self)
         if use_world_templates:
-            shape_world_np = np.asarray(self.shape_world, dtype=np.int32)
+            shape_world_np = index_arrays["shape_world"]
             starts = self.shape_world_start
             if len(starts) != self.world_count + 2:
                 use_world_templates = False
@@ -12962,7 +13172,7 @@ class ModelBuilder:
 
             if use_world_templates:
                 contact_pairs = []
-                shape_flags_np = np.asarray(self.shape_flags, dtype=np.int64)
+                shape_flags_np = index_arrays["shape_flags"]
                 colliding_np = (shape_flags_np & int(ShapeFlags.COLLIDE_SHAPES)) != 0
                 colliding_globals = [
                     (int(shape_idx), self.shape_collision_group[shape_idx])
@@ -12977,7 +13187,7 @@ class ModelBuilder:
                         if pair not in global_filter_pairs:
                             contact_pairs.append(pair)
 
-                shape_group_np = np.asarray(self.shape_collision_group, dtype=np.int64)
+                shape_group_np = index_arrays["shape_collision_group"]
                 template_cache = {}
                 template_runs: list[tuple[list[int], tuple[np.ndarray, np.ndarray]]] = []
                 for world in range(self.world_count):
