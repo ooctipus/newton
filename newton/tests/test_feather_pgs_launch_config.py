@@ -242,8 +242,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             self.assertEqual(solver._point_contact_paths, point)
             for switch in ("_ROWS_MASKED", "_CHECK_ROWS"):
                 with self.subTest(beta=beta, environment=environment, switch=switch):
-                    switches = dict.fromkeys(("_ROWS_MASKED", "_ROWS_FUSED", "_CHECK_ROWS"), False)
-                    switches["_CHECK_ROWS_FUSED"] = False
+                    switches = dict.fromkeys(("_ROWS_MASKED", "_CHECK_ROWS"), False)
                     switches[switch] = True
                     # The plan reads the module's switches, as the solver's own admission does.
                     with mock.patch.multiple(solver_module, **switches):

@@ -424,8 +424,6 @@ def _general_kernels(method, patch, source) -> tuple:
         if patch:
             return (source.contact_row_prelude_patch, source.populate_world_J_masked_patch)
         return (source.contact_row_prelude, source.populate_world_J_masked)
-    if method == "fused_rows":
-        return (source.build_contact_rows,)
     if method == "per_contact":
         return (source.populate_world_J_for_size,)
     raise ValueError(f"No contact-row builder kernels are known for the method {method!r}.")
@@ -504,16 +502,14 @@ def _row_check(plan, source) -> dict | None:
     """Name, by DOF size, the builders the debug row checks launch besides builder_by_dof's.
 
     FEATHER_PGS_CHECK_ROWS builds every size's masked rows into copies and compares them
-    with the per-contact rows the solve uses. FEATHER_PGS_CHECK_ROWS_FUSED rebuilds the combined
-    masked sizes' rows with the fused builder and compares them with the masked rows. None without
-    a check (ContactRowPlan.check).
+    with the per-contact rows the solve uses. None without a check (ContactRowPlan.check).
     """
     if plan.check is None:
         return None
-    sizes = plan.combined if plan.check == "fused_rows" else tuple(plan.methods)
     kernels = _general_kernels(plan.check, plan.law == "patch", source)
     return {
-        str(int(size)): {"method": plan.check, "kernels": _kernel_names(kernels), "law": plan.law} for size in sizes
+        str(int(size)): {"method": plan.check, "kernels": _kernel_names(kernels), "law": plan.law}
+        for size in plan.methods
     }
 
 

@@ -222,7 +222,7 @@ class TestMaskedPatchRowAdmission(unittest.TestCase):
             _patch_dense_paths=True,
             _world_rows_owned_le=lambda: 0,
         )
-        flags = {"_ROWS_FUSED": False, "_CHECK_ROWS": False, "_CHECK_ROWS_FUSED": False}
+        flags = {"_CHECK_ROWS": False}
         for name, value in overrides.items():
             if name in flags:
                 flags[name] = value
@@ -232,14 +232,12 @@ class TestMaskedPatchRowAdmission(unittest.TestCase):
             return SolverFeatherPGS._masked_contact_rows(solver)
 
     def test_patch_takes_masked_rows_unless_an_experiment_or_the_flag_needs_point_rows(self):
-        """Patch friction takes masked rows by policy; point-only row experiments and deferred launches keep it off."""
+        """Patch friction takes masked rows by policy; the point-only row check and deferred launches keep it off."""
         self.assertTrue(self._admit())
         self.assertTrue(self._admit(_point_contact_paths=True, _patch_dense_paths=False))
         self.assertTrue(self._admit(_point_contact_paths=True, _world_rows_owned_le=lambda: 64))
         self.assertFalse(self._admit(_patch_dense_paths=False))
-        for experiment in ("_ROWS_FUSED", "_CHECK_ROWS", "_CHECK_ROWS_FUSED"):
-            with self.subTest(experiment=experiment):
-                self.assertFalse(self._admit(**{experiment: True}))
+        self.assertFalse(self._admit(_CHECK_ROWS=True))
         # In-kernel world rows defer masked launches past the patch link.
         self.assertFalse(self._admit(_world_rows_owned_le=lambda: 64))
 

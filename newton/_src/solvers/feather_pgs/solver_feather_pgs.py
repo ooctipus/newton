@@ -55,7 +55,7 @@ from . import row_metadata as _row_metadata
 from .body_mapping import build_body_maps
 from .capture_joins import capture_queries_available
 from .configuration import resolve_kernel_choices
-from .contact_row_plan import COMBINED_METHODS, SHARED_METADATA_PRODUCERS, contact_row_plan
+from .contact_row_plan import SHARED_METADATA_PRODUCERS, contact_row_plan
 from .contact_torsion import (
     configure_contact_torsion,
     prepare_torsion_rows,
@@ -260,7 +260,6 @@ from .row_build import (
     populate_world_J_masked,
     populate_world_J_masked_patch,
 )
-from .row_build_rows import build_contact_rows
 from .row_inputs import make_row_kernel
 from .solve_policy import (
     EXACT_POLICY,
@@ -447,12 +446,6 @@ _ROW_SLOT_UNBOUNDED = 2**31 - 1
 _CONTACT_BUILD_THREAD_CAP = 65536
 _CONTACT_THREADS_X = max(1, int(os.environ.get("FEATHER_PGS_CONTACT_THREADS_X", "1")))
 _ROWS_THREADS_X = max(1, int(os.environ.get("FEATHER_PGS_ROWS_THREADS_X", "4")))
-_ROWS_FUSED = (
-    os.environ.get("FEATHER_PGS_ROWS_FUSED") == "1"
-)  # experiment: one thread per contact row (row_build_rows.py)
-_CHECK_ROWS_FUSED = (
-    os.environ.get("FEATHER_PGS_CHECK_ROWS_FUSED") == "1"
-)  # debug: compare the fused build with the two-pass one  # row-build grid multiplier (x 65536 threads)  # experiment: slot-allocation grid multiplier
 _CONTACT_JACOBIAN_WORKER_CAP = 4096
 _PAIRED_RESPONSE_WARPS_PER_BLOCK = 4
 _CONTACT_JACOBIAN_MAX_DOF = 10
@@ -3472,11 +3465,7 @@ class SolverFeatherPGS(SolverBase):
 
         self._compact_contact_boundary = False
         # The compact producer writes the point and the patch row law; torsion and compliance keep ordinary rows.
-        if (
-            self._law_agnostic_contact_paths
-            and _COMPACT_CONTACT_BOUNDARY
-            and not (_GROUPED_CHECK or _CHECK_ROWS or _CHECK_ROWS_FUSED)
-        ):
+        if self._law_agnostic_contact_paths and _COMPACT_CONTACT_BOUNDARY and not (_GROUPED_CHECK or _CHECK_ROWS):
             from .compact_contact import supported  # noqa: PLC0415
 
             self._compact_contact_boundary = supported(self)
@@ -15053,7 +15042,7 @@ class SolverFeatherPGS(SolverBase):
                 combined_done = False
                 for size in self.size_groups:
                     method = plan.methods[size]
-                    if method in COMBINED_METHODS:
+                    if method == "masked_combined":
                         if combined_done:
                             continue
                         combined_done = True
@@ -15067,28 +15056,6 @@ class SolverFeatherPGS(SolverBase):
                         J_a = self.J_by_size[size_a]
                         J_b = self.J_by_size[size_b] if size_b > 0 else J_a
                         rows_threads = min(cap, _ROWS_THREADS_X * _CONTACT_BUILD_THREAD_CAP)
-                        if method == "fused_rows":
-                            meta_arrays = [
-                                self.row_type,
-                                self.row_parent,
-                                self.row_mu,
-                                self.row_beta,
-                                self.row_cfm,
-                                self.phi,
-                                self.target_velocity,
-                                self.row_restitution,
-                            ]
-                            self._launch_fused_contact_rows(
-                                contacts,
-                                state_in,
-                                state_aug,
-                                size_a,
-                                size_b,
-                                is_free_rigid,
-                                enable_friction_flag,
-                                [J_a, J_b, *meta_arrays],
-                            )
-                            continue
 
                         def _launch_prelude(size_a=size_a, size_b=size_b, rows_threads=rows_threads, pre=pre):
                             if self._friction_anchors_enabled:
@@ -15221,33 +15188,6 @@ class SolverFeatherPGS(SolverBase):
                             self._deferred_row_launches.append(_launch_j_pass)
                         else:
                             _launch_j_pass()
-                        if plan.check == "fused_rows":
-                            meta_arrays = [
-                                self.row_type,
-                                self.row_parent,
-                                self.row_mu,
-                                self.row_beta,
-                                self.row_cfm,
-                                self.phi,
-                                self.target_velocity,
-                                self.row_restitution,
-                            ]
-                            ref = [wp.clone(J_a), wp.clone(J_b)] + [wp.clone(a) for a in meta_arrays]
-                            self._launch_fused_contact_rows(
-                                contacts,
-                                state_in,
-                                state_aug,
-                                size_a,
-                                size_b,
-                                is_free_rigid,
-                                enable_friction_flag,
-                                [J_a, J_b, *meta_arrays],
-                            )
-                            _report_grouped_check(
-                                "rows_fused(J_a,J_b,type,parent,mu,beta,cfm,phi,target,rest)",
-                                [J_a, J_b, *meta_arrays],
-                                ref,
-                            )
                         continue
                     if "masked" in (method, plan.check):
                         cap = int(contacts.rigid_contact_point0.shape[0])
@@ -16221,8 +16161,8 @@ class SolverFeatherPGS(SolverBase):
         """Whether the masked builder (FEATHER_PGS_ROWS_MASKED) may write this friction law's contact rows.
 
         Point friction may. Patch friction takes the masked builder's patch-law variants (row_build.py),
-        unless FEATHER_PGS_PATCH_DENSE_PATHS=0, a point-only row experiment (fused rows, or the row
-        checks) is on, or the sweep builds its worlds' rows in-kernel: that defers the masked
+        unless FEATHER_PGS_PATCH_DENSE_PATHS=0, the point-only row check (FEATHER_PGS_CHECK_ROWS) is
+        on, or the sweep builds its worlds' rows in-kernel: that defers the masked
         launches past the patch link, which must stay the last writer of ring parents and friction
         coefficients.
 
@@ -16232,11 +16172,7 @@ class SolverFeatherPGS(SolverBase):
         """
         if self._point_contact_paths:
             return True
-        return bool(
-            self._patch_dense_paths
-            and not (_ROWS_FUSED or _CHECK_ROWS or _CHECK_ROWS_FUSED)
-            and self._world_rows_owned_le() == 0
-        )
+        return bool(self._patch_dense_paths and not _CHECK_ROWS and self._world_rows_owned_le() == 0)
 
     def _patch_row_law(self) -> PatchRowLaw:
         law = PatchRowLaw()
@@ -16329,68 +16265,6 @@ class SolverFeatherPGS(SolverBase):
             ],
             outputs=[J_a, J_b],
             device=self.model.device,
-        )
-
-    def _launch_fused_contact_rows(
-        self,
-        contacts,
-        state_in,
-        state_aug,
-        size_a: int,
-        size_b: int,
-        is_free_rigid,
-        enable_friction_flag: int,
-        outputs: list,
-    ) -> None:
-        """One thread per contact row: metadata and Jacobian in a single pass (row_build_rows.py)."""
-        model = self.model
-        cap = int(contacts.rigid_contact_point0.shape[0])
-        threads = min(cap, _ROWS_THREADS_X * _CONTACT_BUILD_THREAD_CAP) * 3
-        wp.launch(
-            build_contact_rows,
-            dim=threads,
-            inputs=[
-                contacts.rigid_contact_count,
-                threads,
-                contacts.rigid_contact_point0,
-                contacts.rigid_contact_point1,
-                contacts.rigid_contact_normal,
-                contacts.rigid_contact_shape0,
-                contacts.rigid_contact_shape1,
-                contacts.rigid_contact_margin0,
-                contacts.rigid_contact_margin1,
-                self.contact_world,
-                self.contact_slot,
-                self.contact_art_a,
-                self.contact_art_b,
-                self.contact_path,
-                size_a,
-                size_b,
-                self.articulation_response_dof_count,
-                self.art_group_idx,
-                self.articulation_dof_start,
-                self.articulation_origin,
-                self.body_response_dof_mask,
-                state_aug.joint_S_s,
-                model.shape_body,
-                state_in.body_q,
-                state_aug.body_v_s,
-                self._prescribed_articulation,
-                self.shape_material_mu,
-                self.shape_material_restitution,
-                enable_friction_flag,
-                self.contact_friction_gap_threshold,
-                int(self.contact_friction_shared_anchor),
-                self.contact_friction_anchor_limit,
-                1 if self.contact_friction_articulation_pairs_only else 0,
-                is_free_rigid,
-                self.contact_friction_scale,
-                int(self.contact_shared_anchor),
-                self.pgs_beta,
-                self.pgs_cfm,
-            ],
-            outputs=outputs[2:] + outputs[:2],
-            device=model.device,
         )
 
     def _build_inkernel_response_meta(self) -> tuple[int, int] | None:

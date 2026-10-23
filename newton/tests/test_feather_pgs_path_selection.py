@@ -617,14 +617,13 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         """Name in builder_by_dof exactly the contact-row builders one CPU step launches, under both laws.
 
         The general builder's methods: per-contact rows, masked rows in one launch for up to two
-        sizes or per size for three, fused rows (point friction; patch friction keeps
-        per-contact rows), FEATHER_PGS_PATCH_DENSE_PATHS=0 and a size above the masked builder's 32
-        DOFs; then keyed rows on CPU stand-ins. Each record is taken under the switches its step
+        sizes or per size for three, FEATHER_PGS_PATCH_DENSE_PATHS=0 and a size above the masked
+        builder's 32 DOFs; then keyed rows on CPU stand-ins. Each record is taken under the switches its step
         runs with. The debug row checks are not routes and stay off.
         """
         mixed, three, wide = _cpu_free_body_model(), _resting_arms_and_box(1, 2), _resting_arms_and_box(34)
         pair = ("6", "1")
-        masked, fused = ({"_ROWS_MASKED": True}, {"_ROWS_MASKED": True, "_ROWS_FUSED": True})
+        masked = {"_ROWS_MASKED": True}
         cases = (
             # (model, switches, FEATHER_PGS_PATCH_DENSE_PATHS, friction_anchor_beta, methods by size)
             (mixed, {}, None, None, dict.fromkeys(pair, "per_contact")),
@@ -632,8 +631,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             (mixed, masked, None, None, dict.fromkeys(pair, "masked_combined")),
             (mixed, masked, None, 0.0, dict.fromkeys(pair, "masked_combined")),
             (mixed, masked, "0", None, dict.fromkeys(pair, "per_contact")),
-            (mixed, fused, None, None, dict.fromkeys(pair, "per_contact")),
-            (mixed, fused, None, 0.0, dict.fromkeys(pair, "fused_rows")),
             (three, masked, None, None, dict.fromkeys(("6", "2", "1"), "masked")),
             (three, masked, None, 0.0, dict.fromkeys(("6", "2", "1"), "masked")),
             (wide, masked, None, None, {"34": "per_contact", "6": "masked_combined"}),
@@ -686,20 +683,16 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
 
         FEATHER_PGS_CHECK_ROWS (point friction) builds every size's masked rows into copies
         and compares them with the per-contact rows the solve uses, which builder_by_dof and
-        general_method_by_dof name. FEATHER_PGS_CHECK_ROWS_FUSED rebuilds the combined masked sizes'
-        rows with the fused builder. Patch friction runs neither check. One CPU step launches exactly
-        the builders the two maps name, and each check compares the sizes its map lists.
+        general_method_by_dof name. Patch friction does not run the check. One CPU step launches exactly
+        the builders the two maps name, and the check compares the sizes its map lists.
         """
         model = _cpu_free_body_model()
         pair = ("6", "1")
-        fused_check = "rows_fused(J_a,J_b,type,parent,mu,beta,cfm,phi,target,rest)"
         cases = (
             # (switches, friction_anchor_beta, builder method, checked method or None, comparisons)
             ({"_CHECK_ROWS": True}, 0.0, "per_contact", "masked", ["rows_J_6", "rows_J_1"]),
             ({"_CHECK_ROWS": True, "_ROWS_MASKED": True}, 0.0, "per_contact", "masked", ["rows_J_6", "rows_J_1"]),
-            ({"_CHECK_ROWS_FUSED": True, "_ROWS_MASKED": True}, 0.0, "masked_combined", "fused_rows", [fused_check]),
             ({"_CHECK_ROWS": True, "_ROWS_MASKED": True}, None, "per_contact", None, []),
-            ({"_CHECK_ROWS_FUSED": True, "_ROWS_MASKED": True}, None, "per_contact", None, []),
         )
         for switches, beta, method, check, comparisons in cases:
             compared = []
@@ -725,7 +718,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                         {size: entry["method"] for size, entry in checked.items()}, dict.fromkeys(pair, check)
                     )
                 assert_row_builders_named(self, record, keys)
-                self.assertEqual([name for name in compared if name.startswith(("rows_J_", "rows_fused"))], comparisons)
+                self.assertEqual([name for name in compared if name.startswith("rows_J_")], comparisons)
 
     def test_host_record_maps_every_producer_plan(self):
         """Map every producer's plan to its builder methods, kernels and law from host attributes alone.
@@ -741,7 +734,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         marker = SimpleNamespace(key="mark_independent_sparse_contact_candidates_stand_in")
         response = SimpleNamespace(key="populate_sparse_contact_response_stand_in")
         prepare, compact = "prepare_world_contact_rows", "populate_world_J_for_compact_size"
-        per_contact, fused = ["populate_world_J_for_size"], ["build_contact_rows"]
+        per_contact = ["populate_world_J_for_size"]
         point_masked = ["contact_row_prelude", "populate_world_J_masked"]
         named, methods = set(), set()
         for law in ("point", "patch"):
@@ -864,30 +857,11 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 ),
                 (
                     {},
-                    {"_ROWS_MASKED": True, "_ROWS_FUSED": True},
-                    (6, 1),
-                    "general",
-                    same((6, 1), "fused_rows", fused) if point else same((6, 1), "per_contact", per_contact),
-                    None,
-                ),
-                (
-                    {},
                     {"_CHECK_ROWS": True, "_ROWS_MASKED": True},
                     (6, 1),
                     "general",
                     same((6, 1), "per_contact", per_contact),
                     same((6, 1), "masked", point_masked) if point else None,
-                ),
-                (
-                    {},
-                    {"_CHECK_ROWS_FUSED": True, "_ROWS_MASKED": True},
-                    (34, 6),
-                    "general",
-                    {
-                        34: ("per_contact", per_contact),
-                        6: ("masked_combined" if point else "per_contact", masked if point else per_contact),
-                    },
-                    {6: ("fused_rows", fused)} if point else None,
                 ),
             )
             for attributes, switches, sizes, producer, expected, check in cases:

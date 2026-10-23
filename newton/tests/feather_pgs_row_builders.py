@@ -23,9 +23,7 @@ from newton._src.solvers.feather_pgs import keyed_rows
 
 # The import-time row-builder switches of the solver module, held off unless a case sets one, whatever the
 # shell exports.
-ROW_SWITCHES_OFF = dict.fromkeys(
-    ("_ROWS_MASKED", "_ROWS_FUSED", "_CHECK_ROWS", "_CHECK_ROWS_FUSED"), False
-)
+ROW_SWITCHES_OFF = dict.fromkeys(("_ROWS_MASKED", "_CHECK_ROWS"), False)
 
 # Every kernel a contact-row producer launches to write dense contact rows outside the sweep: the general
 # builder's methods, the shared-metadata producers, the compact contact boundary, local row packets and keyed
@@ -38,7 +36,6 @@ ROW_BUILDER_KERNELS = frozenset(
         "contact_row_prelude_patch",
         "populate_world_J_masked",
         "populate_world_J_masked_patch",
-        "build_contact_rows",
         "prepare_world_contact_rows",
         "populate_world_J_for_compact_size",
         "populate_sparse_diagonal_contact_response",
@@ -60,7 +57,7 @@ _GENERATED_PREFIXES = ("populate_sparse_contact_response_", "mark_independent_sp
 _GENERATED_SUFFIXES = ("keyed_rows_fallback", "keyed_rows_patch_fallback")
 # Builders that launch once for every DOF size whose entry names them. Every other named builder serves all
 # the sizes that name it in one launch per step (the row metadata, a producer's contact kernels, a combined
-# masked or fused launch), except the masked builder's per-size method, "masked".
+# masked launch), except the masked builder's per-size method, "masked".
 PER_SIZE_KERNELS = frozenset(
     (
         "populate_world_J_for_size",

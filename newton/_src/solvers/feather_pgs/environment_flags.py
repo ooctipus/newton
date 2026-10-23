@@ -100,12 +100,6 @@ FLAGS = declare(
         "=1 compares the masked contact-row builder with the per-contact builder.",
     ),
     _flag(
-        "FEATHER_PGS_CHECK_ROWS_FUSED",
-        "diagnostic",
-        _SOLVER,
-        "=1 compares the fused contact-row builder with the ordinary builder.",
-    ),
-    _flag(
         "FEATHER_PGS_COLORED_LANES",
         "policy",
         _SOLVER,
@@ -477,12 +471,6 @@ FLAGS = declare(
         "policy",
         ("resolved_worlds",),
         "Values other than 1 stop skipping worlds whose candidate rows all separate at the predictor.",
-    ),
-    _flag(
-        "FEATHER_PGS_ROWS_FUSED",
-        "experiment",
-        _SOLVER,
-        "=1 builds contact rows with one thread per row.",
     ),
     _flag(
         "FEATHER_PGS_ROWS_MASKED",

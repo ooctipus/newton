@@ -199,13 +199,11 @@ class TestSparseResearchAdmission(unittest.TestCase):
     def test_contact_writer_requests_do_not_block_sparse(self):
         """Allow general sparse producers to supersede optional canonical row writers."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        for option in ("ROWS_MASKED", "ROWS_FUSED"):
-            with (
-                self.subTest(option=option),
-                mock.patch.dict(os.environ, {f"FEATHER_PGS_{option}": "1"}, clear=True),
-                self.assertRaises(_TopologyReached),
-            ):
-                SolverFeatherPGS._setup_sparse_mass_matrix(_eligible_solver(), model)
+        with (
+            mock.patch.dict(os.environ, {"FEATHER_PGS_ROWS_MASKED": "1"}, clear=True),
+            self.assertRaises(_TopologyReached),
+        ):
+            SolverFeatherPGS._setup_sparse_mass_matrix(_eligible_solver(), model)
 
     def test_grouped_dynamics_auto_and_legacy_opt_out(self):
         """Compose grouped dynamics automatically while retaining its explicit opt-out."""

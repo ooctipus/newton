@@ -243,7 +243,6 @@
   "row_build.contact_row_prelude_patch": "0ab38b85972d5b82785b1672c13ec3a083723df74bd27e7704b714844f9045f2",
   "row_build.populate_world_J_masked": "103b5cdddd58e9a43f97b4bfe50e314d9f0d9a1038002a61bda51b5582ab876a",
   "row_build.populate_world_J_masked_patch": "6c3af7617689ab95b73baea0b733b904061f4107dec022c752c596e336f0fb06",
-  "row_build_rows.build_contact_rows": "b23f2724cc01d5dcd2daebf56215dd24c1def2b2bc026f44725cf9ae218d8bc7",
   "row_packets.finalize_and_queue": "f19e27e306e84c86cc3d2ab6a009838af36409f561fec3b563b388945e027f70",
   "row_packets.general_diag": "6b4e349134265eac46932834f01662bcbff790cd7060e24899abe2f1c4885e15",
   "row_packets.general_response": "9ecb5feb89c0f1016ecf96bc8a5011e05d08c4cb217d1a6fcf27ee871b22434a",
