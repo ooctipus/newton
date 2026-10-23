@@ -348,7 +348,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             options["mf_gs_parallel_rows"], {"applied": 0, "requested": 48, "default": 0, "source": "argument"}
         )
         self.assertIsNone(selected["routes"]["sweep"]["tiers"])
-        self.assertFalse(selected["routes"]["dynamics"]["grouped_topology"])
+        self.assertIsNone(selected["routes"]["dynamics"]["grouped"])
         self.assertEqual(selected["routes"]["publication"]["owner"], "ordinary")
         self.assertEqual(selected["routes"]["friction"]["law"], "point")
         self.assertEqual(selected["routes"]["friction"]["anchor_beta_source"], "argument")
@@ -561,22 +561,14 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(point["routes"]["contact_rows"]["law"], "point")
 
     def test_cpu_grouped_record_follows_the_response_dispatch(self):
-        """Label the sizes a grouped topology would serve, with their reasons, from host state alone."""
+        """Label the sizes the grouped response would serve, with their reasons, from host state alone."""
         solver = SolverFeatherPGS(_cpu_free_body_model())
-        # A stand-in for the CUDA-only grouped topology: the record reads its layout fields only.
-        solver._grouped_topology = SimpleNamespace(
-            lanes_per_articulation=8, articulations_per_block=4, template_count=2
-        )
+        # A stand-in for the CUDA-only grouped response: the record reads host state only.
+        solver._grouped_response = True
         selected = solver.get_path_selection()
         json.dumps(selected, allow_nan=False)
         grouped = selected["routes"]["dynamics"]["grouped"]
-        self.assertEqual(
-            (grouped["lanes_per_articulation"], grouped["articulations_per_block"], grouped["template_count"]),
-            (8, 4, 2),
-        )
-        # CPU builds no FK/ID cache and no asynchronous drives, so neither template kernel is reached.
-        self.assertFalse(grouped["template_fk"])
-        self.assertIsNone(grouped["tau"])
+        self.assertEqual(set(grouped), {"hinv_jt_by_dof"})
         by_dof = grouped["hinv_jt_by_dof"]
         self.assertTrue(by_dof["1"]["grouped"])
         self.assertEqual(selected["kernel_plan_by_dof"][1]["hinv_jt_kernel"], "grouped")
@@ -1216,18 +1208,16 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     self.assertEqual(tiers["pair_step"], "isotropic" if patch_law else "per_row")
                     for tier in tiers["tiers"]:
                         self.assertEqual(tier["kernel"].endswith("_linked_iso"), patch_law, tier)
-                self.assertEqual(applied["grouped_dynamics"], routes["dynamics"]["grouped_topology"])
+                self.assertEqual(applied["grouped_dynamics"], routes["dynamics"]["grouped"] is not None)
                 self.assertFalse(applied["lazy_kinematics"])
                 if options.get("pgs_schedule") == "physx_grasp" and routes["sweep"]["route"] == "matrix_free_gs":
                     self.assertEqual(routes["sweep"]["driver"], "physx_grasp")
                 # A size whose response the grouped kernel solves is labeled so in the kernel plan.
                 grouped = routes["dynamics"]["grouped"]
-                self.assertEqual(grouped is None, solver._grouped_topology is None)
+                self.assertEqual(grouped is None, not solver._grouped_response)
                 for size, plan in selected["kernel_plan_by_dof"].items():
                     is_grouped = grouped is not None and grouped["hinv_jt_by_dof"][str(size)]["grouped"]
                     self.assertEqual(plan["hinv_jt_kernel"] == "grouped", is_grouped, size)
-                if grouped is not None:
-                    self.assertEqual(grouped["lanes_per_articulation"], solver._grouped_topology.lanes_per_articulation)
         self.assertGreaterEqual(built, 8)
         self.assertEqual(opted_out, 1, "The opted-out patch-friction parallel arm must build")
         self.assertGreaterEqual(

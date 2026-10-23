@@ -85,42 +85,23 @@ def _build_fingers(device="cpu", *, articulations=3, include_chain=False, ragged
 
 
 class TestFeatherPGSTreePlan(unittest.TestCase):
-    def test_grouped_tau_does_not_repeat_serial_inverse_dynamics(self):
+    def test_torque_pass_runs_once(self):
         """Dispatch exactly one torque pass, including accumulation into actuator torques."""
-        topology = Mock(blocks=1, lanes_per_articulation=8, max_levels=3)
-        for grouped in (False, True):
-            for add_to_existing in (False, True):
-                with self.subTest(grouped=grouped, add_to_existing=add_to_existing):
-                    solver = Mock(
-                        model=Mock(articulation_count=2),
-                        _direct_branch_tau_kernel=None,
-                        _grouped_topology=topology if grouped else None,
-                        _tree_plan=None,
+        for add_to_existing in (False, True):
+            with self.subTest(add_to_existing=add_to_existing):
+                solver = Mock(model=Mock(articulation_count=2), _direct_branch_tau_kernel=None, _tree_plan=None)
+                state_in, state_aug, control = Mock(body_count=2), Mock(), Mock()
+                with patch.object(wp, "launch") as serial_launch, patch.object(wp, "launch_tiled") as tiled_launch:
+                    SolverFeatherPGS._launch_rigid_tau(
+                        solver, state_in, state_aug, control, add_to_existing=add_to_existing
                     )
-                    state_in, state_aug, control = Mock(body_count=2), Mock(), Mock()
-                    with (
-                        patch.object(solver_feather_pgs, "_GROUPED_CHECK", False),
-                        patch.object(wp, "launch") as serial_launch,
-                        patch.object(wp, "launch_tiled") as grouped_launch,
-                    ):
-                        SolverFeatherPGS._launch_rigid_tau(
-                            solver, state_in, state_aug, control, add_to_existing=add_to_existing
-                        )
-                    state_aug.body_ft_s.zero_.assert_called_once_with()
-                    if grouped:
-                        grouped_launch.assert_called_once()
-                        self.assertIs(grouped_launch.call_args.args[0], solver_feather_pgs.grouped_tau)
-                        self.assertEqual(grouped_launch.call_args.kwargs["inputs"][-1], int(add_to_existing))
-                        serial_launch.assert_not_called()
-                    else:
-                        grouped_launch.assert_not_called()
-                        serial_launch.assert_called_once()
-                        expected = (
-                            solver_feather_pgs.eval_rigid_tau_add
-                            if add_to_existing
-                            else solver_feather_pgs.eval_rigid_tau
-                        )
-                        self.assertIs(serial_launch.call_args.args[0], expected)
+                state_aug.body_ft_s.zero_.assert_called_once_with()
+                tiled_launch.assert_not_called()
+                serial_launch.assert_called_once()
+                expected = (
+                    solver_feather_pgs.eval_rigid_tau_add if add_to_existing else solver_feather_pgs.eval_rigid_tau
+                )
+                self.assertIs(serial_launch.call_args.args[0], expected)
 
     def test_parallel_tree_is_keyword_only_and_defaults_to_serial(self):
         """Require an explicit construction-only opt-in without shifting positional arguments."""

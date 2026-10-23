@@ -142,7 +142,7 @@ _EFFECTIVE = {
     "sparse_mass_matrix": lambda solver: "on" if solver._sparse_mass_matrix_size is not None else "off",
     "cached_dynamics": lambda solver: "on" if solver._tree_kinetic_state is not None else "off",
     "parallel_tree": lambda solver: solver._tree_plan is not None,
-    "grouped_dynamics": lambda solver: solver._grouped_topology is not None,
+    "grouped_dynamics": lambda solver: solver._grouped_response,
     # Nothing defers publication: the request only declines the resolved-world classifier.
     "lazy_kinematics": lambda solver: False,
     # Tier budgets after their gates and clamps.
@@ -1387,30 +1387,9 @@ def _grouped_response_reason(solver, size, source) -> str:
 
 
 def _grouped(solver, source) -> dict | None:
-    topology = solver._grouped_topology
-    if topology is None:
+    if not solver._grouped_response:
         return None
-    held = solver._tree_kinetic_state is not None
-    velocity_pass = solver.pgs_mode == "matrix_free" and solver.pgs_velocity_iterations > 0
-    # Stage-7 kinematics publication: the held-tree finish and the fused general publication bypass it.
-    publishes = solver._fk_id_cache_enabled and (velocity_pass or not (held or solver._fused_publication))
-    asynchronous = bool(solver._async_augmented_drives)
-    # _launch_rigid_tau: asynchronous drives, or drives that do not fuse tau.
-    tau = (
-        not held
-        and solver._direct_branch_tau_kernel is None
-        and (
-            asynchronous
-            or (not asynchronous and not (solver.drive_mode == "augmented" and solver.articulation_max_dofs > 0))
-        )
-    )
     return {
-        "lanes_per_articulation": int(topology.lanes_per_articulation),
-        "articulations_per_block": int(topology.articulations_per_block),
-        # -1 when the template build failed; template kernels then stay off.
-        "template_count": int(topology.template_count),
-        "template_fk": bool(publishes and topology.template_count > 0 and not source._GROUPED_FK_OFF),
-        "tau": "grouped_tau" if tau else None,
         "hinv_jt_by_dof": {
             str(int(size)): {
                 "grouped": grouped_response(solver, size),
@@ -1423,7 +1402,6 @@ def _grouped(solver, source) -> dict | None:
 
 def _dynamics(solver, source) -> dict:
     return {
-        "grouped_topology": solver._grouped_topology is not None,
         "grouped": _grouped(solver, source),
         "parallel_tree": solver._tree_plan is not None,
         "compact_diagonal_mass_dofs": json_value(solver._compact_diagonal_mass_size),

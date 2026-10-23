@@ -723,12 +723,12 @@ class TestCheckedCapture(unittest.TestCase):
         }
         for name, value in expected.items():
             setattr(solver, name, value)
-        solver._grouped_topology = object()
+        solver._grouped_response = True
         checked.check_solver("feather_pgs", solver, entry)
         # A revision without linked tier budgets records no request and no applied budget.
         expected.update(mf_gs_parallel_linked_sweeps=None, mf_gs_parallel_linked_sweeps_applied=0)
         self.assertEqual(entry["solver_recipe"], expected)
-        self.assertTrue(entry["solver_paths"]["grouped_topology"])
+        self.assertTrue(entry["solver_paths"]["grouped_response"])
 
     def test_fpgs_linked_tier_budget_is_recorded(self):
         """Record the linked tiers' budget request and the budget the built tiers sweep, which may exceed the rest."""

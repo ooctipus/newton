@@ -8,9 +8,9 @@ PGS mode changes only that mode and preserves the original grouped/lazy settings
 Replay holds the loaded control fixed and shares reference-generated contacts.
 It tests execution-path closeness, publication and reset invalidation, not
 independent collision trajectories, projection convergence or RL equivalence.
-Use the timing recipe's common environment: FEATHER_PGS_GROUP_LANES=16,
-FEATHER_PGS_ROWS_MASKED=1, NEWTON_NARROW_PHASE_THREADS_X=4. Contact diagnostics
-do not replace the original strict qualification gate.
+Use the timing recipe's common environment: FEATHER_PGS_ROWS_MASKED=1,
+NEWTON_NARROW_PHASE_THREADS_X=4. Contact diagnostics do not replace the
+original strict qualification gate.
 """
 
 from __future__ import annotations
@@ -156,7 +156,7 @@ def qualify(
         {
             "grouped_dynamics": solver.grouped_dynamics,
             "lazy_kinematics": solver.lazy_kinematics,
-            "grouped_active": solver._grouped_topology is not None,
+            "grouped_active": solver._grouped_response,
             "pgs_mode": solver.pgs_mode,
         }
         for solver in solvers

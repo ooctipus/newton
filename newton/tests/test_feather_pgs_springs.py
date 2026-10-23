@@ -3,9 +3,7 @@
 
 """Tests for passive joint springs and passive damping in SolverFeatherPGS."""
 
-import os
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -86,7 +84,6 @@ class TestFeatherPGSSprings(unittest.TestCase):
         self.assertGreater(qd_undamped, 4.0, "undamped joint should keep coasting")
         self.assertLess(qd_damped, 0.2 * qd_undamped)
 
-    @patch.dict(os.environ, {"FEATHER_PGS_GROUP_LANES": "16"})
     def test_grouped_passive_damping_uses_unscaled_velocity(self):
         """Keep passive damping on the input velocity while motion uses the prescale."""
         for damping, velocity in ((0.2, 10.0), (0.0, 10.0), (0.2, 1.0)):

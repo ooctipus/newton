@@ -79,10 +79,7 @@ from .friction_patches import (
     patch_routes,
 )
 from .grouped_dynamics import (
-    GroupedTopology,
     get_grouped_hinv_jt_kernel,
-    grouped_tau,
-    template_fk_kinematics,
 )
 from .kernels import (
     FRICTION_MODE_BISECTION,
@@ -309,7 +306,6 @@ _FPGS_CAPTURE_COUNT = int(os.environ.get("FEATHER_PGS_CAPTURE_COUNT", "1"))  # c
 _FPGS_CAPTURE_PHASE = os.environ.get("FEATHER_PGS_CAPTURE_PHASE")  # None = any phase
 _FPGS_CAPTURE_DIR = os.environ.get("FEATHER_PGS_CAPTURE_DIR", "/tmp/fpgs_capture")
 _GROUPED_CHECK = os.environ.get("FEATHER_PGS_CHECK_GROUPED") == "1"
-_GROUPED_FK_OFF = os.environ.get("FEATHER_PGS_GROUPED_FK") == "0"
 _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
 _FK_ID_CACHE_SNAPSHOT = os.environ.get("FEATHER_PGS_FK_CACHE_SNAPSHOT") == "1"
 # FEATHER_PGS_FUSED_PUBLISH=1 publishes each articulation of the general route
@@ -1821,14 +1817,12 @@ class SolverFeatherPGS(SolverBase):
                 slower on dexterous manipulation at 16k worlds, so it is off by default. Defaults to 0.
             mf_gs_response_block_lane_rows (int, optional): Row bound of the lane-per-world class of the
                 response-block sweep. Capped at 24. Defaults to 16.
-            grouped_dynamics (bool, optional): Run forward kinematics and the inverse-dynamics backward
-                pass level-synchronously with a lane group per articulation instead of one serial thread
-                per articulation. Fusion and parallel reductions can change floating-point accumulation.
-                Experimental CUDA option: consider batches of multi-joint arms or quadrupeds; grouping
-                overhead can outweigh the saved serial work for tiny articulations, such as cartpole.
-                Keep False when retaining specialized simple-world or prismatic-state optimizations:
-                grouping disables their admission, and prismatic linear state rejects this combination.
-                Measure whole-step cost, including fallback and publication. Defaults to False.
+            grouped_dynamics (bool, optional): Solve the contact response ``H^-1 J^T`` of articulations with
+                up to 32 DOFs with one warp per articulation and one lane per row, instead of the planned
+                response kernel (``FEATHER_PGS_GROUPED_HINV=0`` keeps the planned kernel). The request also
+                keeps the resolved-world classifier, the local row packets and the compact contact producer
+                off. Kinematics and inverse dynamics keep their kernels. Experimental CUDA option. Defaults
+                to False.
             lazy_kinematics (bool, optional): Experimental. Every substep publishes the body state, so this
                 option defers no publication and :meth:`publish_kinematics` has no effect; ``True`` keeps the
                 resolved-world classifier off. Defaults to False.
@@ -2515,7 +2509,7 @@ class SolverFeatherPGS(SolverBase):
         self.mf_gs_response_block_lane_rows = int(mf_gs_response_block_lane_rows)
         self.grouped_dynamics = bool(grouped_dynamics)
         self.lazy_kinematics = bool(lazy_kinematics)
-        self._grouped_topology = None
+        self._grouped_response = False
         self.rigid_body_max_linear_velocity = getattr(model, "rigid_body_max_linear_velocity", None)
         self.rigid_body_max_angular_velocity = getattr(model, "rigid_body_max_angular_velocity", None)
         self.rigid_body_max_depenetration_velocity = getattr(model, "rigid_body_max_depenetration_velocity", None)
@@ -3704,7 +3698,7 @@ class SolverFeatherPGS(SolverBase):
         the sweep kernels per route and tier, what drives them and the matrix-free
         sweep's shared-memory storage (``sweep.mf_gs_storage``), resolved worlds,
         publication, velocity limits and the lane width of their prescale, free
-        bodies, the friction law and the grouped-dynamics kernels, each with a
+        bodies, the friction law and the grouped response solve, each with a
         reason; a size whose response the grouped kernel solves reports
         ``hinv_jt_kernel`` ``"grouped"``; ``routes.sweep.readout`` names the
         sweep kernels that count their sweeps, the passes that count the solves
@@ -7972,10 +7966,8 @@ class SolverFeatherPGS(SolverBase):
         self._incremental_rows = 0
         self._rb_build_kernel = None
         if self.grouped_dynamics and model.device.is_cuda and int(model.articulation_count) > 0:
-            self._grouped_topology = GroupedTopology(
-                model, self.articulation_joint_end.numpy(), model.device, body_X_com=self.body_X_com
-            )
-            self._body_fs_scratch = wp.zeros(int(model.body_count), dtype=wp.spatial_vector, device=model.device)
+            # The grouped response solve (_stage4_hinv_jt_tiled) is grouped_dynamics' remaining kernel.
+            self._grouped_response = True
             self._grouped_kernels = {}
             self._grouped_dummy_diag = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
         # World class written by the response-block build kernel (0 = legacy sweep owns the world).
@@ -12547,63 +12539,7 @@ class SolverFeatherPGS(SolverBase):
             self.articulation_origin,
         ]
         if self._direct_branch_tau_kernel is None:
-            topo = self._grouped_topology
-            if topo is not None:
-                check = _GROUPED_CHECK
-                ref = [wp.clone(state_aug.body_ft_s), wp.clone(state_aug.joint_tau)] if check else None
-                # tau_inputs order: art_start, joint_end, type, parent, child, articulation, qd_start,
-                # q_start, dof_dim, joint_f, q, qd, spring_k, spring_ref, damping, S_s, fb_s, f_ext,
-                # flags, body_q, body_com, origin.
-                t = tau_inputs
-                wp.launch_tiled(
-                    grouped_tau,
-                    dim=[topo.blocks],
-                    inputs=[
-                        topo.lanes_per_articulation,
-                        int(model.articulation_count),
-                        topo.max_levels,
-                        topo.art_level_offsets,
-                        topo.level_joint_local,
-                        topo.children_offsets,
-                        topo.children,
-                        t[0],
-                        t[2],
-                        t[3],
-                        t[4],
-                        t[6],
-                        t[7],
-                        t[8],
-                        t[9],
-                        t[10],
-                        t[11],
-                        t[12],
-                        t[13],
-                        t[14],
-                        t[15],
-                        t[16],
-                        t[17],
-                        t[18],
-                        t[19],
-                        t[20],
-                        t[21],
-                        int(add_to_existing),
-                    ],
-                    outputs=[state_aug.body_ft_s, self._body_fs_scratch, state_aug.joint_tau],
-                    block_dim=32,
-                    device=model.device,
-                )
-                if check:
-                    wp.launch(
-                        eval_rigid_tau_add if add_to_existing else eval_rigid_tau,
-                        dim=model.articulation_count,
-                        inputs=tau_inputs,
-                        outputs=ref,
-                        block_dim=self.serial_kernel_block_dim,
-                        device=model.device,
-                    )
-                    _report_grouped_check("tau", [state_aug.body_ft_s, state_aug.joint_tau], ref)
-                return
-            elif self._tree_plan is not None:
+            if self._tree_plan is not None:
                 for group, net_wrench in zip(self._tree_plan.groups, self._tree_net_wrenches, strict=True):
                     per_warp = 32 // group.lanes
                     wp.launch(
@@ -16118,7 +16054,7 @@ class SolverFeatherPGS(SolverBase):
         return [tb["count"], tb["s0"], tb["s1"], tb["p"], tb["lam"], float(getattr(self, "pgs_warmstart_decay", 1.0))]
 
     def _use_grouped_hinv_jt(self, size: int) -> bool:
-        if self._grouped_topology is None or int(size) > 32:
+        if not self._grouped_response or int(size) > 32:
             return False
         if self._ink_skip_rows() > 0:
             return True  # the grouped kernel is the only response kernel with the per-world skip
@@ -17688,59 +17624,7 @@ class SolverFeatherPGS(SolverBase):
             body_a_s,
             self._fk_id_cache_valid,
         ]
-        # Template forward kinematics (bit-identical); 83 us against 90 us serial on AnymalD at
-        # 8 lanes per articulation. FEATHER_PGS_GROUPED_FK=0 falls back to the serial kernel.
-        topo = self._grouped_topology
-        if topo is not None and topo.template_count > 0 and not _GROUPED_FK_OFF:
-            check = _GROUPED_CHECK
-            ref = [wp.clone(a) for a in fk_outputs] if check else None
-            wp.launch_tiled(
-                template_fk_kinematics,
-                dim=[topo.blocks],
-                inputs=[
-                    topo.lanes_per_articulation,
-                    int(model.articulation_count),
-                    topo.tpl_max_levels,
-                    topo.art_template,
-                    topo.art_body_base,
-                    topo.art_q_base,
-                    topo.art_qd_base,
-                    topo.tpl_joint_offset,
-                    topo.tpl_dof_offset,
-                    topo.tpl_level_offsets,
-                    topo.tpl_level_joints,
-                    topo.tpl_type,
-                    topo.tpl_lin,
-                    topo.tpl_ang,
-                    topo.tpl_q_off,
-                    topo.tpl_qd_off,
-                    topo.tpl_parent_local,
-                    topo.tpl_child_off,
-                    topo.tpl_X_p,
-                    topo.tpl_X_c,
-                    topo.tpl_axis,
-                    model.joint_X_p,
-                    self.body_X_com,
-                    model.body_com,
-                    model.articulation_start,
-                    state_out.joint_q,
-                    state_out.joint_qd,
-                ],
-                outputs=fk_outputs,
-                block_dim=32,
-                device=model.device,
-            )
-            if check:
-                wp.launch(
-                    eval_rigid_fk_kinematics,
-                    dim=model.articulation_count,
-                    inputs=fk_inputs,
-                    outputs=ref,
-                    block_dim=16,
-                    device=model.device,
-                )
-                _report_grouped_check("template_fk", fk_outputs, ref)
-        elif self._tree_plan is not None and prismatic is None:
+        if self._tree_plan is not None and prismatic is None:
             self._launch_tree_fk(
                 "kinematics",
                 [

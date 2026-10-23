@@ -214,12 +214,6 @@ FLAGS = declare(
         "Retired G1 alias of the held-tree chain scan; ignored (FEATHER_PGS_TREE_CHAIN_SCAN=0 opts out of it).",
     ),
     _flag(
-        "FEATHER_PGS_GROUPED_FK",
-        "policy",
-        _SOLVER,
-        "=0 replaces the grouped template FK kernel with the serial kernel.",
-    ),
-    _flag(
         "FEATHER_PGS_GROUPED_HINV",
         "policy",
         _SOLVER,
@@ -239,9 +233,9 @@ FLAGS = declare(
     ),
     _flag(
         "FEATHER_PGS_GROUP_LANES",
-        "policy",
-        ("grouped_dynamics",),
-        "Lanes per articulation in grouped dynamics (default twice the widest tree level, at most 32).",
+        "retired",
+        ("environment_flags",),
+        "Retired lanes per articulation of the removed grouped kinematics and torque kernels; ignored.",
     ),
     _flag(
         "FEATHER_PGS_INDEPENDENT_COMPONENTS",
@@ -736,8 +730,9 @@ FLAGS = declare(
 
 # Retired names that Isaac Lab's benchmark recipes still set: the packed
 # sparse-factor route's selectors (480f0f44), the chain-scan and keyed-row
-# aliases (d35949d6), and the selectors of removed research owners and of the
-# branch-Jacobi sweep (790f9782, aa2f332b). Nothing in Newton or Isaac Lab reads
+# aliases (d35949d6), the selectors of removed research owners and of the
+# branch-Jacobi sweep (790f9782, aa2f332b), and the lane count of the removed
+# grouped kinematics and torque kernels. Nothing in Newton or Isaac Lab reads
 # them, and recipes are not Newton's to edit, so they are ignored rather than
 # rejected: the general route runs, the construction record lists them as retired
 # and the solver warns once per process.
@@ -746,6 +741,7 @@ IGNORED_RETIRED = frozenset(
         "FEATHER_PGS_ALLEGRO_KINETIC_ROWS",
         "FEATHER_PGS_FRANKA_COMPACT_WORKSPACE",
         "FEATHER_PGS_G1_CHAIN_SCAN",
+        "FEATHER_PGS_GROUP_LANES",
         "FEATHER_PGS_INDEPENDENT_COMPONENTS",
         "FEATHER_PGS_KUKA_CURRENT_CONTACT",
         "FEATHER_PGS_KUKA_JOINT_WORLD",
