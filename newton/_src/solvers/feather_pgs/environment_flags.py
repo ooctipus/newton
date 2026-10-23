@@ -37,8 +37,8 @@ FLAGS = declare(
     _flag(
         "FEATHER_PGS_SINGLE_FACTOR",
         "retired",
-        ("environment_flags", *_SOLVER),
-        "Retired single-factor owner; =1 raises at construction (sparse admission still reads it).",
+        ("environment_flags",),
+        "Retired single-factor owner; =1 raises at construction.",
     ),
     _flag("FEATHER_PGS_BODY_BASIS_ROWS", "retired", ("environment_flags",), "Retired experiment; =1 raises."),
     _flag("FEATHER_PGS_SPARSE_PACKETS", "retired", ("environment_flags",), "Retired experiment; =1 raises."),

@@ -3225,17 +3225,6 @@ class SolverFeatherPGS(SolverBase):
         self._resolved_worlds = classifier.resolved
         self._resolved_worlds_reason = classifier.reason
 
-        if self._explicit_dense_kernels:
-            for name in (
-                "_tree_kinetic_state",
-                "_single_factor",
-            ):
-                if getattr(self, name, None) is not None:
-                    raise ValueError(
-                        f"Explicit dense kernel choices conflict with active research owner {name}; "
-                        "disable that research mode or use automatic kernel choices"
-                    )
-
         self._free_body_gyro_kernel = None
         if os.environ.get("FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO") == "1" and self._has_free_rigid_bodies:
             # A predictor experiment independent of contact scheduling. The
@@ -5355,10 +5344,7 @@ class SolverFeatherPGS(SolverBase):
         parallel_tier = self.mf_gs_parallel_rows > 0 and (
             self._point_contact_paths or (self._parallel_contact_paths and self.pgs_mode == "matrix_free")
         )
-        if parallel_tier or (
-            self._point_contact_paths
-            and (self.mf_gs_response_block_rows > 0 or os.environ.get("FEATHER_PGS_SINGLE_FACTOR") == "1")
-        ):
+        if parallel_tier or (self._point_contact_paths and self.mf_gs_response_block_rows > 0):
             self._sparse_selection_reason = "A competing response or publication owner reserves the ordinary buffers."
             return
         if self._has_free_rigid_bodies and (self._point_contact_paths or self._patch_dense_paths):
