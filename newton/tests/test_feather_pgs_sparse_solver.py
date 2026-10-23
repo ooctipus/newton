@@ -242,7 +242,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
                     actual = getattr(sparse[1], target).numpy()[world, :count]
                     expected = getattr(dense[1], target).numpy()[world, :count]
                     live_metadata = np.ones(count, dtype=bool)
-                    if family == 0 and sparse[1]._sparse_prepare_contacts:
+                    if family == 0:
                         # Prepared tangents consume prescribed targets directly
                         # in RHS; only normals retain restitution metadata.
                         live_metadata = kinds != PGS_CONSTRAINT_TYPE_FRICTION

@@ -724,7 +724,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
 
         Stand-ins carry what contact_row_plan and the record read, so the producers that need CUDA are
         pinned on CPU as well: local row packets, keyed rows, the compact contact boundary, native sparse
-        factors (with and without a metadata launch, with the free-body size), the sparse-diagonal owner
+        factors (with the free-body size), the sparse-diagonal owner
         (with and without its schedule marker) and the compact Jacobian, beside the general builder's
         methods and debug checks, each under both laws. The cases name every builder method, and every
         kernel they name is one the launch check recognizes.
@@ -789,17 +789,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     (18, 6),
                     "sparse_contact_response",
                     {18: ("sparse_response", [response.key]), 6: ("sparse_free_response", [response.key])},
-                    None,
-                ),
-                (
-                    sparse,
-                    {},
-                    (18, 6),
-                    "sparse_contact_response",
-                    {
-                        18: ("sparse_response", [prepare, response.key]),
-                        6: ("sparse_free_response", [prepare, response.key]),
-                    },
                     None,
                 ),
                 (

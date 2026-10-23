@@ -274,7 +274,6 @@ from .sparse_contact import (
     CONTACT_RING_FLOATS,
     SparseContactRows,
     _get_sparse_contact_response_kernel,
-    apply_sparse_contact_restitution,
     apply_sparse_factor_velocity,
     apply_sparse_free_velocity,
     build_sparse_joint_limit_rows,
@@ -5567,14 +5566,12 @@ class SolverFeatherPGS(SolverBase):
             and (sparse_choice == "on" or os.environ.get("FEATHER_PGS_SPARSE_SPLIT", "1") == "1")
             and self.pgs_kernel == "tiled_row"
             and not self._has_free_rigid_bodies
-            and self._kernel_overrides.get("sparse_prepare_contacts", True)
         )
         velocity_candidate = (
             self.pgs_mode == "matrix_free"
             and self.enable_joint_velocity_limits
             and (sparse_choice == "on" or os.environ.get("FEATHER_PGS_SPARSE_VELOCITY_LIMITS", "1") == "1")
             and not self._has_free_rigid_bodies
-            and self._kernel_overrides.get("sparse_prepare_contacts", True)
         )
         for supported, reason in (
             (
@@ -5802,7 +5799,8 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_max_row_support = int(max_support)
         self._sparse_split = split_candidate
         self._sparse_velocity_limits = velocity_candidate
-        self._sparse_prepare_contacts = bool(self._kernel_overrides.get("sparse_prepare_contacts", True))
+        # The sparse response kernel prepares the contact rows' metadata, CFM, bias and restitution.
+        self._sparse_prepare_contacts = True
         # The sparse producers overwrite every live value and retain factors by the mass mask.
         self._double_buffer = False
         self._local_internal_fast_path = False
@@ -5817,7 +5815,6 @@ class SolverFeatherPGS(SolverBase):
         offsets = self.articulation_world_dof_offset.numpy()
         if (
             self._kernel_overrides.get("sparse_row_support", True)
-            and self._sparse_prepare_contacts
             and not self._has_free_rigid_bodies
             and not self._mimic_count
             and np.all(articulated_counts == 1)
@@ -5905,7 +5902,7 @@ class SolverFeatherPGS(SolverBase):
         self._sparse_contact_response_kernel = _get_sparse_contact_response_kernel(
             size,
             lanes_per_contact=self._sparse_contact_lanes,
-            prepare_rows=self._sparse_prepare_contacts,
+            prepare_rows=True,
             use_support_table=use_support_table,
             **({"contact_records": True} if self._sparse_contact_records is not None else {}),
         )
@@ -16948,24 +16945,6 @@ class SolverFeatherPGS(SolverBase):
         if self._row_packets is not None or self._keyed_rows is not None:
             return  # The current packet producer applies the same incident-velocity law.
         if matrix_free:
-            if self._sparse_mass_matrix_size is not None:
-                wp.launch(
-                    apply_sparse_contact_restitution,
-                    dim=(self.world_count, self.dense_max_constraints),
-                    inputs=[
-                        self.constraint_count,
-                        self.phi,
-                        self.row_type,
-                        self.target_velocity,
-                        self.row_restitution,
-                        self._sparse_row_incident,
-                        dt,
-                        self._effective_restitution_velocity_threshold,
-                    ],
-                    outputs=[self.rhs],
-                    device=self.model.device,
-                )
-                return
             if self._sparse_diagonal_contact_solve:
                 wp.launch(
                     apply_sparse_diagonal_contact_restitution_matrix_free,

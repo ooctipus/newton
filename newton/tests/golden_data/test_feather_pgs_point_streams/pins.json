@@ -416,7 +416,6 @@
   "sparse_contact._get_sparse_contact_response_kernel(8, prepare_rows=True, use_support_table=False)": "9947c704d5dfe0da2fc418a1b537740c0e9567c188449553f72e5934a90582ba",
   "sparse_contact._get_sparse_contact_response_kernel(8, prepare_rows=True, use_support_table=True)": "4da139acf7e4ba6592358aa2d4dc7b0b969dd0210c99fb332ce7d8b4092c148f",
   "sparse_contact._get_sparse_contact_response_kernel(9, prepare_rows=True, use_support_table=False)": "e1a1c9f15d953d798e28fa9b8baab58952ad36f0d1b1cc03b00343056c81392c",
-  "sparse_contact.apply_sparse_contact_restitution": "f04a253b3e9c366e7f387958085e82e8628a99eb0e85eeda9f98adaeba092b87",
   "sparse_contact.apply_sparse_factor_velocity": "edfb7cd2075dffe2a29ba49c9648417adf8b4dbee5ad3cbc40c7a9dc4efde7df",
   "sparse_contact.apply_sparse_free_velocity": "4606fe82f9fbbf1b8f82d21fedccd62dcccfe19d1e8bc415ce9fd27d32ef73fc",
   "sparse_contact.build_sparse_joint_limit_rows": "184c6b7cf24dbd89e691d87afec19973f331afa47dadb1ffb5c88527ede1bf9f",

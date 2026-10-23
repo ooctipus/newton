@@ -651,7 +651,6 @@ def _sparse_mass_matrix(solver) -> dict:
         "reason": solver._sparse_selection_reason,
         "split": bool(solver._sparse_split),
         "velocity_limits": bool(solver._sparse_velocity_limits),
-        "prepare_contacts": bool(solver._sparse_prepare_contacts),
         "active_rows": bool(solver._sparse_active_rows),
         "active_rows_reason": solver._sparse_active_rows_reason,
         "support_table": bool(solver._sparse_row_support.enabled),
