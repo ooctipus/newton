@@ -808,7 +808,9 @@ class ScalarBranchState:
         self.lane_timing = {}
         # The predict folds the branches' augmented drives, so the drive
         # preparation runs only over the other DOFs.
-        others = np.setdiff1d(np.arange(model.joint_dof_count, dtype=np.int32), plan.dofs).astype(np.int32)
+        other = np.ones(model.joint_dof_count, dtype=bool)
+        other[plan.dofs[(plan.dofs >= 0) & (plan.dofs < model.joint_dof_count)]] = False
+        others = np.flatnonzero(other).astype(np.int32)
         self.other_drive_dofs = wp.array(others, dtype=int, device=device) if others.size else None
         self._plan_dimensions = self._dimensions()
 

@@ -1502,12 +1502,17 @@ class _FrictionPatchState:
                 "shape_is_solid",
             )
         }
+        # A body's radius bounds its shapes: the largest collision radius plus
+        # offset from the body origin, zero for a body without shapes.
+        shape_body = geometry["shape_body"]
+        offset = geometry["shape_transform"][:, None, :3]
+        # matmul takes each offset's dot product with BLAS, as np.linalg.norm does,
+        # so the extents match per-shape norms bit for bit.
+        extent = model.shape_collision_radius.numpy() + np.sqrt(np.matmul(offset, offset.swapaxes(1, 2))).reshape(-1)
+        # Only a positive extent raises a radius from zero; NaN never does.
+        reaching = (shape_body >= 0) & (extent > 0.0)
         radii = np.zeros(model.body_count, dtype=np.float32)
-        for body, radius, transform in zip(
-            geometry["shape_body"], model.shape_collision_radius.numpy(), geometry["shape_transform"], strict=True
-        ):
-            if body >= 0:
-                radii[body] = max(radii[body], radius + np.linalg.norm(transform[:3]))
+        np.maximum.at(radii, shape_body[reaching], extent[reaching])
         self.body_radius.assign(radii)
         if hasattr(self, "_geometry"):
             changed = np.zeros(len(geometry["shape_body"]), dtype=bool)
