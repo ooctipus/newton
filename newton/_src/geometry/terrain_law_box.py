@@ -1,22 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The terrain law's kernels for boxes (rules F, E, V, R and X of the law for solid cores).
+"""The terrain law's kernels for boxes (rules F, E, V and R of the law for solid cores).
 
 The kernels are :func:`~newton._src.geometry.terrain_law_solid.solid_kernels`'s for the class, launched in the order of
 :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LAUNCHES` (:mod:`~newton._src.geometry.terrain_shadow`):
 :func:`terrain_box_rows` (the whole-pair rejects, one thread per pair), the scan :func:`terrain_box_rows_scan`, the job
 kernels :func:`terrain_box_rows_faces`, :func:`terrain_box_rows_edges`, :func:`terrain_box_rows_thetas`,
 :func:`terrain_box_rows_creases` and :func:`terrain_box_rows_vertices` (one thread per listed feature), the close
-:func:`terrain_box_rows_close` and rule R's :func:`terrain_box_rows_recovery`, rule X's gate
-:func:`terrain_box_rows_xbound`, :func:`terrain_box_rows_xitems`, :func:`terrain_box_rows_xvalleys`,
-:func:`terrain_box_rows_xdescents` and :func:`terrain_box_rows_exit`, the finish kernels :func:`terrain_box_rows_small`
-(one thread per pair with a plane group of three) and :func:`terrain_box_rows_finish` (a block of lanes per pair of
-:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LANE_ROWS` rows, which no walking pair holds: not
-launched), and last the pairs the others deferred: :func:`terrain_box_rows_pooled` finishes those with more distinct
-rows than the class's 16 walk slots from their pooled candidates, :func:`terrain_box_rows_full` walks those whose work
-found no room. The walk, the rules and the finish are :mod:`~newton._src.geometry.terrain_law_solid`'s; the module is
-compiled without floating-point contraction, so the CPU decides every boundary as the GPU does.
+:func:`terrain_box_rows_close` and rule R's :func:`terrain_box_rows_recovery`, the finish kernels
+:func:`terrain_box_rows_small` (one thread per pair with a plane group of three) and :func:`terrain_box_rows_finish` (a
+block of lanes per pair of :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LANE_ROWS` rows, which no
+walking pair holds: not launched), and last the pairs the others deferred: :func:`terrain_box_rows_pooled` finishes
+those with more distinct rows than the class's 16 walk slots from their pooled candidates, :func:`terrain_box_rows_full`
+walks those whose work found no room. The walk, the rules and the finish are
+:mod:`~newton._src.geometry.terrain_law_solid`'s; the module is compiled without floating-point contraction, so the CPU
+decides every boundary as the GPU does.
 """
 
 from __future__ import annotations
@@ -75,11 +74,6 @@ terrain_box_rows_creases = _KERNELS["creases"]
 terrain_box_rows_vertices = _KERNELS["vertices"]
 terrain_box_rows_close = _KERNELS["close"]
 terrain_box_rows_recovery = _KERNELS["recovery"]
-terrain_box_rows_xbound = _KERNELS["xbound"]
-terrain_box_rows_xitems = _KERNELS["xitems"]
-terrain_box_rows_xvalleys = _KERNELS["xvalleys"]
-terrain_box_rows_xdescents = _KERNELS["xdescents"]
-terrain_box_rows_exit = _KERNELS["exit"]
 terrain_box_rows_small = _KERNELS["small"]
 terrain_box_rows_finish = _KERNELS["finish"]
 terrain_box_rows_pooled = _KERNELS["pooled"]

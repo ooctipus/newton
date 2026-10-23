@@ -70,18 +70,11 @@ jobs and the solid classes' :class:`~newton._src.geometry.terrain_law_solid.Terr
    pool with their place in window order.
 4. The close, the job threads over the live pairs: a pair's candidates held in window order (the walk's held rows),
    then rule R's kernel over the pairs without a row; a pair's held rows are written as they are when the finish keeps
-   them so (fewer than its class's lane rows, no plane group of three), else held for a finish kernel; a core reaching
-   below its window's highest vertex lists rule X's items.
-5. Rule X's gate (per listed window vertex under the core's footprint: whether an exit over its cell can pass the
-   pair's target), then the items of the pairs it opened (a core point, or a window vertex that can give a
-   candidate), valleys and the listed candidates' near-bound descents, the job threads again: they list the candidates
-   whose bounds pass the pair's target; then the exit kernel, one thread per pair of the class (its exit list's room),
-   runs rule X's passes over the listed candidates (exact: any other candidate is a no-op in both passes) and
-   finishes the pair.
-6. The finish kernels: one thread per pair over the pairs with a plane group of three (the small-pair finish), and a
+   them so (fewer than its class's lane rows, no plane group of three), else held for a finish kernel.
+5. The finish kernels: one thread per pair over the pairs with a plane group of three (the small-pair finish), and a
    block of lanes per pair over those holding the lane rows, the lanes splitting its implied-row tests (not launched
    while no class's walk slots hold them).
-7. The full-finish kernel (below).
+6. The full-finish kernel (below).
 
 The full-finish kernel of a class, ``wp.launch_tiled`` on the fixed grid of its
 :class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`
@@ -170,17 +163,12 @@ def _solid_launches(name: str) -> tuple[tuple[str, str], ...]:
         "vertices",
         "close",
         "recovery",
-        "xbound",
-        "xitems",
-        "xvalleys",
-        "xdescents",
-        "exit",
         "small",
         "finish",
         "pooled",
         "full",
     )
-    pair_jobs = ("close", "exit", "small")
+    pair_jobs = ("close", "small")
     kinds = tuple(
         "pairs"
         if kernel == "rows"
@@ -221,11 +209,10 @@ The module is imported only when the class is listed. Launch kinds, every one wi
   :class:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs` and the solid classes'
   :class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData` (a solid class's whole-pair rejects);
 * ``jobs``: the class's job threads (:attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.threads`), the same
-  arguments (a solid class's scan and job kernels, each striding over its list; a job kernel whose list has no room by
-  construction is not launched, :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LIST_OF_KERNEL`);
+  arguments (a solid class's scan and job kernels, each striding over its list);
 * ``pair_jobs``: the same over a list of the class's pairs, with at most one thread per pair
-  (:attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.pair_threads`: a solid class's close and exit
-  kernels and the small-pair finish);
+  (:attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.pair_threads`: a solid class's close and the
+  small-pair finish);
 * ``pair_tiles``: ``wp.launch_tiled`` with
   :attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.finish_blocks` blocks of
   :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK` lanes, a pair per block at a time over a list of the
@@ -262,8 +249,8 @@ A class's module and kernels follow one protocol (the helpers live in :mod:`~new
 
 TERRAIN_LAW_SOLID_CLASSES = (TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_HULL)
 """Partner classes whose kernels take the solid classes' data
-(:class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData`: hull tables and rule X's exit lists, built once
-when one of them is listed) and their class's jobs."""
+(:class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData`: the hull tables, built once when one of them is
+listed) and their class's jobs."""
 
 TERRAIN_LANE_NAMES = {TERRAIN_LANE_THREAD: "thread", TERRAIN_LANE_TILE: "tiled"}
 """Names of the pair table's lane classes, by id (the table orders a class's pairs by lane class id)."""
@@ -350,23 +337,20 @@ TERRAIN_LAW_SPILL_SHARE = 256
 pair's bound (:meth:`TerrainLawShadow.default_spill_rows`): the worst case of one pair in 256 at once. On the recorded
 suite scenes (16,384 worlds) that is 11 to 25% of the walk slots, while at most one pair spilled (30 rows)."""
 
-TERRAIN_LAW_JOB_COUNTERS = 14
-"""Counters of a solid class's jobs: its six job lists, its candidate pool, its live pairs, its pairs left to rule R,
-its scan's runs, its listed rule X candidates' descents, its deferred pairs walked again and its pairs finished by a
-block's lanes (:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_COUNTERS`)."""
+TERRAIN_LAW_JOB_COUNTERS = 11
+"""Counters of a solid class's jobs: its four job lists, its candidate pool, its live pairs, its pairs left to rule R,
+its scan's runs, its deferred pairs walked again, its pairs finished by a block's lanes and those finished by the
+small-pair finish kernel (:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_COUNTERS`)."""
 
 TERRAIN_LAW_JOB_NAMES = (
     "faces",
     "edges",
     "thetas",
     "vertices",
-    "xitems",
-    "xvalleys",
     "candidates",
     "live",
     "recovery",
     "scans",
-    "xdescents",
     "walks",
     "lanes",
     "small",
@@ -386,16 +370,10 @@ _SPILLED = 2 * TERRAIN_PARTNER_CLASSES
 """Offset of the spill rows asked for."""
 _RESERVED = _SPILLED + 1
 """Offset of the spill rows reserved."""
-_EXITS = _RESERVED + 1
-"""Offset of the per-class counters of the pairs left to rule X's exit kernels."""
-_EXIT_WORK = _EXITS + TERRAIN_PARTNER_CLASSES
-"""Offset of rule X's exit searches and the window vertices they covered."""
-_JOBS = _EXIT_WORK + 2
+_JOBS = _RESERVED + 1
 """Offset of the per-class job counters (:data:`TERRAIN_LAW_JOB_COUNTERS` per class)."""
 _COUNTERS = _JOBS + TERRAIN_PARTNER_CLASSES * TERRAIN_LAW_JOB_COUNTERS
 """The shadow's counters, all zeroed by one memset before every launch."""
-_RULE_X_KERNELS = ("xbound", "xitems", "xvalleys", "xdescents", "exit")
-"""A solid class's kernels of rule X, not launched when the law leaves it out (:attr:`TerrainLawShadow.rule_x`)."""
 
 
 @wp.func
@@ -421,14 +399,8 @@ def _print_job_list(k: int):
         wp.printf("rule E crease (theta*) job list")
     elif k == wp.static(TERRAIN_LAW_JOB_NAMES.index("vertices")):
         wp.printf("rule V vertex job list")
-    elif k == wp.static(TERRAIN_LAW_JOB_NAMES.index("xitems")):
-        wp.printf("rule X item list")
-    elif k == wp.static(TERRAIN_LAW_JOB_NAMES.index("xvalleys")):
-        wp.printf("rule X valley list")
-    elif k == wp.static(TERRAIN_LAW_JOB_NAMES.index("candidates")):
-        wp.printf("candidate pool")
     else:
-        wp.printf("rule X candidate region")
+        wp.printf("candidate pool")
 
 
 @wp.kernel(enable_backward=False)
@@ -604,22 +576,6 @@ def parse_terrain_law_shadow_jobs(value: str | None) -> float | None:
     return scale
 
 
-def parse_terrain_law_rule_x(value: str | None) -> bool:
-    """Return whether a ``NEWTON_TERRAIN_LAW_RULE_X`` value runs rule X (off by default).
-
-    Args:
-        value: ``1`` to run it, ``0`` to leave it out; ``None`` or blank for the default (out).
-
-    Raises:
-        ValueError: On any other value.
-    """
-    if value is None or not value.strip():
-        return False
-    if value.strip() not in ("0", "1"):
-        raise ValueError(f"NEWTON_TERRAIN_LAW_RULE_X must be 0 or 1, not {value!r}")
-    return value.strip() == "1"
-
-
 class TerrainLawShadow:
     """The terrain law's kernels for some partner classes, run after the narrow phase into a side buffer.
 
@@ -652,10 +608,8 @@ class TerrainLawShadow:
         status: wp.array | None = None,
         spill_rows: int | None = None,
         job_scale: float | None = None,
-        rule_x: bool = False,
     ):
         started = time.perf_counter()
-        self.rule_x = bool(rule_x)
         self.device = model.device
         self.classes = tuple(sorted(int(c) for c in classes))
         missing = [c for c in self.classes if c not in TERRAIN_LAW_KERNELS]
@@ -673,9 +627,8 @@ class TerrainLawShadow:
         slot_first = np.full(self.table.pair_count, -1, np.int64)
         slot = 0
         device = self.device
-        # Per class its deferred pairs, per class its queued pairs, the spill rows asked for and reserved, per class its
-        # pairs left to rule X, rule X's exit searches and their window vertices, and per class its jobs: zeroed by one
-        # memset before every launch.
+        # Per class its deferred pairs, per class its queued pairs, the spill rows asked for and reserved, and per class
+        # its jobs: zeroed by one memset before every launch.
         self._counters = wp.zeros(_COUNTERS, dtype=wp.int32, device=device)
         capacities = np.zeros(TERRAIN_PARTNER_CLASSES * TERRAIN_LAW_JOB_COUNTERS, np.int32)
         solid_pairs = []
@@ -706,12 +659,8 @@ class TerrainLawShadow:
             scratch = terrain_finish_scratch(device, int(self.table.candidates[begin:end].max()))
             if solid:
                 solid_pairs.append((begin, end - begin))
-                partners = self.table.pairs_host[begin:end, 1]
-                points, takes = solid_module.terrain_solid_exit_items(model, partners)
                 capacity = solid_module.terrain_solid_job_capacities(
                     self.table.vertices[begin:end],
-                    points,
-                    takes,
                     self.table.candidates[begin:end],
                     walk,
                     scan_run=int(TERRAIN_PARTNER_SCAN_RUN[partner_class]),
@@ -725,10 +674,9 @@ class TerrainLawShadow:
                     end - begin,
                     capacity,
                     counts=self._counters[offset : offset + TERRAIN_LAW_JOB_COUNTERS],
-                    rule_x=self.rule_x,
                 )
                 self._jobs[partner_class] = jobs
-                names = (*solid_module.TERRAIN_SOLID_JOB_LISTS, "candidates", "scans", "xdescents")
+                names = (*solid_module.TERRAIN_SOLID_JOB_LISTS, "candidates", "scans")
                 # the live, rule R and lane lists hold every pair of the class: no check
                 for name in names:
                     capacities[offset - _JOBS + TERRAIN_LAW_JOB_NAMES.index(name)] = capacity[name]
@@ -739,10 +687,6 @@ class TerrainLawShadow:
                     if kind == "pairs":
                         self._launches.append(("thread", kernel, end - begin, begin, slot, (jobs, True)))
                     elif kind == "pair_jobs":
-                        if kernel_name.removeprefix(prefix) in _RULE_X_KERNELS and not self.rule_x:
-                            # rule X left out: no pair is left to its exit kernel
-                            skipped.append(kernel_name.removeprefix(prefix))
-                            continue
                         self._launches.append(("thread", kernel, jobs.pair_threads, begin, slot, (jobs, True)))
                     elif kind == "pair_tiles":
                         if kernel_name == prefix + "finish" and walk < solid_module.TERRAIN_SOLID_LANE_ROWS:
@@ -751,20 +695,6 @@ class TerrainLawShadow:
                             continue
                         self._launches.append(("tiled", kernel, jobs.finish_blocks, begin, slot, (jobs, True)))
                     elif kind == "jobs":
-                        # a list none of the class's pairs can fill: no launch
-                        short = kernel_name.removeprefix(prefix)
-                        listed = solid_module.TERRAIN_SOLID_LIST_OF_KERNEL.get(short)
-                        if listed is not None and capacity[listed] == 0:
-                            skipped.append(short)
-                            continue
-                        if short in _RULE_X_KERNELS and not self.rule_x:
-                            # rule X left out: its pairs are finished by their close
-                            skipped.append(short)
-                            continue
-                        if short == "xbound" and partner_class == TERRAIN_PARTNER_HULL:
-                            # rule X's gate does not bound a hull's exits (core_exits_gated): its pairs are open at once
-                            skipped.append(short)
-                            continue
                         self._launches.append(("thread", kernel, jobs.threads, begin, slot, (jobs, True)))
                     else:
                         self._launches.append(("tiled", kernel, scratch.blocks, begin, slot, (scratch, True, jobs)))
@@ -835,13 +765,7 @@ class TerrainLawShadow:
         self._unsupported_pairs = 0
         if solid_pairs:
             partners = np.concatenate([self.table.pairs_host[b : b + c, 1] for b, c in solid_pairs])
-            self._solids = solid_module.terrain_solid_data(
-                model,
-                partners,
-                pairs=self.table.pair_count,
-                exit_count=self._counters[_EXITS : _EXITS + TERRAIN_PARTNER_CLASSES],
-                exit_work=self._counters[_EXIT_WORK : _EXIT_WORK + 2],
-            )
+            self._solids = solid_module.terrain_solid_data(model, partners)
             classes = np.concatenate([self.table.partner_class[b : b + c] for b, c in solid_pairs])
             self._unsupported_pairs = int(
                 np.count_nonzero(solid_module.terrain_solid_unsupported(classes, model.shape_type.numpy()[partners]))
@@ -1012,14 +936,6 @@ class TerrainLawShadow:
         rows, candidates, jobs = (int(v) for v in self._out.overflow.numpy())
         return rows, candidates, jobs
 
-    def exit_work(self) -> tuple[int, int]:
-        """Return rule X's exit searches of the last launch and the window vertices they covered (0 without a solid
-        class)."""
-        if self.device.is_capturing:
-            raise RuntimeError("Terrain-law shadow counters must be read outside graph capture")
-        searches, vertices = (int(v) for v in self._counters.numpy()[_EXIT_WORK : _EXIT_WORK + 2])
-        return searches, vertices
-
     def job_counts(self) -> dict[str, dict[str, int]]:
         """Return, per listed solid class with pairs, the entries its last launch asked of every job list, of its
         candidate pool and of its scan's runs (past a capacity, :meth:`describe`'s ``launch_shapes``: entries without
@@ -1059,11 +975,10 @@ class TerrainLawShadow:
         :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_FULL_SCRATCH_BYTES`); for the point class ``thread_dim``
         (the one-thread kernel's threads, one per pair of the class) and ``tiled_blocks`` (the tiled kernel's grid, 0
         without a tiled segment); for a solid class ``pair_dim`` (its whole-pair rejects' threads, one per pair of the
-        class), ``job_threads`` (its scan and job kernels' threads), ``pair_job_threads`` (its close, rule R and exit
-        kernels' threads, at most one per pair of the class), ``finish_blocks`` (its finish kernel's grid), ``jobs``
-        (the entries
-        of its job lists, its candidate pool's rows, its scan's runs and rule X's candidates) and ``skipped`` (its job
-        kernels not launched: their lists have no room, none of its pairs can list an entry). ``slots`` and
+        class), ``job_threads`` (its scan and job kernels' threads), ``pair_job_threads`` (its close and small-pair
+        finish kernels' threads, at most one per pair of the class), ``finish_blocks`` (its rule R and finish kernels'
+        grid), ``jobs`` (the entries of its job lists, its candidate pool's rows and its scan's runs) and ``skipped``
+        (its kernels not launched: the finish kernel, whose lane list no walk of the class fills). ``slots`` and
         ``spill_rows`` are the side buffer's walk slots and spill rows.
         """
         pairs = {}
@@ -1112,7 +1027,6 @@ class TerrainLawShadow:
                     hulls.hull_faces,
                     hulls.hull_triangles,
                     hulls.shape_hull,
-                    self._solids.exits,
                 )
             )
         solids = {}

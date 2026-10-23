@@ -431,13 +431,12 @@ def body_scene(heights, hx, hy, bodies, *, device, margin=SCENE_MARGIN, gap=SCEN
     return builder.finalize(device=device), heightfield, shapes
 
 
-def shadow_pipeline(model, *, classes: str = "point", rule_x: bool = True, **kwargs):
-    """A collision pipeline built with ``NEWTON_TERRAIN_LAW_SHADOW=classes`` and rule X run (``rule_x``, the float64
-    law's; the pipeline's default leaves it out) or not (keyword arguments pass through)."""
+def shadow_pipeline(model, *, classes: str = "point", **kwargs):
+    """A collision pipeline built with ``NEWTON_TERRAIN_LAW_SHADOW=classes`` (keyword arguments pass through)."""
     import os  # noqa: PLC0415
     from unittest.mock import patch  # noqa: PLC0415
 
-    environ = {"NEWTON_TERRAIN_LAW_SHADOW": classes, "NEWTON_TERRAIN_LAW_RULE_X": "1" if rule_x else "0"}
+    environ = {"NEWTON_TERRAIN_LAW_SHADOW": classes}
     with patch.dict(os.environ, environ):
         return newton.CollisionPipeline(model, **kwargs)
 

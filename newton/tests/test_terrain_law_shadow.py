@@ -44,8 +44,6 @@ from newton._src.geometry.terrain_law_solid import (
     TERRAIN_SOLID_JOB_LISTS,
     TERRAIN_SOLID_JOB_THREADS_CPU,
     TERRAIN_SOLID_LAUNCHES,
-    TERRAIN_SOLID_LIST_OF_KERNEL,
-    terrain_solid_exit_items,
     terrain_solid_job_capacities,
 )
 from newton._src.geometry.terrain_shadow import (
@@ -54,7 +52,6 @@ from newton._src.geometry.terrain_shadow import (
     TERRAIN_LAW_KERNELS,
     TERRAIN_LAW_SPILL_SHARE,
     TerrainLawShadow,
-    parse_terrain_law_rule_x,
     parse_terrain_law_shadow,
     parse_terrain_law_shadow_jobs,
     parse_terrain_law_shadow_rows,
@@ -529,17 +526,6 @@ class TestTerrainLawShadow(unittest.TestCase):
                 parse_terrain_law_shadow_jobs(value)
         with patch.dict(os.environ, {"NEWTON_TERRAIN_LAW_SHADOW_JOBS": "0"}), self.assertRaises(ValueError):
             tu.shadow_pipeline(model, **PIPELINE)
-        # Rule X: off unless asked for.
-        self.assertFalse(parse_terrain_law_rule_x(None))
-        self.assertFalse(parse_terrain_law_rule_x(" "))
-        self.assertFalse(parse_terrain_law_rule_x("0"))
-        self.assertTrue(parse_terrain_law_rule_x(" 1 "))
-        for value in ("2", "yes", "on"):
-            with self.assertRaisesRegex(ValueError, "NEWTON_TERRAIN_LAW_RULE_X"):
-                parse_terrain_law_rule_x(value)
-        with patch.dict(os.environ, {"NEWTON_TERRAIN_LAW_SHADOW": "all", "NEWTON_TERRAIN_LAW_RULE_X": "on"}):
-            with self.assertRaises(ValueError):
-                newton.CollisionPipeline(model, **PIPELINE)
         # The shadow's own option takes the same factors: none of these would size a list.
         for value in (0, -1.0, float("inf"), float("nan")):
             with self.subTest(job_scale=value), self.assertRaisesRegex(ValueError, "positive finite factor"):
@@ -553,7 +539,6 @@ class TestTerrainLawShadow(unittest.TestCase):
         overflowing = {
             (TERRAIN_PARTNER_BOX, "faces"): (9, 5),
             (TERRAIN_PARTNER_CYLINDER, "candidates"): (70, 64),
-            (TERRAIN_PARTNER_CYLINDER, "xdescents"): (3, 2),
             (TERRAIN_PARTNER_HULL, "scans"): (12, 11),
         }
         capacities = np.zeros(4 * TERRAIN_LAW_JOB_COUNTERS, np.int32)
@@ -586,7 +571,6 @@ class TestTerrainLawShadow(unittest.TestCase):
         self.assertEqual(len(lines), len(overflowing), msg=message)
         self.assertIn("Terrain-law box class: its rule F face job list overflowed 9 > 5", message)
         self.assertIn("Terrain-law cylinder class: its candidate pool overflowed 70 > 64", message)
-        self.assertIn("Terrain-law cylinder class: its rule X candidate region overflowed 3 > 2", message)
         self.assertIn("Raise NEWTON_TERRAIN_LAW_SHADOW_JOBS", message)
         self.assertIn("Terrain-law hull class: its scan's runs overflowed 12 > 11", message)
         self.assertIn("Rebuild the collision pipeline", message)
@@ -774,8 +758,7 @@ class TestTerrainLawShadow(unittest.TestCase):
         """Record the solid classes' pairs per lane class, launches, data, job scale, kernel grids, job capacities and
         coreless pairs: one block size, one thread per pair for the whole-pair rejects, the job threads for the others,
         the full-finish grid, and job lists and a candidate pool sized from the pairs' own bounds, the scan's jobs
-        exactly; no launch of a job kernel whose list none of the class's pairs can fill (rule X's valleys of boxes and
-        hulls)."""
+        exactly."""
         rng = np.random.default_rng(8)
         heights = np.round(rng.uniform(0.0, 0.05, (17, 17)) / 0.005) * 0.005
         bodies = [
@@ -812,41 +795,29 @@ class TestTerrainLawShadow(unittest.TestCase):
                     begin, end = table.segment(partner_class, lane)
                     lanes[lane_name] = end - begin
                 self.assertEqual(record["pairs"][name], lanes)
-                # with pairs: the class's launches (whole-pair rejects, scan, job kernels, close, rule R, rule X's
-                # items, valleys and exit kernel, full kernel)
+                # with pairs: the class's launches (whole-pair rejects, scan, job kernels, close, rule R, small-pair
+                # finish, full kernels)
                 count = sum(lanes.values())
                 if count:
                     begin = table.segment(partner_class, TERRAIN_LANE_THREAD)[0]
                     end = begin + count
                     candidates = int(table.candidates[begin:end].max())
                     walk = int(TERRAIN_PARTNER_WALK_SLOTS[partner_class])
-                    points, takes = terrain_solid_exit_items(scene, table.pairs_host[begin:end, 1])
                     capacities = terrain_solid_job_capacities(
                         table.vertices[begin:end],
-                        points,
-                        takes,
                         table.candidates[begin:end],
                         walk,
                         scan_run=int(TERRAIN_PARTNER_SCAN_RUN[partner_class]),
                     )
-                    names = (*TERRAIN_SOLID_JOB_LISTS, "candidates", "scans", "xdescents")
+                    names = (*TERRAIN_SOLID_JOB_LISTS, "candidates", "scans")
                     self.assertEqual(sorted(capacities), sorted(names))
                     # the scan's jobs: every pair's runs of window vertices at its largest window
                     run = int(TERRAIN_PARTNER_SCAN_RUN[partner_class])
                     scans = int(np.sum(-(-table.vertices[begin:end].astype(np.int64) // run)))
                     self.assertEqual(capacities["scans"], scans)
                     longest = max(capacities[n] for n in (*TERRAIN_SOLID_JOB_LISTS, "scans"))
-                    skipped = [k for k, n in TERRAIN_SOLID_LIST_OF_KERNEL.items() if capacities[n] == 0]
-                    # rule X's valleys only for a class some of whose pairs take candidates at window vertices
-                    # (cylinders and cones, ellipsoids): never for boxes
-                    self.assertEqual(skipped, ["xvalleys"] if not np.any(takes) else [])
-                    if name == "box":
-                        self.assertEqual(skipped, ["xvalleys"])
-                    # rule X's gate bounds no hull's exits: never launched for hulls; no class's walk slots hold the
-                    # lane rows: the lanes' finish is launched for none
-                    if name == "hull":
-                        skipped = ["xbound", *skipped]
-                    skipped = [*skipped, "finish"]
+                    # no class's walk slots hold the lane rows: the lanes' finish is launched for none
+                    skipped = ["finish"]
                     launches += len(TERRAIN_SOLID_LAUNCHES) - len(skipped)
                     self.assertEqual(
                         record["launch_shapes"][name],

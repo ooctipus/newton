@@ -930,48 +930,6 @@ def _exit_row(
 
 
 @wp.func
-def terrain_point_exit(
-    data: TerrainFeatureData,
-    window: TerrainWindow,
-    planes: TerrainPlanes,
-    k: wp.vec3,
-    cells: wp.vec4i,
-    eps: float,
-    reach: float,
-) -> tuple[TerrainPlanes, bool, wp.vec3, wp.vec3, float, int]:
-    """The exit of window-frame point ``k`` inside the solid, as rule P gives a sphere centre's: of the minima of the
-    window's features (every vertex of the window ``cells``, its six items in window order) the one with the
-    smallest translation, the first on ties (G2); with none, the face vertically above it (G3).
-
-    Returns ``(planes, found, q, n, d, feature)``: the exit's terrain point, normal, core distance (negative) and
-    feature id (point slot 0). Rule X of the solid law calls it on the core's candidate deepest points.
-    """
-    core = _PointCore()
-    core.a = k
-    core.b = k
-    core.reach = reach
-    core.eps = eps
-    core.below_a = 1
-    core.below_b = 1
-    core.low = k[2] - reach
-    best = _Claim()
-    found = bool(False)
-    r1 = cells[1]
-    c1 = cells[3]
-    for r in range(cells[0], r1 + 2):
-        for c in range(cells[2], c1 + 2):
-            for feature in range(_SPHERE_ITEMS):
-                planes, claim = _end_item(data, window, planes, core, 0, k, 1, r, c, r1, c1, feature)
-                if claim.kind == _EXIT_A and (not found or claim.d > best.d):
-                    best = claim
-                    found = True
-    if not found:
-        planes, best = _exit_row(data, window, planes, k, 0)
-        found = best.kind != 0
-    return planes, found, best.q, best.n, best.d, best.feature
-
-
-@wp.func
 def _wide(cells: wp.vec4i) -> int:
     if cells[1] - cells[0] + 1 >= _WIDE or cells[3] - cells[2] + 1 >= _WIDE:
         return TERRAIN_PAIR_WIDE

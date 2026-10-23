@@ -564,6 +564,40 @@ class TestSelectionEnvironment(unittest.TestCase):
         with _environment({"NEWTON_HEIGHTFIELD_CELL_REJECT": "0"}):
             self.assertEqual(pipeline.get_collision_selection()["environment"], expected)
 
+    def test_collision_pipeline_warns_once_per_process_about_retired_names(self):
+        """Warn at the caller once per process for each retired NEWTON_ name, keep recording it and never raise.
+
+        ``NEWTON_TERRAIN_LAW_RULE_X`` selected the terrain law's removed rule X: any value builds the pipeline, which
+        lists it as retired.
+        """
+        model = _cpu_model()
+        with patch.object(core_flags, "_WARNED_RETIRED", set()):
+            with (
+                _environment({"NEWTON_TERRAIN_LAW_RULE_X": "1"}),
+                self.assertWarnsRegex(
+                    UserWarning,
+                    r"^Ignoring retired environment variables that select nothing: NEWTON_TERRAIN_LAW_RULE_X\.",
+                ) as caught,
+            ):
+                first = newton.CollisionPipeline(model)
+            self.assertEqual(os.path.basename(caught.filename), os.path.basename(__file__))
+            with (
+                _environment({"NEWTON_TERRAIN_LAW_RULE_X": "0", "NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD": "0"}),
+                warnings.catch_warnings(record=True) as seen,
+            ):
+                warnings.simplefilter("always")
+                second = newton.CollisionPipeline(model)
+                third = newton.CollisionPipeline(model)
+        self.assertEqual(
+            [str(item.message).split(": ")[1].split(".")[0] for item in seen], ["NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD"]
+        )
+        self.assertEqual(first.get_collision_selection()["environment"]["retired"], ["NEWTON_TERRAIN_LAW_RULE_X"])
+        for pipeline in (second, third):
+            self.assertEqual(
+                pipeline.get_collision_selection()["environment"]["retired"],
+                ["NEWTON_HEIGHTFIELD_ADAPTIVE_MANIFOLD", "NEWTON_TERRAIN_LAW_RULE_X"],
+            )
+
     def test_collision_pipeline_reports_overridden_environment(self):
         """Report the NEWTON_ names an explicit argument superseded apart from the applied ones."""
         flags = {

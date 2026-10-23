@@ -197,8 +197,6 @@ TERRAIN_PAIR_FULL = wp.constant(128)
 finish kernel."""
 TERRAIN_PAIR_UNSUPPORTED = wp.constant(256)
 """Pair state: the partner's shape has no core in the law yet (a barrel cylinder in the hull class; no row)."""
-TERRAIN_PAIR_EXIT = wp.constant(512)
-"""Pair state, transient: the pair's walk holds its rows and left it to its solid class's exit kernel (rule X)."""
 TERRAIN_PAIR_JOBS = wp.constant(1024)
 """Pair state, transient: a solid pair's scan listed its window's features for its class's job kernels, and its close
 kernel takes their rows."""
@@ -1208,27 +1206,6 @@ def terrain_edge_open_crease(data: TerrainFeatureData, window: TerrainWindow, r:
     if code == TERRAIN_VERTEX_EDGE_CONCAVE:
         return r - window.r0 > _CREASE_CELLS - 2 or c - window.c0 > _CREASE_CELLS - 2
     return code == 0
-
-
-@wp.func
-def terrain_edge_open_valley(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, which: int) -> bool:
-    """Return whether edge ``which`` of window vertex ``(r, c)`` is a crease that may be concave in the window's frame:
-    not flat, not on the border (:func:`terrain_edge_kind`), and not a crease of code 0 at a vertex without
-    :data:`TERRAIN_VERTEX_CREASE_UNSURE_BIT`, which every frame of :data:`TERRAIN_CREASE_STATIC_CELLS` cells classes
-    convex (:func:`terrain_crease_static`; farther from the reference vertex the frame's test decides). One read of
-    the vertex's bits."""
-    surface = window.surface
-    if r < 0 or c < 0 or r >= surface.nrow or c >= surface.ncol:
-        return terrain_edge_kind(data, surface, r, c, which) < 0
-    bits = terrain_vertex_bits(data, surface, r, c)
-    code = (bits >> (2 * which)) & 3
-    if code == TERRAIN_VERTEX_EDGE_CONCAVE:
-        return True
-    if code != 0:
-        return False
-    if (bits & TERRAIN_VERTEX_CREASE_UNSURE_BIT) != 0:
-        return True
-    return r - window.r0 > _CREASE_CELLS - 2 or c - window.c0 > _CREASE_CELLS - 2
 
 
 @wp.func

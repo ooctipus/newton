@@ -331,12 +331,10 @@ NEWTON_FLAGS = declare(
     ),
     EnvironmentFlag(
         "NEWTON_TERRAIN_LAW_RULE_X",
-        "experiment",
-        _COLLIDE,
-        "1 runs the terrain law's rule X (a solid core's deepest exit, offered where it lies deeper than every other "
-        "row of its pair); unset or 0 leaves it out (default: on the law's own operating states it gave no row while "
-        "its kernels cost up to 0.9 ms per env step). Read whenever the terrain law runs (by default with heightfield "
-        "pairs, or in shadow).",
+        "retired",
+        ("core.environment_flags",),
+        "Retired terrain-law rule X (a solid core's deepest exit, which gave no row at the law's operating point); "
+        "ignored, and the collision pipeline warns once per process.",
     ),
     EnvironmentFlag(
         "NEWTON_TERRAIN_LAW_SHADOW_ROWS",

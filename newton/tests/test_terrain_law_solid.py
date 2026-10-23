@@ -121,13 +121,13 @@ LYING = _axis_angle((0.0, 1.0, 0.0), np.pi / 2.0)
 """A cylinder's axis (local z) onto world x."""
 
 
-def _collide(model, *, shadow: bool, rule_x: bool = True, **kwargs):
-    """Collide once on today's route as the suite runs it (:data:`SUITE_ROUTE`), with every class in shadow (rule X
-    run or not) or none (``NEWTON_TERRAIN_LAW=none``: the terrain route writes every heightfield contact)."""
+def _collide(model, *, shadow: bool, **kwargs):
+    """Collide once on today's route as the suite runs it (:data:`SUITE_ROUTE`), with every class in shadow or none
+    (``NEWTON_TERRAIN_LAW=none``: the terrain route writes every heightfield contact)."""
     options = dict(PIPELINE, **kwargs)
     with patch.dict(os.environ, SUITE_ROUTE):
         if shadow:
-            pipeline = tu.shadow_pipeline(model, classes="all", rule_x=rule_x, **options)
+            pipeline = tu.shadow_pipeline(model, classes="all", **options)
         else:
             pipeline = tu.terrain_route_pipeline(model, **options)
     contacts = pipeline.contacts()
@@ -944,10 +944,10 @@ def _penetration_violations(pairs):
 
 LP_SHORT = 0
 """Exposed-cell cases of 40 whose deepest row may be short of the core's depth: none of this seed's (the law leaves
-ties short, 5 of 4,000 cases of the generator)."""
-BURIED_SHORT = 0
-"""Buried solids of 120 whose deepest row may be short of the core's depth: none of this seed's (the law leaves ties
-short, 27 of 12,000 of the generators)."""
+74 of 4,000 cases of the generator short)."""
+BURIED_SHORT = 1
+"""Buried solids of 120 whose deepest row may be short of the core's depth: one of this seed's, a cone 14 mm short (the
+law leaves 154 of 12,000 of the generators short)."""
 
 
 def test_exposed_cell_rows_follow_the_law(test, device):
@@ -958,49 +958,18 @@ def test_exposed_cell_rows_follow_the_law(test, device):
     over that prism (today's route misses 1,569 of 2,000 cases), which a per-pair law that emits one support set per
     pair, not one row per triangle, does not do by design; here a pair's deepest row must reach its core's depth.
 
-    Rule X exits the core's deepest candidate point (its rims' points farthest from the valleys and vertices under
-    them), so a pair reaches its depth unless its deepest point is a tie: equally far from two or more surface points,
-    inside a cap or the side (DESIGN 1.3 and 8.5). Over 4,000 cases of this generator (100 seeds) the shadow rows
-    equal the float64 law's in all but one case (a decision within float32 resolution, as without rule X) and leave 4
-    short, all ties, by at most 0.45 mm, none rowless; without rule X the law left 74 short (by up to 161 mm). Today's
-    route leaves 526 short. The check allows :data:`LP_SHORT` of its 40 (none of this seed's needs rule X; see
-    :func:`test_exposed_cell_exits_reach_their_depth`).
+    A pair reaches its depth unless its deepest point's closest surface point lies on no feature that gives it a row
+    (a valley, or a vertex its rules leave out, or a tie: equally far from two or more surface points; DESIGN 1.3 and
+    8.5). Over 4,000 cases of this generator (100 seeds) the shadow rows equal the float64 law's in all but one case
+    (a decision within float32 resolution) and leave 74 short (by up to 161 mm); the removed rule X, which exited the
+    core's deepest candidate point, left 4. Today's route leaves 526 short. The check allows :data:`LP_SHORT` of its
+    40.
     """
     pairs = _lp_pairs(_lp_cases(np.random.default_rng(17), 40), device, shadow=True)
     differ, rowless, short = _penetration_violations(pairs)
     test.assertEqual(differ, [])
     test.assertEqual(rowless, [])
     test.assertLessEqual(len(short), LP_SHORT, msg=short)
-
-
-LP_EXITS = ((49, 7), (74, 33), (54, 28), (2, 12), (0, 23), (10, 0), (90, 4))
-"""Exposed-cell cases (seed, index of :func:`_lp_cases`) whose deepest row only rule X gives, from 160 down to 5 mm
-deeper than the other rules' rows. In the first the deepest point's closest surface point lies outside the pair's
-window, two cell rows past it (a rod 166 mm deep under a 60 degree face, its reach 40 mm)."""
-
-
-def test_exposed_cell_exits_reach_their_depth(test, device):
-    """Give cylinders through an exposed cell whose depth only rule X reaches an exit row, the float64 law's rows and
-    their depth.
-
-    Deep rods through steep cells (:data:`LP_EXITS`), from the generator of
-    :func:`test_exposed_cell_rows_follow_the_law`: each exit is the point law's over the cells within the deepest
-    candidate's bound, inside the pair's window or not (the first case's lies outside it). Without rule X these pairs
-    stop 5 to 160 mm short; with an exit searched only inside the window the first stops 0.3 mm short, on a farther
-    minimum.
-    """
-    cases = []
-    for seed, index in LP_EXITS:
-        cases.append(_lp_cases(np.random.default_rng(seed), index + 1)[index])
-    pairs = _lp_pairs(cases, device, shadow=True)
-    differ, rowless, short = _penetration_violations(pairs)
-    test.assertEqual(differ, [])
-    test.assertEqual(rowless, [])
-    test.assertEqual(short, [])
-    for (seed, index), (got, law, _pose, _separation, _frame_tol) in zip(LP_EXITS, pairs, strict=True):
-        with test.subTest(case=(seed, index)):
-            test.assertEqual(sum(1 for g in got if su.is_exit_row(g)), 1)
-            test.assertEqual(sum(1 for r in law if su.is_exit_row(r)), 1)
 
 
 def _buried_cylinders(rng, hf, count, dims=TOE):
@@ -1071,10 +1040,10 @@ def test_buried_solids_follow_the_law(test, device):
     Lying cylinders within 20 deg of horizontal (the recorded rough state's buried toes), cones and ellipsoids in any
     orientation, 40 of each, their deepest point 1-40 mm below a rough tile (the burial census, DESIGN 7 Track 1).
 
-    The law reaches a pair's depth unless its deepest point is a tie (rule X; DESIGN 1.3 and 8.5). Over 4,000 of each
-    (100 seeds) the shadow rows equal the float64 law's in every case, none rowless, and leave short 7 cylinders (by
-    at most 3.4 mm), 14 cones (16 mm) and 6 ellipsoids (16 mm), all ties; without rule X the law left 32, 106 and 16
-    short. Today's route leaves 2,088, 345 and 11 short. The check allows :data:`BURIED_SHORT` of its 120.
+    The law reaches a pair's depth unless its deepest point's closest surface point lies on no feature that gives it a
+    row (DESIGN 1.3 and 8.5). Over 4,000 of each (100 seeds) the law left 32, 106 and 16 short, none rowless; the
+    removed rule X, which exited the core's deepest candidate point, left 7, 14 and 6, all ties. Today's route leaves
+    2,088, 345 and 11 short. The check allows :data:`BURIED_SHORT` of its 120.
     """
     hf, model, _hfield, shapes, bodies = _burial_scene(device)
     pipeline, _contacts, _state = _collide(model, shadow=True)
@@ -1105,12 +1074,12 @@ def _valley_bodies(device):
     return hf, model, hfield, shapes, bodies
 
 
-def test_valley_cores_reach_their_depth(test, device):
-    """Give solids sunk into a valley a row as deep as their deepest point, the float64 law's rows and no ghost.
+def test_valley_cores_follow_the_law(test, device):
+    """Give solids sunk into a valley, each deepest in the wedge below the valley's line, the float64 law's rows.
 
-    Each deepest point lies in the wedge below the valley's line and is closest to it (a cylinder's or a cone's rim,
-    a box's corner, a cone's apex, an ellipsoid's support point): no rule but X reaches it. Without rule X their deepest
-    rows were the walls' plane depths of their recovery points (rule R), short by up to 13% of the depth.
+    Their deepest points' closest surface point is the valley's line, which no rule offers: rule F's supports project
+    across the valley onto the other wall, and rule R's recovery points give the walls' plane depths (short by up to 13%
+    of the depth).
     """
     hf, model, _hfield, shapes, bodies = _valley_bodies(device)
     pipeline, _contacts, _state = _collide(model, shadow=True)
@@ -1118,88 +1087,10 @@ def test_valley_cores_reach_their_depth(test, device):
     for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
         with test.subTest(kind=kind):
             got = rows.get(shape, [])
-            law = su.law_rows(hf, kind, dims, pose)
-            missing, extra, deepest = su.compare_solid_rows(law, got)
+            test.assertGreater(len(got), 0)
+            missing, extra, deepest = su.compare_solid_rows(su.law_rows(hf, kind, dims, pose), got)
             test.assertEqual((missing, extra), ([], []))
             test.assertLess(deepest, 1.0e-5)
-            separation = su.refined_separation(hf, ref.make_core(kind, dims, pose))
-            test.assertLess(separation, -0.008)
-            test.assertLessEqual(min(g[2] for g in got), separation + PENETRATING_TOL)
-            exits = [g for g in got if su.is_exit_row(g)]
-            test.assertEqual(len(exits), 1)
-            # the exit's terrain point lies on the valley's line, its normal in the line's normal cone
-            test.assertLessEqual(su.normal_cone_angle(hf, exits[0][0], exits[0][1]), GHOST_ANGLE)
-
-
-def test_rule_x_left_out_leaves_sunk_cores_to_the_other_rules(test, device):
-    """Leave rule X out when the law does not run it (the default): solids sunk into a valley, whose deepest points only
-    rule X reaches, get the float64 law's rows without it and no exit row, and no rule X kernel is launched."""
-    hf, model, _hfield, shapes, bodies = _valley_bodies(device)
-    pipeline, _contacts, _state = _collide(model, shadow=True, rule_x=False)
-    shadow = pipeline._terrain_law_shadow
-    test.assertFalse(shadow.rule_x)
-    rows = tu.shadow_rows(pipeline)
-    for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
-        with test.subTest(kind=kind):
-            got = rows.get(shape, [])
-            test.assertFalse(any(su.is_exit_row(g) for g in got))
-            missing, extra, deepest = su.compare_solid_rows(su.law_rows(hf, kind, dims, pose, rule_x=False), got)
-            test.assertEqual((missing, extra), ([], []))
-            test.assertLess(deepest, 1.0e-5)
-    for name, record in shadow.describe()["launch_shapes"].items():
-        if name != "point":
-            with test.subTest(partner_class=name):
-                test.assertTrue({"xitems", "xvalleys", "xdescents", "exit"} <= set(record["skipped"]))
-
-
-NEEDLES = (
-    ({"semi": (0.03, 0.025, 0.12)}, (-2.88e-05, 0.0017035, 0.05, -0.0035235, 0.0199778, -0.0137802, 0.9996992)),
-    ({"semi": (0.02, 0.02, 0.1)}, (0.000511, -0.0001721, 0.04, -0.0067381, -0.0060868, 0.0250489, 0.999645)),
-    ({"semi": (0.01, 0.01, 0.1)}, (0.0002699, 0.0012358, 0.03, -0.0199863, -0.0199853, 0.0342181, 0.9990146)),
-    ({"semi": (0.015, 0.01, 0.15)}, (-0.0009437, -0.0014296, 0.08, 0.0191654, 0.0038809, 0.0439472, 0.9988425)),
-    ({"semi": (0.02, 0.02, 0.1)}, (0.0, 0.0005, 0.04, 0.0, 0.0, 0.0, 1.0)),
-)
-"""Elongated ellipsoids standing in a one-vertex pit 50 mm deep (5 cm cells), their lower ends 10 to 20 mm below the
-pit's vertex, which lies inside them."""
-
-
-def _needle_bodies(device):
-    """A flat terrain with one vertex 50 mm low and the needles of :data:`NEEDLES` standing in it."""
-    heights = np.zeros((41, 41))
-    heights[20, 20] = -0.05
-    hf = tu.reference_surface(tu.heightfield_model(heights, 1.0, 1.0, device="cpu"))
-    bodies = [("ellipsoid", dims, _f32_pose(np.asarray(pose, np.float64))) for dims, pose in NEEDLES]
-    model, hfield, shapes = su.solid_scene(heights, 1.0, 1.0, bodies, device=device)
-    return hf, model, hfield, shapes, bodies
-
-
-def test_needle_cores_reach_their_depth(test, device):
-    """Give elongated ellipsoids standing in a pit a row as deep as their lower ends, the float64 law's rows.
-
-    The pit's vertex lies inside each needle, whose lower end is its deepest point, closest to that vertex alone. The
-    end is a local maximum of the distance from the vertex, not the farthest point (the upper end, above the surface):
-    rule X takes both, an ellipsoid's every local maximum of the distance from a terrain vertex. With the farthest point
-    alone the law stopped 0.1 to 0.45 mm short, on a valley's support point.
-    """
-    hf, model, _hfield, shapes, bodies = _needle_bodies(device)
-    pipeline, _contacts, _state = _collide(model, shadow=True)
-    rows = tu.shadow_rows(pipeline)
-    pit = hf.V(20, 20)
-    for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
-        with test.subTest(semi=dims["semi"]):
-            got = rows.get(shape, [])
-            law = su.law_rows(hf, kind, dims, pose)
-            missing, extra, deepest = su.compare_solid_rows(law, got)
-            test.assertEqual((missing, extra), ([], []))
-            test.assertLess(deepest, 1.0e-5)
-            separation = su.refined_separation(hf, ref.make_core(kind, dims, pose))
-            test.assertLess(separation, -0.009)
-            test.assertLessEqual(min(g[2] for g in got), separation + PENETRATING_TOL)
-            exits = [g for g in got if su.is_exit_row(g)]
-            test.assertEqual(len(exits), 1)
-            # the lower end's exit is the pit's vertex
-            test.assertLess(float(np.linalg.norm(exits[0][0] - pit)), 1.0e-6)
-            test.assertLessEqual(su.normal_cone_angle(hf, exits[0][0], exits[0][1]), GHOST_ANGLE)
 
 
 def test_recovery_rows_have_distinct_feature_ids(test, device):
@@ -1531,13 +1422,11 @@ _LIST_OF_KERNEL = {
     "vertices": "vertices",
     "close": "live",
     "recovery": "recover",
-    "xitems": "xitems",
-    "xvalleys": "xvalleys",
     "small": "small",
 }
 """The list each job kernel that first takes a list strides over
 (:class:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs`; the creases kernel takes the thetas kernel's list
-entry by entry, its results kept per entry, and the descents kernel rule X's candidates by their slots in the pool)."""
+entry by entry, its results kept per entry)."""
 _COUNTER_OF_LIST = {name: k for k, name in enumerate(TERRAIN_LAW_JOB_NAMES)}
 _COUNTER_OF_LIST.update(
     {"live": TERRAIN_LAW_JOB_NAMES.index("live"), "recover": TERRAIN_LAW_JOB_NAMES.index("recovery")}
@@ -1560,19 +1449,14 @@ def _class_jobs(model, shadow, partner_class, *, threads=None, **capacities):
     job threads (by default the shadow's)."""
     table = shadow.table
     begin, end = _class_pairs(table, partner_class)
-    points, takes = terrain_law_solid.terrain_solid_exit_items(model, table.pairs_host[begin:end, 1])
     sizes = terrain_law_solid.terrain_solid_job_capacities(
         table.vertices[begin:end],
-        points,
-        takes,
         table.candidates[begin:end],
         int(TERRAIN_PARTNER_WALK_SLOTS[partner_class]),
         scan_run=int(TERRAIN_PARTNER_SCAN_RUN[partner_class]),
     )
     sizes.update(capacities)
-    jobs = terrain_law_solid.terrain_solid_jobs(
-        model.device, partner_class, begin, end - begin, sizes, rule_x=shadow.rule_x
-    )
+    jobs = terrain_law_solid.terrain_solid_jobs(model.device, partner_class, begin, end - begin, sizes)
     if threads is not None:
         jobs.threads = int(threads)
         jobs.pair_threads = min(int(threads), end - begin)
@@ -1615,7 +1499,7 @@ def _run_class(
     begin, end = _class_pairs(table, partner_class)
     if jobs is None:
         jobs = _class_jobs(model, shadow, partner_class)
-    solids = terrain_law_solid.terrain_solid_data(model, table.pairs_host[:, 1], pairs=table.pair_count)
+    solids = terrain_law_solid.terrain_solid_data(model, table.pairs_host[:, 1])
     out = _side_buffer(begin, end - begin, TERRAIN_PARTNER_WALK_SLOTS[partner_class], table.pair_count, device)
     capacity = _full_candidates(shadow, partner_class) if candidates is None else candidates
     scratch = terrain_finish_scratch(device, capacity, blocks=blocks)
@@ -1683,8 +1567,8 @@ def test_job_pipeline_rows_are_the_walks(test, device):
     Solids of every class over rough terrain, among them of every class one whose window holds over 256 vertices (its
     scan takes several jobs, its class's :data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_SCAN_RUN`
     window vertices each). Three arms per class: its launches as the shadow runs them; the same with one job thread and every
-    list reversed before its kernel takes it (the scan's jobs, the features, the creases, the live pairs, the pairs left
-    to rule R, rule X's items and valleys), so that the candidate pool holds every pair's rows in another order; and
+    list reversed before its kernel takes it (the scan's jobs, the features, the creases, the live pairs and the pairs
+    left to rule R), so that the candidate pool holds every pair's rows in another order; and
     every pair walked again by the full-finish kernel alone, in window order. The close holds a pair's candidates by
     their place in window order (a cluster plane two scan jobs list is one offer), so the arms agree with each other and
     with the shadow's own rows.
@@ -1705,8 +1589,8 @@ def test_job_pipeline_rows_are_the_walks(test, device):
             pairs = np.arange(begin, end)
             jobs_out, jobs, _solids = _run_class(pipeline, model, partner_class)
             counts = _counts(jobs)
-            # windows of several scan jobs; pairs the jobs finished (not deferred), some by rule X; a deferred pair is
-            # finished from its candidates, not walked again
+            # windows of several scan jobs; pairs the jobs finished (not deferred); a deferred pair is finished from
+            # its candidates, not walked again
             test.assertGreater(counts["scans"], counts["live"])
             test.assertLess(int(jobs_out.deferred_count.numpy()[partner_class]), counts["live"])
             test.assertEqual(counts["walks"], 0)
@@ -1738,33 +1622,27 @@ def _runs_of(entries, run_of):
 
 
 def test_job_lists_hold_each_run_together(test, device):
-    """List a scan run's survivors, a pair's rule X items per run of window vertices and an item's valleys as one
-    block of consecutive entries each, in window order, whatever order the threads append in.
+    """List a scan run's survivors as one block of consecutive entries per list, in window order, whatever order the
+    threads append in.
 
-    Each scan run, rule X's opening of each run of its pair's window vertices and each rule X item reserve their
-    entries of a list with one atomic and write them in window order, so that a warp of a job kernel takes one pair's
-    features (its record, core and heights). Solids of every class over rough terrain, of every class one whose window
-    takes several scan runs: no run's entries are split or out of order in the faces, edges, vertices, rule X item and
-    valley lists. (Appending entry by entry, the lanes of a CUDA warp interleave their runs' entries.)
+    Each scan run reserves its entries of a list with one atomic and writes them in window order, so that a warp of a
+    job kernel takes one pair's features (its record, core and heights). Solids of every class over rough terrain, of
+    every class one whose window takes several scan runs: no run's entries are split or out of order in the faces,
+    edges and vertices lists. (Appending entry by entry, the lanes of a CUDA warp interleave their runs' entries.)
     """
     _hf, model, _shapes, _bodies = _window_scene(np.random.default_rng(37), device)
     pipeline, _contacts, _state = _collide(model, shadow=True)
-    item_run = terrain_law_solid.TERRAIN_SOLID_SCAN_VERTICES
     checked = {}
     for partner_class in _SOLID_MODULES:
         scan = int(TERRAIN_PARTNER_SCAN_RUN[partner_class])
         with test.subTest(partner_class=partner_class):
-            _out, jobs, _solids = _run_class(pipeline, model, partner_class, until="xdescents")
+            _out, jobs, _solids = _run_class(pipeline, model, partner_class, until="close")
             counts = _counts(jobs)
             lists = {
                 # a scan run: its pair's window vertices [k, k + 1) times the run length (six items per vertex)
                 "faces": lambda pair, item, scan=scan: (pair, item // 6 // scan),
                 "edges": lambda pair, item, scan=scan: (pair, item // 6 // scan),
                 "vertices": lambda pair, item, scan=scan: (pair, item // 6 // scan),
-                # rule X's items: the core's points together, then each run of window vertices
-                "xitems": lambda pair, item: (pair, -1 if item < 0 else item // item_run),
-                # an item's valleys: window vertex times three plus the edge
-                "xvalleys": lambda pair, item: (pair, item // 3),
             }
             for name, run_of in lists.items():
                 entries = getattr(jobs, name).numpy()[: counts[name]]
@@ -1772,90 +1650,16 @@ def test_job_lists_hold_each_run_together(test, device):
                 runs = [run for run, _items in blocks]
                 test.assertEqual(len(runs), len(set(runs)), msg=f"{name}: a run's entries are split")
                 for run, items in blocks:
-                    order = sorted(items, key=lambda item: (item >= 0, -item if item < 0 else item))
-                    test.assertEqual(items, order, msg=f"{name}: run {run} out of window order")
+                    test.assertEqual(items, sorted(items), msg=f"{name}: run {run} out of window order")
                 checked[name] = checked.get(name, 0) + len(blocks)
     # not vacuous: every list holds runs, a scan list runs from pairs of several runs
     test.assertTrue(all(count > 1 for count in checked.values()), msg=checked)
 
 
-def _valley_large(device):
-    """Long solids sunk along a V-valley (30 deg walls meeting along y at x = 0, 5 cm cells), each deepest along the
-    valley's line, which only rule X reaches (axes 5 mm below it, a box's edge 20 mm): windows of over 64 vertices and
-    over 256 (their scans take several jobs)."""
-    th = np.radians(30.0)
-    x = np.linspace(-1.0, 1.0, 41)
-    heights = np.tile(np.abs(x) * np.tan(th), (65, 1))
-    hf = tu.reference_surface(tu.heightfield_model(heights, 1.0, 1.6, device="cpu"))
-    along = _axis_angle((1.0, 0.0, 0.0), -np.pi / 2.0)
-    diamond = _quat_mul(_axis_angle((0.0, 1.0, 0.0), np.pi / 4.0), _axis_angle((0.0, 0.0, 1.0), np.pi / 2.0))
-    bodies = [
-        ("cylinder", {"radius": 0.03, "half_height": 0.5}, _f32_pose(np.r_[0.0, -0.6137, -0.005, along])),
-        ("ellipsoid", {"semi": (0.03, 1.4, 0.03)}, _f32_pose(np.r_[0.0, 0.0113, -0.005, 0.0, 0.0, 0.0, 1.0])),
-        ("ellipsoid", {"semi": (0.03, 0.6, 0.03)}, _f32_pose(np.r_[0.0, -0.3, -0.005, 0.0, 0.0, 0.0, 1.0])),
-        ("box", {"half": (0.4, 0.03, 0.03)}, _f32_pose(np.r_[0.0, 0.5911, 0.03 * np.sqrt(2.0) - 0.02, diamond])),
-    ]
-    model, _hfield, shapes = su.solid_scene(heights, 1.0, 1.6, bodies, device=device)
-    return hf, model, shapes, bodies
-
-
-def test_rule_x_lists_give_the_full_passes(test, device):
-    """Give a solid pair the same rule X row and rows, bit for bit, whether its exit kernel takes its listed candidates
-    or the full-finish kernel walks it again and runs rule X over every candidate of its window.
-
-    Long solids sunk along a valley, each deepest along its line (only an exit reaches it): a cylinder, ellipsoids and
-    a box. Rule X's item and valley jobs list the candidates whose bounds pass the pair's target with their near
-    bounds' descents, and the exit kernel runs the rule's passes over those alone (any other is a no-op in both
-    passes). With room for one item and one valley, or for one listed candidate in rule X's region of the candidate
-    pool, a pair's lists lack room and it is left to the full-finish kernel, which runs rule X over every candidate of
-    its window; every pair walked by it alone gives the same rows too.
-    """
-    hf, model, shapes, bodies = _valley_large(device)
-    pipeline, _contacts, _state = _collide(model, shadow=True)
-    shadow = pipeline._terrain_law_shadow
-    table = shadow.table
-    shape_class = {int(p[1]): int(c) for p, c in zip(table.pairs_host, table.partner_class, strict=True)}
-    sizes = sorted(_window_vertices(hf, *body) for body in bodies)
-    test.assertGreater(sizes[0], 64)
-    test.assertGreater(sizes[-1], 256)
-    exits = [g for shape in shapes for g in tu.shadow_rows(pipeline)[shape] if su.is_exit_row(g)]
-    test.assertEqual(len(exits), len(bodies))
-    for partner_class in sorted({shape_class[s] for s in shapes}):
-        with test.subTest(partner_class=partner_class):
-            begin, end = _class_pairs(table, partner_class)
-            pairs = np.arange(begin, end)
-            listed_out, listed, solids = _run_class(pipeline, model, partner_class)
-            test.assertGreater(int(solids.exit_count.numpy()[partner_class]), 0)
-            test.assertGreater(int(solids.exit_work.numpy()[0]), 0)
-            # the listed passes: no pair's lists lacked room
-            test.assertFalse(np.any(listed.xall.numpy()))
-            heads = listed.xhead.numpy()
-            test.assertTrue(np.any(heads >= 0))
-            every_out, every, solids = _run_class(
-                pipeline, model, partner_class, jobs=_class_jobs(model, shadow, partner_class, xitems=1, xvalleys=1)
-            )
-            test.assertTrue(np.any(every.xall.numpy()))
-            test.assertGreater(int(every_out.deferred_count.numpy()[partner_class]), 0)
-            test.assertGreater(int(solids.exit_work.numpy()[0]), 0)
-            # one slot in rule X's region of the pool: the pairs listing more take every candidate too
-            region_out, region, _solids = _run_class(
-                pipeline, model, partner_class, jobs=_class_jobs(model, shadow, partner_class, xdescents=1)
-            )
-            test.assertGreater(_counts(region)["xdescents"], 1)
-            test.assertTrue(np.any(region.xall.numpy()))
-            full_out, _jobs, _solids = _run_class(pipeline, model, partner_class, full=True)
-            _assert_same_rows(test, shadow._out, listed_out, pairs, "the shadow's launch")
-            _assert_same_rows(test, listed_out, every_out, pairs, "lists without room")
-            _assert_same_rows(test, listed_out, region_out, pairs, "rule X's region without room")
-            _assert_same_rows(test, listed_out, full_out, pairs, "the full walk")
-            features = np.concatenate([_pair_rows(listed_out, p)["feature"] for p in pairs])
-            test.assertEqual(int(np.sum((features & 7) == 7)), sum(shape_class[s] == partner_class for s in shapes))
-
-
 def _slope_resting(device):
     """Solids resting 0.5 mm deep on a planar 15 deg slope (rising along x, 5 cm cells), each flat on it: a box, a
     cylinder lying across the slope and an ellipsoid. Every window's uphill vertices rise above its core's lowest
-    point, so every pair goes to rule X; on one plane no exit lies deeper than the face rows."""
+    point."""
     th = np.radians(15.0)
     x = np.linspace(-1.0, 1.0, 41)
     heights = np.tile(x * np.tan(th), (65, 1))
@@ -1876,20 +1680,14 @@ def _slope_resting(device):
     return model, shapes, bodies
 
 
-def test_rule_x_gate_closes_cores_no_exit_can_reach(test, device):
-    """Leave rule X's items of a pair unlisted when no exit of its core can lie deeper than its rows.
+def test_slope_resting_solids_keep_their_sink(test, device):
+    """Give solids resting 0.5 mm deep on a planar slope rows whose deepest is their sink, within float32.
 
-    Solids resting 0.5 mm deep on a planar slope: their lowest points lie below their windows' uphill vertices, so each
-    pair goes to rule X, but over every cell under them the slope's plane lies at most their sink above them, so no
-    exit can beat their face rows. Rule X's gate opens no box or cylinder pair (whose items then list nothing); a hull
-    or ellipsoid pair is open at once. Their rows are bit for bit those of the full-finish kernel, which runs rule X
-    over every candidate of the window.
+    Their lowest points lie below their windows' uphill vertices, and over every cell under them the slope's plane lies
+    their sink above them: a box, a cylinder lying across the slope and an ellipsoid, each flat on it.
     """
     model, shapes, bodies = _slope_resting(device)
     pipeline, _contacts, _state = _collide(model, shadow=True)
-    shadow = pipeline._terrain_law_shadow
-    table = shadow.table
-    shape_class = {int(p[1]): int(c) for p, c in zip(table.pairs_host, table.partner_class, strict=True)}
     rows = tu.shadow_rows(pipeline)
     for shape, (kind, _dims, _pose) in zip(shapes, bodies, strict=True):
         with test.subTest(kind=kind):
@@ -1897,34 +1695,13 @@ def test_rule_x_gate_closes_cores_no_exit_can_reach(test, device):
             test.assertGreater(len(got), 0)
             # the deepest row is the sink (the slope's plane), within float32
             test.assertAlmostEqual(min(g[2] for g in got), -0.0005, delta=2.0e-6)
-    for partner_class in sorted({shape_class[s] for s in shapes}):
-        with test.subTest(partner_class=partner_class):
-            begin, end = _class_pairs(table, partner_class)
-            pairs = np.arange(begin, end)
-            listed_out, listed, solids = _run_class(pipeline, model, partner_class)
-            # every core's lowest point lies below its window's highest vertex: each pair goes to rule X
-            records = listed.records.numpy()[: end - begin]
-            test.assertTrue(np.all(records["low"] < records["pair"]["top"]), msg=records["low"])
-            test.assertEqual(int(solids.exit_count.numpy()[partner_class]), end - begin)
-            hot = listed.xhot.numpy()[: end - begin]
-            if partner_class == TERRAIN_PARTNER_HULL:
-                test.assertTrue(np.all(hot == 1))
-            else:
-                test.assertTrue(np.all(hot == 0))
-                test.assertEqual(_counts(listed)["xvalleys"], 0)
-                test.assertTrue(np.all(listed.xhead.numpy()[: end - begin] < 0))
-            full_out, _jobs, _solids = _run_class(pipeline, model, partner_class, full=True)
-            _assert_same_rows(test, listed_out, full_out, pairs, "the full walk")
 
 
-def test_exit_work_stays_bounded(test, device):
-    """Search few exits for solids buried under a rough slope, over few cells, and keep the float64 law's rows.
+def test_slope_buried_solids_follow_the_law(test, device):
+    """Give solids buried under a rough slope the float64 law's rows.
 
     Ellipsoids of 0.3 x 0.3 x 0.1 m and lying cylinders of 0.6 m buried 0.2 to 0.3 m under a 0.6 slope (0.05 m cells,
-    1 cm roughness): many candidates' closest surface points lie cells up the slope, outside the 3 x 3 cells around
-    them. Rule X's bounds descend along the closest triangles' planes to them, the largest bound is searched first and
-    each search covers the cells within its bound: here at most one exit search per pair, covering fewer vertices than
-    the pairs' windows. A walk of the whole window per candidate whose 3 x 3 bound passes took 50 to 170 walks per pair.
+    1 cm roughness): many of their points' closest surface points lie cells up the slope, outside their windows.
     """
     rng = np.random.default_rng(3)
     xs = np.linspace(-2.0, 2.0, 81)
@@ -1941,11 +1718,6 @@ def test_exit_work_stays_bounded(test, device):
             bodies.append((kind, dims, _f32_pose(np.r_[x, y, float(hf.height(x, y)) - rng.uniform(0.01, 0.05), q])))
     model, _hfield, shapes = su.solid_scene(heights, 2.0, 2.0, bodies, device=device)
     pipeline, _contacts, _state = _collide(model, shadow=True)
-    searches, vertices = pipeline._terrain_law_shadow.exit_work()
-    windows = sum(_window_vertices(hf, *body) for body in bodies)
-    test.assertGreater(searches, 0)
-    test.assertLessEqual(searches, len(bodies))
-    test.assertLess(vertices, windows)
     rows = tu.shadow_rows(pipeline)
     for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
         with test.subTest(kind=kind, pose=pose.tolist()):
@@ -2242,8 +2014,8 @@ def test_solid_shadow_runs_under_graph_capture(test, device):
     uncaptured collide's rows.
 
     Every solid class runs: windows of several scan jobs (a box and an ellipsoid), the job lists and the candidate pool
-    (their counters the capture zeroes), pairs reaching below their windows' highest vertices through rule X's lists and
-    exit kernels, and a long box deferred to its class's full kernel, whose grid reads the deferred count, and spilled.
+    (their counters the capture zeroes), and a long box deferred to its class's full kernel, whose grid reads the
+    deferred count, and spilled.
     The spill region holds exactly the rows the scene asks for, so that a replay that did not zero the spill counters
     would find no room on its second run. The shadow's launches are also captured alone with the device's memory pool
     off, so that an allocation inside them raises instead of becoming a graph allocation node.
@@ -2266,10 +2038,9 @@ def test_solid_shadow_runs_under_graph_capture(test, device):
     # the long box's rows exceed its walk slots: the full kernel writes them to the spill region
     test.assertGreaterEqual(shadow.rows_spilled(), int(expected["count"].max()))
     test.assertTrue(np.all(expected["state"] & 48 == 0))
-    # windows of several scan jobs (a box and an ellipsoid), and rule X's lists
+    # windows of several scan jobs (a box and an ellipsoid)
     test.assertGreater(counts["box"]["scans"], counts["box"]["live"])
     test.assertGreater(counts["hull"]["scans"], counts["hull"]["live"])
-    test.assertGreater(sum(c["xitems"] for c in counts.values()), 0)
     # Move the bodies, so that the replay must recompute the rows.
     moved = model.state()
     q = moved.body_q.numpy()
@@ -2316,10 +2087,9 @@ def test_solid_shadow_runs_under_graph_capture(test, device):
 def test_solid_launches_take_fixed_grids(test, device):
     """Launch every solid kernel with the dimensions fixed at construction, as the route record holds them: one block
     size; the whole-pair rejects one thread per pair of the class; the scan and the job kernels the class's job threads,
-    each striding over its list, but for a job kernel whose list none of the class's pairs can fill (not launched: rule
-    X's valleys of the box class); the close, rule R's kernel and rule X's exit kernel, which stride over lists of the
-    class's pairs, the job threads up to one per pair; the finish kernel, blocks of lanes striding over the live pairs,
-    up to one block per pair; the full-finish kernel the fixed grid of its scratch.
+    each striding over its list; the close and the small-pair finish, which stride over lists of the class's pairs, the
+    job threads up to one per pair; rule R's kernel, blocks of lanes striding over its list, up to one block per pair;
+    the full-finish kernel the fixed grid of its scratch.
 
     Every solid class has pairs here, windows of several scan jobs (a box and an ellipsoid) and a deferring box. The
     live list holds every pair past the whole-pair rejects once.
@@ -2355,10 +2125,8 @@ def test_solid_launches_take_fixed_grids(test, device):
             test.assertEqual(record["pair_job_threads"], min(jobs.threads, end - begin))
             test.assertEqual(record["finish_blocks"], jobs.finish_blocks)
             test.assertLessEqual(jobs.finish_blocks, end - begin)
-            # rule X's valleys never for boxes, its gate never for hulls (core_exits_gated), the lanes' finish for no
-            # class (no class's walk slots hold the lane rows)
-            expected = {TERRAIN_PARTNER_BOX: ["xvalleys"], TERRAIN_PARTNER_HULL: ["xbound"]}.get(partner_class, [])
-            test.assertEqual(record["skipped"], [*expected, "finish"])
+            # the lanes' finish for no class (no class's walk slots hold the lane rows)
+            test.assertEqual(record["skipped"], ["finish"])
             for kind, kernel_name in TERRAIN_SOLID_LAUNCHES:
                 key = _kernel(partner_class, kernel_name).key
                 if kernel_name in record["skipped"]:
@@ -2459,8 +2227,8 @@ def test_job_overflow_takes_the_full_walk(test, device):
     for name in ("box", "cylinder", "hull"):
         capacities = record["launch_shapes"][name]["jobs"]
         lists = {k: v for k, v in capacities.items() if k != "scans"}
-        # one entry each, but rule X's valleys of the box class, which none of its pairs can list (no room, no launch)
-        test.assertEqual(lists, {k: int(name != "box" or k != "xvalleys") for k in lists})
+        # one entry each
+        test.assertEqual(lists, dict.fromkeys(lists, 1))
         counts = shadow.job_counts()[name]
         test.assertGreater(counts["faces"], 1)
     test.assertIn("Terrain-law box class: its rule F face job list overflowed", message)
@@ -2640,10 +2408,8 @@ for _name, _func in (
     ("test_solid_rows_are_complete_and_free_of_ghosts", test_solid_rows_are_complete_and_free_of_ghosts),
     ("test_thin_rods_and_crease_bodies_keep_their_supports", test_thin_rods_and_crease_bodies_keep_their_supports),
     ("test_exposed_cell_rows_follow_the_law", test_exposed_cell_rows_follow_the_law),
-    ("test_exposed_cell_exits_reach_their_depth", test_exposed_cell_exits_reach_their_depth),
     ("test_buried_solids_follow_the_law", test_buried_solids_follow_the_law),
-    ("test_valley_cores_reach_their_depth", test_valley_cores_reach_their_depth),
-    ("test_needle_cores_reach_their_depth", test_needle_cores_reach_their_depth),
+    ("test_valley_cores_follow_the_law", test_valley_cores_follow_the_law),
     ("test_recovery_rows_have_distinct_feature_ids", test_recovery_rows_have_distinct_feature_ids),
     ("test_hovering_core_skips_rule_r", test_hovering_core_skips_rule_r),
     ("test_hovering_core_leaves_at_the_fine_mip", test_hovering_core_leaves_at_the_fine_mip),
@@ -2651,13 +2417,8 @@ for _name, _func in (
     ("test_solid_rows_match_the_float64_law", test_solid_rows_match_the_float64_law),
     ("test_job_pipeline_rows_are_the_walks", test_job_pipeline_rows_are_the_walks),
     ("test_job_lists_hold_each_run_together", test_job_lists_hold_each_run_together),
-    ("test_rule_x_lists_give_the_full_passes", test_rule_x_lists_give_the_full_passes),
-    ("test_rule_x_gate_closes_cores_no_exit_can_reach", test_rule_x_gate_closes_cores_no_exit_can_reach),
-    (
-        "test_rule_x_left_out_leaves_sunk_cores_to_the_other_rules",
-        test_rule_x_left_out_leaves_sunk_cores_to_the_other_rules,
-    ),
-    ("test_exit_work_stays_bounded", test_exit_work_stays_bounded),
+    ("test_slope_resting_solids_keep_their_sink", test_slope_resting_solids_keep_their_sink),
+    ("test_slope_buried_solids_follow_the_law", test_slope_buried_solids_follow_the_law),
     ("test_long_box_keeps_every_support", test_long_box_keeps_every_support),
     ("test_deferred_pairs_keep_their_rows_beyond_the_grid", test_deferred_pairs_keep_their_rows_beyond_the_grid),
     ("test_wide_box_keeps_every_support", test_wide_box_keeps_every_support),

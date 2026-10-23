@@ -15,7 +15,7 @@ from typing import Literal
 import numpy as np
 import warp as wp
 
-from ..core.environment_flags import record_newton_environment
+from ..core.environment_flags import record_newton_environment, retired_notice
 from ..core.reset import normalize_reset_world_mask
 from ..geometry.broad_phase_nxn import BroadPhaseAllPairs, BroadPhaseExplicit, BroadPhaseExplicitTemplates
 from ..geometry.broad_phase_sap import BroadPhaseSAP
@@ -1983,8 +1983,12 @@ class CollisionPipeline:
                 raise ValueError("broad_phase_output_max requires internal explicit broad/narrow phases")
         self.broad_phase_output_max = None if broad_phase_output_max is None else int(broad_phase_output_max)
         # Record the NEWTON_* environment once, before the reads below; undeclared names
-        # are recorded, not rejected, and names only Isaac Lab reads are kept apart.
+        # are recorded, not rejected, names only Isaac Lab reads are kept apart, and
+        # retired names select nothing and warn once per process.
         self._environment_record = record_newton_environment()
+        retired_warning = retired_notice(self._environment_record)
+        if retired_warning is not None:
+            warnings.warn(retired_warning, UserWarning, stacklevel=2)
         pair_shape_prep = os.environ.get("NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP", "0")
         if pair_shape_prep not in ("0", "1"):
             raise ValueError("NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP must be 0 or 1")
@@ -2936,7 +2940,6 @@ class CollisionPipeline:
         from ..geometry.terrain_shadow import (  # noqa: PLC0415
             TERRAIN_LAW_KERNELS,
             TerrainLawShadow,
-            parse_terrain_law_rule_x,
             parse_terrain_law_shadow_jobs,
             parse_terrain_law_shadow_rows,
         )
@@ -2950,8 +2953,6 @@ class CollisionPipeline:
             spill_rows=parse_terrain_law_shadow_rows(os.environ.get("NEWTON_TERRAIN_LAW_SHADOW_ROWS", "")),
             # The factor on its solid classes' job capacities (default 1: terrain_solid_job_capacities()).
             job_scale=parse_terrain_law_shadow_jobs(os.environ.get("NEWTON_TERRAIN_LAW_SHADOW_JOBS", "")),
-            # Rule X (each solid core's deepest exit): off unless asked for.
-            rule_x=parse_terrain_law_rule_x(os.environ.get("NEWTON_TERRAIN_LAW_RULE_X", "")),
         )
         if not writes:
             self._terrain_law_decision, self._terrain_law_reason = decision, reason
