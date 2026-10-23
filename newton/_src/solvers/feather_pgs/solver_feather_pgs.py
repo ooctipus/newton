@@ -1801,11 +1801,11 @@ class SolverFeatherPGS(SolverBase):
                 PhysX row mode is currently supported only with
                 ``pgs_mode="matrix_free"``. Defaults to ``"augmented"``.
             serial_kernel_block_dim (int, optional): CUDA block size for the serial
-                one-thread-per-articulation kernels (``eval_rigid_fk``, ``eval_rigid_id``,
-                ``eval_rigid_tau``, ``update_articulation_origins``). These kernels have no
-                cross-thread reductions, so changing this value is bit-identical; it only
-                changes occupancy/grid shape. Must be a positive multiple of 32.
-                Defaults to 256 (the Warp default).
+                one-thread-per-articulation kernels (``eval_rigid_tau``,
+                ``eval_rigid_tau_and_augmented_drives``, ``prepare_augmented_joint_drives``).
+                These kernels have no cross-thread reductions, so changing this value is
+                bit-identical; it only changes occupancy/grid shape. Must be a positive
+                multiple of 32. Defaults to 256 (the Warp default).
             tile_threads (int, optional): Threads per block for the tiled
                 Cholesky / triangular-solve / H^-1 J^T kernels. Tile primitives may
                 change floating-point reduction order with the block size, so non-default

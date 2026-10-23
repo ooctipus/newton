@@ -136,32 +136,6 @@ def compute_com_transforms(
     body_X_com[tid] = wp.transform(com, wp.quat_identity())
 
 
-@wp.kernel(module=_KINEMATICS_KERNEL_MODULE)
-def update_articulation_origins(
-    articulation_start: wp.array[int],
-    joint_child: wp.array[int],
-    body_q: wp.array[wp.transform],
-    body_com: wp.array[wp.vec3],
-    # outputs
-    articulation_origin: wp.array[wp.vec3],
-):
-    art = wp.tid()
-
-    start = articulation_start[art]
-    end = articulation_start[art + 1]
-
-    if start >= end:
-        articulation_origin[art] = wp.vec3()
-        return
-
-    root_body = joint_child[start]
-    if root_body >= 0:
-        # Store the absolute world-space COM position of the articulation root body.
-        articulation_origin[art] = wp.transform_point(body_q[root_body], body_com[root_body])
-    else:
-        articulation_origin[art] = wp.vec3()
-
-
 @wp.kernel
 def clamp_free_root_velocity_limits(
     articulation_start: wp.array[int],
@@ -946,51 +920,6 @@ def compute_link_transform(
     body_q_com[child] = X_sm
 
 
-@wp.kernel(module=_KINEMATICS_KERNEL_MODULE)
-def eval_rigid_fk(
-    articulation_start: wp.array[int],
-    articulation_joint_end: wp.array[int],
-    joint_type: wp.array[int],
-    joint_parent: wp.array[int],
-    joint_child: wp.array[int],
-    joint_q_start: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_q: wp.array[float],
-    joint_X_p: wp.array[wp.transform],
-    joint_X_c: wp.array[wp.transform],
-    body_X_com: wp.array[wp.transform],
-    joint_axis: wp.array[wp.vec3],
-    joint_dof_dim: wp.array2d[int],
-    # outputs
-    body_q: wp.array[wp.transform],
-    body_q_com: wp.array[wp.transform],
-):
-    # one thread per-articulation
-    index = wp.tid()
-
-    start = articulation_start[index]
-    # Tree prefix only: trailing loop-closing joints would overwrite their child's pose.
-    end = articulation_joint_end[index]
-
-    for i in range(start, end):
-        compute_link_transform(
-            i,
-            joint_type,
-            joint_parent,
-            joint_child,
-            joint_q_start,
-            joint_qd_start,
-            joint_q,
-            joint_X_p,
-            joint_X_c,
-            body_X_com,
-            joint_axis,
-            joint_dof_dim,
-            body_q,
-            body_q_com,
-        )
-
-
 @wp.func
 def spatial_cross(a: wp.spatial_vector, b: wp.spatial_vector):
     w_a = wp.spatial_bottom(a)
@@ -1591,94 +1520,6 @@ def refresh_masked_body_inertia(
         for row in range(3):
             for col in range(3):
                 body_inertia_terms[child, 3 + 3 * row + col] = inertia_origin[row, col]
-
-
-# Inverse dynamics via Recursive Newton-Euler algorithm (Featherstone Table 5.1)
-@wp.kernel(module=_KINEMATICS_KERNEL_MODULE)
-def eval_rigid_id(
-    articulation_start: wp.array[int],
-    articulation_joint_end: wp.array[int],
-    joint_type: wp.array[int],
-    joint_parent: wp.array[int],
-    joint_child: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_qd: wp.array[float],
-    joint_axis: wp.array[wp.vec3],
-    joint_dof_dim: wp.array2d[int],
-    body_mass: wp.array[float],
-    body_inertia: wp.array[wp.mat33],
-    is_free_rigid: wp.array[int],
-    materialize_all_body_inertia: int,
-    materialize_body_inertia_terms: int,
-    body_q: wp.array[wp.transform],
-    body_q_com: wp.array[wp.transform],
-    joint_X_p: wp.array[wp.transform],
-    articulation_origin: wp.array[wp.vec3],
-    gravity: wp.array[wp.vec3],
-    # outputs
-    joint_S_s: wp.array[wp.spatial_vector],
-    body_I_s: wp.array[wp.spatial_matrix],
-    body_inertia_terms: wp.array2d[float],
-    body_v_s: wp.array[wp.spatial_vector],
-    body_f_s: wp.array[wp.spatial_vector],
-    body_a_s: wp.array[wp.spatial_vector],
-):
-    # one thread per-articulation
-    index = wp.tid()
-
-    start = articulation_start[index]
-    # Tree prefix only: trailing loop-closing joints carry no motion subspaces.
-    end = articulation_joint_end[index]
-    origin = articulation_origin[index]
-    gravity_s = gravity[0]
-    write_body_inertia = materialize_all_body_inertia
-    if is_free_rigid[index] != 0:
-        write_body_inertia = 1
-    cached_child = int(-1)
-    cached_v_s = wp.spatial_vector()
-    cached_a_s = wp.spatial_vector()
-
-    # compute link velocities and coriolis forces
-    for i in range(start, end):
-        parent = joint_parent[i]
-        child = joint_child[i]
-        parent_v_s = wp.spatial_vector()
-        parent_a_s = wp.spatial_vector()
-        if parent >= 0:
-            if parent == cached_child:
-                parent_v_s = cached_v_s
-                parent_a_s = cached_a_s
-            else:
-                parent_v_s = body_v_s[parent]
-                parent_a_s = body_a_s[parent]
-        cached_v_s, cached_a_s = compute_link_velocity(
-            i,
-            parent,
-            child,
-            parent_v_s,
-            parent_a_s,
-            origin,
-            gravity_s,
-            joint_type,
-            joint_qd_start,
-            joint_qd,
-            joint_axis,
-            joint_dof_dim,
-            body_mass,
-            body_inertia,
-            write_body_inertia,
-            materialize_body_inertia_terms,
-            body_q,
-            body_q_com,
-            joint_X_p,
-            joint_S_s,
-            body_I_s,
-            body_inertia_terms,
-            body_v_s,
-            body_f_s,
-            body_a_s,
-        )
-        cached_child = child
 
 
 @wp.func
@@ -6131,49 +5972,6 @@ def snapshot_dense_phase_bound(
     """
     world = wp.tid()
     dense_phase_bounds[world, bound_index] = world_slot_counter[world]
-
-
-@wp.kernel
-def apply_augmented_mass_diagonal(
-    articulation_H_start: wp.array[int],
-    articulation_H_rows: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    max_dofs: int,
-    mass_update_mask: wp.array[int],
-    row_counts: wp.array[int],
-    row_dof_index: wp.array[int],
-    row_K: wp.array[float],
-    # outputs
-    H: wp.array[float],
-):
-    articulation = wp.tid()
-    if mass_update_mask[articulation] == 0:
-        return
-
-    n = articulation_H_rows[articulation]
-    if n == 0 or max_dofs == 0:
-        return
-
-    count = row_counts[articulation]
-    if count == 0:
-        return
-
-    H_start = articulation_H_start[articulation]
-    dof_start = articulation_dof_start[articulation]
-
-    for i in range(count):
-        row_index = articulation * max_dofs + i
-        dof = row_dof_index[row_index]
-        local = dof - dof_start
-        if local < 0 or local >= n:
-            continue
-
-        K = row_K[row_index]
-        if K <= 0.0:
-            continue
-
-        diag_index = H_start + dense_index(n, local, local)
-        H[diag_index] += K
 
 
 @wp.kernel
