@@ -91,15 +91,6 @@ _GENERATORS = {
             "fmaxf(old_vlim - residual_vlim * s_inv_diag[i], 0.0f)",
         ),
     ),
-    "propagation_full_iteration": (
-        solver_source._get_pgs_solve_propagation_full_iteration_kernel.__wrapped__,
-        (64, 32, 18, 48, 8, 18, "120"),
-        {"fuse_vel_limits": True},
-        (
-            "fmaxf(old_impulse - residual / denom, 0.0f)",
-            "fmaxf(old_impulse - residual * mf_diag, 0.0f)",
-        ),
-    ),
     "sparse_limits": (
         _get_pgs_solve_sparse_kernel.__wrapped__,
         (48, 18, 12),
@@ -211,7 +202,6 @@ class TestVelocityLimitLawSources(unittest.TestCase):
             {
                 "_get_pgs_solve_mf_gs_kernel",
                 "_get_pgs_solve_mf_gs_incremental_kernel",
-                "_get_pgs_solve_propagation_full_iteration_kernel",
                 "_get_pgs_solve_sparse_kernel",
             },
             factories,
@@ -230,7 +220,7 @@ class TestVelocityLimitLawSources(unittest.TestCase):
             calls += 1
             if "velocity_limit_law" not in {keyword.arg for keyword in node.keywords}:
                 missing.append(f"{name} at line {node.lineno}")
-        self.assertGreaterEqual(calls, 4)
+        self.assertGreaterEqual(calls, 3)
         self.assertEqual(missing, [])
 
     def test_unknown_laws_are_rejected(self):
@@ -467,24 +457,9 @@ def _dense_row_values(device, *, order, row_phase, iterations, first_row=0):
     return values
 
 
-def _launch_inputs(kernel, values, *, stand_in_device=None):
-    """Return ``kernel``'s launch inputs from ``values``, by parameter name.
-
-    With ``stand_in_device`` a parameter that ``values`` lacks gets a one-element
-    zero stand-in on that device (zero for a scalar); without it every parameter
-    must be in ``values``.
-    """
-    arguments = {arg.label: arg.type for arg in kernel.adj.args}
-    inputs = []
-    for name in inspect.signature(kernel.func).parameters:
-        kind = arguments[name]
-        if name in values or stand_in_device is None:
-            inputs.append(values[name])
-        elif wp.types.is_array(kind):
-            inputs.append(wp.zeros((1,) * kind.ndim, dtype=kind.dtype, device=stand_in_device))
-        else:
-            inputs.append(kind(0))
-    return inputs
+def _launch_inputs(kernel, values):
+    """Return ``kernel``'s launch inputs from ``values``, by parameter name; every parameter must be in ``values``."""
+    return [values[name] for name in inspect.signature(kernel.func).parameters]
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "Matrix-free sweep kernels require CUDA")
@@ -515,8 +490,8 @@ class TestVelocityLimitLawKernels(unittest.TestCase):
         """Run the chain's rows through the serial sweeps in both orders and both row phases.
 
         Phase 0 visits velocity-limit rows in the end-of-iteration pass, phase 5 in
-        the main row loop (the velocity-limit phase of the propagation
-        schedules). Reversing the row order moves the accumulated
+        the main row loop (the velocity-limit phase of the PhysX-grasp
+        schedule). Reversing the row order moves the accumulated
         result by at most 1e-6; the stateless law's move documents the
         order-dependent over-braking the accumulated law removes.
         """
@@ -541,44 +516,6 @@ class TestVelocityLimitLawKernels(unittest.TestCase):
                 self._check_chain(values, velocities, order=order, law=law, kernel=name, row_phase=row_phase)
             self._check_order_move(velocities, law=law, kernel=name, row_phase=row_phase)
 
-    def test_propagation_full_iteration_follows_the_reference_in_either_row_order(self):
-        """Run the chain's rows through the propagation full-iteration kernel in both orders.
-
-        The kernel visits velocity-limit rows in the phase-5 stage of every
-        iteration. The world holds no matrix-free or propagation row and no
-        articulation of the kernel's size group, so every input it never reads is
-        a one-element zero stand-in. It stages every dense row's drive tables,
-        which therefore span the row capacity.
-        """
-        device = wp.get_device("cuda:0")
-        arch = str(device.arch)
-        for law in ("stateless", "accumulated"):
-            kernel = solver_source._get_pgs_solve_propagation_full_iteration_kernel(
-                4, 1, 2, 1, 1, 2, arch, velocity_limit_law=law
-            )
-            self.assertEqual("_vacc" in kernel.key, law == "accumulated", kernel.key)
-            velocities = {}
-            for order in ((0, 1), (1, 0)):
-                values = _dense_row_values(device, order=order, row_phase=5, iterations=64)
-                values.update(
-                    world_count=1,
-                    world_dof_start=wp.array([0], dtype=wp.int32, device=device),
-                    # The world owns no articulation of the walked size group: no tree walk.
-                    world_group_art_start=wp.zeros(2, dtype=wp.int32, device=device),
-                    max_propagation_bodies=1,
-                )
-                for name in ("target_vel_bias", "vel_multiplier", "impulse_multiplier", "max_impulse"):
-                    values[f"world_drive_{name}"] = wp.zeros_like(values["world_diag"])
-                wp.launch_tiled(
-                    kernel,
-                    dim=[1],
-                    inputs=_launch_inputs(kernel, values, stand_in_device=device),
-                    block_dim=32,
-                    device=device,
-                )
-                self._check_chain(values, velocities, order=order, law=law, kernel="propagation_full_iteration")
-            self._check_order_move(velocities, law=law, kernel="propagation_full_iteration")
-
 
 def _pushed_arm(device, limit):
     """One revolute link about z without gravity, its velocity limited to ``limit``."""
@@ -590,9 +527,8 @@ def _pushed_arm(device, limit):
     return model
 
 
-# Matrix-free routes that sweep dense velocity-limit rows. Sparse factors and the propagation schedules roll out in
-# test_feather_pgs_sparse_velocity_limits and test_feather_pgs_fused_velocity_limit_ordering; the chain tests above
-# run the propagation full-iteration kernel on its own.
+# Matrix-free routes that sweep dense velocity-limit rows. Sparse factors roll out in
+# test_feather_pgs_sparse_velocity_limits.
 _DENSE_ROUTES = {
     "mf_gs": {"mf_gs_incremental_rows": 0},
     "incremental": {"mf_gs_incremental_rows": 32},

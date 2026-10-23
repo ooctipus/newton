@@ -17,7 +17,6 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_MIMIC,
 )
 from newton.tests.test_feather_pgs_connect import _build_four_bar, _loop_anchor_gap
-from newton.tests.test_feather_pgs_mimic import _build_two_revolute_chain
 
 
 class TestPreeliminationSignature(unittest.TestCase):
@@ -232,20 +231,6 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         self.assertGreater(np.max(solver.impulses.numpy()), 1.0e-4)
         self.assertGreater(np.linalg.norm(solver.v_hat.numpy() - previous_predictor), 1.0e-3)
         self.assertLess(gap, 2.0e-5, f"warm-started projection left a {gap:.2e} m closure gap")
-
-    def test_propagation_uses_iterative_bilateral_fallback(self):
-        """Keep bilateral rows active when propagation lacks a projected response."""
-        builder, _, _ = _build_two_revolute_chain(0.0, 1.0)
-        model = builder.finalize()
-        with self.assertWarnsRegex(UserWarning, "propagation"):
-            solver = newton.solvers.SolverFeatherPGS(
-                model,
-                pgs_mode="matrix_free",
-                articulated_contact_response="propagation",
-                enable_bilateral_preelimination=True,
-            )
-        self.assertFalse(solver._preelim_active)
-        self.assertGreater(solver._mimic_count, 0)
 
     def test_mechanism_behavior_preserved(self):
         """The rocker still tracks the crank through the closed loop (parallel four-bar)."""

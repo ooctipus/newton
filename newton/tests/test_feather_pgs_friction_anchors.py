@@ -11,8 +11,6 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     compute_mf_effective_mass_and_rhs,
     compute_mf_rhs_bias,
-    compute_propagation_effective_mass_and_rhs,
-    compute_propagation_rhs_bias,
     compute_world_contact_bias,
 )
 
@@ -284,7 +282,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
             fa = solver._friction_patches.view.phi.numpy()[:n]
             slot = solver.contact_slot.numpy()[:n]
             path = solver.contact_path.numpy()[:n]
-            checked = {0: 0, 1: 0, 2: 0}
+            checked = {0: 0, 1: 0}
             for c in range(n):
                 if slot[c] < 0 or path[c] < 0:
                     continue
@@ -295,8 +293,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
                     np.testing.assert_allclose(ph[slot[c] + 1 : slot[c] + 3], fa[c], rtol=1.0e-6, atol=1.0e-9)
                     np.testing.assert_allclose(rb[slot[c] + 1 : slot[c] + 3], beta)
                 else:
-                    ph = (solver.mf_phi if path[c] == 1 else solver.propagation_phi).numpy()[0]
-                    rt = (solver.mf_row_type if path[c] == 1 else solver.propagation_row_type).numpy()[0]
+                    ph, rt = solver.mf_phi.numpy()[0], solver.mf_row_type.numpy()[0]
                     if rt[slot[c] + 1] != PGS_CONSTRAINT_TYPE_FRICTION:
                         continue
                     np.testing.assert_allclose(ph[slot[c] + 1 : slot[c] + 3], beta * fa[c], rtol=1.0e-5, atol=1.0e-9)
@@ -307,11 +304,6 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         model, _, _ = _build_v_jaws(5.0)
         c_dense = check(model, _SQUEEZE_SOLVER)
         self.assertGreater(c_dense[0], 0)
-        # propagation route: same scene, contacts routed to propagation rows
-        model, _, _ = _build_v_jaws(5.0)
-        prop_kwargs = dict(_SQUEEZE_SOLVER, articulated_contact_response="propagation", pgs_contact_regularization=0.0)
-        c_prop = check(model, prop_kwargs)
-        self.assertGreater(c_prop[2], 0)
         # matrix-free route: free box resting on a static slab
         model, _, _ = _build_incline(0.0, 0.5)
         c_mf = check(model, {"pgs_mode": "matrix_free", "pgs_iterations": 16, "pgs_beta": 0.05})
@@ -351,7 +343,7 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, dev
     """RHS of one world with rows [CONTACT, FRICTION, FRICTION] for one RHS kernel family.
 
     ``phi`` holds what the row builders store: raw separation for dense rows (paired with
-    ``row_beta``), gain-premultiplied separation for matrix-free and propagation rows.
+    ``row_beta``), gain-premultiplied separation for matrix-free rows.
     """
     contact, friction = PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
     count = wp.array([3], dtype=wp.int32, device=device)
@@ -448,59 +440,6 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, dev
             outputs=[rhs],
             device=device,
         )
-    elif family == "propagation_setup":
-        wp.launch(
-            compute_propagation_effective_mass_and_rhs,
-            dim=3,
-            inputs=[
-                count,
-                neg1,
-                neg1,
-                zJ(),
-                zJ(),
-                wp.zeros((1, 6, 6), dtype=wp.float32, device=device),
-                phi_arr,
-                row_type,
-                zeros3(),
-                wp.zeros((1, 6), dtype=wp.float32, device=device),
-                inf,
-                1.0e-6,
-                pgs_beta,
-                1.0,
-                dt,
-                1.0,
-                0.5,
-                3,
-            ],
-            outputs=[zeros3(), zJ(), zJ(), rhs, zeros3(), zeros3()],
-            device=device,
-        )
-    elif family == "propagation_velocity":
-        wp.launch(
-            compute_propagation_rhs_bias,
-            dim=3,
-            inputs=[
-                count,
-                neg1,
-                neg1,
-                zJ(),
-                zJ(),
-                phi_arr,
-                row_type,
-                zeros3(),
-                inf,
-                pgs_beta,
-                dt,
-                bias_scale,
-                1.0,
-                wp.zeros((1, 6), dtype=wp.float32, device=device),
-                0,
-                0,
-                3,
-            ],
-            outputs=[rhs],
-            device=device,
-        )
     else:
         raise ValueError(family)
     return rhs.numpy()[0]
@@ -530,14 +469,12 @@ class TestFeatherPGSFrictionAnchorKernels(unittest.TestCase):
         pre = [phi_n, fa_beta * e0, fa_beta * e1]
         np.testing.assert_allclose(dense(1.0), expect_pos, rtol=1.0e-5)
         np.testing.assert_allclose(dense(0.0), 0.0, atol=1.0e-9)
-        for family in ("mf_setup", "propagation_setup"):
-            got = _rhs_for_family(family, phi=pre, row_beta=None, pgs_beta=pgs_beta, dt=dt, bias_scale=1.0)
-            np.testing.assert_allclose(got, expect_pos, rtol=1.0e-5, err_msg=family)
-        for family in ("mf_velocity", "propagation_velocity"):
-            got = _rhs_for_family(family, phi=pre, row_beta=None, pgs_beta=pgs_beta, dt=dt, bias_scale=1.0)
-            np.testing.assert_allclose(got, expect_pos, rtol=1.0e-5, err_msg=family)
-            got0 = _rhs_for_family(family, phi=pre, row_beta=None, pgs_beta=pgs_beta, dt=dt, bias_scale=0.0)
-            np.testing.assert_allclose(got0, 0.0, atol=1.0e-9, err_msg=family)
+        got = _rhs_for_family("mf_setup", phi=pre, row_beta=None, pgs_beta=pgs_beta, dt=dt, bias_scale=1.0)
+        np.testing.assert_allclose(got, expect_pos, rtol=1.0e-5, err_msg="mf_setup")
+        got = _rhs_for_family("mf_velocity", phi=pre, row_beta=None, pgs_beta=pgs_beta, dt=dt, bias_scale=1.0)
+        np.testing.assert_allclose(got, expect_pos, rtol=1.0e-5, err_msg="mf_velocity")
+        got0 = _rhs_for_family("mf_velocity", phi=pre, row_beta=None, pgs_beta=pgs_beta, dt=dt, bias_scale=0.0)
+        np.testing.assert_allclose(got0, 0.0, atol=1.0e-9, err_msg="mf_velocity")
 
     def test_reset_clears_anchor_history_full_and_masked(self):
         """Drop carried anchors of selected worlds on reset, including without warm starting."""

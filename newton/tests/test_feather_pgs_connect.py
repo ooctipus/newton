@@ -174,11 +174,7 @@ class TestFeatherPGSConnect(unittest.TestCase):
         self.assertEqual(model.joint_articulation.numpy().tolist(), [0, -1])
         self.assertEqual(standalone_joint, 1)
 
-        solver = newton.solvers.SolverFeatherPGS(
-            model,
-            pgs_mode="matrix_free",
-            articulated_contact_response="propagation",
-        )
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free")
         self.assertFalse(solver._has_loop_joints)
         self.assertEqual(solver._connect_count, 0)
         np.testing.assert_array_equal(

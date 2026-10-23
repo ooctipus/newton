@@ -300,8 +300,7 @@ def main(argv: list[str] | None = None) -> int:
     ):
         parser.error("Use a fresh output outside all source checkouts")
     if any(
-        value.partition("=")[0] not in {"dense_max_constraints", "mf_max_constraints", "propagation_max_constraints"}
-        for value in args.solver_attr
+        value.partition("=")[0] not in {"dense_max_constraints", "mf_max_constraints"} for value in args.solver_attr
     ):
         parser.error("Only explicit solver capacities may override the original task recipe")
     report = {

@@ -37,7 +37,7 @@ CHECKED_ENVIRONMENT = {
     "FPGS_BENCH_LEGACY_CAPACITY",
 }
 SOLVER_CAPACITIES = {
-    "fpgs": {"dense_max_constraints", "mf_max_constraints", "propagation_max_constraints"},
+    "fpgs": {"dense_max_constraints", "mf_max_constraints"},
     "mjwarp": {"njmax", "nconmax"},
 }
 ADDITIONAL_RECIPES = {

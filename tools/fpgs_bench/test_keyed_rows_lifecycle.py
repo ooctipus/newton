@@ -171,7 +171,6 @@ class TestAllegroKineticLifecycleCPU(unittest.TestCase):
             for name, value in (
                 ("dense_max_constraints", 99),
                 ("pgs_warmstart", True),
-                ("articulated_contact_response", "propagation"),
                 ("pgs_velocity_iterations", 1),
                 ("_debug_buffers_enabled", True),
             ):

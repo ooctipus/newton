@@ -44,19 +44,14 @@ RADIUS = 0.1
 # the contact normal; spin parallel to the slide cannot excite the term.
 OMEGA_Y = 20.0
 SLIDE_VX = 2.0
-# (pgs_mode, articulated_contact_response, pgs_velocity_iterations): the split
-# velocity post-pass converts velocity to acceleration at two more patched
-# sites, and each propagation response variant is a separately generated
-# contact path
+# (pgs_mode, pgs_velocity_iterations): the velocity post-pass converts velocity
+# to acceleration at two more patched sites
 SLIDER_CONFIGS = [
-    ("split", "immediate", 0),
+    ("split", 0),
 ]
 SLIDER_CONFIGS_CUDA = [
-    ("matrix_free", "immediate", 0),
-    ("matrix_free", "immediate", 2),
-    ("matrix_free", "propagation", 0),
-    ("matrix_free", "propagation-fused", 0),
-    ("matrix_free", "propagation-colored", 0),
+    ("matrix_free", 0),
+    ("matrix_free", 2),
 ]
 
 
@@ -74,7 +69,7 @@ def _record_slider_step(
     peak_contacts[0] = wp.max(peak_contacts[0], rigid_contact_count[0])
 
 
-def _build_slider(device, articulated=False):
+def _build_slider(device):
     """A frictionless sphere resting on a frictionless ground plane."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     builder.default_shape_cfg.mu = 0.0
@@ -86,23 +81,12 @@ def _build_slider(device, articulated=False):
     )
     builder.add_shape_sphere(body, radius=RADIUS)
     joints = [builder.add_joint_free(body)]
-    if articulated:
-        # Fused propagation deliberately keeps single free bodies on the
-        # ordinary matrix-free path. A concentric fixed child makes this a
-        # floating articulation without changing the frictionless invariant.
-        child = builder.add_link(
-            xform=wp.transform(wp.vec3(0.0, 0.0, RADIUS), wp.quat_identity()),
-            mass=0.1,
-            com=wp.vec3(0.0, 0.0, 0.0),
-            inertia=wp.mat33(0.0004, 0.0, 0.0, 0.0, 0.0004, 0.0, 0.0, 0.0, 0.0004),
-        )
-        joints.append(builder.add_joint_fixed(body, child))
     builder.add_articulation(joints)
     builder.add_ground_plane()
     return builder.finalize(device=device)
 
 
-def _slide_heights(model, omega_y, pgs_mode, response="immediate", velocity_iterations=0):
+def _slide_heights(model, omega_y, pgs_mode, velocity_iterations=0):
     """Slide the sphere at ``SLIDE_VX`` while spinning at ``omega_y``.
 
     Returns per-step COM heights [m] and the peak live contact count, so the
@@ -120,7 +104,6 @@ def _slide_heights(model, omega_y, pgs_mode, response="immediate", velocity_iter
         model,
         angular_damping=0.0,
         pgs_mode=pgs_mode,
-        articulated_contact_response=response,
         pgs_velocity_iterations=velocity_iterations,
     )
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
@@ -128,11 +111,6 @@ def _slide_heights(model, omega_y, pgs_mode, response="immediate", velocity_iter
     control = model.control()
     heights = wp.empty(STEPS, dtype=wp.float32, device=model.device)
     peak_contacts = wp.zeros(1, dtype=wp.int32, device=model.device)
-    if response == "propagation-fused":
-        if not solver._propagation_contacts_enabled():
-            raise AssertionError("propagation-fused test model did not activate propagation contacts")
-        if solver._pgs_solve_propagation_full_iteration_kernel is None:
-            raise AssertionError("propagation-fused test model did not construct the fused iteration kernel")
     for step in range(STEPS):
         pipeline.collide(state_0, contacts)
         solver.step(state_0, state_1, control, contacts, DT)
@@ -144,8 +122,6 @@ def _slide_heights(model, omega_y, pgs_mode, response="immediate", velocity_iter
             outputs=[heights, peak_contacts],
             device=model.device,
         )
-    if response == "propagation-fused" and int(solver.propagation_constraint_count.numpy().sum()) <= 0:
-        raise AssertionError("propagation-fused test did not build any propagation contact rows")
     return heights.numpy(), int(peak_contacts.numpy()[0])
 
 
@@ -186,11 +162,11 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
         configs = list(SLIDER_CONFIGS)
         if device.is_cuda:
             configs += SLIDER_CONFIGS_CUDA
-        for pgs_mode, response, vel_iters in configs:
-            with self.subTest(pgs_mode=pgs_mode, response=response, velocity_iterations=vel_iters):
-                model = _build_slider(device, articulated=response == "propagation-fused")
-                still, contacts_still = _slide_heights(model, 0.0, pgs_mode, response, vel_iters)
-                spinning, contacts_spin = _slide_heights(model, OMEGA_Y, pgs_mode, response, vel_iters)
+        for pgs_mode, vel_iters in configs:
+            with self.subTest(pgs_mode=pgs_mode, velocity_iterations=vel_iters):
+                model = _build_slider(device)
+                still, contacts_still = _slide_heights(model, 0.0, pgs_mode, vel_iters)
+                spinning, contacts_spin = _slide_heights(model, OMEGA_Y, pgs_mode, vel_iters)
                 # the comparison is vacuous unless both runs really ride on
                 # active contact rows at the rest height
                 self.assertGreater(min(contacts_still, contacts_spin), 0, "no contacts were generated")

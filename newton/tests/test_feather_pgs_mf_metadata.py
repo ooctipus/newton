@@ -148,16 +148,10 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
                 np.testing.assert_array_equal(result.numpy(), parents)
 
     def test_other_generated_solve_paths_decode_high_parents(self):
-        """Decode high parents in propagation-full and local-pair consumers too."""
+        """Decode high parents in local-pair consumers too."""
         parents = np.array([-1, 0, 32767, 32768, 37247, 65534], np.int32)
         packed = (((parents.astype(np.int64) & 65535) << 16) | 2).astype(np.uint32).view(np.int32)
         kernels = (
-            (
-                fpgs._get_pgs_solve_propagation_full_iteration_kernel(8, 65535, 29, 64, 8, 6, "cpu"),
-                "pgs_solve_propagation_full_iteration_native",
-                "mf_par",
-                "packed_tp",
-            ),
             (
                 fpgs._get_pgs_solve_local_owned_kernel(
                     8,
@@ -211,11 +205,6 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
                 fpgs._get_pgs_solve_mf_gs_kernel(8, 65535, 29, "cpu"),
                 "pgs_solve_mf_gs_native",
                 "mf_meta.data[off_meta + parent * 4 + 3]",
-            ),
-            (
-                fpgs._get_pgs_solve_propagation_full_iteration_kernel(8, 65535, 29, 64, 8, 6, "cpu"),
-                "pgs_solve_propagation_full_iteration_native",
-                "mf_meta.data[off_meta + mf_par * 4 + 3]",
             ),
             (
                 fpgs._get_pgs_solve_local_owned_kernel(

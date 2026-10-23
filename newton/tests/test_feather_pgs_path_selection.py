@@ -313,7 +313,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertFalse(options["fuse_joint_velocity_limits"]["applied"])
         self.assertEqual(options["sparse_mass_matrix"]["applied"], "off")
         self.assertEqual(options["cached_dynamics"]["applied"], "off")
-        # Split mode builds no matrix-free tier and CPU builds no stream or cached propagation response.
+        # Split mode builds no matrix-free tier, CPU builds no stream, and the deprecated
+        # propagation_cached_response selects nothing.
         self.assertEqual(
             options["mf_gs_incremental_rows"], {"applied": 0, "requested": 32, "default": 32, "source": "default"}
         )
@@ -1033,8 +1034,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 {"sparse_mass_matrix": "off", "mf_gs_parallel_rows": 48, "friction_anchor_beta": 0.0},
                 {"free_count": 2},
             ),
-            ({"articulated_contact_response": "propagation"}, {"free_count": 2}),
-            ({"articulated_contact_response": "propagation-colored"}, {"free_count": 2}),
             ({"grouped_dynamics": True}, {}),
             ({"grouped_dynamics": True, "sparse_mass_matrix": "off", "friction_anchor_beta": 0.0}, {}),
             ({"enable_joint_velocity_limits": True}, {}),

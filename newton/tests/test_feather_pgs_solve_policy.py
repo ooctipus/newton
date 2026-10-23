@@ -645,37 +645,31 @@ class TestSolveReadoutRecord(unittest.TestCase):
         self.assertEqual((velocity_slot["budget"], velocity_slot["solves"], velocity_slot["exhausted"]), (2, 2, 2))
 
     def test_worlds_without_rows_count_as_skipped_per_pass(self):
-        """Count, per pass, one skipped solve per launch of every world without dense, matrix-free or propagation rows.
+        """Count, per pass, one skipped solve per launch of every world without dense or matrix-free rows.
 
         The matrix-free sweeps return before their first sweep for such a world, so no slot records
-        it; a world's solves are its slots' solves plus its skipped ones. On the propagation contact
-        routes the propagation sweeps solve a world whose rows are all propagation rows, so it is not
-        skipped; a route without propagation rows passes no counts of them.
+        it; a world's solves are its slots' solves plus its skipped ones.
         """
         record = SolveReadoutRecord(SWEEPS)
         counted = SimpleNamespace(key="counted_kernel", _fpgs_solve_readout="sweeps")
         record.register(counted, "mf_gs_incremental", world_count=4, budget=4, device="cpu", velocity_budget=2)
         record.register_skipped(world_count=4, device="cpu", velocity_budget=2)
-        # World 0 holds dense rows, world 2 matrix-free rows and world 3 propagation rows; world 1 has none.
+        # World 0 holds dense rows and world 2 matrix-free rows; worlds 1 and 3 have none.
         dense = wp.array([4, 0, 0, 0], dtype=wp.int32, device="cpu")
         free = wp.array([0, 0, 2, 0], dtype=wp.int32, device="cpu")
-        propagation = wp.array([0, 0, 0, 3], dtype=wp.int32, device="cpu")
         for _ in range(2):
-            record.count_skipped(dense, free, propagation_constraint_count=propagation)
+            record.count_skipped(dense, free)
         with record.velocity_pass():
-            record.count_skipped(dense, free, propagation_constraint_count=propagation)
+            record.count_skipped(dense, free)
         # A second registration keeps the counters.
         record.register_skipped(world_count=4, device="cpu")
         summary = record.summary()
         self.assertEqual(
             summary["skipped"],
-            [{"pass": "position", "solves": 2, "worlds": 1}, {"pass": "velocity", "solves": 1, "worlds": 1}],
+            [{"pass": "position", "solves": 4, "worlds": 2}, {"pass": "velocity", "solves": 2, "worlds": 2}],
         )
         self.assertEqual([slot["solves"] for slot in summary["slots"]], [0, 0])
         json.dumps(summary, allow_nan=False)
-        # Without propagation rows world 3 has no rows either.
-        record.count_skipped(dense, free)
-        self.assertEqual(record.summary()["skipped"][0], {"pass": "position", "solves": 4, "worlds": 2})
 
     def test_skip_counters_need_a_readout_and_a_registering_route(self):
         """Count no skipped solve without a readout, or on a route that registered no skip counters."""
@@ -817,7 +811,6 @@ def _sweep_record(**fields):
             "tiers",
             "local",
             "dense",
-            "propagation",
         )
     )
     record.update(route="matrix_free_gs", driver="direct", mf_gs="mf_gs_kernel")
@@ -873,7 +866,7 @@ class TestSweepPolicyRecords(unittest.TestCase):
         record = _sweep_record(driver="contact_then_internal")
         self.assertIn("once per launch", path_selection._readout(_policy_solver(), record)["reason"])
         self.assertIn("solves its worlds", path_selection._readout(_policy_solver(), _sweep_record())["reason"])
-        for driver in ("physx_grasp", "propagation_phases"):
+        for driver in ("physx_grasp",):
             with self.subTest(driver=driver):
                 reason = path_selection._readout(_policy_solver(), _sweep_record(driver=driver))["reason"]
                 self.assertIn("counts are per launch", reason)
@@ -882,20 +875,17 @@ class TestSweepPolicyRecords(unittest.TestCase):
     def test_records_name_the_worlds_no_counter_counts(self):
         """Name each owner that solves whole worlds without counters, and none where counted sweeps own every world.
 
-        The matrix-free sweep returns before its first sweep for the worlds the parallel tiers own,
-        and the propagation sweeps solve the worlds whose rows are all propagation rows. Those
-        worlds hold rows, so the skip counter leaves them out too: without a record their solves
-        would vanish from the summary. The incremental tiers count their own worlds.
+        The matrix-free sweep returns before its first sweep for the worlds the parallel tiers own.
+        Those worlds hold rows, so the skip counter leaves them out too: without a record their
+        solves would vanish from the summary. The incremental tiers count their own worlds.
         """
         parallel = {"family": "parallel", "tiers": [{"rows": 32, "kernel": "tier32"}, {"rows": 48, "kernel": "tier48"}]}
         incremental = {"family": "incremental", "tiers": [{"kernel": "incremental_kernel"}]}
-        propagation = {"mode": "propagation", "row_solve": "propagation_kernel", "cached_response": False}
         for fields, owners in (
             ({}, []),
             ({"tiers": incremental}, []),
             ({"tiers": parallel}, ["parallel_tiers"]),
             ({"tiers": {**parallel, "family": "keyed_parallel"}}, ["parallel_tiers"]),
-            ({"propagation": propagation, "driver": "propagation_phases"}, ["propagation"]),
         ):
             with self.subTest(fields=sorted(fields)):
                 readout = path_selection._readout(_policy_solver(), _sweep_record(**fields))
@@ -910,40 +900,6 @@ class TestSweepPolicyRecords(unittest.TestCase):
         solver = _policy_solver(readout="off")
         solver._solve_readout = SimpleNamespace(kernels={}, skipped_passes=())
         self.assertEqual(path_selection._readout(solver, _sweep_record(tiers=parallel))["uncounted_worlds"], {})
-
-    def test_fused_propagation_records_why_nothing_counts(self):
-        """Say that the fused propagation kernel runs every solve where no sweep counts or honors a tolerance.
-
-        Under ``articulated_contact_response="propagation-fused"`` none of the counted sweeps
-        launches, so the solver builds them under the exact policy, without counters: the records
-        then name the fused kernel as the reason, not fixed-iteration or Jacobi-tier sweeps.
-        """
-        fused = {
-            "mode": "propagation-fused",
-            "row_solve": "propagation_kernel",
-            "full_iteration": "fused_kernel",
-            "cached_response": False,
-        }
-        solver = _policy_solver(tolerance=1.0e-3)
-        solver._solve_readout = SimpleNamespace(kernels={}, skipped_passes=())
-        record = _sweep_record(driver="propagation_fused", propagation=fused)
-        sweep = {
-            "readout": path_selection._readout(solver, record),
-            "exit_law": path_selection._exit_law(solver, record),
-        }
-        readout, law = sweep["readout"], sweep["exit_law"]
-        self.assertEqual((readout["mode"], readout["counted"], readout["uncounted_worlds"]), ("off", {}, {}))
-        self.assertIn("fused propagation kernel", readout["reason"])
-        self.assertEqual((law["law"], law["honored"], law["driver_honors"]), ("exact", {}, False))
-        self.assertIn("fused_kernel", law["ignored"])
-        self.assertIn("fused propagation kernel", law["reason"])
-        (message,) = path_selection.policy_warnings(sweep)
-        self.assertIn("fused propagation kernel", message)
-        json.dumps(sweep, allow_nan=False)
-        # The propagation route that launches its row phases one by one keeps the general reasons.
-        record = _sweep_record(driver="propagation_phases", propagation={**fused, "mode": "propagation"})
-        self.assertIn("No sweep", path_selection._readout(solver, record)["reason"])
-        self.assertIn("No sweep", path_selection._exit_law(solver, record)["reason"])
 
     def test_records_name_the_passes_that_count_skipped_solves(self):
         """Name the passes whose solves of worlds without rows count as skipped, and none without counted sweeps."""

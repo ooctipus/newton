@@ -133,11 +133,11 @@ class TestKeyedRowIntegration(unittest.TestCase):
 
     def test_exact_row_sums(self):
         """Replace ordinary contact inputs while preserving exact scaling."""
-        from newton.tests import test_feather_pgs_propagation_free_root_warp as chain  # noqa: PLC0415
+        from newton.tests import test_feather_pgs_sparse_solver as chain  # noqa: PLC0415
 
         def model_factory():
-            with patch.object(chain, "N_LINKS", 12), patch.object(chain, "N_WORLDS", 2):
-                return chain._build_model("cuda:0", base_z=0.099, contact_sphere="base", ground=True)
+            with patch.object(chain, "CHAIN_LINKS", 12), patch.object(chain, "CHAIN_WORLDS", 2):
+                return chain._build_chain("cuda:0", base_z=0.099, contact_sphere="base", ground=True)
 
         for capacity in (32, 48):
             with self.subTest(capacity=capacity):

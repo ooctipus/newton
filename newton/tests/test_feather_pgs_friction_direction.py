@@ -13,15 +13,18 @@ from newton._src.solvers.feather_pgs.kernels import pgs_solve_loop
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_tiled_row_kernel
 
 
-def _slide(device, mode, beta, mesh, angle, response=None, *, locked_tangent=False):
-    """Slide a symmetric, explicitly massed box under a force above the friction limit."""
+def _slide(device, mode, beta, mesh, angle, articulated=False, *, locked_tangent=False):
+    """Slide a symmetric, explicitly massed box under a force above the friction limit.
+
+    ``articulated`` builds the box as a D6-jointed articulation instead of a free body.
+    """
     builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
     cfg = newton.ModelBuilder.ShapeConfig(mu=0.3, gap=0.0, restitution=0.0)
     builder.add_shape_box(-1, hx=2.0, hy=2.0, hz=0.05, xform=wp.transform((0, 0, -0.05)), cfg=cfg)
     inertia = np.diag([(0.2**2 + 0.05**2) / 12] * 2 + [2 * 0.2**2 / 12]).astype(np.float32)
-    add_body = builder.add_body if response is None else builder.add_link
+    add_body = builder.add_link if articulated else builder.add_body
     body = add_body(xform=wp.transform((0, 0, 0.025)), mass=1.0, inertia=wp.mat33(inertia), lock_inertia=True)
-    if response is not None:
+    if articulated:
         joint = builder.add_joint_d6(
             parent=-1,
             child=body,
@@ -47,7 +50,6 @@ def _slide(device, mode, beta, mesh, angle, response=None, *, locked_tangent=Fal
         mf_max_constraints=128,
         dense_max_constraints=32,
         row_watermark=True,
-        articulated_contact_response=response or "immediate",
     )
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=128, deterministic=True)
     contacts = pipeline.contacts()
@@ -71,25 +73,22 @@ def _slide(device, mode, beta, mesh, angle, response=None, *, locked_tangent=Fal
 class TestFeatherPGSFrictionDirection(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_articulated_sliding_direction(self):
-        """Preserve sliding direction through dense and every articulated propagation route."""
-        for response in ("immediate", "propagation", "propagation-fused", "propagation-colored"):
-            with self.subTest(response=response):
-                velocity, direction, _ = _slide("cuda:0", "matrix_free", 0.2, False, np.pi / 4, response)
-                np.testing.assert_allclose(velocity, direction * (0.2 * 0.3 * 9.81) * 0.5, atol=0.015, rtol=0.03)
+        """Preserve sliding direction through the dense articulated route."""
+        velocity, direction, _ = _slide("cuda:0", "matrix_free", 0.2, False, np.pi / 4, articulated=True)
+        np.testing.assert_allclose(velocity, direction * (0.2 * 0.3 * 9.81) * 0.5, atol=0.015, rtol=0.03)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_locked_tangent_preserves_other_friction_direction(self):
         """Retain friction along a slider when its first tangent has zero response."""
-        for response in ("immediate", "propagation", "propagation-fused", "propagation-colored"):
-            for beta in (0.0, 0.2):
-                with self.subTest(response=response, beta=beta):
-                    velocity, direction, watermarks = _slide(
-                        "cuda:0", "matrix_free", beta, False, 0.0, response, locked_tangent=True
-                    )
-                    np.testing.assert_allclose(velocity, direction * (0.2 * 0.3 * 9.81) * 0.5, atol=0.015, rtol=0.03)
-                    for key, value in watermarks.items():
-                        if "overflow" in key or "dropped" in key:
-                            self.assertEqual(value, 0, key)
+        for beta in (0.0, 0.2):
+            with self.subTest(beta=beta):
+                velocity, direction, watermarks = _slide(
+                    "cuda:0", "matrix_free", beta, False, 0.0, articulated=True, locked_tangent=True
+                )
+                np.testing.assert_allclose(velocity, direction * (0.2 * 0.3 * 9.81) * 0.5, atol=0.015, rtol=0.03)
+                for key, value in watermarks.items():
+                    if "overflow" in key or "dropped" in key:
+                        self.assertEqual(value, 0, key)
 
     def test_unequal_tangent_masses(self):
         """Solve sticking and sliding blocks with rotated, unequal tangent masses in one sweep."""

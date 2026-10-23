@@ -14,7 +14,6 @@ import unittest
 import numpy as np
 import warp as wp
 
-import newton
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton._src.solvers.feather_pgs.kernels import (
     allocate_world_contact_slots,
@@ -168,47 +167,6 @@ class TestFeatherPGSRowAllocation(unittest.TestCase):
             worst_excess = max(worst_excess, excess)
             self.assertEqual(int(np.sum(needed[accepted])), count, "accepted rows must fill exactly [0, count)")
         self.assertLessEqual(worst_excess, 0, f"accepted rows reach {worst_excess} past the row count")
-
-    def test_dense_capacity_keeps_room_for_same_articulation_contacts(self):
-        """Propagation modes must not shrink the dense budget when contacts can still route there.
-
-        Contacts between two links of one articulation stay on the dense family unless
-        ``propagation_same_articulation_rows`` routes them; a 16-row internal reserve
-        drops most of them every step.
-        """
-        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
-        builder.add_ground_plane()
-        root = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()))
-        builder.add_shape_box(root, hx=0.1, hy=0.1, hz=0.1)
-        j_root = builder.add_joint_revolute(parent=-1, child=root, axis=wp.vec3(0.0, 1.0, 0.0))
-        link = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.8), wp.quat_identity()))
-        builder.add_shape_box(link, hx=0.1, hy=0.1, hz=0.1)
-        j_link = builder.add_joint_revolute(
-            parent=root,
-            child=link,
-            axis=wp.vec3(0.0, 1.0, 0.0),
-            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.3), wp.quat_identity()),
-        )
-        builder.add_articulation([j_root, j_link], label="chain")
-        model = builder.finalize()
-        model.rigid_contact_max = 256
-        dense_routed = newton.solvers.SolverFeatherPGS(
-            model,
-            pgs_mode="matrix_free",
-            articulated_contact_response="propagation-colored",
-            dense_max_constraints=320,
-            mf_max_constraints=256,
-        )
-        self.assertEqual(int(dense_routed.dense_max_constraints), 320)
-        propagation_routed = newton.solvers.SolverFeatherPGS(
-            model,
-            pgs_mode="matrix_free",
-            articulated_contact_response="propagation-colored",
-            dense_max_constraints=320,
-            mf_max_constraints=256,
-            propagation_same_articulation_rows=True,
-        )
-        self.assertLess(int(propagation_routed.dense_max_constraints), 320)
 
 
 if __name__ == "__main__":

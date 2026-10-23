@@ -1109,13 +1109,11 @@ def _record_patch_routes(patches):
 class TestPatchSolverRoutes(unittest.TestCase):
     def test_solver_passes_every_patch_route(self):
         """Link, seed and finish every route that holds patch rows; seed with its decay times dt over the last dt."""
-        # Split mode on the CPU routes the fixed-base arm's contacts through dense
-        # rows and the free box's through matrix-free rows; matrix-free mode with
-        # propagation rows on CUDA enables all three routes.
+        # Both modes route the fixed-base arm's contacts through dense rows and the
+        # free box's through matrix-free rows; no route builds the third family.
         configs = [("cpu", {"pgs_mode": "split"}, (1, 1, 0))]
         if wp.is_cuda_available():
-            propagation = {"pgs_mode": "matrix_free", "articulated_contact_response": "propagation"}
-            configs.append(("cuda:0", propagation, (1, 1, 1)))
+            configs.append(("cuda:0", {"pgs_mode": "matrix_free"}, (1, 1, 0)))
         dts = (1.0 / 240.0, 1.0 / 240.0, 1.0 / 120.0, 1.0 / 480.0)
         for (device, mode, enabled), warmstart in itertools.product(configs, (False, True)):
             with self.subTest(device=device, warmstart=warmstart):
@@ -1127,7 +1125,6 @@ class TestPatchSolverRoutes(unittest.TestCase):
                 arrays = (
                     (solver.row_parent, solver.row_mu, solver.impulses),
                     (solver.mf_row_parent, solver.mf_row_mu, solver.mf_impulses),
-                    (solver.propagation_row_parent, solver.propagation_row_mu, solver.propagation_impulses),
                 )
                 pipeline = newton.CollisionPipeline(model, contact_matching="latest")
                 contacts = pipeline.contacts()

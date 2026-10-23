@@ -40,7 +40,6 @@ from newton._src.sim.contacts import Contacts
 from newton.geometry import HydroelasticSDF
 
 DT = 1.0 / 240.0
-FPGS_PROPAGATION_PATH = 2
 
 
 def _cylinder_foot(builder, pos, mass=1.0, num_cyl=7, radius=0.02, half_height=0.015):
@@ -67,7 +66,7 @@ def _free_jointed_foot(builder, pos, num_cyl=7, radius=0.02, half_height=0.015):
 
     ``ModelBuilder.add_body`` creates the same free articulation as a
     convenience. This expanded form is useful in tests that need to contrast
-    free-root routing with non-free propagation paths.
+    free-root routing with non-free articulation routing.
     """
     link = builder.add_link(xform=wp.transform(wp.vec3(*pos), wp.quat_identity()))
     for i in range(num_cyl):
@@ -86,9 +85,8 @@ def _free_jointed_foot(builder, pos, num_cyl=7, radius=0.02, half_height=0.015):
 def _prismatic_jointed_foot(builder, pos, num_cyl=7, radius=0.02, half_height=0.015):
     """A cylinder-row foot on a world-rooted prismatic joint.
 
-    Unlike a single-link free articulation, this is a non-free articulation.
-    Contacts on it must therefore take the articulated propagation-row path in
-    every propagation response mode, including ``propagation-fused``.
+    Unlike a single-link free articulation, this is a non-free articulation,
+    so contacts on it take the articulated (dense) row path.
     """
     link = builder.add_link()
     for i in range(num_cyl):
@@ -110,50 +108,6 @@ def _prismatic_jointed_foot(builder, pos, num_cyl=7, radius=0.02, half_height=0.
     )
     builder.add_articulation([joint])
     return link
-
-
-def _same_articulation_scissor(builder):
-    """Build two overlapping sibling links in one non-free articulation."""
-    no_collision = builder.default_shape_cfg.copy()
-    no_collision.has_shape_collision = False
-    no_collision.collision_group = 0
-
-    base = builder.add_link()
-    builder.add_shape_box(base, hx=0.04, hy=0.04, hz=0.04, cfg=no_collision)
-    joints = [
-        builder.add_joint_revolute(
-            parent=-1,
-            child=base,
-            axis=newton.Axis.Z,
-            parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()),
-            child_xform=wp.transform_identity(),
-        )
-    ]
-    for side in (-1.0, 1.0):
-        link = builder.add_link()
-        # The siblings overlap. Three slightly overlapping boxes on each link
-        # make several box-box manifolds for one body pair, guaranteeing that
-        # body-pair reduction has more than one manifold's worth of real work.
-        for x in (-0.06, 0.0, 0.06):
-            builder.add_shape_box(
-                link,
-                xform=wp.transform(wp.vec3(x, 0.0, 0.0), wp.quat_identity()),
-                hx=0.05,
-                hy=0.04,
-                hz=0.04,
-            )
-        joints.append(
-            builder.add_joint_revolute(
-                parent=base,
-                child=link,
-                axis=newton.Axis.Z,
-                parent_xform=wp.transform(wp.vec3(0.06, side * 0.02, 0.0), wp.quat_identity()),
-                child_xform=wp.transform(wp.vec3(-0.12, 0.0, 0.0), wp.quat_identity()),
-                collision_filter_parent=False,
-            )
-        )
-    builder.add_articulation(joints)
-    return base
 
 
 def _sphere_grid_body(builder, pos, n=5, spacing=0.05, radius=0.01, mass=1.0):
@@ -1050,40 +1004,32 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         self.assertGreater(int(solver._row_dropped_dense.numpy().max()), 0)
         self.assertEqual(int(solver._row_overflow_warning_emitted.numpy()[0]), 1)
 
-    def test_constraint_overflow_warning_covers_matrix_free_and_propagation_rows(self):
-        """Identify overflows on both non-dense contact row families."""
+    def test_constraint_overflow_warning_covers_matrix_free_rows(self):
+        """Identify overflows on the matrix-free contact row family."""
         if not wp.get_device().is_cuda:
             self.skipTest("matrix-free FeatherPGS overflow coverage is CUDA-only")
 
-        cases = (
-            ("immediate", _free_jointed_foot, 1, "_row_dropped_mf"),
-            ("propagation", _prismatic_jointed_foot, 2, "_row_dropped_propagation"),
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        _free_jointed_foot(builder, (0.0, 0.0, 0.02))
+        builder.add_ground_plane()
+        model = builder.finalize(device=wp.get_device())
+        state_0, state_1 = model.state(), model.state()
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        pipeline = _make_pipeline(model, False)
+        contacts = pipeline.contacts()
+        pipeline.collide(state_0, contacts)
+
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            angular_damping=0.0,
+            pgs_mode="matrix_free",
+            dense_max_constraints=4,
+            mf_max_constraints=4,
         )
-        for response, build_foot, warning_index, dropped_attribute in cases:
-            with self.subTest(response=response):
-                builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-                build_foot(builder, (0.0, 0.0, 0.02))
-                builder.add_ground_plane()
-                model = builder.finalize(device=wp.get_device())
-                state_0, state_1 = model.state(), model.state()
-                newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
-                pipeline = _make_pipeline(model, False)
-                contacts = pipeline.contacts()
-                pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, model.control(), contacts, DT)
 
-                solver = newton.solvers.SolverFeatherPGS(
-                    model,
-                    angular_damping=0.0,
-                    pgs_mode="matrix_free",
-                    articulated_contact_response=response,
-                    dense_max_constraints=4,
-                    mf_max_constraints=4,
-                )
-                solver.step(state_0, state_1, model.control(), contacts, DT)
-
-                dropped_rows = getattr(solver, dropped_attribute)
-                self.assertGreater(int(dropped_rows.numpy().max()), 0)
-                self.assertEqual(int(solver._row_overflow_warning_emitted.numpy()[warning_index]), 1)
+        self.assertGreater(int(solver._row_dropped_mf.numpy().max()), 0)
+        self.assertEqual(int(solver._row_overflow_warning_emitted.numpy()[1]), 1)
 
     def test_feather_pgs_conformance(self):
         """SolverFeatherPGS rests a free-jointed foot at the same height on/off.
@@ -1139,33 +1085,23 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
             self.skipTest("FeatherPGS contact-mode conformance is a CUDA-only merge gate")
 
         configs = [
-            ("split", "immediate", 16, _prismatic_jointed_foot, "dense"),
-            ("split", "immediate", 16, _free_jointed_foot, "mf"),
+            ("split", 16, _prismatic_jointed_foot, "dense"),
+            ("split", 16, _free_jointed_foot, "mf"),
+            # Matrix-free is CUDA-only.
+            ("matrix_free", None, _free_jointed_foot, "mf"),
         ]
-        # Matrix-free (and its propagation response family) is CUDA-only. Use
-        # a non-free prismatic articulation for every propagation variant. A
-        # free-only scene disables propagation-fused and would let that
-        # subtest pass through the ordinary matrix-free solver.
-        configs += [
-            ("matrix_free", "immediate", None, _free_jointed_foot, "mf"),
-            ("matrix_free", "propagation", 16, _prismatic_jointed_foot, "propagation"),
-            ("matrix_free", "propagation-fused", None, _prismatic_jointed_foot, "propagation"),
-            ("matrix_free", "propagation-colored", 16, _prismatic_jointed_foot, "propagation"),
-        ]
-        # Dense, propagation, and propagation-colored run 16 iterations. The
-        # two ``None`` entries deliberately omit pgs_iterations and assert the
-        # production default (12), rather than testing a stale assumed default.
-        # At 8 iterations the UNREDUCED redundant set does not converge (dense
-        # settles 5 mm high, plain/colored propagation 4.8 mm high at 0.01980;
-        # the REDUCED set and split land at the true 0.01500 at every
-        # iteration count) -- redundant near-parallel rows hurt PGS
-        # conditioning, the same effect as the stack-collapse case, and
-        # reduction itself is what removes it.  The comparison must be against
-        # a converged baseline.
-        for mode, response, iters, build_foot, row_path in configs:
-            with self.subTest(pgs_mode=mode, response=response):
+        # The dense entries run 16 iterations. The ``None`` entry deliberately
+        # omits pgs_iterations and asserts the production default (12), rather
+        # than testing a stale assumed default. At 8 iterations the UNREDUCED
+        # redundant set does not converge (dense settles 5 mm high; the REDUCED
+        # set and split land at the true 0.01500 at every iteration count) --
+        # redundant near-parallel rows hurt PGS conditioning, the same effect as
+        # the stack-collapse case, and reduction itself is what removes it. The
+        # comparison must be against a converged baseline.
+        for mode, iters, build_foot, row_path in configs:
+            with self.subTest(pgs_mode=mode, row_path=row_path):
 
-                def make_solver(model, mode=mode, response=response, iters=iters, row_path=row_path):
+                def make_solver(model, mode=mode, iters=iters):
                     kwargs = {}
                     if iters is not None:
                         kwargs["pgs_iterations"] = iters
@@ -1173,89 +1109,19 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
                         model,
                         angular_damping=0.0,
                         pgs_mode=mode,
-                        articulated_contact_response=response,
                         row_watermark=True,
                         **kwargs,
                     )
                     if iters is None:
                         self.assertEqual(solver.pgs_iterations, 12)
-                    if row_path == "propagation":
-                        self.assertTrue(
-                            solver._propagation_contacts_enabled(),
-                            f"{response} test scene did not enable propagation contacts",
-                        )
-                    if response == "propagation-fused":
-                        self.assertTrue(solver.propagation_full_fused_iterations)
                     return solver
 
                 self._compare(
                     lambda b, build_foot=build_foot: build_foot(b, (0.0, 0.0, 0.05)),
                     make_solver,
-                    tol=2e-3 if row_path == "propagation" else 5e-4,
+                    tol=5e-4,
                     expected_row_path=row_path,
                 )
-
-    def test_feather_pgs_same_articulation_rows_are_nonvacuous(self):
-        """Route a strictly reduced sibling-link manifold to propagation rows.
-
-        The general propagation scenes are link-to-ground contacts. This pins
-        the opt-in cross-response path for contacts whose two bodies belong to
-        the same articulation, and proves both that reduction did work and
-        that the resulting rows reached the intended CUDA kernel family.
-        """
-        if not wp.get_device().is_cuda:
-            self.skipTest("matrix-free propagation requires CUDA")
-
-        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-        _same_articulation_scissor(builder)
-        model = builder.finalize(device=wp.get_device())
-        state_0, state_1 = model.state(), model.state()
-        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
-
-        raw_pipeline = _make_pipeline(model, False)
-        raw_contacts = raw_pipeline.contacts()
-        raw_pipeline.collide(state_0, raw_contacts)
-        raw_count = int(raw_contacts.rigid_contact_count.numpy()[0])
-
-        reduced_pipeline = _make_pipeline(model, True, body_pair_cell_size=10.0)
-        reduced_contacts = reduced_pipeline.contacts()
-        reduced_pipeline.collide(state_0, reduced_contacts)
-        reduced_count = int(reduced_contacts.rigid_contact_count.numpy()[0])
-        self.assertGreater(raw_count, 0, "scissor scene emitted no sibling-link contacts")
-        self.assertLess(reduced_count, raw_count, "same-articulation manifold was not reduced")
-
-        solver = newton.solvers.SolverFeatherPGS(
-            model,
-            angular_damping=0.0,
-            pgs_mode="matrix_free",
-            articulated_contact_response="propagation",
-            propagation_same_articulation_rows=True,
-            row_watermark=True,
-        )
-        self.assertEqual(solver.pgs_iterations, 12)
-        self.assertTrue(solver._propagation_contacts_enabled())
-        solver.step(state_0, state_1, model.control(), reduced_contacts, DT)
-        self.assertTrue(np.isfinite(state_1.body_q.numpy()).all())
-        self.assertTrue(np.isfinite(state_1.body_qd.numpy()).all())
-        rows = solver.constraint_row_watermarks()
-        self.assertGreater(rows["propagation_high_water"], 0)
-        active_paths = solver.contact_path.numpy()[:reduced_count]
-        routed = np.flatnonzero(active_paths == FPGS_PROPAGATION_PATH)
-        self.assertGreater(routed.size, 0, "no reduced contact was routed to the propagation path")
-        shape_body = model.shape_body.numpy()
-        body_art = solver.body_to_articulation.numpy()
-        shape0 = reduced_contacts.rigid_contact_shape0.numpy()[:reduced_count]
-        shape1 = reduced_contacts.rigid_contact_shape1.numpy()[:reduced_count]
-        for contact in routed:
-            body0 = int(shape_body[shape0[contact]])
-            body1 = int(shape_body[shape1[contact]])
-            self.assertGreaterEqual(body0, 0)
-            self.assertGreaterEqual(body1, 0)
-            self.assertEqual(
-                int(body_art[body0]),
-                int(body_art[body1]),
-                "the path assertion did not cover a same-articulation contact",
-            )
 
     def test_mixed_separation_tilted_patch(self):
         """Settle a tilted patch whose contacts mix penetrating and speculative.

@@ -1519,20 +1519,13 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             response_order = np.asarray(
                 sorted(size_arts, key=lambda art: (int(articulation_world[art]), int(art))), dtype=np.int32
             )
-            propagation_order = response_order[~free_mask[response_order]]
             response_counts = np.bincount(articulation_world[response_order], minlength=solver.world_count)
-            propagation_counts = np.bincount(articulation_world[propagation_order], minlength=solver.world_count)
             response_starts = np.pad(np.cumsum(response_counts), (1, 0)).astype(np.int32)
-            propagation_starts = np.pad(np.cumsum(propagation_counts), (1, 0)).astype(np.int32)
 
             np.testing.assert_array_equal(solver.world_response_group_art_start[size].numpy(), response_starts)
             np.testing.assert_array_equal(solver.world_response_group_to_art[size].numpy(), response_order)
-            np.testing.assert_array_equal(solver.world_group_art_start[size].numpy(), propagation_starts)
-            np.testing.assert_array_equal(solver.world_group_to_art[size].numpy(), propagation_order)
 
         free_articulations = np.flatnonzero(free_mask).astype(np.int32)
-        np.testing.assert_array_equal(solver.world_group_art_start[6].numpy(), np.array((0, 0, 0), dtype=np.int32))
-        np.testing.assert_array_equal(solver.world_group_to_art[6].numpy(), np.empty(0, dtype=np.int32))
         np.testing.assert_array_equal(
             solver.world_response_group_art_start[6].numpy(), np.array((0, 1, 2), dtype=np.int32)
         )

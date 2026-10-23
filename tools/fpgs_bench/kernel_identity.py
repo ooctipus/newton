@@ -145,8 +145,8 @@ def factory_calls():
     hold the suite's shapes); the fallback and linked parallel tiers of a
     second keyed-row coordinate layout (one articulation, no secondary block),
     the Cholesky factor families with the held trees' geometric refreshes
-    (:func:`held_factor_calls`) and the revolute propagation trees follow.
-    Calls a factory rejects are recorded as rejected.
+    (:func:`held_factor_calls`) follow. Calls a factory rejects are recorded as
+    rejected.
     """
     from newton._src.solvers.feather_pgs import keyed_rows, small_cholesky  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
@@ -215,15 +215,6 @@ def factory_calls():
         factory = _unwrapped(solver._get_inverse_cholesky_register_kernel)
         yield name + "_get_inverse_cholesky_register_kernel", factory, (size, ARCH), {"lower_only": True}
     yield from held_factor_calls()
-
-    # One-warp propagation trees of single-coordinate joints, with and without a multi-coordinate root.
-    for factory, size, free_root in itertools.product(
-        ("_get_factor_propagation_tree_revolute_kernel", "_get_propagation_tree_body_response_revolute_kernel"),
-        (7, 18),
-        (False, True),
-    ):
-        kwargs = {"has_free_root": True} if free_root else {}
-        yield name + factory, _unwrapped(getattr(solver, factory)), (size, ARCH), kwargs
 
 
 def held_factor_calls():
@@ -469,9 +460,9 @@ def census_calls():
     Gauss-Seidel (one shape within a warp's width of coordinates, one beyond
     it), sparse (one shape small enough for subwarp sweeps), paired factor,
     local owners plain and over packet rows, sparse diagonal, incremental,
-    parallel and keyed parallel tiers and the fused propagation iteration.
-    Every factory that takes a velocity-limit law is crossed with both laws,
-    and the matrix-free Gauss-Seidel sweep with resident row metadata.
+    parallel and keyed parallel tiers. Every factory that takes a velocity-limit
+    law is crossed with both laws, and the matrix-free Gauss-Seidel sweep with
+    resident row metadata.
     """
     from newton._src.solvers.feather_pgs import keyed_rows, row_packets  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
@@ -602,12 +593,6 @@ def census_calls():
                 _axis("skip_local_internal_worlds"),
                 _axis("linked_rows"),
             ),
-        ),
-        (
-            name + "_get_pgs_solve_propagation_full_iteration_kernel",
-            solver._get_pgs_solve_propagation_full_iteration_kernel,
-            ((64, 32, 18, 48, 8, 18, ARCH),),
-            (_axis("worlds_per_block", (1, 2)), _axis("fuse_vel_limits"), laws),
         ),
     )
     for factory_name, cached, shapes, axes in specs:

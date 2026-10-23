@@ -34,8 +34,8 @@ and the largest velocity-scaled change of its final sweep with that row's
 kind. The counters are one operand per kernel, appended to the kernel's
 arguments, and :class:`SolveReadoutRecord` owns them on the host. The
 matrix-free sweeps enter no world without rows, so the record also counts
-the solves of worlds without dense, matrix-free or propagation rows as
-skipped, in a launch of its own. Neither readout changes a computed value.
+the solves of worlds without dense or matrix-free rows as skipped, in a
+launch of its own. Neither readout changes a computed value.
 """
 
 import math
@@ -436,8 +436,7 @@ class SolveReadoutRecord:
     (:meth:`count_skipped`), the worlds without rows of any family, so a
     world's solves are its slots' solves plus its skipped ones. Sweeps
     without counters can own whole worlds that hold rows: the parallel
-    (Jacobi) tiers the worlds they claim from the matrix-free sweep, and the
-    propagation sweeps a world whose rows are all propagation rows. Neither a
+    (Jacobi) tiers the worlds they claim from the matrix-free sweep. Neither a
     slot nor the skip counter counts those solves. The route record names
     these owners (``routes.sweep.readout.uncounted_worlds``).
     """
@@ -504,32 +503,23 @@ class SolveReadoutRecord:
             if budgets[solve_pass] > 0:
                 self._skipped[solve_pass] = wp.zeros(int(world_count), dtype=wp.int32, device=device)
 
-    def count_skipped(
-        self,
-        world_constraint_count: wp.array,
-        mf_constraint_count: wp.array,
-        *,
-        propagation_constraint_count: wp.array | None = None,
-    ) -> None:
-        """Count, in the current pass, one skipped solve of every world without dense, matrix-free or propagation rows.
+    def count_skipped(self, world_constraint_count: wp.array, mf_constraint_count: wp.array) -> None:
+        """Count, in the current pass, one skipped solve of every world without dense or matrix-free rows.
 
         A launch of its own, made only under a registered readout; capturable.
 
         Args:
             world_constraint_count: Dense rows per world.
             mf_constraint_count: Matrix-free rows per world.
-            propagation_constraint_count: Propagation rows per world, which the propagation sweeps solve
-                on the propagation contact routes, or ``None`` on a route without them.
         """
         skipped = self._skipped.get(self._pass)
         if skipped is None:
             return
-        if propagation_constraint_count is None:
-            propagation_constraint_count = self._no_rows
         wp.launch(
             count_skipped_solves,
             dim=skipped.shape[0],
-            inputs=[world_constraint_count, mf_constraint_count, propagation_constraint_count],
+            # The kernel's third row family has no rows on any route.
+            inputs=[world_constraint_count, mf_constraint_count, self._no_rows],
             outputs=[skipped],
             device=skipped.device,
         )
@@ -576,8 +566,8 @@ class SolveReadoutRecord:
         ``full_budget_fraction`` and ``past_first_sweep["full_budget_fraction"]``.
 
         ``skipped`` holds, per solve pass of a route that registered skip
-        counters, the ``solves`` of worlds without dense, matrix-free or
-        propagation rows, which entered no sweep, and the number of ``worlds``
+        counters, the ``solves`` of worlds without dense or matrix-free rows,
+        which entered no sweep, and the number of ``worlds``
         they came from: the matrix-free sweeps return before their first sweep
         for such a world, so no slot counts it. Under the direct driver
         (``routes.sweep.driver``) each solve of a world that a counted sweep

@@ -16,7 +16,6 @@ from newton._src.solvers.feather_pgs.kernels import (
     apply_world_contact_restitution_accumulated,
     compute_contact_linear_force_from_impulses,
     compute_mf_effective_mass_and_rhs,
-    compute_propagation_effective_mass_and_rhs,
     compute_world_contact_bias,
     populate_world_J_for_compact_size,
     populate_world_J_for_size,
@@ -284,45 +283,6 @@ def _mf_speculative_rhs(scale: float) -> float:
             wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
             wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
             rhs,
-            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
-        ],
-        device="cpu",
-    )
-    return float(rhs.numpy()[0, 0])
-
-
-def _propagation_speculative_rhs(scale: float) -> float:
-    """Return the propagation setup RHS for a requested speculative scale."""
-    rhs = wp.zeros((1, 1), dtype=wp.float32, device="cpu")
-    wp.launch(
-        compute_propagation_effective_mass_and_rhs,
-        dim=1,
-        inputs=[
-            wp.array([1], dtype=wp.int32, device="cpu"),
-            wp.array([[-1]], dtype=wp.int32, device="cpu"),
-            wp.array([[-1]], dtype=wp.int32, device="cpu"),
-            wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
-            wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
-            wp.zeros((1, 6, 6), dtype=wp.float32, device="cpu"),
-            wp.array([[1.0]], dtype=wp.float32, device="cpu"),
-            wp.array([[0]], dtype=wp.int32, device="cpu"),
-            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
-            wp.zeros((1, 6), dtype=wp.float32, device="cpu"),
-            wp.array([float("inf")], dtype=wp.float32, device="cpu"),
-            1.0,
-            0.2,
-            1.0,
-            0.5,
-            scale,
-            0.5,
-            1,
-        ],
-        outputs=[
-            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
-            wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
-            wp.zeros((1, 1, 6), dtype=wp.float32, device="cpu"),
-            rhs,
-            wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
             wp.zeros((1, 1), dtype=wp.float32, device="cpu"),
         ],
         device="cpu",
@@ -786,11 +746,10 @@ class TestFeatherPGSContactControls(unittest.TestCase):
         self.assertEqual(free_body["slots_needed"], 3)
 
     def test_speculative_scale_controls_every_position_rhs_family(self):
-        """Scale positive-gap position bias on dense, MF, and propagation rows."""
+        """Scale positive-gap position bias on dense and MF rows."""
         rhs_families = {
             "dense": _dense_speculative_rhs,
             "matrix_free": _mf_speculative_rhs,
-            "propagation": _propagation_speculative_rhs,
         }
         for name, compute_rhs in rhs_families.items():
             with self.subTest(family=name):

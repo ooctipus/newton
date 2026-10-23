@@ -171,7 +171,6 @@ def _solver_snapshot(solver):
         "kinematic_dof_mask": solver._kinematic_dof_mask,
         "kinematic_joint_mask": solver._kinematic_joint_mask,
         "joint_armature_effective": solver._joint_armature_effective,
-        "body_prescribed": solver._body_prescribed,
         "fk_id_cache_valid": solver._fk_id_cache_valid,
         "mass_update_requested": solver._mass_update_requested,
         **{f"R_by_size[{size}]": solver.R_by_size[size] for size in solver.size_groups},

@@ -492,13 +492,6 @@ def _solver_factory_calls():
         }
         factory = solver._get_pgs_solve_mf_gs_incremental_kernel.__wrapped__
         yield name + "_get_pgs_solve_mf_gs_incremental_kernel", factory, (64, 32, 12, _ARCH), kwargs
-    # The propagation full-iteration kernel, under either law.
-    for fused, accumulated in itertools.product((False, True), repeat=2):
-        kwargs = {"worlds_per_block": 1, "fuse_vel_limits": fused}
-        if accumulated:
-            kwargs["velocity_limit_law"] = "accumulated"
-        factory = solver._get_pgs_solve_propagation_full_iteration_kernel.__wrapped__
-        yield name + "_get_pgs_solve_propagation_full_iteration_kernel", factory, (64, 32, 18, 48, 8, 18, _ARCH), kwargs
     for triples, components in itertools.product((False, True), repeat=2):
         factory = solver._get_pgs_solve_paired_factor_kernel.__wrapped__
         yield name + "_get_pgs_solve_paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, triples, components), {}
@@ -556,12 +549,10 @@ def _spliced_sweep_calls():
 
     Local owners, plain and over packet rows: a contactless subwarp articulation,
     an articulation pair and the pair's residual with matrix-free rows. Then the
-    tiled-row sweep with and without row budgets, the legacy matrix-free sweep
-    and the four propagation sweeps.
+    tiled-row sweep with and without row budgets and the legacy matrix-free sweep.
     """
     from newton._src.solvers.feather_pgs import row_packets  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
-    from newton._src.solvers.feather_pgs.kernels import PROPAGATION_COLOR_TAIL  # noqa: PLC0415
 
     name = "solver_feather_pgs."
     local = solver._get_pgs_solve_local_owned_kernel.__wrapped__
@@ -582,21 +573,6 @@ def _spliced_sweep_calls():
             kwargs = {"row_budget": budget, "min_rows": minimum}
             yield name + "_get_pgs_solve_tiled_row_kernel", tiled, (capacity, _ARCH), kwargs
     yield name + "_get_pgs_solve_mf_kernel", solver._get_pgs_solve_mf_kernel.__wrapped__, (32, 8, _ARCH), {}
-    entries = PROPAGATION_COLOR_TAIL + 2
-    factory = solver._get_pgs_solve_propagation_colored_warp_kernel.__wrapped__
-    for lanes in (1, 4):
-        yield name + "_get_pgs_solve_propagation_colored_warp_kernel", factory, (64, entries, 16, lanes, 2, _ARCH), {}
-    # Shared-memory body staging, and the global-memory path above its body cap.
-    factory = solver._get_pgs_solve_propagation_colored_block_kernel.__wrapped__
-    for bodies in (16, 512):
-        yield name + "_get_pgs_solve_propagation_colored_block_kernel", factory, (64, entries, 64, bodies, _ARCH), {}
-    factory = solver._get_pgs_solve_propagation_contact_kernel
-    yield name + "_get_pgs_solve_propagation_contact_kernel", factory, (64, _ARCH), {"worlds_per_block": 2}
-    factory = solver._get_pgs_solve_propagation_full_iteration_kernel.__wrapped__
-    shape = (64, 32, 18, 64, 16, 18, _ARCH)
-    for fuse in (False, True):
-        kwargs = {"worlds_per_block": 1, "fuse_vel_limits": fuse}
-        yield name + "_get_pgs_solve_propagation_full_iteration_kernel", factory, shape, kwargs
 
 
 def _suite_shape_calls():
@@ -857,7 +833,6 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
             "solver_feather_pgs._get_pgs_solve_mf_gs_incremental_kernel",
             "solver_feather_pgs._get_pgs_solve_parallel_kernel",
             "solver_feather_pgs._get_pgs_solve_paired_factor_kernel",
-            "solver_feather_pgs._get_pgs_solve_propagation_full_iteration_kernel",
             "keyed_rows.get_fallback_kernel",
             "keyed_rows.get_parallel_factory",
             "kernels.allocate_world_contact_slots",
@@ -889,7 +864,6 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
                 "sparse_pgs._get_pgs_solve_sparse_kernel",
                 "solver_feather_pgs._get_pgs_solve_mf_gs_kernel",
                 "solver_feather_pgs._get_pgs_solve_mf_gs_incremental_kernel",
-                "solver_feather_pgs._get_pgs_solve_propagation_full_iteration_kernel",
             },
         )
         # The MF-GS kernels that keep row metadata resident are pinned under both laws.
@@ -913,10 +887,6 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
             "row_packets.get_local_factory",
             "solver_feather_pgs._get_pgs_solve_tiled_row_kernel",
             "solver_feather_pgs._get_pgs_solve_mf_kernel",
-            "solver_feather_pgs._get_pgs_solve_propagation_colored_warp_kernel",
-            "solver_feather_pgs._get_pgs_solve_propagation_colored_block_kernel",
-            "solver_feather_pgs._get_pgs_solve_propagation_contact_kernel",
-            "solver_feather_pgs._get_pgs_solve_propagation_full_iteration_kernel",
         ):
             with self.subTest(family=family):
                 self.assertIn(family, families)

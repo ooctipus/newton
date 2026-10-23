@@ -192,10 +192,7 @@ class TestKernelIdentity(unittest.TestCase):
         its row loads, so a refactor can be exact under the default and change the other variant.
         Labels omit a keyword at its default, so the default variants keep their labels.
         """
-        factories = (
-            "_get_pgs_solve_mf_gs_incremental_kernel",
-            "_get_pgs_solve_propagation_full_iteration_kernel",
-        )
+        factories = ("_get_pgs_solve_mf_gs_incremental_kernel",)
         rows, _ = identity.census(factories)
         for factory in factories:
             with self.subTest(factory=factory):

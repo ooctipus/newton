@@ -31,22 +31,11 @@ IMPACT_FRACTION = 0.4
 # Values written into ``SolverFeatherPGS.contact_path``.
 PATH_DENSE = 0
 PATH_MATRIX_FREE = 1
-PATH_PROPAGATION = 2
 # No rows: the resolved-world classifier skipped the contact's world, whose
 # every candidate row separates at the predictor.
 PATH_RESOLVED = int(CONTACT_PATH_RESOLVED)
 
-RESPONSE_MODES = ("immediate", "propagation", "propagation-fused", "propagation-colored")
-EXPECTED_PATHS = {
-    ("free", "immediate"): {PATH_MATRIX_FREE},
-    ("free", "propagation"): {PATH_PROPAGATION},
-    ("free", "propagation-fused"): {PATH_MATRIX_FREE},
-    ("free", "propagation-colored"): {PATH_PROPAGATION},
-    ("articulated", "immediate"): {PATH_DENSE},
-    ("articulated", "propagation"): {PATH_PROPAGATION},
-    ("articulated", "propagation-fused"): {PATH_PROPAGATION},
-    ("articulated", "propagation-colored"): {PATH_PROPAGATION},
-}
+EXPECTED_PATHS = {"free": {PATH_MATRIX_FREE}, "articulated": {PATH_DENSE}}
 
 
 def _diagonal_inertia(value):
@@ -123,7 +112,6 @@ def _make_solver(
     *,
     enable_restitution=None,
     velocity_iterations=0,
-    response="immediate",
     restitution_velocity_threshold=0.0,
     pgs_iterations=16,
     pgs_warmstart=False,
@@ -135,7 +123,6 @@ def _make_solver(
         "angular_damping": 0.0,
         "enable_contact_friction": False,
         "pgs_mode": pgs_mode,
-        "articulated_contact_response": response,
         "pgs_iterations": pgs_iterations,
         "pgs_velocity_iterations": velocity_iterations,
         "pgs_cfm": 0.0,
@@ -175,7 +162,6 @@ def _step_plane(
     gravity=(0.0, 0.0, 0.0),
     initial_vertical_velocity=None,
     scene="free",
-    response="immediate",
     enable_restitution=None,
     velocity_iterations=0,
     restitution_velocity_threshold=0.0,
@@ -195,7 +181,6 @@ def _step_plane(
     solver = _make_solver(
         model,
         velocity_iterations=velocity_iterations,
-        response=response,
         enable_restitution=enable_restitution,
         restitution_velocity_threshold=restitution_velocity_threshold,
         pgs_iterations=pgs_iterations,
@@ -638,61 +623,59 @@ def test_two_body_impact_conserves_momentum_and_reverses_relative_speed(test, de
 
 
 def test_restitution_is_relative_to_a_moving_kinematic_surface(test, device):
-    """Measure rebound relative to prescribed motion on MF and propagation rows."""
+    """Measure rebound relative to prescribed motion on matrix-free rows."""
     restitution = 0.6
     closing_speed = 3.0
     separation = IMPACT_FRACTION * closing_speed * DEFAULT_DT
-    expected_path = {"immediate": PATH_MATRIX_FREE, "propagation": PATH_PROPAGATION}
 
-    for response in ("immediate", "propagation"):
-        for frame_speed in (0.0, 7.0):
-            label = f"{response}, frame={frame_speed}"
-            with test.subTest(response=response, frame_speed=frame_speed):
-                builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-                cfg = _shape_cfg(restitution)
-                dynamic_body = builder.add_body(
-                    xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
-                    mass=1.0,
-                    inertia=_sphere_inertia(1.0),
-                    lock_inertia=True,
-                )
-                kinematic_body = builder.add_body(
-                    xform=wp.transform(wp.vec3(0.0, 0.0, 2.0 * RADIUS + separation), wp.quat_identity()),
-                    mass=1.0,
-                    inertia=_sphere_inertia(1.0),
-                    lock_inertia=True,
-                    is_kinematic=True,
-                )
-                builder.add_shape_sphere(dynamic_body, radius=RADIUS, cfg=cfg)
-                builder.add_shape_sphere(kinematic_body, radius=RADIUS, cfg=cfg)
-                model = builder.finalize(device=device)
-                solver = _make_solver(model, response=response)
-                state_in, state_out = model.state(), model.state()
-                velocity_dynamic = frame_speed + 2.0
-                velocity_surface = frame_speed - 1.0
-                joint_qd = np.zeros(model.joint_dof_count, dtype=np.float32)
-                joint_qd[2] = velocity_dynamic
-                joint_qd[8] = velocity_surface
-                state_in.joint_qd.assign(joint_qd)
-                newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-                pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
-                contacts = pipeline.contacts()
-                pipeline.collide(state_in, contacts)
-                solver.step(state_in, state_out, model.control(), contacts, DEFAULT_DT)
+    for frame_speed in (0.0, 7.0):
+        label = f"frame={frame_speed}"
+        with test.subTest(frame_speed=frame_speed):
+            builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+            cfg = _shape_cfg(restitution)
+            dynamic_body = builder.add_body(
+                xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+                mass=1.0,
+                inertia=_sphere_inertia(1.0),
+                lock_inertia=True,
+            )
+            kinematic_body = builder.add_body(
+                xform=wp.transform(wp.vec3(0.0, 0.0, 2.0 * RADIUS + separation), wp.quat_identity()),
+                mass=1.0,
+                inertia=_sphere_inertia(1.0),
+                lock_inertia=True,
+                is_kinematic=True,
+            )
+            builder.add_shape_sphere(dynamic_body, radius=RADIUS, cfg=cfg)
+            builder.add_shape_sphere(kinematic_body, radius=RADIUS, cfg=cfg)
+            model = builder.finalize(device=device)
+            solver = _make_solver(model)
+            state_in, state_out = model.state(), model.state()
+            velocity_dynamic = frame_speed + 2.0
+            velocity_surface = frame_speed - 1.0
+            joint_qd = np.zeros(model.joint_dof_count, dtype=np.float32)
+            joint_qd[2] = velocity_dynamic
+            joint_qd[8] = velocity_surface
+            state_in.joint_qd.assign(joint_qd)
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+            pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+            contacts = pipeline.contacts()
+            pipeline.collide(state_in, contacts)
+            solver.step(state_in, state_out, model.control(), contacts, DEFAULT_DT)
 
-                count = int(contacts.rigid_contact_count.numpy()[0])
-                paths = {int(v) for v in solver.contact_path.numpy()[:count] if v >= 0}
-                velocity_after = float(state_out.body_qd.numpy()[dynamic_body][2])
-                expected_after = velocity_surface - restitution * closing_speed
-                test.assertEqual(count, 1, f"{label}: expected one sphere contact")
-                test.assertEqual(paths, {expected_path[response]}, f"{label}: wrong contact route")
-                _assert_velocity(test, velocity_after, expected_after, closing_speed, label, rtol=5.0e-3)
-                test.assertAlmostEqual(
-                    velocity_surface - velocity_after,
-                    restitution * closing_speed,
-                    delta=1.5e-2,
-                    msg=f"{label}: restitution was not measured relative to the moving surface",
-                )
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            paths = {int(v) for v in solver.contact_path.numpy()[:count] if v >= 0}
+            velocity_after = float(state_out.body_qd.numpy()[dynamic_body][2])
+            expected_after = velocity_surface - restitution * closing_speed
+            test.assertEqual(count, 1, f"{label}: expected one sphere contact")
+            test.assertEqual(paths, {PATH_MATRIX_FREE}, f"{label}: wrong contact route")
+            _assert_velocity(test, velocity_after, expected_after, closing_speed, label, rtol=5.0e-3)
+            test.assertAlmostEqual(
+                velocity_surface - velocity_after,
+                restitution * closing_speed,
+                delta=1.5e-2,
+                msg=f"{label}: restitution was not measured relative to the moving surface",
+            )
 
 
 def test_every_contact_response_route_enforces_restitution(test, device):
@@ -701,22 +684,19 @@ def test_every_contact_response_route_enforces_restitution(test, device):
     speed = 3.0
     separation = IMPACT_FRACTION * speed * DEFAULT_DT
     for scene in ("free", "articulated"):
-        for response in RESPONSE_MODES:
-            label = f"{scene}/{response}"
-            with test.subTest(scene=scene, response=response):
-                result = _step_plane(
-                    device,
-                    separation=separation,
-                    speed=speed,
-                    restitution=restitution,
-                    scene=scene,
-                    response=response,
-                    velocity_iterations=0,
-                    pgs_iterations=16,
-                )
-                _assert_crossing_setup(test, result, separation, speed, DEFAULT_DT, label)
-                test.assertEqual(result["paths"], EXPECTED_PATHS[(scene, response)], f"{label}: wrong route")
-                _assert_velocity(test, result["after"], restitution * speed, speed, label, rtol=5.0e-3)
+        with test.subTest(scene=scene):
+            result = _step_plane(
+                device,
+                separation=separation,
+                speed=speed,
+                restitution=restitution,
+                scene=scene,
+                velocity_iterations=0,
+                pgs_iterations=16,
+            )
+            _assert_crossing_setup(test, result, separation, speed, DEFAULT_DT, scene)
+            test.assertEqual(result["paths"], EXPECTED_PATHS[scene], f"{scene}: wrong route")
+            _assert_velocity(test, result["after"], restitution * speed, speed, scene, rtol=5.0e-3)
 
 
 def test_dense_and_production_split_modes_enforce_restitution_without_velocity_iterations(test, device):
@@ -881,25 +861,18 @@ def test_restitution_can_be_disabled_without_changing_materials(test, device):
 
     speed = 2.0
     separation = IMPACT_FRACTION * speed * DEFAULT_DT
-    for scene, response in (("free", "immediate"), ("articulated", "immediate"), ("free", "propagation")):
-        with test.subTest(scene=scene, response=response):
+    for scene in ("free", "articulated"):
+        with test.subTest(scene=scene):
             result = _step_plane(
                 device,
                 separation=separation,
                 speed=speed,
                 restitution=0.8,
                 scene=scene,
-                response=response,
                 enable_restitution=False,
             )
-            _assert_crossing_setup(test, result, separation, speed, DEFAULT_DT, f"{scene}/{response}")
-            _assert_velocity(
-                test,
-                result["after"],
-                -IMPACT_FRACTION * speed,
-                speed,
-                f"{scene}/{response}",
-            )
+            _assert_crossing_setup(test, result, separation, speed, DEFAULT_DT, scene)
+            _assert_velocity(test, result["after"], -IMPACT_FRACTION * speed, speed, scene)
 
 
 def test_velocity_iteration_counts_reach_the_same_single_row_solution(test, device):
@@ -1042,59 +1015,52 @@ def test_articulated_redundant_manifold_preserves_symmetric_rebound(test, device
     inertia = _diagonal_inertia(0.02)
 
     for joint_kind in ("fixed", "revolute"):
-        for response in ("immediate", "propagation-fused", "propagation-colored"):
-            with test.subTest(joint=joint_kind, response=response):
-                builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-                xform = wp.transform(wp.vec3(0.0, 0.0, root_height), wp.quat_identity())
-                root = builder.add_link(xform=xform, mass=mass, inertia=inertia, lock_inertia=True)
-                child = builder.add_link(
-                    xform=xform,
-                    mass=child_mass,
-                    inertia=_diagonal_inertia(0.002),
-                    lock_inertia=True,
+        with test.subTest(joint=joint_kind):
+            builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+            xform = wp.transform(wp.vec3(0.0, 0.0, root_height), wp.quat_identity())
+            root = builder.add_link(xform=xform, mass=mass, inertia=inertia, lock_inertia=True)
+            child = builder.add_link(
+                xform=xform,
+                mass=child_mass,
+                inertia=_diagonal_inertia(0.002),
+                lock_inertia=True,
+            )
+            root_joint = builder.add_joint_free(child=root)
+            if joint_kind == "fixed":
+                child_joint = builder.add_joint_fixed(parent=root, child=child)
+            else:
+                child_joint = builder.add_joint_revolute(
+                    parent=root,
+                    child=child,
+                    axis=wp.vec3(0.0, 0.0, 1.0),
                 )
-                root_joint = builder.add_joint_free(child=root)
-                if joint_kind == "fixed":
-                    child_joint = builder.add_joint_fixed(parent=root, child=child)
-                else:
-                    child_joint = builder.add_joint_revolute(
-                        parent=root,
-                        child=child,
-                        axis=wp.vec3(0.0, 0.0, 1.0),
-                    )
-                builder.add_articulation([root_joint, child_joint])
-                cfg = _shape_cfg(restitution)
-                for sx, sy in ((-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)):
-                    builder.add_shape_sphere(
-                        root,
-                        xform=wp.transform(wp.vec3(sx * half, sy * half, -foot_offset), wp.quat_identity()),
-                        radius=sphere_radius,
-                        cfg=cfg,
-                    )
-                builder.add_ground_plane(cfg=cfg)
-                model = builder.finalize(device=device)
-                solver = _make_solver(
-                    model,
-                    response=response,
-                    velocity_iterations=0,
-                    pgs_iterations=16,
+            builder.add_articulation([root_joint, child_joint])
+            cfg = _shape_cfg(restitution)
+            for sx, sy in ((-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)):
+                builder.add_shape_sphere(
+                    root,
+                    xform=wp.transform(wp.vec3(sx * half, sy * half, -foot_offset), wp.quat_identity()),
+                    radius=sphere_radius,
+                    cfg=cfg,
                 )
-                state_in, state_out = model.state(), model.state()
-                _reset_state(model, state_in, -speed)
-                pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
-                contacts = pipeline.contacts()
-                pipeline.collide(state_in, contacts)
-                solver.step(state_in, state_out, model.control(), contacts, DEFAULT_DT)
+            builder.add_ground_plane(cfg=cfg)
+            model = builder.finalize(device=device)
+            solver = _make_solver(model, velocity_iterations=0, pgs_iterations=16)
+            state_in, state_out = model.state(), model.state()
+            _reset_state(model, state_in, -speed)
+            pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
+            contacts = pipeline.contacts()
+            pipeline.collide(state_in, contacts)
+            solver.step(state_in, state_out, model.control(), contacts, DEFAULT_DT)
 
-                count = int(contacts.rigid_contact_count.numpy()[0])
-                paths = {int(v) for v in solver.contact_path.numpy()[:count] if v >= 0}
-                qd = state_out.body_qd.numpy()[root].astype(np.float64)
-                expected_path = PATH_DENSE if response == "immediate" else PATH_PROPAGATION
-                label = f"{joint_kind}/{response}"
-                test.assertGreaterEqual(count, 4, f"{label}: manifold had only {count} contacts")
-                test.assertEqual(paths, {expected_path}, f"{label}: wrong contact route")
-                _assert_velocity(test, float(qd[2]), restitution * speed, speed, label, rtol=7.5e-3)
-                test.assertLess(np.linalg.norm(qd[3:]), 3.0e-2, f"{label}: symmetric foot spun at {qd[3:]}")
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            paths = {int(v) for v in solver.contact_path.numpy()[:count] if v >= 0}
+            qd = state_out.body_qd.numpy()[root].astype(np.float64)
+            label = joint_kind
+            test.assertGreaterEqual(count, 4, f"{label}: manifold had only {count} contacts")
+            test.assertEqual(paths, {PATH_DENSE}, f"{label}: wrong contact route")
+            _assert_velocity(test, float(qd[2]), restitution * speed, speed, label, rtol=7.5e-3)
+            test.assertLess(np.linalg.norm(qd[3:]), 3.0e-2, f"{label}: symmetric foot spun at {qd[3:]}")
 
 
 def test_cuda_graph_replay_reads_current_restitution_and_matches_eager(test, device):

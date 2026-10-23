@@ -154,10 +154,7 @@ def legacy_row_status(solver, entry: dict) -> None:
     if any(type(value) is not int or value not in (0, 1) for value in values):
         raise RuntimeError("Invalid legacy sticky row warning values")
     entry["flags"] = dict(zip(("dense", "matrix_free", "propagation"), map(bool, values), strict=True))
-    entry["capacities"] = {
-        name: int(getattr(solver, name))
-        for name in ("dense_max_constraints", "mf_max_constraints", "propagation_max_constraints")
-    }
+    entry["capacities"] = {name: int(getattr(solver, name)) for name in ("dense_max_constraints", "mf_max_constraints")}
     entry["capacity_coverage"] = "Existing sticky row warnings only; contacts checked separately at boundaries"
     entry["contact_law"] = {
         "friction_anchor_beta": float(solver.friction_anchor_beta),
@@ -424,8 +421,7 @@ def check_solver(physics: str, solver, entry: dict) -> None:
             raise RuntimeError("Unrecognized FPGS capacity-status contract")
         entry["flags"] = flags
         entry["capacities"] = {
-            name: int(getattr(solver, name))
-            for name in ("dense_max_constraints", "mf_max_constraints", "propagation_max_constraints")
+            name: int(getattr(solver, name)) for name in ("dense_max_constraints", "mf_max_constraints")
         }
         # Execute the public checker, not merely a shadow interpretation of it.
         check()
