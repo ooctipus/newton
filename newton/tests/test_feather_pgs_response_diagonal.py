@@ -280,7 +280,7 @@ def _patch_unit_rows(seed, *, worlds=3, capacity=40, prefix=2, contacts=10, diag
     Each world holds ``prefix`` dense limit rows, then contacts in a random allocation order. A contact
     is a unit: its normal row, followed by two tangent rows when it owns an anchor (at most two per
     ring). The contacts of a body pair split into rings whose normal rows link circularly through their
-    parents, as ``link_patch_rows`` leaves them. Coordinates ``[0, diagonal)`` belong to the diagonal
+    parents, as ``link_patch_routes`` leaves them. Coordinates ``[0, diagonal)`` belong to the diagonal
     articulation (index 0) and the following ``dense`` ones to the dense articulation (index 1).
     ``layout`` replaces every world's random contacts with given units, as in :data:`_UNIT_EDGES`.
     """
@@ -590,7 +590,7 @@ def _paired_unit_rows(seed, *, worlds=6, capacity=64, primary=23, secondary=6):
     Each world holds a prefix of position-limit rows (one world adds a velocity-limit row), then
     contacts in a random allocation order. A contact is a unit: its normal row, followed by two
     tangent rows naming it as parent when it owns an anchor (at most two per ring). The normal rows
-    of a ring link circularly through their parents, as ``link_patch_rows`` leaves them; a ring of
+    of a ring link circularly through their parents, as ``link_patch_routes`` leaves them; a ring of
     one ends with -1 or links to itself. Factor rows, right-hand sides and impulses are random:
     normals separate or close, and some unloaded anchors start with tangent impulses, signed zeros
     included.

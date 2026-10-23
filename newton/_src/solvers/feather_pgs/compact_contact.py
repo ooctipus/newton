@@ -7,8 +7,8 @@ Allocation, contact admission, scheduling, RHS and the solve remain authoritativ
 in the original pipeline. This module only changes the representation producer.
 Persistent patch friction writes its tangent rows with the patch row law. The
 patch link, ``_FrictionPatchState.link``, runs after this producer and alone
-links the patch rings and divides the friction coefficient; its
-``link_patch_routes`` kernel shares ``_link_contact`` with ``link_patch_rows``.
+links the patch rings and divides the friction coefficient, in one
+``link_patch_routes`` launch over every route.
 """
 
 import warp as wp

@@ -12,13 +12,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.friction_patches import (
-    _FrictionPatchState,
-    _pose_motion,
-    finish_patch_impulses,
-    link_patch_rows,
-    seed_patch_impulses,
-)
+from newton._src.solvers.feather_pgs.friction_patches import _FrictionPatchState, _pose_motion, patch_routes
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -26,6 +20,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     pgs_solve_loop,
 )
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_tiled_row_kernel
+from newton.tests.feather_pgs_patch_reference import store_frame
 from newton.tests.test_feather_pgs_friction_anchors import _SQUEEZE_SOLVER, _build_v_jaws, _run_squeeze
 
 
@@ -274,7 +269,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
                     types[body] = int(newton.GeoType.SPHERE)
                     model.shape_type.assign(types)
                     patches.build(model, state, contacts)
-                    patches.store(state)
+                    store_frame(patches, state)
                     patches.build(model, state, contacts)
                     self.assertGreaterEqual(int(patches.current.source.numpy()[0]), 0)
                     transforms = [wp.transform_identity(), wp.transform_identity()]
@@ -286,7 +281,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
     def test_normal_turn_transports_tangent_error_without_decay(self):
         """Preserve spring length during supported rocking without additional slip."""
         model, state, contacts, patches = _patch_fixture([[0, 0, 0]])
-        patches.store(state)
+        store_frame(patches, state)
         pivot = wp.vec3(0.0005, 0, 0)
         local_point = wp.vec3(-0.0005, 0, 0)
         state.body_q.assign([wp.transform(wp.vec3(0.001, 0, 0), wp.quat_identity()), wp.transform_identity()])
@@ -294,7 +289,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         contacts.rigid_contact_point1.assign([pivot])
         patches.build(model, state, contacts)
         for step in range(100):
-            patches.store(state)
+            store_frame(patches, state)
             rotation = wp.quat_from_axis_angle(wp.vec3(0, 1, 0), 0.025 if step % 2 else -0.025)
             state.body_q.assign(
                 [wp.transform(pivot - wp.quat_rotate(rotation, local_point), rotation), wp.transform_identity()]
@@ -312,7 +307,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
             patches.build(model, state, contacts)
             self.assertEqual(len(np.unique(patches.current.owner.numpy()[:2])), 1)
             np.testing.assert_allclose(patches.view.weight.numpy()[:2], [0.5, 0.5])
-            patches.store(state)
+            store_frame(patches, state)
         model.shape_material_mu.assign([0.2, 0.5, 0.8])
         patches.build(model, state, contacts)
         self.assertEqual(len(np.unique(patches.current.owner.numpy()[:2])), 2)
@@ -325,7 +320,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         transforms[10, 0] = 0.002
         state.body_q.assign(transforms)
         patches.build(model, state, contacts)
-        patches.store(state)
+        store_frame(patches, state)
         transforms[10, 0] = 0.003
         state.body_q.assign(transforms)
         patches.build(model, state, contacts)
@@ -336,7 +331,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         """Keep the supported edge's history and replace the opposite anchor after rocking."""
         points = [[-0.1, -0.1, 0], [0.1, -0.1, 0], [-0.1, 0.1, 0], [0.1, 0.1, 0]]
         model, state, contacts, patches = _patch_fixture(points)
-        patches.store(state)
+        store_frame(patches, state)
         rotation = wp.quat_from_axis_angle(wp.vec3(0, 1, 0), -np.pi / 60.0)
         pivot = wp.vec3(-0.1, 0, 0)
         state.body_q.assign([wp.transform(pivot - wp.quat_rotate(rotation, pivot), rotation), wp.transform_identity()])
@@ -355,7 +350,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         model, state, contacts, patches = _patch_fixture([[-0.1, 0, 0], [0.1, 0, 0]])
         contacts.rigid_contact_point0.assign([[-0.1, 0, -0.005], [0.1, 0, -0.005]])
         patches.build(model, state, contacts)
-        patches.store(state)
+        store_frame(patches, state)
         state.body_q.assign([wp.transform(wp.vec3(0, 0, 0.003), wp.quat_identity()), wp.transform_identity()])
         patches.build(model, state, contacts)
         self.assertEqual(np.count_nonzero(patches.current.source.numpy() >= 0), 2)
@@ -366,7 +361,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
             with self.subTest(limits=limits):
                 model, state, contacts, patches = _patch_fixture([[-0.1, 0, 0], [0.1, 0, 0]])
                 model.shape_gap.fill_(0.0005)
-                patches.store(state)
+                store_frame(patches, state)
                 state.body_q.assign([wp.transform(wp.vec3(0, 0, 0.0002), wp.quat_identity()), wp.transform_identity()])
                 contacts.rigid_contact_point0.assign([[-0.1, 0, -0.0004], [0.1, 0, -0.0004]])
                 patches.build(model, state, contacts, **limits)
@@ -391,7 +386,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
                     )
                     contacts.rigid_contact_shape1.assign([1, 4])
                     patches.build(model, state, contacts)
-                    patches.store(state)
+                    store_frame(patches, state)
                     np.testing.assert_array_equal(patches.previous.valid.numpy()[:2], [1, 1])
                     # Static geometry is identified by shape. A dynamic edit on
                     # shape 2 must also retire shape 0's anchor on the same body.
@@ -410,7 +405,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         model, state, contacts, patches = _patch_fixture([[0, 0, 0]], shape_bodies=(0, 1, 1))
         contacts.rigid_contact_shape1.assign([-1])
         patches.build(model, state, contacts)
-        patches.store(state)
+        store_frame(patches, state)
         self.assertEqual(int(patches.previous.valid.numpy()[0]), 1)
         # Editing the last shape must not alias the contact's -1 sentinel.
         transforms = model.shape_transform.numpy()
@@ -424,7 +419,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         model, state, contacts, patches = _patch_fixture([[-0.1, 0, 0], [0.1, 0, 0]])
         contacts.rigid_contact_match_index = wp.array([1, 0], dtype=int, device=model.device)
         active = patches.current.valid.numpy() != 0
-        patches.store(state)
+        store_frame(patches, state)
         for substep in range(1, 4):
             displacement = substep * 0.001
             state.body_q.assign(
@@ -436,7 +431,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
                 np.linalg.norm(patches.view.phi.numpy()[active], axis=1), displacement, atol=1.0e-7
             )
             self.assertTrue(np.all(patches.current.source.numpy()[active] >= 0))
-            patches.store(state)
+            store_frame(patches, state)
 
     def test_connected_convex_chain_forms_one_region(self):
         """Join a chain into one friction region even when the two end shapes do not overlap."""
@@ -497,39 +492,29 @@ class TestFrictionPatchHistory(unittest.TestCase):
 
     def test_saturation_only_releases_an_anchor_with_sliding_motion(self):
         """Keep history under impending slip, and release it under motion against saturated friction."""
-        _, state, contacts, patches = _patch_fixture([[0, 0, 0]])
+        _, state, _, patches = _patch_fixture([[0, 0, 0]])
         zeros = wp.zeros(1, dtype=int, device="cpu")
         lengths = wp.array([3], dtype=int, device="cpu")
         parents = wp.array([[0, 0, 0]], dtype=int, device="cpu")
         mu = wp.array([[0.5, 0.5, 0.5]], dtype=float, device="cpu")
         impulses = wp.array([[2, 1, 0]], dtype=float, device="cpu")
         velocity = wp.zeros(2, dtype=wp.spatial_vector, device="cpu")
-        args = [
-            contacts.rigid_contact_count,
-            patches.current,
-            state.body_q,
-            state.body_q,
-            velocity,
-            wp.zeros(2, dtype=wp.vec3, device="cpu"),
-            zeros,
-            zeros,
-            zeros,
-            lengths,
-            0,
-            parents,
-            mu,
-            impulses,
-            0.005,
-        ]
+        solved = SimpleNamespace(body_q=state.body_q, body_qd=velocity)
+        com = wp.zeros(2, dtype=wp.vec3, device="cpu")
+        routes = patch_routes([(0, parents, mu, impulses, 1.0)])
+
+        def finish():
+            patches.finish(state, solved, com, zeros, zeros, zeros, lengths, routes, 0.005)
+
         impulses.zero_()
-        wp.launch(finish_patch_impulses, dim=1, inputs=args, device="cpu")
+        finish()
         self.assertEqual(patches.current.valid.numpy()[0], 0, "unloaded speculative contacts must not accrue stiction")
         patches.current.valid.fill_(1)
         impulses.assign([[2, 1, 0]])
-        wp.launch(finish_patch_impulses, dim=1, inputs=args, device="cpu")
+        finish()
         self.assertEqual(patches.current.valid.numpy()[0], 1)
         velocity.assign([[0, -0.1, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]])
-        wp.launch(finish_patch_impulses, dim=1, inputs=args, device="cpu")
+        finish()
         self.assertEqual(patches.current.valid.numpy()[0], 0)
 
     def test_convex_shapes_share_one_body_patch(self):
@@ -559,7 +544,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         """Preserve a sticking region's history even when every contact sample changes."""
         points = np.array([[-0.1, -0.1, 0], [0.1, -0.1, 0], [-0.1, 0.1, 0], [0.1, 0.1, 0]], dtype=np.float32)
         model, state, contacts, patches = _patch_fixture(points)
-        patches.store(state)
+        store_frame(patches, state)
         points = points[[3, 1, 0, 2]] * 0.98
         contacts.rigid_contact_point0.assign(points)
         contacts.rigid_contact_point1.assign(points)
@@ -575,14 +560,14 @@ class TestFrictionPatchHistory(unittest.TestCase):
         """Preserve a region's twist rather than copying error from old lever arms."""
         points = np.array([[-0.1, 0, 0], [0.1, 0, 0]], dtype=np.float32)
         model, state, contacts, patches = _patch_fixture(points)
-        patches.store(state)
+        store_frame(patches, state)
         rotation = wp.quat_from_axis_angle(wp.vec3(0, 0, 1), 0.01)
         state.body_q.assign([wp.transform(wp.vec3(0), rotation), wp.transform_identity()])
         contacts.rigid_contact_point0.assign([wp.quat_rotate(wp.quat_inverse(rotation), wp.vec3(*p)) for p in points])
         patches.build(model, state, contacts)
         before = patches.view.phi.numpy()[:2].copy()
         self.assertGreater(np.linalg.norm(before), 0.001)
-        patches.store(state)
+        store_frame(patches, state)
         points *= 0.8
         contacts.rigid_contact_point0.assign([wp.quat_rotate(wp.quat_inverse(rotation), wp.vec3(*p)) for p in points])
         contacts.rigid_contact_point1.assign(points)
@@ -600,7 +585,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         """Keep a cached tangent supported when other normals carry the load."""
         model, state, contacts, patches = _patch_fixture([[-0.1, 0, 0], [0, 0, 0], [0.1, 0, 0]])
         patches.current.tangent_impulse.assign([[0.8, 0, 0], [0, 0, 0], [0.8, 0, 0]] + [[0, 0, 0]] * 5)
-        patches.store(state)
+        store_frame(patches, state)
         patches.build(model, state, contacts)
         slots = wp.array([0, 3, 4], dtype=int, device="cpu")
         worlds = wp.zeros(3, dtype=int, device="cpu")
@@ -609,39 +594,16 @@ class TestFrictionPatchHistory(unittest.TestCase):
         parents = wp.array([[-1, 0, 0, -1, -1, 4, 4]], dtype=int, device="cpu")
         mu = wp.array([[0.5] * 7], dtype=float, device="cpu")
         impulses = wp.array([[0, 0, 0, 4, 0, 0, 0]], dtype=float, device="cpu")
-        wp.launch(
-            link_patch_rows,
-            dim=3,
-            inputs=[contacts.rigid_contact_count, patches.view, worlds, slots, paths, lengths, 0, parents, mu],
-            device="cpu",
-        )
-        wp.launch(
-            seed_patch_impulses,
-            dim=3,
-            inputs=[
-                contacts.rigid_contact_count,
-                patches.current,
-                patches.previous,
-                state.body_q,
-                worlds,
-                slots,
-                paths,
-                lengths,
-                0,
-                parents,
-                mu,
-                impulses,
-                1.0,
-            ],
-            device="cpu",
-        )
+        routes = patch_routes([(0, parents, mu, impulses, 1.0)])
+        patches.link(worlds, slots, paths, lengths, routes)
+        patches.seed(state, worlds, slots, paths, lengths, routes)
         result = impulses.numpy()[0]
         self.assertAlmostEqual(float(np.linalg.norm(result[1:3])), 0.8)
         self.assertAlmostEqual(float(np.linalg.norm(result[5:7])), 0.8)
 
     def test_seed_keeps_matched_warmstart_without_patch_history(self):
         """Keep the contact-matched friction warm start on an anchor that has no patch history yet."""
-        _model, state, contacts, patches = _patch_fixture([[0, 0, 0]])
+        _model, state, _contacts, patches = _patch_fixture([[0, 0, 0]])
         self.assertEqual(int(patches.current.source.numpy()[0]), -1)
         slots = wp.zeros(1, dtype=int, device="cpu")
         lengths = wp.array([3], dtype=int, device="cpu")
@@ -649,65 +611,28 @@ class TestFrictionPatchHistory(unittest.TestCase):
         mu = wp.array([[0.5, 0.25, 0.25] + [0.0] * 5], dtype=float, device="cpu")
         seeded = [1.0, 0.3, -0.2] + [0.0] * 5
         impulses = wp.array([seeded], dtype=float, device="cpu")
-        wp.launch(
-            seed_patch_impulses,
-            dim=1,
-            inputs=[
-                contacts.rigid_contact_count,
-                patches.current,
-                patches.previous,
-                state.body_q,
-                slots,
-                slots,
-                slots,
-                lengths,
-                0,
-                parents,
-                mu,
-                impulses,
-                1.0,
-            ],
-            device="cpu",
-        )
+        patches.seed(state, slots, slots, slots, lengths, patch_routes([(0, parents, mu, impulses, 1.0)]))
         np.testing.assert_array_equal(impulses.numpy()[0], np.array(seeded, dtype=np.float32))
 
     def test_anchors_without_rows_keep_history(self):
         """Keep a valid anchor and its cached impulse when its region gets no friction rows this step."""
-        _model, state, contacts, patches = _patch_fixture([[0, 0, 0]])
+        _model, state, _contacts, patches = _patch_fixture([[0, 0, 0]])
         cached = [[0.1, 0.2, 0.0]] + [[0.0, 0.0, 0.0]] * 7
         zeros = wp.zeros(1, dtype=int, device="cpu")
         parents = wp.array([[-1] * 8], dtype=int, device="cpu")
         mu = wp.zeros((1, 8), dtype=float, device="cpu")
         impulses = wp.zeros((1, 8), dtype=float, device="cpu")
-        qd = wp.zeros(2, dtype=wp.spatial_vector, device="cpu")
+        solved = SimpleNamespace(body_q=state.body_q, body_qd=wp.zeros(2, dtype=wp.spatial_vector, device="cpu"))
         com = wp.zeros(2, dtype=wp.vec3, device="cpu")
+        routes = patch_routes([(0, parents, mu, impulses, 1.0)])
         for slot, length, load, retained in ((-1, 3, 0.0, 1), (0, 1, 2.0, 1), (0, 1, 0.0, 0)):
             with self.subTest(slot=slot, slots_needed=length):
                 impulses.assign([[load] + [0.0] * 7])
                 patches.current.valid.assign([1] + [0] * 7)
                 patches.current.tangent_impulse.assign(cached)
-                wp.launch(
-                    finish_patch_impulses,
-                    dim=1,
-                    inputs=[
-                        contacts.rigid_contact_count,
-                        patches.current,
-                        state.body_q,
-                        state.body_q,
-                        qd,
-                        com,
-                        zeros,
-                        wp.array([slot], dtype=int, device="cpu"),
-                        zeros,
-                        wp.array([length], dtype=int, device="cpu"),
-                        0,
-                        parents,
-                        mu,
-                        impulses,
-                        0.005,
-                    ],
-                    device="cpu",
-                )
+                slots = wp.array([slot], dtype=int, device="cpu")
+                lengths = wp.array([length], dtype=int, device="cpu")
+                patches.finish(state, solved, com, zeros, slots, zeros, lengths, routes, 0.005)
                 self.assertEqual(int(patches.current.valid.numpy()[0]), retained)
                 np.testing.assert_array_equal(
                     patches.current.tangent_impulse.numpy()[0], np.asarray(cached[0], dtype=np.float32)
@@ -720,7 +645,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         state.body_q.assign([wp.transform(wp.vec3(1.3, -0.7, 2.1), rotation), wp.transform_identity()])
         patches.build(model, state, contacts)
         for _ in range(100):
-            patches.store(state)
+            store_frame(patches, state)
             patches.build(model, state, contacts)
             self.assertGreaterEqual(int(patches.current.source.numpy()[0]), 0)
             np.testing.assert_array_equal(patches.view.phi.numpy()[0], [0.0, 0.0])
@@ -728,7 +653,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
     def test_filtered_members_carry_history_without_starting_it(self):
         """Carry existing anchors through a friction-filtered step with zero weight, and never create new ones."""
         model, state, contacts, patches = _patch_fixture([[-0.05, 0, 0], [0.05, 0, 0]])
-        patches.store(state)
+        store_frame(patches, state)
         patches.build(model, state, contacts, friction_gap=-1.0)
         self.assertEqual(int(patches.current.valid.numpy().sum()), 2)
         self.assertTrue((patches.current.source.numpy()[:2] >= 0).all())

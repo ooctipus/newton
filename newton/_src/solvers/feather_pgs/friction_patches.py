@@ -1845,10 +1845,6 @@ class _FrictionPatchState:
             state_in.body_q, state_out.body_q, state_out.body_qd, com, world, slot, path, slots_needed, routes, dt
         )
 
-    def store(self, state):
-        """Store the current frame as built, without finishing any anchor."""
-        self._finish(state.body_q, None, None, None, None, None, None, None, _PatchRoutes(), 0.0)
-
     def _finish(self, q, q_out, qd_out, com, world, slot, path, slots_needed, routes, dt):
         wp.launch(
             _finish_and_store,
@@ -2023,25 +2019,6 @@ def _link_contact(
 
 
 @wp.kernel(enable_backward=False)
-def link_patch_rows(
-    count: wp.array[int],
-    patches: FrictionPatches,
-    world: wp.array[int],
-    slot: wp.array[int],
-    path: wp.array[int],
-    slots_needed: wp.array[int],
-    route: int,
-    parents: wp.array2d[int],
-    mu: wp.array2d[float],
-):
-    """Link the allocated rows of one route; see :func:`_link_contact`."""
-    c = wp.tid()
-    if c >= count[0] or slot[c] < 0 or path[c] != route:
-        return
-    _link_contact(c, patches, world, slot, path, slots_needed, route, parents, mu)
-
-
-@wp.kernel(enable_backward=False)
 def link_patch_routes(
     extent: wp.array[int],
     patches: FrictionPatches,
@@ -2115,29 +2092,6 @@ def _seed_contact(
         value *= radius / magnitude
     impulses[w, s + 1] = value[0]
     impulses[w, s + 2] = value[1]
-
-
-@wp.kernel(enable_backward=False)
-def seed_patch_impulses(
-    count: wp.array[int],
-    frame: _PatchFrame,
-    prev: _PatchFrame,
-    q: wp.array[wp.transform],
-    world: wp.array[int],
-    slot: wp.array[int],
-    path: wp.array[int],
-    slots_needed: wp.array[int],
-    route: int,
-    parents: wp.array2d[int],
-    mu: wp.array2d[float],
-    impulses: wp.array2d[float],
-    scale: float,
-):
-    """Seed the friction rows of one route; see :func:`_seed_contact`."""
-    c = wp.tid()
-    if c >= count[0] or path[c] != route or slot[c] < 0 or slots_needed[c] != 3:
-        return
-    _seed_contact(c, frame, prev, q, world, slot, parents, mu, impulses, scale)
 
 
 @wp.kernel(enable_backward=False)
@@ -2231,41 +2185,6 @@ def _finish_contact(
     if radius > 0.0 and wp.length(tangent) >= (1.0 - 1.0e-5) * radius:
         if wp.dot(speed, tangent) < -radius * (1.0e-5 * frame.radius[c] / dt):
             frame.valid[c] = 0
-
-
-@wp.kernel(enable_backward=False)
-def finish_patch_impulses(
-    count: wp.array[int],
-    frame: _PatchFrame,
-    q: wp.array[wp.transform],
-    q_out: wp.array[wp.transform],
-    qd_out: wp.array[wp.spatial_vector],
-    com: wp.array[wp.vec3],
-    world: wp.array[int],
-    slot: wp.array[int],
-    path: wp.array[int],
-    slots_needed: wp.array[int],
-    route: int,
-    parents: wp.array2d[int],
-    mu: wp.array2d[float],
-    impulses: wp.array2d[float],
-    dt: float,
-):
-    """Finish the anchors of one route; see :func:`_finish_contact`."""
-    c = wp.tid()
-    if c >= count[0] or frame.valid[c] == 0:
-        return
-    if slot[c] < 0:
-        # A contact of a resolved world would have solved zero load on the complete
-        # path, which releases its anchor. Capacity rejection provides no solved
-        # normal load; preserve the geometrically supported history until rows are
-        # available again.
-        if path[c] == CONTACT_PATH_RESOLVED:
-            frame.valid[c] = 0
-        return
-    if path[c] != route:
-        return
-    _finish_contact(c, frame, q, q_out, qd_out, com, world, slot, slots_needed, parents, mu, impulses, dt)
 
 
 @wp.kernel(enable_backward=False)

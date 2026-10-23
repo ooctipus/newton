@@ -19,12 +19,7 @@ import newton
 from newton._src.core import environment_flags as core_flags
 from newton._src.solvers.feather_pgs import kernels
 from newton._src.solvers.feather_pgs import resolved_worlds as rw
-from newton._src.solvers.feather_pgs.friction_patches import (
-    CONTACT_PATH_RESOLVED,
-    FrictionPatches,
-    finish_patch_impulses,
-    patch_routes,
-)
+from newton._src.solvers.feather_pgs.friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, patch_routes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import assert_history_close
 from newton.tests.test_feather_pgs_friction_patches import _patch_fixture
@@ -468,7 +463,7 @@ class TestResolvedWorlds(unittest.TestCase):
 
     def test_patch_finish_releases_resolved_contacts_only(self):
         """The finish epilogue releases CONTACT_PATH_RESOLVED anchors, keeps unrouted ones and finishes routed ones."""
-        model, state, contacts, patches = _patch_fixture([[-0.2, 0, 0], [0.0, 0, 0], [0.2, 0, 0], [0.4, 0, 0]])
+        model, state, _, patches = _patch_fixture([[-0.2, 0, 0], [0.0, 0, 0], [0.2, 0, 0], [0.4, 0, 0]])
         count = 4
         state.body_qd = wp.zeros(model.body_count, dtype=wp.spatial_vector, device="cpu")
         com = wp.zeros(model.body_count, dtype=wp.vec3, device="cpu")
@@ -489,31 +484,6 @@ class TestResolvedWorlds(unittest.TestCase):
                 patches.current.valid.assign([1] * count + [0] * (patches.capacity - count))
                 patches.finish(state, state, com, world, slot, path, needed, finish_routes, DT)
                 np.testing.assert_array_equal(patches.previous.valid.numpy()[:count], expected)
-        # The single-route kernel tests use applies the same release.
-        patches.current.valid.assign([1] * count + [0] * (patches.capacity - count))
-        wp.launch(
-            finish_patch_impulses,
-            dim=count,
-            inputs=[
-                contacts.rigid_contact_count,
-                patches.current,
-                state.body_q,
-                state.body_q,
-                state.body_qd,
-                com,
-                world,
-                slot,
-                path,
-                needed,
-                0,
-                parents,
-                mu,
-                impulses,
-                DT,
-            ],
-            device="cpu",
-        )
-        np.testing.assert_array_equal(patches.current.valid.numpy()[:count], [0, 1, 1, 0])
 
     def test_patch_bound_resolves_only_worlds_whose_rows_fit_each_route(self):
         """Count each checked limit as one dense row and each checked contact as three rows on its route."""

@@ -17,6 +17,8 @@ footprint tolerance, the support-edge members and their carriers), which is
 not mechanism work. This module holds shared test helpers; it defines no tests.
 """
 
+from types import SimpleNamespace
+
 import numpy as np
 import warp as wp
 
@@ -34,9 +36,22 @@ from newton._src.solvers.feather_pgs.friction_patches import (
     _world_point,
     contact_tangent_basis,
     patch_normal_load,
+    patch_routes,
 )
 
 SENTINEL = 0x7FFFFFFFFFFFFFFF
+# The solved state a finish without patch rows takes: with every route disabled it
+# reads neither the state nor the row arrays.
+_UNSOLVED = SimpleNamespace(body_q=None, body_qd=None)
+
+
+def store_frame(patches, state):
+    """Store the patch state's built frame without finishing an anchor, as a solver step without patch rows does.
+
+    The step finishes with every route disabled (``patch_routes(())``), which stores
+    the frame as built at the poses of ``state``.
+    """
+    patches.finish(state, _UNSOLVED, None, None, None, None, None, patch_routes(()), 0.0)
 
 
 def pair_codes(keys, stride=None):

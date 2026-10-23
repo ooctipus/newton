@@ -61,11 +61,10 @@ from newton._src.solvers.feather_pgs.friction_patches import (
     _FrictionPatchState,
     _PatchFrame,
     link_patch_routes,
-    link_patch_rows,
     patch_routes,
 )
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
-from newton.tests.feather_pgs_patch_reference import SENTINEL, ReferencePatches, pair_codes
+from newton.tests.feather_pgs_patch_reference import SENTINEL, ReferencePatches, pair_codes, store_frame
 from newton.tests.feather_pgs_patch_reference import link_patch_rows as reference_link_patch_rows
 from newton.tests.test_feather_pgs_mixed_tree_free_body import _build as _arm_over_box
 
@@ -784,7 +783,7 @@ def run_reference_differential(
             maps, routes = rows.arrays()
             reference.finish(empty, scene.state, out, com, *maps, routes, dt)
             for state in live_states:
-                state.store(scene.state)
+                store_frame(state, scene.state)
             assert_same_patches(patches, reference, 0, context, twin)
             assert_empty_tail(patches, context)
             continue
@@ -887,8 +886,8 @@ class TestPatchSortKeys(unittest.TestCase):
                         state.build(scene.model, scene.state, scene.contacts)
                     assert_same_patches(patches, reference, live, f"step {step} build")
                     carried += int(np.count_nonzero(patches.current.source.numpy()[:live] >= 0))
-                    for state in (patches, reference):
-                        state.store(scene.state)
+                    store_frame(patches, scene.state)
+                    reference.store(scene.state)
                     assert_same_patches(patches, reference, live, f"step {step} store")
                     assert_empty_tail(patches, f"step {step} store")
                 self.assertGreater(carried, 0, "the frames must carry anchor history")
@@ -1539,7 +1538,8 @@ def run_launch_shapes(
             each("reset", None)
             check("reset", f"{context} unstored reset")
         if event == "store":
-            each("store", scene.state)
+            for state in states:
+                store_frame(state, scene.state)
             check("store", f"{context} store")
             continue
         live = scene.frame({"sparse": "sparse", "empty": "empty", "overflow": "overflow"}.get(event, "live"))
@@ -1812,8 +1812,8 @@ def run_ring_links(test, device, seed):
     """Link random rings with the patch link and with the reference's per-route kernel; require equal rows.
 
     ``link_patch_routes`` (all routes in one launch, one thread per contact or
-    seven striding threads) and ``link_patch_rows`` (one launch per route) must
-    write the reference's parents and divided friction budgets bitwise.
+    seven striding threads) must write the reference's parents and divided
+    friction budgets bitwise.
     """
     view, live, maps, (parents, mu), singles = _ring_case(device, seed)
     for name, count in singles.items():
@@ -1857,15 +1857,6 @@ def run_ring_links(test, device, seed):
             device=device,
         )
         assert_rows(joint, f"link_patch_routes on {threads} threads")
-    per_route = rows()
-    for route, route_parents, route_mu, _, _ in per_route:
-        wp.launch(
-            link_patch_rows,
-            dim=contacts,
-            inputs=[count, view, *maps, route, route_parents, route_mu],
-            device=device,
-        )
-    assert_rows(per_route, "link_patch_rows")
 
 
 class TestPatchRingLinks(unittest.TestCase):
@@ -2059,7 +2050,7 @@ def run_sorting_prepare_parity(test, device, *, worlds=3, contacts=96, capacity=
         assert_same_state(recording, plain, f"{context} build", records=False)
         _assert_record(test, recording, _frame_identity(recording, scene.contacts), context)
         for state in (plain, recording):
-            state.store(scene.state)
+            store_frame(state, scene.state)
         assert_same_state(recording, plain, f"{context} store", records=False)
 
 
@@ -2278,7 +2269,7 @@ class TestPatchFrameModes(unittest.TestCase):
                 assert_empty_tail(recording, context)
                 kept += live if substep else 0
                 for state in (plain, recording):
-                    state.store(scene.state)
+                    store_frame(state, scene.state)
                 assert_same_state(recording, plain, f"{context} store", records=False)
         self.assertGreater(kept, 0, "substeps must reuse live pairs")
 
@@ -2328,7 +2319,7 @@ class TestPatchFrameModes(unittest.TestCase):
                 live = scene.frame()
                 self.assertGreater(live, 1)
                 patches.build(scene.model, scene.state, scene.contacts)
-                patches.store(scene.state)
+                store_frame(patches, scene.state)
                 self.assertTrue(np.any(patches.previous.valid.numpy()), "the frame must store anchors")
                 contacts = scene.contacts
                 if change == "generation":
@@ -2349,7 +2340,7 @@ class TestPatchFrameModes(unittest.TestCase):
                 self.assertEqual(int(patches.sorted_frame.numpy()[0]), -1, "the record is dropped")
                 np.testing.assert_array_equal(patches.current.keys.numpy()[: patches.capacity], SENTINEL)
                 assert_empty_tail(patches, change)
-                patches.store(scene.state)
+                store_frame(patches, scene.state)
                 self.assertFalse(np.any(patches.previous.valid.numpy()), "the empty frame releases every anchor")
                 assert_empty_tail(patches, f"{change} store")
                 # A noted write lets the next build sort and record again; only the host clears the status.
@@ -3468,7 +3459,7 @@ def run_captured_entry_filter(test, device, replays):
             for substep in range(2):
                 for patch_state in states:
                     patch_state.build(model, state, filtered)
-                    patch_state.store(state)
+                    store_frame(patch_state, state)
                 if substep == 0:
                     step = 1.0e-4 if index % 2 == 0 else -1.0e-4
                     wp.launch(_nudge_poses, dim=model.body_count, inputs=[state.body_q, step], device=device)

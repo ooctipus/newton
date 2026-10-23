@@ -52,10 +52,7 @@ _PATCH_ONLY = frozenset(
         "friction_patches._prepare_frame",
         "friction_patches._reset_history",
         "friction_patches._sort_chunks",
-        "friction_patches.finish_patch_impulses",
         "friction_patches.link_patch_routes",
-        "friction_patches.link_patch_rows",
-        "friction_patches.seed_patch_impulses",
         "friction_patches.seed_patch_routes",
         # The resolved-world classifier under persistent patch friction.
         "kernels.allocate_world_contact_slots_patch_resolved",
