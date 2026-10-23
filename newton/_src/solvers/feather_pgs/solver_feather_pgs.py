@@ -15041,7 +15041,7 @@ class SolverFeatherPGS(SolverBase):
                             )
 
                         if self._world_rows_owned_le() > 0:
-                            # Ownership needs the final row counts: run after finalize_world_constraint_counts.
+                            # Ownership needs the final row counts: run after finalize_constraint_counts_with_status.
                             self._deferred_row_launches.append(_launch_j_pass)
                         else:
                             _launch_j_pass()

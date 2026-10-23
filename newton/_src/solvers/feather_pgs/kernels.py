@@ -6644,33 +6644,6 @@ def finalize_constraint_counts_with_status(
 
 
 @wp.kernel
-def finalize_world_constraint_counts(
-    world_slot_counter: wp.array[int],
-    max_constraints: int,
-    slots_per_contact: int,
-    first_rejected_slot: wp.array[int],
-    # outputs
-    world_constraint_count: wp.array[int],
-):
-    """Turn the monotone slot counter into the row count.
-
-    The count is the counter truncated at the first rejected reservation and at
-    ``max_constraints``: rows at or past the first rejected slot were reserved by
-    contacts the allocator dropped, so every accepted contact lies below it.
-
-    The ``slots_per_contact`` argument is accepted for backwards
-    compatibility but is no longer used for rounding, because the
-    constraint buffer may now contain a mix of 3-row contact groups and
-    single-row joint-limit constraints.
-    """
-    world = wp.tid()
-    count = wp.min(world_slot_counter[world], first_rejected_slot[world])
-    if count > max_constraints:
-        count = max_constraints
-    world_constraint_count[world] = count
-
-
-@wp.kernel
 def snapshot_dense_phase_bound(
     world_slot_counter: wp.array[int],
     bound_index: int,
@@ -11546,30 +11519,6 @@ def pgs_solve_mf_loop(
                 ds_b2 = art_dof_start[art_b2]
                 for k in range(6):
                     v_out[ds_b2 + k] = v_out[ds_b2 + k] + mf_MiJt_b[world, i, k] * delta_impulse
-
-
-@wp.kernel
-def finalize_mf_constraint_counts(
-    mf_slot_counter: wp.array[int],
-    mf_max_constraints: int,
-    slots_per_contact: int,
-    first_rejected_slot: wp.array[int],
-    # outputs
-    mf_constraint_count: wp.array[int],
-):
-    """Turn the monotone MF slot counter into the row count.
-
-    Truncates at the first rejected reservation and at ``mf_max_constraints``
-    (see :func:`finalize_world_constraint_counts`). ``slots_per_contact`` is
-    kept for call-site compatibility.  The MF buffer may contain a mix of 3-row
-    normal+friction contacts and 1-row speculative normal contacts, so rounding
-    to a fixed stride would drop valid rows.
-    """
-    world = wp.tid()
-    count = wp.min(mf_slot_counter[world], first_rejected_slot[world])
-    if count > mf_max_constraints:
-        count = mf_max_constraints
-    mf_constraint_count[world] = count
 
 
 @wp.kernel
