@@ -23,8 +23,6 @@ _CONSUMERS = (
     kernels.snapshot_contact_warmstart,
     kernels.gather_dense_warmstart,
     kernels.gather_mf_warmstart,
-    kernels.gather_propagation_warmstart,
-    kernels.collect_propagation_units,
 )
 
 
@@ -190,15 +188,7 @@ class TestFeatherPGSCapacityLaunches(unittest.TestCase):
         for device in _devices():
             configurations = [{"pgs_mode": "split", "pgs_warmstart": True}]
             if wp.get_device(device).is_cuda:
-                configurations += [
-                    {"pgs_mode": "matrix_free", "pgs_warmstart": True},
-                    {"pgs_mode": "matrix_free", "pgs_warmstart": True, "articulated_contact_response": "propagation"},
-                    {
-                        "pgs_mode": "matrix_free",
-                        "pgs_warmstart": True,
-                        "articulated_contact_response": "propagation-colored",
-                    },
-                ]
+                configurations.append({"pgs_mode": "matrix_free", "pgs_warmstart": True})
             for options in configurations:
                 with self.subTest(device=device, **options):
                     model = _press(device)

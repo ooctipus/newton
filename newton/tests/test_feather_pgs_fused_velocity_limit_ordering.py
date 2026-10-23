@@ -74,7 +74,6 @@ class TestFeatherPGSFusedVelocityLimitOrdering(unittest.TestCase):
     def _max_arm_speed_over_impact(
         self,
         fuse: bool,
-        articulated_contact_response: str,
         velocity_limit_law: str = "stateless",
         routes: list | None = None,
         velocity_limits: bool = True,
@@ -96,7 +95,6 @@ class TestFeatherPGSFusedVelocityLimitOrdering(unittest.TestCase):
             model,
             pgs_mode="matrix_free",
             drive_mode="physx_pgs",
-            articulated_contact_response=articulated_contact_response,
             enable_joint_velocity_limits=velocity_limits,
             fuse_joint_velocity_limits=fuse,
             enable_contact_friction=False,
@@ -135,66 +133,42 @@ class TestFeatherPGSFusedVelocityLimitOrdering(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free FPGS requires CUDA")
     def test_impact_drives_an_unlimited_arm_past_the_limit(self):
-        """Drive the arm at least twice past the limit on every contact response when no velocity limit acts.
+        """Drive the arm at least twice past the limit when no velocity limit acts.
 
-        Every other test here holds the limit through the impact on one of these
-        responses, which an impact that never reached the limit would pass
-        vacuously. A CPU split solver (augmented drives, 8 iterations) carries the
-        unlimited arm to 6.3 times the limit.
+        Every other test here holds the limit through the impact, which an impact
+        that never reached the limit would pass vacuously. A CPU split solver
+        (augmented drives, 8 iterations) carries the unlimited arm to 6.3 times the
+        limit.
         """
-        for response in ("immediate", "propagation", "propagation-fused"):
-            with self.subTest(articulated_contact_response=response):
-                speed = self._max_arm_speed_over_impact(
-                    fuse=False, articulated_contact_response=response, velocity_limits=False
-                )
-                self.assertGreater(speed, 2.0 * QDOT_MAX)
+        speed = self._max_arm_speed_over_impact(fuse=False, velocity_limits=False)
+        self.assertGreater(speed, 2.0 * QDOT_MAX)
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free FPGS requires CUDA")
     def test_dedicated_rows_hold_limit_through_impact(self):
         # Reference behavior: dedicated velocity-limit rows run in the final
         # phase of every iteration and hold the limit through the impact.
-        speed = self._max_arm_speed_over_impact(fuse=False, articulated_contact_response="immediate")
+        speed = self._max_arm_speed_over_impact(fuse=False)
         self.assertLessEqual(speed, QDOT_MAX * LIMIT_TOL)
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free FPGS requires CUDA")
     def test_accumulated_rows_hold_limit_through_impact(self):
-        """Hold the limit through the impact with accumulated dedicated rows on every contact response.
+        """Hold the limit through the impact with accumulated dedicated rows.
 
-        The accumulated law keeps the end-of-iteration position: the immediate
-        response's final pass, and the velocity-limit phase that follows the
-        contact phases of the propagation schedules (split launches and the fused
-        full-iteration kernel).
+        The accumulated law keeps the end-of-iteration position: the final pass of
+        the matrix-free sweep.
         """
-        for response in ("immediate", "propagation", "propagation-fused"):
-            with self.subTest(articulated_contact_response=response):
-                routes = []
-                speed = self._max_arm_speed_over_impact(
-                    fuse=False,
-                    articulated_contact_response=response,
-                    velocity_limit_law="accumulated",
-                    routes=routes,
-                )
-                self.assertLessEqual(speed, QDOT_MAX * LIMIT_TOL)
-                self.assertEqual(routes[0]["velocity_limits"]["law"], "accumulated")
-                self.assertIn("_vacc", routes[0]["sweep"]["mf_gs"])
-                fused = routes[0]["sweep"]["propagation"]
-                if response == "propagation-fused":
-                    self.assertIn("_vacc", fused["full_iteration"])
+        routes = []
+        speed = self._max_arm_speed_over_impact(fuse=False, velocity_limit_law="accumulated", routes=routes)
+        self.assertLessEqual(speed, QDOT_MAX * LIMIT_TOL)
+        self.assertEqual(routes[0]["velocity_limits"]["law"], "accumulated")
+        self.assertIn("_vacc", routes[0]["sweep"]["mf_gs"])
 
     @unittest.skipUnless(wp.is_cuda_available(), "matrix-free FPGS requires CUDA")
     def test_fused_clamp_holds_limit_through_impact(self):
         # The fused clamp must match the dedicated rows it replaces: the
         # contact impulse lands mid-iteration, so the clamp has to run after
         # contacts to keep the limit at the end of the step.
-        speed = self._max_arm_speed_over_impact(fuse=True, articulated_contact_response="immediate")
-        self.assertLessEqual(speed, QDOT_MAX * LIMIT_TOL)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "propagation-fused FPGS requires CUDA")
-    def test_fused_clamp_holds_limit_through_impact_propagation_fused(self):
-        # Same invariant on the propagation full-iteration kernel, where the
-        # box-arm contact is solved in the propagation family with the tree
-        # response inside the same kernel.
-        speed = self._max_arm_speed_over_impact(fuse=True, articulated_contact_response="propagation-fused")
+        speed = self._max_arm_speed_over_impact(fuse=True)
         self.assertLessEqual(speed, QDOT_MAX * LIMIT_TOL)
 
 

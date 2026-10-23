@@ -71,7 +71,6 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
             ({"_mf_warmstart_enabled": True, "_has_free_rigid_bodies": True}, "1"),
             ({"_has_free_rigid_bodies": True}, "1"),
             ({"drive_mode": "physx_pgs"}, "1"),
-            ({"articulated_contact_response": "propagation"}, "1"),
             ({"pgs_schedule": "contact_then_internal"}, "1"),
             ({"pgs_velocity_iterations": 1}, "1"),
             ({"contact_compliance": True}, "1"),

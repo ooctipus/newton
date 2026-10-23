@@ -29,29 +29,15 @@ SIM_DT = 1.0 / 2000.0
 RADIUS = 0.05
 DROP = 0.12
 
-RESPONSE_MODES = ("immediate", "propagation", "propagation-fused", "propagation-colored")
-
 # Values written into ``SolverFeatherPGS.contact_path``.
 PATH_DENSE = 0
 PATH_MATRIX_FREE = 1
-PATH_PROPAGATION = 2
 
-# The route each scene and response mode takes, measured rather than assumed.
-# A lone free body never reaches dense rows, and "propagation-fused" only uses
-# propagation rows once a real articulation exists -- with a free body it
-# degrades to the matrix-free path -- so a single-sphere scene cannot claim to
-# cover either. Asserting the exact set keeps the suite from silently claiming
-# coverage of a path it never reaches.
-EXPECTED_PATHS = {
-    ("free", "immediate"): {PATH_MATRIX_FREE},
-    ("free", "propagation"): {PATH_PROPAGATION},
-    ("free", "propagation-fused"): {PATH_MATRIX_FREE},
-    ("free", "propagation-colored"): {PATH_PROPAGATION},
-    ("articulated", "immediate"): {PATH_DENSE},
-    ("articulated", "propagation"): {PATH_PROPAGATION},
-    ("articulated", "propagation-fused"): {PATH_PROPAGATION},
-    ("articulated", "propagation-colored"): {PATH_PROPAGATION},
-}
+# The route each scene takes, measured rather than assumed. A lone free body
+# never reaches dense rows, so a single-sphere scene cannot claim to cover them.
+# Asserting the exact set keeps the suite from silently claiming coverage of a
+# path it never reaches.
+EXPECTED_PATHS = {"free": {PATH_MATRIX_FREE}, "articulated": {PATH_DENSE}}
 
 
 def _build(device, scene, mass=1.0):
@@ -86,7 +72,6 @@ def _build(device, scene, mass=1.0):
 def _drop(
     device,
     velocity_iterations,
-    response="immediate",
     steps=620,
     scene="free",
     *,
@@ -101,7 +86,6 @@ def _drop(
             angular_damping=0.0,
             pgs_mode="matrix_free",
             pgs_velocity_iterations=velocity_iterations,
-            articulated_contact_response=response,
             pgs_warmstart=pgs_warmstart,
             mf_warmstart=mf_warmstart,
         )
@@ -322,16 +306,13 @@ def test_every_contact_response_route_lands(test, device):
     cannot claim coverage of a route the scene never reaches.
     """
     for scene in ("free", "articulated"):
-        for response in RESPONSE_MODES:
-            label = f"{scene}/{response}"
-            h, v, n, routes = _drop(device, 4, response=response, scene=scene)
-            _assert_landed(test, h, v, n, label)
-            test.assertEqual(
-                routes,
-                EXPECTED_PATHS[(scene, response)],
-                f"{label}: exercised contact_path {sorted(routes)}, "
-                f"expected {sorted(EXPECTED_PATHS[(scene, response)])}",
-            )
+        h, v, n, routes = _drop(device, 4, scene=scene)
+        _assert_landed(test, h, v, n, scene)
+        test.assertEqual(
+            routes,
+            EXPECTED_PATHS[scene],
+            f"{scene}: exercised contact_path {sorted(routes)}, expected {sorted(EXPECTED_PATHS[scene])}",
+        )
 
 
 def test_non_crossing_row_keeps_its_speculative_allowance(test, device):
@@ -456,13 +437,7 @@ def test_warm_start_with_velocity_iterations_is_supported(test, device):
 
     # Exercise dense slot warm starting and MF identity warm starting through
     # the same velocity pass, not just their constructor paths.
-    h, v, n, routes = _drop(
-        device,
-        4,
-        response="immediate",
-        scene="articulated",
-        pgs_warmstart=True,
-    )
+    h, v, n, routes = _drop(device, 4, scene="articulated", pgs_warmstart=True)
     _assert_landed(test, h, v, n, "dense warm start")
     test.assertEqual(routes, {PATH_DENSE})
 

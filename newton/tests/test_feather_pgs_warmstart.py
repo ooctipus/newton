@@ -50,8 +50,6 @@ def _run_press(
     warm_kwargs: dict,
     contact_matching: str | None = "sticky",
     pgs_mode: str = "matrix_free",
-    articulated_contact_response: str = "immediate",
-    propagation_cached_response: bool = True,
 ):
     """Drive the press to a stall and record per-step contact-impulse sums and speeds.
 
@@ -61,8 +59,6 @@ def _run_press(
     solver = newton.solvers.SolverFeatherPGS(
         model,
         pgs_mode=pgs_mode,
-        articulated_contact_response=articulated_contact_response,
-        propagation_cached_response=propagation_cached_response,
         pgs_iterations=8,
         pgs_beta=0.1,
         **warm_kwargs,
@@ -83,14 +79,9 @@ def _run_press(
         state_0.clear_forces()
         solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
         state_0, state_1 = state_1, state_0
-        if articulated_contact_response.startswith("propagation"):
-            counts = solver.propagation_constraint_count.numpy()
-            rows = solver.propagation_row_type.numpy()[0, : counts[0]]
-            lam = solver.propagation_impulses.numpy()[0, : counts[0]]
-        else:
-            counts = solver.constraint_count.numpy()
-            rows = solver.row_type.numpy()[0, : counts[0]]
-            lam = solver.impulses.numpy()[0, : counts[0]]
+        counts = solver.constraint_count.numpy()
+        rows = solver.row_type.numpy()[0, : counts[0]]
+        lam = solver.impulses.numpy()[0, : counts[0]]
         impulse_sums[i] = np.abs(lam[rows == PGS_CONSTRAINT_TYPE_CONTACT]).sum()
         speeds[i] = np.abs(state_0.joint_qd.numpy()[0])
     return impulse_sums, speeds, state_0
@@ -466,38 +457,6 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
         solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_warmstart=True, pgs_iterations=4)
         self.assertTrue(solver.pgs_warmstart)
         self.assertTrue(solver._mf_warmstart_enabled)
-
-    def test_propagation_routes_hold_static_press(self):
-        """Serial, colored, and cached propagation install carried impulses once."""
-        cases = (
-            ("propagation", False),
-            ("propagation-colored", False),
-            ("propagation-colored", True),
-            ("propagation-fused", False),
-        )
-        for response, cached in cases:
-            with self.subTest(response=response, cached=cached):
-                cold, _, state_cold = _run_press(
-                    160,
-                    {},
-                    articulated_contact_response=response,
-                    propagation_cached_response=cached,
-                )
-                warm, speed, state_warm = _run_press(
-                    160,
-                    {"pgs_warmstart": True},
-                    articulated_contact_response=response,
-                    propagation_cached_response=cached,
-                )
-                self.assertGreater(float(warm[-1]), 0.0)
-                self.assertLess(float(np.ptp(warm[-10:])), 1.0e-5)
-                self.assertLess(float(speed[-10:].max()), 1.0e-4)
-                self.assertAlmostEqual(float(warm[-10:].mean()), float(cold[-10:].mean()), delta=2.0e-3)
-                self.assertAlmostEqual(
-                    float(state_warm.joint_q.numpy()[0]),
-                    float(state_cold.joint_q.numpy()[0]),
-                    delta=1.0e-3,
-                )
 
 
 if __name__ == "__main__":

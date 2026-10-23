@@ -29,7 +29,7 @@ ROW_SWITCHES_OFF = dict.fromkeys(
 
 # Every kernel a contact-row producer launches to write dense contact rows outside the sweep: the general
 # builder's methods, the shared-metadata producers, the compact contact boundary, local row packets and keyed
-# rows. The free-body matrix-free and propagation rows follow the allocation path, not a producer. Add every
+# rows. The free-body matrix-free rows follow the allocation path, not a producer. Add every
 # new producer kernel here: a launched builder missing from this list is invisible to the check below.
 ROW_BUILDER_KERNELS = frozenset(
     (

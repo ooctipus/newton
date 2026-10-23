@@ -101,7 +101,7 @@ Explicit per-device optimization flags can be added only on the FPGS side, for e
 Calibrated buffer sizes can be passed explicitly with repeated
 `--capacity TASK:BACKEND:FIELD=VALUE` options. Each setting applies to both GPUs
 for that task/backend and is recorded in the manifest. FPGS accepts
-`dense_max_constraints`, `mf_max_constraints`, and `propagation_max_constraints`;
+`dense_max_constraints` and `mf_max_constraints`;
 MJWarp accepts `njmax` and `nconmax`. Both accept Newton collision settings
 `rigid_contact_max` and `max_triangle_pairs`. Sizes must be positive integers.
 This does not admit timestep, substep, iteration, tolerance, or contact-law changes.
@@ -187,7 +187,7 @@ and insertion failures; a hash-load warning need not imply lost contacts.
 The capacity checks clear or suppress no flags, launch no additional physics
 kernels, and do not run inside the timing windows. The optional line-search
 correction is an explicitly recorded algorithm change executed in those windows.
-FPGS checks dense, matrix-free and propagation row capacity plus incoming
+FPGS checks dense and matrix-free row capacity plus incoming
 contact-prefix storage; the separate narrow-phase checker covers its transient
 queues. Checked mode requires narrow verification to remain enabled and rejects
 particle/soft-contact, hydroelastic, body-pair reduction and post-narrow

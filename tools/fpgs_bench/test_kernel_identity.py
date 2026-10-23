@@ -196,7 +196,6 @@ class TestKernelIdentity(unittest.TestCase):
             "_get_pgs_solve_mf_gs_incremental_kernel",
             "get_response_block_sweep_lane_kernel",
             "get_response_block_sweep_warp_kernel",
-            "_get_pgs_solve_propagation_full_iteration_kernel",
         )
         rows, _ = identity.census(factories)
         for factory in factories:

@@ -362,7 +362,6 @@ class TestVariantComparison(unittest.TestCase):
                     "capacities": {
                         "dense_max_constraints": 192,
                         "mf_max_constraints": 32,
-                        "propagation_max_constraints": 64,
                     },
                     "solver_recipe": {
                         "grouped_dynamics": False,

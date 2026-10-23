@@ -155,7 +155,7 @@ def fpgs(flags=None):
     flags = flags or dict.fromkeys(checked.FPGS_FLAGS, False)
     solver.constraint_capacity_status = Mock(return_value=flags)
     solver.check_constraint_capacity = Mock()
-    solver.dense_max_constraints, solver.mf_max_constraints, solver.propagation_max_constraints = 704, 64, 64
+    solver.dense_max_constraints, solver.mf_max_constraints = 704, 64
     return solver
 
 

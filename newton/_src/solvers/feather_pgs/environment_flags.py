@@ -106,18 +106,6 @@ FLAGS = declare(
         "=1 compares the fused contact-row builder with the ordinary builder.",
     ),
     _flag(
-        "FEATHER_PGS_COLORED_LANES",
-        "policy",
-        _SOLVER,
-        "Lanes per world in the colored propagation warp kernel (default 1).",
-    ),
-    _flag(
-        "FEATHER_PGS_COLORED_WPB",
-        "policy",
-        _SOLVER,
-        "Worlds per block in the colored propagation warp kernel (default 2).",
-    ),
-    _flag(
         "FEATHER_PGS_COMPACT_CONTACT_BOUNDARY",
         "experiment",
         _SOLVER,

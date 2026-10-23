@@ -17,10 +17,65 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
 from newton.solvers import SolverFeatherPGS
-from newton.tests.test_feather_pgs_propagation_free_root_warp import _build_model as _build_chain
 
 DT = 1.0 / 400.0
 STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
+# Worlds and revolute links of the floating chain (_build_chain), read when it is built.
+CHAIN_WORLDS = 4
+CHAIN_LINKS = 6
+
+
+def _make_floating_chain_world(*, base_z: float, contact_sphere: str | None) -> newton.ModelBuilder:
+    """A floating box base (free joint) trailing CHAIN_LINKS revolute links.
+
+    ``contact_sphere`` places a single collision sphere on the base (``"base"``) or on the
+    deepest link (``"deep"``); all other shapes carry no collision geometry, so each world
+    produces at most one contact point. ``None`` builds density-only box shapes with
+    collision enabled.
+    """
+    builder = newton.ModelBuilder()
+    builder.default_shape_cfg.density = 1000.0
+    builder.default_shape_cfg.mu = 0.7
+
+    no_collision = builder.default_shape_cfg.copy()
+    no_collision.has_shape_collision = False
+    no_collision.collision_group = 0
+
+    base = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, base_z), wp.quat_identity()))
+    cfg = builder.default_shape_cfg if contact_sphere is None else no_collision
+    builder.add_shape_box(base, hx=0.1, hy=0.1, hz=0.1, cfg=cfg)
+    if contact_sphere == "base":
+        builder.add_shape_sphere(base, radius=0.1)
+    joints = [builder.add_joint_free(base)]
+    prev = base
+    for i in range(CHAIN_LINKS):
+        link = builder.add_link()
+        builder.add_shape_box(link, hx=0.12, hy=0.03, hz=0.03, cfg=cfg)
+        if contact_sphere == "deep" and i == CHAIN_LINKS - 1:
+            builder.add_shape_sphere(link, radius=0.05)
+        offset = 0.22 if i == 0 else 0.12
+        joints.append(
+            builder.add_joint_revolute(
+                parent=prev,
+                child=link,
+                axis=wp.vec3(0.0, 1.0, 0.0),
+                parent_xform=wp.transform(wp.vec3(offset, 0.0, 0.0), wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(-0.12, 0.0, 0.0), wp.quat_identity()),
+            )
+        )
+        prev = link
+    builder.add_articulation(joints)
+    return builder
+
+
+def _build_chain(device: str, *, base_z: float, contact_sphere: str | None, ground: bool) -> newton.Model:
+    """Replicate the floating chain in CHAIN_WORLDS worlds, optionally over a ground plane."""
+    scene = newton.ModelBuilder()
+    for _ in range(CHAIN_WORLDS):
+        scene.add_world(_make_floating_chain_world(base_z=base_z, contact_sphere=contact_sphere))
+    if ground:
+        scene.add_ground_plane()
+    return scene.finalize(device=device)
 
 
 def _build_model(*, free_count=0, free_first=False, robot_count=1, prescribed=False, heterogeneous=False):
@@ -249,7 +304,8 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
                         tangent_target_seen |= bool(np.any(np.abs(expected[~live_metadata]) > 0.01))
                     np.testing.assert_allclose(actual[live_metadata], expected[live_metadata], atol=2.0e-5, rtol=2.0e-5)
                     targets_seen[family] |= bool(np.any(np.abs(actual[live_metadata]) > 0.01))
-            prescribed_bodies = np.flatnonzero(sparse[1]._body_prescribed.numpy())
+            # The moving supports are the model's only kinematic bodies.
+            prescribed_bodies = np.flatnonzero(sparse[0].body_flags.numpy() & int(newton.BodyFlags.KINEMATIC))
             np.testing.assert_allclose(
                 sparse[2].body_qd.numpy()[prescribed_bodies],
                 np.tile([0.2, 0.0, 0.04, 0.0, 0.0, 0.15], (len(prescribed_bodies), 1)),

@@ -26,7 +26,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     pgs_solve_loop,
 )
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_tiled_row_kernel
-from newton.tests.test_feather_pgs_friction_anchors import _SQUEEZE_SOLVER, _build_v_jaws, _run_squeeze
+from newton.tests.test_feather_pgs_friction_anchors import _SQUEEZE_SOLVER, _build_v_jaws
 
 
 @wp.kernel(enable_backward=False)
@@ -1321,24 +1321,6 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 rows = solver.mf_row_type.numpy()[0, : solver.mf_constraint_count.numpy()[0]]
                 self.assertEqual(np.count_nonzero(rows == PGS_CONSTRAINT_TYPE_FRICTION), 2)
                 np.testing.assert_allclose(solver._friction_patches.view.weight.numpy()[:3], [0, 1, 0])
-
-    @unittest.skipUnless(wp.is_cuda_available(), "CUDA required")
-    def test_propagation_variants_preserve_a_warmstarted_patch(self):
-        """Retain a sticking articulated grasp across cached, fused, and colored propagation."""
-        for response in ("propagation", "propagation-fused", "propagation-colored"):
-            with self.subTest(response=response):
-                drift, solver, state = _run_squeeze(
-                    5.0,
-                    220,
-                    friction_anchor_beta=0.2,
-                    pgs_warmstart=True,
-                    contact_friction_position_iterations=-1,
-                    pgs_contact_regularization=0.0,
-                    articulated_contact_response=response,
-                )
-                self.assertTrue(np.isfinite(state.body_q.numpy()).all())
-                self.assertLess(abs(drift), 2.0e-4)
-                self.assertGreater(np.count_nonzero(solver._friction_patches.current.valid.numpy()), 0)
 
     def test_shape_updates_refresh_geometry_and_keep_history(self):
         """Refresh broadphase bounds without discarding anchors on unchanged geometry."""

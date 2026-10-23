@@ -646,7 +646,6 @@ def create_owner(solver):
         and solver.pgs_iterations > 0
         and solver.pgs_velocity_iterations == 0
         and not solver.pgs_warmstart
-        and solver.articulated_contact_response == "immediate"
         and (solver._hinv_jt_writes_world or solver._jy_world_aliased)
         and not solver.fuse_joint_velocity_limits
         and not solver._regularization_enabled

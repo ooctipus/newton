@@ -1368,10 +1368,9 @@ def get_source(
         else ""
     )
 
-    # Fused stateless velocity clamp on driven DOFs: the same PhysX PxClamp /
-    # unitResponse math as _FVL_LAST_WORD_CLAMP_SNIPPET (propagation
-    # full-iteration kernel), in this kernel's idiom (packed s_meta_dense,
-    # deferred-response masking). Runs where the dedicated velocity-limit
+    # Fused stateless velocity clamp on driven DOFs: PhysX's PxClamp /
+    # unitResponse math (packed s_meta_dense, deferred-response masking).
+    # Runs where the dedicated velocity-limit
     # rows run — after the contact rows of the same iteration — so the limit
     # keeps the last word even when the sweep is under-converged (the
     # ordering PhysX documents for gripping scenarios via

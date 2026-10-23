@@ -40,7 +40,6 @@ class TestContactComplianceLaw(unittest.TestCase):
         """Reject settings whose update law has not been wired or validated."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True))
         for key, value in (
-            ("articulated_contact_response", "propagation-colored"),
             ("pgs_velocity_iterations", 1),
             ("pgs_contact_regularization", 0.01),
             ("pgs_warmstart", True),

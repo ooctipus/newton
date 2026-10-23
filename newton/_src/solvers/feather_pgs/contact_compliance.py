@@ -63,7 +63,6 @@ def validate_configuration(model, settings):
     """Reject combinations without a defined and tested compliant row update."""
     required = {
         "pgs_mode": "matrix_free",
-        "articulated_contact_response": "immediate",
         "pgs_schedule": "interleaved",
         "pgs_velocity_iterations": 0,
         "pgs_warmstart": False,
@@ -128,10 +127,7 @@ def _prepare_compliant_rows(self):
     dense_counts, mf_counts = self.constraint_count.numpy(), self.mf_constraint_count.numpy()
     # Failed contact reservations roll back the live row count. Check loss counters
     # even when warning output and watermark diagnostics are disabled.
-    dropped = sum(
-        int(rows.numpy().sum())
-        for rows in (self._row_dropped_dense, self._row_dropped_mf, self._row_dropped_propagation)
-    )
+    dropped = sum(int(rows.numpy().sum()) for rows in (self._row_dropped_dense, self._row_dropped_mf))
     if dropped or np.any(dense_counts > self.dense_max_constraints) or np.any(mf_counts > self.mf_max_constraints):
         raise RuntimeError("contact_compliance rejects overflowing solver rows")
     stiffness = contacts.rigid_contact_stiffness.numpy()[:count]

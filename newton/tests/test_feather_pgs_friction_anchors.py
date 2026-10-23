@@ -284,7 +284,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
             fa = solver._friction_patches.view.phi.numpy()[:n]
             slot = solver.contact_slot.numpy()[:n]
             path = solver.contact_path.numpy()[:n]
-            checked = {0: 0, 1: 0, 2: 0}
+            checked = {0: 0, 1: 0}
             for c in range(n):
                 if slot[c] < 0 or path[c] < 0:
                     continue
@@ -295,8 +295,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
                     np.testing.assert_allclose(ph[slot[c] + 1 : slot[c] + 3], fa[c], rtol=1.0e-6, atol=1.0e-9)
                     np.testing.assert_allclose(rb[slot[c] + 1 : slot[c] + 3], beta)
                 else:
-                    ph = (solver.mf_phi if path[c] == 1 else solver.propagation_phi).numpy()[0]
-                    rt = (solver.mf_row_type if path[c] == 1 else solver.propagation_row_type).numpy()[0]
+                    ph, rt = solver.mf_phi.numpy()[0], solver.mf_row_type.numpy()[0]
                     if rt[slot[c] + 1] != PGS_CONSTRAINT_TYPE_FRICTION:
                         continue
                     np.testing.assert_allclose(ph[slot[c] + 1 : slot[c] + 3], beta * fa[c], rtol=1.0e-5, atol=1.0e-9)
@@ -307,11 +306,6 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         model, _, _ = _build_v_jaws(5.0)
         c_dense = check(model, _SQUEEZE_SOLVER)
         self.assertGreater(c_dense[0], 0)
-        # propagation route: same scene, contacts routed to propagation rows
-        model, _, _ = _build_v_jaws(5.0)
-        prop_kwargs = dict(_SQUEEZE_SOLVER, articulated_contact_response="propagation", pgs_contact_regularization=0.0)
-        c_prop = check(model, prop_kwargs)
-        self.assertGreater(c_prop[2], 0)
         # matrix-free route: free box resting on a static slab
         model, _, _ = _build_incline(0.0, 0.5)
         c_mf = check(model, {"pgs_mode": "matrix_free", "pgs_iterations": 16, "pgs_beta": 0.05})

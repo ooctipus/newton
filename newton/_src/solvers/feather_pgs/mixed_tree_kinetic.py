@@ -70,7 +70,6 @@ def supported(solver):
             getattr(solver, "_paired_response_primary_size", None) is None
             or bool(getattr(solver, "_paired_factor_coordinates", False))
         )
-        and solver.articulated_contact_response == "immediate"
         and solver.drive_mode == "augmented"
         and solver.pgs_velocity_iterations == 0
         # Joint velocity limits are ordinary rows over the owner's motion

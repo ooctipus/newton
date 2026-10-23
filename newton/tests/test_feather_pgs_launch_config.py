@@ -6,6 +6,7 @@ import inspect
 import os
 import textwrap
 import unittest
+import warnings
 from unittest import mock
 
 import numpy as np
@@ -299,44 +300,37 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         self.assertEqual(solver.tile_threads, 64)
         self.assertEqual(solver.articulated_contact_response, "immediate")
 
-    @unittest.skipUnless(wp.is_cuda_available(), "matrix-free contact responses require CUDA")
-    def test_articulated_contact_response_validation(self):
+    def test_propagation_responses_are_deprecated(self):
+        """Warn that the propagation responses and their options have no effect, and run the immediate response."""
         model = _build_chain_model(num_links=2, num_worlds=1)
-        solver = SolverFeatherPGS(
-            model,
-            pgs_mode="matrix_free",
-            articulated_contact_response="propagation",
-        )
-        self.assertEqual(solver.articulated_contact_response, "propagation")
-        fused = SolverFeatherPGS(
-            model,
-            pgs_mode="matrix_free",
-            articulated_contact_response="propagation-fused",
-        )
-        self.assertEqual(fused.articulated_contact_response, "propagation-fused")
-
-        with self.assertRaisesRegex(ValueError, "articulated_contact_response"):
-            SolverFeatherPGS(model, articulated_contact_response="bad")
-
-        with self.assertRaisesRegex(NotImplementedError, "pgs_mode='matrix_free'"):
-            SolverFeatherPGS(model, pgs_mode="split", articulated_contact_response="propagation")
-        with self.assertRaisesRegex(NotImplementedError, "pgs_mode='matrix_free'"):
-            SolverFeatherPGS(model, pgs_mode="split", articulated_contact_response="propagation-fused")
-
-        with self.assertRaisesRegex(NotImplementedError, "friction_mode='current'"):
+        for response in ("propagation", "propagation-fused", "propagation-colored"):
+            with self.subTest(response=response):
+                with self.assertWarnsRegex(DeprecationWarning, response):
+                    solver = SolverFeatherPGS(model, articulated_contact_response=response)
+                self.assertEqual(solver.articulated_contact_response, "immediate")
+                option = solver.get_path_selection()["options"]["articulated_contact_response"]
+                self.assertEqual((option["requested"], option["applied"]), (response, "immediate"))
+        for name, value, off in (
+            ("propagation_same_articulation_rows", True, False),
+            ("propagation_cached_response", False, False),
+            ("propagation_cached_response_max_bodies", 4, 0),
+        ):
+            with self.subTest(option=name):
+                with self.assertWarnsRegex(DeprecationWarning, name):
+                    solver = SolverFeatherPGS(model, **{name: value})
+                self.assertEqual(solver.get_path_selection()["options"][name]["applied"], off)
+        # Their former defaults select nothing, as before, and warn about nothing.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
             SolverFeatherPGS(
                 model,
-                pgs_mode="matrix_free",
-                articulated_contact_response="propagation",
-                friction_mode="bisection",
+                articulated_contact_response="immediate",
+                propagation_same_articulation_rows=False,
+                propagation_cached_response=True,
+                propagation_cached_response_max_bodies=8,
             )
-        propagation_debug = SolverFeatherPGS(
-            model,
-            pgs_mode="matrix_free",
-            articulated_contact_response="propagation",
-            pgs_debug=True,
-        )
-        self.assertEqual(propagation_debug.articulated_contact_response, "propagation")
+        with self.assertRaisesRegex(ValueError, "articulated_contact_response"):
+            SolverFeatherPGS(model, articulated_contact_response="bad")
 
     def test_joint_limit_solver_compatibility_validation(self):
         model = _build_chain_model(num_links=2, num_worlds=1)
@@ -948,32 +942,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         wp.synchronize()
         self.assertTrue(np.isfinite(state_0.joint_q.numpy()).all())
         self.assertTrue(np.isfinite(state_0.joint_qd.numpy()).all())
-
-    @unittest.skipUnless(wp.is_cuda_available(), "propagation matrix-free step test requires CUDA")
-    def test_propagation_matrix_free_compiles_and_steps_with_velocity_limit_rows(self):
-        model = _build_chain_model(num_links=3, num_worlds=1)
-        model.joint_velocity_limit.assign(np.full(model.joint_dof_count, 0.1, dtype=np.float32))
-
-        solver = SolverFeatherPGS(
-            model,
-            pgs_mode="matrix_free",
-            articulated_contact_response="propagation",
-            enable_joint_velocity_limits=True,
-            pgs_iterations=2,
-            pgs_velocity_iterations=1,
-            dense_max_constraints=16,
-            mf_max_constraints=16,
-        )
-        state_0, state_1 = model.state(), model.state()
-        state_0.joint_qd.assign(np.full(model.joint_dof_count, 1.0, dtype=np.float32))
-        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
-
-        solver.step(state_0, state_1, model.control(), None, 1.0 / 600.0)
-        wp.synchronize()
-
-        self.assertGreater(int(solver.constraint_count.numpy()[0]), 0)
-        self.assertTrue(np.isfinite(state_1.joint_q.numpy()).all())
-        self.assertTrue(np.isfinite(state_1.joint_qd.numpy()).all())
 
     def test_fuse_joint_velocity_limits_validation(self):
         # fuse_joint_velocity_limits defaults to True but only engages in the

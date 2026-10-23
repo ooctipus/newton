@@ -146,8 +146,8 @@ def factory_calls():
     hold the suite's shapes); the fallback and linked parallel tiers of a
     second keyed-row coordinate layout (one articulation, no secondary block),
     the Cholesky factor families with the held trees' geometric refreshes
-    (:func:`held_factor_calls`), the revolute propagation trees and the opt-in
-    register-whitening parallel tiers follow. Calls a factory rejects are
+    (:func:`held_factor_calls`) and the opt-in register-whitening parallel
+    tiers follow. Calls a factory rejects are
     recorded as rejected.
     """
     from unittest.mock import patch  # noqa: PLC0415
@@ -223,15 +223,6 @@ def factory_calls():
         factory = _unwrapped(solver._get_inverse_cholesky_register_kernel)
         yield name + "_get_inverse_cholesky_register_kernel", factory, (size, ARCH), {"lower_only": True}
     yield from held_factor_calls()
-
-    # One-warp propagation trees of single-coordinate joints, with and without a multi-coordinate root.
-    for factory, size, free_root in itertools.product(
-        ("_get_factor_propagation_tree_revolute_kernel", "_get_propagation_tree_body_response_revolute_kernel"),
-        (7, 18),
-        (False, True),
-    ):
-        kwargs = {"has_free_root": True} if free_root else {}
-        yield name + factory, _unwrapped(getattr(solver, factory)), (size, ARCH), kwargs
 
     def whitened(*args, **kwargs):
         with patch.object(solver, "_REGISTER_WHITENING", True):
@@ -494,8 +485,8 @@ def census_calls():
     Gauss-Seidel (one shape within a warp's width of coordinates, one beyond
     it), sparse (one shape small enough for subwarp sweeps), paired factor,
     local owners plain and over packet rows, sparse diagonal, incremental,
-    parallel and keyed parallel tiers, the response-block sweeps and the fused
-    propagation iteration. Every factory that takes a velocity-limit law is
+    parallel and keyed parallel tiers and the response-block sweeps. Every
+    factory that takes a velocity-limit law is
     crossed with both laws, and the matrix-free Gauss-Seidel sweep with
     resident row metadata. The held-coordinate bindings of
     ``mf_gs_source.get_source``, which no factory passes, are hashed as text.
@@ -669,12 +660,6 @@ def census_calls():
             response_block_sweep.get_response_block_sweep_warp_kernel,
             ((192, 64, 22),),
             (_axis("rows", (32, 64)), _axis("lane_rows", (16,)), _axis("has_drive_rows"), laws),
-        ),
-        (
-            name + "_get_pgs_solve_propagation_full_iteration_kernel",
-            solver._get_pgs_solve_propagation_full_iteration_kernel,
-            ((64, 32, 18, 48, 8, 18, ARCH),),
-            (_axis("worlds_per_block", (1, 2)), _axis("fuse_vel_limits"), laws),
         ),
     )
     for factory_name, cached, shapes, axes in specs:

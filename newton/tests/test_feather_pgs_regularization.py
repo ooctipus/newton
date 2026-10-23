@@ -15,11 +15,63 @@ from newton._src.solvers.feather_pgs.kernels import (
     compute_world_contact_bias,
     pgs_solve_mf_loop,
 )
-from newton.tests.test_feather_pgs_propagation_same_articulation import _build_scissor_model, _contact_rows
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices, get_test_devices
 
 DT = 1.0 / 60.0
 PATH_DENSE = 0  # contact routing id of the dense Delassus path
+
+
+def _build_scissor_model(device: str) -> newton.Model:
+    """One articulation: base link + two sibling links whose boxes overlap.
+
+    The siblings are not directly jointed, so collision produces a
+    link-link contact within a single articulation (common ancestor = base).
+    """
+    builder = newton.ModelBuilder(gravity=0.0)
+    builder.default_shape_cfg.density = 1000.0
+    builder.default_shape_cfg.ke = 1.0e5
+    builder.default_shape_cfg.kd = 1.0e3
+    builder.default_shape_cfg.mu = 0.75
+    builder.default_shape_cfg.margin = 0.0
+    builder.default_shape_cfg.gap = 0.0
+
+    base = builder.add_link()
+    builder.add_shape_box(base, hx=0.05, hy=0.05, hz=0.05)
+    j_base = builder.add_joint_revolute(
+        parent=-1,
+        child=base,
+        axis=wp.vec3(0.0, 0.0, 1.0),
+        parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()),
+        child_xform=wp.transform_identity(),
+    )
+
+    joints = [j_base]
+    for side in (1.0, -1.0):
+        link = builder.add_link()
+        builder.add_shape_box(link, hx=0.12, hy=0.03, hz=0.04)
+        joints.append(
+            builder.add_joint_revolute(
+                parent=base,
+                child=link,
+                axis=wp.vec3(0.0, 0.0, 1.0),
+                parent_xform=wp.transform(wp.vec3(0.06, side * 0.028, 0.0), wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(-0.12, 0.0, 0.0), wp.quat_identity()),
+            )
+        )
+    builder.add_articulation(joints)
+    return builder.finalize(device=device)
+
+
+def _contact_rows(solver, path_id: int, contact_count: int) -> dict[int, int]:
+    """contact index -> row slot for world-0 contacts routed to the given path."""
+    contact_path = solver.contact_path.numpy().astype(np.int32)
+    contact_slot = solver.contact_slot.numpy().astype(np.int32)
+    contact_world = solver.contact_world.numpy().astype(np.int32)
+    out = {}
+    for c in range(contact_count):
+        if int(contact_world[c]) == 0 and int(contact_path[c]) == path_id and int(contact_slot[c]) >= 0:
+            out[c] = int(contact_slot[c])
+    return out
 
 
 def _solve_rows(device, n_rows, g, iterations=300):
@@ -93,7 +145,7 @@ def test_regularization_fixed_points(test: unittest.TestCase, device):
         test.assertAlmostEqual(float(lam.sum()), 1.0, places=5)
 
 
-def _stack_scene(device, g, pgs_mode="matrix_free", response="immediate", velocity_iterations=2):
+def _stack_scene(device, g, pgs_mode="matrix_free", velocity_iterations=2):
     builder = newton.ModelBuilder()
     builder.rigid_gap = 0.003
     cfg = newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.7)
@@ -117,7 +169,6 @@ def _stack_scene(device, g, pgs_mode="matrix_free", response="immediate", veloci
         pgs_mode=pgs_mode,
         pgs_iterations=8,
         pgs_velocity_iterations=velocity_iterations,
-        articulated_contact_response=response,
         pgs_contact_regularization=g,
         mf_warmstart=True,
     )
@@ -141,20 +192,16 @@ def _run(model, pipeline, solver, frames, dt=DT):
 
 def test_regularization_route_agreement(test: unittest.TestCase, device):
     """The regularized update must agree across the matrix-free execution
-    routes: the fused MF-GS kernel (matrix_free/immediate), the standalone
-    MF kernel (split/immediate), and the propagation-fused full-iteration
-    kernel: same scene, same g, matching resting poses."""
+    routes: the fused MF-GS kernel (matrix_free) and the standalone MF kernel
+    (split): same scene, same g, matching resting poses."""
     with wp.ScopedDevice(device):
         results = {}
-        for label, mode, response, velit in (
-            ("fused", "matrix_free", "immediate", 2),
+        for label, mode, velit in (
+            ("fused", "matrix_free", 2),
             # velocity iterations are matrix_free-only; split runs without
-            ("standalone", "split", "immediate", 0),
-            ("propagation-fused", "matrix_free", "propagation-fused", 2),
+            ("standalone", "split", 0),
         ):
-            model, pipeline, solver, _bodies = _stack_scene(
-                device, g=0.05, pgs_mode=mode, response=response, velocity_iterations=velit
-            )
+            model, pipeline, solver, _bodies = _stack_scene(device, g=0.05, pgs_mode=mode, velocity_iterations=velit)
             body_q, _ = _run(model, pipeline, solver, 120)
             results[label] = body_q
         ref = results["fused"]
@@ -220,79 +267,10 @@ def test_regularization_velocity_pass_exempt(test: unittest.TestCase, device):
     """The velocity-only pass solves the exact rigid law: a settled stack holds
     its height to well under a millimetre over the last second."""
     with wp.ScopedDevice(device):
-        for response in ("immediate", "propagation-fused"):
-            model, pipeline, solver, _bodies = _stack_scene(device, g=0.05, response=response, velocity_iterations=4)
-            _, zs = _run(model, pipeline, solver, 240)
-            drift = abs(zs[-1] - zs[179])
-            test.assertLess(
-                drift, 5.0e-4, f"{response}: top box kept sinking ({drift * 1000:.2f} mm over the last second)"
-            )
-
-
-def test_velocity_pass_rigid_on_propagation_schedules(test: unittest.TestCase, device):
-    """Same-articulation link-link contacts stay dense under the ``propagation`` and
-    ``propagation-colored`` schedules, and their velocity-only pass runs through
-    nested fused-GS launches inside the propagation-tree launcher. Every one of
-    those launches must be rigid (``soft_relax=True``), and the converged velocity
-    after the pass must be the ``g = 0`` solution, since the rigid law does not
-    depend on ``g``."""
-
-    def stepped(response, g):
-        model = _build_scissor_model(device)
-        solver = newton.solvers.SolverFeatherPGS(
-            model,
-            pgs_mode="matrix_free",
-            articulated_contact_response=response,
-            pgs_iterations=8,
-            pgs_velocity_iterations=8,
-            pgs_contact_regularization=g,
-            enable_contact_friction=False,
-            dense_max_constraints=64,
-            mf_max_constraints=16,
-        )
-        calls = []
-        in_velocity_pass = {"on": False}
-        launch = solver._launch_matrix_free_gs_solve
-        post = solver._run_matrix_free_velocity_post_solve
-
-        def recording_launch(*args, **kwargs):
-            calls.append((in_velocity_pass["on"], bool(kwargs.get("soft_relax", False))))
-            return launch(*args, **kwargs)
-
-        def flagged_post():
-            in_velocity_pass["on"] = True
-            try:
-                return post()
-            finally:
-                in_velocity_pass["on"] = False
-
-        solver._launch_matrix_free_gs_solve = recording_launch
-        solver._run_matrix_free_velocity_post_solve = flagged_post
-        state_in, state_out = model.state(), model.state()
-        newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-        contacts = model.contacts()
-        state_in.clear_forces()
-        model.collide(state_in, contacts)
-        solver.step(state_in, state_out, model.control(), contacts, 1.0 / 200.0)
-        wp.synchronize()
-        test.assertTrue(
-            _contact_rows(solver, PATH_DENSE, int(contacts.rigid_contact_count.numpy()[0])),
-            f"{response}: scene produced no dense self-contact row",
-        )
-        return calls, state_out.joint_qd.numpy().copy()
-
-    with wp.ScopedDevice(device):
-        for response in ("propagation", "propagation-colored"):
-            calls, qd_soft = stepped(response, 0.5)
-            velocity_calls = [soft for on, soft in calls if on]
-            position_calls = [soft for on, soft in calls if not on]
-            test.assertTrue(velocity_calls, f"{response}: velocity pass issued no fused-GS launch")
-            test.assertTrue(all(velocity_calls), f"{response}: velocity-pass launches were regularized: {calls}")
-            test.assertFalse(any(position_calls), f"{response}: position-pass launches were rigid: {calls}")
-            _, qd_rigid = stepped(response, 0.0)
-            np.testing.assert_allclose(
-                qd_soft, qd_rigid, rtol=0.0, atol=1.0e-4, err_msg=f"{response}: velocity pass depends on g"
-            )
+        model, pipeline, solver, _bodies = _stack_scene(device, g=0.05, velocity_iterations=4)
+        _, zs = _run(model, pipeline, solver, 240)
+        drift = abs(zs[-1] - zs[179])
+        test.assertLess(drift, 5.0e-4, f"top box kept sinking ({drift * 1000:.2f} mm over the last second)")
 
 
 def test_regularization_indeterminate_split(test: unittest.TestCase, device):
@@ -393,9 +371,7 @@ def test_zero_regularization_shares_one_weight_slot(test: unittest.TestCase, dev
 def test_zero_regularization_split_runtime_uses_no_weights(test: unittest.TestCase, device):
     """The standalone MF route must not read its one-element inactive weight argument."""
     with wp.ScopedDevice(device):
-        model, pipeline, solver, _bodies = _stack_scene(
-            device, g=0.0, pgs_mode="split", response="immediate", velocity_iterations=0
-        )
+        model, pipeline, solver, _bodies = _stack_scene(device, g=0.0, pgs_mode="split", velocity_iterations=0)
         body_q, _zs = _run(model, pipeline, solver, 1)
         test.assertGreater(int(solver.mf_constraint_count.numpy().sum()), 1)
         test.assertTrue(np.isfinite(body_q).all())
@@ -473,38 +449,6 @@ def test_assembled_dense_regularization_scales_diagonal(test: unittest.TestCase,
                 1.5 * float(base_diag[slot]),
                 delta=1.0e-5 * max(float(base_diag[slot]), 1.0),
             )
-
-
-def test_regularized_propagation_rows_execute(test: unittest.TestCase, device):
-    """Serial and colored propagation solve real articulated rows with per-row weights."""
-    with wp.ScopedDevice(device):
-        for response in ("propagation", "propagation-colored"):
-            model = _build_scissor_model(device)
-            solver = newton.solvers.SolverFeatherPGS(
-                model,
-                pgs_mode="matrix_free",
-                articulated_contact_response=response,
-                propagation_same_articulation_rows=True,
-                pgs_iterations=1,
-                pgs_velocity_iterations=0,
-                pgs_contact_regularization=0.5,
-                enable_contact_friction=False,
-                dense_max_constraints=64,
-                mf_max_constraints=16,
-            )
-            state_in, state_out = model.state(), model.state()
-            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-            contacts = model.contacts()
-            state_in.clear_forces()
-            model.collide(state_in, contacts)
-            solver.step(state_in, state_out, model.control(), contacts, 1.0 / 200.0)
-            wp.synchronize()
-            rows = _contact_rows(solver, 2, int(contacts.rigid_contact_count.numpy()[0]))
-            test.assertGreater(len(rows), 0, f"{response}: no propagation rows")
-            weights = solver.propagation_row_w.numpy()[0]
-            for slot in rows.values():
-                test.assertAlmostEqual(float(weights[slot]), 2.0 / 3.0, places=6)
-            test.assertTrue(np.isfinite(state_out.joint_qd.numpy()).all())
 
 
 def test_compliance_parameters_removed(test: unittest.TestCase, device):
@@ -610,12 +554,6 @@ add_function_test(
 )
 add_function_test(
     TestFeatherPGSRegularization,
-    "test_velocity_pass_rigid_on_propagation_schedules",
-    test_velocity_pass_rigid_on_propagation_schedules,
-    devices=get_selected_cuda_test_devices(),
-)
-add_function_test(
-    TestFeatherPGSRegularization,
     "test_regularization_indeterminate_split",
     test_regularization_indeterminate_split,
     devices=get_selected_cuda_test_devices(),
@@ -649,12 +587,6 @@ add_function_test(
     "test_assembled_dense_regularization_scales_diagonal",
     test_assembled_dense_regularization_scales_diagonal,
     devices=get_test_devices(),
-)
-add_function_test(
-    TestFeatherPGSRegularization,
-    "test_regularized_propagation_rows_execute",
-    test_regularized_propagation_rows_execute,
-    devices=get_selected_cuda_test_devices(),
 )
 add_function_test(
     TestFeatherPGSRegularization,

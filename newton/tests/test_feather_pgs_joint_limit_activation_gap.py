@@ -77,7 +77,6 @@ def _make_phase_layout_run(
     *,
     pgs_iterations=0,
     pgs_schedule="interleaved",
-    response="immediate",
     enable_joint_velocity_limits=True,
 ):
     """Build a deterministic scene containing every phase-bounded row family."""
@@ -119,7 +118,6 @@ def _make_phase_layout_run(
         model,
         pgs_mode=pgs_mode,
         pgs_schedule=pgs_schedule,
-        articulated_contact_response=response,
         enable_joint_limits=True,
         enable_joint_velocity_limits=enable_joint_velocity_limits,
         velocity_limit_activation_fraction=0.5,
@@ -198,13 +196,12 @@ def _assert_mf_phase_layout(test_case: unittest.TestCase, solver: SolverFeatherP
 
 
 def _run_joint_limit_trajectory(use_warp_builder: bool):
-    """Run a short PhysX-grasp propagation trajectory with one row builder."""
+    """Run a short PhysX-grasp trajectory with one row builder."""
     model, solver, state_in, state_out, control, contacts = _make_phase_layout_run(
         "cuda:0",
         "matrix_free",
         pgs_iterations=8,
         pgs_schedule="physx_grasp",
-        response="propagation",
     )
     if not use_warp_builder:
         solver._joint_limit_warp_kernels.clear()
@@ -216,17 +213,14 @@ def _run_joint_limit_trajectory(use_warp_builder: bool):
         solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
         dense_count = int(solver.constraint_count.numpy()[0])
         mf_count = int(solver.mf_constraint_count.numpy()[0])
-        propagation_count = int(solver.propagation_constraint_count.numpy()[0])
         samples.append(
             {
-                "counts": (dense_count, mf_count, propagation_count),
+                "counts": (dense_count, mf_count),
                 "bounds": solver.dense_phase_bounds.numpy().copy(),
                 "row_type": solver.row_type.numpy()[0, :dense_count].copy(),
                 "mf_row_type": solver.mf_row_type.numpy()[0, :mf_count].copy(),
-                "propagation_row_type": solver.propagation_row_type.numpy()[0, :propagation_count].copy(),
                 "impulses": solver.impulses.numpy()[0, :dense_count].copy(),
                 "mf_impulses": solver.mf_impulses.numpy()[0, :mf_count].copy(),
-                "propagation_impulses": solver.propagation_impulses.numpy()[0, :propagation_count].copy(),
                 "joint_q": state_out.joint_q.numpy().copy(),
                 "joint_qd": state_out.joint_qd.numpy().copy(),
             }
@@ -256,23 +250,22 @@ class TestFeatherPGSJointLimitActivationGap(unittest.TestCase):
         _assert_mf_phase_layout(self, solver)
 
     @unittest.skipUnless(wp.is_cuda_available(), "joint-limit trajectory parity requires CUDA")
-    def test_warp_builder_matches_physx_grasp_propagation_trajectory(self):
-        """Match scalar joint-limit assembly under PhysX-grasp propagation."""
+    def test_warp_builder_matches_physx_grasp_trajectory(self):
+        """Match scalar joint-limit assembly under the PhysX-grasp schedule."""
         reference_solver, reference = _run_joint_limit_trajectory(use_warp_builder=False)
         warp_solver, actual = _run_joint_limit_trajectory(use_warp_builder=True)
 
         self.assertFalse(reference_solver._joint_limit_warp_kernels)
         self.assertTrue(any(kernel is not None for kernel in warp_solver._joint_limit_warp_kernels.values()))
         self.assertEqual(reference_solver.pgs_schedule, "physx_grasp")
-        self.assertEqual(reference_solver.articulated_contact_response, "propagation")
         self.assertEqual(len(reference), len(actual))
         for step, (expected, observed) in enumerate(zip(reference, actual, strict=True)):
             self.assertEqual(observed["counts"], expected["counts"], f"row counts differed at step {step}")
-            for label in ("bounds", "row_type", "mf_row_type", "propagation_row_type"):
+            for label in ("bounds", "row_type", "mf_row_type"):
                 np.testing.assert_array_equal(
                     observed[label], expected[label], err_msg=f"{label} differed at step {step}"
                 )
-            for label in ("impulses", "mf_impulses", "propagation_impulses", "joint_q", "joint_qd"):
+            for label in ("impulses", "mf_impulses", "joint_q", "joint_qd"):
                 np.testing.assert_allclose(
                     observed[label],
                     expected[label],

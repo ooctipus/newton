@@ -1,16 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Constructor guard for heterogeneous multi-world models in SolverFeatherPGS.
+"""Construction of SolverFeatherPGS on heterogeneous multi-world models.
 
 Heterogeneous multi-world models (worlds whose per-world DOF counts differ)
-are only safe on the matrix-free and split paths with the default
-``articulated_contact_response="immediate"``: the dense path produces
-deterministic wrong trajectories, and the propagation-family contact
-responses use fixed-width per-world velocity windows that silently corrupt
-velocities across world boundaries. These tests assert that the constructor
-rejects the unsafe combinations with ``ValueError`` while the safe
-combinations — and every mode on a homogeneous model — still construct.
+construct on the matrix-free and split paths, as homogeneous models do.
 """
 
 from __future__ import annotations
@@ -21,8 +15,6 @@ import warp as wp
 
 import newton
 from newton.solvers import SolverFeatherPGS
-
-PROPAGATION_RESPONSES = ("propagation", "propagation-fused", "propagation-colored")
 
 
 def _make_chain_world(n_links: int) -> newton.ModelBuilder:
@@ -62,7 +54,7 @@ def _build_model(world_link_counts: list[int], device: str) -> newton.Model:
 
 
 class TestFeatherPGSHeteroGuard(unittest.TestCase):
-    """Unsafe hetero-world configurations must fail at construction."""
+    """Heterogeneous and homogeneous models construct on every mode."""
 
     @classmethod
     def setUpClass(cls):
@@ -75,20 +67,6 @@ class TestFeatherPGSHeteroGuard(unittest.TestCase):
         # All 3-link chains: per-world DOF counts uniform -> homogeneous.
         cls.homogeneous_model = _build_model([3, 3, 3, 3], cls.device)
 
-    def test_hetero_propagation_family_raises(self):
-        for response in PROPAGATION_RESPONSES:
-            with self.subTest(articulated_contact_response=response):
-                with self.assertRaises(ValueError) as ctx:
-                    SolverFeatherPGS(
-                        self.hetero_model,
-                        pgs_mode="matrix_free",
-                        articulated_contact_response=response,
-                    )
-                message = str(ctx.exception)
-                self.assertIn(response, message)
-                self.assertIn("heterogeneous", message)
-                self.assertIn("1, 3", message)
-
     def test_hetero_matrix_free_constructs(self):
         solver = SolverFeatherPGS(self.hetero_model, pgs_mode="matrix_free")
         self.assertEqual(solver.pgs_mode, "matrix_free")
@@ -98,21 +76,10 @@ class TestFeatherPGSHeteroGuard(unittest.TestCase):
         self.assertEqual(solver.pgs_mode, "split")
 
     def test_homogeneous_all_modes_construct(self):
-        for pgs_mode, response in (
-            ("split", "immediate"),
-            ("matrix_free", "immediate"),
-            ("matrix_free", "propagation"),
-            ("matrix_free", "propagation-fused"),
-            ("matrix_free", "propagation-colored"),
-        ):
-            with self.subTest(pgs_mode=pgs_mode, articulated_contact_response=response):
-                solver = SolverFeatherPGS(
-                    self.homogeneous_model,
-                    pgs_mode=pgs_mode,
-                    articulated_contact_response=response,
-                )
+        for pgs_mode in ("split", "matrix_free"):
+            with self.subTest(pgs_mode=pgs_mode):
+                solver = SolverFeatherPGS(self.homogeneous_model, pgs_mode=pgs_mode)
                 self.assertEqual(solver.pgs_mode, pgs_mode)
-                self.assertEqual(solver.articulated_contact_response, response)
 
 
 if __name__ == "__main__":

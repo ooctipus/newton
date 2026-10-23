@@ -152,7 +152,10 @@ _EFFECTIVE = {
     "mf_gs_response_block_rows": lambda solver: _response_block_rows(solver, solver.mf_gs_response_block_rows),
     "mf_gs_response_block_lane_rows": lambda solver: _response_block_rows(solver, getattr(solver, "_rb_lane_rows", 0)),
     "use_parallel_streams": _streams_created,
-    "propagation_cached_response": lambda solver: bool(solver._propagation_cached_response_active),
+    # Deprecated options that configured the propagation responses select nothing.
+    "propagation_same_articulation_rows": lambda solver: False,
+    "propagation_cached_response": lambda solver: False,
+    "propagation_cached_response_max_bodies": lambda solver: 0,
     "mf_gs_parallel_linked_velocity_limit_pass": lambda solver: bool(
         solver._ink_rows > 0
         and any(
@@ -443,9 +446,9 @@ def _row_builder(solver, plan, size, source) -> dict:
     (the row metadata, a combined masked launch, a producer's contact kernel) is named under each
     of them. Rows built elsewhere are not named: keyed rows' direct rows, which the parallel tiers
     build in the sweep (``direct_rows`` points to routes.sweep.tiers), the in-sweep world rows of
-    the FEATHER_PGS_WORLD_ROWS experiment, and the free-body matrix-free and propagation rows, which
-    build_mf_contact_rows and build_propagation_contact_rows write for the contacts the allocation
-    routes to them (routes.free_rigid_bodies). _row_check names the debug row checks' builders.
+    the FEATHER_PGS_WORLD_ROWS experiment, and the free-body matrix-free rows, which
+    build_mf_contact_rows writes for the contacts the allocation routes to them
+    (routes.free_rigid_bodies). _row_check names the debug row checks' builders.
     """
     method, law = plan.methods[size], plan.law
     patch = law == "patch"
@@ -576,9 +579,8 @@ def _contact_consumers(solver) -> dict:
     return {
         "max_blocks": blocks,
         "reason": (
-            "Launches over the contact capacity (force export, warm-start snapshot and gathers, propagation unit"
-            f" collection, keyed-row key scatters) grid-stride over {CAPACITY_BLOCKS_PER_SM} blocks of 256 threads"
-            " per SM, about one wave."
+            "Launches over the contact capacity (force export, warm-start snapshot and gathers, keyed-row key"
+            f" scatters) grid-stride over {CAPACITY_BLOCKS_PER_SM} blocks of 256 threads per SM, about one wave."
             if blocks
             else "Uncapped: a CPU launch, or a kernel compiled without the grid-stride loop, covers every slot."
         ),
@@ -732,13 +734,6 @@ def _sweep(solver, source) -> dict:
             "contact_compliance",
             "Compliance updates the right-hand side and repacks metadata before every one-iteration sweep.",
         )
-    elif solver._propagation_contacts_enabled():
-        driver = "propagation_fused" if solver.propagation_full_fused_iterations else "propagation_phases"
-        driver_reason = (
-            "One fused kernel runs each propagation iteration."
-            if solver.propagation_full_fused_iterations
-            else "Each iteration interleaves the route's row phases with the propagation row solve."
-        )
     elif route == "matrix_free_gs" and solver._mf_multiblock is not None:
         driver = "multiblock"
         driver_reason = (
@@ -786,16 +781,6 @@ def _sweep(solver, source) -> dict:
             if packed
             else "Skipped: without free rigid bodies no matrix-free row exists.",
         }
-    propagation = None
-    if solver._propagation_contacts_enabled():
-        propagation = {
-            "mode": solver.articulated_contact_response,
-            "row_solve": _key(solver._pgs_solve_propagation_kernel),
-            "full_iteration": _key(solver._pgs_solve_propagation_full_iteration_kernel),
-            "colored_block": _key(solver._pgs_solve_propagation_colored_block_kernel),
-            "colored_warp": _key(getattr(solver, "_pgs_solve_propagation_colored_warp_kernel", None)),
-            "cached_response": bool(solver._propagation_cached_response_active),
-        }
     local = None
     if solver._local_internal_fast_path:
         local = {
@@ -826,7 +811,6 @@ def _sweep(solver, source) -> dict:
         "dense_tiles": solver._mf_dense_support is not None,
         "dense": dense,
         "free_body_matrix_free": free_body,
-        "propagation": propagation,
     }
     record["readout"] = _readout(solver, record)
     record["exit_law"] = _exit_law(solver, record)
@@ -841,7 +825,6 @@ def _sweep_kernels(solver, record) -> set:
     for owner in ("internal", "pair", "residual"):
         keys.update((record["local"] or {}).get(owner, {}).values())
     keys.update((record["dense"] or {}).get("kernels", ()))
-    keys.update(value for key, value in (record["propagation"] or {}).items() if key not in ("mode", "cached_response"))
     if record["dense_tiles"]:
         # They replace the matrix-free sweep at the multi-block driver's row phase 6, built without a policy.
         keys.update(
@@ -891,17 +874,7 @@ def _uncounted_worlds(record) -> dict:
             "them after each dense row-phase launch, without counters or an exit, so the matrix-free sweep's "
             "slot counts its dense row-phase launches only."
         )
-    if record["propagation"] is not None:
-        owners["propagation"] = (
-            "Worlds whose rows are all propagation rows: the propagation sweeps solve them, and the other sweeps "
-            "return before their first sweep."
-        )
     return owners
-
-
-def _fused_propagation(record) -> bool:
-    """Whether one fused propagation kernel runs every solve of a sweep record's route."""
-    return (record["propagation"] or {}).get("mode") == "propagation-fused"
 
 
 def _readout(solver, record) -> dict:
@@ -911,11 +884,6 @@ def _readout(solver, record) -> dict:
     uncounted_worlds = _uncounted_worlds(record) if counted else {}
     if solver.pgs_solve_readout == "off":
         reason = "pgs_solve_readout is off."
-    elif not counted and _fused_propagation(record):
-        reason = (
-            "The fused propagation kernel sweeps every world's dense, matrix-free and propagation rows without "
-            "counters, and none of the sweeps that count launches, so nothing counts."
-        )
     elif not counted:
         reason = (
             "No sweep of this route carries counters: fixed-iteration, Jacobi-tier and response-block sweeps do not."
@@ -958,11 +926,6 @@ def _exit_law(solver, record) -> dict:
     driver_honors = record["driver"] in ("direct", "contact_then_internal")
     if tolerance == 0.0:
         reason = "pgs_velocity_change_tolerance is 0: every sweep keeps the exact stationary-sweep law."
-    elif not honored and _fused_propagation(record):
-        reason = (
-            "The fused propagation kernel runs every solve's fixed iteration count without an exit, and none of "
-            "the sweeps that compile the velocity law launches, so no sweep applies it."
-        )
     elif not honored:
         reason = "No sweep of this route compiles the velocity law; every sweep keeps the exact law."
     elif not driver_honors:
@@ -1245,9 +1208,7 @@ def _free_rigid_bodies(solver) -> dict:
     count = int(solver._free_rigid_body_count)
     owners = []
     if count:
-        if solver._route_free_free_contacts:
-            owners.append("propagation_rows")
-        elif solver.pgs_mode != "matrix_free" and not solver._sparse_split:
+        if solver.pgs_mode != "matrix_free" and not solver._sparse_split:
             owners.append("split_matrix_free_rows")
         else:
             if solver._sparse_mass_matrix_size is not None:
