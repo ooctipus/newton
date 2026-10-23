@@ -198,8 +198,6 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
                 )
             owner = solver._tree_kinetic_state
             self.assertIsNotNone(owner)
-            self.assertIsNone(solver._fk_id_cache)
-            self.assertFalse(solver._fk_id_cache_uses_snapshot)
             self.assertTrue(owner.bank_compare)
             state_in, state_out = model.state(), model.state()
             newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
@@ -238,8 +236,6 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         solver = SolverFeatherPGS(model, update_mass_matrix_interval=2, pgs_mode="matrix_free")
 
         self.assertTrue(solver._fk_id_cache_enabled)
-        self.assertFalse(solver._fk_id_cache_uses_snapshot)
-        self.assertIsNone(solver._fk_id_cache)
 
     @unittest.skipUnless(wp.is_cuda_available(), "FK/ID launch requires CUDA")
     def test_fk_id_launch_storage_exists_when_reuse_is_disabled(self):
@@ -374,11 +370,10 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
 
         graph_model = _build_model("cuda:0", ground=False)
         eager_model = _build_model("cuda:0", ground=False)
-        # matrix_free keeps the zero-copy FK/ID reuse path; split restores its snapshot and would mask the defect.
+        # Both solvers keep the zero-copy FK/ID reuse path of matrix_free.
         graph_solver = SolverFeatherPGS(graph_model, update_mass_matrix_interval=2, pgs_mode="matrix_free")
         eager_solver = SolverFeatherPGS(eager_model, update_mass_matrix_interval=2, pgs_mode="matrix_free")
         self.assertTrue(graph_solver._fk_id_cache_enabled)
-        self.assertFalse(graph_solver._fk_id_cache_uses_snapshot)
         graph_a, graph_b = _make_initial_state(graph_model), graph_model.state()
         eager_a, eager_b = _make_initial_state(eager_model), eager_model.state()
         graph_control, eager_control = graph_model.control(), eager_model.control()

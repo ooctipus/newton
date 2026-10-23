@@ -679,6 +679,4 @@ def create_owner(solver):
     except ValueError:
         return None
     solver._fk_id_cache_enabled = True
-    solver._fk_id_cache_uses_snapshot = False
-    solver._fk_id_cache = None
     return owner

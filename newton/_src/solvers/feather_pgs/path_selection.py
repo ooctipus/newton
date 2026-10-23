@@ -1160,12 +1160,7 @@ def _publication(solver, source) -> dict:
         reason = (
             "Fused publication declined: an owner, free body, velocity limit or loop joint needs separate launches."
         )
-    if not solver._fk_id_cache_enabled:
-        cache = "off"
-    elif solver._fk_id_cache_uses_snapshot:
-        cache = "snapshot"
-    else:
-        cache = "in_place"
+    cache = "in_place" if solver._fk_id_cache_enabled else "off"
     return {
         "owner": owner,
         "reason": reason,

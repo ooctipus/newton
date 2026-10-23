@@ -98,9 +98,4 @@ def create_owner(solver):
     operator.kinetic_state = owner
     # Only the complete tree owner can cache a distinct prescaled motion input.
     solver._fk_id_cache_enabled = True
-    # The complete sparse solve concludes before finish publishes the next
-    # S/velocity cache. It has no late dense/MF scratch readers, which require
-    # the ordinary split path's separate kinematics snapshot.
-    solver._fk_id_cache_uses_snapshot = False
-    solver._fk_id_cache = None
     return owner

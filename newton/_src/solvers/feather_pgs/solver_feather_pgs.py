@@ -307,7 +307,6 @@ _FPGS_CAPTURE_PHASE = os.environ.get("FEATHER_PGS_CAPTURE_PHASE")  # None = any 
 _FPGS_CAPTURE_DIR = os.environ.get("FEATHER_PGS_CAPTURE_DIR", "/tmp/fpgs_capture")
 _GROUPED_CHECK = os.environ.get("FEATHER_PGS_CHECK_GROUPED") == "1"
 _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
-_FK_ID_CACHE_SNAPSHOT = os.environ.get("FEATHER_PGS_FK_CACHE_SNAPSHOT") == "1"
 # FEATHER_PGS_FUSED_PUBLISH=1 publishes each articulation of the general route
 # in one launch per size group (impulses, acceleration, integration,
 # kinematics and body dynamics). Bit-identical, but one thread per
@@ -321,10 +320,6 @@ _PRISMATIC_PUBLICATION = os.environ.get("FEATHER_PGS_PRISMATIC_PUBLICATION", "0"
 _PRISMATIC_LINEAR_STATE = os.environ.get("FEATHER_PGS_PRISMATIC_LINEAR_STATE", "0") == "1"
 _COMPACT_CONTACT_BOUNDARY = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_BOUNDARY", "0") == "1"
 _COMPACT_CONTACT_ORDERING = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_ORDERING", "0") == "1"
-_DEBUG_CACHE = os.environ.get("FEATHER_PGS_DEBUG_CACHE") == "1"
-_DEBUG_CACHE_MODE = os.environ.get("FEATHER_PGS_DEBUG_CACHE_MODE", "")
-_DEBUG_DELAY = int(os.environ.get("FEATHER_PGS_DEBUG_DELAY", "0"))
-_DEBUG_CACHE_CMP = os.environ.get("FEATHER_PGS_DEBUG_CACHE_CMP") == "1"
 _ROWS_MASKED = os.environ.get("FEATHER_PGS_ROWS_MASKED") == "1"  # thread-per-(contact, dof) contact row build
 _CHECK_ROWS = os.environ.get("FEATHER_PGS_CHECK_ROWS") == "1"
 _SKIP_J_CLEAR = os.environ.get("FEATHER_PGS_SKIP_J_CLEAR") == "1"
@@ -356,41 +351,6 @@ _INK_CHECK = (
 _GROUPED_HINV_FREE = (
     os.environ.get("FEATHER_PGS_GROUPED_HINV_FREE") == "1"
 )  # debug: grouped response solve for free-body groups  # experiment: contact rows are written in full by the masked builder
-
-
-@wp.kernel(enable_backward=False)
-def _debug_maxdiff_sv(a: wp.array[wp.spatial_vector], b: wp.array[wp.spatial_vector], slot: int, out: wp.array[float]):
-    i = wp.tid()
-    d = a[i] - b[i]
-    m = float(0.0)
-    for k in range(6):
-        m = wp.max(m, wp.abs(d[k]))
-    wp.atomic_max(out, slot, m)
-
-
-@wp.kernel(enable_backward=False)
-def _debug_maxdiff_tf(a: wp.array[wp.transform], b: wp.array[wp.transform], slot: int, out: wp.array[float]):
-    i = wp.tid()
-    m = float(0.0)
-    for k in range(7):
-        m = wp.max(m, wp.abs(a[i][k] - b[i][k]))
-    wp.atomic_max(out, slot, m)
-
-
-@wp.kernel(enable_backward=False)
-def _debug_maxdiff_v3(a: wp.array[wp.vec3], b: wp.array[wp.vec3], slot: int, out: wp.array[float]):
-    i = wp.tid()
-    d = a[i] - b[i]
-    wp.atomic_max(out, slot, wp.max(wp.abs(d[0]), wp.max(wp.abs(d[1]), wp.abs(d[2]))))
-
-
-@wp.kernel(enable_backward=False)
-def _debug_spin(iterations: int, out: wp.array[float]):
-    """Debug only: burn GPU time at the start of a step to expose cross-stream races."""
-    acc = float(wp.tid())
-    for _ in range(iterations):
-        acc = acc * 0.999999 + 1.0e-7
-    out[0] = acc
 
 
 _GROUPED_CHECK_COUNT = [0]
@@ -1011,42 +971,6 @@ class _FeatherPGSTreePlan:
                 )
             )
         return cls(tuple(groups))
-
-
-@dataclass(frozen=True)
-class _FeatherPGSKinematicsCache:
-    """Solver-owned next-state dynamics, isolated from active step scratch."""
-
-    body_q_com: wp.array[wp.transform]
-    """Center-of-mass poses [m], shape [body_count]."""
-    joint_S_s: wp.array[wp.spatial_vector]
-    """Joint motion subspaces, shape [joint_dof_count]."""
-    body_I_s: wp.array[wp.spatial_matrix]
-    """Body spatial inertias, shape [body_count]."""
-    body_inertia_terms: wp.array2d[float]
-    """Compact body inertia terms, shape [term_count, 12]."""
-    body_v_s: wp.array[wp.spatial_vector]
-    """Body spatial velocities [m/s, rad/s], shape [body_count]."""
-    body_f_s: wp.array[wp.spatial_vector]
-    """Body spatial forces [N, N·m], shape [body_count]."""
-    body_a_s: wp.array[wp.spatial_vector]
-    """Body spatial accelerations [m/s², rad/s²], shape [body_count]."""
-    articulation_origin: wp.array[wp.vec3]
-    """Articulation origins [m], shape [articulation_count]."""
-
-    @classmethod
-    def allocate(cls, model: Model, inertia_term_count: int) -> "_FeatherPGSKinematicsCache":
-        """Allocate the cache arrays for one model."""
-        return cls(
-            body_q_com=wp.empty_like(model.body_q),
-            joint_S_s=wp.empty(model.joint_dof_count, dtype=wp.spatial_vector, device=model.device),
-            body_I_s=wp.empty(model.body_count, dtype=wp.spatial_matrix, device=model.device),
-            body_inertia_terms=wp.empty((inertia_term_count, 12), dtype=wp.float32, device=model.device),
-            body_v_s=wp.empty(model.body_count, dtype=wp.spatial_vector, device=model.device),
-            body_f_s=wp.empty(model.body_count, dtype=wp.spatial_vector, device=model.device),
-            body_a_s=wp.empty(model.body_count, dtype=wp.spatial_vector, device=model.device),
-            articulation_origin=wp.empty(model.articulation_count, dtype=wp.vec3, device=model.device),
-        )
 
 
 # Retain the internal metadata API while sharing its implementation.
@@ -2628,16 +2552,10 @@ class SolverFeatherPGS(SolverBase):
             and not model.requires_grad
             and not _FK_ID_CACHE_OFF
         )
+        # Stage 7 publishes next-step dynamics in place.
         self._fk_id_cache_enabled = self._fk_id_cache_available and not enable_joint_velocity_limits
-        # Stage 7 publishes next-step dynamics in place; the snapshot copy of
-        # the whole FK/ID cache every substep is retained only as an opt-in
-        # bisection aid (FEATHER_PGS_FK_CACHE_SNAPSHOT=1).
-        self._fk_id_cache_uses_snapshot = (
-            self._fk_id_cache_enabled and self.pgs_mode == "split" and _FK_ID_CACHE_SNAPSHOT
-        )
         self._fk_id_cache_source_state = None
         self._fk_id_cache_valid = wp.zeros(model.articulation_count, dtype=wp.int32, device=model.device)
-        self._fk_id_cache = None
         if model.body_count and not model.requires_grad:
             # Allocate the solver-owned augmented state here rather than on the first step(): a
             # wp.zeros() issued inside a CUDA graph capture becomes a memset node that replays every
@@ -3072,8 +2990,6 @@ class SolverFeatherPGS(SolverBase):
         else:
             self._jy_world_aliased = False
         self._allocate_common_buffers(model)
-        if self._fk_id_cache_uses_snapshot:
-            self._fk_id_cache = _FeatherPGSKinematicsCache.allocate(model, self._body_inertia_terms.shape[0])
         self._setup_parallel_augmented_drive_topology(model)
         if self._sparse_diagonal_contact_solve and not self._parallel_augmented_drive_topology:
             raise RuntimeError("sparse diagonal response requires owned augmented-drive topology")
@@ -7752,7 +7668,7 @@ class SolverFeatherPGS(SolverBase):
         self._paired_components = None
         if os.environ.get("FEATHER_PGS_PAIRED_COMPONENTS", "1") != "1":
             self._paired_components_reason = "FEATHER_PGS_PAIRED_COMPONENTS disables independent components."
-        elif _FPGS_CAPTURE or _GROUPED_CHECK or _DEBUG_CACHE_CMP or _INK_CHECK or _WR_CHECK:
+        elif _FPGS_CAPTURE or _GROUPED_CHECK or _INK_CHECK or _WR_CHECK:
             self._paired_components_reason = "Debug capture and comparison modes keep the coupled paired sweep."
         else:
             from .paired_components import PairedComponents  # noqa: PLC0415
@@ -8502,9 +8418,7 @@ class SolverFeatherPGS(SolverBase):
             and not self._mf_warmstart_enabled
             and not getattr(self, "_pgs_solve_mf_gs_incremental_kernels", ())
             and getattr(self, "_rb_build_kernel", None) is None
-            and not (
-                _FPGS_CAPTURE or _GROUPED_CHECK or _DEBUG_CACHE_CMP or _INK_CHECK or _WR_CHECK or _FPGS_SYNC_TIMINGS
-            )
+            and not (_FPGS_CAPTURE or _GROUPED_CHECK or _INK_CHECK or _WR_CHECK or _FPGS_SYNC_TIMINGS)
         )
         self._paired_general_solve_stream = wp.Stream(model.device) if paired_overlap else None
         self._paired_general_ready = wp.Event(model.device) if paired_overlap else None
@@ -10820,11 +10734,6 @@ class SolverFeatherPGS(SolverBase):
 
         model = self.model
 
-        if _DEBUG_DELAY > 0:
-            if getattr(self, "_debug_spin_out", None) is None:
-                self._debug_spin_out = wp.zeros(1, dtype=float, device=model.device)
-            wp.launch(_debug_spin, dim=1, inputs=[_DEBUG_DELAY], outputs=[self._debug_spin_out], device=model.device)
-
         if control is None:
             control = model.control(clone_variables=False)
         state_aug = self._prepare_augmented_state(state_in, state_out, control)
@@ -12141,36 +12050,12 @@ class SolverFeatherPGS(SolverBase):
 
         # evaluate joint inertias, motion vectors, and forces
         if self._fk_id_cache_enabled:
-            if _DEBUG_CACHE:
-                same = self._fk_id_cache_source_state is state_in
-                capturing = bool(wp.get_device(model.device).is_capturing)
-                nvalid = -1 if capturing else int(self._fk_id_cache_valid.numpy().sum())
-                print(
-                    f"[fk-cache] step={self._step} source_is_state_in={same} valid={nvalid} capturing={capturing}",
-                    flush=True,
-                )
-            if _DEBUG_CACHE_MODE == "zero_even":
-                if self._step % 2 == 0:
-                    self._fk_id_cache_valid.zero_()
-                    self._forget_repair_continuity()
-            elif _DEBUG_CACHE_MODE != "nozero" and not getattr(
-                getattr(self, "_tree_kinetic_state", None), "bank_compare", False
-            ):
+            if not getattr(getattr(self, "_tree_kinetic_state", None), "bank_compare", False):
                 # Owners that compare input banks validate a changed bank on the device.
                 if self._fk_id_cache_source_state is not None and state_in is not self._fk_id_cache_source_state:
                     self._fk_id_cache_valid.zero_()
                     self._forget_repair_continuity()
             self._fk_id_cache_source_state = state_in
-            if self._fk_id_cache_uses_snapshot:
-                cache = self._fk_id_cache
-                wp.copy(state_aug.body_q_com, cache.body_q_com)
-                wp.copy(self.articulation_origin, cache.articulation_origin)
-                wp.copy(state_aug.joint_S_s, cache.joint_S_s)
-                wp.copy(state_aug.body_I_s, cache.body_I_s)
-                wp.copy(self._body_inertia_terms, cache.body_inertia_terms)
-                wp.copy(state_aug.body_v_s, cache.body_v_s)
-                wp.copy(state_aug.body_f_s, cache.body_f_s)
-                wp.copy(state_aug.body_a_s, cache.body_a_s)
         else:
             state_aug.body_f_s.zero_()
         if self.enable_joint_velocity_limits:
@@ -12271,8 +12156,6 @@ class SolverFeatherPGS(SolverBase):
                 block_dim=128,
                 device=model.device,
             )
-        if _DEBUG_CACHE_CMP and self._fk_id_cache_enabled:
-            self._debug_compare_cache(state_in, state_aug, stage3_qd)
         global_inertia_ready = None
         if parallel_global_refresh:
             inertia_stream = self._global_inertia_stream
@@ -12297,146 +12180,6 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
         return global_inertia_ready, stage3_qd
-
-    def _debug_compare_cache(self, state_in: State, state_aug: State, stage3_qd) -> None:
-        """Debug only: recompute FK/ID freshly and accumulate max differences against the values in use.
-
-        Runs inside CUDA graphs; ``self._debug_cache_diff`` holds slots
-        [body_q, body_q_com, origin, joint_S_s, body_v_s, body_a_s, body_f_s].
-        """
-        model = self.model
-        scratch = getattr(self, "_debug_cache_scratch", None)
-        if scratch is None:
-            scratch = {
-                "body_q": wp.zeros_like(state_in.body_q),
-                "body_q_com": wp.zeros_like(state_aug.body_q_com),
-                "origin": wp.zeros_like(self.articulation_origin),
-                "joint_S_s": wp.zeros_like(state_aug.joint_S_s),
-                "body_I_s": wp.zeros_like(state_aug.body_I_s),
-                "terms": wp.zeros_like(self._body_inertia_terms),
-                "body_v_s": wp.zeros_like(state_aug.body_v_s),
-                "body_f_s": wp.zeros_like(state_aug.body_f_s),
-                "body_a_s": wp.zeros_like(state_aug.body_a_s),
-                "valid": wp.zeros_like(self._fk_id_cache_valid),
-            }
-            self._debug_cache_scratch = scratch
-            self._debug_cache_diff = wp.zeros(10, dtype=float, device=model.device)
-        wp.launch(
-            eval_rigid_fk_id,
-            dim=model.articulation_count,
-            inputs=[
-                model.articulation_start,
-                self.articulation_joint_end,
-                model.joint_type,
-                model.joint_parent,
-                model.joint_child,
-                model.joint_q_start,
-                model.joint_qd_start,
-                state_in.joint_q,
-                stage3_qd,
-                model.joint_X_p,
-                model.joint_X_c,
-                self.body_X_com,
-                model.joint_axis,
-                model.joint_dof_dim,
-                model.body_com,
-                model.body_mass,
-                model.body_inertia,
-                self.is_free_rigid,
-                0,
-                1,
-                0,
-                model.gravity,
-            ],
-            outputs=[
-                scratch["body_q"],
-                scratch["body_q_com"],
-                scratch["origin"],
-                scratch["joint_S_s"],
-                scratch["body_I_s"],
-                scratch["terms"],
-                scratch["body_v_s"],
-                scratch["body_f_s"],
-                scratch["body_a_s"],
-                scratch["valid"],
-            ],
-            block_dim=16,
-            device=model.device,
-        )
-        out = self._debug_cache_diff
-        wp.launch(
-            _debug_maxdiff_tf,
-            dim=model.body_count,
-            inputs=[state_in.body_q, scratch["body_q"], 0],
-            outputs=[out],
-            device=model.device,
-        )
-        wp.launch(
-            _debug_maxdiff_tf,
-            dim=model.body_count,
-            inputs=[state_aug.body_q_com, scratch["body_q_com"], 1],
-            outputs=[out],
-            device=model.device,
-        )
-        wp.launch(
-            _debug_maxdiff_v3,
-            dim=model.articulation_count,
-            inputs=[self.articulation_origin, scratch["origin"], 2],
-            outputs=[out],
-            device=model.device,
-        )
-        wp.launch(
-            _debug_maxdiff_sv,
-            dim=model.joint_dof_count,
-            inputs=[state_aug.joint_S_s, scratch["joint_S_s"], 3],
-            outputs=[out],
-            device=model.device,
-        )
-        wp.launch(
-            _debug_maxdiff_sv,
-            dim=model.body_count,
-            inputs=[state_aug.body_v_s, scratch["body_v_s"], 4],
-            outputs=[out],
-            device=model.device,
-        )
-        wp.launch(
-            _debug_maxdiff_sv,
-            dim=model.body_count,
-            inputs=[state_aug.body_a_s, scratch["body_a_s"], 5],
-            outputs=[out],
-            device=model.device,
-        )
-        wp.launch(
-            _debug_maxdiff_sv,
-            dim=model.body_count,
-            inputs=[state_aug.body_f_s, scratch["body_f_s"], 6],
-            outputs=[out],
-            device=model.device,
-        )
-        wp.launch(
-            _debug_maxdiff_sv,
-            dim=model.body_count,
-            inputs=[state_aug.body_f_s, scratch["body_f_s"], 7 + (self._step % 2)],
-            outputs=[out],
-            device=model.device,
-        )
-        if "cached_f" not in scratch:
-            scratch["cached_f"] = wp.zeros_like(state_aug.body_f_s)
-            scratch["cached_v"] = wp.zeros_like(state_aug.body_v_s)
-            scratch["cached_a"] = wp.zeros_like(state_aug.body_a_s)
-            scratch["cached_qcom"] = wp.zeros_like(state_aug.body_q_com)
-            scratch["fresh_f"] = wp.zeros_like(state_aug.body_f_s)
-            scratch["fresh_a"] = wp.zeros_like(state_aug.body_a_s)
-            scratch["fresh_qcom"] = wp.zeros_like(state_aug.body_q_com)
-        if self._step % 2 == 1:
-            return  # keep the copies from the first substep of the captured pair
-        wp.copy(scratch["cached_f"], state_aug.body_f_s)
-        wp.copy(scratch["cached_v"], state_aug.body_v_s)
-        wp.copy(scratch["cached_a"], state_aug.body_a_s)
-        wp.copy(scratch["cached_qcom"], state_aug.body_q_com)
-        wp.copy(scratch["fresh_f"], scratch["body_f_s"])
-        wp.copy(scratch["fresh_a"], scratch["body_a_s"])
-        wp.copy(scratch["fresh_qcom"], scratch["body_q_com"])
 
     def _stage1_prepare_augmented_drives(
         self, state_in: State, state_aug: State, control: Control, dt: float
@@ -17428,7 +17171,7 @@ class SolverFeatherPGS(SolverBase):
 
             self._prismatic_publication = PrismaticPublicationPlan.build(model, self.articulation_joint_end)
         if _PRISMATIC_LINEAR_STATE:
-            if _GROUPED_CHECK or _DEBUG_CACHE_CMP:
+            if _GROUPED_CHECK:
                 raise ValueError("prismatic linear state does not support materialized-inertia debug comparisons")
             from .prismatic_linear_state import configure_linear_state  # noqa: PLC0415
 
@@ -17477,15 +17220,14 @@ class SolverFeatherPGS(SolverBase):
     def _stage7_finish_general(self, state_in: State, state_aug: State, state_out: State, dt: float) -> None:
         """Apply impulses, integrate and publish every articulation in one launch per size group."""
         model = self.model
-        cache = self._fk_id_cache
-        body_q_com = cache.body_q_com if cache is not None else state_aug.body_q_com
-        articulation_origin = cache.articulation_origin if cache is not None else self.articulation_origin
-        joint_S_s = cache.joint_S_s if cache is not None else state_aug.joint_S_s
-        body_I_s = cache.body_I_s if cache is not None else state_aug.body_I_s
-        body_inertia_terms = cache.body_inertia_terms if cache is not None else self._body_inertia_terms
-        body_v_s = cache.body_v_s if cache is not None else state_aug.body_v_s
-        body_f_s = cache.body_f_s if cache is not None else state_aug.body_f_s
-        body_a_s = cache.body_a_s if cache is not None else state_aug.body_a_s
+        body_q_com = state_aug.body_q_com
+        articulation_origin = self.articulation_origin
+        joint_S_s = state_aug.joint_S_s
+        body_I_s = state_aug.body_I_s
+        body_inertia_terms = self._body_inertia_terms
+        body_v_s = state_aug.body_v_s
+        body_f_s = state_aug.body_f_s
+        body_a_s = state_aug.body_a_s
         next_refresh = ((self._step + 1) % self.update_mass_matrix_interval) == 0
         parallel_next_refresh = next_refresh and self._global_inertia_stream is not None
         # Dense and split compositions leave the impulses to this kernel; the
@@ -17586,15 +17328,14 @@ class SolverFeatherPGS(SolverBase):
                 )
             return
 
-        cache = self._fk_id_cache
-        body_q_com = cache.body_q_com if cache is not None else state_aug.body_q_com
-        articulation_origin = cache.articulation_origin if cache is not None else self.articulation_origin
-        joint_S_s = cache.joint_S_s if cache is not None else state_aug.joint_S_s
-        body_I_s = cache.body_I_s if cache is not None else state_aug.body_I_s
-        body_inertia_terms = cache.body_inertia_terms if cache is not None else self._body_inertia_terms
-        body_v_s = cache.body_v_s if cache is not None else state_aug.body_v_s
-        body_f_s = cache.body_f_s if cache is not None else state_aug.body_f_s
-        body_a_s = cache.body_a_s if cache is not None else state_aug.body_a_s
+        body_q_com = state_aug.body_q_com
+        articulation_origin = self.articulation_origin
+        joint_S_s = state_aug.joint_S_s
+        body_I_s = state_aug.body_I_s
+        body_inertia_terms = self._body_inertia_terms
+        body_v_s = state_aug.body_v_s
+        body_f_s = state_aug.body_f_s
+        body_a_s = state_aug.body_a_s
         next_refresh = ((self._step + 1) % self.update_mass_matrix_interval) == 0
         parallel_next_refresh = next_refresh and self._global_inertia_stream is not None
         prismatic = self._prismatic_publication

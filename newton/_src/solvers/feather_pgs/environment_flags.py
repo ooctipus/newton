@@ -142,30 +142,6 @@ FLAGS = declare(
         "sequential or unit overrides the contact_update argument (unset: the argument).",
     ),
     _flag(
-        "FEATHER_PGS_DEBUG_CACHE",
-        "diagnostic",
-        _SOLVER,
-        "=1 prints FK/ID cache validity every step.",
-    ),
-    _flag(
-        "FEATHER_PGS_DEBUG_CACHE_CMP",
-        "diagnostic",
-        _SOLVER,
-        "=1 compares the FK/ID cache with a recomputation.",
-    ),
-    _flag(
-        "FEATHER_PGS_DEBUG_CACHE_MODE",
-        "diagnostic",
-        _SOLVER,
-        "FK/ID cache invalidation override for bisection: zero_even or nozero (default ordinary).",
-    ),
-    _flag(
-        "FEATHER_PGS_DEBUG_DELAY",
-        "diagnostic",
-        _SOLVER,
-        "Spin iterations launched at the start of each step to expose stream races (default 0).",
-    ),
-    _flag(
         "FEATHER_PGS_DEBUG_SNAPSHOTS",
         "diagnostic",
         _SOLVER,
@@ -176,12 +152,6 @@ FLAGS = declare(
         "policy",
         _SOLVER,
         "tiled_row row budgets: 1 on for 64 or 128 rows, unset automatic (128 rows, 1024+ worlds), else off.",
-    ),
-    _flag(
-        "FEATHER_PGS_FK_CACHE_SNAPSHOT",
-        "reference",
-        _SOLVER,
-        "=1 restores the per-substep snapshot copy of the FK/ID cache as a bisection aid.",
     ),
     _flag(
         "FEATHER_PGS_FK_ID_CACHE",
