@@ -336,7 +336,6 @@ _DEBUG_DELAY = int(os.environ.get("FEATHER_PGS_DEBUG_DELAY", "0"))
 _DEBUG_CACHE_CMP = os.environ.get("FEATHER_PGS_DEBUG_CACHE_CMP") == "1"
 _ROWS_MASKED = os.environ.get("FEATHER_PGS_ROWS_MASKED") == "1"  # thread-per-(contact, dof) contact row build
 _CHECK_ROWS = os.environ.get("FEATHER_PGS_CHECK_ROWS") == "1"
-_SKIP_J_CLEAR = os.environ.get("FEATHER_PGS_SKIP_J_CLEAR") == "1"
 _ROWS_NATIVE = os.environ.get("FEATHER_PGS_ROWS_NATIVE") == "1"  # warp-per-contact native row build
 _GROUPED_HINV_OFF = os.environ.get("FEATHER_PGS_GROUPED_HINV") == "0"  # keep the tiled response solve (better on hands)
 _GROUPED_HINV_MAX = int(
@@ -11922,13 +11921,6 @@ class SolverFeatherPGS(SolverBase):
                             continue
                         if self._compact_contact_boundary and size == 6:
                             continue  # Complete contact stores; the next step clears only its limit prefix.
-                        if (
-                            _SKIP_J_CLEAR
-                            and self._point_contact_paths
-                            and (_ROWS_MASKED or _ROWS_NATIVE)
-                            and size <= 32
-                        ):
-                            continue
                         wp.launch(
                             clear_grouped_jacobian_active_rows,
                             dim=self.n_arts_by_size[size] * 32,

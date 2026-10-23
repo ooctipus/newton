@@ -535,12 +535,6 @@ FLAGS = declare(
         "Retired simple-world classifier of a removed robot-specific owner; ignored.",
     ),
     _flag(
-        "FEATHER_PGS_SKIP_J_CLEAR",
-        "experiment",
-        _SOLVER,
-        "=1 skips the Jacobian clear when masked or native builders write rows in full.",
-    ),
-    _flag(
         "FEATHER_PGS_SPARSE_BRANCH_SWEEPS",
         "retired",
         ("environment_flags",),
