@@ -2015,7 +2015,8 @@ class SolverFeatherPGS(SolverBase):
                 ``artifacts/2026-04-16-slack-raisim/coulomb_root_finding_warp.py``.
                 ``friction_mode`` is matrix-free only — passing
                 any value other than ``"current"`` with ``pgs_mode="split"`` raises ``ValueError``.
-                Defaults to ``"current"``.
+                The values other than ``"current"`` are deprecated: they warn and will be removed in a
+                future release. Defaults to ``"current"``.
             mf_max_constraints (int, optional): Maximum number of matrix-free constraints per world.
                 Packed metadata in matrix-free mode supports at most 65535 rows. Defaults to 512.
             pgs_kernel: Dense PGS implementation. ``auto`` uses ``loop`` on CPU and ``tiled_row`` on CUDA.
@@ -2115,6 +2116,13 @@ class SolverFeatherPGS(SolverBase):
             warnings.warn(
                 "pgs_chunk_size is deprecated and has no effect, and will be removed in a future release; "
                 "it tuned the removed streaming kernel. Omit it.",
+                DeprecationWarning,
+                stacklevel=_CONSTRUCTOR_CALLER,
+            )
+        if friction_mode in ("bisection", "bisection_desaxce", "coulomb_newton"):
+            warnings.warn(
+                f"friction_mode={friction_mode!r} is deprecated and will be removed in a future release; "
+                "use the default friction_mode='current'.",
                 DeprecationWarning,
                 stacklevel=_CONSTRUCTOR_CALLER,
             )

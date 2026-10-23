@@ -1241,6 +1241,24 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             with self.subTest(flag=flag), self.assertWarnsRegex(UserWarning, "friction_anchor_beta=0"):
                 newton.solvers.SolverFeatherPGS(model, **{flag: True})
 
+    def test_research_friction_modes_are_deprecated(self):
+        """Warn that the research friction laws will be removed, and leave the default law silent."""
+        builder = newton.ModelBuilder()
+        body = builder.add_body()
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        model = builder.finalize(device="cpu")
+        for mode in ("bisection", "bisection_desaxce", "coulomb_newton"):
+            with self.subTest(friction_mode=mode):
+                # CPU construction then stops at the matrix-free device check.
+                with (
+                    self.assertWarnsRegex(DeprecationWarning, f"friction_mode='{mode}' is deprecated"),
+                    self.assertRaisesRegex(NotImplementedError, "requires CUDA"),
+                ):
+                    newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", friction_mode=mode)
+        with mock.patch("warnings.warn") as warn:
+            newton.solvers.SolverFeatherPGS(model, friction_mode="current")
+        self.assertFalse([call for call in warn.call_args_list if "friction_mode" in str(call.args[0])])
+
     def test_incompatible_point_solvers_are_rejected(self):
         """Reject coupled point solves that would silently consume a patch's shared normal load."""
         builder = newton.ModelBuilder()
