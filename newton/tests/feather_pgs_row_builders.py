@@ -24,7 +24,7 @@ from newton._src.solvers.feather_pgs import keyed_rows
 # The import-time row-builder switches of the solver module, held off unless a case sets one, whatever the
 # shell exports.
 ROW_SWITCHES_OFF = dict.fromkeys(
-    ("_ROWS_MASKED", "_ROWS_NATIVE", "_ROWS_FUSED", "_CHECK_ROWS", "_CHECK_ROWS_FUSED"), False
+    ("_ROWS_MASKED", "_ROWS_FUSED", "_CHECK_ROWS", "_CHECK_ROWS_FUSED"), False
 )
 
 # Every kernel a contact-row producer launches to write dense contact rows outside the sweep: the general
@@ -38,7 +38,6 @@ ROW_BUILDER_KERNELS = frozenset(
         "contact_row_prelude_patch",
         "populate_world_J_masked",
         "populate_world_J_masked_patch",
-        "populate_world_J_native",
         "build_contact_rows",
         "prepare_world_contact_rows",
         "populate_world_J_for_compact_size",
@@ -66,7 +65,6 @@ PER_SIZE_KERNELS = frozenset(
     (
         "populate_world_J_for_size",
         "populate_world_J_for_compact_size",
-        "populate_world_J_native",
         "materialize_fallback",
         "materialize_patch_fallback",
     )

@@ -617,18 +617,14 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         """Name in builder_by_dof exactly the contact-row builders one CPU step launches, under both laws.
 
         The general builder's methods: per-contact rows, masked rows in one launch for up to two
-        sizes or per size for three, native and fused rows (point friction; patch friction keeps
+        sizes or per size for three, fused rows (point friction; patch friction keeps
         per-contact rows), FEATHER_PGS_PATCH_DENSE_PATHS=0 and a size above the masked builder's 32
         DOFs; then keyed rows on CPU stand-ins. Each record is taken under the switches its step
         runs with. The debug row checks are not routes and stay off.
         """
         mixed, three, wide = _cpu_free_body_model(), _resting_arms_and_box(1, 2), _resting_arms_and_box(34)
         pair = ("6", "1")
-        masked, fused, native = (
-            {"_ROWS_MASKED": True},
-            {"_ROWS_MASKED": True, "_ROWS_FUSED": True},
-            {"_ROWS_NATIVE": True},
-        )
+        masked, fused = ({"_ROWS_MASKED": True}, {"_ROWS_MASKED": True, "_ROWS_FUSED": True})
         cases = (
             # (model, switches, FEATHER_PGS_PATCH_DENSE_PATHS, friction_anchor_beta, methods by size)
             (mixed, {}, None, None, dict.fromkeys(pair, "per_contact")),
@@ -636,8 +632,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             (mixed, masked, None, None, dict.fromkeys(pair, "masked_combined")),
             (mixed, masked, None, 0.0, dict.fromkeys(pair, "masked_combined")),
             (mixed, masked, "0", None, dict.fromkeys(pair, "per_contact")),
-            (mixed, native, None, None, dict.fromkeys(pair, "per_contact")),
-            (mixed, native, None, 0.0, dict.fromkeys(pair, "native")),
             (mixed, fused, None, None, dict.fromkeys(pair, "per_contact")),
             (mixed, fused, None, 0.0, dict.fromkeys(pair, "fused_rows")),
             (three, masked, None, None, dict.fromkeys(("6", "2", "1"), "masked")),
@@ -690,7 +684,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_cpu_record_names_the_debug_row_check_builders(self):
         """Name the builders the debug row checks launch in row_check_by_dof, and none without a check.
 
-        FEATHER_PGS_CHECK_ROWS (point friction) builds every size's masked or native rows into copies
+        FEATHER_PGS_CHECK_ROWS (point friction) builds every size's masked rows into copies
         and compares them with the per-contact rows the solve uses, which builder_by_dof and
         general_method_by_dof name. FEATHER_PGS_CHECK_ROWS_FUSED rebuilds the combined masked sizes'
         rows with the fused builder. Patch friction runs neither check. One CPU step launches exactly
@@ -703,7 +697,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             # (switches, friction_anchor_beta, builder method, checked method or None, comparisons)
             ({"_CHECK_ROWS": True}, 0.0, "per_contact", "masked", ["rows_J_6", "rows_J_1"]),
             ({"_CHECK_ROWS": True, "_ROWS_MASKED": True}, 0.0, "per_contact", "masked", ["rows_J_6", "rows_J_1"]),
-            ({"_CHECK_ROWS": True, "_ROWS_NATIVE": True}, 0.0, "per_contact", "native", ["rows_J_6", "rows_J_1"]),
             ({"_CHECK_ROWS_FUSED": True, "_ROWS_MASKED": True}, 0.0, "masked_combined", "fused_rows", [fused_check]),
             ({"_CHECK_ROWS": True, "_ROWS_MASKED": True}, None, "per_contact", None, []),
             ({"_CHECK_ROWS_FUSED": True, "_ROWS_MASKED": True}, None, "per_contact", None, []),
@@ -748,7 +741,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         marker = SimpleNamespace(key="mark_independent_sparse_contact_candidates_stand_in")
         response = SimpleNamespace(key="populate_sparse_contact_response_stand_in")
         prepare, compact = "prepare_world_contact_rows", "populate_world_J_for_compact_size"
-        per_contact, native, fused = ["populate_world_J_for_size"], ["populate_world_J_native"], ["build_contact_rows"]
+        per_contact, fused = ["populate_world_J_for_size"], ["build_contact_rows"]
         point_masked = ["contact_row_prelude", "populate_world_J_masked"]
         named, methods = set(), set()
         for law in ("point", "patch"):
@@ -871,14 +864,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 ),
                 (
                     {},
-                    {"_ROWS_NATIVE": True},
-                    (6, 1),
-                    "general",
-                    same((6, 1), "native", native) if point else same((6, 1), "per_contact", per_contact),
-                    None,
-                ),
-                (
-                    {},
                     {"_ROWS_MASKED": True, "_ROWS_FUSED": True},
                     (6, 1),
                     "general",
@@ -892,14 +877,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     "general",
                     same((6, 1), "per_contact", per_contact),
                     same((6, 1), "masked", point_masked) if point else None,
-                ),
-                (
-                    {},
-                    {"_CHECK_ROWS": True, "_ROWS_NATIVE": True},
-                    (6, 1),
-                    "general",
-                    same((6, 1), "per_contact", per_contact),
-                    same((6, 1), "native", native) if point else None,
                 ),
                 (
                     {},

@@ -260,7 +260,6 @@ from .row_build import (
     populate_world_J_masked,
     populate_world_J_masked_patch,
 )
-from .row_build_native import get_row_build_native_kernel
 from .row_build_rows import build_contact_rows
 from .row_inputs import make_row_kernel
 from .solve_policy import (
@@ -336,7 +335,6 @@ _DEBUG_DELAY = int(os.environ.get("FEATHER_PGS_DEBUG_DELAY", "0"))
 _DEBUG_CACHE_CMP = os.environ.get("FEATHER_PGS_DEBUG_CACHE_CMP") == "1"
 _ROWS_MASKED = os.environ.get("FEATHER_PGS_ROWS_MASKED") == "1"  # thread-per-(contact, dof) contact row build
 _CHECK_ROWS = os.environ.get("FEATHER_PGS_CHECK_ROWS") == "1"
-_ROWS_NATIVE = os.environ.get("FEATHER_PGS_ROWS_NATIVE") == "1"  # warp-per-contact native row build
 _GROUPED_HINV_OFF = os.environ.get("FEATHER_PGS_GROUPED_HINV") == "0"  # keep the tiled response solve (better on hands)
 _GROUPED_HINV_MAX = int(
     os.environ.get("FEATHER_PGS_GROUPED_HINV_MAX", "32")
@@ -15049,9 +15047,9 @@ class SolverFeatherPGS(SolverBase):
                             device=model.device,
                         )
             else:
-                # FEATHER_PGS_CHECK_ROWS builds the native or masked rows into copies, then the
+                # FEATHER_PGS_CHECK_ROWS builds the masked rows into copies, then the
                 # per-contact rows the solve uses, and compares them.
-                check_rows = plan.check in ("native", "masked")
+                check_rows = plan.check == "masked"
                 combined_done = False
                 for size in self.size_groups:
                     method = plan.methods[size]
@@ -15251,79 +15249,7 @@ class SolverFeatherPGS(SolverBase):
                                 ref,
                             )
                         continue
-                    if "native" in (method, plan.check):
-                        kern = getattr(self, "_row_build_native_kernel", None)
-                        if kern is None:
-                            kern = get_row_build_native_kernel()
-                            self._row_build_native_kernel = kern
-                        J_out = self.J_by_size[size]
-                        meta_out = [
-                            self.row_type,
-                            self.row_parent,
-                            self.row_mu,
-                            self.row_beta,
-                            self.row_cfm,
-                            self.phi,
-                            self.target_velocity,
-                            self.row_restitution,
-                        ]
-                        if check_rows:
-                            J_out = wp.clone(J_out)
-                            meta_out = [wp.clone(a) for a in meta_out]
-                        nblocks = min(int(contacts.rigid_contact_point0.shape[0]), 4 * _CONTACT_BUILD_THREAD_CAP)
-                        wp.launch_tiled(
-                            kern,
-                            dim=[nblocks],
-                            inputs=[
-                                nblocks,
-                                contacts.rigid_contact_count,
-                                contacts.rigid_contact_point0,
-                                contacts.rigid_contact_point1,
-                                contacts.rigid_contact_normal,
-                                contacts.rigid_contact_shape0,
-                                contacts.rigid_contact_shape1,
-                                contacts.rigid_contact_margin0,
-                                contacts.rigid_contact_margin1,
-                                self.contact_world,
-                                self.contact_slot,
-                                self.contact_art_a,
-                                self.contact_art_b,
-                                self.contact_path,
-                                size,
-                                self.articulation_response_dof_count,
-                                self.art_group_idx,
-                                self.articulation_dof_start,
-                                self.articulation_origin,
-                                self.body_response_dof_mask,
-                                state_aug.joint_S_s,
-                                model.shape_body,
-                                state_in.body_q,
-                                state_aug.body_v_s,
-                                self._prescribed_articulation,
-                                self.shape_material_mu,
-                                self.shape_material_restitution,
-                                enable_friction_flag,
-                                self.contact_friction_gap_threshold,
-                                int(self.contact_friction_shared_anchor),
-                                self.contact_friction_anchor_limit,
-                                1 if self.contact_friction_articulation_pairs_only else 0,
-                                is_free_rigid,
-                                self.contact_friction_scale,
-                                int(self.contact_shared_anchor),
-                                self.pgs_beta,
-                                self.pgs_cfm,
-                                J_out,
-                                *meta_out,
-                            ],
-                            outputs=[],
-                            block_dim=32,
-                            device=model.device,
-                        )
-                        if check_rows:
-                            self._rows_check = (size, J_out, meta_out)
-                        if method == "native":
-                            continue
-                    elif "masked" in (method, plan.check):
+                    if "masked" in (method, plan.check):
                         cap = int(contacts.rigid_contact_point0.shape[0])
                         pre = getattr(self, "_rows_prelude", None)
                         if pre is None or pre["flags"].shape[0] != cap:
@@ -16295,8 +16221,8 @@ class SolverFeatherPGS(SolverBase):
         """Whether the masked builder (FEATHER_PGS_ROWS_MASKED) may write this friction law's contact rows.
 
         Point friction may. Patch friction takes the masked builder's patch-law variants (row_build.py),
-        unless FEATHER_PGS_PATCH_DENSE_PATHS=0, a point-only row experiment (native or fused rows, or
-        their checks) is on, or the sweep builds its worlds' rows in-kernel: that defers the masked
+        unless FEATHER_PGS_PATCH_DENSE_PATHS=0, a point-only row experiment (fused rows, or the row
+        checks) is on, or the sweep builds its worlds' rows in-kernel: that defers the masked
         launches past the patch link, which must stay the last writer of ring parents and friction
         coefficients.
 
@@ -16308,7 +16234,7 @@ class SolverFeatherPGS(SolverBase):
             return True
         return bool(
             self._patch_dense_paths
-            and not (_ROWS_NATIVE or _ROWS_FUSED or _CHECK_ROWS or _CHECK_ROWS_FUSED)
+            and not (_ROWS_FUSED or _CHECK_ROWS or _CHECK_ROWS_FUSED)
             and self._world_rows_owned_le() == 0
         )
 

@@ -424,9 +424,6 @@ def _general_kernels(method, patch, source) -> tuple:
         if patch:
             return (source.contact_row_prelude_patch, source.populate_world_J_masked_patch)
         return (source.contact_row_prelude, source.populate_world_J_masked)
-    if method == "native":
-        # get_row_build_native_kernel builds a new kernel object per call; name it without one.
-        return ("populate_world_J_native",)
     if method == "fused_rows":
         return (source.build_contact_rows,)
     if method == "per_contact":
@@ -506,7 +503,7 @@ def _row_builder(solver, plan, size, source) -> dict:
 def _row_check(plan, source) -> dict | None:
     """Name, by DOF size, the builders the debug row checks launch besides builder_by_dof's.
 
-    FEATHER_PGS_CHECK_ROWS builds every size's native or masked rows into copies and compares them
+    FEATHER_PGS_CHECK_ROWS builds every size's masked rows into copies and compares them
     with the per-contact rows the solve uses. FEATHER_PGS_CHECK_ROWS_FUSED rebuilds the combined
     masked sizes' rows with the fused builder and compares them with the masked rows. None without
     a check (ContactRowPlan.check).

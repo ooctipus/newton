@@ -29,7 +29,6 @@ BUILDER_METHODS = (
     "per_contact",
     "masked",
     "masked_combined",
-    "native",
     "fused_rows",
 )
 
@@ -49,7 +48,7 @@ class ContactRowPlan:
     """General producer: the sizes whose rows one masked or fused launch builds, in ``size_groups`` order."""
     check: str | None = None
     """General producer, debug only: the builder a row check compares (``FEATHER_PGS_CHECK_ROWS``:
-    ``"native"`` or ``"masked"`` into copies, then the per-contact rows; ``FEATHER_PGS_CHECK_ROWS_FUSED``:
+    ``"masked"`` into copies, then the per-contact rows; ``FEATHER_PGS_CHECK_ROWS_FUSED``:
     ``"fused_rows"`` after the combined masked rows)."""
     metadata_launch: bool = False
     """Shared-metadata producers: a separate ``prepare_world_contact_rows`` launch writes the row metadata.
@@ -75,7 +74,7 @@ def contact_row_plan(solver) -> ContactRowPlan:
       for the free-body size, whose response the sparse kernel writes; ``sparse_diagonal`` for the
       diagonal-mass size; ``compact_jacobian`` for every other size.
     - ``general``: ``fused_rows`` or ``masked_combined`` (one launch for the one or two sizes of at
-      most 32 DOFs), ``native`` or ``masked`` (one launch per size), else ``per_contact``.
+      most 32 DOFs), ``masked`` (one launch per size), else ``per_contact``.
     """
     from . import solver_feather_pgs as source  # noqa: PLC0415 - the solver module's import-time switches
 
@@ -113,19 +112,19 @@ def contact_row_plan(solver) -> ContactRowPlan:
     check_rows = bool(solver._point_contact_paths and source._CHECK_ROWS)
     masked_law = solver._masked_contact_rows()
     masked_sizes = ()
-    if masked_law and source._ROWS_MASKED and not source._ROWS_NATIVE and not check_rows:
+    if masked_law and source._ROWS_MASKED and not check_rows:
         masked_sizes = tuple(size for size in sizes if size <= 32)
     combined = masked_sizes if 1 <= len(masked_sizes) <= 2 else ()
     methods = {}
     for size in sizes:
         if size in combined:
             methods[size] = "fused_rows" if source._ROWS_FUSED and not source._CHECK_ROWS_FUSED else "masked_combined"
-        elif masked_law and (source._ROWS_MASKED or source._ROWS_NATIVE) and size <= 32 and not check_rows:
-            methods[size] = "native" if source._ROWS_NATIVE else "masked"
+        elif masked_law and source._ROWS_MASKED and size <= 32 and not check_rows:
+            methods[size] = "masked"
         else:
             methods[size] = "per_contact"
     if check_rows:
-        check = "native" if source._ROWS_NATIVE else "masked"
+        check = "masked"
     elif combined and source._CHECK_ROWS_FUSED:
         check = "fused_rows"
     else:

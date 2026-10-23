@@ -199,7 +199,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
     def test_contact_writer_requests_do_not_block_sparse(self):
         """Allow general sparse producers to supersede optional canonical row writers."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        for option in ("ROWS_MASKED", "ROWS_NATIVE", "ROWS_FUSED"):
+        for option in ("ROWS_MASKED", "ROWS_FUSED"):
             with (
                 self.subTest(option=option),
                 mock.patch.dict(os.environ, {f"FEATHER_PGS_{option}": "1"}, clear=True),

@@ -97,7 +97,7 @@ FLAGS = declare(
         "FEATHER_PGS_CHECK_ROWS",
         "diagnostic",
         _SOLVER,
-        "=1 compares the native and masked contact-row builders.",
+        "=1 compares the masked contact-row builder with the per-contact builder.",
     ),
     _flag(
         "FEATHER_PGS_CHECK_ROWS_FUSED",
@@ -489,12 +489,6 @@ FLAGS = declare(
         "experiment",
         _SOLVER,
         "=1 builds contact rows with one thread per contact and DOF.",
-    ),
-    _flag(
-        "FEATHER_PGS_ROWS_NATIVE",
-        "experiment",
-        _SOLVER,
-        "=1 builds contact rows with one warp per contact.",
     ),
     _flag(
         "FEATHER_PGS_ROWS_THREADS_X",

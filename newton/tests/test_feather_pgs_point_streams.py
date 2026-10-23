@@ -736,9 +736,7 @@ def _keyed_row_calls():
 
 def _factory_kernels():
     """Kernels of the factories patch integration varies, built with point arguments."""
-    from newton._src.solvers.feather_pgs.row_build_native import get_row_build_native_kernel  # noqa: PLC0415
-
-    kernels = {"row_build_native.get_row_build_native_kernel()": get_row_build_native_kernel()}
+    kernels = {}
     for name, factory, args, kwargs in itertools.chain(
         _sparse_sweep_calls(),
         _accumulated_sparse_calls(),
