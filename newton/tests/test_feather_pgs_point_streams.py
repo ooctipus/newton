@@ -518,28 +518,24 @@ def _solver_factory_calls():
     factory = solver._get_pgs_solve_mf_kernel.__wrapped__
     for kwargs in ({}, {"has_velocity_limit_rows": True}):
         yield name + "_get_pgs_solve_mf_kernel", factory, (32, 8, _ARCH), kwargs
-    # Parallel tiers: one articulation per world with in-kernel response and world rows,
-    # and the response-block variants without them.
-    for tier, matrix_free, inkernel, world_rows in itertools.product(
-        ((32, 0), (48, 32)), (False, True), ((18, 0, 0, 0), None), (False, True)
-    ):
-        if world_rows and inkernel is None:
-            continue
+
+    def tier_without_world_rows(*args, world_rows, **kwargs):
+        # These pins were recorded with world_rows=False in their labels, before the in-sweep world rows went.
+        return solver._get_pgs_solve_parallel_kernel(*args, **kwargs)
+
+    # Parallel tiers: one articulation per world with in-kernel response, and the response-block variants
+    # without it.
+    for tier, matrix_free, inkernel in itertools.product(((32, 0), (48, 32)), (False, True), ((18, 0, 0, 0), None)):
         kwargs = {
             "rows": tier[0],
             "min_rows": tier[1],
             "sweeps": 24,
             "matrix_free": matrix_free,
             "inkernel_response": inkernel,
-            "world_rows": world_rows,
+            "world_rows": False,
             "exact_row_sums": matrix_free,
         }
-        yield (
-            name + "_get_pgs_solve_parallel_kernel",
-            solver._get_pgs_solve_parallel_kernel,
-            (64, 32, 18, _ARCH),
-            kwargs,
-        )
+        yield (name + "_get_pgs_solve_parallel_kernel", tier_without_world_rows, (64, 32, 18, _ARCH), kwargs)
     for label, args, kwargs in _linked_tier_calls():
         yield label, solver._get_pgs_solve_parallel_kernel, args, kwargs
     # Point tiers with the isotropic pair step of the linked tiers (FEATHER_PGS_POINT_PAIR_STEP=isotropic).

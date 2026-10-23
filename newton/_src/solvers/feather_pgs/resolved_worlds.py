@@ -710,9 +710,6 @@ def supported(solver) -> bool:
         return False
     if not solver.model.device.is_cuda or (getattr(solver, "max_world_dofs", 33) or 33) > 32:
         return False
-    owner = getattr(solver, "_world_rows_owned_le", None)
-    if owner is None or owner() != 0:
-        return False
     required = (
         "world_dof_indices",
         "world_dof_count",

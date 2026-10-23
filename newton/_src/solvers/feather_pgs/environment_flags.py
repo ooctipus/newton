@@ -425,12 +425,6 @@ FLAGS = declare(
         "unless FEATHER_PGS_SCALAR_BRANCHES=0.",
     ),
     _flag(
-        "FEATHER_PGS_REGISTER_WHITENING",
-        "experiment",
-        _SOLVER,
-        "=1 enables register whitening for supported matrix-free world-row layouts.",
-    ),
-    _flag(
         "FEATHER_PGS_RESOLVED_WORLDS",
         "policy",
         ("resolved_worlds",),
@@ -473,18 +467,6 @@ FLAGS = declare(
         "=0 keeps a diagonal-mass group of world-fixed roots over one-coordinate leaves out of the held-tree "
         "owner's scalar branches, which run it, own the other articulations of its worlds and supersede the "
         "prismatic opt-ins there (default on).",
-    ),
-    _flag(
-        "FEATHER_PGS_SHADOW_LEAN",
-        "diagnostic",
-        _SOLVER,
-        "=1 launches a lean timing twin of each parallel tier into scratch (timing bound, wrong physics).",
-    ),
-    _flag(
-        "FEATHER_PGS_SHADOW_VARIANT",
-        "diagnostic",
-        _SOLVER,
-        "Timing twin variant: lean (default) or finger.",
     ),
     _flag(
         "FEATHER_PGS_SIMPLE_WORLD_ZERO",
@@ -685,33 +667,15 @@ FLAGS = declare(
     ),
     _flag(
         "FEATHER_PGS_WORLD_ROWS",
-        "experiment",
-        _SOLVER,
-        "=1 builds contact rows inside the in-kernel-response sweep; requires INK.",
-    ),
-    _flag(
-        "FEATHER_PGS_WORLD_ROWS_CHECK",
-        "diagnostic",
-        _SOLVER,
-        "=1 compares in-kernel world rows with the materialized rows.",
+        "retired",
+        ("environment_flags",),
+        "Retired in-sweep world rows, which keyed rows always declined where recipes set it; ignored.",
     ),
     _flag(
         "FEATHER_PGS_WORLD_SCAN_PUBLICATION",
         "retired",
         ("environment_flags",),
         "Retired world-scan publication of a removed robot-specific owner; ignored.",
-    ),
-    _flag(
-        "FEATHER_PGS_WR_STOP",
-        "diagnostic",
-        _SOLVER,
-        "Debug timing: the world-rows kernel returns after phase N (default 0, full kernel).",
-    ),
-    _flag(
-        "FEATHER_PGS_WR_WARM",
-        "experiment",
-        _SOLVER,
-        "=1 warm-starts in-kernel world rows from a per-world contact table.",
     ),
     _flag(
         "IL_NEWTON_FPGS_MF_WARMSTART",
@@ -730,11 +694,12 @@ FLAGS = declare(
 
 # Retired names that Isaac Lab's benchmark recipes still set: the packed
 # sparse-factor route's selectors (480f0f44), the chain-scan and keyed-row
-# aliases (d35949d6), and the selectors of removed research owners and of the
-# branch-Jacobi sweep (790f9782, aa2f332b). Nothing in Newton or Isaac Lab reads
-# them, and recipes are not Newton's to edit, so they are ignored rather than
-# rejected: the general route runs, the construction record lists them as retired
-# and the solver warns once per process.
+# aliases (d35949d6), the selectors of removed research owners and of the
+# branch-Jacobi sweep (790f9782, aa2f332b), and the in-sweep world rows'
+# selector, which keyed rows declined wherever a recipe set it. Nothing in
+# Newton or Isaac Lab reads them, and recipes are not Newton's to edit, so they
+# are ignored rather than rejected: the general route runs, the construction
+# record lists them as retired and the solver warns once per process.
 IGNORED_RETIRED = frozenset(
     (
         "FEATHER_PGS_ALLEGRO_KINETIC_ROWS",
@@ -755,6 +720,7 @@ IGNORED_RETIRED = frozenset(
         "FEATHER_PGS_SPARSE_METRIC_TANGENTS",
         "FEATHER_PGS_SPARSE_PARALLEL_LIMITS",
         "FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS",
+        "FEATHER_PGS_WORLD_ROWS",
         "FEATHER_PGS_WORLD_SCAN_PUBLICATION",
     )
 )

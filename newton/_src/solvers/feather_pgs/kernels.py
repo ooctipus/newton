@@ -11902,29 +11902,6 @@ def apply_mf_warmstart_impulses(
 
 
 @wp.kernel
-def build_world_contact_lists(
-    contact_count: wp.array[int],
-    total_threads: int,
-    contact_world: wp.array[int],
-    contact_slot: wp.array[int],
-    contact_path: wp.array[int],
-    max_per_world: int,
-    # outputs
-    world_contacts: wp.array2d[int],
-    world_contact_counts: wp.array[int],
-):
-    """Append every dense-routed contact to its world's list so one block can own a world end to end."""
-    total = wp.min(contact_count[0], contact_slot.shape[0])
-    for c in range(wp.tid(), total, total_threads):
-        if contact_path[c] != 0 or contact_slot[c] < 0:
-            continue
-        w = contact_world[c]
-        idx = wp.atomic_add(world_contact_counts, w, 1)
-        if idx < max_per_world:
-            world_contacts[w, idx] = c
-
-
-@wp.kernel
 def classify_parallel_sweep_tiers(
     world_constraint_count: wp.array[int],
     mf_constraint_count: wp.array[int],

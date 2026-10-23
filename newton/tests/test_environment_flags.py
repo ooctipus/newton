@@ -58,6 +58,7 @@ _RETIRED_IGNORED = [
     "FEATHER_PGS_SPARSE_METRIC_TANGENTS",
     "FEATHER_PGS_SPARSE_PARALLEL_LIMITS",
     "FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS",
+    "FEATHER_PGS_WORLD_ROWS",
     "FEATHER_PGS_WORLD_SCAN_PUBLICATION",
 ]
 # The recipe variables that the first construction record (64d35720) listed as unknown: read nowhere

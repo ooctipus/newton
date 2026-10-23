@@ -157,7 +157,6 @@ def _plan_stand_in(law, sizes=(108, 6), **attributes):
         "_friction_anchors_enabled": law == "patch",
         "_point_contact_paths": law == "point",
         "_patch_dense_paths": law == "patch",
-        "_world_rows_owned_le": lambda: 0,
         "size_groups": list(sizes),
         "_row_packets": None,
         "_keyed_rows": None,

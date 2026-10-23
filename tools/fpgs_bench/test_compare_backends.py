@@ -1022,7 +1022,7 @@ class TestCompleteDriver(unittest.TestCase):
                     "--task",
                     "anymald",
                     "--fpgs-env",
-                    "0:FEATHER_PGS_REGISTER_WHITENING=1",
+                    "0:FEATHER_PGS_MF_EXACT_ROWSUM=1",
                 ]
             ),
             0,
@@ -1057,7 +1057,7 @@ class TestCompleteDriver(unittest.TestCase):
                 self.assertNotIn("--solver-attr", command)
             else:
                 self.assertEqual(
-                    env.get("FEATHER_PGS_REGISTER_WHITENING"),
+                    env.get("FEATHER_PGS_MF_EXACT_ROWSUM"),
                     "1" if env["GPU"] == "GPU-0" else None,
                 )
                 grouped_ant = command[4] == "Isaac-Ant" and "ant" in driver.GROUPED_SPARSE_TASKS

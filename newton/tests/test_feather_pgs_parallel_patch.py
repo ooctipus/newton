@@ -609,7 +609,7 @@ def _without_isotropic_step(text):
 
 class TestParallelPatchReference(unittest.TestCase):
     def test_linked_factory_pools_only_the_friction_disk(self):
-        """Build linked tiers as the point tiers with the golden ring walk and isotropic step; refuse world rows."""
+        """Build linked tiers as the point tiers with the golden ring walk and isotropic step."""
         for rows, min_rows, matrix_free, inkernel in itertools.product(
             (32, 64), (0,), (False, True), (None, (6, 0, 0, 0))
         ):
@@ -646,19 +646,6 @@ class TestParallelPatchReference(unittest.TestCase):
                 )
                 self.assertEqual(per_row.key, point.key + "_linked")
                 self.assertEqual(per_row._fpgs_row_native_source, _without_isotropic_step(linked_source))
-        with self.assertRaisesRegex(ValueError, "linked_rows"):
-            source._get_pgs_solve_parallel_kernel(
-                _CAPACITY,
-                32,
-                _DOFS,
-                "120",
-                rows=32,
-                sweeps=4,
-                matrix_free=True,
-                inkernel_response=(6, 0, 0, 0),
-                world_rows=True,
-                linked_rows=True,
-            )
 
     def test_reference_holds_pooled_cones_and_restores_point_rings(self):
         """Keep each pair inside its pooled ring disk, and reduce to point friction without ring links."""
@@ -1254,23 +1241,6 @@ class TestPatchParallelAdmission(unittest.TestCase):
             with self.subTest(family="incremental", law=law):
                 tiers = path_selection._tiers(probe)
                 self.assertEqual((tiers["family"], tiers["velocity_limit_law"]), ("incremental", law))
-
-    def test_in_sweep_world_rows_serve_point_friction_only(self):
-        """Build contact rows inside the sweep only under point friction, the law that builder writes.
-
-        The builder runs after the patch link and writes parents -1 and undivided
-        coefficients, so patch friction keeps the rows its producers linked.
-        """
-        for point, keyed, inkernel, switch in itertools.product((False, True), repeat=4):
-            probe = SimpleNamespace(
-                _point_contact_paths=point,
-                _keyed_rows=object() if keyed else None,
-                _ink_sizes=(18, 0, 0, 0) if inkernel else None,
-            )
-            with self.subTest(point=point, keyed=keyed, inkernel=inkernel, switch=switch):
-                with patch.object(source, "_WR_ON", switch):
-                    admitted = SolverFeatherPGS._admit_world_rows(probe)
-                self.assertEqual(admitted, point and not keyed and inkernel and switch)
 
 
 _SWEEPS_FLAG = "FEATHER_PGS_PATCH_PARALLEL_SWEEPS"
@@ -2075,30 +2045,6 @@ class TestPatchParallelRoutes(unittest.TestCase):
                 state, _ = _rollout(model, solver, 2)
                 for name in _STATE_FIELDS:
                     self.assertTrue(np.isfinite(getattr(state, name).numpy()).all(), name)
-
-    def test_in_sweep_world_rows_stay_point_only(self):
-        """Own no in-sweep world rows under patch friction with INK and WORLD_ROWS and keyed rows declined."""
-        model = standing_model()
-        built = {}
-        with (
-            patch.object(source, "_INK_ON", True),
-            patch.object(source, "_WR_ON", True),
-            patch.dict(os.environ, {"FEATHER_PGS_KEYED_ROWS": "0", _SWITCH: "1"}),
-        ):
-            for beta in (0.0, 0.2):
-                built[beta] = _matrix_free_solver(model, beta=beta, parallel_rows=32)
-        point, patch_friction = built[0.0], built[0.2]
-        for solver in (point, patch_friction):
-            self.assertIsNone(solver._keyed_rows)
-            self.assertIsNotNone(solver._ink_sizes)
-            self.assertEqual(solver._ink_rows, 32)
-        self.assertTrue(point._world_rows)
-        self.assertEqual(point._world_rows_owned_le(), 32)
-        self.assertFalse(patch_friction._world_rows)
-        self.assertEqual(patch_friction._world_rows_owned_le(), 0)
-        for kernel in patch_friction._pgs_solve_mf_gs_incremental_kernels:
-            self.assertFalse(kernel._fpgs_world_rows)
-            self.assertTrue(kernel.key.endswith("_linked_iso"))
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "Parallel matrix-free tiers require CUDA")

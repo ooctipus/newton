@@ -431,10 +431,9 @@ def _row_builder(solver, plan, size, source) -> dict:
     finish_rows, and KeyedRows.produce_contacts and finish_rows. A launch shared by several sizes
     (the row metadata, a combined masked launch, a producer's contact kernel) is named under each
     of them. Rows built elsewhere are not named: keyed rows' direct rows, which the parallel tiers
-    build in the sweep (``direct_rows`` points to routes.sweep.tiers), the in-sweep world rows of
-    the FEATHER_PGS_WORLD_ROWS experiment, and the free-body matrix-free and propagation rows, which
-    build_mf_contact_rows and build_propagation_contact_rows write for the contacts the allocation
-    routes to them (routes.free_rigid_bodies). _row_check names the debug row checks' builders.
+    build in the sweep (``direct_rows`` points to routes.sweep.tiers), and the free-body matrix-free
+    and propagation rows, which build_mf_contact_rows and build_propagation_contact_rows write for
+    the contacts the allocation routes to them (routes.free_rigid_bodies). _row_check names the debug row checks' builders.
     """
     method, law = plan.methods[size], plan.law
     patch = law == "patch"

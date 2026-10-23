@@ -145,12 +145,9 @@ def factory_calls():
     hold the suite's shapes); the fallback and linked parallel tiers of a
     second keyed-row coordinate layout (one articulation, no secondary block),
     the Cholesky factor families with the held trees' geometric refreshes
-    (:func:`held_factor_calls`), the revolute propagation trees and the opt-in
-    register-whitening parallel tiers follow. Calls a factory rejects are
-    recorded as rejected.
+    (:func:`held_factor_calls`) and the revolute propagation trees follow.
+    Calls a factory rejects are recorded as rejected.
     """
-    from unittest.mock import patch  # noqa: PLC0415
-
     from newton._src.solvers.feather_pgs import keyed_rows, small_cholesky  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
@@ -227,23 +224,6 @@ def factory_calls():
     ):
         kwargs = {"has_free_root": True} if free_root else {}
         yield name + factory, _unwrapped(getattr(solver, factory)), (size, ARCH), kwargs
-
-    def whitened(*args, **kwargs):
-        with patch.object(solver, "_REGISTER_WHITENING", True):
-            return solver._get_pgs_solve_parallel_kernel(*args, **kwargs)
-
-    # FEATHER_PGS_REGISTER_WHITENING=1 on the parallel tiers the pins hold opted out, at each measured layout.
-    for arch, (rows, min_rows) in itertools.product(("120", "103"), ((32, 0), (48, 32))):
-        kwargs = {
-            "rows": rows,
-            "min_rows": min_rows,
-            "sweeps": 24,
-            "matrix_free": True,
-            "inkernel_response": (18, 0, 0, 0),
-            "world_rows": True,
-            "exact_row_sums": True,
-        }
-        yield name + "_get_pgs_solve_parallel_kernel[register_whitening]", whitened, (64, 32, 18, arch), kwargs
 
 
 def held_factor_calls():
@@ -599,9 +579,6 @@ def census_calls():
                 _axis("skip_local_internal_worlds"),
                 _axis("inkernel_response", (None, (18, 0, 0, 0))),
                 _axis("exact_row_sums"),
-                _axis("world_rows"),
-                _axis("lean_sweep"),
-                _axis("bound_finger"),
                 _axis("linked_rows"),
             ),
         ),
