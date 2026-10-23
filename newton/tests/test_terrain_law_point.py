@@ -27,7 +27,6 @@ import unittest
 import numpy as np
 import warp as wp
 
-import newton
 from newton._src.geometry import terrain_law_point
 from newton._src.geometry.terrain_contacts import TERRAIN_LANE_THREAD, TERRAIN_LANE_TILE, TERRAIN_PARTNER_POINT
 from newton._src.geometry.terrain_law import (
@@ -118,7 +117,8 @@ LYING = _axis_angle((0.0, 1.0, 0.0), np.pi / 2.0)
 
 
 def _collide(model, *, shadow: bool):
-    pipeline = tu.shadow_pipeline(model, **PIPELINE) if shadow else newton.CollisionPipeline(model, **PIPELINE)
+    """Collide once with the point class in shadow, or on today's terrain route alone (``NEWTON_TERRAIN_LAW=none``)."""
+    pipeline = tu.shadow_pipeline(model, **PIPELINE) if shadow else tu.terrain_route_pipeline(model, **PIPELINE)
     contacts = pipeline.contacts()
     state = model.state()
     pipeline.collide(state, contacts)

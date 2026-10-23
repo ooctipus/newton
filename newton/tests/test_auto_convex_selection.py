@@ -30,6 +30,8 @@ _TERRAIN_ENVIRONMENT = {
     "NEWTON_HEIGHTFIELD_GEOMETRIC_CULL": "0",
     "NEWTON_HEIGHTFIELD_PAIR_CSR": "0",
     "NEWTON_REDUCER_EXPORT_CLEANUP": "0",
+    # The hull routes are the terrain route's: keep it for every heightfield pair (the terrain law's opt-out).
+    "NEWTON_TERRAIN_LAW": "none",
 }
 
 

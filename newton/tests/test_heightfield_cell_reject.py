@@ -25,6 +25,9 @@ from newton._src.utils.heightfield import (
     heightfield_vs_convex_midphase,
 )
 
+TERRAIN_ROUTE = {"NEWTON_TERRAIN_LAW": "none"}
+"""Cell rejection is the terrain route's: keep the route for every heightfield pair (the terrain law's opt-out)."""
+
 
 def _create_heightfield_midphase(*, upstream_default):
     """Exercise the upstream call contract or an unculled reference at the launch boundary."""
@@ -171,6 +174,7 @@ def _collide(
     ``launches`` collects the ``(kernel key, dim)`` of every midphase launch.
     """
     reference = {"NEWTON_HEIGHTFIELD_CELL_REJECT": "0"} if legacy or midphase is not None else {}
+    reference.update(TERRAIN_ROUTE)
     if lanes is not None:
         reference["NEWTON_HEIGHTFIELD_LANE_MIDPHASE"] = str(int(lanes))
     with patch.dict(os.environ, reference):
@@ -281,7 +285,7 @@ def make_model(
 
 def collide(model, enabled, *, reduce_contacts=False, speculative=False):
     """Run the complete collision pipeline with one constructor flag."""
-    with patch.dict(os.environ, {"NEWTON_HEIGHTFIELD_CELL_REJECT": str(int(enabled))}):
+    with patch.dict(os.environ, {"NEWTON_HEIGHTFIELD_CELL_REJECT": str(int(enabled)), **TERRAIN_ROUTE}):
         pipeline = newton.CollisionPipeline(
             model,
             reduce_contacts=reduce_contacts,
@@ -545,9 +549,10 @@ class TestHeightfieldCellReject(unittest.TestCase):
     def test_replay_height_withdrawal_and_regrowth(self):
         """Refresh live heights in one pipeline through captured withdrawal and regrowth."""
         model = _model(device=self.device, z=0.2)
-        pipeline = newton.CollisionPipeline(
-            model, reduce_contacts=False, rigid_contact_max=2048, max_triangle_pairs=4096
-        )
+        with patch.dict(os.environ, TERRAIN_ROUTE):
+            pipeline = newton.CollisionPipeline(
+                model, reduce_contacts=False, rigid_contact_max=2048, max_triangle_pairs=4096
+            )
         contacts = pipeline.contacts()
         state = model.state()
         pipeline.collide(state, contacts)

@@ -4,6 +4,7 @@
 import contextlib
 import ctypes
 import gc
+import os
 import unittest
 import warnings
 from collections import Counter
@@ -3137,6 +3138,11 @@ def test_convex_convex_with_sdf_routes_to_sdf_contact(test, device):
 
 
 def test_heightfield_convex_midphase_queries_margin_shell_at_lateral_edge(test, device):
+    """Query the margin shell at a heightfield's lateral edge in the terrain route's convex midphase.
+
+    The terrain route (``NEWTON_TERRAIN_LAW=none``) gives the sphere beside the border a lateral contact; the terrain
+    law, the default, has no border features (``test_heightfield_border_penetration_gets_a_contact_by_default``).
+    """
     margin = 0.02
     gap = 0.005
     radius = 0.1
@@ -3167,7 +3173,8 @@ def test_heightfield_convex_midphase_queries_margin_shell_at_lateral_edge(test, 
     state = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
 
-    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+    with mock.patch.dict(os.environ, {"NEWTON_TERRAIN_LAW": "none"}):
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
     contacts = pipeline.contacts()
     pipeline.collide(state, contacts)
 

@@ -55,11 +55,12 @@ def _hull_box_capsule_model():
 
 
 def _contacts_by_shape(model, labels, convex_collision, environment):
-    """Collide once from Newton's defaults plus ``environment``; return each shape's sorted contact points and normals."""
+    """Collide once on the terrain route (``NEWTON_TERRAIN_LAW=none``, else Newton's defaults) plus ``environment``;
+    return each shape's sorted contact points and normals."""
     with patch.dict(os.environ):
         for name in [name for name in os.environ if name.startswith("NEWTON_")]:
             del os.environ[name]
-        os.environ.update(environment)
+        os.environ.update({"NEWTON_TERRAIN_LAW": "none", **environment})
         collider = newton.CollisionPipeline(
             model, rigid_contact_max=4096, max_triangle_pairs=16384, convex_collision=convex_collision
         )

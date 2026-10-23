@@ -57,6 +57,8 @@ def pipeline(model, route, lanes, *, max_triangle_pairs=1 << 16, rigid_contact_m
         "NEWTON_HEIGHTFIELD_PAIR_CSR": "0",
         **ROUTES[route],
         "NEWTON_HEIGHTFIELD_LANE_MIDPHASE": str(int(lanes)),
+        # The lane midphase is the terrain route's: keep the route for every heightfield pair.
+        "NEWTON_TERRAIN_LAW": "none",
     }
     with patch.dict(os.environ, flags):
         owner = newton.CollisionPipeline(

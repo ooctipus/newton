@@ -19,7 +19,12 @@ from newton._src.utils.heightfield import HeightfieldData
 from newton.tests.test_heightfield_cell_reject import make_model
 from newton.tests.test_heightfield_packed_pairs import logical
 
-FLAGS = {"NEWTON_HEIGHTFIELD_CELL_REJECT": "1", "NEWTON_HEIGHTFIELD_FINITE_QUERY": "1"}
+FLAGS = {
+    "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
+    "NEWTON_HEIGHTFIELD_FINITE_QUERY": "1",
+    # The cull is the terrain route's: keep the route for every heightfield pair.
+    "NEWTON_TERRAIN_LAW": "none",
+}
 
 
 def pipeline(model, enabled, **kwargs):

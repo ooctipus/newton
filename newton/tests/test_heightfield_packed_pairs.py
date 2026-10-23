@@ -19,7 +19,8 @@ from newton.tests.test_heightfield_cell_reject import make_model
 def create_pipeline(model, packed):
     """Select only the independent-pair mapping, preserving current geometry.
 
-    The one-pass midphase is pinned: these tests inspect its dispatch and inputs.
+    The one-pass midphase is pinned: these tests inspect its dispatch and inputs. It is the terrain route's, which
+    keeps every heightfield pair (``NEWTON_TERRAIN_LAW=none``).
     """
     with patch.dict(
         os.environ,
@@ -27,6 +28,7 @@ def create_pipeline(model, packed):
             "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
             "NEWTON_NARROW_PHASE_PACKED_HEIGHTFIELD_PAIRS": str(int(packed)),
             "NEWTON_HEIGHTFIELD_LANE_MIDPHASE": "0",
+            "NEWTON_TERRAIN_LAW": "none",
         },
     ):
         return newton.CollisionPipeline(model, reduce_contacts=True, rigid_contact_max=128, max_triangle_pairs=128)

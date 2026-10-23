@@ -442,6 +442,19 @@ def shadow_pipeline(model, *, classes: str = "point", rule_x: bool = True, **kwa
         return newton.CollisionPipeline(model, **kwargs)
 
 
+def terrain_route_pipeline(model, **kwargs):
+    """A collision pipeline whose terrain route writes every heightfield contact, today's route without the law
+    (``NEWTON_TERRAIN_LAW=none``, the law's temporary opt-out, and no shadow), for comparisons with the law (keyword
+    arguments pass through)."""
+    import os  # noqa: PLC0415
+    from unittest.mock import patch  # noqa: PLC0415
+
+    environ = {k: v for k, v in os.environ.items() if k != "NEWTON_TERRAIN_LAW_SHADOW"}
+    environ["NEWTON_TERRAIN_LAW"] = "none"
+    with patch.dict(os.environ, environ, clear=True):
+        return newton.CollisionPipeline(model, **kwargs)
+
+
 def shadow_rows(pipeline) -> dict[int, list]:
     """The law's shadow rows of the last collide per partner shape: ``[(q, n, d, feature)]``, world frame, float64."""
     rows = pipeline._terrain_law_shadow.rows()

@@ -51,6 +51,8 @@ _TERRAIN_FLAGS = {
     "NEWTON_HEIGHTFIELD_GEOMETRIC_CULL": "1",
     "NEWTON_HEIGHTFIELD_FINITE_QUERY": "0",
     "NEWTON_HEIGHTFIELD_PAIR_CSR": "0",
+    # The recorded terrain outputs are the terrain route's: keep it for every heightfield pair.
+    "NEWTON_TERRAIN_LAW": "none",
 }
 _CONTACT_ARRAYS = (
     "rigid_contact_shape0",
@@ -465,6 +467,7 @@ class TestContactReductionReference(unittest.TestCase):
             "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
             "NEWTON_HEIGHTFIELD_FINITE_QUERY": "1",
             "NEWTON_HEIGHTFIELD_GEOMETRIC_CULL": "1",
+            "NEWTON_TERRAIN_LAW": "none",
         }
         out = {}
         pipeline = _run_passes(self, out, "pair_csr", model, flags, rigid_contact_max=128, max_triangle_pairs=256)

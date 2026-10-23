@@ -123,13 +123,13 @@ LYING = _axis_angle((0.0, 1.0, 0.0), np.pi / 2.0)
 
 def _collide(model, *, shadow: bool, rule_x: bool = True, **kwargs):
     """Collide once on today's route as the suite runs it (:data:`SUITE_ROUTE`), with every class in shadow (rule X
-    run or not) or none."""
+    run or not) or none (``NEWTON_TERRAIN_LAW=none``: the terrain route writes every heightfield contact)."""
     options = dict(PIPELINE, **kwargs)
     with patch.dict(os.environ, SUITE_ROUTE):
         if shadow:
             pipeline = tu.shadow_pipeline(model, classes="all", rule_x=rule_x, **options)
         else:
-            pipeline = newton.CollisionPipeline(model, **options)
+            pipeline = tu.terrain_route_pipeline(model, **options)
     contacts = pipeline.contacts()
     state = model.state()
     pipeline.collide(state, contacts)
@@ -2513,9 +2513,7 @@ def test_shadow_keeps_contacts_bitwise_with_every_class(test, device):
 
     for name, route in (("default", {}), ("suite", SUITE_ROUTE)):
         with test.subTest(route=name), patch.dict(os.environ, route):
-            unset = {k: v for k, v in os.environ.items() if k != "NEWTON_TERRAIN_LAW_SHADOW"}
-            with patch.dict(os.environ, unset, clear=True):
-                today = newton.CollisionPipeline(model, **PIPELINE)
+            today = tu.terrain_route_pipeline(model, **PIPELINE)
             shadow = tu.shadow_pipeline(model, classes="all", **PIPELINE)
             state = model.state()
             contacts = []

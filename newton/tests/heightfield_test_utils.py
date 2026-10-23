@@ -201,6 +201,8 @@ def build_scene(case, enabled, device, *, reduce=True, make_solver=True, hull_sc
         {
             "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
             "NEWTON_HEIGHTFIELD_FINITE_QUERY": str(int(enabled)),
+            # The finite owner is the terrain route's: keep the route for every heightfield pair.
+            "NEWTON_TERRAIN_LAW": "none",
         },
     ):
         pipeline = newton.CollisionPipeline(

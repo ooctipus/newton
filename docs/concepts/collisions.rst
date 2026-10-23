@@ -268,16 +268,23 @@ average or a per-pair limit.
      - ``V_mesh``
      - About 40
      - At most one candidate per mesh vertex.
+   * - Heightfield--sphere, capsule, box, cylinder, cone, ellipsoid or convex hull (terrain law, default)
+     - One per support
+     - One per support
+     - About 40
+     - One contact per support of the terrain (face, edge or vertex) within reach; see the heightfield note below.
    * - Mesh/heightfield--sphere or ellipsoid
      - 240
      - ``T_overlap``
      - About 40
-     - At most one contact per overlapping triangle.
+     - At most one contact per overlapping triangle. Heightfields take this route only where the terrain law does
+       not write their contacts.
    * - Mesh/heightfield--other primitive or convex hull
      - 240
      - ``5 * T_overlap``
      - About 40
-     - Each overlapping triangle uses the convex manifold path.
+     - Each overlapping triangle uses the convex manifold path. Heightfields take this route only where the terrain
+       law does not write their contacts.
    * - Mesh--mesh
      - 240
      - ``E_A + E_B``
@@ -1020,11 +1027,26 @@ often be improved by attaching a precomputed SDF to the mesh (``mesh.build_sdf(.
 
 .. note::
    **Heightfield representation:** A heightfield (``HFIELD``) stores a regular 2D grid
-   of elevation samples. For rigid contacts, Newton uses dedicated heightfield
-   narrow-phase routes: heightfield-vs-convex uses per-cell triangle GJK/MPR, while
-   mesh-vs-heightfield routes through the mesh/SDF path with on-the-fly triangle
-   extraction from the grid. For soft contacts, the collision pipeline automatically
-   samples the heightfield signed distance and normal.
+   of elevation samples. For rigid contacts with spheres, capsules, boxes, cylinders,
+   cones, ellipsoids and convex hulls, the collision pipeline's terrain law writes the
+   contacts by default: after the narrow phase it walks each pair's window of the grid
+   and writes one contact per support it finds there, a terrain face, edge or vertex
+   within reach, so that supports on edges and creases are kept and no pair that
+   penetrates the terrain over its footprint is left without a contact. The law has no
+   border features yet: a body hanging over the heightfield's border gets contacts only
+   where its deepest points lie over the footprint, and a body beside the border's edge
+   gets none. Mesh-vs-heightfield routes through
+   the mesh/SDF path with on-the-fly triangle extraction from the grid. Other partners
+   (planes, barrel cylinders) and the configurations the law does not support yet
+   (speculative contacts, the ``NEWTON_TERRAIN_LAW_SHADOW`` comparison mode, a prebuilt
+   narrow phase with its own contact writer) take the terrain route: per-cell triangle
+   GJK/MPR with contact reduction. ``get_collision_selection()["heightfield"]["law"]``
+   records whether the law writes and why. Set ``NEWTON_TERRAIN_LAW=none`` before
+   constructing the pipeline to keep the terrain route for every heightfield pair; this
+   opt-out is temporary and goes away with the terrain route. The law builds its terrain
+   features from the heights at construction: rebuild the collision pipeline after
+   editing :attr:`~Model.heightfield_elevations` in place. For soft contacts, the
+   collision pipeline automatically samples the heightfield signed distance and normal.
 
 .. note::
    **SDF** in this table refers to shapes with precomputed SDF data. There is no

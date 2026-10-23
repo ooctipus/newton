@@ -4351,9 +4351,10 @@ class NarrowPhase:
         solid class's job lists or candidate pool had no room for a pair's
         work, see ``NEWTON_TERRAIN_LAW_SHADOW_JOBS``: the pair's rows are
         unchanged, taken by a slower path) are set by the terrain law's
-        kernels, which run in shadow beside the terrain route
-        (``NEWTON_TERRAIN_LAW_SHADOW``) or write their partners' contacts
-        (``NEWTON_TERRAIN_LAW``; the ``contacts`` bit then also covers them).
+        kernels, which write their partners' heightfield contacts (by
+        default, see ``NEWTON_TERRAIN_LAW``; the ``contacts`` bit then also
+        covers them) or run in shadow beside the terrain route
+        (``NEWTON_TERRAIN_LAW_SHADOW``).
         """
         if not self.verify_buffers:
             raise RuntimeError("Narrow-phase capacity status requires verify_buffers=True throughout the run")

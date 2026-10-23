@@ -25,6 +25,8 @@ FLAGS = {
     # This module checks the typed GJK/MPR queries against the generic one; the
     # closed-form rows have their own tests (test_heightfield_*_contact).
     "NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES": "0",
+    # Both are terrain-route queries: keep the route for every heightfield pair.
+    "NEWTON_TERRAIN_LAW": "none",
 }
 
 

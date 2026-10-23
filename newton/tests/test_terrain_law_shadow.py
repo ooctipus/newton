@@ -4,7 +4,8 @@
 """Check the terrain law's shadow route: the flag, the side buffer, the pair policy, capture and today's contacts.
 
 ``NEWTON_TERRAIN_LAW_SHADOW`` lists partner classes whose terrain-law kernels run after the narrow phase into a
-side buffer that nothing reads. With it set, today's contacts must stay bit for bit what they are without it; the
+side buffer that nothing reads, while the terrain route writes every heightfield contact (comparison mode). With it set,
+today's contacts must stay bit for bit what the terrain route writes without it (``NEWTON_TERRAIN_LAW=none``); the
 shadow must follow the pipeline's pair policy, run inside CUDA graph capture, give stale features no row and raise
 ``terrain_stale``, keep every support of a pair however many it has, and raise ``terrain_rows`` only when the side
 buffer's spill region, sized at the scene level (``NEWTON_TERRAIN_LAW_SHADOW_ROWS``), has no room for them.
@@ -124,8 +125,8 @@ def _contact_arrays(contacts) -> dict:
 
 
 def _unset():
-    """An environment without NEWTON_TERRAIN_LAW_SHADOW."""
-    environ = {k: v for k, v in os.environ.items() if k != "NEWTON_TERRAIN_LAW_SHADOW"}
+    """An environment without NEWTON_TERRAIN_LAW_SHADOW or NEWTON_TERRAIN_LAW: the default, where the law writes."""
+    environ = {k: v for k, v in os.environ.items() if k not in ("NEWTON_TERRAIN_LAW_SHADOW", "NEWTON_TERRAIN_LAW")}
     return patch.dict(os.environ, environ, clear=True)
 
 
@@ -139,8 +140,7 @@ def test_shadow_keeps_contacts_bitwise(test, device):
     state = model.state()
     for deterministic in (False, True) if device.is_cpu else (True,):
         with test.subTest(deterministic=deterministic):
-            with _unset():
-                today = newton.CollisionPipeline(model, deterministic=deterministic, **PIPELINE)
+            today = tu.terrain_route_pipeline(model, deterministic=deterministic, **PIPELINE)
             shadow = tu.shadow_pipeline(model, deterministic=deterministic, **PIPELINE)
             test.assertIsNone(today._terrain_law_shadow)
             test.assertIsNotNone(shadow._terrain_law_shadow)
@@ -667,15 +667,23 @@ class TestTerrainLawShadow(unittest.TestCase):
         self.assertEqual(len(got[shapes[0]]), TERRAIN_POINT_WALK_SLOTS)
         self.assertEqual(tu.missing_rows(got[shapes[0]], laws[0], q_tol=1.0e-5, angle_tol=1.0e-3, d_tol=1.0e-5), [])
 
-    def test_unset_flag_builds_nothing_cpu(self):
-        """Build no terrain features, table or buffer without the flag, and record why in the route record."""
+    def test_unset_flag_runs_no_shadow_cpu(self):
+        """Run no shadow without the flag, and record why: by default the law writes the contacts instead, and with
+        its opt-out (``NEWTON_TERRAIN_LAW=none``) no terrain features, table or buffer are built."""
         model, _terrain = _mixed_scene("cpu")
+        off = {"enabled": False, "reason": "Off: NEWTON_TERRAIN_LAW_SHADOW lists no partner class."}
         with _unset():
-            pipeline = newton.CollisionPipeline(model, **PIPELINE)
-        self.assertIsNone(pipeline._terrain_law_shadow)
-        record = pipeline.get_collision_selection()["heightfield"]["law_shadow"]
-        self.assertEqual(record, {"enabled": False, "reason": "Off: NEWTON_TERRAIN_LAW_SHADOW lists no partner class."})
-        self.assertNotIn("NEWTON_TERRAIN_LAW_SHADOW", pipeline.get_collision_selection()["environment"]["applied"])
+            default = newton.CollisionPipeline(model, **PIPELINE)
+        selection = default.get_collision_selection()
+        self.assertEqual(selection["heightfield"]["law_shadow"], off)
+        self.assertTrue(selection["heightfield"]["law"]["writes"])
+        self.assertNotIn("NEWTON_TERRAIN_LAW", selection["environment"]["applied"])
+        opted_out = tu.terrain_route_pipeline(model, **PIPELINE)
+        self.assertIsNone(opted_out._terrain_law_shadow)
+        selection = opted_out.get_collision_selection()
+        self.assertEqual(selection["heightfield"]["law_shadow"], off)
+        self.assertFalse(selection["heightfield"]["law"]["writes"])
+        self.assertNotIn("NEWTON_TERRAIN_LAW_SHADOW", selection["environment"]["applied"])
 
     def test_full_finish_launch_is_a_fixed_grid_cpu(self):
         """Launch the full-finish kernel with a fixed grid whatever the class's size, striding over the deferred list.

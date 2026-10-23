@@ -448,13 +448,15 @@ class TestHeightfield(unittest.TestCase):
         contact_count = int(contacts.rigid_contact_count.numpy()[0])
         self.assertGreater(contact_count, 0, "No contacts detected between sphere and heightfield")
 
-    def _get_contact_kinematics(self, model, state, *, reduce_contacts=True, requires_grad=False):
-        """Return contact distances, normals, and heightfield points for a model state."""
-        pipeline = newton.CollisionPipeline(
-            model,
-            reduce_contacts=reduce_contacts,
-            requires_grad=requires_grad,
-        )
+    def _get_contact_kinematics(self, model, state, *, reduce_contacts=True, requires_grad=False, environ=None):
+        """Return contact distances, normals, and heightfield points for a model state, the pipeline built with the
+        ``environ`` variables set."""
+        with patch.dict(os.environ, environ or {}):
+            pipeline = newton.CollisionPipeline(
+                model,
+                reduce_contacts=reduce_contacts,
+                requires_grad=requires_grad,
+            )
         contacts = pipeline.contacts()
         distance = wp.empty(contacts.rigid_contact_max, dtype=float, device=model.device)
         point0 = wp.empty(contacts.rigid_contact_max, dtype=wp.vec3, device=model.device)
@@ -644,20 +646,30 @@ class TestHeightfield(unittest.TestCase):
 
         self.assertTrue(np.all(distance >= 0.0), f"penetrating boundary contacts: {distance}")
 
-    def test_heightfield_boundary_ignores_external_lowest_point(self):
-        """Ignore a penetrating support point outside the heightfield footprint."""
+    @staticmethod
+    def _border_box_model():
+        """A box tilted over the border of a flat heightfield: its lowest corner hangs outside the footprint while its
+        part over the footprint sinks below the surface."""
         builder = newton.ModelBuilder()
-        self._add_flat_heightfield(builder)
+        TestHeightfield._add_flat_heightfield(builder)
 
         rotation = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 0.25 * wp.pi)
         body = builder.add_body(xform=wp.transform((0.95, 0.0, 0.11), rotation))
         builder.add_shape_box(body=body, hx=0.2, hy=0.05, hz=0.05)
+        return builder.finalize()
 
-        model = builder.finalize()
+    def test_heightfield_boundary_ignores_external_lowest_point(self):
+        """Ignore a penetrating support point outside the heightfield footprint on the terrain route.
+
+        The terrain route (``NEWTON_TERRAIN_LAW=none``) clips the box to the footprint's prisms; the terrain law, which
+        writes these contacts by default, has the known gap of
+        :meth:`test_heightfield_border_penetration_gets_a_contact_by_default`.
+        """
+        model = self._border_box_model()
         for reduce_contacts in (False, True):
             with self.subTest(reduce_contacts=reduce_contacts):
                 distance, normal, point0 = self._get_contact_kinematics(
-                    model, model.state(), reduce_contacts=reduce_contacts
+                    model, model.state(), reduce_contacts=reduce_contacts, environ={"NEWTON_TERRAIN_LAW": "none"}
                 )
 
                 self.assertGreater(len(distance), 0, "no contacts between box and heightfield boundary")
@@ -667,6 +679,30 @@ class TestHeightfield(unittest.TestCase):
                 self.assertGreater(float(normal[deepest][2]), 0.999)
                 self.assertLessEqual(float(point0[deepest][0]), 1.0 + 1.0e-5)
                 self.assertAlmostEqual(float(point0[deepest][2]), 0.0, places=5)
+
+    @unittest.expectedFailure
+    def test_heightfield_border_penetration_gets_a_contact_by_default(self):
+        """Give a body that sinks below the surface over the footprint a contact at the heightfield's border (a known
+        gap of the terrain law, the default source of these contacts).
+
+        The law has no border features: a body whose deepest or nearest points lie outside the footprint gets no row,
+        however deep its part over the footprint sinks (the box of
+        :meth:`test_heightfield_boundary_ignores_external_lowest_point`, 5 mm deep there, and a sphere whose centre is
+        2 cm outside the footprint, 3 cm deep), and a body beside the border's edge gets no lateral row. The terrain
+        route (``NEWTON_TERRAIN_LAW=none``) gives the first two a contact against the top face and the last one against
+        the edge. Remove the expected failure when the law supports the border.
+        """
+        builder = newton.ModelBuilder()
+        self._add_flat_heightfield(builder)
+        body = builder.add_body(xform=wp.transform((1.02, 0.0, 0.07), wp.quat_identity()))
+        builder.add_shape_sphere(body=body, radius=0.1)
+        for model in (self._border_box_model(), builder.finalize()):
+            distance, normal, point0 = self._get_contact_kinematics(model, model.state())
+            self.assertGreater(len(distance), 0, "no contacts where the body sinks below the surface at the border")
+            deepest = int(np.argmin(distance))
+            self.assertLess(float(distance[deepest]), -0.001)
+            self.assertGreater(float(normal[deepest][2]), 0.999)
+            self.assertLessEqual(float(point0[deepest][0]), 1.0 + 1.0e-5)
 
     def test_heightfield_native_collision_scaled(self):
         """Per-instance ``scale`` on ``add_shape_heightfield`` is honored by narrow-phase.

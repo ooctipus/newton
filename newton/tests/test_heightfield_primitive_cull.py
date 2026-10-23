@@ -22,6 +22,8 @@ FLAGS = {
     "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
     "NEWTON_HEIGHTFIELD_FINITE_QUERY": "0",
     "NEWTON_HEIGHTFIELD_PAIR_CSR": "0",
+    # The triangle rejection is the terrain route's: keep the route for every heightfield pair.
+    "NEWTON_TERRAIN_LAW": "none",
 }
 
 

@@ -1,11 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run the terrain law beside the narrow phase, into a side buffer that nothing in the step reads (shadow mode).
+"""Run the terrain law after the narrow phase: as the source of its partners' heightfield contacts, or in shadow.
 
-``NEWTON_TERRAIN_LAW_SHADOW`` lists partner classes (``point``: spheres and capsules; ``box``; ``cylinder``:
-cylinders and cones; ``hull``: convex hulls and ellipsoids; or ``all``, every class with a kernel), empty by default.
-With classes listed, a collision pipeline builds :class:`TerrainLawShadow` once, at construction: the terrain features
+The partner classes are ``point`` (spheres and capsules), ``box``, ``cylinder`` (cylinders and cones) and ``hull``
+(convex hulls and ellipsoids). By default (``NEWTON_TERRAIN_LAW`` unset) a collision pipeline with heightfield pairs
+builds :class:`TerrainLawShadow` for every class with a kernel, writes the rows of its pairs as their contacts
+(:meth:`TerrainLawShadow.write_contacts`, :func:`terrain_law_contact_kernel`), and the narrow phase drops those pairs
+(:meth:`TerrainLawShadow.written_pairs`); a configuration the law does not support yet keeps the terrain route instead,
+and the pipeline's route record says why (``get_collision_selection()["heightfield"]["law"]``). ``NEWTON_TERRAIN_LAW``
+lists classes, or ``all``, to request the law strictly (an unsupported configuration raises), or ``none`` to keep the
+terrain route, a temporary opt-out until that route is removed. ``NEWTON_TERRAIN_LAW_SHADOW`` lists classes whose
+kernels run instead beside the terrain route, which writes every contact, into a side buffer that nothing in the step
+reads (shadow mode, for comparisons).
+
+A collision pipeline builds :class:`TerrainLawShadow` once, at construction: the terrain features
 (:class:`~newton._src.geometry.terrain_contacts.TerrainFeatures`), the static pair table
 (:class:`~newton._src.geometry.terrain_contacts.TerrainPairTable`, from the pipeline's pairs), per listed pair a static
 range of walk slots (:data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_WALK_SLOTS`, the fast path's
@@ -15,13 +24,16 @@ contacts: by default from the listed pairs' own bounds on their rows (:meth:`Ter
 ``NEWTON_TERRAIN_LAW_SHADOW_ROWS`` sets it. A listed solid class also has its jobs
 (:class:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs`): job lists and a candidate pool sized at the
 scene level from its pairs' own bounds (:func:`~newton._src.geometry.terrain_law_solid.terrain_solid_job_capacities`),
-which ``NEWTON_TERRAIN_LAW_SHADOW_JOBS`` scales. Every collide then launches, after today's terrain route, each listed
+which ``NEWTON_TERRAIN_LAW_SHADOW_JOBS`` scales. Every collide then launches, after the narrow phase, each listed
 class's kernels (:data:`TERRAIN_LAW_KERNELS`) and a check of the spill region and the job lists, with dimensions fixed
 at construction (:meth:`TerrainLawShadow.describe` records them): no host read, no allocation, no scan, so it runs
-inside CUDA graph capture. In shadow, today's route still produces every contact and the rows are read only by
-:meth:`TerrainLawShadow.rows`. With ``NEWTON_TERRAIN_LAW`` listing classes instead, the same object writes the rows of
-its pairs as their contacts (:meth:`TerrainLawShadow.write_contacts`, :func:`terrain_law_contact_kernel`) and the
-narrow phase drops those pairs (:meth:`TerrainLawShadow.written_pairs`).
+inside CUDA graph capture. When the law writes, its contact kernel follows; in shadow, the terrain route produces every
+contact and the rows are read only by :meth:`TerrainLawShadow.rows`.
+
+The terrain features are built from the heights at construction. Heights edited in place afterwards must be reported
+to them (:meth:`~newton._src.geometry.terrain_contacts.TerrainFeatures.mark_elevations_changed`, which makes the pairs
+over them give no row and raise ``terrain_stale``, then
+:meth:`~newton._src.geometry.terrain_contacts.TerrainFeatures.rebuild_terrain_features`), or the pipeline rebuilt.
 
 The per-type kernels take ``(begin, slot_begin, inputs, data, out)``
 (:class:`~newton._src.geometry.terrain_law.TerrainPairInputs`,
@@ -141,7 +153,7 @@ TERRAIN_LAW_CLASS_NAMES = {
     "cylinder": TERRAIN_PARTNER_CYLINDER,
     "hull": TERRAIN_PARTNER_HULL,
 }
-"""``NEWTON_TERRAIN_LAW_SHADOW`` names of the partner classes."""
+"""``NEWTON_TERRAIN_LAW`` and ``NEWTON_TERRAIN_LAW_SHADOW`` names of the partner classes."""
 
 
 def _solid_launches(name: str) -> tuple[tuple[str, str], ...]:
@@ -307,6 +319,32 @@ def parse_terrain_law_shadow(value: str | None, flag: str = "NEWTON_TERRAIN_LAW_
     return tuple(sorted(classes))
 
 
+def parse_terrain_law(value: str | None) -> tuple[str, tuple[int, ...]]:
+    """Return what a ``NEWTON_TERRAIN_LAW`` value requests and the partner classes it lists.
+
+    Args:
+        value: ``None`` or blank for the default; ``none`` to keep the terrain route (a temporary opt-out until that
+            route is removed); else comma-separated names of :data:`TERRAIN_LAW_CLASS_NAMES`, or ``all``, to request
+            the law for them (:func:`parse_terrain_law_shadow`).
+
+    Returns:
+        ``("default", ())``: the law writes every class with a kernel (:data:`TERRAIN_LAW_KERNELS`) where the
+        collision pipeline's configuration is one it supports, else the terrain route writes; ``("none", ())``; or
+        ``("explicit", classes)``: the law writes the listed classes, and an unsupported configuration raises.
+
+    Raises:
+        ValueError: On an unknown name, a named class without a kernel yet, or ``none`` listed with other names.
+    """
+    names = [item.strip() for item in (value or "").split(",") if item.strip()]
+    if not names:
+        return "default", ()
+    if "none" in names:
+        if names != ["none"]:
+            raise ValueError(f"NEWTON_TERRAIN_LAW={value!r}: 'none' opts out of the terrain law and stands alone")
+        return "none", ()
+    return "explicit", parse_terrain_law_shadow(value, flag="NEWTON_TERRAIN_LAW")
+
+
 TERRAIN_LAW_SPILL_SHARE = 256
 """The default spill region holds the sum of the listed pairs' bounds on their rows over this, beyond the largest
 pair's bound (:meth:`TerrainLawShadow.default_spill_rows`): the worst case of one pair in 256 at once. On the recorded
@@ -442,7 +480,8 @@ contact buffer before the law writes."""
 
 
 def terrain_law_contact_kernel(writer_func: Any):
-    """Return the kernel that writes the law's rows as contacts through a contact writer (``NEWTON_TERRAIN_LAW``).
+    """Return the kernel that writes the law's rows as contacts through a contact writer (the default; see
+    ``NEWTON_TERRAIN_LAW``).
 
     One thread per written pair (``written``, table indices): its rows pass the writer's gap admission (the surface
     distance ``d - r`` beyond both margins within both gaps, ``r`` the radius of a sphere or capsule partner, else 0),
@@ -812,8 +851,8 @@ class TerrainLawShadow:
         """Host time of the construction [s]: features, pair table, kernel modules imported and buffers."""
 
     def written_pairs(self, model) -> tuple[np.ndarray, np.ndarray]:
-        """Return what the law writes when it feeds the solver (``NEWTON_TERRAIN_LAW``): per shape, 1 for a partner
-        whose heightfield pairs it writes (else 0), and the table indices of those pairs.
+        """Return what the law writes when it feeds the solver (the default; see ``NEWTON_TERRAIN_LAW``): per shape, 1
+        for a partner whose heightfield pairs it writes (else 0), and the table indices of those pairs.
 
         Every listed pair is written but those whose partner has no core yet
         (:data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_UNSUPPORTED`: in the hull class, a shape that is

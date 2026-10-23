@@ -303,28 +303,31 @@ NEWTON_FLAGS = declare(
     ),
     EnvironmentFlag(
         "NEWTON_TERRAIN_LAW",
-        "experiment",
+        "policy",
         _COLLIDE,
-        "Partner classes whose heightfield pairs the terrain law writes instead of the terrain route, which drops "
-        "them: point (spheres and capsules), box, cylinder (cylinders and cones), hull (convex hulls and "
-        "ellipsoids) or all. Not with NEWTON_TERRAIN_LAW_SHADOW or speculative contacts. Unset writes none.",
+        "Who writes heightfield contacts. Unset: the terrain law, for the heightfield pairs of every partner class it "
+        "has a kernel for (point: spheres and capsules; box; cylinder: cylinders and cones; hull: convex hulls and "
+        "ellipsoids), which the terrain route then drops, where the pipeline's configuration is one it supports (not "
+        "speculative contacts, NEWTON_TERRAIN_LAW_SHADOW or a prebuilt narrow phase's own contact writer, which keep "
+        "the terrain route). A class list or all requests the law for those classes and raises on such a "
+        "configuration; none keeps the terrain route (a temporary opt-out until that route is removed).",
     ),
     EnvironmentFlag(
         "NEWTON_TERRAIN_LAW_SHADOW",
         "diagnostic",
         _COLLIDE,
-        "Partner classes whose terrain-law kernels run beside the terrain route into a side buffer nothing reads: "
-        "point (spheres and capsules), box, cylinder (cylinders and cones), hull (convex hulls and ellipsoids) or "
-        "all. Unset runs none.",
+        "Partner classes whose terrain-law kernels run beside the terrain route, which then writes every heightfield "
+        "contact, into a side buffer nothing reads (comparison mode): point (spheres and capsules), box, cylinder "
+        "(cylinders and cones), hull (convex hulls and ellipsoids) or all. Unset runs none.",
     ),
     EnvironmentFlag(
         "NEWTON_TERRAIN_LAW_SHADOW_JOBS",
-        "diagnostic",
+        "policy",
         _COLLIDE,
-        "A positive factor on the terrain-law shadow's solid-class job lists and candidate pools, scene-level buffers "
-        "sized from the listed pairs' own bounds (default 1); a pair whose work finds no room takes the slower "
-        "full-finish kernel (its rows unchanged) and raises the narrow phase's terrain_jobs status. Read only with "
-        "NEWTON_TERRAIN_LAW_SHADOW or NEWTON_TERRAIN_LAW set.",
+        "A positive factor on the terrain law's solid-class job lists and candidate pools, scene-level buffers sized "
+        "from its pairs' own bounds (default 1); a pair whose work finds no room takes the slower full-finish kernel "
+        "(its rows unchanged) and raises the narrow phase's terrain_jobs status. Read whenever the terrain law runs "
+        "(by default with heightfield pairs, or in shadow).",
     ),
     EnvironmentFlag(
         "NEWTON_TERRAIN_LAW_RULE_X",
@@ -332,15 +335,16 @@ NEWTON_FLAGS = declare(
         _COLLIDE,
         "1 runs the terrain law's rule X (a solid core's deepest exit, offered where it lies deeper than every other "
         "row of its pair); unset or 0 leaves it out (default: on the law's own operating states it gave no row while "
-        "its kernels cost up to 0.9 ms per env step). Read only with NEWTON_TERRAIN_LAW_SHADOW or NEWTON_TERRAIN_LAW set.",
+        "its kernels cost up to 0.9 ms per env step). Read whenever the terrain law runs (by default with heightfield "
+        "pairs, or in shadow).",
     ),
     EnvironmentFlag(
         "NEWTON_TERRAIN_LAW_SHADOW_ROWS",
-        "diagnostic",
+        "policy",
         _COLLIDE,
-        "Rows of the terrain-law shadow's scene-level spill region, which holds the rows of pairs with more rows than "
-        "their walk slots (default: from the listed pairs' own bounds on their rows); read only with "
-        "NEWTON_TERRAIN_LAW_SHADOW or NEWTON_TERRAIN_LAW set.",
+        "Rows of the terrain law's scene-level spill region, which holds the rows of pairs with more rows than their "
+        "walk slots (default: from its pairs' own bounds on their rows); read whenever the terrain law runs (by "
+        "default with heightfield pairs, or in shadow).",
     ),
     EnvironmentFlag(
         "NEWTON_ASSET_DIR",

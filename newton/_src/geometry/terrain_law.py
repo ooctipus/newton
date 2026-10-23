@@ -14,8 +14,9 @@ the surface predicates, the per-pair window (:func:`terrain_box_cells`, :func:`t
 :func:`terrain_spill_rows`, :func:`terrain_hold_row`, :func:`terrain_hold_candidate`,
 :func:`terrain_plane_group_of_three`, :func:`terrain_defer_pair`, :func:`terrain_store_row`). The static
 data live in :mod:`terrain_contacts`, the per-type kernels in modules of their own (``terrain_law_<type>``), and
-:mod:`terrain_shadow` runs them beside the narrow phase without feeding any contact (``NEWTON_TERRAIN_LAW_SHADOW``),
-or writes their rows as the contacts of the pairs the narrow phase leaves to the law (``NEWTON_TERRAIN_LAW``).
+:mod:`terrain_shadow` runs them after the narrow phase and writes their rows as the contacts of the pairs the narrow
+phase leaves to the law (by default; ``NEWTON_TERRAIN_LAW``), or runs them beside the terrain route without feeding any
+contact (``NEWTON_TERRAIN_LAW_SHADOW``).
 
 Surface model:
 

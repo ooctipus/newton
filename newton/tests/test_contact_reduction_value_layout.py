@@ -141,6 +141,8 @@ _TERRAIN_FLAGS = {
     "NEWTON_HEIGHTFIELD_GEOMETRIC_CULL": "1",
     "NEWTON_HEIGHTFIELD_FINITE_QUERY": "0",
     "NEWTON_HEIGHTFIELD_PAIR_CSR": "0",
+    # The reducer holds the terrain route's contacts: keep the route for every heightfield pair.
+    "NEWTON_TERRAIN_LAW": "none",
 }
 
 
