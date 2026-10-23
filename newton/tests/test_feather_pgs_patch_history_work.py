@@ -8,6 +8,7 @@ import unittest
 import numpy as np
 import warp as wp
 
+from newton.tests.feather_pgs_patch_reference import store_frame
 from newton.tests.test_feather_pgs_friction_patches import _patch_fixture
 
 
@@ -34,7 +35,7 @@ class TestPatchHistoryWork(unittest.TestCase):
                 patches.previous_world.fill_(42)
                 patches.previous.displacement.fill_(wp.vec3(17.0))
                 patches.current.displacement.fill_(wp.vec3(3.0))
-                patches.store(state)
+                store_frame(patches, state)
                 np.testing.assert_array_equal(patches.previous.valid.numpy(), valid)
                 np.testing.assert_array_equal(patches.previous_world.numpy(), np.where(valid, 0, -1))
                 np.testing.assert_array_equal(patches.previous.displacement.numpy()[valid], 3.0)
@@ -57,7 +58,7 @@ class TestPatchHistoryWork(unittest.TestCase):
 
                 def step(model=model, state=state, contacts=contacts, patches=patches):
                     patches.build(model, state, contacts)
-                    patches.store(state)
+                    store_frame(patches, state)
 
                 step()
                 if device.startswith("cuda"):

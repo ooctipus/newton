@@ -16,7 +16,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import compact_contact, friction_patches, kernels
 from newton._src.solvers.feather_pgs import row_packets as rp
-from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, link_patch_rows
+from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, link_patch_routes, patch_routes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
@@ -299,11 +299,15 @@ def _called_functions(kernel):
 
 def _link(data, layout, rows):
     """Link the rows' patch rings and divide their coefficients, as the patch link does after the producer."""
+    contacts = data.point0.shape[0]
+    live = min(int(data.count.numpy()[0]), contacts)
     routing = (data.world, data.slot, data.path, data.slots_needed)
+    # The dense route's rows; linking reads no impulses.
+    routes = patch_routes(((0, rows.row_parent, rows.row_mu, None, 0.0),))
     wp.launch(
-        link_patch_rows,
-        dim=data.point0.shape[0],
-        inputs=[data.count, layout.view, *routing, 0, rows.row_parent, rows.row_mu],
+        link_patch_routes,
+        dim=contacts,
+        inputs=[wp.array([live, live], dtype=int, device=layout.device), layout.view, *routing, routes, contacts],
         device=layout.device,
     )
 
@@ -563,7 +567,6 @@ class TestRowPacketPatchRows(_PatchRowTwins, unittest.TestCase):
             rp.produce_patch_contacts,
             rp.materialize_patch_fallback,
             compact_contact.produce_patch_contacts,
-            compact_contact._produce_ordered_patch_contacts,
         )
         for kernel in producers:
             name = f"{kernel.func.__module__}.{kernel.key}"

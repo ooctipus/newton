@@ -97,13 +97,7 @@ FLAGS = declare(
         "FEATHER_PGS_CHECK_ROWS",
         "diagnostic",
         _SOLVER,
-        "=1 compares the native and masked contact-row builders.",
-    ),
-    _flag(
-        "FEATHER_PGS_CHECK_ROWS_FUSED",
-        "diagnostic",
-        _SOLVER,
-        "=1 compares the fused contact-row builder with the ordinary builder.",
+        "=1 compares the masked contact-row builder with the per-contact builder.",
     ),
     _flag(
         "FEATHER_PGS_COLORED_LANES",
@@ -122,12 +116,6 @@ FLAGS = declare(
         "experiment",
         _SOLVER,
         "=1 selects the complete contact producer for the dense-six plus sparse solve.",
-    ),
-    _flag(
-        "FEATHER_PGS_COMPACT_CONTACT_ORDERING",
-        "experiment",
-        _SOLVER,
-        "=1 orders contacts for the compact contact producer; requires COMPACT_CONTACT_BOUNDARY.",
     ),
     _flag(
         "FEATHER_PGS_CONTACT_THREADS_X",
@@ -408,20 +396,6 @@ FLAGS = declare(
         "needs both off.",
     ),
     _flag(
-        "FEATHER_PGS_PATCH_CONDITIONAL_NODES",
-        "experiment",
-        _SOLVER,
-        "=1 sorts captured patch builds that do not keep their pairs under a conditional graph node that skips "
-        "empty and already sorted contact frames (default 0: other values keep that sort unconditional).",
-    ),
-    _flag(
-        "FEATHER_PGS_PATCH_DENSE_PATHS",
-        "policy",
-        _SOLVER,
-        "=0 keeps patch friction off the paired factor sweep's contact units, masked rows, the resolved-world "
-        "classifier and the dense route for free-body worlds (default on).",
-    ),
-    _flag(
         "FEATHER_PGS_PATCH_FRAME_REUSE",
         "policy",
         _SOLVER,
@@ -479,22 +453,10 @@ FLAGS = declare(
         "Values other than 1 stop skipping worlds whose candidate rows all separate at the predictor.",
     ),
     _flag(
-        "FEATHER_PGS_ROWS_FUSED",
-        "experiment",
-        _SOLVER,
-        "=1 builds contact rows with one thread per row.",
-    ),
-    _flag(
         "FEATHER_PGS_ROWS_MASKED",
         "experiment",
         _SOLVER,
         "=1 builds contact rows with one thread per contact and DOF.",
-    ),
-    _flag(
-        "FEATHER_PGS_ROWS_NATIVE",
-        "experiment",
-        _SOLVER,
-        "=1 builds contact rows with one warp per contact.",
     ),
     _flag(
         "FEATHER_PGS_ROWS_THREADS_X",
@@ -533,12 +495,6 @@ FLAGS = declare(
         "retired",
         ("environment_flags",),
         "Retired simple-world classifier of a removed robot-specific owner; ignored.",
-    ),
-    _flag(
-        "FEATHER_PGS_SKIP_J_CLEAR",
-        "experiment",
-        _SOLVER,
-        "=1 skips the Jacobian clear when masked or native builders write rows in full.",
     ),
     _flag(
         "FEATHER_PGS_SPARSE_BRANCH_SWEEPS",

@@ -46,6 +46,7 @@ from newton.tests.feather_pgs_patch_parity import (
     ring_load,
     standing_model,
 )
+from newton.tests.feather_pgs_patch_reference import store_frame
 from newton.tests.test_feather_pgs_friction_patches import _ground_box, _patch_fixture
 
 # The dense split reference of the patch parity tests, on CPU.
@@ -245,7 +246,7 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
         histories = []
         for _ in range(2):
             _model, state, _contacts, patches = _patch_fixture(points)
-            patches.store(state)
+            store_frame(patches, state)
             histories.append(patches)
         valid = np.flatnonzero(histories[0].previous.valid.numpy())
         self.assertGreater(valid.size, 0)
@@ -334,7 +335,7 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
         _model, state, _contacts, small = _patch_fixture(np.array(square, dtype=np.float32))
         _model, _state, _contacts, large = _patch_fixture(np.array(square * 4, dtype=np.float32))
         self.assertEqual((small.capacity, large.capacity), (8, 16))
-        small.store(state)
+        store_frame(small, state)
         with self.assertRaisesRegex(AssertionError, "hold 8 and 16 contact slots"):
             assert_history_close(small, large)
 

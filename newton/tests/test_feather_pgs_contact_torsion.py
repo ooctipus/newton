@@ -14,7 +14,7 @@ import warp as wp
 import newton
 from newton import GeoType
 from newton._src.solvers.feather_pgs.contact_torsion import _contact_groups, _group_budget
-from newton._src.solvers.feather_pgs.friction_patches import link_patch_rows
+from newton._src.solvers.feather_pgs.friction_patches import patch_routes
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_friction_patches import _patch_fixture
 
@@ -239,7 +239,7 @@ def patch_rows(points, *, slots, slots_needed, row_type, parents, mu, patches_en
     """Link one CPU patch region into dense rows and return the torsion host view of it.
 
     Rows follow the dense builder's layout: every contact keeps its normal, and only
-    anchors receive an adjacent tangent pair. ``link_patch_rows`` then closes the
+    anchors receive an adjacent tangent pair. The patch link then closes the
     normal-parent load ring and divides the anchors' friction coefficient.
     """
     model, state, contacts, patches = _patch_fixture(points)
@@ -262,21 +262,13 @@ def patch_rows(points, *, slots, slots_needed, row_type, parents, mu, patches_en
         _contact_torsion_shape_set=None,
     )
     if patches_enabled:
-        wp.launch(
-            link_patch_rows,
-            dim=n,
-            inputs=[
-                contacts.rigid_contact_count,
-                patches.view,
-                solver.contact_world,
-                solver.contact_slot,
-                solver.contact_path,
-                solver.contact_slots_needed,
-                0,
-                solver.row_parent,
-                solver.row_mu,
-            ],
-            device="cpu",
+        # Linking reads no impulses.
+        patches.link(
+            solver.contact_world,
+            solver.contact_slot,
+            solver.contact_path,
+            solver.contact_slots_needed,
+            patch_routes(((0, solver.row_parent, solver.row_mu, None, 0.0),)),
         )
     return solver, state, contacts
 

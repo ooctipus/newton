@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import itertools
-import os
 import unittest
 from unittest import mock
 
@@ -280,7 +279,7 @@ def _patch_unit_rows(seed, *, worlds=3, capacity=40, prefix=2, contacts=10, diag
     Each world holds ``prefix`` dense limit rows, then contacts in a random allocation order. A contact
     is a unit: its normal row, followed by two tangent rows when it owns an anchor (at most two per
     ring). The contacts of a body pair split into rings whose normal rows link circularly through their
-    parents, as ``link_patch_rows`` leaves them. Coordinates ``[0, diagonal)`` belong to the diagonal
+    parents, as ``link_patch_routes`` leaves them. Coordinates ``[0, diagonal)`` belong to the diagonal
     articulation (index 0) and the following ``dense`` ones to the dense articulation (index 1).
     ``layout`` replaces every world's random contacts with given units, as in :data:`_UNIT_EDGES`.
     """
@@ -590,7 +589,7 @@ def _paired_unit_rows(seed, *, worlds=6, capacity=64, primary=23, secondary=6):
     Each world holds a prefix of position-limit rows (one world adds a velocity-limit row), then
     contacts in a random allocation order. A contact is a unit: its normal row, followed by two
     tangent rows naming it as parent when it owns an anchor (at most two per ring). The normal rows
-    of a ring link circularly through their parents, as ``link_patch_rows`` leaves them; a ring of
+    of a ring link circularly through their parents, as ``link_patch_routes`` leaves them; a ring of
     one ends with -1 or links to itself. Factor rows, right-hand sides and impulses are random:
     normals separate or close, and some unloaded anchors start with tangent impulses, signed zeros
     included.
@@ -1699,16 +1698,6 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 mf_max_constraints=32,
                 friction_anchor_beta=0.0,
             )
-            with mock.patch.dict(os.environ, {"FEATHER_PGS_PATCH_DENSE_PATHS": "0"}):
-                general = SolverFeatherPGS(
-                    model,
-                    pgs_mode="matrix_free",
-                    enable_joint_limits=True,
-                    joint_limit_activation_gap=0.0,
-                    pgs_iterations=8,
-                    dense_max_constraints=96,
-                    mf_max_constraints=32,
-                )
         self.assertTrue(solvers[0.0]._friction_anchors_enabled)
         self.assertTrue(solvers[0.0]._paired_factor_coordinates)
         # Patch rows are not uniform triples; the factor sweep walks patch contact units instead.
@@ -1716,11 +1705,6 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         self.assertTrue(solvers[0.0]._factor_coordinate_contact_units)
         self.assertIn("_units", solvers[0.0]._paired_factor_solve_kernel.key)
         self.assertTrue(solvers[0.0].get_path_selection()["routes"]["paired_response"]["contact_units"])
-        # FEATHER_PGS_PATCH_DENSE_PATHS=0 restores the general factor sweep.
-        self.assertTrue(general._paired_factor_coordinates)
-        self.assertFalse(general._factor_coordinate_contact_units)
-        self.assertNotIn("_units", general._paired_factor_solve_kernel.key)
-        self.assertNotIn("_contact3", general._paired_factor_solve_kernel.key)
         self.assertFalse(point._friction_anchors_enabled)
         self.assertTrue(point._paired_factor_coordinates)
         self.assertTrue(point._factor_coordinate_contact_triples)

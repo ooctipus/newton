@@ -2547,36 +2547,6 @@ def solve_compact_diagonal_mass(
 
 
 @wp.func
-def dense_subs(
-    n: int,
-    L_start: int,
-    b_start: int,
-    L: wp.array[float],
-    b: wp.array[float],
-    # outputs
-    x: wp.array[float],
-):
-    # Solves (L L^T) x = b for x given the Cholesky factor L
-    # forward substitution solves the lower triangular system L y = b for y
-    for i in range(n):
-        s = b[b_start + i]
-
-        for j in range(i):
-            s -= L[L_start + dense_index(n, i, j)] * x[b_start + j]
-
-        x[b_start + i] = s / L[L_start + dense_index(n, i, i)]
-
-    # backward substitution solves the upper triangular system L^T x = y for x
-    for i in range(n - 1, -1, -1):
-        s = x[b_start + i]
-
-        for j in range(i + 1, n):
-            s -= L[L_start + dense_index(n, j, i)] * x[b_start + j]
-
-        x[b_start + i] = s / L[L_start + dense_index(n, i, i)]
-
-
-@wp.func
 def _active_free_root_dof_start(
     free_root_joint_indices: wp.array[int],
     joint_qd_start: wp.array[int],
@@ -6674,33 +6644,6 @@ def finalize_constraint_counts_with_status(
 
 
 @wp.kernel
-def finalize_world_constraint_counts(
-    world_slot_counter: wp.array[int],
-    max_constraints: int,
-    slots_per_contact: int,
-    first_rejected_slot: wp.array[int],
-    # outputs
-    world_constraint_count: wp.array[int],
-):
-    """Turn the monotone slot counter into the row count.
-
-    The count is the counter truncated at the first rejected reservation and at
-    ``max_constraints``: rows at or past the first rejected slot were reserved by
-    contacts the allocator dropped, so every accepted contact lies below it.
-
-    The ``slots_per_contact`` argument is accepted for backwards
-    compatibility but is no longer used for rounding, because the
-    constraint buffer may now contain a mix of 3-row contact groups and
-    single-row joint-limit constraints.
-    """
-    world = wp.tid()
-    count = wp.min(world_slot_counter[world], first_rejected_slot[world])
-    if count > max_constraints:
-        count = max_constraints
-    world_constraint_count[world] = count
-
-
-@wp.kernel
 def snapshot_dense_phase_bound(
     world_slot_counter: wp.array[int],
     bound_index: int,
@@ -8067,76 +8010,6 @@ def snapshot_contact_warmstart(
         previous_mf_slot[contact] = wp.where(path == 1, slot, -1)
     if contact < previous_propagation_slot.shape[0]:
         previous_propagation_slot[contact] = wp.where(path == 2, slot, -1)
-
-
-@wp.kernel
-def snapshot_mf_prev_slots(
-    contact_count: wp.array[int],
-    contact_path: wp.array[int],
-    contact_slot: wp.array[int],
-    # out
-    prev_slot_sorted: wp.array[int],
-):
-    """Record, per current sorted contact index, the base MF slot it occupied
-    this step (or -1 if it was not MF-routed / inactive). Run at the END of the
-    step so next step's ``rigid_contact_match_index`` (referencing this frame's
-    *sorted* index) resolves through it. One thread per contact-array slot;
-    indices beyond ``contact_count`` are written -1 so stale entries from a
-    larger previous frame can't leak.
-    """
-    c = wp.tid()
-    if c >= contact_count[0]:
-        prev_slot_sorted[c] = -1
-        return
-    if contact_path[c] != 1:
-        prev_slot_sorted[c] = -1
-        return
-    slot = contact_slot[c]
-    prev_slot_sorted[c] = slot
-
-
-@wp.kernel
-def snapshot_dense_prev_slots(
-    contact_count: wp.array[int],
-    contact_path: wp.array[int],
-    contact_slot: wp.array[int],
-    # out
-    prev_slot_sorted: wp.array[int],
-):
-    """Dense-path mirror of :func:`snapshot_mf_prev_slots`.
-
-    Records, per current sorted contact index, the absolute dense world row the
-    contact's normal row occupied this step (or -1 when it was not
-    dense-routed / inactive), so next step's ``rigid_contact_match_index`` can
-    resolve previous impulses by contact identity.
-    """
-    c = wp.tid()
-    if c >= contact_count[0]:
-        prev_slot_sorted[c] = -1
-        return
-    if contact_path[c] != 0:
-        prev_slot_sorted[c] = -1
-        return
-    prev_slot_sorted[c] = contact_slot[c]
-
-
-@wp.kernel
-def snapshot_propagation_prev_slots(
-    contact_count: wp.array[int],
-    contact_path: wp.array[int],
-    contact_slot: wp.array[int],
-    # out
-    prev_slot_sorted: wp.array[int],
-):
-    """Propagation-path mirror of :func:`snapshot_mf_prev_slots`."""
-    c = wp.tid()
-    if c >= contact_count[0]:
-        prev_slot_sorted[c] = -1
-        return
-    if contact_path[c] != 2:
-        prev_slot_sorted[c] = -1
-        return
-    prev_slot_sorted[c] = contact_slot[c]
 
 
 @wp.kernel
@@ -11576,30 +11449,6 @@ def pgs_solve_mf_loop(
                 ds_b2 = art_dof_start[art_b2]
                 for k in range(6):
                     v_out[ds_b2 + k] = v_out[ds_b2 + k] + mf_MiJt_b[world, i, k] * delta_impulse
-
-
-@wp.kernel
-def finalize_mf_constraint_counts(
-    mf_slot_counter: wp.array[int],
-    mf_max_constraints: int,
-    slots_per_contact: int,
-    first_rejected_slot: wp.array[int],
-    # outputs
-    mf_constraint_count: wp.array[int],
-):
-    """Turn the monotone MF slot counter into the row count.
-
-    Truncates at the first rejected reservation and at ``mf_max_constraints``
-    (see :func:`finalize_world_constraint_counts`). ``slots_per_contact`` is
-    kept for call-site compatibility.  The MF buffer may contain a mix of 3-row
-    normal+friction contacts and 1-row speculative normal contacts, so rounding
-    to a fixed stride would drop valid rows.
-    """
-    world = wp.tid()
-    count = wp.min(mf_slot_counter[world], first_rejected_slot[world])
-    if count > mf_max_constraints:
-        count = mf_max_constraints
-    mf_constraint_count[world] = count
 
 
 @wp.kernel

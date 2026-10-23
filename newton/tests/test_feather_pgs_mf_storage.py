@@ -469,7 +469,7 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
 
 
 def _patch_ring_rows(seed, *, worlds, dense_capacity, mf_capacity, dofs, drives, velocity_limits, rings):
-    """Build MF-GS operands whose dense contacts form patch rings, as ``link_patch_rows`` leaves them.
+    """Build MF-GS operands whose dense contacts form patch rings, as ``link_patch_routes`` leaves them.
 
     Each world holds a prefix of drive rows (with ``drives``) and position-limit rows, then
     velocity-limit rows (with ``velocity_limits``), recorded in its phase bounds, then contacts in a

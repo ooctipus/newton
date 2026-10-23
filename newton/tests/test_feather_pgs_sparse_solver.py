@@ -23,32 +23,18 @@ DT = 1.0 / 400.0
 STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
 
 
-def _build_model(*, free_count=0, free_first=False, robot_count=1, prescribed=False, heterogeneous=False):
-    """Replicate a contacting tripod, optionally surrounded by separate free bodies."""
+def _build_model(*, free_count=0, robot_count=1, prescribed=False):
+    """Replicate a contacting tripod, optionally surrounded by separate free bodies.
+
+    Native sparse factors decline worlds with free rigid bodies, so ``free_count`` builds
+    models that keep the dense route.
+    """
     env = newton.ModelBuilder()
     if prescribed:
         support = env.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, -0.02), wp.quat_identity()), is_kinematic=True)
         env.add_shape_box(support, hx=0.6, hy=0.4, hz=0.02)
         env.joint_qd[:6] = [0.2, 0.0, 0.04, 0.0, 0.0, 0.15]
 
-    def add_objects():
-        for index in range(free_count):
-            body = env.add_link(
-                xform=wp.transform(
-                    wp.vec3(0.26 + index * 0.095, 0.0, 0.05),
-                    wp.quat_from_axis_angle(wp.normalize(wp.vec3(0.3, 0.4, 0.5)), 0.6 + index * 0.2),
-                ),
-                mass=0.4 + index * 0.2,
-                com=wp.vec3(0.01, -0.015, 0.007),
-                inertia=wp.mat33(np.diag([0.003, 0.004, 0.005])),
-            )
-            cfg = env.default_shape_cfg.copy()
-            cfg.density, cfg.mu = 0.0, 0.6
-            env.add_shape_sphere(body, radius=0.05, cfg=cfg)
-            env.add_articulation([env.add_joint_free(body)])
-
-    if free_first:
-        add_objects()
     for robot in range(robot_count):
         robot_q_start = len(env.joint_q)
         root = env.add_link(
@@ -79,17 +65,22 @@ def _build_model(*, free_count=0, free_first=False, robot_count=1, prescribed=Fa
             )
         env.add_articulation(joints)
         env.joint_q[robot_q_start + 7] = 0.23  # Exercise an actual unilateral limit on the first step.
-    if not free_first:
-        add_objects()
+    for index in range(free_count):
+        body = env.add_link(
+            xform=wp.transform(
+                wp.vec3(0.26 + index * 0.095, 0.0, 0.05),
+                wp.quat_from_axis_angle(wp.normalize(wp.vec3(0.3, 0.4, 0.5)), 0.6 + index * 0.2),
+            ),
+            mass=0.4 + index * 0.2,
+            com=wp.vec3(0.01, -0.015, 0.007),
+            inertia=wp.mat33(np.diag([0.003, 0.004, 0.005])),
+        )
+        cfg = env.default_shape_cfg.copy()
+        cfg.density, cfg.mu = 0.0, 0.6
+        env.add_shape_sphere(body, radius=0.05, cfg=cfg)
+        env.add_articulation([env.add_joint_free(body)])
     builder = newton.ModelBuilder()
-    if heterogeneous:
-        builder.add_world(env)
-        free_world = newton.ModelBuilder()
-        body = free_world.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05), wp.quat_identity()))
-        free_world.add_shape_sphere(body, radius=0.05)
-        builder.add_world(free_world)
-    else:
-        builder.replicate(env, 2)
+    builder.replicate(env, 2)
     if not prescribed:
         builder.add_ground_plane()
     return builder.finalize(device="cuda:0")
@@ -117,35 +108,20 @@ def _make_solver(model, sparse, **overrides):
         return SolverFeatherPGS(model, **options)
 
 
-def _case(sparse, *, free_count=0, free_first=False, robot_count=1, prescribed=False, heterogeneous=False):
+def _case(sparse, *, robot_count=1, prescribed=False):
     """Allocate a stable input state for eager and captured cache reuse."""
-    model = _build_model(
-        free_count=free_count,
-        free_first=free_first,
-        robot_count=robot_count,
-        prescribed=prescribed,
-        heterogeneous=heterogeneous,
-    )
+    model = _build_model(robot_count=robot_count, prescribed=prescribed)
     # Row-level comparisons need every world's rows: the resolved-world classifier, which skips the
-    # rows of worlds that all separate, stays off on the dense reference. Worlds with free rigid
-    # bodies keep the dense route by policy; FEATHER_PGS_PATCH_DENSE_PATHS=0 returns patch friction's
-    # free-body worlds to native sparse factors, the route these cases cover.
-    environment = {"FEATHER_PGS_RESOLVED_WORLDS": "0"}
-    if sparse and (free_count or heterogeneous):
-        environment["FEATHER_PGS_PATCH_DENSE_PATHS"] = "0"
-    with mock.patch.dict(os.environ, environment):
+    # rows of worlds that all separate, stays off on the dense reference.
+    with mock.patch.dict(os.environ, {"FEATHER_PGS_RESOLVED_WORLDS": "0"}):
         solver = _make_solver(
             model,
             sparse,
-            **(
-                {"dense_max_constraints": 96 if robot_count > 1 else 64, "mf_max_constraints": 64}
-                if free_count or robot_count > 1
-                else {}
-            ),
+            **({"dense_max_constraints": 96, "mf_max_constraints": 64} if robot_count > 1 else {}),
         )
     state, out = model.state(), model.state()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=128 if free_count else 64)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
     return model, solver, state, out, model.control(), pipeline, pipeline.contacts()
 
 
@@ -190,27 +166,13 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
                     indices[classes[world, :count]], explicit[1]._sparse_row_dof.numpy()[world, :count]
                 )
 
-    def test_heterogeneous_worlds_do_not_invent_joint_support(self):
-        """Admit a robot-only world and a separate free-only world without oversized row support."""
-        dense, sparse = _case(False, heterogeneous=True), _case(True, heterogeneous=True)
-        self.assertEqual(sparse[1]._sparse_mass_matrix_size, 9)
-        self.assertFalse(sparse[1]._sparse_row_support.enabled)
-        np.testing.assert_array_equal(sparse[1].world_dof_count.numpy(), [9, 6])
-        self.assertLessEqual(sparse[1]._sparse_row_dof.shape[2], sparse[1].max_world_dofs)
-        for _ in range(4):
-            for case in (dense, sparse):
-                _step(case)
-            self.assert_states_close(dense[2], sparse[2])
-        self.assert_sparse_state(sparse)
-
     def test_moving_prescribed_support_and_reset(self):
         """Preserve nonzero prescribed contact targets, support velocity and masked reset."""
-        dense = _case(False, free_count=1, prescribed=True)
-        sparse = _case(True, free_count=1, prescribed=True)
+        dense = _case(False, prescribed=True)
+        sparse = _case(True, prescribed=True)
         self.assertEqual(sparse[1]._sparse_mass_matrix_size, 9)
         self.assertTrue(sparse[1]._has_prescribed_response)
-        targets_seen = [False, False]
-        tangent_target_seen = False
+        target_seen = tangent_target_seen = False
         for step in range(8):
             if step == 4:
                 for model, solver, state, *_ in (dense, sparse):
@@ -222,40 +184,29 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             for case in (dense, sparse):
                 _step(case)
             self.assert_states_close(dense[2], sparse[2])
-            for family, (counter, target, row_type, rhs) in enumerate(
-                (
-                    ("constraint_count", "target_velocity", "row_type", "rhs"),
-                    ("mf_constraint_count", "mf_target_velocity", "mf_row_type", "mf_rhs"),
+            counts = sparse[1].constraint_count.numpy()
+            np.testing.assert_array_equal(counts, dense[1].constraint_count.numpy())
+            for world, count in enumerate(counts):
+                kinds = sparse[1].row_type.numpy()[world, :count]
+                np.testing.assert_array_equal(kinds, dense[1].row_type.numpy()[world, :count])
+                np.testing.assert_allclose(
+                    sparse[1].rhs.numpy()[world, :count], dense[1].rhs.numpy()[world, :count], atol=2.0e-5, rtol=2.0e-5
                 )
-            ):
-                counts = getattr(sparse[1], counter).numpy()
-                np.testing.assert_array_equal(counts, getattr(dense[1], counter).numpy())
-                for world, count in enumerate(counts):
-                    kinds = getattr(sparse[1], row_type).numpy()[world, :count]
-                    np.testing.assert_array_equal(kinds, getattr(dense[1], row_type).numpy()[world, :count])
-                    np.testing.assert_allclose(
-                        getattr(sparse[1], rhs).numpy()[world, :count],
-                        getattr(dense[1], rhs).numpy()[world, :count],
-                        atol=2.0e-5,
-                        rtol=2.0e-5,
-                    )
-                    actual = getattr(sparse[1], target).numpy()[world, :count]
-                    expected = getattr(dense[1], target).numpy()[world, :count]
-                    live_metadata = np.ones(count, dtype=bool)
-                    if family == 0 and sparse[1]._sparse_prepare_contacts:
-                        # Prepared tangents consume prescribed targets directly
-                        # in RHS; only normals retain restitution metadata.
-                        live_metadata = kinds != PGS_CONSTRAINT_TYPE_FRICTION
-                        tangent_target_seen |= bool(np.any(np.abs(expected[~live_metadata]) > 0.01))
-                    np.testing.assert_allclose(actual[live_metadata], expected[live_metadata], atol=2.0e-5, rtol=2.0e-5)
-                    targets_seen[family] |= bool(np.any(np.abs(actual[live_metadata]) > 0.01))
+                actual = sparse[1].target_velocity.numpy()[world, :count]
+                expected = dense[1].target_velocity.numpy()[world, :count]
+                # Prepared tangents consume prescribed targets directly in RHS; only normals retain
+                # restitution metadata.
+                normals = kinds != PGS_CONSTRAINT_TYPE_FRICTION
+                tangent_target_seen |= bool(np.any(np.abs(expected[~normals]) > 0.01))
+                np.testing.assert_allclose(actual[normals], expected[normals], atol=2.0e-5, rtol=2.0e-5)
+                target_seen |= bool(np.any(np.abs(actual[normals]) > 0.01))
             prescribed_bodies = np.flatnonzero(sparse[1]._body_prescribed.numpy())
             np.testing.assert_allclose(
                 sparse[2].body_qd.numpy()[prescribed_bodies],
                 np.tile([0.2, 0.0, 0.04, 0.0, 0.0, 0.15], (len(prescribed_bodies), 1)),
                 atol=1.0e-6,
             )
-        self.assertEqual(targets_seen, [True, True], "Exercise prescribed targets on both contact families")
+        self.assertTrue(target_seen, "Exercise prescribed contact targets")
         self.assertTrue(tangent_target_seen, "Exercise prescribed tangential motion in prepared RHS")
         self.assert_sparse_state(sparse)
 
@@ -447,84 +398,6 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
                 contact_seen |= body_a >= 0 and body_b >= 0 and body_art[body_a] != body_art[body_b]
         self.assertTrue(contact_seen, "Fixture must couple separate responsive articulations")
         self.assert_sparse_state(sparse)
-
-    def test_mixed_contacts_match_existing_solver(self):
-        """Preserve robot/object, free/ground and free/free impulses in either articulation order."""
-        for free_first in (False, True):
-            with self.subTest(free_first=free_first):
-                dense = _case(False, free_count=2, free_first=free_first)
-                sparse = _case(True, free_count=2, free_first=free_first)
-                self.assertEqual(sparse[1]._sparse_mass_matrix_size, 9)
-                self.assertEqual(sparse[0].articulation_count, 6)
-                for case in (dense, sparse):
-                    _step(case)
-                self.assert_states_close(dense[2], sparse[2])
-                for name in ("constraint_count", "mf_constraint_count"):
-                    np.testing.assert_array_equal(getattr(dense[1], name).numpy(), getattr(sparse[1], name).numpy())
-                for count_name, impulse_name in (
-                    ("constraint_count", "impulses"),
-                    ("mf_constraint_count", "mf_impulses"),
-                ):
-                    counts = getattr(sparse[1], count_name).numpy()
-                    self.assertTrue(np.all(counts > 0), count_name)
-                    for world, count in enumerate(counts):
-                        np.testing.assert_allclose(
-                            getattr(sparse[1], impulse_name).numpy()[world, :count],
-                            getattr(dense[1], impulse_name).numpy()[world, :count],
-                            atol=2.0e-4,
-                            rtol=2.0e-3,
-                        )
-                contacts = sparse[-1]
-                active = int(contacts.rigid_contact_count.numpy()[0])
-                shape_body = sparse[0].shape_body.numpy()
-                body_art = sparse[1].body_to_articulation.numpy()
-                free = sparse[1].is_free_rigid.numpy()
-                seen = set()
-                for shape_a, shape_b in zip(
-                    contacts.rigid_contact_shape0.numpy()[:active],
-                    contacts.rigid_contact_shape1.numpy()[:active],
-                    strict=True,
-                ):
-                    bodies = (shape_body[shape_a], shape_body[shape_b])
-                    kinds = tuple(
-                        sorted("static" if body < 0 else "free" if free[body_art[body]] else "robot" for body in bodies)
-                    )
-                    seen.add(kinds)
-                self.assertTrue({("free", "robot"), ("free", "static"), ("free", "free")} <= seen, seen)
-                for _ in range(15):
-                    for case in (dense, sparse):
-                        _step(case)
-                    self.assert_states_close(dense[2], sparse[2])
-                self.assert_sparse_state(sparse)
-
-    def test_mixed_graph_replay_after_masked_reset(self):
-        """Refresh a reset robot/free world and replay its complete shared solve graph."""
-        eager = _case(True, free_count=2, free_first=True)
-        graph = _case(True, free_count=2, free_first=True)
-        for case in (eager, graph):
-            _step(case)
-            model, solver, state, *_ = case
-            robot_art = int(solver.group_to_art[9].numpy()[0])
-            root_joint = int(model.articulation_start.numpy()[robot_art])
-            q_start = int(model.joint_q_start.numpy()[root_joint])
-            q = state.joint_q.numpy()
-            q[q_start + 2] += 0.01
-            state.joint_q.assign(q)
-            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-            solver.reset(state, wp.array([True, False], dtype=bool, device=model.device))
-        held = graph[1]._sparse_Linv.numpy().copy()
-        for case in (eager, graph):
-            _step(case)
-        np.testing.assert_array_equal(graph[1]._sparse_Linv.numpy()[1], held[1])
-        with wp.ScopedCapture("cuda:0") as capture:
-            for _ in range(4):
-                _step(graph)
-        for _ in range(4):
-            wp.capture_launch(capture.graph)
-            for _ in range(4):
-                _step(eager)
-        self.assert_states_close(eager[2], graph[2])
-        self.assert_sparse_state(graph)
 
     def test_trajectory_masked_reset_and_inertial_notify(self):
         """Match 32 contact steps and refresh only the requested cached factors."""

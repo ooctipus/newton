@@ -162,7 +162,6 @@ def _plan_stand_in(law, sizes=(108, 6), **attributes):
         "_row_packets": None,
         "_keyed_rows": None,
         "_compact_contact_boundary": False,
-        "_compact_contact_order": None,
         "_sparse_mass_matrix_size": None,
         "_sparse_prepare_contacts": False,
         "_sparse_diagonal_contact_solve": False,
@@ -493,49 +492,37 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         """State the patch route precedence where it governs the solver, and the torsion exception where it does not.
 
         A law-agnostic patch solver's record names the claims in the order the solver tries them, and its
-        CPU decisions follow the flag-dependent clauses: masked rows take the patch row law and the classifier
-        serves patch friction unless FEATHER_PGS_PATCH_DENSE_PATHS=0. The route claims are decided in
-        test_patch_route_claims_follow_the_recorded_precedence (sparse admission) and the paired factor
-        sweep's exclusions in test_paired_factor_sweep_excludes_a_requested_patch_tier (CUDA). Contact torsion
-        takes none of these routes whatever the flags say, and its record says that instead.
+        CPU decisions follow it: masked rows take the patch row law and the classifier serves patch friction.
+        The route claims are decided in test_patch_route_claims_follow_the_recorded_precedence (sparse
+        admission) and the paired factor sweep's exclusions in
+        test_paired_factor_sweep_excludes_a_requested_patch_tier (CUDA). Contact torsion takes none of these
+        routes whatever the flags say, and its record says that instead.
         """
         model = _cpu_free_body_model()
         claims = ("parallel tier", "free rigid bodies", "native sparse factors take", "paired factor sweep", "producer")
         masked = {**ROW_SWITCHES_OFF, "_ROWS_MASKED": True}
-        for flag in (None, "0"):
-            with (
-                self.subTest(FEATHER_PGS_PATCH_DENSE_PATHS=flag),
-                patch.dict(os.environ),
-                patch.multiple(solver_module, **masked),
-            ):
-                os.environ.pop("FEATHER_PGS_PATCH_DENSE_PATHS", None)
-                if flag is not None:
-                    os.environ["FEATHER_PGS_PATCH_DENSE_PATHS"] = flag
-                routes = SolverFeatherPGS(model).get_path_selection()["routes"]
-                friction = routes["friction"]
-                self.assertEqual(friction["law"], "patch")
-                owners, precedence = friction["reason"].split(" need point friction.")
-                # The resolved-world classifier serves patch friction unless FEATHER_PGS_PATCH_DENSE_PATHS=0.
-                self.assertEqual("resolved-world classifier" in owners, flag == "0")
-                # Route claims, the paired factor sweep's exclusions, then row producers, in the solver's order.
-                positions = [precedence.find(claim) for claim in claims]
-                self.assertNotIn(-1, positions)
-                self.assertEqual(positions, sorted(positions))
-                self.assertIn("excludes the parallel tiers, keyed_rows and local_packets", precedence)
-                self.assertIn("local_packets, keyed_rows (unless FEATHER_PGS_PATCH_PARALLEL_ROWS=0)", precedence)
-                self.assertIn("contact_rows.builder_by_dof names each size's builder kernels", precedence)
-                # The general builder's masked rows take the patch row law unless FEATHER_PGS_PATCH_DENSE_PATHS=0.
-                method = "per_contact" if flag == "0" else "masked_combined"
-                self.assertEqual(routes["contact_rows"]["general_method_by_dof"], {"6": method, "1": method})
-                kernels = (
-                    ["populate_world_J_for_size"]
-                    if flag == "0"
-                    else ["contact_row_prelude_patch", "populate_world_J_masked_patch"]
-                )
-                builder = {"method": method, "kernels": kernels, "law": "patch"}
-                self.assertEqual(routes["contact_rows"]["builder_by_dof"], {"6": builder, "1": builder})
+        with patch.multiple(solver_module, **masked):
+            routes = SolverFeatherPGS(model).get_path_selection()["routes"]
+        friction = routes["friction"]
+        self.assertEqual(friction["law"], "patch")
+        owners, precedence = friction["reason"].split(" need point friction.")
+        # The resolved-world classifier serves patch friction.
+        self.assertNotIn("resolved-world classifier", owners)
+        # Route claims, the paired factor sweep's exclusions, then row producers, in the solver's order.
+        positions = [precedence.find(claim) for claim in claims]
+        self.assertNotIn(-1, positions)
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("excludes the parallel tiers, keyed_rows and local_packets", precedence)
+        self.assertIn("local_packets, keyed_rows (unless FEATHER_PGS_PATCH_PARALLEL_ROWS=0)", precedence)
+        self.assertIn("contact_rows.builder_by_dof names each size's builder kernels", precedence)
+        # The general builder's masked rows take the patch row law.
+        method = "masked_combined"
+        self.assertEqual(routes["contact_rows"]["general_method_by_dof"], {"6": method, "1": method})
+        kernels = ["contact_row_prelude_patch", "populate_world_J_masked_patch"]
+        builder = {"method": method, "kernels": kernels, "law": "patch"}
+        self.assertEqual(routes["contact_rows"]["builder_by_dof"], {"6": builder, "1": builder})
         # Contact torsion keeps ordinary factors, rows and serial sweeps under every patch route flag.
-        for flags in ({}, {"FEATHER_PGS_PATCH_PARALLEL_ROWS": "1", "FEATHER_PGS_PATCH_DENSE_PATHS": "1"}):
+        for flags in ({}, {"FEATHER_PGS_PATCH_PARALLEL_ROWS": "1"}):
             with (
                 self.subTest(torsion=True, **flags),
                 patch.dict(os.environ, flags),
@@ -617,46 +604,30 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         """Name in builder_by_dof exactly the contact-row builders one CPU step launches, under both laws.
 
         The general builder's methods: per-contact rows, masked rows in one launch for up to two
-        sizes or per size for three, native and fused rows (point friction; patch friction keeps
-        per-contact rows), FEATHER_PGS_PATCH_DENSE_PATHS=0 and a size above the masked builder's 32
-        DOFs; then keyed rows on CPU stand-ins. Each record is taken under the switches its step
-        runs with. The debug row checks are not routes and stay off.
+        sizes or per size for three, and a size above the masked builder's 32 DOFs; then keyed rows on
+        CPU stand-ins. Each record is taken under the switches its step runs with. The debug row checks
+        are not routes and stay off.
         """
         mixed, three, wide = _cpu_free_body_model(), _resting_arms_and_box(1, 2), _resting_arms_and_box(34)
         pair = ("6", "1")
-        masked, fused, native = (
-            {"_ROWS_MASKED": True},
-            {"_ROWS_MASKED": True, "_ROWS_FUSED": True},
-            {"_ROWS_NATIVE": True},
-        )
+        masked = {"_ROWS_MASKED": True}
         cases = (
-            # (model, switches, FEATHER_PGS_PATCH_DENSE_PATHS, friction_anchor_beta, methods by size)
-            (mixed, {}, None, None, dict.fromkeys(pair, "per_contact")),
-            (mixed, {}, None, 0.0, dict.fromkeys(pair, "per_contact")),
-            (mixed, masked, None, None, dict.fromkeys(pair, "masked_combined")),
-            (mixed, masked, None, 0.0, dict.fromkeys(pair, "masked_combined")),
-            (mixed, masked, "0", None, dict.fromkeys(pair, "per_contact")),
-            (mixed, native, None, None, dict.fromkeys(pair, "per_contact")),
-            (mixed, native, None, 0.0, dict.fromkeys(pair, "native")),
-            (mixed, fused, None, None, dict.fromkeys(pair, "per_contact")),
-            (mixed, fused, None, 0.0, dict.fromkeys(pair, "fused_rows")),
-            (three, masked, None, None, dict.fromkeys(("6", "2", "1"), "masked")),
-            (three, masked, None, 0.0, dict.fromkeys(("6", "2", "1"), "masked")),
-            (wide, masked, None, None, {"34": "per_contact", "6": "masked_combined"}),
-            (wide, masked, None, 0.0, {"34": "per_contact", "6": "masked_combined"}),
+            # (model, switches, friction_anchor_beta, methods by size)
+            (mixed, {}, None, dict.fromkeys(pair, "per_contact")),
+            (mixed, {}, 0.0, dict.fromkeys(pair, "per_contact")),
+            (mixed, masked, None, dict.fromkeys(pair, "masked_combined")),
+            (mixed, masked, 0.0, dict.fromkeys(pair, "masked_combined")),
+            (three, masked, None, dict.fromkeys(("6", "2", "1"), "masked")),
+            (three, masked, 0.0, dict.fromkeys(("6", "2", "1"), "masked")),
+            (wide, masked, None, {"34": "per_contact", "6": "masked_combined"}),
+            (wide, masked, 0.0, {"34": "per_contact", "6": "masked_combined"}),
         )
-        for model, switches, dense_paths, beta, methods in cases:
+        for model, switches, beta, methods in cases:
             law = "patch" if beta is None else "point"
             with (
-                self.subTest(
-                    sizes=list(methods), switches=switches, FEATHER_PGS_PATCH_DENSE_PATHS=dense_paths, law=law
-                ),
-                patch.dict(os.environ),
+                self.subTest(sizes=list(methods), switches=switches, law=law),
                 patch.multiple(solver_module, **{**ROW_SWITCHES_OFF, **switches}),
             ):
-                os.environ.pop("FEATHER_PGS_PATCH_DENSE_PATHS", None)
-                if dense_paths is not None:
-                    os.environ["FEATHER_PGS_PATCH_DENSE_PATHS"] = dense_paths
                 solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
                 record = solver.get_path_selection()["routes"]["contact_rows"]
                 keys = _launched_kernel_keys(model, solver)
@@ -690,36 +661,29 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
     def test_cpu_record_names_the_debug_row_check_builders(self):
         """Name the builders the debug row checks launch in row_check_by_dof, and none without a check.
 
-        FEATHER_PGS_CHECK_ROWS (point friction) builds every size's masked or native rows into copies
+        FEATHER_PGS_CHECK_ROWS (point friction) builds every size's masked rows into copies
         and compares them with the per-contact rows the solve uses, which builder_by_dof and
-        general_method_by_dof name. FEATHER_PGS_CHECK_ROWS_FUSED rebuilds the combined masked sizes'
-        rows with the fused builder. Patch friction runs neither check. One CPU step launches exactly
-        the builders the two maps name, and each check compares the sizes its map lists.
+        general_method_by_dof name. Patch friction does not run the check. One CPU step launches exactly
+        the builders the two maps name, and the check compares the sizes its map lists.
         """
         model = _cpu_free_body_model()
         pair = ("6", "1")
-        fused_check = "rows_fused(J_a,J_b,type,parent,mu,beta,cfm,phi,target,rest)"
         cases = (
             # (switches, friction_anchor_beta, builder method, checked method or None, comparisons)
             ({"_CHECK_ROWS": True}, 0.0, "per_contact", "masked", ["rows_J_6", "rows_J_1"]),
             ({"_CHECK_ROWS": True, "_ROWS_MASKED": True}, 0.0, "per_contact", "masked", ["rows_J_6", "rows_J_1"]),
-            ({"_CHECK_ROWS": True, "_ROWS_NATIVE": True}, 0.0, "per_contact", "native", ["rows_J_6", "rows_J_1"]),
-            ({"_CHECK_ROWS_FUSED": True, "_ROWS_MASKED": True}, 0.0, "masked_combined", "fused_rows", [fused_check]),
             ({"_CHECK_ROWS": True, "_ROWS_MASKED": True}, None, "per_contact", None, []),
-            ({"_CHECK_ROWS_FUSED": True, "_ROWS_MASKED": True}, None, "per_contact", None, []),
         )
         for switches, beta, method, check, comparisons in cases:
             compared = []
             with (
                 self.subTest(switches=switches, law="patch" if beta is None else "point"),
-                patch.dict(os.environ),
                 patch.multiple(solver_module, **{**ROW_SWITCHES_OFF, **switches}),
                 # The checks print their comparisons; keep the names of the compared outputs instead.
                 patch.object(
                     solver_module, "_report_grouped_check", lambda name, *_, compared=compared: compared.append(name)
                 ),
             ):
-                os.environ.pop("FEATHER_PGS_PATCH_DENSE_PATHS", None)
                 solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
                 record = solver.get_path_selection()["routes"]["contact_rows"]
                 keys = _launched_kernel_keys(model, solver)
@@ -732,30 +696,28 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                         {size: entry["method"] for size, entry in checked.items()}, dict.fromkeys(pair, check)
                     )
                 assert_row_builders_named(self, record, keys)
-                self.assertEqual([name for name in compared if name.startswith(("rows_J_", "rows_fused"))], comparisons)
+                self.assertEqual([name for name in compared if name.startswith("rows_J_")], comparisons)
 
     def test_host_record_maps_every_producer_plan(self):
         """Map every producer's plan to its builder methods, kernels and law from host attributes alone.
 
         Stand-ins carry what contact_row_plan and the record read, so the producers that need CUDA are
-        pinned on CPU as well: local row packets, keyed rows, the compact contact boundary (unordered and
-        ordered), native sparse factors (with and without a metadata launch, with the free-body size), the
-        sparse-diagonal owner (with and without its schedule marker) and the compact Jacobian, beside the
-        general builder's methods and debug checks, each under both laws. The cases name every builder
-        method, and every kernel they name is one the launch check recognizes.
+        pinned on CPU as well: local row packets, keyed rows, the compact contact boundary, native sparse
+        factors, the sparse-diagonal owner (with and without its schedule marker) and the compact Jacobian,
+        beside the general builder's methods and debug checks, each under both laws. The cases name every builder method, and every
+        kernel they name is one the launch check recognizes.
         """
         layout = KeyedLayout(16, 6, 0, 16, 128, False, 0)
         marker = SimpleNamespace(key="mark_independent_sparse_contact_candidates_stand_in")
         response = SimpleNamespace(key="populate_sparse_contact_response_stand_in")
         prepare, compact = "prepare_world_contact_rows", "populate_world_J_for_compact_size"
-        per_contact, native, fused = ["populate_world_J_for_size"], ["populate_world_J_native"], ["build_contact_rows"]
+        per_contact = ["populate_world_J_for_size"]
         point_masked = ["contact_row_prelude", "populate_world_J_masked"]
         named, methods = set(), set()
         for law in ("point", "patch"):
             point = law == "point"
             p = "" if point else "patch_"
             produce = f"produce_{p}contacts"
-            ordered = ["_build_contact_order", f"_produce_ordered_{p}contacts"]
             masked = point_masked if point else ["contact_row_prelude_patch", "populate_world_J_masked_patch"]
             fallback = (keyed_rows.get_fallback_kernel if point else keyed_rows.get_patch_fallback_kernel)(layout).key
             diagonal = {
@@ -800,33 +762,11 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     None,
                 ),
                 (
-                    {"_compact_contact_boundary": True, "_compact_contact_order": object(), **diagonal, **schedule},
-                    {},
-                    (108, 6),
-                    "compact_contact_boundary",
-                    {
-                        108: ("compact_contact_boundary", [*ordered, marker.key]),
-                        6: ("compact_contact_boundary", ["clear_contact_response", *ordered]),
-                    },
-                    None,
-                ),
-                (
                     {**sparse, "_sparse_prepare_contacts": True},
                     {},
-                    (18, 6),
+                    (18,),
                     "sparse_contact_response",
-                    {18: ("sparse_response", [response.key]), 6: ("sparse_free_response", [response.key])},
-                    None,
-                ),
-                (
-                    sparse,
-                    {},
-                    (18, 6),
-                    "sparse_contact_response",
-                    {
-                        18: ("sparse_response", [prepare, response.key]),
-                        6: ("sparse_free_response", [prepare, response.key]),
-                    },
+                    {18: ("sparse_response", [response.key])},
                     None,
                 ),
                 (
@@ -871,46 +811,11 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 ),
                 (
                     {},
-                    {"_ROWS_NATIVE": True},
-                    (6, 1),
-                    "general",
-                    same((6, 1), "native", native) if point else same((6, 1), "per_contact", per_contact),
-                    None,
-                ),
-                (
-                    {},
-                    {"_ROWS_MASKED": True, "_ROWS_FUSED": True},
-                    (6, 1),
-                    "general",
-                    same((6, 1), "fused_rows", fused) if point else same((6, 1), "per_contact", per_contact),
-                    None,
-                ),
-                (
-                    {},
                     {"_CHECK_ROWS": True, "_ROWS_MASKED": True},
                     (6, 1),
                     "general",
                     same((6, 1), "per_contact", per_contact),
                     same((6, 1), "masked", point_masked) if point else None,
-                ),
-                (
-                    {},
-                    {"_CHECK_ROWS": True, "_ROWS_NATIVE": True},
-                    (6, 1),
-                    "general",
-                    same((6, 1), "per_contact", per_contact),
-                    same((6, 1), "native", native) if point else None,
-                ),
-                (
-                    {},
-                    {"_CHECK_ROWS_FUSED": True, "_ROWS_MASKED": True},
-                    (34, 6),
-                    "general",
-                    {
-                        34: ("per_contact", per_contact),
-                        6: ("masked_combined" if point else "per_contact", masked if point else per_contact),
-                    },
-                    {6: ("fused_rows", fused)} if point else None,
                 ),
             )
             for attributes, switches, sizes, producer, expected, check in cases:
@@ -951,8 +856,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         launch, still names the launched set, and the check must reject it.
         """
         model = _resting_arms_and_box(1, 2)
-        with patch.dict(os.environ), patch.multiple(solver_module, **{**ROW_SWITCHES_OFF, "_ROWS_MASKED": True}):
-            os.environ.pop("FEATHER_PGS_PATCH_DENSE_PATHS", None)
+        with patch.multiple(solver_module, **{**ROW_SWITCHES_OFF, "_ROWS_MASKED": True}):
             solver = SolverFeatherPGS(model, friction_anchor_beta=0.0)
             record = solver.get_path_selection()["routes"]["contact_rows"]
             keys = _launched_kernel_keys(model, solver)
@@ -981,8 +885,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             plan = plan_rows(solver)
             return dataclasses.replace(plan, methods=dict.fromkeys(plan.methods, "per_contact"), combined=())
 
-        with patch.dict(os.environ), patch.multiple(solver_module, **{**ROW_SWITCHES_OFF, "_ROWS_MASKED": True}):
-            os.environ.pop("FEATHER_PGS_PATCH_DENSE_PATHS", None)
+        with patch.multiple(solver_module, **{**ROW_SWITCHES_OFF, "_ROWS_MASKED": True}):
             solver = SolverFeatherPGS(model)
             record = solver.get_path_selection()["routes"]["contact_rows"]
             masked = _launched_kernel_keys(model, solver)
@@ -1439,17 +1342,14 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
 
         Sparse factors admit the arm alone. On the dense route patch friction keeps the bundle that makes
         it worth taking: contact units in the paired factor sweep, masked rows (FEATHER_PGS_ROWS_MASKED,
-        set by the recipes) and the resolved-world classifier. FEATHER_PGS_PATCH_DENSE_PATHS=0 returns
-        patch friction's free-body worlds to sparse factors.
+        set by the recipes) and the resolved-world classifier.
         """
         model = _branched_arm_and_box()
         for law, beta in (("patch", None), ("point", 0.0)):
             with (
                 self.subTest(law=law),
-                patch.dict(os.environ),
                 patch.multiple(solver_module, **{**ROW_SWITCHES_OFF, "_ROWS_MASKED": True}),
             ):
-                os.environ.pop("FEATHER_PGS_PATCH_DENSE_PATHS", None)
                 solver = _make_solver(model, True, friction_anchor_beta=beta, dense_max_constraints=96)
                 selected = solver.get_path_selection()
                 routes = selected["routes"]
@@ -1471,16 +1371,12 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     )
                     self.assertTrue(routes["resolved_worlds"]["enabled"], routes["resolved_worlds"]["reason"])
                     self.assertIn("patch-friction rows", routes["resolved_worlds"]["reason"])
-        with patch.dict(os.environ, {"FEATHER_PGS_PATCH_DENSE_PATHS": "0"}):
-            solver = _make_solver(model, True, dense_max_constraints=96)
-        self.assertEqual(solver.get_path_selection()["sparse_mass_matrix"], "on")
 
     @unittest.skipUnless(wp.is_cuda_available(), "The sparse and compact producers require CUDA")
     def test_route_record_names_every_launched_row_builder(self):
         """Name in builder_by_dof exactly the contact-row builders one CUDA step launches, under both laws.
 
-        Native sparse factors (with the free-body size FEATHER_PGS_PATCH_DENSE_PATHS=0 returns to
-        them), the compact Jacobian and combined masked rows on the dense route. The compact contact
+        Native sparse factors, the compact Jacobian and combined masked rows on the dense route. The compact contact
         boundary and the sparse-diagonal owner (both laws), local row packets and keyed rows (both
         laws) are checked in their own modules, keyed rows also on CPU stand-ins
         (test_cpu_record_names_every_launched_row_builder), and every producer's plan-to-record
@@ -1516,7 +1412,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     patch.dict(os.environ),
                     patch.multiple(solver_module, **{**ROW_SWITCHES_OFF, **switches}),
                 ):
-                    os.environ.pop("FEATHER_PGS_PATCH_DENSE_PATHS", None)
                     os.environ.update(environment)
                     solver = build(beta)
                     record = solver.get_path_selection()["routes"]["contact_rows"]
@@ -1539,23 +1434,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                         self.assertEqual(
                             {tuple(entry["kernels"]) for entry in record["builder_by_dof"].values()}, {tuple(builder)}
                         )
-        # FEATHER_PGS_PATCH_DENSE_PATHS=0 returns the free-body worlds to native sparse factors: the sparse
-        # kernel writes the free body's response, and nothing launches for its size alone.
-        with (
-            patch.dict(os.environ, {"FEATHER_PGS_PATCH_DENSE_PATHS": "0"}),
-            patch.multiple(solver_module, **ROW_SWITCHES_OFF),
-        ):
-            solver = _make_solver(arm, True, dense_max_constraints=96)
-            record = solver.get_path_selection()["routes"]["contact_rows"]
-            keys = _launched_kernel_keys(arm, solver, convex_collision="ordinary")
-        self.assertEqual(record["producer"], "sparse_contact_response")
-        builders = record["builder_by_dof"]
-        self.assertEqual(
-            (builders["18"]["method"], builders["6"]["method"]), ("sparse_response", "sparse_free_response")
-        )
-        self.assertEqual(builders["18"]["kernels"], builders["6"]["kernels"])
-        self.assertEqual(keys.count(solver._sparse_contact_response_kernel.key), 1)
-        assert_row_builders_named(self, record, keys)
 
     @unittest.skipUnless(wp.is_cuda_available(), "The paired factor sweep requires CUDA")
     def test_paired_factor_sweep_excludes_a_requested_patch_tier(self):

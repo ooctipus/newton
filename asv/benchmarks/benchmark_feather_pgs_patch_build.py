@@ -23,7 +23,7 @@ from unittest import mock
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs.friction_patches import _build, _FrictionPatchState
+from newton._src.solvers.feather_pgs.friction_patches import _build, _FrictionPatchState, patch_routes
 
 MODEL_DTYPES = {
     "body_world": int,
@@ -102,7 +102,9 @@ def run(data, device, iterations, history):
     patches = _FrictionPatchState(model, capacity, True, wp.zeros(capacity, dtype=wp.vec2, device=device))
     patches.build(model, state, contacts)
     if history:
-        patches.store(state)
+        # Store the frame without finishing an anchor, as a step without patch rows does.
+        unsolved = SimpleNamespace(body_q=None, body_qd=None)
+        patches.finish(state, unsolved, None, None, None, None, None, patch_routes(()), 0.0)
     patches.build(model, state, contacts)
     outputs = {
         name: getattr(patches.view, name).numpy() for name in ("weight", "next_contact", "point_a", "point_b", "phi")

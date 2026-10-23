@@ -569,7 +569,6 @@ def census_calls():
             _get_pgs_solve_sparse_kernel,
             ((48, 18, 12), (32, 8, 8)),
             (
-                ({}, {"mf_max_constraints": 32, "free_row_dofs": 6}),
                 _axis("active_rows"),
                 _axis("use_support_table"),
                 _axis("contact_triplets"),

@@ -13,14 +13,13 @@ import newton
 from newton.tests.test_feather_pgs_sparse_solver import STATE_FIELDS, _build_model, _make_solver, _step
 
 
-def _case(grouped, *, free_count=0, friction_anchor_beta=0.0, environment=None):
+def _case(grouped, *, free_count=0, friction_anchor_beta=0.0):
     """Construct the same eight-sweep native problem with either dynamics mapping.
 
-    ``friction_anchor_beta=None`` selects the solver's default patch friction, and
-    ``environment`` adds ``FEATHER_PGS_*`` variables for the construction.
+    ``friction_anchor_beta=None`` selects the solver's default patch friction.
     """
     model = _build_model(free_count=free_count)
-    with patch.dict(os.environ, {"FEATHER_PGS_SPARSE_GROUPED_DYNAMICS": "1", **(environment or {})}):
+    with patch.dict(os.environ, {"FEATHER_PGS_SPARSE_GROUPED_DYNAMICS": "1"}):
         solver = _make_solver(
             model,
             True,
@@ -68,45 +67,28 @@ class TestSparseGroupedDynamics(unittest.TestCase):
                 self.assertTrue(np.isfinite(lam).all())
                 self.assertTrue(np.all(lam[np.isin(types, (0, 3))] >= -1e-7))
 
-    def test_grouped_sparse_contact_and_free_body_response(self):
-        """Preserve eight-sweep physics on branched and mixed robot/free worlds.
+    def test_grouped_sparse_contact_response(self):
+        """Preserve eight-sweep physics on branched robot worlds.
 
         Worlds that pair an articulation with free rigid bodies keep the dense route under
-        both friction laws, where grouped dynamics runs on ordinary factors. Only patch
-        friction with ``FEATHER_PGS_PATCH_DENSE_PATHS=0`` returns them to native sparse
-        factors: the one route on which sparse factors compose grouped dynamics with
-        free-body response, so the mixed worlds run there.
+        both friction laws, where grouped dynamics runs on ordinary factors.
         """
-        for free_count, beta, environment in (
-            (0, 0.0, None),
-            (2, None, {"FEATHER_PGS_PATCH_DENSE_PATHS": "0"}),
-        ):
-            with self.subTest(free_count=free_count, friction_anchor_beta=beta, environment=environment):
-                plain, grouped = (
-                    _case(flag, free_count=free_count, friction_anchor_beta=beta, environment=environment)
-                    for flag in (False, True)
-                )
-                self.assert_native_grouped(grouped)
-                contact_seen = limit_seen = False
-                for _ in range(8):
-                    for case in (plain, grouped):
-                        _step(case)
-                    contact_seen |= bool(grouped[-1].rigid_contact_count.numpy()[0])
-                    limit_seen |= bool(np.any(grouped[1].row_type.numpy() == 3))
-                    self.assert_physics_close(plain, grouped)
-                self.assertTrue(contact_seen and limit_seen)
+        plain, grouped = (_case(flag) for flag in (False, True))
+        self.assert_native_grouped(grouped)
+        contact_seen = limit_seen = False
+        for _ in range(8):
+            for case in (plain, grouped):
+                _step(case)
+            contact_seen |= bool(grouped[-1].rigid_contact_count.numpy()[0])
+            limit_seen |= bool(np.any(grouped[1].row_type.numpy() == 3))
+            self.assert_physics_close(plain, grouped)
+        self.assertTrue(contact_seen and limit_seen)
 
     def test_free_body_worlds_keep_the_dense_route(self):
-        """Keep mixed robot/free worlds on the dense route unless patch friction opts out of it.
-
-        Point friction keeps them there whatever ``FEATHER_PGS_PATCH_DENSE_PATHS`` says, and
-        patch friction keeps them there by default, which is why the physics test runs its
-        mixed worlds under patch friction with the opt-out.
-        """
-        for beta, dense_paths in ((0.0, "1"), (None, "1"), (0.0, "0")):
-            environment = {"FEATHER_PGS_PATCH_DENSE_PATHS": dense_paths}
-            with self.subTest(friction_anchor_beta=beta, environment=environment):
-                solver = _case(True, free_count=2, friction_anchor_beta=beta, environment=environment)[1]
+        """Keep mixed robot/free worlds on the dense route under both friction laws."""
+        for beta in (0.0, None):
+            with self.subTest(friction_anchor_beta=beta):
+                solver = _case(True, free_count=2, friction_anchor_beta=beta)[1]
                 self.assertIsNone(solver._sparse_mass_matrix_size)
                 reason = solver.get_path_selection()["reasons"]["sparse_mass_matrix"]
                 self.assertIn("free rigid bodies keep the dense route", reason)

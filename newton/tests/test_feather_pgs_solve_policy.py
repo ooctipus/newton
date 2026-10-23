@@ -184,7 +184,6 @@ def _vote_census():
             _get_pgs_solve_sparse_kernel.__wrapped__,
             (48, 18, 12),
             (
-                ({}, {"mf_max_constraints": 32, "free_row_dofs": 6}),
                 _axis("active_rows"),
                 _axis("use_support_table"),
                 _axis("contact_triplets"),
@@ -495,7 +494,7 @@ class TestVelocityExitLaw(unittest.TestCase):
         self.assertEqual(
             checked,
             {
-                "sparse": 288,
+                "sparse": 240,
                 "sparse_lanes": 32,
                 "mf_gs": 1344,
                 "paired": 6,

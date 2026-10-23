@@ -1316,7 +1316,6 @@ def create_owner(solver):
             source._DEBUG_CACHE_CMP,
             source._GROUPED_CHECK,
             source._CHECK_ROWS,
-            source._CHECK_ROWS_FUSED,
         )
     ):
         return None

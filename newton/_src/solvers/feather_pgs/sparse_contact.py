@@ -1354,30 +1354,6 @@ def build_sparse_mimic_rows(
 
 
 @wp.kernel(enable_backward=False)
-def apply_sparse_contact_restitution(
-    constraint_count: wp.array[int],
-    phi: wp.array2d[float],
-    row_type: wp.array2d[int],
-    target_velocity: wp.array2d[float],
-    row_restitution: wp.array2d[float],
-    row_incident: wp.array2d[float],
-    dt: float,
-    restitution_velocity_threshold: float,
-    rhs: wp.array2d[float],
-):
-    """Use the already projected incident velocity for the unchanged impact law."""
-    world, row = wp.tid()
-    if row >= constraint_count[world] or row_type[world, row] != PGS_CONSTRAINT_TYPE_CONTACT:
-        return
-    restitution = row_restitution[world, row]
-    relative_incident = row_incident[world, row] - target_velocity[world, row]
-    if restitution > 0.0 and contact_restitution_fires(
-        phi[world, row], relative_incident, dt, restitution_velocity_threshold
-    ):
-        rhs[world, row] = -target_velocity[world, row] + restitution * relative_incident
-
-
-@wp.kernel(enable_backward=False)
 def apply_sparse_factor_velocity(
     group_to_art: wp.array[int],
     art_to_world: wp.array[int],
@@ -1403,22 +1379,3 @@ def apply_sparse_factor_velocity(
             )
     dof = articulation_dof_start[art] + permutation[column]
     v_out[dof] = v_hat[dof] + delta
-
-
-@wp.kernel(enable_backward=False)
-def apply_sparse_free_velocity(
-    group_to_art: wp.array[int],
-    art_to_world: wp.array[int],
-    articulation_world_dof_offset: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    factor_velocity_delta: wp.array2d[float],
-    v_hat: wp.array[float],
-    v_out: wp.array[float],
-):
-    """Publish physical free-body deltas without a coordinate conversion."""
-    group, column = wp.tid()
-    art = group_to_art[group]
-    world = art_to_world[art]
-    offset = articulation_world_dof_offset[art]
-    dof = articulation_dof_start[art] + column
-    v_out[dof] = v_hat[dof] + factor_velocity_delta[world, offset + column]

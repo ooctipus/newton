@@ -41,7 +41,6 @@ _ARCH = "120"
 # may change; a change that adds a patch-only kernel lists it here.
 _PATCH_ONLY = frozenset(
     (
-        "compact_contact._produce_ordered_patch_contacts",
         "compact_contact.produce_patch_contacts",
         "keyed_rows.scatter_patch_contact_keys",
         "friction_patches._arange",
@@ -51,13 +50,9 @@ _PATCH_ONLY = frozenset(
         "friction_patches._merge_runs",
         "friction_patches._prepare",
         "friction_patches._prepare_frame",
-        "friction_patches._record_sorted_frame",
         "friction_patches._reset_history",
         "friction_patches._sort_chunks",
-        "friction_patches.finish_patch_impulses",
         "friction_patches.link_patch_routes",
-        "friction_patches.link_patch_rows",
-        "friction_patches.seed_patch_impulses",
         "friction_patches.seed_patch_routes",
         # The resolved-world classifier under persistent patch friction.
         "kernels.allocate_world_contact_slots_patch_resolved",
@@ -339,17 +334,16 @@ def _sparse_sweep_calls():
     from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel  # noqa: PLC0415
 
     factory = _get_pgs_solve_sparse_kernel.__wrapped__
-    for size, free, flags in itertools.product(
-        ((32, 8, 8), (48, 18, 12)), ((0, 0), (32, 6)), itertools.product((False, True), repeat=6)
-    ):
+    for size, flags in itertools.product(((32, 8, 8), (48, 18, 12)), itertools.product((False, True), repeat=6)):
         active, table, triplets, velocity, local, warm = flags
         # The factory folds unsatisfiable requests into another variant; pin each variant once.
-        if (active and free != (0, 0)) or (triplets and not (active and table)):
+        if triplets and not (active and table):
             continue
         for lanes in (8, 16, 32):
             kwargs = {
-                "mf_max_constraints": free[0],
-                "free_row_dofs": free[1],
+                # The pins name the free-body capacities, which native sparse factors leave at zero.
+                "mf_max_constraints": 0,
+                "free_row_dofs": 0,
                 "active_rows": active,
                 "use_support_table": table,
                 "contact_triplets": triplets,
@@ -366,12 +360,12 @@ def _accumulated_sparse_calls():
     from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel  # noqa: PLC0415
 
     factory = _get_pgs_solve_sparse_kernel.__wrapped__
-    # The final pass of articulated limits, and the free-body rows of independent free bodies.
-    for size, (free, velocity) in itertools.product(((32, 8, 8), (48, 18, 12)), (((0, 0), True), ((32, 6), False))):
+    # The final pass of articulated limits; the pins name the free-body capacities, always zero.
+    for size in ((32, 8, 8), (48, 18, 12)):
         kwargs = {
-            "mf_max_constraints": free[0],
-            "free_row_dofs": free[1],
-            "velocity_limits": velocity,
+            "mf_max_constraints": 0,
+            "free_row_dofs": 0,
+            "velocity_limits": True,
             "velocity_limit_law": "accumulated",
         }
         yield "sparse_pgs._get_pgs_solve_sparse_kernel", factory, size, kwargs
@@ -736,9 +730,7 @@ def _keyed_row_calls():
 
 def _factory_kernels():
     """Kernels of the factories patch integration varies, built with point arguments."""
-    from newton._src.solvers.feather_pgs.row_build_native import get_row_build_native_kernel  # noqa: PLC0415
-
-    kernels = {"row_build_native.get_row_build_native_kernel()": get_row_build_native_kernel()}
+    kernels = {}
     for name, factory, args, kwargs in itertools.chain(
         _sparse_sweep_calls(),
         _accumulated_sparse_calls(),

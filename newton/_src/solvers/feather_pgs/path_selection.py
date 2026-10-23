@@ -55,7 +55,7 @@ _BETA_REASONS = {
 _PATCH_ROUTE_PRECEDENCE = (
     " Patch routes, first claim first: a parallel tier that mf_gs_parallel_rows requests (unless"
     " FEATHER_PGS_PATCH_PARALLEL_ROWS=0) declines native sparse factors, worlds with free rigid bodies then keep the"
-    " dense route unless FEATHER_PGS_PATCH_DENSE_PATHS=0, and native sparse factors take the worlds whose topology"
+    " dense route, and native sparse factors take the worlds whose topology"
     " they admit, own their rows and may select patch rows at sweep entry (sparse_mass_matrix.active_rows,"
     " FEATHER_PGS_PATCH_ACTIVE_ROWS). Where native sparse factors admit contact triplets"
     " (sparse_mass_matrix.contact_triplets, FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1), they fuse patch anchor units,"
@@ -63,16 +63,16 @@ _PATCH_ROUTE_PRECEDENCE = (
     " single-stage transaction (sparse_mass_matrix.contact_transaction, FEATHER_PGS_SPARSE_TRANSACTION)."
     " On the dense route an admitted paired factor sweep"
     " (paired_response.factor_coordinates) excludes the parallel tiers, keyed_rows and local_packets, even a tier"
-    " whose request declined sparse factors, and walks patch contact units (paired_response.contact_units) unless"
-    " FEATHER_PGS_PATCH_DENSE_PATHS=0. The row producer (contact_rows.producer) is the first admitted of"
+    " whose request declined sparse factors, and walks patch contact units (paired_response.contact_units)."
+    " The row producer (contact_rows.producer) is the first admitted of"
     " local_packets, keyed_rows (unless FEATHER_PGS_PATCH_PARALLEL_ROWS=0), the compact and sparse producers and"
-    " general, whose masked rows take the patch row law unless FEATHER_PGS_PATCH_DENSE_PATHS=0;"
+    " general, whose masked rows take the patch row law;"
     " contact_rows.builder_by_dof names each size's builder kernels and the law they write."
 )
 # Contact torsion (patch friction does not admit compliance) takes none of those routes.
 _ORDINARY_PATCH_ROUTES = (
     " Contact torsion and compliance keep ordinary factors, rows and serial sweeps, so"
-    " FEATHER_PGS_PATCH_ACTIVE_ROWS, FEATHER_PGS_PATCH_DENSE_PATHS, FEATHER_PGS_PATCH_PARALLEL_ROWS and"
+    " FEATHER_PGS_PATCH_ACTIVE_ROWS, FEATHER_PGS_PATCH_PARALLEL_ROWS and"
     " FEATHER_PGS_SPARSE_CONTACT_TRIPLETS select no route."
 )
 
@@ -424,11 +424,6 @@ def _general_kernels(method, patch, source) -> tuple:
         if patch:
             return (source.contact_row_prelude_patch, source.populate_world_J_masked_patch)
         return (source.contact_row_prelude, source.populate_world_J_masked)
-    if method == "native":
-        # get_row_build_native_kernel builds a new kernel object per call; name it without one.
-        return ("populate_world_J_native",)
-    if method == "fused_rows":
-        return (source.build_contact_rows,)
     if method == "per_contact":
         return (source.populate_world_J_for_size,)
     raise ValueError(f"No contact-row builder kernels are known for the method {method!r}.")
@@ -475,19 +470,13 @@ def _row_builder(solver, plan, size, source) -> dict:
     elif method == "compact_contact_boundary":
         from . import compact_contact  # noqa: PLC0415 - the owner's module; loaded with the owner
 
-        if solver._compact_contact_order is not None:
-            ordered = (
-                compact_contact._produce_ordered_patch_contacts if patch else compact_contact._produce_ordered_contacts
-            )
-            produce = (compact_contact._build_contact_order, ordered)
-        else:
-            produce = (compact_contact.produce_patch_contacts if patch else compact_contact.produce_contacts,)
+        produce = (compact_contact.produce_patch_contacts if patch else compact_contact.produce_contacts,)
         if size == solver._sparse_diagonal_response_size:
             # The marker encodes schedule links into the freshly published sparse DOF slots.
             kernels = (*produce, solver._mark_independent_sparse_contact_candidates_kernel)
         else:
             kernels = (compact_contact.clear_contact_response, *produce)
-    elif method in ("sparse_response", "sparse_free_response"):
+    elif method == "sparse_response":
         kernels = (*prepare, solver._sparse_contact_response_kernel)
     elif method == "sparse_diagonal":
         kernels = (*prepare, source.populate_sparse_diagonal_contact_response)
@@ -506,17 +495,15 @@ def _row_builder(solver, plan, size, source) -> dict:
 def _row_check(plan, source) -> dict | None:
     """Name, by DOF size, the builders the debug row checks launch besides builder_by_dof's.
 
-    FEATHER_PGS_CHECK_ROWS builds every size's native or masked rows into copies and compares them
-    with the per-contact rows the solve uses. FEATHER_PGS_CHECK_ROWS_FUSED rebuilds the combined
-    masked sizes' rows with the fused builder and compares them with the masked rows. None without
-    a check (ContactRowPlan.check).
+    FEATHER_PGS_CHECK_ROWS builds every size's masked rows into copies and compares them
+    with the per-contact rows the solve uses. None without a check (ContactRowPlan.check).
     """
     if plan.check is None:
         return None
-    sizes = plan.combined if plan.check == "fused_rows" else tuple(plan.methods)
     kernels = _general_kernels(plan.check, plan.law == "patch", source)
     return {
-        str(int(size)): {"method": plan.check, "kernels": _kernel_names(kernels), "law": plan.law} for size in sizes
+        str(int(size)): {"method": plan.check, "kernels": _kernel_names(kernels), "law": plan.law}
+        for size in plan.methods
     }
 
 
@@ -564,7 +551,6 @@ def _contact_rows(solver, source) -> dict:
         "keyed_rows": {"enabled": solver._keyed_rows is not None, "reason": solver._keyed_rows_reason},
         "compact_contact": {
             "boundary": bool(solver._compact_contact_boundary),
-            "order": solver._compact_contact_order is not None,
             "reason": compact_reason,
         },
         "compact_jacobian": bool(solver._compact_contact_jacobian),
@@ -665,7 +651,6 @@ def _sparse_mass_matrix(solver) -> dict:
         "reason": solver._sparse_selection_reason,
         "split": bool(solver._sparse_split),
         "velocity_limits": bool(solver._sparse_velocity_limits),
-        "prepare_contacts": bool(solver._sparse_prepare_contacts),
         "active_rows": bool(solver._sparse_active_rows),
         "active_rows_reason": solver._sparse_active_rows_reason,
         "support_table": bool(solver._sparse_row_support.enabled),
@@ -1313,7 +1298,7 @@ def _friction(solver) -> dict:
     reason = _BETA_REASONS[solver._friction_anchor_beta_source]
     if patch:
         parallel = "" if solver._parallel_contact_paths else "keyed rows, parallel matrix-free tiers and "
-        # FEATHER_PGS_PATCH_DENSE_PATHS=0 keeps patch friction off the resolved-world classifier.
+        # Patch friction reaches the resolved-world classifier on the dense paths only, not under torsion.
         classifier = "" if solver._patch_dense_paths else "the resolved-world classifier, "
         # FEATHER_PGS_PATCH_ACTIVE_ROWS=0 keeps patch friction off the sparse active-row scan.
         sparse = "" if solver._patch_active_rows else ", sparse active rows"
@@ -1341,10 +1326,6 @@ def _friction(solver) -> dict:
             "reason": solver._patch_frame_reuse_reason,
         },
         "pair_sort": _pair_sort(solver._friction_patches) if patch else None,
-        "conditional_nodes": {
-            "enabled": solver._friction_patches.conditional_nodes,
-            "reason": solver._patch_conditional_nodes_reason,
-        },
     }
 
 

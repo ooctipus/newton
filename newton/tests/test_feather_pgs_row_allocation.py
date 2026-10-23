@@ -16,7 +16,10 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
-from newton._src.solvers.feather_pgs.kernels import allocate_world_contact_slots, finalize_mf_constraint_counts
+from newton._src.solvers.feather_pgs.kernels import (
+    allocate_world_contact_slots,
+    finalize_constraint_counts_with_status,
+)
 
 _UNBOUNDED = 2**31 - 1
 
@@ -105,11 +108,12 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
         ],
         device=device,
     )
+    # The matrix-free family's finalizer, as the solver launches it for these rows.
     wp.launch(
-        finalize_mf_constraint_counts,
+        finalize_constraint_counts_with_status,
         dim=1,
-        inputs=[counter, row_capacity, 3, first_rejected],
-        outputs=[count],
+        inputs=[counter, row_capacity, 1, first_rejected],
+        outputs=[count, wp.zeros(4, dtype=wp.int32, device=device)],
         device=device,
     )
     return (

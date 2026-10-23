@@ -211,8 +211,7 @@ class TestCoalescedContact(unittest.TestCase):
             J_by_size={6: data.J},
             Y_by_size={6: data.Y},
             _mark_independent_sparse_contact_candidates_kernel=marker,
-            # The unordered point producer: no contact ordering and no patch row law.
-            _compact_contact_order=None,
+            # The point producer: no patch row law.
             _friction_anchors_enabled=False,
         )
         contacts = SimpleNamespace(
