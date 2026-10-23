@@ -135,7 +135,6 @@
   "kernels.pgs_ncp_residuals_diagnostic_velocity": "81f134a29e958698d070ab3686b2e9a5179aa9185f016417f53f944fcc4c72e3",
   "kernels.pgs_solve_loop": "8f30b170227d7001baead3c34ae141437009636b12c6929d9b1e3cb90be130fe",
   "kernels.pgs_solve_mf_loop": "310e0dd8b4be41683490bfddf89227cdd939cd4af7f435d453e127d781960034",
-  "kernels.pgs_solve_propagation_contact_loop": "f2c63c07639e9fb43ccea39f93b290bc2ffb65e6b7bc8dd1b3f056d297308c3d",
   "kernels.populate_connect_J_for_size": "3a01820a2dd736e3a561bb907db20622656da9153ecf0fb6630e674dd06ca6bc",
   "kernels.populate_joint_velocity_limit_J_for_size": "7df4a9b0e6c12ebc00a17f10f6f7b9bc4db4bd2254f924695ed4808f859b4733",
   "kernels.populate_mimic_J_for_size": "2b16f3e55e9f9b0bdb972eac3aec75d7b707939b04bc30b402c08207bad149ac",
