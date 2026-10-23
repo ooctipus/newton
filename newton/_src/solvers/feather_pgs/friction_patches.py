@@ -38,22 +38,17 @@ solver's default, a captured build skips the pair sort when the previous build
 was captured in the same graph over the same contact stream (its
 ``contact_generation`` array) and the host issued no write of that stream in
 between, which is the case on every solver substep that shares
-a collision frame (see :class:`_FrictionPatchState`). The solver's experimental
-opt-in ``FEATHER_PGS_PATCH_CONDITIONAL_NODES=1`` sorts the other captured builds
-under a conditional node that also skips empty frames and the frame whose pairs
-the slots already hold sorted.
+a collision frame (see :class:`_FrictionPatchState`).
 """
 
 import itertools
 import weakref
-from contextlib import nullcontext
 
 import numpy as np
 import warp as wp
 
 from ...math.spatial import velocity_at_point
 from ...sim.contacts import GENERATION_SENTINEL, capture_scope, contact_frame_write
-from .capture_joins import capture_has_unjoined_work
 from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
 
 # Grids are fixed at construction so CUDA graphs replay them. Their sizes count
@@ -115,8 +110,8 @@ CONTACT_PATH_RESOLVED = wp.constant(-2)
 # The contact generation no frame has: a recorded frame with it never matches.
 _FRAME_SENTINEL = wp.constant(wp.int64(GENERATION_SENTINEL))
 # Modes of _prepare_frame, the host's admission of a frame-reusing build: the
-# pair sort follows unconditionally, a conditional node sorts if the frame is
-# new, or the slots keep the sorted pairs of the frame an earlier build recorded.
+# pair sort follows unconditionally, or the slots keep the sorted pairs of the
+# frame an earlier build recorded. No build launches the kernel's detect mode.
 _FRAME_SORT = wp.constant(0)
 _FRAME_DETECT = wp.constant(1)
 _FRAME_KEEP = wp.constant(2)
@@ -1267,23 +1262,6 @@ def _build_pair(
             patches.phi[c] = wp.vec2(wp.dot(t0, error), wp.dot(t1, error))
 
 
-@wp.kernel(enable_backward=False, module="unique")
-def _record_sorted_frame(
-    generation: wp.array[wp.int32],
-    count: wp.array[int],
-    stream: wp.int64,
-    sorted_frame: wp.array[wp.int64],
-):
-    """Record the contact frame whose pairs the slots now hold sorted.
-
-    One thread runs it right after the sort, and _prepare_frame read the record
-    in an earlier launch.
-    """
-    sorted_frame[0] = wp.int64(generation[0])
-    sorted_frame[1] = wp.int64(count[0])
-    sorted_frame[2] = stream
-
-
 @wp.kernel(enable_backward=False)
 def _build(
     extent: wp.array[int],
@@ -1430,18 +1408,14 @@ class _FrictionPatchState:
     ``small_live_sort`` lets capacities up to ``_CHUNK_SORT_CAPACITY`` sort only
     their live slots, as capacities from ``_LIVE_SORT_CAPACITY`` on do.
 
-    With ``conditional_nodes``, captured builds that do not keep their pairs sort
-    under a conditional node that skips empty frames and the recorded frame;
-    eager builds then record the frames they sort for such a node. Contact frames
-    are identified by ``Contacts.contact_generation``, which every collision
-    pass and :meth:`newton.Contacts.clear` advance, together with the raw contact
-    count and the contact stream, a token of the generation counter array that
-    is never reused (see :meth:`stream_token`). Eager builds always sort.
+    Contact frames are identified by ``Contacts.contact_generation``, which every
+    collision pass and :meth:`newton.Contacts.clear` advance, together with the
+    raw contact count and the contact stream, a token of the generation counter
+    array that is never reused (see :meth:`stream_token`). Eager builds always
+    sort.
     """
 
-    def __init__(
-        self, model, capacity, enabled, phi, *, reuse_frames=False, conditional_nodes=False, small_live_sort=True
-    ):
+    def __init__(self, model, capacity, enabled, phi, *, reuse_frames=False, small_live_sort=True):
         self.view = FrictionPatches()
         self.view.enabled = int(enabled)
         self.view.phi = phi
@@ -1453,7 +1427,6 @@ class _FrictionPatchState:
         self.view.point_a = wp.zeros(n, dtype=wp.vec3, device=device)
         self.view.point_b = wp.zeros(n, dtype=wp.vec3, device=device)
         self.reuse_frames = bool(reuse_frames and enabled)
-        self.conditional_nodes = bool(conditional_nodes and enabled)
         self.small_live_sort = bool(small_live_sort)
         # (capture scope, weak generation array, frame-write tick) of the previous
         # captured build, which a build in the same scope may keep the pairs of.
@@ -1467,9 +1440,9 @@ class _FrictionPatchState:
         self.body_radius = wp.zeros(model.body_count, dtype=float, device=device)
         # The contact frame whose pairs the current slots hold sorted, as
         # (generation, raw count, contact stream); the sentinel generation makes
-        # the next build sort. _prepare_frame records a frame the sort follows,
-        # compares a reused one and publishes whether a node sorts, and
-        # _record_sorted_frame records the frame a node sorted.
+        # the next build sort. _prepare_frame records a frame the sort follows
+        # and compares a reused one. sort_pairs receives its sort flag, which
+        # only its detect mode writes and no build launches.
         self.sorted_frame = wp.full(3, GENERATION_SENTINEL, dtype=wp.int64, device=device)
         self.sort_pairs = wp.zeros(1, dtype=wp.int32, device=device)
         # Latched when a build that reuses sorted pairs finds another contact
@@ -1503,20 +1476,17 @@ class _FrictionPatchState:
         self._load_capture_modules()
 
     def _load_capture_modules(self):
-        """Load the modules of the kernels that captured builds launch first, on a CUDA device.
+        """Load the module of the kernel that captured builds launch first, on a CUDA device.
 
-        With frame reuse alone only captured builds launch _prepare_frame, and
-        only a conditional node's body launches _record_sorted_frame, so their
-        modules would otherwise first load inside a graph capture. Each kernel
-        has a module of its own: loading it compiles nothing else. CPU captures
-        build as eager ones do.
+        With frame reuse only captured builds launch _prepare_frame, so its module
+        would otherwise first load inside a graph capture. The kernel has a module
+        of its own: loading it compiles nothing else. CPU captures build as eager
+        ones do.
         """
         if not self.device.is_cuda:
             return
-        if self.reuse_frames or self.conditional_nodes:
+        if self.reuse_frames:
             _prepare_frame.module.load(self.device)
-        if self.conditional_nodes:
-            _record_sorted_frame.module.load(self.device)
 
     def update_geometry(self, model):
         """Refresh scales and retire affected history after explicit geometry edits."""
@@ -1571,12 +1541,10 @@ class _FrictionPatchState:
     def forget_frame(self):
         """Make the next build sort its pairs, as it does for a new contact frame.
 
-        Only a conditional node trusts the device record across builds; a kept
-        build follows a sort of its own capture scope, which records its frame.
+        The device record stays: a kept build follows a sort of its own capture
+        scope, which records its frame.
         """
         self._last_build = None
-        if self.conditional_nodes:
-            self.sorted_frame.fill_(GENERATION_SENTINEL)
 
     def stream_token(self, generation):
         """Return the token that names the contact stream whose generation counter is ``generation``.
@@ -1644,18 +1612,12 @@ class _FrictionPatchState:
         articulation_pair_gap_gate=0.0,
         friction_gap=float("inf"),
         friction_articulation_pairs_only=False,
-        capture_pause=nullcontext,
     ):
         """Build the current patch frame from ``contacts``.
 
         With frame reuse, a captured build whose contact frame the previous
         build of its capture scope sorted keeps those pairs instead of sorting
-        (see :class:`_FrictionPatchState`). ``capture_pause`` returns a context
-        manager entered around a build sorted under the opt-in conditional node,
-        which pauses the graph capture to record its body, so the caller joins
-        its forked streams on entry and records again the events it waits on
-        later. A capture that still holds forked work nobody joined cannot
-        pause; that build sorts unconditionally, as an eager build does.
+        (see :class:`_FrictionPatchState`).
         """
         bodies = 0 if state.body_q is None else state.body_q.shape[0]
         if bodies + model.shape_body.shape[0] + 2 != self.key_stride:
@@ -1675,8 +1637,7 @@ class _FrictionPatchState:
             friction_gap=friction_gap,
             friction_articulation_pairs_only=friction_articulation_pairs_only,
         )
-        tracked = self.reuse_frames or self.conditional_nodes
-        generation = getattr(contacts, "contact_generation", None) if tracked else None
+        generation = getattr(contacts, "contact_generation", None) if self.reuse_frames else None
         scope = None
         tick = None
         if generation is None:
@@ -1694,15 +1655,14 @@ class _FrictionPatchState:
                 # The previous build of this capture scope sorted this stream's frame
                 # and the host issued no write of it since.
                 self._launch_prepare_frame(prepare_inputs, generation, stream, _FRAME_KEEP)
-            elif scope is None and not self.conditional_nodes:
+            elif scope is None:
                 # Eager builds sort as without frame reuse: no later build keeps
                 # their pairs, so their frame needs no record.
                 self._prepare_and_sort(prepare_inputs)
             else:
-                self._sort_frame(prepare_inputs, contacts, generation, stream, scope, capture_pause)
-                # A node pauses the capture, after which Warp names the main graph's
-                # raw handle; later builds of the graph compare with that scope.
-                scope = self._capture_scope()
+                # The prepare records the frame that the sort then orders.
+                self._launch_prepare_frame(prepare_inputs, generation, stream, _FRAME_SORT)
+                self._order_pairs()
         self._last_build = None if scope is None else (scope, weakref.ref(generation), tick)
         self._launch_build(model, state)
 
@@ -1727,25 +1687,6 @@ class _FrictionPatchState:
         """Prepare and sort a frame that no record names, as builds without frame reuse do."""
         wp.launch(_prepare, dim=self.threads, inputs=prepare_inputs, outputs=[self.extent], device=self.device)
         self._order_pairs()
-
-    def _sort_frame(self, prepare_inputs, contacts, generation, stream, scope, capture_pause):
-        """Prepare and sort a frame-tracking build, under a conditional node where the opt-in allows one."""
-        branch = self._capture_branch() if self.conditional_nodes and scope is not None else None
-        # Only _order_pairs runs under the node: _prepare_frame computes the
-        # condition, and _build, the link, the seed and the finish stride over
-        # the frame's extent at other stages of the step, where each node
-        # would pause the capture again to skip microseconds of work.
-        with nullcontext() if branch is None else capture_pause():
-            if branch is not None and not self._capture_can_pause():
-                branch = None
-            if branch is None:
-                # The prepare records the frame that the sort then orders.
-                self._launch_prepare_frame(prepare_inputs, generation, stream, _FRAME_SORT)
-                self._order_pairs()
-            else:
-                self._launch_prepare_frame(prepare_inputs, generation, stream, _FRAME_DETECT)
-                record = (generation, contacts.rigid_contact_count, stream)
-                branch(self.sort_pairs, on_true=self._order_pairs, record=record)
 
     def _launch_build(self, model, state):
         """Build the pairs of the prepared, sorted slots."""
@@ -1819,7 +1760,7 @@ class _FrictionPatchState:
         ]
 
     def _launch_prepare_frame(self, prepare_inputs, generation, stream, mode):
-        """Prepare a frame-reusing build in ``mode`` (``_FRAME_SORT``, ``_FRAME_DETECT`` or ``_FRAME_KEEP``)."""
+        """Prepare a frame-reusing build in ``mode`` (``_FRAME_SORT`` or ``_FRAME_KEEP``)."""
         wp.launch(
             _prepare_frame,
             dim=self.threads,
@@ -1832,29 +1773,11 @@ class _FrictionPatchState:
         """Return the capture scope that this device's current stream records into, ``None`` when eager."""
         return capture_scope(self.device)
 
-    def _capture_branch(self):
-        """Return :func:`warp.capture_if` while Warp captures this device's stream, else ``None``.
-
-        Only a graph replay evaluates the condition on the device; eager builds
-        sort unconditionally, so no condition is read back on the host.
-        """
-        device = self.device
-        if device.is_cuda and device.captures.get(device.stream) is not None:
-            return wp.capture_if
-        return None
-
-    def _capture_can_pause(self):
-        """Whether the capture can pause for a conditional node: no forked stream holds unjoined work."""
-        return not capture_has_unjoined_work(self.device)
-
-    def _order_pairs(self, record=None):
+    def _order_pairs(self):
         """Sort the prepared slots by pair key, the work that only a new contact frame needs.
 
-        A captured build runs this as the body of its conditional node, so this is
-        the one place that lists what an empty or reused frame skips; work added
-        here must leave outputs that stay valid while later builds reuse the frame.
-        ``record``, the contact frame's ``(generation, count array, stream token)``,
-        is stored as the frame the slots now hold sorted.
+        A kept build skips exactly this, so work added here must leave outputs that
+        stay valid while later builds reuse the frame.
         """
         if self.live_sort:
             self._sort_live()
@@ -1862,8 +1785,6 @@ class _FrictionPatchState:
             # Empty slots hold INT64_MAX, whose low key_bits are all ones: no pair
             # key exceeds them, and the stable sort keeps live slots ahead of a tie.
             wp.utils.radix_sort_pairs(self.current.keys, self.current.indices, self.capacity, end_bit=self.key_bits)
-        if record is not None:
-            wp.launch(_record_sorted_frame, dim=1, inputs=[*record], outputs=[self.sorted_frame], device=self.device)
 
     def _sort_live(self):
         """Stably sort the live slots by pair key and leave every other slot untouched.

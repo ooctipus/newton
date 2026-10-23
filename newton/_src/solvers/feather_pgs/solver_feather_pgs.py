@@ -53,7 +53,6 @@ from . import environment_flags as _environment_flags
 from . import execution_plan as _execution_plan
 from . import row_metadata as _row_metadata
 from .body_mapping import build_body_maps
-from .capture_joins import capture_queries_available
 from .configuration import resolve_kernel_choices
 from .contact_row_plan import SHARED_METADATA_PRODUCERS, contact_row_plan
 from .contact_torsion import (
@@ -1610,13 +1609,7 @@ class SolverFeatherPGS(SolverBase):
                 step groups its contacts by the previous step's sorted pairs. Rewriting only
                 contact points, normals or margins is exact, since pairs depend on the shapes
                 alone and every step recomputes the rest. ``FEATHER_PGS_PATCH_FRAME_REUSE=0``
-                sorts every step. The experimental opt-in ``FEATHER_PGS_PATCH_CONDITIONAL_NODES=1``
-                sorts the other captured steps under a conditional graph node that skips empty
-                contact frames and the frame sorted last (the same contact stream,
-                ``contact_generation`` value and contact count). The node pauses the capture once per
-                such step: an event recorded before ``step()`` cannot be waited on after it, and a
-                step taken while a stream forked by the caller still holds unjoined work sorts
-                unconditionally.
+                sorts every step.
                 Defaults to None.
             contact_speculative_scale (float, optional): Multiplies the positive-gap position RHS
                 for normal contact rows on the dense, matrix-free free-rigid, and propagation
@@ -6712,16 +6705,12 @@ class SolverFeatherPGS(SolverBase):
         # Persistent state is owned by the body-pair patch builder, independently
         # of collision matching and the contact warm-start tables.
         frame_reuse, self._patch_frame_reuse_reason = self._patch_frame_reuse()
-        conditional_nodes, self._patch_conditional_nodes_reason = self._patch_conditional_nodes(
-            device, frame_reuse=frame_reuse
-        )
         self._friction_patches = _FrictionPatchState(
             model,
             max_contacts,
             self._friction_anchors_enabled,
             wp.zeros(max_contacts, dtype=wp.vec2, device=device),
             reuse_frames=frame_reuse,
-            conditional_nodes=conditional_nodes,
             # Small frames sort their live slots only, so empty ones cost no sort; the
             # opt-out keeps the radix sort of every frame, the previous path.
             small_live_sort=frame_reuse,
@@ -8617,32 +8606,6 @@ class SolverFeatherPGS(SolverBase):
         """
         if self._memset_done_event[slot] is not None and not self._memset_done_seeded[slot]:
             stream.wait_event(self._memset_done_event[slot])
-
-    @contextmanager
-    def _double_buffer_capture_pause(self):
-        """Keep the double buffer valid across a pause of the graph capture.
-
-        The patch build enters this around a captured build, whose conditional
-        node pauses the capture to record its body. The pause ends the capture,
-        which must then have joined every forked stream, and no event recorded
-        before it can be waited on after it. The memset stream forked at the end
-        of a step is joined two steps later, so while it takes part in the
-        capture the main stream waits for both buffer slots on entry, before the
-        build looks for unjoined work. Both slots are recorded again on exit;
-        each slot's consumer still waits for its memset.
-        """
-        stream = self._memset_stream
-        events = self._memset_done_event if stream is not None else []
-        main_stream = wp.get_stream(self.model.device) if events else None
-        if stream is not None and stream.is_capturing:
-            # Forked by an earlier step of this capture, so both slots hold
-            # events of this capture: that step's and one already waited on.
-            for slot in range(len(events)):
-                self._wait_memset_done(main_stream, slot)
-        yield
-        for slot, event in enumerate(events):
-            if event is not None:
-                self._record_memset_done(slot, main_stream.record_event())
 
     def reset_diagnostic_logs(self) -> None:
         """Clear per-step PGS diagnostic logs populated when ``pgs_debug=True``.
@@ -13897,48 +13860,6 @@ class SolverFeatherPGS(SolverBase):
             f"{_CHUNK_SORT_CAPACITY:,} contact slots."
         )
 
-    def _patch_conditional_nodes(self, device, *, frame_reuse=False) -> tuple[bool, str]:
-        """Return whether captured graphs branch around the patch pair sort, with the reason.
-
-        Conditional nodes skip the sort for an empty contact frame and for the last
-        sorted frame (see :class:`_FrictionPatchState`); with ``frame_reuse`` only
-        builds that do not keep their pairs statically take one. They are an
-        experimental opt-in: only ``FEATHER_PGS_PATCH_CONDITIONAL_NODES=1``
-        requests them.
-        """
-        if not self._friction_anchors_enabled:
-            return False, "Point friction sorts no patch pairs."
-        unconditional = (
-            "captured builds that do not keep their pairs sort unconditionally"
-            if frame_reuse
-            else "the patch pair sort is unconditional"
-        )
-        if os.environ.get("FEATHER_PGS_PATCH_CONDITIONAL_NODES", "0") != "1":
-            return False, (
-                "Conditional graph nodes are an experimental opt-in that FEATHER_PGS_PATCH_CONDITIONAL_NODES=1 "
-                f"enables; {unconditional}."
-            )
-        if not device.is_cuda:
-            return False, f"Conditional graph nodes need a CUDA device; {unconditional}."
-        if not wp.is_conditional_graph_supported():
-            return False, (
-                f"Conditional graph nodes need a CUDA 12.4+ driver and a Warp build with CUDA 12.4+; {unconditional}."
-            )
-        if not capture_queries_available():
-            return False, (
-                "The CUDA driver's stream capture queries, which tell whether a capture can pause for a "
-                f"conditional node, could not be loaded; {unconditional}."
-            )
-        if frame_reuse:
-            return True, (
-                "Captured builds that do not keep their pairs sort under a conditional node that skips empty "
-                "contact frames and the last sorted frame."
-            )
-        return True, (
-            "Captured graphs sort patch pairs under a conditional node that skips empty contact frames and "
-            "substeps sharing the last sorted collision frame."
-        )
-
     def _build_friction_patches(self, state_in, contacts):
         """Construct the shared contact law independently of the dynamics owner."""
         if self._friction_anchors_enabled and contacts is not None:
@@ -13953,7 +13874,6 @@ class SolverFeatherPGS(SolverBase):
                 articulation_pair_gap_gate=self.articulation_pair_contact_gap_gate,
                 friction_gap=self.contact_friction_gap_threshold,
                 friction_articulation_pairs_only=self.contact_friction_articulation_pairs_only,
-                capture_pause=self._double_buffer_capture_pause,
             )
 
     @staticmethod

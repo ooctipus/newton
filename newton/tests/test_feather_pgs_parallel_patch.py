@@ -1915,11 +1915,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
                 patch.multiple(source, **ROW_SWITCHES_OFF),
                 patch.dict(os.environ, {_SWITCH: "1"}),
             ):
-                for name in (
-                    "FEATHER_PGS_KEYED_ROWS",
-                    "FEATHER_PGS_PATCH_FRAME_REUSE",
-                    "FEATHER_PGS_PATCH_CONDITIONAL_NODES",
-                ):
+                for name in ("FEATHER_PGS_KEYED_ROWS", "FEATHER_PGS_PATCH_FRAME_REUSE"):
                     os.environ.pop(name, None)
                 if reuse is not None:
                     os.environ["FEATHER_PGS_PATCH_FRAME_REUSE"] = reuse

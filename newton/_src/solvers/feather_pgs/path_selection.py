@@ -1327,10 +1327,6 @@ def _friction(solver) -> dict:
             "reason": solver._patch_frame_reuse_reason,
         },
         "pair_sort": _pair_sort(solver._friction_patches) if patch else None,
-        "conditional_nodes": {
-            "enabled": solver._friction_patches.conditional_nodes,
-            "reason": solver._patch_conditional_nodes_reason,
-        },
     }
 
 

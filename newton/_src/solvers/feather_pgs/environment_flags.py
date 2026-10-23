@@ -396,13 +396,6 @@ FLAGS = declare(
         "needs both off.",
     ),
     _flag(
-        "FEATHER_PGS_PATCH_CONDITIONAL_NODES",
-        "experiment",
-        _SOLVER,
-        "=1 sorts captured patch builds that do not keep their pairs under a conditional graph node that skips "
-        "empty and already sorted contact frames (default 0: other values keep that sort unconditional).",
-    ),
-    _flag(
         "FEATHER_PGS_PATCH_DENSE_PATHS",
         "policy",
         _SOLVER,

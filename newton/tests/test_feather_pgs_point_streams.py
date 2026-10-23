@@ -50,7 +50,6 @@ _PATCH_ONLY = frozenset(
         "friction_patches._merge_runs",
         "friction_patches._prepare",
         "friction_patches._prepare_frame",
-        "friction_patches._record_sorted_frame",
         "friction_patches._reset_history",
         "friction_patches._sort_chunks",
         "friction_patches.finish_patch_impulses",
