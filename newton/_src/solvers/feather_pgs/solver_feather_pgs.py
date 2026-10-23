@@ -96,6 +96,8 @@ from .kernels import (
     PGS_LOCAL_SOLVE_OWNER_SINGLE,
     PREELIM_MAX_ROWS,
     PROPAGATION_COLOR_TAIL,
+    _get_tree_fk_kernel,
+    _get_tree_tau_kernel,
     accumulate_articulation_tau,
     accumulate_group_diag_worlds,
     accumulate_propagation_warmstart_body_impulses,
@@ -809,6 +811,153 @@ class _FeatherPGSModelPlan:
         for array in arrays:
             array.setflags(write=False)
         return cls(*arrays, world_count)
+
+
+@dataclass(frozen=True)
+class _FeatherPGSTreeGroup:
+    """Articulations sharing an execution width, without cached physical data."""
+
+    lanes: int
+    """Power-of-two lane count per articulation."""
+    articulation_count: int
+    """Number of articulations in this group."""
+    max_levels: int
+    """Uniform level count, including empty padding for shorter trees."""
+    articulations: wp.array[int]
+    """Global articulation indices."""
+    level_offsets: wp.array2d[int]
+    """Segment offsets per articulation and level, shape [count, max_levels + 1]."""
+    segment_offsets: wp.array[int]
+    """Offsets into the joint list for each unary-chain or joint-sized segment."""
+    segment_joints: wp.array[int]
+    """Global joint indices, ordered from each segment's parent to its child."""
+    child_offsets: wp.array[int]
+    """Offsets into the child-segment list for backward reductions."""
+    child_segments: wp.array[int]
+    """Child segments in descending authored joint order, preserving force sums."""
+
+
+@dataclass(frozen=True)
+class _FeatherPGSTreePlan:
+    """Schedule independent tree branches together; keep chains in single lanes.
+
+    Only topology is cached. Frames, velocities and inertial properties remain
+    live model/state inputs. Rebuild the solver after changing joint topology.
+    """
+
+    groups: tuple[_FeatherPGSTreeGroup, ...]
+    """Groups with independent execution widths and level tables."""
+
+    @classmethod
+    def build(cls, model: Model, articulation_joint_end: wp.array[int]) -> "_FeatherPGSTreePlan | None":
+        """Compress unary chains and schedule forks, retaining unsafe-tree fallback."""
+        if not model.articulation_count or not model.joint_count:
+            return None
+        starts = model.articulation_start.numpy()
+        ends = articulation_joint_end.numpy()
+        parents = model.joint_parent.numpy()
+        children = model.joint_child.numpy()
+        # Loop closures have distinct public-FK and tree-prefix ownership. Keep
+        # their existing path rather than silently dropping a publication writer.
+        if not np.array_equal(ends, starts[1:]):
+            return None
+        if np.any(children < 0):
+            return None
+        owners = np.bincount(children[children >= 0], minlength=model.body_count)
+        if np.any(owners > 1):
+            return None
+        body_owner = np.full(model.body_count, -1, dtype=np.int32)
+        body_owner[children] = np.arange(model.joint_count, dtype=np.int32)
+        joint_children = [[] for _ in range(model.joint_count)]
+        joint_depth = np.zeros(model.joint_count, dtype=np.int32)
+        for art in range(model.articulation_count):
+            start, end = int(starts[art]), int(ends[art])
+            for joint in range(start, end):
+                parent = int(parents[joint])
+                if parent >= 0:
+                    parent_joint = int(body_owner[parent])
+                    if not start <= parent_joint < joint:
+                        return None
+                    joint_children[parent_joint].append(joint)
+                    joint_depth[joint] = joint_depth[parent_joint] + 1
+
+        def schedule_cost(levels):
+            width = max(map(len, levels), default=1)
+            lanes = min(32, 1 << (width - 1).bit_length())
+            rounds = sum(
+                max(map(len, level[begin : begin + lanes])) for level in levels for begin in range(0, len(level), lanes)
+            )
+            return lanes, rounds
+
+        segment_depth = np.zeros(model.joint_count, dtype=np.int32)
+        grouped = {}
+        has_branches = False
+        for art in range(model.articulation_count):
+            start, end = int(starts[art]), int(ends[art])
+            levels = []
+            joint_levels = []
+            for joint in range(start, end):
+                joint_level = int(joint_depth[joint])
+                if joint_level == len(joint_levels):
+                    joint_levels.append([])
+                joint_levels[joint_level].append([joint])
+                parent = int(parents[joint])
+                level = 0
+                if parent >= 0:
+                    parent_joint = int(body_owner[parent])
+                    if len(joint_children[parent_joint]) == 1:
+                        continue
+                    level = int(segment_depth[parent_joint]) + 1
+                segment = [joint]
+                while len(joint_children[segment[-1]]) == 1:
+                    segment.append(joint_children[segment[-1]][0])
+                segment_depth[segment] = level
+                if level == len(levels):
+                    levels.append([])
+                levels[level].append(segment)
+            lanes, rounds = schedule_cost(levels)
+            joint_lanes, joint_rounds = schedule_cost(joint_levels)
+            # Long chains can hold up unrelated forks. Bound logical joint rounds;
+            # this topology-only span proxy is not a guarantee of GPU runtime.
+            if rounds > joint_rounds:
+                levels, lanes = joint_levels, joint_lanes
+            has_branches |= lanes > 1
+            grouped.setdefault(lanes, []).append((art, levels))
+        if not has_branches:
+            return None
+        groups = []
+        for lanes, trees in sorted(grouped.items()):
+            max_levels = max(len(levels) for _, levels in trees)
+            offsets = np.empty((len(trees), max_levels + 1), dtype=np.int32)
+            segments = []
+            for row, (_, levels) in enumerate(trees):
+                offsets[row, 0] = len(segments)
+                for level in range(max_levels):
+                    if level < len(levels):
+                        segments.extend(levels[level])
+                    offsets[row, level + 1] = len(segments)
+            segment_ids = {segment[0]: index for index, segment in enumerate(segments)}
+            segment_offsets, joints = [0], []
+            child_offsets, child_segments = [0], []
+            for segment in segments:
+                joints.extend(segment)
+                segment_offsets.append(len(joints))
+                child_segments.extend(segment_ids[child] for child in reversed(joint_children[segment[-1]]))
+                child_offsets.append(len(child_segments))
+            groups.append(
+                _FeatherPGSTreeGroup(
+                    lanes=lanes,
+                    articulation_count=len(trees),
+                    max_levels=max_levels,
+                    articulations=wp.array([art for art, _ in trees], dtype=wp.int32, device=model.device),
+                    level_offsets=wp.array(offsets, dtype=wp.int32, device=model.device),
+                    segment_offsets=wp.array(segment_offsets, dtype=wp.int32, device=model.device),
+                    segment_joints=wp.array(joints, dtype=wp.int32, device=model.device),
+                    child_offsets=wp.array(child_offsets, dtype=wp.int32, device=model.device),
+                    child_segments=wp.array(child_segments, dtype=wp.int32, device=model.device),
+                )
+            )
+        return cls(tuple(groups))
 
 
 # Retain the internal metadata API while sharing its implementation.
@@ -1789,9 +1938,14 @@ class SolverFeatherPGS(SolverBase):
                 at a time). None defaults to 1. Defaults to None.
             use_parallel_streams (bool, optional): Dispatch size groups on separate CUDA streams.
                 Defaults to True.
-            parallel_tree: Deprecated; has no effect and will be removed. Kinematics, inverse dynamics
-                and publication run their ordinary kernels or the held-tree owner, which is
-                tree-parallel on CUDA. ``True`` emits a :class:`DeprecationWarning`. Defaults to False.
+            parallel_tree: Opt in to parallel branches for forward dynamics, backward
+                force reduction and state publication on eligible CUDA trees. Defaults
+                to False, retaining serial traversal and its existing launch layouts
+                without allocating a tree plan or branch-wrench scratch. Broad trees
+                can benefit, but narrow trees and interactions with other kernels can
+                regress; measure the full step before enabling. CPU, differentiable,
+                wholly unbranched and unsupported topologies retain serial execution.
+                Construction-only; recreate the solver to change this selection.
             drive_mode (str, optional): Joint target drive implementation.
                 ``"augmented"`` keeps the legacy FeatherPGS implicit-PD path
                 that folds drive stiffness into the articulated mass matrix.
@@ -3152,14 +3306,21 @@ class SolverFeatherPGS(SolverBase):
 
         self._init_double_buffer_stream()
 
-        if parallel_tree:
-            warnings.warn(
-                "parallel_tree is deprecated and has no effect: kinematics, inverse dynamics and publication run "
-                "their ordinary kernels or the held-tree owner. Stop passing it; it will be removed in a future "
-                "release.",
-                DeprecationWarning,
-                stacklevel=_CONSTRUCTOR_CALLER,
+        # Scheduling is independent of cache eligibility: velocity-limited
+        # articulations still expose parallel branches after prescaling.
+        self._tree_plan = (
+            _FeatherPGSTreePlan.build(model, self.articulation_joint_end)
+            if parallel_tree and model.device.is_cuda and not model.requires_grad
+            else None
+        )
+        self._tree_net_wrenches = (
+            tuple(
+                wp.empty(group.segment_offsets.size - 1, dtype=wp.spatial_vector, device=model.device)
+                for group in self._tree_plan.groups
             )
+            if self._tree_plan is not None and self._direct_branch_tau_kernel is None
+            else ()
+        )
 
         self.contact_torsion_device = bool(contact_torsion_device)
         if self._contact_torsion_enabled and self.contact_torsion_device:
@@ -11756,6 +11917,27 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
+    def _launch_tree_fk(self, mode: str, inputs: list, outputs: list) -> None:
+        """Run complete independent branches with one cooperative launch per width."""
+        for group in self._tree_plan.groups:
+            per_warp = 32 // group.lanes
+            wp.launch(
+                _get_tree_fk_kernel(group.lanes, mode),
+                dim=((group.articulation_count + per_warp - 1) // per_warp, 32),
+                inputs=[
+                    group.articulation_count,
+                    group.max_levels,
+                    group.articulations,
+                    group.level_offsets,
+                    group.segment_offsets,
+                    group.segment_joints,
+                    *inputs,
+                ],
+                outputs=outputs,
+                block_dim=32,
+                device=self.model.device,
+            )
+
     def _launch_velocity_prescale(self, joint_qd: wp.array, prescaled_joint_qd: wp.array) -> None:
         """Write every DOF's PhysX-prescaled joint velocity in one launch, without a separate copy."""
         model = self.model
@@ -11845,14 +12027,17 @@ class SolverFeatherPGS(SolverBase):
             state_aug.body_a_s,
             self._fk_id_cache_valid,
         ]
-        wp.launch(
-            eval_rigid_fk_id,
-            dim=model.articulation_count,
-            inputs=fk_inputs,
-            outputs=fk_outputs,
-            block_dim=16,
-            device=model.device,
-        )
+        if self._tree_plan is not None:
+            self._launch_tree_fk("id", fk_inputs, fk_outputs)
+        else:
+            wp.launch(
+                eval_rigid_fk_id,
+                dim=model.articulation_count,
+                inputs=fk_inputs,
+                outputs=fk_outputs,
+                block_dim=16,
+                device=model.device,
+            )
         global_inertia_ready = None
         if parallel_global_refresh:
             inertia_stream = self._global_inertia_stream
@@ -11979,6 +12164,29 @@ class SolverFeatherPGS(SolverBase):
             self.articulation_origin,
         ]
         if self._direct_branch_tau_kernel is None:
+            if self._tree_plan is not None:
+                for group, net_wrench in zip(self._tree_plan.groups, self._tree_net_wrenches, strict=True):
+                    per_warp = 32 // group.lanes
+                    wp.launch(
+                        _get_tree_tau_kernel(group.lanes),
+                        dim=((group.articulation_count + per_warp - 1) // per_warp, 32),
+                        inputs=[
+                            group.articulation_count,
+                            group.max_levels,
+                            group.articulations,
+                            group.level_offsets,
+                            group.segment_offsets,
+                            group.segment_joints,
+                            group.child_offsets,
+                            group.child_segments,
+                            *tau_inputs,
+                            int(add_to_existing),
+                        ],
+                        outputs=[state_aug.body_ft_s, state_aug.joint_tau, net_wrench],
+                        block_dim=32,
+                        device=model.device,
+                    )
+                return
             wp.launch(
                 eval_rigid_tau_add if add_to_existing else eval_rigid_tau,
                 dim=model.articulation_count,
@@ -16788,7 +16996,30 @@ class SolverFeatherPGS(SolverBase):
         """Publish kinematics and prepare reusable inverse dynamics for the next step."""
         model = self.model
         if not self._fk_id_cache_enabled:
-            eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+            if self._tree_plan is None:
+                eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+            else:
+                self._launch_tree_fk(
+                    "public",
+                    [
+                        model.joint_articulation,
+                        state_out.joint_q,
+                        state_out.joint_qd,
+                        model.joint_q_start,
+                        model.joint_qd_start,
+                        model.joint_type,
+                        model.joint_parent,
+                        model.joint_child,
+                        model.joint_X_p,
+                        model.joint_X_c,
+                        model.joint_axis,
+                        model.joint_dof_dim,
+                        model.body_com,
+                        model.body_flags,
+                        int(BodyFlags.ALL),
+                    ],
+                    [state_out.body_q, state_out.body_qd],
+                )
             return
 
         body_q_com = state_aug.body_q_com
@@ -16827,14 +17058,41 @@ class SolverFeatherPGS(SolverBase):
             body_a_s,
             self._fk_id_cache_valid,
         ]
-        wp.launch(
-            eval_rigid_fk_kinematics,
-            dim=model.articulation_count,
-            inputs=fk_inputs,
-            outputs=fk_outputs,
-            block_dim=16,
-            device=model.device,
-        )
+        if self._tree_plan is not None:
+            self._launch_tree_fk(
+                "kinematics",
+                [
+                    *fk_inputs,
+                    model.body_mass,
+                    model.body_inertia,
+                    self.is_free_rigid,
+                    0,
+                    0,
+                    0,
+                    model.gravity,
+                ],
+                [
+                    state_out.body_q,
+                    body_q_com,
+                    articulation_origin,
+                    joint_S_s,
+                    body_I_s,
+                    body_inertia_terms,
+                    body_v_s,
+                    body_f_s,
+                    body_a_s,
+                    self._fk_id_cache_valid,
+                ],
+            )
+        else:
+            wp.launch(
+                eval_rigid_fk_kinematics,
+                dim=model.articulation_count,
+                inputs=fk_inputs,
+                outputs=fk_outputs,
+                block_dim=16,
+                device=model.device,
+            )
         wp.launch(
             finalize_body_dynamics,
             dim=model.body_count,
