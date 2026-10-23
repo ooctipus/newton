@@ -346,16 +346,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 enable_joint_velocity_limits=True,
             )
 
-        for pgs_kernel in ("tiled_contact", "streaming"):
-            with self.subTest(pgs_kernel=pgs_kernel):
-                with self.assertRaisesRegex(ValueError, "contact-only"):
-                    SolverFeatherPGS(
-                        model,
-                        pgs_mode="split",
-                        pgs_kernel=pgs_kernel,
-                        enable_joint_limits=True,
-                    )
-
     def test_default_kwargs_produce_identical_kernel_selection(self):
         model = _build_chain_model()
         implicit = SolverFeatherPGS(model)

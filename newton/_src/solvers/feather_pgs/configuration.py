@@ -8,7 +8,7 @@ _KERNEL_CHOICES = {
     "trisolve_kernel": ("auto", "tiled", "loop"),
     "hinv_jt_kernel": ("auto", "tiled", "par_row"),
     "delassus_kernel": ("auto", "tiled", "par_row_col"),
-    "pgs_kernel": ("auto", "loop", "tiled_row", "tiled_contact", "streaming"),
+    "pgs_kernel": ("auto", "loop", "tiled_row"),
     "sparse_mass_matrix": ("auto", "on", "off"),
     "cached_dynamics": ("auto", "on", "off"),
 }
@@ -30,7 +30,6 @@ def resolve_kernel_choices(
     *,
     is_cpu: bool,
     pgs_mode: str,
-    enable_joint_limits: bool,
 ) -> tuple[dict[str, str], bool, dict[str, str], dict[str, str]]:
     """Return effective choices, explicit dense ownership, construction-time reasons and ignored requests.
 
@@ -43,8 +42,6 @@ def resolve_kernel_choices(
     """
     pgs_kernel = requested["pgs_kernel"]
     matrix_free = pgs_mode == "matrix_free"
-    if not matrix_free and enable_joint_limits and pgs_kernel in ("tiled_contact", "streaming"):
-        raise ValueError(f"pgs_kernel={pgs_kernel!r} is contact-only and cannot solve joint-limit rows")
     ignored = {}
     for name, value in requested.items():
         if value not in _KERNEL_CHOICES[name]:

@@ -34,14 +34,7 @@ _APPLIED_ATTRIBUTES = {
 
 _BETA_REASONS = {
     "default": "friction_anchor_beta omitted: persistent patch friction at the 0.2 default.",
-    "default_point_solver": (
-        "friction_anchor_beta omitted with a point-contact solver (a coupled friction_mode or a contact-only split"
-        " pgs_kernel): point friction."
-    ),
-    "default_point_kernel_request": (
-        "friction_anchor_beta omitted with a contact-only pgs_kernel request, which matrix_free mode ignores:"
-        " point friction."
-    ),
+    "default_point_solver": "friction_anchor_beta omitted with a coupled friction_mode: point friction.",
     "default_compliance": "friction_anchor_beta omitted with contact_compliance: point friction.",
     "argument": "friction_anchor_beta passed explicitly.",
 }
@@ -145,6 +138,8 @@ _EFFECTIVE = {
     "mf_gs_parallel_rows": lambda solver: int(solver._ink_rows),
     "mf_gs_parallel_matrix_free": lambda solver: bool(solver.mf_gs_parallel_matrix_free and solver._ink_rows > 0),
     "mf_gs_incremental_rows": lambda solver: int(solver._incremental_rows),
+    # Deprecated: no kernel reads it.
+    "pgs_chunk_size": lambda solver: None,
     "use_parallel_streams": _streams_created,
     "propagation_cached_response": lambda solver: bool(solver._propagation_cached_response_active),
     "mf_gs_parallel_linked_velocity_limit_pass": lambda solver: bool(
@@ -749,10 +744,6 @@ def _sweep(solver, source) -> dict:
                 "kernels": [_key(kernel) for kernel in budgets or (solver._pgs_solve_tiled_row_kernel,)],
                 "row_budgets": bool(budgets),
             }
-        elif solver.pgs_kernel == "tiled_contact":
-            dense = {"kernels": [_key(solver._pgs_solve_tiled_contact_kernel)]}
-        elif solver.pgs_kernel == "streaming":
-            dense = {"kernels": [_key(solver._pgs_solve_streaming_kernel)]}
         else:
             loop = source.pgs_solve_loop_unit if solver._dense_contact_unit else source.pgs_solve_loop
             dense = {"kernels": [_key(loop)]}

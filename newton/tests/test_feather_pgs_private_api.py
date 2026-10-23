@@ -15,8 +15,6 @@ _TILED_KERNEL_HELPERS = (
     "_get_hinv_jt_fused_kernel",
     "_get_delassus_kernel",
     "_get_pgs_solve_tiled_row_kernel",
-    "_get_pgs_solve_tiled_contact_kernel",
-    "_get_pgs_solve_streaming_kernel",
     "_get_pgs_solve_mf_kernel",
 )
 
