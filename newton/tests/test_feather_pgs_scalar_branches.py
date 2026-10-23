@@ -1471,12 +1471,12 @@ class TestScalarBranchRule(unittest.TestCase):
     def test_owner_proves_the_scalar_topology_through_its_tree_groups(self):
         """Validate a notification with the owner's and the arm group's proofs alone, and still refuse new topology.
 
-        The arm group's proof holds the model topology and art_to_world and
-        watches every joint frame, and the owner's coverage proof every size's
-        group map, so beside them the scalar group adds no proof (one launch and
-        one readback per notification) of its own: a moved key root is reported
-        through the arm group's proof, so the solver invalidates every cache. A
-        scalar group built alone keeps its proof.
+        The arm group's proof holds the model topology, the joint axes and
+        art_to_world and watches every joint frame, and the owner's coverage
+        proof every size's group map, so the scalar group holds no proof of its
+        own: a moved key root is reported through the arm group's proof, so the
+        solver invalidates every cache, and a turned key axis or a changed
+        parent is refused there.
         """
         joint = newton.ModelFlags.JOINT_PROPERTIES
         model = build_branch_model(worlds=2)
@@ -1487,11 +1487,18 @@ class TestScalarBranchRule(unittest.TestCase):
         with mock.patch.object(DeviceProof, "validate", autospec=True, side_effect=validate) as proofs:
             self.assertTrue(owner.validate_model(joint))
         self.assertEqual(proofs.call_count, 2)
-        self.assertIsNotNone(sb.ScalarBranchState(solver, solver._scalar_branches)._proof)
         frames = model.joint_X_p.numpy()
         frames[model.articulation_start.numpy()[owner.scalar.group_to_art.numpy()[1]], 2] += 0.01
         model.joint_X_p.assign(frames)
         self.assertFalse(owner.validate_model(joint))
+        self.assertTrue(owner.validate_model(joint))
+        axes = model.joint_axis.numpy().copy()
+        turned = axes.copy()
+        turned[owner.scalar.plan.dofs[0]] = (0.0, 0.0, 1.0)
+        model.joint_axis.assign(turned)
+        with self.assertRaisesRegex(RuntimeError, "joint_axis changed"):
+            owner.validate_model(joint)
+        model.joint_axis.assign(axes)
         self.assertTrue(owner.validate_model(joint))
         parents = model.joint_parent.numpy()
         parents[model.articulation_start.numpy()[owner.scalar.group_to_art.numpy()[0]] + 2] = -1
@@ -1621,8 +1628,7 @@ class TestScalarBranchKernels(unittest.TestCase):
                 frames[roots, :3] += (0.01, -0.02, 0.03)
                 frames[roots, 3:] = np.asarray(wp.quat_rpy(0.25, -0.1, 0.5))
                 pair.model.joint_X_p.assign(frames)
-                # The moved frames are reported, not refused; the solver then invalidates every cache.
-                self.assertFalse(pair.state.validate_model(newton.ModelFlags.JOINT_PROPERTIES))
+                # The owner's tree groups report the moved frames; the solver then invalidates every cache.
                 pair.state.invalidate()
                 pair.head._fk_id_cache_valid.zero_()
                 np.testing.assert_array_equal(pair.mine._fk_id_cache_valid.numpy()[pair.arts], 0)
@@ -1733,43 +1739,6 @@ class TestScalarBranchKernels(unittest.TestCase):
         self.assertIn(np.float32(1.0e-3), np.abs(head.joint_tau.numpy()[others]))
         np.testing.assert_array_equal(pair.mine.joint_tau.numpy()[pair.dofs], -7.0)
         np.testing.assert_array_equal(pair.mine.aug_row_K.numpy()[rows[pair.dofs]], -7.0)
-
-    def test_validation_accepts_frames_and_rejects_topology(self):
-        """Accept numeric and frame notifications; refuse a changed axis, parent or group map.
-
-        The group reads frames live: a notification that moved one reports it
-        (``False``, the caller invalidates), and the next that moves nothing
-        proves them unchanged (``True``, the caller keeps the caches). An axis
-        is frozen, as in the tree groups: a revolute leaf's inverse mass depends
-        on it and refreshes only at the mass cadence. A changed axis raises
-        before any frame is stored. Numeric notifications skip the proof
-        (``False``).
-        """
-        joint = newton.ModelFlags.JOINT_PROPERTIES
-        model = build_branch_model(worlds=2)
-        pair = _Pair(model)
-        self.assertTrue(pair.state.validate_model(joint))
-        frames = model.joint_X_p.numpy()
-        frames[:, 2] += 0.05
-        model.joint_X_p.assign(frames)
-        axes = model.joint_axis.numpy().copy()
-        turned = axes.copy()
-        turned[pair.dofs[0]] = (0.0, 0.0, 1.0)
-        model.joint_axis.assign(turned)
-        with self.assertRaisesRegex(RuntimeError, "joint_axis changed"):
-            pair.state.validate_model(joint)
-        # The refusal stored nothing: with the axis restored, the moved frames are still reported.
-        model.joint_axis.assign(axes)
-        self.assertFalse(pair.state.validate_model(joint))
-        self.assertTrue(pair.state.validate_model(newton.ModelFlags.ALL))
-        self.assertFalse(pair.state.validate_model(newton.ModelFlags.BODY_INERTIAL_PROPERTIES))
-        parents = model.joint_parent.numpy()
-        parents[model.articulation_start.numpy()[pair.arts[0]] + 2] = -1
-        model.joint_parent.assign(parents)
-        # A numeric notification cannot change topology and is not checked.
-        self.assertFalse(pair.state.validate_model(newton.ModelFlags.JOINT_DOF_PROPERTIES))
-        with self.assertRaisesRegex(RuntimeError, "joint_parent changed"):
-            pair.state.validate_model(joint)
 
 
 def _close(test, expected, actual, index, tag, *, rtol, atol):

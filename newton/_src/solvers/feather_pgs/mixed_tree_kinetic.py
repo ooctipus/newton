@@ -583,10 +583,9 @@ class MixedTreeKineticState:
 
             # A tree group's proof holds the model topology, the joint axes and
             # art_to_world and watches the joint frames, and the coverage proof every
-            # size's group map: beside one, the scalar group's own proof would add a
-            # launch and a readback to each notification for nothing.
-            proven = any(isinstance(group, TreeKineticState) for group in self.groups)
-            self.scalar = ScalarBranchState(solver, scalar, admission=admission, prove=not proven)
+            # size's group map, so the scalar group needs no proof of its own: the
+            # sparse-diagonal pair always leaves a tree group beside it.
+            self.scalar = ScalarBranchState(solver, scalar, admission=admission)
             self.groups.append(self.scalar)
         # The existing solver lifecycle delegates factor refresh to this binding.
         self.sparse = self
