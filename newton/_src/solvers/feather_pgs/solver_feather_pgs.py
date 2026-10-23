@@ -1068,7 +1068,6 @@ _MFGS_RESIDENT_METADATA_MAX_BYTES = _execution_plan._MFGS_RESIDENT_METADATA_MAX_
 _MFGS_TILE_SHARED_STORAGE_BYTES = _execution_plan._MFGS_TILE_SHARED_STORAGE_BYTES
 _HINV_JT_MAX_CHUNK_SIZE = _execution_plan._HINV_JT_MAX_CHUNK_SIZE
 _FUSED_ROW_CHUNK = _execution_plan._FUSED_ROW_CHUNK
-_use_resident_mfgs_metadata = _execution_plan._use_resident_mfgs_metadata
 _MFGSStorage = _execution_plan._MFGSStorage
 _select_mfgs_storage = _execution_plan._select_mfgs_storage
 _fused_response_chunk_size = _execution_plan._fused_response_chunk_size
@@ -8516,6 +8515,8 @@ class SolverFeatherPGS(SolverBase):
     def reset_diagnostic_logs(self) -> None:
         """Clear per-step PGS diagnostic logs populated when ``pgs_debug=True``.
 
+        Deprecated: no Newton code calls it, and it will be removed in a future release.
+
         :attr:`_pgs_convergence_log` and :attr:`_pgs_ncp_residual_log` are
         append-only across :meth:`step` calls so one solver instance can
         accumulate a trace across many frames.  A replay / sweep harness
@@ -8524,6 +8525,12 @@ class SolverFeatherPGS(SolverBase):
         corresponds to exactly one replayed step.  ``pgs_warmstart``
         impulses and all device-side solver buffers are left untouched.
         """
+        warnings.warn(
+            "SolverFeatherPGS.reset_diagnostic_logs() is deprecated and will be removed in a future release; "
+            "the pgs_debug logs it clears are private.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._pgs_convergence_log = []
         self._pgs_ncp_residual_log = []
 
@@ -19026,12 +19033,10 @@ def _get_paired_hinv_jt_kernel(
     warps_per_block: int = 4,
     *,
     factor_coordinates: bool = False,
-    active_list: bool = False,
 ) -> "wp.Kernel":
     """Build a response kernel with one warp per row and one pair per block.
 
-    ``active_list`` launches one block per entry of a compact world list instead of
-    one block per primary group; CPU devices run the same law serially.
+    CPU devices run the same law serially.
     """
     cpu = str(device_arch) == "cpu"
     total_dofs = primary_dofs + secondary_dofs
@@ -19296,65 +19301,14 @@ def _get_paired_hinv_jt_kernel(
             world_diag,
         )
 
-    def paired_hinv_jt_active_template(
-        primary_Hinv: wp.array3d[float],
-        primary_Linv: wp.array3d[float],
-        primary_J: wp.array3d[float],
-        primary_group_to_art: wp.array[int],
-        secondary_Hinv: wp.array3d[float],
-        secondary_Linv: wp.array3d[float],
-        secondary_J: wp.array3d[float],
-        secondary_group_to_art: wp.array[int],
-        secondary_group_by_primary: wp.array[int],
-        art_to_world: wp.array[int],
-        articulation_world_dof_offset: wp.array[int],
-        world_constraint_count: wp.array[int],
-        world_mf_constraint_count: wp.array[int],
-        world_row_cfm: wp.array2d[float],
-        J_world: wp.array3d[float],
-        Y_world: wp.array3d[float],
-        world_diag: wp.array2d[float],
-        active_worlds: wp.array[int],
-        active_count: wp.array[int],
-        primary_group_by_world: wp.array[int],
-    ):
-        active_index, lane = wp.tid()
-        if wp.static(cpu):
-            if lane != 0:
-                return
-        if active_index >= active_count[0]:
-            return
-        primary_group = primary_group_by_world[active_worlds[active_index]]
-        paired_hinv_jt_native(
-            primary_group,
-            primary_Hinv,
-            primary_Linv,
-            primary_J,
-            primary_group_to_art,
-            secondary_Hinv,
-            secondary_Linv,
-            secondary_J,
-            secondary_group_to_art,
-            secondary_group_by_primary,
-            art_to_world,
-            articulation_world_dof_offset,
-            world_constraint_count,
-            world_mf_constraint_count,
-            world_row_cfm,
-            J_world,
-            Y_world,
-            world_diag,
-        )
-
     block_dim = 32 * warps_per_block
-    template = paired_hinv_jt_active_template if active_list else paired_hinv_jt_template
-    name = f"paired_hinv_jt_{'active_' if active_list else ''}{primary_dofs}_{secondary_dofs}_{max_constraints}"
+    name = f"paired_hinv_jt_{primary_dofs}_{secondary_dofs}_{max_constraints}"
     name += f"_bd{block_dim}"
     if factor_coordinates:
         name += "_factor"
-    template.__name__ = name
-    template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(template)
+    paired_hinv_jt_template.__name__ = name
+    paired_hinv_jt_template.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(paired_hinv_jt_template)
 
 
 @cache

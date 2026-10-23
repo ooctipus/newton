@@ -53,26 +53,6 @@ def _mfgs_metadata_footprint(
     return _MFGSMetadataFootprint(resident, metadata_bytes, total_bytes)
 
 
-def _use_resident_mfgs_metadata(
-    max_constraints: int,
-    mf_max_constraints: int,
-    max_world_dofs: int,
-    max_shared_memory: int,
-    *,
-    has_drive_rows: bool,
-    fuse_vel_limits: bool,
-) -> bool:
-    """Select resident MF-GS metadata for compact solver shapes (see :func:`_mfgs_metadata_footprint`)."""
-    return _mfgs_metadata_footprint(
-        max_constraints,
-        mf_max_constraints,
-        max_world_dofs,
-        max_shared_memory,
-        has_drive_rows=has_drive_rows,
-        fuse_vel_limits=fuse_vel_limits,
-    ).resident
-
-
 class _MFGSStorage(NamedTuple):
     """Storage classes of one MF-GS kernel specialization and why they were chosen.
 
