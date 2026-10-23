@@ -11,6 +11,7 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseMassMatrixPlan
 from newton._src.solvers.feather_pgs.sparse_row_projection import _sparse_contact_projection_source
+from newton.tests.test_feather_pgs_sparse_mass_matrix import _endpoint_support
 
 
 @cache
@@ -83,7 +84,7 @@ class TestSparseRowProjection(unittest.TestCase):
                 # Single endpoint for deep trees; union for branches. The final
                 # coordinate/root exercises bit 63 without shifting by 64.
                 endpoint = n - 1 if branched else min(n - 1, 19)
-                indices = plan.endpoint_support(endpoint, n - 2 if branched else -1)
+                indices = _endpoint_support(plan, endpoint, n - 2 if branched else -1)
                 self.assertLessEqual(len(indices), 32)
                 packed = rng.normal(size=(1, plan.nonzero_count)).astype(np.float32)
                 matrix = np.zeros((n, n), dtype=np.float64)

@@ -81,15 +81,11 @@ def supported(solver):
         # the predictor itself.
         and not solver._connect_count
         and not solver._has_loop_joints
-        # The fused world-dynamics kernel (K1) and lazy_kinematics, which only
-        # acts with it, are superseded: the owner predicts kinematics and
-        # torques itself and install() clears the K1 selection.
         and solver._fk_id_cache_available
         and solver._async_augmented_drives
         and solver._parallel_augmented_drive_topology
         and solver._articulation_dynamics_stream is not None
         and not solver._debug_buffers_enabled
-        and getattr(solver, "_prismatic_publication", None) is None
         # Every family refreshes through the geometric small Cholesky (one lane
         # per factor row, up to 32 coordinates) into the solver's dense factor
         # of the same shape; a diagonal-mass size keeps its compact inverse.
@@ -586,10 +582,9 @@ class MixedTreeKineticState:
 
             # A tree group's proof holds the model topology, the joint axes and
             # art_to_world and watches the joint frames, and the coverage proof every
-            # size's group map: beside one, the scalar group's own proof would add a
-            # launch and a readback to each notification for nothing.
-            proven = any(isinstance(group, TreeKineticState) for group in self.groups)
-            self.scalar = ScalarBranchState(solver, scalar, admission=admission, prove=not proven)
+            # size's group map, so the scalar group needs no proof of its own: the
+            # sparse-diagonal pair always leaves a tree group beside it.
+            self.scalar = ScalarBranchState(solver, scalar, admission=admission)
             self.groups.append(self.scalar)
         # The existing solver lifecycle delegates factor refresh to this binding.
         self.sparse = self
@@ -681,6 +676,4 @@ def create_owner(solver):
     except ValueError:
         return None
     solver._fk_id_cache_enabled = True
-    solver._fk_id_cache_uses_snapshot = False
-    solver._fk_id_cache = None
     return owner

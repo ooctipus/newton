@@ -487,19 +487,14 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         self.assertTrue(np.all(final[:, 0, 2] > 0.2))
         self.assertEqual(int(sum(int(group.status.numpy().sum()) for group in owner.groups)), 0)
 
-    def test_fused_world_kernel_scenes_are_owned(self):
-        """Scenes on the fused world-dynamics kernel (the quadruped recipes' grouped, lazy settings) hand it to the owner."""
+    def test_grouped_dynamics_scenes_are_owned(self):
+        """Scenes with grouped dynamics (the quadruped recipes' setting) hand their dynamics to the owner."""
         model = _build(wp.get_device("cuda:0"), quadruped=True)
-        # grouped_dynamics selects the fused kernel; lazy_kinematics (also in
-        # those recipes) would skip the per-step pose publication this
-        # comparison reads, so the ordinary route runs without it.
         recipe = {"grouped_dynamics": True}
-        plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False, rows=256, attrs=recipe)
+        _plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False, rows=256, attrs=recipe)
         self.assertIsNone(plain_owner)
-        self.assertTrue(plain_solver._fused_k1)
-        owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, rows=256, attrs=recipe)
+        _owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, rows=256, attrs=recipe)
         self.assertIsInstance(owner, MixedTreeKineticState)
-        self.assertFalse(owner_solver._fused_k1)
         self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [3, 6, 18])
         self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
         np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=3.0e-4, rtol=0.0)

@@ -33,12 +33,8 @@ def supported(solver):
         and solver._async_augmented_drives
         and solver._parallel_augmented_drive_topology
         and solver._articulation_dynamics_stream is not None
-        # lazy_kinematics defers publication only with the fused world-dynamics
-        # kernel (K1), which needs ordinary factors; on this route it is inert.
-        and not solver._fused_k1
         and not solver._debug_buffers_enabled
         and not solver._double_buffer
-        and getattr(solver, "_prismatic_publication", None) is None
     )
 
 
@@ -101,9 +97,4 @@ def create_owner(solver):
     operator.kinetic_state = owner
     # Only the complete tree owner can cache a distinct prescaled motion input.
     solver._fk_id_cache_enabled = True
-    # The complete sparse solve concludes before finish publishes the next
-    # S/velocity cache. It has no late dense/MF scratch readers, which require
-    # the ordinary split path's separate kinematics snapshot.
-    solver._fk_id_cache_uses_snapshot = False
-    solver._fk_id_cache = None
     return owner

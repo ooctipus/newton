@@ -15,7 +15,38 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import solver_feather_pgs as fpgs
 from newton.tests.feather_pgs_paired_fixture import solve_fixture
-from newton.tests.test_feather_pgs_fused_publication import _build_pendulums
+
+
+def _build_pendulums(device, worlds=5):
+    """Fixed-base double pendulums whose tips touch the ground through the collision pipeline."""
+    builder = newton.ModelBuilder()
+    shape_cfg = builder.default_shape_cfg.copy()
+    shape_cfg.density = 0.0
+    shape_cfg.mu = 0.5
+    for world in range(worlds):
+        builder.begin_world()
+        parent = -1
+        joints = []
+        for link in range(2):
+            body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.05), lock_inertia=True)
+            joints.append(
+                builder.add_joint_revolute(
+                    parent=parent,
+                    child=body,
+                    axis=newton.Axis.Y,
+                    parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.42 if link == 0 else -0.2), wp.quat_identity()),
+                    target_ke=5.0 * world,
+                    target_kd=1.0,
+                )
+            )
+            parent = body
+        builder.add_shape_sphere(
+            parent, radius=0.03, xform=wp.transform(wp.vec3(0.0, 0.0, -0.2), wp.quat_identity()), cfg=shape_cfg
+        )
+        builder.add_articulation(joints)
+        builder.end_world()
+    builder.add_ground_plane()
+    return builder.finalize(device=device)
 
 
 def _parent_decoder(source, *, name="mf_par", packed="packed_tp"):

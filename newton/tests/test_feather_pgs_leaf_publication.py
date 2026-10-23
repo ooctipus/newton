@@ -174,19 +174,17 @@ def _solver(model, *, enabled, mode="split", velocity_limits=False):
 
 
 def _fields(solver, state):
-    cache = solver._fk_id_cache
-    dynamics = solver if cache is None else cache
     return {
         "body_q": state.body_q,
         "body_qd": state.body_qd,
-        "body_q_com": dynamics.body_q_com,
-        "origin": dynamics.articulation_origin,
-        "S": dynamics.joint_S_s,
-        "v": dynamics.body_v_s,
-        "a": dynamics.body_a_s,
-        "I": dynamics.body_I_s,
-        "terms": solver._body_inertia_terms if cache is None else cache.body_inertia_terms,
-        "f": dynamics.body_f_s,
+        "body_q_com": solver.body_q_com,
+        "origin": solver.articulation_origin,
+        "S": solver.joint_S_s,
+        "v": solver.body_v_s,
+        "a": solver.body_a_s,
+        "I": solver.body_I_s,
+        "terms": solver._body_inertia_terms,
+        "f": solver.body_f_s,
         "valid": solver._fk_id_cache_valid,
     }
 

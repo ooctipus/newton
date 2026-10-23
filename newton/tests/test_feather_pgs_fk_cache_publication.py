@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""In-place next-step dynamics publication matches the snapshot copy across graph replays."""
+"""In-place next-step dynamics publication across graph replays."""
 
 import hashlib
 import unittest
@@ -10,7 +10,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS, _FeatherPGSKinematicsCache
+from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 
 
 def _build(device):
@@ -71,7 +71,7 @@ def _digest(state):
 
 @unittest.skipUnless(wp.is_cuda_available(), "The FK/ID cache publication is a CUDA path")
 class TestFeatherPGSFkCachePublication(unittest.TestCase):
-    def _run(self, snapshot, replays, substeps=3, dt=0.005):
+    def _run(self, replays, substeps=3, dt=0.005):
         device = wp.get_device("cuda:0")
         model, contacts = _build(device)
         solver = SolverFeatherPGS(
@@ -83,12 +83,6 @@ class TestFeatherPGSFkCachePublication(unittest.TestCase):
             friction_anchor_beta=0.0,
         )
         self.assertTrue(solver._fk_id_cache_enabled)
-        if snapshot:
-            solver._fk_id_cache_uses_snapshot = True
-            solver._fk_id_cache = _FeatherPGSKinematicsCache.allocate(model, solver._body_inertia_terms.shape[0])
-        else:
-            self.assertFalse(solver._fk_id_cache_uses_snapshot)
-            self.assertIsNone(solver._fk_id_cache)
         states = [model.state() for _ in range(2)]
         newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
         control = model.control()
@@ -112,17 +106,13 @@ class TestFeatherPGSFkCachePublication(unittest.TestCase):
         self.assertTrue(np.isfinite(states[0].joint_q.numpy()).all())
         return digests
 
-    def test_in_place_publication_matches_snapshot_across_replays(self):
-        """Bit-identical trajectories with and without the per-substep snapshot copies."""
-        in_place = self._run(snapshot=False, replays=40)
-        copied = self._run(snapshot=True, replays=40)
-        self.assertEqual(in_place, copied)
-        # Replays must advance the trajectory (the cache is not frozen).
-        self.assertGreater(len(set(in_place)), 30)
+    def test_in_place_publication_advances_across_replays(self):
+        """Advance the trajectory at every replay: the cache is not frozen."""
+        self.assertGreater(len(set(self._run(replays=40))), 30)
 
     def test_in_place_publication_is_deterministic(self):
         """Two independent captures replay identically."""
-        self.assertEqual(self._run(snapshot=False, replays=20), self._run(snapshot=False, replays=20))
+        self.assertEqual(self._run(replays=20), self._run(replays=20))
 
 
 if __name__ == "__main__":

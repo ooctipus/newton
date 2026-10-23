@@ -13,7 +13,7 @@ coordinate and no tree plan, so no body or coordinate cap applies. By default th
 held-tree owner composes it in place of a tree group (``mixed_tree_kinetic.py``)
 wherever :func:`plan_scalar_branches` admits the group;
 ``FEATHER_PGS_SCALAR_BRANCHES=0`` keeps the group on a tree group or on ordinary
-dynamics, with the prismatic opt-ins where they are set:
+dynamics:
 
 * ``begin`` publishes the input state of articulations whose cache is invalid:
   the root pose, the articulation origin, and each leaf's pose and motion axis.
@@ -25,10 +25,10 @@ dynamics, with the prismatic opt-ins where they are set:
   state: coordinates, root and leaf poses, motion axes, body velocities and the
   articulation origin.
 
-Prismatic leaves follow the prismatic linear state's law
-(``prismatic_linear_state.py``) operation for operation; revolute leaves follow
-ordinary dynamics without evaluating the velocity product, which is zero for
-them. The family never writes ``body_q_com``, ``body_v_s``, ``body_a_s``,
+Prismatic leaves follow the linear-state law of a one-body prismatic branch
+operation for operation (the scalar-branch tests keep that law as their
+oracle); revolute leaves follow ordinary dynamics without evaluating the
+velocity product, which is zero for them. The family never writes ``body_q_com``, ``body_v_s``, ``body_a_s``,
 ``body_f_s``, ``body_I_s`` or the compact inertia terms of its bodies, which no
 consumer on its route reads.
 
@@ -40,9 +40,9 @@ its axis, which the group's proof freezes, and on its child frame, which a
 notification may move; the new value then takes effect at the next refresh, as
 in a tree group's held factor. The inverse mass refreshes wherever the solver's
 mass mask selects (the update cadence plus the requests that resets and
-inertial, DOF and body notifications raise), as the prismatic linear state's
-does: that keeps prismatic leaves bitwise with that route and follows a
-changed step duration, which no notification announces. M6 timed prototype
+inertial, DOF and body notifications raise), as the linear-state law does:
+that keeps prismatic leaves bitwise with that law and follows a changed step
+duration, which no notification announces. M6 timed prototype
 predict and finish kernels at 489 us per substep with this cadence over 16384
 keyboard-sized worlds, against 500 us with a refresh on every substep.
 """
@@ -58,7 +58,6 @@ import warp as wp
 from ...math.spatial import transform_twist
 from ...sim import BodyFlags, JointType
 from . import cached_state_binding
-from .device_proof import DeviceProof
 from .kernels import mul_com_spatial_inertia, transform_com_inertia_terms
 from .tree_kinetic_owner import proof_runs
 
@@ -68,24 +67,6 @@ _REPAIR_LANES = wp.constant(32)
 # finish and listed drive launches take Warp's default block. tools/fpgs_bench/kernel_sass.py
 # compiles the repair at this block.
 _REPAIR_BLOCK_DIM = 128
-
-# Topology arrays the plan and the kernels' index arithmetic rely on, and the
-# joint axes, frozen as in the tree groups: a revolute leaf's inverse mass
-# depends on its axis but refreshes only at the mass cadence.
-_FROZEN_FIELDS = (
-    "articulation_start",
-    "joint_type",
-    "joint_parent",
-    "joint_child",
-    "joint_q_start",
-    "joint_qd_start",
-    "joint_dof_dim",
-    "joint_axis",
-)
-# Frames are read live, so they are watched, not frozen: a notification that
-# moves one invalidates the caches. Inertial values arrive with numeric
-# notifications, which invalidate them anyway.
-_FRAME_FIELDS = ("joint_X_p", "joint_X_c")
 
 
 @wp.func
@@ -783,36 +764,9 @@ def plan_scalar_branches(solver, *, requested: bool) -> tuple[ScalarBranchPlan |
     )
     reason = (
         f"Admitted: {plan.group_count} world-fixed roots of {plan.size} one-coordinate {' and '.join(present)} "
-        "leaves run as scalar branches (default; FEATHER_PGS_SCALAR_BRANCHES=0 opts out); they supersede "
-        "FEATHER_PGS_PRISMATIC_PUBLICATION and FEATHER_PGS_PRISMATIC_LINEAR_STATE for these articulations."
+        "leaves run as scalar branches (default; FEATHER_PGS_SCALAR_BRANCHES=0 opts out)."
     )
     return plan, reason
-
-
-_WARNED_SUPERSEDED: set[str] = set()
-"""Prismatic opt-ins that :func:`superseded_notice` has reported in this process."""
-
-
-def superseded_notice(names) -> str | None:
-    """Return a warning naming the prismatic opt-ins in ``names`` that scalar branches leave selecting nothing.
-
-    A solver whose held-tree owner takes the scalar branches builds neither
-    the prismatic publication plan nor the linear state those opt-ins request.
-    Recipes set them, and recipes are not Newton's to edit, so they are
-    warned about, once per name and process, rather than rejected.
-
-    Returns:
-        The warning text, or ``None`` when every name was reported before.
-    """
-    names = [name for name in names if name not in _WARNED_SUPERSEDED]
-    if not names:
-        return None
-    _WARNED_SUPERSEDED.update(names)
-    return (
-        f"Ignoring {' and '.join(names)}: scalar branches supersede the prismatic route on this solver "
-        "(get_path_selection() reports routes.held_tree.scalar_branches). Set FEATHER_PGS_SCALAR_BRANCHES=0 "
-        "to keep the prismatic route."
-    )
 
 
 class ScalarBranchState:
@@ -834,8 +788,8 @@ class ScalarBranchState:
     # Every repair launches: one warp per articulation exits on a valid cache.
     skip_captured_repairs = False
 
-    def __init__(self, solver, plan: ScalarBranchPlan, *, admission=None, prove=True):
-        """Bind the group's kernels; ``prove=False`` leaves the topology proof to an owner that holds it."""
+    def __init__(self, solver, plan: ScalarBranchPlan, *, admission=None):
+        """Bind the group's kernels; the owner's tree groups hold the topology proof."""
         self.solver = solver
         self.plan = plan
         self.size = plan.size
@@ -857,16 +811,6 @@ class ScalarBranchState:
         others = np.setdiff1d(np.arange(model.joint_dof_count, dtype=np.int32), plan.dofs).astype(np.int32)
         self.other_drive_dofs = wp.array(others, dtype=int, device=device) if others.size else None
         self._plan_dimensions = self._dimensions()
-        self._proof = (
-            DeviceProof(
-                [(name, getattr(model, name)) for name in (*_FROZEN_FIELDS, *_FRAME_FIELDS)]
-                + [("group_to_art", self.group_to_art), ("art_to_world", solver.art_to_world)],
-                device,
-                watched=_FRAME_FIELDS,
-            )
-            if prove
-            else None
-        )
 
     def _dimensions(self):
         model = self.solver.model
@@ -880,40 +824,26 @@ class ScalarBranchState:
         )
 
     def validate_model(self, flags=None):
-        """Reject topology and axis changes; frames and inertial values are read live.
+        """Reject dimension changes; frames and inertial values are read live.
 
-        Numeric notifications cannot change the topology and are accepted
-        outright. Other notifications (Isaac Lab re-poses fixed roots through
-        ``joint_X_p`` with ``JOINT_PROPERTIES`` on resets) compare the frozen
-        topology arrays and joint axes on the device with one small readback,
-        which also watches the joint frames, unless the held-tree owner that
-        composes the group already proves them. A changed axis raises, as in
+        The held-tree owner that composes the group proves the topology, the
+        joint axes and the joint frames through its tree groups beside this
+        one (Isaac Lab re-poses fixed roots through ``joint_X_p`` with
+        ``JOINT_PROPERTIES`` on resets). A changed axis raises there, as for
         the tree groups: a revolute leaf's inverse mass depends on it and
         refreshes only at the mass cadence.
 
         Returns:
-            Whether the proof ran and found the topology, axes and frames
-            unchanged (see :meth:`TreeKineticState.validate_model`); ``False``
-            after a moved frame, which the caller invalidates, and for numeric
-            notifications, which skip the proof. Without a proof of its own,
-            ``True``: the owner's tree groups prove the same model arrays, and
-            the owner keeps the caches only when every proof passes.
+            ``False`` for numeric notifications, which skip every proof (see
+            :meth:`TreeKineticState.validate_model`); otherwise ``True``: the
+            owner's tree groups prove the same model arrays, and the owner keeps
+            the caches only when every proof passes.
         """
         if not proof_runs(flags):
             return False
         if self._dimensions() != self._plan_dimensions:
             raise RuntimeError("Scalar branch dimensions changed; reconstruct and recapture")
-        if self._proof is None:
-            return True
-
-        def current(label):
-            if label == "group_to_art":
-                return self.group_to_art
-            if label == "art_to_world":
-                return self.solver.art_to_world
-            return getattr(self.solver.model, label)
-
-        return not self._proof.validate(current, "Scalar branch topology")
+        return True
 
     def forget_continuity(self):
         """Nothing to forget: every repair launches (``skip_captured_repairs`` is ``False``)."""

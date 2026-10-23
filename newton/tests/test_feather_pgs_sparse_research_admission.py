@@ -117,14 +117,6 @@ class TestSparseResearchAdmission(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True), self.assertRaises(_TopologyReached):
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
 
-    def test_point_research_requests_keep_ownership(self):
-        """Do not replace buffers needed by an explicitly requested point-contact owner."""
-        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        with mock.patch.dict(os.environ, {"FEATHER_PGS_SINGLE_FACTOR": "1"}, clear=True):
-            solver = _eligible_solver()
-            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-            self.assertIsNone(solver._sparse_mass_matrix_size)
-
     def test_retired_packed_route_flags_reach_general_sparse(self):
         """Admit the general sparse route under either friction law when a recipe sets the retired flags."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
@@ -191,17 +183,6 @@ class TestSparseResearchAdmission(unittest.TestCase):
         with mock.patch.dict(os.environ, {"FEATHER_PGS_SPARSE_GROUPED_DYNAMICS": "0"}, clear=True):
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
         self.assertIsNone(solver._sparse_mass_matrix_size)
-
-    def test_implicit_gyro_only_reserves_worlds_with_free_bodies(self):
-        """Keep the alternative gyro owner without rejecting an inactive no-free-body request."""
-        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        with mock.patch.dict(os.environ, {"FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO": "1"}, clear=True):
-            solver = _eligible_solver()
-            with self.assertRaises(_TopologyReached):
-                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-            solver._has_free_rigid_bodies = True
-            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-            self.assertIsNone(solver._sparse_mass_matrix_size)
 
     def test_explicit_schedules_keep_their_solve_budget(self):
         """Do not silently replace a requested parallel solve."""
@@ -286,8 +267,6 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 self.assertEqual(solver._pgs_solve_mf_gs_incremental_kernels, [])
                 self.assertIsNone(solver._ink_sizes)
                 self.assertEqual(solver._ink_rows, 0)
-                for name in ("_fused_k1", "_grouped_tau_mass", "_grouped_mass"):
-                    self.assertFalse(getattr(solver, name), name)
 
 
 if __name__ == "__main__":

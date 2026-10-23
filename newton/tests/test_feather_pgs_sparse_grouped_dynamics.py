@@ -38,13 +38,10 @@ def _case(grouped, *, free_count=0, friction_anchor_beta=0.0):
 @unittest.skipUnless(wp.is_cuda_available(), "Sparse grouped dynamics requires CUDA")
 class TestSparseGroupedDynamics(unittest.TestCase):
     def assert_native_grouped(self, case):
-        """Require sparse storage and prohibit dense-factor-writing fusions."""
+        """Require sparse storage beside grouped dynamics and no dense factor."""
         solver = case[1]
         self.assertEqual(solver._sparse_mass_matrix_size, 9)
-        self.assertIsNotNone(solver._grouped_topology)
-        self.assertFalse(solver._grouped_tau_mass)
-        self.assertFalse(solver._grouped_mass)
-        self.assertFalse(solver._fused_k1)
+        self.assertTrue(solver._grouped_response)
         self.assertEqual(solver.L_by_size[9].shape, (1, 1, 1))
 
     def assert_physics_close(self, first, second):
@@ -92,7 +89,7 @@ class TestSparseGroupedDynamics(unittest.TestCase):
                 self.assertIsNone(solver._sparse_mass_matrix_size)
                 reason = solver.get_path_selection()["reasons"]["sparse_mass_matrix"]
                 self.assertIn("free rigid bodies keep the dense route", reason)
-                self.assertIsNotNone(solver._grouped_topology)
+                self.assertTrue(solver._grouped_response)
 
     def test_grouped_sparse_graph_held_factor_and_masked_reset(self):
         """Replay the mass cadence and refresh only the explicitly reset world."""
@@ -126,7 +123,7 @@ class TestSparseGroupedDynamics(unittest.TestCase):
         with patch.dict(os.environ, {"FEATHER_PGS_SPARSE_GROUPED_DYNAMICS": "0"}):
             solver = _make_solver(_build_model(), True, grouped_dynamics=True)
         self.assertIsNone(solver._sparse_mass_matrix_size)
-        self.assertIsNotNone(solver._grouped_topology)
+        self.assertTrue(solver._grouped_response)
 
 
 if __name__ == "__main__":

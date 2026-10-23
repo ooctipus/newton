@@ -3,9 +3,7 @@
 
 """Tests for passive joint springs and passive damping in SolverFeatherPGS."""
 
-import os
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 import warp as wp
@@ -86,7 +84,6 @@ class TestFeatherPGSSprings(unittest.TestCase):
         self.assertGreater(qd_undamped, 4.0, "undamped joint should keep coasting")
         self.assertLess(qd_damped, 0.2 * qd_undamped)
 
-    @patch.dict(os.environ, {"FEATHER_PGS_GROUP_LANES": "16"})
     def test_grouped_passive_damping_uses_unscaled_velocity(self):
         """Keep passive damping on the input velocity while motion uses the prescale."""
         for damping, velocity in ((0.2, 10.0), (0.0, 10.0), (0.2, 1.0)):
@@ -108,7 +105,6 @@ class TestFeatherPGSSprings(unittest.TestCase):
                         use_parallel_streams=True,
                         grouped_dynamics=grouped,
                     )
-                    self.assertEqual(solver._fused_k1, grouped)
                     state_in, state_out = model.state(), model.state()
                     state_in.joint_qd.fill_(velocity)
                     solver.step(state_in, state_out, control, None, 0.001)
@@ -120,8 +116,8 @@ class TestFeatherPGSSprings(unittest.TestCase):
                         solver._last_debug_state_aug.joint_tau.numpy(), [-damping * velocity], atol=2e-5
                     )
                     results.append((state_out.joint_q.numpy(), state_out.joint_qd.numpy()))
-                for original, fused in zip(results[0], results[1], strict=True):
-                    np.testing.assert_allclose(fused, original, rtol=2e-5, atol=2e-6)
+                for original, other in zip(results[0], results[1], strict=True):
+                    np.testing.assert_allclose(other, original, rtol=2e-5, atol=2e-6)
 
 
 if __name__ == "__main__":

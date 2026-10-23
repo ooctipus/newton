@@ -14,6 +14,15 @@ from newton._src.solvers.feather_pgs.sparse_mass_matrix import (
 )
 
 
+def _endpoint_support(plan, joint_a, joint_b=-1):
+    """Sparse coordinates supporting either endpoint joint; -1 denotes the world."""
+    mask = 0
+    for joint in (joint_a, joint_b):
+        if joint != -1:
+            mask |= int(plan.joint_ancestor_mask[joint])
+    return np.asarray([dof for dof in range(plan.dof_count) if mask & (1 << dof)], dtype=np.int32)
+
+
 def _branched_humanoid_topology():
     """Return 43 DOFs with a free base, legs, spine, arms, and branching fingers."""
     parents, counts = [-1], [6]
@@ -96,12 +105,8 @@ class TestSparseMassMatrix(unittest.TestCase):
         plan = _SparseMassMatrixPlan.build([2, -1, 1, 2, -1, 4], [2, 3, 0, 1, 1, 2])
         np.testing.assert_array_equal(np.sort(plan.permutation), np.arange(9))
         np.testing.assert_array_equal(plan.inverse_permutation[plan.permutation], np.arange(9))
-        self.assertEqual(plan.endpoint_support(2).size, 3)
-        self.assertEqual(plan.endpoint_support(0, 5).size, 8)
-        for joint in range(6):
-            support = plan.endpoint_support(joint)
-            mask = sum(1 << int(i) for i in support)
-            self.assertEqual(int(plan.joint_ancestor_mask[joint]), mask)
+        self.assertEqual(_endpoint_support(plan, 2).size, 3)
+        self.assertEqual(_endpoint_support(plan, 0, 5).size, 8)
         rng = np.random.default_rng(54)
         lower = np.zeros((9, 9))
         lower[plan.entry_rows, plan.columns] = rng.normal(size=plan.nonzero_count)
@@ -139,7 +144,7 @@ class TestSparseMassMatrix(unittest.TestCase):
             for joint in range(j):
                 q = rng.normal(size=(6, 6))
                 body_inertia[art * j + joint] = q @ q.T + np.eye(6)
-                physical_support = plan.permutation[plan.endpoint_support(joint)]
+                physical_support = plan.permutation[_endpoint_support(plan, joint)]
                 jacobian = np.zeros((6, n))
                 jacobian[:, physical_support] = motion[art * n + physical_support].T
                 dense[art] += jacobian.T @ body_inertia[art * j + joint] @ jacobian
@@ -228,7 +233,7 @@ class TestSparseMassMatrix(unittest.TestCase):
                             rtol=1.0e-4,
                             atol=1.0e-5,
                         )
-                        support = plan.endpoint_support(0, len(parents) - 1)
+                        support = _endpoint_support(plan, 0, len(parents) - 1)
                         row = np.zeros(n)
                         row[plan.permutation[support]] = rng.normal(size=len(support))
                         z = whiten @ row[plan.permutation]
@@ -240,11 +245,9 @@ class TestSparseMassMatrix(unittest.TestCase):
     def test_mask_bit_63_and_fixed_root(self):
         """Preserve the highest mask bit and fixed-root endpoint support."""
         plan = _SparseMassMatrixPlan.build([-1, 0], [0, 64])
-        self.assertEqual(plan.endpoint_support(0).size, 0)
+        self.assertEqual(int(plan.joint_ancestor_mask[0]), 0)
         self.assertEqual(int(plan.joint_ancestor_mask[1]), (1 << 64) - 1)
         self.assertEqual(int(plan.ancestor_mask[0]), (1 << 64) - 1)
-        with self.assertRaises(ValueError):
-            plan.endpoint_support(2)
 
     def _check_branched_factor(self, device):
         """Compare a broad articulated tree with the independent dense oracle."""

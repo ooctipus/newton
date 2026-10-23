@@ -28,51 +28,6 @@ def _factor_levels(index):
     return levels
 
 
-def _factor_update_schedule(index):
-    """Compile right-looking Schur updates for any packed lower pattern."""
-    index = np.asarray(index)
-    if index.ndim != 2 or index.shape[0] != index.shape[1] or not 1 <= len(index) <= 64:
-        raise ValueError("Sparse level updates require a square 1 to 64 coordinate pattern")
-    if not np.issubdtype(index.dtype, np.integer):
-        raise ValueError("Sparse level updates require integer packed indices")
-    return _factor_update_schedule_cached(len(index), tuple(index.ravel()))
-
-
-@cache
-def _factor_update_schedule_cached(n, pattern):
-    """Share immutable schedules across model notifications."""
-    index = np.asarray(pattern, dtype=np.int32).reshape(n, n)
-    rows, cols = np.nonzero(index >= 0)
-    if not np.array_equal(index[rows, cols], np.arange(len(rows))) or np.any(rows < cols) or np.any(np.diag(index) < 0):
-        raise ValueError("Sparse level updates require a packed lower triangle with every diagonal")
-    levels = _factor_levels(index)
-    offsets, pivots, scales, entries, starts, terms = [(0, 0, 0)], [], [], [], [0], []
-    for level in range(int(np.max(levels)) + 1):
-        current = np.flatnonzero(levels == level)
-        pivots.extend(current)
-        scales.extend(np.flatnonzero((rows > cols) & (levels[cols] == level)))
-        for entry, (row, col) in enumerate(zip(rows, cols, strict=True)):
-            if levels[col] <= level:
-                continue
-            update = [(index[row, k], index[col, k]) for k in current if index[row, k] >= 0 and index[col, k] >= 0]
-            if update:
-                entries.append(entry)
-                terms.extend(update)
-                starts.append(len(terms))
-        offsets.append((len(pivots), len(scales), len(entries)))
-    result = {
-        "level_offsets": np.asarray(offsets, dtype=np.int32),
-        "level_pivots": np.asarray(pivots, dtype=np.int32),
-        "level_scales": np.asarray(scales, dtype=np.int32),
-        "level_entries": np.asarray(entries, dtype=np.int32),
-        "level_term_offsets": np.asarray(starts, dtype=np.int32),
-        "level_terms": np.asarray(terms, dtype=np.int32).reshape(-1, 2),
-    }
-    for values in result.values():
-        values.setflags(write=False)
-    return result
-
-
 @wp.struct
 class _SparseMassMatrixIndices:
     dof_count: int
@@ -120,12 +75,10 @@ class _SparseRowSupportPlan:
     limit_class: np.ndarray
 
     @classmethod
-    def build(cls, mass_plan, body_masks, *, max_row_dofs: int, contact_bodies=None) -> "_SparseRowSupportPlan | None":
+    def build(cls, mass_plan, body_masks, *, max_row_dofs: int) -> "_SparseRowSupportPlan | None":
         """Enumerate collision endpoint unions and every limit support.
 
-        Without ``contact_bodies``, every body is a possible endpoint. Otherwise
-        bodies with an absent ancestry class receive -1 and cannot be used as
-        contacts without rebuilding the catalogue. Shape attachment is topology;
+        Every body is a possible endpoint. Shape attachment is topology;
         geometry, materials and live limit activation do not change this plan.
         """
         body_masks = np.asarray(body_masks, dtype=np.uint64)
@@ -133,20 +86,7 @@ class _SparseRowSupportPlan:
             raise ValueError("Sparse row supports require one-dimensional masks and a valid row width")
         if any(int(mask) >> mass_plan.dof_count for mask in body_masks):
             raise ValueError("Sparse row support exceeds the articulation coordinate range")
-        endpoint_masks = body_masks
-        if contact_bodies is not None:
-            endpoints = np.asarray(contact_bodies)
-            if endpoints.ndim != 1 or (
-                endpoints.size
-                and (
-                    not np.issubdtype(endpoints.dtype, np.integer)
-                    or np.any(endpoints < 0)
-                    or np.any(endpoints >= len(body_masks))
-                )
-            ):
-                raise ValueError("Sparse contact endpoints must be valid body indices")
-            endpoint_masks = body_masks[endpoints.astype(np.int64)]
-        classes = np.unique(np.concatenate((np.zeros(1, dtype=np.uint64), endpoint_masks)))
+        classes = np.unique(np.concatenate((np.zeros(1, dtype=np.uint64), body_masks)))
         pairs = classes[:, None] | classes[None, :]
         masks = np.unique(np.concatenate((pairs.ravel(), mass_plan.ancestor_mask)))
         if any(int(mask).bit_count() > max_row_dofs for mask in masks):
@@ -157,12 +97,9 @@ class _SparseRowSupportPlan:
         for index, mask in enumerate(masks):
             entries = [dof for dof in range(mass_plan.dof_count) if int(mask) & (1 << dof)]
             class_dof[index, : len(entries)] = entries
-        indices = np.searchsorted(classes, body_masks)
-        matched = (indices < len(classes)) & (classes[np.minimum(indices, len(classes) - 1)] == body_masks)
-        body_class = np.full(len(body_masks), -1, dtype=np.int32)
-        body_class[matched] = indices[matched]
         return cls(
-            body_class=body_class,
+            # Every body's mask is one of the classes.
+            body_class=np.searchsorted(classes, body_masks).astype(np.int32),
             pair_class=np.searchsorted(masks, pairs).astype(np.int32),
             class_dof=class_dof,
             # CSC factor support omits structural zeros inside multi-DOF joints.
@@ -336,16 +273,6 @@ class _SparseMassMatrixPlan:
             value.setflags(write=False)
         return cls(**values)
 
-    def endpoint_support(self, joint_a: int, joint_b: int = -1) -> np.ndarray:
-        """Return sparse DOFs supporting either endpoint; -1 denotes the world."""
-        mask = 0
-        for joint in (joint_a, joint_b):
-            if joint < -1 or joint >= len(self.joint_parent):
-                raise ValueError("Endpoint must be a local joint index or -1")
-            if joint != -1:
-                mask |= int(self.joint_ancestor_mask[joint])
-        return np.asarray([dof for dof in range(self.dof_count) if mask & (1 << dof)], dtype=np.int32)
-
     def to_device(self, device) -> _SparseMassMatrixIndices:
         """Upload the topology once; all per-step values remain caller-owned."""
         indices = _SparseMassMatrixIndices()
@@ -460,7 +387,7 @@ def _get_crba_sparse_factor_kernel(
 #if defined(__CUDA_ARCH__)
     __syncwarp();
 #endif
-    {_sparse_cholesky_source(n, nnz, algorithm="left_looking")}
+    {_sparse_cholesky_source(n, nnz)}
     {_sparse_inverse_source(n)}
 #if defined(__CUDA_ARCH__)
     __syncwarp();

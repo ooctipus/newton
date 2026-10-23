@@ -899,7 +899,6 @@ class TestCompactContact(unittest.TestCase):
             for enabled in (False, True):
                 with (
                     mock.patch.object(solver_module, "_COMPACT_CONTACT_BOUNDARY", enabled),
-                    mock.patch.object(solver_module, "_PRISMATIC_PUBLICATION", True),
                     mock.patch.object(solver_module, "_SPARSE_CONTACT_DIRECT", True),
                 ):
                     solvers.append(

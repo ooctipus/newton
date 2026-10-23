@@ -45,7 +45,6 @@ def _held_tree_solver(law):
         _parallel_augmented_drive_topology=True,
         _articulation_dynamics_stream=object(),
         _debug_buffers_enabled=False,
-        _prismatic_publication=None,
         _compact_diagonal_mass_size=None,
         _execution_plan=SimpleNamespace(use_diagonal_mass=lambda size: False),
         _crba_cholesky_warp_kernels_by_size={9: object()},
@@ -72,10 +71,8 @@ def _sparse_tree_solver(**changes):
         _parallel_augmented_drive_topology=True,
         _articulation_dynamics_stream=object(),
         lazy_kinematics=False,
-        _fused_k1=False,
         _debug_buffers_enabled=False,
         _double_buffer=False,
-        _prismatic_publication=None,
     )
     for name, value in changes.items():
         setattr(solver, name, value)
@@ -84,16 +81,10 @@ def _sparse_tree_solver(**changes):
 
 class TestSparseTreeAdmission(unittest.TestCase):
     def test_lazy_kinematics_is_inert_on_the_sparse_route(self):
-        """Admit lazy kinematics on the sparse route, where nothing defers publication, but not the fused kernel."""
-        for lazy, fused, admitted in (
-            (False, False, True),
-            (True, False, True),
-            (False, True, False),
-            (True, True, False),
-        ):
-            with self.subTest(lazy_kinematics=lazy, fused_k1=fused):
-                solver = _sparse_tree_solver(lazy_kinematics=lazy, _fused_k1=fused)
-                self.assertEqual(tree_kinetic_sparse.supported(solver), admitted)
+        """Admit lazy kinematics on the sparse route, where nothing defers publication."""
+        for lazy in (False, True):
+            with self.subTest(lazy_kinematics=lazy):
+                self.assertTrue(tree_kinetic_sparse.supported(_sparse_tree_solver(lazy_kinematics=lazy)))
 
 
 class TestHeldTreeContactLaw(unittest.TestCase):

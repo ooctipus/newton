@@ -98,8 +98,8 @@ class TestErrors(unittest.TestCase):
                 self.kwargs = kwargs
                 self.grouped_dynamics = kwargs.get("grouped_dynamics", False)
                 self.lazy_kinematics = kwargs.get("lazy_kinematics", False)
-                self._grouped_topology = object() if self.grouped_dynamics else None
-                self._fused_k1, self.pgs_mode = self.grouped_dynamics, kwargs["pgs_mode"]
+                self._grouped_response = self.grouped_dynamics
+                self.pgs_mode = kwargs["pgs_mode"]
                 self.resets = 0
                 created.append(self)
 

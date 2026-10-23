@@ -37,8 +37,8 @@ FLAGS = declare(
     _flag(
         "FEATHER_PGS_SINGLE_FACTOR",
         "retired",
-        ("environment_flags", *_SOLVER),
-        "Retired single-factor owner; =1 raises at construction (sparse admission still reads it).",
+        ("environment_flags",),
+        "Retired single-factor owner; =1 raises at construction.",
     ),
     _flag("FEATHER_PGS_BODY_BASIS_ROWS", "retired", ("environment_flags",), "Retired experiment; =1 raises."),
     _flag("FEATHER_PGS_SPARSE_PACKETS", "retired", ("environment_flags",), "Retired experiment; =1 raises."),
@@ -88,12 +88,6 @@ FLAGS = declare(
         "Step at which the kernel capture starts (default -1, none).",
     ),
     _flag(
-        "FEATHER_PGS_CHECK_GROUPED",
-        "diagnostic",
-        _SOLVER,
-        "=1 compares grouped kernels with the serial kernels on the host.",
-    ),
-    _flag(
         "FEATHER_PGS_CHECK_ROWS",
         "diagnostic",
         _SOLVER,
@@ -118,30 +112,6 @@ FLAGS = declare(
         "sequential or unit overrides the contact_update argument (unset: the argument).",
     ),
     _flag(
-        "FEATHER_PGS_DEBUG_CACHE",
-        "diagnostic",
-        _SOLVER,
-        "=1 prints FK/ID cache validity every step.",
-    ),
-    _flag(
-        "FEATHER_PGS_DEBUG_CACHE_CMP",
-        "diagnostic",
-        _SOLVER,
-        "=1 compares the FK/ID cache with a recomputation.",
-    ),
-    _flag(
-        "FEATHER_PGS_DEBUG_CACHE_MODE",
-        "diagnostic",
-        _SOLVER,
-        "FK/ID cache invalidation override for bisection: zero_even or nozero (default ordinary).",
-    ),
-    _flag(
-        "FEATHER_PGS_DEBUG_DELAY",
-        "diagnostic",
-        _SOLVER,
-        "Spin iterations launched at the start of each step to expose stream races (default 0).",
-    ),
-    _flag(
         "FEATHER_PGS_DEBUG_SNAPSHOTS",
         "diagnostic",
         _SOLVER,
@@ -152,12 +122,6 @@ FLAGS = declare(
         "policy",
         _SOLVER,
         "tiled_row row budgets: 1 on for 64 or 128 rows, unset automatic (128 rows, 1024+ worlds), else off.",
-    ),
-    _flag(
-        "FEATHER_PGS_FK_CACHE_SNAPSHOT",
-        "reference",
-        _SOLVER,
-        "=1 restores the per-substep snapshot copy of the FK/ID cache as a bisection aid.",
     ),
     _flag(
         "FEATHER_PGS_FK_ID_CACHE",
@@ -172,40 +136,10 @@ FLAGS = declare(
         "Retired compact workspace of a removed robot-specific owner; ignored.",
     ),
     _flag(
-        "FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO",
-        "experiment",
-        _SOLVER,
-        "=1 applies an implicit gyroscopic predictor correction to independent free bodies.",
-    ),
-    _flag(
-        "FEATHER_PGS_FUSED_K1",
-        "policy",
-        _SOLVER,
-        "=0 disables the fused world-dynamics kernel.",
-    ),
-    _flag(
-        "FEATHER_PGS_FUSED_K1_MASS",
-        "experiment",
-        _SOLVER,
-        "=1 lets the fused world-dynamics kernel also build and factor the mass matrix.",
-    ),
-    _flag(
-        "FEATHER_PGS_FUSED_PUBLISH",
-        "experiment",
-        _SOLVER,
-        "=1 publishes each general-route articulation in one launch per size group.",
-    ),
-    _flag(
         "FEATHER_PGS_G1_CHAIN_SCAN",
         "retired",
         ("environment_flags",),
         "Retired G1 alias of the held-tree chain scan; ignored (FEATHER_PGS_TREE_CHAIN_SCAN=0 opts out of it).",
-    ),
-    _flag(
-        "FEATHER_PGS_GROUPED_FK",
-        "policy",
-        _SOLVER,
-        "=0 replaces the grouped template FK kernel with the serial kernel.",
     ),
     _flag(
         "FEATHER_PGS_GROUPED_HINV",
@@ -226,22 +160,10 @@ FLAGS = declare(
         "Largest DOF size that uses the grouped response solve (default 32).",
     ),
     _flag(
-        "FEATHER_PGS_GROUPED_MASS",
-        "experiment",
-        _SOLVER,
-        "=1 with GROUPED_TAU_MASS also builds the mass matrix in the grouped kernel.",
-    ),
-    _flag(
-        "FEATHER_PGS_GROUPED_TAU_MASS",
-        "experiment",
-        _SOLVER,
-        "=1 fuses joint torques and mass-matrix assembly in the grouped kernel.",
-    ),
-    _flag(
         "FEATHER_PGS_GROUP_LANES",
-        "policy",
-        ("grouped_dynamics",),
-        "Lanes per articulation in grouped dynamics (default twice the widest tree level, at most 32).",
+        "retired",
+        ("environment_flags",),
+        "Retired lanes per articulation of the removed grouped kinematics and torque kernels; ignored.",
     ),
     _flag(
         "FEATHER_PGS_INDEPENDENT_COMPONENTS",
@@ -260,18 +182,6 @@ FLAGS = declare(
         "diagnostic",
         _SOLVER,
         "=1 writes the in-kernel response and diagonal back for comparison.",
-    ),
-    _flag(
-        "FEATHER_PGS_K1_REAL_CHECK",
-        "diagnostic",
-        _SOLVER,
-        "=1 checks the fused world-dynamics kernel against the ordinary stages.",
-    ),
-    _flag(
-        "FEATHER_PGS_K1_TPL_SHARED",
-        "reference",
-        _SOLVER,
-        "=0 reads fused-kernel template tables from global instead of shared memory.",
     ),
     _flag(
         "FEATHER_PGS_KEYED_ROWS",
@@ -374,17 +284,15 @@ FLAGS = declare(
     ),
     _flag(
         "FEATHER_PGS_PRISMATIC_LINEAR_STATE",
-        "experiment",
-        _SOLVER,
-        "=1 keeps current linear state for fixed-root one-body prismatic branches; superseded where scalar "
-        "branches admit them, unless FEATHER_PGS_SCALAR_BRANCHES=0.",
+        "retired",
+        ("environment_flags",),
+        "Retired linear state of fixed-root one-body prismatic branches; ignored (scalar branches run them).",
     ),
     _flag(
         "FEATHER_PGS_PRISMATIC_PUBLICATION",
-        "experiment",
-        _SOLVER,
-        "=1 publishes fixed-root prismatic stars body-parallel; superseded where scalar branches admit them, "
-        "unless FEATHER_PGS_SCALAR_BRANCHES=0.",
+        "retired",
+        ("environment_flags",),
+        "Retired body-parallel publication of fixed-root prismatic stars; ignored (scalar branches run them).",
     ),
     _flag(
         "FEATHER_PGS_RESOLVED_WORLDS",
@@ -415,8 +323,7 @@ FLAGS = declare(
         "policy",
         _SOLVER,
         "=0 keeps a diagonal-mass group of world-fixed roots over one-coordinate leaves out of the held-tree "
-        "owner's scalar branches, which run it, own the other articulations of its worlds and supersede the "
-        "prismatic opt-ins there (default on).",
+        "owner's scalar branches, which run it and own the other articulations of its worlds (default on).",
     ),
     _flag(
         "FEATHER_PGS_SIMPLE_WORLD_ZERO",
@@ -639,22 +546,27 @@ FLAGS = declare(
 # Retired names that Isaac Lab's benchmark recipes still set: the packed
 # sparse-factor route's selectors (480f0f44), the chain-scan and keyed-row
 # aliases (d35949d6), the selectors of removed research owners and of the
-# branch-Jacobi sweep (790f9782, aa2f332b), and the in-sweep world rows'
-# selector, which keyed rows declined wherever a recipe set it. Nothing in
-# Newton or Isaac Lab reads them, and recipes are not Newton's to edit, so they
-# are ignored rather than rejected: the general route runs, the construction
+# branch-Jacobi sweep (790f9782, aa2f332b), the in-sweep world rows'
+# selector, which keyed rows declined wherever a recipe set it, the lane
+# count of the removed grouped kinematics and torque kernels, and the
+# prismatic opt-ins that scalar branches replaced. Nothing in Newton or
+# Isaac Lab reads them, and recipes are not Newton's to edit, so they are
+# ignored rather than rejected: the general route runs, the construction
 # record lists them as retired and the solver warns once per process.
 IGNORED_RETIRED = frozenset(
     (
         "FEATHER_PGS_ALLEGRO_KINETIC_ROWS",
         "FEATHER_PGS_FRANKA_COMPACT_WORKSPACE",
         "FEATHER_PGS_G1_CHAIN_SCAN",
+        "FEATHER_PGS_GROUP_LANES",
         "FEATHER_PGS_INDEPENDENT_COMPONENTS",
         "FEATHER_PGS_KUKA_CURRENT_CONTACT",
         "FEATHER_PGS_KUKA_JOINT_WORLD",
         "FEATHER_PGS_LOCAL_ROW_PACKETS",
         "FEATHER_PGS_PACKED_TREE_KINETIC_STATE",
         "FEATHER_PGS_PAIRED_GENERAL_OVERLAP",
+        "FEATHER_PGS_PRISMATIC_LINEAR_STATE",
+        "FEATHER_PGS_PRISMATIC_PUBLICATION",
         "FEATHER_PGS_SIMPLE_WORLD_ZERO",
         "FEATHER_PGS_SPARSE_BRANCH_SWEEPS",
         "FEATHER_PGS_SPARSE_CONTACT_BLOCK",

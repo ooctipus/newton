@@ -591,7 +591,6 @@ def _admissible_solver():
         "_compact_contact_boundary",
         "pgs_debug",
         "_row_watermark",
-        "_fused_k1",
         "grouped_dynamics",
         "lazy_kinematics",
     ):

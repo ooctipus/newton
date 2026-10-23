@@ -29,6 +29,7 @@ from newton._src.solvers.feather_pgs.sparse_mass_matrix import (
     _SparseRowSupport,
     _SparseRowSupportPlan,
 )
+from newton.tests.test_feather_pgs_sparse_mass_matrix import _endpoint_support
 
 
 def _array(value, dtype=float):
@@ -61,7 +62,7 @@ def _fixture(device="cpu", joint_dof_count=(3, 2, 1, 0)):
     patches.phi = array(np.zeros((3, 2)), wp.vec2)
     normals = rng.normal(size=(3, 3))
     normals /= np.linalg.norm(normals, axis=1)[:, None]
-    physical_masks = [sum(1 << int(plan.permutation[i]) for i in plan.endpoint_support(j)) for j in range(4)]
+    physical_masks = [sum(1 << int(plan.permutation[i]) for i in _endpoint_support(plan, j)) for j in range(4)]
     return {
         "plan": plan,
         "indices": plan.to_device(device),

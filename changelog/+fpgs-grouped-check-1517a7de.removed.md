@@ -1,0 +1,1 @@
+Remove the `FEATHER_PGS_CHECK_GROUPED` host comparison of `SolverFeatherPGS`'s grouped kernels with the serial ones, which also kept paired components, keyed rows, row packets and the compact contact producer off; unset it, it selects nothing.

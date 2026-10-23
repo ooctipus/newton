@@ -76,14 +76,8 @@ from .friction_patches import (
     _FrictionPatchState,
     patch_routes,
 )
-from .fused_dynamics import fused_dynamics_launch_shape, get_fused_dynamics_kernel, template_supported
 from .grouped_dynamics import (
-    GroupedTopology,
     get_grouped_hinv_jt_kernel,
-    get_grouped_mass_kernel,
-    grouped_tau,
-    grouped_tau_mass,
-    template_fk_kinematics,
 )
 from .kernels import (
     FRICTION_MODE_BISECTION,
@@ -159,7 +153,6 @@ from .kernels import (
     finalize_body_dynamics,
     finalize_constraint_counts_with_status,
     finalize_world_diag_cfm,
-    finish_articulation_general,
     gather_dense_warmstart,
     gather_JY_to_world,
     gather_mf_warmstart,
@@ -271,28 +264,8 @@ _FPGS_CAPTURE_STEP = int(os.environ.get("FEATHER_PGS_CAPTURE_STEP", "-1"))
 _FPGS_CAPTURE_COUNT = int(os.environ.get("FEATHER_PGS_CAPTURE_COUNT", "1"))  # consecutive substeps to capture
 _FPGS_CAPTURE_PHASE = os.environ.get("FEATHER_PGS_CAPTURE_PHASE")  # None = any phase
 _FPGS_CAPTURE_DIR = os.environ.get("FEATHER_PGS_CAPTURE_DIR", "/tmp/fpgs_capture")
-_GROUPED_CHECK = os.environ.get("FEATHER_PGS_CHECK_GROUPED") == "1"
-_GROUPED_FK_OFF = os.environ.get("FEATHER_PGS_GROUPED_FK") == "0"
-_GROUPED_TAU_MASS_ON = os.environ.get("FEATHER_PGS_GROUPED_TAU_MASS") == "1"
-_GROUPED_MASS_ON = os.environ.get("FEATHER_PGS_GROUPED_MASS") == "1"
 _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
-_FK_ID_CACHE_SNAPSHOT = os.environ.get("FEATHER_PGS_FK_CACHE_SNAPSHOT") == "1"
-# FEATHER_PGS_FUSED_PUBLISH=1 publishes each articulation of the general route
-# in one launch per size group (impulses, acceleration, integration,
-# kinematics and body dynamics). Bit-identical, but one thread per
-# articulation serializes work the separate launches spread over DOFs,
-# joints and bodies: measured +16.5% on Cartpole and +13.5% on Franka
-# cabinet at 16,384 worlds, flat on Humanoid and Ant. Kept opt-in until a
-# lane-parallel mapping is measured.
-_FUSED_PUBLISH = os.environ.get("FEATHER_PGS_FUSED_PUBLISH", "0") == "1"
-# Experimental Stage 7 producer partition, leaving all solve/mass budgets intact.
-_PRISMATIC_PUBLICATION = os.environ.get("FEATHER_PGS_PRISMATIC_PUBLICATION", "0") == "1"
-_PRISMATIC_LINEAR_STATE = os.environ.get("FEATHER_PGS_PRISMATIC_LINEAR_STATE", "0") == "1"
 _COMPACT_CONTACT_BOUNDARY = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_BOUNDARY", "0") == "1"
-_DEBUG_CACHE = os.environ.get("FEATHER_PGS_DEBUG_CACHE") == "1"
-_DEBUG_CACHE_MODE = os.environ.get("FEATHER_PGS_DEBUG_CACHE_MODE", "")
-_DEBUG_DELAY = int(os.environ.get("FEATHER_PGS_DEBUG_DELAY", "0"))
-_DEBUG_CACHE_CMP = os.environ.get("FEATHER_PGS_DEBUG_CACHE_CMP") == "1"
 _ROWS_MASKED = os.environ.get("FEATHER_PGS_ROWS_MASKED") == "1"  # thread-per-(contact, dof) contact row build
 _CHECK_ROWS = os.environ.get("FEATHER_PGS_CHECK_ROWS") == "1"
 _GROUPED_HINV_OFF = os.environ.get("FEATHER_PGS_GROUPED_HINV") == "0"  # keep the tiled response solve (better on hands)
@@ -315,46 +288,6 @@ _GROUPED_HINV_FREE = (
 )  # debug: grouped response solve for free-body groups  # experiment: contact rows are written in full by the masked builder
 
 
-@wp.kernel(enable_backward=False)
-def _debug_maxdiff_sv(a: wp.array[wp.spatial_vector], b: wp.array[wp.spatial_vector], slot: int, out: wp.array[float]):
-    i = wp.tid()
-    d = a[i] - b[i]
-    m = float(0.0)
-    for k in range(6):
-        m = wp.max(m, wp.abs(d[k]))
-    wp.atomic_max(out, slot, m)
-
-
-@wp.kernel(enable_backward=False)
-def _debug_maxdiff_tf(a: wp.array[wp.transform], b: wp.array[wp.transform], slot: int, out: wp.array[float]):
-    i = wp.tid()
-    m = float(0.0)
-    for k in range(7):
-        m = wp.max(m, wp.abs(a[i][k] - b[i][k]))
-    wp.atomic_max(out, slot, m)
-
-
-@wp.kernel(enable_backward=False)
-def _debug_maxdiff_v3(a: wp.array[wp.vec3], b: wp.array[wp.vec3], slot: int, out: wp.array[float]):
-    i = wp.tid()
-    d = a[i] - b[i]
-    wp.atomic_max(out, slot, wp.max(wp.abs(d[0]), wp.max(wp.abs(d[1]), wp.abs(d[2]))))
-
-
-@wp.kernel(enable_backward=False)
-def _debug_spin(iterations: int, out: wp.array[float]):
-    """Debug only: burn GPU time at the start of a step to expose cross-stream races."""
-    acc = float(wp.tid())
-    for _ in range(iterations):
-        acc = acc * 0.999999 + 1.0e-7
-    out[0] = acc
-
-
-_FUSED_K1_OFF = os.environ.get("FEATHER_PGS_FUSED_K1") == "0"
-# Opt-in: let the fused world-dynamics kernel also build and factor the mass matrix (slower today).
-_FUSED_K1_MASS_ON = os.environ.get("FEATHER_PGS_FUSED_K1_MASS") == "1"
-_K1_TPL_GLOBAL = os.environ.get("FEATHER_PGS_K1_TPL_SHARED") == "0"  # debug: read template tables from global memory
-_K1_REAL_CHECK = os.environ.get("FEATHER_PGS_K1_REAL_CHECK") == "1"
 _GROUPED_CHECK_COUNT = [0]
 
 
@@ -968,42 +901,6 @@ class _FeatherPGSTreePlan:
         return cls(tuple(groups))
 
 
-@dataclass(frozen=True)
-class _FeatherPGSKinematicsCache:
-    """Solver-owned next-state dynamics, isolated from active step scratch."""
-
-    body_q_com: wp.array[wp.transform]
-    """Center-of-mass poses [m], shape [body_count]."""
-    joint_S_s: wp.array[wp.spatial_vector]
-    """Joint motion subspaces, shape [joint_dof_count]."""
-    body_I_s: wp.array[wp.spatial_matrix]
-    """Body spatial inertias, shape [body_count]."""
-    body_inertia_terms: wp.array2d[float]
-    """Compact body inertia terms, shape [term_count, 12]."""
-    body_v_s: wp.array[wp.spatial_vector]
-    """Body spatial velocities [m/s, rad/s], shape [body_count]."""
-    body_f_s: wp.array[wp.spatial_vector]
-    """Body spatial forces [N, N·m], shape [body_count]."""
-    body_a_s: wp.array[wp.spatial_vector]
-    """Body spatial accelerations [m/s², rad/s²], shape [body_count]."""
-    articulation_origin: wp.array[wp.vec3]
-    """Articulation origins [m], shape [articulation_count]."""
-
-    @classmethod
-    def allocate(cls, model: Model, inertia_term_count: int) -> "_FeatherPGSKinematicsCache":
-        """Allocate the cache arrays for one model."""
-        return cls(
-            body_q_com=wp.empty_like(model.body_q),
-            joint_S_s=wp.empty(model.joint_dof_count, dtype=wp.spatial_vector, device=model.device),
-            body_I_s=wp.empty(model.body_count, dtype=wp.spatial_matrix, device=model.device),
-            body_inertia_terms=wp.empty((inertia_term_count, 12), dtype=wp.float32, device=model.device),
-            body_v_s=wp.empty(model.body_count, dtype=wp.spatial_vector, device=model.device),
-            body_f_s=wp.empty(model.body_count, dtype=wp.spatial_vector, device=model.device),
-            body_a_s=wp.empty(model.body_count, dtype=wp.spatial_vector, device=model.device),
-            articulation_origin=wp.empty(model.articulation_count, dtype=wp.vec3, device=model.device),
-        )
-
-
 # Retain the internal metadata API while sharing its implementation.
 _DENSE_META_ROW_TYPE_BITS = _row_metadata._DENSE_META_ROW_TYPE_BITS
 _DENSE_META_ROW_TYPE_MASK = _row_metadata._DENSE_META_ROW_TYPE_MASK
@@ -1386,9 +1283,8 @@ class SolverFeatherPGS(SolverBase):
                 disable auto and conflict with ``on``. Factor refresh intervals and numerical budgets
                 are unchanged. Where the held-tree owner is admitted, a diagonal-mass group of
                 world-fixed roots over one-coordinate prismatic or revolute leaves runs as its scalar
-                branches by default, superseding the prismatic publication opt-ins
-                (``FEATHER_PGS_SCALAR_BRANCHES=0`` opts out); :meth:`get_path_selection` reports it
-                under ``routes.held_tree.scalar_branches``.
+                branches by default (``FEATHER_PGS_SCALAR_BRANCHES=0`` opts out);
+                :meth:`get_path_selection` reports it under ``routes.held_tree.scalar_branches``.
             contact_torsion_radius: Experimental effective spin radius [m], zero disables.
                 Explicit material/footprint assumption: for uniform pressure on a disk
                 of radius R, the effective radius is 2*R/3. Does not consume the generic
@@ -1744,25 +1640,15 @@ class SolverFeatherPGS(SolverBase):
                 onto its limit, in row order. It changes nothing once a tier converges and bounds the limit overshoot
                 of a tier its sweep budget stops early. Applies only with ``enable_joint_velocity_limits`` and
                 linked tiers. Experimental. Defaults to False.
-            grouped_dynamics (bool, optional): Run forward kinematics and the inverse-dynamics backward
-                pass level-synchronously with a lane group per articulation instead of one serial thread
-                per articulation. Fusion and parallel reductions can change floating-point accumulation.
-                Experimental CUDA option: consider batches of multi-joint arms or quadrupeds; grouping
-                overhead can outweigh the saved serial work for tiny articulations, such as cartpole.
-                Keep False when retaining specialized simple-world or prismatic-state optimizations:
-                grouping disables their admission, and prismatic linear state rejects this combination.
-                Measure whole-step cost, including fallback and publication. Defaults to False.
-            lazy_kinematics (bool, optional): With the fused world-dynamics kernel, skip the end-of-substep
-                forward-kinematics publish (body poses, CoM velocities, cached dynamics) and publish only when
-                :meth:`publish_kinematics` is called (Isaac Lab calls it before collision and sensor updates).
-                The fused kernel recomputes kinematics from ``joint_q`` at the start of every substep. Persistent
-                patch friction (``friction_anchor_beta > 0``) still publishes every substep: its anchor release
-                test reads the integrated body state.
-                Experimental: useful when several substeps share a publication point. The caller must publish
-                before collision, sensors, or any other body-state read; without a compatible fused kernel,
-                this option saves no publication work. Keep False if those hooks are absent, or to retain
-                specialized kinetic-state paths, such as the floating-base humanoid path, that exclude lazy
-                publication. Defaults to False.
+            grouped_dynamics (bool, optional): Solve the contact response ``H^-1 J^T`` of articulations with
+                up to 32 DOFs with one warp per articulation and one lane per row, instead of the planned
+                response kernel (``FEATHER_PGS_GROUPED_HINV=0`` keeps the planned kernel). The request also
+                keeps the resolved-world classifier, the local row packets and the compact contact producer
+                off. Kinematics and inverse dynamics keep their kernels. Experimental CUDA option. Defaults
+                to False.
+            lazy_kinematics (bool, optional): Experimental. Every substep publishes the body state, so this
+                option defers no publication and :meth:`publish_kinematics` has no effect; ``True`` keeps the
+                resolved-world classifier off. Defaults to False.
             pgs_iterations (int, optional): Number of Gauss-Seidel iterations to apply per frame. Defaults to 12.
             pgs_velocity_iterations (int, optional): Number of matrix-free iterations using a velocity-only RHS
                 after integrating positions with the biased PGS result. This mirrors the PhysX-style split where
@@ -1949,11 +1835,11 @@ class SolverFeatherPGS(SolverBase):
                 PhysX row mode is currently supported only with
                 ``pgs_mode="matrix_free"``. Defaults to ``"augmented"``.
             serial_kernel_block_dim (int, optional): CUDA block size for the serial
-                one-thread-per-articulation kernels (``eval_rigid_fk``, ``eval_rigid_id``,
-                ``eval_rigid_tau``, ``update_articulation_origins``). These kernels have no
-                cross-thread reductions, so changing this value is bit-identical; it only
-                changes occupancy/grid shape. Must be a positive multiple of 32.
-                Defaults to 256 (the Warp default).
+                one-thread-per-articulation kernels (``eval_rigid_tau``,
+                ``eval_rigid_tau_and_augmented_drives``, ``prepare_augmented_joint_drives``).
+                These kernels have no cross-thread reductions, so changing this value is
+                bit-identical; it only changes occupancy/grid shape. Must be a positive
+                multiple of 32. Defaults to 256 (the Warp default).
             tile_threads (int, optional): Threads per block for the tiled
                 Cholesky / triangular-solve / H^-1 J^T kernels. Tile primitives may
                 change floating-point reduction order with the block size, so non-default
@@ -2392,13 +2278,7 @@ class SolverFeatherPGS(SolverBase):
         self.mf_gs_parallel_linked_velocity_limit_pass = bool(mf_gs_parallel_linked_velocity_limit_pass)
         self.grouped_dynamics = bool(grouped_dynamics)
         self.lazy_kinematics = bool(lazy_kinematics)
-        self._grouped_topology = None
-        self._grouped_tau_mass = False
-        self._grouped_mass = False
-        self._fused_k1 = False
-        self._fused_k1_mass_done = False
-        self._grouped_check_pending = None
-        self._grouped_check_pending_L = None
+        self._grouped_response = False
         self.rigid_body_max_linear_velocity = getattr(model, "rigid_body_max_linear_velocity", None)
         self.rigid_body_max_angular_velocity = getattr(model, "rigid_body_max_angular_velocity", None)
         self.rigid_body_max_depenetration_velocity = getattr(model, "rigid_body_max_depenetration_velocity", None)
@@ -2497,16 +2377,10 @@ class SolverFeatherPGS(SolverBase):
             and not model.requires_grad
             and not _FK_ID_CACHE_OFF
         )
+        # Stage 7 publishes next-step dynamics in place.
         self._fk_id_cache_enabled = self._fk_id_cache_available and not enable_joint_velocity_limits
-        # Stage 7 publishes next-step dynamics in place; the snapshot copy of
-        # the whole FK/ID cache every substep is retained only as an opt-in
-        # bisection aid (FEATHER_PGS_FK_CACHE_SNAPSHOT=1).
-        self._fk_id_cache_uses_snapshot = (
-            self._fk_id_cache_enabled and self.pgs_mode == "split" and _FK_ID_CACHE_SNAPSHOT
-        )
         self._fk_id_cache_source_state = None
         self._fk_id_cache_valid = wp.zeros(model.articulation_count, dtype=wp.int32, device=model.device)
-        self._fk_id_cache = None
         if model.body_count and not model.requires_grad:
             # Allocate the solver-owned augmented state here rather than on the first step(): a
             # wp.zeros() issued inside a CUDA graph capture becomes a memset node that replays every
@@ -2905,8 +2779,6 @@ class SolverFeatherPGS(SolverBase):
         else:
             self._jy_world_aliased = False
         self._allocate_common_buffers(model)
-        if self._fk_id_cache_uses_snapshot:
-            self._fk_id_cache = _FeatherPGSKinematicsCache.allocate(model, self._body_inertia_terms.shape[0])
         self._setup_parallel_augmented_drive_topology(model)
         if self._sparse_diagonal_contact_solve and not self._parallel_augmented_drive_topology:
             raise RuntimeError("sparse diagonal response requires owned augmented-drive topology")
@@ -3249,26 +3121,20 @@ class SolverFeatherPGS(SolverBase):
 
             enable_device_torsion(self)
 
-        self._prismatic_publication = None
-        self._prismatic_linear_state = False
-        self._prismatic_linear_valid = None
         # Scalar branches take a diagonal-mass group of world-fixed roots over
         # one-coordinate leaves (scalar_branches.py), which the held-tree owner
-        # then publishes; the prismatic opt-ins serve the same articulations and
-        # give way. The owner is decided below; if it declines, they apply. The
-        # switch, on unless =0, is read here, at construction, like the
-        # environment record.
+        # then publishes. The owner is decided below; if it declines, ordinary
+        # dynamics runs the group. The switch, on unless =0, is read here, at
+        # construction, like the environment record.
         from .scalar_branches import plan_scalar_branches  # noqa: PLC0415
 
         self._scalar_branches, self._scalar_branches_reason = plan_scalar_branches(
             self, requested=os.environ.get("FEATHER_PGS_SCALAR_BRANCHES", "1") != "0"
         )
-        if self._scalar_branches is None:
-            self._configure_prismatic_publication()
 
         self._compact_contact_boundary = False
         # The compact producer writes the point and the patch row law; torsion and compliance keep ordinary rows.
-        if self._law_agnostic_contact_paths and _COMPACT_CONTACT_BOUNDARY and not (_GROUPED_CHECK or _CHECK_ROWS):
+        if self._law_agnostic_contact_paths and _COMPACT_CONTACT_BOUNDARY and not _CHECK_ROWS:
             from .compact_contact import supported  # noqa: PLC0415
 
             self._compact_contact_boundary = supported(self)
@@ -3279,37 +3145,17 @@ class SolverFeatherPGS(SolverBase):
         if self._scalar_branches is not None and getattr(self._tree_kinetic_state, "scalar", None) is None:
             self._scalar_branches = None
             if self._tree_kinetic_state is None:
-                # Ordinary dynamics keeps the branches, with the opt-ins they superseded.
                 self._scalar_branches_reason = (
                     f"The held-tree owner did not take them ({self._cached_dynamics_selection_reason}); "
-                    "the prismatic opt-ins apply."
+                    "ordinary dynamics runs them."
                 )
-                self._configure_prismatic_publication()
             else:
-                # Every cached owner excludes the prismatic opt-ins (today no other owner admits
-                # a sparse-diagonal response, so this branch is defensive).
+                # Today no other cached owner admits a sparse-diagonal response, so this branch is defensive.
                 self._scalar_branches_reason = (
                     "A cached owner without scalar branches took these worlds: "
                     f"{self._cached_dynamics_selection_reason}"
                 )
-        if self._scalar_branches is not None:
-            # The prismatic opt-ins a recipe sets now select nothing: say so once per process.
-            from .scalar_branches import superseded_notice  # noqa: PLC0415
-
-            notice = superseded_notice(
-                name
-                for name, requested in (
-                    ("FEATHER_PGS_PRISMATIC_PUBLICATION", _PRISMATIC_PUBLICATION),
-                    ("FEATHER_PGS_PRISMATIC_LINEAR_STATE", _PRISMATIC_LINEAR_STATE),
-                )
-                if requested
-            )
-            if notice is not None:
-                warnings.warn(notice, UserWarning, stacklevel=_CONSTRUCTOR_CALLER)
         self._unread_mass_sizes = self._unread_mass_matrix_sizes()
-        # Decide the fused publication now: its host checks must not run inside
-        # a later graph capture of the first step.
-        self._fused_publication_admitted()
 
         # Worlds whose every candidate row separates at the predictor skip row
         # allocation entirely (resolved_worlds.py); the mask is empty when the
@@ -3320,28 +3166,6 @@ class SolverFeatherPGS(SolverBase):
         self._resolved_worlds_owner = classifier if classifier.enabled else None
         self._resolved_worlds = classifier.resolved
         self._resolved_worlds_reason = classifier.reason
-
-        if self._explicit_dense_kernels:
-            for name in (
-                "_tree_kinetic_state",
-                "_single_factor",
-            ):
-                if getattr(self, name, None) is not None:
-                    raise ValueError(
-                        f"Explicit dense kernel choices conflict with active research owner {name}; "
-                        "disable that research mode or use automatic kernel choices"
-                    )
-
-        self._free_body_gyro_kernel = None
-        if os.environ.get("FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO") == "1" and self._has_free_rigid_bodies:
-            # A predictor experiment independent of contact scheduling. The
-            # effective six-DOF factor retains drive/armature contributions;
-            # physical COM inertia supplies only the gyroscopic correction.
-            if model.requires_grad or self.L_by_size.get(6) is None or self._prismatic_linear_state:
-                raise ValueError("Experimental implicit free-body gyro requires ordinary six-DOF mass factors")
-            from .free_body_gyro import correct_free_body_gyroscopic_predictor  # noqa: PLC0415
-
-            self._free_body_gyro_kernel = correct_free_body_gyroscopic_predictor
 
         self._setup_contact_update(model)
         # Record the applied options once; get_path_selection() returns detached copies.
@@ -3409,7 +3233,7 @@ class SolverFeatherPGS(SolverBase):
         the sweep kernels per route and tier, what drives them and the matrix-free
         sweep's shared-memory storage (``sweep.mf_gs_storage``), resolved worlds,
         publication, velocity limits and the lane width of their prescale, free
-        bodies, the friction law and the grouped-dynamics kernels, each with a
+        bodies, the friction law and the grouped response solve, each with a
         reason; a size whose response the grouped kernel solves reports
         ``hinv_jt_kernel`` ``"grouped"``; ``routes.sweep.readout`` names the
         sweep kernels that count their sweeps, the passes that count the solves
@@ -3513,7 +3337,7 @@ class SolverFeatherPGS(SolverBase):
             "requested": dict(self._requested_kernel_choices),
             "sparse_mass_matrix": "on" if self._sparse_mass_matrix_size is not None else "off",
             "cached_dynamics": "on" if cached else "off",
-            "publication": "cached" if cached else "deferred" if self._publication_deferred() else "ordinary",
+            "publication": "cached" if cached else "ordinary",
             "pgs_kernel": "matrix_free" if self.pgs_mode == "matrix_free" else self.pgs_kernel,
             "kernel_plan_by_dof": kernels,
             "cached_prediction": "tree" if self._tree_kinetic_state is not None else None,
@@ -3522,10 +3346,6 @@ class SolverFeatherPGS(SolverBase):
                 "cached_dynamics": self._cached_dynamics_selection_reason,
                 "publication": "Paired cache owns next-state publication."
                 if cached
-                else "Fused current dynamics permits deferred kinematics publication."
-                if self._publication_deferred()
-                else "Patch friction publishes every substep for its release test."
-                if self.lazy_kinematics and self._fused_k1
                 else "Ordinary state publication remains active.",
                 "pgs_kernel": "Matrix-free mode owns the iteration kernel; split PGS selection is unused."
                 + (
@@ -5019,8 +4839,8 @@ class SolverFeatherPGS(SolverBase):
             self.grouped_dynamics
             and sparse_choice != "on"
             and os.environ.get("FEATHER_PGS_SPARSE_GROUPED_DYNAMICS", "1") != "1"
-        ) or (self._has_free_rigid_bodies and os.environ.get("FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO") == "1"):
-            self._sparse_selection_reason = "A legacy grouped or free-body option retains ordinary factors."
+        ):
+            self._sparse_selection_reason = "A legacy grouped option retains ordinary factors."
             return
         # A parallel tier that serves the active friction law owns the ordinary buffers.
         # Patch friction yields only to a parallel tier, which split mode never builds;
@@ -5030,8 +4850,8 @@ class SolverFeatherPGS(SolverBase):
         parallel_tier = self.mf_gs_parallel_rows > 0 and (
             self._point_contact_paths or (self._parallel_contact_paths and self.pgs_mode == "matrix_free")
         )
-        if parallel_tier or (self._point_contact_paths and os.environ.get("FEATHER_PGS_SINGLE_FACTOR") == "1"):
-            self._sparse_selection_reason = "A competing response or publication owner reserves the ordinary buffers."
+        if parallel_tier:
+            self._sparse_selection_reason = "A competing parallel tier reserves the ordinary buffers."
             return
         if self._has_free_rigid_bodies:
             # A world that pairs an articulation with free rigid bodies is served
@@ -6860,7 +6680,7 @@ class SolverFeatherPGS(SolverBase):
         self._paired_components = None
         if os.environ.get("FEATHER_PGS_PAIRED_COMPONENTS", "1") != "1":
             self._paired_components_reason = "FEATHER_PGS_PAIRED_COMPONENTS disables independent components."
-        elif _FPGS_CAPTURE or _GROUPED_CHECK or _DEBUG_CACHE_CMP or _INK_CHECK:
+        elif _FPGS_CAPTURE or _INK_CHECK:
             self._paired_components_reason = "Debug capture and comparison modes keep the coupled paired sweep."
         else:
             from .paired_components import PairedComponents  # noqa: PLC0415
@@ -7062,65 +6882,10 @@ class SolverFeatherPGS(SolverBase):
         # Row budget of the built incremental tiers (0 when none); recorded by get_path_selection().
         self._incremental_rows = 0
         if self.grouped_dynamics and model.device.is_cuda and int(model.articulation_count) > 0:
-            self._grouped_topology = GroupedTopology(
-                model, self.articulation_joint_end.numpy(), model.device, body_X_com=self.body_X_com
-            )
-            self._body_fs_scratch = wp.zeros(int(model.body_count), dtype=wp.spatial_vector, device=model.device)
+            # The grouped response solve (_stage4_hinv_jt_tiled) is grouped_dynamics' remaining kernel.
+            self._grouped_response = True
             self._grouped_kernels = {}
             self._grouped_dummy_diag = wp.zeros((1, 1), dtype=wp.float32, device=model.device)
-            # Grouped tau and publication do not consume the factor representation.
-            # The mass-writing fusions below require dense factor storage.
-            # Fused inverse dynamics + composite inertia + CRBA + Cholesky: every size group must
-            # use the compact-terms composite path and the lower-schedule CRBA, none may be a
-            # free-body-inertia group.
-            self._grouped_tau_mass = bool(
-                self._sparse_mass_matrix_size is None
-                and self._parallel_composite_inertia
-                and self._composite_articulation_count == int(model.articulation_count)
-                and all(
-                    size in self._crba_source_dof_by_size
-                    and size in self._crba_dof_joint_offset_by_size
-                    and size not in self._free_body_inertia_sizes
-                    and size <= _FACTOR_DENSE_MAX_DOF
-                    for size in self.size_groups
-                )
-                and self._direct_branch_tau_kernel is None
-            )
-            # Both fused mass-matrix variants are correct but slower than the tiled CRBA/Cholesky
-            # on AnymalD (pure Warp 235 us, native 195 us per update launch against ~113 us);
-            # they stay opt-in (FEATHER_PGS_GROUPED_TAU_MASS=1 / FEATHER_PGS_GROUPED_MASS=1).
-            self._grouped_mass = self._grouped_tau_mass and _GROUPED_MASS_ON
-            if not _GROUPED_TAU_MASS_ON:
-                self._grouped_tau_mass = False
-            # Fused world-dynamics kernel (K1): one launch per size group from the joint state.
-            topo = self._grouped_topology
-            self._fused_k1 = bool(
-                self._sparse_mass_matrix_size is None
-                and not _FUSED_K1_OFF
-                and topo.template_count > 0
-                and template_supported(topo.tpl_type_host)
-                and self._async_augmented_drives
-                and self._parallel_composite_inertia
-                and (not _FUSED_K1_MASS_ON or self._composite_articulation_count == int(model.articulation_count))
-                and self._direct_branch_tau_kernel is None
-                and all(
-                    size in self._crba_source_dof_by_size
-                    and size in self._crba_dof_joint_offset_by_size
-                    and (not _FUSED_K1_MASS_ON or size not in self._free_body_inertia_sizes)
-                    and size <= 32
-                    for size in self.size_groups
-                )
-            )
-            if self._fused_k1:
-                # Host-side template uniformity per size group, computed here (never inside a graph capture).
-                for size_ in self.size_groups:
-                    self._k1_size_single_template(int(size_))
-                self._grouped_tau_mass = False
-                self._grouped_mass = False
-                self._fused_k1_dummy_wrench = wp.zeros(
-                    max(int(model.body_count), 1), dtype=wp.spatial_vector, device=model.device
-                )
-                self._fused_k1_check = None
         # The sweep kernels keep an rb_class operand, which stays zero for every world.
         self._rb_class = wp.zeros(max(int(self.world_count), 1), dtype=wp.int32, device=model.device)
         if (
@@ -7363,7 +7128,7 @@ class SolverFeatherPGS(SolverBase):
             and not self.pgs_debug
             and not self._mf_warmstart_enabled
             and not getattr(self, "_pgs_solve_mf_gs_incremental_kernels", ())
-            and not (_FPGS_CAPTURE or _GROUPED_CHECK or _DEBUG_CACHE_CMP or _INK_CHECK or _FPGS_SYNC_TIMINGS)
+            and not (_FPGS_CAPTURE or _INK_CHECK or _FPGS_SYNC_TIMINGS)
         )
         self._paired_general_solve_stream = wp.Stream(model.device) if paired_overlap else None
         self._paired_general_ready = wp.Event(model.device) if paired_overlap else None
@@ -7600,238 +7365,6 @@ class SolverFeatherPGS(SolverBase):
                     True,
                     self._local_residual_warps_per_block[size],
                 )
-
-    def _k1_size_single_template(self, size: int) -> bool:
-        """True when every articulation of this size group shares one kinematic template (per-block staging)."""
-        cache = getattr(self, "_k1_single_template", None)
-        if cache is None:
-            cache = {}
-            self._k1_single_template = cache
-        if size not in cache:
-            arts = self.group_to_art[size].numpy()
-            tpl = np.asarray(self._grouped_topology.template_of_art)[arts]
-            cache[size] = bool(tpl.size > 0 and np.all(tpl == tpl[0]))
-        return cache[size]
-
-    def _launch_fused_k1(self, state_in: State, state_aug: State, stage3_qd, do_mass: int) -> None:
-        """One launch per size group: kinematics, bias forces, torques, composite inertia, mass factor."""
-        model = self.model
-        topo = self._grouped_topology
-        control = self._fused_k1_control
-        check = _GROUPED_CHECK
-        outputs = [
-            state_in.body_q,
-            state_aug.body_q_com,
-            self.articulation_origin,
-            state_aug.joint_S_s,
-            state_aug.body_v_s,
-            state_aug.body_a_s,
-            self._body_inertia_terms,
-            state_aug.body_I_s,
-            state_aug.body_f_s,
-            state_aug.body_ft_s,
-            state_aug.joint_tau,
-            self.body_I_c,
-        ]
-        cache_valid = self._fk_id_cache_valid
-        if check:
-            # Fused results go to scratch copies; the legacy chain runs afterwards and is compared.
-            outputs = [wp.clone(a) for a in outputs]
-            L_out = {size: wp.clone(self.L_by_size[size]) for size in self.size_groups}
-            cache_valid = wp.clone(self._fk_id_cache_valid)
-            self._fused_k1_check = (outputs, L_out, int(do_mass))
-        else:
-            L_out = self.L_by_size
-            if _K1_REAL_CHECK:
-                state_aug.body_ft_s.zero_()  # body_a_s / body_ft_s have no readers; published only for checks
-        body_f = state_in.body_f if state_in.body_count else self._fused_k1_dummy_wrench
-        real_check = _K1_REAL_CHECK and not check
-        if real_check:
-            tau_before = wp.clone(state_aug.joint_tau)
-        for size in self.size_groups:
-            n_arts = int(self.n_arts_by_size[size])
-            if n_arts == 0:
-                continue
-            key = ("k1", size)
-            kern = self._grouped_kernels.get(key)
-            lanes = int(topo.lanes_per_articulation)
-            if kern is None:
-                kern = get_fused_dynamics_kernel(
-                    int(size),
-                    int(topo.max_joints),
-                    lanes=lanes,
-                    with_mass=_FUSED_K1_MASS_ON,
-                    tpl_shared=self._k1_size_single_template(size) and not _K1_TPL_GLOBAL,
-                )
-                self._grouped_kernels[key] = kern
-            wpb, slots = fused_dynamics_launch_shape(lanes, _FUSED_K1_MASS_ON)
-            wp.launch_tiled(
-                kern,
-                dim=[(n_arts + slots - 1) // slots],
-                inputs=[
-                    wpb,
-                    n_arts,
-                    int(do_mass),
-                    1,
-                    1,
-                    int(check or real_check),
-                    int(topo.tpl_max_levels),
-                    self.group_to_art[size],
-                    topo.art_template,
-                    topo.art_body_base,
-                    topo.art_q_base,
-                    topo.art_qd_base,
-                    topo.tpl_joint_offset,
-                    topo.tpl_dof_offset,
-                    topo.tpl_level_offsets,
-                    topo.tpl_level_joints,
-                    topo.tpl_children_offsets,
-                    topo.tpl_children,
-                    topo.tpl_type,
-                    topo.tpl_lin,
-                    topo.tpl_ang,
-                    topo.tpl_q_off,
-                    topo.tpl_qd_off,
-                    topo.tpl_parent_local,
-                    topo.tpl_child_off,
-                    topo.tpl_X_p,
-                    topo.tpl_X_c,
-                    topo.tpl_axis,
-                    model.articulation_start,
-                    self.articulation_dof_start,
-                    state_in.joint_q,
-                    stage3_qd,
-                    state_in.joint_qd,
-                    control.joint_f,
-                    self._passive_spring_stiffness,
-                    self._passive_spring_ref,
-                    self._passive_joint_damping,
-                    self.body_X_com,
-                    model.body_com,
-                    model.body_mass,
-                    model.body_inertia,
-                    body_f,
-                    model.body_flags,
-                    self.is_free_rigid,
-                    model.gravity,
-                    self.R_by_size[size],
-                    self._crba_dof_joint_offset_by_size[size],
-                    self._crba_source_dof_by_size[size],
-                    self._augmented_drive_row_by_dof,
-                    self.aug_row_K,
-                    *outputs,
-                    L_out[size],
-                    cache_valid,
-                    model.joint_X_p,
-                ],
-                outputs=[],
-                block_dim=32 * wpb,
-                device=model.device,
-            )
-        if real_check:
-            # Legacy kinematics + inverse dynamics into scratch arrays from the same inputs.
-            ref_body_q = wp.clone(state_in.body_q)
-            ref = {
-                "body_q_com": wp.clone(state_aug.body_q_com),
-                "origin": wp.clone(self.articulation_origin),
-                "joint_S_s": wp.clone(state_aug.joint_S_s),
-                "body_I_s": wp.clone(state_aug.body_I_s),
-                "terms": wp.clone(self._body_inertia_terms),
-                "body_v_s": wp.clone(state_aug.body_v_s),
-                "body_f_s": wp.clone(state_aug.body_f_s),
-                "body_a_s": wp.clone(state_aug.body_a_s),
-                "valid": wp.zeros_like(self._fk_id_cache_valid),
-            }
-            wp.launch(
-                eval_rigid_fk_id,
-                dim=model.articulation_count,
-                inputs=[
-                    model.articulation_start,
-                    self.articulation_joint_end,
-                    model.joint_type,
-                    model.joint_parent,
-                    model.joint_child,
-                    model.joint_q_start,
-                    model.joint_qd_start,
-                    state_in.joint_q,
-                    stage3_qd,
-                    model.joint_X_p,
-                    model.joint_X_c,
-                    self.body_X_com,
-                    model.joint_axis,
-                    model.joint_dof_dim,
-                    model.body_com,
-                    model.body_mass,
-                    model.body_inertia,
-                    self.is_free_rigid,
-                    0,
-                    1,
-                    0,
-                    model.gravity,
-                ],
-                outputs=[
-                    ref_body_q,
-                    ref["body_q_com"],
-                    ref["origin"],
-                    ref["joint_S_s"],
-                    ref["body_I_s"],
-                    ref["terms"],
-                    ref["body_v_s"],
-                    ref["body_f_s"],
-                    ref["body_a_s"],
-                    ref["valid"],
-                ],
-                block_dim=16,
-                device=model.device,
-            )
-            ref_ft = wp.zeros_like(state_aug.body_ft_s)
-            ref_tau = tau_before
-            wp.launch(
-                eval_rigid_tau_add,
-                dim=model.articulation_count,
-                inputs=[
-                    model.articulation_start,
-                    self.articulation_joint_end,
-                    model.joint_type,
-                    model.joint_parent,
-                    model.joint_child,
-                    model.joint_articulation,
-                    model.joint_qd_start,
-                    model.joint_q_start,
-                    model.joint_dof_dim,
-                    control.joint_f,
-                    state_in.joint_q,
-                    state_in.joint_qd,
-                    self._passive_spring_stiffness,
-                    self._passive_spring_ref,
-                    self._passive_joint_damping,
-                    ref["joint_S_s"],
-                    ref["body_f_s"],
-                    body_f,
-                    model.body_flags,
-                    ref_body_q,
-                    model.body_com,
-                    ref["origin"],
-                ],
-                outputs=[ref_ft, ref_tau],
-                block_dim=self.serial_kernel_block_dim,
-                device=model.device,
-            )
-            pairs = [
-                ("body_q", state_in.body_q, ref_body_q),
-                ("body_q_com", state_aug.body_q_com, ref["body_q_com"]),
-                ("origin", self.articulation_origin, ref["origin"]),
-                ("joint_S_s", state_aug.joint_S_s, ref["joint_S_s"]),
-                ("body_v_s", state_aug.body_v_s, ref["body_v_s"]),
-                ("body_a_s", state_aug.body_a_s, ref["body_a_s"]),
-                ("terms", self._body_inertia_terms, ref["terms"]),
-                ("body_I_s", state_aug.body_I_s, ref["body_I_s"]),
-                ("body_f_s", state_aug.body_f_s, ref["body_f_s"]),
-                ("body_ft_s", state_aug.body_ft_s, ref_ft),
-                ("joint_tau", state_aug.joint_tau, ref_tau),
-            ]
-            for nm, a, b in pairs:
-                _report_grouped_check(f"k1real:{nm}", [a], [b])
 
     def _launch_matrix_free_gs_solve(
         self,
@@ -8533,16 +8066,10 @@ class SolverFeatherPGS(SolverBase):
 
         model = self.model
 
-        if _DEBUG_DELAY > 0:
-            if getattr(self, "_debug_spin_out", None) is None:
-                self._debug_spin_out = wp.zeros(1, dtype=float, device=model.device)
-            wp.launch(_debug_spin, dim=1, inputs=[_DEBUG_DELAY], outputs=[self._debug_spin_out], device=model.device)
-
         if control is None:
             control = model.control(clone_variables=False)
         state_aug = self._prepare_augmented_state(state_in, state_out, control)
         self._last_debug_state_aug = state_aug
-        self._fused_k1_control = control
 
         if collide_done_event is not None and state_in.particle_count > 0:
             wp.get_stream(self.model.device).wait_event(collide_done_event)
@@ -8569,8 +8096,6 @@ class SolverFeatherPGS(SolverBase):
         # ══════════════════════════════════════════════════════════════
         with wp.ScopedTimer("S1_FK_ID_CRBA", print=False, use_nvtx=self._nvtx, synchronize=False):
             drive_rows_ready = self._stage1_prepare_augmented_drives(state_in, state_aug, control, dt)
-            if self._fused_k1 and drive_rows_ready is not None:
-                wp.get_stream(model.device).wait_event(drive_rows_ready)
             global_inertia_ready, stage3_qd = self._stage1_fk_id(state_in, state_aug, state_out)
 
             if model.articulation_count:
@@ -9113,13 +8638,9 @@ class SolverFeatherPGS(SolverBase):
                     friction_start_iteration=self._contact_friction_start_iteration(self.pgs_iterations),
                 )
 
-            if self._fused_publication_admitted():
-                # The fused publication applies the impulses itself.
-                self._fused_publication_apply = True
-            else:
-                self._stage6_prepare_world_velocity()
-                for size in self.size_groups:
-                    self._stage6_apply_impulses_world(size)
+            self._stage6_prepare_world_velocity()
+            for size in self.size_groups:
+                self._stage6_apply_impulses_world(size)
 
             if self.pgs_mode == "split" and self._has_free_rigid_bodies:
                 self._stage6b_mf_pgs(state_aug, dt)
@@ -9132,8 +8653,6 @@ class SolverFeatherPGS(SolverBase):
         with wp.ScopedTimer("S7_Integrate", print=False, use_nvtx=self._nvtx, synchronize=False):
             if self.pgs_mode == "matrix_free" and self.pgs_velocity_iterations > 0:
                 self._stage6_write_final_velocity(state_in, state_aug, state_out, dt)
-            elif self._fused_publication_admitted():
-                self._stage7_finish_general(state_in, state_aug, state_out, dt)
             else:
                 self._stage6_update_qdd(state_in, state_aug, dt)
                 self._stage6_integrate(state_in, state_aug, state_out, dt)
@@ -9147,9 +8666,6 @@ class SolverFeatherPGS(SolverBase):
         # the MF carry below).
         if self._friction_anchors_enabled:
             with wp.ScopedTimer("S7_Friction_Patch_Carry", print=False, use_nvtx=self._nvtx, synchronize=False):
-                if self._fused_k1 and self.lazy_kinematics:
-                    # The release test reads the integrated public body state.
-                    self._stage7_update_kinematics(state_out, state_aug, force=True)
                 self._finish_friction_patches(state_in, state_out, contacts, dt)
 
         if self.pgs_warmstart and self._ws_prev_dense_impulses is not None:
@@ -9726,36 +9242,12 @@ class SolverFeatherPGS(SolverBase):
 
         # evaluate joint inertias, motion vectors, and forces
         if self._fk_id_cache_enabled:
-            if _DEBUG_CACHE:
-                same = self._fk_id_cache_source_state is state_in
-                capturing = bool(wp.get_device(model.device).is_capturing)
-                nvalid = -1 if capturing else int(self._fk_id_cache_valid.numpy().sum())
-                print(
-                    f"[fk-cache] step={self._step} source_is_state_in={same} valid={nvalid} capturing={capturing}",
-                    flush=True,
-                )
-            if _DEBUG_CACHE_MODE == "zero_even":
-                if self._step % 2 == 0:
-                    self._fk_id_cache_valid.zero_()
-                    self._forget_repair_continuity()
-            elif _DEBUG_CACHE_MODE != "nozero" and not getattr(
-                getattr(self, "_tree_kinetic_state", None), "bank_compare", False
-            ):
+            if not getattr(getattr(self, "_tree_kinetic_state", None), "bank_compare", False):
                 # Owners that compare input banks validate a changed bank on the device.
                 if self._fk_id_cache_source_state is not None and state_in is not self._fk_id_cache_source_state:
                     self._fk_id_cache_valid.zero_()
                     self._forget_repair_continuity()
             self._fk_id_cache_source_state = state_in
-            if self._fk_id_cache_uses_snapshot:
-                cache = self._fk_id_cache
-                wp.copy(state_aug.body_q_com, cache.body_q_com)
-                wp.copy(self.articulation_origin, cache.articulation_origin)
-                wp.copy(state_aug.joint_S_s, cache.joint_S_s)
-                wp.copy(state_aug.body_I_s, cache.body_I_s)
-                wp.copy(self._body_inertia_terms, cache.body_inertia_terms)
-                wp.copy(state_aug.body_v_s, cache.body_v_s)
-                wp.copy(state_aug.body_f_s, cache.body_f_s)
-                wp.copy(state_aug.body_a_s, cache.body_a_s)
         else:
             state_aug.body_f_s.zero_()
         if self.enable_joint_velocity_limits:
@@ -9771,107 +9263,55 @@ class SolverFeatherPGS(SolverBase):
             )
             return None, stage3_qd
         parallel_global_refresh = refresh_composite and self._global_inertia_stream is not None
-        if self._fused_k1:
-            self._fused_k1_legacy_state_in = state_in
-            self._launch_fused_k1(state_in, state_aug, stage3_qd, int(refresh_composite and _FUSED_K1_MASS_ON))
-        if self._fused_k1 and not _GROUPED_CHECK:
-            pass  # kinematics and inverse dynamics produced by the fused world-dynamics kernel
+        fk_inputs = [
+            model.articulation_start,
+            self.articulation_joint_end,
+            model.joint_type,
+            model.joint_parent,
+            model.joint_child,
+            model.joint_q_start,
+            model.joint_qd_start,
+            state_in.joint_q,
+            stage3_qd,
+            model.joint_X_p,
+            model.joint_X_c,
+            self.body_X_com,
+            model.joint_axis,
+            model.joint_dof_dim,
+            model.body_com,
+            model.body_mass,
+            model.body_inertia,
+            self.is_free_rigid,
+            int(refresh_composite and not parallel_global_refresh),
+            int(parallel_global_refresh),
+            int(self._fk_id_cache_enabled),
+            model.gravity,
+        ]
+        fk_outputs = [
+            state_in.body_q,
+            state_aug.body_q_com,
+            self.articulation_origin,
+            state_aug.joint_S_s,
+            state_aug.body_I_s,
+            self._body_inertia_terms,
+            state_aug.body_v_s,
+            state_aug.body_f_s,
+            state_aug.body_a_s,
+            self._fk_id_cache_valid,
+        ]
+        if self._tree_plan is not None:
+            self._launch_tree_fk("id", fk_inputs, fk_outputs)
         else:
-            if self._prismatic_linear_state:
-                # The shortened root producer stamps validity before the leaf
-                # pass. Preserve admission from before either producer runs.
-                wp.copy(self._prismatic_linear_valid, self._fk_id_cache_valid)
-            fk_inputs = [
-                model.articulation_start,
-                self._prismatic_publication.joint_end if self._prismatic_linear_state else self.articulation_joint_end,
-                model.joint_type,
-                model.joint_parent,
-                model.joint_child,
-                model.joint_q_start,
-                model.joint_qd_start,
-                state_in.joint_q,
-                stage3_qd,
-                model.joint_X_p,
-                model.joint_X_c,
-                self.body_X_com,
-                model.joint_axis,
-                model.joint_dof_dim,
-                model.body_com,
-                model.body_mass,
-                model.body_inertia,
-                self.is_free_rigid,
-                int(refresh_composite and not parallel_global_refresh),
-                int(parallel_global_refresh),
-                int(self._fk_id_cache_enabled),
-                model.gravity,
-            ]
-            fk_outputs = [
-                state_in.body_q,
-                state_aug.body_q_com,
-                self.articulation_origin,
-                state_aug.joint_S_s,
-                state_aug.body_I_s,
-                self._body_inertia_terms,
-                state_aug.body_v_s,
-                state_aug.body_f_s,
-                state_aug.body_a_s,
-                self._fk_id_cache_valid,
-            ]
-            if self._tree_plan is not None and not self._prismatic_linear_state:
-                self._launch_tree_fk("id", fk_inputs, fk_outputs)
-            else:
-                wp.launch(
-                    eval_rigid_fk_id,
-                    dim=model.articulation_count,
-                    inputs=fk_inputs,
-                    outputs=fk_outputs,
-                    block_dim=16,
-                    device=model.device,
-                )
-            if self._prismatic_linear_state:
-                from .prismatic_linear_state import repair_prismatic_linear_state  # noqa: PLC0415
-
-                wp.launch(
-                    repair_prismatic_linear_state,
-                    dim=model.body_count,
-                    inputs=[
-                        self._prismatic_publication.body_joint,
-                        self._prismatic_linear_valid,
-                        model.joint_parent,
-                        model.joint_q_start,
-                        model.joint_qd_start,
-                        state_in.joint_q,
-                        stage3_qd,
-                        model.joint_X_p,
-                        model.joint_X_c,
-                        self.body_X_com,
-                        model.joint_axis,
-                        self.body_to_articulation,
-                        model.body_mass,
-                        self.articulation_origin,
-                        model.gravity,
-                    ],
-                    outputs=[
-                        state_in.body_q,
-                        state_aug.body_q_com,
-                        state_aug.joint_S_s,
-                        state_aug.body_v_s,
-                        state_aug.body_a_s,
-                        state_aug.body_f_s,
-                    ],
-                    block_dim=128,
-                    device=model.device,
-                )
-        if _DEBUG_CACHE_CMP and self._fk_id_cache_enabled and not self._fused_k1:
-            self._debug_compare_cache(state_in, state_aug, stage3_qd)
+            wp.launch(
+                eval_rigid_fk_id,
+                dim=model.articulation_count,
+                inputs=fk_inputs,
+                outputs=fk_outputs,
+                block_dim=16,
+                device=model.device,
+            )
         global_inertia_ready = None
-        if (
-            parallel_global_refresh
-            and (self._grouped_tau_mass or self._grouped_mass or (self._fused_k1 and _FUSED_K1_MASS_ON))
-            and not _GROUPED_CHECK
-        ):
-            pass  # composite inertia is produced by a fused kernel
-        elif parallel_global_refresh:
+        if parallel_global_refresh:
             inertia_stream = self._global_inertia_stream
             inertia_stream.wait_event(wp.get_stream(model.device).record_event())
             with wp.ScopedStream(inertia_stream, sync_enter=False):
@@ -9894,146 +9334,6 @@ class SolverFeatherPGS(SolverBase):
                 device=model.device,
             )
         return global_inertia_ready, stage3_qd
-
-    def _debug_compare_cache(self, state_in: State, state_aug: State, stage3_qd) -> None:
-        """Debug only: recompute FK/ID freshly and accumulate max differences against the values in use.
-
-        Runs inside CUDA graphs; ``self._debug_cache_diff`` holds slots
-        [body_q, body_q_com, origin, joint_S_s, body_v_s, body_a_s, body_f_s].
-        """
-        model = self.model
-        scratch = getattr(self, "_debug_cache_scratch", None)
-        if scratch is None:
-            scratch = {
-                "body_q": wp.zeros_like(state_in.body_q),
-                "body_q_com": wp.zeros_like(state_aug.body_q_com),
-                "origin": wp.zeros_like(self.articulation_origin),
-                "joint_S_s": wp.zeros_like(state_aug.joint_S_s),
-                "body_I_s": wp.zeros_like(state_aug.body_I_s),
-                "terms": wp.zeros_like(self._body_inertia_terms),
-                "body_v_s": wp.zeros_like(state_aug.body_v_s),
-                "body_f_s": wp.zeros_like(state_aug.body_f_s),
-                "body_a_s": wp.zeros_like(state_aug.body_a_s),
-                "valid": wp.zeros_like(self._fk_id_cache_valid),
-            }
-            self._debug_cache_scratch = scratch
-            self._debug_cache_diff = wp.zeros(10, dtype=float, device=model.device)
-        wp.launch(
-            eval_rigid_fk_id,
-            dim=model.articulation_count,
-            inputs=[
-                model.articulation_start,
-                self.articulation_joint_end,
-                model.joint_type,
-                model.joint_parent,
-                model.joint_child,
-                model.joint_q_start,
-                model.joint_qd_start,
-                state_in.joint_q,
-                stage3_qd,
-                model.joint_X_p,
-                model.joint_X_c,
-                self.body_X_com,
-                model.joint_axis,
-                model.joint_dof_dim,
-                model.body_com,
-                model.body_mass,
-                model.body_inertia,
-                self.is_free_rigid,
-                0,
-                1,
-                0,
-                model.gravity,
-            ],
-            outputs=[
-                scratch["body_q"],
-                scratch["body_q_com"],
-                scratch["origin"],
-                scratch["joint_S_s"],
-                scratch["body_I_s"],
-                scratch["terms"],
-                scratch["body_v_s"],
-                scratch["body_f_s"],
-                scratch["body_a_s"],
-                scratch["valid"],
-            ],
-            block_dim=16,
-            device=model.device,
-        )
-        out = self._debug_cache_diff
-        wp.launch(
-            _debug_maxdiff_tf,
-            dim=model.body_count,
-            inputs=[state_in.body_q, scratch["body_q"], 0],
-            outputs=[out],
-            device=model.device,
-        )
-        wp.launch(
-            _debug_maxdiff_tf,
-            dim=model.body_count,
-            inputs=[state_aug.body_q_com, scratch["body_q_com"], 1],
-            outputs=[out],
-            device=model.device,
-        )
-        wp.launch(
-            _debug_maxdiff_v3,
-            dim=model.articulation_count,
-            inputs=[self.articulation_origin, scratch["origin"], 2],
-            outputs=[out],
-            device=model.device,
-        )
-        wp.launch(
-            _debug_maxdiff_sv,
-            dim=model.joint_dof_count,
-            inputs=[state_aug.joint_S_s, scratch["joint_S_s"], 3],
-            outputs=[out],
-            device=model.device,
-        )
-        wp.launch(
-            _debug_maxdiff_sv,
-            dim=model.body_count,
-            inputs=[state_aug.body_v_s, scratch["body_v_s"], 4],
-            outputs=[out],
-            device=model.device,
-        )
-        wp.launch(
-            _debug_maxdiff_sv,
-            dim=model.body_count,
-            inputs=[state_aug.body_a_s, scratch["body_a_s"], 5],
-            outputs=[out],
-            device=model.device,
-        )
-        wp.launch(
-            _debug_maxdiff_sv,
-            dim=model.body_count,
-            inputs=[state_aug.body_f_s, scratch["body_f_s"], 6],
-            outputs=[out],
-            device=model.device,
-        )
-        wp.launch(
-            _debug_maxdiff_sv,
-            dim=model.body_count,
-            inputs=[state_aug.body_f_s, scratch["body_f_s"], 7 + (self._step % 2)],
-            outputs=[out],
-            device=model.device,
-        )
-        if "cached_f" not in scratch:
-            scratch["cached_f"] = wp.zeros_like(state_aug.body_f_s)
-            scratch["cached_v"] = wp.zeros_like(state_aug.body_v_s)
-            scratch["cached_a"] = wp.zeros_like(state_aug.body_a_s)
-            scratch["cached_qcom"] = wp.zeros_like(state_aug.body_q_com)
-            scratch["fresh_f"] = wp.zeros_like(state_aug.body_f_s)
-            scratch["fresh_a"] = wp.zeros_like(state_aug.body_a_s)
-            scratch["fresh_qcom"] = wp.zeros_like(state_aug.body_q_com)
-        if self._step % 2 == 1:
-            return  # keep the copies from the first substep of the captured pair
-        wp.copy(scratch["cached_f"], state_aug.body_f_s)
-        wp.copy(scratch["cached_v"], state_aug.body_v_s)
-        wp.copy(scratch["cached_a"], state_aug.body_a_s)
-        wp.copy(scratch["cached_qcom"], state_aug.body_q_com)
-        wp.copy(scratch["fresh_f"], scratch["body_f_s"])
-        wp.copy(scratch["fresh_a"], scratch["body_a_s"])
-        wp.copy(scratch["fresh_qcom"], scratch["body_q_com"])
 
     def _stage1_prepare_augmented_drives(
         self, state_in: State, state_aug: State, control: Control, dt: float
@@ -10136,145 +9436,7 @@ class SolverFeatherPGS(SolverBase):
             self.articulation_origin,
         ]
         if self._direct_branch_tau_kernel is None:
-            topo = self._grouped_topology
-            if topo is not None and self._grouped_tau_mass:
-                do_mass = 1 if ((self._step % self.update_mass_matrix_interval) == 0 or self._force_mass_update) else 0
-                check = _GROUPED_CHECK
-                ref = [wp.clone(state_aug.body_ft_s), wp.clone(state_aug.joint_tau)] if check else None
-                t = tau_inputs
-                for size in self.size_groups:
-                    n_arts = int(self.n_arts_by_size[size])
-                    if n_arts == 0:
-                        continue
-                    sched = self._crba_source_dof_by_size[size]
-                    apb = 32 // topo.lanes_per_articulation
-                    wp.launch_tiled(
-                        grouped_tau_mass,
-                        dim=[(n_arts + apb - 1) // apb],
-                        inputs=[
-                            topo.lanes_per_articulation,
-                            n_arts,
-                            topo.max_levels,
-                            do_mass,
-                            int(size),
-                            int(sched.shape[0]),
-                            1,
-                            topo.art_level_offsets,
-                            topo.level_joint_local,
-                            topo.children_offsets,
-                            topo.children,
-                            self.group_to_art[size],
-                            t[0],
-                            self.articulation_dof_start,
-                            t[2],
-                            t[3],
-                            t[4],
-                            t[6],
-                            t[7],
-                            t[8],
-                            t[9],
-                            t[10],
-                            t[11],
-                            t[12],
-                            t[13],
-                            t[14],
-                            t[15],
-                            t[16],
-                            t[17],
-                            t[18],
-                            t[19],
-                            t[20],
-                            t[21],
-                            int(add_to_existing),
-                            model.body_mass,
-                            self._body_inertia_terms,
-                            self.R_by_size[size],
-                            self._crba_dof_joint_offset_by_size[size],
-                            sched,
-                            self._augmented_drive_row_by_dof,
-                            self.aug_row_K,
-                        ],
-                        outputs=[
-                            state_aug.body_ft_s,
-                            self._body_fs_scratch,
-                            state_aug.joint_tau,
-                            self.body_I_c,
-                            self.L_by_size[size],
-                        ],
-                        block_dim=32,
-                        device=model.device,
-                    )
-                self._grouped_mass_done = bool(do_mass)
-                if check:
-                    fused_ic = wp.clone(self.body_I_c) if do_mass else None
-                    fused_L = {size: wp.clone(self.L_by_size[size]) for size in self.size_groups} if do_mass else None
-                    wp.launch(
-                        eval_rigid_tau_add if add_to_existing else eval_rigid_tau,
-                        dim=model.articulation_count,
-                        inputs=tau_inputs,
-                        outputs=ref,
-                        block_dim=self.serial_kernel_block_dim,
-                        device=model.device,
-                    )
-                    _report_grouped_check("tau(fused)", [state_aug.body_ft_s, state_aug.joint_tau], ref)
-                    self._grouped_check_pending = (fused_ic, fused_L)
-                return
-            if topo is not None:
-                check = _GROUPED_CHECK
-                ref = [wp.clone(state_aug.body_ft_s), wp.clone(state_aug.joint_tau)] if check else None
-                # tau_inputs order: art_start, joint_end, type, parent, child, articulation, qd_start,
-                # q_start, dof_dim, joint_f, q, qd, spring_k, spring_ref, damping, S_s, fb_s, f_ext,
-                # flags, body_q, body_com, origin.
-                t = tau_inputs
-                wp.launch_tiled(
-                    grouped_tau,
-                    dim=[topo.blocks],
-                    inputs=[
-                        topo.lanes_per_articulation,
-                        int(model.articulation_count),
-                        topo.max_levels,
-                        topo.art_level_offsets,
-                        topo.level_joint_local,
-                        topo.children_offsets,
-                        topo.children,
-                        t[0],
-                        t[2],
-                        t[3],
-                        t[4],
-                        t[6],
-                        t[7],
-                        t[8],
-                        t[9],
-                        t[10],
-                        t[11],
-                        t[12],
-                        t[13],
-                        t[14],
-                        t[15],
-                        t[16],
-                        t[17],
-                        t[18],
-                        t[19],
-                        t[20],
-                        t[21],
-                        int(add_to_existing),
-                    ],
-                    outputs=[state_aug.body_ft_s, self._body_fs_scratch, state_aug.joint_tau],
-                    block_dim=32,
-                    device=model.device,
-                )
-                if check:
-                    wp.launch(
-                        eval_rigid_tau_add if add_to_existing else eval_rigid_tau,
-                        dim=model.articulation_count,
-                        inputs=tau_inputs,
-                        outputs=ref,
-                        block_dim=self.serial_kernel_block_dim,
-                        device=model.device,
-                    )
-                    _report_grouped_check("tau", [state_aug.body_ft_s, state_aug.joint_tau], ref)
-                return
-            elif self._tree_plan is not None:
+            if self._tree_plan is not None:
                 for group, net_wrench in zip(self._tree_plan.groups, self._tree_net_wrenches, strict=True):
                     per_warp = 32 // group.lanes
                     wp.launch(
@@ -10369,8 +9531,6 @@ class SolverFeatherPGS(SolverBase):
             return None
 
         model = self.model
-        if self._fused_k1 and not _GROUPED_CHECK:
-            return None  # joint torques produced by the fused world-dynamics kernel
         dynamics_stream = self._articulation_dynamics_stream
         dynamics_stream.wait_event(wp.get_stream(model.device).record_event())
         with wp.ScopedStream(dynamics_stream, sync_enter=False):
@@ -10625,57 +9785,6 @@ class SolverFeatherPGS(SolverBase):
                         device=model.device,
                     )
                 continue
-            if self._grouped_tau_mass and global_flag and not _GROUPED_CHECK:
-                continue  # mass matrix factored by the fused inverse-dynamics kernel
-            if self._fused_k1 and _FUSED_K1_MASS_ON and global_flag and not _GROUPED_CHECK:
-                continue  # mass matrix factored by the fused world-dynamics kernel
-            if self._grouped_mass and global_flag:
-                key = ("mass", size)
-                kern = self._grouped_kernels.get(key)
-                if kern is None:
-                    kern = get_grouped_mass_kernel(int(size), int(self._grouped_topology.max_joints))
-                    self._grouped_kernels[key] = kern
-                n_arts = int(self.n_arts_by_size[size])
-                check = _GROUPED_CHECK
-                wpb = 4
-                wp.launch_tiled(
-                    kern,
-                    dim=[(n_arts + wpb - 1) // wpb],
-                    inputs=[
-                        wpb,
-                        n_arts,
-                        self.group_to_art[size],
-                        model.articulation_start,
-                        self.articulation_joint_end,
-                        model.joint_ancestor,
-                        model.joint_child,
-                        model.body_mass,
-                        self._body_inertia_terms,
-                        self.articulation_dof_start,
-                        state_aug.joint_S_s,
-                        self.R_by_size[size],
-                        self._crba_dof_joint_offset_by_size[size],
-                        self._crba_source_dof_by_size[size],
-                        1,
-                        self._augmented_drive_row_by_dof,
-                        self.aug_row_K,
-                        self.body_I_c,
-                        self.L_by_size[size],
-                    ],
-                    outputs=[],
-                    block_dim=32 * wpb,
-                    device=model.device,
-                )
-                if check:
-                    fused_ic = wp.clone(self.body_I_c)
-                    fused_L = wp.clone(self.L_by_size[size])
-                    # legacy composite (into body_I_c) then fall through to the legacy CRBA below
-                    self._launch_parallel_composite_inertia(state_aug.body_I_s, compact_terms=True)
-                    wp.synchronize_device(model.device)
-                    _report_grouped_check(f"composite_{size}(native)", [fused_ic], [self.body_I_c])
-                    self._grouped_check_pending_L = (size, fused_L)
-                else:
-                    continue
             fused_crba_cholesky_warp = self._crba_cholesky_warp_kernels_by_size[size]
             if fused_crba_cholesky_warp is not None:
                 wp.launch(
@@ -10779,82 +9888,6 @@ class SolverFeatherPGS(SolverBase):
         self._mass_update_requested.zero_()
 
         self._force_mass_update = False
-
-        k1c = getattr(self, "_fused_k1_check", None)
-        if _GROUPED_CHECK and k1c is not None:
-            outs, L_out, dm = k1c
-            self._fused_k1_check = None
-            names = [
-                "body_q",
-                "body_q_com",
-                "origin",
-                "joint_S_s",
-                "body_v_s",
-                "body_a_s",
-                "inertia_terms",
-                "body_I_s",
-                "body_f_s",
-                "body_ft_s",
-                "joint_tau",
-                "body_I_c",
-            ]
-            legacy = [
-                self._fused_k1_legacy_state_in.body_q,
-                state_aug.body_q_com,
-                self.articulation_origin,
-                state_aug.joint_S_s,
-                state_aug.body_v_s,
-                state_aug.body_a_s,
-                self._body_inertia_terms,
-                state_aug.body_I_s,
-                state_aug.body_f_s,
-                state_aug.body_ft_s,
-                state_aug.joint_tau,
-                self.body_I_c,
-            ]
-            for nm, a, b in zip(names, outs, legacy, strict=False):
-                if nm == "body_I_c" and not dm:
-                    continue
-                _report_grouped_check(f"k1:{nm}", [a], [b])
-            if dm:
-                for size in self.size_groups:
-                    a = L_out[size].numpy().astype(np.float64)
-                    b = self.L_by_size[size].numpy().astype(np.float64)
-                    tri = np.tril(np.ones((a.shape[1], a.shape[2]), dtype=bool))
-                    print(
-                        f"[grouped-check] k1:cholesky_{size}: lower max abs diff {np.nanmax(np.abs(a[:, tri] - b[:, tri])):.3e}, nan {int(np.isnan(a).sum())}",
-                        flush=True,
-                    )
-        pend_L = getattr(self, "_grouped_check_pending_L", None)
-        if _GROUPED_CHECK and pend_L is not None:
-            size, fused_L = pend_L
-            self._grouped_check_pending_L = None
-            a = fused_L.numpy().astype(np.float64)
-            b = self.L_by_size[size].numpy().astype(np.float64)
-            tri = np.tril(np.ones((a.shape[1], a.shape[2]), dtype=bool))
-            print(
-                f"[grouped-check] cholesky_{size}(native): lower max abs diff {np.nanmax(np.abs(a[:, tri] - b[:, tri])):.3e}, "
-                f"nan fused {int(np.isnan(a).sum())}, |L| max {np.nanmax(np.abs(b[:, tri])):.3e}, upper fused max {np.nanmax(np.abs(a[:, ~tri])):.3e}",
-                flush=True,
-            )
-        pending = getattr(self, "_grouped_check_pending", None)
-        if _GROUPED_CHECK and pending is not None:
-            fused_ic, fused_L = pending
-            self._grouped_check_pending = None
-            if fused_ic is not None:
-                _report_grouped_check("composite_inertia(fused)", [fused_ic], [self.body_I_c])
-                for size in self.size_groups:
-                    a = fused_L[size].numpy().astype(np.float64)
-                    b = self.L_by_size[size].numpy().astype(np.float64)
-                    tri = np.tril(np.ones((a.shape[1], a.shape[2]), dtype=bool))
-                    da = a[:, tri]
-                    db = b[:, tri]
-                    print(
-                        f"[grouped-check] cholesky_{size}(fused): lower max abs diff {np.nanmax(np.abs(da - db)):.3e}, "
-                        f"nan fused {int(np.isnan(a).sum())} legacy {int(np.isnan(b).sum())}, |L| max {np.nanmax(np.abs(db)):.3e}, "
-                        f"upper fused max {np.nanmax(np.abs(a[:, ~tri])):.3e} legacy {np.nanmax(np.abs(b[:, ~tri])):.3e}",
-                        flush=True,
-                    )
 
     def _stage2_factor(self, size: int):
         """The stage-2 factorization of one DOF size, or ``None`` when stage 2 has none to run.
@@ -11092,27 +10125,6 @@ class SolverFeatherPGS(SolverBase):
             outputs=[state_aug.joint_qdd, self.v_hat],
             device=model.device,
         )
-        if self._free_body_gyro_kernel is not None:
-            wp.launch(
-                self._free_body_gyro_kernel,
-                dim=self.n_arts_by_size[6],
-                inputs=[
-                    self.group_to_art[6],
-                    self.is_free_rigid,
-                    model.articulation_start,
-                    model.joint_child,
-                    model.joint_qd_start,
-                    self._kinematic_joint_mask,
-                    state_aug.body_q_com,
-                    model.joint_X_p,
-                    model.body_inertia,
-                    self.L_by_size[6],
-                    stage3_qd,
-                    dt,
-                ],
-                outputs=[self.v_hat],
-                device=model.device,
-            )
         self._stage3_correct_free_root_velocity(state_in, stage3_qd, dt)
 
     def _stage3_correct_free_root_velocity(
@@ -11125,9 +10137,7 @@ class SolverFeatherPGS(SolverBase):
         # runtime kinematic changes without changing graph topology.
         if not self._free_root_joint_count:
             return
-        # The retained clutter experiment replaces, never compounds, main's
-        # angular correction. Both paths still need linear transport once.
-        if self._free_rigid_body_count and self._free_body_gyro_kernel is None:
+        if self._free_rigid_body_count:
             wp.launch(
                 apply_free_root_velocity_corrections,
                 dim=self._free_root_joint_count,
@@ -12922,7 +11932,7 @@ class SolverFeatherPGS(SolverBase):
         outputs = [self.Y_by_size[size], J_world, Y_world]
         if size in self._hinv_jt_diag_sizes:
             outputs.append(self.diag_by_size[size])
-        # The grouped response solve is verified for <= 32 DOF only (43-DOF G1 diverged; see check mode).
+        # The grouped response solve is verified for <= 32 DOF only (43-DOF G1 diverged).
         if self._use_grouped_hinv_jt(size):
             key = ("hinv_jt", size)
             kern = self._grouped_kernels.get(key)
@@ -12939,8 +11949,6 @@ class SolverFeatherPGS(SolverBase):
                 )
                 self._grouped_kernels[key] = kern
             diag_out = self.diag_by_size[size] if size in self._hinv_jt_diag_sizes else self._grouped_dummy_diag
-            check = _GROUPED_CHECK
-            ref = [wp.clone(a) for a in outputs] if check else None
             wpb = 4
             wp.launch_tiled(
                 kern,
@@ -12965,30 +11973,6 @@ class SolverFeatherPGS(SolverBase):
                 block_dim=32 * wpb,
                 device=model.device,
             )
-            if check:
-                if hinv_jt_kernel is not None:
-                    wp.launch_tiled(
-                        hinv_jt_kernel,
-                        dim=[n_arts, self._hinv_jt_chunk_count_by_size[size]],
-                        inputs=[
-                            self.L_by_size[size],
-                            self.J_by_size[size],
-                            self.group_to_art[size],
-                            self.art_to_world,
-                            world_dof_offset,
-                            self.constraint_count,
-                        ],
-                        outputs=ref,
-                        block_dim=self.tile_threads,
-                        device=model.device,
-                    )
-                    _report_grouped_check(f"hinv_jt_{size}", outputs, ref)
-                else:
-                    # No tiled kernel for this size (free-body group): compare against the per-row kernel,
-                    # which writes the real arrays; the grouped results were snapshotted first.
-                    grouped_out = [wp.clone(a) for a in outputs]
-                    self._stage4_hinv_jt_par_row(size)
-                    _report_grouped_check(f"hinv_jt_{size}(vs par_row)", grouped_out, outputs)
             return
         if hinv_jt_kernel is None:
             raise RuntimeError(f"H^-1 J^T tiled kernel is unavailable for DOF size {size}")
@@ -13335,7 +12319,7 @@ class SolverFeatherPGS(SolverBase):
         ]
 
     def _use_grouped_hinv_jt(self, size: int) -> bool:
-        if self._grouped_topology is None or int(size) > 32:
+        if not self._grouped_response or int(size) > 32:
             return False
         if self._ink_skip_rows() > 0:
             return True  # the grouped kernel is the only response kernel with the per-world skip
@@ -14575,165 +13559,16 @@ class SolverFeatherPGS(SolverBase):
             self._stage7_update_kinematics(state_out, state_aug)
 
     def publish_kinematics(self, state: State) -> None:
-        """Publish body poses and CoM velocities of ``state`` (used with ``lazy_kinematics``)."""
-        if self._fused_k1 and self.lazy_kinematics:
-            self._stage7_update_kinematics(state, self._last_debug_state_aug, force=True)
+        """Publish body poses and CoM velocities of ``state``; a no-op.
 
-    def _configure_prismatic_publication(self) -> None:
-        """Build the opt-in prismatic Stage 7 producer and its linear state (``prismatic_*.py``)."""
-        model = self.model
-        if (
-            (_PRISMATIC_PUBLICATION or _PRISMATIC_LINEAR_STATE)
-            and not model.requires_grad
-            and not self.grouped_dynamics
-        ):
-            from .prismatic_publication import PrismaticPublicationPlan  # noqa: PLC0415
-
-            self._prismatic_publication = PrismaticPublicationPlan.build(model, self.articulation_joint_end)
-        if _PRISMATIC_LINEAR_STATE:
-            if _GROUPED_CHECK or _DEBUG_CACHE_CMP:
-                raise ValueError("prismatic linear state does not support materialized-inertia debug comparisons")
-            from .prismatic_linear_state import configure_linear_state  # noqa: PLC0415
-
-            configure_linear_state(self)
-
-    def _publication_deferred(self) -> bool:
-        """Whether body-state publication waits for :meth:`publish_kinematics`.
-
-        Only the fused world-dynamics kernel defers it. Patch friction
-        publishes every substep, because its anchor release test reads the
-        integrated body state.
+        Every substep publishes the body state, so nothing is left to publish.
+        Callers of ``lazy_kinematics`` may keep calling this method.
         """
-        return bool(self.lazy_kinematics and self._fused_k1 and not self._friction_anchors_enabled)
+        del state
 
-    def _fused_publication_admitted(self) -> bool:
-        """Admit the one-launch-per-size-group publication of the general route.
-
-        The fused kernel reproduces the separate apply-impulses, acceleration,
-        free-root transport, integration, kinematics and body-dynamics launches
-        for complete articulations. Owners with their own finish, prismatic
-        publication, free rigid bodies, velocity-limit clamps and trailing
-        loop-closing joints keep the separate launches.
-        """
-        admitted = getattr(self, "_fused_publication", None)
-        if admitted is not None:
-            return admitted
-        model = self.model
-        admitted = bool(
-            _FUSED_PUBLISH
-            and self._fk_id_cache_enabled
-            and model.joint_count
-            and model.articulation_count
-            and not (self._fused_k1 and self.lazy_kinematics)
-            and self._prismatic_publication is None
-            and getattr(self, "_tree_kinetic_state", None) is None
-            and not (self.pgs_mode == "matrix_free" and self.pgs_velocity_iterations > 0)
-            and not self._has_free_rigid_bodies
-            and not (self._has_root_free and self._has_rigid_body_velocity_limits)
-            and model.particle_count == 0
-        )
-        if admitted:
-            # Every joint and body must belong to the size groups' articulations.
-            starts = model.articulation_start.numpy()
-            ends = self.articulation_joint_end.numpy()
-            grouped = sum(int(self.n_arts_by_size[size]) for size in self.size_groups)
-            admitted = bool(
-                np.array_equal(ends, starts[1:])
-                and int(starts[-1]) == model.joint_count
-                and grouped == model.articulation_count
-                and int(np.sum(ends - starts[:-1])) == model.body_count
-            )
-        self._fused_publication = admitted
-        self._fused_publication_apply = False
-        return admitted
-
-    def _stage7_finish_general(self, state_in: State, state_aug: State, state_out: State, dt: float) -> None:
-        """Apply impulses, integrate and publish every articulation in one launch per size group."""
-        model = self.model
-        cache = self._fk_id_cache
-        body_q_com = cache.body_q_com if cache is not None else state_aug.body_q_com
-        articulation_origin = cache.articulation_origin if cache is not None else self.articulation_origin
-        joint_S_s = cache.joint_S_s if cache is not None else state_aug.joint_S_s
-        body_I_s = cache.body_I_s if cache is not None else state_aug.body_I_s
-        body_inertia_terms = cache.body_inertia_terms if cache is not None else self._body_inertia_terms
-        body_v_s = cache.body_v_s if cache is not None else state_aug.body_v_s
-        body_f_s = cache.body_f_s if cache is not None else state_aug.body_f_s
-        body_a_s = cache.body_a_s if cache is not None else state_aug.body_a_s
-        next_refresh = ((self._step + 1) % self.update_mass_matrix_interval) == 0
-        parallel_next_refresh = next_refresh and self._global_inertia_stream is not None
-        # Dense and split compositions leave the impulses to this kernel; the
-        # matrix-free sweep has already produced v_out.
-        apply_impulses = int(self._fused_publication_apply)
-        self._fused_publication_apply = False
-        for size in self.size_groups:
-            n_arts = self.n_arts_by_size[size]
-            wp.launch(
-                finish_articulation_general,
-                dim=int(n_arts),
-                inputs=[
-                    self.group_to_art[size],
-                    self.art_to_world,
-                    self.articulation_dof_start,
-                    size,
-                    n_arts,
-                    apply_impulses,
-                    self.constraint_count,
-                    self.Y_by_size[size],
-                    self.impulses,
-                    self.v_hat,
-                    state_in.joint_qd,
-                    self._kinematic_dof_mask,
-                    self._kinematic_joint_mask,
-                    dt,
-                    1.0 / dt,
-                    self.angular_damping,
-                    model.articulation_start,
-                    self.articulation_joint_end,
-                    model.joint_type,
-                    model.joint_parent,
-                    model.joint_child,
-                    model.joint_q_start,
-                    model.joint_qd_start,
-                    model.joint_dof_dim,
-                    state_in.joint_q,
-                    model.joint_X_p,
-                    model.joint_X_c,
-                    self.body_X_com,
-                    model.joint_axis,
-                    model.body_com,
-                    model.body_mass,
-                    model.body_inertia,
-                    self.is_free_rigid,
-                    int(next_refresh and not parallel_next_refresh),
-                    int(parallel_next_refresh),
-                    model.gravity,
-                ],
-                outputs=[
-                    self.v_out,
-                    state_aug.joint_qdd,
-                    state_out.joint_q,
-                    state_out.joint_qd,
-                    state_out.body_q,
-                    body_q_com,
-                    articulation_origin,
-                    joint_S_s,
-                    body_v_s,
-                    body_a_s,
-                    self._fk_id_cache_valid,
-                    body_I_s,
-                    body_inertia_terms,
-                    body_f_s,
-                    state_out.body_qd,
-                ],
-                device=model.device,
-            )
-        self._fk_id_cache_source_state = state_out
-
-    def _stage7_update_kinematics(self, state_out: State, state_aug: State, force: bool = False) -> None:
+    def _stage7_update_kinematics(self, state_out: State, state_aug: State) -> None:
         """Publish kinematics and prepare reusable inverse dynamics for the next step."""
         model = self.model
-        if self._fused_k1 and self.lazy_kinematics and not force:
-            return  # The fused producer refreshes kinematics at the next substep start.
         if not self._fk_id_cache_enabled:
             if self._tree_plan is None:
                 eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
@@ -14761,21 +13596,19 @@ class SolverFeatherPGS(SolverBase):
                 )
             return
 
-        cache = self._fk_id_cache
-        body_q_com = cache.body_q_com if cache is not None else state_aug.body_q_com
-        articulation_origin = cache.articulation_origin if cache is not None else self.articulation_origin
-        joint_S_s = cache.joint_S_s if cache is not None else state_aug.joint_S_s
-        body_I_s = cache.body_I_s if cache is not None else state_aug.body_I_s
-        body_inertia_terms = cache.body_inertia_terms if cache is not None else self._body_inertia_terms
-        body_v_s = cache.body_v_s if cache is not None else state_aug.body_v_s
-        body_f_s = cache.body_f_s if cache is not None else state_aug.body_f_s
-        body_a_s = cache.body_a_s if cache is not None else state_aug.body_a_s
+        body_q_com = state_aug.body_q_com
+        articulation_origin = self.articulation_origin
+        joint_S_s = state_aug.joint_S_s
+        body_I_s = state_aug.body_I_s
+        body_inertia_terms = self._body_inertia_terms
+        body_v_s = state_aug.body_v_s
+        body_f_s = state_aug.body_f_s
+        body_a_s = state_aug.body_a_s
         next_refresh = ((self._step + 1) % self.update_mass_matrix_interval) == 0
         parallel_next_refresh = next_refresh and self._global_inertia_stream is not None
-        prismatic = self._prismatic_publication
         fk_inputs = [
             model.articulation_start,
-            prismatic.joint_end if prismatic is not None else self.articulation_joint_end,
+            self.articulation_joint_end,
             model.joint_type,
             model.joint_parent,
             model.joint_child,
@@ -14799,59 +13632,7 @@ class SolverFeatherPGS(SolverBase):
             body_a_s,
             self._fk_id_cache_valid,
         ]
-        # Template forward kinematics (bit-identical); 83 us against 90 us serial on AnymalD at
-        # 8 lanes per articulation. FEATHER_PGS_GROUPED_FK=0 falls back to the serial kernel.
-        topo = self._grouped_topology
-        if topo is not None and topo.template_count > 0 and not _GROUPED_FK_OFF:
-            check = _GROUPED_CHECK
-            ref = [wp.clone(a) for a in fk_outputs] if check else None
-            wp.launch_tiled(
-                template_fk_kinematics,
-                dim=[topo.blocks],
-                inputs=[
-                    topo.lanes_per_articulation,
-                    int(model.articulation_count),
-                    topo.tpl_max_levels,
-                    topo.art_template,
-                    topo.art_body_base,
-                    topo.art_q_base,
-                    topo.art_qd_base,
-                    topo.tpl_joint_offset,
-                    topo.tpl_dof_offset,
-                    topo.tpl_level_offsets,
-                    topo.tpl_level_joints,
-                    topo.tpl_type,
-                    topo.tpl_lin,
-                    topo.tpl_ang,
-                    topo.tpl_q_off,
-                    topo.tpl_qd_off,
-                    topo.tpl_parent_local,
-                    topo.tpl_child_off,
-                    topo.tpl_X_p,
-                    topo.tpl_X_c,
-                    topo.tpl_axis,
-                    model.joint_X_p,
-                    self.body_X_com,
-                    model.body_com,
-                    model.articulation_start,
-                    state_out.joint_q,
-                    state_out.joint_qd,
-                ],
-                outputs=fk_outputs,
-                block_dim=32,
-                device=model.device,
-            )
-            if check:
-                wp.launch(
-                    eval_rigid_fk_kinematics,
-                    dim=model.articulation_count,
-                    inputs=fk_inputs,
-                    outputs=ref,
-                    block_dim=16,
-                    device=model.device,
-                )
-                _report_grouped_check("template_fk", fk_outputs, ref)
-        elif self._tree_plan is not None and prismatic is None:
+        if self._tree_plan is not None:
             self._launch_tree_fk(
                 "kinematics",
                 [
@@ -14886,34 +13667,10 @@ class SolverFeatherPGS(SolverBase):
                 block_dim=16,
                 device=model.device,
             )
-        finalize_kernel = finalize_body_dynamics
-        finalize_prefix = []
-        if prismatic is not None:
-            from .prismatic_publication import finalize_prismatic_body_dynamics  # noqa: PLC0415
-
-            finalize_kernel = finalize_prismatic_body_dynamics
-            if self._prismatic_linear_state:
-                from .prismatic_linear_state import finalize_prismatic_linear_state  # noqa: PLC0415
-
-                finalize_kernel = finalize_prismatic_linear_state
-            finalize_prefix = [
-                prismatic.body_joint,
-                model.joint_parent,
-                model.joint_q_start,
-                model.joint_qd_start,
-                state_out.joint_q,
-                state_out.joint_qd,
-                model.joint_X_p,
-                model.joint_X_c,
-                self.body_X_com,
-                model.joint_axis,
-                joint_S_s,
-            ]
         wp.launch(
-            finalize_kernel,
+            finalize_body_dynamics,
             dim=model.body_count,
             inputs=[
-                *finalize_prefix,
                 self.body_to_articulation,
                 state_out.body_q,
                 body_q_com,
@@ -15097,14 +13854,8 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
 
 
 @cache
-def _get_direct_diagonal_inverse_mass_kernel(
-    n_dofs: int, device_arch: str, *, linear_state: bool = False
-) -> "wp.Kernel":
+def _get_direct_diagonal_inverse_mass_kernel(n_dofs: int, device_arch: str) -> "wp.Kernel":
     """Project one-body diagonal branches without materializing composite spatial inertia."""
-    if linear_state:
-        from .prismatic_linear_state import get_linear_inverse_mass_kernel  # noqa: PLC0415
-
-        return get_linear_inverse_mass_kernel(n_dofs)
     del device_arch
     N = int(n_dofs)
     if N <= 0:

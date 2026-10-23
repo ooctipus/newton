@@ -131,9 +131,9 @@ _EFFECTIVE = {
     "sparse_mass_matrix": lambda solver: "on" if solver._sparse_mass_matrix_size is not None else "off",
     "cached_dynamics": lambda solver: "on" if solver._tree_kinetic_state is not None else "off",
     "parallel_tree": lambda solver: solver._tree_plan is not None,
-    "grouped_dynamics": lambda solver: solver._grouped_topology is not None,
-    # Deferred publication acts only with the fused world-dynamics kernel (K1), and not under patch friction.
-    "lazy_kinematics": lambda solver: solver._publication_deferred(),
+    "grouped_dynamics": lambda solver: solver._grouped_response,
+    # Nothing defers publication: the request only declines the resolved-world classifier.
+    "lazy_kinematics": lambda solver: False,
     # Tier budgets after their gates and clamps.
     "mf_gs_parallel_rows": lambda solver: int(solver._ink_rows),
     "mf_gs_parallel_matrix_free": lambda solver: bool(solver.mf_gs_parallel_matrix_free and solver._ink_rows > 0),
@@ -239,7 +239,7 @@ def route_selection(solver) -> dict:
         "sparse_mass_matrix": _sparse_mass_matrix(solver),
         "sweep": _sweep(solver, source),
         "resolved_worlds": _resolved_worlds(solver),
-        "publication": _publication(solver, source),
+        "publication": _publication(solver),
         "velocity_limits": _velocity_limits(solver),
         "free_rigid_bodies": _free_rigid_bodies(solver),
         "friction": _friction(solver),
@@ -1039,36 +1039,16 @@ def _resolved_worlds(solver) -> dict:
     }
 
 
-def _publication(solver, source) -> dict:
-    fused = bool(solver._fused_publication)
+def _publication(solver) -> dict:
     if solver._tree_kinetic_state is not None:
         owner, reason = "cached", "The held-tree owner publishes next-step state."
-    elif solver._publication_deferred():
-        owner, reason = "deferred", "Fused current dynamics permits deferred kinematics publication."
-    elif solver.lazy_kinematics and solver._fused_k1:
-        owner, reason = "ordinary", "Patch friction publishes every substep for its release test."
-    elif fused:
-        owner, reason = "fused_general", "Each articulation publishes in one launch per size group."
-    elif not source._FUSED_PUBLISH:
-        owner, reason = "ordinary", "Separate launches; FEATHER_PGS_FUSED_PUBLISH is an import-time opt-in."
     else:
-        owner = "ordinary"
-        reason = (
-            "Fused publication declined: an owner, free body, velocity limit or loop joint needs separate launches."
-        )
-    if not solver._fk_id_cache_enabled:
-        cache = "off"
-    elif solver._fk_id_cache_uses_snapshot:
-        cache = "snapshot"
-    else:
-        cache = "in_place"
+        owner, reason = "ordinary", "Separate launches integrate and publish the next state."
+    cache = "in_place" if solver._fk_id_cache_enabled else "off"
     return {
         "owner": owner,
         "reason": reason,
-        "fused_general": fused,
         "fk_id_cache": cache,
-        "prismatic_publication": solver._prismatic_publication is not None,
-        "prismatic_linear_state": bool(solver._prismatic_linear_state),
     }
 
 
@@ -1154,7 +1134,6 @@ def _free_rigid_bodies(solver) -> dict:
         "count": count,
         "mixed_worlds": bool(solver._has_mixed_contacts),
         "owners": owners,
-        "implicit_gyro": solver._free_body_gyro_kernel is not None,
         "reason": "No free rigid bodies."
         if not count
         else "Owners that can solve free-body rows, in claim order; contacts are routed per world at run time.",
@@ -1279,30 +1258,9 @@ def _grouped_response_reason(solver, size, source) -> str:
 
 
 def _grouped(solver, source) -> dict | None:
-    topology = solver._grouped_topology
-    if topology is None:
+    if not solver._grouped_response:
         return None
-    held = solver._tree_kinetic_state is not None
-    velocity_pass = solver.pgs_mode == "matrix_free" and solver.pgs_velocity_iterations > 0
-    # Stage-7 kinematics publication: the held-tree finish and the fused general publication bypass it.
-    publishes = solver._fk_id_cache_enabled and (velocity_pass or not (held or solver._fused_publication))
-    asynchronous = bool(solver._async_augmented_drives)
-    # _launch_rigid_tau: asynchronous drives without fused world dynamics, or drives that do not fuse tau.
-    tau = (
-        not held
-        and solver._direct_branch_tau_kernel is None
-        and (
-            (asynchronous and not solver._fused_k1)
-            or (not asynchronous and not (solver.drive_mode == "augmented" and solver.articulation_max_dofs > 0))
-        )
-    )
     return {
-        "lanes_per_articulation": int(topology.lanes_per_articulation),
-        "articulations_per_block": int(topology.articulations_per_block),
-        # -1 when the template build failed; template kernels then stay off.
-        "template_count": int(topology.template_count),
-        "template_fk": bool(publishes and topology.template_count > 0 and not source._GROUPED_FK_OFF),
-        "tau": ("grouped_tau_mass" if solver._grouped_tau_mass else "grouped_tau") if tau else None,
         "hinv_jt_by_dof": {
             str(int(size)): {
                 "grouped": grouped_response(solver, size),
@@ -1315,11 +1273,7 @@ def _grouped(solver, source) -> dict | None:
 
 def _dynamics(solver, source) -> dict:
     return {
-        "grouped_topology": solver._grouped_topology is not None,
         "grouped": _grouped(solver, source),
-        "fused_world_dynamics": bool(solver._fused_k1),
-        "grouped_tau_mass": bool(solver._grouped_tau_mass),
-        "grouped_mass": bool(solver._grouped_mass),
         "parallel_tree": solver._tree_plan is not None,
         "compact_diagonal_mass_dofs": json_value(solver._compact_diagonal_mass_size),
         "diagonal_mass_dofs": sorted(int(size) for size in solver._diagonal_mass_sizes),

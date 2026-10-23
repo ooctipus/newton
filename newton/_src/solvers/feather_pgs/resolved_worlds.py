@@ -696,7 +696,6 @@ def supported(solver) -> bool:
         "_compact_contact_boundary",
         "pgs_debug",
         "_row_watermark",
-        "_fused_k1",
         "grouped_dynamics",
         "lazy_kinematics",
     )
@@ -740,8 +739,8 @@ class ResolvedWorlds:
             self.reason = "The classifier evaluates the CUDA matrix-free route only."
         elif not getattr(solver, "_law_agnostic_contact_paths", False):
             self.reason = "Contact torsion and compliance rows are outside the contact laws it classifies."
-        elif any(getattr(solver, name, False) for name in ("grouped_dynamics", "lazy_kinematics", "_fused_k1")):
-            self.reason = "grouped_dynamics, lazy_kinematics and the fused world-dynamics kernel are not classified."
+        elif any(getattr(solver, name, False) for name in ("grouped_dynamics", "lazy_kinematics")):
+            self.reason = "grouped_dynamics and lazy_kinematics are not classified."
         elif getattr(solver, "_keyed_rows", None) is not None:
             self.reason = "Keyed rows own the contact rows."
         else:

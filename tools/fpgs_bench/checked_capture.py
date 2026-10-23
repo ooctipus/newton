@@ -405,8 +405,7 @@ def check_solver(physics: str, solver, entry: dict) -> None:
         }
         entry["solver_recipe"]["mf_gs_parallel_linked_sweeps_applied"] = linked_tier_sweeps(solver)
         entry["solver_paths"] = {
-            "fused_k1": bool(getattr(solver, "_fused_k1", False)),
-            "grouped_topology": getattr(solver, "_grouped_topology", None) is not None,
+            "grouped_response": bool(getattr(solver, "_grouped_response", False)),
             "sparse_diagonal_contact_solve": bool(getattr(solver, "_sparse_diagonal_contact_solve", False)),
         }
         read = getattr(solver, "constraint_capacity_status", None)

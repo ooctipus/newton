@@ -24,7 +24,6 @@ from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.configuration import resolve_kernel_choices
 from newton._src.solvers.feather_pgs.contact_row_plan import BUILDER_METHODS, contact_row_plan
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
-from newton._src.solvers.feather_pgs.path_selection import applied_options
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import (
     STANDING_REGION_BOUNDS,
@@ -347,7 +346,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             options["mf_gs_parallel_rows"], {"applied": 0, "requested": 48, "default": 0, "source": "argument"}
         )
         self.assertIsNone(selected["routes"]["sweep"]["tiers"])
-        self.assertFalse(selected["routes"]["dynamics"]["grouped_topology"])
+        self.assertIsNone(selected["routes"]["dynamics"]["grouped"])
         self.assertEqual(selected["routes"]["publication"]["owner"], "ordinary")
         self.assertEqual(selected["routes"]["friction"]["law"], "point")
         self.assertEqual(selected["routes"]["friction"]["anchor_beta_source"], "argument")
@@ -549,22 +548,14 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(point["routes"]["contact_rows"]["law"], "point")
 
     def test_cpu_grouped_record_follows_the_response_dispatch(self):
-        """Label the sizes a grouped topology would serve, with their reasons, from host state alone."""
+        """Label the sizes the grouped response would serve, with their reasons, from host state alone."""
         solver = SolverFeatherPGS(_cpu_free_body_model())
-        # A stand-in for the CUDA-only grouped topology: the record reads its layout fields only.
-        solver._grouped_topology = SimpleNamespace(
-            lanes_per_articulation=8, articulations_per_block=4, template_count=2
-        )
+        # A stand-in for the CUDA-only grouped response: the record reads host state only.
+        solver._grouped_response = True
         selected = solver.get_path_selection()
         json.dumps(selected, allow_nan=False)
         grouped = selected["routes"]["dynamics"]["grouped"]
-        self.assertEqual(
-            (grouped["lanes_per_articulation"], grouped["articulations_per_block"], grouped["template_count"]),
-            (8, 4, 2),
-        )
-        # CPU builds no FK/ID cache and no asynchronous drives, so neither template kernel is reached.
-        self.assertFalse(grouped["template_fk"])
-        self.assertIsNone(grouped["tau"])
+        self.assertEqual(set(grouped), {"hinv_jt_by_dof"})
         by_dof = grouped["hinv_jt_by_dof"]
         self.assertTrue(by_dof["1"]["grouped"])
         self.assertEqual(selected["kernel_plan_by_dof"][1]["hinv_jt_kernel"], "grouped")
@@ -1045,7 +1036,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             # resident, under either friction law.
             ({"sparse_mass_matrix": "off", "dense_max_constraints": 320}, {}),
             ({"sparse_mass_matrix": "off", "dense_max_constraints": 320, "friction_anchor_beta": 0.0}, {}),
-            # Lazy publication defers only on the fused world-dynamics kernel, and never under patch friction.
+            # lazy_kinematics defers no publication, under either friction law.
             (
                 {
                     "grouped_dynamics": True,
@@ -1117,24 +1108,16 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     self.assertEqual(tiers["pair_step"], "isotropic" if patch_law else "per_row")
                     for tier in tiers["tiers"]:
                         self.assertEqual(tier["kernel"].endswith("_linked_iso"), patch_law, tier)
-                self.assertEqual(applied["grouped_dynamics"], routes["dynamics"]["grouped_topology"])
-                self.assertEqual(
-                    applied["lazy_kinematics"],
-                    selected["options"]["lazy_kinematics"]["requested"]
-                    and routes["dynamics"]["fused_world_dynamics"]
-                    and routes["friction"]["law"] == "point",
-                )
-                self.assertEqual(applied["lazy_kinematics"], routes["publication"]["owner"] == "deferred")
+                self.assertEqual(applied["grouped_dynamics"], routes["dynamics"]["grouped"] is not None)
+                self.assertFalse(applied["lazy_kinematics"])
                 if options.get("pgs_schedule") == "physx_grasp" and routes["sweep"]["route"] == "matrix_free_gs":
                     self.assertEqual(routes["sweep"]["driver"], "physx_grasp")
                 # A size whose response the grouped kernel solves is labeled so in the kernel plan.
                 grouped = routes["dynamics"]["grouped"]
-                self.assertEqual(grouped is None, solver._grouped_topology is None)
+                self.assertEqual(grouped is None, not solver._grouped_response)
                 for size, plan in selected["kernel_plan_by_dof"].items():
                     is_grouped = grouped is not None and grouped["hinv_jt_by_dof"][str(size)]["grouped"]
                     self.assertEqual(plan["hinv_jt_kernel"] == "grouped", is_grouped, size)
-                if grouped is not None:
-                    self.assertEqual(grouped["lanes_per_articulation"], solver._grouped_topology.lanes_per_articulation)
         self.assertGreaterEqual(built, 8)
         self.assertEqual(opted_out, 1, "The opted-out patch-friction parallel arm must build")
         self.assertGreaterEqual(
@@ -1255,24 +1238,23 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             with self.subTest(choice=choice), self.assertRaisesRegex(ValueError, "cached_dynamics"):
                 SolverFeatherPGS(model, cached_dynamics=choice)
 
-    def test_cpu_patch_publication_is_never_deferred(self):
-        """Report every-substep publication for patch friction, even with lazy kinematics on the fused kernel."""
-        for beta, publication in ((0.0, "deferred"), (0.2, "ordinary")):
+    def test_lazy_kinematics_defers_no_publication(self):
+        """Publish every substep with lazy kinematics under either friction law; publish_kinematics changes nothing."""
+        for beta in (0.0, 0.2):
             with self.subTest(friction_anchor_beta=beta):
                 solver = SolverFeatherPGS(_cpu_model(), friction_anchor_beta=beta, lazy_kinematics=True)
-                # A stand-in for the CUDA-only fused world-dynamics kernel: the record reads host flags only.
-                solver._fused_k1 = True
                 selected = solver.get_path_selection()
-                self.assertEqual(selected["publication"], publication)
-                self.assertEqual(selected["routes"]["publication"]["owner"], publication)
-                # The options record was captured at construction, before the stand-in: recompute it.
-                options = applied_options(
-                    solver, SolverFeatherPGS.__init__, {"friction_anchor_beta": beta, "lazy_kinematics": True}
+                self.assertEqual(selected["publication"], "ordinary")
+                self.assertEqual(selected["routes"]["publication"]["owner"], "ordinary")
+                self.assertEqual(
+                    selected["options"]["lazy_kinematics"],
+                    {"applied": False, "requested": True, "default": False, "source": "argument"},
                 )
-                self.assertEqual(options["lazy_kinematics"]["applied"], publication == "deferred")
-                if beta:
-                    self.assertIn("release test", selected["reasons"]["publication"])
-                    self.assertIn("release test", selected["routes"]["publication"]["reason"])
+                state = solver.model.state()
+                published = state.body_q.numpy().copy(), state.body_qd.numpy().copy()
+                solver.publish_kinematics(state)
+                np.testing.assert_array_equal(state.body_q.numpy(), published[0])
+                np.testing.assert_array_equal(state.body_qd.numpy(), published[1])
 
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
     def test_cached_dynamics_overrides_environment_and_dense_conflicts(self):

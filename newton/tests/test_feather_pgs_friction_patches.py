@@ -1303,22 +1303,21 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 else:
                     self.assertGreater(angular_speed, 1.0)
 
-    @unittest.skipUnless(wp.is_cuda_available(), "The fused world-dynamics kernel is a CUDA path")
+    @unittest.skipUnless(wp.is_cuda_available(), "Grouped dynamics on the general route is a CUDA path")
     def test_lazy_publication_precedes_the_release_test(self):
         """Publish the integrated body state before the anchor release test reads it, eager and lazy alike.
 
         The release test (``_finish_and_store``) reads ``state_out``'s body poses
-        and twists. With lazy kinematics the fused world-dynamics kernel defers
-        that publication to the next substep, so patch friction forces it first.
-        In each arm, the release test's inputs, captured as it launches, and the
-        published state must equal forward kinematics of the integrated joint
-        state while twisted boxes slip and release their anchors. Two arms do
-        not reproduce each other bit for bit on CUDA (per-world atomic row
-        reservations order the Gauss-Seidel rows), so no arm is compared with
-        another. Basis: on CPU, where the integrated state is published
-        directly, the captured inputs equal forward kinematics exactly; one
-        float32 ulp at 4 m is 4.8e-7; a stale publication misses by at least
-        1.95e-3 m and 4.8e-2 in twist.
+        and twists. Every substep publishes them, with or without lazy
+        kinematics. In each arm, the release test's inputs, captured as it
+        launches, and the published state must equal forward kinematics of the
+        integrated joint state while twisted boxes slip and release their
+        anchors. Two arms do not reproduce each other bit for bit on CUDA
+        (per-world atomic row reservations order the Gauss-Seidel rows), so no
+        arm is compared with another. Basis: on CPU, where the integrated state
+        is published directly, the captured inputs equal forward kinematics
+        exactly; one float32 ulp at 4 m is 4.8e-7; a stale publication misses by
+        at least 1.95e-3 m and 4.8e-2 in twist.
         """
         from newton._src.solvers.feather_pgs import friction_patches  # noqa: PLC0415
         from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module  # noqa: PLC0415
@@ -1352,27 +1351,22 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
 
         for lazy in (False, True):
             with self.subTest(lazy_kinematics=lazy):
-                # The ordinary arm takes the separate publication launches that the lazy arm forces.
-                with mock.patch.object(solver_module, "_FUSED_PUBLISH", False):
-                    solver = newton.solvers.SolverFeatherPGS(
-                        model,
-                        pgs_mode="matrix_free",
-                        pgs_iterations=8,
-                        enable_joint_limits=True,
-                        update_mass_matrix_interval=2,
-                        dense_max_constraints=256,
-                        grouped_dynamics=True,
-                        lazy_kinematics=lazy,
-                        cached_dynamics="off",
-                        sparse_mass_matrix="off",
-                        friction_anchor_beta=0.2,
-                    )
-                self.assertTrue(solver._fused_k1)
-                self.assertFalse(solver._fused_publication_admitted())
+                solver = newton.solvers.SolverFeatherPGS(
+                    model,
+                    pgs_mode="matrix_free",
+                    pgs_iterations=8,
+                    enable_joint_limits=True,
+                    update_mass_matrix_interval=2,
+                    dense_max_constraints=256,
+                    grouped_dynamics=True,
+                    lazy_kinematics=lazy,
+                    cached_dynamics="off",
+                    sparse_mass_matrix="off",
+                    friction_anchor_beta=0.2,
+                )
                 selected = solver.get_path_selection()
                 self.assertEqual(selected["publication"], "ordinary")
-                self.assertTrue(selected["routes"]["dynamics"]["fused_world_dynamics"])
-                # Patch friction publishes every substep, so a lazy request applies nothing.
+                # Every substep publishes, so a lazy request applies nothing.
                 lazy_option = selected["options"]["lazy_kinematics"]
                 self.assertEqual((lazy_option["requested"], lazy_option["applied"]), (lazy, False))
                 # Sorted contacts: the narrow phase's output order no longer depends on thread scheduling.

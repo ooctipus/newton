@@ -4,18 +4,18 @@
 """Scalar branches: world-fixed roots over one-coordinate leaves (``scalar_branches.py``).
 
 The CPU tests compare the scalar kernels, bound through ``ScalarBranchState``,
-with the head chain they replace, launched on the same inputs: the prismatic
-linear state route for prismatic leaves (bitwise) and ordinary dynamics for
-revolute leaves. ``TestGripperContactBound`` checks the CUDA arm-key press
-bound on ordinary dynamics, the law both CUDA routes integrate.
+with reference chains launched on the same inputs: the linear-state law of
+one-body prismatic branches, kept here as the oracle of prismatic leaves
+(bitwise), and ordinary dynamics for revolute leaves. ``TestGripperContactBound``
+checks the CUDA arm-key press bound on ordinary dynamics, the law both CUDA
+routes integrate.
 """
 
-import contextlib
 import dataclasses
+import functools
 import json
 import os
 import unittest
-import warnings
 from unittest import mock
 
 import numpy as np
@@ -27,13 +27,8 @@ from newton._src.solvers.feather_pgs import kernels as fk
 from newton._src.solvers.feather_pgs import scalar_branches as sb
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.device_proof import DeviceProof
+from newton._src.solvers.feather_pgs.kernels import finalize_body_dynamics_body
 from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
-from newton._src.solvers.feather_pgs.prismatic_linear_state import (
-    finalize_prismatic_linear_state,
-    get_linear_inverse_mass_kernel,
-    repair_prismatic_linear_state,
-)
-from newton._src.solvers.feather_pgs.prismatic_publication import PrismaticPublicationPlan
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_subtree_reduce import _assert_switch_within, _excess
 
@@ -43,8 +38,9 @@ GRAVITY = (0.7, -1.2, -9.1)
 DROPPED_FIELDS = ("body_q_com", "body_v_s", "body_a_s", "body_f_s", "body_I_s", "_body_inertia_terms")
 # Fields the held owner writes only for free bodies, not for a fixed-base arm (it publishes body_v_s).
 ARM_DROPPED_FIELDS = ("body_q_com", "body_a_s", "body_f_s", "body_I_s", "_body_inertia_terms")
-# CUDA bounds against the prismatic linear state route: the keys' are that route's own A/B
-# tolerances (FMA contraction); the arm leaves the serial route for the held owner's float order.
+# CUDA bounds against ordinary dynamics: the keys' are FMA contraction and the rounding of the
+# inverse-mass projection and gravity force, which ordinary dynamics evaluates in another order;
+# the arm leaves the serial route for the held owner's float order.
 KEY_BOUND = {"rtol": 3.0e-5, "atol": 5.0e-6}
 # Key-only contact impulses [N·s] (1e-4 to 1e-2 per step in these tests) at the keys' relative bound.
 IMPULSE_BOUND = {"rtol": KEY_BOUND["rtol"], "atol": 1.0e-8}
@@ -71,7 +67,7 @@ GRIPPER_BUDGET_FRACTION = 0.1
 # 1024 and 2048 match it bitwise.
 GRIPPER_REFERENCE_ITERATIONS = 512
 # Coordinates of the fixtures' arm. A star of as many leaves shares the arm's size group, which is
-# then not diagonal: the recipe refuses its prismatic linear state and no scalar plan exists.
+# then not diagonal: no scalar plan exists.
 ARM_DOFS = 6
 # Leaves of the CUDA owner fixtures: the key presses, the small stars and the keyboard-shaped worlds.
 PRESS_LEAVES = 7
@@ -254,8 +250,8 @@ def same(test, expected, actual, index, name):
     np.testing.assert_array_equal(actual, expected, err_msg=name)
 
 
-def recipe_solver(model, *, scalar, compact=True, prismatic=True, **options):
-    """The keyboard recipe's solver: compact contacts and both prismatic opt-ins, plus scalar branches if asked."""
+def recipe_solver(model, *, scalar, compact=True, **options):
+    """The keyboard recipe's solver: compact contacts, plus scalar branches if asked."""
     arguments = {
         "pgs_mode": "matrix_free",
         "pgs_iterations": 8,
@@ -269,8 +265,6 @@ def recipe_solver(model, *, scalar, compact=True, prismatic=True, **options):
     with (
         mock.patch.object(solver_module, "_COMPACT_CONTACT_BOUNDARY", compact),
         mock.patch.object(solver_module, "_SPARSE_CONTACT_DIRECT", True),
-        mock.patch.object(solver_module, "_PRISMATIC_PUBLICATION", prismatic),
-        mock.patch.object(solver_module, "_PRISMATIC_LINEAR_STATE", prismatic),
         # Read at construction, so an exported value cannot change the route.
         mock.patch.dict(os.environ, {"FEATHER_PGS_SCALAR_BRANCHES": str(int(scalar))}),
     ):
@@ -329,8 +323,251 @@ class _Layout:
         self.arm_tips = child[starts[self.arms + 1] - 1]
 
 
+# The linear-state law of one-body prismatic branches: the prismatic kernels of the scalar
+# family follow it operation for operation, so it is their bitwise oracle. The joint passes
+# stop at each branch root; one thread per leaf body publishes the leaf from its coordinate.
+
+
+def _linear_state_plan(solver):
+    """Shorten each branch articulation's joint pass to its root and map every leaf body to its joint."""
+    model = solver.model
+    starts = model.articulation_start.numpy()
+    ends = solver.articulation_joint_end.numpy().copy()
+    body_joint = np.full(model.body_count, -1, dtype=np.int32)
+    for art in solver.group_to_art[solver._compact_diagonal_mass_size].numpy():
+        joints = np.arange(starts[art] + 1, ends[art], dtype=np.int32)
+        body_joint[model.joint_child.numpy()[joints]] = joints
+        ends[art] = starts[art] + 1
+    return wp.array(ends, dtype=int, device=model.device), wp.array(body_joint, dtype=int, device=model.device)
+
+
+@wp.func
+def _write_linear_body(
+    body: int,
+    joint: int,
+    joint_parent: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    body_X_com: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    body_to_articulation: wp.array[int],
+    body_mass: wp.array[float],
+    articulation_origin: wp.array[wp.vec3],
+    gravity: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
+    body_q_com: wp.array[wp.transform],
+    joint_S_s: wp.array[wp.spatial_vector],
+    body_v_s: wp.array[wp.spatial_vector],
+    body_a_s: wp.array[wp.spatial_vector],
+    body_f_s: wp.array[wp.spatial_vector],
+):
+    dof = joint_qd_start[joint]
+    X_wpj = body_q[joint_parent[joint]] * joint_X_p[joint]
+    axis = joint_axis[dof]
+    X_j = wp.transform(axis * joint_q[joint_q_start[joint]], wp.quat_identity())
+    X_wc = (X_wpj * X_j) * wp.transform_inverse(joint_X_c[joint])
+    X_com = X_wc * body_X_com[body]
+    body_q[body] = X_wc
+    body_q_com[body] = X_com
+    motion = wp.spatial_vector(wp.quat_rotate(wp.transform_get_rotation(X_wpj), axis), wp.vec3())
+    joint_S_s[dof] = motion
+    body_v_s[body] = motion * joint_qd[dof]
+    body_a_s[body] = wp.spatial_vector()
+    com = wp.transform_get_translation(X_com) - articulation_origin[body_to_articulation[body]]
+    force = body_mass[body] * gravity[0]
+    body_f_s[body] = -wp.spatial_vector(force, wp.cross(com, force))
+
+
+@wp.kernel(enable_backward=False)
+def _repair_linear_state(
+    body_joint: wp.array[int],
+    previous_valid: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    body_X_com: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    body_to_articulation: wp.array[int],
+    body_mass: wp.array[float],
+    articulation_origin: wp.array[wp.vec3],
+    gravity: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
+    body_q_com: wp.array[wp.transform],
+    joint_S_s: wp.array[wp.spatial_vector],
+    body_v_s: wp.array[wp.spatial_vector],
+    body_a_s: wp.array[wp.spatial_vector],
+    body_f_s: wp.array[wp.spatial_vector],
+):
+    """Repair cold leaves after their roots using pre-launch cache validity."""
+    body = wp.tid()
+    joint = body_joint[body]
+    if joint < 0:
+        return
+    if previous_valid[body_to_articulation[body]] != 0:
+        return
+    _write_linear_body(
+        body,
+        joint,
+        joint_parent,
+        joint_q_start,
+        joint_qd_start,
+        joint_q,
+        joint_qd,
+        joint_X_p,
+        joint_X_c,
+        body_X_com,
+        joint_axis,
+        body_to_articulation,
+        body_mass,
+        articulation_origin,
+        gravity,
+        body_q,
+        body_q_com,
+        joint_S_s,
+        body_v_s,
+        body_a_s,
+        body_f_s,
+    )
+
+
+@wp.kernel(enable_backward=False)
+def _finalize_linear_state(
+    body_joint: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    body_X_com: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_S_s: wp.array[wp.spatial_vector],
+    body_to_articulation: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_q_com: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    body_mass: wp.array[float],
+    body_inertia: wp.array[wp.mat33],
+    is_free_rigid: wp.array[int],
+    articulation_origin: wp.array[wp.vec3],
+    materialize_all_body_inertia: int,
+    materialize_body_inertia_terms: int,
+    gravity: wp.array[wp.vec3],
+    body_v_s: wp.array[wp.spatial_vector],
+    body_a_s: wp.array[wp.spatial_vector],
+    body_I_s: wp.array[wp.spatial_matrix],
+    body_inertia_terms: wp.array2d[float],
+    body_f_s: wp.array[wp.spatial_vector],
+    body_qd: wp.array[wp.spatial_vector],
+):
+    """Publish admitted linear bodies and retain full dynamics for other bodies."""
+    body = wp.tid()
+    joint = body_joint[body]
+    if joint >= 0:
+        _write_linear_body(
+            body,
+            joint,
+            joint_parent,
+            joint_q_start,
+            joint_qd_start,
+            joint_q,
+            joint_qd,
+            joint_X_p,
+            joint_X_c,
+            body_X_com,
+            joint_axis,
+            body_to_articulation,
+            body_mass,
+            articulation_origin,
+            gravity,
+            body_q,
+            body_q_com,
+            joint_S_s,
+            body_v_s,
+            body_a_s,
+            body_f_s,
+        )
+        body_qd[body] = body_v_s[body]
+    else:
+        finalize_body_dynamics_body(
+            body,
+            body_to_articulation,
+            body_q,
+            body_q_com,
+            body_com,
+            body_mass,
+            body_inertia,
+            is_free_rigid,
+            articulation_origin,
+            materialize_all_body_inertia,
+            materialize_body_inertia_terms,
+            gravity,
+            body_v_s,
+            body_a_s,
+            body_I_s,
+            body_inertia_terms,
+            body_f_s,
+            body_qd,
+        )
+
+
+@functools.cache
+def _linear_inverse_mass_kernel(n_dofs: int) -> wp.Kernel:
+    """The linear state's inverse mass: the direct-mass ABI without the inertia projection."""
+    N = int(n_dofs)
+    if N <= 0:
+        raise ValueError("linear direct inertia requires a positive DOF count")
+
+    def compute_linear_inverse_mass(
+        articulation_start: wp.array[int],
+        articulation_dof_start: wp.array[int],
+        mass_update_mask: wp.array[int],
+        joint_child: wp.array[int],
+        joint_S_s: wp.array[wp.spatial_vector],
+        body_mass: wp.array[float],
+        body_inertia_terms: wp.array2d[float],
+        group_to_art: wp.array[int],
+        dof_joint_offset: wp.array[int],
+        armature: wp.array2d[float],
+        drive_row_by_dof: wp.array[int],
+        drive_row_K: wp.array[float],
+        diagonal_inverse_mass: wp.array[float],
+    ):
+        element = wp.tid()
+        group = element // N
+        dof = element - group * N
+        art = group_to_art[group]
+        if mass_update_mask[art] == 0:
+            return
+        global_dof = articulation_dof_start[art] + dof
+        joint = articulation_start[art] + dof_joint_offset[dof]
+        body = joint_child[joint]
+        linear = wp.spatial_top(joint_S_s[global_dof])
+        mass = body_mass[body] * wp.dot(linear, linear) + armature[group, dof]
+        drive_row = drive_row_by_dof[global_dof]
+        if drive_row >= 0:
+            stiffness = drive_row_K[drive_row]
+            if stiffness > 0.0:
+                mass += stiffness
+        diagonal_inverse_mass[global_dof] = 1.0 / mass
+
+    name = f"compute_prismatic_linear_inverse_mass_{N}"
+    compute_linear_inverse_mass.__name__ = name
+    compute_linear_inverse_mass.__qualname__ = name
+    return wp.kernel(enable_backward=False, module="unique")(compute_linear_inverse_mass)
+
+
 class _PrismaticRoute:
-    """The head chain of prismatic leaves (prismatic linear state), launched on one solver's arrays."""
+    """The linear-state law of prismatic leaves (the scalar family's oracle), launched on one solver's arrays."""
 
     def __init__(self, solver):
         self.solver, model = solver, solver.model
@@ -338,10 +575,10 @@ class _PrismaticRoute:
         self.size = solver._compact_diagonal_mass_size
         self.group = solver.group_to_art[self.size]
         self.offsets = solver._crba_dof_joint_offset_by_size[self.size]
-        self.plan = PrismaticPublicationPlan.build(model, solver.articulation_joint_end)
+        self.joint_end, self.body_joint = _linear_state_plan(solver)
         self.previous = wp.zeros(model.articulation_count, dtype=int, device=self.device)
         _, self.direct_tau = solver_module._get_partitioned_inverse_dynamics_kernels(self.size, "cpu")
-        self.inverse_mass = get_linear_inverse_mass_kernel(self.size)
+        self.inverse_mass = _linear_inverse_mass_kernel(self.size)
 
     def begin(self, state):
         s, model = self.solver, self.model
@@ -351,7 +588,7 @@ class _PrismaticRoute:
             dim=model.articulation_count,
             inputs=[
                 model.articulation_start,
-                self.plan.joint_end,
+                self.joint_end,
                 model.joint_type,
                 model.joint_parent,
                 model.joint_child,
@@ -388,10 +625,10 @@ class _PrismaticRoute:
             device=self.device,
         )
         wp.launch(
-            repair_prismatic_linear_state,
+            _repair_linear_state,
             dim=model.body_count,
             inputs=[
-                self.plan.body_joint,
+                self.body_joint,
                 self.previous,
                 model.joint_parent,
                 model.joint_q_start,
@@ -534,7 +771,7 @@ class _PrismaticRoute:
             dim=model.articulation_count,
             inputs=[
                 model.articulation_start,
-                self.plan.joint_end,
+                self.joint_end,
                 model.joint_type,
                 model.joint_parent,
                 model.joint_child,
@@ -561,10 +798,10 @@ class _PrismaticRoute:
             device=self.device,
         )
         wp.launch(
-            finalize_prismatic_linear_state,
+            _finalize_linear_state,
             dim=model.body_count,
             inputs=[
-                self.plan.body_joint,
+                self.body_joint,
                 model.joint_parent,
                 model.joint_q_start,
                 model.joint_qd_start,
@@ -1049,7 +1286,7 @@ class TestScalarBranchRule(unittest.TestCase):
                 self.assertEqual((plan.size, plan.group_count), (7, model.world_count))
                 self.assertEqual(plan.kinds, tuple(sorted(kinds)))
                 self.assertEqual(plan.prismatic, kinds == ("prismatic",))
-                self.assertIn("supersede FEATHER_PGS_PRISMATIC", reason)
+                self.assertIn("(default; FEATHER_PGS_SCALAR_BRANCHES=0 opts out)", reason)
                 starts = model.articulation_start.numpy()
                 expected = np.concatenate(
                     [model.joint_qd_start.numpy()[starts[a] + 1] + np.arange(7) for a in solver.group_to_art[7].numpy()]
@@ -1234,12 +1471,12 @@ class TestScalarBranchRule(unittest.TestCase):
     def test_owner_proves_the_scalar_topology_through_its_tree_groups(self):
         """Validate a notification with the owner's and the arm group's proofs alone, and still refuse new topology.
 
-        The arm group's proof holds the model topology and art_to_world and
-        watches every joint frame, and the owner's coverage proof every size's
-        group map, so beside them the scalar group adds no proof (one launch and
-        one readback per notification) of its own: a moved key root is reported
-        through the arm group's proof, so the solver invalidates every cache. A
-        scalar group built alone keeps its proof.
+        The arm group's proof holds the model topology, the joint axes and
+        art_to_world and watches every joint frame, and the owner's coverage
+        proof every size's group map, so the scalar group holds no proof of its
+        own: a moved key root is reported through the arm group's proof, so the
+        solver invalidates every cache, and a turned key axis or a changed
+        parent is refused there.
         """
         joint = newton.ModelFlags.JOINT_PROPERTIES
         model = build_branch_model(worlds=2)
@@ -1250,11 +1487,18 @@ class TestScalarBranchRule(unittest.TestCase):
         with mock.patch.object(DeviceProof, "validate", autospec=True, side_effect=validate) as proofs:
             self.assertTrue(owner.validate_model(joint))
         self.assertEqual(proofs.call_count, 2)
-        self.assertIsNotNone(sb.ScalarBranchState(solver, solver._scalar_branches)._proof)
         frames = model.joint_X_p.numpy()
         frames[model.articulation_start.numpy()[owner.scalar.group_to_art.numpy()[1]], 2] += 0.01
         model.joint_X_p.assign(frames)
         self.assertFalse(owner.validate_model(joint))
+        self.assertTrue(owner.validate_model(joint))
+        axes = model.joint_axis.numpy().copy()
+        turned = axes.copy()
+        turned[owner.scalar.plan.dofs[0]] = (0.0, 0.0, 1.0)
+        model.joint_axis.assign(turned)
+        with self.assertRaisesRegex(RuntimeError, "joint_axis changed"):
+            owner.validate_model(joint)
+        model.joint_axis.assign(axes)
         self.assertTrue(owner.validate_model(joint))
         parents = model.joint_parent.numpy()
         parents[model.articulation_start.numpy()[owner.scalar.group_to_art.numpy()[0]] + 2] = -1
@@ -1326,104 +1570,27 @@ class TestScalarBranchRule(unittest.TestCase):
         self.assertIsNotNone(plan, reason)
         return plan, reason
 
-    def test_admitted_branches_skip_the_prismatic_opt_ins(self):
-        """Build no prismatic publication or linear state where the owner takes the scalar branches.
+    def test_declined_branches_keep_ordinary_dynamics(self):
+        """Drop an admitted plan the held-tree owner does not take and build the routes of a solver without it.
 
-        CPU installs no owner, so the install is replaced by one that takes the plan.
+        The declined solver and a twin built without the plan must hold the
+        same routes, apart from the scalar branches' reason.
         """
         model = build_branch_model(worlds=2)
-        admitted = self._admitted(model)
-
-        def install(solver):
-            solver._tree_kinetic_state = mock.Mock(scalar=object(), bank_compare=False)
-            solver._cached_dynamics_selection_reason = "A test owner takes the branches."
-
-        with (
-            mock.patch.object(sb, "plan_scalar_branches", return_value=admitted),
-            mock.patch("newton._src.solvers.feather_pgs.cached_dynamics.install", install),
-            mock.patch.object(solver_module, "_PRISMATIC_PUBLICATION", True),
-            mock.patch.object(sb, "_WARNED_SUPERSEDED", set()),
-            self.assertWarnsRegex(UserWarning, "^Ignoring FEATHER_PGS_PRISMATIC_PUBLICATION: "),
-        ):
+        with mock.patch.object(sb, "plan_scalar_branches", return_value=self._admitted(model)):
             solver = SolverFeatherPGS(model, pgs_mode="split")
-        self.assertIs(solver._scalar_branches, admitted[0])
-        self.assertEqual(solver._scalar_branches_reason, admitted[1])
-        self.assertIsNone(solver._prismatic_publication)
-        self.assertFalse(solver._prismatic_linear_state)
-
-    def test_admitted_branches_warn_about_the_prismatic_opt_ins(self):
-        """Warn once per process about each prismatic opt-in that taken scalar branches leave selecting nothing.
-
-        Recipes set the opt-ins, and recipes are Isaac Lab's to edit, so they are warned about,
-        not rejected, and the warning names the way back. A plan the owner declines builds the
-        opt-ins and warns about nothing, nor does a solver without them. CPU installs no owner,
-        so the install is replaced by one that takes the plan.
-        """
-        model = build_branch_model(worlds=2)
-        admitted = self._admitted(model)
-
-        def install(solver):
-            solver._tree_kinetic_state = mock.Mock(scalar=object(), bank_compare=False)
-            solver._cached_dynamics_selection_reason = "A test owner takes the branches."
-
-        def notices(publication, linear_state, *, taken=True):
-            """The superseded opt-ins' warnings of one construction."""
-            with (
-                mock.patch.object(solver_module, "_PRISMATIC_PUBLICATION", publication),
-                mock.patch.object(solver_module, "_PRISMATIC_LINEAR_STATE", linear_state),
-                mock.patch.object(sb, "plan_scalar_branches", return_value=admitted),
-                mock.patch("newton._src.solvers.feather_pgs.cached_dynamics.install", install)
-                if taken
-                else contextlib.nullcontext(),
-                warnings.catch_warnings(record=True) as caught,
-            ):
-                warnings.simplefilter("always")
-                solver = SolverFeatherPGS(model, pgs_mode="split")
-            self.assertEqual(solver._scalar_branches is not None, taken)
-            return [str(warning.message) for warning in caught if "scalar branches supersede" in str(warning.message)]
-
-        both = "FEATHER_PGS_PRISMATIC_PUBLICATION and FEATHER_PGS_PRISMATIC_LINEAR_STATE"
-        with mock.patch.object(sb, "_WARNED_SUPERSEDED", set()):
-            (message,) = notices(True, True)
-            self.assertTrue(message.startswith(f"Ignoring {both}: "), message)
-            self.assertIn("Set FEATHER_PGS_SCALAR_BRANCHES=0 to keep the prismatic route.", message)
-            self.assertEqual(notices(True, True), [])
-        with mock.patch.object(sb, "_WARNED_SUPERSEDED", set()):
-            self.assertEqual(notices(False, False), [])
-            self.assertEqual(notices(True, False, taken=False), [])
-            (message,) = notices(True, False)
-            self.assertTrue(message.startswith("Ignoring FEATHER_PGS_PRISMATIC_PUBLICATION: "), message)
-            (message,) = notices(True, True)
-            self.assertTrue(message.startswith("Ignoring FEATHER_PGS_PRISMATIC_LINEAR_STATE: "), message)
-
-    def test_declined_branches_restore_the_prismatic_opt_ins(self):
-        """Drop an admitted plan the held-tree owner does not take and build the prismatic opt-ins as without it.
-
-        The declined solver and a twin built without the plan under the same
-        opt-in must hold the same publication plan and the same routes, apart
-        from the scalar branches' reason.
-        """
-        model = build_branch_model(worlds=2)
-        with mock.patch.object(solver_module, "_PRISMATIC_PUBLICATION", True):
-            with mock.patch.object(sb, "plan_scalar_branches", return_value=self._admitted(model)):
-                solver = SolverFeatherPGS(model, pgs_mode="split")
-            plain = SolverFeatherPGS(model, pgs_mode="split")
+        plain = SolverFeatherPGS(model, pgs_mode="split")
         self.assertIsNone(solver._tree_kinetic_state)
         self.assertIsNone(solver._scalar_branches)
         self.assertIn("did not take them", solver._scalar_branches_reason)
         self.assertIn("CPU", solver._scalar_branches_reason)
+        self.assertIn("ordinary dynamics runs them", solver._scalar_branches_reason)
         self.assertIn("No diagonal-mass group", plain._scalar_branches_reason)
-        for name in ("joint_end", "body_joint"):
-            np.testing.assert_array_equal(
-                getattr(solver._prismatic_publication, name).numpy(),
-                getattr(plain._prismatic_publication, name).numpy(),
-            )
         routes = [twin.get_path_selection()["routes"] for twin in (solver, plain)]
         for record in routes:
             self.assertFalse(record["held_tree"]["scalar_branches"]["enabled"])
             del record["held_tree"]["scalar_branches"]["reason"]
         self.assertEqual(routes[0], routes[1])
-        self.assertTrue(routes[0]["publication"]["prismatic_publication"])
 
 
 class TestScalarBranchKernels(unittest.TestCase):
@@ -1461,8 +1628,7 @@ class TestScalarBranchKernels(unittest.TestCase):
                 frames[roots, :3] += (0.01, -0.02, 0.03)
                 frames[roots, 3:] = np.asarray(wp.quat_rpy(0.25, -0.1, 0.5))
                 pair.model.joint_X_p.assign(frames)
-                # The moved frames are reported, not refused; the solver then invalidates every cache.
-                self.assertFalse(pair.state.validate_model(newton.ModelFlags.JOINT_PROPERTIES))
+                # The owner's tree groups report the moved frames; the solver then invalidates every cache.
                 pair.state.invalidate()
                 pair.head._fk_id_cache_valid.zero_()
                 np.testing.assert_array_equal(pair.mine._fk_id_cache_valid.numpy()[pair.arts], 0)
@@ -1573,43 +1739,6 @@ class TestScalarBranchKernels(unittest.TestCase):
         self.assertIn(np.float32(1.0e-3), np.abs(head.joint_tau.numpy()[others]))
         np.testing.assert_array_equal(pair.mine.joint_tau.numpy()[pair.dofs], -7.0)
         np.testing.assert_array_equal(pair.mine.aug_row_K.numpy()[rows[pair.dofs]], -7.0)
-
-    def test_validation_accepts_frames_and_rejects_topology(self):
-        """Accept numeric and frame notifications; refuse a changed axis, parent or group map.
-
-        The group reads frames live: a notification that moved one reports it
-        (``False``, the caller invalidates), and the next that moves nothing
-        proves them unchanged (``True``, the caller keeps the caches). An axis
-        is frozen, as in the tree groups: a revolute leaf's inverse mass depends
-        on it and refreshes only at the mass cadence. A changed axis raises
-        before any frame is stored. Numeric notifications skip the proof
-        (``False``).
-        """
-        joint = newton.ModelFlags.JOINT_PROPERTIES
-        model = build_branch_model(worlds=2)
-        pair = _Pair(model)
-        self.assertTrue(pair.state.validate_model(joint))
-        frames = model.joint_X_p.numpy()
-        frames[:, 2] += 0.05
-        model.joint_X_p.assign(frames)
-        axes = model.joint_axis.numpy().copy()
-        turned = axes.copy()
-        turned[pair.dofs[0]] = (0.0, 0.0, 1.0)
-        model.joint_axis.assign(turned)
-        with self.assertRaisesRegex(RuntimeError, "joint_axis changed"):
-            pair.state.validate_model(joint)
-        # The refusal stored nothing: with the axis restored, the moved frames are still reported.
-        model.joint_axis.assign(axes)
-        self.assertFalse(pair.state.validate_model(joint))
-        self.assertTrue(pair.state.validate_model(newton.ModelFlags.ALL))
-        self.assertFalse(pair.state.validate_model(newton.ModelFlags.BODY_INERTIAL_PROPERTIES))
-        parents = model.joint_parent.numpy()
-        parents[model.articulation_start.numpy()[pair.arts[0]] + 2] = -1
-        model.joint_parent.assign(parents)
-        # A numeric notification cannot change topology and is not checked.
-        self.assertFalse(pair.state.validate_model(newton.ModelFlags.JOINT_DOF_PROPERTIES))
-        with self.assertRaisesRegex(RuntimeError, "joint_parent changed"):
-            pair.state.validate_model(joint)
 
 
 def _close(test, expected, actual, index, tag, *, rtol, atol):
@@ -1815,7 +1944,7 @@ class TestGripperContactBound(unittest.TestCase):
                 values[layout.key_dofs] = 0.0
                 getattr(model, name).assign(values)
         model.rigid_contact_max = model.world_count
-        solver = recipe_solver(model, scalar=False, prismatic=False, pgs_mode="split", pgs_iterations=iterations)
+        solver = recipe_solver(model, scalar=False, pgs_mode="split", pgs_iterations=iterations)
         return solver, _press_key_with_tip(self, model, layout, solver, shift=shift)
 
     def _head_and_reference(self):
@@ -1829,7 +1958,7 @@ class TestGripperContactBound(unittest.TestCase):
 
         The first impulses move linearly with the shift, at the contact's position-correction gain
         ``pgs_beta / (D dt)`` scaled by the friction cone (1.40 and 0.86), within a factor of two of
-        that gain, and every bound of ``test_gripper_contact_matches_the_prismatic_route`` holds
+        that gain, and every bound of ``test_gripper_contact_matches_ordinary_dynamics`` holds
         (0.35 and 0.21 of the pose floor). The loaded world's later impulses move by 3.7 times the
         floor alone: the bound needs its budget term.
         """
@@ -1903,31 +2032,29 @@ class TestScalarBranchOwner(unittest.TestCase):
         solver.aug_row_K.assign(stiffness)
 
     def _assert_routes(self, head, scalar):
-        """Require the routes an A/B compares: the head's prismatic linear state and the scalar owner.
+        """Require the routes an A/B compares: the head's ordinary dynamics and the scalar owner.
 
         The keys must form their own size group: an arm-sized star would share
         the arm's group, which the recipe cannot run (see
         ``test_owner_fixtures_give_the_keys_their_own_group``).
         """
         self.assertIsNone(head._tree_kinetic_state)
-        self.assertTrue(head._prismatic_linear_state)
+        self.assertIsNone(head._scalar_branches)
         owner = scalar._tree_kinetic_state
         self.assertIsInstance(owner, MixedTreeKineticState)
         self.assertIsInstance(owner.scalar, sb.ScalarBranchState)
         self.assertIs(owner.scalar.predictor_kernel, sb.predict_prismatic_branches)
         self.assertNotEqual(owner.scalar.size, ARM_DOFS)
         self.assertEqual(sorted(group.sparse.size for group in owner.groups), sorted((ARM_DOFS, owner.scalar.size)))
-        self.assertIsNone(scalar._prismatic_publication)
-        self.assertFalse(scalar._prismatic_linear_state)
         return owner
 
-    def test_owner_matches_the_prismatic_route(self):
-        """Own 108-key worlds as scalar branches beside a held arm and track the prismatic linear state route.
+    def test_owner_matches_ordinary_dynamics(self):
+        """Own 108-key worlds as scalar branches beside a held arm and track ordinary dynamics.
 
-        The held-tree plan caps a group at 64 bodies, so the recipe's route had no
-        owner for this keyboard-shaped model. Keys and their floor-contact
-        impulses stay within the FMA bound of the prismatic linear state route
-        through the mass cadence, an inertial and drive notification, a masked
+        The held-tree plan caps a group at 64 bodies, so without scalar branches
+        no owner takes this keyboard-shaped model. Keys and their floor-contact
+        impulses stay within the keys' bound of ordinary dynamics through the
+        mass cadence, an inertial and drive notification, a masked
         reset after a coordinate write, a root re-pose, a state bank copied back
         into the input (which every cache must repair) and captured graphs with
         masked and full resets. The arm moves to the held owner's float order,
@@ -1945,7 +2072,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         model.rigid_contact_max = len(floors)
         # The head, the scalar route (captured below) and the scalar route's eager twin.
         solvers = [
-            recipe_solver(model, scalar=False),
+            recipe_solver(model, scalar=False, cached_dynamics="off"),
             recipe_solver(model, scalar=True),
             recipe_solver(model, scalar=True),
         ]
@@ -2012,7 +2139,7 @@ class TestScalarBranchOwner(unittest.TestCase):
                 f"{tag} minv",
                 **KEY_BOUND,
             )
-            # The floor contacts are key-only rows: their impulses follow the head's within FMA contraction.
+            # The floor contacts are key-only rows: their impulses follow the head's within the keys' bound.
             impulses = [_normal_impulses(self, solver, len(floors)) for solver in solvers]
             np.testing.assert_allclose(impulses[1], impulses[0], err_msg=f"{tag} impulses", **IMPULSE_BOUND)
             loads.append(float(impulses[0].max()))
@@ -2157,7 +2284,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         model.joint_q.zero_()
         model.joint_qd.zero_()
         model.rigid_contact_max = 1
-        solvers = [recipe_solver(model, scalar=False), recipe_solver(model, scalar=True)]
+        solvers = [recipe_solver(model, scalar=False, cached_dynamics="off"), recipe_solver(model, scalar=True)]
         self._assert_routes(*solvers)
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
@@ -2205,14 +2332,15 @@ class TestScalarBranchOwner(unittest.TestCase):
         for index in range(2):
             np.testing.assert_allclose(travel[index], expected, rtol=1.0e-4, atol=2.0e-6)
 
-    def test_pusher_press_matches_the_prismatic_route(self):
+    def test_pusher_press_matches_ordinary_dynamics(self):
         """Press a key with a kinematic pusher: travel and impulses follow the head, the spring-back the key law.
 
         The pusher is a frictionless world contact above one key per world; its
         witness descends at constant speed, holds and then leaves. The contact is
         key-only (one sparse coordinate), so both routes solve the same row from
         the same motion axis, origin and inverse mass and differ by FMA
-        contraction alone: travel and normal impulses within 1e-5 relative. Once
+        contraction and the inverse-mass projection's rounding alone: travel and
+        normal impulses within 1e-5 relative. Once
         the pusher leaves, each key springs back by its scalar law, integrated in
         float64 from the state it was released in.
         """
@@ -2231,7 +2359,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         mu[np.isin(model.shape_body.numpy(), layout.key_leaves)] = 0.0
         model.shape_material_mu.assign(mu)
         model.rigid_contact_max = worlds
-        solvers = [recipe_solver(model, scalar=False), recipe_solver(model, scalar=True)]
+        solvers = [recipe_solver(model, scalar=False, cached_dynamics="off"), recipe_solver(model, scalar=True)]
         self._assert_routes(*solvers)
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
@@ -2295,26 +2423,26 @@ class TestScalarBranchOwner(unittest.TestCase):
             expected = _key_law(model, pressed, dofs, pressed_axes, *released[index], release)
             np.testing.assert_allclose(spring[index], expected, rtol=1.0e-4, atol=1.0e-7)
 
-    def test_gripper_contact_matches_the_prismatic_route(self):
+    def test_gripper_contact_matches_ordinary_dynamics(self):
         """Press a key with the arm's tip: travel and impulses stay within the head's pose and budget bounds.
 
-        The scalar route changes two float orders at once: the key's (scalar kernels, CPU-bitwise
-        with the prismatic linear state, within FMA contraction on CUDA) and the arm's (the held
-        owner instead of ordinary dynamics). Both integrate the same law, so the bound is what that
-        law leaves undetermined at the recipe's eight sweeps (``_assert_gripper_switch``):
+        The scalar route changes two float orders at once: the key's (the scalar kernels instead of
+        ordinary dynamics) and the arm's (the held owner instead of ordinary dynamics). Both
+        integrate the same law, so the bound is what that law leaves undetermined at the recipe's
+        eight sweeps (``_assert_gripper_switch``):
 
         - The contact response is determined: the normal row's Delassus diagonal ``D``, 29 1/kg,
           is the key's inverse mass along the normal (the upright arm's tip adds under 2e-6 of it on
           the CPU twin). The head's matches that closed form within 1e-4, and the scalar route's the
-          head's within the keys' FMA bound.
+          head's within the keys' bound.
         - The first step starts both routes from one state. They differ by the float order of the
           tip's and the key's poses, about one float32 spacing of the contact's world position each,
           which the contact's position correction turns into impulse at ``pgs_beta / (D dt)``
           without friction: 1.6 N s/m, 1e-7 N s per spacing of 0.5 m. The first impulses must agree
           within the pose floor, that gain's response to four spacings. On the CPU twin the friction
           cone scales the gain by 1.40 and 0.86 while the contact stays penetrating (it starts three
-          spacings deep), so the floor admits about three spacings. Measured on CUDA: 6.8e-8 and
-          4.2e-8 N s, 0.17 and 0.11 of the floor. The response is linear: on the CPU twin a 3e-8 m
+          spacings deep), so the floor admits about three spacings. Measured on CUDA against the
+          linear-state law the scalar kernels follow: 6.8e-8 and 4.2e-8 N s, 0.17 and 0.11 of the floor. The response is linear: on the CPU twin a 3e-8 m
           shift of the tip's witness (one spacing of 0.3 m) gives 6.9e-8 and 4.2e-8 N s, and
           ``TestGripperContactBound``'s one-spacing shift of the 0.5 m extent (6e-8 m) gives 1.4e-7
           and 8.4e-8 N s (0.35 and 0.21 of the floor).
@@ -2343,22 +2471,23 @@ class TestScalarBranchOwner(unittest.TestCase):
         model = build_branch_model(device, worlds=2, leaves=STAR_LEAVES, shapes=True)
         layout = _Layout(model)
         model.rigid_contact_max = model.world_count
-        head, scalar = recipe_solver(model, scalar=False), recipe_solver(model, scalar=True)
+        head = recipe_solver(model, scalar=False, cached_dynamics="off")
+        scalar = recipe_solver(model, scalar=True)
         self._assert_routes(head, scalar)
         # The head route converged: the same solver with many more sweeps.
-        reference = recipe_solver(model, scalar=False, pgs_iterations=GRIPPER_REFERENCE_ITERATIONS)
+        reference = recipe_solver(
+            model, scalar=False, cached_dynamics="off", pgs_iterations=GRIPPER_REFERENCE_ITERATIONS
+        )
         self.assertIsNone(reference._tree_kinetic_state)
-        self.assertTrue(reference._prismatic_linear_state)
         presses = [_press_key_with_tip(self, model, layout, solver) for solver in (head, scalar, reference)]
         _assert_gripper_switch(self, *presses, beta=head.pgs_beta, dt=DT)
 
     def test_mixed_leaves_follow_ordinary_dynamics(self):
         """Own a star of prismatic and revolute leaves end to end and track ordinary dynamics.
 
-        The prismatic opt-ins do not admit revolute leaves, so the reference is
-        ordinary dynamics (cached_dynamics='off'); the scalar family runs its
-        general kernels: revolute motion axes about the published origin,
-        their inverse mass from the COM inertia and their COM velocities. Floor
+        The reference is ordinary dynamics (cached_dynamics='off'); the scalar
+        family runs its general kernels: revolute motion axes about the published
+        origin, their inverse mass from the COM inertia and their COM velocities. Floor
         contacts on both leaf kinds read those axes and the origin, and a root
         re-pose must republish them. Revolute torques differ by the velocity
         product's rounding, which ordinary dynamics evaluates and the family
@@ -2373,8 +2502,8 @@ class TestScalarBranchOwner(unittest.TestCase):
         floors = [int(child[starts[a] + 1 + k]) for a in layout.branches for k in (0, 3, 6, 9)]
         model.rigid_contact_max = len(floors)
         solvers = [
-            recipe_solver(model, scalar=False, prismatic=False, cached_dynamics="off"),
-            recipe_solver(model, scalar=True, prismatic=False),
+            recipe_solver(model, scalar=False, cached_dynamics="off"),
+            recipe_solver(model, scalar=True),
         ]
         self.assertIsNone(solvers[0]._tree_kinetic_state)
         owner = solvers[1]._tree_kinetic_state
@@ -2441,7 +2570,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         self.assertGreater(float(np.abs(states[1][0].body_qd.numpy()[layout.key_leaves, 3:]).max()), 1.0e-4)
 
     def test_route_record_names_the_scalar_group(self):
-        """Record the scalar group, its precedence over the prismatic opt-ins, and its decline without an owner."""
+        """Record the scalar group, the request that opts out of it, and its decline without an owner."""
         device = wp.get_device("cuda:0")
         model = build_branch_model(device, worlds=2, leaves=STAR_LEAVES, shapes=True)
         model.rigid_contact_max = 1
@@ -2450,7 +2579,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         held, publication = record["routes"]["held_tree"], record["routes"]["publication"]
         self.assertEqual(held["owner"], "mixed")
         self.assertTrue(held["scalar_branches"]["enabled"])
-        self.assertIn("supersede FEATHER_PGS_PRISMATIC", held["scalar_branches"]["reason"])
+        self.assertIn("(default; FEATHER_PGS_SCALAR_BRANCHES=0 opts out)", held["scalar_branches"]["reason"])
         groups = {group["operator"]: group for group in held["groups"]}
         self.assertEqual(set(groups), {"TreeHeldOperator", "ScalarBranchState"})
         self.assertEqual(
@@ -2464,21 +2593,17 @@ class TestScalarBranchOwner(unittest.TestCase):
             self.assertEqual(group["input_validation"], "identity", name)
             self.assertEqual((group["kernels"]["bank"], group["kernels"]["bank_repair"]), (None, None), name)
         self.assertEqual(len(record["measurements"]["held_tree_lane_timing_us"]), 2)
-        self.assertEqual((publication["owner"], publication["prismatic_publication"]), ("cached", False))
-        self.assertFalse(publication["prismatic_linear_state"])
+        self.assertEqual(publication["owner"], "cached")
         head = recipe_solver(model, scalar=False).get_path_selection()["routes"]
-        self.assertIsNone(head["held_tree"]["owner"])
         self.assertFalse(head["held_tree"]["scalar_branches"]["enabled"])
         self.assertIn("Off: FEATHER_PGS_SCALAR_BRANCHES=0", head["held_tree"]["scalar_branches"]["reason"])
-        self.assertTrue(head["publication"]["prismatic_linear_state"])
-        # Without the held-tree owner the branches stay on ordinary dynamics with the recipe's opt-ins:
-        # every route is the one of the same solver built without the flag, apart from the reason.
+        # Without the held-tree owner the branches stay on ordinary dynamics: every route is the one
+        # of the same solver built without the flag, apart from the reason.
         declined = recipe_solver(model, scalar=True, cached_dynamics="off")
         self.assertIsNone(declined._scalar_branches)
         routes = declined.get_path_selection()["routes"]
         self.assertFalse(routes["held_tree"]["scalar_branches"]["enabled"])
         self.assertIn("did not take them", routes["held_tree"]["scalar_branches"]["reason"])
-        self.assertTrue(routes["publication"]["prismatic_linear_state"])
         plain = recipe_solver(model, scalar=False, cached_dynamics="off").get_path_selection()["routes"]
         for record in (routes, plain):
             del record["held_tree"]["scalar_branches"]["reason"]
