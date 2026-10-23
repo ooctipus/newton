@@ -2304,22 +2304,18 @@ class SolverFeatherPGS(SolverBase):
         elif articulated_contact_response != "immediate":
             raise ValueError(f"articulated_contact_response must be 'immediate', got {articulated_contact_response!r}")
         self.articulated_contact_response = articulated_contact_response
-        deprecated_options = [
-            name
-            for name, ignored in (
-                ("propagation_same_articulation_rows", bool(propagation_same_articulation_rows)),
-                ("propagation_cached_response", not propagation_cached_response),
-                ("propagation_cached_response_max_bodies", propagation_cached_response_max_bodies != 8),
-            )
-            if ignored
-        ]
-        if deprecated_options:
-            warnings.warn(
-                f"{', '.join(deprecated_options)} configured the deprecated propagation contact responses and "
-                "have no effect; they will be removed. Omit them.",
-                DeprecationWarning,
-                stacklevel=_CONSTRUCTOR_CALLER,
-            )
+        for name, ignored in (
+            ("propagation_same_articulation_rows", bool(propagation_same_articulation_rows)),
+            ("propagation_cached_response", not propagation_cached_response),
+            ("propagation_cached_response_max_bodies", propagation_cached_response_max_bodies != 8),
+        ):
+            if ignored:
+                warnings.warn(
+                    f"{name} is deprecated and has no effect: it configured the propagation contact responses, "
+                    "which will be removed. Omit it.",
+                    DeprecationWarning,
+                    stacklevel=_CONSTRUCTOR_CALLER,
+                )
         # ``mf_warmstart`` and its environment switch predate the unified
         # contact-warm-start contract. Keep them as compatibility aliases, but
         # map them onto the one all-route mode rather than retaining a second
