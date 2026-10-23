@@ -3225,17 +3225,6 @@ class SolverFeatherPGS(SolverBase):
         self._resolved_worlds = classifier.resolved
         self._resolved_worlds_reason = classifier.reason
 
-        self._free_body_gyro_kernel = None
-        if os.environ.get("FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO") == "1" and self._has_free_rigid_bodies:
-            # A predictor experiment independent of contact scheduling. The
-            # effective six-DOF factor retains drive/armature contributions;
-            # physical COM inertia supplies only the gyroscopic correction.
-            if model.requires_grad or self.L_by_size.get(6) is None:
-                raise ValueError("Experimental implicit free-body gyro requires ordinary six-DOF mass factors")
-            from .free_body_gyro import correct_free_body_gyroscopic_predictor  # noqa: PLC0415
-
-            self._free_body_gyro_kernel = correct_free_body_gyroscopic_predictor
-
         self._mf_multiblock = None
         if os.environ.get("FEATHER_PGS_MF_MULTIBLOCK") == "1":
             from .mf_multiblock import MultiBlockContactSolver  # noqa: PLC0415
@@ -5326,15 +5315,11 @@ class SolverFeatherPGS(SolverBase):
         # requested owner later declines the topology. They cannot acquire
         # dense storage after this sparse allocation decision.
         if (
-            (
-                self.grouped_dynamics
-                and sparse_choice != "on"
-                and os.environ.get("FEATHER_PGS_SPARSE_GROUPED_DYNAMICS", "1") != "1"
-            )
-            or os.environ.get("FEATHER_PGS_MF_MULTIBLOCK") == "1"
-            or (self._has_free_rigid_bodies and os.environ.get("FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO") == "1")
-        ):
-            self._sparse_selection_reason = "A legacy grouped, multiblock or free-body option retains ordinary factors."
+            self.grouped_dynamics
+            and sparse_choice != "on"
+            and os.environ.get("FEATHER_PGS_SPARSE_GROUPED_DYNAMICS", "1") != "1"
+        ) or os.environ.get("FEATHER_PGS_MF_MULTIBLOCK") == "1":
+            self._sparse_selection_reason = "A legacy grouped or multiblock option retains ordinary factors."
             return
         # A parallel tier or response block that serves the active friction law owns the
         # ordinary buffers. Patch friction yields only to a parallel tier, which split mode
@@ -12660,27 +12645,6 @@ class SolverFeatherPGS(SolverBase):
             outputs=[state_aug.joint_qdd, self.v_hat],
             device=model.device,
         )
-        if self._free_body_gyro_kernel is not None:
-            wp.launch(
-                self._free_body_gyro_kernel,
-                dim=self.n_arts_by_size[6],
-                inputs=[
-                    self.group_to_art[6],
-                    self.is_free_rigid,
-                    model.articulation_start,
-                    model.joint_child,
-                    model.joint_qd_start,
-                    self._kinematic_joint_mask,
-                    state_aug.body_q_com,
-                    model.joint_X_p,
-                    model.body_inertia,
-                    self.L_by_size[6],
-                    stage3_qd,
-                    dt,
-                ],
-                outputs=[self.v_hat],
-                device=model.device,
-            )
         self._stage3_correct_free_root_velocity(state_in, stage3_qd, dt)
 
     def _stage3_correct_free_root_velocity(
@@ -12693,9 +12657,7 @@ class SolverFeatherPGS(SolverBase):
         # runtime kinematic changes without changing graph topology.
         if not self._free_root_joint_count:
             return
-        # The retained clutter experiment replaces, never compounds, main's
-        # angular correction. Both paths still need linear transport once.
-        if self._free_rigid_body_count and self._free_body_gyro_kernel is None:
+        if self._free_rigid_body_count:
             wp.launch(
                 apply_free_root_velocity_corrections,
                 dim=self._free_root_joint_count,

@@ -160,12 +160,6 @@ FLAGS = declare(
         "Retired compact workspace of a removed robot-specific owner; ignored.",
     ),
     _flag(
-        "FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO",
-        "experiment",
-        _SOLVER,
-        "=1 applies an implicit gyroscopic predictor correction to independent free bodies.",
-    ),
-    _flag(
         "FEATHER_PGS_G1_CHAIN_SCAN",
         "retired",
         ("environment_flags",),

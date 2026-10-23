@@ -1245,7 +1245,6 @@ def _free_rigid_bodies(solver) -> dict:
         "count": count,
         "mixed_worlds": bool(solver._has_mixed_contacts),
         "owners": owners,
-        "implicit_gyro": solver._free_body_gyro_kernel is not None,
         "reason": "No free rigid bodies."
         if not count
         else "Owners that can solve free-body rows, in claim order; contacts are routed per world at run time.",
