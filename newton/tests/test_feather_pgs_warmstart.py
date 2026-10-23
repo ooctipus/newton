@@ -15,7 +15,6 @@ from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     gather_dense_warmstart,
     gather_mf_warmstart,
-    gather_propagation_warmstart,
     prepare_world_impulses,
 )
 
@@ -203,8 +202,8 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
         )
         np.testing.assert_array_equal(got, np.array([0.0, 110.0, 0.0, 0.0, 22.0], dtype=np.float32))
 
-    def test_mf_and_propagation_share_friction_ownership_rule(self):
-        """Every routed family rejects A's old tangent from B's new span."""
+    def test_mf_friction_ownership_rule(self):
+        """The matrix-free family rejects A's old tangent from B's new span."""
         c, f, dead = PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, -1
         prev_impulses = wp.array([[11.0, 22.0, 33.0, 55.0]], dtype=wp.float32, device="cpu")
         prev_types = wp.array([[c, f, f, c]], dtype=wp.int32, device="cpu")
@@ -246,37 +245,6 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
             device="cpu",
         )
         np.testing.assert_array_equal(mf_impulses.numpy()[0], np.array([11.0, 55.0, 0.0, 0.0], dtype=np.float32))
-
-        propagation_impulses = wp.zeros((1, 4), dtype=wp.float32, device="cpu")
-        wp.launch(
-            gather_propagation_warmstart,
-            dim=2,
-            inputs=[
-                contact_count,
-                wp.array([2, 2], dtype=wp.int32, device="cpu"),
-                contact_slots,
-                contact_world,
-                match_indices,
-                prev_slots,
-                prev_impulses,
-                prev_types,
-                prev_parents,
-                constraint_count,
-                current_types,
-                current_parents,
-                wp.array([[0.0, 0.0, 1.0]] * 2, dtype=wp.vec3, device="cpu"),
-                wp.array([[0.0, 0.0, 1.0]] * 2, dtype=wp.vec3, device="cpu"),
-                wp.full((1, 4), 100.0, dtype=wp.float32, device="cpu"),
-                1.0,
-                1.0,
-                4,
-            ],
-            outputs=[propagation_impulses],
-            device="cpu",
-        )
-        np.testing.assert_array_equal(
-            propagation_impulses.numpy()[0], np.array([11.0, 55.0, 0.0, 0.0], dtype=np.float32)
-        )
 
     def test_current_slot_is_bounded_by_constraint_count(self):
         got = _gather_dense_rows(
