@@ -454,7 +454,6 @@ class TestSparseContactTriplets(unittest.TestCase):
                     dense_max_constraints=capacity,
                     grouped_dynamics=False,
                     mf_gs_parallel_rows=0,
-                    mf_gs_response_block_rows=0,
                     use_parallel_streams=True,
                 )
                 self.assertEqual(solver._sparse_mass_matrix_size, 18)
@@ -814,7 +813,6 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
                     dense_max_constraints=192,
                     grouped_dynamics=False,
                     mf_gs_parallel_rows=0,
-                    mf_gs_response_block_rows=0,
                     use_parallel_streams=True,
                 )
                 self.assertEqual(solver._sparse_mass_matrix_size, 18)

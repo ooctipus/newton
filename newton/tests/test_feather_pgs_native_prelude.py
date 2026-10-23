@@ -16,7 +16,7 @@ import pkgutil
 import unittest
 from pathlib import Path
 
-from newton._src.solvers.feather_pgs import contact_unit, device_preludes, friction, mf_gs_source
+from newton._src.solvers.feather_pgs import contact_unit, device_preludes, friction
 from newton._src.solvers.feather_pgs.device_preludes import ARCHITECTURE_GUARD, DevicePrelude, cuda_native
 
 _PACKAGE = "newton._src.solvers.feather_pgs"
@@ -171,15 +171,6 @@ class TestDevicePreludeComposition(unittest.TestCase):
         self.assertIn(friction.FRICTION_PAIR_CACHED, self.preludes)
         # The contact-unit law for native sweeps; its CPU binding backs the Warp loop sweeps' functions.
         self.assertIn(contact_unit.CONTACT_UNIT, self.preludes)
-
-    def test_dense_tile_entry_precedes_the_friction_law(self):
-        """Keep the dense-tile entry trap ahead of the friction law in the dense-tile variant."""
-        source = mf_gs_source.get_source(64, 32, 12, "120", dense_support_tiles=True).native
-        lead, names, body = split_preludes(source, self.preludes)
-        self.assertEqual((lead, names), ("\n", ["dense_tile_entry", "friction_pair"]))
-        plain = mf_gs_source.get_source(64, 32, 12, "120").native
-        self.assertEqual(split_preludes(plain, self.preludes)[1], ["friction_pair"])
-        self.assertNotIn("trap", body)
 
 
 class TestNativeSweepLayout(unittest.TestCase):

@@ -1,0 +1,1 @@
+Deprecate the research friction laws of `SolverFeatherPGS`: `friction_mode="bisection"`, `"bisection_desaxce"` and `"coulomb_newton"` now warn and will be removed in a future release. They still run on the CUDA matrix-free route during the deprecation period; use the default `friction_mode="current"`.

@@ -31,7 +31,6 @@ def make_case(
     free_count=0,
     *,
     exact=False,
-    world_rows=False,
     model_factory=None,
     beta=0.0,
     deterministic=False,
@@ -45,8 +44,6 @@ def make_case(
         patch.dict(os.environ, {"FEATHER_PGS_KEYED_ROWS": ("" if enabled is None else str(int(enabled)))}),
         patch.object(source, "_INK_ON", True),
         patch.object(source, "_MF_EXACT_ROWSUM", exact),
-        patch.object(source, "_WR_ON", world_rows and not enabled),
-        patch.object(source, "_REGISTER_WHITENING", exact),
     ):
         # Patch friction sets the switch that admits it to the parallel tiers and keyed rows (its default);
         # point friction runs with the switch unset, whatever the exported environment says.
@@ -134,8 +131,8 @@ class TestKeyedRowIntegration(unittest.TestCase):
         np.testing.assert_array_equal(keyed[1].L_by_size[9].numpy()[1], held[1])
         self.compare(ordinary, keyed)
 
-    def test_exact_row_sums_and_register_whitening(self):
-        """Replace world-contact inputs while preserving exact scaling and register rows."""
+    def test_exact_row_sums(self):
+        """Replace ordinary contact inputs while preserving exact scaling."""
         from newton.tests import test_feather_pgs_propagation_free_root_warp as chain  # noqa: PLC0415
 
         def model_factory():
@@ -144,23 +141,20 @@ class TestKeyedRowIntegration(unittest.TestCase):
 
         for capacity in (32, 48):
             with self.subTest(capacity=capacity):
-                ordinary = make_case(False, capacity, exact=True, world_rows=True, model_factory=model_factory)
-                keyed = make_case(True, capacity, exact=True, world_rows=True, model_factory=model_factory)
+                ordinary = make_case(False, capacity, exact=True, model_factory=model_factory)
+                keyed = make_case(True, capacity, exact=True, model_factory=model_factory)
                 self.assertIsNotNone(keyed[1]._keyed_rows)
                 self.assertEqual(keyed[1]._keyed_rows.layout.primary, 18)
-                for kernel in keyed[1]._pgs_solve_mf_gs_incremental_kernels:
-                    self.assertIn("_rw", kernel.key)
                 for _ in range(8):
                     _step(ordinary)
                     _step(keyed)
                     self.compare(ordinary, keyed)
 
-    def test_generic_world_row_request_selects_keyed_inputs(self):
+    def test_default_request_selects_keyed_inputs(self):
         """Adopt admitted physical keys without naming a task or adding a caller flag."""
-        case = make_case(None, 32, exact=True, world_rows=True)
+        case = make_case(None, 32, exact=True)
         self.assertIsNotNone(case[1]._keyed_rows)
         self.assertIsNotNone(case[1]._keyed_rows.layout)
-        self.assertIsNone(getattr(case[1], "_wr_world_contacts", None))
 
     def test_patch_rows_match_ordinary_patch_rows(self):
         """Solve patch friction through keyed rows as through ordinary rows in the same linked tiers.

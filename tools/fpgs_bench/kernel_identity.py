@@ -50,7 +50,6 @@ of the parent commit, so one copy of this script records both sides.
 
 import argparse
 import collections
-import dataclasses
 import hashlib
 import inspect
 import itertools
@@ -146,12 +145,9 @@ def factory_calls():
     hold the suite's shapes); the fallback and linked parallel tiers of a
     second keyed-row coordinate layout (one articulation, no secondary block),
     the Cholesky factor families with the held trees' geometric refreshes
-    (:func:`held_factor_calls`), the revolute propagation trees and the opt-in
-    register-whitening parallel tiers follow. Calls a factory rejects are
-    recorded as rejected.
+    (:func:`held_factor_calls`) and the revolute propagation trees follow.
+    Calls a factory rejects are recorded as rejected.
     """
-    from unittest.mock import patch  # noqa: PLC0415
-
     from newton._src.solvers.feather_pgs import keyed_rows, small_cholesky  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
@@ -163,16 +159,12 @@ def factory_calls():
         {"friction_mode": "bisection"},
         {"friction_mode": "bisection_desaxce"},
         {"friction_mode": "coulomb_newton"},
-        {"software_pipeline": False},
         {"shared_metadata": False},
         {"stream_mf_impulses": True},
         {"fuse_vel_limits": True},
         {"contact_torsion": True},
         {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19},
         {"skip_incremental_rows": 32},
-        {"skip_response_block": True},
-        {"dense_support_tiles": True},
-        {"dense_support_tiles": True, "stage_velocities": True},
         {"factor_coordinates": True},
         {"factor_coordinates": True, "independent_components": True},
     )
@@ -232,23 +224,6 @@ def factory_calls():
     ):
         kwargs = {"has_free_root": True} if free_root else {}
         yield name + factory, _unwrapped(getattr(solver, factory)), (size, ARCH), kwargs
-
-    def whitened(*args, **kwargs):
-        with patch.object(solver, "_REGISTER_WHITENING", True):
-            return solver._get_pgs_solve_parallel_kernel(*args, **kwargs)
-
-    # FEATHER_PGS_REGISTER_WHITENING=1 on the parallel tiers the pins hold opted out, at each measured layout.
-    for arch, (rows, min_rows) in itertools.product(("120", "103"), ((32, 0), (48, 32))):
-        kwargs = {
-            "rows": rows,
-            "min_rows": min_rows,
-            "sweeps": 24,
-            "matrix_free": True,
-            "inkernel_response": (18, 0, 0, 0),
-            "world_rows": True,
-            "exact_row_sums": True,
-        }
-        yield name + "_get_pgs_solve_parallel_kernel[register_whitening]", whitened, (64, 32, 18, arch), kwargs
 
 
 def held_factor_calls():
@@ -494,18 +469,11 @@ def census_calls():
     Gauss-Seidel (one shape within a warp's width of coordinates, one beyond
     it), sparse (one shape small enough for subwarp sweeps), paired factor,
     local owners plain and over packet rows, sparse diagonal, incremental,
-    parallel and keyed parallel tiers, the response-block sweeps and the fused
-    propagation iteration. Every factory that takes a velocity-limit law is
-    crossed with both laws, and the matrix-free Gauss-Seidel sweep with
-    resident row metadata. The held-coordinate bindings of
-    ``mf_gs_source.get_source``, which no factory passes, are hashed as text.
+    parallel and keyed parallel tiers and the fused propagation iteration.
+    Every factory that takes a velocity-limit law is crossed with both laws,
+    and the matrix-free Gauss-Seidel sweep with resident row metadata.
     """
-    from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
-        keyed_rows,
-        mf_gs_source,
-        response_block_sweep,
-        row_packets,
-    )
+    from newton._src.solvers.feather_pgs import keyed_rows, row_packets  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel  # noqa: PLC0415
@@ -515,7 +483,6 @@ def census_calls():
     laws = _axis("velocity_limit_law", VELOCITY_LIMIT_LAWS)
     mf_gs = (
         _axis("friction_mode", ("current", "bisection", "bisection_desaxce", "coulomb_newton")),
-        _axis("software_pipeline", (True, False)),
         _axis("shared_metadata", (True, False)),
         _axis("stream_mf_impulses"),
         _axis("has_drive_rows", (True, False)),
@@ -525,10 +492,7 @@ def census_calls():
         _axis("contact_torsion"),
         _axis("factor_coordinates"),
         _axis("skip_incremental_rows", (0, 32)),
-        _axis("skip_response_block"),
         _axis("independent_components"),
-        _axis("dense_support_tiles"),
-        _axis("stage_velocities"),
         _axis("resident_row_metadata"),
         laws,
     )
@@ -548,21 +512,6 @@ def census_calls():
             solver._get_pgs_solve_mf_gs_kernel,
             ((64, 32, 12, ARCH), (192, 64, 40, ARCH)),
             mf_gs,
-        ),
-        (
-            "mf_gs_source.get_source",
-            mf_gs_source.get_source,
-            ((192, 64, 29, ARCH),),
-            (
-                ({"factor_coordinates": True, "has_drive_rows": False, "has_dense_velocity_limit_rows": False},),
-                _axis("independent_components"),
-                _axis(
-                    "held_policy", (None, Named("held_policy", ("/* entry */", "/* staging */", "/* publication */")))
-                ),
-                _axis("shared_arena"),
-                _axis("cpu_body", ("", "/* scalar recurrence */")),
-                laws,
-            ),
         ),
         (
             "sparse_pgs._get_pgs_solve_sparse_kernel",
@@ -629,9 +578,6 @@ def census_calls():
                 _axis("skip_local_internal_worlds"),
                 _axis("inkernel_response", (None, (18, 0, 0, 0))),
                 _axis("exact_row_sums"),
-                _axis("world_rows"),
-                _axis("lean_sweep"),
-                _axis("bound_finger"),
                 _axis("linked_rows"),
             ),
         ),
@@ -658,18 +604,6 @@ def census_calls():
             ),
         ),
         (
-            "response_block_sweep.get_response_block_sweep_lane_kernel",
-            response_block_sweep.get_response_block_sweep_lane_kernel,
-            ((192, 64, 22),),
-            (_axis("lane_rows", (8, 16)), _axis("has_drive_rows"), laws),
-        ),
-        (
-            "response_block_sweep.get_response_block_sweep_warp_kernel",
-            response_block_sweep.get_response_block_sweep_warp_kernel,
-            ((192, 64, 22),),
-            (_axis("rows", (32, 64)), _axis("lane_rows", (16,)), _axis("has_drive_rows"), laws),
-        ),
-        (
             name + "_get_pgs_solve_propagation_full_iteration_kernel",
             solver._get_pgs_solve_propagation_full_iteration_kernel,
             ((64, 32, 18, 48, 8, 18, ARCH),),
@@ -692,8 +626,6 @@ def census(select=(), skip=()):
     messages and a digest of their labels, so that a change of admission shows
     in a diff as a changed rejection.
     """
-    import warp as wp  # noqa: PLC0415
-
     rows, rejected, defaults = {}, {}, {}
     for name, factory, args, options in census_calls():
         if id(factory) not in defaults:
@@ -713,11 +645,7 @@ def census(select=(), skip=()):
             # Generators also refuse a combination when a source seam guard fails.
             rejected.setdefault(name, []).append((key, f"{type(error).__name__}: {error}"))
             continue
-        if isinstance(built, wp.Kernel):
-            rows[key] = {"family": "census", **kernel_digests(built, codegen=False)}
-        else:
-            # Generated source text (mf_gs_source.GeneratedSource).
-            rows[key] = {"family": "census", "key": name, "hash": digest(json.dumps(dataclasses.astuple(built)))}
+        rows[key] = {"family": "census", **kernel_digests(built, codegen=False)}
     summaries = {}
     for name, entries in rejected.items():
         messages = collections.Counter(message for _, message in entries)

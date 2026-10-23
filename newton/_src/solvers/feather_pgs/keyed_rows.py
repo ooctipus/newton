@@ -400,7 +400,7 @@ def get_patch_fallback_kernel(layout):
 
 
 def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=False):
-    """Decode physical endpoints in the ordinary factor stage, including register whitening.
+    """Decode physical endpoints in the ordinary factor stage.
 
     ``patch`` writes the persistent patch row law and reads every row's parent and
     coefficient as the scatter and the patch link left them.
@@ -640,7 +640,6 @@ def create_owner(solver):
         and solver.enable_joint_limits
         and 0 < solver.mf_gs_parallel_rows <= 128
         and solver.mf_gs_parallel_matrix_free
-        and solver.mf_gs_response_block_rows == 0
         and solver.dense_max_constraints >= solver.mf_gs_parallel_rows
         and solver.mf_gs_parallel_sweeps > 0
         and solver.pgs_iterations > 0
@@ -661,12 +660,9 @@ def create_owner(solver):
         and solver._contact_w == 1.0
         and not solver._debug_buffers_enabled
         and source._INK_ON
-        and not source._WR_WARM
-        and not source._WR_CHECK
         and not source._INK_CHECK
         and not source._CHECK_ROWS
         and not source._GROUPED_CHECK
-        and not source._SHADOW_LEAN
         and not source._FPGS_CAPTURE
     )
     if not supported:

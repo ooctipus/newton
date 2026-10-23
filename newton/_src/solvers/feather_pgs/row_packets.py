@@ -1310,7 +1310,6 @@ def create_owner(solver):
         (
             source._FPGS_CAPTURE,
             source._INK_ON,
-            source._WR_ON,
             source._DEBUG_CACHE,
             source._DEBUG_CACHE_MODE,
             source._DEBUG_CACHE_CMP,

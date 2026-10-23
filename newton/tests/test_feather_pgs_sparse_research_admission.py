@@ -76,7 +76,6 @@ def _eligible_solver():
         _has_free_rigid_bodies=False,
         mf_gs_parallel_rows=0,
         mf_gs_incremental_rows=32,
-        mf_gs_response_block_rows=0,
         _patch_parallel_rows=True,
     )
 
@@ -193,19 +192,6 @@ class TestSparseResearchAdmission(unittest.TestCase):
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
         self.assertIsNone(solver._sparse_mass_matrix_size)
 
-    def test_multiblock_request_keeps_existing_owner(self):
-        """Leave explicit multiblock selection and its feature validation on the existing path."""
-        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        for patches in (False, True):
-            with (
-                self.subTest(patches=patches),
-                mock.patch.dict(os.environ, {"FEATHER_PGS_MF_MULTIBLOCK": "1"}, clear=True),
-            ):
-                solver = _eligible_solver()
-                solver._friction_anchors_enabled = patches
-                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-                self.assertIsNone(solver._sparse_mass_matrix_size)
-
     def test_implicit_gyro_only_reserves_worlds_with_free_bodies(self):
         """Keep the alternative gyro owner without rejecting an inactive no-free-body request."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
@@ -218,29 +204,27 @@ class TestSparseResearchAdmission(unittest.TestCase):
             self.assertIsNone(solver._sparse_mass_matrix_size)
 
     def test_explicit_schedules_keep_their_solve_budget(self):
-        """Do not silently replace a requested parallel or response-block solve."""
+        """Do not silently replace a requested parallel solve."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        for name in ("mf_gs_parallel_rows", "mf_gs_response_block_rows"):
-            with self.subTest(name=name), mock.patch.dict(os.environ, {}, clear=True):
-                solver = _eligible_solver()
-                setattr(solver, name, 32)
-                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-                self.assertIsNone(solver._sparse_mass_matrix_size)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            solver = _eligible_solver()
+            solver.mf_gs_parallel_rows = 32
+            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+            self.assertIsNone(solver._sparse_mass_matrix_size)
 
     def test_patch_friction_yields_only_to_a_parallel_tier_it_runs(self):
-        """Keep the ordinary buffers for a patch parallel tier, but not for split mode, response blocks or the default.
+        """Keep the ordinary buffers for a patch parallel tier, but not for split mode or the default.
 
         Patch friction runs the recipe's parallel tier as point friction does, so the
         tier's request declines sparse factors in matrix-free mode. Split mode builds no
-        tier, response blocks stay point-only, and opted out with
-        FEATHER_PGS_PATCH_PARALLEL_ROWS=0, patch friction keeps its sparse route.
+        tier, and opted out with FEATHER_PGS_PATCH_PARALLEL_ROWS=0, patch friction keeps
+        its sparse route.
         """
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
         for name, changes, declined in (
             ("parallel", {"mf_gs_parallel_rows": 48}, True),
             ("switched_off", {"mf_gs_parallel_rows": 48, "_patch_parallel_rows": False}, False),
             ("split", {"mf_gs_parallel_rows": 48, "pgs_mode": "split", "pgs_kernel": "tiled_row"}, False),
-            ("response_block", {"mf_gs_response_block_rows": 64}, False),
         ):
             with self.subTest(name=name), mock.patch.dict(os.environ, {}, clear=True):
                 solver = _eligible_solver()
@@ -292,7 +276,6 @@ class TestSparseResearchAdmission(unittest.TestCase):
                     dense_max_constraints=40,
                     grouped_dynamics=False,
                     mf_gs_parallel_rows=0,
-                    mf_gs_response_block_rows=0,
                     use_parallel_streams=True,
                 )
                 self.assertEqual(solver._sparse_mass_matrix_size, 18)

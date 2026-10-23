@@ -53,26 +53,6 @@ def _mfgs_metadata_footprint(
     return _MFGSMetadataFootprint(resident, metadata_bytes, total_bytes)
 
 
-def _use_resident_mfgs_metadata(
-    max_constraints: int,
-    mf_max_constraints: int,
-    max_world_dofs: int,
-    max_shared_memory: int,
-    *,
-    has_drive_rows: bool,
-    fuse_vel_limits: bool,
-) -> bool:
-    """Select resident MF-GS metadata for compact solver shapes (see :func:`_mfgs_metadata_footprint`)."""
-    return _mfgs_metadata_footprint(
-        max_constraints,
-        mf_max_constraints,
-        max_world_dofs,
-        max_shared_memory,
-        has_drive_rows=has_drive_rows,
-        fuse_vel_limits=fuse_vel_limits,
-    ).resident
-
-
 class _MFGSStorage(NamedTuple):
     """Storage classes of one MF-GS kernel specialization and why they were chosen.
 
@@ -96,8 +76,8 @@ def _select_mfgs_storage(
     *,
     has_drive_rows: bool,
     fuse_vel_limits: bool,
-    block_count: int | None = None,
-    sm_count: int | None = None,
+    block_count: int,
+    sm_count: int,
     force_stream_mf_impulses: bool = False,
 ) -> _MFGSStorage:
     """Select metadata and impulse storage without changing row capacity or order.
@@ -115,7 +95,7 @@ def _select_mfgs_storage(
     block then declares at most 48 KiB of static shared memory. The sweep reads
     them on every row and along every patch ring, as chains of dependent loads.
     Both storage classes hold identical values, so results are bitwise
-    identical. Without the launch shape the packed metadata streams with the rest.
+    identical.
     """
     footprint = _mfgs_metadata_footprint(
         max_constraints,
@@ -154,9 +134,7 @@ def _select_mfgs_storage(
     if not shared_metadata:
         static_bytes = fixed_bytes + 4 * max_constraints + (0 if stream_mf_impulses else 4 * mf_max_constraints)
         budget = min(_MFGS_STATIC_SHARED_MAX_BYTES, max_shared_memory)
-        if block_count is None or sm_count is None:
-            reason += " Row types and parents stream too: the launch shape is unknown."
-        elif block_count > sm_count:
+        if block_count > sm_count:
             reason += (
                 f" Row types and parents stream too: the {block_count}-block grid exceeds one block per SM "
                 f"({sm_count} SMs)."

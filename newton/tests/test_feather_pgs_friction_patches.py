@@ -1147,22 +1147,17 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         valid = patches.previous.valid.numpy()[:2]
         np.testing.assert_array_equal(valid, (worlds != 0).astype(np.int32))
 
-    @unittest.skipUnless(wp.is_cuda_available(), "explicit point kernels require CUDA")
+    @unittest.skipUnless(wp.is_cuda_available(), "coupled friction modes require CUDA")
     def test_explicit_point_solver_defaults_remain_compatible(self):
-        """Honor existing point-solver selections without requiring a new opt-out argument."""
+        """Honor an existing point-solver selection without requiring a new opt-out argument."""
         builder = newton.ModelBuilder()
         body = builder.add_body()
         builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
         model = builder.finalize(device="cuda:0")
-        for kwargs in (
-            {"pgs_mode": "matrix_free", "friction_mode": "bisection"},
-            {"pgs_mode": "matrix_free", "pgs_kernel": "tiled_contact"},
-            {"pgs_mode": "matrix_free", "pgs_kernel": "streaming"},
-        ):
-            with self.subTest(kwargs=kwargs), self.assertWarnsRegex(UserWarning, "point-contact"):
-                solver = newton.solvers.SolverFeatherPGS(model, **kwargs)
-                self.assertFalse(solver._friction_anchors_enabled)
-                self.assertEqual(solver.friction_anchor_beta, 0.0)
+        with self.assertWarnsRegex(UserWarning, "point-contact"):
+            solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", friction_mode="bisection")
+        self.assertFalse(solver._friction_anchors_enabled)
+        self.assertEqual(solver.friction_anchor_beta, 0.0)
 
     def test_shared_point_flags_warn_with_patch_friction(self):
         """Explain when patch anchors override an explicitly requested shared friction point."""
@@ -1170,6 +1165,24 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         for flag in ("contact_shared_anchor", "contact_friction_shared_anchor"):
             with self.subTest(flag=flag), self.assertWarnsRegex(UserWarning, "friction_anchor_beta=0"):
                 newton.solvers.SolverFeatherPGS(model, **{flag: True})
+
+    def test_research_friction_modes_are_deprecated(self):
+        """Warn that the research friction laws will be removed, and leave the default law silent."""
+        builder = newton.ModelBuilder()
+        body = builder.add_body()
+        builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        model = builder.finalize(device="cpu")
+        for mode in ("bisection", "bisection_desaxce", "coulomb_newton"):
+            with self.subTest(friction_mode=mode):
+                # CPU construction then stops at the matrix-free device check.
+                with (
+                    self.assertWarnsRegex(DeprecationWarning, f"friction_mode='{mode}' is deprecated"),
+                    self.assertRaisesRegex(NotImplementedError, "requires CUDA"),
+                ):
+                    newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", friction_mode=mode)
+        with mock.patch("warnings.warn") as warn:
+            newton.solvers.SolverFeatherPGS(model, friction_mode="current")
+        self.assertFalse([call for call in warn.call_args_list if "friction_mode" in str(call.args[0])])
 
     def test_incompatible_point_solvers_are_rejected(self):
         """Reject coupled point solves that would silently consume a patch's shared normal load."""
@@ -1179,15 +1192,8 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         model = builder.finalize(device="cpu")
         with self.assertRaisesRegex(ValueError, "Patch friction requires"):
             newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2, friction_mode="bisection")
-        with self.assertRaisesRegex(ValueError, "pgs_kernel.*requires CUDA"):
-            newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2, pgs_kernel="tiled_contact")
         solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.2, pgs_kernel="auto")
         self.assertEqual(solver.pgs_kernel, "loop")
-        if wp.is_cuda_available():
-            cuda_model = builder.finalize(device="cuda:0")
-            for kernel in ("tiled_contact", "streaming"):
-                with self.subTest(pgs_kernel=kernel), self.assertRaisesRegex(ValueError, "Patch friction requires"):
-                    newton.solvers.SolverFeatherPGS(cuda_model, friction_anchor_beta=0.2, pgs_kernel=kernel)
 
     def test_deprecated_anchor_limit_warns_instead_of_raising(self):
         """Ignore the deprecated anchor limit without overriding the default or explicit opt-out."""

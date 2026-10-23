@@ -41,8 +41,6 @@ class TestFeatherPGSDenseConstructor(unittest.TestCase):
             ("0", 128, "tiled_row"),
             ("1", 128, "tiled_row"),
             ("1", 64, "loop"),
-            ("1", 64, "tiled_contact"),
-            ("1", 64, "streaming"),
         )
         for budgets, capacity, mode in cases:
             with self.subTest(device=str(device), budgets=budgets, capacity=capacity, mode=mode):
@@ -61,7 +59,6 @@ class TestFeatherPGSDenseConstructor(unittest.TestCase):
                         pgs_kernel=mode,
                         dense_max_constraints=capacity,
                         mf_max_constraints=8,
-                        pgs_chunk_size=16,
                         use_parallel_streams=False,
                         double_buffer=False,
                     )

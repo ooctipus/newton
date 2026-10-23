@@ -22,10 +22,10 @@ DT = 1.0 / 240.0
 STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
 
 # Module switches and environment of each tier configuration: the default point tiers, and the
-# in-kernel response with in-sweep world rows (keyed rows declined so the general tier builds them).
+# in-kernel response of the general tier (keyed rows declined).
 _CONFIGURATIONS = {
     "default": ({}, {}),
-    "in_kernel_rows": ({"_INK_ON": True, "_WR_ON": True}, {"FEATHER_PGS_KEYED_ROWS": "0"}),
+    "in_kernel_response": ({"_INK_ON": True}, {"FEATHER_PGS_KEYED_ROWS": "0"}),
 }
 
 
@@ -59,49 +59,42 @@ class _Scene:
 
 class TestFeatherPGSTierPlaceholders(unittest.TestCase):
     def test_tier_inputs_read_placeholders_allocated_up_front(self):
-        """Read the tiers' placeholder inputs without allocating, and leave only the warm-start table to first use.
+        """Read the tiers' placeholder inputs without allocating.
 
-        ``_allocate_tier_placeholders`` runs with the tiers' construction. Afterwards the input
-        helpers allocate nothing, except the per-world contact table of the in-kernel warm start
-        (``FEATHER_PGS_WR_WARM`` with world rows), which is tier state rather than a placeholder.
+        ``_allocate_tier_placeholders`` runs with the tiers' construction; afterwards the input
+        helpers allocate nothing.
         """
         device = wp.get_device("cpu")
-        for warm, world_rows in ((False, False), (False, True), (True, False), (True, True)):
-            with self.subTest(warm=warm, world_rows=world_rows):
-                solver = SimpleNamespace(
-                    model=SimpleNamespace(device=device),
-                    world_count=3,
-                    pgs_warmstart_decay=0.5,
-                    row_cfm=wp.zeros((3, 4), dtype=float, device=device),
-                    _ink_sizes=None,
-                    _wr_world_contacts=wp.zeros((3, 4), dtype=int, device=device) if world_rows else None,
-                )
-                solver._warm_table_inputs = lambda solver=solver: SolverFeatherPGS._warm_table_inputs(solver)
-                with patch.object(source, "_WR_WARM", warm):
-                    SolverFeatherPGS._allocate_tier_placeholders(solver)
-                    allocated, zeros = [], wp.zeros
+        solver = SimpleNamespace(
+            model=SimpleNamespace(device=device),
+            world_count=3,
+            pgs_warmstart_decay=0.5,
+            row_cfm=wp.zeros((3, 4), dtype=float, device=device),
+            _ink_sizes=None,
+        )
+        SolverFeatherPGS._allocate_tier_placeholders(solver)
+        allocated, zeros = [], wp.zeros
 
-                    def allocate(*args, allocated=allocated, zeros=zeros, **kwargs):
-                        array = zeros(*args, **kwargs)
-                        allocated.append(array.shape)
-                        return array
+        def allocate(*args, **kwargs):
+            array = zeros(*args, **kwargs)
+            allocated.append(array.shape)
+            return array
 
-                    with patch.object(wp, "zeros", allocate):
-                        ink = SolverFeatherPGS._inkernel_response_inputs(solver)
-                        rows = SolverFeatherPGS._world_rows_inputs(solver)
-                        again = SolverFeatherPGS._world_rows_inputs(solver)
-                state = warm and world_rows
-                # The warm-start table: count, two shape tables, points and impulses.
-                self.assertEqual(allocated, [(3,), (3, 64), (3, 64), (3, 64), (3, 64)] if state else [])
-                self.assertEqual(ink[0].shape, (4,))
-                self.assertTrue(all(array is solver._ink_dummy3 for array in ink[1:5]))
-                table = rows[-6:-1]
-                self.assertTrue(all(a is b for a, b in zip(table, again[-6:-1], strict=True)))
-                self.assertEqual([array.shape[0] for array in table], [3, 3, 3, 3, 3] if state else [1, 1, 1, 1, 1])
-                self.assertEqual(rows[-1], 0.5)
-                for value in rows[:-6]:
-                    if isinstance(value, wp.array):
-                        self.assertTrue(any(value is placeholder for placeholder in solver._wr_dummies.values()))
+        with patch.object(wp, "zeros", allocate):
+            ink = SolverFeatherPGS._inkernel_response_inputs(solver)
+            rows = SolverFeatherPGS._world_rows_inputs(solver)
+            again = SolverFeatherPGS._world_rows_inputs(solver)
+        self.assertEqual(allocated, [])
+        self.assertEqual(ink[0].shape, (4,))
+        self.assertTrue(all(array is solver._ink_dummy3 for array in ink[1:5]))
+        # The warm-start table's placeholders: count, two shape tables, points and impulses.
+        table = rows[-6:-1]
+        self.assertTrue(all(a is b for a, b in zip(table, again[-6:-1], strict=True)))
+        self.assertEqual([array.shape[0] for array in table], [1, 1, 1, 1, 1])
+        self.assertEqual(rows[-1], 0.5)
+        for value in rows[:-6]:
+            if isinstance(value, wp.array):
+                self.assertTrue(any(value is placeholder for placeholder in solver._wr_dummies.values()))
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "Parallel matrix-free tiers require CUDA")
@@ -121,9 +114,8 @@ class TestFeatherPGSCaptureAllocation(unittest.TestCase):
                 tiers = captured.solver._pgs_solve_mf_gs_incremental_kernels
                 self.assertTrue(tiers)
                 self.assertTrue(all(getattr(kernel, "_fpgs_extra_inputs", False) for kernel in tiers))
-                if name == "in_kernel_rows":
+                if name == "in_kernel_response":
                     self.assertIsNotNone(captured.solver._ink_sizes, "The in-kernel response must be admitted")
-                    self.assertTrue(captured.solver._world_rows, "In-sweep world rows must be admitted")
                 allocated, tier_inputs = [], []
                 zeros, launch_tiled = wp.zeros, wp.launch_tiled
 

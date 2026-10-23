@@ -165,8 +165,8 @@ def _vote_census():
     shape each, crossed with the factories' other options that rewrite their sweeps: the velocity-limit
     law of the sparse, matrix-free and incremental sweeps, the sparse sweep's triplet transaction and
     the matrix-free sweep's resident row metadata. The matrix-free sweep keeps the current friction law
-    without torsion or dense tiles, the variants that compile the velocity law; the census pins the
-    others' text unchanged.
+    without torsion, the variants that compile the velocity law; the census pins the others' text
+    unchanged.
     """
     laws = _axis("velocity_limit_law", VELOCITY_LIMIT_LAWS)
     local = (
@@ -212,7 +212,6 @@ def _vote_census():
             solver._get_pgs_solve_mf_gs_kernel.__wrapped__,
             (64, 32, 12, "120"),
             (
-                _axis("software_pipeline"),
                 _axis("shared_metadata"),
                 _axis("stream_mf_impulses"),
                 _axis("has_drive_rows"),
@@ -221,7 +220,6 @@ def _vote_census():
                 ({}, {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
                 _axis("factor_coordinates"),
                 _axis("skip_incremental_rows", (0, 32)),
-                _axis("skip_response_block"),
                 _axis("independent_components"),
                 _axis("resident_row_metadata"),
                 laws,
@@ -348,12 +346,6 @@ class TestSolvePolicy(unittest.TestCase):
         self.assertIn("const bool sweep_stop = open && done;", counted)
         self.assertIn("if (l == 0 && (sweep_stop || k + 1 == n))", counted)
         self.assertIn("solve_readout_sweeps(w, k + 1, sweep_stop);", counted)
-
-    def test_readout_rejects_unbound_or_tiled_matrix_free_variants(self):
-        """Refuse a readout where the matrix-free generator has no physical sweep exit to record."""
-        for options in ({"dense_support_tiles": True}, {"shared_arena": True}):
-            with self.subTest(options=options), self.assertRaisesRegex(ValueError, "readout"):
-                mf_gs_source.get_source(64, 32, 12, "120", solve_policy=SWEEPS, **options)
 
     def test_world_dispatch_requires_the_world_first(self):
         """Reject the world dispatches of generated kernels unless the native's first operand is the world."""
@@ -496,7 +488,7 @@ class TestVelocityExitLaw(unittest.TestCase):
             {
                 "sparse": 240,
                 "sparse_lanes": 32,
-                "mf_gs": 1344,
+                "mf_gs": 336,
                 "paired": 6,
                 "local": 48,
                 "packets": 48,
@@ -824,14 +816,11 @@ def _sweep_record(**fields):
             "free_body_matrix_free",
             "tiers",
             "local",
-            "multiblock",
             "dense",
             "propagation",
         )
     )
-    record.update(
-        route="matrix_free_gs", driver="direct", mf_gs="mf_gs_kernel", response_block=False, dense_tiles=False
-    )
+    record.update(route="matrix_free_gs", driver="direct", mf_gs="mf_gs_kernel")
     record.update(fields)
     return record
 
@@ -850,40 +839,6 @@ def _policy_solver(*, readout="sweeps", tolerance=0.0, declined=(), honored=(), 
 
 class TestSweepPolicyRecords(unittest.TestCase):
     """The readout and exit-law records of a route's sweeps and the warnings they raise."""
-
-    def test_records_name_the_dense_tile_kernels(self):
-        """Name the dense-tile kernels, built without a policy, as uncounted and ignoring the tolerance."""
-        solver = _policy_solver(
-            tolerance=1.0e-3,
-            honored=("mf_gs_kernel",),
-            _pgs_solve_mf_dense_tiles_kernel=SimpleNamespace(key="dense_tiles_kernel"),
-            _pgs_solve_mf_dense_tiles_staged_kernel=SimpleNamespace(key="dense_tiles_staged_kernel"),
-        )
-        record = _sweep_record(driver="multiblock", dense_tiles=True)
-        tiles = ["dense_tiles_kernel", "dense_tiles_staged_kernel"]
-        self.assertEqual(path_selection._readout(solver, record)["uncounted"], tiles)
-        self.assertEqual(path_selection._exit_law(solver, record)["ignored"], tiles)
-        self.assertEqual(path_selection._readout(solver, _sweep_record())["uncounted"], [])
-
-    def test_records_name_the_multiblock_kernels(self):
-        """Name the multi-block driver's free-body kernels as uncounted, ignoring the tolerance and owning rows.
-
-        Between the dense row-phase launches of the matrix-free sweep, the driver's color, tail or
-        mass-split kernels sweep every world's matrix-free rows without counters or an exit. The
-        record names them by the driver's flag, as it names the response-block sweeps.
-        """
-        solver = _policy_solver(tolerance=1.0e-3, honored=("mf_gs_kernel",))
-        for mode in ("colored", "mass_split"):
-            with self.subTest(mode=mode):
-                record = _sweep_record(driver="multiblock", multiblock=mode)
-                readout, law = path_selection._readout(solver, record), path_selection._exit_law(solver, record)
-                self.assertEqual(readout["uncounted"], ["multiblock"])
-                self.assertEqual(law["ignored"], ["multiblock"])
-                self.assertEqual(list(readout["uncounted_worlds"]), ["multiblock"])
-                self.assertIn("matrix-free rows", readout["uncounted_worlds"]["multiblock"])
-                messages = path_selection.policy_warnings({"readout": readout, "exit_law": law})
-                self.assertIn("'multiblock'", messages[0])
-                json.dumps({"readout": readout, "exit_law": law}, allow_nan=False)
 
     def test_declined_trace_is_recorded_and_warned_apart_from_the_law(self):
         """Record and warn a declined trace under the readout, and a declined tolerance under the exit law."""
@@ -918,7 +873,7 @@ class TestSweepPolicyRecords(unittest.TestCase):
         record = _sweep_record(driver="contact_then_internal")
         self.assertIn("once per launch", path_selection._readout(_policy_solver(), record)["reason"])
         self.assertIn("solves its worlds", path_selection._readout(_policy_solver(), _sweep_record())["reason"])
-        for driver in ("physx_grasp", "propagation_phases", "multiblock"):
+        for driver in ("physx_grasp", "propagation_phases"):
             with self.subTest(driver=driver):
                 reason = path_selection._readout(_policy_solver(), _sweep_record(driver=driver))["reason"]
                 self.assertIn("counts are per launch", reason)
@@ -927,12 +882,10 @@ class TestSweepPolicyRecords(unittest.TestCase):
     def test_records_name_the_worlds_no_counter_counts(self):
         """Name each owner that solves whole worlds without counters, and none where counted sweeps own every world.
 
-        The matrix-free sweep returns before its first sweep for the worlds the parallel tiers or the
-        response-block sweeps own, and the propagation sweeps solve the worlds whose rows are all
-        propagation rows. Those worlds hold rows, so the skip counter leaves them out too: without a
-        record their solves would vanish from the summary. The multi-block driver's dense tiles and
-        its color, tail and mass-split kernels own rows of every world. The incremental tiers count
-        their own worlds.
+        The matrix-free sweep returns before its first sweep for the worlds the parallel tiers own,
+        and the propagation sweeps solve the worlds whose rows are all propagation rows. Those
+        worlds hold rows, so the skip counter leaves them out too: without a record their solves
+        would vanish from the summary. The incremental tiers count their own worlds.
         """
         parallel = {"family": "parallel", "tiers": [{"rows": 32, "kernel": "tier32"}, {"rows": 48, "kernel": "tier48"}]}
         incremental = {"family": "incremental", "tiers": [{"kernel": "incremental_kernel"}]}
@@ -942,10 +895,7 @@ class TestSweepPolicyRecords(unittest.TestCase):
             ({"tiers": incremental}, []),
             ({"tiers": parallel}, ["parallel_tiers"]),
             ({"tiers": {**parallel, "family": "keyed_parallel"}}, ["parallel_tiers"]),
-            ({"response_block": True}, ["response_block"]),
             ({"propagation": propagation, "driver": "propagation_phases"}, ["propagation"]),
-            ({"multiblock": "colored", "driver": "multiblock"}, ["multiblock"]),
-            ({"multiblock": "colored", "dense_tiles": True, "driver": "multiblock"}, ["dense_tiles", "multiblock"]),
         ):
             with self.subTest(fields=sorted(fields)):
                 readout = path_selection._readout(_policy_solver(), _sweep_record(**fields))

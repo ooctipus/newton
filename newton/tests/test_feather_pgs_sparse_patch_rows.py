@@ -113,7 +113,7 @@ class TestFeatherPGSSparsePatchRows(unittest.TestCase):
                     self.assertEqual("sparse active rows" in friction["reason"], not policy)
                     # Linked triplets serve patch friction in either sweep: they are not among the
                     # record's point-only owners, and its route precedence names both sweeps.
-                    owners, routes = friction["reason"].split(" need point friction.")
+                    owners, _, routes = friction["reason"].rpartition(" need point friction.")
                     self.assertNotIn("triplets", owners)
                     self.assertIn("contact triplets", routes)
                     self.assertIn("in the linked active scan and in the full ordered sweep", routes)
@@ -196,7 +196,6 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
             "dense_max_constraints": 1884,
             "grouped_dynamics": False,
             "mf_gs_parallel_rows": 0,
-            "mf_gs_response_block_rows": 0,
         }
         patch_friction = SolverFeatherPGS(model, **options)
         point = SolverFeatherPGS(model, friction_anchor_beta=0.0, **options)

@@ -216,11 +216,7 @@ def _anchor_count(records):
 
 class TestMaskedPatchRowAdmission(unittest.TestCase):
     def _admit(self, **overrides):
-        solver = SimpleNamespace(
-            _point_contact_paths=False,
-            _patch_dense_paths=True,
-            _world_rows_owned_le=lambda: 0,
-        )
+        solver = SimpleNamespace(_point_contact_paths=False, _patch_dense_paths=True)
         flags = {"_CHECK_ROWS": False}
         for name, value in overrides.items():
             if name in flags:
@@ -231,14 +227,11 @@ class TestMaskedPatchRowAdmission(unittest.TestCase):
             return SolverFeatherPGS._masked_contact_rows(solver)
 
     def test_patch_takes_masked_rows_unless_an_experiment_or_the_flag_needs_point_rows(self):
-        """Patch friction takes masked rows; torsion, the point-only row check and deferred launches keep it off."""
+        """Patch friction takes masked rows; torsion and the point-only row check keep it off."""
         self.assertTrue(self._admit())
         self.assertTrue(self._admit(_point_contact_paths=True, _patch_dense_paths=False))
-        self.assertTrue(self._admit(_point_contact_paths=True, _world_rows_owned_le=lambda: 64))
         self.assertFalse(self._admit(_patch_dense_paths=False))
         self.assertFalse(self._admit(_CHECK_ROWS=True))
-        # In-kernel world rows defer masked launches past the patch link.
-        self.assertFalse(self._admit(_world_rows_owned_le=lambda: 64))
 
 
 class TestMaskedPatchRows(unittest.TestCase):

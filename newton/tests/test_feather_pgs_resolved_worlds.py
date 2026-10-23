@@ -573,7 +573,6 @@ def _admissible_solver():
         _patch_dense_paths=False,
         model=SimpleNamespace(requires_grad=False, device=SimpleNamespace(is_cuda=True)),
         max_world_dofs=29,
-        _world_rows_owned_le=lambda: 0,
         world_dof_indices=1,
         world_dof_count=1,
         body_response_dof_mask=1,

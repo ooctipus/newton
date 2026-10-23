@@ -19,7 +19,7 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _estimate_hinv_jt_shared_memory,
     _FeatherPGSExecutionPlan,
     _select_hinv_jt_chunk_size,
-    _use_resident_mfgs_metadata,
+    _select_mfgs_storage,
     _validate_dense_metadata_encoding,
 )
 from newton.solvers import SolverFeatherPGS
@@ -214,8 +214,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             "mf_gs_parallel_nesterov",
             "mf_gs_parallel_tol",
             "mf_gs_parallel_matrix_free",
-            "mf_gs_response_block_rows",
-            "mf_gs_response_block_lane_rows",
             "grouped_dynamics",
             "lazy_kinematics",
         ):
@@ -326,16 +324,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 pgs_mode="split",
                 enable_joint_velocity_limits=True,
             )
-
-        for pgs_kernel in ("tiled_contact", "streaming"):
-            with self.subTest(pgs_kernel=pgs_kernel):
-                with self.assertRaisesRegex(ValueError, "contact-only"):
-                    SolverFeatherPGS(
-                        model,
-                        pgs_mode="split",
-                        pgs_kernel=pgs_kernel,
-                        enable_joint_limits=True,
-                    )
 
     def test_default_kwargs_produce_identical_kernel_selection(self):
         model = _build_chain_model()
@@ -872,13 +860,22 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
 
     def test_mfgs_metadata_storage_respects_resource_budget(self):
         """Keep resident metadata only when its complete working set fits."""
-        compact = _use_resident_mfgs_metadata(192, 64, 29, 101376, has_drive_rows=False, fuse_vel_limits=False)
-        large = _use_resident_mfgs_metadata(1024, 4096, 604, 101376, has_drive_rows=False, fuse_vel_limits=False)
-        overcommitted = _use_resident_mfgs_metadata(192, 64, 29, 4096, has_drive_rows=False, fuse_vel_limits=False)
+        options = {"has_drive_rows": False, "fuse_vel_limits": False, "block_count": 16384, "sm_count": 188}
+        compact = _select_mfgs_storage(192, 64, 29, 101376, **options).shared_metadata
+        large = _select_mfgs_storage(1024, 4096, 604, 101376, **options).shared_metadata
+        overcommitted = _select_mfgs_storage(192, 64, 29, 4096, **options).shared_metadata
 
         self.assertTrue(compact)
         self.assertFalse(large)
         self.assertFalse(overcommitted)
+
+    def test_reset_diagnostic_logs_is_deprecated(self):
+        """Warn that reset_diagnostic_logs() will be removed, and still clear the pgs_debug logs."""
+        solver = SolverFeatherPGS(newton.ModelBuilder().finalize(device="cpu"))
+        solver._pgs_convergence_log.append([1.0])
+        with self.assertWarnsRegex(DeprecationWarning, "reset_diagnostic_logs"):
+            solver.reset_diagnostic_logs()
+        self.assertEqual((solver._pgs_convergence_log, solver._pgs_ncp_residual_log), ([], []))
 
     def test_serial_kernel_block_dim_validation(self):
         model = newton.ModelBuilder().finalize()
