@@ -74,7 +74,6 @@
   "kernels.clear_grouped_jacobian_active_rows": "f6eb6a39d0828b79900c5c3270485c70452272d1175531b589a53c2d0ed692f4",
   "kernels.clear_local_solve_diag": "be3904488fe6e6c9d7e9c6f18e72550b7b8d2a27218a813b169d2654b3e79f99",
   "kernels.clear_sparse_diagonal_response_prefix": "07f1f3a7bb6c70b547fb7258264081c8ad7282affeeacb8c830cc547d6dd4913",
-  "kernels.collect_propagation_units": "7978d981a80871c570a35a9f3e3469146752dddd2edb73455fecdc8e3e7d5357",
   "kernels.compact_local_pair_candidates": "ca308dd43002026e0dff0e37cfd3bd20cd861c3cd88ac88fe55cacc1757f207d",
   "kernels.compute_com_transforms": "10a82d03e9ad7d29aef27da97019cece181e199e505186e993fbefaeeda6d86a",
   "kernels.compute_compact_diagonal_inverse_mass": "ed12fe90fbb711e6776848cc950aa5eab4896ce4e87f2d51290af1d24f2d749a",
