@@ -1311,7 +1311,6 @@ def create_owner(solver):
             source._FPGS_CAPTURE,
             source._INK_ON,
             source._WR_ON,
-            source._GROUPED_CHECK,
             source._CHECK_ROWS,
             source._CHECK_ROWS_FUSED,
         )

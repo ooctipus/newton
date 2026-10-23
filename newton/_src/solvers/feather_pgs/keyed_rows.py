@@ -666,7 +666,6 @@ def create_owner(solver):
         and not source._INK_CHECK
         and not source._CHECK_ROWS
         and not source._CHECK_ROWS_FUSED
-        and not source._GROUPED_CHECK
         and not source._SHADOW_LEAN
         and not source._FPGS_CAPTURE
     )

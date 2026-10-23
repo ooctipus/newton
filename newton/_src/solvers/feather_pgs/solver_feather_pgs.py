@@ -305,7 +305,6 @@ _FPGS_CAPTURE_STEP = int(os.environ.get("FEATHER_PGS_CAPTURE_STEP", "-1"))
 _FPGS_CAPTURE_COUNT = int(os.environ.get("FEATHER_PGS_CAPTURE_COUNT", "1"))  # consecutive substeps to capture
 _FPGS_CAPTURE_PHASE = os.environ.get("FEATHER_PGS_CAPTURE_PHASE")  # None = any phase
 _FPGS_CAPTURE_DIR = os.environ.get("FEATHER_PGS_CAPTURE_DIR", "/tmp/fpgs_capture")
-_GROUPED_CHECK = os.environ.get("FEATHER_PGS_CHECK_GROUPED") == "1"
 _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
 # FEATHER_PGS_FUSED_PUBLISH=1 publishes each articulation of the general route
 # in one launch per size group (impulses, acceleration, integration,
@@ -3361,11 +3360,7 @@ class SolverFeatherPGS(SolverBase):
 
         self._compact_contact_boundary = False
         # The compact producer writes the point and the patch row law; torsion and compliance keep ordinary rows.
-        if (
-            self._law_agnostic_contact_paths
-            and _COMPACT_CONTACT_BOUNDARY
-            and not (_GROUPED_CHECK or _CHECK_ROWS or _CHECK_ROWS_FUSED)
-        ):
+        if self._law_agnostic_contact_paths and _COMPACT_CONTACT_BOUNDARY and not (_CHECK_ROWS or _CHECK_ROWS_FUSED):
             from .compact_contact import supported  # noqa: PLC0415
 
             self._compact_contact_boundary = supported(self)
@@ -7668,7 +7663,7 @@ class SolverFeatherPGS(SolverBase):
         self._paired_components = None
         if os.environ.get("FEATHER_PGS_PAIRED_COMPONENTS", "1") != "1":
             self._paired_components_reason = "FEATHER_PGS_PAIRED_COMPONENTS disables independent components."
-        elif _FPGS_CAPTURE or _GROUPED_CHECK or _INK_CHECK or _WR_CHECK:
+        elif _FPGS_CAPTURE or _INK_CHECK or _WR_CHECK:
             self._paired_components_reason = "Debug capture and comparison modes keep the coupled paired sweep."
         else:
             from .paired_components import PairedComponents  # noqa: PLC0415
@@ -8418,7 +8413,7 @@ class SolverFeatherPGS(SolverBase):
             and not self._mf_warmstart_enabled
             and not getattr(self, "_pgs_solve_mf_gs_incremental_kernels", ())
             and getattr(self, "_rb_build_kernel", None) is None
-            and not (_FPGS_CAPTURE or _GROUPED_CHECK or _INK_CHECK or _WR_CHECK or _FPGS_SYNC_TIMINGS)
+            and not (_FPGS_CAPTURE or _INK_CHECK or _WR_CHECK or _FPGS_SYNC_TIMINGS)
         )
         self._paired_general_solve_stream = wp.Stream(model.device) if paired_overlap else None
         self._paired_general_ready = wp.Event(model.device) if paired_overlap else None
@@ -15263,7 +15258,7 @@ class SolverFeatherPGS(SolverBase):
         outputs = [self.Y_by_size[size], J_world, Y_world]
         if size in self._hinv_jt_diag_sizes:
             outputs.append(self.diag_by_size[size])
-        # The grouped response solve is verified for <= 32 DOF only (43-DOF G1 diverged; see check mode).
+        # The grouped response solve is verified for <= 32 DOF only (43-DOF G1 diverged).
         if self._use_grouped_hinv_jt(size):
             key = ("hinv_jt", size)
             kern = self._grouped_kernels.get(key)
@@ -15280,8 +15275,6 @@ class SolverFeatherPGS(SolverBase):
                 )
                 self._grouped_kernels[key] = kern
             diag_out = self.diag_by_size[size] if size in self._hinv_jt_diag_sizes else self._grouped_dummy_diag
-            check = _GROUPED_CHECK
-            ref = [wp.clone(a) for a in outputs] if check else None
             wpb = 4
             wp.launch_tiled(
                 kern,
@@ -15306,30 +15299,6 @@ class SolverFeatherPGS(SolverBase):
                 block_dim=32 * wpb,
                 device=model.device,
             )
-            if check:
-                if hinv_jt_kernel is not None:
-                    wp.launch_tiled(
-                        hinv_jt_kernel,
-                        dim=[n_arts, self._hinv_jt_chunk_count_by_size[size]],
-                        inputs=[
-                            self.L_by_size[size],
-                            self.J_by_size[size],
-                            self.group_to_art[size],
-                            self.art_to_world,
-                            world_dof_offset,
-                            self.constraint_count,
-                        ],
-                        outputs=ref,
-                        block_dim=self.tile_threads,
-                        device=model.device,
-                    )
-                    _report_grouped_check(f"hinv_jt_{size}", outputs, ref)
-                else:
-                    # No tiled kernel for this size (free-body group): compare against the per-row kernel,
-                    # which writes the real arrays; the grouped results were snapshotted first.
-                    grouped_out = [wp.clone(a) for a in outputs]
-                    self._stage4_hinv_jt_par_row(size)
-                    _report_grouped_check(f"hinv_jt_{size}(vs par_row)", grouped_out, outputs)
             return
         if hinv_jt_kernel is None:
             raise RuntimeError(f"H^-1 J^T tiled kernel is unavailable for DOF size {size}")
@@ -17171,8 +17140,6 @@ class SolverFeatherPGS(SolverBase):
 
             self._prismatic_publication = PrismaticPublicationPlan.build(model, self.articulation_joint_end)
         if _PRISMATIC_LINEAR_STATE:
-            if _GROUPED_CHECK:
-                raise ValueError("prismatic linear state does not support materialized-inertia debug comparisons")
             from .prismatic_linear_state import configure_linear_state  # noqa: PLC0415
 
             configure_linear_state(self)

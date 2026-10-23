@@ -88,12 +88,6 @@ FLAGS = declare(
         "Step at which the kernel capture starts (default -1, none).",
     ),
     _flag(
-        "FEATHER_PGS_CHECK_GROUPED",
-        "diagnostic",
-        _SOLVER,
-        "=1 compares grouped kernels with the serial kernels on the host.",
-    ),
-    _flag(
         "FEATHER_PGS_CHECK_ROWS",
         "diagnostic",
         _SOLVER,
