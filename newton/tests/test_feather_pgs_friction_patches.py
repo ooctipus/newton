@@ -1438,22 +1438,19 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
 
         for lazy in (False, True):
             with self.subTest(lazy_kinematics=lazy):
-                # The ordinary arm takes the separate publication launches that the lazy arm forces.
-                with mock.patch.object(solver_module, "_FUSED_PUBLISH", False):
-                    solver = newton.solvers.SolverFeatherPGS(
-                        model,
-                        pgs_mode="matrix_free",
-                        pgs_iterations=8,
-                        enable_joint_limits=True,
-                        update_mass_matrix_interval=2,
-                        dense_max_constraints=256,
-                        grouped_dynamics=True,
-                        lazy_kinematics=lazy,
-                        cached_dynamics="off",
-                        sparse_mass_matrix="off",
-                        friction_anchor_beta=0.2,
-                    )
-                self.assertFalse(solver._fused_publication_admitted())
+                solver = newton.solvers.SolverFeatherPGS(
+                    model,
+                    pgs_mode="matrix_free",
+                    pgs_iterations=8,
+                    enable_joint_limits=True,
+                    update_mass_matrix_interval=2,
+                    dense_max_constraints=256,
+                    grouped_dynamics=True,
+                    lazy_kinematics=lazy,
+                    cached_dynamics="off",
+                    sparse_mass_matrix="off",
+                    friction_anchor_beta=0.2,
+                )
                 selected = solver.get_path_selection()
                 self.assertEqual(selected["publication"], "ordinary")
                 # Every substep publishes, so a lazy request applies nothing.

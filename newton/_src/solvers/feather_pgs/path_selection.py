@@ -247,7 +247,7 @@ def route_selection(solver) -> dict:
         "sparse_mass_matrix": _sparse_mass_matrix(solver),
         "sweep": _sweep(solver, source),
         "resolved_worlds": _resolved_worlds(solver),
-        "publication": _publication(solver, source),
+        "publication": _publication(solver),
         "velocity_limits": _velocity_limits(solver),
         "free_rigid_bodies": _free_rigid_bodies(solver),
         "friction": _friction(solver),
@@ -1147,24 +1147,15 @@ def _resolved_worlds(solver) -> dict:
     }
 
 
-def _publication(solver, source) -> dict:
-    fused = bool(solver._fused_publication)
+def _publication(solver) -> dict:
     if solver._tree_kinetic_state is not None:
         owner, reason = "cached", "The held-tree owner publishes next-step state."
-    elif fused:
-        owner, reason = "fused_general", "Each articulation publishes in one launch per size group."
-    elif not source._FUSED_PUBLISH:
-        owner, reason = "ordinary", "Separate launches; FEATHER_PGS_FUSED_PUBLISH is an import-time opt-in."
     else:
-        owner = "ordinary"
-        reason = (
-            "Fused publication declined: an owner, free body, velocity limit or loop joint needs separate launches."
-        )
+        owner, reason = "ordinary", "Separate launches integrate and publish the next state."
     cache = "in_place" if solver._fk_id_cache_enabled else "off"
     return {
         "owner": owner,
         "reason": reason,
-        "fused_general": fused,
         "fk_id_cache": cache,
         "prismatic_publication": solver._prismatic_publication is not None,
         "prismatic_linear_state": bool(solver._prismatic_linear_state),

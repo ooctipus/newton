@@ -166,12 +166,6 @@ FLAGS = declare(
         "=1 applies an implicit gyroscopic predictor correction to independent free bodies.",
     ),
     _flag(
-        "FEATHER_PGS_FUSED_PUBLISH",
-        "experiment",
-        _SOLVER,
-        "=1 publishes each general-route articulation in one launch per size group.",
-    ),
-    _flag(
         "FEATHER_PGS_G1_CHAIN_SCAN",
         "retired",
         ("environment_flags",),
