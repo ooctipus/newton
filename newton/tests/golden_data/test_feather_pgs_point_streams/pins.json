@@ -153,7 +153,6 @@
   "kernels.prepare_world_impulses": "287caaac4f8e7dcd1c4ce540a1265c7e94d9200b6415fce351c6bed9babdd83f",
   "kernels.prescale_joint_velocity_limits": "05936d0465024a7dafb04a7969c054c483806849ffef75388b60ceaca8863b9e",
   "kernels.propagate_tree_impulses_for_size": "6f7a5819ffc190e0ee99c5d16867083d2346747c4170088f2301c5428ac30388",
-  "kernels.refine_same_articulation_propagation_rows": "b636c1829a6edb0e5ad5641a06b5a22d134f1d33a86ff77e601e51acf0583e41",
   "kernels.refresh_masked_body_inertia": "03588bd11586264011f522a355f78f4560e0f9542dbf634cb6255c310efbc908",
   "kernels.refresh_propagation_free_body_qd_from_vout": "37d580970a46424c73e686a419bb898b8284b5035c3278ef5511eebcad4bf4b2",
   "kernels.refresh_propagation_tree_body_qd_for_size": "685ac7e9e74630c32d0dfc861146d8333e1482dfd9c8b1b95adf99c05a17f2ea",
