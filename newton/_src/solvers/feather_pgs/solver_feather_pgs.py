@@ -244,16 +244,6 @@ from .path_selection import (
     policy_warnings,
     route_selection,
 )
-from .response_block_sweep import (
-    RB_A_SLOT,
-    RB_NM,
-    RB_NV,
-    RB_STRIDE,
-    get_response_block_build_kernel,
-    get_response_block_sweep_lane_kernel,
-    get_response_block_sweep_warp_kernel,
-    list_count_slots,
-)
 from .row_build import (
     contact_row_prelude,
     contact_row_prelude_patch,
@@ -1404,8 +1394,6 @@ class SolverFeatherPGS(SolverBase):
         mf_gs_parallel_tol: float = 1e-4,
         mf_gs_parallel_matrix_free: bool = False,
         mf_gs_parallel_linked_velocity_limit_pass: bool = False,
-        mf_gs_response_block_rows: int = 0,
-        mf_gs_response_block_lane_rows: int = 16,
         velocity_limit_law: Literal["stateless", "accumulated"] = "stateless",
         contact_update: Literal["sequential", "unit"] = "sequential",
         grouped_dynamics: bool = False,
@@ -1822,15 +1810,6 @@ class SolverFeatherPGS(SolverBase):
                 onto its limit, in row order. It changes nothing once a tier converges and bounds the limit overshoot
                 of a tier its sweep budget stops early. Applies only with ``enable_joint_velocity_limits`` and
                 linked tiers. Experimental. Defaults to False.
-            mf_gs_response_block_rows (int, optional): Row budget of the response-block Gauss-Seidel
-                sweep on the matrix-free path. Worlds whose dense plus matrix-free row count is at most
-                this many rows are swept from a per-world response block ``J H^-1 J^T`` built once per
-                launch (lane-per-world for small worlds, warp-per-world above
-                ``mf_gs_response_block_lane_rows``); larger worlds keep the legacy sweep. Only 64 or 0
-                (disabled) are supported. Experimental: measured neutral on flat quadruped locomotion and
-                slower on dexterous manipulation at 16k worlds, so it is off by default. Defaults to 0.
-            mf_gs_response_block_lane_rows (int, optional): Row bound of the lane-per-world class of the
-                response-block sweep. Capped at 24. Defaults to 16.
             grouped_dynamics (bool, optional): Run forward kinematics and the inverse-dynamics backward
                 pass level-synchronously with a lane group per articulation instead of one serial thread
                 per articulation. Fusion and parallel reductions can change floating-point accumulation.
@@ -2528,9 +2507,6 @@ class SolverFeatherPGS(SolverBase):
         self.mf_gs_parallel_tol = float(mf_gs_parallel_tol)
         self.mf_gs_parallel_matrix_free = bool(mf_gs_parallel_matrix_free)
         self.mf_gs_parallel_linked_velocity_limit_pass = bool(mf_gs_parallel_linked_velocity_limit_pass)
-        # Response-block sweep budgets (see class docstring); 0 rows disables the path.
-        self.mf_gs_response_block_rows = int(mf_gs_response_block_rows)
-        self.mf_gs_response_block_lane_rows = int(mf_gs_response_block_lane_rows)
         self.grouped_dynamics = bool(grouped_dynamics)
         self.lazy_kinematics = bool(lazy_kinematics)
         self._grouped_topology = None
@@ -3585,7 +3561,6 @@ class SolverFeatherPGS(SolverBase):
                 or self.pgs_velocity_iterations != 0
                 or self.mf_gs_parallel_rows != 0
                 or self.mf_gs_incremental_rows != 0
-                or self.mf_gs_response_block_rows != 0
                 or self._pgs_solve_mf_gs_kernel is None
                 or self._local_internal_fast_path
                 or self._paired_factor_coordinates
@@ -5671,18 +5646,15 @@ class SolverFeatherPGS(SolverBase):
         ):
             self._sparse_selection_reason = "A legacy grouped, multiblock or free-body option retains ordinary factors."
             return
-        # A parallel tier or response block that serves the active friction law owns the
-        # ordinary buffers. Patch friction yields only to a parallel tier, which split mode
-        # never builds; point friction keeps its unconditional yield. The yield reserves the
-        # dense route, not the tier: a paired factor sweep admitted there later excludes the
-        # tiers, response blocks and keyed rows under both laws (_init_tiled_kernels, keyed_rows).
+        # A parallel tier that serves the active friction law owns the ordinary buffers.
+        # Patch friction yields only to a parallel tier, which split mode never builds;
+        # point friction keeps its unconditional yield. The yield reserves the dense route,
+        # not the tier: a paired factor sweep admitted there later excludes the tiers and
+        # keyed rows under both laws (_init_tiled_kernels, keyed_rows).
         parallel_tier = self.mf_gs_parallel_rows > 0 and (
             self._point_contact_paths or (self._parallel_contact_paths and self.pgs_mode == "matrix_free")
         )
-        if parallel_tier or (
-            self._point_contact_paths
-            and (self.mf_gs_response_block_rows > 0 or os.environ.get("FEATHER_PGS_SINGLE_FACTOR") == "1")
-        ):
+        if parallel_tier or (self._point_contact_paths and os.environ.get("FEATHER_PGS_SINGLE_FACTOR") == "1"):
             self._sparse_selection_reason = "A competing response or publication owner reserves the ordinary buffers."
             return
         if self._has_free_rigid_bodies and (self._point_contact_paths or self._patch_dense_paths):
@@ -7998,7 +7970,6 @@ class SolverFeatherPGS(SolverBase):
         self._world_rows = False
         # Row budget of the built incremental tiers (0 when none); recorded by get_path_selection().
         self._incremental_rows = 0
-        self._rb_build_kernel = None
         if self.grouped_dynamics and model.device.is_cuda and int(model.articulation_count) > 0:
             self._grouped_topology = GroupedTopology(
                 model, self.articulation_joint_end.numpy(), model.device, body_X_com=self.body_X_com
@@ -8059,7 +8030,7 @@ class SolverFeatherPGS(SolverBase):
                     max(int(model.body_count), 1), dtype=wp.spatial_vector, device=model.device
                 )
                 self._fused_k1_check = None
-        # World class written by the response-block build kernel (0 = legacy sweep owns the world).
+        # The sweep kernels keep an rb_class operand, which stays zero for every world.
         self._rb_class = wp.zeros(max(int(self.world_count), 1), dtype=wp.int32, device=model.device)
         if (
             self.pgs_mode == "matrix_free"
@@ -8096,21 +8067,11 @@ class SolverFeatherPGS(SolverBase):
                     force_stream_mf_impulses=force_stream_mf_impulses,
                 )
             self._mfgs_storage = storage
-            use_rb = (
-                self.mf_gs_response_block_rows > 0
-                and self._point_contact_paths
-                and self.friction_mode == "current"
-                and not self.fuse_joint_velocity_limits
-                and not self._paired_factor_coordinates
-            )
-            if use_rb and self.mf_gs_response_block_rows != 64:
-                raise ValueError("mf_gs_response_block_rows must be 64 or 0")
             incremental_rows = 0
             # The incremental kernel loads the whole row prefix and pools each
             # friction pair's ring of normal loads, so it serves patch friction.
             if (
-                not use_rb
-                and self.mf_gs_incremental_rows > 0
+                self.mf_gs_incremental_rows > 0
                 and self._law_agnostic_contact_paths
                 and self.friction_mode == "current"
                 and not self.fuse_joint_velocity_limits
@@ -8120,8 +8081,7 @@ class SolverFeatherPGS(SolverBase):
             parallel_rows = 0
             # The linked tiers pool each friction pair's cone over its patch ring.
             if (
-                not use_rb
-                and self.mf_gs_parallel_rows > 0
+                self.mf_gs_parallel_rows > 0
                 and self._parallel_contact_paths
                 and self.friction_mode == "current"
                 and not self.fuse_joint_velocity_limits
@@ -8153,12 +8113,9 @@ class SolverFeatherPGS(SolverBase):
                 contact_torsion=self._contact_torsion_enabled,
                 factor_coordinates=self._paired_factor_coordinates,
                 skip_incremental_rows=max(incremental_rows, parallel_rows),
-                skip_response_block=use_rb,
                 independent_components=self._paired_components is not None,
                 velocity_limit_law=self._velocity_limit_kernel_law(),
             )
-            if use_rb:
-                self._build_response_block_sweep(model, has_drive_rows)
             self._pgs_solve_mf_gs_incremental_kernels = []
             self._ink_sizes = self._build_inkernel_response_meta() if (parallel_rows > 0 and _INK_ON) else None
             self._ink_rows = int(parallel_rows)
@@ -8590,7 +8547,6 @@ class SolverFeatherPGS(SolverBase):
             and not self.pgs_debug
             and not self._mf_warmstart_enabled
             and not getattr(self, "_pgs_solve_mf_gs_incremental_kernels", ())
-            and getattr(self, "_rb_build_kernel", None) is None
             and not (
                 _FPGS_CAPTURE or _GROUPED_CHECK or _DEBUG_CACHE_CMP or _INK_CHECK or _WR_CHECK or _FPGS_SYNC_TIMINGS
             )
@@ -8849,49 +8805,6 @@ class SolverFeatherPGS(SolverBase):
                     self._local_residual_warps_per_block[size],
                 )
 
-    def _build_response_block_sweep(self, model, has_drive_rows: bool) -> None:
-        """Construct the response-block sweep kernels and their per-world blobs."""
-        device = model.device
-        world_count = int(self.world_count)
-        lane_rows = max(0, min(int(self.mf_gs_response_block_lane_rows), 24))
-        m_d, m_mf, dofs = int(self.dense_max_constraints), int(self.mf_max_constraints), int(self.max_world_dofs)
-        self._rb_lane_rows = lane_rows
-        self._rb_build_kernel = get_response_block_build_kernel(
-            m_d,
-            m_mf,
-            dofs,
-            lane_rows=lane_rows,
-            has_drive_rows=has_drive_rows,
-            skip_local_internal_worlds=self._local_internal_fast_path,
-        )
-        law = self._velocity_limit_kernel_law()
-        self._rb_sweep_lane_kernel = (
-            get_response_block_sweep_lane_kernel(
-                m_d, m_mf, dofs, lane_rows=lane_rows, has_drive_rows=has_drive_rows, velocity_limit_law=law
-            )
-            if lane_rows > 0
-            else None
-        )
-        self._rb_sweep_warp32_kernel = get_response_block_sweep_warp_kernel(
-            m_d, m_mf, dofs, rows=32, lane_rows=lane_rows, has_drive_rows=has_drive_rows, velocity_limit_law=law
-        )
-        self._rb_sweep_warp64_kernel = get_response_block_sweep_warp_kernel(
-            m_d, m_mf, dofs, rows=64, lane_rows=lane_rows, has_drive_rows=has_drive_rows, velocity_limit_law=law
-        )
-        slots = list_count_slots(lane_rows)
-        self._rb_counts = wp.zeros(slots, dtype=wp.int32, device=device)
-        self._rb_lists = wp.zeros(slots * world_count, dtype=wp.int32, device=device)
-        self._rb_A = wp.zeros(world_count * RB_A_SLOT, dtype=wp.float32, device=device)
-        self._rb_vec = wp.zeros(world_count * RB_NV * RB_STRIDE, dtype=wp.float32, device=device)
-        self._rb_meta = wp.zeros(world_count * RB_NM * RB_STRIDE, dtype=wp.int32, device=device)
-        sm_count = max(1, int(getattr(device, "sm_count", 1)))
-        # Persistent grids: eight resident warps per SM for the sweeps, four times that for the
-        # latency-bound build.
-        self._rb_sweep_blocks = min(world_count, 8 * sm_count)
-        self._rb_build_blocks = min(world_count, 32 * sm_count)
-        # The three sweep classes touch disjoint worlds and run on parallel streams.
-        self._rb_streams = (wp.Stream(device), wp.Stream(device)) if device.is_cuda else None
-
     def _k1_size_single_template(self, size: int) -> bool:
         """True when every articulation of this size group shares one kinematic template (per-block staging)."""
         cache = getattr(self, "_k1_single_template", None)
@@ -9123,134 +9036,6 @@ class SolverFeatherPGS(SolverBase):
             ]
             for nm, a, b in pairs:
                 _report_grouped_check(f"k1real:{nm}", [a], [b])
-
-    def _launch_response_block_sweep(
-        self,
-        dense_rhs,
-        mf_meta,
-        general_block_count: int,
-        use_general_queue: bool,
-        phase_iterations: int,
-        omega: float,
-        regularize: int,
-        row_phase: int,
-        friction_start_iteration: int,
-        phase_iteration_offset: int,
-        freeze_drive_rows: int,
-        defer_dense_response: int,
-    ) -> None:
-        """Build the per-world response blocks and sweep the claimed worlds (three classes)."""
-        device = self.model.device
-        world_count = int(self.world_count)
-        self._rb_counts.zero_()
-        wp.launch_tiled(
-            self._rb_build_kernel,
-            dim=[self._rb_build_blocks],
-            inputs=[
-                self._local_general_world_count,
-                self._local_general_worlds,
-                self._rb_build_blocks,
-                int(use_general_queue),
-                world_count,
-                self.constraint_count,
-                self._local_solve_owner,
-                self.world_dof_indices,
-                dense_rhs,
-                self.diag,
-                self.row_w,
-                self.impulses,
-                self.J_world,
-                self.Y_world,
-                self.row_type,
-                self.row_parent,
-                self.row_mu,
-                self.drive_target_vel_bias,
-                self.drive_vel_multiplier,
-                self.drive_impulse_multiplier,
-                self.drive_max_impulse,
-                self.mf_constraint_count,
-                self.mf_contact_rows_end,
-                mf_meta,
-                self.mf_impulses,
-                self.mf_J_a,
-                self.mf_J_b,
-                self.mf_MiJt_a,
-                self.mf_MiJt_b,
-                self.mf_row_mu,
-                self.mf_row_w,
-                int(regularize),
-                int(defer_dense_response),
-                self.v_out,
-                self._rb_class,
-                self._rb_counts,
-                self._rb_lists,
-                self._rb_A,
-                self._rb_vec,
-                self._rb_meta,
-            ],
-            outputs=[],
-            block_dim=32,
-            device=device,
-        )
-        tail = [
-            self.constraint_count,
-            self.mf_constraint_count,
-            self.mf_contact_rows_end,
-            self.dense_phase_bounds,
-            self.world_dof_indices,
-            self.Y_world,
-            self.mf_MiJt_a,
-            self.mf_MiJt_b,
-            self.impulses,
-            self.mf_impulses,
-            int(phase_iterations),
-            float(omega),
-            int(regularize),
-            int(row_phase),
-            int(friction_start_iteration),
-            int(phase_iteration_offset),
-            int(freeze_drive_rows),
-            self.v_out,
-        ]
-        blob = [self._rb_counts, self._rb_lists, self._rb_A, self._rb_vec, self._rb_meta]
-        main_stream = wp.get_stream(device)
-        side = self._rb_streams
-        done_events = []
-        if side is not None:
-            ready = main_stream.record_event()
-            for stream, kernel in zip(side, (self._rb_sweep_warp32_kernel, self._rb_sweep_warp64_kernel), strict=False):
-                stream.wait_event(ready)
-                with wp.ScopedStream(stream, sync_enter=False):
-                    wp.launch_tiled(
-                        kernel,
-                        dim=[self._rb_sweep_blocks],
-                        inputs=[world_count, self._rb_sweep_blocks, *blob, *tail],
-                        outputs=[],
-                        block_dim=32,
-                        device=device,
-                    )
-                done_events.append(stream.record_event())
-        else:
-            for kernel in (self._rb_sweep_warp32_kernel, self._rb_sweep_warp64_kernel):
-                wp.launch_tiled(
-                    kernel,
-                    dim=[self._rb_sweep_blocks],
-                    inputs=[world_count, self._rb_sweep_blocks, *blob, *tail],
-                    outputs=[],
-                    block_dim=32,
-                    device=device,
-                )
-        if self._rb_sweep_lane_kernel is not None:
-            wp.launch_tiled(
-                self._rb_sweep_lane_kernel,
-                dim=[(world_count + 31) // 32],
-                inputs=[world_count, *blob, *tail],
-                outputs=[],
-                block_dim=32,
-                device=device,
-            )
-        for event in done_events:
-            main_stream.wait_event(event)
 
     def _launch_matrix_free_gs_solve(
         self,
@@ -9657,23 +9442,6 @@ class SolverFeatherPGS(SolverBase):
                     int(freeze_drive_rows),
                     int(defer_dense_response),
                 ]
-                if getattr(self, "_rb_build_kernel", None) is not None:
-                    # Response-block sweep for worlds within its row budget; the legacy kernel
-                    # returns early for the worlds it claimed (rb_class != 0).
-                    self._launch_response_block_sweep(
-                        dense_rhs,
-                        mf_meta,
-                        general_block_count,
-                        use_general_queue,
-                        phase_iterations,
-                        omega,
-                        int(self._regularization_enabled and not soft_relax),
-                        row_phase,
-                        friction_start_iteration,
-                        phase_iteration_offset,
-                        freeze_drive_rows,
-                        defer_dense_response,
-                    )
                 # The incremental kernel owns worlds with only dense rows inside its row
                 # budget; the legacy kernel returns early for those and solves the rest.
                 ink_ref = (
@@ -27870,7 +27638,6 @@ def _get_pgs_solve_mf_gs_kernel(
     contact_torsion: bool = False,
     factor_coordinates: bool = False,
     skip_incremental_rows: int = 0,
-    skip_response_block: bool = False,
     independent_components: bool = False,
     dense_support_tiles: bool = False,
     stage_velocities: bool = False,
@@ -27954,7 +27721,6 @@ def _get_pgs_solve_mf_gs_kernel(
         contact_torsion=contact_torsion,
         factor_coordinates=factor_coordinates,
         skip_incremental_rows=skip_incremental_rows,
-        skip_response_block=skip_response_block,
         independent_components=independent_components,
         dense_support_tiles=dense_support_tiles,
         stage_velocities=stage_velocities,
@@ -28149,8 +27915,6 @@ def _get_pgs_solve_mf_gs_kernel(
         name += "_factor"
     if skip_incremental_rows > 0:
         name += f"_skipinc{int(skip_incremental_rows)}"
-    if skip_response_block:
-        name += "_rb"
     if independent_components:
         name += "_components"
     if dense_support_tiles:

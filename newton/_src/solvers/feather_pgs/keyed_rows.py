@@ -640,7 +640,6 @@ def create_owner(solver):
         and solver.enable_joint_limits
         and 0 < solver.mf_gs_parallel_rows <= 128
         and solver.mf_gs_parallel_matrix_free
-        and solver.mf_gs_response_block_rows == 0
         and solver.dense_max_constraints >= solver.mf_gs_parallel_rows
         and solver.mf_gs_parallel_sweeps > 0
         and solver.pgs_iterations > 0

@@ -202,7 +202,6 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
             "dense_max_constraints": 1884,
             "grouped_dynamics": False,
             "mf_gs_parallel_rows": 0,
-            "mf_gs_response_block_rows": 0,
         }
         patch_friction = SolverFeatherPGS(model, **options)
         point = SolverFeatherPGS(model, friction_anchor_beta=0.0, **options)

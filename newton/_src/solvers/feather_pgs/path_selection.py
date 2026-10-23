@@ -126,10 +126,6 @@ def _streams_created(solver) -> bool:
     return any(stream is not None for stream in streams)
 
 
-def _response_block_rows(solver, rows) -> int:
-    return int(rows) if solver._rb_build_kernel is not None else 0
-
-
 def _linked_tier_sweeps(solver) -> int:
     if solver._ink_rows <= 0:
         return 0
@@ -149,8 +145,6 @@ _EFFECTIVE = {
     "mf_gs_parallel_rows": lambda solver: int(solver._ink_rows),
     "mf_gs_parallel_matrix_free": lambda solver: bool(solver.mf_gs_parallel_matrix_free and solver._ink_rows > 0),
     "mf_gs_incremental_rows": lambda solver: int(solver._incremental_rows),
-    "mf_gs_response_block_rows": lambda solver: _response_block_rows(solver, solver.mf_gs_response_block_rows),
-    "mf_gs_response_block_lane_rows": lambda solver: _response_block_rows(solver, getattr(solver, "_rb_lane_rows", 0)),
     "use_parallel_streams": _streams_created,
     "propagation_cached_response": lambda solver: bool(solver._propagation_cached_response_active),
     "mf_gs_parallel_linked_velocity_limit_pass": lambda solver: bool(
@@ -704,7 +698,7 @@ def _sweep(solver, source) -> dict:
         route, reason = "sparse_diagonal", "The diagonal-mass contact owner owns the sweep."
     else:
         route = "matrix_free_gs"
-        reason = "Matrix-free Gauss-Seidel; local, paired, tiered and response-block owners claim their worlds first."
+        reason = "Matrix-free Gauss-Seidel; local, paired and tiered owners claim their worlds first."
     # What drives the route's sweep each solve: mirrors the stage-6 branches of step(),
     # _launch_matrix_free_position_solve and the schedule branches of _launch_matrix_free_gs_solve.
     if dense_split and solver._has_mixed_contacts:
@@ -820,7 +814,6 @@ def _sweep(solver, source) -> dict:
         "mf_gs": _key(solver._pgs_solve_mf_gs_kernel),
         "mf_gs_storage": _mf_gs_storage(solver),
         "tiers": _tiers(solver),
-        "response_block": solver._rb_build_kernel is not None,
         "local": local,
         "multiblock": None if multiblock is None else multiblock.mode,
         "dense_tiles": solver._mf_dense_support is not None,
@@ -854,7 +847,7 @@ def _sweep_kernels(solver, record) -> set:
 
 def _flagged_owners(record) -> list[str]:
     """Owners of sweeps without counters or exit that a sweep record names by a flag, not by kernel keys."""
-    return [name for name in ("response_block", "multiblock") if record[name]]
+    return [name for name in ("multiblock",) if record[name]]
 
 
 def _uncounted_worlds(record) -> dict:
@@ -874,11 +867,6 @@ def _uncounted_worlds(record) -> dict:
             f"Worlds without matrix-free rows and with 1 to {rows} dense rows that no local owner claims: the "
             "parallel (Jacobi) tiers solve them under their own sweep budget and mf_gs_parallel_tol, and the "
             "matrix-free sweep returns before its first sweep."
-        )
-    if record["response_block"]:
-        owners["response_block"] = (
-            "Worlds the response-block build claims: the response-block sweeps solve them, and the matrix-free "
-            "sweep returns before its first sweep."
         )
     if record["dense_tiles"]:
         owners["dense_tiles"] = (

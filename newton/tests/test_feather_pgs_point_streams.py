@@ -414,12 +414,6 @@ def _sparse_contact_calls():
 
 def _solver_factory_calls():
     from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
-    from newton._src.solvers.feather_pgs.response_block_sweep import (  # noqa: PLC0415
-        get_response_block_sweep_lane_kernel as rb_lane,
-    )
-    from newton._src.solvers.feather_pgs.response_block_sweep import (  # noqa: PLC0415
-        get_response_block_sweep_warp_kernel as rb_warp,
-    )
 
     name = "solver_feather_pgs."
     for triples, batches in itertools.product((False, True), repeat=2):
@@ -504,21 +498,13 @@ def _solver_factory_calls():
         }
         factory = solver._get_pgs_solve_mf_gs_incremental_kernel.__wrapped__
         yield name + "_get_pgs_solve_mf_gs_incremental_kernel", factory, (64, 32, 12, _ARCH), kwargs
-    # The propagation full-iteration kernel and the response-block sweeps, under either law.
+    # The propagation full-iteration kernel, under either law.
     for fused, accumulated in itertools.product((False, True), repeat=2):
         kwargs = {"worlds_per_block": 1, "fuse_vel_limits": fused}
         if accumulated:
             kwargs["velocity_limit_law"] = "accumulated"
         factory = solver._get_pgs_solve_propagation_full_iteration_kernel.__wrapped__
         yield name + "_get_pgs_solve_propagation_full_iteration_kernel", factory, (64, 32, 18, 48, 8, 18, _ARCH), kwargs
-    for rows, accumulated in itertools.product((0, 32, 64), (False, True)):
-        law = {"velocity_limit_law": "accumulated"} if accumulated else {}
-        if rows:
-            kwargs = {"rows": rows, "lane_rows": 16, "has_drive_rows": False, **law}
-            yield "response_block_sweep.get_response_block_sweep_warp_kernel", rb_warp, (64, 32, 18), kwargs
-        else:
-            kwargs = {"lane_rows": 16, "has_drive_rows": False, **law}
-            yield "response_block_sweep.get_response_block_sweep_lane_kernel", rb_lane, (64, 32, 18), kwargs
     for triples, components in itertools.product((False, True), repeat=2):
         factory = solver._get_pgs_solve_paired_factor_kernel.__wrapped__
         yield name + "_get_pgs_solve_paired_factor_kernel", factory, (192, 29, 23, 6, _ARCH, triples, components), {}
@@ -580,10 +566,10 @@ def _spliced_sweep_calls():
 
     Local owners, plain and over packet rows: a contactless subwarp articulation,
     an articulation pair and the pair's residual with matrix-free rows. Then the
-    tiled-row sweep with and without row budgets, the legacy matrix-free sweep,
-    the four propagation sweeps and the response-block sweeps.
+    tiled-row sweep with and without row budgets, the legacy matrix-free sweep
+    and the four propagation sweeps.
     """
-    from newton._src.solvers.feather_pgs import response_block_sweep, row_packets  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs import row_packets  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.kernels import PROPAGATION_COLOR_TAIL  # noqa: PLC0415
 
@@ -621,14 +607,6 @@ def _spliced_sweep_calls():
     for fuse in (False, True):
         kwargs = {"worlds_per_block": 1, "fuse_vel_limits": fuse}
         yield name + "_get_pgs_solve_propagation_full_iteration_kernel", factory, shape, kwargs
-    name = "response_block_sweep."
-    for drives in (False, True):
-        kwargs = {"lane_rows": 16, "has_drive_rows": drives}
-        factory = response_block_sweep.get_response_block_sweep_lane_kernel
-        yield name + "get_response_block_sweep_lane_kernel", factory, (192, 64, 22), kwargs
-        for rows in (32, 64):
-            factory = response_block_sweep.get_response_block_sweep_warp_kernel
-            yield name + "get_response_block_sweep_warp_kernel", factory, (192, 64, 22), {**kwargs, "rows": rows}
 
 
 def _suite_shape_calls():
@@ -892,8 +870,6 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
             "solver_feather_pgs._get_pgs_solve_parallel_kernel",
             "solver_feather_pgs._get_pgs_solve_paired_factor_kernel",
             "solver_feather_pgs._get_pgs_solve_propagation_full_iteration_kernel",
-            "response_block_sweep.get_response_block_sweep_lane_kernel",
-            "response_block_sweep.get_response_block_sweep_warp_kernel",
             "keyed_rows.get_fallback_kernel",
             "keyed_rows.get_parallel_factory",
             "kernels.allocate_world_contact_slots",
@@ -926,8 +902,6 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
                 "solver_feather_pgs._get_pgs_solve_mf_gs_kernel",
                 "solver_feather_pgs._get_pgs_solve_mf_gs_incremental_kernel",
                 "solver_feather_pgs._get_pgs_solve_propagation_full_iteration_kernel",
-                "response_block_sweep.get_response_block_sweep_lane_kernel",
-                "response_block_sweep.get_response_block_sweep_warp_kernel",
             },
         )
         # The MF-GS kernels that keep row metadata resident are pinned under both laws.
@@ -955,8 +929,6 @@ class TestFeatherPGSPointStreams(unittest.TestCase):
             "solver_feather_pgs._get_pgs_solve_propagation_colored_block_kernel",
             "solver_feather_pgs._get_pgs_solve_propagation_contact_kernel",
             "solver_feather_pgs._get_pgs_solve_propagation_full_iteration_kernel",
-            "response_block_sweep.get_response_block_sweep_lane_kernel",
-            "response_block_sweep.get_response_block_sweep_warp_kernel",
         ):
             with self.subTest(family=family):
                 self.assertIn(family, families)

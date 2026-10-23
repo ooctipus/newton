@@ -217,8 +217,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             "mf_gs_parallel_nesterov",
             "mf_gs_parallel_tol",
             "mf_gs_parallel_matrix_free",
-            "mf_gs_response_block_rows",
-            "mf_gs_response_block_lane_rows",
             "grouped_dynamics",
             "lazy_kinematics",
         ):

@@ -59,7 +59,6 @@ def get_source(
     contact_torsion: bool = False,
     factor_coordinates: bool = False,
     skip_incremental_rows: int = 0,
-    skip_response_block: bool = False,
     independent_components: bool = False,
     dense_support_tiles: bool = False,
     stage_velocities: bool = False,
@@ -99,7 +98,6 @@ def get_source(
         or independent_components
         or skip_local_internal_worlds
         or skip_incremental_rows
-        or skip_response_block
         or contact_torsion
         or local_internal_max_constraints
     ):
@@ -144,7 +142,6 @@ def get_source(
             contact_torsion,
             factor_coordinates,
             skip_incremental_rows,
-            skip_response_block,
             dense_support_tiles,
             stage_velocities,
         ) != (
@@ -163,7 +160,6 @@ def get_source(
             False,
             True,
             0,
-            False,
             False,
             False,
         ):
@@ -273,11 +269,6 @@ def get_source(
         # solved by _get_pgs_solve_mf_gs_incremental_kernel in the same launch pair.
         local_internal_skip += f"""
     if (m_mf == 0 && m_dense <= {int(skip_incremental_rows)} && defer_dense_response == 0) return;"""
-    if skip_response_block:
-        # Worlds claimed by the response-block build kernel (rb_class != 0) are solved by the
-        # response-block sweep kernels launched before this one.
-        local_internal_skip += """
-    if (rb_class.data[world] != 0) return;"""
     # How many DOF elements each lane handles (ceil(D/32))
     ELEMS_PER_LANE = (D + 31) // 32
 

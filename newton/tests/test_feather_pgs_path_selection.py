@@ -319,7 +319,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(
             options["mf_gs_incremental_rows"], {"applied": 0, "requested": 32, "default": 32, "source": "default"}
         )
-        self.assertEqual(options["mf_gs_response_block_lane_rows"]["applied"], 0)
         for name in ("use_parallel_streams", "propagation_cached_response"):
             self.assertEqual(options[name], {"applied": False, "requested": True, "default": True, "source": "default"})
         solver = SolverFeatherPGS(
@@ -1131,7 +1130,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 {"sparse_mass_matrix": "off", "mf_gs_parallel_rows": 48, "friction_anchor_beta": 0.0},
                 {"free_count": 2},
             ),
-            ({"sparse_mass_matrix": "off", "mf_gs_response_block_rows": 64, "friction_anchor_beta": 0.0}, {}),
             ({"articulated_contact_response": "propagation"}, {"free_count": 2}),
             ({"articulated_contact_response": "propagation-colored"}, {"free_count": 2}),
             ({"grouped_dynamics": True}, {}),

@@ -52,7 +52,6 @@ _STREAMED_OPTIONS = (
     {"friction_mode": "coulomb_newton"},
     {"stream_mf_impulses": True},
     {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19},
-    {"skip_response_block": True},
     {
         "has_dense_velocity_limit_rows": False,
         "factor_coordinates": True,

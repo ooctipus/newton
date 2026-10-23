@@ -222,7 +222,6 @@ def _vote_census():
                 ({}, {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19}),
                 _axis("factor_coordinates"),
                 _axis("skip_incremental_rows", (0, 32)),
-                _axis("skip_response_block"),
                 _axis("independent_components"),
                 _axis("resident_row_metadata"),
                 laws,
@@ -497,7 +496,7 @@ class TestVelocityExitLaw(unittest.TestCase):
             {
                 "sparse": 288,
                 "sparse_lanes": 32,
-                "mf_gs": 1344,
+                "mf_gs": 672,
                 "paired": 6,
                 "local": 48,
                 "packets": 48,
@@ -830,9 +829,7 @@ def _sweep_record(**fields):
             "propagation",
         )
     )
-    record.update(
-        route="matrix_free_gs", driver="direct", mf_gs="mf_gs_kernel", response_block=False, dense_tiles=False
-    )
+    record.update(route="matrix_free_gs", driver="direct", mf_gs="mf_gs_kernel", dense_tiles=False)
     record.update(fields)
     return record
 
@@ -871,7 +868,7 @@ class TestSweepPolicyRecords(unittest.TestCase):
 
         Between the dense row-phase launches of the matrix-free sweep, the driver's color, tail or
         mass-split kernels sweep every world's matrix-free rows without counters or an exit. The
-        record names them by the driver's flag, as it names the response-block sweeps.
+        record names them by the driver's flag.
         """
         solver = _policy_solver(tolerance=1.0e-3, honored=("mf_gs_kernel",))
         for mode in ("colored", "mass_split"):
@@ -928,12 +925,11 @@ class TestSweepPolicyRecords(unittest.TestCase):
     def test_records_name_the_worlds_no_counter_counts(self):
         """Name each owner that solves whole worlds without counters, and none where counted sweeps own every world.
 
-        The matrix-free sweep returns before its first sweep for the worlds the parallel tiers or the
-        response-block sweeps own, and the propagation sweeps solve the worlds whose rows are all
-        propagation rows. Those worlds hold rows, so the skip counter leaves them out too: without a
-        record their solves would vanish from the summary. The multi-block driver's dense tiles and
-        its color, tail and mass-split kernels own rows of every world. The incremental tiers count
-        their own worlds.
+        The matrix-free sweep returns before its first sweep for the worlds the parallel tiers own,
+        and the propagation sweeps solve the worlds whose rows are all propagation rows. Those
+        worlds hold rows, so the skip counter leaves them out too: without a record their solves
+        would vanish from the summary. The multi-block driver's dense tiles and its color, tail and
+        mass-split kernels own rows of every world. The incremental tiers count their own worlds.
         """
         parallel = {"family": "parallel", "tiers": [{"rows": 32, "kernel": "tier32"}, {"rows": 48, "kernel": "tier48"}]}
         incremental = {"family": "incremental", "tiers": [{"kernel": "incremental_kernel"}]}
@@ -943,7 +939,6 @@ class TestSweepPolicyRecords(unittest.TestCase):
             ({"tiers": incremental}, []),
             ({"tiers": parallel}, ["parallel_tiers"]),
             ({"tiers": {**parallel, "family": "keyed_parallel"}}, ["parallel_tiers"]),
-            ({"response_block": True}, ["response_block"]),
             ({"propagation": propagation, "driver": "propagation_phases"}, ["propagation"]),
             ({"multiblock": "colored", "driver": "multiblock"}, ["multiblock"]),
             ({"multiblock": "colored", "dense_tiles": True, "driver": "multiblock"}, ["dense_tiles", "multiblock"]),

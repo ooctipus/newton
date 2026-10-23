@@ -169,7 +169,6 @@ class TestAllegroKineticLifecycleCPU(unittest.TestCase):
         with mode(True), patch.object(rows, "KeyedRows", return_value=sentinel):
             self.assertIs(rows.create_owner(admitted), sentinel)
             for name, value in (
-                ("mf_gs_response_block_rows", 32),
                 ("dense_max_constraints", 99),
                 ("pgs_warmstart", True),
                 ("articulated_contact_response", "propagation"),
