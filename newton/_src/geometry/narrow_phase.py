@@ -507,6 +507,7 @@ def create_narrow_phase_primitive_kernel(
         shape_flags: wp.array[wp.int32],
         shape_sdf_index: wp.array[wp.int32],
         shape_edge_range: wp.array[wp.vec2i],
+        terrain_law_partner: wp.array[wp.int32],
         writer_data: Any,
         total_num_threads: int,
         # Output: pairs that need GJK/MPR processing
@@ -619,6 +620,10 @@ def create_narrow_phase_primitive_kernel(
                     hf_pair = wp.vec2i(shape_a, shape_b)
                 else:
                     hf_pair = wp.vec2i(shape_b, shape_a)
+                # The terrain law writes the contacts of its partners' heightfield pairs.
+                if terrain_law_partner.shape[0] > 0:
+                    if terrain_law_partner[hf_pair[1]] != 0:
+                        continue
                 idx = wp.atomic_add(shape_pairs_mesh_count, 0, 1)
                 if idx < shape_pairs_mesh.shape[0]:
                     shape_pairs_mesh[idx] = hf_pair
@@ -3150,6 +3155,8 @@ class NarrowPhase:
             self.empty_tangent = None
             self._empty_sort_key = wp.zeros(0, dtype=wp.int64, device=device)
             self._empty_vec3 = wp.zeros(0, dtype=wp.vec3, device=device)
+            # Per shape, nonzero for a partner whose heightfield pairs the terrain law writes (empty: none).
+            self._terrain_law_partner = wp.zeros(0, dtype=wp.int32, device=device)
             det_capacity = contact_max if contact_max is not None else max_candidate_pairs
             if deterministic:
                 self._sort_key_array = wp.zeros(det_capacity, dtype=wp.int64, device=device)
@@ -3473,6 +3480,7 @@ class NarrowPhase:
                 shape_flags,
                 shape_sdf_index,
                 shape_edge_range,
+                self._terrain_law_partner,
                 writer_data,
                 self.total_num_threads,
             ],
@@ -4343,8 +4351,9 @@ class NarrowPhase:
         solid class's job lists or candidate pool had no room for a pair's
         work, see ``NEWTON_TERRAIN_LAW_SHADOW_JOBS``: the pair's rows are
         unchanged, taken by a slower path) are set by the terrain law's
-        kernels, which today run only in shadow (``NEWTON_TERRAIN_LAW_SHADOW``),
-        beside the terrain route.
+        kernels, which run in shadow beside the terrain route
+        (``NEWTON_TERRAIN_LAW_SHADOW``) or write their partners' contacts
+        (``NEWTON_TERRAIN_LAW``; the ``contacts`` bit then also covers them).
         """
         if not self.verify_buffers:
             raise RuntimeError("Narrow-phase capacity status requires verify_buffers=True throughout the run")
@@ -4377,6 +4386,22 @@ class NarrowPhase:
             if self._heightfield_pair_csr:
                 self._pair_csr.status.zero_()
         return result
+
+    def set_terrain_law_partners(self, partner: wp.array | None) -> None:
+        """Leave the heightfield pairs of some partner shapes to the terrain law, which writes their contacts.
+
+        Set outside graph capture, before the first capture: a captured collide keeps the array it launched with.
+
+        Args:
+            partner: Per shape, nonzero for a partner whose heightfield pairs the primitive kernel drops instead of
+                routing them to the terrain route (int32, one entry per shape); ``None`` routes every pair.
+        """
+        if partner is None:
+            self._terrain_law_partner = wp.zeros(0, dtype=wp.int32, device=self.device)
+            return
+        if partner.dtype != wp.int32 or partner.ndim != 1:
+            raise ValueError("The terrain law's partner mask must be a one-dimensional int32 array")
+        self._terrain_law_partner = partner
 
     def check_buffer_capacity(self) -> None:
         """Raise at a safe host boundary if any narrow-phase verification flag is set.

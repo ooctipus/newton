@@ -129,8 +129,9 @@ def solid_kernel_band(hf: ref.ReferenceHeightfield, core, reach: float) -> float
     return TERRAIN_EPS_FACTOR * TERRAIN_EPS32 * max(extent, TERRAIN_EPS_MIN_EXTENT)
 
 
-def law_rows(hf: ref.ReferenceHeightfield, kind, dims, pose, *, reach=REACH, row_limit=None):
-    """The float64 law's rows of a solid pair, its plane groups at the float32 finish's offset (four kernel bands)."""
+def law_rows(hf: ref.ReferenceHeightfield, kind, dims, pose, *, reach=REACH, row_limit=None, rule_x=True):
+    """The float64 law's rows of a solid pair, its plane groups at the float32 finish's offset (four kernel bands); its
+    rule X row only with ``rule_x``."""
     core = ref.make_core(kind, dims, pose)
     lo, hi = core.aabb()
     box = hf.cells_in_box(lo[:2] - reach, hi[:2] + reach)
@@ -140,7 +141,8 @@ def law_rows(hf: ref.ReferenceHeightfield, kind, dims, pose, *, reach=REACH, row
     raw = ref.solid_law(hf, core, reach, window)
     if not raw:
         raw = ref._solid_recovery(hf, core)
-    raw = raw + ref.exit_rule(hf, core, reach, window, raw)
+    if rule_x:
+        raw = raw + ref.exit_rule(hf, core, reach, window, raw)
     return ref.finish(raw, row_limit=row_limit, group_offset=4.0 * solid_kernel_band(hf, core, reach))
 
 

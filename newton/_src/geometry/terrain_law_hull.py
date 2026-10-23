@@ -8,13 +8,16 @@ The kernels are :func:`~newton._src.geometry.terrain_law_solid.solid_kernels`'s 
 :func:`terrain_hull_rows` (the whole-pair rejects, one thread per pair), the scan :func:`terrain_hull_rows_scan`, the
 job kernels :func:`terrain_hull_rows_faces`, :func:`terrain_hull_rows_edges`, :func:`terrain_hull_rows_thetas`,
 :func:`terrain_hull_rows_creases` and :func:`terrain_hull_rows_vertices` (one thread per listed feature), the close
-:func:`terrain_hull_rows_close` and rule R's :func:`terrain_hull_rows_recovery`, rule X's
-:func:`terrain_hull_rows_xitems`, :func:`terrain_hull_rows_xvalleys`, :func:`terrain_hull_rows_xdescents`,
-:func:`terrain_hull_rows_exit` and the finish kernel :func:`terrain_hull_rows_finish`, and last the pairs the others
-deferred: :func:`terrain_hull_rows_pooled` finishes those with more distinct rows than the class's 24 walk slots from
-their pooled candidates, :func:`terrain_hull_rows_full` walks those whose work found no room. The walk, the rules and
-the finish are :mod:`~newton._src.geometry.terrain_law_solid`'s; the module is compiled without floating-point
-contraction, so the CPU decides every boundary as the GPU does.
+:func:`terrain_hull_rows_close` and rule R's :func:`terrain_hull_rows_recovery`, rule X's gate
+:func:`terrain_hull_rows_xbound`, :func:`terrain_hull_rows_xitems`, :func:`terrain_hull_rows_xvalleys`,
+:func:`terrain_hull_rows_xdescents` and :func:`terrain_hull_rows_exit`, the finish kernels
+:func:`terrain_hull_rows_small` (one thread per pair with a plane group of three) and :func:`terrain_hull_rows_finish`
+(a block of lanes per pair of :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LANE_ROWS` rows, which no
+walking pair holds: not launched), and last the pairs the others deferred: :func:`terrain_hull_rows_pooled` finishes
+those with more distinct rows than the class's 24 walk slots from their pooled candidates,
+:func:`terrain_hull_rows_full` walks those whose work found no room. The walk, the rules and the finish are
+:mod:`~newton._src.geometry.terrain_law_solid`'s; the module is compiled without floating-point contraction, so the CPU
+decides every boundary as the GPU does.
 """
 
 from __future__ import annotations
@@ -48,6 +51,8 @@ def _core(local: wp.transform, size: wp.vec4, kind: int, partner: int, solids: T
     if kind == _ELLIPSOID:
         core.ellipsoid = 1
         core.radius = wp.max(core.s[0], wp.max(core.s[1], core.s[2]))
+        core.box_c = wp.vec3(0.0)
+        core.box_h = core.s
         return True, core
     if kind != _CONVEX_MESH:
         return False, core
@@ -68,14 +73,23 @@ def _core(local: wp.transform, size: wp.vec4, kind: int, partner: int, solids: T
     radius = float(0.0)
     core.start = core.point_begin
     low = wp.dot(solids.hulls.points[core.point_begin], up)
+    # the bounding box in the core's frame, of the scaled points as the core's points take them
+    box_lo = wp.cw_mul(solids.hulls.points[core.point_begin], core.s)
+    box_hi = box_lo
     for i in range(core.point_begin, core.point_begin + core.point_count):
         p = solids.hulls.points[i]
-        radius = wp.max(radius, wp.length(wp.cw_mul(p, core.s)))
+        ps = wp.cw_mul(p, core.s)
+        radius = wp.max(radius, wp.length(ps))
+        box_lo = wp.min(box_lo, ps)
+        box_hi = wp.max(box_hi, ps)
         value = wp.dot(p, up)
         if value < low:
             low = value
             core.start = i
     core.radius = radius
+    # centre and half extents, the half extents rounded up so that the box holds every point in float32
+    core.box_c = 0.5 * (box_lo + box_hi)
+    core.box_h = 0.5 * (box_hi - box_lo) * (1.0 + 4.0 * 1.1920929e-07) + wp.vec3(1.0e-9)
     return True, core
 
 
@@ -95,6 +109,8 @@ def _core_save(jobs: TerrainSolidJobs, i: int, core: TerrainHullCore):
     record.triangle_count = core.triangle_count
     record.radius = core.radius
     record.start = core.start
+    record.box_c = core.box_c
+    record.box_h = core.box_h
     jobs.hull_cores[i] = record
 
 
@@ -115,6 +131,8 @@ def _core_load(jobs: TerrainSolidJobs, i: int, solids: TerrainSolidData) -> Terr
     core.triangle_count = record.triangle_count
     core.radius = record.radius
     core.start = record.start
+    core.box_c = record.box_c
+    core.box_h = record.box_h
     core.table = solids.hulls
     return core
 
@@ -138,10 +156,12 @@ terrain_hull_rows_creases = _KERNELS["creases"]
 terrain_hull_rows_vertices = _KERNELS["vertices"]
 terrain_hull_rows_close = _KERNELS["close"]
 terrain_hull_rows_recovery = _KERNELS["recovery"]
+terrain_hull_rows_xbound = _KERNELS["xbound"]
 terrain_hull_rows_xitems = _KERNELS["xitems"]
 terrain_hull_rows_xvalleys = _KERNELS["xvalleys"]
 terrain_hull_rows_xdescents = _KERNELS["xdescents"]
 terrain_hull_rows_exit = _KERNELS["exit"]
+terrain_hull_rows_small = _KERNELS["small"]
 terrain_hull_rows_finish = _KERNELS["finish"]
 terrain_hull_rows_pooled = _KERNELS["pooled"]
 terrain_hull_rows_full = _KERNELS["full"]

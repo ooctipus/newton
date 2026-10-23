@@ -302,6 +302,14 @@ NEWTON_FLAGS = declare(
         "A non-empty value marks a documentation build, which the viewer treats as Sphinx.",
     ),
     EnvironmentFlag(
+        "NEWTON_TERRAIN_LAW",
+        "experiment",
+        _COLLIDE,
+        "Partner classes whose heightfield pairs the terrain law writes instead of the terrain route, which drops "
+        "them: point (spheres and capsules), box, cylinder (cylinders and cones), hull (convex hulls and "
+        "ellipsoids) or all. Not with NEWTON_TERRAIN_LAW_SHADOW or speculative contacts. Unset writes none.",
+    ),
+    EnvironmentFlag(
         "NEWTON_TERRAIN_LAW_SHADOW",
         "diagnostic",
         _COLLIDE,
@@ -316,7 +324,15 @@ NEWTON_FLAGS = declare(
         "A positive factor on the terrain-law shadow's solid-class job lists and candidate pools, scene-level buffers "
         "sized from the listed pairs' own bounds (default 1); a pair whose work finds no room takes the slower "
         "full-finish kernel (its rows unchanged) and raises the narrow phase's terrain_jobs status. Read only with "
-        "NEWTON_TERRAIN_LAW_SHADOW set.",
+        "NEWTON_TERRAIN_LAW_SHADOW or NEWTON_TERRAIN_LAW set.",
+    ),
+    EnvironmentFlag(
+        "NEWTON_TERRAIN_LAW_RULE_X",
+        "experiment",
+        _COLLIDE,
+        "1 runs the terrain law's rule X (a solid core's deepest exit, offered where it lies deeper than every other "
+        "row of its pair); unset or 0 leaves it out (default: on the law's own operating states it gave no row while "
+        "its kernels cost up to 0.9 ms per env step). Read only with NEWTON_TERRAIN_LAW_SHADOW or NEWTON_TERRAIN_LAW set.",
     ),
     EnvironmentFlag(
         "NEWTON_TERRAIN_LAW_SHADOW_ROWS",
@@ -324,7 +340,7 @@ NEWTON_FLAGS = declare(
         _COLLIDE,
         "Rows of the terrain-law shadow's scene-level spill region, which holds the rows of pairs with more rows than "
         "their walk slots (default: from the listed pairs' own bounds on their rows); read only with "
-        "NEWTON_TERRAIN_LAW_SHADOW set.",
+        "NEWTON_TERRAIN_LAW_SHADOW or NEWTON_TERRAIN_LAW set.",
     ),
     EnvironmentFlag(
         "NEWTON_ASSET_DIR",

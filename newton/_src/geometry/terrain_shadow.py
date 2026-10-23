@@ -18,8 +18,10 @@ scene level from its pairs' own bounds (:func:`~newton._src.geometry.terrain_law
 which ``NEWTON_TERRAIN_LAW_SHADOW_JOBS`` scales. Every collide then launches, after today's terrain route, each listed
 class's kernels (:data:`TERRAIN_LAW_KERNELS`) and a check of the spill region and the job lists, with dimensions fixed
 at construction (:meth:`TerrainLawShadow.describe` records them): no host read, no allocation, no scan, so it runs
-inside CUDA graph capture. Today's route still produces every contact; the shadow's rows are read only by
-:meth:`TerrainLawShadow.rows`.
+inside CUDA graph capture. In shadow, today's route still produces every contact and the rows are read only by
+:meth:`TerrainLawShadow.rows`. With ``NEWTON_TERRAIN_LAW`` listing classes instead, the same object writes the rows of
+its pairs as their contacts (:meth:`TerrainLawShadow.write_contacts`, :func:`terrain_law_contact_kernel`) and the
+narrow phase drops those pairs (:meth:`TerrainLawShadow.written_pairs`).
 
 The per-type kernels take ``(begin, slot_begin, inputs, data, out)``
 (:class:`~newton._src.geometry.terrain_law.TerrainPairInputs`,
@@ -55,14 +57,18 @@ jobs and the solid classes' :class:`~newton._src.geometry.terrain_law_solid.Terr
    are listed for ``theta*``), the creases' ``theta*``, their rows, vertices. A job's rows go to the class's candidate
    pool with their place in window order.
 4. The close, the job threads over the live pairs: a pair's candidates held in window order (the walk's held rows),
-   then rule R's kernel over the pairs without a row; a pair holds its rows for the finish kernel, or for a core
-   reaching below its window's highest vertex lists rule X's items.
-5. Rule X's items (a core point, or a window vertex that can give a candidate), valleys and the listed candidates'
-   near-bound descents, the job threads again: they list the candidates whose bounds pass the pair's target; then the
-   exit kernel, one thread per pair of the class (its exit list's room), runs rule X's passes over the listed
-   candidates (exact: any other candidate is a no-op in both passes).
-6. The finish kernel, a block of lanes per pair over the live pairs: the finish of every pair holding its rows or
-   kept by the exit kernel, the lanes splitting its implied-row tests.
+   then rule R's kernel over the pairs without a row; a pair's held rows are written as they are when the finish keeps
+   them so (fewer than its class's lane rows, no plane group of three), else held for a finish kernel; a core reaching
+   below its window's highest vertex lists rule X's items.
+5. Rule X's gate (per listed window vertex under the core's footprint: whether an exit over its cell can pass the
+   pair's target), then the items of the pairs it opened (a core point, or a window vertex that can give a
+   candidate), valleys and the listed candidates' near-bound descents, the job threads again: they list the candidates
+   whose bounds pass the pair's target; then the exit kernel, one thread per pair of the class (its exit list's room),
+   runs rule X's passes over the listed candidates (exact: any other candidate is a no-op in both passes) and
+   finishes the pair.
+6. The finish kernels: one thread per pair over the pairs with a plane group of three (the small-pair finish), and a
+   block of lanes per pair over those holding the lane rows, the lanes splitting its implied-row tests (not launched
+   while no class's walk slots hold them).
 7. The full-finish kernel (below).
 
 The full-finish kernel of a class, ``wp.launch_tiled`` on the fixed grid of its
@@ -90,10 +96,12 @@ from __future__ import annotations
 
 import importlib
 import time
+from typing import Any
 
 import numpy as np
 import warp as wp
 
+from .contact_data import ContactData
 from .terrain_contacts import (
     TERRAIN_LANE_THREAD,
     TERRAIN_LANE_TILE,
@@ -118,12 +126,14 @@ from .terrain_law import (
     TERRAIN_PAIR_TILE_EXIT,
     TERRAIN_PAIR_UNSUPPORTED,
     TERRAIN_PAIR_WIDE,
+    TerrainLawRows,
     TerrainPairInputs,
     terrain_finish_scratch,
     terrain_law_block_dim,
     terrain_law_rows,
     terrain_pair_work,
 )
+from .types import GeoType
 
 TERRAIN_LAW_CLASS_NAMES = {
     "point": TERRAIN_PARTNER_POINT,
@@ -148,15 +158,17 @@ def _solid_launches(name: str) -> tuple[tuple[str, str], ...]:
         "vertices",
         "close",
         "recovery",
+        "xbound",
         "xitems",
         "xvalleys",
         "xdescents",
         "exit",
+        "small",
         "finish",
         "pooled",
         "full",
     )
-    pair_jobs = ("close", "exit")
+    pair_jobs = ("close", "exit", "small")
     kinds = tuple(
         "pairs"
         if kernel == "rows"
@@ -201,7 +213,7 @@ The module is imported only when the class is listed. Launch kinds, every one wi
   construction is not launched, :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LIST_OF_KERNEL`);
 * ``pair_jobs``: the same over a list of the class's pairs, with at most one thread per pair
   (:attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.pair_threads`: a solid class's close and exit
-  kernels);
+  kernels and the small-pair finish);
 * ``pair_tiles``: ``wp.launch_tiled`` with
   :attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.finish_blocks` blocks of
   :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK` lanes, a pair per block at a time over a list of the
@@ -262,12 +274,14 @@ def terrain_law_class_name(partner_class: int) -> str:
     return next(name for name, value in TERRAIN_LAW_CLASS_NAMES.items() if value == partner_class)
 
 
-def parse_terrain_law_shadow(value: str | None) -> tuple[int, ...]:
-    """Return the partner classes a ``NEWTON_TERRAIN_LAW_SHADOW`` value lists, sorted (empty for none).
+def parse_terrain_law_shadow(value: str | None, flag: str = "NEWTON_TERRAIN_LAW_SHADOW") -> tuple[int, ...]:
+    """Return the partner classes a ``NEWTON_TERRAIN_LAW_SHADOW`` (or ``NEWTON_TERRAIN_LAW``) value lists, sorted
+    (empty for none).
 
     Args:
         value: Comma-separated names of :data:`TERRAIN_LAW_CLASS_NAMES`, or ``all`` for every class with a
             kernel; ``None`` or blank for none.
+        flag: The variable's name, for the errors.
 
     Raises:
         ValueError: On an unknown name, or a named class without a kernel yet.
@@ -283,12 +297,12 @@ def parse_terrain_law_shadow(value: str | None) -> tuple[int, ...]:
             continue
         if name not in TERRAIN_LAW_CLASS_NAMES:
             raise ValueError(
-                f"NEWTON_TERRAIN_LAW_SHADOW names unknown partner class {name!r}; "
+                f"{flag} names unknown partner class {name!r}; "
                 f"use a comma-separated list of {sorted(TERRAIN_LAW_CLASS_NAMES)} or 'all'"
             )
         partner_class = TERRAIN_LAW_CLASS_NAMES[name]
         if partner_class not in TERRAIN_LAW_KERNELS:
-            raise ValueError(f"NEWTON_TERRAIN_LAW_SHADOW: the terrain law has no kernel for {name!r} yet")
+            raise ValueError(f"{flag}: the terrain law has no kernel for {name!r} yet")
         classes.add(partner_class)
     return tuple(sorted(classes))
 
@@ -298,7 +312,7 @@ TERRAIN_LAW_SPILL_SHARE = 256
 pair's bound (:meth:`TerrainLawShadow.default_spill_rows`): the worst case of one pair in 256 at once. On the recorded
 suite scenes (16,384 worlds) that is 11 to 25% of the walk slots, while at most one pair spilled (30 rows)."""
 
-TERRAIN_LAW_JOB_COUNTERS = 13
+TERRAIN_LAW_JOB_COUNTERS = 14
 """Counters of a solid class's jobs: its six job lists, its candidate pool, its live pairs, its pairs left to rule R,
 its scan's runs, its listed rule X candidates' descents, its deferred pairs walked again and its pairs finished by a
 block's lanes (:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_COUNTERS`)."""
@@ -317,6 +331,7 @@ TERRAIN_LAW_JOB_NAMES = (
     "xdescents",
     "walks",
     "lanes",
+    "small",
 )
 """Names of a solid class's job counters, in order (:meth:`TerrainLawShadow.job_counts`)."""
 
@@ -341,6 +356,8 @@ _JOBS = _EXIT_WORK + 2
 """Offset of the per-class job counters (:data:`TERRAIN_LAW_JOB_COUNTERS` per class)."""
 _COUNTERS = _JOBS + TERRAIN_PARTNER_CLASSES * TERRAIN_LAW_JOB_COUNTERS
 """The shadow's counters, all zeroed by one memset before every launch."""
+_RULE_X_KERNELS = ("xbound", "xitems", "xvalleys", "xdescents", "exit")
+"""A solid class's kernels of rule X, not launched when the law leaves it out (:attr:`TerrainLawShadow.rule_x`)."""
 
 
 @wp.func
@@ -417,6 +434,94 @@ def terrain_law_spill_check(
                 )
 
 
+_CONTACT_KERNELS = {}
+
+_CONTACTS_OVERFLOWED = wp.constant(1024)
+"""The ``contacts`` bit of the narrow phase's buffer status word (``verify_narrow_phase_buffers``), which checks the
+contact buffer before the law writes."""
+
+
+def terrain_law_contact_kernel(writer_func: Any):
+    """Return the kernel that writes the law's rows as contacts through a contact writer (``NEWTON_TERRAIN_LAW``).
+
+    One thread per written pair (``written``, table indices): its rows pass the writer's gap admission (the surface
+    distance ``d - r`` beyond both margins within both gaps, ``r`` the radius of a sphere or capsule partner, else 0),
+    one reservation takes the admitted rows' contacts, and the writer writes each at its index. A contact's shape A is
+    the heightfield, its normal the row's (terrain to partner), its points the terrain point ``q`` and the partner's
+    core point ``q + d n`` (a sphere or capsule partner's ``radius_eff_b`` is ``r``) and its ``sort_sub_key`` the row's
+    window-local feature id.
+
+    Args:
+        writer_func: Contact writer ``(ContactData, writer_data, output_index)`` that writes at a given index
+            ``output_index >= 0`` without admission.
+    """
+    kernel = _CONTACT_KERNELS.get(writer_func)
+    if kernel is not None:
+        return kernel
+
+    @wp.kernel(enable_backward=False, module=f"terrain_law_contacts_{writer_func.key}")
+    def terrain_law_write_contacts(
+        written: wp.array[wp.int32],
+        pairs: wp.array[wp.vec2i],
+        rows: TerrainLawRows,
+        shape_type: wp.array[wp.int32],
+        shape_data: wp.array[wp.vec4],
+        writer_data: Any,
+    ):
+        pair = written[wp.tid()]
+        count = rows.count[pair]
+        if count <= 0:
+            return
+        first = rows.first[pair]
+        hfield = pairs[pair][0]
+        partner = pairs[pair][1]
+        radius = float(0.0)
+        kind = shape_type[partner]
+        if kind == GeoType.SPHERE or kind == GeoType.CAPSULE:
+            radius = shape_data[partner][0]
+        margin_a = shape_data[hfield][3]
+        margin_b = shape_data[partner][3]
+        gap = writer_data.shape_gap[hfield] + writer_data.shape_gap[partner]
+        admitted = int(0)
+        for i in range(count):
+            if rows.d[first + i] - radius - margin_a - margin_b <= gap:
+                admitted += 1
+        if admitted == 0:
+            return
+        index = wp.atomic_add(writer_data.contact_count, 0, admitted)
+        if index + admitted > writer_data.contact_max:
+            # The writer drops the contacts past the buffer; raise the narrow phase's contacts bit, warn once.
+            wp.atomic_or(rows.status, 0, _CONTACTS_OVERFLOWED)
+            if index <= writer_data.contact_max:
+                wp.printf(
+                    "Warning: Contact buffer overflowed by the terrain law's contacts: %d > %d.\n",
+                    index + admitted,
+                    writer_data.contact_max,
+                )
+        contact = ContactData()
+        contact.shape_a = hfield
+        contact.shape_b = partner
+        contact.radius_eff_a = 0.0
+        contact.radius_eff_b = radius
+        contact.margin_a = margin_a
+        contact.margin_b = margin_b
+        contact.gap_sum = gap
+        for i in range(count):
+            d = rows.d[first + i]
+            if d - radius - margin_a - margin_b > gap:
+                continue
+            n = rows.n[first + i]
+            contact.contact_normal_a_to_b = n
+            contact.contact_distance = d - radius
+            contact.contact_point_center = rows.q[first + i] + (0.5 * (d - radius)) * n
+            contact.sort_sub_key = rows.feature[first + i]
+            writer_func(contact, writer_data, index)
+            index += 1
+
+    _CONTACT_KERNELS[writer_func] = terrain_law_write_contacts
+    return terrain_law_write_contacts
+
+
 def parse_terrain_law_shadow_rows(value: str | None) -> int | None:
     """Return the spill region's rows a ``NEWTON_TERRAIN_LAW_SHADOW_ROWS`` value sets, or ``None`` for the default.
 
@@ -460,6 +565,22 @@ def parse_terrain_law_shadow_jobs(value: str | None) -> float | None:
     return scale
 
 
+def parse_terrain_law_rule_x(value: str | None) -> bool:
+    """Return whether a ``NEWTON_TERRAIN_LAW_RULE_X`` value runs rule X (off by default).
+
+    Args:
+        value: ``1`` to run it, ``0`` to leave it out; ``None`` or blank for the default (out).
+
+    Raises:
+        ValueError: On any other value.
+    """
+    if value is None or not value.strip():
+        return False
+    if value.strip() not in ("0", "1"):
+        raise ValueError(f"NEWTON_TERRAIN_LAW_RULE_X must be 0 or 1, not {value!r}")
+    return value.strip() == "1"
+
+
 class TerrainLawShadow:
     """The terrain law's kernels for some partner classes, run after the narrow phase into a side buffer.
 
@@ -492,8 +613,10 @@ class TerrainLawShadow:
         status: wp.array | None = None,
         spill_rows: int | None = None,
         job_scale: float | None = None,
+        rule_x: bool = False,
     ):
         started = time.perf_counter()
+        self.rule_x = bool(rule_x)
         self.device = model.device
         self.classes = tuple(sorted(int(c) for c in classes))
         missing = [c for c in self.classes if c not in TERRAIN_LAW_KERNELS]
@@ -563,6 +686,7 @@ class TerrainLawShadow:
                     end - begin,
                     capacity,
                     counts=self._counters[offset : offset + TERRAIN_LAW_JOB_COUNTERS],
+                    rule_x=self.rule_x,
                 )
                 self._jobs[partner_class] = jobs
                 names = (*solid_module.TERRAIN_SOLID_JOB_LISTS, "candidates", "scans", "xdescents")
@@ -576,14 +700,30 @@ class TerrainLawShadow:
                     if kind == "pairs":
                         self._launches.append(("thread", kernel, end - begin, begin, slot, (jobs, True)))
                     elif kind == "pair_jobs":
+                        if kernel_name.removeprefix(prefix) in _RULE_X_KERNELS and not self.rule_x:
+                            # rule X left out: no pair is left to its exit kernel
+                            skipped.append(kernel_name.removeprefix(prefix))
+                            continue
                         self._launches.append(("thread", kernel, jobs.pair_threads, begin, slot, (jobs, True)))
                     elif kind == "pair_tiles":
+                        if kernel_name == prefix + "finish" and walk < solid_module.TERRAIN_SOLID_LANE_ROWS:
+                            # no walking pair holds the lane rows: its lane list stays empty
+                            skipped.append("finish")
+                            continue
                         self._launches.append(("tiled", kernel, jobs.finish_blocks, begin, slot, (jobs, True)))
                     elif kind == "jobs":
                         # a list none of the class's pairs can fill: no launch
                         short = kernel_name.removeprefix(prefix)
                         listed = solid_module.TERRAIN_SOLID_LIST_OF_KERNEL.get(short)
                         if listed is not None and capacity[listed] == 0:
+                            skipped.append(short)
+                            continue
+                        if short in _RULE_X_KERNELS and not self.rule_x:
+                            # rule X left out: its pairs are finished by their close
+                            skipped.append(short)
+                            continue
+                        if short == "xbound" and partner_class == TERRAIN_PARTNER_HULL:
+                            # rule X's gate does not bound a hull's exits (core_exits_gated): its pairs are open at once
                             skipped.append(short)
                             continue
                         self._launches.append(("thread", kernel, jobs.threads, begin, slot, (jobs, True)))
@@ -671,6 +811,28 @@ class TerrainLawShadow:
         self.build_seconds = time.perf_counter() - started
         """Host time of the construction [s]: features, pair table, kernel modules imported and buffers."""
 
+    def written_pairs(self, model) -> tuple[np.ndarray, np.ndarray]:
+        """Return what the law writes when it feeds the solver (``NEWTON_TERRAIN_LAW``): per shape, 1 for a partner
+        whose heightfield pairs it writes (else 0), and the table indices of those pairs.
+
+        Every listed pair is written but those whose partner has no core yet
+        (:data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_UNSUPPORTED`: in the hull class, a shape that is
+        neither a convex hull nor an ellipsoid), which stay with the terrain route.
+
+        Args:
+            model: The finalized model the law was built for.
+        """
+        listed = self._listed
+        partners = self.table.pairs_host[listed, 1].astype(np.int64)
+        written = np.ones(len(listed), bool)
+        if any(c in TERRAIN_LAW_SOLID_CLASSES for c in self.classes):
+            from .terrain_law_solid import terrain_solid_unsupported  # noqa: PLC0415
+
+            written = ~terrain_solid_unsupported(self.table.partner_class[listed], model.shape_type.numpy()[partners])
+        partner = np.zeros(model.shape_count, np.int32)
+        partner[partners[written]] = 1
+        return partner, listed[written].astype(np.int32)
+
     def default_spill_rows(self) -> int:
         """Return the spill region's rows by default, from the listed pairs' own bounds on their rows
         (:func:`~newton._src.geometry.terrain_contacts.terrain_pair_candidates`, from each pair's shape extent, reach
@@ -738,6 +900,29 @@ class TerrainLawShadow:
             terrain_law_spill_check,
             dim=1,
             inputs=[self._counters, _SPILLED, self.spill_rows, _JOBS, self._capacities],
+            device=self.device,
+            record_tape=False,
+        )
+
+    def write_contacts(
+        self, written: wp.array, shape_type: wp.array, shape_data: wp.array, writer_func: Any, writer_data: Any
+    ) -> None:
+        """Write the rows of the last :meth:`launch` as contacts (graph-capture safe), for the pairs
+        :meth:`written_pairs` returns (:func:`terrain_law_contact_kernel`).
+
+        Args:
+            written: Table indices of the pairs to write (int32).
+            shape_type: Geometry type of every shape.
+            shape_data: Per shape, scale ``xyz`` and margin ``w``, current for this collide.
+            writer_func: Contact writer that writes at a given index without admission.
+            writer_data: The writer's data (its contact counter, gaps and output arrays).
+        """
+        if written.shape[0] == 0:
+            return
+        wp.launch(
+            terrain_law_contact_kernel(writer_func),
+            dim=written.shape[0],
+            inputs=[written, self.table.pairs, self._out, shape_type, shape_data, writer_data],
             device=self.device,
             record_tape=False,
         )

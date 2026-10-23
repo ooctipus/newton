@@ -53,6 +53,7 @@ from newton._src.geometry.terrain_shadow import (
     TERRAIN_LAW_KERNELS,
     TERRAIN_LAW_SPILL_SHARE,
     TerrainLawShadow,
+    parse_terrain_law_rule_x,
     parse_terrain_law_shadow,
     parse_terrain_law_shadow_jobs,
     parse_terrain_law_shadow_rows,
@@ -528,6 +529,17 @@ class TestTerrainLawShadow(unittest.TestCase):
                 parse_terrain_law_shadow_jobs(value)
         with patch.dict(os.environ, {"NEWTON_TERRAIN_LAW_SHADOW_JOBS": "0"}), self.assertRaises(ValueError):
             tu.shadow_pipeline(model, **PIPELINE)
+        # Rule X: off unless asked for.
+        self.assertFalse(parse_terrain_law_rule_x(None))
+        self.assertFalse(parse_terrain_law_rule_x(" "))
+        self.assertFalse(parse_terrain_law_rule_x("0"))
+        self.assertTrue(parse_terrain_law_rule_x(" 1 "))
+        for value in ("2", "yes", "on"):
+            with self.assertRaisesRegex(ValueError, "NEWTON_TERRAIN_LAW_RULE_X"):
+                parse_terrain_law_rule_x(value)
+        with patch.dict(os.environ, {"NEWTON_TERRAIN_LAW_SHADOW": "all", "NEWTON_TERRAIN_LAW_RULE_X": "on"}):
+            with self.assertRaises(ValueError):
+                newton.CollisionPipeline(model, **PIPELINE)
         # The shadow's own option takes the same factors: none of these would size a list.
         for value in (0, -1.0, float("inf"), float("nan")):
             with self.subTest(job_scale=value), self.assertRaisesRegex(ValueError, "positive finite factor"):
@@ -822,6 +834,11 @@ class TestTerrainLawShadow(unittest.TestCase):
                     self.assertEqual(skipped, ["xvalleys"] if not np.any(takes) else [])
                     if name == "box":
                         self.assertEqual(skipped, ["xvalleys"])
+                    # rule X's gate bounds no hull's exits: never launched for hulls; no class's walk slots hold the
+                    # lane rows: the lanes' finish is launched for none
+                    if name == "hull":
+                        skipped = ["xbound", *skipped]
+                    skipped = [*skipped, "finish"]
                     launches += len(TERRAIN_SOLID_LAUNCHES) - len(skipped)
                     self.assertEqual(
                         record["launch_shapes"][name],
