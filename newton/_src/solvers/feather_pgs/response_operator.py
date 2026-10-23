@@ -21,9 +21,7 @@ def _at(vector: str, index: str) -> str:
     return vector.replace("$index", f"({index})")
 
 
-def _accumulate(coefficient: str, operand: str, check: str = "") -> str:
-    if check:
-        return f"const float a={coefficient};{check}value+=a*{operand};"
+def _accumulate(coefficient: str, operand: str) -> str:
     return f"value+={coefficient}*{operand};"
 
 
@@ -111,98 +109,6 @@ class LaneCholeskySolve:
             }}
             if(active)s[{output_base}+i]=z;
         }}"""
-
-
-@dataclass(frozen=True)
-class DenseLowerInverse:
-    """Apply an existing row-major lower inverse factor without refactoring it."""
-
-    size: int | str
-    factor: str
-
-    def forward(self, row: str, rhs: str, *, check: str = "") -> str:
-        """Compute one forward row; check may validate coefficient ``a``."""
-        operation = _accumulate(f"({self.factor})[({row})*{self.size}+k]", _at(rhs, "k"), check)
-        return f"float value=0.0f;for(int k=0;k<=({row});++k){{{operation}}}"
-
-    def transpose(self, col: str, rhs: str) -> str:
-        """Compute one transpose column in increasing contributing-row order."""
-        operation = _accumulate(f"({self.factor})[k*{self.size}+({col})]", _at(rhs, "k"))
-        return f"float value=0.0f;for(int k=({col});k<{self.size};++k){{{operation}}}"
-
-
-@dataclass(frozen=True)
-class BlockArrowInverse:
-    """Apply independent lower branch blocks coupled into a lower central block.
-
-    Coordinates place the central block before all equal-sized branch blocks.
-    Packed storage places branch triangles, the central triangle, then dense
-    central-by-branch rectangles. This describes storage, not topology admission.
-    """
-
-    central: int
-    branch: int
-    branches: int
-    factor: str
-
-    def __post_init__(self):
-        if self.central < 1 or self.branch < 1 or self.branches < 1:
-            raise ValueError("Block response dimensions must be positive")
-
-    @property
-    def branch_triangle(self):
-        return self.branch * (self.branch + 1) // 2
-
-    @property
-    def central_offset(self):
-        return self.branches * self.branch_triangle
-
-    @property
-    def coupling_offset(self):
-        return self.central_offset + self.central * (self.central + 1) // 2
-
-    def forward(self, index: str, rhs: str, *, check: str = "") -> str:
-        """Apply each branch locally and include every branch in the central action."""
-        n, b, count = self.central, self.branch, self.branches
-        central = _accumulate(
-            f"({self.factor})[{self.central_offset}+({index})*(({index})+1)/2+k]", _at(rhs, "k"), check
-        )
-        coupling = _accumulate(
-            f"({self.factor})[{self.coupling_offset}+branch_id*{n * b}+({index})*{b}+k]",
-            _at(rhs, f"{n}+branch_id*{b}+k"),
-            check,
-        )
-        branch = _accumulate(
-            f"({self.factor})[branch_id*{self.branch_triangle}+branch_row*(branch_row+1)/2+k]",
-            _at(rhs, f"{n}+branch_id*{b}+k"),
-            check,
-        )
-        return f"""float value=0.0f;
-            if(({index})<{n}){{
-                for(int k=0;k<=({index});++k){{{central}}}
-                for(int branch_id=0;branch_id<{count};++branch_id)for(int k=0;k<{b};++k){{{coupling}}}
-            }}else{{
-                const int branch_id=(({index})-{n})/{b},branch_row=(({index})-{n})%{b};
-                for(int k=0;k<=branch_row;++k){{{branch}}}
-            }}"""
-
-    def transpose(self, index: str, rhs: str) -> str:
-        """Apply the central transpose, then each branch and its central coupling."""
-        n, b = self.central, self.branch
-        central = _accumulate(f"({self.factor})[{self.central_offset}+k*(k+1)/2+({index})]", _at(rhs, "k"))
-        branch = _accumulate(
-            f"({self.factor})[branch_id*{self.branch_triangle}+k*(k+1)/2+branch_col]", _at(rhs, f"{n}+branch_id*{b}+k")
-        )
-        coupling = _accumulate(
-            f"({self.factor})[{self.coupling_offset}+branch_id*{n * b}+k*{b}+branch_col]", _at(rhs, "k")
-        )
-        return f"""float value=0.0f;
-            if(({index})<{n}){{for(int k=({index});k<{n};++k){{{central}}}}}
-            else{{
-                const int branch_id=(({index})-{n})/{b},branch_col=(({index})-{n})%{b};
-                for(int k=branch_col;k<{b};++k){{{branch}}}
-                for(int k=0;k<{n};++k){{{coupling}}}
-            }}"""
 
 
 @dataclass(frozen=True)

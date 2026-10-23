@@ -11,7 +11,7 @@ import warp as wp
 from newton._src.solvers.feather_pgs import response_operator as response
 
 
-def make_probe(kind, size, width, *, block_shape=None):
+def make_probe(kind, size, width):
     """Bind the same physical vector contract to distinct numerical methods."""
     coefficients = "factors.data+group*factors.shape[1]"
     rhs = "rhs.data[group*rhs.shape[1]+permutation.data[$index]+1]"
@@ -24,19 +24,14 @@ def make_probe(kind, size, width, *, block_shape=None):
             {operator.transpose(intermediate, output)}
         }}"""
     else:
-        if kind == "block":
-            operator = response.BlockArrowInverse(*block_shape, "factor")
-        elif kind == "dense":
-            operator = response.DenseLowerInverse(size, "factor")
-        else:
-            support = (
-                response.IndexedSupport(size, "index.data", "column_count.data", "column_nodes.data", size)
-                if kind == "indexed"
-                else response.CompressedSupport(
-                    "row_offsets.data", "columns.data", "column_offsets.data", "column_entries.data", "entry_rows.data"
-                )
+        support = (
+            response.IndexedSupport(size, "index.data", "column_count.data", "column_nodes.data", size)
+            if kind == "indexed"
+            else response.CompressedSupport(
+                "row_offsets.data", "columns.data", "column_offsets.data", "column_entries.data", "entry_rows.data"
             )
-            operator = response.SparseInverseFactor("factor", support)
+        )
+        operator = response.SparseInverseFactor("factor", support)
         stages = f"""for(int row=lane;row<{size};row+=stride){{
             {operator.forward("row", rhs)}
             x[row]=value;
@@ -116,7 +111,7 @@ def make_probe(kind, size, width, *, block_shape=None):
     return probe, block
 
 
-def make_case(kind, size, *, block_shape=None):
+def make_case(kind, size):
     """Construct a well-conditioned mass independently of the emitted action."""
     rng = np.random.default_rng(731 + size)
     worlds = 8
@@ -136,30 +131,9 @@ def make_case(kind, size, *, block_shape=None):
         nodes[col, : counts[col]] = np.flatnonzero(lower_mask[:, col])
     for _ in range(worlds):
         matrix = np.tril(rng.normal(scale=0.04, size=(size, size))) + np.eye(size) * 1.4
-        if kind == "block":
-            trunk, branch, count = block_shape
-            transform = np.zeros_like(matrix)
-            transform[:trunk, :trunk] = matrix[:trunk, :trunk]
-            packed = []
-            for part in range(count):
-                start = trunk + part * branch
-                tile = matrix[start : start + branch, start : start + branch]
-                transform[start : start + branch, start : start + branch] = tile
-                transform[:trunk, start : start + branch] = rng.normal(scale=0.04, size=(trunk, branch))
-                packed.extend(tile[np.tril_indices(branch)])
-            packed.extend(transform[:trunk, :trunk][np.tril_indices(trunk)])
-            for part in range(count):
-                start = trunk + part * branch
-                packed.extend(transform[:trunk, start : start + branch].ravel())
-            inverse = np.linalg.solve(transform, np.eye(size))
-            mass = inverse @ inverse.T
-        elif kind in ("indexed", "compressed"):
+        if kind in ("indexed", "compressed"):
             matrix *= lower_mask
             packed = matrix[rows, columns]
-            inverse = np.linalg.solve(matrix, np.eye(size))
-            mass = inverse @ inverse.T
-        elif kind == "dense":
-            packed = matrix.ravel()
             inverse = np.linalg.solve(matrix, np.eye(size))
             mass = inverse @ inverse.T
         else:
@@ -187,20 +161,17 @@ def make_case(kind, size, *, block_shape=None):
 class TestResponseOperators(unittest.TestCase):
     def check_methods(self, device):
         cases = [
-            ("cholesky", 9, 16, None),
-            ("cholesky", 6, 32, None),
-            ("dense", 6, 32, None),
-            ("block", 23, 32, (7, 4, 4)),
-            ("block", 11, 32, (5, 3, 2)),
-            ("indexed", 43, 64, None),
-            ("compressed", 43, 32, None),
-            ("indexed", 11, 32, None),
-            ("compressed", 64, 32, None),
+            ("cholesky", 9, 16),
+            ("cholesky", 6, 32),
+            ("indexed", 43, 64),
+            ("compressed", 43, 32),
+            ("indexed", 11, 32),
+            ("compressed", 64, 32),
         ]
-        for kind, size, width, shape in cases:
+        for kind, size, width in cases:
             with self.subTest(device=device, kind=kind, size=size):
-                kernel, block = make_probe(kind, size, width, block_shape=shape)
-                factors, rhs, arrays, masses = make_case(kind, size, block_shape=shape)
+                kernel, block = make_probe(kind, size, width)
+                factors, rhs, arrays, masses = make_case(kind, size)
                 inputs = [wp.array(factors, dtype=float, device=device), wp.array(rhs, dtype=float, device=device)]
                 inputs += [wp.array(value, dtype=int, device=device) for value in arrays]
                 out = wp.full(rhs.shape, -731.0, dtype=float, device=device)
