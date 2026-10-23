@@ -39,12 +39,6 @@ def install(solver) -> None:
         from .mixed_tree_kinetic import create_owner  # noqa: PLC0415
 
         solver._tree_kinetic_state = create_owner(solver)
-        if solver._tree_kinetic_state is not None:
-            # The owner predicts kinematics and joint torques from its cached
-            # state; the fused world-dynamics kernel (K1) that would produce
-            # them on the general route is superseded, and every later stage
-            # takes its ordinary branch.
-            solver._fused_k1 = False
 
     if solver._tree_kinetic_state is not None:
         source = "Explicit cached_dynamics='on'" if choice == "on" else "Automatic cache selection"

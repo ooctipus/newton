@@ -82,9 +82,6 @@ def supported(solver):
         # the predictor itself.
         and not solver._connect_count
         and not solver._has_loop_joints
-        # The fused world-dynamics kernel (K1) and lazy_kinematics, which only
-        # acts with it, are superseded: the owner predicts kinematics and
-        # torques itself and install() clears the K1 selection.
         and solver._fk_id_cache_available
         and solver._async_augmented_drives
         and solver._parallel_augmented_drive_topology

@@ -202,18 +202,6 @@ FLAGS = declare(
         "=1 applies an implicit gyroscopic predictor correction to independent free bodies.",
     ),
     _flag(
-        "FEATHER_PGS_FUSED_K1",
-        "policy",
-        _SOLVER,
-        "=0 disables the fused world-dynamics kernel.",
-    ),
-    _flag(
-        "FEATHER_PGS_FUSED_K1_MASS",
-        "experiment",
-        _SOLVER,
-        "=1 lets the fused world-dynamics kernel also build and factor the mass matrix.",
-    ),
-    _flag(
         "FEATHER_PGS_FUSED_PUBLISH",
         "experiment",
         _SOLVER,
@@ -284,18 +272,6 @@ FLAGS = declare(
         "diagnostic",
         _SOLVER,
         "=1 writes the in-kernel response and diagonal back for comparison.",
-    ),
-    _flag(
-        "FEATHER_PGS_K1_REAL_CHECK",
-        "diagnostic",
-        _SOLVER,
-        "=1 checks the fused world-dynamics kernel against the ordinary stages.",
-    ),
-    _flag(
-        "FEATHER_PGS_K1_TPL_SHARED",
-        "reference",
-        _SOLVER,
-        "=0 reads fused-kernel template tables from global instead of shared memory.",
     ),
     _flag(
         "FEATHER_PGS_KEYED_ROWS",

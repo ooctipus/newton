@@ -625,7 +625,6 @@ def _admissible_solver():
         "_row_watermark",
         "_route_free_free_contacts",
         "propagation_same_articulation_rows",
-        "_fused_k1",
         "grouped_dynamics",
         "lazy_kinematics",
     ):

@@ -24,7 +24,6 @@ def configure_linear_state(solver) -> None:
         and solver.pgs_mode == "matrix_free"
         and solver._direct_compact_diagonal_inertia
         and not solver.grouped_dynamics
-        and not solver._fused_k1
         and plan is not None
     ):
         raise ValueError("prismatic linear state requires cached matrix-free direct-diagonal prismatic response")

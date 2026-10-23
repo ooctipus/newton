@@ -143,8 +143,8 @@ _EFFECTIVE = {
     "cached_dynamics": lambda solver: "on" if solver._tree_kinetic_state is not None else "off",
     "parallel_tree": lambda solver: solver._tree_plan is not None,
     "grouped_dynamics": lambda solver: solver._grouped_topology is not None,
-    # Deferred publication acts only with the fused world-dynamics kernel (K1), and not under patch friction.
-    "lazy_kinematics": lambda solver: solver._publication_deferred(),
+    # Nothing defers publication: the request only declines the resolved-world classifier.
+    "lazy_kinematics": lambda solver: False,
     # Tier budgets after their gates and clamps.
     "mf_gs_parallel_rows": lambda solver: int(solver._ink_rows),
     "mf_gs_parallel_matrix_free": lambda solver: bool(solver.mf_gs_parallel_matrix_free and solver._ink_rows > 0),
@@ -1151,10 +1151,6 @@ def _publication(solver, source) -> dict:
     fused = bool(solver._fused_publication)
     if solver._tree_kinetic_state is not None:
         owner, reason = "cached", "The held-tree owner publishes next-step state."
-    elif solver._publication_deferred():
-        owner, reason = "deferred", "Fused current dynamics permits deferred kinematics publication."
-    elif solver.lazy_kinematics and solver._fused_k1:
-        owner, reason = "ordinary", "Patch friction publishes every substep for its release test."
     elif fused:
         owner, reason = "fused_general", "Each articulation publishes in one launch per size group."
     elif not source._FUSED_PUBLISH:
@@ -1399,12 +1395,12 @@ def _grouped(solver, source) -> dict | None:
     # Stage-7 kinematics publication: the held-tree finish and the fused general publication bypass it.
     publishes = solver._fk_id_cache_enabled and (velocity_pass or not (held or solver._fused_publication))
     asynchronous = bool(solver._async_augmented_drives)
-    # _launch_rigid_tau: asynchronous drives without fused world dynamics, or drives that do not fuse tau.
+    # _launch_rigid_tau: asynchronous drives, or drives that do not fuse tau.
     tau = (
         not held
         and solver._direct_branch_tau_kernel is None
         and (
-            (asynchronous and not solver._fused_k1)
+            asynchronous
             or (not asynchronous and not (solver.drive_mode == "augmented" and solver.articulation_max_dofs > 0))
         )
     )
@@ -1429,7 +1425,6 @@ def _dynamics(solver, source) -> dict:
     return {
         "grouped_topology": solver._grouped_topology is not None,
         "grouped": _grouped(solver, source),
-        "fused_world_dynamics": bool(solver._fused_k1),
         "grouped_tau_mass": bool(solver._grouped_tau_mass),
         "grouped_mass": bool(solver._grouped_mass),
         "parallel_tree": solver._tree_plan is not None,

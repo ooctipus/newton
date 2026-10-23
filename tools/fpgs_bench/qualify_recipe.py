@@ -157,7 +157,6 @@ def qualify(
             "grouped_dynamics": solver.grouped_dynamics,
             "lazy_kinematics": solver.lazy_kinematics,
             "grouped_active": solver._grouped_topology is not None,
-            "fused_k1": solver._fused_k1,
             "pgs_mode": solver.pgs_mode,
         }
         for solver in solvers
@@ -170,7 +169,6 @@ def qualify(
     if candidate_pgs_mode is not None and report["paths"][1]["pgs_mode"] != candidate_pgs_mode:
         raise RuntimeError("Constructed candidate PGS mode differs from the requested recipe")
     report["grouped_execution_admitted"] = report["paths"][1]["grouped_active"]
-    report["lazy_execution_admitted"] = report["paths"][1]["fused_k1"]
     states = [[model.state(), model.state()] for _ in solvers]
     loaded_final = [model.state(), model.state()]
     contacts = pipeline.contacts()

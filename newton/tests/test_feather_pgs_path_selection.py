@@ -24,7 +24,6 @@ from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.configuration import resolve_kernel_choices
 from newton._src.solvers.feather_pgs.contact_row_plan import BUILDER_METHODS, contact_row_plan
 from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
-from newton._src.solvers.feather_pgs.path_selection import applied_options
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import (
     STANDING_REGION_BOUNDS,
@@ -1145,7 +1144,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             # resident, under either friction law.
             ({"sparse_mass_matrix": "off", "dense_max_constraints": 320}, {}),
             ({"sparse_mass_matrix": "off", "dense_max_constraints": 320, "friction_anchor_beta": 0.0}, {}),
-            # Lazy publication defers only on the fused world-dynamics kernel, and never under patch friction.
+            # lazy_kinematics defers no publication, under either friction law.
             (
                 {
                     "grouped_dynamics": True,
@@ -1218,13 +1217,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     for tier in tiers["tiers"]:
                         self.assertEqual(tier["kernel"].endswith("_linked_iso"), patch_law, tier)
                 self.assertEqual(applied["grouped_dynamics"], routes["dynamics"]["grouped_topology"])
-                self.assertEqual(
-                    applied["lazy_kinematics"],
-                    selected["options"]["lazy_kinematics"]["requested"]
-                    and routes["dynamics"]["fused_world_dynamics"]
-                    and routes["friction"]["law"] == "point",
-                )
-                self.assertEqual(applied["lazy_kinematics"], routes["publication"]["owner"] == "deferred")
+                self.assertFalse(applied["lazy_kinematics"])
                 if options.get("pgs_schedule") == "physx_grasp" and routes["sweep"]["route"] == "matrix_free_gs":
                     self.assertEqual(routes["sweep"]["driver"], "physx_grasp")
                 # A size whose response the grouped kernel solves is labeled so in the kernel plan.
@@ -1355,24 +1348,23 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             with self.subTest(choice=choice), self.assertRaisesRegex(ValueError, "cached_dynamics"):
                 SolverFeatherPGS(model, cached_dynamics=choice)
 
-    def test_cpu_patch_publication_is_never_deferred(self):
-        """Report every-substep publication for patch friction, even with lazy kinematics on the fused kernel."""
-        for beta, publication in ((0.0, "deferred"), (0.2, "ordinary")):
+    def test_lazy_kinematics_defers_no_publication(self):
+        """Publish every substep with lazy kinematics under either friction law; publish_kinematics changes nothing."""
+        for beta in (0.0, 0.2):
             with self.subTest(friction_anchor_beta=beta):
                 solver = SolverFeatherPGS(_cpu_model(), friction_anchor_beta=beta, lazy_kinematics=True)
-                # A stand-in for the CUDA-only fused world-dynamics kernel: the record reads host flags only.
-                solver._fused_k1 = True
                 selected = solver.get_path_selection()
-                self.assertEqual(selected["publication"], publication)
-                self.assertEqual(selected["routes"]["publication"]["owner"], publication)
-                # The options record was captured at construction, before the stand-in: recompute it.
-                options = applied_options(
-                    solver, SolverFeatherPGS.__init__, {"friction_anchor_beta": beta, "lazy_kinematics": True}
+                self.assertEqual(selected["publication"], "ordinary")
+                self.assertEqual(selected["routes"]["publication"]["owner"], "ordinary")
+                self.assertEqual(
+                    selected["options"]["lazy_kinematics"],
+                    {"applied": False, "requested": True, "default": False, "source": "argument"},
                 )
-                self.assertEqual(options["lazy_kinematics"]["applied"], publication == "deferred")
-                if beta:
-                    self.assertIn("release test", selected["reasons"]["publication"])
-                    self.assertIn("release test", selected["routes"]["publication"]["reason"])
+                state = solver.model.state()
+                published = state.body_q.numpy().copy(), state.body_qd.numpy().copy()
+                solver.publish_kinematics(state)
+                np.testing.assert_array_equal(state.body_q.numpy(), published[0])
+                np.testing.assert_array_equal(state.body_qd.numpy(), published[1])
 
     @unittest.skipUnless(wp.is_cuda_available(), "Cached dynamics requires CUDA")
     def test_cached_dynamics_overrides_environment_and_dense_conflicts(self):

@@ -108,7 +108,6 @@ class TestFeatherPGSSprings(unittest.TestCase):
                         use_parallel_streams=True,
                         grouped_dynamics=grouped,
                     )
-                    self.assertEqual(solver._fused_k1, grouped)
                     state_in, state_out = model.state(), model.state()
                     state_in.joint_qd.fill_(velocity)
                     solver.step(state_in, state_out, control, None, 0.001)
@@ -120,8 +119,8 @@ class TestFeatherPGSSprings(unittest.TestCase):
                         solver._last_debug_state_aug.joint_tau.numpy(), [-damping * velocity], atol=2e-5
                     )
                     results.append((state_out.joint_q.numpy(), state_out.joint_qd.numpy()))
-                for original, fused in zip(results[0], results[1], strict=True):
-                    np.testing.assert_allclose(fused, original, rtol=2e-5, atol=2e-6)
+                for original, other in zip(results[0], results[1], strict=True):
+                    np.testing.assert_allclose(other, original, rtol=2e-5, atol=2e-6)
 
 
 if __name__ == "__main__":

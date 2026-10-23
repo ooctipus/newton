@@ -45,7 +45,6 @@ class TestSparseGroupedDynamics(unittest.TestCase):
         self.assertIsNotNone(solver._grouped_topology)
         self.assertFalse(solver._grouped_tau_mass)
         self.assertFalse(solver._grouped_mass)
-        self.assertFalse(solver._fused_k1)
         self.assertEqual(solver.L_by_size[9].shape, (1, 1, 1))
 
     def assert_physics_close(self, first, second):

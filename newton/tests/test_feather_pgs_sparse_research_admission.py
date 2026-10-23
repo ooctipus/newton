@@ -342,7 +342,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 self.assertEqual(solver._pgs_solve_mf_gs_incremental_kernels, [])
                 self.assertIsNone(solver._ink_sizes)
                 self.assertEqual(solver._ink_rows, 0)
-                for name in ("_fused_k1", "_grouped_tau_mass", "_grouped_mass"):
+                for name in ("_grouped_tau_mass", "_grouped_mass"):
                     self.assertFalse(getattr(solver, name), name)
 
 

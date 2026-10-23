@@ -112,7 +112,6 @@ class TestTreeForestSteps(unittest.TestCase):
         self.assertIsNotNone(cases[2][1]._tree_kinetic_state)
         for arm, case in enumerate(cases):
             self.assertIsNotNone(case[1]._sparse_mass_matrix_size)
-            self.assertFalse(case[1]._fused_k1)
             # The route record the GPU gates grade: sparse factors, the owner where admitted, and a
             # lazy request that applies nothing on this route.
             selected = case[1].get_path_selection()
