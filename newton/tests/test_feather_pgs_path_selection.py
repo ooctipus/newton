@@ -162,7 +162,6 @@ def _plan_stand_in(law, sizes=(108, 6), **attributes):
         "_row_packets": None,
         "_keyed_rows": None,
         "_compact_contact_boundary": False,
-        "_compact_contact_order": None,
         "_sparse_mass_matrix_size": None,
         "_sparse_prepare_contacts": False,
         "_sparse_diagonal_contact_solve": False,
@@ -724,11 +723,11 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         """Map every producer's plan to its builder methods, kernels and law from host attributes alone.
 
         Stand-ins carry what contact_row_plan and the record read, so the producers that need CUDA are
-        pinned on CPU as well: local row packets, keyed rows, the compact contact boundary (unordered and
-        ordered), native sparse factors (with and without a metadata launch, with the free-body size), the
-        sparse-diagonal owner (with and without its schedule marker) and the compact Jacobian, beside the
-        general builder's methods and debug checks, each under both laws. The cases name every builder
-        method, and every kernel they name is one the launch check recognizes.
+        pinned on CPU as well: local row packets, keyed rows, the compact contact boundary, native sparse
+        factors (with and without a metadata launch, with the free-body size), the sparse-diagonal owner
+        (with and without its schedule marker) and the compact Jacobian, beside the general builder's
+        methods and debug checks, each under both laws. The cases name every builder method, and every
+        kernel they name is one the launch check recognizes.
         """
         layout = KeyedLayout(16, 6, 0, 16, 128, False, 0)
         marker = SimpleNamespace(key="mark_independent_sparse_contact_candidates_stand_in")
@@ -741,7 +740,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             point = law == "point"
             p = "" if point else "patch_"
             produce = f"produce_{p}contacts"
-            ordered = ["_build_contact_order", f"_produce_ordered_{p}contacts"]
             masked = point_masked if point else ["contact_row_prelude_patch", "populate_world_J_masked_patch"]
             fallback = (keyed_rows.get_fallback_kernel if point else keyed_rows.get_patch_fallback_kernel)(layout).key
             diagonal = {
@@ -782,17 +780,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     {
                         108: ("compact_contact_boundary", [produce, marker.key]),
                         6: ("compact_contact_boundary", ["clear_contact_response", produce]),
-                    },
-                    None,
-                ),
-                (
-                    {"_compact_contact_boundary": True, "_compact_contact_order": object(), **diagonal, **schedule},
-                    {},
-                    (108, 6),
-                    "compact_contact_boundary",
-                    {
-                        108: ("compact_contact_boundary", [*ordered, marker.key]),
-                        6: ("compact_contact_boundary", ["clear_contact_response", *ordered]),
                     },
                     None,
                 ),

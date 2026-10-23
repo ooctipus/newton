@@ -470,13 +470,7 @@ def _row_builder(solver, plan, size, source) -> dict:
     elif method == "compact_contact_boundary":
         from . import compact_contact  # noqa: PLC0415 - the owner's module; loaded with the owner
 
-        if solver._compact_contact_order is not None:
-            ordered = (
-                compact_contact._produce_ordered_patch_contacts if patch else compact_contact._produce_ordered_contacts
-            )
-            produce = (compact_contact._build_contact_order, ordered)
-        else:
-            produce = (compact_contact.produce_patch_contacts if patch else compact_contact.produce_contacts,)
+        produce = (compact_contact.produce_patch_contacts if patch else compact_contact.produce_contacts,)
         if size == solver._sparse_diagonal_response_size:
             # The marker encodes schedule links into the freshly published sparse DOF slots.
             kernels = (*produce, solver._mark_independent_sparse_contact_candidates_kernel)
@@ -557,7 +551,6 @@ def _contact_rows(solver, source) -> dict:
         "keyed_rows": {"enabled": solver._keyed_rows is not None, "reason": solver._keyed_rows_reason},
         "compact_contact": {
             "boundary": bool(solver._compact_contact_boundary),
-            "order": solver._compact_contact_order is not None,
             "reason": compact_reason,
         },
         "compact_jacobian": bool(solver._compact_contact_jacobian),

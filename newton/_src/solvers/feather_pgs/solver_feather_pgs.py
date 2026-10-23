@@ -327,7 +327,6 @@ _FUSED_PUBLISH = os.environ.get("FEATHER_PGS_FUSED_PUBLISH", "0") == "1"
 _PRISMATIC_PUBLICATION = os.environ.get("FEATHER_PGS_PRISMATIC_PUBLICATION", "0") == "1"
 _PRISMATIC_LINEAR_STATE = os.environ.get("FEATHER_PGS_PRISMATIC_LINEAR_STATE", "0") == "1"
 _COMPACT_CONTACT_BOUNDARY = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_BOUNDARY", "0") == "1"
-_COMPACT_CONTACT_ORDERING = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_ORDERING", "0") == "1"
 _DEBUG_CACHE = os.environ.get("FEATHER_PGS_DEBUG_CACHE") == "1"
 _DEBUG_CACHE_MODE = os.environ.get("FEATHER_PGS_DEBUG_CACHE_MODE", "")
 _DEBUG_DELAY = int(os.environ.get("FEATHER_PGS_DEBUG_DELAY", "0"))
@@ -3469,18 +3468,6 @@ class SolverFeatherPGS(SolverBase):
             from .compact_contact import supported  # noqa: PLC0415
 
             self._compact_contact_boundary = supported(self)
-
-        self._compact_contact_order = None
-        if (
-            self._compact_contact_boundary
-            and _COMPACT_CONTACT_ORDERING
-            and 0 < self.world_count * self.dense_max_constraints < (1 << 31)
-        ):
-            from .compact_contact import _ContactOrder  # noqa: PLC0415
-
-            self._compact_contact_order = _ContactOrder(
-                self._max_contacts_alloc, self.world_count, self.dense_max_constraints, model.device
-            )
 
         from .cached_dynamics import install as install_cached_dynamics  # noqa: PLC0415
 

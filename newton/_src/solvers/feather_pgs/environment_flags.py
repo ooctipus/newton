@@ -118,12 +118,6 @@ FLAGS = declare(
         "=1 selects the complete contact producer for the dense-six plus sparse solve.",
     ),
     _flag(
-        "FEATHER_PGS_COMPACT_CONTACT_ORDERING",
-        "experiment",
-        _SOLVER,
-        "=1 orders contacts for the compact contact producer; requires COMPACT_CONTACT_BOUNDARY.",
-    ),
-    _flag(
         "FEATHER_PGS_CONTACT_THREADS_X",
         "policy",
         _SOLVER,

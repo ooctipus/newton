@@ -330,11 +330,11 @@ _LAUNCH_FIELDS = {
 }
 
 
-def launch_solver(data, aux, *, anchors, order=None, beta=0.0):
+def launch_solver(data, aux, *, anchors, beta=0.0):
     """A solver namespace holding what ``launch_contacts`` binds, over the fixture's arrays.
 
     ``anchors`` turns on persistent patch friction with an enabled patch view and ``friction_anchor_beta``
-    ``beta``; ``order`` is the contact schedule, or ``None`` for collision order.
+    ``beta``.
     """
     return SimpleNamespace(
         **{name: getattr(data, field) for name, field in _LAUNCH_FIELDS.items()},
@@ -346,7 +346,6 @@ def launch_solver(data, aux, *, anchors, order=None, beta=0.0):
         J_by_size={6: data.J},
         Y_by_size={6: data.Y},
         _mark_independent_sparse_contact_candidates_kernel=object(),
-        _compact_contact_order=order,
         _friction_anchors_enabled=anchors,
         _friction_patches=SimpleNamespace(view=patch_view(aux.device) if anchors else FrictionPatches()),
         friction_anchor_beta=beta,
@@ -605,12 +604,12 @@ def assert_patch_tangent_law(solver, contacts):
     return anchors
 
 
-# The three solver arms of the CUDA tests: the sparse-diagonal owner, then the compact boundary unordered and ordered.
-_ARMS = ("sparse_diagonal", "unordered", "ordered")
+# The two solver arms of the CUDA tests: the sparse-diagonal owner, then the compact boundary.
+_ARMS = ("sparse_diagonal", "compact")
 
 
 def check_compact_records(test, solvers, law):
-    """Check and return the contact-row records of the three arms of ``build_solver_fixture`` under ``law``.
+    """Check and return the contact-row records of the two arms of ``build_solver_fixture`` under ``law``.
 
     Each names the builders of the diagonal-mass size (108) and the dense six with the friction law's
     variants. The marker encodes schedule links into the sparse rows: of point friction's triples, or of
@@ -628,11 +627,7 @@ def check_compact_records(test, solvers, law):
             }
         else:
             p = "patch_" if law == "patch" else ""
-            produce = (
-                [f"produce_{p}contacts"]
-                if arm == "unordered"
-                else ["_build_contact_order", f"_produce_ordered_{p}contacts"]
-            )
+            produce = [f"produce_{p}contacts"]
             expected = {
                 "108": ("compact_contact_boundary", [*produce, marker]),
                 "6": ("compact_contact_boundary", ["clear_contact_response", *produce]),
@@ -730,54 +725,10 @@ class TestCompactContact(unittest.TestCase):
             normal = candidate.row_type.numpy() == 0
             np.testing.assert_array_equal(candidate.diag.numpy()[normal], point.diag.numpy()[normal])
 
-    def test_ordered_patch_rows_match_collision_order(self):
-        """Publish patch rows through the contact schedule exactly as in collision order."""
-        units = (3, 1, 1, 3, 3, 3, 1, 3)
-        reference, aux = fixture(rows=units)
-        candidate, _ = fixture(rows=units)
-        law = compact.PatchRowLaw()
-        law.patches = patch_view(aux.device)
-        law.beta = 0.35
-        run_candidate(reference, aux, law=law)
-        # Permute the contacts and their patch view together; allocated rows keep their owners.
-        permutation = np.random.default_rng(457).permutation(16)
-        for field in ("point0", "point1", "normal", "shape0", "shape1", "margin0", "margin1"):
-            getattr(candidate, field).assign(getattr(reference, field).numpy()[permutation].copy())
-        for field in ("world", "slot", "art0", "art1", "path", "slots_needed"):
-            getattr(candidate, field).assign(getattr(reference, field).numpy()[permutation].copy())
-        for field in ("weight", "point_a", "point_b", "phi"):
-            getattr(law.patches, field).assign(getattr(law.patches, field).numpy()[permutation].copy())
-        install_prefix(candidate, aux)
-        wp.launch(
-            compact.clear_contact_response,
-            dim=(2, 256),
-            inputs=[aux.counts, aux.bounds, candidate.dense_group, candidate.J, candidate.Y],
-            block_dim=256,
-            device=aux.device,
-        )
-        compact._ContactOrder(16, 2, 40, aux.device).launch(candidate, 16, law)
-        wp.launch(
-            compact.produce_limit_response,
-            dim=(2, 12),
-            inputs=[
-                aux.bounds,
-                aux.counts,
-                candidate.dense_group,
-                candidate.factor,
-                candidate.J,
-                candidate.Y,
-                candidate.row_cfm,
-                candidate.diag,
-            ],
-            device=aux.device,
-        )
-        self.compare(reference, candidate, aux)
-
     def test_launch_binds_the_friction_law_of_the_solver(self):
         """Launch the patch producer exactly when anchors are on, with the solver's patch view and beta.
 
-        The tests above check the producers' rows; this checks the selection in ``launch_contacts``, in
-        collision order and through the contact schedule.
+        The tests above check the producers' rows; this checks the selection in ``launch_contacts``.
         """
         data, aux = fixture(rows=(3, 1, 1, 3, 3, 3, 1, 3))
         contacts = SimpleNamespace(
@@ -787,16 +738,10 @@ class TestCompactContact(unittest.TestCase):
                 for name in ("count", "point0", "point1", "normal", "shape0", "shape1", "margin0", "margin1")
             },
         )
-        producers = {
-            (False, False): compact.produce_contacts,
-            (True, False): compact.produce_patch_contacts,
-            (False, True): compact._produce_ordered_contacts,
-            (True, True): compact._produce_ordered_patch_contacts,
-        }
-        for (anchors, ordered), producer in producers.items():
-            with self.subTest(anchors=anchors, ordered=ordered):
-                order = compact._ContactOrder(16, 2, 40, aux.device) if ordered else None
-                solver = launch_solver(data, aux, anchors=anchors, order=order, beta=0.375 if anchors else 0.0)
+        producers = {False: compact.produce_contacts, True: compact.produce_patch_contacts}
+        for anchors, producer in producers.items():
+            with self.subTest(anchors=anchors):
+                solver = launch_solver(data, aux, anchors=anchors, beta=0.375 if anchors else 0.0)
                 with mock.patch.object(compact.wp, "launch") as launch:
                     compact.launch_contacts(
                         solver,
@@ -805,19 +750,16 @@ class TestCompactContact(unittest.TestCase):
                         contacts,
                         16,
                     )
-                schedule = [compact._build_contact_order] if ordered else []
                 marker = solver._mark_independent_sparse_contact_candidates_kernel
                 self.assertEqual(
                     [call.args[0] for call in launch.call_args_list],
-                    [compact.clear_contact_response, *schedule, producer, marker],
+                    [compact.clear_contact_response, producer, marker],
                 )
                 produce = launch.call_args_list[-2]
                 self.assertEqual(produce.kwargs["dim"], 16)
                 inputs = produce.kwargs["inputs"]
-                # The data, then the patch row law under anchors, then the schedule's order.
-                self.assertEqual(len(inputs), 1 + int(anchors) + int(ordered))
-                if ordered:
-                    self.assertIs(inputs[-1], order.order)
+                # The data, then the patch row law under anchors.
+                self.assertEqual(len(inputs), 1 + int(anchors))
                 if anchors:
                     law, view = inputs[1], solver._friction_patches.view
                     self.assertEqual(law.beta, 0.375)
@@ -954,10 +896,9 @@ class TestCompactContact(unittest.TestCase):
         for device in devices:
             model = build_solver_fixture(device)
             solvers = []
-            for enabled, ordered in ((False, False), (True, False), (True, True)):
+            for enabled in (False, True):
                 with (
                     mock.patch.object(solver_module, "_COMPACT_CONTACT_BOUNDARY", enabled),
-                    mock.patch.object(solver_module, "_COMPACT_CONTACT_ORDERING", ordered),
                     mock.patch.object(solver_module, "_PRISMATIC_PUBLICATION", True),
                     mock.patch.object(solver_module, "_SPARSE_CONTACT_DIRECT", True),
                 ):
@@ -976,9 +917,6 @@ class TestCompactContact(unittest.TestCase):
                     )
             self.assertFalse(solvers[0]._compact_contact_boundary)
             self.assertTrue(solvers[1]._compact_contact_boundary)
-            self.assertIsNone(solvers[0]._compact_contact_order)
-            self.assertIsNone(solvers[1]._compact_contact_order)
-            self.assertIsNotNone(solvers[2]._compact_contact_order)
             self.assertLessEqual(solvers[1]._dense_internal_max_rows, 12)
             for solver in solvers:
                 self.assertTrue(solver._sparse_diagonal_contact_triples)
@@ -1047,10 +985,9 @@ class TestCompactContact(unittest.TestCase):
             model = build_solver_fixture(device)
             model.rigid_contact_max = 24
             solvers = []
-            for enabled, ordered in ((False, False), (True, False), (True, True)):
+            for enabled in (False, True):
                 with (
                     mock.patch.object(solver_module, "_COMPACT_CONTACT_BOUNDARY", enabled),
-                    mock.patch.object(solver_module, "_COMPACT_CONTACT_ORDERING", ordered),
                     mock.patch.object(solver_module, "_SPARSE_CONTACT_DIRECT", True),
                 ):
                     solvers.append(
@@ -1064,11 +1001,10 @@ class TestCompactContact(unittest.TestCase):
                             mf_max_constraints=64,
                         )
                     )
-            for solver, enabled in zip(solvers, (False, True, True), strict=True):
+            for solver, enabled in zip(solvers, (False, True), strict=True):
                 self.assertTrue(solver._friction_anchors_enabled)
                 self.assertTrue(solver._sparse_diagonal_contact_units)
                 self.assertEqual(solver._compact_contact_boundary, enabled)
-            self.assertIsNotNone(solvers[2]._compact_contact_order)
             records = check_compact_records(self, solvers, "patch")
             states = [[model.state(), model.state()] for _ in solvers]
             controls = [model.control() for _ in solvers]
@@ -1089,7 +1025,7 @@ class TestCompactContact(unittest.TestCase):
                         assert_row_builders_named(self, records[index], keys)
                     states[index] = [following, current]
                 reference = contact_rows(solvers[0], contacts[0])
-                for index in (1, 2):
+                for index in range(1, len(solvers)):
                     for field in ("joint_q", "joint_qd", "body_q", "body_qd"):
                         np.testing.assert_allclose(
                             getattr(states[index][0], field).numpy(),
