@@ -2547,36 +2547,6 @@ def solve_compact_diagonal_mass(
 
 
 @wp.func
-def dense_subs(
-    n: int,
-    L_start: int,
-    b_start: int,
-    L: wp.array[float],
-    b: wp.array[float],
-    # outputs
-    x: wp.array[float],
-):
-    # Solves (L L^T) x = b for x given the Cholesky factor L
-    # forward substitution solves the lower triangular system L y = b for y
-    for i in range(n):
-        s = b[b_start + i]
-
-        for j in range(i):
-            s -= L[L_start + dense_index(n, i, j)] * x[b_start + j]
-
-        x[b_start + i] = s / L[L_start + dense_index(n, i, i)]
-
-    # backward substitution solves the upper triangular system L^T x = y for x
-    for i in range(n - 1, -1, -1):
-        s = x[b_start + i]
-
-        for j in range(i + 1, n):
-            s -= L[L_start + dense_index(n, j, i)] * x[b_start + j]
-
-        x[b_start + i] = s / L[L_start + dense_index(n, i, i)]
-
-
-@wp.func
 def _active_free_root_dof_start(
     free_root_joint_indices: wp.array[int],
     joint_qd_start: wp.array[int],
