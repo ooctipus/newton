@@ -25,7 +25,6 @@ def _admission_probe(**changes):
     """Provide the host fields the sparse sweep policy reads, for an admitted 18-DOF, 256-row route."""
     probe = SimpleNamespace(
         _kernel_overrides={},
-        _has_free_rigid_bodies=False,
         _friction_anchors_enabled=False,
         _patch_active_rows=False,
         max_world_dofs=18,
@@ -45,20 +44,17 @@ def _admit(probe, *, split=False, velocity=False, lanes=0):
 class TestFeatherPGSSparsePatchRows(unittest.TestCase):
     def test_point_admission_ignores_the_patch_policy(self):
         """Admit point friction's active rows exactly as before, whatever the patch policy says."""
-        for overrides, split, velocity, free, lanes in (
-            ({}, False, False, False, 0),
-            ({}, False, False, False, 16),
-            ({"sparse_active_contacts": False}, False, False, False, 0),
-            ({}, True, False, False, 8),
-            ({}, False, True, False, 0),
-            ({}, False, False, True, 0),
+        for overrides, split, velocity, lanes in (
+            ({}, False, False, 0),
+            ({}, False, False, 16),
+            ({"sparse_active_contacts": False}, False, False, 0),
+            ({}, True, False, 8),
+            ({}, False, True, 0),
         ):
-            expected = not overrides and not split and not velocity and not free
+            expected = not overrides and not split and not velocity
             for policy in (False, True):
-                with self.subTest(overrides=overrides, split=split, velocity=velocity, free=free, policy=policy):
-                    probe = _admission_probe(
-                        _kernel_overrides=overrides, _has_free_rigid_bodies=free, _patch_active_rows=policy
-                    )
+                with self.subTest(overrides=overrides, split=split, velocity=velocity, policy=policy):
+                    probe = _admission_probe(_kernel_overrides=overrides, _patch_active_rows=policy)
                     active, reason = _admit(probe, split=split, velocity=velocity, lanes=lanes)
                     self.assertEqual(active, expected)
                     if active:
@@ -82,23 +78,21 @@ class TestFeatherPGSSparsePatchRows(unittest.TestCase):
     def test_small_world_lanes_follow_the_full_sweep(self):
         """Pack small complete sweeps into 8 or 16 lanes from the full sweep's shared memory."""
         limit = 48 * 1024
-        for dofs, rows, free, mf_rows, environment, shared, expected in (
-            (8, 64, False, 0, {}, 1000, 8),
-            (9, 32, False, 0, {}, 1000, 16),
-            (16, 64, False, 0, {}, limit // 2, 16),
-            (16, 64, False, 0, {}, limit // 2 + 1, 0),
-            (17, 32, False, 0, {}, 1000, 0),
-            (9, 65, False, 0, {}, 1000, 0),
-            (9, 32, True, 0, {}, 1000, 0),
-            (9, 32, False, 4, {}, 1000, 0),
-            (9, 32, False, 0, {"FEATHER_PGS_SPARSE_SMALL_WORLDS": "0"}, 1000, 0),
+        for dofs, rows, environment, shared, expected in (
+            (8, 64, {}, 1000, 8),
+            (9, 32, {}, 1000, 16),
+            (16, 64, {}, limit // 2, 16),
+            (16, 64, {}, limit // 2 + 1, 0),
+            (17, 32, {}, 1000, 0),
+            (9, 65, {}, 1000, 0),
+            (9, 32, {"FEATHER_PGS_SPARSE_SMALL_WORLDS": "0"}, 1000, 0),
         ):
             with (
-                self.subTest(dofs=dofs, rows=rows, free=free, mf_rows=mf_rows, environment=environment, shared=shared),
+                self.subTest(dofs=dofs, rows=rows, environment=environment, shared=shared),
                 mock.patch.dict(os.environ, environment, clear=True),
             ):
-                probe = _admission_probe(max_world_dofs=dofs, dense_max_constraints=rows, _has_free_rigid_bodies=free)
-                self.assertEqual(SolverFeatherPGS._sparse_small_world_lanes(probe, shared, limit, mf_rows), expected)
+                probe = _admission_probe(max_world_dofs=dofs, dense_max_constraints=rows)
+                self.assertEqual(SolverFeatherPGS._sparse_small_world_lanes(probe, shared, limit), expected)
 
     def test_policy_reads_the_environment_once_and_reports_it(self):
         """Read FEATHER_PGS_PATCH_ACTIVE_ROWS at construction and report it in the friction record."""

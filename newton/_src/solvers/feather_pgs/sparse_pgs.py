@@ -20,7 +20,7 @@ from .row_inputs import RowArgument, make_row_kernel
 from .solve_policy import EXACT_POLICY, SolvePolicy, sweep_exit, vote
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport
-from .velocity_limit_law import accumulated_impulse, accumulated_update, check_velocity_limit_law
+from .velocity_limit_law import accumulated_update, check_velocity_limit_law
 
 _SPARSE_CONTACT_METRIC_CACHE_SIZE = 12
 _SPARSE_LOCAL_WORKSPACE_BYTES = 8 * 1024
@@ -67,26 +67,26 @@ def _get_pgs_solve_sparse_kernel(
     contact_transaction: str = "auto",
     transaction_blocks: int = 16,
 ) -> wp.Kernel:
-    """Build a CUDA sweep over factored articulations and physical free bodies.
+    """Build a CUDA sweep over factored articulations.
 
     Rows contain unique factor-coordinate indices, padded with -1. Both
     tangent rows of a contact must have identical, ordered support. The caller
     supplies ``row_incident = J v_hat``. Factor blocks store ``Z = J P^T L^-T``
-    once; physical free blocks store J and their response separately. All
-    coordinates accumulate deltas from v_hat; only factor blocks need decoding.
+    once. All coordinates accumulate deltas from v_hat, which the caller
+    decodes. Native sparse factors decline free rigid bodies, so
+    ``mf_max_constraints`` and ``free_row_dofs``, the capacities of physical
+    free-body rows, must be zero.
 
     This uses the existing interleaved row order and paired friction law,
     including linked patch normal loads. The caller admits only augmented
     drives, immediate response, and no warm start or torsion. ``velocity_limits``
     adds a final articulated limit pass to each sweep, whose unrelaxed
     corrections under ``velocity_limit_law`` accumulate in the factor delta.
-    It requires full ordered rows and no independent free-body response.
-    Seeded patch impulses retain the ordinary delta semantics.
-    Independent free-body rows follow the articulated rows in every sweep,
-    retaining their own response, capacity, friction law, and impulse buffer.
+    It requires full ordered rows. Seeded patch impulses retain the ordinary
+    delta semantics.
     ``active_rows`` selects point-contact normal/limit rows at sweep entry,
     then retains their ordered GS updates. Newly violated zero rows wait until
-    the next sweep; mixed responses and linked patches retain the full sweep.
+    the next sweep; linked patches retain the full sweep.
 
     ``linked_rows`` admits ring-linked patch normals to the active-row scan.
     A first tangent is then selected while any normal of its patch ring is
@@ -98,7 +98,7 @@ def _get_pgs_solve_sparse_kernel(
 
     ``use_support_table`` reads identical padded indices from a shared
     topology table. It requires a single factored articulation per world,
-    at offset zero, with no physical free-body response.
+    at offset zero.
 
     ``contact_triplets`` optionally retains tangent metrics within this call
     and publishes an admitted normal/tangent transaction once. It requires
@@ -130,8 +130,8 @@ def _get_pgs_solve_sparse_kernel(
 
     Small complete articulated sweeps may use 8 or 16 lanes per world, as in
     the local response/solve owner. Launch with ``ceil(world_count / (64 /
-    lanes_per_world))`` tiles and 64 threads per tile. Active-row bitsets and
-    independent free-body work retain whole warps.
+    lanes_per_world))`` tiles and 64 threads per tile. Active-row bitsets
+    retain whole warps.
 
     ``local_factors`` retains small factor rows in private shared storage,
     like the local response/solve owner. It expands sparse indices once per
@@ -140,12 +140,10 @@ def _get_pgs_solve_sparse_kernel(
     ``warm_start`` seeds the factor delta with the response of the impulses
     already stored in the row buffer before the first sweep, so carried
     contact impulses act on the velocity exactly as the ordinary route
-    installs them in ``v_out``. Warm start seeds no velocity-limit row. It
-    requires no independent free-body rows.
+    installs them in ``v_out``. Warm start seeds no velocity-limit row.
 
     ``velocity_limit_law="accumulated"`` makes the final velocity-limit pass
-    and independent free-body velocity-limit rows accumulate unrelaxed
-    unilateral impulses (:mod:`.velocity_limit_law`); velocity-limit rows enter
+    accumulate unrelaxed unilateral impulses (:mod:`.velocity_limit_law`); velocity-limit rows enter
     every solve with zero impulse, so warm starting still seeds none of them.
     The stateless default keeps the generated source byte-identical, and a
     sweep without velocity-limit rows ignores the law.
@@ -158,28 +156,28 @@ def _get_pgs_solve_sparse_kernel(
     left unvisited.
     """
     M, D, S = int(max_constraints), int(max_world_dofs), int(max_row_dofs)
-    F = int(mf_max_constraints)
-    P = int(free_row_dofs)
-    if M <= 0 or D <= 0 or S <= 0 or S > D or F < 0 or P < 0 or P > S:
+    # The kernel name keeps the free-body capacities, which are always zero.
+    F, P = int(mf_max_constraints), int(free_row_dofs)
+    if F or P:
+        raise ValueError("sparse PGS holds no physical free-body rows: mf_max_constraints and free_row_dofs must be 0")
+    if M <= 0 or D <= 0 or S <= 0 or S > D:
         raise ValueError("sparse PGS requires positive capacities and max_row_dofs <= max_world_dofs")
-    if use_support_table and (F or P or D > 64):
-        raise ValueError("sparse support tables require at most 64 factored DOFs and no free rows")
-    if velocity_limits and (F or P or active_rows or contact_triplets):
+    if use_support_table and D > 64:
+        raise ValueError("sparse support tables require at most 64 factored DOFs")
+    if velocity_limits and (active_rows or contact_triplets):
         raise ValueError("sparse joint velocity limits require full articulated row sweeps")
     L = int(lanes_per_world)
     if L not in (8, 16, 32):
         raise ValueError("sparse PGS requires 8, 16 or 32 lanes per world")
-    if L < 32 and (D > L or F or P or active_rows or contact_triplets):
+    if L < 32 and (D > L or active_rows or contact_triplets):
         raise ValueError("subwarp sparse PGS requires a small complete articulated sweep")
-    if local_factors and (D > 16 or M > 64 or F or P or active_rows or contact_triplets):
+    if local_factors and (D > 16 or M > 64 or active_rows or contact_triplets):
         raise ValueError("local factor storage requires a small complete articulated sweep")
-    if warm_start and F:
-        raise ValueError("sparse warm starting requires no independent free-body rows")
     if contact_transaction not in CONTACT_TRANSACTIONS:
         raise ValueError(f"contact_transaction must be one of {CONTACT_TRANSACTIONS}")
     launch_bounds = contact_transaction_launch_bounds(M, transaction_blocks=transaction_blocks)
     # Only a sweep that can hold velocity-limit rows has a law to choose; the others share one variant.
-    accumulated_limits = check_velocity_limit_law(velocity_limit_law) == "accumulated" and bool(velocity_limits or F)
+    accumulated_limits = check_velocity_limit_law(velocity_limit_law) == "accumulated" and bool(velocity_limits)
     index_read = (
         f"support.class_dof.data[support.row_class.data[offset + row] * {S} + entry]"
         if use_support_table
@@ -212,7 +210,7 @@ def _get_pgs_solve_sparse_kernel(
     friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
     limit_type = int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)
     velocity_limit_type = int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
-    active_rows = bool(active_rows) and F == 0 and P == 0
+    active_rows = bool(active_rows)
     # Linked triplets pool the ring as the pair update does, so they fuse in either sweep.
     contact_triplets = bool(contact_triplets) and (active_rows or bool(linked_rows)) and use_support_table and M >= 3
     linked_rows = bool(linked_rows) and (active_rows or contact_triplets)
@@ -309,168 +307,6 @@ def _get_pgs_solve_sparse_kernel(
                 pending &= pending - 1u;"""
         row_loop_end = "            }\n        }"
     impulse_slack = "change_tolerance + relative_change_tolerance * fabsf(new_impulse)"
-    mf_storage = mf_initialize = mf_sweep = mf_writeback = ""
-    if accumulated_limits:
-        free_velocity_limit = (
-            "                // Velocity limits accumulate an unrelaxed unilateral impulse.\n"
-            f"                new_impulse = {accumulated_impulse('old_impulse', 'residual * inverse_diagonal')};"
-        )
-        free_change = "const float change = new_impulse - old_impulse;"
-    else:
-        free_velocity_limit = """                // Velocity limits apply a stateless, unrelaxed correction.
-                new_impulse = residual < 0.0f ? -residual * inverse_diagonal : 0.0f;"""
-        free_change = f"const float change = kind == {velocity_limit_type} ? new_impulse : new_impulse - old_impulse;"
-    if F:
-        sibling_inverse = "__int_as_float(mf_meta.data[(mf_offset + sibling) * 4 + 1])"
-        mf_vote = vote(
-            solve_policy,
-            """                if (!(fabsf(change) <= change_tolerance + relative_change_tolerance * fabsf(new_impulse)
-                      && fabsf(sibling_change) <= change_tolerance + relative_change_tolerance * fabsf(new_impulse))) changed = 1;""",
-            flag="changed",
-            terms=(
-                ("change", "inverse_diagonal > 0.0f ? 1.0f / inverse_diagonal : 0.0f", "kind"),
-                ("sibling_change", f"{sibling_inverse} > 0.0f ? 1.0f / {sibling_inverse} : 0.0f", str(friction_type)),
-            ),
-            slack=(impulse_slack, impulse_slack),
-        )
-        mf_storage = f"""
-    __shared__ float mf_impulse_storage[{W * F}];
-    __shared__ float mf_incident_storage[{W * F}];
-    const int mf_offset = world * {F};
-    const int mf_count = min(mf_constraint_count.data[world], {F});
-    float* mf_impulse = mf_impulse_storage + slot * {F};
-    float* mf_incident = mf_incident_storage + slot * {F};
-"""
-        mf_initialize = f"""
-    for (int i = lane; i < mf_count; i += 32) {{
-        const int global_row = mf_offset + i;
-        mf_impulse[i] = mf_impulses.data[global_row];
-        const int dofs = mf_meta.data[global_row * 4];
-        const int first = dofs >> 16;
-        const int second = (dofs << 16) >> 16;
-        float incident = 0.0f;
-        for (int k = 0; k < 6; ++k) {{
-            if (first >= 0)
-                incident += mf_J_a.data[global_row * 6 + k]
-                    * v_hat.data[world_dof_indices.data[world * {D} + first + k]];
-            if (second >= 0)
-                incident += mf_J_b.data[global_row * 6 + k]
-                    * v_hat.data[world_dof_indices.data[world * {D} + second + k]];
-        }}
-        mf_incident[i] = incident;
-    }}
-"""
-        mf_sweep = f"""
-        for (int row = 0; row < mf_count; ++row) {{
-            const int global_row = mf_offset + row;
-            const int4 meta = *reinterpret_cast<const int4*>(&mf_meta.data[global_row * 4]);
-            const int kind = meta.w & 0xffff;
-            const bool friction = kind == {friction_type};
-            if (friction && global_iteration < friction_start_iteration) {{
-                if (lane == 0) mf_impulse[row] = 0.0f;
-                __syncwarp(MASK);
-                continue;
-            }}
-            const int parent = meta.w >> 16;
-            if (friction && row != parent + 1) continue;
-            const int sibling = friction ? parent + 2 : -1;
-            const float inverse_diagonal = __int_as_float(meta.y);
-            if (!friction && inverse_diagonal <= 0.0f) continue;
-            const int first = meta.x >> 16;
-            const int second = (meta.x << 16) >> 16;
-            int index = -1;
-            if (lane < 6 && first >= 0) index = first + lane;
-            if (lane >= 6 && lane < 12 && second >= 0) index = second + lane - 6;
-            float left = 0.0f, right = 0.0f, sibling_left = 0.0f, sibling_right = 0.0f;
-            if (index >= 0 && lane < 6) {{
-                left = mf_J_a.data[global_row * 6 + lane];
-                right = mf_MiJt_a.data[global_row * 6 + lane];
-                if (friction) {{
-                    sibling_left = mf_J_a.data[(mf_offset + sibling) * 6 + lane];
-                    sibling_right = mf_MiJt_a.data[(mf_offset + sibling) * 6 + lane];
-                }}
-            }}
-            if (index >= 0 && lane >= 6 && lane < 12) {{
-                left = mf_J_b.data[global_row * 6 + lane - 6];
-                right = mf_MiJt_b.data[global_row * 6 + lane - 6];
-                if (friction) {{
-                    sibling_left = mf_J_b.data[(mf_offset + sibling) * 6 + lane - 6];
-                    sibling_right = mf_MiJt_b.data[(mf_offset + sibling) * 6 + lane - 6];
-                }}
-            }}
-            // A coordinate has one writer, including coincident endpoint blocks.
-            if (first >= 0 && first == second) {{
-                if (lane < 6) {{
-                    left += mf_J_b.data[global_row * 6 + lane];
-                    right += mf_MiJt_b.data[global_row * 6 + lane];
-                    if (friction) {{
-                        sibling_left += mf_J_b.data[(mf_offset + sibling) * 6 + lane];
-                        sibling_right += mf_MiJt_b.data[(mf_offset + sibling) * 6 + lane];
-                    }}
-                }} else {{
-                    index = -1;
-                    left = right = sibling_left = sibling_right = 0.0f;
-                }}
-            }}
-            float dot = index >= 0 ? left * delta[index] : 0.0f;
-            float sibling_dot = index >= 0 ? sibling_left * delta[index] : 0.0f;
-            float cross = left * sibling_right;
-            for (int shift = 16; shift > 0; shift >>= 1) {{
-                dot += __shfl_down_sync(MASK, dot, shift);
-                sibling_dot += __shfl_down_sync(MASK, sibling_dot, shift);
-                cross += __shfl_down_sync(MASK, cross, shift);
-            }}
-            const float residual = __shfl_sync(MASK, dot, 0)
-                + mf_incident[row] + __int_as_float(meta.z);
-            const float old_impulse = mf_impulse[row];
-            float new_impulse = old_impulse;
-            float sibling_change = 0.0f;
-            if (friction) {{
-                float normal_load = mf_impulse[parent];
-                for (int next = mf_meta.data[(mf_offset + parent) * 4 + 3] >> 16;
-                     next >= 0 && next != parent; next = mf_meta.data[(mf_offset + next) * 4 + 3] >> 16)
-                    normal_load += mf_impulse[next];
-                const float radius = fmaxf(mf_row_mu.data[global_row] * normal_load, 0.0f);
-                const float old_sibling = mf_impulse[sibling];
-                float2 pair = make_float2(0.0f, 0.0f);
-                if (radius > 0.0f) {{
-                    const float sibling_inverse = __int_as_float(mf_meta.data[(mf_offset + sibling) * 4 + 1]);
-                    const float sibling_residual = __shfl_sync(MASK, sibling_dot, 0)
-                        + mf_incident[sibling]
-                        + __int_as_float(mf_meta.data[(mf_offset + sibling) * 4 + 2]);
-                    pair = friction_pair_candidate(inverse_diagonal > 0.0f ? 1.0f / inverse_diagonal : 0.0f,
-                        __shfl_sync(MASK, cross, 0), sibling_inverse > 0.0f ? 1.0f / sibling_inverse : 0.0f,
-                        residual, sibling_residual, old_impulse, old_sibling, radius, omega);
-                }}
-                const float magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
-                const float scale = magnitude > radius ? radius / magnitude : 1.0f;
-                new_impulse = pair.x * scale;
-                const float new_sibling = pair.y * scale;
-                sibling_change = new_sibling - old_sibling;
-                if (lane == 0) mf_impulse[sibling] = new_sibling;
-            }} else if (kind == {velocity_limit_type}) {{
-{free_velocity_limit}
-            }} else {{
-                new_impulse = old_impulse - omega * residual * inverse_diagonal;
-                if (kind == {contact_type}) new_impulse = fmaxf(new_impulse, 0.0f);
-            }}
-            {free_change}
-            if (lane == 0) mf_impulse[row] = new_impulse;
-            if (change != 0.0f || sibling_change != 0.0f) {{
-{mf_vote}
-                if (index >= 0) {{
-                    float value = delta[index];
-                    if (sibling_change != 0.0f) value += sibling_right * sibling_change;
-                    if (change != 0.0f) value += right * change;
-                    delta[index] = value;
-                }}
-            }}
-            __syncwarp(MASK);
-        }}
-"""
-        mf_writeback = """
-    for (int i = lane; i < mf_count; i += 32) mf_impulses.data[mf_offset + i] = mf_impulse[i];
-"""
     setup = f"""    __shared__ float delta_storage[{W * D}];
     __shared__ float impulse_storage[{W * M}];
     __shared__ float rhs_storage[{W * M}];
@@ -487,7 +323,7 @@ def _get_pgs_solve_sparse_kernel(
     float* rhs = rhs_storage + slot * {M};
     float* diagonal = diagonal_storage + slot * {M};
     unsigned char* type = type_storage + slot * {M};
-{mf_storage}
+
 {active_storage}
 {factor_storage}
 
@@ -498,7 +334,7 @@ def _get_pgs_solve_sparse_kernel(
         diagonal[i] = world_diag.data[offset + i];
         type[i] = static_cast<unsigned char>(world_row_type.data[offset + i]);
     }}
-{mf_initialize}
+
 {factor_initialize}
     __syncwarp(MASK);
 {active_initialize}
@@ -518,7 +354,7 @@ def _get_pgs_solve_sparse_kernel(
                 const int index = entry < {row_width} ? {index_read} : -1;
                 if (index >= 0) {{
                     float response = {factor_read};
-                    if ({str(bool(P)).lower()} && world_free_dof_mask.data[world * {D} + index] != 0)
+                    if (false && world_free_dof_mask.data[world * {D} + index] != 0)
                         response = row_free_response.data[(offset + row) * row_free_response.shape[2] + entry];
                     delta[index] += response * seed;
                 }}
@@ -641,7 +477,7 @@ def _get_pgs_solve_sparse_kernel(
                     ? {sibling_read} : 0.0f;
                 float response = value;
                 float sibling_response = sibling_value;
-                if ({str(bool(P)).lower()} && index >= 0 && world_free_dof_mask.data[world * {D} + index] != 0) {{
+                if (false && index >= 0 && world_free_dof_mask.data[world * {D} + index] != 0) {{
                     const int width = row_free_response.shape[2];
                     response = row_free_response.data[(offset + row) * width + entry];
                     if (friction)
@@ -779,7 +615,7 @@ for (int offset = 16; offset > 0; offset >>= 1) {{
     writeback = f"""
     for (int d = lane; d < {D}; d += {L}) factor_velocity_delta.data[world * {D} + d] = delta[d];
     for (int i = lane; i < count; i += {L}) world_impulses.data[offset + i] = impulse[i];
-{mf_writeback}
+
 """
     snippet = cuda_native(
         setup
@@ -791,7 +627,7 @@ for (int offset = 16; offset > 0; offset >>= 1) {{
 {row_loop}
 {row_update}
 {row_loop_end}
-{mf_sweep}
+
 {velocity_sweep}
 {sweep_finish}
     }}

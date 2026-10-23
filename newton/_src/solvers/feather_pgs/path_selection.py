@@ -55,7 +55,7 @@ _BETA_REASONS = {
 _PATCH_ROUTE_PRECEDENCE = (
     " Patch routes, first claim first: a parallel tier that mf_gs_parallel_rows requests (unless"
     " FEATHER_PGS_PATCH_PARALLEL_ROWS=0) declines native sparse factors, worlds with free rigid bodies then keep the"
-    " dense route unless FEATHER_PGS_PATCH_DENSE_PATHS=0, and native sparse factors take the worlds whose topology"
+    " dense route, and native sparse factors take the worlds whose topology"
     " they admit, own their rows and may select patch rows at sweep entry (sparse_mass_matrix.active_rows,"
     " FEATHER_PGS_PATCH_ACTIVE_ROWS). Where native sparse factors admit contact triplets"
     " (sparse_mass_matrix.contact_triplets, FEATHER_PGS_SPARSE_CONTACT_TRIPLETS=1), they fuse patch anchor units,"
@@ -63,16 +63,16 @@ _PATCH_ROUTE_PRECEDENCE = (
     " single-stage transaction (sparse_mass_matrix.contact_transaction, FEATHER_PGS_SPARSE_TRANSACTION)."
     " On the dense route an admitted paired factor sweep"
     " (paired_response.factor_coordinates) excludes the parallel tiers, keyed_rows and local_packets, even a tier"
-    " whose request declined sparse factors, and walks patch contact units (paired_response.contact_units) unless"
-    " FEATHER_PGS_PATCH_DENSE_PATHS=0. The row producer (contact_rows.producer) is the first admitted of"
+    " whose request declined sparse factors, and walks patch contact units (paired_response.contact_units)."
+    " The row producer (contact_rows.producer) is the first admitted of"
     " local_packets, keyed_rows (unless FEATHER_PGS_PATCH_PARALLEL_ROWS=0), the compact and sparse producers and"
-    " general, whose masked rows take the patch row law unless FEATHER_PGS_PATCH_DENSE_PATHS=0;"
+    " general, whose masked rows take the patch row law;"
     " contact_rows.builder_by_dof names each size's builder kernels and the law they write."
 )
 # Contact torsion (patch friction does not admit compliance) takes none of those routes.
 _ORDINARY_PATCH_ROUTES = (
     " Contact torsion and compliance keep ordinary factors, rows and serial sweeps, so"
-    " FEATHER_PGS_PATCH_ACTIVE_ROWS, FEATHER_PGS_PATCH_DENSE_PATHS, FEATHER_PGS_PATCH_PARALLEL_ROWS and"
+    " FEATHER_PGS_PATCH_ACTIVE_ROWS, FEATHER_PGS_PATCH_PARALLEL_ROWS and"
     " FEATHER_PGS_SPARSE_CONTACT_TRIPLETS select no route."
 )
 
@@ -476,7 +476,7 @@ def _row_builder(solver, plan, size, source) -> dict:
             kernels = (*produce, solver._mark_independent_sparse_contact_candidates_kernel)
         else:
             kernels = (compact_contact.clear_contact_response, *produce)
-    elif method in ("sparse_response", "sparse_free_response"):
+    elif method == "sparse_response":
         kernels = (*prepare, solver._sparse_contact_response_kernel)
     elif method == "sparse_diagonal":
         kernels = (*prepare, source.populate_sparse_diagonal_contact_response)
@@ -1298,7 +1298,7 @@ def _friction(solver) -> dict:
     reason = _BETA_REASONS[solver._friction_anchor_beta_source]
     if patch:
         parallel = "" if solver._parallel_contact_paths else "keyed rows, parallel matrix-free tiers and "
-        # FEATHER_PGS_PATCH_DENSE_PATHS=0 keeps patch friction off the resolved-world classifier.
+        # Patch friction reaches the resolved-world classifier on the dense paths only, not under torsion.
         classifier = "" if solver._patch_dense_paths else "the resolved-world classifier, "
         # FEATHER_PGS_PATCH_ACTIVE_ROWS=0 keeps patch friction off the sparse active-row scan.
         sparse = "" if solver._patch_active_rows else ", sparse active rows"

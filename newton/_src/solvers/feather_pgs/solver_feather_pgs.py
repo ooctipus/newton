@@ -275,7 +275,6 @@ from .sparse_contact import (
     SparseContactRows,
     _get_sparse_contact_response_kernel,
     apply_sparse_factor_velocity,
-    apply_sparse_free_velocity,
     build_sparse_joint_limit_rows,
     build_sparse_joint_velocity_limit_rows,
     build_sparse_mimic_rows,
@@ -3070,14 +3069,7 @@ class SolverFeatherPGS(SolverBase):
         # contact units, the masked row builder writes the patch row law, the
         # resolved-world classifier skips worlds whose rows all separate, and
         # worlds with free rigid bodies keep the dense route.
-        # FEATHER_PGS_PATCH_DENSE_PATHS=0 restores the general paired sweep, the
-        # per-contact row builder, complete rows in every world and sparse
-        # factors for free-body worlds.
-        self._patch_dense_paths = bool(
-            self._law_agnostic_contact_paths
-            and self._friction_anchors_enabled
-            and os.environ.get("FEATHER_PGS_PATCH_DENSE_PATHS", "1") != "0"
-        )
+        self._patch_dense_paths = bool(self._law_agnostic_contact_paths and self._friction_anchors_enabled)
         if self.pgs_mode == "matrix_free":
             self._jy_world_aliased = self._detect_jy_world_identity()
         else:
@@ -5648,17 +5640,15 @@ class SolverFeatherPGS(SolverBase):
         ):
             self._sparse_selection_reason = "A competing response or publication owner reserves the ordinary buffers."
             return
-        if self._has_free_rigid_bodies and (self._point_contact_paths or self._patch_dense_paths):
+        if self._has_free_rigid_bodies:
             # A world that pairs an articulation with free rigid bodies is served
             # by the held-tree owner and the paired response on the dense route
             # (measured: Kuka lift 12.7 ms there against 15.5 on sparse factors).
             # Both friction laws: patch friction walks contact units in the paired
             # sweep, writes masked patch rows and keeps the resolved-world
-            # classifier, unless FEATHER_PGS_PATCH_DENSE_PATHS=0. A parallel tier
-            # that mf_gs_parallel_rows requests (unless
+            # classifier. A parallel tier that mf_gs_parallel_rows requests (unless
             # FEATHER_PGS_PATCH_PARALLEL_ROWS=0) declines sparse factors first
-            # (above); the active-row scan below serves only worlds sparse factors
-            # keep, never free-body ones.
+            # (above), so native sparse factors never serve free rigid bodies.
             self._sparse_selection_reason = (
                 "Worlds with free rigid bodies keep the dense route for the held-tree owner and paired response."
             )
@@ -5676,10 +5666,6 @@ class SolverFeatherPGS(SolverBase):
             self._sparse_selection_reason = "Native sparse factors require one articulated response DOF size."
             return
         size = int(sizes[0])
-        # A six-DOF articulated group cannot share the independent free-body factor view.
-        if self._has_free_rigid_bodies and (size == 6 or 6 not in self._free_body_inertia_sizes):
-            self._sparse_selection_reason = "Free-body response cannot share this articulated factor layout."
-            return
         # The endpoint support uses one 64-bit ancestry mask, not a robot-specific DOF limit.
         if size > 64 or size not in self._crba_source_dof_by_size or size in self._diagonal_mass_sizes:
             self._sparse_selection_reason = (
@@ -5737,8 +5723,6 @@ class SolverFeatherPGS(SolverBase):
             # Different articulations have disjoint coordinate blocks, even
             # when they share the same topology and local ancestor indices.
             max_support = max(max_support, 2 * max(int(mask).bit_count() for mask in joint_masks))
-        if self._has_free_rigid_bodies:
-            max_support = max(max_support, max(int(mask).bit_count() for mask in joint_masks) + 6)
         # Response groups need not coexist in every world. No row can contain
         # more distinct coordinates than the largest world's response vector.
         max_support = min(max_support, self.max_world_dofs)
@@ -5748,13 +5732,12 @@ class SolverFeatherPGS(SolverBase):
         # Native kernels use static shared memory, as in the existing grouped CRBA path.
         shared_limit = min(48 * 1024, int(model.device.max_shared_memory_per_block))
         # Two worlds share a block: three float row arrays, row types, and velocity deltas.
-        mf_capacity = self.mf_max_constraints if self._has_free_rigid_bodies else 0
-        solve_shared_bytes = 8 * self.max_world_dofs + 26 * self.dense_max_constraints + 16 * mf_capacity
+        solve_shared_bytes = 8 * self.max_world_dofs + 26 * self.dense_max_constraints
         if split_candidate or velocity_candidate:
             solve_shared_bytes += 256  # Warp's tiled launch base.
         # Patch friction keeps the packed lanes of small worlds, so size them from the
         # full sweep before the active-row scan claims whole warps.
-        small_world_lanes = self._sparse_small_world_lanes(solve_shared_bytes, shared_limit, mf_capacity)
+        small_world_lanes = self._sparse_small_world_lanes(solve_shared_bytes, shared_limit)
         active_rows, active_rows_reason = self._admit_sparse_active_rows(
             split_candidate=split_candidate,
             velocity_candidate=velocity_candidate,
@@ -5815,7 +5798,6 @@ class SolverFeatherPGS(SolverBase):
         offsets = self.articulation_world_dof_offset.numpy()
         if (
             self._kernel_overrides.get("sparse_row_support", True)
-            and not self._has_free_rigid_bodies
             and not self._mimic_count
             and np.all(articulated_counts == 1)
             and size == self.max_world_dofs
@@ -5880,20 +5862,15 @@ class SolverFeatherPGS(SolverBase):
         index_shape = (1, 1, 1) if use_support_table else shape
         self._sparse_row_dof = wp.empty(index_shape, dtype=wp.int32, device=model.device)
         self._sparse_row_factor = wp.empty(shape, dtype=wp.float32, device=model.device)
-        # Ordinary contacts have at most one free endpoint; free/free rows retain
-        # their existing MF storage. Factor-coordinate responses alias the row.
-        free_shape = (*shape[:2], 6) if self._has_free_rigid_bodies else (1, 1, 1)
-        self._sparse_row_free_response = wp.empty(free_shape, dtype=wp.float32, device=model.device)
+        # The response kernel's free-body response output, where no contact records take
+        # it: a placeholder, since native sparse factors decline free rigid bodies.
+        self._sparse_row_free_response = wp.empty((1, 1, 1), dtype=wp.float32, device=model.device)
         self._sparse_row_incident = wp.empty(shape[:2], dtype=wp.float32, device=model.device)
         self._sparse_factor_velocity_delta = wp.empty(
             (self.world_count, self.max_world_dofs), dtype=wp.float32, device=model.device
         )
-        free_dof_mask = np.zeros((self.world_count, self.max_world_dofs), dtype=np.int32)
-        for art in np.flatnonzero(free_rigid & (response_dofs > 0)):
-            world = self._model_plan.articulation_world[art]
-            offset = offsets[art]
-            free_dof_mask[world, offset : offset + response_dofs[art]] = 1
-        self._sparse_world_free_dof_mask = wp.array(free_dof_mask, dtype=wp.int32, device=model.device)
+        # Placeholders of the sweep's free-coordinate mask and the response kernel's free-body factor.
+        self._sparse_world_free_dof_mask = wp.zeros((1, 1), dtype=wp.int32, device=model.device)
         self._sparse_free_factor_dummy = wp.zeros((1, 6, 6), dtype=wp.float32, device=model.device)
         self._crba_sparse_factor_kernel = _get_crba_sparse_factor_kernel(
             size, plan.nonzero_count, warps_per_block=self._sparse_factor_warps_per_block
@@ -5921,8 +5898,6 @@ class SolverFeatherPGS(SolverBase):
             self.dense_max_constraints,
             self.max_world_dofs,
             max_support,
-            mf_max_constraints=mf_capacity,
-            free_row_dofs=6 if self._has_free_rigid_bodies else 0,
             active_rows=active_rows,
             use_support_table=use_support_table,
             contact_triplets=self._sparse_contact_triplets,
@@ -5968,18 +5943,15 @@ class SolverFeatherPGS(SolverBase):
         )
         return kernel
 
-    def _sparse_small_world_lanes(self, solve_shared_bytes: int, shared_limit: int, mf_capacity: int) -> int:
+    def _sparse_small_world_lanes(self, solve_shared_bytes: int, shared_limit: int) -> int:
         """Return the lanes per world (8 or 16) that pack a small complete sparse sweep, or 0 for whole warps.
 
         Args:
             solve_shared_bytes: Shared memory of one world's full ordered sweep.
             shared_limit: Static shared memory available to one block.
-            mf_capacity: Independent free-body rows per world.
         """
         if (
             os.environ.get("FEATHER_PGS_SPARSE_SMALL_WORLDS", "1") == "0"
-            or mf_capacity
-            or self._has_free_rigid_bodies
             or self.max_world_dofs > 16
             or self.dense_max_constraints > 64
         ):
@@ -6008,8 +5980,6 @@ class SolverFeatherPGS(SolverBase):
             return False, "A private sparse_active_contacts override disables the active-row scan."
         if split_candidate or velocity_candidate:
             return False, "Split and velocity-limit rows keep full ordered sweeps."
-        if self._has_free_rigid_bodies:
-            return False, "Independent free-body rows keep full ordered sweeps."
         if not self._friction_anchors_enabled:
             return True, "Point-contact normal and limit rows are selected at sweep entry."
         if not self._patch_active_rows:
@@ -9270,21 +9240,6 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[self.v_out],
                 device=self.model.device,
             )
-            if self._has_free_rigid_bodies:
-                wp.launch(
-                    apply_sparse_free_velocity,
-                    dim=(self.n_arts_by_size[6], 6),
-                    inputs=[
-                        self.group_to_art[6],
-                        self.art_to_world,
-                        self.articulation_world_dof_offset,
-                        self.articulation_dof_start,
-                        self._sparse_factor_velocity_delta,
-                        self.v_hat,
-                    ],
-                    outputs=[self.v_out],
-                    device=self.model.device,
-                )
             return
         if self._sparse_diagonal_contact_solve:
             if row_phase_override not in (None, 0):
@@ -14775,8 +14730,6 @@ class SolverFeatherPGS(SolverBase):
                 contact_jacobian_workers = min(contacts.rigid_contact_max, _CONTACT_JACOBIAN_WORKER_CAP)
                 for size in self.size_groups:
                     method = plan.methods[size]
-                    if method == "sparse_free_response":
-                        continue  # The sparse response kernel writes the free bodies' response.
                     if method == "sparse_response":
                         indices = self._sparse_mass_matrix_indices
                         sparse_contact_workers = min(
@@ -14817,7 +14770,7 @@ class SolverFeatherPGS(SolverBase):
                                 indices.permutation,
                                 indices.row_offsets,
                                 self._sparse_Linv,
-                                self.Linv_by_size[6] if self._has_free_rigid_bodies else self._sparse_free_factor_dummy,
+                                self._sparse_free_factor_dummy,
                                 self.v_hat,
                                 self._sparse_contact_rows,
                                 dt,
@@ -16065,10 +16018,10 @@ class SolverFeatherPGS(SolverBase):
         """Whether the masked builder (FEATHER_PGS_ROWS_MASKED) may write this friction law's contact rows.
 
         Point friction may. Patch friction takes the masked builder's patch-law variants (row_build.py),
-        unless FEATHER_PGS_PATCH_DENSE_PATHS=0, the point-only row check (FEATHER_PGS_CHECK_ROWS) is
-        on, or the sweep builds its worlds' rows in-kernel: that defers the masked
-        launches past the patch link, which must stay the last writer of ring parents and friction
-        coefficients.
+        unless torsion or compliance keeps ordinary rows, the point-only row check
+        (FEATHER_PGS_CHECK_ROWS) is on, or the sweep builds its worlds' rows in-kernel: that defers the
+        masked launches past the patch link, which must stay the last writer of ring parents and
+        friction coefficients.
 
         This decides only the general builder's method (contact_row_plan). Local row packets, keyed
         rows (under patch friction unless FEATHER_PGS_PATCH_PARALLEL_ROWS=0), the compact producers

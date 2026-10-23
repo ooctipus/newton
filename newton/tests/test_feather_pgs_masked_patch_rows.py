@@ -3,7 +3,6 @@
 
 """The masked contact-row builder writes the persistent patch row law as the per-contact builder does."""
 
-import os
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -80,12 +79,12 @@ def _rows(solver, contacts):
     return records
 
 
-def _rollout(model, *, masked, steps, environment=None, **solver_kwargs):
+def _rollout(model, *, masked, steps, **solver_kwargs):
     """Step the scene with the masked builder on or off; return the solver and each step's rows by contact.
 
     Each step records its rows by contact, the body poses and, on CPU, the whole row arrays.
     """
-    with mock.patch.dict(os.environ, environment or {}), mock.patch.object(solver_module, "_ROWS_MASKED", masked):
+    with mock.patch.object(solver_module, "_ROWS_MASKED", masked):
         solver = SolverFeatherPGS(model, **solver_kwargs)
         pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False, deterministic=True)
         contacts = pipeline.contacts()
@@ -232,7 +231,7 @@ class TestMaskedPatchRowAdmission(unittest.TestCase):
             return SolverFeatherPGS._masked_contact_rows(solver)
 
     def test_patch_takes_masked_rows_unless_an_experiment_or_the_flag_needs_point_rows(self):
-        """Patch friction takes masked rows by policy; the point-only row check and deferred launches keep it off."""
+        """Patch friction takes masked rows; torsion, the point-only row check and deferred launches keep it off."""
         self.assertTrue(self._admit())
         self.assertTrue(self._admit(_point_contact_paths=True, _patch_dense_paths=False))
         self.assertTrue(self._admit(_point_contact_paths=True, _world_rows_owned_le=lambda: 64))
@@ -290,15 +289,6 @@ class TestMaskedPatchRows(unittest.TestCase):
         ):
             with self.subTest(scene=name):
                 self._assert_parity(model, steps, method, pgs_mode="split", pgs_iterations=8)
-
-    def test_cpu_flag_off_restores_the_per_contact_builder(self):
-        """FEATHER_PGS_PATCH_DENSE_PATHS=0 keeps patch friction on the per-contact builder."""
-        model = standing_model("cpu")
-        solver, _, methods = _rollout(
-            model, masked=True, steps=1, environment={"FEATHER_PGS_PATCH_DENSE_PATHS": "0"}, pgs_mode="split"
-        )
-        self.assertEqual(methods, {"per_contact"})
-        self.assertFalse(hasattr(solver, "_rows_prelude"))
 
     @unittest.skipUnless(wp.is_cuda_available(), "the matrix-free dense route requires CUDA")
     def test_cuda_masked_patch_rows_match_the_per_contact_builder(self):

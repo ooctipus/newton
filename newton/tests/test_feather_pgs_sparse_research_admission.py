@@ -44,11 +44,7 @@ class _AdmissionProbe(SimpleNamespace):
 
     @property
     def _patch_dense_paths(self):
-        return (
-            self._law_agnostic_contact_paths
-            and self._friction_anchors_enabled
-            and os.environ.get("FEATHER_PGS_PATCH_DENSE_PATHS", "1") != "0"
-        )
+        return self._law_agnostic_contact_paths and self._friction_anchors_enabled
 
 
 def _eligible_solver():
@@ -166,25 +162,6 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
                 self.assertIsNone(solver._sparse_mass_matrix_size)
                 self.assertIn("free rigid bodies", solver._sparse_selection_reason)
-        # FEATHER_PGS_PATCH_DENSE_PATHS=0 leaves patch friction's free-body worlds to sparse admission.
-        with (
-            mock.patch.dict(os.environ, {"FEATHER_PGS_PATCH_DENSE_PATHS": "0"}, clear=True),
-            self.assertRaises(_TopologyReached),
-        ):
-            solver = _eligible_solver()
-            solver._friction_anchors_enabled = True
-            solver._has_free_rigid_bodies = True
-            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-        # Point friction's free-body worlds keep the dense route whatever that switch says.
-        with (
-            self.subTest(friction_anchors=False, FEATHER_PGS_PATCH_DENSE_PATHS="0"),
-            mock.patch.dict(os.environ, {"FEATHER_PGS_PATCH_DENSE_PATHS": "0"}, clear=True),
-        ):
-            solver = _eligible_solver()
-            solver._has_free_rigid_bodies = True
-            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-            self.assertIsNone(solver._sparse_mass_matrix_size)
-            self.assertIn("free rigid bodies", solver._sparse_selection_reason)
         # The decline is about free rigid bodies, not the friction law: without them, both laws reach admission.
         for anchors in (False, True):
             with (
@@ -279,37 +256,23 @@ class TestSparseResearchAdmission(unittest.TestCase):
                         SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
 
     def test_patch_route_claims_follow_the_recorded_precedence(self):
-        """Claim a patch free-body world for a requested tier, then for the dense route, then for sparse factors.
+        """Claim a patch free-body world for a requested tier, then for the dense route.
 
         This is the order the patch friction record states. A tier that mf_gs_parallel_rows requests (unless
-        FEATHER_PGS_PATCH_PARALLEL_ROWS=0) declines sparse factors first, whatever FEATHER_PGS_PATCH_DENSE_PATHS
-        says; without it the free-body rule keeps the world dense unless FEATHER_PGS_PATCH_DENSE_PATHS=0; with
-        neither the world reaches sparse topology admission.
+        FEATHER_PGS_PATCH_PARALLEL_ROWS=0) declines sparse factors first; without it the free-body rule keeps
+        the world dense.
         """
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        for switch, dense_paths, declined in (
-            (True, None, "competing"),
-            (True, "0", "competing"),
-            (False, None, "free rigid bodies"),
-            (False, "0", None),
-        ):
-            environment = {} if dense_paths is None else {"FEATHER_PGS_PATCH_DENSE_PATHS": dense_paths}
-            with (
-                self.subTest(parallel_rows=switch, FEATHER_PGS_PATCH_DENSE_PATHS=dense_paths),
-                mock.patch.dict(os.environ, environment, clear=True),
-            ):
+        for switch, declined in ((True, "competing"), (False, "free rigid bodies")):
+            with self.subTest(parallel_rows=switch), mock.patch.dict(os.environ, {}, clear=True):
                 solver = _eligible_solver()
                 solver._friction_anchors_enabled = True
                 solver._has_free_rigid_bodies = True
                 solver.mf_gs_parallel_rows = 48
                 solver._patch_parallel_rows = switch
-                if declined is None:
-                    with self.assertRaises(_TopologyReached):
-                        SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-                else:
-                    SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-                    self.assertIsNone(solver._sparse_mass_matrix_size)
-                    self.assertIn(declined, solver._sparse_selection_reason)
+                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+                self.assertIsNone(solver._sparse_mass_matrix_size)
+                self.assertIn(declined, solver._sparse_selection_reason)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse construction requires CUDA")
     def test_branched_18_dof_trees_select_general_sparse(self):

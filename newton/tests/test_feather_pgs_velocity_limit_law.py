@@ -140,12 +140,6 @@ _GENERATORS = {
         {"velocity_limits": True},
         ("fmaxf(old_vlim - residual / denominator, 0.0f)",),
     ),
-    "sparse_free_rows": (
-        _get_pgs_solve_sparse_kernel.__wrapped__,
-        (48, 18, 12),
-        {"mf_max_constraints": 32, "free_row_dofs": 6},
-        ("fmaxf(old_impulse - residual * inverse_diagonal, 0.0f)",),
-    ),
 }
 
 # Text of the stateless law at its visits; none may survive in an accumulated kernel.

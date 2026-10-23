@@ -657,8 +657,8 @@ def finalize_resolved_worlds_bounded(
 def supported(solver) -> bool:
     """Whether the solver's rows follow the law the classifier evaluates.
 
-    The dense route with point contacts, or with persistent patch friction
-    (FEATHER_PGS_PATCH_DENSE_PATHS), the plain matrix-free interleaved sweep,
+    The dense route with point contacts, or with persistent patch friction,
+    the plain matrix-free interleaved sweep,
     and only unilateral row kinds whose zero-impulse condition is the
     predictor residual: contacts, their friction and joint position limits.
     A patch tangent pair projects on its ring's pooled normal load, which is
@@ -746,8 +746,6 @@ class ResolvedWorlds:
             self.reason = "The classifier evaluates the CUDA matrix-free route only."
         elif not getattr(solver, "_law_agnostic_contact_paths", False):
             self.reason = "Contact torsion and compliance rows are outside the contact laws it classifies."
-        elif not getattr(solver, "_point_contact_paths", False) and not getattr(solver, "_patch_dense_paths", False):
-            self.reason = "FEATHER_PGS_PATCH_DENSE_PATHS=0 keeps patch friction off the classifier."
         elif any(getattr(solver, name, False) for name in ("grouped_dynamics", "lazy_kinematics", "_fused_k1")):
             self.reason = "grouped_dynamics, lazy_kinematics and the fused world-dynamics kernel are not classified."
         elif getattr(solver, "_keyed_rows", None) is not None:

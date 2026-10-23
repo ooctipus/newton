@@ -506,7 +506,7 @@ class TestResolvedWorlds(unittest.TestCase):
         self.assertEqual(evaluate(data, raw, scratch, row_bound=(100, 2)), 0)
 
     def test_patch_friction_admission(self):
-        """Admit persistent patch friction on the dense route unless FEATHER_PGS_PATCH_DENSE_PATHS=0 or torsion."""
+        """Admit persistent patch friction on the dense route, not under torsion or compliance."""
         solver = _admissible_solver()
         self.assertTrue(rw.supported(solver))
         solver._point_contact_paths = False

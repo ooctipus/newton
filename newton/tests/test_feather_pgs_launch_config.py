@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import inspect
-import os
 import unittest
 from unittest import mock
 
@@ -226,22 +225,16 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
     def test_point_row_builders_preserve_main_contact_defaults(self):
         """Admit legacy row switches for explicit point friction, including debug dispatch.
 
-        Patch friction takes the masked builder's patch-law variant by policy
-        (FEATHER_PGS_PATCH_DENSE_PATHS), never the point-only row checks. The row
-        build dispatches on contact_row_plan.
+        Patch friction takes the masked builder's patch-law variant, never the
+        point-only row checks. The row build dispatches on contact_row_plan.
         """
         with wp.ScopedDevice("cpu"):  # the general builder; CUDA admits other producers first
             model = _build_chain_model(num_links=12, num_worlds=1)
-        for beta, environment, point, patch_masked in (
-            (None, {}, False, True),
-            (None, {"FEATHER_PGS_PATCH_DENSE_PATHS": "0"}, False, False),
-            (0.0, {}, True, False),
-        ):
-            with mock.patch.dict(os.environ, environment):
-                solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
+        for beta, point, patch_masked in ((None, False, True), (0.0, True, False)):
+            solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
             self.assertEqual(solver._point_contact_paths, point)
             for switch in ("_ROWS_MASKED", "_CHECK_ROWS"):
-                with self.subTest(beta=beta, environment=environment, switch=switch):
+                with self.subTest(beta=beta, switch=switch):
                     switches = dict.fromkeys(("_ROWS_MASKED", "_CHECK_ROWS"), False)
                     switches[switch] = True
                     # The plan reads the module's switches, as the solver's own admission does.

@@ -1379,22 +1379,3 @@ def apply_sparse_factor_velocity(
             )
     dof = articulation_dof_start[art] + permutation[column]
     v_out[dof] = v_hat[dof] + delta
-
-
-@wp.kernel(enable_backward=False)
-def apply_sparse_free_velocity(
-    group_to_art: wp.array[int],
-    art_to_world: wp.array[int],
-    articulation_world_dof_offset: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    factor_velocity_delta: wp.array2d[float],
-    v_hat: wp.array[float],
-    v_out: wp.array[float],
-):
-    """Publish physical free-body deltas without a coordinate conversion."""
-    group, column = wp.tid()
-    art = group_to_art[group]
-    world = art_to_world[art]
-    offset = articulation_world_dof_offset[art]
-    dof = articulation_dof_start[art] + column
-    v_out[dof] = v_hat[dof] + factor_velocity_delta[world, offset + column]

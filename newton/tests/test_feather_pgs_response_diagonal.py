@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import itertools
-import os
 import unittest
 from unittest import mock
 
@@ -1699,16 +1698,6 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 mf_max_constraints=32,
                 friction_anchor_beta=0.0,
             )
-            with mock.patch.dict(os.environ, {"FEATHER_PGS_PATCH_DENSE_PATHS": "0"}):
-                general = SolverFeatherPGS(
-                    model,
-                    pgs_mode="matrix_free",
-                    enable_joint_limits=True,
-                    joint_limit_activation_gap=0.0,
-                    pgs_iterations=8,
-                    dense_max_constraints=96,
-                    mf_max_constraints=32,
-                )
         self.assertTrue(solvers[0.0]._friction_anchors_enabled)
         self.assertTrue(solvers[0.0]._paired_factor_coordinates)
         # Patch rows are not uniform triples; the factor sweep walks patch contact units instead.
@@ -1716,11 +1705,6 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         self.assertTrue(solvers[0.0]._factor_coordinate_contact_units)
         self.assertIn("_units", solvers[0.0]._paired_factor_solve_kernel.key)
         self.assertTrue(solvers[0.0].get_path_selection()["routes"]["paired_response"]["contact_units"])
-        # FEATHER_PGS_PATCH_DENSE_PATHS=0 restores the general factor sweep.
-        self.assertTrue(general._paired_factor_coordinates)
-        self.assertFalse(general._factor_coordinate_contact_units)
-        self.assertNotIn("_units", general._paired_factor_solve_kernel.key)
-        self.assertNotIn("_contact3", general._paired_factor_solve_kernel.key)
         self.assertFalse(point._friction_anchors_enabled)
         self.assertTrue(point._paired_factor_coordinates)
         self.assertTrue(point._factor_coordinate_contact_triples)

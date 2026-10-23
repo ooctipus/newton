@@ -20,7 +20,6 @@ BUILDER_METHODS = (
     "keyed_rows",
     "compact_contact_boundary",
     "sparse_response",
-    "sparse_free_response",
     "sparse_diagonal",
     "compact_jacobian",
     "per_contact",
@@ -65,9 +64,9 @@ def contact_row_plan(solver) -> ContactRowPlan:
     Builder methods by producer:
 
     - ``local_packets``, ``keyed_rows``, ``compact_contact_boundary``: the owner's own builder.
-    - Shared-metadata producers: ``sparse_response`` for the factored size, ``sparse_free_response``
-      for the free-body size, whose response the sparse kernel writes; ``sparse_diagonal`` for the
-      diagonal-mass size; ``compact_jacobian`` for every other size.
+    - Shared-metadata producers: ``sparse_response`` for the factored size, the only size of a model
+      native sparse factors admit; ``sparse_diagonal`` for the diagonal-mass size; ``compact_jacobian``
+      for every other size.
     - ``general``: ``masked_combined`` (one launch for the one or two sizes of at most 32 DOFs),
       ``masked`` (one launch per size), else ``per_contact``.
     """
@@ -91,8 +90,8 @@ def contact_row_plan(solver) -> ContactRowPlan:
         methods = {}
         for size in sizes:
             if sparse_size is not None:
-                # Native sparse factors admit one articulated size; the other is the free bodies'.
-                methods[size] = "sparse_response" if size == sparse_size else "sparse_free_response"
+                # Native sparse factors admit one articulated size and no free rigid bodies.
+                methods[size] = "sparse_response"
             elif diagonal and size == solver._sparse_diagonal_response_size:
                 methods[size] = "sparse_diagonal"
             else:
