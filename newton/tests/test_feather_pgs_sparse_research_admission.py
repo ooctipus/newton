@@ -217,19 +217,6 @@ class TestSparseResearchAdmission(unittest.TestCase):
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
         self.assertIsNone(solver._sparse_mass_matrix_size)
 
-    def test_multiblock_request_keeps_existing_owner(self):
-        """Leave explicit multiblock selection and its feature validation on the existing path."""
-        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
-        for patches in (False, True):
-            with (
-                self.subTest(patches=patches),
-                mock.patch.dict(os.environ, {"FEATHER_PGS_MF_MULTIBLOCK": "1"}, clear=True),
-            ):
-                solver = _eligible_solver()
-                solver._friction_anchors_enabled = patches
-                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
-                self.assertIsNone(solver._sparse_mass_matrix_size)
-
     def test_implicit_gyro_only_reserves_worlds_with_free_bodies(self):
         """Keep the alternative gyro owner without rejecting an inactive no-free-body request."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)

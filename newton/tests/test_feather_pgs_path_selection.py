@@ -471,7 +471,8 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertFalse(routes["velocity_limits"]["free_body_rows"])
         self.assertEqual(routes["friction"]["law"], "patch")
         self.assertEqual(routes["friction"]["anchor_beta_source"], "default")
-        self.assertIn("need point friction", routes["friction"]["reason"])
+        # Every contact owner of the default route serves patch friction, so the record names none as point-only.
+        self.assertNotIn("need point friction", routes["friction"]["reason"])
         # The compact contact boundary and the local packets write the patch row law as well.
         self.assertNotIn("compact contacts", routes["friction"]["reason"])
         self.assertNotIn("local packets", routes["friction"]["reason"])
@@ -513,7 +514,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 routes = SolverFeatherPGS(model).get_path_selection()["routes"]
                 friction = routes["friction"]
                 self.assertEqual(friction["law"], "patch")
-                owners, precedence = friction["reason"].split(" need point friction.")
+                owners, _, precedence = friction["reason"].rpartition(" need point friction.")
                 # The resolved-world classifier serves patch friction unless FEATHER_PGS_PATCH_DENSE_PATHS=0.
                 self.assertEqual("resolved-world classifier" in owners, flag == "0")
                 # Route claims, the paired factor sweep's exclusions, then row producers, in the solver's order.

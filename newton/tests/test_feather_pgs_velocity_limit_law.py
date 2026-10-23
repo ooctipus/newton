@@ -201,9 +201,8 @@ class TestVelocityLimitLawSources(unittest.TestCase):
 
         The solver builds each matrix-free sweep with ``_velocity_limit_kernel_law()``, so its kernels apply the
         law that ``routes.velocity_limits.law`` reports. A call that omits the argument builds the stateless law
-        under either option, as the multi-block solver's dense-tile sweeps
-        (``FEATHER_PGS_MF_MULTIBLOCK_DENSE_TILES=1``) did. A sweep built through ``_sweep_kernel(route, factory,
-        ...)``, which applies the solve policy, is a call of its factory.
+        under either option. A sweep built through ``_sweep_kernel(route, factory, ...)``, which applies the solve
+        policy, is a call of its factory.
         """
         factories = set()
         for name, value in vars(solver_source).items():
@@ -237,7 +236,7 @@ class TestVelocityLimitLawSources(unittest.TestCase):
             calls += 1
             if "velocity_limit_law" not in {keyword.arg for keyword in node.keywords}:
                 missing.append(f"{name} at line {node.lineno}")
-        self.assertGreaterEqual(calls, 6)
+        self.assertGreaterEqual(calls, 4)
         self.assertEqual(missing, [])
 
     def test_unknown_laws_are_rejected(self):
@@ -522,8 +521,8 @@ class TestVelocityLimitLawKernels(unittest.TestCase):
         """Run the chain's rows through the serial sweeps in both orders and both row phases.
 
         Phase 0 visits velocity-limit rows in the end-of-iteration pass, phase 5 in
-        the main row loop (the velocity-limit phase of the propagation and
-        multi-block schedules). Reversing the row order moves the accumulated
+        the main row loop (the velocity-limit phase of the propagation
+        schedules). Reversing the row order moves the accumulated
         result by at most 1e-6; the stateless law's move documents the
         order-dependent over-braking the accumulated law removes.
         """
@@ -653,30 +652,6 @@ class TestVelocityLimitLawRollouts(unittest.TestCase):
                     speeds.append(float(abs(state.joint_qd.numpy()[0])))
                 self.assertGreater(max(speeds), 0.99 * limit, speeds)
                 self.assertLessEqual(max(speeds), limit * (1.0 + 1.0e-5), speeds)
-
-    def test_dense_tile_sweeps_take_the_solver_law(self):
-        """Build the multi-block solver's dense-tile sweeps with the law its other sweeps take.
-
-        ``FEATHER_PGS_MF_MULTIBLOCK_DENSE_TILES=1`` replaces the MF-GS kernel of the phase-6 dense pass with an
-        unstaged or a staged dense-tile kernel. Phase 6 visits no velocity-limit row (phase 5 runs the ordinary
-        kernel), so the law moves no impulse there, but the kernels must carry the law that
-        ``routes.velocity_limits.law`` reports.
-        """
-        model = _pushed_arm("cuda:0", 1.0)
-        multiblock = {"FEATHER_PGS_MF_MULTIBLOCK": "1", "FEATHER_PGS_MF_MULTIBLOCK_DENSE_TILES": "1"}
-        for law in ("stateless", "accumulated"):
-            with self.subTest(law=law), mock.patch.dict(os.environ, multiblock):
-                os.environ.pop(_LAW_FLAG, None)
-                solver = _matrix_free_solver(model, law, mf_gs_incremental_rows=0)
-                self.assertIsNotNone(solver._mf_dense_support)
-                self.assertEqual(solver.get_path_selection()["routes"]["velocity_limits"]["law"], law)
-                kernels = (
-                    solver._pgs_solve_mf_gs_kernel,
-                    solver._pgs_solve_mf_dense_tiles_kernel,
-                    solver._pgs_solve_mf_dense_tiles_staged_kernel,
-                )
-                for kernel in kernels:
-                    self.assertEqual("_vacc" in kernel.key, law == "accumulated", kernel.key)
 
     def test_accumulated_serial_sweep_converges_to_the_parallel_tier(self):
         """Converge every serial sweep route under the accumulated law to the parallel tier's fixed point.

@@ -1130,9 +1130,9 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 if beta == 0.0:
                     self.assertIn("Point friction", friction["parallel_rows"]["reason"])
                     continue
-                # Under the switch the only parallel-row owners left to point friction are the response blocks.
+                # Under the switch no point-contact owner is left to name.
                 self.assertEqual("keyed rows" in friction["reason"], not admitted)
-                self.assertIn("need point friction", friction["reason"])
+                self.assertEqual("need point friction" in friction["reason"], not admitted)
                 if admitted:
                     self.assertIn("patch ring", friction["parallel_rows"]["reason"])
                     self.assertNotIn("point contacts", keyed["reason"])

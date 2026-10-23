@@ -334,48 +334,6 @@ FLAGS = declare(
         "=1 uses the exact A-based step scale in the matrix-free parallel sweep.",
     ),
     _flag(
-        "FEATHER_PGS_MF_MULTIBLOCK",
-        "experiment",
-        _SOLVER,
-        "=1 colors free-body contact pairs for multi-block matrix-free sweeps.",
-    ),
-    _flag(
-        "FEATHER_PGS_MF_MULTIBLOCK_CACHE_COEFFICIENTS",
-        "experiment",
-        _SOLVER,
-        "=1 caches row coefficients in the multi-block solver.",
-    ),
-    _flag(
-        "FEATHER_PGS_MF_MULTIBLOCK_DENSE_TILES",
-        "experiment",
-        _SOLVER,
-        "=1 adds dense row-support tiles to the multi-block solver.",
-    ),
-    _flag(
-        "FEATHER_PGS_MF_MULTIBLOCK_DIRECT_STATIC",
-        "experiment",
-        _SOLVER,
-        "=1 solves static pairs directly in the multi-block solver.",
-    ),
-    _flag(
-        "FEATHER_PGS_MF_MULTIBLOCK_MODE",
-        "experiment",
-        _SOLVER,
-        "Multi-block schedule (default colored).",
-    ),
-    _flag(
-        "FEATHER_PGS_MF_MULTIBLOCK_PARALLEL_PREPARE",
-        "experiment",
-        _SOLVER,
-        "=1 prepares the multi-block colors in parallel.",
-    ),
-    _flag(
-        "FEATHER_PGS_MF_MULTIBLOCK_STAGE_VELOCITIES",
-        "experiment",
-        _SOLVER,
-        "=1 stages velocities in the dense-tile multi-block kernels.",
-    ),
-    _flag(
         "FEATHER_PGS_MIXED_TREE_KINETIC_STATE",
         "policy",
         _CACHE,

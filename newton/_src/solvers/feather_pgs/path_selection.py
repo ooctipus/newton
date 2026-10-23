@@ -589,7 +589,7 @@ def _local_solve(solver) -> dict:
         reason = (
             "Local owners need CUDA matrix-free immediate interleaved augmented-drive solving with free rigid "
             "bodies present, one small articulation per world, and no velocity limits, velocity passes, warm "
-            "start, preelimination, debug, torsion or multiblock."
+            "start, preelimination, debug or torsion."
         )
     # The candidate counts predate sparse admission, which can retire the owners; report built owners only.
     return {
@@ -625,8 +625,8 @@ def _paired_response(solver) -> dict:
         "two_stream_overlap": overlap,
         "two_stream_reason": "The paired factor sweep and the general sweep fork onto two streams."
         if overlap
-        else "Overlap needs independent components on parallel CUDA streams without debug, warm start, "
-        "parallel tiers or a response block.",
+        else "Overlap needs independent components on parallel CUDA streams without debug, warm start or "
+        "parallel tiers.",
         "reason": "One articulation factor and one free body per world share one response"
         + (" in factor coordinates." if factor else " with a register inverse."),
     }
@@ -733,11 +733,6 @@ def _sweep(solver, source) -> dict:
             if solver.propagation_full_fused_iterations
             else "Each iteration interleaves the route's row phases with the propagation row solve."
         )
-    elif route == "matrix_free_gs" and solver._mf_multiblock is not None:
-        driver = "multiblock"
-        driver_reason = (
-            "Each iteration launches the dense row phase, then every color (or the mass split) and the tail."
-        )
     elif route == "matrix_free_gs" and solver.pgs_schedule == "contact_then_internal":
         driver = "contact_then_internal"
         driver_reason = "Contact rows sweep all iterations in one dispatch, then internal rows in a second."
@@ -798,7 +793,6 @@ def _sweep(solver, source) -> dict:
             "pair": _keys_by_size(solver._pgs_solve_local_pair_kernels),
             "residual": _keys_by_size(solver._pgs_solve_local_residual_kernels),
         }
-    multiblock = solver._mf_multiblock
     record = {
         "route": route,
         "reason": reason,
@@ -815,8 +809,6 @@ def _sweep(solver, source) -> dict:
         "mf_gs_storage": _mf_gs_storage(solver),
         "tiers": _tiers(solver),
         "local": local,
-        "multiblock": None if multiblock is None else multiblock.mode,
-        "dense_tiles": solver._mf_dense_support is not None,
         "dense": dense,
         "free_body_matrix_free": free_body,
         "propagation": propagation,
@@ -828,36 +820,23 @@ def _sweep(solver, source) -> dict:
 
 
 def _sweep_kernels(solver, record) -> set:
-    """Every sweep kernel key of a sweep record, with the dense-tile kernels the record names only by a flag."""
+    """Every sweep kernel key of a sweep record."""
     keys = {record[name] for name in ("sparse", "sparse_diagonal", "paired_factor", "mf_gs", "free_body_matrix_free")}
     keys.update(tier["kernel"] for tier in (record["tiers"] or {}).get("tiers", ()))
     for owner in ("internal", "pair", "residual"):
         keys.update((record["local"] or {}).get(owner, {}).values())
     keys.update((record["dense"] or {}).get("kernels", ()))
     keys.update(value for key, value in (record["propagation"] or {}).items() if key not in ("mode", "cached_response"))
-    if record["dense_tiles"]:
-        # They replace the matrix-free sweep at the multi-block driver's row phase 6, built without a policy.
-        keys.update(
-            _key(getattr(solver, name, None))
-            for name in ("_pgs_solve_mf_dense_tiles_kernel", "_pgs_solve_mf_dense_tiles_staged_kernel")
-        )
     keys.discard(None)
     return keys
-
-
-def _flagged_owners(record) -> list[str]:
-    """Owners of sweeps without counters or exit that a sweep record names by a flag, not by kernel keys."""
-    return [name for name in ("multiblock",) if record[name]]
 
 
 def _uncounted_worlds(record) -> dict:
     """Owners whose sweeps solve rows without counters, with the worlds or rows each one solves.
 
     A world one owns whole holds rows, so the skip counter leaves it out, and the counted sweeps do
-    not enter it: its solves are in no slot and not skipped. The multi-block driver's kernels own
-    part of every world instead (the dense tiles its dense rows, the color, tail and mass-split
-    kernels its matrix-free rows), so a counted launch counts such a world without those rows'
-    sweeps. The incremental tiers count their own worlds.
+    not enter it: its solves are in no slot and not skipped. The incremental tiers count their own
+    worlds.
     """
     owners = {}
     tiers = record["tiers"] or {}
@@ -867,17 +846,6 @@ def _uncounted_worlds(record) -> dict:
             f"Worlds without matrix-free rows and with 1 to {rows} dense rows that no local owner claims: the "
             "parallel (Jacobi) tiers solve them under their own sweep budget and mf_gs_parallel_tol, and the "
             "matrix-free sweep returns before its first sweep."
-        )
-    if record["dense_tiles"]:
-        owners["dense_tiles"] = (
-            "Every world's dense rows on the multi-block driver: the dense-tile kernels sweep them at row phase 6 "
-            "in place of the matrix-free sweep."
-        )
-    if record["multiblock"]:
-        owners["multiblock"] = (
-            "Every world's matrix-free rows on the multi-block driver: its color, tail or mass-split kernels sweep "
-            "them after each dense row-phase launch, without counters or an exit, so the matrix-free sweep's "
-            "slot counts its dense row-phase launches only."
         )
     if record["propagation"] is not None:
         owners["propagation"] = (
@@ -895,7 +863,7 @@ def _fused_propagation(record) -> bool:
 def _readout(solver, record) -> dict:
     """Which sweep kernels of the route count their sweeps under ``pgs_solve_readout``, and why the others do not."""
     counted = solver._solve_readout.kernels
-    uncounted = sorted(_sweep_kernels(solver, record) - counted.keys()) + _flagged_owners(record)
+    uncounted = sorted(_sweep_kernels(solver, record) - counted.keys())
     uncounted_worlds = _uncounted_worlds(record) if counted else {}
     if solver.pgs_solve_readout == "off":
         reason = "pgs_solve_readout is off."
@@ -905,9 +873,7 @@ def _readout(solver, record) -> dict:
             "counters, and none of the sweeps that count launches, so nothing counts."
         )
     elif not counted:
-        reason = (
-            "No sweep of this route carries counters: fixed-iteration, Jacobi-tier and response-block sweeps do not."
-        )
+        reason = "No sweep of this route carries counters: fixed-iteration and Jacobi-tier sweeps do not."
     elif record["driver"] == "direct":
         reason = "Each launch of a counted kernel solves its worlds; uncounted sweeps carry no counters."
     elif record["driver"] == "contact_then_internal":
@@ -942,7 +908,7 @@ def _exit_law(solver, record) -> dict:
     tolerance = float(solver.pgs_velocity_change_tolerance)
     honored = dict(sorted(solver._solve_policy_honored.items()))
     declined = dict(sorted(solver._solve_policy_declined.items())) if tolerance > 0.0 else {}
-    ignored = sorted(_sweep_kernels(solver, record) - honored.keys() - declined.keys()) + _flagged_owners(record)
+    ignored = sorted(_sweep_kernels(solver, record) - honored.keys() - declined.keys())
     driver_honors = record["driver"] in ("direct", "contact_then_internal")
     if tolerance == 0.0:
         reason = "pgs_velocity_change_tolerance is 0: every sweep keeps the exact stationary-sweep law."
@@ -984,7 +950,7 @@ def _contact_update(solver, record) -> dict:
     requested = solver.contact_update
     sequential = []
     if requested == "unit":
-        sequential = sorted(_sweep_kernels(solver, record) - set(unit)) + _flagged_owners(record)
+        sequential = sorted(_sweep_kernels(solver, record) - set(unit))
     if requested == "sequential":
         reason = (
             "contact_update is 'sequential': a sweep steps each contact's normal row, then solves its friction pair "
@@ -1300,16 +1266,18 @@ def _friction(solver) -> dict:
     patch = bool(solver._friction_anchors_enabled)
     reason = _BETA_REASONS[solver._friction_anchor_beta_source]
     if patch:
-        parallel = "" if solver._parallel_contact_paths else "keyed rows, parallel matrix-free tiers and "
+        owners = []
+        if not solver._parallel_contact_paths:
+            owners.append("keyed rows and parallel matrix-free tiers")
         # FEATHER_PGS_PATCH_DENSE_PATHS=0 keeps patch friction off the resolved-world classifier.
-        classifier = "" if solver._patch_dense_paths else "the resolved-world classifier, "
+        if not solver._patch_dense_paths:
+            owners.append("the resolved-world classifier")
         # FEATHER_PGS_PATCH_ACTIVE_ROWS=0 keeps patch friction off the sparse active-row scan.
-        sparse = "" if solver._patch_active_rows else ", sparse active rows"
-        routes = _PATCH_ROUTE_PRECEDENCE if solver._law_agnostic_contact_paths else _ORDINARY_PATCH_ROUTES
-        reason += (
-            f" Point-contact owners ({parallel}response blocks, {classifier}multiblock sweeps{sparse}) need point"
-            f" friction.{routes}"
-        )
+        if not solver._patch_active_rows:
+            owners.append("sparse active rows")
+        if owners:
+            reason += f" Point-contact owners ({', '.join(owners)}) need point friction."
+        reason += _PATCH_ROUTE_PRECEDENCE if solver._law_agnostic_contact_paths else _ORDINARY_PATCH_ROUTES
     return {
         "law": "patch" if patch else "point",
         "friction_anchor_beta": json_value(solver.friction_anchor_beta),

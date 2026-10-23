@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 
 from .contact_torsion import torque_sweep_source
-from .device_preludes import DevicePrelude, cuda_native
+from .device_preludes import cuda_native
 from .friction import FRICTION_PAIR
 from .kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -24,11 +24,6 @@ from .row_metadata import (
 )
 from .solve_policy import EXACT_POLICY, SolvePolicy, SolvePolicyUnsupported, sweep_exit, vote
 from .velocity_limit_law import accumulated_update, check_velocity_limit_law
-
-# The dense-tile variant owns one fixed row phase; any other launch is a device error, never a different phase.
-_DENSE_TILE_ENTRY = DevicePrelude(
-    "dense_tile_entry", '    if (row_phase != 6 || defer_dense_response != 0) { asm("trap;"); return; }'
-)
 
 
 @dataclass(frozen=True)
@@ -60,8 +55,6 @@ def get_source(
     factor_coordinates: bool = False,
     skip_incremental_rows: int = 0,
     independent_components: bool = False,
-    dense_support_tiles: bool = False,
-    stage_velocities: bool = False,
     held_policy: tuple[str, str, str] | None = None,
     shared_arena: bool = False,
     cpu_body: str = "",
@@ -83,25 +76,11 @@ def get_source(
     """
     if resident_row_metadata and shared_metadata:
         raise ValueError("resident_row_metadata applies to streamed metadata (shared_metadata=False)")
-    if resident_row_metadata and dense_support_tiles:
-        raise ValueError("resident_row_metadata does not apply to dense support tiles, whose row metadata streams")
     accumulated_limits = check_velocity_limit_law(velocity_limit_law) == "accumulated"
     if fuse_vel_limits and not has_drive_rows:
         raise ValueError("fuse_vel_limits requires has_drive_rows")
-    if stage_velocities and not dense_support_tiles:
-        raise ValueError("stage_velocities requires dense_support_tiles")
     if stream_mf_impulses and friction_mode != "current":
         raise ValueError("Streamed MF impulses require the warp-uniform current-friction projection")
-    if dense_support_tiles and (
-        friction_mode != "current"
-        or factor_coordinates
-        or independent_components
-        or skip_local_internal_worlds
-        or skip_incremental_rows
-        or contact_torsion
-        or local_internal_max_constraints
-    ):
-        raise ValueError("Dense support tiles require the ordinary current-friction phase-6 solve")
     if factor_coordinates and (
         friction_mode != "current"
         or has_drive_rows
@@ -112,13 +91,13 @@ def get_source(
         raise ValueError("factor coordinates require the paired augmented-drive contact solve")
     if independent_components and not factor_coordinates:
         raise ValueError("Independent components require the paired factor-coordinate solve")
-    if solve_policy.counts and (held_policy is not None or shared_arena or dense_support_tiles):
-        raise ValueError("A solve readout requires the physical bindings without dense support tiles")
+    if solve_policy.counts and (held_policy is not None or shared_arena):
+        raise ValueError("A solve readout requires the physical bindings")
     if (not solve_policy.exact or solve_policy.traces) and (
-        friction_mode != "current" or contact_torsion or dense_support_tiles or held_policy is not None or shared_arena
+        friction_mode != "current" or contact_torsion or held_policy is not None or shared_arena
     ):
         raise SolvePolicyUnsupported(
-            "The velocity exit law and trace cover the current-friction physical sweep without torsion or dense tiles"
+            "The velocity exit law and trace cover the current-friction physical sweep without torsion"
         )
     _validate_dense_metadata_encoding(max_constraints)
     M_D = max_constraints
@@ -142,8 +121,6 @@ def get_source(
             contact_torsion,
             factor_coordinates,
             skip_incremental_rows,
-            dense_support_tiles,
-            stage_velocities,
         ) != (
             192,
             64,
@@ -160,8 +137,6 @@ def get_source(
             False,
             True,
             0,
-            False,
-            False,
         ):
             raise ValueError(
                 "Held coordinates and shared arena require the fixed 192/64-row 29D paired-component recipe"
@@ -366,41 +341,6 @@ def get_source(
     dense_tangent_cross_code = f"""
                     for (int d = lane; d < {D}; d += 32)
                         cross += {dense_j_read(f"jy_world_base + i * {D}", "d")} * {dense_read("Y_world", "sib_row_base + d")};"""
-
-    if dense_support_tiles:
-        mask_words = ((D + 31) // 32 + 31) // 32
-
-        def tile_loop(row: str, operation: str) -> str:
-            return f"""
-                for (int word = 0; word < {mask_words}; ++word) {{
-                    unsigned bits = dense_support_masks.data[(world * {M_D} + ({row})) * {mask_words} + word];
-                    while (bits != 0u) {{
-                        const int tile = word * 32 + __ffs(bits) - 1;
-                        bits &= bits - 1u;
-                        const int d = tile * 32 + lane;
-                        if (d < {D}) {{ {operation} }}
-                    }}
-                }}"""
-
-        # Do not retain D-wide prefetch registers in the tile variant.
-        dense_pipe_decl = ""
-        dense_prefetch_init_code = ";"
-        dense_prefetch_next_code = ";"
-        dense_consume_code = f"const int cur_jy_base = jy_world_base + i * {D};"
-        dense_dot_code = "float my_sum = 0.0f;" + tile_loop(
-            "i", f"""my_sum += {dense_read("J_world", "cur_jy_base + d")} * s_v[d];"""
-        )
-        dense_v_update_code = tile_loop(
-            "i", f"""s_v[d] += {dense_read("Y_world", "cur_jy_base + d")} * delta_impulse;"""
-        )
-        dense_sib_v_code = tile_loop("sib", f"""s_v[d] += {dense_read("Y_world", "sib_row_base + d")} * sib_delta;""")
-        dense_sibling_dot_code = tile_loop(
-            "sib", f"""sibling_residual += {dense_read("J_world", "sib_row_base + d")} * s_v[d];"""
-        )
-        dense_tangent_cross_code = tile_loop(
-            "i",
-            f"""cross += {dense_read("J_world", f"jy_world_base + i * {D} + d")} * {dense_read("Y_world", "sib_row_base + d")};""",
-        )
 
     # Dense friction-row projection.  The dense rows carry articulated
     # contacts such as finger/cube; leaving them on the legacy per-row
@@ -1952,46 +1892,5 @@ def get_source(
     # array — a (1, 1) dummy when the fused clamp is off — and
     # fuse_vel_limits only gates the clamp code emission above.
 
-    entry = ()
-    if dense_support_tiles:
-        # Keep the existing dense projector, but compile out phases this wrapper
-        # cannot own. In particular no MF pipeline registers or row scan remain.
-        begin = snippet.index("        // ── Phase 2: MF constraints")
-        end = snippet.index("        // Friction rows may intentionally", begin)
-        snippet = snippet[:begin] + snippet[end:]
-        snippet = re.sub(r"\brow_phase\b", "6", snippet)
-        snippet = re.sub(r"\bdefer_dense_response\b", "0", snippet)
-        snippet = snippet.replace(
-            "int m_mf = mf_constraint_count.data[world];", "int m_mf = 0; // This variant owns only dense rows."
-        )
-        if stage_velocities:
-            # Every row read and response write (including a friction sibling)
-            # is covered by this exact union. Other shared slots stay unused,
-            # and their global velocities must remain untouched on publication.
-            for operation in (
-                "s_v[d] = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;",
-                "if (global_dof >= 0) v_out.data[global_dof] = s_v[d];",
-            ):
-                old = f"""    for (int d = lane; d < {D}; d += 32) {{
-        int global_dof = world_dof_indices.data[dof_map_base + d];
-        {operation}
-    }}"""
-                new = f"""    for (int word = 0; word < {mask_words}; ++word) {{
-        unsigned bits = dense_support_world_masks.data[world * {mask_words} + word];
-        while (bits != 0u) {{
-            const int tile = word * 32 + __ffs(bits) - 1;
-            bits &= bits - 1u;
-            const int d = tile * 32 + lane;
-            if (d < {D}) {{
-                int global_dof = world_dof_indices.data[dof_map_base + d];
-                {operation}
-            }}
-        }}
-    }}"""
-                if snippet.count(old) != 1:
-                    raise ValueError("Dense tile staging expected one velocity load/store loop")
-                snippet = snippet.replace(old, new)
-        entry = (_DENSE_TILE_ENTRY,)
-
-    snippet = cuda_native(snippet, preludes=(*entry, FRICTION_PAIR, *solve_policy.preludes))
+    snippet = cuda_native(snippet, preludes=(FRICTION_PAIR, *solve_policy.preludes))
     return GeneratedSource(snippet, mf_phase if held_policy is not None else None, arena_offset if shared_arena else 0)

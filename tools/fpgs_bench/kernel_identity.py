@@ -170,8 +170,6 @@ def factory_calls():
         {"contact_torsion": True},
         {"skip_local_internal_worlds": True, "local_internal_max_constraints": 19},
         {"skip_incremental_rows": 32},
-        {"dense_support_tiles": True},
-        {"dense_support_tiles": True, "stage_velocities": True},
         {"factor_coordinates": True},
         {"factor_coordinates": True, "independent_components": True},
     )
@@ -520,8 +518,6 @@ def census_calls():
         _axis("factor_coordinates"),
         _axis("skip_incremental_rows", (0, 32)),
         _axis("independent_components"),
-        _axis("dense_support_tiles"),
-        _axis("stage_velocities"),
         _axis("resident_row_metadata"),
         laws,
     )

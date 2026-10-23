@@ -213,14 +213,14 @@ def _replay_rewrite(source: wp.array[float], velocity: wp.array[float]):
 class TestFeatherPGSMFStorage(unittest.TestCase):
     def test_hardware_capacity_streams_only_when_required(self):
         """Preserve all hardware rows when resident impulses exceed the device limit."""
-        options = {"has_drive_rows": False, "fuse_vel_limits": False}
+        options = {"has_drive_rows": False, "fuse_vel_limits": False, "block_count": 16384, "sm_count": 188}
         self.assertEqual(fpgs._select_mfgs_storage(256, 37248, 1551, 101376, **options)[:2], (False, True))
         self.assertEqual(fpgs._select_mfgs_storage(256, 37248, 1551, 232448, **options)[:2], (True, False))
         self.assertEqual(fpgs._select_mfgs_storage(256, 15984, 3135, 101376, **options)[:2], (True, False))
 
     def test_storage_boundary_and_remaining_state(self):
         """Include tile storage and reject an unrepresentable velocity working set."""
-        options = {"has_drive_rows": False, "fuse_vel_limits": False}
+        options = {"has_drive_rows": False, "fuse_vel_limits": False, "block_count": 16384, "sm_count": 188}
         # Four streamed metadata arrays leave velocities and two impulse arrays.
         required = 128 + 4 * (29 + 1024 + 4096)
         self.assertEqual(fpgs._select_mfgs_storage(1024, 4096, 29, required, **options)[:2], (False, False))
@@ -231,6 +231,7 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
     def test_metadata_reasons_report_the_footprint_they_compared(self):
         """Report the metadata and block bytes the residency decision compared, for each outcome."""
         options = {"has_drive_rows": False, "fuse_vel_limits": False}
+        launch = {"block_count": 16384, "sm_count": 188}
         cases = (
             ((192, 64, 29), 101376, "Row metadata is resident: {metadata} bytes fit the 4096-byte budget."),
             ((1024, 4096, 604), 101376, "Row metadata streams: {metadata} bytes exceed the 4096-byte budget."),
@@ -239,7 +240,7 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
         for shape, shared_memory, text in cases:
             with self.subTest(shape=shape, shared_memory=shared_memory):
                 footprint = execution_plan._mfgs_metadata_footprint(*shape, shared_memory, **options)
-                storage = fpgs._select_mfgs_storage(*shape, shared_memory, **options)
+                storage = fpgs._select_mfgs_storage(*shape, shared_memory, **options, **launch)
                 self.assertEqual(storage.shared_metadata, footprint.resident)
                 self.assertIn(
                     text.format(metadata=footprint.metadata_bytes, total=footprint.total_bytes), storage.reason
@@ -293,13 +294,10 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                 requested = select(shape, 101376, blocks, force_stream_mf_impulses=True)
                 self.assertTrue(requested.stream_mf_impulses)
                 self.assertEqual(requested.resident_row_metadata, select(shape, 101376, blocks).resident_row_metadata)
-        # Resident metadata already holds the packed rows; an unknown launch shape keeps them streamed.
+        # Resident metadata already holds the packed rows.
         storage = select((192, 64, 22), 101376, 16384)
         self.assertEqual(storage[:3], (True, False, False))
         self.assertIn("Row metadata is resident", storage.reason)
-        storage = fpgs._select_mfgs_storage(*large, 101376, **options)
-        self.assertEqual(storage[:3], (False, False, False))
-        self.assertIn("launch shape is unknown", storage.reason)
 
     def test_resident_row_metadata_reads_what_the_streamed_source_reads(self):
         """Read every row type and parent from the packed array where the streamed source reads global memory.
@@ -372,11 +370,6 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "streamed metadata"):
             factory(*shape, resident_row_metadata=True, **options)
-        # The dense-tile variants keep their row metadata streamed; nothing selects the combination.
-        tiles = {"has_drive_rows": False, "has_dense_velocity_limit_rows": False, "dense_support_tiles": True}
-        factory(*shape, shared_metadata=False, **tiles)
-        with self.assertRaisesRegex(ValueError, "dense support tiles"):
-            factory(*shape, shared_metadata=False, resident_row_metadata=True, **tiles)
 
     def test_launch_replay_compares_each_launch_when_it_runs(self):
         """Compare each replayed launch with its twin before later stages rewrite the operands they share.
@@ -450,6 +443,35 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                     for line in source.splitlines():
                         if re.search(r"g_lam_mf\[[^]]+\]\s*=(?!=)", line):
                             self.assertIn("if (lane == 0)", line)
+
+    def test_paired_dense_impulses_have_one_owner(self):
+        """Keep the paired tangent law and fenced publication in the dense projector of either friction law."""
+        for friction in ("current", "coulomb_newton"):
+            with self.subTest(friction=friction):
+                kernel = fpgs._get_pgs_solve_mf_gs_kernel(
+                    256,
+                    15984,
+                    3135,
+                    "cpu",
+                    friction_mode=friction,
+                    has_drive_rows=False,
+                    has_dense_velocity_limit_rows=False,
+                    stream_mf_impulses=friction == "current",
+                )
+                snippet = kernel.mf_native.native_snippet
+                self.assertIn("__shfl_sync(MASK, lane == 0 ? s_lam_dense[i] : 0.0f, 0)", snippet)
+                self.assertIn("if (lane == 0) s_lam_dense[i] = 0.0f;", snippet)
+                self.assertIn("if (lane == 0) s_lam_dense[i] = new_impulse;", snippet)
+                start = snippet.index("const float sibling_impulse = s_lam_dense[sib];")
+                end = snippet.index("if (sib_delta != 0.0f) iteration_changed = 1;", start)
+                owner = snippet[start:end]
+                self.assertIn("friction_pair_candidate(denom, cross, s_diag_dense[sib]", owner)
+                self.assertIn("float sib_delta = b * scale - sibling_impulse;", owner)
+                self.assertIn(
+                    "__syncwarp();\n                    if (lane == 0) s_lam_dense[sib] = b * scale;\n"
+                    "                    __syncwarp();",
+                    owner,
+                )
 
     def test_limit_only_phase_does_not_stage_contact_prefix(self):
         """Keep contacts untouched and retain work for empty-segment fused clamps."""
