@@ -15,6 +15,7 @@
   "contact_unit_sweeps.pgs_solve_loop_unit": "cb8837c3a5b6fd77ae0368d74027463219c0655cb0fd0781ac27064a9127bf87",
   "contact_unit_sweeps.pgs_solve_mf_loop_unit": "0a8c609221077f7bfa669a323dfb744631e7a519e327707f4699cc27203cfdb2",
   "device_proof._checksum_words": "539d4dfaf5523eb00eac977262740ec66706aa1a166614751c756013a3e15d62",
+  "free_body_gyro.correct_free_body_gyroscopic_predictor": "b12f0164d5a1d93a35a31c74e6e6909a21f05a54faedca55bb6a0e16cc279c33",
   "friction_patches._arange": "edb4523f6b383526e5286b572acdb79ba0b36d30fafbbf0b64cc04e8b256a01f",
   "friction_patches._build": "39078f0ae32e1c28a17e423d58bdc7d067bb716e129c3544b616de194ca56283",
   "friction_patches._finish_and_store": "1f706e042a70e6ce7095d7c919ec3ee5b8d6db2b891e45a1ad5509fa2d4086c4",

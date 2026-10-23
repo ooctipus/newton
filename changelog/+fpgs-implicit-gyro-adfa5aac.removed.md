@@ -1,1 +1,0 @@
-Remove the experimental implicit gyroscopic predictor of `SolverFeatherPGS` for independent free bodies; the default bounded gyroscopic correction runs in its place. Unset `FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO`, which selects nothing; `get_path_selection()["routes"]["free_rigid_bodies"]` no longer has an `implicit_gyro` entry.

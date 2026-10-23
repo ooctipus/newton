@@ -184,6 +184,17 @@ class TestSparseResearchAdmission(unittest.TestCase):
             SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
         self.assertIsNone(solver._sparse_mass_matrix_size)
 
+    def test_implicit_gyro_only_reserves_worlds_with_free_bodies(self):
+        """Keep the alternative gyro owner without rejecting an inactive no-free-body request."""
+        model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
+        with mock.patch.dict(os.environ, {"FEATHER_PGS_FREE_BODY_IMPLICIT_GYRO": "1"}, clear=True):
+            solver = _eligible_solver()
+            with self.assertRaises(_TopologyReached):
+                SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+            solver._has_free_rigid_bodies = True
+            SolverFeatherPGS._setup_sparse_mass_matrix(solver, model)
+            self.assertIsNone(solver._sparse_mass_matrix_size)
+
     def test_explicit_schedules_keep_their_solve_budget(self):
         """Do not silently replace a requested parallel solve."""
         model = SimpleNamespace(device=SimpleNamespace(is_cuda=True), requires_grad=False)
