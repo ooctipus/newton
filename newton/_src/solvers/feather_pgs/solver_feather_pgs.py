@@ -26888,7 +26888,6 @@ def _get_pgs_solve_mf_gs_kernel(
     device_arch: str,
     friction_mode: str = "current",
     *,
-    software_pipeline: bool = True,
     shared_metadata: bool = True,
     resident_row_metadata: bool = False,
     stream_mf_impulses: bool = False,
@@ -26961,7 +26960,6 @@ def _get_pgs_solve_mf_gs_kernel(
         max_world_dofs,
         device_arch,
         friction_mode,
-        software_pipeline=software_pipeline,
         shared_metadata=shared_metadata,
         resident_row_metadata=resident_row_metadata,
         stream_mf_impulses=stream_mf_impulses,
@@ -26976,7 +26974,7 @@ def _get_pgs_solve_mf_gs_kernel(
         independent_components=independent_components,
         velocity_limit_law=velocity_limit_law,
         solve_policy=solve_policy,
-    ).native
+    )
 
     from .mf_dispatch import make_dispatch, make_native  # noqa: PLC0415
 
@@ -26990,8 +26988,6 @@ def _get_pgs_solve_mf_gs_kernel(
     )
     if fuse_vel_limits:
         name += "_fvl"
-    if not software_pipeline:
-        name += "_nopipe"
     if not shared_metadata:
         name += "_gmeta"
     if resident_row_metadata:

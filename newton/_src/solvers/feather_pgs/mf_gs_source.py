@@ -1,10 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Construct common matrix-free arithmetic with explicit representation bindings."""
+"""Generate the native source of the matrix-free Gauss-Seidel sweep."""
 
 import re
-from dataclasses import dataclass
 
 from .contact_torsion import torque_sweep_source
 from .device_preludes import cuda_native
@@ -26,15 +25,6 @@ from .solve_policy import EXACT_POLICY, SolvePolicy, SolvePolicyUnsupported, swe
 from .velocity_limit_law import accumulated_update, check_velocity_limit_law
 
 
-@dataclass(frozen=True)
-class GeneratedSource:
-    """Complete native body plus the shared held-owner MF phase and arena size."""
-
-    native: str
-    mf_phase: str | None
-    arena_floats: int
-
-
 def get_source(
     max_constraints: int,
     mf_max_constraints: int,
@@ -42,7 +32,6 @@ def get_source(
     device_arch: str,
     friction_mode: str = "current",
     *,
-    software_pipeline: bool = True,
     shared_metadata: bool = True,
     resident_row_metadata: bool = False,
     stream_mf_impulses: bool = False,
@@ -55,13 +44,10 @@ def get_source(
     factor_coordinates: bool = False,
     skip_incremental_rows: int = 0,
     independent_components: bool = False,
-    held_policy: tuple[str, str, str] | None = None,
-    shared_arena: bool = False,
-    cpu_body: str = "",
     velocity_limit_law: str = "stateless",
     solve_policy: SolvePolicy = EXACT_POLICY,
-) -> GeneratedSource:
-    """Build the shared recurrence with explicit physical or held bindings.
+) -> str:
+    """Return the native body of the matrix-free Gauss-Seidel sweep.
 
     ``resident_row_metadata`` keeps the packed dense row types and parents
     resident in a streamed-metadata (``shared_metadata=False``) source.
@@ -71,8 +57,7 @@ def get_source(
     the dense rows of a velocity-limit row phase. The stateless law keeps the source
     byte-identical.
 
-    ``solve_policy`` compiles the sweep's stopping rule and readout; a readout
-    needs the physical bindings and the per-world phases of the plain kernel.
+    ``solve_policy`` compiles the sweep's stopping rule and readout.
     """
     if resident_row_metadata and shared_metadata:
         raise ValueError("resident_row_metadata applies to streamed metadata (shared_metadata=False)")
@@ -91,11 +76,7 @@ def get_source(
         raise ValueError("factor coordinates require the paired augmented-drive contact solve")
     if independent_components and not factor_coordinates:
         raise ValueError("Independent components require the paired factor-coordinate solve")
-    if solve_policy.counts and (held_policy is not None or shared_arena):
-        raise ValueError("A solve readout requires the physical bindings")
-    if (not solve_policy.exact or solve_policy.traces) and (
-        friction_mode != "current" or contact_torsion or held_policy is not None or shared_arena
-    ):
+    if (not solve_policy.exact or solve_policy.traces) and (friction_mode != "current" or contact_torsion):
         raise SolvePolicyUnsupported(
             "The velocity exit law and trace cover the current-friction physical sweep without torsion"
         )
@@ -104,48 +85,6 @@ def get_source(
     M_MF = mf_max_constraints
     D = max_world_dofs
 
-    if held_policy is not None or shared_arena:
-        if (
-            M_D,
-            M_MF,
-            D,
-            friction_mode,
-            software_pipeline,
-            shared_metadata,
-            stream_mf_impulses,
-            has_drive_rows,
-            has_dense_velocity_limit_rows,
-            fuse_vel_limits,
-            skip_local_internal_worlds,
-            local_internal_max_constraints,
-            contact_torsion,
-            factor_coordinates,
-            skip_incremental_rows,
-        ) != (
-            192,
-            64,
-            29,
-            "current",
-            True,
-            True,
-            False,
-            False,
-            False,
-            False,
-            False,
-            0,
-            False,
-            True,
-            0,
-        ):
-            raise ValueError(
-                "Held coordinates and shared arena require the fixed 192/64-row 29D paired-component recipe"
-            )
-    if held_policy is not None and (len(held_policy) != 3 or not all(held_policy) or shared_arena):
-        raise ValueError("Held coordinates require complete entry, staging and publication policies")
-    if cpu_body and held_policy is None:
-        raise ValueError("Only the held-coordinate owner supplies a scalar CPU recurrence")
-    held_entry = "\n" + held_policy[0] if held_policy is not None else ""
     # Change votes under the solve policy; the exact law keeps each site's own text.
     friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
     velocity_limit_type = int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
@@ -193,45 +132,26 @@ def get_source(
         flag="iteration_changed",
         terms=(("delta_impulse", "denom", "row_type"),),
     )
-    dense_rhs = "rows.r0.data[off_dense + i]" if held_policy is not None else "rhs_bias.data[off_dense + i]"
-    velocity_load = (
-        "s_v[d] = 0.0f;" if held_policy is not None else "s_v[d] = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;"
-    )
-    velocity_store = (
-        held_policy[2]
-        if held_policy is not None
-        else f"""    for (int d = lane; d < {D}; d += 32) {{
+    dense_rhs = "rhs_bias.data[off_dense + i]"
+    velocity_load = "s_v[d] = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;"
+    velocity_store = f"""    for (int d = lane; d < {D}; d += 32) {{
         int global_dof = world_dof_indices.data[dof_map_base + d];
         if (global_dof >= 0) v_out.data[global_dof] = s_v[d];
     }}"""
-    )
-    cpu_section = "#else\n" + cpu_body + "\n" if cpu_body else ""
-    arena_offset = 0
 
     def dense_read(array: str, index: str) -> str:
-        if held_policy is not None:
-            return ("hybrid_j" if array == "J_world" else "hybrid_y") + f"({index})"
         return f"{array}.data[{index}]"
 
-    def mf_velocity(index: str, base: str) -> str:
-        if held_policy is not None:
-            return f"* (s_v[{index}] + hybrid_base[{base}])"
+    def mf_velocity(index: str) -> str:
         return f"* s_v[{index}]"
 
     def shared(dtype: str, name: str, count: int, spacing: str) -> str:
-        nonlocal arena_offset
-        offset = arena_offset
-        arena_offset += count
-        if shared_arena:
-            return f"    {dtype}* {name}=reinterpret_cast<{dtype}*>(arena_address)+{offset};"
         return f"    __shared__ {dtype}{spacing}{name}[{count}];"
 
     def dense_j_read(base: str, dof: str) -> str:
         return f"""{dense_read("J_world", f"{base} + {dof}")}"""
 
     factor_fallback_skip = "    if (m_mf == 0) return;" if factor_coordinates else ""
-    if held_policy is not None:
-        factor_fallback_skip += "\n" + held_policy[1]
 
     local_internal_skip = (
         f"""
@@ -300,29 +220,6 @@ def get_source(
                 s_v[{d_expr}] += cur_dY_{k} * delta_impulse;
             }}""")
     dense_v_update_code = "\n".join(dense_v_update_parts)
-
-    if not software_pipeline:
-        # Direct-load variant: no double-buffer registers, J/Y read at use.
-        dense_pipe_decl = ""
-        dense_prefetch_init_code = ";"
-        dense_prefetch_next_code = ";"
-        dense_consume_code = f"const int cur_jy_base = jy_world_base + i * {D};"
-        dot_parts = []
-        upd_parts = []
-        for k in range(ELEMS_PER_LANE):
-            d_expr = f"lane + {k * 32}" if k > 0 else "lane"
-            dot_parts.append(f"""
-            if ({d_expr} < {D}) {{
-                my_sum += {dense_j_read("cur_jy_base", d_expr)} * s_v[{d_expr}];
-            }}""")
-            upd_parts.append(f"""
-            if ({d_expr} < {D} &&
-                (defer_dense_response == 0 ||
-                 world_deferred_dof_mask.data[deferred_mask_base + {d_expr}] == 0)) {{
-                s_v[{d_expr}] += {dense_read("Y_world", f"cur_jy_base + {d_expr}")} * delta_impulse;
-            }}""")
-        dense_dot_code = "\n".join(["float my_sum = 0.0f;", *dot_parts])
-        dense_v_update_code = "\n".join(upd_parts)
 
     # Dense sibling v update — NOT pipelined (random sib index)
     dense_sib_v_parts = []
@@ -1091,9 +988,9 @@ def get_source(
                     if (radius > 0.0f) {{
                         float sibling_residual = 0.0f;
                         if (lane < 6 && dof_a >= 0)
-                            sibling_residual = mf_J_a.data[sib_mf6 + lane] {mf_velocity("dof_a + lane", "lane")};
+                            sibling_residual = mf_J_a.data[sib_mf6 + lane] {mf_velocity("dof_a + lane")};
                         if (lane >= 6 && lane < 12 && dof_b >= 0)
-                            sibling_residual = mf_J_b.data[sib_mf6 + lane - 6] {mf_velocity("dof_b + lane - 6", "lane - 6")};
+                            sibling_residual = mf_J_b.data[sib_mf6 + lane - 6] {mf_velocity("dof_b + lane - 6")};
                         for (int offset = 16; offset > 0; offset >>= 1)
                             sibling_residual += __shfl_down_sync(MASK, sibling_residual, offset);
                         sibling_residual = __shfl_sync(MASK, sibling_residual, 0)
@@ -1441,10 +1338,10 @@ def get_source(
             // J · v using prefetched J values
             float my_sum = 0.0f;
             if (lane < 6 && dof_a >= 0) {{
-                my_sum = cur_Ja {mf_velocity("dof_a + lane", "lane")};
+                my_sum = cur_Ja {mf_velocity("dof_a + lane")};
             }}
             if (lane >= 6 && lane < 12 && dof_b >= 0) {{
-                my_sum = cur_Jb {mf_velocity("dof_b + lane - 6", "lane - 6")};
+                my_sum = cur_Jb {mf_velocity("dof_b + lane - 6")};
             }}
             my_sum += __shfl_down_sync(MASK, my_sum, 16);
             my_sum += __shfl_down_sync(MASK, my_sum, 8);
@@ -1514,10 +1411,10 @@ def get_source(
                 int row_mf6 = mf6_base + i * 6;
                 float my_sum_mf_vlim = 0.0f;
                 if (lane < 6 && dof_a >= 0) {{
-                    my_sum_mf_vlim = mf_J_a.data[row_mf6 + lane] {mf_velocity("dof_a + lane", "lane")};
+                    my_sum_mf_vlim = mf_J_a.data[row_mf6 + lane] {mf_velocity("dof_a + lane")};
                 }}
                 if (lane >= 6 && lane < 12 && dof_b >= 0) {{
-                    my_sum_mf_vlim = mf_J_b.data[row_mf6 + lane - 6] {mf_velocity("dof_b + lane - 6", "lane - 6")};
+                    my_sum_mf_vlim = mf_J_b.data[row_mf6 + lane - 6] {mf_velocity("dof_b + lane - 6")};
                 }}
                 my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 16);
                 my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 8);
@@ -1560,7 +1457,7 @@ def get_source(
         iteration="iter",
     )
     snippet = f"""    const unsigned MASK = 0xFFFFFFFF;
-    int lane = threadIdx.x;{held_entry}
+    int lane = threadIdx.x;
 
     int m_dense = world_constraint_count.data[world];
     int m_mf = mf_constraint_count.data[world];
@@ -1749,7 +1646,7 @@ def get_source(
             mf_impulses.data[off_mf + i] = s_lam_mf[i];
         }}
     }}
-{cpu_section}#endif
+#endif
 """
 
     snippet = snippet.replace("packed_tp >> 16", _mf_parent_expression("packed_tp", M_MF))
@@ -1893,4 +1790,4 @@ def get_source(
     # fuse_vel_limits only gates the clamp code emission above.
 
     snippet = cuda_native(snippet, preludes=(FRICTION_PAIR, *solve_policy.preludes))
-    return GeneratedSource(snippet, mf_phase if held_policy is not None else None, arena_offset if shared_arena else 0)
+    return snippet

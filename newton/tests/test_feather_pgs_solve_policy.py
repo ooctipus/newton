@@ -213,7 +213,6 @@ def _vote_census():
             solver._get_pgs_solve_mf_gs_kernel.__wrapped__,
             (64, 32, 12, "120"),
             (
-                _axis("software_pipeline"),
                 _axis("shared_metadata"),
                 _axis("stream_mf_impulses"),
                 _axis("has_drive_rows"),
@@ -348,11 +347,6 @@ class TestSolvePolicy(unittest.TestCase):
         self.assertIn("const bool sweep_stop = open && done;", counted)
         self.assertIn("if (l == 0 && (sweep_stop || k + 1 == n))", counted)
         self.assertIn("solve_readout_sweeps(w, k + 1, sweep_stop);", counted)
-
-    def test_readout_rejects_unbound_matrix_free_variants(self):
-        """Refuse a readout where the matrix-free generator has no physical sweep exit to record."""
-        with self.assertRaisesRegex(ValueError, "readout"):
-            mf_gs_source.get_source(64, 32, 12, "120", solve_policy=SWEEPS, shared_arena=True)
 
     def test_world_dispatch_requires_the_world_first(self):
         """Reject the world dispatches of generated kernels unless the native's first operand is the world."""
@@ -495,7 +489,7 @@ class TestVelocityExitLaw(unittest.TestCase):
             {
                 "sparse": 288,
                 "sparse_lanes": 32,
-                "mf_gs": 672,
+                "mf_gs": 336,
                 "paired": 6,
                 "local": 48,
                 "packets": 48,

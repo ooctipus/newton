@@ -67,7 +67,7 @@ _STREAMED_OPTIONS = (
 
 def _streamed_source(**options):
     """Generate a streamed-metadata MF-GS source for the large shape with ``options`` applied."""
-    return get_source(**{**_LARGE_STREAMED_SHAPE, "shared_metadata": False, **options}).native
+    return get_source(**{**_LARGE_STREAMED_SHAPE, "shared_metadata": False, **options})
 
 
 def _row_metadata_read_globally(source):

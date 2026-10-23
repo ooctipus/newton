@@ -210,19 +210,6 @@ class TestKernelIdentity(unittest.TestCase):
         self.assertTrue(any(kwargs["resident_row_metadata"] and not kwargs["shared_metadata"] for kwargs in calls))
         self.assertEqual({kwargs["velocity_limit_law"] for kwargs in calls}, {"stateless", "accumulated"})
 
-    def test_census_hashes_generated_source_text(self):
-        """Hash the held-coordinate bindings of the matrix-free generator, which no factory passes, as text."""
-        import dataclasses  # noqa: PLC0415
-
-        from newton._src.solvers.feather_pgs import mf_gs_source  # noqa: PLC0415
-
-        rows, _ = identity.census(("mf_gs_source.get_source",))
-        recipe = {"factor_coordinates": True, "has_drive_rows": False, "has_dense_velocity_limit_rows": False}
-        source = mf_gs_source.get_source(192, 64, 29, "120", **recipe)
-        key = identity.label("mf_gs_source.get_source", (192, 64, 29, "120"), recipe)
-        self.assertEqual(rows[key]["hash"], identity.digest(json.dumps(dataclasses.astuple(source))))
-        self.assertTrue(any("held_policy=held_policy" in key for key in rows))
-
     def test_scalar_branch_kernels_are_recorded_with_the_pins(self):
         """Record every kernel of the held-tree owner's scalar-branch group in the pins family.
 

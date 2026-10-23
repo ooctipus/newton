@@ -50,7 +50,6 @@ of the parent commit, so one copy of this script records both sides.
 
 import argparse
 import collections
-import dataclasses
 import hashlib
 import inspect
 import itertools
@@ -163,7 +162,6 @@ def factory_calls():
         {"friction_mode": "bisection"},
         {"friction_mode": "bisection_desaxce"},
         {"friction_mode": "coulomb_newton"},
-        {"software_pipeline": False},
         {"shared_metadata": False},
         {"stream_mf_impulses": True},
         {"fuse_vel_limits": True},
@@ -493,11 +491,9 @@ def census_calls():
     local owners plain and over packet rows, sparse diagonal, incremental,
     parallel and keyed parallel tiers and the fused propagation iteration.
     Every factory that takes a velocity-limit law is crossed with both laws,
-    and the matrix-free Gauss-Seidel sweep with resident row metadata. The
-    held-coordinate bindings of ``mf_gs_source.get_source``, which no factory
-    passes, are hashed as text.
+    and the matrix-free Gauss-Seidel sweep with resident row metadata.
     """
-    from newton._src.solvers.feather_pgs import keyed_rows, mf_gs_source, row_packets  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs import keyed_rows, row_packets  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel  # noqa: PLC0415
@@ -507,7 +503,6 @@ def census_calls():
     laws = _axis("velocity_limit_law", VELOCITY_LIMIT_LAWS)
     mf_gs = (
         _axis("friction_mode", ("current", "bisection", "bisection_desaxce", "coulomb_newton")),
-        _axis("software_pipeline", (True, False)),
         _axis("shared_metadata", (True, False)),
         _axis("stream_mf_impulses"),
         _axis("has_drive_rows", (True, False)),
@@ -537,21 +532,6 @@ def census_calls():
             solver._get_pgs_solve_mf_gs_kernel,
             ((64, 32, 12, ARCH), (192, 64, 40, ARCH)),
             mf_gs,
-        ),
-        (
-            "mf_gs_source.get_source",
-            mf_gs_source.get_source,
-            ((192, 64, 29, ARCH),),
-            (
-                ({"factor_coordinates": True, "has_drive_rows": False, "has_dense_velocity_limit_rows": False},),
-                _axis("independent_components"),
-                _axis(
-                    "held_policy", (None, Named("held_policy", ("/* entry */", "/* staging */", "/* publication */")))
-                ),
-                _axis("shared_arena"),
-                _axis("cpu_body", ("", "/* scalar recurrence */")),
-                laws,
-            ),
         ),
         (
             "sparse_pgs._get_pgs_solve_sparse_kernel",
@@ -670,8 +650,6 @@ def census(select=(), skip=()):
     messages and a digest of their labels, so that a change of admission shows
     in a diff as a changed rejection.
     """
-    import warp as wp  # noqa: PLC0415
-
     rows, rejected, defaults = {}, {}, {}
     for name, factory, args, options in census_calls():
         if id(factory) not in defaults:
@@ -691,11 +669,7 @@ def census(select=(), skip=()):
             # Generators also refuse a combination when a source seam guard fails.
             rejected.setdefault(name, []).append((key, f"{type(error).__name__}: {error}"))
             continue
-        if isinstance(built, wp.Kernel):
-            rows[key] = {"family": "census", **kernel_digests(built, codegen=False)}
-        else:
-            # Generated source text (mf_gs_source.GeneratedSource).
-            rows[key] = {"family": "census", "key": name, "hash": digest(json.dumps(dataclasses.astuple(built)))}
+        rows[key] = {"family": "census", **kernel_digests(built, codegen=False)}
     summaries = {}
     for name, entries in rejected.items():
         messages = collections.Counter(message for _, message in entries)
