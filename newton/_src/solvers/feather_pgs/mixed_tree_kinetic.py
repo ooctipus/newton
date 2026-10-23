@@ -327,15 +327,18 @@ def forest_families(solver):
     art_world = solver.art_to_world.numpy()
     prescribed = solver._prescribed_articulation.numpy()
     counts = np.diff([*solver.articulation_dof_start.numpy().tolist(), model.joint_dof_count])
-    per_world = [np.flatnonzero(art_world == w) for w in range(worlds)]
-    if not per_world or any(len(a) != len(per_world[0]) or len(a) == 0 for a in per_world):
+    world_arts = np.bincount(art_world, minlength=worlds)[:worlds]
+    if not worlds or np.any(world_arts != world_arts[0]) or world_arts[0] == 0:
         return None
-    if len(per_world[0]) > 4 or len(per_world[0]) < 2:
+    if world_arts[0] > 4 or world_arts[0] < 2:
+        return None
+    # Each world's articulations in ascending order, one row per world.
+    per_world = np.argsort(art_world, kind="stable").reshape(worlds, world_arts[0])
+    if np.any(np.diff(per_world, axis=1) != 1):
+        return None
+    if np.any(counts[per_world] != counts[per_world[0]]) or np.any(prescribed[per_world] != prescribed[per_world[0]]):
         return None
     signature = [(int(counts[a]), int(prescribed[a])) for a in per_world[0]]
-    for arts in per_world:
-        if np.any(np.diff(arts) != 1) or [(int(counts[a]), int(prescribed[a])) for a in arts] != signature:
-            return None
     families = [0 if pres else size for size, pres in signature]
     for size in sorted({f for f in families if f}):
         if size == solver._compact_diagonal_mass_size:
