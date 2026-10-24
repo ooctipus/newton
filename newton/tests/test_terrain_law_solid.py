@@ -1792,6 +1792,7 @@ _LIST_OF_KERNEL = {
     "edges": "edges",
     "thetas": "thetas",
     "vertices": "vertices",
+    "border": "border",
     "close": "live",
     "recovery": "recover",
     "small": "small",
@@ -1922,7 +1923,12 @@ def _run_class(
             dim = jobs.finish_blocks + extra_blocks
             wp.launch_tiled(kernel, dim=dim, inputs=[*args, jobs, solids], block_dim=block, device=device)
         else:
-            dim = {"pairs": end - begin, "jobs": jobs.threads, "pair_jobs": jobs.pair_threads}[kind]
+            dim = {
+                "pairs": end - begin,
+                "jobs": jobs.threads,
+                "border_jobs": jobs.border_threads,
+                "pair_jobs": jobs.pair_threads,
+            }[kind]
             if kind != "pairs":
                 dim += extra_threads
             wp.launch(kernel, dim=dim, inputs=[*args, jobs, solids], block_dim=block, device=device)
@@ -2513,6 +2519,7 @@ def test_solid_launches_take_fixed_grids(test, device):
             record = shapes[name]
             test.assertEqual(record["pair_dim"], end - begin)
             test.assertEqual(record["job_threads"], jobs.threads)
+            test.assertEqual(record["border_threads"], jobs.border_threads)
             test.assertEqual(record["pair_job_threads"], min(jobs.threads, end - begin))
             test.assertEqual(record["finish_blocks"], jobs.finish_blocks)
             test.assertLessEqual(jobs.finish_blocks, end - begin)
@@ -2521,6 +2528,7 @@ def test_solid_launches_take_fixed_grids(test, device):
                 dim = {
                     "pairs": ("launch", end - begin),
                     "jobs": ("launch", jobs.threads),
+                    "border_jobs": ("launch", jobs.border_threads),
                     "pair_jobs": ("launch", jobs.pair_threads),
                     "pair_tiles": ("tiled", jobs.finish_blocks),
                     "deferred": ("tiled", record["deferred_blocks"]),

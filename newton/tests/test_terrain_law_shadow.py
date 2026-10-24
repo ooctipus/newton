@@ -832,17 +832,19 @@ class TestTerrainLawShadow(unittest.TestCase):
                         sides=table.sides[begin:end],
                     )
                     # the reserve: the work of up to TERRAIN_SOLID_RESERVE_PAIRS pairs of the class's largest bounds,
-                    # the border's work included (walls per scan run, corner lines, border edges' clips)
+                    # corner lines among the edges and creases, the border's walls per scan run and border edges'
+                    # clips in its own list
                     vertices = int(table.vertices[begin:end].max())
                     v = table.vertices[begin:end].astype(np.int64)
                     sides = table.sides[begin:end].astype(np.int64)
                     reserve_pairs = reserves["candidates"] // candidates
                     self.assertTrue(1 <= reserve_pairs <= TERRAIN_SOLID_RESERVE_PAIRS, msg=reserves)
                     bounds = {
-                        "faces": int(np.max(2 * v + 4 * -(-v // run))),
+                        "faces": int(np.max(2 * v)),
                         "edges": int(np.max(3 * v + 4)),
-                        "thetas": int(np.max(3 * v + 2 * sides + 4)),
+                        "thetas": int(np.max(3 * v + 4)),
                         "vertices": vertices,
+                        "border": int(np.max(4 * -(-v // run) + 2 * sides)),
                     }
                     expected = {name: reserve_pairs * bound for name, bound in bounds.items()}
                     expected["candidates"] = reserve_pairs * candidates
@@ -857,6 +859,7 @@ class TestTerrainLawShadow(unittest.TestCase):
                             "block_dim": terrain_law_block_dim("cpu"),
                             "pair_dim": count,
                             "job_threads": min(TERRAIN_SOLID_JOB_THREADS_CPU, longest),
+                            "border_threads": min(TERRAIN_SOLID_JOB_THREADS_CPU, capacities["border"]),
                             "pair_job_threads": min(TERRAIN_SOLID_JOB_THREADS_CPU, longest, count),
                             "finish_blocks": min(TERRAIN_SOLID_JOB_THREADS_CPU, count),
                             "jobs": capacities,

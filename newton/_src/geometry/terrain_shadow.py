@@ -166,6 +166,7 @@ def _solid_launches(name: str) -> tuple[tuple[str, str], ...]:
         "thetas",
         "creases",
         "vertices",
+        "border",
         "close",
         "recovery",
         "small",
@@ -180,6 +181,8 @@ def _solid_launches(name: str) -> tuple[tuple[str, str], ...]:
         if kernel == "recovery"
         else "pair_jobs"
         if kernel in ("close", "small")
+        else "border_jobs"
+        if kernel == "border"
         else "jobs"
         for kernel in kernels
     )
@@ -216,6 +219,9 @@ The module is imported only when the class is listed. Launch kinds, every one wi
   :class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData` (a solid class's whole-pair rejects);
 * ``jobs``: the class's job threads (:attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.threads`), the same
   arguments (a solid class's scan and job kernels, each striding over its list);
+* ``border_jobs``: the same with the border kernel's threads
+  (:attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.border_threads`, a smaller grid: the border's jobs
+  are rare);
 * ``pair_jobs``: the same over a list of the class's pairs, with at most one thread per pair
   (:attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.pair_threads`: a solid class's close and the
   small-pair finish);
@@ -356,8 +362,8 @@ TERRAIN_LAW_SPILL_SHARE = 256
 pair's bound (:meth:`TerrainLawShadow.default_spill_rows`): the worst case of one pair in 256 at once. On the recorded
 suite scenes (16,384 worlds) that is 11 to 25% of the walk slots, while at most one pair spilled (30 rows)."""
 
-TERRAIN_LAW_JOB_COUNTERS = 9
-"""Counters of a solid class's jobs: its four job lists, its candidate pool, its live pairs, its pairs left to rule R,
+TERRAIN_LAW_JOB_COUNTERS = 10
+"""Counters of a solid class's jobs: its five job lists, its candidate pool, its live pairs, its pairs left to rule R,
 its scan's runs and its pairs finished by the small-pair finish kernel
 (:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_COUNTERS`)."""
 
@@ -366,6 +372,7 @@ TERRAIN_LAW_JOB_NAMES = (
     "edges",
     "thetas",
     "vertices",
+    "border",
     "candidates",
     "live",
     "recovery",
@@ -416,6 +423,8 @@ def _print_job_list(k: int):
         wp.printf("rule E crease (theta*) job list")
     elif k == wp.static(TERRAIN_LAW_JOB_NAMES.index("vertices")):
         wp.printf("rule V vertex job list")
+    elif k == wp.static(TERRAIN_LAW_JOB_NAMES.index("border")):
+        wp.printf("border wall and clip job list")
     else:
         wp.printf("candidate pool")
 
@@ -732,12 +741,15 @@ class TerrainLawShadow:
                         self._launches.append(("tiled", kernel, jobs.finish_blocks, begin, slot, (jobs, True)))
                     elif kind == "jobs":
                         self._launches.append(("thread", kernel, jobs.threads, begin, slot, (jobs, True)))
+                    elif kind == "border_jobs":
+                        self._launches.append(("thread", kernel, jobs.border_threads, begin, slot, (jobs, True)))
                     else:
                         self._launches.append(("tiled", kernel, scratch.blocks, begin, slot, (scratch, True, jobs)))
                 shapes.update(
                     {
                         "pair_dim": end - begin,
                         "job_threads": jobs.threads,
+                        "border_threads": jobs.border_threads,
                         "pair_job_threads": jobs.pair_threads,
                         "finish_blocks": jobs.finish_blocks,
                         "jobs": {name: int(capacity[name]) for name in names},
