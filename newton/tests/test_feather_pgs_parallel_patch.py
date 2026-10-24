@@ -20,6 +20,7 @@ import itertools
 import math
 import os
 import unittest
+import warnings
 from fractions import Fraction
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
@@ -88,7 +89,7 @@ def parallel_sweep_reference(
     linked,
     omega=1.0,
     friction_start=0,
-    pair_step=None,
+    pair_step="isotropic",
     velocity_limit_pass=False,
 ):
     """Repeat one world of the parallel tier's sweep in float64.
@@ -99,10 +100,11 @@ def parallel_sweep_reference(
     ``|A|`` over admitted rows (A-based tiers and exact row sums) or the
     row-sum bound ``sum_d |P_id| sum_j |Q_jd|`` of the matrix-free tiers, with
     ``(P, Q) = (J, Y)`` or the whitened rows ``(Z, Z)`` of the in-kernel
-    response. With the isotropic ``pair_step`` (the default of ``linked``) both
-    rows of a friction pair take the smaller of their two steps, unless the
-    sibling is not an admitted friction row of the same normal or either step is
-    zero. Every sweep steps all rows from the extrapolated impulses, clamps
+    response. With the isotropic ``pair_step``, every tier's law, both rows of a
+    friction pair take the smaller of their two steps, unless the sibling is not an
+    admitted friction row of the same normal or either step is zero; ``"per_row"``
+    keeps each row's own step, the retired law that turns a sliding pair's
+    friction. Every sweep steps all rows from the extrapolated impulses, clamps
     normal and limit rows, scales each tangent pair into its disk (the ring's
     pooled normal load when ``linked``), restarts momentum against the last step
     and stops once no row changes. ``velocity_limit_pass`` then pushes every
@@ -126,7 +128,7 @@ def parallel_sweep_reference(
         bound = np.abs(A[:, admitted]).sum(axis=1)
     weight = np.where(bound > 0.0, np.minimum(np.diag(A) / np.where(bound > 0.0, bound, 1.0), 1.0), 0.0)
     step = np.where(admitted, weight * omega / np.where(diag > 0.0, diag, 1.0), 0.0)
-    if (pair_step or ("isotropic" if linked else "per_row")) == "isotropic":
+    if pair_step == "isotropic":
         for row in np.flatnonzero(kinds == 1):
             parent, sibling = parents[row], row + 1
             if row != parent + 1 or sibling >= len(kinds) or kinds[sibling] != 1 or parents[sibling] != parent:
@@ -602,14 +604,9 @@ _ISOTROPIC_STEP = (
 )
 
 
-def _without_isotropic_step(text):
-    """Remove the isotropic pair step, comment included, from a tier's native source."""
-    return text.replace(source._ISOTROPIC_PAIR_STEP, "")
-
-
 class TestParallelPatchReference(unittest.TestCase):
     def test_linked_factory_pools_only_the_friction_disk(self):
-        """Build linked tiers as the point tiers with the golden ring walk and isotropic step."""
+        """Build linked tiers as the point tiers with the golden ring walk; both take the isotropic pair step."""
         for rows, min_rows, matrix_free, inkernel in itertools.product(
             (32, 64), (0,), (False, True), (None, (6, 0, 0, 0))
         ):
@@ -623,29 +620,23 @@ class TestParallelPatchReference(unittest.TestCase):
             with self.subTest(**options):
                 point = source._get_pgs_solve_parallel_kernel(_CAPACITY, 32, _DOFS, "120", **options)
                 linked = source._get_pgs_solve_parallel_kernel(_CAPACITY, 32, _DOFS, "120", linked_rows=True, **options)
-                self.assertEqual(linked.key, point.key + "_linked_iso")
-                self.assertEqual((point._fpgs_pair_step, linked._fpgs_pair_step), ("per_row", "isotropic"))
+                self.assertTrue(point.key.endswith("_iso"), point.key)
+                self.assertEqual(linked.key, point.key.removesuffix("_iso") + "_linked_iso")
                 point_source = point._fpgs_row_native_source
                 linked_source = linked._fpgs_row_native_source
                 for text, golden in (
                     (point_source, _POINT_WARP_PAIR),
                     (point_source, _POINT_BLOCK_PAIR),
+                    (point_source, _ISOTROPIC_STEP),
                     (linked_source, _LINKED_WARP_PAIR),
                     (linked_source, _LINKED_BLOCK_PAIR),
                     (linked_source, _ISOTROPIC_STEP),
                 ):
                     self.assertEqual(text.count(golden), 1, golden)
-                self.assertNotIn("step_pair", point_source)
-                # Nothing but the two projections and the pair step differs from the point tier.
-                restored = _without_isotropic_step(linked_source).replace(_LINKED_WARP_PAIR, _POINT_WARP_PAIR)
+                # Nothing but the two projections differs from the point tier.
+                restored = linked_source.replace(_LINKED_WARP_PAIR, _POINT_WARP_PAIR)
                 self.assertEqual(restored.replace(_LINKED_BLOCK_PAIR, _POINT_BLOCK_PAIR), point_source)
                 self.assertEqual(linked._fpgs_block_dim, point._fpgs_block_dim)
-                # The per-row law of the linked tiers remains available to compare against.
-                per_row = source._get_pgs_solve_parallel_kernel(
-                    _CAPACITY, 32, _DOFS, "120", linked_rows=True, pair_step="per_row", **options
-                )
-                self.assertEqual(per_row.key, point.key + "_linked")
-                self.assertEqual(per_row._fpgs_row_native_source, _without_isotropic_step(linked_source))
 
     def test_reference_holds_pooled_cones_and_restores_point_rings(self):
         """Keep each pair inside its pooled ring disk, and reduce to point friction without ring links."""
@@ -718,34 +709,21 @@ class TestParallelPatchReference(unittest.TestCase):
                 np.testing.assert_allclose(moved_velocity, velocity, rtol=1.0e-12, atol=1.0e-14)
                 assert_pooled_coulomb(self, spread, moved, linked=True)
 
-    def test_point_tiers_opt_into_the_isotropic_step(self):
-        """Give point tiers the isotropic pair step only on request, and reject unknown pair steps."""
-        options = {"rows": 32, "sweeps": 24, "matrix_free": True, "inkernel_response": (6, 0, 0, 0)}
-        point = source._get_pgs_solve_parallel_kernel(_CAPACITY, 32, _DOFS, "120", **options)
-        isotropic = source._get_pgs_solve_parallel_kernel(_CAPACITY, 32, _DOFS, "120", pair_step="isotropic", **options)
-        self.assertEqual(isotropic.key, point.key + "_iso")
-        self.assertEqual(isotropic._fpgs_row_native_source.count(_ISOTROPIC_STEP), 1)
-        self.assertEqual(_without_isotropic_step(isotropic._fpgs_row_native_source), point._fpgs_row_native_source)
-        with self.assertRaisesRegex(ValueError, "pair_step"):
-            source._get_pgs_solve_parallel_kernel(_CAPACITY, 32, _DOFS, "120", pair_step="radial", **options)
-
-    def test_solver_steps_linked_pairs_isotropically(self):
-        """Step every linked pair isotropically, and point pairs per row unless the private experiment opts in."""
-        decide = SolverFeatherPGS._parallel_pair_step
-        for anchors, flag, expected in (
-            (True, None, "isotropic"),
-            (True, "per_row", "isotropic"),
-            (False, None, "per_row"),
-            (False, "per_row", "per_row"),
-            (False, "isotropic", "isotropic"),
+    def test_every_tier_steps_pairs_isotropically(self):
+        """Give every tier variant, point and linked, the isotropic pair step once; no per-row variant remains."""
+        layout = KeyedLayout(16, 6, 0, 16, 128, False, 0)
+        keyed = keyed_rows.get_parallel_factory(source._get_pgs_solve_parallel_kernel, layout)
+        for factory, shape, extra in (
+            (source._get_pgs_solve_parallel_kernel, (_CAPACITY, 32, _DOFS, "120"), {}),
+            (source._get_pgs_solve_parallel_kernel, (_CAPACITY, 32, _DOFS, "120"), {"matrix_free": True}),
+            (keyed, (128, 32, 22, "120"), {"matrix_free": True, "inkernel_response": (16, 6, 0, 16)}),
         ):
-            with self.subTest(anchors=anchors, flag=flag), patch.dict(os.environ):
-                os.environ.pop(_PAIR_STEP_FLAG, None)
-                if flag is not None:
-                    os.environ[_PAIR_STEP_FLAG] = flag
-                self.assertEqual(decide(SimpleNamespace(_friction_anchors_enabled=anchors)), expected)
-        with patch.dict(os.environ, {_PAIR_STEP_FLAG: "radial"}), self.assertRaisesRegex(ValueError, "radial"):
-            decide(SimpleNamespace(_friction_anchors_enabled=False))
+            for linked in (False, True):
+                with self.subTest(shape=shape, linked=linked, **extra):
+                    kernel = factory(*shape, rows=32, sweeps=24, linked_rows=linked, **extra)
+                    self.assertTrue(kernel.key.endswith("_linked_iso" if linked else "_iso"), kernel.key)
+                    self.assertEqual(kernel._fpgs_row_native_source.count(_ISOTROPIC_STEP), 1)
+        self.assertNotIn("pair_step", inspect.signature(source._get_pgs_solve_parallel_kernel).parameters)
 
     def test_isotropic_pairs_slide_with_maximal_dissipation(self):
         """Slide a pair with fourfold unequal tangent masses against its velocity, as the serial pair solve does.
@@ -1057,7 +1035,7 @@ class TestKeyedPatchRows(unittest.TestCase):
         options = {"rows": 32, "sweeps": 24, "matrix_free": True, "inkernel_response": (16, 6, 0, 16)}
         point = factory(128, 32, 22, "120", **options)
         linked = factory(128, 32, 22, "120", linked_rows=True, **options)
-        self.assertEqual(linked.key, point.key + "_linked_iso")
+        self.assertEqual(linked.key, point.key.removesuffix("_iso") + "_linked_iso")
         self.assertTrue(linked.key.startswith("pgs_solve_kinetic_keyed_parallel_"))
         self.assertIn("patch_law", inspect.signature(linked.func).parameters)
         self.assertNotIn("patch_law", inspect.signature(point.func).parameters)
@@ -1073,7 +1051,6 @@ class TestKeyedPatchRows(unittest.TestCase):
 
 
 _SWITCH = "FEATHER_PGS_PATCH_PARALLEL_ROWS"
-_PAIR_STEP_FLAG = "FEATHER_PGS_POINT_PAIR_STEP"
 _LAW_FLAG = "FEATHER_PGS_VELOCITY_LIMIT_LAW"
 
 
@@ -1203,7 +1180,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 _pgs_solve_mf_gs_incremental_kernels=kernels,
                 _par_tiers=[(32, 0), (64, 32)],
                 _par_sweeps_rule="auto",
-                _par_sweeps_reason="mf_gs_parallel_linked_sweeps='auto': ...",
+                _par_sweeps_reason="auto: ...",
                 _ink_rows=64,
                 _ink_sizes=None,
                 _keyed_rows=None,
@@ -1218,12 +1195,13 @@ class TestPatchParallelAdmission(unittest.TestCase):
             with self.subTest(anchors=anchors, linked=linked, limits=limits):
                 tiers = path_selection._tiers(probe)
                 self.assertEqual(tiers["linked_rows"], linked)
-                self.assertEqual(tiers["tiers"][0]["kernel"].endswith("_linked_iso"), linked)
-                self.assertEqual(tiers["pair_step"], "isotropic" if linked else "per_row")
+                self.assertTrue(tiers["tiers"][0]["kernel"].endswith("_linked_iso" if linked else "_iso"))
+                self.assertEqual("_linked" in tiers["tiers"][0]["kernel"], linked)
+                self.assertNotIn("pair_step", tiers)
                 self.assertEqual([tier["sweeps"] for tier in tiers["tiers"]], [24, 34])
                 self.assertEqual((tiers["sweeps"], tiers["sweeps_rule"]), (34, "auto"))
                 self.assertEqual(tiers["velocity_limit_law"], "accumulated" if limits else None)
-                # The applied linked budget is the largest built linked tier's; point tiers apply none.
+                # The deprecated linked option applies the largest built linked tier's budget; point tiers none.
                 self.assertEqual(path_selection._EFFECTIVE["mf_gs_parallel_linked_sweeps"](probe), 34 if linked else 0)
                 # An infinite activation fraction reserves no velocity-limit row.
                 probe.velocity_limit_activation_fraction = float("inf")
@@ -1246,11 +1224,11 @@ class TestPatchParallelAdmission(unittest.TestCase):
 _SWEEPS_FLAG = "FEATHER_PGS_PATCH_PARALLEL_SWEEPS"
 
 
-class TestLinkedTierSweeps(unittest.TestCase):
-    """Give the linked (patch) tiers their own sweep budget, by count or by the ``"auto"`` rule."""
+class TestTierSweeps(unittest.TestCase):
+    """Budget every parallel tier by one automatic rule, at least ``mf_gs_parallel_sweeps``, under either law."""
 
     def test_requests_are_validated(self):
-        """Accept None, "auto" and positive counts (decimal text too); reject the rest and name their source."""
+        """Accept None, "auto" and positive counts (decimal text too) as linked budgets; reject the rest."""
         for value, expected in ((None, None), ("auto", "auto"), (64, 64), (np.int64(40), 40), ("48", 48)):
             with self.subTest(value=value):
                 self.assertEqual(source._linked_sweeps_request(value, "option"), expected)
@@ -1266,44 +1244,49 @@ class TestLinkedTierSweeps(unittest.TestCase):
                         SolverFeatherPGS(model)
 
     def test_auto_budget_grows_with_iterations_and_tier_rows(self):
-        """Sweep ceil(15/4 * pgs_iterations * sqrt(rows / 32)) times within the linked tiers' bounds.
+        """Sweep ceil(7/2 * pgs_iterations * sqrt(rows / 32)) times within every tier's bounds.
 
-        The budget is at least mf_gs_parallel_sweeps and at most 128, unless
-        mf_gs_parallel_sweeps is larger. The factor is refit per row bucket (see
-        _LINKED_SWEEPS_PER_ITERATION): at 12 iterations the four tiers sweep 45, 64,
-        78 and 90 times, at 8 iterations the 32- and 48-row tiers 30 and 37 times.
+        The budget is at least mf_gs_parallel_sweeps (and one sweep) and at most 128,
+        unless mf_gs_parallel_sweeps is larger. The factor is fit per row bucket (see
+        _TIER_SWEEPS_PER_ITERATION): at 12 iterations the four tiers sweep 42, 60, 73 and 84
+        times, at 8 iterations the 32- and 48-row tiers 28 and 35 times, under either law.
         """
-        self.assertEqual(source._LINKED_SWEEPS_PER_ITERATION, Fraction(15, 4))
+        self.assertEqual(source._TIER_SWEEPS_PER_ITERATION, Fraction(7, 2))
+        self.assertEqual(source._TIER_SWEEPS_CAP, 128)
         for rows, iterations, sweeps, expected in (
-            (32, 12, 24, 45),  # 15/4 * 12 exactly: no rounding up past a whole budget
-            (64, 12, 24, 64),
-            (96, 12, 24, 78),
-            (128, 12, 24, 90),  # 15/4 * 12 * 2 exactly
-            (32, 8, 24, 30),  # 15/4 * 8 exactly
-            (48, 8, 24, 37),
-            (64, 8, 24, 43),
-            (32, 6, 24, 24),  # 22.5 rounds up to 23: never fewer sweeps than mf_gs_parallel_sweeps
-            (128, 40, 24, 128),  # the cap
+            (32, 12, 24, 42),  # 7/2 * 12 exactly: no rounding up past a whole budget
+            (64, 12, 24, 60),
+            (96, 12, 24, 73),
+            (128, 12, 24, 84),  # 7/2 * 12 * 2 exactly
+            (32, 8, 24, 28),  # 7/2 * 8 exactly
+            (48, 8, 24, 35),
+            (64, 8, 24, 40),
+            (32, 6, 24, 24),  # 21 sweeps: never fewer than mf_gs_parallel_sweeps
+            (32, 1, 1, 4),  # 3.5 rounds up
+            (32, 32, 24, 112),
+            (32, 64, 24, 128),  # the cap
             (32, 4, 160, 160),  # mf_gs_parallel_sweeps above the cap keeps its own budget
-            (64, 0, 24, 24),
+            (64, 0, 0, 1),  # at least one sweep
         ):
             with self.subTest(rows=rows, iterations=iterations, sweeps=sweeps):
-                self.assertEqual(source._auto_linked_sweeps(rows, iterations, sweeps), expected)
+                self.assertEqual(source._auto_tier_sweeps(rows, iterations, sweeps), expected)
         # The integer arithmetic is the exact ceiling: the least n with 32 (q n)^2 >= (p iterations)^2 rows.
-        p, q = source._LINKED_SWEEPS_PER_ITERATION.numerator, source._LINKED_SWEEPS_PER_ITERATION.denominator
+        p, q = source._TIER_SWEEPS_PER_ITERATION.numerator, source._TIER_SWEEPS_PER_ITERATION.denominator
         wrong = []
         for rows, iterations in itertools.product(range(1, 129), range(41)):
             exact = 0
             while 32 * (q * exact) ** 2 < (p * iterations) ** 2 * rows:
                 exact += 1
-            if source._auto_linked_sweeps(rows, iterations, 1) != min(max(exact, 1), 128):
+            if source._auto_tier_sweeps(rows, iterations, 1) != min(max(exact, 1), source._TIER_SWEEPS_CAP):
                 wrong.append((rows, iterations))
         self.assertEqual(wrong, [])
 
-    def test_solver_budgets_linked_tiers_only(self):
-        """Budget linked tiers by the request and point tiers by mf_gs_parallel_sweeps; record the rule and source."""
+    def test_solver_budgets_every_tier(self):
+        """Budget point and linked tiers by one rule; the deprecated linked budget still sets the linked tiers'."""
         tiers = [(32, 0), (64, 32), (96, 64), (128, 96)]
-        for anchors, linked, environment in itertools.product((False, True), (None, 40, "auto"), (False, True)):
+        for anchors, linked, environment in itertools.product((False, True), ("auto", None, 40), (False, True)):
+            if environment and linked == "auto":
+                continue
             probe = SimpleNamespace(
                 _friction_anchors_enabled=anchors,
                 _environment_options=frozenset({"mf_gs_parallel_linked_sweeps"} if environment else ()),
@@ -1313,21 +1296,19 @@ class TestLinkedTierSweeps(unittest.TestCase):
             )
             with self.subTest(anchors=anchors, linked=linked, environment=environment):
                 budgets, rule, reason = SolverFeatherPGS._parallel_tier_sweeps(probe, tiers)
-                if not anchors or linked is None:
-                    self.assertEqual((budgets, rule), ([24] * 4, "mf_gs_parallel_sweeps"))
-                    self.assertIn("mf_gs_parallel_sweeps", reason)
+                if anchors and linked != "auto":
+                    expected = 24 if linked is None else linked
+                    self.assertEqual((budgets, rule), ([expected] * 4, "mf_gs_parallel_linked_sweeps"))
+                    source_name = _SWEEPS_FLAG if environment else "mf_gs_parallel_linked_sweeps"
+                    self.assertTrue(reason.startswith(f"{source_name}={linked} (deprecated)"), reason)
                     continue
-                if linked == "auto":
-                    self.assertEqual((budgets, rule), ([45, 64, 78, 90], "auto"))
-                    self.assertIn("ceil(15/4 * pgs_iterations * sqrt(R / 32))", reason)
-                    self.assertIn("pgs_iterations=12", reason)
-                    self.assertIn("at least mf_gs_parallel_sweeps=24 and at most 128", reason)
-                else:
-                    self.assertEqual((budgets, rule), ([40] * 4, "mf_gs_parallel_linked_sweeps"))
-                self.assertTrue(reason.startswith(_SWEEPS_FLAG if environment else "mf_gs_parallel_linked_sweeps"))
+                self.assertEqual((budgets, rule), ([42, 60, 73, 84], "auto"))
+                self.assertIn("ceil(7/2 * pgs_iterations * sqrt(R / 32))", reason)
+                self.assertIn("pgs_iterations=12", reason)
+                self.assertIn("at least mf_gs_parallel_sweeps=24 and at most 128", reason)
         # mf_gs_parallel_sweeps above the cap keeps its own budget; the reason states the bounds that way round.
         probe = SimpleNamespace(
-            _friction_anchors_enabled=True,
+            _friction_anchors_enabled=False,
             _environment_options=frozenset(),
             mf_gs_parallel_linked_sweeps="auto",
             mf_gs_parallel_sweeps=160,
@@ -1336,10 +1317,9 @@ class TestLinkedTierSweeps(unittest.TestCase):
         budgets, rule, reason = SolverFeatherPGS._parallel_tier_sweeps(probe, tiers)
         self.assertEqual((budgets, rule), ([160] * 4, "auto"))
         self.assertIn("at most 128 unless mf_gs_parallel_sweeps is larger", reason)
-        self.assertNotIn("[mf_gs_parallel_sweeps", reason)
 
-    def test_option_records_its_source(self):
-        """Default to "auto", report the override as the option's source, and apply no budget without linked tiers."""
+    def test_linked_budget_is_deprecated(self):
+        """Warn for a linked budget or its override, keep honoring it, and record its source."""
         default = inspect.signature(SolverFeatherPGS).parameters["mf_gs_parallel_linked_sweeps"].default
         self.assertEqual(default, "auto")
         model = _cpu_arm()
@@ -1354,17 +1334,27 @@ class TestLinkedTierSweeps(unittest.TestCase):
                 os.environ.pop(_SWEEPS_FLAG, None)
                 if environment is not None:
                     os.environ[_SWEEPS_FLAG] = environment
-                solver = SolverFeatherPGS(model, friction_anchor_beta=0.2, mf_gs_parallel_linked_sweeps=argument)
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    solver = SolverFeatherPGS(model, friction_anchor_beta=0.2, mf_gs_parallel_linked_sweeps=argument)
+                deprecated = sorted(
+                    str(warning.message).split(" ", 1)[0]
+                    for warning in caught
+                    if issubclass(warning.category, DeprecationWarning) and "parallel tier" in str(warning.message)
+                )
+                given = (("mf_gs_parallel_linked_sweeps", argument != "auto"), (_SWEEPS_FLAG, environment is not None))
+                self.assertEqual(deprecated, sorted(name for name, present in given if present))
                 self.assertEqual(solver.mf_gs_parallel_linked_sweeps, expected)
                 selected = solver.get_path_selection()
                 option = selected["options"]["mf_gs_parallel_linked_sweeps"]
                 self.assertEqual((option["requested"], option["source"]), (argument, source_name))
                 self.assertEqual(option["applied"], 0)  # no tiers on CPU
                 self.assertEqual(selected["environment"]["applied"].get(_SWEEPS_FLAG), environment)
-        with patch.dict(os.environ):
+        with patch.dict(os.environ), warnings.catch_warnings():
             os.environ.pop(_SWEEPS_FLAG, None)
+            warnings.simplefilter("error", DeprecationWarning)
             omitted = SolverFeatherPGS(model, friction_anchor_beta=0.2)
-        self.assertEqual(omitted.mf_gs_parallel_linked_sweeps, "auto")
+        self.assertEqual((omitted.mf_gs_parallel_sweeps, omitted.mf_gs_parallel_linked_sweeps), (24, "auto"))
         self.assertEqual(
             omitted.get_path_selection()["options"]["mf_gs_parallel_linked_sweeps"],
             {"applied": 0, "requested": "auto", "default": "auto", "source": "default"},
@@ -1735,12 +1725,17 @@ def _assert_tier_owned(test, solver, budget):
             test.assertEqual(int(mf_rows), 0, f"world {world}")
 
 
+def _exact_budget():
+    """Build tiers that sweep exactly ``mf_gs_parallel_sweeps``: no automatic budget above it."""
+    return patch.object(source, "_TIER_SWEEPS_PER_ITERATION", Fraction(0))
+
+
 def _drop_budget_override(test):
     """Run ``test`` without an exported ``FEATHER_PGS_PATCH_PARALLEL_SWEEPS``, which overrides every linked budget.
 
-    The tier tests request their budgets, or rely on the ``"auto"`` default or on
-    ``mf_gs_parallel_sweeps`` reaching the linked tiers. The environment is restored
-    after the test.
+    The tier tests rely on the automatic budget, raise it with ``mf_gs_parallel_sweeps``
+    or pin it (:func:`_exact_budget`); the deprecated override would replace the linked
+    tiers'. The environment is restored after the test.
     """
     environment = patch.dict(os.environ)
     environment.start()
@@ -1775,10 +1770,8 @@ class TestPatchParallelRoutes(unittest.TestCase):
         Opted out, patch friction keeps the route it had before the tiers learned the
         ring: the serial sweep, or the incremental tier that the constructor's default
         ``mf_gs_incremental_rows=32`` requests and an admitted parallel tier replaces.
-        Point friction builds its tiers whatever the switch says. With the option
-        omitted, the linked tier sweeps the ``"auto"`` budget, ``ceil(15/4 * 8)`` = 30
-        sweeps for 32 rows at eight iterations, and the point tier keeps
-        ``mf_gs_parallel_sweeps``.
+        Point friction builds its tiers whatever the switch says. Every tier, point or
+        linked, sweeps the automatic budget of 32 rows at eight iterations.
         """
         model = standing_model()
         options = {"sparse_mass_matrix": "auto", "cached_dynamics": "auto"}
@@ -1799,13 +1792,13 @@ class TestPatchParallelRoutes(unittest.TestCase):
             self.assertIsNone(solver._sparse_mass_matrix_size)
             keys = [kernel.key for kernel in solver._pgs_solve_mf_gs_incremental_kernels]
             self.assertTrue(keys)
-            self.assertTrue(all(key.endswith("_linked_iso") == linked for key in keys), keys)
-            sweeps, rule = (30, "auto") if linked else (24, "mf_gs_parallel_sweeps")
+            self.assertTrue(all(key.endswith("_linked_iso" if linked else "_iso") for key in keys), keys)
+            self.assertTrue(all(("_linked" in key) == linked for key in keys), keys)
+            sweeps = source._auto_tier_sweeps(32, 8, 24)
             self.assertTrue(all(f"_sweeps{sweeps}_" in key for key in keys), keys)
             tiers = solver.get_path_selection()["routes"]["sweep"]["tiers"]
             self.assertEqual((tiers["family"], tiers["linked_rows"]), ("parallel", linked))
-            self.assertEqual(tiers["pair_step"], "isotropic" if linked else "per_row")
-            self.assertEqual((tiers["sweeps"], tiers["sweeps_rule"]), (sweeps, rule))
+            self.assertEqual((tiers["sweeps"], tiers["sweeps_rule"]), (sweeps, "auto"))
         # Opted out, patch friction keeps the serial route it had before the tiers learned the ring.
         self.assertEqual(opted_out._ink_rows, 0)
         self.assertEqual(opted_out._pgs_solve_mf_gs_incremental_kernels, [])
@@ -1950,8 +1943,8 @@ class TestPatchParallelRoutes(unittest.TestCase):
         limit = 0.5
         model = _pushed_sphere("cuda:0", limit=limit)
         built = {}
-        # The pass is under test, not the budget: every tier sweeps mf_gs_parallel_sweeps.
-        with patch.dict(os.environ, {_SWITCH: "1"}):
+        # The pass is under test, not the budget: every tier sweeps exactly 24 times to 1e-4.
+        with patch.dict(os.environ, {_SWITCH: "1"}), _exact_budget():
             for limits, requested in itertools.product((False, True), repeat=2):
                 built[limits, requested] = _matrix_free_solver(
                     model,
@@ -1959,7 +1952,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
                     parallel_rows=32,
                     enable_joint_velocity_limits=limits,
                     mf_gs_parallel_linked_velocity_limit_pass=requested,
-                    mf_gs_parallel_linked_sweeps=None,
+                    mf_gs_parallel_tol=1.0e-4,
                 )
             budgets = {
                 (sweeps, requested): _matrix_free_solver(
@@ -1969,7 +1962,6 @@ class TestPatchParallelRoutes(unittest.TestCase):
                     enable_joint_velocity_limits=True,
                     mf_gs_parallel_linked_velocity_limit_pass=requested,
                     mf_gs_parallel_sweeps=sweeps,
-                    mf_gs_parallel_linked_sweeps=None,
                     mf_gs_parallel_tol=0.0,
                 )
                 for sweeps, requested in itertools.product((2, 2000), (False, True))
@@ -2008,30 +2000,38 @@ class TestPatchParallelRoutes(unittest.TestCase):
         # A converged tier leaves the pass nothing to push.
         np.testing.assert_allclose(velocities[2000, True], velocities[2000, False], rtol=0.0, atol=1.0e-6)
 
-    def test_linked_tiers_take_their_own_sweep_budget(self):
-        """Build each linked tier with its budget, record it, and leave point tiers on mf_gs_parallel_sweeps."""
+    def test_every_tier_takes_the_automatic_budget(self):
+        """Build point and linked tiers with the automatic budget, at least mf_gs_parallel_sweeps, and record it.
+
+        The deprecated ``mf_gs_parallel_linked_sweeps`` still sets the linked tiers'
+        budget, a count or exactly ``mf_gs_parallel_sweeps`` for ``None``, and warns.
+        """
         model = standing_model()
         options = {"dense_max_constraints": 64, "pgs_iterations": 8}
         with patch.dict(os.environ, {_SWITCH: "1"}):
-            built = {
-                (beta, linked): _matrix_free_solver(
-                    model, beta=beta, parallel_rows=64, mf_gs_parallel_linked_sweeps=linked, **options
+            built = {}
+            for beta, sweeps in itertools.product((0.0, 0.2), (24, 40, 64)):
+                built[beta, sweeps, "auto"] = _matrix_free_solver(
+                    model, beta=beta, parallel_rows=64, mf_gs_parallel_sweeps=sweeps, **options
                 )
-                for beta, linked in itertools.product((0.0, 0.2), (None, 40, "auto"))
-            }
-        for (beta, linked), solver in built.items():
-            with self.subTest(beta=beta, linked=linked):
-                if not beta or linked is None:
-                    expected, rule = [24, 24], "mf_gs_parallel_sweeps"
-                elif linked == "auto":
-                    expected, rule = [30, 43], "auto"  # ceil(15/4 * 8 * sqrt(rows / 32)) for 32 and 64 rows
+            for linked in (48, None):
+                with self.assertWarnsRegex(DeprecationWarning, "mf_gs_parallel_linked_sweeps is deprecated"):
+                    built[0.2, 24, linked] = _matrix_free_solver(
+                        model, beta=0.2, parallel_rows=64, mf_gs_parallel_linked_sweeps=linked, **options
+                    )
+        for (beta, sweeps, linked), solver in built.items():
+            with self.subTest(beta=beta, sweeps=sweeps, linked=linked):
+                if linked == "auto":
+                    # 7/2 * 8 * sqrt(rows / 32): 28 and 40 sweeps for 32 and 64 rows, at least mf_gs_parallel_sweeps.
+                    expected, rule = [max(28, sweeps), max(40, sweeps)], "auto"
                 else:
-                    expected, rule = [40, 40], "mf_gs_parallel_linked_sweeps"
+                    budget = sweeps if linked is None else linked
+                    expected, rule = [budget, budget], "mf_gs_parallel_linked_sweeps"
                 keys = [kernel.key for kernel in solver._pgs_solve_mf_gs_incremental_kernels]
                 self.assertEqual(len(keys), 2, keys)
-                for key, sweeps in zip(keys, expected, strict=True):
-                    self.assertIn(f"_sweeps{sweeps}_", key)
-                    self.assertEqual(key.endswith("_linked_iso"), bool(beta))
+                for key, budget in zip(keys, expected, strict=True):
+                    self.assertIn(f"_sweeps{budget}_", key)
+                    self.assertTrue(key.endswith("_linked_iso" if beta else "_iso"), key)
                 selected = solver.get_path_selection()
                 tiers = selected["routes"]["sweep"]["tiers"]
                 self.assertEqual([tier["sweeps"] for tier in tiers["tiers"]], expected)
@@ -2048,42 +2048,35 @@ class TestPatchParallelPhysics(unittest.TestCase):
     """Compare each law's parallel tiers with its serial sweep, the patch gap bounded by the point gap.
 
     Parallel tiers are Jacobi sweeps, not float reorderings of the serial sweep.
-    While every pair sticks the two schemes share their fixed point, and the
-    rollouts differ by the convergence gap. Once a pair slides the point tiers do
-    not: they scale the pair radially after per-row step scales, which turns its
-    sliding direction and, through the coupling, moves the normals and the body
-    velocity (on this module's reference case the converged velocities of the two
-    schemes differ by 4-15 %). The linked tiers step each pair isotropically and
-    keep the serial fixed point, so the point tiers' measured gap on the same
-    fixture, with a floor at the float-order tolerance of an exact route change,
-    bounds the patch tiers' gap. Where the two are compared, both sweep
-    ``mf_gs_parallel_sweeps`` (``mf_gs_parallel_linked_sweeps=None``), so the bound
-    compares the laws at one budget; the linked tiers' default ``"auto"`` budget
-    sweeps more and must stay within the same bound of the serial sweep. Every
-    parallel step must leave each world in the tiers' domain, so the comparison is
-    never serial against serial.
+    Every tier steps each friction pair isotropically, so under either law the
+    tiers share the serial sweep's fixed point (a sliding pair converges to maximal
+    dissipation) and the rollouts differ by the convergence gap. The point tiers'
+    measured gap on the same fixture, with a floor at the float-order tolerance of
+    an exact route change, bounds the patch tiers' gap. Both laws' tiers sweep their
+    default budget, which is the same for both, so the bound compares the laws at one
+    budget. Every parallel step must leave each world in the tiers' domain, so the
+    comparison is never serial against serial.
     """
 
-    # (friction_anchor_beta, mf_gs_parallel_rows, mf_gs_parallel_linked_sweeps): each law's serial sweep and tiers at
-    # mf_gs_parallel_sweeps, and the patch tiers at their default budget.
-    _ARMS = ((0.0, 0, None), (0.0, 32, None), (0.2, 0, None), (0.2, 32, None), (0.2, 32, "auto"))
+    # (friction_anchor_beta, mf_gs_parallel_rows): each law's serial sweep and tiers at their default budget.
+    _ARMS = ((0.0, 0), (0.0, 32), (0.2, 0), (0.2, 32))
 
     def setUp(self):
         """Build every tier with the budget the test requests (:func:`_drop_budget_override`)."""
         _drop_budget_override(self)
 
-    def _assert_budget(self, solver, parallel_rows, linked):
-        """Require the tiers to sweep 24 times, or the auto budget's 30 at eight iterations and 32 rows."""
+    def _assert_budget(self, solver, parallel_rows):
+        """Require the tiers to sweep the automatic budget of 32 rows at eight iterations."""
         keys = [kernel.key for kernel in solver._pgs_solve_mf_gs_incremental_kernels]
         self.assertEqual(bool(keys), bool(parallel_rows), keys)
-        sweeps = 30 if linked == "auto" else 24
-        self.assertTrue(all(f"_sweeps{sweeps}_" in key for key in keys), keys)
+        budget = source._auto_tier_sweeps(32, 8, 24)
+        self.assertTrue(all(f"_sweeps{budget}_" in key for key in keys), keys)
 
     def test_standing_feet_match_the_serial_patch_sweep(self):
         """Keep loaded, ring-linked anchors and the serial sweep's motion on two box feet.
 
-        The patch tiers' gap to the serial patch sweep, at the point tiers' budget and
-        at the default ``"auto"`` budget, stays within the point tiers' gap bound.
+        The patch tiers' gap to the serial patch sweep stays within the point tiers'
+        gap bound.
         """
         model = standing_model()
         velocity = model.joint_qd.numpy()
@@ -2091,7 +2084,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
         model.joint_qd.assign(velocity)
         with patch.dict(os.environ, {_SWITCH: "1"}):
             states = {}
-            for beta, parallel_rows, linked in self._ARMS:
+            for beta, parallel_rows in self._ARMS:
 
                 def check(step, solver, contacts, state, beta=beta, parallel_rows=parallel_rows):
                     for name in _STATE_FIELDS:
@@ -2105,35 +2098,30 @@ class TestPatchParallelPhysics(unittest.TestCase):
                         assert_ring_coulomb(solver)
                         assert_loaded_anchors(solver, contacts, carried=step > 0)
 
-                solver = _matrix_free_solver(
-                    model, beta=beta, parallel_rows=parallel_rows, mf_gs_parallel_linked_sweeps=linked
-                )
-                self._assert_budget(solver, parallel_rows, linked)
-                states[beta, parallel_rows, linked] = _rollout(model, solver, 24, after_step=check)[0]
-        point_gap = _state_differences(states[0.0, 32, None], states[0.0, 0, None])
-        patch_gap = _state_differences(states[0.2, 32, None], states[0.2, 0, None])
-        auto_gap = _state_differences(states[0.2, 32, "auto"], states[0.2, 0, None])
-        measured = {"point_gap": point_gap, "patch_gap": patch_gap, "auto_gap": auto_gap}
+                solver = _matrix_free_solver(model, beta=beta, parallel_rows=parallel_rows)
+                self._assert_budget(solver, parallel_rows)
+                states[beta, parallel_rows] = _rollout(model, solver, 24, after_step=check)[0]
+        point_gap = _state_differences(states[0.0, 32], states[0.0, 0])
+        patch_gap = _state_differences(states[0.2, 32], states[0.2, 0])
+        measured = {"point_gap": point_gap, "patch_gap": patch_gap}
         for name in _STATE_FIELDS:
             bound = 3.0 * point_gap[name] + _STATE_FLOOR[name]
             self.assertLessEqual(patch_gap[name], bound, (name, measured))
-            self.assertLessEqual(auto_gap[name], bound, (name, measured))
 
     def test_box_rests_and_slides_like_the_serial_patch_sweep(self):
         """Hold a resting box, and stop a sliding one where the serial patch sweep stops it.
 
         A sliding box saturates its patch's pooled cone: each anchor pair carries
         mu / 2 of the four normals' load. Pooling each pair on its own normal would
-        halve the friction and double the stopping distance. The patch tiers at the
-        point tiers' budget and at the default ``"auto"`` budget stop the box within
-        the point tiers' gap bound of the serial patch sweep.
+        halve the friction and double the stopping distance. The patch tiers stop the
+        box within the point tiers' gap bound of the serial patch sweep.
         """
         speed, mu, gravity = 1.0, 0.5, 9.81
         expected = speed * speed / (2.0 * mu * gravity)
         model = _sliding_boxes("cuda:0", (0.0, speed), mu=mu)
         distances = {}
         with patch.dict(os.environ, {_SWITCH: "1"}):
-            for beta, parallel_rows, linked in self._ARMS:
+            for beta, parallel_rows in self._ARMS:
                 ratios = []
 
                 def check(step, solver, contacts, state, ratios=ratios, parallel_rows=parallel_rows):
@@ -2143,13 +2131,11 @@ class TestPatchParallelPhysics(unittest.TestCase):
                         pairs = _friction_pairs(solver, world=1)
                         ratios.extend(magnitude / budget for magnitude, budget in pairs if budget > 0.0)
 
-                solver = _matrix_free_solver(
-                    model, beta=beta, parallel_rows=parallel_rows, mf_gs_parallel_linked_sweeps=linked
-                )
-                self._assert_budget(solver, parallel_rows, linked)
+                solver = _matrix_free_solver(model, beta=beta, parallel_rows=parallel_rows)
+                self._assert_budget(solver, parallel_rows)
                 state, _ = _rollout(model, solver, 96, after_step=check)
                 q, qd = state.joint_q.numpy(), state.joint_qd.numpy()
-                with self.subTest(beta=beta, parallel_rows=parallel_rows, linked=linked):
+                with self.subTest(beta=beta, parallel_rows=parallel_rows):
                     self.assertLess(np.max(np.abs(q[0:2])), 2.0e-4, "the resting box must not creep")
                     self.assertLess(abs(qd[3]), 1.0e-3, "the sliding box must stop")
                     self.assertLess(abs(q[3] - expected), 0.2 * expected, "friction must act at the full coefficient")
@@ -2158,11 +2144,10 @@ class TestPatchParallelPhysics(unittest.TestCase):
                     # A parallel iterate is projected onto its pooled cone; a serial sweep may update
                     # a ring normal after the pair, leaving the pair marginally outside.
                     self.assertLess(max(ratios), 1.0 + (1.0e-4 if parallel_rows else 5.0e-3))
-                distances[beta, parallel_rows, linked] = float(q[3])
-        point_gap = abs(distances[0.0, 32, None] - distances[0.0, 0, None])
-        for linked in (None, "auto"):
-            patch_gap = abs(distances[0.2, 32, linked] - distances[0.2, 0, None])
-            self.assertLessEqual(patch_gap, max(3.0 * point_gap, 0.01 * expected), (linked, distances))
+                distances[beta, parallel_rows] = float(q[3])
+        point_gap = abs(distances[0.0, 32] - distances[0.0, 0])
+        patch_gap = abs(distances[0.2, 32] - distances[0.2, 0])
+        self.assertLessEqual(patch_gap, max(3.0 * point_gap, 0.01 * expected), distances)
 
     def test_sliding_contact_reaches_the_serial_fixed_point(self):
         """Slide one contact of fourfold unequal tangent masses to the serial patch sweep's converged velocity.
@@ -2211,37 +2196,29 @@ class TestPatchParallelPhysics(unittest.TestCase):
         for name in ("tier", "tier_response_block"):
             np.testing.assert_allclose(velocities[name], velocities["serial"], atol=1.0e-5 * scale, err_msg=name)
 
-    def test_linked_budget_carries_the_tiers_to_the_serial_fixed_point(self):
-        """Converge the linked tiers on their own budget while the shared budget stays truncated.
+    def test_budget_carries_the_tiers_to_the_serial_fixed_point(self):
+        """Converge the linked tiers on their budget, where a truncated budget stays short.
 
-        On the first step of :func:`sliding_stance` a linked tier that
-        ``mf_gs_parallel_sweeps=2`` (tolerance 0) stops must stay short of the
-        serial sweep's velocity (2000 iterations), and the linked budget of 2000
-        sweeps alone must carry it there (:func:`assert_budget_reaches_the_fixed_point`;
-        the float64 reference on the CPU split rows: 3.4e-2 of the scale after two
-        sweeps, 1.1e-7 after 2000). A single sliding contact cannot show what a budget
-        carries: two sweeps converge it (4.2e-6 of the scale in the reference). One
-        step keeps the comparison on the solve, as later steps add the float32 drift
-        of the feet's poses that the position correction amplifies. Point tiers built
-        with the same request keep two sweeps.
+        On the first step of :func:`sliding_stance` a linked tier pinned to two
+        sweeps (tolerance 0, :func:`_exact_budget`) must stay short of the serial
+        sweep's velocity (2000 iterations), and a budget of 2000 sweeps must
+        carry it there (:func:`assert_budget_reaches_the_fixed_point`; the float64
+        reference on the CPU split rows: 3.4e-2 of the scale after two sweeps, 1.1e-7
+        after 2000). A single sliding contact cannot show what a budget carries: two
+        sweeps converge it (4.2e-6 of the scale in the reference). One step keeps the
+        comparison on the solve, as later steps add the float32 drift of the feet's
+        poses that the position correction amplifies.
         """
         model = sliding_stance("cuda:0")
-        # The truncated tier opts out of the default "auto" budget, which would sweep it 30 times.
-        truncated = {"mf_gs_parallel_sweeps": 2, "mf_gs_parallel_tol": 0.0, "mf_gs_parallel_linked_sweeps": None}
-        budgeted = {**truncated, "mf_gs_parallel_linked_sweeps": 2000}
+        truncated = {"mf_gs_parallel_sweeps": 2, "mf_gs_parallel_tol": 0.0}
+        budgeted = {**truncated, "mf_gs_parallel_sweeps": 2000}
         with patch.dict(os.environ, {_SWITCH: "1"}):
-            routes = {
-                "serial": _matrix_free_solver(model, beta=0.2, parallel_rows=0, pgs_iterations=2000),
-                "truncated": _matrix_free_solver(model, beta=0.2, parallel_rows=32, **truncated),
-                "linked_budget": _matrix_free_solver(model, beta=0.2, parallel_rows=32, **budgeted),
-            }
-            point = _matrix_free_solver(model, beta=0.0, parallel_rows=32, **budgeted)
-        point_keys = [kernel.key for kernel in point._pgs_solve_mf_gs_incremental_kernels]
-        self.assertTrue(
-            point_keys and all("_sweeps2_" in key and "_linked" not in key for key in point_keys), point_keys
-        )
-        for name in ("truncated", "linked_budget"):
-            sweeps = 2000 if name == "linked_budget" else 2
+            routes = {"serial": _matrix_free_solver(model, beta=0.2, parallel_rows=0, pgs_iterations=2000)}
+            with _exact_budget():
+                routes["truncated"] = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **truncated)
+            routes["budgeted"] = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **budgeted)
+        for name in ("truncated", "budgeted"):
+            sweeps = 2000 if name == "budgeted" else 2
             kernels = routes[name]._pgs_solve_mf_gs_incremental_kernels
             self.assertTrue(kernels and all(f"_sweeps{sweeps}_" in kernel.key for kernel in kernels), name)
         velocities = {}
@@ -2251,11 +2228,10 @@ class TestPatchParallelPhysics(unittest.TestCase):
                 _assert_tier_owned(self, solver, 32)
             velocities[name] = state.joint_qd.numpy().astype(np.float64)
         gaps = {
-            name: float(np.max(np.abs(velocities[name] - velocities["serial"])))
-            for name in ("truncated", "linked_budget")
+            name: float(np.max(np.abs(velocities[name] - velocities["serial"]))) for name in ("truncated", "budgeted")
         }
         scale = float(np.max(np.abs(velocities["serial"])))
-        assert_budget_reaches_the_fixed_point(self, gaps["truncated"], gaps["linked_budget"], scale)
+        assert_budget_reaches_the_fixed_point(self, gaps["truncated"], gaps["budgeted"], scale)
 
     def test_lone_live_tangent_keeps_its_friction(self):
         """Brake a sphere whose second tangent no joint moves as the serial sweep brakes it.

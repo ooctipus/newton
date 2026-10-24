@@ -641,7 +641,6 @@ def create_owner(solver):
         and 0 < solver.mf_gs_parallel_rows <= 128
         and solver.mf_gs_parallel_matrix_free
         and solver.dense_max_constraints >= solver.mf_gs_parallel_rows
-        and solver.mf_gs_parallel_sweeps > 0
         and solver.pgs_iterations > 0
         and solver.pgs_velocity_iterations == 0
         and not solver.pgs_warmstart

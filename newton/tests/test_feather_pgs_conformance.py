@@ -90,10 +90,11 @@ Reference and tolerances
     penetration, energy gain, patch cone excess, limit, loop and mimic errors
     may exceed the reference's at ``N`` by the same factor plus a floor; the
     point cone, the normal force sign and the free-body momentum balance, which
-    every iterate satisfies, get a float32 floor only. Jacobi tiers sweep
-    ``4 N`` times, the ratio the solver's ``mf_gs_parallel_linked_sweeps="auto"``
-    rule gives patch tiers. Each group also checks that its routes agree with
-    each other, and on CUDA that the converged CUDA and CPU references agree.
+    every iterate satisfies, get a float32 floor only. The parallel (Jacobi)
+    tiers run the solver's default budget and exit law, as users run them: the
+    automatic budget sizes each tier from ``N`` and its row bound. Each group also
+    checks that its routes agree with each other, and on CUDA that the converged
+    CUDA and CPU references agree.
 
 Findings
     Routes that fail a check at the gate's baseline (584eae97) are expected
@@ -957,9 +958,6 @@ SCENE_LAWS = {
 REFERENCE_FACTOR = 8
 """The converged reference runs ``REFERENCE_FACTOR`` times the gate budget (and one iteration more)."""
 
-TIER_SWEEPS = 4
-"""Jacobi sweeps of the parallel tiers per serial iteration (the ratio of ``mf_gs_parallel_linked_sweeps="auto"``)."""
-
 TRAJECTORY_FACTOR = 4.0
 """A route may stray from the converged reference by this multiple of the reference's own convergence spread."""
 
@@ -1038,10 +1036,7 @@ def run_physics(physics: Physics, route: Route, device, iterations: int | None =
     iterations = physics.iterations if iterations is None else iterations
     key = (physics.name, route.name, str(device), iterations)
     if key not in _RUNS:
-        options = physics.options(iterations)
-        if route.options.get("mf_gs_parallel_rows", 0) > 0 and "mf_gs_parallel_sweeps" not in route.options:
-            options["mf_gs_parallel_sweeps"] = TIER_SWEEPS * iterations
-        _RUNS[key] = simulate(physics.scene, route, device, options=options)
+        _RUNS[key] = simulate(physics.scene, route, device, options=physics.options(iterations))
     return _RUNS[key]
 
 
@@ -1187,13 +1182,13 @@ MF_MASKED = Route(
 MF_PARALLEL = Route(
     "mf_parallel",
     "cuda",
-    options={**_MF, "mf_gs_parallel_rows": 32, "mf_gs_parallel_tol": 1.0e-7},
+    options={**_MF, "mf_gs_parallel_rows": 32},
     expect={"sweep.route": "matrix_free_gs", "sweep.tiers.family": "parallel", "sweep.tiers.matrix_free": False},
 )
 MF_PARALLEL_MATRIX_FREE = Route(
     "mf_parallel_matrix_free",
     "cuda",
-    options={**_MF, "mf_gs_parallel_rows": 32, "mf_gs_parallel_matrix_free": True, "mf_gs_parallel_tol": 1.0e-7},
+    options={**_MF, "mf_gs_parallel_rows": 32, "mf_gs_parallel_matrix_free": True},
     module={"_MF_EXACT_ROWSUM": True},
     expect={"sweep.route": "matrix_free_gs", "sweep.tiers.family": "parallel", "sweep.tiers.matrix_free": True},
 )
@@ -1201,7 +1196,7 @@ KEYED_PARALLEL = Route(
     "keyed_parallel",
     "cuda",
     # The allegro and anymal-D recipes: in-kernel response (FEATHER_PGS_INK) over matrix-free parallel tiers.
-    options={**_MF, "mf_gs_parallel_rows": 32, "mf_gs_parallel_matrix_free": True, "mf_gs_parallel_tol": 1.0e-7},
+    options={**_MF, "mf_gs_parallel_rows": 32, "mf_gs_parallel_matrix_free": True},
     module={"_INK_ON": True, "_MF_EXACT_ROWSUM": True},
     expect={
         "sweep.route": "matrix_free_gs",

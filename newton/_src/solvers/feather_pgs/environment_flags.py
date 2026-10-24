@@ -274,13 +274,8 @@ FLAGS = declare(
         "FEATHER_PGS_PATCH_PARALLEL_SWEEPS",
         "policy",
         _SOLVER,
-        "A positive count or auto overrides mf_gs_parallel_linked_sweeps, the linked tiers' sweep budget.",
-    ),
-    _flag(
-        "FEATHER_PGS_POINT_PAIR_STEP",
-        "experiment",
-        _SOLVER,
-        "isotropic steps each point-friction pair of the parallel tiers with one step (default per_row).",
+        "Deprecated (warns): a positive count or auto overrides the deprecated mf_gs_parallel_linked_sweeps, the "
+        "linked tiers' own budget; every tier follows one automatic budget rule.",
     ),
     _flag(
         "FEATHER_PGS_PREDICTED_TWISTS",
