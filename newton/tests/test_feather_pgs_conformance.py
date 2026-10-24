@@ -98,9 +98,8 @@ Reference and tolerances
 
 Findings
     Routes that fail a check at the gate's baseline (584eae97) are expected
-    failures that name the finding: rigid-body speed limits (per-axis rows in
-    matrix-free mode, a predictor clamp in split mode) and the research
-    friction modes.
+    failures that name the finding: the rigid-body speed limit of split mode
+    (a predictor clamp) and the research friction modes.
 
 Runtime
     Small scenes (one or two worlds, 60 to 240 steps): with a warm kernel
@@ -1381,20 +1380,14 @@ def _laws(*laws):
 
 
 _WARM = {"pgs_warmstart": True}
-_SPEED_AXES = (
-    "Matrix-free mode bounds a free body's linear velocity per world axis (two rows per axis), so the diagonal "
-    "push reaches sqrt(2) times rigid_body_max_linear_velocity; PhysX's maxLinearVelocity bounds the speed."
-)
 _SPEED_PREDICTOR = (
     "Split mode clamps the magnitude of the predicted velocity, gravity's increment included, before the solve; the "
     "ground contact then removes the vertical part, so the pushed box settles 0.25% below its speed limit."
 )
 _SPEED_FINDINGS = (
-    ("reference", _SPEED_AXES),
-    ("mf_incremental_held", _SPEED_AXES),
     ("split_loop", _SPEED_PREDICTOR),
     ("cpu_split", _SPEED_PREDICTOR),
-    ("reference_matches_cpu", f"{_SPEED_AXES} {_SPEED_PREDICTOR}"),
+    ("reference_matches_cpu", _SPEED_PREDICTOR),
 )
 
 

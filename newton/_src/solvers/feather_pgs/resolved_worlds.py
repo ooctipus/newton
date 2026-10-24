@@ -200,6 +200,26 @@ def check_world_limits(data: ResolvedWorldInput, scratch: ResolvedWorldScratch):
         wp.atomic_max(scratch.rejected, world, 1)
 
 
+@wp.func
+def _within_speed_limits(data: ResolvedWorldInput, body: int, start: int) -> bool:
+    """Whether a free body's predicted linear and angular speeds are within its speed limits.
+
+    A limit bounds the magnitude of the velocity (PhysX's ``maxLinearVelocity`` and
+    ``maxAngularVelocity``), as the free body's speed rows do. A NaN limit is malformed.
+    """
+    valid = True
+    for speed_row in range(2):
+        limit = data.max_linear_velocity[body]
+        if speed_row == 1:
+            limit = data.max_angular_velocity[body]
+        valid = valid and not wp.isnan(limit)
+        if wp.isfinite(limit) and limit > 0.0:
+            dof = start + 3 * speed_row
+            speed = wp.length(wp.vec3(data.v_hat[dof], data.v_hat[dof + 1], data.v_hat[dof + 2]))
+            valid = valid and speed <= limit
+    return valid
+
+
 @wp.kernel(enable_backward=False)
 def build_predicted_body_twists(data: ResolvedWorldInput, scratch: ResolvedWorldScratch):
     """Contract each body's motion axes against the predictor, never the incoming velocity."""
@@ -252,13 +272,7 @@ def build_predicted_body_twists(data: ResolvedWorldInput, scratch: ResolvedWorld
             valid = valid and count == 6 and body < data.max_linear_velocity.shape[0]
             valid = valid and body < data.max_angular_velocity.shape[0]
             if valid:
-                for k in range(6):
-                    limit = data.max_linear_velocity[body]
-                    if k >= 3:
-                        limit = data.max_angular_velocity[body]
-                    valid = valid and not wp.isnan(limit)
-                    if wp.isfinite(limit) and limit > 0.0:
-                        valid = valid and wp.abs(data.v_hat[start + k]) <= limit
+                valid = _within_speed_limits(data, body, start)
     elif data.articulation_response_dof_count[art] > 0 and (data.body_flags[body] & 2) != 0:
         # Partial prescribed membership needs a different source target model.
         valid = False
@@ -295,13 +309,7 @@ def check_free_bodies(data: ResolvedWorldInput, scratch: ResolvedWorldScratch):
     valid = count == 6 and start >= 0 and start + 6 <= data.v_hat.shape[0]
     valid = valid and body < data.max_linear_velocity.shape[0] and body < data.max_angular_velocity.shape[0]
     if valid:
-        for k in range(6):
-            limit = data.max_linear_velocity[body]
-            if k >= 3:
-                limit = data.max_angular_velocity[body]
-            valid = valid and not wp.isnan(limit)
-            if wp.isfinite(limit) and limit > 0.0:
-                valid = valid and wp.abs(data.v_hat[start + k]) <= limit
+        valid = _within_speed_limits(data, body, start)
     if not valid:
         wp.atomic_max(scratch.rejected, world, 1)
 

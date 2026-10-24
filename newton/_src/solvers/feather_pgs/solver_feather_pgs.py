@@ -93,6 +93,7 @@ from .kernels import (
     PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
     PGS_LOCAL_SOLVE_OWNER_SINGLE,
     PREELIM_MAX_ROWS,
+    RIGID_SPEED_ROWS,
     _get_tree_fk_kernel,
     _get_tree_tau_kernel,
     accumulate_articulation_tau,
@@ -1127,7 +1128,14 @@ class SolverFeatherPGS(SolverBase):
 
     @classmethod
     def register_custom_attributes(cls, builder: ModelBuilder) -> None:
-        """Register PhysX rigid-body attributes consumed by FeatherPGS."""
+        """Register PhysX rigid-body attributes consumed by FeatherPGS.
+
+        ``rigid_body_max_linear_velocity`` [m/s] and ``rigid_body_max_angular_velocity``
+        [rad/s] bound the speeds of a free body, the magnitudes of its center of mass
+        velocity and of its angular velocity (``physxRigidBody:maxLinearVelocity`` and
+        ``physxRigidBody:maxAngularVelocity``, default unbounded).
+        ``rigid_body_max_depenetration_velocity`` [m/s] bounds its contact correction velocity.
+        """
 
         def _angular_velocity_deg_to_rad(value, _context):
             if value is None:
@@ -1533,13 +1541,14 @@ class SolverFeatherPGS(SolverBase):
                 ``pgs_mode`` together with ``enable_joint_velocity_limits=True`` raises
                 :class:`NotImplementedError` at construction. Defaults to False.
             velocity_limit_activation_fraction (float, optional): Proximity gate for velocity-limit
-                row allocation. ``0.0`` allocates the lower/upper row pair for every finitely
-                limited joint DOF and free-rigid-body axis each step, preserving the historical
-                behavior exactly. A positive fraction allocates a pair only when the current
-                speed satisfies ``|qd| >= fraction * limit``, skipping rows that would be exact
-                no-op clamps. Because the gate samples the pre-solve velocity, a DOF crossing the
-                threshold between steps is clamped one step late. Must be non-negative and not
-                NaN. Defaults to ``0.0``.
+                row allocation. ``0.0`` allocates the lower/upper row pair of every finitely
+                limited joint DOF, and the speed row of every finitely limited free-rigid-body
+                linear or angular speed, each step. A positive fraction allocates them only when
+                the current speed satisfies ``|qd| >= fraction * limit`` (the magnitude of the
+                linear or angular velocity for a free body's speed row), skipping rows that would
+                be exact no-op clamps. Because the gate samples the pre-solve velocity, a DOF
+                crossing the threshold between steps is clamped one step late. Must be non-negative
+                and not NaN. Defaults to ``0.0``.
             fuse_joint_velocity_limits (bool, optional): Enforce joint velocity limits of
                 *driven* DOFs (``drive_slot[dof] >= 0``, i.e. ``joint_target_ke/kd > 0``) as a
                 stateless clamp instead of two dedicated dense rows per DOF. This mirrors
@@ -1574,7 +1583,9 @@ class SolverFeatherPGS(SolverBase):
                 dedicated rows it replaces. Defaults to True.
             velocity_limit_law (str, optional): How the matrix-free sweeps project the dedicated
                 joint and free-body velocity-limit rows, which keep the last word at the end of
-                every iteration either way. ``"stateless"`` is PhysX's clamp: each visit applies
+                every iteration either way. A free body's row bounds the magnitude of its linear or
+                angular velocity (a speed row: residual ``limit - |v|``, correction along ``v``).
+                ``"stateless"`` is PhysX's clamp: each visit applies
                 only the impulse that removes the current overshoot and stores that correction,
                 so an impulse that later rows made unnecessary is never released and the
                 converged velocity depends on the row order. ``"accumulated"`` treats the row like
@@ -6361,21 +6372,16 @@ class SolverFeatherPGS(SolverBase):
         )
 
         if self._has_rigid_body_velocity_limits and self._free_rigid_body_count > 0:
-            # Twelve entries per free rigid body: lower/upper rows for the
-            # three linear and three angular velocity components.
+            # Two speed rows per free rigid body: its linear and its angular speed.
             self.rigid_velocity_limit_slot = wp.full(
-                (12 * self._free_rigid_body_count,),
+                (RIGID_SPEED_ROWS * self._free_rigid_body_count,),
                 -1,
                 dtype=wp.int32,
                 device=device,
                 requires_grad=requires_grad,
             )
-            self.rigid_velocity_limit_sign = wp.zeros(
-                (12 * self._free_rigid_body_count,), dtype=wp.float32, device=device, requires_grad=requires_grad
-            )
         else:
             self.rigid_velocity_limit_slot = None
-            self.rigid_velocity_limit_sign = None
 
         self.mf_body_Hinv = wp.zeros((body_count,), dtype=wp.spatial_matrix, device=device, requires_grad=requires_grad)
 
@@ -6460,12 +6466,8 @@ class SolverFeatherPGS(SolverBase):
             self.rigid_velocity_limit_slot = wp.full(
                 (1,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
             )
-            self.rigid_velocity_limit_sign = wp.zeros(
-                (1,), dtype=wp.float32, device=device, requires_grad=requires_grad
-            )
         else:
             self.rigid_velocity_limit_slot = None
-            self.rigid_velocity_limit_sign = None
 
     def _allocate_debug_buffers(self, model):
         """Allocate buffers for PGS convergence diagnostics."""
@@ -11735,7 +11737,6 @@ class SolverFeatherPGS(SolverBase):
                 ],
                 outputs=[
                     self.rigid_velocity_limit_slot,
-                    self.rigid_velocity_limit_sign,
                     self.mf_slot_counter,
                 ],
                 device=model.device,
@@ -11751,7 +11752,6 @@ class SolverFeatherPGS(SolverBase):
                     self.rigid_body_max_linear_velocity,
                     self.rigid_body_max_angular_velocity,
                     self.rigid_velocity_limit_slot,
-                    self.rigid_velocity_limit_sign,
                 ],
                 outputs=[
                     self.mf_body_a,
@@ -15646,24 +15646,41 @@ def _get_pgs_solve_mf_kernel(
     global memory round-trips. J, MiJt, eff_mass_inv, and rhs are read
     from global memory per constraint (read-only, cache-friendly sequential access).
 
-    ``has_velocity_limit_rows`` compiles the free-body velocity-limit law of
-    :func:`pgs_solve_mf_loop`: a ``PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT`` row
-    pushes only while its limit is violated (``J v + rhs < 0``), by the whole
-    unrelaxed correction, and stores that correction instead of an accumulated
-    impulse. The rows occupy the tail of each world's rows, so they keep the
-    last word of every iteration, as in the fused MF-GS kernel's final
-    velocity-limit pass. Without the flag such a row is relaxed as a bilateral
-    row, which drives every limited axis onto its limit; the variant without it
-    keeps its historical generated code for solvers that cannot allocate these rows.
+    ``has_velocity_limit_rows`` compiles the free-body speed law of
+    :func:`pgs_solve_mf_loop` (:func:`project_free_body_speed`): a
+    ``PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT`` row bounds the magnitude of
+    its body's linear or angular velocity, pushes only while that speed exceeds
+    its limit, along the velocity, by the whole unrelaxed correction, and stores
+    that correction instead of an accumulated impulse. The rows occupy the tail
+    of each world's rows, so they keep the last word of every iteration, as in
+    the fused MF-GS kernel's final velocity-limit pass. The variant without the
+    flag keeps its historical generated code for solvers that cannot allocate
+    these rows.
     """
     MF_MAX_C = mf_max_constraints
     MAX_BODIES = max_mf_bodies
     velocity_limit_projection = (
         f"""
                 if (row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)}) {{
-                    // Stateless clamp: only a violated limit pushes, and the row keeps that correction.
-                    delta_impulse = (jv + rhs_i) < 0.0f ? delta : 0.0f;
-                    new_impulse = delta_impulse;
+                    // A free body's speed row: the stateless clamp of its linear (J = e_0) or angular (J = e_3)
+                    // speed, along the velocity; the row keeps the correction it applied.
+                    float eff = mf_eff_mass_inv.data[c_off + i];
+                    int lb = mf_local_body_a.data[c_off + i];
+                    if (eff > 0.0f && lb >= 0) {{
+                        int sv = lb * 6 + (mf_J_a.data[(c_off + i) * 6 + 3] != 0.0f ? 3 : 0);
+                        float speed = sqrtf(s_vel[sv] * s_vel[sv] + s_vel[sv + 1] * s_vel[sv + 1]
+                            + s_vel[sv + 2] * s_vel[sv + 2]);
+                        float overshoot = speed - mf_rhs.data[c_off + i];
+                        float correction = overshoot > 0.0f ? overshoot * eff : 0.0f;
+                        if (correction != 0.0f) {{
+                            float scale = 1.0f - (correction / eff) / speed;
+                            s_vel[sv] *= scale;
+                            s_vel[sv + 1] *= scale;
+                            s_vel[sv + 2] *= scale;
+                        }}
+                        s_impulse[i] = correction;
+                    }}
+                    continue;
                 }}"""
         if has_velocity_limit_rows
         else ""
@@ -15722,7 +15739,7 @@ def _get_pgs_solve_mf_kernel(
                 if (row_type == 2 && global_iter < friction_start_iteration) {{
                     s_impulse[i] = 0.0f;
                     continue;
-                }}
+                }}{velocity_limit_projection}
 
                 float eff_inv = mf_eff_mass_inv.data[c_off + i];
                 if (eff_inv <= 0.0f && row_type != 2) continue;
@@ -15835,7 +15852,7 @@ def _get_pgs_solve_mf_kernel(
                     }}
                 }}
 
-                float delta_impulse = new_impulse - old_impulse;{velocity_limit_projection}
+                float delta_impulse = new_impulse - old_impulse;
                 s_impulse[i] = new_impulse;
 
                 // Apply velocity correction: v += MiJt * delta_impulse

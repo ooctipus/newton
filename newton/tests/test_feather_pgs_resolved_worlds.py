@@ -332,6 +332,21 @@ class TestResolvedWorlds(unittest.TestCase):
         self.assertEqual(evaluate(data, raw, scratch), 1)
         self.assertAlmostEqual(float(scratch.minimum_residual.numpy()[0]), 0.5, places=6)
 
+    def test_rigid_caps_bound_speeds(self):
+        """Keep the rows of a free body whose speed exceeds its cap although every component is within it."""
+        for part, cap in ((slice(0, 3), "max_linear_velocity"), (slice(3, 6), "max_angular_velocity")):
+            with self.subTest(cap=cap):
+                data, raw, scratch = make_case(free=True)
+                # Without contacts only the cap can keep the world's rows.
+                raw.count.assign([0])
+                velocity = np.zeros(6, dtype=np.float32)
+                velocity[part] = (-0.6, 0.6, 0.0)
+                data.v_hat.assign(velocity)
+                getattr(data, cap).assign([1.0, np.inf])
+                self.assertEqual(evaluate(data, raw, scratch), 1)
+                getattr(data, cap).assign([0.8, np.inf])
+                self.assertEqual(evaluate(data, raw, scratch), 0)
+
     def test_shared_anchor_and_large_world_translation(self):
         """Use shared normal anchors and stable endpoint-relative geometry."""
         data, raw, scratch = make_case()

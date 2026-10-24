@@ -7466,6 +7466,10 @@ def gather_dense_warmstart(
         )
 
 
+RIGID_SPEED_ROWS = wp.constant(2)
+"""Speed rows of a limited free rigid body: the first bounds its linear speed, the second its angular speed."""
+
+
 @wp.kernel
 def allocate_rigid_velocity_limit_slots(
     free_rigid_body_indices: wp.array[int],
@@ -7482,33 +7486,29 @@ def allocate_rigid_velocity_limit_slots(
     resolved_worlds: wp.array[int],
     # outputs
     rigid_velocity_limit_slot: wp.array[int],
-    rigid_velocity_limit_sign: wp.array[float],
     mf_slot_counter: wp.array[int],
 ):
-    """Allocate two signed MF velocity-limit rows per limited rigid velocity axis.
+    """Allocate one MF speed row per finitely limited speed of a free rigid body.
 
-    Free-rigid generalized velocity is stored as six root DOFs:
-    ``[lin_x, lin_y, lin_z, ang_x, ang_y, ang_z]``.  Each finite max speed
-    contributes lower/upper unilateral rows with Jacobians ``+e_i`` and
-    ``-e_i`` so the same stateless row projection used by articulated joint
-    velocity limits can clamp the current scalar speed.
+    Free-rigid generalized velocity is stored as six root DOFs, the center of
+    mass velocity and the angular velocity: ``[v, omega]``. PhysX's
+    ``maxLinearVelocity`` and ``maxAngularVelocity`` bound their magnitudes,
+    ``|v| <= limit`` and ``|omega| <= limit``, so each finite limit owns one
+    speed row (:func:`populate_rigid_velocity_limit_rows`) that the sweeps
+    project onto that ball, along the current velocity.
 
-    ``velocity_limit_activation_fraction`` proximity-gates the allocation per
-    axis, mirroring :func:`allocate_joint_velocity_limit_slots`: a positive
-    fraction reserves the lower/upper pair only when the axis speed read from
-    ``joint_qd`` at the free root's DOFs satisfies
-    ``|qd[axis]| >= fraction * limit``. A fraction of ``0.0`` short-circuits
-    the gate (``articulation_root_dof_start`` / ``joint_qd`` are not read) so
-    the default allocation and slot ordering match the historical behavior
-    exactly.
+    ``velocity_limit_activation_fraction`` proximity-gates the allocation,
+    mirroring :func:`allocate_joint_velocity_limit_slots`: a positive fraction
+    reserves a row only when the speed read from ``joint_qd`` at the free
+    root's DOFs satisfies ``|v| >= fraction * limit``. A fraction of ``0.0``
+    reserves every finitely limited speed's row without reading ``joint_qd``.
     """
     candidate = wp.tid()
     body = free_rigid_body_indices[candidate]
-    base = 12 * candidate
+    base = RIGID_SPEED_ROWS * candidate
 
-    for row in range(12):
+    for row in range(RIGID_SPEED_ROWS):
         rigid_velocity_limit_slot[base + row] = -1
-        rigid_velocity_limit_sign[base + row] = 0.0
 
     art = body_to_articulation[body]
     if art < 0:
@@ -7524,37 +7524,24 @@ def allocate_rigid_velocity_limit_slots(
     if world < resolved_worlds.shape[0] and resolved_worlds[world] != 0:
         return
 
-    lin_limit = rigid_body_max_linear_velocity[body]
-    ang_limit = rigid_body_max_angular_velocity[body]
-
-    for axis in range(6):
-        limit = lin_limit
-        if axis >= 3:
-            limit = ang_limit
+    for speed_row in range(RIGID_SPEED_ROWS):
+        limit = rigid_body_max_linear_velocity[body]
+        if speed_row == 1:
+            limit = rigid_body_max_angular_velocity[body]
         if limit <= 0.0 or not wp.isfinite(limit):
             continue
 
-        # Proximity gate: only reserve the pair when this axis is within
-        # ``fraction * limit`` of the box edge. The fraction==0 branch
-        # short-circuits before any velocity read so the default path
-        # allocates exactly as before (same slots, same order).
+        # Proximity gate: only reserve the row when the speed is within ``fraction * limit`` of the bound.
+        # The fraction==0 branch short-circuits before any velocity read.
         if velocity_limit_activation_fraction > 0.0:
-            root_dof = articulation_root_dof_start[art] + axis
-            if wp.abs(joint_qd[root_dof]) < velocity_limit_activation_fraction * limit:
+            root_dof = articulation_root_dof_start[art] + 3 * speed_row
+            speed = wp.length(wp.vec3(joint_qd[root_dof], joint_qd[root_dof + 1], joint_qd[root_dof + 2]))
+            if speed < velocity_limit_activation_fraction * limit:
                 continue
 
-        lower_idx = base + 2 * axis
-        upper_idx = lower_idx + 1
-
-        lower_slot = wp.atomic_add(mf_slot_counter, world, 1)
-        if lower_slot < mf_max_constraints:
-            rigid_velocity_limit_slot[lower_idx] = lower_slot
-            rigid_velocity_limit_sign[lower_idx] = 1.0
-
-        upper_slot = wp.atomic_add(mf_slot_counter, world, 1)
-        if upper_slot < mf_max_constraints:
-            rigid_velocity_limit_slot[upper_idx] = upper_slot
-            rigid_velocity_limit_sign[upper_idx] = -1.0
+        slot = wp.atomic_add(mf_slot_counter, world, 1)
+        if slot < mf_max_constraints:
+            rigid_velocity_limit_slot[base + speed_row] = slot
 
 
 @wp.kernel
@@ -7566,7 +7553,6 @@ def populate_rigid_velocity_limit_rows(
     rigid_body_max_linear_velocity: wp.array[float],
     rigid_body_max_angular_velocity: wp.array[float],
     rigid_velocity_limit_slot: wp.array[int],
-    rigid_velocity_limit_sign: wp.array[float],
     # outputs
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -7577,7 +7563,14 @@ def populate_rigid_velocity_limit_rows(
     mf_row_mu: wp.array2d[float],
     mf_phi: wp.array2d[float],
 ):
-    """Populate MF rows for rigid-body linear/angular velocity limits."""
+    """Populate the MF speed rows of free rigid bodies' linear and angular velocity limits.
+
+    A speed row's Jacobian is the unit vector of the first DOF of the
+    velocity it bounds (``e_0`` for the linear velocity, ``e_3`` for the
+    angular one); the sweeps read the row's three DOFs from there, and its
+    effective mass converts the speed correction into the impulse the row
+    stores. ``mf_phi`` holds the limit.
+    """
     candidate = wp.tid()
     body = free_rigid_body_indices[candidate]
     art = body_to_articulation[body]
@@ -7590,35 +7583,74 @@ def populate_rigid_velocity_limit_rows(
     if world < 0:
         return
 
-    lin_limit = rigid_body_max_linear_velocity[body]
-    ang_limit = rigid_body_max_angular_velocity[body]
-    base = 12 * candidate
+    base = RIGID_SPEED_ROWS * candidate
+    for speed_row in range(RIGID_SPEED_ROWS):
+        slot = rigid_velocity_limit_slot[base + speed_row]
+        if slot < 0:
+            continue
+        limit = rigid_body_max_linear_velocity[body]
+        if speed_row == 1:
+            limit = rigid_body_max_angular_velocity[body]
 
-    for axis in range(6):
-        limit = lin_limit
-        if axis >= 3:
-            limit = ang_limit
+        for k in range(6):
+            mf_J_a[world, slot, k] = 0.0
+            mf_J_b[world, slot, k] = 0.0
+        mf_J_a[world, slot, 3 * speed_row] = 1.0
 
-        for side in range(2):
-            row_idx = base + 2 * axis + side
-            slot = rigid_velocity_limit_slot[row_idx]
-            if slot < 0:
-                continue
+        mf_body_a[world, slot] = body
+        mf_body_b[world, slot] = -1
+        mf_row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
+        mf_row_parent[world, slot] = -1
+        mf_row_mu[world, slot] = 0.0
+        # For velocity-limit rows mf_phi stores the speed limit; contact rows
+        # use it as geometric gap. Row type disambiguates the meaning.
+        mf_phi[world, slot] = limit
 
-            sign = rigid_velocity_limit_sign[row_idx]
-            for k in range(6):
-                mf_J_a[world, slot, k] = 0.0
-                mf_J_b[world, slot, k] = 0.0
-            mf_J_a[world, slot, axis] = sign
 
-            mf_body_a[world, slot] = body
-            mf_body_b[world, slot] = -1
-            mf_row_type[world, slot] = PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
-            mf_row_parent[world, slot] = -1
-            mf_row_mu[world, slot] = 0.0
-            # For velocity-limit rows mf_phi stores qdot_max; contact rows
-            # use it as geometric gap. Row type disambiguates the meaning.
-            mf_phi[world, slot] = limit
+@wp.func
+def project_free_body_speed(
+    velocity: wp.array[float],
+    dof: int,
+    speed_limit: float,
+    effective_mass: float,
+    old_impulse: float,
+    accumulated: int,
+) -> wp.vec2:
+    """Project the free-body velocity ``velocity[dof:dof + 3]`` of a speed row onto ``|v| <= speed_limit``.
+
+    The row's residual is ``speed_limit - |v|``. The stateless law (PhysX's
+    clamp) removes the whole overshoot and keeps that correction; the
+    accumulated law keeps a total, ``max(old - residual * effective_mass, 0)``.
+    The correction acts along the current velocity, so a body over its limit
+    keeps its direction and ends on the limit. Returns the row's new impulse
+    and the impulse change applied, both in units of ``effective_mass`` times
+    speed.
+    """
+    v = wp.vec3(velocity[dof], velocity[dof + 1], velocity[dof + 2])
+    speed = wp.length(v)
+    residual = speed_limit - speed
+    new_impulse = float(0.0)
+    delta = float(0.0)
+    if accumulated != 0:
+        new_impulse = wp.max(old_impulse - residual * effective_mass, 0.0)
+        delta = new_impulse - old_impulse
+    elif residual < 0.0:
+        new_impulse = -residual * effective_mass
+        delta = new_impulse
+    if delta != 0.0 and speed > 0.0:
+        change = v * (-(delta / effective_mass) / speed)
+        velocity[dof] = velocity[dof] + change[0]
+        velocity[dof + 1] = velocity[dof + 1] + change[1]
+        velocity[dof + 2] = velocity[dof + 2] + change[2]
+    return wp.vec2(new_impulse, delta)
+
+
+@wp.func
+def free_body_speed_dof(mf_J_a: wp.array3d[float], world: int, row: int) -> int:
+    """Offset of the velocity a free-body speed row bounds: 0 for the linear velocity, 3 for the angular."""
+    if mf_J_a[world, row, 3] != 0.0:
+        return 3
+    return 0
 
 
 @wp.func
@@ -8880,6 +8912,14 @@ def pgs_solve_mf_loop(
             ba = mf_body_a[world, i]
             bb = mf_body_b[world, i]
 
+            if row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+                # A free body's speed row, behind every other row: the stateless clamp of its speed.
+                if ba >= 0:
+                    dof = art_dof_start[body_to_articulation[ba]] + free_body_speed_dof(mf_J_a, world, i)
+                    projected = project_free_body_speed(v_out, dof, mf_rhs[world, i], eff_inv, 0.0, 0)
+                    mf_impulses[world, i] = projected[0]
+                continue
+
             # Compute current J * v
             jv = float(0.0)
             if ba >= 0:
@@ -8906,17 +8946,10 @@ def pgs_solve_mf_loop(
                     w = mf_row_w[world, i]
                 delta = -residual * eff_inv * w - (1.0 - w) * old_impulse
             new_impulse = old_impulse + omega * delta
-            delta_impulse = float(0.0)
 
             # Project
             if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
                 if new_impulse < 0.0:
-                    new_impulse = 0.0
-            elif row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
-                if residual < 0.0:
-                    delta_impulse = delta
-                    new_impulse = delta
-                else:
                     new_impulse = 0.0
             elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
                 if friction_mode == FRICTION_MODE_BISECTION or friction_mode == FRICTION_MODE_BISECTION_DESAXCE:
@@ -8986,8 +9019,7 @@ def pgs_solve_mf_loop(
                         v_out,
                     )
 
-            if row_type != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
-                delta_impulse = new_impulse - old_impulse
+            delta_impulse = new_impulse - old_impulse
             mf_impulses[world, i] = new_impulse
 
             # Apply velocity correction: v += M_inv * J^T * delta_impulse

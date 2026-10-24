@@ -1100,10 +1100,11 @@ def _split_free_body_velocity_limit_law(solver) -> tuple[str | None, str]:
         return None, "No split free-body sweep: matrix-free mode, native sparse split rows or no free rigid bodies."
     if solver._has_free_body_velocity_limit_rows:
         return "stateless", (
-            "A violated free-body velocity-limit row pushes by its whole, unrelaxed correction and keeps that "
-            "correction instead of an accumulated impulse; the rows end every iteration. The CPU loop applies "
-            "this law and CUDA builds the _vlim sweep for it; velocity_limit_law selects the law of the "
-            "matrix-free sweeps and does not apply here."
+            "A free body's speed row bounds the magnitude of its linear or angular velocity: past the limit it "
+            "pushes, along the velocity, by its whole unrelaxed correction and keeps that correction instead of "
+            "an accumulated impulse; the rows end every iteration. The CPU loop applies this law and CUDA builds "
+            "the _vlim sweep for it; velocity_limit_law selects the law of the matrix-free sweeps and does not "
+            "apply here."
         )
     if solver._has_rigid_body_velocity_limits:
         return None, "velocity_limit_activation_fraction=inf reserves no free-body velocity-limit row."
