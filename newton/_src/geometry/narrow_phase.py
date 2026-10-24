@@ -2534,7 +2534,8 @@ class NarrowPhase:
                 Must match the ``contact_pair`` array size passed to :meth:`launch`.
                 Defaults to ``max_candidate_pairs``.  Set this to a larger value when
                 a single candidate pair can emit multiple contacts (e.g. up to 4 for
-                primitive multi-contact paths).
+                primitive multi-contact paths). ``0`` allocates no sort buffer, for
+                callers that only use :meth:`launch_custom_write` and sort themselves.
             verify_buffers: When True (the default), launch a ``dim=[1]``
                 diagnostic kernel (:func:`verify_narrow_phase_buffers`) at the
                 end of :meth:`launch` that compares each public counter on this
@@ -3158,7 +3159,7 @@ class NarrowPhase:
             # Per shape, nonzero for a partner whose heightfield pairs the terrain law writes (empty: none).
             self._terrain_law_partner = wp.zeros(0, dtype=wp.int32, device=device)
             det_capacity = contact_max if contact_max is not None else max_candidate_pairs
-            if deterministic:
+            if deterministic and det_capacity > 0:
                 self._sort_key_array = wp.zeros(det_capacity, dtype=wp.int64, device=device)
                 self._contact_sorter = ContactSorter(det_capacity, device=device)
             else:

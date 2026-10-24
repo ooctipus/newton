@@ -29,6 +29,7 @@ from typing import ClassVar, Literal
 import numpy as np
 import warp as wp
 
+from ...core.contact_pool import ContactField, ContactPool
 from ...core.environment_flags import retired_notice
 from ...core.types import override
 from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
@@ -5834,8 +5835,55 @@ class SolverFeatherPGS(SolverBase):
 
             max_contacts = int(_estimate_rigid_contact_max(model))
         max_contacts = max(max_contacts, 1)
-        self._max_contacts_alloc = max_contacts
+        # Every per-contact buffer holds this pool's ready rows: they start at the pool's
+        # initial rows and grow with the contact stream the solver consumes (see
+        # _follow_contacts), up to the bound. Buffers with gradients stay at the bound.
+        self._contact_pool = ContactPool(
+            max_contacts, device=device, world_count=self.world_count, rows=max_contacts if requires_grad else None
+        )
+        contact_fields = [
+            ContactField(name, wp.int32, requires_grad=requires_grad)
+            for name in (
+                "contact_world",
+                "contact_slot",
+                "contact_slots_needed",
+                "contact_art_a",
+                "contact_art_b",
+                "contact_path",
+            )
+        ]
+        # The masked row builders' per-contact flags; every entry below the live
+        # contact count is written by the prelude before it is read.
+        contact_fields.append(ContactField("_rows_prelude_flags", wp.int32))
         # Row builders always receive a zero phi view when patch friction is off.
+        contact_fields.append(ContactField("_friction_patch_phi", wp.vec2))
+        if self.pgs_warmstart:
+            contact_fields.append(ContactField("_ws_prev_contact_normal", wp.vec3))
+        else:
+            self._ws_prev_contact_normal = None
+        debug_fields = (
+            ("contact_world", wp.int32),
+            ("contact_slot", wp.int32),
+            ("contact_art_a", wp.int32),
+            ("contact_art_b", wp.int32),
+            ("contact_path", wp.int32),
+            ("rigid_contact_shape0", wp.int32),
+            ("rigid_contact_shape1", wp.int32),
+            ("rigid_contact_point0", wp.vec3),
+            ("rigid_contact_point1", wp.vec3),
+            ("rigid_contact_normal", wp.vec3),
+            ("rigid_contact_margin0", wp.float32),
+            ("rigid_contact_margin1", wp.float32),
+        )
+        if self._debug_buffers_enabled:
+            contact_fields += [
+                ContactField(f"_debug_position_{name}", dtype, requires_grad=requires_grad)
+                for name, dtype in debug_fields
+            ]
+        else:
+            for name, _ in debug_fields:
+                setattr(self, f"_debug_position_{name}", None)
+        self._contact_rows = self._contact_pool.rows(contact_fields, on_rows=self._on_contact_rows)
         # Persistent state is owned by the body-pair patch builder, independently
         # of collision matching and the contact warm-start tables.
         frame_reuse, self._patch_frame_reuse_reason = self._patch_frame_reuse()
@@ -5843,22 +5891,13 @@ class SolverFeatherPGS(SolverBase):
             model,
             max_contacts,
             self._friction_anchors_enabled,
-            wp.zeros(max_contacts, dtype=wp.vec2, device=device),
+            self._friction_patch_phi,
             reuse_frames=frame_reuse,
             # Small frames sort their live slots only, so empty ones cost no sort; the
             # opt-out keeps the radix sort of every frame, the previous path.
             small_live_sort=frame_reuse,
+            pool=self._contact_pool,
         )
-        self._ws_prev_contact_normal = (
-            wp.zeros(max_contacts, dtype=wp.vec3, device=device) if self.pgs_warmstart else None
-        )
-        self.contact_world = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
-        self.contact_slot = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
-        self.contact_slots_needed = wp.zeros(
-            (max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad
-        )
-        self.contact_art_a = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
-        self.contact_art_b = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self.slot_counter = wp.zeros((self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self._dense_first_rejected_slot = wp.full(
             (self.world_count,), _ROW_SLOT_UNBOUNDED, dtype=wp.int32, device=device
@@ -5877,69 +5916,8 @@ class SolverFeatherPGS(SolverBase):
         # First MF slot past the contact/friction rows (start of the
         # velocity-limit tail); snapshotted from mf_slot_counter each step.
         self.mf_contact_rows_end = wp.zeros((self.world_count,), dtype=wp.int32, device=device)
-        self.contact_path = wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
         self._debug_position_rigid_contact_count = (
             wp.zeros((1,), dtype=wp.int32, device=device) if self._debug_buffers_enabled else None
-        )
-        self._debug_position_contact_world = (
-            wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
-            if self._debug_buffers_enabled
-            else None
-        )
-        self._debug_position_contact_slot = (
-            wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
-            if self._debug_buffers_enabled
-            else None
-        )
-        self._debug_position_contact_art_a = (
-            wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
-            if self._debug_buffers_enabled
-            else None
-        )
-        self._debug_position_contact_art_b = (
-            wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
-            if self._debug_buffers_enabled
-            else None
-        )
-        self._debug_position_contact_path = (
-            wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
-            if self._debug_buffers_enabled
-            else None
-        )
-        self._debug_position_rigid_contact_shape0 = (
-            wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
-            if self._debug_buffers_enabled
-            else None
-        )
-        self._debug_position_rigid_contact_shape1 = (
-            wp.zeros((max_contacts,), dtype=wp.int32, device=device, requires_grad=requires_grad)
-            if self._debug_buffers_enabled
-            else None
-        )
-        self._debug_position_rigid_contact_point0 = (
-            wp.zeros((max_contacts,), dtype=wp.vec3, device=device, requires_grad=requires_grad)
-            if self._debug_buffers_enabled
-            else None
-        )
-        self._debug_position_rigid_contact_point1 = (
-            wp.zeros((max_contacts,), dtype=wp.vec3, device=device, requires_grad=requires_grad)
-            if self._debug_buffers_enabled
-            else None
-        )
-        self._debug_position_rigid_contact_normal = (
-            wp.zeros((max_contacts,), dtype=wp.vec3, device=device, requires_grad=requires_grad)
-            if self._debug_buffers_enabled
-            else None
-        )
-        self._debug_position_rigid_contact_margin0 = (
-            wp.zeros((max_contacts,), dtype=wp.float32, device=device, requires_grad=requires_grad)
-            if self._debug_buffers_enabled
-            else None
-        )
-        self._debug_position_rigid_contact_margin1 = (
-            wp.zeros((max_contacts,), dtype=wp.float32, device=device, requires_grad=requires_grad)
-            if self._debug_buffers_enabled
-            else None
         )
 
         # Joint velocity-limit buffers (per-DOF tracking). Independent from the
@@ -6068,7 +6046,9 @@ class SolverFeatherPGS(SolverBase):
             self._ws_prev_dense_row_parent = wp.full(
                 (self.world_count, max_constraints), -1, dtype=wp.int32, device=device
             )
-            self._ws_prev_dense_slot_sorted = wp.full((self._max_contacts_alloc,), -1, dtype=wp.int32, device=device)
+            self._ws_prev_dense_slot_rows = self._contact_pool.rows(
+                (ContactField("_ws_prev_dense_slot_sorted", wp.int32, -1),), on_rows=self._publish_contact_rows
+            )
         self._debug_position_impulses = (
             wp.zeros((self.world_count, max_constraints), dtype=wp.float32, device=device, requires_grad=requires_grad)
             if self._debug_buffers_enabled
@@ -6313,9 +6293,13 @@ class SolverFeatherPGS(SolverBase):
             )
             self._ws_prev_mf_row_type = wp.full((worlds, mf_max_c), -1, dtype=wp.int32, device=device)
             self._ws_prev_mf_row_parent = wp.full((worlds, mf_max_c), -1, dtype=wp.int32, device=device)
-            self._ws_prev_slot_sorted = wp.full(
-                (getattr(self, "_max_contacts_alloc", 1),), -1, dtype=wp.int32, device=device
-            )
+            pool = getattr(self, "_contact_pool", None)
+            if pool is None:
+                self._ws_prev_slot_sorted = wp.full((1,), -1, dtype=wp.int32, device=device)
+            else:
+                self._ws_prev_slot_rows = pool.rows(
+                    (ContactField("_ws_prev_slot_sorted", wp.int32, -1),), on_rows=self._publish_contact_rows
+                )
         self._debug_position_mf_impulses = (
             wp.zeros((worlds, mf_max_c), dtype=wp.float32, device=device, requires_grad=requires_grad)
             if self._debug_buffers_enabled
@@ -7969,6 +7953,36 @@ class SolverFeatherPGS(SolverBase):
         wp.copy(self._debug_position_rigid_contact_margin0, contacts.rigid_contact_margin0)
         wp.copy(self._debug_position_rigid_contact_margin1, contacts.rigid_contact_margin1)
 
+    def _on_contact_rows(self, rows) -> None:
+        """Assign the per-contact buffers at the contact pool's ready rows, on creation and after each growth."""
+        rows.publish(self)
+        self._max_contacts_alloc = rows.rows
+        patches = getattr(self, "_friction_patches", None)
+        if patches is not None:
+            patches.view.phi = self._friction_patch_phi
+
+    def _publish_contact_rows(self, rows) -> None:
+        rows.publish(self)
+
+    def _follow_contacts(self, contacts: Contacts) -> None:
+        """Hold at least ``contacts``' rigid rows, and grow with the pool of a pipeline's buffer from now on."""
+        pool = getattr(self, "_contact_pool", None)
+        if pool is None:
+            return
+        try:
+            source = getattr(contacts, "_rigid_contact_pool", None)
+            if source is not None:
+                source.follow(pool)
+            if contacts.rigid_contact_max > pool.ready:
+                pool.grow(contacts.rigid_contact_max)
+        except (ValueError, RuntimeError) as error:
+            raise ValueError(
+                "FeatherPGS contact capacity mismatch: received "
+                f"{contacts.rigid_contact_max} slots, but solver scratch holds {pool.ready} and is bounded by "
+                f"{pool.bound}. Set model.rigid_contact_max before constructing the solver, and grow the "
+                "contact buffers before graph capture (CollisionPipeline.service_capacity)."
+            ) from error
+
     @override
     def step(
         self,
@@ -8000,12 +8014,8 @@ class SolverFeatherPGS(SolverBase):
         if self.contact_compliance:
             # Reject incompatible contact preprocessing before it can mutate the stream.
             _contact_compliance.validate_step(self)
-        if contacts is not None and contacts.rigid_contact_max > self._max_contacts_alloc:
-            raise ValueError(
-                "FeatherPGS contact capacity mismatch: received "
-                f"{contacts.rigid_contact_max} slots, but solver scratch was allocated for "
-                f"{self._max_contacts_alloc}. Set model.rigid_contact_max before constructing the solver."
-            )
+        if contacts is not None:
+            self._follow_contacts(contacts)
         if self.pgs_warmstart:
             # A reduced stream is valid when it carries retained identities.
             # Preserve the reader lease for an unreduced captured stream: a
@@ -11245,10 +11255,7 @@ class SolverFeatherPGS(SolverBase):
                             continue
                         combined_done = True
                         cap = int(contacts.rigid_contact_point0.shape[0])
-                        pre = getattr(self, "_rows_prelude", None)
-                        if pre is None or pre["flags"].shape[0] != cap:
-                            pre = {"flags": wp.empty(cap, dtype=wp.int32, device=model.device)}
-                            self._rows_prelude = pre
+                        pre = {"flags": self._rows_prelude_flags[:cap]}
                         size_a = plan.combined[0]
                         size_b = plan.combined[1] if len(plan.combined) > 1 else -1
                         J_a = self.J_by_size[size_a]
@@ -11382,12 +11389,7 @@ class SolverFeatherPGS(SolverBase):
                         continue
                     if "masked" in (method, plan.check):
                         cap = int(contacts.rigid_contact_point0.shape[0])
-                        pre = getattr(self, "_rows_prelude", None)
-                        if pre is None or pre["flags"].shape[0] != cap:
-                            # wp.empty: no memset node lands in a CUDA graph capture; every entry below the
-                            # active contact count is written by the prelude before it is read.
-                            pre = {"flags": wp.empty(cap, dtype=wp.int32, device=model.device)}
-                            self._rows_prelude = pre
+                        pre = {"flags": self._rows_prelude_flags[:cap]}
                         J_out = self.J_by_size[size]
                         meta_out = [
                             self.row_type,

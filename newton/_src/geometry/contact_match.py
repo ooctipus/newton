@@ -92,9 +92,9 @@ from typing import TYPE_CHECKING
 
 import warp as wp
 
+from ..core.contact_pool import ContactField, ContactPool
 from ..core.reset import reset_world_selected
 from ..core.types import Devicelike
-from .contact_sort import SORT_KEY_SENTINEL
 
 if TYPE_CHECKING:
     from .contact_sort import ContactSorter
@@ -622,7 +622,8 @@ class ContactMatcher:
         :data:`MATCH_NOT_FOUND`.
 
     Args:
-        capacity: Maximum number of contacts (must match :class:`ContactSorter`).
+        capacity: Maximum number of contacts (must match :class:`ContactSorter`);
+            ignored when ``pool`` is given.
         sorter: The :class:`ContactSorter` producing the sorted contact stream.
         shape_world: Per-shape world ids, with ``-1`` for global shapes.
         world_count: Number of local worlds.
@@ -638,6 +639,8 @@ class ContactMatcher:
             The owned previous normal is shared with matching. When ``False``,
             point/offset arrays are ``None`` and replay is skipped.
         device: Device to allocate on.
+        pool: Contact pool whose ready rows the history holds and grows with,
+            keeping its contents; by default a fixed pool of ``capacity`` rows.
     """
 
     def __init__(
@@ -652,9 +655,12 @@ class ContactMatcher:
         contact_report: bool = False,
         sticky: bool = False,
         device: Devicelike = None,
+        pool: ContactPool | None = None,
     ):
         with wp.ScopedDevice(device):
-            self._capacity = capacity
+            if pool is None:
+                pool = ContactPool(capacity, device=wp.get_device(), rows=capacity)
+            self._capacity = pool.ready
             self._pos_threshold_sq = pos_threshold * pos_threshold
             self._normal_dot_threshold = normal_dot_threshold
             self._sorter = sorter
@@ -666,21 +672,22 @@ class ContactMatcher:
             # Init with the sort-key sentinel so a debugger dump of the buffer
             # before the first save_sorted_state does not look like valid keys
             # for shape_a=0, shape_b=0, sub_key=0.
-            self._prev_sorted_keys = wp.full(capacity, SORT_KEY_SENTINEL, dtype=wp.int64)
-            self._prev_count = wp.zeros(1, dtype=wp.int32)
-            self._prev_pos_world = wp.zeros(capacity, dtype=wp.vec3)
-            self._prev_normal = wp.zeros(capacity, dtype=wp.vec3)
-
-            # Per-prev claim word for the atomic_min race that keeps the new→prev
+            # The per-prev claim word serves the atomic_min race that keeps the new→prev
             # mapping injective (see module docstring). The save-state pass resets
-            # each active slot for the next frame; initialize the allocation for
-            # the first frame before any state has been saved.
-            self._prev_claim = wp.full(capacity, _CLAIM_SENTINEL, dtype=wp.int64)
+            # each active slot for the next frame; the fill covers the first frame.
+            # History persists across frames: rows keep it when the pool grows.
+            fields = [
+                ContactField("_prev_sorted_keys", wp.int64, 0x7FFFFFFFFFFFFFFF),
+                ContactField("_prev_pos_world", wp.vec3),
+                ContactField("_prev_normal", wp.vec3),
+                ContactField("_prev_claim", wp.int64, 0x7FFFFFFFFFFFFFFF),
+            ]
+            self._prev_count = wp.zeros(1, dtype=wp.int32)
 
             # Contact report (optional).
             self._has_report = contact_report
             if contact_report:
-                self._prev_was_matched = wp.zeros(capacity, dtype=wp.int32)
+                fields.append(ContactField("_prev_was_matched", wp.int32))
             else:
                 # Dummy single-element array so the Warp struct is always valid.
                 self._prev_was_matched = wp.zeros(1, dtype=wp.int32)
@@ -688,17 +695,24 @@ class ContactMatcher:
             # Sticky replay shares the owned previous normal with matching.
             self._sticky = sticky
             if sticky:
-                self._prev_point0 = wp.zeros(capacity, dtype=wp.vec3)
-                self._prev_point1 = wp.zeros(capacity, dtype=wp.vec3)
-                self._prev_offset0 = wp.zeros(capacity, dtype=wp.vec3)
-                self._prev_offset1 = wp.zeros(capacity, dtype=wp.vec3)
-                self._prev_normal_sticky = self._prev_normal
+                fields += [
+                    ContactField(name, wp.vec3)
+                    for name in ("_prev_point0", "_prev_point1", "_prev_offset0", "_prev_offset1")
+                ]
             else:
                 self._prev_point0 = None
                 self._prev_point1 = None
                 self._prev_offset0 = None
                 self._prev_offset1 = None
                 self._prev_normal_sticky = None
+            self._rows = pool.rows(fields, on_rows=self._on_rows)
+
+    def _on_rows(self, rows) -> None:
+        """Assign the history at the pool's ready rows, on creation and after each growth."""
+        rows.publish(self)
+        self._capacity = rows.rows
+        if self._sticky:
+            self._prev_normal_sticky = self._prev_normal
 
     # ------------------------------------------------------------------
     # Properties

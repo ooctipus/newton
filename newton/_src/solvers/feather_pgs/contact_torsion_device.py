@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
+from ...core.contact_pool import ContactField, ContactPool
 from .contact_torsion import _NORMAL_COSINE, _SUPPORTED_TYPES, _TOUCH_TOLERANCE
 from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
 
@@ -440,40 +441,45 @@ class DeviceTorsionPreparation:
     def __init__(self, solver, *, deferred_errors=False):
         self.solver = solver
         self.deferred_errors = bool(deferred_errors)
-        self.capacity = solver._max_contacts_alloc
         device = solver.model.device
         self.work = _Workspace()
         w = self.work
-        w.keys = wp.empty(2 * self.capacity, dtype=wp.int64, device=device)
-        w.indices = wp.empty(2 * self.capacity, dtype=int, device=device)
-        for name in (
-            "world",
-            "slot",
-            "shape_a",
-            "shape_b",
-            "body_a",
-            "body_b",
-            "owner",
-            "eligible",
-            "anchor",
-            "group",
-            "next_member",
-            "tail",
-            "first_pair",
-            "lead",
-            "spin_row",
-        ):
-            setattr(w, name, wp.empty(self.capacity, dtype=int, device=device))
-        for name in ("gap", "coefficient"):
-            setattr(w, name, wp.empty(self.capacity, dtype=float, device=device))
-        for name in ("normal", "point"):
-            setattr(w, name, wp.empty(self.capacity, dtype=wp.vec3, device=device))
+        # Per-contact work holds the solver's contact rows and grows with them.
+        pool = getattr(solver, "_contact_pool", None)
+        if pool is None:
+            pool = ContactPool(solver._max_contacts_alloc, device=device, rows=solver._max_contacts_alloc)
+        fields = [
+            ContactField("keys", wp.int64, per_contact=2),
+            ContactField("indices", wp.int32, per_contact=2),
+            ContactField("spin_row", wp.int32, -1),
+        ]
+        fields += [
+            ContactField(name, wp.int32)
+            for name in (
+                "world",
+                "slot",
+                "shape_a",
+                "shape_b",
+                "body_a",
+                "body_b",
+                "owner",
+                "eligible",
+                "anchor",
+                "group",
+                "next_member",
+                "tail",
+                "first_pair",
+                "lead",
+            )
+        ]
+        fields += [ContactField(name, wp.float32) for name in ("gap", "coefficient")]
+        fields += [ContactField(name, wp.vec3) for name in ("normal", "point")]
+        self._rows = pool.rows(fields, on_rows=self._on_rows)
         shape = (solver.world_count, solver.dense_max_constraints)
         w.row_contact = wp.full(shape, -1, dtype=int, device=device)
         w.spin_source = wp.full(shape, -1, dtype=int, device=device)
         w.planned_count = wp.zeros(solver.world_count, dtype=int, device=device)
         w.status = wp.zeros(1, dtype=int, device=device)
-        w.spin_row.fill_(-1)
         selected = solver._contact_torsion_shape_set
         self.selected = wp.array(
             np.array([selected is None or i in selected for i in range(solver.model.shape_count)], dtype=np.int32),
@@ -487,6 +493,10 @@ class DeviceTorsionPreparation:
         self._dummy_owner = wp.full(1, -1, dtype=int, device=device)
         self._dummy_mf_count = wp.zeros(solver.world_count, dtype=int, device=device)
         self._saved_state = None
+
+    def _on_rows(self, rows):
+        rows.publish(self.work)
+        self.capacity = rows.rows
 
     def begin_step(self, state_in, state_out):
         """Snapshot dynamic state on-device for fail-stop deferred validation."""

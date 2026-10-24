@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import warp as wp
 
+from ..core.contact_pool import ContactField, ContactPool
 from ..core.types import Devicelike
 
 # Sentinel key for unused contact slots.  ``radix_sort_pairs`` treats
@@ -198,49 +199,73 @@ class ContactSorter:
     time so that the per-frame :meth:`sort_simple` / :meth:`sort_full` calls
     are allocation-free and fully CUDA-graph-capturable (no host synchronization).
 
-    The radix sort always runs over the full *capacity* buffer.  Slots beyond
-    the active ``contact_count`` are filled with a sentinel key
-    (``0x7FFFFFFFFFFFFFFF``) so they sort to the end and the gather kernels
-    skip them via the ``contact_count`` guard.
+    The radix sort always runs over the full *capacity* buffer: the ready rows
+    of the contact pool the buffers grow with.  Slots beyond the active
+    ``contact_count`` are filled with a sentinel key (``0x7FFFFFFFFFFFFFFF``)
+    so they sort to the end and the gather kernels skip them via the
+    ``contact_count`` guard.
     """
 
-    def __init__(self, capacity: int, *, per_contact_shape_properties: bool = False, device: Devicelike = None):
+    def __init__(
+        self,
+        capacity: int,
+        *,
+        per_contact_shape_properties: bool = False,
+        device: Devicelike = None,
+        pool: ContactPool | None = None,
+    ):
+        """
+        Args:
+            capacity: Contact slots to sort; ignored when ``pool`` is given.
+            per_contact_shape_properties: Provision scratch for per-contact stiffness, damping and friction.
+            device: Device to allocate on.
+            pool: Contact pool whose ready rows the buffers hold and grow with; by default a fixed
+                pool of ``capacity`` rows.
+        """
         with wp.ScopedDevice(device):
-            self._capacity = capacity
-            # radix_sort_pairs uses the second half as scratch, so allocate 2x.
-            self._sort_indices = wp.zeros(2 * capacity, dtype=wp.int32)
-            self._sort_keys_copy = wp.zeros(2 * capacity, dtype=wp.int64)
-
             self._has_shape_props = per_contact_shape_properties
-
-            # Scratch buffers for the simple gather (NarrowPhase.launch path).
-            self._simple_pair_buf = wp.zeros(capacity, dtype=wp.vec2i)
-            self._simple_position_buf = wp.zeros(capacity, dtype=wp.vec3)
-            self._simple_normal_buf = wp.zeros(capacity, dtype=wp.vec3)
-            self._simple_penetration_buf = wp.zeros(capacity, dtype=float)
-            self._simple_tangent_buf = wp.zeros(capacity, dtype=wp.vec3)
-            self._simple_match_index_buf = wp.zeros(1, dtype=wp.int32)
-
-            # Scratch buffers for the full gather (CollisionPipeline.collide path).
-            self._full_shape0_buf = wp.zeros(capacity, dtype=wp.int32)
-            self._full_shape1_buf = wp.zeros(capacity, dtype=wp.int32)
-            self._full_point0_buf = wp.zeros(capacity, dtype=wp.vec3)
-            self._full_point1_buf = wp.zeros(capacity, dtype=wp.vec3)
-            self._full_offset0_buf = wp.zeros(capacity, dtype=wp.vec3)
-            self._full_offset1_buf = wp.zeros(capacity, dtype=wp.vec3)
-            self._full_normal_buf = wp.zeros(capacity, dtype=wp.vec3)
-            self._full_margin0_buf = wp.zeros(capacity, dtype=float)
-            self._full_margin1_buf = wp.zeros(capacity, dtype=float)
-            self._full_tids_buf = wp.zeros(capacity, dtype=wp.int32)
+            if pool is None:
+                pool = ContactPool(capacity, device=wp.get_device(), rows=capacity)
+            fields = [
+                # radix_sort_pairs uses the second half as scratch, so hold 2 rows per contact.
+                ContactField("_sort_indices", wp.int32, per_contact=2),
+                ContactField("_sort_keys_copy", wp.int64, per_contact=2),
+                # Scratch buffers for the simple gather (NarrowPhase.launch path).
+                ContactField("_simple_pair_buf", wp.vec2i),
+                ContactField("_simple_position_buf", wp.vec3),
+                ContactField("_simple_normal_buf", wp.vec3),
+                ContactField("_simple_penetration_buf", wp.float32),
+                ContactField("_simple_tangent_buf", wp.vec3),
+                # Scratch buffers for the full gather (CollisionPipeline.collide path).
+                ContactField("_full_shape0_buf", wp.int32),
+                ContactField("_full_shape1_buf", wp.int32),
+                ContactField("_full_point0_buf", wp.vec3),
+                ContactField("_full_point1_buf", wp.vec3),
+                ContactField("_full_offset0_buf", wp.vec3),
+                ContactField("_full_offset1_buf", wp.vec3),
+                ContactField("_full_normal_buf", wp.vec3),
+                ContactField("_full_margin0_buf", wp.float32),
+                ContactField("_full_margin1_buf", wp.float32),
+                ContactField("_full_tids_buf", wp.int32),
+                ContactField("_full_match_index_buf", wp.int32),
+            ]
             if per_contact_shape_properties:
-                self._full_stiffness_buf = wp.zeros(capacity, dtype=float)
-                self._full_damping_buf = wp.zeros(capacity, dtype=float)
-                self._full_friction_buf = wp.zeros(capacity, dtype=float)
+                fields += [
+                    ContactField(name, wp.float32)
+                    for name in ("_full_stiffness_buf", "_full_damping_buf", "_full_friction_buf")
+                ]
             else:
                 self._full_stiffness_buf = wp.zeros(0, dtype=float)
                 self._full_damping_buf = wp.zeros(0, dtype=float)
                 self._full_friction_buf = wp.zeros(0, dtype=float)
-            self._full_match_index_buf = wp.zeros(capacity, dtype=wp.int32)
+            self._simple_match_index_buf = wp.zeros(1, dtype=wp.int32)
+            self._capacity = pool.ready
+            self._rows = pool.rows(fields, on_rows=self._on_rows)
+
+    def _on_rows(self, rows) -> None:
+        """Assign the buffers at the pool's ready rows, on creation and after each growth."""
+        rows.publish(self)
+        self._capacity = rows.rows
 
     # ------------------------------------------------------------------
     # Public API

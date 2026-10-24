@@ -147,6 +147,7 @@ import math
 import numpy as np
 import warp as wp
 
+from ..core.contact_pool import ContactField, ContactPool
 from ..sim.contacts import contact_surface_separation
 from .contact_reduction import float_flip
 from .hashtable import (
@@ -1741,6 +1742,23 @@ def _scatter_reduced_sort_keys(
         destination[i] = source[i]
 
 
+# Gather scratch for the compaction, by contact field; borrowed from the
+# deterministic sorter when it provides them.
+_GATHER_SCRATCH = {
+    "shape0": wp.int32,
+    "shape1": wp.int32,
+    "point0": wp.vec3,
+    "point1": wp.vec3,
+    "offset0": wp.vec3,
+    "offset1": wp.vec3,
+    "normal": wp.vec3,
+    "margin0": wp.float32,
+    "margin1": wp.float32,
+    "tids": wp.int32,
+}
+_MATERIAL_SCRATCH = ("stiffness", "damping", "friction")
+
+
 class BodyPairContactReducer:
     """Owns the buffers and launch sequence for body-pair contact reduction.
 
@@ -1749,7 +1767,8 @@ class BodyPairContactReducer:
     the public API.
 
     Args:
-        rigid_contact_max: Capacity of the ``Contacts`` buffer being reduced.
+        rigid_contact_max: Capacity of the ``Contacts`` buffer being reduced;
+            ignored when ``pool`` is given.
         cell_size: Spatial cell edge [m] on the normal bin's face plane. Each
             (body pair, bin, cell) keeps its own deepest + extremes, so
             same-normal patches farther apart than a cell never compete.
@@ -1767,6 +1786,11 @@ class BodyPairContactReducer:
             deepest, and a spatial slot may hold a contact within ``hysteresis``
             of the true extreme.  ``0`` disables the mechanism entirely and
             restores the exact, memoryless behavior.
+        borrowed_scratch: Full-layout gather scratch to reuse, or a callable
+            returning it (``ContactSorter.borrow_full_scratch``) so growth
+            borrows the current arrays.
+        pool: Contact pool whose ready rows the per-contact buffers hold and
+            grow with; by default a fixed pool of ``rigid_contact_max`` rows.
     """
 
     def __init__(
@@ -1784,8 +1808,12 @@ class BodyPairContactReducer:
         hysteresis: float = 0.001,
         shape_world=None,
         world_count: int = 1,
+        pool: ContactPool | None = None,
     ):
-        self.rigid_contact_max = rigid_contact_max
+        if pool is None:
+            pool = ContactPool(rigid_contact_max, device=device, rows=rigid_contact_max)
+        self._pool = pool
+        self.rigid_contact_max = pool.ready
         # Validate at KERNEL precision: the kernels receive float32, so a
         # host-side double like 1e-50 would pass a double check and reach the
         # cell division as zero, and a large finite double becomes inf.
@@ -1812,9 +1840,8 @@ class BodyPairContactReducer:
         # aligned through the sort. Without borrowed material arrays, this
         # reducer allocates its own lazily on first rich-buffer use. In either
         # case the exact buffer must see a warm-up collide before capture.
-        self._borrowed_scratch = borrowed_scratch
-        self._sort_key_scratch = (
-            wp.zeros(rigid_contact_max, dtype=wp.int64, device=device) if preserve_sort_keys else None
+        self._borrow = (
+            borrowed_scratch if callable(borrowed_scratch) else (lambda scratch=borrowed_scratch or {}: scratch)
         )
         self.verify = bool(verify)
         # Telemetry storage: int32 watermarks/per-frame atomic scratch plus
@@ -1851,15 +1878,11 @@ class BodyPairContactReducer:
         else:
             # No precomputed pair list to derive from; fall back to the old
             # contact-anchored heuristic rather than guessing.
-            capacity_request = int(rigid_contact_max * 0.25 * hashtable_headroom)
-        self.hashtable_capacity_request = max(1024, min(capacity_request, rigid_contact_max))
+            capacity_request = int(pool.bound * 0.25 * hashtable_headroom)
+        self.hashtable_capacity_request = max(1024, min(capacity_request, pool.bound))
         self.group_pair_bound = int(group_pair_bound) if group_pair_bound is not None else -1
         self.hashtable = HashTable(self.hashtable_capacity_request, device=device)
         self.ht_values = wp.zeros(BODY_PAIR_REDUCTION_SLOTS * self.hashtable.capacity, dtype=wp.uint64, device=device)
-        # Fixed launch width for every pass; the kernels grid-stride over the
-        # live count, so this only has to fill the device. See
-        # REDUCTION_MAX_THREADS.
-        self.stride_threads = min(rigid_contact_max, REDUCTION_MAX_THREADS)
         # The kernels that walk the ACTIVE entry list (clearing, snapshotting)
         # touch only as many entries as the scene has groups -- thousands, not
         # millions -- so their launch is sized an order of magnitude narrower
@@ -1867,13 +1890,18 @@ class BodyPairContactReducer:
         # snapshot kernel measured 1.9 ms to copy ~2.6k entries, all of it
         # idle-thread overhead.
         self.entry_stride_threads = min(self.hashtable.capacity, 32768)
-        self.keep_flags = wp.zeros(rigid_contact_max, dtype=wp.int32, device=device)
-        self.keep_scan = wp.zeros(rigid_contact_max, dtype=wp.int32, device=device)
-        # pass-1 cache read by the selection pass: hashtable entry, canonical
-        # gap, face-plane position
-        self.contact_entry = wp.zeros(rigid_contact_max, dtype=wp.int32, device=device)
-        self.contact_gap = wp.zeros(rigid_contact_max, dtype=wp.float32, device=device)
-        self.contact_pos2d = wp.zeros(rigid_contact_max, dtype=wp.vec2, device=device)
+        # Per-contact buffers, at the pool's ready rows: keep flags and their
+        # scan, the pass-1 cache read by the selection pass (hashtable entry,
+        # canonical gap, face-plane position) and the gather scratch the sorter
+        # does not lend.
+        contact_fields = [
+            ContactField("keep_flags", wp.int32),
+            ContactField("keep_scan", wp.int32),
+            ContactField("contact_entry", wp.int32),
+            ContactField("contact_gap", wp.float32),
+            ContactField("contact_pos2d", wp.vec2),
+            ContactField("_scratch_point_id", wp.int32),
+        ]
         # Previous-step winner snapshot for temporal hysteresis: group keys,
         # per-slot winner position identities, and the active list needed to
         # erase the snapshot next step. Rebuilt by copy each reduce (never
@@ -1887,7 +1915,7 @@ class BodyPairContactReducer:
             self.prev_keys = wp.full(cap, _HASHTABLE_EMPTY_KEY_VALUE, dtype=wp.uint64, device=device)
             self.prev_winner_pos = wp.zeros(BODY_PAIR_REDUCTION_SLOTS * cap, dtype=wp.uint32, device=device)
             self.prev_active_slots = wp.zeros(cap + 1, dtype=wp.int32, device=device)
-            self.contact_incumbent = wp.zeros(rigid_contact_max, dtype=wp.int32, device=device)
+            contact_fields.append(ContactField("contact_incumbent", wp.int32))
             # Per-world history generations: a snapshot entry only grants
             # incumbency while its stamped generation matches its world's
             # current one, so bumping a world's generation severs history for
@@ -1908,7 +1936,21 @@ class BodyPairContactReducer:
             self.prev_generation = wp.zeros(0, dtype=wp.int32, device=device)
             self.entry_generation = wp.zeros(0, dtype=wp.int32, device=device)
             self.shape_world = wp.zeros(len(shape_group), dtype=wp.int32, device=device)
+        if preserve_sort_keys:
+            contact_fields.append(ContactField("_sort_key_scratch", wp.int64))
+        else:
+            self._sort_key_scratch = None
+        borrowed = self._borrow()
+        self._owned_scratch = tuple(
+            name for name in _GATHER_SCRATCH if name not in borrowed or borrowed[name].shape[0] < pool.ready
+        )
+        contact_fields += [ContactField(f"_scratch_{name}", _GATHER_SCRATCH[name]) for name in self._owned_scratch]
+        # Placeholders so kernels always receive valid (possibly unused)
+        # arguments when the buffer carries no per-contact materials.
+        self._zero_material = wp.zeros(0, dtype=wp.float32, device=device)
+        self._material_rows = None
         self._scratch = None
+        self._rows = pool.rows(contact_fields, on_rows=self._on_rows)
         # Preallocate the non-material scratch now: the pass promises CUDA
         # graph-capture compatibility, and a first-use allocation inside the
         # first captured reduce() would break that promise (and make
@@ -1916,50 +1958,54 @@ class BodyPairContactReducer:
         # material scratch stays lazy but size-checked in _ensure_scratch.
         self._ensure_scratch(False)
 
+    def _on_rows(self, rows) -> None:
+        """Assign the per-contact buffers at the pool's ready rows, on creation and after each growth."""
+        rows.publish(self)
+        self.rigid_contact_max = rows.rows
+        # Fixed launch width for every pass; the kernels grid-stride over the
+        # live count, so this only has to fill the device. See
+        # REDUCTION_MAX_THREADS.
+        self.stride_threads = min(rows.rows, REDUCTION_MAX_THREADS)
+        # The gather scratch is assembled again from the current arrays.
+        self._scratch = None
+
     def _ensure_scratch(self, need_material: bool):
         if self._scratch is None:
-            n = self.rigid_contact_max
-            dev = self.device
-            dtypes = {
-                "shape0": wp.int32,
-                "shape1": wp.int32,
-                "point0": wp.vec3,
-                "point1": wp.vec3,
-                "offset0": wp.vec3,
-                "offset1": wp.vec3,
-                "normal": wp.vec3,
-                "margin0": wp.float32,
-                "margin1": wp.float32,
-                "tids": wp.int32,
-            }
-            borrowed = self._borrowed_scratch or {}
+            borrowed = self._borrow()
             self._scratch = {
-                name: (
-                    borrowed[name]
-                    if name in borrowed and borrowed[name].shape[0] >= n
-                    else wp.zeros(n, dtype=dtype, device=dev)
-                )
-                for name, dtype in dtypes.items()
+                name: getattr(self, f"_scratch_{name}") if name in self._owned_scratch else borrowed[name]
+                for name in _GATHER_SCRATCH
             }
-            self._scratch["point_id"] = wp.zeros(n, dtype=wp.int32, device=dev)
-            # Placeholders so kernels always receive valid (possibly unused)
-            # arguments when the buffer carries no per-contact materials.
-            zero = wp.zeros(0, dtype=wp.float32, device=dev)
-            for name in ("stiffness", "damping", "friction"):
-                self._scratch[name] = zero
+            self._scratch["point_id"] = self._scratch_point_id
+            for name in _MATERIAL_SCRATCH:
+                self._scratch[name] = (
+                    self._zero_material if self._material_rows is None else getattr(self, f"_material_{name}")
+                )
         if need_material and self._scratch["stiffness"].shape[0] < self.rigid_contact_max:
             # The material scratch must be SIZE-checked, not key-checked: a
             # property-less first buffer installs the zero-length placeholders
             # above, and a later property-enabled buffer of the same capacity
             # would otherwise make the gather write into zero-length arrays --
             # an out-of-bounds device write, not a graceful failure.
-            n = self.rigid_contact_max
-            borrowed = self._borrowed_scratch or {}
-            for name in ("stiffness", "damping", "friction"):
-                arr = borrowed.get(name)
-                self._scratch[name] = (
-                    arr if arr is not None and arr.shape[0] >= n else wp.zeros(n, dtype=wp.float32, device=self.device)
-                )
+            borrowed = self._borrow()
+            if all(
+                borrowed.get(name) is not None and borrowed[name].shape[0] >= self.rigid_contact_max
+                for name in _MATERIAL_SCRATCH
+            ):
+                for name in _MATERIAL_SCRATCH:
+                    self._scratch[name] = borrowed[name]
+            else:
+                if self._material_rows is None:
+                    self._material_rows = self._pool.rows(
+                        [ContactField(f"_material_{name}", wp.float32) for name in _MATERIAL_SCRATCH],
+                        on_rows=self._on_rows_material,
+                    )
+                for name in _MATERIAL_SCRATCH:
+                    self._scratch[name] = getattr(self, f"_material_{name}")
+
+    def _on_rows_material(self, rows) -> None:
+        rows.publish(self)
+        self._scratch = None
 
     def reduce(self, model, state, contacts, *, sort_keys=None):
         """Compact ``contacts`` in place, dropping patch-redundant candidates.
@@ -2482,14 +2528,13 @@ class BodyPairContactReducer:
         """
         n = self.rigid_contact_max
         owned = 0
-        borrowed_ids = {id(a) for a in (self._borrowed_scratch or {}).values()}
+        borrowed_scratch = self._borrow()
+        borrowed_ids = {id(a) for a in borrowed_scratch.values()}
         for arr in (self._scratch or {}).values():
             if id(arr) not in borrowed_ids:
                 owned += arr.size * wp.types.type_size_in_bytes(arr.dtype)
         borrowed = sum(
-            arr.size * wp.types.type_size_in_bytes(arr.dtype)
-            for arr in (self._borrowed_scratch or {}).values()
-            if arr.size > 0
+            arr.size * wp.types.type_size_in_bytes(arr.dtype) for arr in borrowed_scratch.values() if arr.size > 0
         )
         return {
             "rigid_contact_max": n,

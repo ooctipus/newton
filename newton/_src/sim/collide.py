@@ -15,6 +15,7 @@ from typing import Literal
 import numpy as np
 import warp as wp
 
+from ..core.contact_pool import ContactField, ContactPool
 from ..core.environment_flags import record_newton_environment, retired_notice
 from ..core.reset import normalize_reset_world_mask
 from ..geometry.broad_phase_nxn import BroadPhaseAllPairs, BroadPhaseExplicit, BroadPhaseExplicitTemplates
@@ -2071,6 +2072,15 @@ class CollisionPipeline:
         model.rigid_contact_max = rigid_contact_max
         if requires_grad is None:
             requires_grad = model.requires_grad
+        # Every per-contact buffer of this pipeline, its Contacts and the solvers that follow them
+        # holds the pool's ready rows, which start small and grow from measured demand toward
+        # rigid_contact_max (service_capacity). Arrays with gradients stay at the bound.
+        self._contact_pool = ContactPool(
+            rigid_contact_max,
+            device=device,
+            world_count=int(getattr(model, "world_count", 1) or 1),
+            rows=rigid_contact_max if requires_grad else None,
+        )
 
         shape_world = getattr(model, "shape_world", None)
         shape_flags = getattr(model, "shape_flags", None)
@@ -2416,7 +2426,8 @@ class CollisionPipeline:
                 mesh_sdf_texture_only=mesh_sdf_texture_only,
                 sdf_texture_paired_samples=model._sdf_texture_paired_samples,
                 deterministic=deterministic,
-                contact_max=rigid_contact_max,
+                # The pipeline sorts with its own sorter; the narrow phase's standalone sort buffers stay empty.
+                contact_max=0,
                 verify_buffers=verify_buffers,
                 contact_reduction_hashtable_size_factor=contact_reduction_hashtable_size_factor,
                 speculative=self._speculative_enabled,
@@ -2781,13 +2792,17 @@ class CollisionPipeline:
         # rows. The extra scratch remains opt-in with the reducer.
         per_contact_props = self.narrow_phase.hydroelastic_sdf is not None or self.contact_reduction_config.body_pairs
         if deterministic:
-            with wp.ScopedDevice(device):
-                self._sort_key_array = wp.zeros(rigid_contact_max, dtype=wp.int64, device=device)
+            self._sort_key_rows = self._contact_pool.rows(
+                (ContactField("_sort_key_array", wp.int64),), on_rows=self._on_sort_key_rows
+            )
         else:
             self._sort_key_array = wp.zeros(0, dtype=wp.int64, device=device)
         if deterministic:
             self._contact_sorter = ContactSorter(
-                rigid_contact_max, per_contact_shape_properties=per_contact_props, device=device
+                rigid_contact_max,
+                per_contact_shape_properties=per_contact_props,
+                device=device,
+                pool=self._contact_pool,
             )
         else:
             self._contact_sorter = None
@@ -2799,6 +2814,7 @@ class CollisionPipeline:
         if matching_enabled:
             self._contact_matcher = ContactMatcher(
                 rigid_contact_max,
+                pool=self._contact_pool,
                 sorter=self._contact_sorter,
                 shape_world=model.shape_world,
                 world_count=model.world_count,
@@ -2836,7 +2852,8 @@ class CollisionPipeline:
                 up_axis=int(getattr(model, "up_axis", 2)),
                 shape_world=(model.shape_world.numpy() if getattr(model, "shape_world", None) is not None else None),
                 world_count=max(int(getattr(model, "world_count", 1)), 1),
-                borrowed_scratch=(self._contact_sorter.borrow_full_scratch() if self._contact_sorter else None),
+                borrowed_scratch=(self._contact_sorter.borrow_full_scratch if self._contact_sorter else None),
+                pool=self._contact_pool,
                 preserve_sort_keys=deterministic and matching_enabled,
                 verify=self.contact_reduction_config.body_pair_verify,
                 hysteresis=self.contact_reduction_config.body_pair_hysteresis,
@@ -3610,10 +3627,50 @@ class CollisionPipeline:
             raise RuntimeError("body-pair contact reduction is not enabled on this pipeline")
         return self._body_pair_reducer.describe()
 
+    def _on_sort_key_rows(self, rows):
+        rows.publish(self)
+
     @property
     def rigid_contact_max(self) -> int:
-        """Maximum rigid contact buffer capacity used by this pipeline."""
+        """Most rigid contacts this pipeline's buffers can grow to hold.
+
+        The bound resolved at construction (explicit, ``model.rigid_contact_max`` or
+        estimated). Large scenes start their buffers below it, at
+        :attr:`rigid_contact_ready` rows, and grow toward it from measured demand; see
+        :meth:`service_capacity`.
+        """
         return self._rigid_contact_max
+
+    @property
+    def rigid_contact_ready(self) -> int:
+        """Rigid contacts this pipeline's buffers hold now (``Contacts.rigid_contact_max`` of :meth:`contacts`)."""
+        return self._contact_pool.ready
+
+    def service_capacity(self) -> bool:
+        """Grow the rigid contact buffers from measured demand; return whether CUDA graphs must be recaptured.
+
+        Call once per step outside graph capture, e.g. right after launching the
+        step's graph. Every :meth:`collide` records the contact count in a sticky
+        high-water mark and copies it to pinned host memory, also when replayed
+        from a graph; this reads that copy without synchronizing, so it lags the
+        device by the steps still in flight. When the high-water mark passes half
+        the ready rows, the buffers of this pipeline, of its :meth:`contacts` and of
+        the solvers that consume them (e.g. :class:`~newton.solvers.SolverFeatherPGS`)
+        grow to twice the high-water mark, rounded up, at most
+        :attr:`rigid_contact_max`. Their contents and addresses are kept; recapture
+        graphs that use them before their next replay (a stale replay stays within
+        mapped memory but runs at the old extents). Growth synchronizes the device
+        and logs the new rows and bytes. A high-water mark at the ready rows means
+        a collision pass may have dropped contacts: its capacity status stays
+        flagged (:meth:`~newton.geometry.NarrowPhase.check_buffer_capacity`) and
+        this warns.
+
+        Returns:
+            True when the buffers grew and graphs that use them must be recaptured.
+
+        .. experimental::
+        """
+        return self._contact_pool.service()
 
     @property
     def soft_contact_max(self) -> int:
@@ -3647,7 +3704,7 @@ class CollisionPipeline:
             :func:`newton.eval_rigid_contact_kinematics`.
         """
         contacts = Contacts(
-            self.rigid_contact_max,
+            self._contact_pool.ready,
             self.soft_contact_max,
             # The per-thread replay array must span every soft candidate-pair thread (particle + edge +
             # face), independent of soft_contact_max (which the caller may set smaller). See E2 fix.
@@ -3660,6 +3717,7 @@ class CollisionPipeline:
             requested_attributes=self.model.get_requested_contact_attributes(),
             contact_matching=self._matching_enabled,
             contact_report=self.contact_report,
+            rigid_contact_pool=self._contact_pool,
         )
         contacts._contact_matching_mode = self.contact_matching
         # Flag the buffer so solvers that only consume particle contacts can refuse it (see
@@ -3973,15 +4031,15 @@ class CollisionPipeline:
         # a rejected buffer must come back untouched, and a wrong-device buffer
         # must produce this ValueError rather than a cross-device Warp launch.
         if self._body_pair_reducer is not None:
-            # The reducer's caches, scratch, and launch bounds are sized to the
-            # pipeline's capacity at construction; an external buffer with any
-            # other capacity would let the narrow phase write more contacts
-            # than the reducer's arrays can hold.
-            if contacts.rigid_contact_max != self._rigid_contact_max:
+            # The reducer's caches, scratch, and launch bounds hold the
+            # pipeline's ready rows; an external buffer with any other capacity
+            # would let the narrow phase write more contacts than the reducer's
+            # arrays can hold.
+            if contacts.rigid_contact_max != self._contact_pool.ready:
                 raise ValueError(
                     f"body-pair contact reduction requires the Contacts buffer capacity "
-                    f"({contacts.rigid_contact_max}) to exactly match the pipeline's "
-                    f"rigid_contact_max ({self._rigid_contact_max}). Use CollisionPipeline.contacts() "
+                    f"({contacts.rigid_contact_max}) to exactly match the pipeline's ready "
+                    f"rigid contact rows ({self._contact_pool.ready}). Use CollisionPipeline.contacts() "
                     f"or construct the pipeline with a matching rigid_contact_max."
                 )
             if str(contacts.device) != str(self._body_pair_reducer._stats.device):
@@ -4300,6 +4358,9 @@ class CollisionPipeline:
                 self._terrain_law_shadow.write_contacts(
                     self._terrain_law_listed, model.shape_type, self.geom_data, write_contact, writer_data
                 )
+
+        # Every rigid writer has counted its contacts: record the demand that grows the pool.
+        self._contact_pool.record_demand(contacts.rigid_contact_count)
 
         reducer = self.narrow_phase.global_contact_reducer
         if reducer is not None:

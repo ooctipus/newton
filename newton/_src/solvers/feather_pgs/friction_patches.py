@@ -31,7 +31,10 @@ saturation alone does not. All matching tolerances are internal so correction
 strength is the only new user control.
 
 Sorting body pairs makes construction local to a pair and preserves CUDA graph
-capture: all buffers and the radix-sort workspace have fixed capacity. Launches
+capture: all buffers and the radix-sort workspace have a fixed capacity, the
+ready rows of the solver's contact pool, which only change between captures.
+Growth keeps the frames' contents and gives the new slots the empty record.
+Launches
 stride over the live contacts and the slots earlier frames used, so their work
 follows the live contact count rather than the capacity. With frame reuse, the
 solver's default, a captured build skips the pair sort when the previous build
@@ -47,6 +50,7 @@ import weakref
 import numpy as np
 import warp as wp
 
+from ...core.contact_pool import ContactField, ContactPool
 from ...math.spatial import velocity_at_point
 from ...sim.contacts import GENERATION_SENTINEL, capture_scope, contact_frame_write
 from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
@@ -1415,23 +1419,24 @@ class _FrictionPatchState:
     sort.
     """
 
-    def __init__(self, model, capacity, enabled, phi, *, reuse_frames=False, small_live_sort=True):
+    def __init__(self, model, capacity, enabled, phi, *, reuse_frames=False, small_live_sort=True, pool=None):
         self.view = FrictionPatches()
         self.view.enabled = int(enabled)
         self.view.phi = phi
-        self.capacity = capacity
         device = model.device
-        n = capacity if enabled else 0
-        self.view.weight = wp.zeros(n, dtype=float, device=device)
-        self.view.next_contact = wp.full(n, -1, dtype=int, device=device)
-        self.view.point_a = wp.zeros(n, dtype=wp.vec3, device=device)
-        self.view.point_b = wp.zeros(n, dtype=wp.vec3, device=device)
+        if pool is None:
+            pool = ContactPool(capacity, device=device, rows=capacity)
+        self.capacity = pool.ready
         self.reuse_frames = bool(reuse_frames and enabled)
         self.small_live_sort = bool(small_live_sort)
         # (capture scope, weak generation array, frame-write tick) of the previous
         # captured build, which a build in the same scope may keep the pairs of.
         self._last_build = None
         if not enabled:
+            self.view.weight = wp.zeros(0, dtype=float, device=device)
+            self.view.next_contact = wp.zeros(0, dtype=int, device=device)
+            self.view.point_a = wp.zeros(0, dtype=wp.vec3, device=device)
+            self.view.point_b = wp.zeros(0, dtype=wp.vec3, device=device)
             return
         self.device = device
         # The pair sort skips the key bits no pair key can set.
@@ -1450,10 +1455,23 @@ class _FrictionPatchState:
         self.frame_status = wp.zeros(1, dtype=wp.int32, device=device)
         self._stream_tokens = weakref.WeakKeyDictionary()
         self._next_stream_token = itertools.count(1)
+        # Per-contact slots hold the contact pool's ready rows and grow with it.
+        self.current = _PatchFrame()
+        self.previous = _PatchFrame()
+        self._view_rows = pool.rows(
+            (
+                ContactField("weight", wp.float32),
+                ContactField("next_contact", wp.int32, -1),
+                ContactField("point_a", wp.vec3),
+                ContactField("point_b", wp.vec3),
+            ),
+            on_rows=self._on_view_rows,
+        )
+        self._current_rows = pool.rows(self._frame_fields(), on_rows=self._on_current_rows)
+        self._previous_rows = pool.rows(
+            (*self._frame_fields(), ContactField("previous_world", wp.int32, -1)), on_rows=self._on_previous_rows
+        )
         self.update_geometry(model)
-        self.current = self._frame(capacity, device)
-        self.previous = self._frame(capacity, device)
-        self.previous_world = wp.full(capacity, -1, dtype=int, device=device)
         self.previous_q = wp.zeros(model.body_count, dtype=wp.transform, device=device)
         # Live contact counts on the device. The finish epilogue alone writes the
         # stored frame's count and _build the last built frame's; _prepare
@@ -1462,18 +1480,35 @@ class _FrictionPatchState:
         self.stored = wp.zeros(1, dtype=int, device=device)
         self.built = wp.zeros(1, dtype=int, device=device)
         self.extent = wp.zeros(2, dtype=int, device=device)
-        # Fixed grids keep CUDA graph replay valid; threads stride over live slots.
-        blocks = device.sm_count if device.is_cuda else 1
+        self._load_capture_modules()
+
+    def _on_view_rows(self, rows):
+        rows.publish(self.view)
+
+    def _on_current_rows(self, rows):
+        rows.publish(self.current)
+
+    def _on_previous_rows(self, rows):
+        for field in rows.fields:
+            if field.name != "previous_world":
+                setattr(self.previous, field.name, rows.views[field.name])
+        self.previous_world = rows.views["previous_world"]
+        # The last rows to grow: the slots' grids follow the new capacity.
+        self._set_capacity(rows.rows)
+
+    def _set_capacity(self, capacity):
+        """Size the fixed grids for ``capacity`` slots; CUDA graphs replay them until the next capture."""
+        self.capacity = capacity
+        blocks = self.device.sm_count if self.device.is_cuda else 1
         self.threads = max(1, min(capacity, _LIGHT_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
         self.build_threads = max(1, min(capacity, _BUILD_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
         self.build_block_dim = _BUILD_BLOCK_DIM
         self.merge_threads = max(1, min(capacity, _MERGE_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
-        self.live_sort = _uses_live_sort(capacity, self.key_bits, small=small_live_sort)
+        self.live_sort = _uses_live_sort(capacity, self.key_bits, small=self.small_live_sort)
         self.sort_blocks = max(1, min(-(-capacity // _SORT_CHUNK), _SORT_BLOCKS_PER_SM * blocks))
         self.merges = 0
         while _SORT_CHUNK << self.merges < capacity:
             self.merges += 1
-        self._load_capture_modules()
 
     def _load_capture_modules(self):
         """Load the module of the kernel that captured builds launch first, on a CUDA device.
@@ -1564,45 +1599,51 @@ class _FrictionPatchState:
         return token
 
     @staticmethod
-    def _frame(n, device):
-        frame = _PatchFrame()
-        # Every slot starts as the empty record _prepare writes: the sentinel key,
-        # its own index, and no owner or source. Bounded launches never revisit
-        # slots that still hold it.
-        frame.keys = wp.full(2 * n, 0x7FFFFFFFFFFFFFFF, dtype=wp.int64, device=device)
-        frame.indices = wp.zeros(2 * n, dtype=int, device=device)
-        wp.launch(_arange, dim=n, inputs=[frame.indices], device=device)
-        for field in (
-            "center",
-            "normal",
-            "displacement",
-            "anchor_a",
-            "anchor_b",
-            "surface_a",
-            "surface_b",
-            "tangent_impulse",
-        ):
-            setattr(frame, field, wp.zeros(n, dtype=wp.vec3, device=device))
-        frame.mu = wp.zeros(n, dtype=wp.vec2, device=device)
-        frame.radius = wp.zeros(n, dtype=float, device=device)
-        frame.support_gap_limit = wp.zeros(n, dtype=float, device=device)
-        for field in (
-            "body_a",
-            "body_b",
-            "shape_a",
-            "shape_b",
-            "flipped",
-            "owner",
-            "valid",
-            "used",
-            "source",
-            "eligible",
-            "members",
-        ):
-            setattr(frame, field, wp.zeros(n, dtype=int, device=device))
-        frame.owner.fill_(-1)
-        frame.source.fill_(-1)
-        return frame
+    def _frame_fields():
+        """Return the per-slot fields of a patch frame.
+
+        Every slot starts as the empty record _prepare writes: the sentinel key,
+        its own index, and no owner or source. Bounded launches never revisit
+        slots that still hold it. Keys and indices hold a second, scratch half
+        for the radix sort.
+        """
+        fields = [
+            ContactField("keys", wp.int64, 0x7FFFFFFFFFFFFFFF, per_contact=2),
+            ContactField("indices", wp.int32, None, per_contact=2),
+            ContactField("mu", wp.vec2),
+            ContactField("radius", wp.float32),
+            ContactField("support_gap_limit", wp.float32),
+        ]
+        fields += [
+            ContactField(name, wp.vec3)
+            for name in (
+                "center",
+                "normal",
+                "displacement",
+                "anchor_a",
+                "anchor_b",
+                "surface_a",
+                "surface_b",
+                "tangent_impulse",
+            )
+        ]
+        fields += [
+            ContactField(name, wp.int32, -1 if name in ("owner", "source") else 0)
+            for name in (
+                "body_a",
+                "body_b",
+                "shape_a",
+                "shape_b",
+                "flipped",
+                "owner",
+                "valid",
+                "used",
+                "source",
+                "eligible",
+                "members",
+            )
+        ]
+        return fields
 
     def build(
         self,

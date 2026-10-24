@@ -185,7 +185,8 @@ class TestCollisionOutputCapacity(unittest.TestCase):
             "max_mesh_plane_pairs",
         ):
             self.assertEqual(kwargs[key], 2)
-        self.assertEqual(kwargs["contact_max"], 32)
+        # The pipeline sorts with its own buffers; the narrow phase allocates no standalone sort buffer.
+        self.assertEqual(kwargs["contact_max"], 0)
         self.assertEqual(len(bounded._sort_key_array), 32)
         baseline = _pipeline(model, pairs, deterministic=True)
         contacts = bounded.contacts()
