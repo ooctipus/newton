@@ -31,7 +31,13 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.geometry import terrain_law_box, terrain_law_cylinder, terrain_law_hull, terrain_law_solid
+from newton._src.geometry import (
+    terrain_law_barrel,
+    terrain_law_box,
+    terrain_law_cylinder,
+    terrain_law_hull,
+    terrain_law_solid,
+)
 from newton._src.geometry.terrain_contacts import (
     TERRAIN_LANE_THREAD,
     TERRAIN_LANE_TILE,
@@ -1627,6 +1633,43 @@ def test_barrel_rows_follow_its_profile(test, device):
             test.assertAlmostEqual(float(np.hypot(q[0] + 0.33, q[1] - 0.37)), dims["radius"], delta=1.0e-5)
 
 
+def test_barrel_kernels_only_with_a_barrel(test, device):
+    """Take the cylinder class's barrel kernels only for a table that holds a barrel cylinder, and give flat-sided
+    cylinders and cones the same rows from both kernel sets, bit for bit.
+
+    The class's own kernels set every barrel radius to a literal 0, so that the compiler drops the core functions'
+    barrel paths; with a barrel among its partners the class takes :mod:`terrain_law_barrel`'s for every pair. Cylinders
+    and cones of random poses over rough terrain, with and without a barrel beside them.
+    """
+    rng = np.random.default_rng(29)
+    heights = np.round(rng.uniform(0.0, 0.06, size=(31, 31)) / 0.005) * 0.005
+    hf = tu.reference_surface(tu.heightfield_model(heights, 1.5, 1.5, device="cpu"))
+    kinds = [("cylinder", CYLINDER), ("cone", CONE)]
+    bodies = _free_poses(rng, hf, kinds, 12)
+    barrel = [("barrel", BARRELS[0], _f32_pose(np.r_[1.2, 1.2, 0.2, 0.0, 0.0, 0.0, 1.0]))]
+    rows, names = [], []
+    for scene in (bodies, bodies + barrel):
+        model, _hfield, shapes = su.solid_scene(heights, 1.5, 1.5, scene, device=device)
+        pipeline, _contacts, _state = _collide(model, shadow=True)
+        shadow = pipeline._terrain_law_shadow
+        names.append({launch[1].key.split("_rows")[0] for launch in shadow._launches if "_rows" in launch[1].key})
+        got = tu.shadow_rows(pipeline)
+        rows.append([got.get(shape, []) for shape in shapes[: len(bodies)]])
+    test.assertIn("terrain_cylinder", names[0])
+    test.assertNotIn("terrain_barrel", names[0])
+    test.assertIn("terrain_barrel", names[1])
+    test.assertNotIn("terrain_cylinder", names[1])
+    total = 0
+    for i, (plain, with_barrel) in enumerate(zip(rows[0], rows[1], strict=True)):
+        test.assertEqual(len(plain), len(with_barrel), msg=f"body {i}")
+        for (qa, na, da, fa), (qb, nb, db, fb) in zip(plain, with_barrel, strict=True):
+            bits_a = np.float32(qa).tobytes() + np.float32(na).tobytes() + np.float32(da).tobytes()
+            bits_b = np.float32(qb).tobytes() + np.float32(nb).tobytes() + np.float32(db).tobytes()
+            test.assertEqual((bits_a, fa), (bits_b, fb), msg=f"body {i}")
+        total += len(plain)
+    test.assertGreater(total, 20)
+
+
 def test_finite_planes_rest_as_boxes_without_thickness(test, device):
     """Give a finite plane on a body the rows of a box of its width and length and no thickness.
 
@@ -2745,7 +2788,7 @@ class TestTerrainLawSolid(unittest.TestCase):
         """
         if 86 not in wp.get_cuda_supported_archs():
             self.skipTest("NVRTC cannot compile for sm_86 here")
-        for module in (terrain_law_box, terrain_law_cylinder, terrain_law_hull):
+        for module in (terrain_law_barrel, terrain_law_box, terrain_law_cylinder, terrain_law_hull):
             with self.subTest(module=module.__name__), tempfile.TemporaryDirectory() as directory:
                 wp.compile_aot_module(module, arch=86, module_dir=directory, use_ptx=True)
                 paths = glob.glob(os.path.join(directory, "*.ptx"))
@@ -2782,6 +2825,7 @@ for _name, _func in (
     ("test_barrels_and_planes_match_the_float64_law", test_barrels_and_planes_match_the_float64_law),
     ("test_barrels_follow_exact_geometry", test_barrels_follow_exact_geometry),
     ("test_barrel_rows_follow_its_profile", test_barrel_rows_follow_its_profile),
+    ("test_barrel_kernels_only_with_a_barrel", test_barrel_kernels_only_with_a_barrel),
     ("test_finite_planes_rest_as_boxes_without_thickness", test_finite_planes_rest_as_boxes_without_thickness),
     ("test_job_pipeline_rows_depend_on_the_pair_alone", test_job_pipeline_rows_depend_on_the_pair_alone),
     ("test_job_lists_hold_each_run_together", test_job_lists_hold_each_run_together),

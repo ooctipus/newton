@@ -229,7 +229,9 @@ The module is imported only when the class is listed. Launch kinds, every one wi
   class's also the solid classes' data and its jobs), so that an empty list costs one near-empty launch: the class's
   finish of its deferred pairs.
 
-``begin`` and ``slot_begin`` are the class's first pair and walk slot but for the ``tiled`` launch.
+``begin`` and ``slot_begin`` are the class's first pair and walk slot but for the ``tiled`` launch. The cylinder
+class's kernels compile its barrel cylinders' paths out; a class whose table holds a barrel cylinder takes
+:data:`TERRAIN_LAW_BARREL_KERNELS` instead.
 
 A class's module and kernels follow one protocol (the helpers live in :mod:`~newton._src.geometry.terrain_law`):
 
@@ -254,6 +256,15 @@ A class's module and kernels follow one protocol (the helpers live in :mod:`~new
   first ``K`` of them by priority in the walk slots, ``terrain_finish_overflow``, state ``TERRAIN_PAIR_ROW_OVERFLOW``,
   ``terrain_rows``).
 """
+
+TERRAIN_LAW_BARREL_KERNELS: tuple[str, tuple[tuple[str, str], ...]] = (
+    "newton._src.geometry.terrain_law_barrel",
+    _solid_launches("barrel"),
+)
+"""The cylinder class's module and launches when its table holds a barrel cylinder
+(:attr:`~newton._src.geometry.terrain_contacts.TerrainPairTable.barrels`): its kernels with the barrels' paths, which
+:data:`TERRAIN_LAW_KERNELS`'s compile out (every pair of the class takes them; a flat-sided cylinder or cone gets the
+same rows from both)."""
 
 TERRAIN_LAW_SOLID_CLASSES = (TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_HULL)
 """Partner classes whose kernels take the solid classes' data
@@ -665,6 +676,8 @@ class TerrainLawShadow:
         self._jobs = {}
         for partner_class in self.classes:
             module_name, launches = TERRAIN_LAW_KERNELS[partner_class]
+            if partner_class == TERRAIN_PARTNER_CYLINDER and self.table.barrels:
+                module_name, launches = TERRAIN_LAW_BARREL_KERNELS
             module = importlib.import_module(module_name)
             walk = int(TERRAIN_PARTNER_WALK_SLOTS[partner_class])
             # The class's lane segments are contiguous in the table (lane classes by id); its walk slots follow them.

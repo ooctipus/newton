@@ -1543,6 +1543,11 @@ class TerrainPairTable:
         """Bound on every pair's window columns plus rows, any pose (:func:`terrain_window_sides`), int64 (host)."""
         self.candidates = candidates[order]
         """Bound on every pair's distinct candidates, any pose (:func:`terrain_pair_candidates`), int64 (host)."""
+        barrel = (types == int(GeoType.CYLINDER)) & (scale[:, 2] > 0.0)
+        self.barrels = bool(np.any(barrel[self.pairs_host[:, 1]]))
+        """Whether a pair's partner is a barrel cylinder (a cylinder whose scale's third entry, its side's radius, is not
+        zero): the cylinder class then takes the kernels that hold the barrels' paths
+        (:data:`~newton._src.geometry.terrain_shadow.TERRAIN_LAW_BARREL_KERNELS`)."""
         segment = self.partner_class * TERRAIN_LANE_CLASSES + self.lane_class
         segments = TERRAIN_PARTNER_CLASSES * TERRAIN_LANE_CLASSES
         sizes = np.bincount(segment, minlength=segments) if len(segment) else np.zeros(segments, np.int64)
