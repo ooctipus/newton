@@ -21,6 +21,13 @@ surface feature:
 * The finish: coincident rows merged, rows implied by the others of their plane group dropped (the lower convex
   hull of tangent position and distance), at most four rows per plane group and, given a row limit, at most that
   many per pair (every group's deepest row first, then its extremes).
+* The border: the heightfield is a solid block whose footprint has vertical walls from its border edges down
+  ``WALL_DEPTH``. A border edge is a ridge between its one triangle and its wall, a border vertex's ring takes the wall
+  below it, two walls meet at a vertical corner line below each corner of the footprint, and the walls and corner
+  lines are one-sided (they bound the block for points beside it; a point inside the footprint below the surface exits
+  through the top). A solid's face is clipped to the footprint: the core's part on the face's side of the clip plane
+  through a border edge (containing the face's normal) gives the face its deepest points there (rule F), and rule R
+  takes the core's boundary points inside the footprint.
 
 This is a port of the design study's float64 prototype with three changes, each measured on the CPU:
 
@@ -103,6 +110,15 @@ there, and the golden-section ``theta*`` places it within about 1e-9 m. A tighte
 
 RING = ((0, 1), (1, 1), (1, 0), (0, -1), (-1, -1), (-1, 0))
 """One-ring neighbour offsets (dr, dc) of a vertex, counter-clockwise."""
+WALL_DEPTH = 1.0
+"""Depth of the side walls below the border edges [m] (the float32 law's ``TERRAIN_WALL_DEPTH``)."""
+WALL_NORMALS = (
+    np.array([0.0, -1.0, 0.0]),
+    np.array([0.0, 1.0, 0.0]),
+    np.array([-1.0, 0.0, 0.0]),
+    np.array([1.0, 0.0, 0.0]),
+)
+"""Outward normals of the walls ``y = -hy``, ``y = hy``, ``x = -hx`` and ``x = hx`` (sides 0 to 3)."""
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -610,14 +626,82 @@ class ReferenceHeightfield:
         ]
 
     def vertex_span(self, r, c):
-        """The largest triple product of three distinct incident cluster normals of vertex (r, c), 0 at the border."""
+        """The largest triple product of three distinct incident cluster normals of vertex (r, c), at the border its
+        triangles' and its walls'."""
         if self.ring(r, c) is None:
-            return 0.0
+            normals = [self.plane(t)[0] for t in self.incident_in_grid(r, c)]
+            normals += [WALL_NORMALS[side] for side in self.vertex_sides(r, c)]
+            return largest_triple_product(normals)
         return largest_triple_product([self.plane(t)[0] for t in self.incident_triangles(r, c)])
 
     def vertex_feature(self, r, c):
         """Whether vertex (r, c) is a feature of its own: its incident cluster normals span 3-D."""
         return self.vertex_span(r, c) > VERTEX_SPAN
+
+    # ---- the border ------------------------------------------------------------------------------------------
+    def border_side(self, kind, r, c):
+        """The wall (0 to 3, :data:`WALL_NORMALS`) of window edge kind ``"H"`` (x-edge) or ``"V"`` (y-edge) at vertex
+        (r, c) on the border, else None."""
+        if kind == "H" and 0 <= c < self.cols:
+            if r == 0:
+                return 0
+            if r == self.rows:
+                return 1
+        if kind == "V" and 0 <= r < self.rows:
+            if c == 0:
+                return 2
+            if c == self.cols:
+                return 3
+        return None
+
+    def vertex_sides(self, r, c):
+        """The walls through vertex (r, c): none inside, one on the border, two at a corner (the y-wall first)."""
+        out = []
+        if r == 0:
+            out.append(0)
+        elif r == self.rows:
+            out.append(1)
+        if c == 0:
+            out.append(2)
+        elif c == self.cols:
+            out.append(3)
+        return out
+
+    def border_ring(self, r, c):
+        """The one-ring vertices of vertex (r, c) in the grid."""
+        return [(r + dr, c + dc) for dr, dc in RING if self.valid_vertex(r + dr, c + dc)]
+
+    def incident_in_grid(self, r, c):
+        """The triangles around vertex (r, c) in the grid, in the one-ring's order."""
+        cells = ((r, c, 0), (r, c, 1), (r, c - 1, 0), (r - 1, c - 1, 1), (r - 1, c - 1, 0), (r - 1, c, 1))
+        return [self.tri_id(rr, cc, sub) for rr, cc, sub in cells if self.valid_cell(rr, cc)]
+
+    @staticmethod
+    def wall_value(k, v, side):
+        """(k - v) . n of wall ``side``: k's distance beyond the wall through v."""
+        return float((np.asarray(k) - np.asarray(v)) @ WALL_NORMALS[side])
+
+    @staticmethod
+    def wall_along(k, v, side):
+        """(k - v) . t, t the wall's axis toward higher vertex indices (x for walls 0 and 1, y for 2 and 3)."""
+        return float(k[0] - v[0]) if side < 2 else float(k[1] - v[1])
+
+    @staticmethod
+    def wall_frame(v0, v1, side):
+        """The in-wall unit normal of border edge v0 v1 pointing up."""
+        m = np.cross(v1 - v0, WALL_NORMALS[side])
+        if m[2] < 0.0:
+            m = -m
+        return m / np.linalg.norm(m)
+
+    def wall_holds(self, side, v0, v1, k, *, tol=0.0):
+        """Whether the wall below border edge v0 v1 holds k's projection: below the edge, between its vertices' vertical
+        lines and above the base (``WALL_DEPTH`` below the edge)."""
+        m = self.wall_frame(v0, v1, side)
+        s = float((k - v0) @ m)
+        if s > tol or s < -WALL_DEPTH * m[2] - tol:
+            return False
+        return self.wall_along(k, v0, side) >= -tol and self.wall_along(k, v1, side) <= tol
 
 
 def largest_triple_product(normals) -> float:
@@ -836,6 +920,9 @@ class Polytope(Core):
         for i, j in self.edges():
             a, b = self.verts[i], self.verts[j]
             ab = b - a
+            if float(ab @ ab) == 0.0:
+                # a zero-thickness box's coincident corners
+                continue
             s = float(np.clip((v - a) @ ab / (ab @ ab), 0.0, 1.0))
             p = a + s * ab
             d = float(np.linalg.norm(p - v))
@@ -898,10 +985,13 @@ class Box(Polytope):
 
     def plane_manifold(self, n, a, D):
         """Newton's plane-box manifold: up to 4 deepest corners within reach, deepest first; a corner passes a kept one
-        only when deeper by more than the tie band (else corner order holds)."""
+        only when deeper by more than the tie band (else corner order holds). Each corner once: along a zero half
+        extent (a finite plane's thickness) only the corner on its lower side."""
         band = TIE * float(np.linalg.norm(self.half))
         kept = []
         for i in range(8):
+            if any(self.half[axis] == 0.0 and (i >> axis) & 1 for axis in range(3)):
+                continue
             h = float(n @ (self.verts[i] - a))
             if h > D:
                 continue
@@ -1059,6 +1149,148 @@ class Cylinder(Core):
         if t_lo > t_hi + LIFT_SLACK or not np.isfinite(t_lo):
             return None
         return u + t_lo * n, t_lo
+
+
+class Barrel(Cylinder):
+    """A barrel cylinder (Newton's ``scale[2]``): caps of radius ``r`` at ``+-h`` along the axis and a side of
+    revolution of a circular arc of radius ``R >= h`` through the caps' rims (:meth:`rho`). Its plane manifold is its
+    lowest point (Newton's support point) with the cylinder's tripod within 22.5 deg of upright; its curved side has no
+    generator."""
+
+    kind = "barrel"
+
+    def __init__(self, c, axis, radius, half_height, barrel):
+        super().__init__(c, axis, radius, half_height)
+        self.R = float(barrel)
+
+    def rho(self, z):
+        """The side's radius at axial height ``z`` (``|z| <= h``), in Newton's support function's form."""
+        denom = math.sqrt(max(self.R**2 - z * z, 0.0)) + math.sqrt(max(self.R**2 - self.h**2, 0.0))
+        return self.r if denom <= 0.0 else self.r + (self.h**2 - z * z) / denom
+
+    def lowest(self, n):
+        ax = self.axis
+        z = min(max(-self.R * float(n @ ax), -self.h), self.h)
+        perp = -n + ax * float(n @ ax)
+        ln2 = float(perp @ perp)
+        if ln2 <= 1e-10:
+            return self.c + z * ax
+        return self.c + z * ax + self.rho(z) * perp / math.sqrt(ln2)
+
+    def aabb(self):
+        lo, hi = np.zeros(3), np.zeros(3)
+        for i in range(3):
+            e = np.zeros(3)
+            e[i] = 1.0
+            lo[i] = self.lowest(e)[i]
+            hi[i] = self.lowest(-e)[i]
+        return lo, hi
+
+    def plane_manifold(self, n, a, D):
+        axis = self.axis.copy()
+        dot_na = float(n @ axis)
+        if dot_na > TIE:
+            axis = -axis
+            dot_na = -dot_na
+        cap = self.c + axis * self.h
+        pts = [self.lowest(n)]
+        if -dot_na >= CYLINDER_FLAT_MODE_COS:
+            ref = np.array([1.0, 0.0, 0.0])
+            if abs(axis @ ref) > 0.9:
+                ref = np.array([0.0, 1.0, 0.0])
+            perp_fixed = ref - axis * (axis @ ref)
+            perp_fixed /= np.linalg.norm(perp_fixed)
+            u = perp_fixed * self.r
+            v = np.cross(axis, perp_fixed) * self.r
+            merge = (0.01 * max(self.r, self.h)) ** 2
+            for p in (cap + u, cap - 0.5 * u + 0.8660254 * v, cap - 0.5 * u - 0.8660254 * v):
+                if len(pts) < 4 and np.sum((p - pts[0]) ** 2) > merge:
+                    pts.append(p)
+        out = []
+        for p in pts:
+            hh = float(n @ (p - a))
+            if hh <= D:
+                out.append((p, hh))
+        return out
+
+    def excess(self, x):
+        """How far ``x`` lies outside the side at its axial height (clamped to the caps): convex along any line."""
+        w = x - self.c
+        z = float(w @ self.axis)
+        return float(np.linalg.norm(w - z * self.axis)) - self.rho(min(max(z, -self.h), self.h))
+
+    def lift(self, u, n):
+        """Entry of the line u + t n into the barrel (smallest t): the caps' slab, then the side's excess along the
+        line, convex there: a golden section to its least value, a bisection to its first zero before it."""
+        ax = self.axis
+        w = u - self.c
+        dn, dw = float(n @ ax), float(w @ ax)
+        if abs(dn) < 1e-14:
+            if abs(dw) > self.h + LIFT_SLACK:
+                return None
+            # parallel to the caps: the side's circle at the line's height
+            return Cylinder(self.c, ax, self.rho(min(max(dw, -self.h), self.h)), self.h).lift(u, n)
+        t1, t2 = (-self.h - dw) / dn, (self.h - dw) / dn
+        t_lo, t_hi = min(t1, t2), max(t1, t2)
+        if self.excess(u + t_lo * n) > 0.0:
+            g = (math.sqrt(5.0) - 1.0) / 2.0
+            a, b = t_lo, t_hi
+            for _ in range(120):
+                c, d = b - g * (b - a), a + g * (b - a)
+                if self.excess(u + c * n) <= self.excess(u + d * n):
+                    b = d
+                else:
+                    a = c
+            least = 0.5 * (a + b)
+            if self.excess(u + least * n) > LIFT_SLACK:
+                return None
+            lo, hi = t_lo, least
+            for _ in range(120):
+                mid = 0.5 * (lo + hi)
+                if self.excess(u + mid * n) > 0.0:
+                    lo = mid
+                else:
+                    hi = mid
+            t_lo = hi
+        return u + t_lo * n, t_lo
+
+    def contains(self, x):
+        w = x - self.c
+        z = float(w @ self.axis)
+        return abs(z) <= self.h and float(np.linalg.norm(w - z * self.axis)) <= self.rho(z)
+
+    def nearest(self, v):
+        """:func:`_nearest`'s ``(n, k, d)``, in the meridian half-plane of ``v`` (radial ``x``, axial ``z``): outside,
+        the nearest of the near cap's projection and the side arc's (the circle of radius ``R`` about ``(x0, 0)``,
+        ``x0 = r - sqrt(R^2 - h^2)``, where it lies on the side); inside, the nearer of the cap and the arc."""
+        ax = self.axis
+        w = v - self.c
+        z = float(w @ ax)
+        rad = w - z * ax
+        x = float(np.linalg.norm(rad))
+        radial = rad / x if x > 1e-12 else _disk_basis(ax)[0]
+        x0 = self.r - math.sqrt(max(self.R**2 - self.h**2, 0.0))
+        ox = x - x0
+        od = math.hypot(ox, z)
+        arc = od > 0.0 and ox >= 0.0 and abs(self.R * z) <= self.h * od
+        if abs(z) <= self.h and x <= self.rho(z):
+            d_cap = self.h - abs(z)
+            if arc and self.R - od < d_cap:
+                f = (ox * radial + z * ax) / od
+                d = self.R - od
+                return -f, v + d * f, -d
+            f = ax * (1.0 if z >= 0.0 else -1.0)
+            return -f, v + d_cap * f, -d_cap
+        sz = 1.0 if z >= 0.0 else -1.0
+        cands = [(min(x, self.r), sz * self.h)]
+        if arc:
+            cands.append((x0 + self.R * ox / od, self.R * z / od))
+        bx, bz = min(cands, key=lambda p: (x - p[0]) ** 2 + (z - p[1]) ** 2)
+        k = self.c + bz * ax + bx * radial
+        dist = float(np.linalg.norm(k - v))
+        if dist <= 0.0:
+            return None
+        return (k - v) / dist, k, dist
 
 
 def _disk_basis(axis):
@@ -1296,8 +1528,10 @@ class Ellipsoid(Core):
 def make_core(kind: str, dims: dict, pose_local, *, verts=None) -> Core:
     """A core in the heightfield-local frame: ``pose_local`` = (px, py, pz, qx, qy, qz, qw).
 
-    ``dims``: sphere ``radius``; capsule, cylinder and cone ``radius`` and ``half_height``; box ``half``; ellipsoid
-    ``semi`` (semi-axes); hull ``verts`` (its local vertices, scale applied).
+    ``dims``: sphere ``radius``; capsule, cylinder and cone ``radius`` and ``half_height``; barrel ``radius``,
+    ``half_height`` and ``barrel`` (its side's profile radius); box ``half``; plane ``size`` (width and length: a box of
+    half its width and length and no thickness); ellipsoid ``semi`` (semi-axes); hull ``verts`` (its local vertices,
+    scale applied).
     """
     p = np.asarray(pose_local[:3], np.float64)
     q = np.asarray(pose_local[3:7], np.float64)
@@ -1312,6 +1546,10 @@ def make_core(kind: str, dims: dict, pose_local, *, verts=None) -> Core:
         return Box(p, R, dims["half"])
     if kind == "cylinder":
         return Cylinder(p, z, dims["radius"], dims["half_height"])
+    if kind == "barrel":
+        return Barrel(p, z, dims["radius"], dims["half_height"], dims["barrel"])
+    if kind == "plane":
+        return Box(p, R, (0.5 * dims["size"][0], 0.5 * dims["size"][1], 0.0))
     if kind == "cone":
         return Cone(p, z, dims["radius"], dims["half_height"])
     if kind == "ellipsoid":
@@ -1419,6 +1657,10 @@ class PointLaw:
         for e in self.edges:
             _k, _r, _c, i0, i1, ta, tb, _oa, _ob = e
             if ta is None or tb is None:
+                if not below:
+                    row = self.border_edge(e, p, D, tag)
+                    if row is not None:
+                        out.append(row)
                 continue
             key = tuple(sorted((i0, i1)))
             if not below and self.cls.get(key) == "concave":
@@ -1451,6 +1693,10 @@ class PointLaw:
         for r, c in self.verts:
             ring = hf.ring(r, c)
             if ring is None:
+                if not below:
+                    row = self.border_vertex(r, c, p, D, tag)
+                    if row is not None:
+                        out.append(row)
                 continue
             v = hf.V(r, c)
             w = p - v
@@ -1476,6 +1722,69 @@ class PointLaw:
                     out = [*rest, rec]
         return out
 
+    def border_edge(self, e, p, D, tag):
+        """A border edge's claim on point p outside the solid: the edge (strictly beyond its triangle and its wall at
+        the edge, inside its slab) above the wall's edge line, the wall below it (p beside the wall, its projection
+        held), or None."""
+        hf = self.hf
+        kind, r, c, i0, i1, ta, tb, _oa, _ob = e
+        side = hf.border_side(kind, r, c)
+        if side is None:
+            return None
+        t = ta if ta is not None else tb
+        v0, v1 = hf.V(*i0), hf.V(*i1)
+        n_wall = WALL_NORMALS[side]
+        s_wall = float((p - v0) @ hf.wall_frame(v0, v1, side))
+        if s_wall > 0.0:
+            s_top = self.face_pred(t, tuple(sorted((i0, i1))), p)
+            u = v1 - v0
+            w0 = float((p - v0) @ u)
+            w1 = float((p - v1) @ (-u))
+            if not (s_top > EPS_PRED and s_wall > EPS_PRED and w0 > EPS_PRED and w1 > EPS_PRED):
+                return None
+            q = v0 + (w0 / float(u @ u)) * u
+            dist = float(np.linalg.norm(p - q))
+            if dist < 1e-12:
+                n = hf.plane(t)[0] + n_wall
+                n, d = n / np.linalg.norm(n), 0.0
+            else:
+                n, d = (p - q) / dist, dist
+            if d > D:
+                return None
+            return Row(q, p.copy(), n, d, (tag, "E", kind, r, c))
+        d = hf.wall_value(p, v0, side)
+        if d < -EPS_PRED or d > D or not hf.wall_holds(side, v0, v1, p, tol=EPS_PRED):
+            return None
+        return Row(p - d * n_wall, p.copy(), n_wall.copy(), d, (tag, "W", kind, r, c))
+
+    def border_vertex(self, r, c, p, D, tag):
+        """A border vertex's claim on point p outside the solid: its Voronoi region (its ring's vertices in the grid
+        and the wall below it: p not below the vertex), or below a corner of the footprint the corner line (p beyond
+        both walls, within ``WALL_DEPTH`` of the corner); None otherwise."""
+        hf = self.hf
+        v = hf.V(r, c)
+        if v[2] - p[2] > 0.0:
+            sides = hf.vertex_sides(r, c)
+            if len(sides) < 2 or v[2] - p[2] <= EPS_PRED or v[2] - p[2] > WALL_DEPTH:
+                return None
+            if any(hf.wall_value(p, v, side) <= EPS_PRED for side in sides):
+                return None
+            q = np.array([v[0], v[1], p[2]])
+            w = p - q
+            dist = float(np.linalg.norm(w))
+            n = w / dist if dist >= 1e-12 else WALL_NORMALS[sides[0]] + WALL_NORMALS[sides[1]]
+            n = n / np.linalg.norm(n)
+            if dist > D:
+                return None
+            return Row(q, p.copy(), n, dist, (tag, "L", r, c))
+        w = p - v
+        if any(float(w @ (hf.V(rr, cc) - v)) > EPS_PRED for rr, cc in hf.border_ring(r, c)):
+            return None
+        dist = float(np.linalg.norm(w))
+        if dist < 1e-12 or dist > D:
+            return None
+        return Row(v, p.copy(), w / dist, dist, (tag, "V", r, c))
+
 
 def _recovery_row(hf, p, feat):
     """G3: the face vertically above a core point below the surface, plane normal, plane depth."""
@@ -1490,8 +1799,9 @@ def _recovery_row(hf, p, feat):
 
 
 def solid_recovery_points(core):
-    """The boundary points G3 tries for a solid core: polytope vertices; a cylinder's 16 rim points per cap; a cone's
-    16 base rim points and its apex; an ellipsoid's 14 points on its local axes and diagonals."""
+    """The boundary points G3 tries for a solid core: polytope vertices; a cylinder's 16 rim points per cap (a barrel's
+    then 16 around its side's middle); a cone's 16 base rim points and its apex; an ellipsoid's 14 points on its local
+    axes and diagonals."""
     if hasattr(core, "verts"):
         return core.verts
     th = np.linspace(0.0, 2.0 * np.pi, 16, endpoint=False)
@@ -1507,12 +1817,17 @@ def solid_recovery_points(core):
     ring = core.r * (np.outer(np.cos(th), u) + np.outer(np.sin(th), w))
     if core.kind == "cone":
         return np.concatenate([core.base + ring, core.apex[None, :]])
-    return np.concatenate([core.c + core.h * ax + ring, core.c - core.h * ax + ring])
+    rims = [core.c + core.h * ax + ring, core.c - core.h * ax + ring]
+    if core.kind == "barrel":
+        rims.append(core.c + (core.rho(0.0) / core.r) * ring)
+    return np.concatenate(rims)
 
 
 def _solid_recovery(hf, core, *, kmax=4):
-    """G3 for solid cores with no row: up to 4 of the core's deepest boundary points below the surface."""
-    if hasattr(core, "verts") or core.kind in ("cone", "ellipsoid"):
+    """G3 for solid cores with no row: up to 4 of the core's deepest boundary points below the surface, clipped to the
+    footprint (a point outside it has no face above it; the core's part inside it on a border edge's clip plane below
+    the edge's face is rule F's clip row, :func:`_clip_points`, so a pair left to rule R has none)."""
+    if hasattr(core, "verts") or core.kind in ("cone", "ellipsoid", "barrel"):
         pts = solid_recovery_points(core)
     else:
         ax = core.axis
@@ -1598,12 +1913,17 @@ def capsule_law(hf, core, D, window, *, stats=None):
     axis = []
     ends_outside = not _below_surface(hf, a) and not _below_surface(hf, b)
     witness = None
-    # axis-interior minima and exits against creases
+    # axis-interior minima and exits against creases (a border edge is a ridge between its triangle and its wall)
     for e in edges:
         kind, r, c, i0, i1, ta, tb, _oa, _ob = e
+        side = None
         if ta is None or tb is None:
-            continue
-        cls = hf.edge_class(e)
+            side = hf.border_side(kind, r, c)
+            if side is None:
+                continue
+            cls = "convex"
+        else:
+            cls = hf.edge_class(e)
         if cls == "flat":
             continue
         v0, v1 = hf.V(*i0), hf.V(*i1)
@@ -1614,11 +1934,16 @@ def capsule_law(hf, core, D, window, *, stats=None):
             p = a + s * ab
             q = v0 + t * (v1 - v0)
             key = tuple(sorted((i0, i1)))
-            sa, sb = law.face_pred(ta, key, p), law.face_pred(tb, key, p)
+            if side is None:
+                sa, sb = law.face_pred(ta, key, p), law.face_pred(tb, key, p)
+            else:
+                sa = law.face_pred(ta if ta is not None else tb, key, p)
+                sb = float((p - v0) @ hf.wall_frame(v0, v1, side))
             dist = float(np.linalg.norm(p - q))
             if dist >= 1e-12:
                 if _below_surface(hf, p):
-                    claims = (sa > 0.0 and sb > 0.0) if cls == "concave" else (sa < 0.0 and sb < 0.0)
+                    # a border edge is one-sided: an axis below it exits through the top (G3 at its crossing)
+                    claims = side is None and ((sa > 0.0 and sb > 0.0) if cls == "concave" else (sa < 0.0 and sb < 0.0))
                     n, d = (q - p) / dist, -dist
                 else:
                     claims = cls == "convex" and sa > 0.0 and sb > 0.0
@@ -1634,12 +1959,15 @@ def capsule_law(hf, core, D, window, *, stats=None):
                 depth = float((v0[2] + t * (v1[2] - v0[2])) - (a[2] + s * ab[2]))
                 order = (r, c, EDGE_ORDER[kind])
                 if depth > 0.0 and (witness is None or (-depth, order) < (-witness[0], witness[1])):
-                    witness = (depth, order, a + s * ab, ta)
+                    witness = (depth, order, a + s * ab, ta if ta is not None else tb)
     # axis-interior minima against vertices
     L2 = float(ab @ ab)
     for r, c in verts:
         ring = hf.ring(r, c)
         if ring is None:
+            row = _axis_border_vertex(hf, law, a, b, r, c, D)
+            if row is not None:
+                axis.append(row)
             continue
         v = hf.V(r, c)
         s = float((v - a) @ ab) / L2
@@ -1664,6 +1992,27 @@ def capsule_law(hf, core, D, window, *, stats=None):
         if d < 0.0:
             axis.append(Row(p - d * n, p.copy(), n.copy(), d, ("s", "R", ta)))
     return out + axis
+
+
+def _axis_border_vertex(hf, law, a, b, r, c, D):
+    """The axis interior at a border vertex, outside the solid only: the axis point over the vertex in its Voronoi
+    region (its ring in the grid and the wall below it), else at a corner of the footprint the axis point closest to
+    the corner line below it, beyond both walls."""
+    ab = b - a
+    v = hf.V(r, c)
+    s = float((v - a) @ ab) / float(ab @ ab)
+    if 0.0 < s < 1.0:
+        p = a + s * ab
+        row = law.border_vertex(r, c, p, D, "s") if not _below_surface(hf, p) and p[2] >= v[2] else None
+        if row is not None:
+            return row
+    sides = hf.vertex_sides(r, c)
+    if len(sides) < 2:
+        return None
+    st = _closest_seg_seg(a, b, v, v - np.array([0.0, 0.0, WALL_DEPTH]))
+    if st is None or not (0.0 < st[0] < 1.0 and 0.0 < st[1] < 1.0):
+        return None
+    return law.border_vertex(r, c, a + st[0] * ab, D, "s")
 
 
 def _sigma(core, n, x0):
@@ -1716,11 +2065,18 @@ def _support_feature(core, n, band):
     or a cylinder's lowest point or generator, ('disk', centre, axis, r) for a cylinder cap within the band.
 
     A cone's is its base disk (base down within the band), the lowest generator (both ends within the band) or its
-    lowest point; an ellipsoid's is its support point."""
+    lowest point; an ellipsoid's is its support point; a barrel's a cap within the band or its lowest point."""
     if hasattr(core, "verts"):
         h = core.verts @ n
         return ("pts", core.verts[h <= h.min() + band])
     if core.kind == "ellipsoid":
+        return ("pts", core.lowest(n)[None, :])
+    if core.kind == "barrel":
+        # a level cap within the band, else the lowest point (the curved side has no generator)
+        ax = core.axis
+        tilt = math.sqrt(max(0.0, 1.0 - float(n @ ax) ** 2))
+        if 2.0 * core.r * tilt <= band:
+            return ("disk", core.c + (-1.0 if n @ ax > 0 else 1.0) * core.h * ax, ax, core.r)
         return ("pts", core.lowest(n)[None, :])
     if core.kind == "cone":
         ax = core.axis
@@ -1747,7 +2103,7 @@ def _support_feature(core, n, band):
 def _reference_feature(core, n):
     """The core's reference feature at normal n, as the plane manifold sees it (G1): a polytope's face through its
     deepest vertex that is most opposed to n; a cylinder's near cap inside the 22.5 deg flat mode, else its lowest
-    generator."""
+    generator (a barrel's lowest point)."""
     if hasattr(core, "verts"):
         h = core.verts @ n
         radius = float(np.linalg.norm(core.verts - core.c, axis=1).max())
@@ -1756,6 +2112,12 @@ def _reference_feature(core, n):
         k = through[first_within([-float(core.fnormals[q] @ n) for q in through], TIE, largest=True)]
         return ("pts", core.verts[core.faces[k]])
     if core.kind == "ellipsoid":
+        return ("pts", core.lowest(n)[None, :])
+    if core.kind == "barrel":
+        # The near cap within the flat mode, else the lowest point (which straddles no line).
+        axis = core.axis if float(n @ core.axis) < 0.0 else -core.axis
+        if -float(n @ axis) >= CYLINDER_FLAT_MODE_COS:
+            return ("disk", core.c + core.h * axis, axis, core.r)
         return ("pts", core.lowest(n)[None, :])
     if core.kind == "cone":
         # The base within the flat mode, else the lowest generator (the apex alone when the axis is along n).
@@ -1854,6 +2216,191 @@ def hull2d(P):
     return np.asarray(lower[:-1] + upper[:-1], np.float64)
 
 
+def _crease_rows(core, D, band, size, v0, v1, nA, nB, end_feature, tag, groups, *, one_sided=False, stats=None):
+    """Rule E's rows of a convex crease from ``v0`` to ``v1`` with face normals ``nA`` and ``nB`` (a border edge: its
+    triangle's and its wall's; a corner line: its walls'): theta* on the normal arc, then the core's flat support
+    feature (interior) or reference feature (an arc end, G1) crossed with the crease's line, its ends lifted onto the
+    core. ``end_feature(j)``: whether the edge's end ``j`` is a vertex feature (an end there is the vertex's); ``groups``: the
+    plane groups of the arc's ends; ``one_sided``: no row for a core inside both faces (a corner line's walls)."""
+    out = []
+    dvec = v1 - v0
+    L = float(np.linalg.norm(dvec))
+    dh = dvec / L
+    # the edge's normal arc, exactly perpendicular to the edge
+    nA = nA - (nA @ dh) * dh
+    nA /= np.linalg.norm(nA)
+    nB = nB - (nB @ dh) * dh
+    nB /= np.linalg.norm(nB)
+    cosab = float(np.clip(nA @ nB, -1.0, 1.0))
+    th_ab = math.acos(cosab)
+    m = nB - cosab * nA
+    if th_ab < 1e-9 or np.linalg.norm(m) < 1e-12:
+        return out
+    m /= np.linalg.norm(m)
+    lo_s = max(_sigma(core, nA, v0)[0], _sigma(core, nB, v0)[0])
+    if lo_s > D:
+        return out
+    if stats:
+        stats.edge_solves += 1
+    th, sig = _maximize_arc(core, nA, m, th_ab, v0)
+    if sig > D or (one_sided and sig < 0.0):
+        return out
+    nst = math.cos(th) * nA + math.sin(th) * m
+    interior = EPS_THETA < th < th_ab - EPS_THETA
+    e1, e2 = dh, np.cross(nst, dh)
+    # G1: interior theta*: the flat support feature along -n(theta*); arc end: the reference feature
+    feat = _support_feature(core, nst, band) if interior else _reference_feature(core, nst)
+    iv = _feature_crossing(feat, v0, e1, e2, 1e-7 + 1e-6 * size, need_straddle=not interior)
+    if iv is None and interior:
+        # inside the arc the feature meets the line; the float32 search's rounding may leave a single fast-turning
+        # support point off it: within the flatness band
+        iv = _feature_crossing(feat, v0, e1, e2, band)
+    xs = []
+    if iv is not None:
+        x0, x1 = max(iv[0], 0.0), min(iv[1], L)
+        if x1 >= x0 - 1e-12:
+            xs = [x0, x1] if x1 - x0 >= 1e-9 else [0.5 * (x0 + x1)]
+    # an end of the edge on a vertex feature belongs to that vertex
+    xs = [x for x in xs if not ((x <= 1e-12 and end_feature(0)) or (x >= L - 1e-12 and end_feature(1)))]
+    grp = (*tag, round(th, 9)) if interior else (groups[0] if th < 0.5 * th_ab else groups[1])
+    for x in xs:
+        u = v0 + x * dh
+        # The feature's chord over the interval lies in the core on the line, so the lift is no deeper than its
+        # point over u; at an end, where the line can only touch the core, that point is the lift (a tangent
+        # lift that rounding made miss, or carried past the chord, is the chord's point).
+        lo, hi, k_lo, k_hi = iv
+        k = k_lo if x == lo else k_hi if x == hi else k_lo + ((x - lo) / (hi - lo)) * (k_hi - k_lo)
+        tt = float(nst @ (k - u))
+        hit = core.lift(u, nst)
+        if hit is not None and hit[1] <= tt + LIFT_SLACK:
+            tt = hit[1]
+        if tt > D:
+            continue
+        out.append(Row(u, u + tt * nst, nst.copy(), tt, (*tag, round(x / L, 6)), group=grp))
+    return out
+
+
+def _feature_min(feat, m, v0):
+    """The smallest ``m . (k - v0)`` over a support feature (:func:`_support_feature`)."""
+    if feat[0] == "pts":
+        return float(np.min((feat[1] - v0) @ m))
+    _kind, centre, axis, r = feat
+    return float(m @ (centre - v0)) - r * math.sqrt(max(0.0, 1.0 - float(m @ axis) ** 2))
+
+
+def _clip_normal(core, n, m, v0, band):
+    """Rule F's clip at a border edge (face normal ``n``, clip plane through ``v0`` of outward normal ``m``): the normal
+    on the quarter arc from ``n`` toward ``m`` at which the core's support first reaches the clip plane (``n`` itself
+    when its flat support feature does), or None when no point of the core lies on the face's side of the plane."""
+    if _feature_min(_support_feature(core, n, band), m, v0) <= 0.0:
+        return n
+    if float(m @ (core.lowest(m) - v0)) >= 0.0:
+        return None
+    lo, hi = 0.0, 0.5 * math.pi
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        k = core.lowest(math.cos(mid) * n + math.sin(mid) * m)
+        if float(m @ (k - v0)) > 0.0:
+            lo = mid
+        else:
+            hi = mid
+    return math.cos(hi) * n + math.sin(hi) * m
+
+
+def _clip_points(hf, core, D, window, band, tol):
+    """Rule F's footprint clipping: per border edge of the window, the core's part on its triangle's side of the clip
+    plane through the edge (containing the face's normal, its outward normal the face's in-plane normal at the edge),
+    deepest along the face's normal: the ends of its support feature's crossing with the clip plane at
+    :func:`_clip_normal`, an end past a corner of the footprint replaced by the core's point on the corner line (the
+    lift along the normal), an end past another vertex left to the next edge. Returns ``(k, h, n, t, order)`` per point:
+    core point, depth along the face's normal ``n``, the face's triangle and the edge's place (row, column, x/y, end),
+    within the reach and front-facing as a face's supported point is (below the face inside every wall and below the
+    surface, above it not below the surface)."""
+    out = []
+    for e in window[1]:
+        kind, r, c, i0, i1, ta, tb, oa, ob = e
+        if ta is not None and tb is not None:
+            continue
+        side = hf.border_side(kind, r, c)
+        if side is None:
+            continue
+        t = ta if ta is not None else tb
+        far = oa if ta is not None else ob
+        n, a = hf.plane(t)
+        v0, v1 = hf.V(*i0), hf.V(*i1)
+        m = np.cross(v1 - v0, n)
+        if m @ (hf.V(*far) - v0) > 0.0:
+            m = -m
+        m = m / np.linalg.norm(m)
+        nc = _clip_normal(core, n, m, v0, band)
+        if nc is None:
+            continue
+        L = float(np.linalg.norm(v1 - v0))
+        dh = (v1 - v0) / L
+        feat = _support_feature(core, nc, band)
+        iv = _feature_crossing(feat, v0, dh, m, tol)
+        if iv is None and nc is not n:
+            iv = _feature_crossing(feat, v0, dh, m, band)
+        if iv is None:
+            continue
+        lo, hi, k_lo, k_hi = iv
+        ends = [(lo, k_lo), (hi, k_hi)] if hi - lo >= 1e-9 else [(0.5 * (lo + hi), 0.5 * (k_lo + k_hi))]
+        for slot, (x, k_end) in enumerate(ends):
+            k = k_end
+            corner = i0 if x < -1e-12 else i1 if x > L + 1e-12 else None
+            if corner is not None:
+                if len(hf.vertex_sides(*corner)) < 2:
+                    continue
+                hit = core.lift(hf.V(*corner), n)
+                if hit is None:
+                    continue
+                k = hit[0]
+            else:
+                # the core's point on the clip plane over the end (its lift along the normal)
+                u = v0 + x * dh
+                hit = core.lift(u, n)
+                if hit is not None and hit[1] <= float(n @ (k - u)) + LIFT_SLACK:
+                    k = hit[0]
+            h = float(n @ (k - a))
+            if h > D:
+                continue
+            if h < 0.0 and max(abs(k[0]) - hf.hx, abs(k[1]) - hf.hy) > 1e-12:
+                # below the face: inside every wall (near a corner the point may lie beyond the other one)
+                continue
+            # front-facing, as a face's supported point: below the face inside the solid (the point taken within the
+            # footprint's closure), above it outside
+            if h < -EPS_PRED:
+                if not _below_surface(hf, np.r_[np.clip(k[:2], (-hf.hx, -hf.hy), (hf.hx, hf.hy)), k[2]]):
+                    continue
+            elif h > EPS_PRED and _below_surface(hf, k):
+                continue
+            out.append((k.copy(), h, n.copy(), t, (r, c, 0 if kind == "H" else 1, slot)))
+    return out
+
+
+def _wall_rows(hf, core, D, window):
+    """Rule F on the walls: per wall of the window, its plane manifold's points beside it (the walls are one-sided)
+    whose projection a piece of it in the window holds (below a border edge, between its vertices' vertical lines,
+    above the base)."""
+    pieces = {}
+    for e in window[1]:
+        kind, r, c, i0, i1, ta, tb, _oa, _ob = e
+        if ta is not None and tb is not None:
+            continue
+        side = hf.border_side(kind, r, c)
+        if side is not None:
+            pieces.setdefault(side, []).append((hf.V(*i0), hf.V(*i1)))
+    out = []
+    for side, segments in sorted(pieces.items()):
+        n = WALL_NORMALS[side]
+        for k, h in core.plane_manifold(n, segments[0][0], D):
+            if h < -1e-12:
+                continue
+            if any(hf.wall_holds(side, v0, v1, k, tol=1e-12) for v0, v1 in segments):
+                out.append(Row(k - h * n, k.copy(), n.copy(), h, ("W", side), group=("W", side)))
+    return out
+
+
 def solid_law(hf, core, D, window, *, stats=None, flat_band=None):
     tris, edges, verts = window
     out = []
@@ -1887,7 +2434,11 @@ def solid_law(hf, core, D, window, *, stats=None, flat_band=None):
         for (k, h), ok in zip(cands, sup, strict=True):
             if ok:
                 out.append(Row(k - h * n, k.copy(), n.copy(), h, ("F", t), group=("P", t)))
-    # ---- convex edges ----------------------------------------------------------------------------------------
+    # ---- the border: the faces clipped to the footprint, the walls ---------------------------------------------
+    for k, h, n, t, order in _clip_points(hf, core, D, window, band, 1e-7 + 1e-6 * size):
+        out.append(Row(k - h * n, k, n, h, ("F", t, "clip", order), group=("P", t)))
+    out.extend(_wall_rows(hf, core, D, window))
+    # ---- convex edges: creases, border edges (triangle and wall), corner lines (two walls) --------------------
     vcache = {}
 
     def vfeat(rc):
@@ -1896,77 +2447,74 @@ def solid_law(hf, core, D, window, *, stats=None, flat_band=None):
         return vcache[rc]
 
     for e in edges:
-        if hf.edge_class(e) != "convex":
-            continue
-        _k, er, ec, i0, i1, ta, tb, _oa, _ob = e
+        kind, er, ec, i0, i1, ta, tb, _oa, _ob = e
+        if ta is None or tb is None:
+            side = hf.border_side(kind, er, ec)
+            if side is None:
+                continue
+            t = ta if ta is not None else tb
+            nA, nB = hf.plane(t)[0], WALL_NORMALS[side]
+            groups = (("P", t), ("W", side))
+        else:
+            if hf.edge_class(e) != "convex":
+                continue
+            nA, nB = hf.plane(ta)[0], hf.plane(tb)[0]
+            groups = (("P", ta), ("P", tb))
         if stats:
             stats.convex_edges += 1
-        v0, v1 = hf.V(*i0), hf.V(*i1)
-        dvec = v1 - v0
-        L = float(np.linalg.norm(dvec))
-        dh = dvec / L
-        nA, _ = hf.plane(ta)
-        nB, _ = hf.plane(tb)
-        # the edge's normal arc, exactly perpendicular to the edge
-        nA = nA - (nA @ dh) * dh
-        nA /= np.linalg.norm(nA)
-        nB = nB - (nB @ dh) * dh
-        nB /= np.linalg.norm(nB)
-        cosab = float(np.clip(nA @ nB, -1.0, 1.0))
-        th_ab = math.acos(cosab)
-        m = nB - cosab * nA
-        if th_ab < 1e-9 or np.linalg.norm(m) < 1e-12:
+        out.extend(
+            _crease_rows(
+                core,
+                D,
+                band,
+                size,
+                hf.V(*i0),
+                hf.V(*i1),
+                nA,
+                nB,
+                lambda j, i0=i0, i1=i1: vfeat(i1 if j else i0),
+                ("E", kind, er, ec),
+                groups,
+                stats=stats,
+            )
+        )
+    for r, c in verts:
+        sides = hf.vertex_sides(r, c)
+        if len(sides) < 2:
             continue
-        m /= np.linalg.norm(m)
-        lo_s = max(_sigma(core, nA, v0)[0], _sigma(core, nB, v0)[0])
-        if lo_s > D:
-            continue
-        if stats:
-            stats.edge_solves += 1
-        th, sig = _maximize_arc(core, nA, m, th_ab, v0)
-        if sig > D:
-            continue
-        nst = math.cos(th) * nA + math.sin(th) * m
-        interior = EPS_THETA < th < th_ab - EPS_THETA
-        e1, e2 = dh, np.cross(nst, dh)
-        # G1: interior theta*: the flat support feature along -n(theta*); arc end: the reference feature
-        feat = _support_feature(core, nst, band) if interior else _reference_feature(core, nst)
-        iv = _feature_crossing(feat, v0, e1, e2, 1e-7 + 1e-6 * size, need_straddle=not interior)
-        xs = []
-        if iv is not None:
-            x0, x1 = max(iv[0], 0.0), min(iv[1], L)
-            if x1 >= x0 - 1e-12:
-                xs = [x0, x1] if x1 - x0 >= 1e-9 else [0.5 * (x0 + x1)]
-        # an end of the edge on a vertex feature belongs to that vertex
-        xs = [x for x in xs if not ((x <= 1e-12 and vfeat(i0)) or (x >= L - 1e-12 and vfeat(i1)))]
-        if not xs:
-            continue
-        grp = ("E", e[0], er, ec, round(th, 9)) if interior else ("P", ta if th < 0.5 * th_ab else tb)
-        for x in xs:
-            u = v0 + x * dh
-            # The feature's chord over the interval lies in the core on the line, so the lift is no deeper than its
-            # point over u; at an end, where the line can only touch the core, that point is the lift (a tangent
-            # lift that rounding made miss, or carried past the chord, is the chord's point).
-            lo, hi, k_lo, k_hi = iv
-            k = k_lo if x == lo else k_hi if x == hi else k_lo + ((x - lo) / (hi - lo)) * (k_hi - k_lo)
-            tt = float(nst @ (k - u))
-            hit = core.lift(u, nst)
-            if hit is not None and hit[1] <= tt + LIFT_SLACK:
-                tt = hit[1]
-            if tt > D:
-                continue
-            out.append(Row(u, u + tt * nst, nst.copy(), tt, ("E", e[0], er, ec, round(x / L, 6)), group=grp))
+        v = hf.V(r, c)
+        out.extend(
+            _crease_rows(
+                core,
+                D,
+                band,
+                size,
+                v,
+                v - np.array([0.0, 0.0, WALL_DEPTH]),
+                WALL_NORMALS[sides[0]],
+                WALL_NORMALS[sides[1]],
+                lambda j, r=r, c=c: j == 0 and vfeat((r, c)),
+                ("L", r, c),
+                (("W", sides[0]), ("W", sides[1])),
+                one_sided=True,
+                stats=stats,
+            )
+        )
     # ---- vertex features -------------------------------------------------------------------------------------
     for r, c in verts:
         ring = hf.ring(r, c)
-        if ring is None:
-            continue
         if not hf.vertex_feature(r, c):
             continue
-        inc = hf.incident_triangles(r, c)
-        normals = [hf.plane(t)[0] for t in inc]
         v = hf.V(r, c)
-        W = [hf.V(rr, cc) - v for rr, cc in ring]
+        if ring is None:
+            # a border vertex: its triangles and walls, its ring in the grid and the wall below it
+            inc = hf.incident_in_grid(r, c)
+            normals = [hf.plane(t)[0] for t in inc]
+            W = [hf.V(rr, cc) - v for rr, cc in hf.border_ring(r, c)] + [np.array([0.0, 0.0, -1.0])]
+        else:
+            inc = hf.incident_triangles(r, c)
+            normals = [hf.plane(t)[0] for t in inc]
+            W = [hf.V(rr, cc) - v for rr, cc in ring]
         if stats:
             stats.vertex_solves += 1
         res = _nearest(core, v)
@@ -1991,6 +2539,8 @@ def solid_law(hf, core, D, window, *, stats=None, flat_band=None):
 def _nearest(core, v):
     """(n, k, d): the direction from v to the core's nearest point k and the distance d, or, with v inside the
     core, the direction that expels v fastest with d = -depth."""
+    if core.kind == "barrel":
+        return core.nearest(v)
     kc = _closest_point(core, v)
     if kc is not None:
         w = kc - v

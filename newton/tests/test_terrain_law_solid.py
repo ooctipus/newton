@@ -31,7 +31,13 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.geometry import terrain_law_box, terrain_law_cylinder, terrain_law_hull, terrain_law_solid
+from newton._src.geometry import (
+    terrain_law_barrel,
+    terrain_law_box,
+    terrain_law_cylinder,
+    terrain_law_hull,
+    terrain_law_solid,
+)
 from newton._src.geometry.terrain_contacts import (
     TERRAIN_LANE_THREAD,
     TERRAIN_LANE_TILE,
@@ -43,6 +49,8 @@ from newton._src.geometry.terrain_contacts import (
     TerrainFeatures,
 )
 from newton._src.geometry.terrain_law import (
+    TERRAIN_FEATURE_EDGE,
+    TERRAIN_FEATURE_FACE,
     TERRAIN_FEATURE_RECOVERY,
     TERRAIN_FINISH_MASK_ROWS,
     TERRAIN_PAIR_CANDIDATE_OVERFLOW,
@@ -54,7 +62,6 @@ from newton._src.geometry.terrain_law import (
     TERRAIN_PAIR_ROW_OVERFLOW,
     TERRAIN_PAIR_STALE,
     TERRAIN_PAIR_TILE_EXIT,
-    TERRAIN_PAIR_UNSUPPORTED,
     TERRAIN_PAIR_WIDE,
     TERRAIN_STATUS_JOBS,
     TerrainFeatureData,
@@ -234,17 +241,64 @@ def _candidate_lists(rng, count):
     return lists
 
 
+def _chain_lists(rng, count, eps):
+    """Candidate lists whose merge and plane groups only candidate order decides: chains of rows each coinciding with
+    the next but not with the one after (0.55 merge tolerances apart, ``4 eps``) and chains of rows each on the next
+    one's plane but not on the one after's (normals 0.55 group tolerances apart), on and around a plane group of
+    corners, edge and inner rows, in random order. Returns ``(rows, prefix)`` per list, every row its own."""
+    step = 0.55 * 4.0 * eps
+    lists = []
+    for _i in range(count):
+        rows = []
+        normal = rng.normal(size=3) * np.array([0.3, 0.3, 1.0])
+        normal[2] = abs(normal[2]) + 0.5
+        normal /= np.linalg.norm(normal)
+        e1 = np.cross(normal, [1.0, 0.0, 0.0])
+        e1 /= np.linalg.norm(e1)
+        e2 = np.cross(normal, e1)
+        origin = rng.uniform(-0.05, 0.05, size=3)
+        tilt = rng.uniform(-0.05, 0.05, size=2) * rng.choice([0.0, 1.0])
+
+        def depth(u, v, tilt=tilt):
+            return 0.01 + tilt[0] * u + tilt[1] * v + rng.choice([0.0, 0.0, rng.uniform(-0.002, 0.004)])
+
+        for _j in range(int(rng.integers(3, 9))):
+            u, v = rng.uniform(-0.02, 0.02, size=2)
+            rows.append((origin + u * e1 + v * e2, normal, depth(u, v)))
+        for _chain in range(int(rng.integers(1, 3))):
+            # a merge chain on the group's plane
+            u, v = rng.uniform(-0.02, 0.02, size=2)
+            angle = rng.uniform(0.0, 2.0 * np.pi)
+            direction = np.cos(angle) * e1 + np.sin(angle) * e2
+            dist = depth(u, v)
+            for j in range(int(rng.integers(3, 6))):
+                rows.append((origin + u * e1 + v * e2 + j * step * direction, normal, dist))
+        for _chain in range(int(rng.integers(1, 3))):
+            # a plane chain: normals turned 0.55 group tolerances a row, positions within 2 cm (offsets of a few
+            # tenths of a band from each other's planes)
+            axis = e1 if rng.uniform() < 0.5 else e2
+            for j in range(int(rng.integers(3, 6))):
+                nj = normal + j * 0.55e-5 * axis
+                nj /= np.linalg.norm(nj)
+                u, v = rng.uniform(-0.01, 0.01, size=2)
+                rows.append((origin + u * e1 + v * e2, nj, depth(u, v)))
+        order = rng.permutation(len(rows))
+        rows = [rows[k] for k in order][:TERRAIN_FINISH_MASK_ROWS]
+        lists.append((rows, len(rows)))
+    return lists
+
+
 def test_finish_in_place_equals_finish(test, device):
     """Keep the same rows, bit for bit, with the finish in a walk's slots as with the finish on a scratch (the finish
     of deferred pairs), and finish any number of candidates there.
 
-    Lists with coincident rows, several plane groups, implied rows and groups of more than four rows; lists of more
-    rows than the in-place finish's masks hold (:data:`TERRAIN_FINISH_MASK_ROWS`) are copies of a shorter list, whose
-    copies merge into their first occurrence: the scratch finish keeps the rows the in-place finish keeps of the
-    shorter list.
+    Lists with coincident rows, several plane groups, implied rows and groups of more than four rows, and lists whose
+    merge and plane groups only candidate order decides (:func:`_chain_lists`); lists of more rows than the in-place
+    finish's masks hold (:data:`TERRAIN_FINISH_MASK_ROWS`) are copies of a shorter list, whose copies merge into their
+    first occurrence: the scratch finish keeps the rows the in-place finish keeps of the shorter list.
     """
     rng = np.random.default_rng(31)
-    lists = _candidate_lists(rng, 400)
+    lists = _candidate_lists(rng, 400) + _chain_lists(rng, 200, 8.0 * 1.1920928955078125e-7 * 0.2)
     q = np.zeros((len(lists) * 40, 3), np.float32)
     n = np.zeros((len(lists) * 40, 3), np.float32)
     d = np.zeros(len(lists) * 40, np.float32)
@@ -395,7 +449,8 @@ def _finish_lanes(
         for j in range(count):
             one_lane[i, j] = scratch.mark[block + j]
         one_lane[i, 40] = kept
-    # the first lane runs every step but the implied-row tests: the others wait for its writes
+    # the lanes split every step: they start after the first lane's reads (a block barrier)
+    wp.tile_extract(wp.tile_max(wp.tile(0)), 0)
     kept = terrain_finish_list(scratch, block, count, eps[i], lane, wp.block_dim())
     if lane == 0:
         for j in range(count):
@@ -447,15 +502,20 @@ def _large_group_lists(rng, count):
 
 
 def test_finish_lanes_keep_one_lanes_rows(test, device):
-    """Keep the same rows, bit for bit, with a block's lanes splitting the finish's implied-row tests as with one lane
-    taking them all (the finish of deferred pairs, on a scratch): the lanes OR their shares, each test the same float32
-    operations.
+    """Keep the same rows, bit for bit, with a block's lanes splitting every step of the finish as with one lane taking
+    them all (the finish of deferred pairs, on a scratch): the merge, the plane groups, the implied-row tests and the
+    groups' ranks, each test the same float32 operations, the lanes' answers combined across the block.
 
-    The candidate lists of :func:`test_finish_in_place_equals_finish` and lists dominated by one plane group of 9-24
-    rows, whose implied-row tests cost the most. On the CPU a block is one lane.
+    The candidate lists of :func:`test_finish_in_place_equals_finish` (with the chains only candidate order decides,
+    which the first lane decides) and lists dominated by one plane group of 9-24 rows, whose implied-row tests cost the
+    most. On the CPU a block is one lane.
     """
     rng = np.random.default_rng(47)
-    lists = _candidate_lists(rng, 300) + _large_group_lists(rng, 300)
+    lists = (
+        _candidate_lists(rng, 300)
+        + _chain_lists(rng, 300, 8.0 * 1.1920928955078125e-7 * 0.2)
+        + _large_group_lists(rng, 300)
+    )
     q = np.zeros((len(lists) * 40, 3), np.float32)
     n = np.zeros((len(lists) * 40, 3), np.float32)
     d = np.zeros(len(lists) * 40, np.float32)
@@ -1338,6 +1398,312 @@ def test_solid_rows_match_the_float64_law(test, device):
 
 
 # ----------------------------------------------------------------------------------------------------------------
+# the border
+# ----------------------------------------------------------------------------------------------------------------
+
+
+def test_solid_rows_match_the_float64_law_at_the_border(test, device):
+    """Reproduce the float64 law's rows at the heightfield's border in float32 for every solid kind.
+
+    Boxes, cylinders, cones, ellipsoids and hulls in any orientation within 8 cm of a wall's plane or a corner of flat,
+    rough and sloped tiles, their lowest point up to 3 cm into the top: the faces clipped to the footprint, the walls,
+    the border edges and vertices and the corner lines give the float64 law's rows. No float64 row is missed and no
+    float32 row is extra but those the other side's rows imply or carry (the same plane and depth: a single clipped
+    point's place along its edge is ill-conditioned; at most 2% of the rows); every pair's deepest row agrees within
+    10 um, and every penetrating row's core point lies inside the block.
+    """
+    rng = np.random.default_rng(37)
+    kinds = [kind for kind in _solid_kinds(rng) if kind[1] is not TOE]
+    totals = {"f64": 0, "carried": 0}
+    defects = []
+    for name, heights in tu.border_terrains(rng).items():
+        with test.subTest(terrain=name):
+            hf = tu.reference_surface(tu.heightfield_model(heights, 1.0, 1.0, device="cpu"))
+            bodies = tu.border_bodies(rng, hf, kinds, 8)
+            model, _hfield, shapes = su.solid_scene(heights, 1.0, 1.0, bodies, device=device)
+            pipeline, _contacts, _state = _collide(model, shadow=True)
+            rows = tu.shadow_rows(pipeline)
+            for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
+                law = su.law_rows(hf, kind, dims, pose)
+                got = rows.get(shape, [])
+                missing, extra, deepest = su.compare_solid_rows(law, got)
+                carried = [m for m in missing if tu.carries_half_space(m, got)]
+                carried += [e for e in extra if tu.carries_half_space(e, law)]
+                totals["f64"] += len(law)
+                totals["carried"] += len(carried)
+                if len(missing) + len(extra) > len(carried) or deepest > 1.0e-5 or tu.outside_face_rows(hf, got):
+                    defects.append((name, kind, pose.tolist(), [repr(m) for m in missing], extra, deepest))
+    test.assertEqual(defects, [])
+    test.assertGreater(totals["f64"], 100)
+    test.assertLessEqual(totals["carried"], 0.02 * totals["f64"], msg=totals)
+
+
+def test_clip_rows_are_front_facing(test, device):
+    """Keep a face's clipped rows to points inside the solid, as its supported points are.
+
+    An ellipsoid buried under a ridge of a sawtooth terrain (56 deg faces), straddling the border's edge: the core's
+    part inside the footprint on a border edge's clip plane lies below each face's plane, but above the surface, under
+    the other face; the clipped rows (7.8 and 4.4 cm deep along the faces' normals before the test) would push it out
+    of the ridge's faces it does not penetrate there. The border edge's crease row remains, the float64 law's.
+    """
+    x = np.linspace(-1.6, 1.6, 33)
+    heights = np.tile(np.abs(((x + 1.6) % 0.2) - 0.1) * 1.5, (33, 1))
+    hf = tu.reference_surface(tu.heightfield_model(heights, 1.6, 1.6, device="cpu"))
+    quat = [0.4019, -0.4489, -0.7217, -0.3407]
+    bodies = [("ellipsoid", ELLIPSOID, _f32_pose([0.992, y, 0.1397, *quat])) for y in (1.6, 1.62)]
+    model, _hfield, shapes = su.solid_scene(heights, 1.6, 1.6, bodies, device=device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    rows = tu.shadow_rows(pipeline)
+    for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
+        with test.subTest(y=float(pose[1])):
+            got = rows.get(shape, [])
+            law = su.law_rows(hf, kind, dims, pose)
+            test.assertEqual(len(got), 1)
+            test.assertEqual(su.compare_solid_rows(law, got)[:2], ([], []))
+            test.assertEqual(tu.outside_face_rows(hf, got), [])
+            test.assertEqual((got[0][3] >> 5) & 3, int(TERRAIN_FEATURE_EDGE))
+
+
+def _feature_parts(feature):
+    """A feature id's ``(r mod 64, c mod 64, kind, sub-feature, point slot)``."""
+    return (feature >> 13) & 63, (feature >> 7) & 63, (feature >> 5) & 3, (feature >> 3) & 3, feature & 7
+
+
+def test_border_rows_carry_their_feature_codes(test, device):
+    """Give the border's rows their feature ids: walls and clipped faces under the face kind, corner lines under the
+    edge kind, each row of a pair distinct.
+
+    On a flat unit heightfield of 0.1 m cells: a level box beside the wall ``x = 1`` gets its face's four corners on the
+    wall (the face kind, sub-feature ``TERRAIN_FACE_WALL + 1``, the wall of a y-edge, slots 0-3); a box beside a
+    corner's line, two rows on it (the edge kind, sub-feature ``TERRAIN_EDGE_CORNER``); a box tilted over the wall's
+    edge, the top face clipped at the wall (sub-feature ``TERRAIN_FACE_WALL + 1``, the crossing's ends in slots 4 and 5,
+    each from the edge it lies on) and the border edges' crease rows (the edge kind, the y-edges); a level box over the
+    corner, 1 cm deep, the top face's row inside (sub-feature 0 or 1) and the clipped row at the corner vertex.
+    """
+    level = np.array([0.0, 0.0, 0.0, 1.0])
+    tilted = np.array([0.0, np.sin(np.pi / 8.0), 0.0, np.cos(np.pi / 8.0)])
+    bodies = [
+        ("box", {"half": (0.05, 0.05, 0.05)}, _f32_pose(np.r_[1.055, 0.33, -0.1, level])),
+        ("box", {"half": (0.05, 0.05, 0.05)}, _f32_pose(np.r_[1.055, 1.055, -0.1, level])),
+        ("box", {"half": (0.2, 0.05, 0.05)}, _f32_pose(np.r_[0.95, -0.33, 0.11, tilted])),
+        ("box", {"half": (0.1, 0.1, 0.05)}, _f32_pose(np.r_[1.0, 1.0, 0.04, level])),
+    ]
+    model, _hfield, shapes = su.solid_scene(np.zeros((21, 21)), 1.0, 1.0, bodies, device=device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    rows = tu.shadow_rows(pipeline)
+    wall, corner, hanging, over = (rows.get(shape, []) for shape in shapes)
+    face, edge = int(TERRAIN_FEATURE_FACE), int(TERRAIN_FEATURE_EDGE)
+    test.assertEqual(sorted(_feature_parts(f)[2:] for _q, _n, _d, f in wall), [(face, 3, j) for j in range(4)])
+    test.assertEqual(sorted(_feature_parts(f)[2:4] for _q, _n, _d, f in corner), [(edge, 3)] * 2)
+    clipped = sorted(_feature_parts(f)[2:] for _q, n, _d, f in hanging if n[2] > 0.999)
+    test.assertEqual(clipped, [(face, 3, 4), (face, 3, 5)])
+    creases = sorted(_feature_parts(f)[2:4] for _q, n, _d, f in hanging if n[2] < 0.999)
+    test.assertEqual(creases, [(edge, 1)] * 2)
+    inside = [_feature_parts(f) for q, _n, _d, f in over if np.allclose(q[:2], (0.9, 0.9), atol=1.0e-5)]
+    test.assertEqual([p[2:4] in ((face, 0), (face, 1)) for p in inside], [True])
+    at_corner = [_feature_parts(f) for q, _n, _d, f in over if np.allclose(q[:2], (1.0, 1.0), atol=1.0e-5)]
+    test.assertEqual([p[2] == face and p[3] >= 2 and p[4] >= 4 for p in at_corner], [True])
+    for name, got in (("wall", wall), ("corner", corner), ("hanging", hanging), ("over", over)):
+        features = [f for _q, _n, _d, f in got]
+        test.assertEqual(len(set(features)), len(features), msg=name)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# barrel cylinders and finite planes
+# ----------------------------------------------------------------------------------------------------------------
+
+BARRELS = (
+    {"radius": 0.04, "half_height": 0.05, "barrel": 0.12},
+    {"radius": 0.03, "half_height": 0.06, "barrel": 0.06},
+    {"radius": 0.05, "half_height": 0.03, "barrel": 2.0},
+)
+"""Barrel cylinders: a bulging one, one whose side is a half circle (``R = h``), a nearly straight one."""
+PLATE = {"size": (0.16, 0.1)}
+"""A finite plane, 16 cm by 10 cm (a box of half that width and length and no thickness)."""
+
+
+def _barrel_kinds():
+    return [("barrel", dims) for dims in BARRELS] + [("plane", PLATE)]
+
+
+def _free_poses(rng, hf, kinds, count):
+    """Random poses over the footprint, any orientation, the lowest point 3 cm into to 12 mm above the terrain under
+    the body."""
+    bodies = []
+    for i in range(count * len(kinds)):
+        kind, dims = kinds[i % len(kinds)]
+        x, y = rng.uniform(-0.8, 0.8, 2)
+        q = _random_quat(rng)
+        lo, hi = ref.make_core(kind, dims, np.r_[x, y, 0.0, q]).aabb()
+        top = max(hf.height(xx, yy) for xx in np.linspace(lo[0], hi[0], 7) for yy in np.linspace(lo[1], hi[1], 7))
+        bodies.append((kind, dims, _f32_pose(np.r_[x, y, top - lo[2] + rng.uniform(-0.03, 0.012), q])))
+    return bodies
+
+
+def test_barrels_and_planes_match_the_float64_law(test, device):
+    """Reproduce the float64 law's rows of barrel cylinders and finite planes in float32.
+
+    Barrels of three profiles and a plate in any orientation over flat, rough and sloped tiles, over the footprint and
+    at its border, the lowest point up to 3 cm into the terrain: no float64 row is missed and no float32 row is extra
+    but those the other side implies, every pair's deepest row agrees within 10 um, and every penetrating face row's
+    core point lies inside the block.
+    """
+    rng = np.random.default_rng(43)
+    kinds = _barrel_kinds()
+    defects, total = [], 0
+    for name, heights in tu.border_terrains(rng).items():
+        hf = tu.reference_surface(tu.heightfield_model(heights, 1.0, 1.0, device="cpu"))
+        bodies = _free_poses(rng, hf, kinds, 6) + tu.border_bodies(rng, hf, kinds, 4)
+        model, _hfield, shapes = su.solid_scene(heights, 1.0, 1.0, bodies, device=device)
+        pipeline, _contacts, _state = _collide(model, shadow=True)
+        rows = tu.shadow_rows(pipeline)
+        for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
+            law = su.law_rows(hf, kind, dims, pose)
+            got = rows.get(shape, [])
+            missing, extra, deepest = su.compare_solid_rows(law, got)
+            total += len(law)
+            if missing or extra or deepest > 1.0e-5 or tu.outside_face_rows(hf, got):
+                defects.append((name, kind, pose.tolist(), [repr(m) for m in missing], extra, deepest))
+    test.assertEqual(defects, [])
+    test.assertGreater(total, 100)
+
+
+def test_barrels_follow_exact_geometry(test, device):
+    """Give every barrel cylinder within reach a deepest row equal to its exact separation (as deep as its deepest
+    point when penetrating) and every normal inside the surface's normal cone (check_solid), on rough, pitted and
+    stepped terrain, half of them in any orientation, half tilted 2, 10 or 30 deg."""
+    rng = np.random.default_rng(5)
+    for name, heights in _rough_terrains(rng).items():
+        with test.subTest(terrain=name):
+            hf = tu.reference_surface(tu.heightfield_model(heights, 1.6, 1.6, device="cpu"))
+            bodies = []
+            for dims in BARRELS:
+                for i in range(6):
+                    x, y = rng.uniform(-1.1, 1.1, 2)
+                    q = _random_quat(rng, None if i % 2 else np.radians(rng.choice([2.0, 10.0, 30.0])))
+                    lo, hi = ref.make_core("barrel", dims, np.r_[x, y, 0.0, q]).aabb()
+                    z = _top_under(hf, lo, hi) - lo[2] + rng.uniform(-0.005, 0.025)
+                    bodies.append(("barrel", dims, _f32_pose(np.r_[x, y, z, q])))
+            model, _hfield, shapes = su.solid_scene(heights, 1.6, 1.6, bodies, device=device)
+            pipeline, _contacts, _state = _collide(model, shadow=True)
+            incomplete, ghosts = _exact_violations(hf, tu.shadow_rows(pipeline), shapes, bodies)
+            test.assertEqual(incomplete, [])
+            test.assertEqual(ghosts, [])
+
+
+def _flat_rows(device, bodies):
+    """The shadow rows of bodies over a flat unit heightfield of 0.1 m cells, per body."""
+    model, _hfield, shapes = su.solid_scene(np.zeros((21, 21)), 1.0, 1.0, bodies, device=device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    rows = tu.shadow_rows(pipeline)
+    return [rows.get(shape, []) for shape in shapes]
+
+
+def test_barrel_rows_follow_its_profile(test, device):
+    """Give a barrel cylinder on flat ground the rows of its own shape, 2 mm into it.
+
+    Lying on its side: one row at its side's lowest point, the bulge (a curved side has no rolling points). Upright:
+    the cylinder's tripod on its cap. Tilted 80 deg: one row at its lowest point on the side, Newton's support point.
+    """
+    dims = BARRELS[0]
+    core = ref.make_core("barrel", dims, np.r_[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+    bulge = core.rho(0.0)
+    tilted = _axis_angle((1.0, 0.0, 0.0), np.radians(80.0))
+    lowest = ref.make_core("barrel", dims, np.r_[0.0, 0.0, 0.0, tilted]).lowest(np.array([0.0, 0.0, 1.0]))
+    bodies = [
+        ("barrel", dims, _f32_pose(np.r_[0.33, 0.37, bulge - 0.002, LYING])),
+        ("barrel", dims, _f32_pose(np.r_[-0.33, 0.37, dims["half_height"] - 0.002, 0.0, 0.0, 0.0, 1.0])),
+        ("barrel", dims, _f32_pose(np.r_[0.33, -0.37, -lowest[2] - 0.002, tilted])),
+    ]
+    lying, upright, tilt = _flat_rows(device, bodies)
+    up = np.array([0.0, 0.0, 1.0])
+    expected = {
+        "lying": [(np.array([0.33, 0.37, 0.0]), up, -0.002)],
+        "tilted": [(np.array([0.33 + lowest[0], -0.37 + lowest[1], 0.0]), up, -0.002)],
+    }
+    for name, got in (("lying", lying), ("tilted", tilt)):
+        with test.subTest(pose=name):
+            test.assertEqual(len(got), 1, msg=got)
+            test.assertEqual(tu.missing_rows(expected[name], got, q_tol=1.0e-5, angle_tol=1.0e-5, d_tol=1.0e-6), [])
+    with test.subTest(pose="upright"):
+        test.assertEqual(len(upright), 3, msg=upright)
+        for q, n, d, _f in upright:
+            test.assertAlmostEqual(d, -0.002, delta=1.0e-6)
+            test.assertLess(tu.angle_between(n, up), 1.0e-5)
+            test.assertAlmostEqual(float(np.hypot(q[0] + 0.33, q[1] - 0.37)), dims["radius"], delta=1.0e-5)
+
+
+def test_barrel_kernels_only_with_a_barrel(test, device):
+    """Take the cylinder class's barrel kernels only for a table that holds a barrel cylinder, and give flat-sided
+    cylinders and cones the same rows from both kernel sets, bit for bit.
+
+    The class's own kernels set every barrel radius to a literal 0, so that the compiler drops the core functions'
+    barrel paths; with a barrel among its partners the class takes :mod:`terrain_law_barrel`'s for every pair. Cylinders
+    and cones of random poses over rough terrain, with and without a barrel beside them.
+    """
+    rng = np.random.default_rng(29)
+    heights = np.round(rng.uniform(0.0, 0.06, size=(31, 31)) / 0.005) * 0.005
+    hf = tu.reference_surface(tu.heightfield_model(heights, 1.5, 1.5, device="cpu"))
+    kinds = [("cylinder", CYLINDER), ("cone", CONE)]
+    bodies = _free_poses(rng, hf, kinds, 12)
+    barrel = [("barrel", BARRELS[0], _f32_pose(np.r_[1.2, 1.2, 0.2, 0.0, 0.0, 0.0, 1.0]))]
+    rows, names = [], []
+    for scene in (bodies, bodies + barrel):
+        model, _hfield, shapes = su.solid_scene(heights, 1.5, 1.5, scene, device=device)
+        pipeline, _contacts, _state = _collide(model, shadow=True)
+        shadow = pipeline._terrain_law_shadow
+        names.append({launch[1].key.split("_rows")[0] for launch in shadow._launches if "_rows" in launch[1].key})
+        got = tu.shadow_rows(pipeline)
+        rows.append([got.get(shape, []) for shape in shapes[: len(bodies)]])
+    test.assertIn("terrain_cylinder", names[0])
+    test.assertNotIn("terrain_barrel", names[0])
+    test.assertIn("terrain_barrel", names[1])
+    test.assertNotIn("terrain_cylinder", names[1])
+    total = 0
+    for i, (plain, with_barrel) in enumerate(zip(rows[0], rows[1], strict=True)):
+        test.assertEqual(len(plain), len(with_barrel), msg=f"body {i}")
+        for (qa, na, da, fa), (qb, nb, db, fb) in zip(plain, with_barrel, strict=True):
+            bits_a = np.float32(qa).tobytes() + np.float32(na).tobytes() + np.float32(da).tobytes()
+            bits_b = np.float32(qb).tobytes() + np.float32(nb).tobytes() + np.float32(db).tobytes()
+            test.assertEqual((bits_a, fa), (bits_b, fb), msg=f"body {i}")
+        total += len(plain)
+    test.assertGreater(total, 20)
+
+
+def test_finite_planes_rest_as_boxes_without_thickness(test, device):
+    """Give a finite plane on a body the rows of a box of its width and length and no thickness.
+
+    Level and 2 mm into flat ground: its four corners (half its width and length about its centre). Tilted 20 deg about
+    its length: the two corners of its lower edge. Over the border's edge: its corners over the footprint and its
+    rectangle clipped at the edge.
+    """
+    half = np.array(PLATE["size"]) / 2.0
+    tilt = _axis_angle((0.0, 1.0, 0.0), np.radians(20.0))
+    drop = half[0] * np.sin(np.radians(20.0))
+    level = np.array([0.0, 0.0, 0.0, 1.0])
+    bodies = [
+        ("plane", PLATE, _f32_pose(np.r_[0.33, 0.37, -0.002, level])),
+        ("plane", PLATE, _f32_pose(np.r_[-0.33, 0.37, drop - 0.002, tilt])),
+        ("plane", PLATE, _f32_pose(np.r_[1.0, -0.37, -0.002, level])),
+    ]
+    flat, tilted, border = _flat_rows(device, bodies)
+    up = np.array([0.0, 0.0, 1.0])
+
+    def corners(cx, cy, xs, ys):
+        return [(np.array([cx + x, cy + y, 0.0]), up, -0.002) for x in xs for y in ys]
+
+    cases = (
+        ("level", flat, corners(0.33, 0.37, (-half[0], half[0]), (-half[1], half[1]))),
+        ("tilted", tilted, corners(-0.33 + half[0] * np.cos(np.radians(20.0)), 0.37, (0.0,), (-half[1], half[1]))),
+        ("border", border, corners(1.0, -0.37, (-half[0], 0.0), (-half[1], half[1]))),
+    )
+    for name, got, want in cases:
+        with test.subTest(pose=name):
+            test.assertEqual(len(got), len(want), msg=got)
+            test.assertEqual(tu.missing_rows(want, got, q_tol=1.0e-5, angle_tol=1.0e-5, d_tol=2.0e-6), [])
+
+
+# ----------------------------------------------------------------------------------------------------------------
 # the job pipeline, row overflow, unsupported shapes and the shadow
 # ----------------------------------------------------------------------------------------------------------------
 
@@ -1418,13 +1784,7 @@ _SOLID_MODULES = {
     TERRAIN_PARTNER_CYLINDER: (terrain_law_cylinder, "cylinder"),
     TERRAIN_PARTNER_HULL: (terrain_law_hull, "hull"),
 }
-_WHOLE_PAIR_EXITS = int(
-    TERRAIN_PAIR_TILE_EXIT
-    | TERRAIN_PAIR_STALE
-    | TERRAIN_PAIR_FILTERED
-    | TERRAIN_PAIR_OUTSIDE
-    | TERRAIN_PAIR_UNSUPPORTED
-)
+_WHOLE_PAIR_EXITS = int(TERRAIN_PAIR_TILE_EXIT | TERRAIN_PAIR_STALE | TERRAIN_PAIR_FILTERED | TERRAIN_PAIR_OUTSIDE)
 """States of a pair the whole-pair rejects take (no row)."""
 _LIST_OF_KERNEL = {
     "scan": "scans",
@@ -1432,6 +1792,7 @@ _LIST_OF_KERNEL = {
     "edges": "edges",
     "thetas": "thetas",
     "vertices": "vertices",
+    "border": "border",
     "close": "live",
     "recovery": "recover",
     "small": "small",
@@ -1467,12 +1828,13 @@ def _class_jobs(model, shadow, partner_class, *, threads=None, reserve=True, **c
         table.candidates[begin:end],
         int(TERRAIN_PARTNER_WALK_SLOTS[partner_class]),
         scan_run=run,
+        sides=table.sides[begin:end],
     )
     sizes.update(capacities)
     reserves = None
     if reserve:
         reserves = terrain_law_solid.terrain_solid_job_reserves(
-            table.vertices[begin:end], table.candidates[begin:end], scan_run=run
+            table.vertices[begin:end], table.candidates[begin:end], scan_run=run, sides=table.sides[begin:end]
         )
     jobs = terrain_law_solid.terrain_solid_jobs(model.device, partner_class, begin, end - begin, sizes, reserves)
     if threads is not None:
@@ -1561,7 +1923,12 @@ def _run_class(
             dim = jobs.finish_blocks + extra_blocks
             wp.launch_tiled(kernel, dim=dim, inputs=[*args, jobs, solids], block_dim=block, device=device)
         else:
-            dim = {"pairs": end - begin, "jobs": jobs.threads, "pair_jobs": jobs.pair_threads}[kind]
+            dim = {
+                "pairs": end - begin,
+                "jobs": jobs.threads,
+                "border_jobs": jobs.border_threads,
+                "pair_jobs": jobs.pair_threads,
+            }[kind]
             if kind != "pairs":
                 dim += extra_threads
             wp.launch(kernel, dim=dim, inputs=[*args, jobs, solids], block_dim=block, device=device)
@@ -1664,11 +2031,13 @@ def test_job_lists_hold_each_run_together(test, device):
         with test.subTest(partner_class=partner_class):
             _out, jobs, _solids = _run_class(pipeline, model, partner_class, until="close")
             counts = _counts(jobs)
+            per_vertex = terrain_law_solid.TERRAIN_SOLID_ITEMS
             lists = {
-                # a scan run: its pair's window vertices [k, k + 1) times the run length (six items per vertex)
-                "faces": lambda pair, item, scan=scan: (pair, item // 6 // scan),
-                "edges": lambda pair, item, scan=scan: (pair, item // 6 // scan),
-                "vertices": lambda pair, item, scan=scan: (pair, item // 6 // scan),
+                # a scan run: its pair's window vertices [k, k + 1) times the run length (TERRAIN_SOLID_ITEMS items per
+                # vertex)
+                "faces": lambda pair, item, scan=scan, per_vertex=per_vertex: (pair, item // per_vertex // scan),
+                "edges": lambda pair, item, scan=scan, per_vertex=per_vertex: (pair, item // per_vertex // scan),
+                "vertices": lambda pair, item, scan=scan, per_vertex=per_vertex: (pair, item // per_vertex // scan),
             }
             for name, run_of in lists.items():
                 entries = getattr(jobs, name).numpy()[: counts[name]]
@@ -2150,6 +2519,7 @@ def test_solid_launches_take_fixed_grids(test, device):
             record = shapes[name]
             test.assertEqual(record["pair_dim"], end - begin)
             test.assertEqual(record["job_threads"], jobs.threads)
+            test.assertEqual(record["border_threads"], jobs.border_threads)
             test.assertEqual(record["pair_job_threads"], min(jobs.threads, end - begin))
             test.assertEqual(record["finish_blocks"], jobs.finish_blocks)
             test.assertLessEqual(jobs.finish_blocks, end - begin)
@@ -2158,6 +2528,7 @@ def test_solid_launches_take_fixed_grids(test, device):
                 dim = {
                     "pairs": ("launch", end - begin),
                     "jobs": ("launch", jobs.threads),
+                    "border_jobs": ("launch", jobs.border_threads),
                     "pair_jobs": ("launch", jobs.pair_threads),
                     "pair_tiles": ("tiled", jobs.finish_blocks),
                     "deferred": ("tiled", record["deferred_blocks"]),
@@ -2418,20 +2789,6 @@ class TestTerrainLawSolid(unittest.TestCase):
         self.assertGreater(found["g_thin incomplete"], 5, msg=found)
         self.assertGreater(found["c_crease20 incomplete"] + found["c_crease20 ghosts"], 5, msg=found)
 
-    def test_barrel_cylinders_are_left_out_cpu(self):
-        """Give a barrel cylinder (a hull-class shape with no core in the law yet) no row and say why."""
-        builder = newton.ModelBuilder()
-        cfg = builder.ShapeConfig(margin=su.MARGIN, gap=su.GAP)
-        terrain = newton.Heightfield(data=np.zeros((9, 9), np.float32), nrow=9, ncol=9, hx=0.4, hy=0.4)
-        builder.add_shape_heightfield(heightfield=terrain, cfg=cfg)
-        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05)))
-        builder.add_shape(body=body, type=newton.GeoType.CYLINDER, scale=wp.vec3(0.03, 0.04, 0.2), cfg=cfg)
-        model = builder.finalize(device="cpu")
-        pipeline, _contacts, _state = _collide(model, shadow=True)
-        rows = pipeline._terrain_law_shadow.rows()
-        self.assertEqual(int(rows["count"][0]), 0)
-        self.assertEqual(int(rows["state"][0]), int(TERRAIN_PAIR_UNSUPPORTED))
-
     def test_solid_kernels_compile_without_contraction_cpu(self):
         """Compile the solid classes' kernels to PTX without fused multiply-adds (NVRTC, any host).
 
@@ -2439,7 +2796,7 @@ class TestTerrainLawSolid(unittest.TestCase):
         """
         if 86 not in wp.get_cuda_supported_archs():
             self.skipTest("NVRTC cannot compile for sm_86 here")
-        for module in (terrain_law_box, terrain_law_cylinder, terrain_law_hull):
+        for module in (terrain_law_barrel, terrain_law_box, terrain_law_cylinder, terrain_law_hull):
             with self.subTest(module=module.__name__), tempfile.TemporaryDirectory() as directory:
                 wp.compile_aot_module(module, arch=86, module_dir=directory, use_ptx=True)
                 paths = glob.glob(os.path.join(directory, "*.ptx"))
@@ -2470,6 +2827,14 @@ for _name, _func in (
     ("test_hovering_core_leaves_at_the_fine_mip", test_hovering_core_leaves_at_the_fine_mip),
     ("test_recovery_picks_follow_depth_then_index", test_recovery_picks_follow_depth_then_index),
     ("test_solid_rows_match_the_float64_law", test_solid_rows_match_the_float64_law),
+    ("test_solid_rows_match_the_float64_law_at_the_border", test_solid_rows_match_the_float64_law_at_the_border),
+    ("test_clip_rows_are_front_facing", test_clip_rows_are_front_facing),
+    ("test_border_rows_carry_their_feature_codes", test_border_rows_carry_their_feature_codes),
+    ("test_barrels_and_planes_match_the_float64_law", test_barrels_and_planes_match_the_float64_law),
+    ("test_barrels_follow_exact_geometry", test_barrels_follow_exact_geometry),
+    ("test_barrel_rows_follow_its_profile", test_barrel_rows_follow_its_profile),
+    ("test_barrel_kernels_only_with_a_barrel", test_barrel_kernels_only_with_a_barrel),
+    ("test_finite_planes_rest_as_boxes_without_thickness", test_finite_planes_rest_as_boxes_without_thickness),
     ("test_job_pipeline_rows_depend_on_the_pair_alone", test_job_pipeline_rows_depend_on_the_pair_alone),
     ("test_job_lists_hold_each_run_together", test_job_lists_hold_each_run_together),
     ("test_slope_resting_solids_keep_their_sink", test_slope_resting_solids_keep_their_sink),

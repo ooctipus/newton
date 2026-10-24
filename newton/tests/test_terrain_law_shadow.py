@@ -765,7 +765,7 @@ class TestTerrainLawShadow(unittest.TestCase):
 
     def test_route_record_of_solid_classes_cpu(self):
         """Record the solid classes' pairs per lane class, launches, data, job scale, kernel grids, job capacities and
-        reserves and coreless pairs: one block size, one thread per pair for the whole-pair rejects, the job threads for
+        reserves (a barrel cylinder's in the cylinder class): one block size, one thread per pair for the whole-pair rejects, the job threads for
         the others, the grid of the finish of deferred pairs, and job lists and a candidate pool sized from the pairs'
         own bounds, the scan's jobs exactly, each with a reserve of the class's largest pairs' work."""
         rng = np.random.default_rng(8)
@@ -786,7 +786,7 @@ class TestTerrainLawShadow(unittest.TestCase):
         builder.add_shape_box(builder.add_body(xform=wp.transform(wp.vec3(-0.2, 0.0, 0.05))), hx=0.03, hy=0.03, hz=0.03)
         barrel = builder.add_body(xform=wp.transform(wp.vec3(0.2, 0.0, 0.05)))
         builder.add_shape(body=barrel, type=newton.GeoType.CYLINDER, scale=wp.vec3(0.03, 0.04, 0.2), cfg=cfg)
-        for scene, unsupported in ((model, 0), (builder.finalize(device="cpu"), 1)):
+        for scene in (model, builder.finalize(device="cpu")):
             pipeline = tu.shadow_pipeline(scene, classes="box,cylinder,hull", **PIPELINE)
             record = pipeline.get_collision_selection()["heightfield"]["law_shadow"]
             self.assertTrue(record["enabled"])
@@ -817,6 +817,7 @@ class TestTerrainLawShadow(unittest.TestCase):
                         table.candidates[begin:end],
                         walk,
                         scan_run=int(TERRAIN_PARTNER_SCAN_RUN[partner_class]),
+                        sides=table.sides[begin:end],
                     )
                     names = (*TERRAIN_SOLID_JOB_LISTS, "candidates", "scans")
                     self.assertEqual(sorted(capacities), sorted(names))
@@ -825,14 +826,27 @@ class TestTerrainLawShadow(unittest.TestCase):
                     scans = int(np.sum(-(-table.vertices[begin:end].astype(np.int64) // run)))
                     self.assertEqual(capacities["scans"], scans)
                     reserves = terrain_solid_job_reserves(
-                        table.vertices[begin:end], table.candidates[begin:end], scan_run=run
+                        table.vertices[begin:end],
+                        table.candidates[begin:end],
+                        scan_run=run,
+                        sides=table.sides[begin:end],
                     )
-                    # the reserve: the work of up to TERRAIN_SOLID_RESERVE_PAIRS pairs of the class's largest bounds
+                    # the reserve: the work of up to TERRAIN_SOLID_RESERVE_PAIRS pairs of the class's largest bounds,
+                    # corner lines among the edges and creases, the border's walls per scan run and border edges'
+                    # clips in its own list
                     vertices = int(table.vertices[begin:end].max())
+                    v = table.vertices[begin:end].astype(np.int64)
+                    sides = table.sides[begin:end].astype(np.int64)
                     reserve_pairs = reserves["candidates"] // candidates
                     self.assertTrue(1 <= reserve_pairs <= TERRAIN_SOLID_RESERVE_PAIRS, msg=reserves)
-                    bounds = {"faces": 2, "edges": 3, "thetas": 3, "vertices": 1}
-                    expected = {name: reserve_pairs * bound * vertices for name, bound in bounds.items()}
+                    bounds = {
+                        "faces": int(np.max(2 * v)),
+                        "edges": int(np.max(3 * v + 4)),
+                        "thetas": int(np.max(3 * v + 4)),
+                        "vertices": vertices,
+                        "border": int(np.max(4 * -(-v // run) + 2 * sides)),
+                    }
+                    expected = {name: reserve_pairs * bound for name, bound in bounds.items()}
                     expected["candidates"] = reserve_pairs * candidates
                     expected["scans"] = reserve_pairs * -(-vertices // run)
                     self.assertEqual(reserves, expected)
@@ -845,6 +859,7 @@ class TestTerrainLawShadow(unittest.TestCase):
                             "block_dim": terrain_law_block_dim("cpu"),
                             "pair_dim": count,
                             "job_threads": min(TERRAIN_SOLID_JOB_THREADS_CPU, longest),
+                            "border_threads": min(TERRAIN_SOLID_JOB_THREADS_CPU, capacities["border"]),
                             "pair_job_threads": min(TERRAIN_SOLID_JOB_THREADS_CPU, longest, count),
                             "finish_blocks": min(TERRAIN_SOLID_JOB_THREADS_CPU, count),
                             "jobs": capacities,
@@ -857,7 +872,6 @@ class TestTerrainLawShadow(unittest.TestCase):
                     )
             self.assertEqual(record["launches"], launches)
             self.assertEqual(record["job_scale"], 1.0)
-            self.assertEqual(record["unsupported_pairs"], unsupported)
             self.assertGreater(record["bytes"]["solid_data"], 0)
             self.assertGreater(record["bytes"]["jobs"], 0)
             self.assertEqual(record["bytes"]["work_lists"], 0)

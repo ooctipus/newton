@@ -68,11 +68,11 @@ TERRAIN_CLUSTER_ROUNDS = 8
 TERRAIN_PARTNER_POINT = 0
 """Partner class of point and segment cores: spheres and capsules."""
 TERRAIN_PARTNER_BOX = 1
-"""Partner class of boxes."""
+"""Partner class of boxes and finite planes (a box of no thickness)."""
 TERRAIN_PARTNER_CYLINDER = 2
-"""Partner class of flat-capped cylinders and cones."""
+"""Partner class of cylinders (flat-sided and barrel) and cones."""
 TERRAIN_PARTNER_HULL = 3
-"""Partner class of the support-function cores: convex meshes, ellipsoids and barrel cylinders."""
+"""Partner class of the support-function cores: convex meshes and ellipsoids."""
 TERRAIN_PARTNER_CLASSES = 4
 TERRAIN_PARTNER_WALK_SLOTS = (8, 16, 16, 24)
 """Walk slots of a pair of each partner class in the law's side buffer, the fast path's layout: its walk holds its
@@ -97,6 +97,14 @@ each, its three edges' interval ends, itself)."""
 TERRAIN_WALK_ROWS_PER_PAIR = (1, 3, 4)
 """Rows a pair can gain after its walk at most: a sphere's exit, a capsule's two ends' exits and its axis's recovery,
 a solid's four recovery rows."""
+TERRAIN_BORDER_ROWS_PER_SIDE = 4
+"""Rows a solid pair's window can give at the heightfield's border, per vertex along its sides at most
+(:func:`terrain_pair_candidates`): two clipped rows of each border edge's face (two border edges per window vertex along
+a side, at most, its rows and columns on both borders). A sphere's or capsule's border claims take its edges' and
+vertices' items, which :data:`TERRAIN_WALK_ROWS_PER_VERTEX` counts."""
+TERRAIN_BORDER_ROWS_PER_PAIR = 24
+"""Rows a solid pair's window can give at the heightfield's border beyond :data:`TERRAIN_BORDER_ROWS_PER_SIDE`: a wall's
+plane manifold (four rows) on each of four walls and two rows on each of four corner lines, at most."""
 
 TERRAIN_LANE_THREAD = 0
 """Lane class of pairs whose largest window holds at most :data:`TERRAIN_LANE_CELLS` cells: the class's one-thread
@@ -1343,10 +1351,11 @@ def _cross(first: np.ndarray, second: np.ndarray) -> np.ndarray:
 
 
 def terrain_partner_classes(shape_type: np.ndarray, shape_scale: np.ndarray) -> np.ndarray:
-    """Return the law's partner class of every shape (-1 when the law has none: meshes, planes, heightfields).
+    """Return the law's partner class of every shape (-1 when the law has none: meshes, infinite planes,
+    heightfields).
 
-    Flat-capped cylinders take the cylinder class; a barrel cylinder (a nonzero barrel radius in ``scale[2]``)
-    takes the support-function class with hulls and ellipsoids.
+    Cylinders, barrel cylinders (a nonzero barrel radius in ``scale[2]``) among them, take the cylinder class with
+    cones; a finite plane (:func:`terrain_finite_planes`) takes the box class.
 
     Args:
         shape_type: Geometry type of every shape.
@@ -1356,16 +1365,20 @@ def terrain_partner_classes(shape_type: np.ndarray, shape_scale: np.ndarray) -> 
         The partner class of every shape, int32.
     """
     kind = np.asarray(shape_type)
-    barrel = np.asarray(shape_scale, dtype=np.float64).reshape(-1, 3)[:, 2] != 0.0
-    cylinder = kind == int(GeoType.CYLINDER)
     result = np.full(len(kind), -1, np.int32)
     result[(kind == int(GeoType.SPHERE)) | (kind == int(GeoType.CAPSULE))] = TERRAIN_PARTNER_POINT
-    result[kind == int(GeoType.BOX)] = TERRAIN_PARTNER_BOX
-    result[(cylinder & ~barrel) | (kind == int(GeoType.CONE))] = TERRAIN_PARTNER_CYLINDER
-    result[(cylinder & barrel) | (kind == int(GeoType.CONVEX_MESH)) | (kind == int(GeoType.ELLIPSOID))] = (
-        TERRAIN_PARTNER_HULL
-    )
+    result[(kind == int(GeoType.BOX)) | terrain_finite_planes(kind, shape_scale)] = TERRAIN_PARTNER_BOX
+    result[(kind == int(GeoType.CYLINDER)) | (kind == int(GeoType.CONE))] = TERRAIN_PARTNER_CYLINDER
+    result[(kind == int(GeoType.CONVEX_MESH)) | (kind == int(GeoType.ELLIPSOID))] = TERRAIN_PARTNER_HULL
     return result
+
+
+def terrain_finite_planes(shape_type: np.ndarray, shape_scale: np.ndarray) -> np.ndarray:
+    """Return which shapes are planes of finite width and length (``scale[0]`` and ``scale[1]``, both nonzero; a
+    zero one is infinite, as :meth:`~newton.ModelBuilder.add_shape_plane` and the collision radius take it)."""
+    scale = np.asarray(shape_scale, dtype=np.float64).reshape(-1, 3)
+    plane = np.asarray(shape_type) == int(GeoType.PLANE)
+    return plane & (scale[:, 0] != 0.0) & (scale[:, 1] != 0.0)
 
 
 def terrain_window_cells(radius, reach, dx, dy) -> np.ndarray:
@@ -1392,27 +1405,45 @@ def terrain_window_vertices(radius, reach, dx, dy, nrow, ncol) -> np.ndarray:
     return (columns * rows).astype(np.int64)
 
 
-def terrain_pair_candidates(shape_type, vertices) -> np.ndarray:
+def terrain_window_sides(radius, reach, dx, dy, nrow, ncol) -> np.ndarray:
+    """Return a bound on the vertex columns plus rows of a pair's window, any pose (the sides of
+    :func:`terrain_window_vertices`'s window). Takes scalars or arrays of equal shape [m]; computes in float64."""
+    extent = 2.0 * (np.asarray(radius, np.float64) + np.asarray(reach, np.float64))
+    columns = np.minimum(np.floor(extent / np.asarray(dx, np.float64)) + 4.0, np.asarray(ncol, np.float64))
+    rows = np.minimum(np.floor(extent / np.asarray(dy, np.float64)) + 4.0, np.asarray(nrow, np.float64))
+    return (columns + rows).astype(np.int64)
+
+
+def terrain_pair_candidates(shape_type, vertices, sides=None) -> np.ndarray:
     """Return the most distinct candidates a pair's walk can give its finish: every feature of each of its window's
     ``vertices`` (:func:`terrain_window_vertices`) giving its partner's most rows
-    (:data:`TERRAIN_WALK_ROWS_PER_VERTEX`), and the rows added after the walk (:data:`TERRAIN_WALK_ROWS_PER_PAIR`).
+    (:data:`TERRAIN_WALK_ROWS_PER_VERTEX`), the rows added after the walk (:data:`TERRAIN_WALK_ROWS_PER_PAIR`) and for
+    a solid the rows its window can give at the heightfield's border (:data:`TERRAIN_BORDER_ROWS_PER_SIDE` per vertex
+    along its ``sides``, :func:`terrain_window_sides`, and :data:`TERRAIN_BORDER_ROWS_PER_PAIR`).
 
     The walks visit every feature of a window once (a window vertex owns its cell's faces and diagonal, its x- and
-    y-edges and itself), and each feature gives a partner at most the rows counted there, so no window can give more:
-    a scratch block that holds this many holds every candidate of the pair.
+    y-edges and itself; at the border the walls, the corner lines and the clipped faces of its border edges), and
+    each feature gives a partner at most the rows counted there, so no window can give more: a scratch block that holds
+    this many holds every candidate of the pair.
 
     Args:
         shape_type: Geometry type of every partner.
         vertices: The bound on every partner's window vertices.
+        sides: The bound on every partner's window columns plus rows, or ``None`` for a window that reaches no border.
     """
     kind = np.asarray(shape_type)
     per_vertex = np.full(kind.shape, TERRAIN_WALK_ROWS_PER_VERTEX[2], np.int64)
     per_pair = np.full(kind.shape, TERRAIN_WALK_ROWS_PER_PAIR[2], np.int64)
+    border = np.zeros(kind.shape, np.int64)
+    if sides is not None:
+        border = TERRAIN_BORDER_ROWS_PER_SIDE * np.asarray(sides, np.int64) + TERRAIN_BORDER_ROWS_PER_PAIR
     sphere = kind == int(GeoType.SPHERE)
     capsule = kind == int(GeoType.CAPSULE)
     per_vertex[sphere], per_pair[sphere] = TERRAIN_WALK_ROWS_PER_VERTEX[0], TERRAIN_WALK_ROWS_PER_PAIR[0]
     per_vertex[capsule], per_pair[capsule] = TERRAIN_WALK_ROWS_PER_VERTEX[1], TERRAIN_WALK_ROWS_PER_PAIR[1]
-    return per_vertex * np.asarray(vertices, np.int64) + per_pair
+    border = np.broadcast_to(border, kind.shape).copy()
+    border[sphere | capsule] = 0
+    return per_vertex * np.asarray(vertices, np.int64) + per_pair + border
 
 
 class TerrainPairTable:
@@ -1459,12 +1490,27 @@ class TerrainPairTable:
                 filter_mask=model.shape_collision_filter_mask,
             )
         scale = model.shape_scale.numpy() if count else np.zeros((0, 3), np.float32)
+        if count:
+            # An infinite plane on a body meets the whole heightfield: no window holds its contacts.
+            body = model.shape_body.numpy()[pairs[:, 1]]
+            plane = types[pairs[:, 1]] == int(GeoType.PLANE)
+            infinite = plane & ~terrain_finite_planes(types, scale)[pairs[:, 1]] & (body >= 0)
+            if np.any(infinite):
+                heightfield, partner = (int(s) for s in pairs[np.argmax(infinite)])
+                raise ValueError(
+                    f"Shape {partner}, a plane of infinite extent on body {int(body[np.argmax(infinite)])}, collides "
+                    f"with heightfield shape {heightfield}: the terrain law has no contact for a plane that meets the "
+                    "whole heightfield. Give the plane a finite width and length (ModelBuilder.add_shape_plane), "
+                    "filter the pair, or set NEWTON_TERRAIN_LAW=none before constructing the collision pipeline to "
+                    "keep the terrain route."
+                )
         partner_class = terrain_partner_classes(types, scale)[pairs[:, 1]]
         pairs = pairs[partner_class >= 0]
         partner_class = partner_class[partner_class >= 0]
         lane = np.zeros(len(pairs), np.int32)
         world = np.zeros(len(pairs), np.int32)
         vertices = np.zeros(len(pairs), np.int64)
+        sides = np.zeros(len(pairs), np.int64)
         candidates = np.zeros(len(pairs), np.int64)
         if len(pairs):
             first, second = pairs[:, 0], pairs[:, 1]
@@ -1480,7 +1526,8 @@ class TerrainPairTable:
             lane = np.where(cells <= TERRAIN_LANE_CELLS, TERRAIN_LANE_THREAD, TERRAIN_LANE_TILE).astype(np.int32)
             world = np.where(worlds[second] >= 0, worlds[second], worlds[first]).astype(np.int32)
             vertices = terrain_window_vertices(radius, reach, dx, dy, nrow, ncol)
-            candidates = terrain_pair_candidates(types[second], vertices)
+            sides = terrain_window_sides(radius, reach, dx, dy, nrow, ncol)
+            candidates = terrain_pair_candidates(types[second], vertices, sides)
         order = np.lexsort((pairs[:, 1], pairs[:, 0], world, lane, partner_class))
         self.pairs_host = pairs[order].astype(np.int32).reshape(-1, 2)
         """``(heightfield, partner)`` shape pairs in table order, int32 ``(pair_count, 2)`` (host)."""
@@ -1492,8 +1539,15 @@ class TerrainPairTable:
         """World of every pair (the partner's, or the heightfield's for a global partner), int32 (host)."""
         self.vertices = vertices[order]
         """Bound on every pair's window vertices, any pose (:func:`terrain_window_vertices`), int64 (host)."""
+        self.sides = sides[order]
+        """Bound on every pair's window columns plus rows, any pose (:func:`terrain_window_sides`), int64 (host)."""
         self.candidates = candidates[order]
         """Bound on every pair's distinct candidates, any pose (:func:`terrain_pair_candidates`), int64 (host)."""
+        barrel = (types == int(GeoType.CYLINDER)) & (scale[:, 2] > 0.0)
+        self.barrels = bool(np.any(barrel[self.pairs_host[:, 1]]))
+        """Whether a pair's partner is a barrel cylinder (a cylinder whose scale's third entry, its side's radius, is
+        not zero): the cylinder class then takes the kernels that hold the barrels' paths
+        (:data:`~newton._src.geometry.terrain_shadow.TERRAIN_LAW_BARREL_KERNELS`)."""
         segment = self.partner_class * TERRAIN_LANE_CLASSES + self.lane_class
         segments = TERRAIN_PARTNER_CLASSES * TERRAIN_LANE_CLASSES
         sizes = np.bincount(segment, minlength=segments) if len(segment) else np.zeros(segments, np.int64)

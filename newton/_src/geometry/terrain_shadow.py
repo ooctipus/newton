@@ -81,11 +81,11 @@ there keeps no row.
 The finish of a class's deferred pairs (pairs whose rows need more than their walk slots, or for the point class the
 general finish), ``wp.launch_tiled`` on the fixed grid of its
 :class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`
-(:func:`~newton._src.geometry.terrain_law.terrain_finish_blocks` blocks, each holding every distinct candidate a window
-of the class can give), strides over the class's deferred list, a block of lanes per pair: it collects the pair's
-candidates in the block's scratch (a solid pair's from the pool, a point pair's by the tiled walk), the lanes run the
-finish on them, its implied-row tests split among them, and every row it keeps is written, in the pair's walk slots when
-they fit, else in rows of the spill region.
+(:func:`~newton._src.geometry.terrain_law.terrain_finish_blocks` blocks, each holding every candidate a window of the
+class can give), strides over the class's deferred list, a block of lanes per pair: it collects the pair's candidates
+in the block's scratch (a solid pair's from the pool, a point pair's by the tiled walk), the lanes run the finish on
+them, every step split among them, and write every row it keeps, in the pair's walk slots when they fit, else in rows
+of the spill region.
 
 The kernels apply the pipeline's pair policy: the table holds the pairs its collision filter admits (worlds,
 collision groups, filter pairs, or its explicit pair list), and each kernel drops the pairs its broad phase's
@@ -135,7 +135,6 @@ from .terrain_law import (
     TERRAIN_PAIR_ROW_OVERFLOW,
     TERRAIN_PAIR_STALE,
     TERRAIN_PAIR_TILE_EXIT,
-    TERRAIN_PAIR_UNSUPPORTED,
     TERRAIN_PAIR_WIDE,
     TerrainLawRows,
     TerrainPairInputs,
@@ -167,6 +166,7 @@ def _solid_launches(name: str) -> tuple[tuple[str, str], ...]:
         "thetas",
         "creases",
         "vertices",
+        "border",
         "close",
         "recovery",
         "small",
@@ -181,6 +181,8 @@ def _solid_launches(name: str) -> tuple[tuple[str, str], ...]:
         if kernel == "recovery"
         else "pair_jobs"
         if kernel in ("close", "small")
+        else "border_jobs"
+        if kernel == "border"
         else "jobs"
         for kernel in kernels
     )
@@ -217,6 +219,9 @@ The module is imported only when the class is listed. Launch kinds, every one wi
   :class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData` (a solid class's whole-pair rejects);
 * ``jobs``: the class's job threads (:attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.threads`), the same
   arguments (a solid class's scan and job kernels, each striding over its list);
+* ``border_jobs``: the same with the border kernel's threads
+  (:attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.border_threads`, a smaller grid: the border's jobs
+  are rare);
 * ``pair_jobs``: the same over a list of the class's pairs, with at most one thread per pair
   (:attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.pair_threads`: a solid class's close and the
   small-pair finish);
@@ -230,7 +235,9 @@ The module is imported only when the class is listed. Launch kinds, every one wi
   class's also the solid classes' data and its jobs), so that an empty list costs one near-empty launch: the class's
   finish of its deferred pairs.
 
-``begin`` and ``slot_begin`` are the class's first pair and walk slot but for the ``tiled`` launch.
+``begin`` and ``slot_begin`` are the class's first pair and walk slot but for the ``tiled`` launch. The cylinder
+class's kernels compile its barrel cylinders' paths out; a class whose table holds a barrel cylinder takes
+:data:`TERRAIN_LAW_BARREL_KERNELS` instead.
 
 A class's module and kernels follow one protocol (the helpers live in :mod:`~newton._src.geometry.terrain_law`):
 
@@ -248,12 +255,22 @@ A class's module and kernels follow one protocol (the helpers live in :mod:`~new
   ``K`` rows), the point kernels write them in the world frame (``terrain_store_row``) with the pair's count and state;
   the solid kernels run the finish in place on any held rows (``terrain_finish_slots``) and write the kept ones. A pair
   beyond that (for the solid kernels: more distinct rows than ``K``) is deferred (``terrain_defer_pair``), and the
-  class's finish of its deferred pairs collects its distinct candidates in its scratch (a solid pair's from the pool,
-  a point pair's by its walk, ``terrain_hold_candidate``), runs the finish on all of them with a block's lanes
-  (``terrain_finish_list``) and writes every row it keeps, in the pair's walk slots when they fit, else in rows of the
-  spill region it reserves (``terrain_finish_deferred``, ``terrain_spill_rows``; no room: the first ``K`` of them by
-  priority in the walk slots, ``terrain_finish_overflow``, state ``TERRAIN_PAIR_ROW_OVERFLOW``, ``terrain_rows``).
+  class's finish of its deferred pairs places its candidates in its scratch, unmerged (a solid pair's from the pool,
+  a point pair's by its walk, ``terrain_place_candidate``), runs the finish on all of them with a block's lanes, every
+  step split among them (``terrain_finish_list``), and writes every row it keeps, in the pair's walk slots when they
+  fit, else in rows of the spill region it reserves (``terrain_finish_deferred``, ``terrain_spill_rows``; no room: the
+  first ``K`` of them by priority in the walk slots, ``terrain_finish_overflow``, state ``TERRAIN_PAIR_ROW_OVERFLOW``,
+  ``terrain_rows``).
 """
+
+TERRAIN_LAW_BARREL_KERNELS: tuple[str, tuple[tuple[str, str], ...]] = (
+    "newton._src.geometry.terrain_law_barrel",
+    _solid_launches("barrel"),
+)
+"""The cylinder class's module and launches when its table holds a barrel cylinder
+(:attr:`~newton._src.geometry.terrain_contacts.TerrainPairTable.barrels`): its kernels with the barrels' paths, which
+:data:`TERRAIN_LAW_KERNELS`'s compile out (every pair of the class takes them; a flat-sided cylinder or cone gets the
+same rows from both)."""
 
 TERRAIN_LAW_SOLID_CLASSES = (TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_HULL)
 """Partner classes whose kernels take the solid classes' data
@@ -272,7 +289,6 @@ TERRAIN_PAIR_STATES = {
     "candidate_overflow": int(TERRAIN_PAIR_CANDIDATE_OVERFLOW),
     "incomplete": int(TERRAIN_PAIR_INCOMPLETE),
     "wide": int(TERRAIN_PAIR_WIDE),
-    "unsupported": int(TERRAIN_PAIR_UNSUPPORTED),
 }
 """Names of the ``TERRAIN_PAIR_*`` state bits."""
 
@@ -346,8 +362,8 @@ TERRAIN_LAW_SPILL_SHARE = 256
 pair's bound (:meth:`TerrainLawShadow.default_spill_rows`): the worst case of one pair in 256 at once. On the recorded
 suite scenes (16,384 worlds) that is 11 to 25% of the walk slots, while at most one pair spilled (30 rows)."""
 
-TERRAIN_LAW_JOB_COUNTERS = 9
-"""Counters of a solid class's jobs: its four job lists, its candidate pool, its live pairs, its pairs left to rule R,
+TERRAIN_LAW_JOB_COUNTERS = 10
+"""Counters of a solid class's jobs: its five job lists, its candidate pool, its live pairs, its pairs left to rule R,
 its scan's runs and its pairs finished by the small-pair finish kernel
 (:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_COUNTERS`)."""
 
@@ -356,6 +372,7 @@ TERRAIN_LAW_JOB_NAMES = (
     "edges",
     "thetas",
     "vertices",
+    "border",
     "candidates",
     "live",
     "recovery",
@@ -406,6 +423,8 @@ def _print_job_list(k: int):
         wp.printf("rule E crease (theta*) job list")
     elif k == wp.static(TERRAIN_LAW_JOB_NAMES.index("vertices")):
         wp.printf("rule V vertex job list")
+    elif k == wp.static(TERRAIN_LAW_JOB_NAMES.index("border")):
+        wp.printf("border wall and clip job list")
     else:
         wp.printf("candidate pool")
 
@@ -666,6 +685,8 @@ class TerrainLawShadow:
         self._jobs = {}
         for partner_class in self.classes:
             module_name, launches = TERRAIN_LAW_KERNELS[partner_class]
+            if partner_class == TERRAIN_PARTNER_CYLINDER and self.table.barrels:
+                module_name, launches = TERRAIN_LAW_BARREL_KERNELS
             module = importlib.import_module(module_name)
             walk = int(TERRAIN_PARTNER_WALK_SLOTS[partner_class])
             # The class's lane segments are contiguous in the table (lane classes by id); its walk slots follow them.
@@ -685,10 +706,14 @@ class TerrainLawShadow:
                     self.table.candidates[begin:end],
                     walk,
                     scan_run=run,
+                    sides=self.table.sides[begin:end],
                     scale=self.job_scale,
                 )
                 reserve = solid_module.terrain_solid_job_reserves(
-                    self.table.vertices[begin:end], self.table.candidates[begin:end], scan_run=run
+                    self.table.vertices[begin:end],
+                    self.table.candidates[begin:end],
+                    scan_run=run,
+                    sides=self.table.sides[begin:end],
                 )
                 offset = _JOBS + TERRAIN_LAW_JOB_COUNTERS * partner_class
                 jobs = solid_module.terrain_solid_jobs(
@@ -716,12 +741,15 @@ class TerrainLawShadow:
                         self._launches.append(("tiled", kernel, jobs.finish_blocks, begin, slot, (jobs, True)))
                     elif kind == "jobs":
                         self._launches.append(("thread", kernel, jobs.threads, begin, slot, (jobs, True)))
+                    elif kind == "border_jobs":
+                        self._launches.append(("thread", kernel, jobs.border_threads, begin, slot, (jobs, True)))
                     else:
                         self._launches.append(("tiled", kernel, scratch.blocks, begin, slot, (scratch, True, jobs)))
                 shapes.update(
                     {
                         "pair_dim": end - begin,
                         "job_threads": jobs.threads,
+                        "border_threads": jobs.border_threads,
                         "pair_job_threads": jobs.pair_threads,
                         "finish_blocks": jobs.finish_blocks,
                         "jobs": {name: int(capacity[name]) for name in names},
@@ -750,7 +778,7 @@ class TerrainLawShadow:
                     else:
                         self._launches.append(("tiled", kernel, scratch.blocks, begin, slot, (scratch, False)))
             # The finish of the class's deferred pairs: a fixed grid over its deferred list (the pairs are found on the
-            # device, in any order), each block holding every distinct candidate a window of the class can give. A
+            # device, in any order), each block holding every candidate a window of the class can give. A
             # class whose largest pair's window can give many candidates takes fewer blocks, its scratch kept near
             # TERRAIN_LAW_SCRATCH_BYTES: the rare deferred path's parallelism, never a row.
             shapes["deferred_blocks"] = scratch.blocks
@@ -783,39 +811,25 @@ class TerrainLawShadow:
         self._capacities = wp.array(capacities, dtype=wp.int32, device=device)
         self._reserves = wp.array(reserves, dtype=wp.int32, device=device)
         self._solids = None
-        self._unsupported_pairs = 0
         if solid_pairs:
             partners = np.concatenate([self.table.pairs_host[b : b + c, 1] for b, c in solid_pairs])
             self._solids = solid_module.terrain_solid_data(model, partners)
-            classes = np.concatenate([self.table.partner_class[b : b + c] for b, c in solid_pairs])
-            self._unsupported_pairs = int(
-                np.count_nonzero(solid_module.terrain_solid_unsupported(classes, model.shape_type.numpy()[partners]))
-            )
         self._no_body_flags = wp.empty(0, dtype=wp.int32, device=device)
         self.build_seconds = time.perf_counter() - started
         """Host time of the construction [s]: features, pair table, kernel modules imported and buffers."""
 
     def written_pairs(self, model) -> tuple[np.ndarray, np.ndarray]:
         """Return what the law writes when it feeds the solver (the default; see ``NEWTON_TERRAIN_LAW``): per shape, 1
-        for a partner whose heightfield pairs it writes (else 0), and the table indices of those pairs.
-
-        Every listed pair is written but those whose partner has no core yet
-        (:data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_UNSUPPORTED`: in the hull class, a shape that is
-        neither a convex hull nor an ellipsoid), which stay with the terrain route.
+        for a partner whose heightfield pairs it writes (else 0), and the table indices of those pairs: every listed
+        pair (every partner of a listed class has a core).
 
         Args:
             model: The finalized model the law was built for.
         """
         listed = self._listed
-        partners = self.table.pairs_host[listed, 1].astype(np.int64)
-        written = np.ones(len(listed), bool)
-        if any(c in TERRAIN_LAW_SOLID_CLASSES for c in self.classes):
-            from .terrain_law_solid import terrain_solid_unsupported  # noqa: PLC0415
-
-            written = ~terrain_solid_unsupported(self.table.partner_class[listed], model.shape_type.numpy()[partners])
         partner = np.zeros(model.shape_count, np.int32)
-        partner[partners[written]] = 1
-        return partner, listed[written].astype(np.int32)
+        partner[self.table.pairs_host[listed, 1].astype(np.int64)] = 1
+        return partner, listed.astype(np.int32)
 
     def default_spill_rows(self) -> int:
         """Return the spill region's rows by default, from the listed pairs' own bounds on their rows
@@ -983,13 +997,12 @@ class TerrainLawShadow:
 
     def describe(self) -> dict:
         """Return a host-only record of the shadow: classes, pairs per lane class, launches, walk slots and the spill
-        region, memory, the solid classes' job scale and with a solid class listed the pairs whose partner has no core
-        yet (``unsupported_pairs``, no row).
+        region, memory and with a solid class listed the solid classes' job scale.
 
         ``launches`` counts every launch of a collide, the spill and job check included. ``launch_shapes`` holds, per
         class with pairs, the dimensions fixed at construction: ``block_dim`` (every launch's), ``walk_slots`` (a
         pair's walk slots), ``deferred_blocks`` (the grid of the finish of its deferred pairs), ``deferred_candidates``
-        (the distinct candidates a block of it holds: the most any pair of the class can give) and ``deferred_limited``
+        (the candidates a block of it holds: the most any pair of the class can give) and ``deferred_limited``
         (whether that grid has fewer than :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_DEFERRED_BLOCKS` blocks:
         its blocks, each sized for the class's largest pair, would exceed
         :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_SCRATCH_BYTES`); for the point class ``thread_dim`` (the
@@ -1050,7 +1063,7 @@ class TerrainLawShadow:
             )
         solids = {}
         if self._solids is not None:
-            solids = {"job_scale": self.job_scale, "unsupported_pairs": self._unsupported_pairs}
+            solids = {"job_scale": self.job_scale}
         return {
             "classes": [terrain_law_class_name(c) for c in self.classes],
             "pairs": pairs,
