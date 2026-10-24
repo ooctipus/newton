@@ -98,8 +98,7 @@ Reference and tolerances
 
 Findings
     Routes that fail a check at the gate's baseline (584eae97) are expected
-    failures that name the finding: the rigid-body speed limit of split mode
-    (a predictor clamp) and the research friction modes.
+    failures that name the finding: the research friction modes.
 
 Runtime
     Small scenes (one or two worlds, 60 to 240 steps): with a warm kernel
@@ -1380,15 +1379,6 @@ def _laws(*laws):
 
 
 _WARM = {"pgs_warmstart": True}
-_SPEED_PREDICTOR = (
-    "Split mode clamps the magnitude of the predicted velocity, gravity's increment included, before the solve; the "
-    "ground contact then removes the vertical part, so the pushed box settles 0.25% below its speed limit."
-)
-_SPEED_FINDINGS = (
-    ("split_loop", _SPEED_PREDICTOR),
-    ("cpu_split", _SPEED_PREDICTOR),
-    ("reference_matches_cpu", _SPEED_PREDICTOR),
-)
 
 
 def cpu_groups() -> list:
@@ -1411,7 +1401,7 @@ def cpu_groups() -> list:
             (CPU_SPLIT.but("cpu_split_warm_start", options=_WARM),),
         ),
         Group(_physics(scenes.ball_drop(), "point", 16), CPU_SPLIT, (CPU_SPLIT,)),
-        Group(_physics(scenes.box_push(), "point", 16), CPU_SPLIT, (CPU_SPLIT,), findings=_SPEED_FINDINGS),
+        Group(_physics(scenes.box_push(), "point", 16), CPU_SPLIT, (CPU_SPLIT,)),
         Group(_physics(scenes.keyboard(), "point", 16), CPU_SPLIT, (CPU_SPLIT,)),
         Group(_physics(scenes.hand(), "point", 16), CPU_SPLIT, (CPU_SPLIT,)),
         Group(_physics(scenes.sprawl(), "point", 64), CPU_SPLIT, (CPU_SPLIT,)),
@@ -1490,7 +1480,7 @@ def cuda_groups() -> list:
             (SPARSE.but("sparse_warm_start", options=_WARM),),
         ),
         Group(_physics(scenes.ball_drop(), "point", 16), ref, (MF_HELD, MF_GENERAL, SPLIT_LOOP)),
-        Group(_physics(scenes.box_push(), "point", 16), ref, (MF_HELD, SPLIT_LOOP), findings=_SPEED_FINDINGS),
+        Group(_physics(scenes.box_push(), "point", 16), ref, (MF_HELD, SPLIT_LOOP)),
         Group(_physics(scenes.chain(), None, 16), ref, (MF_HELD, MF_GENERAL, MF_PARALLEL, SPLIT_LOOP)),
         Group(
             _physics(scenes.chain(), None, 16, "physx_drives", drive_mode="physx_pgs"),

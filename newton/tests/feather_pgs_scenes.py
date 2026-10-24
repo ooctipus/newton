@@ -307,7 +307,10 @@ def box_push(*, speed_limit: float = 0.5, force: float = 20.0) -> Scene:
 
     World 0 pushes along ``+x``, world 1 along the diagonal ``(1, 1, 0) / sqrt(2)``.
     PhysX's ``maxLinearVelocity`` bounds the speed, the magnitude of the linear
-    velocity, so both boxes settle at ``speed_limit``.
+    velocity, and FeatherPGS bounds it on the body's solved velocity, so both
+    boxes settle at ``speed_limit``. (PhysX clamps the unconstrained velocity,
+    gravity's increment included, before its solve, which leaves a box pushed
+    along the ground slightly below the limit.)
     """
     directions = ((1.0, 0.0, 0.0), (math.sqrt(0.5), math.sqrt(0.5), 0.0))
 

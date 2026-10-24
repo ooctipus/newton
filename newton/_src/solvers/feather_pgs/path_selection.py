@@ -1079,18 +1079,14 @@ def _velocity_limits(solver) -> dict:
         "prescale_lanes": int(solver._velocity_prescale_lanes) if prescale else 0,
         "activation_fraction": json_value(solver.velocity_limit_activation_fraction),
         "rigid_body_limits": limits,
-        # Mirrors _allocate_mf_buffers and the row allocation of _stage4_build_rows (both modes),
-        # and _clamp_rigid_velocity_limits for free articulation roots. At an infinite activation
-        # fraction the allocator still launches but reserves no row.
+        # Mirrors _allocate_mf_buffers and the row allocation of _stage4_build_rows (both modes). At an
+        # infinite activation fraction the allocator still launches but reserves no row.
         "free_body_rows": bool(limits and solver._free_rigid_body_count > 0),
         # The law of split mode's free-body sweep (sweep.free_body_matrix_free) for these rows.
         "free_body_sweep_law": free_body_law,
         "free_body_sweep_law_reason": free_body_law_reason,
-        "root_clamp": bool(
-            limits
-            and solver._has_root_free
-            and not (matrix_free and getattr(solver, "rigid_velocity_limit_slot", None) is not None)
-        ),
+        # Split mode's clamp of the solved velocity of free roots (_stage6_clamp_rigid_velocity_limits).
+        "root_clamp": bool(limits and solver._has_root_free and not matrix_free),
     }
 
 

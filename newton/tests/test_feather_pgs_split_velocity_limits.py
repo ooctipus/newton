@@ -13,10 +13,10 @@ impulse: a body past its limit keeps its direction and ends on the limit. Per-ax
 velocity reach ``sqrt(3)`` times the limit; a sweep that relaxed the rows as bilateral rows would accelerate a
 body that moves below its limit.
 
-Split mode also scales each free body's predicted velocity onto its speed limits before the rows are built,
-and its solved velocity after the sweep (the root clamp). In free flight every row therefore finds its limit
-satisfied and must not move the body. The rows act inside a step where another row of the sweep pushes a
-body past a limit, as a contact row pushes a body out of the ground.
+Split mode leaves the predicted velocity alone, so the contact rows act on it first, and scales the solved
+velocity of every free root onto its speed limits after the sweep (the root clamp). The rows act wherever the
+predicted velocity or another row of the sweep sets a body past a limit, as a force pushes a body along the
+ground or a contact row pushes it out of the ground.
 """
 
 import unittest
@@ -34,6 +34,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_mf_kernel
 from newton.solvers import SolverFeatherPGS
+from newton.tests import feather_pgs_scenes as scenes
 
 DT = 1.0 / 60.0
 # Speed limits of every free box [m/s, rad/s].
@@ -291,7 +292,7 @@ def _sweep(device, *, iterations, articulated=False, omega=1.0):
     """Sweep each box's speed rows ``iterations`` times from the ``SWEEP_*`` velocities.
 
     A step at rest builds the rows (``velocity_limit_activation_fraction=0`` allocates both); the sweep then
-    starts from velocities that the step's predictor clamp never saw, so the rows alone decide.
+    starts from velocities that the step never saw, so the rows alone decide.
     """
     run = _free_boxes(
         device, [((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))] * len(SWEEP_LINEAR), articulated=articulated, omega=omega
@@ -366,8 +367,8 @@ class _SplitVelocityLimitChecks:
     def test_step_keeps_speeds_below_the_limits(self):
         """Keep the velocity of a free body that moves below its limits and feels no other force.
 
-        The root clamp leaves such a velocity alone, so every velocity-limit row finds its limit satisfied
-        and must not move the body: a bilateral relaxation would drive each axis onto a limit.
+        Every speed row finds its limit satisfied and must not move the body: a bilateral relaxation would
+        drive each axis onto a limit.
         """
         for articulated in (False, True):
             for fraction in (0.0, 0.7):
@@ -387,9 +388,9 @@ class _SplitVelocityLimitChecks:
     def test_step_clamps_speeds_past_the_limits(self):
         """Hold a free body launched or pushed past its limits on them, along its own direction.
 
-        The root clamp scales the predicted velocity onto the limits before the rows are built, so the rows
-        find their limits satisfied and must not move the body; :meth:`test_step_holds_a_contact_push_on_the_limit`
-        covers the rows holding a body inside a step.
+        The speed rows scale the predicted velocity onto the limits in the sweep's first iteration and find
+        them satisfied in its last, which keeps a zero correction; the root clamp after the sweep finds the
+        speeds on their limits.
         """
         worlds = [(linear, angular) for linear, angular, _, _ in PAST]
         wrenches = [np.concatenate((force, torque)) for _, _, force, torque in PAST]
@@ -407,11 +408,36 @@ class _SplitVelocityLimitChecks:
                 np.testing.assert_allclose(speeds, [[LINEAR_LIMIT, ANGULAR_LIMIT]] * len(PAST), rtol=RTOL)
                 np.testing.assert_allclose(_velocity_limit_impulses(run), 0.0, rtol=0.0, atol=1.0e-6)
 
+    def test_step_holds_a_pushed_box_on_the_limit(self):
+        """Hold a box that a force pushes along frictionless ground on its speed limit, along the push.
+
+        Gravity's increment to the predicted velocity is the ground contact's to remove: a speed bound applied to
+        the predicted velocity, before the contact acts, would leave the box 0.25% below its limit. One box is
+        pushed along an axis, one along a diagonal (the conformance gate's scene).
+        """
+        scene = scenes.box_push()
+        model = scene.build(self.device)
+        solver = SolverFeatherPGS(model, pgs_mode="split", angular_damping=0.0, friction_anchor_beta=0.0)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        for step in range(scene.steps):
+            state_0.clear_forces()
+            scene.control(model, control, state_0, step)
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, scene.dt)
+            state_0, state_1 = state_1, state_0
+        velocity = state_0.body_qd.numpy()[:, :3]
+        np.testing.assert_allclose(np.linalg.norm(velocity, axis=1), scene.params["speed_limit"], rtol=1.0e-4)
+        np.testing.assert_allclose(velocity[1, 0], velocity[1, 1], rtol=1.0e-4)
+
     def test_step_holds_a_contact_push_on_the_limit(self):
         """End a step on the limit that a contact row pushed a free body past, keeping only the last correction.
 
         A sphere pressed into the ground leaves it at the Baumgarte speed ``-rhs`` of its contact row, which
-        the root clamp before the sweep does not see. In every iteration the contact row pushes the sphere
+        the predicted velocity does not hold. In every iteration the contact row pushes the sphere
         to that speed and the linear speed row behind it takes the overshoot back, so the step ends on the
         limit and the row keeps the overshoot of the last iteration, not the sum over all iterations.
         """

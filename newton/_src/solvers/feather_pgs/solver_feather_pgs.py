@@ -6460,9 +6460,8 @@ class SolverFeatherPGS(SolverBase):
         self.mf_meta_packed = wp.zeros((worlds, 4), dtype=wp.int32, device=device)
 
         if self._has_rigid_body_velocity_limits and model.body_count > 0:
-            # Only the ``is not None`` checks observe these on the inactive
-            # path; allocating them keeps the matrix_free clamp semantics of
-            # _clamp_rigid_velocity_limits identical to the full allocation.
+            # Only the ``is not None`` checks observe this on the inactive
+            # path, where no free rigid body owns a speed row.
             self.rigid_velocity_limit_slot = wp.full(
                 (1,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
             )
@@ -8098,7 +8097,6 @@ class SolverFeatherPGS(SolverBase):
             if self._tree_kinetic_state is not None:
                 self._tree_kinetic_state.predict(state_in, state_aug, control, stage3_qd, dt)
                 self._stage3_correct_free_root_velocity(state_in, stage3_qd, dt, apply_transport=False)
-                self._clamp_rigid_velocity_limits(self.v_hat)
             else:
                 self._stage3_zero_qdd(state_aug)
                 for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
@@ -8130,7 +8128,6 @@ class SolverFeatherPGS(SolverBase):
                         else:
                             self._stage3_trisolve_loop(size, state_aug)
                 self._stage3_compute_v_hat(state_in, state_aug, dt, stage3_qd)
-                self._clamp_rigid_velocity_limits(self.v_hat)
             if self._debug_stage3_snapshots:
                 wp.copy(self._debug_stage3_qd_work, stage3_qd)
                 wp.copy(self._debug_stage3_joint_qdd, state_aug.joint_qdd)
@@ -8517,8 +8514,6 @@ class SolverFeatherPGS(SolverBase):
                         friction_start_iteration=self._contact_friction_start_iteration(self.pgs_iterations),
                     )
 
-            self._stage6_clamp_rigid_velocity_limits()
-
             if self.pgs_velocity_iterations > 0:
                 if self.pgs_debug:
                     wp.copy(self._debug_position_v_out, self.v_out)
@@ -8526,9 +8521,7 @@ class SolverFeatherPGS(SolverBase):
                 wp.copy(self.v_out_snap, self.v_out)
                 self._conclude_matrix_free_position_problem(dt)
                 wp.copy(self.v_hat, self.v_out_snap)
-                self._clamp_rigid_velocity_limits(self.v_hat)
                 self._run_matrix_free_velocity_post_solve()
-                self._stage6_clamp_rigid_velocity_limits()
                 self._stage6_integrate_position_from_velocity(state_in, state_aug, state_out, dt, self.v_out_snap)
         elif self.pgs_mode == "split" and self._has_mixed_contacts:
             # Split mode with mixed contacts: interleaved dense and MF, 1 iteration each.
@@ -13113,14 +13106,17 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
-    def _clamp_rigid_velocity_limits(self, qd: wp.array):
+    def _stage6_clamp_rigid_velocity_limits(self):
+        """Bound the solved speeds of every free root in split mode, where its step ends (the root clamp).
+
+        Split mode bounds free rigid bodies inside its free-body sweep with speed rows where the activation
+        gate reserved them; this clamp of the solved velocity bounds every free root, floating bases included,
+        without changing a predicted velocity the contacts still act on. Matrix-free mode bounds free rigid
+        bodies with speed rows alone.
+        """
         if not self._has_root_free or not self._has_rigid_body_velocity_limits:
             return
-        if self.pgs_mode == "matrix_free" and getattr(self, "rigid_velocity_limit_slot", None) is not None:
-            # Matrix-free solves free-rigid velocity limits as rows now. Keep
-            # this direct clamp for dense/split legacy paths only, otherwise
-            # probes cannot distinguish row enforcement from a hidden final
-            # projection.
+        if self.pgs_mode == "matrix_free":
             return
 
         wp.launch(
@@ -13135,12 +13131,9 @@ class SolverFeatherPGS(SolverBase):
                 self.rigid_body_max_linear_velocity,
                 self.rigid_body_max_angular_velocity,
             ],
-            outputs=[qd],
+            outputs=[self.v_out],
             device=self.model.device,
         )
-
-    def _stage6_clamp_rigid_velocity_limits(self):
-        self._clamp_rigid_velocity_limits(self.v_out)
 
     def _stage6_apply_impulses_world(self, size: int):
         model = self.model
