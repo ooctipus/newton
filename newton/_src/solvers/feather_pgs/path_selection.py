@@ -722,6 +722,9 @@ def _sweep(solver, source) -> dict:
             dense = {
                 "kernels": [_key(kernel) for kernel in budgets or (solver._pgs_solve_tiled_row_kernel,)],
                 "row_budgets": bool(budgets),
+                # Where the sweep reads the Delassus operator, chosen from the device's shared memory per block.
+                "staging": solver._tiled_row_staging,
+                "staging_reason": solver._tiled_row_staging_reason,
             }
         else:
             loop = source.pgs_solve_loop_unit if solver._dense_contact_unit else source.pgs_solve_loop

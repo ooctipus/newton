@@ -10,7 +10,12 @@ from unittest.mock import patch
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS, _get_pgs_solve_tiled_row_kernel
+from newton._src.solvers.feather_pgs.solver_feather_pgs import (
+    SolverFeatherPGS,
+    _get_pgs_solve_tiled_row_kernel,
+    _tiled_row_shared_bytes,
+    _tiled_row_staging,
+)
 
 
 class TestFeatherPGSDenseRowBudgetFactory(unittest.TestCase):
@@ -46,6 +51,34 @@ class TestFeatherPGSDenseRowBudgetFactory(unittest.TestCase):
         """Retain the default kernel identity for previously supported capacities."""
         for capacity in (32, 64, 96, 128):
             self.assertEqual(_get_pgs_solve_tiled_row_kernel(capacity, 120).key, f"pgs_solve_tiled_row_{capacity}")
+
+    def test_staging_follows_device_shared_memory(self):
+        """Stage the Delassus triangle in shared memory only while it fits a block's shared memory on the device.
+
+        The opt-in limits are the RTX PRO 6000's (sm_120) and the GB300's; ptxas reports the shared-staging
+        blocks of 224 and 384 rows at 0x19f40 and 0x4a780 bytes.
+        """
+        self.assertEqual(_tiled_row_shared_bytes(224, "shared"), 0x19F40)
+        self.assertEqual(_tiled_row_shared_bytes(384, "shared"), 0x4A780)
+        rtx_pro_6000 = SimpleNamespace(max_shared_memory_per_block=101376)
+        gb300 = SimpleNamespace(max_shared_memory_per_block=232448)
+        for capacity, device, staging in (
+            (192, rtx_pro_6000, "shared"),
+            (224, rtx_pro_6000, "global"),
+            (256, gb300, "shared"),
+            (384, gb300, "global"),
+        ):
+            with self.subTest(capacity=capacity, limit=device.max_shared_memory_per_block):
+                selected, reason = _tiled_row_staging(capacity, device)
+                self.assertEqual(selected, staging)
+                self.assertIn(str(device.max_shared_memory_per_block), reason)
+        with self.assertRaisesRegex(ValueError, "pgs_kernel='loop'"):
+            _tiled_row_staging(8192, rtx_pro_6000)
+        self.assertEqual(
+            _get_pgs_solve_tiled_row_kernel(384, 120, staging="global").key, "pgs_solve_tiled_row_384_global"
+        )
+        with self.assertRaises(ValueError):
+            _get_pgs_solve_tiled_row_kernel(64, 120, row_budget=32, staging="global")
 
     def test_dispatch_preserves_arguments(self):
         """Keep one default launch or two partition launches with the original arguments."""
@@ -213,6 +246,40 @@ class TestFeatherPGSDenseRowBudget(unittest.TestCase):
         self.assertEqual(expected[0].tobytes(), arrays[4][0].tobytes())
         for world, count in enumerate(arrays[0][: capacity + 1]):
             self.assertEqual(expected[world, count:].tobytes(), arrays[4][world, count:].tobytes())
+
+    def test_global_staging_matches_shared_staging(self):
+        """Solve a symmetric Delassus problem bit for bit alike from shared and from global staging.
+
+        The shared staging reads the operator's lower triangle and the global staging its rows, so the two read
+        the same values when the operator is symmetric bit for bit; every lane then sums the same terms in the
+        same order.
+        """
+        device = wp.get_device("cuda:0")
+        for capacity in (64, 128):
+            with self.subTest(capacity=capacity):
+                arrays = list(_dense_fixture(capacity))
+                # As in _compare: keep the tangent siblings of these worlds inside their active rows.
+                for world, active in ((capacity + 1, 16), (capacity + 2, 32)):
+                    arrays[5][world] = arrays[5][active]
+                    arrays[6][world] = arrays[6][active]
+                lower = np.tril(arrays[2])
+                arrays[2] = lower + np.tril(lower, -1).transpose(0, 2, 1)
+                counts, diag, matrix, rhs, initial, types, parents, mu = (
+                    wp.array(value, device=device) for value in arrays
+                )
+                results = []
+                for staging in ("shared", "global"):
+                    impulses = wp.clone(initial)
+                    wp.launch_tiled(
+                        _get_pgs_solve_tiled_row_kernel(capacity, device.arch, staging=staging),
+                        dim=[len(arrays[0])],
+                        inputs=[counts, diag, matrix, rhs, impulses, 8, 1.0, types, parents, mu, 2, 0],
+                        block_dim=32,
+                        device=device,
+                    )
+                    results.append(impulses.numpy())
+                self.assertFalse(np.array_equal(results[0], arrays[4]))
+                np.testing.assert_array_equal(results[1].view(np.uint32), results[0].view(np.uint32))
 
     def test_all_counts_and_projection_phases(self):
         """Preserve every count, row projector, warm state and delayed-friction phase."""

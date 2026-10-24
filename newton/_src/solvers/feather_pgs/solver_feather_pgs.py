@@ -1839,9 +1839,11 @@ class SolverFeatherPGS(SolverBase):
                 Packed metadata in matrix-free mode supports at most 65535 rows. Defaults to 512.
             pgs_kernel: Dense PGS implementation. ``auto`` uses ``loop`` on CPU and ``tiled_row`` on CUDA.
                 Explicit ``loop`` and ``tiled_row`` select the split-mode kernel and require a supported
-                device. Matrix-free mode owns its sweep dispatcher: an explicit choice there warns and is
-                ignored. ``tiled_contact`` and ``streaming`` are deprecated: they warn, have no effect and
-                select the ``auto`` kernel.
+                device. ``tiled_row`` stages the packed Delassus triangle in shared memory while it fits the
+                device's shared memory per block and reads the Delassus rows from global memory past that
+                (``routes.sweep.dense.staging``). Matrix-free mode owns its sweep dispatcher: an explicit
+                choice there warns and is ignored. ``tiled_contact`` and ``streaming`` are deprecated: they
+                warn, have no effect and select the ``auto`` kernel.
             pgs_chunk_size (int, optional): Deprecated compatibility argument. It tuned the removed
                 streaming kernel; a value other than ``None`` warns and has no effect. Defaults to None.
             use_parallel_streams (bool, optional): Dispatch size groups on separate CUDA streams.
@@ -6699,10 +6701,16 @@ class SolverFeatherPGS(SolverBase):
 
         self._pgs_solve_tiled_row_kernel = None
         self._pgs_solve_tiled_row_budgets = ()
+        self._tiled_row_staging = None
+        self._tiled_row_staging_reason = None
         if self.dense_max_constraints > 0:
-            if self.pgs_kernel == "tiled_row":
+            # Only split mode without native sparse split rows sweeps the assembled Delassus rows.
+            if self.pgs_kernel == "tiled_row" and self.pgs_mode == "split" and not self._sparse_split:
+                self._tiled_row_staging, self._tiled_row_staging_reason = _tiled_row_staging(
+                    self.dense_max_constraints, model.device
+                )
                 self._pgs_solve_tiled_row_kernel = _get_pgs_solve_tiled_row_kernel(
-                    self.dense_max_constraints, device_arch
+                    self.dense_max_constraints, device_arch, staging=self._tiled_row_staging
                 )
                 # Large C128 batches benefit from small-world storage without
                 # reducing capacity. Avoid extra launches for small batches.
@@ -15229,29 +15237,101 @@ def _get_triangular_solve_kernel(n_dofs: int, device_arch: str, tile_threads: in
     return wp.kernel(enable_backward=False, module="unique")(trisolve_tiled_template)
 
 
+_TILED_ROW_THREADS = 32
+"""Threads of a tiled_row sweep block: one warp per world."""
+
+TILED_ROW_STAGINGS = ("shared", "global")
+"""Where a tiled_row sweep reads the Delassus operator: its packed lower triangle in shared memory, or its rows in
+global memory."""
+
+
+def _tiled_row_shared_bytes(max_constraints: int, staging: str) -> int:
+    """Static shared memory of one tiled_row sweep block [bytes].
+
+    The block stages six row vectors (impulses, right-hand sides, diagonals,
+    types, parents and friction coefficients) and, with ``staging="shared"``,
+    the packed lower triangle of the Delassus operator, ``M (M + 1) / 2``
+    floats; Warp's tile storage of a tiled launch adds four bytes per thread.
+    """
+    words = 6 * max_constraints
+    if staging == "shared":
+        words += max_constraints * (max_constraints + 1) // 2
+    return 4 * (words + _TILED_ROW_THREADS)
+
+
+def _tiled_row_staging(max_constraints: int, device) -> tuple[str, str]:
+    """Choose where a tiled_row sweep of ``max_constraints`` rows reads the Delassus operator on ``device``.
+
+    The packed triangle stays in shared memory while it fits the device's
+    opt-in shared memory per block; past that, the warp reads each Delassus
+    row from global memory (coalesced, one row per update) and stages only
+    the row vectors.
+
+    Returns:
+        The staging, one of :data:`TILED_ROW_STAGINGS`, and the reason.
+
+    Raises:
+        ValueError: If even the row vectors exceed the device's shared memory per block.
+    """
+    limit = int(device.max_shared_memory_per_block)
+    shared = _tiled_row_shared_bytes(max_constraints, "shared")
+    if shared <= limit:
+        return "shared", (
+            f"The packed Delassus triangle of {max_constraints} rows and the row vectors take {shared} of the "
+            f"device's {limit} bytes of shared memory per block."
+        )
+    rows = _tiled_row_shared_bytes(max_constraints, "global")
+    if rows <= limit:
+        return "global", (
+            f"The packed Delassus triangle of {max_constraints} rows would take {shared} bytes of shared memory "
+            f"per block, more than the device's {limit}: the sweep reads Delassus rows from global memory and "
+            f"stages only the row vectors ({rows} bytes)."
+        )
+    raise ValueError(
+        f"dense_max_constraints={max_constraints} needs {rows} bytes of shared memory per block for the tiled_row "
+        f"sweep's row vectors, more than the device's {limit}; use pgs_kernel='loop' or fewer dense rows"
+    )
+
+
 @cache
 def _get_pgs_solve_tiled_row_kernel(
-    max_constraints: int, device_arch: str, *, row_budget: int | None = None, min_rows: int = 0
+    max_constraints: int,
+    device_arch: str,
+    *,
+    row_budget: int | None = None,
+    min_rows: int = 0,
+    staging: str = "shared",
 ) -> "wp.Kernel":
-    """PGS world solve kernel that stages only the LOWER triangle of Delassus.
+    """PGS world solve kernel: one warp per world, the Delassus operator staged as ``staging`` names.
 
-    Shared memory footprint drops from M*M to M*(M+1)/2 floats.
-    Uses symmetry in dot: C(i,j) = L(i,j) if j<=i else L(j,i).
+    ``staging="shared"`` stages only the LOWER triangle of Delassus in shared
+    memory: the footprint drops from M*M to M*(M+1)/2 floats, and the dot uses
+    symmetry, C(i,j) = L(i,j) if j<=i else L(j,i). ``staging="global"`` reads
+    each row of the full, symmetric Delassus operator from global memory, for
+    capacities whose triangle exceeds a block's shared memory
+    (:func:`_tiled_row_staging`); both stagings sum the same terms in the same
+    order, so they produce the same impulses.
 
     C64/C128 budgets change only local storage, not global strides or
     the 32-lane GS reduction. Small budgets own ``min_rows < m <= row_budget``;
     the full-budget fallback also owns small worlds whose friction metadata
     reads outside the active prefix. A missing budget retains the original path.
     """
+    if staging not in TILED_ROW_STAGINGS:
+        raise ValueError(f"staging must be one of {TILED_ROW_STAGINGS}, got {staging!r}")
     if row_budget is not None:
         if (
             max_constraints not in (64, 128)
             or row_budget not in (16, 32, max_constraints)
             or not 0 <= min_rows < row_budget
+            or staging != "shared"
         ):
-            raise ValueError("Dense row budgets require C64/C128, budget 16/32/capacity, and 0 <= min_rows < budget")
+            raise ValueError(
+                "Dense row budgets require C64/C128, budget 16/32/capacity, 0 <= min_rows < budget and shared staging"
+            )
     elif min_rows != 0:
         raise ValueError("min_rows requires an explicit row_budget")
+    global_rows = staging == "global"
     TILE_M = max_constraints if row_budget is None else row_budget
     TILE_M_SQ = max_constraints * max_constraints
     TILE_TRI = TILE_M * (TILE_M + 1) // 2
@@ -15297,7 +15377,12 @@ def _get_pgs_solve_tiled_row_kernel(
     for k in range(ELEMS_PER_THREAD_1D):
         j = k * 32
         if j < TILE_M:
-            precompute_j.append(f"    const int j{k} = lane + {j};\n    const int jb{k} = (j{k} * (j{k} + 1)) >> 1;")
+            if global_rows:
+                precompute_j.append(f"    const int j{k} = lane + {j};")
+            else:
+                precompute_j.append(
+                    f"    const int j{k} = lane + {j};\n    const int jb{k} = (j{k} * (j{k} + 1)) >> 1;"
+                )
     precompute_j_code = "\n".join(precompute_j)
 
     # Dot code: guarded on j_k < m
@@ -15305,6 +15390,13 @@ def _get_pgs_solve_tiled_row_kernel(
     for k in range(ELEMS_PER_THREAD_1D):
         joff = k * 32
         if joff < TILE_M:
+            if global_rows:
+                dot_terms.append(
+                    f"""    if (j{k} < m) {{
+        my_sum += world_C.data[row_i + j{k}] * s_lam[j{k}];
+    }}"""
+                )
+                continue
             dot_terms.append(
                 f"""    if (j{k} < m) {{
         // Use symmetry to fetch C(i, j{k}) from packed-lower shared.
@@ -15313,7 +15405,8 @@ def _get_pgs_solve_tiled_row_kernel(
         my_sum += cij * s_lam[j{k}];
     }}"""
             )
-    dot_code = "\n".join(["float my_sum = 0.0f;", "int base_i = (i * (i + 1)) >> 1;", *dot_terms])
+    row_base = f"const int row_i = off2 + i * {stride_symbol};" if global_rows else "int base_i = (i * (i + 1)) >> 1;"
+    dot_code = "\n".join(["float my_sum = 0.0f;", row_base, *dot_terms])
 
     store_lines = []
     for k in range(ELEMS_PER_THREAD_1D):
@@ -15350,9 +15443,46 @@ def _get_pgs_solve_tiled_row_kernel(
         else:
             admission_code += f"    if (m <= {min_rows} && !unsupported) return;\n"
 
+    triangle_declaration = (
+        ""
+        if global_rows
+        else """
+    // Packed LOWER triangle of C in row-major (i*(i+1)/2 + j), j<=i
+    __shared__ float s_Ctri[TILE_TRI];
+"""
+    )
+    triangle_load = (
+        "    // Delassus rows stay in global memory: each update reads its row, coalesced across lanes.\n"
+        if global_rows
+        else f"""
+    // Load only the lower triangle of the active m x m block into packed shared.
+    // Rows >= m are never read by the sweep below, so they are not loaded.
+    // Work distribution: each lane walks rows; for each row i, lane loads j = lane, lane+32, lane+64...
+    for (int i = 0; i < m; ++i) {{
+        int base = (i * (i + 1)) >> 1; // packed base for row i
+        for (int j = lane; j <= i; j += 32) {{
+            s_Ctri[base + j] = world_C.data[off2 + i * {stride_symbol} + j];
+        }}
+    }}
+"""
+    )
+    if global_rows:
+        sibling_row = f"""                const int sib_row = off2 + sib * {stride_symbol};
+                for (int j = lane; j < m; j += 32) {{
+                    sibling_residual += world_C.data[sib_row + j] * s_lam[j];
+                }}"""
+        sibling_coupling = "world_C.data[sib_row + i]"
+    else:
+        sibling_row = """                int sib_base = (sib * (sib + 1)) >> 1;
+                for (int j = lane; j < m; j += 32) {
+                    float c = j <= sib ? s_Ctri[sib_base + j] : s_Ctri[((j * (j + 1)) >> 1) + sib];
+                    sibling_residual += c * s_lam[j];
+                }"""
+        sibling_coupling = "s_Ctri[sib_base + i]"
+
+    triangle_constant = "" if global_rows else f"\n    const int TILE_TRI = {TILE_TRI};"
     snippet = f"""    const int TILE_M = {TILE_M};{stride_constant}
-    const int TILE_M_SQ = {TILE_M_SQ};
-    const int TILE_TRI = {TILE_TRI};
+    const int TILE_M_SQ = {TILE_M_SQ};{triangle_constant}
     const unsigned MASK = 0xFFFFFFFF;
 
     int lane = threadIdx.x;
@@ -15360,10 +15490,7 @@ def _get_pgs_solve_tiled_row_kernel(
     int m = world_constraint_count.data[world];
     if (m == 0) return;
 {admission_code}
-
-    // Packed LOWER triangle of C in row-major (i*(i+1)/2 + j), j<=i
-    __shared__ float s_Ctri[TILE_TRI];
-
+{triangle_declaration}
     __shared__ float s_lam[TILE_M];
     __shared__ float s_rhs[TILE_M];
     __shared__ float s_diag[TILE_M];
@@ -15375,17 +15502,7 @@ def _get_pgs_solve_tiled_row_kernel(
     int off2 = world * TILE_M_SQ;
 
 {load_code}
-
-    // Load only the lower triangle of the active m x m block into packed shared.
-    // Rows >= m are never read by the sweep below, so they are not loaded.
-    // Work distribution: each lane walks rows; for each row i, lane loads j = lane, lane+32, lane+64...
-    for (int i = 0; i < m; ++i) {{
-        int base = (i * (i + 1)) >> 1; // packed base for row i
-        for (int j = lane; j <= i; j += 32) {{
-            s_Ctri[base + j] = world_C.data[off2 + i * {stride_symbol} + j];
-        }}
-    }}
-    __syncwarp();
+{triangle_load}    __syncwarp();
 
 {precompute_j_code}
 
@@ -15438,15 +15555,11 @@ def _get_pgs_solve_tiled_row_kernel(
                 if (i != parent_idx + 1) continue;
                 int sib = parent_idx + 2;
                 float sibling_residual = 0.0f;
-                int sib_base = (sib * (sib + 1)) >> 1;
-                for (int j = lane; j < m; j += 32) {{
-                    float c = j <= sib ? s_Ctri[sib_base + j] : s_Ctri[((j * (j + 1)) >> 1) + sib];
-                    sibling_residual += c * s_lam[j];
-                }}
+{sibling_row}
                 for (int offset = 16; offset > 0; offset >>= 1)
                     sibling_residual += __shfl_down_sync(MASK, sibling_residual, offset);
                 sibling_residual = __shfl_sync(MASK, sibling_residual, 0) + s_rhs[sib];
-                float2 pair = friction_pair_candidate(denom, s_Ctri[sib_base + i], s_diag[sib],
+                float2 pair = friction_pair_candidate(denom, {sibling_coupling}, s_diag[sib],
                     w_val, sibling_residual, s_lam[i], s_lam[sib], radius, omega);
                 float a = pair.x;
                 float b = pair.y;
@@ -15515,6 +15628,8 @@ def _get_pgs_solve_tiled_row_kernel(
         )
 
     suffix = "" if row_budget is None else f"_b{row_budget}_m{min_rows}"
+    if global_rows:
+        suffix += "_global"
     pgs_solve_tiled_template.__name__ = f"pgs_solve_tiled_row_{max_constraints}{suffix}"
     pgs_solve_tiled_template.__qualname__ = pgs_solve_tiled_template.__name__
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_tiled_template)

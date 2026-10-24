@@ -99,8 +99,8 @@ Reference and tolerances
 Findings
     Routes that fail a check at the gate's baseline (584eae97) are expected
     failures that name the finding: rigid-body speed limits (per-axis rows in
-    matrix-free mode, a predictor clamp in split mode), the tiled-row sweep's
-    shared memory for 384 rows, and the research friction modes.
+    matrix-free mode, a predictor clamp in split mode) and the research
+    friction modes.
 
 Runtime
     Small scenes (one or two worlds, 60 to 240 steps): with a warm kernel
@@ -1381,11 +1381,6 @@ def _laws(*laws):
 
 
 _WARM = {"pgs_warmstart": True}
-_TILED_ROW_FINDING = (
-    "split_tiled_row",
-    "pgs_mode='split' selects the tiled_row sweep on CUDA, whose kernel stages M (M + 1) / 2 Delassus floats in "
-    "shared memory: 305 KB for M = 384 rows, beyond the 227 KB of a GB300 block, so the first step fails to load it.",
-)
 _SPEED_AXES = (
     "Matrix-free mode bounds a free body's linear velocity per world axis (two rows per axis), so the diagonal "
     "push reaches sqrt(2) times rigid_body_max_linear_velocity; PhysX's maxLinearVelocity bounds the speed."
@@ -1479,7 +1474,6 @@ def cuda_groups() -> list:
                 _physics(scenes.long_chain(), law, 64),
                 ref,
                 (MF_DEFAULT, MF_PARALLEL, MF_PARALLEL_MATRIX_FREE, SPLIT_LOOP, SPLIT_TILED),
-                findings=(_TILED_ROW_FINDING,),
             ),
             Group(
                 _physics(scenes.torsion_pad(), law, 32, "torsion", contact_torsion_radius=0.05),
