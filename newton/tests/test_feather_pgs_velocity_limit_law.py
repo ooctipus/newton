@@ -46,8 +46,7 @@ _GENERATORS = {
         (
             "fmaxf(old_impulse - residual / denom, 0.0f)",  # dense rows of a velocity-limit row phase
             "fmaxf(old_vlim - residual_vlim / denom, 0.0f)",  # end-of-iteration dense pass
-            "fmaxf(old_mf_vlim - residual_mf_vlim * mf_diag, 0.0f)",  # end-of-iteration free-body pass
-            "fmaxf(old_impulse - residual * mf_diag, 0.0f)",  # the contact loop's unreachable free-body branch
+            "fmaxf(old_mf_vlim - residual_mf_vlim * mf_diag, 0.0f)",  # end-of-iteration free-body speed pass
         ),
     ),
     "mf_gs_without_dense_limits": (
@@ -57,7 +56,6 @@ _GENERATORS = {
         (
             "fmaxf(old_impulse - residual / denom, 0.0f)",
             "fmaxf(old_mf_vlim - residual_mf_vlim * mf_diag, 0.0f)",
-            "fmaxf(old_impulse - residual * mf_diag, 0.0f)",
         ),
     ),
     "mf_gs_streamed": (
@@ -68,7 +66,6 @@ _GENERATORS = {
             "fmaxf(old_impulse - residual / denom, 0.0f)",
             "fmaxf(old_vlim - residual_vlim / denom, 0.0f)",
             "fmaxf(old_mf_vlim - residual_mf_vlim * mf_diag, 0.0f)",
-            "fmaxf(old_impulse - residual * mf_diag, 0.0f)",
         ),
     ),
     "mf_gs_global_metadata": (
@@ -79,7 +76,6 @@ _GENERATORS = {
             "fmaxf(old_impulse - residual / denom, 0.0f)",
             "fmaxf(old_vlim - residual_vlim / denom, 0.0f)",
             "fmaxf(old_mf_vlim - residual_mf_vlim * mf_diag, 0.0f)",
-            "fmaxf(old_impulse - residual * mf_diag, 0.0f)",
         ),
     ),
     "incremental": (

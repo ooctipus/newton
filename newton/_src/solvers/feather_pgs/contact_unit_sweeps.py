@@ -65,7 +65,9 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
+    free_body_speed_dof,
     friction_step_current,
+    project_free_body_speed,
 )
 
 CONTACT_UPDATES = ("sequential", "unit")
@@ -1204,6 +1206,14 @@ def pgs_solve_mf_loop_unit(
             ba = mf_body_a[world, i]
             bb = mf_body_b[world, i]
 
+            if row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
+                # A free body's speed row, behind every other row: the stateless clamp of its speed.
+                if ba >= 0:
+                    dof = art_dof_start[body_to_articulation[ba]] + free_body_speed_dof(mf_J_a, world, i)
+                    projected = project_free_body_speed(v_out, dof, mf_rhs[world, i], eff_inv, 0.0, 0)
+                    mf_impulses[world, i] = projected[0]
+                continue
+
             jv = float(0.0)
             if ba >= 0:
                 art_a = body_to_articulation[ba]
@@ -1225,16 +1235,9 @@ def pgs_solve_mf_loop_unit(
                     w = mf_row_w[world, i]
                 delta = -residual * eff_inv * w - (1.0 - w) * old_impulse
             new_impulse = old_impulse + omega * delta
-            delta_impulse = float(0.0)
 
             if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
                 if new_impulse < 0.0:
-                    new_impulse = 0.0
-            elif row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
-                if residual < 0.0:
-                    delta_impulse = delta
-                    new_impulse = delta
-                else:
                     new_impulse = 0.0
             elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
                 new_impulse = friction_step_current(
@@ -1257,8 +1260,7 @@ def pgs_solve_mf_loop_unit(
                     v_out,
                 )
 
-            if row_type != PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
-                delta_impulse = new_impulse - old_impulse
+            delta_impulse = new_impulse - old_impulse
             mf_impulses[world, i] = new_impulse
 
             if ba >= 0:

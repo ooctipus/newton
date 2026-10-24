@@ -1807,12 +1807,17 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "articulation-local mixed-world parity requires CUDA")
     def test_free_body_velocity_limit_rows_stay_on_general_owner(self):
-        """Keep worlds with free-body velocity-limit rows on the general owner."""
+        """Keep worlds with free-body velocity-limit rows on the general owner.
+
+        The rows exist from the first step (activation fraction 0) and never act: the arm sets the body moving
+        below the limit, so both owners solve the same problem. An acting speed row couples the struck body's
+        velocity to the arm's contact, where the two response kernels' rounding leaves near-zero impulses apart.
+        """
         run_kwargs = {
             "warmstart": False,
             "preelimination": False,
             "inactive_joint_limit_capacity": True,
-            "model_kwargs": {"free_body_velocity_limit": 1.0},
+            "model_kwargs": {"free_body_velocity_limit": 5.0},
         }
         general_solver, general = _run_mixed_response("tiled", **run_kwargs)
         local_solver, local = _run_mixed_response("par_row", **run_kwargs)
@@ -1821,6 +1826,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         self.assertTrue(local_solver._local_internal_fast_path)
         limited = [sample for sample in local if np.any(sample[9] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)]
         self.assertTrue(limited, "free body never produced a velocity-limit row")
+        for sample in general + local:
+            np.testing.assert_array_equal(sample[8][sample[9] == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT], 0.0)
         # The residual owner is eligible for this world; only the velocity-limit rows keep it general.
         self.assertGreaterEqual(int(local_solver._local_residual_pair_articulation.numpy()[0]), 0)
         for sample in limited:

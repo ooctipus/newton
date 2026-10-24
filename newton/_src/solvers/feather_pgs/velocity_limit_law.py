@@ -3,9 +3,12 @@
 
 """The velocity-limit row law that the serial sweeps' code generators share.
 
-A joint or free-body velocity-limit row is unilateral, ``r = J v + b >= 0``,
-with ``b`` the negated speed limit and ``d`` the row's diagonal. Two laws decide
-what a sweep does with it:
+A joint velocity-limit row is unilateral, ``r = J v + b >= 0``, with ``J`` signed
+by the side of the limit it bounds, ``b`` set by the speed limit and ``d`` the
+row's diagonal. A free body's velocity-limit row is a speed row: it bounds the
+magnitude of the body's linear or angular velocity, ``r = b - |v| >= 0`` with
+``b`` the limit, and its correction acts along ``v``. Two laws decide what a
+sweep does with a row:
 
 * ``"stateless"`` is PhysX's clamp. Each visit applies only the impulse that
   removes the current overshoot, ``max(-r / d, 0)``, and stores that correction

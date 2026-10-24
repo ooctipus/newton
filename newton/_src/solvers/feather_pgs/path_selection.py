@@ -19,6 +19,7 @@ import math
 import numpy as np
 
 from ...sim.contacts import CAPACITY_BLOCKS_PER_SM
+from .conditioning import DEEP_CHAIN_JOINTS
 from .contact_row_plan import contact_row_plan
 from .friction_patches import _CHUNK_SORT_CAPACITY, _LIVE_SORT_CAPACITY, _SORT_SLOT_BITS
 
@@ -722,6 +723,9 @@ def _sweep(solver, source) -> dict:
             dense = {
                 "kernels": [_key(kernel) for kernel in budgets or (solver._pgs_solve_tiled_row_kernel,)],
                 "row_budgets": bool(budgets),
+                # Where the sweep reads the Delassus operator, chosen from the device's shared memory per block.
+                "staging": solver._tiled_row_staging,
+                "staging_reason": solver._tiled_row_staging_reason,
             }
         else:
             loop = source.pgs_solve_loop_unit if solver._dense_contact_unit else source.pgs_solve_loop
@@ -1076,18 +1080,14 @@ def _velocity_limits(solver) -> dict:
         "prescale_lanes": int(solver._velocity_prescale_lanes) if prescale else 0,
         "activation_fraction": json_value(solver.velocity_limit_activation_fraction),
         "rigid_body_limits": limits,
-        # Mirrors _allocate_mf_buffers and the row allocation of _stage4_build_rows (both modes),
-        # and _clamp_rigid_velocity_limits for free articulation roots. At an infinite activation
-        # fraction the allocator still launches but reserves no row.
+        # Mirrors _allocate_mf_buffers and the row allocation of _stage4_build_rows (both modes). At an
+        # infinite activation fraction the allocator still launches but reserves no row.
         "free_body_rows": bool(limits and solver._free_rigid_body_count > 0),
         # The law of split mode's free-body sweep (sweep.free_body_matrix_free) for these rows.
         "free_body_sweep_law": free_body_law,
         "free_body_sweep_law_reason": free_body_law_reason,
-        "root_clamp": bool(
-            limits
-            and solver._has_root_free
-            and not (matrix_free and getattr(solver, "rigid_velocity_limit_slot", None) is not None)
-        ),
+        # Split mode's clamp of the solved velocity of free roots (_stage6_clamp_rigid_velocity_limits).
+        "root_clamp": bool(limits and solver._has_root_free and not matrix_free),
     }
 
 
@@ -1097,10 +1097,11 @@ def _split_free_body_velocity_limit_law(solver) -> tuple[str | None, str]:
         return None, "No split free-body sweep: matrix-free mode, native sparse split rows or no free rigid bodies."
     if solver._has_free_body_velocity_limit_rows:
         return "stateless", (
-            "A violated free-body velocity-limit row pushes by its whole, unrelaxed correction and keeps that "
-            "correction instead of an accumulated impulse; the rows end every iteration. The CPU loop applies "
-            "this law and CUDA builds the _vlim sweep for it; velocity_limit_law selects the law of the "
-            "matrix-free sweeps and does not apply here."
+            "A free body's speed row bounds the magnitude of its linear or angular velocity: past the limit it "
+            "pushes, along the velocity, by its whole unrelaxed correction and keeps that correction instead of "
+            "an accumulated impulse; the rows end every iteration. The CPU loop applies this law and CUDA builds "
+            "the _vlim sweep for it; velocity_limit_law selects the law of the matrix-free sweeps and does not "
+            "apply here."
         )
     if solver._has_rigid_body_velocity_limits:
         return None, "velocity_limit_activation_fraction=inf reserves no free-body velocity-limit row."
@@ -1293,6 +1294,28 @@ def _dynamics(solver, source) -> dict:
         "connect_rows": int(solver._connect_count or 0),
         "loop_joints": bool(solver._has_loop_joints),
         "prescribed_response": bool(solver._has_prescribed_response),
+        "armature_floor": _armature_floor(solver),
+    }
+
+
+def _armature_floor(solver) -> dict:
+    # Mirrors _kinematic_state: the armature conditioning_armature added to deep articulations.
+    floor = solver._armature_floor
+    if floor.evaluated == 0:
+        reason = f"No articulation has a root-to-leaf path of {DEEP_CHAIN_JOINTS} joints or more; none is evaluated."
+    elif floor.coordinates == 0:
+        reason = "Every pivot of the evaluated mass matrices clears 4 n u of its diagonal; no armature is added."
+    else:
+        reason = (
+            "Pivots of the evaluated mass matrices fell below 4 n u of their diagonal, beyond float32 "
+            "factorization: the least armature that lifts them there is added."
+        )
+    return {
+        "evaluated_articulations": floor.evaluated,
+        "articulations": floor.articulations,
+        "coordinates": floor.coordinates,
+        "largest": float(floor.largest),
+        "reason": reason,
     }
 
 

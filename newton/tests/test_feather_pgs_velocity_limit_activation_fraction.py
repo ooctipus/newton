@@ -52,8 +52,7 @@ def _allocated_rigid_velocity_slots(
     qd6, *, fraction: float, lin_limit: float = 1.0, ang_limit: float = 1.0, resolved: bool = False
 ):
     device = "cpu"
-    rigid_velocity_limit_slot = wp.full((12,), 91, dtype=wp.int32, device=device)
-    rigid_velocity_limit_sign = wp.full((12,), 19.0, dtype=wp.float32, device=device)
+    rigid_velocity_limit_slot = wp.full((2,), 91, dtype=wp.int32, device=device)
     mf_slot_counter = wp.zeros((1,), dtype=wp.int32, device=device)
 
     wp.launch(
@@ -73,22 +72,17 @@ def _allocated_rigid_velocity_slots(
             64,
             wp.array([int(resolved)], dtype=wp.int32, device=device),
         ],
-        outputs=[rigid_velocity_limit_slot, rigid_velocity_limit_sign, mf_slot_counter],
+        outputs=[rigid_velocity_limit_slot, mf_slot_counter],
         device=device,
     )
-    return (
-        rigid_velocity_limit_slot.numpy().tolist(),
-        rigid_velocity_limit_sign.numpy().tolist(),
-        int(mf_slot_counter.numpy()[0]),
-    )
+    return rigid_velocity_limit_slot.numpy().tolist(), int(mf_slot_counter.numpy()[0])
 
 
 class TestFeatherPGSVelocityLimitActivationFraction(unittest.TestCase):
     def test_resolved_world_clears_stale_rigid_slots_without_allocating(self):
         """Resolved worlds leave no stale velocity-limit publication metadata."""
-        slots, signs, count = _allocated_rigid_velocity_slots([0.0] * 6, fraction=0.0, resolved=True)
-        self.assertEqual(slots, [-1] * 12)
-        self.assertEqual(signs, [0.0] * 12)
+        slots, count = _allocated_rigid_velocity_slots([0.0] * 6, fraction=0.0, resolved=True)
+        self.assertEqual(slots, [-1, -1])
         self.assertEqual(count, 0)
 
     def test_solver_rejects_invalid_velocity_limit_activation_fraction(self):
@@ -139,31 +133,33 @@ class TestFeatherPGSVelocityLimitActivationFraction(unittest.TestCase):
                 self.assertEqual(signs, [1.0, -1.0])
                 self.assertEqual(count, 2)
 
-    def test_fraction_zero_preserves_always_allocate_rigid_rows(self):
-        slots, signs, count = _allocated_rigid_velocity_slots([0.0] * 6, fraction=0.0)
-        self.assertEqual(slots, list(range(12)))
-        self.assertEqual(signs, [1.0, -1.0] * 6)
-        self.assertEqual(count, 12)
+    def test_fraction_zero_allocates_every_limited_speed_row(self):
+        """Allocate the linear and the angular speed row of a limited free body whatever its velocity."""
+        slots, count = _allocated_rigid_velocity_slots([0.0] * 6, fraction=0.0)
+        self.assertEqual(slots, [0, 1])
+        self.assertEqual(count, 2)
+        slots, count = _allocated_rigid_velocity_slots([0.0] * 6, fraction=0.0, lin_limit=float("inf"))
+        self.assertEqual(slots, [-1, 0])
+        self.assertEqual(count, 1)
 
     def test_fraction_gates_static_rigid_body_to_zero_rows(self):
-        slots, signs, count = _allocated_rigid_velocity_slots([0.0] * 6, fraction=0.9)
-        self.assertEqual(slots, [-1] * 12)
-        self.assertEqual(signs, [0.0] * 12)
+        """Reserve no speed row for a free body at rest under a positive fraction."""
+        slots, count = _allocated_rigid_velocity_slots([0.0] * 6, fraction=0.9)
+        self.assertEqual(slots, [-1, -1])
         self.assertEqual(count, 0)
 
-    def test_rigid_axis_past_threshold_allocates_rows_same_step(self):
-        # Only the linear-z axis (axis 2 -> slot indices 4, 5) exceeds the
-        # 90% activation threshold; its pair allocates this step.
-        slots, signs, count = _allocated_rigid_velocity_slots([0.0, 0.0, 0.95, 0.0, 0.0, 0.0], fraction=0.9)
-        expected_slots = [-1] * 12
-        expected_slots[4] = 0
-        expected_slots[5] = 1
-        expected_signs = [0.0] * 12
-        expected_signs[4] = 1.0
-        expected_signs[5] = -1.0
-        self.assertEqual(slots, expected_slots)
-        self.assertEqual(signs, expected_signs)
-        self.assertEqual(count, 2)
+    def test_rigid_speed_past_threshold_allocates_row_same_step(self):
+        """Gate a speed row on the magnitude of its velocity, not on one component.
+
+        Each component of the linear velocity (0.6, 0.6, 0.2) is below 90% of the limit, its magnitude (0.87)
+        is not; the angular velocity is at rest.
+        """
+        slots, count = _allocated_rigid_velocity_slots([0.6, 0.6, 0.2, 0.0, 0.0, 0.0], fraction=0.85)
+        self.assertEqual(slots, [0, -1])
+        self.assertEqual(count, 1)
+        slots, count = _allocated_rigid_velocity_slots([0.0, 0.0, 0.0, -0.7, 0.0, 0.7], fraction=0.9)
+        self.assertEqual(slots, [-1, 0])
+        self.assertEqual(count, 1)
 
 
 if __name__ == "__main__":

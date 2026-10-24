@@ -1,20 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Hold split-mode free rigid bodies to the stateless velocity-limit law on every device.
+"""Hold split-mode free rigid bodies to the stateless speed law on every device.
 
 Split mode sweeps free-body rows after the dense rows: on the CPU in ``pgs_solve_mf_loop``, on CUDA in the
-shared-memory sweep of ``_get_pgs_solve_mf_kernel``. Each finitely limited body axis owns a lower and an
-upper velocity-limit row (``J = +e`` and ``-e``, ``rhs = limit``) at the tail of its world's rows. The
-stateless law pushes a row only while its limit is violated (``J v + rhs < 0``), by the whole correction
-whatever ``pgs_omega`` relaxes, and keeps that correction rather than an accumulated impulse. A sweep that
-relaxes these rows as bilateral rows drives every limited axis onto its limit instead, so it accelerates a
+shared-memory sweep of ``_get_pgs_solve_mf_kernel``. Each finite speed limit of a body owns a speed row at
+the tail of its world's rows: it bounds the magnitude of the body's linear or angular velocity, as PhysX's
+``maxLinearVelocity`` and ``maxAngularVelocity`` do, with ``J = e_0`` or ``e_3`` naming which and
+``rhs = limit``. The stateless law pushes a row only while its speed exceeds the limit, along the velocity,
+by the whole correction whatever ``pgs_omega`` relaxes, and keeps that correction rather than an accumulated
+impulse: a body past its limit keeps its direction and ends on the limit. Per-axis rows would let a diagonal
+velocity reach ``sqrt(3)`` times the limit; a sweep that relaxed the rows as bilateral rows would accelerate a
 body that moves below its limit.
 
-Split mode also scales each free body's predicted velocity onto its speed limits before the rows are built,
-and its solved velocity after the sweep (the root clamp). In free flight every row therefore finds its limit
-satisfied and must not move the body. The rows act inside a step where another row of the sweep pushes a
-body past a limit, as a contact row pushes a body out of the ground.
+Split mode leaves the predicted velocity alone, so the contact rows act on it first, and scales the solved
+velocity of every free root onto its speed limits after the sweep (the root clamp). The rows act wherever the
+predicted velocity or another row of the sweep sets a body past a limit, as a force pushes a body along the
+ground or a contact row pushes it out of the ground.
 """
 
 import unittest
@@ -32,6 +34,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_pgs_solve_mf_kernel
 from newton.solvers import SolverFeatherPGS
+from newton.tests import feather_pgs_scenes as scenes
 
 DT = 1.0 / 60.0
 # Speed limits of every free box [m/s, rad/s].
@@ -61,9 +64,10 @@ PAST = (
     ((-3.0, 1.0, 0.0), (0.0, -4.0, 1.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
     ((1.5, 0.0, 0.0), (0.0, 0.0, 1.0), (-5.0, 0.5, 0.0), (0.0, 0.0, -6.0)),
 )
-# Per-axis sweep inputs: every axis past its limit on one side or the other, or inside it.
-SWEEP_LINEAR = ((3.0, -2.5, 1.0), (-1.0, 0.5, -2.0), (0.0, 4.0, -7.0))
-SWEEP_ANGULAR = ((-3.5, 0.0, 2.9), (5.0, -1.0, -3.0), (0.2, -6.0, 3.1))
+# Sweep inputs per world: speeds past their limit, within it, and past it along a diagonal whose every component
+# is within the limit.
+SWEEP_LINEAR = ((3.0, -2.5, 1.0), (-1.0, 0.5, -1.0), (1.5, 1.5, 0.5))
+SWEEP_ANGULAR = ((-3.5, 0.0, 2.9), (2.0, -1.0, -1.5), (2.2, -2.2, 0.5))
 
 # Spheres pressed into the ground [m], one per world. A contact row pushes each out at its Baumgarte speed
 # (pgs_beta * depth / DT: 0.06, 0.12 and 0.24 m/s), below or past the linear limit CONTACT_LIMIT [m/s].
@@ -237,7 +241,10 @@ def _step(run):
 
 
 def _free_body_rows(run):
-    """Return each world's free-body row types, axes, signs, right-hand sides and impulses: [world, row]."""
+    """Return each world's free-body row types, axes, signs, right-hand sides and impulses: [world, row].
+
+    A speed row's axis is the first DOF of the velocity it bounds: 0 for the linear, 3 for the angular.
+    """
     solver = run.solver
     count = solver.mf_constraint_count.numpy()
     rows = int(count.max())
@@ -266,20 +273,26 @@ def _assert_on_limit_scale(actual, desired, limits=LIMITS):
     np.testing.assert_allclose(np.asarray(actual) / limits, np.asarray(desired) / limits, rtol=0.0, atol=RTOL)
 
 
-def _clamped_magnitudes(velocity):
+def _speeds(velocity):
+    """Linear and angular speed of each world: [world, 2]."""
+    velocity = np.asarray(velocity, dtype=np.float64)
+    return np.stack((np.linalg.norm(velocity[:, :3], axis=1), np.linalg.norm(velocity[:, 3:], axis=1)), axis=1)
+
+
+def _clamped_magnitudes(velocity, limits=(LINEAR_LIMIT, ANGULAR_LIMIT)):
     """Scale each world's linear and angular velocity onto its limit where it exceeds it: [world, 6]."""
     clamped = np.array(velocity, dtype=np.float64)
-    for part, limit in ((slice(0, 3), LINEAR_LIMIT), (slice(3, 6), ANGULAR_LIMIT)):
+    for part, limit in zip((slice(0, 3), slice(3, 6)), limits, strict=True):
         speed = np.linalg.norm(clamped[:, part], axis=1, keepdims=True)
         clamped[:, part] *= np.minimum(1.0, limit / np.maximum(speed, 1.0e-30))
     return clamped
 
 
 def _sweep(device, *, iterations, articulated=False, omega=1.0):
-    """Sweep each box's velocity-limit rows ``iterations`` times from the ``SWEEP_*`` velocities.
+    """Sweep each box's speed rows ``iterations`` times from the ``SWEEP_*`` velocities.
 
-    A step at rest builds the rows (``velocity_limit_activation_fraction=0`` allocates all twelve); the sweep
-    then starts from velocities that the step's predictor clamp never saw, so the rows alone decide.
+    A step at rest builds the rows (``velocity_limit_activation_fraction=0`` allocates both); the sweep then
+    starts from velocities that the step never saw, so the rows alone decide.
     """
     run = _free_boxes(
         device, [((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))] * len(SWEEP_LINEAR), articulated=articulated, omega=omega
@@ -305,44 +318,57 @@ class _SplitVelocityLimitChecks:
     device = "cpu"
 
     def check_rows_are_velocity_limits(self, run):
-        """Every box owns its twelve velocity-limit rows, on both sides of each axis."""
+        """Every box owns its two speed rows: the linear (axis 0) and the angular (axis 3) one."""
         rows = _free_body_rows(run)
-        np.testing.assert_array_equal(rows.count, 12)
+        np.testing.assert_array_equal(rows.count, 2)
         np.testing.assert_array_equal(rows.type, PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
         for world in range(rows.type.shape[0]):
             pairs = sorted(zip(rows.axis[world].tolist(), rows.sign[world].tolist(), strict=True))
-            self.assertEqual(pairs, [(axis, sign) for axis in range(6) for sign in (-1.0, 1.0)])
+            self.assertEqual(pairs, [(0, 1.0), (3, 1.0)])
         np.testing.assert_allclose(rows.rhs, LIMITS[rows.axis], rtol=1.0e-6)
 
     def test_sweep_pushes_only_violated_limits(self):
-        """Push each violated limit back by its whole, unrelaxed correction; satisfied rows keep zero impulse."""
+        """Push each speed past its limit back along its velocity by the whole, unrelaxed correction.
+
+        Speeds within their limit keep their velocity and their row zero impulse, also where every component of
+        a diagonal velocity is within the limit but its magnitude is not.
+        """
         for articulated in (False, True):
             for omega in (1.0, RELAXED_OMEGA):
                 with self.subTest(articulated=articulated, omega=omega):
                     swept = _sweep(self.device, iterations=1, articulated=articulated, omega=omega)
                     rows = swept.rows
-                    # One sweep: a violated axis lands on its limit, an axis inside both limits keeps its velocity.
-                    _assert_on_limit_scale(swept.velocity, np.clip(swept.start, -LIMITS, LIMITS))
-                    inside = np.abs(swept.start) <= LIMITS
-                    np.testing.assert_allclose(swept.velocity[inside], swept.start[inside], rtol=0.0, atol=1.0e-6)
+                    # One sweep: a speed past its limit lands on it along its own direction.
+                    _assert_on_limit_scale(swept.velocity, _clamped_magnitudes(swept.start))
+                    speeds = _speeds(swept.start)
+                    inside = speeds <= np.array([LINEAR_LIMIT, ANGULAR_LIMIT])
+                    for column, part in ((0, slice(0, 3)), (1, slice(3, 6))):
+                        np.testing.assert_allclose(
+                            swept.velocity[inside[:, column], part],
+                            swept.start[inside[:, column], part],
+                            rtol=0.0,
+                            atol=1.0e-6,
+                        )
                     # Each row stores the stateless correction it applied from the starting velocity.
-                    residual = rows.sign * np.take_along_axis(swept.start, rows.axis, axis=1) + rows.rhs
-                    correction = np.where(residual < 0.0, -residual * rows.eff_mass_inv, 0.0)
+                    speed = np.take_along_axis(speeds, rows.axis // 3, axis=1)
+                    correction = np.where(speed > rows.rhs, (speed - rows.rhs) * rows.eff_mass_inv, 0.0)
                     np.testing.assert_allclose(swept.impulses, correction, rtol=RTOL, atol=0.0)
-                    self.assertTrue(np.any(correction > 0.0))
+                    self.assertTrue(np.any(correction > 0.0) and np.any(correction == 0.0))
+                    # The diagonal world: every component within the limit, both speeds past it.
+                    self.assertTrue(np.all(np.abs(swept.start[2]) < LIMITS) and not np.any(inside[2]))
 
     def test_sweep_keeps_corrections_not_accumulated_impulses(self):
         """Converge onto the limits and store each row's last correction, not the impulse it accumulated."""
         swept = _sweep(self.device, iterations=12)
-        _assert_on_limit_scale(swept.velocity, np.clip(swept.start, -LIMITS, LIMITS))
+        _assert_on_limit_scale(swept.velocity, _clamped_magnitudes(swept.start))
         # The first sweep applied up to MASS * 5 m/s; the last finds the limits satisfied to cfm rounding.
         self.assertLess(np.abs(swept.impulses).max(), 1.0e-4)
 
     def test_step_keeps_speeds_below_the_limits(self):
         """Keep the velocity of a free body that moves below its limits and feels no other force.
 
-        The root clamp leaves such a velocity alone, so every velocity-limit row finds its limit satisfied
-        and must not move the body: a bilateral relaxation would drive each axis onto a limit.
+        Every speed row finds its limit satisfied and must not move the body: a bilateral relaxation would
+        drive each axis onto a limit.
         """
         for articulated in (False, True):
             for fraction in (0.0, 0.7):
@@ -362,9 +388,9 @@ class _SplitVelocityLimitChecks:
     def test_step_clamps_speeds_past_the_limits(self):
         """Hold a free body launched or pushed past its limits on them, along its own direction.
 
-        The root clamp scales the predicted velocity onto the limits before the rows are built, so the rows
-        find their limits satisfied and must not move the body; :meth:`test_step_holds_a_contact_push_on_the_limit`
-        covers the rows holding a body inside a step.
+        The speed rows scale the predicted velocity onto the limits in the sweep's first iteration and find
+        them satisfied in its last, which keeps a zero correction; the root clamp after the sweep finds the
+        speeds on their limits.
         """
         worlds = [(linear, angular) for linear, angular, _, _ in PAST]
         wrenches = [np.concatenate((force, torque)) for _, _, force, torque in PAST]
@@ -382,13 +408,38 @@ class _SplitVelocityLimitChecks:
                 np.testing.assert_allclose(speeds, [[LINEAR_LIMIT, ANGULAR_LIMIT]] * len(PAST), rtol=RTOL)
                 np.testing.assert_allclose(_velocity_limit_impulses(run), 0.0, rtol=0.0, atol=1.0e-6)
 
+    def test_step_holds_a_pushed_box_on_the_limit(self):
+        """Hold a box that a force pushes along frictionless ground on its speed limit, along the push.
+
+        Gravity's increment to the predicted velocity is the ground contact's to remove: a speed bound applied to
+        the predicted velocity, before the contact acts, would leave the box 0.25% below its limit. One box is
+        pushed along an axis, one along a diagonal (the conformance gate's scene).
+        """
+        scene = scenes.box_push()
+        model = scene.build(self.device)
+        solver = SolverFeatherPGS(model, pgs_mode="split", angular_damping=0.0, friction_anchor_beta=0.0)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        for step in range(scene.steps):
+            state_0.clear_forces()
+            scene.control(model, control, state_0, step)
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, scene.dt)
+            state_0, state_1 = state_1, state_0
+        velocity = state_0.body_qd.numpy()[:, :3]
+        np.testing.assert_allclose(np.linalg.norm(velocity, axis=1), scene.params["speed_limit"], rtol=1.0e-4)
+        np.testing.assert_allclose(velocity[1, 0], velocity[1, 1], rtol=1.0e-4)
+
     def test_step_holds_a_contact_push_on_the_limit(self):
         """End a step on the limit that a contact row pushed a free body past, keeping only the last correction.
 
         A sphere pressed into the ground leaves it at the Baumgarte speed ``-rhs`` of its contact row, which
-        the root clamp before the sweep does not see. In every iteration the contact row pushes the sphere
-        to that speed and the velocity-limit rows behind it take the overshoot back, so the step ends on the
-        limit and the upper row keeps the overshoot of the last iteration, not the sum over all iterations.
+        the predicted velocity does not hold. In every iteration the contact row pushes the sphere
+        to that speed and the linear speed row behind it takes the overshoot back, so the step ends on the
+        limit and the row keeps the overshoot of the last iteration, not the sum over all iterations.
         """
         for articulated in (False, True):
             with self.subTest(articulated=articulated):
@@ -398,16 +449,16 @@ class _SplitVelocityLimitChecks:
                 contact = rows.type == PGS_CONSTRAINT_TYPE_CONTACT
                 limit = rows.type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
                 np.testing.assert_array_equal(contact.sum(axis=1), 1)
-                np.testing.assert_array_equal(limit.sum(axis=1), 12)
+                np.testing.assert_array_equal(limit.sum(axis=1), 2)
                 push = -rows.rhs[contact]
                 # One sphere leaves below its limit; the others would overshoot it.
                 self.assertTrue(np.any(push < CONTACT_LIMIT) and np.any(push > 1.1 * CONTACT_LIMIT))
                 expected = np.zeros((len(DEPTHS), 6))
                 expected[:, 2] = np.minimum(push, CONTACT_LIMIT)
                 _assert_on_limit_scale(velocity, expected, CONTACT_LIMITS)
-                upper_z = limit & (rows.axis == 2) & (rows.sign < 0.0)
+                linear = limit & (rows.axis == 0)
                 overshoot = np.maximum(push - CONTACT_LIMIT, 0.0)[:, None]
-                correction = np.where(upper_z, overshoot * rows.eff_mass_inv, 0.0)
+                correction = np.where(linear, overshoot * rows.eff_mass_inv, 0.0)
                 np.testing.assert_allclose(
                     np.where(limit, rows.impulses, 0.0), correction, rtol=0.0, atol=RTOL * CONTACT_LIMIT * MASS
                 )
@@ -534,9 +585,10 @@ class TestSplitFreeBodyVelocityLimitsCUDA(_SplitVelocityLimitChecks, unittest.Te
                 for _ in range(3):
                     velocity = _step(cuda)
                     _assert_on_limit_scale(velocity, _step(cpu), CONTACT_LIMITS)
-                    # Every axis of every body stays within its limit.
-                    bound = np.broadcast_to(CONTACT_LIMITS * (1.0 + RTOL), velocity.shape)
-                    np.testing.assert_array_less(np.abs(velocity), bound)
+                    # Every speed of every body stays within its limit.
+                    speeds = _speeds(velocity)
+                    bound = np.broadcast_to(np.array([CONTACT_LIMIT, ANGULAR_LIMIT]) * (1.0 + RTOL), speeds.shape)
+                    np.testing.assert_array_less(speeds, bound)
                     expected, actual = _free_body_rows(cpu), _free_body_rows(cuda)
                     np.testing.assert_array_equal(actual.count, expected.count)
                     np.testing.assert_array_equal(actual.type, expected.type)

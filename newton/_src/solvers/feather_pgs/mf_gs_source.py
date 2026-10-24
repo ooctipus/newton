@@ -1080,9 +1080,9 @@ def get_source(
                 continue;
             }"""
     )
-    # Every visit of a velocity-limit row: the end-of-iteration dense and free-body passes, the
-    # dense rows of a velocity-limit row phase (row_phase 5), and the contact loop's free-body
-    # branch, which the contact-first row order never reaches.
+    # Every visit of a velocity-limit row: the end-of-iteration dense and free-body passes and the
+    # dense rows of a velocity-limit row phase (row_phase 5). A free body's velocity-limit row is a
+    # speed row: its residual is the limit minus the speed of the velocity it bounds.
     if accumulated_limits:
         # Lane 0 owns a dense total, as it owns the scalar dense rows' impulses.
         dense_velocity_limit_law = (
@@ -1122,9 +1122,6 @@ def get_source(
             )
             + "            }"
         )
-        mf_velocity_limit_row = accumulated_update(
-            "old_impulse", "residual * mf_diag", new="new_impulse", delta="delta_impulse", indent=" " * 16
-        ).rstrip("\n")
     else:
         dense_velocity_limit_law = """                float delta_vlim = -residual_vlim / denom;
                 float delta_impulse_vlim = 0.0f;
@@ -1150,13 +1147,6 @@ def get_source(
                     new_impulse = 0.0f;
                 }
             }"""
-        mf_velocity_limit_row = """                if (residual < 0.0f) {
-                    delta_impulse = delta;
-                    new_impulse = delta_impulse;
-                } else {
-                    delta_impulse = 0.0f;
-                    new_impulse = 0.0f;
-                }"""
     dense_velocity_limit_phase = (
         f"""
         if (row_phase == 0 || row_phase == 2) {{
@@ -1359,17 +1349,14 @@ def get_source(
                 delta = -residual * mf_diag * w - (1.0f - w) * old_impulse;
             }}
             float new_impulse = old_impulse + omega * delta;
-            float delta_impulse = 0.0f;
 
             if (mf_rt == 0) {{
                 if (new_impulse < 0.0f) new_impulse = 0.0f;
-            }} else if (mf_rt == 4) {{
-{mf_velocity_limit_row}
             }} else if (mf_rt == 2) {{
                 {mf_friction_block}
             }}
 
-            if (mf_rt != 4) delta_impulse = new_impulse - old_impulse;
+            float delta_impulse = new_impulse - old_impulse;
             s_lam_mf[i] = new_impulse;
 
             // V update using prefetched MiJt values
@@ -1403,35 +1390,27 @@ def get_source(
 
                 int packed_dofs = meta.x;
                 int dof_a = packed_dofs >> 16;
-                int dof_b = (packed_dofs << 16) >> 16;
                 float mf_diag = __int_as_float(meta.y);
-                if (mf_diag <= 0.0f) continue;
+                if (mf_diag <= 0.0f || dof_a < 0) continue;
 
+                // A free body's speed row bounds the magnitude of its linear (J = e_0) or angular
+                // (J = e_3) velocity: lanes 0-2 hold its components.
                 int row_mf6 = mf6_base + i * 6;
-                float my_sum_mf_vlim = 0.0f;
-                if (lane < 6 && dof_a >= 0) {{
-                    my_sum_mf_vlim = mf_J_a.data[row_mf6 + lane] {mf_velocity("dof_a + lane")};
-                }}
-                if (lane >= 6 && lane < 12 && dof_b >= 0) {{
-                    my_sum_mf_vlim = mf_J_b.data[row_mf6 + lane - 6] {mf_velocity("dof_b + lane - 6")};
-                }}
-                my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 16);
-                my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 8);
-                my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 4);
-                my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 2);
-                my_sum_mf_vlim += __shfl_down_sync(MASK, my_sum_mf_vlim, 1);
-                float jv_mf_vlim = __shfl_sync(MASK, my_sum_mf_vlim, 0);
+                const int speed_dof = dof_a + (mf_J_a.data[row_mf6 + 3] != 0.0f ? 3 : 0);
+                const float speed_component = lane < 3 ? s_v[speed_dof + lane] : 0.0f;
+                float speed_sq = speed_component * speed_component;
+                speed_sq += __shfl_down_sync(MASK, speed_sq, 1);
+                speed_sq += __shfl_down_sync(MASK, speed_sq, 2);
+                const float speed_mf_vlim = sqrtf(__shfl_sync(MASK, speed_sq, 0));
 
-                float residual_mf_vlim = jv_mf_vlim + __int_as_float(meta.z);
+                float residual_mf_vlim = __int_as_float(meta.z) - speed_mf_vlim;
 {mf_velocity_limit_law}
 
-                if (delta_impulse_mf_vlim != 0.0f) {{
+                if (delta_impulse_mf_vlim != 0.0f && speed_mf_vlim > 0.0f) {{
 {mf_limit_vote}
-                    if (lane < 6 && dof_a >= 0) {{
-                        s_v[dof_a + lane] += mf_MiJt_a.data[row_mf6 + lane] * delta_impulse_mf_vlim;
-                    }}
-                    if (lane >= 6 && lane < 12 && dof_b >= 0) {{
-                        s_v[dof_b + lane - 6] += mf_MiJt_b.data[row_mf6 + lane - 6] * delta_impulse_mf_vlim;
+                    // The correction acts along the velocity: it removes the overshoot, keeping the direction.
+                    if (lane < 3) {{
+                        s_v[speed_dof + lane] -= (delta_impulse_mf_vlim / mf_diag) * speed_component / speed_mf_vlim;
                     }}
                 }}
                 __syncwarp();

@@ -53,6 +53,7 @@ from . import environment_flags as _environment_flags
 from . import execution_plan as _execution_plan
 from . import row_metadata as _row_metadata
 from .body_mapping import build_body_maps
+from .conditioning import ArmatureFloor, conditioning_armature
 from .configuration import resolve_kernel_choices
 from .contact_row_plan import SHARED_METADATA_PRODUCERS, contact_row_plan
 from .contact_torsion import (
@@ -94,6 +95,7 @@ from .kernels import (
     PGS_LOCAL_SOLVE_OWNER_PAIR_RESIDUAL,
     PGS_LOCAL_SOLVE_OWNER_SINGLE,
     PREELIM_MAX_ROWS,
+    RIGID_SPEED_ROWS,
     _get_tree_fk_kernel,
     _get_tree_tau_kernel,
     accumulate_articulation_tau,
@@ -1020,6 +1022,15 @@ class SolverFeatherPGS(SolverBase):
     :meth:`check_constraint_capacity` outside capture at an observation boundary
     to reject incomplete physics. Ordinary stepping does not synchronize it.
 
+    The solver factors each articulation's mass matrix in float32. Along a
+    serial chain its pivots fall roughly as the cube of the chain's length, so
+    a long chain without joint armature leaves float32's resolution: where an
+    articulation with a root-to-leaf path of at least 32 joints has a pivot
+    below ``4 n u`` of its diagonal (``n`` coordinates, ``u = 2^-24``) at the
+    model's configuration, the solver adds the least joint armature that lifts
+    it there, warns, and reports it under ``routes.dynamics.armature_floor`` of
+    :meth:`get_path_selection`. Give such joints armature to choose it yourself.
+
     Single-body FREE-joint articulations use an energy-preserving local
     gyroscopic update to prevent explicit angular-bias runaway. Fast rotation
     can trigger bounded gyro microsteps inside the velocity predictor, without
@@ -1128,7 +1139,14 @@ class SolverFeatherPGS(SolverBase):
 
     @classmethod
     def register_custom_attributes(cls, builder: ModelBuilder) -> None:
-        """Register PhysX rigid-body attributes consumed by FeatherPGS."""
+        """Register PhysX rigid-body attributes consumed by FeatherPGS.
+
+        ``rigid_body_max_linear_velocity`` [m/s] and ``rigid_body_max_angular_velocity``
+        [rad/s] bound the speeds of a free body, the magnitudes of its center of mass
+        velocity and of its angular velocity (``physxRigidBody:maxLinearVelocity`` and
+        ``physxRigidBody:maxAngularVelocity``, default unbounded).
+        ``rigid_body_max_depenetration_velocity`` [m/s] bounds its contact correction velocity.
+        """
 
         def _angular_velocity_deg_to_rad(value, _context):
             if value is None:
@@ -1534,13 +1552,14 @@ class SolverFeatherPGS(SolverBase):
                 ``pgs_mode`` together with ``enable_joint_velocity_limits=True`` raises
                 :class:`NotImplementedError` at construction. Defaults to False.
             velocity_limit_activation_fraction (float, optional): Proximity gate for velocity-limit
-                row allocation. ``0.0`` allocates the lower/upper row pair for every finitely
-                limited joint DOF and free-rigid-body axis each step, preserving the historical
-                behavior exactly. A positive fraction allocates a pair only when the current
-                speed satisfies ``|qd| >= fraction * limit``, skipping rows that would be exact
-                no-op clamps. Because the gate samples the pre-solve velocity, a DOF crossing the
-                threshold between steps is clamped one step late. Must be non-negative and not
-                NaN. Defaults to ``0.0``.
+                row allocation. ``0.0`` allocates the lower/upper row pair of every finitely
+                limited joint DOF, and the speed row of every finitely limited free-rigid-body
+                linear or angular speed, each step. A positive fraction allocates them only when
+                the current speed satisfies ``|qd| >= fraction * limit`` (the magnitude of the
+                linear or angular velocity for a free body's speed row), skipping rows that would
+                be exact no-op clamps. Because the gate samples the pre-solve velocity, a DOF
+                crossing the threshold between steps is clamped one step late. Must be non-negative
+                and not NaN. Defaults to ``0.0``.
             fuse_joint_velocity_limits (bool, optional): Enforce joint velocity limits of
                 *driven* DOFs (``drive_slot[dof] >= 0``, i.e. ``joint_target_ke/kd > 0``) as a
                 stateless clamp instead of two dedicated dense rows per DOF. This mirrors
@@ -1575,7 +1594,9 @@ class SolverFeatherPGS(SolverBase):
                 dedicated rows it replaces. Defaults to True.
             velocity_limit_law (str, optional): How the matrix-free sweeps project the dedicated
                 joint and free-body velocity-limit rows, which keep the last word at the end of
-                every iteration either way. ``"stateless"`` is PhysX's clamp: each visit applies
+                every iteration either way. A free body's row bounds the magnitude of its linear or
+                angular velocity (a speed row: residual ``limit - |v|``, correction along ``v``).
+                ``"stateless"`` is PhysX's clamp: each visit applies
                 only the impulse that removes the current overshoot and stores that correction,
                 so an impulse that later rows made unnecessary is never released and the
                 converged velocity depends on the row order. ``"accumulated"`` treats the row like
@@ -1840,9 +1861,11 @@ class SolverFeatherPGS(SolverBase):
                 Packed metadata in matrix-free mode supports at most 65535 rows. Defaults to 512.
             pgs_kernel: Dense PGS implementation. ``auto`` uses ``loop`` on CPU and ``tiled_row`` on CUDA.
                 Explicit ``loop`` and ``tiled_row`` select the split-mode kernel and require a supported
-                device. Matrix-free mode owns its sweep dispatcher: an explicit choice there warns and is
-                ignored. ``tiled_contact`` and ``streaming`` are deprecated: they warn, have no effect and
-                select the ``auto`` kernel.
+                device. ``tiled_row`` stages the packed Delassus triangle in shared memory while it fits the
+                device's shared memory per block and reads the Delassus rows from global memory past that
+                (``routes.sweep.dense.staging``). Matrix-free mode owns its sweep dispatcher: an explicit
+                choice there warns and is ignored. ``tiled_contact`` and ``streaming`` are deprecated: they
+                warn, have no effect and select the ``auto`` kernel.
             pgs_chunk_size (int, optional): Deprecated compatibility argument. It tuned the removed
                 streaming kernel; a value other than ``None`` warns and has no effect. Defaults to None.
             use_parallel_streams (bool, optional): Dispatch size groups on separate CUDA streams.
@@ -3452,11 +3475,14 @@ class SolverFeatherPGS(SolverBase):
                 raise RuntimeError("Validate contact torsion outside CUDA graph capture")
             preparation.validate()
 
-    def _kinematic_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _kinematic_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, ArmatureFloor]:
         """Derive the kinematic masks and effective joint armature from the body flags, changing nothing.
 
+        The effective armature also holds the least armature that keeps the mass matrix of a deep
+        articulation within float32 factorization (:func:`conditioning_armature`).
+
         Returns:
-            ``(armature, joint_mask, dof_mask)`` for :meth:`_apply_kinematic_state`.
+            ``(armature, joint_mask, dof_mask, floor)`` for :meth:`_apply_kinematic_state`.
 
         Raises:
             RuntimeError: If the flags make a DOF of a sparse split or
@@ -3499,11 +3525,21 @@ class SolverFeatherPGS(SolverBase):
                         "A prescribed-response articulation changed kinematic membership; "
                         "reconstruct the solver and recapture its CUDA graph."
                     )
-        return armature, joint_mask, dof_mask
+        armature, floor = conditioning_armature(model, armature)
+        return armature, joint_mask, dof_mask, floor
 
-    def _apply_kinematic_state(self, kinematic: tuple[np.ndarray, np.ndarray, np.ndarray]) -> None:
+    def _apply_kinematic_state(self, kinematic: tuple[np.ndarray, np.ndarray, np.ndarray, ArmatureFloor]) -> None:
         """Publish derived kinematic masks and armature in place, where captured graphs read them."""
-        armature, joint_mask, dof_mask = kinematic
+        armature, joint_mask, dof_mask, floor = kinematic
+        if floor.coordinates and floor != getattr(self, "_armature_floor", None):
+            warnings.warn(
+                f"SolverFeatherPGS adds joint armature, up to {floor.largest:.3g}, to {floor.coordinates} "
+                f"coordinate(s) of {floor.articulations} articulation(s) whose mass matrix float32 cannot factor "
+                "without it (routes.dynamics.armature_floor). Give these joints armature to choose it yourself.",
+                UserWarning,
+                stacklevel=3,
+            )
+        self._armature_floor = floor
         self._joint_armature_effective = armature
         self._kinematic_dof_mask_host = dof_mask.copy()
         self._kinematic_joint_mask.assign(joint_mask)
@@ -6343,21 +6379,16 @@ class SolverFeatherPGS(SolverBase):
         )
 
         if self._has_rigid_body_velocity_limits and self._free_rigid_body_count > 0:
-            # Twelve entries per free rigid body: lower/upper rows for the
-            # three linear and three angular velocity components.
+            # Two speed rows per free rigid body: its linear and its angular speed.
             self.rigid_velocity_limit_slot = wp.full(
-                (12 * self._free_rigid_body_count,),
+                (RIGID_SPEED_ROWS * self._free_rigid_body_count,),
                 -1,
                 dtype=wp.int32,
                 device=device,
                 requires_grad=requires_grad,
             )
-            self.rigid_velocity_limit_sign = wp.zeros(
-                (12 * self._free_rigid_body_count,), dtype=wp.float32, device=device, requires_grad=requires_grad
-            )
         else:
             self.rigid_velocity_limit_slot = None
-            self.rigid_velocity_limit_sign = None
 
         self.mf_body_Hinv = wp.zeros((body_count,), dtype=wp.spatial_matrix, device=device, requires_grad=requires_grad)
 
@@ -6436,18 +6467,13 @@ class SolverFeatherPGS(SolverBase):
         self.mf_meta_packed = wp.zeros((worlds, 4), dtype=wp.int32, device=device)
 
         if self._has_rigid_body_velocity_limits and model.body_count > 0:
-            # Only the ``is not None`` checks observe these on the inactive
-            # path; allocating them keeps the matrix_free clamp semantics of
-            # _clamp_rigid_velocity_limits identical to the full allocation.
+            # Only the ``is not None`` checks observe this on the inactive
+            # path, where no free rigid body owns a speed row.
             self.rigid_velocity_limit_slot = wp.full(
                 (1,), -1, dtype=wp.int32, device=device, requires_grad=requires_grad
             )
-            self.rigid_velocity_limit_sign = wp.zeros(
-                (1,), dtype=wp.float32, device=device, requires_grad=requires_grad
-            )
         else:
             self.rigid_velocity_limit_slot = None
-            self.rigid_velocity_limit_sign = None
 
     def _allocate_debug_buffers(self, model):
         """Allocate buffers for PGS convergence diagnostics."""
@@ -6683,10 +6709,16 @@ class SolverFeatherPGS(SolverBase):
 
         self._pgs_solve_tiled_row_kernel = None
         self._pgs_solve_tiled_row_budgets = ()
+        self._tiled_row_staging = None
+        self._tiled_row_staging_reason = None
         if self.dense_max_constraints > 0:
-            if self.pgs_kernel == "tiled_row":
+            # Only split mode without native sparse split rows sweeps the assembled Delassus rows.
+            if self.pgs_kernel == "tiled_row" and self.pgs_mode == "split" and not self._sparse_split:
+                self._tiled_row_staging, self._tiled_row_staging_reason = _tiled_row_staging(
+                    self.dense_max_constraints, model.device
+                )
                 self._pgs_solve_tiled_row_kernel = _get_pgs_solve_tiled_row_kernel(
-                    self.dense_max_constraints, device_arch
+                    self.dense_max_constraints, device_arch, staging=self._tiled_row_staging
                 )
                 # Large C128 batches benefit from small-world storage without
                 # reducing capacity. Avoid extra launches for small batches.
@@ -8098,7 +8130,6 @@ class SolverFeatherPGS(SolverBase):
             if self._tree_kinetic_state is not None:
                 self._tree_kinetic_state.predict(state_in, state_aug, control, stage3_qd, dt)
                 self._stage3_correct_free_root_velocity(state_in, stage3_qd, dt, apply_transport=False)
-                self._clamp_rigid_velocity_limits(self.v_hat)
             else:
                 self._stage3_zero_qdd(state_aug)
                 for size, ctx in self._for_sizes(enabled=self.use_parallel_streams):
@@ -8130,7 +8161,6 @@ class SolverFeatherPGS(SolverBase):
                         else:
                             self._stage3_trisolve_loop(size, state_aug)
                 self._stage3_compute_v_hat(state_in, state_aug, dt, stage3_qd)
-                self._clamp_rigid_velocity_limits(self.v_hat)
             if self._debug_stage3_snapshots:
                 wp.copy(self._debug_stage3_qd_work, stage3_qd)
                 wp.copy(self._debug_stage3_joint_qdd, state_aug.joint_qdd)
@@ -8517,8 +8547,6 @@ class SolverFeatherPGS(SolverBase):
                         friction_start_iteration=self._contact_friction_start_iteration(self.pgs_iterations),
                     )
 
-            self._stage6_clamp_rigid_velocity_limits()
-
             if self.pgs_velocity_iterations > 0:
                 if self.pgs_debug:
                     wp.copy(self._debug_position_v_out, self.v_out)
@@ -8526,9 +8554,7 @@ class SolverFeatherPGS(SolverBase):
                 wp.copy(self.v_out_snap, self.v_out)
                 self._conclude_matrix_free_position_problem(dt)
                 wp.copy(self.v_hat, self.v_out_snap)
-                self._clamp_rigid_velocity_limits(self.v_hat)
                 self._run_matrix_free_velocity_post_solve()
-                self._stage6_clamp_rigid_velocity_limits()
                 self._stage6_integrate_position_from_velocity(state_in, state_aug, state_out, dt, self.v_out_snap)
         elif self.pgs_mode == "split" and self._has_mixed_contacts:
             # Split mode with mixed contacts: interleaved dense and MF, 1 iteration each.
@@ -11729,7 +11755,6 @@ class SolverFeatherPGS(SolverBase):
                 ],
                 outputs=[
                     self.rigid_velocity_limit_slot,
-                    self.rigid_velocity_limit_sign,
                     self.mf_slot_counter,
                 ],
                 device=model.device,
@@ -11745,7 +11770,6 @@ class SolverFeatherPGS(SolverBase):
                     self.rigid_body_max_linear_velocity,
                     self.rigid_body_max_angular_velocity,
                     self.rigid_velocity_limit_slot,
-                    self.rigid_velocity_limit_sign,
                 ],
                 outputs=[
                     self.mf_body_a,
@@ -13107,14 +13131,17 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
-    def _clamp_rigid_velocity_limits(self, qd: wp.array):
+    def _stage6_clamp_rigid_velocity_limits(self):
+        """Bound the solved speeds of every free root in split mode, where its step ends (the root clamp).
+
+        Split mode bounds free rigid bodies inside its free-body sweep with speed rows where the activation
+        gate reserved them; this clamp of the solved velocity bounds every free root, floating bases included,
+        without changing a predicted velocity the contacts still act on. Matrix-free mode bounds free rigid
+        bodies with speed rows alone.
+        """
         if not self._has_root_free or not self._has_rigid_body_velocity_limits:
             return
-        if self.pgs_mode == "matrix_free" and getattr(self, "rigid_velocity_limit_slot", None) is not None:
-            # Matrix-free solves free-rigid velocity limits as rows now. Keep
-            # this direct clamp for dense/split legacy paths only, otherwise
-            # probes cannot distinguish row enforcement from a hidden final
-            # projection.
+        if self.pgs_mode == "matrix_free":
             return
 
         wp.launch(
@@ -13129,12 +13156,9 @@ class SolverFeatherPGS(SolverBase):
                 self.rigid_body_max_linear_velocity,
                 self.rigid_body_max_angular_velocity,
             ],
-            outputs=[qd],
+            outputs=[self.v_out],
             device=self.model.device,
         )
-
-    def _stage6_clamp_rigid_velocity_limits(self):
-        self._clamp_rigid_velocity_limits(self.v_out)
 
     def _stage6_apply_impulses_world(self, size: int):
         model = self.model
@@ -15231,29 +15255,101 @@ def _get_triangular_solve_kernel(n_dofs: int, device_arch: str, tile_threads: in
     return wp.kernel(enable_backward=False, module="unique")(trisolve_tiled_template)
 
 
+_TILED_ROW_THREADS = 32
+"""Threads of a tiled_row sweep block: one warp per world."""
+
+TILED_ROW_STAGINGS = ("shared", "global")
+"""Where a tiled_row sweep reads the Delassus operator: its packed lower triangle in shared memory, or its rows in
+global memory."""
+
+
+def _tiled_row_shared_bytes(max_constraints: int, staging: str) -> int:
+    """Static shared memory of one tiled_row sweep block [bytes].
+
+    The block stages six row vectors (impulses, right-hand sides, diagonals,
+    types, parents and friction coefficients) and, with ``staging="shared"``,
+    the packed lower triangle of the Delassus operator, ``M (M + 1) / 2``
+    floats; Warp's tile storage of a tiled launch adds four bytes per thread.
+    """
+    words = 6 * max_constraints
+    if staging == "shared":
+        words += max_constraints * (max_constraints + 1) // 2
+    return 4 * (words + _TILED_ROW_THREADS)
+
+
+def _tiled_row_staging(max_constraints: int, device) -> tuple[str, str]:
+    """Choose where a tiled_row sweep of ``max_constraints`` rows reads the Delassus operator on ``device``.
+
+    The packed triangle stays in shared memory while it fits the device's
+    opt-in shared memory per block; past that, the warp reads each Delassus
+    row from global memory (coalesced, one row per update) and stages only
+    the row vectors.
+
+    Returns:
+        The staging, one of :data:`TILED_ROW_STAGINGS`, and the reason.
+
+    Raises:
+        ValueError: If even the row vectors exceed the device's shared memory per block.
+    """
+    limit = int(device.max_shared_memory_per_block)
+    shared = _tiled_row_shared_bytes(max_constraints, "shared")
+    if shared <= limit:
+        return "shared", (
+            f"The packed Delassus triangle of {max_constraints} rows and the row vectors take {shared} of the "
+            f"device's {limit} bytes of shared memory per block."
+        )
+    rows = _tiled_row_shared_bytes(max_constraints, "global")
+    if rows <= limit:
+        return "global", (
+            f"The packed Delassus triangle of {max_constraints} rows would take {shared} bytes of shared memory "
+            f"per block, more than the device's {limit}: the sweep reads Delassus rows from global memory and "
+            f"stages only the row vectors ({rows} bytes)."
+        )
+    raise ValueError(
+        f"dense_max_constraints={max_constraints} needs {rows} bytes of shared memory per block for the tiled_row "
+        f"sweep's row vectors, more than the device's {limit}; use pgs_kernel='loop' or fewer dense rows"
+    )
+
+
 @cache
 def _get_pgs_solve_tiled_row_kernel(
-    max_constraints: int, device_arch: str, *, row_budget: int | None = None, min_rows: int = 0
+    max_constraints: int,
+    device_arch: str,
+    *,
+    row_budget: int | None = None,
+    min_rows: int = 0,
+    staging: str = "shared",
 ) -> "wp.Kernel":
-    """PGS world solve kernel that stages only the LOWER triangle of Delassus.
+    """PGS world solve kernel: one warp per world, the Delassus operator staged as ``staging`` names.
 
-    Shared memory footprint drops from M*M to M*(M+1)/2 floats.
-    Uses symmetry in dot: C(i,j) = L(i,j) if j<=i else L(j,i).
+    ``staging="shared"`` stages only the LOWER triangle of Delassus in shared
+    memory: the footprint drops from M*M to M*(M+1)/2 floats, and the dot uses
+    symmetry, C(i,j) = L(i,j) if j<=i else L(j,i). ``staging="global"`` reads
+    each row of the full, symmetric Delassus operator from global memory, for
+    capacities whose triangle exceeds a block's shared memory
+    (:func:`_tiled_row_staging`); both stagings sum the same terms in the same
+    order, so they produce the same impulses.
 
     C64/C128 budgets change only local storage, not global strides or
     the 32-lane GS reduction. Small budgets own ``min_rows < m <= row_budget``;
     the full-budget fallback also owns small worlds whose friction metadata
     reads outside the active prefix. A missing budget retains the original path.
     """
+    if staging not in TILED_ROW_STAGINGS:
+        raise ValueError(f"staging must be one of {TILED_ROW_STAGINGS}, got {staging!r}")
     if row_budget is not None:
         if (
             max_constraints not in (64, 128)
             or row_budget not in (16, 32, max_constraints)
             or not 0 <= min_rows < row_budget
+            or staging != "shared"
         ):
-            raise ValueError("Dense row budgets require C64/C128, budget 16/32/capacity, and 0 <= min_rows < budget")
+            raise ValueError(
+                "Dense row budgets require C64/C128, budget 16/32/capacity, 0 <= min_rows < budget and shared staging"
+            )
     elif min_rows != 0:
         raise ValueError("min_rows requires an explicit row_budget")
+    global_rows = staging == "global"
     TILE_M = max_constraints if row_budget is None else row_budget
     TILE_M_SQ = max_constraints * max_constraints
     TILE_TRI = TILE_M * (TILE_M + 1) // 2
@@ -15299,7 +15395,12 @@ def _get_pgs_solve_tiled_row_kernel(
     for k in range(ELEMS_PER_THREAD_1D):
         j = k * 32
         if j < TILE_M:
-            precompute_j.append(f"    const int j{k} = lane + {j};\n    const int jb{k} = (j{k} * (j{k} + 1)) >> 1;")
+            if global_rows:
+                precompute_j.append(f"    const int j{k} = lane + {j};")
+            else:
+                precompute_j.append(
+                    f"    const int j{k} = lane + {j};\n    const int jb{k} = (j{k} * (j{k} + 1)) >> 1;"
+                )
     precompute_j_code = "\n".join(precompute_j)
 
     # Dot code: guarded on j_k < m
@@ -15307,6 +15408,13 @@ def _get_pgs_solve_tiled_row_kernel(
     for k in range(ELEMS_PER_THREAD_1D):
         joff = k * 32
         if joff < TILE_M:
+            if global_rows:
+                dot_terms.append(
+                    f"""    if (j{k} < m) {{
+        my_sum += world_C.data[row_i + j{k}] * s_lam[j{k}];
+    }}"""
+                )
+                continue
             dot_terms.append(
                 f"""    if (j{k} < m) {{
         // Use symmetry to fetch C(i, j{k}) from packed-lower shared.
@@ -15315,7 +15423,8 @@ def _get_pgs_solve_tiled_row_kernel(
         my_sum += cij * s_lam[j{k}];
     }}"""
             )
-    dot_code = "\n".join(["float my_sum = 0.0f;", "int base_i = (i * (i + 1)) >> 1;", *dot_terms])
+    row_base = f"const int row_i = off2 + i * {stride_symbol};" if global_rows else "int base_i = (i * (i + 1)) >> 1;"
+    dot_code = "\n".join(["float my_sum = 0.0f;", row_base, *dot_terms])
 
     store_lines = []
     for k in range(ELEMS_PER_THREAD_1D):
@@ -15352,9 +15461,46 @@ def _get_pgs_solve_tiled_row_kernel(
         else:
             admission_code += f"    if (m <= {min_rows} && !unsupported) return;\n"
 
+    triangle_declaration = (
+        ""
+        if global_rows
+        else """
+    // Packed LOWER triangle of C in row-major (i*(i+1)/2 + j), j<=i
+    __shared__ float s_Ctri[TILE_TRI];
+"""
+    )
+    triangle_load = (
+        "    // Delassus rows stay in global memory: each update reads its row, coalesced across lanes.\n"
+        if global_rows
+        else f"""
+    // Load only the lower triangle of the active m x m block into packed shared.
+    // Rows >= m are never read by the sweep below, so they are not loaded.
+    // Work distribution: each lane walks rows; for each row i, lane loads j = lane, lane+32, lane+64...
+    for (int i = 0; i < m; ++i) {{
+        int base = (i * (i + 1)) >> 1; // packed base for row i
+        for (int j = lane; j <= i; j += 32) {{
+            s_Ctri[base + j] = world_C.data[off2 + i * {stride_symbol} + j];
+        }}
+    }}
+"""
+    )
+    if global_rows:
+        sibling_row = f"""                const int sib_row = off2 + sib * {stride_symbol};
+                for (int j = lane; j < m; j += 32) {{
+                    sibling_residual += world_C.data[sib_row + j] * s_lam[j];
+                }}"""
+        sibling_coupling = "world_C.data[sib_row + i]"
+    else:
+        sibling_row = """                int sib_base = (sib * (sib + 1)) >> 1;
+                for (int j = lane; j < m; j += 32) {
+                    float c = j <= sib ? s_Ctri[sib_base + j] : s_Ctri[((j * (j + 1)) >> 1) + sib];
+                    sibling_residual += c * s_lam[j];
+                }"""
+        sibling_coupling = "s_Ctri[sib_base + i]"
+
+    triangle_constant = "" if global_rows else f"\n    const int TILE_TRI = {TILE_TRI};"
     snippet = f"""    const int TILE_M = {TILE_M};{stride_constant}
-    const int TILE_M_SQ = {TILE_M_SQ};
-    const int TILE_TRI = {TILE_TRI};
+    const int TILE_M_SQ = {TILE_M_SQ};{triangle_constant}
     const unsigned MASK = 0xFFFFFFFF;
 
     int lane = threadIdx.x;
@@ -15362,10 +15508,7 @@ def _get_pgs_solve_tiled_row_kernel(
     int m = world_constraint_count.data[world];
     if (m == 0) return;
 {admission_code}
-
-    // Packed LOWER triangle of C in row-major (i*(i+1)/2 + j), j<=i
-    __shared__ float s_Ctri[TILE_TRI];
-
+{triangle_declaration}
     __shared__ float s_lam[TILE_M];
     __shared__ float s_rhs[TILE_M];
     __shared__ float s_diag[TILE_M];
@@ -15377,17 +15520,7 @@ def _get_pgs_solve_tiled_row_kernel(
     int off2 = world * TILE_M_SQ;
 
 {load_code}
-
-    // Load only the lower triangle of the active m x m block into packed shared.
-    // Rows >= m are never read by the sweep below, so they are not loaded.
-    // Work distribution: each lane walks rows; for each row i, lane loads j = lane, lane+32, lane+64...
-    for (int i = 0; i < m; ++i) {{
-        int base = (i * (i + 1)) >> 1; // packed base for row i
-        for (int j = lane; j <= i; j += 32) {{
-            s_Ctri[base + j] = world_C.data[off2 + i * {stride_symbol} + j];
-        }}
-    }}
-    __syncwarp();
+{triangle_load}    __syncwarp();
 
 {precompute_j_code}
 
@@ -15440,15 +15573,11 @@ def _get_pgs_solve_tiled_row_kernel(
                 if (i != parent_idx + 1) continue;
                 int sib = parent_idx + 2;
                 float sibling_residual = 0.0f;
-                int sib_base = (sib * (sib + 1)) >> 1;
-                for (int j = lane; j < m; j += 32) {{
-                    float c = j <= sib ? s_Ctri[sib_base + j] : s_Ctri[((j * (j + 1)) >> 1) + sib];
-                    sibling_residual += c * s_lam[j];
-                }}
+{sibling_row}
                 for (int offset = 16; offset > 0; offset >>= 1)
                     sibling_residual += __shfl_down_sync(MASK, sibling_residual, offset);
                 sibling_residual = __shfl_sync(MASK, sibling_residual, 0) + s_rhs[sib];
-                float2 pair = friction_pair_candidate(denom, s_Ctri[sib_base + i], s_diag[sib],
+                float2 pair = friction_pair_candidate(denom, {sibling_coupling}, s_diag[sib],
                     w_val, sibling_residual, s_lam[i], s_lam[sib], radius, omega);
                 float a = pair.x;
                 float b = pair.y;
@@ -15517,6 +15646,8 @@ def _get_pgs_solve_tiled_row_kernel(
         )
 
     suffix = "" if row_budget is None else f"_b{row_budget}_m{min_rows}"
+    if global_rows:
+        suffix += "_global"
     pgs_solve_tiled_template.__name__ = f"pgs_solve_tiled_row_{max_constraints}{suffix}"
     pgs_solve_tiled_template.__qualname__ = pgs_solve_tiled_template.__name__
     return wp.kernel(enable_backward=False, module="unique")(pgs_solve_tiled_template)
@@ -15533,24 +15664,41 @@ def _get_pgs_solve_mf_kernel(
     global memory round-trips. J, MiJt, eff_mass_inv, and rhs are read
     from global memory per constraint (read-only, cache-friendly sequential access).
 
-    ``has_velocity_limit_rows`` compiles the free-body velocity-limit law of
-    :func:`pgs_solve_mf_loop`: a ``PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT`` row
-    pushes only while its limit is violated (``J v + rhs < 0``), by the whole
-    unrelaxed correction, and stores that correction instead of an accumulated
-    impulse. The rows occupy the tail of each world's rows, so they keep the
-    last word of every iteration, as in the fused MF-GS kernel's final
-    velocity-limit pass. Without the flag such a row is relaxed as a bilateral
-    row, which drives every limited axis onto its limit; the variant without it
-    keeps its historical generated code for solvers that cannot allocate these rows.
+    ``has_velocity_limit_rows`` compiles the free-body speed law of
+    :func:`pgs_solve_mf_loop` (:func:`project_free_body_speed`): a
+    ``PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT`` row bounds the magnitude of
+    its body's linear or angular velocity, pushes only while that speed exceeds
+    its limit, along the velocity, by the whole unrelaxed correction, and stores
+    that correction instead of an accumulated impulse. The rows occupy the tail
+    of each world's rows, so they keep the last word of every iteration, as in
+    the fused MF-GS kernel's final velocity-limit pass. The variant without the
+    flag keeps its historical generated code for solvers that cannot allocate
+    these rows.
     """
     MF_MAX_C = mf_max_constraints
     MAX_BODIES = max_mf_bodies
     velocity_limit_projection = (
         f"""
                 if (row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)}) {{
-                    // Stateless clamp: only a violated limit pushes, and the row keeps that correction.
-                    delta_impulse = (jv + rhs_i) < 0.0f ? delta : 0.0f;
-                    new_impulse = delta_impulse;
+                    // A free body's speed row: the stateless clamp of its linear (J = e_0) or angular (J = e_3)
+                    // speed, along the velocity; the row keeps the correction it applied.
+                    float eff = mf_eff_mass_inv.data[c_off + i];
+                    int lb = mf_local_body_a.data[c_off + i];
+                    if (eff > 0.0f && lb >= 0) {{
+                        int sv = lb * 6 + (mf_J_a.data[(c_off + i) * 6 + 3] != 0.0f ? 3 : 0);
+                        float speed = sqrtf(s_vel[sv] * s_vel[sv] + s_vel[sv + 1] * s_vel[sv + 1]
+                            + s_vel[sv + 2] * s_vel[sv + 2]);
+                        float overshoot = speed - mf_rhs.data[c_off + i];
+                        float correction = overshoot > 0.0f ? overshoot * eff : 0.0f;
+                        if (correction != 0.0f) {{
+                            float scale = 1.0f - (correction / eff) / speed;
+                            s_vel[sv] *= scale;
+                            s_vel[sv + 1] *= scale;
+                            s_vel[sv + 2] *= scale;
+                        }}
+                        s_impulse[i] = correction;
+                    }}
+                    continue;
                 }}"""
         if has_velocity_limit_rows
         else ""
@@ -15609,7 +15757,7 @@ def _get_pgs_solve_mf_kernel(
                 if (row_type == 2 && global_iter < friction_start_iteration) {{
                     s_impulse[i] = 0.0f;
                     continue;
-                }}
+                }}{velocity_limit_projection}
 
                 float eff_inv = mf_eff_mass_inv.data[c_off + i];
                 if (eff_inv <= 0.0f && row_type != 2) continue;
@@ -15722,7 +15870,7 @@ def _get_pgs_solve_mf_kernel(
                     }}
                 }}
 
-                float delta_impulse = new_impulse - old_impulse;{velocity_limit_projection}
+                float delta_impulse = new_impulse - old_impulse;
                 s_impulse[i] = new_impulse;
 
                 // Apply velocity correction: v += MiJt * delta_impulse

@@ -37,7 +37,8 @@ Scenes and features
     legged robot standing on a free base, a gripper lifting a box, a
     diagonal-mass keyboard pressed by an arm, a 17-coordinate hand pressing a
     free cube, and two articulations above the held-tree owner's caps (a
-    66-coordinate humanoid-like tree, a 100-link snake). Articulated contact
+    66-coordinate humanoid-like tree, a 100-link snake with and without joint
+    armature). Articulated contact
     scenes hold two worlds that differ, so a world mix-up shows. Variants: PhysX
     drives, velocity iterations, warm start, contact compliance, contact
     torsion, ``contact_update="unit"``, restitution, bilateral pre-elimination,
@@ -98,9 +99,7 @@ Reference and tolerances
 
 Findings
     Routes that fail a check at the gate's baseline (584eae97) are expected
-    failures that name the finding: rigid-body speed limits (per-axis rows in
-    matrix-free mode, a predictor clamp in split mode), the tiled-row sweep's
-    shared memory for 384 rows, and the research friction modes.
+    failures that name the finding: the research friction modes.
 
 Runtime
     Small scenes (one or two worlds, 60 to 240 steps): with a warm kernel
@@ -1381,26 +1380,6 @@ def _laws(*laws):
 
 
 _WARM = {"pgs_warmstart": True}
-_TILED_ROW_FINDING = (
-    "split_tiled_row",
-    "pgs_mode='split' selects the tiled_row sweep on CUDA, whose kernel stages M (M + 1) / 2 Delassus floats in "
-    "shared memory: 305 KB for M = 384 rows, beyond the 227 KB of a GB300 block, so the first step fails to load it.",
-)
-_SPEED_AXES = (
-    "Matrix-free mode bounds a free body's linear velocity per world axis (two rows per axis), so the diagonal "
-    "push reaches sqrt(2) times rigid_body_max_linear_velocity; PhysX's maxLinearVelocity bounds the speed."
-)
-_SPEED_PREDICTOR = (
-    "Split mode clamps the magnitude of the predicted velocity, gravity's increment included, before the solve; the "
-    "ground contact then removes the vertical part, so the pushed box settles 0.25% below its speed limit."
-)
-_SPEED_FINDINGS = (
-    ("reference", _SPEED_AXES),
-    ("mf_incremental_held", _SPEED_AXES),
-    ("split_loop", _SPEED_PREDICTOR),
-    ("cpu_split", _SPEED_PREDICTOR),
-    ("reference_matches_cpu", f"{_SPEED_AXES} {_SPEED_PREDICTOR}"),
-)
 
 
 def cpu_groups() -> list:
@@ -1423,11 +1402,12 @@ def cpu_groups() -> list:
             (CPU_SPLIT.but("cpu_split_warm_start", options=_WARM),),
         ),
         Group(_physics(scenes.ball_drop(), "point", 16), CPU_SPLIT, (CPU_SPLIT,)),
-        Group(_physics(scenes.box_push(), "point", 16), CPU_SPLIT, (CPU_SPLIT,), findings=_SPEED_FINDINGS),
+        Group(_physics(scenes.box_push(), "point", 16), CPU_SPLIT, (CPU_SPLIT,)),
         Group(_physics(scenes.keyboard(), "point", 16), CPU_SPLIT, (CPU_SPLIT,)),
         Group(_physics(scenes.hand(), "point", 16), CPU_SPLIT, (CPU_SPLIT,)),
         Group(_physics(scenes.sprawl(), "point", 64), CPU_SPLIT, (CPU_SPLIT,)),
         Group(_physics(scenes.long_chain(), "point", 64), CPU_SPLIT, (CPU_SPLIT,)),
+        Group(_physics(scenes.long_chain(armature=0.0), "point", 64), CPU_SPLIT, (CPU_SPLIT,)),
     ]
     for scene, iterations in (
         (scenes.chain(), 16),
@@ -1473,14 +1453,16 @@ def cuda_groups() -> list:
             ),
             Group(_physics(scenes.hand(), law, 16), ref, (PAIRED, PAIRED_FOREST, SPLIT_LOOP)),
             Group(_physics(scenes.sprawl(), law, 64), ref, (MF_DEFAULT, MF_PARALLEL, SPLIT_LOOP, SPLIT_TILED)),
-            # The parallel tiers cannot own the snake's 303-row world either; requesting them showed a rare
-            # end-velocity kick of 1 cm/s under patch friction (2 of 14 runs), so the gate leaves them to sprawl.
+            # The parallel tiers cannot own the snake's 303-row world either: requesting them must leave its
+            # serial sweep undisturbed.
             Group(
                 _physics(scenes.long_chain(), law, 64),
                 ref,
-                (MF_DEFAULT, SPLIT_LOOP, SPLIT_TILED),
-                findings=(_TILED_ROW_FINDING,),
+                (MF_DEFAULT, MF_PARALLEL, MF_PARALLEL_MATRIX_FREE, SPLIT_LOOP, SPLIT_TILED),
             ),
+            # Without armature the snake's mass matrix is beyond float32 factorization: the solver adds the
+            # armature it needs near the head, the same on every route.
+            Group(_physics(scenes.long_chain(armature=0.0), law, 64), ref, (MF_DEFAULT, SPLIT_LOOP, SPLIT_TILED)),
             Group(
                 _physics(scenes.torsion_pad(), law, 32, "torsion", contact_torsion_radius=0.05),
                 ref,
@@ -1503,7 +1485,7 @@ def cuda_groups() -> list:
             (SPARSE.but("sparse_warm_start", options=_WARM),),
         ),
         Group(_physics(scenes.ball_drop(), "point", 16), ref, (MF_HELD, MF_GENERAL, SPLIT_LOOP)),
-        Group(_physics(scenes.box_push(), "point", 16), ref, (MF_HELD, SPLIT_LOOP), findings=_SPEED_FINDINGS),
+        Group(_physics(scenes.box_push(), "point", 16), ref, (MF_HELD, SPLIT_LOOP)),
         Group(_physics(scenes.chain(), None, 16), ref, (MF_HELD, MF_GENERAL, MF_PARALLEL, SPLIT_LOOP)),
         Group(
             _physics(scenes.chain(), None, 16, "physx_drives", drive_mode="physx_pgs"),
@@ -1821,6 +1803,8 @@ OWNERSHIP = (
     (scenes.legged, "point", 32, SPARSE, ("sparse_pgs",), ("mf_gs", "mf_gs_incremental")),
     (scenes.legged, "point", 32, MF_PARALLEL, (), ("mf_gs", "mf_gs_incremental")),
     (scenes.legged, "patch", 32, KEYED_PARALLEL, (), ("mf_gs", "mf_gs_incremental")),
+    # The snake's world exceeds every tier's row bound: the serial sweep keeps it.
+    (scenes.long_chain, "patch", 64, MF_PARALLEL, ("mf_gs",), ()),
     (scenes.gripper, "point", 32, LOCAL_PACKETS, ("local_pair|local_residual|local_internal",), ()),
     (scenes.gripper, "patch", 32, LOCAL_OWNED, ("local_pair|local_residual|local_internal",), ()),
     # The paired factor sweep solves worlds of independent components; coupled worlds take the mixed fallback.

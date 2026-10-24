@@ -7,9 +7,11 @@ import os
 import unittest
 from unittest.mock import patch
 
+import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.solver_feather_pgs import _tiled_row_shared_bytes
 
 
 def _small_worlds(device, world_count=3):
@@ -111,6 +113,39 @@ class TestFeatherPGSDenseConstructor(unittest.TestCase):
         if not devices:
             self.skipTest("CUDA constructor selection requires a CUDA device")
         self._check_device(devices[0])
+
+    def test_cuda_constructor_stages_rows_past_shared_memory(self):
+        """Read Delassus rows from global memory where their packed triangle exceeds a block's shared memory.
+
+        The capacity is the smallest multiple of 32 rows whose triangle exceeds the device's shared memory per
+        block; a step loads and runs the kernel.
+        """
+        devices = wp.get_cuda_devices()
+        if not devices:
+            self.skipTest("CUDA constructor selection requires a CUDA device")
+        device = devices[0]
+        limit = device.max_shared_memory_per_block
+        capacity = 64
+        while _tiled_row_shared_bytes(capacity, "shared") <= limit:
+            capacity += 32
+        model = _small_worlds(device)
+        solver = newton.solvers.SolverFeatherPGS(
+            model,
+            pgs_mode="split",
+            pgs_kernel="tiled_row",
+            dense_max_constraints=capacity,
+            mf_max_constraints=8,
+            use_parallel_streams=False,
+            double_buffer=False,
+        )
+        dense = solver.get_path_selection()["routes"]["sweep"]["dense"]
+        self.assertEqual(dense["kernels"], [f"pgs_solve_tiled_row_{capacity}_global"])
+        self.assertEqual(dense["staging"], "global")
+        self.assertIn(str(limit), dense["staging_reason"])
+        state_0, state_1 = model.state(), model.state()
+        solver.step(state_0, state_1, model.control(), None, 1.0 / 60.0)
+        self.assertTrue(np.isfinite(state_1.joint_qd.numpy()).all())
+        del solver
 
     def test_cuda_constructor_large_capacity_default(self):
         """Enable large C128 batches by default while preserving explicit opt-out."""
