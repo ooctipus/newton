@@ -1689,10 +1689,8 @@ def terrain_point_below_cached(
 
 
 @wp.func
-def terrain_point_below_inside(
-    data: TerrainFeatureData, window: TerrainWindow, planes: TerrainPlanes, k: wp.vec3
-) -> tuple[TerrainPlanes, bool]:
-    """Return :func:`terrain_point_below_cached` for a point of the footprint's closure: a point past its border by the
+def terrain_point_below_inside(data: TerrainFeatureData, window: TerrainWindow, k: wp.vec3) -> bool:
+    """Return :func:`terrain_point_below` for a point of the footprint's closure: a point past its border by the
     predicates' rounding is taken over the border's cells (their planes extended to it), where the half-open partition
     of :func:`terrain_locate` has no triangle."""
     surface = window.surface
@@ -1705,8 +1703,8 @@ def terrain_point_below_inside(
     sub = int(0)
     if fx < fy:
         sub = 1
-    planes, n, a = terrain_plane(data, window, planes, r, c, sub)
-    return planes, k[2] < a[2] - (n[0] * (k[0] - a[0]) + n[1] * (k[1] - a[1])) / n[2]
+    n, a = terrain_cluster_plane(data, window, r, c, sub)
+    return k[2] < a[2] - (n[0] * (k[0] - a[0]) + n[1] * (k[1] - a[1])) / n[2]
 
 
 # ----------------------------------------------------------------------------------------------------------------
