@@ -333,16 +333,14 @@ def test_pipeline_rejection_capacity_status(test, device):
         finally:
             wp.synchronize_device(device)
             captured = messages.end()
+    # The contact rows grow with the demand (the first pass outside capture grew them), so only the
+    # broad phase, whose output stays undersized, overflows.
     test.assertIn("Broad phase pair buffer overflowed", captured)
-    test.assertIn("Contact buffer overflowed", captured)
     for line in captured.splitlines():
         if line.startswith("Module") and "load on device" in line:
             continue
         if line.strip():
-            test.assertRegex(
-                line,
-                r"^Warning: (Broad phase pair buffer overflowed \d+ > 27776|Contact buffer overflowed \d+ > 16)\.$",
-            )
+            test.assertRegex(line, r"^Warning: Broad phase pair buffer overflowed \d+ > 27776\.$")
 
 
 class TestCoherentConvexRejection(unittest.TestCase):

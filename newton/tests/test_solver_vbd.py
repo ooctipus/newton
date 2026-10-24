@@ -46,6 +46,7 @@ from newton.tests.unittest_utils import (
     add_function_test,
     configure_sdf_for_collision_shapes,
     get_test_devices,
+    scoped_capture_after_gc,
 )
 
 devices = get_test_devices()
@@ -1303,26 +1304,27 @@ def _rigid_contact_history_capture_requires_preallocation(test, device):
         pipeline.collide(state_in, contacts)
         return pipeline, solver, contacts, state_in, state_out, control
 
-    # The history exists from construction, before the solver meets any contacts.
+    # The history exists from construction, before the solver meets any contacts. Each capture keeps
+    # its own name: dropping an earlier graph during a later capture would invalidate that capture.
     pipeline, solver, contacts, state_in, state_out, control = make_scene()
     test.assertIsNotNone(solver._prev_contact_lambda)
-    with wp.ScopedCapture(device=device) as capture:
+    with scoped_capture_after_gc(device=device) as first:
         solver.step(state_in, state_out, control, contacts, 1.0e-3)
-    test.assertIsNotNone(capture.graph)
+    test.assertIsNotNone(first.graph)
 
     # Contact rows that outgrew the history cannot grow it during capture: one uncaptured step grows it.
     pipeline, solver, contacts, state_in, state_out, control = make_scene()
     rows = solver._prev_contact_lambda.shape[0]
     test.assertTrue(contacts.reserve_rigid_contacts(2 * rows))
     with test.assertRaisesRegex(RuntimeError, "during CUDA graph capture"):
-        with wp.ScopedCapture(device=device):
+        with scoped_capture_after_gc(device=device):
             solver.step(state_in, state_out, control, contacts, 1.0e-3)
     solver.step(state_in, state_out, control, contacts, 1.0e-3)
     test.assertEqual(solver._prev_contact_lambda.shape[0], contacts.rigid_contact_max)
     pipeline.collide(state_out, contacts)
-    with wp.ScopedCapture(device=device) as capture:
+    with scoped_capture_after_gc(device=device) as grown:
         solver.step(state_out, state_in, control, contacts, 1.0e-3)
-    test.assertIsNotNone(capture.graph)
+    test.assertIsNotNone(grown.graph)
 
 
 def _rigid_contact_stick_eps_are_deprecated(test, device):

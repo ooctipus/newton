@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 import warp as wp
 
-from ...core.contact_pool import ContactField, ContactPool, ContactRows, capturing
+from ...core.contact_pool import ContactField, ContactPool, ContactRows
 from ...core.reset import reset_world_selected as _reset_world_selected
 from ...geometry import ParticleFlags, ShapeFlags
 from ...sim import JointType, Model, ModelFlags, StateFlags
@@ -2218,11 +2218,11 @@ class SolverCoupled(SolverBase, CouplingInterface):
         self._entry_output_state_valid = True
 
     def prepare_contacts(self, contacts: Contacts | None) -> None:
-        """Preallocate entry-local filtered contact buffers for graph capture.
+        """Preallocate entry-local filtered contact buffers before graph capture.
 
-        Required before capture for a ``contacts`` whose rigid rows can grow (from
-        :meth:`newton.CollisionPipeline.contacts` of a large scene): the entry buffers
-        then grow with it.
+        The entry buffers follow ``contacts``' rigid rows as they grow. Buffers that
+        a step creates during capture instead are ordinary arrays, allocated in the
+        graph's memory pool.
         """
         if contacts is None:
             return
@@ -2872,11 +2872,6 @@ class SolverCoupled(SolverBase, CouplingInterface):
 
             # The entry's rigid rows follow the source's, which may grow with its pipeline.
             source_pool = contacts._rigid_contact_pool
-            if contacts.device.is_cuda and capturing(contacts.device):
-                raise RuntimeError(
-                    "SolverCoupled cannot allocate entry contact buffers during CUDA graph capture; "
-                    "call prepare_contacts(contacts) or step once before capturing"
-                )
             pool = ContactPool(device=contacts.device, rows=source_pool.ready)
             requested = {"force"} if contacts.force is not None else None
             filtered = Contacts(

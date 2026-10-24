@@ -4,6 +4,7 @@
 """Tests for the growable rigid contact pool: policy, growth, overflow, capture, and its consumers."""
 
 import contextlib
+import sys
 import unittest
 import warnings
 from unittest import mock
@@ -27,11 +28,33 @@ WORLDS = 4
 BOXES = 3
 # Four contacts per box on the ground.
 CONTACTS = 4 * WORLDS * BOXES
+# The rows a pool grows to for those contacts.
+GROWN = contact_pool.GROW_FACTOR * CONTACTS
 
 
 def _small_pool_policy(rows_per_world: int, quantum: int):
     """Shrink the pool policy so a small scene starts below its demand."""
     return mock.patch.multiple(contact_pool, READY_ROWS_PER_WORLD=rows_per_world, ROW_QUANTUM=quantum, MIN_READY_ROWS=0)
+
+
+@contextlib.contextmanager
+def _without_gpu_components():
+    """Make importing ``gpu_components`` fail, as in an environment without the optional package."""
+    hidden = dict.fromkeys(
+        ("gpu_components", "gpu_components.backing", "gpu_components.fields", "gpu_components.field_data")
+    )
+    with mock.patch.dict(sys.modules, hidden), mock.patch.object(contact_pool, "_VIRTUAL_MEMORY", []):
+        yield
+
+
+def _without_virtual_memory(function):
+    """Run a test function with ``gpu_components`` hidden."""
+
+    def run(test, device):
+        with _without_gpu_components():
+            function(test, device)
+
+    return run
 
 
 def _build_boxes(device, worlds=WORLDS, boxes=BOXES, *, color=False):
@@ -72,15 +95,18 @@ class TestContactPoolPolicy(unittest.TestCase):
         self.assertEqual(initial_rows(1), 4096)
         self.assertEqual(initial_rows(0), 4096)
 
-    def test_growth_doubles_the_high_water_past_half_of_ready(self):
-        """Grow to twice the high-water mark past half the ready rows, rounded and bounded; never shrink."""
+    def test_growth_quadruples_the_high_water_past_half_of_ready(self):
+        """Grow to four times the high-water mark past half the ready rows, rounded and bounded; never shrink."""
         ready, bound = 1_048_576, 25_231_360
         self.assertEqual(grown_rows(0, ready, bound), ready)
         self.assertEqual(grown_rows(ready // 2, ready, bound), ready)
-        self.assertEqual(grown_rows(ready // 2 + 1, ready, bound), ready + 64)
-        self.assertEqual(grown_rows(3 * ready, ready, bound), 6 * ready)
+        self.assertEqual(grown_rows(ready // 2 + 1, ready, bound), 2 * ready + 64)
+        self.assertEqual(grown_rows(3 * ready, ready, bound), 12 * ready)
         self.assertEqual(grown_rows(20_000_000, ready, bound), bound)
-        self.assertEqual(grown_rows(49, 64, 1000), 128)
+        self.assertEqual(grown_rows(49, 64, 1000), 256)
+        # The mark then sits at a quarter of the rows: the pool grows again only once the demand doubles.
+        grown = grown_rows(ready // 2 + 1, ready, bound)
+        self.assertEqual(grown_rows(2 * (ready // 2 + 1), grown, bound), grown)
 
     def test_device_row_limit_divides_the_device_memory(self):
         """Bound rows by the int32 index limit everywhere, and by the device memory over the row bytes on CUDA."""
@@ -139,10 +165,14 @@ def test_pool_rows_keep_contents_and_fill_new_rows(test, device):
     test.assertEqual(target.force.shape, (grown + 7,))
     test.assertTrue(np.all(target.point.numpy() == 0.0))
     test.assertFalse(pool.grow(10))
-    if wp.get_device(device).is_cuda:
+    if rows._mode == "virtual":
         # Virtual memory keeps addresses: the old view is a valid prefix of the new one.
         test.assertEqual(old_index.ptr, target.index.ptr)
-        np.testing.assert_array_equal(old_index.numpy(), np.arange(100))
+    else:
+        # Ordinary arrays are reallocated; the superseded ones stay alive for stale graph replays.
+        test.assertNotEqual(old_index.ptr, target.index.ptr)
+        test.assertTrue(any(array is old_index for array in rows._superseded))
+    np.testing.assert_array_equal(old_index.numpy(), np.arange(100))
     with test.assertRaisesRegex(MemoryError, "cannot back"):
         pool.grow(pool.bound + 1)
     test.assertEqual(pool.ready, grown)
@@ -153,18 +183,19 @@ def test_pool_bound_is_the_hardware_limit(test, device):
 
     Warp arrays index int32 elements; on CUDA, ``gpu_components`` also views a field's reservation as int32 bytes.
     """
-    cuda = wp.get_device(device).is_cuda
     pool = ContactPool(device=device, rows=64)
     test.assertEqual(pool.bound, INDEX_LIMIT)
     narrow = pool.rows((ContactField("a", wp.int32), ContactField("b", wp.vec3)))
-    narrow_limit = INDEX_LIMIT // 12 if cuda else INDEX_LIMIT
+    virtual = narrow._mode == "virtual"
+    test.assertEqual(virtual, wp.get_device(device).is_cuda and contact_pool._virtual_memory() is not None)
+    narrow_limit = INDEX_LIMIT // 12 if virtual else INDEX_LIMIT
     test.assertEqual(pool.row_bytes, 16)
     test.assertEqual(pool.bound, device_row_limit(device, 16, narrow_limit))
     test.assertEqual(narrow.reserve, pool.bound)
     wide = pool.rows((ContactField("keys", wp.int64, per_contact=2),))
     test.assertEqual(pool.row_bytes, 32)
     test.assertEqual(
-        pool.bound, device_row_limit(device, 32, min(narrow_limit, INDEX_LIMIT // (8 if cuda else 1) // 2))
+        pool.bound, device_row_limit(device, 32, min(narrow_limit, INDEX_LIMIT // (8 if virtual else 1) // 2))
     )
     test.assertEqual(wide.reserve, pool.bound)
     with test.assertRaisesRegex(MemoryError, "cannot back"):
@@ -177,12 +208,17 @@ def test_pool_bound_is_the_hardware_limit(test, device):
 
 
 def test_reservation_holds_the_device_bound(test, device):
-    """Reserve addresses for the pool's device bound in every field, which the driver accepts, and map only the rows."""
+    """Reserve addresses for the pool's device bound in every field, which the driver accepts, and map only the rows.
+
+    Without ``gpu_components`` nothing is reserved: the rows are ordinary arrays of the ready rows.
+    """
     model = _build_boxes(device)
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     pool = contacts._rigid_contact_pool
     members = pool._live_members()
+    virtual = contact_pool._virtual_memory() is not None
+    test.assertTrue(all(member._mode == ("virtual" if virtual else "realloc") for member in members))
     memory = int(wp.get_device(device).total_memory)
     reserved = pool.reserved_bytes()
     mapped = pool.mapped_bytes()
@@ -191,24 +227,60 @@ def test_reservation_holds_the_device_bound(test, device):
         f"{sum(len(member.fields) for member in members)} fields, {pool.row_bytes} B/row, bound {pool.bound} rows, "
         f"reserves {reserved / 2**30:.1f} GiB of addresses, maps {mapped / 2**20:.1f} MiB for {pool.ready} rows"
     )
-    index_limit = min(field.row_limit(True) for member in members for field in member.fields)
+    index_limit = min(field.row_limit(virtual) for member in members for field in member.fields)
     test.assertEqual(pool.bound, device_row_limit(device, pool.row_bytes, index_limit))
-    test.assertGreaterEqual(reserved, pool.bound * pool.row_bytes)
+    if virtual:
+        test.assertGreaterEqual(reserved, pool.bound * pool.row_bytes)
+    else:
+        test.assertEqual(reserved, mapped)
+        test.assertEqual(mapped, pool.ready * pool.row_bytes)
     for member in members:
         test.assertGreaterEqual(member.reserve, pool.bound)
         for field in member.fields:
-            test.assertLessEqual(field.length(member.reserve) * wp.types.type_size_in_bytes(field.dtype), INDEX_LIMIT)
+            size = wp.types.type_size_in_bytes(field.dtype) if virtual else 1
+            test.assertLessEqual(field.length(member.reserve) * size, INDEX_LIMIT)
     test.assertLess(mapped, memory // 64, "only the ready rows are mapped")
     test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 0)
     pipeline.collide(model.state(), contacts)
     test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), CONTACTS)
 
 
+def test_rows_fall_back_without_gpu_components(test, device):
+    """Hold CUDA rows in ordinary arrays without ``gpu_components``: growth reallocates, copies and replaces the views."""
+    with _without_gpu_components():
+        with test.assertLogs("newton._src.core.contact_pool", level="INFO") as logs:
+            pool = ContactPool(device=device, rows=64)
+            target = type("Target", (), {})()
+            rows = pool.rows((ContactField("value", wp.int32, -1),), on_rows=lambda rows: rows.publish(target))
+            test.assertEqual(rows._mode, "realloc")
+            # The second rows of the process look the package up no more.
+            pool.rows((ContactField("other", wp.vec3),))
+        test.assertEqual(sum("gpu_components is not installed" in line for line in logs.output), 1)
+        target.value.assign(np.arange(64, dtype=np.int32))
+        first = target.value
+        test.assertTrue(pool.grow(4096))
+        test.assertIsNot(target.value, first)
+        test.assertEqual(target.value.shape, (4096,))
+        np.testing.assert_array_equal(target.value.numpy()[:64], np.arange(64))
+        test.assertTrue(np.all(target.value.numpy()[64:] == -1))
+        test.assertTrue(pool.service(), "a growth requests a recapture")
+        # A collision pass outside capture grows the fallback rows as it grows virtual memory.
+        model = _build_boxes(device)
+        with _small_pool_policy(1, 8):
+            pipeline = newton.CollisionPipeline(model)
+            contacts = pipeline.contacts()
+            test.assertEqual(contacts._rigid_rows._mode, "realloc")
+            pipeline.collide(model.state(), contacts)
+        test.assertEqual(contacts.rigid_contact_max, GROWN)
+        test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), CONTACTS)
+
+
 def test_growth_past_free_memory_raises_before_changing(test, device):
     """Refuse a growth the free device memory cannot back, before mapping anything, and keep the rows."""
     pool = ContactPool(device=device, rows=64)
     target = type("Target", (), {})()
-    pool.rows((ContactField("value", wp.vec4, 1.0),), on_rows=lambda rows: rows.publish(target))
+    # Owners hold their rows; the pool holds them weakly.
+    rows = pool.rows((ContactField("value", wp.vec4, 1.0),), on_rows=lambda rows: rows.publish(target))
     view = target.value
     free = mock.PropertyMock(return_value=64 << 20)
     with mock.patch.object(type(wp.get_device(device)), "free_memory", new=free):
@@ -217,6 +289,7 @@ def test_growth_past_free_memory_raises_before_changing(test, device):
     test.assertEqual(pool.ready, 64)
     test.assertIs(target.value, view)
     test.assertTrue(pool.grow(128))
+    test.assertEqual(rows.rows, 128)
 
 
 def test_pool_follower_grows_with_its_leader(test, device):
@@ -278,8 +351,8 @@ def test_collide_outside_capture_grows_before_reading(test, device):
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             pipeline.collide(model.state(), contacts)
-    test.assertEqual(contacts.rigid_contact_max, 2 * demand)
-    test.assertEqual(pipeline._sort_key_array.shape, (2 * demand,))
+    test.assertEqual(contacts.rigid_contact_max, contact_pool.GROW_FACTOR * demand)
+    test.assertEqual(pipeline._sort_key_array.shape, (contact_pool.GROW_FACTOR * demand,))
     test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), demand)
     test.assertFalse(any(pipeline.narrow_phase.buffer_capacity_status().values()))
     np.testing.assert_array_equal(_records(contacts), _records(expected))
@@ -300,11 +373,11 @@ def test_service_measures_a_state_before_capture(test, device):
         pipeline = newton.CollisionPipeline(model, contact_matching="latest")
         contacts = pipeline.contacts()
         test.assertEqual(contacts.rigid_contact_max, 8)
-        generation = contacts.contact_generation.numpy()
+        generation = contacts.contact_generation.numpy().copy()
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             test.assertTrue(pipeline.service_capacity(resting), "graphs captured before must be recaptured")
-        test.assertEqual(contacts.rigid_contact_max, 2 * CONTACTS)
+        test.assertEqual(contacts.rigid_contact_max, GROWN)
         test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 0, "the measurement writes no Contacts")
         np.testing.assert_array_equal(contacts.contact_generation.numpy(), generation)
         test.assertFalse(any(pipeline.narrow_phase.buffer_capacity_status().values()))
@@ -359,10 +432,10 @@ def test_example_runner_measures_and_recaptures(test, device):
         example.graph = object()
         example.capture = lambda: captures.append(example.contacts.rigid_contact_max)
         _service_contact_capacity(example, example.state_0)
-        test.assertEqual(captures, [2 * CONTACTS])
+        test.assertEqual(captures, [GROWN])
         _service_contact_capacity(example)
         _service_contact_capacity(example, example.state_0)
-    test.assertEqual(captures, [2 * CONTACTS], "no growth, no recapture")
+    test.assertEqual(captures, [GROWN], "no growth, no recapture")
 
 
 def test_pipeline_growth_without_overflow_matches_fixed(test, device):
@@ -375,7 +448,7 @@ def test_pipeline_growth_without_overflow_matches_fixed(test, device):
         contacts = pipeline.contacts()
         test.assertEqual(contacts.rigid_contact_max, 64)
         _collide_like_fixed(test, device, model, reference, expected, pipeline, contacts)
-    test.assertEqual(contacts.rigid_contact_max, 96)
+    test.assertEqual(contacts.rigid_contact_max, GROWN)
 
 
 def _collide_like_fixed(test, device, model, fixed, expected, pipeline, contacts):
@@ -417,10 +490,10 @@ def test_feather_pgs_grows_mid_run(test, device):
     reference, _, _, _ = _feather_pgs_run(device, 6)
     state, contacts, pipeline, solver = _feather_pgs_run(device, 6, policy=_small_pool_policy(16, 8))
     test.assertEqual(pipeline._contact_pool.growth_count, 1)
-    test.assertEqual(solver._contact_pool.ready, 96)
-    test.assertEqual(solver.contact_slot.shape, (96,))
-    test.assertEqual(solver._friction_patches.capacity, 96)
-    test.assertEqual(contacts.rigid_contact_max, 96)
+    test.assertEqual(solver._contact_pool.ready, GROWN)
+    test.assertEqual(solver.contact_slot.shape, (GROWN,))
+    test.assertEqual(solver._friction_patches.capacity, GROWN)
+    test.assertEqual(contacts.rigid_contact_max, GROWN)
     solver.check_constraint_capacity()
     np.testing.assert_allclose(state.body_q.numpy(), reference.body_q.numpy(), rtol=0.0, atol=1.0e-5)
     np.testing.assert_allclose(state.body_qd.numpy(), reference.body_qd.numpy(), rtol=0.0, atol=1.0e-4)
@@ -430,8 +503,8 @@ def test_feather_pgs_follows_a_pass_that_grew(test, device):
     """Hand FeatherPGS the rows a collision pass grew to before it reads them, so no constraint is lost."""
     state, contacts, _, solver = _feather_pgs_run(device, 2, policy=_small_pool_policy(1, 8))
     solver.check_constraint_capacity()
-    test.assertEqual(contacts.rigid_contact_max, 2 * CONTACTS)
-    test.assertEqual(solver._contact_pool.ready, 2 * CONTACTS)
+    test.assertEqual(contacts.rigid_contact_max, GROWN)
+    test.assertEqual(solver._contact_pool.ready, GROWN)
     test.assertTrue(np.all(np.isfinite(state.body_q.numpy())))
 
 
@@ -494,7 +567,7 @@ def _graph_capture_recapture_after_growth(test, device):
         warnings.simplefilter("always")
         test.assertTrue(pipeline.service_capacity())
     test.assertTrue(any("reached the 8 ready rows" in str(w.message) for w in caught))
-    test.assertEqual(contacts.rigid_contact_max, 2 * CONTACTS)
+    test.assertEqual(contacts.rigid_contact_max, GROWN)
     # A stale replay stays within mapped memory at its old extents: still flagged, still finite.
     wp.capture_launch(old_graph)
     wp.synchronize_device(device)
@@ -659,7 +732,7 @@ def _newton_contacts_feed_mujoco_below_naconmax(test, device, model, reference):
             state_0.assign(state_1)
             wp.synchronize_device(device)
             test.assertEqual(run_pipeline.service_capacity(), run_pipeline is pipeline and step == 0)
-    test.assertEqual(contacts.rigid_contact_max, 96, "grown from the demand of 48 contacts, not to naconmax")
+    test.assertEqual(contacts.rigid_contact_max, GROWN, "grown from the demand of 48 contacts, not to naconmax")
     test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), int(fixed.rigid_contact_count.numpy()[0]))
     for _, _, run_solver, _, _ in runs:
         test.assertFalse(any(run_solver.contact_capacity_status().values()))
@@ -695,7 +768,7 @@ def _newton_contacts_feed_mujoco_below_naconmax(test, device, model, reference):
         if not pipeline.service_capacity():
             break
     test.assertEqual(len(graphs), 2, "one growth from demand, then one recapture")
-    test.assertEqual(contacts.rigid_contact_max, 96)
+    test.assertEqual(contacts.rigid_contact_max, GROWN)
     test.assertFalse(any(solver.contact_capacity_status().values()))
     test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), int(solver.mjw_data.nacon.numpy()[0]))
     test.assertTrue(np.all(np.isfinite(state_0.body_q.numpy())))
@@ -792,8 +865,8 @@ def test_coupled_entry_contacts_grow_with_their_source(test, device):
         test.assertEqual(filtered.rigid_contact_max, 8)
         state = model.state()
         pipeline.collide(state, contacts)
-    test.assertEqual(contacts.rigid_contact_max, 2 * CONTACTS)
-    test.assertEqual(filtered.rigid_contact_max, 2 * CONTACTS)
+    test.assertEqual(contacts.rigid_contact_max, GROWN)
+    test.assertEqual(filtered.rigid_contact_max, GROWN)
     test.assertIs(coupled.entry_contacts("A", contacts), filtered)
     np.testing.assert_array_equal(_records(filtered), _records(contacts))
 
@@ -825,6 +898,7 @@ class TestContactPool(unittest.TestCase):
 
 devices = get_test_devices()
 cuda_devices = get_cuda_test_devices()
+# Every test runs as well with gpu_components hidden: CUDA rows then fall back to ordinary arrays.
 # Overflowing passes print the narrow phase's capacity warning.
 for name, function, check_output in (
     ("test_pool_rows_keep_contents_and_fill_new_rows", test_pool_rows_keep_contents_and_fill_new_rows, True),
@@ -848,6 +922,13 @@ for name, function, check_output in (
     ("test_contact_kinematics_outputs_hold_the_rows", test_contact_kinematics_outputs_hold_the_rows, True),
 ):
     add_function_test(TestContactPool, name, function, devices=devices, check_output=check_output)
+    add_function_test(
+        TestContactPool,
+        f"{name}_without_gpu_components",
+        _without_virtual_memory(function),
+        devices=devices,
+        check_output=check_output,
+    )
 for name, function in (
     ("test_reservation_holds_the_device_bound", test_reservation_holds_the_device_bound),
     ("test_growth_past_free_memory_raises_before_changing", test_growth_past_free_memory_raises_before_changing),
@@ -855,6 +936,20 @@ for name, function in (
     ("test_capture_after_measuring_holds_every_contact", test_capture_after_measuring_holds_every_contact),
 ):
     add_function_test(TestContactPool, name, function, devices=cuda_devices, check_output=False)
+    add_function_test(
+        TestContactPool,
+        f"{name}_without_gpu_components",
+        _without_virtual_memory(function),
+        devices=cuda_devices,
+        check_output=False,
+    )
+add_function_test(
+    TestContactPool,
+    "test_rows_fall_back_without_gpu_components",
+    test_rows_fall_back_without_gpu_components,
+    devices=cuda_devices,
+    check_output=False,
+)
 
 
 if __name__ == "__main__":

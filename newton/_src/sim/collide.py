@@ -3420,25 +3420,28 @@ class CollisionPipeline:
         reads that copy without synchronizing, so it lags the device by the steps
         still in flight. When the high-water mark passes half the ready rows, the
         buffers of this pipeline, of its :meth:`contacts` and of the solvers that
-        consume them (e.g. :class:`~newton.solvers.SolverFeatherPGS`) grow to twice
-        the high-water mark, limited only by the device memory (a growth it cannot
-        back raises :class:`MemoryError`). Their contents and addresses are kept;
-        recapture graphs that use them before their next replay (a stale replay
-        stays within mapped memory but runs at the old extents). Growth
-        synchronizes the device and logs the new rows and bytes. A high-water mark
-        at the ready rows means a replayed collision pass may have dropped
-        contacts: its capacity status stays flagged
+        consume them (e.g. :class:`~newton.solvers.SolverFeatherPGS`) grow to four
+        times the high-water mark, limited only by the device memory (a growth it
+        cannot back raises :class:`MemoryError`), so a replay's demand may double
+        before it drops a contact, and the buffers grow again only once the demand
+        doubles. Their contents and addresses are kept; recapture graphs that use
+        them before their next replay (a stale replay stays within mapped memory
+        but runs at the old extents). Growth synchronizes the device and logs the
+        new rows and bytes. A high-water mark at the ready rows means a replayed
+        collision pass may have dropped contacts: its capacity status stays flagged
         (:meth:`~newton.geometry.NarrowPhase.check_buffer_capacity`) and this
         warns. Rows that a writer reserved during capture
         (:meth:`~newton.Contacts.reserve_rigid_contacts`) are grown here too.
 
         Args:
-            state: A state whose demand to measure first, outside capture: its
-                rigid contacts are detected into scratch rows, growing them until
-                they fit, without writing any :class:`~newton.Contacts` or the
-                pipeline's state across passes (contact matching, reduction
-                history, capacity status). Pass the state a graph will start from
-                before capturing it, so its first replays hold every contact.
+            state: A state to make fit instead, outside capture: its rigid contacts
+                are detected into scratch rows, without writing any
+                :class:`~newton.Contacts` or the pipeline's state across passes
+                (contact matching, reduction history, capacity status), and the
+                buffers grow only if those contacts fill them, then with the same
+                headroom. Pass the state a graph starts from before capturing it,
+                so its first replays hold every contact. The demand is recorded,
+                so a later call without ``state`` grows from it as above.
 
         Returns:
             True when the buffers grew since the last call, here, by a
@@ -3448,7 +3451,9 @@ class CollisionPipeline:
         .. experimental::
         """
         pool = self._contact_pool
-        if state is not None and pool.growable and not capturing(self.device):
+        if state is None:
+            return pool.service()
+        if pool.growable and not capturing(self.device):
             scratch = Contacts(
                 0,
                 0,
@@ -3458,7 +3463,7 @@ class CollisionPipeline:
             )
             self._detect_rigid_contacts(state, scratch, dt=0.0)
             wp.copy(self.narrow_phase._buffer_capacity_status, self._capacity_status_before_pass)
-        return pool.service()
+        return pool.service(grow=False)
 
     @property
     def soft_contact_max(self) -> int:

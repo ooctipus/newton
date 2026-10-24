@@ -526,8 +526,11 @@ def _service_contact_capacity(example, state: newton.State | None = None) -> Non
     capture, so the runner does what every loop that replays
     :meth:`newton.CollisionPipeline.collide` from a graph does (see
     :meth:`~newton.CollisionPipeline.service_capacity`): before the first frame
-    it measures ``state``, the state the example's graph starts from, and after
-    each frame it grows from the recorded demand.
+    it makes ``state``, the state the example's graph starts from, fit, and
+    after each frame it grows from the recorded demand. Before the first frame
+    the graph is recaptured only when its buffers could not hold ``state``'s
+    contacts: an example may allocate buffers in its first capture that only
+    its first replay makes valid.
     """
     grew = False
     for pipeline in list(vars(example).values()):

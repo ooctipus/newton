@@ -23,16 +23,18 @@ that existed and gives new rows the values the fields were created with.
 
 Storage:
 
-* On CUDA, rows are CUDA virtual memory: one reservation per field of the
-  pool's bound when the rows were created, of which a prefix is mapped
-  (``gpu_components``). The bound costs addresses, not memory. Growth maps
-  more pages behind the same addresses, so a graph captured before a growth
-  still addresses mapped memory. Recapture it before its next replay: launch
-  sizes and array lengths are fixed at capture, and a stale replay would treat
-  rows that growth made contact rows as its scratch.
-* On the CPU, and for fields with gradients, rows are ordinary arrays that
-  growth reallocates, copying their prefix. The superseded arrays stay alive
-  with their rows, so a stale graph replay still addresses allocated memory.
+* On CUDA with the optional ``gpu_components`` package, rows are CUDA virtual
+  memory: one reservation per field of the pool's bound when the rows were
+  created, of which a prefix is mapped. The bound costs addresses, not memory.
+  Growth maps more pages behind the same addresses, so a graph captured before
+  a growth still addresses mapped memory. Recapture it before its next replay:
+  launch sizes and array lengths are fixed at capture, and a stale replay would
+  treat rows that growth made contact rows as its scratch.
+* On the CPU, on CUDA without ``gpu_components`` (logged once), for fields with
+  gradients and for rows created during a graph capture, rows are ordinary
+  arrays of the ready rows that growth reallocates, copying their prefix. The
+  superseded arrays stay alive with their rows, so a stale graph replay still
+  addresses allocated memory; recapture after a growth all the same.
 
 The demand signal is a sticky device high-water mark of the contact count
 (:meth:`ContactPool.record_demand`), never reset by a collision pass and
@@ -85,10 +87,17 @@ vector), and on the CPU it is a few hundred kilobytes.
 """
 
 GROW_THRESHOLD = 0.5
-"""Grow when the high-water mark passes this fraction of the ready rows."""
+"""Grow when the high-water mark passes this fraction of the ready rows.
 
-GROW_FACTOR = 2
-"""Grow to this multiple of the high-water mark."""
+A graph replay cannot grow the rows, so its demand may double between two
+services before it drops a contact."""
+
+GROW_FACTOR = 4
+"""Grow to this multiple of the high-water mark.
+
+After a growth the high-water mark sits at a quarter of the rows, so the pool
+grows again, and graphs are recaptured, only when the demand doubles (at twice
+the mark, a slowly rising demand would grow and recapture at every service)."""
 
 ROW_QUANTUM = 64
 """Rows that grown and reserved ready counts round up to.
@@ -141,7 +150,7 @@ def grown_rows(high_water: int, ready: int, bound: int) -> int:
     return max(ready, min(int(bound), _round_up(GROW_FACTOR * high_water, ROW_QUANTUM)))
 
 
-def device_row_limit(device, row_bytes: int, index_limit: int = INDEX_LIMIT) -> int:
+def device_row_limit(device, row_bytes: int, index_limit: int = INDEX_LIMIT, *, memory: int | None = None) -> int:
     """Return the most rows of ``row_bytes`` bytes that ``device`` could ever back.
 
     On CUDA that is the device memory divided by the bytes per row; everywhere
@@ -152,10 +161,13 @@ def device_row_limit(device, row_bytes: int, index_limit: int = INDEX_LIMIT) -> 
         device: The device of the rows.
         row_bytes: Bytes one contact row costs in every field of the pool.
         index_limit: The most rows every field's arrays can index.
+        memory: The device's total memory [bytes], if already known; querying
+            it is a driver call, which a pool avoids during graph capture.
     """
     device = wp.get_device(device)
     if device.is_cuda and row_bytes > 0:
-        return min(int(index_limit), int(device.total_memory) // int(row_bytes))
+        total = int(device.total_memory) if memory is None else int(memory)
+        return min(int(index_limit), total // int(row_bytes))
     return int(index_limit)
 
 
@@ -215,33 +227,64 @@ def capturing(device) -> bool:
     return bool(device.is_capturing or (device.is_cuda and wp.get_stream(device).is_capturing))
 
 
-def _gpu_components():
-    try:
-        from gpu_components import backing, fields  # noqa: PLC0415
-        from gpu_components.field_data import FieldSpec  # noqa: PLC0415
-    except ImportError as error:
-        raise ImportError(
-            "Rigid contact buffers on CUDA need the gpu_components package (CUDA virtual memory): "
-            "install a checkout with `uv pip install --no-deps -e <gpu-components>`"
-        ) from error
-    return backing, fields, FieldSpec
+_VIRTUAL_MEMORY: list[Any] = []
+"""After the first look: ``gpu_components``' ``(backing, fields, FieldSpec)``, or ``None`` without the package."""
 
 
-_BACKINGS: dict[str, Any] = {}
-"""One CUDA virtual-memory ledger per device, shared by every growable pool on it."""
+def _virtual_memory():
+    """Return ``gpu_components``' ``(backing, fields, FieldSpec)``, or ``None`` without the optional package.
+
+    Without it, rows on CUDA are ordinary arrays that growth reallocates and copies, as on the CPU.
+    """
+    if not _VIRTUAL_MEMORY:
+        try:
+            from gpu_components import backing, fields  # noqa: PLC0415
+            from gpu_components.field_data import FieldSpec  # noqa: PLC0415
+        except ImportError:
+            _VIRTUAL_MEMORY.append(None)
+            logger.info(
+                "gpu_components is not installed: rigid contact rows on CUDA are ordinary arrays that growth "
+                "reallocates and copies, as on the CPU, instead of CUDA virtual memory"
+            )
+        else:
+            _VIRTUAL_MEMORY.append((backing, fields, FieldSpec))
+    return _VIRTUAL_MEMORY[0]
+
+
+_BACKINGS: dict[str, tuple] = {}
+"""One CUDA virtual-memory ledger per device, shared by every pool on it, with the ``gpu_components`` modules
+that made it: ``(owner, backing, fields)``."""
 _RETIRED: list[tuple[str, Any]] = []
 """Virtual-memory storages of collected rows, released at the next pool operation outside capture."""
+_RETIRED_HOST: list[wp.array] = []
+"""Pinned demand copies of collected pools, released when the next pool is created outside capture.
+
+Freeing pinned memory synchronizes the device, which a graph capture refuses, and a pool may be
+collected at any time, during a capture too."""
 
 
-def _backing(device):
+def _virtual_rows(device, fields):
+    """Return the ``gpu_components`` modules that hold ``fields`` in CUDA virtual memory, or ``None``.
+
+    Rows are ordinary arrays on the CPU, without ``gpu_components``, for fields with gradients, and when
+    created during a graph capture (a buffer a capture-first loop creates lazily): CUDA virtual memory
+    cannot be mapped while a stream captures.
+    """
+    device = wp.get_device(device)
+    if not device.is_cuda or any(field.requires_grad for field in fields) or capturing(device):
+        return None
+    return _virtual_memory()
+
+
+def _backing(device, backing_ops, fields_ops) -> tuple:
+    """Return ``device``'s virtual-memory ledger ``(owner, backing, fields)``, prepared on first use."""
     key = str(device)
-    owner = _BACKINGS.get(key)
-    if owner is None:
-        backing_ops, _, _ = _gpu_components()
+    ledger = _BACKINGS.get(key)
+    if ledger is None:
         with wp.ScopedDevice(device):
             owner = backing_ops.prepare(int(device.total_memory), device_ordinal=int(device.ordinal))
-        _BACKINGS[key] = owner
-    return owner
+        ledger = _BACKINGS[key] = (owner, backing_ops, fields_ops)
+    return ledger
 
 
 def _retire(device_key: str, storages: list) -> None:
@@ -255,8 +298,7 @@ def _release_retired(device) -> None:
     pending = [storage for owner_key, storage in _RETIRED if owner_key == key]
     if not pending or capturing(device):
         return
-    backing_ops, fields_ops, _ = _gpu_components()
-    owner = _BACKINGS[key]
+    owner, backing_ops, fields_ops = _BACKINGS[key]
     wp.synchronize_device(device)
     stream = wp.get_stream(device).cuda_stream
     released = []
@@ -299,8 +341,8 @@ class ContactRows:
     Args:
         fields: The fields of the owner.
         rows: Initial contact rows.
-        reserve: The most contact rows the storage may hold: on CUDA, the
-            addresses each field reserves.
+        reserve: The most contact rows the storage may hold: in CUDA virtual
+            memory, the addresses each field reserves.
         device: The device of the fields.
         on_rows: Called with the rows after creation and every growth.
     """
@@ -315,7 +357,8 @@ class ContactRows:
         self._storages = []
         # Arrays a reallocating growth replaced; a stale graph replay may still address them.
         self._superseded: list[wp.array] = []
-        if self.device.is_cuda and not any(field.requires_grad for field in self.fields):
+        self._vm = _virtual_rows(self.device, self.fields)
+        if self._vm is not None:
             self._mode = "virtual"
             self._allocate_virtual()
         else:
@@ -338,14 +381,14 @@ class ContactRows:
         """Return the device bytes the rows hold now."""
         if self._mode != "virtual":
             return sum(view.capacity * (2 if view.requires_grad else 1) for view in self.views.values())
-        _, fields_ops, _ = _gpu_components()
+        fields_ops = self._vm[1]
         return sum(fields_ops.memory_report(storage)["mapped_dense_bytes"] for storage, _ in self._storages)
 
     def reserved_bytes(self) -> int:
         """Return the device addresses the rows reserve (CUDA virtual memory), or the bytes they hold."""
         if self._mode != "virtual":
             return self.mapped_bytes()
-        _, fields_ops, _ = _gpu_components()
+        fields_ops = self._vm[1]
         return sum(fields_ops.memory_report(storage)["virtual_dense_bytes"] for storage, _ in self._storages)
 
     def _array(self, field, length):
@@ -365,11 +408,9 @@ class ContactRows:
             array[start:end].fill_(field.fill)
 
     def _allocate_virtual(self):
-        if capturing(self.device):
-            raise RuntimeError("Rigid contact buffers cannot be created during graph capture")
-        _, fields_ops, FieldSpec = _gpu_components()
+        backing_ops, fields_ops, FieldSpec = self._vm
         _release_retired(self.device)
-        owner = _backing(self.device)
+        owner, _, _ = _backing(self.device, backing_ops, fields_ops)
         groups: dict[tuple[int, int], list] = {}
         for field in self.fields:
             groups.setdefault((field.per_contact, field.extra), []).append(field)
@@ -457,9 +498,8 @@ def _grow_rows(members: list[ContactRows], rows: int) -> None:
     virtual = [member for member in members if member._mode == "virtual"]
     granule = 1
     if virtual:
-        backing_ops, fields_ops, _ = _gpu_components()
         _release_retired(device)
-        owner = _backing(device)
+        owner, backing_ops, fields_ops = _backing(device, *virtual[0]._vm[:2])
         granule = int(owner.granularity_bytes)
     added = sum(member._added_bytes(rows, granule) for member in members)
     held = members[0].rows
@@ -497,16 +537,25 @@ class ContactPool:
     def __init__(self, *, device, world_count: int = 1, rows: int | None = None):
         self.device = wp.get_device(device)
         self.ready = initial_rows(world_count) if rows is None else max(int(rows), 0)
+        # Queried once: the bound is recomputed when a member is collected, possibly during capture.
+        self._device_memory = int(self.device.total_memory) if self.device.is_cuda else 0
         self._members: list[weakref.ReferenceType] = []
         # The bound of the live members, recomputed after one is collected.
         self._bound = INDEX_LIMIT
         self._bound_stale = False
         self._followers: list[weakref.ReferenceType] = []
-        # Allocated here, outside any graph capture that records demand.
-        self._high_water = wp.zeros(1, dtype=wp.int32, device=self.device)
-        self._high_water_host = (
-            wp.zeros(1, dtype=wp.int32, device="cpu", pinned=True) if self.device.is_cuda else self._high_water
-        )
+        # The demand record, allocated here, outside any graph capture that records demand. A pool
+        # created during a capture (for a buffer created lazily in it) records none: it grows by
+        # reservations and by following its leader.
+        self._high_water = None
+        self._high_water_host = None
+        if not capturing(self.device):
+            self._high_water = wp.zeros(1, dtype=wp.int32, device=self.device)
+            self._high_water_host = self._high_water
+            if self.device.is_cuda:
+                _RETIRED_HOST.clear()
+                self._high_water_host = wp.zeros(1, dtype=wp.int32, device="cpu", pinned=True)
+                weakref.finalize(self, _RETIRED_HOST.append, self._high_water_host).atexit = False
         self.growth_count = 0
         """Growths so far; each one requires recapturing graphs that use the pool."""
         self._reserved = 0
@@ -543,10 +592,11 @@ class ContactPool:
         groups = [(member.fields, member._mode == "virtual") for member in members]
         fields = tuple(fields)
         if fields:
-            groups.append((fields, self.device.is_cuda and not any(field.requires_grad for field in fields)))
+            groups.append((fields, _virtual_rows(self.device, fields) is not None))
         row_bytes = sum(field.row_bytes for group, _ in groups for field in group)
         index_limit = min([INDEX_LIMIT, *(field.row_limit(virtual) for group, virtual in groups for field in group)])
-        return min([device_row_limit(self.device, row_bytes, index_limit), *(member.reserve for member in members)])
+        limit = device_row_limit(self.device, row_bytes, index_limit, memory=self._device_memory)
+        return min([limit, *(member.reserve for member in members)])
 
     def rows(self, fields, *, on_rows=None) -> ContactRows:
         """Create per-contact fields that follow this pool's ready rows (see :class:`ContactRows`).
@@ -681,7 +731,7 @@ class ContactPool:
 
         Graph capture records both launches.
         """
-        if not self.growable:
+        if self._high_water is None or not self.growable:
             return
         wp.launch(_record_high_water, dim=1, inputs=[count, self._high_water], device=self.device, record_tape=False)
         if self._high_water_host is not self._high_water:
@@ -690,9 +740,9 @@ class ContactPool:
     @property
     def high_water(self) -> int:
         """The most contacts any recorded collision pass counted, as last copied to the host (no synchronization)."""
-        return int(self._high_water_host.numpy()[0])
+        return 0 if self._high_water_host is None else int(self._high_water_host.numpy()[0])
 
-    def service(self) -> bool:
+    def service(self, *, grow: bool = True) -> bool:
         """Grow from the recorded demand and reservations; return whether graphs using the pool must be recaptured.
 
         Reads the pinned high-water mark without synchronizing, so it lags the
@@ -702,10 +752,13 @@ class ContactPool:
         capacity status stays flagged and this warns. Returns ``True`` when live
         buffers of this pool or its followers grew since the last call, also by
         a :meth:`reserve`, :meth:`fit` or :meth:`follow` outside it.
+
+        Args:
+            grow: Whether to grow; ``False`` only reports the growths since the last call.
         """
         if capturing(self.device):
             return False
-        if self.growable:
+        if grow and self.growable:
             high_water = self.high_water
             target = grown_rows(high_water, self.ready, self.bound)
             if self._reserved > self.ready:
