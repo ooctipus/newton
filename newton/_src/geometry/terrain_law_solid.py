@@ -74,11 +74,12 @@ pairs' features at once instead of one pair's whole window, and no thread walks 
    (its close or rule R's first lane); any other is listed for the small-pair finish kernel, one thread per pair
    (:func:`solid_finish_pair`).
 5. The finish of the deferred pairs (:func:`solid_finish_deferred`), a block of lanes per pair on the fixed grid of the
-   class's scratch (:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`, which holds every distinct
-   candidate a window of the class can give, :func:`~newton._src.geometry.terrain_contacts.terrain_pair_candidates`):
-   the first lane holds the pair's candidates from the pool in key order, as its close does, the lanes finish them
-   (:func:`~newton._src.geometry.terrain_law.terrain_finish_list`, its implied-row tests split among them), and every
-   row it keeps is written in the pair's walk slots when they fit, else in rows of the spill region it reserves
+   class's scratch (:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`, which holds every candidate a
+   window of the class can give, :func:`~newton._src.geometry.terrain_contacts.terrain_pair_candidates`): the first
+   lane places the pair's candidates from the pool in key order, one per key as its close takes them, the lanes merge
+   and finish them, every step split among them
+   (:func:`~newton._src.geometry.terrain_law.terrain_finish_list`), and write every row it keeps in the pair's walk
+   slots when they fit, else in rows of the spill region it reserves
    (:func:`~newton._src.geometry.terrain_law.terrain_finish_deferred`).
 
 The kernels follow the per-pair output protocol of :mod:`~newton._src.geometry.terrain_law`: a pair with no row is
@@ -155,6 +156,7 @@ from .terrain_law import (
     terrain_interior_vertex,
     terrain_locate,
     terrain_pair_exit,
+    terrain_place_candidate,
     terrain_plane,
     terrain_plane_group_of_three,
     terrain_planes,
@@ -1543,18 +1545,6 @@ def solid_sink(slot: int, capacity: int, eps: float) -> _Sink:
 
 
 @wp.func
-def solid_scratch_store(scratch: TerrainFinishScratch) -> TerrainLawRows:
-    """A scratch's rows as a store of held rows (its row fields only), for the hold of a deferred pair's candidates
-    (:func:`solid_finish_deferred`)."""
-    store = TerrainLawRows()
-    store.q = scratch.q
-    store.n = scratch.n
-    store.d = scratch.d
-    store.feature = scratch.feature
-    return store
-
-
-@wp.func
 def solid_finish(
     window: TerrainWindow,
     pair: _Pair,
@@ -2017,15 +2007,29 @@ def solid_vertex_job(
 def _hold_candidate(
     out: TerrainLawRows, jobs: TerrainSolidJobs, entry: int, slot: int, held: int, eps: float, limit: int
 ) -> int:
+    """Hold a pool candidate in a pair's walk slots from ``slot``, merged as the finish merges
+    (:func:`~newton._src.geometry.terrain_law.terrain_hold_row`, at most ``limit``)."""
     return terrain_hold_row(
         out, slot, held, jobs.q[entry], jobs.n[entry], jobs.d[entry], jobs.feature[entry], eps, limit
     )
 
 
 @wp.func
-def _hold_few(
-    out: TerrainLawRows, jobs: TerrainSolidJobs, i: int, slot: int, limit: int, eps: float
-) -> tuple[bool, int, int]:
+def _hold_candidate(
+    scratch: TerrainFinishScratch, jobs: TerrainSolidJobs, entry: int, slot: int, held: int, eps: float, limit: int
+) -> int:
+    """Place a pool candidate after the ``held`` ones of a scratch block from ``slot``, with its core point ``q + d n``
+    (the row's definition, as the in-place finish reads it), unmerged: the finish of deferred pairs merges
+    (:func:`~newton._src.geometry.terrain_law.terrain_place_candidate`, up to the block's capacity; ``eps`` and
+    ``limit`` serve the walk slots' overload)."""
+    q = jobs.q[entry]
+    n = jobs.n[entry]
+    d = jobs.d[entry]
+    return terrain_place_candidate(scratch, slot, held, q, q + d * n, n, d, jobs.feature[entry])
+
+
+@wp.func
+def _hold_few(store: Any, jobs: TerrainSolidJobs, i: int, slot: int, limit: int, eps: float) -> tuple[bool, int, int]:
     """:func:`_hold_candidates` of a list of at most :data:`TERRAIN_SOLID_FEW` candidates, its keys sorted in named
     registers (no array on the stack, nothing to zero): ``(few, held, raw)``, ``few`` ``False`` (nothing read past the
     list's fifth entry, nothing held) for a longer list. The same rows: one walk of the list, a stable insertion by
@@ -2075,38 +2079,38 @@ def _hold_few(
     raw = int(0)
     if count > 0:
         raw = 1
-        held = _hold_candidate(out, jobs, e0, slot, held, eps, limit)
+        held = _hold_candidate(store, jobs, e0, slot, held, eps, limit)
     if count > 1 and k1 != k0:
         raw += 1
-        held = _hold_candidate(out, jobs, e1, slot, held, eps, limit)
+        held = _hold_candidate(store, jobs, e1, slot, held, eps, limit)
     if count > 2 and k2 != k1:
         raw += 1
-        held = _hold_candidate(out, jobs, e2, slot, held, eps, limit)
+        held = _hold_candidate(store, jobs, e2, slot, held, eps, limit)
     if count > 3 and k3 != k2:
         raw += 1
-        held = _hold_candidate(out, jobs, e3, slot, held, eps, limit)
+        held = _hold_candidate(store, jobs, e3, slot, held, eps, limit)
     return True, held, raw
 
 
 @wp.func
-def _hold_candidates(
-    out: TerrainLawRows, jobs: TerrainSolidJobs, i: int, slot: int, limit: int, eps: float
-) -> tuple[int, int]:
-    """Hold class pair ``i``'s candidates in its walk slots from ``slot`` in window order (by key), as the walk offers
-    them (:func:`~newton._src.geometry.terrain_law.terrain_hold_row`, at most ``limit``): ``(held, raw)``, its
-    distinct rows and its offers. Candidates of one key (a cluster listed twice) are one offer; the list's order (its
+def _hold_candidates(store: Any, jobs: TerrainSolidJobs, i: int, slot: int, limit: int, eps: float) -> tuple[int, int]:
+    """Hold class pair ``i``'s candidates from ``slot`` of ``store`` in window order (by key), as the walk offers them:
+    ``(held, raw)``, its rows held and its offers. In a pair's walk slots
+    (:class:`~newton._src.geometry.terrain_law.TerrainLawRows`) they merge as the finish merges
+    (:func:`~newton._src.geometry.terrain_law.terrain_hold_row`, at most ``limit``), so that ``held`` counts its
+    distinct rows; in a scratch block of the finish of deferred pairs
+    (:class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`) each is placed as it is, the finish merging them
+    (:func:`_hold_candidate`). Candidates of one key (a cluster listed twice) are one offer; the list's order (its
     jobs') never matters. A list of at most :data:`TERRAIN_SOLID_FEW` candidates (most pairs' on the recorded states)
     is sorted in registers (:func:`_hold_few`), a longer one in chunks on the stack (:func:`_hold_sorted`)."""
-    few, held, raw = _hold_few(out, jobs, i, slot, limit, eps)
+    few, held, raw = _hold_few(store, jobs, i, slot, limit, eps)
     if few:
         return held, raw
-    return _hold_sorted(out, jobs, i, slot, limit, eps)
+    return _hold_sorted(store, jobs, i, slot, limit, eps)
 
 
 @wp.func
-def _hold_sorted(
-    out: TerrainLawRows, jobs: TerrainSolidJobs, i: int, slot: int, limit: int, eps: float
-) -> tuple[int, int]:
+def _hold_sorted(store: Any, jobs: TerrainSolidJobs, i: int, slot: int, limit: int, eps: float) -> tuple[int, int]:
     """:func:`_hold_candidates` of any list: taken in chunks of :data:`TERRAIN_SOLID_SORTED` keys sorted in a stack
     array, one walk of it per chunk (:data:`TERRAIN_SOLID_SORTED`): one walk on the recorded states."""
     keys = _Sorted()
@@ -2140,7 +2144,7 @@ def _hold_sorted(
                 continue
             last = keys[j]
             raw += 1
-            held = _hold_candidate(out, jobs, entries[j], slot, held, eps, limit)
+            held = _hold_candidate(store, jobs, entries[j], slot, held, eps, limit)
     return held, raw
 
 
@@ -2288,6 +2292,64 @@ def solid_finish_pair(
 
 
 @wp.func
+def _place_deferred(
+    scratch: TerrainFinishScratch, jobs: TerrainSolidJobs, i: int, base: int, eps: float, lane: int, lanes: int
+) -> int:
+    """Place class pair ``i``'s candidates in a scratch block from ``base`` in window order, one per key, as
+    :func:`_hold_candidates` places them, with a block's ``lanes`` lanes (lane ``lane``; one thread passes ``0, 1``):
+    the first lane walks the pair's pool list into the block's state words (an entry's key and index), then each lane
+    takes every ``lanes``-th entry, and the first of its key in the list places its candidate at its key's place among
+    the list's keys. Returns the candidates placed (the first lane's count is the one read). A list longer than the
+    block (a window its shape data no longer bounds) is placed by the first lane alone (:func:`_hold_candidates`)."""
+    length = int(0)
+    if lane == 0:
+        entry = jobs.head[i]
+        while entry >= 0:
+            if length < scratch.capacity:
+                scratch.alive[base + length] = jobs.key[entry]
+                scratch.group[base + length] = entry
+            length += 1
+            entry = jobs.next[entry]
+    if lanes > 1:
+        # every lane takes the first lane's length, after its writes
+        length = wp.tile_extract(wp.tile(length), 0)
+    if length > scratch.capacity:
+        held = int(0)
+        if lane == 0:
+            held, _raw = _hold_candidates(scratch, jobs, i, base, scratch.capacity, eps)
+        return held
+    # the first entry of each key in the list (its candidates are one offer)
+    for t in range(lane, length, lanes):
+        key = scratch.alive[base + t]
+        first = int(1)
+        for u in range(t):
+            if scratch.alive[base + u] == key:
+                first = 0
+        scratch.rank[base + t] = first
+    if lanes > 1:
+        # every lane reads the others' first entries
+        wp.tile_extract(wp.tile_max(wp.tile(0)), 0)
+    held = int(0)
+    for t in range(lane, length, lanes):
+        if scratch.rank[base + t] == 0:
+            continue
+        key = scratch.alive[base + t]
+        place = int(0)
+        for u in range(length):
+            if scratch.rank[base + u] != 0 and scratch.alive[base + u] < key:
+                place += 1
+        entry = scratch.group[base + t]
+        q = jobs.q[entry]
+        n = jobs.n[entry]
+        d = jobs.d[entry]
+        terrain_place_candidate(scratch, base, place, q, q + d * n, n, d, jobs.feature[entry])
+        held += 1
+    if lanes > 1:
+        held = wp.tile_extract(wp.tile_sum(wp.tile(held)), 0)
+    return held
+
+
+@wp.func
 def solid_finish_deferred(
     data: TerrainFeatureData,
     out: TerrainLawRows,
@@ -2303,24 +2365,14 @@ def solid_finish_deferred(
     lanes: int,
 ):
     """Finish a deferred pair (class pair ``i``: more distinct rows than its ``walk_slots`` walk slots from ``slot``)
-    with a block's ``lanes`` lanes (lane ``lane``; one thread passes ``0, 1``): its candidates held from the candidate
-    pool into block ``block``'s scratch in window order by the first lane, as its close holds them
-    (:func:`_hold_candidates`; the scratch holds every distinct candidate a window of the class can give), then
-    finished there by every lane and written
-    (:func:`~newton._src.geometry.terrain_law.terrain_finish_deferred`)."""
+    with a block's ``lanes`` lanes (lane ``lane``; one thread passes ``0, 1``): its candidates placed from the candidate
+    pool into block ``block``'s scratch in window order, one per key as its close takes them (:func:`_place_deferred`;
+    the scratch holds every candidate a window of the class can give), then merged and finished there by every lane and
+    written (:func:`~newton._src.geometry.terrain_law.terrain_finish_deferred`)."""
     record, window = solid_job_window(data, jobs, i)
     pair = record.pair
     base = block * scratch.capacity
-    held = int(0)
-    if lane == 0:
-        held, _raw = _hold_candidates(solid_scratch_store(scratch), jobs, i, base, scratch.capacity, pair.eps)
-        for h in range(wp.min(held, scratch.capacity)):
-            s = base + h
-            # a row's core point, as the in-place finish of a walk reads it
-            scratch.k[s] = scratch.q[s] + scratch.d[s] * scratch.n[s]
-    if lanes > 1:
-        # every lane takes the first lane's count, after its writes
-        held = wp.tile_extract(wp.tile_max(wp.tile(held)), 0)
+    held = _place_deferred(scratch, jobs, i, base, pair.eps, lane, lanes)
     terrain_finish_deferred(
         scratch,
         base,
@@ -2668,8 +2720,8 @@ def solid_kernels(
     ):
         """The finish of the class's deferred pairs (more distinct rows than their walk slots), ``wp.block_dim()``
         lanes per pair (:func:`solid_finish_deferred`): the grid's ``scratch.blocks`` blocks stride over the class's
-        deferred list, each block taking its pairs one at a time into its scratch, which holds every distinct candidate
-        a window of the class can give, so that a pair's rows depend on the pair alone: not on the order of the
+        deferred list, each block taking its pairs one at a time into its scratch, which holds every candidate a
+        window of the class can give, so that a pair's rows depend on the pair alone: not on the order of the
         deferral, the number of deferred pairs or the block that finishes it. ``wp.launch_tiled`` with
         ``dim=scratch.blocks``; a block past it returns at once."""
         block, lane = wp.tid()

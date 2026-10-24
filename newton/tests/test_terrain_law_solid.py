@@ -235,17 +235,64 @@ def _candidate_lists(rng, count):
     return lists
 
 
+def _chain_lists(rng, count, eps):
+    """Candidate lists whose merge and plane groups only candidate order decides: chains of rows each coinciding with
+    the next but not with the one after (0.55 merge tolerances apart, ``4 eps``) and chains of rows each on the next
+    one's plane but not on the one after's (normals 0.55 group tolerances apart), on and around a plane group of
+    corners, edge and inner rows, in random order. Returns ``(rows, prefix)`` per list, every row its own."""
+    step = 0.55 * 4.0 * eps
+    lists = []
+    for _i in range(count):
+        rows = []
+        normal = rng.normal(size=3) * np.array([0.3, 0.3, 1.0])
+        normal[2] = abs(normal[2]) + 0.5
+        normal /= np.linalg.norm(normal)
+        e1 = np.cross(normal, [1.0, 0.0, 0.0])
+        e1 /= np.linalg.norm(e1)
+        e2 = np.cross(normal, e1)
+        origin = rng.uniform(-0.05, 0.05, size=3)
+        tilt = rng.uniform(-0.05, 0.05, size=2) * rng.choice([0.0, 1.0])
+
+        def depth(u, v, tilt=tilt):
+            return 0.01 + tilt[0] * u + tilt[1] * v + rng.choice([0.0, 0.0, rng.uniform(-0.002, 0.004)])
+
+        for _j in range(int(rng.integers(3, 9))):
+            u, v = rng.uniform(-0.02, 0.02, size=2)
+            rows.append((origin + u * e1 + v * e2, normal, depth(u, v)))
+        for _chain in range(int(rng.integers(1, 3))):
+            # a merge chain on the group's plane
+            u, v = rng.uniform(-0.02, 0.02, size=2)
+            angle = rng.uniform(0.0, 2.0 * np.pi)
+            direction = np.cos(angle) * e1 + np.sin(angle) * e2
+            dist = depth(u, v)
+            for j in range(int(rng.integers(3, 6))):
+                rows.append((origin + u * e1 + v * e2 + j * step * direction, normal, dist))
+        for _chain in range(int(rng.integers(1, 3))):
+            # a plane chain: normals turned 0.55 group tolerances a row, positions within 2 cm (offsets of a few
+            # tenths of a band from each other's planes)
+            axis = e1 if rng.uniform() < 0.5 else e2
+            for j in range(int(rng.integers(3, 6))):
+                nj = normal + j * 0.55e-5 * axis
+                nj /= np.linalg.norm(nj)
+                u, v = rng.uniform(-0.01, 0.01, size=2)
+                rows.append((origin + u * e1 + v * e2, nj, depth(u, v)))
+        order = rng.permutation(len(rows))
+        rows = [rows[k] for k in order][:TERRAIN_FINISH_MASK_ROWS]
+        lists.append((rows, len(rows)))
+    return lists
+
+
 def test_finish_in_place_equals_finish(test, device):
     """Keep the same rows, bit for bit, with the finish in a walk's slots as with the finish on a scratch (the finish
     of deferred pairs), and finish any number of candidates there.
 
-    Lists with coincident rows, several plane groups, implied rows and groups of more than four rows; lists of more
-    rows than the in-place finish's masks hold (:data:`TERRAIN_FINISH_MASK_ROWS`) are copies of a shorter list, whose
-    copies merge into their first occurrence: the scratch finish keeps the rows the in-place finish keeps of the
-    shorter list.
+    Lists with coincident rows, several plane groups, implied rows and groups of more than four rows, and lists whose
+    merge and plane groups only candidate order decides (:func:`_chain_lists`); lists of more rows than the in-place
+    finish's masks hold (:data:`TERRAIN_FINISH_MASK_ROWS`) are copies of a shorter list, whose copies merge into their
+    first occurrence: the scratch finish keeps the rows the in-place finish keeps of the shorter list.
     """
     rng = np.random.default_rng(31)
-    lists = _candidate_lists(rng, 400)
+    lists = _candidate_lists(rng, 400) + _chain_lists(rng, 200, 8.0 * 1.1920928955078125e-7 * 0.2)
     q = np.zeros((len(lists) * 40, 3), np.float32)
     n = np.zeros((len(lists) * 40, 3), np.float32)
     d = np.zeros(len(lists) * 40, np.float32)
@@ -396,7 +443,8 @@ def _finish_lanes(
         for j in range(count):
             one_lane[i, j] = scratch.mark[block + j]
         one_lane[i, 40] = kept
-    # the first lane runs every step but the implied-row tests: the others wait for its writes
+    # the lanes split every step: they start after the first lane's reads (a block barrier)
+    wp.tile_extract(wp.tile_max(wp.tile(0)), 0)
     kept = terrain_finish_list(scratch, block, count, eps[i], lane, wp.block_dim())
     if lane == 0:
         for j in range(count):
@@ -448,15 +496,20 @@ def _large_group_lists(rng, count):
 
 
 def test_finish_lanes_keep_one_lanes_rows(test, device):
-    """Keep the same rows, bit for bit, with a block's lanes splitting the finish's implied-row tests as with one lane
-    taking them all (the finish of deferred pairs, on a scratch): the lanes OR their shares, each test the same float32
-    operations.
+    """Keep the same rows, bit for bit, with a block's lanes splitting every step of the finish as with one lane taking
+    them all (the finish of deferred pairs, on a scratch): the merge, the plane groups, the implied-row tests and the
+    groups' ranks, each test the same float32 operations, the lanes' answers combined across the block.
 
-    The candidate lists of :func:`test_finish_in_place_equals_finish` and lists dominated by one plane group of 9-24
-    rows, whose implied-row tests cost the most. On the CPU a block is one lane.
+    The candidate lists of :func:`test_finish_in_place_equals_finish` (with the chains only candidate order decides,
+    which the first lane decides) and lists dominated by one plane group of 9-24 rows, whose implied-row tests cost the
+    most. On the CPU a block is one lane.
     """
     rng = np.random.default_rng(47)
-    lists = _candidate_lists(rng, 300) + _large_group_lists(rng, 300)
+    lists = (
+        _candidate_lists(rng, 300)
+        + _chain_lists(rng, 300, 8.0 * 1.1920928955078125e-7 * 0.2)
+        + _large_group_lists(rng, 300)
+    )
     q = np.zeros((len(lists) * 40, 3), np.float32)
     n = np.zeros((len(lists) * 40, 3), np.float32)
     d = np.zeros(len(lists) * 40, np.float32)

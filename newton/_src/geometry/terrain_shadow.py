@@ -81,11 +81,11 @@ there keeps no row.
 The finish of a class's deferred pairs (pairs whose rows need more than their walk slots, or for the point class the
 general finish), ``wp.launch_tiled`` on the fixed grid of its
 :class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`
-(:func:`~newton._src.geometry.terrain_law.terrain_finish_blocks` blocks, each holding every distinct candidate a window
-of the class can give), strides over the class's deferred list, a block of lanes per pair: it collects the pair's
-candidates in the block's scratch (a solid pair's from the pool, a point pair's by the tiled walk), the lanes run the
-finish on them, its implied-row tests split among them, and every row it keeps is written, in the pair's walk slots when
-they fit, else in rows of the spill region.
+(:func:`~newton._src.geometry.terrain_law.terrain_finish_blocks` blocks, each holding every candidate a window of the
+class can give), strides over the class's deferred list, a block of lanes per pair: it collects the pair's candidates
+in the block's scratch (a solid pair's from the pool, a point pair's by the tiled walk), the lanes run the finish on
+them, every step split among them, and write every row it keeps, in the pair's walk slots when they fit, else in rows
+of the spill region.
 
 The kernels apply the pipeline's pair policy: the table holds the pairs its collision filter admits (worlds,
 collision groups, filter pairs, or its explicit pair list), and each kernel drops the pairs its broad phase's
@@ -247,11 +247,12 @@ A class's module and kernels follow one protocol (the helpers live in :mod:`~new
   ``K`` rows), the point kernels write them in the world frame (``terrain_store_row``) with the pair's count and state;
   the solid kernels run the finish in place on any held rows (``terrain_finish_slots``) and write the kept ones. A pair
   beyond that (for the solid kernels: more distinct rows than ``K``) is deferred (``terrain_defer_pair``), and the
-  class's finish of its deferred pairs collects its distinct candidates in its scratch (a solid pair's from the pool,
-  a point pair's by its walk, ``terrain_hold_candidate``), runs the finish on all of them with a block's lanes
-  (``terrain_finish_list``) and writes every row it keeps, in the pair's walk slots when they fit, else in rows of the
-  spill region it reserves (``terrain_finish_deferred``, ``terrain_spill_rows``; no room: the first ``K`` of them by
-  priority in the walk slots, ``terrain_finish_overflow``, state ``TERRAIN_PAIR_ROW_OVERFLOW``, ``terrain_rows``).
+  class's finish of its deferred pairs places its candidates in its scratch, unmerged (a solid pair's from the pool,
+  a point pair's by its walk, ``terrain_place_candidate``), runs the finish on all of them with a block's lanes, every
+  step split among them (``terrain_finish_list``), and writes every row it keeps, in the pair's walk slots when they
+  fit, else in rows of the spill region it reserves (``terrain_finish_deferred``, ``terrain_spill_rows``; no room: the
+  first ``K`` of them by priority in the walk slots, ``terrain_finish_overflow``, state ``TERRAIN_PAIR_ROW_OVERFLOW``,
+  ``terrain_rows``).
 """
 
 TERRAIN_LAW_SOLID_CLASSES = (TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_HULL)
@@ -752,7 +753,7 @@ class TerrainLawShadow:
                     else:
                         self._launches.append(("tiled", kernel, scratch.blocks, begin, slot, (scratch, False)))
             # The finish of the class's deferred pairs: a fixed grid over its deferred list (the pairs are found on the
-            # device, in any order), each block holding every distinct candidate a window of the class can give. A
+            # device, in any order), each block holding every candidate a window of the class can give. A
             # class whose largest pair's window can give many candidates takes fewer blocks, its scratch kept near
             # TERRAIN_LAW_SCRATCH_BYTES: the rare deferred path's parallelism, never a row.
             shapes["deferred_blocks"] = scratch.blocks
@@ -976,7 +977,7 @@ class TerrainLawShadow:
         ``launches`` counts every launch of a collide, the spill and job check included. ``launch_shapes`` holds, per
         class with pairs, the dimensions fixed at construction: ``block_dim`` (every launch's), ``walk_slots`` (a
         pair's walk slots), ``deferred_blocks`` (the grid of the finish of its deferred pairs), ``deferred_candidates``
-        (the distinct candidates a block of it holds: the most any pair of the class can give) and ``deferred_limited``
+        (the candidates a block of it holds: the most any pair of the class can give) and ``deferred_limited``
         (whether that grid has fewer than :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_DEFERRED_BLOCKS` blocks:
         its blocks, each sized for the class's largest pair, would exceed
         :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_SCRATCH_BYTES`); for the point class ``thread_dim`` (the

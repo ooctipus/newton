@@ -11,7 +11,7 @@ the surface predicates, the per-pair window (:func:`terrain_box_cells`, :func:`t
 (:func:`terrain_finish_slots`, :func:`terrain_finish_list`, :func:`terrain_finish_deferred`), the per-pair inputs and
 side buffer of the shadow route (:class:`TerrainPairInputs`, :class:`TerrainLawRows`), the launch arguments of its fixed
 grids (:class:`TerrainPairWork`, :class:`TerrainFinishScratch`) and the per-pair output protocol
-(:func:`terrain_pair_exit`, :func:`terrain_spill_rows`, :func:`terrain_hold_row`, :func:`terrain_hold_candidate`,
+(:func:`terrain_pair_exit`, :func:`terrain_spill_rows`, :func:`terrain_hold_row`, :func:`terrain_place_candidate`,
 :func:`terrain_plane_group_of_three`, :func:`terrain_defer_pair`, :func:`terrain_store_row`). The static
 data live in :mod:`terrain_contacts`, the per-type kernels in modules of their own (``terrain_law_<type>``), and
 :mod:`terrain_shadow` runs them after the narrow phase and writes their rows as the contacts of the pairs the narrow
@@ -59,8 +59,8 @@ hull of tangent position and distance, residual ``1e-6 m``) and keeps at most fo
 farthest, largest triangle, largest quadrilateral): every row it keeps is a support, and no count bounds them. It
 runs in place, on a walking pair's own slots (:func:`terrain_finish_slots`, up to :data:`TERRAIN_FINISH_MASK_ROWS`
 rows, one thread), or for a deferred pair on its candidates in a block's scratch (:func:`terrain_finish_list`, every
-distinct candidate a pair's window can give, :class:`TerrainFinishScratch`; a block's lanes splitting the implied-row
-tests); both keep the same rows, bit for bit. A pair's rows live in its walk slots, or when they are more, in a spill
+candidate a pair's window can give, :class:`TerrainFinishScratch`; a block's lanes splitting every step); both keep the
+same rows, bit for bit. A pair's rows live in its walk slots, or when they are more, in a spill
 region sized at the scene level (:class:`TerrainLawRows`). A spill region too small for a collide's rows, or a window
 larger than the one its pair's shape data gave at construction, sets a sticky bit of the narrow phase's buffer status
 word, which ``verify_narrow_phase_buffers`` keeps and ``NarrowPhase.check_buffer_capacity`` raises on
@@ -183,7 +183,7 @@ TERRAIN_SIDE_COUNT = 4
 """Walls of a heightfield (:func:`terrain_border_side`)."""
 
 TERRAIN_FINISH_CANDIDATE_OVERFLOW = wp.constant(1)
-"""Report flag: the pair's window gave more distinct candidates than its scratch holds (:class:`TerrainFinishScratch`),
+"""Report flag: the pair's window gave more candidates than its scratch holds (:class:`TerrainFinishScratch`),
 which only a window larger than its pair's shape data gave at construction can (the shape's scale, margin or gap
 changed since)."""
 TERRAIN_FINISH_ROW_OVERFLOW = wp.constant(2)
@@ -211,7 +211,7 @@ TERRAIN_PAIR_ROW_OVERFLOW = wp.constant(16)
 """Pair state: the pair's rows exceed its walk slots and the spill region had no room for them (no row;
 ``terrain_rows`` is raised)."""
 TERRAIN_PAIR_CANDIDATE_OVERFLOW = wp.constant(32)
-"""Pair state: the pair's window gave more distinct candidates than its scratch holds (it keeps the first in window
+"""Pair state: the pair's window gave more candidates than its scratch holds (it keeps the first in window
 order; ``terrain_rows`` is raised): its shape data changed after the shadow was built."""
 TERRAIN_PAIR_WIDE = wp.constant(64)
 """Pair state: the window spans 64 cells or more, so feature ids may repeat within it (rows are still emitted)."""
@@ -262,6 +262,9 @@ _CREASE_FLAT = wp.constant(TERRAIN_FLAT_EPS)
 _GROUP_ROWS = wp.constant(TERRAIN_GROUP_ROWS)
 _WALL_DEPTH = wp.constant(TERRAIN_WALL_DEPTH)
 _ON_FEATURE = wp.constant(TERRAIN_ON_FEATURE)
+_NO_ROW = wp.constant(2147483647)
+"""A lane's answer when it has no candidate (the finish of deferred pairs): past every candidate, so that the least
+answer of a block's lanes is the first candidate any lane has."""
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -556,14 +559,14 @@ words of state."""
 
 @wp.struct
 class TerrainFinishScratch:
-    """Global scratch of a class's finish of deferred pairs: per block, the distinct candidates of the pair it finishes
-    and the finish's state of each.
+    """Global scratch of a class's finish of deferred pairs: per block, the candidates of the pair it finishes (its
+    walk's rows, unmerged) and the finish's state of each.
 
     Block ``b`` holds candidate ``j`` at ``b * capacity + j``, off the per-thread stack: the largest stack a context
     launches sets the driver's local-memory reservation for every thread the device can hold. ``capacity`` bounds the
-    distinct candidates of every pair of the class
-    (:func:`~newton._src.geometry.terrain_contacts.terrain_pair_candidates` from each pair's shape extent, reach and
-    cells at construction), so that the finish (:func:`terrain_finish_list`) sees all of them.
+    candidates of every pair of the class (:func:`~newton._src.geometry.terrain_contacts.terrain_pair_candidates` from
+    each pair's shape extent, reach and cells at construction), so that the finish (:func:`terrain_finish_list`) sees
+    all of them.
     """
 
     blocks: int
@@ -586,9 +589,10 @@ class TerrainFinishScratch:
     """The finish's state: the candidate representing a candidate's plane group (-1: none)."""
     rank: wp.array[wp.int32]
     """The finish's state: a candidate's rank in its plane group (0 deepest, 1 farthest, 2 largest triangle, 3 largest
-    quadrilateral, 4 not kept)."""
+    quadrilateral, 4 not kept); before its last step, a plane group's size at the candidate representing it."""
     mark: wp.array[wp.int32]
-    """The finish's state: candidates tested for implied-row removal, and on return the kept ones (1)."""
+    """The finish's state: the first coincident or coplanar candidate of one the merge or the groups leave undecided,
+    then the candidates tested for implied-row removal, and on return the kept ones (1)."""
 
 
 def terrain_finish_blocks(capacity: int) -> int:
@@ -2149,11 +2153,11 @@ def _list_implied(
     """:func:`_staged_implied` over a scratch's candidates (their core points read, not rebuilt), from this lane's share
     of the tests: the points and segments of the other live members of plane group ``g``, each segment with its
     triangles; lane ``lane`` of ``lanes`` takes every ``lanes``-th of them in that order, so that the lanes' answers
-    ORed are the answer of one lane taking all."""
+    ORed are the answer of one lane taking all. A group's members follow its first candidate ``g``."""
     limit = scratch.d[base + skip]
     tolerance = _MERGE_SCALE * eps
     test = int(0)
-    for a in range(count):
+    for a in range(g, count):
         if a == skip or not _list_member(scratch, base + a, g):
             continue
         ka = scratch.k[base + a]
@@ -2212,179 +2216,297 @@ def _lanes_max(value: int) -> int:
 
 
 @wp.func
-def _list_groups(scratch: TerrainFinishScratch, base: int, count: int, eps: float):
-    """Steps 1 and 2 of :func:`terrain_finish_list`: coincident rows merged (the first in feature order stays), and the
-    first row of a plane representing its plane group."""
-    # 1. coincident rows: the first in feature order stays
-    for i in range(count):
-        qi = scratch.q[base + i]
-        ni = scratch.n[base + i]
-        survives = int(1)
-        for j in range(i):
-            if scratch.alive[base + j] != 0 and terrain_rows_coincide(
-                scratch.q[base + j], scratch.n[base + j], qi, ni, eps
-            ):
-                survives = 0
-                break
-        scratch.alive[base + i] = survives
-    # 2. plane groups: the first row of a plane represents it
-    for i in range(count):
-        scratch.group[base + i] = -1
-        if scratch.alive[base + i] == 0:
-            continue
-        qi = scratch.q[base + i]
-        ni = scratch.n[base + i]
-        scratch.group[base + i] = i
-        for j in range(i):
-            if scratch.alive[base + j] != 0 and scratch.group[base + j] == j:
-                if terrain_rows_same_plane(qi, ni, scratch.q[base + j], scratch.n[base + j], eps):
-                    scratch.group[base + i] = j
-                    break
+def _lanes_max(value: float) -> float:
+    """The largest ``value`` of a block's lanes (a block barrier)."""
+    return wp.tile_extract(wp.tile_max(wp.tile(value)), 0)
 
 
 @wp.func
-def _list_keep(scratch: TerrainFinishScratch, base: int, count: int) -> int:
-    """Step 4 of :func:`terrain_finish_list`: at most four rows per plane group (deepest, farthest, largest triangle,
-    largest quadrilateral), the kept ones marked (``scratch.mark`` 1); returns their count."""
-    for i in range(count):
-        scratch.rank[base + i] = 4
-    for g in range(count):
-        # A group keeps its first row's id even when that row was implied.
-        if scratch.group[base + g] != g:
-            continue
-        size = int(0)
+def _lanes_min(value: int) -> int:
+    """The least ``value`` of a block's lanes (a block barrier)."""
+    return wp.tile_extract(wp.tile_min(wp.tile(value)), 0)
+
+
+@wp.func
+def _lanes_sum(value: int) -> int:
+    """The sum of a block's lanes' ``value`` (a block barrier)."""
+    return wp.tile_extract(wp.tile_sum(wp.tile(value)), 0)
+
+
+@wp.func
+def _lanes_first(value: int) -> int:
+    """The first lane's ``value``, for every lane of a block (a block barrier)."""
+    return wp.tile_extract(wp.tile(value), 0)
+
+
+@wp.func
+def _list_merge(scratch: TerrainFinishScratch, base: int, count: int, eps: float, lane: int, lanes: int):
+    """Step 1 of :func:`terrain_finish_list`: coincident candidates merged, the first in candidate order staying
+    (``alive`` 1, the others 0); the group sizes of step 2 zeroed (``rank``).
+
+    Each lane takes every ``lanes``-th candidate: one that no earlier candidate coincides with stays, and one whose
+    first coincident candidate stays merges into it; any other (a chain of coincident candidates, rows within a few
+    bands of each other) is decided by the first lane in candidate order, as one lane decides them all."""
+    for i in range(lane, count, lanes):
+        qi = scratch.q[base + i]
+        ni = scratch.n[base + i]
+        first = int(-1)
+        for j in range(i):
+            # every test, so that a lane's loads overlap
+            coincide = terrain_rows_coincide(scratch.q[base + j], scratch.n[base + j], qi, ni, eps)
+            if coincide and first < 0:
+                first = j
+        alive = int(1)
+        if first >= 0:
+            # undecided: its first coincident candidate in ``mark``
+            alive = -1
+            scratch.mark[base + i] = first
+        scratch.alive[base + i] = alive
+        scratch.rank[base + i] = 0
+    if lanes > 1:
+        _lanes_max(0)
+    undecided = int(0)
+    for i in range(lane, count, lanes):
+        if scratch.alive[base + i] < 0:
+            if scratch.alive[base + scratch.mark[base + i]] == 1:
+                scratch.alive[base + i] = 0
+            else:
+                undecided = 1
+    if lanes > 1:
+        undecided = _lanes_max(undecided)
+    if undecided == 0:
+        return
+    if lane == 0:
         for i in range(count):
-            if _list_member(scratch, base + i, g):
-                size += 1
-        if size == 0:
-            continue
-        ng = scratch.n[base + g]
-        i0 = int(-1)
-        for i in range(count):
-            if _list_member(scratch, base + i, g):
-                if i0 < 0 or scratch.d[base + i] < scratch.d[base + i0]:
-                    i0 = i
-        p0 = scratch.k[base + i0]
-        p0 = p0 - wp.dot(p0, ng) * ng
-        scratch.rank[base + i0] = 0
-        i1 = int(-1)
-        far = float(-1.0)
-        for j in range(count):
-            if not _list_member(scratch, base + j, g) or scratch.rank[base + j] == 0:
+            if scratch.alive[base + i] >= 0:
                 continue
-            pj = scratch.k[base + j]
-            distance = wp.length(pj - wp.dot(pj, ng) * ng - p0)
-            if distance > far:
-                far = distance
-                i1 = j
-        if i1 < 0:
-            continue
-        scratch.rank[base + i1] = 1
-        p1 = scratch.k[base + i1]
-        p1 = p1 - wp.dot(p1, ng) * ng
-        i2 = int(-1)
-        largest = float(-1.0)
-        for j in range(count):
-            if not _list_member(scratch, base + j, g) or scratch.rank[base + j] <= 1:
-                continue
-            pj = scratch.k[base + j]
-            area = wp.abs(wp.dot(wp.cross(p1 - p0, pj - wp.dot(pj, ng) * ng - p0), ng))
-            if area > largest:
-                largest = area
-                i2 = j
-        if i2 < 0:
-            continue
-        scratch.rank[base + i2] = 2
-        p2 = scratch.k[base + i2]
-        p2 = p2 - wp.dot(p2, ng) * ng
-        i3 = int(-1)
-        gain_best = float(1.0e-15)
-        for j in range(count):
-            if not _list_member(scratch, base + j, g) or scratch.rank[base + j] <= 2:
-                continue
-            pj = scratch.k[base + j]
-            pj = pj - wp.dot(pj, ng) * ng
-            gain = float(0.0)
-            for side in range(3):
-                pa = p0
-                pb = p1
-                pc = p2
-                if side == 1:
-                    pa = p1
-                    pb = p2
-                    pc = p0
-                elif side == 2:
-                    pa = p2
-                    pb = p0
-                    pc = p1
-                side_c = wp.dot(wp.cross(pb - pa, pc - pa), ng)
-                side_j = wp.dot(wp.cross(pb - pa, pj - pa), ng)
-                if side_c * side_j < 0.0:
-                    gain = wp.max(gain, wp.abs(side_j))
-            if gain > gain_best:
-                gain_best = gain
-                i3 = j
-        if i3 >= 0:
-            scratch.rank[base + i3] = 3
-        if size <= _GROUP_ROWS:
-            # A group of at most four rows keeps them all.
-            for j in range(count):
-                if _list_member(scratch, base + j, g) and scratch.rank[base + j] == _GROUP_ROWS:
-                    scratch.rank[base + j] = _GROUP_ROWS - 1
-    kept = int(0)
+            qi = scratch.q[base + i]
+            ni = scratch.n[base + i]
+            survives = int(1)
+            for j in range(i):
+                if scratch.alive[base + j] == 1 and terrain_rows_coincide(
+                    scratch.q[base + j], scratch.n[base + j], qi, ni, eps
+                ):
+                    survives = 0
+                    break
+            scratch.alive[base + i] = survives
+    if lanes > 1:
+        _lanes_max(0)
+
+
+@wp.func
+def _list_groups(scratch: TerrainFinishScratch, base: int, count: int, eps: float, lane: int, lanes: int):
+    """Step 2 of :func:`terrain_finish_list`: the first live candidate of a plane represents its plane group
+    (``group``), then each group's size at its first candidate (``rank``) and the implied-row step's marks cleared
+    (``mark``).
+
+    As step 1 (:func:`_list_merge`): a live candidate that shares a plane with no earlier live one represents its
+    group, and one whose first such candidate represents a group joins it; any other is decided by the first lane in
+    candidate order, as one lane decides them all."""
+    for i in range(lane, count, lanes):
+        group = int(-1)
+        if scratch.alive[base + i] != 0:
+            qi = scratch.q[base + i]
+            ni = scratch.n[base + i]
+            first = int(-1)
+            for j in range(i):
+                same = terrain_rows_same_plane(qi, ni, scratch.q[base + j], scratch.n[base + j], eps)
+                if same and first < 0 and scratch.alive[base + j] != 0:
+                    first = j
+            group = i
+            if first >= 0:
+                # undecided: the first live candidate on its plane in ``mark``
+                group = -2
+                scratch.mark[base + i] = first
+        scratch.group[base + i] = group
+    if lanes > 1:
+        _lanes_max(0)
+    undecided = int(0)
+    for i in range(lane, count, lanes):
+        if scratch.group[base + i] == -2:
+            first = scratch.mark[base + i]
+            if scratch.group[base + first] == first:
+                scratch.group[base + i] = first
+            else:
+                undecided = 1
+    if lanes > 1:
+        undecided = _lanes_max(undecided)
+    if undecided != 0:
+        if lane == 0:
+            for i in range(count):
+                if scratch.group[base + i] != -2:
+                    continue
+                qi = scratch.q[base + i]
+                ni = scratch.n[base + i]
+                group = i
+                for j in range(i):
+                    if scratch.alive[base + j] != 0 and scratch.group[base + j] == j:
+                        if terrain_rows_same_plane(qi, ni, scratch.q[base + j], scratch.n[base + j], eps):
+                            group = j
+                            break
+                scratch.group[base + i] = group
+        if lanes > 1:
+            _lanes_max(0)
+    for i in range(lane, count, lanes):
+        scratch.mark[base + i] = 0
+        if scratch.alive[base + i] != 0:
+            wp.atomic_add(scratch.rank, base + scratch.group[base + i], 1)
+    if lanes > 1:
+        _lanes_max(0)
+
+
+@wp.func
+def _list_next_group(scratch: TerrainFinishScratch, base: int, count: int, after: int, lane: int, lanes: int) -> int:
+    """The first plane group past candidate ``after`` with three live candidates or more (its size at its first
+    candidate, ``rank``), or -1: the groups whose rows the implied-row step tests, in candidate order."""
+    found = int(_NO_ROW)
+    for i in range(lane, count, lanes):
+        if i > after and scratch.group[base + i] == i and scratch.rank[base + i] >= 3:
+            found = i
+            break
+    if lanes > 1:
+        found = _lanes_min(found)
+    if found == _NO_ROW:
+        return -1
+    return found
+
+
+@wp.func
+def _list_pick(scratch: TerrainFinishScratch, base: int, count: int, g: int, lane: int, lanes: int) -> int:
+    """The implied-row step's next candidate of plane group ``g``: its shallowest live candidate not yet tested
+    (``mark`` 0), the first in candidate order on ties, or -1. Each lane reads its own candidates' marks."""
+    pick = int(-1)
+    for i in range(lane, count, lanes):
+        if _list_member(scratch, base + i, g) and scratch.mark[base + i] == 0:
+            if pick < 0 or scratch.d[base + i] > scratch.d[base + pick]:
+                pick = i
+    if lanes > 1:
+        mine = float(-wp.inf)
+        if pick >= 0:
+            mine = scratch.d[base + pick]
+        shallowest = _lanes_max(mine)
+        first = int(_NO_ROW)
+        if pick >= 0 and mine == shallowest:
+            first = pick
+        pick = _lanes_min(first)
+        if pick == _NO_ROW:
+            pick = -1
+    return pick
+
+
+@wp.func
+def _list_keep_group(scratch: TerrainFinishScratch, base: int, count: int, g: int):
+    """Step 4 of :func:`terrain_finish_list` for plane group ``g`` (its size at its first candidate, ``rank``): its live
+    candidates ranked (``rank``: 0 deepest, 1 farthest, 2 largest triangle, 3 largest quadrilateral, 4 not kept; a
+    group of at most four keeps every one, ranking 3 the one it does not pick)."""
+    size = scratch.rank[base + g]
+    if size <= 1:
+        # its first candidate alone: no step drops a row of a group of fewer than three
+        scratch.rank[base + g] = 0
+        return
+    rest = int(_GROUP_ROWS)
+    if size <= _GROUP_ROWS:
+        rest = _GROUP_ROWS - 1
+    ng = scratch.n[base + g]
+    i0 = int(-1)
     for i in range(count):
-        keep = int(0)
-        if scratch.alive[base + i] != 0 and scratch.rank[base + i] < _GROUP_ROWS:
-            keep = 1
-        scratch.mark[base + i] = keep
-        kept += keep
-    return kept
+        if _list_member(scratch, base + i, g):
+            scratch.rank[base + i] = rest
+            if i0 < 0 or scratch.d[base + i] < scratch.d[base + i0]:
+                i0 = i
+    scratch.rank[base + i0] = 0
+    p0 = scratch.k[base + i0]
+    p0 = p0 - wp.dot(p0, ng) * ng
+    i1 = int(-1)
+    far = float(-1.0)
+    for j in range(count):
+        if j == i0 or not _list_member(scratch, base + j, g):
+            continue
+        pj = scratch.k[base + j]
+        distance = wp.length(pj - wp.dot(pj, ng) * ng - p0)
+        if distance > far:
+            far = distance
+            i1 = j
+    if i1 < 0:
+        return
+    scratch.rank[base + i1] = 1
+    p1 = scratch.k[base + i1]
+    p1 = p1 - wp.dot(p1, ng) * ng
+    i2 = int(-1)
+    largest = float(-1.0)
+    for j in range(count):
+        if j == i0 or j == i1 or not _list_member(scratch, base + j, g):
+            continue
+        pj = scratch.k[base + j]
+        area = wp.abs(wp.dot(wp.cross(p1 - p0, pj - wp.dot(pj, ng) * ng - p0), ng))
+        if area > largest:
+            largest = area
+            i2 = j
+    if i2 < 0:
+        return
+    scratch.rank[base + i2] = 2
+    p2 = scratch.k[base + i2]
+    p2 = p2 - wp.dot(p2, ng) * ng
+    i3 = int(-1)
+    gain_best = float(1.0e-15)
+    for j in range(count):
+        if j == i0 or j == i1 or j == i2 or not _list_member(scratch, base + j, g):
+            continue
+        pj = scratch.k[base + j]
+        pj = pj - wp.dot(pj, ng) * ng
+        gain = float(0.0)
+        for side in range(3):
+            pa = p0
+            pb = p1
+            pc = p2
+            if side == 1:
+                pa = p1
+                pb = p2
+                pc = p0
+            elif side == 2:
+                pa = p2
+                pb = p0
+                pc = p1
+            side_c = wp.dot(wp.cross(pb - pa, pc - pa), ng)
+            side_j = wp.dot(wp.cross(pb - pa, pj - pa), ng)
+            if side_c * side_j < 0.0:
+                gain = wp.max(gain, wp.abs(side_j))
+        if gain > gain_best:
+            gain_best = gain
+            i3 = j
+    if i3 >= 0:
+        scratch.rank[base + i3] = 3
 
 
 @wp.func
 def terrain_finish_list(scratch: TerrainFinishScratch, base: int, count: int, eps: float, lane: int, lanes: int) -> int:
     """The law's finish (:func:`terrain_finish_slots`) of ``count`` candidates at ``[base, base + count)`` of a
-    scratch, any number of them, with their core points from ``scratch.k``, by a block's ``lanes`` lanes (lane
-    ``lane``; one thread passes ``0, 1``).
+    scratch, any number of them, coincident ones included, with their core points from ``scratch.k``, by a block's
+    ``lanes`` lanes (lane ``lane``; one thread passes ``0, 1``).
 
     The finish's state lives in the scratch (``alive``, ``group``, ``rank``, ``mark``), not on the stack, so that it
     holds as many candidates as the scratch does: on the rows :func:`terrain_finish_slots` takes, with core points
-    ``q + d n``, it keeps the same rows, bit for bit (the same steps, ties and float32 operations). The first lane runs
-    every step and writes the state; the implied-row test of a row (every point, segment and triangle of its group's
-    other live members) is split among the lanes and their answers ORed across the block (:func:`_list_implied`), so
-    that any number of lanes keeps the rows one lane keeps. With ``lanes > 1`` every lane of the block must call it with
-    the same candidates.
+    ``q + d n``, it keeps the same rows, bit for bit (the same steps, ties and float32 operations). The lanes split
+    every step: each takes every ``lanes``-th candidate of the merge and the plane groups (:func:`_list_merge`,
+    :func:`_list_groups`: a candidate's earlier ones, the order's few chains decided by the first lane), the
+    implied-row tests of a row (:func:`_list_implied`, the next row picked across the block, :func:`_list_pick`) and
+    the groups whose rows it ranks (:func:`_list_keep_group`); their answers combine across the block (block
+    reductions, which also order the lanes' writes before the reads that follow), so that any number of lanes keeps the
+    rows one lane keeps. With ``lanes > 1`` every lane of the block must call it with the same candidates.
 
     Returns the kept candidates' count (every lane); ``scratch.mark`` is 1 at the kept ones (kept rows in candidate
     order).
     """
-    if lane == 0:
-        _list_groups(scratch, base, count, eps)
-    if lanes > 1:
-        # every lane reads the groups the first lane wrote
-        _lanes_max(0)
-    # 3. implied rows, the shallowest first, one at a time, in one pass (see terrain_finish_slots); every lane walks the
-    # same groups and picks, the first lane picking and writing the state
-    for g in range(count):
-        if scratch.alive[base + g] == 0 or scratch.group[base + g] != g:
-            continue
+    _list_merge(scratch, base, count, eps, lane, lanes)
+    _list_groups(scratch, base, count, eps, lane, lanes)
+    # 3. implied rows (see terrain_finish_slots), the shallowest first, one at a time: the groups of three rows or more,
+    # each with every lane (a group's tests touch its own rows alone, so that their order is free)
+    g = _list_next_group(scratch, base, count, -1, lane, lanes)
+    while g >= 0:
         e1, e2 = _tangent_frame(scratch.n[base + g])
-        size = int(0)
-        for i in range(count):
-            if _list_member(scratch, base + i, g):
-                size += 1
-        if lane == 0:
-            for i in range(count):
-                scratch.mark[base + i] = 0
+        size = scratch.rank[base + g]
         while size >= 3:
-            pick = int(-1)
-            if lane == 0:
-                for i in range(count):
-                    if _list_member(scratch, base + i, g) and scratch.mark[base + i] == 0:
-                        if pick < 0 or scratch.d[base + i] > scratch.d[base + pick]:
-                            pick = i
-            if lanes > 1:
-                pick = _lanes_max(pick)
+            pick = _list_pick(scratch, base, count, g, lane, lanes)
             if pick < 0:
                 break
             kj = scratch.k[base + pick]
@@ -2392,17 +2514,33 @@ def terrain_finish_list(scratch: TerrainFinishScratch, base: int, count: int, ep
             implied = _list_implied(scratch, base, count, g, pick, e1, e2, point, eps, lane, lanes)
             if lanes > 1:
                 implied = _lanes_max(int(implied)) != 0
-            if lane == 0:
+            if pick % lanes == lane:
+                # the pick's lane, which alone reads its mark; the next pick's reductions order its writes
                 scratch.mark[base + pick] = 1
                 if implied:
                     scratch.alive[base + pick] = 0
             if implied:
                 size -= 1
-    kept = int(0)
-    if lane == 0:
-        kept = _list_keep(scratch, base, count)
+        if lane == 0:
+            scratch.rank[base + g] = size
+        g = _list_next_group(scratch, base, count, g, lane, lanes)
+    # 4. at most four rows per plane group: each lane ranks the groups of its candidates that represent one
+    for g in range(lane, count, lanes):
+        if scratch.group[base + g] == g:
+            _list_keep_group(scratch, base, count, g)
     if lanes > 1:
-        kept = _lanes_max(kept)
+        _lanes_max(0)
+    kept = int(0)
+    for i in range(lane, count, lanes):
+        keep = int(0)
+        if scratch.alive[base + i] == 0:
+            scratch.rank[base + i] = _GROUP_ROWS
+        elif scratch.rank[base + i] < _GROUP_ROWS:
+            keep = 1
+        scratch.mark[base + i] = keep
+        kept += keep
+    if lanes > 1:
+        kept = _lanes_sum(kept)
     return kept
 
 
@@ -2474,7 +2612,7 @@ def terrain_finish_overflow(scratch: TerrainFinishScratch, base: int, count: int
 
 
 @wp.func
-def terrain_hold_candidate(
+def terrain_place_candidate(
     scratch: TerrainFinishScratch,
     base: int,
     held: int,
@@ -2483,14 +2621,10 @@ def terrain_hold_candidate(
     n: wp.vec3,
     d: float,
     feature: int,
-    eps: float,
 ) -> int:
-    """Add a candidate (window frame) to the distinct ones a scratch block holds from ``base``, as the finish merges
-    (:func:`terrain_hold_row`, with its core point ``k``): past the block's capacity a distinct candidate is only
-    counted. Returns the new number of distinct candidates."""
-    for h in range(wp.min(held, scratch.capacity)):
-        if terrain_rows_coincide(scratch.q[base + h], scratch.n[base + h], q, n, eps):
-            return held
+    """Place a candidate (window frame) with its core point ``k`` after the ``held`` ones a scratch block holds from
+    ``base``, unmerged (the finish merges coincident candidates, :func:`terrain_finish_list`): past the block's
+    capacity it is only counted. Returns the new number of candidates."""
     if held < scratch.capacity:
         scratch.q[base + held] = q
         scratch.k[base + held] = k
@@ -2587,37 +2721,55 @@ def terrain_finish_deferred(
     lane: int,
     lanes: int,
 ):
-    """Finish a deferred pair's ``held`` distinct candidates in a block's scratch from ``base`` (window frame, their
-    core points in ``scratch.k``) with the block's ``lanes`` lanes (lane ``lane``; one thread passes ``0, 1``;
-    :func:`terrain_finish_list`) and write every row it keeps in the world frame: in the pair's ``walk_slots`` walk
-    slots from ``slot`` when they fit, else in rows of the spill region it reserves (:func:`terrain_spill_rows`), or,
-    when that has no room left, the first of them by priority in its walk slots (flagged
+    """Finish a deferred pair's ``held`` candidates, which the first lane placed in a block's scratch from ``base``
+    (window frame, their core points in ``scratch.k``; the other lanes' ``held`` is not read), with the block's
+    ``lanes`` lanes (lane ``lane``; one thread passes ``0, 1``; :func:`terrain_finish_list`), and write every row it
+    keeps in the world frame, each lane its own candidates' in candidate order: in the pair's ``walk_slots`` walk slots
+    from ``slot`` when they fit, else in rows of the spill region the first lane reserves (:func:`terrain_spill_rows`),
+    or, when that has no room left, the first of them by priority in its walk slots (flagged
     :data:`TERRAIN_PAIR_ROW_OVERFLOW`); its state ``state`` with the report's bits. The scratch holds every candidate a
     window of the class can give; a pair with more has a window its shape data no longer bounds (changed since
     construction): it keeps the first ``scratch.capacity`` in window order and is flagged. Every lane of the block must
     call it with the same pair."""
+    if lanes > 1:
+        # every lane takes the first lane's count, after its writes
+        held = _lanes_first(held)
     flags = int(0)
     count = held
     if held > scratch.capacity:
         flags = TERRAIN_FINISH_CANDIDATE_OVERFLOW
         count = scratch.capacity
     kept = terrain_finish_list(scratch, base, count, eps, lane, lanes)
-    if lane != 0:
-        return
-    if kept > walk_slots:
-        first = terrain_spill_rows(out, kept)
-        if first >= 0:
-            slot = first
-        else:
-            # no room left: the finish's first rows by priority, in the pair's own walk slots
-            kept = terrain_finish_overflow(scratch, base, count, walk_slots)
-            flags = flags | TERRAIN_FINISH_ROW_OVERFLOW
+    if lane == 0:
+        if kept > walk_slots:
+            first = terrain_spill_rows(out, kept)
+            if first >= 0:
+                slot = first
+            else:
+                # no room left: the finish's first rows by priority, in the pair's own walk slots
+                kept = terrain_finish_overflow(scratch, base, count, walk_slots)
+                flags = flags | TERRAIN_FINISH_ROW_OVERFLOW
+        out.first[pair] = slot
+        out.count[pair] = kept
+        out.state[pair] = state | terrain_finish_state(flags)
+        terrain_report(out.status, out.overflow, flags, True)
+    if lanes > 1:
+        # every lane takes the first lane's rows, after its marks
+        slot = _lanes_first(slot)
+    # a kept row's place: the kept candidates before it, the lanes' counted across the block
     written = int(0)
-    for i in range(count):
-        if scratch.mark[base + i] != 0:
+    for start in range(0, count, lanes):
+        i = start + lane
+        keep = int(0)
+        if i < count:
+            keep = scratch.mark[base + i]
+        before = int(0)
+        if lanes > 1:
+            before = wp.untile(wp.tile_scan_exclusive(wp.tile(keep)))
+        if keep != 0:
             terrain_store_row(
                 out,
-                slot + written,
+                slot + written + before,
                 scratch.q[base + i],
                 scratch.n[base + i],
                 scratch.d[base + i],
@@ -2625,11 +2777,10 @@ def terrain_finish_deferred(
                 window,
                 frame,
             )
-            written += 1
-    out.first[pair] = slot
-    out.count[pair] = kept
-    out.state[pair] = state | terrain_finish_state(flags)
-    terrain_report(out.status, out.overflow, flags, True)
+        if lanes > 1:
+            written += _lanes_sum(keep)
+        else:
+            written += keep
 
 
 @wp.func

@@ -70,13 +70,13 @@ them when the finish keeps them as they are: no plane group holds three of them 
 per-group steps act on larger groups) and they fit the eight slots. Any other pair is appended to a deferred list, and
 the class's finish, :func:`terrain_point_rows_finish`, launched after them with a fixed grid of lane blocks that
 strides over the list, walks each pair with the tiled kernel's code (one function, specialized at compile time): the
-lanes mark its window, and the first lane walks the marked items into its distinct candidates (its scratch holds every
-candidate a window of the class can give); the lanes then run the finish on all of them, its implied-row tests split
-among them, and every row it keeps is written: in the pair's walk slots when they fit, else in rows of the spill
-region. A pair whose window reaches the heightfield's border (:func:`_border_window`) is deferred at once: the finish
-alone walks it, its item code alone holding the border's features (:func:`_point_item_border`), so that the walks'
-kernels, which take every other pair, compile without them (the one-thread kernel's compile cost, the module's
-largest, doubles with them).
+lanes mark its window, and the first lane walks the marked items into its candidates (its scratch holds every
+candidate a window of the class can give); the lanes then run the finish on all of them, every step split among them,
+and write every row it keeps: in the pair's walk slots when they fit, else in rows of the spill region. A pair whose
+window reaches the heightfield's border (:func:`_border_window`) is deferred at once: the finish alone walks it, its
+item code alone holding the border's features (:func:`_point_item_border`), so that the walks' kernels, which take
+every other pair, compile without them (the one-thread kernel's compile cost, the module's largest, doubles with
+them).
 
 Inlined into the walks, the finish took every thread to 255 registers and a 10 KB stack on sm_120. Apart, the one-thread
 kernel takes 168 registers (its launch bounds: 12 blocks of 32 threads per SM) and a 40-byte stack (at 16 blocks its 128
@@ -143,11 +143,11 @@ from .terrain_law import (
     terrain_features_current,
     terrain_finish_deferred,
     terrain_height,
-    terrain_hold_candidate,
     terrain_hold_row,
     terrain_interior_vertex,
     terrain_locate,
     terrain_pair_exit,
+    terrain_place_candidate,
     terrain_plane,
     terrain_plane_group_of_three,
     terrain_planes,
@@ -1532,10 +1532,10 @@ def _tiled_window(inputs: TerrainPairInputs, data: TerrainFeatureData, pair: int
 
 
 @wp.func
-def _hold_candidate(scratch: TerrainFinishScratch, base: int, held: int, claim: _Claim, eps: float) -> int:
-    """Hold a claim's row among a scratch block's distinct candidates
-    (:func:`~newton._src.geometry.terrain_law.terrain_hold_candidate`)."""
-    return terrain_hold_candidate(scratch, base, held, claim.q, claim.k, claim.n, claim.d, claim.feature, eps)
+def _place_claim(scratch: TerrainFinishScratch, base: int, held: int, claim: _Claim) -> int:
+    """Place a claim's row after a scratch block's ``held`` candidates, unmerged (the finish merges,
+    :func:`~newton._src.geometry.terrain_law.terrain_place_candidate`)."""
+    return terrain_place_candidate(scratch, base, held, claim.q, claim.k, claim.n, claim.d, claim.feature)
 
 
 @wp.func
@@ -1547,21 +1547,20 @@ def _deferred_claim(
     exit_a: _Claim,
     exit_b: _Claim,
     axis_exit: bool,
-    eps: float,
 ) -> tuple[int, _Claim, _Claim, bool]:
-    """Take one item's claim of a deferred pair's walk: hold a row among the scratch block's candidates from ``base``,
-    or keep an end's exit (G2: the smallest translation, the first in window order on ties; with both ends outside, end
-    ``b``'s keeps the axis's deepest crossing under a crease, :data:`_WITNESS`). Returns the distinct candidates held,
-    the exits and whether an exit of the axis interior (an axis row inside the solid) was claimed."""
+    """Take one item's claim of a deferred pair's walk: place a row after the scratch block's candidates from
+    ``base``, or keep an end's exit (G2: the smallest translation, the first in window order on ties; with both ends
+    outside, end ``b``'s keeps the axis's deepest crossing under a crease, :data:`_WITNESS`). Returns the candidates
+    placed, the exits and whether an exit of the axis interior (an axis row inside the solid) was claimed."""
     if claim.kind == _EXIT_A and (exit_a.kind == 0 or claim.d > exit_a.d):
         exit_a = claim
     elif claim.kind == _EXIT_B and (exit_b.kind == 0 or claim.d > exit_b.d):
         exit_b = claim
     elif claim.kind == _ROW:
-        # an exit of the axis interior, merged into a held candidate or not
+        # an exit of the axis interior, which the finish may merge into another candidate or not
         if (claim.feature & 7) == _SLOT_AXIS and claim.d < 0.0:
             axis_exit = True
-        held = _hold_candidate(scratch, base, held, claim, eps)
+        held = _place_claim(scratch, base, held, claim)
     return held, exit_a, exit_b, axis_exit
 
 
@@ -1580,7 +1579,7 @@ def _deferred_close(
 ) -> tuple[TerrainPlanes, int]:
     """Add a deferred pair's ends' exits after its window's rows (G2, or G3 for an end inside the solid without one)
     and the axis interior's G3 (both ends outside, no axis exit, a crossing of the axis under a crease) to its
-    candidates in the scratch block from ``base``. Returns the plane cache and the distinct candidates held."""
+    candidates in the scratch block from ``base``. Returns the plane cache and the candidates placed."""
     for end in range(2):
         if (end == 0 and core.below_a != 0) or (end == 1 and core.segment != 0 and core.below_b != 0):
             claim = exit_a
@@ -1594,12 +1593,12 @@ def _deferred_close(
             else:
                 planes, claim = _exit_row(data, window, planes, k, end)
             if claim.kind != 0:
-                held = _hold_candidate(scratch, base, held, claim, core.eps)
+                held = _place_claim(scratch, base, held, claim)
     witness = exit_b
     if core.segment != 0 and core.below_a == 0 and core.below_b == 0 and witness.kind != 0 and not axis_exit:
         planes, claim = _axis_recovery(data, window, planes, witness.q, witness.feature)
         if claim.kind != 0:
-            held = _hold_candidate(scratch, base, held, claim, core.eps)
+            held = _place_claim(scratch, base, held, claim)
     return planes, held
 
 
@@ -1702,7 +1701,7 @@ def _tiled_pair_function(deferred: bool):
                             )
                             if wp.static(deferred):
                                 held, exit_a, exit_b, axis_exit = _deferred_claim(
-                                    scratch, base, held, claim, exit_a, exit_b, axis_exit, core.eps
+                                    scratch, base, held, claim, exit_a, exit_b, axis_exit
                                 )
                             else:
                                 held = _walk_claim(out, slot, held, claim, core.eps)
@@ -1714,9 +1713,6 @@ def _tiled_pair_function(deferred: bool):
             else:
                 _close_pair(out, pair, slot, _wide(cells), held, data, window, planes, core, frame)
         if wp.static(deferred):
-            if lanes > 1:
-                # every lane takes the first lane's count, after its writes
-                held = wp.tile_extract(wp.tile_max(wp.tile(held)), 0)
             terrain_finish_deferred(
                 scratch, base, held, core.eps, out, pair, slot, _ROWS, _wide(cells), window, frame, lane, lanes
             )
@@ -1777,11 +1773,12 @@ def terrain_point_rows_finish(
     (``wp.launch_tiled``), whatever the class's size: block ``b`` takes the deferred pairs ``b``, ``b + blocks``, ...
     (the order is free: a pair's rows depend on the pair alone), so that an empty list costs a near-empty launch. The
     walk is the tiled kernel's (:func:`terrain_point_rows_tiled`, the same code): the lanes mark the pair's window, and
-    the first lane walks the marked items into the pair's distinct candidates in the block's scratch (which holds every
+    the first lane walks the marked items into the pair's candidates in the block's scratch (which holds every
     candidate a window of the class can give) and adds its ends' exits and its axis's G3; the lanes then run the law's
-    finish on them (:func:`~newton._src.geometry.terrain_law.terrain_finish_list`: merge, implied rows split among the
-    lanes, four rows per plane group) and every row it keeps is written: in the pair's walk slots when they fit, else
-    in rows of the spill region (:func:`~newton._src.geometry.terrain_law.terrain_finish_deferred`).
+    finish on them (:func:`~newton._src.geometry.terrain_law.terrain_finish_list`: merge, plane groups, implied rows,
+    four rows per plane group, every step split among the lanes) and write every row it keeps: in the pair's walk
+    slots when they fit, else in rows of the spill region
+    (:func:`~newton._src.geometry.terrain_law.terrain_finish_deferred`).
 
     Launch: ``wp.launch_tiled`` with ``dim=scratch.blocks`` and ``block_dim``
     :func:`~newton._src.geometry.terrain_law.terrain_law_block_dim`. A block past ``scratch.blocks`` returns at
