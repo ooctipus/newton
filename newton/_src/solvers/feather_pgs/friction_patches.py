@@ -81,15 +81,6 @@ _BUILD_BLOCKS_PER_SM = 8
 # _merge_runs keeps the former build grid: a live sort launches it for every
 # merge round its capacity allows, mostly over few live slots.
 _MERGE_BLOCKS_PER_SM = 4
-# From this contact capacity on, the pair sort orders only the live slots
-# instead of the whole capacity. Provisional: calibrate against the full radix
-# sort on the GPU at large capacities and at high occupancy.
-_LIVE_SORT_CAPACITY = 2_000_000
-# Up to this contact capacity the pair sort orders only the live slots too: its
-# launches do no work without live contacts, where a radix sort still passes over
-# the whole capacity (52-55 us at 16,384 slots on the RTX PRO 6000). Provisional:
-# tune against the radix sort in a captured graph at partial occupancy.
-_CHUNK_SORT_CAPACITY = 16_384
 # The live sort orders chunks of _SORT_CHUNK slots in shared memory by
 # (key, slot) and then merges sorted runs pairwise.
 _SORT_CHUNK = wp.constant(2048)
@@ -1379,16 +1370,19 @@ def _pair_key_layout(bodies, shapes):
     return stride, (stride * stride - 1).bit_length()
 
 
-def _uses_live_sort(capacity, key_bits, *, small=True):
+def _uses_live_sort(key_bits):
     """Whether the pair sort orders only the live slots instead of the whole capacity.
 
-    It does from _LIVE_SORT_CAPACITY on, and with ``small`` up to
-    _CHUNK_SORT_CAPACITY, unless a chunk key, the pair key with an 11-bit slot
-    appended, would reach the pad bit. Both sorts leave the unique (key, slot)
-    order.
+    It does whenever a chunk key, the pair key with an 11-bit slot appended,
+    stays below the pad bit (pair keys up to 51 bits: about 47 million bodies
+    and shapes); wider keys take the radix sort of the whole capacity. Both sorts
+    leave the unique (key, slot) order. The live sort's cost follows the live
+    contacts, the radix sort's the capacity: on the 21-task suite (16,384
+    worlds, patch friction) the live sort was never slower and up to 4.4%
+    faster per step (franka, whose 1M-slot capacity had taken the radix sort
+    for about 1,900 live contacts).
     """
-    sized = (small and capacity <= _CHUNK_SORT_CAPACITY) or capacity >= _LIVE_SORT_CAPACITY
-    return sized and key_bits + _SORT_SLOT_BITS <= 62
+    return key_bits + _SORT_SLOT_BITS <= 62
 
 
 class _FrictionPatchState:
@@ -1409,9 +1403,6 @@ class _FrictionPatchState:
     below the live count. Rewrites of points, normals or margins alone are
     exact: pair keys follow the shapes, and a kept build prepares the rest anew.
 
-    ``small_live_sort`` lets capacities up to ``_CHUNK_SORT_CAPACITY`` sort only
-    their live slots, as capacities from ``_LIVE_SORT_CAPACITY`` on do.
-
     Contact frames are identified by ``Contacts.contact_generation``, which every
     collision pass and :meth:`newton.Contacts.clear` advance, together with the
     raw contact count and the contact stream, a token of the generation counter
@@ -1419,7 +1410,7 @@ class _FrictionPatchState:
     sort.
     """
 
-    def __init__(self, model, capacity, enabled, phi, *, reuse_frames=False, small_live_sort=True, pool=None):
+    def __init__(self, model, capacity, enabled, phi, *, reuse_frames=False, pool=None):
         self.view = FrictionPatches()
         self.view.enabled = int(enabled)
         self.view.phi = phi
@@ -1428,7 +1419,6 @@ class _FrictionPatchState:
             pool = ContactPool(capacity, device=device, rows=capacity)
         self.capacity = pool.ready
         self.reuse_frames = bool(reuse_frames and enabled)
-        self.small_live_sort = bool(small_live_sort)
         # (capture scope, weak generation array, frame-write tick) of the previous
         # captured build, which a build in the same scope may keep the pairs of.
         self._last_build = None
@@ -1504,7 +1494,7 @@ class _FrictionPatchState:
         self.build_threads = max(1, min(capacity, _BUILD_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
         self.build_block_dim = _BUILD_BLOCK_DIM
         self.merge_threads = max(1, min(capacity, _MERGE_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
-        self.live_sort = _uses_live_sort(capacity, self.key_bits, small=self.small_live_sort)
+        self.live_sort = _uses_live_sort(self.key_bits)
         self.sort_blocks = max(1, min(-(-capacity // _SORT_CHUNK), _SORT_BLOCKS_PER_SM * blocks))
         self.merges = 0
         while _SORT_CHUNK << self.merges < capacity:

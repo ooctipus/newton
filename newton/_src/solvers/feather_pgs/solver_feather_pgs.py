@@ -72,8 +72,6 @@ from .contact_unit_sweeps import (
 from .device_preludes import cuda_native
 from .friction import FRICTION_PAIR
 from .friction_patches import (
-    _CHUNK_SORT_CAPACITY,
-    _LIVE_SORT_CAPACITY,
     PatchRowLaw,
     _FrictionPatchState,
     patch_routes,
@@ -5929,9 +5927,6 @@ class SolverFeatherPGS(SolverBase):
             self._friction_anchors_enabled,
             self._friction_patch_phi,
             reuse_frames=frame_reuse,
-            # Small frames sort their live slots only, so empty ones cost no sort; the
-            # opt-out keeps the radix sort of every frame, the previous path.
-            small_live_sort=frame_reuse,
             pool=self._contact_pool,
         )
         self.slot_counter = wp.zeros((self.world_count,), dtype=wp.int32, device=device, requires_grad=requires_grad)
@@ -10209,16 +10204,12 @@ class SolverFeatherPGS(SolverBase):
         if not self._friction_anchors_enabled:
             return False, "Point friction sorts no patch pairs."
         if os.environ.get("FEATHER_PGS_PATCH_FRAME_REUSE", "1") == "0":
-            return False, (
-                "FEATHER_PGS_PATCH_FRAME_REUSE=0 sorts the patch pairs of every build, over the whole capacity "
-                f"below {_LIVE_SORT_CAPACITY:,} contact slots."
-            )
+            return False, "FEATHER_PGS_PATCH_FRAME_REUSE=0 sorts the patch pairs of every build."
         return True, (
             "A captured build keeps the sorted patch pairs of the previous build captured in the same graph over the "
             "same contact stream (its contact_generation array, which wrappers of one Contacts share) when the host "
             "noted no write of that stream in between (such as a collision pass, Contacts.clear() or a "
-            "coupled-solver filter); other builds sort, only their live slots up to "
-            f"{_CHUNK_SORT_CAPACITY:,} contact slots."
+            "coupled-solver filter); other builds sort."
         )
 
     def _build_friction_patches(self, state_in, contacts):

@@ -1220,30 +1220,18 @@ def run_live_sort_cases(test, device, capacities, extra_counts=()):
 class TestPatchLiveSort(unittest.TestCase):
     def test_live_sort_matches_stable_argsort_and_radix_sort(self):
         """Sort the live prefix exactly as a stable sort, from no contacts, which no slot sees, through merges."""
-        run_live_sort_cases(self, "cpu", (128, 2047, 3000, 4096, 10000, friction_patches._CHUNK_SORT_CAPACITY))
+        run_live_sort_cases(self, "cpu", (128, 2047, 3000, 4096, 10000, 16_384))
 
-    def test_capacity_thresholds_select_the_live_sort(self):
-        """Sort only the live prefix up to the small capacity threshold and from the large one on, while keys fit."""
+    def test_key_width_selects_the_live_sort(self):
+        """Sort only the live prefix at every capacity while the pair keys leave room for the slot bits."""
         scene = _Scene("cpu", 0)
         phi = wp.zeros(96, dtype=wp.vec2, device="cpu")
-        self.assertTrue(_FrictionPatchState(scene.model, 96, True, phi).live_sort, "small capacities sort live slots")
-        with mock.patch.object(friction_patches, "_CHUNK_SORT_CAPACITY", 64):
-            self.assertFalse(_FrictionPatchState(scene.model, 96, True, phi).live_sort)
-            self.assertTrue(_FrictionPatchState(scene.model, 64, True, phi[:64]).live_sort)
-            with mock.patch.object(friction_patches, "_LIVE_SORT_CAPACITY", 96):
-                self.assertTrue(_FrictionPatchState(scene.model, 96, True, phi).live_sort)
-                self.assertFalse(_FrictionPatchState(scene.model, 95, True, phi[:95]).live_sort)
-        self.assertFalse(_FrictionPatchState(scene.model, 96, True, phi, small_live_sort=False).live_sort)
-        self.assertEqual(friction_patches._CHUNK_SORT_CAPACITY, 16_384)
-        self.assertTrue(friction_patches._uses_live_sort(16_384, 51))
-        self.assertFalse(friction_patches._uses_live_sort(16_384, 51, small=False))
-        self.assertFalse(friction_patches._uses_live_sort(16_385, 51))
-        self.assertTrue(friction_patches._uses_live_sort(friction_patches._LIVE_SORT_CAPACITY, 51, small=False))
-        self.assertTrue(friction_patches._uses_live_sort(friction_patches._LIVE_SORT_CAPACITY, 51))
+        self.assertTrue(_FrictionPatchState(scene.model, 96, True, phi).live_sort)
+        self.assertTrue(_FrictionPatchState(scene.model, 64, True, phi[:64]).live_sort)
+        self.assertTrue(friction_patches._uses_live_sort(51))
         # Pair keys of 52 bits and more fall back to the radix sort: their 11-bit
         # slot would reach the chunk keys' pad bit.
-        self.assertFalse(friction_patches._uses_live_sort(96, 52))
-        self.assertFalse(friction_patches._uses_live_sort(friction_patches._LIVE_SORT_CAPACITY, 52))
+        self.assertFalse(friction_patches._uses_live_sort(52))
 
     def test_live_sort_builds_match_the_full_capacity_reference(self):
         """Build, link, seed, finish and store bitwise as the reference with the live sort."""
@@ -1260,7 +1248,7 @@ class TestPatchLiveSort(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "the device sort needs CUDA")
     def test_live_sort_matches_on_the_device(self):
         """Sort live prefixes on the device, from capacities below one chunk to hundreds of chunks and nine merges."""
-        capacities = (128, 3000, 10000, friction_patches._CHUNK_SORT_CAPACITY, 1_000_000)
+        capacities = (128, 3000, 10000, 16_384, 1_000_000)
         run_live_sort_cases(self, "cuda:0", capacities, (300_000,))
 
     @unittest.skipUnless(wp.is_cuda_available(), "multi-block grids need CUDA")
@@ -2673,66 +2661,45 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
                         self.assertIn("FEATHER_PGS_PATCH_FRAME_REUSE=0", friction["frame_reuse"]["reason"])
                     else:
                         self.assertIn("previous build captured in the same graph", friction["frame_reuse"]["reason"])
-                    # The arms' contact capacity is small: the live sort follows frame reuse.
+                    # The live sort does not depend on frame reuse.
                     pair_sort = friction["pair_sort"]
-                    self.assertEqual(pair_sort["live"], reused)
+                    self.assertTrue(pair_sort["live"])
                     self.assertEqual(pair_sort["live"], solver._friction_patches.live_sort)
                     self.assertEqual(pair_sort["capacity"], solver._friction_patches.capacity)
-                    self.assertLessEqual(pair_sort["capacity"], friction_patches._CHUNK_SORT_CAPACITY)
-                    self.assertEqual(pair_sort["live_up_to"], friction_patches._CHUNK_SORT_CAPACITY if reused else None)
-                    self.assertIn("Up to 16,384" if reused else "FEATHER_PGS_PATCH_FRAME_REUSE=0", pair_sort["reason"])
+                    self.assertEqual(pair_sort["key_bits"], solver._friction_patches.key_bits)
+                    self.assertIn("only the live slots", pair_sort["reason"])
 
-    def test_frame_reuse_opt_out_records_the_route_before_frame_reuse(self):
-        """Take and record under FEATHER_PGS_PATCH_FRAME_REUSE=0 the sort route from before frame reuse.
-
-        Both arms record the same routes apart from the frame_reuse and pair_sort
-        fields. The opt-out records the radix sort, and frame reuse the live sort,
-        on a solver of few contact slots.
-        """
+    def test_frame_reuse_opt_out_changes_only_frame_reuse(self):
+        """Record under FEATHER_PGS_PATCH_FRAME_REUSE=0 the same routes, the live pair sort included, but frame reuse."""
         self.assertEqual(fpgs_flags.FLAGS["FEATHER_PGS_PATCH_FRAME_REUSE"].kind, "policy")
         routes = {}
         for reuse in (None, "0"):
             with _flags(reuse=reuse):
                 solver = SolverFeatherPGS(_arm_over_box(wp.get_device("cpu"), worlds=2))
             routes[reuse] = solver.get_path_selection()
-            # Small frames sort their live slots only with frame reuse; the opt-out keeps the radix sort.
-            self.assertLessEqual(solver._friction_patches.capacity, friction_patches._CHUNK_SORT_CAPACITY)
-            self.assertEqual(solver._friction_patches.live_sort, reuse is None)
-            self.assertEqual(routes[reuse]["routes"]["friction"]["pair_sort"]["live"], reuse is None)
-        self.assertIn("FEATHER_PGS_PATCH_FRAME_REUSE=0", routes["0"]["routes"]["friction"]["pair_sort"]["reason"])
+            self.assertTrue(solver._friction_patches.live_sort)
+        self.assertIn("FEATHER_PGS_PATCH_FRAME_REUSE=0", routes["0"]["routes"]["friction"]["frame_reuse"]["reason"])
         for selected in routes.values():
             del selected["routes"]["friction"]["frame_reuse"]
-            del selected["routes"]["friction"]["pair_sort"]
             selected.pop("environment", None)
         self.assertEqual(routes[None], routes["0"])
 
     def test_route_records_the_pair_sort(self):
-        """Record the live sort or the radix sort with the reason that capacity, key width and frame reuse give."""
-        large, small = friction_patches._LIVE_SORT_CAPACITY, friction_patches._CHUNK_SORT_CAPACITY
+        """Record the live sort, or the radix sort with the reason when the pair keys are too wide."""
         cases = (
-            # (live_sort, capacity, key_bits, small_live_sort, reason)
-            (True, small, 51, True, "Up to 16,384"),
-            (True, large, 51, True, "From 2,000,000"),
-            (True, large, 51, False, "From 2,000,000"),
-            (False, small, 51, False, "FEATHER_PGS_PATCH_FRAME_REUSE=0"),
-            (False, small + 1, 51, True, "Between 16,384 and 2,000,000"),
-            (False, small, 52, True, "52-bit pair keys"),
+            # (live_sort, capacity, key_bits, reason)
+            (True, 16_384, 51, "only the live slots"),
+            (True, 2_000_000, 51, "only the live slots"),
+            (False, 16_384, 52, "52-bit pair keys"),
         )
-        for live, capacity, key_bits, small_live_sort, reason in cases:
-            with self.subTest(capacity=capacity, key_bits=key_bits, small_live_sort=small_live_sort):
-                patches = SimpleNamespace(
-                    live_sort=live, capacity=capacity, key_bits=key_bits, small_live_sort=small_live_sort
-                )
-                self.assertEqual(friction_patches._uses_live_sort(capacity, key_bits, small=small_live_sort), live)
+        for live, capacity, key_bits, reason in cases:
+            with self.subTest(capacity=capacity, key_bits=key_bits):
+                patches = SimpleNamespace(live_sort=live, capacity=capacity, key_bits=key_bits)
+                self.assertEqual(friction_patches._uses_live_sort(key_bits), live)
                 record = path_selection._pair_sort(patches)
                 self.assertEqual(
-                    {name: record[name] for name in ("live", "capacity", "live_up_to", "live_from")},
-                    {
-                        "live": live,
-                        "capacity": capacity,
-                        "live_up_to": small if small_live_sort else None,
-                        "live_from": large,
-                    },
+                    {name: record[name] for name in ("live", "capacity", "key_bits")},
+                    {"live": live, "capacity": capacity, "key_bits": key_bits},
                 )
                 self.assertIn(reason, record["reason"])
 
