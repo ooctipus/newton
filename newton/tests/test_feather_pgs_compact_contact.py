@@ -494,7 +494,6 @@ def build_solver_fixture(device):
     builder.add_world(template)
     builder.add_world(template)
     model = builder.finalize(device=device)
-    model.rigid_contact_max = 8
     model.joint_q.assign(np.linspace(-0.06, 0.06, model.joint_coord_count, dtype=np.float32))
     model.joint_qd.assign(np.linspace(-0.1, 0.1, model.joint_dof_count, dtype=np.float32))
     return model
@@ -877,7 +876,7 @@ class TestCompactContact(unittest.TestCase):
         self.assertEqual(model.shape_count, 8)
         state = model.state()
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-        contacts = newton.Contacts(model.rigid_contact_max, 0, device=model.device)
+        contacts = newton.Contacts(8, 0, device=model.device)
         install_contacts(model, state, contacts)
         self.assertEqual(contacts.rigid_contact_count.numpy()[0], 6)
         with mock.patch.object(solver_module, "_COMPACT_CONTACT_BOUNDARY", True):
@@ -922,7 +921,7 @@ class TestCompactContact(unittest.TestCase):
             records = check_compact_records(self, solvers, "point")
             states = [[model.state(), model.state()] for _ in solvers]
             controls = [model.control() for _ in solvers]
-            contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]
+            contacts = [newton.Contacts(8, 0, device=device) for _ in solvers]
             for index in range(len(solvers)):
                 state = states[index][0]
                 newton.eval_fk(model, state.joint_q, state.joint_qd, state)
@@ -982,7 +981,6 @@ class TestCompactContact(unittest.TestCase):
             self.skipTest("Actual sparse constructor requires CUDA")
         for device in devices:
             model = build_solver_fixture(device)
-            model.rigid_contact_max = 24
             solvers = []
             for enabled in (False, True):
                 with (
@@ -1007,7 +1005,7 @@ class TestCompactContact(unittest.TestCase):
             records = check_compact_records(self, solvers, "patch")
             states = [[model.state(), model.state()] for _ in solvers]
             controls = [model.control() for _ in solvers]
-            contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]
+            contacts = [newton.Contacts(24, 0, device=device) for _ in solvers]
             for index in range(len(solvers)):
                 state = states[index][0]
                 newton.eval_fk(model, state.joint_q, state.joint_qd, state)

@@ -513,11 +513,19 @@ class ConveyorForceModel:
 
         self.body_contact_count = wp.zeros(self.model.body_count, dtype=wp.int32, device=d)
         self.conveyor_body_f = wp.zeros(self.model.body_count, dtype=wp.spatial_vector, device=d)
-        # Sized by the bound: the contacts' rows may grow (CollisionPipeline.service_capacity).
-        self.belt_contacts = wp.empty(contacts.rigid_contact_bound, dtype=BeltContact, device=d)
-        self.contact_force_vec = wp.zeros(contacts.rigid_contact_bound, dtype=wp.vec3, device=d)
+        self._size_contact_buffers(contacts)
         self.body_q_prev = wp.zeros(self.model.body_count, dtype=wp.transform, device=d)
         self._finalized = True
+
+    def _size_contact_buffers(self, contacts) -> None:
+        """Hold one entry per contact row; the contacts' rows grow with the demand."""
+        if (
+            getattr(self, "contact_force_vec", None) is not None
+            and self.contact_force_vec.shape[0] >= contacts.rigid_contact_max
+        ):
+            return
+        self.belt_contacts = wp.empty(contacts.rigid_contact_max, dtype=BeltContact, device=self.device)
+        self.contact_force_vec = wp.zeros(contacts.rigid_contact_max, dtype=wp.vec3, device=self.device)
 
     def set_speed_scale(self, scale: float) -> None:
         """Set a global multiplier on all belt target velocities (e.g. a start-up ramp)."""
@@ -545,6 +553,7 @@ class ConveyorForceModel:
 
     def _report_contact_forces(self, solver, contacts, state_post, dt: float) -> None:
         """Copy solver-specific contact forces into a common linear-force buffer."""
+        self._size_contact_buffers(contacts)
         if self.solver_type == "vbd":
             solver.collect_rigid_contact_forces(state_post.body_q, self.body_q_prev, contacts, dt)
             wp.copy(self.contact_force_vec, contacts.rigid_contact_force)

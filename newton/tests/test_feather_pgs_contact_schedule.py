@@ -418,7 +418,7 @@ def _record_schedules(model, device, *, anchors, compact, steps=6):
 
     states = [model.state(), model.state()]
     control = model.control()
-    contacts = newton.Contacts(model.rigid_contact_max, 0, device=device)
+    contacts = newton.Contacts(24, 0, device=device)
     newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
     install_patch_contacts(model, states[0], contacts)
     with mock.patch.object(wp, "launch", recording_launch):
@@ -636,7 +636,6 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
         """
         device = wp.get_device("cuda:0")
         model = build_solver_fixture(device)
-        model.rigid_contact_max = 24
         for compact in (False, True):
             with self.subTest(compact=compact):
                 solver, records = _record_schedules(model, device, anchors=True, compact=compact)
@@ -658,7 +657,6 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
         """Schedule the point triples the solver produces, through both producers, as the serial walks do."""
         device = wp.get_device("cuda:0")
         model = build_solver_fixture(device)
-        model.rigid_contact_max = 24
         for compact in (False, True):
             with self.subTest(compact=compact):
                 solver, records = _record_schedules(model, device, anchors=False, compact=compact)

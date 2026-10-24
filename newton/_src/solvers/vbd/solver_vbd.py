@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
+from ...core.contact_pool import ContactField, ContactPool
 from ...core.types import override
 from ...geometry import ParticleFlags
 from ...sim import (
@@ -175,24 +176,17 @@ class SolverVBD(SolverBase, CouplingInterface):
         See :ref:`Joint feature support` for the full comparison across solvers.
 
     Buffer sizing:
-        Body-body contact state is pre-allocated from ``model.rigid_contact_max`` when a
-        :class:`~newton.CollisionPipeline` has already published it and this solver owns the
-        rigid system. Body-particle contact state is pre-sized from a world-aware
-        particle-shape pair count, which excludes the
-        ``enable_rigid_soft_full_surface_contact`` edge/face headroom. Both grow from
-        ``Contacts`` on the first :meth:`step`, and the rigid contact force outputs grow in
-        :meth:`collect_rigid_contact_forces`; rigid buffers grow to the contacts'
-        :attr:`~newton.Contacts.rigid_contact_bound`, so later growth of the contact
-        rows (:meth:`~newton.CollisionPipeline.service_capacity`) needs no resize. During graph capture,
-        ordinary lazy resizing is supported on CPU and on CUDA with Warp's
-        stream-ordered memory pool enabled; otherwise the solver raises with
-        guidance to pre-size before capture. Rigid contact history is
-        cross-replay-persistent state, so it must always be allocated before
-        capture regardless of the device's allocation-during-capture support --
-        allocating it inside a graph records a `wp.zeros` fill that wipes the
-        warm-start buffers on every replay. With ``rigid_contact_history=True``,
-        construct :class:`~newton.CollisionPipeline` before ``SolverVBD``, or run
-        one uncaptured solver step before capture.
+        When this solver owns the rigid system, its body-body contact state, rigid contact
+        history and rigid contact force outputs are per-contact rows that start from the data
+        (64 per world, at least 4096) and grow with the :class:`~newton.Contacts` each :meth:`step` receives,
+        keeping their contents; growth cannot happen during graph capture, so run one
+        uncaptured step first and recapture after the contact buffers grow
+        (:meth:`~newton.CollisionPipeline.service_capacity`). Body-particle contact state is
+        pre-sized from a world-aware particle-shape pair count, which excludes the
+        ``enable_rigid_soft_full_surface_contact`` edge/face headroom, and grows from
+        ``Contacts`` on the first :meth:`step`; during graph capture that resizing is
+        supported on CPU and on CUDA with Warp's stream-ordered memory pool enabled,
+        otherwise the solver raises with guidance to pre-size before capture.
 
     References:
         - Anka He Chen, Ziheng Liu, Yin Yang, and Cem Yuksel. 2024. Vertex Block Descent. ACM Trans. Graph. 43, 4, Article 116 (July 2024), 16 pages.
@@ -914,20 +908,31 @@ class SolverVBD(SolverBase, CouplingInterface):
             self._init_structural_k()
             self.joint_rest_angle = self._init_joint_rest_angle()
 
-            # Body-body contact state (pre-allocated in __init__ when possible, resized on first step otherwise).
-            self.body_body_contact_penalty_k = wp.zeros(0, dtype=float, device=self.device)
-            self.body_body_contact_normal_rho = wp.zeros(0, dtype=float, device=self.device)
-            self.body_body_contact_material_ke = wp.zeros(0, dtype=float, device=self.device)
-            self.body_body_contact_material_kd = wp.zeros(0, dtype=float, device=self.device)
-            self.body_body_contact_material_mu = wp.zeros(0, dtype=float, device=self.device)
-            self.body_body_contact_tangent_rho = wp.zeros(0, dtype=float, device=self.device)
-            self.body_body_contact_lambda = wp.zeros(0, dtype=wp.vec3, device=self.device)
-            self.body_body_contact_C0 = wp.zeros(0, dtype=wp.vec3, device=self.device)
-
-            # Rigid contact warm-start buffers.
-            self._prev_contact_lambda = None
-            self._prev_contact_penalty_k = None
-            self._prev_contact_normal = None
+            # Body-body contact state, warm-start history and contact-query outputs: per-contact rows
+            # that start from the data and grow with the contacts the solver consumes
+            # (see _follow_contacts).
+            self._contact_pool = ContactPool(device=self.device, world_count=model.world_count)
+            self._contact_state_rows = self._contact_pool.rows(
+                [
+                    ContactField(f"body_body_contact_{name}", wp.float32)
+                    for name in ("penalty_k", "normal_rho", "material_ke", "material_kd", "material_mu", "tangent_rho")
+                ]
+                + [ContactField("body_body_contact_lambda", wp.vec3), ContactField("body_body_contact_C0", wp.vec3)],
+                on_rows=self._publish_contact_rows,
+            )
+            if self.rigid_contact_history:
+                self._contact_history_rows = self._contact_pool.rows(
+                    (
+                        ContactField("_prev_contact_lambda", wp.vec3),
+                        ContactField("_prev_contact_penalty_k", wp.float32),
+                        ContactField("_prev_contact_normal", wp.vec3),
+                    ),
+                    on_rows=self._publish_contact_rows,
+                )
+            else:
+                self._prev_contact_lambda = None
+                self._prev_contact_penalty_k = None
+                self._prev_contact_normal = None
 
             # Joint augmented-Lagrangian state (vec3, per-joint, bilateral)
             self.joint_lambda_lin = wp.zeros(model.joint_count, dtype=wp.vec3, device=self.device)
@@ -997,19 +1002,24 @@ class SolverVBD(SolverBase, CouplingInterface):
         # with kinematic bodies zeroed out.
         self._init_kinematic_state()
 
-        # Pre-allocate body-body contact buffers when the contact capacity is
-        # already known; otherwise lazy allocation handles the first step.
-        rcm = getattr(model, "rigid_contact_max", 0) or 0
-        if rcm > 0 and self._integrates_rigid_bodies:
-            self._init_body_body_contact_state(rcm)
-            if self.rigid_contact_history:
-                self._init_rigid_contact_warmstart(rcm)
-
-        # Persistent contact-query outputs; per-contact arrays grow on demand.
-        self._rigid_contact_body0 = wp.full(0, -1, dtype=wp.int32, device=self.device)
-        self._rigid_contact_body1 = wp.full(0, -1, dtype=wp.int32, device=self.device)
-        self._rigid_contact_point0_world = wp.zeros(0, dtype=wp.vec3, device=self.device)
-        self._rigid_contact_point1_world = wp.zeros(0, dtype=wp.vec3, device=self.device)
+        # Persistent contact-query outputs: per-contact rows of the contact pool when this solver
+        # owns the rigid system, otherwise empty.
+        if self._integrates_rigid_bodies:
+            self._contact_output_rows = self._contact_pool.rows(
+                (
+                    ContactField("_rigid_contact_body0", wp.int32, -1),
+                    ContactField("_rigid_contact_body1", wp.int32, -1),
+                    ContactField("_rigid_contact_point0_world", wp.vec3),
+                    ContactField("_rigid_contact_point1_world", wp.vec3),
+                ),
+                on_rows=self._publish_contact_rows,
+            )
+        else:
+            self._contact_pool = None
+            self._rigid_contact_body0 = wp.full(0, -1, dtype=wp.int32, device=self.device)
+            self._rigid_contact_body1 = wp.full(0, -1, dtype=wp.int32, device=self.device)
+            self._rigid_contact_point0_world = wp.zeros(0, dtype=wp.vec3, device=self.device)
+            self._rigid_contact_point1_world = wp.zeros(0, dtype=wp.vec3, device=self.device)
         self._rigid_contact_zero_count = wp.zeros(1, dtype=wp.int32, device=self.device)
         self._rigid_contact_zero_force = wp.zeros(0, dtype=wp.vec3, device=self.device)
 
@@ -1320,16 +1330,29 @@ class SolverVBD(SolverBase, CouplingInterface):
     # Initialization Helper Methods
     # =====================================================
 
-    def _init_body_body_contact_state(self, rigid_contact_max: int) -> None:
-        """Allocate body-body contact state arrays sized to the given contact buffer capacity."""
-        self.body_body_contact_penalty_k = wp.zeros(rigid_contact_max, dtype=float, device=self.device)
-        self.body_body_contact_normal_rho = wp.zeros(rigid_contact_max, dtype=float, device=self.device)
-        self.body_body_contact_material_ke = wp.zeros(rigid_contact_max, dtype=float, device=self.device)
-        self.body_body_contact_material_kd = wp.zeros(rigid_contact_max, dtype=float, device=self.device)
-        self.body_body_contact_material_mu = wp.zeros(rigid_contact_max, dtype=float, device=self.device)
-        self.body_body_contact_tangent_rho = wp.zeros(rigid_contact_max, dtype=float, device=self.device)
-        self.body_body_contact_lambda = wp.zeros(rigid_contact_max, dtype=wp.vec3, device=self.device)
-        self.body_body_contact_C0 = wp.zeros(rigid_contact_max, dtype=wp.vec3, device=self.device)
+    def _publish_contact_rows(self, rows) -> None:
+        rows.publish(self)
+
+    def _follow_contacts(self, contacts: Contacts | None) -> bool:
+        """Hold at least ``contacts``' rigid rows, and grow with its buffer from now on.
+
+        Returns:
+            Whether the per-contact state grew, so contact lists must be rebuilt.
+        """
+        pool = self._contact_pool
+        if pool is None or contacts is None:
+            return False
+        held = pool.ready
+        try:
+            contacts._rigid_contact_pool.follow(pool)
+            pool.grow(contacts.rigid_contact_max)
+        except RuntimeError as error:
+            raise RuntimeError(
+                f"SolverVBD per-contact state holds {held} rows but received {contacts.rigid_contact_max} during "
+                "CUDA graph capture: run one uncaptured solver step first, and recapture after the contact buffers "
+                "grow (CollisionPipeline.service_capacity())."
+            ) from error
+        return pool.ready > held
 
     def _validate_compliant_contact_materials(self) -> None:
         """Validate physical contact coefficients consumed by compliant ALM."""
@@ -1358,22 +1381,13 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.body_particle_contact_material_kd = wp.zeros(soft_contact_max, dtype=float, device=self.device)
         self.body_particle_contact_material_mu = wp.zeros(soft_contact_max, dtype=float, device=self.device)
 
-    def _init_rigid_contact_warmstart(self, rigid_contact_max: int) -> None:
-        """Allocate fresh contact-history buffers."""
-        cap = rigid_contact_max
-        self._prev_contact_lambda = wp.zeros(cap, dtype=wp.vec3, device=self.device)
-        self._prev_contact_penalty_k = wp.zeros(cap, dtype=float, device=self.device)
-        self._prev_contact_normal = wp.zeros(cap, dtype=wp.vec3, device=self.device)
-
     def _raise_if_capturing_resize(self, name: str, current: int, required: int) -> None:
         if self.device.is_capturing and not is_graph_capture_allocation_enabled(self.device):
             raise RuntimeError(
                 f"SolverVBD {name} buffer needs to grow from {current} to {required} "
                 "during graph capture, but allocation during capture is not enabled on this device. "
-                "Run one uncaptured step (or force-collection pass) before capture so the contact "
-                "buffers are sized for the scene, or enable Warp's stream-ordered memory pool on this device. "
-                "Rigid buffers can also be pre-sized by constructing CollisionPipeline before SolverVBD, "
-                "which publishes model.rigid_contact_max; there is no equivalent for body-particle contacts."
+                "Run one uncaptured step before capture so the contact buffers are sized for the scene, "
+                "or enable Warp's stream-ordered memory pool on this device."
             )
 
     def _refresh_rod_rest_bend_twist_cache(self) -> None:
@@ -2283,9 +2297,6 @@ class SolverVBD(SolverBase, CouplingInterface):
         if contact_launch_dim == 0:
             return
 
-        if self._prev_contact_lambda is None or self._prev_contact_lambda.shape[0] < contact_launch_dim:
-            self._init_rigid_contact_warmstart(contacts.rigid_contact_bound)
-
         # Snapshot solved contact rows for the next step's warm-start.
         wp.launch(
             kernel=snapshot_body_body_contact_history,
@@ -2427,26 +2438,11 @@ class SolverVBD(SolverBase, CouplingInterface):
         first-time allocation or resizing.
         """
         model = self.model
-        rigid_capacity = contacts.rigid_contact_max if contacts is not None else 0
         soft_capacity = contacts.soft_contact_max if contacts is not None else 0
-        body_undersized = self._integrates_rigid_bodies and self.body_body_contact_penalty_k.shape[0] < rigid_capacity
         particle_undersized = model.particle_count > 0 and self.body_particle_contact_penalty_k.shape[0] < soft_capacity
 
-        # Rigid contact history is cross-replay-persistent state: allocating it
-        # during capture records a `wp.zeros` fill into the graph, which then
-        # re-zeros the warm-start buffers on every replay -- silently
-        # equivalent to `rigid_contact_history=False`. So this guard fires
-        # unconditionally when capturing, regardless of the device's
-        # allocation-during-capture support.
-        if self.device.is_capturing and self._integrates_rigid_bodies and self.rigid_contact_history:
-            history_capacity = 0 if self._prev_contact_lambda is None else self._prev_contact_lambda.shape[0]
-            if history_capacity < rigid_capacity:
-                raise RuntimeError(
-                    "SolverVBD contact history must be allocated before graph capture. "
-                    "Construct CollisionPipeline before SolverVBD, or run one uncaptured solver step before capture."
-                )
-
-        refresh = refresh or body_undersized
+        # Per-contact state grows with the contacts outside capture; new rows need fresh contact lists.
+        refresh = self._follow_contacts(contacts) or refresh
 
         # ---------------------------
         # Rigid-only initialization
@@ -2459,15 +2455,6 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.body_body_contact_counts.zero_()
                 else:
                     contact_launch_dim = contacts.rigid_contact_max
-
-                    if self.body_body_contact_penalty_k.shape[0] < contact_launch_dim:
-                        self._raise_if_capturing_resize(
-                            "body-body contact state",
-                            self.body_body_contact_penalty_k.shape[0],
-                            contact_launch_dim,
-                        )
-                        # Sized by the bound, so a growth of the contact rows needs no resize in a capture.
-                        self._init_body_body_contact_state(contacts.rigid_contact_bound)
 
                     # Build body-body contact lists
                     self.body_body_contact_counts.zero_()
@@ -2510,12 +2497,6 @@ class SolverVBD(SolverBase, CouplingInterface):
                                 'CollisionPipeline(contact_matching="sticky"), or set rigid_contact_history=False. '
                                 f"Got contact_matching_mode={contacts.contact_matching_mode!r}."
                             )
-
-                        history_required = contact_launch_dim
-                        if self._prev_contact_lambda is None or self._prev_contact_lambda.shape[0] < history_required:
-                            history_cap = 0 if self._prev_contact_lambda is None else self._prev_contact_lambda.shape[0]
-                            self._raise_if_capturing_resize("rigid contact history", history_cap, history_required)
-                            self._init_rigid_contact_warmstart(history_required)
 
                         history = RigidContactHistory()
                         history.lambda_ = self._prev_contact_lambda
@@ -3448,16 +3429,6 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         # Type narrowing: remaining path requires a valid Contacts instance.
         assert contacts is not None
-
-        output_capacity = self._rigid_contact_body0.shape[0]
-        if output_capacity < max_contacts:
-            self._raise_if_capturing_resize("rigid contact output", output_capacity, max_contacts)
-            # Sized by the bound, so a growth of the contact rows needs no resize in a capture.
-            bound = contacts.rigid_contact_bound
-            self._rigid_contact_body0 = wp.full(bound, -1, dtype=wp.int32, device=self.device)
-            self._rigid_contact_body1 = wp.full(bound, -1, dtype=wp.int32, device=self.device)
-            self._rigid_contact_point0_world = wp.zeros(bound, dtype=wp.vec3, device=self.device)
-            self._rigid_contact_point1_world = wp.zeros(bound, dtype=wp.vec3, device=self.device)
 
         wp.launch(
             kernel=compute_rigid_contact_forces,

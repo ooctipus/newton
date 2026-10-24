@@ -64,7 +64,7 @@ def primitive_model(device, kind, *, slope=False, border=False, deep=False, barr
 def primitive_pipeline(model, enabled):
     """Keep the stock generic query and reducer while toggling triangle rejection."""
     with patch.dict(os.environ, {**FLAGS, "NEWTON_HEIGHTFIELD_GEOMETRIC_CULL": str(int(enabled))}):
-        return newton.CollisionPipeline(model, reduce_contacts=True, rigid_contact_max=4096, max_triangle_pairs=4096)
+        return newton.CollisionPipeline(model, reduce_contacts=True, max_triangle_pairs=4096)
 
 
 @wp.kernel

@@ -181,7 +181,6 @@ def _collide(
         pipeline = newton.CollisionPipeline(
             model,
             reduce_contacts=reduce_contacts,
-            rigid_contact_max=2048,
             max_triangle_pairs=4096,
             speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(max_speculative_extension=0.5)
             if speculative
@@ -221,8 +220,8 @@ def _collide(
     count = int(contacts.rigid_contact_count.numpy()[0])
     assert count <= contacts.rigid_contact_max
     assert int(pipeline.narrow_phase.triangle_pairs_count.numpy()[0]) <= pipeline.narrow_phase.max_triangle_pairs
-    distance = wp.empty(2048, dtype=float, device=model.device)
-    point = wp.empty(2048, dtype=wp.vec3, device=model.device)
+    distance = wp.empty(contacts.rigid_contact_max, dtype=float, device=model.device)
+    point = wp.empty(contacts.rigid_contact_max, dtype=wp.vec3, device=model.device)
     newton.eval_rigid_contact_kinematics(model, state, contacts, out_distance=distance, out_point0_world=point)
     geometry = (distance.numpy()[:count], contacts.rigid_contact_normal.numpy()[:count], point.numpy()[:count])
     return pipeline, geometry
@@ -289,7 +288,6 @@ def collide(model, enabled, *, reduce_contacts=False, speculative=False):
         pipeline = newton.CollisionPipeline(
             model,
             reduce_contacts=reduce_contacts,
-            rigid_contact_max=2048,
             max_triangle_pairs=4096,
             speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(max_speculative_extension=0.5)
             if speculative
@@ -304,8 +302,8 @@ def collide(model, enabled, *, reduce_contacts=False, speculative=False):
     pipeline.collide(state, contacts, dt=0.01 if speculative else None)
     pipeline.narrow_phase.check_buffer_capacity()
     count = int(contacts.rigid_contact_count.numpy()[0])
-    distance = wp.empty(2048, dtype=float, device=model.device)
-    point = wp.empty(2048, dtype=wp.vec3, device=model.device)
+    distance = wp.empty(contacts.rigid_contact_max, dtype=float, device=model.device)
+    point = wp.empty(contacts.rigid_contact_max, dtype=wp.vec3, device=model.device)
     newton.eval_rigid_contact_kinematics(model, state, contacts, out_distance=distance, out_point0_world=point)
     return (
         pipeline,
@@ -550,9 +548,7 @@ class TestHeightfieldCellReject(unittest.TestCase):
         """Refresh live heights in one pipeline through captured withdrawal and regrowth."""
         model = _model(device=self.device, z=0.2)
         with patch.dict(os.environ, TERRAIN_ROUTE):
-            pipeline = newton.CollisionPipeline(
-                model, reduce_contacts=False, rigid_contact_max=2048, max_triangle_pairs=4096
-            )
+            pipeline = newton.CollisionPipeline(model, reduce_contacts=False, max_triangle_pairs=4096)
         contacts = pipeline.contacts()
         state = model.state()
         pipeline.collide(state, contacts)
@@ -660,7 +656,7 @@ class TestHeightfieldCellRejectResearch(unittest.TestCase):
         body = builder.add_body(xform=wp.transform((0.0, 0.0, 0.02), wp.quat_identity()))
         builder.add_shape_sphere(body=body, radius=0.05)
         model = builder.finalize(device=self.device)
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=8)
+        pipeline = newton.CollisionPipeline(model)
         self.assertFalse(pipeline.narrow_phase._heightfield_cell_reject)
         original_write = pipeline.narrow_phase.launch_custom_write
 

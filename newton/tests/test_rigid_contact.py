@@ -8,6 +8,7 @@ import warp as wp
 
 import newton
 from newton._src.core import quat_between_axes
+from newton._src.solvers.kamino.config import CollisionDetectorConfig
 from newton.tests.unittest_utils import (
     add_function_test,
     assert_np_equal,
@@ -146,7 +147,6 @@ def test_shapes_on_plane(test, device, solver_fn):
     builder.add_ground_plane()
 
     model = builder.finalize(device=device)
-    model.rigid_contact_max = 150
 
     # Create solver with stability parameters for Featherstone and SemiImplicit
     # For other solvers, use the default solver_fn
@@ -850,7 +850,10 @@ solvers = {
     "mujoco_warp": lambda model: newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=False, njmax=150),
     "xpbd": lambda model: newton.solvers.SolverXPBD(model, iterations=2),
     "semi_implicit": newton.solvers.SolverSemiImplicit,
-    "kamino": newton.solvers.SolverKamino,
+    "kamino": lambda model: newton.solvers.SolverKamino(
+        model,
+        config=newton.solvers.SolverKamino.Config(collision_detector=CollisionDetectorConfig(max_contacts=150)),
+    ),
 }
 
 

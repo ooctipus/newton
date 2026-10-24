@@ -23,8 +23,9 @@ def _fixture(*, device=None, native=False, public_capacity=4, mj_capacity=1):
     solver = SolverMuJoCo(model, use_mujoco_contacts=native, nconmax=mj_capacity, njmax=32, iterations=8)
     state = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=public_capacity)
-    contacts = pipeline.contacts()
+    pipeline = newton.CollisionPipeline(model)
+    # A buffer of public_capacity rows that holds the three contacts, so the pass does not grow it.
+    contacts = newton.Contacts(public_capacity, 0, device=model.device)
     pipeline.collide(state, contacts)
     return model, solver, state, pipeline, contacts
 

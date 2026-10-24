@@ -128,7 +128,7 @@ def _patch_case(model, incremental_rows, *, iterations=8):
     # Sorted contacts: both arms see the same contact order, which the by-contact patch checks key on.
     # The pipeline sets model.rigid_contact_max, which sizes the solver's contact and patch buffers, so it is
     # built first: both arms then hold the same capacity on the shared model.
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32, deterministic=True)
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
     solver = SolverFeatherPGS(
         model,
         pgs_mode="matrix_free",

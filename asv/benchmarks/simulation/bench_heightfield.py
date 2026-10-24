@@ -42,7 +42,6 @@ def _build_heightfield_scene(num_bodies=200, nrow=100, ncol=100):
             count += 1
 
     model = builder.finalize()
-    model.rigid_contact_max = num_bodies * 20
     return model
 
 

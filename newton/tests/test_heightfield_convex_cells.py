@@ -28,7 +28,6 @@ def pipeline(model, enabled, *, automatic=False):
         return newton.CollisionPipeline(
             model,
             reduce_contacts=True,
-            rigid_contact_max=4096,
             max_triangle_pairs=4096,
             convex_collision="auto" if automatic else "convex_cells" if enabled else "ordinary",
         )
@@ -61,9 +60,7 @@ def _contacts_by_shape(model, labels, convex_collision, environment):
         for name in [name for name in os.environ if name.startswith("NEWTON_")]:
             del os.environ[name]
         os.environ.update({"NEWTON_TERRAIN_LAW": "none", **environment})
-        collider = newton.CollisionPipeline(
-            model, rigid_contact_max=4096, max_triangle_pairs=16384, convex_collision=convex_collision
-        )
+        collider = newton.CollisionPipeline(model, max_triangle_pairs=16384, convex_collision=convex_collision)
     contacts = collider.contacts()
     collider.collide(model.state(), contacts)
     count = int(contacts.rigid_contact_count.numpy()[0])
@@ -186,7 +183,6 @@ class TestHeightfieldConvexCells(unittest.TestCase):
                 scene.model,
                 convex_collision="auto",
                 reduce_contacts=True,
-                rigid_contact_max=4096,
                 max_triangle_pairs=4096,
             )
         reference = pipeline(scene.model, False, automatic=True)

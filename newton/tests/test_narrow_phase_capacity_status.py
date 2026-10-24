@@ -38,9 +38,7 @@ def make_pipeline(device="cpu", *, verify=True, capacity=1):
         body = builder.add_body(xform=wp.transform(wp.vec3(x, 0.0, 0.0)))
         builder.add_shape_sphere(body, radius=0.5)
     model = builder.finalize(device=device)
-    pipeline = newton.CollisionPipeline(
-        model, broad_phase_output_max=capacity, rigid_contact_max=8, verify_buffers=verify
-    )
+    pipeline = newton.CollisionPipeline(model, broad_phase_output_max=capacity, verify_buffers=verify)
     return model, pipeline
 
 

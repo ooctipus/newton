@@ -290,9 +290,7 @@ class TestHeightfieldCapsuleContact(unittest.TestCase):
                         "NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES": analytic,
                     }
                     with patch.dict(os.environ, env):
-                        owner = newton.CollisionPipeline(
-                            model, reduce_contacts=True, rigid_contact_max=4096, max_triangle_pairs=4096
-                        )
+                        owner = newton.CollisionPipeline(model, reduce_contacts=True, max_triangle_pairs=4096)
                     solver = newton.solvers.SolverXPBD(model, iterations=10)
                     state, next_state = model.state(), model.state()
                     contacts, control = owner.contacts(), model.control()

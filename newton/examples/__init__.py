@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import warnings
+import weakref
 from collections import defaultdict
 from collections.abc import Callable
 
@@ -518,6 +519,32 @@ def _throttle_render_fps(
     return sleep_time
 
 
+def _service_contact_capacity(example, state: newton.State | None = None) -> None:
+    """Grow the example's rigid contact buffers to their demand and recapture its graph when they grew.
+
+    A graph replays fixed buffer extents, and the buffers grow only outside
+    capture, so the runner does what every loop that replays
+    :meth:`newton.CollisionPipeline.collide` from a graph does (see
+    :meth:`~newton.CollisionPipeline.service_capacity`): before the first frame
+    it measures ``state``, the state the example's graph starts from, and after
+    each frame it grows from the recorded demand.
+    """
+    grew = False
+    for pipeline in list(vars(example).values()):
+        if isinstance(pipeline, newton.CollisionPipeline):
+            model = pipeline.model
+            measured = (
+                state
+                if isinstance(state, newton.State)
+                and state.body_count == model.body_count
+                and state.particle_count == model.particle_count
+                else None
+            )
+            grew |= pipeline.service_capacity(measured)
+    if grew and getattr(example, "graph", None) is not None and callable(getattr(example, "capture", None)):
+        example.capture()
+
+
 def run(example, args):
     viewer = example.viewer
     example_class = type(example)
@@ -535,6 +562,8 @@ def run(example, args):
     if hasattr(example, "gui") and hasattr(viewer, "register_ui_callback"):
         viewer.register_ui_callback(lambda ui, ex=example: ex.gui(ui), position="side")
 
+    # Weakly: a reset drops the old example before the new one captures its graph.
+    prepared = None
     while viewer.is_running():
         frame_start_time = time.perf_counter()
 
@@ -558,9 +587,14 @@ def run(example, args):
             _throttle_render_fps(frame_start_time, render_fps)
             continue
 
+        if prepared is None or prepared() is not example:
+            _service_contact_capacity(example, getattr(example, "state_0", None))
+            prepared = weakref.ref(example)
+
         if viewer.should_step():
             with wp.ScopedTimer("step", active=False):
                 example.step()
+            _service_contact_capacity(example)
         if test_post_step:
             example.test_post_step()
 

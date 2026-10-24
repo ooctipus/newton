@@ -48,7 +48,7 @@ ROUTES = {
 SCHEDULES = ((0, 1), (0, 4), (6, 16), (2, 32))
 
 
-def pipeline(model, route, lanes, *, max_triangle_pairs=1 << 16, rigid_contact_max=1 << 14):
+def pipeline(model, route, lanes, *, max_triangle_pairs=1 << 16):
     """Build one terrain route with the lane midphase on or off."""
     flags = {
         "NEWTON_HEIGHTFIELD_CELL_REJECT": "1",
@@ -61,9 +61,7 @@ def pipeline(model, route, lanes, *, max_triangle_pairs=1 << 16, rigid_contact_m
         "NEWTON_TERRAIN_LAW": "none",
     }
     with patch.dict(os.environ, flags):
-        owner = newton.CollisionPipeline(
-            model, reduce_contacts=True, rigid_contact_max=rigid_contact_max, max_triangle_pairs=max_triangle_pairs
-        )
+        owner = newton.CollisionPipeline(model, reduce_contacts=True, max_triangle_pairs=max_triangle_pairs)
     narrow = owner.narrow_phase
     if route == "pair_csr":
         assert narrow._heightfield_pair_csr
@@ -369,7 +367,7 @@ class TestHeightfieldLaneMidphase(unittest.TestCase):
     def test_original_triangles_cuda(self):
         """Match the original midphase per pair with warp lanes on a many-world rough terrain."""
         model = rough_terrain_model("cuda:0", KINDS, per_kind=4, samples=64, half=2.0, terrain_yaw=0.4, worlds=128)
-        capacities = {"max_triangle_pairs": 1 << 20, "rigid_contact_max": 1 << 18}
+        capacities = {"max_triangle_pairs": 1 << 20}
         self.check_original_triangles("cuda:0", model, ((0, 16), (6, 32), (16, 8)), **capacities)
 
     def check_current_geometry(self, device):

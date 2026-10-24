@@ -89,9 +89,7 @@ class TestCompactContactExport(unittest.TestCase):
             flags = {**primitive.FLAGS, "NEWTON_REDUCER_EXPORT_CLEANUP": str(int(cleanup))}
             with self.subTest(cleanup=cleanup), patch.dict(os.environ, flags):
                 ordinary, compact = (
-                    newton.CollisionPipeline(
-                        model, contact_export=choice, rigid_contact_max=4096, max_triangle_pairs=4096
-                    )
+                    newton.CollisionPipeline(model, contact_export=choice, max_triangle_pairs=4096)
                     for choice in ("tiled", "auto")
                 )
                 self.assertEqual(compact.get_collision_selection()["contact_export"]["method"], "compact")

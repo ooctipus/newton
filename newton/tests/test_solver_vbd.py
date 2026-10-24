@@ -1280,57 +1280,45 @@ def _rigid_contact_history_soft_restores_penalty_only(test, device):
 
 
 def _rigid_contact_history_capture_requires_preallocation(test, device):
-    """Contact history must be allocated before CUDA graph recording."""
+    """Allocate contact history before CUDA graph recording: at construction, and grown outside capture."""
 
-    def make_scene(pipeline_first, rigid_contact_max=4):
+    def make_scene():
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -10.0))
         builder.add_ground_plane()
         body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.2), wp.quat_identity()))
         builder.add_shape_box(body, hx=0.2, hy=0.2, hz=0.2)
         builder.color()
         model = builder.finalize(device=device)
-
-        pipeline = contacts = None
-        if pipeline_first:
-            pipeline = newton.CollisionPipeline(model, rigid_contact_max=rigid_contact_max, contact_matching="latest")
-            contacts = pipeline.contacts()
-
         solver = newton.solvers.SolverVBD(
             model,
             iterations=1,
             rigid_contact_history=True,
             rigid_compliant_alm=True,
         )
-
-        if not pipeline_first:
-            pipeline = newton.CollisionPipeline(model, rigid_contact_max=rigid_contact_max, contact_matching="latest")
-            contacts = pipeline.contacts()
-
+        pipeline = newton.CollisionPipeline(model, contact_matching="latest")
+        contacts = pipeline.contacts()
         state_in = model.state()
         state_out = model.state()
         control = model.control()
-        if rigid_contact_max > 0:
-            pipeline.collide(state_in, contacts)
+        pipeline.collide(state_in, contacts)
         return pipeline, solver, contacts, state_in, state_out, control
 
-    pipeline, solver, contacts, state_in, state_out, control = make_scene(pipeline_first=False)
-    with test.assertRaisesRegex(RuntimeError, "contact history must be allocated before graph capture"):
+    # The history exists from construction, before the solver meets any contacts.
+    pipeline, solver, contacts, state_in, state_out, control = make_scene()
+    test.assertIsNotNone(solver._prev_contact_lambda)
+    with wp.ScopedCapture(device=device) as capture:
+        solver.step(state_in, state_out, control, contacts, 1.0e-3)
+    test.assertIsNotNone(capture.graph)
+
+    # Contact rows that outgrew the history cannot grow it during capture: one uncaptured step grows it.
+    pipeline, solver, contacts, state_in, state_out, control = make_scene()
+    rows = solver._prev_contact_lambda.shape[0]
+    test.assertTrue(contacts.reserve_rigid_contacts(2 * rows))
+    with test.assertRaisesRegex(RuntimeError, "during CUDA graph capture"):
         with wp.ScopedCapture(device=device):
             solver.step(state_in, state_out, control, contacts, 1.0e-3)
-
-    pipeline, solver, contacts, state_in, state_out, control = make_scene(pipeline_first=True)
-    with wp.ScopedCapture(device=device) as capture:
-        solver.step(state_in, state_out, control, contacts, 1.0e-3)
-    test.assertIsNotNone(capture.graph)
-
-    pipeline, solver, contacts, state_in, state_out, control = make_scene(pipeline_first=True, rigid_contact_max=0)
-    with wp.ScopedCapture(device=device) as capture:
-        solver.step(state_in, state_out, control, contacts, 1.0e-3)
-    test.assertIsNotNone(capture.graph)
-    test.assertIsNone(solver._prev_contact_lambda)
-
-    pipeline, solver, contacts, state_in, state_out, control = make_scene(pipeline_first=False)
     solver.step(state_in, state_out, control, contacts, 1.0e-3)
+    test.assertEqual(solver._prev_contact_lambda.shape[0], contacts.rigid_contact_max)
     pipeline.collide(state_out, contacts)
     with wp.ScopedCapture(device=device) as capture:
         solver.step(state_out, state_in, control, contacts, 1.0e-3)

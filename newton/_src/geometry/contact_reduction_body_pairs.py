@@ -1767,7 +1767,7 @@ class BodyPairContactReducer:
     the public API.
 
     Args:
-        rigid_contact_max: Capacity of the ``Contacts`` buffer being reduced;
+        rigid_contact_max: Initial rows of the ``Contacts`` buffer being reduced;
             ignored when ``pool`` is given.
         cell_size: Spatial cell edge [m] on the normal bin's face plane. Each
             (body pair, bin, cell) keeps its own deepest + extremes, so
@@ -1790,7 +1790,7 @@ class BodyPairContactReducer:
             returning it (``ContactSorter.borrow_full_scratch``) so growth
             borrows the current arrays.
         pool: Contact pool whose ready rows the per-contact buffers hold and
-            grow with; by default a fixed pool of ``rigid_contact_max`` rows.
+            grow with; by default a pool starting at ``rigid_contact_max`` rows.
     """
 
     def __init__(
@@ -1811,7 +1811,7 @@ class BodyPairContactReducer:
         pool: ContactPool | None = None,
     ):
         if pool is None:
-            pool = ContactPool(rigid_contact_max, device=device, rows=rigid_contact_max)
+            pool = ContactPool(device=device, rows=rigid_contact_max)
         self._pool = pool
         self.rigid_contact_max = pool.ready
         # Validate at KERNEL precision: the kernels receive float32, so a
@@ -1854,18 +1854,17 @@ class BodyPairContactReducer:
         # One entry per (body pair, bin, cell) actually touched. Sized from the
         # scene's own topology -- the distinct group pairs its contact-pair list
         # can produce (see build_reduction_group_pair_bound) -- rather than from
-        # rigid_contact_max, which counts CONTACTS and relates to the group
-        # count only through how many contacts share a patch, i.e. through
-        # exactly the quantity this pass exists to vary.
+        # the contact rows, which count CONTACTS and relate to the group count
+        # only through how many contacts share a patch, i.e. through exactly
+        # the quantity this pass exists to vary.
         #
         # The anchor is loose in both directions and deliberately so: it bounds
         # only the pair dimension of the key, and reachable pairs are not
-        # simultaneously active. Neither direction is unsafe. Undersizing
+        # simultaneously active. Neither direction is unsafe: undersizing
         # cannot drop a contact -- a bounded probe failure makes the whole
-        # frame keep everything, counted in fallback_frames -- and
-        # rigid_contact_max caps the request because a group cannot exist
-        # without a contact to create it. Tune with hashtable_headroom against
-        # the fallback_frames / max_hashtable_entries telemetry.
+        # frame keep everything, counted in fallback_frames. Tune with
+        # hashtable_headroom against the fallback_frames /
+        # max_hashtable_entries telemetry.
         if group_pair_bound is not None and group_pair_bound > 0:
             # A replicated scene can have only one reachable pair per body,
             # yet each pair occupies several normal bins / spatial cells.
@@ -1877,9 +1876,9 @@ class BodyPairContactReducer:
             capacity_request = int(max(group_pair_bound, group_budget) * hashtable_headroom)
         else:
             # No precomputed pair list to derive from; fall back to the old
-            # contact-anchored heuristic rather than guessing.
-            capacity_request = int(pool.bound * 0.25 * hashtable_headroom)
-        self.hashtable_capacity_request = max(1024, min(capacity_request, pool.bound))
+            # contact-anchored heuristic (at the initial rows) rather than guessing.
+            capacity_request = int(pool.ready * 0.25 * hashtable_headroom)
+        self.hashtable_capacity_request = max(1024, capacity_request)
         self.group_pair_bound = int(group_pair_bound) if group_pair_bound is not None else -1
         self.hashtable = HashTable(self.hashtable_capacity_request, device=device)
         self.ht_values = wp.zeros(BODY_PAIR_REDUCTION_SLOTS * self.hashtable.capacity, dtype=wp.uint64, device=device)

@@ -640,7 +640,7 @@ class ContactMatcher:
             point/offset arrays are ``None`` and replay is skipped.
         device: Device to allocate on.
         pool: Contact pool whose ready rows the history holds and grows with,
-            keeping its contents; by default a fixed pool of ``capacity`` rows.
+            keeping its contents; by default a pool starting at ``capacity`` rows.
     """
 
     def __init__(
@@ -659,7 +659,7 @@ class ContactMatcher:
     ):
         with wp.ScopedDevice(device):
             if pool is None:
-                pool = ContactPool(capacity, device=wp.get_device(), rows=capacity)
+                pool = ContactPool(device=wp.get_device(), rows=capacity)
             self._capacity = pool.ready
             self._pos_threshold_sq = pos_threshold * pos_threshold
             self._normal_dot_threshold = normal_dot_threshold

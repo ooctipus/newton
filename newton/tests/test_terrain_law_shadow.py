@@ -70,7 +70,7 @@ from newton.tests.unittest_utils import (
     scoped_capture_after_gc,
 )
 
-PIPELINE = {"rigid_contact_max": 1 << 14, "max_triangle_pairs": 1 << 16}
+PIPELINE = {"max_triangle_pairs": 1 << 16}
 
 
 def _mixed_scene(device):

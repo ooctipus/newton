@@ -119,7 +119,7 @@ def _expert_narrow_phase(model, writer):
         contact_writer_warp_func=writer,
         has_meshes=False,
         has_heightfields=True,
-        contact_max=PIPELINE["rigid_contact_max"],
+        contact_max=1 << 14,
     )
 
 
@@ -290,7 +290,6 @@ class TestTerrainLawContacts(unittest.TestCase):
             TERRAIN_ROUTE,
             broad_phase=BroadPhaseExplicit(),
             narrow_phase=law.narrow_phase,
-            rigid_contact_max=PIPELINE["rigid_contact_max"],
         )
         self.assertEqual(_law_record(expert)["decision"], "opted_out")
         self.assertEqual(law.narrow_phase._terrain_law_partner.shape[0], 0)
@@ -336,7 +335,6 @@ class TestTerrainLawContacts(unittest.TestCase):
             {},
             broad_phase=BroadPhaseExplicit(),
             narrow_phase=_expert_narrow_phase(model, _forwarding_writer),
-            rigid_contact_max=PIPELINE["rigid_contact_max"],
         )
         record = _law_record(expert)
         self.assertEqual((record["writes"], record["decision"]), (False, "unsupported"))
@@ -350,7 +348,6 @@ class TestTerrainLawContacts(unittest.TestCase):
                 {"NEWTON_TERRAIN_LAW": "all"},
                 broad_phase=BroadPhaseExplicit(),
                 narrow_phase=_expert_narrow_phase(model, _forwarding_writer),
-                rigid_contact_max=PIPELINE["rigid_contact_max"],
             )
         # With the stock writer, a prebuilt narrow phase is supported: the law writes by default.
         stock = _pipeline(
@@ -358,7 +355,6 @@ class TestTerrainLawContacts(unittest.TestCase):
             {},
             broad_phase=BroadPhaseExplicit(),
             narrow_phase=_expert_narrow_phase(model, write_contact),
-            rigid_contact_max=PIPELINE["rigid_contact_max"],
         )
         self.assertEqual(_law_record(stock)["decision"], "default")
 
@@ -392,9 +388,15 @@ class TestTerrainLawContacts(unittest.TestCase):
         """
         model, _terrain = _mixed_scene(wp.get_device("cpu"))
         state = model.state()
-        pipeline = _pipeline(model, {}, rigid_contact_max=60, max_triangle_pairs=1 << 16, verify_buffers=True)
-        contacts = _collide(pipeline, state)
+        pipeline = _pipeline(model, {}, max_triangle_pairs=1 << 16, verify_buffers=True)
+        # Outside capture a pass grows a buffer it overflows; a graph replay cannot, so it flags.
+        _collide(pipeline, state)
+        contacts = newton.Contacts(60, 0, device=model.device)
+        with wp.ScopedCapture(device=model.device) as capture:
+            pipeline.collide(state, contacts)
+        wp.capture_launch(capture.graph)
         self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 60)
+        self.assertEqual(contacts.rigid_contact_max, 60)
         self.assertTrue(pipeline.narrow_phase.buffer_capacity_status()["contacts"])
         roomy = _pipeline(model, {}, verify_buffers=True, **PIPELINE)
         _collide(roomy, state)

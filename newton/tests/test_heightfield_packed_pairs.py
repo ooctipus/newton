@@ -31,7 +31,7 @@ def create_pipeline(model, packed):
             "NEWTON_TERRAIN_LAW": "none",
         },
     ):
-        return newton.CollisionPipeline(model, reduce_contacts=True, rigid_contact_max=128, max_triangle_pairs=128)
+        return newton.CollisionPipeline(model, reduce_contacts=True, max_triangle_pairs=128)
 
 
 def logical(narrow):

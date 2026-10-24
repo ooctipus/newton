@@ -735,7 +735,6 @@ def _tossed_spheres(device, worlds=4):
     builder.replicate(scene, worlds, spacing=(3.0, 3.0, 0.0))
     builder.add_ground_plane()
     model = builder.finalize(device=device)
-    model.rigid_contact_max = 256
     return model
 
 
@@ -852,7 +851,6 @@ def _walkers(device, worlds=4):
     builder.replicate(scene, worlds, spacing=(3.0, 3.0, 0.0))
     builder.add_ground_plane()
     model = builder.finalize(device=device)
-    model.rigid_contact_max = 2048
     return model
 
 

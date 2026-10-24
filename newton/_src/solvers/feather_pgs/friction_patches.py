@@ -1425,7 +1425,7 @@ class _FrictionPatchState:
         self.view.phi = phi
         device = model.device
         if pool is None:
-            pool = ContactPool(capacity, device=device, rows=capacity)
+            pool = ContactPool(device=device, rows=capacity)
         self.capacity = pool.ready
         self.reuse_frames = bool(reuse_frames and enabled)
         self.small_live_sort = bool(small_live_sort)

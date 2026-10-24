@@ -52,7 +52,6 @@ class Example:
         # Create the multi-world model by duplicating the single-robot
         # builder for the specified number of worlds
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
-        builder.num_rigid_contacts_per_world = 2048
         for _ in range(self.world_count):
             builder.add_world(robot_builder)
 

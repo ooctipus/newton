@@ -20,9 +20,7 @@ def _build_model():
     body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
     joint = builder.add_joint_free(parent=-1, child=body)
     builder.add_articulation([joint])
-    model = builder.finalize(device="cpu")
-    model.rigid_contact_max = 1
-    return model
+    return builder.finalize(device="cpu")
 
 
 class TestFeatherPGSContactCapacity(unittest.TestCase):
@@ -99,14 +97,16 @@ class TestFeatherPGSContactCapacity(unittest.TestCase):
         np.testing.assert_array_equal(contact_path.numpy(), np.full(capacity, -1, dtype=np.int32))
         self.assertEqual(int(world_slot_counter.numpy()[0]), 0)
 
-    def test_step_rejects_contacts_larger_than_scratch(self):
-        """Reject oversized contact input before it can overwrite solver scratch."""
+    def test_step_grows_scratch_to_larger_contacts(self):
+        """Grow the solver's per-contact scratch to a larger contact buffer before writing it."""
         model = _build_model()
         solver = SolverFeatherPGS(model)
-        contacts = newton.Contacts(rigid_contact_max=2, soft_contact_max=0, device=model.device)
+        rows = solver._contact_pool.ready + 64
+        contacts = newton.Contacts(rigid_contact_max=rows, soft_contact_max=0, device=model.device)
 
-        with self.assertRaisesRegex(ValueError, "contact capacity"):
-            solver.step(model.state(), model.state(), model.control(), contacts, 1.0 / 60.0)
+        solver.step(model.state(), model.state(), model.control(), contacts, 1.0 / 60.0)
+        self.assertEqual(solver._contact_pool.ready, rows)
+        self.assertEqual(solver.contact_slot.shape, (rows,))
 
 
 if __name__ == "__main__":

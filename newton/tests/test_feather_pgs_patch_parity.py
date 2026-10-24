@@ -220,7 +220,7 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
             solver = SolverFeatherPGS(
                 model, pgs_mode="split", friction_anchor_beta=0.2, pgs_iterations=8, dense_max_constraints=32
             )
-            pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
+            pipeline = newton.CollisionPipeline(model)
             contacts, control = pipeline.contacts(), model.control()
             state, output = model.state(), model.state()
             newton.eval_fk(model, state.joint_q, state.joint_qd, state)

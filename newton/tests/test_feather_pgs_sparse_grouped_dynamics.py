@@ -31,7 +31,7 @@ def _case(grouped, *, free_count=0, friction_anchor_beta=0.0):
         )
     state, out = model.state(), model.state()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=128)
+    pipeline = newton.CollisionPipeline(model)
     return model, solver, state, out, model.control(), pipeline, pipeline.contacts()
 
 

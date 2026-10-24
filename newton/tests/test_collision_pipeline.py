@@ -41,9 +41,6 @@ from newton._src.geometry.soft_contacts_sdf import (
 )
 from newton._src.sim import contacts as contacts_module
 from newton._src.sim.collide import (
-    _CONVEX_PAIR_MAX_CONTACTS,
-    _HYDRO_PAIR_MAX_CONTACTS,
-    _MESH_PAIR_MAX_CONTACTS,
     _SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD,
     CollisionPipeline,
     _build_soft_edge_rigid_contact_pairs,
@@ -53,7 +50,6 @@ from newton._src.sim.collide import (
     _compute_per_world_mask_pair_max,
     _compute_per_world_shape_pairs_max,
     _count_soft_particle_rigid_contact_pairs,
-    _estimate_rigid_contact_max,
     _has_generic_convex_pairs,
     _pair_requires_generic_convex_narrow_phase,
     write_contact,
@@ -825,7 +821,6 @@ def test_mesh_sdf_voxel_tolerance_preserves_inner_contact_coverage(test, device)
         model,
         broad_phase="nxn",
         deterministic=True,
-        rigid_contact_max=128,
         max_triangle_pairs=128,
     )
     contacts = pipeline.contacts()
@@ -2136,239 +2131,6 @@ class TestParticleShapeContacts(unittest.TestCase):
             )
 
 
-class TestContactEstimator(unittest.TestCase):
-    def test_visual_only_meshes_do_not_inflate_estimate(self):
-        """Visual meshes should not affect rigid contact capacity estimates."""
-        model = newton.Model()
-        model.world_count = 1
-        model.shape_contact_pair_count = 0
-
-        shape_type = np.array(
-            [int(GeoType.BOX)] * 4 + [int(GeoType.MESH)] * 100,
-            dtype=np.int32,
-        )
-        shape_world = np.zeros(len(shape_type), dtype=np.int32)
-        shape_flags = np.array(
-            [int(ShapeFlags.COLLIDE_SHAPES)] * 4 + [int(ShapeFlags.VISIBLE)] * 100,
-            dtype=np.int32,
-        )
-
-        model.shape_type = wp.array(shape_type, dtype=wp.int32)
-        model.shape_world = wp.array(shape_world, dtype=wp.int32)
-        model.shape_flags = wp.array(shape_flags, dtype=wp.int32)
-
-        estimate = _estimate_rigid_contact_max(model)
-        self.assertEqual(estimate, 1000)
-
-    def test_heuristic_caps_large_pair_count(self):
-        """When pair count is huge, the heuristic provides a tighter bound."""
-        model = newton.Model()
-        model.world_count = 1
-        model.shape_contact_pair_count = 999999
-
-        # 4 primitives (CPP=5), 3 meshes (CPP=40), 2 planes, all in world 0.
-        # non-plane: (4*20*5 + 3*20*40) // 2 = (400 + 2400) // 2 = 1400
-        # weighted_plane_cpp: (4*5 + 3*40) // 7 = 140 // 7 = 20
-        # plane (per-world): 2*7 pairs * 20 = 280
-        # heuristic = 1680, pair = huge => min = 1680
-        shape_type = np.array(
-            [int(GeoType.BOX)] * 4 + [int(GeoType.MESH)] * 3 + [int(GeoType.PLANE)] * 2,
-            dtype=np.int32,
-        )
-        shape_world = np.zeros(len(shape_type), dtype=np.int32)
-
-        model.shape_type = wp.array(shape_type, dtype=wp.int32)
-        model.shape_world = wp.array(shape_world, dtype=wp.int32)
-
-        estimate = _estimate_rigid_contact_max(model)
-        self.assertEqual(estimate, 1680)
-
-    def test_world_aware_plane_estimate(self):
-        """Per-world plane computation avoids quadratic cross-world overcount."""
-        model = newton.Model()
-        model.world_count = 4
-        model.shape_contact_pair_count = 0
-
-        # 4 worlds, each with 10 boxes (CPP=5) and 10 planes.
-        # non-plane: (40*20*5) // 2 = 2000
-        # weighted_plane_cpp: (40*5) // 40 = 5
-        # plane (per-world): 4*(10*10) pairs * 5 = 2000
-        # total = 4000
-        shape_type = np.array(
-            ([int(GeoType.BOX)] * 10 + [int(GeoType.PLANE)] * 10) * 4,
-            dtype=np.int32,
-        )
-        shape_world = np.repeat(np.arange(4, dtype=np.int32), 20)
-
-        model.shape_type = wp.array(shape_type, dtype=wp.int32)
-        model.shape_world = wp.array(shape_world, dtype=wp.int32)
-
-        estimate = _estimate_rigid_contact_max(model)
-        self.assertEqual(estimate, 4000)
-
-    def test_pair_count_tighter_than_heuristic(self):
-        """When precomputed pair count is tighter than the heuristic, it is used."""
-        model = newton.Model()
-        model.world_count = 4
-        model.shape_contact_pair_count = 300
-
-        # 40 boxes (CPP=5) across 4 worlds, no planes.
-        # heuristic: (40*20*5) // 2 = 2000
-        # weighted_cpp: max(5, 5) = 5
-        # pair-based: 300 * 5 = 1500
-        # min(2000, 1500) = 1500
-        shape_type = np.array(
-            [int(GeoType.BOX)] * 40,
-            dtype=np.int32,
-        )
-        shape_world = np.repeat(np.arange(4, dtype=np.int32), 10)
-
-        model.shape_type = wp.array(shape_type, dtype=wp.int32)
-        model.shape_world = wp.array(shape_world, dtype=wp.int32)
-
-        estimate = _estimate_rigid_contact_max(model)
-        self.assertEqual(estimate, 1500)
-
-    # ------------------------------------------------------------------
-    # Pair-aware estimator tests (builder-based scenes, CPU)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _cube_mesh(hs: float = 0.1) -> newton.Mesh:
-        vertices = np.array(
-            [
-                [-hs, -hs, -hs],
-                [hs, -hs, -hs],
-                [hs, hs, -hs],
-                [-hs, hs, -hs],
-                [-hs, -hs, hs],
-                [hs, -hs, hs],
-                [hs, hs, hs],
-                [-hs, hs, hs],
-            ],
-            dtype=np.float32,
-        )
-        # fmt: off
-        indices = np.array(
-            [
-                0, 3, 2, 0, 2, 1,  # -z
-                4, 5, 6, 4, 6, 7,  # +z
-                0, 1, 5, 0, 5, 4,  # -y
-                2, 3, 7, 2, 7, 6,  # +y
-                0, 4, 7, 0, 7, 3,  # -x
-                1, 2, 6, 1, 6, 5,  # +x
-            ],
-            dtype=np.int32,
-        )
-        # fmt: on
-        return newton.Mesh(vertices, indices)
-
-    @classmethod
-    def _build_multi_world_scene(
-        cls, num_worlds: int, boxes_per_world: int, mesh_per_world: bool = False
-    ) -> newton.Model:
-        """Global ground plane + ``num_worlds`` worlds of free-body boxes (and optionally one colliding mesh)."""
-        builder = newton.ModelBuilder()
-        builder.add_ground_plane()
-        for _ in range(num_worlds):
-            builder.begin_world()
-            for i in range(boxes_per_world):
-                b = builder.add_body(xform=wp.transform(wp.vec3(0.5 * float(i), 0.0, 0.5), wp.quat_identity()))
-                builder.add_shape_box(body=b, hx=0.1, hy=0.1, hz=0.1)
-            if mesh_per_world:
-                b = builder.add_body(xform=wp.transform(wp.vec3(-1.0, 0.0, 0.5), wp.quat_identity()))
-                builder.add_shape_mesh(body=b, mesh=cls._cube_mesh())
-            builder.end_world()
-        return builder.finalize(device="cpu")
-
-    @classmethod
-    def _build_box_scene(cls, num_boxes: int, mesh_mode: str | None = None) -> newton.Model:
-        """Ground plane + ``num_boxes`` free-body boxes, optionally plus a mesh shape.
-
-        mesh_mode:
-            None         -- no mesh shape
-            "colliding"  -- mesh shape that participates in collision
-            "visual"     -- mesh shape with has_shape_collision=False (render-only)
-        """
-        builder = newton.ModelBuilder()
-        builder.add_ground_plane()
-        for i in range(num_boxes):
-            b = builder.add_body(xform=wp.transform(wp.vec3(0.5 * float(i), 0.0, 0.5), wp.quat_identity()))
-            builder.add_shape_box(body=b, hx=0.1, hy=0.1, hz=0.1)
-        if mesh_mode is not None:
-            cfg = None
-            if mesh_mode == "visual":
-                cfg = newton.ModelBuilder.ShapeConfig(has_shape_collision=False)
-            b = builder.add_body(xform=wp.transform(wp.vec3(-1.0, 0.0, 0.5), wp.quat_identity()))
-            builder.add_shape_mesh(body=b, mesh=cls._cube_mesh(), cfg=cfg)
-        return builder.finalize(device="cpu")
-
-    def test_pair_aware_sum_of_budgets(self):
-        """For sparse multi-world scenes the estimate is the exact per-pair budget sum."""
-        model = self._build_multi_world_scene(num_worlds=100, boxes_per_world=2)
-        # Per world: 1 box-box + 2 plane-box pairs = 3 pairs, all convex.
-        self.assertEqual(model.shape_contact_pair_count, 300)
-        # Locality cap (plane pairs full + 200 boxes * 20 neighbors * 5 // 2)
-        # is far larger, so the provable pair sum binds.
-        self.assertEqual(_estimate_rigid_contact_max(model), 300 * _CONVEX_PAIR_MAX_CONTACTS)
-
-    def test_pair_aware_mesh_pair_budget(self):
-        """Mesh-involved pairs are budgeted with the contact-reduction per-pair cap."""
-        model = self._build_multi_world_scene(num_worlds=50, boxes_per_world=2, mesh_per_world=True)
-        # Per world: 1 box-box + 2 plane-box (convex) + 2 mesh-box + 1 plane-mesh (mesh) = 6 pairs.
-        self.assertEqual(model.shape_contact_pair_count, 300)
-        expected = 50 * (3 * _CONVEX_PAIR_MAX_CONTACTS + 3 * _MESH_PAIR_MAX_CONTACTS)
-        self.assertEqual(_estimate_rigid_contact_max(model), expected)
-
-    def test_locality_cap_binds_for_dense_single_world(self):
-        """Dense single-world pair graphs are capped by the spatial-locality estimate."""
-        model = self._build_box_scene(num_boxes=25)
-        # Pair sum: C(25,2)=300 box-box + 25 plane-box = 325 pairs * 5 = 1625.
-        self.assertEqual(model.shape_contact_pair_count, 325)
-        # Locality cap: plane pairs keep their budget (25 * 5) and the 25 boxes
-        # are budgeted for 20 simultaneous neighbors each (halved per pair):
-        # 125 + 25 * 5 * 20 // 2 = 1375 < 1625, so the cap binds.
-        plane_term = 25 * _CONVEX_PAIR_MAX_CONTACTS
-        locality = 25 * _CONVEX_PAIR_MAX_CONTACTS * 20 // 2
-        self.assertEqual(_estimate_rigid_contact_max(model), plane_term + locality)
-
-    def test_visual_mesh_does_not_inflate_estimate(self):
-        """A non-colliding (visual-only) mesh shape must not change the estimate."""
-        model_plain = self._build_box_scene(num_boxes=25)
-        model_visual = self._build_box_scene(num_boxes=25, mesh_mode="visual")
-        # The visual mesh adds a shape but no contact pairs.
-        self.assertEqual(model_visual.shape_count, model_plain.shape_count + 1)
-        self.assertEqual(model_visual.shape_contact_pair_count, model_plain.shape_contact_pair_count)
-        self.assertEqual(
-            _estimate_rigid_contact_max(model_visual),
-            _estimate_rigid_contact_max(model_plain),
-        )
-
-    def test_hydroelastic_pair_budget(self):
-        """Hydro-hydro pairs get the anchor-augmented per-pair budget."""
-        model = self._build_multi_world_scene(num_worlds=50, boxes_per_world=2)
-        flags = model.shape_flags.numpy()
-        flags |= int(ShapeFlags.HYDROELASTIC)
-        model.shape_flags = wp.array(flags, dtype=wp.int32, device=model.device)
-        # All 150 pairs become hydro-hydro: budgeted at MAX_CONTACTS_PER_PAIR
-        # plus one anchor contact per normal bin; the locality cap (which also
-        # uses the hydro budget per shape) stays larger, so the sum binds.
-        self.assertEqual(_estimate_rigid_contact_max(model), 150 * _HYDRO_PAIR_MAX_CONTACTS)
-
-    def test_explicit_rigid_contact_max_override_wins(self):
-        """An explicit model.rigid_contact_max (>0) bypasses the estimator."""
-        model = self._build_box_scene(num_boxes=4)
-        model.rigid_contact_max = 777777
-        pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
-        self.assertEqual(pipeline.rigid_contact_max, 777777)
-
-    def test_minimum_allocation_floor(self):
-        """Small pair sums are floored at the 1000-contact minimum allocation."""
-        model = self._build_box_scene(num_boxes=2)
-        # 2 boxes + plane: 3 pairs * 5 = 15 -> floored to 1000.
-        self.assertEqual(_estimate_rigid_contact_max(model), 1000)
-
-
 class TestShapePairsMaxScaling(unittest.TestCase):
     """Verify that shape_pairs_max scales linearly with world count, not quadratically."""
 
@@ -2936,7 +2698,7 @@ def test_mesh_convex_with_sdf_routes_to_sdf_contact(test, device):
     builder.add_shape_convex_hull(body=body_convex, mesh=convex)
 
     model = builder.finalize(device=device)
-    pipeline = newton.CollisionPipeline(model, broad_phase="sap", rigid_contact_max=256)
+    pipeline = newton.CollisionPipeline(model, broad_phase="sap")
     contacts = pipeline.contacts()
     pipeline.collide(model.state(), contacts)
 
@@ -2997,7 +2759,7 @@ def test_scalar_sdf_texture_routes_to_sdf_contact(test, device):
 
         model = builder.finalize(device=device)
         state = model.state()
-        pipeline = newton.CollisionPipeline(model, broad_phase="sap", rigid_contact_max=256)
+        pipeline = newton.CollisionPipeline(model, broad_phase="sap")
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)
 
@@ -3047,7 +2809,7 @@ def test_mesh_convex_one_sdf_keeps_existing_route(test, device):
     builder.add_shape_convex_hull(body=body_convex, mesh=convex)
 
     model = builder.finalize(device=device)
-    pipeline = newton.CollisionPipeline(model, broad_phase="sap", rigid_contact_max=256)
+    pipeline = newton.CollisionPipeline(model, broad_phase="sap")
     contacts = pipeline.contacts()
     pipeline.collide(model.state(), contacts)
 
@@ -3073,7 +2835,7 @@ def test_mesh_box_with_sdf_routes_to_sdf_contact(test, device):
     test.assertGreaterEqual(int(model._shape_sdf_index.numpy()[box]), 0)
     test.assertEqual(int(model.shape_edge_range.numpy()[box][1]), 12)
 
-    pipeline = newton.CollisionPipeline(model, broad_phase="sap", rigid_contact_max=256)
+    pipeline = newton.CollisionPipeline(model, broad_phase="sap")
     contacts = pipeline.contacts()
     pipeline.collide(model.state(), contacts)
 
@@ -3099,7 +2861,7 @@ def test_box_box_with_sdf_keeps_primitive_route(test, device):
     test.assertGreaterEqual(int(shape_sdf_index[box_a]), 0)
     test.assertGreaterEqual(int(shape_sdf_index[box_b]), 0)
 
-    pipeline = newton.CollisionPipeline(model, broad_phase="sap", rigid_contact_max=256)
+    pipeline = newton.CollisionPipeline(model, broad_phase="sap")
     contacts = pipeline.contacts()
     pipeline.collide(model.state(), contacts)
 
@@ -3125,7 +2887,7 @@ def test_convex_convex_with_sdf_routes_to_sdf_contact(test, device):
     builder.add_shape_convex_hull(body=body_b, mesh=mesh_b)
 
     model = builder.finalize(device=device)
-    pipeline = newton.CollisionPipeline(model, broad_phase="sap", rigid_contact_max=256)
+    pipeline = newton.CollisionPipeline(model, broad_phase="sap")
     contacts = pipeline.contacts()
     pipeline.collide(model.state(), contacts)
 
@@ -3344,14 +3106,12 @@ def test_deterministic_pipeline_500_steps(test, device):
             broad_phase="nxn",
             deterministic=True,
             reduce_contacts=True,
-            rigid_contact_max=50000,
         )
         pipeline_b = newton.CollisionPipeline(
             model,
             broad_phase="nxn",
             deterministic=True,
             reduce_contacts=True,
-            rigid_contact_max=50000,
         )
         contacts_a = pipeline_a.contacts()
         contacts_b = pipeline_b.contacts()
@@ -3463,13 +3223,11 @@ def test_static_empty_gjk_specialization_under_graph_capture(test, device):
         model,
         broad_phase="explicit",
         deterministic=True,
-        rigid_contact_max=64,
     )
     reference = newton.CollisionPipeline(
         model,
         broad_phase="explicit",
         deterministic=True,
-        rigid_contact_max=64,
     )
     test.assertFalse(specialized.narrow_phase.has_generic_convex_pairs)
     reference.narrow_phase.has_generic_convex_pairs = True
@@ -3600,7 +3358,6 @@ def test_split_gjk_mpr_matches_fused_under_graph_capture(test, device):
         broad_phase="sap",
         shape_pairs_max=_SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD,
         deterministic=True,
-        rigid_contact_max=16384,
         verify_buffers=False,
     )
     fused = newton.CollisionPipeline(
@@ -3608,7 +3365,6 @@ def test_split_gjk_mpr_matches_fused_under_graph_capture(test, device):
         broad_phase="sap",
         shape_pairs_max=_SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD,
         deterministic=True,
-        rigid_contact_max=16384,
         verify_buffers=False,
     )
     test.assertTrue(split.narrow_phase.split_gjk_mpr)
@@ -3777,7 +3533,6 @@ def test_deterministic_pipeline_sticky_500_steps(test, device):
         common_kwargs = {
             "broad_phase": "nxn",
             "reduce_contacts": True,
-            "rigid_contact_max": 50000,
             # contact_matching="sticky" implies deterministic=True.
             "contact_matching": "sticky",
         }
@@ -5424,7 +5179,7 @@ def test_expert_narrow_phase_voxel_resolution(test, device):
 
     narrow_phase = make_narrow_phase()
     test.assertIsNone(narrow_phase.shape_voxel_resolution)
-    pipeline = CollisionPipeline(model, broad_phase=broad_phase, narrow_phase=narrow_phase, rigid_contact_max=1024)
+    pipeline = CollisionPipeline(model, broad_phase=broad_phase, narrow_phase=narrow_phase)
     test.assertIs(pipeline.narrow_phase.shape_voxel_resolution, model._shape_voxel_resolution)
     contacts = pipeline.contacts()
     pipeline.collide(state, contacts)
@@ -5434,7 +5189,7 @@ def test_expert_narrow_phase_voxel_resolution(test, device):
         shape_voxel_resolution=wp.zeros(model.shape_count + 1, dtype=wp.vec3i, device=device)
     )
     with test.assertRaisesRegex(ValueError, "shape_voxel_resolution"):
-        CollisionPipeline(model, broad_phase=broad_phase, narrow_phase=wrong_length, rigid_contact_max=1024)
+        CollisionPipeline(model, broad_phase=broad_phase, narrow_phase=wrong_length)
 
 
 add_function_test(

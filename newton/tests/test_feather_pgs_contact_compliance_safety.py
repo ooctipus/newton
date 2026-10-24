@@ -144,7 +144,7 @@ class TestContactComplianceSafety(unittest.TestCase):
         self.assertEqual(solver.compliance_skipped_contact_count, 0)
         for name, value in before.items():
             np.testing.assert_array_equal(getattr(state, name).numpy(), value)
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
+        pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
         for field in ("rigid_contact_stiffness", "rigid_contact_damping", "rigid_contact_friction"):
             setattr(contacts, field, wp.zeros(32, device=self.device))

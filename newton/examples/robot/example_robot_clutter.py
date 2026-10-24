@@ -317,7 +317,6 @@ class Example:
                 body_pair_hysteresis=0.0,
                 body_pair_verify=args.test,
             ),
-            rigid_contact_max=self.contact_capacity * args.world_count,
             max_triangle_pairs=self.triangle_pair_capacity * args.world_count,
         )
         self.contacts = self.pipeline.contacts()

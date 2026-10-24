@@ -161,7 +161,6 @@ def test_box_box_corner_manifold_preserved(test: unittest.TestCase, device):
         pipeline = newton.CollisionPipeline(
             model,
             reduce_contacts=True,
-            rigid_contact_max=128,
             broad_phase="nxn",
             deterministic=True,
             contact_matching="latest",
@@ -201,7 +200,6 @@ def test_box_box_sat_speculative_approach(test: unittest.TestCase, device):
         pipeline = newton.CollisionPipeline(
             model,
             reduce_contacts=True,
-            rigid_contact_max=128,
             broad_phase="nxn",
             deterministic=True,
             contact_matching="latest",
@@ -257,7 +255,6 @@ def test_box_box_sat_honors_shape_margin(test: unittest.TestCase, device):
         pipeline = newton.CollisionPipeline(
             model,
             reduce_contacts=True,
-            rigid_contact_max=64,
             broad_phase="nxn",
             deterministic=True,
             contact_matching="latest",
@@ -290,7 +287,6 @@ def test_box_box_aligned_manifold_distinct_corners(test: unittest.TestCase, devi
             pipeline = newton.CollisionPipeline(
                 model,
                 reduce_contacts=True,
-                rigid_contact_max=64,
                 broad_phase="nxn",
                 deterministic=True,
                 contact_matching="latest",

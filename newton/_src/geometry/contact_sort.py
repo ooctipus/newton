@@ -216,16 +216,16 @@ class ContactSorter:
     ):
         """
         Args:
-            capacity: Contact slots to sort; ignored when ``pool`` is given.
+            capacity: Initial contact slots to sort; ignored when ``pool`` is given.
             per_contact_shape_properties: Provision scratch for per-contact stiffness, damping and friction.
             device: Device to allocate on.
-            pool: Contact pool whose ready rows the buffers hold and grow with; by default a fixed
-                pool of ``capacity`` rows.
+            pool: Contact pool whose ready rows the buffers hold and grow with; by default a pool
+                starting at ``capacity`` rows.
         """
         with wp.ScopedDevice(device):
             self._has_shape_props = per_contact_shape_properties
             if pool is None:
-                pool = ContactPool(capacity, device=wp.get_device(), rows=capacity)
+                pool = ContactPool(device=wp.get_device(), rows=capacity)
             fields = [
                 # radix_sort_pairs uses the second half as scratch, so hold 2 rows per contact.
                 ContactField("_sort_indices", wp.int32, per_contact=2),

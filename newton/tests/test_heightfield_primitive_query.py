@@ -56,7 +56,7 @@ def _evaluate_supports(
 def pipeline(model, enabled):
     """Toggle query specialization while preserving append and reduction settings."""
     with patch.dict(os.environ, {**FLAGS, "NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": str(int(enabled))}):
-        return newton.CollisionPipeline(model, reduce_contacts=True, rigid_contact_max=4096, max_triangle_pairs=4096)
+        return newton.CollisionPipeline(model, reduce_contacts=True, max_triangle_pairs=4096)
 
 
 class TestHeightfieldPrimitiveQuery(unittest.TestCase):

@@ -61,7 +61,6 @@ def _build_model(device="cpu", *, locked_d6=False, chain=False, leaves=7):
     free = body(leaves + 2)
     builder.add_articulation([builder.add_joint_free(free)])
     model = builder.finalize(device=device)
-    model.rigid_contact_max = 1
     q = model.joint_q.numpy()
     q[: leaves + 1] = np.linspace(-0.31, 0.27, leaves + 1)
     model.joint_q.assign(q)
@@ -378,14 +377,12 @@ class TestLeafPublication(unittest.TestCase):
 
     def _check_cached_next_step_dynamics_and_reset(self, device, mode, *, loaded=False, velocity_limits=False):
         model = _build_contact_model(device) if loaded else _build_model(device, leaves=4)[0]
-        contact_capacity = 32 if loaded else 1
-        model.rigid_contact_max = contact_capacity
         if velocity_limits:
             model.joint_velocity_limit.fill_(0.01)
         solvers = [_solver(model, enabled=value, mode=mode, velocity_limits=velocity_limits) for value in (False, True)]
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=contact_capacity)
+        pipeline = newton.CollisionPipeline(model)
         contacts = [pipeline.contacts() for _ in solvers]
         saw_contacts = False
         for pair in states:

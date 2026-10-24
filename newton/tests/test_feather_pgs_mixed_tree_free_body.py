@@ -205,7 +205,6 @@ def _build(
     builder.add_ground_plane()
     model = builder.finalize(device=device)
     # The walker's thirteen shapes multiply the candidate pairs per world.
-    model.rigid_contact_max = 2048 if quadruped else 256
     return model
 
 

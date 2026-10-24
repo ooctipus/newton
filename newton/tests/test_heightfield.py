@@ -71,7 +71,6 @@ class TestHeightfield(unittest.TestCase):
                             model,
                             broad_phase="nxn",
                             reduce_contacts=reduce,
-                            rigid_contact_max=100,
                             max_triangle_pairs=128,
                         )
                     contacts = pipeline.contacts()

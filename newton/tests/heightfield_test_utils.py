@@ -209,7 +209,6 @@ def build_scene(case, enabled, device, *, reduce=True, make_solver=True, hull_sc
             model,
             broad_phase="nxn",
             reduce_contacts=reduce,
-            rigid_contact_max=100,
             max_triangle_pairs=128,
         )
     contacts = pipeline.contacts()
@@ -261,9 +260,9 @@ def build_scene(case, enabled, device, *, reduce=True, make_solver=True, hull_sc
         ballast=ballast,
         mass=MASS + CHILD_MASS,
         half=HALF.copy(),
-        distance=wp.empty(100, dtype=float, device=device),
-        point0=wp.empty(100, dtype=wp.vec3, device=device),
-        point1=wp.empty(100, dtype=wp.vec3, device=device),
+        distance=wp.empty(contacts.rigid_contact_max, dtype=float, device=device),
+        point0=wp.empty(contacts.rigid_contact_max, dtype=wp.vec3, device=device),
+        point1=wp.empty(contacts.rigid_contact_max, dtype=wp.vec3, device=device),
     )
 
 

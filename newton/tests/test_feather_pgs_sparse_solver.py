@@ -184,7 +184,7 @@ def _case(sparse, *, robot_count=1, prescribed=False):
         )
     state, out = model.state(), model.state()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
+    pipeline = newton.CollisionPipeline(model)
     return model, solver, state, out, model.control(), pipeline, pipeline.contacts()
 
 

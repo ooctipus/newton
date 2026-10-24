@@ -197,7 +197,6 @@ class TestContactReductionValueLayout(unittest.TestCase):
                 pipeline = newton.CollisionPipeline(
                     model,
                     broad_phase="nxn",
-                    rigid_contact_max=2048,
                     max_triangle_pairs=4096,
                     contact_reduction_hashtable_size_factor=factor,
                 )

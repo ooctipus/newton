@@ -266,7 +266,7 @@ class TestHeightfieldCylinderContact(unittest.TestCase):
                 "NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES": analytic_flag,
             }
             with patch.dict(os.environ, env):
-                pipeline = newton.CollisionPipeline(model, reduce_contacts=True, rigid_contact_max=256)
+                pipeline = newton.CollisionPipeline(model, reduce_contacts=True)
             self.assertEqual(pipeline.narrow_phase._heightfield_cylinder_split, split)
             self.assertEqual(
                 pipeline.narrow_phase._heightfield_primitive_kernels[1].key.endswith("_analytic"), not split
@@ -305,9 +305,7 @@ class TestHeightfieldCylinderContact(unittest.TestCase):
                             "NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES": analytic,
                         }
                         with patch.dict(os.environ, env):
-                            owner = newton.CollisionPipeline(
-                                model, reduce_contacts=True, rigid_contact_max=4096, max_triangle_pairs=4096
-                            )
+                            owner = newton.CollisionPipeline(model, reduce_contacts=True, max_triangle_pairs=4096)
                         solver = newton.solvers.SolverXPBD(model, iterations=10)
                         state, next_state = model.state(), model.state()
                         contacts, control = owner.contacts(), model.control()
@@ -357,9 +355,7 @@ class TestHeightfieldCylinderContact(unittest.TestCase):
                 "NEWTON_HEIGHTFIELD_ANALYTIC_PRIMITIVES": analytic,
             }
             with patch.dict(os.environ, env):
-                owner = newton.CollisionPipeline(
-                    model, reduce_contacts=True, rigid_contact_max=4096, max_triangle_pairs=4096
-                )
+                owner = newton.CollisionPipeline(model, reduce_contacts=True, max_triangle_pairs=4096)
             solver = newton.solvers.SolverXPBD(model, iterations=10)
             state, next_state = model.state(), model.state()
             contacts, control = owner.contacts(), model.control()

@@ -550,23 +550,15 @@ def test_contacts_exposes_matching_mode(test, device):
         with test.assertRaises(AttributeError):
             contacts.contact_matching_mode = "sticky"
 
-        incompatible_pipeline = newton.CollisionPipeline(
-            model,
-            broad_phase="nxn",
-            rigid_contact_max=contacts.rigid_contact_max + 1,
-            contact_matching="sticky",
-        )
+        incompatible_pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="sticky")
+        # Its rows grow past the buffer's, so its sort buffers no longer match them.
+        incompatible_pipeline.contacts().reserve_rigid_contacts(contacts.rigid_contact_max + 1)
         with test.assertRaisesRegex(ValueError, "capacity"):
             incompatible_pipeline.collide(state, contacts)
         test.assertEqual(contacts.contact_matching_mode, "latest")
 
         for mode in ("sticky", "disabled"):
-            pipeline = newton.CollisionPipeline(
-                model,
-                broad_phase="nxn",
-                rigid_contact_max=contacts.rigid_contact_max,
-                contact_matching=mode,
-            )
+            pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching=mode)
             pipeline.collide(state, contacts)
             test.assertEqual(contacts.contact_matching_mode, mode)
 

@@ -13,7 +13,14 @@ import warp as wp
 
 import newton
 from newton._src.core import contact_pool
-from newton._src.core.contact_pool import ContactField, ContactPool, grown_rows, initial_rows
+from newton._src.core.contact_pool import (
+    INDEX_LIMIT,
+    ContactField,
+    ContactPool,
+    device_row_limit,
+    grown_rows,
+    initial_rows,
+)
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
 WORLDS = 4
@@ -23,8 +30,8 @@ CONTACTS = 4 * WORLDS * BOXES
 
 
 def _small_pool_policy(rows_per_world: int, quantum: int):
-    """Shrink the pool policy so a small scene starts below its bound."""
-    return mock.patch.multiple(contact_pool, READY_ROWS_PER_WORLD=rows_per_world, ROW_QUANTUM=quantum)
+    """Shrink the pool policy so a small scene starts below its demand."""
+    return mock.patch.multiple(contact_pool, READY_ROWS_PER_WORLD=rows_per_world, ROW_QUANTUM=quantum, MIN_READY_ROWS=0)
 
 
 def _build_boxes(device, worlds=WORLDS, boxes=BOXES, *, color=False):
@@ -57,23 +64,32 @@ def _records(contacts, *extra):
 
 
 class TestContactPoolPolicy(unittest.TestCase):
-    def test_initial_rows_follow_worlds_and_bound(self):
-        """Start at 64 rows per world, rounded to the row quantum and at most the bound."""
-        self.assertEqual(initial_rows(25_231_360, 16384), 1_048_576)
-        self.assertEqual(initial_rows(4_000_000, 4096), 524_288)
-        self.assertEqual(initial_rows(589_824, 16384), 589_824)
-        self.assertEqual(initial_rows(1000, 1), 1000)
+    def test_initial_rows_follow_worlds(self):
+        """Start at 64 rows per world, at least 4096 rows."""
+        self.assertEqual(initial_rows(16384), 1_048_576)
+        self.assertEqual(initial_rows(4096), 262_144)
+        self.assertEqual(initial_rows(65), 4160)
+        self.assertEqual(initial_rows(1), 4096)
+        self.assertEqual(initial_rows(0), 4096)
 
     def test_growth_doubles_the_high_water_past_half_of_ready(self):
         """Grow to twice the high-water mark past half the ready rows, rounded and bounded; never shrink."""
         ready, bound = 1_048_576, 25_231_360
         self.assertEqual(grown_rows(0, ready, bound), ready)
         self.assertEqual(grown_rows(ready // 2, ready, bound), ready)
-        self.assertEqual(grown_rows(ready // 2 + 1, ready, bound), 1_572_864)
-        self.assertEqual(grown_rows(3 * ready, ready, bound), 6_291_456)
+        self.assertEqual(grown_rows(ready // 2 + 1, ready, bound), ready + 64)
+        self.assertEqual(grown_rows(3 * ready, ready, bound), 6 * ready)
         self.assertEqual(grown_rows(20_000_000, ready, bound), bound)
-        with _small_pool_policy(64, 8):
-            self.assertEqual(grown_rows(48, 64, 1000), 96)
+        self.assertEqual(grown_rows(49, 64, 1000), 128)
+
+    def test_device_row_limit_divides_the_device_memory(self):
+        """Bound rows by the int32 index limit everywhere, and by the device memory over the row bytes on CUDA."""
+        self.assertEqual(device_row_limit("cpu", 100), INDEX_LIMIT)
+        self.assertEqual(device_row_limit("cpu", 100, 1000), 1000)
+        for device in get_cuda_test_devices():
+            memory = int(wp.get_device(device).total_memory)
+            self.assertEqual(device_row_limit(device, 1000), memory // 1000)
+            self.assertEqual(device_row_limit(device, 1), INDEX_LIMIT)
 
 
 def test_pool_rows_keep_contents_and_fill_new_rows(test, device):
@@ -82,7 +98,7 @@ def test_pool_rows_keep_contents_and_fill_new_rows(test, device):
     Growing past one 2 MiB granule of every field maps new pages on CUDA.
     """
     grown = 300_000
-    pool = ContactPool(1_000_000, device=device, rows=100)
+    pool = ContactPool(device=device, rows=100)
     fields = (
         ContactField("index", wp.int32, -1),
         ContactField("point", wp.vec3),
@@ -127,14 +143,86 @@ def test_pool_rows_keep_contents_and_fill_new_rows(test, device):
         # Virtual memory keeps addresses: the old view is a valid prefix of the new one.
         test.assertEqual(old_index.ptr, target.index.ptr)
         np.testing.assert_array_equal(old_index.numpy(), np.arange(100))
-    with test.assertRaises(ValueError):
-        pool.grow(2_000_000)
+    with test.assertRaisesRegex(MemoryError, "cannot back"):
+        pool.grow(pool.bound + 1)
+    test.assertEqual(pool.ready, grown)
 
 
-def test_pool_follower_grows_and_respects_its_bound(test, device):
-    """Grow a following pool with its leader, and refuse to grow it past its bound."""
-    leader = ContactPool(10_000, device=device, rows=100)
-    follower = ContactPool(10_000, device=device, rows=50)
+def test_pool_bound_is_the_hardware_limit(test, device):
+    """Bound a pool by the rows the device could back for its live fields; reservations follow the bound.
+
+    Warp arrays index int32 elements; on CUDA, ``gpu_components`` also views a field's reservation as int32 bytes.
+    """
+    cuda = wp.get_device(device).is_cuda
+    pool = ContactPool(device=device, rows=64)
+    test.assertEqual(pool.bound, INDEX_LIMIT)
+    narrow = pool.rows((ContactField("a", wp.int32), ContactField("b", wp.vec3)))
+    narrow_limit = INDEX_LIMIT // 12 if cuda else INDEX_LIMIT
+    test.assertEqual(pool.row_bytes, 16)
+    test.assertEqual(pool.bound, device_row_limit(device, 16, narrow_limit))
+    test.assertEqual(narrow.reserve, pool.bound)
+    wide = pool.rows((ContactField("keys", wp.int64, per_contact=2),))
+    test.assertEqual(pool.row_bytes, 32)
+    test.assertEqual(
+        pool.bound, device_row_limit(device, 32, min(narrow_limit, INDEX_LIMIT // (8 if cuda else 1) // 2))
+    )
+    test.assertEqual(wide.reserve, pool.bound)
+    with test.assertRaisesRegex(MemoryError, "cannot back"):
+        pool.reserve(pool.bound + 1)
+    test.assertEqual(pool.ready, 64)
+    # A collected member, such as a measurement's scratch rows, gives its bytes back.
+    del wide
+    test.assertEqual(pool.row_bytes, 16)
+    test.assertEqual(pool.bound, device_row_limit(device, 16, narrow_limit))
+
+
+def test_reservation_holds_the_device_bound(test, device):
+    """Reserve addresses for the pool's device bound in every field, which the driver accepts, and map only the rows."""
+    model = _build_boxes(device)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    pool = contacts._rigid_contact_pool
+    members = pool._live_members()
+    memory = int(wp.get_device(device).total_memory)
+    reserved = pool.reserved_bytes()
+    mapped = pool.mapped_bytes()
+    print(
+        f"{wp.get_device(device).name}: {memory / 2**30:.1f} GiB device; contact pool of {len(members)} members, "
+        f"{sum(len(member.fields) for member in members)} fields, {pool.row_bytes} B/row, bound {pool.bound} rows, "
+        f"reserves {reserved / 2**30:.1f} GiB of addresses, maps {mapped / 2**20:.1f} MiB for {pool.ready} rows"
+    )
+    index_limit = min(field.row_limit(True) for member in members for field in member.fields)
+    test.assertEqual(pool.bound, device_row_limit(device, pool.row_bytes, index_limit))
+    test.assertGreaterEqual(reserved, pool.bound * pool.row_bytes)
+    for member in members:
+        test.assertGreaterEqual(member.reserve, pool.bound)
+        for field in member.fields:
+            test.assertLessEqual(field.length(member.reserve) * wp.types.type_size_in_bytes(field.dtype), INDEX_LIMIT)
+    test.assertLess(mapped, memory // 64, "only the ready rows are mapped")
+    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 0)
+    pipeline.collide(model.state(), contacts)
+    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), CONTACTS)
+
+
+def test_growth_past_free_memory_raises_before_changing(test, device):
+    """Refuse a growth the free device memory cannot back, before mapping anything, and keep the rows."""
+    pool = ContactPool(device=device, rows=64)
+    target = type("Target", (), {})()
+    pool.rows((ContactField("value", wp.vec4, 1.0),), on_rows=lambda rows: rows.publish(target))
+    view = target.value
+    free = mock.PropertyMock(return_value=64 << 20)
+    with mock.patch.object(type(wp.get_device(device)), "free_memory", new=free):
+        with test.assertRaisesRegex(MemoryError, r"to 67108864 rows needs [0-9.]+ MiB more device memory; 64\.0 MiB"):
+            pool.grow(64 << 20)
+    test.assertEqual(pool.ready, 64)
+    test.assertIs(target.value, view)
+    test.assertTrue(pool.grow(128))
+
+
+def test_pool_follower_grows_with_its_leader(test, device):
+    """Grow a following pool with its leader."""
+    leader = ContactPool(device=device, rows=100)
+    follower = ContactPool(device=device, rows=50)
     target = type("Target", (), {})()
     # Owners hold their rows; the pool holds them weakly.
     rows = follower.rows((ContactField("value", wp.float32, 1.0),), on_rows=lambda rows: rows.publish(target))
@@ -145,62 +233,148 @@ def test_pool_follower_grows_and_respects_its_bound(test, device):
     test.assertEqual(follower.ready, 400)
     test.assertEqual(rows.rows, 400)
     test.assertTrue(np.all(target.value.numpy() == 1.0))
-    small = ContactPool(200, device=device, rows=200)
-    with test.assertRaises(ValueError):
-        leader.follow(small)
 
 
-def test_pipeline_grows_after_overflow_and_warns(test, device):
-    """Flag an overflowing collision pass, grow on service and warn, then match a fixed pipeline."""
+def test_deprecated_budgets_warn_and_are_ignored(test, device):
+    """Warn once per use of a retired rigid contact budget, and ignore its value."""
     model = _build_boxes(device)
-    fixed = newton.CollisionPipeline(model, deterministic=True)
-    test.assertFalse(fixed._contact_pool.growable)
-    expected = fixed.contacts()
-    state = model.state()
-    fixed.collide(state, expected)
-    test.assertEqual(int(expected.rigid_contact_count.numpy()[0]), CONTACTS)
-    with _small_pool_policy(1, 8):
-        _pipeline_grows_after_overflow(test, device, model, state, expected)
-
-
-def _pipeline_grows_after_overflow(test, device, model, state, expected):
-    fixed_bound = expected.rigid_contact_max
-    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    with test.assertWarns(DeprecationWarning):
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=5)
     contacts = pipeline.contacts()
-    test.assertEqual(contacts.rigid_contact_max, 8)
-    test.assertEqual(pipeline.rigid_contact_ready, 8)
-    test.assertEqual(pipeline.rigid_contact_max, fixed_bound)
-    pipeline.collide(state, contacts)
-    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), CONTACTS, "the count keeps the demand")
-    test.assertTrue(pipeline.narrow_phase.buffer_capacity_status()["contacts"])
-    with test.assertRaisesRegex(RuntimeError, "contacts"):
-        pipeline.narrow_phase.check_buffer_capacity()
-    wp.synchronize_device(device)
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        test.assertTrue(pipeline.service_capacity())
-    test.assertTrue(any("reached the 8 ready rows" in str(w.message) for w in caught))
-    test.assertEqual(contacts.rigid_contact_max, 2 * CONTACTS)
-    test.assertEqual(contacts.rigid_contact_shape0.shape, (2 * CONTACTS,))
-    test.assertEqual(pipeline._sort_key_array.shape, (2 * CONTACTS,))
-    test.assertTrue(pipeline.narrow_phase.buffer_capacity_status(clear=True)["contacts"], "the flag stays")
-    pipeline.collide(state, contacts)
-    test.assertFalse(pipeline.narrow_phase.buffer_capacity_status()["contacts"])
+    test.assertEqual(contacts.rigid_contact_max, contact_pool.initial_rows(WORLDS))
+    with test.assertWarns(DeprecationWarning):
+        test.assertEqual(pipeline.rigid_contact_max, contacts.rigid_contact_max)
+    with test.assertWarns(DeprecationWarning):
+        model.rigid_contact_max = 5
+    with test.assertWarns(DeprecationWarning):
+        test.assertEqual(model.rigid_contact_max, 5, "kept for code that reads it back; nothing sizes by it")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        later = newton.CollisionPipeline(model).contacts()
+    test.assertEqual(later.rigid_contact_max, contacts.rigid_contact_max, "the model value sizes nothing")
+    builder = newton.ModelBuilder()
+    with test.assertWarns(DeprecationWarning):
+        builder.num_rigid_contacts_per_world = 3
+    with test.assertWarns(DeprecationWarning):
+        test.assertIsNone(builder.num_rigid_contacts_per_world)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        pipeline.collide(model.state(), contacts)
+    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), CONTACTS)
+
+
+def test_collide_outside_capture_grows_before_reading(test, device):
+    """Grow and rerun a collision pass outside capture that overflows its rows: no contact dropped, no flag."""
+    model = _build_boxes(device, worlds=1, boxes=40)
+    reference = newton.CollisionPipeline(model)
+    expected = newton.Contacts(1024, 0, device=device)
+    reference.collide(model.state(), expected)
+    demand = int(expected.rigid_contact_count.numpy()[0])
+    test.assertGreater(demand, 64)
+    with _small_pool_policy(64, 64):
+        pipeline = newton.CollisionPipeline(model, deterministic=True)
+        contacts = pipeline.contacts()
+        test.assertEqual(contacts.rigid_contact_max, 64)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            pipeline.collide(model.state(), contacts)
+    test.assertEqual(contacts.rigid_contact_max, 2 * demand)
+    test.assertEqual(pipeline._sort_key_array.shape, (2 * demand,))
+    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), demand)
+    test.assertFalse(any(pipeline.narrow_phase.buffer_capacity_status().values()))
     np.testing.assert_array_equal(_records(contacts), _records(expected))
-    wp.synchronize_device(device)
-    test.assertFalse(pipeline.service_capacity(), "half the ready rows or less: no growth")
+    test.assertTrue(pipeline.service_capacity(), "graphs captured before the growth must be recaptured")
+    test.assertFalse(pipeline.service_capacity())
+
+
+def test_service_measures_a_state_before_capture(test, device):
+    """Measure a state's demand outside capture: grow to it without writing any Contacts or matching history."""
+    model = _build_boxes(device)
+    resting, lifted = model.state(), model.state()
+    body_q = lifted.body_q.numpy()
+    body_q[:, 2] += 1.0
+    lifted.body_q.assign(body_q)
+    with _small_pool_policy(1, 8):
+        reference = newton.CollisionPipeline(model, contact_matching="latest")
+        expected = reference.contacts()
+        pipeline = newton.CollisionPipeline(model, contact_matching="latest")
+        contacts = pipeline.contacts()
+        test.assertEqual(contacts.rigid_contact_max, 8)
+        generation = contacts.contact_generation.numpy()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            test.assertTrue(pipeline.service_capacity(resting), "graphs captured before must be recaptured")
+        test.assertEqual(contacts.rigid_contact_max, 2 * CONTACTS)
+        test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 0, "the measurement writes no Contacts")
+        np.testing.assert_array_equal(contacts.contact_generation.numpy(), generation)
+        test.assertFalse(any(pipeline.narrow_phase.buffer_capacity_status().values()))
+        test.assertFalse(pipeline.service_capacity(resting), "the rows hold the measured demand")
+        # Measuring a contact-free state between two frames keeps the second frame's matches.
+        for state in (resting, None, resting):
+            if state is None:
+                pipeline.service_capacity(lifted)
+                continue
+            for run_pipeline, run_contacts in ((reference, expected), (pipeline, contacts)):
+                run_pipeline.collide(state, run_contacts)
+    test.assertEqual(contacts.rigid_contact_max, expected.rigid_contact_max)
+    match = contacts.rigid_contact_match_index
+    np.testing.assert_array_equal(_records(contacts, match), _records(expected, expected.rigid_contact_match_index))
+    test.assertTrue(np.all(match.numpy()[:CONTACTS] >= 0), "resting contacts match their previous frame")
+
+
+def test_capture_after_measuring_holds_every_contact(test, device):
+    """Capture a collision pass after measuring the state it starts from: its first replay drops nothing."""
+    model = _build_boxes(device)
+    resting, lifted = model.state(), model.state()
+    body_q = lifted.body_q.numpy()
+    body_q[:, 2] += 1.0
+    lifted.body_q.assign(body_q)
+    with _small_pool_policy(1, 8):
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        # Load the modules outside capture with a contact-free pass: no growth.
+        pipeline.collide(lifted, contacts)
+        test.assertEqual(contacts.rigid_contact_max, 8)
+        test.assertTrue(pipeline.service_capacity(resting))
+        with wp.ScopedCapture(device=device) as capture:
+            pipeline.collide(resting, contacts)
+        wp.capture_launch(capture.graph)
+        wp.synchronize_device(device)
+    test.assertFalse(pipeline.narrow_phase.buffer_capacity_status()["contacts"])
+    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), CONTACTS)
+    test.assertFalse(pipeline.service_capacity())
+
+
+def test_example_runner_measures_and_recaptures(test, device):
+    """Measure an example's starting state before its first frame and recapture its graph only when rows grew."""
+    from newton.examples import _service_contact_capacity  # noqa: PLC0415
+
+    model = _build_boxes(device)
+    example = type("Example", (), {})()
+    captures = []
+    with _small_pool_policy(1, 8):
+        example.collision_pipeline = newton.CollisionPipeline(model)
+        example.contacts = example.collision_pipeline.contacts()
+        example.state_0 = model.state()
+        example.graph = object()
+        example.capture = lambda: captures.append(example.contacts.rigid_contact_max)
+        _service_contact_capacity(example, example.state_0)
+        test.assertEqual(captures, [2 * CONTACTS])
+        _service_contact_capacity(example)
+        _service_contact_capacity(example, example.state_0)
+    test.assertEqual(captures, [2 * CONTACTS], "no growth, no recapture")
 
 
 def test_pipeline_growth_without_overflow_matches_fixed(test, device):
-    """Grow past half the ready rows without dropping contacts; every pass equals the fixed pipeline's."""
+    """Grow past half the ready rows without dropping contacts; every pass equals a larger buffer's."""
     model = _build_boxes(device)
-    fixed = newton.CollisionPipeline(model)
-    expected = fixed.contacts()
+    reference = newton.CollisionPipeline(model)
+    expected = reference.contacts()
     with _small_pool_policy(16, 8):
         pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
         test.assertEqual(contacts.rigid_contact_max, 64)
-        _collide_like_fixed(test, device, model, fixed, expected, pipeline, contacts)
+        _collide_like_fixed(test, device, model, reference, expected, pipeline, contacts)
     test.assertEqual(contacts.rigid_contact_max, 96)
 
 
@@ -239,7 +413,7 @@ def _feather_pgs_run(device, steps, *, policy=None, warmstart=False, after_colli
 
 
 def test_feather_pgs_grows_mid_run(test, device):
-    """Grow FeatherPGS's per-contact buffers with the pipeline mid-run and keep the physics of a fixed run."""
+    """Grow FeatherPGS's per-contact buffers with the pipeline mid-run and keep the physics of a larger run."""
     reference, _, _, _ = _feather_pgs_run(device, 6)
     state, contacts, pipeline, solver = _feather_pgs_run(device, 6, policy=_small_pool_policy(16, 8))
     test.assertEqual(pipeline._contact_pool.growth_count, 1)
@@ -252,11 +426,11 @@ def test_feather_pgs_grows_mid_run(test, device):
     np.testing.assert_allclose(state.body_qd.numpy(), reference.body_qd.numpy(), rtol=0.0, atol=1.0e-4)
 
 
-def test_feather_pgs_overflow_is_flagged_and_raised(test, device):
-    """Flag the overflowing step in the solver's capacity status, then grow and keep stepping."""
-    state, _, _, solver = _feather_pgs_run(device, 1, policy=_small_pool_policy(1, 8))
-    with test.assertRaisesRegex(RuntimeError, "capacity exceeded"):
-        solver.check_constraint_capacity()
+def test_feather_pgs_follows_a_pass_that_grew(test, device):
+    """Hand FeatherPGS the rows a collision pass grew to before it reads them, so no constraint is lost."""
+    state, contacts, _, solver = _feather_pgs_run(device, 2, policy=_small_pool_policy(1, 8))
+    solver.check_constraint_capacity()
+    test.assertEqual(contacts.rigid_contact_max, 2 * CONTACTS)
     test.assertEqual(solver._contact_pool.ready, 2 * CONTACTS)
     test.assertTrue(np.all(np.isfinite(state.body_q.numpy())))
 
@@ -277,7 +451,7 @@ def test_matching_and_warm_start_survive_growth(test, device):
 
 
 def test_graph_capture_recapture_after_growth(test, device):
-    """Replay a graph captured before a growth safely, then recapture to use the new rows."""
+    """Flag a replayed overflow, grow on service, replay the stale graph safely, then recapture."""
     with _small_pool_policy(1, 8):
         _graph_capture_recapture_after_growth(test, device)
 
@@ -288,6 +462,7 @@ def _graph_capture_recapture_after_growth(test, device):
     solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=8)
     contacts = pipeline.contacts()
     state_0, state_1, control = model.state(), model.state(), model.control()
+    resting = state_0.body_q.numpy()
 
     def simulate():
         pipeline.collide(state_0, contacts)
@@ -303,12 +478,22 @@ def _graph_capture_recapture_after_growth(test, device):
             simulate()
         return capture.graph
 
-    simulate()  # warm up outside capture: module loads and lazy setup
+    # Warm up outside capture (module loads, lazy setup) with the boxes in the air: no contacts, no growth.
+    lifted = resting.copy()
+    lifted[:, 2] += 1.0
+    state_0.body_q.assign(lifted)
+    simulate()
+    test.assertEqual(contacts.rigid_contact_max, 8)
+    state_0.body_q.assign(resting)
+    state_0.body_qd.zero_()
     old_graph = capture_step()
     wp.capture_launch(old_graph)
     wp.synchronize_device(device)
     test.assertTrue(pipeline.narrow_phase.buffer_capacity_status(clear=True)["contacts"])
-    test.assertTrue(pipeline.service_capacity())
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        test.assertTrue(pipeline.service_capacity())
+    test.assertTrue(any("reached the 8 ready rows" in str(w.message) for w in caught))
     test.assertEqual(contacts.rigid_contact_max, 2 * CONTACTS)
     # A stale replay stays within mapped memory at its old extents: still flagged, still finite.
     wp.capture_launch(old_graph)
@@ -328,7 +513,7 @@ def _graph_capture_recapture_after_growth(test, device):
 def test_reserve_grows_now_or_at_the_next_service(test, device):
     """Grow to a reservation outside capture; defer it, with a warning, during capture; report each growth once."""
     with _small_pool_policy(1, 8):
-        pool = ContactPool(1000, device=device, rows=8)
+        pool = ContactPool(device=device, rows=8)
         target = type("Target", (), {})()
         rows = pool.rows((ContactField("value", wp.int32, -1),), on_rows=lambda rows: rows.publish(target))
         test.assertFalse(pool.reserve(8))
@@ -337,8 +522,8 @@ def test_reserve_grows_now_or_at_the_next_service(test, device):
         test.assertEqual(rows.rows, 104)
         test.assertTrue(pool.service(), "a growth outside the service is reported once")
         test.assertFalse(pool.service())
-        with test.assertRaisesRegex(ValueError, "cannot hold"):
-            pool.reserve(1001)
+        with test.assertRaisesRegex(MemoryError, "cannot back"):
+            pool.reserve(pool.bound + 1)
         if not wp.get_device(device).is_cuda:
             return
         with warnings.catch_warnings(record=True) as caught:
@@ -390,7 +575,7 @@ def _mujoco_contacts_grow_a_pipeline_buffer(test, device, model, solver, referen
         solver.step(state_0, state_1, control, None, 1.0 / 240.0)
         state_0, state_1 = state_1, state_0
     nacon = int(solver.mjw_data.nacon.numpy()[0])
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=4 * naconmax)
+    pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     test.assertEqual(contacts.rigid_contact_max, 8)
     test.assertGreater(naconmax, 8)
@@ -407,7 +592,7 @@ def _mujoco_contacts_grow_a_pipeline_buffer(test, device, model, solver, referen
 
     if not wp.get_device(device).is_cuda:
         return
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=4 * naconmax)
+    pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
 
     def simulate():
@@ -451,8 +636,7 @@ def test_newton_contacts_feed_mujoco_below_naconmax(test, device):
     """
     model = _build_boxes(device)
     model.request_contact_attributes("force")
-    reference = newton.CollisionPipeline(model, rigid_contact_max=512)
-    test.assertFalse(reference._contact_pool.growable)
+    reference = newton.CollisionPipeline(model)
     with _small_pool_policy(16, 8):
         _newton_contacts_feed_mujoco_below_naconmax(test, device, model, reference)
 
@@ -460,7 +644,7 @@ def test_newton_contacts_feed_mujoco_below_naconmax(test, device):
 def _newton_contacts_feed_mujoco_below_naconmax(test, device, model, reference):
     runs = [
         (pipeline, pipeline.contacts(), _mujoco(model, use_mujoco_contacts=False), model.state(), model.state())
-        for pipeline in (reference, newton.CollisionPipeline(model, rigid_contact_max=512))
+        for pipeline in (reference, newton.CollisionPipeline(model))
     ]
     (_, fixed, _, fixed_state, _), (pipeline, contacts, solver, state, _) = runs
     naconmax = solver.mjw_data.naconmax
@@ -484,7 +668,7 @@ def _newton_contacts_feed_mujoco_below_naconmax(test, device, model, reference):
 
     if not wp.get_device(device).is_cuda:
         return
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=512)
+    pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     state_0 = model.state()
     state_0.assign(state)
@@ -522,21 +706,19 @@ def test_xpbd_update_contacts_after_growth(test, device):
     model = _build_boxes(device)
     model.request_contact_attributes("force")
     solver = newton.solvers.SolverXPBD(model, iterations=4)
-    with _small_pool_policy(1, 8):
-        pipeline = newton.CollisionPipeline(model)
-        contacts = pipeline.contacts()
-        state_0, state_1, control = model.state(), model.state(), model.control()
-        pipeline.collide(state_0, contacts)
-        solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
-        solver.update_contacts(contacts)
-        forces = contacts.force.numpy()[:8]
-        test.assertTrue(np.any(forces != 0.0))
-        wp.synchronize_device(device)
-        test.assertTrue(pipeline.service_capacity())
-        test.assertEqual(contacts.rigid_contact_max, 2 * CONTACTS)
-        solver.update_contacts(contacts)
-    np.testing.assert_array_equal(contacts.force.numpy()[:8], forces)
-    test.assertTrue(np.all(contacts.force.numpy()[8 : 2 * CONTACTS] == 0.0))
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_0, state_1, control = model.state(), model.state(), model.control()
+    pipeline.collide(state_0, contacts)
+    solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+    solver.update_contacts(contacts)
+    rows = contacts.rigid_contact_max
+    forces = contacts.force.numpy()[:rows]
+    test.assertTrue(np.any(forces != 0.0))
+    test.assertTrue(contacts.reserve_rigid_contacts(4 * rows))
+    solver.update_contacts(contacts)
+    np.testing.assert_array_equal(contacts.force.numpy()[:rows], forces)
+    test.assertTrue(np.all(contacts.force.numpy()[rows : 4 * rows] == 0.0))
 
 
 def test_kamino_contacts_grow_a_pipeline_buffer(test, device):
@@ -553,9 +735,7 @@ def test_kamino_contacts_grow_a_pipeline_buffer(test, device):
     solver = newton.solvers.SolverKamino(model, config=newton.solvers.SolverKamino.Config(use_collision_detector=True))
     capacity = solver._contacts_kamino.model_max_contacts_host
     with _small_pool_policy(1, 1):
-        pipeline = newton.CollisionPipeline(model)
-        contacts = pipeline.contacts()
-        test.assertEqual(pipeline.rigid_contact_max, capacity)
+        contacts = newton.CollisionPipeline(model).contacts()
         test.assertLess(contacts.rigid_contact_max, capacity)
         state_0, state_1 = model.state(), model.state()
         solver.step(state_0, state_1, None, None, 1.0 / 240.0)
@@ -567,30 +747,30 @@ def test_kamino_contacts_grow_a_pipeline_buffer(test, device):
     test.assertTrue(np.all(contacts.rigid_contact_shape0.numpy()[:active] >= 0))
 
 
-def test_vbd_contact_buffers_hold_the_bound(test, device):
-    """Size VBD's per-contact buffers by the contacts' bound, so a growth needs no resize (none in a capture)."""
+def test_vbd_contact_buffers_follow_the_contacts(test, device):
+    """Grow VBD's per-contact state with the contacts it consumes, keeping its contents."""
     model = _build_boxes(device, color=True)
     solver = newton.solvers.SolverVBD(model, iterations=2, rigid_compliant_alm=True)
-    with _small_pool_policy(1, 8):
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=512)
-        contacts = pipeline.contacts()
-        state_0, state_1, control = model.state(), model.state(), model.control()
-        pipeline.collide(state_0, contacts)
-        solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
-        penalty = solver.body_body_contact_penalty_k
-        wp.synchronize_device(device)
-        test.assertTrue(pipeline.service_capacity())
-        test.assertEqual(contacts.rigid_contact_max, 2 * CONTACTS)
-        pipeline.collide(state_1, contacts)
-        solver.step(state_1, state_0, control, contacts, 1.0 / 240.0)
-    test.assertIs(solver.body_body_contact_penalty_k, penalty)
-    test.assertEqual(penalty.shape, (512,))
-    test.assertEqual(contacts.rigid_contact_bound, 512)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_0, state_1, control = model.state(), model.state(), model.control()
+    pipeline.collide(state_0, contacts)
+    solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+    rows = contacts.rigid_contact_max
+    test.assertEqual(solver.body_body_contact_penalty_k.shape, (rows,))
+    penalty = solver.body_body_contact_penalty_k.numpy().copy()
+    test.assertTrue(contacts.reserve_rigid_contacts(4 * rows))
+    pipeline.collide(state_1, contacts)
+    solver.step(state_1, state_0, control, contacts, 1.0 / 240.0)
+    test.assertEqual(solver.body_body_contact_penalty_k.shape, (4 * rows,))
+    test.assertEqual(solver._rigid_contact_body0.shape, (4 * rows,))
+    test.assertTrue(np.all(np.isfinite(solver.body_body_contact_penalty_k.numpy()[:rows])))
+    test.assertEqual(penalty.shape, (rows,))
     test.assertTrue(np.all(np.isfinite(state_0.body_q.numpy())))
 
 
 def test_coupled_entry_contacts_grow_with_their_source(test, device):
-    """Grow a coupled entry's filtered buffer with its source's pool, and keep reusing it."""
+    """Grow a coupled entry's filtered buffer with its source, and keep reusing it."""
     from newton.solvers.experimental.coupled import SolverCoupled  # noqa: PLC0415
 
     model = _build_boxes(device)
@@ -612,36 +792,30 @@ def test_coupled_entry_contacts_grow_with_their_source(test, device):
         test.assertEqual(filtered.rigid_contact_max, 8)
         state = model.state()
         pipeline.collide(state, contacts)
-        wp.synchronize_device(device)
-        test.assertTrue(pipeline.service_capacity())
     test.assertEqual(contacts.rigid_contact_max, 2 * CONTACTS)
     test.assertEqual(filtered.rigid_contact_max, 2 * CONTACTS)
-    pipeline.collide(state, contacts)
     test.assertIs(coupled.entry_contacts("A", contacts), filtered)
     np.testing.assert_array_equal(_records(filtered), _records(contacts))
 
 
-def test_contact_kinematics_outputs_sized_by_the_bound(test, device):
-    """Evaluate contact kinematics into outputs sized by the bound, before and after a growth."""
+def test_contact_kinematics_outputs_hold_the_rows(test, device):
+    """Evaluate contact kinematics into outputs of at least the contacts' rows, before and after a growth."""
     model = _build_boxes(device)
     state = model.state()
-    with _small_pool_policy(16, 8):
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=512)
-        contacts = pipeline.contacts()
-        distance = wp.empty(pipeline.rigid_contact_max, dtype=float, device=device)
-        pipeline.collide(state, contacts)
-        newton.eval_rigid_contact_kinematics(model, state, contacts, out_distance=distance)
-        before = np.sort(distance.numpy()[:CONTACTS])
-        wp.synchronize_device(device)
-        test.assertTrue(pipeline.service_capacity())
-        test.assertEqual(contacts.rigid_contact_max, 2 * CONTACTS)
-        pipeline.collide(state, contacts)
-        newton.eval_rigid_contact_kinematics(model, state, contacts, out_distance=distance)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    rows = contacts.rigid_contact_max
+    distance = wp.empty(4 * rows, dtype=float, device=device)
+    pipeline.collide(state, contacts)
+    newton.eval_rigid_contact_kinematics(model, state, contacts, out_distance=distance)
+    before = np.sort(distance.numpy()[:CONTACTS])
+    test.assertTrue(contacts.reserve_rigid_contacts(4 * rows))
+    pipeline.collide(state, contacts)
+    newton.eval_rigid_contact_kinematics(model, state, contacts, out_distance=distance)
     np.testing.assert_allclose(np.sort(distance.numpy()[:CONTACTS]), before, rtol=0.0, atol=1.0e-7)
-    test.assertEqual(contacts.rigid_contact_bound, pipeline.rigid_contact_max)
     with test.assertRaisesRegex(ValueError, "expected"):
         newton.eval_rigid_contact_kinematics(
-            model, state, contacts, out_distance=wp.empty(64, dtype=float, device=device)
+            model, state, contacts, out_distance=wp.empty(rows, dtype=float, device=device)
         )
 
 
@@ -654,29 +828,33 @@ cuda_devices = get_cuda_test_devices()
 # Overflowing passes print the narrow phase's capacity warning.
 for name, function, check_output in (
     ("test_pool_rows_keep_contents_and_fill_new_rows", test_pool_rows_keep_contents_and_fill_new_rows, True),
-    ("test_pool_follower_grows_and_respects_its_bound", test_pool_follower_grows_and_respects_its_bound, True),
-    ("test_pipeline_grows_after_overflow_and_warns", test_pipeline_grows_after_overflow_and_warns, False),
+    ("test_pool_bound_is_the_hardware_limit", test_pool_bound_is_the_hardware_limit, True),
+    ("test_pool_follower_grows_with_its_leader", test_pool_follower_grows_with_its_leader, True),
+    ("test_deprecated_budgets_warn_and_are_ignored", test_deprecated_budgets_warn_and_are_ignored, True),
+    ("test_collide_outside_capture_grows_before_reading", test_collide_outside_capture_grows_before_reading, True),
+    ("test_service_measures_a_state_before_capture", test_service_measures_a_state_before_capture, True),
+    ("test_example_runner_measures_and_recaptures", test_example_runner_measures_and_recaptures, True),
     ("test_pipeline_growth_without_overflow_matches_fixed", test_pipeline_growth_without_overflow_matches_fixed, True),
     ("test_feather_pgs_grows_mid_run", test_feather_pgs_grows_mid_run, True),
-    ("test_feather_pgs_overflow_is_flagged_and_raised", test_feather_pgs_overflow_is_flagged_and_raised, False),
+    ("test_feather_pgs_follows_a_pass_that_grew", test_feather_pgs_follows_a_pass_that_grew, True),
     ("test_matching_and_warm_start_survive_growth", test_matching_and_warm_start_survive_growth, True),
     ("test_reserve_grows_now_or_at_the_next_service", test_reserve_grows_now_or_at_the_next_service, True),
     ("test_mujoco_contacts_grow_a_pipeline_buffer", test_mujoco_contacts_grow_a_pipeline_buffer, False),
     ("test_newton_contacts_feed_mujoco_below_naconmax", test_newton_contacts_feed_mujoco_below_naconmax, True),
-    ("test_xpbd_update_contacts_after_growth", test_xpbd_update_contacts_after_growth, False),
+    ("test_xpbd_update_contacts_after_growth", test_xpbd_update_contacts_after_growth, True),
     ("test_kamino_contacts_grow_a_pipeline_buffer", test_kamino_contacts_grow_a_pipeline_buffer, True),
-    ("test_vbd_contact_buffers_hold_the_bound", test_vbd_contact_buffers_hold_the_bound, False),
-    ("test_coupled_entry_contacts_grow_with_their_source", test_coupled_entry_contacts_grow_with_their_source, False),
-    ("test_contact_kinematics_outputs_sized_by_the_bound", test_contact_kinematics_outputs_sized_by_the_bound, True),
+    ("test_vbd_contact_buffers_follow_the_contacts", test_vbd_contact_buffers_follow_the_contacts, True),
+    ("test_coupled_entry_contacts_grow_with_their_source", test_coupled_entry_contacts_grow_with_their_source, True),
+    ("test_contact_kinematics_outputs_hold_the_rows", test_contact_kinematics_outputs_hold_the_rows, True),
 ):
     add_function_test(TestContactPool, name, function, devices=devices, check_output=check_output)
-add_function_test(
-    TestContactPool,
-    "test_graph_capture_recapture_after_growth",
-    test_graph_capture_recapture_after_growth,
-    devices=cuda_devices,
-    check_output=False,
-)
+for name, function in (
+    ("test_reservation_holds_the_device_bound", test_reservation_holds_the_device_bound),
+    ("test_growth_past_free_memory_raises_before_changing", test_growth_past_free_memory_raises_before_changing),
+    ("test_graph_capture_recapture_after_growth", test_graph_capture_recapture_after_growth),
+    ("test_capture_after_measuring_holds_every_contact", test_capture_after_measuring_holds_every_contact),
+):
+    add_function_test(TestContactPool, name, function, devices=cuda_devices, check_output=False)
 
 
 if __name__ == "__main__":

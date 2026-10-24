@@ -32,7 +32,7 @@ class TestMeshShapeAABB(unittest.TestCase):
 
     def _get_shape_aabb(self, model, shape_idx=0):
         """Run collision pipeline and return the world-space AABB for a shape."""
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=100)
+        pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
         state = model.state()
         newton.eval_fk(model, model.joint_q, model.joint_qd, state)
@@ -84,7 +84,7 @@ class TestMeshShapeAABB(unittest.TestCase):
         builder.add_ground_plane()
         model = builder.finalize()
 
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=200)
+        pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
         state = model.state()
         newton.eval_fk(model, model.joint_q, model.joint_qd, state)

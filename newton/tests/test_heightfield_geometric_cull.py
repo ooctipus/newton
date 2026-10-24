@@ -30,9 +30,7 @@ FLAGS = {
 def pipeline(model, enabled, **kwargs):
     """Select the complete stock collision owner with fixed capacities."""
     with patch.dict(os.environ, {**FLAGS, "NEWTON_HEIGHTFIELD_GEOMETRIC_CULL": str(int(enabled))}):
-        return newton.CollisionPipeline(
-            model, reduce_contacts=True, rigid_contact_max=32768, max_triangle_pairs=32768, **kwargs
-        )
+        return newton.CollisionPipeline(model, reduce_contacts=True, max_triangle_pairs=32768, **kwargs)
 
 
 @wp.kernel

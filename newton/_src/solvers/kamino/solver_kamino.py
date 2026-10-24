@@ -27,15 +27,15 @@ from ...sim import (
     State,
     StateFlags,
 )
-from ...sim.collide import (
+from ..coupled.interface import CouplingInterface
+from ..solver import SolverBase
+from .contact_capacity import (
     _RIGID_CONTACT_MAX_NEIGHBORS_PER_SHAPE,
     _RIGID_CONTACT_MIN_CAPACITY,
     _RIGID_CONTACTS_PER_MESH_PAIR,
     _RIGID_CONTACTS_PER_PRIMITIVE_PAIR,
-    _estimate_rigid_contact_max,
+    estimate_rigid_contact_capacity,
 )
-from ..coupled.interface import CouplingInterface
-from ..solver import SolverBase
 
 if TYPE_CHECKING:
     from .config import (
@@ -60,7 +60,7 @@ def _estimate_dvi_contacts_per_world(model, newton_model: Model) -> int:
     """Estimate DVI contact capacity using the collision pipeline's weights."""
     theoretical = max(model.geoms.world_minimum_contacts, default=0)
     if model.size.num_worlds == 1:
-        heuristic = _estimate_rigid_contact_max(newton_model)
+        heuristic = estimate_rigid_contact_capacity(newton_model)
         return min(theoretical, heuristic) if theoretical > 0 else heuristic
 
     world_count = model.size.num_worlds
@@ -195,6 +195,9 @@ class SolverKamino(SolverBase, CouplingInterface):
         """
         Configurations for the collision detector.\n
         See :class:`CollisionDetectorConfig` for more details.\n
+        Its contact capacity (``max_contacts_per_world``, or the estimate capped at
+        ``max_contacts``) also sizes the container of Newton's contacts that Kamino
+        converts when ``use_collision_detector`` is off.\n
         If `None`, the default configuration will be used.
         """
 
@@ -465,7 +468,7 @@ class SolverKamino(SolverBase, CouplingInterface):
                 self.sparse_jacobian = self.dynamics_solver == "dvi"
 
             # Default-initialize any sub-configurations that were not explicitly provided by the user
-            if self.collision_detector is None and self.use_collision_detector:
+            if self.collision_detector is None:
                 self.collision_detector = config.CollisionDetectorConfig()
             if self.fk is None and self.use_fk_solver:
                 self.fk = config.ForwardKinematicsSolverConfig()
@@ -793,25 +796,24 @@ class SolverKamino(SolverBase, CouplingInterface):
                 config=collision_config,
             )
 
-        # Capture a reference to the contacts container
+        # Capture a reference to the contacts container. Newton's Contacts that update_contacts()
+        # writes declare their size there (reserve_rigid_contacts).
         self._contacts_kamino = None
         if self._collision_detector_kamino is not None:
             self._contacts_kamino = self._collision_detector_kamino.contacts
-            # Keep Newton's externally allocated contact buffer in sync with Kamino.
-            # The contacts container is `None` if no contacts are possible.
-            model.rigid_contact_max = (
-                self._contacts_kamino.model_max_contacts_host if self._contacts_kamino is not None else 0
-            )
         else:
-            # If collision detector is disabled allocate contacts based on the capacity estimate from the Newton CollisionPipeline.
+            # Without the detector Kamino converts Newton's contacts into its own fixed-capacity
+            # container, sized as the detector's would be: per world, the collision detector config's
+            # max_contacts_per_world, or an estimate from the model's shapes capped at its max_contacts.
             world_count = self.model.world_count
-            if self.model.rigid_contact_max == 0:
-                estimated_contacts = _estimate_rigid_contact_max(model)
-                # Write back to the model to ensure the CollisionPipeline capacity is consistent.
-                model.rigid_contact_max = ((estimated_contacts + world_count - 1) // world_count) * world_count
-
-            # Round up to the nearest multiple of the world count to account for Kamino's per world capacity.
-            world_max_contacts = [(model.rigid_contact_max + world_count - 1) // world_count] * world_count
+            detector_config = self._config.collision_detector
+            per_world = detector_config.max_contacts_per_world if detector_config is not None else None
+            if per_world is None:
+                capacity = estimate_rigid_contact_capacity(model)
+                if detector_config is not None and detector_config.max_contacts is not None:
+                    capacity = min(capacity, int(detector_config.max_contacts))
+                per_world = (capacity + world_count - 1) // world_count
+            world_max_contacts = [int(per_world)] * world_count
             self._contacts_kamino = self._kamino.ContactsKamino(
                 # TODO: model=self._model_kamino,
                 capacity=world_max_contacts,
@@ -1140,18 +1142,6 @@ class SolverKamino(SolverBase, CouplingInterface):
         # Skip the conversion if contacts have not been allocated
         if self._contacts_kamino is None or self._contacts_kamino.model_max_contacts_host == 0:
             return
-
-        # Kamino-generated contacts must fit in the Newton output buffer: declare them,
-        # which grows a buffer from CollisionPipeline.contacts() outside graph capture.
-        if self._detector is not None:
-            try:
-                contacts.reserve_rigid_contacts(self._contacts_kamino.model_max_contacts_host)
-            except ValueError as error:
-                raise RuntimeError(
-                    f"Contacts container has insufficient capacity for Kamino contacts: "
-                    f"model_max_contacts={self._contacts_kamino.model_max_contacts_host} > "
-                    f"contacts.rigid_contact_bound={contacts.rigid_contact_bound}"
-                ) from error
 
         # If all checks pass, proceed to convert contacts from Kamino to Newton format
         self._kamino.convert_contacts_kamino_to_newton(

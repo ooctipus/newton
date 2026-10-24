@@ -5863,20 +5863,9 @@ class SolverFeatherPGS(SolverBase):
                     requires_grad=requires_grad,
                 )
 
-        max_contacts = int(model.rigid_contact_max)
-        if max_contacts <= 0:
-            # Unified collision pipeline manages its own contact capacity and may
-            # leave model.rigid_contact_max unset. Use the same estimator as collide.py.
-            from ...sim.collide import _estimate_rigid_contact_max  # noqa: PLC0415
-
-            max_contacts = int(_estimate_rigid_contact_max(model))
-        max_contacts = max(max_contacts, 1)
-        # Every per-contact buffer holds this pool's ready rows: they start at the pool's
-        # initial rows and grow with the contact stream the solver consumes (see
-        # _follow_contacts), up to the bound. Buffers with gradients stay at the bound.
-        self._contact_pool = ContactPool(
-            max_contacts, device=device, world_count=self.world_count, rows=max_contacts if requires_grad else None
-        )
+        # Every per-contact buffer holds this pool's ready rows: they start from the data and grow
+        # with the contact stream the solver consumes (see _follow_contacts).
+        self._contact_pool = ContactPool(device=device, world_count=self.world_count)
         contact_fields = [
             ContactField(name, wp.int32, requires_grad=requires_grad)
             for name in (
@@ -5925,7 +5914,7 @@ class SolverFeatherPGS(SolverBase):
         frame_reuse, self._patch_frame_reuse_reason = self._patch_frame_reuse()
         self._friction_patches = _FrictionPatchState(
             model,
-            max_contacts,
+            self._contact_pool.ready,
             self._friction_anchors_enabled,
             self._friction_patch_phi,
             reuse_frames=frame_reuse,
@@ -8007,12 +7996,11 @@ class SolverFeatherPGS(SolverBase):
                 source.follow(pool)
             if contacts.rigid_contact_max > pool.ready:
                 pool.grow(contacts.rigid_contact_max)
-        except (ValueError, RuntimeError) as error:
-            raise ValueError(
-                "FeatherPGS contact capacity mismatch: received "
-                f"{contacts.rigid_contact_max} slots, but solver scratch holds {pool.ready} and is bounded by "
-                f"{pool.bound}. Set model.rigid_contact_max before constructing the solver, and grow the "
-                "contact buffers before graph capture (CollisionPipeline.service_capacity)."
+        except RuntimeError as error:
+            raise RuntimeError(
+                f"FeatherPGS received {contacts.rigid_contact_max} contact rows during CUDA graph capture, but its "
+                f"per-contact scratch holds {pool.ready}: step once outside capture first, and recapture after "
+                "the contact buffers grow (CollisionPipeline.service_capacity)."
             ) from error
 
     @override

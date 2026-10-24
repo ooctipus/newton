@@ -61,8 +61,7 @@ def run_fixture(
             flags = model.body_flags.numpy()
             flags[body] |= int(newton.BodyFlags.KINEMATIC)
             model.body_flags.assign(flags)
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
-        model.rigid_contact_max = 32
+        pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
         for name in ("rigid_contact_stiffness", "rigid_contact_damping", "rigid_contact_friction"):
             setattr(contacts, name, wp.zeros(32, dtype=float))
@@ -133,13 +132,11 @@ def run_native_hydro_fixture(*, articulated=True):
         model = builder.finalize()
         pipeline = newton.CollisionPipeline(
             model,
-            rigid_contact_max=512,
             deterministic=True,
             sdf_hydroelastic_config=HydroelasticSDF.Config(
                 reduce_contacts=True, moment_matching=True, anchor_contact=True, buffer_fraction=1.0
             ),
         )
-        model.rigid_contact_max = 512
         inertia = tuple(x.numpy().copy() for x in (model.body_mass, model.body_com, model.body_inertia))
         initial = model.state()
         newton.eval_fk(model, model.joint_q, model.joint_qd, initial)

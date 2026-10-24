@@ -317,9 +317,7 @@ class TestTerrainLawSurface(unittest.TestCase):
                     shapes.append((shape, tilt, label))
             model = builder.finalize(device=device)
             with patch.dict(os.environ, SUITE_FLAGS):
-                pipeline = tu.terrain_route_pipeline(
-                    model, reduce_contacts=True, rigid_contact_max=1 << 12, max_triangle_pairs=1 << 14
-                )
+                pipeline = tu.terrain_route_pipeline(model, reduce_contacts=True, max_triangle_pairs=1 << 14)
             contacts = pipeline.contacts()
             pipeline.collide(model.state(), contacts)
             count = int(contacts.rigid_contact_count.numpy()[0])

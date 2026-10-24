@@ -135,7 +135,6 @@ def pipeline(model, gate, *, convex_collision=None, environment=None):
         return newton.CollisionPipeline(
             model,
             reduce_contacts=True,
-            rigid_contact_max=1 << 14,
             max_triangle_pairs=1 << 16,
             convex_collision=convex_collision,
         )
@@ -364,13 +363,13 @@ class TestHeightfieldRowGate(unittest.TestCase):
         self.assertIn("NEWTON_HEIGHTFIELD_ROW_GATE=0", record["reason"])
         self.assertIsNone(reference.narrow_phase._heightfield_row_counts)
         with patch.dict(os.environ, {**FLAGS, "NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": "0"}):
-            plain = newton.CollisionPipeline(model, reduce_contacts=True, rigid_contact_max=256)
+            plain = newton.CollisionPipeline(model, reduce_contacts=True)
         self.assertFalse(plain.narrow_phase._heightfield_row_gate)
         self.assertIn(
             "table is off", plain.get_collision_selection()["heightfield"]["primitive_query"]["row_gate"]["reason"]
         )
         with patch.dict(os.environ, {**FLAGS, "NEWTON_HEIGHTFIELD_ROW_GATE": "yes"}), self.assertRaises(ValueError):
-            newton.CollisionPipeline(model, reduce_contacts=True, rigid_contact_max=256)
+            newton.CollisionPipeline(model, reduce_contacts=True)
 
 
 if __name__ == "__main__":

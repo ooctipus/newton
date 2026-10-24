@@ -3,11 +3,17 @@
 
 """Growable storage for per-rigid-contact device fields.
 
-A rigid contact stream sizes several buffers by its contact capacity: the
+A rigid contact stream sizes several buffers by its contact rows: the
 :class:`~newton.Contacts` arrays, the collision pipeline's sort, matching and
 reduction buffers, and a solver's per-contact scratch. :class:`ContactPool`
-holds them at one *ready* row count, starts it small and grows it from the
-measured demand, up to a *bound* (the resolved ``rigid_contact_max``).
+holds them at one *ready* row count, starts it from the data
+(:func:`initial_rows`) and grows it from the measured demand.
+There is no configured contact budget: the only limit, the pool's *bound*, is
+the most rows the platform could ever back, the device memory divided by the
+bytes one row costs in the pool's fields, at most the rows every field's int32
+Warp indices reach (:func:`device_row_limit`, :meth:`ContactField.row_limit`).
+Physical memory runs out long before it: a growth that the device cannot back
+raises :class:`MemoryError` before changing anything.
 
 Each owner declares its fields once as a :class:`ContactRows`. Views of the
 fields always hold the pool's ready rows (times a field's rows per contact,
@@ -15,34 +21,37 @@ plus fixed extra rows), so every launch and in-kernel bound that reads an
 array's length follows the ready count. Growth keeps the contents of the rows
 that existed and gives new rows the values the fields were created with.
 
-Storage depends on whether the rows can grow:
+Storage:
 
-* Rows that start at the bound never grow and are ordinary arrays.
-* On CUDA, growable rows are CUDA virtual memory: one reservation per field,
-  sized by the bound, of which a prefix is mapped (``gpu_components``). The
-  bound costs addresses, not memory. Growth maps more pages behind the same
-  addresses, so a graph captured before a growth still addresses mapped
-  memory. Recapture it before its next replay: launch sizes and array lengths
-  are fixed at capture, and a stale replay would treat rows that growth made
-  contact rows as its scratch.
-* On the CPU, growable rows are reallocated and their prefix copied.
+* On CUDA, rows are CUDA virtual memory: one reservation per field of the
+  pool's bound when the rows were created, of which a prefix is mapped
+  (``gpu_components``). The bound costs addresses, not memory. Growth maps
+  more pages behind the same addresses, so a graph captured before a growth
+  still addresses mapped memory. Recapture it before its next replay: launch
+  sizes and array lengths are fixed at capture, and a stale replay would treat
+  rows that growth made contact rows as its scratch.
+* On the CPU, and for fields with gradients, rows are ordinary arrays that
+  growth reallocates, copying their prefix. The superseded arrays stay alive
+  with their rows, so a stale graph replay still addresses allocated memory.
 
 The demand signal is a sticky device high-water mark of the contact count
 (:meth:`ContactPool.record_demand`), never reset by a collision pass and
 copied each pass into pinned host memory by an asynchronous copy that graphs
 capture. :meth:`ContactPool.service` reads it without synchronizing and grows
-the pool when the high-water mark passes half the ready rows. Overflow stays
-loud: writers drop contacts past the ready rows as before and the capacity
-status reports it; the service then grows and warns.
+the pool when the high-water mark passes half the ready rows. Under graph
+replay, overflow stays loud: writers drop contacts past the ready rows and the
+capacity status reports it; the service then grows and warns. A collision pass
+outside capture checks its own count and grows before anything reads the rows
+(:meth:`newton.CollisionPipeline.collide`).
 
-A writer with a fixed contact capacity (a solver that writes up to N contacts of
-its own into the buffer, such as MuJoCo's or Kamino's collision) declares N with
-:meth:`ContactPool.reserve` (``Contacts.reserve_rigid_contacts``): outside graph
-capture the rows grow to at least N right away; during capture the request warns
-and waits for the next service. Its kernels stay bounded by the ready rows, keep
-the demand in the count and flag the overflow, as the pipeline's writer does.
-Readers that keep per-contact buffers of their own either grow them with the
-pool (:meth:`ContactPool.follow`) or size them by the bound.
+A writer that produces contacts of its own (such as MuJoCo's or Kamino's
+collision) declares how many it may write with :meth:`ContactPool.reserve`
+(``Contacts.reserve_rigid_contacts``): outside graph capture the rows grow to at
+least that many right away; during capture the request warns and waits for the
+next service. Its kernels stay bounded by the ready rows, keep the demand in
+the count and flag the overflow, as the pipeline's writer does. Readers that
+keep per-contact buffers of their own grow them with the pool
+(:meth:`ContactPool.follow`).
 """
 
 from __future__ import annotations
@@ -63,8 +72,16 @@ READY_ROWS_PER_WORLD = 64
 Measured live rigid contacts per world on the 21-task Isaac Lab suite at
 16,384 worlds peak at about 30 (keyboard-so101 29.2, anymald 10.7,
 franka-cabinet 11.6, franka 0.12), so 64 per world holds every task without
-growth while franka-cabinet's estimated 25.2M-slot bound shrinks to 1M ready
-rows.
+growth.
+"""
+
+MIN_READY_ROWS = 4096
+"""Fewest initial ready rows, for scenes of few worlds.
+
+A scene of a few objects starts with room for a few thousand contacts at no
+cost: on CUDA every field maps at least one 2 MiB allocation granule, which
+holds over 87,000 rows of the widest per-contact field (a 24-byte spatial
+vector), and on the CPU it is a few hundred kilobytes.
 """
 
 GROW_THRESHOLD = 0.5
@@ -73,13 +90,18 @@ GROW_THRESHOLD = 0.5
 GROW_FACTOR = 2
 """Grow to this multiple of the high-water mark."""
 
-ROW_QUANTUM = 524_288
-"""Rows that the initial and grown ready counts round up to.
+ROW_QUANTUM = 64
+"""Rows that grown and reserved ready counts round up to.
 
-One 2 MiB CUDA allocation granule holds this many 4-byte rows, so a ready
-count that is a multiple of it maps whole granules for every field whose
-element size is a multiple of 4 bytes. Pools whose bound is at most this many
-rows start at their bound and never grow.
+Launches follow the ready rows, so they stay close to the data; on CUDA the
+mapping itself rounds each field up to whole 2 MiB allocation granules.
+"""
+
+INDEX_LIMIT = 2**31 - 1
+"""Most elements a Warp array may hold: array shapes and kernel indices are int32.
+
+On CUDA, ``gpu_components`` also views each field's whole reservation as one
+byte array, so a CUDA virtual-memory field reserves at most this many bytes.
 """
 
 
@@ -87,14 +109,13 @@ def _round_up(value: int, quantum: int) -> int:
     return -(-int(value) // quantum) * quantum
 
 
-def initial_rows(bound: int, world_count: int) -> int:
-    """Return the initial ready rows of a pool: :data:`READY_ROWS_PER_WORLD` per world, rounded, at most ``bound``.
+def initial_rows(world_count: int) -> int:
+    """Return the initial ready rows of a pool: :data:`READY_ROWS_PER_WORLD` per world, at least :data:`MIN_READY_ROWS`.
 
     Args:
-        bound: The most rows the pool may grow to.
         world_count: Number of worlds of the model.
     """
-    return min(int(bound), _round_up(READY_ROWS_PER_WORLD * max(int(world_count), 1), ROW_QUANTUM))
+    return max(MIN_READY_ROWS, _round_up(READY_ROWS_PER_WORLD * max(int(world_count), 1), ROW_QUANTUM))
 
 
 def reserved_rows(rows: int, bound: int) -> int:
@@ -120,6 +141,24 @@ def grown_rows(high_water: int, ready: int, bound: int) -> int:
     return max(ready, min(int(bound), _round_up(GROW_FACTOR * high_water, ROW_QUANTUM)))
 
 
+def device_row_limit(device, row_bytes: int, index_limit: int = INDEX_LIMIT) -> int:
+    """Return the most rows of ``row_bytes`` bytes that ``device`` could ever back.
+
+    On CUDA that is the device memory divided by the bytes per row; everywhere
+    it is at most ``index_limit``, the rows the fields' int32 indices reach
+    (:meth:`ContactField.row_limit`).
+
+    Args:
+        device: The device of the rows.
+        row_bytes: Bytes one contact row costs in every field of the pool.
+        index_limit: The most rows every field's arrays can index.
+    """
+    device = wp.get_device(device)
+    if device.is_cuda and row_bytes > 0:
+        return min(int(index_limit), int(device.total_memory) // int(row_bytes))
+    return int(index_limit)
+
+
 @dataclass(frozen=True)
 class ContactField:
     """One per-contact device field of a :class:`ContactRows`."""
@@ -137,11 +176,26 @@ class ContactField:
     extra: int = 0
     """Fixed scratch rows past the per-contact rows; growth moves them and gives them ``fill`` again."""
     requires_grad: bool = False
-    """Allocate a gradient; only rows that cannot grow support it."""
+    """Allocate a gradient; such rows are ordinary arrays that growth reallocates."""
 
     def length(self, rows: int) -> int:
         """Return the view length for ``rows`` contact rows."""
         return self.per_contact * rows + self.extra
+
+    @property
+    def row_bytes(self) -> int:
+        """Device bytes one contact row costs in this field, its gradient included."""
+        return self.per_contact * wp.types.type_size_in_bytes(self.dtype) * (2 if self.requires_grad else 1)
+
+    def row_limit(self, virtual: bool) -> int:
+        """Return the most contact rows the field's arrays can index (:data:`INDEX_LIMIT`).
+
+        Args:
+            virtual: Whether the field is CUDA virtual memory, whose reservation
+                is also viewed as bytes.
+        """
+        elements = INDEX_LIMIT // (wp.types.type_size_in_bytes(self.dtype) if virtual else 1)
+        return (elements - self.extra) // self.per_contact
 
 
 @wp.kernel(enable_backward=False)
@@ -155,16 +209,20 @@ def _record_high_water(count: wp.array[wp.int32], high_water: wp.array[wp.int32]
     wp.atomic_max(high_water, 0, count[0])
 
 
+def capturing(device) -> bool:
+    """Whether ``device`` records a graph now: CUDA graph capture, or Warp's CPU graph capture."""
+    device = wp.get_device(device)
+    return bool(device.is_capturing or (device.is_cuda and wp.get_stream(device).is_capturing))
+
+
 def _gpu_components():
     try:
         from gpu_components import backing, fields  # noqa: PLC0415
         from gpu_components.field_data import FieldSpec  # noqa: PLC0415
     except ImportError as error:
         raise ImportError(
-            "Growable rigid contact buffers on CUDA need the gpu_components package (CUDA virtual memory): "
-            "install a checkout with `uv pip install --no-deps -e <gpu-components>`. Buffers whose bound "
-            f"(rigid_contact_max) is at most {READY_ROWS_PER_WORLD} contacts per world, rounded up to "
-            f"{ROW_QUANTUM} rows, need no growth and no package"
+            "Rigid contact buffers on CUDA need the gpu_components package (CUDA virtual memory): "
+            "install a checkout with `uv pip install --no-deps -e <gpu-components>`"
         ) from error
     return backing, fields, FieldSpec
 
@@ -195,7 +253,7 @@ def _release_retired(device) -> None:
     """Release the queued storages of ``device`` that no view references any more."""
     key = str(device)
     pending = [storage for owner_key, storage in _RETIRED if owner_key == key]
-    if not pending or (device.is_cuda and wp.get_stream(device).is_capturing):
+    if not pending or capturing(device):
         return
     backing_ops, fields_ops, _ = _gpu_components()
     owner = _BACKINGS[key]
@@ -216,6 +274,12 @@ def _release_retired(device) -> None:
     _RETIRED[:] = [entry for entry in _RETIRED if entry[1] not in released]
 
 
+def _mark_bound_stale(pool) -> None:
+    # Runs when a member is collected: the bound is recomputed at its next use.
+    if pool is not None:
+        pool._bound_stale = True
+
+
 def _call(callback, contact_rows):
     if callback is None:
         return
@@ -231,31 +295,39 @@ class ContactRows:
     after the views are created and after every growth; owners assign the
     views there (:meth:`publish`) and refresh values derived from
     :attr:`rows`. A bound method is held weakly.
+
+    Args:
+        fields: The fields of the owner.
+        rows: Initial contact rows.
+        reserve: The most contact rows the storage may hold: on CUDA, the
+            addresses each field reserves.
+        device: The device of the fields.
+        on_rows: Called with the rows after creation and every growth.
     """
 
-    def __init__(self, fields, *, rows: int, bound: int, device, on_rows=None):
+    def __init__(self, fields, *, rows: int, reserve: int, device, on_rows=None):
         self.fields = tuple(fields)
         self.rows = int(rows)
-        self.bound = int(bound)
+        self.reserve = int(reserve)
         self.device = wp.get_device(device)
         self.views: dict[str, wp.array] = {}
         self._on_rows = weakref.WeakMethod(on_rows) if hasattr(on_rows, "__self__") else on_rows
         self._storages = []
-        if self.rows < self.bound and self.device.is_cuda:
+        # Arrays a reallocating growth replaced; a stale graph replay may still address them.
+        self._superseded: list[wp.array] = []
+        if self.device.is_cuda and not any(field.requires_grad for field in self.fields):
             self._mode = "virtual"
             self._allocate_virtual()
         else:
-            self._mode = "fixed" if self.rows >= self.bound else "realloc"
+            self._mode = "realloc"
             for field in self.fields:
                 self.views[field.name] = self._array(field, field.length(self.rows))
-        if any(field.requires_grad for field in self.fields) and self._mode != "fixed":
-            raise ValueError("Per-contact fields with gradients cannot grow; size them at their bound")
         _call(self._on_rows, self)
 
     @property
-    def growable(self) -> bool:
-        """Whether the rows can still grow."""
-        return self.rows < self.bound
+    def row_bytes(self) -> int:
+        """Device bytes one contact row costs in these fields."""
+        return sum(field.row_bytes for field in self.fields)
 
     def publish(self, target) -> None:
         """Assign each field's current view to the attribute of ``target`` named after the field."""
@@ -265,9 +337,16 @@ class ContactRows:
     def mapped_bytes(self) -> int:
         """Return the device bytes the rows hold now."""
         if self._mode != "virtual":
-            return sum(view.capacity for view in self.views.values())
+            return sum(view.capacity * (2 if view.requires_grad else 1) for view in self.views.values())
         _, fields_ops, _ = _gpu_components()
         return sum(fields_ops.memory_report(storage)["mapped_dense_bytes"] for storage, _ in self._storages)
+
+    def reserved_bytes(self) -> int:
+        """Return the device addresses the rows reserve (CUDA virtual memory), or the bytes they hold."""
+        if self._mode != "virtual":
+            return self.mapped_bytes()
+        _, fields_ops, _ = _gpu_components()
+        return sum(fields_ops.memory_report(storage)["virtual_dense_bytes"] for storage, _ in self._storages)
 
     def _array(self, field, length):
         array = wp.empty(length, dtype=field.dtype, device=self.device, requires_grad=field.requires_grad)
@@ -286,8 +365,8 @@ class ContactRows:
             array[start:end].fill_(field.fill)
 
     def _allocate_virtual(self):
-        if wp.get_stream(self.device).is_capturing:
-            raise RuntimeError("Growable per-contact buffers cannot be created during CUDA graph capture")
+        if capturing(self.device):
+            raise RuntimeError("Rigid contact buffers cannot be created during graph capture")
         _, fields_ops, FieldSpec = _gpu_components()
         _release_retired(self.device)
         owner = _backing(self.device)
@@ -297,7 +376,7 @@ class ContactRows:
         with wp.ScopedDevice(self.device):
             for (per_contact, extra), members in groups.items():
                 storage = fields_ops.allocate(
-                    per_contact * self.bound + extra,
+                    per_contact * self.reserve + extra,
                     wp.zeros(1, dtype=wp.int32),
                     fields=tuple(FieldSpec(field.name, (), field.dtype, False) for field in members),
                     backing=owner,
@@ -315,6 +394,21 @@ class ContactRows:
                 self._initialize(view, field, kept_rows, view.shape[0])
                 self.views[field.name] = view
 
+    def _added_bytes(self, rows, granule) -> int:
+        """Return the device bytes growing to ``rows`` rows would map or allocate."""
+        if self._mode != "virtual":
+            return sum(
+                (field.length(rows) - field.length(self.rows))
+                * wp.types.type_size_in_bytes(field.dtype)
+                * (2 if field.requires_grad else 1)
+                for field in self.fields
+            )
+        added = 0
+        for field in self.fields:
+            size = wp.types.type_size_in_bytes(field.dtype)
+            added += _round_up(field.length(rows) * size, granule) - _round_up(field.length(self.rows) * size, granule)
+        return added
+
     def _map(self, rows, fields_ops):
         """Map ``rows`` rows of every virtual field; the caller holds the backing's maintenance scope."""
         for storage, members in self._storages:
@@ -329,42 +423,64 @@ class ContactRows:
             self._bind_virtual_views(previous)
         else:
             for field in self.fields:
-                array = wp.empty(field.length(rows), dtype=field.dtype, device=self.device)
+                old = self.views[field.name]
+                array = wp.empty(
+                    field.length(rows), dtype=field.dtype, device=self.device, requires_grad=field.requires_grad
+                )
                 if previous:
-                    wp.copy(array, self.views[field.name], count=previous)
+                    wp.copy(array, old, count=previous)
                 self._initialize(array, field, previous, array.shape[0])
                 self.views[field.name] = array
+                self._superseded.append(old)
         _call(self._on_rows, self)
 
 
 def _grow_rows(members: list[ContactRows], rows: int) -> None:
-    """Bring every member's rows to at least ``rows``: map virtual storage in one maintenance scope, then publish."""
+    """Bring every member's rows to at least ``rows``: map virtual storage in one maintenance scope, then publish.
+
+    Raises:
+        MemoryError: Before changing anything, if the device cannot back the rows.
+        RuntimeError: During CUDA graph capture.
+    """
     members = [member for member in members if member.rows < rows]
-    for member in members:
-        if rows > member.bound:
-            raise ValueError(
-                f"Per-contact buffers bounded by {member.bound} rigid contacts cannot hold {rows}; "
-                "construct the solver with model.rigid_contact_max at least the collision pipeline's rigid_contact_max"
-            )
     if not members:
         return
     device = members[0].device
-    if device.is_cuda and wp.get_stream(device).is_capturing:
+    if capturing(device):
         raise RuntimeError(
-            "Per-contact buffers cannot grow during CUDA graph capture; grow them before capturing "
-            "(CollisionPipeline.service_capacity(), or one eager step)"
+            "Rigid contact buffers cannot grow during graph capture; grow them before capturing "
+            "(CollisionPipeline.service_capacity(), or one collision pass outside capture)"
         )
+    for member in members:
+        if rows > member.reserve:
+            raise MemoryError(f"Rigid contact buffers reserved for {member.reserve} rows cannot hold {rows}")
     virtual = [member for member in members if member._mode == "virtual"]
+    granule = 1
     if virtual:
         backing_ops, fields_ops, _ = _gpu_components()
         _release_retired(device)
         owner = _backing(device)
+        granule = int(owner.granularity_bytes)
+    added = sum(member._added_bytes(rows, granule) for member in members)
+    held = members[0].rows
+    if device.is_cuda and added > int(device.free_memory):
+        raise MemoryError(
+            f"Growing rigid contact buffers from {held} to {rows} rows needs {added / 2**20:.1f} MiB more device "
+            f"memory; {int(device.free_memory) / 2**20:.1f} MiB are free"
+        )
+    if virtual:
         # Join every stream that may touch the rows (graph replays, solver side streams) before remapping.
         wp.synchronize_device(device)
         stream = wp.get_stream(device).cuda_stream
-        with wp.ScopedDevice(device), backing_ops.maintenance(owner, streams=(stream,)):
-            for member in virtual:
-                member._map(rows, fields_ops)
+        try:
+            with wp.ScopedDevice(device), backing_ops.maintenance(owner, streams=(stream,)):
+                for member in virtual:
+                    member._map(rows, fields_ops)
+        except MemoryError as error:
+            raise MemoryError(
+                f"Growing rigid contact buffers from {held} to {rows} rows ({added / 2**20:.1f} MiB more) exceeds "
+                f"the device memory: {error}"
+            ) from error
     for member in members:
         member._publish_rows(rows)
 
@@ -373,27 +489,24 @@ class ContactPool:
     """The ready rows of a rigid contact stream's per-contact buffers, and their growth from measured demand.
 
     Args:
-        bound: The most rows the pool may grow to.
         device: The device of the buffers.
         world_count: Number of worlds of the model, for the initial rows.
-        rows: Initial ready rows; defaults to :func:`initial_rows`. Rows equal
-            to ``bound`` never grow.
+        rows: Initial ready rows; defaults to :func:`initial_rows`.
     """
 
-    def __init__(self, bound: int, *, device, world_count: int = 1, rows: int | None = None):
-        self.bound = int(bound)
+    def __init__(self, *, device, world_count: int = 1, rows: int | None = None):
         self.device = wp.get_device(device)
-        self.ready = min(self.bound, initial_rows(self.bound, world_count) if rows is None else int(rows))
+        self.ready = initial_rows(world_count) if rows is None else max(int(rows), 0)
         self._members: list[weakref.ReferenceType] = []
+        # The bound of the live members, recomputed after one is collected.
+        self._bound = INDEX_LIMIT
+        self._bound_stale = False
         self._followers: list[weakref.ReferenceType] = []
-        self._high_water = None
-        self._high_water_host = None
-        if self.growable:
-            # Allocated here, outside any graph capture that records demand.
-            self._high_water = wp.zeros(1, dtype=wp.int32, device=self.device)
-            self._high_water_host = (
-                wp.zeros(1, dtype=wp.int32, device="cpu", pinned=True) if self.device.is_cuda else self._high_water
-            )
+        # Allocated here, outside any graph capture that records demand.
+        self._high_water = wp.zeros(1, dtype=wp.int32, device=self.device)
+        self._high_water_host = (
+            wp.zeros(1, dtype=wp.int32, device="cpu", pinned=True) if self.device.is_cuda else self._high_water
+        )
         self.growth_count = 0
         """Growths so far; each one requires recapturing graphs that use the pool."""
         self._reserved = 0
@@ -403,14 +516,58 @@ class ContactPool:
         self._reported = 0
 
     @property
+    def bound(self) -> int:
+        """The most rows the device could back for the pool's live fields (:func:`device_row_limit`).
+
+        Every live member's storage holds it: a member reserves the bound when it is created, and
+        the bound only rises again when a member that lowered it is collected."""
+        if self._bound_stale:
+            self._bound_stale = False
+            self._bound = self._limit(())
+        return self._bound
+
+    @property
+    def row_bytes(self) -> int:
+        """Device bytes one contact row costs in the pool's live fields."""
+        return sum(member.row_bytes for member in self._live_members())
+
+    @property
     def growable(self) -> bool:
         """Whether the pool can still grow."""
         return self.ready < self.bound
 
+    def _limit(self, fields) -> int:
+        """Return the bound of the live members plus ``fields``: the device limit for all their bytes per row,
+        at most what every field can index and what every live member reserved."""
+        members = self._live_members()
+        groups = [(member.fields, member._mode == "virtual") for member in members]
+        fields = tuple(fields)
+        if fields:
+            groups.append((fields, self.device.is_cuda and not any(field.requires_grad for field in fields)))
+        row_bytes = sum(field.row_bytes for group, _ in groups for field in group)
+        index_limit = min([INDEX_LIMIT, *(field.row_limit(virtual) for group, virtual in groups for field in group)])
+        return min([device_row_limit(self.device, row_bytes, index_limit), *(member.reserve for member in members)])
+
     def rows(self, fields, *, on_rows=None) -> ContactRows:
-        """Create per-contact fields that follow this pool's ready rows (see :class:`ContactRows`)."""
-        rows = ContactRows(fields, rows=self.ready, bound=self.bound, device=self.device, on_rows=on_rows)
-        self._members.append(weakref.ref(rows))
+        """Create per-contact fields that follow this pool's ready rows (see :class:`ContactRows`).
+
+        Their bytes per row lower the pool's bound while they live; their storage reserves the new bound.
+
+        Raises:
+            MemoryError: If the device cannot back the pool's ready rows of every field.
+        """
+        fields = tuple(fields)
+        bound = self._limit(fields)
+        if self.ready > bound:
+            row_bytes = self.row_bytes + sum(field.row_bytes for field in fields)
+            raise MemoryError(
+                f"{self.device} cannot back {self.ready} rigid contact rows of {row_bytes} bytes: it holds at most "
+                f"{bound}"
+            )
+        rows = ContactRows(fields, rows=self.ready, reserve=bound, device=self.device, on_rows=on_rows)
+        pool = weakref.ref(self)
+        self._members.append(weakref.ref(rows, lambda _, pool=pool: _mark_bound_stale(pool())))
+        self._bound = bound
         return rows
 
     def follow(self, other: ContactPool) -> None:
@@ -420,7 +577,7 @@ class ContactPool:
         graph capture. Following is idempotent.
 
         Raises:
-            ValueError: If ``other`` is bounded below this pool's ready rows.
+            MemoryError: If the device cannot back ``other`` at this pool's ready rows.
             RuntimeError: If ``other`` must grow during graph capture.
         """
         if other is self:
@@ -436,15 +593,19 @@ class ContactPool:
         Returns:
             Whether any live buffer changed. Graphs that captured them must then
             be recaptured to use the new rows; :meth:`service` reports it too.
+
+        Raises:
+            MemoryError: Before changing anything, if the device cannot back the rows.
         """
+        rows = int(rows)
         pools = self._closure()
         if all(pool.ready >= rows for pool in pools):
             return False
         for pool in pools:
             if rows > pool.bound and pool.ready < rows:
-                raise ValueError(
-                    f"A contact pool bounded by {pool.bound} rows cannot grow to {rows}; construct the solver with "
-                    "model.rigid_contact_max at least the collision pipeline's rigid_contact_max"
+                raise MemoryError(
+                    f"{pool.device} cannot back {rows} rigid contact rows of {pool.row_bytes} bytes: it holds at "
+                    f"most {pool.bound}"
                 )
         growing = [(pool, pool._live_members()) for pool in pools if pool.ready < rows]
         _grow_rows([member for _, members in growing for member in members], rows)
@@ -455,7 +616,7 @@ class ContactPool:
         return any(members for _, members in growing)
 
     def reserve(self, rows: int) -> bool:
-        """Hold at least ``rows`` ready rows from now on, for a writer with a fixed contact capacity.
+        """Hold at least ``rows`` ready rows from now on, for a writer that produces its own contacts.
 
         Outside graph capture the pool and its followers grow now, to
         :func:`reserved_rows`, keeping their contents. During capture the request
@@ -468,14 +629,17 @@ class ContactPool:
             recaptured (:meth:`service` reports it too).
 
         Raises:
-            ValueError: If ``rows`` exceeds the bound.
+            MemoryError: If the device cannot back ``rows`` rows of the pool's fields.
         """
         rows = int(rows)
         if rows <= self.ready:
             return False
         if rows > self.bound:
-            raise ValueError(f"A contact pool bounded by {self.bound} rows cannot hold the {rows} required")
-        if self.device.is_cuda and wp.get_stream(self.device).is_capturing:
+            raise MemoryError(
+                f"{self.device} cannot back the {rows} rigid contact rows reserved, of {self.row_bytes} bytes each: "
+                f"it holds at most {self.bound}"
+            )
+        if capturing(self.device):
             if rows > self._reserved:
                 warnings.warn(
                     f"{rows} rigid contact rows were reserved during CUDA graph capture, with {self.ready} ready: "
@@ -489,12 +653,35 @@ class ContactPool:
         self._reserved = max(self._reserved, rows)
         return self.grow(reserved_rows(rows, self.bound))
 
+    def fit(self, count: int) -> bool:
+        """Grow outside capture when a pass's ``count`` filled the rows, with :func:`grown_rows` headroom.
+
+        A collision pass outside capture calls this with its count before
+        anything reads the rows. Some writers stop counting once the rows are
+        full, so a count at the ready rows counts as an overflow too.
+
+        Returns:
+            Whether the rows grew, so the pass must run again.
+
+        Raises:
+            MemoryError: If the rows are full at the device bound.
+        """
+        if count <= 0 or count < self.ready:
+            return False
+        target = grown_rows(count, self.ready, self.bound)
+        if target <= self.ready:
+            raise MemoryError(
+                f"{count} rigid contacts fill the {self.ready} rows {self.device} can back for these buffers"
+            )
+        self._grow_logged(target, count)
+        return True
+
     def record_demand(self, count: wp.array) -> None:
         """Record the contact count in the sticky high-water mark and copy it to pinned host memory.
 
-        Graph capture records both launches. Pools that cannot grow record nothing.
+        Graph capture records both launches.
         """
-        if self._high_water is None or not self.growable:
+        if not self.growable:
             return
         wp.launch(_record_high_water, dim=1, inputs=[count, self._high_water], device=self.device, record_tape=False)
         if self._high_water_host is not self._high_water:
@@ -503,7 +690,7 @@ class ContactPool:
     @property
     def high_water(self) -> int:
         """The most contacts any recorded collision pass counted, as last copied to the host (no synchronization)."""
-        return 0 if self._high_water_host is None else int(self._high_water_host.numpy()[0])
+        return int(self._high_water_host.numpy()[0])
 
     def service(self) -> bool:
         """Grow from the recorded demand and reservations; return whether graphs using the pool must be recaptured.
@@ -514,9 +701,9 @@ class ContactPool:
         at or above the ready rows means a pass may have dropped contacts: its
         capacity status stays flagged and this warns. Returns ``True`` when live
         buffers of this pool or its followers grew since the last call, also by
-        a :meth:`reserve` or :meth:`follow` outside it.
+        a :meth:`reserve`, :meth:`fit` or :meth:`follow` outside it.
         """
-        if self.device.is_cuda and wp.get_stream(self.device).is_capturing:
+        if capturing(self.device):
             return False
         if self.growable:
             high_water = self.high_water
@@ -525,19 +712,7 @@ class ContactPool:
                 target = max(target, reserved_rows(self._reserved, self.bound))
             if target > self.ready:
                 previous = self.ready
-                before = self.mapped_bytes()
-                self.grow(target)
-                logger.info(
-                    "Rigid contact pool grew from %d to %d rows (high-water %d, reserved %d, bound %d): "
-                    "%.1f -> %.1f MiB",
-                    previous,
-                    target,
-                    high_water,
-                    self._reserved,
-                    self.bound,
-                    before / 2**20,
-                    self.mapped_bytes() / 2**20,
-                )
+                self._grow_logged(target, high_water)
                 if high_water >= previous:
                     warnings.warn(
                         f"Rigid contact demand {high_water} reached the {previous} ready rows: a collision pass may "
@@ -550,9 +725,28 @@ class ContactPool:
         self._reported = changes
         return changed
 
+    def _grow_logged(self, target: int, demand: int) -> None:
+        previous = self.ready
+        before = self.mapped_bytes()
+        self.grow(target)
+        logger.info(
+            "Rigid contact pool grew from %d to %d rows (demand %d, reserved %d, device bound %d): %.1f -> %.1f MiB",
+            previous,
+            target,
+            demand,
+            self._reserved,
+            self.bound,
+            before / 2**20,
+            self.mapped_bytes() / 2**20,
+        )
+
     def mapped_bytes(self) -> int:
         """Return the device bytes this pool's and its followers' rows hold now."""
         return sum(member.mapped_bytes() for pool in self._closure() for member in pool._live_members())
+
+    def reserved_bytes(self) -> int:
+        """Return the device addresses this pool's own rows reserve (diagnostics)."""
+        return sum(member.reserved_bytes() for member in self._live_members())
 
     def _live_members(self) -> list[ContactRows]:
         members = [ref() for ref in self._members]
