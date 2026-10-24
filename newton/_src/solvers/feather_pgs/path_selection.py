@@ -155,7 +155,7 @@ _EFFECTIVE = {
     # The sweeps' law after the schedule and row gates (routes.velocity_limits.law): None in split mode, which
     # builds no matrix-free sweep and applies no law.
     "velocity_limit_law": lambda solver: solver._velocity_limit_sweep_law()[0],
-    # The largest budget of the built linked (patch) tiers; 0 without them.
+    # The largest budget of the built linked (patch) tiers; 0 without them (deprecated option).
     "mf_gs_parallel_linked_sweeps": _linked_tier_sweeps,
     # A readout applies only where a sweep kernel carries its counters, the velocity law where a sweep compiles it.
     "pgs_solve_readout": lambda solver: solver.pgs_solve_readout if solver._solve_readout.kernels else "off",
@@ -977,12 +977,6 @@ def _tiers(solver) -> dict | None:
             "inkernel_response": solver._ink_sizes is not None,
             # Every built tier projects each friction pair on its patch ring's pooled normal load (patch friction).
             "linked_rows": all(getattr(kernel, "_fpgs_linked_rows", False) for kernel in kernels),
-            # How a friction pair's tangent rows step: one isotropic step (the linked tiers' law, the serial pair
-            # solve's friction law) or each row's own step. routes.friction.parallel_rows says whether the tiers
-            # share the serial sweep's whole fixed point, which also depends on the velocity-limit law.
-            "pair_step": "isotropic"
-            if all(getattr(kernel, "_fpgs_pair_step", "per_row") == "isotropic" for kernel in kernels)
-            else "per_row",
             # The last-word velocity-limit pass after the final sweep (mf_gs_parallel_linked_velocity_limit_pass).
             "velocity_limit_pass": all(getattr(kernel, "_fpgs_velocity_limit_pass", False) for kernel in kernels),
             # The tiers accumulate joint velocity-limit rows whatever the serial sweeps' law
@@ -990,8 +984,8 @@ def _tiers(solver) -> dict | None:
             "velocity_limit_law": _tier_velocity_limit_law(solver, kernels),
             "nesterov": bool(solver.mf_gs_parallel_nesterov),
             "matrix_free": bool(solver.mf_gs_parallel_matrix_free),
-            # The largest tier budget; each tier records its own. Point tiers sweep mf_gs_parallel_sweeps, linked
-            # tiers mf_gs_parallel_linked_sweeps unless it is None (rule "auto", its default, or a count).
+            # The largest tier budget; each tier records its own. Every tier sweeps the automatic budget, at least
+            # mf_gs_parallel_sweeps (rule "auto"); the deprecated mf_gs_parallel_linked_sweeps still sets linked tiers'.
             "sweeps": max(int(kernel._fpgs_sweeps) for kernel in kernels),
             "sweeps_rule": solver._par_sweeps_rule,
             "sweeps_reason": solver._par_sweeps_reason,

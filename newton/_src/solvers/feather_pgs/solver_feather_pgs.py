@@ -1256,7 +1256,7 @@ class SolverFeatherPGS(SolverBase):
         mf_gs_parallel_sweeps: int = 24,
         mf_gs_parallel_linked_sweeps: int | Literal["auto"] | None = "auto",
         mf_gs_parallel_nesterov: bool = True,
-        mf_gs_parallel_tol: float = 1e-4,
+        mf_gs_parallel_tol: float = 0.0,
         mf_gs_parallel_matrix_free: bool = False,
         mf_gs_parallel_linked_velocity_limit_pass: bool = False,
         velocity_limit_law: Literal["stateless", "accumulated"] = "stateless",
@@ -1626,35 +1626,37 @@ class SolverFeatherPGS(SolverBase):
                 ``0`` disables it. Requires the same conditions as ``mf_gs_incremental_rows`` and takes precedence.
                 Consider small contact sets, such as an arm against fixed geometry; worlds with mixed/free-body
                 rows or excess rows retain serial solving. The effective limit is capped at 96 for response-block
-                sweeps or 128 for matrix-free sweeps, and rounded down to a multiple of four. Under persistent
-                patch friction each tangent pair projects on its patch's pooled normal load with one isotropic
-                step, the serial pair solve's friction law; ``FEATHER_PGS_PATCH_PARALLEL_ROWS=0`` keeps patch
-                friction on the serial kernels. The tiers accumulate joint velocity-limit rows
+                sweeps or 128 for matrix-free sweeps, and rounded down to a multiple of four. Each tangent pair
+                takes one isotropic step, the serial pair solve's friction law, so a sliding pair converges to
+                maximal dissipation; under persistent patch friction it projects on its patch's pooled normal
+                load, and ``FEATHER_PGS_PATCH_PARALLEL_ROWS=0`` keeps patch friction on the serial kernels. Each
+                tier's sweep budget follows ``mf_gs_parallel_sweeps``. The tiers accumulate joint velocity-limit rows
                 (``routes.sweep.tiers.velocity_limit_law``). The worlds they decline keep the serial sweep and its
                 ``velocity_limit_law``, ``"stateless"`` by default, so tier and serial worlds share one fixed point
                 under ``velocity_limit_law="accumulated"`` or without joint velocity limits.
-            mf_gs_parallel_sweeps (int, optional): Maximum number of parallel sweeps per launch (early exit when no
-                impulse changes). Independent of ``pgs_iterations``; preserve the sweep allowance when comparing
-                execution speed, and validate convergence separately. The tiers that serve persistent patch
-                friction take ``mf_gs_parallel_linked_sweeps`` instead unless it is ``None``.
-            mf_gs_parallel_linked_sweeps (int | Literal["auto"] | None, optional): Sweep budget of the parallel
-                tiers that serve persistent patch friction (linked tiers); point-friction tiers keep
-                ``mf_gs_parallel_sweeps``. Jacobi sweeps need more passes than serial sweeps where many rows
-                couple through one body, so a contact-rich patch world can need more than
-                ``mf_gs_parallel_sweeps`` to reach the serial sweep's accuracy. ``None`` uses
-                ``mf_gs_parallel_sweeps``; a positive count sets every linked tier's budget. ``"auto"`` gives
-                each linked tier serving up to ``R`` rows ``ceil(15/4 * pgs_iterations * sqrt(R / 32))`` sweeps,
-                at least ``mf_gs_parallel_sweeps`` and at most 128 unless ``mf_gs_parallel_sweeps`` is larger,
-                from ``pgs_iterations`` at construction: the serial sweep's iteration count sets the accuracy to
-                match, and larger worlds converge more slowly. The factor is fit, by interpolating each world's
-                error between measured sweep caps, so that each evaluated row bucket of two contact-rich
-                patch-friction workloads reaches the serial sweep's accuracy.
-                Every world still exits early once its impulses change by less than ``mf_gs_parallel_tol``.
-                The environment variable ``FEATHER_PGS_PATCH_PARALLEL_SWEEPS`` (a positive count or ``auto``)
-                overrides the argument. ``get_path_selection()`` reports each tier's budget under
-                ``routes.sweep.tiers``. Experimental. Defaults to ``"auto"``.
+            mf_gs_parallel_sweeps (int, optional): Minimum sweep budget of each parallel tier
+                (``mf_gs_parallel_rows``). Jacobi sweeps need more passes than the serial sweep's Gauss-Seidel
+                iterations to reach its accuracy, the more so the more rows couple through one body, so every tier,
+                under either friction law, sweeps ``ceil(7/2 * pgs_iterations * sqrt(R / 32))`` times for its row
+                bound ``R``, at least ``mf_gs_parallel_sweeps`` and at most 128 unless ``mf_gs_parallel_sweeps`` is
+                larger, from ``pgs_iterations`` at construction: the serial sweep's iteration count sets the
+                accuracy to match. The factor is fit, by interpolating each world's error between measured sweep
+                caps, so that each evaluated row bucket of contact-rich point- and patch-friction workloads reaches
+                the serial sweep's accuracy. A world stops earlier only where ``mf_gs_parallel_tol`` lets it.
+                ``get_path_selection()`` reports each tier's budget and its rule under ``routes.sweep.tiers``.
+                Defaults to 24.
+            mf_gs_parallel_linked_sweeps (int | Literal["auto"] | None, optional): Deprecated: the tiers that serve
+                persistent patch friction (linked tiers) follow the budget rule of every tier, the default
+                ``"auto"``. A count, or ``None`` for exactly ``mf_gs_parallel_sweeps``, still sets the linked tiers'
+                budget, with a :class:`DeprecationWarning`, and so does the environment variable
+                ``FEATHER_PGS_PATCH_PARALLEL_SWEEPS``; omit both. Defaults to ``"auto"``.
             mf_gs_parallel_nesterov (bool, optional): Apply Nesterov momentum to the parallel sweeps.
-            mf_gs_parallel_tol (float, optional): Relative impulse change below which the parallel sweep exits early.
+            mf_gs_parallel_tol (float, optional): Relative impulse change below which a parallel tier's world stops
+                sweeping before its budget. ``0`` keeps the serial sweeps' exact stationary-sweep law: a world stops
+                early only once a sweep changes no impulse, so the budget alone sets the accuracy. A positive
+                tolerance trades accuracy for speed and stops small worlds short of the serial sweep's accuracy
+                whatever their budget (at ``1e-4`` the 32-row point tier of a contact-rich hand stalls near its
+                serial error). Defaults to ``0``.
             mf_gs_parallel_matrix_free (bool, optional): Parallel sweep without the response block (per sweep
                 ``Y^T y`` and ``J . dv`` from staged rows; row-sum-bound step scale). With ``m`` rows and ``D`` DOFs,
                 the block costs ``O(m^2 D)`` to build plus ``O(m^2)`` per sweep; matrix-free costs ``O(m D)`` per
@@ -2204,14 +2206,28 @@ class SolverFeatherPGS(SolverBase):
             if environment_update
             else contact_update
         )
-        # FEATHER_PGS_PATCH_PARALLEL_SWEEPS overrides the argument, so recipes set the linked tiers' budget.
+        # One budget rule for every parallel tier. The linked tiers' own budget and its
+        # FEATHER_PGS_PATCH_PARALLEL_SWEEPS override are deprecated: they still set the linked tiers' budget.
         requested_linked_sweeps = _linked_sweeps_request(mf_gs_parallel_linked_sweeps, "mf_gs_parallel_linked_sweeps")
-        environment_linked_sweeps = os.environ.get("FEATHER_PGS_PATCH_PARALLEL_SWEEPS")
+        environment_linked_sweeps = os.environ.get("FEATHER_PGS_PATCH_PARALLEL_SWEEPS") or None
         self.mf_gs_parallel_linked_sweeps = (
             _linked_sweeps_request(environment_linked_sweeps, "FEATHER_PGS_PATCH_PARALLEL_SWEEPS")
             if environment_linked_sweeps
             else requested_linked_sweeps
         )
+        for name, given in (
+            ("mf_gs_parallel_linked_sweeps", requested_linked_sweeps != "auto"),
+            ("FEATHER_PGS_PATCH_PARALLEL_SWEEPS", environment_linked_sweeps is not None),
+        ):
+            if given:
+                warnings.warn(
+                    f"{name} is deprecated and will be removed in a future release: every parallel tier now sweeps "
+                    "the automatic budget, at least mf_gs_parallel_sweeps, under either friction law. Until then a "
+                    "count, or None for exactly mf_gs_parallel_sweeps, still sets the budget of the tiers that serve "
+                    "persistent patch friction; omit it.",
+                    DeprecationWarning,
+                    stacklevel=_CONSTRUCTOR_CALLER,
+                )
         # The sparse triplet transaction's flags, checked on every route; the sparse route applies them.
         self._sparse_transaction_request = self._sparse_transaction_flags()
         # Options whose effective value an IL_NEWTON_FPGS_* alias or a FEATHER_PGS_* override changed;
@@ -6966,7 +6982,6 @@ class SolverFeatherPGS(SolverBase):
                             has_drive_rows=has_drive_rows,
                             exact_row_sums=_MF_EXACT_ROWSUM,
                             linked_rows=self._friction_anchors_enabled,
-                            pair_step=self._parallel_pair_step(),
                             velocity_limit_pass=self._parallel_velocity_limit_pass(),
                         )
                     )
@@ -12307,10 +12322,12 @@ class SolverFeatherPGS(SolverBase):
         They pool each friction pair's cone over its patch ring and write the patch
         row law, so patch friction honors ``mf_gs_parallel_rows`` and keyed rows as
         point friction does, unless ``FEATHER_PGS_PATCH_PARALLEL_ROWS=0`` keeps it on
-        its serial sweeps and ordinary rows. The linked tiers step each friction pair
+        its serial sweeps and ordinary rows. Every tier steps each friction pair
         isotropically, so a sliding pair converges to the serial pair solve's maximal
-        dissipation; with per-row steps it did not, which moved body-velocity RMS by
-        0.4-0.9% on two contact-rich patch-friction workloads. Whether the tiers then
+        dissipation under either law; with per-row steps it did not, which moved
+        body-velocity RMS by 0.4-0.9% on two contact-rich patch-friction workloads, and
+        converged point tiers sat 3.9 times the serial sweep's p90 error away from its
+        fixed point on anymal-D's 33-48-row worlds. Whether the tiers then
         share the serial sweep's whole fixed point depends on the joint velocity
         limits, and the worlds the tiers decline keep the serial sweep and its law
         (:meth:`_parallel_velocity_limit_agreement`). Torsion and compliance keep
@@ -12357,21 +12374,6 @@ class SolverFeatherPGS(SolverBase):
             "binds."
         )
 
-    def _parallel_pair_step(self) -> str:
-        """The friction pair step of the parallel tiers (``routes.sweep.tiers.pair_step``).
-
-        The linked (patch) tiers always step each pair isotropically: it is their law,
-        and it gives a sliding pair the serial pair solve's maximal dissipation. The
-        point tiers keep per-row steps unless the private experiment
-        ``FEATHER_PGS_POINT_PAIR_STEP=isotropic`` opts them in.
-        """
-        if self._friction_anchors_enabled:
-            return "isotropic"
-        step = os.environ.get("FEATHER_PGS_POINT_PAIR_STEP") or "per_row"
-        if step not in ("per_row", "isotropic"):
-            raise ValueError(f"FEATHER_PGS_POINT_PAIR_STEP must be per_row or isotropic, got {step!r}")
-        return step
-
     def _parallel_velocity_limit_pass(self) -> bool:
         """Whether the parallel tiers end with the last-word velocity-limit pass (``routes.sweep.tiers``).
 
@@ -12387,35 +12389,34 @@ class SolverFeatherPGS(SolverBase):
     def _parallel_tier_sweeps(self, tiers) -> tuple[list[int], str, str]:
         """Return each parallel tier's sweep budget, the rule that set it, and why (``routes.sweep.tiers``).
 
-        ``tiers`` lists ``(rows, min_rows)`` per tier. Point tiers sweep
-        ``mf_gs_parallel_sweeps``. Linked (patch) tiers sweep ``mf_gs_parallel_linked_sweeps``
-        unless it is ``None``; under ``"auto"``, the default, each takes
-        :func:`_auto_linked_sweeps` of its row bound. Every world still exits early at
-        ``mf_gs_parallel_tol``.
+        ``tiers`` lists ``(rows, min_rows)`` per tier. Every tier, under either friction
+        law, sweeps :func:`_auto_tier_sweeps` of its row bound, at least
+        ``mf_gs_parallel_sweeps``. The deprecated ``mf_gs_parallel_linked_sweeps`` (or
+        ``FEATHER_PGS_PATCH_PARALLEL_SWEEPS``) still sets the linked (patch) tiers' budget
+        where given: a count, or ``mf_gs_parallel_sweeps`` for ``None``. A world stops
+        earlier only where ``mf_gs_parallel_tol`` lets it.
         """
         sweeps = int(self.mf_gs_parallel_sweeps)
         linked = self.mf_gs_parallel_linked_sweeps
-        if not self._friction_anchors_enabled:
-            reason = "Point tiers sweep mf_gs_parallel_sweeps; mf_gs_parallel_linked_sweeps budgets linked tiers only."
-            return [sweeps] * len(tiers), "mf_gs_parallel_sweeps", reason
-        if linked is None:
-            reason = "Linked tiers sweep mf_gs_parallel_sweeps: mf_gs_parallel_linked_sweeps is None."
-            return [sweeps] * len(tiers), "mf_gs_parallel_sweeps", reason
-        source = (
-            "FEATHER_PGS_PATCH_PARALLEL_SWEEPS"
-            if "mf_gs_parallel_linked_sweeps" in self._environment_options
-            else "mf_gs_parallel_linked_sweeps"
-        )
-        if linked != "auto":
-            return [int(linked)] * len(tiers), "mf_gs_parallel_linked_sweeps", f"{source}={int(linked)}."
+        if self._friction_anchors_enabled and linked != "auto":
+            source = (
+                "FEATHER_PGS_PATCH_PARALLEL_SWEEPS"
+                if "mf_gs_parallel_linked_sweeps" in self._environment_options
+                else "mf_gs_parallel_linked_sweeps"
+            )
+            budget = sweeps if linked is None else int(linked)
+            reason = (
+                f"{source}={linked} (deprecated): every linked tier sweeps {budget} times; a world stops earlier "
+                "only at mf_gs_parallel_tol."
+            )
+            return [budget] * len(tiers), "mf_gs_parallel_linked_sweeps", reason
         reason = (
-            f"{source}='auto': a linked tier serving up to R rows sweeps "
-            f"ceil({_LINKED_SWEEPS_PER_ITERATION} * pgs_iterations * sqrt(R / 32)) times with "
-            f"pgs_iterations={int(self.pgs_iterations)}, at least mf_gs_parallel_sweeps={sweeps} and at most "
-            f"{_LINKED_SWEEPS_CAP} unless mf_gs_parallel_sweeps is larger; every world exits early at "
-            "mf_gs_parallel_tol."
+            f"auto: a tier serving up to R rows sweeps ceil({_TIER_SWEEPS_PER_ITERATION} * pgs_iterations * "
+            f"sqrt(R / 32)) times with pgs_iterations={int(self.pgs_iterations)}, at least "
+            f"mf_gs_parallel_sweeps={sweeps} and at most {_TIER_SWEEPS_CAP} unless mf_gs_parallel_sweeps is larger; "
+            "a world stops earlier only at mf_gs_parallel_tol."
         )
-        return [_auto_linked_sweeps(rows, self.pgs_iterations, sweeps) for rows, _ in tiers], "auto", reason
+        return [_auto_tier_sweeps(rows, self.pgs_iterations, sweeps) for rows, _ in tiers], "auto", reason
 
     def _velocity_limit_sweep_law(self) -> tuple[str | None, str]:
         """Return the law the serial matrix-free sweep kernels give velocity-limit rows, and why.
@@ -19038,23 +19039,25 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
     return kernel
 
 
-# mf_gs_parallel_linked_sweeps="auto": the budget grows with the serial sweep's iteration count, whose accuracy the
-# linked tiers must match, and with the square root of a tier's row bound, as Jacobi sweeps with momentum need more
-# passes where more rows couple through one body. The factor, in eighths, is the smallest that brings each evaluated
-# row bucket to the serial sweep's accuracy on two contact-rich patch-friction workloads (12 and 8 iterations): per row
-# bucket, the p90 energy-norm velocity error against a converged reference over the serial route's, 95% CI upper
-# bound at most 1. The ratios below are interpolated from one probe's fixed caps (each world's error log-linear
-# between them), not measured at the auto budgets, and its 97-128-row tier held too few worlds to evaluate. The
-# serial sweep is most accurate on small worlds, so the 12-iteration workload's 32-row tier sets the factor: 3 left
-# those worlds at 1.38x the serial error measured (1.57x interpolated) and 29/8 at 0.92x (CI upper 1.01); 15/4 gives
-# 0.89x (0.97), its larger tiers 0.41x and 0.55x, and the 8-iteration workload's tiers 0.18x and 0.51x, where 24 and
-# 31 sweeps would reach parity. A fraction keeps the budget in exact integer arithmetic.
-_LINKED_SWEEPS_PER_ITERATION = Fraction(15, 4)
-_LINKED_SWEEPS_CAP = 128
+# The parallel tiers' automatic budget (_auto_tier_sweeps) grows with the serial sweep's iteration count, whose accuracy
+# every tier must match, and with the square root of a tier's row bound, as Jacobi sweeps with momentum need more passes
+# where more rows couple through one body. One factor serves both friction laws, since every tier steps each friction
+# pair isotropically. It is the smallest, in eighths, that brings each evaluated row bucket (>= 100 world-samples) of
+# four contact-rich workloads, allegro (12 iterations) and anymal-D flat (8) under point and patch friction, to the
+# serial sweep's accuracy: per bucket, the p90 energy-norm velocity error against a converged serial reference over the
+# serial route's, 95% world-bootstrap CI upper bound at most 1, each world's error interpolated log-linearly between
+# measured sweep caps under the default exit law (mf_gs_parallel_tol=0). The point workload's sparse 97-128-row tier
+# sets it: 27/8 left its worlds at 0.95x (CI upper 1.06), 7/2 gives 0.87x (0.99); its other tiers reach 0.23x, 0.50x and
+# 0.70x, the patch tiers 0.23x, 0.49x and 0.65x, and at 8 iterations every tier stays below 0.62x. The exit law sets the
+# small tiers' floor: at a tolerance of 1e-4 the 32-row point tier stalls near 0.87x the serial error whatever its
+# budget, which had made the patch factor 15/4. The cap bounds the cost at high iteration counts; the conformance gate's
+# 64-iteration scenes pass at it. A fraction keeps the budget in exact integer arithmetic.
+_TIER_SWEEPS_PER_ITERATION = Fraction(7, 2)
+_TIER_SWEEPS_CAP = 128
 
 
 def _linked_sweeps_request(value, name: str) -> int | str | None:
-    """Validate a linked-tier sweep request: ``None``, ``"auto"`` or a positive count (decimal text included)."""
+    """Validate the deprecated linked-tier budget: ``None``, ``"auto"`` or a positive count (decimal text included)."""
     if value is None or value == "auto":
         return value
     count = value
@@ -19068,19 +19071,19 @@ def _linked_sweeps_request(value, name: str) -> int | str | None:
     return int(count)
 
 
-def _auto_linked_sweeps(rows: int, iterations: int, sweeps: int) -> int:
-    """The ``"auto"`` sweep budget of a linked tier serving up to ``rows`` rows.
+def _auto_tier_sweeps(rows: int, iterations: int, sweeps: int) -> int:
+    """The automatic sweep budget of a parallel tier serving up to ``rows`` rows.
 
     ``ceil(c * iterations * sqrt(rows / 32))`` for the factor ``c = p / q``
-    (:data:`_LINKED_SWEEPS_PER_ITERATION`), at least ``sweeps`` (``mf_gs_parallel_sweeps``) and
-    at most 128 unless ``sweeps`` is larger. The ceiling is exact: the least ``n`` with
-    ``32 q^2 n^2 >= (p iterations)^2 rows``.
+    (:data:`_TIER_SWEEPS_PER_ITERATION`), at least ``sweeps`` (``mf_gs_parallel_sweeps``) and
+    at most :data:`_TIER_SWEEPS_CAP` unless ``sweeps`` is larger, and never fewer than one. The
+    ceiling is exact: the least ``n`` with ``32 q^2 n^2 >= (p iterations)^2 rows``.
     """
-    factor = _LINKED_SWEEPS_PER_ITERATION
+    factor = _TIER_SWEEPS_PER_ITERATION
     numerator = (factor.numerator * int(iterations)) ** 2 * int(rows)
     square = -(-numerator // (32 * factor.denominator**2))
     raw = math.isqrt(square - 1) + 1 if square > 0 else 0
-    return max(int(sweeps), min(raw, _LINKED_SWEEPS_CAP))
+    return max(1, int(sweeps), min(raw, _TIER_SWEEPS_CAP))
 
 
 def _get_pgs_solve_parallel_kernel(
@@ -19102,7 +19105,6 @@ def _get_pgs_solve_parallel_kernel(
     exact_row_sums: bool = False,
     row_inputs=None,
     linked_rows: bool = False,
-    pair_step: str | None = None,
     velocity_limit_pass: bool = False,
 ) -> "wp.Kernel":
     """Scaled parallel projection (Jacobi with per-row step scaling and Nesterov momentum) for dense-row worlds.
@@ -19113,15 +19115,13 @@ def _get_pgs_solve_parallel_kernel(
     a sweep every pair reads the freshly clamped impulses of all its ring's normals, which this sweep updated
     together, just as a point pair reads its own freshly clamped normal.
 
-    ``pair_step`` sets how a friction pair's two tangent rows step. ``"per_row"`` keeps each row's own step scale,
-    so the radial projection onto the disk follows the step metric ``diag(1 / s)`` of two unequal steps: a sliding
-    pair converges to a friction direction turned towards its stiffer tangent, not the serial pair solve's maximal
-    dissipation. ``"isotropic"`` gives both rows the smaller of their two steps; the projection is then the
-    projection in the pair's own metric, so a sliding pair converges to maximal dissipation, the serial pair
-    solve's friction law. A row keeps its own step when its sibling is not an admitted friction row of
-    the same normal, or when either step is zero (a zero-Jacobian tangent would otherwise freeze its live sibling).
-    The default is ``"isotropic"`` for ``linked_rows`` (the patch tier law) and ``"per_row"`` otherwise; an
-    isotropic kernel's name gains ``_iso``.
+    Both tangent rows of a friction pair take the smaller of their two step scales (one isotropic step per pair,
+    :data:`_ISOTROPIC_PAIR_STEP`), so the radial projection onto the disk is the projection in the pair's own metric
+    and a sliding pair converges to maximal dissipation, the serial pair solve's friction law, under either friction
+    law. Per-row steps would project in the metric ``diag(1 / s)`` of two unequal steps and turn a sliding pair's
+    friction towards its stiffer tangent. A row keeps its own step when its sibling is not an admitted friction row
+    of the same normal, or when either step is zero (a zero-Jacobian tangent would otherwise freeze its live
+    sibling). The kernel's name ends in ``_iso`` (``_linked_iso`` for ``linked_rows``).
 
     ``velocity_limit_pass`` adds the last word of the serial sweeps' velocity-limit pass after the final sweep
     (:func:`_parallel_velocity_limit_pass`): an ordered, push-only pass over the velocity-limit rows that changes
@@ -19151,11 +19151,6 @@ def _get_pgs_solve_parallel_kernel(
     Section 12.
     """
     _validate_dense_metadata_encoding(max_constraints)
-    if pair_step is None:
-        pair_step = "isotropic" if linked_rows else "per_row"
-    if pair_step not in ("per_row", "isotropic"):
-        raise ValueError(f"pair_step must be 'per_row' or 'isotropic', got {pair_step!r}")
-    isotropic_step = _ISOTROPIC_PAIR_STEP if pair_step == "isotropic" else ""
     velocity_limit_pass = bool(velocity_limit_pass)
     M_D = max_constraints
     D = max_world_dofs
@@ -19647,7 +19642,7 @@ def _get_pgs_solve_parallel_kernel(
     SYNC();
 #endif
 
-{isotropic_step}    if ({STOP} == 3) return;
+{_ISOTROPIC_PAIR_STEP}    if ({STOP} == 3) return;
     float t_k = 1.0f;
     for (int sweep = 0; sweep < {NSWEEPS}; ++sweep) {{
         const int global_iter = iteration_offset + sweep;
@@ -20014,8 +20009,7 @@ def _get_pgs_solve_parallel_kernel(
         name += "_local_fallback"
     if linked_rows:
         name += "_linked"
-    if pair_step == "isotropic":
-        name += "_iso"
+    name += "_iso"
     if velocity_limit_pass:
         name += "_lw"
     if row_inputs is not None:
@@ -20025,7 +20019,6 @@ def _get_pgs_solve_parallel_kernel(
     kernel._fpgs_block_dim = NT  # two warps per world above 32 rows
     kernel._fpgs_extra_inputs = True  # takes the in-kernel response inputs after defer_dense_response
     kernel._fpgs_linked_rows = bool(linked_rows)  # recorded as routes.sweep.tiers.linked_rows
-    kernel._fpgs_pair_step = pair_step  # recorded as routes.sweep.tiers.pair_step
     kernel._fpgs_velocity_limit_pass = velocity_limit_pass  # recorded as routes.sweep.tiers.velocity_limit_pass
     # Velocity-limit rows are unilateral rows here (kind 0), whatever the serial sweeps' velocity_limit_law.
     kernel._fpgs_velocity_limit_law = "accumulated"  # recorded as routes.sweep.tiers.velocity_limit_law
@@ -20109,8 +20102,8 @@ def _parallel_velocity_limit_pass(*, matrix_free: bool, inkernel: bool, dofs: in
 """
 
 
-# A friction pair's isotropic step in the parallel sweep (``pair_step="isotropic"``), emitted after the step
-# scales are final and before the sweeps. The pair's first tangent row's lane handles it.
+# The friction pair step of every parallel tier, emitted after the step scales are final and before the sweeps.
+# The pair's first tangent row's lane handles it.
 _ISOTROPIC_PAIR_STEP = """    // Both tangent rows of a friction pair take the smaller of their two steps, so the radial projection onto
     // the friction disk is the projection in the pair's step metric and a sliding pair converges to maximal
     // dissipation. A row keeps its own step when its sibling is not an admitted friction row of the same
@@ -20138,9 +20131,9 @@ def _link_parallel_friction_pairs(snippet: str) -> str:
 
     Normal rows keep their clamped value through the friction projection, so a pair
     reads every normal of its ring at the value this sweep stores, summed in ring
-    order from the pair's own normal as the ordered sweeps sum it. The linked tiers
-    step each pair isotropically (``pair_step``), so the radial projection onto that
-    pooled disk has the serial pair solve's fixed point: the linked tiers and the
+    order from the pair's own normal as the ordered sweeps sum it. Every tier steps
+    each pair isotropically (:data:`_ISOTROPIC_PAIR_STEP`), so the radial projection onto
+    that pooled disk has the serial pair solve's fixed point: the linked tiers and the
     serial patch sweep share their friction solution, and their whole solution where
     both accumulate the velocity-limit rows.
     """

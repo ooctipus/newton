@@ -1104,10 +1104,13 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     self.assertEqual(parallel, options is patch_parallel[0] and switch != "0")
                 if parallel:
                     self.assertEqual(tiers["linked_rows"], patch_law)
-                    # Linked tiers step each friction pair isotropically; point tiers keep per-row steps.
-                    self.assertEqual(tiers["pair_step"], "isotropic" if patch_law else "per_row")
+                    # Every tier steps each friction pair isotropically; linked tiers also pool the ring.
                     for tier in tiers["tiers"]:
-                        self.assertEqual(tier["kernel"].endswith("_linked_iso"), patch_law, tier)
+                        self.assertTrue(tier["kernel"].endswith("_linked_iso" if patch_law else "_iso"), tier)
+                        self.assertEqual("_linked" in tier["kernel"], patch_law, tier)
+                    # Every tier sweeps the automatic budget, at least mf_gs_parallel_sweeps.
+                    self.assertEqual(tiers["sweeps_rule"], "auto")
+                    self.assertTrue(all(t["sweeps"] >= applied["mf_gs_parallel_sweeps"] for t in tiers["tiers"]))
                 self.assertEqual(applied["grouped_dynamics"], routes["dynamics"]["grouped"] is not None)
                 self.assertFalse(applied["lazy_kinematics"])
                 if options.get("pgs_schedule") == "physx_grasp" and routes["sweep"]["route"] == "matrix_free_gs":
