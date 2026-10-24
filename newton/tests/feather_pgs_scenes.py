@@ -77,6 +77,9 @@ class Scene:
     """Contact capacity of the collision pipeline; ``None`` uses the pipeline's estimate."""
     contact_matching: str | None = None
     """Contact matching mode of the collision pipeline (``"latest"`` for warm start)."""
+    deterministic_contacts: bool = False
+    """Whether the collision pipeline sorts its contacts (``deterministic=True``), so repeats of a route agree
+    bitwise and the reference's run-to-run spread holds no contact or row order."""
     contact_stiffness: float = 0.0
     """Per-contact stiffness [N/m] written after each collision pass; 0 keeps hard contact."""
     contact_damping: float = 0.0
@@ -789,6 +792,8 @@ def gripper(
         params={"mu": [mu] * worlds, "lift": lift, "worlds": worlds},
         solver_options={"enable_joint_limits": True, "dense_max_constraints": 64},
         control=control,
+        # The table's grasp drifted between CUDA repeats by more than its routes' bands allowed.
+        deterministic_contacts=table,
         tags=frozenset({"articulated_contact", "grasp"}),
     )
 

@@ -259,6 +259,8 @@ def simulate(
         pipeline_options["rigid_contact_max"] = scene.rigid_contact_max
     if scene.contact_matching is not None:
         pipeline_options["contact_matching"] = scene.contact_matching
+    if scene.deterministic_contacts:
+        pipeline_options["deterministic"] = True
     pipeline = newton.CollisionPipeline(model, **pipeline_options)
     contacts = pipeline.contacts()
     if scene.contact_stiffness > 0.0:
@@ -1060,6 +1062,8 @@ def reference(physics: Physics, route: Route, device) -> Reference:
     On CUDA the budget run repeats: contact rows are allocated with atomics,
     so the row order, and with it a Gauss-Seidel iterate, varies from run to
     run within the budget's convergence band, which the spread then includes.
+    A scene whose pipeline sorts its contacts (``deterministic_contacts``)
+    repeats bitwise, as FeatherPGS then gives the rows the contacts' order.
     """
     high = REFERENCE_FACTOR * physics.iterations
     converged = run_physics(physics, route, device, high)
