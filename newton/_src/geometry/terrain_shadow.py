@@ -135,7 +135,6 @@ from .terrain_law import (
     TERRAIN_PAIR_ROW_OVERFLOW,
     TERRAIN_PAIR_STALE,
     TERRAIN_PAIR_TILE_EXIT,
-    TERRAIN_PAIR_UNSUPPORTED,
     TERRAIN_PAIR_WIDE,
     TerrainLawRows,
     TerrainPairInputs,
@@ -272,7 +271,6 @@ TERRAIN_PAIR_STATES = {
     "candidate_overflow": int(TERRAIN_PAIR_CANDIDATE_OVERFLOW),
     "incomplete": int(TERRAIN_PAIR_INCOMPLETE),
     "wide": int(TERRAIN_PAIR_WIDE),
-    "unsupported": int(TERRAIN_PAIR_UNSUPPORTED),
 }
 """Names of the ``TERRAIN_PAIR_*`` state bits."""
 
@@ -787,39 +785,25 @@ class TerrainLawShadow:
         self._capacities = wp.array(capacities, dtype=wp.int32, device=device)
         self._reserves = wp.array(reserves, dtype=wp.int32, device=device)
         self._solids = None
-        self._unsupported_pairs = 0
         if solid_pairs:
             partners = np.concatenate([self.table.pairs_host[b : b + c, 1] for b, c in solid_pairs])
             self._solids = solid_module.terrain_solid_data(model, partners)
-            classes = np.concatenate([self.table.partner_class[b : b + c] for b, c in solid_pairs])
-            self._unsupported_pairs = int(
-                np.count_nonzero(solid_module.terrain_solid_unsupported(classes, model.shape_type.numpy()[partners]))
-            )
         self._no_body_flags = wp.empty(0, dtype=wp.int32, device=device)
         self.build_seconds = time.perf_counter() - started
         """Host time of the construction [s]: features, pair table, kernel modules imported and buffers."""
 
     def written_pairs(self, model) -> tuple[np.ndarray, np.ndarray]:
         """Return what the law writes when it feeds the solver (the default; see ``NEWTON_TERRAIN_LAW``): per shape, 1
-        for a partner whose heightfield pairs it writes (else 0), and the table indices of those pairs.
-
-        Every listed pair is written but those whose partner has no core yet
-        (:data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_UNSUPPORTED`: in the hull class, a shape that is
-        neither a convex hull nor an ellipsoid), which stay with the terrain route.
+        for a partner whose heightfield pairs it writes (else 0), and the table indices of those pairs: every listed
+        pair (every partner of a listed class has a core).
 
         Args:
             model: The finalized model the law was built for.
         """
         listed = self._listed
-        partners = self.table.pairs_host[listed, 1].astype(np.int64)
-        written = np.ones(len(listed), bool)
-        if any(c in TERRAIN_LAW_SOLID_CLASSES for c in self.classes):
-            from .terrain_law_solid import terrain_solid_unsupported  # noqa: PLC0415
-
-            written = ~terrain_solid_unsupported(self.table.partner_class[listed], model.shape_type.numpy()[partners])
         partner = np.zeros(model.shape_count, np.int32)
-        partner[partners[written]] = 1
-        return partner, listed[written].astype(np.int32)
+        partner[self.table.pairs_host[listed, 1].astype(np.int64)] = 1
+        return partner, listed.astype(np.int32)
 
     def default_spill_rows(self) -> int:
         """Return the spill region's rows by default, from the listed pairs' own bounds on their rows
@@ -987,8 +971,7 @@ class TerrainLawShadow:
 
     def describe(self) -> dict:
         """Return a host-only record of the shadow: classes, pairs per lane class, launches, walk slots and the spill
-        region, memory, the solid classes' job scale and with a solid class listed the pairs whose partner has no core
-        yet (``unsupported_pairs``, no row).
+        region, memory and with a solid class listed the solid classes' job scale.
 
         ``launches`` counts every launch of a collide, the spill and job check included. ``launch_shapes`` holds, per
         class with pairs, the dimensions fixed at construction: ``block_dim`` (every launch's), ``walk_slots`` (a
@@ -1054,7 +1037,7 @@ class TerrainLawShadow:
             )
         solids = {}
         if self._solids is not None:
-            solids = {"job_scale": self.job_scale, "unsupported_pairs": self._unsupported_pairs}
+            solids = {"job_scale": self.job_scale}
         return {
             "classes": [terrain_law_class_name(c) for c in self.classes],
             "pairs": pairs,

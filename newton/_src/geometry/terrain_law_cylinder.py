@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The terrain law's kernels for flat-capped cylinders and cones (rules F, E, V and R of the law for solid cores).
+"""The terrain law's kernels for cylinders (flat-sided and barrel) and cones (rules F, E, V and R of the law for solid
+cores).
 
 The kernels are :func:`~newton._src.geometry.terrain_law_solid.solid_kernels`'s for the class, launched in the order of
 :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LAUNCHES` (:mod:`~newton._src.geometry.terrain_shadow`):
@@ -36,14 +37,17 @@ TERRAIN_CYLINDER_WALK_SLOTS = TERRAIN_PARTNER_WALK_SLOTS[TERRAIN_PARTNER_CYLINDE
 
 @wp.func
 def _core(local: wp.transform, size: wp.vec4, kind: int, partner: int, solids: TerrainSolidData):
-    """The pair's cylinder or cone in the heightfield frame (centre, axis, radius, half height)."""
+    """The pair's cylinder (a barrel cylinder's side radius from ``scale[2]``) or cone in the heightfield frame (centre,
+    axis, radius, half height)."""
     core = TerrainCylinderCore()
     core.c = wp.transform_get_translation(local)
     core.a = wp.normalize(wp.quat_rotate(wp.transform_get_rotation(local), wp.vec3(0.0, 0.0, 1.0)))
     core.r = size[0]
     core.h = size[1]
     core.cone = int(kind == _CONE)
-    return True, core
+    if kind != _CONE:
+        core.barrel = size[2]
+    return core
 
 
 @wp.func

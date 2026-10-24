@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Solid cores of the terrain law (rounding radius 0): boxes, cylinders and cones, convex hulls and ellipsoids.
+"""Solid cores of the terrain law (rounding radius 0): boxes, cylinders (barrel cylinders too) and cones, convex hulls
+and ellipsoids.
 
 One struct per partner class, each with overloads of the same functions, which the law's generic per-pair walk
 (:mod:`terrain_law_solid`) calls:
@@ -21,8 +22,10 @@ One struct per partner class, each with overloads of the same functions, which t
 Every definition is the float64 law's (``newton/tests/terrain_law_reference.py``), in float32: the plane manifolds are
 Newton's analytic plane queries (a box's four deepest corners, the cylinder's deepest rim point with a tripod or the
 rolling points, a hull's face through its deepest vertex most opposed to the normal with that vertex, reduced to four
-by area, an ellipsoid's support point); a cone's mirrors the cylinder's with its base as the only cap. Ties are broken as the float64 law breaks them
-(lowest index first), and boundary decisions are closed by the caller's tolerances.
+by area, an ellipsoid's support point); a cone's mirrors the cylinder's with its base as the only cap, a barrel
+cylinder's takes its lowest point (Newton's support point) with the cylinder's tripod within 22.5 deg of upright. Ties
+are broken as the float64 law breaks them (lowest index first), and boundary decisions are closed by the caller's
+tolerances.
 """
 
 from __future__ import annotations
@@ -63,6 +66,9 @@ _RING_ANGLES = wp.constant(
 """``(cos, sin)`` of the rim points' angles ``2 pi i / 16`` (a table: CUDA's trigonometry fuses operations)."""
 _ELLIPSOID_STEPS = wp.constant(48)
 """Bisection steps of the ellipsoid's nearest-point (secular) equation."""
+_BARREL_STEPS = wp.constant(48)
+"""Golden-section steps of a barrel's lift to the least excess along the line, then bisection steps to its entry."""
+_GOLDEN = wp.constant(0.6180339887498949)
 
 _Vec4i = wp.types.vector(length=4, dtype=wp.int32)
 _Mat43 = wp.types.matrix(shape=(4, 3), dtype=wp.float32)
@@ -87,13 +93,16 @@ class TerrainBoxCore:
 @wp.struct
 class TerrainCylinderCore:
     """A flat-capped cylinder (``cone`` 0) or a cone (``cone`` 1): centre ``c``, unit axis ``a`` (local z), radius ``r``
-    and half height ``h``; a cone's apex is ``c + h a`` and its base disk is centred at ``c - h a``."""
+    and half height ``h``; a cone's apex is ``c + h a`` and its base disk is centred at ``c - h a``. A barrel cylinder
+    (``barrel`` the radius ``R >= h`` of its side's profile, 0 for a straight side) has caps of radius ``r`` and a side
+    of revolution of a circular arc through their rims (:func:`_barrel_radius`), Newton's barrel cylinder."""
 
     c: wp.vec3
     a: wp.vec3
     r: float
     h: float
     cone: int
+    barrel: float
 
 
 @wp.struct
@@ -467,12 +476,19 @@ def core_slope_near(
 @wp.func
 def core_manifold(core: TerrainBoxCore, n: wp.vec3, a: wp.vec3, reach: float) -> tuple[int, _Mat43, wp.vec4]:
     """Rule F's plane manifold: the four deepest corners within ``reach`` of the plane ``(n, a)``, deepest first
-    (ties within the band in corner order)."""
+    (ties within the band in corner order), each corner once: along a zero half extent (a finite plane's thickness)
+    only the corner on its lower side."""
     order = _Vec4i(-1, -1, -1, -1)
     depth = wp.vec4(_HUGE)
     count = int(0)
     band = _TIE * wp.length(core.h)
     for i in range(8):
+        if (
+            (core.h[0] == 0.0 and (i & 1) != 0)
+            or (core.h[1] == 0.0 and (i & 2) != 0)
+            or (core.h[2] == 0.0 and (i & 4) != 0)
+        ):
+            continue
         h = wp.dot(n, _box_corner(core, i) - a)
         if h > reach:
             continue
@@ -676,7 +692,56 @@ def _cone_order(core: TerrainCylinderCore, n: wp.vec3) -> tuple[wp.vec3, wp.vec3
 
 
 @wp.func
+def _barrel_radius(core: TerrainCylinderCore, z: float) -> float:
+    """A barrel's side radius at axial height ``z`` (``|z| <= h``): ``r + (h^2 - z^2) / (sqrt(R^2 - z^2) +
+    sqrt(R^2 - h^2))``, the arc through the caps' rims in Newton's support function's form (no cancellation)."""
+    r2 = core.barrel * core.barrel
+    denom = wp.sqrt(wp.max(r2 - z * z, 0.0)) + wp.sqrt(wp.max(r2 - core.h * core.h, 0.0))
+    if denom <= 0.0:
+        return core.r
+    return core.r + (core.h * core.h - z * z) / denom
+
+
+@wp.func
+def _barrel_lowest(core: TerrainCylinderCore, n: wp.vec3) -> wp.vec3:
+    """A barrel's point lowest along ``n``, Newton's support point along ``-n``: at axial height ``-R n . a`` on its
+    side, clamped to a cap's rim (its centre when the axis lies along ``n`` within :data:`_ALIGN`). The radial
+    direction is made normal to the axis again: near the axis rounding leaves ``n``'s radial part along it."""
+    z = wp.clamp(-core.barrel * wp.dot(n, core.a), -core.h, core.h)
+    perp = -_radial(n, core.a)
+    perp = perp - wp.dot(perp, core.a) * core.a
+    length2 = wp.dot(perp, perp)
+    if length2 <= _ALIGN:
+        return core.c + z * core.a
+    return core.c + z * core.a + _barrel_radius(core, z) * perp / wp.sqrt(length2)
+
+
+@wp.func
+def _barrel_side(core: TerrainCylinderCore, n: wp.vec3) -> bool:
+    """Whether a barrel's lowest point along ``n`` lies on its side's arc between the caps (a single point, its
+    derivative along a turning normal the point's)."""
+    return core.barrel * wp.abs(wp.dot(n, core.a)) < core.h
+
+
+@wp.func
+def _barrel_excess(core: TerrainCylinderCore, w: wp.vec3) -> float:
+    """How far point ``c + w`` lies outside a barrel's side at its axial height (clamped to the caps): its distance from
+    the axis less the side's radius there, convex along any line."""
+    z = wp.dot(w, core.a)
+    return wp.length(w - z * core.a) - _barrel_radius(core, wp.clamp(z, -core.h, core.h))
+
+
+@wp.func
 def core_bounds(core: TerrainCylinderCore) -> tuple[wp.vec3, wp.vec3]:
+    if core.barrel > 0.0:
+        lo = wp.vec3(0.0)
+        hi = wp.vec3(0.0)
+        for i in range(3):
+            e = wp.vec3(0.0)
+            e[i] = 1.0
+            lo[i] = _barrel_lowest(core, e)[i]
+            hi[i] = _barrel_lowest(core, -e)[i]
+        return lo, hi
     a = core.a
     ext = core.r * wp.vec3(
         wp.sqrt(wp.max(0.0, 1.0 - a[0] * a[0])),
@@ -693,7 +758,10 @@ def core_bounds(core: TerrainCylinderCore) -> tuple[wp.vec3, wp.vec3]:
 
 @wp.func
 def core_sphere(core: TerrainCylinderCore) -> tuple[wp.vec3, float]:
-    return core.c, wp.sqrt(core.r * core.r + core.h * core.h)
+    radius = wp.sqrt(core.r * core.r + core.h * core.h)
+    if core.barrel > 0.0:
+        radius = wp.max(radius, _barrel_radius(core, 0.0))
+    return core.c, radius
 
 
 @wp.func
@@ -704,14 +772,20 @@ def core_sigma_bound(core: TerrainCylinderCore, n: wp.vec3, p0: wp.vec3) -> floa
 
 @wp.func
 def core_capsule(core: TerrainCylinderCore) -> tuple[wp.vec3, wp.vec3, float]:
-    """A capsule containing the core: its axis (a cone's from its base centre to its apex) and radius."""
-    return core.c - core.h * core.a, core.c + core.h * core.a, core.r
+    """A capsule containing the core: its axis (a cone's from its base centre to its apex) and radius (a barrel's
+    side's at its middle)."""
+    radius = core.r
+    if core.barrel > 0.0:
+        radius = _barrel_radius(core, 0.0)
+    return core.c - core.h * core.a, core.c + core.h * core.a, radius
 
 
 @wp.func
 def _cylinder_lowest(core: TerrainCylinderCore, n: wp.vec3) -> wp.vec3:
     """The core's point lowest along ``n``: a cone's lowest generator end, a cylinder's lowest rim point (its cap's
-    centre when the axis lies along ``n``)."""
+    centre when the axis lies along ``n``), a barrel's :func:`_barrel_lowest`."""
+    if core.barrel > 0.0:
+        return _barrel_lowest(core, n)
     if core.cone != 0:
         k0, _k1 = _cone_order(core, n)
         return k0
@@ -726,6 +800,11 @@ def _cylinder_lowest(core: TerrainCylinderCore, n: wp.vec3) -> wp.vec3:
 
 @wp.func
 def core_sigma(core: TerrainCylinderCore, n: wp.vec3, p0: wp.vec3) -> float:
+    if core.barrel > 0.0:
+        # n . k of the lowest point k = c + z a - rho(z) P n / |P n| (no division: robust along the axis)
+        g = wp.dot(n, core.a)
+        z = wp.clamp(-core.barrel * g, -core.h, core.h)
+        return wp.dot(n, core.c - p0) + z * g - _barrel_radius(core, z) * wp.length(_radial(n, core.a))
     rim = core.r * wp.length(_radial(n, core.a))
     if core.cone != 0:
         apex = wp.dot(n, core.c + core.h * core.a - p0)
@@ -746,6 +825,9 @@ def _rim_slope(core: TerrainCylinderCore, n: wp.vec3, dn: wp.vec3, side: float) 
 
 @wp.func
 def core_slope(core: TerrainCylinderCore, n: wp.vec3, dn: wp.vec3, p0: wp.vec3, side: float) -> float:
+    if core.barrel > 0.0 and _barrel_side(core, n):
+        # a single lowest point on the side: the derivative is its own (on a cap's rim or disk, the cylinder's)
+        return wp.dot(dn, _barrel_lowest(core, n) - p0)
     rim = _rim_slope(core, n, dn, side)
     if core.cone != 0:
         apex = core.c + core.h * core.a
@@ -821,7 +903,8 @@ def core_slope_near(
 def core_manifold(core: TerrainCylinderCore, n: wp.vec3, a: wp.vec3, reach: float) -> tuple[int, _Mat43, wp.vec4]:
     """Rule F's plane manifold: Newton's plane-cylinder manifold (the deepest rim point with the fixed tripod within
     22.5 deg of upright, else the rolling points); for a cone, the deepest base rim point with the base tripod within
-    22.5 deg of base-down, else the lowest generator's two ends, the lower first."""
+    22.5 deg of base-down, else the lowest generator's two ends, the lower first; for a barrel, its lowest point with
+    the cylinder's tripod within 22.5 deg of upright (its curved side has no rolling points)."""
     points = _Mat43()
     depth = wp.vec4(_HUGE)
     merge = 0.01 * wp.max(core.r, core.h)
@@ -870,6 +953,8 @@ def core_manifold(core: TerrainCylinderCore, n: wp.vec3, a: wp.vec3, reach: floa
     if has_align:
         deepest_perp = perp_align
     first = cap + deepest_perp * core.r
+    if core.barrel > 0.0:
+        first = _barrel_lowest(core, n)
     points[0, 0] = first[0]
     points[0, 1] = first[1]
     points[0, 2] = first[2]
@@ -879,7 +964,7 @@ def core_manifold(core: TerrainCylinderCore, n: wp.vec3, a: wp.vec3, reach: floa
         count, points, depth = _manifold_add(count, points, depth, cap + u, merge)
         count, points, depth = _manifold_add(count, points, depth, cap - 0.5 * u + _TRIPOD_S * v, merge)
         count, points, depth = _manifold_add(count, points, depth, cap - 0.5 * u - _TRIPOD_S * v, merge)
-    else:
+    elif core.barrel <= 0.0:
         perp_roll = perp_fixed
         if has_align:
             perp_roll = perp_align
@@ -898,7 +983,7 @@ def core_flat_crossing(
     core: TerrainCylinderCore, n: wp.vec3, band: float, v0: wp.vec3, e1: wp.vec3, e2: wp.vec3, tol: float
 ) -> tuple[bool, TerrainCrossing]:
     """Rule E, interior ``theta*``: the flat support feature along ``n`` within ``band`` (a level cap or base disk,
-    a generator, or the lowest point) crossed with the crease's line."""
+    a generator, or the lowest point; a barrel's curved side has no generator) crossed with the crease's line."""
     tilt = wp.length(_radial(n, core.a))
     if core.cone != 0:
         if wp.dot(n, core.a) > 0.0 and 2.0 * core.r * tilt <= band:
@@ -912,7 +997,7 @@ def core_flat_crossing(
         return _disk_crossing(core.c + s * core.h * core.a, core.a, core.r, v0, e1, e2, tol, 0, 0.0)
     k0 = _cylinder_lowest(core, n)
     k1 = k0 - 2.0 * s * core.h * core.a
-    if wp.dot(n, k1 - k0) <= band:
+    if core.barrel <= 0.0 and wp.dot(n, k1 - k0) <= band:
         return _two_point_crossing(k0, k1, v0, e1, e2, tol, 0, 0.0)
     return _point_crossing(k0, v0, e1, e2, tol)
 
@@ -922,7 +1007,8 @@ def core_reference_crossing(
     core: TerrainCylinderCore, n: wp.vec3, v0: wp.vec3, e1: wp.vec3, e2: wp.vec3, tol: float, straddle_tol: float
 ) -> tuple[bool, TerrainCrossing]:
     """Rule E at an arc end (G1): the near cap (base) within 22.5 deg of level, else the lowest generator, crossed
-    with the crease's line when it straddles it."""
+    with the crease's line when it straddles it; a barrel's curved side offers its lowest point alone, which straddles
+    no line."""
     if core.cone != 0:
         if wp.dot(n, core.a) >= _FLAT_COS:
             return _disk_crossing(core.c - core.h * core.a, core.a, core.r, v0, e1, e2, tol, 1, straddle_tol)
@@ -940,6 +1026,8 @@ def core_reference_crossing(
     length = wp.length(perp)
     if length < 1.0e-12:
         return _disk_crossing(cap, axis, core.r, v0, e1, e2, tol, 1, straddle_tol)
+    if core.barrel > 0.0:
+        return False, _crossing()
     perp = perp / length
     pa = core.c - axis * core.h + perp * core.r
     pb = core.c + axis * core.h + perp * core.r
@@ -1007,20 +1095,71 @@ def core_lift(core: TerrainCylinderCore, u: wp.vec3, n: wp.vec3, tol: float) -> 
     ok, t_lo, t_hi = _slab(core.h + dw, -dn, tol, t_lo, t_hi)
     if not ok:
         return False, u, 0.0
+    radius = core.r
+    if core.barrel > 0.0:
+        if t_lo > -_HUGE and t_hi < _HUGE:
+            return _barrel_lift(core, u, n, tol, t_lo, t_hi)
+        # parallel to the caps: the side's circle at the line's height
+        radius = _barrel_radius(core, wp.clamp(dw, -core.h, core.h))
     wr = w - dw * ax
     nr = n - dn * ax
     qa = wp.dot(nr, nr)
     qb = 2.0 * wp.dot(wr, nr)
-    qc = wp.dot(wr, wr) - core.r * core.r
+    qc = wp.dot(wr, wr) - radius * radius
     if qa < 1.0e-12:
-        if qc > 2.0 * core.r * tol:
+        if qc > 2.0 * radius * tol:
             return False, u, 0.0
     else:
-        ok, t_lo, t_hi = _quadratic_entry(qa, qb, qc, t_lo, t_hi, core.r, tol)
+        ok, t_lo, t_hi = _quadratic_entry(qa, qb, qc, t_lo, t_hi, radius, tol)
         if not ok:
             return False, u, 0.0
     if t_lo > t_hi + tol or t_lo <= -_HUGE:
         return False, u, 0.0
+    return True, u + t_lo * n, t_lo
+
+
+@wp.func
+def _barrel_lift(
+    core: TerrainCylinderCore, u: wp.vec3, n: wp.vec3, tol: float, t_lo: float, t_hi: float
+) -> tuple[bool, wp.vec3, float]:
+    """Where line ``u + t n`` enters a barrel between its caps' planes (``[t_lo, t_hi]``): its side's excess along the
+    line (:func:`_barrel_excess`) is convex there, so the entry is its first zero, before its least value (a golden
+    section) when the line starts outside; a line whose least excess exceeds ``tol`` misses."""
+    w = u - core.c
+    if t_lo > t_hi + tol:
+        return False, u, 0.0
+    if _barrel_excess(core, w + t_lo * n) > 0.0:
+        a = t_lo
+        b = wp.max(t_hi, t_lo)
+        x1 = b - _GOLDEN * (b - a)
+        x2 = a + _GOLDEN * (b - a)
+        f1 = _barrel_excess(core, w + x1 * n)
+        f2 = _barrel_excess(core, w + x2 * n)
+        for _step in range(_BARREL_STEPS):
+            if f1 <= f2:
+                b = x2
+                x2 = x1
+                f2 = f1
+                x1 = b - _GOLDEN * (b - a)
+                f1 = _barrel_excess(core, w + x1 * n)
+            else:
+                a = x1
+                x1 = x2
+                f1 = f2
+                x2 = a + _GOLDEN * (b - a)
+                f2 = _barrel_excess(core, w + x2 * n)
+        least = 0.5 * (a + b)
+        if _barrel_excess(core, w + least * n) > tol:
+            return False, u, 0.0
+        lo = t_lo
+        hi = least
+        for _step in range(_BARREL_STEPS):
+            mid = 0.5 * (lo + hi)
+            if _barrel_excess(core, w + mid * n) > 0.0:
+                lo = mid
+            else:
+                hi = mid
+        t_lo = hi
     return True, u + t_lo * n, t_lo
 
 
@@ -1058,8 +1197,60 @@ def _closest_on_triangle_2d(p: wp.vec2, a: wp.vec2, b: wp.vec2, c: wp.vec2) -> w
 
 
 @wp.func
+def _barrel_nearest(core: TerrainCylinderCore, v: wp.vec3) -> tuple[bool, wp.vec3, wp.vec3, float]:
+    """:func:`core_nearest` of a barrel, in the meridian half-plane of ``v`` (radial ``x``, axial ``z``): outside, the
+    nearest of the caps' projections and the side arc's (the circle of radius ``R`` about ``(x0, 0)``, ``x0 = r -
+    sqrt(R^2 - h^2)``, where it lies between the caps); inside, the nearer of the caps and the arc."""
+    ax = core.a
+    w = v - core.c
+    z = wp.dot(w, ax)
+    rad = w - z * ax
+    x = wp.length(rad)
+    radial = wp.vec3(0.0)
+    if x > 1.0e-12:
+        radial = rad / x
+    else:
+        radial, _w = _disk_basis(ax)
+    x0 = core.r - wp.sqrt(wp.max(core.barrel * core.barrel - core.h * core.h, 0.0))
+    ox = x - x0
+    od = wp.sqrt(ox * ox + z * z)
+    # the side arc's point along the ray from its circle's centre, when on the side (between the caps, on the far
+    # side of the centre: from a point nearer the axis the side's nearest point is a rim, no nearer than a cap)
+    arc = od > 0.0 and ox >= 0.0 and wp.abs(core.barrel * z) <= core.h * od
+    ax2 = x0 + core.barrel * ox / wp.max(od, 1.0e-30)
+    az2 = core.barrel * z / wp.max(od, 1.0e-30)
+    if wp.abs(z) <= core.h and x <= _barrel_radius(core, z):
+        # inside: the cap or the side, whichever is nearer
+        d_cap = core.h - wp.abs(z)
+        if arc and core.barrel - od < d_cap:
+            f = (ox * radial + z * ax) / od
+            d = core.barrel - od
+            return True, -f, v + d * f, -d
+        f = ax * wp.where(z >= 0.0, 1.0, -1.0)
+        return True, -f, v + d_cap * f, -d_cap
+    # outside: the caps' nearest points and the arc's
+    sz = wp.where(z >= 0.0, 1.0, -1.0)
+    bx = wp.min(x, core.r)
+    bz = sz * core.h
+    best = (x - bx) * (x - bx) + (z - bz) * (z - bz)
+    if arc:
+        d2 = (x - ax2) * (x - ax2) + (z - az2) * (z - az2)
+        if d2 < best:
+            best = d2
+            bx = ax2
+            bz = az2
+    k = core.c + bz * ax + bx * radial
+    dist = wp.length(k - v)
+    if dist <= 0.0:
+        return False, ax, k, 0.0
+    return True, (k - v) / dist, k, dist
+
+
+@wp.func
 def core_nearest(core: TerrainCylinderCore, v: wp.vec3) -> tuple[bool, wp.vec3, wp.vec3, float]:
     ax = core.a
+    if core.barrel > 0.0:
+        return _barrel_nearest(core, v)
     if core.cone != 0:
         apex = core.c + core.h * ax
         w = v - apex
@@ -1114,13 +1305,15 @@ def core_nearest(core: TerrainCylinderCore, v: wp.vec3) -> tuple[bool, wp.vec3, 
 def core_recovery_count(core: TerrainCylinderCore) -> int:
     if core.cone != 0:
         return _RING + 1
+    if core.barrel > 0.0:
+        return 3 * _RING
     return 2 * _RING
 
 
 @wp.func
 def core_recovery_point(core: TerrainCylinderCore, i: int) -> wp.vec3:
-    """Rule R's boundary point ``i``: 16 rim points per cap (the top cap first); a cone's 16 base rim points, then its
-    apex."""
+    """Rule R's boundary point ``i``: 16 rim points per cap (the top cap first), then a barrel's 16 points around its
+    side's middle; a cone's 16 base rim points, then its apex."""
     u, w = _disk_basis(core.a)
     j = i % _RING
     ring = core.r * (_RING_ANGLES[j, 0] * u + _RING_ANGLES[j, 1] * w)
@@ -1130,6 +1323,8 @@ def core_recovery_point(core: TerrainCylinderCore, i: int) -> wp.vec3:
         return core.c - core.h * core.a + ring
     if i < _RING:
         return core.c + core.h * core.a + ring
+    if i >= 2 * _RING:
+        return core.c + (_barrel_radius(core, 0.0) / core.r) * ring
     return core.c - core.h * core.a + ring
 
 

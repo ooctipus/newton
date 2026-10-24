@@ -1027,9 +1027,10 @@ often be improved by attaching a precomputed SDF to the mesh (``mesh.build_sdf(.
 
 .. note::
    **Heightfield representation:** A heightfield (``HFIELD``) stores a regular 2D grid
-   of elevation samples. For rigid contacts with spheres, capsules, boxes, cylinders,
-   cones, ellipsoids and convex hulls, the collision pipeline's terrain law writes the
-   contacts by default: after the narrow phase it walks each pair's window of the grid
+   of elevation samples. For rigid contacts with spheres, capsules, boxes, cylinders
+   (barrel cylinders too), cones, ellipsoids, convex hulls and finite planes on bodies (a
+   box of no thickness), the collision pipeline's terrain law writes the contacts by
+   default: after the narrow phase it walks each pair's window of the grid
    and writes one contact per support it finds there, a terrain face, edge or vertex
    within reach, so that supports on edges and creases are kept and no pair that
    penetrates the terrain over its footprint is left without a contact. The law takes the
@@ -1038,9 +1039,9 @@ often be improved by attaching a precomputed SDF to the mesh (``mesh.build_sdf(.
    face's contacts at its deepest points over the footprint (clipped at the border's edge),
    a body beside the border gets contacts on the walls, the border's edges and the corners'
    vertical lines, and a body inside the footprint below the surface exits through the top.
-   Mesh-vs-heightfield routes through
-   the mesh/SDF path with on-the-fly triangle extraction from the grid. Other partners
-   (planes, barrel cylinders) and the configurations the law does not support yet
+   Mesh-vs-heightfield routes through the mesh/SDF path with on-the-fly triangle
+   extraction from the grid. An infinite plane on a body meets the whole heightfield: the
+   law refuses it at construction. The configurations the law does not support yet
    (speculative contacts, the ``NEWTON_TERRAIN_LAW_SHADOW`` comparison mode, a prebuilt
    narrow phase with its own contact writer) take the terrain route: per-cell triangle
    GJK/MPR with contact reduction. ``get_collision_selection()["heightfield"]["law"]``

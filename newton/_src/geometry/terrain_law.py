@@ -218,8 +218,6 @@ TERRAIN_PAIR_WIDE = wp.constant(64)
 TERRAIN_PAIR_DEFERRED = wp.constant(128)
 """Pair state, transient: the pair's rows need more than its walk slots (or, for the point class, the general finish),
 and it awaits its class's finish of deferred pairs (:func:`terrain_defer_pair`)."""
-TERRAIN_PAIR_UNSUPPORTED = wp.constant(256)
-"""Pair state: the partner's shape has no core in the law yet (a barrel cylinder in the hull class; no row)."""
 TERRAIN_PAIR_JOBS = wp.constant(1024)
 """Pair state, transient: a solid pair's scan listed its window's features for its class's job kernels, and its close
 kernel takes their rows."""
@@ -2418,8 +2416,8 @@ def terrain_pair_exit(out: TerrainLawRows, pair: int, state: int):
     """Record a pair that has no row, with its ``TERRAIN_PAIR_*`` bits, raising ``terrain_stale`` for stale features.
 
     Every per-type kernel's early exit (:data:`TERRAIN_PAIR_STALE`, :data:`TERRAIN_PAIR_FILTERED`,
-    :data:`TERRAIN_PAIR_OUTSIDE`, :data:`TERRAIN_PAIR_TILE_EXIT`, :data:`TERRAIN_PAIR_UNSUPPORTED`), and rows the spill
-    region has no room for (:func:`terrain_spill_rows`).
+    :data:`TERRAIN_PAIR_OUTSIDE`, :data:`TERRAIN_PAIR_TILE_EXIT`), and rows the spill region has no room for
+    (:func:`terrain_spill_rows`).
     """
     out.first[pair] = -1
     out.count[pair] = 0

@@ -25,7 +25,6 @@ from .terrain_law_solid import TerrainSolidData, TerrainSolidJobs, solid_kernels
 from .types import GeoType
 
 _ELLIPSOID = wp.constant(int(GeoType.ELLIPSOID))
-_CONVEX_MESH = wp.constant(int(GeoType.CONVEX_MESH))
 
 # Every float32 operation rounds as on the CPU (see the module docstring).
 wp.set_module_options({"fuse_fp": False})
@@ -36,8 +35,9 @@ TERRAIN_HULL_WALK_SLOTS = TERRAIN_PARTNER_WALK_SLOTS[TERRAIN_PARTNER_HULL]
 
 @wp.func
 def _core(local: wp.transform, size: wp.vec4, kind: int, partner: int, solids: TerrainSolidData):
-    """The pair's convex hull (its points and faces from the hull table, scaled) or ellipsoid (semi-axes) in the
-    heightfield frame; ``False`` for a shape of the class with no core yet (a barrel cylinder)."""
+    """The pair's convex hull (its points and faces from the hull table, scaled; every convex-mesh partner has one,
+    :func:`~newton._src.geometry.terrain_law_solid.terrain_solid_data`) or ellipsoid (semi-axes) in the heightfield
+    frame."""
     core = TerrainHullCore()
     core.c = wp.transform_get_translation(local)
     core.rot = wp.quat_to_matrix(wp.normalize(wp.transform_get_rotation(local)))
@@ -48,12 +48,8 @@ def _core(local: wp.transform, size: wp.vec4, kind: int, partner: int, solids: T
         core.radius = wp.max(core.s[0], wp.max(core.s[1], core.s[2]))
         core.box_c = wp.vec3(0.0)
         core.box_h = core.s
-        return True, core
-    if kind != _CONVEX_MESH:
-        return False, core
+        return core
     hull = solids.hulls.shape_hull[partner]
-    if hull < 0:
-        return False, core
     points = solids.hulls.hull_points[hull]
     faces = solids.hulls.hull_faces[hull]
     triangles = solids.hulls.hull_triangles[hull]
@@ -85,7 +81,7 @@ def _core(local: wp.transform, size: wp.vec4, kind: int, partner: int, solids: T
     # centre and half extents, the half extents rounded up so that the box holds every point in float32
     core.box_c = 0.5 * (box_lo + box_hi)
     core.box_h = 0.5 * (box_hi - box_lo) * (1.0 + 4.0 * 1.1920929e-07) + wp.vec3(1.0e-9)
-    return True, core
+    return core
 
 
 @wp.func

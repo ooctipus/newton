@@ -123,7 +123,6 @@ from .terrain_law import (
     TERRAIN_PAIR_RESERVE,
     TERRAIN_PAIR_STALE,
     TERRAIN_PAIR_TILE_EXIT,
-    TERRAIN_PAIR_UNSUPPORTED,
     TERRAIN_PAIR_WIDE,
     TERRAIN_STATUS_JOBS,
     TERRAIN_VERTEX_FEATURE_BIT,
@@ -2339,13 +2338,6 @@ def solid_finish_deferred(
     )
 
 
-@wp.func
-def solid_unsupported(out: TerrainLawRows, pair_index: int):
-    """Record a pair whose partner has no core in the law (no row,
-    :func:`~newton._src.geometry.terrain_law.terrain_pair_exit`)."""
-    terrain_pair_exit(out, pair_index, TERRAIN_PAIR_UNSUPPORTED)
-
-
 # ----------------------------------------------------------------------------------------------------------------
 # the kernels of one solid class
 # ----------------------------------------------------------------------------------------------------------------
@@ -2391,8 +2383,8 @@ def solid_kernels(
         scan_run: Window vertices of one scan job of the class
             (:data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_SCAN_RUN`), at most
             :data:`TERRAIN_SOLID_SCAN_VERTICES`.
-        make_core: ``wp.func`` ``(local, size, kind, partner, solids) -> (supported, core)``: a pair's core in the
-            heightfield frame.
+        make_core: ``wp.func`` ``(local, size, kind, partner, solids) -> core``: a pair's core in the heightfield
+            frame.
         save_core: ``wp.func`` ``(jobs, i, core)``: keep class pair ``i``'s core (window frame) for its jobs.
         load_core: ``wp.func`` ``(jobs, i, solids) -> core``: class pair ``i``'s kept core.
         module: The module the kernels join.
@@ -2412,9 +2404,9 @@ def solid_kernels(
         jobs: TerrainSolidJobs,
         solids: TerrainSolidData,
     ):
-        """The whole-pair rejects, one thread per pair of the class (stale features, the pair policy, a partner without
-        a core, a window off the heightfield, the tile-max exit): a pair past them keeps its core and record (window
-        frame) for its scan and jobs, is listed live (:attr:`TerrainSolidJobs.live`) for the close, its window's runs
+        """The whole-pair rejects, one thread per pair of the class (stale features, the pair policy, a window off the
+        heightfield, the tile-max exit): a pair past them keeps its core and record (window frame) for its scan and
+        jobs, is listed live (:attr:`TerrainSolidJobs.live`) for the close, its window's runs
         for the scan (:attr:`TerrainSolidJobs.scans`), and takes state
         :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_JOBS`; any other is recorded with no row."""
         i = wp.tid()
@@ -2423,10 +2415,7 @@ def solid_kernels(
         if state != 0:
             terrain_pair_exit(out, pair, state)
             return
-        supported, core = wp.static(make_core)(local, size, inputs.shape_type[partner], partner, solids)
-        if not supported:
-            solid_unsupported(out, pair)
-            return
+        core = wp.static(make_core)(local, size, inputs.shape_type[partner], partner, solids)
         state, cells, lo, hi = solid_pair_cells(core, data, heightfield, reach)
         if state != 0:
             terrain_pair_exit(out, pair, state)
@@ -2839,24 +2828,6 @@ def build_hull_table(meshes: list[np.ndarray], shape_hull: np.ndarray, device) -
     )
     table.shape_hull = array(np.asarray(shape_hull, np.int32), wp.int32, np.full(1, -1, np.int32))
     return table
-
-
-def terrain_solid_unsupported(partner_class: np.ndarray, shape_type: np.ndarray) -> np.ndarray:
-    """Whether solid partners have no core in the law yet (their pairs get no row and state
-    :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_UNSUPPORTED`): in the hull class, a shape that is neither a
-    convex hull nor an ellipsoid (a barrel cylinder).
-
-    Args:
-        partner_class: Partner class of every partner
-            (:func:`~newton._src.geometry.terrain_contacts.terrain_partner_classes`).
-        shape_type: Geometry type of every partner.
-    """
-    from .terrain_contacts import TERRAIN_PARTNER_HULL  # noqa: PLC0415
-    from .types import GeoType  # noqa: PLC0415
-
-    kind = np.asarray(shape_type)
-    cored = (kind == int(GeoType.CONVEX_MESH)) | (kind == int(GeoType.ELLIPSOID))
-    return (np.asarray(partner_class) == TERRAIN_PARTNER_HULL) & ~cored
 
 
 def terrain_solid_data(model, partners: np.ndarray) -> TerrainSolidData:

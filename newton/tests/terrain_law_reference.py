@@ -920,6 +920,9 @@ class Polytope(Core):
         for i, j in self.edges():
             a, b = self.verts[i], self.verts[j]
             ab = b - a
+            if float(ab @ ab) == 0.0:
+                # a zero-thickness box's coincident corners
+                continue
             s = float(np.clip((v - a) @ ab / (ab @ ab), 0.0, 1.0))
             p = a + s * ab
             d = float(np.linalg.norm(p - v))
@@ -982,10 +985,13 @@ class Box(Polytope):
 
     def plane_manifold(self, n, a, D):
         """Newton's plane-box manifold: up to 4 deepest corners within reach, deepest first; a corner passes a kept one
-        only when deeper by more than the tie band (else corner order holds)."""
+        only when deeper by more than the tie band (else corner order holds). Each corner once: along a zero half
+        extent (a finite plane's thickness) only the corner on its lower side."""
         band = TIE * float(np.linalg.norm(self.half))
         kept = []
         for i in range(8):
+            if any(self.half[axis] == 0.0 and (i >> axis) & 1 for axis in range(3)):
+                continue
             h = float(n @ (self.verts[i] - a))
             if h > D:
                 continue
@@ -1143,6 +1149,148 @@ class Cylinder(Core):
         if t_lo > t_hi + LIFT_SLACK or not np.isfinite(t_lo):
             return None
         return u + t_lo * n, t_lo
+
+
+class Barrel(Cylinder):
+    """A barrel cylinder (Newton's ``scale[2]``): caps of radius ``r`` at ``+-h`` along the axis and a side of
+    revolution of a circular arc of radius ``R >= h`` through the caps' rims (:meth:`rho`). Its plane manifold is its
+    lowest point (Newton's support point) with the cylinder's tripod within 22.5 deg of upright; its curved side has no
+    generator."""
+
+    kind = "barrel"
+
+    def __init__(self, c, axis, radius, half_height, barrel):
+        super().__init__(c, axis, radius, half_height)
+        self.R = float(barrel)
+
+    def rho(self, z):
+        """The side's radius at axial height ``z`` (``|z| <= h``), in Newton's support function's form."""
+        denom = math.sqrt(max(self.R**2 - z * z, 0.0)) + math.sqrt(max(self.R**2 - self.h**2, 0.0))
+        return self.r if denom <= 0.0 else self.r + (self.h**2 - z * z) / denom
+
+    def lowest(self, n):
+        ax = self.axis
+        z = min(max(-self.R * float(n @ ax), -self.h), self.h)
+        perp = -n + ax * float(n @ ax)
+        ln2 = float(perp @ perp)
+        if ln2 <= 1e-10:
+            return self.c + z * ax
+        return self.c + z * ax + self.rho(z) * perp / math.sqrt(ln2)
+
+    def aabb(self):
+        lo, hi = np.zeros(3), np.zeros(3)
+        for i in range(3):
+            e = np.zeros(3)
+            e[i] = 1.0
+            lo[i] = self.lowest(e)[i]
+            hi[i] = self.lowest(-e)[i]
+        return lo, hi
+
+    def plane_manifold(self, n, a, D):
+        axis = self.axis.copy()
+        dot_na = float(n @ axis)
+        if dot_na > TIE:
+            axis = -axis
+            dot_na = -dot_na
+        cap = self.c + axis * self.h
+        pts = [self.lowest(n)]
+        if -dot_na >= CYLINDER_FLAT_MODE_COS:
+            ref = np.array([1.0, 0.0, 0.0])
+            if abs(axis @ ref) > 0.9:
+                ref = np.array([0.0, 1.0, 0.0])
+            perp_fixed = ref - axis * (axis @ ref)
+            perp_fixed /= np.linalg.norm(perp_fixed)
+            u = perp_fixed * self.r
+            v = np.cross(axis, perp_fixed) * self.r
+            merge = (0.01 * max(self.r, self.h)) ** 2
+            for p in (cap + u, cap - 0.5 * u + 0.8660254 * v, cap - 0.5 * u - 0.8660254 * v):
+                if len(pts) < 4 and np.sum((p - pts[0]) ** 2) > merge:
+                    pts.append(p)
+        out = []
+        for p in pts:
+            hh = float(n @ (p - a))
+            if hh <= D:
+                out.append((p, hh))
+        return out
+
+    def excess(self, x):
+        """How far ``x`` lies outside the side at its axial height (clamped to the caps): convex along any line."""
+        w = x - self.c
+        z = float(w @ self.axis)
+        return float(np.linalg.norm(w - z * self.axis)) - self.rho(min(max(z, -self.h), self.h))
+
+    def lift(self, u, n):
+        """Entry of the line u + t n into the barrel (smallest t): the caps' slab, then the side's excess along the
+        line, convex there: a golden section to its least value, a bisection to its first zero before it."""
+        ax = self.axis
+        w = u - self.c
+        dn, dw = float(n @ ax), float(w @ ax)
+        if abs(dn) < 1e-14:
+            if abs(dw) > self.h + LIFT_SLACK:
+                return None
+            # parallel to the caps: the side's circle at the line's height
+            return Cylinder(self.c, ax, self.rho(min(max(dw, -self.h), self.h)), self.h).lift(u, n)
+        t1, t2 = (-self.h - dw) / dn, (self.h - dw) / dn
+        t_lo, t_hi = min(t1, t2), max(t1, t2)
+        if self.excess(u + t_lo * n) > 0.0:
+            g = (math.sqrt(5.0) - 1.0) / 2.0
+            a, b = t_lo, t_hi
+            for _ in range(120):
+                c, d = b - g * (b - a), a + g * (b - a)
+                if self.excess(u + c * n) <= self.excess(u + d * n):
+                    b = d
+                else:
+                    a = c
+            least = 0.5 * (a + b)
+            if self.excess(u + least * n) > LIFT_SLACK:
+                return None
+            lo, hi = t_lo, least
+            for _ in range(120):
+                mid = 0.5 * (lo + hi)
+                if self.excess(u + mid * n) > 0.0:
+                    lo = mid
+                else:
+                    hi = mid
+            t_lo = hi
+        return u + t_lo * n, t_lo
+
+    def contains(self, x):
+        w = x - self.c
+        z = float(w @ self.axis)
+        return abs(z) <= self.h and float(np.linalg.norm(w - z * self.axis)) <= self.rho(z)
+
+    def nearest(self, v):
+        """:func:`_nearest`'s ``(n, k, d)``, in the meridian half-plane of ``v`` (radial ``x``, axial ``z``): outside,
+        the nearest of the near cap's projection and the side arc's (the circle of radius ``R`` about ``(x0, 0)``,
+        ``x0 = r - sqrt(R^2 - h^2)``, where it lies on the side); inside, the nearer of the cap and the arc."""
+        ax = self.axis
+        w = v - self.c
+        z = float(w @ ax)
+        rad = w - z * ax
+        x = float(np.linalg.norm(rad))
+        radial = rad / x if x > 1e-12 else _disk_basis(ax)[0]
+        x0 = self.r - math.sqrt(max(self.R**2 - self.h**2, 0.0))
+        ox = x - x0
+        od = math.hypot(ox, z)
+        arc = od > 0.0 and ox >= 0.0 and abs(self.R * z) <= self.h * od
+        if abs(z) <= self.h and x <= self.rho(z):
+            d_cap = self.h - abs(z)
+            if arc and self.R - od < d_cap:
+                f = (ox * radial + z * ax) / od
+                d = self.R - od
+                return -f, v + d * f, -d
+            f = ax * (1.0 if z >= 0.0 else -1.0)
+            return -f, v + d_cap * f, -d_cap
+        sz = 1.0 if z >= 0.0 else -1.0
+        cands = [(min(x, self.r), sz * self.h)]
+        if arc:
+            cands.append((x0 + self.R * ox / od, self.R * z / od))
+        bx, bz = min(cands, key=lambda p: (x - p[0]) ** 2 + (z - p[1]) ** 2)
+        k = self.c + bz * ax + bx * radial
+        dist = float(np.linalg.norm(k - v))
+        if dist <= 0.0:
+            return None
+        return (k - v) / dist, k, dist
 
 
 def _disk_basis(axis):
@@ -1380,8 +1528,10 @@ class Ellipsoid(Core):
 def make_core(kind: str, dims: dict, pose_local, *, verts=None) -> Core:
     """A core in the heightfield-local frame: ``pose_local`` = (px, py, pz, qx, qy, qz, qw).
 
-    ``dims``: sphere ``radius``; capsule, cylinder and cone ``radius`` and ``half_height``; box ``half``; ellipsoid
-    ``semi`` (semi-axes); hull ``verts`` (its local vertices, scale applied).
+    ``dims``: sphere ``radius``; capsule, cylinder and cone ``radius`` and ``half_height``; barrel ``radius``,
+    ``half_height`` and ``barrel`` (its side's profile radius); box ``half``; plane ``size`` (width and length: a box of
+    half its width and length and no thickness); ellipsoid ``semi`` (semi-axes); hull ``verts`` (its local vertices,
+    scale applied).
     """
     p = np.asarray(pose_local[:3], np.float64)
     q = np.asarray(pose_local[3:7], np.float64)
@@ -1396,6 +1546,10 @@ def make_core(kind: str, dims: dict, pose_local, *, verts=None) -> Core:
         return Box(p, R, dims["half"])
     if kind == "cylinder":
         return Cylinder(p, z, dims["radius"], dims["half_height"])
+    if kind == "barrel":
+        return Barrel(p, z, dims["radius"], dims["half_height"], dims["barrel"])
+    if kind == "plane":
+        return Box(p, R, (0.5 * dims["size"][0], 0.5 * dims["size"][1], 0.0))
     if kind == "cone":
         return Cone(p, z, dims["radius"], dims["half_height"])
     if kind == "ellipsoid":
@@ -1645,8 +1799,9 @@ def _recovery_row(hf, p, feat):
 
 
 def solid_recovery_points(core):
-    """The boundary points G3 tries for a solid core: polytope vertices; a cylinder's 16 rim points per cap; a cone's
-    16 base rim points and its apex; an ellipsoid's 14 points on its local axes and diagonals."""
+    """The boundary points G3 tries for a solid core: polytope vertices; a cylinder's 16 rim points per cap (a barrel's
+    then 16 around its side's middle); a cone's 16 base rim points and its apex; an ellipsoid's 14 points on its local
+    axes and diagonals."""
     if hasattr(core, "verts"):
         return core.verts
     th = np.linspace(0.0, 2.0 * np.pi, 16, endpoint=False)
@@ -1662,14 +1817,17 @@ def solid_recovery_points(core):
     ring = core.r * (np.outer(np.cos(th), u) + np.outer(np.sin(th), w))
     if core.kind == "cone":
         return np.concatenate([core.base + ring, core.apex[None, :]])
-    return np.concatenate([core.c + core.h * ax + ring, core.c - core.h * ax + ring])
+    rims = [core.c + core.h * ax + ring, core.c - core.h * ax + ring]
+    if core.kind == "barrel":
+        rims.append(core.c + (core.rho(0.0) / core.r) * ring)
+    return np.concatenate(rims)
 
 
 def _solid_recovery(hf, core, *, kmax=4):
     """G3 for solid cores with no row: up to 4 of the core's deepest boundary points below the surface, clipped to the
     footprint (a point outside it has no face above it; the core's part inside it on a border edge's clip plane below
     the edge's face is rule F's clip row, :func:`_clip_points`, so a pair left to rule R has none)."""
-    if hasattr(core, "verts") or core.kind in ("cone", "ellipsoid"):
+    if hasattr(core, "verts") or core.kind in ("cone", "ellipsoid", "barrel"):
         pts = solid_recovery_points(core)
     else:
         ax = core.axis
@@ -1907,11 +2065,18 @@ def _support_feature(core, n, band):
     or a cylinder's lowest point or generator, ('disk', centre, axis, r) for a cylinder cap within the band.
 
     A cone's is its base disk (base down within the band), the lowest generator (both ends within the band) or its
-    lowest point; an ellipsoid's is its support point."""
+    lowest point; an ellipsoid's is its support point; a barrel's a cap within the band or its lowest point."""
     if hasattr(core, "verts"):
         h = core.verts @ n
         return ("pts", core.verts[h <= h.min() + band])
     if core.kind == "ellipsoid":
+        return ("pts", core.lowest(n)[None, :])
+    if core.kind == "barrel":
+        # a level cap within the band, else the lowest point (the curved side has no generator)
+        ax = core.axis
+        tilt = math.sqrt(max(0.0, 1.0 - float(n @ ax) ** 2))
+        if 2.0 * core.r * tilt <= band:
+            return ("disk", core.c + (-1.0 if n @ ax > 0 else 1.0) * core.h * ax, ax, core.r)
         return ("pts", core.lowest(n)[None, :])
     if core.kind == "cone":
         ax = core.axis
@@ -1938,7 +2103,7 @@ def _support_feature(core, n, band):
 def _reference_feature(core, n):
     """The core's reference feature at normal n, as the plane manifold sees it (G1): a polytope's face through its
     deepest vertex that is most opposed to n; a cylinder's near cap inside the 22.5 deg flat mode, else its lowest
-    generator."""
+    generator (a barrel's lowest point)."""
     if hasattr(core, "verts"):
         h = core.verts @ n
         radius = float(np.linalg.norm(core.verts - core.c, axis=1).max())
@@ -1947,6 +2112,12 @@ def _reference_feature(core, n):
         k = through[first_within([-float(core.fnormals[q] @ n) for q in through], TIE, largest=True)]
         return ("pts", core.verts[core.faces[k]])
     if core.kind == "ellipsoid":
+        return ("pts", core.lowest(n)[None, :])
+    if core.kind == "barrel":
+        # The near cap within the flat mode, else the lowest point (which straddles no line).
+        axis = core.axis if float(n @ core.axis) < 0.0 else -core.axis
+        if -float(n @ axis) >= CYLINDER_FLAT_MODE_COS:
+            return ("disk", core.c + core.h * axis, axis, core.r)
         return ("pts", core.lowest(n)[None, :])
     if core.kind == "cone":
         # The base within the flat mode, else the lowest generator (the apex alone when the axis is along n).
@@ -2368,6 +2539,8 @@ def solid_law(hf, core, D, window, *, stats=None, flat_band=None):
 def _nearest(core, v):
     """(n, k, d): the direction from v to the core's nearest point k and the distance d, or, with v inside the
     core, the direction that expels v fastest with d = -depth."""
+    if core.kind == "barrel":
+        return core.nearest(v)
     kc = _closest_point(core, v)
     if kc is not None:
         w = kc - v

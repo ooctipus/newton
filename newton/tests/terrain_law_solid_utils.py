@@ -74,6 +74,12 @@ def add_solid(builder, kind, dims, pose, cfg):
         return builder.add_shape_box(body, hx=h[0], hy=h[1], hz=h[2], cfg=cfg)
     if kind == "cylinder":
         return builder.add_shape_cylinder(body, radius=dims["radius"], half_height=dims["half_height"], cfg=cfg)
+    if kind == "barrel":
+        return builder.add_shape_cylinder(
+            body, radius=dims["radius"], half_height=dims["half_height"], barrel_radius=dims["barrel"], cfg=cfg
+        )
+    if kind == "plane":
+        return builder.add_shape_plane(body=body, width=dims["size"][0], length=dims["size"][1], cfg=cfg)
     if kind == "cone":
         return builder.add_shape_cone(body, radius=dims["radius"], half_height=dims["half_height"], cfg=cfg)
     if kind == "ellipsoid":
@@ -223,9 +229,10 @@ def boundary_samples(core, step=0.002) -> np.ndarray:
     m = int(np.ceil(2.0 * np.pi * core.r / step)) + 1
     phi = np.linspace(0.0, 2.0 * np.pi, m, endpoint=False)
     ring = np.outer(np.cos(phi), u) + np.outer(np.sin(phi), w)
-    if kind == "cylinder":
-        zs = np.linspace(-core.h, core.h, int(np.ceil(2.0 * core.h / step)) + 1)
-        pts.append((core.c + zs[:, None, None] * ax + core.r * ring[None]).reshape(-1, 3))
+    if kind in ("cylinder", "barrel"):
+        # the side by arc length along its profile
+        zs, radii = _side_profile(core, np.linspace(0.0, 1.0, int(np.ceil(_side_length(core) / step)) + 1))
+        pts.append((core.c + zs[:, None, None] * ax + radii[:, None, None] * ring[None]).reshape(-1, 3))
         for sign in (-1.0, 1.0):
             for rho in np.linspace(0.0, core.r, int(np.ceil(core.r / step)) + 1):
                 pts.append(core.c + sign * core.h * ax + rho * ring)
@@ -236,6 +243,26 @@ def boundary_samples(core, step=0.002) -> np.ndarray:
     for rho in np.linspace(0.0, core.r, int(np.ceil(core.r / step)) + 1):
         pts.append(core.base + rho * ring)
     return np.concatenate(pts)
+
+
+def _side_profile(core, v) -> tuple[np.ndarray, np.ndarray]:
+    """A cylinder's side profile at parameters ``v`` in ``[0, 1]``, by arc length: ``(z, radius)``. A barrel's arc
+    (:class:`terrain_law_reference.Barrel`) by its angle, so that its steep ends near the rims are sampled as finely as
+    its middle."""
+    v = np.asarray(v, np.float64)
+    if core.kind != "barrel":
+        return (2.0 * v - 1.0) * core.h, np.full(v.shape, core.r)
+    span = math.asin(min(core.h / core.R, 1.0))
+    phi = (2.0 * v - 1.0) * span
+    x0 = core.r - math.sqrt(max(core.R**2 - core.h**2, 0.0))
+    return core.R * np.sin(phi), x0 + core.R * np.cos(phi)
+
+
+def _side_length(core) -> float:
+    """The length of a cylinder's side profile (a barrel's arc)."""
+    if core.kind != "barrel":
+        return 2.0 * core.h
+    return 2.0 * core.R * math.asin(min(core.h / core.R, 1.0))
 
 
 def _surface_triangles(hf: ref.ReferenceHeightfield, lo, hi):
@@ -384,14 +411,13 @@ def boundary_patches(core) -> list:
         th = 2.0 * np.pi * u
         return np.cos(th)[:, None] * w1[None] + np.sin(th)[:, None] * w2[None]
 
-    if kind == "cylinder":
-        patches.append(
-            (
-                lambda u, v: core.c + ((2.0 * v - 1.0) * core.h)[:, None] * ax + core.r * ring(u),
-                2 * np.pi * core.r,
-                2 * core.h,
-            )
-        )
+    if kind in ("cylinder", "barrel"):
+
+        def side(u, v):
+            zs, radii = _side_profile(core, v)
+            return core.c + zs[:, None] * ax + radii[:, None] * ring(u)
+
+        patches.append((side, 2 * np.pi * float(_side_profile(core, np.full(1, 0.5))[1][0]), _side_length(core)))
         for sign in (-1.0, 1.0):
             patches.append(
                 (

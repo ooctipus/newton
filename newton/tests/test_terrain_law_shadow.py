@@ -765,7 +765,7 @@ class TestTerrainLawShadow(unittest.TestCase):
 
     def test_route_record_of_solid_classes_cpu(self):
         """Record the solid classes' pairs per lane class, launches, data, job scale, kernel grids, job capacities and
-        reserves and coreless pairs: one block size, one thread per pair for the whole-pair rejects, the job threads for
+        reserves (a barrel cylinder's in the cylinder class): one block size, one thread per pair for the whole-pair rejects, the job threads for
         the others, the grid of the finish of deferred pairs, and job lists and a candidate pool sized from the pairs'
         own bounds, the scan's jobs exactly, each with a reserve of the class's largest pairs' work."""
         rng = np.random.default_rng(8)
@@ -786,7 +786,7 @@ class TestTerrainLawShadow(unittest.TestCase):
         builder.add_shape_box(builder.add_body(xform=wp.transform(wp.vec3(-0.2, 0.0, 0.05))), hx=0.03, hy=0.03, hz=0.03)
         barrel = builder.add_body(xform=wp.transform(wp.vec3(0.2, 0.0, 0.05)))
         builder.add_shape(body=barrel, type=newton.GeoType.CYLINDER, scale=wp.vec3(0.03, 0.04, 0.2), cfg=cfg)
-        for scene, unsupported in ((model, 0), (builder.finalize(device="cpu"), 1)):
+        for scene in (model, builder.finalize(device="cpu")):
             pipeline = tu.shadow_pipeline(scene, classes="box,cylinder,hull", **PIPELINE)
             record = pipeline.get_collision_selection()["heightfield"]["law_shadow"]
             self.assertTrue(record["enabled"])
@@ -869,7 +869,6 @@ class TestTerrainLawShadow(unittest.TestCase):
                     )
             self.assertEqual(record["launches"], launches)
             self.assertEqual(record["job_scale"], 1.0)
-            self.assertEqual(record["unsupported_pairs"], unsupported)
             self.assertGreater(record["bytes"]["solid_data"], 0)
             self.assertGreater(record["bytes"]["jobs"], 0)
             self.assertEqual(record["bytes"]["work_lists"], 0)

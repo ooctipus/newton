@@ -68,11 +68,11 @@ TERRAIN_CLUSTER_ROUNDS = 8
 TERRAIN_PARTNER_POINT = 0
 """Partner class of point and segment cores: spheres and capsules."""
 TERRAIN_PARTNER_BOX = 1
-"""Partner class of boxes."""
+"""Partner class of boxes and finite planes (a box of no thickness)."""
 TERRAIN_PARTNER_CYLINDER = 2
-"""Partner class of flat-capped cylinders and cones."""
+"""Partner class of cylinders (flat-sided and barrel) and cones."""
 TERRAIN_PARTNER_HULL = 3
-"""Partner class of the support-function cores: convex meshes, ellipsoids and barrel cylinders."""
+"""Partner class of the support-function cores: convex meshes and ellipsoids."""
 TERRAIN_PARTNER_CLASSES = 4
 TERRAIN_PARTNER_WALK_SLOTS = (8, 16, 16, 24)
 """Walk slots of a pair of each partner class in the law's side buffer, the fast path's layout: its walk holds its
@@ -1351,10 +1351,11 @@ def _cross(first: np.ndarray, second: np.ndarray) -> np.ndarray:
 
 
 def terrain_partner_classes(shape_type: np.ndarray, shape_scale: np.ndarray) -> np.ndarray:
-    """Return the law's partner class of every shape (-1 when the law has none: meshes, planes, heightfields).
+    """Return the law's partner class of every shape (-1 when the law has none: meshes, infinite planes,
+    heightfields).
 
-    Flat-capped cylinders take the cylinder class; a barrel cylinder (a nonzero barrel radius in ``scale[2]``)
-    takes the support-function class with hulls and ellipsoids.
+    Cylinders, barrel cylinders (a nonzero barrel radius in ``scale[2]``) among them, take the cylinder class with
+    cones; a finite plane (:func:`terrain_finite_planes`) takes the box class.
 
     Args:
         shape_type: Geometry type of every shape.
@@ -1364,16 +1365,20 @@ def terrain_partner_classes(shape_type: np.ndarray, shape_scale: np.ndarray) -> 
         The partner class of every shape, int32.
     """
     kind = np.asarray(shape_type)
-    barrel = np.asarray(shape_scale, dtype=np.float64).reshape(-1, 3)[:, 2] != 0.0
-    cylinder = kind == int(GeoType.CYLINDER)
     result = np.full(len(kind), -1, np.int32)
     result[(kind == int(GeoType.SPHERE)) | (kind == int(GeoType.CAPSULE))] = TERRAIN_PARTNER_POINT
-    result[kind == int(GeoType.BOX)] = TERRAIN_PARTNER_BOX
-    result[(cylinder & ~barrel) | (kind == int(GeoType.CONE))] = TERRAIN_PARTNER_CYLINDER
-    result[(cylinder & barrel) | (kind == int(GeoType.CONVEX_MESH)) | (kind == int(GeoType.ELLIPSOID))] = (
-        TERRAIN_PARTNER_HULL
-    )
+    result[(kind == int(GeoType.BOX)) | terrain_finite_planes(kind, shape_scale)] = TERRAIN_PARTNER_BOX
+    result[(kind == int(GeoType.CYLINDER)) | (kind == int(GeoType.CONE))] = TERRAIN_PARTNER_CYLINDER
+    result[(kind == int(GeoType.CONVEX_MESH)) | (kind == int(GeoType.ELLIPSOID))] = TERRAIN_PARTNER_HULL
     return result
+
+
+def terrain_finite_planes(shape_type: np.ndarray, shape_scale: np.ndarray) -> np.ndarray:
+    """Return which shapes are planes of finite width and length (``scale[0]`` and ``scale[1]``, both nonzero; a
+    zero one is infinite, as :meth:`~newton.ModelBuilder.add_shape_plane` and the collision radius take it)."""
+    scale = np.asarray(shape_scale, dtype=np.float64).reshape(-1, 3)
+    plane = np.asarray(shape_type) == int(GeoType.PLANE)
+    return plane & (scale[:, 0] != 0.0) & (scale[:, 1] != 0.0)
 
 
 def terrain_window_cells(radius, reach, dx, dy) -> np.ndarray:
@@ -1485,6 +1490,20 @@ class TerrainPairTable:
                 filter_mask=model.shape_collision_filter_mask,
             )
         scale = model.shape_scale.numpy() if count else np.zeros((0, 3), np.float32)
+        if count:
+            # An infinite plane on a body meets the whole heightfield: no window holds its contacts.
+            body = model.shape_body.numpy()[pairs[:, 1]]
+            plane = types[pairs[:, 1]] == int(GeoType.PLANE)
+            infinite = plane & ~terrain_finite_planes(types, scale)[pairs[:, 1]] & (body >= 0)
+            if np.any(infinite):
+                heightfield, partner = (int(s) for s in pairs[np.argmax(infinite)])
+                raise ValueError(
+                    f"Shape {partner}, a plane of infinite extent on body {int(body[np.argmax(infinite)])}, collides "
+                    f"with heightfield shape {heightfield}: the terrain law has no contact for a plane that meets the "
+                    "whole heightfield. Give the plane a finite width and length (ModelBuilder.add_shape_plane), "
+                    "filter the pair, or set NEWTON_TERRAIN_LAW=none before constructing the collision pipeline to "
+                    "keep the terrain route."
+                )
         partner_class = terrain_partner_classes(types, scale)[pairs[:, 1]]
         pairs = pairs[partner_class >= 0]
         partner_class = partner_class[partner_class >= 0]
