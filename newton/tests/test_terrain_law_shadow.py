@@ -817,6 +817,7 @@ class TestTerrainLawShadow(unittest.TestCase):
                         table.candidates[begin:end],
                         walk,
                         scan_run=int(TERRAIN_PARTNER_SCAN_RUN[partner_class]),
+                        sides=table.sides[begin:end],
                     )
                     names = (*TERRAIN_SOLID_JOB_LISTS, "candidates", "scans")
                     self.assertEqual(sorted(capacities), sorted(names))
@@ -825,14 +826,25 @@ class TestTerrainLawShadow(unittest.TestCase):
                     scans = int(np.sum(-(-table.vertices[begin:end].astype(np.int64) // run)))
                     self.assertEqual(capacities["scans"], scans)
                     reserves = terrain_solid_job_reserves(
-                        table.vertices[begin:end], table.candidates[begin:end], scan_run=run
+                        table.vertices[begin:end],
+                        table.candidates[begin:end],
+                        scan_run=run,
+                        sides=table.sides[begin:end],
                     )
-                    # the reserve: the work of up to TERRAIN_SOLID_RESERVE_PAIRS pairs of the class's largest bounds
+                    # the reserve: the work of up to TERRAIN_SOLID_RESERVE_PAIRS pairs of the class's largest bounds,
+                    # the border's work included (walls per scan run, corner lines, border edges' clips)
                     vertices = int(table.vertices[begin:end].max())
+                    v = table.vertices[begin:end].astype(np.int64)
+                    sides = table.sides[begin:end].astype(np.int64)
                     reserve_pairs = reserves["candidates"] // candidates
                     self.assertTrue(1 <= reserve_pairs <= TERRAIN_SOLID_RESERVE_PAIRS, msg=reserves)
-                    bounds = {"faces": 2, "edges": 3, "thetas": 3, "vertices": 1}
-                    expected = {name: reserve_pairs * bound * vertices for name, bound in bounds.items()}
+                    bounds = {
+                        "faces": int(np.max(2 * v + 4 * -(-v // run))),
+                        "edges": int(np.max(3 * v + 4)),
+                        "thetas": int(np.max(3 * v + 2 * sides + 4)),
+                        "vertices": vertices,
+                    }
+                    expected = {name: reserve_pairs * bound for name, bound in bounds.items()}
                     expected["candidates"] = reserve_pairs * candidates
                     expected["scans"] = reserve_pairs * -(-vertices // run)
                     self.assertEqual(reserves, expected)

@@ -155,12 +155,15 @@ def test_pair_table_from_the_collision_filter(test, device):
             test.assertTrue(np.all(np.diff(table.world[segment]) >= 0))
             test.assertEqual(end - begin, int(np.sum((table.partner_class == partner) & (table.lane_class == lane))))
     # Every pair's bound on its candidates: its largest window's vertices (21 x 21 at most) times the rows a vertex's
-    # features give its partner, and the rows added after the walk.
+    # features give its partner, the rows added after the walk and for a solid the rows of the heightfield's border
+    # (four per vertex along the window's sides, 24 more).
     for i, b in enumerate(pairs[:, 1]):
         kind = kinds[int(b)][0]
         side = min(math.floor(2.0 * (radius[b] + 0.04) / 0.1) + 4, 21)
         per_vertex, per_pair = _ROWS_PER_VERTEX.get(kind, (15, 4))
-        test.assertEqual(table.candidates[i], per_vertex * side * side + per_pair, msg=kind)
+        border = 0 if kind in _ROWS_PER_VERTEX else 4 * 2 * side + 24
+        test.assertEqual(table.sides[i], 2 * side, msg=kind)
+        test.assertEqual(table.candidates[i], per_vertex * side * side + per_pair + border, msg=kind)
     test.assertEqual(table.memory_bytes()["pairs"], 8 * len(kinds))
 
 

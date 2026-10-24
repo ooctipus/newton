@@ -42,9 +42,17 @@ Surface model:
   cluster uses the cluster's plane, a cluster of one triangle its own plane. Edge classes (flat inside a cluster,
   else convex or concave) and vertex features (incident cluster normals spanning 3-D) follow from the cluster ids
   and the heights.
+* The border: the heightfield is a solid block. Its footprint ``[-hx, hx] x [-hy, hy]`` has vertical side walls from
+  the border edges down :data:`TERRAIN_WALL_DEPTH` (the terrain route's prism extrusion), so that the block's border
+  features are its walls (one plane per side, :func:`terrain_border_side`), its border edges (convex creases between
+  their one triangle and the wall, :func:`terrain_wall_edge_value`), its border vertices (whose rings take the wall
+  below them) and the vertical corner lines where two walls meet. The walls are one-sided: they bound the block for
+  points beside it, while a point inside the footprint below the surface exits through the top, as everywhere.
 
 Rows carry a window-local feature id in the 23-bit ``sort_sub_key`` of the contact contract (19 bits:
-``r mod 64``, ``c mod 64``, kind, sub-feature, point slot), unique within any window under 64 cells across.
+``r mod 64``, ``c mod 64``, kind, sub-feature, point slot), unique within any window under 64 cells across. The kinds'
+sub-features: a face's triangle (0, 1) or the wall of its vertex's x- or y-edge (2, 3: :data:`TERRAIN_FACE_WALL`); an
+edge's x-, y- or diagonal edge (0, 1, 2) or its vertex's corner line (3: :data:`TERRAIN_EDGE_CORNER`).
 
 The per-pair finish merges coincident rows, drops the rows the others of their plane group imply (the lower convex
 hull of tangent position and distance, residual ``1e-6 m``) and keeps at most four rows per plane group (deepest,
@@ -159,6 +167,20 @@ TERRAIN_FEATURE_VERTEX = wp.constant(2)
 TERRAIN_FEATURE_RECOVERY = wp.constant(3)
 TERRAIN_FEATURE_BITS = 19
 """Bits of a feature id: ``r mod 64`` (6), ``c mod 64`` (6), kind (2), sub-feature (2), point slot (3)."""
+TERRAIN_FACE_WALL = wp.constant(2)
+"""Sub-feature of a face row on a wall: the wall below vertex ``(r, c)``'s x-edge (this code) or y-edge (one more)."""
+TERRAIN_EDGE_CORNER = wp.constant(3)
+"""Sub-feature of an edge row on a corner line: the vertical edge where two walls meet below vertex ``(r, c)``."""
+
+TERRAIN_ON_FEATURE = 1.0e-9
+"""Core distance [m] below which a core point lies on an edge or a corner line: its row takes the bisector of their
+normals."""
+TERRAIN_WALL_DEPTH = 1.0
+"""Depth of the heightfield's side walls below its border edges [m, heightfield-local]: the block's footprint has
+vertical walls from every border edge down this far, the terrain route's prism extrusion (``TRIANGLE_PRISM_EXTRUSION``),
+and a wall or corner line claims nothing below them."""
+TERRAIN_SIDE_COUNT = 4
+"""Walls of a heightfield (:func:`terrain_border_side`)."""
 
 TERRAIN_FINISH_CANDIDATE_OVERFLOW = wp.constant(1)
 """Report flag: the pair's window gave more distinct candidates than its scratch holds (:class:`TerrainFinishScratch`),
@@ -240,6 +262,8 @@ _CREASE_CELLS = wp.constant(TERRAIN_CREASE_STATIC_CELLS)
 _CREASE_ROUNDING = wp.constant(TERRAIN_CREASE_STATIC_ROUNDING)
 _CREASE_FLAT = wp.constant(TERRAIN_FLAT_EPS)
 _GROUP_ROWS = wp.constant(TERRAIN_GROUP_ROWS)
+_WALL_DEPTH = wp.constant(TERRAIN_WALL_DEPTH)
+_ON_FEATURE = wp.constant(TERRAIN_ON_FEATURE)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1086,6 +1110,152 @@ def terrain_interior_vertex(surface: TerrainSurfaceInfo, r: int, c: int) -> bool
     return r >= 1 and c >= 1 and r < surface.nrow - 1 and c < surface.ncol - 1
 
 
+@wp.func
+def terrain_grid_vertex(surface: TerrainSurfaceInfo, r: int, c: int) -> bool:
+    """Return whether vertex ``(r, c)`` exists."""
+    return r >= 0 and c >= 0 and r < surface.nrow and c < surface.ncol
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# the border: walls, border edges, border vertices and corner lines
+# ----------------------------------------------------------------------------------------------------------------
+
+
+@wp.func
+def terrain_border_side(surface: TerrainSurfaceInfo, r: int, c: int, which: int) -> int:
+    """Return the wall of edge ``which`` of vertex ``(r, c)`` when the edge lies on the heightfield's border, else -1:
+    0 and 1 the walls ``y = -hy`` and ``y = hy`` (the x-edges of rows 0 and ``nrow - 1``), 2 and 3 the walls
+    ``x = -hx`` and ``x = hx`` (the y-edges of columns 0 and ``ncol - 1``)."""
+    if which == 0:
+        if c >= 0 and c < surface.ncol - 1:
+            if r == 0:
+                return 0
+            if r == surface.nrow - 1:
+                return 1
+    elif which == 1:
+        if r >= 0 and r < surface.nrow - 1:
+            if c == 0:
+                return 2
+            if c == surface.ncol - 1:
+                return 3
+    return -1
+
+
+@wp.func
+def terrain_wall_normal(side: int) -> wp.vec3:
+    """Return the outward unit normal of wall ``side`` (:func:`terrain_border_side`)."""
+    if side == 0:
+        return wp.vec3(0.0, -1.0, 0.0)
+    if side == 1:
+        return wp.vec3(0.0, 1.0, 0.0)
+    if side == 2:
+        return wp.vec3(-1.0, 0.0, 0.0)
+    return wp.vec3(1.0, 0.0, 0.0)
+
+
+@wp.func
+def terrain_wall_value(k: wp.vec3, v: wp.vec3, side: int) -> float:
+    """Return ``(k - v) . n``, ``n`` wall ``side``'s outward normal: point ``k``'s distance beyond the wall through
+    ``v``, one coordinate difference (exact negations of each other for opposite directions)."""
+    if side == 0:
+        return v[1] - k[1]
+    if side == 1:
+        return k[1] - v[1]
+    if side == 2:
+        return v[0] - k[0]
+    return k[0] - v[0]
+
+
+@wp.func
+def terrain_beyond_walls(window: TerrainWindow, k: wp.vec3) -> float:
+    """Return how far window-frame point ``k`` lies beyond the heightfield's walls: the largest of its four walls'
+    values (:func:`terrain_wall_value`, from the border vertices' coordinates), at most 0 over the footprint."""
+    surface = window.surface
+    x_lo = float(-window.c0) * surface.dx
+    x_hi = float(surface.ncol - 1 - window.c0) * surface.dx
+    y_lo = float(-window.r0) * surface.dy
+    y_hi = float(surface.nrow - 1 - window.r0) * surface.dy
+    return wp.max(wp.max(x_lo - k[0], k[0] - x_hi), wp.max(y_lo - k[1], k[1] - y_hi))
+
+
+@wp.func
+def terrain_wall_along(k: wp.vec3, v: wp.vec3, side: int) -> float:
+    """Return ``(k - v) . t``, ``t`` the axis along wall ``side`` toward higher vertex indices (x for walls 0 and 1, y
+    for walls 2 and 3): the value both wall pieces at a border vertex, or a wall piece and a corner line, share."""
+    if side < 2:
+        return k[0] - v[0]
+    return k[1] - v[1]
+
+
+@wp.func
+def terrain_border_triangle(r: int, c: int, which: int, side: int) -> wp.vec3i:
+    """Return the one triangle ``(row, column, sub)`` of border edge ``which`` of vertex ``(r, c)`` on wall ``side``."""
+    _v0, _v1, ta, tb, _wa, _wb = terrain_edge_sides(r, c, which)
+    if side == 0 or side == 2:
+        return tb
+    return ta
+
+
+@wp.func
+def terrain_border_far(r: int, c: int, which: int, side: int) -> wp.vec2i:
+    """Return the third vertex of a border edge's triangle (:func:`terrain_border_triangle`)."""
+    _v0, _v1, _ta, _tb, wa, wb = terrain_edge_sides(r, c, which)
+    if side == 0 or side == 2:
+        return wb
+    return wa
+
+
+@wp.func
+def terrain_wall_frame(v0: wp.vec3, v1: wp.vec3, n_wall: wp.vec3) -> wp.vec3:
+    """Return the in-wall unit normal of border edge ``v0 v1`` pointing up, away from the wall below the edge."""
+    m = wp.cross(v1 - v0, n_wall)
+    if m[2] < 0.0:
+        m = -m
+    return wp.normalize(m)
+
+
+@wp.func
+def terrain_wall_edge_value(k: wp.vec3, v0: wp.vec3, v1: wp.vec3, n_wall: wp.vec3) -> float:
+    """Return ``s = (k - v0) . m`` (:func:`terrain_wall_frame`) of border edge ``v0 v1`` (``v0`` its lower vertex): the
+    value the border edge's claim above the wall and the wall's claim below the edge share, as
+    :func:`terrain_face_edge_value` is a face's and its edge's."""
+    return wp.dot(k - v0, terrain_wall_frame(v0, v1, n_wall))
+
+
+@wp.func
+def terrain_wall_holds(eps: float, side: int, v0: wp.vec3, v1: wp.vec3, k: wp.vec3) -> bool:
+    """Return whether the wall below border edge ``v0 v1`` (wall ``side``) holds point ``k``'s projection on it (closed
+    by ``eps``): below the edge, between the vertical lines through its vertices and above the wall's base,
+    :data:`TERRAIN_WALL_DEPTH` below the edge. The tests are along the wall, so that ``k`` and its projection decide
+    alike."""
+    m = terrain_wall_frame(v0, v1, terrain_wall_normal(side))
+    s = wp.dot(k - v0, m)
+    if not terrain_claims(s, eps):
+        return False
+    if s < -_WALL_DEPTH * m[2] - eps:
+        return False
+    return terrain_beyond(terrain_wall_along(k, v0, side), eps) and terrain_claims(terrain_wall_along(k, v1, side), eps)
+
+
+@wp.func
+def terrain_vertex_sides(surface: TerrainSurfaceInfo, r: int, c: int) -> wp.vec2i:
+    """Return the walls through vertex ``(r, c)`` (:func:`terrain_border_side`): ``(-1, -1)`` for an interior vertex,
+    one of them for a border vertex, two for a corner of the footprint (the y-wall first)."""
+    a = int(-1)
+    b = int(-1)
+    if r == 0:
+        a = 0
+    elif r == surface.nrow - 1:
+        a = 1
+    if c == 0:
+        b = 2
+    elif c == surface.ncol - 1:
+        b = 3
+    if a < 0:
+        return wp.vec2i(b, -1)
+    return wp.vec2i(a, b)
+
+
 _RingNormals = wp.types.matrix(shape=(6, 3), dtype=wp.float32)
 
 
@@ -1095,27 +1265,40 @@ def _ring_normal(normals: _RingNormals, i: int) -> wp.vec3:
 
 
 @wp.func
+def _ring_add(normals: _RingNormals, count: int, n: wp.vec3) -> tuple[_RingNormals, int]:
+    """Add a normal to a vertex's distinct incident normals (closer than :data:`TERRAIN_NORMAL_SAME`: one)."""
+    fresh = bool(True)
+    for i in range(count):
+        if wp.length(n - _ring_normal(normals, i)) <= _NORMAL_SAME:
+            fresh = False
+    if fresh:
+        normals[count, 0] = n[0]
+        normals[count, 1] = n[1]
+        normals[count, 2] = n[2]
+        count += 1
+    return normals, count
+
+
+@wp.func
 def _vertex_feature_of_planes(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int) -> bool:
     """:func:`terrain_vertex_feature` from the incident clusters' planes (what the vertex bits record). The cluster
     normals do not depend on the window: a cluster's from its gradient, a lone triangle's from edge vectors of integer
-    index differences and height differences."""
+    index differences and height differences. A border vertex's incident normals are its triangles' and its walls'
+    (at most three triangles and one wall, or two triangles and two walls at a corner of the footprint)."""
     surface = window.surface
-    if not terrain_interior_vertex(surface, r, c):
+    if not terrain_grid_vertex(surface, r, c):
         return False
     normals = _RingNormals()
     count = int(0)
     for j in range(6):
         t = terrain_incident_triangle(r, c, j)
-        n, _a = terrain_cluster_plane(data, window, t[0], t[1], t[2])
-        fresh = bool(True)
-        for i in range(count):
-            if wp.length(n - _ring_normal(normals, i)) <= _NORMAL_SAME:
-                fresh = False
-        if fresh:
-            normals[count, 0] = n[0]
-            normals[count, 1] = n[1]
-            normals[count, 2] = n[2]
-            count += 1
+        if terrain_valid_cell(surface, t[0], t[1]):
+            n, _a = terrain_cluster_plane(data, window, t[0], t[1], t[2])
+            normals, count = _ring_add(normals, count, n)
+    sides = terrain_vertex_sides(surface, r, c)
+    for j in range(2):
+        if sides[j] >= 0:
+            normals, count = _ring_add(normals, count, terrain_wall_normal(sides[j]))
     for i in range(count):
         ni = _ring_normal(normals, i)
         for j in range(i + 1, count):
@@ -1256,12 +1439,18 @@ def terrain_vertex_feature(data: TerrainFeatureData, window: TerrainWindow, r: i
 
 @wp.func
 def terrain_vertex_in_cone(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, n: wp.vec3) -> bool:
-    """Return whether direction ``n`` lies in vertex ``(r, c)``'s normal cone (closed): ``n . (w - v) <= 0``."""
+    """Return whether direction ``n`` lies in vertex ``(r, c)``'s normal cone (closed): ``n . (w - v) <= 0`` for its
+    ring's vertices in the grid, and at a border vertex for the wall below it (``n . (-z) <= 0``)."""
+    surface = window.surface
     v = terrain_window_vertex(data, window, r, c)
     for j in range(6):
         w = terrain_ring_vertex(r, c, j)
-        e = terrain_window_vertex(data, window, w[0], w[1]) - v
-        if wp.dot(n, e) > _CONE_BAND * wp.length(e):
+        if terrain_grid_vertex(surface, w[0], w[1]):
+            e = terrain_window_vertex(data, window, w[0], w[1]) - v
+            if wp.dot(n, e) > _CONE_BAND * wp.length(e):
+                return False
+    if not terrain_interior_vertex(surface, r, c):
+        if -n[2] > _CONE_BAND:
             return False
     return True
 
@@ -1336,15 +1525,113 @@ def terrain_edge_point(
 
 
 @wp.func
+def terrain_border_edge_values(
+    data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, which: int, side: int, k: wp.vec3
+) -> wp.vec4:
+    """Return a border edge's predicate values for point ``k``: ``(s_top, s_wall, w_0, w_1)``, the value its triangle
+    reads at the edge (:func:`terrain_face_values`), the value its wall reads at the edge
+    (:func:`terrain_wall_edge_value`) and the values its end vertices read for each other, as
+    :func:`terrain_edge_values` gives an edge's with the wall as its second face."""
+    v0i, v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
+    t = terrain_border_triangle(r, c, which, side)
+    far = terrain_border_far(r, c, which, side)
+    v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
+    v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
+    n, _a = terrain_cluster_plane(data, window, t[0], t[1], t[2])
+    s_top = terrain_face_edge_value(k, v0, v1, n, terrain_window_vertex(data, window, far[0], far[1]))
+    s_wall = terrain_wall_edge_value(k, v0, v1, terrain_wall_normal(side))
+    return wp.vec4(s_top, s_wall, terrain_vertex_edge_value(k, v0, v1), terrain_vertex_edge_value(k, v1, v0))
+
+
+@wp.func
+def terrain_border_point(
+    data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, which: int, side: int, k: wp.vec3
+) -> tuple[int, wp.vec3, wp.vec3, float]:
+    """Return the claim of border edge ``which`` of vertex ``(r, c)`` (wall ``side``) and its wall on point ``k``
+    outside the solid: ``(kind, q, n, d)``, ``kind`` 1 for the edge (beyond its triangle and its wall at the edge,
+    inside its slab: ``q`` its closest point), 2 for the wall below it (``k`` beside the wall, its projection held,
+    :func:`terrain_wall_holds`: ``q`` the projection, ``n`` the wall's normal) and 0 for none. One claim per point:
+    the edge above the wall's edge line, the wall below it. ``n`` points from ``q`` to ``k`` (the bisector of the
+    triangle's and the wall's normals for ``k`` on the edge) and ``d = |k - q|``."""
+    v0i, v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
+    v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
+    v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
+    eps = window.eps
+    n_wall = terrain_wall_normal(side)
+    values = terrain_border_edge_values(data, window, r, c, which, side, k)
+    if values[1] <= 0.0:
+        # below the wall's edge line: the wall, from beside it only
+        d = terrain_wall_value(k, v0, side)
+        if not terrain_beyond(d, eps) or not terrain_wall_holds(eps, side, v0, v1, k):
+            return 0, wp.vec3(0.0), n_wall, 0.0
+        return 2, k - d * n_wall, n_wall, d
+    u = v1 - v0
+    length = wp.length(u)
+    claims = (
+        terrain_beyond(values[0], eps)
+        and terrain_beyond(values[2], eps * length)
+        and terrain_beyond(values[3], eps * length)
+    )
+    if not claims:
+        return 0, wp.vec3(0.0), n_wall, 0.0
+    q = v0 + wp.clamp(values[2] / wp.dot(u, u), 0.0, 1.0) * u
+    w = k - q
+    dist = wp.length(w)
+    if dist <= _ON_FEATURE:
+        t = terrain_border_triangle(r, c, which, side)
+        n_top, _a = terrain_cluster_plane(data, window, t[0], t[1], t[2])
+        return 1, q, wp.normalize(n_top + n_wall), 0.0
+    return 1, q, w / dist, dist
+
+
+@wp.func
+def terrain_corner_point(
+    data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, k: wp.vec3
+) -> tuple[bool, wp.vec3, wp.vec3, float]:
+    """Return whether the corner line below footprint corner ``(r, c)`` claims point ``k``, and the row ``(q, n, d)``:
+    ``k`` beyond both walls (the values the walls' pieces at the corner share, :func:`terrain_wall_along`), below the
+    corner vertex (the value its claim shares, :func:`terrain_vertex_point`) and above the walls' base; ``q`` the corner
+    line's point at ``k``'s height, ``n`` horizontal from it to ``k`` (the bisector of the walls' normals on the line)."""
+    surface = window.surface
+    sides = terrain_vertex_sides(surface, r, c)
+    if sides[1] < 0:
+        return False, wp.vec3(0.0), wp.vec3(0.0), 0.0
+    v = terrain_window_vertex(data, window, r, c)
+    eps = window.eps
+    below = v[2] - k[2]
+    claims = (
+        terrain_beyond(below, eps)
+        and below <= _WALL_DEPTH + eps
+        and terrain_beyond(terrain_wall_value(k, v, sides[0]), eps)
+        and terrain_beyond(terrain_wall_value(k, v, sides[1]), eps)
+    )
+    if not claims:
+        return False, wp.vec3(0.0), wp.vec3(0.0), 0.0
+    q = wp.vec3(v[0], v[1], k[2])
+    w = k - q
+    dist = wp.length(w)
+    if dist <= _ON_FEATURE:
+        return True, q, wp.normalize(terrain_wall_normal(sides[0]) + terrain_wall_normal(sides[1])), 0.0
+    return True, q, w / dist, dist
+
+
+@wp.func
 def terrain_vertex_point(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, k: wp.vec3) -> bool:
-    """Return whether vertex ``(r, c)`` claims point ``k``: ``(k - v) . (w - v) <= 0`` for its whole one-ring."""
-    if not terrain_interior_vertex(window.surface, r, c):
+    """Return whether vertex ``(r, c)`` claims point ``k``: ``(k - v) . (w - v) <= 0`` for its one-ring's vertices in
+    the grid, and at a border vertex ``k`` not below it (the wall below it: ``v_z - k_z <= 0``, the value a corner
+    line's claim below a corner of the footprint shares, :func:`terrain_corner_point`)."""
+    surface = window.surface
+    if not terrain_grid_vertex(surface, r, c):
         return False
     v = terrain_window_vertex(data, window, r, c)
     for j in range(6):
         wi = terrain_ring_vertex(r, c, j)
-        w = terrain_window_vertex(data, window, wi[0], wi[1])
-        if not terrain_claims(terrain_vertex_edge_value(k, v, w), window.eps * wp.length(w - v)):
+        if terrain_grid_vertex(surface, wi[0], wi[1]):
+            w = terrain_window_vertex(data, window, wi[0], wi[1])
+            if not terrain_claims(terrain_vertex_edge_value(k, v, w), window.eps * wp.length(w - v)):
+                return False
+    if not terrain_interior_vertex(surface, r, c):
+        if not terrain_claims(v[2] - k[2], window.eps):
             return False
     return True
 
@@ -1396,6 +1683,27 @@ def terrain_point_below_cached(
     if t[0] < 0:
         return planes, False
     planes, n, a = terrain_plane(data, window, planes, t[0], t[1], t[2])
+    return planes, k[2] < a[2] - (n[0] * (k[0] - a[0]) + n[1] * (k[1] - a[1])) / n[2]
+
+
+@wp.func
+def terrain_point_below_inside(
+    data: TerrainFeatureData, window: TerrainWindow, planes: TerrainPlanes, k: wp.vec3
+) -> tuple[TerrainPlanes, bool]:
+    """Return :func:`terrain_point_below_cached` for a point of the footprint's closure: a point past its border by the
+    predicates' rounding is taken over the border's cells (their planes extended to it), where the half-open partition
+    of :func:`terrain_locate` has no triangle."""
+    surface = window.surface
+    u = k[0] / surface.dx
+    v = k[1] / surface.dy
+    c = wp.clamp(window.c0 + int(wp.floor(u)), 0, surface.ncol - 2)
+    r = wp.clamp(window.r0 + int(wp.floor(v)), 0, surface.nrow - 2)
+    fx = wp.clamp(u - float(c - window.c0), 0.0, 1.0)
+    fy = wp.clamp(v - float(r - window.r0), 0.0, 1.0)
+    sub = int(0)
+    if fx < fy:
+        sub = 1
+    planes, n, a = terrain_plane(data, window, planes, r, c, sub)
     return planes, k[2] < a[2] - (n[0] * (k[0] - a[0]) + n[1] * (k[1] - a[1])) / n[2]
 
 

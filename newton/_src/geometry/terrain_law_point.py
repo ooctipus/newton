@@ -15,7 +15,15 @@ radius plus both margins and both gaps, the contact writer's admission limit), o
 * capsule interior: the axis point closest to a crease edge (both segment parameters inside), and the axis point
   over a vertex in its Voronoi region. An axis point inside the solid below a ridge exits over it: within both
   faces the normal from it to the crease lies in the ridge's arc, and lifting the axis along it by the distance is
-  the segment's minimum translation out of the ridge (a point exit through either face would push it sideways).
+  the segment's minimum translation out of the ridge (a point exit through either face would push it sideways);
+* the border (the heightfield a solid block with vertical walls, see :mod:`~newton._src.geometry.terrain_law`), outside
+  the solid only: a border edge, a ridge between its one triangle and its wall, claims a point beyond both
+  (:func:`~newton._src.geometry.terrain_law.terrain_border_point`), the wall below it a point beside it whose
+  projection it holds, a border vertex a point in its Voronoi region (its ring's vertices in the grid and the wall
+  below it), and below a corner of the footprint the corner line a point beyond both walls
+  (:func:`~newton._src.geometry.terrain_law.terrain_corner_point`); the capsule's axis takes the border edges, the
+  border vertices and the corner lines alike. The walls are one-sided: a point inside the solid exits through the top,
+  an axis passing below a border edge by its crossing under it (G3).
 
 Every boundary is decided by one canonical value that both sides read, closed by the window's band
 (:func:`~newton._src.geometry.terrain_law.terrain_eps`); duplicates of one constraint merge in the finish. A core
@@ -38,8 +46,9 @@ vertex mask and the off-cell reject (the point-kernel tests check it). A window'
 (:class:`~newton._src.geometry.terrain_law.TerrainPlanes`).
 
 The window is walked vertex by vertex: vertex ``(r, c)`` owns the features :func:`_point_item` lists (its cell's
-faces and diagonal, its x- and y-edges, itself), each evaluated for the sphere centre or for both capsule ends and
-the axis. An item yields at most one row (:class:`_Claim`).
+faces and diagonal, its x- and y-edges, itself; on the border an edge's item takes the wall below it, a corner
+vertex's item the corner line below it, :func:`_point_item_border`), each evaluated for the sphere centre or for both
+capsule ends and the axis. An item yields at most one row (:class:`_Claim`).
 
 Thread mapping (the pair table's lane classes): :func:`terrain_point_rows` runs one thread per pair of the class, in
 blocks of :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK` (so that its warps spread evenly over the SMs).
@@ -64,7 +73,10 @@ strides over the list, walks each pair with the tiled kernel's code (one functio
 lanes mark its window, and the first lane walks the marked items into its distinct candidates (its scratch holds every
 candidate a window of the class can give); the lanes then run the finish on all of them, its implied-row tests split
 among them, and every row it keeps is written: in the pair's walk slots when they fit, else in rows of the spill
-region.
+region. A pair whose window reaches the heightfield's border (:func:`_border_window`) is deferred at once: the finish
+alone walks it, its item code alone holding the border's features (:func:`_point_item_border`), so that the walks'
+kernels, which take every other pair, compile without them (the one-thread kernel's compile cost, the module's
+largest, doubles with them).
 
 Inlined into the walks, the finish took every thread to 255 registers and a 10 KB stack on sm_120. Apart, the one-thread
 kernel takes 168 registers (its launch bounds: 12 blocks of 32 threads per SM) and a 40-byte stack (at 16 blocks its 128
@@ -88,7 +100,9 @@ from .broad_phase_common import is_shape_pair_immovable_filtered
 from .terrain_contacts import TERRAIN_PARTNER_POINT, TERRAIN_PARTNER_WALK_SLOTS
 from .terrain_law import (
     TERRAIN_EDGE_CONCAVE,
+    TERRAIN_EDGE_CORNER,
     TERRAIN_EPS32,
+    TERRAIN_FACE_WALL,
     TERRAIN_FEATURE_EDGE,
     TERRAIN_FEATURE_FACE,
     TERRAIN_FEATURE_RECOVERY,
@@ -100,6 +114,7 @@ from .terrain_law import (
     TERRAIN_PAIR_STALE,
     TERRAIN_PAIR_TILE_EXIT,
     TERRAIN_PAIR_WIDE,
+    TERRAIN_WALL_DEPTH,
     TERRAIN_WINDOW_WIDE,
     TerrainFeatureData,
     TerrainFinishScratch,
@@ -107,10 +122,16 @@ from .terrain_law import (
     TerrainPairInputs,
     TerrainPairWork,
     TerrainPlanes,
+    TerrainSurfaceInfo,
     TerrainWindow,
     terrain_beyond,
+    terrain_border_edge_values,
+    terrain_border_point,
+    terrain_border_side,
+    terrain_border_triangle,
     terrain_box_cells,
     terrain_claims,
+    terrain_corner_point,
     terrain_crease_class,
     terrain_defer_pair,
     terrain_edge_kind,
@@ -135,6 +156,7 @@ from .terrain_law import (
     terrain_tile_exit,
     terrain_vertex_edge_value,
     terrain_vertex_point,
+    terrain_vertex_sides,
     terrain_window,
     terrain_window_extent,
     terrain_window_point,
@@ -169,6 +191,7 @@ _AXIS_ITEMS = wp.constant(0xF000)
 _CAPSULE = wp.constant(int(GeoType.CAPSULE))
 _WIDE = wp.constant(TERRAIN_WINDOW_WIDE)
 _EPS32 = wp.constant(TERRAIN_EPS32)
+_WALL_DEPTH = wp.constant(TERRAIN_WALL_DEPTH)
 _ON_FEATURE = wp.constant(1.0e-9)
 """Core distance [m] below which a core point lies on an edge (bisector normal) or vertex (no normal: no row)."""
 _FOOTPRINT_BANDS = wp.constant(16.0)
@@ -324,8 +347,8 @@ def _end_edge(
 ) -> tuple[TerrainPlanes, _Claim]:
     """Rule P, crease edge: the end lies beyond both faces at the edge and inside its slab; q is its closest point.
 
-    For a crease (:func:`_point_item` drops flat and border edges); the slab and the reach are tested before the
-    edge's class and planes are read.
+    For a crease (:func:`_end_item` drops flat edges, :func:`_end_item_border` takes border edges to
+    :func:`_end_border`); the slab and the reach are tested before the edge's class and planes are read.
     """
     u = v1 - v0
     length = wp.length(u)
@@ -365,9 +388,8 @@ def _end_edge(
 def _end_vertex(
     data: TerrainFeatureData, window: TerrainWindow, core: _PointCore, end: int, k: wp.vec3, below: int, r: int, c: int
 ) -> _Claim:
-    """Rule P, vertex: the end lies in the vertex's Voronoi region; the row's normal points from the vertex to it."""
-    if not terrain_interior_vertex(window.surface, r, c):
-        return _Claim()
+    """Rule P, vertex: the end lies in the vertex's Voronoi region; the row's normal points from the vertex to it. For
+    a vertex off the border (:func:`_end_border_vertex` takes a border vertex)."""
     v = terrain_window_vertex(data, window, r, c)
     w = k - v
     dist = wp.length(w)
@@ -383,9 +405,86 @@ def _end_vertex(
     return _offer(end, below, v, k, n, d, core.reach, terrain_feature_id(r, c, TERRAIN_FEATURE_VERTEX, 0, end))
 
 
+@wp.func
+def _end_border(
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    core: _PointCore,
+    end: int,
+    k: wp.vec3,
+    below: int,
+    r: int,
+    c: int,
+    which: int,
+    side: int,
+) -> _Claim:
+    """Rule P at a border edge: the edge (beyond its triangle and its wall, inside its slab) or the wall below it (the
+    end beside the wall, its projection on it), :func:`~newton._src.geometry.terrain_law.terrain_border_point`. Only
+    an end outside the solid: the walls are one-sided, and no end inside the solid lies beyond a border edge."""
+    if below != 0:
+        return _Claim()
+    kind, q, n, d = terrain_border_point(data, window, r, c, which, side, k)
+    if kind == 0:
+        return _Claim()
+    feature = terrain_feature_id(r, c, TERRAIN_FEATURE_EDGE, which, end)
+    if kind == 2:
+        feature = terrain_feature_id(r, c, TERRAIN_FEATURE_FACE, TERRAIN_FACE_WALL + which, end)
+    return _offer(end, below, q, k, n, d, core.reach, feature)
+
+
+@wp.func
+def _end_border_vertex(
+    data: TerrainFeatureData, window: TerrainWindow, core: _PointCore, end: int, k: wp.vec3, below: int, r: int, c: int
+) -> _Claim:
+    """Rule P at a border vertex: the end in its Voronoi region (its ring's vertices in the grid and the wall below
+    it), or below a corner of the footprint, on the corner line (beyond both walls,
+    :func:`~newton._src.geometry.terrain_law.terrain_corner_point`). Only an end outside the solid."""
+    if below != 0:
+        return _Claim()
+    v = terrain_window_vertex(data, window, r, c)
+    if v[2] - k[2] > 0.0:
+        ok, q, n, d = terrain_corner_point(data, window, r, c, k)
+        if not ok:
+            return _Claim()
+        return _offer(
+            end, below, q, k, n, d, core.reach, terrain_feature_id(r, c, TERRAIN_FEATURE_EDGE, TERRAIN_EDGE_CORNER, end)
+        )
+    w = k - v
+    dist = wp.length(w)
+    if dist <= _ON_FEATURE or dist > core.reach:
+        return _Claim()
+    if not terrain_vertex_point(data, window, r, c, k):
+        return _Claim()
+    return _offer(
+        end, below, v, k, w / dist, dist, core.reach, terrain_feature_id(r, c, TERRAIN_FEATURE_VERTEX, 0, end)
+    )
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # the capsule's axis interior
 # ----------------------------------------------------------------------------------------------------------------
+
+
+@wp.func
+def _axis_closest(core: _PointCore, v0: wp.vec3, v1: wp.vec3) -> tuple[bool, wp.vec3, wp.vec3]:
+    """The closest points of the capsule's axis and segment ``v0 v1`` when both parameters lie inside the segments
+    (not parallel): ``(ok, p, q)``, ``p`` on the axis and ``q`` on the segment."""
+    d2 = v1 - v0
+    d1 = core.b - core.a
+    offset = core.a - v0
+    aa = wp.dot(d1, d1)
+    e = wp.dot(d2, d2)
+    f = wp.dot(d2, offset)
+    cc = wp.dot(d1, offset)
+    bb = wp.dot(d1, d2)
+    denom = aa * e - bb * bb
+    if denom <= _PARALLEL * aa * e:
+        return False, v0, v0
+    s = (bb * f - cc * e) / denom
+    t = (bb * s + f) / e
+    if s < 0.0 or s > 1.0 or t < 0.0 or t > 1.0:
+        return False, v0, v0
+    return True, core.a + s * d1, v0 + t * d2
 
 
 @wp.func
@@ -406,25 +505,12 @@ def _axis_crease(
     Outside the solid a ridge claims it beyond both faces at the edge. Inside it a valley claims it beyond both faces
     (the edge is its closest surface point), and a ridge within both faces: the axis passes below the ridge, and the
     exit lifts it over the crease by the distance of the two lines, the segment's minimum translation out of the
-    ridge. For a crease (:func:`_point_item` drops flat and border edges).
+    ridge. For a crease (:func:`_axis_item` drops flat edges, :func:`_axis_item_border` takes border edges to
+    :func:`_axis_border`).
     """
-    d2 = v1 - v0
-    d1 = core.b - core.a
-    offset = core.a - v0
-    aa = wp.dot(d1, d1)
-    e = wp.dot(d2, d2)
-    f = wp.dot(d2, offset)
-    cc = wp.dot(d1, offset)
-    bb = wp.dot(d1, d2)
-    denom = aa * e - bb * bb
-    if denom <= _PARALLEL * aa * e:
+    ok, p, q = _axis_closest(core, v0, v1)
+    if not ok:
         return planes, _Claim()
-    s = (bb * f - cc * e) / denom
-    t = (bb * s + f) / e
-    if s < 0.0 or s > 1.0 or t < 0.0 or t > 1.0:
-        return planes, _Claim()
-    p = core.a + s * d1
-    q = v0 + t * d2
     w = p - q
     dist = wp.length(w)
     if dist <= _ON_FEATURE:
@@ -454,6 +540,41 @@ def _axis_crease(
     # Every axis row is a row, never an end's exit candidate (G2 holds for the ends).
     feature = terrain_feature_id(r, c, TERRAIN_FEATURE_EDGE, which, _SLOT_AXIS)
     return planes, _offer(0, 0, q, p, n, d, core.reach, feature)
+
+
+@wp.func
+def _axis_border(
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    core: _PointCore,
+    r: int,
+    c: int,
+    which: int,
+    side: int,
+    v0: wp.vec3,
+    v1: wp.vec3,
+) -> tuple[TerrainPlanes, _Claim]:
+    """:func:`_axis_crease` at a border edge, a ridge between its triangle and its wall (wall ``side``), outside the
+    solid only: it claims the axis point beyond both at the edge (the values
+    :func:`~newton._src.geometry.terrain_law.terrain_border_edge_values` gives). The border is one-sided: an axis
+    passing below the edge inside the solid exits through the top (:func:`_axis_witness`, the crossing under the
+    edge)."""
+    ok, p, q = _axis_closest(core, v0, v1)
+    if not ok:
+        return planes, _Claim()
+    w = p - q
+    dist = wp.length(w)
+    if dist <= _ON_FEATURE or dist > core.reach:
+        return planes, _Claim()
+    planes, below = terrain_point_below_cached(data, window, planes, p)
+    if below:
+        return planes, _Claim()
+    values = terrain_border_edge_values(data, window, r, c, which, side, p)
+    if not (terrain_beyond(values[0], core.eps) and terrain_beyond(values[1], core.eps)):
+        return planes, _Claim()
+    feature = terrain_feature_id(r, c, TERRAIN_FEATURE_EDGE, which, _SLOT_AXIS)
+    return planes, _offer(0, 0, q, p, w / dist, dist, core.reach, feature)
 
 
 @wp.func
@@ -489,6 +610,17 @@ def _axis_witness(
 
 
 @wp.func
+def _or_witness(
+    claim: _Claim, window: TerrainWindow, core: _PointCore, r: int, c: int, which: int, v0: wp.vec3, v1: wp.vec3
+) -> _Claim:
+    """An edge's claim for the axis, or without one, and with both ends outside the solid, the axis's crossing under
+    the edge (:func:`_axis_witness`)."""
+    if claim.kind == 0 and core.below_a == 0 and core.below_b == 0:
+        return _axis_witness(window, core, r, c, which, v0, v1)
+    return claim
+
+
+@wp.func
 def _axis_edge(
     data: TerrainFeatureData,
     window: TerrainWindow,
@@ -500,12 +632,10 @@ def _axis_edge(
     v0: wp.vec3,
     v1: wp.vec3,
 ) -> tuple[TerrainPlanes, _Claim]:
-    """The axis's claim at a crease (:func:`_axis_crease`); without one, and with both ends outside the solid, the
-    axis's crossing under the crease (:func:`_axis_witness`)."""
+    """The axis's claim at a crease (:func:`_axis_crease`), or its crossing under the edge (:func:`_or_witness`). For
+    an edge off the border (:func:`_axis_item_border` takes a border edge)."""
     planes, claim = _axis_crease(data, window, planes, core, r, c, which, v0, v1)
-    if claim.kind == 0 and core.below_a == 0 and core.below_b == 0:
-        claim = _axis_witness(window, core, r, c, which, v0, v1)
-    return planes, claim
+    return planes, _or_witness(claim, window, core, r, c, which, v0, v1)
 
 
 @wp.func
@@ -519,6 +649,10 @@ def _axis_recovery(
     r = vertex // window.surface.ncol
     c = vertex - r * window.surface.ncol
     _v0, _v1, ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
+    side = terrain_border_side(window.surface, r, c, which)
+    if side >= 0:
+        # a border edge's one triangle
+        ta = terrain_border_triangle(r, c, which, side)
     planes, n, a = terrain_plane(data, window, planes, ta[0], ta[1], ta[2])
     d = wp.dot(n, p - a)
     claim = _Claim()
@@ -536,9 +670,8 @@ def _axis_recovery(
 def _axis_vertex(
     data: TerrainFeatureData, window: TerrainWindow, planes: TerrainPlanes, core: _PointCore, r: int, c: int
 ) -> tuple[TerrainPlanes, _Claim]:
-    """The axis point over a vertex (parameter inside the segment) in the vertex's Voronoi region."""
-    if not terrain_interior_vertex(window.surface, r, c):
-        return planes, _Claim()
+    """The axis point over a vertex (parameter inside the segment) in the vertex's Voronoi region. For a vertex off
+    the border (:func:`_axis_border_vertex` takes a border vertex)."""
     v = terrain_window_vertex(data, window, r, c)
     d1 = core.b - core.a
     s = wp.dot(v - core.a, d1) / wp.dot(d1, d1)
@@ -562,6 +695,38 @@ def _axis_vertex(
     return planes, _offer(0, 0, v, p, n, d, core.reach, terrain_feature_id(r, c, TERRAIN_FEATURE_VERTEX, 0, _SLOT_AXIS))
 
 
+@wp.func
+def _axis_border_vertex(
+    data: TerrainFeatureData, window: TerrainWindow, planes: TerrainPlanes, core: _PointCore, r: int, c: int
+) -> tuple[TerrainPlanes, _Claim]:
+    """The axis at a border vertex, outside the solid only: the axis point over the vertex in its Voronoi region (its
+    ring's vertices in the grid and the wall below it), or at a corner of the footprint, the axis point closest to the
+    corner line below it, beyond both walls (the corner line's claim,
+    :func:`~newton._src.geometry.terrain_law.terrain_corner_point`, of that point)."""
+    v = terrain_window_vertex(data, window, r, c)
+    d1 = core.b - core.a
+    s = wp.dot(v - core.a, d1) / wp.dot(d1, d1)
+    if s >= 0.0 and s <= 1.0:
+        p = core.a + s * d1
+        w = p - v
+        dist = wp.length(w)
+        if dist > _ON_FEATURE and dist <= core.reach:
+            planes, below = terrain_point_below_cached(data, window, planes, p)
+            if not below and terrain_vertex_point(data, window, r, c, p):
+                feature = terrain_feature_id(r, c, TERRAIN_FEATURE_VERTEX, 0, _SLOT_AXIS)
+                return planes, _offer(0, 0, v, p, w / dist, dist, core.reach, feature)
+    if terrain_vertex_sides(window.surface, r, c)[1] < 0:
+        return planes, _Claim()
+    ok, p, _q = _axis_closest(core, v, wp.vec3(v[0], v[1], v[2] - _WALL_DEPTH))
+    if not ok:
+        return planes, _Claim()
+    ok, q, n, d = terrain_corner_point(data, window, r, c, p)
+    if not ok or d <= _ON_FEATURE:
+        return planes, _Claim()
+    feature = terrain_feature_id(r, c, TERRAIN_FEATURE_EDGE, TERRAIN_EDGE_CORNER, _SLOT_AXIS)
+    return planes, _offer(0, 0, q, p, n, d, core.reach, feature)
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # the items a window vertex owns
 # ----------------------------------------------------------------------------------------------------------------
@@ -583,7 +748,8 @@ def _end_item(
     feature: int,
 ) -> tuple[TerrainPlanes, _Claim]:
     """Evaluate feature ``feature`` of window vertex ``(r, c)`` for core end ``end`` at ``k`` (``below``: inside the
-    solid): the face of sub 0 or 1, the x-, y- or diagonal edge, or the vertex (0-5; see :func:`_point_item`)."""
+    solid): the face of sub 0 or 1, the x-, y- or diagonal edge, or the vertex (0-5; see :func:`_point_item`), in a
+    window off the heightfield's border (:func:`_end_item_border` takes the border's items)."""
     inside = r <= r1 and c <= c1
     if feature < 2:
         if not inside:
@@ -596,7 +762,7 @@ def _end_item(
     if (which == 0 and c > c1) or (which == 1 and r > r1) or (which == 2 and not inside):
         return planes, _Claim()
     if terrain_edge_kind(data, window.surface, r, c, which) >= 0:
-        # Flat inside one cluster, or on the heightfield's border: no edge minimum (decided from cluster ids).
+        # Flat inside one cluster: no edge minimum (decided from cluster ids).
         return planes, _Claim()
     v0i, v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
     v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
@@ -617,13 +783,15 @@ def _axis_item(
     feature: int,
 ) -> tuple[TerrainPlanes, _Claim]:
     """Evaluate feature ``feature`` of window vertex ``(r, c)`` for the capsule's axis: the x-, y- or diagonal edge or
-    the vertex (2-5, numbered as :func:`_end_item` numbers them)."""
+    the vertex (2-5, numbered as :func:`_end_item` numbers them), in a window off the heightfield's border
+    (:func:`_axis_item_border` takes the border's items)."""
     if feature == 5:
         return _axis_vertex(data, window, planes, core, r, c)
     which = feature - 2
     if (which == 0 and c > c1) or (which == 1 and r > r1) or (which == 2 and not (r <= r1 and c <= c1)):
         return planes, _Claim()
     if terrain_edge_kind(data, window.surface, r, c, which) >= 0:
+        # flat inside one cluster
         return planes, _Claim()
     v0i, v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
     v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
@@ -632,7 +800,37 @@ def _axis_item(
 
 
 @wp.func
-def _point_item(
+def _end_item_border(
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    core: _PointCore,
+    end: int,
+    k: wp.vec3,
+    below: int,
+    r: int,
+    c: int,
+    r1: int,
+    c1: int,
+    feature: int,
+) -> tuple[TerrainPlanes, _Claim]:
+    """:func:`_end_item` in a window that reaches the heightfield's border: a border edge's item takes the edge and
+    the wall below it (:func:`_end_border`), a border vertex's the vertex and the corner line below it
+    (:func:`_end_border_vertex`)."""
+    if feature == 5:
+        if not terrain_interior_vertex(window.surface, r, c):
+            return planes, _end_border_vertex(data, window, core, end, k, below, r, c)
+    elif feature == 2 or feature == 3:
+        which = feature - 2
+        if (which == 0 and c <= c1) or (which == 1 and r <= r1):
+            side = terrain_border_side(window.surface, r, c, which)
+            if side >= 0:
+                return planes, _end_border(data, window, core, end, k, below, r, c, which, side)
+    return _end_item(data, window, planes, core, end, k, below, r, c, r1, c1, feature)
+
+
+@wp.func
+def _axis_item_border(
     data: TerrainFeatureData,
     window: TerrainWindow,
     planes: TerrainPlanes,
@@ -641,25 +839,85 @@ def _point_item(
     c: int,
     r1: int,
     c1: int,
-    item: int,
+    feature: int,
 ) -> tuple[TerrainPlanes, _Claim]:
-    """Evaluate one item of window vertex ``(r, c)`` in a window of cells ``[r0, r1] x [c0, c1]``.
+    """:func:`_axis_item` in a window that reaches the heightfield's border: a border edge's item takes the edge
+    (:func:`_axis_border`, or the axis's crossing under it), a border vertex's the vertex and the corner line below it
+    (:func:`_axis_border_vertex`)."""
+    if feature == 5:
+        if not terrain_interior_vertex(window.surface, r, c):
+            return _axis_border_vertex(data, window, planes, core, r, c)
+    elif feature == 2 or feature == 3:
+        which = feature - 2
+        if (which == 0 and c <= c1) or (which == 1 and r <= r1):
+            side = terrain_border_side(window.surface, r, c, which)
+            if side >= 0:
+                v0i, v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
+                v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
+                v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
+                planes, claim = _axis_border(data, window, planes, core, r, c, which, side, v0, v1)
+                return planes, _or_witness(claim, window, core, r, c, which, v0, v1)
+    return _axis_item(data, window, planes, core, r, c, r1, c1, feature)
 
-    Vertex ``(r, c)`` owns its cell's two faces and diagonal (inside the window), its x-edge (``c <= c1``), its
-    y-edge (``r <= r1``) and itself, so that every feature of the window is visited once. Items 0-5 are the face of
-    sub 0, sub 1, the x-edge, the y-edge, the diagonal and the vertex for the sphere centre or capsule end ``a``
-    (:func:`_end_item`), items 6-11 the same for end ``b``, items 12-15 the edges and the vertex for the capsule's
-    axis (:func:`_axis_item`).
-    """
-    if item < 12:
-        end = item // 6
-        k = core.a
-        below = core.below_a
-        if end == 1:
-            k = core.b
-            below = core.below_b
-        return _end_item(data, window, planes, core, end, k, below, r, c, r1, c1, item - 6 * end)
-    return _axis_item(data, window, planes, core, r, c, r1, c1, item - 10)
+
+def _point_item_function(border: bool):
+    """Build the evaluation of one item of a window vertex: for a window off the heightfield's border (``border``
+    ``False``, :func:`_point_item`, the one-thread and tiled walks) or one that reaches it (``border`` ``True``,
+    :func:`_point_item_border`, the finish of deferred pairs, which alone walks such windows), so that only the
+    finish's kernel compiles the border's features."""
+
+    def point_item(
+        data: TerrainFeatureData,
+        window: TerrainWindow,
+        planes: TerrainPlanes,
+        core: _PointCore,
+        r: int,
+        c: int,
+        r1: int,
+        c1: int,
+        item: int,
+    ):
+        """Evaluate one item of window vertex ``(r, c)`` in a window of cells ``[r0, r1] x [c0, c1]``.
+
+        Vertex ``(r, c)`` owns its cell's two faces and diagonal (inside the window), its x-edge (``c <= c1``), its
+        y-edge (``r <= r1``) and itself, so that every feature of the window is visited once. Items 0-5 are the face
+        of sub 0, sub 1, the x-edge, the y-edge, the diagonal and the vertex for the sphere centre or capsule end
+        ``a`` (:func:`_end_item`), items 6-11 the same for end ``b``, items 12-15 the edges and the vertex for the
+        capsule's axis (:func:`_axis_item`); at the heightfield's border, :func:`_end_item_border` and
+        :func:`_axis_item_border`.
+        """
+        # Early returns: a claim and the plane cache merged across branches would cost the one-thread kernel twice
+        # its compile time.
+        if item < 12:
+            end = item // 6
+            k = core.a
+            below = core.below_a
+            if end == 1:
+                k = core.b
+                below = core.below_b
+            return wp.static(_end_item_border if border else _end_item)(
+                data, window, planes, core, end, k, below, r, c, r1, c1, item - 6 * end
+            )
+        return wp.static(_axis_item_border if border else _axis_item)(
+            data, window, planes, core, r, c, r1, c1, item - 10
+        )
+
+    key = "_point_item_border" if border else "_point_item"
+    point_item.__name__ = key
+    point_item.__qualname__ = key
+    return wp.func(point_item)
+
+
+_point_item = _point_item_function(False)
+_point_item_border = _point_item_function(True)
+
+
+@wp.func
+def _border_window(surface: TerrainSurfaceInfo, cells: wp.vec4i) -> bool:
+    """Whether a window of cells ``(r0, r1, c0, c1)`` reaches the heightfield's border: its vertices include a border
+    vertex, its edges a border edge. Such a pair is walked by the finish of deferred pairs alone
+    (:func:`terrain_point_rows_finish`, :func:`_point_item_border`)."""
+    return cells[0] == 0 or cells[2] == 0 or cells[1] >= surface.nrow - 2 or cells[3] >= surface.ncol - 2
 
 
 @wp.func
@@ -687,7 +945,9 @@ def _vertex_box(
     data: TerrainFeatureData, window: TerrainWindow, core: _PointCore, margins: wp.vec3, r: int, c: int
 ) -> wp.vec3:
     """The heights of the box vertex ``(r, c)``'s rows lie in (see :func:`_vertex_dropped`): its cell's lowest and
-    highest vertex (those in the grid), window frame, and how far a row's terrain point may leave them, ``zm``."""
+    highest vertex (those in the grid), window frame, and how far a row's terrain point may leave them, ``zm``. A
+    border vertex's walls and corner line reach :data:`~newton._src.geometry.terrain_law.TERRAIN_WALL_DEPTH` below
+    its cell's lowest vertex."""
     surface = window.surface
     zlo = float(1.0e30)
     zhi = float(-1.0e30)
@@ -701,6 +961,8 @@ def _vertex_box(
                 zhi = wp.max(zhi, z)
     slope = (zhi - zlo + 2.0 * _FLAT) * margins[2] + 1.0
     zm = 4.0 * (_FLAT * slope + (margins[0] + margins[1]) * slope) + _FOOTPRINT_BANDS * core.eps
+    if not terrain_interior_vertex(surface, r, c):
+        zlo = zlo - _WALL_DEPTH
     return wp.vec3(zlo, zhi, zm)
 
 
@@ -1175,6 +1437,11 @@ def terrain_point_rows(
     if state != 0:
         terrain_pair_exit(out, pair, state)
         return
+    if _border_window(data.surfaces[heightfield], cells):
+        # At the heightfield's border: the finish of deferred pairs walks it, its item code alone holding the border's
+        # features (this kernel and the tiled one compile without them).
+        terrain_defer_pair(out, _CLASS, pair, _wide(cells))
+        return
     if pair >= work.first:
         # A larger window that the rejects keep: a tile of lanes walks it.
         work.pairs[wp.atomic_add(work.count, 0, 1)] = pair
@@ -1195,29 +1462,42 @@ def terrain_point_rows(
     _close_pair(out, pair, slot, _wide(cells), held, data, window, planes, core, frame)
 
 
-@wp.func
-def _vertex_marks(
-    data: TerrainFeatureData,
-    window: TerrainWindow,
-    planes: TerrainPlanes,
-    core: _PointCore,
-    margins: wp.vec3,
-    r: int,
-    c: int,
-    r1: int,
-    c1: int,
-    items: int,
-):
-    """Bit ``item`` for every item of window vertex ``(r, c)`` whose claim is not nothing, of the items it can yield
-    anything at all (:func:`_kept_items`), and the updated plane cache."""
-    m = int(0)
-    kept = _kept_items(data, window, core, margins, r, c)
-    for item in range(items):
-        if ((kept >> item) & 1) != 0:
-            planes, claim = _point_item(data, window, planes, core, r, c, r1, c1, item)
-            if claim.kind != 0:
-                m = m | (1 << item)
-    return planes, m
+def _vertex_marks_function(border: bool):
+    """Build the marks of a window vertex's items, for a window off the heightfield's border (``border`` ``False``,
+    :func:`_vertex_marks`) or one that reaches it (:func:`_vertex_marks_border`)."""
+    item_function = _point_item_border if border else _point_item
+
+    def vertex_marks(
+        data: TerrainFeatureData,
+        window: TerrainWindow,
+        planes: TerrainPlanes,
+        core: _PointCore,
+        margins: wp.vec3,
+        r: int,
+        c: int,
+        r1: int,
+        c1: int,
+        items: int,
+    ):
+        """Bit ``item`` for every item of window vertex ``(r, c)`` whose claim is not nothing, of the items it can
+        yield anything at all (:func:`_kept_items`), and the updated plane cache."""
+        m = int(0)
+        kept = _kept_items(data, window, core, margins, r, c)
+        for item in range(items):
+            if ((kept >> item) & 1) != 0:
+                planes, claim = wp.static(item_function)(data, window, planes, core, r, c, r1, c1, item)
+                if claim.kind != 0:
+                    m = m | (1 << item)
+        return planes, m
+
+    key = "_vertex_marks_border" if border else "_vertex_marks"
+    vertex_marks.__name__ = key
+    vertex_marks.__qualname__ = key
+    return wp.func(vertex_marks)
+
+
+_vertex_marks = _vertex_marks_function(False)
+_vertex_marks_border = _vertex_marks_function(True)
 
 
 @wp.func
@@ -1354,6 +1634,12 @@ def _tiled_pair_function(deferred: bool):
             if lane == 0:
                 terrain_pair_exit(out, pair, state)
             return
+        if wp.static(not deferred):
+            if _border_window(window.surface, cells):
+                # the border's features are the finish of deferred pairs' (the one-thread kernel queues none)
+                if lane == 0:
+                    terrain_defer_pair(out, _CLASS, pair, _wide(cells))
+                return
         r0 = cells[0]
         r1 = cells[1]
         c0 = cells[2]
@@ -1372,7 +1658,7 @@ def _tiled_pair_function(deferred: bool):
                 v = start + lane
                 m = int(0)
                 if v < vertices:
-                    planes, m = _vertex_marks(
+                    planes, m = wp.static(_vertex_marks_border if deferred else _vertex_marks)(
                         data, window, planes, core, margins, r0 + v // width, c0 + v % width, r1, c1, items
                     )
                     if m != 0:
@@ -1411,7 +1697,7 @@ def _tiled_pair_function(deferred: bool):
                 if m != 0:
                     for item in range(items):
                         if ((m >> item) & 1) != 0:
-                            planes, claim = _point_item(
+                            planes, claim = wp.static(_point_item_border if deferred else _point_item)(
                                 data, window, planes, core, r0 + v // width, c0 + v % width, r1, c1, item
                             )
                             if wp.static(deferred):

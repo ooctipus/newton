@@ -43,6 +43,8 @@ from newton._src.geometry.terrain_contacts import (
     TerrainFeatures,
 )
 from newton._src.geometry.terrain_law import (
+    TERRAIN_FEATURE_EDGE,
+    TERRAIN_FEATURE_FACE,
     TERRAIN_FEATURE_RECOVERY,
     TERRAIN_FINISH_MASK_ROWS,
     TERRAIN_PAIR_CANDIDATE_OVERFLOW,
@@ -1338,6 +1340,117 @@ def test_solid_rows_match_the_float64_law(test, device):
 
 
 # ----------------------------------------------------------------------------------------------------------------
+# the border
+# ----------------------------------------------------------------------------------------------------------------
+
+
+def test_solid_rows_match_the_float64_law_at_the_border(test, device):
+    """Reproduce the float64 law's rows at the heightfield's border in float32 for every solid kind.
+
+    Boxes, cylinders, cones, ellipsoids and hulls in any orientation within 8 cm of a wall's plane or a corner of flat,
+    rough and sloped tiles, their lowest point up to 3 cm into the top: the faces clipped to the footprint, the walls,
+    the border edges and vertices and the corner lines give the float64 law's rows. No float64 row is missed and no
+    float32 row is extra but those the other side's rows imply or carry (the same plane and depth: a single clipped
+    point's place along its edge is ill-conditioned; at most 2% of the rows); every pair's deepest row agrees within
+    10 um, and every penetrating row's core point lies inside the block.
+    """
+    rng = np.random.default_rng(37)
+    kinds = [kind for kind in _solid_kinds(rng) if kind[1] is not TOE]
+    totals = {"f64": 0, "carried": 0}
+    defects = []
+    for name, heights in tu.border_terrains(rng).items():
+        with test.subTest(terrain=name):
+            hf = tu.reference_surface(tu.heightfield_model(heights, 1.0, 1.0, device="cpu"))
+            bodies = tu.border_bodies(rng, hf, kinds, 8)
+            model, _hfield, shapes = su.solid_scene(heights, 1.0, 1.0, bodies, device=device)
+            pipeline, _contacts, _state = _collide(model, shadow=True)
+            rows = tu.shadow_rows(pipeline)
+            for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
+                law = su.law_rows(hf, kind, dims, pose)
+                got = rows.get(shape, [])
+                missing, extra, deepest = su.compare_solid_rows(law, got)
+                carried = [m for m in missing if tu.carries_half_space(m, got)]
+                carried += [e for e in extra if tu.carries_half_space(e, law)]
+                totals["f64"] += len(law)
+                totals["carried"] += len(carried)
+                if len(missing) + len(extra) > len(carried) or deepest > 1.0e-5 or tu.outside_face_rows(hf, got):
+                    defects.append((name, kind, pose.tolist(), [repr(m) for m in missing], extra, deepest))
+    test.assertEqual(defects, [])
+    test.assertGreater(totals["f64"], 100)
+    test.assertLessEqual(totals["carried"], 0.02 * totals["f64"], msg=totals)
+
+
+def test_clip_rows_are_front_facing(test, device):
+    """Keep a face's clipped rows to points inside the solid, as its supported points are.
+
+    An ellipsoid buried under a ridge of a sawtooth terrain (56 deg faces), straddling the border's edge: the core's
+    part inside the footprint on a border edge's clip plane lies below each face's plane, but above the surface, under
+    the other face; the clipped rows (7.8 and 4.4 cm deep along the faces' normals before the test) would push it out
+    of the ridge's faces it does not penetrate there. The border edge's crease row remains, the float64 law's.
+    """
+    x = np.linspace(-1.6, 1.6, 33)
+    heights = np.tile(np.abs(((x + 1.6) % 0.2) - 0.1) * 1.5, (33, 1))
+    hf = tu.reference_surface(tu.heightfield_model(heights, 1.6, 1.6, device="cpu"))
+    quat = [0.4019, -0.4489, -0.7217, -0.3407]
+    bodies = [("ellipsoid", ELLIPSOID, _f32_pose([0.992, y, 0.1397, *quat])) for y in (1.6, 1.62)]
+    model, _hfield, shapes = su.solid_scene(heights, 1.6, 1.6, bodies, device=device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    rows = tu.shadow_rows(pipeline)
+    for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
+        with test.subTest(y=float(pose[1])):
+            got = rows.get(shape, [])
+            law = su.law_rows(hf, kind, dims, pose)
+            test.assertEqual(len(got), 1)
+            test.assertEqual(su.compare_solid_rows(law, got)[:2], ([], []))
+            test.assertEqual(tu.outside_face_rows(hf, got), [])
+            test.assertEqual((got[0][3] >> 5) & 3, int(TERRAIN_FEATURE_EDGE))
+
+
+def _feature_parts(feature):
+    """A feature id's ``(r mod 64, c mod 64, kind, sub-feature, point slot)``."""
+    return (feature >> 13) & 63, (feature >> 7) & 63, (feature >> 5) & 3, (feature >> 3) & 3, feature & 7
+
+
+def test_border_rows_carry_their_feature_codes(test, device):
+    """Give the border's rows their feature ids: walls and clipped faces under the face kind, corner lines under the
+    edge kind, each row of a pair distinct.
+
+    On a flat unit heightfield of 0.1 m cells: a level box beside the wall ``x = 1`` gets its face's four corners on the
+    wall (the face kind, sub-feature ``TERRAIN_FACE_WALL + 1``, the wall of a y-edge, slots 0-3); a box beside a
+    corner's line, two rows on it (the edge kind, sub-feature ``TERRAIN_EDGE_CORNER``); a box tilted over the wall's
+    edge, the top face clipped at the wall (sub-feature ``TERRAIN_FACE_WALL + 1``, the crossing's ends in slots 4 and 5,
+    each from the edge it lies on) and the border edges' crease rows (the edge kind, the y-edges); a level box over the
+    corner, 1 cm deep, the top face's row inside (sub-feature 0 or 1) and the clipped row at the corner vertex.
+    """
+    level = np.array([0.0, 0.0, 0.0, 1.0])
+    tilted = np.array([0.0, np.sin(np.pi / 8.0), 0.0, np.cos(np.pi / 8.0)])
+    bodies = [
+        ("box", {"half": (0.05, 0.05, 0.05)}, _f32_pose(np.r_[1.055, 0.33, -0.1, level])),
+        ("box", {"half": (0.05, 0.05, 0.05)}, _f32_pose(np.r_[1.055, 1.055, -0.1, level])),
+        ("box", {"half": (0.2, 0.05, 0.05)}, _f32_pose(np.r_[0.95, -0.33, 0.11, tilted])),
+        ("box", {"half": (0.1, 0.1, 0.05)}, _f32_pose(np.r_[1.0, 1.0, 0.04, level])),
+    ]
+    model, _hfield, shapes = su.solid_scene(np.zeros((21, 21)), 1.0, 1.0, bodies, device=device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    rows = tu.shadow_rows(pipeline)
+    wall, corner, hanging, over = (rows.get(shape, []) for shape in shapes)
+    face, edge = int(TERRAIN_FEATURE_FACE), int(TERRAIN_FEATURE_EDGE)
+    test.assertEqual(sorted(_feature_parts(f)[2:] for _q, _n, _d, f in wall), [(face, 3, j) for j in range(4)])
+    test.assertEqual(sorted(_feature_parts(f)[2:4] for _q, _n, _d, f in corner), [(edge, 3)] * 2)
+    clipped = sorted(_feature_parts(f)[2:] for _q, n, _d, f in hanging if n[2] > 0.999)
+    test.assertEqual(clipped, [(face, 3, 4), (face, 3, 5)])
+    creases = sorted(_feature_parts(f)[2:4] for _q, n, _d, f in hanging if n[2] < 0.999)
+    test.assertEqual(creases, [(edge, 1)] * 2)
+    inside = [_feature_parts(f) for q, _n, _d, f in over if np.allclose(q[:2], (0.9, 0.9), atol=1.0e-5)]
+    test.assertEqual([p[2:4] in ((face, 0), (face, 1)) for p in inside], [True])
+    at_corner = [_feature_parts(f) for q, _n, _d, f in over if np.allclose(q[:2], (1.0, 1.0), atol=1.0e-5)]
+    test.assertEqual([p[2] == face and p[3] >= 2 and p[4] >= 4 for p in at_corner], [True])
+    for name, got in (("wall", wall), ("corner", corner), ("hanging", hanging), ("over", over)):
+        features = [f for _q, _n, _d, f in got]
+        test.assertEqual(len(set(features)), len(features), msg=name)
+
+
+# ----------------------------------------------------------------------------------------------------------------
 # the job pipeline, row overflow, unsupported shapes and the shadow
 # ----------------------------------------------------------------------------------------------------------------
 
@@ -1467,12 +1580,13 @@ def _class_jobs(model, shadow, partner_class, *, threads=None, reserve=True, **c
         table.candidates[begin:end],
         int(TERRAIN_PARTNER_WALK_SLOTS[partner_class]),
         scan_run=run,
+        sides=table.sides[begin:end],
     )
     sizes.update(capacities)
     reserves = None
     if reserve:
         reserves = terrain_law_solid.terrain_solid_job_reserves(
-            table.vertices[begin:end], table.candidates[begin:end], scan_run=run
+            table.vertices[begin:end], table.candidates[begin:end], scan_run=run, sides=table.sides[begin:end]
         )
     jobs = terrain_law_solid.terrain_solid_jobs(model.device, partner_class, begin, end - begin, sizes, reserves)
     if threads is not None:
@@ -1664,11 +1778,13 @@ def test_job_lists_hold_each_run_together(test, device):
         with test.subTest(partner_class=partner_class):
             _out, jobs, _solids = _run_class(pipeline, model, partner_class, until="close")
             counts = _counts(jobs)
+            per_vertex = terrain_law_solid.TERRAIN_SOLID_ITEMS
             lists = {
-                # a scan run: its pair's window vertices [k, k + 1) times the run length (six items per vertex)
-                "faces": lambda pair, item, scan=scan: (pair, item // 6 // scan),
-                "edges": lambda pair, item, scan=scan: (pair, item // 6 // scan),
-                "vertices": lambda pair, item, scan=scan: (pair, item // 6 // scan),
+                # a scan run: its pair's window vertices [k, k + 1) times the run length (TERRAIN_SOLID_ITEMS items per
+                # vertex)
+                "faces": lambda pair, item, scan=scan, per_vertex=per_vertex: (pair, item // per_vertex // scan),
+                "edges": lambda pair, item, scan=scan, per_vertex=per_vertex: (pair, item // per_vertex // scan),
+                "vertices": lambda pair, item, scan=scan, per_vertex=per_vertex: (pair, item // per_vertex // scan),
             }
             for name, run_of in lists.items():
                 entries = getattr(jobs, name).numpy()[: counts[name]]
@@ -2470,6 +2586,9 @@ for _name, _func in (
     ("test_hovering_core_leaves_at_the_fine_mip", test_hovering_core_leaves_at_the_fine_mip),
     ("test_recovery_picks_follow_depth_then_index", test_recovery_picks_follow_depth_then_index),
     ("test_solid_rows_match_the_float64_law", test_solid_rows_match_the_float64_law),
+    ("test_solid_rows_match_the_float64_law_at_the_border", test_solid_rows_match_the_float64_law_at_the_border),
+    ("test_clip_rows_are_front_facing", test_clip_rows_are_front_facing),
+    ("test_border_rows_carry_their_feature_codes", test_border_rows_carry_their_feature_codes),
     ("test_job_pipeline_rows_depend_on_the_pair_alone", test_job_pipeline_rows_depend_on_the_pair_alone),
     ("test_job_lists_hold_each_run_together", test_job_lists_hold_each_run_together),
     ("test_slope_resting_solids_keep_their_sink", test_slope_resting_solids_keep_their_sink),

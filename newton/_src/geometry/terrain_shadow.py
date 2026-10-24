@@ -685,10 +685,14 @@ class TerrainLawShadow:
                     self.table.candidates[begin:end],
                     walk,
                     scan_run=run,
+                    sides=self.table.sides[begin:end],
                     scale=self.job_scale,
                 )
                 reserve = solid_module.terrain_solid_job_reserves(
-                    self.table.vertices[begin:end], self.table.candidates[begin:end], scan_run=run
+                    self.table.vertices[begin:end],
+                    self.table.candidates[begin:end],
+                    scan_run=run,
+                    sides=self.table.sides[begin:end],
                 )
                 offset = _JOBS + TERRAIN_LAW_JOB_COUNTERS * partner_class
                 jobs = solid_module.terrain_solid_jobs(

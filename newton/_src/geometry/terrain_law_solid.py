@@ -6,13 +6,19 @@ that run them on a class's pairs.
 
 A solid core has no rounding radius; its reach ``D`` is both margins and both gaps (the contact writer's admission
 limit). Per pair the law visits every surface feature of the window once (window vertex ``(r, c)`` owns its cell's
-two faces and diagonal, its x- and y-edges and itself) and offers the rows of the law's rules for solids, in window
-order:
+two faces and diagonal, its x- and y-edges and itself, and on the heightfield's border the walls below its border edges,
+those edges' clips of their faces and at a corner of the footprint the corner line below it,
+:data:`TERRAIN_SOLID_ITEMS`) and offers the rows of the law's rules for solids, in window order:
 
 * F, faces: the analytic plane manifold of the core against the triangle's cluster plane
   (:func:`~newton._src.geometry.terrain_law_cores.core_manifold`); a manifold point is supported when its footprint
   along the normal lies in a triangle of the cluster and it is front-facing, and the triangle holding the first
-  supported point emits every supported point (one emission per plane);
+  supported point emits every supported point (one emission per plane). The faces are clipped to the heightfield's
+  footprint: at a border edge, the core's part on its face's side of the clip plane through the edge (containing the
+  face's normal) gives the face that part's deepest points on the plane (:func:`_clip_theta`, :func:`_clip_ends`; past
+  a corner of the footprint, the core's point on the corner line). The walls (one plane per side, from the border edges
+  down :data:`~newton._src.geometry.terrain_law.TERRAIN_WALL_DEPTH`) are faces too, one-sided: their manifold points
+  beside them whose projection a piece of wall holds (:func:`_wall_support`);
 * E, convex creases: ``theta* = argmax sigma(theta)`` over the crease's normal arc: nine equally spaced normals, then
   a bisection on the sign of the derivative between the best one's neighbours
   (:func:`~newton._src.geometry.terrain_law_cores.core_slope`, closed form for boxes and cylinders, the support
@@ -20,11 +26,14 @@ order:
   ``sigma``); inside the arc, the core's flat support feature within the band
   ``beta = max(0.1 mm, 1e-3 size)``, at an arc end its reference feature (G1); the interval where it meets the
   crease's line emits its ends lifted onto the core (no deeper than the feature's chord over them), ends on vertex
-  features left to the vertex;
+  features left to the vertex. A border edge is a convex crease between its triangle and its wall; a corner line,
+  one-sided as its walls are, between its two walls;
 * V, vertex features: the direction to the core's nearest point (or the minimum translation from inside) inside the
-  vertex's normal cone, within reach;
+  vertex's normal cone, within reach; a border vertex's cone takes its walls' normals, and its ring the wall below it;
 * R, recovery (G3): a pair with no row whose core lies below the surface gets up to four of the core's deepest
-  boundary points against the face vertically above them.
+  boundary points against the face vertically above them, clipped to the footprint: its points inside it (its part
+  inside it on a border edge's clip plane below the edge's face is rule F's clip row, so a pair left to rule R has
+  none).
 
 Rule C (concave anticipation) is off. Cheapest rejects first: the tile-max exit, a feature skipped when its highest
 vertex lies below the core's lowest point minus the reach, a face's plane rejected by one support call before its
@@ -43,15 +52,19 @@ pairs' features at once instead of one pair's whole window, and no thread walks 
    :data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_SCAN_RUN` window vertices. The scan
    (:func:`solid_scan`), one thread per run: the run's
    features through their cheapest rejects in window order: rule F's faces (one per cluster plane and run: its
-   manifold, support tests and emitting triangle are its cluster's alone, :func:`_face_support`), rule E's edges
-   (:func:`_edge_cheap`) and rule V's vertices (:func:`_vertex_cheap`), each survivor listed for its job kernel.
-2. The job kernels, a fixed grid striding over each list: :func:`solid_face_job`, :func:`solid_edge_job` (its crease
-   tests, :func:`_edge_arc`; a crease whose arc can hold a row is listed for ``theta*``), :func:`solid_theta_job`
-   (``theta*``, :func:`_edge_theta`, kept per listed crease), :func:`solid_crease_job` (the crossing at ``theta*``
-   and its ends, :func:`_edge_rows_at`; apart, so that the search runs in a lean kernel) and :func:`solid_vertex_job`
+   manifold, support tests and emitting triangle are its cluster's alone, :func:`_face_support`) and walls (one per wall
+   and run, :func:`_wall_cheap`), rule E's edges and corner lines (:func:`_edge_cheap`) and rule V's vertices
+   (:func:`_vertex_cheap`), each survivor listed for its job kernel.
+2. The job kernels, a fixed grid striding over each list: :func:`solid_face_job` (a wall's :func:`solid_wall_job`),
+   :func:`solid_edge_job` (its crease tests, :func:`_edge_arc`; a crease whose arc can hold a row is listed for
+   ``theta*``, a border edge whose clip plane the core may cross for its clip, :func:`_clip_cheap`),
+   :func:`solid_theta_job` (``theta*``, :func:`_edge_theta`, or the clip's normal, :func:`_clip_theta`, kept per listed
+   crease), :func:`solid_crease_job` (the crossing at ``theta*`` and its ends, :func:`_edge_rows_at`, or the clip's rows,
+   :func:`_clip_rows_at`; apart, so that the search runs in a lean kernel) and :func:`solid_vertex_job`
    (:func:`_vertex_rows`).
    A job adds its rows to the class's candidate pool, each with its place in window order (its key: its item's index,
-   window vertex times six plus its item, times eight plus its point slot), the row the walk would offer there.
+   window vertex times :data:`TERRAIN_SOLID_ITEMS` plus its item, times eight plus its point slot), the row the walk
+   would offer there.
 3. The close (:func:`solid_close_jobs`), one thread per live pair: the pair's candidates held in its walk slots in key
    order (:func:`~newton._src.geometry.terrain_law.terrain_hold_row`, the rows a walk of its window holds, bit for bit,
    however the jobs ran; a candidate listed twice is one offer), then rule R's kernel for a pair without a row, a block
@@ -93,7 +106,9 @@ import warp as wp
 from .broad_phase_common import is_shape_pair_immovable_filtered
 from .terrain_law import (
     TERRAIN_EDGE_CONCAVE,
+    TERRAIN_EDGE_CORNER,
     TERRAIN_EPS32,
+    TERRAIN_FACE_WALL,
     TERRAIN_FEATURE_EDGE,
     TERRAIN_FEATURE_FACE,
     TERRAIN_FEATURE_RECOVERY,
@@ -112,6 +127,7 @@ from .terrain_law import (
     TERRAIN_PAIR_WIDE,
     TERRAIN_STATUS_JOBS,
     TERRAIN_VERTEX_FEATURE_BIT,
+    TERRAIN_WALL_DEPTH,
     TERRAIN_WINDOW_WIDE,
     TerrainFeatureData,
     TerrainFinishScratch,
@@ -120,6 +136,10 @@ from .terrain_law import (
     TerrainPlanes,
     TerrainSurfaceInfo,
     TerrainWindow,
+    terrain_beyond_walls,
+    terrain_border_far,
+    terrain_border_side,
+    terrain_border_triangle,
     terrain_box_cells,
     terrain_cluster,
     terrain_crease_class,
@@ -133,18 +153,24 @@ from .terrain_law import (
     terrain_finish_slots,
     terrain_height,
     terrain_hold_row,
+    terrain_interior_vertex,
     terrain_locate,
     terrain_pair_exit,
     terrain_plane,
     terrain_plane_group_of_three,
     terrain_planes,
     terrain_point_below_cached,
+    terrain_point_below_inside,
     terrain_store_row,
     terrain_tile_exit,
     terrain_triangle_vertices,
     terrain_vertex_bits,
     terrain_vertex_feature,
     terrain_vertex_in_cone,
+    terrain_vertex_sides,
+    terrain_wall_holds,
+    terrain_wall_normal,
+    terrain_wall_value,
     terrain_window,
     terrain_window_point,
     terrain_window_vertex,
@@ -250,7 +276,18 @@ _WIDE = wp.constant(TERRAIN_WINDOW_WIDE)
 _EPS32 = wp.constant(TERRAIN_EPS32)
 _FLAT = wp.constant(TERRAIN_FLAT_EPS)
 _HUGE = wp.constant(3.0e38)
-_ITEMS = wp.constant(6)
+TERRAIN_SOLID_ITEMS = 9
+"""Items a window vertex ``(r, c)`` owns in a solid pair's window order: its cell's faces (0, 1), its x-, y- and diagonal
+edges (2, 3, 4), itself (5), the corner line below it at a corner of the footprint (6) and on the border, the wall below
+its x-edge or y-edge and that edge's clip of its triangle's face (7, 8). A row's key is its item's index (window vertex
+times this plus its item) times eight plus its point slot."""
+_ITEMS = wp.constant(TERRAIN_SOLID_ITEMS)
+_ITEM_VERTEX = wp.constant(5)
+_ITEM_CORNER = wp.constant(6)
+_ITEM_BORDER = wp.constant(7)
+_WALL_DEPTH = wp.constant(TERRAIN_WALL_DEPTH)
+_CLIP_SLOT = wp.constant(4)
+"""Point slot of a clip row's first end (:func:`_clip_rows_at`; a wall's manifold points take slots 0-3)."""
 _SEEN = wp.constant(TERRAIN_SOLID_SEEN)
 _SORTED = wp.constant(TERRAIN_SOLID_SORTED)
 _FEW = wp.constant(TERRAIN_SOLID_FEW)
@@ -657,16 +694,47 @@ def _theta_star(
 
 
 @wp.func
-def _edge_cheap(data: TerrainFeatureData, window: TerrainWindow, pair: _Pair, r: int, c: int, which: int) -> bool:
-    """Rule E's cheapest rejects of edge ``which`` of vertex ``(r, c)``, from its vertices and the core's sphere alone:
-    ``False`` for an edge that gives no row (not a crease, below the core, the sphere off the crease's segment)."""
-    if not terrain_edge_open_crease(data, window, r, c, which):
-        # flat inside one cluster, or on the border: no crease; or a valley in this window's frame by its static class,
-        # which the crease tests reject (:func:`_edge_arc`)
-        return False
+def _item_edge(item: int) -> int:
+    """The edge of a window vertex's item (:data:`TERRAIN_SOLID_ITEMS`): 0, 1, 2 its x-, y- and diagonal edge, 3 the
+    corner line below it; -1 for an item that is no edge."""
+    if item >= 2 and item <= 4:
+        return item - 2
+    if item == _ITEM_CORNER:
+        return TERRAIN_EDGE_CORNER
+    return -1
+
+
+@wp.func
+def _edge_ends(
+    data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, which: int
+) -> tuple[wp.vec2i, wp.vec2i, wp.vec3, wp.vec3]:
+    """An edge's end vertices ``(v0i, v1i, v0, v1)`` (window frame): edge ``which`` of vertex ``(r, c)`` from its lower
+    vertex, or for the corner line (``which`` :data:`~newton._src.geometry.terrain_law.TERRAIN_EDGE_CORNER`) from the
+    corner vertex down to the walls' base (``v1i`` off the grid)."""
+    if which == TERRAIN_EDGE_CORNER:
+        v = terrain_window_vertex(data, window, r, c)
+        return wp.vec2i(r, c), wp.vec2i(-1, -1), v, wp.vec3(v[0], v[1], v[2] - _WALL_DEPTH)
     v0i, v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
-    v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
-    v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
+    return (
+        v0i,
+        v1i,
+        terrain_window_vertex(data, window, v0i[0], v0i[1]),
+        terrain_window_vertex(data, window, v1i[0], v1i[1]),
+    )
+
+
+@wp.func
+def _edge_cheap(data: TerrainFeatureData, window: TerrainWindow, pair: _Pair, r: int, c: int, which: int) -> bool:
+    """Rule E's cheapest rejects of edge ``which`` of vertex ``(r, c)`` (a corner line below it for ``which``
+    :data:`~newton._src.geometry.terrain_law.TERRAIN_EDGE_CORNER`), from its vertices and the core's sphere alone:
+    ``False`` for an edge that gives no row (not a crease, below the core, the sphere off the crease's segment). A border
+    edge is a ridge between its triangle and its wall."""
+    if which < TERRAIN_EDGE_CORNER and terrain_border_side(window.surface, r, c, which) < 0:
+        if not terrain_edge_open_crease(data, window, r, c, which):
+            # flat inside one cluster: no crease; or a valley in this window's frame by its static class, which the
+            # crease tests reject (:func:`_edge_arc`)
+            return False
+    _v0i, _v1i, v0, v1 = _edge_ends(data, window, r, c, which)
     top = wp.max(v0[2], v1[2])
     if top < pair.low:
         return False
@@ -702,20 +770,34 @@ def _edge_arc(
 ) -> tuple[TerrainPlanes, bool, wp.vec3, wp.vec3, float, float]:
     """Rule E's crease tests of edge ``which`` of vertex ``(r, c)`` past :func:`_edge_cheap`: ``(planes, ok, n_a,
     n_b, sigma_a, sigma_b)``, ``ok`` for a convex crease whose normal arc (``n_a`` to ``n_b``) can hold a row within
-    reach (its ends' support values ``sigma_a`` and ``sigma_b``)."""
-    v0i, v1i, ta, tb, _wa, _wb = terrain_edge_sides(r, c, which)
-    v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
-    v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
+    reach (its ends' support values ``sigma_a`` and ``sigma_b``). A border edge's arc runs from its triangle's normal
+    to its wall's, a corner line's from one wall's normal to the other's."""
+    _v0i, _v1i, v0, v1 = _edge_ends(data, window, r, c, which)
     e = v1 - v0
     length2 = wp.dot(e, e)
     length = wp.sqrt(length2)
     dh = e / length
     toward = pair.sphere_c - v0
     no = wp.vec3(0.0)
-    planes, na, pa = terrain_plane(data, window, planes, ta[0], ta[1], ta[2])
-    if terrain_crease_class(data, window, r, c, which, na, pa) == TERRAIN_EDGE_CONCAVE:
-        return planes, False, no, no, 0.0, 0.0
-    planes, nb, _pb = terrain_plane(data, window, planes, tb[0], tb[1], tb[2])
+    na = wp.vec3(0.0)
+    nb = wp.vec3(0.0)
+    side = int(-1)
+    if which < TERRAIN_EDGE_CORNER:
+        side = terrain_border_side(window.surface, r, c, which)
+    if which == TERRAIN_EDGE_CORNER:
+        sides = terrain_vertex_sides(window.surface, r, c)
+        na = terrain_wall_normal(sides[0])
+        nb = terrain_wall_normal(sides[1])
+    elif side >= 0:
+        t = terrain_border_triangle(r, c, which, side)
+        planes, na, _pa = terrain_plane(data, window, planes, t[0], t[1], t[2])
+        nb = terrain_wall_normal(side)
+    else:
+        _v0i, _v1i, ta, tb, _wa, _wb = terrain_edge_sides(r, c, which)
+        planes, na, pa = terrain_plane(data, window, planes, ta[0], ta[1], ta[2])
+        if terrain_crease_class(data, window, r, c, which, na, pa) == TERRAIN_EDGE_CONCAVE:
+            return planes, False, no, no, 0.0, 0.0
+        planes, nb, _pb = terrain_plane(data, window, planes, tb[0], tb[1], tb[2])
     # the normal arc, exactly perpendicular to the edge
     n_a = wp.normalize(na - wp.dot(na, dh) * dh)
     n_b = wp.normalize(nb - wp.dot(nb, dh) * dh)
@@ -773,9 +855,7 @@ def _edge_reach(
     Each test is exact: it rejects only creases that the ``theta*`` search and the crossing (:func:`_edge_rows_at`)
     would leave without a row, with every float32 rounding of both sides inside its margin.
     """
-    v0i, v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
-    v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
-    v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
+    _v0i, _v1i, v0, v1 = _edge_ends(data, window, r, c, which)
     e = v1 - v0
     length = wp.sqrt(wp.dot(e, e))
     dh = e / length
@@ -837,11 +917,13 @@ def _edge_theta(
 ) -> tuple[wp.vec3, int]:
     """A crease's ``theta*`` (:func:`_theta_star`): ``(n*, kind)``, ``kind`` -1 when the core's support there lies
     beyond the reach (no row), 1 inside the arc, 0 at an arc end (within :data:`TERRAIN_SOLID_ARC_END` of one: its
-    reference feature, G1)."""
-    v0i, _v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
-    v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
+    reference feature, G1). A corner line is one-sided, as its walls are: a core inside both walls there
+    (``sigma* < 0`` beyond the band) has no row."""
+    _v0i, _v1i, v0, _v1 = _edge_ends(data, window, r, c, which)
     nst, sigma, end = _theta_star(core, n_a, n_b, v0, sigma_a, sigma_b, pair.eps)
     if sigma > pair.reach:
+        return nst, -1
+    if which == TERRAIN_EDGE_CORNER and sigma < -pair.eps:
         return nst, -1
     if end == 0 and wp.length(nst - n_a) > _ARC_END and wp.length(nst - n_b) > _ARC_END:
         return nst, 1
@@ -866,9 +948,7 @@ def _edge_rows_at(
     """Rule E's rows of a crease at its ``theta*`` ``nst`` (``kind`` from :func:`_edge_theta`): the crossing of the
     core's flat support feature (inside the arc) or reference feature (an arc end) with the crease's line, and its
     ends lifted onto the core."""
-    v0i, v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
-    v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
-    v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
+    v0i, v1i, v0, v1 = _edge_ends(data, window, r, c, which)
     e = v1 - v0
     length2 = wp.dot(e, e)
     length = wp.sqrt(length2)
@@ -879,6 +959,11 @@ def _edge_rows_at(
     crossing = TerrainCrossing()
     if interior:
         found, crossing = core_flat_crossing(core, nst, pair.band, v0, dh, e2, pair.tol)
+        if not found:
+            # Inside the arc the feature meets the line (theta* is sigma's stationary point), but a single support point
+            # that turns fast with the normal (a cylinder's rim near its axis, a barrel's side) the search's rounding
+            # leaves off it: within the flatness band.
+            found, crossing = core_flat_crossing(core, nst, pair.band, v0, dh, e2, pair.band)
     else:
         found, crossing = core_reference_crossing(core, nst, v0, dh, e2, pair.tol, pair.straddle)
     if not found:
@@ -923,6 +1008,270 @@ def _edge_rows_at(
             continue
         sink = _offer(store, sink, u, nst, t, terrain_feature_id(r, c, TERRAIN_FEATURE_EDGE, which, slot))
     return planes, sink
+
+
+@wp.func
+def _clip_frame(
+    data: TerrainFeatureData, window: TerrainWindow, planes: TerrainPlanes, r: int, c: int, which: int, side: int
+) -> tuple[TerrainPlanes, wp.vec3, wp.vec3, wp.vec3, wp.vec3, wp.vec3]:
+    """Rule F's clip at border edge ``which`` of vertex ``(r, c)`` (wall ``side``): ``(planes, v0, v1, n, a, m)``, the
+    edge's ends, its triangle's cluster plane (normal ``n`` through ``a``) and the outward normal ``m`` of the clip
+    plane through the edge containing ``n``: the triangle's in-plane outward normal there, as
+    :func:`~newton._src.geometry.terrain_law.terrain_face_edge_value` takes it, so that the plane bounds the face's
+    claims (a manifold point is supported where its projection lies on the face's side)."""
+    _v0i, _v1i, v0, v1 = _edge_ends(data, window, r, c, which)
+    t = terrain_border_triangle(r, c, which, side)
+    far = terrain_border_far(r, c, which, side)
+    planes, n, a = terrain_plane(data, window, planes, t[0], t[1], t[2])
+    m = wp.cross(v1 - v0, n)
+    if wp.dot(m, terrain_window_vertex(data, window, far[0], far[1]) - v0) > 0.0:
+        m = -m
+    return planes, v0, v1, n, a, wp.normalize(m)
+
+
+@wp.func
+def _clip_cheap(
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    pair: _Pair,
+    r: int,
+    c: int,
+    which: int,
+    side: int,
+) -> tuple[TerrainPlanes, bool]:
+    """Rule F's clip at a border edge past :func:`_edge_cheap`: ``False`` when the core's sphere lies wholly on one side
+    of the clip plane (:func:`_clip_frame`; nothing of the core is clipped there, or nothing lies on the face's side) or
+    above the face beyond the reach."""
+    planes, v0, _v1, n, a, m = _clip_frame(data, window, planes, r, c, which, side)
+    across = wp.dot(m, pair.sphere_c - v0)
+    if wp.abs(across) > pair.sphere_r + pair.eps:
+        return planes, False
+    return planes, wp.dot(n, pair.sphere_c - a) - pair.sphere_r <= pair.reach
+
+
+@wp.func
+def _clip_theta(core: Any, n: wp.vec3, m: wp.vec3, v0: wp.vec3):
+    """Rule F's clip at a border edge (its face's normal ``n``, its clip plane through ``v0`` of outward normal ``m``,
+    :func:`_clip_frame`): ``(core, n_c, kind)``, the normal ``n_c`` on the quarter arc from ``n`` toward ``m`` at which
+    the core's support first reaches the clip plane, where its support feature holds the deepest points along ``n`` of
+    its part on the face's side: ``kind`` 0 at ``n`` itself (the support there reaches the plane), 1 inside the arc, -1
+    when no point of the core lies on the face's side of the plane.
+
+    The depth of that part along ``n`` is ``max over lambda >= 0`` of ``min over the core of (n + lambda m) . (k - v0)``
+    (Lagrange duality, up to the face's offset), a concave function of ``lambda`` whose slope is ``m . (k* - v0)`` at
+    its support point ``k*``: the bisection (:data:`TERRAIN_SOLID_BISECTION` steps on the arc, ``lambda`` its tangent)
+    follows the sign of that slope, the smallest of tied support points
+    (:func:`~newton._src.geometry.terrain_law_cores.core_slope_near` along ``m``)."""
+    core, slope = core_slope_near(core, n, m, v0, 1.0)
+    if slope <= 0.0:
+        return core, n, 0
+    core, inner = core_sigma_near(core, m, v0)
+    if inner >= 0.0:
+        return core, m, -1
+    lo = n
+    hi = m
+    for _step in range(_BISECTION):
+        mid = wp.normalize(lo + hi)
+        core, slope = core_slope_near(core, mid, m, v0, 1.0)
+        if slope > 0.0:
+            lo = mid
+        else:
+            hi = mid
+    return core, wp.normalize(lo + hi), 1
+
+
+@wp.func
+def _clip_ends(
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    pair: _Pair,
+    r: int,
+    c: int,
+    which: int,
+    side: int,
+    n_c: wp.vec3,
+    kind: int,
+) -> tuple[TerrainPlanes, int, _Mat43, wp.vec4, wp.vec3, wp.vec3]:
+    """The clipped points of a border edge (wall ``side``) at :func:`_clip_theta`'s ``n_c``: ``(planes, mask, points,
+    depth, n, a)``, bit ``j`` of ``mask`` set for end ``j`` (0 and 1, or 0 alone for one point) of the core's part on its
+    face's side of the clip plane deepest along the face's normal ``n`` (plane through ``a``): its support feature at
+    ``n_c`` crossed with the clip plane (:func:`~newton._src.geometry.terrain_law_cores.core_flat_crossing` across the
+    plane's normal; inside the arc, a single support point the search left off the plane by its rounding, within the
+    flatness band) gives the ends of that part's deepest region on the plane, each the core's point on the plane over
+    its place on the edge (its lift along ``n``, which a chord's point beyond it by the tolerance or a miss leaves to the
+    chord). An end within this edge is its own, an end past a corner of the footprint becomes the core's point on the
+    corner line along ``n``, an end past another vertex is the next edge's (not set). Each end's depth along ``n`` is
+    within the reach, and the point is front-facing as a face's supported point is (:func:`_face_support`): below the
+    face it lies inside every wall and below the surface, above the face not below it."""
+    points = _Mat43()
+    depth = wp.vec4(0.0)
+    if kind < 0:
+        return planes, 0, points, depth, wp.vec3(0.0), wp.vec3(0.0)
+    planes, v0, v1, n, a, m = _clip_frame(data, window, planes, r, c, which, side)
+    e = v1 - v0
+    length = wp.length(e)
+    dh = e / length
+    found, crossing = core_flat_crossing(core, n_c, pair.band, v0, dh, m, pair.tol)
+    if not found and kind == 1:
+        found, crossing = core_flat_crossing(core, n_c, pair.band, v0, dh, m, pair.band)
+    if not found:
+        return planes, 0, points, depth, n, a
+    ends = 2
+    if crossing.hi - crossing.lo < 1.0e-9:
+        ends = 1
+    v0i, v1i, _v0, _v1 = _edge_ends(data, window, r, c, which)
+    mask = int(0)
+    for slot in range(ends):
+        x = crossing.lo
+        k = crossing.k_lo
+        if ends == 1:
+            x = 0.5 * (crossing.lo + crossing.hi)
+            k = 0.5 * (crossing.k_lo + crossing.k_hi)
+        elif slot == 1:
+            x = crossing.hi
+            k = crossing.k_hi
+        corner = wp.vec2i(-1, -1)
+        if x < -pair.eps:
+            corner = v0i
+        elif x > length + pair.eps:
+            corner = v1i
+        u = v0 + x * dh
+        if corner[0] >= 0:
+            # past a vertex: the next edge's, or at a corner of the footprint the core's point on the corner line
+            if terrain_vertex_sides(window.surface, corner[0], corner[1])[1] < 0:
+                continue
+            u = terrain_window_vertex(data, window, corner[0], corner[1])
+            hit, k_lift, _t = core_lift(core, u, n, pair.tol)
+            if not hit:
+                continue
+            k = k_lift
+        else:
+            hit, k_lift, t = core_lift(core, u, n, pair.tol)
+            if hit and t <= wp.dot(n, k - u) + pair.tol:
+                k = k_lift
+        h = wp.dot(n, k - a)
+        if h > pair.reach:
+            continue
+        if h < -pair.eps:
+            # below the face: inside every wall (the block's footprint; near a corner the point on this edge's clip
+            # plane may lie beyond the other wall) and front-facing as a face's supported point
+            # (:func:`_face_support`): inside the solid
+            if terrain_beyond_walls(window, k) > pair.eps:
+                continue
+            planes, below = terrain_point_below_inside(data, window, planes, k)
+            if not below:
+                continue
+        elif h > pair.eps:
+            # above the face: front-facing, outside the solid
+            planes, below = terrain_point_below_cached(data, window, planes, k)
+            if below:
+                continue
+        mask = mask | (1 << slot)
+        points[slot, 0] = k[0]
+        points[slot, 1] = k[1]
+        points[slot, 2] = k[2]
+        depth[slot] = h
+    return planes, mask, points, depth, n, a
+
+
+@wp.func
+def _clip_rows_at(
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    planes: TerrainPlanes,
+    pair: _Pair,
+    sink: _Sink,
+    store: Any,
+    r: int,
+    c: int,
+    which: int,
+    side: int,
+    n_c: wp.vec3,
+    kind: int,
+) -> tuple[TerrainPlanes, _Sink]:
+    """Rule F's clipped rows at border edge ``which`` of vertex ``(r, c)`` (wall ``side``), at :func:`_clip_theta`'s
+    ``n_c``: its clipped points (:func:`_clip_ends`) as rows of its triangle's face: the terrain point on the edge
+    (the point's projection along the face's normal), the face's normal and the point's depth along it."""
+    planes, mask, points, depth, n, _a = _clip_ends(core, data, window, planes, pair, r, c, which, side, n_c, kind)
+    for slot in range(2):
+        if ((mask >> slot) & 1) != 0:
+            k = wp.vec3(points[slot, 0], points[slot, 1], points[slot, 2])
+            sink = _offer(
+                store,
+                sink,
+                k - depth[slot] * n,
+                n,
+                depth[slot],
+                terrain_feature_id(r, c, TERRAIN_FEATURE_FACE, TERRAIN_FACE_WALL + which, _CLIP_SLOT + slot),
+            )
+    return planes, sink
+
+
+@wp.func
+def _wall_cheap(data: TerrainFeatureData, window: TerrainWindow, pair: _Pair, r: int, c: int, which: int, side: int):
+    """Rule F's cheapest rejects of the wall below border edge ``which`` of vertex ``(r, c)`` (wall ``side``): ``False``
+    when the core's lowest point clears the edge by the reach, or its sphere lies wholly inside the wall's plane (the
+    wall is one-sided) or beyond the reach of it."""
+    _v0i, _v1i, v0, v1 = _edge_ends(data, window, r, c, which)
+    if wp.max(v0[2], v1[2]) < pair.low:
+        return False
+    beyond = terrain_wall_value(pair.sphere_c, v0, side)
+    if beyond + pair.sphere_r < -pair.eps:
+        return False
+    return beyond - pair.sphere_r <= pair.reach
+
+
+@wp.func
+def _wall_piece(window: TerrainWindow, cells: wp.vec4i, r: int, c: int, side: int, k: wp.vec3) -> wp.vec2i:
+    """The window vertex whose border edge's piece of wall ``side`` lies along point ``k`` (the edge's row ``r`` or
+    column ``c`` kept, the other coordinate from ``k``, clamped to the window's edges)."""
+    surface = window.surface
+    if side < 2:
+        return wp.vec2i(r, wp.clamp(window.c0 + int(wp.floor(k[0] / surface.dx)), cells[2], cells[3]))
+    return wp.vec2i(wp.clamp(window.r0 + int(wp.floor(k[1] / surface.dy)), cells[0], cells[1]), c)
+
+
+@wp.func
+def _wall_support(
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    pair: _Pair,
+    cells: wp.vec4i,
+    r: int,
+    c: int,
+    which: int,
+    side: int,
+) -> tuple[int, wp.vec2i, int, _Mat43, wp.vec4]:
+    """Rule F's manifold of wall ``side`` (below border edge ``which`` of vertex ``(r, c)``): ``(supported, emitter,
+    count, points, depth)``, ``supported`` the bits of the manifold points beside the wall (it is one-sided) whose
+    projection a piece of it in the window holds (:func:`~newton._src.geometry.terrain_law.terrain_wall_holds`) and
+    ``emitter`` the window vertex of the piece holding the first of them (``(-1, -1)`` for none). A function of the
+    wall alone: whichever of its pieces lists it gives the same emitter and rows."""
+    _v0i, _v1i, v0, _v1 = _edge_ends(data, window, r, c, which)
+    n = terrain_wall_normal(side)
+    emitter = wp.vec2i(-1, -1)
+    if core_sigma(core, n, v0) > pair.reach:
+        return 0, emitter, 0, _Mat43(), wp.vec4(0.0)
+    count, points, depth = core_manifold(core, n, v0, pair.reach)
+    supported = int(0)
+    for j in range(count):
+        if depth[j] < -pair.eps:
+            continue
+        k = wp.vec3(points[j, 0], points[j, 1], points[j, 2])
+        piece = _wall_piece(window, cells, r, c, side, k)
+        _u0i, _u1i, u0, u1 = _edge_ends(data, window, piece[0], piece[1], which)
+        if not terrain_wall_holds(pair.eps, side, u0, u1, k):
+            continue
+        supported = supported | (1 << j)
+        if emitter[0] < 0:
+            emitter = piece
+    return supported, emitter, count, points, depth
 
 
 @wp.func
@@ -991,7 +1340,9 @@ def solid_recovery(
     Each lane takes every ``lanes``-th point and keeps its first four in (depth, index) order, each point's depth taken
     once; four block minima then pick the pair's first four in that order, and the first lane offers their rows. A
     row's feature id takes the pick's rank (0-3) as its point slot, unique within the pair: a boundary point's index (up
-    to 32 for a cylinder) would wrap in the slot's three bits.
+    to 32 for a cylinder) would wrap in the slot's three bits. Rule R is clipped to the heightfield's footprint: a point
+    outside it has no face above it. The core's part inside it on a border edge's clip plane below the edge's face is
+    rule F's clip row (:func:`_clip_rows_at`), so that a pair left to rule R has none.
     """
     depth = wp.vec4(0.0)
     index = wp.vec4i(-1)
@@ -1089,10 +1440,15 @@ def solid_pair_read(inputs: TerrainPairInputs, data: TerrainFeatureData, pair: i
 
 @wp.func
 def _vertex_quiet(data: TerrainFeatureData, surface: TerrainSurfaceInfo, r: int, c: int) -> bool:
-    """Whether window vertex ``(r, c)`` lists nothing for rules E and V in any window: its three edges are flat or on
-    the border (two-bit codes 1 or 2 of its bits, whose bits then differ) and it is no vertex feature."""
+    """Whether window vertex ``(r, c)`` lists nothing for rules E and V and no border feature in any window: it is
+    interior, its three edges are flat (two-bit codes 1 or 2 of its bits, whose bits then differ; an interior vertex's
+    edges have both triangles) and it is no vertex feature."""
     bits = terrain_vertex_bits(data, surface, r, c)
-    return ((bits ^ (bits >> 1)) & 21) == 21 and (bits & TERRAIN_VERTEX_FEATURE_BIT) == 0
+    return (
+        ((bits ^ (bits >> 1)) & 21) == 21
+        and (bits & TERRAIN_VERTEX_FEATURE_BIT) == 0
+        and terrain_interior_vertex(surface, r, c)
+    )
 
 
 @wp.func
@@ -1305,10 +1661,12 @@ def solid_scan(
 ):
     """Run ``run`` of a live pair's scan (class pair ``i``, its kept core and record; the window vertices ``[run, run +
     1)`` times ``run_vertices``, its class's run of at most :data:`TERRAIN_SOLID_SCAN_VERTICES`, in window order): its
-    vertices' features in window order through the
-    cheapest rejects of their rules, every survivor listed for its job kernel: rule F's faces (:func:`_face_top`; of a cluster of several triangles, the first that passes, its
-    cluster's manifold and emitting triangle being its cluster's alone), rule E's edges (:func:`_edge_cheap`) and rule
-    V's vertices (:func:`_vertex_cheap`). The run marks its survivors in one bit per vertex and item, then reserves
+    vertices' features in window order through the cheapest rejects of their rules, every survivor listed for its job
+    kernel: rule F's faces (:func:`_face_top`; of a cluster of several triangles, the first that passes, its cluster's
+    manifold and emitting triangle being its cluster's alone) and walls (:func:`_wall_cheap`; each wall once, its
+    manifold and emitting piece being its own), rule E's edges, border edges among them, and corner lines
+    (:func:`_edge_cheap`) and rule V's vertices (:func:`_vertex_cheap`). The run marks its survivors in one bit per
+    vertex and item, then reserves
     each list's entries with one atomic and writes them in window order (:func:`_job_reserve`): consecutive entries of a
     list are one run's, so that the threads of a job kernel's warp take one pair's features. A job without room, the
     list's reserve included, flags the pair :data:`~newton._src.geometry.terrain_law.TERRAIN_PAIR_INCOMPLETE` (its
@@ -1331,13 +1689,17 @@ def solid_scan(
     # edge, the vertex)
     face0 = wp.uint32(0)
     face1 = wp.uint32(0)
+    wall0 = wp.uint32(0)
+    wall1 = wp.uint32(0)
     edge0 = wp.uint32(0)
     edge1 = wp.uint32(0)
     edge2 = wp.uint32(0)
+    corner = wp.uint32(0)
     point = wp.uint32(0)
     faces = int(0)
     edges = int(0)
     points = int(0)
+    walls_seen = int(0)
     for vertex in range(first, last):
         v = vertex - first
         row = vertex // width
@@ -1375,6 +1737,20 @@ def solid_scan(
                 else:
                     edge2 = _with_bit(edge2, v)
                 edges += 1
+            if which < 2:
+                side = terrain_border_side(surface, r, c, which)
+                if side >= 0 and ((walls_seen >> side) & 1) == 0:
+                    if _wall_cheap(data, window, pair, r, c, which, side):
+                        walls_seen = walls_seen | (1 << side)
+                        if which == 0:
+                            wall0 = _with_bit(wall0, v)
+                        else:
+                            wall1 = _with_bit(wall1, v)
+                        faces += 1
+        if terrain_vertex_sides(surface, r, c)[1] >= 0:
+            if _edge_cheap(data, window, pair, r, c, TERRAIN_EDGE_CORNER):
+                corner = _with_bit(corner, v)
+                edges += 1
         core, listed = _vertex_cheap(core, data, window, pair, r, c)
         if listed:
             point = _with_bit(point, v)
@@ -1387,6 +1763,10 @@ def solid_scan(
                 entry = _job_put(jobs.faces, entry, wp.vec2i(pair_index, item))
             if _bit(face1, v):
                 entry = _job_put(jobs.faces, entry, wp.vec2i(pair_index, item + 1))
+            if _bit(wall0, v):
+                entry = _job_put(jobs.faces, entry, wp.vec2i(pair_index, item + _ITEM_BORDER))
+            if _bit(wall1, v):
+                entry = _job_put(jobs.faces, entry, wp.vec2i(pair_index, item + _ITEM_BORDER + 1))
     entry, room = _job_reserve(jobs, out, pair_index, _EDGES, jobs.edges, edges)
     kept = kept & room
     if edges > 0:
@@ -1398,12 +1778,14 @@ def solid_scan(
                 entry = _job_put(jobs.edges, entry, wp.vec2i(pair_index, item + 3))
             if _bit(edge2, v):
                 entry = _job_put(jobs.edges, entry, wp.vec2i(pair_index, item + 4))
+            if _bit(corner, v):
+                entry = _job_put(jobs.edges, entry, wp.vec2i(pair_index, item + _ITEM_CORNER))
     entry, room = _job_reserve(jobs, out, pair_index, _VERTICES, jobs.vertices, points)
     kept = kept & room
     if points > 0:
         for v in range(last - first):
             if _bit(point, v):
-                entry = _job_put(jobs.vertices, entry, wp.vec2i(pair_index, (first + v) * _ITEMS + 5))
+                entry = _job_put(jobs.vertices, entry, wp.vec2i(pair_index, (first + v) * _ITEMS + _ITEM_VERTEX))
     if kept == 0:
         wp.atomic_or(out.state, pair_index, TERRAIN_PAIR_INCOMPLETE)
 
@@ -1454,13 +1836,17 @@ def solid_face_job(
 ):
     """Rule F for the cluster of a listed face: its manifold, support tests and emitting triangle
     (:func:`_face_support`), and its rows, at the emitting triangle's place in window order, when the walk would emit
-    them there: the triangle lies in the window and its highest vertex is not below the pair's ``low``."""
+    them there: the triangle lies in the window and its highest vertex is not below the pair's ``low``. A listed wall
+    (item :data:`TERRAIN_SOLID_ITEMS` 7 or 8) takes :func:`solid_wall_job`."""
     record, window = solid_job_window(data, jobs, i)
     cells = record.cells
     pair = record.pair
     vertex = item // _ITEMS
     sub = item - vertex * _ITEMS
     rc = _job_vertex(cells, vertex)
+    if sub >= _ITEM_BORDER:
+        solid_wall_job(core, data, window, record, out, jobs, pair_index, i, rc[0], rc[1], sub - _ITEM_BORDER)
+        return
     cluster = terrain_cluster(data, window.surface, rc[0], rc[1], sub)
     planes = terrain_planes()
     planes, supported, first, count, points, depth, n = _face_support(
@@ -1479,16 +1865,71 @@ def solid_face_job(
 
 
 @wp.func
+def solid_wall_job(
+    core: Any,
+    data: TerrainFeatureData,
+    window: TerrainWindow,
+    record: TerrainSolidRecord,
+    out: TerrainLawRows,
+    jobs: TerrainSolidJobs,
+    pair_index: int,
+    i: int,
+    r: int,
+    c: int,
+    which: int,
+):
+    """Rule F for a listed wall (below border edge ``which`` of vertex ``(r, c)``): its manifold, support tests and
+    emitting piece (:func:`_wall_support`), and its rows at that piece's place in window order (its vertex's item 7 or
+    8), when its edge is not below the pair's ``low``: terrain points on the wall, its normal, the manifold points'
+    distances beyond it."""
+    cells = record.cells
+    pair = record.pair
+    side = terrain_border_side(window.surface, r, c, which)
+    supported, emitter, count, points, depth = _wall_support(core, data, window, pair, cells, r, c, which, side)
+    if supported == 0:
+        return
+    _u0i, _u1i, u0, u1 = _edge_ends(data, window, emitter[0], emitter[1], which)
+    if wp.max(u0[2], u1[2]) < pair.low:
+        return
+    width = cells[3] + 2 - cells[2]
+    item = ((emitter[0] - cells[0]) * width + emitter[1] - cells[2]) * _ITEMS + _ITEM_BORDER + which
+    sink = _job_sink(i, item, pair.eps)
+    n = terrain_wall_normal(side)
+    for j in range(count):
+        if ((supported >> j) & 1) != 0:
+            k = wp.vec3(points[j, 0], points[j, 1], points[j, 2])
+            sink = _offer(
+                jobs,
+                sink,
+                k - depth[j] * n,
+                n,
+                depth[j],
+                terrain_feature_id(emitter[0], emitter[1], TERRAIN_FEATURE_FACE, TERRAIN_FACE_WALL + which, j),
+            )
+    _job_flags(out, pair_index, sink)
+
+
+@wp.func
 def solid_edge_job(
     core: Any, data: TerrainFeatureData, out: TerrainLawRows, jobs: TerrainSolidJobs, pair_index: int, i: int, item: int
 ):
     """Rule E's crease tests of a listed edge (:func:`_edge_arc`) and its pre-bounds (:func:`_edge_reach`); a convex
-    crease whose arc can hold a row within reach is listed for ``theta*`` (:func:`solid_theta_job`)."""
+    crease whose arc can hold a row within reach is listed for ``theta*`` (:func:`solid_theta_job`). A border edge is
+    also listed for rule F's clip of its triangle's face when the core may lie across the clip plane
+    (:func:`_clip_cheap`, item :data:`TERRAIN_SOLID_ITEMS` 7 or 8)."""
     record, window = solid_job_window(data, jobs, i)
     vertex = item // _ITEMS
     rc = _job_vertex(record.cells, vertex)
-    which = item - vertex * _ITEMS - 2
+    which = _item_edge(item - vertex * _ITEMS)
     planes = terrain_planes()
+    if which < TERRAIN_EDGE_CORNER:
+        side = terrain_border_side(window.surface, rc[0], rc[1], which)
+        if side >= 0:
+            planes, clip = _clip_cheap(core, data, window, planes, record.pair, rc[0], rc[1], which, side)
+            if clip:
+                job = wp.vec2i(pair_index, vertex * _ITEMS + _ITEM_BORDER + which)
+                if _job_append(jobs, out, pair_index, _THETAS, jobs.thetas, job) == 0:
+                    wp.atomic_or(out.state, pair_index, TERRAIN_PAIR_INCOMPLETE)
     planes, ok, n_a, n_b, _sigma_a, _sigma_b = _edge_arc(core, data, window, planes, record.pair, rc[0], rc[1], which)
     if not ok or not _edge_reach(core, data, window, record.pair, rc[0], rc[1], which, n_a, n_b):
         return
@@ -1500,13 +1941,22 @@ def solid_edge_job(
 def solid_theta_job(core: Any, data: TerrainFeatureData, jobs: TerrainSolidJobs, i: int, item: int, entry: int):
     """Rule E's ``theta*`` of a crease whose arc can hold a row (entry ``entry`` of :attr:`TerrainSolidJobs.thetas`):
     its arc again (:func:`_edge_arc`, the edge job's, bit for bit) and :func:`_edge_theta`, kept for
-    :func:`solid_crease_job`."""
+    :func:`solid_crease_job`; or for a border edge's clip (item 7 or 8), :func:`_clip_theta`."""
     record, window = solid_job_window(data, jobs, i)
     pair = record.pair
     vertex = item // _ITEMS
-    which = item - vertex * _ITEMS - 2
+    local = item - vertex * _ITEMS
     rc = _job_vertex(record.cells, vertex)
     planes = terrain_planes()
+    if local >= _ITEM_BORDER:
+        which_c = local - _ITEM_BORDER
+        side = terrain_border_side(window.surface, rc[0], rc[1], which_c)
+        planes, v0, _v1, n, _a, m = _clip_frame(data, window, planes, rc[0], rc[1], which_c, side)
+        core, n_c, kind_c = _clip_theta(core, n, m, v0)
+        jobs.theta_n[entry] = n_c
+        jobs.theta_kind[entry] = kind_c
+        return
+    which = _item_edge(local)
     planes, _ok, n_a, n_b, sigma_a, sigma_b = _edge_arc(core, data, window, planes, pair, rc[0], rc[1], which)
     nst, kind = _edge_theta(core, data, window, pair, rc[0], rc[1], which, n_a, n_b, sigma_a, sigma_b)
     jobs.theta_n[entry] = nst
@@ -1525,20 +1975,28 @@ def solid_crease_job(
     entry: int,
 ):
     """Rule E's rows of a crease at its ``theta*`` (entry ``entry`` of :attr:`TerrainSolidJobs.thetas`,
-    :func:`solid_theta_job`'s): the crossing and its ends (:func:`_edge_rows_at`)."""
+    :func:`solid_theta_job`'s): the crossing and its ends (:func:`_edge_rows_at`); or a border edge's clipped rows of
+    its triangle's face (item 7 or 8, :func:`_clip_rows_at`)."""
     kind = jobs.theta_kind[entry]
     if kind < 0:
         return
     record, window = solid_job_window(data, jobs, i)
     pair = record.pair
     vertex = item // _ITEMS
-    which = item - vertex * _ITEMS - 2
+    local = item - vertex * _ITEMS
     rc = _job_vertex(record.cells, vertex)
     planes = terrain_planes()
     sink = _job_sink(i, item, pair.eps)
-    planes, sink = _edge_rows_at(
-        core, data, window, planes, pair, sink, jobs, rc[0], rc[1], which, jobs.theta_n[entry], kind
-    )
+    if local >= _ITEM_BORDER:
+        which_c = local - _ITEM_BORDER
+        side = terrain_border_side(window.surface, rc[0], rc[1], which_c)
+        planes, sink = _clip_rows_at(
+            core, data, window, planes, pair, sink, jobs, rc[0], rc[1], which_c, side, jobs.theta_n[entry], kind
+        )
+    else:
+        planes, sink = _edge_rows_at(
+            core, data, window, planes, pair, sink, jobs, rc[0], rc[1], _item_edge(local), jobs.theta_n[entry], kind
+        )
     _job_flags(out, pair_index, sink)
 
 
@@ -2430,12 +2888,24 @@ def terrain_solid_data(model, partners: np.ndarray) -> TerrainSolidData:
     return solids
 
 
+def _job_bounds(vertices, sides, scan_run: int) -> tuple:
+    """Per job list (:data:`TERRAIN_SOLID_JOB_LISTS`), a pair's bound from its window's vertices and sides: two faces per
+    window vertex and four walls per scan run, three edges per window vertex and four corner lines, three creases per
+    window vertex, four corner lines and the clips of the border edges along its sides (two per vertex there), one
+    vertex per window vertex."""
+    v = np.asarray(vertices, np.int64)
+    runs = -(-v // int(scan_run))
+    border = 2 * np.asarray(sides, np.int64)
+    return (2 * v + 4 * runs, 3 * v + 4, 3 * v + border + 4, v)
+
+
 def terrain_solid_job_capacities(
     vertices: np.ndarray,
     candidates: np.ndarray,
     walk_slots: int,
     *,
     scan_run: int,
+    sides: np.ndarray,
     scale: float = 1.0,
 ) -> dict[str, int]:
     """Return a solid class's job list rooms by default, from its pairs' own bounds: per list
@@ -2460,18 +2930,20 @@ def terrain_solid_job_capacities(
         scan_run: Window vertices of one scan job of the class
             (:data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_SCAN_RUN`): the scan's runs are sized
             exactly from the pairs' windows.
+        sides: Per pair, the bound on its window's columns plus rows
+            (:func:`~newton._src.geometry.terrain_contacts.terrain_window_sides`).
         scale: Factor on every capacity.
     """
     v = np.asarray(vertices, np.int64)
-    bounds = (2 * v, 3 * v, 3 * v, v)
+    bounds = _job_bounds(v, sides, scan_run)
     capacities = {}
     for name, bound, share in zip(TERRAIN_SOLID_JOB_LISTS, bounds, TERRAIN_SOLID_JOB_SHARES, strict=True):
         total = int(bound.sum())
         default = (int(bound.max()) + -(-total // share)) if len(bound) else 0
         default = max(default, min(total, TERRAIN_SOLID_JOB_FLOOR))
         capacities[name] = max(1, int(np.ceil(scale * default)))
-    # a pair's pool entries: up to eight rows (its key's point slots) per listed face, crease and vertex
-    total = int(np.sum(48 * v))
+    # a pair's pool entries: up to eight rows (its key's point slots) per item of a window vertex
+    total = int(np.sum(8 * TERRAIN_SOLID_ITEMS * v))
     default = (int(np.max(candidates)) if len(v) else 0) + walk_slots * len(v) // TERRAIN_SOLID_CANDIDATE_SHARE
     default = max(default, min(total, TERRAIN_SOLID_POOL_FLOOR))
     capacities["candidates"] = max(1, int(np.ceil(scale * default)))
@@ -2480,10 +2952,12 @@ def terrain_solid_job_capacities(
     return capacities
 
 
-def terrain_solid_job_reserves(vertices: np.ndarray, candidates: np.ndarray, *, scan_run: int) -> dict[str, int]:
+def terrain_solid_job_reserves(
+    vertices: np.ndarray, candidates: np.ndarray, *, scan_run: int, sides: np.ndarray
+) -> dict[str, int]:
     """Return a solid class's job reserves: per job list, the candidate pool and the scan's runs, the work of
-    :data:`TERRAIN_SOLID_RESERVE_PAIRS` pairs of the class's largest bounds (two faces, three edges, three creases and
-    one vertex per window vertex, the most distinct candidates, the runs of the largest window), whatever
+    :data:`TERRAIN_SOLID_RESERVE_PAIRS` pairs of the class's largest bounds (:func:`_job_bounds`, the most distinct
+    candidates, the runs of the largest window), whatever
     ``NEWTON_TERRAIN_LAW_SHADOW_JOBS``, or of fewer pairs (at least one) when that would exceed
     :data:`TERRAIN_SOLID_RESERVE_BYTES`: the room a collide's work takes beyond the lists' room
     (:func:`terrain_solid_job_capacities`) with its rows unchanged.
@@ -2495,16 +2969,14 @@ def terrain_solid_job_reserves(vertices: np.ndarray, candidates: np.ndarray, *, 
             (:func:`~newton._src.geometry.terrain_contacts.terrain_pair_candidates`).
         scan_run: Window vertices of one scan job of the class
             (:data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_SCAN_RUN`).
+        sides: Per pair, the bound on its window's columns plus rows
+            (:func:`~newton._src.geometry.terrain_contacts.terrain_window_sides`).
     """
     v = int(np.max(vertices)) if len(vertices) else 0
-    bounds = {
-        "faces": 2 * v,
-        "edges": 3 * v,
-        "thetas": 3 * v,
-        "vertices": v,
-        "candidates": int(np.max(candidates)) if len(candidates) else 0,
-        "scans": -(-v // int(scan_run)),
-    }
+    largest = [int(np.max(bound)) if len(vertices) else 0 for bound in _job_bounds(vertices, sides, scan_run)]
+    bounds = dict(zip(TERRAIN_SOLID_JOB_LISTS, largest, strict=True))
+    bounds["candidates"] = int(np.max(candidates)) if len(candidates) else 0
+    bounds["scans"] = -(-v // int(scan_run))
     # bytes of a pair's reserve: 8 per job and run, 16 more per crease (its theta*), 40 per candidate
     per_pair = 8 * sum(bounds[name] for name in (*TERRAIN_SOLID_JOB_LISTS, "scans")) + 16 * bounds["thetas"]
     per_pair += 40 * bounds["candidates"]

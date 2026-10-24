@@ -97,6 +97,14 @@ each, its three edges' interval ends, itself)."""
 TERRAIN_WALK_ROWS_PER_PAIR = (1, 3, 4)
 """Rows a pair can gain after its walk at most: a sphere's exit, a capsule's two ends' exits and its axis's recovery,
 a solid's four recovery rows."""
+TERRAIN_BORDER_ROWS_PER_SIDE = 4
+"""Rows a solid pair's window can give at the heightfield's border, per vertex along its sides at most
+(:func:`terrain_pair_candidates`): two clipped rows of each border edge's face (two border edges per window vertex along
+a side, at most, its rows and columns on both borders). A sphere's or capsule's border claims take its edges' and
+vertices' items, which :data:`TERRAIN_WALK_ROWS_PER_VERTEX` counts."""
+TERRAIN_BORDER_ROWS_PER_PAIR = 24
+"""Rows a solid pair's window can give at the heightfield's border beyond :data:`TERRAIN_BORDER_ROWS_PER_SIDE`: a wall's
+plane manifold (four rows) on each of four walls and two rows on each of four corner lines, at most."""
 
 TERRAIN_LANE_THREAD = 0
 """Lane class of pairs whose largest window holds at most :data:`TERRAIN_LANE_CELLS` cells: the class's one-thread
@@ -1392,27 +1400,45 @@ def terrain_window_vertices(radius, reach, dx, dy, nrow, ncol) -> np.ndarray:
     return (columns * rows).astype(np.int64)
 
 
-def terrain_pair_candidates(shape_type, vertices) -> np.ndarray:
+def terrain_window_sides(radius, reach, dx, dy, nrow, ncol) -> np.ndarray:
+    """Return a bound on the vertex columns plus rows of a pair's window, any pose (the sides of
+    :func:`terrain_window_vertices`'s window). Takes scalars or arrays of equal shape [m]; computes in float64."""
+    extent = 2.0 * (np.asarray(radius, np.float64) + np.asarray(reach, np.float64))
+    columns = np.minimum(np.floor(extent / np.asarray(dx, np.float64)) + 4.0, np.asarray(ncol, np.float64))
+    rows = np.minimum(np.floor(extent / np.asarray(dy, np.float64)) + 4.0, np.asarray(nrow, np.float64))
+    return (columns + rows).astype(np.int64)
+
+
+def terrain_pair_candidates(shape_type, vertices, sides=None) -> np.ndarray:
     """Return the most distinct candidates a pair's walk can give its finish: every feature of each of its window's
     ``vertices`` (:func:`terrain_window_vertices`) giving its partner's most rows
-    (:data:`TERRAIN_WALK_ROWS_PER_VERTEX`), and the rows added after the walk (:data:`TERRAIN_WALK_ROWS_PER_PAIR`).
+    (:data:`TERRAIN_WALK_ROWS_PER_VERTEX`), the rows added after the walk (:data:`TERRAIN_WALK_ROWS_PER_PAIR`) and for
+    a solid the rows its window can give at the heightfield's border (:data:`TERRAIN_BORDER_ROWS_PER_SIDE` per vertex
+    along its ``sides``, :func:`terrain_window_sides`, and :data:`TERRAIN_BORDER_ROWS_PER_PAIR`).
 
     The walks visit every feature of a window once (a window vertex owns its cell's faces and diagonal, its x- and
-    y-edges and itself), and each feature gives a partner at most the rows counted there, so no window can give more:
-    a scratch block that holds this many holds every candidate of the pair.
+    y-edges and itself; at the border the walls, the corner lines and the clipped faces of its border edges), and
+    each feature gives a partner at most the rows counted there, so no window can give more: a scratch block that holds
+    this many holds every candidate of the pair.
 
     Args:
         shape_type: Geometry type of every partner.
         vertices: The bound on every partner's window vertices.
+        sides: The bound on every partner's window columns plus rows, or ``None`` for a window that reaches no border.
     """
     kind = np.asarray(shape_type)
     per_vertex = np.full(kind.shape, TERRAIN_WALK_ROWS_PER_VERTEX[2], np.int64)
     per_pair = np.full(kind.shape, TERRAIN_WALK_ROWS_PER_PAIR[2], np.int64)
+    border = np.zeros(kind.shape, np.int64)
+    if sides is not None:
+        border = TERRAIN_BORDER_ROWS_PER_SIDE * np.asarray(sides, np.int64) + TERRAIN_BORDER_ROWS_PER_PAIR
     sphere = kind == int(GeoType.SPHERE)
     capsule = kind == int(GeoType.CAPSULE)
     per_vertex[sphere], per_pair[sphere] = TERRAIN_WALK_ROWS_PER_VERTEX[0], TERRAIN_WALK_ROWS_PER_PAIR[0]
     per_vertex[capsule], per_pair[capsule] = TERRAIN_WALK_ROWS_PER_VERTEX[1], TERRAIN_WALK_ROWS_PER_PAIR[1]
-    return per_vertex * np.asarray(vertices, np.int64) + per_pair
+    border = np.broadcast_to(border, kind.shape).copy()
+    border[sphere | capsule] = 0
+    return per_vertex * np.asarray(vertices, np.int64) + per_pair + border
 
 
 class TerrainPairTable:
@@ -1465,6 +1491,7 @@ class TerrainPairTable:
         lane = np.zeros(len(pairs), np.int32)
         world = np.zeros(len(pairs), np.int32)
         vertices = np.zeros(len(pairs), np.int64)
+        sides = np.zeros(len(pairs), np.int64)
         candidates = np.zeros(len(pairs), np.int64)
         if len(pairs):
             first, second = pairs[:, 0], pairs[:, 1]
@@ -1480,7 +1507,8 @@ class TerrainPairTable:
             lane = np.where(cells <= TERRAIN_LANE_CELLS, TERRAIN_LANE_THREAD, TERRAIN_LANE_TILE).astype(np.int32)
             world = np.where(worlds[second] >= 0, worlds[second], worlds[first]).astype(np.int32)
             vertices = terrain_window_vertices(radius, reach, dx, dy, nrow, ncol)
-            candidates = terrain_pair_candidates(types[second], vertices)
+            sides = terrain_window_sides(radius, reach, dx, dy, nrow, ncol)
+            candidates = terrain_pair_candidates(types[second], vertices, sides)
         order = np.lexsort((pairs[:, 1], pairs[:, 0], world, lane, partner_class))
         self.pairs_host = pairs[order].astype(np.int32).reshape(-1, 2)
         """``(heightfield, partner)`` shape pairs in table order, int32 ``(pair_count, 2)`` (host)."""
@@ -1492,6 +1520,8 @@ class TerrainPairTable:
         """World of every pair (the partner's, or the heightfield's for a global partner), int32 (host)."""
         self.vertices = vertices[order]
         """Bound on every pair's window vertices, any pose (:func:`terrain_window_vertices`), int64 (host)."""
+        self.sides = sides[order]
+        """Bound on every pair's window columns plus rows, any pose (:func:`terrain_window_sides`), int64 (host)."""
         self.candidates = candidates[order]
         """Bound on every pair's distinct candidates, any pose (:func:`terrain_pair_candidates`), int64 (host)."""
         segment = self.partner_class * TERRAIN_LANE_CLASSES + self.lane_class

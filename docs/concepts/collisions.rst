@@ -1032,10 +1032,13 @@ often be improved by attaching a precomputed SDF to the mesh (``mesh.build_sdf(.
    contacts by default: after the narrow phase it walks each pair's window of the grid
    and writes one contact per support it finds there, a terrain face, edge or vertex
    within reach, so that supports on edges and creases are kept and no pair that
-   penetrates the terrain over its footprint is left without a contact. The law has no
-   border features yet: a body hanging over the heightfield's border gets contacts only
-   where its deepest points lie over the footprint, and a body beside the border's edge
-   gets none. Mesh-vs-heightfield routes through
+   penetrates the terrain over its footprint is left without a contact. The law takes the
+   heightfield as a solid block: vertical side walls run from the border down 1 m (the
+   terrain route's prism extrusion), so that a body hanging over the border gets the top
+   face's contacts at its deepest points over the footprint (clipped at the border's edge),
+   a body beside the border gets contacts on the walls, the border's edges and the corners'
+   vertical lines, and a body inside the footprint below the surface exits through the top.
+   Mesh-vs-heightfield routes through
    the mesh/SDF path with on-the-fly triangle extraction from the grid. Other partners
    (planes, barrel cylinders) and the configurations the law does not support yet
    (speculative contacts, the ``NEWTON_TERRAIN_LAW_SHADOW`` comparison mode, a prebuilt
