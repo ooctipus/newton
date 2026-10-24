@@ -46,14 +46,17 @@ from newton._src.geometry.terrain_law import (
     TERRAIN_FEATURE_RECOVERY,
     TERRAIN_FINISH_MASK_ROWS,
     TERRAIN_PAIR_CANDIDATE_OVERFLOW,
+    TERRAIN_PAIR_DEFERRED,
     TERRAIN_PAIR_FILTERED,
-    TERRAIN_PAIR_FULL,
     TERRAIN_PAIR_INCOMPLETE,
+    TERRAIN_PAIR_JOBS,
     TERRAIN_PAIR_OUTSIDE,
     TERRAIN_PAIR_ROW_OVERFLOW,
     TERRAIN_PAIR_STALE,
     TERRAIN_PAIR_TILE_EXIT,
     TERRAIN_PAIR_UNSUPPORTED,
+    TERRAIN_PAIR_WIDE,
+    TERRAIN_STATUS_JOBS,
     TerrainFeatureData,
     TerrainFinishScratch,
     TerrainLawRows,
@@ -163,12 +166,12 @@ def _finish_both(
     in_list: wp.array2d[int],
 ):
     """Per list of rows at ``40 i``: ``terrain_finish_slots`` in place (its masks take the first ``prefixes[i]``, at
-    most 32) and ``terrain_finish_list`` on all of them (core points ``q + d n``, in the list's block of a scratch),
-    each as per-row keep flags and the kept count last."""
+    most 32) and ``terrain_finish_list`` on all of them (core points ``q + d n``, in the list's block of a scratch, one
+    lane), each as per-row keep flags and the kept count last."""
     i = wp.tid()
     base = i * 40
     count = counts[i]
-    keep, kept = terrain_finish_slots(q, n, d, base, prefixes[i], eps[i], 0, 1, False)
+    keep, kept = terrain_finish_slots(q, n, d, base, prefixes[i], eps[i], False)
     for j in range(prefixes[i]):
         in_slots[i, j] = (keep >> j) & 1
     in_slots[i, 40] = kept
@@ -180,7 +183,7 @@ def _finish_both(
         scratch.n[block + j] = n[s]
         scratch.d[block + j] = d[s]
         scratch.feature[block + j] = j
-    in_list[i, 40] = terrain_finish_list(scratch, block, count, eps[i])
+    in_list[i, 40] = terrain_finish_list(scratch, block, count, eps[i], 0, 1)
     for j in range(count):
         in_list[i, j] = scratch.mark[block + j]
 
@@ -232,8 +235,8 @@ def _candidate_lists(rng, count):
 
 
 def test_finish_in_place_equals_finish(test, device):
-    """Keep the same rows, bit for bit, with the finish in a walk's slots as with the finish on a full-finish scratch,
-    and finish any number of candidates there.
+    """Keep the same rows, bit for bit, with the finish in a walk's slots as with the finish on a scratch (the finish
+    of deferred pairs), and finish any number of candidates there.
 
     Lists with coincident rows, several plane groups, implied rows and groups of more than four rows; lists of more
     rows than the in-place finish's masks hold (:data:`TERRAIN_FINISH_MASK_ROWS`) are copies of a shorter list, whose
@@ -304,12 +307,12 @@ def _finish_held(
     for j in range(counts[i]):
         held = terrain_hold_row(out, base, held, q[base + j], n[base + j], d[base + j], j, eps[i], 32)
     held = wp.min(held, 32)
-    keep, kept = terrain_finish_slots(out.q, out.n, out.d, base, held, eps[i], 0, 1, False)
+    keep, kept = terrain_finish_slots(out.q, out.n, out.d, base, held, eps[i], False)
     for j in range(held):
         merged[i, j] = (keep >> j) & 1
     merged[i, 39] = held
     merged[i, 40] = kept
-    keep, kept = terrain_finish_slots(out.q, out.n, out.d, base, held, eps[i], 0, 1, True)
+    keep, kept = terrain_finish_slots(out.q, out.n, out.d, base, held, eps[i], True)
     for j in range(held):
         skipped[i, j] = (keep >> j) & 1
     skipped[i, 39] = held
@@ -367,24 +370,36 @@ def _finish_lanes(
     q: wp.array[wp.vec3],
     n: wp.array[wp.vec3],
     d: wp.array[float],
-    prefixes: wp.array[int],
+    counts: wp.array[int],
     eps: wp.array[float],
+    scratch: TerrainFinishScratch,
     one_lane: wp.array2d[int],
     lanes: wp.array2d[int],
 ):
-    """Per list of rows at ``40 i``, one block: ``terrain_finish_slots`` by the first lane alone (``0, 1``), then by
-    the block's lanes together, each as per-row keep flags and the kept count last."""
+    """Per list of rows at ``40 i``, one block and the list's block of a scratch (core points ``q + d n``):
+    ``terrain_finish_list`` by the first lane alone (``0, 1``), then by the block's lanes together, each as per-row keep
+    flags and the kept count last."""
     i, lane = wp.tid()
     base = i * 40
+    block = i * scratch.capacity
+    count = counts[i]
     if lane == 0:
-        keep, kept = terrain_finish_slots(q, n, d, base, prefixes[i], eps[i], 0, 1, False)
-        for j in range(prefixes[i]):
-            one_lane[i, j] = (keep >> j) & 1
+        for j in range(count):
+            s = base + j
+            scratch.q[block + j] = q[s]
+            scratch.k[block + j] = q[s] + d[s] * n[s]
+            scratch.n[block + j] = n[s]
+            scratch.d[block + j] = d[s]
+            scratch.feature[block + j] = j
+        kept = terrain_finish_list(scratch, block, count, eps[i], 0, 1)
+        for j in range(count):
+            one_lane[i, j] = scratch.mark[block + j]
         one_lane[i, 40] = kept
-    keep, kept = terrain_finish_slots(q, n, d, base, prefixes[i], eps[i], lane, wp.block_dim(), False)
+    # the first lane runs every step but the implied-row tests: the others wait for its writes
+    kept = terrain_finish_list(scratch, block, count, eps[i], lane, wp.block_dim())
     if lane == 0:
-        for j in range(prefixes[i]):
-            lanes[i, j] = (keep >> j) & 1
+        for j in range(count):
+            lanes[i, j] = scratch.mark[block + j]
         lanes[i, 40] = kept
 
 
@@ -433,29 +448,24 @@ def _large_group_lists(rng, count):
 
 def test_finish_lanes_keep_one_lanes_rows(test, device):
     """Keep the same rows, bit for bit, with a block's lanes splitting the finish's implied-row tests as with one lane
-    taking them all: the lanes OR their shares, each test the same float32 operations.
+    taking them all (the finish of deferred pairs, on a scratch): the lanes OR their shares, each test the same float32
+    operations.
 
-    The candidate lists of :func:`test_finish_in_place_equals_finish` (up to the masks' rows) and lists dominated by one
-    plane group of 9-24 rows, whose implied-row tests cost the most. On the CPU a block is one lane.
+    The candidate lists of :func:`test_finish_in_place_equals_finish` and lists dominated by one plane group of 9-24
+    rows, whose implied-row tests cost the most. On the CPU a block is one lane.
     """
     rng = np.random.default_rng(47)
-    lists = [
-        entry
-        for entry in _candidate_lists(rng, 300)
-        if entry[1] == len(entry[0]) and entry[1] <= TERRAIN_FINISH_MASK_ROWS
-    ]
-    lists += _large_group_lists(rng, 300)
+    lists = _candidate_lists(rng, 300) + _large_group_lists(rng, 300)
     q = np.zeros((len(lists) * 40, 3), np.float32)
     n = np.zeros((len(lists) * 40, 3), np.float32)
     d = np.zeros(len(lists) * 40, np.float32)
-    prefixes = np.zeros(len(lists), np.int32)
-    for i, (rows, prefix) in enumerate(lists):
-        prefixes[i] = prefix
+    counts = np.zeros(len(lists), np.int32)
+    for i, (rows, _prefix) in enumerate(lists):
+        counts[i] = len(rows)
         for j, (qq, nn, dd) in enumerate(rows):
             q[i * 40 + j] = qq
             n[i * 40 + j] = nn
             d[i * 40 + j] = dd
-    test.assertTrue(np.all(prefixes <= TERRAIN_FINISH_MASK_ROWS))
     eps = np.full(len(lists), 8.0 * 1.1920928955078125e-7 * 0.2, np.float32)
     one_lane = wp.zeros((len(lists), 41), dtype=int, device=device)
     lanes = wp.zeros((len(lists), 41), dtype=int, device=device)
@@ -466,8 +476,9 @@ def test_finish_lanes_keep_one_lanes_rows(test, device):
             wp.array(q, dtype=wp.vec3, device=device),
             wp.array(n, dtype=wp.vec3, device=device),
             wp.array(d, dtype=float, device=device),
-            wp.array(prefixes, dtype=int, device=device),
+            wp.array(counts, dtype=int, device=device),
             wp.array(eps, dtype=float, device=device),
+            terrain_finish_scratch(device, 40, blocks=len(lists)),
         ],
         outputs=[one_lane, lanes],
         block_dim=terrain_law_block_dim(device),
@@ -476,11 +487,11 @@ def test_finish_lanes_keep_one_lanes_rows(test, device):
     a = one_lane.numpy()
     b = lanes.numpy()
     for i in range(len(lists)):
-        np.testing.assert_array_equal(b[i, : prefixes[i]], a[i, : prefixes[i]], err_msg=f"list {i}")
+        np.testing.assert_array_equal(b[i, : counts[i]], a[i, : counts[i]], err_msg=f"list {i}")
         test.assertEqual(b[i, 40], a[i, 40], msg=f"list {i}")
     # the large groups lose rows to the implied-row tests and the group caps
     large = slice(len(lists) - 300, len(lists))
-    test.assertGreater(int(np.sum(a[large, 40] < prefixes[large])), 250)
+    test.assertGreater(int(np.sum(a[large, 40] < counts[large])), 250)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1344,10 +1355,11 @@ def _pair_rows(out, pair: int) -> dict:
     return {name: getattr(out, name).numpy()[first : first + count] for name in ("q", "n", "d", "feature")}
 
 
-def _full_candidates(shadow, partner_class) -> int:
-    """The distinct candidates a full-finish block of a solid class holds (the most any of its pairs can give)."""
+def _deferred_candidates(shadow, partner_class) -> int:
+    """The distinct candidates a block of a solid class's finish of deferred pairs holds (the most any of its pairs can
+    give)."""
     name = {TERRAIN_PARTNER_BOX: "box", TERRAIN_PARTNER_CYLINDER: "cylinder", TERRAIN_PARTNER_HULL: "hull"}
-    return shadow.describe()["launch_shapes"][name[partner_class]]["full_candidates"]
+    return shadow.describe()["launch_shapes"][name[partner_class]]["deferred_candidates"]
 
 
 LARGE_WINDOWS = (
@@ -1444,19 +1456,25 @@ def _class_pairs(table, partner_class) -> tuple[int, int]:
     return table.segment(partner_class, TERRAIN_LANE_THREAD)[0], table.segment(partner_class, TERRAIN_LANE_TILE)[1]
 
 
-def _class_jobs(model, shadow, partner_class, *, threads=None, **capacities):
-    """A solid class's jobs, sized as the shadow sizes them but for ``capacities`` (entries per list), with ``threads``
-    job threads (by default the shadow's)."""
+def _class_jobs(model, shadow, partner_class, *, threads=None, reserve=True, **capacities):
+    """A solid class's jobs, sized as the shadow sizes them but for ``capacities`` (room per list), with the shadow's
+    reserves beyond the room (none without ``reserve``) and ``threads`` job threads (by default the shadow's)."""
     table = shadow.table
     begin, end = _class_pairs(table, partner_class)
+    run = int(TERRAIN_PARTNER_SCAN_RUN[partner_class])
     sizes = terrain_law_solid.terrain_solid_job_capacities(
         table.vertices[begin:end],
         table.candidates[begin:end],
         int(TERRAIN_PARTNER_WALK_SLOTS[partner_class]),
-        scan_run=int(TERRAIN_PARTNER_SCAN_RUN[partner_class]),
+        scan_run=run,
     )
     sizes.update(capacities)
-    jobs = terrain_law_solid.terrain_solid_jobs(model.device, partner_class, begin, end - begin, sizes)
+    reserves = None
+    if reserve:
+        reserves = terrain_law_solid.terrain_solid_job_reserves(
+            table.vertices[begin:end], table.candidates[begin:end], scan_run=run
+        )
+    jobs = terrain_law_solid.terrain_solid_jobs(model.device, partner_class, begin, end - begin, sizes, reserves)
     if threads is not None:
         jobs.threads = int(threads)
         jobs.pair_threads = min(int(threads), end - begin)
@@ -1472,6 +1490,24 @@ def _reverse_list(jobs, name):
     entries.assign(values)
 
 
+def _defer_every_pair(out, jobs, partner_class, begin, end):
+    """Defer every pair of a solid class holding a candidate before its close, as the close defers a pair holding more
+    rows than its walk slots (:func:`~newton._src.geometry.terrain_law.terrain_defer_pair`), so that the finish of
+    deferred pairs takes it; the close passes it by."""
+    state = out.state.numpy()
+    heads = jobs.head.numpy()[: end - begin]
+    pairs = begin + np.flatnonzero(((state[begin:end] & int(TERRAIN_PAIR_JOBS)) != 0) & (heads >= 0))
+    deferred = out.deferred.numpy()
+    deferred[begin : begin + len(pairs)] = pairs
+    out.deferred.assign(deferred)
+    counts = out.deferred_count.numpy()
+    counts[partner_class] = len(pairs)
+    out.deferred_count.assign(counts)
+    state[pairs] = (state[pairs] & int(TERRAIN_PAIR_WIDE)) | int(TERRAIN_PAIR_DEFERRED)
+    out.state.assign(state)
+    return len(pairs)
+
+
 def _run_class(
     pipeline,
     model,
@@ -1480,7 +1516,7 @@ def _run_class(
     jobs=None,
     reverse=False,
     until=None,
-    full=False,
+    defer=False,
     blocks=None,
     extra_blocks=0,
     extra_threads=0,
@@ -1489,10 +1525,10 @@ def _run_class(
     """Run a solid class's launches (:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LAUNCHES`) for a
     shadow pipeline's last collide into a side buffer of their own (:func:`_side_buffer`), with ``jobs`` (by default
     sized as the shadow's), every list reversed before its kernel takes it with ``reverse``, up to the launch ``until``
-    (not run). With ``full``, every pair the shadow did not reject whole goes straight to the full-finish kernel, which
-    walks it (as a pair some of whose work found no room). The full-finish kernel's grid holds ``blocks`` blocks (by default the shadow's) of ``candidates``
-    candidates (by default the class's bound), launched with ``extra_blocks`` more; the job kernels are launched with
-    ``extra_threads`` threads more than the jobs' grid. Returns ``(out, jobs, solids)``."""
+    (not run). With ``defer``, every pair holding a candidate is deferred before the close (:func:`_defer_every_pair`),
+    so that the finish of deferred pairs finishes it. That finish's grid holds ``blocks`` blocks (by default the
+    shadow's) of ``candidates`` candidates (by default the class's bound), launched with ``extra_blocks`` more; the job
+    kernels are launched with ``extra_threads`` threads more than the jobs' grid. Returns ``(out, jobs, solids)``."""
     shadow = pipeline._terrain_law_shadow
     table = shadow.table
     device = model.device
@@ -1501,7 +1537,7 @@ def _run_class(
         jobs = _class_jobs(model, shadow, partner_class)
     solids = terrain_law_solid.terrain_solid_data(model, table.pairs_host[:, 1])
     out = _side_buffer(begin, end - begin, TERRAIN_PARTNER_WALK_SLOTS[partner_class], table.pair_count, device)
-    capacity = _full_candidates(shadow, partner_class) if candidates is None else candidates
+    capacity = _deferred_candidates(shadow, partner_class) if candidates is None else candidates
     scratch = terrain_finish_scratch(device, capacity, blocks=blocks)
     grid = scratch.blocks
     if extra_blocks:
@@ -1510,27 +1546,15 @@ def _run_class(
         scratch.blocks = grid
     args = [begin, 0, _pair_inputs(model, pipeline), shadow.features.data(), out]
     block = terrain_law_block_dim(device)
-    launches = TERRAIN_SOLID_LAUNCHES
-    if full:
-        walked = np.arange(begin, end, dtype=np.int32)
-        walked = walked[(shadow._out.state.numpy()[begin:end] & _WHOLE_PAIR_EXITS) == 0]
-        deferred = out.deferred.numpy()
-        deferred[begin : begin + len(walked)] = walked
-        out.deferred.assign(deferred)
-        counts = out.deferred_count.numpy()
-        counts[partner_class] = len(walked)
-        out.deferred_count.assign(counts)
-        state = out.state.numpy()
-        state[walked] = int(TERRAIN_PAIR_INCOMPLETE | TERRAIN_PAIR_FULL)
-        out.state.assign(state)
-        launches = launches[-1:]
-    for kind, name in launches:
+    for kind, name in TERRAIN_SOLID_LAUNCHES:
         if name == until:
             break
+        if defer and name == "close":
+            _defer_every_pair(out, jobs, partner_class, begin, end)
         if reverse and name in _LIST_OF_KERNEL:
             _reverse_list(jobs, _LIST_OF_KERNEL[name])
         kernel = _kernel(partner_class, name)
-        if kind == "full":
+        if kind == "deferred":
             inputs = [*args, scratch, solids, jobs]
             wp.launch_tiled(kernel, dim=grid + extra_blocks, inputs=inputs, block_dim=block, device=device)
         elif kind == "pair_tiles":
@@ -1561,17 +1585,18 @@ def _counts(jobs) -> dict:
     return dict(zip(TERRAIN_LAW_JOB_NAMES, (int(v) for v in jobs.counts.numpy()), strict=True))
 
 
-def test_job_pipeline_rows_are_the_walks(test, device):
-    """Give a solid pair the rows its window's walk gives, bit for bit, whatever order its jobs run in.
+def test_job_pipeline_rows_depend_on_the_pair_alone(test, device):
+    """Give a solid pair the same rows, bit for bit, whatever order its jobs run in and whichever finish takes it.
 
     Solids of every class over rough terrain, among them of every class one whose window holds over 256 vertices (its
     scan takes several jobs, its class's :data:`~newton._src.geometry.terrain_contacts.TERRAIN_PARTNER_SCAN_RUN`
-    window vertices each). Three arms per class: its launches as the shadow runs them; the same with one job thread and every
-    list reversed before its kernel takes it (the scan's jobs, the features, the creases, the live pairs and the pairs
-    left to rule R), so that the candidate pool holds every pair's rows in another order; and
-    every pair walked again by the full-finish kernel alone, in window order. The close holds a pair's candidates by
-    their place in window order (a cluster plane two scan jobs list is one offer), so the arms agree with each other and
-    with the shadow's own rows.
+    window vertices each). Three arms per class: its launches as the shadow runs them; the same with one job thread and
+    every list reversed before its kernel takes it (the scan's jobs, the features, the creases, the live pairs and the
+    pairs left to rule R), so that the candidate pool holds every pair's rows in another order; and every pair holding a
+    candidate deferred before its close, so that the finish of deferred pairs finishes it from its candidates, a block's
+    lanes splitting its implied-row tests. The close and that finish hold a pair's candidates by their place in window
+    order (a cluster plane two scan jobs list is one offer), and the finish in a pair's walk slots keeps the rows the
+    finish on a scratch keeps, so the arms agree with each other and with the shadow's own rows.
     """
     hf, model, shapes, bodies = _window_scene(np.random.default_rng(37), device)
     pipeline, _contacts, _state = _collide(model, shadow=True)
@@ -1589,22 +1614,23 @@ def test_job_pipeline_rows_are_the_walks(test, device):
             pairs = np.arange(begin, end)
             jobs_out, jobs, _solids = _run_class(pipeline, model, partner_class)
             counts = _counts(jobs)
-            # windows of several scan jobs; pairs the jobs finished (not deferred); a deferred pair is finished from
-            # its candidates, not walked again
+            # windows of several scan jobs; pairs the close finished (not deferred)
             test.assertGreater(counts["scans"], counts["live"])
             test.assertLess(int(jobs_out.deferred_count.numpy()[partner_class]), counts["live"])
-            test.assertEqual(counts["walks"], 0)
             reversed_out, reversed_jobs, _solids = _run_class(
                 pipeline, model, partner_class, jobs=_class_jobs(model, shadow, partner_class, threads=1), reverse=True
             )
             pool = counts["candidates"]
             test.assertEqual(_counts(reversed_jobs)["candidates"], pool)
             test.assertFalse(np.array_equal(jobs.key.numpy()[:pool], reversed_jobs.key.numpy()[:pool]))
-            full_out, full_jobs, _solids = _run_class(pipeline, model, partner_class, full=True)
-            test.assertEqual(_counts(full_jobs)["walks"], int(full_out.deferred_count.numpy()[partner_class]))
+            deferred_out, _jobs, _solids = _run_class(pipeline, model, partner_class, defer=True)
+            # every pair holding a candidate went through the finish of deferred pairs, more than defer by themselves
+            deferred = int(deferred_out.deferred_count.numpy()[partner_class])
+            test.assertEqual(deferred, int(np.count_nonzero(jobs.head.numpy() >= 0)))
+            test.assertGreater(deferred, int(jobs_out.deferred_count.numpy()[partner_class]))
             _assert_same_rows(test, shadow._out, jobs_out, pairs, "the shadow's launch")
             _assert_same_rows(test, jobs_out, reversed_out, pairs, "the lists reversed")
-            _assert_same_rows(test, jobs_out, full_out, pairs, "the full walk")
+            _assert_same_rows(test, jobs_out, deferred_out, pairs, "every pair deferred")
             walked += int(jobs_out.count.numpy()[begin:end].sum())
     test.assertGreater(walked, 20)
 
@@ -1730,7 +1756,7 @@ def _ridge_boxes(device, half, ys):
     """Long boxes lying across ridges of different heights (every ridge in reach its own plane group), one per world:
     ``(heightfield, model, shapes, bodies)``. With half extents ``(0.9, 0.05, 0.02)`` a box has more distinct
     candidates (28) and rows (20) than the box class's 16 walk slots; with ``(0.9, 0.15, 0.02)``, more distinct
-    candidates (48) than a full-finish list held before (32)."""
+    candidates (48) than a finish list held before (32)."""
     rng = np.random.default_rng(2)
     heights = np.zeros((41, 41))
     heights[:, 1::2] = rng.uniform(0.02, 0.035, size=41)[1::2]
@@ -1748,9 +1774,9 @@ def test_long_box_keeps_every_support(test, device):
     """Keep every support of a box with more rows than its walk slots, as the float64 law gives them, raising nothing.
 
     A long box lies across ridges of different heights (every ridge in reach its own plane group): 20 rows, more than
-    the box class's 16 walk slots. Its class's full-finish kernel finishes it from its candidates in the candidate pool,
-    without walking its window again (every job of it found room), and writes them to the spill region. (With a
-    per-class limit of 16 rows the law kept 16, each plane's deepest first, and raised ``terrain_rows``.)
+    the box class's 16 walk slots. Its class's finish of deferred pairs finishes it from its candidates in the
+    candidate pool and writes its rows to the spill region. (With a per-class limit of 16 rows the law kept 16, each
+    plane's deepest first, and raised ``terrain_rows``.)
     """
     hf, model, shapes, bodies = _ridge_boxes(device, (0.9, 0.05, 0.02), (0.05,))
     _kind, dims, pose = bodies[0]
@@ -1758,7 +1784,6 @@ def test_long_box_keeps_every_support(test, device):
     shadow = pipeline._terrain_law_shadow
     rows = shadow.rows()
     test.assertEqual(int(shadow._out.deferred_count.numpy()[TERRAIN_PARTNER_BOX]), 1)
-    test.assertEqual(shadow.job_counts()["box"]["walks"], 0)
     law = su.law_rows(hf, "box", dims, pose)
     test.assertEqual(len(law), 20)
     test.assertGreater(len(law), terrain_law_box.TERRAIN_BOX_WALK_SLOTS)
@@ -1773,8 +1798,9 @@ def test_long_box_keeps_its_first_rows_without_room(test, device):
     """Keep a box's first rows by priority in its walk slots, flagged, when the spill region has no room for all.
 
     The long box's 20 rows exceed the box class's 16 walk slots, and a spill region of 19 rows cannot hold them: the
-    full finish keeps 16 in the box's own walk slots, every plane group's deepest row first (the deepest first), then
-    the groups' farthest ones, flags a row overflow and raises ``terrain_rows``. (Before, the pair kept no row.)
+    finish of deferred pairs keeps 16 in the box's own walk slots, every plane group's deepest row first (the deepest
+    first), then the groups' farthest ones, flags a row overflow and raises ``terrain_rows``. (Before, the pair kept no
+    row.)
     """
     hf, model, shapes, bodies = _ridge_boxes(device, (0.9, 0.05, 0.02), (0.05,))
     _kind, dims, pose = bodies[0]
@@ -1811,11 +1837,12 @@ def test_long_box_keeps_its_first_rows_without_room(test, device):
 
 
 def test_deferred_pairs_keep_their_rows_beyond_the_grid(test, device):
-    """Finish every deferred pair from its own rows, however many defer: one full-finish block for three boxes.
+    """Finish every deferred pair from its own rows, however many defer: one block of the finish of deferred pairs for
+    three boxes.
 
-    Three long boxes have more rows than the box class's walk slots and defer; a full kernel of one block walks them
-    again one after the other, each into the block's scratch. Every box keeps the float64 law's rows, as with the
-    shadow's own grid, bit for bit, none flagged, each in rows of the spill region.
+    Three long boxes have more rows than the box class's walk slots and defer; a finish of one block takes them one
+    after the other, each from its candidates into the block's scratch. Every box keeps the float64 law's rows, as with
+    the shadow's own grid, bit for bit, none flagged, each in rows of the spill region.
     """
     hf, model, _shapes, bodies = _ridge_boxes(device, (0.9, 0.05, 0.02), (-0.55, 0.0, 0.55))
     pipeline, _contacts, _state = _collide(model, shadow=True)
@@ -1845,10 +1872,10 @@ def test_deferred_pairs_keep_their_rows_beyond_the_grid(test, device):
 
 
 def test_wide_box_keeps_every_support(test, device):
-    """Keep every support of a pair whose distinct candidates outnumber what a full-finish list held before (32).
+    """Keep every support of a pair whose distinct candidates outnumber what a finish list held before (32).
 
-    A wide box across ridges has 48 distinct candidates: its class's full-finish kernel holds them all (its scratch
-    holds every candidate a window of the class can give) and keeps the float64 law's 22 rows, raising nothing.
+    A wide box across ridges has 48 distinct candidates: its class's finish of deferred pairs holds them all (its
+    scratch holds every candidate a window of the class can give) and keeps the float64 law's 22 rows, raising nothing.
     (With a list of 32 candidates the law kept the first 32 in window order, then 16 rows, and flagged a candidate and
     a row overflow.)
     """
@@ -1910,29 +1937,30 @@ def test_plane_groups_finish_in_one_thread(test, device):
     the small-pair finish kernel, and one holding few others in place, all with the float64 law's rows.
 
     A flat box 2 mm above the pillar lattice of :func:`test_large_plane_group_follows_the_law`: 6 cm across it holds 15
-    candidates in one plane group, fewer than
-    :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_LANE_ROWS`, which its close lists for the small-pair
-    finish kernel and whose implied-row step drops 6; 3 cm across it holds 4 on four planes, which its close writes as
-    they are; 2 cm across over one pillar's top it holds its 4 corners on that plane, which its close lists for the
-    small-pair finish kernel too. No pair takes the lanes.
+    candidates in one plane group, within the box class's walk slots, which its close lists for the small-pair finish
+    kernel and whose implied-row step drops 6; 3 cm across it holds 4 on four planes, which its close writes as they
+    are; 2 cm across over one pillar's top it holds its 4 corners on that plane, which its close lists for the
+    small-pair finish kernel too. No pair is deferred.
     """
     n = 61
     r = np.arange(n)
     heights = np.where((r[:, None] % 3 != 0) & (r[None, :] % 3 != 0), 0.05, 0.0)
     hf = tu.reference_surface(tu.heightfield_model(heights, 1.5, 1.5, device="cpu"))
-    # (half size, centre, pairs for the lanes, pairs for the small-pair finish); a pillar's top spans 5 cm about 0.075
-    for half, centre, lanes, small in (
-        (0.06, (0.013, 0.007), 0, 1),
-        (0.03, (0.013, 0.007), 0, 0),
-        (0.01, (0.073, 0.077), 0, 1),
+    # (half size, centre, pairs for the small-pair finish); a pillar's top spans 5 cm about 0.075
+    for half, centre, small in (
+        (0.06, (0.013, 0.007), 1),
+        (0.03, (0.013, 0.007), 0),
+        (0.01, (0.073, 0.077), 1),
     ):
         with test.subTest(half=half):
             dims = {"half": (half, half, 0.02)}
             pose = _f32_pose(np.r_[centre[0], centre[1], 0.05 + 0.02 + 0.002, 0.0, 0.0, 0.0, 1.0])
             model, _hfield, shapes = su.solid_scene(heights, 1.5, 1.5, [("box", dims, pose)], device=device)
             pipeline, _contacts, _state = _collide(model, shadow=True)
-            counts = pipeline._terrain_law_shadow.job_counts()["box"]
-            test.assertEqual((counts["lanes"], counts["small"]), (lanes, small))
+            shadow = pipeline._terrain_law_shadow
+            counts = shadow.job_counts()["box"]
+            test.assertEqual(counts["small"], small)
+            test.assertEqual(int(shadow._out.deferred_count.numpy()[TERRAIN_PARTNER_BOX]), 0)
             rows = tu.shadow_rows(pipeline)[shapes[0]]
             if half == 0.06:
                 # the finish's implied-row step dropped some of its candidates
@@ -1945,7 +1973,7 @@ def test_plane_groups_finish_in_one_thread(test, device):
 
 
 def test_window_past_its_bound_is_flagged(test, device):
-    """Flag a pair whose window gives more distinct candidates than its full-finish scratch holds, and raise.
+    """Flag a pair whose window gives more distinct candidates than its class's scratch holds, and raise.
 
     Only a window its shape data no longer bounds can: the scratch holds every candidate a window of the class can give
     as the shapes were at construction. A scratch made smaller than the wide box's 48 candidates stands for such a
@@ -1979,7 +2007,7 @@ def test_window_past_its_bound_is_flagged(test, device):
 
 def _capture_scene(device):
     """Every solid kind on ridges of different heights, small and long, a long box whose rows overflow its slots (its
-    class's full kernel finishes it), and a box and an ellipsoid whose windows take several scan jobs."""
+    class's finish of deferred pairs takes it), and a box and an ellipsoid whose windows take several scan jobs."""
     rng = np.random.default_rng(2)
     heights = np.zeros((41, 41))
     heights[:, 1::2] = rng.uniform(0.02, 0.035, size=41)[1::2]
@@ -2014,8 +2042,8 @@ def test_solid_shadow_runs_under_graph_capture(test, device):
     uncaptured collide's rows.
 
     Every solid class runs: windows of several scan jobs (a box and an ellipsoid), the job lists and the candidate pool
-    (their counters the capture zeroes), and a long box deferred to its class's full kernel, whose grid reads the
-    deferred count, and spilled.
+    (their counters the capture zeroes), and a long box deferred to its class's finish of deferred pairs, whose grid
+    strides over the deferred count, and spilled.
     The spill region holds exactly the rows the scene asks for, so that a replay that did not zero the spill counters
     would find no room on its second run. The shadow's launches are also captured alone with the device's memory pool
     off, so that an allocation inside them raises instead of becoming a graph allocation node.
@@ -2035,7 +2063,7 @@ def test_solid_shadow_runs_under_graph_capture(test, device):
     expected = shadow.rows()
     counts = shadow.job_counts()
     test.assertTrue(np.all(expected["count"] > 0), msg=expected["count"])
-    # the long box's rows exceed its walk slots: the full kernel writes them to the spill region
+    # the long box's rows exceed its walk slots: the finish of deferred pairs writes them to the spill region
     test.assertGreaterEqual(shadow.rows_spilled(), int(expected["count"].max()))
     test.assertTrue(np.all(expected["state"] & 48 == 0))
     # windows of several scan jobs (a box and an ellipsoid)
@@ -2089,7 +2117,7 @@ def test_solid_launches_take_fixed_grids(test, device):
     size; the whole-pair rejects one thread per pair of the class; the scan and the job kernels the class's job threads,
     each striding over its list; the close and the small-pair finish, which stride over lists of the class's pairs, the
     job threads up to one per pair; rule R's kernel, blocks of lanes striding over its list, up to one block per pair;
-    the full-finish kernel the fixed grid of its scratch.
+    the finish of deferred pairs the fixed grid of its scratch.
 
     Every solid class has pairs here, windows of several scan jobs (a box and an ellipsoid) and a deferring box. The
     live list holds every pair past the whole-pair rejects once.
@@ -2125,27 +2153,23 @@ def test_solid_launches_take_fixed_grids(test, device):
             test.assertEqual(record["pair_job_threads"], min(jobs.threads, end - begin))
             test.assertEqual(record["finish_blocks"], jobs.finish_blocks)
             test.assertLessEqual(jobs.finish_blocks, end - begin)
-            # the lanes' finish for no class (no class's walk slots hold the lane rows)
-            test.assertEqual(record["skipped"], ["finish"])
             for kind, kernel_name in TERRAIN_SOLID_LAUNCHES:
                 key = _kernel(partner_class, kernel_name).key
-                if kernel_name in record["skipped"]:
-                    test.assertNotIn(key, launched)
-                    continue
                 dim = {
                     "pairs": ("launch", end - begin),
                     "jobs": ("launch", jobs.threads),
                     "pair_jobs": ("launch", jobs.pair_threads),
                     "pair_tiles": ("tiled", jobs.finish_blocks),
-                }.get(kind)
-                if dim is None:
-                    dim = ("tiled", record["full_blocks"])
+                    "deferred": ("tiled", record["deferred_blocks"]),
+                }[kind]
                 test.assertEqual(launched[key], [(*dim, block)], msg=key)
             counts = shadow.job_counts()[name]
             live = jobs.live.numpy()[: counts["live"]] + begin
             test.assertEqual(
                 sorted(live.tolist()), (begin + np.flatnonzero((states[begin:end] & _WHOLE_PAIR_EXITS) == 0)).tolist()
             )
+    # every launch of the solid modules is one of their classes' launches
+    test.assertEqual(len(launched), len(_SOLID_MODULES) * len(TERRAIN_SOLID_LAUNCHES), msg=sorted(launched))
     test.assertGreater(shadow.job_counts()["box"]["scans"], shadow.job_counts()["box"]["live"])
     test.assertGreater(int(shadow._out.deferred_count.numpy()[TERRAIN_PARTNER_BOX]), 0)
 
@@ -2155,12 +2179,12 @@ def test_job_grids_take_each_entry_once(test, device):
     or blocks than their grids.
 
     The scan, job, close and rule R kernels stride over their lists by the class's job threads (``jobs.threads``, fixed
-    at construction), a thread past them returning at once; the full-finish kernel strides over the deferred list by its
-    scratch's grid (``scratch.blocks``), a block past it returning at once. Long boxes lie across ridges: their rows
-    exceed the box class's walk slots (deferred, spilled). One job thread, three and the shadow's give the same rows, as
-    do job kernels launched with three threads more than the jobs' grid, which would otherwise take entries twice
-    (closing a pair twice), and a full-finish launch of three blocks more than its grid of two, which would otherwise
-    finish deferred pairs twice, counting their spill rows twice.
+    at construction), a thread past them returning at once; the finish of deferred pairs strides over the deferred list
+    by its scratch's grid (``scratch.blocks``), a block past it returning at once. Long boxes lie across ridges: their
+    rows exceed the box class's walk slots (deferred, spilled). One job thread, three and the shadow's give the same
+    rows, as do job kernels launched with three threads more than the jobs' grid, which would otherwise take entries
+    twice (closing a pair twice), and a finish of deferred pairs launched with three blocks more than its grid of two,
+    which would otherwise finish deferred pairs twice, counting their spill rows twice.
     """
     _hf, model, _shapes, bodies = _ridge_boxes(device, (0.9, 0.05, 0.02), (-0.75, -0.45, -0.15, 0.15, 0.45, 0.75))
     pipeline, _contacts, _state = _collide(model, shadow=True)
@@ -2197,21 +2221,26 @@ def test_job_grids_take_each_entry_once(test, device):
         _assert_same_rows(test, grid["out"], other["out"], np.arange(begin, end), "another grid")
 
 
-def test_job_overflow_takes_the_full_walk(test, device):
-    """Keep every pair's rows, bit for bit, when its class's job lists, candidate pool or scan jobs have no room for its
-    work, count those pairs, raise ``terrain_jobs`` and warn with the entries asked for, by class and list.
+def test_job_overflow_takes_the_reserve(test, device):
+    """Keep every pair's rows, bit for bit, when its class's job lists, candidate pool or scan's runs have no room for
+    its work, count those pairs, raise ``terrain_jobs`` and warn with the entries asked for, by class and list; past the
+    reserve, a pair that lost work keeps no row.
 
     ``NEWTON_TERRAIN_LAW_SHADOW_JOBS`` scales the solid classes' job lists and candidate pools, sized at the scene level
-    from the pairs' own bounds: at 1e-6 each holds one entry. A pair whose work finds no room is left to its class's
-    full-finish kernel, which walks it again; it is counted (the shadow's third overflow count) and raises the narrow
-    phase's sticky ``terrain_jobs`` bit, which the capacity check raises on, as ``rigid_contact_max`` does for
-    contacts, though no row is lost; the job check prints the entries asked for against the room. The scan's jobs,
-    sized from every pair's bound on its window, lack room only for a window its shape data no longer bounds: with room
-    for one, the other pairs are deferred from the whole-pair rejects on, before their scan.
+    from the pairs' own bounds: at 1e-6 each has room for one entry. Work past a list's room takes its reserve (the work
+    of :data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_RESERVE_PAIRS` pairs of the class's largest
+    bounds), which the same kernels run: its pair's rows are unchanged; the pair is counted (the shadow's third overflow
+    count) and raises the narrow phase's sticky ``terrain_jobs`` bit, which the capacity check raises on, as
+    ``rigid_contact_max`` does for contacts, though no row is lost; the job check prints the entries asked for against
+    the room. The scan's runs, sized from every pair's bound on its window, lack room only for a window its shape data
+    no longer bounds: with room for one run, the other pairs' runs take the reserve, their rows unchanged. With room for
+    one entry fewer than a launch asks of each list and no reserve, a pair some of whose work found no room keeps no row
+    (:data:`TERRAIN_PAIR_INCOMPLETE`, counted, ``terrain_jobs``), every other pair its rows.
     """
     model, _hfield, _shapes = _capture_scene(device)
     pipeline, _contacts, _state = _collide(model, shadow=True)
     expected = pipeline._terrain_law_shadow.rows()
+    default_counts = pipeline._terrain_law_shadow.job_counts()
     capture = StdOutCapture()
     capture.begin()
     try:
@@ -2224,42 +2253,68 @@ def test_job_overflow_takes_the_full_walk(test, device):
     shadow = small._terrain_law_shadow
     record = shadow.describe()
     test.assertEqual(record["job_scale"], 1.0e-6)
+    live = 0
     for name in ("box", "cylinder", "hull"):
         capacities = record["launch_shapes"][name]["jobs"]
+        reserves = record["launch_shapes"][name]["jobs_reserve"]
         lists = {k: v for k, v in capacities.items() if k != "scans"}
-        # one entry each
+        # one entry each, and the reserve beyond it held all the work
         test.assertEqual(lists, dict.fromkeys(lists, 1))
         counts = shadow.job_counts()[name]
         test.assertGreater(counts["faces"], 1)
+        for k in lists:
+            test.assertLessEqual(counts[k], 1 + reserves[k], msg=f"{name} {k}")
+        live += counts["live"]
     test.assertIn("Terrain-law box class: its rule F face job list overflowed", message)
     test.assertIn("Terrain-law hull class: its rule E edge job list overflowed", message)
+    test.assertNotIn("overflowed too", message)
     rows = shadow.rows()
     for name in ("count", "state", "q", "n", "d", "feature"):
         np.testing.assert_array_equal(rows[name], expected[name], err_msg=name)
-    test.assertGreater(int(shadow._out.deferred_count.numpy()[TERRAIN_PARTNER_CYLINDER]), 1)
-    # the pairs that lost work are walked again, counted and flagged
-    test.assertGreater(shadow.job_counts()["cylinder"]["walks"], 1)
-    rows_lost, candidates_lost, jobs_lost = shadow.overflow_counts()
+    # the pairs whose work took the reserve are counted
+    rows_lost, candidates_lost, jobs_taken = shadow.overflow_counts()
     test.assertEqual((rows_lost, candidates_lost), (0, 0))
-    test.assertGreater(jobs_lost, 1)
-    test.assertLessEqual(jobs_lost, sum(int(v) for v in shadow._out.deferred_count.numpy()[1:]))
+    test.assertGreater(jobs_taken, 1)
+    test.assertLessEqual(jobs_taken, live)
     test.assertEqual([k for k, v in small.narrow_phase.buffer_capacity_status().items() if v], ["terrain_jobs"])
     with test.assertRaisesRegex(RuntimeError, "terrain_jobs"):
         small.narrow_phase.check_buffer_capacity()
     # the default lists have room for every pair's work
     pipeline.narrow_phase.check_buffer_capacity()
     test.assertEqual(pipeline._terrain_law_shadow.overflow_counts(), (0, 0, 0))
-    # room for one scan job
     table = pipeline._terrain_law_shadow.table
+    names = {TERRAIN_PARTNER_BOX: "box", TERRAIN_PARTNER_CYLINDER: "cylinder", TERRAIN_PARTNER_HULL: "hull"}
+    lost_pairs = 0
+    kept_pairs = 0
     for partner_class in _SOLID_MODULES:
         with test.subTest(partner_class=partner_class):
             begin, end = _class_pairs(table, partner_class)
+            pairs = np.arange(begin, end)
+            # room for one scan run: the other pairs' runs take the reserve
             jobs = _class_jobs(model, pipeline._terrain_law_shadow, partner_class, scans=1)
             out, jobs, _solids = _run_class(pipeline, model, partner_class, jobs=jobs)
             counts = _counts(jobs)
             test.assertGreater(counts["scans"], 1)
-            test.assertGreaterEqual(int(out.deferred_count.numpy()[partner_class]), counts["live"] - 1)
-            _assert_same_rows(test, pipeline._terrain_law_shadow._out, out, np.arange(begin, end), "one scan job")
+            test.assertGreaterEqual(int(out.overflow.numpy()[2]), counts["live"] - 1)
+            _assert_same_rows(test, pipeline._terrain_law_shadow._out, out, pairs, "one scan run")
+            # room for one entry fewer than a launch asks of each list, no reserve: a pair that lost work keeps no row
+            asked = default_counts[names[partner_class]]
+            sizes = {k: max(1, asked[k] - 1) for k in (*terrain_law_solid.TERRAIN_SOLID_JOB_LISTS, "candidates")}
+            jobs = _class_jobs(model, pipeline._terrain_law_shadow, partner_class, reserve=False, **sizes)
+            out, jobs, _solids = _run_class(pipeline, model, partner_class, jobs=jobs)
+            state = out.state.numpy()[pairs]
+            lost = (state & int(TERRAIN_PAIR_INCOMPLETE)) != 0
+            test.assertGreater(int(np.count_nonzero(lost)), 0)
+            test.assertTrue(np.all(out.count.numpy()[pairs][lost] == 0))
+            test.assertTrue(np.all(out.first.numpy()[pairs][lost] == -1))
+            test.assertEqual(int(out.overflow.numpy()[2]), int(np.count_nonzero(lost)))
+            test.assertNotEqual(int(out.status.numpy()[0]) & int(TERRAIN_STATUS_JOBS), 0)
+            _assert_same_rows(test, pipeline._terrain_law_shadow._out, out, pairs[~lost], "no reserve")
+            lost_pairs += int(np.count_nonzero(lost))
+            kept_pairs += int(np.count_nonzero(out.count.numpy()[pairs][~lost] > 0))
+    # not vacuous: pairs of every class lost work, and others kept their rows
+    test.assertGreaterEqual(lost_pairs, len(_SOLID_MODULES))
+    test.assertGreater(kept_pairs, 2)
 
 
 def test_shadow_keeps_contacts_bitwise_with_every_class(test, device):
@@ -2415,7 +2470,7 @@ for _name, _func in (
     ("test_hovering_core_leaves_at_the_fine_mip", test_hovering_core_leaves_at_the_fine_mip),
     ("test_recovery_picks_follow_depth_then_index", test_recovery_picks_follow_depth_then_index),
     ("test_solid_rows_match_the_float64_law", test_solid_rows_match_the_float64_law),
-    ("test_job_pipeline_rows_are_the_walks", test_job_pipeline_rows_are_the_walks),
+    ("test_job_pipeline_rows_depend_on_the_pair_alone", test_job_pipeline_rows_depend_on_the_pair_alone),
     ("test_job_lists_hold_each_run_together", test_job_lists_hold_each_run_together),
     ("test_slope_resting_solids_keep_their_sink", test_slope_resting_solids_keep_their_sink),
     ("test_slope_buried_solids_follow_the_law", test_slope_buried_solids_follow_the_law),
@@ -2441,8 +2496,8 @@ add_function_test(
 # The job check's warning is the expected output; the test captures it itself.
 add_function_test(
     TestTerrainLawSolid,
-    "test_job_overflow_takes_the_full_walk",
-    test_job_overflow_takes_the_full_walk,
+    "test_job_overflow_takes_the_reserve",
+    test_job_overflow_takes_the_reserve,
     devices=devices,
     check_output=False,
 )

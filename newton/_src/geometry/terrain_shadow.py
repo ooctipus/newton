@@ -53,7 +53,7 @@ The point class (spheres and capsules) walks a pair's window in one thread:
 2. The tiled kernel, ``wp.launch_tiled`` with :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK` lanes per
    pair and the work list's fixed grid (:attr:`~newton._src.geometry.terrain_law.TerrainPairWork.blocks` blocks),
    which strides over the queued pairs.
-3. The full-finish kernel (below).
+3. The class's finish of its deferred pairs (below), the tiled kernel's walk into the scratch.
 
 A solid class (boxes; cylinders and cones; convex hulls and ellipsoids) takes the shape of today's terrain route: a
 cheap scan that lists the surviving features, one thread per listed feature, and a per-pair close that holds their rows
@@ -68,20 +68,24 @@ jobs and the solid classes' :class:`~newton._src.geometry.terrain_law_solid.Terr
 3. The job kernels, the job threads striding over a list: faces, edges (whose creases with an arc that can hold a row
    are listed for ``theta*``), the creases' ``theta*``, their rows, vertices. A job's rows go to the class's candidate
    pool with their place in window order.
-4. The close, the job threads over the live pairs: a pair's candidates held in window order (the walk's held rows),
-   then rule R's kernel over the pairs without a row; a pair's held rows are written as they are when the finish keeps
-   them so (fewer than its class's lane rows, no plane group of three), else held for a finish kernel.
-5. The finish kernels: one thread per pair over the pairs with a plane group of three (the small-pair finish), and a
-   block of lanes per pair over those holding the lane rows, the lanes splitting its implied-row tests (not launched
-   while no class's walk slots hold them).
-6. The full-finish kernel (below).
+4. The close, the job threads over the live pairs: a pair's candidates held in window order (the rows a walk of its
+   window holds), then rule R's kernel over the pairs without a row; a pair's held rows are written as they are when
+   the finish keeps them so (no plane group of three), else held for the small-pair finish, one thread per pair.
+5. The class's finish of its deferred pairs (below), from their candidates in the pool.
 
-The full-finish kernel of a class, ``wp.launch_tiled`` on the fixed grid of its
+Work past a solid class's job lists or candidate pool (scene-level buffers) takes their reserve, the same kernels
+running it, with its pair's rows unchanged: the narrow phase's sticky ``terrain_jobs`` bit is raised, and the job
+check prints the entries asked for against the room, by list and class; a pair some of whose work found no room even
+there keeps no row.
+
+The finish of a class's deferred pairs (pairs whose rows need more than their walk slots, or for the point class the
+general finish), ``wp.launch_tiled`` on the fixed grid of its
 :class:`~newton._src.geometry.terrain_law.TerrainFinishScratch`
 (:func:`~newton._src.geometry.terrain_law.terrain_finish_blocks` blocks, each holding every distinct candidate a window
-of the class can give), strides over the class's deferred list: pairs with more distinct rows than their walk slots,
-and solid pairs whose work found no room in a job list or the candidate pool (they raise the narrow phase's sticky
-``terrain_jobs`` bit, and the job check prints the entries asked for against the room, by list and class).
+of the class can give), strides over the class's deferred list, a block of lanes per pair: it collects the pair's
+candidates in the block's scratch (a solid pair's from the pool, a point pair's by the tiled walk), the lanes run the
+finish on them, its implied-row tests split among them, and every row it keeps is written, in the pair's walk slots when
+they fit, else in rows of the spill region.
 
 The kernels apply the pipeline's pair policy: the table holds the pairs its collision filter admits (worlds,
 collision groups, filter pairs, or its explicit pair list), and each kernel drops the pairs its broad phase's
@@ -91,7 +95,8 @@ narrow phase's sticky ``terrain_stale`` bit; a pair whose rows the spill region 
 them by priority in its walk slots (each plane group's deepest first) and raises ``terrain_rows`` (the spill check
 prints the rows asked for against the region's), as does a pair whose window outgrew the bound its shape data gave at
 construction; a solid pair whose work found no room in its class's job lists raises ``terrain_jobs`` (its rows are
-unchanged, the full-finish kernel takes it); ``NarrowPhase.check_buffer_capacity`` raises on each.
+unchanged while the lists' reserve takes the work; past it, it keeps no row); ``NarrowPhase.check_buffer_capacity``
+raises on each.
 
 A solid class's kernels pass 4.2 to 4.7 KB of launch arguments (its jobs and the solid classes' data by value): CUDA
 launches them on Volta or newer GPUs with a CUDA 12.1 or newer driver (older drivers take at most 4 KB).
@@ -122,9 +127,10 @@ from .terrain_contacts import (
 )
 from .terrain_law import (
     TERRAIN_FINISH_ROW_BYTES,
-    TERRAIN_LAW_FULL_BLOCKS,
+    TERRAIN_LAW_DEFERRED_BLOCKS,
     TERRAIN_PAIR_CANDIDATE_OVERFLOW,
     TERRAIN_PAIR_FILTERED,
+    TERRAIN_PAIR_INCOMPLETE,
     TERRAIN_PAIR_OUTSIDE,
     TERRAIN_PAIR_ROW_OVERFLOW,
     TERRAIN_PAIR_STALE,
@@ -165,19 +171,16 @@ def _solid_launches(name: str) -> tuple[tuple[str, str], ...]:
         "recovery",
         "small",
         "finish",
-        "pooled",
-        "full",
     )
-    pair_jobs = ("close", "small")
     kinds = tuple(
         "pairs"
         if kernel == "rows"
-        else "full"
-        if kernel in ("pooled", "full")
+        else "deferred"
+        if kernel == "finish"
         else "pair_tiles"
-        if kernel in ("recovery", "finish")
+        if kernel == "recovery"
         else "pair_jobs"
-        if kernel in pair_jobs
+        if kernel in ("close", "small")
         else "jobs"
         for kernel in kernels
     )
@@ -190,7 +193,11 @@ def _solid_launches(name: str) -> tuple[tuple[str, str], ...]:
 TERRAIN_LAW_KERNELS: dict[int, tuple[str, tuple[tuple[str, str], ...]]] = {
     TERRAIN_PARTNER_POINT: (
         "newton._src.geometry.terrain_law_point",
-        (("thread", "terrain_point_rows"), ("tiled", "terrain_point_rows_tiled"), ("full", "terrain_point_rows_full")),
+        (
+            ("thread", "terrain_point_rows"),
+            ("tiled", "terrain_point_rows_tiled"),
+            ("deferred", "terrain_point_rows_finish"),
+        ),
     ),
     TERRAIN_PARTNER_BOX: ("newton._src.geometry.terrain_law_box", _solid_launches("box")),
     TERRAIN_PARTNER_CYLINDER: ("newton._src.geometry.terrain_law_cylinder", _solid_launches("cylinder")),
@@ -216,11 +223,12 @@ The module is imported only when the class is listed. Launch kinds, every one wi
 * ``pair_tiles``: ``wp.launch_tiled`` with
   :attr:`~newton._src.geometry.terrain_law_solid.TerrainSolidJobs.finish_blocks` blocks of
   :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK` lanes, a pair per block at a time over a list of the
-  class's pairs, the same arguments (a solid class's rule R and finish kernels);
-* ``full``: ``wp.launch_tiled`` with :func:`~newton._src.geometry.terrain_law.terrain_finish_blocks` blocks of
+  class's pairs, the same arguments (a solid class's rule R kernel);
+* ``deferred``: ``wp.launch_tiled`` with :func:`~newton._src.geometry.terrain_law.terrain_finish_blocks` blocks of
   :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_BLOCK` lanes whatever the class's size, striding over its
   deferred list, and a :class:`~newton._src.geometry.terrain_law.TerrainFinishScratch` as sixth argument (a solid
-  class's also the solid classes' data and its jobs), so that an empty list costs one near-empty launch.
+  class's also the solid classes' data and its jobs), so that an empty list costs one near-empty launch: the class's
+  finish of its deferred pairs.
 
 ``begin`` and ``slot_begin`` are the class's first pair and walk slot but for the ``tiled`` launch.
 
@@ -239,12 +247,12 @@ A class's module and kernels follow one protocol (the helpers live in :mod:`~new
 * When the finish keeps the held rows as they are (no plane group of three, ``terrain_plane_group_of_three``; at most
   ``K`` rows), the point kernels write them in the world frame (``terrain_store_row``) with the pair's count and state;
   the solid kernels run the finish in place on any held rows (``terrain_finish_slots``) and write the kept ones. A pair
-  beyond that (for the solid kernels: more distinct rows than ``K``, or work without room) is deferred
-  (``terrain_defer_pair``), and the class's full-finish kernel walks it again into its distinct candidates
-  (``terrain_hold_candidate``), runs the finish on all of them (``terrain_finish_list``) and writes every row it keeps,
-  in the pair's walk slots when they fit, else in rows of the spill region it reserves (``terrain_spill_rows``; no
-  room: the first ``K`` of them by priority in the walk slots, ``terrain_finish_overflow``, state
-  ``TERRAIN_PAIR_ROW_OVERFLOW``, ``terrain_rows``).
+  beyond that (for the solid kernels: more distinct rows than ``K``) is deferred (``terrain_defer_pair``), and the
+  class's finish of its deferred pairs collects its distinct candidates in its scratch (a solid pair's from the pool,
+  a point pair's by its walk, ``terrain_hold_candidate``), runs the finish on all of them with a block's lanes
+  (``terrain_finish_list``) and writes every row it keeps, in the pair's walk slots when they fit, else in rows of the
+  spill region it reserves (``terrain_finish_deferred``, ``terrain_spill_rows``; no room: the first ``K`` of them by
+  priority in the walk slots, ``terrain_finish_overflow``, state ``TERRAIN_PAIR_ROW_OVERFLOW``, ``terrain_rows``).
 """
 
 TERRAIN_LAW_SOLID_CLASSES = (TERRAIN_PARTNER_BOX, TERRAIN_PARTNER_CYLINDER, TERRAIN_PARTNER_HULL)
@@ -262,6 +270,7 @@ TERRAIN_PAIR_STATES = {
     "outside": int(TERRAIN_PAIR_OUTSIDE),
     "row_overflow": int(TERRAIN_PAIR_ROW_OVERFLOW),
     "candidate_overflow": int(TERRAIN_PAIR_CANDIDATE_OVERFLOW),
+    "incomplete": int(TERRAIN_PAIR_INCOMPLETE),
     "wide": int(TERRAIN_PAIR_WIDE),
     "unsupported": int(TERRAIN_PAIR_UNSUPPORTED),
 }
@@ -337,10 +346,10 @@ TERRAIN_LAW_SPILL_SHARE = 256
 pair's bound (:meth:`TerrainLawShadow.default_spill_rows`): the worst case of one pair in 256 at once. On the recorded
 suite scenes (16,384 worlds) that is 11 to 25% of the walk slots, while at most one pair spilled (30 rows)."""
 
-TERRAIN_LAW_JOB_COUNTERS = 11
+TERRAIN_LAW_JOB_COUNTERS = 9
 """Counters of a solid class's jobs: its four job lists, its candidate pool, its live pairs, its pairs left to rule R,
-its scan's runs, its deferred pairs walked again, its pairs finished by a block's lanes and those finished by the
-small-pair finish kernel (:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_COUNTERS`)."""
+its scan's runs and its pairs finished by the small-pair finish kernel
+(:data:`~newton._src.geometry.terrain_law_solid.TERRAIN_SOLID_COUNTERS`)."""
 
 TERRAIN_LAW_JOB_NAMES = (
     "faces",
@@ -351,8 +360,6 @@ TERRAIN_LAW_JOB_NAMES = (
     "live",
     "recovery",
     "scans",
-    "walks",
-    "lanes",
     "small",
 )
 """Names of a solid class's job counters, in order (:meth:`TerrainLawShadow.job_counts`)."""
@@ -405,13 +412,19 @@ def _print_job_list(k: int):
 
 @wp.kernel(enable_backward=False)
 def terrain_law_spill_check(
-    counters: wp.array[wp.int32], spilled: int, spill: int, jobs: int, capacities: wp.array[wp.int32]
+    counters: wp.array[wp.int32],
+    spilled: int,
+    spill: int,
+    jobs: int,
+    capacities: wp.array[wp.int32],
+    reserves: wp.array[wp.int32],
 ):
     """After a launch: warn when the spill region overflowed, with the spill rows asked for against its rows (the pairs
-    that found no room have raised ``terrain_rows``), and when a solid class's job list or candidate pool overflowed,
-    with the entries asked for against its room, by class and list (the pairs that found none took the full-finish
-    kernel, their rows unchanged, and raised ``terrain_jobs``). The scan's runs are sized exactly from the pairs'
-    windows: they overflow only when a window outgrew the bound its shape data gave at construction."""
+    that found no room have raised ``terrain_rows``), and when a solid class's job list, candidate pool or scan's runs
+    outgrew their room, with the entries asked for against it, by class and list (the pairs whose work took the reserve
+    beyond it, their rows unchanged, have raised ``terrain_jobs``), and again when the reserve overflowed too (the pairs
+    whose work found no room there keep no row). The scan's runs are sized exactly from the pairs' windows: they
+    overflow only when a window outgrew the bound its shape data gave at construction."""
     if counters[spilled] > spill:
         wp.printf(
             "Warning: Terrain-law spill region overflowed %d > %d. Set NEWTON_TERRAIN_LAW_SHADOW_ROWS to at least the "
@@ -427,8 +440,7 @@ def terrain_law_spill_check(
             if kind == _JOB_SCANS:
                 wp.printf(
                     " class: its scan's runs overflowed %d > %d: windows outgrew the bounds their shapes gave when the "
-                    "collision pipeline was built (those pairs took the full-finish kernel). Rebuild the collision "
-                    "pipeline.\n",
+                    "collision pipeline was built (their runs took the reserve). Rebuild the collision pipeline.\n",
                     counters[jobs + k],
                     capacities[k],
                 )
@@ -436,11 +448,18 @@ def terrain_law_spill_check(
                 wp.printf(" class: its ")
                 _print_job_list(kind)
                 wp.printf(
-                    " overflowed %d > %d: those pairs took the full-finish kernel (rows unchanged, slower). Raise "
+                    " overflowed %d > %d: those pairs' work took its reserve (rows unchanged). Raise "
                     "NEWTON_TERRAIN_LAW_SHADOW_JOBS, a factor on every job list's room, by at least the first number "
                     "over the second.\n",
                     counters[jobs + k],
                     capacities[k],
+                )
+            if counters[jobs + k] > capacities[k] + reserves[k]:
+                wp.printf("Warning: Terrain-law ")
+                _print_solid_class(k // _JOB_COUNTERS)
+                wp.printf(
+                    " class: the reserve of %d overflowed too: the pairs whose work found no room there kept no row.\n",
+                    reserves[k],
                 )
 
 
@@ -631,6 +650,7 @@ class TerrainLawShadow:
         # its jobs: zeroed by one memset before every launch.
         self._counters = wp.zeros(_COUNTERS, dtype=wp.int32, device=device)
         capacities = np.zeros(TERRAIN_PARTNER_CLASSES * TERRAIN_LAW_JOB_COUNTERS, np.int32)
+        reserves = np.zeros_like(capacities)
         solid_pairs = []
         solid_module = None
         if any(c in TERRAIN_LAW_SOLID_CLASSES for c in self.classes):
@@ -659,12 +679,16 @@ class TerrainLawShadow:
             scratch = terrain_finish_scratch(device, int(self.table.candidates[begin:end].max()))
             if solid:
                 solid_pairs.append((begin, end - begin))
+                run = int(TERRAIN_PARTNER_SCAN_RUN[partner_class])
                 capacity = solid_module.terrain_solid_job_capacities(
                     self.table.vertices[begin:end],
                     self.table.candidates[begin:end],
                     walk,
-                    scan_run=int(TERRAIN_PARTNER_SCAN_RUN[partner_class]),
+                    scan_run=run,
                     scale=self.job_scale,
+                )
+                reserve = solid_module.terrain_solid_job_reserves(
+                    self.table.vertices[begin:end], self.table.candidates[begin:end], scan_run=run
                 )
                 offset = _JOBS + TERRAIN_LAW_JOB_COUNTERS * partner_class
                 jobs = solid_module.terrain_solid_jobs(
@@ -673,15 +697,15 @@ class TerrainLawShadow:
                     begin,
                     end - begin,
                     capacity,
+                    reserve,
                     counts=self._counters[offset : offset + TERRAIN_LAW_JOB_COUNTERS],
                 )
                 self._jobs[partner_class] = jobs
                 names = (*solid_module.TERRAIN_SOLID_JOB_LISTS, "candidates", "scans")
-                # the live, rule R and lane lists hold every pair of the class: no check
+                # the live, rule R and small lists hold every pair of the class: no check
                 for name in names:
                     capacities[offset - _JOBS + TERRAIN_LAW_JOB_NAMES.index(name)] = capacity[name]
-                skipped = []
-                prefix = f"terrain_{terrain_law_class_name(partner_class)}_rows_"
+                    reserves[offset - _JOBS + TERRAIN_LAW_JOB_NAMES.index(name)] = reserve[name]
                 for kind, kernel_name in launches:
                     kernel = getattr(module, kernel_name)
                     if kind == "pairs":
@@ -689,10 +713,6 @@ class TerrainLawShadow:
                     elif kind == "pair_jobs":
                         self._launches.append(("thread", kernel, jobs.pair_threads, begin, slot, (jobs, True)))
                     elif kind == "pair_tiles":
-                        if kernel_name == prefix + "finish" and walk < solid_module.TERRAIN_SOLID_LANE_ROWS:
-                            # no walking pair holds the lane rows: its lane list stays empty
-                            skipped.append("finish")
-                            continue
                         self._launches.append(("tiled", kernel, jobs.finish_blocks, begin, slot, (jobs, True)))
                     elif kind == "jobs":
                         self._launches.append(("thread", kernel, jobs.threads, begin, slot, (jobs, True)))
@@ -705,7 +725,7 @@ class TerrainLawShadow:
                         "pair_job_threads": jobs.pair_threads,
                         "finish_blocks": jobs.finish_blocks,
                         "jobs": {name: int(capacity[name]) for name in names},
-                        "skipped": skipped,
+                        "jobs_reserve": {name: int(reserve[name]) for name in names},
                     }
                 )
             else:
@@ -729,13 +749,13 @@ class TerrainLawShadow:
                             shapes["tiled_blocks"] = work.blocks
                     else:
                         self._launches.append(("tiled", kernel, scratch.blocks, begin, slot, (scratch, False)))
-            # A fixed grid over the class's deferred list (the pairs are found on the device, in any order), each block
-            # holding every distinct candidate a window of the class can give. A class whose largest pair's window can
-            # give many candidates takes fewer blocks, its scratch kept near TERRAIN_LAW_FULL_SCRATCH_BYTES: the rare
-            # deferred path's parallelism, never a row.
-            shapes["full_blocks"] = scratch.blocks
-            shapes["full_candidates"] = scratch.capacity
-            shapes["full_limited"] = scratch.blocks < TERRAIN_LAW_FULL_BLOCKS
+            # The finish of the class's deferred pairs: a fixed grid over its deferred list (the pairs are found on the
+            # device, in any order), each block holding every distinct candidate a window of the class can give. A
+            # class whose largest pair's window can give many candidates takes fewer blocks, its scratch kept near
+            # TERRAIN_LAW_SCRATCH_BYTES: the rare deferred path's parallelism, never a row.
+            shapes["deferred_blocks"] = scratch.blocks
+            shapes["deferred_candidates"] = scratch.capacity
+            shapes["deferred_limited"] = scratch.blocks < TERRAIN_LAW_DEFERRED_BLOCKS
             self._launch_shapes[terrain_law_class_name(partner_class)] = shapes
             slot += walk * (end - begin)
         self.slot_count = slot
@@ -761,6 +781,7 @@ class TerrainLawShadow:
             deferred_count=self._counters[_DEFERRED : _DEFERRED + TERRAIN_PARTNER_CLASSES],
         )
         self._capacities = wp.array(capacities, dtype=wp.int32, device=device)
+        self._reserves = wp.array(reserves, dtype=wp.int32, device=device)
         self._solids = None
         self._unsupported_pairs = 0
         if solid_pairs:
@@ -862,7 +883,7 @@ class TerrainLawShadow:
         wp.launch(
             terrain_law_spill_check,
             dim=1,
-            inputs=[self._counters, _SPILLED, self.spill_rows, _JOBS, self._capacities],
+            inputs=[self._counters, _SPILLED, self.spill_rows, _JOBS, self._capacities, self._reserves],
             device=self.device,
             record_tape=False,
         )
@@ -928,9 +949,9 @@ class TerrainLawShadow:
 
     def overflow_counts(self) -> tuple[int, int, int]:
         """Return the pairs whose rows found no room in the spill region (``terrain_rows``), whose windows outgrew their
-        full-finish scratch (``terrain_rows``) and whose work found no room in their solid class's job lists or
-        candidate pool (``terrain_jobs``: the full-finish kernel took them, their rows unchanged), summed over every
-        launch so far."""
+        scratch (``terrain_rows``) and whose work found no room in their solid class's job lists or candidate pool
+        (``terrain_jobs``: the reserve took it, their rows unchanged, or past the reserve they keep no row), summed over
+        every launch so far."""
         if self.device.is_capturing:
             raise RuntimeError("Terrain-law shadow counters must be read outside graph capture")
         rows, candidates, jobs = (int(v) for v in self._out.overflow.numpy())
@@ -938,10 +959,9 @@ class TerrainLawShadow:
 
     def job_counts(self) -> dict[str, dict[str, int]]:
         """Return, per listed solid class with pairs, the entries its last launch asked of every job list, of its
-        candidate pool and of its scan's runs (past a capacity, :meth:`describe`'s ``launch_shapes``: entries without
-        room, whose pairs took the full-finish kernel), its live pairs, its pairs left to rule R and its deferred pairs
-        whose windows the full-finish kernel walked again (``walks``: those some of whose work found no room; it
-        finishes the others from their candidates), by :data:`TERRAIN_LAW_JOB_NAMES`."""
+        candidate pool and of its scan's runs (past a room, :meth:`describe`'s ``launch_shapes``: entries that took the
+        reserve, ``jobs_reserve``, or found no room), its live pairs, its pairs left to rule R and its pairs given to
+        the small-pair finish, by :data:`TERRAIN_LAW_JOB_NAMES`."""
         if self.device.is_capturing:
             raise RuntimeError("Terrain-law shadow counters must be read outside graph capture")
         if not self._jobs:
@@ -968,18 +988,17 @@ class TerrainLawShadow:
 
         ``launches`` counts every launch of a collide, the spill and job check included. ``launch_shapes`` holds, per
         class with pairs, the dimensions fixed at construction: ``block_dim`` (every launch's), ``walk_slots`` (a
-        pair's walk slots), ``full_blocks`` (the full-finish kernel's grid), ``full_candidates`` (the distinct
-        candidates a full-finish block holds: the most any pair of the class can give) and ``full_limited`` (whether
-        the full-finish grid has fewer than :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_FULL_BLOCKS` blocks:
+        pair's walk slots), ``deferred_blocks`` (the grid of the finish of its deferred pairs), ``deferred_candidates``
+        (the distinct candidates a block of it holds: the most any pair of the class can give) and ``deferred_limited``
+        (whether that grid has fewer than :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_DEFERRED_BLOCKS` blocks:
         its blocks, each sized for the class's largest pair, would exceed
-        :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_FULL_SCRATCH_BYTES`); for the point class ``thread_dim``
-        (the one-thread kernel's threads, one per pair of the class) and ``tiled_blocks`` (the tiled kernel's grid, 0
+        :data:`~newton._src.geometry.terrain_law.TERRAIN_LAW_SCRATCH_BYTES`); for the point class ``thread_dim`` (the
+        one-thread kernel's threads, one per pair of the class) and ``tiled_blocks`` (the tiled kernel's grid, 0
         without a tiled segment); for a solid class ``pair_dim`` (its whole-pair rejects' threads, one per pair of the
         class), ``job_threads`` (its scan and job kernels' threads), ``pair_job_threads`` (its close and small-pair
-        finish kernels' threads, at most one per pair of the class), ``finish_blocks`` (its rule R and finish kernels'
-        grid), ``jobs`` (the entries of its job lists, its candidate pool's rows and its scan's runs) and ``skipped``
-        (its kernels not launched: the finish kernel, whose lane list no walk of the class fills). ``slots`` and
-        ``spill_rows`` are the side buffer's walk slots and spill rows.
+        finish kernels' threads, at most one per pair of the class), ``finish_blocks`` (its rule R kernel's grid),
+        ``jobs`` (the room of its job lists, its candidate pool and its scan's runs) and ``jobs_reserve`` (their
+        reserves). ``slots`` and ``spill_rows`` are the side buffer's walk slots and spill rows.
         """
         pairs = {}
         for partner_class in range(TERRAIN_PARTNER_CLASSES):
@@ -998,7 +1017,7 @@ class TerrainLawShadow:
         scratch = sum(
             extra[0].blocks * extra[0].capacity * TERRAIN_FINISH_ROW_BYTES
             for kind, kernel, *_launch, extra in self._launches
-            if kernel.key.endswith("_full")
+            if kernel.key.endswith("_finish")
         )
         work = sum(
             extra[0].pairs.capacity for kind, *_launch, extra in self._launches if kind == "thread" and not extra[1]

@@ -208,11 +208,11 @@ def _box_cells(hf, lo, hi):
 def test_window_bound_holds_for_every_pose(test, device):
     """Bound every pair's window, whatever its pose, by the vertices its shape extent, reach and cells give.
 
-    The full-finish kernels' scratch holds the candidates such a window can give, so this bound is what makes them
-    complete. Random positions (on cell lines and off them, 60 m from the origin of a 200 m grid, where float32 cell
-    coordinates round coarsest) and orientations of every kind, a convex hull off its shape's origin among them (its
-    radius half its local box's diagonal, the model's), each window taken as the kernels take it: the core's bounds
-    (its axis-aligned box or its ends) widened by the reach. The sampling checks the argument of
+    The scratch of the finish of deferred pairs holds the candidates such a window can give, so this bound is what
+    makes it complete. Random positions (on cell lines and off them, 60 m from the origin of a 200 m grid, where
+    float32 cell coordinates round coarsest) and orientations of every kind, a convex hull off its shape's origin among
+    them (its radius half its local box's diagonal, the model's), each window taken as the kernels take it: the core's
+    bounds (its axis-aligned box or its ends) widened by the reach. The sampling checks the argument of
     :func:`~newton._src.geometry.terrain_contacts.terrain_window_vertices`, which holds for every pose: a core lies in
     a ball of its radius, so its box spans at most twice the radius along each axis.
     """

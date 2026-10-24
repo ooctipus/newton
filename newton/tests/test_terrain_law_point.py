@@ -662,9 +662,9 @@ def _launch_segment(shadow, model, pipeline, lane, begin, count, out, *, kernel=
 
     With ``lane`` the one-thread class, the one-thread kernel (or ``kernel``, of its signature) walks every pair; with
     the tiled class, it queues them past the whole-pair rejects and the tiled kernel takes the queue, with ``blocks``
-    blocks (the work list's own when ``None``). The full-finish kernel finishes the deferred pairs; after the plain
-    walk (:func:`_plain_point_rows`) the plain full finish does (:func:`_plain_point_rows_full`), so that the plain
-    side's deferred pairs are finished independently of the kernels' marks, scratch and grid too.
+    blocks (the work list's own when ``None``). The class's finish of deferred pairs finishes the deferred pairs; after
+    the plain walk (:func:`_plain_point_rows`) the plain finish does (:func:`_plain_point_rows_finish`), so that the
+    plain side's deferred pairs are finished independently of the kernels' marks, scratch and grid too.
     """
     device = model.device
     args = [begin, 0, _pair_inputs(shadow, model, pipeline), shadow.features.data(), out]
@@ -687,23 +687,24 @@ def _launch_segment(shadow, model, pipeline, lane, begin, count, out, *, kernel=
             device=device,
         )
     if kernel is _plain_point_rows:
-        _launch_plain_full(shadow, model, pipeline, begin, count, out)
+        _launch_plain_finish(shadow, model, pipeline, begin, count, out)
     else:
-        _launch_full(shadow, model, pipeline, begin, out)
+        _launch_finish(shadow, model, pipeline, begin, out)
 
 
 def _candidates(shadow) -> int:
-    """The distinct candidates a full-finish block of the point class holds (the most any of its pairs can give)."""
-    return shadow.describe()["launch_shapes"]["point"]["full_candidates"]
+    """The distinct candidates a block of the point class's finish of deferred pairs holds (the most any of its pairs
+    can give)."""
+    return shadow.describe()["launch_shapes"]["point"]["deferred_candidates"]
 
 
-def _launch_full(shadow, model, pipeline, begin, out, *, blocks=None):
-    """Run the full-finish kernel, with ``blocks`` blocks (the shadow's grid when ``None``), over the pairs of
-    ``out``'s deferred list (``deferred_count``) from table pair ``begin``."""
+def _launch_finish(shadow, model, pipeline, begin, out, *, blocks=None):
+    """Run the class's finish of deferred pairs, with ``blocks`` blocks (the shadow's grid when ``None``), over the
+    pairs of ``out``'s deferred list (``deferred_count``) from table pair ``begin``."""
     scratch = terrain_finish_scratch(model.device, _candidates(shadow), blocks=blocks)
     args = [begin, 0, _pair_inputs(shadow, model, pipeline), shadow.features.data(), out, scratch]
     wp.launch_tiled(
-        terrain_law_point.terrain_point_rows_full,
+        terrain_law_point.terrain_point_rows_finish,
         dim=scratch.blocks,
         inputs=args,
         block_dim=terrain_law_block_dim(model.device),
@@ -757,20 +758,20 @@ def _assert_same_rows(a: dict, b: dict, begin: int, count: int, what: str):
             np.testing.assert_array_equal(_bits(a[f][rows_a]), _bits(b[f][rows_b]), err_msg=f"{what}: pair {i} {f}")
 
 
-def _full_on_every_pair(shadow, model, pipeline, begin, count) -> dict:
-    """Run the full-finish kernel on every one of table pairs ``[begin, begin + count)``, seven blocks taking them in
-    turn through the same scratch, and return its side buffer (:func:`_host_rows`)."""
-    full = _side_buffer(begin, count, shadow.table.pair_count, model.device)
-    full.deferred.assign(np.arange(shadow.table.pair_count, dtype=np.int32))
-    full.deferred_count.assign(np.full(4, count, np.int32))
-    _launch_full(shadow, model, pipeline, begin, full, blocks=7)
-    return _host_rows(full)
+def _finish_on_every_pair(shadow, model, pipeline, begin, count) -> dict:
+    """Run the class's finish of deferred pairs on every one of table pairs ``[begin, begin + count)``, seven blocks
+    taking them in turn through the same scratch, and return its side buffer (:func:`_host_rows`)."""
+    finished = _side_buffer(begin, count, shadow.table.pair_count, model.device)
+    finished.deferred.assign(np.arange(shadow.table.pair_count, dtype=np.int32))
+    finished.deferred_count.assign(np.full(4, count, np.int32))
+    _launch_finish(shadow, model, pipeline, begin, finished, blocks=7)
+    return _host_rows(finished)
 
 
-def _assert_full_rows(test, walked: dict, finished: dict, begin: int, count: int, what: str) -> int:
-    """Assert that the full-finish kernel run on every pair (:func:`_full_on_every_pair`) gives each pair that reaches
-    its window the count, state and rows of its walk, bit for bit: so the walks write a pair's rows as the finish keeps
-    them. Returns the pairs compared."""
+def _assert_finished_rows(test, walked: dict, finished: dict, begin: int, count: int, what: str) -> int:
+    """Assert that the class's finish of deferred pairs run on every pair (:func:`_finish_on_every_pair`) gives each
+    pair that reaches its window the count, state and rows of its walk, bit for bit: so the walks write a pair's rows
+    as the finish keeps them. Returns the pairs compared."""
     compared = 0
     for i in range(count):
         pair = begin + i
@@ -790,8 +791,8 @@ def _assert_full_rows(test, walked: dict, finished: dict, begin: int, count: int
 def _production_rows(shadow, model, pipeline) -> dict:
     """Launch the shadow as a collide does (:meth:`TerrainLawShadow.launch`, the production protocol: the one-thread
     kernel over the class, queueing the tiled segment's pairs that pass the whole-pair rejects; the tiled kernel's
-    fixed grid over the queue; the full-finish kernel's fixed grid over the deferred list), and return its side
-    buffer (:func:`_host_rows`) and its queued pairs (``queued``)."""
+    fixed grid over the queue; the fixed grid of the finish of deferred pairs over the deferred list), and return its
+    side buffer (:func:`_host_rows`) and its queued pairs (``queued``)."""
     shadow.launch(
         pipeline.geom_transform,
         pipeline.geom_data,
@@ -828,7 +829,7 @@ def _tile_scenes(rng):
     """Scenes whose pairs all take the tiled kernel (windows over 16 cells): ``(name, heights, half extent, bodies)``.
 
     Large spheres and long capsules rest on rough terrain; long capsules lie across ridges of one height, whose ridge
-    rows share a plane, so that the finish may drop some of them (the full kernel's pairs); spheres whose rows mark
+    rows share a plane, so that the finish may drop some of them (deferred pairs); spheres whose rows mark
     bit 31 of a mask word (:data:`MARKED_BIT_31`) and spheres whose first mask word is empty and whose next word's first
     vertex yields (:data:`AFTER_EMPTY_WORD`); a sphere and a capsule whose windows hold over 256 vertices, which the
     tiled kernel's first lane walks unmasked.
@@ -900,14 +901,14 @@ def _owner_vertex_indices(hf, rows, bodies, shapes):
 def test_tiled_kernel_matches_one_thread_kernel(test, device):
     """Give a pair the same rows, bit for bit, whether one thread or a tile of lanes evaluates its window.
 
-    Both kernels evaluate the same table segment of tile-lane pairs (:func:`_tile_scenes`), the full kernel after
-    them; some pairs go through the full kernel. The tiled kernel takes the pairs the one-thread kernel queues: with
-    a block per pair, and with three blocks that take the queue in turn. The full-finish kernel, which marks and walks
-    a window as the tiled kernel does, also runs on every pair (seven blocks taking them in turn) and gives each walked
-    pair its walk's rows. On the CPU Warp runs ``wp.launch_tiled`` with one lane per pair (``block_dim`` 1), so the CPU
-    run checks one lane's walk, its masked and unmasked paths, bit 31 of a mask word, the skip of an empty mask word
-    onto a marked vertex and the blocks' turns; the 32-lane path (the window extent's ``tile_max``, the union of the
-    lanes' mask words by ``tile_sum`` and the lanes' striding) runs on CUDA only, in this test's CUDA variant.
+    Both kernels evaluate the same table segment of tile-lane pairs (:func:`_tile_scenes`), the finish of deferred pairs
+    after them; some pairs go through that finish. The tiled kernel takes the pairs the one-thread kernel queues: with a
+    block per pair, and with three blocks that take the queue in turn. The finish of deferred pairs, which marks and
+    walks a window with the tiled kernel's code, also runs on every pair (seven blocks taking them in turn) and gives
+    each walked pair its walk's rows. On the CPU Warp runs ``wp.launch_tiled`` with one lane per pair (``block_dim`` 1),
+    so the CPU run checks one lane's walk, its masked and unmasked paths, bit 31 of a mask word, the skip of an empty
+    mask word onto a marked vertex and the blocks' turns; the 32-lane path (the window extent's ``tile_max``, the union
+    of the lanes' mask words by ``tile_sum`` and the lanes' striding) runs on CUDA only, in this test's CUDA variant.
     """
     deferred = 0
     for name, heights, extent, bodies in _tile_scenes(np.random.default_rng(4)):
@@ -928,8 +929,8 @@ def test_tiled_kernel_matches_one_thread_kernel(test, device):
             for tiled in outputs[1:]:
                 test.assertEqual(int(one.deferred_count.numpy()[0]), int(tiled.deferred_count.numpy()[0]))
                 _assert_same_rows(_host_rows(one), _host_rows(tiled), begin, end - begin, f"{name}: tiled")
-            finished = _full_on_every_pair(shadow, model, pipeline, begin, end - begin)
-            _assert_full_rows(test, _host_rows(one), finished, begin, end - begin, name)
+            finished = _finish_on_every_pair(shadow, model, pipeline, begin, end - begin)
+            _assert_finished_rows(test, _host_rows(one), finished, begin, end - begin, name)
             hf = tu.reference_surface(tu.heightfield_model(heights, extent, extent, device="cpu"))
             owners = _owner_vertex_indices(hf, tu.shadow_rows(pipeline), bodies, shapes)
             if name == "marked bit 31":
@@ -942,7 +943,7 @@ def test_tiled_kernel_matches_one_thread_kernel(test, device):
                     test.assertTrue(len(marks) <= 256 and not marks[:32].any() and marks[32] != 0, msg=marks)
             elif name == "unmasked":
                 test.assertTrue(all(vertices > 256 and rows for rows, vertices in owners), msg=owners)
-    # Both paths finished pairs in the full kernel too.
+    # Both paths deferred pairs to the finish of deferred pairs too.
     test.assertGreater(deferred, 0)
 
 
@@ -1100,7 +1101,7 @@ def _plain_candidate(scratch: TerrainFinishScratch, base: int, count: int, claim
 
 
 @wp.kernel(enable_backward=False)
-def _plain_point_rows_full(
+def _plain_point_rows_finish(
     begin: int,
     slot_begin: int,
     inputs: TerrainPairInputs,
@@ -1108,9 +1109,9 @@ def _plain_point_rows_full(
     out: TerrainLawRows,
     scratch: TerrainFinishScratch,
 ):
-    """The full finish of the pairs a walk deferred, as the plain walk takes them: ``terrain_point_rows_full`` as one
-    thread per deferred pair (its form before the fixed grid), without the kernels' rejects and marks, and with every
-    raw candidate held (the finish merges them, where the kernel merges them as it holds them).
+    """The finish of the pairs a walk deferred, as the plain walk takes them: ``terrain_point_rows_finish`` as one
+    thread per deferred pair (one lane, no fixed grid), without the kernels' rejects and marks, and with every raw
+    candidate held (the finish merges them, where the kernel merges them as it holds them).
 
     Every item of every window vertex in window order (:func:`_plain_point_item`: no vertex drop, no item marks, no
     off-cell face reject) goes into the entry's candidate list, then the ends' exits (G2, G3) and the axis interior's
@@ -1179,7 +1180,7 @@ def _plain_point_rows_full(
     if count > scratch.capacity:
         flags = TERRAIN_FINISH_CANDIDATE_OVERFLOW
         count = scratch.capacity
-    kept = terrain_finish_list(scratch, base, count, eps)
+    kept = terrain_finish_list(scratch, base, count, eps, 0, 1)
     slot = slot_begin + (pair - begin) * _PLAIN_ROWS
     if kept > _PLAIN_ROWS:
         first = terrain_spill_rows(out, kept)
@@ -1208,13 +1209,13 @@ def _plain_point_rows_full(
     terrain_report(out.status, out.overflow, flags, True)
 
 
-def _launch_plain_full(shadow, model, pipeline, begin, count, out):
-    """Run the plain full finish (:func:`_plain_point_rows_full`) over ``out``'s deferred list, one thread per entry
+def _launch_plain_finish(shadow, model, pipeline, begin, count, out):
+    """Run the plain finish (:func:`_plain_point_rows_finish`) over ``out``'s deferred list, one thread per entry
     (at most ``count``, each with a candidate list of the class's bound), from table pair ``begin``."""
     scratch = terrain_finish_scratch(model.device, _candidates(shadow), blocks=count)
     args = [begin, 0, _pair_inputs(shadow, model, pipeline), shadow.features.data(), out, scratch]
     wp.launch(
-        _plain_point_rows_full,
+        _plain_point_rows_finish,
         dim=count,
         inputs=args,
         block_dim=terrain_law_block_dim(model.device),
@@ -1276,15 +1277,15 @@ def test_rejects_keep_the_plain_walk_rows(test, device):
     The one-thread kernel drops the vertices whose features lie out of reach (``_vertex_dropped``), walks a bit mask of
     the rest, and refuses a face whose projection lies off its cell (``_off_cell``) before its canonical values; the
     plain walk (:func:`_plain_point_rows`) evaluates every item of every window vertex in window order and closes the
-    pair the same way, and finishes the pairs it defers the same way too (:func:`_plain_point_rows_full`). On rough,
+    pair the same way, and finishes the pairs it defers the same way too (:func:`_plain_point_rows_finish`). On rough,
     pitted, stepped, seam-adversarial, buried, ridge, axis-recovery and reach-limit scenes the count, state, q, n, d and
     feature of every pair agree bit for bit with the plain walk's: the one-thread kernel's walking every pair, and the
     production launches' (the shadow's own: the larger windows queued for the tiled kernel, whose lanes mark the items
     that yield anything, a capsule's far ends dropped, and whose first lane walks the marked items). So do those of the
-    full-finish kernel (which walks with the drop and runs the finish) run on every walked pair, which also checks that
-    the walks write a pair's rows as the finish keeps them. The full-finish kernel runs with fewer blocks than deferred
-    pairs, as its fixed grid does when many pairs are deferred: each block finishes several pairs in turn, through the
-    same scratch.
+    class's finish of deferred pairs (which walks with the drop and runs the finish) run on every walked pair, which
+    also checks that the walks write a pair's rows as the finish keeps them. That finish runs with fewer blocks than
+    deferred pairs, as its fixed grid does when many pairs are deferred: each block finishes several pairs in turn,
+    through the same scratch.
     """
     walked = 0
     queued = 0
@@ -1305,15 +1306,15 @@ def test_rejects_keep_the_plain_walk_rows(test, device):
             queued += results["production"]["queued"]
             for label in ("kernel", "production"):
                 _assert_same_rows(results[label], results["plain"], begin, count, f"{name}: {label} against plain")
-            finished = _full_on_every_pair(shadow, model, pipeline, begin, count)
-            walked += _assert_full_rows(test, results["kernel"], finished, begin, count, name)
+            finished = _finish_on_every_pair(shadow, model, pipeline, begin, count)
+            walked += _assert_finished_rows(test, results["kernel"], finished, begin, count, name)
     test.assertGreater(walked, 200)
     # The production launches walked larger windows in the tiled kernel: capsules and spheres of every scene.
     test.assertGreater(queued, 80)
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# the full finish of deferred pairs
+# the finish of deferred pairs
 # ----------------------------------------------------------------------------------------------------------------
 
 
@@ -1322,7 +1323,7 @@ RIDGE_CREST = 0.03
 
 
 def _deferring_scene(rng):
-    """A scene whose walks defer dozens of pairs to the full finish: ``(heights, half extent, bodies)``.
+    """A scene whose walks defer dozens of pairs to the finish of deferred pairs: ``(heights, half extent, bodies)``.
 
     Ridges of one height every second column of 0.1 m cells, every fourth row raised 15 mm. Capsules 0.6-1.2 m long lie
     across the ridges or at random yaws, their lowest points 2 cm below to 2 cm above the crests (the raised rows poke
@@ -1361,7 +1362,7 @@ def _deferring_scene(rng):
 
 
 def _deferring_rows(heights, extent, bodies, device):
-    """A scene's point pairs through the production launches and through the plain walk and its full finish:
+    """A scene's point pairs through the production launches and through the plain walk and its finish:
     ``(production, plain, begin, count)``, the side buffers as :func:`_host_rows` and the class's table pairs."""
     model = tu.body_scene(heights, extent, extent, bodies, device=device)[0]
     pipeline, _contacts, _state = _collide(model, shadow=True)
@@ -1375,16 +1376,17 @@ def _deferring_rows(heights, extent, bodies, device):
 
 
 def test_deferred_pairs_keep_the_plain_finish_rows(test, device):
-    """Give the pairs the walks defer the rows of the plain walk's own full finish, bit for bit.
+    """Give the pairs the walks defer the rows of the plain walk's own finish, bit for bit.
 
     A walk defers a pair whose rows the finish may change (a plane group of three rows, more rows than the walk slots)
-    to the full-finish kernel, whose fixed grid of lane blocks marks the window's productive items, walks them on the
-    first lane into its block's distinct candidates and runs the finish on them. The production launches (the
-    shadow's own) are compared with the plain walk and its full finish (:func:`_plain_point_rows_full`: one thread per
-    deferred pair, every item of every window vertex, every raw candidate held) on a scene that defers dozens of pairs
-    (:func:`_deferring_scene`), some with more rows than their walk slots (written to the spill region), some with
-    windows the full-finish kernel walks unmasked. On CUDA the rows also equal a CPU run's, bit for bit (there the
-    lanes split the windows, mark the items and take their union, where the CPU's one lane walks alone).
+    to the class's finish of deferred pairs, whose fixed grid of lane blocks marks the window's productive items, walks
+    them on the first lane into its block's distinct candidates and runs the finish on them with its lanes. The
+    production launches (the shadow's own) are compared with the plain walk and its finish
+    (:func:`_plain_point_rows_finish`: one thread per deferred pair, every item of every window vertex, every raw
+    candidate held) on a scene that defers dozens of pairs (:func:`_deferring_scene`), some with more rows than their
+    walk slots (written to the spill region), some with windows that finish walks unmasked. On CUDA the rows also equal
+    a CPU run's, bit for bit (there the lanes split the windows, mark the items, take their union and split the
+    finish's implied-row tests, where the CPU's one lane runs alone).
     """
     heights, extent, bodies = _deferring_scene(np.random.default_rng(77))
     production, plain, begin, count = _deferring_rows(heights, extent, bodies, device)
@@ -1413,10 +1415,10 @@ def test_deferred_pairs_keep_the_plain_finish_rows(test, device):
 def test_fixed_grids_take_each_pair_once(test, device):
     """Take every queued and every deferred pair once, even in a launch with more blocks than the grid.
 
-    The tiled and full-finish kernels stride over their lists by the grids fixed in the work list and in the finish
-    scratch (``work.blocks``, ``scratch.blocks``); a block past that grid returns at once. Launched with three blocks
-    more (and scratch room for them), the tiled kernel would otherwise take queued pairs twice, deferring them twice,
-    and the full-finish kernel would finish deferred pairs twice, reserving their spill rows twice.
+    The tiled kernel and the finish of deferred pairs stride over their lists by the grids fixed in the work list and
+    in the finish scratch (``work.blocks``, ``scratch.blocks``); a block past that grid returns at once. Launched with
+    three blocks more (and scratch room for them), the tiled kernel would otherwise take queued pairs twice, deferring
+    them twice, and the finish would finish deferred pairs twice, reserving their spill rows twice.
     """
     heights, extent, bodies = _deferring_scene(np.random.default_rng(77))
     model = tu.body_scene(heights, extent, extent, bodies, device=device)[0]
@@ -1454,7 +1456,7 @@ def test_fixed_grids_take_each_pair_once(test, device):
         scratch = terrain_finish_scratch(device, _candidates(shadow), blocks=blocks + extra)
         scratch.blocks = blocks
         wp.launch_tiled(
-            terrain_law_point.terrain_point_rows_full,
+            terrain_law_point.terrain_point_rows_finish,
             dim=blocks + extra,
             inputs=[begin, 0, *args, out, scratch],
             block_dim=block,
@@ -1713,8 +1715,9 @@ class TestTerrainLawPoint(unittest.TestCase):
         self.assertEqual(ptx.count("fma.rn"), 0)
         self.assertGreater(ptx.count("mul.rn.f32"), 100)
 
-    def test_full_finish_keeps_its_candidates_off_the_stack_cpu(self):
-        """Keep the full-finish kernel's per-thread local frame under 512 bytes (its PTX local depot, sm_86, NVRTC).
+    def test_deferred_finish_keeps_its_candidates_off_the_stack_cpu(self):
+        """Keep the finish of deferred pairs' per-thread local frame under 512 bytes (its PTX local depot, sm_86,
+        NVRTC).
 
         The driver reserves local memory for the largest stack a context launches, for every thread the device can
         hold (about 289,000 on a 188-SM GPU), launched or not. The kernel's candidates and the finish's state live in
@@ -1731,9 +1734,9 @@ class TestTerrainLawPoint(unittest.TestCase):
             body = ptx[entry.end() : ptx.find("\n}\n", entry.end())]
             depot = re.search(r"__local_depot\d+\[(\d+)\]", body)
             depots[entry.group(1)] = int(depot.group(1)) if depot else 0
-        full = [size for name, size in depots.items() if name.startswith("terrain_point_rows_full_")]
-        self.assertEqual(len(full), 1, msg=depots)
-        self.assertLess(full[0], 512, msg=depots)
+        finish = [size for name, size in depots.items() if name.startswith("terrain_point_rows_finish_")]
+        self.assertEqual(len(finish), 1, msg=depots)
+        self.assertLess(finish[0], 512, msg=depots)
 
 
 devices = get_test_devices()

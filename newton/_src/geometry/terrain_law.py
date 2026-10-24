@@ -8,10 +8,10 @@ core-to-surface distance within the writer's reach, plus the corners of flat sup
 surface feature (a plane cluster, a crease edge or a vertex). This module holds what every per-type kernel shares:
 the surface predicates, the per-pair window (:func:`terrain_box_cells`, :func:`terrain_tile_exit`,
 :func:`terrain_window_extent`), a window's cache of cluster planes (:class:`TerrainPlanes`), the finish
-(:func:`terrain_finish_slots`, :func:`terrain_finish_list`), the per-pair inputs and side buffer of the shadow route
-(:class:`TerrainPairInputs`, :class:`TerrainLawRows`), the launch arguments of its fixed grids
-(:class:`TerrainPairWork`, :class:`TerrainFinishScratch`) and the per-pair output protocol (:func:`terrain_pair_exit`,
-:func:`terrain_spill_rows`, :func:`terrain_hold_row`, :func:`terrain_hold_candidate`,
+(:func:`terrain_finish_slots`, :func:`terrain_finish_list`, :func:`terrain_finish_deferred`), the per-pair inputs and
+side buffer of the shadow route (:class:`TerrainPairInputs`, :class:`TerrainLawRows`), the launch arguments of its fixed
+grids (:class:`TerrainPairWork`, :class:`TerrainFinishScratch`) and the per-pair output protocol
+(:func:`terrain_pair_exit`, :func:`terrain_spill_rows`, :func:`terrain_hold_row`, :func:`terrain_hold_candidate`,
 :func:`terrain_plane_group_of_three`, :func:`terrain_defer_pair`, :func:`terrain_store_row`). The static
 data live in :mod:`terrain_contacts`, the per-type kernels in modules of their own (``terrain_law_<type>``), and
 :mod:`terrain_shadow` runs them after the narrow phase and writes their rows as the contacts of the pairs the narrow
@@ -50,14 +50,14 @@ The per-pair finish merges coincident rows, drops the rows the others of their p
 hull of tangent position and distance, residual ``1e-6 m``) and keeps at most four rows per plane group (deepest,
 farthest, largest triangle, largest quadrilateral): every row it keeps is a support, and no count bounds them. It
 runs in place, on a walking pair's own slots (:func:`terrain_finish_slots`, up to :data:`TERRAIN_FINISH_MASK_ROWS`
-rows; :func:`terrain_finish_slots_lanes` with a block's lanes splitting the implied-row tests), or on a full-finish
-block's scratch (:func:`terrain_finish_list`, every distinct candidate a pair's window can give,
-:class:`TerrainFinishScratch`); all three keep the same rows, bit for bit. A pair's rows live in its walk slots, or
-when they are more, in a spill region sized at the scene level (:class:`TerrainLawRows`). A spill region too small
-for a collide's rows, or a window larger than the one its pair's shape data gave at construction, sets a sticky bit
-of the narrow phase's buffer status word, which ``verify_narrow_phase_buffers`` keeps and
-``NarrowPhase.check_buffer_capacity`` raises on (``terrain_rows``; stale features: ``terrain_stale``; a solid class's
-job lists without room for a pair's work: ``terrain_jobs``).
+rows, one thread), or for a deferred pair on its candidates in a block's scratch (:func:`terrain_finish_list`, every
+distinct candidate a pair's window can give, :class:`TerrainFinishScratch`; a block's lanes splitting the implied-row
+tests); both keep the same rows, bit for bit. A pair's rows live in its walk slots, or when they are more, in a spill
+region sized at the scene level (:class:`TerrainLawRows`). A spill region too small for a collide's rows, or a window
+larger than the one its pair's shape data gave at construction, sets a sticky bit of the narrow phase's buffer status
+word, which ``verify_narrow_phase_buffers`` keeps and ``NarrowPhase.check_buffer_capacity`` raises on
+(``terrain_rows``; stale features: ``terrain_stale``; a solid class's job lists without room for a pair's work:
+``terrain_jobs``).
 """
 
 from __future__ import annotations
@@ -103,7 +103,7 @@ TERRAIN_GROUP_ROWS = 4
 """Rows kept per plane group."""
 TERRAIN_FINISH_MASK_ROWS = 24
 """Rows the in-place finish of a walking pair (:func:`terrain_finish_slots`) takes: the length of its arrays, which every
-call zero-fills, so the largest class's walk slots (a hull's 24); the full-finish kernels finish any number
+call zero-fills, so the largest class's walk slots (a hull's 24); a deferred pair's finish takes any number
 (:func:`terrain_finish_list`)."""
 TERRAIN_TILE_CELLS = 8
 """Cells per side of a tile of the tile-max mip."""
@@ -161,8 +161,9 @@ TERRAIN_FEATURE_BITS = 19
 """Bits of a feature id: ``r mod 64`` (6), ``c mod 64`` (6), kind (2), sub-feature (2), point slot (3)."""
 
 TERRAIN_FINISH_CANDIDATE_OVERFLOW = wp.constant(1)
-"""Report flag: the pair's window gave more distinct candidates than its full-finish scratch holds, which only a window
-larger than its pair's shape data gave at construction can (the shape's scale, margin or gap changed since)."""
+"""Report flag: the pair's window gave more distinct candidates than its scratch holds (:class:`TerrainFinishScratch`),
+which only a window larger than its pair's shape data gave at construction can (the shape's scale, margin or gap
+changed since)."""
 TERRAIN_FINISH_ROW_OVERFLOW = wp.constant(2)
 """Report flag: the spill region had no room left for the pair's rows (:attr:`TerrainLawRows.capacity`)."""
 TERRAIN_STATUS_ROWS = wp.constant(1 << 13)
@@ -173,8 +174,8 @@ TERRAIN_STATUS_STALE = wp.constant(1 << 14)
 were read."""
 TERRAIN_STATUS_JOBS = wp.constant(1 << 15)
 """Sticky bit of the narrow phase's buffer status word (``terrain_jobs``): a solid class's job lists or candidate pool
-(scene-level buffers) had no room for some of a pair's work, so that its full-finish kernel took the pair (its rows
-unchanged, at a slower path's cost)."""
+(scene-level buffers) had no room for some of a pair's work, which took the lists' reserve (its rows unchanged) or,
+past the reserve, was lost (the pair keeps no row, :data:`TERRAIN_PAIR_INCOMPLETE`)."""
 
 TERRAIN_PAIR_TILE_EXIT = wp.constant(1)
 """Pair state: the core lies above every tile-max block under its window by more than its reach (no row)."""
@@ -188,24 +189,27 @@ TERRAIN_PAIR_ROW_OVERFLOW = wp.constant(16)
 """Pair state: the pair's rows exceed its walk slots and the spill region had no room for them (no row;
 ``terrain_rows`` is raised)."""
 TERRAIN_PAIR_CANDIDATE_OVERFLOW = wp.constant(32)
-"""Pair state: the pair's window gave more distinct candidates than its full-finish scratch holds (it keeps the first
-in window order; ``terrain_rows`` is raised): its shape data changed after the shadow was built."""
+"""Pair state: the pair's window gave more distinct candidates than its scratch holds (it keeps the first in window
+order; ``terrain_rows`` is raised): its shape data changed after the shadow was built."""
 TERRAIN_PAIR_WIDE = wp.constant(64)
 """Pair state: the window spans 64 cells or more, so feature ids may repeat within it (rows are still emitted)."""
-TERRAIN_PAIR_FULL = wp.constant(128)
-"""Pair state, transient: the finish may drop some of the pair's distinct rows, and the pair awaits its type's full
-finish kernel."""
+TERRAIN_PAIR_DEFERRED = wp.constant(128)
+"""Pair state, transient: the pair's rows need more than its walk slots (or, for the point class, the general finish),
+and it awaits its class's finish of deferred pairs (:func:`terrain_defer_pair`)."""
 TERRAIN_PAIR_UNSUPPORTED = wp.constant(256)
 """Pair state: the partner's shape has no core in the law yet (a barrel cylinder in the hull class; no row)."""
 TERRAIN_PAIR_JOBS = wp.constant(1024)
 """Pair state, transient: a solid pair's scan listed its window's features for its class's job kernels, and its close
 kernel takes their rows."""
 TERRAIN_PAIR_INCOMPLETE = wp.constant(2048)
-"""Pair state, transient: a job list or the candidate pool of a solid pair's class had no room for some of its work, so
-its close kernel leaves it to the class's full-finish kernel, which walks it again."""
+"""Pair state: a job list or the candidate pool of a solid pair's class had no room for some of its work, its reserve
+included, so that the pair keeps no row (``terrain_jobs`` is raised)."""
 TERRAIN_PAIR_HELD = wp.constant(4096)
 """Pair state, transient: a solid pair holds its rows in its walk slots (window frame, ``count`` of them) for its
-class's finish kernel."""
+class's small-pair finish kernel."""
+TERRAIN_PAIR_RESERVE = wp.constant(8192)
+"""Pair state, transient: some of a solid pair's work found no room in its class's job lists or candidate pool and took
+their reserve: its rows are unchanged, and its close counts it and raises ``terrain_jobs``."""
 TERRAIN_WINDOW_WIDE = 64
 """Cells across a window from which feature ids are no longer unique."""
 TERRAIN_PLANE_CACHE = 4
@@ -377,9 +381,9 @@ class TerrainPlanes:
 class TerrainPairInputs:
     """What the law's per-type kernels read of a pair besides the terrain: its shapes and the pipeline's pair policy.
 
-    Every per-type kernel takes ``(begin, slot_begin, inputs, data, out)`` and a launch argument (its class's
-    :class:`TerrainPairWork` for the one-thread and tiled kernels, a :class:`TerrainFinishScratch` for the full-finish
-    kernel), a solid class's kernel also the solid classes'
+    Every per-type kernel takes ``(begin, slot_begin, inputs, data, out)`` and a launch argument (the point class's
+    walks its :class:`TerrainPairWork`, a solid class's kernels its jobs, every class's finish of deferred pairs its
+    :class:`TerrainFinishScratch`), a solid class's kernel also the solid classes'
     :class:`~newton._src.geometry.terrain_law_solid.TerrainSolidData` (see
     :data:`~newton._src.geometry.terrain_shadow.TERRAIN_LAW_KERNELS`): pair ``begin + i`` of the static pair table
     (:class:`~newton._src.geometry.terrain_contacts.TerrainPairTable`) walks its window in its walk slots
@@ -413,13 +417,13 @@ class TerrainLawRows:
     per pair its first row, row count and state.
 
     A pair's rows are rows ``first`` to ``first + count``: read them per pair, through ``first`` and ``count``. A pair
-    that walks its window holds its distinct rows in its walk slots (window frame), and when they are its rows, they
-    are rewritten at the front in the world frame. A pair with more rows than its walk slots is finished by its class's
-    full-finish kernel, which writes all of them to rows of the spill region it reserves (:func:`terrain_spill_rows`):
-    its rows are bounded by its window, not by its slots. Reservations take spill rows in the order the pairs reach
-    them (the launch's order, which varies between runs on a GPU), so a pair's rows depend on the pair alone, their
-    place in the spill region does not. A pair that finds no room keeps its finish's first rows by priority in its walk
-    slots and is flagged (:func:`terrain_finish_overflow`).
+    that walks its window holds its distinct rows in its walk slots (window frame), and when they are its rows, they are
+    rewritten at the front in the world frame. A pair with more rows than its walk slots is deferred to its class's
+    finish of deferred pairs, which writes all of them to rows of the spill region it reserves
+    (:func:`terrain_spill_rows`): its rows are bounded by its window, not by its slots. Reservations take spill rows in
+    the order the pairs reach them (the launch's order, which varies between runs on a GPU), so a pair's rows depend on
+    the pair alone, their place in the spill region does not. A pair that finds no room keeps its finish's first rows by
+    priority in its walk slots and is flagged (:func:`terrain_finish_overflow`).
 
     Rows are in the world frame: ``q`` on the terrain, ``n`` the unit normal from the terrain to the partner and
     ``d = n . (k - q)`` the core distance, so that the partner's core point is ``q + d n``.
@@ -452,12 +456,12 @@ class TerrainLawRows:
     status: wp.array[wp.int32]
     """The narrow phase's sticky buffer status word (``terrain_rows``, ``terrain_stale``, ``terrain_jobs``)."""
     overflow: wp.array[wp.int32]
-    """Pairs whose rows found no room in the spill region (``[0]``), whose windows outgrew their full-finish scratch
-    (``[1]``) and whose work found no room in their solid class's job lists or candidate pool (``[2]``), accumulated
-    over collides."""
+    """Pairs whose rows found no room in the spill region (``[0]``), whose windows outgrew their scratch (``[1]``) and
+    whose work found no room in their solid class's job lists or candidate pool (``[2]``: those that took the lists'
+    reserve and those that lost work), accumulated over collides."""
     deferred: wp.array[wp.int32]
-    """Pairs a type's walks left to its full-finish kernel (:data:`TERRAIN_PAIR_FULL`): partner class ``c``'s list
-    starts at ``deferred_first[c]`` and holds ``deferred_count[c]`` pairs, appended in any order."""
+    """Pairs a class's walks left to its finish of deferred pairs (:data:`TERRAIN_PAIR_DEFERRED`): partner class
+    ``c``'s list starts at ``deferred_first[c]`` and holds ``deferred_count[c]`` pairs, appended in any order."""
     deferred_first: wp.array[wp.int32]
     """Per partner class: the start of its deferred list (its first pair in the table)."""
     deferred_count: wp.array[wp.int32]
@@ -465,7 +469,7 @@ class TerrainLawRows:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# launches of the per-type kernels: block size, the tiled kernels' work list, the full-finish kernels' scratch
+# launches of the per-type kernels: block size, the tiled kernels' work list, the deferred pairs' scratch
 # ----------------------------------------------------------------------------------------------------------------
 
 TERRAIN_LAW_BLOCK = 32
@@ -474,9 +478,9 @@ one-thread kernel's block (several blocks per SM, so that its warps spread evenl
 TERRAIN_LAW_TILE_BLOCKS = 2048
 """Blocks of a tiled launch at most, whatever the class's size: one per queued pair up to this many (about one
 resident wave of one-warp blocks on a 188-SM GPU), more queued pairs taking turns."""
-TERRAIN_LAW_FULL_BLOCKS = 64
-"""Blocks of a full-finish launch (:data:`TERRAIN_LAW_BLOCK` lanes each), whatever the class's size: they take the
-class's deferred pairs in turn."""
+TERRAIN_LAW_DEFERRED_BLOCKS = 64
+"""Blocks of a class's finish of deferred pairs (:data:`TERRAIN_LAW_BLOCK` lanes each), whatever the class's size: they
+take the class's deferred pairs in turn."""
 
 
 @wp.struct
@@ -518,19 +522,20 @@ def terrain_law_block_dim(device) -> int:
     return TERRAIN_LAW_BLOCK if wp.get_device(device).is_cuda else 1
 
 
-TERRAIN_LAW_FULL_SCRATCH_BYTES = 1 << 24
-"""Bytes of a class's full-finish scratch up to which its launch takes :data:`TERRAIN_LAW_FULL_BLOCKS` blocks: a class
-whose windows can give more candidates finishes its deferred pairs on fewer blocks (at least one), so that its scratch
-stays near this size (:func:`terrain_finish_blocks`). A rare path's parallelism, not a bound on any pair."""
+TERRAIN_LAW_SCRATCH_BYTES = 1 << 24
+"""Bytes of a class's scratch up to which its finish of deferred pairs takes :data:`TERRAIN_LAW_DEFERRED_BLOCKS`
+blocks: a class whose windows can give more candidates finishes its deferred pairs on fewer blocks (at least one), so
+that its scratch stays near this size (:func:`terrain_finish_blocks`). A rare path's parallelism, not a bound on any
+pair."""
 TERRAIN_FINISH_ROW_BYTES = 60
-"""Bytes of one candidate in a full-finish scratch: terrain point, core point, normal, distance, feature id and the
-finish's four words of state."""
+"""Bytes of one candidate in a scratch: terrain point, core point, normal, distance, feature id and the finish's four
+words of state."""
 
 
 @wp.struct
 class TerrainFinishScratch:
-    """Global scratch of a full-finish launch: per block, the distinct candidates of the pair it finishes and the
-    finish's state of each.
+    """Global scratch of a class's finish of deferred pairs: per block, the distinct candidates of the pair it finishes
+    and the finish's state of each.
 
     Block ``b`` holds candidate ``j`` at ``b * capacity + j``, off the per-thread stack: the largest stack a context
     launches sets the driver's local-memory reservation for every thread the device can hold. ``capacity`` bounds the
@@ -565,15 +570,16 @@ class TerrainFinishScratch:
 
 
 def terrain_finish_blocks(capacity: int) -> int:
-    """Return the blocks of a full-finish launch whose blocks hold ``capacity`` candidates each:
-    :data:`TERRAIN_LAW_FULL_BLOCKS`, fewer (at least one) when that scratch would exceed
-    :data:`TERRAIN_LAW_FULL_SCRATCH_BYTES`."""
+    """Return the blocks of a finish of deferred pairs whose blocks hold ``capacity`` candidates each:
+    :data:`TERRAIN_LAW_DEFERRED_BLOCKS`, fewer (at least one) when that scratch would exceed
+    :data:`TERRAIN_LAW_SCRATCH_BYTES`."""
     per_block = max(int(capacity), 1) * TERRAIN_FINISH_ROW_BYTES
-    return max(1, min(TERRAIN_LAW_FULL_BLOCKS, TERRAIN_LAW_FULL_SCRATCH_BYTES // per_block))
+    return max(1, min(TERRAIN_LAW_DEFERRED_BLOCKS, TERRAIN_LAW_SCRATCH_BYTES // per_block))
 
 
 def terrain_finish_scratch(device, capacity: int, *, blocks: int | None = None) -> TerrainFinishScratch:
-    """Allocate the :class:`TerrainFinishScratch` of a full-finish launch whose blocks hold ``capacity`` candidates.
+    """Allocate the :class:`TerrainFinishScratch` of a finish of deferred pairs whose blocks hold ``capacity``
+    candidates.
 
     Args:
         device: The device.
@@ -1502,7 +1508,7 @@ def terrain_report(status: wp.array[wp.int32], overflow: wp.array[wp.int32], fla
     """Record a pair's report flags and staleness in the narrow phase's sticky status word and counters.
 
     ``overflow[0]`` counts pairs whose rows found no room in the spill region, ``overflow[1]`` pairs whose candidates
-    outgrew their full-finish scratch.
+    outgrew their scratch.
     """
     if (flags & TERRAIN_FINISH_ROW_OVERFLOW) != 0:
         wp.atomic_or(status, 0, TERRAIN_STATUS_ROWS)
@@ -1574,24 +1580,19 @@ def _staged_implied(
     live: int,
     skip: int,
     eps: float,
-    lane: int,
-    lanes: int,
 ) -> bool:
-    """Whether the other live members of a plane group imply member ``skip`` at its tangent position, from this lane's
-    share of the tests: whether the lowest convex interpolation of their distances there (members within ``4 eps`` of
-    the position coincide with it; a position on a segment or in a triangle of members interpolates their distances)
-    reaches its distance within :data:`TERRAIN_IMPLIED_RESIDUAL`. The group's ``members`` are staged in member order
-    (row order): tangent positions ``(px, py)`` of their core points and distances ``pd``, live where ``live`` has
-    their bit.
+    """Whether the other live members of a plane group imply member ``skip`` at its tangent position: whether the
+    lowest convex interpolation of their distances there (members within ``4 eps`` of the position coincide with it; a
+    position on a segment or in a triangle of members interpolates their distances) reaches its distance within
+    :data:`TERRAIN_IMPLIED_RESIDUAL`. The group's ``members`` are staged in member order (row order): tangent positions
+    ``(px, py)`` of their core points and distances ``pd``, live where ``live`` has their bit.
 
     The tests are the points and segments of the other live members, each segment with its triangles (a third member
-    after it); lane ``lane`` of ``lanes`` takes every ``lanes``-th of them in that order, so that the lanes' answers
-    ORed are the answer of one lane taking all. A lane stops at the first interpolation that reaches the distance: the
-    lowest one does exactly when one does (a rounded subtraction keeps order)."""
+    after it). The test stops at the first interpolation that reaches the distance: the lowest one does exactly when
+    one does (a rounded subtraction keeps order)."""
     point = wp.vec2(px[skip], py[skip])
     limit = pd[skip]
     tolerance = _MERGE_SCALE * eps
-    test = int(0)
     for a in range(members):
         if a == skip or ((live >> a) & 1) == 0:
             continue
@@ -1600,10 +1601,6 @@ def _staged_implied(
         # test (a, a): the point alone; tests (a, b): the segment and its triangles
         for b in range(a, members):
             if b != a and (b == skip or ((live >> b) & 1) == 0):
-                continue
-            mine = test % lanes == lane
-            test += 1
-            if not mine:
                 continue
             if b == a:
                 if wp.length(point - pa) <= tolerance:
@@ -1648,8 +1645,6 @@ def terrain_finish_slots(
     base: int,
     count: int,
     eps: float,
-    lane: int,
-    lanes: int,
     distinct: bool,
 ) -> tuple[int, int]:
     """The law's finish of a walking pair's held rows in place: ``count`` rows (at most
@@ -1664,11 +1659,6 @@ def terrain_finish_slots(
 
     ``distinct`` rows have no coincident pair to merge (rows held with :func:`terrain_hold_row` at ``eps``: it drops a
     row coinciding with a held one by the same test), so the first step is skipped.
-
-    ``lanes`` threads may run it together on one pair (lane ``lane``, ``lanes`` the block's size; one thread passes
-    ``0, 1``): every lane runs every step and returns the same values, but the implied-row test of a row (up to every
-    triangle of its group's members) is split among the lanes and their answers ORed across the block
-    (:func:`_staged_implied`). With ``lanes > 1`` every lane of the block must call it with the same rows.
 
     Returns ``(keep, kept)``: bit ``i`` of ``keep`` marks row ``i`` kept (kept rows in row order), and their count.
     """
@@ -1735,10 +1725,7 @@ def terrain_finish_slots(
             if pick < 0:
                 break
             tested = tested | (1 << pick)
-            implied = _staged_implied(px, py, pd, members, live, pick, eps, lane, lanes)
-            if lanes > 1:
-                # every lane holds the same group: OR their shares across the block
-                implied = wp.tile_extract(wp.tile_max(wp.tile(int(implied))), 0) != 0
+            implied = _staged_implied(px, py, pd, members, live, pick, eps)
             if implied:
                 live = live & ~(1 << pick)
                 alive = alive & ~(1 << rank[pick])
@@ -1850,21 +1837,34 @@ def _list_implied(
     e2: wp.vec3,
     point: wp.vec2,
     eps: float,
+    lane: int,
+    lanes: int,
 ) -> bool:
-    """:func:`_slot_implied` over a full-finish block's candidates (their core points read, not rebuilt)."""
+    """:func:`_staged_implied` over a scratch's candidates (their core points read, not rebuilt), from this lane's share
+    of the tests: the points and segments of the other live members of plane group ``g``, each segment with its
+    triangles; lane ``lane`` of ``lanes`` takes every ``lanes``-th of them in that order, so that the lanes' answers
+    ORed are the answer of one lane taking all."""
     limit = scratch.d[base + skip]
     tolerance = _MERGE_SCALE * eps
+    test = int(0)
     for a in range(count):
         if a == skip or not _list_member(scratch, base + a, g):
             continue
         ka = scratch.k[base + a]
         pa = wp.vec2(wp.dot(ka, e1), wp.dot(ka, e2))
         da = scratch.d[base + a]
-        if wp.length(point - pa) <= tolerance:
-            if limit >= da - _IMPLIED_RESIDUAL:
-                return True
+        mine = test % lanes == lane
+        test += 1
+        if mine:
+            if wp.length(point - pa) <= tolerance:
+                if limit >= da - _IMPLIED_RESIDUAL:
+                    return True
         for b in range(a + 1, count):
             if b == skip or not _list_member(scratch, base + b, g):
+                continue
+            mine = test % lanes == lane
+            test += 1
+            if not mine:
                 continue
             kb = scratch.k[base + b]
             pb = wp.vec2(wp.dot(kb, e1), wp.dot(kb, e2))
@@ -1899,16 +1899,16 @@ def _list_implied(
 
 
 @wp.func
-def terrain_finish_list(scratch: TerrainFinishScratch, base: int, count: int, eps: float) -> int:
-    """The law's finish (:func:`terrain_finish_slots`) of ``count`` candidates at ``[base, base + count)`` of a
-    full-finish scratch, any number of them, with their core points from ``scratch.k``.
+def _lanes_max(value: int) -> int:
+    """The largest ``value`` of a block's lanes: a reduction across the block, which also orders every lane's memory
+    accesses before it before every lane's after it (a block barrier)."""
+    return wp.tile_extract(wp.tile_max(wp.tile(value)), 0)
 
-    The finish's state lives in the scratch (``alive``, ``group``, ``rank``, ``mark``), not on the stack, so that it
-    holds as many candidates as the scratch does: on the rows :func:`terrain_finish_slots` takes, with core points
-    ``q + d n``, it keeps the same rows, bit for bit (the same steps, ties and float32 operations).
 
-    Returns the kept candidates' count; ``scratch.mark`` is 1 at the kept ones (kept rows in candidate order).
-    """
+@wp.func
+def _list_groups(scratch: TerrainFinishScratch, base: int, count: int, eps: float):
+    """Steps 1 and 2 of :func:`terrain_finish_list`: coincident rows merged (the first in feature order stays), and the
+    first row of a plane representing its plane group."""
     # 1. coincident rows: the first in feature order stays
     for i in range(count):
         qi = scratch.q[base + i]
@@ -1934,31 +1934,12 @@ def terrain_finish_list(scratch: TerrainFinishScratch, base: int, count: int, ep
                 if terrain_rows_same_plane(qi, ni, scratch.q[base + j], scratch.n[base + j], eps):
                     scratch.group[base + i] = j
                     break
-    # 3. implied rows, the shallowest first, one at a time, in one pass (see terrain_finish_slots)
-    for g in range(count):
-        if scratch.alive[base + g] == 0 or scratch.group[base + g] != g:
-            continue
-        e1, e2 = _tangent_frame(scratch.n[base + g])
-        size = int(0)
-        for i in range(count):
-            if _list_member(scratch, base + i, g):
-                size += 1
-        for i in range(count):
-            scratch.mark[base + i] = 0
-        while size >= 3:
-            pick = int(-1)
-            for i in range(count):
-                if _list_member(scratch, base + i, g) and scratch.mark[base + i] == 0:
-                    if pick < 0 or scratch.d[base + i] > scratch.d[base + pick]:
-                        pick = i
-            if pick < 0:
-                break
-            scratch.mark[base + pick] = 1
-            kj = scratch.k[base + pick]
-            if _list_implied(scratch, base, count, g, pick, e1, e2, wp.vec2(wp.dot(kj, e1), wp.dot(kj, e2)), eps):
-                scratch.alive[base + pick] = 0
-                size -= 1
-    # 4. at most four rows per group: deepest, farthest, largest triangle, largest quadrilateral
+
+
+@wp.func
+def _list_keep(scratch: TerrainFinishScratch, base: int, count: int) -> int:
+    """Step 4 of :func:`terrain_finish_list`: at most four rows per plane group (deepest, farthest, largest triangle,
+    largest quadrilateral), the kept ones marked (``scratch.mark`` 1); returns their count."""
     for i in range(count):
         scratch.rank[base + i] = 4
     for g in range(count):
@@ -2054,6 +2035,71 @@ def terrain_finish_list(scratch: TerrainFinishScratch, base: int, count: int, ep
     return kept
 
 
+@wp.func
+def terrain_finish_list(scratch: TerrainFinishScratch, base: int, count: int, eps: float, lane: int, lanes: int) -> int:
+    """The law's finish (:func:`terrain_finish_slots`) of ``count`` candidates at ``[base, base + count)`` of a
+    scratch, any number of them, with their core points from ``scratch.k``, by a block's ``lanes`` lanes (lane
+    ``lane``; one thread passes ``0, 1``).
+
+    The finish's state lives in the scratch (``alive``, ``group``, ``rank``, ``mark``), not on the stack, so that it
+    holds as many candidates as the scratch does: on the rows :func:`terrain_finish_slots` takes, with core points
+    ``q + d n``, it keeps the same rows, bit for bit (the same steps, ties and float32 operations). The first lane runs
+    every step and writes the state; the implied-row test of a row (every point, segment and triangle of its group's
+    other live members) is split among the lanes and their answers ORed across the block (:func:`_list_implied`), so
+    that any number of lanes keeps the rows one lane keeps. With ``lanes > 1`` every lane of the block must call it with
+    the same candidates.
+
+    Returns the kept candidates' count (every lane); ``scratch.mark`` is 1 at the kept ones (kept rows in candidate
+    order).
+    """
+    if lane == 0:
+        _list_groups(scratch, base, count, eps)
+    if lanes > 1:
+        # every lane reads the groups the first lane wrote
+        _lanes_max(0)
+    # 3. implied rows, the shallowest first, one at a time, in one pass (see terrain_finish_slots); every lane walks the
+    # same groups and picks, the first lane picking and writing the state
+    for g in range(count):
+        if scratch.alive[base + g] == 0 or scratch.group[base + g] != g:
+            continue
+        e1, e2 = _tangent_frame(scratch.n[base + g])
+        size = int(0)
+        for i in range(count):
+            if _list_member(scratch, base + i, g):
+                size += 1
+        if lane == 0:
+            for i in range(count):
+                scratch.mark[base + i] = 0
+        while size >= 3:
+            pick = int(-1)
+            if lane == 0:
+                for i in range(count):
+                    if _list_member(scratch, base + i, g) and scratch.mark[base + i] == 0:
+                        if pick < 0 or scratch.d[base + i] > scratch.d[base + pick]:
+                            pick = i
+            if lanes > 1:
+                pick = _lanes_max(pick)
+            if pick < 0:
+                break
+            kj = scratch.k[base + pick]
+            point = wp.vec2(wp.dot(kj, e1), wp.dot(kj, e2))
+            implied = _list_implied(scratch, base, count, g, pick, e1, e2, point, eps, lane, lanes)
+            if lanes > 1:
+                implied = _lanes_max(int(implied)) != 0
+            if lane == 0:
+                scratch.mark[base + pick] = 1
+                if implied:
+                    scratch.alive[base + pick] = 0
+            if implied:
+                size -= 1
+    kept = int(0)
+    if lane == 0:
+        kept = _list_keep(scratch, base, count)
+    if lanes > 1:
+        kept = _lanes_max(kept)
+    return kept
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # per-pair output: the protocol every per-type kernel follows (see terrain_shadow.TERRAIN_LAW_KERNELS)
 # ----------------------------------------------------------------------------------------------------------------
@@ -2097,7 +2143,7 @@ def terrain_spill_rows(out: TerrainLawRows, rows: int) -> int:
 
 @wp.func
 def terrain_finish_overflow(scratch: TerrainFinishScratch, base: int, count: int, limit: int) -> int:
-    """Keep at most ``limit`` of a full finish's kept candidates (``scratch.mark`` 1 at the kept ones, on return at
+    """Keep at most ``limit`` of a scratch finish's kept candidates (``scratch.mark`` 1 at the kept ones, on return at
     the ones still kept), when the spill region has no room for them all: each plane group's deepest row first
     (rank 0), then each group's farthest, largest-triangle and largest-quadrilateral rows (ranks 1 to 3), the deepest
     first within a rank, ties to the earlier candidate. Returns the count kept."""
@@ -2133,8 +2179,8 @@ def terrain_hold_candidate(
     feature: int,
     eps: float,
 ) -> int:
-    """Add a candidate (window frame) to the distinct ones a full-finish block holds from ``base``, as the finish
-    merges (:func:`terrain_hold_row`, with its core point ``k``): past the block's capacity a distinct candidate is only
+    """Add a candidate (window frame) to the distinct ones a scratch block holds from ``base``, as the finish merges
+    (:func:`terrain_hold_row`, with its core point ``k``): past the block's capacity a distinct candidate is only
     counted. Returns the new number of distinct candidates."""
     for h in range(wp.min(held, scratch.capacity)):
         if terrain_rows_coincide(scratch.q[base + h], scratch.n[base + h], q, n, eps):
@@ -2212,11 +2258,72 @@ def terrain_plane_group_of_three(out: TerrainLawRows, slot: int, held: int, eps:
 
 @wp.func
 def terrain_defer_pair(out: TerrainLawRows, partner_class: int, pair: int, state: int):
-    """Leave a pair to its partner class's full-finish kernel: no row yet, :data:`TERRAIN_PAIR_FULL` added to
+    """Leave a pair to its partner class's finish of deferred pairs: no row yet, :data:`TERRAIN_PAIR_DEFERRED` added to
     ``state``, and the pair appended to the class's deferred list (in any order; a pair's rows depend on it alone)."""
     out.count[pair] = 0
-    out.state[pair] = state | TERRAIN_PAIR_FULL
+    out.state[pair] = state | TERRAIN_PAIR_DEFERRED
     out.deferred[out.deferred_first[partner_class] + wp.atomic_add(out.deferred_count, partner_class, 1)] = pair
+
+
+@wp.func
+def terrain_finish_deferred(
+    scratch: TerrainFinishScratch,
+    base: int,
+    held: int,
+    eps: float,
+    out: TerrainLawRows,
+    pair: int,
+    slot: int,
+    walk_slots: int,
+    state: int,
+    window: TerrainWindow,
+    frame: wp.transform,
+    lane: int,
+    lanes: int,
+):
+    """Finish a deferred pair's ``held`` distinct candidates in a block's scratch from ``base`` (window frame, their
+    core points in ``scratch.k``) with the block's ``lanes`` lanes (lane ``lane``; one thread passes ``0, 1``;
+    :func:`terrain_finish_list`) and write every row it keeps in the world frame: in the pair's ``walk_slots`` walk
+    slots from ``slot`` when they fit, else in rows of the spill region it reserves (:func:`terrain_spill_rows`), or,
+    when that has no room left, the first of them by priority in its walk slots (flagged
+    :data:`TERRAIN_PAIR_ROW_OVERFLOW`); its state ``state`` with the report's bits. The scratch holds every candidate a
+    window of the class can give; a pair with more has a window its shape data no longer bounds (changed since
+    construction): it keeps the first ``scratch.capacity`` in window order and is flagged. Every lane of the block must
+    call it with the same pair."""
+    flags = int(0)
+    count = held
+    if held > scratch.capacity:
+        flags = TERRAIN_FINISH_CANDIDATE_OVERFLOW
+        count = scratch.capacity
+    kept = terrain_finish_list(scratch, base, count, eps, lane, lanes)
+    if lane != 0:
+        return
+    if kept > walk_slots:
+        first = terrain_spill_rows(out, kept)
+        if first >= 0:
+            slot = first
+        else:
+            # no room left: the finish's first rows by priority, in the pair's own walk slots
+            kept = terrain_finish_overflow(scratch, base, count, walk_slots)
+            flags = flags | TERRAIN_FINISH_ROW_OVERFLOW
+    written = int(0)
+    for i in range(count):
+        if scratch.mark[base + i] != 0:
+            terrain_store_row(
+                out,
+                slot + written,
+                scratch.q[base + i],
+                scratch.n[base + i],
+                scratch.d[base + i],
+                scratch.feature[base + i],
+                window,
+                frame,
+            )
+            written += 1
+    out.first[pair] = slot
+    out.count[pair] = kept
+    out.state[pair] = state | terrain_finish_state(flags)
+    terrain_report(out.status, out.overflow, flags, True)
 
 
 @wp.func

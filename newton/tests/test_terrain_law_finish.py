@@ -4,7 +4,7 @@
 """Check the terrain law's shared per-pair finish and its output layout (feature ids, overflow flags).
 
 The finish keeps every row the law selects: no count bounds a pair's rows, and it takes any number of candidates
-(:func:`~newton._src.geometry.terrain_law.terrain_finish_list`, its state in a full-finish scratch).
+(:func:`~newton._src.geometry.terrain_law.terrain_finish_list`, its state in a scratch).
 """
 
 import unittest
@@ -57,7 +57,7 @@ def _finish(
         scratch.n[base + j] = n[i, j]
         scratch.d[base + j] = d[i, j]
         scratch.feature[base + j] = j
-    kept[i] = terrain_finish_list(scratch, base, counts[i], eps)
+    kept[i] = terrain_finish_list(scratch, base, counts[i], eps, 0, 1)
     written = int(0)
     for j in range(counts[i]):
         if scratch.mark[base + j] != 0:

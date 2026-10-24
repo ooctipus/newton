@@ -325,9 +325,9 @@ NEWTON_FLAGS = declare(
         "policy",
         _COLLIDE,
         "A positive factor on the terrain law's solid-class job lists and candidate pools, scene-level buffers sized "
-        "from its pairs' own bounds (default 1); a pair whose work finds no room takes the slower full-finish kernel "
-        "(its rows unchanged) and raises the narrow phase's terrain_jobs status. Read whenever the terrain law runs "
-        "(by default with heightfield pairs, or in shadow).",
+        "from its pairs' own bounds (default 1); work past their room takes their fixed reserve (its pair's rows "
+        "unchanged) and raises the narrow phase's terrain_jobs status, and a pair whose work finds no room there "
+        "either keeps no row. Read whenever the terrain law runs (by default with heightfield pairs, or in shadow).",
     ),
     EnvironmentFlag(
         "NEWTON_TERRAIN_LAW_RULE_X",

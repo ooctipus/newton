@@ -216,7 +216,7 @@ def _point_rows_kernel(
                             scratch, base, count, v, k, n, d, terrain_feature_id(r, c, TERRAIN_FEATURE_VERTEX, 0, 0)
                         )
     count = wp.min(count, scratch.capacity)
-    kept = terrain_finish_list(scratch, base, count, eps)
+    kept = terrain_finish_list(scratch, base, count, eps, 0, 1)
     out_count[i] = kept
     j = int(0)
     for row in range(count):

@@ -44,7 +44,9 @@ from newton._src.geometry.terrain_law_solid import (
     TERRAIN_SOLID_JOB_LISTS,
     TERRAIN_SOLID_JOB_THREADS_CPU,
     TERRAIN_SOLID_LAUNCHES,
+    TERRAIN_SOLID_RESERVE_PAIRS,
     terrain_solid_job_capacities,
+    terrain_solid_job_reserves,
 )
 from newton._src.geometry.terrain_shadow import (
     TERRAIN_LAW_JOB_COUNTERS,
@@ -250,10 +252,10 @@ def _assert_law_rows(test, expected, got, what):
 def test_long_capsule_keeps_every_support(test, device):
     """Keep every support of a pair with more rows than its walk slots, as the float64 law gives them; raise nothing.
 
-    A long capsule lies across ridges of different heights: each ridge in reach is a support (its own plane), more
-    than the point class's eight walk slots. Its class's full-finish kernel finishes it and writes its rows to the side
-    buffer's spill region; the walk slots bound no row. (With a per-class limit of eight rows the law kept eight of
-    the ten, each plane's deepest first, and raised ``terrain_rows``.)
+    A long capsule lies across ridges of different heights: each ridge in reach is a support (its own plane), more than
+    the point class's eight walk slots. Its class's finish of deferred pairs finishes it and writes its rows to the side
+    buffer's spill region; the walk slots bound no row. (With a per-class limit of eight rows the law kept eight of the
+    ten, each plane's deepest first, and raised ``terrain_rows``.)
     """
     rng = np.random.default_rng(2)
     heights = _corrugated(rng)
@@ -479,7 +481,7 @@ def test_shadow_launches_take_one_block_size(test, device):
     with patch.object(wp, "launch", recorder(launch)), patch.object(wp, "launch_tiled", recorder(launch_tiled)):
         _contacts(pipeline, model)
     test.assertEqual(
-        sorted(blocks), ["terrain_point_rows", "terrain_point_rows_full", "terrain_point_rows_tiled"], msg=blocks
+        sorted(blocks), ["terrain_point_rows", "terrain_point_rows_finish", "terrain_point_rows_tiled"], msg=blocks
     )
     test.assertEqual(set().union(*blocks.values()), {terrain_law_block_dim(device)}, msg=blocks)
 
@@ -534,18 +536,20 @@ class TestTerrainLawShadow(unittest.TestCase):
     def test_job_check_names_lists_and_classes_cpu(self):
         """Warn of a solid class's job list without room by the class's and the list's names, with the entries asked
         for against the room and the factor to raise, and of the scan's runs by the window bound they hold (a pipeline
-        to rebuild); stay silent within the room."""
+        to rebuild); warn again of a reserve without room (its pairs keep no row); stay silent within the room."""
         jobs = 4
+        # (entries asked, room, reserve): the cylinder class's candidates outgrow their reserve too
         overflowing = {
-            (TERRAIN_PARTNER_BOX, "faces"): (9, 5),
-            (TERRAIN_PARTNER_CYLINDER, "candidates"): (70, 64),
-            (TERRAIN_PARTNER_HULL, "scans"): (12, 11),
+            (TERRAIN_PARTNER_BOX, "faces"): (9, 5, 10),
+            (TERRAIN_PARTNER_CYLINDER, "candidates"): (70, 64, 2),
+            (TERRAIN_PARTNER_HULL, "scans"): (12, 11, 4),
         }
         capacities = np.zeros(4 * TERRAIN_LAW_JOB_COUNTERS, np.int32)
+        reserves = np.zeros_like(capacities)
         counters = np.zeros(jobs + len(capacities), np.int32)
-        for (partner_class, name), (asked, room) in overflowing.items():
+        for (partner_class, name), (asked, room, reserve) in overflowing.items():
             k = partner_class * TERRAIN_LAW_JOB_COUNTERS + TERRAIN_LAW_JOB_NAMES.index(name)
-            capacities[k], counters[jobs + k] = room, asked
+            capacities[k], reserves[k], counters[jobs + k] = room, reserve, asked
         # within the room: no warning
         k = TERRAIN_PARTNER_HULL * TERRAIN_LAW_JOB_COUNTERS + TERRAIN_LAW_JOB_NAMES.index("edges")
         capacities[k], counters[jobs + k] = 8, 8
@@ -561,6 +565,7 @@ class TestTerrainLawShadow(unittest.TestCase):
                     1,
                     jobs,
                     wp.array(capacities, dtype=wp.int32, device="cpu"),
+                    wp.array(reserves, dtype=wp.int32, device="cpu"),
                 ],
                 device="cpu",
             )
@@ -568,12 +573,15 @@ class TestTerrainLawShadow(unittest.TestCase):
         finally:
             message = capture.end()
         lines = [line for line in message.splitlines() if line.startswith("Warning: Terrain-law")]
-        self.assertEqual(len(lines), len(overflowing), msg=message)
+        self.assertEqual(len(lines), len(overflowing) + 1, msg=message)
         self.assertIn("Terrain-law box class: its rule F face job list overflowed 9 > 5", message)
         self.assertIn("Terrain-law cylinder class: its candidate pool overflowed 70 > 64", message)
+        self.assertIn("took its reserve (rows unchanged)", message)
         self.assertIn("Raise NEWTON_TERRAIN_LAW_SHADOW_JOBS", message)
         self.assertIn("Terrain-law hull class: its scan's runs overflowed 12 > 11", message)
         self.assertIn("Rebuild the collision pipeline", message)
+        self.assertIn("Terrain-law cylinder class: the reserve of 2 overflowed too", message)
+        self.assertEqual(message.count("overflowed too"), 1, msg=message)
         self.assertNotIn("edge job list", message)
 
     def test_spill_overflow_raises_terrain_rows_cpu(self):
@@ -669,10 +677,11 @@ class TestTerrainLawShadow(unittest.TestCase):
         self.assertFalse(selection["heightfield"]["law"]["writes"])
         self.assertNotIn("NEWTON_TERRAIN_LAW_SHADOW", selection["environment"]["applied"])
 
-    def test_full_finish_launch_is_a_fixed_grid_cpu(self):
-        """Launch the full-finish kernel with a fixed grid whatever the class's size, striding over the deferred list.
+    def test_deferred_finish_launch_is_a_fixed_grid_cpu(self):
+        """Launch the finish of deferred pairs with a fixed grid whatever the class's size, striding over the deferred
+        list.
 
-        The deferred pairs are found on the device, during the collide; ``TERRAIN_LAW_FULL_BLOCKS`` blocks of lanes
+        The deferred pairs are found on the device, during the collide; ``TERRAIN_LAW_DEFERRED_BLOCKS`` blocks of lanes
         with their global scratch take them in turn, so that a collide with nothing deferred costs one near-empty
         launch instead of one thread per pair of the class (each of which, before, initialized the finish's locals).
         """
@@ -683,7 +692,7 @@ class TestTerrainLawShadow(unittest.TestCase):
         launch_tiled = wp.launch_tiled
 
         def record(kernel, *args, **kwargs):
-            if kernel is terrain_law_point.terrain_point_rows_full:
+            if kernel is terrain_law_point.terrain_point_rows_finish:
                 launches.append((kwargs["dim"], kwargs["block_dim"]))
             return launch_tiled(kernel, *args, **kwargs)
 
@@ -718,7 +727,7 @@ class TestTerrainLawShadow(unittest.TestCase):
         candidates = int(bounds.max())
         self.assertEqual(record["spill_rows"], candidates + -(-int(bounds.sum()) // TERRAIN_LAW_SPILL_SHARE))
         # The one-thread kernel over the class, the tiled kernel over its queue when it has a tiled segment, the
-        # class's full-finish kernel and the spill check, with the dimensions fixed at construction.
+        # class's finish of deferred pairs and the spill check, with the dimensions fixed at construction.
         self.assertEqual(record["launches"], 3 + int(lanes["tiled"] > 0))
         self.assertEqual(
             record["launch_shapes"],
@@ -727,9 +736,9 @@ class TestTerrainLawShadow(unittest.TestCase):
                     "block_dim": terrain_law_block_dim("cpu"),
                     "thread_dim": 12,
                     "tiled_blocks": min(lanes["tiled"], TERRAIN_LAW_TILE_BLOCKS),
-                    "full_blocks": terrain_finish_blocks(candidates),
-                    "full_candidates": candidates,
-                    "full_limited": False,
+                    "deferred_blocks": terrain_finish_blocks(candidates),
+                    "deferred_candidates": candidates,
+                    "deferred_limited": False,
                     "walk_slots": TERRAIN_POINT_WALK_SLOTS,
                 }
             },
@@ -756,9 +765,9 @@ class TestTerrainLawShadow(unittest.TestCase):
 
     def test_route_record_of_solid_classes_cpu(self):
         """Record the solid classes' pairs per lane class, launches, data, job scale, kernel grids, job capacities and
-        coreless pairs: one block size, one thread per pair for the whole-pair rejects, the job threads for the others,
-        the full-finish grid, and job lists and a candidate pool sized from the pairs' own bounds, the scan's jobs
-        exactly."""
+        reserves and coreless pairs: one block size, one thread per pair for the whole-pair rejects, the job threads for
+        the others, the grid of the finish of deferred pairs, and job lists and a candidate pool sized from the pairs'
+        own bounds, the scan's jobs exactly, each with a reserve of the class's largest pairs' work."""
         rng = np.random.default_rng(8)
         heights = np.round(rng.uniform(0.0, 0.05, (17, 17)) / 0.005) * 0.005
         bodies = [
@@ -796,7 +805,7 @@ class TestTerrainLawShadow(unittest.TestCase):
                     lanes[lane_name] = end - begin
                 self.assertEqual(record["pairs"][name], lanes)
                 # with pairs: the class's launches (whole-pair rejects, scan, job kernels, close, rule R, small-pair
-                # finish, full kernels)
+                # finish, finish of deferred pairs)
                 count = sum(lanes.values())
                 if count:
                     begin = table.segment(partner_class, TERRAIN_LANE_THREAD)[0]
@@ -815,10 +824,21 @@ class TestTerrainLawShadow(unittest.TestCase):
                     run = int(TERRAIN_PARTNER_SCAN_RUN[partner_class])
                     scans = int(np.sum(-(-table.vertices[begin:end].astype(np.int64) // run)))
                     self.assertEqual(capacities["scans"], scans)
+                    reserves = terrain_solid_job_reserves(
+                        table.vertices[begin:end], table.candidates[begin:end], scan_run=run
+                    )
+                    # the reserve: the work of up to TERRAIN_SOLID_RESERVE_PAIRS pairs of the class's largest bounds
+                    vertices = int(table.vertices[begin:end].max())
+                    reserve_pairs = reserves["candidates"] // candidates
+                    self.assertTrue(1 <= reserve_pairs <= TERRAIN_SOLID_RESERVE_PAIRS, msg=reserves)
+                    bounds = {"faces": 2, "edges": 3, "thetas": 3, "vertices": 1}
+                    expected = {name: reserve_pairs * bound * vertices for name, bound in bounds.items()}
+                    expected["candidates"] = reserve_pairs * candidates
+                    expected["scans"] = reserve_pairs * -(-vertices // run)
+                    self.assertEqual(reserves, expected)
+                    # the job kernels' threads: at most the longest list's room (they stride over its reserve too)
                     longest = max(capacities[n] for n in (*TERRAIN_SOLID_JOB_LISTS, "scans"))
-                    # no class's walk slots hold the lane rows: the lanes' finish is launched for none
-                    skipped = ["finish"]
-                    launches += len(TERRAIN_SOLID_LAUNCHES) - len(skipped)
+                    launches += len(TERRAIN_SOLID_LAUNCHES)
                     self.assertEqual(
                         record["launch_shapes"][name],
                         {
@@ -828,10 +848,10 @@ class TestTerrainLawShadow(unittest.TestCase):
                             "pair_job_threads": min(TERRAIN_SOLID_JOB_THREADS_CPU, longest, count),
                             "finish_blocks": min(TERRAIN_SOLID_JOB_THREADS_CPU, count),
                             "jobs": capacities,
-                            "skipped": skipped,
-                            "full_blocks": terrain_finish_blocks(candidates),
-                            "full_candidates": candidates,
-                            "full_limited": False,
+                            "jobs_reserve": reserves,
+                            "deferred_blocks": terrain_finish_blocks(candidates),
+                            "deferred_candidates": candidates,
+                            "deferred_limited": False,
                             "walk_slots": walk,
                         },
                     )

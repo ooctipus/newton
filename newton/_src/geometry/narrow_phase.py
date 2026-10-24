@@ -4350,7 +4350,8 @@ class NarrowPhase:
         features older than the heights were read) and ``terrain_jobs`` (a
         solid class's job lists or candidate pool had no room for a pair's
         work, see ``NEWTON_TERRAIN_LAW_SHADOW_JOBS``: the pair's rows are
-        unchanged, taken by a slower path) are set by the terrain law's
+        unchanged while the lists' reserve takes it; past the reserve the
+        pair keeps no row) are set by the terrain law's
         kernels, which write their partners' heightfield contacts (by
         default, see ``NEWTON_TERRAIN_LAW``; the ``contacts`` bit then also
         covers them) or run in shadow beside the terrain route
