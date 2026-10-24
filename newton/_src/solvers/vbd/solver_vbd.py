@@ -181,7 +181,9 @@ class SolverVBD(SolverBase, CouplingInterface):
         particle-shape pair count, which excludes the
         ``enable_rigid_soft_full_surface_contact`` edge/face headroom. Both grow from
         ``Contacts`` on the first :meth:`step`, and the rigid contact force outputs grow in
-        :meth:`collect_rigid_contact_forces`. During graph capture,
+        :meth:`collect_rigid_contact_forces`; rigid buffers grow to the contacts'
+        :attr:`~newton.Contacts.rigid_contact_bound`, so later growth of the contact
+        rows (:meth:`~newton.CollisionPipeline.service_capacity`) needs no resize. During graph capture,
         ordinary lazy resizing is supported on CPU and on CUDA with Warp's
         stream-ordered memory pool enabled; otherwise the solver raises with
         guidance to pre-size before capture. Rigid contact history is
@@ -2282,7 +2284,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             return
 
         if self._prev_contact_lambda is None or self._prev_contact_lambda.shape[0] < contact_launch_dim:
-            self._init_rigid_contact_warmstart(contact_launch_dim)
+            self._init_rigid_contact_warmstart(contacts.rigid_contact_bound)
 
         # Snapshot solved contact rows for the next step's warm-start.
         wp.launch(
@@ -2464,7 +2466,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                             self.body_body_contact_penalty_k.shape[0],
                             contact_launch_dim,
                         )
-                        self._init_body_body_contact_state(contact_launch_dim)
+                        # Sized by the bound, so a growth of the contact rows needs no resize in a capture.
+                        self._init_body_body_contact_state(contacts.rigid_contact_bound)
 
                     # Build body-body contact lists
                     self.body_body_contact_counts.zero_()
@@ -3449,10 +3452,12 @@ class SolverVBD(SolverBase, CouplingInterface):
         output_capacity = self._rigid_contact_body0.shape[0]
         if output_capacity < max_contacts:
             self._raise_if_capturing_resize("rigid contact output", output_capacity, max_contacts)
-            self._rigid_contact_body0 = wp.full(max_contacts, -1, dtype=wp.int32, device=self.device)
-            self._rigid_contact_body1 = wp.full(max_contacts, -1, dtype=wp.int32, device=self.device)
-            self._rigid_contact_point0_world = wp.zeros(max_contacts, dtype=wp.vec3, device=self.device)
-            self._rigid_contact_point1_world = wp.zeros(max_contacts, dtype=wp.vec3, device=self.device)
+            # Sized by the bound, so a growth of the contact rows needs no resize in a capture.
+            bound = contacts.rigid_contact_bound
+            self._rigid_contact_body0 = wp.full(bound, -1, dtype=wp.int32, device=self.device)
+            self._rigid_contact_body1 = wp.full(bound, -1, dtype=wp.int32, device=self.device)
+            self._rigid_contact_point0_world = wp.zeros(bound, dtype=wp.vec3, device=self.device)
+            self._rigid_contact_point1_world = wp.zeros(bound, dtype=wp.vec3, device=self.device)
 
         wp.launch(
             kernel=compute_rigid_contact_forces,

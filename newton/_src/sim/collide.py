@@ -3663,10 +3663,12 @@ class CollisionPipeline:
         and logs the new rows and bytes. A high-water mark at the ready rows means
         a collision pass may have dropped contacts: its capacity status stays
         flagged (:meth:`~newton.geometry.NarrowPhase.check_buffer_capacity`) and
-        this warns.
+        this warns. Rows that a writer reserved during capture
+        (:meth:`~newton.Contacts.reserve_rigid_contacts`) are grown here too.
 
         Returns:
-            True when the buffers grew and graphs that use them must be recaptured.
+            True when the buffers grew since the last call, here or by a
+            reservation outside capture, and graphs that use them must be recaptured.
 
         .. experimental::
         """
@@ -4359,8 +4361,9 @@ class CollisionPipeline:
                     self._terrain_law_listed, model.shape_type, self.geom_data, write_contact, writer_data
                 )
 
-        # Every rigid writer has counted its contacts: record the demand that grows the pool.
-        self._contact_pool.record_demand(contacts.rigid_contact_count)
+        # Every rigid writer has counted its contacts: record the demand that grows the buffer's pool
+        # (this pipeline's for its own contacts(); a fixed external buffer records nothing).
+        contacts._rigid_contact_pool.record_demand(contacts.rigid_contact_count)
 
         reducer = self.narrow_phase.global_contact_reducer
         if reducer is not None:

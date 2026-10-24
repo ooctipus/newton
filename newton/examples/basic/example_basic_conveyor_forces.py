@@ -513,8 +513,9 @@ class ConveyorForceModel:
 
         self.body_contact_count = wp.zeros(self.model.body_count, dtype=wp.int32, device=d)
         self.conveyor_body_f = wp.zeros(self.model.body_count, dtype=wp.spatial_vector, device=d)
-        self.belt_contacts = wp.empty(contacts.rigid_contact_max, dtype=BeltContact, device=d)
-        self.contact_force_vec = wp.zeros(contacts.rigid_contact_max, dtype=wp.vec3, device=d)
+        # Sized by the bound: the contacts' rows may grow (CollisionPipeline.service_capacity).
+        self.belt_contacts = wp.empty(contacts.rigid_contact_bound, dtype=BeltContact, device=d)
+        self.contact_force_vec = wp.zeros(contacts.rigid_contact_bound, dtype=wp.vec3, device=d)
         self.body_q_prev = wp.zeros(self.model.body_count, dtype=wp.transform, device=d)
         self._finalized = True
 

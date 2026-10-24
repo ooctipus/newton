@@ -1211,6 +1211,12 @@ def _convert_active_contacts_kamino_to_newton(
     # Retrieve the contact index for this thread
     cid = wp.tid()
 
+    # Like Newton's collision writer, the output count keeps every active
+    # contact, while only the rows the output holds are written: a count past
+    # ``rigid_contact_max`` flags the dropped contacts.
+    if cid == 0:
+        newton_count[0] = model_active_contacts[0]
+
     # Determine the total number of contacts to convert, which is the
     # smaller of the number of active contacts and the output capacity.
     num_active = wp.min(model_active_contacts[0], max_converted_contacts)
@@ -1247,8 +1253,8 @@ def _convert_active_contacts_kamino_to_newton(
     if body_1 >= 0:
         X_inv_1 = wp.transform_inverse(body_q[body_1])
 
-    # Increment the number of active contacts in the Newton format
-    cid_out = wp.atomic_add(newton_count, 0, 1)
+    # Active contacts are compact, so each keeps its row
+    cid_out = cid
 
     # Store the converted contact data in the Newton format
     newton_shape0[cid_out] = shape_0
@@ -1552,7 +1558,10 @@ def convert_contacts_kamino_to_newton(
       cleared and repopulated from scratch with the currently active Kamino
       contacts; Newton's ``shape0/shape1`` are written to match Kamino's A/B
       ordering. If ``convert_forces`` is true, ``contacts_out.force`` is
-      populated as well; otherwise it is left untouched.
+      populated as well; otherwise it is left untouched. Contacts past the
+      output's ``rigid_contact_max`` rows are dropped, while its
+      ``rigid_contact_count`` keeps the active count, as Newton's collision
+      writer does.
     - ``clear_output=False``: the existing-contacts path. The geometric data
       already on ``contacts_out`` is preserved and only the per-contact
       reaction is converted into ``contacts_out.force``. This path requires

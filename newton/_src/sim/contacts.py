@@ -299,8 +299,9 @@ class Contacts:
 
     Every rigid contact array holds :attr:`rigid_contact_max` rows. A buffer from
     :meth:`newton.CollisionPipeline.contacts` starts with fewer rows than the pipeline's
-    :attr:`~newton.CollisionPipeline.rigid_contact_max` bound when the scene is large, and its
-    rigid arrays grow toward the bound through :meth:`newton.CollisionPipeline.service_capacity`;
+    :attr:`~newton.CollisionPipeline.rigid_contact_max` bound (:attr:`rigid_contact_bound`) when
+    the scene is large, and its rigid arrays grow toward the bound through
+    :meth:`newton.CollisionPipeline.service_capacity` and :meth:`reserve_rigid_contacts`;
     growth replaces the array attributes with longer views of the same memory, so read them from
     this object rather than keeping them, and recapture CUDA graphs after a growth.
 
@@ -797,6 +798,40 @@ class Contacts:
         Returns the device on which the contact buffers are allocated.
         """
         return self.rigid_contact_count.device
+
+    @property
+    def rigid_contact_bound(self) -> int:
+        """Most rigid contact rows the arrays can grow to; :attr:`rigid_contact_max` when they cannot grow.
+
+        Per-contact buffers kept beside this object that must hold every row it may
+        ever have are sized by this bound.
+        """
+        return self._rigid_contact_pool.bound
+
+    def reserve_rigid_contacts(self, count: int) -> bool:
+        """Hold at least ``count`` rigid contact rows from now on, for a writer with a fixed contact capacity.
+
+        A solver that writes contacts of its own into this buffer (e.g.
+        :meth:`newton.solvers.SolverMuJoCo.update_contacts` with MuJoCo's collision)
+        declares the most contacts it writes. Outside CUDA graph capture the rigid
+        arrays grow now, keeping their contents. During capture the growth waits,
+        with a warning, for :meth:`newton.CollisionPipeline.service_capacity` or the
+        next reservation outside capture; until then the writer keeps the demand in
+        :attr:`rigid_contact_count`, drops the rows past :attr:`rigid_contact_max` and
+        flags it.
+
+        Args:
+            count: Most rigid contacts the writer produces.
+
+        Returns:
+            Whether the arrays grew now. CUDA graphs that captured them must be
+            recaptured; :meth:`~newton.CollisionPipeline.service_capacity` reports the
+            growth too.
+
+        Raises:
+            ValueError: If ``count`` exceeds :attr:`rigid_contact_bound`.
+        """
+        return self._rigid_contact_pool.reserve(count)
 
     @property
     def rigid_contact_diff_distance(self) -> wp.array[float] | None:

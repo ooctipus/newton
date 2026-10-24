@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the growable rigid contact pool: policy, growth, overflow, capture and FeatherPGS."""
+"""Tests for the growable rigid contact pool: policy, growth, overflow, capture, and its consumers."""
 
 import contextlib
 import unittest
@@ -27,7 +27,7 @@ def _small_pool_policy(rows_per_world: int, quantum: int):
     return mock.patch.multiple(contact_pool, READY_ROWS_PER_WORLD=rows_per_world, ROW_QUANTUM=quantum)
 
 
-def _build_boxes(device, worlds=WORLDS, boxes=BOXES):
+def _build_boxes(device, worlds=WORLDS, boxes=BOXES, *, color=False):
     """Build ``worlds`` worlds of ``boxes`` free boxes resting on one global ground plane."""
     template = newton.ModelBuilder(up_axis=newton.Axis.Z)
     for i in range(boxes):
@@ -36,20 +36,23 @@ def _build_boxes(device, worlds=WORLDS, boxes=BOXES):
     builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
     builder.add_ground_plane()
     builder.replicate(template, worlds, spacing=(4.0, 4.0, 0.0))
+    if color:
+        builder.color()
     return builder.finalize(device=device)
 
 
-def _records(contacts):
-    """Return the live rigid contacts as one sorted float table."""
+def _records(contacts, *extra):
+    """Return the live rigid contacts, with ``extra`` per-contact arrays, as one sorted float table."""
     count = int(contacts.rigid_contact_count.numpy()[0])
-    columns = [
-        contacts.rigid_contact_shape0.numpy()[:count, None].astype(np.float64),
-        contacts.rigid_contact_shape1.numpy()[:count, None].astype(np.float64),
-        contacts.rigid_contact_point0.numpy()[:count],
-        contacts.rigid_contact_point1.numpy()[:count],
-        contacts.rigid_contact_normal.numpy()[:count],
-    ]
-    table = np.concatenate(columns, axis=1)
+    arrays = (
+        contacts.rigid_contact_shape0,
+        contacts.rigid_contact_shape1,
+        contacts.rigid_contact_point0,
+        contacts.rigid_contact_point1,
+        contacts.rigid_contact_normal,
+        *extra,
+    )
+    table = np.concatenate([array.numpy()[:count].reshape(count, -1).astype(np.float64) for array in arrays], axis=1)
     return table[np.lexsort(table.T[::-1])]
 
 
@@ -322,6 +325,326 @@ def _graph_capture_recapture_after_growth(test, device):
     test.assertTrue(np.all(np.isfinite(state_0.body_q.numpy())))
 
 
+def test_reserve_grows_now_or_at_the_next_service(test, device):
+    """Grow to a reservation outside capture; defer it, with a warning, during capture; report each growth once."""
+    with _small_pool_policy(1, 8):
+        pool = ContactPool(1000, device=device, rows=8)
+        target = type("Target", (), {})()
+        rows = pool.rows((ContactField("value", wp.int32, -1),), on_rows=lambda rows: rows.publish(target))
+        test.assertFalse(pool.reserve(8))
+        test.assertTrue(pool.reserve(100))
+        test.assertEqual(pool.ready, 104, "rounded up to the row quantum")
+        test.assertEqual(rows.rows, 104)
+        test.assertTrue(pool.service(), "a growth outside the service is reported once")
+        test.assertFalse(pool.service())
+        with test.assertRaisesRegex(ValueError, "cannot hold"):
+            pool.reserve(1001)
+        if not wp.get_device(device).is_cuda:
+            return
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with wp.ScopedCapture(device=device):
+                test.assertFalse(pool.reserve(300))
+        test.assertTrue(any("reserved during CUDA graph capture" in str(w.message) for w in caught))
+        test.assertEqual(pool.ready, 104, "no growth during capture")
+        test.assertTrue(pool.service())
+        test.assertEqual(pool.ready, 304)
+        test.assertEqual(target.value.shape, (304,))
+        test.assertTrue(np.all(target.value.numpy() == -1))
+        test.assertFalse(pool.service())
+
+
+def _mujoco(model, **kwargs):
+    """Construct SolverMuJoCo for the boxes, with room for 32 contacts per world."""
+    try:
+        return newton.solvers.SolverMuJoCo(model, nconmax=32, njmax=192, iterations=20, ls_iterations=10, **kwargs)
+    except ImportError as error:
+        raise unittest.SkipTest(f"MuJoCo Warp is not available: {error}") from error
+
+
+def _mujoco_records(contacts):
+    """Return the live contacts MuJoCo wrote, with their forces, as one sorted table."""
+    return _records(contacts, contacts.force)
+
+
+def test_mujoco_contacts_grow_a_pipeline_buffer(test, device):
+    """Write MJWarp's own contacts into a pipeline buffer below naconmax: grow it eagerly, or after a capture.
+
+    MJWarp -> Newton: ``update_contacts`` declares ``naconmax`` rows. Outside capture the buffer grows at once
+    and holds what a fixed ``naconmax`` buffer holds; during capture the replay keeps the count, drops the rows
+    past the ready ones and flags it, and the service grows the buffer for the recapture.
+    """
+    model = _build_boxes(device)
+    model.request_contact_attributes("force")
+    solver = _mujoco(model, use_mujoco_contacts=True)
+    naconmax = solver.mjw_data.naconmax
+    reference = newton.Contacts(naconmax, 0, device=device, requested_attributes={"force"})
+    with _small_pool_policy(1, 8):
+        _mujoco_contacts_grow_a_pipeline_buffer(test, device, model, solver, reference)
+
+
+def _mujoco_contacts_grow_a_pipeline_buffer(test, device, model, solver, reference):
+    naconmax = solver.mjw_data.naconmax
+    state_0, state_1, control = model.state(), model.state(), model.control()
+    for _ in range(3):
+        solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+    nacon = int(solver.mjw_data.nacon.numpy()[0])
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=4 * naconmax)
+    contacts = pipeline.contacts()
+    test.assertEqual(contacts.rigid_contact_max, 8)
+    test.assertGreater(naconmax, 8)
+    test.assertGreater(nacon, 8, "MJWarp must hold more contacts than the initial rows")
+    solver.update_contacts(reference, state_0)
+    solver.update_contacts(contacts, state_0)
+    test.assertEqual(contacts.rigid_contact_max, naconmax)
+    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), nacon)
+    np.testing.assert_array_equal(_mujoco_records(contacts), _mujoco_records(reference))
+    test.assertFalse(any(solver.contact_capacity_status().values()))
+    wp.synchronize_device(device)
+    test.assertTrue(pipeline.service_capacity(), "the growth needs graphs recaptured")
+    test.assertFalse(pipeline.service_capacity())
+
+    if not wp.get_device(device).is_cuda:
+        return
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=4 * naconmax)
+    contacts = pipeline.contacts()
+
+    def simulate():
+        solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+        solver.update_contacts(contacts, state_1)
+        state_0.assign(state_1)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with wp.ScopedCapture(device=device) as capture:
+            simulate()
+    test.assertTrue(any("reserved during CUDA graph capture" in str(w.message) for w in caught))
+    test.assertEqual(contacts.rigid_contact_max, 8)
+    wp.capture_launch(capture.graph)
+    wp.synchronize_device(device)
+    nacon = int(solver.mjw_data.nacon.numpy()[0])
+    test.assertGreater(nacon, 8)
+    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), nacon, "the count keeps MJWarp's count")
+    test.assertTrue(solver.contact_capacity_status(clear=True)["source_contacts"])
+    test.assertTrue(pipeline.service_capacity())
+    test.assertEqual(contacts.rigid_contact_max, naconmax)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with wp.ScopedCapture(device=device) as capture:
+            simulate()
+    test.assertFalse(any("reserved during CUDA graph capture" in str(w.message) for w in caught))
+    for _ in range(2):
+        wp.capture_launch(capture.graph)
+    wp.synchronize_device(device)
+    test.assertFalse(any(solver.contact_capacity_status().values()))
+    solver.update_contacts(reference, state_1)
+    np.testing.assert_array_equal(_mujoco_records(contacts), _mujoco_records(reference))
+    test.assertFalse(pipeline.service_capacity())
+
+
+def test_newton_contacts_feed_mujoco_below_naconmax(test, device):
+    """Feed MJWarp from a pipeline buffer below naconmax and write its contacts back without a growth.
+
+    Newton -> MJWarp: the buffer grows from its demand only; ``update_contacts`` declares the rows it converted,
+    which the buffer already holds, and the run matches one on a fixed buffer, eagerly and under capture.
+    """
+    model = _build_boxes(device)
+    model.request_contact_attributes("force")
+    reference = newton.CollisionPipeline(model, rigid_contact_max=512)
+    test.assertFalse(reference._contact_pool.growable)
+    with _small_pool_policy(16, 8):
+        _newton_contacts_feed_mujoco_below_naconmax(test, device, model, reference)
+
+
+def _newton_contacts_feed_mujoco_below_naconmax(test, device, model, reference):
+    runs = [
+        (pipeline, pipeline.contacts(), _mujoco(model, use_mujoco_contacts=False), model.state(), model.state())
+        for pipeline in (reference, newton.CollisionPipeline(model, rigid_contact_max=512))
+    ]
+    (_, fixed, _, fixed_state, _), (pipeline, contacts, solver, state, _) = runs
+    naconmax = solver.mjw_data.naconmax
+    test.assertEqual(contacts.rigid_contact_max, 64)
+    test.assertGreater(naconmax, 64)
+    control = model.control()
+    for step in range(4):
+        for run_pipeline, run_contacts, run_solver, state_0, state_1 in runs:
+            run_pipeline.collide(state_0, run_contacts)
+            run_solver.step(state_0, state_1, control, run_contacts, 1.0 / 240.0)
+            run_solver.update_contacts(run_contacts, state_1)
+            state_0.assign(state_1)
+            wp.synchronize_device(device)
+            test.assertEqual(run_pipeline.service_capacity(), run_pipeline is pipeline and step == 0)
+    test.assertEqual(contacts.rigid_contact_max, 96, "grown from the demand of 48 contacts, not to naconmax")
+    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), int(fixed.rigid_contact_count.numpy()[0]))
+    for _, _, run_solver, _, _ in runs:
+        test.assertFalse(any(run_solver.contact_capacity_status().values()))
+    np.testing.assert_allclose(state.body_q.numpy(), fixed_state.body_q.numpy(), rtol=0.0, atol=1.0e-5)
+    np.testing.assert_allclose(_mujoco_records(contacts), _mujoco_records(fixed), rtol=1.0e-4, atol=1.0e-4)
+
+    if not wp.get_device(device).is_cuda:
+        return
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=512)
+    contacts = pipeline.contacts()
+    state_0 = model.state()
+    state_0.assign(state)
+    state_1 = model.state()
+
+    def simulate():
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+        solver.update_contacts(contacts, state_1)
+        state_0.assign(state_1)
+
+    pipeline.collide(state_0, contacts)  # warm up outside capture
+    graphs = []
+    for _ in range(2):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with wp.ScopedCapture(device=device) as capture:
+                simulate()
+        test.assertFalse(any("reserved during CUDA graph capture" in str(w.message) for w in caught))
+        graphs.append(capture.graph)
+        for _ in range(2):
+            wp.capture_launch(graphs[-1])
+        wp.synchronize_device(device)
+        if not pipeline.service_capacity():
+            break
+    test.assertEqual(len(graphs), 2, "one growth from demand, then one recapture")
+    test.assertEqual(contacts.rigid_contact_max, 96)
+    test.assertFalse(any(solver.contact_capacity_status().values()))
+    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), int(solver.mjw_data.nacon.numpy()[0]))
+    test.assertTrue(np.all(np.isfinite(state_0.body_q.numpy())))
+
+
+def test_xpbd_update_contacts_after_growth(test, device):
+    """Report the forces of the last step from a buffer that grew since it; rows the step did not solve get zero."""
+    model = _build_boxes(device)
+    model.request_contact_attributes("force")
+    solver = newton.solvers.SolverXPBD(model, iterations=4)
+    with _small_pool_policy(1, 8):
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+        solver.update_contacts(contacts)
+        forces = contacts.force.numpy()[:8]
+        test.assertTrue(np.any(forces != 0.0))
+        wp.synchronize_device(device)
+        test.assertTrue(pipeline.service_capacity())
+        test.assertEqual(contacts.rigid_contact_max, 2 * CONTACTS)
+        solver.update_contacts(contacts)
+    np.testing.assert_array_equal(contacts.force.numpy()[:8], forces)
+    test.assertTrue(np.all(contacts.force.numpy()[8 : 2 * CONTACTS] == 0.0))
+
+
+def test_kamino_contacts_grow_a_pipeline_buffer(test, device):
+    """Write Kamino's own contacts into a pipeline buffer below Kamino's capacity: it grows to hold them."""
+    from newton.tests.utils import basics  # noqa: PLC0415
+
+    source = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    newton.solvers.SolverKamino.register_custom_attributes(source)
+    basics.build_box_on_plane(builder=source, z_offset=0.0)
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    newton.solvers.SolverKamino.register_custom_attributes(builder)
+    builder.replicate(source, world_count=3)
+    model = builder.finalize(device=device, skip_validation_joints=True)
+    solver = newton.solvers.SolverKamino(model, config=newton.solvers.SolverKamino.Config(use_collision_detector=True))
+    capacity = solver._contacts_kamino.model_max_contacts_host
+    with _small_pool_policy(1, 1):
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        test.assertEqual(pipeline.rigid_contact_max, capacity)
+        test.assertLess(contacts.rigid_contact_max, capacity)
+        state_0, state_1 = model.state(), model.state()
+        solver.step(state_0, state_1, None, None, 1.0 / 240.0)
+        solver.update_contacts(contacts, state_1)
+    test.assertEqual(contacts.rigid_contact_max, capacity)
+    active = int(solver._contacts_kamino.model_active_contacts.numpy()[0])
+    test.assertGreater(active, 0)
+    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), active)
+    test.assertTrue(np.all(contacts.rigid_contact_shape0.numpy()[:active] >= 0))
+
+
+def test_vbd_contact_buffers_hold_the_bound(test, device):
+    """Size VBD's per-contact buffers by the contacts' bound, so a growth needs no resize (none in a capture)."""
+    model = _build_boxes(device, color=True)
+    solver = newton.solvers.SolverVBD(model, iterations=2, rigid_compliant_alm=True)
+    with _small_pool_policy(1, 8):
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=512)
+        contacts = pipeline.contacts()
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+        penalty = solver.body_body_contact_penalty_k
+        wp.synchronize_device(device)
+        test.assertTrue(pipeline.service_capacity())
+        test.assertEqual(contacts.rigid_contact_max, 2 * CONTACTS)
+        pipeline.collide(state_1, contacts)
+        solver.step(state_1, state_0, control, contacts, 1.0 / 240.0)
+    test.assertIs(solver.body_body_contact_penalty_k, penalty)
+    test.assertEqual(penalty.shape, (512,))
+    test.assertEqual(contacts.rigid_contact_bound, 512)
+    test.assertTrue(np.all(np.isfinite(state_0.body_q.numpy())))
+
+
+def test_coupled_entry_contacts_grow_with_their_source(test, device):
+    """Grow a coupled entry's filtered buffer with its source's pool, and keep reusing it."""
+    from newton.solvers.experimental.coupled import SolverCoupled  # noqa: PLC0415
+
+    model = _build_boxes(device)
+    coupled = SolverCoupled(
+        model=model,
+        entries=[
+            SolverCoupled.Entry(
+                name="A",
+                solver=newton.solvers.SolverSemiImplicit,
+                bodies=list(range(model.body_count)),
+                shapes=list(range(model.shape_count)),
+            )
+        ],
+    )
+    with _small_pool_policy(1, 8):
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        filtered = coupled.entry_contacts("A", contacts)
+        test.assertEqual(filtered.rigid_contact_max, 8)
+        state = model.state()
+        pipeline.collide(state, contacts)
+        wp.synchronize_device(device)
+        test.assertTrue(pipeline.service_capacity())
+    test.assertEqual(contacts.rigid_contact_max, 2 * CONTACTS)
+    test.assertEqual(filtered.rigid_contact_max, 2 * CONTACTS)
+    pipeline.collide(state, contacts)
+    test.assertIs(coupled.entry_contacts("A", contacts), filtered)
+    np.testing.assert_array_equal(_records(filtered), _records(contacts))
+
+
+def test_contact_kinematics_outputs_sized_by_the_bound(test, device):
+    """Evaluate contact kinematics into outputs sized by the bound, before and after a growth."""
+    model = _build_boxes(device)
+    state = model.state()
+    with _small_pool_policy(16, 8):
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=512)
+        contacts = pipeline.contacts()
+        distance = wp.empty(pipeline.rigid_contact_max, dtype=float, device=device)
+        pipeline.collide(state, contacts)
+        newton.eval_rigid_contact_kinematics(model, state, contacts, out_distance=distance)
+        before = np.sort(distance.numpy()[:CONTACTS])
+        wp.synchronize_device(device)
+        test.assertTrue(pipeline.service_capacity())
+        test.assertEqual(contacts.rigid_contact_max, 2 * CONTACTS)
+        pipeline.collide(state, contacts)
+        newton.eval_rigid_contact_kinematics(model, state, contacts, out_distance=distance)
+    np.testing.assert_allclose(np.sort(distance.numpy()[:CONTACTS]), before, rtol=0.0, atol=1.0e-7)
+    test.assertEqual(contacts.rigid_contact_bound, pipeline.rigid_contact_max)
+    with test.assertRaisesRegex(ValueError, "expected"):
+        newton.eval_rigid_contact_kinematics(
+            model, state, contacts, out_distance=wp.empty(64, dtype=float, device=device)
+        )
+
+
 class TestContactPool(unittest.TestCase):
     pass
 
@@ -337,6 +660,14 @@ for name, function, check_output in (
     ("test_feather_pgs_grows_mid_run", test_feather_pgs_grows_mid_run, True),
     ("test_feather_pgs_overflow_is_flagged_and_raised", test_feather_pgs_overflow_is_flagged_and_raised, False),
     ("test_matching_and_warm_start_survive_growth", test_matching_and_warm_start_survive_growth, True),
+    ("test_reserve_grows_now_or_at_the_next_service", test_reserve_grows_now_or_at_the_next_service, True),
+    ("test_mujoco_contacts_grow_a_pipeline_buffer", test_mujoco_contacts_grow_a_pipeline_buffer, False),
+    ("test_newton_contacts_feed_mujoco_below_naconmax", test_newton_contacts_feed_mujoco_below_naconmax, True),
+    ("test_xpbd_update_contacts_after_growth", test_xpbd_update_contacts_after_growth, False),
+    ("test_kamino_contacts_grow_a_pipeline_buffer", test_kamino_contacts_grow_a_pipeline_buffer, True),
+    ("test_vbd_contact_buffers_hold_the_bound", test_vbd_contact_buffers_hold_the_bound, False),
+    ("test_coupled_entry_contacts_grow_with_their_source", test_coupled_entry_contacts_grow_with_their_source, False),
+    ("test_contact_kinematics_outputs_sized_by_the_bound", test_contact_kinematics_outputs_sized_by_the_bound, True),
 ):
     add_function_test(TestContactPool, name, function, devices=devices, check_output=check_output)
 add_function_test(

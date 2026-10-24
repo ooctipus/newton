@@ -1496,20 +1496,28 @@ def create_convert_mjw_contacts_to_newton_kernel():
         rigid_contact_point1: wp.array[wp.vec3],
         rigid_contact_normal: wp.array[wp.vec3],
         contact_force: wp.array[wp.spatial_vector],
+        contact_capacity_status: wp.array[wp.int32],
     ):
         """Convert MuJoCo contacts to Newton contact format.
 
         Uses mjc_geom_to_newton_shape to convert MuJoCo geom indices to Newton shape indices.
         Contact positions are converted from MuJoCo world frame to Newton body-local frame.
         Contact forces are computed via ``mujoco_warp`` ``contact_force_fn``.
+
+        Like the collision pipeline's writer, the count keeps MuJoCo's contact count
+        while only the rows the Newton arrays hold are written; a count past them sets
+        the ``source_contacts`` bit (2) of ``contact_capacity_status``.
         """
         contact_idx = wp.tid()
         n_contacts = mj_nacon[0]
+        rows = rigid_contact_shape0.shape[0]
 
         if contact_idx == 0:
             rigid_contact_count[0] = n_contacts
+            if n_contacts > rows:
+                wp.atomic_or(contact_capacity_status, 0, 2)
 
-        if contact_idx >= n_contacts:
+        if contact_idx >= n_contacts or contact_idx >= rows:
             return
 
         world = mj_contact_worldid[contact_idx]

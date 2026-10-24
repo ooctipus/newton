@@ -1128,6 +1128,9 @@ class SolverCoupledADMM(SolverCoupled):
             self._admm_dynamic_rr_contact_groups or self._admm_dynamic_rp_contact_groups
         ) and self._admm_internal_contacts is None:
             self._admm_internal_contacts = self._admm_collision_pipeline.contacts()
+            if self._admm_rigid_rigid_contact_specs:
+                # The exact pair capacity, not a guess: hold it from the start.
+                self._admm_internal_contacts.reserve_rigid_contacts(self._admm_rigid_contact_capacity())
 
         if coupling.gamma > 0.0:
             self._refresh_admm_proximal_masks()

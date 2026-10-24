@@ -34,6 +34,15 @@ capture. :meth:`ContactPool.service` reads it without synchronizing and grows
 the pool when the high-water mark passes half the ready rows. Overflow stays
 loud: writers drop contacts past the ready rows as before and the capacity
 status reports it; the service then grows and warns.
+
+A writer with a fixed contact capacity (a solver that writes up to N contacts of
+its own into the buffer, such as MuJoCo's or Kamino's collision) declares N with
+:meth:`ContactPool.reserve` (``Contacts.reserve_rigid_contacts``): outside graph
+capture the rows grow to at least N right away; during capture the request warns
+and waits for the next service. Its kernels stay bounded by the ready rows, keep
+the demand in the count and flag the overflow, as the pipeline's writer does.
+Readers that keep per-contact buffers of their own either grow them with the
+pool (:meth:`ContactPool.follow`) or size them by the bound.
 """
 
 from __future__ import annotations
@@ -86,6 +95,11 @@ def initial_rows(bound: int, world_count: int) -> int:
         world_count: Number of worlds of the model.
     """
     return min(int(bound), _round_up(READY_ROWS_PER_WORLD * max(int(world_count), 1), ROW_QUANTUM))
+
+
+def reserved_rows(rows: int, bound: int) -> int:
+    """Return the ready rows that hold a reservation of ``rows``: rounded up to :data:`ROW_QUANTUM`, at most ``bound``."""
+    return min(int(bound), _round_up(rows, ROW_QUANTUM))
 
 
 def grown_rows(high_water: int, ready: int, bound: int) -> int:
@@ -272,6 +286,8 @@ class ContactRows:
             array[start:end].fill_(field.fill)
 
     def _allocate_virtual(self):
+        if wp.get_stream(self.device).is_capturing:
+            raise RuntimeError("Growable per-contact buffers cannot be created during CUDA graph capture")
         _, fields_ops, FieldSpec = _gpu_components()
         _release_retired(self.device)
         owner = _backing(self.device)
@@ -380,6 +396,11 @@ class ContactPool:
             )
         self.growth_count = 0
         """Growths so far; each one requires recapturing graphs that use the pool."""
+        self._reserved = 0
+        # Growths of live rows in this pool, and the total over the pools that follow it
+        # that service() last reported.
+        self._changes = 0
+        self._reported = 0
 
     @property
     def growable(self) -> bool:
@@ -413,11 +434,10 @@ class ContactPool:
         """Grow the ready rows of this pool and its followers to at least ``rows``.
 
         Returns:
-            Whether any row count changed. Graphs that captured the pool's
-            buffers must then be recaptured to use the new rows.
+            Whether any live buffer changed. Graphs that captured them must then
+            be recaptured to use the new rows; :meth:`service` reports it too.
         """
         pools = self._closure()
-        members = [member for pool in pools if pool.ready < rows for member in pool._live_members()]
         if all(pool.ready >= rows for pool in pools):
             return False
         for pool in pools:
@@ -426,12 +446,48 @@ class ContactPool:
                     f"A contact pool bounded by {pool.bound} rows cannot grow to {rows}; construct the solver with "
                     "model.rigid_contact_max at least the collision pipeline's rigid_contact_max"
                 )
-        _grow_rows(members, rows)
-        for pool in pools:
-            if pool.ready < rows:
-                pool.ready = rows
-                pool.growth_count += 1
-        return True
+        growing = [(pool, pool._live_members()) for pool in pools if pool.ready < rows]
+        _grow_rows([member for _, members in growing for member in members], rows)
+        for pool, members in growing:
+            pool.ready = rows
+            pool.growth_count += 1
+            pool._changes += int(bool(members))
+        return any(members for _, members in growing)
+
+    def reserve(self, rows: int) -> bool:
+        """Hold at least ``rows`` ready rows from now on, for a writer with a fixed contact capacity.
+
+        Outside graph capture the pool and its followers grow now, to
+        :func:`reserved_rows`, keeping their contents. During capture the request
+        warns and waits for the next :meth:`service` (or a reservation outside
+        capture); meanwhile writers stay bounded by the current rows and flag
+        their overflow.
+
+        Returns:
+            Whether live buffers grew now; graphs that captured them must be
+            recaptured (:meth:`service` reports it too).
+
+        Raises:
+            ValueError: If ``rows`` exceeds the bound.
+        """
+        rows = int(rows)
+        if rows <= self.ready:
+            return False
+        if rows > self.bound:
+            raise ValueError(f"A contact pool bounded by {self.bound} rows cannot hold the {rows} required")
+        if self.device.is_cuda and wp.get_stream(self.device).is_capturing:
+            if rows > self._reserved:
+                warnings.warn(
+                    f"{rows} rigid contact rows were reserved during CUDA graph capture, with {self.ready} ready: "
+                    "writers drop and flag the rows past them until the pool's service (or a reservation outside "
+                    "capture) grows it; recapture then",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+            self._reserved = max(self._reserved, rows)
+            return False
+        self._reserved = max(self._reserved, rows)
+        return self.grow(reserved_rows(rows, self.bound))
 
     def record_demand(self, count: wp.array) -> None:
         """Record the contact count in the sticky high-water mark and copy it to pinned host memory.
@@ -450,40 +506,49 @@ class ContactPool:
         return 0 if self._high_water_host is None else int(self._high_water_host.numpy()[0])
 
     def service(self) -> bool:
-        """Grow from the recorded demand; return whether graphs using the pool must be recaptured.
+        """Grow from the recorded demand and reservations; return whether graphs using the pool must be recaptured.
 
         Reads the pinned high-water mark without synchronizing, so it lags the
-        device by the passes still in flight. Grows to :func:`grown_rows`,
-        logging the change. A high-water mark at or above the ready rows means
-        a pass may have dropped contacts: its capacity status stays flagged
-        and this warns.
+        device by the passes still in flight. Grows to :func:`grown_rows`, or to
+        a reservation made during capture, logging the change. A high-water mark
+        at or above the ready rows means a pass may have dropped contacts: its
+        capacity status stays flagged and this warns. Returns ``True`` when live
+        buffers of this pool or its followers grew since the last call, also by
+        a :meth:`reserve` or :meth:`follow` outside it.
         """
-        if not self.growable or (self.device.is_cuda and wp.get_stream(self.device).is_capturing):
+        if self.device.is_cuda and wp.get_stream(self.device).is_capturing:
             return False
-        high_water = self.high_water
-        target = grown_rows(high_water, self.ready, self.bound)
-        if target <= self.ready:
-            return False
-        previous = self.ready
-        before = self.mapped_bytes()
-        self.grow(target)
-        logger.info(
-            "Rigid contact pool grew from %d to %d rows (high-water %d, bound %d): %.1f -> %.1f MiB",
-            previous,
-            target,
-            high_water,
-            self.bound,
-            before / 2**20,
-            self.mapped_bytes() / 2**20,
-        )
-        if high_water >= previous:
-            warnings.warn(
-                f"Rigid contact demand {high_water} reached the {previous} ready rows: a collision pass may have "
-                f"dropped contacts (its capacity status stays flagged); the pool grew to {target} rows",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        return True
+        if self.growable:
+            high_water = self.high_water
+            target = grown_rows(high_water, self.ready, self.bound)
+            if self._reserved > self.ready:
+                target = max(target, reserved_rows(self._reserved, self.bound))
+            if target > self.ready:
+                previous = self.ready
+                before = self.mapped_bytes()
+                self.grow(target)
+                logger.info(
+                    "Rigid contact pool grew from %d to %d rows (high-water %d, reserved %d, bound %d): "
+                    "%.1f -> %.1f MiB",
+                    previous,
+                    target,
+                    high_water,
+                    self._reserved,
+                    self.bound,
+                    before / 2**20,
+                    self.mapped_bytes() / 2**20,
+                )
+                if high_water >= previous:
+                    warnings.warn(
+                        f"Rigid contact demand {high_water} reached the {previous} ready rows: a collision pass may "
+                        f"have dropped contacts (its capacity status stays flagged); the pool grew to {target} rows",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+        changes = sum(pool._changes for pool in self._closure())
+        changed = changes != self._reported
+        self._reported = changes
+        return changed
 
     def mapped_bytes(self) -> int:
         """Return the device bytes this pool's and its followers' rows hold now."""

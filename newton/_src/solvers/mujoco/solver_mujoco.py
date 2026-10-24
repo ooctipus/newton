@@ -5129,7 +5129,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         return as_signed_int32(contype), as_signed_int32(conaffinity)
 
     def contact_capacity_status(self, *, clear: bool = False) -> dict[str, bool]:
-        """Read sticky external Newton-to-MJWarp contact-prefix failures.
+        """Read sticky failures of the contact conversions between Newton and MJWarp.
 
         ``negative_count`` indicates an invalid raw Newton contact count;
         ``source_contacts`` and ``mjwarp_contacts`` indicate demand exceeding
@@ -5137,10 +5137,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         The raw prefix is checked before accounting for contact filtering, so
         flags conservatively report truncation even if omitted contacts would
         subsequently have been rejected. No flag estimates required capacity.
+        :meth:`update_contacts` also sets ``source_contacts`` when MJWarp holds
+        more contacts than the rows of the Newton Contacts it writes.
 
         This status is independent of native MJWarp warning bits. Native
-        MuJoCo collision and the MuJoCo-C backend do not use this converter;
-        their converter flags remain false, not evidence about native capacity.
+        MuJoCo collision and the MuJoCo-C backend do not use the Newton-to-MJWarp
+        converter; its flags are not evidence about native capacity.
         Flags survive later clean conversions, contact generations, model
         notifications, solver resets, and CUDA graph replay.
 
@@ -5189,7 +5191,21 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
 
     @override
     def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
-        """Update `contacts` from MuJoCo contacts when running with ``use_mujoco_contacts``."""
+        """Write MJWarp's contacts and their forces into ``contacts``.
+
+        ``contacts`` must hold every contact MJWarp may have: ``naconmax`` with
+        ``use_mujoco_contacts``, otherwise the rows of the Newton contacts the last
+        step converted. Each call declares that count
+        (:meth:`~newton.Contacts.reserve_rigid_contacts`), which grows a buffer from
+        :meth:`newton.CollisionPipeline.contacts` outside graph capture. During
+        capture the growth waits for :meth:`newton.CollisionPipeline.service_capacity`;
+        until then ``rigid_contact_count`` keeps MJWarp's count, contacts past
+        ``rigid_contact_max`` are dropped and the ``source_contacts`` flag of
+        :meth:`contact_capacity_status` is set.
+
+        Raises:
+            ValueError: If ``contacts`` cannot grow to that count.
+        """
         self._apply_module_options()
         if self.use_mujoco_cpu:
             raise NotImplementedError()
@@ -5199,12 +5215,19 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         mj_data = self.mjw_data
         mj_contact = mj_data.contact
 
-        if mj_data.naconmax > contacts.rigid_contact_max:
+        # MJWarp's own collision fills up to naconmax contacts; otherwise they are the
+        # Newton contacts the last conversion launched over, at most its rows.
+        rows = mj_data.naconmax
+        if not self._use_mujoco_contacts:
+            rows = min(rows, self._last_rigid_contact_max or 0)
+        try:
+            contacts.reserve_rigid_contacts(rows)
+        except ValueError as error:
             raise ValueError(
-                f"MuJoCo naconmax ({mj_data.naconmax}) exceeds contacts.rigid_contact_max "
-                f"({contacts.rigid_contact_max}). Create Contacts with at least "
-                f"rigid_contact_max={mj_data.naconmax}."
-            )
+                f"MuJoCo holds up to {rows} contacts (naconmax {mj_data.naconmax}), more than contacts can hold "
+                f"(rigid_contact_bound {contacts.rigid_contact_bound}). Create Contacts with at least "
+                f"rigid_contact_max={rows}."
+            ) from error
 
         # The conversion rewrites the count, shapes, points and normals in place,
         # without a new contact generation.
@@ -5240,6 +5263,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 contacts.rigid_contact_point1,
                 contacts.rigid_contact_normal,
                 contacts.force,
+                self._contact_capacity_status,
             ],
             device=self.model.device,
         )
