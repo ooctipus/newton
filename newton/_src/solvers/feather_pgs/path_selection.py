@@ -19,6 +19,7 @@ import math
 import numpy as np
 
 from ...sim.contacts import CAPACITY_BLOCKS_PER_SM
+from .conditioning import DEEP_CHAIN_JOINTS
 from .contact_row_plan import contact_row_plan
 from .friction_patches import _CHUNK_SORT_CAPACITY, _LIVE_SORT_CAPACITY, _SORT_SLOT_BITS
 
@@ -1293,6 +1294,28 @@ def _dynamics(solver, source) -> dict:
         "connect_rows": int(solver._connect_count or 0),
         "loop_joints": bool(solver._has_loop_joints),
         "prescribed_response": bool(solver._has_prescribed_response),
+        "armature_floor": _armature_floor(solver),
+    }
+
+
+def _armature_floor(solver) -> dict:
+    # Mirrors _kinematic_state: the armature conditioning_armature added to deep articulations.
+    floor = solver._armature_floor
+    if floor.evaluated == 0:
+        reason = f"No articulation has a root-to-leaf path of {DEEP_CHAIN_JOINTS} joints or more; none is evaluated."
+    elif floor.coordinates == 0:
+        reason = "Every pivot of the evaluated mass matrices clears 4 n u of its diagonal; no armature is added."
+    else:
+        reason = (
+            "Pivots of the evaluated mass matrices fell below 4 n u of their diagonal, beyond float32 "
+            "factorization: the least armature that lifts them there is added."
+        )
+    return {
+        "evaluated_articulations": floor.evaluated,
+        "articulations": floor.articulations,
+        "coordinates": floor.coordinates,
+        "largest": float(floor.largest),
+        "reason": reason,
     }
 
 

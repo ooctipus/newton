@@ -37,7 +37,8 @@ Scenes and features
     legged robot standing on a free base, a gripper lifting a box, a
     diagonal-mass keyboard pressed by an arm, a 17-coordinate hand pressing a
     free cube, and two articulations above the held-tree owner's caps (a
-    66-coordinate humanoid-like tree, a 100-link snake). Articulated contact
+    66-coordinate humanoid-like tree, a 100-link snake with and without joint
+    armature). Articulated contact
     scenes hold two worlds that differ, so a world mix-up shows. Variants: PhysX
     drives, velocity iterations, warm start, contact compliance, contact
     torsion, ``contact_update="unit"``, restitution, bilateral pre-elimination,
@@ -1406,6 +1407,7 @@ def cpu_groups() -> list:
         Group(_physics(scenes.hand(), "point", 16), CPU_SPLIT, (CPU_SPLIT,)),
         Group(_physics(scenes.sprawl(), "point", 64), CPU_SPLIT, (CPU_SPLIT,)),
         Group(_physics(scenes.long_chain(), "point", 64), CPU_SPLIT, (CPU_SPLIT,)),
+        Group(_physics(scenes.long_chain(armature=0.0), "point", 64), CPU_SPLIT, (CPU_SPLIT,)),
     ]
     for scene, iterations in (
         (scenes.chain(), 16),
@@ -1458,6 +1460,9 @@ def cuda_groups() -> list:
                 ref,
                 (MF_DEFAULT, MF_PARALLEL, MF_PARALLEL_MATRIX_FREE, SPLIT_LOOP, SPLIT_TILED),
             ),
+            # Without armature the snake's mass matrix is beyond float32 factorization: the solver adds the
+            # armature it needs near the head, the same on every route.
+            Group(_physics(scenes.long_chain(armature=0.0), law, 64), ref, (MF_DEFAULT, SPLIT_LOOP, SPLIT_TILED)),
             Group(
                 _physics(scenes.torsion_pad(), law, 32, "torsion", contact_torsion_radius=0.05),
                 ref,

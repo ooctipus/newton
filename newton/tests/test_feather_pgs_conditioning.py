@@ -1,0 +1,111 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""Keep the mass matrices of deep articulations within float32 factorization.
+
+A 100-link chain without armature has pivots ratios down to 3.5e-7 of their diagonal, below what a float32
+factorization resolves, and its factor turns non-finite within a few steps. The solver adds the least armature
+that lifts every pivot to ``4 n u`` of its diagonal, only where a pivot falls short.
+"""
+
+import unittest
+import warnings
+
+import numpy as np
+import warp as wp
+
+import newton
+from newton._src.solvers.feather_pgs import conditioning
+from newton.solvers import SolverFeatherPGS
+from newton.tests import feather_pgs_scenes as scenes
+
+
+def _solver(scene, device="cpu"):
+    model = scene.build(device)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        solver = SolverFeatherPGS(model, pgs_mode="split", dense_max_constraints=384)
+    added = [str(warning.message) for warning in caught if "armature" in str(warning.message)]
+    return model, solver, added
+
+
+class TestFeatherPGSConditioning(unittest.TestCase):
+    def test_pivot_floor_lifts_only_short_pivots(self):
+        """Lift each pivot below the floor exactly onto it and leave well-conditioned matrices untouched."""
+        rng = np.random.default_rng(3)
+        factor = rng.standard_normal((2, 12, 12))
+        mass = factor @ factor.transpose(0, 2, 1) + 12.0 * np.eye(12)
+        np.testing.assert_array_equal(conditioning.pivot_floor(mass), 0.0)
+        # A light coordinate nearly redundant with a heavy one: its pivot is 1e-9 of its diagonal.
+        mass = np.array([[[1.0, 1.0 - 1.0e-9], [1.0 - 1.0e-9, 1.0]]])
+        added = conditioning.pivot_floor(mass)
+        ratio = conditioning.PIVOT_FLOOR_FACTOR * 2 * conditioning.FLOAT32_ROUNDING
+        self.assertEqual(added[0, 0], 0.0)
+        lifted = mass[0] + np.diag(added[0])
+        pivots = np.diag(np.linalg.cholesky(lifted)) ** 2
+        np.testing.assert_allclose(pivots[1] / lifted[1, 1], ratio, rtol=1.0e-6)
+
+    def test_depths_follow_the_longest_path(self):
+        """Count the joints on the longest root-to-leaf path of each articulation."""
+        np.testing.assert_array_equal(conditioning.articulation_depths(scenes.long_chain().build("cpu")), [101])
+        self.assertLess(int(conditioning.articulation_depths(scenes.sprawl().build("cpu")).max()), 32)
+
+    def test_bare_chain_gains_armature_near_its_head(self):
+        """Add armature to the joints near a bare chain's head, record it and warn once."""
+        model, solver, added = _solver(scenes.long_chain(armature=0.0))
+        floor = solver.get_path_selection()["routes"]["dynamics"]["armature_floor"]
+        self.assertEqual((floor["evaluated_articulations"], floor["articulations"]), (1, 1))
+        extra = solver._joint_armature_effective - model.joint_armature.numpy()
+        self.assertEqual(floor["coordinates"], int(np.count_nonzero(extra)))
+        self.assertAlmostEqual(floor["largest"], float(extra.max()), places=6)
+        # The free root keeps its armature; the coordinates near the head gain the most.
+        np.testing.assert_array_equal(extra[:6], 0.0)
+        self.assertEqual(int(np.argmax(extra)), 6)
+        self.assertLess(float(extra.max()), 1.0e-3)
+        self.assertEqual(len(added), 1)
+
+    def test_conditioned_and_shallow_models_keep_their_armature(self):
+        """Keep the armature bit for bit where every pivot clears the floor or no path is deep."""
+        for scene, evaluated in ((scenes.long_chain(), 1), (scenes.sprawl(), 0), (scenes.legged(), 0)):
+            with self.subTest(scene=scene.name):
+                model, solver, added = _solver(scene)
+                floor = solver.get_path_selection()["routes"]["dynamics"]["armature_floor"]
+                self.assertEqual(floor["evaluated_articulations"], evaluated)
+                self.assertEqual(floor["coordinates"], 0)
+                np.testing.assert_array_equal(solver._joint_armature_effective, model.joint_armature.numpy())
+                self.assertEqual(added, [])
+
+    def test_bare_chain_stays_finite(self):
+        """Step a bare 100-link chain on the ground without a non-finite factor or velocity."""
+        scene = scenes.long_chain(armature=0.0)
+        model, solver, _ = _solver(scene)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=scene.rigid_contact_max)
+        contacts = pipeline.contacts()
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+        for _ in range(scene.steps):
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, control, contacts, scene.dt)
+            state_0, state_1 = state_1, state_0
+        self.assertTrue(np.isfinite(state_0.joint_qd.numpy()).all())
+        size = solver.size_groups[0]
+        self.assertTrue(np.isfinite(solver.L_by_size[size].numpy()).all())
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
+    def test_cuda_adds_the_cpu_armature(self):
+        """Add the armature on CUDA that the CPU adds, up to the float32 rounding of the mass matrices.
+
+        A pivot near the floor is the difference of two large terms, so a rounding of the mass matrix moves the
+        armature that lifts it by a few percent of the largest addition.
+        """
+        model, cpu, _ = _solver(scenes.long_chain(armature=0.0), "cpu")
+        _, cuda, _ = _solver(scenes.long_chain(armature=0.0), "cuda:0")
+        extra = cpu._joint_armature_effective - model.joint_armature.numpy()
+        np.testing.assert_allclose(
+            cuda._joint_armature_effective, cpu._joint_armature_effective, rtol=0.0, atol=0.05 * float(extra.max())
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

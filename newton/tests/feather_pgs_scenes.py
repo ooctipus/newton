@@ -1184,8 +1184,9 @@ def long_chain(*, links: int = 100, mu: float = 0.6, pull: float = 0.0, armature
     has ``links + 1`` bodies and ``links + 6`` coordinates, above the
     held-tree owner's caps. Joint ``armature`` [kg·m²] (a geared joint's rotor
     inertia) bounds the condition number of the generalized mass matrix: a
-    passive 100-link cable without it reaches about 4e8, beyond float32
-    (dragged by 15 N it diverges on several routes).
+    passive 100-link cable without it reaches about 4e8, beyond float32, and
+    the solver adds the armature its factorization needs near the head (the
+    scene is then named ``long_chain_bare``).
     """
     radius = 0.02
 
@@ -1223,7 +1224,7 @@ def long_chain(*, links: int = 100, mu: float = 0.6, pull: float = 0.0, armature
         state.body_f.assign(forces)
 
     return Scene(
-        "long_chain",
+        "long_chain" if armature else "long_chain_bare",
         build,
         dt=1.0 / 240.0,
         steps=40,

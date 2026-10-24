@@ -52,6 +52,7 @@ from . import environment_flags as _environment_flags
 from . import execution_plan as _execution_plan
 from . import row_metadata as _row_metadata
 from .body_mapping import build_body_maps
+from .conditioning import ArmatureFloor, conditioning_armature
 from .configuration import resolve_kernel_choices
 from .contact_row_plan import SHARED_METADATA_PRODUCERS, contact_row_plan
 from .contact_torsion import (
@@ -1019,6 +1020,15 @@ class SolverFeatherPGS(SolverBase):
     Read it in an RL observation/termination kernel, or call
     :meth:`check_constraint_capacity` outside capture at an observation boundary
     to reject incomplete physics. Ordinary stepping does not synchronize it.
+
+    The solver factors each articulation's mass matrix in float32. Along a
+    serial chain its pivots fall roughly as the cube of the chain's length, so
+    a long chain without joint armature leaves float32's resolution: where an
+    articulation with a root-to-leaf path of at least 32 joints has a pivot
+    below ``4 n u`` of its diagonal (``n`` coordinates, ``u = 2^-24``) at the
+    model's configuration, the solver adds the least joint armature that lifts
+    it there, warns, and reports it under ``routes.dynamics.armature_floor`` of
+    :meth:`get_path_selection`. Give such joints armature to choose it yourself.
 
     Single-body FREE-joint articulations use an energy-preserving local
     gyroscopic update to prevent explicit angular-bias runaway. Fast rotation
@@ -3464,11 +3474,14 @@ class SolverFeatherPGS(SolverBase):
                 raise RuntimeError("Validate contact torsion outside CUDA graph capture")
             preparation.validate()
 
-    def _kinematic_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _kinematic_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, ArmatureFloor]:
         """Derive the kinematic masks and effective joint armature from the body flags, changing nothing.
 
+        The effective armature also holds the least armature that keeps the mass matrix of a deep
+        articulation within float32 factorization (:func:`conditioning_armature`).
+
         Returns:
-            ``(armature, joint_mask, dof_mask)`` for :meth:`_apply_kinematic_state`.
+            ``(armature, joint_mask, dof_mask, floor)`` for :meth:`_apply_kinematic_state`.
 
         Raises:
             RuntimeError: If the flags make a DOF of a sparse split or
@@ -3511,11 +3524,21 @@ class SolverFeatherPGS(SolverBase):
                         "A prescribed-response articulation changed kinematic membership; "
                         "reconstruct the solver and recapture its CUDA graph."
                     )
-        return armature, joint_mask, dof_mask
+        armature, floor = conditioning_armature(model, armature)
+        return armature, joint_mask, dof_mask, floor
 
-    def _apply_kinematic_state(self, kinematic: tuple[np.ndarray, np.ndarray, np.ndarray]) -> None:
+    def _apply_kinematic_state(self, kinematic: tuple[np.ndarray, np.ndarray, np.ndarray, ArmatureFloor]) -> None:
         """Publish derived kinematic masks and armature in place, where captured graphs read them."""
-        armature, joint_mask, dof_mask = kinematic
+        armature, joint_mask, dof_mask, floor = kinematic
+        if floor.coordinates and floor != getattr(self, "_armature_floor", None):
+            warnings.warn(
+                f"SolverFeatherPGS adds joint armature, up to {floor.largest:.3g}, to {floor.coordinates} "
+                f"coordinate(s) of {floor.articulations} articulation(s) whose mass matrix float32 cannot factor "
+                "without it (routes.dynamics.armature_floor). Give these joints armature to choose it yourself.",
+                UserWarning,
+                stacklevel=3,
+            )
+        self._armature_floor = floor
         self._joint_armature_effective = armature
         self._kinematic_dof_mask_host = dof_mask.copy()
         self._kinematic_joint_mask.assign(joint_mask)
