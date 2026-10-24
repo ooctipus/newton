@@ -167,6 +167,7 @@ from .kernels import (
     jcalc_tau,
     local_solve_launch_gate,
     mul_com_spatial_inertia,
+    order_world_contact_rows,
     pack_contact_linear_force_as_spatial,
     pgs_convergence_diagnostic_velocity,
     pgs_ncp_residuals_diagnostic_velocity,
@@ -188,6 +189,7 @@ from .kernels import (
     prepare_world_contact_rows,
     prepare_world_impulses,
     prescale_joint_velocity_limits,
+    record_world_contact_rows,
     refresh_masked_body_inertia,
     remove_free_root_transport_from_qdd,
     reset_world_warmstart_buffers,
@@ -5933,6 +5935,13 @@ class SolverFeatherPGS(SolverBase):
         self._dense_first_rejected_slot = wp.full(
             (self.world_count,), _ROW_SLOT_UNBOUNDED, dtype=wp.int32, device=device
         )
+        # The contact that reserved each dense and matrix-free contact row this step
+        # (record_world_contact_rows); only free rigid bodies take matrix-free contact rows.
+        self._dense_row_contact = wp.zeros(
+            (self.world_count, max(int(self.dense_max_constraints), 1)), dtype=wp.int32, device=device
+        )
+        mf_rows = int(self.mf_max_constraints) if self._has_free_rigid_bodies else 1
+        self._mf_row_contact = wp.zeros((self.world_count, max(mf_rows, 1)), dtype=wp.int32, device=device)
         # Per-world dense row-family boundaries, snapshotted from slot_counter
         # each step (allocated once here: per-step allocation is forbidden
         # under CUDA graph capture). The dense slot layout is
@@ -10316,6 +10325,57 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
+    def _order_contact_rows(self, contacts, contact_build_threads, mf_slot_counter, mf_first_rejected_slot):
+        """Put each world's contact rows in their contacts' order, whatever order the allocator reserved them in.
+
+        The allocator reserves rows with atomics, so on CUDA a world's contact rows follow the
+        order in which warps reach its counter, and an unconverged Gauss-Seidel solve of the same
+        contacts changes with that order between runs. Ordered by contact index, the rows of the
+        same contacts are the same on every run and device. Dense contact rows are ordered from
+        the velocity-limit family's recorded end; the local row packets and keyed rows place
+        their own dense rows and record none.
+        """
+        order_dense = int(self._row_packets is None and self._keyed_rows is None)
+        order_mf = int(self._has_free_rigid_bodies)
+        if not (order_dense or order_mf):
+            return
+        device = self.model.device
+        # One complete warp per world and row family on CUDA, whose lanes count each other's rows.
+        lanes = 32 if device.is_cuda else 1
+        wp.launch(
+            record_world_contact_rows,
+            dim=contact_build_threads,
+            inputs=[
+                contacts.rigid_contact_count,
+                contact_build_threads,
+                contacts.rigid_contact_shape0,
+                self.contact_world,
+                self.contact_slot,
+                self.contact_path,
+                self.contact_slots_needed,
+            ],
+            outputs=[self._dense_row_contact, self._mf_row_contact],
+            device=device,
+        )
+        wp.launch(
+            order_world_contact_rows,
+            dim=(self.world_count, 2, lanes),
+            inputs=[
+                self._dense_row_contact,
+                self.slot_counter,
+                self._dense_first_rejected_slot,
+                self.dense_phase_bounds,
+                order_dense,
+                self._mf_row_contact,
+                mf_slot_counter,
+                mf_first_rejected_slot,
+                order_mf,
+                lanes,
+            ],
+            outputs=[self.contact_slot],
+            device=device,
+        )
+
     def _stage4_build_rows(self, state_in: State, state_aug: State, control: Control, contacts: Contacts, dt: float):
         if self.contact_compliance:
             _contact_compliance.start_step(self, contacts, dt)
@@ -11026,6 +11086,7 @@ class SolverFeatherPGS(SolverBase):
                 ],
                 device=model.device,
             )
+            self._order_contact_rows(contacts, contact_build_threads, mf_slot_counter, mf_first_rejected_slot)
 
             if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
                 for size in self.size_groups:

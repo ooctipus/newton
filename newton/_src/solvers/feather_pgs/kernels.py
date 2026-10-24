@@ -5009,6 +5009,159 @@ def allocate_world_contact_slots_patch_resolved(
         )
 
 
+# The allocators above reserve each contact's rows with an atomic on its world's counter, so on
+# CUDA a world's contact rows follow the order in which warps reach that counter, which varies
+# between runs. Gauss-Seidel sweeps the rows in slot order and stops before it converges, so that
+# order changes the solve. The two kernels below put every world's contact rows in the order of
+# their contacts' indices, as one thread reserving the contacts in turn would: the first records
+# which contact reserved each row, the second moves each contact to the slot at which the rows of
+# its world's lower contact indices end.
+@wp.kernel
+def record_world_contact_rows(
+    contact_count: wp.array[int],
+    total_num_threads: int,
+    contact_shape0: wp.array[int],
+    contact_world: wp.array[int],
+    contact_slot: wp.array[int],
+    contact_path: wp.array[int],
+    contact_slots_needed: wp.array[int],
+    # outputs
+    dense_row_contact: wp.array2d[int],
+    mf_row_contact: wp.array2d[int],
+):
+    """Record the contact that reserved each dense and matrix-free contact row this step."""
+    thread = wp.tid()
+    total_contacts = contact_count[0]
+    if total_contacts > contact_shape0.shape[0]:
+        return  # The allocators reserved no row for an overflowed frame.
+    for c in range(thread, total_contacts, total_num_threads):
+        slot = contact_slot[c]
+        if slot < 0:
+            continue
+        world = contact_world[c]
+        path = contact_path[c]
+        for k in range(contact_slots_needed[c]):
+            if path == 0:
+                dense_row_contact[world, slot + k] = c
+            elif path == 1:
+                mf_row_contact[world, slot + k] = c
+
+
+# A contact index above every real one: the value of a lane past a world's last row.
+_ROW_CONTACT_NONE = wp.constant(2**31 - 1)
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    int count = 0;
+#pragma unroll
+    for (int source = 0; source < 32; ++source)
+        count += __shfl_sync(0xffffffffu, other, source) < contact;
+    return count;
+#else
+    return other < contact;
+#endif
+""")
+def _warp_count_below(other: int, contact: int) -> int:
+    """Count the ``other`` values of this lane's complete CUDA warp below ``contact``; this thread's on CPU.
+
+    Every lane of the warp must call it.
+    """
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    return __all_sync(0xffffffffu, value);
+#else
+    return value;
+#endif
+""")
+def _warp_all(value: int) -> int:
+    """Return nonzero when ``value`` is nonzero on every lane of this lane's complete CUDA warp; ``value`` on CPU.
+
+    Every lane of the warp must call it.
+    """
+
+
+@wp.func
+def _order_family_contact_rows(
+    world: int,
+    lane: int,
+    lanes: int,
+    row_contact: wp.array2d[int],
+    start: int,
+    end: int,
+    contact_slot: wp.array[int],
+):
+    """Move the contacts of one world's reserved rows ``[start, end)`` to their contact order.
+
+    Every row of the range belongs to an accepted contact (a rejected reservation starts at or
+    past the family's first rejected slot), and a contact's rows are contiguous, so a contact's
+    slot is ``start`` plus the number of rows of the range that lower contact indices hold. The
+    world's ``lanes`` lanes read the range ``lanes`` rows at a time and count each other's rows.
+    A range already in contact order, as CPU and most CUDA reservations leave it, keeps its slots.
+    """
+    in_order = int(1)
+    for base in range(start, end - 1, lanes):
+        row = base + lane
+        if row + 1 < end:
+            if row_contact[world, row] > row_contact[world, row + 1]:
+                in_order = 0
+    if _warp_all(in_order) != 0:
+        return
+    for base in range(start, end, lanes):
+        row = base + lane
+        contact = _ROW_CONTACT_NONE
+        first = False
+        if row < end:
+            contact = row_contact[world, row]
+            first = row == start or row_contact[world, row - 1] != contact
+        rank = int(0)
+        for other_base in range(start, end, lanes):
+            other = _ROW_CONTACT_NONE
+            if other_base + lane < end:
+                other = row_contact[world, other_base + lane]
+            rank += _warp_count_below(other, contact)
+        if first:
+            contact_slot[contact] = start + rank
+
+
+@wp.kernel
+def order_world_contact_rows(
+    dense_row_contact: wp.array2d[int],
+    dense_slot_counter: wp.array[int],
+    dense_first_rejected_slot: wp.array[int],
+    dense_phase_bounds: wp.array2d[int],
+    order_dense: int,
+    mf_row_contact: wp.array2d[int],
+    mf_slot_counter: wp.array[int],
+    mf_first_rejected_slot: wp.array[int],
+    order_mf: int,
+    lanes: int,
+    # outputs
+    contact_slot: wp.array[int],
+):
+    """Give each world's dense and matrix-free contact rows the order of their contacts' indices.
+
+    Launched over ``(world_count, 2, lanes)``, one complete warp per world and
+    family (dense, matrix-free) on CUDA (``lanes`` 32) and one thread on CPU
+    (``lanes`` 1), right after the allocator and :func:`record_world_contact_rows`,
+    before any row producer reads ``contact_slot``. Dense contact rows start at
+    the velocity-limit family's end (``dense_phase_bounds[:, 1]``) and
+    matrix-free contact rows at slot 0; both end at the family's counter or
+    first rejected slot.
+    """
+    world, family, lane = wp.tid()
+    if family == 0 and order_dense != 0:
+        end = wp.min(wp.min(dense_slot_counter[world], dense_first_rejected_slot[world]), dense_row_contact.shape[1])
+        _order_family_contact_rows(
+            world, lane, lanes, dense_row_contact, dense_phase_bounds[world, 1], end, contact_slot
+        )
+    if family == 1 and order_mf != 0:
+        end = wp.min(wp.min(mf_slot_counter[world], mf_first_rejected_slot[world]), mf_row_contact.shape[1])
+        _order_family_contact_rows(world, lane, lanes, mf_row_contact, 0, end, contact_slot)
+
+
 @wp.func
 def accumulate_jacobian_row_world(
     body_index: int,

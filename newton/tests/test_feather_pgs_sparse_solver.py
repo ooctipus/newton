@@ -78,7 +78,7 @@ def _build_chain(device: str, *, base_z: float, contact_sphere: str | None, grou
     return scene.finalize(device=device)
 
 
-def _build_model(*, free_count=0, robot_count=1, prescribed=False, heterogeneous=False):
+def _build_model(*, free_count=0, robot_count=1, prescribed=False, heterogeneous=False, device="cuda:0"):
     """Replicate a contacting tripod, optionally surrounded by separate free bodies.
 
     Native sparse factors decline worlds with free rigid bodies, so ``free_count`` builds
@@ -146,7 +146,7 @@ def _build_model(*, free_count=0, robot_count=1, prescribed=False, heterogeneous
         builder.replicate(env, 2)
     if not prescribed:
         builder.add_ground_plane()
-    return builder.finalize(device="cuda:0")
+    return builder.finalize(device=device)
 
 
 def _make_solver(model, sparse, **overrides):
