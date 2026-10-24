@@ -22,16 +22,21 @@ from newton._src.geometry.terrain_law import (
     TERRAIN_CELL_WIDEN,
     TERRAIN_EDGE_BORDER,
     TERRAIN_EDGE_CONCAVE,
+    TERRAIN_EDGE_CORNER,
     TERRAIN_EDGE_FLAT,
     TERRAIN_EPS32,
     TERRAIN_EPS_FACTOR,
     TERRAIN_EPS_MIN_EXTENT,
+    TERRAIN_FACE_WALL,
     TERRAIN_FEATURE_EDGE,
     TERRAIN_FEATURE_FACE,
     TERRAIN_FEATURE_VERTEX,
     TerrainFeatureData,
     TerrainFinishScratch,
+    terrain_border_point,
+    terrain_border_side,
     terrain_cluster,
+    terrain_corner_point,
     terrain_edge_class,
     terrain_edge_point,
     terrain_eps,
@@ -39,6 +44,7 @@ from newton._src.geometry.terrain_law import (
     terrain_feature_id,
     terrain_finish_list,
     terrain_finish_scratch,
+    terrain_interior_vertex,
     terrain_point_below,
     terrain_vertex_feature,
     terrain_vertex_in_cone,
@@ -104,6 +110,64 @@ def suite_like_heights(rng, rows: int = 64, cols: int = 64, *, tile: int = 32):
     return Z
 
 
+def border_terrains(rng) -> dict:
+    """2 m tiles of 0.1 m cells for the heightfield's border, heights ``(21, 21)`` [m] by name: flat, rough (uniform
+    noise in 5 mm steps up to 8 cm) and a slope (0.2 along y), so that the walls stand under a level, a jagged and a
+    tilted rim."""
+    return {
+        "flat": np.zeros((21, 21)),
+        "rough": np.round(rng.uniform(0.0, 0.08, size=(21, 21)) / 0.005) * 0.005,
+        "slope": np.broadcast_to(0.2 * np.linspace(-1.0, 1.0, 21), (21, 21)).T + 0.1,
+    }
+
+
+def border_bodies(rng, hf: ref.ReferenceHeightfield, kinds, count: int) -> list:
+    """Bodies ``(kind, dims, pose)`` at a heightfield's border, ``count`` of each ``(kind, dims)`` of ``kinds``: the
+    pose's point within 8 cm of a wall's plane (a sixth of them at each wall) or of both walls at a corner (a third), in
+    any orientation, the lowest point (a sphere's or capsule's rounded) 3 cm into to 12 mm above the highest terrain
+    under the body's bounds."""
+    bodies = []
+    for i in range(count * len(kinds)):
+        kind, dims = kinds[i % len(kinds)]
+        x = rng.uniform(-hf.hx + 0.1, hf.hx - 0.1)
+        y = rng.uniform(-hf.hy + 0.1, hf.hy - 0.1)
+        side = int(rng.integers(0, 6))
+        if side < 2:
+            x = (1 - 2 * side) * hf.hx + rng.uniform(-0.08, 0.08)
+        elif side < 4:
+            y = (5 - 2 * side) * hf.hy + rng.uniform(-0.08, 0.08)
+        else:
+            x = rng.choice([-1.0, 1.0]) * (hf.hx + rng.uniform(-0.08, 0.08))
+            y = rng.choice([-1.0, 1.0]) * (hf.hy + rng.uniform(-0.08, 0.08))
+        q = rng.normal(size=4)
+        q /= np.linalg.norm(q)
+        lo, hi = ref.make_core(kind, dims, np.r_[x, y, 0.0, q]).aabb()
+        xs = np.clip(np.linspace(lo[0], hi[0], 5), -hf.hx, hf.hx)
+        ys = np.clip(np.linspace(lo[1], hi[1], 5), -hf.hy, hf.hy)
+        top = max(hf.height(xx, yy) for xx in xs for yy in ys)
+        radius = dims["radius"] if kind in ("sphere", "capsule") else 0.0
+        z = top - lo[2] + radius + rng.uniform(-0.03, 0.012)
+        bodies.append((kind, dims, np.array([x, y, z, *q], np.float32).astype(np.float64)))
+    return bodies
+
+
+def outside_face_rows(hf: ref.ReferenceHeightfield, rows, *, tol: float = 1.0e-6) -> list:
+    """The float32 face rows (faces, clipped faces and walls) deeper than ``tol`` whose core point ``q + d n`` lies
+    outside the solid: above the surface over the footprint's closure (the point taken into it within ``tol``) or
+    beyond it. A face's supported point is front-facing: below its plane, it lies inside the block."""
+    out = []
+    for row in rows:
+        q, n, d = row_qnd(row)
+        if d >= -tol or (int(row[3]) >> 5) & 3 != int(TERRAIN_FEATURE_FACE):
+            continue
+        k = q + d * n
+        inside = abs(k[0]) <= hf.hx + tol and abs(k[1]) <= hf.hy + tol
+        height = hf.height(float(np.clip(k[0], -hf.hx, hf.hx)), float(np.clip(k[1], -hf.hy, hf.hy)))
+        if not inside or k[2] > height + tol:
+            out.append(row)
+    return out
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # float32 predicate kernels
 # ----------------------------------------------------------------------------------------------------------------
@@ -146,8 +210,9 @@ def _point_rows_kernel(
     out_d: wp.array2d[float],
     out_feature: wp.array2d[int],
 ):
-    """The point-core rows of the law from the float32 predicates (faces, crease edges, vertices; no G2/G3), every
-    candidate into the point's list of the finish scratch, then the law's finish."""
+    """The point-core rows of the law from the float32 predicates (faces, crease edges, vertices and at the border the
+    border edges, walls and corner lines; no G2/G3), every candidate into the point's list of the finish scratch, then
+    the law's finish."""
     i = wp.tid()
     base = i * scratch.capacity
     p = points[i]
@@ -186,7 +251,17 @@ def _point_rows_kernel(
                 if which == 2 and (r > r1 or c > c1):
                     continue
                 kind = terrain_edge_class(data, window, r, c, which)
-                if kind == TERRAIN_EDGE_FLAT or kind == TERRAIN_EDGE_BORDER:
+                if kind == TERRAIN_EDGE_BORDER:
+                    side = terrain_border_side(window.surface, r, c, which)
+                    if side >= 0 and not below:
+                        claim, q, n, d = terrain_border_point(data, window, r, c, which, side, k)
+                        if claim != 0 and d <= D:
+                            f = terrain_feature_id(r, c, TERRAIN_FEATURE_EDGE, which, 0)
+                            if claim == 2:
+                                f = terrain_feature_id(r, c, TERRAIN_FEATURE_FACE, TERRAIN_FACE_WALL + which, 0)
+                            count = _push(scratch, base, count, q, k, n, d, f)
+                    continue
+                if kind == TERRAIN_EDGE_FLAT:
                     continue
                 if kind == TERRAIN_EDGE_CONCAVE and not below:
                     continue
@@ -202,6 +277,16 @@ def _point_rows_kernel(
                         count = _push(
                             scratch, base, count, q, k, n, d, terrain_feature_id(r, c, TERRAIN_FEATURE_EDGE, which, 0)
                         )
+            if not terrain_interior_vertex(window.surface, r, c):
+                v = terrain_window_vertex(data, window, r, c)
+                if below:
+                    continue
+                if v[2] - k[2] > 0.0:
+                    ok, q, n, d = terrain_corner_point(data, window, r, c, k)
+                    if ok and d <= D:
+                        f = terrain_feature_id(r, c, TERRAIN_FEATURE_EDGE, TERRAIN_EDGE_CORNER, 0)
+                        count = _push(scratch, base, count, q, k, n, d, f)
+                    continue
             if terrain_vertex_point(data, window, r, c, k):
                 v = terrain_window_vertex(data, window, r, c)
                 dist = wp.length(k - v)

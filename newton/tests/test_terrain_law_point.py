@@ -47,8 +47,6 @@ from newton._src.geometry.terrain_law import (
     TerrainPlanes,
     TerrainWindow,
     terrain_claims,
-    terrain_edge_kind,
-    terrain_edge_sides,
     terrain_eps,
     terrain_face_values,
     terrain_feature_id,
@@ -68,7 +66,6 @@ from newton._src.geometry.terrain_law import (
     terrain_window,
     terrain_window_extent,
     terrain_window_point,
-    terrain_window_vertex,
 )
 from newton.tests import terrain_law_reference as ref
 from newton.tests import terrain_law_test_utils as tu
@@ -393,6 +390,94 @@ def test_point_rows_match_the_float64_law(test, device):
             test.assertGreater(totals["f64"], len(bodies))
             test.assertLessEqual(totals["covered"], 0.05 * totals["f64"], msg=totals)
             test.assertLessEqual(totals["tolerated"], 0.02 * totals["f64"], msg=totals)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# the border
+# ----------------------------------------------------------------------------------------------------------------
+
+
+def test_point_rows_match_the_float64_law_at_the_border(test, device):
+    """Reproduce the float64 law's rows at the heightfield's border in float32 for spheres and capsules.
+
+    Spheres and capsules in any orientation within 8 cm of a wall's plane or a corner of flat, rough and sloped tiles,
+    their lowest point up to 3 cm into the top: the walls, border edges, border vertices and corner lines give the
+    float64 law's rows (none missed or extra, none carried or decided within the band here), every pair's deepest row
+    within 10 um, every penetrating row's core point inside the block.
+    """
+    rng = np.random.default_rng(31)
+    kinds = [("sphere", {"radius": 0.03}), ("capsule", {"radius": 0.02, "half_height": 0.06})]
+    for name, heights in tu.border_terrains(rng).items():
+        with test.subTest(terrain=name):
+            hf = tu.reference_surface(tu.heightfield_model(heights, 1.0, 1.0, device="cpu"))
+            bodies = tu.border_bodies(rng, hf, kinds, 20)
+            model, _hfield, shapes = tu.body_scene(heights, 1.0, 1.0, bodies, device=device)
+            pipeline, _contacts, _state = _collide(model, shadow=True)
+            rows = tu.shadow_rows(pipeline)
+            total, defects = 0, []
+            for shape, (kind, dims, pose) in zip(shapes, bodies, strict=True):
+                law = _law_rows(hf, kind, dims, pose)
+                got = rows.get(shape, [])
+                result = tu.compare_rows(hf, law, got)
+                total += len(law)
+                if result.missing or result.extra or result.covered or result.tolerated or result.deepest > 1.0e-5:
+                    defects.append((kind, pose.tolist(), result))
+                if tu.outside_face_rows(hf, got):
+                    defects.append((kind, pose.tolist(), "outside", tu.outside_face_rows(hf, got)))
+            test.assertEqual(defects, [])
+            test.assertGreater(total, len(bodies))
+
+
+def _block_row(centre, reach):
+    """The one row of a point core at ``centre`` about the block ``[-1, 1] x [-1, 1] x [-1, 0]`` (a flat unit
+    heightfield and its walls) within ``reach``, or None: inside the footprint the top face's (a point below it exits
+    through the top), outside it the block's closest point, its wall's above the walls' base."""
+    x, y, z = centre
+    if abs(x) <= 1.0 and abs(y) <= 1.0:
+        return (np.array([x, y, 0.0]), np.array([0.0, 0.0, 1.0]), z) if z <= reach else None
+    if z < -1.0:
+        return None
+    q = np.array([np.clip(x, -1.0, 1.0), np.clip(y, -1.0, 1.0), min(z, 0.0)])
+    d = float(np.linalg.norm(centre - q))
+    return (q, (centre - q) / d, d) if d <= reach else None
+
+
+def test_point_rows_take_the_block_at_the_border(test, device):
+    """Give a sphere about a corner of a flat heightfield's block its one exact row: the block's closest point.
+
+    The heightfield is the solid block ``[-1, 1] x [-1, 1] x [-1, 0]``: its top face, its walls from the border down
+    1 m, the border edges and vertices between them and the corner lines where two walls meet. Sphere centres about
+    every corner, 3-3.5 cm in or out across each wall: over the top (the top face), beyond one wall above the top (a
+    border edge) or beside it below the top (the wall, also 2 cm above its base), beyond both walls above the top (the
+    corner vertex) or below it (the corner line), and inside the footprint below the top (which exits through the
+    top). Each gets one row, the block's closest point with its normal toward the centre and its distance; centres
+    beside the block below the walls' base get none.
+    """
+    radius = 0.02
+    reach = radius + REACH
+    bodies, expected = [], []
+    for sx in (-1.0, 1.0):
+        for sy in (-1.0, 1.0):
+            for u in (0.97, 1.03):
+                for w in (0.965, 1.035):
+                    for z in (0.025, -0.3, -0.98, -1.05):
+                        centre = np.array([sx * u, sy * w, z])
+                        if u < 1.0 and w < 1.0 and z < -0.5:
+                            continue
+                        row = _block_row(centre, reach)
+                        bodies.append(("sphere", {"radius": radius}, np.r_[centre, 0.0, 0.0, 0.0, 1.0]))
+                        expected.append([] if row is None else [row])
+    model, _hfield, shapes = tu.body_scene(np.zeros((21, 21)), 1.0, 1.0, bodies, device=device)
+    pipeline, _contacts, _state = _collide(model, shadow=True)
+    rows = tu.shadow_rows(pipeline)
+    defects = []
+    for shape, (_kind, _dims, pose), want in zip(shapes, bodies, expected, strict=True):
+        got = rows.get(shape, [])
+        missing = tu.missing_rows(want, got, q_tol=1.0e-5, angle_tol=1.0e-5, d_tol=1.0e-5)
+        if len(got) != len(want) or missing:
+            defects.append((pose[:3].tolist(), want, got))
+    test.assertEqual(defects, [])
+    test.assertEqual(sum(len(w) for w in expected), len(bodies) - 12)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1003,7 +1088,8 @@ def _plain_point_item(
     c1: int,
     item: int,
 ):
-    """``terrain_law_point._point_item`` with :func:`_plain_end_face`."""
+    """``terrain_law_point._point_item_border`` (every item of any window, the border's too) with
+    :func:`_plain_end_face`."""
     end = item // 6
     feature = item - 6 * end
     if end == 2:
@@ -1013,27 +1099,14 @@ def _plain_point_item(
     if end == 1:
         k = core.b
         below = core.below_b
-    inside = r <= r1 and c <= c1
     if feature < 2:
-        if not inside:
+        if not (r <= r1 and c <= c1):
             return planes, _Claim()
         planes, n, a = terrain_plane(data, window, planes, r, c, feature)
         return planes, _plain_end_face(data, window, core, end, k, below, r, c, feature, n, a)
-    if feature == 5:
-        if end == 2:
-            return terrain_law_point._axis_vertex(data, window, planes, core, r, c)
-        return planes, terrain_law_point._end_vertex(data, window, core, end, k, below, r, c)
-    which = feature - 2
-    if (which == 0 and c > c1) or (which == 1 and r > r1) or (which == 2 and not inside):
-        return planes, _Claim()
-    if terrain_edge_kind(data, window.surface, r, c, which) >= 0:
-        return planes, _Claim()
-    v0i, v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
-    v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
-    v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
     if end == 2:
-        return terrain_law_point._axis_edge(data, window, planes, core, r, c, which, v0, v1)
-    return terrain_law_point._end_edge(data, window, planes, core, end, k, below, r, c, which, v0, v1)
+        return terrain_law_point._axis_item_border(data, window, planes, core, r, c, r1, c1, feature)
+    return terrain_law_point._end_item_border(data, window, planes, core, end, k, below, r, c, r1, c1, feature)
 
 
 @wp.kernel(enable_backward=False)
@@ -1744,6 +1817,8 @@ for _name, _func in (
     ("test_point_rows_are_minimal_at_flat_seams", test_point_rows_are_minimal_at_flat_seams),
     ("test_point_rows_are_complete", test_point_rows_are_complete),
     ("test_point_rows_match_the_float64_law", test_point_rows_match_the_float64_law),
+    ("test_point_rows_match_the_float64_law_at_the_border", test_point_rows_match_the_float64_law_at_the_border),
+    ("test_point_rows_take_the_block_at_the_border", test_point_rows_take_the_block_at_the_border),
     ("test_buried_cores_exit_by_the_minimum_translation", test_buried_cores_exit_by_the_minimum_translation),
     ("test_point_rows_have_the_plane_at_noisy_flat_seams", test_point_rows_have_the_plane_at_noisy_flat_seams),
     ("test_capsule_axis_exits_over_a_ridge", test_capsule_axis_exits_over_a_ridge),

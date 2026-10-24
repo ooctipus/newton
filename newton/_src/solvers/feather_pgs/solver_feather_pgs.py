@@ -172,6 +172,7 @@ from .kernels import (
     pgs_ncp_residuals_diagnostic_velocity,
     pgs_solve_loop,
     pgs_solve_mf_loop,
+    place_world_contact_runs,
     populate_connect_J_for_size,
     populate_joint_velocity_limit_J_for_size,
     populate_mimic_J_for_size,
@@ -188,6 +189,7 @@ from .kernels import (
     prepare_world_contact_rows,
     prepare_world_impulses,
     prescale_joint_velocity_limits,
+    record_world_contact_runs,
     refresh_masked_body_inertia,
     remove_free_root_transport_from_qdd,
     reset_world_warmstart_buffers,
@@ -5922,6 +5924,20 @@ class SolverFeatherPGS(SolverBase):
         self._dense_first_rejected_slot = wp.full(
             (self.world_count,), _ROW_SLOT_UNBOUNDED, dtype=wp.int32, device=device
         )
+        # Contact runs of each world and block under sorted contacts (record_world_contact_runs):
+        # blocks are the global shapes before every world's, the worlds' own shapes, and the global
+        # shapes after them; 16 bytes per world and block.
+        shape_world_start = model.shape_world_start.numpy() if model.shape_world_start is not None else None
+        if shape_world_start is None or model.shape_count == 0:
+            self._contact_run_lead, self._contact_run_trail_start = 0, int(model.shape_count)
+        else:
+            self._contact_run_lead = int(shape_world_start[0])
+            self._contact_run_trail_start = int(shape_world_start[-2])
+        run_blocks = self._contact_run_lead + 1 + int(model.shape_count) - self._contact_run_trail_start
+        run_shape = (self.world_count, run_blocks)
+        self._contact_run_first = wp.full(run_shape, 2**31 - 1, dtype=wp.int32, device=device)
+        self._contact_run_last = wp.full(run_shape, -1, dtype=wp.int32, device=device)
+        self._contact_run_rows = wp.zeros(run_shape, dtype=wp.vec2i, device=device)
         # Per-world dense row-family boundaries, snapshotted from slot_counter
         # each step (allocated once here: per-step allocation is forbidden
         # under CUDA graph capture). The dense slot layout is
@@ -10304,6 +10320,64 @@ class SolverFeatherPGS(SolverBase):
             device=self.model.device,
         )
 
+    def _place_sorted_contact_rows(self, contacts, contact_build_threads, mf_slot_counter, mf_first_rejected_slot):
+        """Give each world's contact rows the order of sorted contacts, whatever order the allocator reserved them in.
+
+        Runs only when the contacts come from a deterministic collision pipeline
+        (``Contacts.rigid_contacts_pair_sorted``), whose determinism Newton promises when the
+        solver is deterministic as well; the default pipeline keeps the allocator's atomic
+        reservation, whose order on CUDA follows the warps. A captured step keeps the order of
+        its capture. Dense rows are placed unless the local row packets or keyed rows place
+        their own; matrix-free rows are placed with free rigid bodies.
+        """
+        order_dense = int(self._row_packets is None and self._keyed_rows is None)
+        order_mf = int(self._has_free_rigid_bodies)
+        if not (order_dense or order_mf):
+            return
+        device = self.model.device
+        runs = (self._contact_run_first, self._contact_run_last, self._contact_run_rows)
+        blocks = (self._contact_run_lead, self._contact_run_trail_start)
+        # Complete warps on CUDA, whose lanes merge each run's contacts before recording it.
+        lanes = 32 if device.is_cuda else 1
+        record_threads = -(-contact_build_threads // lanes) * lanes
+        wp.launch(
+            record_world_contact_runs,
+            dim=record_threads,
+            inputs=[
+                contacts.rigid_contact_count,
+                record_threads,
+                lanes,
+                contacts.rigid_contact_shape0,
+                self.contact_world,
+                self.contact_path,
+                self.contact_slots_needed,
+                order_dense,
+                order_mf,
+                *blocks,
+            ],
+            outputs=list(runs),
+            device=device,
+        )
+        # One complete warp per world on CUDA, whose lanes sum each other's rows.
+        wp.launch(
+            place_world_contact_runs,
+            dim=(self.world_count, lanes),
+            inputs=[
+                contacts.rigid_contact_shape0,
+                self.contact_world,
+                self.contact_path,
+                self.contact_slots_needed,
+                self.slot_counter,
+                self._dense_first_rejected_slot,
+                mf_slot_counter,
+                mf_first_rejected_slot,
+                *blocks,
+                lanes,
+            ],
+            outputs=[*runs, self.contact_slot],
+            device=device,
+        )
+
     def _stage4_build_rows(self, state_in: State, state_aug: State, control: Control, contacts: Contacts, dt: float):
         if self.contact_compliance:
             _contact_compliance.start_step(self, contacts, dt)
@@ -11014,6 +11088,10 @@ class SolverFeatherPGS(SolverBase):
                 ],
                 device=model.device,
             )
+            if contacts.rigid_contacts_pair_sorted:
+                self._place_sorted_contact_rows(
+                    contacts, contact_build_threads, mf_slot_counter, mf_first_rejected_slot
+                )
 
             if self._H_bufs is None and not j_buffers_zeroed:  # not double-buffered
                 for size in self.size_groups:

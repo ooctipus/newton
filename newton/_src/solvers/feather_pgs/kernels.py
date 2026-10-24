@@ -5009,6 +5009,251 @@ def allocate_world_contact_slots_patch_resolved(
         )
 
 
+# The allocators above reserve each contact's rows with an atomic on its world's counter, so on CUDA a
+# world's rows follow the order in which warps reach that counter, which varies between runs, and an
+# unconverged Gauss-Seidel solve changes with it. Under a deterministic collision pipeline
+# (Contacts.rigid_contacts_pair_sorted) the contacts arrive sorted by (shape0, shape1), and the two kernels
+# below give every world's rows that order instead. Shapes are numbered world by world, with the global
+# shapes before and after every world's (Model.shape_world_start), so a world's contacts form one contiguous
+# run per block: the run its own shapes head, and one per global shape that heads its contacts with the
+# world. record_world_contact_runs notes each run's first and last contact and rows, and
+# place_world_contact_runs, one warp per world, places the runs block after block from the world's first
+# contact row. A family whose reservations overflowed keeps the allocator's layout.
+
+# The first contact of a run without contacts.
+_CONTACT_RUN_EMPTY = wp.constant(2**31 - 1)
+
+
+@wp.func
+def _contact_run_block(shape: int, global_lead: int, global_trail_start: int) -> int:
+    """Block of a contact whose first shape is ``shape``: its own if the shape is global, else the worlds' block."""
+    if shape < global_lead:
+        return wp.max(shape, 0)
+    if shape < global_trail_start:
+        return global_lead
+    return global_lead + 1 + shape - global_trail_start
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    // The lanes of one warp iteration hold ascending contacts; the lanes of one run form a group,
+    // whose lowest lane records the group's first and last contact and rows.
+    const unsigned group = __match_any_sync(0xffffffffu, key);
+    const int leader = __ffs(group) - 1;
+    const int first = __shfl_sync(0xffffffffu, contact, leader);
+    const int last = __shfl_sync(0xffffffffu, contact, 31 - __clz(group));
+#if __CUDA_ARCH__ >= 800
+    const int dense_rows = __reduce_add_sync(group, dense);
+    const int mf_rows = __reduce_add_sync(group, mf);
+#else
+    int dense_rows = 0;
+    int mf_rows = 0;
+    for (int source = 0; source < 32; ++source) {
+        const int source_dense = __shfl_sync(0xffffffffu, dense, source);
+        const int source_mf = __shfl_sync(0xffffffffu, mf, source);
+        if (group & (1u << source)) {
+            dense_rows += source_dense;
+            mf_rows += source_mf;
+        }
+    }
+#endif
+    if (key >= 0 && (int)(threadIdx.x & 31) == leader) {
+        atomicMin(&run_first.data[key], first);
+        atomicMax(&run_last.data[key], last);
+        if (dense_rows != 0)
+            atomicAdd(&run_rows.data[key].c[0], dense_rows);
+        if (mf_rows != 0)
+            atomicAdd(&run_rows.data[key].c[1], mf_rows);
+    }
+#elif defined(__CUDA_ARCH__)
+    if (key >= 0) {
+        atomicMin(&run_first.data[key], contact);
+        atomicMax(&run_last.data[key], contact);
+        atomicAdd(&run_rows.data[key].c[0], dense);
+        atomicAdd(&run_rows.data[key].c[1], mf);
+    }
+#else
+    if (key >= 0) {
+        if (contact < run_first.data[key])
+            run_first.data[key] = contact;
+        if (contact > run_last.data[key])
+            run_last.data[key] = contact;
+        run_rows.data[key].c[0] += dense;
+        run_rows.data[key].c[1] += mf;
+    }
+#endif
+""")
+def _record_contact_run(
+    key: int,
+    contact: int,
+    dense: int,
+    mf: int,
+    run_first: wp.array2d[int],
+    run_last: wp.array2d[int],
+    run_rows: wp.array2d[wp.vec2i],
+):
+    """Merge a contact into the run ``key`` (flat world and block index; -1 for none), once per run and warp on CUDA.
+
+    Every lane of the complete warp must call it, with ascending contacts.
+    """
+
+
+@wp.kernel(enable_backward=False)
+def record_world_contact_runs(
+    contact_count: wp.array[int],
+    total_num_threads: int,
+    lanes: int,
+    contact_shape0: wp.array[int],
+    contact_world: wp.array[int],
+    contact_path: wp.array[int],
+    contact_slots_needed: wp.array[int],
+    order_dense: int,
+    order_mf: int,
+    global_lead: int,
+    global_trail_start: int,
+    # outputs
+    run_first: wp.array2d[int],
+    run_last: wp.array2d[int],
+    run_rows: wp.array2d[wp.vec2i],
+):
+    """Record each (world, block) run's first and last routed contact and its rows (dense, matrix-free).
+
+    ``total_num_threads`` is a multiple of ``lanes`` (32 on CUDA, 1 on CPU), so each warp
+    iteration covers 32 consecutive contacts.
+    """
+    thread = wp.tid()
+    lane = thread % lanes
+    total_contacts = contact_count[0]
+    if total_contacts > contact_shape0.shape[0]:
+        return  # The allocators routed no contact of an overflowed frame.
+    blocks = run_rows.shape[1]
+    for base in range(thread - lane, total_contacts, total_num_threads):
+        c = base + lane
+        key = int(-1)
+        dense = int(0)
+        mf = int(0)
+        if c < total_contacts:
+            path = contact_path[c]
+            world = contact_world[c]
+            shape = contact_shape0[c]
+            needed = contact_slots_needed[c]
+            if path == 0 and order_dense != 0:
+                dense = needed
+            if path == 1 and order_mf != 0:
+                mf = needed
+            if dense > 0 or mf > 0:
+                key = world * blocks + _contact_run_block(shape, global_lead, global_trail_start)
+        _record_contact_run(key, c, dense, mf, run_first, run_last, run_rows)
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    const int lane = threadIdx.x & 31;
+    int sum = value;
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        const int lower = __shfl_up_sync(0xffffffffu, sum, offset);
+        if (lane >= offset)
+            sum += lower;
+    }
+    return sum - value;
+#else
+    return 0;
+#endif
+""")
+def _warp_sum_below(value: int) -> int:
+    """Sum ``value`` over the lower lanes of this lane's complete CUDA warp; 0 on CPU, where a thread is alone.
+
+    Every lane of the warp must call it.
+    """
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    int sum = value;
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+    return sum;
+#else
+    return value;
+#endif
+""")
+def _warp_sum(value: int) -> int:
+    """Sum ``value`` over this lane's complete CUDA warp; ``value`` on CPU, where a thread is alone.
+
+    Every lane of the warp must call it.
+    """
+
+
+@wp.kernel(enable_backward=False)
+def place_world_contact_runs(
+    contact_shape0: wp.array[int],
+    contact_world: wp.array[int],
+    contact_path: wp.array[int],
+    contact_slots_needed: wp.array[int],
+    dense_slot_counter: wp.array[int],
+    dense_first_rejected_slot: wp.array[int],
+    mf_slot_counter: wp.array[int],
+    mf_first_rejected_slot: wp.array[int],
+    global_lead: int,
+    global_trail_start: int,
+    lanes: int,
+    # outputs
+    run_first: wp.array2d[int],
+    run_last: wp.array2d[int],
+    run_rows: wp.array2d[wp.vec2i],
+    contact_slot: wp.array[int],
+):
+    """Place each world's recorded contact runs in block order and reset the records for the next step.
+
+    Launched over ``(world_count, lanes)``: one complete warp per world on CUDA (``lanes`` 32),
+    one thread on CPU (``lanes`` 1). Each family's runs start at the slot where the allocator's
+    counter began, which the counter less the family's rows recovers; a family whose
+    reservations overflowed (a first rejected slot below its counter) keeps the allocator's
+    slots, all of which lie below that slot.
+    """
+    world, lane = wp.tid()
+    blocks = run_rows.shape[1]
+    total = wp.vec2i(0, 0)
+    for block in range(blocks):
+        total += run_rows[world, block]
+    place_dense = total[0] > 0 and dense_first_rejected_slot[world] >= dense_slot_counter[world]
+    place_mf = total[1] > 0 and mf_first_rejected_slot[world] >= mf_slot_counter[world]
+    next_dense = dense_slot_counter[world] - total[0]
+    next_mf = mf_slot_counter[world] - total[1]
+    for block in range(blocks):
+        last = run_last[world, block]
+        if not (place_dense or place_mf):
+            last = -1
+        for base in range(run_first[world, block], last + 1, lanes):
+            c = base + lane
+            dense = int(0)
+            mf = int(0)
+            if c <= last:
+                path = contact_path[c]
+                owner = contact_world[c]
+                shape = contact_shape0[c]
+                needed = contact_slots_needed[c]
+                if owner == world and _contact_run_block(shape, global_lead, global_trail_start) == block:
+                    if path == 0 and place_dense:
+                        dense = needed
+                    if path == 1 and place_mf:
+                        mf = needed
+            dense_below = _warp_sum_below(dense)
+            mf_below = _warp_sum_below(mf)
+            if dense > 0:
+                contact_slot[c] = next_dense + dense_below
+            if mf > 0:
+                contact_slot[c] = next_mf + mf_below
+            next_dense += _warp_sum(dense)
+            next_mf += _warp_sum(mf)
+    # Every lane has read the records before any is reset.
+    _tree_warp_sync()
+    for block in range(lane, blocks, lanes):
+        run_first[world, block] = _CONTACT_RUN_EMPTY
+        run_last[world, block] = -1
+        run_rows[world, block] = wp.vec2i(0, 0)
+
+
 @wp.func
 def accumulate_jacobian_row_world(
     body_index: int,

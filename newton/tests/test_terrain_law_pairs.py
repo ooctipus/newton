@@ -40,7 +40,8 @@ _CLASS = {
     "box": TERRAIN_PARTNER_BOX,
     "cylinder": TERRAIN_PARTNER_CYLINDER,
     "cone": TERRAIN_PARTNER_CYLINDER,
-    "barrel": TERRAIN_PARTNER_HULL,
+    "barrel": TERRAIN_PARTNER_CYLINDER,
+    "plane": TERRAIN_PARTNER_BOX,
     "ellipsoid": TERRAIN_PARTNER_HULL,
     "hull": TERRAIN_PARTNER_HULL,
 }
@@ -66,7 +67,8 @@ def _cube():
 
 
 def _scene(device, *, worlds=3):
-    """A global heightfield (0.1 m cells) and, per world, one partner of every kind plus excluded ones.
+    """A global heightfield (0.1 m cells) and, per world, one partner of every kind (a finite plane on the body
+    among them) plus excluded ones.
 
     Excluded per world: a triangle mesh, a sphere that takes no part in shape collision, one in collision group
     2 (the heightfield is in group 1) and one filtered against the heightfield.
@@ -89,6 +91,7 @@ def _scene(device, *, worlds=3):
             "cylinder": builder.add_shape_cylinder(body, radius=0.02, half_height=0.06, cfg=cfg),
             "cone": builder.add_shape_cone(body, radius=0.03, half_height=0.04, cfg=cfg),
             "barrel": builder.add_shape_cylinder(body, radius=0.02, half_height=0.06, barrel_radius=0.2, cfg=cfg),
+            "plane": builder.add_shape_plane(body=body, width=0.1, length=0.08, cfg=cfg),
             "ellipsoid": builder.add_shape_ellipsoid(body, rx=0.03, ry=0.02, rz=0.01, cfg=cfg),
             "hull": builder.add_shape_convex_hull(body, mesh=cube, cfg=cfg),
         }
@@ -155,12 +158,15 @@ def test_pair_table_from_the_collision_filter(test, device):
             test.assertTrue(np.all(np.diff(table.world[segment]) >= 0))
             test.assertEqual(end - begin, int(np.sum((table.partner_class == partner) & (table.lane_class == lane))))
     # Every pair's bound on its candidates: its largest window's vertices (21 x 21 at most) times the rows a vertex's
-    # features give its partner, and the rows added after the walk.
+    # features give its partner, the rows added after the walk and for a solid the rows of the heightfield's border
+    # (four per vertex along the window's sides, 24 more).
     for i, b in enumerate(pairs[:, 1]):
         kind = kinds[int(b)][0]
         side = min(math.floor(2.0 * (radius[b] + 0.04) / 0.1) + 4, 21)
         per_vertex, per_pair = _ROWS_PER_VERTEX.get(kind, (15, 4))
-        test.assertEqual(table.candidates[i], per_vertex * side * side + per_pair, msg=kind)
+        border = 0 if kind in _ROWS_PER_VERTEX else 4 * 2 * side + 24
+        test.assertEqual(table.sides[i], 2 * side, msg=kind)
+        test.assertEqual(table.candidates[i], per_vertex * side * side + per_pair + border, msg=kind)
     test.assertEqual(table.memory_bytes()["pairs"], 8 * len(kinds))
 
 

@@ -359,14 +359,15 @@ class TestTerrainLawContacts(unittest.TestCase):
         self.assertEqual(_law_record(stock)["decision"], "default")
 
     def test_no_partner_keeps_the_terrain_route_cpu(self):
-        """Build no law where no heightfield pair has a partner it writes, and say so: a barrel cylinder's (a
-        hull-class shape without a core in the law yet) only pair, and a listed class without pairs."""
+        """Build no law where no heightfield pair has a partner it writes, and say so: a triangle mesh's only pair (the
+        mesh path's), and a listed class without pairs."""
         builder = newton.ModelBuilder()
         cfg = builder.ShapeConfig(margin=0.01, gap=0.01)
         terrain = newton.Heightfield(data=np.zeros((9, 9), np.float32), nrow=9, ncol=9, hx=0.4, hy=0.4)
         builder.add_shape_heightfield(heightfield=terrain, cfg=cfg)
-        barrel = builder.add_body(xform=wp.transform(wp.vec3(0.2, 0.0, 0.05)))
-        builder.add_shape(body=barrel, type=newton.GeoType.CYLINDER, scale=wp.vec3(0.03, 0.04, 0.2), cfg=cfg)
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.2, 0.0, 0.05)))
+        mesh = newton.Mesh.create_box(0.03, 0.03, 0.03, compute_inertia=False)
+        builder.add_shape_mesh(body, mesh=mesh, cfg=cfg)
         model = builder.finalize(device="cpu")
         pipeline = _pipeline(model, {}, **PIPELINE)
         record = _law_record(pipeline)
@@ -379,6 +380,39 @@ class TestTerrainLawContacts(unittest.TestCase):
         record = _law_record(_pipeline(builder.finalize(device="cpu"), {"NEWTON_TERRAIN_LAW": "point"}, **PIPELINE))
         self.assertEqual((record["writes"], record["decision"]), (False, "no_partner"))
         self.assertIn("of the listed classes", record["reason"])
+
+    def test_barrels_and_finite_planes_are_the_laws_cpu(self):
+        """Write the heightfield contacts of barrel cylinders (the cylinder class) and of finite planes on bodies (the box
+        class, a box of no thickness) with the law by default; refuse an infinite plane on a body, which meets the
+        whole heightfield, at construction (``NEWTON_TERRAIN_LAW=none`` keeps the terrain route for it)."""
+        builder = newton.ModelBuilder()
+        cfg = builder.ShapeConfig(margin=0.01, gap=0.01)
+        terrain = newton.Heightfield(data=np.zeros((9, 9), np.float32), nrow=9, ncol=9, hx=0.4, hy=0.4)
+        hfield = builder.add_shape_heightfield(heightfield=terrain, cfg=cfg)
+        barrel = builder.add_shape_cylinder(
+            builder.add_body(xform=wp.transform(wp.vec3(0.2, 0.0, 0.035))),
+            radius=0.03,
+            half_height=0.04,
+            barrel_radius=0.2,
+            cfg=cfg,
+        )
+        plate = builder.add_shape_plane(
+            body=builder.add_body(xform=wp.transform(wp.vec3(-0.2, 0.0, -0.002))), width=0.1, length=0.06, cfg=cfg
+        )
+        model = builder.finalize(device="cpu")
+        pipeline = _pipeline(model, {}, **PIPELINE)
+        self.assertEqual(_law_record(pipeline)["decision"], "default")
+        partner = pipeline.narrow_phase._terrain_law_partner.numpy()
+        self.assertEqual((int(partner[barrel]), int(partner[plate])), (1, 1))
+        state = model.state()
+        rows = tu.contact_rows(model, state, _collide(pipeline, state), hfield)
+        self.assertEqual(len(rows[barrel]), 3)
+        self.assertEqual(len(rows[plate]), 4)
+        builder.add_shape_plane(body=builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.3, 0.1))), width=0.0, cfg=cfg)
+        model = builder.finalize(device="cpu")
+        with self.assertRaisesRegex(ValueError, "a plane of infinite extent on body 2, collides with heightfield"):
+            _pipeline(model, {}, **PIPELINE)
+        self.assertEqual(_law_record(_pipeline(model, TERRAIN_ROUTE, **PIPELINE))["decision"], "opted_out")
 
     def test_contact_overflow_raises_contacts_cpu(self):
         """Raise the narrow phase's ``contacts`` bit when the law's contacts overflow the contact buffer.

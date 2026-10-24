@@ -11,7 +11,7 @@ the surface predicates, the per-pair window (:func:`terrain_box_cells`, :func:`t
 (:func:`terrain_finish_slots`, :func:`terrain_finish_list`, :func:`terrain_finish_deferred`), the per-pair inputs and
 side buffer of the shadow route (:class:`TerrainPairInputs`, :class:`TerrainLawRows`), the launch arguments of its fixed
 grids (:class:`TerrainPairWork`, :class:`TerrainFinishScratch`) and the per-pair output protocol
-(:func:`terrain_pair_exit`, :func:`terrain_spill_rows`, :func:`terrain_hold_row`, :func:`terrain_hold_candidate`,
+(:func:`terrain_pair_exit`, :func:`terrain_spill_rows`, :func:`terrain_hold_row`, :func:`terrain_place_candidate`,
 :func:`terrain_plane_group_of_three`, :func:`terrain_defer_pair`, :func:`terrain_store_row`). The static
 data live in :mod:`terrain_contacts`, the per-type kernels in modules of their own (``terrain_law_<type>``), and
 :mod:`terrain_shadow` runs them after the narrow phase and writes their rows as the contacts of the pairs the narrow
@@ -42,17 +42,25 @@ Surface model:
   cluster uses the cluster's plane, a cluster of one triangle its own plane. Edge classes (flat inside a cluster,
   else convex or concave) and vertex features (incident cluster normals spanning 3-D) follow from the cluster ids
   and the heights.
+* The border: the heightfield is a solid block. Its footprint ``[-hx, hx] x [-hy, hy]`` has vertical side walls from
+  the border edges down :data:`TERRAIN_WALL_DEPTH` (the terrain route's prism extrusion), so that the block's border
+  features are its walls (one plane per side, :func:`terrain_border_side`), its border edges (convex creases between
+  their one triangle and the wall, :func:`terrain_wall_edge_value`), its border vertices (whose rings take the wall
+  below them) and the vertical corner lines where two walls meet. The walls are one-sided: they bound the block for
+  points beside it, while a point inside the footprint below the surface exits through the top, as everywhere.
 
 Rows carry a window-local feature id in the 23-bit ``sort_sub_key`` of the contact contract (19 bits:
-``r mod 64``, ``c mod 64``, kind, sub-feature, point slot), unique within any window under 64 cells across.
+``r mod 64``, ``c mod 64``, kind, sub-feature, point slot), unique within any window under 64 cells across. The kinds'
+sub-features: a face's triangle (0, 1) or the wall of its vertex's x- or y-edge (2, 3: :data:`TERRAIN_FACE_WALL`); an
+edge's x-, y- or diagonal edge (0, 1, 2) or its vertex's corner line (3: :data:`TERRAIN_EDGE_CORNER`).
 
 The per-pair finish merges coincident rows, drops the rows the others of their plane group imply (the lower convex
 hull of tangent position and distance, residual ``1e-6 m``) and keeps at most four rows per plane group (deepest,
 farthest, largest triangle, largest quadrilateral): every row it keeps is a support, and no count bounds them. It
 runs in place, on a walking pair's own slots (:func:`terrain_finish_slots`, up to :data:`TERRAIN_FINISH_MASK_ROWS`
 rows, one thread), or for a deferred pair on its candidates in a block's scratch (:func:`terrain_finish_list`, every
-distinct candidate a pair's window can give, :class:`TerrainFinishScratch`; a block's lanes splitting the implied-row
-tests); both keep the same rows, bit for bit. A pair's rows live in its walk slots, or when they are more, in a spill
+candidate a pair's window can give, :class:`TerrainFinishScratch`; a block's lanes splitting every step); both keep the
+same rows, bit for bit. A pair's rows live in its walk slots, or when they are more, in a spill
 region sized at the scene level (:class:`TerrainLawRows`). A spill region too small for a collide's rows, or a window
 larger than the one its pair's shape data gave at construction, sets a sticky bit of the narrow phase's buffer status
 word, which ``verify_narrow_phase_buffers`` keeps and ``NarrowPhase.check_buffer_capacity`` raises on
@@ -159,9 +167,23 @@ TERRAIN_FEATURE_VERTEX = wp.constant(2)
 TERRAIN_FEATURE_RECOVERY = wp.constant(3)
 TERRAIN_FEATURE_BITS = 19
 """Bits of a feature id: ``r mod 64`` (6), ``c mod 64`` (6), kind (2), sub-feature (2), point slot (3)."""
+TERRAIN_FACE_WALL = wp.constant(2)
+"""Sub-feature of a face row on a wall: the wall below vertex ``(r, c)``'s x-edge (this code) or y-edge (one more)."""
+TERRAIN_EDGE_CORNER = wp.constant(3)
+"""Sub-feature of an edge row on a corner line: the vertical edge where two walls meet below vertex ``(r, c)``."""
+
+TERRAIN_ON_FEATURE = 1.0e-9
+"""Core distance [m] below which a core point lies on an edge or a corner line: its row takes the bisector of their
+normals."""
+TERRAIN_WALL_DEPTH = 1.0
+"""Depth of the heightfield's side walls below its border edges [m, heightfield-local]: the block's footprint has
+vertical walls from every border edge down this far, the terrain route's prism extrusion (``TRIANGLE_PRISM_EXTRUSION``),
+and a wall or corner line claims nothing below them."""
+TERRAIN_SIDE_COUNT = 4
+"""Walls of a heightfield (:func:`terrain_border_side`)."""
 
 TERRAIN_FINISH_CANDIDATE_OVERFLOW = wp.constant(1)
-"""Report flag: the pair's window gave more distinct candidates than its scratch holds (:class:`TerrainFinishScratch`),
+"""Report flag: the pair's window gave more candidates than its scratch holds (:class:`TerrainFinishScratch`),
 which only a window larger than its pair's shape data gave at construction can (the shape's scale, margin or gap
 changed since)."""
 TERRAIN_FINISH_ROW_OVERFLOW = wp.constant(2)
@@ -189,15 +211,13 @@ TERRAIN_PAIR_ROW_OVERFLOW = wp.constant(16)
 """Pair state: the pair's rows exceed its walk slots and the spill region had no room for them (no row;
 ``terrain_rows`` is raised)."""
 TERRAIN_PAIR_CANDIDATE_OVERFLOW = wp.constant(32)
-"""Pair state: the pair's window gave more distinct candidates than its scratch holds (it keeps the first in window
+"""Pair state: the pair's window gave more candidates than its scratch holds (it keeps the first in window
 order; ``terrain_rows`` is raised): its shape data changed after the shadow was built."""
 TERRAIN_PAIR_WIDE = wp.constant(64)
 """Pair state: the window spans 64 cells or more, so feature ids may repeat within it (rows are still emitted)."""
 TERRAIN_PAIR_DEFERRED = wp.constant(128)
 """Pair state, transient: the pair's rows need more than its walk slots (or, for the point class, the general finish),
 and it awaits its class's finish of deferred pairs (:func:`terrain_defer_pair`)."""
-TERRAIN_PAIR_UNSUPPORTED = wp.constant(256)
-"""Pair state: the partner's shape has no core in the law yet (a barrel cylinder in the hull class; no row)."""
 TERRAIN_PAIR_JOBS = wp.constant(1024)
 """Pair state, transient: a solid pair's scan listed its window's features for its class's job kernels, and its close
 kernel takes their rows."""
@@ -240,6 +260,11 @@ _CREASE_CELLS = wp.constant(TERRAIN_CREASE_STATIC_CELLS)
 _CREASE_ROUNDING = wp.constant(TERRAIN_CREASE_STATIC_ROUNDING)
 _CREASE_FLAT = wp.constant(TERRAIN_FLAT_EPS)
 _GROUP_ROWS = wp.constant(TERRAIN_GROUP_ROWS)
+_WALL_DEPTH = wp.constant(TERRAIN_WALL_DEPTH)
+_ON_FEATURE = wp.constant(TERRAIN_ON_FEATURE)
+_NO_ROW = wp.constant(2147483647)
+"""A lane's answer when it has no candidate (the finish of deferred pairs): past every candidate, so that the least
+answer of a block's lanes is the first candidate any lane has."""
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -534,14 +559,14 @@ words of state."""
 
 @wp.struct
 class TerrainFinishScratch:
-    """Global scratch of a class's finish of deferred pairs: per block, the distinct candidates of the pair it finishes
-    and the finish's state of each.
+    """Global scratch of a class's finish of deferred pairs: per block, the candidates of the pair it finishes (its
+    walk's rows, unmerged) and the finish's state of each.
 
     Block ``b`` holds candidate ``j`` at ``b * capacity + j``, off the per-thread stack: the largest stack a context
     launches sets the driver's local-memory reservation for every thread the device can hold. ``capacity`` bounds the
-    distinct candidates of every pair of the class
-    (:func:`~newton._src.geometry.terrain_contacts.terrain_pair_candidates` from each pair's shape extent, reach and
-    cells at construction), so that the finish (:func:`terrain_finish_list`) sees all of them.
+    candidates of every pair of the class (:func:`~newton._src.geometry.terrain_contacts.terrain_pair_candidates` from
+    each pair's shape extent, reach and cells at construction), so that the finish (:func:`terrain_finish_list`) sees
+    all of them.
     """
 
     blocks: int
@@ -564,9 +589,10 @@ class TerrainFinishScratch:
     """The finish's state: the candidate representing a candidate's plane group (-1: none)."""
     rank: wp.array[wp.int32]
     """The finish's state: a candidate's rank in its plane group (0 deepest, 1 farthest, 2 largest triangle, 3 largest
-    quadrilateral, 4 not kept)."""
+    quadrilateral, 4 not kept); before its last step, a plane group's size at the candidate representing it."""
     mark: wp.array[wp.int32]
-    """The finish's state: candidates tested for implied-row removal, and on return the kept ones (1)."""
+    """The finish's state: the first coincident or coplanar candidate of one the merge or the groups leave undecided,
+    then the candidates tested for implied-row removal, and on return the kept ones (1)."""
 
 
 def terrain_finish_blocks(capacity: int) -> int:
@@ -1086,6 +1112,152 @@ def terrain_interior_vertex(surface: TerrainSurfaceInfo, r: int, c: int) -> bool
     return r >= 1 and c >= 1 and r < surface.nrow - 1 and c < surface.ncol - 1
 
 
+@wp.func
+def terrain_grid_vertex(surface: TerrainSurfaceInfo, r: int, c: int) -> bool:
+    """Return whether vertex ``(r, c)`` exists."""
+    return r >= 0 and c >= 0 and r < surface.nrow and c < surface.ncol
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# the border: walls, border edges, border vertices and corner lines
+# ----------------------------------------------------------------------------------------------------------------
+
+
+@wp.func
+def terrain_border_side(surface: TerrainSurfaceInfo, r: int, c: int, which: int) -> int:
+    """Return the wall of edge ``which`` of vertex ``(r, c)`` when the edge lies on the heightfield's border, else -1:
+    0 and 1 the walls ``y = -hy`` and ``y = hy`` (the x-edges of rows 0 and ``nrow - 1``), 2 and 3 the walls
+    ``x = -hx`` and ``x = hx`` (the y-edges of columns 0 and ``ncol - 1``)."""
+    if which == 0:
+        if c >= 0 and c < surface.ncol - 1:
+            if r == 0:
+                return 0
+            if r == surface.nrow - 1:
+                return 1
+    elif which == 1:
+        if r >= 0 and r < surface.nrow - 1:
+            if c == 0:
+                return 2
+            if c == surface.ncol - 1:
+                return 3
+    return -1
+
+
+@wp.func
+def terrain_wall_normal(side: int) -> wp.vec3:
+    """Return the outward unit normal of wall ``side`` (:func:`terrain_border_side`)."""
+    if side == 0:
+        return wp.vec3(0.0, -1.0, 0.0)
+    if side == 1:
+        return wp.vec3(0.0, 1.0, 0.0)
+    if side == 2:
+        return wp.vec3(-1.0, 0.0, 0.0)
+    return wp.vec3(1.0, 0.0, 0.0)
+
+
+@wp.func
+def terrain_wall_value(k: wp.vec3, v: wp.vec3, side: int) -> float:
+    """Return ``(k - v) . n``, ``n`` wall ``side``'s outward normal: point ``k``'s distance beyond the wall through
+    ``v``, one coordinate difference (exact negations of each other for opposite directions)."""
+    if side == 0:
+        return v[1] - k[1]
+    if side == 1:
+        return k[1] - v[1]
+    if side == 2:
+        return v[0] - k[0]
+    return k[0] - v[0]
+
+
+@wp.func
+def terrain_beyond_walls(window: TerrainWindow, k: wp.vec3) -> float:
+    """Return how far window-frame point ``k`` lies beyond the heightfield's walls: the largest of its four walls'
+    values (:func:`terrain_wall_value`, from the border vertices' coordinates), at most 0 over the footprint."""
+    surface = window.surface
+    x_lo = float(-window.c0) * surface.dx
+    x_hi = float(surface.ncol - 1 - window.c0) * surface.dx
+    y_lo = float(-window.r0) * surface.dy
+    y_hi = float(surface.nrow - 1 - window.r0) * surface.dy
+    return wp.max(wp.max(x_lo - k[0], k[0] - x_hi), wp.max(y_lo - k[1], k[1] - y_hi))
+
+
+@wp.func
+def terrain_wall_along(k: wp.vec3, v: wp.vec3, side: int) -> float:
+    """Return ``(k - v) . t``, ``t`` the axis along wall ``side`` toward higher vertex indices (x for walls 0 and 1, y
+    for walls 2 and 3): the value both wall pieces at a border vertex, or a wall piece and a corner line, share."""
+    if side < 2:
+        return k[0] - v[0]
+    return k[1] - v[1]
+
+
+@wp.func
+def terrain_border_triangle(r: int, c: int, which: int, side: int) -> wp.vec3i:
+    """Return the one triangle ``(row, column, sub)`` of border edge ``which`` of vertex ``(r, c)`` on wall ``side``."""
+    _v0, _v1, ta, tb, _wa, _wb = terrain_edge_sides(r, c, which)
+    if side == 0 or side == 2:
+        return tb
+    return ta
+
+
+@wp.func
+def terrain_border_far(r: int, c: int, which: int, side: int) -> wp.vec2i:
+    """Return the third vertex of a border edge's triangle (:func:`terrain_border_triangle`)."""
+    _v0, _v1, _ta, _tb, wa, wb = terrain_edge_sides(r, c, which)
+    if side == 0 or side == 2:
+        return wb
+    return wa
+
+
+@wp.func
+def terrain_wall_frame(v0: wp.vec3, v1: wp.vec3, n_wall: wp.vec3) -> wp.vec3:
+    """Return the in-wall unit normal of border edge ``v0 v1`` pointing up, away from the wall below the edge."""
+    m = wp.cross(v1 - v0, n_wall)
+    if m[2] < 0.0:
+        m = -m
+    return wp.normalize(m)
+
+
+@wp.func
+def terrain_wall_edge_value(k: wp.vec3, v0: wp.vec3, v1: wp.vec3, n_wall: wp.vec3) -> float:
+    """Return ``s = (k - v0) . m`` (:func:`terrain_wall_frame`) of border edge ``v0 v1`` (``v0`` its lower vertex): the
+    value the border edge's claim above the wall and the wall's claim below the edge share, as
+    :func:`terrain_face_edge_value` is a face's and its edge's."""
+    return wp.dot(k - v0, terrain_wall_frame(v0, v1, n_wall))
+
+
+@wp.func
+def terrain_wall_holds(eps: float, side: int, v0: wp.vec3, v1: wp.vec3, k: wp.vec3) -> bool:
+    """Return whether the wall below border edge ``v0 v1`` (wall ``side``) holds point ``k``'s projection on it (closed
+    by ``eps``): below the edge, between the vertical lines through its vertices and above the wall's base,
+    :data:`TERRAIN_WALL_DEPTH` below the edge. The tests are along the wall, so that ``k`` and its projection decide
+    alike."""
+    m = terrain_wall_frame(v0, v1, terrain_wall_normal(side))
+    s = wp.dot(k - v0, m)
+    if not terrain_claims(s, eps):
+        return False
+    if s < -_WALL_DEPTH * m[2] - eps:
+        return False
+    return terrain_beyond(terrain_wall_along(k, v0, side), eps) and terrain_claims(terrain_wall_along(k, v1, side), eps)
+
+
+@wp.func
+def terrain_vertex_sides(surface: TerrainSurfaceInfo, r: int, c: int) -> wp.vec2i:
+    """Return the walls through vertex ``(r, c)`` (:func:`terrain_border_side`): ``(-1, -1)`` for an interior vertex,
+    one of them for a border vertex, two for a corner of the footprint (the y-wall first)."""
+    a = int(-1)
+    b = int(-1)
+    if r == 0:
+        a = 0
+    elif r == surface.nrow - 1:
+        a = 1
+    if c == 0:
+        b = 2
+    elif c == surface.ncol - 1:
+        b = 3
+    if a < 0:
+        return wp.vec2i(b, -1)
+    return wp.vec2i(a, b)
+
+
 _RingNormals = wp.types.matrix(shape=(6, 3), dtype=wp.float32)
 
 
@@ -1095,27 +1267,40 @@ def _ring_normal(normals: _RingNormals, i: int) -> wp.vec3:
 
 
 @wp.func
+def _ring_add(normals: _RingNormals, count: int, n: wp.vec3) -> tuple[_RingNormals, int]:
+    """Add a normal to a vertex's distinct incident normals (closer than :data:`TERRAIN_NORMAL_SAME`: one)."""
+    fresh = bool(True)
+    for i in range(count):
+        if wp.length(n - _ring_normal(normals, i)) <= _NORMAL_SAME:
+            fresh = False
+    if fresh:
+        normals[count, 0] = n[0]
+        normals[count, 1] = n[1]
+        normals[count, 2] = n[2]
+        count += 1
+    return normals, count
+
+
+@wp.func
 def _vertex_feature_of_planes(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int) -> bool:
     """:func:`terrain_vertex_feature` from the incident clusters' planes (what the vertex bits record). The cluster
     normals do not depend on the window: a cluster's from its gradient, a lone triangle's from edge vectors of integer
-    index differences and height differences."""
+    index differences and height differences. A border vertex's incident normals are its triangles' and its walls'
+    (at most three triangles and one wall, or two triangles and two walls at a corner of the footprint)."""
     surface = window.surface
-    if not terrain_interior_vertex(surface, r, c):
+    if not terrain_grid_vertex(surface, r, c):
         return False
     normals = _RingNormals()
     count = int(0)
     for j in range(6):
         t = terrain_incident_triangle(r, c, j)
-        n, _a = terrain_cluster_plane(data, window, t[0], t[1], t[2])
-        fresh = bool(True)
-        for i in range(count):
-            if wp.length(n - _ring_normal(normals, i)) <= _NORMAL_SAME:
-                fresh = False
-        if fresh:
-            normals[count, 0] = n[0]
-            normals[count, 1] = n[1]
-            normals[count, 2] = n[2]
-            count += 1
+        if terrain_valid_cell(surface, t[0], t[1]):
+            n, _a = terrain_cluster_plane(data, window, t[0], t[1], t[2])
+            normals, count = _ring_add(normals, count, n)
+    sides = terrain_vertex_sides(surface, r, c)
+    for j in range(2):
+        if sides[j] >= 0:
+            normals, count = _ring_add(normals, count, terrain_wall_normal(sides[j]))
     for i in range(count):
         ni = _ring_normal(normals, i)
         for j in range(i + 1, count):
@@ -1256,12 +1441,18 @@ def terrain_vertex_feature(data: TerrainFeatureData, window: TerrainWindow, r: i
 
 @wp.func
 def terrain_vertex_in_cone(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, n: wp.vec3) -> bool:
-    """Return whether direction ``n`` lies in vertex ``(r, c)``'s normal cone (closed): ``n . (w - v) <= 0``."""
+    """Return whether direction ``n`` lies in vertex ``(r, c)``'s normal cone (closed): ``n . (w - v) <= 0`` for its
+    ring's vertices in the grid, and at a border vertex for the wall below it (``n . (-z) <= 0``)."""
+    surface = window.surface
     v = terrain_window_vertex(data, window, r, c)
     for j in range(6):
         w = terrain_ring_vertex(r, c, j)
-        e = terrain_window_vertex(data, window, w[0], w[1]) - v
-        if wp.dot(n, e) > _CONE_BAND * wp.length(e):
+        if terrain_grid_vertex(surface, w[0], w[1]):
+            e = terrain_window_vertex(data, window, w[0], w[1]) - v
+            if wp.dot(n, e) > _CONE_BAND * wp.length(e):
+                return False
+    if not terrain_interior_vertex(surface, r, c):
+        if -n[2] > _CONE_BAND:
             return False
     return True
 
@@ -1336,15 +1527,113 @@ def terrain_edge_point(
 
 
 @wp.func
+def terrain_border_edge_values(
+    data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, which: int, side: int, k: wp.vec3
+) -> wp.vec4:
+    """Return a border edge's predicate values for point ``k``: ``(s_top, s_wall, w_0, w_1)``, the value its triangle
+    reads at the edge (:func:`terrain_face_values`), the value its wall reads at the edge
+    (:func:`terrain_wall_edge_value`) and the values its end vertices read for each other, as
+    :func:`terrain_edge_values` gives an edge's with the wall as its second face."""
+    v0i, v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
+    t = terrain_border_triangle(r, c, which, side)
+    far = terrain_border_far(r, c, which, side)
+    v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
+    v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
+    n, _a = terrain_cluster_plane(data, window, t[0], t[1], t[2])
+    s_top = terrain_face_edge_value(k, v0, v1, n, terrain_window_vertex(data, window, far[0], far[1]))
+    s_wall = terrain_wall_edge_value(k, v0, v1, terrain_wall_normal(side))
+    return wp.vec4(s_top, s_wall, terrain_vertex_edge_value(k, v0, v1), terrain_vertex_edge_value(k, v1, v0))
+
+
+@wp.func
+def terrain_border_point(
+    data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, which: int, side: int, k: wp.vec3
+) -> tuple[int, wp.vec3, wp.vec3, float]:
+    """Return the claim of border edge ``which`` of vertex ``(r, c)`` (wall ``side``) and its wall on point ``k``
+    outside the solid: ``(kind, q, n, d)``, ``kind`` 1 for the edge (beyond its triangle and its wall at the edge,
+    inside its slab: ``q`` its closest point), 2 for the wall below it (``k`` beside the wall, its projection held,
+    :func:`terrain_wall_holds`: ``q`` the projection, ``n`` the wall's normal) and 0 for none. One claim per point:
+    the edge above the wall's edge line, the wall below it. ``n`` points from ``q`` to ``k`` (the bisector of the
+    triangle's and the wall's normals for ``k`` on the edge) and ``d = |k - q|``."""
+    v0i, v1i, _ta, _tb, _wa, _wb = terrain_edge_sides(r, c, which)
+    v0 = terrain_window_vertex(data, window, v0i[0], v0i[1])
+    v1 = terrain_window_vertex(data, window, v1i[0], v1i[1])
+    eps = window.eps
+    n_wall = terrain_wall_normal(side)
+    values = terrain_border_edge_values(data, window, r, c, which, side, k)
+    if values[1] <= 0.0:
+        # below the wall's edge line: the wall, from beside it only
+        d = terrain_wall_value(k, v0, side)
+        if not terrain_beyond(d, eps) or not terrain_wall_holds(eps, side, v0, v1, k):
+            return 0, wp.vec3(0.0), n_wall, 0.0
+        return 2, k - d * n_wall, n_wall, d
+    u = v1 - v0
+    length = wp.length(u)
+    claims = (
+        terrain_beyond(values[0], eps)
+        and terrain_beyond(values[2], eps * length)
+        and terrain_beyond(values[3], eps * length)
+    )
+    if not claims:
+        return 0, wp.vec3(0.0), n_wall, 0.0
+    q = v0 + wp.clamp(values[2] / wp.dot(u, u), 0.0, 1.0) * u
+    w = k - q
+    dist = wp.length(w)
+    if dist <= _ON_FEATURE:
+        t = terrain_border_triangle(r, c, which, side)
+        n_top, _a = terrain_cluster_plane(data, window, t[0], t[1], t[2])
+        return 1, q, wp.normalize(n_top + n_wall), 0.0
+    return 1, q, w / dist, dist
+
+
+@wp.func
+def terrain_corner_point(
+    data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, k: wp.vec3
+) -> tuple[bool, wp.vec3, wp.vec3, float]:
+    """Return whether the corner line below footprint corner ``(r, c)`` claims point ``k``, and the row ``(q, n, d)``:
+    ``k`` beyond both walls (the values the walls' pieces at the corner share, :func:`terrain_wall_along`), below the
+    corner vertex (the value its claim shares, :func:`terrain_vertex_point`) and above the walls' base; ``q`` the corner
+    line's point at ``k``'s height, ``n`` horizontal from it to ``k`` (the bisector of the walls' normals on the line)."""
+    surface = window.surface
+    sides = terrain_vertex_sides(surface, r, c)
+    if sides[1] < 0:
+        return False, wp.vec3(0.0), wp.vec3(0.0), 0.0
+    v = terrain_window_vertex(data, window, r, c)
+    eps = window.eps
+    below = v[2] - k[2]
+    claims = (
+        terrain_beyond(below, eps)
+        and below <= _WALL_DEPTH + eps
+        and terrain_beyond(terrain_wall_value(k, v, sides[0]), eps)
+        and terrain_beyond(terrain_wall_value(k, v, sides[1]), eps)
+    )
+    if not claims:
+        return False, wp.vec3(0.0), wp.vec3(0.0), 0.0
+    q = wp.vec3(v[0], v[1], k[2])
+    w = k - q
+    dist = wp.length(w)
+    if dist <= _ON_FEATURE:
+        return True, q, wp.normalize(terrain_wall_normal(sides[0]) + terrain_wall_normal(sides[1])), 0.0
+    return True, q, w / dist, dist
+
+
+@wp.func
 def terrain_vertex_point(data: TerrainFeatureData, window: TerrainWindow, r: int, c: int, k: wp.vec3) -> bool:
-    """Return whether vertex ``(r, c)`` claims point ``k``: ``(k - v) . (w - v) <= 0`` for its whole one-ring."""
-    if not terrain_interior_vertex(window.surface, r, c):
+    """Return whether vertex ``(r, c)`` claims point ``k``: ``(k - v) . (w - v) <= 0`` for its one-ring's vertices in
+    the grid, and at a border vertex ``k`` not below it (the wall below it: ``v_z - k_z <= 0``, the value a corner
+    line's claim below a corner of the footprint shares, :func:`terrain_corner_point`)."""
+    surface = window.surface
+    if not terrain_grid_vertex(surface, r, c):
         return False
     v = terrain_window_vertex(data, window, r, c)
     for j in range(6):
         wi = terrain_ring_vertex(r, c, j)
-        w = terrain_window_vertex(data, window, wi[0], wi[1])
-        if not terrain_claims(terrain_vertex_edge_value(k, v, w), window.eps * wp.length(w - v)):
+        if terrain_grid_vertex(surface, wi[0], wi[1]):
+            w = terrain_window_vertex(data, window, wi[0], wi[1])
+            if not terrain_claims(terrain_vertex_edge_value(k, v, w), window.eps * wp.length(w - v)):
+                return False
+    if not terrain_interior_vertex(surface, r, c):
+        if not terrain_claims(v[2] - k[2], window.eps):
             return False
     return True
 
@@ -1397,6 +1686,25 @@ def terrain_point_below_cached(
         return planes, False
     planes, n, a = terrain_plane(data, window, planes, t[0], t[1], t[2])
     return planes, k[2] < a[2] - (n[0] * (k[0] - a[0]) + n[1] * (k[1] - a[1])) / n[2]
+
+
+@wp.func
+def terrain_point_below_inside(data: TerrainFeatureData, window: TerrainWindow, k: wp.vec3) -> bool:
+    """Return :func:`terrain_point_below` for a point of the footprint's closure: a point past its border by the
+    predicates' rounding is taken over the border's cells (their planes extended to it), where the half-open partition
+    of :func:`terrain_locate` has no triangle."""
+    surface = window.surface
+    u = k[0] / surface.dx
+    v = k[1] / surface.dy
+    c = wp.clamp(window.c0 + int(wp.floor(u)), 0, surface.ncol - 2)
+    r = wp.clamp(window.r0 + int(wp.floor(v)), 0, surface.nrow - 2)
+    fx = wp.clamp(u - float(c - window.c0), 0.0, 1.0)
+    fy = wp.clamp(v - float(r - window.r0), 0.0, 1.0)
+    sub = int(0)
+    if fx < fy:
+        sub = 1
+    n, a = terrain_cluster_plane(data, window, r, c, sub)
+    return k[2] < a[2] - (n[0] * (k[0] - a[0]) + n[1] * (k[1] - a[1])) / n[2]
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1843,11 +2151,11 @@ def _list_implied(
     """:func:`_staged_implied` over a scratch's candidates (their core points read, not rebuilt), from this lane's share
     of the tests: the points and segments of the other live members of plane group ``g``, each segment with its
     triangles; lane ``lane`` of ``lanes`` takes every ``lanes``-th of them in that order, so that the lanes' answers
-    ORed are the answer of one lane taking all."""
+    ORed are the answer of one lane taking all. A group's members follow its first candidate ``g``."""
     limit = scratch.d[base + skip]
     tolerance = _MERGE_SCALE * eps
     test = int(0)
-    for a in range(count):
+    for a in range(g, count):
         if a == skip or not _list_member(scratch, base + a, g):
             continue
         ka = scratch.k[base + a]
@@ -1906,179 +2214,297 @@ def _lanes_max(value: int) -> int:
 
 
 @wp.func
-def _list_groups(scratch: TerrainFinishScratch, base: int, count: int, eps: float):
-    """Steps 1 and 2 of :func:`terrain_finish_list`: coincident rows merged (the first in feature order stays), and the
-    first row of a plane representing its plane group."""
-    # 1. coincident rows: the first in feature order stays
-    for i in range(count):
-        qi = scratch.q[base + i]
-        ni = scratch.n[base + i]
-        survives = int(1)
-        for j in range(i):
-            if scratch.alive[base + j] != 0 and terrain_rows_coincide(
-                scratch.q[base + j], scratch.n[base + j], qi, ni, eps
-            ):
-                survives = 0
-                break
-        scratch.alive[base + i] = survives
-    # 2. plane groups: the first row of a plane represents it
-    for i in range(count):
-        scratch.group[base + i] = -1
-        if scratch.alive[base + i] == 0:
-            continue
-        qi = scratch.q[base + i]
-        ni = scratch.n[base + i]
-        scratch.group[base + i] = i
-        for j in range(i):
-            if scratch.alive[base + j] != 0 and scratch.group[base + j] == j:
-                if terrain_rows_same_plane(qi, ni, scratch.q[base + j], scratch.n[base + j], eps):
-                    scratch.group[base + i] = j
-                    break
+def _lanes_max(value: float) -> float:
+    """The largest ``value`` of a block's lanes (a block barrier)."""
+    return wp.tile_extract(wp.tile_max(wp.tile(value)), 0)
 
 
 @wp.func
-def _list_keep(scratch: TerrainFinishScratch, base: int, count: int) -> int:
-    """Step 4 of :func:`terrain_finish_list`: at most four rows per plane group (deepest, farthest, largest triangle,
-    largest quadrilateral), the kept ones marked (``scratch.mark`` 1); returns their count."""
-    for i in range(count):
-        scratch.rank[base + i] = 4
-    for g in range(count):
-        # A group keeps its first row's id even when that row was implied.
-        if scratch.group[base + g] != g:
-            continue
-        size = int(0)
+def _lanes_min(value: int) -> int:
+    """The least ``value`` of a block's lanes (a block barrier)."""
+    return wp.tile_extract(wp.tile_min(wp.tile(value)), 0)
+
+
+@wp.func
+def _lanes_sum(value: int) -> int:
+    """The sum of a block's lanes' ``value`` (a block barrier)."""
+    return wp.tile_extract(wp.tile_sum(wp.tile(value)), 0)
+
+
+@wp.func
+def _lanes_first(value: int) -> int:
+    """The first lane's ``value``, for every lane of a block (a block barrier)."""
+    return wp.tile_extract(wp.tile(value), 0)
+
+
+@wp.func
+def _list_merge(scratch: TerrainFinishScratch, base: int, count: int, eps: float, lane: int, lanes: int):
+    """Step 1 of :func:`terrain_finish_list`: coincident candidates merged, the first in candidate order staying
+    (``alive`` 1, the others 0); the group sizes of step 2 zeroed (``rank``).
+
+    Each lane takes every ``lanes``-th candidate: one that no earlier candidate coincides with stays, and one whose
+    first coincident candidate stays merges into it; any other (a chain of coincident candidates, rows within a few
+    bands of each other) is decided by the first lane in candidate order, as one lane decides them all."""
+    for i in range(lane, count, lanes):
+        qi = scratch.q[base + i]
+        ni = scratch.n[base + i]
+        first = int(-1)
+        for j in range(i):
+            # every test, so that a lane's loads overlap
+            coincide = terrain_rows_coincide(scratch.q[base + j], scratch.n[base + j], qi, ni, eps)
+            if coincide and first < 0:
+                first = j
+        alive = int(1)
+        if first >= 0:
+            # undecided: its first coincident candidate in ``mark``
+            alive = -1
+            scratch.mark[base + i] = first
+        scratch.alive[base + i] = alive
+        scratch.rank[base + i] = 0
+    if lanes > 1:
+        _lanes_max(0)
+    undecided = int(0)
+    for i in range(lane, count, lanes):
+        if scratch.alive[base + i] < 0:
+            if scratch.alive[base + scratch.mark[base + i]] == 1:
+                scratch.alive[base + i] = 0
+            else:
+                undecided = 1
+    if lanes > 1:
+        undecided = _lanes_max(undecided)
+    if undecided == 0:
+        return
+    if lane == 0:
         for i in range(count):
-            if _list_member(scratch, base + i, g):
-                size += 1
-        if size == 0:
-            continue
-        ng = scratch.n[base + g]
-        i0 = int(-1)
-        for i in range(count):
-            if _list_member(scratch, base + i, g):
-                if i0 < 0 or scratch.d[base + i] < scratch.d[base + i0]:
-                    i0 = i
-        p0 = scratch.k[base + i0]
-        p0 = p0 - wp.dot(p0, ng) * ng
-        scratch.rank[base + i0] = 0
-        i1 = int(-1)
-        far = float(-1.0)
-        for j in range(count):
-            if not _list_member(scratch, base + j, g) or scratch.rank[base + j] == 0:
+            if scratch.alive[base + i] >= 0:
                 continue
-            pj = scratch.k[base + j]
-            distance = wp.length(pj - wp.dot(pj, ng) * ng - p0)
-            if distance > far:
-                far = distance
-                i1 = j
-        if i1 < 0:
-            continue
-        scratch.rank[base + i1] = 1
-        p1 = scratch.k[base + i1]
-        p1 = p1 - wp.dot(p1, ng) * ng
-        i2 = int(-1)
-        largest = float(-1.0)
-        for j in range(count):
-            if not _list_member(scratch, base + j, g) or scratch.rank[base + j] <= 1:
-                continue
-            pj = scratch.k[base + j]
-            area = wp.abs(wp.dot(wp.cross(p1 - p0, pj - wp.dot(pj, ng) * ng - p0), ng))
-            if area > largest:
-                largest = area
-                i2 = j
-        if i2 < 0:
-            continue
-        scratch.rank[base + i2] = 2
-        p2 = scratch.k[base + i2]
-        p2 = p2 - wp.dot(p2, ng) * ng
-        i3 = int(-1)
-        gain_best = float(1.0e-15)
-        for j in range(count):
-            if not _list_member(scratch, base + j, g) or scratch.rank[base + j] <= 2:
-                continue
-            pj = scratch.k[base + j]
-            pj = pj - wp.dot(pj, ng) * ng
-            gain = float(0.0)
-            for side in range(3):
-                pa = p0
-                pb = p1
-                pc = p2
-                if side == 1:
-                    pa = p1
-                    pb = p2
-                    pc = p0
-                elif side == 2:
-                    pa = p2
-                    pb = p0
-                    pc = p1
-                side_c = wp.dot(wp.cross(pb - pa, pc - pa), ng)
-                side_j = wp.dot(wp.cross(pb - pa, pj - pa), ng)
-                if side_c * side_j < 0.0:
-                    gain = wp.max(gain, wp.abs(side_j))
-            if gain > gain_best:
-                gain_best = gain
-                i3 = j
-        if i3 >= 0:
-            scratch.rank[base + i3] = 3
-        if size <= _GROUP_ROWS:
-            # A group of at most four rows keeps them all.
-            for j in range(count):
-                if _list_member(scratch, base + j, g) and scratch.rank[base + j] == _GROUP_ROWS:
-                    scratch.rank[base + j] = _GROUP_ROWS - 1
-    kept = int(0)
+            qi = scratch.q[base + i]
+            ni = scratch.n[base + i]
+            survives = int(1)
+            for j in range(i):
+                if scratch.alive[base + j] == 1 and terrain_rows_coincide(
+                    scratch.q[base + j], scratch.n[base + j], qi, ni, eps
+                ):
+                    survives = 0
+                    break
+            scratch.alive[base + i] = survives
+    if lanes > 1:
+        _lanes_max(0)
+
+
+@wp.func
+def _list_groups(scratch: TerrainFinishScratch, base: int, count: int, eps: float, lane: int, lanes: int):
+    """Step 2 of :func:`terrain_finish_list`: the first live candidate of a plane represents its plane group
+    (``group``), then each group's size at its first candidate (``rank``) and the implied-row step's marks cleared
+    (``mark``).
+
+    As step 1 (:func:`_list_merge`): a live candidate that shares a plane with no earlier live one represents its
+    group, and one whose first such candidate represents a group joins it; any other is decided by the first lane in
+    candidate order, as one lane decides them all."""
+    for i in range(lane, count, lanes):
+        group = int(-1)
+        if scratch.alive[base + i] != 0:
+            qi = scratch.q[base + i]
+            ni = scratch.n[base + i]
+            first = int(-1)
+            for j in range(i):
+                same = terrain_rows_same_plane(qi, ni, scratch.q[base + j], scratch.n[base + j], eps)
+                if same and first < 0 and scratch.alive[base + j] != 0:
+                    first = j
+            group = i
+            if first >= 0:
+                # undecided: the first live candidate on its plane in ``mark``
+                group = -2
+                scratch.mark[base + i] = first
+        scratch.group[base + i] = group
+    if lanes > 1:
+        _lanes_max(0)
+    undecided = int(0)
+    for i in range(lane, count, lanes):
+        if scratch.group[base + i] == -2:
+            first = scratch.mark[base + i]
+            if scratch.group[base + first] == first:
+                scratch.group[base + i] = first
+            else:
+                undecided = 1
+    if lanes > 1:
+        undecided = _lanes_max(undecided)
+    if undecided != 0:
+        if lane == 0:
+            for i in range(count):
+                if scratch.group[base + i] != -2:
+                    continue
+                qi = scratch.q[base + i]
+                ni = scratch.n[base + i]
+                group = i
+                for j in range(i):
+                    if scratch.alive[base + j] != 0 and scratch.group[base + j] == j:
+                        if terrain_rows_same_plane(qi, ni, scratch.q[base + j], scratch.n[base + j], eps):
+                            group = j
+                            break
+                scratch.group[base + i] = group
+        if lanes > 1:
+            _lanes_max(0)
+    for i in range(lane, count, lanes):
+        scratch.mark[base + i] = 0
+        if scratch.alive[base + i] != 0:
+            wp.atomic_add(scratch.rank, base + scratch.group[base + i], 1)
+    if lanes > 1:
+        _lanes_max(0)
+
+
+@wp.func
+def _list_next_group(scratch: TerrainFinishScratch, base: int, count: int, after: int, lane: int, lanes: int) -> int:
+    """The first plane group past candidate ``after`` with three live candidates or more (its size at its first
+    candidate, ``rank``), or -1: the groups whose rows the implied-row step tests, in candidate order."""
+    found = int(_NO_ROW)
+    for i in range(lane, count, lanes):
+        if i > after and scratch.group[base + i] == i and scratch.rank[base + i] >= 3:
+            found = i
+            break
+    if lanes > 1:
+        found = _lanes_min(found)
+    if found == _NO_ROW:
+        return -1
+    return found
+
+
+@wp.func
+def _list_pick(scratch: TerrainFinishScratch, base: int, count: int, g: int, lane: int, lanes: int) -> int:
+    """The implied-row step's next candidate of plane group ``g``: its shallowest live candidate not yet tested
+    (``mark`` 0), the first in candidate order on ties, or -1. Each lane reads its own candidates' marks."""
+    pick = int(-1)
+    for i in range(lane, count, lanes):
+        if _list_member(scratch, base + i, g) and scratch.mark[base + i] == 0:
+            if pick < 0 or scratch.d[base + i] > scratch.d[base + pick]:
+                pick = i
+    if lanes > 1:
+        mine = float(-wp.inf)
+        if pick >= 0:
+            mine = scratch.d[base + pick]
+        shallowest = _lanes_max(mine)
+        first = int(_NO_ROW)
+        if pick >= 0 and mine == shallowest:
+            first = pick
+        pick = _lanes_min(first)
+        if pick == _NO_ROW:
+            pick = -1
+    return pick
+
+
+@wp.func
+def _list_keep_group(scratch: TerrainFinishScratch, base: int, count: int, g: int):
+    """Step 4 of :func:`terrain_finish_list` for plane group ``g`` (its size at its first candidate, ``rank``): its live
+    candidates ranked (``rank``: 0 deepest, 1 farthest, 2 largest triangle, 3 largest quadrilateral, 4 not kept; a
+    group of at most four keeps every one, ranking 3 the one it does not pick)."""
+    size = scratch.rank[base + g]
+    if size <= 1:
+        # its first candidate alone: no step drops a row of a group of fewer than three
+        scratch.rank[base + g] = 0
+        return
+    rest = int(_GROUP_ROWS)
+    if size <= _GROUP_ROWS:
+        rest = _GROUP_ROWS - 1
+    ng = scratch.n[base + g]
+    i0 = int(-1)
     for i in range(count):
-        keep = int(0)
-        if scratch.alive[base + i] != 0 and scratch.rank[base + i] < _GROUP_ROWS:
-            keep = 1
-        scratch.mark[base + i] = keep
-        kept += keep
-    return kept
+        if _list_member(scratch, base + i, g):
+            scratch.rank[base + i] = rest
+            if i0 < 0 or scratch.d[base + i] < scratch.d[base + i0]:
+                i0 = i
+    scratch.rank[base + i0] = 0
+    p0 = scratch.k[base + i0]
+    p0 = p0 - wp.dot(p0, ng) * ng
+    i1 = int(-1)
+    far = float(-1.0)
+    for j in range(count):
+        if j == i0 or not _list_member(scratch, base + j, g):
+            continue
+        pj = scratch.k[base + j]
+        distance = wp.length(pj - wp.dot(pj, ng) * ng - p0)
+        if distance > far:
+            far = distance
+            i1 = j
+    if i1 < 0:
+        return
+    scratch.rank[base + i1] = 1
+    p1 = scratch.k[base + i1]
+    p1 = p1 - wp.dot(p1, ng) * ng
+    i2 = int(-1)
+    largest = float(-1.0)
+    for j in range(count):
+        if j == i0 or j == i1 or not _list_member(scratch, base + j, g):
+            continue
+        pj = scratch.k[base + j]
+        area = wp.abs(wp.dot(wp.cross(p1 - p0, pj - wp.dot(pj, ng) * ng - p0), ng))
+        if area > largest:
+            largest = area
+            i2 = j
+    if i2 < 0:
+        return
+    scratch.rank[base + i2] = 2
+    p2 = scratch.k[base + i2]
+    p2 = p2 - wp.dot(p2, ng) * ng
+    i3 = int(-1)
+    gain_best = float(1.0e-15)
+    for j in range(count):
+        if j == i0 or j == i1 or j == i2 or not _list_member(scratch, base + j, g):
+            continue
+        pj = scratch.k[base + j]
+        pj = pj - wp.dot(pj, ng) * ng
+        gain = float(0.0)
+        for side in range(3):
+            pa = p0
+            pb = p1
+            pc = p2
+            if side == 1:
+                pa = p1
+                pb = p2
+                pc = p0
+            elif side == 2:
+                pa = p2
+                pb = p0
+                pc = p1
+            side_c = wp.dot(wp.cross(pb - pa, pc - pa), ng)
+            side_j = wp.dot(wp.cross(pb - pa, pj - pa), ng)
+            if side_c * side_j < 0.0:
+                gain = wp.max(gain, wp.abs(side_j))
+        if gain > gain_best:
+            gain_best = gain
+            i3 = j
+    if i3 >= 0:
+        scratch.rank[base + i3] = 3
 
 
 @wp.func
 def terrain_finish_list(scratch: TerrainFinishScratch, base: int, count: int, eps: float, lane: int, lanes: int) -> int:
     """The law's finish (:func:`terrain_finish_slots`) of ``count`` candidates at ``[base, base + count)`` of a
-    scratch, any number of them, with their core points from ``scratch.k``, by a block's ``lanes`` lanes (lane
-    ``lane``; one thread passes ``0, 1``).
+    scratch, any number of them, coincident ones included, with their core points from ``scratch.k``, by a block's
+    ``lanes`` lanes (lane ``lane``; one thread passes ``0, 1``).
 
     The finish's state lives in the scratch (``alive``, ``group``, ``rank``, ``mark``), not on the stack, so that it
     holds as many candidates as the scratch does: on the rows :func:`terrain_finish_slots` takes, with core points
-    ``q + d n``, it keeps the same rows, bit for bit (the same steps, ties and float32 operations). The first lane runs
-    every step and writes the state; the implied-row test of a row (every point, segment and triangle of its group's
-    other live members) is split among the lanes and their answers ORed across the block (:func:`_list_implied`), so
-    that any number of lanes keeps the rows one lane keeps. With ``lanes > 1`` every lane of the block must call it with
-    the same candidates.
+    ``q + d n``, it keeps the same rows, bit for bit (the same steps, ties and float32 operations). The lanes split
+    every step: each takes every ``lanes``-th candidate of the merge and the plane groups (:func:`_list_merge`,
+    :func:`_list_groups`: a candidate's earlier ones, the order's few chains decided by the first lane), the
+    implied-row tests of a row (:func:`_list_implied`, the next row picked across the block, :func:`_list_pick`) and
+    the groups whose rows it ranks (:func:`_list_keep_group`); their answers combine across the block (block
+    reductions, which also order the lanes' writes before the reads that follow), so that any number of lanes keeps the
+    rows one lane keeps. With ``lanes > 1`` every lane of the block must call it with the same candidates.
 
     Returns the kept candidates' count (every lane); ``scratch.mark`` is 1 at the kept ones (kept rows in candidate
     order).
     """
-    if lane == 0:
-        _list_groups(scratch, base, count, eps)
-    if lanes > 1:
-        # every lane reads the groups the first lane wrote
-        _lanes_max(0)
-    # 3. implied rows, the shallowest first, one at a time, in one pass (see terrain_finish_slots); every lane walks the
-    # same groups and picks, the first lane picking and writing the state
-    for g in range(count):
-        if scratch.alive[base + g] == 0 or scratch.group[base + g] != g:
-            continue
+    _list_merge(scratch, base, count, eps, lane, lanes)
+    _list_groups(scratch, base, count, eps, lane, lanes)
+    # 3. implied rows (see terrain_finish_slots), the shallowest first, one at a time: the groups of three rows or more,
+    # each with every lane (a group's tests touch its own rows alone, so that their order is free)
+    g = _list_next_group(scratch, base, count, -1, lane, lanes)
+    while g >= 0:
         e1, e2 = _tangent_frame(scratch.n[base + g])
-        size = int(0)
-        for i in range(count):
-            if _list_member(scratch, base + i, g):
-                size += 1
-        if lane == 0:
-            for i in range(count):
-                scratch.mark[base + i] = 0
+        size = scratch.rank[base + g]
         while size >= 3:
-            pick = int(-1)
-            if lane == 0:
-                for i in range(count):
-                    if _list_member(scratch, base + i, g) and scratch.mark[base + i] == 0:
-                        if pick < 0 or scratch.d[base + i] > scratch.d[base + pick]:
-                            pick = i
-            if lanes > 1:
-                pick = _lanes_max(pick)
+            pick = _list_pick(scratch, base, count, g, lane, lanes)
             if pick < 0:
                 break
             kj = scratch.k[base + pick]
@@ -2086,17 +2512,33 @@ def terrain_finish_list(scratch: TerrainFinishScratch, base: int, count: int, ep
             implied = _list_implied(scratch, base, count, g, pick, e1, e2, point, eps, lane, lanes)
             if lanes > 1:
                 implied = _lanes_max(int(implied)) != 0
-            if lane == 0:
+            if pick % lanes == lane:
+                # the pick's lane, which alone reads its mark; the next pick's reductions order its writes
                 scratch.mark[base + pick] = 1
                 if implied:
                     scratch.alive[base + pick] = 0
             if implied:
                 size -= 1
-    kept = int(0)
-    if lane == 0:
-        kept = _list_keep(scratch, base, count)
+        if lane == 0:
+            scratch.rank[base + g] = size
+        g = _list_next_group(scratch, base, count, g, lane, lanes)
+    # 4. at most four rows per plane group: each lane ranks the groups of its candidates that represent one
+    for g in range(lane, count, lanes):
+        if scratch.group[base + g] == g:
+            _list_keep_group(scratch, base, count, g)
     if lanes > 1:
-        kept = _lanes_max(kept)
+        _lanes_max(0)
+    kept = int(0)
+    for i in range(lane, count, lanes):
+        keep = int(0)
+        if scratch.alive[base + i] == 0:
+            scratch.rank[base + i] = _GROUP_ROWS
+        elif scratch.rank[base + i] < _GROUP_ROWS:
+            keep = 1
+        scratch.mark[base + i] = keep
+        kept += keep
+    if lanes > 1:
+        kept = _lanes_sum(kept)
     return kept
 
 
@@ -2110,8 +2552,8 @@ def terrain_pair_exit(out: TerrainLawRows, pair: int, state: int):
     """Record a pair that has no row, with its ``TERRAIN_PAIR_*`` bits, raising ``terrain_stale`` for stale features.
 
     Every per-type kernel's early exit (:data:`TERRAIN_PAIR_STALE`, :data:`TERRAIN_PAIR_FILTERED`,
-    :data:`TERRAIN_PAIR_OUTSIDE`, :data:`TERRAIN_PAIR_TILE_EXIT`, :data:`TERRAIN_PAIR_UNSUPPORTED`), and rows the spill
-    region has no room for (:func:`terrain_spill_rows`).
+    :data:`TERRAIN_PAIR_OUTSIDE`, :data:`TERRAIN_PAIR_TILE_EXIT`), and rows the spill region has no room for
+    (:func:`terrain_spill_rows`).
     """
     out.first[pair] = -1
     out.count[pair] = 0
@@ -2168,7 +2610,7 @@ def terrain_finish_overflow(scratch: TerrainFinishScratch, base: int, count: int
 
 
 @wp.func
-def terrain_hold_candidate(
+def terrain_place_candidate(
     scratch: TerrainFinishScratch,
     base: int,
     held: int,
@@ -2177,14 +2619,10 @@ def terrain_hold_candidate(
     n: wp.vec3,
     d: float,
     feature: int,
-    eps: float,
 ) -> int:
-    """Add a candidate (window frame) to the distinct ones a scratch block holds from ``base``, as the finish merges
-    (:func:`terrain_hold_row`, with its core point ``k``): past the block's capacity a distinct candidate is only
-    counted. Returns the new number of distinct candidates."""
-    for h in range(wp.min(held, scratch.capacity)):
-        if terrain_rows_coincide(scratch.q[base + h], scratch.n[base + h], q, n, eps):
-            return held
+    """Place a candidate (window frame) with its core point ``k`` after the ``held`` ones a scratch block holds from
+    ``base``, unmerged (the finish merges coincident candidates, :func:`terrain_finish_list`): past the block's
+    capacity it is only counted. Returns the new number of candidates."""
     if held < scratch.capacity:
         scratch.q[base + held] = q
         scratch.k[base + held] = k
@@ -2281,37 +2719,55 @@ def terrain_finish_deferred(
     lane: int,
     lanes: int,
 ):
-    """Finish a deferred pair's ``held`` distinct candidates in a block's scratch from ``base`` (window frame, their
-    core points in ``scratch.k``) with the block's ``lanes`` lanes (lane ``lane``; one thread passes ``0, 1``;
-    :func:`terrain_finish_list`) and write every row it keeps in the world frame: in the pair's ``walk_slots`` walk
-    slots from ``slot`` when they fit, else in rows of the spill region it reserves (:func:`terrain_spill_rows`), or,
-    when that has no room left, the first of them by priority in its walk slots (flagged
+    """Finish a deferred pair's ``held`` candidates, which the first lane placed in a block's scratch from ``base``
+    (window frame, their core points in ``scratch.k``; the other lanes' ``held`` is not read), with the block's
+    ``lanes`` lanes (lane ``lane``; one thread passes ``0, 1``; :func:`terrain_finish_list`), and write every row it
+    keeps in the world frame, each lane its own candidates' in candidate order: in the pair's ``walk_slots`` walk slots
+    from ``slot`` when they fit, else in rows of the spill region the first lane reserves (:func:`terrain_spill_rows`),
+    or, when that has no room left, the first of them by priority in its walk slots (flagged
     :data:`TERRAIN_PAIR_ROW_OVERFLOW`); its state ``state`` with the report's bits. The scratch holds every candidate a
     window of the class can give; a pair with more has a window its shape data no longer bounds (changed since
     construction): it keeps the first ``scratch.capacity`` in window order and is flagged. Every lane of the block must
     call it with the same pair."""
+    if lanes > 1:
+        # every lane takes the first lane's count, after its writes
+        held = _lanes_first(held)
     flags = int(0)
     count = held
     if held > scratch.capacity:
         flags = TERRAIN_FINISH_CANDIDATE_OVERFLOW
         count = scratch.capacity
     kept = terrain_finish_list(scratch, base, count, eps, lane, lanes)
-    if lane != 0:
-        return
-    if kept > walk_slots:
-        first = terrain_spill_rows(out, kept)
-        if first >= 0:
-            slot = first
-        else:
-            # no room left: the finish's first rows by priority, in the pair's own walk slots
-            kept = terrain_finish_overflow(scratch, base, count, walk_slots)
-            flags = flags | TERRAIN_FINISH_ROW_OVERFLOW
+    if lane == 0:
+        if kept > walk_slots:
+            first = terrain_spill_rows(out, kept)
+            if first >= 0:
+                slot = first
+            else:
+                # no room left: the finish's first rows by priority, in the pair's own walk slots
+                kept = terrain_finish_overflow(scratch, base, count, walk_slots)
+                flags = flags | TERRAIN_FINISH_ROW_OVERFLOW
+        out.first[pair] = slot
+        out.count[pair] = kept
+        out.state[pair] = state | terrain_finish_state(flags)
+        terrain_report(out.status, out.overflow, flags, True)
+    if lanes > 1:
+        # every lane takes the first lane's rows, after its marks
+        slot = _lanes_first(slot)
+    # a kept row's place: the kept candidates before it, the lanes' counted across the block
     written = int(0)
-    for i in range(count):
-        if scratch.mark[base + i] != 0:
+    for start in range(0, count, lanes):
+        i = start + lane
+        keep = int(0)
+        if i < count:
+            keep = scratch.mark[base + i]
+        before = int(0)
+        if lanes > 1:
+            before = wp.untile(wp.tile_scan_exclusive(wp.tile(keep)))
+        if keep != 0:
             terrain_store_row(
                 out,
-                slot + written,
+                slot + written + before,
                 scratch.q[base + i],
                 scratch.n[base + i],
                 scratch.d[base + i],
@@ -2319,11 +2775,10 @@ def terrain_finish_deferred(
                 window,
                 frame,
             )
-            written += 1
-    out.first[pair] = slot
-    out.count[pair] = kept
-    out.state[pair] = state | terrain_finish_state(flags)
-    terrain_report(out.status, out.overflow, flags, True)
+        if lanes > 1:
+            written += _lanes_sum(keep)
+        else:
+            written += keep
 
 
 @wp.func
