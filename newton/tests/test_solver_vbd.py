@@ -1306,22 +1306,34 @@ def _rigid_contact_history_capture_requires_preallocation(test, device):
 
     # The history exists from construction, before the solver meets any contacts. Each capture keeps
     # its own name: dropping an earlier graph during a later capture would invalidate that capture.
-    pipeline, solver, contacts, state_in, state_out, control = make_scene()
+    _pipeline, solver, contacts, state_in, state_out, control = make_scene()
     test.assertIsNotNone(solver._prev_contact_lambda)
     with scoped_capture_after_gc(device=device) as first:
         solver.step(state_in, state_out, control, contacts, 1.0e-3)
     test.assertIsNotNone(first.graph)
 
-    # Contact rows that outgrew the history cannot grow it during capture: one uncaptured step grows it.
-    pipeline, solver, contacts, state_in, state_out, control = make_scene()
+    # The model's contacts and the solver share the model's rows: a reservation grows the history at once.
+    _pipeline, solver, contacts, state_in, state_out, control = make_scene()
     rows = solver._prev_contact_lambda.shape[0]
     test.assertTrue(contacts.reserve_rigid_contacts(2 * rows))
+    test.assertEqual(solver._prev_contact_lambda.shape[0], contacts.rigid_contact_max)
+    with scoped_capture_after_gc(device=device) as shared:
+        solver.step(state_in, state_out, control, contacts, 1.0e-3)
+    test.assertIsNotNone(shared.graph)
+
+    # Contacts of another model's pipeline that outgrew the history cannot grow it during capture: one uncaptured
+    # step grows it.
+    _, solver, _, state_in, state_out, control = make_scene()
+    other, _, contacts, _, _, _ = make_scene()
+    rows = solver._prev_contact_lambda.shape[0]
+    test.assertTrue(contacts.reserve_rigid_contacts(2 * rows))
+    other.collide(state_in, contacts)
     with test.assertRaisesRegex(RuntimeError, "during CUDA graph capture"):
         with scoped_capture_after_gc(device=device):
             solver.step(state_in, state_out, control, contacts, 1.0e-3)
     solver.step(state_in, state_out, control, contacts, 1.0e-3)
     test.assertEqual(solver._prev_contact_lambda.shape[0], contacts.rigid_contact_max)
-    pipeline.collide(state_out, contacts)
+    other.collide(state_out, contacts)
     with scoped_capture_after_gc(device=device) as grown:
         solver.step(state_out, state_in, control, contacts, 1.0e-3)
     test.assertIsNotNone(grown.graph)

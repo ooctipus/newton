@@ -43,9 +43,9 @@ Storage:
   addresses allocated memory; recapture after a growth all the same.
 
 The demand signal is a sticky device high-water mark of the contact count
-(:meth:`ContactPool.record_demand`), never reset by a collision pass and
-copied each pass into pinned host memory by an asynchronous copy that graphs
-capture. :meth:`ContactPool.service` reads it without synchronizing and grows
+(:meth:`ContactPool.record_demand`), never reset by a collision pass, which
+the same launch writes into pinned host memory (mapped into the device's
+address space, so graphs replay no copy). :meth:`ContactPool.service` reads it without synchronizing and grows
 the pool when the high-water mark passes :data:`GROW_THRESHOLD` of the ready
 rows. Under graph replay, overflow stays loud: writers drop contacts past the
 ready rows and the capacity status reports it; the service then grows and
@@ -232,8 +232,9 @@ def _fill_index(start: int, out: wp.array[wp.int32]):
 
 
 @wp.kernel(enable_backward=False)
-def _record_high_water(count: wp.array[wp.int32], high_water: wp.array[wp.int32]):
-    wp.atomic_max(high_water, 0, count[0])
+def _record_high_water(count: wp.array[wp.int32], high_water: wp.array[wp.int32], mirror: wp.array[wp.int32]):
+    demand = count[0]
+    mirror[0] = wp.max(wp.atomic_max(high_water, 0, demand), demand)
 
 
 def capturing(device) -> bool:
@@ -570,6 +571,13 @@ class ContactPool:
                 _RETIRED_HOST.clear()
                 self._high_water_host = wp.zeros(1, dtype=wp.int32, device="cpu", pinned=True)
                 weakref.finalize(self, _RETIRED_HOST.append, self._high_water_host).atexit = False
+        # The record kernel writes the mark straight into the host copy, which pinned memory maps into the
+        # device's address space: a copy node per collision pass costs a contact-free task 5-8% of its step.
+        self._high_water_mirror = self._high_water_host
+        if self._high_water_host is not self._high_water:
+            self._high_water_mirror = wp.array(
+                ptr=self._high_water_host.ptr, dtype=wp.int32, shape=(1,), device=self.device
+            )
         self.growth_count = 0
         """Growths so far; each one requires recapturing graphs that use the pool."""
         self._reserved = 0
@@ -765,15 +773,19 @@ class ContactPool:
         return self._grow_logged(target, demand)
 
     def record_demand(self, count: wp.array) -> None:
-        """Record the contact count in the sticky high-water mark and copy it to pinned host memory.
+        """Record the contact count in the sticky high-water mark and in its pinned host copy.
 
-        Graph capture records both launches.
+        One launch, which graph capture records: it writes the host copy directly.
         """
         if self._high_water is None or not self.growable:
             return
-        wp.launch(_record_high_water, dim=1, inputs=[count, self._high_water], device=self.device, record_tape=False)
-        if self._high_water_host is not self._high_water:
-            wp.copy(self._high_water_host, self._high_water)
+        wp.launch(
+            _record_high_water,
+            dim=1,
+            inputs=[count, self._high_water, self._high_water_mirror],
+            device=self.device,
+            record_tape=False,
+        )
 
     @property
     def high_water(self) -> int:
