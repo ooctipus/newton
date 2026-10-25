@@ -293,6 +293,7 @@ class FastConvexCollision:
         self.collision_pipeline = newton.CollisionPipeline(
             self.model,
             broad_phase="sap",
+            rigid_contact_max=self.model.shape_count * 8,
             verify_buffers=False,
         )
         self.contacts = self.collision_pipeline.contacts()

@@ -70,7 +70,7 @@ def _terrain_pipeline(model, choice, environment=None):
         for name in [name for name in os.environ if name.startswith("NEWTON_")]:
             del os.environ[name]
         os.environ.update({**_TERRAIN_ENVIRONMENT, **(environment or {})})
-        return newton.CollisionPipeline(model, max_triangle_pairs=4096, convex_collision=choice)
+        return newton.CollisionPipeline(model, rigid_contact_max=4096, max_triangle_pairs=4096, convex_collision=choice)
 
 
 def test_graph_choice_preserves_queries(test, device):
@@ -164,7 +164,9 @@ def test_dense_pipeline_uses_ordinary(test, device):
                 "NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP": "0",
             },
         ):
-            pipelines.append(newton.CollisionPipeline(model, broad_phase="explicit", convex_collision=mode))
+            pipelines.append(
+                newton.CollisionPipeline(model, broad_phase="explicit", rigid_contact_max=300000, convex_collision=mode)
+            )
     state = model.state()
     counts = []
     for pipeline in pipelines:

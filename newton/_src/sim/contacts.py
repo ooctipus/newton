@@ -298,11 +298,12 @@ class Contacts:
     optionally require gradients for differentiable simulation.
 
     Every rigid contact array holds :attr:`rigid_contact_max` rows, the rows the buffer holds
-    now. They start from the data (64 per world, at least 4096, for :meth:`newton.CollisionPipeline.contacts`)
-    and grow with the measured demand, limited only by the device memory: a collision pass
-    outside graph capture grows them as it needs, :meth:`newton.CollisionPipeline.service_capacity`
-    grows them between graph replays, and a solver writing contacts of its own declares them
-    with :meth:`reserve_rigid_contacts`. Growth replaces the array attributes with longer views
+    now. A :meth:`newton.CollisionPipeline.contacts` buffer holds its model's contact rows, which
+    start at a few thousand and are sized from the measured demand, limited only by the device
+    memory: a collision pass outside graph capture grows them as it needs, and
+    :meth:`newton.CollisionPipeline.service_capacity` sizes them for a state before a graph is
+    captured and grows them between graph replays; a solver writing contacts of its own declares
+    them with :meth:`reserve_rigid_contacts`. Growth replaces the array attributes with longer views
     (on CUDA, of the same memory), so read them from this object rather than keeping them, and
     recapture CUDA graphs after a growth.
 
@@ -365,8 +366,11 @@ class Contacts:
         Initialize Contacts storage.
 
         Args:
-            rigid_contact_max: Initial rows of the rigid arrays, which grow as needed. Ignored
-                when ``rigid_contact_pool`` is given: the arrays then hold the pool's ready rows.
+            rigid_contact_max: Initial rows of the rigid arrays of a buffer built directly, which
+                grow as needed: the sizing input for code that builds its own ``Contacts`` (for
+                example to hold a solver's own contacts, see :meth:`reserve_rigid_contacts`).
+                Ignored when ``rigid_contact_pool`` is given: the arrays then hold the pool's ready
+                rows, as for :meth:`newton.CollisionPipeline.contacts`.
             soft_contact_max: Maximum number of soft contacts
             soft_contact_tids_size: Length of the internal per-thread replay-index array
                 (``soft_contact_tids``) used for differentiable backward. Defaults to

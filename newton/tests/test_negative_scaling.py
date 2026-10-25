@@ -38,7 +38,7 @@ def _build_mesh_pair(scale_a, scale_b, body_pos_a=(-0.5, 0.0, 1.0), body_pos_b=(
 
 def _run_pipeline(model):
     """Run a single collide() pass and return the contact arrays."""
-    pipeline = newton.CollisionPipeline(model)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=200)
     contacts = pipeline.contacts()
     state = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)

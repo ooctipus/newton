@@ -29,7 +29,7 @@ from typing import ClassVar, Literal
 import numpy as np
 import warp as wp
 
-from ...core.contact_pool import ContactField, ContactPool
+from ...core.contact_pool import ContactField, model_contact_pool
 from ...core.environment_flags import retired_notice
 from ...core.types import override
 from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
@@ -5863,9 +5863,10 @@ class SolverFeatherPGS(SolverBase):
                     requires_grad=requires_grad,
                 )
 
-        # Every per-contact buffer holds this pool's ready rows: they start from the data and grow
-        # with the contact stream the solver consumes (see _follow_contacts).
-        self._contact_pool = ContactPool(device=device, world_count=self.world_count)
+        # Every per-contact buffer holds the ready rows of the model's contact pool, which its
+        # collision pipelines share: they are sized with the pipeline's measured demand before a graph
+        # is captured, and grow with any other contact stream the solver consumes (see _follow_contacts).
+        self._contact_pool = model_contact_pool(model, device)
         contact_fields = [
             ContactField(name, wp.int32, requires_grad=requires_grad)
             for name in (

@@ -203,6 +203,7 @@ class Example:
         self.pipeline = newton.CollisionPipeline(
             self.model,
             broad_phase="sap",
+            rigid_contact_max=args.contacts * len(args.amplitudes),
             max_triangle_pairs=32768 * len(args.amplitudes),
         )
         self.contacts = self.pipeline.contacts()

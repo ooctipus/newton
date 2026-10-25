@@ -34,13 +34,6 @@ if TYPE_CHECKING:
     from .collide import CollisionPipeline
 
 
-_RIGID_CONTACT_MAX_DEPRECATION_MSG = (
-    "Model.rigid_contact_max is deprecated and ignored: rigid contact buffers start from the data and grow with "
-    "the measured demand, limited only by the device memory (see CollisionPipeline.service_capacity()). Size "
-    "SolverKamino's contact container with SolverKamino.Config.collision_detector.max_contacts or "
-    "max_contacts_per_world."
-)
-
 _SHAPE_COLLISION_FILTER_MUTATION_DEPRECATION_MSG = (
     "Mutating Model.shape_collision_filter_pairs after ModelBuilder.finalize() is deprecated. "
     "Configure collision filters on ModelBuilder before finalizing; post-finalize filter changes "
@@ -1314,6 +1307,15 @@ class Model:
         self.soft_contact_restitution: float = 0.0
         """Restitution coefficient of soft contacts [dimensionless] (used by :class:`SolverXPBD`)."""
 
+        self.rigid_contact_max: int = 0
+        """Number of potential contact points between rigid bodies, kept for compatibility with Newton main.
+
+        Contact buffers grow on demand and are not sized by it. A
+        :class:`~newton.CollisionPipeline` writes the budget it resolves here, as on
+        Newton main, and :class:`~newton.solvers.SolverKamino` sizes its fixed contact
+        container for converted Newton contacts by it.
+        """
+
         self.up_axis: int = 2
         """Up axis: 0 for x, 1 for y, 2 for z."""
         self.gravity: wp.array[wp.vec3] | None = None
@@ -1987,25 +1989,6 @@ class Model:
             broad_phase="explicit",
             enable_rigid_soft_full_surface_contact=enable_rigid_soft_full_surface_contact,
         )
-
-    @property
-    def rigid_contact_max(self) -> int:
-        """The value last assigned (``0`` by default); nothing reads it.
-
-        .. deprecated:: 1.6
-            Rigid contact buffers start from the data and grow with the measured
-            demand, limited only by the device memory; this value sizes nothing.
-            Size :class:`~newton.solvers.SolverKamino`'s contact container with
-            its config's ``collision_detector.max_contacts`` or
-            ``collision_detector.max_contacts_per_world``.
-        """
-        warnings.warn(_RIGID_CONTACT_MAX_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
-        return self.__dict__.get("_rigid_contact_max", 0)
-
-    @rigid_contact_max.setter
-    def rigid_contact_max(self, value: int) -> None:
-        warnings.warn(_RIGID_CONTACT_MAX_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
-        self.__dict__["_rigid_contact_max"] = int(value)
 
     def contacts(
         self: Model,

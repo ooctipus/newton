@@ -133,13 +133,12 @@ class Example:
 
         builder.color()
         self.model = builder.finalize()
+        self.model.rigid_contact_max = 96
 
         self.device = self.model.device
 
         kamino_config = _make_kamino_config()
         kamino_config.padmm.max_iterations = args.kamino_iterations
-        # Kamino's contact container holds 96 contacts over all worlds.
-        kamino_config.collision_detector.max_contacts = 96
 
         self.solver = SolverCoupledADMM(
             model=self.model,

@@ -27,7 +27,6 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.kamino.config import CollisionDetectorConfig
 from newton.tests.unittest_utils import (
     add_function_test,
     get_selected_cuda_test_devices,
@@ -154,6 +153,9 @@ def build_friction_grid(device, mus, angles_deg, contact_kf=0.0):
 
     builder.color()  # required for VBD
     model = builder.finalize(device=device)
+    # Set conservative limit on number of contacts to avoid unnecessary allocations and work
+    total_boxes = sum(len(row) for row in box_ids)
+    model.rigid_contact_max = 8 * total_boxes
     return model, box_ids
 
 
@@ -269,6 +271,8 @@ def build_stopping_distance_scene(device, contact_ke=1.0e5):
 
     builder.color()  # required for VBD
     model = builder.finalize(device=device)
+    # Set conservative limit on number of contacts to avoid unnecessary allocations and work
+    model.rigid_contact_max = 8 * len(box_ids)
     return model, box_ids
 
 
@@ -456,13 +460,7 @@ _SOLVERS = {
         "stopping_distance_rest_speed_max": STOPPING_REST_SPEED_MAX,
     },
     "kamino": {
-        # Kamino's contact container holds eight contacts per box.
-        "factory": lambda model: newton.solvers.SolverKamino(
-            model,
-            config=newton.solvers.SolverKamino.Config(
-                collision_detector=CollisionDetectorConfig(max_contacts=8 * model.body_count)
-            ),
-        ),
+        "factory": newton.solvers.SolverKamino,
         "mus": _DEFAULT_MUS,
         "angles_deg": _DEFAULT_ANGLES_DEG,
         "thresholds": _DEFAULT_THRESHOLDS,

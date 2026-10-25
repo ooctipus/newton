@@ -519,20 +519,29 @@ def _throttle_render_fps(
     return sleep_time
 
 
-def _service_contact_capacity(example, state: newton.State | None = None) -> None:
-    """Grow the example's rigid contact buffers to their demand and recapture its graph when they grew.
+def _service_contact_capacity(example, state: newton.State | None = None, *, recapture: bool = False) -> bool:
+    """Size the example's rigid contact buffers from their demand and recapture its graph when they grew.
 
     A graph replays fixed buffer extents, and the buffers grow only outside
     capture, so the runner does what every loop that replays
     :meth:`newton.CollisionPipeline.collide` from a graph does (see
     :meth:`~newton.CollisionPipeline.service_capacity`): before the first frame
-    it makes ``state``, the state the example's graph starts from, fit, and
-    after each frame it grows from the recorded demand. Before the first frame
-    the graph is recaptured only when its buffers could not hold ``state``'s
-    contacts: an example may allocate buffers in its first capture that only
-    its first replay makes valid.
+    it measures ``state``, the state the example's graph starts from, and
+    after each frame it grows from the recorded demand. Examples capture their
+    graph before the runner measures, and may allocate buffers in that first
+    capture that only its first replay makes valid; so before the first frame
+    the graph is recaptured only when its buffers cannot hold ``state``'s
+    contacts. Otherwise the recapture waits for the first frame to replay it.
+
+    Args:
+        example: The example whose :class:`newton.CollisionPipeline` attributes to service.
+        state: The state to measure before the first frame.
+        recapture: Recapture the graph even if the buffers did not grow now.
+
+    Returns:
+        Whether the buffers grew but the graph was left to recapture after the first frame.
     """
-    grew = False
+    grew = overflowed = False
     for pipeline in list(vars(example).values()):
         if isinstance(pipeline, newton.CollisionPipeline):
             model = pipeline.model
@@ -543,9 +552,16 @@ def _service_contact_capacity(example, state: newton.State | None = None) -> Non
                 and state.particle_count == model.particle_count
                 else None
             )
+            rows = pipeline._contact_pool.ready
             grew |= pipeline.service_capacity(measured)
-    if grew and getattr(example, "graph", None) is not None and callable(getattr(example, "capture", None)):
-        example.capture()
+            overflowed |= measured is not None and pipeline._contact_pool.high_water > rows
+    graph = getattr(example, "graph", None) is not None and callable(getattr(example, "capture", None))
+    if not graph or not (grew or recapture):
+        return False
+    if state is not None and not overflowed:
+        return True
+    example.capture()
+    return False
 
 
 def run(example, args):
@@ -567,6 +583,7 @@ def run(example, args):
 
     # Weakly: a reset drops the old example before the new one captures its graph.
     prepared = None
+    recapture = False
     while viewer.is_running():
         frame_start_time = time.perf_counter()
 
@@ -591,13 +608,13 @@ def run(example, args):
             continue
 
         if prepared is None or prepared() is not example:
-            _service_contact_capacity(example, getattr(example, "state_0", None))
+            recapture = _service_contact_capacity(example, getattr(example, "state_0", None))
             prepared = weakref.ref(example)
 
         if viewer.should_step():
             with wp.ScopedTimer("step", active=False):
                 example.step()
-            _service_contact_capacity(example)
+            recapture = _service_contact_capacity(example, recapture=recapture)
         if test_post_step:
             example.test_post_step()
 

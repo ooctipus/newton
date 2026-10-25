@@ -62,13 +62,12 @@ class Example:
 
         # Create the model from the builder
         self.model = builder.finalize(skip_validation_joints=True)
+        self.model.rigid_contact_max = 4
 
         # Create the Kamino solver for the given model
         self.config = newton.solvers.SolverKamino.Config.from_model(self.model)
         self.config.use_fk_solver = True
         self.config.use_collision_detector = self.use_kamino_contacts
-        # Kamino's contact container holds 4 contacts over all worlds.
-        self.config.collision_detector.max_contacts = 4
         self.config.constraints.gamma = 0.001
         self.config.constraints.delta = 1e-4
         self.config.padmm.max_iterations = 200

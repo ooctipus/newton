@@ -79,7 +79,7 @@ class TestFeatherPGSConditioning(unittest.TestCase):
         """Step a bare 100-link chain on the ground without a non-finite factor or velocity."""
         scene = scenes.long_chain(armature=0.0)
         model, solver, _ = _solver(scene)
-        pipeline = newton.CollisionPipeline(model)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=scene.rigid_contact_max)
         contacts = pipeline.contacts()
         state_0, state_1 = model.state(), model.state()
         control = model.control()

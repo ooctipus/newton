@@ -255,6 +255,8 @@ def simulate(
     steps = scene.steps if steps is None else steps
     model = scene.build(device)
     pipeline_options = {}
+    if scene.rigid_contact_max is not None:
+        pipeline_options["rigid_contact_max"] = scene.rigid_contact_max
     if scene.contact_matching is not None:
         pipeline_options["contact_matching"] = scene.contact_matching
     if scene.deterministic_contacts:

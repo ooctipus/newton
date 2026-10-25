@@ -51,7 +51,7 @@ def _slide(device, mode, beta, mesh, angle, articulated=False, *, locked_tangent
         dense_max_constraints=32,
         row_watermark=True,
     )
-    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=128, deterministic=True)
     contacts = pipeline.contacts()
     state, next_state = model.state(), model.state()
     control = model.control()

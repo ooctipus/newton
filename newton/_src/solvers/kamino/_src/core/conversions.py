@@ -1940,7 +1940,12 @@ def convert_geometries(
     )
 
     # Compute total number of required contacts per world
-    model_min_contacts, world_min_contacts = compute_required_contact_capacity(model)
+    if model.rigid_contact_max > 0:
+        model_min_contacts = int(model.rigid_contact_max)
+        min_contacts_per_world = model.rigid_contact_max // model.world_count
+        world_min_contacts = [min_contacts_per_world] * model.world_count
+    else:
+        model_min_contacts, world_min_contacts = compute_required_contact_capacity(model)
 
     # Convert shape offsets from body-frame-relative to COM-relative
     offset = wp.zeros_like(model.shape_transform)

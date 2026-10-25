@@ -128,7 +128,7 @@ def _rollout(solver, model, *, steps, slide_world=None, speed=0.0):
 
     Returns per-step anchor counts, contact counts and (body_q, body_qd, row impulses).
     """
-    pipeline = newton.CollisionPipeline(model)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
     contacts, control = pipeline.contacts(), model.control()
     state, output = model.state(), model.state()
     if slide_world is not None:

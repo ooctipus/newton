@@ -501,7 +501,7 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
                 target[0] = 0.03
                 control.joint_target_q.assign(target)
                 pipeline = newton.CollisionPipeline(
-                    model, contact_matching="latest", reduce_contacts=False, broad_phase="nxn"
+                    model, contact_matching="latest", reduce_contacts=False, broad_phase="nxn", rigid_contact_max=64
                 )
                 contacts = pipeline.contacts()
                 spins = 0
@@ -675,7 +675,7 @@ class TestDeviceTorsionPreparation(unittest.TestCase):
                 solver.prepare_contact_torsion_capture(a, z)
                 control = model.control()
                 pipeline = newton.CollisionPipeline(
-                    model, contact_matching="latest", reduce_contacts=False, broad_phase="nxn"
+                    model, contact_matching="latest", reduce_contacts=False, broad_phase="nxn", rigid_contact_max=64
                 )
 
                 def pair(a=a, z=z, pipeline=pipeline, solver=solver, control=control, contacts=contacts):

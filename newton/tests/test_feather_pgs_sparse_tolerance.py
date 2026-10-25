@@ -81,6 +81,7 @@ def _build(device, worlds=8, *, hip_pitch=False):
     plane = builder.add_ground_plane()
     model = builder.finalize(device=device)
     count = len(shapes)
+    model.rigid_contact_max = count
     contacts = newton.Contacts(rigid_contact_max=count, soft_contact_max=0, device=device)
     contacts.rigid_contact_count.assign(np.array([count], dtype=np.int32))
     contacts.rigid_contact_shape0.assign(np.asarray(shapes, dtype=np.int32))

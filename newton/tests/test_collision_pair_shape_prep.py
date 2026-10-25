@@ -28,7 +28,7 @@ class TestCollisionPairShapePrep(unittest.TestCase):
     def _pipeline(self, model, *, enabled=True, pairs=((0, 1),), **kwargs):
         pair_array = wp.array(np.asarray(pairs, dtype=np.int32).reshape(-1, 2), dtype=wp.vec2i, device=model.device)
         with patch.dict(os.environ, {"NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP": str(int(enabled))}):
-            return newton.CollisionPipeline(model, shape_pairs_filtered=pair_array, **kwargs)
+            return newton.CollisionPipeline(model, shape_pairs_filtered=pair_array, rigid_contact_max=100, **kwargs)
 
     @staticmethod
     def _geometry(pipeline):

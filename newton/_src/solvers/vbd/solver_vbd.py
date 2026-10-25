@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-from ...core.contact_pool import ContactField, ContactPool
+from ...core.contact_pool import ContactField, model_contact_pool
 from ...core.types import override
 from ...geometry import ParticleFlags
 from ...sim import (
@@ -177,10 +177,11 @@ class SolverVBD(SolverBase, CouplingInterface):
 
     Buffer sizing:
         When this solver owns the rigid system, its body-body contact state, rigid contact
-        history and rigid contact force outputs are per-contact rows that start from the data
-        (64 per world, at least 4096) and grow with the :class:`~newton.Contacts` each :meth:`step` receives,
-        keeping their contents; growth cannot happen during graph capture, so run one
-        uncaptured step first and recapture after the contact buffers grow
+        history and rigid contact force outputs are rows of the model's contact pool, which its
+        collision pipelines share: they are sized with the pipeline's measured demand and grow
+        with any other :class:`~newton.Contacts` a :meth:`step` receives, keeping their contents;
+        growth cannot happen during graph capture, so measure the starting state (or run one
+        uncaptured step) first and recapture after the contact buffers grow
         (:meth:`~newton.CollisionPipeline.service_capacity`). Body-particle contact state is
         pre-sized from a world-aware particle-shape pair count, which excludes the
         ``enable_rigid_soft_full_surface_contact`` edge/face headroom, and grows from
@@ -909,9 +910,10 @@ class SolverVBD(SolverBase, CouplingInterface):
             self.joint_rest_angle = self._init_joint_rest_angle()
 
             # Body-body contact state, warm-start history and contact-query outputs: per-contact rows
-            # that start from the data and grow with the contacts the solver consumes
+            # of the model's contact pool, which its collision pipelines share, so they are sized with
+            # the pipeline's measured demand and grow with any other contacts the solver consumes
             # (see _follow_contacts).
-            self._contact_pool = ContactPool(device=self.device, world_count=model.world_count)
+            self._contact_pool = model_contact_pool(model, self.device)
             self._contact_state_rows = self._contact_pool.rows(
                 [
                     ContactField(f"body_body_contact_{name}", wp.float32)

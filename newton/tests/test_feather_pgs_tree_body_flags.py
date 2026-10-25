@@ -156,7 +156,7 @@ def _sparse_case(beta, cached, *, kinematic_body=None):
     state, out, control = model.state(), model.state(), model.control()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     control.joint_f.assign(np.linspace(-0.08, 0.11, model.joint_dof_count, dtype=np.float32))
-    pipeline = newton.CollisionPipeline(model)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32)
     return model, solver, state, out, control, pipeline, pipeline.contacts()
 
 

@@ -86,11 +86,6 @@ else:
 
 _NEWTON_SRC_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), os.pardir)) + os.sep
 
-_RIGID_CONTACT_BUDGET_DEPRECATION_MSG = (
-    "ModelBuilder.num_rigid_contacts_per_world is deprecated and ignored: rigid contact buffers start from the "
-    "data and grow with the measured demand."
-)
-
 _SCALAR_GRAVITY_DEPRECATION_MSG = (
     "Scalar ModelBuilder.gravity is deprecated in Newton 1.4; pass a gravity vector instead. "
     "Scalar gravity will be removed in a future release."
@@ -1765,6 +1760,11 @@ class ModelBuilder:
         ``ModelBuilder.ShapeConfig.gap`` is ``None``. The resolved per-shape values are later
         propagated to :attr:`Model.shape_gap`."""
 
+        self.num_rigid_contacts_per_world: int | None = None
+        """Optional per-world rigid-contact allocation budget, kept for compatibility with Newton main.
+
+        Contact buffers grow on demand and are not sized by it."""
+
         # mimic constraints
         self.constraint_mimic_joint0: list[int] = []
         """Follower joint indices accumulated for :attr:`Model.constraint_mimic_joint0`."""
@@ -2577,21 +2577,6 @@ class ModelBuilder:
         raise AttributeError(
             "The 'up_vector' property is read-only and cannot be set. Instead, use 'up_axis' to set the up axis."
         )
-
-    @property
-    def num_rigid_contacts_per_world(self) -> int | None:
-        """Always ``None``: there is no per-world rigid contact budget.
-
-        .. deprecated:: 1.6
-            Rigid contact buffers start from the data and grow with the measured
-            demand; setting this is ignored.
-        """
-        warnings.warn(_RIGID_CONTACT_BUDGET_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
-        return None
-
-    @num_rigid_contacts_per_world.setter
-    def num_rigid_contacts_per_world(self, value: int | None) -> None:
-        warnings.warn(_RIGID_CONTACT_BUDGET_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
 
     @property
     def gravity(self) -> float | wp.vec3:

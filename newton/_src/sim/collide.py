@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import logging
 import os
 import warnings
 import weakref
@@ -15,7 +16,7 @@ from typing import Literal
 import numpy as np
 import warp as wp
 
-from ..core.contact_pool import ContactField, ContactPool, capturing
+from ..core.contact_pool import ContactField, capturing, model_contact_pool
 from ..core.environment_flags import record_newton_environment, retired_notice
 from ..core.reset import normalize_reset_world_mask
 from ..geometry.broad_phase_nxn import BroadPhaseAllPairs, BroadPhaseExplicit, BroadPhaseExplicitTemplates
@@ -28,6 +29,7 @@ from ..geometry.contact_data import (
     prepare_speculative_contact,
 )
 from ..geometry.contact_match import ContactMatcher
+from ..geometry.contact_reduction import MAX_CONTACTS_PER_PAIR, NUM_NORMAL_BINS
 from ..geometry.contact_reduction_body_pairs import (
     MAX_GROUP_ID,
     BodyPairContactReducer,
@@ -51,6 +53,8 @@ from ..sim.contacts import Contacts, note_contact_frame_write
 from ..sim.enums import BodyFlags, ModelFlags
 from ..sim.model import Model
 from ..sim.state import State
+
+logger = logging.getLogger(__name__)
 
 
 @wp.kernel
@@ -726,6 +730,40 @@ def _compute_pair_shape_aabbs(
     geom_xform[shape_id] = X_ws
 
 
+# Per-pair worst-case contact counts established by the narrow phase:
+#
+# * Convex-convex pairs (all primitive GeoTypes, CONVEX_MESH, and planes) are
+#   handled either by the analytic primitive fast path, which writes at most 4
+#   contacts per pair (``narrow_phase.py::narrow_phase_primitive_kernel``,
+#   contact slots 0-3), or by the GJK/MPR multi-contact path, which writes at
+#   most 4 manifold points plus 1 deepest contact = 5 per pair
+#   (``multicontact.py::build_manifold``: ``count_out = min(num_manifold_points, 4)``
+#   followed by an optional deepest-contact write).
+_CONVEX_PAIR_MAX_CONTACTS = 5
+#
+# * Mesh/heightfield-involved pairs (mesh-convex, mesh-plane, mesh-mesh,
+#   heightfield-*) and hydroelastic SDF-SDF pairs route their per-triangle /
+#   per-vertex contacts through contact reduction, which retains at most
+#   ``NUM_NORMAL_BINS * (NUM_SPATIAL_DIRECTIONS + 1) + NUM_VOXEL_DEPTH_SLOTS``
+#   slots per pair (240 with the default icosahedron configuration).
+#   ``contact_reduction.py`` asserts at import time that the slot count never
+#   exceeds ``MAX_CONTACTS_PER_PAIR`` (255, the hard architectural limit that
+#   keeps per-pair contact indices representable in 8 bits), so
+#   MAX_CONTACTS_PER_PAIR bounds every reduced mesh path. The bound assumes
+#   contact reduction is enabled (the default); with ``reduce_contacts=False``
+#   mesh paths write unreduced per-triangle/per-vertex contacts and no static
+#   estimate is possible.
+_MESH_PAIR_MAX_CONTACTS = MAX_CONTACTS_PER_PAIR
+#
+# * Hydroelastic SDF-SDF pairs additionally export one synthetic anchor
+#   contact PER ACTIVE NORMAL BIN when ``anchor_contact`` (or
+#   ``moment_matching``, which implies it) is enabled
+#   (``contact_reduction_hydroelastic.py::export_hydroelastic_reduced_contacts_kernel``),
+#   on top of the reduced slots — worst case ``MAX_CONTACTS_PER_PAIR +
+#   NUM_NORMAL_BINS`` per pair.
+_HYDRO_PAIR_MAX_CONTACTS = MAX_CONTACTS_PER_PAIR + NUM_NORMAL_BINS
+
+
 @wp.kernel(enable_backward=False)
 def compute_shape_velocities(
     body_q: wp.array[wp.transform],
@@ -794,6 +832,195 @@ def compute_shape_velocities(
     angular_extension_vec = wp.min(wp.vec3(angular_extension), cap)
     shape_aabb_lower[shape_id] = shape_aabb_lower[shape_id] - angular_extension_vec
     shape_aabb_upper[shape_id] = shape_aabb_upper[shape_id] + angular_extension_vec
+
+
+# Primitive pairs (GJK/MPR) produce up to 5 manifold contacts.
+# Mesh-involved pairs (SDF + contact reduction) typically retain about 40.
+_RIGID_CONTACTS_PER_PRIMITIVE_PAIR = 5
+_RIGID_CONTACTS_PER_MESH_PAIR = 40
+_RIGID_CONTACT_MAX_NEIGHBORS_PER_SHAPE = 20
+_RIGID_CONTACT_MIN_CAPACITY = 1000
+
+
+def _estimate_rigid_contact_max(model: Model) -> int:
+    """
+    Estimate the maximum number of rigid contacts for the collision pipeline.
+
+    When precomputed contact pairs are available (``model.shape_contact_pairs``,
+    produced by ``ModelBuilder.find_shape_contact_pairs`` for every finalized
+    model), the estimate is the exact sum of per-pair worst-case contact counts
+    over the actual pair list: each pair is classified by the GeoTypes (and
+    hydroelastic flags) of its two shapes and assigned the narrow phase's hard
+    per-pair cap. Every broad phase mode (explicit, nxn, sap) applies the same
+    world/group/filter-pair logic as ``find_shape_contact_pairs``, so any
+    candidate pair reaching the narrow phase is contained in the precomputed
+    list and the sum is a provable worst case. For dense pair graphs the sum is
+    capped by a spatial-locality estimate (see the inline comment); where that
+    cap binds, capacity is physically motivated rather than provable, matching
+    the pre-pair-aware behavior. Crucially, shapes that participate in no
+    contact pair (e.g. visual-only meshes) contribute nothing to either term.
+    The per-pair caps assume contact reduction is enabled (the default for
+    mesh/hydroelastic paths); with ``reduce_contacts=False`` no static bound
+    exists and overflow remains detectable via ``contact_count > contact_max``.
+
+    Otherwise falls back to a linear neighbor-budget estimate assuming each
+    non-plane shape contacts at most ``_RIGID_CONTACT_MAX_NEIGHBORS_PER_SHAPE`` others (spatial
+    locality).  The non-plane term is additive across independent worlds so a
+    single-pool computation is correct.  The plane term (each plane vs all
+    non-planes in its world) would be quadratic if computed globally, so it is
+    evaluated per world when metadata is available.
+
+    Args:
+        model: The simulation model.
+
+    Returns:
+        Estimated maximum number of rigid contacts.
+    """
+    if not hasattr(model, "shape_type") or model.shape_type is None:
+        return 1000  # Fallback
+
+    shape_types = model.shape_type.numpy()
+    colliding_mask = _shape_collide_mask(model, len(shape_types))
+
+    mesh_mask = colliding_mask & ((shape_types == int(GeoType.MESH)) | (shape_types == int(GeoType.HFIELD)))
+
+    # ------------------------------------------------------------------
+    # Pair-aware exact bound: sum of per-pair worst cases over the actual
+    # precomputed contact pairs.
+    # ------------------------------------------------------------------
+    shape_contact_pairs = getattr(model, "shape_contact_pairs", None)
+    if getattr(model, "shape_contact_pair_count", 0) > 0 and shape_contact_pairs is not None:
+        # One-time host transfer at pipeline/solver init (can be large for many
+        # worlds, e.g. ~655k pairs; init-only cost is acceptable).
+        pairs = shape_contact_pairs.numpy().reshape(-1, 2)
+
+        # Mesh/heightfield-involved pairs go through contact reduction.
+        pair_is_mesh = mesh_mask[pairs[:, 0]] | mesh_mask[pairs[:, 1]]
+
+        # Pairs where both shapes are hydroelastic route to the SDF-SDF
+        # hydroelastic path, whose anchor export can exceed the reduction
+        # slots by one contact per normal bin.
+        shape_flags = getattr(model, "shape_flags", None)
+        if shape_flags is not None:
+            hydro_mask = (shape_flags.numpy() & int(ShapeFlags.HYDROELASTIC)) != 0
+            pair_is_hydro = hydro_mask[pairs[:, 0]] & hydro_mask[pairs[:, 1]]
+        else:
+            pair_is_hydro = np.zeros(len(pairs), dtype=bool)
+        pair_is_mesh = pair_is_mesh & ~pair_is_hydro
+
+        pair_cap = np.full(len(pairs), _CONVEX_PAIR_MAX_CONTACTS, dtype=np.int64)
+        pair_cap[pair_is_mesh] = _MESH_PAIR_MAX_CONTACTS
+        pair_cap[pair_is_hydro] = _HYDRO_PAIR_MAX_CONTACTS
+        pair_contacts = int(pair_cap.sum())
+
+        # The pair sum is the combinatorial worst case, but for dense pair
+        # graphs (e.g. thousands of mutually collidable shapes piled in one
+        # world) it explodes quadratically while only a bounded number of
+        # neighbors can touch a shape simultaneously. Cap it with a
+        # spatial-locality estimate, mirroring the pre-pair-aware behavior:
+        # plane-involved pairs keep their full per-pair budget (a ground plane
+        # really can contact every shape resting on it at once), and each
+        # non-plane shape is budgeted for at most MAX_NEIGHBORS_PER_SHAPE
+        # simultaneous neighbors at its own per-pair cap (halved to avoid
+        # double-counting both shapes of a pair). Where this cap binds the
+        # capacity is physically motivated rather than a provable bound -
+        # exactly as before this estimator existed; where the pair sum binds
+        # (typical multi-world robot scenes) it is a provable worst case.
+        plane_shape = shape_types == int(GeoType.PLANE)
+        pair_has_plane = plane_shape[pairs[:, 0]] | plane_shape[pairs[:, 1]]
+        plane_pair_contacts = int(pair_cap[pair_has_plane].sum())
+        nonplane_pairs = pairs[~pair_has_plane]
+        if len(nonplane_pairs) > 0:
+            active_shapes = np.unique(nonplane_pairs)
+            shape_cap = np.full(len(active_shapes), _CONVEX_PAIR_MAX_CONTACTS, dtype=np.int64)
+            shape_cap[mesh_mask[active_shapes]] = _MESH_PAIR_MAX_CONTACTS
+            if shape_flags is not None:
+                shape_cap[hydro_mask[active_shapes]] = _HYDRO_PAIR_MAX_CONTACTS
+            nonplane_locality = int(shape_cap.sum()) * _RIGID_CONTACT_MAX_NEIGHBORS_PER_SHAPE // 2
+        else:
+            nonplane_locality = 0
+        locality_cap = plane_pair_contacts + nonplane_locality
+
+        return max(1000, min(pair_contacts, locality_cap))
+
+    # ------------------------------------------------------------------
+    # Fallback: neighbor-budget heuristic (no precomputed pairs available).
+    # ------------------------------------------------------------------
+    plane_mask = colliding_mask & (shape_types == int(GeoType.PLANE))
+    non_plane_mask = colliding_mask & ~plane_mask
+    num_meshes = int(np.count_nonzero(mesh_mask))
+    num_non_planes = int(np.count_nonzero(non_plane_mask))
+    num_primitives = num_non_planes - num_meshes
+    num_planes = int(np.count_nonzero(plane_mask))
+
+    # Weighted contacts from non-plane shape types.
+    # Each shape's neighbor pairs are weighted by its type's contacts-per-pair.
+    # Divide by 2 to avoid double-counting pairs.
+    non_plane_contacts = (
+        num_primitives * _RIGID_CONTACT_MAX_NEIGHBORS_PER_SHAPE * _RIGID_CONTACTS_PER_PRIMITIVE_PAIR
+        + num_meshes * _RIGID_CONTACT_MAX_NEIGHBORS_PER_SHAPE * _RIGID_CONTACTS_PER_MESH_PAIR
+    ) // 2
+
+    # Weighted average contacts-per-pair based on the scene's shape mix.
+    avg_cpp = (
+        (num_primitives * _RIGID_CONTACTS_PER_PRIMITIVE_PAIR + num_meshes * _RIGID_CONTACTS_PER_MESH_PAIR)
+        // max(num_non_planes, 1)
+        if num_non_planes > 0
+        else 0
+    )
+
+    # Plane contacts: each plane contacts all non-plane shapes *in its world*.
+    # The naive global formula (num_planes * num_non_planes) is O(worlds²) when
+    # both counts grow with the number of worlds.  Use per-world counts instead.
+    plane_contacts = 0
+    if num_planes > 0 and num_non_planes > 0:
+        has_world_info = (
+            hasattr(model, "shape_world")
+            and model.shape_world is not None
+            and hasattr(model, "world_count")
+            and model.world_count > 0
+        )
+        shape_world = model.shape_world.numpy() if has_world_info else None
+
+        if shape_world is not None and len(shape_world) == len(shape_types):
+            global_mask = shape_world == -1
+            local_mask = ~global_mask
+            n_worlds = model.world_count
+
+            global_planes = int(np.count_nonzero(global_mask & plane_mask))
+            global_non_planes = int(np.count_nonzero(global_mask & non_plane_mask))
+
+            local_plane_counts = np.bincount(shape_world[local_mask & plane_mask], minlength=n_worlds)[:n_worlds]
+            local_non_plane_counts = np.bincount(shape_world[local_mask & non_plane_mask], minlength=n_worlds)[
+                :n_worlds
+            ]
+
+            per_world_planes = local_plane_counts + global_planes
+            per_world_non_planes = local_non_plane_counts + global_non_planes
+
+            # Global-global pairs appear in every world slice; keep one copy.
+            plane_pair_count = int(np.sum(per_world_planes * per_world_non_planes))
+            if n_worlds > 1:
+                plane_pair_count -= (n_worlds - 1) * global_planes * global_non_planes
+            plane_contacts = plane_pair_count * avg_cpp
+        else:
+            # Fallback: exact type-weighted sum (correct for single-world models).
+            plane_contacts = num_planes * (
+                num_primitives * _RIGID_CONTACTS_PER_PRIMITIVE_PAIR + num_meshes * _RIGID_CONTACTS_PER_MESH_PAIR
+            )
+
+    total_contacts = non_plane_contacts + plane_contacts
+
+    # Legacy fallback: a pair count is known but the pair list itself is not
+    # available (only possible for hand-assembled models; ModelBuilder.finalize
+    # always populates shape_contact_pairs). Use the count as a tighter bound.
+    if hasattr(model, "shape_contact_pair_count") and model.shape_contact_pair_count > 0:
+        weighted_cpp = max(avg_cpp, _RIGID_CONTACTS_PER_PRIMITIVE_PAIR)
+        pair_contacts = int(model.shape_contact_pair_count) * weighted_cpp
+        total_contacts = min(total_contacts, pair_contacts)
+
+    # Ensure minimum allocation
+    return max(_RIGID_CONTACT_MIN_CAPACITY, total_contacts)
 
 
 def _compute_per_world_shape_pairs_max(model: Model) -> int:
@@ -1484,11 +1711,11 @@ class CollisionPipeline:
                 Hydroelastic reduction is configured independently through
                 :class:`~newton.geometry.HydroelasticSDF.Config`.  Defaults to
                 ``True``.
-            rigid_contact_max: Deprecated and ignored. Rigid contact buffers start
-                from the data (64 rows per world, at least 4096) and grow with the measured demand,
-                limited only by the device memory; see :meth:`service_capacity`.
-
-                .. deprecated:: 1.6
+            rigid_contact_max: Kept for compatibility with Newton main; contact buffers grow on
+                demand (:meth:`service_capacity`) and are not sized by it. Resolved as on Newton
+                main, this value, else ``model.rigid_contact_max`` if positive, else an estimate
+                from the model's shape pairs, and written to ``model.rigid_contact_max``, which
+                sizes :class:`~newton.solvers.SolverKamino`'s fixed contact container.
             max_triangle_pairs:
                 Maximum number of triangle pairs allocated by narrow phase
                 for mesh and heightfield collisions.  Increase this when
@@ -1831,20 +2058,25 @@ class CollisionPipeline:
         self._terrain_law_reason = None
         self._terrain_law_listed = None
 
-        if rigid_contact_max is not None:
-            warnings.warn(
-                "CollisionPipeline(rigid_contact_max=...) is deprecated and ignored: rigid contact buffers grow "
-                "with the measured demand (see CollisionPipeline.service_capacity()).",
-                DeprecationWarning,
-                stacklevel=2,
-            )
+        # Kept for compatibility with Newton main, with its explicit > model > estimated precedence and the
+        # model kept in sync; contact buffers grow on demand and nothing of this pipeline is sized by it.
+        model_rigid_contact_max = int(getattr(model, "rigid_contact_max", 0) or 0)
+        if rigid_contact_max is None:
+            if model_rigid_contact_max > 0:
+                rigid_contact_max = model_rigid_contact_max
+            else:
+                rigid_contact_max = _estimate_rigid_contact_max(model)
+        self._rigid_contact_max = rigid_contact_max
+        model.rigid_contact_max = rigid_contact_max
         if max_triangle_pairs <= 0:
             raise ValueError("max_triangle_pairs must be > 0")
         if requires_grad is None:
             requires_grad = model.requires_grad
-        # Every per-contact buffer of this pipeline, its Contacts and the solvers that follow them
-        # holds the pool's ready rows, which start from the data and grow with measured demand.
-        self._contact_pool = ContactPool(device=device, world_count=int(getattr(model, "world_count", 1) or 1))
+        # Every per-contact buffer of this pipeline, its Contacts and the solvers that step the model
+        # holds the model's pool's ready rows, which start at a floor and are sized from measured demand.
+        self._contact_pool = model_contact_pool(model, device)
+        # The pool's generation the last service_capacity() reported.
+        self._service_generation = self._contact_pool.generation
         # The narrow phase's capacity flags before a pass outside capture, restored if the pass reruns.
         self._capacity_status_before_pass = wp.zeros(1, dtype=wp.int32, device=device)
 
@@ -3393,55 +3625,54 @@ class CollisionPipeline:
 
     @property
     def rigid_contact_max(self) -> int:
-        """Rigid contact rows this pipeline's buffers hold now.
+        """The rigid contact budget resolved at construction, kept for compatibility with Newton main.
 
-        .. deprecated:: 1.6
-            The pipeline has no fixed rigid contact capacity any more: its
-            buffers grow with the measured demand. Read
-            :attr:`newton.Contacts.rigid_contact_max` of :meth:`contacts`.
+        Contact buffers grow on demand and are not sized by it: read
+        :attr:`newton.Contacts.rigid_contact_max` of :meth:`contacts` for the rows
+        they hold now.
         """
-        warnings.warn(
-            "CollisionPipeline.rigid_contact_max is deprecated: rigid contact buffers grow with the measured "
-            "demand; read Contacts.rigid_contact_max for the rows they hold now.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._contact_pool.ready
+        return self._rigid_contact_max
 
-    def service_capacity(self, state: State | None = None) -> bool:
-        """Grow the rigid contact buffers from measured demand; return whether CUDA graphs must be recaptured.
+    def service_capacity(self, state: State | None = None, *, dt: float | None = None) -> bool:
+        """Size the rigid contact buffers from measured demand; return whether CUDA graphs must be recaptured.
 
-        A :meth:`collide` outside graph capture grows the buffers itself. A graph
-        replays fixed buffer extents, so a loop that replays :meth:`collide` from a
-        graph calls this once per step outside capture, e.g. right after launching
-        the step's graph, and recaptures when it returns ``True``. Every
-        :meth:`collide` records the contact count in a sticky high-water mark and
-        copies it to pinned host memory, also when replayed from a graph; this
-        reads that copy without synchronizing, so it lags the device by the steps
-        still in flight. When the high-water mark passes half the ready rows, the
-        buffers of this pipeline, of its :meth:`contacts` and of the solvers that
-        consume them (e.g. :class:`~newton.solvers.SolverFeatherPGS`) grow to four
-        times the high-water mark, limited only by the device memory (a growth it
-        cannot back raises :class:`MemoryError`), so a replay's demand may double
-        before it drops a contact, and the buffers grow again only once the demand
-        doubles. Their contents and addresses are kept; recapture graphs that use
-        them before their next replay (a stale replay stays within mapped memory
-        but runs at the old extents). Growth synchronizes the device and logs the
-        new rows and bytes. A high-water mark at the ready rows means a replayed
-        collision pass may have dropped contacts: its capacity status stays flagged
-        (:meth:`~newton.geometry.NarrowPhase.check_buffer_capacity`) and this
-        warns. Rows that a writer reserved during capture
+        The buffers of this pipeline, of its :meth:`contacts` and of the solvers
+        that step its model (e.g. :class:`~newton.solvers.SolverFeatherPGS`)
+        start at a few thousand rows and never shrink. A graph replays fixed
+        buffer extents, so a loop that captures :meth:`collide` in a graph:
+
+        * calls this with ``state``, the state the graph starts from, right
+          before capturing it: its rigid contacts are counted (into scratch
+          rows, writing no :class:`~newton.Contacts` and none of the pipeline's
+          state across passes: contact matching, reduction history, capacity
+          status), and the buffers grow to
+          :data:`~newton._src.core.contact_pool.HEADROOM` rows per contact of
+          the most contacts measured so far;
+        * calls this without ``state`` once per step outside capture, e.g. right
+          after launching the step's graph, and recaptures when it returns
+          ``True``. Every :meth:`collide` records its contact count in a sticky
+          high-water mark, copied to pinned host memory also when replayed from
+          a graph; this reads that copy without synchronizing, so it lags the
+          device by the steps still in flight. When the mark passes half the
+          rows, the buffers grow to the same headroom over it.
+
+        A graph captured without measuring its starting state starts with the
+        initial rows: if its first replays hold more contacts, they drop the
+        rows past them and flag the capacity status, and this grows the buffers
+        and warns. A :meth:`collide` outside graph capture grows the buffers
+        itself before anything reads them. Growth keeps the buffers' contents
+        and, with CUDA virtual memory, their addresses; it synchronizes the
+        device and logs the new rows and bytes. The buffers hold at most what
+        the device memory can back: a demand past it raises
+        :class:`MemoryError`. Rows that a writer reserved during capture
         (:meth:`~newton.Contacts.reserve_rigid_contacts`) are grown here too.
 
         Args:
-            state: A state to make fit instead, outside capture: its rigid contacts
-                are detected into scratch rows, without writing any
-                :class:`~newton.Contacts` or the pipeline's state across passes
-                (contact matching, reduction history, capacity status), and the
-                buffers grow only if those contacts fill them, then with the same
-                headroom. Pass the state a graph starts from before capturing it,
-                so its first replays hold every contact. The demand is recorded,
-                so a later call without ``state`` grows from it as above.
+            state: The state a graph is about to start from, to measure. Ignored
+                during graph capture.
+            dt: The time step [s] of the collision passes the graph runs, when
+                speculative contacts are enabled; without it the state is
+                measured without speculative extension.
 
         Returns:
             True when the buffers grew since the last call, here, by a
@@ -3451,19 +3682,37 @@ class CollisionPipeline:
         .. experimental::
         """
         pool = self._contact_pool
-        if state is None:
-            return pool.service()
-        if pool.growable and not capturing(self.device):
-            scratch = Contacts(
-                0,
-                0,
-                device=self.device,
-                per_contact_shape_properties=self.narrow_phase.hydroelastic_sdf is not None,
-                rigid_contact_pool=pool,
-            )
-            self._detect_rigid_contacts(state, scratch, dt=0.0)
-            wp.copy(self.narrow_phase._buffer_capacity_status, self._capacity_status_before_pass)
-        return pool.service(grow=False)
+        if not capturing(self.device):
+            if state is not None and pool.growable:
+                demand = self._measure_rigid_contacts(state, dt=dt)
+                pool.size(max(demand, pool.high_water))
+                logger.info(
+                    "Measured %d rigid contacts in a state; the contact buffers hold %d rows", demand, pool.ready
+                )
+            else:
+                pool.service()
+        generation = pool.generation
+        changed = generation != self._service_generation
+        self._service_generation = generation
+        return changed
+
+    def _measure_rigid_contacts(self, state: State, *, dt: float | None) -> int:
+        """Count the rigid contacts of ``state`` into scratch rows, recording them as demand, and return the count.
+
+        Writes no :class:`~newton.Contacts` of the caller and leaves the
+        pipeline's state across passes as it was. The scratch rows grow (and
+        the pass reruns) only when the contacts do not fit them.
+        """
+        scratch = Contacts(
+            0,
+            0,
+            device=self.device,
+            per_contact_shape_properties=self.narrow_phase.hydroelastic_sdf is not None,
+            rigid_contact_pool=self._contact_pool,
+        )
+        self._detect_rigid_contacts(state, scratch, dt=0.0 if dt is None else dt)
+        wp.copy(self.narrow_phase._buffer_capacity_status, self._capacity_status_before_pass)
+        return int(scratch.rigid_contact_count.numpy()[0])
 
     @property
     def soft_contact_max(self) -> int:

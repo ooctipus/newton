@@ -2497,11 +2497,11 @@ class _SolverTwin:
             with wp.ScopedDevice(device):
                 self.model, _, _ = _build_v_jaws(5.0)
             options = dict(_SQUEEZE_SOLVER)
-            pipeline_options = {"broad_phase": "nxn", "deterministic": True}
+            pipeline_options = {"rigid_contact_max": 256, "broad_phase": "nxn", "deterministic": True}
         elif boxes:
             self.model = _falling_boxes(device)
             options = {"pgs_iterations": 16}
-            pipeline_options = {"broad_phase": "nxn", "deterministic": True}
+            pipeline_options = {"rigid_contact_max": 128, "broad_phase": "nxn", "deterministic": True}
         else:
             self.model = _arm_over_box(wp.get_device(device), worlds=2)
             options, pipeline_options = {"pgs_iterations": 8}, {}
@@ -3405,7 +3405,7 @@ def run_captured_entry_filter(test, device, replays):
             )
         ],
     )
-    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=128, broad_phase="nxn", deterministic=True)
     contacts = pipeline.contacts()
     state = model.state()
     poses = state.body_q.numpy()

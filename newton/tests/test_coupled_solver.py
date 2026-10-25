@@ -1148,6 +1148,7 @@ class TestSolverCoupledBasic(unittest.TestCase):
             pipeline = newton.CollisionPipeline(
                 self.model,
                 broad_phase="nxn",
+                rigid_contact_max=contacts.rigid_contact_max,
                 contact_matching=mode,
             )
             pipeline.collide(state, contacts)

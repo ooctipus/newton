@@ -202,8 +202,8 @@ def _max_angular_hole(points_xy, center_xy):
 
 
 def _pool_rows(rows):
-    """Start the rigid contact rows of a one-world model's pipelines at exactly ``rows``."""
-    return unittest.mock.patch.multiple(contact_pool, READY_ROWS_PER_WORLD=rows, ROW_QUANTUM=1, MIN_READY_ROWS=0)
+    """Start the rigid contact rows of a model's pipelines at exactly ``rows``."""
+    return unittest.mock.patch.multiple(contact_pool, MIN_READY_ROWS=rows, ROW_QUANTUM=1)
 
 
 def _make_pipeline(model, reduce_body_pairs, *, reduce_mesh_contacts=True, **kwargs):

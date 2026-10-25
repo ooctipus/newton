@@ -550,8 +550,10 @@ def test_contacts_exposes_matching_mode(test, device):
         with test.assertRaises(AttributeError):
             contacts.contact_matching_mode = "sticky"
 
-        incompatible_pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="sticky")
-        # Its rows grow past the buffer's, so its sort buffers no longer match them.
+        # A pipeline of another model has rows of its own: they grow past the buffer's, so its sort buffers no
+        # longer match them.
+        other_model, _ = _build_simple_scene(device)
+        incompatible_pipeline = newton.CollisionPipeline(other_model, broad_phase="nxn", contact_matching="sticky")
         incompatible_pipeline.contacts().reserve_rigid_contacts(contacts.rigid_contact_max + 1)
         with test.assertRaisesRegex(ValueError, "capacity"):
             incompatible_pipeline.collide(state, contacts)

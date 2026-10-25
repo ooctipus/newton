@@ -41,7 +41,7 @@ class TestCollisionTransformMatrix(unittest.TestCase):
                     builder.add_shape_convex_hull(body, mesh=mesh, cfg=cfg)
                 model = builder.finalize(device=device)
                 pipeline = newton.CollisionPipeline(
-                    model, reduce_contacts=False, deterministic=True, contact_matching=matching
+                    model, reduce_contacts=False, deterministic=True, contact_matching=matching, rigid_contact_max=32
                 )
                 state = model.state()
                 contacts = pipeline.contacts()

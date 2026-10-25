@@ -30,7 +30,6 @@ from newton._src.solvers.kamino._src.models.builders.utils import make_homogeneo
 from newton._src.solvers.kamino._src.solver_kamino_impl import SolverKaminoImpl
 from newton._src.solvers.kamino._src.solvers import PADMMSolver
 from newton._src.solvers.kamino._src.utils import logger as msg
-from newton._src.solvers.kamino.contact_capacity import estimate_rigid_contact_capacity
 from newton._src.solvers.kamino.examples import print_progress_bar
 from newton._src.solvers.kamino.solver_kamino import SolverKamino
 from newton.tests.kamino import setup_tests, test_context
@@ -431,27 +430,36 @@ class TestCollisionCapacityInitialization(unittest.TestCase):
         builder.replicate(source_builder, world_count=3)
         return builder.finalize(device=self.default_device, skip_validation_joints=True)
 
-    def test_external_contact_capacity_follows_the_estimate(self):
-        """Size Kamino's container for Newton's contacts from the model's shapes, per world."""
+    def test_capacity_allocation_for_pipeline_allocated_after_kamino(self):
+        """Verify capacity allocation for a pipeline allocated after Kamino."""
         model = self._make_three_world_model()
 
         solver = SolverKamino(model, config=SolverKamino.Config(use_collision_detector=False))
-        newton.CollisionPipeline(model)
 
-        per_world = -(-estimate_rigid_contact_capacity(model) // model.world_count)
-        self.assertEqual(solver._contacts_kamino.world_max_contacts_host, [per_world] * model.world_count)
+        pipeline = newton.CollisionPipeline(model)
 
-    def test_internal_collision_capacity_leaves_the_model(self):
-        """Keep the internal detector's capacity in Kamino: Newton's contacts reserve it when written."""
+        # Kamino's capacity should be equal to the pipeline's capacity.
+        self.assertEqual(solver._contacts_kamino.model_max_contacts_host, pipeline.rigid_contact_max)
+
+    def test_capacity_allocation_for_pipeline_allocated_before_kamino(self):
+        """Verify capacity allocation for a pipeline allocated before Kamino."""
+        model = self._make_three_world_model()
+
+        pipeline = newton.CollisionPipeline(model)
+        solver = SolverKamino(model, config=SolverKamino.Config(use_collision_detector=False))
+
+        # Kamino's capacity should be at least as large as the pipeline's capacity. Due to rounding up to the nearest multiple of the world count.
+        self.assertGreaterEqual(solver._contacts_kamino.model_max_contacts_host, pipeline.rigid_contact_max)
+
+    def test_internal_collision_capacity_updates_model(self):
+        """Verify internal collision capacity updates the Newton model."""
         model = self._make_three_world_model()
 
         solver = SolverKamino(model, config=SolverKamino.Config(use_collision_detector=True))
-        contacts = newton.CollisionPipeline(model).contacts()
+        pipeline = newton.CollisionPipeline(model)
 
-        capacity = solver._contacts_kamino.model_max_contacts_host
-        self.assertGreater(capacity, 0)
-        solver.update_contacts(contacts, model.state())
-        self.assertGreaterEqual(contacts.rigid_contact_max, capacity)
+        self.assertEqual(model.rigid_contact_max, solver._contacts_kamino.model_max_contacts_host)
+        self.assertEqual(pipeline.rigid_contact_max, solver._contacts_kamino.model_max_contacts_host)
 
     def test_moreau_uses_internal_detection(self):
         """Verify Moreau-Jean is selected with internal collision detection."""
@@ -507,22 +515,16 @@ class TestCollisionCapacityInitialization(unittest.TestCase):
         self.assertIsInstance(solver._solver_kamino._integrator, IntegratorEuler)
         self.assertTrue(any("Falling back to the 'euler' integrator" in message for message in logs.output))
 
-    def test_external_collisions_honor_the_per_world_capacity(self):
-        """Verify external collisions use the configured contact capacity, as the internal detector would."""
+    def test_external_collisions_preserve_explicit_rigid_contact_max(self):
+        """Verify external collisions preserve an explicit contact capacity."""
         model = self._make_three_world_model()
-        config = SolverKamino.Config.from_model(model, use_collision_detector=False)
-        config.collision_detector.max_contacts_per_world = 334
+        model.rigid_contact_max = 1000
 
-        solver = SolverKamino(model, config=config)
+        solver = SolverKamino(model, config=SolverKamino.Config(use_collision_detector=False))
 
+        self.assertEqual(model.rigid_contact_max, 1000)
         self.assertEqual(solver._contacts_kamino.world_max_contacts_host, [334, 334, 334])
         self.assertEqual(solver._contacts_kamino.model_max_contacts_host, 1002)
-
-        # A model-wide cap on the estimate is split over the worlds.
-        capped = SolverKamino.Config.from_model(model, use_collision_detector=False)
-        capped.collision_detector.max_contacts = 1000
-        self.assertGreaterEqual(estimate_rigid_contact_capacity(model), 1000)
-        self.assertEqual(SolverKamino(model, config=capped)._contacts_kamino.world_max_contacts_host, [334, 334, 334])
 
         contacts = newton.CollisionPipeline(model).contacts()
         with self.assertNoLogs(level="WARNING"):

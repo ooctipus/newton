@@ -93,7 +93,7 @@ from newton.tests.unittest_utils import (
     scoped_capture_after_gc,
 )
 
-PIPELINE = {"max_triangle_pairs": 1 << 17}
+PIPELINE = {"rigid_contact_max": 1 << 15, "max_triangle_pairs": 1 << 17}
 SUITE_ROUTE = {
     "NEWTON_HEIGHTFIELD_GEOMETRIC_CULL": "1",
     "NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": "1",

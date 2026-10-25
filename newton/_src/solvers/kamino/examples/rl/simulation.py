@@ -34,7 +34,6 @@ from newton._src.solvers.kamino._src.solver_kamino_impl import SolverKaminoImpl
 from newton._src.solvers.kamino._src.utils import logger as msg
 from newton._src.solvers.kamino._src.utils.sim import Simulator
 from newton._src.solvers.kamino._src.utils.viewer import Color3, ViewerConfig
-from newton._src.solvers.kamino.contact_capacity import estimate_rigid_contact_capacity
 from newton._src.solvers.kamino.solver_kamino import SolverKamino
 from newton._src.viewer import ViewerGL
 
@@ -85,9 +84,9 @@ class SimulatorFromNewton:
             self._newton_state = newton_model.state()
             self._newton_collision_pipeline = newton.CollisionPipeline(newton_model)
             self._newton_contacts = self._newton_collision_pipeline.contacts()
-            per_world = config.collision_detector.max_contacts_per_world
-            if per_world is None:
-                per_world = max(1024, estimate_rigid_contact_capacity(newton_model) // max(newton_model.world_count, 1))
+            per_world = max(1024, newton_model.rigid_contact_max // max(newton_model.world_count, 1))
+            if config.collision_detector.max_contacts_per_world is not None:
+                per_world = min(per_world, config.collision_detector.max_contacts_per_world)
             world_max = [per_world] * newton_model.world_count
             self._contacts = ContactsKamino(capacity=world_max, device=self._device)
         else:

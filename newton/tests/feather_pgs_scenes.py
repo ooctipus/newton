@@ -73,6 +73,8 @@ class Scene:
     control: Callable[[newton.Model, newton.Control, newton.State, int], None] | None = None
     """Write a step's control and body forces before it is taken (after ``clear_forces``); ``None`` keeps the
     model's targets."""
+    rigid_contact_max: int | None = None
+    """Contact capacity of the collision pipeline; ``None`` uses the pipeline's estimate."""
     contact_matching: str | None = None
     """Contact matching mode of the collision pipeline (``"latest"`` for warm start)."""
     deterministic_contacts: bool = False
@@ -298,6 +300,7 @@ def heightfield(*, mu: float = 0.6) -> Scene:
         steps=120,
         params={"mu": [mu]},
         passive=True,
+        rigid_contact_max=256,
         tags=frozenset({"heightfield"}),
     )
 
@@ -1029,6 +1032,7 @@ def compliant_ball(*, stiffness: float = 3000.0, damping: float = 20.0, mass: fl
         dt=0.005,
         steps=200,
         params={"mu": [0.5], "stiffness": stiffness, "mass": mass, "radius": radius},
+        rigid_contact_max=32,
         contact_stiffness=stiffness,
         contact_damping=damping,
         tags=frozenset({"contact_compliance"}),
@@ -1170,6 +1174,7 @@ def sprawl(*, mu: float = 0.8, fingers: int = 5, finger_links: int = 4) -> Scene
         steps=60,
         params={"mu": [mu]},
         solver_options={"dense_max_constraints": 256},
+        rigid_contact_max=512,
         tags=frozenset({"articulated_contact", "large_articulation"}),
     )
 
@@ -1230,6 +1235,7 @@ def long_chain(*, links: int = 100, mu: float = 0.6, pull: float = 0.0, armature
         steps=40,
         params={"mu": [mu], "pull": pull},
         solver_options={"dense_max_constraints": 384},
+        rigid_contact_max=512,
         control=control,
         tags=frozenset({"articulated_contact", "large_articulation"}),
     )

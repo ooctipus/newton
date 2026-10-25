@@ -53,7 +53,7 @@ def _fixture(kind="locked_d6"):
     state = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
     # A fixed root and the ground are both immobile; keep their pair for the converter to reject.
-    pipeline = newton.CollisionPipeline(model, include_immobile_pairs=True)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, include_immobile_pairs=True)
     contacts = pipeline.contacts()
     pipeline.collide(state, contacts)
     return model, solver, state, pipeline, contacts, case_shape, dynamic_shape

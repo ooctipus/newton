@@ -159,6 +159,7 @@ def _stack_scene(device, g, pgs_mode="matrix_free", velocity_iterations=2):
     pipeline = newton.CollisionPipeline(
         model,
         reduce_contacts=True,
+        rigid_contact_max=128,
         broad_phase="nxn",
         deterministic=True,
         contact_matching="latest",
@@ -221,6 +222,7 @@ def _resting_box(device, g, pgs_mode, rate, frames, **solver_kwargs):
     pipeline = newton.CollisionPipeline(
         model,
         reduce_contacts=True,
+        rigid_contact_max=32,
         broad_phase="nxn",
         deterministic=True,
         contact_matching="latest",
@@ -290,6 +292,7 @@ def test_regularization_indeterminate_split(test: unittest.TestCase, device):
         pipeline = newton.CollisionPipeline(
             model,
             reduce_contacts=True,
+            rigid_contact_max=256,
             broad_phase="nxn",
             deterministic=True,
             contact_matching="latest",
@@ -481,6 +484,7 @@ def test_restitution_rows_stay_rigid(test: unittest.TestCase, device):
         pipeline = newton.CollisionPipeline(
             model,
             reduce_contacts=True,
+            rigid_contact_max=32,
             broad_phase="nxn",
             deterministic=True,
             contact_matching="latest",

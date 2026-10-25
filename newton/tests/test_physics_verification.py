@@ -32,11 +32,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.kamino.config import (
-    CollisionDetectorConfig,
-    ConstraintStabilizationConfig,
-    PADMMSolverConfig,
-)
+from newton._src.solvers.kamino.config import ConstraintStabilizationConfig, PADMMSolverConfig
 from newton._src.solvers.mujoco.equality import _add_equality_constraint
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
@@ -59,6 +55,8 @@ def test_free_fall(test, device, solver_fn):
     b = builder.add_body(xform=wp.transform(wp.vec3(0.0, h0, 0.0), wp.quat_identity()))
     builder.add_shape_sphere(b, radius=0.1)
     model = builder.finalize(device=device)
+    # Limit contacts to avoid unnecessary allocations and work
+    model.rigid_contact_max = 1
 
     solver = solver_fn(model)
     state_0 = model.state()
@@ -131,6 +129,8 @@ def test_pendulum_period(test, device, solver_fn, uses_generalized_coords, sim_d
     )
     builder.add_articulation([j])
     model = builder.finalize(device=device)
+    # Limit contacts to avoid unnecessary allocations and work
+    model.rigid_contact_max = 1
 
     # Set initial angle
     q_init = model.joint_q.numpy().copy()
@@ -209,6 +209,8 @@ def test_energy_conservation(test, device, solver_fn, uses_generalized_coords, s
     )
     builder.add_articulation([j])
     model = builder.finalize(device=device)
+    # Limit contacts to avoid unnecessary allocations and work
+    model.rigid_contact_max = 1
 
     # Set initial angle
     q_init = model.joint_q.numpy().copy()
@@ -295,6 +297,8 @@ def test_projectile_motion(test, device, solver_fn, uses_generalized_coords):
     b = builder.add_body(xform=wp.transform(wp.vec3(x0, y0, z0), wp.quat_identity()))
     builder.add_shape_sphere(b, radius=0.1)
     model = builder.finalize(device=device)
+    # Limit contacts to avoid unnecessary allocations and work
+    model.rigid_contact_max = 1
 
     solver = solver_fn(model)
     state_0 = model.state()
@@ -381,6 +385,8 @@ def test_joint_actuation(test, device, solver_fn):
     )
     builder.add_articulation([j_prismatic])
     model = builder.finalize(device=device)
+    # Limit contacts to avoid unnecessary allocations and work
+    model.rigid_contact_max = 1
 
     I_body_rev = model.body_inertia.numpy()[0]
     I_cm_zz = float(I_body_rev[2, 2] if I_body_rev.ndim == 2 else I_body_rev[2])
@@ -484,6 +490,8 @@ def test_momentum_conservation(test, device, solver_fn, uses_generalized_coords)
         b = builder.add_body(xform=wp.transform(wp.vec3(*pos), wp.quat_identity()))
         builder.add_shape_box(b, hx=0.5, hy=0.5, hz=0.5)
     model = builder.finalize(device=device)
+    # Limit contacts to avoid unnecessary allocations and work
+    model.rigid_contact_max = 1
 
     solver = solver_fn(model)
     state_0 = model.state()
@@ -1484,11 +1492,7 @@ for device in devices:
             False,
         ),
         "kamino": (
-            # These scenes have no contacts: hold Kamino's contact container at one.
-            lambda model: newton.solvers.SolverKamino(
-                model,
-                config=newton.solvers.SolverKamino.Config(collision_detector=CollisionDetectorConfig(max_contacts=1)),
-            ),
+            newton.solvers.SolverKamino,
             False,
         ),
     }
@@ -1554,7 +1558,6 @@ for device in devices:
                 config=newton.solvers.SolverKamino.Config(
                     constraints=ConstraintStabilizationConfig(alpha=0.1),
                     padmm=PADMMSolverConfig(rho_0=0.01),
-                    collision_detector=CollisionDetectorConfig(max_contacts=1),
                 ),
             ),
             False,

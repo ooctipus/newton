@@ -1927,15 +1927,21 @@ storage is allocated explicitly.
 **Contact buffer growth**
 
 There is no rigid contact budget to configure. The rigid contact buffers of a
-pipeline, of its :meth:`~CollisionPipeline.contacts` and of the solvers that
-consume them start at 64 rows per world (at least 4096) and grow with the measured
-contact count, keeping their contents, up to what the device memory can back; a
-growth the device cannot back raises :class:`MemoryError`. A ``collide`` outside
-graph capture grows the buffers before anything reads them, so it never drops a
-contact. Writers that produce contacts of their own (such as MuJoCo's or Kamino's
-collision) declare how many they may write with
-:meth:`~Contacts.reserve_rigid_contacts`. A graph replays fixed buffer extents and
-cannot grow them: see :ref:`Graph capture <Contact graph capture>`.
+model's pipelines, of their :meth:`~CollisionPipeline.contacts` and of the solvers
+that step the model share one set of rows: they start at 4096 rows and are sized
+from the measured contact count, 2.5 rows per contact, keeping their contents, up to
+what the device memory can back; a growth the device cannot back raises
+:class:`MemoryError`. A ``collide`` outside graph capture grows the buffers before
+anything reads them, so it never drops a contact. Writers that produce contacts of
+their own (such as MuJoCo's or Kamino's collision) declare how many they may write
+with :meth:`~Contacts.reserve_rigid_contacts`. A graph replays fixed buffer extents
+and cannot grow them: see :ref:`Graph capture <Contact graph capture>`.
+
+``CollisionPipeline(rigid_contact_max=...)``, :attr:`CollisionPipeline.rigid_contact_max`,
+``Model.rigid_contact_max`` and ``ModelBuilder.num_rigid_contacts_per_world`` are kept
+for compatibility with Newton main; contact buffers grow on demand and none of them
+sizes them (:class:`~solvers.SolverKamino` still sizes its fixed contact container by
+``Model.rigid_contact_max``).
 
 .. _Hydroelastic Contacts:
 
@@ -2491,7 +2497,11 @@ The simulation loop (including ``collide`` and ``solver.step``) can be captured 
 captured region so it is replayed each frame. A replay runs at the contact buffer
 extents of its capture, so measure the state the graph starts from before capturing
 it, and after each frame grow the buffers from the recorded demand and recapture
-when they grew (:meth:`~CollisionPipeline.service_capacity`):
+when they grew (:meth:`~CollisionPipeline.service_capacity`). Bodies that start
+above the ground or fall into new contacts in the first steps have more contacts
+than their starting state: step such a scene a few times outside capture (its
+passes grow the buffers before anything reads them) before measuring and
+capturing it.
 
 .. code-block:: python
 
@@ -2514,8 +2524,10 @@ when they grew (:meth:`~CollisionPipeline.service_capacity`):
 
 A replayed pass whose contacts outgrew the buffers drops the rows past them and
 flags it (:meth:`~geometry.NarrowPhase.check_buffer_capacity`);
-:meth:`~CollisionPipeline.service_capacity` then grows the buffers and warns.
-The example runner (``newton.examples.run``) services and recaptures the examples this way.
+:meth:`~CollisionPipeline.service_capacity` then grows the buffers and warns, so a
+graph captured without measuring its starting state warns at its first step if that
+state's contacts did not fit the initial rows. The example runner
+(``newton.examples.run``) measures, services and recaptures the examples this way.
 
 .. _Solver Integration:
 

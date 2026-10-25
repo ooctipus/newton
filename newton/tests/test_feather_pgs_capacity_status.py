@@ -154,6 +154,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
             )
         plane = builder.add_ground_plane()
         model = builder.finalize(device="cpu")
+        model.rigid_contact_max = count
         histories = {}
         for capacity in (192, 640, 768):
             solver = SolverFeatherPGS(

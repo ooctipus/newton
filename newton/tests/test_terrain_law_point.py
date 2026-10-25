@@ -85,7 +85,7 @@ SITES = {
 }
 """Sphere sites on a 0.1 m grid, offsets from a vertex [m] (the symptom bench's resting sites)."""
 CAPSULE_SITES = {"vertex": (0.0, 0.0), "edge": (0.05, 0.0005), "interior": (0.033, 0.067)}
-PIPELINE = {"max_triangle_pairs": 1 << 17}
+PIPELINE = {"rigid_contact_max": 1 << 15, "max_triangle_pairs": 1 << 17}
 GHOST_ANGLE = np.radians(1.0)
 EXITS = int(TERRAIN_PAIR_TILE_EXIT | TERRAIN_PAIR_STALE | TERRAIN_PAIR_FILTERED | TERRAIN_PAIR_OUTSIDE)
 """Pair states of a pair that leaves before its window is walked."""

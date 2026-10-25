@@ -95,6 +95,7 @@ def _humanoids(device, worlds=4):
     builder.replicate(scene, worlds, spacing=(2.0, 2.0, 0.0))
     builder.add_ground_plane()
     model = builder.finalize(device=device)
+    model.rigid_contact_max = 1024
     return model
 
 

@@ -69,6 +69,7 @@ def fixture(
         contact_matching="latest",
         reduce_contacts=False,
         broad_phase="nxn",
+        rigid_contact_max=64,
         box_box_sat=sat,
     )
     contacts = pipeline.contacts()
@@ -217,7 +218,9 @@ def held_box(radius, torque, *, steps=20, dt=0.0025, mu=0.5, mass=0.3, half=0.00
         mf_max_constraints=16,
         **PATCH_OPTIONS,
     )
-    pipeline = newton.CollisionPipeline(model, contact_matching="latest", reduce_contacts=False, broad_phase="nxn")
+    pipeline = newton.CollisionPipeline(
+        model, contact_matching="latest", reduce_contacts=False, broad_phase="nxn", rigid_contact_max=64
+    )
     contacts = pipeline.contacts()
     s0, s1 = model.state(), model.state()
     control = model.control()

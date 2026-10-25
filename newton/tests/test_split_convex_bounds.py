@@ -162,7 +162,11 @@ class TestSplitConvexBounds(unittest.TestCase):
                     os.environ,
                     {"NEWTON_NARROW_PHASE_COHERENT_CONVEX": method, "NEWTON_NARROW_PHASE_COHERENT_STATS": "0"},
                 ):
-                    pipelines.append(newton.CollisionPipeline(model, broad_phase="explicit", deterministic=True))
+                    pipelines.append(
+                        newton.CollisionPipeline(
+                            model, broad_phase="explicit", deterministic=True, rigid_contact_max=64
+                        )
+                    )
         self.assertTrue(all(p.narrow_phase.split_gjk_mpr for p in pipelines))
         pipelines[0].narrow_phase.split_gjk_mpr = False
         self.assertIsNotNone(pipelines[2].narrow_phase._coherent_cache)
