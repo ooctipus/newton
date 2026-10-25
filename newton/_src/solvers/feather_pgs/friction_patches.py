@@ -98,7 +98,7 @@ _SORT_PAD = wp.constant(wp.int64(1 << 62))
 # fraction covers squares wider than about 3 cm at 80 m from the origin and
 # 6 cm at 190 m, and narrower ones nearer to it.
 _FOOTPRINT_TOLERANCE = wp.constant(1.0e-3)
-# Contact paths 0, 1 and 2 hold dense, matrix-free and propagation rows, and -1 holds none.
+# Contact paths 0 and 1 hold dense and matrix-free rows, and -1 holds none.
 # CONTACT_PATH_RESOLVED marks a contact without rows in a world the resolved-world classifier
 # skipped, where the complete path would have reserved them: its patch anchor releases.
 CONTACT_PATH_RESOLVED = wp.constant(-2)
@@ -2294,9 +2294,3 @@ def _reset_history(
             if w >= 0 and w < world_mask.shape[0] and not world_mask[w]:
                 continue
         prev_valid[c] = 0
-
-
-@wp.kernel(enable_backward=False)
-def _arange(values: wp.array[int]):
-    i = wp.tid()
-    values[i] = i

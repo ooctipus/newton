@@ -115,16 +115,11 @@ class SolveTrace:
 def count_skipped_solves(
     world_constraint_count: wp.array[int],
     mf_constraint_count: wp.array[int],
-    propagation_constraint_count: wp.array[int],
     skipped: wp.array[wp.int32],
 ):
-    """Count one skipped solve of every world without dense, matrix-free or propagation rows."""
+    """Count one skipped solve of every world without dense or matrix-free rows."""
     world = wp.tid()
-    if (
-        world_constraint_count[world] == 0
-        and mf_constraint_count[world] == 0
-        and propagation_constraint_count[world] == 0
-    ):
+    if world_constraint_count[world] == 0 and mf_constraint_count[world] == 0:
         skipped[world] = skipped[world] + 1
 
 
@@ -446,8 +441,6 @@ class SolveReadoutRecord:
         self._slots: dict[tuple[str, str], _ReadoutSlot] = {}
         self._labels: dict[str, str] = {}
         self._skipped: dict[str, wp.array] = {}
-        # Row counts of a family a route does not build: no world holds such rows.
-        self._no_rows: wp.array | None = None
         self._pass = "position"
 
     def register(self, kernel, label: str, *, world_count: int, budget: int, device, velocity_budget: int = 0) -> None:
@@ -497,7 +490,6 @@ class SolveReadoutRecord:
         """
         if not self.policy.counts or self._skipped or int(world_count) <= 0:
             return
-        self._no_rows = wp.zeros(int(world_count), dtype=wp.int32, device=device)
         budgets = {"position": 1, "velocity": int(velocity_budget)}
         for solve_pass in SOLVE_PASSES:
             if budgets[solve_pass] > 0:
@@ -518,8 +510,7 @@ class SolveReadoutRecord:
         wp.launch(
             count_skipped_solves,
             dim=skipped.shape[0],
-            # The kernel's third row family has no rows on any route.
-            inputs=[world_constraint_count, mf_constraint_count, self._no_rows],
+            inputs=[world_constraint_count, mf_constraint_count],
             outputs=[skipped],
             device=skipped.device,
         )

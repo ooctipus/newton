@@ -156,12 +156,10 @@ def _patch_fixture(device="cpu", *, shared=0, friction_shared=0):
     data.origin = array(rng.normal(size=(2 * WORLDS, 3)).astype(np.float32), wp.vec3)
     data.motion = array(rng.normal(size=(9 * WORLDS, 6)).astype(np.float32), wp.spatial_vector)
     data.prescribed = array([int(a == 3) for a in range(2 * WORLDS)], int)
-    data.is_free = array(np.zeros(2 * WORLDS), int)
     data.material_mu = array(rng.uniform(0.2, 1.2, 4 * WORLDS).astype(np.float32), float)
     data.material_restitution = array([0.8 if s == 2 else 0.0 for s in range(4 * WORLDS)], float)
     data.incident = array(rng.normal(0.0, 3.0, 9 * WORLDS).astype(np.float32), float)
     data.shared_anchor, data.friction_shared_anchor = shared, friction_shared
-    data.friction_anchor_limit, data.friction_pairs_only = 0, 0
     data.friction_scale, data.beta, data.cfm, data.dt = 0.85, 0.23, 2.0e-4, 1.0 / 240.0
     data.bias_scale, data.speculative_scale, data.restitution_threshold, data.contact_w = 1.0, 0.6, 0.05, 1.0
     for name, values in _poisoned_rows(device).items():
@@ -235,13 +233,12 @@ def _run_general(data, layout, beta):
     for w in range(WORLDS):
         world_jacobian[w, :, :PRIMARY] = jacobians[PRIMARY].numpy()[groups[2 * w]]
         world_jacobian[w, :, PRIMARY:] = jacobians[SECONDARY].numpy()[groups[2 * w + 1]]
-    no_free_rows = wp.zeros(WORLDS, dtype=int, device=device)
     wp.launch(
         kernels.compute_world_contact_bias,
         dim=WORLDS * ROWS,
         inputs=[
             *(layout.counts, ROWS, rows.phi, rows.row_beta, rows.row_type, rows.target, data.dt, data.bias_scale),
-            *(data.speculative_scale, 1.0, data.contact_w, no_free_rows, 0),
+            *(data.speculative_scale, 1.0, data.contact_w),
         ],
         outputs=[rows.rhs, rows.row_w],
         device=device,
@@ -255,7 +252,7 @@ def _run_general(data, layout, beta):
             *(rows.phi, rows.row_type, rows.target, rows.restitution, data.incident),
             wp.array(np.arange(9 * WORLDS, dtype=np.int32).reshape(WORLDS, 9), dtype=int, device=device),
             wp.array(world_jacobian, dtype=float, device=device),
-            *(data.dt, data.restitution_threshold, 0, no_free_rows, 0),
+            *(data.dt, data.restitution_threshold, 0),
         ],
         outputs=[rows.rhs, rows.row_w],
         device=device,

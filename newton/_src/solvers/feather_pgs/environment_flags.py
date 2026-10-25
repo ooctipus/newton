@@ -59,39 +59,39 @@ FLAGS = declare(
     ),
     _flag(
         "FEATHER_PGS_CAPTURE_COUNT",
-        "diagnostic",
-        _SOLVER,
-        "Consecutive substeps the kernel capture records (default 1).",
+        "retired",
+        ("environment_flags",),
+        "Retired substep count of the removed sweep-input capture; ignored.",
     ),
     _flag(
         "FEATHER_PGS_CAPTURE_DIR",
-        "diagnostic",
-        _SOLVER,
-        "Directory for kernel captures (default /tmp/fpgs_capture).",
+        "retired",
+        ("environment_flags",),
+        "Retired directory of the removed sweep-input capture; ignored.",
     ),
     _flag(
         "FEATHER_PGS_CAPTURE_KERNEL",
-        "diagnostic",
-        _SOLVER,
-        "=1 captures pgs_solve_mf_gs inputs and launch configuration for standalone replay.",
+        "retired",
+        ("environment_flags",),
+        "Retired capture of the matrix-free sweep's inputs for standalone replay; ignored.",
     ),
     _flag(
         "FEATHER_PGS_CAPTURE_PHASE",
-        "diagnostic",
-        _SOLVER,
-        "Solve phase the kernel capture records (default any).",
+        "retired",
+        ("environment_flags",),
+        "Retired solve phase of the removed sweep-input capture; ignored.",
     ),
     _flag(
         "FEATHER_PGS_CAPTURE_STEP",
-        "diagnostic",
-        _SOLVER,
-        "Step at which the kernel capture starts (default -1, none).",
+        "retired",
+        ("environment_flags",),
+        "Retired first step of the removed sweep-input capture; ignored.",
     ),
     _flag(
         "FEATHER_PGS_CHECK_ROWS",
-        "diagnostic",
-        _SOLVER,
-        "=1 compares the masked contact-row builder with the per-contact builder.",
+        "retired",
+        ("environment_flags",),
+        "Retired comparison of the masked contact-row builder with the per-contact builder; ignored.",
     ),
     _flag(
         "FEATHER_PGS_COMPACT_CONTACT_BOUNDARY",
@@ -155,9 +155,9 @@ FLAGS = declare(
     ),
     _flag(
         "FEATHER_PGS_GROUPED_HINV_FREE",
-        "experiment",
-        _SOLVER,
-        "=1 uses the grouped response solve for free-body size groups.",
+        "retired",
+        ("environment_flags",),
+        "Retired grouped response solve of free-body size groups, slower than the per-row kernel; ignored.",
     ),
     _flag(
         "FEATHER_PGS_GROUPED_HINV_MAX",
@@ -185,9 +185,9 @@ FLAGS = declare(
     ),
     _flag(
         "FEATHER_PGS_INK_CHECK",
-        "diagnostic",
-        _SOLVER,
-        "=1 writes the in-kernel response and diagonal back for comparison.",
+        "retired",
+        ("environment_flags",),
+        "Retired write-back of the in-kernel response and diagonal for comparison; ignored.",
     ),
     _flag(
         "FEATHER_PGS_KEYED_ROWS",
@@ -544,23 +544,36 @@ FLAGS = declare(
 )
 
 
-# Retired names that Isaac Lab's benchmark recipes still set: the packed
-# sparse-factor route's selectors (480f0f44), the chain-scan and keyed-row
-# aliases (d35949d6), the selectors of removed research owners and of the
-# branch-Jacobi sweep (790f9782, aa2f332b), the in-sweep world rows'
-# selector, which keyed rows declined wherever a recipe set it, the lane
-# count of the removed grouped kinematics and torque kernels, and the
-# prismatic opt-ins that scalar branches replaced. Nothing in Newton or
-# Isaac Lab reads them, and recipes are not Newton's to edit, so they are
-# ignored rather than rejected: the general route runs, the construction
-# record lists them as retired and the solver warns once per process.
+# Retired names that are ignored rather than rejected: those Isaac Lab's
+# benchmark recipes still set, namely the packed sparse-factor route's
+# selectors (480f0f44), the chain-scan and keyed-row aliases (d35949d6), the
+# selectors of removed research owners and of the branch-Jacobi sweep
+# (790f9782, aa2f332b), the in-sweep world rows' selector, which keyed rows
+# declined wherever a recipe set it, the lane count of the removed grouped
+# kinematics and torque kernels, and the prismatic opt-ins that scalar
+# branches replaced; and the removed diagnostics and experiment that selected
+# no route of their own: the sweep-input capture (FEATHER_PGS_CAPTURE_*), the
+# row and in-kernel response comparisons (FEATHER_PGS_CHECK_ROWS,
+# FEATHER_PGS_INK_CHECK) and the grouped free-body response
+# (FEATHER_PGS_GROUPED_HINV_FREE). Nothing in Newton or Isaac Lab reads them,
+# and recipes are not Newton's to edit, so the general route runs, the
+# construction record lists them as retired and the solver warns once per
+# process.
 IGNORED_RETIRED = frozenset(
     (
         "FEATHER_PGS_ALLEGRO_KINETIC_ROWS",
+        "FEATHER_PGS_CAPTURE_COUNT",
+        "FEATHER_PGS_CAPTURE_DIR",
+        "FEATHER_PGS_CAPTURE_KERNEL",
+        "FEATHER_PGS_CAPTURE_PHASE",
+        "FEATHER_PGS_CAPTURE_STEP",
+        "FEATHER_PGS_CHECK_ROWS",
         "FEATHER_PGS_FRANKA_COMPACT_WORKSPACE",
         "FEATHER_PGS_G1_CHAIN_SCAN",
+        "FEATHER_PGS_GROUPED_HINV_FREE",
         "FEATHER_PGS_GROUP_LANES",
         "FEATHER_PGS_INDEPENDENT_COMPONENTS",
+        "FEATHER_PGS_INK_CHECK",
         "FEATHER_PGS_KUKA_CURRENT_CONTACT",
         "FEATHER_PGS_KUKA_JOINT_WORLD",
         "FEATHER_PGS_LOCAL_ROW_PACKETS",

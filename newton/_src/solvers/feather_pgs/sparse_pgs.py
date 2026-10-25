@@ -353,9 +353,7 @@ def _get_pgs_solve_sparse_kernel(
                 const int entry = lane + q * {L};
                 const int index = entry < {row_width} ? {index_read} : -1;
                 if (index >= 0) {{
-                    float response = {factor_read};
-                    if (false && world_free_dof_mask.data[world * {D} + index] != 0)
-                        response = row_free_response.data[(offset + row) * row_free_response.shape[2] + entry];
+                    const float response = {factor_read};
                     delta[index] += response * seed;
                 }}
             }}
@@ -475,22 +473,14 @@ def _get_pgs_solve_sparse_kernel(
                 const float value = index >= 0 ? {factor_read} : 0.0f;
                 const float sibling_value = friction && index >= 0
                     ? {sibling_read} : 0.0f;
-                float response = value;
-                float sibling_response = sibling_value;
-                if (false && index >= 0 && world_free_dof_mask.data[world * {D} + index] != 0) {{
-                    const int width = row_free_response.shape[2];
-                    response = row_free_response.data[(offset + row) * width + entry];
-                    if (friction)
-                        sibling_response = row_free_response.data[(offset + sibling) * width + entry];
-                }}
                 indices[q] = index;
-                responses[q] = response;
-                sibling_responses[q] = sibling_response;
+                responses[q] = value;
+                sibling_responses[q] = sibling_value;
                 if (index >= 0) {{
                     const float velocity = delta[index];
                     dot += value * velocity;
                     sibling_dot += sibling_value * velocity;
-                    cross += value * sibling_response;
+                    cross += value * sibling_value;
                 }}
             }}
             for (int shift = {L // 2}; shift > 0; shift >>= 1) {{
@@ -596,20 +586,24 @@ for (int offset = 16; offset > 0; offset >>= 1) {{
         )
         setup += triplet_setup
         active_scan += "\n        int consumed_tangent = -1;\n"
-        row_update = row_update.replace(
-            "            int indices[",
-            "            const int metric_slot = friction ? contact_metric_slot(parent) : -1;\n"
-            "            const bool metric_ready = metric_slot >= 0 && metric_map[metric_slot] >= 0;\n"
-            "            int indices[",
-            1,
-        ).replace("cross += value * sibling_response;", "if (!metric_ready) cross += value * sibling_response;")
-        row_update = row_update.replace(
-            "cross += __shfl_down_sync(MASK, cross, shift, 32);",
-            "if (!metric_ready) cross += __shfl_down_sync(MASK, cross, shift, 32);",
-        ).replace(
-            "pair = friction_pair_candidate(denominator,",
-            "pair = friction_pair_cached(metric_slot, denominator,",
-        )
+        # A pair whose metric the triplets cached skips the coupling's dot product and reduction.
+        for old, new in (
+            (
+                "            int indices[",
+                "            const int metric_slot = friction ? contact_metric_slot(parent) : -1;\n"
+                "            const bool metric_ready = metric_slot >= 0 && metric_map[metric_slot] >= 0;\n"
+                "            int indices[",
+            ),
+            ("cross += value * sibling_value;", "if (!metric_ready) cross += value * sibling_value;"),
+            (
+                "cross += __shfl_down_sync(MASK, cross, shift, 32);",
+                "if (!metric_ready) cross += __shfl_down_sync(MASK, cross, shift, 32);",
+            ),
+            ("pair = friction_pair_candidate(denominator,", "pair = friction_pair_cached(metric_slot, denominator,"),
+        ):
+            if row_update.count(old) != 1:
+                raise ValueError("the sparse row update changed; update the cached pair metric's edits")
+            row_update = row_update.replace(old, new)
         row_update = triplet_update + row_update
         laws = (FRICTION_PAIR_CACHED,)
     writeback = f"""
@@ -647,12 +641,10 @@ for (int offset = 16; offset > 0; offset >>= 1) {{
         world_impulses: wp.array2d[float],
         row_dof: wp.array3d[int],
         row_factor: wp.array3d[float],
-        row_free_response: wp.array3d[float],
         row_incident: wp.array2d[float],
         world_row_type: wp.array2d[int],
         world_row_parent: wp.array2d[int],
         world_row_mu: wp.array2d[float],
-        world_free_dof_mask: wp.array2d[int],
         world_dof_indices: wp.array2d[int],
         v_hat: wp.array[float],
         mf_constraint_count: wp.array[int],
@@ -681,12 +673,10 @@ for (int offset = 16; offset > 0; offset >>= 1) {{
         world_impulses: wp.array2d[float],
         row_dof: wp.array3d[int],
         row_factor: wp.array3d[float],
-        row_free_response: wp.array3d[float],
         row_incident: wp.array2d[float],
         world_row_type: wp.array2d[int],
         world_row_parent: wp.array2d[int],
         world_row_mu: wp.array2d[float],
-        world_free_dof_mask: wp.array2d[int],
         world_dof_indices: wp.array2d[int],
         v_hat: wp.array[float],
         mf_constraint_count: wp.array[int],
@@ -717,12 +707,10 @@ for (int offset = 16; offset > 0; offset >>= 1) {{
                 world_impulses,
                 row_dof,
                 row_factor,
-                row_free_response,
                 row_incident,
                 world_row_type,
                 world_row_parent,
                 world_row_mu,
-                world_free_dof_mask,
                 world_dof_indices,
                 v_hat,
                 mf_constraint_count,

@@ -410,13 +410,11 @@ def _dense_row_values(device, *, order, row_phase, iterations, first_row=0):
         "general_worlds": zero_int,
         "general_world_grid_stride": 1,
         "use_general_world_queue": 0,
-        "rb_class": zero_int,
         "world_constraint_count": array([count], wp.int32),
         # Every row is in the velocity-limit segment of a phase-5 launch.
         "dense_phase_bounds": array([[0, count]], wp.int32),
         "local_solve_owner": zero_int,
         "world_dof_indices": array([[0, 1]], wp.int32),
-        "world_deferred_dof_mask": array([[0, 0]], wp.int32),
         "rhs_bias": array(bias),
         "world_diag": array(diagonal),
         "world_row_w": array(np.ones((1, capacity), np.float32)),
@@ -445,7 +443,6 @@ def _dense_row_values(device, *, order, row_phase, iterations, first_row=0):
         "friction_start_iteration": 0,
         "iteration_offset": 0,
         "freeze_drive_rows": 0,
-        "defer_dense_response": 0,
         "v_out": array(_CHAIN_VELOCITY.astype(np.float32)),
     }
     for name in ("target_vel_bias", "vel_multiplier", "impulse_multiplier", "max_impulse", "vel_limit"):

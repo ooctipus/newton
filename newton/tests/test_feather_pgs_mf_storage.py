@@ -529,7 +529,6 @@ def _patch_ring_rows(seed, *, worlds, dense_capacity, mf_capacity, dofs, drives,
         "mf_MiJt_b": np.zeros((w_count, mf_capacity, 6), np.float32),
         "mf_row_mu": np.zeros((w_count, mf_capacity), np.float32),
         "mf_row_w": rng.uniform(0.6, 1.0, (w_count, mf_capacity)).astype(np.float32),
-        "world_deferred_dof_mask": (rng.random((w_count, dofs)) < 0.2).astype(np.int32),
         "v_out": rng.normal(0.0, 0.3, w_count * dofs).astype(np.float32),
     }
 
@@ -647,7 +646,6 @@ def _bind_rows(host, device):
     values.update(
         general_world_count=array(np.array([worlds], np.int32)),
         general_worlds=array(np.random.default_rng(5).permutation(worlds).astype(np.int32)),
-        rb_class=array(np.zeros(worlds, np.int32)),
         local_solve_owner=array(np.zeros(worlds, np.int32)),
         world_torsion_group=array(np.full((1, 1), -1, np.int32)),
         contact_torsion_radius=0.0,
@@ -661,8 +659,8 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
         """Solve dense patch rings with resident row types and parents: identical bits out in every row phase.
 
         Random patch layouts at a small and at a large dense capacity run every row
-        phase, from warm and signed-zero impulses, with delayed friction, iteration offsets,
-        regularization and deferred responses, both one world per block and through a two-block
+        phase, from warm and signed-zero impulses, with delayed friction, iteration offsets
+        and regularization, both one world per block and through a two-block
         queue whose blocks reuse their shared memory across worlds, then once more from a captured
         graph. The drive and limit cases run the end-of-iteration limit scans (row phases 0, 2 and
         5), which read row types from global memory in both kernels, under either velocity-limit law.
@@ -694,7 +692,6 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
                 "iteration_offset": 1,
                 "regularize": 1,
                 "freeze_drive_rows": 1,
-                "defer_dense_response": 1,
             },
         )
         outputs = ("v_out", "world_impulses", "mf_impulses")
@@ -745,7 +742,6 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
                     "use_general_world_queue": int(grid < 5),
                     "regularize": 0,
                     "freeze_drive_rows": 0,
-                    "defer_dense_response": 0,
                     **setting,
                 }
                 for phase, grid, setting in itertools.product(range(7), (5, 2), settings)
@@ -930,7 +926,6 @@ class TestFeatherPGSMFStorageCUDA(unittest.TestCase):
             friction_start_iteration=2,
             iteration_offset=0,
             freeze_drive_rows=0,
-            defer_dense_response=0,
         )
         outputs = ("v_out", "world_impulses", "mf_impulses")
         for friction in ("current",):

@@ -370,8 +370,6 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, dev
                 1.0,
                 1.0,
                 1.0,
-                wp.zeros(1, dtype=wp.int32, device=device),
-                0,
             ],
             outputs=[rhs, zeros3()],
             device=device,

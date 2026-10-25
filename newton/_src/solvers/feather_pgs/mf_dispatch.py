@@ -11,12 +11,10 @@ import warp as wp
 
 _NATIVE_ARGUMENTS = (
     ("world", "int"),
-    ("rb_class", "wp.array[int]"),
     ("world_constraint_count", "wp.array[int]"),
     ("dense_phase_bounds", "wp.array2d[int]"),
     ("local_solve_owner", "wp.array[int]"),
     ("world_dof_indices", "wp.array2d[int]"),
-    ("world_deferred_dof_mask", "wp.array2d[int]"),
     ("rhs_bias", "wp.array2d[float]"),
     ("world_diag", "wp.array2d[float]"),
     ("world_row_w", "wp.array2d[float]"),
@@ -50,7 +48,6 @@ _NATIVE_ARGUMENTS = (
     ("friction_start_iteration", "int"),
     ("iteration_offset", "int"),
     ("freeze_drive_rows", "int"),
-    ("defer_dense_response", "int"),
     ("v_out", "wp.array[float]"),
 )
 

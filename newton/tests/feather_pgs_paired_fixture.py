@@ -141,11 +141,9 @@ def solve_fixture(device):
     arrays = {
         "general_world_count": array(np.array([5], np.int32)),
         "general_worlds": array(np.arange(5, dtype=np.int32)),
-        "rb_class": array(np.zeros(5, np.int32)),
         "dense_phase_bounds": array(np.array([[1, 1]] * 4 + [[0, 0]], np.int32)),
         "local_solve_owner": array(np.zeros(5, np.int32)),
         "world_dof_indices": array(np.arange(145, dtype=np.int32).reshape(5, 29)),
-        "world_deferred_dof_mask": array(np.zeros((5, 29), np.int32)),
         "world_impulses": array(np.full((5, 8), 0.01, np.float32)),
         "world_torsion_group": array(np.full((1, 1), -1, np.int32)),
         "contact_torsion_radius": 0.0,
@@ -204,7 +202,6 @@ def launch_solve_pair(data, arrays, *, enabled, device, iterations=8, friction_s
         friction_start_iteration=friction_start,
         iteration_offset=0,
         freeze_drive_rows=0,
-        defer_dense_response=0,
     )
     if enabled:
         values["local_solve_owner"] = values["world_mf_constraint_count"] = data.selector

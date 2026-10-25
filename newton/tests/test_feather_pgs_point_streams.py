@@ -43,7 +43,6 @@ _PATCH_ONLY = frozenset(
     (
         "compact_contact.produce_patch_contacts",
         "keyed_rows.scatter_patch_contact_keys",
-        "friction_patches._arange",
         "friction_patches._build",
         "friction_patches._finish_and_store",
         "friction_patches._invalidate_geometry_history",

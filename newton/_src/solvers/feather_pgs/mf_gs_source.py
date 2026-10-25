@@ -163,7 +163,7 @@ def get_source(
         # Worlds with only dense rows within the incremental kernel's row budget are
         # solved by _get_pgs_solve_mf_gs_incremental_kernel in the same launch pair.
         local_internal_skip += f"""
-    if (m_mf == 0 && m_dense <= {int(skip_incremental_rows)} && defer_dense_response == 0) return;"""
+    if (m_mf == 0 && m_dense <= {int(skip_incremental_rows)}) return;"""
     # How many DOF elements each lane handles (ceil(D/32))
     ELEMS_PER_LANE = (D + 31) // 32
 
@@ -214,9 +214,7 @@ def get_source(
     for k in range(ELEMS_PER_LANE):
         d_expr = f"lane + {k * 32}" if k > 0 else "lane"
         dense_v_update_parts.append(f"""
-            if ({d_expr} < {D} &&
-                (defer_dense_response == 0 ||
-                 world_deferred_dof_mask.data[deferred_mask_base + {d_expr}] == 0)) {{
+            if ({d_expr} < {D}) {{
                 s_v[{d_expr}] += cur_dY_{k} * delta_impulse;
             }}""")
     dense_v_update_code = "\n".join(dense_v_update_parts)
@@ -226,9 +224,7 @@ def get_source(
     for k in range(ELEMS_PER_LANE):
         d_expr = f"lane + {k * 32}" if k > 0 else "lane"
         dense_sib_v_parts.append(f"""
-                if ({d_expr} < {D} &&
-                    (defer_dense_response == 0 ||
-                     world_deferred_dof_mask.data[deferred_mask_base + {d_expr}] == 0)) {{
+                if ({d_expr} < {D}) {{
                     s_v[{d_expr}] += {dense_read("Y_world", f"sib_row_base + {d_expr}")} * sib_delta;
                 }}""")
     dense_sib_v_code = "\n".join(dense_sib_v_parts)
@@ -380,18 +376,12 @@ def get_source(
 
                     if (d_n_total != 0.0f) {{
                         for (int d = lane; d < __D__; d += 32) {{
-                            if (defer_dense_response == 0 ||
-                                world_deferred_dof_mask.data[deferred_mask_base + d] == 0) {{
-                                s_v[d] += {dense_read("Y_world", "n_row_base + d")} * d_n_total;
-                            }}
+                            s_v[d] += {dense_read("Y_world", "n_row_base + d")} * d_n_total;
                         }}
                     }}
                     if (d_t2_total != 0.0f) {{
                         for (int d = lane; d < __D__; d += 32) {{
-                            if (defer_dense_response == 0 ||
-                                world_deferred_dof_mask.data[deferred_mask_base + d] == 0) {{
-                                s_v[d] += {dense_read("Y_world", "t2_row_base + d")} * d_t2_total;
-                            }}
+                            s_v[d] += {dense_read("Y_world", "t2_row_base + d")} * d_t2_total;
                         }}
                     }}
                     __syncwarp();
@@ -1173,10 +1163,7 @@ def get_source(
                 if (delta_impulse_vlim != 0.0f) {{
 {dense_limit_vote}
                     for (int d = lane; d < {D}; d += 32) {{
-                        if (defer_dense_response == 0 ||
-                            world_deferred_dof_mask.data[deferred_mask_base + d] == 0) {{
-                            s_v[d] += {dense_read("Y_world", "row_base_vlim + d")} * delta_impulse_vlim;
-                        }}
+                        s_v[d] += {dense_read("Y_world", "row_base_vlim + d")} * delta_impulse_vlim;
                     }}
                 }}
                 __syncwarp();
@@ -1187,7 +1174,7 @@ def get_source(
     )
 
     # Fused stateless velocity clamp on driven DOFs: PhysX's PxClamp /
-    # unitResponse math (packed s_meta_dense, deferred-response masking).
+    # unitResponse math (packed s_meta_dense).
     # Runs where the dedicated velocity-limit
     # rows run — after the contact rows of the same iteration — so the limit
     # keeps the last word even when the sweep is under-converged (the
@@ -1220,10 +1207,7 @@ def get_source(
                     float delta_fvl = (fminf(fmaxf(jv_fvl, -qdot_max_fvl), qdot_max_fvl) - jv_fvl) / denom_fvl;
 {drive_limit_vote}
                     for (int d = lane; d < {D}; d += 32) {{
-                        if (defer_dense_response == 0 ||
-                            world_deferred_dof_mask.data[deferred_mask_base + d] == 0) {{
-                            s_v[d] += {dense_read("Y_world", "row_base_fvl + d")} * delta_fvl;
-                        }}
+                        s_v[d] += {dense_read("Y_world", "row_base_fvl + d")} * delta_fvl;
                     }}
                 }}
                 __syncwarp();
@@ -1471,7 +1455,6 @@ def get_source(
     int off_mf = world * {M_MF};
     int off_meta = off_mf * 4;
     int jy_world_base = world * {M_D} * {D};
-    int deferred_mask_base = world * {D};
     int mf6_base = world * {M_MF} * 6;
     int mf_load_lo = (row_phase == 5) ? mf_contact_end : 0;
 

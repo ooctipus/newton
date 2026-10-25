@@ -307,7 +307,6 @@ def _solve_parent_rows(device, friction, parents):
         friction_start_iteration=0,
         iteration_offset=0,
         freeze_drive_rows=0,
-        defer_dense_response=0,
     )
     kernel = fpgs._get_pgs_solve_mf_gs_kernel(
         8,

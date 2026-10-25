@@ -250,20 +250,7 @@ __PREFIX__
             }
         }
         if (materials) { mu /= static_cast<float>(materials); restitution /= static_cast<float>(materials); }
-        float friction = mu * c.friction_scale;
-        const bool filter = c.friction_pairs_only == 0 || (aa >= 0 && ab >= 0 && c.is_free.data[aa] == 0 && c.is_free.data[ab] == 0);
-        if (r > 0 && filter && c.friction_anchor_limit > 0) {
-            const int total = wp::min(c.count.data[0], c.point0.shape[0]);
-            int rank = 0;
-            for (int look = 1; look <= 8; ++look) {
-                const int prev = contact - look;
-                if (prev < 0 || prev >= total) break;
-                if (c.shape0.data[prev] != sa || c.shape1.data[prev] != sb) break;
-                ++rank;
-            }
-            const int next = contact + 1;
-            if (rank > 0 || (next < total && c.shape0.data[next] == sa && c.shape1.data[next] == sb)) friction *= 0.5f;
-        }
+        const float friction = mu * c.friction_scale;
 __PROJECTION__
         const float phi = r == 0 ? separation : 0.0f;
         float rhs = -target;
@@ -660,9 +647,6 @@ def create_owner(solver):
         and solver._contact_w == 1.0
         and not solver._debug_buffers_enabled
         and source._INK_ON
-        and not source._INK_CHECK
-        and not source._CHECK_ROWS
-        and not source._FPGS_CAPTURE
     )
     if not supported:
         return None

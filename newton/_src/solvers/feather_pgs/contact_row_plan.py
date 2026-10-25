@@ -41,9 +41,6 @@ class ContactRowPlan:
     """Builder method by DOF size, in ``size_groups`` order."""
     combined: tuple[int, ...] = ()
     """General producer: the sizes whose rows one masked launch builds, in ``size_groups`` order."""
-    check: str | None = None
-    """General producer, debug only: the builder a row check compares (``FEATHER_PGS_CHECK_ROWS``:
-    ``"masked"`` into copies, then the per-contact rows)."""
     metadata_launch: bool = False
     """Shared-metadata producers: a separate ``prepare_world_contact_rows`` launch writes the row metadata.
 
@@ -103,19 +100,15 @@ def contact_row_plan(solver) -> ContactRowPlan:
         else:
             producer = "compact_jacobian"
         return ContactRowPlan(producer, law, methods, metadata_launch=not solver._sparse_prepare_contacts)
-    check_rows = bool(solver._point_contact_paths and source._CHECK_ROWS)
-    masked_law = solver._masked_contact_rows()
-    masked_sizes = ()
-    if masked_law and source._ROWS_MASKED and not check_rows:
-        masked_sizes = tuple(size for size in sizes if size <= 32)
+    masked = solver._masked_contact_rows() and source._ROWS_MASKED
+    masked_sizes = tuple(size for size in sizes if size <= 32) if masked else ()
     combined = masked_sizes if 1 <= len(masked_sizes) <= 2 else ()
     methods = {}
     for size in sizes:
         if size in combined:
             methods[size] = "masked_combined"
-        elif masked_law and source._ROWS_MASKED and size <= 32 and not check_rows:
+        elif size in masked_sizes:
             methods[size] = "masked"
         else:
             methods[size] = "per_contact"
-    check = "masked" if check_rows else None
-    return ContactRowPlan("general", law, methods, combined=combined, check=check)
+    return ContactRowPlan("general", law, methods, combined=combined)

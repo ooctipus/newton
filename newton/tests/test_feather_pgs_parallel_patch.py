@@ -599,7 +599,6 @@ _ISOTROPIC_STEP = (
     "        }\n"
     "    }\n"
     "    SYNC();\n"
-    "    if (0 == 3) return;\n"
     "    float t_k = 1.0f;\n"
 )
 
@@ -926,8 +925,6 @@ def _general_bias(solver, rows, dt):
             solver.contact_speculative_scale,
             1.0,
             1.0,
-            wp.zeros(rhs.shape[0], dtype=wp.int32, device=device),
-            0,
         ],
         outputs=[rhs, wp.zeros_like(rhs)],
         device=device,
@@ -1854,7 +1851,6 @@ class TestPatchParallelRoutes(unittest.TestCase):
                         "direct_rows": "routes.sweep.tiers",
                     }
                     self.assertEqual(record["builder_by_dof"], dict.fromkeys(record["builder_by_dof"], builder))
-                    self.assertIsNone(record["row_check_by_dof"])
                     with launched_kernels() as keys:
                         _rollout(model, solver, 1)
                     assert_row_builders_named(self, record, keys)

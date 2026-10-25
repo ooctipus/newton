@@ -551,33 +551,6 @@ def incident_projection(data: ContactInput, body: int, art: int, point: wp.vec3,
     return result
 
 
-@wp.func
-def friction_multiplier(data: ContactInput, contact: int, total: int, art0: int, art1: int):
-    """Keep the adjacent-anchor scaling without re-admitting allocated rows."""
-    apply_filter = data.friction_pairs_only == 0
-    if art0 >= 0 and art1 >= 0:
-        apply_filter = apply_filter or (data.is_free[art0] == 0 and data.is_free[art1] == 0)
-    result = data.friction_scale
-    if apply_filter and data.friction_anchor_limit > 0:
-        rank = int(0)
-        for lookback in range(1, 9):
-            previous = contact - lookback
-            if previous < 0 or previous >= total:
-                break
-            if data.shape0[previous] == data.shape0[contact] and data.shape1[previous] == data.shape1[contact]:
-                rank += 1
-            else:
-                break
-        same_next = False
-        if contact + 1 < total:
-            same_next = (
-                data.shape0[contact + 1] == data.shape0[contact] and data.shape1[contact + 1] == data.shape1[contact]
-            )
-        if rank > 0 or same_next:
-            result *= 0.5
-    return result
-
-
 @wp.kernel(enable_backward=False)
 def produce_contacts(workers: int, data: ContactInput, packet: ContactPacketData, primary: int, secondary: int):
     """Cooperatively project current contacts into physical packets after allocation."""
@@ -650,7 +623,7 @@ def produce_contacts(workers: int, data: ContactInput, packet: ContactPacketData
             restitution = mixed_contact_restitution(
                 data.shape0[contact], data.shape1[contact], data.material_restitution
             )
-            friction_mu = mu * friction_multiplier(data, contact, total, art0, art1)
+            friction_mu = mu * data.friction_scale
             separation = wp.dot(normal, point0 - point1)
             for row in range(rows):
                 output_row = slot + row
@@ -1306,13 +1279,7 @@ def create_owner(solver):
         )
     ):
         return None
-    if any(
-        (
-            source._FPGS_CAPTURE,
-            source._INK_ON,
-            source._CHECK_ROWS,
-        )
-    ):
+    if source._INK_ON:
         return None
     layout = plan(solver)
     if layout is None:
