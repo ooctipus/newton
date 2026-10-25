@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Keep compact contact metadata inside the allocator's recorded row reservation."""
+"""Keep every contact row builder inside the allocator's recorded row reservation."""
 
 import inspect
 import unittest
@@ -11,8 +11,16 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
-from newton._src.solvers.feather_pgs.kernels import prepare_world_contact_rows
+from newton._src.solvers.feather_pgs.kernels import (
+    build_mf_contact_rows,
+    populate_world_J_for_size,
+    prepare_world_contact_rows,
+)
 from newton._src.solvers.feather_pgs.row_build import contact_row_prelude, populate_world_J_masked
+
+# Normal +X gives tangents +Z and -Y: against three unit translation dofs, these are the
+# Jacobian rows of a contact's normal and its two tangents.
+ROW_DIRECTIONS = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]], dtype=np.float32)
 
 
 def metadata_inputs(device, needed, gaps):
@@ -69,14 +77,100 @@ def metadata_inputs(device, needed, gaps):
     return values, slots
 
 
-def launch_metadata(values, device):
-    """Launch the actual shared producer using its declared argument names."""
+def translation_dofs(device):
+    """Give the contacts' articulation three unit translation dofs, so each Jacobian row is its direction."""
+    axes = np.zeros((3, 6), dtype=np.float32)
+    axes[:, :3] = np.eye(3)
+    return {
+        "target_size": 3,
+        "size_a": 3,
+        "size_b": -1,
+        "articulation_response_dof_count": wp.array([3], dtype=int, device=device),
+        "art_group_idx": wp.zeros(1, dtype=int, device=device),
+        "art_dof_start": wp.zeros(1, dtype=int, device=device),
+        "body_to_joint": wp.zeros(1, dtype=int, device=device),
+        "joint_ancestor": wp.array([-1], dtype=int, device=device),
+        "joint_qd_start": wp.array([0, 3], dtype=int, device=device),
+        "joint_S_s": wp.array(axes, dtype=wp.spatial_vector, device=device),
+        "body_response_dof_mask": wp.array([0b111], dtype=wp.uint32, device=device),
+        "shape_transform": wp.array([wp.transform_identity()] * 2, dtype=wp.transform, device=device),
+    }
+
+
+def launch(kernel, values, threads, device):
+    """Launch an actual row producer using its declared argument names."""
     wp.launch(
-        prepare_world_contact_rows,
-        dim=values["total_num_threads"],
-        inputs=[values[name] for name in inspect.signature(prepare_world_contact_rows.func).parameters],
+        kernel,
+        dim=threads,
+        inputs=[values[name] for name in inspect.signature(kernel.func).parameters],
         device=device,
     )
+
+
+def launch_metadata(values, device):
+    """Launch the shared metadata producer, which writes no Jacobian."""
+    launch(prepare_world_contact_rows, values, values["total_num_threads"], device)
+    return None, None
+
+
+def launch_per_contact(values, device):
+    """Accumulate the per-contact builder's rows into a cleared Jacobian, as the solver does."""
+    jacobian = wp.zeros((1, values["world_row_type"].shape[1], 3), dtype=float, device=device)
+    values["J_group"] = jacobian
+    launch(populate_world_J_for_size, values, values["total_num_threads"], device)
+    return jacobian.numpy()[0], 0.0
+
+
+def launch_masked(values, device):
+    """Launch the point-law masked prelude, three threads per contact, and its Jacobian pass, one per dof."""
+    count = values["contact_path"].shape[0]
+    jacobian = wp.full((1, values["world_row_type"].shape[1], 3), -9.0, dtype=float, device=device)
+    values.update(
+        total_threads=3 * count,
+        world_constraint_count=wp.zeros(1, dtype=int, device=device),
+        mf_constraint_count=wp.zeros(1, dtype=int, device=device),
+        owned_rows_le=0,
+        contact_friction_anchor_limit=0,
+        pre_flags=wp.full(count, -9, dtype=int, device=device),
+        J_group_a=jacobian,
+        J_group_b=jacobian,
+    )
+    launch(contact_row_prelude, values, 3 * count, device)
+    launch(populate_world_J_masked, values, 3 * count, device)
+    return jacobian.numpy()[0], -9.0
+
+
+def launch_matrix_free(values, device):
+    """Route the contacts to the matrix-free builder, writing its row metadata into the same arrays."""
+    count = values["contact_path"].shape[0]
+    capacity = values["world_row_type"].shape[1]
+    jacobian = wp.full((1, capacity, 6), -9.0, dtype=float, device=device)
+    values.update(
+        contact_path=wp.ones(count, dtype=int, device=device),
+        has_target_velocity=0,
+        mf_body_a=wp.full((1, capacity), -9, dtype=int, device=device),
+        mf_body_b=wp.full((1, capacity), -9, dtype=int, device=device),
+        mf_J_a=jacobian,
+        mf_J_b=wp.full((1, capacity, 6), -9.0, dtype=float, device=device),
+        mf_row_type=values["world_row_type"],
+        mf_row_parent=values["world_row_parent"],
+        mf_row_mu=values["world_row_mu"],
+        mf_phi=values["world_phi"],
+        mf_target_velocity=values["world_target_velocity"],
+        mf_row_restitution=values["world_row_restitution"],
+    )
+    launch(build_mf_contact_rows, values, values["total_num_threads"], device)
+    # The linear part of a matrix-free row is its direction.
+    return jacobian.numpy()[0, :, :3], -9.0
+
+
+# Every producer that writes a contact's rows from its allocator reservation.
+ROW_BUILDERS = {
+    "metadata": launch_metadata,
+    "per_contact": launch_per_contact,
+    "masked": launch_masked,
+    "matrix_free": launch_matrix_free,
+}
 
 
 class TestContactReservations(unittest.TestCase):
@@ -149,33 +243,44 @@ class TestContactReservations(unittest.TestCase):
                         np.testing.assert_array_equal(array.numpy()[0, 9:], -9)
 
     def check_reservations(self, device):
-        """Preserve both one-to-three and three-to-one threshold disagreements."""
+        """Preserve both one-to-three and three-to-one threshold disagreements in every row builder.
+
+        Each contact's gap lies on the other side of the friction gap than its reservation, so a
+        builder that recomputes eligibility writes tangent rows into the next contact's rows, or
+        leaves two reserved rows unwritten.
+        """
         below = np.nextafter(np.float32(0.02), np.float32(0.0))
         above = np.nextafter(np.float32(0.02), np.float32(1.0))
-        for needed, gaps in (([1, 3], [below, above]), ([3, 1], [above, below])):
-            with self.subTest(device=str(device), needed=needed):
-                values, slots = metadata_inputs(device, needed, gaps)
-                launch_metadata(values, device)
-                kinds = values["world_row_type"].numpy()[0]
-                parents = values["world_row_parent"].numpy()[0]
-                expected_kinds, expected_parents = [], []
-                for slot, width in zip(slots, needed, strict=True):
-                    expected_kinds += [0] + [2] * (width - 1)
-                    expected_parents += [-1] + [int(slot)] * (width - 1)
-                np.testing.assert_array_equal(kinds[:4], expected_kinds)
-                np.testing.assert_array_equal(parents[:4], expected_parents)
-                np.testing.assert_array_equal(kinds[4:], -9)
-                np.testing.assert_array_equal(parents[4:], -9)
-                np.testing.assert_array_equal(values["world_phi"].numpy()[0, slots], gaps)
-                np.testing.assert_allclose(values["world_row_mu"].numpy()[0, slots], 0.7, atol=1.0e-7)
+        for builder, launch_builder in ROW_BUILDERS.items():
+            for needed, gaps in (([1, 3], [below, above]), ([3, 1], [above, below])):
+                with self.subTest(device=str(device), builder=builder, needed=needed):
+                    values, slots = metadata_inputs(device, needed, gaps)
+                    values.update(translation_dofs(device))
+                    jacobian, untouched = launch_builder(values, device)
+                    kinds = values["world_row_type"].numpy()[0]
+                    parents = values["world_row_parent"].numpy()[0]
+                    expected_kinds, expected_parents = [], []
+                    expected_jacobian = np.full((kinds.shape[0], 3), untouched, dtype=np.float32)
+                    for slot, width in zip(slots, needed, strict=True):
+                        expected_kinds += [0] + [2] * (width - 1)
+                        expected_parents += [-1] + [int(slot)] * (width - 1)
+                        expected_jacobian[slot : slot + width] = ROW_DIRECTIONS[:width]
+                    np.testing.assert_array_equal(kinds[:4], expected_kinds)
+                    np.testing.assert_array_equal(parents[:4], expected_parents)
+                    np.testing.assert_array_equal(kinds[4:], -9)
+                    np.testing.assert_array_equal(parents[4:], -9)
+                    np.testing.assert_array_equal(values["world_phi"].numpy()[0, slots], gaps)
+                    np.testing.assert_allclose(values["world_row_mu"].numpy()[0, slots], 0.7, atol=1.0e-7)
+                    if jacobian is not None:
+                        np.testing.assert_array_equal(jacobian, expected_jacobian)
 
     def test_reservations_cpu(self):
-        """Keep CPU metadata inside each reserved packet despite opposite gap admission."""
+        """Keep CPU rows inside each reserved packet despite opposite gap admission."""
         self.check_reservations("cpu")
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA is required")
     def test_reservations_cuda(self):
-        """Keep CUDA metadata inside each reserved packet despite opposite gap admission."""
+        """Keep CUDA rows inside each reserved packet despite opposite gap admission."""
         self.check_reservations("cuda:0")
 
 

@@ -57,6 +57,7 @@ def contact_row_prelude(
     contact_art_a: wp.array[int],
     contact_art_b: wp.array[int],
     contact_path: wp.array[int],
+    contact_slots_needed: wp.array[int],
     size_a: int,
     size_b: int,
     articulation_response_dof_count: wp.array[int],
@@ -67,8 +68,6 @@ def contact_row_prelude(
     prescribed_articulation: wp.array[int],
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
-    enable_friction: int,
-    contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
     contact_friction_anchor_limit: int,
     contact_friction_articulation_pairs_only: int,
@@ -118,6 +117,7 @@ def contact_row_prelude(
             contact_art_a,
             contact_art_b,
             contact_path,
+            contact_slots_needed,
             size_a,
             size_b,
             articulation_response_dof_count,
@@ -128,8 +128,6 @@ def contact_row_prelude(
             prescribed_articulation,
             shape_material_mu,
             shape_material_restitution,
-            enable_friction,
-            contact_friction_gap_threshold,
             contact_friction_shared_anchor,
             contact_friction_anchor_limit,
             contact_friction_articulation_pairs_only,
@@ -167,6 +165,7 @@ def _contact_row_prelude_one(
     contact_art_a: wp.array[int],
     contact_art_b: wp.array[int],
     contact_path: wp.array[int],
+    contact_slots_needed: wp.array[int],
     size_a: int,
     size_b: int,
     articulation_response_dof_count: wp.array[int],
@@ -177,8 +176,6 @@ def _contact_row_prelude_one(
     prescribed_articulation: wp.array[int],
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
-    enable_friction: int,
-    contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
     contact_friction_anchor_limit: int,
     contact_friction_articulation_pairs_only: int,
@@ -282,9 +279,9 @@ def _contact_row_prelude_one(
     friction_mu = mu * contact_friction_scale * friction_anchor_scale
 
     t0, t1 = contact_tangent_basis(normal)
-    will_add_friction = enable_friction != 0 and (not apply_friction_filter or phi <= contact_friction_gap_threshold)
-    if effective_friction_anchor_limit > 0 and friction_anchor_rank >= effective_friction_anchor_limit:
-        will_add_friction = False
+    # Allocation owns the row extent; recomputing eligibility can cross a
+    # floating-point threshold and overwrite the following contact.
+    will_add_friction = contact_slots_needed[c] >= 3
     contact_anchor_world = 0.5 * (point_a_world + point_b_world)
     point_a_normal = point_a_world
     point_b_normal = point_b_world

@@ -5969,6 +5969,7 @@ def _populate_world_J_for_size_contact(
     contact_art_a: wp.array[int],
     contact_art_b: wp.array[int],
     contact_path: wp.array[int],
+    contact_slots_needed: wp.array[int],
     target_size: int,
     articulation_response_dof_count: wp.array[int],
     art_group_idx: wp.array[int],
@@ -5985,11 +5986,7 @@ def _populate_world_J_for_size_contact(
     shape_transform: wp.array[wp.transform],
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
-    enable_friction: int,
-    contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
-    contact_friction_articulation_pairs_only: int,
-    is_free_rigid: wp.array[int],
     contact_friction_scale: float,
     contact_shared_anchor: int,
     pgs_beta: float,
@@ -6074,17 +6071,13 @@ def _populate_world_J_for_size_contact(
     if mat_count > 0:
         mu /= float(mat_count)
     restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
-    a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
-    b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
     friction_mu = mu * contact_friction_scale
 
     # Compute tangent basis for friction
     t0, t1 = contact_tangent_basis(normal)
-    will_add_friction = enable_friction != 0 and contact_friction_eligible(
-        phi, a_non_free, b_non_free, contact_friction_articulation_pairs_only, contact_friction_gap_threshold
-    )
-    if friction_patches.enabled != 0:
-        will_add_friction = will_add_friction and friction_patches.weight[c] > 0.0
+    # Allocation owns the row extent; recomputing eligibility can cross a
+    # floating-point threshold and overwrite the following contact.
+    will_add_friction = contact_slots_needed[c] >= 3
     contact_anchor_world = 0.5 * (point_a_world + point_b_world)
     target_point_a_normal = point_a_world
     target_point_b_normal = point_b_world
@@ -6356,6 +6349,7 @@ def populate_world_J_for_size(
     contact_art_a: wp.array[int],
     contact_art_b: wp.array[int],
     contact_path: wp.array[int],
+    contact_slots_needed: wp.array[int],
     target_size: int,
     articulation_response_dof_count: wp.array[int],
     art_group_idx: wp.array[int],
@@ -6372,11 +6366,7 @@ def populate_world_J_for_size(
     shape_transform: wp.array[wp.transform],
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
-    enable_friction: int,
-    contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
-    contact_friction_articulation_pairs_only: int,
-    is_free_rigid: wp.array[int],
     contact_friction_scale: float,
     contact_shared_anchor: int,
     pgs_beta: float,
@@ -6412,6 +6402,7 @@ def populate_world_J_for_size(
             contact_art_a,
             contact_art_b,
             contact_path,
+            contact_slots_needed,
             target_size,
             articulation_response_dof_count,
             art_group_idx,
@@ -6428,11 +6419,7 @@ def populate_world_J_for_size(
             shape_transform,
             shape_material_mu,
             shape_material_restitution,
-            enable_friction,
-            contact_friction_gap_threshold,
             contact_friction_shared_anchor,
-            contact_friction_articulation_pairs_only,
-            is_free_rigid,
             contact_friction_scale,
             contact_shared_anchor,
             pgs_beta,
@@ -7124,6 +7111,7 @@ def _build_mf_contact_row(
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
     contact_path: wp.array[int],
+    contact_slots_needed: wp.array[int],
     contact_art_a: wp.array[int],
     contact_art_b: wp.array[int],
     articulation_response_dof_count: wp.array[int],
@@ -7135,10 +7123,7 @@ def _build_mf_contact_row(
     has_target_velocity: int,
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
-    enable_friction: int,
-    contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
-    contact_friction_articulation_pairs_only: int,
     contact_friction_scale: float,
     contact_shared_anchor: int,
     friction_patches: FrictionPatches,
@@ -7228,17 +7213,13 @@ def _build_mf_contact_row(
     if mat_count > 0:
         mu /= float(mat_count)
     restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
-    a_non_free = False
-    b_non_free = False
     friction_mu = mu * contact_friction_scale
 
     # Tangent basis
     t0, t1 = contact_tangent_basis(normal)
-    will_add_friction = enable_friction != 0 and contact_friction_eligible(
-        phi, a_non_free, b_non_free, contact_friction_articulation_pairs_only, contact_friction_gap_threshold
-    )
-    if friction_patches.enabled != 0:
-        will_add_friction = will_add_friction and friction_patches.weight[c] > 0.0
+    # Allocation owns the row extent; recomputing eligibility can cross a
+    # floating-point threshold and overwrite the following contact.
+    will_add_friction = contact_slots_needed[c] >= 3
     contact_anchor_world = 0.5 * (point_a_world + point_b_world)
 
     # Write rows for normal + friction
@@ -7340,6 +7321,7 @@ def build_mf_contact_rows(
     contact_world: wp.array[int],
     contact_slot: wp.array[int],
     contact_path: wp.array[int],
+    contact_slots_needed: wp.array[int],
     contact_art_a: wp.array[int],
     contact_art_b: wp.array[int],
     articulation_response_dof_count: wp.array[int],
@@ -7351,10 +7333,7 @@ def build_mf_contact_rows(
     has_target_velocity: int,
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
-    enable_friction: int,
-    contact_friction_gap_threshold: float,
     contact_friction_shared_anchor: int,
-    contact_friction_articulation_pairs_only: int,
     contact_friction_scale: float,
     contact_shared_anchor: int,
     friction_patches: FrictionPatches,
@@ -7387,6 +7366,7 @@ def build_mf_contact_rows(
             contact_world,
             contact_slot,
             contact_path,
+            contact_slots_needed,
             contact_art_a,
             contact_art_b,
             articulation_response_dof_count,
@@ -7398,10 +7378,7 @@ def build_mf_contact_rows(
             has_target_velocity,
             shape_material_mu,
             shape_material_restitution,
-            enable_friction,
-            contact_friction_gap_threshold,
             contact_friction_shared_anchor,
-            contact_friction_articulation_pairs_only,
             contact_friction_scale,
             contact_shared_anchor,
             friction_patches,

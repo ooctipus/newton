@@ -1163,7 +1163,8 @@ def _friction(solver) -> dict:
     reason = _BETA_REASONS[solver._friction_anchor_beta_source]
     if patch:
         owners = []
-        if not solver._parallel_contact_paths:
+        # Contact regularization keeps them off under either law (parallel_rows.reason).
+        if not solver._parallel_contact_paths and not solver._regularization_enabled:
             owners.append("keyed rows and parallel matrix-free tiers")
         # Patch friction reaches the resolved-world classifier on the dense paths only, not under torsion.
         if not solver._patch_dense_paths:

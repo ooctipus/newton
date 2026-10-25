@@ -1107,7 +1107,9 @@ class TestPatchParallelAdmission(unittest.TestCase):
                     self.assertIn(f"{_SWITCH}=0", friction["parallel_rows"]["reason"])
                     self.assertIn(f"{_SWITCH}=0", keyed["reason"])
         # Torsion and compliance (CUDA-only laws here) keep ordinary rows whatever the switch says.
-        other_law = SimpleNamespace(_point_contact_paths=False, _law_agnostic_contact_paths=False)
+        other_law = SimpleNamespace(
+            _regularization_enabled=False, _point_contact_paths=False, _law_agnostic_contact_paths=False
+        )
         for switch in (None, "0", "1"):
             with self.subTest(law="torsion or compliance", switch=switch), patch.dict(os.environ):
                 os.environ.pop(_SWITCH, None)
@@ -1136,6 +1138,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
             (True, 0.0, "accumulated", "physx_grasp", False),  # the grasp schedule keeps PhysX's clamp
         ):
             probe = SimpleNamespace(
+                _regularization_enabled=False,
                 _point_contact_paths=False,
                 _law_agnostic_contact_paths=True,
                 pgs_mode="matrix_free",
