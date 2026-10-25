@@ -2078,13 +2078,14 @@ class CollisionPipeline:
         self._terrain_law_listed = None
 
         # Kept for compatibility with Newton main, with its explicit > model > estimated precedence and the
-        # model kept in sync; contact buffers grow on demand and nothing of this pipeline is sized by it.
+        # model kept in sync; nothing of this pipeline is sized by it (the first mapping below takes the estimate).
         model_rigid_contact_max = int(getattr(model, "rigid_contact_max", 0) or 0)
+        estimate = None
         if rigid_contact_max is None:
             if model_rigid_contact_max > 0:
                 rigid_contact_max = model_rigid_contact_max
             else:
-                rigid_contact_max = _estimate_rigid_contact_max(model)
+                rigid_contact_max = estimate = _estimate_rigid_contact_max(model)
         self._rigid_contact_max = rigid_contact_max
         model.rigid_contact_max = rigid_contact_max
         if max_triangle_pairs <= 0:
@@ -2092,7 +2093,7 @@ class CollisionPipeline:
         if requires_grad is None:
             requires_grad = model.requires_grad
         # Every per-contact buffer of this pipeline, its Contacts and the solvers that step the model
-        # holds the model's pool's ready rows, which start at a floor and are sized from measured demand.
+        # holds the model's pool's ready rows: the first mapping planned below, then sized from measured demand.
         self._contact_pool = model_contact_pool(model, device)
         # The pool's generation the last service_capacity() reported.
         self._service_generation = self._contact_pool.generation
@@ -2888,6 +2889,12 @@ class CollisionPipeline:
         # concurrently by independent graph executables.
         self._body_pair_reduction_capture_tokens: set[object] = set()
         self._captured_contacts: Contacts | None = None
+        # Map big, then trim: the model's pool maps rows for its shape-pair contact estimate (never an explicit
+        # budget) once its fields exist, and trims to the measured demand in service_capacity().
+        pool = self._contact_pool
+        if pool.estimate is None:
+            pool.plan_first_mapping(_estimate_rigid_contact_max(model) if estimate is None else estimate)
+            self._service_generation = pool.generation
 
     def _terrain_law_unsupported(self) -> tuple[str, str, str] | None:
         """Return why the terrain law cannot write this pipeline's heightfield contacts, or ``None`` when it can.
@@ -3655,12 +3662,13 @@ class CollisionPipeline:
         return self._rigid_contact_max
 
     def service_capacity(self, state: State | None = None, *, dt: float | None = None) -> bool:
-        """Grow the rigid contact buffers from measured demand; return whether CUDA graphs must be recaptured.
+        """Size the rigid contact buffers from measured demand; return whether CUDA graphs must be recaptured.
 
         The buffers of this pipeline, of its :meth:`contacts` and of the solvers
         that step its model (e.g. :class:`~newton.solvers.SolverFeatherPGS`)
-        start at a few thousand rows and never shrink. Call this once per step
-        outside capture, e.g. right after launching the step's graph. Every
+        start with rows for the model's shape-pair contact estimate. Call this
+        once per step outside capture, e.g. right after launching the step's
+        graph. Every
         :meth:`collide` records its contact count in a sticky high-water mark,
         written to pinned host memory also when replayed from a graph; this reads
         it without synchronizing, so it lags the device by the steps still in
@@ -3672,7 +3680,14 @@ class CollisionPipeline:
         and graphs whose contact launches follow the rows (this pipeline's and
         FeatherPGS's) use the new rows from their next replay. The replay whose
         contacts first outnumbered the rows dropped the excess and flagged its
-        capacity status; this warns.
+        capacity status; this warns. Once the mark has stayed within
+        :data:`~newton._src.core.contact_pool.TRIM_BAND` for
+        :data:`~newton._src.core.contact_pool.TRIM_AFTER_PASSES` collision
+        passes, the rows trim to
+        :data:`~newton._src.core.contact_pool.HEADROOM` rows per contact of it:
+        the ready rows drop in stream order and the pages past them are unmapped
+        once the replays submitted before have completed, without synchronizing
+        the device or recapturing (CUDA virtual memory only).
 
         With ``state``, the state a graph starts from, the state's rigid
         contacts are counted first (into scratch rows, writing no

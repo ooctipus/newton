@@ -8,6 +8,7 @@ import math
 import sys
 import unittest
 import warnings
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -35,9 +36,17 @@ CONTACTS = 4 * WORLDS * BOXES
 GROWN = math.ceil(contact_pool.HEADROOM * CONTACTS / 8) * 8
 
 
+@contextlib.contextmanager
 def _small_pool_policy(rows: int, quantum: int):
-    """Start new pools at ``rows`` rows and round sizes to ``quantum``, so a small scene starts below its demand."""
-    return mock.patch.multiple(contact_pool, MIN_READY_ROWS=rows, ROW_QUANTUM=quantum)
+    """Start new pools at ``rows`` rows, without a first mapping, and round sizes to ``quantum``.
+
+    A small scene then starts below its demand, which exercises growth past the mapped rows.
+    """
+    with (
+        mock.patch.multiple(contact_pool, MIN_READY_ROWS=rows, ROW_QUANTUM=quantum),
+        mock.patch.object(ContactPool, "plan_first_mapping", lambda pool, estimate: None),
+    ):
+        yield
 
 
 @contextlib.contextmanager
@@ -95,12 +104,34 @@ def _records(contacts, *extra):
 
 
 class TestContactPoolPolicy(unittest.TestCase):
-    def test_pools_start_at_the_floor(self):
-        """Start every pool at the floor, whatever the model's world count."""
+    def test_pipelines_map_the_model_estimate_and_never_a_budget(self):
+        """A pool no pipeline planned holds the floor; a pipeline maps the model's shape-pair estimate, not a budget."""
         self.assertEqual(contact_pool.MIN_READY_ROWS, 4096)
         self.assertEqual(ContactPool(device="cpu").ready, 4096)
-        model = _build_boxes("cpu", worlds=128, boxes=1)
-        self.assertEqual(newton.CollisionPipeline(model).contacts().rigid_contact_max, 4096)
+        model = _build_boxes("cpu", worlds=32, boxes=8)
+        estimate = _estimate_rigid_contact_max(model)
+        self.assertGreater(estimate, contact_pool.MIN_READY_ROWS)
+        model.rigid_contact_max = 7
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=5)
+        self.assertEqual(pipeline.rigid_contact_max, 5)
+        self.assertEqual(pipeline._contact_pool.estimate, estimate)
+        self.assertEqual(pipeline.contacts().rigid_contact_max, estimate, "the estimate, never the budget")
+        small = _build_boxes("cpu", worlds=1, boxes=1)
+        self.assertEqual(newton.CollisionPipeline(small).contacts().rigid_contact_max, contact_pool.MIN_READY_ROWS)
+
+    def test_first_mapping_keeps_a_share_of_the_free_memory(self):
+        """Cap the first mapping at FIRST_MAPPING_SHARE of the memory free at creation over every field's bytes."""
+        pool = ContactPool(device="cpu")
+        pool._estimate = 10_000_000
+        self.assertEqual(pool._first_rows(100, INDEX_LIMIT), 10_000_000, "the CPU reports no free memory: no cap")
+        pool.device = SimpleNamespace(is_cuda=True)
+        pool.free_memory_at_creation = 8 * 2**30
+        share = contact_pool.FIRST_MAPPING_SHARE
+        self.assertEqual(pool._first_rows(1000, INDEX_LIMIT), int(share * 8 * 2**30) // 1000)
+        self.assertEqual(pool._first_rows(10, INDEX_LIMIT), 10_000_000, "the estimate fits the share")
+        self.assertEqual(pool._first_rows(10, 1000), 1000, "at most the bound")
+        pool._estimate = 0
+        self.assertEqual(pool._first_rows(10, INDEX_LIMIT), contact_pool.MIN_READY_ROWS, "at least the floor")
 
     def test_sizing_holds_the_headroom_per_contact(self):
         """Size for a demand at HEADROOM rows per contact, rounded up and bounded; never shrink."""
@@ -532,13 +563,12 @@ def test_example_runner_measures_and_recaptures(test, device):
     test.assertEqual(holding.captures, [GROWN] if reallocates else [], "recaptured after the first frame")
 
 
-def test_measurement_keeps_the_floor_or_sizes_to_the_demand(test, device):
-    """Size a model's buffers before capture: no contacts keep the floor, contacts get HEADROOM rows each.
+def test_first_mapping_holds_the_demand_from_the_first_replay(test, device):
+    """Map the model's estimate before anything runs: the first replay holds every contact, and nothing grows.
 
-    The solver, constructed before the pipeline, shares the model's pool, so the measurement sizes its per-contact
-    buffers too; a graph captured afterwards holds every contact from its first replay and never grows.
+    The solver, constructed before the pipeline, shares the model's pool, so the pipeline's first mapping sizes its
+    per-contact buffers too. Measuring a state the estimate covers grows nothing.
     """
-    floor = contact_pool.MIN_READY_ROWS
     model = _build_boxes(device)
     solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=4)
     pipeline = newton.CollisionPipeline(model)
@@ -546,11 +576,9 @@ def test_measurement_keeps_the_floor_or_sizes_to_the_demand(test, device):
     body_q = lifted.body_q.numpy()
     body_q[:, 2] += 1.0
     lifted.body_q.assign(body_q)
-    test.assertFalse(pipeline.service_capacity(lifted), "a contact-free scene keeps the floor")
+    test.assertFalse(pipeline.service_capacity(lifted), "a contact-free scene keeps the first mapping")
     held = pipeline.contacts().rigid_contact_max
-    # CUDA virtual memory holds every row its first pages cover; ordinary arrays hold the floor.
-    test.assertEqual(held == floor, _reallocates(pipeline._contact_pool))
-    test.assertGreaterEqual(held, floor)
+    test.assertGreaterEqual(held, max(contact_pool.MIN_READY_ROWS, _estimate_rigid_contact_max(model)))
     test.assertEqual(solver.contact_slot.shape, (held,))
 
     worlds, boxes = 128, 8
@@ -560,13 +588,12 @@ def test_measurement_keeps_the_floor_or_sizes_to_the_demand(test, device):
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     state_0, state_1, control = model.state(), model.state(), model.control()
-    reallocates = _reallocates(pipeline._contact_pool)
-    held = contacts.rigid_contact_max
+    rows = contacts.rigid_contact_max
+    test.assertGreaterEqual(rows, _estimate_rigid_contact_max(model))
+    test.assertGreater(rows, contact_pool.HEADROOM * demand, "the estimate holds the demand with headroom")
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        test.assertEqual(pipeline.service_capacity(state_0), reallocates)
-    rows = sized_rows(demand, floor, pipeline._contact_pool.bound) if reallocates else held
-    test.assertGreater(rows, demand)
+        test.assertFalse(pipeline.service_capacity(state_0), "the first mapping holds the measured demand")
     test.assertEqual(contacts.rigid_contact_max, rows)
     test.assertIs(solver._contact_pool, pipeline._contact_pool)
     test.assertEqual(solver.contact_slot.shape, (rows,))
@@ -757,6 +784,125 @@ def test_bound_launch_follows_growth_past_mapped_pages(test, device):
     test.assertGreater(pool.mapped_bytes(), first_mapping, "growth mapped pages past the first ones")
     test.assertGreaterEqual(rows.rows, 3_000_000)
     np.testing.assert_array_equal(pool._update_status.numpy()[:1], [0])
+
+
+def test_trim_releases_pages_while_a_bound_graph_replays(test, device):
+    """Map big, trim while a captured graph replays, then grow past the trimmed rows: never recapture.
+
+    A pool planned for 4M contacts maps them up front. Contact-free replays trim nothing: the demand has not been
+    observed. Then each replay records a steady demand; once the high-water mark stayed within TRIM_BAND for
+    TRIM_AFTER_PASSES recorded passes, the service lowers the ready rows in stream order and a later service unmaps
+    the pages past them. Throughout, every replay writes exactly its counted rows and flags nothing. A demand past
+    the trimmed rows' growth threshold then grows them again.
+    """
+    pool = ContactPool(device=device)
+    target = type("Target", (), {})()
+    rows = pool.rows((ContactField("value", wp.int32, -1),), on_rows=lambda rows: rows.publish(target))
+    if not pool.bindable:
+        test.skipTest("only CUDA virtual memory trims")
+    pool.plan_first_mapping(4_000_000)
+    test.assertGreaterEqual(pool.ready, 4_000_000)
+    first = pool.mapped_bytes()
+    demand, count = wp.zeros(1, dtype=wp.int32, device=device), wp.zeros(1, dtype=wp.int32, device=device)
+    status = wp.zeros(1, dtype=wp.int32, device=device)
+    with wp.ScopedCapture(device=device) as capture:
+        wp.copy(count, demand)
+        pool.record_demand(count, pool.ready_rows, status)
+        pool.begin_updates()
+        pool.launch(_write_counted_rows, pool.launch_rows(), inputs=[count, 7, target.value], extent=count)
+    ready, mapped = [], []
+    with mock.patch.object(contact_pool, "TRIM_AFTER_PASSES", 4):
+        for size in [0] * 6 + [100_000] * 8 + [400_000] * 2 + [900_000] * 2:
+            demand.fill_(size)
+            target.value.fill_(-1)
+            wp.capture_launch(capture.graph)
+            # Reading the rows joins the replay; the trim itself joins nothing.
+            values = target.value.numpy()
+            np.testing.assert_array_equal(values[:size], 7 + np.arange(size, dtype=np.int32))
+            test.assertTrue(np.all(values[size:] == -1))
+            test.assertFalse(pool.service(), "a bound graph needs no recapture")
+            ready.append(pool.ready)
+            mapped.append(pool.mapped_bytes())
+    test.assertEqual(pool.trim_count, 1)
+    test.assertEqual(ready[:6], [ready[0]] * 6, "no trim before the first contact")
+    trimmed = min(ready)
+    test.assertGreaterEqual(trimmed, contact_pool.HEADROOM * 100_000, "a trim keeps HEADROOM rows per contact")
+    test.assertLess(trimmed, 4_000_000)
+    test.assertLess(min(mapped), first, "the trim returned pages")
+    test.assertEqual(ready.index(trimmed), 10, "the service after TRIM_AFTER_PASSES steady passes trims")
+    test.assertGreater(mapped[10], mapped[11], "the next service unmaps, once the replays before completed")
+    test.assertGreaterEqual(rows.rows, contact_pool.HEADROOM * 900_000, "growth after the trim")
+    test.assertEqual(int(status.numpy()[0]), 0, "no replay dropped a contact")
+    np.testing.assert_array_equal(pool._update_status.numpy()[:1], [0])
+
+
+def test_trim_and_growth_follow_a_feather_pgs_graph(test, device):
+    """Capture collide and FeatherPGS once with the model's estimate mapped; trim it, then grow past it while it replays.
+
+    Half the boxes start in the air: once the demand settled, the service trims the first mapping (the model's
+    estimate) to HEADROOM rows per contact while the graph keeps replaying. Then every box is put on the ground: the
+    demand doubles within the trimmed rows, the service grows them, and no replay drops a contact or needs a recapture.
+    """
+    worlds, boxes = 12288, 6
+    model = _build_resting_boxes(device, worlds, boxes)
+    solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=8)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    pool = pipeline._contact_pool
+    if not pool.bindable:
+        test.skipTest("only CUDA virtual memory trims")
+    test.assertGreaterEqual(contacts.rigid_contact_max, _estimate_rigid_contact_max(model), "the estimate, mapped")
+    state_0, state_1, control = model.state(), model.state(), model.control()
+
+    def simulate():
+        for source, target in ((state_0, state_1), (state_1, state_0)):
+            pipeline.collide(source, contacts)
+            solver.step(source, target, control, contacts, 1.0 / 120.0)
+
+    resting = state_0.joint_q.numpy()
+    lifted = resting.reshape(worlds, boxes, 7).copy()
+    lifted[:, 1::2, 2] += 50.0
+
+    def place(joint_q):
+        state_0.joint_q.assign(joint_q.reshape(-1))
+        state_0.joint_qd.zero_()
+        newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+
+    place(lifted)
+    simulate()  # load the modules outside capture
+    place(lifted)
+    wp.synchronize_device(device)
+    with wp.ScopedCapture(device=device) as capture:
+        solver.seed_double_buffer_events()
+        simulate()
+    first = pool.mapped_bytes()
+    counts, recaptures, overflowed, trimmed_bytes = [], 0, [], None
+    with mock.patch.object(contact_pool, "TRIM_AFTER_PASSES", 6):
+        for frame in range(40):
+            if frame == 20:
+                test.assertEqual(pool.trim_count, 1, "trimmed once the demand settled")
+                trimmed_bytes, trimmed_rows, growths = pool.mapped_bytes(), pool.ready, pool.growth_count
+                place(resting)
+            wp.capture_launch(capture.graph)
+            wp.synchronize_device(device)
+            counts.append(int(contacts.rigid_contact_count.numpy()[0]))
+            if pipeline.narrow_phase.buffer_capacity_status(clear=True)["contacts"]:
+                overflowed.append(frame)
+            recaptures += int(pipeline.service_capacity())
+    demand = 4 * worlds * boxes
+    test.assertEqual(overflowed, [], "no replay dropped a contact")
+    test.assertEqual(recaptures, 0)
+    test.assertEqual(counts[19], demand // 2)
+    test.assertEqual(counts[-1], demand)
+    test.assertLess(trimmed_bytes, first, "the trim returned pages of the first mapping")
+    test.assertGreaterEqual(trimmed_rows, contact_pool.HEADROOM * demand // 2)
+    test.assertGreater(demand, contact_pool.GROW_THRESHOLD * trimmed_rows, "the doubled demand grows the rows")
+    test.assertGreater(pool.growth_count, growths, "growth after the trim")
+    test.assertGreaterEqual(contacts.rigid_contact_max, contact_pool.HEADROOM * demand)
+    solver.check_constraint_capacity()
+    body_q = state_0.body_q.numpy()
+    test.assertTrue(np.all(np.isfinite(body_q)))
+    np.testing.assert_allclose(body_q[:, 2], 0.1, atol=2.0e-3, err_msg="every box rests on the ground")
 
 
 def _build_resting_boxes(device, worlds, boxes):
@@ -1320,8 +1466,8 @@ for name, function, check_output in (
     ("test_service_measures_a_state_before_capture", test_service_measures_a_state_before_capture, True),
     ("test_example_runner_measures_and_recaptures", test_example_runner_measures_and_recaptures, True),
     (
-        "test_measurement_keeps_the_floor_or_sizes_to_the_demand",
-        test_measurement_keeps_the_floor_or_sizes_to_the_demand,
+        "test_first_mapping_holds_the_demand_from_the_first_replay",
+        test_first_mapping_holds_the_demand_from_the_first_replay,
         True,
     ),
     ("test_pipelines_of_a_model_share_its_pool", test_pipelines_of_a_model_share_its_pool, True),
@@ -1350,6 +1496,8 @@ for name, function in (
     ("test_reservation_holds_the_device_bound", test_reservation_holds_the_device_bound),
     ("test_growth_past_free_memory_raises_before_changing", test_growth_past_free_memory_raises_before_changing),
     ("test_bound_launch_follows_growth_past_mapped_pages", test_bound_launch_follows_growth_past_mapped_pages),
+    ("test_trim_releases_pages_while_a_bound_graph_replays", test_trim_releases_pages_while_a_bound_graph_replays),
+    ("test_trim_and_growth_follow_a_feather_pgs_graph", test_trim_and_growth_follow_a_feather_pgs_graph),
     ("test_bound_graph_follows_growth_without_recapture", test_bound_graph_follows_growth_without_recapture),
     ("test_sorted_matched_graph_follows_growth", test_sorted_matched_graph_follows_growth),
     ("test_debug_clear_follows_growth", test_debug_clear_follows_growth),

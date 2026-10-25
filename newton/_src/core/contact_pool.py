@@ -9,14 +9,21 @@ reduction buffers, and a solver's per-contact scratch. :class:`ContactPool`
 holds them at one *ready* row count. Every rigid contact buffer of a model
 shares the model's pool (:func:`model_contact_pool`), so a pipeline and the
 solvers that consume its contacts grow together from the moment they exist.
-A pool starts at a floor (:data:`MIN_READY_ROWS`), or in CUDA virtual memory
-at every row its first pages hold once its owner settles it
-(:meth:`ContactPool.settle`), and grows from measured demand to
-:data:`HEADROOM` rows per contact. There is no configured contact
-budget: the only limit, the pool's *bound*, is the most rows the platform
-could ever back, the device memory divided by the bytes one row costs in the
-pool's fields, at most the rows every field's int32 Warp indices reach
-(:func:`device_row_limit`, :meth:`ContactField.row_limit`).
+
+Sizing: map big, then trim. The collision pipeline plans a *first mapping*
+(:meth:`ContactPool.plan_first_mapping`): rows for the model's shape-pair
+contact estimate, at most :data:`FIRST_MAPPING_SHARE` of the device memory
+free when the pool was created across all its fields, so the first replays
+drop nothing. Once the demand has been observed (the high-water mark stayed
+within :data:`TRIM_BAND` for :data:`TRIM_AFTER_PASSES` collision passes), :meth:`ContactPool.service`
+trims the pool to :data:`HEADROOM` rows per contact of the largest demand ever
+recorded, never below :data:`MIN_READY_ROWS`. Past the mapped rows the pool
+still grows from measured demand, without a recapture; a replay drops
+contacts (and flags it) only when the demand outruns that growth. No configured
+contact budget sizes anything: the only limit, the pool's *bound*, is the most
+rows the platform could ever back, the device memory divided by the bytes one
+row costs in the pool's fields, at most the rows every field's int32 Warp
+indices reach (:func:`device_row_limit`, :meth:`ContactField.row_limit`).
 
 Storage:
 
@@ -29,7 +36,10 @@ Storage:
   device too (:attr:`ContactPool.ready_rows`), in stream order after the new
   rows are initialized: rows past the old ones served in-flight replays as
   scratch (second halves, extra rows), so no replay launched before a growth
-  may see the new rows.
+  may see the new rows. A trim works the other way round, also while graphs
+  replay: it lowers the ready rows in stream order first, so no later replay
+  addresses the pages past them, records an event, and unmaps those pages
+  once the event completed (a later service), joining no stream.
 * On the CPU, on CUDA without ``gpu_components`` (logged once), for fields with
   gradients and for rows created during a graph capture, rows are ordinary
   arrays of the ready rows that growth reallocates, copying their prefix. The
@@ -54,11 +64,11 @@ records an updater after each pass's narrow phase
 (:meth:`ContactPool.begin_updates`), so the pass's consumers, and a solver
 that steps its contacts, follow the count it produced; a launch in a capture
 without an updater records one first. Such graphs need no recapture when the
-pool grows: :meth:`ContactPool.service`, outside capture, reads the pinned
-high-water mark without synchronizing, maps more rows when it passes
+pool grows or trims: :meth:`ContactPool.service`, outside capture, reads the
+pinned high-water mark without synchronizing, maps more rows when it passes
 :data:`GROW_THRESHOLD` of the ready rows and publishes them for the next
-replay. The replay in which demand first passes the ready rows drops the
-excess, and the capacity status flags it.
+replay, or trims once it settled. The replay in which demand first passes
+the ready rows drops the excess, and the capacity status flags it.
 
 A capture is *unbound* when something in it sized work by the host's row count
 instead: an unconverted consumer reading
@@ -90,13 +100,50 @@ import warp as wp
 logger = logging.getLogger(__name__)
 
 MIN_READY_ROWS = 4096
-"""Ready rows of a pool before any demand is measured: a floor, not a guess.
+"""The fewest ready rows a pool holds: a pool no pipeline planned starts here, and a trim stops here.
 
 On the 21-task Isaac Lab suite (16,384 worlds) a floor of one 2 MiB granule's
 rows (131,072) maps no more memory with CUDA virtual memory but slows the
 contact-free tasks through passes that follow the rows (cartpole +6.9% under
 patch friction on the GB300), so the floor stays a few thousand rows.
 """
+
+FIRST_MAPPING_SHARE = 0.25
+"""Share of the device memory free at a pool's creation that its first mapping may take, across all its fields.
+
+The first mapping holds rows for the model's shape-pair contact estimate
+(:meth:`ContactPool.plan_first_mapping`) unless that would map more than this
+share; a field created later lowers the rows it may hold. Chosen on the 21-task
+Isaac Lab suite (16,384 worlds, RTX PRO 6000, one task at a time) and the
+hardware scene: the estimates exceed the demand 100-250 times where they are
+large (keyboard-so101 127M rows for 0.52M contacts, hardware 87M for 1.3M), so
+the share only caps those, and a quarter still holds 20 times their demand; at
+half, keyboard-so101 under patch friction left 18 GB free after the environment
+was created (77 GB start-up peak), little for a training run's own buffers
+before the trim.
+"""
+
+TRIM_AFTER_PASSES = 200
+"""Collision passes the recorded high-water mark must stay within :data:`TRIM_BAND` before :meth:`ContactPool.service` trims.
+
+Counted on the device, as the passes complete: the host's service runs ahead
+of the GPU, so service calls would count passes not run yet; no trim happens
+before the first contact. Chosen on the demand of the 21-task Isaac Lab suite
+(both friction laws) and of the hardware scene (128 worlds) recorded per pass:
+the steep start-up rise ends within 80 passes everywhere (hardware's 256 parts
+land from pass 13 to 83, 0 to 1.2M contacts; legged robots touch down by pass
+40), after which the mark creeps by at most a few percent per 200 passes; the
+window then trims every task with contacts within its first 900 passes (kuka
+after 200, hardware after 270, anymald's creep after 860), and no recorded
+demand later passed 1.17 times the mark it trimmed at (the rows keep 2.5 times).
+"""
+
+TRIM_BAND = 0.1
+"""Growth of the high-water mark the trim's window tolerates: a mark past ``1 + TRIM_BAND`` times the one the
+window started from starts a new window.
+
+Without it a mark that creeps (anymald's from 54K to 170K contacts over 1,600 passes, hardware's by 0.1% per
+frame after its parts landed) never holds still, and those tasks would keep their first mapping."""
 
 HEADROOM = 2.5
 """Ready rows per contact of a measured demand.
@@ -105,7 +152,8 @@ A measured demand (a state measured before capture, a collision pass outside
 capture that filled the rows, or a graph replay's high-water mark past
 :data:`GROW_THRESHOLD` of the rows) sizes the pool to this many rows per
 contact, so the demand may rise by ``HEADROOM * GROW_THRESHOLD`` (1.5) before
-the pool grows again. Chosen on the 21-task suite's per-step demand (both
+the pool grows again; a trim keeps this many rows per contact of the largest
+demand ever recorded. Chosen on the 21-task suite's per-step demand (both
 friction laws): measured after 20 eager steps, no task overflowed under graph
 replay, 7 tasks grew 12 times in 400 environment steps of random actions as
 their demand kept rising (anymald from 54,386 to 170,539 contacts), and the
@@ -242,6 +290,7 @@ def _record_demand(
     count: wp.array[wp.int32],
     ready_rows: wp.array[wp.int32],
     high_water: wp.array[wp.int32],
+    passes: wp.array[wp.int32],
     mirror: wp.array[wp.int32],
     rows_used: wp.array[wp.int32],
     status: wp.array[wp.int32],
@@ -250,6 +299,7 @@ def _record_demand(
     if high_water.shape[0] > 0:
         mirror[0] = wp.max(wp.atomic_max(high_water, 0, demand), demand)
         mirror[1] = demand
+        mirror[2] = wp.atomic_add(passes, 0, 1) + 1
     rows = ready_rows[0]
     held = wp.min(demand, rows)
     if rows_used.shape[0] > 0:
@@ -402,8 +452,8 @@ class ContactRows:
     """Per-contact device fields of one owner, whose views hold the same number of contact rows.
 
     Create through :meth:`ContactPool.rows`. ``on_rows(contact_rows)`` runs
-    after the views are created and after every growth; owners assign the
-    views there (:meth:`publish`) and refresh values derived from
+    after the views are created and after every growth or trim; owners assign
+    the views there (:meth:`publish`) and refresh values derived from
     :attr:`rows`. A bound method is held weakly.
 
     :attr:`views` hold the ready rows and are safe to read on the host.
@@ -417,7 +467,7 @@ class ContactRows:
         reserve: The most contact rows the storage may hold: in CUDA virtual
             memory, the addresses each field reserves.
         device: The device of the fields.
-        on_rows: Called with the rows after creation and every growth.
+        on_rows: Called with the rows after creation and every growth or trim.
     """
 
     def __init__(self, fields, *, rows: int, reserve: int, device, on_rows=None):
@@ -541,6 +591,37 @@ class ContactRows:
             *((storage.ready_rows - members[0].extra) // members[0].per_contact for storage, members in self._storages),
         )
 
+    def covered_at(self, rows: int, granule: int) -> int:
+        """Return the contact rows every field holds once its pages cover ``rows`` rows in whole granules."""
+        if self._mode != "virtual":
+            return rows
+        covered = self.reserve
+        for field in self.fields:
+            size = wp.types.type_size_in_bytes(field.dtype)
+            length = _round_up(field.length(rows) * size, granule) // size
+            covered = min(covered, (length - field.extra) // field.per_contact)
+        return covered
+
+    def _withdraw(self, rows):
+        """Shrink the views to ``rows`` rows and withdraw the storage's readiness to them, in stream order.
+
+        Virtual rows only. The pages past them stay mapped for the replays already
+        submitted; :meth:`_unmap` returns them once those completed.
+        """
+        fields_ops = self._vm[1]
+        with wp.ScopedDevice(self.device):
+            for storage, members in self._storages:
+                field = members[0]
+                fields_ops.withdraw(storage, field.per_contact * rows + field.extra)
+        self._publish_rows(rows)
+
+    def _unmap(self, rows):
+        """Unmap the pages past ``rows`` rows that :meth:`_withdraw` left mapped, in a joined maintenance scope."""
+        fields_ops = self._vm[1]
+        for storage, members in self._storages:
+            field = members[0]
+            fields_ops.resize_backing(storage, field.per_contact * rows + field.extra, protected_count_host=0)
+
     def _map(self, rows, fields_ops):
         """Map ``rows`` rows of every virtual field: an append that joins no reader.
 
@@ -552,11 +633,14 @@ class ContactRows:
             fields_ops.resize_backing(storage, max(storage.ready_rows, field.per_contact * rows + field.extra))
 
     def _publish_rows(self, rows):
-        """Rebuild the views at ``rows`` rows after the storage holds them, then notify the owner."""
+        """Rebuild the views at ``rows`` rows after the storage holds them, then notify the owner.
+
+        Rows past the kept contact rows (new rows, second halves, extra rows) take their fill.
+        """
         previous = self.rows
         self.rows = rows
         if self._mode == "virtual":
-            self._bind_virtual_views(previous)
+            self._bind_virtual_views(min(previous, rows))
         else:
             for field in self.fields:
                 old = self.views[field.name]
@@ -646,6 +730,14 @@ class ContactPool:
         self.ready = MIN_READY_ROWS if rows is None else max(int(rows), 0)
         # Queried once: the bound is recomputed when members are added, possibly during capture.
         self._device_memory = int(self.device.total_memory) if self.device.is_cuda else 0
+        # The free memory the first mapping's share applies to: queried when the pool is created.
+        self.free_memory_at_creation = (
+            int(self.device.free_memory) if self.device.is_cuda and not capturing(self.device) else 0
+        )
+        """Device memory free when the pool was created [bytes]; 0 on the CPU."""
+        # The model's contact estimate a pipeline planned (plan_first_mapping), while it sizes the rows.
+        self._estimate: int | None = None
+        self._first_mapping = False
         self._members: list[weakref.ReferenceType] = []
         # The bound of the members so far. It never rises: graphs captured at it keep covering the rows.
         self._bound = INDEX_LIMIT
@@ -656,6 +748,7 @@ class ContactPool:
         # created during a capture (for a buffer created lazily in it) records none: it grows by
         # reservations and by following its leader.
         self._high_water = None
+        self._passes = None
         self._high_water_host = None
         self.rows_used = None
         """The most contacts any recorded pass held, at most the ready rows then (int32, shape 1, on the device):
@@ -664,21 +757,28 @@ class ContactPool:
             self.ready_rows = wp.full(1, self.ready, dtype=wp.int32, device=self.device)
             self.rows_used = wp.zeros(1, dtype=wp.int32, device=self.device)
             self._high_water = wp.zeros(1, dtype=wp.int32, device=self.device)
-            # [high-water mark, the last pass's demand]
-            self._high_water_host = wp.zeros(2, dtype=wp.int32, device=self.device)
+            self._passes = wp.zeros(1, dtype=wp.int32, device=self.device)
+            # [high-water mark, the last pass's demand, passes recorded]
+            self._high_water_host = wp.zeros(3, dtype=wp.int32, device=self.device)
             if self.device.is_cuda:
                 _RETIRED_HOST.clear()
-                self._high_water_host = wp.zeros(2, dtype=wp.int32, device="cpu", pinned=True)
+                self._high_water_host = wp.zeros(3, dtype=wp.int32, device="cpu", pinned=True)
                 weakref.finalize(self, _RETIRED_HOST.append, self._high_water_host).atexit = False
         # The record kernel writes the mark straight into the host copy, which pinned memory maps into the
         # device's address space: a copy node per collision pass costs a contact-free task 5-8% of its step.
         self._high_water_mirror = self._high_water_host
         if self._high_water_host is not None and self._high_water_host.device != self.device:
             self._high_water_mirror = wp.array(
-                ptr=self._high_water_host.ptr, dtype=wp.int32, shape=(2,), device=self.device
+                ptr=self._high_water_host.ptr, dtype=wp.int32, shape=(3,), device=self.device
             )
         self.growth_count = 0
         """Growths so far."""
+        self.trim_count = 0
+        """Trims completed so far."""
+        # The high-water mark the trim watches, and the recorded passes when it last rose.
+        self._still = (0, 0)
+        # A trim between its withdrawal and its unmap: (event after the withdrawal, rows, rows before, bytes before).
+        self._trim = None
         self._reserved = 0
         # Graph binding: the updater recorded last, by capture, and the captures that sized work by the host's rows.
         self._graph_ops = None
@@ -703,6 +803,11 @@ class ContactPool:
                 logger.info("Rigid contact launches are not bound to graph updates: %s", error)
             else:
                 self._graph_ops = (graph_ops, vm[4])
+
+    @property
+    def estimate(self) -> int | None:
+        """The contact estimate a pipeline planned the first mapping for (:meth:`plan_first_mapping`), or ``None``."""
+        return self._estimate
 
     @property
     def bound(self) -> int:
@@ -740,12 +845,16 @@ class ContactPool:
         """Create per-contact fields that follow this pool's ready rows (see :class:`ContactRows`).
 
         Their bytes per row lower the pool's bound; their storage reserves the new bound.
+        While the pool holds its first mapping, they also lower the rows it may hold
+        (:meth:`plan_first_mapping`): the other fields shrink first.
 
         Raises:
             MemoryError: If the device cannot back the pool's ready rows of every field.
         """
         fields = tuple(fields)
         bound = self._limit(fields)
+        if self._first_mapping and not capturing(self.device):
+            self._size_first_mapping(sum(field.row_bytes for field in fields), bound)
         if self.ready > bound:
             row_bytes = self.row_bytes + sum(field.row_bytes for field in fields)
             raise MemoryError(
@@ -756,6 +865,61 @@ class ContactPool:
         self._members.append(weakref.ref(rows))
         self._bound = bound
         return rows
+
+    def plan_first_mapping(self, estimate: int) -> None:
+        """Hold rows for ``estimate`` contacts from now on, outside capture: the model's shape-pair contact estimate.
+
+        A collision pipeline plans this when it is created, so the first graph
+        replays find the rows mapped. The rows are at least :data:`MIN_READY_ROWS`
+        and, on CUDA, cost at most :data:`FIRST_MAPPING_SHARE` of the device memory
+        free when the pool was created, in every field of the pool: a field created
+        later lowers them (:meth:`rows`). They stay until :meth:`service` trims the
+        pool to the measured demand. A pool plans once.
+
+        Raises:
+            MemoryError: If the device cannot back the rows.
+        """
+        if self._estimate is not None or capturing(self.device):
+            return
+        self._estimate = max(int(estimate), 0)
+        self._first_mapping = True
+        self._size_first_mapping(0, self.bound)
+
+    def _first_rows(self, row_bytes: int, bound: int) -> int:
+        """Return the rows of the first mapping for ``row_bytes`` bytes per row in all fields."""
+        rows = max(MIN_READY_ROWS, self._estimate)
+        if self.device.is_cuda and row_bytes > 0:
+            rows = min(rows, max(MIN_READY_ROWS, int(FIRST_MAPPING_SHARE * self.free_memory_at_creation) // row_bytes))
+        return min(rows, bound)
+
+    def _size_first_mapping(self, added_row_bytes: int, bound: int) -> None:
+        """Hold the first mapping for the live fields and ``added_row_bytes`` more per row, outside capture.
+
+        Growth maps rows; a field that lowers them trims the others first, joining
+        the stream (members are created during setup, which joins it anyway). Never
+        below the rows a recorded demand or a reservation needs.
+        """
+        target = self._first_rows(self.row_bytes + added_row_bytes, bound)
+        target = max(target, self._kept_rows(self.high_water))
+        if target > self.ready:
+            previous = self.ready
+            self.grow(target)
+            logger.info(
+                "Rigid contact pool maps %d rows for the model's estimate of %d contacts (from %d; %d bytes per row, "
+                "%.1f MiB free at creation): %.1f MiB",
+                self.ready,
+                self._estimate,
+                previous,
+                self.row_bytes + added_row_bytes,
+                self.free_memory_at_creation / 2**20,
+                self.mapped_bytes() / 2**20,
+            )
+        elif target < self.ready and self._trimmable():
+            rows = self._trim_rows(target)
+            if rows < self.ready:
+                self._begin_trim(rows)
+                wp.synchronize_event(self._trim[0])
+                self._finish_trim()
 
     def settle(self) -> None:
         """Publish every row all live members hold, outside capture: CUDA virtual memory maps whole granules.
@@ -830,6 +994,8 @@ class ContactPool:
             if pool.ready >= rows:
                 continue
             members = pool._live_members()
+            # A trim not yet unmapped is dropped: growth publishes the withdrawn rows again.
+            pool._trim = None
             # Virtual rows hold every row their pages cover, often more than asked for.
             pool._publish_ready(_grow_rows(members, rows))
             pool.growth_count += 1
@@ -968,6 +1134,7 @@ class ContactPool:
                 count,
                 rows,
                 empty if self._high_water is None else self._high_water,
+                empty if self._high_water is None else self._passes,
                 empty if self._high_water is None else self._high_water_mirror,
                 empty if self.rows_used is None else self.rows_used,
                 empty if status is None else status,
@@ -981,8 +1148,13 @@ class ContactPool:
         """The most contacts any recorded collision pass counted, as last copied to the host (no synchronization)."""
         return 0 if self._high_water_host is None else int(self._high_water_host.numpy()[0])
 
+    @property
+    def recorded_passes(self) -> int:
+        """The collision passes recorded so far, as last copied to the host (no synchronization)."""
+        return 0 if self._high_water_host is None else int(self._high_water_host.numpy()[2])
+
     def service(self) -> bool:
-        """Grow from the recorded demand and reservations, outside capture, without synchronizing.
+        """Grow from the recorded demand and reservations, or trim to it, outside capture, without synchronizing.
 
         Reads the pinned high-water mark, which lags the device by the passes
         still in flight, and grows to :func:`grown_rows` or to a reservation made
@@ -990,31 +1162,119 @@ class ContactPool:
         their next replay. A high-water mark at or above the ready rows means a
         replay dropped contacts, which its capacity status flags; this warns.
 
+        Without a growth, once the mark has stayed within :data:`TRIM_BAND` of
+        where it stood :data:`TRIM_AFTER_PASSES` recorded passes earlier, it trims the rows to :data:`HEADROOM` rows per contact
+        of the mark, at least :data:`MIN_READY_ROWS`, a reservation and the rows
+        of any graph that sized work by the host's rows, in whole granules: it
+        lowers the ready rows in stream order and unmaps the pages past them in a
+        later call, once the replays submitted before have completed. Graphs keep
+        replaying meanwhile, and need no recapture. Only CUDA virtual memory trims.
+
         Returns:
             Whether graphs that captured the buffers must be recaptured (see :meth:`grow`).
         """
         if capturing(self.device):
             return False
+        self._finish_trim()
         self.settle()
-        if not self.growable:
-            return False
-        high_water = self.high_water
-        target = grown_rows(high_water, self.ready, self.bound)
-        if self._reserved > self.ready:
-            target = max(target, reserved_rows(self._reserved, self.bound))
-        if target <= self.ready:
-            return False
-        previous = self.ready
-        recapture = self._grow_logged(target, high_water)
-        if high_water >= previous:
-            warnings.warn(
-                f"Rigid contact demand {high_water} reached the {previous} ready rows in a graph replay, which "
-                f"dropped the contacts past them (its capacity status flags it); the buffers grew to {target} rows "
-                "for the next replay.",
-                RuntimeWarning,
-                stacklevel=3,
-            )
-        return recapture
+        if self.growable:
+            high_water = self.high_water
+            target = grown_rows(high_water, self.ready, self.bound)
+            if self._reserved > self.ready:
+                target = max(target, reserved_rows(self._reserved, self.bound))
+            if target > self.ready:
+                previous = self.ready
+                recapture = self._grow_logged(target, high_water)
+                if high_water >= previous:
+                    warnings.warn(
+                        f"Rigid contact demand {high_water} reached the {previous} ready rows in a graph replay, "
+                        f"which dropped the contacts past them (its capacity status flags it); the buffers grew to "
+                        f"{target} rows for the next replay.",
+                        RuntimeWarning,
+                        stacklevel=3,
+                    )
+                return recapture
+        self._consider_trim()
+        return False
+
+    # -- trim ----------------------------------------------------------------------------------------------------
+
+    def _kept_rows(self, high_water: int) -> int:
+        """Return the fewest rows a trim keeps: the demand's headroom, the floor, a reservation, unbound graphs."""
+        rows = max(MIN_READY_ROWS, _round_up(HEADROOM * max(int(high_water), 0), ROW_QUANTUM))
+        if self._reserved:
+            rows = max(rows, reserved_rows(self._reserved, self.bound))
+        return max(rows, *self._unbound_captures.values(), 0)
+
+    def _trimmable(self) -> bool:
+        """Whether the rows can trim now: virtual rows only, no trim pending, every graph's rows known."""
+        members = self._live_members()
+        return (
+            bool(members)
+            and all(member.virtual for member in members)
+            and self._trim is None
+            and not self._stale_on_growth
+            and not capturing(self.device)
+        )
+
+    def _trim_rows(self, rows: int) -> int:
+        """Return the ready rows of a trim to ``rows``: what the kept whole granules of every field cover."""
+        members = self._live_members()
+        owner, _, _ = _backing(self.device, *members[0]._vm[:2])
+        granule = int(owner.granularity_bytes)
+        return min(self.ready, *(member.covered_at(rows, granule) for member in members))
+
+    def _consider_trim(self) -> None:
+        """Trim once the high-water mark stayed within :data:`TRIM_BAND` for :data:`TRIM_AFTER_PASSES` recorded passes."""
+        if self._high_water_host is None or not self._trimmable():
+            return
+        mark = self._high_water_host.numpy()
+        high_water, passes = int(mark[0]), int(mark[2])
+        # The window opens at the first contact: before it, the demand has not been observed.
+        if high_water == 0 or high_water > (1.0 + TRIM_BAND) * self._still[0]:
+            self._still = (high_water, passes)
+            return
+        if passes - self._still[1] < TRIM_AFTER_PASSES:
+            return
+        rows = self._trim_rows(self._kept_rows(high_water))
+        if rows < self.ready:
+            self._begin_trim(rows)
+            self._first_mapping = False
+
+    def _begin_trim(self, rows: int) -> None:
+        """Lower the ready rows to ``rows`` in stream order and record the event after which their pages unmap."""
+        previous, mapped = self.ready, self.mapped_bytes()
+        for member in self._live_members():
+            member._withdraw(rows)
+        self._publish_ready(rows)
+        event = wp.Event(self.device)
+        wp.get_stream(self.device).record_event(event)
+        self._trim = (event, rows, previous, mapped)
+
+    def _finish_trim(self) -> None:
+        """Unmap the pages a trim withdrew once the replays submitted before it completed; return spare memory."""
+        if self._trim is None:
+            return
+        event, rows, previous, mapped = self._trim
+        if not event.is_complete:
+            return
+        members = self._live_members()
+        if members:
+            owner, backing_ops, _ = _backing(self.device, *members[0]._vm[:2])
+            with wp.ScopedDevice(self.device), backing_ops.maintenance(owner, events=(event.cuda_event,)):
+                for member in members:
+                    member._unmap(rows)
+                backing_ops.trim(owner)
+        self._trim = None
+        self.trim_count += 1
+        logger.info(
+            "Rigid contact pool trimmed from %d to %d rows (contact high-water mark %d): %.1f -> %.1f MiB",
+            previous,
+            rows,
+            self.high_water,
+            mapped / 2**20,
+            self.mapped_bytes() / 2**20,
+        )
 
     def _grow_logged(self, target: int, demand: int) -> bool:
         previous = self.ready

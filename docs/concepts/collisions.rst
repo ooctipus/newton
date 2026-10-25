@@ -1928,26 +1928,33 @@ storage is allocated explicitly.
 
 There is no rigid contact budget to configure. The rigid contact buffers of a
 model's pipelines, of their :meth:`~CollisionPipeline.contacts` and of the solvers
-that step the model share one set of rows, which grows from the measured contact
-count to 2.5 rows per contact, keeping their contents, up to what the device
-memory can back; a growth the device cannot back raises :class:`MemoryError`. On
-CUDA with the optional ``gpu_components`` package the rows are CUDA virtual memory:
-every per-contact field reserves addresses for as many rows as the device memory
-could hold and maps physical pages for the rows in use, starting with every row
-its first pages hold; growth maps more pages behind the same addresses without
-synchronizing the device. Without it, and on the CPU, the rows are ordinary arrays
-that start at 4096 rows and that growth reallocates. A ``collide`` outside graph
-capture grows the buffers before anything reads them, so it never drops a
-contact; a pass never counts more contacts than its buffers hold
-(``rigid_contact_count`` is clamped to them and the drop flagged). Writers that
-produce contacts of their own (such as MuJoCo's or Kamino's collision) declare how
-many they may write with :meth:`~Contacts.reserve_rigid_contacts`. Graph replays
-follow the growth: see :ref:`Graph capture <Contact graph capture>`.
+that step the model share one set of rows: map big, then trim. A pipeline maps
+rows for the model's shape-pair contact estimate up front (at most a quarter of the
+device memory free when the rows were created, across all their fields; at least
+4096 rows), so the first steps drop nothing. Once the measured contact count has
+settled (grown by less than 10% over 200 collision passes),
+:meth:`~CollisionPipeline.service_capacity` trims the rows to 2.5 per contact of the
+largest count ever measured, and beyond that the rows grow from
+the measured count, keeping their contents, up to what the device memory can back;
+a growth the device cannot back raises :class:`MemoryError`. On CUDA with the
+optional ``gpu_components`` package the rows are CUDA virtual memory: every
+per-contact field reserves addresses for as many rows as the device memory could
+hold and maps physical pages for the rows in use; growth maps more pages behind
+the same addresses and a trim unmaps them, both without synchronizing the device.
+Without it, and on the CPU, the rows are ordinary arrays that growth reallocates
+and that never trim. A ``collide`` outside graph capture grows the buffers before
+anything reads them, so it never drops a contact; a pass never counts more
+contacts than its buffers hold (``rigid_contact_count`` is clamped to them and the
+drop flagged). Writers that produce contacts of their own (such as MuJoCo's or
+Kamino's collision) declare how many they may write with
+:meth:`~Contacts.reserve_rigid_contacts`. Graph replays follow the growth and the
+trim: see :ref:`Graph capture <Contact graph capture>`.
 
 ``CollisionPipeline(rigid_contact_max=...)``, :attr:`CollisionPipeline.rigid_contact_max`,
 ``Model.rigid_contact_max`` and ``ModelBuilder.num_rigid_contacts_per_world`` are kept
-for compatibility with Newton main; contact buffers grow on demand and none of them
-sizes them (:class:`~solvers.SolverKamino` still sizes its fixed contact container by
+for compatibility with Newton main; none of them sizes the contact buffers, whose
+first mapping takes the shape-pair estimate even when they are set
+(:class:`~solvers.SolverKamino` still sizes its fixed contact container by
 ``Model.rigid_contact_max``).
 
 .. _Hydroelastic Contacts:
