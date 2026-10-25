@@ -518,6 +518,38 @@ def test_restitution_rows_stay_rigid(test: unittest.TestCase, device):
             test.assertAlmostEqual(ratio, 1.0, delta=0.05, msg=f"g={g}: rebound ratio {ratio:.3f}")
 
 
+def test_regularization_keeps_parallel_tiers_off(test: unittest.TestCase, device):
+    """Admit no parallel tier or keyed rows to a regularized solver, under either friction law, and record why.
+
+    The parallel tiers solve the unregularized contact law: their kernels take the row weights
+    but never apply them, so the worlds they own would drop ``pgs_contact_regularization``
+    while the serial sweeps apply it. Admission is decided at construction on every device;
+    only the matrix-free route, which needs CUDA, builds the tiers it admits.
+    """
+    with wp.ScopedDevice(device):
+        model = _build_scissor_model(device)
+        for beta, g in ((0.0, 0.0), (0.0, 0.02), (0.2, 0.02)):
+            with test.subTest(friction_anchor_beta=beta, g=g):
+                solver = newton.solvers.SolverFeatherPGS(
+                    model, friction_anchor_beta=beta, mf_gs_parallel_rows=32, pgs_contact_regularization=g
+                )
+                selected = solver.get_path_selection()
+                routes = selected["routes"]
+                parallel_rows = routes["friction"]["parallel_rows"]
+                regularized = g > 0.0
+                test.assertEqual(parallel_rows["admitted"], not regularized, parallel_rows["reason"])
+                test.assertEqual("regularization" in parallel_rows["reason"], regularized, parallel_rows["reason"])
+                if not regularized:
+                    continue
+                test.assertNotIn((routes["sweep"]["tiers"] or {}).get("family"), ("parallel", "keyed_parallel"))
+                test.assertEqual(selected["options"]["mf_gs_parallel_rows"]["applied"], 0)
+                keyed = routes["contact_rows"]["keyed_rows"]
+                test.assertFalse(keyed["enabled"])
+                test.assertIn("regularization", keyed["reason"])
+                # The patch law's record does not name the tiers among the owners it excludes.
+                test.assertNotIn("parallel matrix-free tiers", routes["friction"]["reason"])
+
+
 class TestFeatherPGSRegularization(unittest.TestCase):
     pass
 
@@ -599,6 +631,12 @@ add_function_test(
     "test_restitution_rows_stay_rigid",
     test_restitution_rows_stay_rigid,
     devices=get_selected_cuda_test_devices(),
+)
+add_function_test(
+    TestFeatherPGSRegularization,
+    "test_regularization_keeps_parallel_tiers_off",
+    test_regularization_keeps_parallel_tiers_off,
+    devices=["cpu"],
 )
 
 if __name__ == "__main__":

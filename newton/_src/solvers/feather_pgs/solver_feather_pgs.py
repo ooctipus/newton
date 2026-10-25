@@ -1655,7 +1655,9 @@ class SolverFeatherPGS(SolverBase):
                 tier's sweep budget follows ``mf_gs_parallel_sweeps``. The tiers accumulate joint velocity-limit rows
                 (``routes.sweep.tiers.velocity_limit_law``). The worlds they decline keep the serial sweep and its
                 ``velocity_limit_law``, ``"stateless"`` by default, so tier and serial worlds share one fixed point
-                under ``velocity_limit_law="accumulated"`` or without joint velocity limits.
+                under ``velocity_limit_law="accumulated"`` or without joint velocity limits. The tiers solve the
+                unregularized contact law, so regularized contacts (``pgs_contact_regularization``) keep the serial
+                kernels.
             mf_gs_parallel_sweeps (int, optional): Minimum sweep budget of each parallel tier
                 (``mf_gs_parallel_rows``). Jacobi sweeps need more passes than the serial sweep's Gauss-Seidel
                 iterations to reach its accuracy, the more so the more rows couple through one body, so every tier,
@@ -3061,6 +3063,8 @@ class SolverFeatherPGS(SolverBase):
         self._keyed_rows = None
         if self._sparse_mass_matrix_size is not None:
             self._keyed_rows_reason = "Native sparse factors own the contact rows."
+        elif self._regularization_enabled:
+            self._keyed_rows_reason = self._parallel_contact_paths_reason
         elif not self._parallel_contact_paths:
             self._keyed_rows_reason = (
                 "Keyed rows write the point and patch row laws; torsion and compliance keep ordinary rows."
@@ -12419,8 +12423,15 @@ class SolverFeatherPGS(SolverBase):
         share the serial sweep's whole fixed point depends on the joint velocity
         limits, and the worlds the tiers decline keep the serial sweep and its law
         (:meth:`_parallel_velocity_limit_agreement`). Torsion and compliance keep
-        ordinary rows.
+        ordinary rows. So does contact regularization, under either law: the tiers
+        solve the unregularized law, so the worlds they own would drop
+        ``pgs_contact_regularization`` while the serial sweeps apply it.
         """
+        if self._regularization_enabled:
+            return False, (
+                "Contact regularization keeps serial sweeps and ordinary rows: the parallel tiers, which keyed rows "
+                "feed, solve the unregularized law, and the serial sweeps apply pgs_contact_regularization."
+            )
         if self._point_contact_paths:
             return True, "Point friction: parallel tiers and keyed rows serve it."
         if not self._law_agnostic_contact_paths:
