@@ -246,14 +246,6 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
                 _allocate(arrays)
                 np.testing.assert_array_equal(arrays["capacity_status"].numpy(), expected)
 
-    def test_raw_contact_prefix_overflow(self):
-        """Report an incomplete contact prefix separately from row overflow."""
-        arrays = _allocator_arrays(640, count=2)
-        arrays["contact_count"].assign(np.array([3], dtype=np.int32))
-        _allocate(arrays)
-        np.testing.assert_array_equal(arrays["capacity_status"].numpy(), [0, 0, 0, 1])
-        np.testing.assert_array_equal(arrays["contact_slot"].numpy(), [-1, -1])
-
     def test_internal_row_overflow(self):
         """Report unclamped internal demand even without contact reservations."""
         status = wp.zeros(4, dtype=wp.int32, device="cpu")

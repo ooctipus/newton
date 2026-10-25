@@ -1211,11 +1211,11 @@ def _convert_active_contacts_kamino_to_newton(
     # Retrieve the contact index for this thread
     cid = wp.tid()
 
-    # Like Newton's collision writer, the output count keeps every active
-    # contact, while only the rows the output holds are written: a count past
-    # ``rigid_contact_max`` flags the dropped contacts.
+    # Like Newton's collision writer, only the rows the output holds are
+    # written and the count is clamped to them, so consumers read every row
+    # below it.
     if cid == 0:
-        newton_count[0] = model_active_contacts[0]
+        newton_count[0] = wp.min(model_active_contacts[0], newton_shape0.shape[0])
 
     # Determine the total number of contacts to convert, which is the
     # smaller of the number of active contacts and the output capacity.
@@ -1553,8 +1553,8 @@ def convert_contacts_kamino_to_newton(
       reserves rows for Kamino's capacity
       (:meth:`~newton.Contacts.reserve_rigid_contacts`), which grows them
       outside graph capture; during capture, contacts past its ready rows are
-      dropped while its ``rigid_contact_count`` keeps the active count, as
-      Newton's collision writer does.
+      dropped and its ``rigid_contact_count`` holds the rows kept, as Newton's
+      collision writer does.
     - ``clear_output=False``: the existing-contacts path. The geometric data
       already on ``contacts_out`` is preserved and only the per-contact
       reaction is converted into ``contacts_out.force``. This path requires

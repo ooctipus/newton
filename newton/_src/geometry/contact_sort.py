@@ -1,15 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Deterministic contact sorting via radix sort on per-contact keys.
+"""Deterministic contact sorting on per-contact keys.
 
 Provides the machinery to reorder contact arrays into a canonical,
 deterministic order after the narrow-phase collision pipeline has
 written contacts in GPU-scheduling-dependent order.
 
-The sort always operates over the full pre-allocated buffer (for CUDA
-graph capture compatibility).  Unused slots beyond ``contact_count``
-are filled with ``0x7FFFFFFFFFFFFFFF`` so they sort to the end.
+The sort orders the live contacts only (:mod:`~newton._src.core.live_sort`):
+a chunk sort in shared memory and pairwise merges whose launches follow
+the live count, published on the device. In a CUDA graph capture whose
+contact launches bind (:meth:`~newton._src.core.contact_pool.ContactPool.launch`),
+every replay sorts the contacts of that replay, so the capture follows
+the contact pool's growth.
 """
 
 from __future__ import annotations
@@ -17,10 +20,10 @@ from __future__ import annotations
 import warp as wp
 
 from ..core.contact_pool import ContactField, ContactPool
+from ..core.live_sort import EXTENT_SIZE, SORT_CHUNK, launch_live_sort, publish_live, sort_grid
 from ..core.types import Devicelike
 
-# Sentinel key for unused contact slots.  ``radix_sort_pairs`` treats
-# keys as signed int64, so ``0x7FFF…`` (max positive int64) sorts last.
+# Sentinel key for unused contact slots: the max positive int64 sorts last.
 SORT_KEY_SENTINEL = wp.constant(wp.int64(0x7FFFFFFFFFFFFFFF))
 
 # -----------------------------------------------------------------------
@@ -199,11 +202,9 @@ class ContactSorter:
     time so that the per-frame :meth:`sort_simple` / :meth:`sort_full` calls
     are allocation-free and fully CUDA-graph-capturable (no host synchronization).
 
-    The radix sort always runs over the full *capacity* buffer: the ready rows
-    of the contact pool the buffers grow with.  Slots beyond the active
-    ``contact_count`` are filled with a sentinel key (``0x7FFFFFFFFFFFFFFF``)
-    so they sort to the end and the gather kernels skip them via the
-    ``contact_count`` guard.
+    The buffers hold the ready rows of the contact pool they grow with. Each
+    sort publishes the live contacts on the device, at most those rows, and
+    sorts only them; every launch follows that count.
     """
 
     def __init__(
@@ -227,9 +228,9 @@ class ContactSorter:
             if pool is None:
                 pool = ContactPool(device=wp.get_device(), rows=capacity)
             fields = [
-                # radix_sort_pairs uses the second half as scratch, so hold 2 rows per contact.
-                ContactField("_sort_indices", wp.int32, per_contact=2),
-                ContactField("_sort_keys_copy", wp.int64, per_contact=2),
+                # The live sort merges through a second half and loads whole chunks past the first.
+                ContactField("_sort_indices", wp.int32, per_contact=2, extra=int(SORT_CHUNK)),
+                ContactField("_sort_keys_copy", wp.int64, SORT_KEY_SENTINEL, per_contact=2, extra=int(SORT_CHUNK)),
                 # Scratch buffers for the simple gather (NarrowPhase.launch path).
                 ContactField("_simple_pair_buf", wp.vec2i),
                 ContactField("_simple_position_buf", wp.vec3),
@@ -259,6 +260,9 @@ class ContactSorter:
                 self._full_damping_buf = wp.zeros(0, dtype=float)
                 self._full_friction_buf = wp.zeros(0, dtype=float)
             self._simple_match_index_buf = wp.zeros(1, dtype=wp.int32)
+            # The sort extent: the live contacts first (live_sort.publish_live).
+            self._extent = wp.zeros(EXTENT_SIZE, dtype=int)
+            self._pool = pool
             self._capacity = pool.ready
             self._rows = pool.rows(fields, on_rows=self._on_rows)
 
@@ -331,8 +335,6 @@ class ContactSorter:
                 permuted alongside the other contact fields during sorting.
             device: Device to launch on.
         """
-        n = self._capacity
-
         has_tangent = contact_tangent is not None and contact_tangent.shape[0] > 0
         has_match = match_index is not None and match_index.shape[0] > 0
 
@@ -352,14 +354,7 @@ class ContactSorter:
         data.has_tangent = 1 if has_tangent else 0
         data.has_match_index = 1 if has_match else 0
 
-        wp.launch(
-            _backup_simple_kernel,
-            dim=n,
-            inputs=[data, contact_count, sort_keys, self._sort_keys_copy, self._sort_indices],
-            device=device,
-        )
-        wp.utils.radix_sort_pairs(self._sort_keys_copy, self._sort_indices, n)
-        wp.launch(_gather_simple_kernel, dim=n, inputs=[data, self._sort_indices, contact_count], device=device)
+        self._sort(_backup_simple_kernel, _gather_simple_kernel, data, sort_keys, contact_count)
 
     def sort_full(
         self,
@@ -407,8 +402,6 @@ class ContactSorter:
                 permuted alongside the other contact fields during sorting.
             device: Device to launch on.
         """
-        n = self._capacity
-
         # Scratch provisioning and the current buffer schema are separate.
         # A reducer-enabled deterministic pipeline provisions material scratch
         # so a later external rich Contacts buffer is safe, but its ordinary
@@ -461,14 +454,35 @@ class ContactSorter:
         data.has_shape_props = 1 if has_props else 0
         data.has_match_index = 1 if has_match else 0
 
-        wp.launch(
-            _backup_full_kernel,
-            dim=n,
-            inputs=[data, contact_count, sort_keys, self._sort_keys_copy, self._sort_indices],
-            device=device,
+        self._sort(_backup_full_kernel, _gather_full_kernel, data, sort_keys, contact_count)
+
+    def _sort(self, backup, gather, data, sort_keys, contact_count):
+        """Back up the live contacts, sort their keys, and gather them in key order.
+
+        The live contacts are published first, at most the ready rows, and
+        every launch follows them; in a capture whose launches bind, each replay
+        sorts the contacts of that replay.
+        """
+        pool = self._pool
+        publish_live(pool, contact_count, self._extent)
+        live = self._extent[0:1]
+        rows = pool.launch_rows()
+        keys = self._rows.reserved["_sort_keys_copy"]
+        indices = self._rows.reserved["_sort_indices"]
+        pool.launch(backup, rows, inputs=[data, live, sort_keys, keys, indices], extent=live)
+        blocks, merges, merge_threads = sort_grid(pool.device, rows)
+        launch_live_sort(
+            pool,
+            keys,
+            indices,
+            self._extent,
+            self._capacity,
+            blocks=blocks,
+            merges=merges,
+            merge_threads=merge_threads,
+            slot_keys=False,
         )
-        wp.utils.radix_sort_pairs(self._sort_keys_copy, self._sort_indices, n)
-        wp.launch(_gather_full_kernel, dim=n, inputs=[data, self._sort_indices, contact_count], device=device)
+        pool.launch(gather, rows, inputs=[data, indices, live], extent=live)
 
     @property
     def sorted_keys_view(self) -> wp.array:

@@ -586,7 +586,7 @@ def produce_contacts(workers: int, data: ContactInput, packet: ContactPacketData
     stride = _stride_value()
     capacity = packet.jacobian.shape[1]
     width = primary + secondary
-    total = wp.min(data.count[0], data.point0.shape[0])
+    total = data.count[0]
     for contact in range(worker, total, workers):
         if data.path[contact] != 0 or data.slot[contact] < 0:
             continue
@@ -732,7 +732,7 @@ def materialize_fallback(
     worker, _logical_lane = wp.tid()
     lane = _lane()
     stride = _stride_value()
-    total = wp.min(data.count[0], data.point0.shape[0])
+    total = data.count[0]
     for contact in range(worker, total, workers):
         if data.path[contact] != 0 or data.slot[contact] < 0:
             continue
@@ -788,7 +788,7 @@ def produce_patch_contacts(
     stride = _stride_value()
     capacity = packet.jacobian.shape[1]
     width = primary + secondary
-    total = wp.min(data.count[0], data.point0.shape[0])
+    total = data.count[0]
     for contact in range(worker, total, workers):
         if data.path[contact] != 0 or data.slot[contact] < 0:
             continue
@@ -915,7 +915,7 @@ def materialize_patch_fallback(
     worker, _logical_lane = wp.tid()
     lane = _lane()
     stride = _stride_value()
-    total = wp.min(data.count[0], data.point0.shape[0])
+    total = data.count[0]
     for contact in range(worker, total, workers):
         if data.path[contact] != 0 or data.slot[contact] < 0:
             continue

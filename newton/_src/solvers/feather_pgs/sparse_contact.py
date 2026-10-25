@@ -522,7 +522,7 @@ def _get_sparse_contact_response_kernel(
         tid = wp.tid()
         lane = tid % lanes
         worker = tid // lanes
-        total_contacts = wp.min(contact_count[0], contact_point0.shape[0])
+        total_contacts = contact_count[0]
         for c in range(worker, total_contacts, total_num_workers):
             row_count = wp.min(contact_slots_needed[c], 3)
             if contact_path[c] != 0 or contact_slot[c] < 0 or row_count <= 0:

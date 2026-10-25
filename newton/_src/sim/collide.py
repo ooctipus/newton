@@ -183,9 +183,17 @@ def _iter_pair_blocks(pairs: wp.array[wp.vec2i] | np.ndarray) -> Iterator[np.nda
 
 @wp.struct
 class ContactWriterData:
-    """Contact writer data for collide write_contact function."""
+    """Contact writer data for collide write_contact function.
+
+    ``contact_max`` is the most rows the buffer's addresses span (its pool's
+    bound), which only stops the narrow phase's work early; ``contact_limit``
+    holds the rows writable now (its pool's ready rows, on the device), and the
+    writer drops every row past it. A writer without ``contact_limit`` (an empty
+    array) drops the rows past ``contact_max``.
+    """
 
     contact_max: int
+    contact_limit: wp.array[wp.int32]
     # Body information arrays (for transforming to body-local coordinates)
     body_q: wp.array[wp.transform]
     shape_body: wp.array[int]
@@ -226,7 +234,10 @@ def _write_contact_at_index(
     normal_a_to_b: wp.vec3,
 ):
     """Write a previously accepted contact at a reserved output index."""
-    if index >= writer_data.contact_max:
+    limit = writer_data.contact_max
+    if writer_data.contact_limit.shape[0] > 0:
+        limit = writer_data.contact_limit[0]
+    if index >= limit:
         return
 
     writer_data.out_shape0[index] = contact_data.shape_a
@@ -331,6 +342,14 @@ def write_contact_speculative(
         index = wp.atomic_add(writer_data.contact_count, 0, 1)
 
     _write_contact_at_index(contact_data, writer_data, index, point_a_world, point_b_world, normal)
+
+
+@wp.kernel(enable_backward=False)
+def _clear_match_index(count: wp.array[wp.int32], match_index: wp.array[wp.int32]):
+    """Mark every live contact unmatched, for a buffer whose producer does not match contacts."""
+    i = wp.tid()
+    if i < count[0]:
+        match_index[i] = -1
 
 
 @wp.kernel(enable_backward=False)
@@ -2077,6 +2096,8 @@ class CollisionPipeline:
         self._contact_pool = model_contact_pool(model, device)
         # The pool's generation the last service_capacity() reported.
         self._service_generation = self._contact_pool.generation
+        # The writers' row limit for a buffer whose pool was created during a capture (see _detect_rigid_contacts).
+        self._contact_limit = wp.zeros(1, dtype=wp.int32, device=device)
         # The narrow phase's capacity flags before a pass outside capture, restored if the pass reruns.
         self._capacity_status_before_pass = wp.zeros(1, dtype=wp.int32, device=device)
 
@@ -3634,67 +3655,66 @@ class CollisionPipeline:
         return self._rigid_contact_max
 
     def service_capacity(self, state: State | None = None, *, dt: float | None = None) -> bool:
-        """Size the rigid contact buffers from measured demand; return whether CUDA graphs must be recaptured.
+        """Grow the rigid contact buffers from measured demand; return whether CUDA graphs must be recaptured.
 
         The buffers of this pipeline, of its :meth:`contacts` and of the solvers
         that step its model (e.g. :class:`~newton.solvers.SolverFeatherPGS`)
-        start at a few thousand rows and never shrink. A graph replays fixed
-        buffer extents, so a loop that captures :meth:`collide` in a graph:
+        start at a few thousand rows and never shrink. Call this once per step
+        outside capture, e.g. right after launching the step's graph. Every
+        :meth:`collide` records its contact count in a sticky high-water mark,
+        written to pinned host memory also when replayed from a graph; this reads
+        it without synchronizing, so it lags the device by the steps still in
+        flight, and when it passes
+        :data:`~newton._src.core.contact_pool.GROW_THRESHOLD` of the rows the
+        buffers grow to :data:`~newton._src.core.contact_pool.HEADROOM` rows per
+        contact of it. On CUDA with ``gpu_components`` growth maps more memory
+        behind the buffers' fixed addresses without synchronizing the device,
+        and graphs whose contact launches follow the rows (this pipeline's and
+        FeatherPGS's) use the new rows from their next replay. The replay whose
+        contacts first outnumbered the rows dropped the excess and flagged its
+        capacity status; this warns.
 
-        * calls this with ``state``, the state the graph starts from, right
-          before capturing it: its rigid contacts are counted (into scratch
-          rows, writing no :class:`~newton.Contacts` and none of the pipeline's
-          state across passes: contact matching, reduction history, capacity
-          status), and the buffers grow to
-          :data:`~newton._src.core.contact_pool.HEADROOM` rows per contact of
-          the most contacts measured so far;
-        * calls this without ``state`` once per step outside capture, e.g. right
-          after launching the step's graph, and recaptures when it returns
-          ``True``. Every :meth:`collide` records its contact count in a sticky
-          high-water mark, copied to pinned host memory also when replayed from
-          a graph; this reads that copy without synchronizing, so it lags the
-          device by the steps still in flight. When the mark passes half the
-          rows, the buffers grow to the same headroom over it.
-
-        A graph captured without measuring its starting state starts with the
-        initial rows: if its first replays hold more contacts, they drop the
-        rows past them and flag the capacity status, and this grows the buffers
-        and warns. A :meth:`collide` outside graph capture grows the buffers
-        itself before anything reads them. Growth keeps the buffers' contents
-        and, with CUDA virtual memory, their addresses; it synchronizes the
-        device and logs the new rows and bytes. The buffers hold at most what
-        the device memory can back: a demand past it raises
-        :class:`MemoryError`. Rows that a writer reserved during capture
+        With ``state``, the state a graph starts from, the state's rigid
+        contacts are counted first (into scratch rows, writing no
+        :class:`~newton.Contacts` and none of the pipeline's state across passes:
+        contact matching, reduction history, capacity status) and the buffers
+        grow for them too. A :meth:`collide` outside graph capture grows the
+        buffers itself before anything reads them. The buffers hold at most what
+        the device memory can back: a demand past it raises :class:`MemoryError`.
+        Rows that a writer reserved during capture
         (:meth:`~newton.Contacts.reserve_rigid_contacts`) are grown here too.
 
         Args:
-            state: The state a graph is about to start from, to measure. Ignored
-                during graph capture.
+            state: A state to measure before a graph starts from it, or ``None``.
+                Ignored during graph capture.
             dt: The time step [s] of the collision passes the graph runs, when
                 speculative contacts are enabled; without it the state is
                 measured without speculative extension.
 
         Returns:
-            True when the buffers grew since the last call, here, by a
-            :meth:`collide` or by a reservation outside capture, and graphs that
-            use them must be recaptured.
+            True when the buffers grew since this pipeline's last call (here, in
+            a :meth:`collide` outside capture, or through another owner of the
+            model's pool) and a live graph sized work by their old rows: a
+            consumer that reads :attr:`newton.Contacts.rigid_contact_max` while
+            capturing (MuJoCo, XPBD, VBD and other solvers), or buffers without
+            CUDA virtual memory, whose growth reallocates. Such graphs must be
+            recaptured before their next replay.
 
         .. experimental::
         """
         pool = self._contact_pool
-        if not capturing(self.device):
-            if state is not None and pool.growable:
-                demand = self._measure_rigid_contacts(state, dt=dt)
-                pool.size(max(demand, pool.high_water))
-                logger.info(
-                    "Measured %d rigid contacts in a state; the contact buffers hold %d rows", demand, pool.ready
-                )
-            else:
-                pool.service()
+        if capturing(self.device):
+            return False
+        if state is not None and pool.growable:
+            demand = self._measure_rigid_contacts(state, dt=dt)
+            pool.size(max(demand, pool.high_water))
+            logger.info("Measured %d rigid contacts in a state; the contact buffers hold %d rows", demand, pool.ready)
+        pool.service()
+        # Each pipeline learns of a growth once, also of one another owner of the model's pool caused.
         generation = pool.generation
-        changed = generation != self._service_generation
+        grew = generation != self._service_generation
         self._service_generation = generation
-        return changed
+        return grew and pool.needs_recapture
 
     def _measure_rigid_contacts(self, state: State, *, dt: float | None) -> int:
         """Count the rigid contacts of ``state`` into scratch rows, recording them as demand, and return the count.
@@ -3762,6 +3782,8 @@ class CollisionPipeline:
             rigid_contact_pool=self._contact_pool,
         )
         contacts._contact_matching_mode = self.contact_matching
+        # The buffer's rows exist now: hold every row their pages cover.
+        self._contact_pool.settle()
         # Flag the buffer so solvers that only consume particle contacts can refuse it (see
         # Contacts._enable_rigid_soft_full_surface_contact); edge/face records appear only when this is set.
         contacts._enable_rigid_soft_full_surface_contact = self.enable_rigid_soft_full_surface_contact
@@ -4031,16 +4053,20 @@ class CollisionPipeline:
     def _detect_rigid_contacts(self, state: State, contacts: Contacts, *, dt: float | None) -> None:
         """Write and count the rigid contacts of ``state`` in ``contacts``; outside capture, grow until they fit.
 
-        Every rigid writer counts its contacts, also those past the rows, and the
-        count is recorded as the demand that grows the buffer's pool (this
-        pipeline's, for its own :meth:`contacts`). Outside graph capture the
-        exact count is one readback away: a pass that filled the rows grows them
-        and runs again before anything reads them, so no contact is dropped, and
-        its capacity flags do not outlive it. Graph replays rely on
-        :meth:`service_capacity` instead and flag their overflow.
+        Every rigid writer counts its contacts, also those past the rows, and
+        drops the rows past the ready rows it reads on the device. The count is
+        then recorded as the demand that grows the buffer's pool (this
+        pipeline's, for its own :meth:`contacts`) and clamped to the rows, with
+        the overflow flagged in the capacity status. Outside graph capture the
+        count is one synchronization away: a pass that filled the rows grows
+        them and runs again before anything reads them, so no contact is
+        dropped, and its capacity flags do not outlive it. In a capture, the
+        pass then records a device graph updater, so the launches that consume
+        its contacts follow the count on every replay; graph replays grow
+        through :meth:`service_capacity` and flag the replay that overflowed.
         """
         pool = contacts._rigid_contact_pool
-        grows = pool.growable and not capturing(self.device)
+        grows = pool.growable and pool.ready_rows is not None and not capturing(self.device)
         if grows:
             wp.copy(self._capacity_status_before_pass, self.narrow_phase._buffer_capacity_status)
         while True:
@@ -4048,16 +4074,23 @@ class CollisionPipeline:
             # (debug) also zeroes the rows, without a second generation bump.
             if contacts.clear_buffers:
                 contacts.clear(bump_generation=False)
-            self._launch_rigid_detection(state, contacts, dt=dt, verify_contacts=not grows)
-            pool.record_demand(contacts.rigid_contact_count)
-            if not (grows and pool.fit(int(contacts.rigid_contact_count.numpy()[0]))):
-                return
+            limit = pool.ready_rows
+            if limit is None:
+                # A pool created during a capture holds its rows until a recapture: publish them here.
+                limit = self._contact_limit
+                limit.fill_(contacts._rigid_contact_rows)
+            self._launch_rigid_detection(state, contacts, limit, dt=dt)
+            pool.record_demand(contacts.rigid_contact_count, limit, self.narrow_phase._buffer_capacity_status)
+            if not (grows and pool.fit()):
+                break
             wp.copy(self.narrow_phase._buffer_capacity_status, self._capacity_status_before_pass)
+        pool.begin_updates()
 
-    def _launch_rigid_detection(
-        self, state: State, contacts: Contacts, *, dt: float | None, verify_contacts: bool
-    ) -> None:
-        """Launch the broad and narrow phases, and the terrain law's writes, into ``contacts``' rigid rows."""
+    def _launch_rigid_detection(self, state: State, contacts: Contacts, limit: wp.array, *, dt: float | None) -> None:
+        """Launch the broad and narrow phases, and the terrain law's writes, into ``contacts``' rigid rows.
+
+        ``limit`` holds the rows the writers may fill, on the device.
+        """
         model = self.model
         if self._speculative_enabled:
             config = self.speculative_config
@@ -4216,7 +4249,8 @@ class CollisionPipeline:
 
         # Create ContactWriterData struct for custom contact writing
         writer_data = ContactWriterData()
-        writer_data.contact_max = contacts.rigid_contact_max
+        writer_data.contact_max = contacts._rigid_contact_pool.bound
+        writer_data.contact_limit = limit
         writer_data.body_q = state.body_q
         writer_data.shape_body = model.shape_body
         writer_data.shape_gap = model.shape_gap
@@ -4235,9 +4269,9 @@ class CollisionPipeline:
         writer_data.out_stiffness = contacts.rigid_contact_stiffness
         writer_data.out_damping = contacts.rigid_contact_damping
         writer_data.out_friction = contacts.rigid_contact_friction
-        if self.deterministic and contacts.rigid_contact_max != self._sort_key_array.shape[0]:
+        if self.deterministic and contacts._rigid_contact_rows != self._sort_key_array.shape[0]:
             raise ValueError(
-                f"Contacts buffer capacity ({contacts.rigid_contact_max}) does not match the "
+                f"Contacts buffer capacity ({contacts._rigid_contact_rows}) does not match the "
                 f"deterministic sort buffer size ({self._sort_key_array.shape[0]}). "
                 f"The sorter operates over fixed-capacity buffers for CUDA graph capture "
                 f"compatibility, so the sizes must match exactly. Use CollisionPipeline.contacts()."
@@ -4274,7 +4308,8 @@ class CollisionPipeline:
             mesh_edge_halves=model.mesh_edge_halves,
             shape_edge_range=model.shape_edge_range,
             writer_data=writer_data,
-            verify_contacts=verify_contacts,
+            # The demand record flags a pass whose contacts outnumbered the rows.
+            verify_contacts=False,
             hydroelastic_shape_sdf_data_prepared=self._hydro_shape_sdf_data_prepared,
             shape_linear_velocity=self._shape_linear_velocity,
             shape_angular_velocity=self._shape_angular_velocity,
@@ -4348,10 +4383,10 @@ class CollisionPipeline:
             # pipeline's ready rows; an external buffer with any other capacity
             # would let the narrow phase write more contacts than the reducer's
             # arrays can hold.
-            if contacts.rigid_contact_max != self._contact_pool.ready:
+            if contacts._rigid_contact_rows != self._contact_pool.ready:
                 raise ValueError(
                     f"body-pair contact reduction requires the Contacts buffer capacity "
-                    f"({contacts.rigid_contact_max}) to exactly match the pipeline's ready "
+                    f"({contacts._rigid_contact_rows}) to exactly match the pipeline's ready "
                     f"rigid contact rows ({self._contact_pool.ready}). Use CollisionPipeline.contacts()."
                 )
             if str(contacts.device) != str(self._body_pair_reducer._stats.device):
@@ -4436,6 +4471,7 @@ class CollisionPipeline:
                 record_tape=False,
             )
 
+        pool = contacts._rigid_contact_pool
         if self.deterministic and self._contact_sorter is not None:
             self._contact_sorter.sort_full(
                 self._sort_key_array,
@@ -4485,6 +4521,8 @@ class CollisionPipeline:
                 contacts,
                 sort_keys=self._contact_sorter.sorted_keys_view if self._contact_matcher is not None else None,
             )
+            # The reduction rewrote the count: later launches follow the reduced count.
+            pool.begin_updates()
 
         # Match and save the retained stream so all indices name solver contacts.
         # Matching now sees the final retained and sorted stream.
@@ -4511,7 +4549,12 @@ class CollisionPipeline:
         elif contacts.rigid_contact_match_index is not None:
             # A buffer may come from a matching pipeline. Its current producer
             # cannot validate that previous identity, including on graph replay.
-            contacts.rigid_contact_match_index.fill_(-1)
+            pool.launch(
+                _clear_match_index,
+                pool.launch_rows(),
+                inputs=[contacts.rigid_contact_count, contacts.rigid_contact_match_index],
+                extent=contacts.rigid_contact_count,
+            )
 
         # Sticky mode: overwrite matched rows with the saved previous-frame
         # contact geometry.  Must run after sort_full (so match_index points at

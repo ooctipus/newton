@@ -472,14 +472,6 @@ class TestFrictionPatchHistory(unittest.TestCase):
         wp.launch(_friction_residual_probe, dim=1, inputs=[residuals], device="cpu")
         np.testing.assert_allclose(residuals.numpy(), [[0, 0, 0, 0], [1.5, 1.5, 0, 1.5], [0, 0.2, 0.1, 0]], atol=1e-7)
 
-    def test_incomplete_frame_cannot_create_anchor_history(self):
-        """Reject an overflowing contact frame before selecting or carrying anchors."""
-        model, state, contacts, patches = _patch_fixture([[-0.1, 0, 0], [0.1, 0, 0]])
-        contacts.rigid_contact_count.assign([3])
-        patches.build(model, state, contacts)
-        self.assertEqual(np.count_nonzero(patches.current.valid.numpy()), 0)
-        self.assertEqual(np.count_nonzero(patches.view.weight.numpy()), 0)
-
     def test_reversed_contact_orientation_uses_same_patch(self):
         """Give a body pair one identity regardless of collision shape ordering."""
         model, state, contacts, patches = _patch_fixture([[-0.1, 0, 0], [0.1, 0, 0]])

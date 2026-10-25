@@ -12,6 +12,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.core.contact_pool import ContactPool
 from newton._src.solvers.feather_pgs import compact_contact as compact
 from newton._src.solvers.feather_pgs import kernels
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
@@ -349,6 +350,8 @@ def launch_solver(data, aux, *, anchors, beta=0.0):
         _friction_anchors_enabled=anchors,
         _friction_patches=SimpleNamespace(view=patch_view(aux.device) if anchors else FrictionPatches()),
         friction_anchor_beta=beta,
+        # Launches sized by contact rows go through the pool, eagerly here.
+        _contact_pool=ContactPool(device=aux.device, rows=16),
     )
 
 

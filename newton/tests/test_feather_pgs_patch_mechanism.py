@@ -4,7 +4,7 @@
 """Compare the persistent patch mechanism with its full-capacity reference.
 
 Random contact frames cover static and missing shapes, flipped pair orientation,
-several contacts per pair, empty tails and overflowing counts. The reference
+several contacts per pair, empty tails and frames past the arrays. The reference
 copies the patch kernels as of 98401301 (:mod:`feather_pgs_patch_reference`);
 pair keys compare through their decoded body and shape codes. A solver-level
 check covers the route tables and warm-start scales the solver passes to the
@@ -52,6 +52,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.core.live_sort import MAX_MERGES, SORT_CHUNK
 from newton._src.sim import contacts as contacts_module
 from newton._src.sim.contacts import note_contact_frame_write
 from newton._src.solvers.feather_pgs import environment_flags as fpgs_flags
@@ -233,7 +234,9 @@ class _Scene:
         """Write a random contact frame and return the live contact count.
 
         ``mode`` is ``"live"`` (the active pairs), ``"sparse"`` (a single pair),
-        ``"empty"`` (no contacts) or ``"overflow"`` (a count beyond the arrays).
+        ``"empty"`` (no contacts) or ``"overflow"`` (more contacts than the arrays
+        hold: as a collision pass does, the frame keeps the rows the arrays hold
+        and its count is clamped to them, so every slot below it is live).
         ``churn`` toggles a few pairs and footprint sizes first. The contact
         generation advances and the host notes the write, as in a collision pass.
         """
@@ -279,10 +282,8 @@ class _Scene:
             margin = np.concatenate((np.asarray(margin), np.zeros((self.capacity - n, 2))))
             self.contacts.rigid_contact_margin0.assign(margin[:, 0])
             self.contacts.rigid_contact_margin1.assign(margin[:, 1])
-        if mode == "overflow":
-            count = self.capacity + int(rng.integers(1, 6))
         self.contacts.rigid_contact_count.assign([count])
-        return count if count <= self.capacity else 0
+        return count
 
 
 def _pair(scene, capacity):
@@ -677,7 +678,8 @@ def _solved_state(scene, rng):
 
 
 # Random sequence events: "grow" raises the active pair count, "sparse" keeps one
-# pair, "empty" and "overflow" leave no live contact, "none" passes no contacts,
+# pair, "empty" leaves no live contact, "overflow" keeps the rows the arrays hold
+# of more contacts, "none" passes no contacts,
 # "noframe" passes contacts without capacity, "rebuild" builds twice before the
 # rows, "unstored" resets all worlds between an unstored sparse build and the
 # step, "gates" filters friction, "geometry" edits a shape, and "reset" and
@@ -1178,8 +1180,19 @@ def _fill_sort_case(patches, live, rng, codes):
     indices = np.concatenate((np.arange(n), rng.integers(0, n, size=n))).astype(np.int32)
     patches.current.keys.assign(keys)
     patches.current.indices.assign(indices)
-    patches.extent.assign([live, live])
+    patches.extent.assign(_patch_extent(live, live, patches.extent.shape[0]))
     return keys[:n]
+
+
+def _patch_extent(end, live, size):
+    """Return the patch extent a prepare publishes: the slots to visit, then the live sort's extent."""
+    extent = np.zeros(size, dtype=np.int32)
+    rounds = 0
+    while (int(SORT_CHUNK) << rounds) < live and rounds < int(MAX_MERGES):
+        rounds += 1
+    extent[:3] = end, live, -(-live // int(SORT_CHUNK))
+    extent[3 : 3 + rounds] = live
+    return extent
 
 
 def run_live_sort_cases(test, device, capacities, extra_counts=()):
@@ -1282,8 +1295,9 @@ _SHAPE = {"light": 6, "build": 8, "block": 32}
 _ODD_SHAPE = {"threads": 7, "build_threads": 5, "build_block_dim": 32, "merge_threads": 3, "sort_blocks": 1}
 
 # Collision frames of the launch-shape differential and the substeps that solve
-# each: "grow" activates more pairs, "sparse" keeps one pair, "empty" and
-# "overflow" leave no live contact, "unstored" first builds a sparse frame that
+# each: "grow" activates more pairs, "sparse" keeps one pair, "empty" leaves no
+# live contact, "overflow" keeps the rows the arrays hold of more contacts,
+# "unstored" first builds a sparse frame that
 # no store follows and resets every world, "store" stores the frame again
 # without finishing it, and "masked" resets some worlds after its substeps.
 _SHAPE_PLAN = (
@@ -1377,10 +1391,6 @@ class _TiledScene:
         base.frame(mode, churn)
         count = int(base.contacts.rigid_contact_count.numpy()[0])
         self.contacts.contact_generation.assign([base.generation])
-        if count > base.capacity:
-            # An overflowing count stays as far past the copies' capacity.
-            self.contacts.rigid_contact_count.assign([self.capacity + count - base.capacity])
-            return 0
         live = count * self.copies
         copy, contact = np.divmod(self.rng.permutation(live), max(count, 1))
         for name in self._FIELDS:
@@ -2285,7 +2295,7 @@ class TestPatchFrameModes(unittest.TestCase):
         )
         np.testing.assert_array_equal(patches.current.keys.numpy(), keys)
         np.testing.assert_array_equal(patches.current.indices.numpy(), indices)
-        np.testing.assert_array_equal(patches.extent.numpy(), [live, live])
+        np.testing.assert_array_equal(patches.extent.numpy()[:2], [live, live])
 
     def test_keep_mode_empties_a_frame_rewritten_since_its_record(self):
         """Leave a kept build without live contacts and latch the status when its frame is not the recorded one.
@@ -2320,7 +2330,7 @@ class TestPatchFrameModes(unittest.TestCase):
                     self.assertEqual(len(sorts), 1, "the unnoted rewrite is admitted as a reuse")
                 else:
                     _reused_build(patches, scene, contacts)
-                np.testing.assert_array_equal(patches.extent.numpy(), [live, 0])
+                np.testing.assert_array_equal(patches.extent.numpy()[:2], [live, 0])
                 np.testing.assert_array_equal(patches.frame_status.numpy(), [1])
                 self.assertEqual(int(patches.sorted_frame.numpy()[0]), -1, "the record is dropped")
                 np.testing.assert_array_equal(patches.current.keys.numpy()[: patches.capacity], SENTINEL)

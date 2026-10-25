@@ -520,26 +520,29 @@ def _throttle_render_fps(
 
 
 def _service_contact_capacity(example, state: newton.State | None = None, *, recapture: bool = False) -> bool:
-    """Size the example's rigid contact buffers from their demand and recapture its graph when they grew.
+    """Size the example's rigid contact buffers from their demand and recapture its graph when it must follow them.
 
-    A graph replays fixed buffer extents, and the buffers grow only outside
-    capture, so the runner does what every loop that replays
-    :meth:`newton.CollisionPipeline.collide` from a graph does (see
-    :meth:`~newton.CollisionPipeline.service_capacity`): before the first frame
-    it measures ``state``, the state the example's graph starts from, and
-    after each frame it grows from the recorded demand. Examples capture their
-    graph before the runner measures, and may allocate buffers in that first
-    capture that only its first replay makes valid; so before the first frame
-    the graph is recaptured only when its buffers cannot hold ``state``'s
-    contacts. Otherwise the recapture waits for the first frame to replay it.
+    The buffers grow only outside capture. A graph whose contact launches bind
+    follows them; one with a consumer that sized work by the rows of its
+    capture, or with buffers that growth reallocates, must be recaptured (see
+    :meth:`~newton.CollisionPipeline.service_capacity`). The runner does what
+    every loop that replays :meth:`newton.CollisionPipeline.collide` from a
+    graph does: before the first frame it measures ``state``, the state the
+    example's graph starts from, so the graph holds its contacts from its
+    first replay, and after each frame it grows the buffers from the recorded
+    demand. Examples capture their graph before the runner measures, and may
+    allocate buffers in that first capture that only its first replay makes
+    valid; so before the first frame a graph is recaptured only when its
+    buffers cannot hold ``state``'s contacts. Otherwise the recapture waits for
+    the first frame to replay it.
 
     Args:
         example: The example whose :class:`newton.CollisionPipeline` attributes to service.
         state: The state to measure before the first frame.
-        recapture: Recapture the graph even if the buffers did not grow now.
+        recapture: Recapture the graph even if no service asks for it now.
 
     Returns:
-        Whether the buffers grew but the graph was left to recapture after the first frame.
+        Whether a recapture was left for after the first frame.
     """
     grew = overflowed = False
     for pipeline in list(vars(example).values()):

@@ -8002,17 +8002,17 @@ class SolverFeatherPGS(SolverBase):
         pool = getattr(self, "_contact_pool", None)
         if pool is None:
             return
+        rows = contacts._rigid_contact_rows
         try:
             source = getattr(contacts, "_rigid_contact_pool", None)
             if source is not None:
                 source.follow(pool)
-            if contacts.rigid_contact_max > pool.ready:
-                pool.grow(contacts.rigid_contact_max)
+            if rows > pool.ready:
+                pool.grow(rows)
         except RuntimeError as error:
             raise RuntimeError(
-                f"FeatherPGS received {contacts.rigid_contact_max} contact rows during CUDA graph capture, but its "
-                f"per-contact scratch holds {pool.ready}: step once outside capture first, and recapture after "
-                "the contact buffers grow (CollisionPipeline.service_capacity)."
+                f"FeatherPGS received {rows} contact rows during CUDA graph capture, but its per-contact scratch "
+                f"holds {pool.ready}: step once outside capture first."
             ) from error
 
     @override
@@ -8290,9 +8290,10 @@ class SolverFeatherPGS(SolverBase):
             self._stage5_prepare_impulses_world()
             if self.pgs_warmstart and self._ws_prev_dense_impulses is not None and contacts is not None:
                 match_index = contacts.rigid_contact_match_index
-                wp.launch(
+                pool = self._contact_pool
+                pool.launch(
                     gather_dense_warmstart,
-                    dim=contacts.rigid_contact_max,
+                    pool.launch_rows(),
                     inputs=[
                         contacts.rigid_contact_count,
                         self.contact_path,
@@ -8314,7 +8315,7 @@ class SolverFeatherPGS(SolverBase):
                         self.dense_max_constraints,
                     ],
                     outputs=[self.impulses],
-                    device=self.model.device,
+                    extent=contacts.rigid_contact_count,
                     max_blocks=self._contact_capacity_blocks,
                 )
 
@@ -8687,9 +8688,12 @@ class SolverFeatherPGS(SolverBase):
 
         if self.pgs_warmstart:
             if contacts is not None:
-                wp.launch(
+                # One thread per row the contact stream ever used: the slot tables of every such row are rewritten.
+                pool = self._contact_pool
+                used = pool.rows_used if contacts._rigid_contact_pool is pool else None
+                pool.launch(
                     snapshot_contact_warmstart,
-                    dim=contacts.rigid_contact_max,
+                    pool.launch_rows(),
                     inputs=[
                         contacts.rigid_contact_count,
                         self.contact_path,
@@ -8702,7 +8706,7 @@ class SolverFeatherPGS(SolverBase):
                         None,  # no propagation slots
                         self._ws_prev_contact_normal,
                     ],
-                    device=model.device,
+                    extent=pool.ready_rows if used is None else used,
                     max_blocks=self._contact_capacity_blocks,
                 )
             self._ws_prev_dt = float(dt)
@@ -8831,8 +8835,9 @@ class SolverFeatherPGS(SolverBase):
         The keys ``dense`` and ``matrix_free`` identify row buffers whose
         capacity omitted constraints; ``propagation`` remains for compatibility
         and is always ``False``, because no route builds the deprecated
-        propagation rows. ``contacts`` identifies an
-        incoming contact count exceeding its materialized storage.
+        propagation rows. ``contacts`` remains for compatibility and is always
+        ``False`` too: a contact stream's count never exceeds its rows (a
+        collision pass clamps it and flags the drop in its own capacity status).
         ``patch_frames`` identifies a captured step of patch friction whose
         ``contact_generation`` or contact count changed since the previous
         captured step of the same graph without a write Newton noted (such as
@@ -8993,9 +8998,11 @@ class SolverFeatherPGS(SolverBase):
         if mf_row_parent is None:
             mf_row_parent = self._dummy_contact_row_parent
 
-        wp.launch(
+        pool = self._contact_pool
+        rows = pool.launch_rows()
+        pool.launch(
             compute_contact_linear_force_from_impulses,
-            dim=contacts.rigid_contact_max,
+            rows,
             inputs=[
                 contacts.rigid_contact_count,
                 contacts.rigid_contact_normal,
@@ -9018,20 +9025,20 @@ class SolverFeatherPGS(SolverBase):
                 inv_dt,
             ],
             outputs=[contacts.rigid_contact_force],
-            device=self.model.device,
+            extent=contacts.rigid_contact_count,
             max_blocks=self._contact_capacity_blocks,
         )
 
         if contacts.force is not None:
-            wp.launch(
+            pool.launch(
                 pack_contact_linear_force_as_spatial,
-                dim=contacts.rigid_contact_max,
+                rows,
                 inputs=[
                     contacts.rigid_contact_count,
                     contacts.rigid_contact_force,
                 ],
                 outputs=[contacts.force],
-                device=self.model.device,
+                extent=contacts.rigid_contact_count,
                 max_blocks=self._contact_capacity_blocks,
             )
 
@@ -10239,7 +10246,7 @@ class SolverFeatherPGS(SolverBase):
         return (
             contacts is not None
             and getattr(contacts, "rigid_contact_count", None) is not None
-            and contacts.rigid_contact_max > 0
+            and contacts._rigid_contact_rows > 0
         )
 
     def _link_friction_patches(self, contacts):
@@ -10258,6 +10265,8 @@ class SolverFeatherPGS(SolverBase):
         if not self._friction_anchors_enabled:
             return
         if contacts is None:
+            # A memset of today's rows: a capture of it is recaptured after growth.
+            self._contact_pool.note_unbound()
             self._friction_patches.previous.valid.zero_()
             return
         # A step without a frame holds no patch rows; it stores the last frame again.
@@ -10302,9 +10311,10 @@ class SolverFeatherPGS(SolverBase):
 
     def _finalize_constraint_status(self, contacts: Contacts | None) -> None:
         """Latch current per-world capacity failures for every row owner."""
-        wp.launch(
+        # The contact capacity (argument 10) follows the ready rows in a capture whose launches bind.
+        self._contact_pool.launch(
             _finalize_constraint_status,
-            dim=self.world_count,
+            self.world_count,
             inputs=[
                 self.slot_counter,
                 self.mf_slot_counter if self._has_free_rigid_bodies else self._dummy_mf_slot_counter,
@@ -10315,10 +10325,10 @@ class SolverFeatherPGS(SolverBase):
                 self.dense_max_constraints,
                 self.mf_max_constraints,
                 0,
-                contacts.rigid_contact_max if contacts is not None else 0,
+                contacts._rigid_contact_rows if contacts is not None else 0,
                 self.constraint_overflow,
             ],
-            device=self.model.device,
+            row_args=(10,) if contacts is not None else (),
         )
 
     def _place_sorted_contact_rows(self, contacts, contact_build_threads, mf_slot_counter, mf_first_rejected_slot):
@@ -10341,9 +10351,10 @@ class SolverFeatherPGS(SolverBase):
         # Complete warps on CUDA, whose lanes merge each run's contacts before recording it.
         lanes = 32 if device.is_cuda else 1
         record_threads = -(-contact_build_threads // lanes) * lanes
-        wp.launch(
+        # Its warps merge runs, so the grid stays whole: no extent follows the count.
+        self._contact_pool.launch(
             record_world_contact_runs,
-            dim=record_threads,
+            record_threads,
             inputs=[
                 contacts.rigid_contact_count,
                 record_threads,
@@ -10357,7 +10368,6 @@ class SolverFeatherPGS(SolverBase):
                 *blocks,
             ],
             outputs=list(runs),
-            device=device,
         )
         # One complete warp per world on CUDA, whose lanes sum each other's rows.
         wp.launch(
@@ -11014,10 +11024,15 @@ class SolverFeatherPGS(SolverBase):
         if (
             contacts is not None
             and getattr(contacts, "rigid_contact_count", None) is not None
-            and contacts.rigid_contact_max > 0
+            and contacts._rigid_contact_rows > 0
         ):
             enable_friction_flag = 1 if self.enable_contact_friction else 0
-            contact_build_threads = min(contacts.rigid_contact_max, _CONTACT_BUILD_THREAD_CAP * _CONTACT_THREADS_X)
+            pool = self._contact_pool
+            count = contacts.rigid_contact_count
+            # Sized for the bound in a capture whose launches bind: every replay runs them at the live
+            # count and strides with the captured threads (ContactPool.launch); otherwise for the ready rows.
+            rows = pool.launch_rows()
+            contact_build_threads = min(rows, _CONTACT_BUILD_THREAD_CAP * _CONTACT_THREADS_X)
 
             self._build_friction_patches(state_in, contacts)
 
@@ -11028,9 +11043,9 @@ class SolverFeatherPGS(SolverBase):
                 if self._friction_anchors_enabled and self._resolved_worlds_owner is not None
                 else allocate_world_contact_slots
             )
-            wp.launch(
+            pool.launch(
                 allocator,
-                dim=contact_build_threads,
+                contact_build_threads,
                 inputs=[
                     contacts.rigid_contact_count,
                     contact_build_threads,
@@ -11087,7 +11102,8 @@ class SolverFeatherPGS(SolverBase):
                     self._dummy_mf_slot_counter,
                     self._constraint_capacity_status,
                 ],
-                device=model.device,
+                extent=count,
+                clamp=True,
             )
             if contacts.rigid_contacts_pair_sorted:
                 self._place_sorted_contact_rows(
@@ -11116,9 +11132,9 @@ class SolverFeatherPGS(SolverBase):
                 launch_contacts(self, state_in, state_aug, contacts, contact_build_threads)
             elif plan.producer in SHARED_METADATA_PRODUCERS:
                 if plan.metadata_launch:
-                    wp.launch(
+                    pool.launch(
                         prepare_world_contact_rows,
-                        dim=contact_build_threads,
+                        contact_build_threads,
                         inputs=[
                             contacts.rigid_contact_count,
                             contact_build_threads,
@@ -11160,9 +11176,10 @@ class SolverFeatherPGS(SolverBase):
                             self.target_velocity,
                             self.row_restitution,
                         ],
-                        device=model.device,
+                        extent=count,
+                        clamp=True,
                     )
-                contact_jacobian_workers = min(contacts.rigid_contact_max, _CONTACT_JACOBIAN_WORKER_CAP)
+                contact_jacobian_workers = min(rows, _CONTACT_JACOBIAN_WORKER_CAP)
                 for size in self.size_groups:
                     method = plan.methods[size]
                     if method == "sparse_response":
@@ -11170,9 +11187,9 @@ class SolverFeatherPGS(SolverBase):
                         sparse_contact_workers = min(
                             contact_build_threads, contact_jacobian_workers * 32 // self._sparse_contact_lanes
                         )
-                        wp.launch(
+                        pool.launch(
                             self._sparse_contact_response_kernel,
-                            dim=sparse_contact_workers * self._sparse_contact_lanes,
+                            sparse_contact_workers * self._sparse_contact_lanes,
                             inputs=[
                                 contacts.rigid_contact_count,
                                 sparse_contact_workers,
@@ -11222,15 +11239,17 @@ class SolverFeatherPGS(SolverBase):
                                 self.diag,
                                 self._sparse_row_support,
                             ],
+                            extent=count,
+                            scale=self._sparse_contact_lanes,
+                            clamp=True,
                             block_dim=128,
-                            device=model.device,
                         )
                         continue
                     if method == "sparse_diagonal":
                         continue  # populate_sparse_diagonal_contact_response below writes these rows.
-                    wp.launch(
+                    pool.launch(
                         populate_world_J_for_compact_size,
-                        dim=(contact_jacobian_workers, 32),
+                        (contact_jacobian_workers, 32),
                         inputs=[
                             contacts.rigid_contact_count,
                             contact_jacobian_workers,
@@ -11260,19 +11279,18 @@ class SolverFeatherPGS(SolverBase):
                             int(self.contact_shared_anchor),
                         ],
                         outputs=[self.J_by_size[size]],
-                        device=model.device,
+                        extent=count,
+                        clamp=True,
                     )
                 if plan.producer == "sparse_diagonal":
                     # The dense builder has 32 lanes per worker. Give the scalar
                     # builder the contact-build thread budget; its live-prefix
                     # stride covers larger counts without visiting unused slots.
                     # Retain the explicit full-capacity experiment for replay.
-                    sparse_contact_response_workers = (
-                        contacts.rigid_contact_max if _SPARSE_CONTACT_DIRECT else contact_build_threads
-                    )
-                    wp.launch(
+                    sparse_contact_response_workers = rows if _SPARSE_CONTACT_DIRECT else contact_build_threads
+                    pool.launch(
                         populate_sparse_diagonal_contact_response,
-                        dim=sparse_contact_response_workers,
+                        sparse_contact_response_workers,
                         inputs=[
                             contacts.rigid_contact_count,
                             sparse_contact_response_workers,
@@ -11304,15 +11322,16 @@ class SolverFeatherPGS(SolverBase):
                             int(self.contact_shared_anchor),
                         ],
                         outputs=[self._sparse_diagonal_row_dof, self._sparse_diagonal_row_jy],
-                        device=model.device,
+                        extent=count,
+                        clamp=True,
                     )
                     if self._sparse_diagonal_contact_triples or self._sparse_diagonal_contact_units:
                         marker = self._mark_independent_sparse_contact_candidates_kernel
                         if marker is None:
                             raise RuntimeError("Independent sparse-contact marker kernel is unavailable")
-                        wp.launch(
+                        pool.launch(
                             marker,
-                            dim=contact_build_threads,
+                            contact_build_threads,
                             inputs=[
                                 contacts.rigid_contact_count,
                                 contact_build_threads,
@@ -11325,7 +11344,8 @@ class SolverFeatherPGS(SolverBase):
                                 self.articulation_response_dof_count,
                             ],
                             outputs=[self._sparse_diagonal_row_dof],
-                            device=model.device,
+                            extent=count,
+                            clamp=True,
                         )
             else:
                 # FEATHER_PGS_CHECK_ROWS builds the masked rows into copies, then the
@@ -11338,8 +11358,8 @@ class SolverFeatherPGS(SolverBase):
                         if combined_done:
                             continue
                         combined_done = True
-                        cap = int(contacts.rigid_contact_point0.shape[0])
-                        pre = {"flags": self._rows_prelude_flags[:cap]}
+                        cap = rows
+                        pre = {"flags": self._rows_prelude_flags}
                         size_a = plan.combined[0]
                         size_b = plan.combined[1] if len(plan.combined) > 1 else -1
                         J_a = self.J_by_size[size_a]
@@ -11352,9 +11372,9 @@ class SolverFeatherPGS(SolverBase):
                                     contacts, state_in, state_aug, size_a, size_b, rows_threads, pre["flags"]
                                 )
                                 return
-                            wp.launch(
+                            pool.launch(
                                 contact_row_prelude,
-                                dim=rows_threads * 3,
+                                rows_threads * 3,
                                 inputs=[
                                     contacts.rigid_contact_count,
                                     rows_threads * 3,
@@ -11405,7 +11425,9 @@ class SolverFeatherPGS(SolverBase):
                                     self.target_velocity,
                                     self.row_restitution,
                                 ],
-                                device=model.device,
+                                extent=count,
+                                scale=3,
+                                clamp=True,
                             )
 
                         _launch_prelude()
@@ -11431,9 +11453,9 @@ class SolverFeatherPGS(SolverBase):
                                     J_b,
                                 )
                                 return
-                            wp.launch(
+                            pool.launch(
                                 populate_world_J_masked,
-                                dim=rows_threads * max(size_a, size_b if size_b > 0 else 1),
+                                rows_threads * max(size_a, size_b if size_b > 0 else 1),
                                 inputs=[
                                     contacts.rigid_contact_count,
                                     rows_threads * max(size_a, size_b if size_b > 0 else 1),
@@ -11466,14 +11488,16 @@ class SolverFeatherPGS(SolverBase):
                                     0,  # owned_rows_le: no sweep kernel builds its own contact rows
                                 ],
                                 outputs=[J_a, J_b],
-                                device=model.device,
+                                extent=count,
+                                scale=max(size_a, size_b if size_b > 0 else 1),
+                                clamp=True,
                             )
 
                         _launch_j_pass()
                         continue
                     if "masked" in (method, plan.check):
-                        cap = int(contacts.rigid_contact_point0.shape[0])
-                        pre = {"flags": self._rows_prelude_flags[:cap]}
+                        cap = rows
+                        pre = {"flags": self._rows_prelude_flags}
                         J_out = self.J_by_size[size]
                         meta_out = [
                             self.row_type,
@@ -11497,9 +11521,9 @@ class SolverFeatherPGS(SolverBase):
                                 contacts, state_in, state_aug, size, -1, rows_threads * 32, pre["flags"], J_out, J_out
                             )
                             continue
-                        wp.launch(
+                        pool.launch(
                             contact_row_prelude,
-                            dim=rows_threads * 3,
+                            rows_threads * 3,
                             inputs=[
                                 contacts.rigid_contact_count,
                                 rows_threads * 3,
@@ -11540,11 +11564,13 @@ class SolverFeatherPGS(SolverBase):
                                 self.pgs_cfm,
                             ],
                             outputs=[pre["flags"], *meta_out],
-                            device=model.device,
+                            extent=count,
+                            scale=3,
+                            clamp=True,
                         )
-                        wp.launch(
+                        pool.launch(
                             populate_world_J_masked,
-                            dim=rows_threads * 32,
+                            rows_threads * 32,
                             inputs=[
                                 contacts.rigid_contact_count,
                                 rows_threads * 32,
@@ -11577,15 +11603,17 @@ class SolverFeatherPGS(SolverBase):
                                 0,
                             ],
                             outputs=[J_out, J_out],
-                            device=model.device,
+                            extent=count,
+                            scale=size,
+                            clamp=True,
                         )
                         if check_rows:
                             self._rows_check = (size, J_out, meta_out)
                         if method == "masked":
                             continue
-                    wp.launch(
+                    pool.launch(
                         populate_world_J_for_size,
-                        dim=contact_build_threads,
+                        contact_build_threads,
                         inputs=[
                             contacts.rigid_contact_count,
                             contact_build_threads,
@@ -11640,7 +11668,8 @@ class SolverFeatherPGS(SolverBase):
                             self.target_velocity,
                             self.row_restitution,
                         ],
-                        device=model.device,
+                        extent=count,
+                        clamp=True,
                     )
                     if check_rows and getattr(self, "_rows_check", None) is not None and self._rows_check[0] == size:
                         _, J_m, meta_m = self._rows_check
@@ -11666,9 +11695,9 @@ class SolverFeatherPGS(SolverBase):
 
             # Build MF contact rows
             if mf_active:
-                wp.launch(
+                pool.launch(
                     build_mf_contact_rows,
-                    dim=contact_build_threads,
+                    contact_build_threads,
                     inputs=[
                         contacts.rigid_contact_count,
                         contact_build_threads,
@@ -11714,7 +11743,8 @@ class SolverFeatherPGS(SolverBase):
                         self.mf_target_velocity,
                         self.mf_row_restitution,
                     ],
-                    device=model.device,
+                    extent=count,
+                    clamp=True,
                 )
 
             if mf_active:
@@ -11742,9 +11772,9 @@ class SolverFeatherPGS(SolverBase):
                             "is None). Build the CollisionPipeline / Contacts with "
                             'contact_matching="latest" (or "sticky").'
                         )
-                    wp.launch(
+                    pool.launch(
                         gather_mf_warmstart,
-                        dim=contacts.rigid_contact_max,
+                        rows,
                         inputs=[
                             contacts.rigid_contact_count,
                             self.contact_path,
@@ -11768,7 +11798,7 @@ class SolverFeatherPGS(SolverBase):
                             self.mf_max_constraints,
                         ],
                         outputs=[self.mf_impulses],
-                        device=model.device,
+                        extent=count,
                         max_blocks=self._contact_capacity_blocks,
                     )
 
@@ -12174,9 +12204,9 @@ class SolverFeatherPGS(SolverBase):
 
     def _launch_patch_contact_prelude(self, contacts, state_in, state_aug, size_a, size_b, rows_threads, flags):
         """Write the patch row law's contact row metadata and the masked builder's per-contact flags."""
-        wp.launch(
+        self._contact_pool.launch(
             contact_row_prelude_patch,
-            dim=rows_threads * 3,
+            rows_threads * 3,
             inputs=[
                 contacts.rigid_contact_count,
                 rows_threads * 3,
@@ -12220,14 +12250,16 @@ class SolverFeatherPGS(SolverBase):
                 self.target_velocity,
                 self.row_restitution,
             ],
-            device=self.model.device,
+            extent=contacts.rigid_contact_count,
+            scale=3,
+            clamp=True,
         )
 
     def _launch_patch_contact_jacobian(self, contacts, state_in, state_aug, size_a, size_b, threads, flags, J_a, J_b):
         """Write the patch rows' Jacobians, tangent rows at the patch friction location, one thread per DOF."""
-        wp.launch(
+        self._contact_pool.launch(
             populate_world_J_masked_patch,
-            dim=threads,
+            threads,
             inputs=[
                 contacts.rigid_contact_count,
                 threads,
@@ -12256,7 +12288,10 @@ class SolverFeatherPGS(SolverBase):
                 flags,
             ],
             outputs=[J_a, J_b],
-            device=self.model.device,
+            # The kernel gives each contact one lane per DOF of the larger group.
+            extent=contacts.rigid_contact_count,
+            scale=max(size_a, size_b),
+            clamp=True,
         )
 
     def _build_inkernel_response_meta(self) -> tuple[int, int] | None:
@@ -17143,7 +17178,7 @@ def _get_mark_independent_sparse_contact_candidates_kernel(
         sparse_row_dof: wp.array3d[int],
     ):
         worker = wp.tid()
-        total_contacts = wp.min(contact_count[0], contact_slot.shape[0])
+        total_contacts = contact_count[0]
         for contact in range(worker, total_contacts, total_num_workers):
             slot = contact_slot[contact]
             rows = contact_slots_needed[contact]
@@ -17189,7 +17224,7 @@ def _get_mark_independent_sparse_contact_candidates_kernel(
         sparse_row_dof: wp.array3d[int],
     ):
         worker = wp.tid()
-        total_contacts = wp.min(contact_count[0], contact_slot.shape[0])
+        total_contacts = contact_count[0]
         for contact in range(worker, total_contacts, total_num_workers):
             slot = contact_slot[contact]
             if contact_path[contact] != 0 or slot < 0 or contact_slots_needed[contact] != 3:

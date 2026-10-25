@@ -95,7 +95,7 @@ def contact_row_prelude(
     """
     tid = wp.tid()
     r = tid % 3
-    total_contacts = wp.min(contact_count[0], contact_point0.shape[0])
+    total_contacts = contact_count[0]
     for c in range(tid // 3, total_contacts, total_threads // 3):
         if owned_rows_le > 0:
             # Worlds the sweep kernel owns build their contact rows in-kernel (world_rows); skip them here.
@@ -394,7 +394,7 @@ def populate_world_J_masked(
     tid = wp.tid()
     lanes = wp.max(size_a, size_b)
     lane = tid % lanes
-    total_contacts = wp.min(contact_count[0], pre_flags.shape[0])
+    total_contacts = contact_count[0]
     for c in range(tid // lanes, total_contacts, total_threads // lanes):
         if owned_rows_le > 0:
             # Worlds the sweep kernel owns build their contact rows in-kernel (world_rows); skip them here.
@@ -644,7 +644,7 @@ def contact_row_prelude_patch(
     """
     tid = wp.tid()
     r = tid % 3
-    total_contacts = wp.min(contact_count[0], contact_point0.shape[0])
+    total_contacts = contact_count[0]
     for c in range(tid // 3, total_contacts, total_threads // 3):
         _contact_row_prelude_patch_one(
             c,
@@ -881,7 +881,7 @@ def populate_world_J_masked_patch(
     tid = wp.tid()
     lanes = wp.max(size_a, size_b)
     lane = tid % lanes
-    total_contacts = wp.min(contact_count[0], pre_flags.shape[0])
+    total_contacts = contact_count[0]
     for c in range(tid // lanes, total_contacts, total_threads // lanes):
         flags = pre_flags[c]
         if (flags & 1) == 0:

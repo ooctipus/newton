@@ -9,57 +9,70 @@ reduction buffers, and a solver's per-contact scratch. :class:`ContactPool`
 holds them at one *ready* row count. Every rigid contact buffer of a model
 shares the model's pool (:func:`model_contact_pool`), so a pipeline and the
 solvers that consume its contacts grow together from the moment they exist.
-A pool starts at a floor (:data:`MIN_READY_ROWS`) and is sized from measured
-demand: :data:`HEADROOM` rows per contact of the state a graph starts from
-(:meth:`ContactPool.size`, through
-:meth:`newton.CollisionPipeline.service_capacity`), and the same headroom over
-the high-water mark when a graph replay's demand outgrows it.
-There is no configured contact budget: the only limit, the pool's *bound*, is
-the most rows the platform could ever back, the device memory divided by the
-bytes one row costs in the pool's fields, at most the rows every field's int32
-Warp indices reach (:func:`device_row_limit`, :meth:`ContactField.row_limit`).
-Physical memory runs out long before it: a growth that the device cannot back
-raises :class:`MemoryError` before changing anything.
-
-Each owner declares its fields once as a :class:`ContactRows`. Views of the
-fields always hold the pool's ready rows (times a field's rows per contact,
-plus fixed extra rows), so every launch and in-kernel bound that reads an
-array's length follows the ready count. Growth keeps the contents of the rows
-that existed and gives new rows the values the fields were created with.
+A pool starts at a floor (:data:`MIN_READY_ROWS`), or in CUDA virtual memory
+at every row its first pages hold once its owner settles it
+(:meth:`ContactPool.settle`), and grows from measured demand to
+:data:`HEADROOM` rows per contact. There is no configured contact
+budget: the only limit, the pool's *bound*, is the most rows the platform
+could ever back, the device memory divided by the bytes one row costs in the
+pool's fields, at most the rows every field's int32 Warp indices reach
+(:func:`device_row_limit`, :meth:`ContactField.row_limit`).
 
 Storage:
 
 * On CUDA with the optional ``gpu_components`` package, rows are CUDA virtual
-  memory: one reservation per field of the pool's bound when the rows were
-  created, of which a prefix is mapped. The bound costs addresses, not memory.
-  Growth maps more pages behind the same addresses, so a graph captured before
-  a growth still addresses mapped memory. Recapture it before its next replay:
-  launch sizes and array lengths are fixed at capture, and a stale replay would
-  treat rows that growth made contact rows as its scratch.
+  memory: every field reserves addresses for the pool's bound when it is
+  created, as if the whole device held contact rows, and maps physical pages
+  for a prefix. Growth maps more pages behind the same addresses without
+  joining the GPU: rows past every published count have no reader, so graphs
+  keep replaying while the pool grows. The ready rows are published to the
+  device too (:attr:`ContactPool.ready_rows`), in stream order after the new
+  rows are initialized: rows past the old ones served in-flight replays as
+  scratch (second halves, extra rows), so no replay launched before a growth
+  may see the new rows.
 * On the CPU, on CUDA without ``gpu_components`` (logged once), for fields with
   gradients and for rows created during a graph capture, rows are ordinary
   arrays of the ready rows that growth reallocates, copying their prefix. The
-  superseded arrays stay alive with their rows, so a stale graph replay still
-  addresses allocated memory; recapture after a growth all the same.
+  superseded arrays stay alive, so a stale graph replay still addresses
+  allocated memory; graphs that captured them must be recaptured.
 
-The demand signal is a sticky device high-water mark of the contact count
-(:meth:`ContactPool.record_demand`), never reset by a collision pass, which
-the same launch writes into pinned host memory (mapped into the device's
-address space, so graphs replay no copy). :meth:`ContactPool.service` reads it without synchronizing and grows
-the pool when the high-water mark passes :data:`GROW_THRESHOLD` of the ready
-rows. Under graph replay, overflow stays loud: writers drop contacts past the
-ready rows and the capacity status reports it; the service then grows and
-warns. A collision pass outside capture checks its own count and grows before
-anything reads the rows (:meth:`newton.CollisionPipeline.collide`).
+Counts: the collision pipeline's writers count every contact they find and
+drop the rows past :attr:`ContactPool.ready_rows`, which they read on the
+device. After each pass :meth:`ContactPool.record_demand` records the count as
+demand, in a sticky high-water mark that the same launch writes into pinned
+host memory (mapped into the device's address space, so graphs replay no
+copy), clamps the count to the ready rows and flags the overflow: a stream's
+``rigid_contact_count`` never exceeds its rows, so consumers read every row
+below it.
+
+Graph capture: a consumer launches each contact-sized kernel through
+:meth:`ContactPool.launch`. In a CUDA graph capture the launch is captured once
+at the bound and bound to ``gpu_components``' device graph updater, which
+every replay shrinks to the live contact count or the ready rows and uses to
+rewrite row-count arguments from :attr:`ContactPool.ready_rows`. The pipeline
+records an updater after each pass's narrow phase
+(:meth:`ContactPool.begin_updates`), so the pass's consumers, and a solver
+that steps its contacts, follow the count it produced; a launch in a capture
+without an updater records one first. Such graphs need no recapture when the
+pool grows: :meth:`ContactPool.service`, outside capture, reads the pinned
+high-water mark without synchronizing, maps more rows when it passes
+:data:`GROW_THRESHOLD` of the ready rows and publishes them for the next
+replay. The replay in which demand first passes the ready rows drops the
+excess, and the capacity status flags it.
+
+A capture is *unbound* when something in it sized work by the host's row count
+instead: an unconverted consumer reading
+:attr:`newton.Contacts.rigid_contact_max` while capturing, a launch with no
+virtual memory to bind, or rows that growth reallocates.
+:meth:`ContactPool.service` reports that such graphs must be recaptured once
+the pool holds more rows than they were captured with.
 
 A writer that produces contacts of its own (such as MuJoCo's or Kamino's
 collision) declares how many it may write with :meth:`ContactPool.reserve`
 (``Contacts.reserve_rigid_contacts``): outside graph capture the rows grow to at
 least that many right away; during capture the request warns and waits for the
-next service. Its kernels stay bounded by the ready rows, keep the demand in
-the count and flag the overflow, as the pipeline's writer does. Readers that
-keep per-contact buffers of their own grow them with the pool
-(:meth:`ContactPool.follow`).
+next service. Readers that keep per-contact buffers of their own grow them with
+the pool (:meth:`ContactPool.follow`).
 """
 
 from __future__ import annotations
@@ -81,11 +94,7 @@ MIN_READY_ROWS = 4096
 On the 21-task Isaac Lab suite (16,384 worlds) a floor of one 2 MiB granule's
 rows (131,072) maps no more memory with CUDA virtual memory but slows the
 contact-free tasks through passes that follow the rows (cartpole +6.9% under
-patch friction on the GB300), so the floor stays a few thousand rows. A scene
-with more contacts is sized from its measured demand: a collision pass outside
-capture grows before anything reads the rows, and
-:meth:`newton.CollisionPipeline.service_capacity` with a state sizes the rows
-before a graph is captured.
+patch friction on the GB300), so the floor stays a few thousand rows.
 """
 
 HEADROOM = 2.5
@@ -95,12 +104,12 @@ A measured demand (a state measured before capture, a collision pass outside
 capture that filled the rows, or a graph replay's high-water mark past
 :data:`GROW_THRESHOLD` of the rows) sizes the pool to this many rows per
 contact, so the demand may rise by ``HEADROOM * GROW_THRESHOLD`` (1.5) before
-the pool grows again and graphs are recaptured. Chosen on the 21-task suite's
-per-step demand (both friction laws): measured after 20 eager steps, no task
-overflowed under graph replay, 7 tasks grew 12 times in 400 environment steps
-of random actions as their demand kept rising (anymald from 54,386 to 170,539
-contacts), and the pools mapped 4.8 GiB in all (patch), against 3.9 GiB for the
-hand-tuned budgets of 19 of the tasks and 11.4 GiB at 64 rows per world.
+the pool grows again. Chosen on the 21-task suite's per-step demand (both
+friction laws): measured after 20 eager steps, no task overflowed under graph
+replay, 7 tasks grew 12 times in 400 environment steps of random actions as
+their demand kept rising (anymald from 54,386 to 170,539 contacts), and the
+pools mapped 4.8 GiB in all (patch), against 3.9 GiB for the hand-tuned budgets
+of 19 of the tasks and 11.4 GiB at 64 rows per world.
 """
 
 GROW_THRESHOLD = 0.6
@@ -119,11 +128,13 @@ mapping itself rounds each field up to whole 2 MiB allocation granules.
 """
 
 INDEX_LIMIT = 2**31 - 1
-"""Most elements a Warp array may hold: array shapes and kernel indices are int32.
+"""Most elements a Warp array may hold: array shapes and kernel indices are int32."""
 
-On CUDA, ``gpu_components`` also views each field's whole reservation as one
-byte array, so a CUDA virtual-memory field reserves at most this many bytes.
-"""
+UPDATE_BINDINGS = 128
+"""Kernels one device graph updater binds; a capture records another updater when one fills."""
+
+CAPACITY_OVERFLOW = 1024
+"""Capacity-status bit a pass sets when its contacts outnumbered the ready rows (the narrow phase's contacts bit)."""
 
 
 def _round_up(value: float, quantum: int) -> int:
@@ -214,15 +225,9 @@ class ContactField:
         """Device bytes one contact row costs in this field, its gradient included."""
         return self.per_contact * wp.types.type_size_in_bytes(self.dtype) * (2 if self.requires_grad else 1)
 
-    def row_limit(self, virtual: bool) -> int:
-        """Return the most contact rows the field's arrays can index (:data:`INDEX_LIMIT`).
-
-        Args:
-            virtual: Whether the field is CUDA virtual memory, whose reservation
-                is also viewed as bytes.
-        """
-        elements = INDEX_LIMIT // (wp.types.type_size_in_bytes(self.dtype) if virtual else 1)
-        return (elements - self.extra) // self.per_contact
+    def row_limit(self) -> int:
+        """Return the most contact rows the field's arrays can index (:data:`INDEX_LIMIT` elements)."""
+        return (INDEX_LIMIT - self.extra) // self.per_contact
 
 
 @wp.kernel(enable_backward=False)
@@ -232,9 +237,27 @@ def _fill_index(start: int, out: wp.array[wp.int32]):
 
 
 @wp.kernel(enable_backward=False)
-def _record_high_water(count: wp.array[wp.int32], high_water: wp.array[wp.int32], mirror: wp.array[wp.int32]):
+def _record_demand(
+    count: wp.array[wp.int32],
+    ready_rows: wp.array[wp.int32],
+    high_water: wp.array[wp.int32],
+    mirror: wp.array[wp.int32],
+    rows_used: wp.array[wp.int32],
+    status: wp.array[wp.int32],
+):
     demand = count[0]
-    mirror[0] = wp.max(wp.atomic_max(high_water, 0, demand), demand)
+    if high_water.shape[0] > 0:
+        mirror[0] = wp.max(wp.atomic_max(high_water, 0, demand), demand)
+        mirror[1] = demand
+    rows = ready_rows[0]
+    held = wp.min(demand, rows)
+    if rows_used.shape[0] > 0:
+        wp.atomic_max(rows_used, 0, held)
+    if demand > rows:
+        # Writers dropped the rows past the ready rows: consumers read every row below the count.
+        count[0] = rows
+        if status.shape[0] > 0:
+            wp.atomic_or(status, 0, CAPACITY_OVERFLOW)
 
 
 def capturing(device) -> bool:
@@ -243,19 +266,28 @@ def capturing(device) -> bool:
     return bool(device.is_capturing or (device.is_cuda and wp.get_stream(device).is_capturing))
 
 
+def _capture_owner(device):
+    """Return the Warp graph recording ``device``'s current stream, or ``None`` (eager, or a capture Warp does not own)."""
+    if not device.is_cuda:
+        return None
+    return getattr(device, "captures", {}).get(wp.get_stream(device))
+
+
 _VIRTUAL_MEMORY: list[Any] = []
-"""After the first look: ``gpu_components``' ``(backing, fields, FieldSpec)``, or ``None`` without the package."""
+"""After the first look: ``gpu_components``' ``(backing, fields, FieldSpec, graph, KernelParameterBinding)``, or
+``None`` without the package."""
 
 
 def _virtual_memory():
-    """Return ``gpu_components``' ``(backing, fields, FieldSpec)``, or ``None`` without the optional package.
+    """Return ``gpu_components``' operation modules and records, or ``None`` without the optional package.
 
     Without it, rows on CUDA are ordinary arrays that growth reallocates and copies, as on the CPU.
     """
     if not _VIRTUAL_MEMORY:
         try:
-            from gpu_components import backing, fields  # noqa: PLC0415
+            from gpu_components import backing, fields, graph  # noqa: PLC0415
             from gpu_components.field_data import FieldSpec  # noqa: PLC0415
+            from gpu_components.graph_data import KernelParameterBinding  # noqa: PLC0415
         except ImportError:
             _VIRTUAL_MEMORY.append(None)
             logger.info(
@@ -263,7 +295,7 @@ def _virtual_memory():
                 "reallocates and copies, as on the CPU, instead of CUDA virtual memory"
             )
         else:
-            _VIRTUAL_MEMORY.append((backing, fields, FieldSpec))
+            _VIRTUAL_MEMORY.append((backing, fields, FieldSpec, graph, KernelParameterBinding))
     return _VIRTUAL_MEMORY[0]
 
 
@@ -284,7 +316,7 @@ def _virtual_rows(device, fields):
 
     Rows are ordinary arrays on the CPU, without ``gpu_components``, for fields with gradients, and when
     created during a graph capture (a buffer a capture-first loop creates lazily): CUDA virtual memory
-    cannot be mapped while a stream captures.
+    cannot be reserved while a stream captures.
     """
     device = wp.get_device(device)
     if not device.is_cuda or any(field.requires_grad for field in fields) or capturing(device):
@@ -315,6 +347,7 @@ def _release_retired(device) -> None:
     if not pending or capturing(device):
         return
     owner, backing_ops, fields_ops = _BACKINGS[key]
+    # Retirement unmaps: join every reader first.
     wp.synchronize_device(device)
     stream = wp.get_stream(device).cuda_stream
     released = []
@@ -330,12 +363,6 @@ def _release_retired(device) -> None:
             with backing_ops.maintenance(owner, streams=(stream,)):
                 backing_ops.trim(owner)
     _RETIRED[:] = [entry for entry in _RETIRED if entry[1] not in released]
-
-
-def _mark_bound_stale(pool) -> None:
-    # Runs when a member is collected: the bound is recomputed at its next use.
-    if pool is not None:
-        pool._bound_stale = True
 
 
 def _call(callback, contact_rows):
@@ -354,6 +381,11 @@ class ContactRows:
     views there (:meth:`publish`) and refresh values derived from
     :attr:`rows`. A bound method is held weakly.
 
+    :attr:`views` hold the ready rows and are safe to read on the host.
+    :attr:`reserved` view each field's whole reservation (``reserve`` rows) for
+    kernels whose loads are bounded by a view's length, such as tile loads, in
+    a graph that outlives growth; only the ready rows of them are mapped.
+
     Args:
         fields: The fields of the owner.
         rows: Initial contact rows.
@@ -369,6 +401,7 @@ class ContactRows:
         self.reserve = int(reserve)
         self.device = wp.get_device(device)
         self.views: dict[str, wp.array] = {}
+        self.reserved: dict[str, wp.array] = {}
         self._on_rows = weakref.WeakMethod(on_rows) if hasattr(on_rows, "__self__") else on_rows
         self._storages = []
         # Arrays a reallocating growth replaced; a stale graph replay may still address them.
@@ -381,7 +414,13 @@ class ContactRows:
             self._mode = "realloc"
             for field in self.fields:
                 self.views[field.name] = self._array(field, field.length(self.rows))
+            self.reserved = self.views
         _call(self._on_rows, self)
+
+    @property
+    def virtual(self) -> bool:
+        """Whether the rows are CUDA virtual memory, which grows behind fixed addresses."""
+        return self._mode == "virtual"
 
     @property
     def row_bytes(self) -> int:
@@ -424,7 +463,7 @@ class ContactRows:
             array[start:end].fill_(field.fill)
 
     def _allocate_virtual(self):
-        backing_ops, fields_ops, FieldSpec = self._vm
+        backing_ops, fields_ops, FieldSpec = self._vm[:3]
         _release_retired(self.device)
         owner, _, _ = _backing(self.device, backing_ops, fields_ops)
         groups: dict[tuple[int, int], list] = {}
@@ -440,11 +479,13 @@ class ContactRows:
                     initial_ready_count=per_contact * self.rows + extra,
                 )
                 self._storages.append((storage, members))
+                for field in members:
+                    self.reserved[field.name] = storage.arrays[field.name]
         weakref.finalize(self, _retire, str(self.device), [storage for storage, _ in self._storages]).atexit = False
         self._bind_virtual_views(0)
 
     def _bind_virtual_views(self, kept_rows):
-        # New pages are uninitialized: every row past the kept contact rows takes its fill.
+        # New pages are uninitialized: every row past the kept contact rows takes its fill, in stream order.
         for storage, members in self._storages:
             for field in members:
                 view = storage.arrays[field.name][: field.length(self.rows)]
@@ -466,11 +507,24 @@ class ContactRows:
             added += _round_up(field.length(rows) * size, granule) - _round_up(field.length(self.rows) * size, granule)
         return added
 
+    def covered_rows(self) -> int:
+        """Return the contact rows every field holds now: what its mapped pages cover, or its arrays' rows."""
+        if self._mode != "virtual":
+            return self.rows
+        return min(
+            self.reserve,
+            *((storage.ready_rows - members[0].extra) // members[0].per_contact for storage, members in self._storages),
+        )
+
     def _map(self, rows, fields_ops):
-        """Map ``rows`` rows of every virtual field; the caller holds the backing's maintenance scope."""
+        """Map ``rows`` rows of every virtual field: an append that joins no reader.
+
+        A storage's ready rows are the rows its mapped granules cover, often more than
+        the pool's: asking for fewer would be a shrink, so a request never goes below them.
+        """
         for storage, members in self._storages:
             field = members[0]
-            fields_ops.resize_backing(storage, field.per_contact * rows + field.extra, protected_count_host=0)
+            fields_ops.resize_backing(storage, max(storage.ready_rows, field.per_contact * rows + field.extra))
 
     def _publish_rows(self, rows):
         """Rebuild the views at ``rows`` rows after the storage holds them, then notify the owner."""
@@ -489,24 +543,37 @@ class ContactRows:
                 self._initialize(array, field, previous, array.shape[0])
                 self.views[field.name] = array
                 self._superseded.append(old)
+            self.reserved = self.views
         _call(self._on_rows, self)
 
 
-def _grow_rows(members: list[ContactRows], rows: int) -> None:
-    """Bring every member's rows to at least ``rows``: map virtual storage in one maintenance scope, then publish.
+def _grow_rows(members: list[ContactRows], rows: int) -> int:
+    """Bring every member's rows to at least ``rows`` and return the rows they all hold.
+
+    Virtual storage appends pages behind its fixed addresses without joining the
+    GPU and holds every row its pages cover; the views are then published at the
+    rows all members hold, the new rows initialized in stream order, ahead of any
+    later launch.
 
     Raises:
         MemoryError: Before changing anything, if the device cannot back the rows.
         RuntimeError: During CUDA graph capture.
     """
-    members = [member for member in members if member.rows < rows]
     if not members:
-        return
+        return rows
+    held = [member for member in members if member.covered_rows() < rows]
+    if not held:
+        rows = min(member.covered_rows() for member in members)
+        for member in members:
+            if member.rows < rows:
+                member._publish_rows(rows)
+        return rows
+    members_to_publish, members = members, held
     device = members[0].device
     if capturing(device):
         raise RuntimeError(
-            "Rigid contact buffers cannot grow during graph capture; grow them before capturing "
-            "(CollisionPipeline.service_capacity(), or one collision pass outside capture)"
+            "Rigid contact buffers cannot grow during graph capture; they grow in "
+            "CollisionPipeline.service_capacity() or in a collision pass outside capture"
         )
     for member in members:
         if rows > member.reserve:
@@ -515,7 +582,7 @@ def _grow_rows(members: list[ContactRows], rows: int) -> None:
     granule = 1
     if virtual:
         _release_retired(device)
-        owner, backing_ops, fields_ops = _backing(device, *virtual[0]._vm[:2])
+        owner, _, fields_ops = _backing(device, *virtual[0]._vm[:2])
         granule = int(owner.granularity_bytes)
     added = sum(member._added_bytes(rows, granule) for member in members)
     held = members[0].rows
@@ -525,11 +592,8 @@ def _grow_rows(members: list[ContactRows], rows: int) -> None:
             f"memory; {int(device.free_memory) / 2**20:.1f} MiB are free"
         )
     if virtual:
-        # Join every stream that may touch the rows (graph replays, solver side streams) before remapping.
-        wp.synchronize_device(device)
-        stream = wp.get_stream(device).cuda_stream
         try:
-            with wp.ScopedDevice(device), backing_ops.maintenance(owner, streams=(stream,)):
+            with wp.ScopedDevice(device):
                 for member in virtual:
                     member._map(rows, fields_ops)
         except MemoryError as error:
@@ -537,8 +601,11 @@ def _grow_rows(members: list[ContactRows], rows: int) -> None:
                 f"Growing rigid contact buffers from {held} to {rows} rows ({added / 2**20:.1f} MiB more) exceeds "
                 f"the device memory: {error}"
             ) from error
-    for member in members:
-        member._publish_rows(rows)
+    rows = max(rows, min(member.covered_rows() for member in members_to_publish))
+    for member in members_to_publish:
+        if member.rows < rows:
+            member._publish_rows(rows)
+    return rows
 
 
 class ContactPool:
@@ -552,47 +619,73 @@ class ContactPool:
     def __init__(self, *, device, rows: int | None = None):
         self.device = wp.get_device(device)
         self.ready = MIN_READY_ROWS if rows is None else max(int(rows), 0)
-        # Queried once: the bound is recomputed when a member is collected, possibly during capture.
+        # Queried once: the bound is recomputed when members are added, possibly during capture.
         self._device_memory = int(self.device.total_memory) if self.device.is_cuda else 0
         self._members: list[weakref.ReferenceType] = []
-        # The bound of the live members, recomputed after one is collected.
+        # The bound of the members so far. It never rises: graphs captured at it keep covering the rows.
         self._bound = INDEX_LIMIT
-        self._bound_stale = False
         self._followers: list[weakref.ReferenceType] = []
+        self.ready_rows = None
+        """The ready rows on the device: writers' row limit and the rows bound launches follow (int32, shape 1)."""
         # The demand record, allocated here, outside any graph capture that records demand. A pool
         # created during a capture (for a buffer created lazily in it) records none: it grows by
         # reservations and by following its leader.
         self._high_water = None
         self._high_water_host = None
+        self.rows_used = None
+        """The most contacts any recorded pass held, at most the ready rows then (int32, shape 1, on the device):
+        the rows a sweep over every used row covers. ``None`` for a pool created during capture."""
         if not capturing(self.device):
+            self.ready_rows = wp.full(1, self.ready, dtype=wp.int32, device=self.device)
+            self.rows_used = wp.zeros(1, dtype=wp.int32, device=self.device)
             self._high_water = wp.zeros(1, dtype=wp.int32, device=self.device)
-            self._high_water_host = self._high_water
+            # [high-water mark, the last pass's demand]
+            self._high_water_host = wp.zeros(2, dtype=wp.int32, device=self.device)
             if self.device.is_cuda:
                 _RETIRED_HOST.clear()
-                self._high_water_host = wp.zeros(1, dtype=wp.int32, device="cpu", pinned=True)
+                self._high_water_host = wp.zeros(2, dtype=wp.int32, device="cpu", pinned=True)
                 weakref.finalize(self, _RETIRED_HOST.append, self._high_water_host).atexit = False
         # The record kernel writes the mark straight into the host copy, which pinned memory maps into the
         # device's address space: a copy node per collision pass costs a contact-free task 5-8% of its step.
         self._high_water_mirror = self._high_water_host
-        if self._high_water_host is not self._high_water:
+        if self._high_water_host is not None and self._high_water_host.device != self.device:
             self._high_water_mirror = wp.array(
-                ptr=self._high_water_host.ptr, dtype=wp.int32, shape=(1,), device=self.device
+                ptr=self._high_water_host.ptr, dtype=wp.int32, shape=(2,), device=self.device
             )
         self.growth_count = 0
-        """Growths so far; each one requires recapturing graphs that use the pool."""
+        """Growths so far."""
         self._reserved = 0
-        # Growths of live rows in this pool (see generation).
-        self._changes = 0
+        # Graph binding: the updater recorded last, by capture, and the captures that sized work by the host's rows.
+        self._graph_ops = None
+        self._update_status = None
+        self._recording: tuple[weakref.ReferenceType, Any] | None = None
+        # Live captures that sized work by the host's rows, with the ready rows they sized it by.
+        self._unbound_captures: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+        self._stale_on_growth = False
+        vm = _virtual_memory() if self.device.is_cuda and self.ready_rows is not None else None
+        if vm is not None:
+            graph_ops = vm[3]
+            self._update_status = wp.zeros(UPDATE_BINDINGS, dtype=wp.int32, device=self.device)
+            try:
+                # One preparation outside capture loads the updater; captures then prepare tables freely.
+                graph_ops.prepare_updates(
+                    self.ready_rows,
+                    enable_count_maximum=INDEX_LIMIT,
+                    binding_capacity=UPDATE_BINDINGS,
+                    errors=self._update_status,
+                )
+            except Exception as error:  # No toolkit or bridge: launches stay unbound.
+                logger.info("Rigid contact launches are not bound to graph updates: %s", error)
+            else:
+                self._graph_ops = (graph_ops, vm[4])
 
     @property
     def bound(self) -> int:
-        """The most rows the device could back for the pool's live fields (:func:`device_row_limit`).
+        """The most rows the device could back for the pool's fields (:func:`device_row_limit`).
 
-        Every live member's storage holds it: a member reserves the bound when it is created, and
-        the bound only rises again when a member that lowered it is collected."""
-        if self._bound_stale:
-            self._bound_stale = False
-            self._bound = self._limit(())
+        Every member's storage reserves at least it: a member reserves the bound
+        when it is created, and the bound never rises, so a graph captured at it
+        covers every row the pool may grow to."""
         return self._bound
 
     @property
@@ -606,22 +699,22 @@ class ContactPool:
         return self.ready < self.bound
 
     def _limit(self, fields) -> int:
-        """Return the bound of the live members plus ``fields``: the device limit for all their bytes per row,
-        at most what every field can index and what every live member reserved."""
+        """Return the bound with ``fields`` added: the device limit for all live bytes per row, at most every
+        field's index limit and the bound so far."""
         members = self._live_members()
-        groups = [(member.fields, member._mode == "virtual") for member in members]
+        groups = [member.fields for member in members]
         fields = tuple(fields)
         if fields:
-            groups.append((fields, _virtual_rows(self.device, fields) is not None))
-        row_bytes = sum(field.row_bytes for group, _ in groups for field in group)
-        index_limit = min([INDEX_LIMIT, *(field.row_limit(virtual) for group, virtual in groups for field in group)])
+            groups.append(fields)
+        row_bytes = sum(field.row_bytes for group in groups for field in group)
+        index_limit = min([INDEX_LIMIT, *(field.row_limit() for group in groups for field in group)])
         limit = device_row_limit(self.device, row_bytes, index_limit, memory=self._device_memory)
-        return min([limit, *(member.reserve for member in members)])
+        return min(limit, self._bound)
 
     def rows(self, fields, *, on_rows=None) -> ContactRows:
         """Create per-contact fields that follow this pool's ready rows (see :class:`ContactRows`).
 
-        Their bytes per row lower the pool's bound while they live; their storage reserves the new bound.
+        Their bytes per row lower the pool's bound; their storage reserves the new bound.
 
         Raises:
             MemoryError: If the device cannot back the pool's ready rows of every field.
@@ -635,10 +728,38 @@ class ContactPool:
                 f"{bound}"
             )
         rows = ContactRows(fields, rows=self.ready, reserve=bound, device=self.device, on_rows=on_rows)
-        pool = weakref.ref(self)
-        self._members.append(weakref.ref(rows, lambda _, pool=pool: _mark_bound_stale(pool())))
+        self._members.append(weakref.ref(rows))
         self._bound = bound
         return rows
+
+    def settle(self) -> None:
+        """Publish every row all live members hold, outside capture: CUDA virtual memory maps whole granules.
+
+        The rows past the requested ones cost no memory, so writers fill them
+        instead of dropping contacts. Owners call this once their members exist
+        (:meth:`newton.CollisionPipeline.contacts`, :meth:`service`); a member
+        created later maps as many rows. A buffer sized explicitly keeps its
+        rows until it grows. Followers follow.
+        """
+        members = self._live_members()
+        if not members or capturing(self.device):
+            return
+        covered = min(member.covered_rows() for member in members)
+        if covered <= self.ready:
+            return
+        for member in members:
+            member._publish_rows(covered)
+        self._publish_ready(covered)
+        # More rows to write: a graph that sized work by the old rows must learn of it as of a growth.
+        self.growth_count += 1
+        for pool in self._closure():
+            if pool.ready < covered:
+                pool.grow(covered)
+
+    def _publish_ready(self, rows):
+        self.ready = int(rows)
+        if self.ready_rows is not None:
+            self.ready_rows.fill_(self.ready)
 
     def follow(self, other: ContactPool) -> None:
         """Make ``other`` grow with this pool: its rows stay at least this pool's ready rows.
@@ -658,11 +779,14 @@ class ContactPool:
             self._followers.append(weakref.ref(other))
 
     def grow(self, rows: int) -> bool:
-        """Grow the ready rows of this pool and its followers to at least ``rows``.
+        """Grow the ready rows of this pool and its followers to at least ``rows``, outside capture.
+
+        Virtual rows grow without joining the GPU and keep their addresses; the
+        new ready rows reach the device in stream order.
 
         Returns:
-            Whether any live buffer changed. Graphs that captured them must then
-            be recaptured to use the new rows (:attr:`generation` counts it).
+            Whether graphs that captured the buffers must be recaptured: some
+            capture sized work by the host's rows, or rows were reallocated.
 
         Raises:
             MemoryError: Before changing anything, if the device cannot back the rows.
@@ -677,13 +801,33 @@ class ContactPool:
                     f"{pool.device} cannot back {rows} rigid contact rows of {pool.row_bytes} bytes: it holds at "
                     f"most {pool.bound}"
                 )
-        growing = [(pool, pool._live_members()) for pool in pools if pool.ready < rows]
-        _grow_rows([member for _, members in growing for member in members], rows)
-        for pool, members in growing:
-            pool.ready = rows
+        for pool in pools:
+            if pool.ready >= rows:
+                continue
+            members = pool._live_members()
+            # Virtual rows hold every row their pages cover, often more than asked for.
+            pool._publish_ready(_grow_rows(members, rows))
             pool.growth_count += 1
-            pool._changes += int(bool(members))
-        return any(members for _, members in growing)
+            pool._stale_on_growth |= any(not member.virtual for member in members)
+        return self.needs_recapture
+
+    @property
+    def generation(self) -> int:
+        """Growths of this pool and the pools that follow it, for owners that report each growth once."""
+        return sum(pool.growth_count for pool in self._closure())
+
+    @property
+    def needs_recapture(self) -> bool:
+        """Whether graphs that captured this pool's or its followers' buffers must be recaptured after growth.
+
+        True when a live capture sized work by fewer rows than the pool holds
+        now, or when growth reallocated rows; a graph whose contact launches are
+        all bound follows the rows without a recapture.
+        """
+        return any(
+            pool._stale_on_growth or any(rows < pool.ready for rows in pool._unbound_captures.values())
+            for pool in self._closure()
+        )
 
     def reserve(self, rows: int) -> bool:
         """Hold at least ``rows`` ready rows from now on, for a writer that produces its own contacts.
@@ -695,8 +839,7 @@ class ContactPool:
         their overflow.
 
         Returns:
-            Whether live buffers grew now; graphs that captured them must be
-            recaptured (:meth:`service` reports it too).
+            Whether graphs that captured the buffers must be recaptured (see :meth:`grow`).
 
         Raises:
             MemoryError: If the device cannot back ``rows`` rows of the pool's fields.
@@ -710,11 +853,13 @@ class ContactPool:
                 f"it holds at most {self.bound}"
             )
         if capturing(self.device):
+            # The writer fills the rows of capture time on every replay: its graph must be recaptured after growth.
+            self.note_unbound()
             if rows > self._reserved:
                 warnings.warn(
                     f"{rows} rigid contact rows were reserved during CUDA graph capture, with {self.ready} ready: "
                     "writers drop and flag the rows past them until the pool's service (or a reservation outside "
-                    "capture) grows it; recapture then",
+                    "capture) grows it",
                     RuntimeWarning,
                     stacklevel=3,
                 )
@@ -723,12 +868,13 @@ class ContactPool:
         self._reserved = max(self._reserved, rows)
         return self.grow(reserved_rows(rows, self.bound))
 
-    def fit(self, count: int) -> bool:
-        """Grow outside capture when a pass's ``count`` filled the rows, to :func:`sized_rows` for it.
+    def fit(self) -> bool:
+        """Grow outside capture when the last recorded pass filled the rows, to :func:`sized_rows` for its count.
 
-        A collision pass outside capture calls this with its count before
-        anything reads the rows. Some writers stop counting once the rows are
-        full, so a count at the ready rows counts as an overflow too.
+        A collision pass outside capture calls this after :meth:`record_demand`,
+        before anything reads the rows. It synchronizes the stream to read the
+        pass's count. Some writers stop counting once the rows are full, so a
+        count at the ready rows counts as an overflow too.
 
         Returns:
             Whether the rows grew, so the pass must run again.
@@ -736,6 +882,11 @@ class ContactPool:
         Raises:
             MemoryError: If the rows are full at the device bound.
         """
+        if self._high_water_host is None:
+            return False
+        if self.device.is_cuda:
+            wp.synchronize_stream(wp.get_stream(self.device))
+        count = int(self._high_water_host.numpy()[1])
         if count <= 0 or count < self.ready:
             return False
         target = sized_rows(count, self.ready, self.bound)
@@ -749,11 +900,8 @@ class ContactPool:
     def size(self, demand: int) -> bool:
         """Hold :func:`sized_rows` for a measured demand of ``demand`` contacts, outside capture; never shrink.
 
-        :meth:`newton.CollisionPipeline.service_capacity` calls this with the
-        contacts of the state a graph starts from, before the graph is captured.
-
         Returns:
-            Whether live buffers grew; graphs that captured them must be recaptured.
+            Whether graphs that captured the buffers must be recaptured (see :meth:`grow`).
 
         Raises:
             MemoryError: If the device cannot back ``demand`` rows of the pool's fields.
@@ -772,17 +920,33 @@ class ContactPool:
             return False
         return self._grow_logged(target, demand)
 
-    def record_demand(self, count: wp.array) -> None:
-        """Record the contact count in the sticky high-water mark and in its pinned host copy.
+    def record_demand(self, count: wp.array, rows: wp.array, status: wp.array | None = None) -> None:
+        """Record a pass's contact count as demand, then clamp it to the rows the writers held.
 
-        One launch, which graph capture records: it writes the host copy directly.
+        One launch, which graph capture records: it raises the sticky high-water
+        mark and writes it and the pass's count into the pinned host copy (a
+        pool created during capture records no demand), and when the count
+        exceeds ``rows`` (the writers dropped the rows past them) sets it to
+        ``rows`` and :data:`CAPACITY_OVERFLOW` in ``status``.
+
+        Args:
+            count: The pass's contact count (int32, shape 1), written by its writers.
+            rows: The writers' row limit on the device: :attr:`ready_rows`, or the
+                rows a pool created during capture holds.
+            status: A capacity-status array (int32) whose element 0 flags the overflow, or ``None``.
         """
-        if self._high_water is None or not self.growable:
-            return
+        empty = wp.empty(0, dtype=wp.int32, device=self.device)
         wp.launch(
-            _record_high_water,
+            _record_demand,
             dim=1,
-            inputs=[count, self._high_water, self._high_water_mirror],
+            inputs=[
+                count,
+                rows,
+                empty if self._high_water is None else self._high_water,
+                empty if self._high_water is None else self._high_water_mirror,
+                empty if self.rows_used is None else self.rows_used,
+                empty if status is None else status,
+            ],
             device=self.device,
             record_tape=False,
         )
@@ -793,15 +957,21 @@ class ContactPool:
         return 0 if self._high_water_host is None else int(self._high_water_host.numpy()[0])
 
     def service(self) -> bool:
-        """Grow from the recorded demand and reservations, outside capture; return whether live buffers grew.
+        """Grow from the recorded demand and reservations, outside capture, without synchronizing.
 
-        Reads the pinned high-water mark without synchronizing, so it lags the
-        device by the passes still in flight. Grows to :func:`grown_rows`, or to
-        a reservation made during capture, logging the change. A high-water mark
-        at or above the ready rows means a graph replay may have dropped
-        contacts: its capacity status stays flagged and this warns.
+        Reads the pinned high-water mark, which lags the device by the passes
+        still in flight, and grows to :func:`grown_rows` or to a reservation made
+        during capture, logging the change. Bound graphs follow the new rows from
+        their next replay. A high-water mark at or above the ready rows means a
+        replay dropped contacts, which its capacity status flags; this warns.
+
+        Returns:
+            Whether graphs that captured the buffers must be recaptured (see :meth:`grow`).
         """
-        if capturing(self.device) or not self.growable:
+        if capturing(self.device):
+            return False
+        self.settle()
+        if not self.growable:
             return False
         high_water = self.high_water
         target = grown_rows(high_water, self.ready, self.bound)
@@ -810,31 +980,21 @@ class ContactPool:
         if target <= self.ready:
             return False
         previous = self.ready
-        grew = self._grow_logged(target, high_water)
+        recapture = self._grow_logged(target, high_water)
         if high_water >= previous:
             warnings.warn(
-                f"Rigid contact demand {high_water} reached the {previous} ready rows in a graph replay, which may "
-                f"have dropped contacts (its capacity status stays flagged); the buffers grew to {target} rows, and "
-                "graphs that use them must be recaptured. Size them before capturing: step the scene outside capture "
-                "until its first contacts settle (bodies that start in the air land then), then call "
-                "CollisionPipeline.service_capacity(state) with the state the graph starts from.",
+                f"Rigid contact demand {high_water} reached the {previous} ready rows in a graph replay, which "
+                f"dropped the contacts past them (its capacity status flags it); the buffers grew to {target} rows "
+                "for the next replay.",
                 RuntimeWarning,
                 stacklevel=3,
             )
-        return grew
-
-    @property
-    def generation(self) -> int:
-        """Growths of live rows in this pool and the pools that follow it.
-
-        A graph captured at another generation must be recaptured before its next replay.
-        """
-        return sum(pool._changes for pool in self._closure())
+        return recapture
 
     def _grow_logged(self, target: int, demand: int) -> bool:
         previous = self.ready
         before = self.mapped_bytes()
-        grew = self.grow(target)
+        recapture = self.grow(target)
         logger.info(
             "Rigid contact pool grew from %d to %d rows (demand %d, reserved %d, device bound %d): %.1f -> %.1f MiB",
             previous,
@@ -845,7 +1005,164 @@ class ContactPool:
             before / 2**20,
             self.mapped_bytes() / 2**20,
         )
-        return grew
+        return recapture
+
+    # -- graph binding -----------------------------------------------------------------------------------------
+
+    @property
+    def bindable(self) -> bool:
+        """Whether contact launches in a CUDA graph capture bind to device graph updates.
+
+        Requires ``gpu_components``' graph bridge and virtual rows for every
+        member: reallocated rows move, so graphs that use them cannot follow growth.
+        """
+        return self._graph_ops is not None and all(member.virtual for member in self._live_members())
+
+    def _binding_owner(self):
+        """Return the capture that a contact launch now binds into, or ``None`` when it does not bind."""
+        owner = _capture_owner(self.device)
+        if owner is None:
+            return None
+        if self.bindable:
+            return owner
+        self._note(owner)
+        return None
+
+    def _note(self, owner) -> None:
+        # Growth cannot happen during a capture, so the rows a capture sized work by are the rows of its start.
+        self._unbound_captures[owner] = self.ready
+
+    def note_unbound(self) -> None:
+        """Note that the current capture sized work by the host's row count: it must be recaptured after growth.
+
+        :attr:`newton.Contacts.rigid_contact_max` calls this when read during a capture."""
+        owner = _capture_owner(self.device)
+        if owner is not None:
+            self._note(owner)
+        elif capturing(self.device):
+            # A capture Warp does not own: nothing to follow, so every growth asks for a recapture.
+            self._stale_on_growth = True
+
+    def launch_rows(self) -> int:
+        """Return the rows a contact-sized launch is sized for now.
+
+        The bound in a capture whose launches bind (each replay then shrinks
+        them, see :meth:`launch`), otherwise the ready rows.
+        """
+        return self.bound if self._binding_owner() is not None else self.ready
+
+    def begin_updates(self) -> None:
+        """Record a device graph updater, in a capture whose launches bind, for the launches that follow.
+
+        A collision pass calls this right after its writers and :meth:`record_demand`,
+        so its consumers and the solvers that step its contacts follow the count it
+        produced. Outside capture this does nothing.
+        """
+        owner = self._binding_owner()
+        if owner is not None:
+            self._open_updates(owner)
+
+    def _open_updates(self, owner):
+        graph_ops, _ = self._graph_ops
+        updates = graph_ops.prepare_updates(
+            self.ready_rows,
+            enable_count_maximum=self.bound,
+            binding_capacity=UPDATE_BINDINGS,
+            errors=self._update_status,
+        )
+        graph_ops.record_update(updates)
+        self._recording = (weakref.ref(owner), updates)
+        return updates
+
+    def _updates_for(self, owner):
+        recording = self._recording
+        if recording is not None and recording[0]() is owner:
+            updates = recording[1]
+            if len(updates.bindings) < updates.binding_capacity:
+                return updates
+        return self._open_updates(owner)
+
+    def launch(
+        self,
+        kernel,
+        dim,
+        *,
+        inputs=(),
+        outputs=(),
+        extent: wp.array | None = None,
+        axis: int = 0,
+        scale: int = 1,
+        clamp: bool = False,
+        row_args: tuple[int, ...] = (),
+        tiled: bool = False,
+        block_dim: int = 0,
+        max_blocks: int = 0,
+    ) -> None:
+        """Launch a kernel sized by contact rows, binding it in a capture so replays follow growth.
+
+        Size ``dim`` (and any thread-count argument) for :meth:`launch_rows`,
+        called right before. Outside capture this is an ordinary launch. In a
+        capture whose launches bind, the launch is captured at the bound and
+        bound to the current device graph updater: each replay runs axis ``axis``
+        of ``dim`` at ``extent * scale`` (``scale`` launch items per counted
+        item, e.g. 3 threads per contact), where ``extent`` is a device count of
+        at most the ready rows (the live contact count, or :attr:`ready_rows` for
+        work over every row), and rewrites the int32 arguments at ``row_args``
+        (indices from 1, the first kernel argument) with the ready rows.
+        ``clamp`` serves kernels that stride over their own count with the
+        launched threads as their stride: a replay then runs at most the
+        captured threads. A zero extent skips the kernel. A sweep over every
+        row the stream used takes ``extent=rows_used``, and one over every row
+        ``extent=ready_rows``. ``extent=None`` keeps the captured size, so
+        ``dim`` must then not depend on the rows.
+        """
+        owner = self._binding_owner()
+        if owner is None:
+            # Contact bookkeeping is forward-only: an active autodiff tape records none of it.
+            options = {"block_dim": block_dim} if block_dim else {}
+            if tiled:
+                wp.launch_tiled(
+                    kernel,
+                    dim=dim,
+                    inputs=list(inputs),
+                    outputs=list(outputs),
+                    device=self.device,
+                    record_tape=False,
+                    **(options or {"block_dim": 256}),
+                )
+            else:
+                if max_blocks:
+                    options["max_blocks"] = max_blocks
+                wp.launch(
+                    kernel,
+                    dim=dim,
+                    inputs=list(inputs),
+                    outputs=list(outputs),
+                    device=self.device,
+                    record_tape=False,
+                    **options,
+                )
+            return
+        graph_ops, parameter = self._graph_ops
+        updates = self._updates_for(owner)
+        graph_ops.launch(
+            updates,
+            kernel,
+            dim,
+            inputs=list(inputs),
+            outputs=list(outputs),
+            extent_axis=None if extent is None else axis,
+            extent_source=extent,
+            extent_scale=scale,
+            clamp_extent=clamp,
+            parameters=tuple(parameter(index, self.ready_rows, self.bound) for index in row_args),
+            tiled=tiled,
+            block_dim=block_dim,
+            max_blocks=max_blocks,
+            device=self.device,
+        )
+
+    # ----------------------------------------------------------------------------------------------------------
 
     def mapped_bytes(self) -> int:
         """Return the device bytes this pool's and its followers' rows hold now."""
@@ -884,9 +1201,7 @@ def model_contact_pool(model, device=None) -> ContactPool:
 
     The model's collision pipelines with their :class:`~newton.Contacts` and the
     per-contact state of the solvers that step the model hold the same ready
-    rows, so they grow together: a solver constructed before the pipeline is
-    sized with it when the pipeline measures a state before a graph is captured
-    (:meth:`newton.CollisionPipeline.service_capacity`), never during the capture.
+    rows, so they grow together.
 
     Args:
         model: The model whose rigid contacts the buffers hold.

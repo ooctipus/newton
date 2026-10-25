@@ -5199,9 +5199,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         (:meth:`~newton.Contacts.reserve_rigid_contacts`), which grows a buffer from
         :meth:`newton.CollisionPipeline.contacts` outside graph capture. During
         capture the growth waits for :meth:`newton.CollisionPipeline.service_capacity`;
-        until then ``rigid_contact_count`` keeps MJWarp's count, contacts past
-        ``rigid_contact_max`` are dropped and the ``source_contacts`` flag of
-        :meth:`contact_capacity_status` is set.
+        until then contacts past ``rigid_contact_max`` are dropped,
+        ``rigid_contact_count`` holds the rows kept, and the ``source_contacts``
+        flag of :meth:`contact_capacity_status` is set.
 
         Raises:
             MemoryError: If the device cannot back that many contact rows.

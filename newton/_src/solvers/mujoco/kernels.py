@@ -1504,16 +1504,17 @@ def create_convert_mjw_contacts_to_newton_kernel():
         Contact positions are converted from MuJoCo world frame to Newton body-local frame.
         Contact forces are computed via ``mujoco_warp`` ``contact_force_fn``.
 
-        Like the collision pipeline's writer, the count keeps MuJoCo's contact count
-        while only the rows the Newton arrays hold are written; a count past them sets
-        the ``source_contacts`` bit (2) of ``contact_capacity_status``.
+        Like the collision pipeline, only the rows the Newton arrays hold are written
+        and the count is clamped to them, so consumers read every row below it; MuJoCo
+        contacts past them set the ``source_contacts`` bit (2) of
+        ``contact_capacity_status``.
         """
         contact_idx = wp.tid()
         n_contacts = mj_nacon[0]
         rows = rigid_contact_shape0.shape[0]
 
         if contact_idx == 0:
-            rigid_contact_count[0] = n_contacts
+            rigid_contact_count[0] = wp.min(n_contacts, rows)
             if n_contacts > rows:
                 wp.atomic_or(contact_capacity_status, 0, 2)
 

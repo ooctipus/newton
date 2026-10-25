@@ -1928,14 +1928,21 @@ storage is allocated explicitly.
 
 There is no rigid contact budget to configure. The rigid contact buffers of a
 model's pipelines, of their :meth:`~CollisionPipeline.contacts` and of the solvers
-that step the model share one set of rows: they start at 4096 rows and are sized
-from the measured contact count, 2.5 rows per contact, keeping their contents, up to
-what the device memory can back; a growth the device cannot back raises
-:class:`MemoryError`. A ``collide`` outside graph capture grows the buffers before
-anything reads them, so it never drops a contact. Writers that produce contacts of
-their own (such as MuJoCo's or Kamino's collision) declare how many they may write
-with :meth:`~Contacts.reserve_rigid_contacts`. A graph replays fixed buffer extents
-and cannot grow them: see :ref:`Graph capture <Contact graph capture>`.
+that step the model share one set of rows, which grows from the measured contact
+count to 2.5 rows per contact, keeping their contents, up to what the device
+memory can back; a growth the device cannot back raises :class:`MemoryError`. On
+CUDA with the optional ``gpu_components`` package the rows are CUDA virtual memory:
+every per-contact field reserves addresses for as many rows as the device memory
+could hold and maps physical pages for the rows in use, starting with every row
+its first pages hold; growth maps more pages behind the same addresses without
+synchronizing the device. Without it, and on the CPU, the rows are ordinary arrays
+that start at 4096 rows and that growth reallocates. A ``collide`` outside graph
+capture grows the buffers before anything reads them, so it never drops a
+contact; a pass never counts more contacts than its buffers hold
+(``rigid_contact_count`` is clamped to them and the drop flagged). Writers that
+produce contacts of their own (such as MuJoCo's or Kamino's collision) declare how
+many they may write with :meth:`~Contacts.reserve_rigid_contacts`. Graph replays
+follow the growth: see :ref:`Graph capture <Contact graph capture>`.
 
 ``CollisionPipeline(rigid_contact_max=...)``, :attr:`CollisionPipeline.rigid_contact_max`,
 ``Model.rigid_contact_max`` and ``ModelBuilder.num_rigid_contacts_per_world`` are kept
@@ -2494,18 +2501,19 @@ Performance
 
 The simulation loop (including ``collide`` and ``solver.step``) can be captured with
 ``wp.ScopedCapture`` for reduced launch overhead. Place ``collide`` inside the
-captured region so it is replayed each frame. A replay runs at the contact buffer
-extents of its capture, so measure the state the graph starts from before capturing
-it, and after each frame grow the buffers from the recorded demand and recapture
-when they grew (:meth:`~CollisionPipeline.service_capacity`). Bodies that start
-above the ground or fall into new contacts in the first steps have more contacts
-than their starting state, and a replay cannot grow the buffers in time (the
-service reads the demand of steps already in flight): step such a scene outside
-capture until its first contacts settle (its passes grow the buffers before
-anything reads them), then measure and capture it. A pile of 256 parts dropped
-into a bin per world, for example, ramps from 15 to 9,100 contacts per world in
-its first seven frames; ten uncaptured frames size it so that no replay drops a
-contact.
+captured region so it is replayed each frame. With ``gpu_components`` a replay
+follows the contact buffers as they grow: the pipeline's contact-sized launches,
+its sort, matching and body-pair reduction, and those of
+:class:`~solvers.SolverFeatherPGS` are captured at the most rows the device could
+back and bound to a device graph updater, which shrinks each of them on every
+replay to the contact count of that replay. Call
+:meth:`~CollisionPipeline.service_capacity` once per frame outside capture: it reads
+the recorded contact high-water mark without synchronizing and, once it passes 60%
+of the rows, maps more rows for the next replays. It returns ``True`` only when a
+live graph must be recaptured: one with a consumer that sized work by the rows of
+its capture (a solver such as MuJoCo, XPBD or VBD that reads
+:attr:`~Contacts.rigid_contact_max` while capturing), or buffers without virtual
+memory, whose growth reallocates them.
 
 .. code-block:: python
 
@@ -2518,20 +2526,25 @@ contact.
         return capture.graph
 
     if wp.get_device().is_cuda:
-        pipeline.service_capacity(state_0)  # size the buffers to the starting state
         graph = capture()
 
         # Each frame:
         wp.capture_launch(graph)
-        if pipeline.service_capacity():  # the contact buffers grew
+        if pipeline.service_capacity():  # a graph sized work by the old rows
             graph = capture()
 
-A replayed pass whose contacts outgrew the buffers drops the rows past them and
-flags it (:meth:`~geometry.NarrowPhase.check_buffer_capacity`);
-:meth:`~CollisionPipeline.service_capacity` then grows the buffers and warns, so a
-graph captured without measuring its starting state warns at its first step if that
-state's contacts did not fit the initial rows. The example runner
-(``newton.examples.run``) measures, services and recaptures the examples this way.
+A replayed pass whose contacts outnumber the rows drops the rows past them and flags
+it (:meth:`~geometry.NarrowPhase.check_buffer_capacity`), and
+:meth:`~CollisionPipeline.service_capacity` warns. The service sees the demand of
+replays that already ran, so the replays launched before it also run at the old
+rows: at least the next one, more when the host runs ahead of the device. A scene
+whose contacts jump, such as a pile of parts dropped into a bin, interpenetrates
+over those frames. To hold its contacts from the first replay, size the buffers
+before capturing: measure the state a graph starts from with
+``service_capacity(state)``, or step the scene outside capture until its contacts
+settle (its passes grow the buffers before anything reads them). The example
+runner (``newton.examples.run``) measures, services and recaptures the examples
+this way.
 
 .. _Solver Integration:
 

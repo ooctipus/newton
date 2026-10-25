@@ -51,6 +51,7 @@ import numpy as np
 import warp as wp
 
 from ...core.contact_pool import ContactField, ContactPool
+from ...core.live_sort import EXTENT_SIZE, SORT_CHUNK, launch_live_sort, publish_sort_extent, slot_keys_fit, sort_grid
 from ...math.spatial import velocity_at_point
 from ...sim.contacts import GENERATION_SENTINEL, capture_scope, contact_frame_write
 from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
@@ -67,8 +68,6 @@ _BLOCK_THREADS = 256
 # 0.77x per call with 512k live contacts, the link 0.67x with 346k, a new
 # frame's prepare 0.98x to 1.05x, and no change with 1.6k.
 _LIGHT_BLOCKS_PER_SM = 6
-# Each of the live sort's chunk blocks sorts 2048 slots in shared memory.
-_SORT_BLOCKS_PER_SM = 2
 # A _build thread walks one body pair's run, a chain of dependent loads at 96
 # registers. One-warp blocks fit 21 warps per SM instead of two 256-thread
 # blocks' 16, free each warp's slot when it finishes rather than with its
@@ -78,14 +77,8 @@ _SORT_BLOCKS_PER_SM = 2
 # with 346k, 0.81x with 1.6k of a 4M capacity.
 _BUILD_BLOCK_DIM = 32
 _BUILD_BLOCKS_PER_SM = 8
-# _merge_runs keeps the former build grid: a live sort launches it for every
-# merge round its capacity allows, mostly over few live slots.
-_MERGE_BLOCKS_PER_SM = 4
-# The live sort orders chunks of _SORT_CHUNK slots in shared memory by
-# (key, slot) and then merges sorted runs pairwise.
-_SORT_CHUNK = wp.constant(2048)
-_SORT_SLOT_BITS = wp.constant(11)
-_SORT_PAD = wp.constant(wp.int64(1 << 62))
+# The patch extent: the slots to visit, then the live sort's extent (live_sort.publish_sort_extent).
+_SORT_EXTENT = wp.constant(1)
 # Contact centres carry the narrow phase's float32 world-space quantization. On
 # a resting 0.1 m cube it reads as a relative anisotropy of the footprint's
 # second moments of up to 1.2e-6 at 1.5 m from the origin, 9.5e-6 at 10 m and
@@ -491,6 +484,21 @@ def _prepare_contact_fields(
     return wp.int64(ka) * wp.int64(key_stride) + wp.int64(kb)
 
 
+# Defined ahead of _prepare_frame: a kernel of a unique module is named after the functions
+# defined when it is decorated, and a later definition would rename it after its first load.
+@wp.func
+def _publish_extent(extent: wp.array[int], end: int, live: int):
+    """Publish the slots to visit, then the live sort's extent of the live slots.
+
+    ``extent[0]`` holds the slots to visit and ``extent[1:]`` the sort extent
+    (:func:`~newton._src.core.live_sort.publish_sort_extent`), whose first entry
+    is the live count: a captured live sort follows it, launching no work past
+    the live slots.
+    """
+    extent[0] = end
+    publish_sort_extent(extent, _SORT_EXTENT, live)
+
+
 @wp.kernel(enable_backward=False)
 def _prepare(
     count: wp.array[int],
@@ -523,21 +531,18 @@ def _prepare(
 ):
     """Fill this frame's contact slots and clear every slot an earlier frame used.
 
-    The narrow phase counts contacts before checking its capacity, so an
-    overflowing count describes an incomplete frame and leaves no contact live.
-    Slots past the stored and the last built frame already hold the empty
+    A collision pass clamps the count to the rows it wrote, so every slot below
+    it is live. Slots past the stored and the last built frame already hold the empty
     record. Thread 0 publishes the slots to visit and the live count; this
     launch reads neither.
     """
     thread = wp.tid()
     live = count[0]
-    if live < 0 or live > shape0.shape[0]:
+    if live < 0:
         live = 0
-    live = wp.min(live, frame.valid.shape[0])
     end = wp.max(live, wp.max(stored[0], built[0]))
     if thread == 0:
-        extent[0] = end
-        extent[1] = live
+        _publish_extent(extent, end, live)
     for c in range(thread, end, threads):
         _prepare_contact(
             c,
@@ -626,9 +631,8 @@ def _prepare_frame(
     thread = wp.tid()
     raw = count[0]
     live = raw
-    if live < 0 or live > shape0.shape[0]:
+    if live < 0:
         live = 0
-    live = wp.min(live, frame.valid.shape[0])
     end = wp.max(live, wp.max(stored[0], built[0]))
     recorded = int(0)
     if (
@@ -641,8 +645,7 @@ def _prepare_frame(
     if mode == _FRAME_KEEP and recorded == 0:
         live = 0
     if thread == 0:
-        extent[0] = end
-        extent[1] = live
+        _publish_extent(extent, end, live)
         # The slots hold a frame without live contacts sorted as soon as it is
         # prepared; a thread that reads its record keeps no slot.
         if mode == _FRAME_SORT or (mode == _FRAME_DETECT and recorded == 0 and live == 0):
@@ -688,114 +691,6 @@ def _prepare_frame(
         if recorded == 0 or c >= live:
             frame.indices[c] = c
             frame.keys[c] = key
-
-
-@wp.func
-def _chunk_key(key: wp.int64, local: int, start: int, live: int):
-    """Order a chunk's slots by (pair key, slot); slots past the live count sort last, in slot order."""
-    if start + local < live:
-        return (key << wp.int64(_SORT_SLOT_BITS)) | wp.int64(local)
-    return _SORT_PAD + wp.int64(local)
-
-
-@wp.func
-def _chunk_pair_key(order: wp.int64):
-    if order >= _SORT_PAD:
-        return wp.int64(0x7FFFFFFFFFFFFFFF)
-    return order >> wp.int64(_SORT_SLOT_BITS)
-
-
-@wp.func
-def _merge_rounds(live: int):
-    """Return the pairwise merges that join sorted chunks into one run of ``live`` slots."""
-    rounds = int(0)
-    width = int(_SORT_CHUNK)
-    while width < live and rounds < 30:
-        width *= 2
-        rounds += 1
-    return rounds
-
-
-# Below _SORT_CHUNK // 2 contact slots a chunk's tile reaches past the 2 * capacity
-# keys and indices: those capacities rely on wp.tile_store's bounds check, which
-# drops the stores past the arrays' end. They only hold padding past the live slots.
-@wp.kernel(enable_backward=False)
-def _sort_chunks(
-    slot_keys: wp.array[wp.int64],
-    slot_indices: wp.array[int],
-    keys: wp.array[wp.int64],
-    indices: wp.array[int],
-    extent: wp.array[int],
-    capacity: int,
-    blocks: int,
-):
-    """Sort each chunk of the live slots by (key, slot) in shared memory.
-
-    The composite keys are unique, so even an unstable sort orders a chunk as a
-    stable sort by key would. Each block strides over chunks; the output goes to
-    the half from which the merges end in the first. Chunks load through
-    ``slot_keys`` and ``slot_indices``, views of the first half that read zeros
-    past the capacity, so no block reads what another block of this launch
-    writes.
-    """
-    block = wp.tid()
-    live = extent[1]
-    output = capacity * (_merge_rounds(live) % 2)
-    for start in range(block * _SORT_CHUNK, live, blocks * _SORT_CHUNK):
-        loaded = wp.tile_load(slot_keys, shape=_SORT_CHUNK, offset=start)
-        local = wp.tile_arange(_SORT_CHUNK, dtype=int)
-        first = wp.tile_full(_SORT_CHUNK, start, dtype=int)
-        count = wp.tile_full(_SORT_CHUNK, live, dtype=int)
-        order = wp.tile_zeros(shape=_SORT_CHUNK, dtype=wp.int64, storage="shared")
-        # Warp hashes a function passed to a builtin only through wp.static();
-        # otherwise edits to the key maps would reuse a stale cached kernel.
-        wp.tile_assign(order, wp.tile_map(wp.static(_chunk_key), loaded, local, first, count))
-        values = wp.tile_load(slot_indices, shape=_SORT_CHUNK, offset=start, storage="shared")
-        wp.tile_sort(order, values)
-        wp.tile_store(keys, wp.tile_map(wp.static(_chunk_pair_key), order), offset=output + start)
-        wp.tile_store(indices, values, offset=output + start)
-
-
-@wp.kernel(enable_backward=False)
-def _merge_runs(
-    keys: wp.array[wp.int64],
-    indices: wp.array[int],
-    extent: wp.array[int],
-    capacity: int,
-    merge: int,
-    threads: int,
-):
-    """Merge sorted runs pairwise; each slot moves past the smaller slots of its partner run.
-
-    Slots compare by (key, index). Indices are unique, so no two slots tie and
-    every target position is distinct. Launches past the needed merges return.
-    """
-    thread = wp.tid()
-    live = extent[1]
-    rounds = _merge_rounds(live)
-    if merge >= rounds:
-        return
-    source = capacity * ((rounds + merge) % 2)
-    target = capacity * ((rounds + merge + 1) % 2)
-    width = int(_SORT_CHUNK) << merge
-    for i in range(thread, live, threads):
-        key = keys[source + i]
-        index = indices[source + i]
-        run = i // width
-        partner = run ^ 1
-        lo = partner * width
-        hi = wp.min(lo + width, live)
-        first = lo
-        while lo < hi:
-            mid = (lo + hi) // 2
-            other = keys[source + mid]
-            if other < key or (other == key and indices[source + mid] < index):
-                lo = mid + 1
-            else:
-                hi = mid
-        position = wp.min(run, partner) * width + (i - run * width) + (lo - first)
-        keys[target + position] = key
-        indices[target + position] = index
 
 
 @wp.func
@@ -1382,7 +1277,7 @@ def _uses_live_sort(key_bits):
     faster per step (franka, whose 1M-slot capacity had taken the radix sort
     for about 1,900 live contacts).
     """
-    return key_bits + _SORT_SLOT_BITS <= 62
+    return slot_keys_fit(key_bits)
 
 
 class _FrictionPatchState:
@@ -1417,6 +1312,8 @@ class _FrictionPatchState:
         device = model.device
         if pool is None:
             pool = ContactPool(device=device, rows=capacity)
+        self.pool = pool
+        self._rows_used = None
         self.capacity = pool.ready
         self.reuse_frames = bool(reuse_frames and enabled)
         # (capture scope, weak generation array, frame-write tick) of the previous
@@ -1469,7 +1366,7 @@ class _FrictionPatchState:
         # reads a count it writes, so blocks never race on them.
         self.stored = wp.zeros(1, dtype=int, device=device)
         self.built = wp.zeros(1, dtype=int, device=device)
-        self.extent = wp.zeros(2, dtype=int, device=device)
+        self.extent = wp.zeros(_SORT_EXTENT + EXTENT_SIZE, dtype=int, device=device)
         self._load_capture_modules()
 
     def _on_view_rows(self, rows):
@@ -1487,18 +1384,22 @@ class _FrictionPatchState:
         self._set_capacity(rows.rows)
 
     def _set_capacity(self, capacity):
-        """Size the fixed grids for ``capacity`` slots; CUDA graphs replay them until the next capture."""
+        """Hold the slots' capacity: the rows the radix fallback sorts and eager grids follow."""
         self.capacity = capacity
-        blocks = self.device.sm_count if self.device.is_cuda else 1
-        self.threads = max(1, min(capacity, _LIGHT_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
-        self.build_threads = max(1, min(capacity, _BUILD_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
         self.build_block_dim = _BUILD_BLOCK_DIM
-        self.merge_threads = max(1, min(capacity, _MERGE_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
         self.live_sort = _uses_live_sort(self.key_bits)
-        self.sort_blocks = max(1, min(-(-capacity // _SORT_CHUNK), _SORT_BLOCKS_PER_SM * blocks))
-        self.merges = 0
-        while _SORT_CHUNK << self.merges < capacity:
-            self.merges += 1
+        self._grids(capacity)
+
+    def _grids(self, rows):
+        """Size the grids for ``rows`` slots: the ready rows, or the bound of a capture whose launches bind.
+
+        Every launch strides over its device count, so a grid only has to fill the device.
+        """
+        blocks = self.device.sm_count if self.device.is_cuda else 1
+        self.threads = max(1, min(rows, _LIGHT_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
+        self.build_threads = max(1, min(rows, _BUILD_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
+        self.sort_blocks, self.merges, self.merge_threads = sort_grid(self.device, rows)
+        return self
 
     def _load_capture_modules(self):
         """Load the module of the kernel that captured builds launch first, on a CUDA device.
@@ -1598,8 +1499,9 @@ class _FrictionPatchState:
         for the radix sort.
         """
         fields = [
-            ContactField("keys", wp.int64, 0x7FFFFFFFFFFFFFFF, per_contact=2),
-            ContactField("indices", wp.int32, None, per_contact=2),
+            # One chunk of slack past the scratch half takes the live sort's padded tile stores.
+            ContactField("keys", wp.int64, 0x7FFFFFFFFFFFFFFF, per_contact=2, extra=int(SORT_CHUNK)),
+            ContactField("indices", wp.int32, None, per_contact=2, extra=int(SORT_CHUNK)),
             ContactField("mu", wp.vec2),
             ContactField("radius", wp.float32),
             ContactField("support_gap_limit", wp.float32),
@@ -1661,6 +1563,9 @@ class _FrictionPatchState:
                 "Friction patch pair keys were sized for another model: "
                 f"{bodies} body poses and {model.shape_body.shape[0]} shapes"
             )
+        self._grids(self.pool.launch_rows())
+        source = getattr(contacts, "_rigid_contact_pool", None)
+        self._rows_used = source.rows_used if source is self.pool else None
         prepare_inputs = self._prepare_inputs(
             model,
             state,
@@ -1721,19 +1626,30 @@ class _FrictionPatchState:
 
     def _prepare_and_sort(self, prepare_inputs):
         """Prepare and sort a frame that no record names, as builds without frame reuse do."""
-        wp.launch(_prepare, dim=self.threads, inputs=prepare_inputs, outputs=[self.extent], device=self.device)
+        self._launch_prepare(_prepare, prepare_inputs, [self.extent])
         self._order_pairs()
+
+    def _launch_prepare(self, kernel, inputs, outputs):
+        """Prepare the slots, a pass over every slot an earlier frame used, then follow its published extent.
+
+        The pass visits the live slots and those of the stored and the last built
+        frame, all among the rows the contact stream ever used (``rows_used``,
+        when the slots share the stream's pool). It publishes the live count and
+        the sort's work (:func:`_publish_extent`); in a capture whose launches
+        bind, the launches after it follow them through a new updater.
+        """
+        used = self._rows_used if self._rows_used is not None else self.pool.ready_rows
+        self.pool.launch(kernel, self.threads, inputs=inputs, outputs=outputs, extent=used, clamp=True)
+        self.pool.begin_updates()
 
     def _launch_build(self, model, state):
         """Build the pairs of the prepared, sorted slots."""
         # Warp compiles this module once more for _build's block size; the
         # variants differ only in the tile block size, which no _build
-        # arithmetic reads. That variant also tiles _sort_chunks for 32
-        # threads, which no launch uses and which about doubles the variant's
-        # compile time on a cold kernel cache.
-        wp.launch(
+        # arithmetic reads.
+        self.pool.launch(
             _build,
-            dim=self.build_threads,
+            self.build_threads,
             inputs=[
                 self.extent,
                 self.stored,
@@ -1747,7 +1663,9 @@ class _FrictionPatchState:
                 self.view,
             ],
             outputs=[self.built],
-            device=model.device,
+            # The slots to visit, not the live ones: thread 0 publishes the live count, also when it drops to zero.
+            extent=self.extent[0:1],
+            clamp=True,
             block_dim=self.build_block_dim,
         )
 
@@ -1797,12 +1715,10 @@ class _FrictionPatchState:
 
     def _launch_prepare_frame(self, prepare_inputs, generation, stream, mode):
         """Prepare a frame-reusing build in ``mode`` (``_FRAME_SORT`` or ``_FRAME_KEEP``)."""
-        wp.launch(
+        self._launch_prepare(
             _prepare_frame,
-            dim=self.threads,
-            inputs=[*prepare_inputs, generation, stream, int(mode), self.sorted_frame],
-            outputs=[self.extent, self.sort_pairs, self.frame_status],
-            device=self.device,
+            [*prepare_inputs, generation, stream, int(mode), self.sorted_frame],
+            [self.extent, self.sort_pairs, self.frame_status],
         )
 
     def _capture_scope(self):
@@ -1820,6 +1736,8 @@ class _FrictionPatchState:
         else:
             # Empty slots hold INT64_MAX, whose low key_bits are all ones: no pair
             # key exceeds them, and the stable sort keeps live slots ahead of a tie.
+            # The radix sort covers today's rows: a capture of it is recaptured after growth.
+            self.pool.note_unbound()
             wp.utils.radix_sort_pairs(self.current.keys, self.current.indices, self.capacity, end_bit=self.key_bits)
 
     def _sort_live(self):
@@ -1827,39 +1745,43 @@ class _FrictionPatchState:
 
         A stable sort of slots [0, live) from indices c is the unique order by
         (key, c), which the full radix sort produces; slots past live already
-        hold the empty record that sort leaves there.
+        hold the empty record that sort leaves there. The launches follow the
+        sort's work that the prepare published: a capture launches the chunk
+        sort over the live chunks and only the merges the live slots need. The
+        scratch half starts at the ready rows, which a capture's updater
+        rewrites on every replay, and the kernels address the whole
+        reservation, of which the live slots, the scratch half and one chunk of
+        slack are mapped.
         """
-        keys, indices = self.current.keys, self.current.indices
-        n = self.capacity
-        wp.launch_tiled(
-            _sort_chunks,
-            dim=[self.sort_blocks],
-            inputs=[keys[:n], indices[:n], keys, indices, self.extent, n, self.sort_blocks],
-            block_dim=_BLOCK_THREADS,
-            device=self.device,
+        launch_live_sort(
+            self.pool,
+            self._current_rows.reserved["keys"],
+            self._current_rows.reserved["indices"],
+            self.extent[_SORT_EXTENT:],
+            self.capacity,
+            blocks=self.sort_blocks,
+            merges=self.merges,
+            merge_threads=self.merge_threads,
+            slot_keys=True,
         )
-        for merge in range(self.merges):
-            wp.launch(
-                _merge_runs,
-                dim=self.merge_threads,
-                inputs=[keys, indices, self.extent, self.capacity, merge, self.merge_threads],
-                device=self.device,
-            )
 
     def link(self, world, slot, path, slots_needed, routes):
         """Link the normal rows of each patch and share its Coulomb budget on the enabled routes."""
-        wp.launch(
+        self._grids(self.pool.launch_rows())
+        self.pool.launch(
             link_patch_routes,
-            dim=self.threads,
+            self.threads,
             inputs=[self.extent, self.view, world, slot, path, slots_needed, routes, self.threads],
-            device=self.device,
+            extent=self.extent[1:2],
+            clamp=True,
         )
 
     def seed(self, state, world, slot, path, slots_needed, routes):
         """Transport cached patch impulses on the enabled routes, scaled by each route's decay."""
-        wp.launch(
+        self._grids(self.pool.launch_rows())
+        self.pool.launch(
             seed_patch_routes,
-            dim=self.threads,
+            self.threads,
             inputs=[
                 self.extent,
                 self.current,
@@ -1872,7 +1794,8 @@ class _FrictionPatchState:
                 routes,
                 self.threads,
             ],
-            device=self.device,
+            extent=self.extent[1:2],
+            clamp=True,
         )
 
     def finish(self, state_in, state_out, com, world, slot, path, slots_needed, routes, dt):
@@ -1882,9 +1805,10 @@ class _FrictionPatchState:
         )
 
     def _finish(self, q, q_out, qd_out, com, world, slot, path, slots_needed, routes, dt):
-        wp.launch(
+        self._grids(self.pool.launch_rows())
+        self.pool.launch(
             _finish_and_store,
-            dim=self.threads,
+            self.threads,
             inputs=[
                 self.extent,
                 q,
@@ -1905,16 +1829,19 @@ class _FrictionPatchState:
                 self.previous_q,
             ],
             outputs=[self.stored],
-            device=self.device,
+            extent=self.extent[0:1],
+            clamp=True,
         )
 
     def reset(self, world_mask):
         """Drop the stored anchors of the masked worlds (all worlds without a mask)."""
-        wp.launch(
+        self._grids(self.pool.launch_rows())
+        self.pool.launch(
             _reset_history,
-            dim=self.threads,
+            self.threads,
             inputs=[world_mask, self.stored, self.threads, self.previous_world, self.previous.valid],
-            device=self.device,
+            extent=self.stored,
+            clamp=True,
         )
 
 

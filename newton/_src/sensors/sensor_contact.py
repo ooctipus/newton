@@ -761,9 +761,11 @@ class SensorContact:
     def _eval_forces(self, state: State | None, contacts: Contacts):
         """Accumulate the outputs :meth:`update` cleared and, when ``state.body_q`` is available, contact positions."""
         update_contact_positions = self.position_matrix is not None and state is not None and state.body_q is not None
-        wp.launch(
+        # One thread per contact; in a capture whose contact launches bind, each replay runs the live count.
+        pool = contacts._rigid_contact_pool
+        pool.launch(
             accumulate_contact_forces_kernel,
-            dim=contacts.rigid_contact_max,
+            pool.launch_rows(),
             inputs=[
                 contacts.rigid_contact_count,
                 contacts.rigid_contact_shape0,
@@ -789,7 +791,7 @@ class SensorContact:
                 self.position_matrix if update_contact_positions else None,
                 self._position_weight if update_contact_positions else None,
             ],
-            device=self.device,
+            extent=contacts.rigid_contact_count,
             max_blocks=self._capacity_blocks,
         )
         if update_contact_positions:

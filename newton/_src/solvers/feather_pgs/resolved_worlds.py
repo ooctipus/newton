@@ -522,7 +522,6 @@ def check_raw_contact_normals(threads: int, raw: RawContacts, data: ResolvedWorl
     capacity = raw.shape0.shape[0]
     if (
         count < 0
-        or count > capacity
         or raw.shape1.shape[0] != capacity
         or raw.point0.shape[0] != capacity
         or raw.point1.shape[0] != capacity
@@ -611,7 +610,6 @@ def check_raw_contact_normals_by_route(
     capacity = raw.shape0.shape[0]
     if (
         count < 0
-        or count > capacity
         or raw.shape1.shape[0] != capacity
         or raw.point0.shape[0] != capacity
         or raw.point1.shape[0] != capacity
@@ -846,20 +844,32 @@ class ResolvedWorlds:
             setattr(raw, name, getattr(contacts, "rigid_contact_" + name))
         raw.shape_body, raw.shape_mu = solver.model.shape_body, solver.shape_material_mu
         raw.shape_restitution = solver.shape_material_restitution
+        pool = solver._contact_pool
         launch(
             data,
             raw,
             self.scratch,
-            contacts.rigid_contact_max,
+            pool.launch_rows(),
             solver.model.device,
             published=self.published,
             row_bound=self.row_bound,
             free_normals=self.free_normals,
+            pool=pool,
         )
 
 
 def launch(
-    data, raw, scratch, contact_capacity, device, *, enabled=1, published=False, row_bound=None, free_normals=None
+    data,
+    raw,
+    scratch,
+    contact_capacity,
+    device,
+    *,
+    enabled=1,
+    published=False,
+    row_bound=None,
+    free_normals=None,
+    pool=None,
 ):
     """Run the decision launches in stream order on ``device``.
 
@@ -869,7 +879,10 @@ def launch(
     ``row_bound`` of (dense, matrix-free) row capacities resolves only worlds
     whose worst-case rows fit both (:func:`finalize_resolved_worlds_bounded`),
     counting matrix-free contacts in ``free_normals``. Both contact checks
-    run :func:`_check_normal`, so either law rejects the same contacts.
+    run :func:`_check_normal`, so either law rejects the same contacts. With
+    the contacts' ``pool`` the contact checks follow the live count in a
+    capture whose launches bind (:meth:`ContactPool.launch`); size
+    ``contact_capacity`` with its ``launch_rows()`` then.
     """
     worlds = scratch.resolved.shape[0]
     wp.launch(reset_world_decisions, dim=worlds, inputs=[enabled, data, scratch], device=device)
@@ -881,17 +894,19 @@ def launch(
         bodies = scratch.body_valid.shape[0]
         wp.launch(build_predicted_body_twists, dim=bodies, inputs=[data, scratch], device=device)
     threads = max(1, min(int(contact_capacity), 65536))
+
+    def check(kernel, inputs):
+        if pool is None:
+            wp.launch(kernel, dim=threads, inputs=inputs, device=device)
+        else:
+            pool.launch(kernel, threads, inputs=inputs, extent=raw.count, clamp=True)
+
     if row_bound is None:
-        wp.launch(check_raw_contact_normals, dim=threads, inputs=[threads, raw, data, scratch], device=device)
+        check(check_raw_contact_normals, [threads, raw, data, scratch])
         wp.launch(finalize_resolved_worlds, dim=worlds, inputs=[scratch], device=device)
         return
     free_normals.zero_()
-    wp.launch(
-        check_raw_contact_normals_by_route,
-        dim=threads,
-        inputs=[threads, raw, data, scratch, free_normals],
-        device=device,
-    )
+    check(check_raw_contact_normals_by_route, [threads, raw, data, scratch, free_normals])
     wp.launch(
         finalize_resolved_worlds_bounded,
         dim=worlds,
