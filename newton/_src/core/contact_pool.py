@@ -815,7 +815,8 @@ class ContactPool:
             warnings.warn(
                 f"Rigid contact demand {high_water} reached the {previous} ready rows in a graph replay, which may "
                 f"have dropped contacts (its capacity status stays flagged); the buffers grew to {target} rows, and "
-                "graphs that use them must be recaptured. Size them before capturing: "
+                "graphs that use them must be recaptured. Size them before capturing: step the scene outside capture "
+                "until its first contacts settle (bodies that start in the air land then), then call "
                 "CollisionPipeline.service_capacity(state) with the state the graph starts from.",
                 RuntimeWarning,
                 stacklevel=3,

@@ -2499,9 +2499,13 @@ extents of its capture, so measure the state the graph starts from before captur
 it, and after each frame grow the buffers from the recorded demand and recapture
 when they grew (:meth:`~CollisionPipeline.service_capacity`). Bodies that start
 above the ground or fall into new contacts in the first steps have more contacts
-than their starting state: step such a scene a few times outside capture (its
-passes grow the buffers before anything reads them) before measuring and
-capturing it.
+than their starting state, and a replay cannot grow the buffers in time (the
+service reads the demand of steps already in flight): step such a scene outside
+capture until its first contacts settle (its passes grow the buffers before
+anything reads them), then measure and capture it. A pile of 256 parts dropped
+into a bin per world, for example, ramps from 15 to 9,100 contacts per world in
+its first seven frames; ten uncaptured frames size it so that no replay drops a
+contact.
 
 .. code-block:: python
 
