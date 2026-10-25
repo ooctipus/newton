@@ -776,11 +776,34 @@ def _slot_index(entry_idx: int, slot: int) -> int:
 REDUCTION_MAX_THREADS = 262144
 
 
-SCAN_LANES = 256
+SCAN_LANES = wp.constant(256)
 """Keep flags one block of the keep scan sums at a time."""
 
 SCAN_MAX_BLOCKS = 1024
 """Blocks of the keep scan's chunk passes; they stride over the chunks of the live count."""
+
+
+@wp.func
+def _live_value(value: wp.int32, local: int, first: int, end: int):
+    """Keep a loaded value below ``end``; values past it (stale rows) count as zero."""
+    if first + local < end:
+        return value
+    return wp.int32(0)
+
+
+@wp.func
+def _live_chunk(values: wp.array[wp.int32], first: int, end: int):
+    """Load the :data:`SCAN_LANES` values from ``first``, zero past ``end``.
+
+    Tiles have explicit shapes, so the scan runs alike on the CPU, where a
+    block has one thread, and on CUDA.
+    """
+    loaded = wp.tile_load(values, shape=SCAN_LANES, offset=first)
+    local = wp.tile_arange(SCAN_LANES, dtype=int)
+    start = wp.tile_full(SCAN_LANES, first, dtype=int)
+    stop = wp.tile_full(SCAN_LANES, end, dtype=int)
+    # Warp hashes a function passed to a builtin only through wp.static().
+    return wp.tile_map(wp.static(_live_value), loaded, local, start, stop)
 
 
 @wp.kernel(enable_backward=False)
@@ -792,17 +815,11 @@ def _scan_chunk_totals(
     totals: wp.array[wp.int32],
 ):
     """Sum the keep flags of each chunk of :data:`SCAN_LANES` work items."""
-    block, lane = wp.tid()
+    block = wp.tid()
     work = frame_state[wp.static(FRAME_WORK_COUNT)]
     chunks = (work + SCAN_LANES - 1) // SCAN_LANES
     for chunk in range(block, chunks, blocks):
-        i = chunk * SCAN_LANES + lane
-        flag = int(0)
-        if i < work:
-            flag = keep_flags[i]
-        total = wp.tile_sum(wp.tile(flag))
-        if lane == 0:
-            totals[chunk] = wp.tile_extract(total, 0)
+        wp.tile_store(totals, wp.tile_sum(_live_chunk(keep_flags, chunk * SCAN_LANES, work)), offset=chunk)
 
 
 @wp.kernel(enable_backward=False)
@@ -812,21 +829,15 @@ def _scan_chunk_offsets(
     totals: wp.array[wp.int32],
 ):
     """Turn the chunk totals into exclusive chunk offsets, :data:`SCAN_LANES` chunks at a time (one block)."""
-    _block, lane = wp.tid()
     work = frame_state[wp.static(FRAME_WORK_COUNT)]
     chunks = (work + SCAN_LANES - 1) // SCAN_LANES
     carry = int(0)
     for start in range(0, chunks, SCAN_LANES):
-        chunk = start + lane
-        total = int(0)
-        if chunk < chunks:
-            total = totals[chunk]
-        group = wp.tile(total)
-        before = wp.untile(wp.tile_scan_exclusive(group))
-        added = wp.tile_extract(wp.tile_sum(group), 0)
-        if chunk < chunks:
-            totals[chunk] = carry + before
-        carry += added
+        group = _live_chunk(totals, start, chunks)
+        before = wp.tile_scan_exclusive(group) + wp.tile_full(SCAN_LANES, carry, dtype=wp.int32)
+        carry += wp.tile_extract(wp.tile_sum(group), 0)
+        # Entries past the chunks take offsets no pass reads.
+        wp.tile_store(totals, before, offset=start)
 
 
 @wp.kernel(enable_backward=False)
@@ -838,18 +849,17 @@ def _scan_chunks(
     # outputs
     keep_scan: wp.array[wp.int32],
 ):
-    """Write the inclusive scan of the keep flags over the work count, from each chunk's offset."""
-    block, lane = wp.tid()
+    """Write the inclusive scan of the keep flags over the work count, from each chunk's offset.
+
+    The last chunk also writes the slots past the work count, which no pass reads.
+    """
+    block = wp.tid()
     work = frame_state[wp.static(FRAME_WORK_COUNT)]
     chunks = (work + SCAN_LANES - 1) // SCAN_LANES
     for chunk in range(block, chunks, blocks):
-        i = chunk * SCAN_LANES + lane
-        flag = int(0)
-        if i < work:
-            flag = keep_flags[i]
-        kept = wp.untile(wp.tile_scan_inclusive(wp.tile(flag)))
-        if i < work:
-            keep_scan[i] = kept + offsets[chunk]
+        first = chunk * SCAN_LANES
+        kept = wp.tile_scan_inclusive(_live_chunk(keep_flags, first, work))
+        wp.tile_store(keep_scan, kept + wp.tile_full(SCAN_LANES, offsets[chunk], dtype=wp.int32), offset=first)
 
 
 @wp.kernel(enable_backward=False)
@@ -1970,10 +1980,11 @@ class BodyPairContactReducer:
         # canonical gap, face-plane position) and the gather scratch the sorter
         # does not lend.
         contact_fields = [
-            ContactField("keep_flags", wp.int32),
-            ContactField("keep_scan", wp.int32),
+            # The keep scan loads and stores whole chunks of SCAN_LANES: one more chunk stays mapped.
+            ContactField("keep_flags", wp.int32, extra=int(SCAN_LANES)),
+            ContactField("keep_scan", wp.int32, extra=int(SCAN_LANES)),
             # Chunk totals of the keep scan: one per SCAN_LANES rows, held per row so it grows with them.
-            ContactField("_scan_chunk_totals", wp.int32),
+            ContactField("_scan_chunk_totals", wp.int32, extra=int(SCAN_LANES)),
             ContactField("contact_entry", wp.int32),
             ContactField("contact_gap", wp.float32),
             ContactField("contact_pos2d", wp.vec2),
@@ -2252,12 +2263,17 @@ class BodyPairContactReducer:
                 clamp=True,
             )
         # Inclusive scan of the keep flags over the work count (a CUB scan would cover the rows of capture time).
+        # Its tiles load and store through views of the whole reservation, which a capture's
+        # rows do not clip after growth.
         blocks = min(-(-rows // SCAN_LANES), SCAN_MAX_BLOCKS)
+        keep_flags = self._rows.reserved["keep_flags"]
+        keep_scan = self._rows.reserved["keep_scan"]
+        totals = self._rows.reserved["_scan_chunk_totals"]
         pool.launch(
             _scan_chunk_totals,
             blocks,
-            inputs=[self.keep_flags, self._frame_state, blocks],
-            outputs=[self._scan_chunk_totals],
+            inputs=[keep_flags, self._frame_state, blocks],
+            outputs=[totals],
             extent=count,
             clamp=True,
             tiled=True,
@@ -2267,7 +2283,7 @@ class BodyPairContactReducer:
             _scan_chunk_offsets,
             dim=[1],
             inputs=[self._frame_state],
-            outputs=[self._scan_chunk_totals],
+            outputs=[totals],
             block_dim=SCAN_LANES,
             device=self.device,
             record_tape=False,
@@ -2275,8 +2291,8 @@ class BodyPairContactReducer:
         pool.launch(
             _scan_chunks,
             blocks,
-            inputs=[self.keep_flags, self._frame_state, self._scan_chunk_totals, blocks],
-            outputs=[self.keep_scan],
+            inputs=[keep_flags, self._frame_state, totals, blocks],
+            outputs=[keep_scan],
             extent=count,
             clamp=True,
             tiled=True,

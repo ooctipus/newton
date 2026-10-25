@@ -77,6 +77,7 @@ the pool (:meth:`ContactPool.follow`).
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 import warnings
@@ -275,13 +276,27 @@ def _capture_owner(device):
 
 _VIRTUAL_MEMORY: list[Any] = []
 """After the first look: ``gpu_components``' ``(backing, fields, FieldSpec, graph, KernelParameterBinding)``, or
-``None`` without the package."""
+``None`` without a usable package."""
+
+_GRAPH_FEATURES = {"prepare_updates": ("errors",), "launch": ("clamp_extent", "extent_scale")}
+"""The ``gpu_components.graph`` parameters the pool passes; releases without them also predate its Warp 1.17 support."""
+
+
+def _missing_graph_features(graph) -> list[str]:
+    """Return the :data:`_GRAPH_FEATURES` that ``graph`` lacks, as ``function(parameter)``."""
+    missing = []
+    for name, parameters in _GRAPH_FEATURES.items():
+        function = getattr(graph, name, None)
+        known = inspect.signature(function).parameters if callable(function) else {}
+        missing.extend(f"{name}({parameter})" for parameter in parameters if parameter not in known)
+    return missing
 
 
 def _virtual_memory():
-    """Return ``gpu_components``' operation modules and records, or ``None`` without the optional package.
+    """Return ``gpu_components``' operation modules and records, or ``None`` without a usable optional package.
 
-    Without it, rows on CUDA are ordinary arrays that growth reallocates and copies, as on the CPU.
+    Without it, rows on CUDA are ordinary arrays that growth reallocates and copies, as on the CPU. A release
+    older than the one the pool follows counts as absent.
     """
     if not _VIRTUAL_MEMORY:
         try:
@@ -295,7 +310,17 @@ def _virtual_memory():
                 "reallocates and copies, as on the CPU, instead of CUDA virtual memory"
             )
         else:
-            _VIRTUAL_MEMORY.append((backing, fields, FieldSpec, graph, KernelParameterBinding))
+            missing = _missing_graph_features(graph)
+            if missing:
+                _VIRTUAL_MEMORY.append(None)
+                logger.warning(
+                    "gpu_components at %s lacks %s: rigid contact rows on CUDA are ordinary arrays that growth "
+                    "reallocates and copies, instead of CUDA virtual memory; install a newer gpu_components",
+                    graph.__file__,
+                    ", ".join(missing),
+                )
+            else:
+                _VIRTUAL_MEMORY.append((backing, fields, FieldSpec, graph, KernelParameterBinding))
     return _VIRTUAL_MEMORY[0]
 
 

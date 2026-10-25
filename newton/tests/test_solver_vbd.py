@@ -1315,7 +1315,9 @@ def _rigid_contact_history_capture_requires_preallocation(test, device):
     # The model's contacts and the solver share the model's rows: a reservation grows the history at once.
     _pipeline, solver, contacts, state_in, state_out, control = make_scene()
     rows = solver._prev_contact_lambda.shape[0]
-    test.assertTrue(contacts.reserve_rigid_contacts(2 * rows))
+    # No graph captured the rows yet, so the reservation asks for no recapture; it grows the rows at once.
+    contacts.reserve_rigid_contacts(2 * rows)
+    test.assertGreaterEqual(contacts.rigid_contact_max, 2 * rows)
     test.assertEqual(solver._prev_contact_lambda.shape[0], contacts.rigid_contact_max)
     with scoped_capture_after_gc(device=device) as shared:
         solver.step(state_in, state_out, control, contacts, 1.0e-3)
@@ -1326,13 +1328,15 @@ def _rigid_contact_history_capture_requires_preallocation(test, device):
     _, solver, _, state_in, state_out, control = make_scene()
     other, _, contacts, _, _, _ = make_scene()
     rows = solver._prev_contact_lambda.shape[0]
-    test.assertTrue(contacts.reserve_rigid_contacts(2 * rows))
+    contacts.reserve_rigid_contacts(2 * rows)
+    test.assertGreaterEqual(contacts.rigid_contact_max, 2 * rows)
     other.collide(state_in, contacts)
     with test.assertRaisesRegex(RuntimeError, "during CUDA graph capture"):
         with scoped_capture_after_gc(device=device):
             solver.step(state_in, state_out, control, contacts, 1.0e-3)
     solver.step(state_in, state_out, control, contacts, 1.0e-3)
-    test.assertEqual(solver._prev_contact_lambda.shape[0], contacts.rigid_contact_max)
+    # The solver's own pool follows the other pool's rows, rounded up to its mapped pages.
+    test.assertGreaterEqual(solver._prev_contact_lambda.shape[0], contacts.rigid_contact_max)
     other.collide(state_out, contacts)
     with scoped_capture_after_gc(device=device) as grown:
         solver.step(state_out, state_in, control, contacts, 1.0e-3)

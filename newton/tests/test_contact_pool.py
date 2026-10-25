@@ -133,6 +133,29 @@ class TestContactPoolPolicy(unittest.TestCase):
             self.assertEqual(device_row_limit(device, 1000), memory // 1000)
             self.assertEqual(device_row_limit(device, 1), INDEX_LIMIT)
 
+    def test_outdated_gpu_components_counts_as_absent(self):
+        """Keep ordinary arrays, with a warning, under a gpu_components release without the graph API the pool uses."""
+
+        def prepare_updates(enable_count, *, enable_count_maximum, binding_capacity, library=None):
+            pass
+
+        def launch(updates, kernel, dim, *, inputs=None, extent_axis=None, extent_source=None, parameters=()):
+            pass
+
+        package = mock.MagicMock()
+        package.graph.prepare_updates = prepare_updates
+        package.graph.launch = launch
+        package.graph.__file__ = "outdated/gpu_components/graph.py"
+        modules = {
+            "gpu_components": package,
+            **{f"gpu_components.{name}": getattr(package, name) for name in ("backing", "fields", "graph")},
+            **{f"gpu_components.{name}": mock.MagicMock() for name in ("field_data", "graph_data")},
+        }
+        with mock.patch.dict(sys.modules, modules), mock.patch.object(contact_pool, "_VIRTUAL_MEMORY", []):
+            with self.assertLogs(contact_pool.logger, "WARNING") as logs:
+                self.assertIsNone(contact_pool._virtual_memory())
+        self.assertIn("prepare_updates(errors), launch(clamp_extent), launch(extent_scale)", logs.output[0])
+
 
 def test_pool_rows_keep_contents_and_fill_new_rows(test, device):
     """Keep every field's first rows through growth and give new and scratch rows their fill.
