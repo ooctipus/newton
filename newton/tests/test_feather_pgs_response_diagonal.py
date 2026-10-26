@@ -9,7 +9,6 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.friction import friction_pair_candidate
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -21,6 +20,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     accumulate_group_diag_worlds,
 )
 from newton._src.solvers.feather_pgs.paired_factor_source import get_source as get_paired_factor_source
+from newton._src.solvers.feather_pgs.projection_laws import friction_pair
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _FeatherPGSExecutionPlan,
     _get_build_independent_sparse_contact_groups_kernel,
@@ -560,7 +560,7 @@ def _ring_pooled_serial_reference(rows, *, iterations, friction_start=0, schedul
                     radius = max(rows["row_mu"][w, row] * load, 0.0)
                     pair = (0.0, 0.0)
                     if radius > 0.0:
-                        pair = friction_pair_candidate(
+                        pair = friction_pair(
                             float(denominator),
                             float(J[row] @ Y[sibling]),
                             float(rows["diag"][w, sibling]),
@@ -848,9 +848,9 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             expected_impulses[0] = new_impulse
             expected_velocity += response[0] * (new_impulse - old_impulse)
             # The general owner solves both tangent rows together on the friction disk at the current normal
-            # load (friction_pair_candidate); the second tangent visit is a no-op.
+            # load (projection_laws.friction_pair); the second tangent visit is a no-op.
             radius = max(row_mu[0, 1] * expected_impulses[0], 0.0)
-            pair = friction_pair_candidate(
+            pair = friction_pair(
                 float(diag[0, 1]),
                 float(jacobian[1] @ response[2]),
                 float(diag[0, 2]),

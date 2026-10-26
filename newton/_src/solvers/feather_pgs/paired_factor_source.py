@@ -4,13 +4,13 @@
 """Share the paired GS recurrence through explicit representation entry and exit."""
 
 from .device_preludes import RING, cuda_native, lane_group
-from .friction import FRICTION_PAIR
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
+from .projection_laws import PROJECTION_LAW
 from .solve_policy import EXACT_POLICY, SolvePolicy, sweep_exit, vote
 
 
@@ -77,7 +77,7 @@ def _unit_walk(D, factor_rows, contact_type, friction_type, joint_limit_type, jo
     return f"""        for (int i = 0; i < m;) {{
             const int row_type = static_cast<int>(s_type[i]);
             if (row_type == {friction_type}) {{
-                if (global_iter < friction_start_iteration) s_lam[i] = 0.0f;
+                if (ProjectionLaw::friction_gate(row_type, global_iter, friction_start_iteration)) s_lam[i] = 0.0f;
                 SYNC();
                 ++i;
                 continue;
@@ -100,20 +100,16 @@ def _unit_walk(D, factor_rows, contact_type, friction_type, joint_limit_type, jo
                 float sum = lane < {D} ? row_factor * factor_velocity : 0.0f;
                 SUM(sum);
                 const float residual = sum + s_rhs[i];
-                const float raw_delta = -residual / denom;
                 const float old_impulse = s_lam[i];
-                float new_impulse = old_impulse + omega * raw_delta;
+                float new_impulse = ProjectionLaw::relaxed_step(old_impulse, -residual / denom, omega);
                 float delta_impulse = 0.0f;
                 if (row_type == {contact_type} || row_type == {joint_limit_type}) {{
-                    if (new_impulse < 0.0f) new_impulse = 0.0f;
+                    new_impulse = ProjectionLaw::unilateral(new_impulse);
                     delta_impulse = new_impulse - old_impulse;
                 }} else if (row_type == {joint_velocity_limit_type}) {{
-                    if (residual < 0.0f) {{
-                        delta_impulse = raw_delta;
-                        new_impulse = raw_delta;
-                    }} else {{
-                        new_impulse = 0.0f;
-                    }}
+                    const auto vlim = ProjectionLaw::velocity_limit_update(old_impulse, residual, residual / denom, 0);
+                    new_impulse = vlim.v0;
+                    delta_impulse = vlim.v1;
                 }} else {{
                     delta_impulse = new_impulse - old_impulse;
                 }}
@@ -128,7 +124,7 @@ def _unit_walk(D, factor_rows, contact_type, friction_type, joint_limit_type, jo
                 ++i;
                 continue;
             }}
-            if (global_iter < friction_start_iteration) {{
+            if (ProjectionLaw::friction_gate({friction_type}, global_iter, friction_start_iteration)) {{
                 s_lam[tangent1] = 0.0f;
                 s_lam[tangent2] = 0.0f;
                 SYNC();
@@ -149,7 +145,7 @@ def _unit_walk(D, factor_rows, contact_type, friction_type, joint_limit_type, jo
                 i += 3;
                 continue;
             }}
-            float2 pair = make_float2(0.0f, 0.0f);
+            wp::vec2 pair(0.0f);
             if (radius > 0.0f) {{
                 float tangent1_sum = lane < {D} ? tangent1_factor * factor_velocity : 0.0f;
                 float tangent2_sum = lane < {D} ? tangent2_factor * factor_velocity : 0.0f;
@@ -158,13 +154,12 @@ def _unit_walk(D, factor_rows, contact_type, friction_type, joint_limit_type, jo
                 const float tangent1_residual = tangent1_sum + s_rhs[tangent1];
                 const float tangent2_residual = tangent2_sum + s_rhs[tangent2];
                 const float cross = cross_sum;
-                pair = friction_pair_candidate(s_diag[tangent1], cross, s_diag[tangent2],
-                    tangent1_residual, tangent2_residual, old_tangent1, old_tangent2, radius, omega);
+                pair = ProjectionLaw::friction_pair(s_diag[tangent1], cross, s_diag[tangent2],
+                    wp::vec2(tangent1_residual, tangent2_residual), wp::vec2(old_tangent1, old_tangent2), radius, omega);
             }}
-            const float magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
-            const float scale = magnitude > radius ? radius / magnitude : 1.0f;
-            const float new_tangent1 = pair.x * scale;
-            const float new_tangent2 = pair.y * scale;
+            pair = ProjectionLaw::disk(pair, radius);
+            const float new_tangent1 = pair[0];
+            const float new_tangent2 = pair[1];
             const float tangent1_delta = new_tangent1 - old_tangent1;
             const float tangent2_delta = new_tangent2 - old_tangent2;
             s_lam[tangent1] = new_tangent1;
@@ -318,11 +313,10 @@ def get_source(
                 float sum = lane < {D} ? {product("row_factor", "i")} : 0.0f;
                 SUM(sum);
                 const float old_impulse = s_lam[i];
-                float new_impulse = old_impulse
-                    + omega * (-( sum + s_rhs[i]) / denom);
+                float new_impulse = ProjectionLaw::relaxed_step(old_impulse, -(sum + s_rhs[i]) / denom, omega);
                 const int row_type = static_cast<int>(s_type[i]);
-                if ((row_type == {contact_type} || row_type == {joint_limit_type}) && new_impulse < 0.0f)
-                    new_impulse = 0.0f;
+                if (row_type == {contact_type} || row_type == {joint_limit_type})
+                    new_impulse = ProjectionLaw::unilateral(new_impulse);
                 const float delta = new_impulse - old_impulse;{fences[0]}
                 s_lam[i] = new_impulse;
                 if (delta != 0.0f) {{
@@ -343,9 +337,8 @@ def get_source(
                 const float normal_denom = s_diag[normal];
                 if (normal_denom > 0.0f) {{
                     const float old_normal = s_lam[normal];
-                    float new_normal = old_normal
-                        + omega * (-( normal_sum + s_rhs[normal]) / normal_denom);
-                    if (new_normal < 0.0f) new_normal = 0.0f;
+                    const float new_normal = ProjectionLaw::unilateral(ProjectionLaw::relaxed_step(
+                        old_normal, -(normal_sum + s_rhs[normal]) / normal_denom, omega));
                     const float normal_delta = new_normal - old_normal;{fences[1]}
                     s_lam[normal] = new_normal;
                     if (normal_delta != 0.0f) {{
@@ -369,13 +362,13 @@ def get_source(
                     SYNC();
                     continue;
                 }}
-                if (global_iter < friction_start_iteration) {{{fences[2]}
+                if (ProjectionLaw::friction_gate({friction_type}, global_iter, friction_start_iteration)) {{{fences[2]}
                     s_lam[tangent1] = 0.0f;
                     s_lam[tangent2] = 0.0f;
                     SYNC();
                     continue;
                 }}
-                float2 pair = make_float2(0.0f, 0.0f);
+                wp::vec2 pair(0.0f);
                 if (radius > 0.0f) {{
                     float tangent1_sum = lane < {D} ? {product("tangent1_factor", "tangent1")} : 0.0f;
                     float tangent2_sum = lane < {D} ? {product("tangent2_factor", "tangent2")} : 0.0f;
@@ -384,13 +377,12 @@ def get_source(
                     const float tangent1_residual = tangent1_sum + s_rhs[tangent1];
                     const float tangent2_residual = tangent2_sum + s_rhs[tangent2];
                     const float cross = cross_sum;
-                    pair = friction_pair_candidate(s_diag[tangent1], cross, s_diag[tangent2],
-                        tangent1_residual, tangent2_residual, old_tangent1, old_tangent2, radius, omega);
+                    pair = ProjectionLaw::friction_pair(s_diag[tangent1], cross, s_diag[tangent2],
+                        wp::vec2(tangent1_residual, tangent2_residual), wp::vec2(old_tangent1, old_tangent2), radius, omega);
                 }}
-                const float magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
-                const float scale = magnitude > radius ? radius / magnitude : 1.0f;
-                const float new_tangent1 = pair.x * scale;
-                const float new_tangent2 = pair.y * scale;
+                pair = ProjectionLaw::disk(pair, radius);
+                const float new_tangent1 = pair[0];
+                const float new_tangent2 = pair[1];
                 const float tangent1_delta = new_tangent1 - old_tangent1;
                 const float tangent2_delta = new_tangent2 - old_tangent2;{fences[3]}
                 s_lam[tangent1] = new_tangent1;
@@ -414,7 +406,7 @@ def get_source(
                 prefetched_factor = {factor_rows}.data[row_base + (i + 1) * {D} + lane];
 
             const int row_type = static_cast<int>(s_type[i]);
-            if (row_type == {friction_type} && global_iter < friction_start_iteration) {{
+            if (ProjectionLaw::friction_gate(row_type, global_iter, friction_start_iteration)) {{
                 s_lam[i] = 0.0f;
                 SYNC();
                 continue;
@@ -441,40 +433,36 @@ def get_source(
             const float jv = sum;
 
             const float residual = jv + s_rhs[i];
-            const float raw_delta = denom > 0.0f ? -residual / denom : 0.0f;
             const float old_impulse = s_lam[i];
-            float new_impulse = old_impulse + omega * raw_delta;
+            float new_impulse = denom > 0.0f
+                ? ProjectionLaw::relaxed_step(old_impulse, -residual / denom, omega) : old_impulse;
             float delta_impulse = 0.0f;
             float sibling_delta = 0.0f;
             if (row_type == {contact_type} || row_type == {joint_limit_type}) {{
-                if (new_impulse < 0.0f) new_impulse = 0.0f;
+                new_impulse = ProjectionLaw::unilateral(new_impulse);
                 delta_impulse = new_impulse - old_impulse;
             }} else if (row_type == {joint_velocity_limit_type}) {{
-                if (residual < 0.0f) {{
-                    delta_impulse = raw_delta;
-                    new_impulse = raw_delta;
-                }} else {{
-                    new_impulse = 0.0f;
-                }}
+                const auto vlim = ProjectionLaw::velocity_limit_update(old_impulse, residual, residual / denom, 0);
+                new_impulse = vlim.v0;
+                delta_impulse = vlim.v1;
             }} else if (row_type == {friction_type}) {{
                 // Paired tangent solve at the patch normal load, matching the general owner.
                 const float lambda_n = RING_LOAD(s_lam[parent], parent, m, ring_parent, ring_impulse);
                 const float radius = fmaxf(world_row_mu.data[off + i] * lambda_n, 0.0f);
                 const float sibling_impulse = s_lam[sibling];
-                float2 pair = make_float2(0.0f, 0.0f);
+                wp::vec2 pair(0.0f);
                 if (radius > 0.0f) {{
                     float sibling_sum = lane < {D} ? sibling_factor * factor_velocity : 0.0f;
                     float cross_sum = lane < {D} ? row_factor * sibling_factor : 0.0f;
                     SUM(sibling_sum, cross_sum);
                     const float sibling_residual = sibling_sum + s_rhs[sibling];
                     const float cross = cross_sum;
-                    pair = friction_pair_candidate(denom, cross, s_diag[sibling],
-                        residual, sibling_residual, old_impulse, sibling_impulse, radius, omega);
+                    pair = ProjectionLaw::friction_pair(denom, cross, s_diag[sibling],
+                        wp::vec2(residual, sibling_residual), wp::vec2(old_impulse, sibling_impulse), radius, omega);
                 }}
-                const float magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
-                const float scale = magnitude > radius ? radius / magnitude : 1.0f;
-                new_impulse = pair.x * scale;
-                const float new_sibling_impulse = pair.y * scale;
+                pair = ProjectionLaw::disk(pair, radius);
+                new_impulse = pair[0];
+                const float new_sibling_impulse = pair[1];
                 sibling_delta = new_sibling_impulse - sibling_impulse;{fences[4]}
                 s_lam[sibling] = new_sibling_impulse;
                 delta_impulse = new_impulse - old_impulse;
@@ -532,4 +520,6 @@ def get_source(
 
 {exit_code}    for (int i = lane; i < m; i += 32) world_impulses.data[off + i] = s_lam[i];
 """
-    return cuda_native(body + "#endif\n", preludes=(lane_group(32), RING, FRICTION_PAIR, *solve_policy.preludes))
+    return cuda_native(
+        body + "#endif\n", preludes=(lane_group(32), RING, *PROJECTION_LAW.preludes(), *solve_policy.preludes)
+    )

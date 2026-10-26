@@ -1,10 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The projection laws against the sweeps' implementations, in Warp and as native CUDA text.
+"""The projection laws solve the problems they name, on every test device.
 
-Native references are the blocks the generators emit, extracted from their output
-and compiled; the pair law unifies the native sweeps' rounding with the Warp one.
+Each law meets its defining conditions, checked in float64: the tangent pair's
+disk problem, the contact's Coulomb problem (cone, normal complementarity and,
+for Daviet's Newton, maximal dissipation), the regularized step's fixed point
+and its block-solve diagonal, and the velocity-limit, drive and set projections.
+The laws' CUDA renderings agree with these Warp functions
+(``test_feather_pgs_law_source``'s twins).
 """
 
 import unittest
@@ -12,32 +16,13 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import friction, kernels, projection_laws
-from newton.tests.feather_pgs_law_harness import (
-    anchored,
-    between,
-    call,
-    dedent_block,
-    mismatches,
-    native_kernel,
-    normalized,
-    reference_kernel,
-    register_device_tests,
-    require_cuda,
-    run_native,
-    scalars,
-    spd3,
-    twin_inputs,
-    unified,
-)
-
-# ---------------------------------------------------------------------------------------------------------------------
-# Projection laws against the sweeps' implementations
-# ---------------------------------------------------------------------------------------------------------------------
+from newton._src.solvers.feather_pgs import projection_laws as laws
+from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION
+from newton.tests.feather_pgs_law_harness import call, register_device_tests, scalars, twin_inputs
 
 
 @wp.kernel
-def _kernel_friction_pair(
+def _pair(
     a: wp.array[float],
     c: wp.array[float],
     d: wp.array[float],
@@ -46,603 +31,218 @@ def _kernel_friction_pair(
     radius: wp.array[float],
     omega: wp.array[float],
     out: wp.array[wp.vec2],
+    relaxed: wp.array[wp.vec2],
 ):
     i = wp.tid()
-    out[i] = friction.friction_pair_candidate(a[i], c[i], d[i], residual[i], old[i], radius[i], omega[i])
+    out[i] = laws.disk(laws.friction_pair(a[i], c[i], d[i], residual[i], old[i], radius[i], 1.0), radius[i])
+    relaxed[i] = laws.friction_pair(a[i], c[i], d[i], residual[i], old[i], radius[i], omega[i])
 
 
-@wp.kernel
-def _law_friction_pair(
-    a: wp.array[float],
-    c: wp.array[float],
-    d: wp.array[float],
-    residual: wp.array[wp.vec2],
-    old: wp.array[wp.vec2],
-    radius: wp.array[float],
-    omega: wp.array[float],
-    out: wp.array[wp.vec2],
-):
-    i = wp.tid()
-    out[i] = projection_laws.friction_pair(a[i], c[i], d[i], residual[i], old[i], radius[i], omega[i])
+def test_friction_pair_solves_the_disk_problem(test, device):
+    """Minimize the pair's quadratic on its disk: the residual at the result opposes every feasible move.
 
-
-def test_friction_pair_matches_warp_pair_law(test, device):
-    """Equal ``friction.friction_pair_candidate``, the Warp loop sweeps' pair law, bitwise."""
-    rng = np.random.default_rng(41)
-    n = 8192
-    values = {**twin_inputs("friction_pair", rng, n, device), "out": np.zeros((n, 2), dtype=np.float32)}
-    a = call(_kernel_friction_pair, n, device, **values)["out"].numpy()
-    b = call(_law_friction_pair, n, device, **values)["out"].numpy()
-    test.assertFalse(mismatches(a, b).any())
-
-
-def _contact_triples(rng, worlds):
-    """One matrix-free contact (normal and two tangent rows) per world between bodies 2w and 2w + 1."""
-    body_a = np.where(rng.uniform(size=worlds) < 0.9, 2 * np.arange(worlds), -1).astype(np.int32)
-    body_b = np.where(rng.uniform(size=worlds) < 0.6, 2 * np.arange(worlds) + 1, -1).astype(np.int32)
-    J_a = rng.normal(size=(worlds, 3, 6)).astype(np.float32)
-    J_b = rng.normal(size=(worlds, 3, 6)).astype(np.float32)
-    mass = rng.uniform(0.2, 3.0, size=(worlds, 1, 6)).astype(np.float32)
-    rhs = np.zeros((worlds, 3), dtype=np.float32)
-    rhs[:, 0] = rng.normal(scale=0.5, size=worlds)
-    old = np.abs(rng.normal(scale=0.3, size=(worlds, 3))).astype(np.float32)
-    old[:, 1:] = rng.normal(scale=0.2, size=(worlds, 2))
-    return {
-        "mf_body_a": np.repeat(body_a[:, None], 3, axis=1),
-        "mf_body_b": np.repeat(body_b[:, None], 3, axis=1),
-        "mf_J_a": J_a,
-        "mf_J_b": J_b,
-        "mf_MiJt_a": J_a * mass,
-        "mf_MiJt_b": J_b * mass,
-        "mf_row_parent": np.tile(np.array([[-1, 0, 0]], dtype=np.int32), (worlds, 1)),
-        "mf_row_mu": np.repeat(rng.uniform(0.0, 1.2, (worlds, 1)), 3, axis=1).astype(np.float32),
-        "mf_rhs": rhs,
-        "body_to_articulation": np.arange(2 * worlds, dtype=np.int32),
-        "art_dof_start": (6 * np.arange(2 * worlds)).astype(np.int32),
-        "mf_impulses": old,
-        "v_out": rng.normal(size=12 * worlds).astype(np.float32),
-    }
-
-
-@wp.func
-def _gather_contact_block(
-    world: int,
-    mf_body_a: wp.array2d[int],
-    mf_body_b: wp.array2d[int],
-    mf_J_a: wp.array3d[float],
-    mf_J_b: wp.array3d[float],
-    mf_MiJt_a: wp.array3d[float],
-    mf_MiJt_b: wp.array3d[float],
-    body_to_articulation: wp.array[int],
-    art_dof_start: wp.array[int],
-    v_out: wp.array[float],
-):
-    """The sweeps' gather of a contact's row velocities and Delassus block (the friction steps' own loops)."""
-    ba = mf_body_a[world, 0]
-    bb = mf_body_b[world, 0]
-    u_n = float(0.0)
-    u_t1 = float(0.0)
-    u_t2 = float(0.0)
-    if ba >= 0:
-        ds_a = art_dof_start[body_to_articulation[ba]]
-        for k in range(6):
-            va_k = v_out[ds_a + k]
-            u_n = u_n + mf_J_a[world, 0, k] * va_k
-            u_t1 = u_t1 + mf_J_a[world, 1, k] * va_k
-            u_t2 = u_t2 + mf_J_a[world, 2, k] * va_k
-    if bb >= 0:
-        ds_b = art_dof_start[body_to_articulation[bb]]
-        for k in range(6):
-            vb_k = v_out[ds_b + k]
-            u_n = u_n + mf_J_b[world, 0, k] * vb_k
-            u_t1 = u_t1 + mf_J_b[world, 1, k] * vb_k
-            u_t2 = u_t2 + mf_J_b[world, 2, k] * vb_k
-    G_nn = float(0.0)
-    G_nt1 = float(0.0)
-    G_nt2 = float(0.0)
-    G_t1t1 = float(0.0)
-    G_t1t2 = float(0.0)
-    G_t2t2 = float(0.0)
-    if ba >= 0:
-        for k in range(6):
-            G_nn = G_nn + mf_J_a[world, 0, k] * mf_MiJt_a[world, 0, k]
-            G_nt1 = G_nt1 + mf_J_a[world, 0, k] * mf_MiJt_a[world, 1, k]
-            G_nt2 = G_nt2 + mf_J_a[world, 0, k] * mf_MiJt_a[world, 2, k]
-            G_t1t1 = G_t1t1 + mf_J_a[world, 1, k] * mf_MiJt_a[world, 1, k]
-            G_t1t2 = G_t1t2 + mf_J_a[world, 1, k] * mf_MiJt_a[world, 2, k]
-            G_t2t2 = G_t2t2 + mf_J_a[world, 2, k] * mf_MiJt_a[world, 2, k]
-    if bb >= 0:
-        for k in range(6):
-            G_nn = G_nn + mf_J_b[world, 0, k] * mf_MiJt_b[world, 0, k]
-            G_nt1 = G_nt1 + mf_J_b[world, 0, k] * mf_MiJt_b[world, 1, k]
-            G_nt2 = G_nt2 + mf_J_b[world, 0, k] * mf_MiJt_b[world, 2, k]
-            G_t1t1 = G_t1t1 + mf_J_b[world, 1, k] * mf_MiJt_b[world, 1, k]
-            G_t1t2 = G_t1t2 + mf_J_b[world, 1, k] * mf_MiJt_b[world, 2, k]
-            G_t2t2 = G_t2t2 + mf_J_b[world, 2, k] * mf_MiJt_b[world, 2, k]
-    W = wp.mat33(G_nn, G_nt1, G_nt2, G_nt1, G_t1t1, G_t1t2, G_nt2, G_t1t2, G_t2t2)
-    return W, wp.vec3(u_n, u_t1, u_t2)
-
-
-@wp.kernel
-def _kernel_coulomb_steps(
-    mf_body_a: wp.array2d[int],
-    mf_body_b: wp.array2d[int],
-    mf_J_a: wp.array3d[float],
-    mf_J_b: wp.array3d[float],
-    mf_MiJt_a: wp.array3d[float],
-    mf_MiJt_b: wp.array3d[float],
-    mf_row_parent: wp.array2d[int],
-    mf_row_mu: wp.array2d[float],
-    mf_rhs: wp.array2d[float],
-    body_to_articulation: wp.array[int],
-    art_dof_start: wp.array[int],
-    mode: int,
-    mf_impulses: wp.array2d[float],
-    v_out: wp.array[float],
-    out: wp.array[wp.vec3],
-):
-    world = wp.tid()
-    new_t1 = float(0.0)
-    if mode == 2:
-        new_t1 = kernels.friction_step_coulomb_newton(
-            world,
-            1,
-            mf_body_a,
-            mf_body_b,
-            mf_J_a,
-            mf_J_b,
-            mf_MiJt_a,
-            mf_MiJt_b,
-            mf_row_parent,
-            mf_row_mu,
-            mf_rhs,
-            body_to_articulation,
-            art_dof_start,
-            mf_impulses,
-            v_out,
-        )
-    else:
-        new_t1 = kernels.friction_step_bisection(
-            world,
-            1,
-            mf_body_a,
-            mf_body_b,
-            mf_J_a,
-            mf_J_b,
-            mf_MiJt_a,
-            mf_MiJt_b,
-            mf_row_parent,
-            mf_row_mu,
-            mf_rhs,
-            body_to_articulation,
-            art_dof_start,
-            mode,
-            mf_impulses,
-            v_out,
-        )
-    out[world] = wp.vec3(mf_impulses[world, 0], new_t1, mf_impulses[world, 2])
-
-
-@wp.kernel
-def _law_coulomb_steps(
-    mf_body_a: wp.array2d[int],
-    mf_body_b: wp.array2d[int],
-    mf_J_a: wp.array3d[float],
-    mf_J_b: wp.array3d[float],
-    mf_MiJt_a: wp.array3d[float],
-    mf_MiJt_b: wp.array3d[float],
-    mf_row_mu: wp.array2d[float],
-    mf_rhs: wp.array2d[float],
-    body_to_articulation: wp.array[int],
-    art_dof_start: wp.array[int],
-    mode: int,
-    mf_impulses: wp.array2d[float],
-    v_out: wp.array[float],
-    out: wp.array[wp.vec3],
-):
-    world = wp.tid()
-    W, u = _gather_contact_block(
-        world, mf_body_a, mf_body_b, mf_J_a, mf_J_b, mf_MiJt_a, mf_MiJt_b, body_to_articulation, art_dof_start, v_out
-    )
-    old = wp.vec3(mf_impulses[world, 0], mf_impulses[world, 1], mf_impulses[world, 2])
-    mu = mf_row_mu[world, 1]
-    target = -mf_rhs[world, 0]
-    if mode == 2:
-        out[world] = projection_laws.coulomb_newton(W, u, old, mu, target)
-    else:
-        if mode == 1:
-            target = projection_laws.de_saxce_target(target, u, mu)
-        out[world] = projection_laws.coulomb_bisection(W, u, old, mu, target)
-
-
-def test_coulomb_laws_match_mf_friction_steps(test, device):
-    """Equal ``friction_step_bisection`` (with and without de Saxce) and ``friction_step_coulomb_newton`` bitwise."""
-    rng = np.random.default_rng(42)
-    worlds = 2048
-    for mode, name in ((0, "bisection"), (1, "bisection_desaxce"), (2, "coulomb_newton")):
-        with test.subTest(friction_mode=name):
-            values = _contact_triples(rng, worlds)
-            out = call(
-                _kernel_coulomb_steps, worlds, device, mode=mode, out=np.zeros((worlds, 3), np.float32), **values
-            )
-            law_values = {k: v for k, v in values.items() if k != "mf_row_parent"}
-            law = call(
-                _law_coulomb_steps, worlds, device, mode=mode, out=np.zeros((worlds, 3), np.float32), **law_values
-            )
-            test.assertFalse(mismatches(out["out"].numpy(), law["out"].numpy()).any())
-            test.assertTrue(np.any(out["out"].numpy() != values["mf_impulses"]))
-
-
-@wp.kernel
-def _kernel_coulomb_row(
-    W: wp.array[wp.mat33], b: wp.array[wp.vec3], mu: wp.array[float], out: wp.array[kernels.FPGSCoulombNewtonResult]
-):
-    i = wp.tid()
-    out[i] = kernels.solve_coulomb_row(W[i], b[i], mu[i])
-
-
-@wp.kernel
-def _law_coulomb_row(
-    W: wp.array[wp.mat33], b: wp.array[wp.vec3], mu: wp.array[float], out: wp.array[kernels.FPGSCoulombNewtonResult]
-):
-    i = wp.tid()
-    out[i] = projection_laws.coulomb_row(W[i], b[i], mu[i])
-
-
-def test_coulomb_row_matches_daviet_solve(test, device):
-    """Equal ``kernels.solve_coulomb_row`` (Daviet's Newton on one block) bitwise, iteration counts included."""
-    rng = np.random.default_rng(43)
-    n = 8192
-    values = {**twin_inputs("coulomb_row", rng, n, device), "out": np.zeros((n, 6), dtype=np.float32)}
-    a = call(_kernel_coulomb_row, n, device, **values)["out"].numpy()
-    b = call(_law_coulomb_row, n, device, **values)["out"].numpy()
-    test.assertFalse(mismatches(a, b).any())
-
-
-@wp.kernel
-def _kernel_speed_row(
-    velocity: wp.array[float],
-    limit: wp.array[float],
-    effective_mass: wp.array[float],
-    old: wp.array[float],
-    accumulated: int,
-    out: wp.array[wp.vec2],
-):
-    row = wp.tid()
-    out[row] = kernels.project_free_body_speed(
-        velocity, 3 * row, limit[row], effective_mass[row], old[row], accumulated
-    )
-
-
-@wp.kernel
-def _law_speed_row(
-    velocity: wp.array[float],
-    limit: wp.array[float],
-    effective_mass: wp.array[float],
-    old: wp.array[float],
-    accumulated: int,
-    out: wp.array[wp.vec2],
-):
-    row = wp.tid()
-    dof = 3 * row
-    v = wp.vec3(velocity[dof], velocity[dof + 1], velocity[dof + 2])
-    result = projection_laws.speed_row(wp.length(v), limit[row], effective_mass[row], old[row], accumulated)
-    if result[2] != 0.0:
-        for k in range(3):
-            velocity[dof + k] = velocity[dof + k] + v[k] * result[2]
-    out[row] = wp.vec2(result[0], result[1])
-
-
-def test_speed_row_matches_free_body_speed_projection(test, device):
-    """Equal ``project_free_body_speed`` bitwise in impulse, change and the projected velocity, under both laws."""
-    rng = np.random.default_rng(44)
-    rows = 4096
-    for accumulated in (0, 1):
-        with test.subTest(accumulated=accumulated):
-            velocity = rng.normal(scale=2.0, size=3 * rows).astype(np.float32)
-            velocity[: 3 * 16] = 0.0
-            values = {
-                "limit": rng.uniform(0.1, 3.0, rows).astype(np.float32),
-                "effective_mass": rng.uniform(0.1, 2.0, rows).astype(np.float32),
-                "old": np.abs(rng.normal(size=rows)).astype(np.float32),
-                "accumulated": accumulated,
-            }
-            a = call(
-                _kernel_speed_row, rows, device, velocity=velocity.copy(), out=np.zeros((rows, 2), np.float32), **values
-            )
-            b = call(
-                _law_speed_row, rows, device, velocity=velocity.copy(), out=np.zeros((rows, 2), np.float32), **values
-            )
-            test.assertFalse(mismatches(a["out"].numpy(), b["out"].numpy()).any())
-            test.assertFalse(mismatches(a["velocity"].numpy()[:, None], b["velocity"].numpy()[:, None]).any())
-
-
-# The Warp loop sweeps' update, unilateral clamp and disk clamp, as kernels.py writes them.
-_MF_LOOP_STEP = """
-            if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-                # Proximal regularization in w-form (w = 1/(1+g)): identical
-                # algebra, but no g*lambda product that could overflow for
-                # extreme finite g; w = 1 (g = 0) is the exact hard update.
-                w = float(1.0)
-                if regularize != 0:
-                    w = mf_row_w[world, i]
-                delta = -residual * eff_inv * w - (1.0 - w) * old_impulse
-            new_impulse = old_impulse + omega * delta
-
-            # Project
-            if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-                if new_impulse < 0.0:
-                    new_impulse = 0.0
-"""
-_LOOP_DISK = """
-                mag = wp.sqrt(a * a + b * b)
-                if mag > radius:
-                    scale = radius / mag
-                    a *= scale
-                    b *= scale
-"""
-
-
-def test_step_and_clamps_match_warp_loop_sweeps(test, device):
-    """Equal the Warp loop sweeps' regularized update, unilateral clamp and disk clamp bitwise."""
-    anchored(test, "kernels.py", _MF_LOOP_STEP)
-    anchored(test, "kernels.py", _LOOP_DISK)
-    signature = (
-        "residual_in: wp.array[float], eff_inv_in: wp.array[float], w_in: wp.array[float], "
-        "old_in: wp.array[float], pair: wp.array[wp.vec2], radius_in: wp.array[float], "
-        "omega: float, out: wp.array[wp.vec3]"
-    )
-    body = (
-        "i = wp.tid()\nworld = 0\nmf_row_w = w_in\nregularize = 1\nrow_type = PGS_CONSTRAINT_TYPE_CONTACT\n"
-        "residual = residual_in[i]\neff_inv = eff_inv_in[i]\nold_impulse = old_in[i]\ndelta = -residual * eff_inv\n"
-        + dedent_block(_MF_LOOP_STEP).replace("mf_row_w[world, i]", "mf_row_w[i]")
-        + "a = pair[i][0]\nb = pair[i][1]\nradius = radius_in[i]\n"
-        + dedent_block(_LOOP_DISK)
-        + "out[i] = wp.vec3(new_impulse, a, b)\n"
-    )
-    reference = reference_kernel(
-        "loop_step_reference", signature, body, {"PGS_CONSTRAINT_TYPE_CONTACT": kernels.PGS_CONSTRAINT_TYPE_CONTACT}
-    )
-    law_body = (
-        "i = wp.tid()\n"
-        "new_impulse = projection_laws.unilateral(projection_laws.regularized_step(old_in[i], -residual_in[i] * eff_inv_in[i], w_in[i], omega))\n"
-        "pair_out = projection_laws.disk(pair[i], radius_in[i])\n"
-        "out[i] = wp.vec3(new_impulse, pair_out[0], pair_out[1])\n"
-    )
-    law = reference_kernel("loop_step_law", signature, law_body, {"projection_laws": projection_laws})
-    rng = np.random.default_rng(45)
-    n = 8192
-    values = {
-        "residual_in": scalars(rng, n),
-        "eff_inv_in": rng.uniform(0.1, 3.0, n).astype(np.float32),
-        "w_in": rng.choice(np.array([1.0, 0.5, 0.98, 0.2], dtype=np.float32), n),
-        "old_in": np.abs(scalars(rng, n)),
-        "pair": rng.normal(size=(n, 2)).astype(np.float32),
-        "radius_in": np.abs(scalars(rng, n)),
-        "omega": 0.9,
-        "out": np.zeros((n, 3), dtype=np.float32),
-    }
-    a = call(reference, n, device, **values)["out"].numpy()
-    b = call(law, n, device, **values)["out"].numpy()
-    test.assertFalse(mismatches(a, b).any())
-
-
-def test_friction_pair_matches_native_pair_law(test, device):
-    """Unify the native sweeps' pair law (``friction.FRICTION_PAIR``) with the Warp one: equal within 1e-5 of the disk.
-
-    Today's CUDA text and Warp function are two writings of one law whose
-    roundings differ. The law is the Warp writing; its CUDA rendering moves the
-    native sweeps by that rounding, a few float32 units of the disk's radius.
+    At ``omega = 1`` the pair ``x`` and its residual ``r(x) = residual + A (x - old)`` meet the variational
+    inequality ``r . x + radius |r| = 0``: zero inside the disk (sticking), anti-parallel on it (sliding).
+    A relaxed pair moves the old one ``omega`` of the way.
     """
-    require_cuda(test, device)
-    inputs = {"a": float, "c": float, "d": float, "residual": wp.vec2, "old": wp.vec2, "radius": float, "omega": float}
-    outputs = {"result": wp.vec2}
-    hand = native_kernel(
-        "pair_hand",
-        inputs,
-        outputs,
-        "    const float2 p = friction_pair_candidate(a, c, d, residual[0], residual[1], old[0], old[1], radius, omega);\n"
-        "    const wp::vec2 result(p.x, p.y);",
-        preludes=(friction.FRICTION_PAIR,),
-    )
-    law = native_kernel(
-        "pair_law",
-        inputs,
-        outputs,
-        "    const wp::vec2 result = ProjectionLaw::friction_pair(a, c, d, residual, old, radius, omega);",
-        preludes=projection_laws.PROJECTION_LAW.preludes(),
-    )
-    rng = np.random.default_rng(51)
-    n = 65536
+    rng = np.random.default_rng(61)
+    n = 8192
     values = twin_inputs("friction_pair", rng, n, device)
-    a = run_native(hand, inputs, outputs, values, n, device)["result"]
-    b = run_native(law, inputs, outputs, values, n, device)["result"]
-    scale = np.maximum(values["radius"], 1.0e-6)[:, None]
-    unified("native pair law (friction.FRICTION_PAIR)", a, b, scale, 0.0)
-    test.assertLess(np.max(np.abs(a - b) / scale), 1.0e-5)
+    outputs = call(_pair, n, device, **values, out=np.zeros((n, 2), np.float32), relaxed=np.zeros((n, 2), np.float32))
+    x = outputs["out"].numpy().astype(np.float64)
+    relaxed = outputs["relaxed"].numpy().astype(np.float64)
+    old = values["old"].astype(np.float64)
+    a, c, d = (values[k].astype(np.float64) for k in ("a", "c", "d"))
+    block = np.stack([np.stack([a, c], 1), np.stack([c, d], 1)], 1)
+    r = values["residual"].astype(np.float64) + np.einsum("nij,nj->ni", block, x - old)
+    radius = values["radius"].astype(np.float64)
+    norm = np.linalg.norm(x, axis=1)
+    test.assertTrue(np.all(norm <= radius * (1.0 + 1.0e-6) + 1.0e-30))
+    test.assertTrue(np.all(x[radius == 0.0] == 0.0))
+    loaded = radius > 0.0
+    scale = np.abs(block).max(axis=(1, 2)) * np.maximum(radius, np.linalg.norm(old, axis=1))
+    scale += np.linalg.norm(values["residual"], axis=1)
+    gap = np.einsum("ni,ni->n", r, x) + radius * np.linalg.norm(r, axis=1)
+    gap = gap[loaded] / (scale[loaded] * radius[loaded])
+    test.assertGreater(gap.min(), -1.0e-5)
+    test.assertLess(np.quantile(gap, 0.995), 1.0e-5)
+    test.assertLess(gap.max(), 1.0e-3)
+    # A sticking pair relaxes to old + omega (pair - old), before the caller's disk.
+    omega = values["omega"].astype(np.float64)[:, None]
+    sticking = loaded & (norm < radius * (1.0 - 1.0e-3))
+    expected = old + omega * (x - old)
+    test.assertLess(np.max(np.abs(relaxed[sticking] - expected[sticking]) / (1.0 + np.abs(expected[sticking]))), 1.0e-4)
 
 
-def test_coulomb_laws_match_native_friction_modes(test, device):
-    """Equal the MF-GS sweep's native RAISim bisection (dense and matrix-free copies) and Daviet Newton.
+@wp.kernel
+def _coulomb(
+    W: wp.array[wp.mat33],
+    u: wp.array[wp.vec3],
+    old: wp.array[wp.vec3],
+    mu: wp.array[float],
+    target_n: wp.array[float],
+    newton: wp.array[wp.vec3],
+    bisection: wp.array[wp.vec3],
+    de_saxce: wp.array[float],
+):
+    i = wp.tid()
+    newton[i] = laws.coulomb_newton(W[i], u[i], old[i], mu[i], target_n[i])
+    bisection[i] = laws.coulomb_bisection(W[i], u[i], old[i], mu[i], target_n[i])
+    de_saxce[i] = laws.de_saxce_target(target_n[i], u[i], mu[i])
 
-    Each reference is the block the generator emits, extracted from its output.
+
+def test_coulomb_laws_solve_the_contact_problem(test, device):
+    """Keep the cone and the normal target; Daviet's Newton also dissipates maximally, RAISim's bisection bounds.
+
+    ``v = u + W (lambda - old)`` is a contact's velocity at the result: a loaded contact reaches its normal
+    target, an unloaded one separates, and Newton's tangent velocity vanishes while sticking and opposes the
+    impulse while sliding. A degenerate block keeps the old impulses; a contact separating without its normal
+    impulse releases all three.
     """
-    require_cuda(test, device)
-    from newton._src.solvers.feather_pgs import mf_gs_source  # noqa: PLC0415
-
-    inputs = {
-        "u_n": float,
-        "u_t1": float,
-        "u_t2": float,
-        "G_nn": float,
-        "G_nt1": float,
-        "G_nt2": float,
-        "G_t1t1": float,
-        "G_t1t2": float,
-        "G_t2t2": float,
-        "old_lambda_n": float,
-        "old_lambda_t1": float,
-        "old_lambda_t2": float,
-        "mu": float,
-        "target_vel_n": float,
-    }
-    outputs = {"result": wp.vec3}
-    law_body = (
-        "    const wp::mat33 W(G_nn, G_nt1, G_nt2, G_nt1, G_t1t1, G_t1t2, G_nt2, G_t1t2, G_t2t2);\n"
-        "    const wp::vec3 u(u_n, u_t1, u_t2), old(old_lambda_n, old_lambda_t1, old_lambda_t2);\n"
-        "    const wp::vec3 result = CoulombLaw::{law}(W, u, old, mu, target_vel_n);"
+    rng = np.random.default_rng(62)
+    n = 8192
+    root = rng.normal(size=(n, 3, 3))
+    W = (root @ np.transpose(root, (0, 2, 1)) + 0.05 * np.eye(3)).astype(np.float32)
+    W[::97] *= 1.0e-22
+    u = rng.normal(size=(n, 3)).astype(np.float32)
+    old = np.abs(rng.normal(scale=0.5, size=(n, 3))).astype(np.float32)
+    mu = rng.uniform(0.05, 1.2, n).astype(np.float32)
+    target = scalars(rng, n)
+    out = call(
+        _coulomb,
+        n,
+        device,
+        W=W,
+        u=u,
+        old=old,
+        mu=mu,
+        target_n=target,
+        newton=np.zeros((n, 3), np.float32),
+        bisection=np.zeros((n, 3), np.float32),
+        de_saxce=np.zeros(n, np.float32),
     )
-    rng = np.random.default_rng(52)
-    n = 32768
-    w = spd3(rng, n)
-    values = {
-        "u_n": scalars(rng, n),
-        "u_t1": scalars(rng, n),
-        "u_t2": scalars(rng, n),
-        "G_nn": w[:, 0, 0],
-        "G_nt1": w[:, 0, 1],
-        "G_nt2": w[:, 0, 2],
-        "G_t1t1": w[:, 1, 1],
-        "G_t1t2": w[:, 1, 2],
-        "G_t2t2": w[:, 2, 2],
-        "old_lambda_n": np.abs(scalars(rng, n)),
-        "old_lambda_t1": scalars(rng, n, 0.3),
-        "old_lambda_t2": scalars(rng, n, 0.3),
-        "mu": rng.uniform(0.0, 1.2, n).astype(np.float32),
-        "target_vel_n": scalars(rng, n),
-    }
-    cases = []
-    for mode, law_name, occurrences in (
-        ("bisection", "coulomb_bisection", (0, 1)),
-        ("coulomb_newton", "coulomb_newton", (0,)),
-    ):
-        source = mf_gs_source.get_source(16, 16, 12, "sm_80", friction_mode=mode)
-        for occurrence in occurrences:
-            block = between(source, "if (G_nn >= 1.0e-20f) {", "d_n_total = new_lambda_n - old_lambda_n;", occurrence)
-            cases.append((f"{mode}_{occurrence}", law_name, block))
-    for name, law_name, block in cases:
-        with test.subTest(block=name):
-            reference = native_kernel(
-                f"native_{name}",
-                inputs,
-                outputs,
-                "    float new_lambda_n = old_lambda_n, new_lambda_t1 = old_lambda_t1, new_lambda_t2 = old_lambda_t2;\n"
-                + block
-                + "}\n    const wp::vec3 result(new_lambda_n, new_lambda_t1, new_lambda_t2);",
-            )
-            law = native_kernel(
-                f"law_{name}",
-                inputs,
-                outputs,
-                law_body.replace("{law}", law_name),
-                preludes=projection_laws.COULOMB_LAW.preludes(),
-            )
-            a = run_native(reference, inputs, outputs, values, n, device)["result"]
-            b = run_native(law, inputs, outputs, values, n, device)["result"]
-            scale = np.maximum(np.abs(a).max(axis=1, keepdims=True), 1.0e-3)
-            unified(f"native {name} (mf_gs_source)", a, b, scale, 0.0)
-            test.assertLess(np.max(np.abs(a - b) / scale), 1.0e-4)
-
-
-def test_drive_and_velocity_limit_laws_match_native_text(test, device):
-    """Equal the native PhysX drive update and both velocity-limit laws, as the generators emit them, bitwise."""
-    require_cuda(test, device)
-    from newton._src.solvers.feather_pgs import mf_gs_source, velocity_limit_law  # noqa: PLC0415
-
-    source = mf_gs_source.get_source(16, 16, 12, "sm_80")
-    drive = between(source, "new_impulse = old_impulse * s_drive_imp_mul_dense[i]", "delta_impulse = new_impulse")
-    stateless = between(source, "float delta_vlim = -residual_vlim / denom;", "if (lane == 0) s_lam_dense[i]")
-    accumulated = velocity_limit_law.accumulated_update(
-        "old_vlim", "residual_vlim / denom", new="new_vlim", delta="delta_impulse_vlim", indent="    ", declare="float "
+    degenerate = W[:, 0, 0] < 1.0e-20
+    W64, u64, old64, mu64 = W.astype(np.float64), u.astype(np.float64), old.astype(np.float64), mu.astype(np.float64)
+    np.testing.assert_allclose(
+        out["de_saxce"].numpy(), target + mu64 * np.linalg.norm(u64[:, 1:], axis=1), rtol=1.0e-6, atol=1.0e-6
     )
-    test.assertIn(
-        normalized(accumulated),
-        normalized(mf_gs_source.get_source(16, 16, 12, "sm_80", velocity_limit_law="accumulated")),
-    )
-    rng = np.random.default_rng(53)
-    n = 32768
-    values = {
-        "old_impulse": scalars(rng, n),
-        "jv": scalars(rng, n),
-        "imp_mul": rng.uniform(0.0, 1.0, n).astype(np.float32),
-        "vel_mul": scalars(rng, n),
-        "target": scalars(rng, n),
-        "max_impulse": np.abs(scalars(rng, n)),
-        "residual_vlim": scalars(rng, n),
-        "denom": rng.uniform(0.1, 3.0, n).astype(np.float32),
-        "old_vlim": np.abs(scalars(rng, n)),
-    }
-    inputs = dict.fromkeys(values, float)
-    outputs = {"drive": float, "stateless_new": float, "accumulated_new": float, "accumulated_delta": float}
-    # Each extracted text in its own block: both velocity-limit laws declare ``delta_impulse_vlim``.
-    reference_body = (
-        "    float drive, stateless_new, accumulated_new, accumulated_delta;\n    {\n    float new_impulse = 0.0f;\n    "
-        + drive.replace("s_drive_imp_mul_dense[i]", "imp_mul")
-        .replace("s_drive_vel_mul_dense[i]", "vel_mul")
-        .replace("s_drive_target_dense[i]", "target")
-        .replace("s_drive_max_imp_dense[i]", "max_impulse")
-        + "\n    drive = new_impulse;\n    }\n    {\n    "
-        + stateless
-        + "\n    stateless_new = delta_impulse_vlim;\n    }\n    {\n"
-        + accumulated
-        + "    accumulated_new = new_vlim;\n    accumulated_delta = delta_impulse_vlim;\n    }"
-    )
-    law_body = (
-        "    const float drive = ProjectionLaw::physx_drive(old_impulse, jv, imp_mul, vel_mul, target, max_impulse);\n"
-        "    const float step = residual_vlim / denom;\n"
-        "    const float stateless_new = ProjectionLaw::velocity_limit_update(0.0f, residual_vlim, step, 0).v0;\n"
-        "    const auto accumulated = ProjectionLaw::velocity_limit_update(old_vlim, residual_vlim, step, 1);\n"
-        "    const float accumulated_new = accumulated.v0, accumulated_delta = accumulated.v1;"
-    )
-    reference = native_kernel("native_drive_vlim", inputs, outputs, reference_body)
-    law = native_kernel("law_drive_vlim", inputs, outputs, law_body, preludes=projection_laws.PROJECTION_LAW.preludes())
-    a = run_native(reference, inputs, outputs, values, n, device)
-    b = run_native(law, inputs, outputs, values, n, device)
-    for name in outputs:
-        test.assertFalse(mismatches(a[name][:, None], b[name][:, None]).any(), name)
+    for name in ("newton", "bisection"):
+        lam = out[name].numpy().astype(np.float64)
+        np.testing.assert_array_equal(lam[degenerate], old64[degenerate], err_msg=name)
+        lam, W_, u_, old_, mu_, target_ = (
+            value[~degenerate] for value in (lam, W64, u64, old64, mu64, target.astype(np.float64))
+        )
+        velocity = u_ + np.einsum("nij,nj->ni", W_, lam - old_)
+        scale = np.abs(W_).max(axis=(1, 2)) * np.maximum(np.abs(lam).max(axis=1), np.abs(old_).max(axis=1))
+        scale += np.abs(u_).max(axis=1) + np.abs(target_)
+        tangent = np.linalg.norm(lam[:, 1:], axis=1)
+        test.assertGreaterEqual(lam[:, 0].min(), 0.0, name)
+        test.assertLess(np.max((tangent - mu_ * lam[:, 0]) / scale), 1.0e-4, name)
+        separating = u_[:, 0] - W_[:, 0, 0] * old_[:, 0] >= target_
+        if name == "bisection":
+            test.assertTrue(np.all(lam[separating] == 0.0))
+            continue
+        loaded = lam[:, 0] > 1.0e-6 * scale
+        gap = (velocity[:, 0] - target_) / scale
+        test.assertLess(np.max(np.abs(gap[loaded])), 1.0e-5)
+        test.assertGreater(gap[~loaded].min(), -1.0e-5)
+        sticking = loaded & (tangent < mu_ * lam[:, 0] * (1.0 - 1.0e-4))
+        test.assertLess(np.max(np.linalg.norm(velocity[sticking, 1:], axis=1) / scale[sticking]), 1.0e-5)
+        sliding = loaded & ~sticking & (tangent > 0.0)
+        alpha = -np.einsum("ni,ni->n", velocity[sliding, 1:], lam[sliding, 1:]) / tangent[sliding] ** 2
+        test.assertGreaterEqual(alpha.min(), 0.0)
+        opposed = velocity[sliding, 1:] + alpha[:, None] * lam[sliding, 1:]
+        test.assertLess(np.max(np.linalg.norm(opposed, axis=1) / scale[sliding]), 1.0e-4)
 
 
-def test_cached_friction_pair_matches_native_cached_law(test, device):
-    """Unify the sparse sweep's cached pair law (``friction.FRICTION_PAIR_CACHED``) with the law's metric form.
+@wp.kernel
+def _scalar_laws(
+    old: wp.array[float],
+    residual: wp.array[float],
+    diagonal: wp.array[float],
+    w: wp.array[float],
+    bound: wp.array[float],
+    kind: wp.array[int],
+    iteration: wp.array[int],
+    out: wp.array2d[float],
+):
+    i = wp.tid()
+    step = -residual[i] / diagonal[i]
+    out[i, 0] = laws.relaxed_step(old[i], laws.regularized_delta(step, w[i], old[i]), 0.7)
+    out[i, 1] = laws.regularized_diagonal(diagonal[i], w[i])
+    out[i, 2] = laws.unilateral(old[i])
+    out[i, 3] = laws.box(old[i], -bound[i], bound[i])
+    accumulated_new, accumulated_delta = laws.velocity_limit_update(old[i], residual[i], residual[i] / diagonal[i], 1)
+    stateless_new, stateless_delta = laws.velocity_limit_update(old[i], residual[i], residual[i] / diagonal[i], 0)
+    out[i, 4] = accumulated_new
+    out[i, 5] = accumulated_delta
+    out[i, 6] = stateless_new
+    out[i, 7] = stateless_delta
+    out[i, 8] = laws.velocity_clamp_impulse(residual[i], bound[i], diagonal[i])
+    out[i, 9] = laws.physx_drive(old[i], residual[i], w[i], 0.5, 0.25, bound[i])
+    out[i, 10] = float(laws.friction_gate(kind[i], iteration[i], 3))
+    row = laws.speed_row(wp.abs(residual[i]) * 3.0, bound[i], diagonal[i], 0.0, 0)
+    out[i, 11] = row[2]
 
-    The law's :func:`friction_pair_metric` and :func:`friction_pair_from_metric` compose
-    :func:`friction_pair`; the native text rounds as the native pair law does.
+
+def test_scalar_laws(test, device):
+    """Hold each scalar law's definition: steps, sets, velocity limits, the drive and the friction gate.
+
+    The regularized step's fixed point, residual ``-(1 / w - 1) d lambda``, is the exact solve against
+    :func:`~.projection_laws.regularized_diagonal`.
     """
-    require_cuda(test, device)
-    inputs = {"a": float, "c": float, "d": float, "residual": wp.vec2, "old": wp.vec2, "radius": float, "omega": float}
-    outputs = {"result": wp.vec2, "whole": wp.vec2}
-    hand = native_kernel(
-        "pair_cached_hand",
-        inputs,
-        outputs,
-        "    const FrictionPairMetric metric = friction_pair_metric(a, c, d);\n"
-        "    const float2 p = friction_pair_from_metric(metric, residual[0], residual[1], old[0], old[1], radius, omega);\n"
-        "    const wp::vec2 result(p.x, p.y), whole = result;",
-        preludes=(friction.FRICTION_PAIR_CACHED,),
-    )
-    law = native_kernel(
-        "pair_cached_law",
-        inputs,
-        outputs,
-        "    const auto metric = ProjectionLaw::friction_pair_metric(a, c, d);\n"
-        "    const wp::vec2 result = ProjectionLaw::friction_pair_from_metric(\n"
-        "        metric.v0, metric.v1, metric.v2, metric.v3, residual, old, radius, omega);\n"
-        "    const wp::vec2 whole = ProjectionLaw::friction_pair(a, c, d, residual, old, radius, omega);",
-        preludes=projection_laws.PROJECTION_LAW.preludes(),
-    )
-    rng = np.random.default_rng(56)
-    n = 65536
-    values = twin_inputs("friction_pair", rng, n, device)
-    a = run_native(hand, inputs, outputs, values, n, device)
-    b = run_native(law, inputs, outputs, values, n, device)
-    test.assertFalse(mismatches(b["result"], b["whole"]).any(), "the metric form composes the whole law")
-    scale = np.maximum(values["radius"], 1.0e-6)[:, None]
-    unified("native cached pair law (friction.FRICTION_PAIR_CACHED)", a["result"], b["result"], scale, 0.0)
-    test.assertLess(np.max(np.abs(a["result"] - b["result"]) / scale), 1.0e-5)
+    rng = np.random.default_rng(63)
+    n = 4096
+    old = scalars(rng, n)
+    residual = scalars(rng, n)
+    diagonal = rng.uniform(0.1, 3.0, n).astype(np.float32)
+    w = rng.choice(np.array([1.0, 0.5, 0.98, 0.25], np.float32), n)
+    bound = rng.uniform(0.05, 2.0, n).astype(np.float32)
+    kind = rng.integers(0, 6, n).astype(np.int32)
+    iteration = rng.integers(0, 6, n).astype(np.int32)
+    out = call(
+        _scalar_laws,
+        n,
+        device,
+        old=old,
+        residual=residual,
+        diagonal=diagonal,
+        w=w,
+        bound=bound,
+        kind=kind,
+        iteration=iteration,
+        out=np.zeros((n, 12), np.float32),
+    )["out"].numpy()
+    o, r, d, w64, b = (v.astype(np.float64) for v in (old, residual, diagonal, w, bound))
+    np.testing.assert_allclose(out[:, 0], o + 0.7 * (w64 * (-r / d) - (1.0 - w64) * o), rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(out[:, 1], d / w64, rtol=1e-6)
+    np.testing.assert_array_equal(out[:, 2], np.where(old < 0.0, 0.0, old))
+    np.testing.assert_array_equal(out[:, 3], np.clip(old, -bound, bound))
+    np.testing.assert_allclose(out[:, 4], np.maximum(o - r / d, 0.0), rtol=1e-6, atol=1e-7)
+    np.testing.assert_allclose(out[:, 5], out[:, 4] - old, rtol=1e-6, atol=1e-6)
+    stateless = np.where(r < 0.0, -r / d, 0.0)
+    np.testing.assert_allclose(out[:, 6], stateless, rtol=1e-6, atol=1e-7)
+    np.testing.assert_allclose(out[:, 7], stateless, rtol=1e-6, atol=1e-7)
+    # The clamp impulse moves the coordinate's velocity into [-limit, limit].
+    np.testing.assert_allclose(r + d * out[:, 8], np.clip(r, -b, b), rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(out[:, 9], np.clip(o * w64 + 0.5 * r + 0.25, -b, b), rtol=1e-5, atol=1e-6)
+    np.testing.assert_array_equal(out[:, 10], (kind == ROW_FRICTION) & (iteration < 3))
+    # A free body over its speed limit keeps its direction and ends on the limit.
+    speed = np.abs(r) * 3.0
+    over = speed > b
+    np.testing.assert_allclose(speed[over] * (1.0 + out[over, 11]), b[over], rtol=1e-5)
+    np.testing.assert_array_equal(out[~over, 11], 0.0)
+    # The regularized step's fixed point solves the row against the regularized diagonal.
+    b_free = r
+    fixed = -b_free * w64 / d
+    test.assertTrue(np.allclose(fixed, -b_free / (d / w64)))
+    stepped = fixed + 0.7 * (w64 * (-(d * fixed + b_free) / d) - (1.0 - w64) * fixed)
+    np.testing.assert_allclose(stepped, fixed, rtol=1e-12, atol=1e-12)
+    test.assertEqual(ROW_CONTACT, 0)
 
 
 class TestFeatherPGSProjectionLaws(unittest.TestCase):
-    """Each projection law against the implementations it replaces."""
+    """The projection laws against the conditions that define them."""
 
 
 register_device_tests(TestFeatherPGSProjectionLaws, globals())

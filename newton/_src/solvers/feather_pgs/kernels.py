@@ -48,8 +48,19 @@ from .device_preludes import (
     warp_sum,
     warp_sync,
 )
-from .friction import friction_pair_candidate
 from .friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, patch_friction_location, patch_normal_load
+from .projection_laws import (
+    coulomb_bisection,
+    coulomb_newton,
+    de_saxce_target,
+    disk,
+    friction_gate,
+    friction_pair,
+    regularized_delta,
+    relaxed_step,
+    speed_row,
+    unilateral,
+)
 from .row_laws import (
     contact_depenetration_cap,
     contact_restitution_fires,
@@ -115,24 +126,9 @@ def local_solve_launch_gate():
 FRICTION_MODE_CURRENT = 0
 FRICTION_MODE_BISECTION = 1
 FRICTION_MODE_BISECTION_DESAXCE = 2
-# Gilles Daviet's scalar bracketed-Newton on the tangential-force ratio
-# alpha (FPGS Friction Modes 7/13).  The @wp.func implementation is
-# :func:`friction_step_coulomb_newton`; the core solver is ported from
-# ``artifacts/2026-04-16-slack-raisim/coulomb_root_finding_warp.py``.
+# Gilles Daviet's scalar bracketed Newton on the tangential-force ratio
+# alpha (FPGS Friction Modes 7/13): projection_laws.coulomb_newton.
 FRICTION_MODE_COULOMB_NEWTON = 3
-
-# RAISim-style bisection step count for :func:`friction_step_bisection`.
-# Matches the ``BISECTION_ITERS`` constant in Miles Macklin's
-# ``solvers/raisim/kernels.py``.
-_FPGS_BISECTION_ITERS = 20
-
-# Bracketed-Newton expansion / iteration bounds for
-# :func:`friction_step_coulomb_newton`.  Match the constants in
-# ``coulomb_root_finding_warp.py::solve_coulomb`` so the in-solver
-# behaviour is byte-for-byte identical to the reference self-test
-# (``|phi| < ~5e-6`` at solution).
-_FPGS_COULOMB_NEWTON_EXPAND_ITERS = 30
-_FPGS_COULOMB_NEWTON_NEWTON_ITERS = 50
 
 
 @wp.kernel
@@ -6629,8 +6625,8 @@ def _transport_warmstart_contact(
     radius = wp.max(row_mu[world, slot + 1] * normal_impulse, 0.0)
     if not wp.isfinite(magnitude) or radius <= 0.0:
         tangent = wp.vec2(0.0)
-    elif magnitude > radius:
-        tangent *= radius / magnitude
+    else:
+        tangent = disk(tangent, radius)
     impulses[world, slot + 1] = tangent[0]
     impulses[world, slot + 2] = tangent[1]
 
@@ -6922,20 +6918,20 @@ def allocate_rigid_velocity_limit_slots(
     if world < resolved_worlds.shape[0] and resolved_worlds[world] != 0:
         return
 
-    for speed_row in range(RIGID_SPEED_ROWS):
+    for speed_axis in range(RIGID_SPEED_ROWS):
         limit = rigid_body_max_linear_velocity[body]
-        if speed_row == 1:
+        if speed_axis == 1:
             limit = rigid_body_max_angular_velocity[body]
         # An infinite speed limit is no limit; otherwise the velocity-limit activation law, whose proximity
         # gate reserves the row only when the speed reaches ``fraction * limit``.
         if not wp.isfinite(limit):
             continue
-        root_dof = articulation_root_dof_start[art] + 3 * speed_row
+        root_dof = articulation_root_dof_start[art] + 3 * speed_axis
         speed = wp.length(wp.vec3(joint_qd[root_dof], joint_qd[root_dof + 1], joint_qd[root_dof + 2]))
         if not velocity_limit_active(limit, speed, velocity_limit_activation_fraction):
             continue
 
-        rigid_velocity_limit_slot[base + speed_row] = reserve(
+        rigid_velocity_limit_slot[base + speed_axis] = reserve(
             mf_slot_counter, world, 1, mf_max_constraints, mf_first_rejected_slot
         )
 
@@ -6980,18 +6976,18 @@ def populate_rigid_velocity_limit_rows(
         return
 
     base = RIGID_SPEED_ROWS * candidate
-    for speed_row in range(RIGID_SPEED_ROWS):
-        slot = rigid_velocity_limit_slot[base + speed_row]
+    for speed_axis in range(RIGID_SPEED_ROWS):
+        slot = rigid_velocity_limit_slot[base + speed_axis]
         if slot < 0:
             continue
         limit = rigid_body_max_linear_velocity[body]
-        if speed_row == 1:
+        if speed_axis == 1:
             limit = rigid_body_max_angular_velocity[body]
 
         for k in range(6):
             mf_J_a[world, slot, k] = 0.0
             mf_J_b[world, slot, k] = 0.0
-        mf_J_a[world, slot, 3 * speed_row] = 1.0
+        mf_J_a[world, slot, 3 * speed_axis] = 1.0
 
         mf_body_a[world, slot] = body
         mf_body_b[world, slot] = -1
@@ -7014,31 +7010,21 @@ def project_free_body_speed(
 ) -> wp.vec2:
     """Project the free-body velocity ``velocity[dof:dof + 3]`` of a speed row onto ``|v| <= speed_limit``.
 
-    The row's residual is ``speed_limit - |v|``. The stateless law (PhysX's
-    clamp) removes the whole overshoot and keeps that correction; the
-    accumulated law keeps a total, ``max(old - residual * effective_mass, 0)``.
-    The correction acts along the current velocity, so a body over its limit
+    The row's law is :func:`~.projection_laws.speed_row` (the stateless clamp
+    or the accumulated total of :func:`~.projection_laws.velocity_limit_update`),
+    and its correction acts along the current velocity, so a body over its limit
     keeps its direction and ends on the limit. Returns the row's new impulse
     and the impulse change applied, both in units of ``effective_mass`` times
     speed.
     """
     v = wp.vec3(velocity[dof], velocity[dof + 1], velocity[dof + 2])
-    speed = wp.length(v)
-    residual = speed_limit - speed
-    new_impulse = float(0.0)
-    delta = float(0.0)
-    if accumulated != 0:
-        new_impulse = wp.max(old_impulse - residual * effective_mass, 0.0)
-        delta = new_impulse - old_impulse
-    elif residual < 0.0:
-        new_impulse = -residual * effective_mass
-        delta = new_impulse
-    if delta != 0.0 and speed > 0.0:
-        change = v * (-(delta / effective_mass) / speed)
+    row = speed_row(wp.length(v), speed_limit, effective_mass, old_impulse, accumulated)
+    if row[2] != 0.0:
+        change = v * row[2]
         velocity[dof] = velocity[dof] + change[0]
         velocity[dof + 1] = velocity[dof + 1] + change[1]
         velocity[dof + 2] = velocity[dof + 2] + change[2]
-    return wp.vec2(new_impulse, delta)
+    return wp.vec2(row[0], row[1])
 
 
 @wp.func
@@ -7427,184 +7413,6 @@ def compute_mf_rhs_bias(
     mf_rhs[world, i] = rhs
 
 
-# ---------------------------------------------------------------------------
-# Gilles Daviet's 1D Coulomb Newton — ported from
-# ``artifacts/2026-04-16-slack-raisim/coulomb_root_finding_warp.py``.
-#
-# The scalar bracketed-Newton on the tangential-force ratio alpha solves the
-# Coulomb cone coupling directly (no lagged de Saxce correction, no
-# quartic).  See the artifact's module docstring for the full
-# derivation; summary:
-#
-#     A_T = W_T - w_NT w_NT^T / W_N          (2x2 Schur complement)
-#     c_T = b_T - (b_N / W_N) w_NT           (2-vector)
-#
-#     phi(alpha) = |s(alpha)| - mu (w_NT . s(alpha) - b_N) / W_N
-#     where  s(alpha) = (A_T + alpha I)^{-1} c_T
-#
-#     Sticking:  phi(0) <= 0  =>  alpha = 0
-#     Sliding:   find alpha > 0 s.t. phi(alpha) = 0 via bracketed Newton
-#
-# The FeatherPGS matrix-free path exposes each contact triple through a
-# 3x3 effective-mass (Delassus) block ``G = J H^{-1} J^T`` assembled in
-# :func:`friction_step_coulomb_newton` on the fly from ``mf_J_*`` /
-# ``mf_MiJt_*`` — exactly the same data consumed by
-# :func:`friction_step_bisection`.  The ``W`` argument of
-# :func:`solve_coulomb_row` is that block, ``b`` the per-contact
-# velocity bias (``u_free`` shifted by the normal-row target velocity
-# so the reference's ``b_N < 0`` convention is preserved), and ``mu``
-# the row's Coulomb coefficient.
-# ---------------------------------------------------------------------------
-
-
-@wp.func
-def _fpgs_mat22_solve(M: wp.mat22, rhs: wp.vec2) -> wp.vec2:
-    """Solve ``M x = rhs`` via Cramer's rule (cheaper than a full inverse).
-
-    Ported verbatim from ``coulomb_root_finding_warp.py::_mat22_solve``;
-    renamed with the ``_fpgs_`` prefix to avoid colliding with any other
-    2x2 helpers that may be registered as ``@wp.func``s.
-    """
-    inv_det = 1.0 / (M[0, 0] * M[1, 1] - M[0, 1] * M[1, 0])
-    return wp.vec2(
-        (M[1, 1] * rhs[0] - M[0, 1] * rhs[1]) * inv_det,
-        (M[0, 0] * rhs[1] - M[1, 0] * rhs[0]) * inv_det,
-    )
-
-
-@wp.func
-def _fpgs_phi_dphi_and_s(
-    AT: wp.mat22,
-    cT: wp.vec2,
-    wNT: wp.vec2,
-    bN: float,
-    WN: float,
-    mu: float,
-    alpha: float,
-) -> wp.vec4:
-    """Return ``(phi, phi', s[0], s[1])`` with ``s = (A_T + alpha I)^{-1} c_T``.
-
-    Shares the 2x2 determinant across both solves (``s`` and
-    ``t = M^{-1} s``).  Ported from
-    ``coulomb_root_finding_warp.py::_phi_dphi_and_s``.
-    """
-    a = AT[0, 0] + alpha
-    b_ = AT[0, 1]
-    c = AT[1, 0]
-    d = AT[1, 1] + alpha
-    inv_det = 1.0 / (a * d - b_ * c)
-
-    # s = M^{-1} cT
-    s0 = (d * cT[0] - b_ * cT[1]) * inv_det
-    s1 = (a * cT[1] - c * cT[0]) * inv_det
-    # t = M^{-1} s  (reuses same inv_det)
-    t0 = (d * s0 - b_ * s1) * inv_det
-    t1 = (a * s1 - c * s0) * inv_det
-
-    norm_s = wp.sqrt(s0 * s0 + s1 * s1)
-    wNT_s = wNT[0] * s0 + wNT[1] * s1
-    wNT_t = wNT[0] * t0 + wNT[1] * t1
-
-    val = norm_s - mu * (wNT_s - bN) / WN
-    dval = -(s0 * t0 + s1 * t1) / norm_s + mu * wNT_t / WN
-    return wp.vec4(val, dval, s0, s1)
-
-
-# Return type matches the reference batch kernel:
-# ``[alpha, r_N, r_T[0], r_T[1], float(iterations), float(status)]`` where
-# ``status`` is ``0.0`` for sticking (``alpha = 0``, ``|r_T| <= mu r_N``)
-# or ``1.0`` for sliding (``alpha > 0``, ``|r_T| = mu r_N``).
-FPGSCoulombNewtonResult = wp.types.vector(6, float)
-
-
-@wp.func
-def solve_coulomb_row(W: wp.mat33, b: wp.vec3, mu: float) -> FPGSCoulombNewtonResult:
-    """Solve a single 3-D Coulomb friction contact (Gilles Daviet 1D Newton).
-
-    Given a 3x3 SPD Delassus block ``W``, velocity-level rhs ``b`` (with
-    ``b_N < 0`` for penetrating / sliding-into-plane contacts), and the
-    row's Coulomb coefficient ``mu``, returns the 6-vector
-    ``[alpha, r_N, r_T[0], r_T[1], iterations, status]`` described
-    above.  Ported from
-    ``artifacts/2026-04-16-slack-raisim/coulomb_root_finding_warp.py::
-    solve_coulomb`` (renamed here so the in-solver symbol does not
-    collide with the reference batch kernel).
-
-    Args:
-        W: 3x3 SPD effective-mass (Delassus) block for the contact
-            triple.  Index 0 is the normal row, indices 1 / 2 are the
-            two tangential rows.
-        b: Velocity-level rhs; ``b[0]`` is the normal component
-            (``bN < 0`` on penetrating contacts) and ``b[1:]`` are the
-            two tangential components.
-        mu: Row-level Coulomb friction coefficient.
-
-    Returns:
-        ``[alpha, r_N, r_T[0], r_T[1], iterations, status]`` with status
-        ``0.0`` for sticking and ``1.0`` for sliding.
-    """
-    WN = W[0, 0]
-    wNT = wp.vec2(W[1, 0], W[2, 0])
-    WT = wp.mat22(W[1, 1], W[1, 2], W[2, 1], W[2, 2])
-    bN = b[0]
-    bT = wp.vec2(b[1], b[2])
-
-    AT = WT - wp.outer(wNT, wNT) / WN
-    cT = bT - (bN / WN) * wNT
-
-    # Sticking check: alpha = 0.
-    s0 = _fpgs_mat22_solve(AT, cT)
-    phi0 = wp.length(s0) - mu * (wp.dot(wNT, s0) - bN) / WN
-
-    if phi0 <= 0.0:
-        rT_stick = -s0
-        rN_stick = -(wp.dot(wNT, rT_stick) + bN) / WN
-        return FPGSCoulombNewtonResult(0.0, rN_stick, rT_stick[0], rT_stick[1], 0.0, 0.0)
-
-    # Find upper bracket by doubling.
-    hi = float(1.0)
-    for _expand in range(wp.static(_FPGS_COULOMB_NEWTON_EXPAND_ITERS)):
-        vhi = _fpgs_phi_dphi_and_s(AT, cT, wNT, bN, WN, mu, hi)
-        if vhi[0] < 0.0:
-            break
-        hi = hi * 2.0
-
-    lo = float(0.0)
-    x = 0.5 * (lo + hi)
-    iterations = int(0)
-    tol = 1.0e-6 + 1.0e-6 * phi0
-    # s from the last evaluation, used for final r_T / r_N recovery.
-    last_s = wp.vec2(0.0, 0.0)
-
-    for _it in range(wp.static(_FPGS_COULOMB_NEWTON_NEWTON_ITERS)):
-        vd = _fpgs_phi_dphi_and_s(AT, cT, wNT, bN, WN, mu, x)
-        fx = vd[0]
-        dfx = vd[1]
-        last_s = wp.vec2(vd[2], vd[3])
-        iterations = iterations + 1
-
-        if wp.abs(fx) < tol or wp.abs(hi - lo) < 1.0e-6 * (1.0 + hi):
-            break
-
-        if fx > 0.0:
-            lo = x
-        else:
-            hi = x
-
-        x_new = float(0.5) * (lo + hi)
-        if dfx != 0.0:
-            x_newton = x - fx / dfx
-            if x_newton > lo and x_newton < hi:
-                x_new = x_newton
-        x = x_new
-
-    # Recover r_T, r_N from the last evaluated s (avoids a redundant solve).
-    rT_final = -last_s
-    rN_final = -(wp.dot(wNT, rT_final) + bN) / WN
-
-    return FPGSCoulombNewtonResult(x, rN_final, rT_final[0], rT_final[1], float(iterations), 1.0)
-
-
 @wp.func
 def friction_step_current(
     world: int,
@@ -7659,18 +7467,18 @@ def friction_step_current(
     first_diag = float(0.0)
     if inv0 > 0.0:
         first_diag = 1.0 / inv0
-    trial = friction_pair_candidate(
-        first_diag,
-        cross,
-        sibling_diag,
-        residual,
-        wp.vec2(mf_impulses[world, i], mf_impulses[world, sib]),
+    trial = disk(
+        friction_pair(
+            first_diag,
+            cross,
+            sibling_diag,
+            residual,
+            wp.vec2(mf_impulses[world, i], mf_impulses[world, sib]),
+            radius,
+            omega,
+        ),
         radius,
-        omega,
     )
-    magnitude = wp.length(trial)
-    if magnitude > radius:
-        trial *= radius / magnitude
     sibling_delta = trial[1] - mf_impulses[world, sib]
     mf_impulses[world, sib] = trial[1]
     for k in range(6):
@@ -7684,9 +7492,10 @@ def friction_step_current(
 
 
 @wp.func
-def friction_step_bisection(
+def friction_step_coulomb(
     world: int,
     i: int,
+    friction_mode: int,
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
     mf_J_a: wp.array3d[float],
@@ -7698,89 +7507,33 @@ def friction_step_bisection(
     mf_rhs: wp.array2d[float],
     body_to_articulation: wp.array[int],
     art_dof_start: wp.array[int],
-    use_de_saxce: int,
     mf_impulses: wp.array2d[float],
     v_out: wp.array[float],
 ):
-    """RAISim-style bisection-on-λ_n Coulomb friction step.
+    """Solve a matrix-free contact's Coulomb problem with a research friction mode's law.
 
-    Drop-in replacement for :func:`friction_step_current` selected by
-    ``friction_mode="bisection"`` (``use_de_saxce == 0``) or
-    ``friction_mode="bisection_desaxce"`` (``use_de_saxce == 1``) on
-    ``pgs_mode="matrix_free"``.  Ported from the ``USE_BISECTION`` branch
-    of ``artifacts/2026-04-16-slack-raisim/repos/mmacklin-newton-solver-raisim
-    /newton/_src/solvers/raisim/kernels.py`` (``gs_contact_sweep``, lines
-    ~687-803).  The de Saxce branch augments the normal target velocity
-    with ``μ · ‖c_T‖`` (Le Lidec & Carpentier 2024) to enforce the
-    maximum dissipation principle on sliding contacts — the 5/13 vs 6/13
-    split in the ``[FPGS Friction Modes]`` series.
+    ``friction_mode`` picks :func:`~.projection_laws.coulomb_bisection` (RAISim's
+    bisection on the normal impulse; ``FRICTION_MODE_BISECTION_DESAXCE`` first raises
+    the normal target with :func:`~.projection_laws.de_saxce_target`) or
+    :func:`~.projection_laws.coulomb_newton` (Daviet's scalar Newton).
 
-    The matrix-free layout stores each contact as three consecutive rows
-    (normal + 2 friction).  The RAISim step is naturally a per-contact
-    3-DOF solve, so this function centralises the bisection on the first
-    friction row of the triple (``i == parent + 1``) and becomes a no-op
-    on the second friction row (``i == parent + 2``).  It therefore:
-
-    * Recomputes ``u_n, u_t1, u_t2`` from the current ``v_out``.
-    * Builds the 3x3 Delassus block ``G = J H⁻¹ Jᵀ`` on the fly from the
-      per-row ``mf_J_*`` / ``mf_MiJt_*`` arrays.
-    * Bisects ``λ_n`` in ``[0, hi]`` with
-      :data:`_FPGS_BISECTION_ITERS` steps.  At each probe, solves the
-      2x2 tangential sub-problem and projects onto the Coulomb cone.
-    * Writes the final ``(λ_n, λ_t2)`` to ``mf_impulses`` directly and
-      applies the corresponding ``v_out`` corrections for the normal
-      row and the second friction row.  The first-friction-row ``v_out``
-      correction is returned as the new impulse so the outer PGS loop
-      applies it via its usual ``delta_impulse`` path.
-
-    Args:
-        world: World index for the current row.
-        i: Constraint row index within the world.
-        mf_body_a: Matrix-free body-a indices [shape: world_count,
-            mf_max_constraints].
-        mf_body_b: Matrix-free body-b indices [shape: world_count,
-            mf_max_constraints].
-        mf_J_a: Per-row Jacobian ``J`` for body a [shape: world_count,
-            mf_max_constraints, 6].
-        mf_J_b: Per-row Jacobian ``J`` for body b [shape: world_count,
-            mf_max_constraints, 6].
-        mf_MiJt_a: ``H^{-1} J^T`` for body a per row [shape: world_count,
-            mf_max_constraints, 6].
-        mf_MiJt_b: ``H^{-1} J^T`` for body b per row [shape: world_count,
-            mf_max_constraints, 6].
-        mf_row_parent: Parent normal-row index for each friction row
-            [shape: world_count, mf_max_constraints].
-        mf_row_mu: Coulomb friction coefficient per row [shape:
-            world_count, mf_max_constraints].
-        mf_rhs: Baumgarte normal-row bias ``b_n`` (and 0 on friction
-            rows) [shape: world_count, mf_max_constraints].
-        body_to_articulation: Body-to-articulation index map.
-        art_dof_start: First DOF index per articulation.
-        use_de_saxce: When non-zero, augment the normal target velocity
-            by ``μ · ‖c_T‖`` (de Saxce maximum-dissipation correction,
-            Le Lidec & Carpentier 2024).  ``0`` matches the pure RAISim
-            ``USE_BISECTION`` branch; ``1`` matches the
-            ``USE_BISECTION + USE_DE_SAXCE`` branch.
-        mf_impulses: Current matrix-free impulses; updated in place for
-            the normal and second-friction siblings with the bisection
-            solution [shape: world_count, mf_max_constraints].
-        v_out: Generalized velocity buffer; updated in place with the
-            normal and second-friction row velocity corrections [N].
+    A matrix-free contact is its normal row and two friction rows. The solve runs at
+    the first friction row (``i == parent + 1``) on the contact's rows' velocities
+    and its Delassus block ``G = J H^-1 J^T``, both gathered from ``v_out`` and the
+    rows' ``mf_J_*`` / ``mf_MiJt_*``. It writes the normal and second friction
+    impulses with their velocity changes and returns the first friction row's new
+    impulse for the caller to apply; the second friction row's visit returns its
+    stored impulse, a zero change. The normal row's ``mf_rhs`` is ``beta phi / dt``,
+    negative on penetration, so the laws' normal target velocity is ``-mf_rhs``.
 
     Returns:
-        The projected friction impulse for row ``i`` [N·s].  On the
-        first friction row this is the new ``λ_t1`` from the bisection;
-        on the second friction row it is the pre-stored ``λ_t2`` so the
-        outer PGS loop applies a zero delta.
+        The first friction row's new impulse [N·s], or the second friction row's
+        stored one.
     """
     parent_idx = mf_row_parent[world, i]
     i_n = parent_idx
     i_t1 = parent_idx + 1
     i_t2 = parent_idx + 2
-
-    # Second friction row of the triple: the bisection already ran at
-    # i == i_t1 and wrote mf_impulses[i_t2].  Returning that value makes
-    # the outer kernel's ``delta_impulse = new - old`` a no-op.
     if i != i_t1:
         return mf_impulses[world, i]
 
@@ -7788,38 +7541,32 @@ def friction_step_bisection(
     ba = mf_body_a[world, i_n]
     bb = mf_body_b[world, i_n]
 
-    # --- Recompute u_n, u_t1, u_t2 from current v_out --------------------
+    # The rows' velocities and the block G, from the current v_out.
     u_n = float(0.0)
     u_t1 = float(0.0)
     u_t2 = float(0.0)
-
-    ds_a = int(0)
-    ds_b = int(0)
-    if ba >= 0:
-        art_a = body_to_articulation[ba]
-        ds_a = art_dof_start[art_a]
-        for k in range(6):
-            va_k = v_out[ds_a + k]
-            u_n = u_n + mf_J_a[world, i_n, k] * va_k
-            u_t1 = u_t1 + mf_J_a[world, i_t1, k] * va_k
-            u_t2 = u_t2 + mf_J_a[world, i_t2, k] * va_k
-    if bb >= 0:
-        art_b = body_to_articulation[bb]
-        ds_b = art_dof_start[art_b]
-        for k in range(6):
-            vb_k = v_out[ds_b + k]
-            u_n = u_n + mf_J_b[world, i_n, k] * vb_k
-            u_t1 = u_t1 + mf_J_b[world, i_t1, k] * vb_k
-            u_t2 = u_t2 + mf_J_b[world, i_t2, k] * vb_k
-
-    # --- Build the 3x3 block G = J H^{-1} J^T ---------------------------
     G_nn = float(0.0)
     G_nt1 = float(0.0)
     G_nt2 = float(0.0)
     G_t1t1 = float(0.0)
     G_t1t2 = float(0.0)
     G_t2t2 = float(0.0)
-
+    ds_a = int(0)
+    ds_b = int(0)
+    if ba >= 0:
+        ds_a = art_dof_start[body_to_articulation[ba]]
+        for k in range(6):
+            va_k = v_out[ds_a + k]
+            u_n = u_n + mf_J_a[world, i_n, k] * va_k
+            u_t1 = u_t1 + mf_J_a[world, i_t1, k] * va_k
+            u_t2 = u_t2 + mf_J_a[world, i_t2, k] * va_k
+    if bb >= 0:
+        ds_b = art_dof_start[body_to_articulation[bb]]
+        for k in range(6):
+            vb_k = v_out[ds_b + k]
+            u_n = u_n + mf_J_b[world, i_n, k] * vb_k
+            u_t1 = u_t1 + mf_J_b[world, i_t1, k] * vb_k
+            u_t2 = u_t2 + mf_J_b[world, i_t2, k] * vb_k
     if ba >= 0:
         for k in range(6):
             Jna = mf_J_a[world, i_n, k]
@@ -7848,112 +7595,21 @@ def friction_step_bisection(
             G_t1t1 = G_t1t1 + Jt1b * Mt1b
             G_t1t2 = G_t1t2 + Jt1b * Mt2b
             G_t2t2 = G_t2t2 + Jt2b * Mt2b
-
-    # Degenerate contact: leave impulses alone.
-    if G_nn < 1.0e-20:
-        return mf_impulses[world, i_t1]
-
-    old_lambda_n = mf_impulses[world, i_n]
-    old_lambda_t1 = mf_impulses[world, i_t1]
-    old_lambda_t2 = mf_impulses[world, i_t2]
-
-    # FeatherPGS stores ``rhs = beta * phi / dt`` on contact rows —
-    # *negative* for penetration — because its PGS step solves
-    # ``delta = -(J·v + rhs) / d_ii`` (converging to ``J·v + rhs = 0``).
-    # RAISim's bisection instead targets ``u_n >= b_n`` with a
-    # *positive* ``b_n = -erp * gap / dt`` for penetration.  Convert
-    # once here so the rest of the bisection mirrors RAISim's sign
-    # convention verbatim.
+    W = wp.mat33(G_nn, G_nt1, G_nt2, G_nt1, G_t1t1, G_t1t2, G_nt2, G_t1t2, G_t2t2)
+    u = wp.vec3(u_n, u_t1, u_t2)
+    old = wp.vec3(mf_impulses[world, i_n], mf_impulses[world, i_t1], mf_impulses[world, i_t2])
     target_vel_n = -mf_rhs[world, i_n]
-
-    # De Saxce correction (Le Lidec & Carpentier 2024): when requested,
-    # augment the normal target by ``μ · ‖c_T‖`` where ``c_T`` is the
-    # current (pre-solve) tangential velocity.  This enforces the
-    # maximum-dissipation principle on sliding contacts and drives the
-    # ``r_mdp_dir`` / ``r_ds_compl`` residuals down — see
-    # ``raisim/kernels.py`` (lines ~687-698) for the reference impl.
-    if use_de_saxce != 0:
-        c_T_mag = wp.sqrt(u_t1 * u_t1 + u_t2 * u_t2)
-        target_vel_n = target_vel_n + mu_val * c_T_mag
-
-    new_lambda_n = old_lambda_n
-    new_lambda_t1 = old_lambda_t1
-    new_lambda_t2 = old_lambda_t2
-
-    # Check whether lambda_n = 0 already satisfies complementarity
-    # (separating contact).  ``u_n_at_zero`` is the normal velocity we
-    # would see if we removed the current normal impulse entirely.
-    u_n_at_zero = u_n + G_nn * (0.0 - old_lambda_n)
-    if u_n_at_zero >= target_vel_n:
-        new_lambda_n = 0.0
-        new_lambda_t1 = 0.0
-        new_lambda_t2 = 0.0
+    new = old
+    if friction_mode == FRICTION_MODE_COULOMB_NEWTON:
+        new = coulomb_newton(W, u, old, mu_val, target_vel_n)
     else:
-        # --- Bisect lambda_n in [lo, hi] --------------------------------
-        lo = float(0.0)
-        hi = wp.max(old_lambda_n * 2.0, (target_vel_n - u_n) / G_nn + old_lambda_n)
-        hi = wp.max(hi, 1.0)
+        if friction_mode == FRICTION_MODE_BISECTION_DESAXCE:
+            target_vel_n = de_saxce_target(target_vel_n, u, mu_val)
+        new = coulomb_bisection(W, u, old, mu_val, target_vel_n)
 
-        for _bi in range(wp.static(_FPGS_BISECTION_ITERS)):
-            mid = 0.5 * (lo + hi)
-            d_n = mid - old_lambda_n
-            ut1_eff = u_t1 + G_nt1 * d_n
-            ut2_eff = u_t2 + G_nt2 * d_n
-
-            det = G_t1t1 * G_t2t2 - G_t1t2 * G_t1t2
-            d_t1 = float(0.0)
-            d_t2 = float(0.0)
-            if wp.abs(det) > 1.0e-20:
-                d_t1 = (-ut1_eff * G_t2t2 + ut2_eff * G_t1t2) / det
-                d_t2 = (ut1_eff * G_t1t2 - ut2_eff * G_t1t1) / det
-
-            trial_t1 = old_lambda_t1 + d_t1
-            trial_t2 = old_lambda_t2 + d_t2
-
-            flimit = mu_val * mid
-            tmag = wp.sqrt(trial_t1 * trial_t1 + trial_t2 * trial_t2)
-            if tmag > flimit and tmag > 1.0e-20:
-                sc = flimit / tmag
-                trial_t1 = trial_t1 * sc
-                trial_t2 = trial_t2 * sc
-
-            d_t1_actual = trial_t1 - old_lambda_t1
-            d_t2_actual = trial_t2 - old_lambda_t2
-            u_n_trial = u_n + G_nn * d_n + G_nt1 * d_t1_actual + G_nt2 * d_t2_actual
-
-            if u_n_trial < target_vel_n:
-                lo = mid
-            else:
-                hi = mid
-
-        new_lambda_n = 0.5 * (lo + hi)
-
-        # --- Final friction solve at converged lambda_n -----------------
-        d_n_final = new_lambda_n - old_lambda_n
-        ut1_f = u_t1 + G_nt1 * d_n_final
-        ut2_f = u_t2 + G_nt2 * d_n_final
-
-        det_f = G_t1t1 * G_t2t2 - G_t1t2 * G_t1t2
-        d_t1_f = float(0.0)
-        d_t2_f = float(0.0)
-        if wp.abs(det_f) > 1.0e-20:
-            d_t1_f = (-ut1_f * G_t2t2 + ut2_f * G_t1t2) / det_f
-            d_t2_f = (ut1_f * G_t1t2 - ut2_f * G_t1t1) / det_f
-
-        new_lambda_t1 = old_lambda_t1 + d_t1_f
-        new_lambda_t2 = old_lambda_t2 + d_t2_f
-
-        flimit_f = mu_val * new_lambda_n
-        tmag_f = wp.sqrt(new_lambda_t1 * new_lambda_t1 + new_lambda_t2 * new_lambda_t2)
-        if tmag_f > flimit_f and tmag_f > 1.0e-20:
-            sc_f = flimit_f / tmag_f
-            new_lambda_t1 = new_lambda_t1 * sc_f
-            new_lambda_t2 = new_lambda_t2 * sc_f
-
-    # --- Apply v_out deltas for normal and t2 rows ----------------------
-    d_n_total = new_lambda_n - old_lambda_n
-    d_t2_total = new_lambda_t2 - old_lambda_t2
-
+    # The normal and second friction rows' velocity changes; the caller applies the first friction row's.
+    d_n_total = new[0] - old[0]
+    d_t2_total = new[2] - old[2]
     if ba >= 0:
         for k in range(6):
             v_out[ds_a + k] = (
@@ -7964,262 +7620,9 @@ def friction_step_bisection(
             v_out[ds_b + k] = (
                 v_out[ds_b + k] + mf_MiJt_b[world, i_n, k] * d_n_total + mf_MiJt_b[world, i_t2, k] * d_t2_total
             )
-
-    # --- Store normal + second-friction impulses ------------------------
-    # The first-friction row's impulse is returned so the outer PGS loop
-    # applies its own ``delta_impulse`` and v_out correction.
-    mf_impulses[world, i_n] = new_lambda_n
-    mf_impulses[world, i_t2] = new_lambda_t2
-
-    return new_lambda_t1
-
-
-@wp.func
-def friction_step_coulomb_newton(
-    world: int,
-    i: int,
-    mf_body_a: wp.array2d[int],
-    mf_body_b: wp.array2d[int],
-    mf_J_a: wp.array3d[float],
-    mf_J_b: wp.array3d[float],
-    mf_MiJt_a: wp.array3d[float],
-    mf_MiJt_b: wp.array3d[float],
-    mf_row_parent: wp.array2d[int],
-    mf_row_mu: wp.array2d[float],
-    mf_rhs: wp.array2d[float],
-    body_to_articulation: wp.array[int],
-    art_dof_start: wp.array[int],
-    mf_impulses: wp.array2d[float],
-    v_out: wp.array[float],
-):
-    """Gilles Daviet's 1D Coulomb Newton per-row friction step.
-
-    Drop-in replacement for :func:`friction_step_current` selected by
-    ``friction_mode="coulomb_newton"`` on ``pgs_mode="matrix_free"``.
-    FPGS Friction Modes 7/13.  Invokes :func:`solve_coulomb_row`
-    (ported from ``coulomb_root_finding_warp.py``) on the per-contact
-    3x3 effective-mass (Delassus) block and rewrites the contact
-    triple's impulses directly from its ``(r_N, r_T1, r_T2)`` return.
-    Shares the matrix-free row data layout with
-    :func:`friction_step_bisection`.
-
-    The matrix-free layout stores each contact as three consecutive
-    rows (normal + two friction).  The 1D Newton is naturally a
-    per-contact 3-DOF solve, so this function centralises the work on
-    the first friction row (``i == parent + 1``) and becomes a no-op
-    on the second friction row (``i == parent + 2``) — same pattern as
-    the bisection step.
-
-    Mapping of matrix-free row data to the reference ``solve_coulomb``
-    interface (docstring required by the acceptance criterion):
-
-    * ``W`` is the per-contact ``3x3`` Delassus block ``G = J H^{-1}
-      J^T`` assembled on the fly from ``mf_J_*`` / ``mf_MiJt_*``.
-      Layout: ``W[0, 0] = G_nn`` (normal/normal), ``W[0, 1:]`` =
-      ``W[1:, 0]`` = ``(G_nt1, G_nt2)`` (normal/tangential coupling),
-      and the remaining ``2x2`` tangential block is populated from the
-      two friction rows' dot products.
-    * ``b`` is the velocity-level rhs.  The matrix-free PGS stores the
-      Baumgarte bias as ``mf_rhs[i_n] = beta * phi / dt`` (negative on
-      penetration), while the reference expects ``b_N < 0`` on
-      contacts that would penetrate at zero impulse.  We set
-      ``target_vel_n = -mf_rhs[i_n]`` to convert the FPGS convention
-      to RAISim's positive-target convention (matching
-      :func:`friction_step_bisection`), then use
-      ``b_N = u_free_n - target_vel_n`` so the ``b_N < 0`` invariant
-      holds in the shifted frame.  ``b[1:]`` are the tangential
-      components of ``u_free`` (no bias on friction rows).
-    * ``u_free = u_current - G · lambda_old`` is recomputed from
-      ``v_out`` (``J_row · v_out``) and the current impulses so the
-      step is Gauss-Seidel consistent with the rest of the sweep.
-    * ``mu`` comes directly from ``mf_row_mu[i]``.
-
-    The returned ``(r_N, r_T1, r_T2)`` are full (non-delta) impulses
-    for the triple.  We write them to ``mf_impulses`` for the normal
-    and second-friction rows directly, apply the corresponding
-    ``v_out`` corrections, and return ``r_T1`` as the first-friction
-    row's new impulse so the outer PGS loop applies the t1
-    ``delta_impulse`` via its usual path.
-
-    Args:
-        world: World index for the current row.
-        i: Constraint row index within the world.
-        mf_body_a: Matrix-free body-a indices [shape: world_count,
-            mf_max_constraints].
-        mf_body_b: Matrix-free body-b indices [shape: world_count,
-            mf_max_constraints].
-        mf_J_a: Per-row Jacobian ``J`` for body a [shape: world_count,
-            mf_max_constraints, 6].
-        mf_J_b: Per-row Jacobian ``J`` for body b [shape: world_count,
-            mf_max_constraints, 6].
-        mf_MiJt_a: ``H^{-1} J^T`` for body a per row [shape:
-            world_count, mf_max_constraints, 6].
-        mf_MiJt_b: ``H^{-1} J^T`` for body b per row [shape:
-            world_count, mf_max_constraints, 6].
-        mf_row_parent: Parent normal-row index for each friction row
-            [shape: world_count, mf_max_constraints].
-        mf_row_mu: Coulomb friction coefficient per row [shape:
-            world_count, mf_max_constraints].
-        mf_rhs: Baumgarte normal-row bias ``beta * phi / dt`` (and 0
-            on friction rows) [shape: world_count, mf_max_constraints].
-        body_to_articulation: Body-to-articulation index map.
-        art_dof_start: First DOF index per articulation.
-        mf_impulses: Current matrix-free impulses; updated in place
-            for the normal and second-friction siblings with the
-            Newton solution [shape: world_count, mf_max_constraints].
-        v_out: Generalized velocity buffer; updated in place with the
-            normal and second-friction row velocity corrections [N].
-
-    Returns:
-        The projected friction impulse for row ``i`` [N·s].  On the
-        first friction row this is ``r_T1``; on the second friction
-        row it is the pre-stored ``r_T2`` so the outer PGS loop
-        applies a zero delta.
-    """
-    parent_idx = mf_row_parent[world, i]
-    i_n = parent_idx
-    i_t1 = parent_idx + 1
-    i_t2 = parent_idx + 2
-
-    # Second friction row of the triple: the Newton solve already ran
-    # at ``i == i_t1`` and wrote ``mf_impulses[i_t2]``.  Returning that
-    # value makes the outer kernel's ``delta_impulse = new - old`` a
-    # no-op.
-    if i != i_t1:
-        return mf_impulses[world, i]
-
-    mu_val = mf_row_mu[world, i]
-    ba = mf_body_a[world, i_n]
-    bb = mf_body_b[world, i_n]
-
-    # --- Recompute u_n, u_t1, u_t2 from current v_out --------------------
-    u_n = float(0.0)
-    u_t1 = float(0.0)
-    u_t2 = float(0.0)
-
-    ds_a = int(0)
-    ds_b = int(0)
-    if ba >= 0:
-        art_a = body_to_articulation[ba]
-        ds_a = art_dof_start[art_a]
-        for k in range(6):
-            va_k = v_out[ds_a + k]
-            u_n = u_n + mf_J_a[world, i_n, k] * va_k
-            u_t1 = u_t1 + mf_J_a[world, i_t1, k] * va_k
-            u_t2 = u_t2 + mf_J_a[world, i_t2, k] * va_k
-    if bb >= 0:
-        art_b = body_to_articulation[bb]
-        ds_b = art_dof_start[art_b]
-        for k in range(6):
-            vb_k = v_out[ds_b + k]
-            u_n = u_n + mf_J_b[world, i_n, k] * vb_k
-            u_t1 = u_t1 + mf_J_b[world, i_t1, k] * vb_k
-            u_t2 = u_t2 + mf_J_b[world, i_t2, k] * vb_k
-
-    # --- Build the 3x3 Delassus block G = J H^{-1} J^T ------------------
-    G_nn = float(0.0)
-    G_nt1 = float(0.0)
-    G_nt2 = float(0.0)
-    G_t1t1 = float(0.0)
-    G_t1t2 = float(0.0)
-    G_t2t2 = float(0.0)
-
-    if ba >= 0:
-        for k in range(6):
-            Jna = mf_J_a[world, i_n, k]
-            Jt1a = mf_J_a[world, i_t1, k]
-            Jt2a = mf_J_a[world, i_t2, k]
-            Mna = mf_MiJt_a[world, i_n, k]
-            Mt1a = mf_MiJt_a[world, i_t1, k]
-            Mt2a = mf_MiJt_a[world, i_t2, k]
-            G_nn = G_nn + Jna * Mna
-            G_nt1 = G_nt1 + Jna * Mt1a
-            G_nt2 = G_nt2 + Jna * Mt2a
-            G_t1t1 = G_t1t1 + Jt1a * Mt1a
-            G_t1t2 = G_t1t2 + Jt1a * Mt2a
-            G_t2t2 = G_t2t2 + Jt2a * Mt2a
-    if bb >= 0:
-        for k in range(6):
-            Jnb = mf_J_b[world, i_n, k]
-            Jt1b = mf_J_b[world, i_t1, k]
-            Jt2b = mf_J_b[world, i_t2, k]
-            Mnb = mf_MiJt_b[world, i_n, k]
-            Mt1b = mf_MiJt_b[world, i_t1, k]
-            Mt2b = mf_MiJt_b[world, i_t2, k]
-            G_nn = G_nn + Jnb * Mnb
-            G_nt1 = G_nt1 + Jnb * Mt1b
-            G_nt2 = G_nt2 + Jnb * Mt2b
-            G_t1t1 = G_t1t1 + Jt1b * Mt1b
-            G_t1t2 = G_t1t2 + Jt1b * Mt2b
-            G_t2t2 = G_t2t2 + Jt2b * Mt2b
-
-    # Degenerate contact: leave impulses alone.
-    if G_nn < 1.0e-20:
-        return mf_impulses[world, i_t1]
-
-    old_lambda_n = mf_impulses[world, i_n]
-    old_lambda_t1 = mf_impulses[world, i_t1]
-    old_lambda_t2 = mf_impulses[world, i_t2]
-
-    # --- u_free = u_current - G * lambda_old (velocity with impulses
-    # removed).  Mirrors the frame ``solve_coulomb_row`` expects: b is
-    # the rhs at zero impulse.
-    u_free_n = u_n - (G_nn * old_lambda_n + G_nt1 * old_lambda_t1 + G_nt2 * old_lambda_t2)
-    u_free_t1 = u_t1 - (G_nt1 * old_lambda_n + G_t1t1 * old_lambda_t1 + G_t1t2 * old_lambda_t2)
-    u_free_t2 = u_t2 - (G_nt2 * old_lambda_n + G_t1t2 * old_lambda_t1 + G_t2t2 * old_lambda_t2)
-
-    # FeatherPGS stores rhs = beta * phi / dt (negative on penetration).
-    # Shift to the positive-target convention (``target_vel_n = -rhs``)
-    # so ``b_N < 0`` iff the contact would penetrate at zero impulse.
-    target_vel_n = -mf_rhs[world, i_n]
-
-    # If the contact separates already (u_free_n >= target_vel_n), the
-    # Coulomb problem has the trivial solution λ = 0.  Short-circuit
-    # to avoid the full Newton solve.
-    new_lambda_n = float(0.0)
-    new_lambda_t1 = float(0.0)
-    new_lambda_t2 = float(0.0)
-
-    if u_free_n < target_vel_n:
-        W = wp.mat33(
-            G_nn,
-            G_nt1,
-            G_nt2,
-            G_nt1,
-            G_t1t1,
-            G_t1t2,
-            G_nt2,
-            G_t1t2,
-            G_t2t2,
-        )
-        b_vec = wp.vec3(u_free_n - target_vel_n, u_free_t1, u_free_t2)
-        res = solve_coulomb_row(W, b_vec, mu_val)
-        new_lambda_n = res[1]
-        new_lambda_t1 = res[2]
-        new_lambda_t2 = res[3]
-
-    # --- Apply v_out deltas for the normal and t2 rows ------------------
-    d_n_total = new_lambda_n - old_lambda_n
-    d_t2_total = new_lambda_t2 - old_lambda_t2
-
-    if ba >= 0:
-        for k in range(6):
-            v_out[ds_a + k] = (
-                v_out[ds_a + k] + mf_MiJt_a[world, i_n, k] * d_n_total + mf_MiJt_a[world, i_t2, k] * d_t2_total
-            )
-    if bb >= 0:
-        for k in range(6):
-            v_out[ds_b + k] = (
-                v_out[ds_b + k] + mf_MiJt_b[world, i_n, k] * d_n_total + mf_MiJt_b[world, i_t2, k] * d_t2_total
-            )
-
-    # Store normal + second-friction impulses.  The first-friction
-    # row's impulse is returned so the outer PGS loop applies its own
-    # ``delta_impulse`` and v_out correction.
-    mf_impulses[world, i_n] = new_lambda_n
-    mf_impulses[world, i_t2] = new_lambda_t2
-
-    return new_lambda_t1
+    mf_impulses[world, i_n] = new[0]
+    mf_impulses[world, i_t2] = new[2]
+    return new[1]
 
 
 @wp.kernel
@@ -8256,15 +7659,11 @@ def pgs_solve_mf_loop(
     immediately (Gauss-Seidel style).
 
     The per-row Coulomb friction projection is delegated to
-    :func:`friction_step_current` (``friction_mode == FRICTION_MODE_CURRENT``),
-    :func:`friction_step_bisection` (``friction_mode ==
-    FRICTION_MODE_BISECTION`` for pure RAISim bisection, or
-    ``friction_mode == FRICTION_MODE_BISECTION_DESAXCE`` for bisection
-    augmented with the de Saxce max-dissipation bias), or
-    :func:`friction_step_coulomb_newton` (``friction_mode ==
-    FRICTION_MODE_COULOMB_NEWTON`` for Gilles Daviet's 1D Coulomb
-    Newton — FPGS Friction Modes 7/13) so alternate strategies can be
-    plugged in without rewriting this kernel body.
+    :func:`friction_step_current` (``friction_mode == FRICTION_MODE_CURRENT``)
+    or :func:`friction_step_coulomb` (the research modes: RAISim's
+    bisection, with or without the de Saxce bias, and Gilles Daviet's
+    Newton), so alternate strategies can be plugged in without rewriting
+    this kernel body.
     """
     world = wp.tid()
     m_count = mf_constraint_count[world]
@@ -8274,7 +7673,7 @@ def pgs_solve_mf_loop(
     for it in range(iterations):
         for i in range(m_count):
             row_type = mf_row_type[world, i]
-            if row_type == PGS_CONSTRAINT_TYPE_FRICTION and iteration_offset + it < friction_start_iteration:
+            if friction_gate(row_type, iteration_offset + it, friction_start_iteration):
                 mf_impulses[world, i] = 0.0
                 continue
 
@@ -8308,57 +7707,23 @@ def pgs_solve_mf_loop(
                 for k in range(6):
                     jv += mf_J_b[world, i, k] * v_out[ds_b + k]
 
-            # PGS update: delta = -(J*v_current + bias) / d_ii
+            # The relaxed step of the residual J v + b, regularized on contact rows.
             residual = jv + mf_rhs[world, i]
             old_impulse = mf_impulses[world, i]
             delta = -residual * eff_inv
-            if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-                # Proximal regularization in w-form (w = 1/(1+g)): identical
-                # algebra, but no g*lambda product that could overflow for
-                # extreme finite g; w = 1 (g = 0) is the exact hard update.
-                w = float(1.0)
-                if regularize != 0:
-                    w = mf_row_w[world, i]
-                delta = -residual * eff_inv * w - (1.0 - w) * old_impulse
-            new_impulse = old_impulse + omega * delta
+            if row_type == PGS_CONSTRAINT_TYPE_CONTACT and regularize != 0:
+                delta = regularized_delta(delta, mf_row_w[world, i], old_impulse)
+            new_impulse = relaxed_step(old_impulse, delta, omega)
 
             # Project
             if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-                if new_impulse < 0.0:
-                    new_impulse = 0.0
+                new_impulse = unilateral(new_impulse)
             elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
-                if friction_mode == FRICTION_MODE_BISECTION or friction_mode == FRICTION_MODE_BISECTION_DESAXCE:
-                    # Shared RAISim bisection step; the de Saxce branch
-                    # of the [FPGS Friction Modes] series toggles the
-                    # μ·‖c_T‖ bias correction via ``use_de_saxce``.
-                    use_de_saxce = int(0)
-                    if friction_mode == FRICTION_MODE_BISECTION_DESAXCE:
-                        use_de_saxce = int(1)
-                    new_impulse = friction_step_bisection(
+                if friction_mode != FRICTION_MODE_CURRENT:
+                    new_impulse = friction_step_coulomb(
                         world,
                         i,
-                        mf_body_a,
-                        mf_body_b,
-                        mf_J_a,
-                        mf_J_b,
-                        mf_MiJt_a,
-                        mf_MiJt_b,
-                        mf_row_parent,
-                        mf_row_mu,
-                        mf_rhs,
-                        body_to_articulation,
-                        art_dof_start,
-                        use_de_saxce,
-                        mf_impulses,
-                        v_out,
-                    )
-                elif friction_mode == FRICTION_MODE_COULOMB_NEWTON:
-                    # Gilles Daviet's 1D Coulomb Newton (7/13): scalar
-                    # bracketed-Newton on alpha solves the cone coupling
-                    # directly.  See :func:`friction_step_coulomb_newton`.
-                    new_impulse = friction_step_coulomb_newton(
-                        world,
-                        i,
+                        friction_mode,
                         mf_body_a,
                         mf_body_b,
                         mf_J_a,
@@ -8526,13 +7891,15 @@ def pgs_solve_loop(
     world_row_type: wp.array2d[int],
     world_row_parent: wp.array2d[int],
     world_row_mu: wp.array2d[float],
+    world_row_w: wp.array2d[float],
+    regularize: int,
     friction_start_iteration: int,
     iteration_offset: int,
 ):
-    """
-    World-level Projected Gauss-Seidel solver.
+    """World-level projected Gauss-Seidel over the assembled Delassus rows.
 
-    Similar to pgs_solve_contacts but operates on 2D world-indexed arrays.
+    ``world_C`` and ``world_diag`` hold the unregularized system; with ``regularize``
+    a contact row's step takes its weight ``world_row_w`` (:func:`.projection_laws.regularized_delta`).
     """
     world = wp.tid()
     m = world_constraint_count[world]
@@ -8543,25 +7910,20 @@ def pgs_solve_loop(
     for it in range(iterations):
         for i in range(m):
             row_type = world_row_type[world, i]
-            if row_type == PGS_CONSTRAINT_TYPE_FRICTION and iteration_offset + it < friction_start_iteration:
+            if friction_gate(row_type, iteration_offset + it, friction_start_iteration):
                 world_impulses[world, i] = 0.0
                 continue
             if row_type == PGS_CONSTRAINT_TYPE_FRICTION and i != world_row_parent[world, i] + 1:
                 continue
 
-            # Compute residual: w = rhs_i + sum_j C_ij * lambda_j
-            w = world_rhs[world, i]
+            # The residual r = rhs_i + sum_j C_ij * lambda_j.
+            residual = world_rhs[world, i]
             for j in range(m):
-                w += world_C[world, i, j] * world_impulses[world, j]
+                residual += world_C[world, i, j] * world_impulses[world, j]
 
             denom = world_diag[world, i]
             if denom <= 0.0 and row_type != PGS_CONSTRAINT_TYPE_FRICTION:
                 continue
-
-            delta = float(0.0)
-            if denom > 0.0:
-                delta = -w / denom
-            new_impulse = world_impulses[world, i] + omega * delta
 
             # --- Normal contact, joint limit, or joint velocity limit:
             #     lambda_n >= 0. The velocity-limit row uses a signed Jacobian
@@ -8572,9 +7934,10 @@ def pgs_solve_loop(
                 or row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT
                 or row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
             ):
-                if new_impulse < 0.0:
-                    new_impulse = 0.0
-                world_impulses[world, i] = new_impulse
+                delta = -residual / denom
+                if row_type == PGS_CONSTRAINT_TYPE_CONTACT and regularize != 0:
+                    delta = regularized_delta(delta, world_row_w[world, i], world_impulses[world, i])
+                world_impulses[world, i] = unilateral(relaxed_step(world_impulses[world, i], delta, omega))
 
             # --- Friction: isotropic Coulomb ---
             elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
@@ -8595,28 +7958,23 @@ def pgs_solve_loop(
                 for j in range(m):
                     sibling_residual += world_C[world, sib, j] * world_impulses[world, j]
 
-                trial = friction_pair_candidate(
-                    denom,
-                    world_C[world, i, sib],
-                    world_diag[world, sib],
-                    wp.vec2(w, sibling_residual),
-                    wp.vec2(world_impulses[world, i], world_impulses[world, sib]),
+                trial = disk(
+                    friction_pair(
+                        denom,
+                        world_C[world, i, sib],
+                        world_diag[world, sib],
+                        wp.vec2(residual, sibling_residual),
+                        wp.vec2(world_impulses[world, i], world_impulses[world, sib]),
+                        radius,
+                        omega,
+                    ),
                     radius,
-                    omega,
                 )
-                a = trial[0]
-                b = trial[1]
-
-                mag = wp.sqrt(a * a + b * b)
-                if mag > radius:
-                    scale = radius / mag
-                    a *= scale
-                    b *= scale
-                world_impulses[world, i] = a
-                world_impulses[world, sib] = b
+                world_impulses[world, i] = trial[0]
+                world_impulses[world, sib] = trial[1]
 
             else:
-                world_impulses[world, i] = new_impulse
+                world_impulses[world, i] = relaxed_step(world_impulses[world, i], -residual / denom, omega)
 
 
 @wp.kernel
@@ -8754,33 +8112,6 @@ def finalize_world_diag_cfm(
 
     for i in range(m):
         world_diag[world, i] += world_row_cfm[world, i]
-
-
-@wp.kernel
-def apply_contact_regularization(
-    world_constraint_count: wp.array[int],
-    world_row_type: wp.array2d[int],
-    world_row_w: wp.array2d[float],
-    # in/out
-    world_diag: wp.array2d[float],
-    world_C: wp.array3d[float],
-):
-    """Fold the per-row weight of dense contact rows into the assembled Delassus system.
-
-    Adding ``reg = (1/w - 1) * d`` to the matrix diagonal and the divisor is the
-    w-form update ``delta = -w*r/d - (1-w)*lambda`` used by every other route.
-    Only the split mode, which solves with the assembled matrix, needs this; the
-    fused velocity-residual routes read ``world_row_w`` directly.
-    """
-    world = wp.tid()
-    m = world_constraint_count[world]
-    for i in range(m):
-        if world_row_type[world, i] == PGS_CONSTRAINT_TYPE_CONTACT:
-            w = world_row_w[world, i]
-            if w < 1.0:
-                reg = (1.0 / w - 1.0) * world_diag[world, i]
-                world_diag[world, i] += reg
-                world_C[world, i, i] += reg
 
 
 # =============================================================================

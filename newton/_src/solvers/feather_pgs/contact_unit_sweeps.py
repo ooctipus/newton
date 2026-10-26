@@ -58,7 +58,6 @@ from .contact_unit import (
     contact_unit_ring,
     contact_unit_solve,
 )
-from .friction import friction_pair_candidate
 from .friction_patches import patch_normal_load
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -68,6 +67,15 @@ from .kernels import (
     free_body_speed_dof,
     friction_step_current,
     project_free_body_speed,
+)
+from .projection_laws import (
+    disk,
+    friction_gate,
+    friction_pair,
+    regularized_delta,
+    regularized_diagonal,
+    relaxed_step,
+    unilateral,
 )
 
 CONTACT_UPDATES = ("sequential", "unit")
@@ -169,6 +177,18 @@ def _skip_friction(row_type: wp.array2d[int], row_parent: wp.array2d[int], world
 
 
 @wp.func
+def _contact_weight(row_w: wp.array2d[float], regularize: int, world: int, row: int) -> float:
+    """A contact row's regularization weight ``w`` (1 without regularization).
+
+    A sequential update weights the row's step with it (:func:`.projection_laws.regularized_delta`) and a unit solves
+    its normal against :func:`.projection_laws.regularized_diagonal`.
+    """
+    if regularize != 0:
+        return row_w[world, row]
+    return 1.0
+
+
+@wp.func
 def _dense_residual(
     world_C: wp.array3d[float],
     world_rhs: wp.array2d[float],
@@ -190,6 +210,8 @@ def _dense_point_unit(
     world_rhs: wp.array2d[float],
     world_impulses: wp.array2d[float],
     world_row_mu: wp.array2d[float],
+    world_row_w: wp.array2d[float],
+    regularize: int,
     unit_state: wp.array3d[float],
     world: int,
     m: int,
@@ -200,7 +222,8 @@ def _dense_point_unit(
     """Visit the 3x3 unit of normal ``n`` and its pair, a point contact or a patch anchor with ``ring_load`` held.
 
     A point unit reads its normal-tangent coupling from the normal row, an anchor (``anchor`` 1) from its tangent
-    rows; the two agree up to the assembly's rounding.
+    rows; the two agree up to the assembly's rounding. The residuals use the unregularized block and the solve the
+    normal's regularized diagonal.
     """
     t0 = n + 1
     t1 = n + 2
@@ -232,7 +255,7 @@ def _dense_point_unit(
         w_nt0 = world_C[world, t0, n]
         w_nt1 = world_C[world, t1, n]
     solution = contact_unit_solve(
-        w_nn,
+        regularized_diagonal(w_nn, _contact_weight(world_row_w, regularize, world, n)),
         w_t0,
         world_C[world, t0, t1],
         w_t1,
@@ -272,6 +295,8 @@ def _dense_anchor_units(
     world_row_type: wp.array2d[int],
     world_row_parent: wp.array2d[int],
     world_row_mu: wp.array2d[float],
+    world_row_w: wp.array2d[float],
+    regularize: int,
     unit_state: wp.array3d[float],
     unit_rows: wp.array2d[int],
     world: int,
@@ -292,6 +317,8 @@ def _dense_anchor_units(
                 world_rhs,
                 world_impulses,
                 world_row_mu,
+                world_row_w,
+                regularize,
                 unit_state,
                 world,
                 m,
@@ -300,14 +327,13 @@ def _dense_anchor_units(
                 1,
             )
         else:
-            w = _dense_residual(world_C, world_rhs, world_impulses, world, m, row)
+            residual = _dense_residual(world_C, world_rhs, world_impulses, world, m, row)
             denom = world_diag[world, row]
             if denom > 0.0:
-                delta = -w / denom
-                new_impulse = world_impulses[world, row] + omega * delta
-                if new_impulse < 0.0:
-                    new_impulse = 0.0
-                world_impulses[world, row] = new_impulse
+                delta = -residual / denom
+                if regularize != 0:
+                    delta = regularized_delta(delta, world_row_w[world, row], world_impulses[world, row])
+                world_impulses[world, row] = unilateral(relaxed_step(world_impulses[world, row], delta, omega))
 
 
 @wp.func
@@ -319,6 +345,8 @@ def _dense_ring_unit(
     world_row_type: wp.array2d[int],
     world_row_parent: wp.array2d[int],
     world_row_mu: wp.array2d[float],
+    world_row_w: wp.array2d[float],
+    regularize: int,
     unit_state: wp.array3d[float],
     unit_rows: wp.array2d[int],
     unit_block: wp.array[float],
@@ -366,11 +394,17 @@ def _dense_ring_unit(
             if c == a:
                 value = wp.max(world_diag[world, row], value)
             unit_block[base + _BLOCK + a * rows + c] = value
+    # b = r - W_U lambda_U with the unregularized block, which the regularized one leaves unchanged.
     for a in range(rows):
         v = unit_block[base + _RESIDUAL + a]
         for c in range(rows):
             v -= unit_block[base + _BLOCK + a * rows + c] * unit_block[base + _IMPULSE + c]
         unit_block[base + _RESIDUAL + a] = v
+    for a in range(normals):
+        diagonal = base + _BLOCK + a * rows + a
+        unit_block[diagonal] = regularized_diagonal(
+            unit_block[diagonal], _contact_weight(world_row_w, regularize, world, unit_rows[world, a])
+        )
     mu0 = float(0.0)
     mu1 = float(0.0)
     if anchors >= 1:
@@ -413,6 +447,8 @@ def pgs_solve_loop_unit(
     world_row_type: wp.array2d[int],
     world_row_parent: wp.array2d[int],
     world_row_mu: wp.array2d[float],
+    world_row_w: wp.array2d[float],
+    regularize: int,
     friction_start_iteration: int,
     iteration_offset: int,
     ring_units: int,
@@ -461,6 +497,8 @@ def pgs_solve_loop_unit(
                             world_rhs,
                             world_impulses,
                             world_row_mu,
+                            world_row_w,
+                            regularize,
                             unit_state,
                             world,
                             m,
@@ -479,6 +517,8 @@ def pgs_solve_loop_unit(
                                 world_row_type,
                                 world_row_parent,
                                 world_row_mu,
+                                world_row_w,
+                                regularize,
                                 unit_state,
                                 unit_rows,
                                 unit_block,
@@ -496,6 +536,8 @@ def pgs_solve_loop_unit(
                                 world_row_type,
                                 world_row_parent,
                                 world_row_mu,
+                                world_row_w,
+                                regularize,
                                 unit_state,
                                 unit_rows,
                                 world,
@@ -505,33 +547,26 @@ def pgs_solve_loop_unit(
                     continue
 
             # Rows outside units: the sequential update of pgs_solve_loop.
-            if row_type == PGS_CONSTRAINT_TYPE_FRICTION and iteration_offset + it < friction_start_iteration:
+            if friction_gate(row_type, iteration_offset + it, friction_start_iteration):
                 world_impulses[world, i] = 0.0
                 continue
             if row_type == PGS_CONSTRAINT_TYPE_FRICTION and i != world_row_parent[world, i] + 1:
                 continue
 
-            w = world_rhs[world, i]
-            for j in range(m):
-                w += world_C[world, i, j] * world_impulses[world, j]
-
+            residual = _dense_residual(world_C, world_rhs, world_impulses, world, m, i)
             denom = world_diag[world, i]
             if denom <= 0.0 and row_type != PGS_CONSTRAINT_TYPE_FRICTION:
                 continue
-
-            delta = float(0.0)
-            if denom > 0.0:
-                delta = -w / denom
-            new_impulse = world_impulses[world, i] + omega * delta
 
             if (
                 row_type == PGS_CONSTRAINT_TYPE_CONTACT
                 or row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT
                 or row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT
             ):
-                if new_impulse < 0.0:
-                    new_impulse = 0.0
-                world_impulses[world, i] = new_impulse
+                delta = -residual / denom
+                if row_type == PGS_CONSTRAINT_TYPE_CONTACT and regularize != 0:
+                    delta = regularized_delta(delta, world_row_w[world, i], world_impulses[world, i])
+                world_impulses[world, i] = unilateral(relaxed_step(world_impulses[world, i], delta, omega))
 
             elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
                 parent_idx = world_row_parent[world, i]
@@ -551,28 +586,23 @@ def pgs_solve_loop_unit(
                 for j in range(m):
                     sibling_residual += world_C[world, sib, j] * world_impulses[world, j]
 
-                trial = friction_pair_candidate(
-                    denom,
-                    world_C[world, i, sib],
-                    world_diag[world, sib],
-                    wp.vec2(w, sibling_residual),
-                    wp.vec2(world_impulses[world, i], world_impulses[world, sib]),
+                trial = disk(
+                    friction_pair(
+                        denom,
+                        world_C[world, i, sib],
+                        world_diag[world, sib],
+                        wp.vec2(residual, sibling_residual),
+                        wp.vec2(world_impulses[world, i], world_impulses[world, sib]),
+                        radius,
+                        omega,
+                    ),
                     radius,
-                    omega,
                 )
-                a = trial[0]
-                b = trial[1]
-
-                mag = wp.sqrt(a * a + b * b)
-                if mag > radius:
-                    scale = radius / mag
-                    a *= scale
-                    b *= scale
-                world_impulses[world, i] = a
-                world_impulses[world, sib] = b
+                world_impulses[world, i] = trial[0]
+                world_impulses[world, sib] = trial[1]
 
             else:
-                world_impulses[world, i] = new_impulse
+                world_impulses[world, i] = relaxed_step(world_impulses[world, i], -residual / denom, omega)
 
 
 # -- free-body (matrix-free) rows --------------------------------------------------------------------------------
@@ -675,14 +705,6 @@ def _mf_apply(
 
 
 @wp.func
-def _mf_normal_weight(mf_row_w: wp.array2d[float], regularize: int, world: int, row: int) -> float:
-    """The contact regularization weight: the unit solves its normal against the diagonal over this weight."""
-    if regularize != 0:
-        return mf_row_w[world, row]
-    return 1.0
-
-
-@wp.func
 def _mf_point_unit(
     mf_body_a: wp.array2d[int],
     mf_body_b: wp.array2d[int],
@@ -746,7 +768,7 @@ def _mf_point_unit(
         w_nt0 = c_t0n
         w_nt1 = c_t1n
     solution = contact_unit_solve(
-        d_n / _mf_normal_weight(mf_row_w, regularize, world, n),
+        regularized_diagonal(d_n, _contact_weight(mf_row_w, regularize, world, n)),
         d_t0,
         c_t0t1,
         d_t1,
@@ -816,13 +838,10 @@ def _mf_scalar_normal(
         mf_body_a, mf_body_b, mf_J_a, mf_J_b, mf_rhs, body_to_articulation, art_dof_start, v_out, world, i
     )
     old_impulse = mf_impulses[world, i]
-    w = float(1.0)
+    delta = -residual * eff_inv
     if regularize != 0:
-        w = mf_row_w[world, i]
-    delta = -residual * eff_inv * w - (1.0 - w) * old_impulse
-    new_impulse = old_impulse + omega * delta
-    if new_impulse < 0.0:
-        new_impulse = 0.0
+        delta = regularized_delta(delta, mf_row_w[world, i], old_impulse)
+    new_impulse = unilateral(relaxed_step(old_impulse, delta, omega))
     mf_impulses[world, i] = new_impulse
     _mf_apply(
         mf_body_a,
@@ -1004,8 +1023,8 @@ def _mf_ring_unit(
         unit_block[base + _RESIDUAL + a] = v
     for a in range(normals):
         diagonal = base + _BLOCK + a * rows + a
-        unit_block[diagonal] = unit_block[diagonal] / _mf_normal_weight(
-            mf_row_w, regularize, world, unit_rows[world, a]
+        unit_block[diagonal] = regularized_diagonal(
+            unit_block[diagonal], _contact_weight(mf_row_w, regularize, world, unit_rows[world, a])
         )
     mu0 = float(0.0)
     mu1 = float(0.0)
@@ -1195,7 +1214,7 @@ def pgs_solve_mf_loop_unit(
                     continue
 
             # Rows outside units: the sequential update of pgs_solve_mf_loop (friction mode "current").
-            if row_type == PGS_CONSTRAINT_TYPE_FRICTION and iteration_offset + it < friction_start_iteration:
+            if friction_gate(row_type, iteration_offset + it, friction_start_iteration):
                 mf_impulses[world, i] = 0.0
                 continue
 
@@ -1229,16 +1248,12 @@ def pgs_solve_mf_loop_unit(
             residual = jv + mf_rhs[world, i]
             old_impulse = mf_impulses[world, i]
             delta = -residual * eff_inv
-            if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-                w = float(1.0)
-                if regularize != 0:
-                    w = mf_row_w[world, i]
-                delta = -residual * eff_inv * w - (1.0 - w) * old_impulse
-            new_impulse = old_impulse + omega * delta
+            if row_type == PGS_CONSTRAINT_TYPE_CONTACT and regularize != 0:
+                delta = regularized_delta(delta, mf_row_w[world, i], old_impulse)
+            new_impulse = relaxed_step(old_impulse, delta, omega)
 
             if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-                if new_impulse < 0.0:
-                    new_impulse = 0.0
+                new_impulse = unilateral(new_impulse)
             elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
                 new_impulse = friction_step_current(
                     world,

@@ -547,7 +547,7 @@ def assert_budget_reaches_the_fixed_point(test, truncated, budget, scale):
 
 
 # Golden text of the parallel sweep's friction projection, one warp (NT == 32) and several warps. The point
-# pair scales into the disk of its own freshly clamped normal. The linked pair stages every row's fresh value
+# pair projects onto the disk of its own freshly clamped normal (projection_laws.disk). The linked pair stages every row's fresh value
 # in shared memory (one warp: store, then a warp barrier; several warps stage before projecting) and walks its
 # ring from its own normal, summing in ring order; a parent past the admitted rows ends the ring.
 _RING_WALK = (
@@ -561,23 +561,25 @@ _POINT_WARP_PAIR = (
     "            const float xs = READ(x_new[0], sib & 31);\n"
     "            if (fr) {\n"
     "                const float radius = fmaxf(s_mu[i] * xp, 0.0f);\n"
-    "                const float a_val = x_new[0];\n"
+    "                x_new[0] = radius <= 0.0f ? 0.0f : ProjectionLaw::disk(wp::vec2(x_new[0], xs), radius)[0];\n"
 )
 _LINKED_WARP_PAIR = (
     "            const float xs = READ(x_new[0], sib & 31);\n"
     "            if (i < n_rows) s_x[i] = x_new[0];\n"
     "            WARP_SYNC();\n"
-    "            if (fr) {\n" + _RING_WALK + "                const float a_val = x_new[0];\n"
+    "            if (fr) {\n"
+    + _RING_WALK
+    + "                x_new[0] = radius <= 0.0f ? 0.0f : ProjectionLaw::disk(wp::vec2(x_new[0], xs), radius)[0];\n"
 )
 _POINT_BLOCK_PAIR = (
     "                const int sib = (i == p + 1) ? p + 2 : p + 1;\n"
     "                const float radius = fmaxf(s_mu[i] * s_x[p], 0.0f);\n"
-    "                const float a_val = s_x[i];\n"
+    "                x_new[q] = radius <= 0.0f ? 0.0f : ProjectionLaw::disk(wp::vec2(s_x[i], s_x[sib]), radius)[0];\n"
 )
 _LINKED_BLOCK_PAIR = (
     "                const int sib = (i == p + 1) ? p + 2 : p + 1;\n"
     + _RING_WALK
-    + "                const float a_val = s_x[i];\n"
+    + "                x_new[q] = radius <= 0.0f ? 0.0f : ProjectionLaw::disk(wp::vec2(s_x[i], s_x[sib]), radius)[0];\n"
 )
 
 

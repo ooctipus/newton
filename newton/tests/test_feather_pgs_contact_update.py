@@ -331,6 +331,8 @@ class World:
                 self.w_rtype,
                 self.w_parent,
                 self.w["mu"],
+                self.w["mu"],  # unread weights: no regularization
+                0,
                 0,
                 offset,
             ]
@@ -1003,6 +1005,8 @@ class TestContactUpdateSolver(unittest.TestCase):
                 row_type=world.w_rtype,
                 row_parent=world.w_parent,
                 row_mu=world.w["mu"],
+                row_w=world.w["mu"],  # unread: no regularization
+                _regularization_enabled=False,
                 _pgs_friction_start_iteration=0,
                 _pgs_iteration_offset=0,
                 _contact_unit_patch="ring",

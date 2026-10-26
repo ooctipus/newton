@@ -557,8 +557,8 @@ def torque_sweep_source(dofs):
                 float residual = dot + rhs_bias.data[off_dense + spin];
                 float old = s_lam_dense[spin];
                 float diagonal = world_diag.data[off_dense + spin];
-                float trial = diagonal > 0.0f ? old - omega * residual / diagonal : 0.0f;
-                float next = fminf(fmaxf(trial, -bound), bound);
+                float trial = diagonal > 0.0f ? ProjectionLaw::relaxed_step(old, -residual / diagonal, omega) : 0.0f;
+                float next = ProjectionLaw::box(trial, -bound, bound);
                 float delta = next - old;
                 if (delta != 0.0f) {{
                     iteration_changed = 1;

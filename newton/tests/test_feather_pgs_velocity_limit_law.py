@@ -20,6 +20,7 @@ import ast
 import inspect
 import itertools
 import os
+import re
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -37,75 +38,56 @@ from newton.solvers import SolverFeatherPGS
 _LAW_FLAG = "FEATHER_PGS_VELOCITY_LIMIT_LAW"
 
 # Every serial sweep generator with velocity-limit rows: (factory, arguments, options, accumulated sites).
-# Each site is the accumulated expression one visit of a velocity-limit row compiles.
+# Each site is the law call one visit of a velocity-limit row compiles (projection_laws.velocity_limit_update and
+# its free-body form speed_row, whose last argument selects the accumulated total).
+_DENSE_PHASE = "ProjectionLaw::velocity_limit_update(old_impulse, residual, residual / denom, 1)"
+_DENSE_PASS = "ProjectionLaw::velocity_limit_update(old_vlim, residual_vlim, residual_vlim / denom, 1)"
+_SPEED_PASS = "ProjectionLaw::speed_row(speed_mf_vlim, __int_as_float(meta.z), mf_diag, old_mf_vlim, 1)"
 _GENERATORS = {
     "mf_gs": (
         solver_source._get_pgs_solve_mf_gs_kernel.__wrapped__,
         (64, 32, 12, "120"),
         {"has_drive_rows": True},
-        (
-            "fmaxf(old_impulse - residual / denom, 0.0f)",  # dense rows of a velocity-limit row phase
-            "fmaxf(old_vlim - residual_vlim / denom, 0.0f)",  # end-of-iteration dense pass
-            "fmaxf(old_mf_vlim - residual_mf_vlim * mf_diag, 0.0f)",  # end-of-iteration free-body speed pass
-        ),
+        # Dense rows of a velocity-limit row phase, the end-of-iteration dense pass and free-body speed pass.
+        (_DENSE_PHASE, _DENSE_PASS, _SPEED_PASS),
     ),
     "mf_gs_without_dense_limits": (
         solver_source._get_pgs_solve_mf_gs_kernel.__wrapped__,
         (64, 32, 12, "120"),
         {"has_drive_rows": False, "has_dense_velocity_limit_rows": False},
-        (
-            "fmaxf(old_impulse - residual / denom, 0.0f)",
-            "fmaxf(old_mf_vlim - residual_mf_vlim * mf_diag, 0.0f)",
-        ),
+        (_DENSE_PHASE, _SPEED_PASS),
     ),
     "mf_gs_streamed": (
         solver_source._get_pgs_solve_mf_gs_kernel.__wrapped__,
         (64, 32, 12, "120"),
         {"has_drive_rows": True, "stream_mf_impulses": True},
-        (
-            "fmaxf(old_impulse - residual / denom, 0.0f)",
-            "fmaxf(old_vlim - residual_vlim / denom, 0.0f)",
-            "fmaxf(old_mf_vlim - residual_mf_vlim * mf_diag, 0.0f)",
-        ),
+        (_DENSE_PHASE, _DENSE_PASS, _SPEED_PASS),
     ),
     "mf_gs_global_metadata": (
         solver_source._get_pgs_solve_mf_gs_kernel.__wrapped__,
         (64, 32, 12, "120"),
         {"has_drive_rows": True, "shared_metadata": False, "fuse_vel_limits": True},
-        (
-            "fmaxf(old_impulse - residual / denom, 0.0f)",
-            "fmaxf(old_vlim - residual_vlim / denom, 0.0f)",
-            "fmaxf(old_mf_vlim - residual_mf_vlim * mf_diag, 0.0f)",
-        ),
+        (_DENSE_PHASE, _DENSE_PASS, _SPEED_PASS),
     ),
     "incremental": (
         solver_source._get_pgs_solve_mf_gs_incremental_kernel.__wrapped__,
         (64, 32, 12, "120"),
         {"incremental_rows": 32},
         (
-            "fmaxf(old_impulse - residual * s_inv_diag[i], 0.0f)",
-            "fmaxf(old_vlim - residual_vlim * s_inv_diag[i], 0.0f)",
+            "ProjectionLaw::velocity_limit_update(old_impulse, residual, residual * s_inv_diag[i], 1)",
+            "ProjectionLaw::velocity_limit_update(s_lam[i], residual_vlim, residual_vlim * s_inv_diag[i], 1)",
         ),
     ),
     "sparse_limits": (
         _get_pgs_solve_sparse_kernel.__wrapped__,
         (48, 18, 12),
         {"velocity_limits": True},
-        ("fmaxf(old_vlim - residual / denominator, 0.0f)",),
+        ("ProjectionLaw::velocity_limit_update(impulse[row], residual, residual / denominator, 1)",),
     ),
 }
 
-# Text of the stateless law at its visits; none may survive in an accumulated kernel.
-_STATELESS_TEXT = (
-    "PhysX applies the clamp delta directly",
-    "if (residual_vlim < 0.0f)",
-    "if (residual_mf_vlim < 0.0f)",
-    "(residual < 0.0f) ? delta : 0.0f",
-    "(residual < 0.0f) ? -residual",
-    "residual < 0.0f ? -residual",
-    "delta_impulse = delta;",
-    "kind == 4 ? new_impulse",
-)
+# The stateless law at a visit: a law call that selects it; none may survive in an accumulated kernel.
+_STATELESS_CALL = re.compile(r"(velocity_limit_update|speed_row)\([^;]*, 0\);")
 
 
 def _native_sources(factory, *args, **kwargs):
@@ -143,7 +125,7 @@ class TestVelocityLimitLawSources(unittest.TestCase):
         )
 
     def test_accumulated_law_reaches_every_velocity_limit_visit(self):
-        """Project every visit of a velocity-limit row with ``max(old - r / d, 0)`` and name the kernel for it."""
+        """Project every visit of a velocity-limit row with the accumulated law and name the kernel for it."""
         for name, (factory, args, options, sites) in _GENERATORS.items():
             with self.subTest(generator=name):
                 kernel, sources = _native_sources(factory, *args, velocity_limit_law="accumulated", **options)
@@ -151,8 +133,7 @@ class TestVelocityLimitLawSources(unittest.TestCase):
                 self.assertIn("_vacc", kernel.key)
                 for site in sites:
                     self.assertEqual(text.count(site), 1, site)
-                for stateless in _STATELESS_TEXT:
-                    self.assertNotIn(stateless, text)
+                self.assertIsNone(_STATELESS_CALL.search(text))
 
     def test_streamed_impulses_read_the_total_once(self):
         """Read a streamed free-body total through one lane-0 broadcast, never a broadcast inside a broadcast."""

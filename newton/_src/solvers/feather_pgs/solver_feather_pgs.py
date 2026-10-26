@@ -69,7 +69,6 @@ from .contact_unit_sweeps import (
     pgs_solve_mf_loop_unit,
 )
 from .device_preludes import RING, cuda_native, lane_group
-from .friction import FRICTION_PAIR
 from .friction_patches import (
     PatchRowLaw,
     _FrictionPatchState,
@@ -106,7 +105,6 @@ from .kernels import (
     allocate_world_contact_slots,
     allocate_world_contact_slots_patch_resolved,
     apply_augmented_mass_diagonal_grouped,
-    apply_contact_regularization,
     apply_free_root_transport_to_predictor,
     apply_free_root_velocity_corrections,
     apply_impulses_world_par_dof,
@@ -213,6 +211,7 @@ from .path_selection import (
     policy_warnings,
     route_selection,
 )
+from .projection_laws import PROJECTION_LAW
 from .row_build import (
     contact_row_prelude,
     contact_row_prelude_patch,
@@ -256,7 +255,7 @@ from .sparse_pgs import (
     _get_pgs_solve_sparse_kernel,
     contact_transaction_launch_bounds,
 )
-from .velocity_limit_law import accumulated_update, check_velocity_limit_law, velocity_limit_law_suffix
+from .velocity_limit_law import check_velocity_limit_law, velocity_limit_law_suffix
 
 _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
 _COMPACT_CONTACT_BOUNDARY = os.environ.get("FEATHER_PGS_COMPACT_CONTACT_BOUNDARY", "0") == "1"
@@ -8107,9 +8106,6 @@ class SolverFeatherPGS(SolverBase):
                     patch_routes(seeded),
                 )
 
-        if self.pgs_mode != "matrix_free":
-            self._stage6_apply_contact_regularization()
-
         if self._sparse_split:
             # The sparse producers already published bias, incident velocity,
             # CFM and restitution. Decode the accumulated factor delta once;
@@ -8172,8 +8168,6 @@ class SolverFeatherPGS(SolverBase):
                     # this after every warm-start velocity install so a carried
                     # contact cannot reopen the projected closure.
                     self._stage6_project_bilateral_velocity()
-
-                self._stage6_apply_contact_regularization()
 
                 # Pack MF metadata into int4 structs for coalesced 128-bit loads
                 self._pack_mf_meta(self.mf_rhs)
@@ -12308,23 +12302,6 @@ class SolverFeatherPGS(SolverBase):
             device=model.device,
         )
 
-    def _stage6_apply_contact_regularization(self):
-        """Fold contact weights into the assembled Delassus system (split mode only).
-
-        The fused velocity-residual routes read the per-row weights directly, so
-        this runs only when the split mode solves with the assembled matrix and
-        regularization is on.
-        """
-        if not self._regularization_enabled or self.C is None:
-            return
-        wp.launch(
-            apply_contact_regularization,
-            dim=self.world_count,
-            inputs=[self.constraint_count, self.row_type, self.row_w],
-            outputs=[self.diag, self.C],
-            device=self.model.device,
-        )
-
     def _stage4_compute_physx_drive_desc(
         self,
         dt: float,
@@ -12716,6 +12693,8 @@ class SolverFeatherPGS(SolverBase):
                     self.row_type,
                     self.row_parent,
                     self.row_mu,
+                    self.row_w,
+                    int(self._regularization_enabled),
                     self._pgs_friction_start_iteration,
                     self._pgs_iteration_offset,
                 ],
@@ -12740,6 +12719,8 @@ class SolverFeatherPGS(SolverBase):
                     self.row_type,
                     self.row_parent,
                     self.row_mu,
+                    self.row_w,
+                    int(self._regularization_enabled),
                     self._pgs_friction_start_iteration,
                     self._pgs_iteration_offset,
                     int(self._contact_unit_patch == "ring"),
@@ -12765,6 +12746,8 @@ class SolverFeatherPGS(SolverBase):
                 self.row_type,
                 self.row_parent,
                 self.row_mu,
+                self.row_w,
+                int(self._regularization_enabled),
                 self._pgs_friction_start_iteration,
                 self._pgs_iteration_offset,
             ],
@@ -15214,10 +15197,8 @@ def _get_pgs_solve_tiled_row_kernel(
             if (denom <= 0.0f && s_rtype[i] != 2) continue;
 
             float w_val = s_rhs[i] + dot_sum;
-            float delta = denom > 0.0f ? -w_val / denom : 0.0f;
-            float new_impulse = s_lam[i] + omega * delta;
             int row_type = s_rtype[i];
-            if (row_type == 2 && global_iter < friction_start_iteration) {{
+            if (ProjectionLaw::friction_gate(row_type, global_iter, friction_start_iteration)) {{
                 s_lam[i] = 0.0f;
                 continue;
             }}
@@ -15227,10 +15208,13 @@ def _get_pgs_solve_tiled_row_kernel(
             // row_type 0=CONTACT, 3=JOINT_LIMIT, 4=JOINT_VELOCITY_LIMIT:
             // unilateral lambda >= 0 projector. The velocity-limit row
             // uses a signed Jacobian so one side of the bilateral
-            // [-qdot_max, +qdot_max] box is active at a time.
+            // [-qdot_max, +qdot_max] box is active at a time. A contact
+            // row's step takes its regularization weight.
             if (row_type == 0 || row_type == 3 || row_type == 4) {{
-                if (new_impulse < 0.0f) new_impulse = 0.0f;
-                s_lam[i] = new_impulse;
+                float delta = -w_val / denom;
+                if (regularize && row_type == 0)
+                    delta = ProjectionLaw::regularized_delta(delta, world_row_w.data[off1 + i], s_lam[i]);
+                s_lam[i] = ProjectionLaw::unilateral(ProjectionLaw::relaxed_step(s_lam[i], delta, omega));
             }} else if (row_type == 2) {{
                 int parent_idx = s_parent[i];
                 float lambda_n = RING_LOAD(s_lam[parent_idx], parent_idx, TILE_M,
@@ -15240,20 +15224,20 @@ def _get_pgs_solve_tiled_row_kernel(
 
                 if (i != parent_idx + 1) continue;
                 int sib = parent_idx + 2;
+                wp::vec2 pair(0.0f);
+                // Zero load gives a zero disk; avoid unused tangent reductions.
+                if (radius > 0.0f) {{
                 float sibling_residual = 0.0f;
 {sibling_row}
                 SUM(sibling_residual);
                 sibling_residual = sibling_residual + s_rhs[sib];
-                float2 pair = friction_pair_candidate(denom, {sibling_coupling}, s_diag[sib],
-                    w_val, sibling_residual, s_lam[i], s_lam[sib], radius, omega);
-                float a = pair.x;
-                float b = pair.y;
-                float mag = sqrtf(a * a + b * b);
-                float scale = mag > radius ? radius / mag : 1.0f;
-                s_lam[i] = a * scale;
-                s_lam[sib] = b * scale;
+                pair = ProjectionLaw::disk(ProjectionLaw::friction_pair(denom, {sibling_coupling}, s_diag[sib],
+                    wp::vec2(w_val, sibling_residual), wp::vec2(s_lam[i], s_lam[sib]), radius, omega), radius);
+                }}
+                s_lam[i] = pair[0];
+                s_lam[sib] = pair[1];
             }} else {{
-                s_lam[i] = new_impulse;
+                s_lam[i] = ProjectionLaw::relaxed_step(s_lam[i], -w_val / denom, omega);
             }}
         }}
     }}
@@ -15262,7 +15246,7 @@ def _get_pgs_solve_tiled_row_kernel(
 #endif
 """
 
-    snippet = cuda_native(snippet, preludes=(lane_group(32), RING, FRICTION_PAIR))
+    snippet = cuda_native(snippet, preludes=(lane_group(32), RING, *PROJECTION_LAW.preludes()))
 
     @wp.func_native(snippet)
     def pgs_solve_native(
@@ -15277,6 +15261,8 @@ def _get_pgs_solve_tiled_row_kernel(
         world_row_type: wp.array2d[int],
         world_row_parent: wp.array2d[int],
         world_row_mu: wp.array2d[float],
+        world_row_w: wp.array2d[float],
+        regularize: int,
         friction_start_iteration: int,
         iteration_offset: int,
     ): ...
@@ -15292,6 +15278,8 @@ def _get_pgs_solve_tiled_row_kernel(
         world_row_type: wp.array2d[int],
         world_row_parent: wp.array2d[int],
         world_row_mu: wp.array2d[float],
+        world_row_w: wp.array2d[float],
+        regularize: int,
         friction_start_iteration: int,
         iteration_offset: int,
     ):
@@ -15308,6 +15296,8 @@ def _get_pgs_solve_tiled_row_kernel(
             world_row_type,
             world_row_parent,
             world_row_mu,
+            world_row_w,
+            regularize,
             friction_start_iteration,
             iteration_offset,
         )
@@ -15355,15 +15345,13 @@ def _get_pgs_solve_mf_kernel(
                         int sv = lb * 6 + (mf_J_a.data[(c_off + i) * 6 + 3] != 0.0f ? 3 : 0);
                         float speed = sqrtf(s_vel[sv] * s_vel[sv] + s_vel[sv + 1] * s_vel[sv + 1]
                             + s_vel[sv + 2] * s_vel[sv + 2]);
-                        float overshoot = speed - mf_rhs.data[c_off + i];
-                        float correction = overshoot > 0.0f ? overshoot * eff : 0.0f;
-                        if (correction != 0.0f) {{
-                            float scale = 1.0f - (correction / eff) / speed;
-                            s_vel[sv] *= scale;
-                            s_vel[sv + 1] *= scale;
-                            s_vel[sv + 2] *= scale;
+                        const wp::vec3 row = ProjectionLaw::speed_row(speed, mf_rhs.data[c_off + i], eff, 0.0f, 0);
+                        if (row[2] != 0.0f) {{
+                            s_vel[sv] += row[2] * s_vel[sv];
+                            s_vel[sv + 1] += row[2] * s_vel[sv + 1];
+                            s_vel[sv + 2] += row[2] * s_vel[sv + 2];
                         }}
-                        s_impulse[i] = correction;
+                        s_impulse[i] = row[0];
                     }}
                     continue;
                 }}"""
@@ -15421,7 +15409,7 @@ def _get_pgs_solve_mf_kernel(
             int global_iter = iteration_offset + iter;
             for (int i = 0; i < m; i++) {{
                 int row_type = mf_row_type.data[c_off + i];
-                if (row_type == 2 && global_iter < friction_start_iteration) {{
+                if (ProjectionLaw::friction_gate(row_type, global_iter, friction_start_iteration)) {{
                     s_impulse[i] = 0.0f;
                     continue;
                 }}{velocity_limit_projection}
@@ -15465,16 +15453,14 @@ def _get_pgs_solve_mf_kernel(
                 float rhs_i = mf_rhs.data[c_off + i];
                 float old_impulse = s_impulse[i];
                 float delta = -(jv + rhs_i) * eff_inv;
-                if (row_type == 0) {{
-                    // Diagonal contact compliance (see the fused MF-GS kernel).
-                    float w = regularize ? mf_row_w.data[c_off + i] : 1.0f;
-                    delta = -(jv + rhs_i) * eff_inv * w - (1.0f - w) * old_impulse;
-                }}
-                float new_impulse = old_impulse + omega * delta;
+                // Diagonal contact compliance (see the fused MF-GS kernel).
+                if (row_type == 0 && regularize)
+                    delta = ProjectionLaw::regularized_delta(delta, mf_row_w.data[c_off + i], old_impulse);
+                float new_impulse = ProjectionLaw::relaxed_step(old_impulse, delta, omega);
 
                 // Project: contact or joint limit
                 if (row_type == 0 || row_type == 3) {{
-                    if (new_impulse < 0.0f) new_impulse = 0.0f;
+                    new_impulse = ProjectionLaw::unilateral(new_impulse);
                 }}
                 // Project: friction
                 else if (row_type == 2) {{
@@ -15489,25 +15475,25 @@ def _get_pgs_solve_mf_kernel(
                     }} else {{
                         int sib = parent_idx + 2;
                         int sib_base = (c_off + sib) * 6;
-                        float sibling_residual = mf_rhs.data[c_off + sib];
-                        for (int k = 0; k < 6; ++k) {{
-                            if (lba >= 0) sibling_residual += mf_J_a.data[sib_base + k] * s_vel[lba * 6 + k];
-                            if (lbb >= 0) sibling_residual += mf_J_b.data[sib_base + k] * s_vel[lbb * 6 + k];
+                        wp::vec2 pair(0.0f);
+                        // Zero load gives a zero disk; avoid unused tangent reductions.
+                        if (radius > 0.0f) {{
+                            float sibling_residual = mf_rhs.data[c_off + sib];
+                            for (int k = 0; k < 6; ++k) {{
+                                if (lba >= 0) sibling_residual += mf_J_a.data[sib_base + k] * s_vel[lba * 6 + k];
+                                if (lbb >= 0) sibling_residual += mf_J_b.data[sib_base + k] * s_vel[lbb * 6 + k];
+                            }}
+                            float inv_sib = mf_eff_mass_inv.data[c_off + sib];
+                            float cross = 0.0f;
+                            for (int k = 0; k < 6; ++k) {{
+                                if (lba >= 0) cross += mf_J_a.data[j_base + k] * mf_MiJt_a.data[sib_base + k];
+                                if (lbb >= 0) cross += mf_J_b.data[j_base + k] * mf_MiJt_b.data[sib_base + k];
+                            }}
+                            pair = ProjectionLaw::disk(ProjectionLaw::friction_pair(eff_inv > 0.0f ? 1.0f / eff_inv : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
+                                wp::vec2(jv + rhs_i, sibling_residual), wp::vec2(old_impulse, s_impulse[sib]), radius, omega), radius);
                         }}
-                        float inv_sib = mf_eff_mass_inv.data[c_off + sib];
-                        float cross = 0.0f;
-                        for (int k = 0; k < 6; ++k) {{
-                            if (lba >= 0) cross += mf_J_a.data[j_base + k] * mf_MiJt_a.data[sib_base + k];
-                            if (lbb >= 0) cross += mf_J_b.data[j_base + k] * mf_MiJt_b.data[sib_base + k];
-                        }}
-                        float2 pair = friction_pair_candidate(eff_inv > 0.0f ? 1.0f / eff_inv : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
-                            jv + rhs_i, sibling_residual, old_impulse, s_impulse[sib], radius, omega);
-                        float a_val = pair.x;
-                        float b_val = pair.y;
-                        float mag = sqrtf(a_val * a_val + b_val * b_val);
-                        float scale = mag > radius ? radius / mag : 1.0f;
-                        new_impulse = a_val * scale;
-                        float sib_new = b_val * scale;
+                        new_impulse = pair[0];
+                        float sib_new = pair[1];
                         float sib_delta = sib_new - s_impulse[sib];
                         s_impulse[sib] = sib_new;
 
@@ -15583,7 +15569,7 @@ def _get_pgs_solve_mf_kernel(
 #endif
 """
 
-    snippet = cuda_native(snippet, preludes=(lane_group(32), RING, FRICTION_PAIR))
+    snippet = cuda_native(snippet, preludes=(lane_group(32), RING, *PROJECTION_LAW.preludes()))
 
     @wp.func_native(snippet)
     def pgs_solve_mf_native(
@@ -15935,7 +15921,7 @@ def _get_pgs_solve_local_owned_kernel(
         row_masks = ""
         row_setup = """            if (s_active[row] == 0) continue;
             const int row_type = s_type[row];"""
-        joint_limit_projection = f"row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)} && new_impulse < 0.0f"
+        joint_limit_row = f"row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)}"
         impulse_active = "s_active[row] != 0"
     elif lanes_per_world < 32:
         lane_metadata = ""
@@ -15945,7 +15931,7 @@ def _get_pgs_solve_local_owned_kernel(
         row_masks = ""
         row_setup = """            if (s_active[row] == 0) continue;
             const int row_joint_limit = s_joint_limit[row];"""
-        joint_limit_projection = "row_joint_limit != 0 && new_impulse < 0.0f"
+        joint_limit_row = "row_joint_limit != 0"
         impulse_active = "s_active[row] != 0"
     else:
         lane_metadata = """    int lane_joint_limit = 0;
@@ -15957,7 +15943,7 @@ def _get_pgs_solve_local_owned_kernel(
     const unsigned joint_limit_rows = BALLOT(lane_joint_limit != 0);"""
         row_setup = """            const unsigned row_bit = 1u << row;
             if ((active_rows & row_bit) == 0u) continue;"""
-        joint_limit_projection = "(joint_limit_rows & row_bit) != 0u && new_impulse < 0.0f"
+        joint_limit_row = "(joint_limit_rows & row_bit) != 0u"
         impulse_active = "(active_rows & (1u << row)) != 0u"
     iteration_setup = "        const int global_iteration = iteration_offset + iteration;" if contact_capable else ""
     friction_kind = str(int(PGS_CONSTRAINT_TYPE_FRICTION))
@@ -15982,12 +15968,11 @@ def _get_pgs_solve_local_owned_kernel(
     mf_main_vote = local_vote(16, "delta_impulse_mf", "1.0f / inverse_diagonal", "mf_row_type")
     main_vote = local_vote(16, "delta_impulse", "1.0f / inverse_diagonal", row_kind)
     friction_gate = (
-        f"""            if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}
-                && global_iteration < friction_start_iteration) {{
+        """            if (ProjectionLaw::friction_gate(row_type, global_iteration, friction_start_iteration)) {
                 s_lambda[row] = 0.0f;
                 SYNC();
                 continue;
-            }}"""
+            }"""
         if contact_capable
         else ""
     )
@@ -16028,9 +16013,9 @@ def _get_pgs_solve_local_owned_kernel(
                     const float tangent_cross = cross_partial;"""
     )
     impulse_projection = (
-        f"""            if ((row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)}
+        f"""            if (row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)}
                 || row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)})
-                && new_impulse < 0.0f) new_impulse = 0.0f;
+                new_impulse = ProjectionLaw::unilateral(new_impulse);
             else if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}) {{
                 const int parent = s_parent[row];
                 if (row != parent + 1) {{
@@ -16040,23 +16025,25 @@ def _get_pgs_solve_local_owned_kernel(
                         [&](int r) {{ return s_parent[r]; }}, [&](int r) {{ return s_lambda[r]; }});
                     const float radius = fmaxf(s_mu[row] * lambda_n, 0.0f);
                     const int sibling = parent + 2;
-                    {dense_friction_pair_terms}
                     const float sibling_old = s_lambda[sibling];
                     const float sibling_inverse_diagonal = s_inverse_diagonal[sibling];
-                    float2 pair = friction_pair_candidate(
-                        1.0f / inverse_diagonal,
-                        tangent_cross,
-                        sibling_inverse_diagonal > 0.0f ? 1.0f / sibling_inverse_diagonal : 0.0f,
-                        residual,
-                        sibling_residual,
-                        old_impulse,
-                        sibling_old,
-                        radius,
-                        omega);
-                    const float pair_magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
-                    const float pair_scale = pair_magnitude > radius ? radius / pair_magnitude : 1.0f;
-                    new_impulse = pair.x * pair_scale;
-                    const float sibling_new = pair.y * pair_scale;
+                    wp::vec2 pair(0.0f);
+                    // Zero load gives a zero disk; avoid unused tangent reductions.
+                    if (radius > 0.0f) {{
+                    {dense_friction_pair_terms}
+                    pair = ProjectionLaw::disk(
+                        ProjectionLaw::friction_pair(
+                            1.0f / inverse_diagonal,
+                            tangent_cross,
+                            sibling_inverse_diagonal > 0.0f ? 1.0f / sibling_inverse_diagonal : 0.0f,
+                            wp::vec2(residual, sibling_residual),
+                            wp::vec2(old_impulse, sibling_old),
+                            radius,
+                            omega),
+                        radius);
+                    }}
+                    new_impulse = pair[0];
+                    const float sibling_new = pair[1];
                     const float sibling_delta = sibling_new - sibling_old;
                     s_lambda[sibling] = sibling_new;
                     if (sibling_delta != 0.0f) {{
@@ -16066,8 +16053,8 @@ def _get_pgs_solve_local_owned_kernel(
                 }}
             }}"""
         if contact_capable
-        else f"""            if ({joint_limit_projection})
-                new_impulse = 0.0f;"""
+        else f"""            if ({joint_limit_row})
+                new_impulse = ProjectionLaw::unilateral(new_impulse);"""
     )
     if dense_response_matrix and local_mf_rows:
         response_matrix_setup = f"""
@@ -16408,8 +16395,7 @@ def _get_pgs_solve_local_owned_kernel(
             const float inverse_diagonal = __int_as_float(meta.y);
             const int packed_type_parent = meta.w;
             const int mf_row_type = packed_type_parent & 0xFFFF;
-            if (mf_row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}
-                && global_iteration < friction_start_iteration) {{
+            if (ProjectionLaw::friction_gate(mf_row_type, global_iteration, friction_start_iteration)) {{
                 s_mf_lambda[mf_row] = 0.0f;
                 SYNC();
                 continue;
@@ -16420,14 +16406,12 @@ def _get_pgs_solve_local_owned_kernel(
             {mf_row_residual}
             const float old_impulse_mf = s_mf_lambda[mf_row];
             float delta_mf = -residual_mf * inverse_diagonal;
-            if (mf_row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)}) {{
-                const float w_mf = regularize != 0 ? mf_row_w.data[mf_offset + mf_row] : 1.0f;
-                delta_mf = -residual_mf * inverse_diagonal * w_mf - (1.0f - w_mf) * old_impulse_mf;
-            }}
-            float new_impulse_mf = old_impulse_mf + omega * delta_mf;
+            if (mf_row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)} && regularize != 0)
+                delta_mf = ProjectionLaw::regularized_delta(delta_mf, mf_row_w.data[mf_offset + mf_row], old_impulse_mf);
+            float new_impulse_mf = ProjectionLaw::relaxed_step(old_impulse_mf, delta_mf, omega);
 
             if (mf_row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)}) {{
-                if (new_impulse_mf < 0.0f) new_impulse_mf = 0.0f;
+                new_impulse_mf = ProjectionLaw::unilateral(new_impulse_mf);
             }} else if (mf_row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}) {{
                 const int parent_mf = {_mf_parent_expression("packed_type_parent", mf_max_constraints)};
                 if (mf_row != parent_mf + 1) {{
@@ -16439,27 +16423,27 @@ def _get_pgs_solve_local_owned_kernel(
                     const float radius_mf = fmaxf(
                         mf_row_mu.data[mf_offset + mf_row] * lambda_n_mf, 0.0f);
                     const int sibling_mf = parent_mf + 2;
-                    {mf_friction_pair_terms}
                     const float sibling_old_mf = s_mf_lambda[sibling_mf];
                     const float sibling_inverse_diagonal_mf =
                         __int_as_float(mf_meta.data[mf_meta_offset + sibling_mf * 4 + 1]);
-                    float2 pair_mf = friction_pair_candidate(
-                        1.0f / inverse_diagonal,
-                        tangent_cross_mf,
-                        sibling_inverse_diagonal_mf > 0.0f
-                            ? 1.0f / sibling_inverse_diagonal_mf : 0.0f,
-                        residual_mf,
-                        sibling_residual_mf,
-                        old_impulse_mf,
-                        sibling_old_mf,
-                        radius_mf,
-                        omega);
-                    const float pair_magnitude_mf =
-                        sqrtf(pair_mf.x * pair_mf.x + pair_mf.y * pair_mf.y);
-                    const float pair_scale_mf =
-                        pair_magnitude_mf > radius_mf ? radius_mf / pair_magnitude_mf : 1.0f;
-                    new_impulse_mf = pair_mf.x * pair_scale_mf;
-                    const float sibling_new_mf = pair_mf.y * pair_scale_mf;
+                    wp::vec2 pair_mf(0.0f);
+                    // Zero load gives a zero disk; avoid unused tangent reductions.
+                    if (radius_mf > 0.0f) {{
+                    {mf_friction_pair_terms}
+                    pair_mf = ProjectionLaw::disk(
+                        ProjectionLaw::friction_pair(
+                            1.0f / inverse_diagonal,
+                            tangent_cross_mf,
+                            sibling_inverse_diagonal_mf > 0.0f
+                                ? 1.0f / sibling_inverse_diagonal_mf : 0.0f,
+                            wp::vec2(residual_mf, sibling_residual_mf),
+                            wp::vec2(old_impulse_mf, sibling_old_mf),
+                            radius_mf,
+                            omega),
+                        radius_mf);
+                    }}
+                    new_impulse_mf = pair_mf[0];
+                    const float sibling_new_mf = pair_mf[1];
                     const float sibling_delta_mf = sibling_new_mf - sibling_old_mf;
                     s_mf_lambda[sibling_mf] = sibling_new_mf;
                     if (sibling_delta_mf != 0.0f) {{
@@ -16577,9 +16561,10 @@ def _get_pgs_solve_local_owned_kernel(
 
 {row_residual}
             const float old_impulse = s_lambda[row];
-            // Per-row relative regularization exactly as the general owner applies it (w = 1 is the hard update).
-            const float w_row = regularize != 0 ? world_row_w.data[world_row_base + row] : 1.0f;
-            float new_impulse = old_impulse + omega * (delta * w_row - (1.0f - w_row) * old_impulse);
+            // Per-row relative regularization exactly as the general owner applies it.
+            const float row_delta = regularize != 0
+                ? ProjectionLaw::regularized_delta(delta, world_row_w.data[world_row_base + row], old_impulse) : delta;
+            float new_impulse = ProjectionLaw::relaxed_step(old_impulse, row_delta, omega);
 {impulse_projection}
             const float delta_impulse = new_impulse - old_impulse;
             s_lambda[row] = new_impulse;
@@ -16606,7 +16591,8 @@ def _get_pgs_solve_local_owned_kernel(
         snippet,
         preludes=(
             lane_group(lanes_per_world),
-            *((RING, FRICTION_PAIR) if contact_capable else ()),
+            *((RING,) if contact_capable else ()),
+            *PROJECTION_LAW.preludes(),
             *solve_policy.preludes,
         ),
     )
@@ -17291,7 +17277,8 @@ def _get_pgs_solve_sparse_diagonal_kernel(
             if ((limit_active_{element} & 1) != 0) {{
                 const float residual = s_v[{coord}] + limit_lower_rhs_{element};
                 const float old_lambda = limit_lower_lambda_{element};
-                const float new_lambda = fmaxf(0.0f, old_lambda - omega * residual / limit_denom);
+                const float new_lambda = ProjectionLaw::unilateral(
+                    ProjectionLaw::relaxed_step(old_lambda, -residual / limit_denom, omega));
                 const float delta_lambda = new_lambda - old_lambda;
                 limit_lower_lambda_{element} = new_lambda;
                 s_v[{coord}] += limit_response_{element} * delta_lambda;
@@ -17300,7 +17287,8 @@ def _get_pgs_solve_sparse_diagonal_kernel(
             if ((limit_active_{element} & 2) != 0) {{
                 const float residual = -s_v[{coord}] + limit_upper_rhs_{element};
                 const float old_lambda = limit_upper_lambda_{element};
-                const float new_lambda = fmaxf(0.0f, old_lambda - omega * residual / limit_denom);
+                const float new_lambda = ProjectionLaw::unilateral(
+                    ProjectionLaw::relaxed_step(old_lambda, -residual / limit_denom, omega));
                 const float delta_lambda = new_lambda - old_lambda;
                 limit_upper_lambda_{element} = new_lambda;
                 s_v[{coord}] -= limit_response_{element} * delta_lambda;
@@ -17348,8 +17336,8 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                     const float normal_jv = __fmul_rn(normal_j, s_v[scalar_coord]);
                     const float residual = __fadd_rn(normal_jv, s_rhs[normal]);
                     const float old_impulse = s_lambda[normal];
-                    float new_impulse = old_impulse - omega * residual / normal_denom;
-                    if (new_impulse < 0.0f) new_impulse = 0.0f;
+                    const float new_impulse = ProjectionLaw::unilateral(
+                        ProjectionLaw::relaxed_step(old_impulse, -residual / normal_denom, omega));
                     const float delta_impulse = new_impulse - old_impulse;
                     s_lambda[normal] = new_impulse;
                     if (delta_impulse != 0.0f) {{
@@ -17367,7 +17355,8 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                     normal = next_normal;
                     continue;
                 }}
-                if (global_iteration < friction_start_iteration) {{
+                if (ProjectionLaw::friction_gate({int(PGS_CONSTRAINT_TYPE_FRICTION)}, global_iteration,
+                        friction_start_iteration)) {{
                     s_lambda[tangent1] = 0.0f;
                     s_lambda[tangent2] = 0.0f;
                     normal = next_normal;
@@ -17389,18 +17378,17 @@ def _get_pgs_solve_sparse_diagonal_kernel(
 
                 // Both tangents act on the same scalar coordinate: solve them together on the friction disk
                 // at the patch normal load, as the general owner does.
-                float2 pair = make_float2(0.0f, 0.0f);
+                wp::vec2 pair(0.0f);
                 if (radius > 0.0f) {{
                     const float tangent1_residual = __fadd_rn(__fmul_rn(tangent1_j, s_v[scalar_coord]), s_rhs[tangent1]);
                     const float tangent2_residual = __fadd_rn(__fmul_rn(tangent2_j, s_v[scalar_coord]), s_rhs[tangent2]);
                     const float cross = tangent1_j * tangent2_y;
-                    pair = friction_pair_candidate(s_diag[tangent1], cross, s_diag[tangent2],
-                        tangent1_residual, tangent2_residual, old_tangent1, old_tangent2, radius, omega);
+                    pair = ProjectionLaw::friction_pair(s_diag[tangent1], cross, s_diag[tangent2],
+                        wp::vec2(tangent1_residual, tangent2_residual), wp::vec2(old_tangent1, old_tangent2), radius, omega);
                 }}
-                const float magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
-                const float scale = magnitude > radius ? radius / magnitude : 1.0f;
-                const float new_tangent1 = pair.x * scale;
-                const float new_tangent2 = pair.y * scale;
+                pair = ProjectionLaw::disk(pair, radius);
+                const float new_tangent1 = pair[0];
+                const float new_tangent2 = pair[1];
                 const float tangent1_delta = new_tangent1 - old_tangent1;
                 const float tangent2_delta = new_tangent2 - old_tangent2;
                 s_lambda[tangent1] = new_tangent1;
@@ -17475,9 +17463,8 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                         float new_impulse = old_impulse;
                         const float denominator = s_diag[candidate_normal];
                         if (denominator > 0.0f) {{
-                            new_impulse -= omega
-                                * (candidate_velocity + s_rhs[candidate_normal]) / denominator;
-                            if (new_impulse < 0.0f) new_impulse = 0.0f;
+                            new_impulse = ProjectionLaw::unilateral(ProjectionLaw::relaxed_step(
+                                old_impulse, -(candidate_velocity + s_rhs[candidate_normal]) / denominator, omega));
                         }}
                         candidate_noop = old_impulse == 0.0f && new_impulse == 0.0f
                             && s_lambda[candidate_normal + 1] == 0.0f
@@ -17549,8 +17536,8 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                     const float normal_jv = __fmul_rn(normal_j, s_v[scalar_coord]);
                     const float residual = __fadd_rn(normal_jv, s_rhs[normal]);
                     const float old_impulse = s_lambda[normal];
-                    float new_impulse = old_impulse - omega * residual / normal_denom;
-                    if (new_impulse < 0.0f) new_impulse = 0.0f;
+                    const float new_impulse = ProjectionLaw::unilateral(
+                        ProjectionLaw::relaxed_step(old_impulse, -residual / normal_denom, omega));
                     const float delta_impulse = new_impulse - old_impulse;
                     s_lambda[normal] = new_impulse;
                     if (delta_impulse != 0.0f) {{
@@ -17576,7 +17563,8 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                     normal = next_normal;
                     continue;
                 }}
-                if (global_iteration < friction_start_iteration) {{
+                if (ProjectionLaw::friction_gate({int(PGS_CONSTRAINT_TYPE_FRICTION)}, global_iteration,
+                        friction_start_iteration)) {{
                     s_lambda[tangent1] = 0.0f;
                     s_lambda[tangent2] = 0.0f;
                     normal = next_normal;
@@ -17598,18 +17586,17 @@ def _get_pgs_solve_sparse_diagonal_kernel(
 
                 // Both tangents act on the same scalar coordinate: solve them together on the friction disk
                 // at the patch normal load, as the general owner does.
-                float2 pair = make_float2(0.0f, 0.0f);
+                wp::vec2 pair(0.0f);
                 if (radius > 0.0f) {{
                     const float tangent1_residual = __fadd_rn(__fmul_rn(tangent1_j, s_v[scalar_coord]), s_rhs[tangent1]);
                     const float tangent2_residual = __fadd_rn(__fmul_rn(tangent2_j, s_v[scalar_coord]), s_rhs[tangent2]);
                     const float cross = tangent1_j * tangent2_y;
-                    pair = friction_pair_candidate(s_diag[tangent1], cross, s_diag[tangent2],
-                        tangent1_residual, tangent2_residual, old_tangent1, old_tangent2, radius, omega);
+                    pair = ProjectionLaw::friction_pair(s_diag[tangent1], cross, s_diag[tangent2],
+                        wp::vec2(tangent1_residual, tangent2_residual), wp::vec2(old_tangent1, old_tangent2), radius, omega);
                 }}
-                const float magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
-                const float scale = magnitude > radius ? radius / magnitude : 1.0f;
-                const float new_tangent1 = pair.x * scale;
-                const float new_tangent2 = pair.y * scale;
+                pair = ProjectionLaw::disk(pair, radius);
+                const float new_tangent1 = pair[0];
+                const float new_tangent2 = pair[1];
                 const float tangent1_delta = new_tangent1 - old_tangent1;
                 const float tangent2_delta = new_tangent2 - old_tangent2;
                 s_lambda[tangent1] = new_tangent1;
@@ -17689,9 +17676,8 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                             float new_impulse = old_impulse;
                             const float denominator = s_diag[candidate_normal];
                             if (denominator > 0.0f) {{
-                                new_impulse -= omega
-                                    * (candidate_velocity + s_rhs[candidate_normal]) / denominator;
-                                if (new_impulse < 0.0f) new_impulse = 0.0f;
+                                new_impulse = ProjectionLaw::unilateral(ProjectionLaw::relaxed_step(
+                                    old_impulse, -(candidate_velocity + s_rhs[candidate_normal]) / denominator, omega));
                             }}
                             candidate_noop = old_impulse == 0.0f && new_impulse == 0.0f;
                             // Only a unit with tangent rows reads them and its ring's load.
@@ -17803,8 +17789,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
 {serial_loop_open}
 {skip_independent_contact}
             const int row_type = s_meta[row] & {_DENSE_META_ROW_TYPE_MASK};
-            if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}
-                && global_iteration < friction_start_iteration) {{
+            if (ProjectionLaw::friction_gate(row_type, global_iteration, friction_start_iteration)) {{
                 s_lambda[row] = 0.0f;
                 SYNC();
                 continue;
@@ -17839,11 +17824,11 @@ def _get_pgs_solve_sparse_diagonal_kernel(
 
             const float residual = velocity + s_rhs[row];
             const float old_impulse = s_lambda[row];
-            float new_impulse = old_impulse;
-            if (denominator > 0.0f) new_impulse -= omega * residual / denominator;
+            float new_impulse = denominator > 0.0f
+                ? ProjectionLaw::relaxed_step(old_impulse, -residual / denominator, omega) : old_impulse;
             if (row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)}
                 || row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)}) {{
-                new_impulse = fmaxf(new_impulse, 0.0f);
+                new_impulse = ProjectionLaw::unilateral(new_impulse);
             }} else if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}) {{
                 // Paired tangent solve at the patch normal load, matching the general owner.
                 const int sibling = parent + 2;
@@ -17875,20 +17860,19 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                     else if (coord >= 0 && coord == sibling_coord_1)
                         sibling_response_here = sparse_row_jy.data[sibling_sparse_row * 4 + 3];
                 }}
-                float2 pair = make_float2(0.0f, 0.0f);
+                wp::vec2 pair(0.0f);
                 if (radius > 0.0f) {{
                     float partial_sibling = sibling_coord >= 0 ? sibling_jacobian * s_v[sibling_coord] : 0.0f;
                     float partial_cross = coord >= 0 ? jacobian * sibling_response_here : 0.0f;
                     SUM(partial_sibling, partial_cross);
                     const float sibling_residual = partial_sibling + s_rhs[sibling];
                     const float cross = partial_cross;
-                    pair = friction_pair_candidate(denominator, cross, s_diag[sibling],
-                        residual, sibling_residual, old_impulse, sibling_old, radius, omega);
+                    pair = ProjectionLaw::friction_pair(denominator, cross, s_diag[sibling],
+                        wp::vec2(residual, sibling_residual), wp::vec2(old_impulse, sibling_old), radius, omega);
                 }}
-                const float magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
-                const float scale = magnitude > radius ? radius / magnitude : 1.0f;
-                new_impulse = pair.x * scale;
-                const float sibling_new = pair.y * scale;
+                pair = ProjectionLaw::disk(pair, radius);
+                new_impulse = pair[0];
+                const float sibling_new = pair[1];
                 const float sibling_delta = sibling_new - sibling_old;
                 s_lambda[sibling] = sibling_new;
                 if (sibling_delta != 0.0f) {{
@@ -17919,7 +17903,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
 {chr(10).join(limit_stores)}
 #endif
 """
-    snippet = cuda_native(snippet, preludes=(lane_group(32), RING, FRICTION_PAIR, *solve_policy.preludes))
+    snippet = cuda_native(snippet, preludes=(lane_group(32), RING, *PROJECTION_LAW.preludes(), *solve_policy.preludes))
 
     @wp.func_native(snippet)
     def pgs_solve_sparse_diagonal_native(
@@ -18262,42 +18246,27 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
     drive_kind_case = (
         """
                 } else if (kind == 3) {
-                    new_impulse = old_impulse * s_drive_imp_mul[i]
-                        + (residual - s_rhs[i]) * s_drive_vel_mul[i]
-                        + s_drive_target[i];
-                    float max_imp = s_drive_max_imp[i];
-                    if (new_impulse > max_imp) new_impulse = max_imp;
-                    if (new_impulse < -max_imp) new_impulse = -max_imp;
+                    new_impulse = ProjectionLaw::physx_drive(old_impulse, residual - s_rhs[i], s_drive_imp_mul[i],
+                        s_drive_vel_mul[i], s_drive_target[i], s_drive_max_imp[i]);
                     delta_impulse = new_impulse - old_impulse;"""
         if has_drive_rows
         else ""
     )
     # Type-1 rows are skipped when the drive model does not produce PhysX rows.
     drive_row_admit = "1" if has_drive_rows else "(row_type != 1)"
-    if accumulated_limits:
-        vlim_law = "                const float old_vlim = s_lam[i];\n" + accumulated_update(
-            "old_vlim",
-            "residual_vlim * s_inv_diag[i]",
-            new="new_vlim",
-            delta="delta_impulse_vlim",
-            indent=" " * 16,
-            declare="float ",
-        ).rstrip("\n")
-        vlim_stored = "new_vlim"
-        # A velocity-limit row phase (row_phase 5) visits its rows in the main loop with the same law.
-        vlim_main = accumulated_update(
-            "old_impulse", "residual * s_inv_diag[i]", new="new_impulse", delta="delta_impulse", indent=" " * 20
-        ).rstrip("\n")
-    else:
-        vlim_law = """                float delta_impulse_vlim = 0.0f;
-                if (residual_vlim < 0.0f) delta_impulse_vlim = -residual_vlim * s_inv_diag[i];"""
-        vlim_stored = "delta_impulse_vlim"
-        vlim_main = """                    if (residual < 0.0f) {
-                        delta_impulse = delta;
-                        new_impulse = delta_impulse;
-                    } else {
-                        new_impulse = 0.0f;
-                    }"""
+    # Every visit of a velocity-limit row, the end-of-iteration pass and a velocity-limit row phase (row_phase 5)
+    # in the main loop, takes the row's law (projection_laws.velocity_limit_update); the stateless law stores
+    # its correction and never reads the old impulse.
+    law = int(accumulated_limits)
+    vlim_old = "s_lam[i]" if accumulated_limits else "0.0f"
+    vlim_law = (
+        f"                const auto vlim = ProjectionLaw::velocity_limit_update({vlim_old}, residual_vlim, residual_vlim * s_inv_diag[i], {law});\n"
+        "                const float delta_impulse_vlim = vlim.v1;"
+    )
+    vlim_stored = "vlim.v0"
+    vlim_main = f"""                    const auto vlim = ProjectionLaw::velocity_limit_update(old_impulse, residual, residual * s_inv_diag[i], {law});
+                    new_impulse = vlim.v0;
+                    delta_impulse = vlim.v1;"""
     vlim_vote = vote(
         solve_policy,
         "                    iteration_changed = 1;",
@@ -18492,15 +18461,15 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
             float sib_delta = 0.0f;
             float sib_new = 0.0f;
             int sib = -1;
-            if (kind == 1 && global_iter < friction_start_iteration) {{
+            if (ProjectionLaw::friction_gate(s_type[i], global_iter, friction_start_iteration)) {{
                 // Friction rows stay inactive until friction_start_iteration.
                 new_impulse = 0.0f;
             }} else {{
-                const float w = s_w[i];
-                const float delta = -residual * s_inv_diag[i] * w - (1.0f - w) * old_impulse;
-                new_impulse = old_impulse + omega * delta;
+                float delta = -residual * s_inv_diag[i];
+                if (regularize) delta = ProjectionLaw::regularized_delta(delta, s_w[i], old_impulse);
+                new_impulse = ProjectionLaw::relaxed_step(old_impulse, delta, omega);
                 if (kind == 0) {{
-                    if (new_impulse < 0.0f) new_impulse = 0.0f;
+                    new_impulse = ProjectionLaw::unilateral(new_impulse);
                     delta_impulse = new_impulse - old_impulse;
                 }} else if (kind == 1) {{
                     const int parent_idx = s_parent[i];
@@ -18511,13 +18480,14 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
                         const float lambda_n = RING_LOAD(s_lam[parent_idx], parent_idx, {AM},
                             [&](int r) {{ return s_parent[r]; }}, [&](int r) {{ return s_lam[r]; }});
                         const float radius = fmaxf(s_mu[i] * lambda_n, 0.0f);
-                        const float2 pair = friction_pair_candidate(
-                            s_diag[i], s_A[sib * {AM} + i], s_diag[sib],
-                            residual, s_res[sib], old_impulse, s_lam[sib], radius, omega);
-                        const float mag = sqrtf(pair.x * pair.x + pair.y * pair.y);
-                        const float scale = mag > radius ? radius / mag : 1.0f;
-                        new_impulse = pair.x * scale;
-                        sib_new = pair.y * scale;
+                        wp::vec2 pair(0.0f);
+                        // Zero load gives a zero disk; avoid unused tangent reductions.
+                        if (radius > 0.0f)
+                            pair = ProjectionLaw::disk(ProjectionLaw::friction_pair(
+                                s_diag[i], s_A[sib * {AM} + i], s_diag[sib],
+                                wp::vec2(residual, s_res[sib]), wp::vec2(old_impulse, s_lam[sib]), radius, omega), radius);
+                        new_impulse = pair[0];
+                        sib_new = pair[1];
                         sib_delta = sib_new - s_lam[sib];
                     }}
                     delta_impulse = new_impulse - old_impulse;
@@ -18565,7 +18535,7 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
 #endif
 """
 
-    snippet = cuda_native(snippet, preludes=(lane_group(32), RING, FRICTION_PAIR, *solve_policy.preludes))
+    snippet = cuda_native(snippet, preludes=(lane_group(32), RING, *PROJECTION_LAW.preludes(), *solve_policy.preludes))
 
     @wp.func_native(snippet)
     def pgs_solve_mf_gs_incremental_native(
@@ -19325,15 +19295,13 @@ def _get_pgs_solve_parallel_kernel(
                     const float r = (r0 + r1) + (r2 + r3);
 #endif
                     if (s_kind[i] == 3) {{
-                        // PhysX drive row (legacy formula): impulse from the current joint velocity J.v = r - rhs
-                        float nv = s_y[i] * s_drv_i[i] + (r - s_rhs0[i]) * s_drv_v[i] + s_drv_t[i];
-                        const float mx = s_drv_m[i];
-                        if (nv > mx) nv = mx;
-                        if (nv < -mx) nv = -mx;
-                        value = nv;
+                        // PhysX drive row: impulse from the current joint velocity J.v = r - rhs
+                        value = ProjectionLaw::physx_drive(s_y[i], r - s_rhs0[i], s_drv_i[i], s_drv_v[i], s_drv_t[i],
+                            s_drv_m[i]);
                     }} else {{
+                        // The projected Jacobi step; the tier codes rows by kind (1 friction), not by row type.
                         value = s_y[i] - s_step[i] * r;
-                        if (s_kind[i] == 0 && value < 0.0f) value = 0.0f;
+                        if (s_kind[i] == 0) value = ProjectionLaw::unilateral(value);
                         if (s_kind[i] == 1 && global_iter < friction_start_iteration) value = 0.0f;
                     }}
                 }}
@@ -19352,12 +19320,7 @@ def _get_pgs_solve_parallel_kernel(
             const float xs = READ(x_new[0], sib & 31);
             if (fr) {{
                 const float radius = fmaxf(s_mu[i] * xp, 0.0f);
-                const float a_val = x_new[0];
-                const float mag = sqrtf(a_val * a_val + xs * xs);
-                float value = a_val;
-                if (radius <= 0.0f) value = 0.0f;
-                else if (mag > radius) value = a_val * (radius / mag);
-                x_new[0] = value;
+                x_new[0] = radius <= 0.0f ? 0.0f : ProjectionLaw::disk(wp::vec2(x_new[0], xs), radius)[0];
             }}
         }} else {{
         SYNC();
@@ -19371,13 +19334,7 @@ def _get_pgs_solve_parallel_kernel(
                 const int p = s_parent[i];
                 const int sib = (i == p + 1) ? p + 2 : p + 1;
                 const float radius = fmaxf(s_mu[i] * s_x[p], 0.0f);
-                const float a_val = s_x[i];
-                const float b_val = s_x[sib];
-                const float mag = sqrtf(a_val * a_val + b_val * b_val);
-                float value = a_val;
-                if (radius <= 0.0f) value = 0.0f;
-                else if (mag > radius) value = a_val * (radius / mag);
-                x_new[q] = value;
+                x_new[q] = radius <= 0.0f ? 0.0f : ProjectionLaw::disk(wp::vec2(s_x[i], s_x[sib]), radius)[0];
             }}
         }}
         SYNC();
@@ -19480,7 +19437,10 @@ def _get_pgs_solve_parallel_kernel(
 #endif
 """
     row_preludes = operands.preludes if operands is not None else ()
-    snippet = cuda_native(snippet, preludes=(lane_group(NT), *((RING,) if linked_rows else ()), *row_preludes))
+    snippet = cuda_native(
+        snippet,
+        preludes=(lane_group(NT), *((RING,) if linked_rows else ()), *row_preludes, *PROJECTION_LAW.preludes()),
+    )
     if linked_rows:
         snippet = _link_parallel_friction_pairs(snippet)
 
@@ -19586,7 +19546,9 @@ def _parallel_velocity_limit_pass(*, matrix_free: bool, inkernel: bool, dofs: in
                 SUM(part);
                 const float r_vlim = s_rhs[i] + part;
                 const float diag_vlim = world_diag.data[off_dense + i];
-                if (r_vlim < 0.0f && diag_vlim > 0.0f && lane == 0) s_x[i] += -r_vlim / diag_vlim;
+                // The stateless clamp's correction, pushed onto the row's total.
+                if (diag_vlim > 0.0f && lane == 0)
+                    s_x[i] += ProjectionLaw::velocity_limit_update(0.0f, r_vlim, r_vlim / diag_vlim, 0).v1;
                 WARP_SYNC();
             }
         }
@@ -19621,8 +19583,10 @@ def _parallel_velocity_limit_pass(*, matrix_free: bool, inkernel: bool, dofs: in
                 SUM(part, zz);
                 const float r_vlim = s_rhs[i] + part;
                 const float diag_vlim = {diagonal};
-                if (r_vlim < 0.0f && diag_vlim > 0.0f) {{
-                    const float delta_vlim = -r_vlim / diag_vlim;
+                // The stateless clamp's correction, pushed onto the row's total.
+                const float delta_vlim = diag_vlim > 0.0f
+                    ? ProjectionLaw::velocity_limit_update(0.0f, r_vlim, r_vlim / diag_vlim, 0).v1 : 0.0f;
+                if (delta_vlim != 0.0f) {{
                     if (lane == 0) s_x[i] += delta_vlim;
                     for (int d = lane; d < {dofs}; d += 32) s_dv[d] += {column} * delta_vlim;
                 }}

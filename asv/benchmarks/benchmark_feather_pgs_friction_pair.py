@@ -43,7 +43,7 @@ if __name__ == "__main__":
         parser.error("pairs, samples and launches must be positive")
     sys.path.insert(0, str(args.source.resolve()))
 
-from newton._src.solvers.feather_pgs.friction import friction_pair_candidate
+from newton._src.solvers.feather_pgs.projection_laws import friction_pair
 
 
 @wp.func
@@ -74,7 +74,7 @@ def corrected_pair(
 ):
     i = wp.tid()
     a = blocks[i]
-    out[i] = project(friction_pair_candidate(a[0], a[1], a[2], residuals[i], old[i], 1.0, 1.0), 1.0)
+    out[i] = project(friction_pair(a[0], a[1], a[2], residuals[i], old[i], 1.0, 1.0), 1.0)
 
 
 def reference(block, residual, old):
@@ -171,7 +171,7 @@ def run(args):
                 }
             result["ratio"] = result["corrected"]["median_batch_ms"] / result["old"]["median_batch_ms"]
         results[case] = result
-    source = args.source / "newton/_src/solvers/feather_pgs/friction.py"
+    source = args.source / "newton/_src/solvers/feather_pgs/projection_laws.py"
     report = {
         "device": str(wp.get_device()),
         "device_name": wp.get_device().name,

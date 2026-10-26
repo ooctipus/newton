@@ -7,7 +7,6 @@ import re
 
 from .contact_torsion import torque_sweep_source
 from .device_preludes import RING, cuda_native, lane_group
-from .friction import FRICTION_PAIR
 from .kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
@@ -15,6 +14,8 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_TORSION,
     PGS_LOCAL_SOLVE_OWNER_GENERAL,
 )
+from .law_source import law_preludes
+from .projection_laws import COULOMB_LAW, PROJECTION_LAW
 from .row_metadata import (
     _DENSE_META_ROW_TYPE_BITS,
     _DENSE_META_ROW_TYPE_MASK,
@@ -22,7 +23,7 @@ from .row_metadata import (
     _validate_dense_metadata_encoding,
 )
 from .solve_policy import EXACT_POLICY, SolvePolicy, SolvePolicyUnsupported, sweep_exit, vote
-from .velocity_limit_law import accumulated_update, check_velocity_limit_law
+from .velocity_limit_law import check_velocity_limit_law
 
 
 def get_source(
@@ -124,7 +125,7 @@ def get_source(
         solve_policy,
         "                    iteration_changed = 1;",
         flag="iteration_changed",
-        terms=(("delta_impulse_mf_vlim", "1.0f / mf_diag", str(velocity_limit_type)),),
+        terms=(("speed_row[1]", "1.0f / mf_diag", str(velocity_limit_type)),),
     )
     dense_vote = vote(
         solve_policy,
@@ -294,78 +295,16 @@ def get_source(
 
                         // __DENSE_DESAXCE_BIAS__
 
-                        if (G_nn >= 1.0e-20f) {{
-                            float u_n_at_zero = u_n + G_nn * (0.0f - old_lambda_n);
-                            if (u_n_at_zero >= target_vel_n) {{
-                                new_lambda_n = 0.0f;
-                                new_lambda_t1 = 0.0f;
-                                new_lambda_t2 = 0.0f;
-                            }} else {{
-                                float lo = 0.0f;
-                                float hi = fmaxf(
-                                    old_lambda_n * 2.0f,
-                                    (target_vel_n - u_n) / G_nn + old_lambda_n);
-                                hi = fmaxf(hi, 1.0f);
-
-                                for (int _bi = 0; _bi < 20; _bi++) {{
-                                    float mid = 0.5f * (lo + hi);
-                                    float d_n = mid - old_lambda_n;
-                                    float ut1_eff = u_t1 + G_nt1 * d_n;
-                                    float ut2_eff = u_t2 + G_nt2 * d_n;
-
-                                    float det = G_t1t1 * G_t2t2 - G_t1t2 * G_t1t2;
-                                    float d_t1 = 0.0f, d_t2 = 0.0f;
-                                    if (fabsf(det) > 1.0e-20f) {{
-                                        d_t1 = (-ut1_eff * G_t2t2 + ut2_eff * G_t1t2) / det;
-                                        d_t2 = ( ut1_eff * G_t1t2 - ut2_eff * G_t1t1) / det;
-                                    }}
-
-                                    float trial_t1 = old_lambda_t1 + d_t1;
-                                    float trial_t2 = old_lambda_t2 + d_t2;
-                                    float flimit = mu * mid;
-                                    float tmag = sqrtf(trial_t1 * trial_t1 + trial_t2 * trial_t2);
-                                    if (tmag > flimit && tmag > 1.0e-20f) {{
-                                        float sc = flimit / tmag;
-                                        trial_t1 *= sc;
-                                        trial_t2 *= sc;
-                                    }}
-
-                                    float d_t1_actual = trial_t1 - old_lambda_t1;
-                                    float d_t2_actual = trial_t2 - old_lambda_t2;
-                                    float u_n_trial = u_n + G_nn * d_n
-                                        + G_nt1 * d_t1_actual
-                                        + G_nt2 * d_t2_actual;
-                                    if (u_n_trial < target_vel_n) lo = mid;
-                                    else hi = mid;
-                                }}
-
-                                new_lambda_n = 0.5f * (lo + hi);
-                                float d_n_final = new_lambda_n - old_lambda_n;
-                                float ut1_f = u_t1 + G_nt1 * d_n_final;
-                                float ut2_f = u_t2 + G_nt2 * d_n_final;
-                                float det_f = G_t1t1 * G_t2t2 - G_t1t2 * G_t1t2;
-                                float d_t1_f = 0.0f, d_t2_f = 0.0f;
-                                if (fabsf(det_f) > 1.0e-20f) {{
-                                    d_t1_f = (-ut1_f * G_t2t2 + ut2_f * G_t1t2) / det_f;
-                                    d_t2_f = ( ut1_f * G_t1t2 - ut2_f * G_t1t1) / det_f;
-                                }}
-
-                                new_lambda_t1 = old_lambda_t1 + d_t1_f;
-                                new_lambda_t2 = old_lambda_t2 + d_t2_f;
-                                float flimit_f = mu * new_lambda_n;
-                                float tmag_f = sqrtf(new_lambda_t1 * new_lambda_t1 + new_lambda_t2 * new_lambda_t2);
-                                if (tmag_f > flimit_f && tmag_f > 1.0e-20f) {{
-                                    float sc_f = flimit_f / tmag_f;
-                                    new_lambda_t1 *= sc_f;
-                                    new_lambda_t2 *= sc_f;
-                                }}
-                            }}
-
-                            d_n_total = new_lambda_n - old_lambda_n;
-                            d_t2_total = new_lambda_t2 - old_lambda_t2;
-                            s_lam_dense[parent_idx] = new_lambda_n;
-                            s_lam_dense[i_t2] = new_lambda_t2;
-                        }}
+                        const wp::vec3 lambda = CoulombLaw::coulomb_bisection(
+                            wp::mat33(G_nn, G_nt1, G_nt2, G_nt1, G_t1t1, G_t1t2, G_nt2, G_t1t2, G_t2t2),
+                            wp::vec3(u_n, u_t1, u_t2), wp::vec3(old_lambda_n, old_lambda_t1, old_lambda_t2), mu, target_vel_n);
+                        new_lambda_n = lambda[0];
+                        new_lambda_t1 = lambda[1];
+                        new_lambda_t2 = lambda[2];
+                        d_n_total = new_lambda_n - old_lambda_n;
+                        d_t2_total = new_lambda_t2 - old_lambda_t2;
+                        s_lam_dense[parent_idx] = new_lambda_n;
+                        s_lam_dense[i_t2] = new_lambda_t2;
                     }}
 
                     SYNC();
@@ -412,24 +351,24 @@ def get_source(
                         [&](int patch_row) {{ return ((s_meta_dense[patch_row] >> __DENSE_META_ROW_TYPE_BITS__) - 1); }},
                         [&](int patch_row) {{ return s_lam_dense[patch_row]; }});
                     float radius = fmaxf(s_mu_dense[i] * lambda_n, 0.0f);
-                    float sibling_residual = 0.0f;
-                    {dense_sibling_dot_code}
-                    SUM(sibling_residual);
-                    sibling_residual += s_rhs_dense[sib];
-                    float cross = 0.0f;
-                    {dense_tangent_cross_code}
-                    SUM(cross);
                     const float sibling_impulse = s_lam_dense[sib];
-                    float2 pair = friction_pair_candidate(denom, cross, s_diag_dense[sib],
-                        residual, sibling_residual, old_impulse, sibling_impulse, radius, omega);
-                    float a = pair.x;
-                    float b = pair.y;
-                    float mag = sqrtf(a * a + b * b);
-                    float scale = mag > radius ? radius / mag : 1.0f;
-                    new_impulse = a * scale;
-                    float sib_delta = b * scale - sibling_impulse;
+                    wp::vec2 pair(0.0f);
+                    // Zero load gives a zero disk; avoid unused tangent reductions.
+                    if (radius > 0.0f) {{
+                        float sibling_residual = 0.0f;
+                        {dense_sibling_dot_code}
+                        SUM(sibling_residual);
+                        sibling_residual += s_rhs_dense[sib];
+                        float cross = 0.0f;
+                        {dense_tangent_cross_code}
+                        SUM(cross);
+                        pair = ProjectionLaw::disk(ProjectionLaw::friction_pair(denom, cross, s_diag_dense[sib],
+                            wp::vec2(residual, sibling_residual), wp::vec2(old_impulse, sibling_impulse), radius, omega), radius);
+                    }}
+                    new_impulse = pair[0];
+                    float sib_delta = pair[1] - sibling_impulse;
                     SYNC();
-                    if (lane == 0) s_lam_dense[sib] = b * scale;
+                    if (lane == 0) s_lam_dense[sib] = pair[1];
                     SYNC();
 {dense_sibling_vote}
                     {dense_sib_v_code}
@@ -448,14 +387,13 @@ def get_source(
     # ``friction_mode="current"`` solves the tangent block on its friction
     # disk at fixed normal load (matches :func:`friction_step_current`).
     # ``friction_mode="bisection"`` runs the RAISim bisection on λ_n
-    # (matches :func:`friction_step_bisection`).
+    # (``CoulombLaw::coulomb_bisection``, as :func:`friction_step_coulomb`).
     # ``friction_mode="bisection_desaxce"`` runs the same bisection
     # with the de Saxce max-dissipation bias (``μ · ‖c_T‖`` added to
     # the normal target velocity) — FPGS Friction Modes 6/13.
     # ``friction_mode="coulomb_newton"`` runs Gilles Daviet's scalar
-    # bracketed-Newton on alpha (matches
-    # :func:`friction_step_coulomb_newton`) — FPGS Friction Modes
-    # 7/13.  We inject one of these CUDA blocks into the MF phase;
+    # bracketed-Newton on alpha (``CoulombLaw::coulomb_newton``) — FPGS
+    # Friction Modes 7/13.  We inject one of these CUDA blocks into the MF phase;
     # the outer row loop handles the standard ``delta_impulse``
     # accounting for the first-friction row (and t2's delta
     # collapses to zero because ``s_lam_mf[i_t2]`` is pre-written
@@ -565,80 +503,16 @@ def get_source(
                             }
                         }
 
-                        if (G_nn >= 1.0e-20f) {
-                            // Check separating contact (λ_n = 0 solves it)
-                            float u_n_at_zero = u_n + G_nn * (0.0f - old_lambda_n);
-                            if (u_n_at_zero >= target_vel_n) {
-                                new_lambda_n = 0.0f;
-                                new_lambda_t1 = 0.0f;
-                                new_lambda_t2 = 0.0f;
-                            } else {
-                                float lo = 0.0f;
-                                float hi = fmaxf(
-                                    old_lambda_n * 2.0f,
-                                    (target_vel_n - u_n) / G_nn + old_lambda_n);
-                                hi = fmaxf(hi, 1.0f);
-
-                                for (int _bi = 0; _bi < 20; _bi++) {
-                                    float mid = 0.5f * (lo + hi);
-                                    float d_n = mid - old_lambda_n;
-                                    float ut1_eff = u_t1 + G_nt1 * d_n;
-                                    float ut2_eff = u_t2 + G_nt2 * d_n;
-
-                                    float det = G_t1t1 * G_t2t2 - G_t1t2 * G_t1t2;
-                                    float d_t1 = 0.0f, d_t2 = 0.0f;
-                                    if (fabsf(det) > 1.0e-20f) {
-                                        d_t1 = (-ut1_eff * G_t2t2 + ut2_eff * G_t1t2) / det;
-                                        d_t2 = ( ut1_eff * G_t1t2 - ut2_eff * G_t1t1) / det;
-                                    }
-                                    float trial_t1 = old_lambda_t1 + d_t1;
-                                    float trial_t2 = old_lambda_t2 + d_t2;
-
-                                    float flimit = mu * mid;
-                                    float tmag = sqrtf(
-                                        trial_t1 * trial_t1 + trial_t2 * trial_t2);
-                                    if (tmag > flimit && tmag > 1.0e-20f) {
-                                        float sc = flimit / tmag;
-                                        trial_t1 *= sc;
-                                        trial_t2 *= sc;
-                                    }
-                                    float d_t1_actual = trial_t1 - old_lambda_t1;
-                                    float d_t2_actual = trial_t2 - old_lambda_t2;
-                                    float u_n_trial = u_n + G_nn * d_n
-                                        + G_nt1 * d_t1_actual
-                                        + G_nt2 * d_t2_actual;
-                                    if (u_n_trial < target_vel_n) lo = mid;
-                                    else hi = mid;
-                                }
-                                new_lambda_n = 0.5f * (lo + hi);
-
-                                float d_n_final = new_lambda_n - old_lambda_n;
-                                float ut1_f = u_t1 + G_nt1 * d_n_final;
-                                float ut2_f = u_t2 + G_nt2 * d_n_final;
-                                float det_f = G_t1t1 * G_t2t2 - G_t1t2 * G_t1t2;
-                                float d_t1_f = 0.0f, d_t2_f = 0.0f;
-                                if (fabsf(det_f) > 1.0e-20f) {
-                                    d_t1_f = (-ut1_f * G_t2t2 + ut2_f * G_t1t2) / det_f;
-                                    d_t2_f = ( ut1_f * G_t1t2 - ut2_f * G_t1t1) / det_f;
-                                }
-                                new_lambda_t1 = old_lambda_t1 + d_t1_f;
-                                new_lambda_t2 = old_lambda_t2 + d_t2_f;
-
-                                float flimit_f = mu * new_lambda_n;
-                                float tmag_f = sqrtf(
-                                    new_lambda_t1 * new_lambda_t1
-                                    + new_lambda_t2 * new_lambda_t2);
-                                if (tmag_f > flimit_f && tmag_f > 1.0e-20f) {
-                                    float sc_f = flimit_f / tmag_f;
-                                    new_lambda_t1 *= sc_f;
-                                    new_lambda_t2 *= sc_f;
-                                }
-                            }
-                            d_n_total = new_lambda_n - old_lambda_n;
-                            d_t2_total = new_lambda_t2 - old_lambda_t2;
-                            s_lam_mf[mf_par] = new_lambda_n;
-                            s_lam_mf[i_t2]   = new_lambda_t2;
-                        }
+                        const wp::vec3 lambda = CoulombLaw::coulomb_bisection(
+                            wp::mat33(G_nn, G_nt1, G_nt2, G_nt1, G_t1t1, G_t1t2, G_nt2, G_t1t2, G_t2t2),
+                            wp::vec3(u_n, u_t1, u_t2), wp::vec3(old_lambda_n, old_lambda_t1, old_lambda_t2), mu, target_vel_n);
+                        new_lambda_n = lambda[0];
+                        new_lambda_t1 = lambda[1];
+                        new_lambda_t2 = lambda[2];
+                        d_n_total = new_lambda_n - old_lambda_n;
+                        d_t2_total = new_lambda_t2 - old_lambda_t2;
+                        s_lam_mf[mf_par] = new_lambda_n;
+                        s_lam_mf[i_t2] = new_lambda_t2;
                     }
 
                     SYNC();
@@ -683,10 +557,7 @@ def get_source(
             )
             mf_friction_block = mf_friction_block.replace(
                 "// __DESAXCE_BIAS__",
-                "{\n"
-                "                                float c_T_mag = sqrtf(u_t1 * u_t1 + u_t2 * u_t2);\n"
-                "                                target_vel_n = target_vel_n + mu * c_T_mag;\n"
-                "                            }",
+                "target_vel_n = CoulombLaw::de_saxce_target(target_vel_n, wp::vec3(u_n, u_t1, u_t2), mu);",
             )
         else:
             mf_friction_block = mf_friction_block.replace(
@@ -699,18 +570,16 @@ def get_source(
                 '// (no de Saxce bias; friction_mode="bisection".)',
             )
     elif friction_mode == "coulomb_newton":
-        # Gilles Daviet's 1D Coulomb Newton (7/13).  CUDA port of
-        # :func:`friction_step_coulomb_newton`; mirrors the
+        # Gilles Daviet's 1D Coulomb Newton (7/13), as
+        # :func:`friction_step_coulomb` runs it; mirrors the
         # bisection block's structure — lane 0 runs the serial
         # scalar Newton, then broadcasts (new_t1, d_n, d_t2) to
         # every lane via ``READ`` so the v_out deltas for
         # the normal / t2 rows are applied cooperatively.
         mf_friction_block = """
                 // friction_mode="coulomb_newton": Gilles Daviet's
-                // scalar bracketed-Newton on alpha.  Ported from
-                // ``coulomb_root_finding_warp.py::solve_coulomb`` —
-                // see :func:`friction_step_coulomb_newton` for the
-                // matrix-free row-data mapping.
+                // scalar bracketed-Newton on alpha (CoulombLaw::coulomb_newton;
+                // friction_step_coulomb documents the matrix-free row data).
                 int mf_par = packed_tp >> 16;
                 int i_t1 = mf_par + 1;
                 int i_t2 = mf_par + 2;
@@ -797,134 +666,16 @@ def get_source(
                             }
                         }
 
-                        if (G_nn >= 1.0e-20f) {
-                            // u_free = u_current - G * lambda_old
-                            float u_free_n = u_n - (G_nn * old_lambda_n
-                                + G_nt1 * old_lambda_t1
-                                + G_nt2 * old_lambda_t2);
-                            float u_free_t1 = u_t1 - (G_nt1 * old_lambda_n
-                                + G_t1t1 * old_lambda_t1
-                                + G_t1t2 * old_lambda_t2);
-                            float u_free_t2 = u_t2 - (G_nt2 * old_lambda_n
-                                + G_t1t2 * old_lambda_t1
-                                + G_t2t2 * old_lambda_t2);
-
-                            if (u_free_n < target_vel_n) {
-                                // Reference b vector shifted into the
-                                // positive-target frame (b_N < 0 on
-                                // penetrating contacts).
-                                float bN = u_free_n - target_vel_n;
-                                float bT0 = u_free_t1;
-                                float bT1 = u_free_t2;
-
-                                float WN = G_nn;
-                                float wNT0 = G_nt1;
-                                float wNT1 = G_nt2;
-                                // A_T = W_T - wNT wNT^T / WN.
-                                float AT00 = G_t1t1 - (wNT0 * wNT0) / WN;
-                                float AT01 = G_t1t2 - (wNT0 * wNT1) / WN;
-                                float AT10 = G_t1t2 - (wNT1 * wNT0) / WN;
-                                float AT11 = G_t2t2 - (wNT1 * wNT1) / WN;
-                                // c_T = bT - (bN / WN) * wNT.
-                                float cT0 = bT0 - (bN / WN) * wNT0;
-                                float cT1 = bT1 - (bN / WN) * wNT1;
-
-                                // Sticking check at alpha = 0.
-                                float inv_det0 = 1.0f /
-                                    (AT00 * AT11 - AT01 * AT10);
-                                float s0_0 = (AT11 * cT0 - AT01 * cT1) * inv_det0;
-                                float s0_1 = (AT00 * cT1 - AT10 * cT0) * inv_det0;
-                                float norm_s0 = sqrtf(s0_0 * s0_0 + s0_1 * s0_1);
-                                float phi0 = norm_s0 - mu *
-                                    (wNT0 * s0_0 + wNT1 * s0_1 - bN) / WN;
-
-                                float last_s0 = 0.0f, last_s1 = 0.0f;
-                                float alpha = 0.0f;
-
-                                if (phi0 <= 0.0f) {
-                                    // Sticking: alpha = 0, s = s0.
-                                    last_s0 = s0_0;
-                                    last_s1 = s0_1;
-                                    alpha = 0.0f;
-                                } else {
-                                    // Bracket: double hi until phi(hi) < 0.
-                                    float hi = 1.0f;
-                                    for (int _e = 0; _e < 30; _e++) {
-                                        float a_hi = AT00 + hi;
-                                        float d_hi = AT11 + hi;
-                                        float idet_hi = 1.0f /
-                                            (a_hi * d_hi - AT01 * AT10);
-                                        float sh0 = (d_hi * cT0 - AT01 * cT1) * idet_hi;
-                                        float sh1 = (a_hi * cT1 - AT10 * cT0) * idet_hi;
-                                        float ns_hi = sqrtf(sh0 * sh0 + sh1 * sh1);
-                                        float phi_hi = ns_hi - mu *
-                                            (wNT0 * sh0 + wNT1 * sh1 - bN) / WN;
-                                        if (phi_hi < 0.0f) break;
-                                        hi *= 2.0f;
-                                    }
-
-                                    float lo = 0.0f;
-                                    float x = 0.5f * (lo + hi);
-                                    float tol = 1.0e-6f + 1.0e-6f * phi0;
-
-                                    for (int _it = 0; _it < 50; _it++) {
-                                        float ax = AT00 + x;
-                                        float dx = AT11 + x;
-                                        float idet = 1.0f /
-                                            (ax * dx - AT01 * AT10);
-                                        float s0 = (dx * cT0 - AT01 * cT1) * idet;
-                                        float s1 = (ax * cT1 - AT10 * cT0) * idet;
-                                        float t0 = (dx * s0 - AT01 * s1) * idet;
-                                        float t1 = (ax * s1 - AT10 * s0) * idet;
-                                        float ns = sqrtf(s0 * s0 + s1 * s1);
-                                        float fx = ns - mu *
-                                            (wNT0 * s0 + wNT1 * s1 - bN) / WN;
-                                        float dfx = -(s0 * t0 + s1 * t1) / ns
-                                            + mu * (wNT0 * t0 + wNT1 * t1) / WN;
-
-                                        last_s0 = s0;
-                                        last_s1 = s1;
-
-                                        if (fabsf(fx) < tol
-                                            || fabsf(hi - lo) < 1.0e-6f * (1.0f + hi)) {
-                                            alpha = x;
-                                            break;
-                                        }
-
-                                        if (fx > 0.0f) lo = x;
-                                        else hi = x;
-
-                                        float x_new = 0.5f * (lo + hi);
-                                        if (dfx != 0.0f) {
-                                            float x_newton = x - fx / dfx;
-                                            if (x_newton > lo && x_newton < hi) {
-                                                x_new = x_newton;
-                                            }
-                                        }
-                                        x = x_new;
-                                        alpha = x;
-                                    }
-                                }
-
-                                // Recover r_T, r_N from the last s.
-                                float rT0 = -last_s0;
-                                float rT1 = -last_s1;
-                                float rN = -(wNT0 * rT0 + wNT1 * rT1 + bN) / WN;
-                                new_lambda_n = rN;
-                                new_lambda_t1 = rT0;
-                                new_lambda_t2 = rT1;
-                            } else {
-                                // Separating contact: zero impulse.
-                                new_lambda_n = 0.0f;
-                                new_lambda_t1 = 0.0f;
-                                new_lambda_t2 = 0.0f;
-                            }
-
-                            d_n_total = new_lambda_n - old_lambda_n;
-                            d_t2_total = new_lambda_t2 - old_lambda_t2;
-                            s_lam_mf[mf_par] = new_lambda_n;
-                            s_lam_mf[i_t2]   = new_lambda_t2;
-                        }
+                        const wp::vec3 lambda = CoulombLaw::coulomb_newton(
+                            wp::mat33(G_nn, G_nt1, G_nt2, G_nt1, G_t1t1, G_t1t2, G_nt2, G_t1t2, G_t2t2),
+                            wp::vec3(u_n, u_t1, u_t2), wp::vec3(old_lambda_n, old_lambda_t1, old_lambda_t2), mu, target_vel_n);
+                        new_lambda_n = lambda[0];
+                        new_lambda_t1 = lambda[1];
+                        new_lambda_t2 = lambda[2];
+                        d_n_total = new_lambda_n - old_lambda_n;
+                        d_t2_total = new_lambda_t2 - old_lambda_t2;
+                        s_lam_mf[mf_par] = new_lambda_n;
+                        s_lam_mf[i_t2] = new_lambda_t2;
                     }
 
                     SYNC();
@@ -968,7 +719,7 @@ def get_source(
                     int sib = mf_par + 2;
                     int sib_mf6 = mf6_base + sib * 6;
                     float radius = mf_friction_radius;
-                    float2 pair = make_float2(0.0f, 0.0f);
+                    wp::vec2 pair(0.0f);
                     // Zero load gives a zero disk; avoid unused tangent reductions.
                     if (radius > 0.0f) {{
                         float sibling_residual = 0.0f;
@@ -985,16 +736,13 @@ def get_source(
                         if (lane >= 6 && lane < 12 && dof_b >= 0)
                             cross = mf_J_b.data[mf6_base + i * 6 + lane - 6] * mf_MiJt_b.data[sib_mf6 + lane - 6];
                         SUM(cross);
-                        pair = friction_pair_candidate(mf_diag > 0.0f ? 1.0f / mf_diag : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
-                            residual, sibling_residual, old_impulse, s_lam_mf[sib], radius, omega);
+                        pair = ProjectionLaw::friction_pair(mf_diag > 0.0f ? 1.0f / mf_diag : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
+                            wp::vec2(residual, sibling_residual), wp::vec2(old_impulse, s_lam_mf[sib]), radius, omega);
                     }}
-                    float a = pair.x;
-                    float b = pair.y;
-                    float mag = sqrtf(a * a + b * b);
-                    float scale = mag > radius ? radius / mag : 1.0f;
-                    new_impulse = a * scale;
-                    float sib_delta = b * scale - s_lam_mf[sib];
-                    s_lam_mf[sib] = b * scale;
+                    pair = ProjectionLaw::disk(pair, radius);
+                    new_impulse = pair[0];
+                    float sib_delta = pair[1] - s_lam_mf[sib];
+                    s_lam_mf[sib] = pair[1];
 {mf_sibling_vote}
                     if (lane < 6 && dof_a >= 0)
                         s_v[dof_a + lane] += mf_MiJt_a.data[sib_mf6 + lane] * sib_delta;
@@ -1047,12 +795,8 @@ def get_source(
     drive_projection = (
         """
             if (row_type == 1) {
-                new_impulse = old_impulse * s_drive_imp_mul_dense[i]
-                    + jv * s_drive_vel_mul_dense[i]
-                    + s_drive_target_dense[i];
-                float max_imp = s_drive_max_imp_dense[i];
-                if (new_impulse > max_imp) new_impulse = max_imp;
-                if (new_impulse < -max_imp) new_impulse = -max_imp;
+                new_impulse = ProjectionLaw::physx_drive(old_impulse, jv, s_drive_imp_mul_dense[i],
+                    s_drive_vel_mul_dense[i], s_drive_target_dense[i], s_drive_max_imp_dense[i]);
                 delta_impulse = new_impulse - old_impulse;
             }"""
         if has_drive_rows
@@ -1062,72 +806,43 @@ def get_source(
             }"""
     )
     # Every visit of a velocity-limit row: the end-of-iteration dense and free-body passes and the
-    # dense rows of a velocity-limit row phase (row_phase 5). A free body's velocity-limit row is a
-    # speed row: its residual is the limit minus the speed of the velocity it bounds.
+    # dense rows of a velocity-limit row phase (row_phase 5), under the law projection_laws.velocity_limit_update
+    # names (stateless: the correction of the current overshoot; accumulated: a unilateral total). A free
+    # body's velocity-limit row is a speed row (projection_laws.speed_row): its residual is the limit minus
+    # the speed of the velocity it bounds, and its correction acts along that velocity.
+    law = int(accumulated_limits)
     if accumulated_limits:
-        # Lane 0 owns a dense total, as it owns the scalar dense rows' impulses.
-        dense_velocity_limit_law = (
-            "                const float old_vlim = READ(lane == 0 ? s_lam_dense[i] : 0.0f, 0);\n"
-            + accumulated_update(
-                "old_vlim",
-                "residual_vlim / denom",
-                new="new_vlim",
-                delta="delta_impulse_vlim",
-                indent=" " * 16,
-                declare="float ",
-            )
-            + "                SYNC();\n"
-            + "                if (lane == 0) s_lam_dense[i] = new_vlim;"
-        )
-        # Every lane reads a free-body total before lane 0 stores the new one: a plain read stays
-        # warp-uniform when streamed impulses rewrite it into a lane-0 broadcast.
-        mf_velocity_limit_law = (
-            "                const float old_mf_vlim = s_lam_mf[i];\n"
-            + accumulated_update(
-                "old_mf_vlim",
-                "residual_mf_vlim * mf_diag",
-                new="new_mf_vlim",
-                delta="delta_impulse_mf_vlim",
-                indent=" " * 16,
-                declare="float ",
-            )
-            + "                SYNC();\n"
-            + "                if (lane == 0) s_lam_mf[i] = new_mf_vlim;"
-        )
-        dense_velocity_limit_row = (
-            "            // row_type 4=JOINT_VELOCITY_LIMIT: an accumulated unilateral row,\n"
-            "            // unrelaxed, as in the end-of-iteration velocity-limit pass.\n"
-            "            else if (row_type == 4) {\n"
-            + accumulated_update(
-                "old_impulse", "residual / denom", new="new_impulse", delta="delta_impulse", indent=" " * 16
-            )
-            + "            }"
-        )
+        # Lane 0 owns a dense total, as it owns the scalar dense rows' impulses. Every lane reads a free-body
+        # total before lane 0 stores the new one: a plain read stays warp-uniform when streamed impulses
+        # rewrite it into a lane-0 broadcast.
+        dense_old_vlim, mf_old_vlim = "old_vlim", "old_mf_vlim"
+        dense_total = "                const float old_vlim = READ(lane == 0 ? s_lam_dense[i] : 0.0f, 0);\n"
+        mf_total = "                const float old_mf_vlim = s_lam_mf[i];\n"
+        total_fence = "                SYNC();\n"
     else:
-        dense_velocity_limit_law = """                float delta_vlim = -residual_vlim / denom;
-                float delta_impulse_vlim = 0.0f;
-                if (residual_vlim < 0.0f) delta_impulse_vlim = delta_vlim;
-                if (lane == 0) s_lam_dense[i] = delta_impulse_vlim;"""
-        mf_velocity_limit_law = """                float delta_mf_vlim = -residual_mf_vlim * mf_diag;
-                float delta_impulse_mf_vlim = 0.0f;
-                if (residual_mf_vlim < 0.0f) delta_impulse_mf_vlim = delta_mf_vlim;
-                if (lane == 0) s_lam_mf[i] = delta_impulse_mf_vlim;"""
-        dense_velocity_limit_row = """            // row_type 4=JOINT_VELOCITY_LIMIT:
-            // PhysX-style stateless bilateral speed projection. The row
-            // uses a signed Jacobian and target velocity so residual < 0
-            // means that side of the velocity box is currently violated.
-            // Do not accumulate lambda: each visit recomputes jointV and
-            // applies only the impulse needed for the current overshoot.
-            else if (row_type == 4) {
-                if (residual < 0.0f) {
-                    // PhysX applies the clamp delta directly; it is not
-                    // a relaxed PGS correction.
-                    delta_impulse = delta;
-                    new_impulse = delta_impulse;
-                } else {
-                    new_impulse = 0.0f;
-                }
-            }"""
+        # The stateless law stores the correction, not a total: it never reads the old one.
+        dense_old_vlim = mf_old_vlim = "0.0f"
+        dense_total = mf_total = total_fence = ""
+    dense_velocity_limit_law = (
+        f"{dense_total}"
+        f"                const auto vlim = ProjectionLaw::velocity_limit_update({dense_old_vlim}, residual_vlim, residual_vlim / denom, {law});\n"
+        "                const float delta_impulse_vlim = vlim.v1;\n"
+        f"{total_fence}"
+        "                if (lane == 0) s_lam_dense[i] = vlim.v0;"
+    )
+    mf_velocity_limit_law = (
+        f"{mf_total}"
+        f"                const wp::vec3 speed_row = ProjectionLaw::speed_row(speed_mf_vlim, __int_as_float(meta.z), mf_diag, {mf_old_vlim}, {law});\n"
+        f"{total_fence}"
+        "                if (lane == 0) s_lam_mf[i] = speed_row[0];"
+    )
+    dense_velocity_limit_row = f"""            // row_type 4=JOINT_VELOCITY_LIMIT: a signed Jacobian and target velocity, so residual < 0
+            // means that side of the velocity box is violated; the unrelaxed velocity-limit law.
+            else if (row_type == 4) {{
+                const auto vlim = ProjectionLaw::velocity_limit_update(old_impulse, residual, residual / denom, {law});
+                new_impulse = vlim.v0;
+                delta_impulse = vlim.v1;
+            }}"""
     dense_velocity_limit_phase = (
         f"""
         if (row_phase == 0 || row_phase == 2) {{
@@ -1187,7 +902,7 @@ def get_source(
                 float jv_fvl = my_sum_fvl;
 
                 if (fabsf(jv_fvl) > qdot_max_fvl) {{
-                    float delta_fvl = (fminf(fmaxf(jv_fvl, -qdot_max_fvl), qdot_max_fvl) - jv_fvl) / denom_fvl;
+                    const float delta_fvl = ProjectionLaw::velocity_clamp_impulse(jv_fvl, qdot_max_fvl, denom_fvl);
 {drive_limit_vote}
                     for (int d = lane; d < {D}; d += 32) {{
                         s_v[d] += {dense_read("Y_world", "row_base_fvl + d")} * delta_fvl;
@@ -1280,7 +995,7 @@ def get_source(
 
             if ((row_phase == 1 || row_phase == 4) && mf_rt != 0 && mf_rt != 2) continue;
             if (row_phase == 0 && mf_rt == 4) continue;
-            if (mf_rt == 2 && global_iter < friction_start_iteration) {{
+            if (ProjectionLaw::friction_gate(mf_rt, global_iter, friction_start_iteration)) {{
                 s_lam_mf[i] = 0.0f;
                 SYNC();
                 continue;
@@ -1305,16 +1020,13 @@ def get_source(
             float residual = jv + __int_as_float(meta.z);
             float old_impulse = s_lam_mf[i];
             float delta = -residual * mf_diag;
-            if (mf_rt == 0) {{
-                // Relative diagonal regularization (residual + divisor): makes
-                // indeterminate normal-force splits unique. Identity at g = 0.
-                float w = regularize ? mf_row_w.data[off_mf + i] : 1.0f;
-                delta = -residual * mf_diag * w - (1.0f - w) * old_impulse;
-            }}
-            float new_impulse = old_impulse + omega * delta;
+            // A contact row's regularization weight makes indeterminate normal-force splits unique.
+            if (mf_rt == 0 && regularize)
+                delta = ProjectionLaw::regularized_delta(delta, mf_row_w.data[off_mf + i], old_impulse);
+            float new_impulse = ProjectionLaw::relaxed_step(old_impulse, delta, omega);
 
             if (mf_rt == 0) {{
-                if (new_impulse < 0.0f) new_impulse = 0.0f;
+                new_impulse = ProjectionLaw::unilateral(new_impulse);
             }} else if (mf_rt == 2) {{
                 {mf_friction_block}
             }}
@@ -1365,14 +1077,13 @@ def get_source(
                 // In lane order, (s0 + s1) + s2: not the group's widest-first SUM.
                 const float speed_mf_vlim = sqrtf((READ(speed_sq, 0) + READ(speed_sq, 1)) + READ(speed_sq, 2));
 
-                float residual_mf_vlim = __int_as_float(meta.z) - speed_mf_vlim;
 {mf_velocity_limit_law}
 
-                if (delta_impulse_mf_vlim != 0.0f && speed_mf_vlim > 0.0f) {{
+                if (speed_row[2] != 0.0f) {{
 {mf_limit_vote}
                     // The correction acts along the velocity: it removes the overshoot, keeping the direction.
                     if (lane < 3) {{
-                        s_v[speed_dof + lane] -= (delta_impulse_mf_vlim / mf_diag) * speed_component / speed_mf_vlim;
+                        s_v[speed_dof + lane] += speed_row[2] * speed_component;
                     }}
                 }}
                 SYNC();
@@ -1516,7 +1227,7 @@ def get_source(
             if (row_phase == 5 && row_type != 4) continue;
             if ((row_phase == 0 || row_phase == 2 || row_phase == 6) && row_type == 4) continue;
             if (freeze_drive_rows != 0 && row_type == 1) continue;
-            if (row_type == 2 && global_iter < friction_start_iteration) {{
+            if (ProjectionLaw::friction_gate(row_type, global_iter, friction_start_iteration)) {{
                 {dense_impulse_store}s_lam_dense[i] = 0.0f;
                 SYNC();
                 continue;
@@ -1533,10 +1244,11 @@ def get_source(
             float jv = my_sum;
 
             float old_impulse = {dense_old_impulse};
-            float w = regularize ? world_row_w.data[off_dense + i] : 1.0f;
             float residual = jv + s_rhs_dense[i];
-            float delta = denom > 0.0f ? -residual / denom * w - (1.0f - w) * old_impulse : 0.0f;
-            float new_impulse = old_impulse + omega * delta;
+            float delta = denom > 0.0f ? -residual / denom : 0.0f;
+            if (regularize && denom > 0.0f)
+                delta = ProjectionLaw::regularized_delta(delta, world_row_w.data[off_dense + i], old_impulse);
+            float new_impulse = ProjectionLaw::relaxed_step(old_impulse, delta, omega);
             float delta_impulse = 0.0f;
 
             // row_type 1=JOINT_TARGET: PhysX PGS force-drive row.
@@ -1547,7 +1259,7 @@ def get_source(
             // row_type 0=CONTACT, 3=JOINT_LIMIT: unilateral lambda >= 0
             // projector with accumulated impulse.
             else if (row_type == 0 || row_type == 3) {{
-                if (new_impulse < 0.0f) new_impulse = 0.0f;
+                new_impulse = ProjectionLaw::unilateral(new_impulse);
                 delta_impulse = new_impulse - old_impulse;
             }} else if (row_type == 2) {{
                 {dense_friction_block}
@@ -1723,5 +1435,7 @@ def get_source(
     # array — a (1, 1) dummy when the fused clamp is off — and
     # fuse_vel_limits only gates the clamp code emission above.
 
-    snippet = cuda_native(snippet, preludes=(lane_group(32), RING, FRICTION_PAIR, *solve_policy.preludes))
+    # The research friction modes' Coulomb laws compile only into the sweeps that run them.
+    laws = law_preludes(PROJECTION_LAW, *((COULOMB_LAW,) if friction_mode != "current" else ()))
+    snippet = cuda_native(snippet, preludes=(lane_group(32), RING, *laws, *solve_policy.preludes))
     return snippet

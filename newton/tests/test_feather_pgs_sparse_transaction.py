@@ -376,9 +376,8 @@ class TestSingleStageTransaction(unittest.TestCase):
                 self.assertEqual(transaction.count("SUM("), 1)
                 self.assertIn("SUM(normal_dot, tangent_dot, sibling_dot);", transaction)
                 self.assertNotIn("__shfl", transaction)
-                self.assertIn(
-                    "friction_pair_from_metric(metric, tangent_residual + coupling.x * normal_change", transaction
-                )
+                self.assertIn("ProjectionLaw::friction_pair_from_metric(tangent_scale, basis.x, basis.y,", transaction)
+                self.assertIn("wp::vec2(tangent_residual + coupling.x * normal_change,", transaction)
                 self.assertIn("normal_residual * coupling.w", transaction)
                 self.assertEqual("normal_parent < 0" in transaction, not linked)
                 # Linked visits pool listed members and walk only rings longer than four members.

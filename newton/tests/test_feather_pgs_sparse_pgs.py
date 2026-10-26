@@ -9,12 +9,12 @@ from itertools import product
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs.friction import friction_pair_candidate
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
 )
+from newton._src.solvers.feather_pgs.projection_laws import friction_pair
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
 from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel
 
@@ -92,7 +92,7 @@ def _sweep(
                     load += impulses[next_row]
                     next_row = parents[next_row]
                 radius = max(mu[row] * load, 0.0)
-                pair = friction_pair_candidate(
+                pair = friction_pair(
                     float(diagonal[row]),
                     float(jacobian[row] @ response[sibling]),
                     float(diagonal[sibling]),

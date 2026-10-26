@@ -465,10 +465,10 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                 start = snippet.index("const float sibling_impulse = s_lam_dense[sib];")
                 end = snippet.index("if (sib_delta != 0.0f) iteration_changed = 1;", start)
                 owner = snippet[start:end]
-                self.assertIn("friction_pair_candidate(denom, cross, s_diag_dense[sib]", owner)
-                self.assertIn("float sib_delta = b * scale - sibling_impulse;", owner)
+                self.assertIn("ProjectionLaw::friction_pair(denom, cross, s_diag_dense[sib]", owner)
+                self.assertIn("float sib_delta = pair[1] - sibling_impulse;", owner)
                 self.assertIn(
-                    "SYNC();\n                    if (lane == 0) s_lam_dense[sib] = b * scale;\n"
+                    "SYNC();\n                    if (lane == 0) s_lam_dense[sib] = pair[1];\n"
                     "                    SYNC();",
                     owner,
                 )

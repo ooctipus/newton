@@ -87,12 +87,9 @@ class TestLawSource(unittest.TestCase):
             self.assertIn(law_source.law_signature(law).name, str(raised.exception))
 
     def test_constants_are_the_replaced_codes(self):
-        """Keep the row kinds, slops and iteration counts of the kernels the laws replace."""
+        """Keep the row kinds of the kernels' row types."""
         for name in ("CONTACT", "JOINT_TARGET", "FRICTION", "JOINT_LIMIT", "JOINT_VELOCITY_LIMIT", "MIMIC", "CONNECT"):
             self.assertEqual(getattr(row_laws, f"ROW_{name}"), getattr(kernels, f"PGS_CONSTRAINT_TYPE_{name}"))
-        self.assertEqual(projection_laws.COULOMB_BISECTION_STEPS, kernels._FPGS_BISECTION_ITERS)
-        self.assertEqual(projection_laws.COULOMB_NEWTON_EXPANSIONS, kernels._FPGS_COULOMB_NEWTON_EXPAND_ITERS)
-        self.assertEqual(projection_laws.COULOMB_NEWTON_STEPS, kernels._FPGS_COULOMB_NEWTON_NEWTON_ITERS)
 
     def test_cuda_renderings_compile(self):
         """Compile the three families' CUDA renderings through NVRTC, without a device (sm_80)."""

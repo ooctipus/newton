@@ -9,18 +9,18 @@ from functools import cache
 import warp as wp
 
 from .device_preludes import RING, cuda_native, lane_group
-from .friction import FRICTION_PAIR, FRICTION_PAIR_CACHED
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
+from .projection_laws import PROJECTION_LAW
 from .row_inputs import RowArgument, make_row_kernel
 from .solve_policy import EXACT_POLICY, SolvePolicy, sweep_exit, vote
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport
-from .velocity_limit_law import accumulated_update, check_velocity_limit_law
+from .velocity_limit_law import check_velocity_limit_law
 
 _SPARSE_CONTACT_METRIC_CACHE_SIZE = 12
 _SPARSE_LOCAL_WORKSPACE_BYTES = 8 * 1024
@@ -272,7 +272,7 @@ def _get_pgs_solve_sparse_kernel(
                         const float residual = dot + rhs[row];
                         selected = residual < 0.0f || !isfinite(residual);
                     }}
-                }} else if (select_active && global_iteration < friction_start_iteration) {{
+                }} else if (select_active && ProjectionLaw::friction_gate(kind, global_iteration, friction_start_iteration)) {{
                     // The active list visits only first tangents; clear both delayed rows here.
                     impulse[row] = 0.0f;
                 }}
@@ -375,24 +375,20 @@ def _get_pgs_solve_sparse_kernel(
             if (row_type == {velocity_limit_type}) continue;
 """
         if accumulated_limits:
+            # An accumulated total: its change applies to the delta.
             final_velocity_limit = (
-                "            // An accumulated total: its change applies to the delta.\n"
-                "            const float old_vlim = impulse[row];\n"
-                + accumulated_update(
-                    "old_vlim",
-                    "residual / denominator",
-                    new="new_vlim",
-                    delta="correction",
-                    indent=" " * 12,
-                    declare="const float ",
-                )
-                + "            SYNC();\n"
-                + "            if (lane == 0) impulse[row] = new_vlim;"
+                "            const auto vlim = ProjectionLaw::velocity_limit_update(impulse[row], residual, residual / denominator, 1);\n"
+                "            const float correction = vlim.v1;\n"
+                "            SYNC();\n"
+                "            if (lane == 0) impulse[row] = vlim.v0;"
             )
         else:
-            final_velocity_limit = """            // Limits report this correction without undoing earlier ones.
-            const float correction = residual < 0.0f ? -residual / denominator : 0.0f;
-            if (lane == 0) impulse[row] = correction;"""
+            # Limits report this correction without undoing earlier ones.
+            final_velocity_limit = (
+                "            const auto vlim = ProjectionLaw::velocity_limit_update(0.0f, residual, residual / denominator, 0);\n"
+                "            const float correction = vlim.v1;\n"
+                "            if (lane == 0) impulse[row] = vlim.v0;"
+            )
         velocity_sweep = f"""
         for (int row = 0; row < count; ++row) {{
             if (type[row] != {velocity_limit_type}) continue;
@@ -434,7 +430,7 @@ def _get_pgs_solve_sparse_kernel(
             const int row_type = static_cast<int>(type[row]);
 {velocity_filter}
             const bool friction = row_type == {friction_type};
-            if (friction && global_iteration < friction_start_iteration) {{
+            if (ProjectionLaw::friction_gate(row_type, global_iteration, friction_start_iteration)) {{
                 if (lane == 0) impulse[row] = 0.0f;
                 SYNC();
                 continue;
@@ -483,22 +479,21 @@ def _get_pgs_solve_sparse_kernel(
             float new_impulse = old_impulse;
             float sibling_change = 0.0f;
             if (friction) {{
-                float2 pair = make_float2(0.0f, 0.0f);
+                wp::vec2 pair(0.0f);
                 if (radius > 0.0f) {{
                     const float sibling_residual = sibling_dot + rhs[sibling];
-                    pair = friction_pair_candidate(denominator, cross,
-                        diagonal[sibling], residual, sibling_residual, old_impulse, old_sibling, radius, omega);
+                    pair = ProjectionLaw::friction_pair(denominator, cross, diagonal[sibling],
+                        wp::vec2(residual, sibling_residual), wp::vec2(old_impulse, old_sibling), radius, omega);
                 }}
-                const float magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
-                const float scale = magnitude > radius ? radius / magnitude : 1.0f;
-                new_impulse = pair.x * scale;
-                const float new_sibling = pair.y * scale;
+                pair = ProjectionLaw::disk(pair, radius);
+                new_impulse = pair[0];
+                const float new_sibling = pair[1];
                 sibling_change = new_sibling - old_sibling;
                 if (lane == 0) impulse[sibling] = new_sibling;
             }} else {{
-                new_impulse = old_impulse - omega * residual / denominator;
+                new_impulse = ProjectionLaw::relaxed_step(old_impulse, -residual / denominator, omega);
                 if (row_type == {contact_type} || row_type == {limit_type})
-                    new_impulse = fmaxf(new_impulse, 0.0f);
+                    new_impulse = ProjectionLaw::unilateral(new_impulse);
             }}
             const float change = new_impulse - old_impulse;
             if (lane == 0) impulse[row] = new_impulse;
@@ -553,7 +548,6 @@ ARGMAX(sweep_violation, sweep_violation_kind);""",
         quiet="BALLOT(changed != 0) == 0u",
         violation=violation,
     )
-    laws = (FRICTION_PAIR,)
     if single_stage:
         triplet_setup, triplet_update = _single_stage_triplet_code(
             M, S, Q, contact_type, friction_type, linked=linked_rows, active=active_rows, solve_policy=solve_policy
@@ -562,7 +556,6 @@ ARGMAX(sweep_violation, sweep_violation_kind);""",
         active_scan += "\n        int consumed_tangent = -1;\n"
         # Rows the transaction declines keep the ordinary update and its own pair metric.
         row_update = triplet_update + row_update
-        laws = (FRICTION_PAIR, FRICTION_PAIR_CACHED)
     elif contact_triplets:
         triplet_setup, triplet_update = _contact_triplet_code(
             M, S, Q, contact_type, friction_type, linked=linked_rows, active=active_rows, solve_policy=solve_policy
@@ -579,13 +572,15 @@ ARGMAX(sweep_violation, sweep_violation_kind);""",
             ),
             ("cross += value * sibling_value;", "if (!metric_ready) cross += value * sibling_value;"),
             ("SUM(dot, sibling_dot, cross);", "SUM(dot, sibling_dot);\n            if (!metric_ready) SUM(cross);"),
-            ("pair = friction_pair_candidate(denominator,", "pair = friction_pair_cached(metric_slot, denominator,"),
+            (
+                "pair = ProjectionLaw::friction_pair(denominator,",
+                "pair = friction_pair_cached(metric_slot, denominator,",
+            ),
         ):
             if row_update.count(old) != 1:
                 raise ValueError("the sparse row update changed; update the cached pair metric's edits")
             row_update = row_update.replace(old, new)
         row_update = triplet_update + row_update
-        laws = (FRICTION_PAIR_CACHED,)
     writeback = f"""
     for (int d = lane; d < {D}; d += {L}) factor_velocity_delta.data[world * {D} + d] = delta[d];
     for (int i = lane; i < count; i += {L}) world_impulses.data[offset + i] = impulse[i];
@@ -608,7 +603,7 @@ ARGMAX(sweep_violation, sweep_violation_kind);""",
 {writeback}
 #endif
 """,
-        preludes=(lane_group(L), RING, *laws, *solve_policy.preludes),
+        preludes=(lane_group(L), RING, *PROJECTION_LAW.preludes(), *solve_policy.preludes),
         lead="",
     )
 
@@ -818,29 +813,36 @@ def _contact_triplet_code(
         return normal / 3;
     }};
     const auto friction_pair_cached = [&](int id, float a, float c, float d,
-        float r0, float r1, float old0, float old1, float radius, float relaxation) {{
-        FrictionPairMetric metric;
+        wp::vec2 residual, wp::vec2 old, float radius, float relaxation) {{
+        float scale, largest, smallest;
+        wp::vec2 axis;
         const int cached = id >= 0 ? metric_map[id] : -1;
         if (cached >= 0) {{
-            metric = FrictionPairMetric{{metrics[cached * 5], metrics[cached * 5 + 1], metrics[cached * 5 + 2],
-                metrics[cached * 5 + 3], metrics[cached * 5 + 4]}};
+            scale = metrics[cached * 5];
+            largest = metrics[cached * 5 + 1];
+            smallest = metrics[cached * 5 + 2];
+            axis = wp::vec2(metrics[cached * 5 + 3], metrics[cached * 5 + 4]);
         }} else {{
-            metric = friction_pair_metric(a, c, d);
+            const auto metric = ProjectionLaw::friction_pair_metric(a, c, d);
+            scale = metric.v0;
+            largest = metric.v1;
+            smallest = metric.v2;
+            axis = metric.v3;
             if (id >= 0 && lane == 0 && *metric_count < {cache_size}) {{
                 // One warp owns this world's ordered visits. A full cache
                 // leaves the map unset, retaining exact recomputation.
                 const int entry = *metric_count;
-                metrics[entry * 5] = metric.scale;
-                metrics[entry * 5 + 1] = metric.largest;
-                metrics[entry * 5 + 2] = metric.smallest;
-                metrics[entry * 5 + 3] = metric.vx;
-                metrics[entry * 5 + 4] = metric.vy;
+                metrics[entry * 5] = scale;
+                metrics[entry * 5 + 1] = largest;
+                metrics[entry * 5 + 2] = smallest;
+                metrics[entry * 5 + 3] = axis[0];
+                metrics[entry * 5 + 4] = axis[1];
                 metric_map[id] = static_cast<signed char>(entry);
                 *metric_count = entry + 1;
             }}
             SYNC();
         }}
-        return friction_pair_from_metric(metric, r0, r1, old0, old1, radius, relaxation);
+        return ProjectionLaw::friction_pair_from_metric(scale, largest, smallest, axis, residual, old, radius, relaxation);
     }};
 """
     update = f"""
@@ -868,7 +870,8 @@ def _contact_triplet_code(
                 SUM(normal_dot);
                 const float normal_residual = normal_dot + rhs[row];
                 const float old_normal = impulse[row];
-                const float new_normal = fmaxf(old_normal - omega * normal_residual / diagonal[row], 0.0f);
+                const float new_normal = ProjectionLaw::unilateral(
+                    ProjectionLaw::relaxed_step(old_normal, -normal_residual / diagonal[row], omega));
                 const float normal_change = new_normal - old_normal;{ring_load}
                 const float radius = fmaxf(world_row_mu.data[offset + tangent] * {load}, 0.0f);
                 const float old_tangent = impulse[tangent], old_sibling = impulse[sibling];
@@ -901,15 +904,14 @@ def _contact_triplet_code(
                     SUM(dot, sibling_dot);
                     if (!ready) SUM(cross);
                     const float residual = dot + rhs[tangent];
-                    float2 pair = make_float2(0.0f, 0.0f);
+                    wp::vec2 pair(0.0f);
                     if (radius > 0.0f) {{
                         const float sibling_residual = sibling_dot + rhs[sibling];
-                        pair = friction_pair_cached(triplet_slot, diagonal[tangent], cross,
-                            diagonal[sibling], residual, sibling_residual, old_tangent, old_sibling, radius, omega);
+                        pair = friction_pair_cached(triplet_slot, diagonal[tangent], cross, diagonal[sibling],
+                            wp::vec2(residual, sibling_residual), wp::vec2(old_tangent, old_sibling), radius, omega);
                     }}
-                    const float magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
-                    const float scale = magnitude > radius ? radius / magnitude : 1.0f;
-                    const float new_tangent = pair.x * scale, new_sibling = pair.y * scale;
+                    pair = ProjectionLaw::disk(pair, radius);
+                    const float new_tangent = pair[0], new_sibling = pair[1];
                     tangent_change = new_tangent - old_tangent;
                     sibling_change = new_sibling - old_sibling;{tangent_keep}
                     if (lane == 0) {{ impulse[tangent] = new_tangent; impulse[sibling] = new_sibling; }}
@@ -1118,7 +1120,8 @@ def _single_stage_triplet_code(
                     const float normal_residual = normal_dot + normal_rhs;
                     const float tangent_residual = tangent_dot + tangent_rhs;
                     const float sibling_residual = sibling_dot + sibling_rhs;
-                    const float new_normal = fmaxf(old_normal - omega * normal_residual * coupling.w, 0.0f);
+                    const float new_normal = ProjectionLaw::unilateral(
+                        ProjectionLaw::relaxed_step(old_normal, -normal_residual * coupling.w, omega));
                     const float normal_change = new_normal - old_normal;{ring_load}
                     const float radius = fmaxf(mu * {load}, 0.0f);
                     {tangent_state}
@@ -1127,17 +1130,18 @@ def _single_stage_triplet_code(
                     SYNC();
                     if (lane == 0) impulse[row] = new_normal;
                     if (!(radius == 0.0f && old_tangent == 0.0f && old_sibling == 0.0f)) {{
-                        float2 pair = make_float2(0.0f, 0.0f);
+                        wp::vec2 pair(0.0f);
                         if (radius > 0.0f) {{
                             // W_nt moves the tangent residuals by the normal change. The eigenbasis
                             // is relative to the larger tangent diagonal, as the pair law scales it.
-                            const FrictionPairMetric metric{{tangent_scale, basis.x, basis.y, basis.z, basis.w}};
-                            pair = friction_pair_from_metric(metric, tangent_residual + coupling.x * normal_change,
-                                sibling_residual + coupling.y * normal_change, old_tangent, old_sibling, radius, omega);
+                            pair = ProjectionLaw::friction_pair_from_metric(tangent_scale, basis.x, basis.y,
+                                wp::vec2(basis.z, basis.w),
+                                wp::vec2(tangent_residual + coupling.x * normal_change,
+                                         sibling_residual + coupling.y * normal_change),
+                                wp::vec2(old_tangent, old_sibling), radius, omega);
                         }}
-                        const float magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
-                        const float projection = magnitude > radius ? radius / magnitude : 1.0f;
-                        const float new_tangent = pair.x * projection, new_sibling = pair.y * projection;
+                        pair = ProjectionLaw::disk(pair, radius);
+                        const float new_tangent = pair[0], new_sibling = pair[1];
                         tangent_change = new_tangent - old_tangent;
                         sibling_change = new_sibling - old_sibling;{tangent_keep}
                         if (lane == 0) {{ impulse[tangent] = new_tangent; impulse[sibling] = new_sibling; }}

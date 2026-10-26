@@ -56,6 +56,7 @@ from ...math.spatial import velocity_at_point
 from ...sim.contacts import GENERATION_SENTINEL, capture_scope, contact_frame_write
 from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
 from .contact_laws import contact_bodies, contact_points, contact_tangent_basis
+from .projection_laws import disk
 
 # Grids are fixed at construction so CUDA graphs replay them. Their sizes count
 # _BLOCK_THREADS threads per SM (one SM on the CPU); launches stride over the
@@ -1992,9 +1993,7 @@ def _seed_contact(
     w = world[c]
     s = slot[c]
     radius = wp.max(mu[w, s + 1] * patch_normal_load(parents, impulses, w, s), 0.0)
-    magnitude = wp.length(value)
-    if magnitude > radius and magnitude > 0.0:
-        value *= radius / magnitude
+    value = disk(value, radius)
     impulses[w, s + 1] = value[0]
     impulses[w, s + 2] = value[1]
 

@@ -476,6 +476,8 @@ class TestSparseSplitPhysics(unittest.TestCase):
                         solve.inputs[8],
                         solve.inputs[9],
                         solve.inputs[10],
+                        solve.inputs[10],  # unread weights: no regularization
+                        0,
                         delay,
                         0,
                     ],

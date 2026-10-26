@@ -529,7 +529,9 @@ def _spliced_sweep_calls():
 
     Local owners, plain and over packet rows: a contactless subwarp articulation,
     an articulation pair and the pair's residual with matrix-free rows. Then the
-    tiled-row sweep with and without row budgets and the legacy matrix-free sweep.
+    tiled-row sweep with and without row budgets, the legacy matrix-free sweep and
+    the matrix-free Gauss-Seidel sweeps of the research friction modes, which call
+    the Coulomb laws.
     """
     from newton._src.solvers.feather_pgs import row_packets  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import solver_feather_pgs as solver  # noqa: PLC0415
@@ -553,6 +555,9 @@ def _spliced_sweep_calls():
             kwargs = {"row_budget": budget, "min_rows": minimum}
             yield name + "_get_pgs_solve_tiled_row_kernel", tiled, (capacity, _ARCH), kwargs
     yield name + "_get_pgs_solve_mf_kernel", solver._get_pgs_solve_mf_kernel.__wrapped__, (32, 8, _ARCH), {}
+    mf_gs = solver._get_pgs_solve_mf_gs_kernel.__wrapped__
+    for friction in ("bisection", "bisection_desaxce", "coulomb_newton"):
+        yield name + "_get_pgs_solve_mf_gs_kernel", mf_gs, (64, 32, 12, _ARCH), {"friction_mode": friction}
 
 
 def _suite_shape_calls():

@@ -1431,7 +1431,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         rows = wp.array([[0, 2, 2, 0, 0, 2, 2] + [-1] * 25], dtype=int, device=device)
         parents = wp.array([[3, 0, 0, 4, 0, 4, 4] + [-1] * 25], dtype=int, device=device)
         mu = wp.array([[0.5, 0.25, 0.25, 0.5, 0.5, 0.25, 0.25] + [0] * 25], dtype=float, device=device)
-        args = [count, diag, matrix, rhs, impulses, 2, 1.0, rows, parents, mu, 0, 0]
+        args = [count, diag, matrix, rhs, impulses, 2, 1.0, rows, parents, mu, diag, 0, 0, 0]
         if native:
             kernel = _get_pgs_solve_tiled_row_kernel(capacity, str(wp.get_device(device).arch))
             wp.launch_tiled(kernel, dim=[1], inputs=args, block_dim=32, device=device)

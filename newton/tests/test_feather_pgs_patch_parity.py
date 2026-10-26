@@ -181,7 +181,7 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
         impulses = wp.zeros((1, capacity), dtype=float, device="cpu")
         diag = wp.ones((1, capacity), dtype=float, device="cpu")
         matrix = wp.array(np.eye(capacity, dtype=np.float32)[None], dtype=float, device="cpu")
-        inputs = [count, capacity, diag, matrix, rhs, impulses, 2, 1.0, rows, parents, mu, 0, 0]
+        inputs = [count, capacity, diag, matrix, rhs, impulses, 2, 1.0, rows, parents, mu, mu, 0, 0, 0]
         wp.launch(pgs_solve_loop, dim=1, inputs=inputs, device="cpu")
         solved = impulses.numpy()
         np.testing.assert_allclose(solved[0, :7], [0, 1, 0, 4, 0, 1, 0], atol=1.0e-6)
@@ -372,7 +372,7 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
                 impulses[world[c], slot[c] + 1 : slot[c] + 3] *= factor
             solver.impulses.assign(impulses)
 
-        seed, regularize, launch = patches.seed, solver._stage6_apply_contact_regularization, wp.launch
+        seed, dispatch, launch = patches.seed, solver._dispatch_dense_pgs_solve, wp.launch
 
         def rescaled(state, world, slot, path, slots_needed, routes):
             routes.scale = wp.vec3(0.5 * routes.scale[0], routes.scale[1], routes.scale[2])
@@ -385,9 +385,9 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
                 scale_carried_friction(0.5)
             return result
 
-        def overwritten():
-            regularize()
+        def overwritten(*args, **kwargs):
             scale_carried_friction(0.0)
+            return dispatch(*args, **kwargs)
 
         self.assertEqual(assert_patch_seeds(seeded_step(), scale=decay, carried=False), 0.0)
         largest = max(assert_patch_seeds(seeded_step(), scale=decay) for _ in range(3))
@@ -396,7 +396,7 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
             "not 0 times": mock.patch.object(patches, "seed", lambda *args: None),
             "warm-start scale": mock.patch.object(patches, "seed", rescaled),
             "seeded friction rows": mock.patch.object(wp, "launch", altered),
-            "the sweep starts from": mock.patch.object(solver, "_stage6_apply_contact_regularization", overwritten),
+            "the sweep starts from": mock.patch.object(solver, "_dispatch_dense_pgs_solve", overwritten),
         }
         for message, defect in defects.items():
             with self.subTest(defect=message), defect, self.assertRaisesRegex(AssertionError, message):

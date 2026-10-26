@@ -134,6 +134,8 @@ def _first_solve_sweeps(model, contacts, sweeps, dt=0.005):
                 solver.row_type,
                 solver.row_parent,
                 solver.row_mu,
+                solver.row_w,
+                int(solver._regularization_enabled),
                 0,
                 sweep,
             ],

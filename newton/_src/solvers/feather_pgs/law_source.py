@@ -359,6 +359,7 @@ class LawSourceError(SyntaxError):
 # functions (wp::add, wp::mul, ...), as Warp's code generator writes it.
 _SCALAR, _VECTOR, _MATRIX, _QUAT, _TRANSFORM, _ARRAY = "scalar", "vector", "matrix", "quat", "transform", "array"
 _FIRST = "first argument"
+_SECOND = "second argument"
 _BUILTIN_KINDS = {
     "length": _SCALAR,
     "length_sq": _SCALAR,
@@ -393,6 +394,7 @@ _BUILTIN_KINDS = {
     "transpose": _MATRIX,
     "skew": _MATRIX,
     "inverse": _FIRST,
+    "where": _SECOND,
     "transform_get_rotation": _QUAT,
     "quat": _QUAT,
     "transform_inverse": _TRANSFORM,
@@ -833,6 +835,8 @@ class _Renderer:
                 self.fail(node, f"wp.{name} is not a builtin this module renders; add its kind to _BUILTIN_KINDS")
             if kind == _FIRST:
                 kind = operands[0][2]
+            elif kind == _SECOND:
+                kind = operands[1][2]
             return f"wp::{name}({', '.join(args)})", kind
         if isinstance(func, ast.Name):
             if func.id in _CASTS and not self.declared(func.id):

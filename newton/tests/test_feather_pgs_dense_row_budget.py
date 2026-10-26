@@ -91,8 +91,9 @@ class TestFeatherPGSDenseRowBudgetFactory(unittest.TestCase):
             pgs_omega=0.8,
             _pgs_friction_start_iteration=2,
             _pgs_iteration_offset=3,
+            _regularization_enabled=True,
         )
-        for name in ("constraint_count", "diag", "C", "rhs", "impulses", "row_type", "row_parent", "row_mu"):
+        for name in ("constraint_count", "diag", "C", "rhs", "impulses", "row_type", "row_parent", "row_mu", "row_w"):
             setattr(state, name, object())
         expected = [
             state.constraint_count,
@@ -105,6 +106,8 @@ class TestFeatherPGSDenseRowBudgetFactory(unittest.TestCase):
             state.row_type,
             state.row_parent,
             state.row_mu,
+            state.row_w,
+            1,
             2,
             3,
         ]
@@ -135,6 +138,7 @@ def _dense_fixture(capacity=64):
     types = np.tile(np.array([0, 1, 3, 4, 5, 6, 1, 0], dtype=np.int32), (worlds, capacity // 8))
     parents = np.full((worlds, capacity), -1, dtype=np.int32)
     mu = np.full((worlds, capacity), 0.35, dtype=np.float32)
+    weights = rng.uniform(0.25, 1.0, size=(worlds, capacity)).astype(np.float32)
     for world, count in enumerate(counts):
         for normal in (0, 7, 14, 23, 30, 39, 46, 55, 61, 70, 78, 87, 94, 103, 110, 119, 125):
             if normal + 2 < count:
@@ -152,7 +156,7 @@ def _dense_fixture(capacity=64):
         diag[world, row] = 1.0
         impulses[world, parent] = 0.1
         impulses[world, parent + 1 : parent + 3] = 0.7
-    return counts, diag, matrix, rhs, impulses, types, parents, mu
+    return counts, diag, matrix, rhs, impulses, types, parents, mu, weights
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "Native dense row budgets require CUDA")
@@ -168,6 +172,7 @@ class TestFeatherPGSDenseRowBudget(unittest.TestCase):
         graph=False,
         nan_diag=False,
         change_counts=False,
+        regularize=0,
     ):
         """Compare both budget partitions against the default factory byte for byte."""
         device = wp.get_device("cuda:0")
@@ -185,7 +190,7 @@ class TestFeatherPGSDenseRowBudget(unittest.TestCase):
             arrays[1][capacity + 3, 1] = np.nan
         values = [wp.array(value, device=device) for value in arrays]
         snapshots = [value.numpy() for value in values]
-        counts, diag, matrix, rhs, initial, types, parents, mu = values
+        counts, diag, matrix, rhs, initial, types, parents, mu, weights = values
         original = _get_pgs_solve_tiled_row_kernel(capacity, device.arch)
         reference = wp.clone(initial)
 
@@ -204,6 +209,8 @@ class TestFeatherPGSDenseRowBudget(unittest.TestCase):
                     types,
                     parents,
                     mu,
+                    weights,
+                    regularize,
                     friction_start,
                     iteration_offset,
                 ],
@@ -264,7 +271,7 @@ class TestFeatherPGSDenseRowBudget(unittest.TestCase):
                     arrays[6][world] = arrays[6][active]
                 lower = np.tril(arrays[2])
                 arrays[2] = lower + np.tril(lower, -1).transpose(0, 2, 1)
-                counts, diag, matrix, rhs, initial, types, parents, mu = (
+                counts, diag, matrix, rhs, initial, types, parents, mu, weights = (
                     wp.array(value, device=device) for value in arrays
                 )
                 results = []
@@ -273,7 +280,7 @@ class TestFeatherPGSDenseRowBudget(unittest.TestCase):
                     wp.launch_tiled(
                         _get_pgs_solve_tiled_row_kernel(capacity, device.arch, staging=staging),
                         dim=[len(arrays[0])],
-                        inputs=[counts, diag, matrix, rhs, impulses, 8, 1.0, types, parents, mu, 2, 0],
+                        inputs=[counts, diag, matrix, rhs, impulses, 8, 1.0, types, parents, mu, weights, 0, 2, 0],
                         block_dim=32,
                         device=device,
                     )
@@ -282,16 +289,30 @@ class TestFeatherPGSDenseRowBudget(unittest.TestCase):
                 np.testing.assert_array_equal(results[1].view(np.uint32), results[0].view(np.uint32))
 
     def test_all_counts_and_projection_phases(self):
-        """Preserve every count, row projector, warm state and delayed-friction phase."""
+        """Preserve every count, row projector, contact regularization, warm state and delayed-friction phase."""
         for capacity in (64, 128):
-            for iterations, omega, delay, offset in ((0, 1.0, 0, 0), (1, 0.8, 0, 0), (8, 1.0, 2, 0), (3, 1.2, 2, 3)):
-                with self.subTest(capacity=capacity, iterations=iterations, omega=omega, delay=delay, offset=offset):
+            for iterations, omega, delay, offset, regularize in (
+                (0, 1.0, 0, 0, 0),
+                (1, 0.8, 0, 0, 0),
+                (8, 1.0, 2, 0, 0),
+                (3, 1.2, 2, 3, 0),
+                (8, 1.0, 2, 0, 1),
+            ):
+                with self.subTest(
+                    capacity=capacity,
+                    iterations=iterations,
+                    omega=omega,
+                    delay=delay,
+                    offset=offset,
+                    regularize=regularize,
+                ):
                     self._compare(
                         capacity=capacity,
                         iterations=iterations,
                         omega=omega,
                         friction_start=delay,
                         iteration_offset=offset,
+                        regularize=regularize,
                     )
 
     def test_graph_preserves_full_capacity(self):
@@ -334,7 +355,7 @@ class TestFeatherPGSDenseRowBudget(unittest.TestCase):
                     arrays[6][world, :3] = (10, 0, 0)
                     arrays[6][world, 10] = -1
                     values = [wp.array(value, device=device) for value in arrays]
-                    counts, diag, matrix, rhs, initial, types, parents, mu = values
+                    counts, diag, matrix, rhs, initial, types, parents, mu, weights = values
                     for budget, minimum in ((16, 0), (32, 0), (32, 16)):
                         result = wp.clone(initial)
                         kernel = _get_pgs_solve_tiled_row_kernel(
@@ -343,7 +364,7 @@ class TestFeatherPGSDenseRowBudget(unittest.TestCase):
                         wp.launch_tiled(
                             kernel,
                             dim=[len(arrays[0])],
-                            inputs=[counts, diag, matrix, rhs, result, 2, 1.0, types, parents, mu, 0, 0],
+                            inputs=[counts, diag, matrix, rhs, result, 2, 1.0, types, parents, mu, weights, 0, 0, 0],
                             block_dim=32,
                             device=device,
                         )
@@ -363,7 +384,7 @@ class TestFeatherPGSDenseRowBudget(unittest.TestCase):
                         wp.launch_tiled(
                             kernel,
                             dim=[len(arrays[0])],
-                            inputs=[counts, diag, matrix, rhs, target, 2, 1.0, types, parents, mu, 0, 0],
+                            inputs=[counts, diag, matrix, rhs, target, 2, 1.0, types, parents, mu, weights, 0, 0, 0],
                             block_dim=32,
                             device=device,
                         )

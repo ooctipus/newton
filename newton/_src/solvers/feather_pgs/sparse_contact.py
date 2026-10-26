@@ -3,7 +3,6 @@
 
 """Build contact responses in the sparse mass factor's coordinates."""
 
-import textwrap
 from functools import cache
 
 import warp as wp
@@ -20,7 +19,6 @@ from .contact_laws import (
     prescribed_target,
 )
 from .device_preludes import dual_native, lane_group
-from .friction import _PAIR_METRIC
 from .friction_patches import FrictionPatches, patch_friction_location
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -29,6 +27,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_CONSTRAINT_TYPE_MIMIC,
 )
+from .projection_laws import PROJECTION_LAW
 from .row_laws import ROW_LAW, contact_restitution_rhs, row_rhs
 from .sparse_mass_matrix import _SparseRowSupport
 from .sparse_row_projection import _sparse_contact_projection_source
@@ -86,14 +85,12 @@ _CONTACT_RECORD_SOURCE = """
             record[1] = cross.c[1];
             record[2] = cross.c[2];
             record[3] = 1.0f / (norm.c[0] + cfm);
-            float a = norm.c[1] + cfm, c = cross.c[2], d = norm.c[2] + cfm;
-            {
-$PAIR_METRIC
-                record[4] = largest;
-                record[5] = smallest;
-                record[6] = vx;
-                record[7] = vy;
-            }
+            // The tangent pair's metric (ProjectionLaw::friction_pair_metric), which the triplet sweeps reuse.
+            const auto metric = ProjectionLaw::friction_pair_metric(norm.c[1] + cfm, cross.c[2], norm.c[2] + cfm);
+            record[4] = metric.v1;
+            record[5] = metric.v2;
+            record[6] = metric.v3[0];
+            record[7] = metric.v3[1];
         }
     }
 """
@@ -386,8 +383,7 @@ def _get_sparse_contact_response_kernel(
                 }
 """,
         )
-        metric = textwrap.indent(_PAIR_METRIC.substitute(max_call="wp::max"), "        ")
-        snippet += _CONTACT_RECORD_SOURCE.replace("$PAIR_METRIC", metric.rstrip("\n"))
+        snippet += _CONTACT_RECORD_SOURCE
     snippet = (
         snippet.replace(
             "$SPARSE_PROJECTION",
@@ -405,7 +401,7 @@ def _get_sparse_contact_response_kernel(
         .replace("$N", str(n))
         .replace("$SUPPORT_TABLE", str(bool(use_support_table)).lower())
     )
-    snippet = dual_native(snippet, preludes=(lane_group(lanes),))
+    snippet = dual_native(snippet, preludes=(lane_group(lanes), *PROJECTION_LAW.preludes()))
 
     @wp.func_native(snippet)
     def project_native(

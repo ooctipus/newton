@@ -5,15 +5,16 @@
 
 One law each, written once for Warp kernels and native CUDA (:mod:`.law_source`):
 
-* the update: :func:`regularized_step` (the proximal w-form; ``w = 1`` is the
-  hard Gauss-Seidel step) and :func:`friction_gate` (friction rows wait for
-  ``friction_start_iteration``);
+* the update: :func:`relaxed_step` (``old + omega delta``), the proximal
+  regularization of a row's step, :func:`regularized_delta` (the w-form), its
+  diagonal for block solves, :func:`regularized_diagonal`, and
+  :func:`friction_gate` (friction rows wait for ``friction_start_iteration``);
 * sets: :func:`unilateral` (``lambda >= 0``), :func:`box` (``|lambda| <= b``) and
   :func:`disk` (``|lambda_t| <= r``);
 * friction at a fixed normal load: :func:`friction_pair`, the bounded solve of a
-  tangent pair on its disk (``friction.friction_pair_candidate``), composed of
-  :func:`friction_pair_metric` and :func:`friction_pair_from_metric` for sweeps
-  that keep a pair's block across iterations;
+  tangent pair on its disk, composed of :func:`friction_pair_metric` and
+  :func:`friction_pair_from_metric` for sweeps that keep a pair's block across
+  iterations;
 * the contact's Coulomb problem of the research friction modes (the
   :data:`COULOMB_LAW` family): :func:`coulomb_bisection` (RAISim's bisection on
   the normal impulse, with :func:`de_saxce_target` for its de Saxce variant) and
@@ -47,14 +48,31 @@ CoulombRowResult = wp.types.vector(length=6, dtype=float)
 
 
 @PROJECTION_LAW.law
-def regularized_step(old: float, delta: float, w: float, omega: float) -> float:
-    """Return a row's relaxed update in the proximal w-form, ``old + omega (w delta - (1 - w) old)``.
+def relaxed_step(old: float, delta: float, omega: float) -> float:
+    """Return a row's relaxed update, ``old + omega delta``, for its step ``delta`` (``-r / d``, or regularized)."""
+    return old + omega * delta
 
-    ``delta`` is the hard step (``-r / d``) and ``w = 1 / (1 + g)`` the row's
-    regularization weight: ``w = 1`` is the hard update, and the form has no
-    ``g lambda`` product that could overflow for an extreme finite ``g``.
+
+@PROJECTION_LAW.law
+def regularized_delta(delta: float, w: float, old: float) -> float:
+    """Return a row's step in the proximal w-form, ``w delta - (1 - w) old``, for its hard step ``delta``.
+
+    ``w = 1 / (1 + g)`` is the row's regularization weight. The form has no
+    ``g lambda`` product that could overflow for an extreme finite ``g``, and
+    ``w = 1`` leaves the hard step: sweeps apply it only to regularized rows.
     """
-    return old + omega * (delta * w - (1.0 - w) * old)
+    return delta * w - (1.0 - w) * old
+
+
+@PROJECTION_LAW.law
+def regularized_diagonal(diagonal: float, w: float) -> float:
+    """Return the diagonal a block solve gives a row of weight ``w``, ``d / w``.
+
+    A block solved exactly with it reaches the fixed point of the regularized
+    step (:func:`regularized_delta`): the row's residual settles at
+    ``-(1 / w - 1) d lambda``.
+    """
+    return diagonal / w
 
 
 @PROJECTION_LAW.law
@@ -65,30 +83,28 @@ def friction_gate(kind: int, iteration: int, start_iteration: int) -> bool:
 
 @PROJECTION_LAW.law
 def unilateral(impulse: float) -> float:
-    """Project an impulse onto ``impulse >= 0`` (contact normals, position and accumulated velocity limits)."""
-    if impulse < 0.0:
-        return 0.0
-    return impulse
+    """Project an impulse onto ``impulse >= 0`` (contact normals, position and accumulated velocity limits).
+
+    Selected, not branched, as the sweeps' own clamps compiled.
+    """
+    return wp.where(impulse < 0.0, 0.0, impulse)
 
 
 @PROJECTION_LAW.law
 def box(impulse: float, lower: float, upper: float) -> float:
     """Project an impulse onto ``[lower, upper]``, testing the upper bound first."""
-    result = impulse
-    if result > upper:
-        result = upper
-    if result < lower:
-        result = lower
-    return result
+    result = wp.where(impulse > upper, upper, impulse)
+    return wp.where(result < lower, lower, result)
 
 
 @PROJECTION_LAW.law
 def disk(pair: wp.vec2, radius: float) -> wp.vec2:
-    """Scale a tangent impulse pair back onto the disk of ``radius`` when it lies outside."""
+    """Scale a tangent impulse pair back onto the disk of ``radius`` when it lies outside.
+
+    The scale is selected, not branched, as the sweeps' own projections selected it.
+    """
     magnitude = wp.sqrt(pair[0] * pair[0] + pair[1] * pair[1])
-    if magnitude > radius:
-        return pair * (radius / magnitude)
-    return pair
+    return pair * wp.where(magnitude > radius, radius / magnitude, 1.0)
 
 
 @PROJECTION_LAW.law

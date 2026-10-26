@@ -147,6 +147,8 @@ class TestFeatherPGSFrictionDirection(unittest.TestCase):
                             wp.array(row_types, dtype=int, device=device),
                             wp.array(parents, dtype=int, device=device),
                             wp.full((1, capacity), 0.3, dtype=float, device=device),
+                            wp.ones((1, capacity), dtype=float, device=device),  # unread weights: no regularization
+                            0,
                             0,
                             0,
                         ]

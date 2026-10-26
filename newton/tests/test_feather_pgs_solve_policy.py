@@ -73,7 +73,7 @@ _SCALED_VOTES = {
         "fabsf(sib_delta) * (s_diag_dense[sib])",
         "fabsf(delta_impulse) * (mf_diag > 0.0f ? 1.0f / mf_diag : 0.0f)",
         "fabsf(delta_impulse_vlim) * (denom)",
-        "fabsf(delta_impulse_mf_vlim) * (1.0f / mf_diag)",
+        "fabsf(speed_row[1]) * (1.0f / mf_diag)",
     ),
     "paired": (
         "fabsf(delta_impulse) * (denom)",
@@ -149,8 +149,8 @@ def _factory_calls():
     )
 
 
-# An accumulated velocity-limit impulse, max(old - r / d, 0) with the unrelaxed step, as velocity_limit_law emits it.
-_LAW_SITE = re.compile(r"fmaxf\(old_\w+ - residual")
+# An accumulated velocity-limit visit: the law call (projection_laws.velocity_limit_update or speed_row) that selects it.
+_LAW_SITE = re.compile(r"(?:velocity_limit_update|speed_row)\([^;]*, 1\);")
 
 
 def _axis(name, values=(False, True)):

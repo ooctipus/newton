@@ -3,8 +3,8 @@
 
 """Compose FeatherPGS native sources from declared device preludes only.
 
-A native body declares the device helpers it calls, such as the paired
-friction law, a lane group or the patch ring, and ``device_preludes.cuda_native``
+A native body declares the device helpers it calls, such as a law family's
+struct, a lane group or the patch ring, and ``device_preludes.cuda_native``
 places them after the body's one architecture guard; ``dual_native`` places
 their CPU twins after an ``#else`` for a body that also runs on the CPU. These
 tests check that layout on every native snippet of the point-stream inventory
@@ -17,7 +17,8 @@ import pkgutil
 import unittest
 from pathlib import Path
 
-from newton._src.solvers.feather_pgs import contact_unit, device_preludes, friction
+from newton._src.solvers.feather_pgs import contact_unit, device_preludes
+from newton._src.solvers.feather_pgs.contact_laws import CONTACT_LAW
 from newton._src.solvers.feather_pgs.device_preludes import (
     ARCHITECTURE_GUARD,
     DevicePrelude,
@@ -25,13 +26,16 @@ from newton._src.solvers.feather_pgs.device_preludes import (
     dual_native,
     lane_group,
 )
+from newton._src.solvers.feather_pgs.law_source import LawFamily
+from newton._src.solvers.feather_pgs.projection_laws import COULOMB_LAW, PROJECTION_LAW
+from newton._src.solvers.feather_pgs.row_laws import ROW_LAW
 
 _PACKAGE = "newton._src.solvers.feather_pgs"
+# Law families whose structs native sweeps call (``Family::law(...)``).
+_FAMILIES = (CONTACT_LAW, ROW_LAW, PROJECTION_LAW, COULOMB_LAW)
 # Helper names a body may call only after declaring the prelude that defines them.
 _HELPERS = {
-    "friction_pair_candidate(": "friction_pair",
-    "friction_pair_metric(": "friction_pair_cached",
-    "friction_pair_from_metric(": "friction_pair_cached",
+    **{f"{family.name}::": family.name for family in _FAMILIES},
     "RING_LOAD(": "ring",
     "RING_ANY(": "ring",
 }
@@ -47,12 +51,16 @@ def _modules():
 
 
 def _preludes(modules):
-    """Return the distinct module-level preludes of the package and every module-level name bound to one."""
+    """Return the distinct module-level preludes of the package and every module-level name bound to one.
+
+    A module-level law family contributes its prelude.
+    """
     preludes, names = {}, set()
     for module in modules.values():
         for key, value in vars(module).items():
-            if isinstance(value, DevicePrelude):
-                preludes[id(value)] = value
+            prelude = value.prelude() if isinstance(value, LawFamily) else value
+            if isinstance(prelude, DevicePrelude):
+                preludes[id(prelude)] = prelude
                 names.add(key)
     return list(preludes.values()), names
 
@@ -81,8 +89,8 @@ def _splices(module_file, text, prelude_names):
     """Return the prelude and guard splices of one module's source, which only ``device_preludes`` may make.
 
     Prelude text reaches a body only through ``cuda_native``: no other module names the guard constant,
-    calls the friction law's source producer (``friction`` calls it once, to declare the prelude), reads
-    a prelude's ``source`` or concatenates a prelude, and none replaces or extends an opening guard.
+    renders a law family (``law_source`` renders each once, to declare its prelude), reads a prelude's
+    ``source`` or concatenates a prelude, and none replaces or extends an opening guard.
 
     Args:
         module_file: File name of the module, for the messages and the producer's own module.
@@ -129,11 +137,11 @@ def _splices(module_file, text, prelude_names):
             or (isinstance(node, ast.alias) and node.name == "ARCHITECTURE_GUARD")
         ):
             violations.append(f"{location}: the architecture guard named outside the helper")
-        if isinstance(node, ast.Call) and module_file != "friction.py":
+        if isinstance(node, ast.Call) and module_file != "law_source.py":
             function = node.func
             called = function.id if isinstance(function, ast.Name) else getattr(function, "attr", None)
-            if called == "get_pair_source":
-                violations.append(f"{location}: the friction law's source taken outside its prelude")
+            if called == "render_family":
+                violations.append(f"{location}: a law family rendered outside its prelude")
     return violations
 
 
@@ -214,8 +222,8 @@ class TestDevicePreludeComposition(unittest.TestCase):
         """Give every declared prelude its own name, so a composed snippet names its preludes unambiguously."""
         names = [prelude.name for prelude in self.preludes]
         self.assertEqual(len(names), len(set(names)), names)
-        self.assertIn(friction.FRICTION_PAIR, self.preludes)
-        self.assertIn(friction.FRICTION_PAIR_CACHED, self.preludes)
+        for family in _FAMILIES:
+            self.assertIn(family.prelude(), self.preludes)
         # The contact-unit law for native sweeps; its CPU binding backs the Warp loop sweeps' functions.
         self.assertIn(contact_unit.CONTACT_UNIT, self.preludes)
 
@@ -235,10 +243,10 @@ class TestNativeSweepLayout(unittest.TestCase):
                 cls.snippets.setdefault(snippet, name)
 
     def test_inventory_reaches_every_prelude_site(self):
-        """Reach the friction law in both forms, so the layout checks below cover their sweeps."""
+        """Reach every law family's struct, so the layout checks below cover the sweeps that call it."""
         text = "".join(self.snippets)
-        self.assertIn(friction.FRICTION_PAIR.source, text)
-        self.assertIn(friction.FRICTION_PAIR_CACHED.source, text)
+        for family in _FAMILIES:
+            self.assertIn(family.prelude().source, text, family.name)
 
     def test_preludes_follow_one_guard(self):
         """Open every snippet holding a prelude with one guard and its preludes, then a body without preludes.
@@ -263,7 +271,7 @@ class TestNativeSweepLayout(unittest.TestCase):
         self.assertGreater(checked, 0)
 
     def test_helper_calls_declare_their_prelude(self):
-        """Declare the defining prelude in every snippet that calls a friction helper."""
+        """Declare the defining prelude in every snippet that calls a law or a ring helper."""
         for snippet, kernel in self.snippets.items():
             calls = [helper for helper in _HELPERS if helper in snippet]
             if not calls:
@@ -293,22 +301,21 @@ class TestNoPreludeSplices(unittest.TestCase):
         idioms = {
             "guard replace": 'snippet = snippet.replace("#if defined(__CUDA_ARCH__)", "#if defined(__CUDA_ARCH__)\\n" + law)',
             "guard then code": 'snippet = "\\n#if defined(__CUDA_ARCH__)\\n" + law',
-            "prelude concatenated": "snippet = FRICTION_PAIR + body",
-            "prelude source": "snippet = FRICTION_PAIR.source + body",
-            "guard then the law's source": 'snippet = "#if defined(__CUDA_ARCH__)\\n" + get_pair_source() + body',
-            "f-string of the law's source": 'snippet = f"#if defined(__CUDA_ARCH__)\\n{get_pair_source()}{body}"',
+            "prelude concatenated": "snippet = RING + body",
+            "prelude source": "snippet = RING.source + body",
+            "guard then a family's source": 'snippet = "#if defined(__CUDA_ARCH__)\\n" + render_family(LAW) + body',
+            "f-string of a family's source": 'snippet = f"#if defined(__CUDA_ARCH__)\\n{render_family(LAW)}{body}"',
             "joined guard": 'snippet = "".join([ARCHITECTURE_GUARD, law, body])',
             "imported guard": "from .device_preludes import ARCHITECTURE_GUARD",
             "declared prelude source": "snippet = policy.preludes[0].source + body",
         }
         for idiom, text in idioms.items():
             with self.subTest(idiom=idiom):
-                self.assertTrue(_splices("module.py", text, {"FRICTION_PAIR"}))
-        composed = "snippet = cuda_native(body, preludes=(FRICTION_PAIR, *policy.preludes))"
-        self.assertEqual(_splices("module.py", composed, {"FRICTION_PAIR"}), [])
-        self.assertEqual(
-            _splices("friction.py", 'FRICTION_PAIR = DevicePrelude("friction_pair", get_pair_source())', set()), []
-        )
+                self.assertTrue(_splices("module.py", text, {"RING"}))
+        composed = "snippet = cuda_native(body, preludes=(RING, *LAW.preludes()))"
+        self.assertEqual(_splices("module.py", composed, {"RING"}), [])
+        declared = "self._prelude = DevicePrelude(self.name, render_family(self), cpu=render_family(self, cpu=True))"
+        self.assertEqual(_splices("law_source.py", declared, set()), [])
 
 
 if __name__ == "__main__":
