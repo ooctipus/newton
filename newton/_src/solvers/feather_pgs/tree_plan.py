@@ -23,10 +23,8 @@ template tree and a whole model alike):
 
 Plans of a template tree (at most 64 nodes and coordinates) also carry the
 schedule data the native scans bake in; :func:`local_parents` maps a model's
-global ancestors to template-local parents.
-
-The host index operation below (``_group_by``) has the semantics of the host
-index toolkit's ``group_by``; it moves there when the toolkit lands.
+global ancestors to template-local parents. The ragged-array steps (CSR bounds,
+grouping by key, ranks within segments) are the host index toolkit's.
 """
 
 from __future__ import annotations
@@ -36,24 +34,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .host_index import expand, group_by, offsets, segmented_rank
+
 __all__ = ["ChainPacking", "FactorPattern", "SupportClasses", "TreePlan", "local_parents"]
-
-
-# ---------------------------------------------------------------------------------------------------------------------
-# Host index operations (the host index toolkit's semantics)
-# ---------------------------------------------------------------------------------------------------------------------
-
-
-def _group_by(keys: np.ndarray, count: int) -> tuple[np.ndarray, np.ndarray]:
-    """Return ``(offsets, order)``: ``order[offsets[k]:offsets[k + 1]]`` lists the positions holding key ``k``.
-
-    Positions keep ascending order within a key (a stable grouping).
-    """
-    keys = np.asarray(keys, dtype=np.int64)
-    order = np.argsort(keys, kind="stable")
-    offsets = np.zeros(count + 1, dtype=np.int64)
-    np.cumsum(np.bincount(keys, minlength=count), out=offsets[1:])
-    return offsets, order
 
 
 def local_parents(ancestor: np.ndarray, starts: np.ndarray, count: int) -> np.ndarray:
@@ -235,8 +218,7 @@ class TreePlan:
         if np.any(parent < -1) or np.any(parent >= count) or np.any(parent == np.arange(count)):
             raise ValueError("A tree plan's parents must name other nodes or -1")
         nodes = np.arange(count, dtype=np.int64)
-        dof_start = np.zeros(count + 1, dtype=np.int64)
-        np.cumsum(dofs, out=dof_start[1:])
+        dof_start = offsets(dofs)
 
         # Depth and the jump table by pointer doubling: after r rounds every node knows its 2**r-th ancestor.
         depth = (parent >= 0).astype(np.int64)
@@ -260,7 +242,7 @@ class TreePlan:
             jump[r] = table[r]
 
         roots = np.flatnonzero(parent < 0)
-        level_offsets, level_nodes = _group_by(depth, max_depth + 1)
+        level_offsets, level_nodes = group_by(depth, max_depth + 1)
         # A parent-first order: the input order when every parent precedes its children, else by depth.
         parent_first = bool(np.all(parent < nodes))
         order = nodes.copy() if parent_first else level_nodes.copy()
@@ -269,8 +251,7 @@ class TreePlan:
         child_nodes = nodes[children_mask]
         by_parent = np.lexsort((-child_nodes, parent[children_mask]))
         children = child_nodes[by_parent]
-        children_offsets = np.zeros(count + 1, dtype=np.int64)
-        np.cumsum(np.bincount(parent[children_mask], minlength=count), out=children_offsets[1:])
+        children_offsets = offsets(np.bincount(parent[children_mask], minlength=count))
 
         # Subtree sizes, deepest level first; each node's root, shallowest first.
         size = np.ones(count, dtype=np.int64)
@@ -284,17 +265,12 @@ class TreePlan:
 
         # Depth-first positions: a child follows its parent and the subtrees of its lower siblings.
         position = np.zeros(count, dtype=np.int64)
-        position[roots] = np.cumsum(size[roots]) - size[roots]
+        position[roots] = offsets(size[roots])[:-1]
         for level in range(1, max_depth + 1):
             level_set = level_nodes[level_offsets[level] : level_offsets[level + 1]]
             # level_set ascends, so a parent's children ascend within it.
-            by_family = np.argsort(parent[level_set], kind="stable")
-            family = level_set[by_family]
-            sizes = size[family]
-            inclusive = np.cumsum(sizes)
-            first = np.r_[True, parent[family][1:] != parent[family][:-1]]
-            group_start = np.maximum.accumulate(np.where(first, np.arange(family.size), 0))
-            before = inclusive - sizes - (inclusive[group_start] - sizes[group_start])
+            family = level_set[np.argsort(parent[level_set], kind="stable")]
+            before = segmented_rank(parent[family], size[family])
             position[family] = position[parent[family]] + 1 + before
         dfs_order = np.empty(count, dtype=np.int64)
         dfs_order[position] = nodes
@@ -328,8 +304,7 @@ class TreePlan:
         light_mask = children_mask & ~is_heavy
         light_nodes = nodes[light_mask]
         light = light_nodes[np.lexsort((-light_nodes, parent[light_mask]))]
-        light_offsets = np.zeros(count + 1, dtype=np.int64)
-        np.cumsum(np.bincount(parent[light_mask], minlength=count), out=light_offsets[1:])
+        light_offsets = offsets(np.bincount(parent[light_mask], minlength=count))
 
         values = {
             "parent": parent,
@@ -391,7 +366,7 @@ class TreePlan:
     @property
     def dof_node(self) -> np.ndarray:
         """The node owning each coordinate."""
-        return np.repeat(np.arange(self.count, dtype=np.int32), self.dofs)
+        return expand(self.dofs)[0].astype(np.int32)
 
     def parent_slots(self, slot: np.ndarray) -> np.ndarray:
         """Each node's parent's slot, ``slot[parent]``, or ``-1`` at a root.
@@ -472,7 +447,7 @@ class TreePlan:
         meta[:, 1] = np.arange(32 * warps)
         meta[:, 2] = 0
         used = [0] * warps
-        members = _group_by(self.chain_of, self.chain_heads.size)
+        members = group_by(self.chain_of, self.chain_heads.size)
         for chain in sorted(range(self.chain_heads.size), key=lambda c: (-int(widths[c]), int(self.chain_heads[c]))):
             candidates = [warp for warp in range(warps) if used[warp] + widths[chain] <= 32]
             if not candidates:
@@ -520,11 +495,9 @@ class TreePlan:
         rows, cols = np.nonzero(present)
         lookup = np.full((n, n), -1, dtype=np.int32)
         lookup[rows, cols] = np.arange(rows.size, dtype=np.int32)
-        row_offsets = np.zeros(n + 1, dtype=np.int32)
-        np.cumsum(np.bincount(rows, minlength=n), out=row_offsets[1:])
+        row_offsets = offsets(np.bincount(rows, minlength=n), np.int32)
         column_order = np.lexsort((rows, cols))
-        column_offsets = np.zeros(n + 1, dtype=np.int32)
-        np.cumsum(np.bincount(cols, minlength=n), out=column_offsets[1:])
+        column_offsets = offsets(np.bincount(cols, minlength=n), np.int32)
         physical_lookup = np.full((n, n), -1, dtype=np.int32)
         a, b = permutation[rows], permutation[cols]
         physical_lookup[a, b] = physical_lookup[b, a] = np.arange(rows.size, dtype=np.int32)
@@ -534,12 +507,10 @@ class TreePlan:
             previous = np.flatnonzero(lookup[col, :col] >= 0)
             levels[col] = 0 if not previous.size else 1 + int(levels[previous].max())
         level_count = int(levels.max()) + 1
-        level_offsets = np.zeros(level_count + 1, dtype=np.int32)
-        np.cumsum(np.bincount(levels, minlength=level_count), out=level_offsets[1:])
+        level_offsets = offsets(np.bincount(levels, minlength=level_count), np.int32)
         off = np.flatnonzero(rows != cols)
         entries = off[np.lexsort((rows[off], cols[off], levels[cols[off]]))]
-        entry_offsets = np.zeros(level_count + 1, dtype=np.int32)
-        np.cumsum(np.bincount(levels[cols[entries]], minlength=level_count), out=entry_offsets[1:])
+        entry_offsets = offsets(np.bincount(levels[cols[entries]], minlength=level_count), np.int32)
         values = {
             "permutation": permutation,
             "inverse_permutation": inverse,
