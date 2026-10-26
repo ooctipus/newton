@@ -393,10 +393,13 @@ _BUILTIN_KINDS = {
     "mat44": _MATRIX,
     "transpose": _MATRIX,
     "skew": _MATRIX,
+    "quat_to_matrix": _MATRIX,
     "inverse": _FIRST,
     "where": _SECOND,
     "transform_get_rotation": _QUAT,
     "quat": _QUAT,
+    "quat_from_axis_angle": _QUAT,
+    "transform": _TRANSFORM,
     "transform_inverse": _TRANSFORM,
     "transform_multiply": _TRANSFORM,
 }
