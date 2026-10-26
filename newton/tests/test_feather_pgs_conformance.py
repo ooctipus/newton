@@ -1451,7 +1451,7 @@ def cuda_groups() -> list:
             Group(_physics(scenes.incline(), law, 32), ref, (MF_HELD, MF_GENERAL, SPLIT_LOOP, SPLIT_LOOP_UNIT)),
             Group(_physics(scenes.heightfield(), law, 32), ref, (MF_HELD, SPLIT_LOOP)),
             Group(_physics(scenes.legged(), law, 32), ref, tuple(legged)),
-            # A grasp drifts with the row order at a small budget: 32 keeps GPU row orders within its band.
+            # A grasp drifts with the row order at a small budget: the scene sorts its contacts and runs 32 iterations.
             Group(
                 _physics(scenes.gripper(), law, 32),
                 ref,

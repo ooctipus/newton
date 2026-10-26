@@ -792,8 +792,9 @@ def gripper(
         params={"mu": [mu] * worlds, "lift": lift, "worlds": worlds},
         solver_options={"enable_joint_limits": True, "dense_max_constraints": 64},
         control=control,
-        # The table's grasp drifted between CUDA repeats by more than its routes' bands allowed.
-        deterministic_contacts=table,
+        # A squeezed box is a statically indeterminate support, so the grasp drifts with the row order between CUDA
+        # repeats (the table's by more than its routes' bands allowed): sorted contacts fix the order.
+        deterministic_contacts=True,
         tags=frozenset({"articulated_contact", "grasp"}),
     )
 
@@ -1175,6 +1176,9 @@ def sprawl(*, mu: float = 0.8, fingers: int = 5, finger_links: int = 4) -> Scene
         params={"mu": [mu]},
         solver_options={"dense_max_constraints": 256},
         rigid_contact_max=512,
+        # The tree rests on one contact per link, a statically indeterminate support: sorted contacts fix the row
+        # order (see long_chain).
+        deterministic_contacts=True,
         tags=frozenset({"articulated_contact", "large_articulation"}),
     )
 
