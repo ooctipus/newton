@@ -7062,6 +7062,13 @@ class SolverFeatherPGS(SolverBase):
 
         When multiple DOF sizes exist (heterogeneous articulations), we can launch
         tiled kernels for different sizes in parallel using separate CUDA streams.
+
+        None of this solver's side streams (size groups, local-owner forks, the
+        paired sweep, inertia, dynamics, memset) reads contact rows or the contact
+        pool's ready count: they run factorizations, response and row sweeps over
+        dense and matrix-free rows, and articulation data, while contact rows are
+        read on the launch stream, which the pool registers. A trim therefore
+        waits for none of them (:meth:`ContactPool.add_reader_stream`).
         """
         self._size_streams: dict[int, wp.Stream | None] = {}
         self._size_events: dict[int, wp.Event | None] = {}
@@ -8847,8 +8854,13 @@ class SolverFeatherPGS(SolverBase):
         captured step of the same graph without a write Newton noted (such as
         a collision pass or :meth:`~newton.Contacts.clear`), and which was
         solved without patch friction rows (see ``friction_anchor_beta``); only
-        patch frame reuse sets it. Flags remain set across later successful
-        steps and :meth:`reset` calls.
+        patch frame reuse sets it. ``contact_launches`` identifies a contact-sized
+        launch of a captured graph, the solver's or the collision pipeline's
+        sharing its contact rows, that the graph's last replay skipped: its
+        device graph updater failed closed after the capture emitted it, or its
+        count passed the captured bound. Flags remain set across later successful
+        steps and :meth:`reset` calls; ``contact_launches`` until a replay runs
+        the launch again.
 
         Call outside CUDA graph capture, on the solver's execution stream or
         after explicitly joining that stream. This copies four integers to the
@@ -8870,6 +8882,8 @@ class SolverFeatherPGS(SolverBase):
         result = dict(zip(("dense", "matrix_free", "propagation", "contacts"), map(bool, values), strict=True))
         frame_status = self._patch_frame_status()
         result["patch_frames"] = frame_status is not None and bool(frame_status.numpy()[0])
+        pool = getattr(self, "_contact_pool", None)
+        result["contact_launches"] = pool is not None and pool.launch_failed(clear=clear)
         if clear:
             self._constraint_capacity_status.zero_()
             if frame_status is not None:
@@ -8890,6 +8904,14 @@ class SolverFeatherPGS(SolverBase):
         """
         if self.model.device.is_cuda and self.model.device.is_capturing:
             raise RuntimeError("check_constraint_capacity() must run outside CUDA graph capture")
+        # Skipped contact launches come first: they leave the rows the other checks read unbuilt.
+        pool = getattr(self, "_contact_pool", None)
+        if pool is not None and pool.launch_failed():
+            raise RuntimeError(
+                f"Captured contact launches did not run in their graph's last replay ({pool.launch_status()}): a "
+                "device graph updater failed closed after its capture emitted a launch, or a count passed what a "
+                "launch was captured for. Discard the graph's results and recapture."
+            )
         worlds = np.flatnonzero(self.constraint_overflow.numpy())
         if worlds.size:
             raise RuntimeError(

@@ -2895,6 +2895,8 @@ class CollisionPipeline:
         if pool.estimate is None:
             pool.plan_first_mapping(_estimate_rigid_contact_max(model) if estimate is None else estimate)
             self._service_generation = pool.generation
+        # Captured contact launches that a replay skipped surface with the narrow phase's capacity flags.
+        self.narrow_phase.contact_pool = pool
 
     def _terrain_law_unsupported(self) -> tuple[str, str, str] | None:
         """Return why the terrain law cannot write this pipeline's heightfield contacts, or ``None`` when it can.

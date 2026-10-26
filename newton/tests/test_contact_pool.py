@@ -6,6 +6,7 @@
 import contextlib
 import math
 import sys
+import time
 import unittest
 import warnings
 from types import SimpleNamespace
@@ -165,17 +166,25 @@ class TestContactPoolPolicy(unittest.TestCase):
             self.assertEqual(device_row_limit(device, 1), INDEX_LIMIT)
 
     def test_outdated_gpu_components_counts_as_absent(self):
-        """Keep ordinary arrays, with a warning, under a gpu_components release without the graph API the pool uses."""
+        """Keep ordinary arrays, with a warning, under a gpu_components release without the API the pool uses.
 
-        def prepare_updates(enable_count, *, enable_count_maximum, binding_capacity, library=None):
+        A release whose withdrawal takes no reader streams would let a trim unmap rows that a replay on another
+        stream still writes.
+        """
+
+        def prepare_updates(enable_count, *, enable_count_maximum, binding_capacity, errors=None, library=None):
             pass
 
         def launch(updates, kernel, dim, *, inputs=None, extent_axis=None, extent_source=None, parameters=()):
             pass
 
+        def withdraw(storage, rows):
+            pass
+
         package = mock.MagicMock()
         package.graph.prepare_updates = prepare_updates
         package.graph.launch = launch
+        package.fields.withdraw = withdraw
         package.graph.__file__ = "outdated/gpu_components/graph.py"
         modules = {
             "gpu_components": package,
@@ -185,7 +194,11 @@ class TestContactPoolPolicy(unittest.TestCase):
         with mock.patch.dict(sys.modules, modules), mock.patch.object(contact_pool, "_VIRTUAL_MEMORY", []):
             with self.assertLogs(contact_pool.logger, "WARNING") as logs:
                 self.assertIsNone(contact_pool._virtual_memory())
-        self.assertIn("prepare_updates(errors), launch(clamp_extent), launch(extent_scale)", logs.output[0])
+        self.assertIn(
+            "graph.launch(clamp_extent), graph.launch(extent_scale), fields.withdraw(streams), "
+            "fields.withdraw(protected_count_host)",
+            logs.output[0],
+        )
 
 
 def test_pool_rows_keep_contents_and_fill_new_rows(test, device):
@@ -783,7 +796,7 @@ def test_bound_launch_follows_growth_past_mapped_pages(test, device):
         test.assertTrue(np.all(values[size:] == -1))
     test.assertGreater(pool.mapped_bytes(), first_mapping, "growth mapped pages past the first ones")
     test.assertGreaterEqual(rows.rows, 3_000_000)
-    np.testing.assert_array_equal(pool._update_status.numpy()[:1], [0])
+    test.assertFalse(pool.launch_failed(), pool.launch_status())
 
 
 def test_trim_releases_pages_while_a_bound_graph_replays(test, device):
@@ -833,7 +846,175 @@ def test_trim_releases_pages_while_a_bound_graph_replays(test, device):
     test.assertGreater(mapped[10], mapped[11], "the next service unmaps, once the replays before completed")
     test.assertGreaterEqual(rows.rows, contact_pool.HEADROOM * 900_000, "growth after the trim")
     test.assertEqual(int(status.numpy()[0]), 0, "no replay dropped a contact")
-    np.testing.assert_array_equal(pool._update_status.numpy()[:1], [0])
+    test.assertFalse(pool.launch_failed(), pool.launch_status())
+
+
+@wp.kernel(enable_backward=False)
+def _snapshot_count(source: wp.array[wp.int32], target: wp.array[wp.int32]):
+    target[0] = source[0]
+
+
+@wp.kernel(enable_backward=False)
+def _spin(value: wp.array[float], iterations: wp.array[wp.int32]):
+    x = value[0]
+    for _ in range(iterations[0]):
+        x = x * 0.999999 + 1.0e-6
+    value[0] = x
+
+
+def _spin_iterations(device, milliseconds: float) -> int:
+    """Return the iterations of :func:`_spin` that keep the device busy for about ``milliseconds``."""
+    value, iterations = wp.zeros(1, dtype=float, device=device), wp.full(1, 1 << 20, dtype=wp.int32, device=device)
+    wp.launch(_spin, 1, [value, iterations], device=device)
+    start, end = wp.Event(device, enable_timing=True), wp.Event(device, enable_timing=True)
+    wp.get_stream(device).record_event(start)
+    wp.launch(_spin, 1, [value, iterations], device=device)
+    wp.get_stream(device).record_event(end)
+    wp.synchronize_device(device)
+    return int((1 << 20) * milliseconds / max(wp.get_event_elapsed_time(start, end), 1.0e-3))
+
+
+def test_trim_waits_for_a_replay_on_another_stream(test, device):
+    """A trim unmaps only once a replay on another stream, which read the higher count, has finished writing.
+
+    The graph, captured on a second stream, records its pass's demand, reads the ready rows as a graph updater
+    does and writes those rows half a second later. While a replay runs, the service lowers the ready rows on its
+    own stream and on the replay's (which the capture registered), with an event on each: the replay's stream's
+    event completes after the replay, so its late writes stay mapped. Joining only the service stream's event
+    instead unmaps under the replay, which faults with an illegal address.
+    """
+    pool = ContactPool(device=device)
+    target = type("Target", (), {})()
+    rows = pool.rows((ContactField("value", wp.int32, -1),), on_rows=lambda rows: rows.publish(target))
+    if not pool.bindable:
+        test.skipTest("only CUDA virtual memory trims")
+    pool.plan_first_mapping(4_000_000)
+    full, first = pool.ready, pool.mapped_bytes()
+    reader = wp.Stream(device)
+    demand = wp.full(1, 100_000, dtype=wp.int32, device=device)
+    count, seen = wp.zeros(1, dtype=wp.int32, device=device), wp.zeros(1, dtype=wp.int32, device=device)
+    spin, iterations = wp.zeros(1, dtype=float, device=device), wp.zeros(1, dtype=wp.int32, device=device)
+    slow = _spin_iterations(device, 500.0)
+    with wp.ScopedStream(reader), wp.ScopedCapture(device=device) as capture:
+        wp.copy(count, demand)
+        pool.record_demand(count, pool.ready_rows)
+        wp.launch(_snapshot_count, 1, [pool.ready_rows, seen], device=device)
+        wp.launch(_spin, 1, [spin, iterations], device=device)
+        wp.launch(_write_counted_rows, full, [seen, 7, target.value], device=device)
+    wp.synchronize_device(device)
+    with mock.patch.object(contact_pool, "TRIM_AFTER_PASSES", 2):
+        for _ in range(2):
+            wp.capture_launch(capture.graph, stream=reader)
+            wp.synchronize_stream(reader)
+            pool.service()
+        test.assertEqual(pool.trim_count, 0)
+        iterations.fill_(slow)
+        wp.synchronize_device(device)
+        wp.capture_launch(capture.graph, stream=reader)
+        time.sleep(0.1)  # the replay recorded its pass and read the full rows; it now spins
+        pool.service()
+        test.assertIsNotNone(pool._trim, "the service withdrew the rows")
+        events = pool._trim[0]
+        test.assertEqual(len(events), 2, "an event on the service's stream and one on the replay's")
+        test.assertFalse(all(event.is_complete for event in events), "the replay still writes the rows it read")
+        pool.service()
+        test.assertEqual(pool.trim_count, 0, "no unmap before the replay finished")
+        test.assertEqual(pool.mapped_bytes(), first)
+        while not all(event.is_complete for event in events):
+            time.sleep(0.005)
+        pool.service()
+    test.assertEqual(pool.trim_count, 1)
+    test.assertLess(pool.mapped_bytes(), first)
+    wp.synchronize_device(device)
+    test.assertEqual(int(seen.numpy()[0]), full, "the replay wrote the rows of the higher count")
+    trimmed = rows.rows
+    np.testing.assert_array_equal(target.value.numpy(), 7 + np.arange(trimmed, dtype=np.int32))
+    iterations.fill_(0)
+    target.value.fill_(-1)
+    wp.synchronize_device(device)
+    wp.capture_launch(capture.graph, stream=reader)
+    wp.synchronize_device(device)
+    test.assertEqual(int(seen.numpy()[0]), trimmed, "a later replay reads the lower count")
+    np.testing.assert_array_equal(target.value.numpy(), 7 + np.arange(trimmed, dtype=np.int32))
+
+
+def test_conditional_bodies_record_their_own_updaters(test, device):
+    """Each scope of a capture follows an updater of its own: a launch after a conditional body binds as before it.
+
+    A collision pass inside a conditional node's body (a solver's iteration loop) records an updater there, which
+    binds only launches in that body; a launch after the body binds to an updater of the graph around it.
+    """
+    pool = ContactPool(device=device, rows=1024)
+    target = type("Target", (), {})()
+    fields = tuple(ContactField(name, wp.int32, -1) for name in ("before", "inside", "after"))
+    pool_rows = pool.rows(fields, on_rows=lambda rows: rows.publish(target))
+    if not pool.bindable:
+        test.skipTest("contact launches bind with gpu_components' graph bridge only")
+    count, always = wp.full(1, 100, dtype=wp.int32, device=device), wp.ones(1, dtype=wp.int32, device=device)
+    wp.launch(_write_counted_rows, 1, inputs=[count, 0, target.before], device=device)
+
+    def body():
+        pool.begin_updates()
+        pool.launch(_write_counted_rows, pool.launch_rows(), inputs=[count, 2, target.inside], extent=count)
+
+    with wp.ScopedCapture(device=device) as capture:
+        pool.begin_updates()
+        pool.launch(_write_counted_rows, pool.launch_rows(), inputs=[count, 1, target.before], extent=count)
+        wp.capture_if(always, on_true=body)
+        pool.launch(_write_counted_rows, pool.launch_rows(), inputs=[count, 3, target.after], extent=count)
+    wp.capture_launch(capture.graph)
+    for name, value in (("before", 1), ("inside", 2), ("after", 3)):
+        values = getattr(target, name).numpy()
+        np.testing.assert_array_equal(values[:100], value + np.arange(100, dtype=np.int32), name)
+        test.assertTrue(np.all(values[100:] == -1), name)
+    test.assertFalse(pool.launch_failed(), pool.launch_status())
+    del pool_rows
+
+
+def test_failed_closed_launches_are_capacity_failures(test, device):
+    """A launch whose binding fails after its capture emitted it leaves a graph that skips its updater's launches.
+
+    Every replay disables them and reports -117 (gpu_components fails the updater closed); the pool, the narrow
+    phase and FeatherPGS report the skipped launches as a capacity failure instead of a silent zero launch.
+    """
+    model = _build_boxes(device)
+    solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=4)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    pool = pipeline._contact_pool
+    if not pool.bindable:
+        test.skipTest("contact launches bind with gpu_components' graph bridge only")
+    state_0, state_1, control = model.state(), model.state(), model.control()
+    extra = wp.zeros(pool.ready, dtype=wp.int32, device=device)
+
+    def simulate():
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 120.0)
+
+    simulate()  # load the modules outside capture
+    wp.synchronize_device(device)
+    with wp.ScopedCapture(device=device) as capture:
+        solver.seed_double_buffer_events()
+        simulate()
+        library = next(iter(pool._tables))._library
+        with mock.patch.object(library, "bind_node", return_value=-999), test.assertRaisesRegex(RuntimeError, "bind"):
+            pool.launch(
+                _write_counted_rows,
+                pool.launch_rows(),
+                inputs=[contacts.rigid_contact_count, 1, extra],
+                extent=contacts.rigid_contact_count,
+            )
+    test.assertFalse(pool.launch_failed(), "nothing replayed yet")
+    wp.capture_launch(capture.graph)
+    status = pool.launch_status()
+    test.assertGreater(status["failed_closed"], 0, status)
+    test.assertTrue(np.all(extra.numpy() == 0), "the failed launch did no work")
+    test.assertTrue(pipeline.narrow_phase.buffer_capacity_status()["contact_launches"])
+    test.assertTrue(solver.constraint_capacity_status()["contact_launches"])
+    with test.assertRaisesRegex(RuntimeError, "did not run in their graph's last replay"):
+        solver.check_constraint_capacity()
+    with test.assertRaisesRegex(RuntimeError, "contact_launches"):
+        pipeline.narrow_phase.check_buffer_capacity()
 
 
 def test_trim_and_growth_follow_a_feather_pgs_graph(test, device):
@@ -1055,8 +1236,7 @@ def test_sorted_matched_graph_follows_growth(test, device):
                 graph = capture()
     test.assertEqual(overflowed, [0], "only the replay where the demand first passed the rows drops contacts")
     test.assertEqual(recaptures, int(reallocates))
-    if pool._update_status is not None:
-        np.testing.assert_array_equal(pool._update_status.numpy(), 0)
+    test.assertFalse(pool.launch_failed(), pool.launch_status())
 
 
 def test_debug_clear_follows_growth(test, device):
@@ -1497,6 +1677,9 @@ for name, function in (
     ("test_growth_past_free_memory_raises_before_changing", test_growth_past_free_memory_raises_before_changing),
     ("test_bound_launch_follows_growth_past_mapped_pages", test_bound_launch_follows_growth_past_mapped_pages),
     ("test_trim_releases_pages_while_a_bound_graph_replays", test_trim_releases_pages_while_a_bound_graph_replays),
+    ("test_trim_waits_for_a_replay_on_another_stream", test_trim_waits_for_a_replay_on_another_stream),
+    ("test_conditional_bodies_record_their_own_updaters", test_conditional_bodies_record_their_own_updaters),
+    ("test_failed_closed_launches_are_capacity_failures", test_failed_closed_launches_are_capacity_failures),
     ("test_trim_and_growth_follow_a_feather_pgs_graph", test_trim_and_growth_follow_a_feather_pgs_graph),
     ("test_bound_graph_follows_growth_without_recapture", test_bound_graph_follows_growth_without_recapture),
     ("test_sorted_matched_graph_follows_growth", test_sorted_matched_graph_follows_growth),

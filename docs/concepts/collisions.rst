@@ -2553,6 +2553,14 @@ settle (its passes grow the buffers before anything reads them). The example
 runner (``newton.examples.run``) measures, services and recaptures the examples
 this way.
 
+A trim lowers the rows first and unmaps the pages past them once every stream that
+may read them has finished the work it submitted before: the streams collision
+passes and contact launches ran on, which includes the stream a graph was captured
+on: replay a graph on the stream it was captured on. A captured contact
+launch that a replay skipped (its updater failed after the capture emitted it)
+sets ``contact_launches`` in :meth:`~geometry.NarrowPhase.buffer_capacity_status`
+and in :meth:`~solvers.SolverFeatherPGS.constraint_capacity_status`.
+
 .. _Solver Integration:
 
 Solver Integration

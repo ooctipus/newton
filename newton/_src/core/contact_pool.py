@@ -37,9 +37,12 @@ Storage:
   rows are initialized: rows past the old ones served in-flight replays as
   scratch (second halves, extra rows), so no replay launched before a growth
   may see the new rows. A trim works the other way round, also while graphs
-  replay: it lowers the ready rows in stream order first, so no later replay
-  addresses the pages past them, records an event, and unmaps those pages
-  once the event completed (a later service), joining no stream.
+  replay: it lowers the ready rows in stream order first, makes every stream
+  that may read them wait for the lower count (:meth:`ContactPool.add_reader_stream`;
+  collision passes and contact launches register theirs), so no later work on
+  any of them addresses the pages past them, records an event on each, and
+  unmaps those pages once every event completed (a later service), joining no
+  stream.
 * On the CPU, on CUDA without ``gpu_components`` (logged once), for fields with
   gradients and for rows created during a graph capture, rows are ordinary
   arrays of the ready rows that growth reallocates, copying their prefix. The
@@ -181,6 +184,16 @@ INDEX_LIMIT = 2**31 - 1
 
 UPDATE_BINDINGS = 128
 """Kernels one device graph updater binds; a capture records another updater when one fills."""
+
+UPDATE_TABLES = 256
+"""Live device graph updaters a pool's status array holds: each claims its own :data:`UPDATE_BINDINGS` words.
+
+A capture records an updater per collision pass and per scope it launches in (a stream, a conditional body), and
+graphs keep theirs alive, so a few captures alive at once hold tens; the words cost 128 KiB."""
+
+FAILED_CLOSED = -117
+"""Status ``gpu_components`` writes for every binding of an updater whose capture failed after emitting a launch:
+each replay disables those launches."""
 
 CAPACITY_OVERFLOW = 1024
 """Capacity-status bit a pass sets when its contacts outnumbered the ready rows (the narrow phase's contacts bit)."""
@@ -328,17 +341,22 @@ _VIRTUAL_MEMORY: list[Any] = []
 """After the first look: ``gpu_components``' ``(backing, fields, FieldSpec, graph, KernelParameterBinding)``, or
 ``None`` without a usable package."""
 
-_GRAPH_FEATURES = {"prepare_updates": ("errors",), "launch": ("clamp_extent", "extent_scale")}
-"""The ``gpu_components.graph`` parameters the pool passes; releases without them also predate its Warp 1.17 support."""
+_FEATURES = {
+    ("graph", "prepare_updates"): ("errors",),
+    ("graph", "launch"): ("clamp_extent", "extent_scale"),
+    ("fields", "withdraw"): ("streams", "protected_count_host"),
+}
+"""The ``gpu_components`` parameters the pool passes, by module and function: releases without the reader streams
+of a withdrawal could unmap rows a replay on another stream still writes."""
 
 
-def _missing_graph_features(graph) -> list[str]:
-    """Return the :data:`_GRAPH_FEATURES` that ``graph`` lacks, as ``function(parameter)``."""
+def _missing_features(modules: dict) -> list[str]:
+    """Return the :data:`_FEATURES` that ``modules`` (name to module) lack, as ``module.function(parameter)``."""
     missing = []
-    for name, parameters in _GRAPH_FEATURES.items():
-        function = getattr(graph, name, None)
+    for (module, name), parameters in _FEATURES.items():
+        function = getattr(modules[module], name, None)
         known = inspect.signature(function).parameters if callable(function) else {}
-        missing.extend(f"{name}({parameter})" for parameter in parameters if parameter not in known)
+        missing.extend(f"{module}.{name}({parameter})" for parameter in parameters if parameter not in known)
     return missing
 
 
@@ -360,7 +378,7 @@ def _virtual_memory():
                 "reallocates and copies, as on the CPU, instead of CUDA virtual memory"
             )
         else:
-            missing = _missing_graph_features(graph)
+            missing = _missing_features({"graph": graph, "fields": fields})
             if missing:
                 _VIRTUAL_MEMORY.append(None)
                 logger.warning(
@@ -602,25 +620,36 @@ class ContactRows:
             covered = min(covered, (length - field.extra) // field.per_contact)
         return covered
 
-    def _withdraw(self, rows):
-        """Shrink the views to ``rows`` rows and withdraw the storage's readiness to them, in stream order.
+    @staticmethod
+    def _storage_rows(field, rows: int, protected: int) -> tuple[int, int]:
+        """Return a storage's rows and its protected bound for ``rows`` contact rows of which ``protected`` are live."""
+        withdrawn = field.per_contact * rows + field.extra
+        return withdrawn, min(field.per_contact * protected + field.extra, withdrawn)
 
-        Virtual rows only. The pages past them stay mapped for the replays already
-        submitted; :meth:`_unmap` returns them once those completed.
+    def _withdraw(self, rows: int, *, streams: tuple[int, ...], protected: int) -> list:
+        """Shrink the views to ``rows`` rows and withdraw the storage's readiness to them; return the events to join.
+
+        Virtual rows only. ``streams`` are the raw handles of the streams other than
+        the current one that may read the rows; each waits for the lower count. The
+        pages past the rows stay mapped for the work already submitted on any of
+        them; :meth:`_unmap` returns them once every event completed. The first
+        ``protected`` contact rows hold live contacts: no withdrawal goes below them.
         """
         fields_ops = self._vm[1]
+        events = []
         with wp.ScopedDevice(self.device):
             for storage, members in self._storages:
-                field = members[0]
-                fields_ops.withdraw(storage, field.per_contact * rows + field.extra)
+                withdrawn, bound = self._storage_rows(members[0], rows, protected)
+                events.extend(fields_ops.withdraw(storage, withdrawn, streams=streams, protected_count_host=bound))
         self._publish_rows(rows)
+        return events
 
-    def _unmap(self, rows):
-        """Unmap the pages past ``rows`` rows that :meth:`_withdraw` left mapped, in a joined maintenance scope."""
+    def _unmap(self, rows: int, protected: int) -> None:
+        """Unmap the pages past ``rows`` rows that :meth:`_withdraw` left mapped, in a maintenance scope joining it."""
         fields_ops = self._vm[1]
         for storage, members in self._storages:
-            field = members[0]
-            fields_ops.resize_backing(storage, field.per_contact * rows + field.extra, protected_count_host=0)
+            withdrawn, bound = self._storage_rows(members[0], rows, protected)
+            fields_ops.resize_backing(storage, withdrawn, protected_count_host=bound)
 
     def _map(self, rows, fields_ops):
         """Map ``rows`` rows of every virtual field: an append that joins no reader.
@@ -777,20 +806,28 @@ class ContactPool:
         """Trims completed so far."""
         # The high-water mark the trim watches, and the recorded passes when it last rose.
         self._still = (0, 0)
-        # A trim between its withdrawal and its unmap: (event after the withdrawal, rows, rows before, bytes before).
+        # A trim between its withdrawal and its unmap: (events to join, rows, protected rows, rows before, bytes before).
         self._trim = None
+        # Streams that may read the ready rows or the rows past them, by raw handle: where collision passes and
+        # contact launches ran (a captured graph replays on the stream it was captured on), and consumers' own.
+        self._readers: dict[int, weakref.ReferenceType] = {}
         self._reserved = 0
-        # Graph binding: the updater recorded last, by capture, and the captures that sized work by the host's rows.
+        # Graph binding: the updater recorded last in each scope of a capture (its graph or a conditional body),
+        # the live updaters this pool recorded, and the captures that sized work by the host's rows.
         self._graph_ops = None
         self._update_status = None
-        self._recording: tuple[weakref.ReferenceType, Any] | None = None
+        self._recording: dict[tuple[int, int | None], tuple[weakref.ReferenceType, Any]] = {}
+        self._tables: weakref.WeakSet = weakref.WeakSet()
+        # Status words of collected updaters, which a later updater may claim before its first replay writes them.
+        self._stale_status: list[tuple[int, int]] = []
         # Live captures that sized work by the host's rows, with the ready rows they sized it by.
         self._unbound_captures: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
         self._stale_on_growth = False
         vm = _virtual_memory() if self.device.is_cuda and self.ready_rows is not None else None
         if vm is not None:
             graph_ops = vm[3]
-            self._update_status = wp.zeros(UPDATE_BINDINGS, dtype=wp.int32, device=self.device)
+            # Each updater claims its own UPDATE_BINDINGS words, so a check reads every binding's last replay.
+            self._update_status = wp.zeros(UPDATE_TABLES * UPDATE_BINDINGS, dtype=wp.int32, device=self.device)
             try:
                 # One preparation outside capture loads the updater; captures then prepare tables freely.
                 graph_ops.prepare_updates(
@@ -917,8 +954,9 @@ class ContactPool:
         elif target < self.ready and self._trimmable():
             rows = self._trim_rows(target)
             if rows < self.ready:
-                self._begin_trim(rows)
-                wp.synchronize_event(self._trim[0])
+                self._begin_trim(rows, self._kept_rows(self.high_water))
+                for event in self._trim[0]:
+                    wp.synchronize_event(event)
                 self._finish_trim()
 
     def settle(self) -> None:
@@ -1126,6 +1164,7 @@ class ContactPool:
                 rows a pool created during capture holds.
             status: A capacity-status array (int32) whose element 0 flags the overflow, or ``None``.
         """
+        self._note_reader()
         empty = wp.empty(0, dtype=wp.int32, device=self.device)
         wp.launch(
             _record_demand,
@@ -1142,6 +1181,56 @@ class ContactPool:
             device=self.device,
             record_tape=False,
         )
+
+    def add_reader_stream(self, stream: wp.Stream) -> None:
+        """Register ``stream`` as one that may read the ready rows or the rows past them.
+
+        A trim makes every registered stream wait for the lower count and unmaps
+        only once the work each had submitted before it completed (:meth:`service`).
+        Collision passes and contact launches register the stream they run on, so
+        a graph replayed on the stream it was captured on needs nothing more;
+        register a stream of a consumer's own that reads contact rows, and a
+        stream a graph replays on that it was not captured on. Held weakly.
+        """
+        if self.device.is_cuda and stream is not None:
+            handle = int(stream.cuda_stream)
+            known = self._readers.get(handle)
+            if known is None or known() is None:
+                self._readers[handle] = weakref.ref(stream)
+
+    def _note_reader(self) -> None:
+        if self.device.is_cuda:
+            self.add_reader_stream(wp.get_stream(self.device))
+
+    def launch_status(self, *, clear: bool = False) -> dict[str, int]:
+        """Count the bound contact launches that the last replay of their graph did not run, outside capture.
+
+        ``failed_closed``: launches of an updater whose capture failed after
+        emitting a launch (status :data:`FAILED_CLOSED`); every replay skips them.
+        ``out_of_bounds``: launches whose count passed what they were captured
+        for, which the replay skipped. ``errors``: launches whose update raised a
+        CUDA error. Reads the status words of the live updaters this pool recorded
+        back to the host, which waits for the current stream; ``clear`` zeroes
+        them after reading (a later replay reports again what still fails).
+        """
+        if self._update_status is None or capturing(self.device):
+            return {}
+        values = self._update_status.numpy()
+        base = self._update_status.ptr
+        failed_closed = out_of_bounds = errors = 0
+        for table in list(self._tables):
+            offset = (table.errors.ptr - base) // 4
+            words = values[offset : offset + len(table.bindings)]
+            failed_closed += int((words == FAILED_CLOSED).sum())
+            out_of_bounds += int((words == -1).sum())
+            errors += int((words > 0).sum())
+        if clear:
+            self._update_status.zero_()
+        return {"failed_closed": failed_closed, "out_of_bounds": out_of_bounds, "errors": errors}
+
+    def launch_failed(self, *, clear: bool = False) -> bool:
+        """Whether a bound contact launch did not run in the last replay of its graph (see :meth:`launch_status`)."""
+        return any(self.launch_status(clear=clear).values())
 
     @property
     def high_water(self) -> int:
@@ -1175,6 +1264,9 @@ class ContactPool:
         """
         if capturing(self.device):
             return False
+        while self._stale_status:
+            offset, count = self._stale_status.pop()
+            self._update_status[offset : offset + count].zero_()
         self._finish_trim()
         self.settle()
         if self.growable:
@@ -1236,34 +1328,53 @@ class ContactPool:
             return
         if passes - self._still[1] < TRIM_AFTER_PASSES:
             return
-        rows = self._trim_rows(self._kept_rows(high_water))
+        kept = self._kept_rows(high_water)
+        rows = self._trim_rows(kept)
         if rows < self.ready:
-            self._begin_trim(rows)
+            self._begin_trim(rows, kept)
             self._first_mapping = False
 
-    def _begin_trim(self, rows: int) -> None:
-        """Lower the ready rows to ``rows`` in stream order and record the event after which their pages unmap."""
+    def _reader_streams(self) -> tuple[int, ...]:
+        """Return the raw handles of the live reader streams other than the current one."""
+        current = int(wp.get_stream(self.device).cuda_stream)
+        live = {}
+        for handle, ref in self._readers.items():
+            stream = ref()
+            if stream is not None:
+                live[handle] = ref
+        self._readers = live
+        return tuple(handle for handle in live if handle != current)
+
+    def _begin_trim(self, rows: int, protected: int) -> None:
+        """Lower the ready rows to ``rows`` in stream order on every reader stream and keep the events to join.
+
+        The pool's count goes first, then each storage's: every reader stream
+        waits for both, and the events recorded after them on the current stream
+        and each reader stream complete once every replay that may have read the
+        higher count has finished. ``protected`` rows hold live contacts.
+        """
         previous, mapped = self.ready, self.mapped_bytes()
-        for member in self._live_members():
-            member._withdraw(rows)
+        streams = self._reader_streams()
         self._publish_ready(rows)
-        event = wp.Event(self.device)
-        wp.get_stream(self.device).record_event(event)
-        self._trim = (event, rows, previous, mapped)
+        events = []
+        for member in self._live_members():
+            events.extend(member._withdraw(rows, streams=streams, protected=protected))
+        self._trim = (tuple(events), rows, protected, previous, mapped)
 
     def _finish_trim(self) -> None:
-        """Unmap the pages a trim withdrew once the replays submitted before it completed; return spare memory."""
+        """Unmap the pages a trim withdrew once the work every reader stream submitted before it completed."""
         if self._trim is None:
             return
-        event, rows, previous, mapped = self._trim
-        if not event.is_complete:
+        events, rows, protected, previous, mapped = self._trim
+        if not all(event.is_complete for event in events):
             return
         members = self._live_members()
         if members:
             owner, backing_ops, _ = _backing(self.device, *members[0]._vm[:2])
-            with wp.ScopedDevice(self.device), backing_ops.maintenance(owner, events=(event.cuda_event,)):
+            joined = [event.cuda_event for event in events]
+            with wp.ScopedDevice(self.device), backing_ops.maintenance(owner, events=joined):
                 for member in members:
-                    member._unmap(rows)
+                    member._unmap(rows, protected)
                 backing_ops.trim(owner)
         self._trim = None
         self.trim_count += 1
@@ -1347,6 +1458,17 @@ class ContactPool:
         if owner is not None:
             self._open_updates(owner)
 
+    @staticmethod
+    def _scope(owner) -> tuple[int, int | None]:
+        """Return the scope launches are captured in now: ``owner``'s graph or the conditional body it records.
+
+        Warp swaps the raw graph of a capture while it records a conditional
+        node's body; an updater binds only launches downstream of it in its own
+        graph, or in a body that follows it, so each scope records its own.
+        """
+        handle = getattr(owner, "graph", None)
+        return id(owner), getattr(handle, "value", handle)
+
     def _open_updates(self, owner):
         graph_ops, _ = self._graph_ops
         updates = graph_ops.prepare_updates(
@@ -1356,11 +1478,16 @@ class ContactPool:
             errors=self._update_status,
         )
         graph_ops.record_update(updates)
-        self._recording = (weakref.ref(owner), updates)
+        self._recording = {key: value for key, value in self._recording.items() if value[0]() is not None}
+        self._recording[self._scope(owner)] = (weakref.ref(owner), updates)
+        self._tables.add(updates)
+        words = ((updates.errors.ptr - self._update_status.ptr) // 4, UPDATE_BINDINGS)
+        # Runs from a finalizer, perhaps during a capture: queue only; the next service clears the words.
+        weakref.finalize(updates, self._stale_status.append, words).atexit = False
         return updates
 
     def _updates_for(self, owner):
-        recording = self._recording
+        recording = self._recording.get(self._scope(owner))
         if recording is not None and recording[0]() is owner:
             updates = recording[1]
             if len(updates.bindings) < updates.binding_capacity:
@@ -1401,8 +1528,12 @@ class ContactPool:
         ``extent=ready_rows``. ``extent=None`` keeps the captured size, so
         ``dim`` must then not depend on the rows.
         """
+        self._note_reader()
         owner = self._binding_owner()
         if owner is None:
+            if capturing(self.device):
+                # Captured unbound (no virtual rows, or a stream Warp's capture does not own): sized by today's rows.
+                self.note_unbound()
             # Contact bookkeeping is forward-only: an active autodiff tape records none of it.
             options = {"block_dim": block_dim} if block_dim else {}
             if tiled:

@@ -2819,6 +2819,9 @@ class NarrowPhase:
         self.mesh_sdf_identity_scale_only = mesh_sdf_identity_scale_only
         self.deterministic = deterministic
         self.verify_buffers = verify_buffers
+        self.contact_pool = None
+        """The contact rows of the collision pipeline using this narrow phase, set by the pipeline; their captured
+        launches report through :meth:`buffer_capacity_status` (``contact_launches``)."""
         self.speculative = speculative
         if speculative and contact_writer_warp_func is not None and not contact_writer_supports_speculative:
             raise ValueError(
@@ -4360,7 +4363,12 @@ class NarrowPhase:
         kernels, which write their partners' heightfield contacts (by
         default, see ``NEWTON_TERRAIN_LAW``; the ``contacts`` bit then also
         covers them) or run in shadow beside the terrain route
-        (``NEWTON_TERRAIN_LAW_SHADOW``).
+        (``NEWTON_TERRAIN_LAW_SHADOW``). ``contact_launches`` (a narrow phase of a
+        :class:`~newton.CollisionPipeline`): a contact-sized launch of a captured
+        graph, the pipeline's or a solver's sharing its contact rows, that the
+        graph's last replay skipped, because its device graph updater failed
+        closed after the capture emitted it or its count passed the captured
+        bound; clearing acknowledges it until a replay reports it again.
         """
         if not self.verify_buffers:
             raise RuntimeError("Narrow-phase capacity status requires verify_buffers=True throughout the run")
@@ -4388,6 +4396,8 @@ class NarrowPhase:
         result = {name: bool(mask & (1 << bit)) for bit, name in enumerate(names)}
         if self._heightfield_pair_csr:
             result["heightfield_pair_csr_raw_or_membership"] = int(self._pair_csr.status.numpy()[0]) != 0
+        if self.contact_pool is not None:
+            result["contact_launches"] = self.contact_pool.launch_failed(clear=clear)
         if clear:
             self._buffer_capacity_status.zero_()
             if self._heightfield_pair_csr:
