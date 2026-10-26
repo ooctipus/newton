@@ -12,7 +12,7 @@ import warp as wp
 from ...sim import BodyFlags
 from . import cached_force, kernels, response_operator, sparse_factor, tree_chain_scan
 from .publication_data import PublicationData
-from .tree_kinetic_layout import REFERENCE_LAYOUT, THREADS, TreeLayout
+from .tree_kinetic_layout import REFERENCE_LAYOUT, TreeLayout
 
 
 @wp.func
@@ -190,10 +190,10 @@ _DIFFERENT_MOTION_SOURCE = r"""
 @functools.cache
 def _thread_helpers(layout):
     """Lane, barrier and sub-tree natives for one tree layout."""
-    lanes_source = layout.render(THREADS + _LANES_SOURCE)
-    sync_source = layout.render(THREADS + _SYNC_SOURCE)
-    sub_source = layout.render(THREADS + _SUB_SOURCE)
-    motion_source = layout.render(THREADS + _DIFFERENT_MOTION_SOURCE)
+    lanes_source = layout.native(_LANES_SOURCE)
+    sync_source = layout.native(_SYNC_SOURCE)
+    sub_source = layout.native(_SUB_SOURCE)
+    motion_source = layout.native(_DIFFERENT_MOTION_SOURCE)
 
     @wp.func_native(lanes_source)
     def _lanes() -> wp.vec3i: ...
@@ -278,7 +278,7 @@ def _bank_binding(coordinates, layout):
     bitwise.
     """
 
-    @wp.func_native(layout.render(THREADS + _LANE_STRIDE + _BANK_MATCHES, COORDINATES=str(coordinates)))
+    @wp.func_native(layout.native(_LANE_STRIDE + _BANK_MATCHES, COORDINATES=str(coordinates)))
     def matches(
         bank: StateBank,
         first_q: int,
@@ -314,7 +314,7 @@ def _block_vote(layout):
     warp; an unpacked block holds one tree and votes over the block.
     """
 
-    @wp.func_native(layout.render(THREADS + _BLOCK_VOTE))
+    @wp.func_native(layout.native(_BLOCK_VOTE))
     def block_any(value: int) -> int: ...
 
     return block_any
@@ -748,7 +748,7 @@ _HOST_STORAGE_SOURCE = r"""
 def _host_storage(layout):
     """Return the scratch of an owner on the CPU, which the kernels release with ``_keep_static``."""
 
-    @wp.func_native(layout.render(THREADS + _HOST_STORAGE_SOURCE))
+    @wp.func_native(layout.native(_HOST_STORAGE_SOURCE))
     def _storage() -> wp.uint64: ...
 
     return _storage
@@ -832,11 +832,11 @@ def get_helpers(
         motion_source = layout.render(tree_chain_scan._MOTION)
         reduction = tree_chain_scan.reduction_source(moments=True, layout=layout)
     else:
-        pose_source = layout.render(THREADS + (_POSE_SHFL if register_scan else _POSE))
-        motion_source = layout.render(THREADS + (_MOTION_SHFL if register_scan else _MOTION))
+        pose_source = layout.native(_POSE_SHFL if register_scan else _POSE)
+        motion_source = layout.native(_MOTION_SHFL if register_scan else _MOTION)
         reduction = _INTERVAL_REDUCE if register_scan else _LEVEL_REDUCE
-    collect_source = layout.render(
-        THREADS + _COLLECT,
+    collect_source = layout.native(
+        _COLLECT,
         PHYSICAL_TABLE=layout.physical_table(),
         PHYSICAL_ROW=layout.physical("p.row.data[e]"),
         PHYSICAL_COL=layout.physical("p.col.data[e]"),
@@ -845,7 +845,7 @@ def get_helpers(
         **_native_clocks(clocked, "cache", stages=3, column=13),
     )
 
-    @wp.func_native(layout.render(THREADS + _STORAGE_SOURCE))
+    @wp.func_native(layout.native(_STORAGE_SOURCE))
     def _storage() -> wp.uint64: ...
 
     @wp.func_native(
@@ -1789,7 +1789,7 @@ def get_predictor_kernel(
     elif response != "sparse":
         raise ValueError("Unknown held tree response representation")
     operations["TWIST_BLOCK"] = _TWIST_BLOCK if (layout.lanes <= 32 and not chain_scan) else ""
-    source = layout.render(THREADS + _PREDICT, **operations, **_native_clocks(clocked, "f", stages=5, column=8))
+    source = layout.native(_PREDICT, **operations, **_native_clocks(clocked, "f", stages=5, column=8))
 
     @wp.func_native(source)
     def native(

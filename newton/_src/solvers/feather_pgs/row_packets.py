@@ -28,6 +28,15 @@ import warp as wp
 
 from ...sim import ModelFlags
 from .contact_input import ContactInput, bind
+from .device_preludes import (
+    dual_native,
+    lane_group,
+    reserved_count,
+    warp_broadcast,
+    warp_lane,
+    warp_stride,
+    warp_sync,
+)
 from .friction_patches import PatchRowLaw, patch_friction_location, patch_row_frame, patch_tangent_row
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -120,33 +129,18 @@ class QueueData:
 
 
 _PREFIX_SOURCE = r"""
-#if defined(__CUDA_ARCH__)
-    const int lane = threadIdx.x & 31;
-    const int group = block * WARPS + (threadIdx.x >> 5);
-    if (group >= data.group_to_art.shape[0]) return;
-#else
-    if (logical_lane != 0) return;
-    for (int group = block * WARPS; group < (block + 1) * WARPS && group < data.group_to_art.shape[0]; ++group) {
-    const int lane = 0;
-#endif
+    // A warp runs each group on CUDA; on the CPU one thread runs the block's groups in turn.
+    for (int group = block * WARPS + SUB; group < (block + 1) * WARPS && group < data.group_to_art.shape[0]; group += GROUPS) {
     const int art = data.group_to_art.data[group];
     const int world = data.art_to_world.data[art];
     const int first_dof = data.dof_start.data[art];
     const int mimic_first = data.mimic_start.data[art];
     const int mimic_end = data.mimic_start.data[art + 1];
     const int M = data.kind.shape[1];
-#if defined(__CUDA_ARCH__)
-    for (int row = lane; row < PACKETS; row += 32) data.row_contact.data[world * PACKETS + row] = -1;
-#else
-    for (int row = 0; row < PACKETS; ++row) data.row_contact.data[world * PACKETS + row] = -1;
-#endif
+    for (int row = LANE; row < PACKETS; row += STRIDE) data.row_contact.data[world * PACKETS + row] = -1;
     int count = 0;
-    for (int chunk = 0; chunk < CANDIDATES; chunk += 32) {
-#if defined(__CUDA_ARCH__)
-        const int candidate = chunk + lane;
-#else
-        for (int candidate = chunk; candidate < chunk + 32 && candidate < CANDIDATES; ++candidate) {
-#endif
+    for (int chunk = 0; chunk < CANDIDATES; chunk += STRIDE) {
+        const int candidate = chunk + LANE;
         int active = 0, d0 = -1, d1 = -1, type = 3, mimic = -1;
         float w0 = 0.0f, w1 = 0.0f, phi = 0.0f;
         if (candidate < MIMICS) {
@@ -178,15 +172,9 @@ _PREFIX_SOURCE = r"""
                 w0 = side == 0 ? 1.0f : -1.0f;
             }
         }
-#if defined(__CUDA_ARCH__)
-        const unsigned mask = __ballot_sync(0xffffffffu, active != 0);
-        const unsigned earlier = lane == 0 ? 0u : ((1u << lane) - 1u);
-        const int slot = count + __popc(mask & earlier);
-        count += __popc(mask);
-#else
-        const int slot = count;
-        count += active;
-#endif
+        const unsigned votes = BALLOT(active != 0);
+        const int slot = count + BELOW(votes);
+        count += COUNT(votes);
         if (active && slot < PACKETS) {
             const int sparse = (world * PACKETS + slot) * 2;
             data.dofs.data[sparse] = d0;
@@ -210,18 +198,13 @@ _PREFIX_SOURCE = r"""
             data.impulses.data[row] = 0.0f;
             if (mimic >= 0) data.mimic_slot.data[mimic] = slot;
         }
-#if !defined(__CUDA_ARCH__)
-        }
-#endif
     }
-    if (lane == 0) {
+    if (LANE == 0) {
         data.slot_counter.data[world] = count;
         data.bounds.data[world * 2] = count;
         data.bounds.data[world * 2 + 1] = count;
     }
-#if !defined(__CUDA_ARCH__)
     }
-#endif
 """
 
 
@@ -246,12 +229,12 @@ def get_prefix_kernel(primary: int, mimics: int, packets: int):
     ):
         source = source.replace(token, str(value))
 
-    @wp.func_native(source)
-    def prefix_native(block: int, logical_lane: int, data: PrefixData): ...
+    @wp.func_native(dual_native(source, preludes=(lane_group(32),)))
+    def prefix_native(block: int, data: PrefixData): ...
 
     def prefix(data: PrefixData):
-        block, lane = wp.tid()
-        prefix_native(block, lane, data)
+        block, _lane = wp.tid()
+        prefix_native(block, data)
 
     prefix.__name__ = prefix.__qualname__ = f"row_packet_prefix{primary}_m{mimics}_r{packets}"
     return wp.kernel(module="unique", enable_backward=False)(prefix)
@@ -319,46 +302,6 @@ def validate_prefix_topology(
     return True
 
 
-@wp.func_native("""
-#if defined(__CUDA_ARCH__)
-return 32;
-#else
-return 1;
-#endif
-""")
-def _row_stride() -> int: ...
-
-
-@wp.func_native("""
-#if defined(__CUDA_ARCH__)
-return threadIdx.x;
-#else
-return 0;
-#endif
-""")
-def _lane() -> int: ...
-
-
-@wp.func_native("""
-#if defined(__CUDA_ARCH__)
-return wp::vec3(__shfl_sync(0xffffffffu, value[0], 0),
-                __shfl_sync(0xffffffffu, value[1], 0),
-                __shfl_sync(0xffffffffu, value[2], 0));
-#else
-return value;
-#endif
-""")
-def _broadcast(value: wp.vec3) -> wp.vec3: ...
-
-
-@wp.func_native("""
-#if defined(__CUDA_ARCH__)
-__syncwarp();
-#endif
-""")
-def _join(): ...
-
-
 @wp.kernel
 def finalize_and_queue(
     prefix: PrefixData,
@@ -370,11 +313,7 @@ def finalize_and_queue(
 ):
     """Fuse the dense-count clamp, the local ownership decision and the two queues."""
     world = wp.tid()
-    rows = prefix.slot_counter[world]
-    if rows > prefix.kind.shape[1]:
-        wp.atomic_max(queue.status, 0, 1)
-        rows = prefix.kind.shape[1]
-    rows = wp.min(rows, prefix.first_rejected_slot[world])
+    rows = reserved_count(prefix.slot_counter, world, prefix.kind.shape[1], prefix.first_rejected_slot, queue.status, 0)
     queue.count[world] = rows
     mf_count = queue.mf_count[world]
     primary = queue.primary[world]
@@ -433,7 +372,7 @@ def materialize_general_prefix(
         for item in range(group_start[world], group_start[world + 1]):
             art = group_art[item]
             group = art_group[art]
-            for coefficient in range(lane, queue.count[world] * size, _row_stride()):
+            for coefficient in range(lane, queue.count[world] * size, warp_stride()):
                 row, dof = coefficient // size, coefficient % size
                 value = float(0.0)
                 if art == queue.primary[world] and row < prefix.bounds[world, 0]:
@@ -465,7 +404,7 @@ def general_response(
         for item in range(group_start[world], group_start[world + 1]):
             art = group_art[item]
             group = art_group[art]
-            for row in range(lane, queue.count[world], _row_stride()):
+            for row in range(lane, queue.count[world], warp_stride()):
                 for i in range(size):
                     value = J[group, row, i]
                     for k in range(i):
@@ -497,7 +436,7 @@ def general_diag(
     worker, lane = wp.tid()
     for entry in range(worker, queue.general_count[0], workers):
         world = queue.general[entry]
-        for row in range(lane, queue.count[world], _row_stride()):
+        for row in range(lane, queue.count[world], warp_stride()):
             value = float(0.0)
             for dof in range(world_dofs[world]):
                 value += J[world, row, dof] * Y[world, row, dof]
@@ -555,8 +494,8 @@ def incident_projection(data: ContactInput, body: int, art: int, point: wp.vec3,
 def produce_contacts(workers: int, data: ContactInput, packet: ContactPacketData, primary: int, secondary: int):
     """Cooperatively project current contacts into physical packets after allocation."""
     worker, _logical_lane = wp.tid()
-    lane = _lane()
-    stride = _stride_value()
+    lane = warp_lane()
+    stride = warp_stride()
     capacity = packet.jacobian.shape[1]
     width = primary + secondary
     total = wp.min(data.count[0], data.point0.shape[0])
@@ -582,10 +521,10 @@ def produce_contacts(workers: int, data: ContactInput, packet: ContactPacketData
         if lane == 0:
             _body0, _body1, point0, point1 = contact_points(data, contact)
             tangent0, tangent1 = contact_tangent_basis(normal)
-        point0 = _broadcast(point0)
-        point1 = _broadcast(point1)
-        tangent0 = _broadcast(tangent0)
-        tangent1 = _broadcast(tangent1)
+        point0 = warp_broadcast(point0)
+        point1 = warp_broadcast(point1)
+        tangent0 = warp_broadcast(tangent0)
+        tangent1 = warp_broadcast(tangent1)
         anchor = 0.5 * (point0 + point1)
         for coefficient in range(lane, rows * width, stride):
             row = coefficient // width
@@ -608,7 +547,7 @@ def produce_contacts(workers: int, data: ContactInput, packet: ContactPacketData
                 value = endpoint_projection(data, body0, art0, size, dof, p0, direction)
                 value -= endpoint_projection(data, body1, art1, size, dof, p1, direction)
                 packet.jacobian[world, output_row, coordinate] = value
-        _join()
+        warp_sync()
         if lane == 0:
             mu = float(0.0)
             materials = int(0)
@@ -679,17 +618,7 @@ def produce_contacts(workers: int, data: ContactInput, packet: ContactPacketData
                     data.row_w[world, output_row] = weight
                 if output_row < capacity:
                     packet.row_contact[world, output_row] = contact * 3 + row
-        _join()
-
-
-@wp.func_native("""
-#if defined(__CUDA_ARCH__)
-return 32;
-#else
-return 1;
-#endif
-""")
-def _stride_value() -> int: ...
+        warp_sync()
 
 
 @wp.kernel(enable_backward=False)
@@ -703,8 +632,8 @@ def materialize_fallback(
 ):
     """Reproject every general-world endpoint, including rows outside the local bound."""
     worker, _logical_lane = wp.tid()
-    lane = _lane()
-    stride = _stride_value()
+    lane = warp_lane()
+    stride = warp_stride()
     total = wp.min(data.count[0], data.point0.shape[0])
     for contact in range(worker, total, workers):
         if data.path[contact] != 0 or data.slot[contact] < 0:
@@ -757,8 +686,8 @@ def produce_patch_contacts(
     bounce threshold, where the two routes can disagree on whether the row bounces.
     """
     worker, _logical_lane = wp.tid()
-    lane = _lane()
-    stride = _stride_value()
+    lane = warp_lane()
+    stride = warp_stride()
     capacity = packet.jacobian.shape[1]
     width = primary + secondary
     total = wp.min(data.count[0], data.point0.shape[0])
@@ -784,10 +713,10 @@ def produce_patch_contacts(
         if lane == 0:
             _body0, _body1, point0, point1 = contact_points(data, contact)
             tangent0, tangent1 = contact_tangent_basis(normal)
-        point0 = _broadcast(point0)
-        point1 = _broadcast(point1)
-        tangent0 = _broadcast(tangent0)
-        tangent1 = _broadcast(tangent1)
+        point0 = warp_broadcast(point0)
+        point1 = warp_broadcast(point1)
+        tangent0 = warp_broadcast(tangent0)
+        tangent1 = warp_broadcast(tangent1)
         friction0, friction1 = patch_friction_location(law.patches, contact)
         for coefficient in range(lane, rows * width, stride):
             row = coefficient // width
@@ -805,7 +734,7 @@ def produce_patch_contacts(
                 value = endpoint_projection(data, body0, art0, size, dof, p0, direction)
                 value -= endpoint_projection(data, body1, art1, size, dof, p1, direction)
                 packet.jacobian[world, output_row, coordinate] = value
-        _join()
+        warp_sync()
         if lane == 0:
             mu = float(0.0)
             materials = int(0)
@@ -871,7 +800,7 @@ def produce_patch_contacts(
                     data.row_w[world, output_row] = weight
                 if output_row < capacity:
                     packet.row_contact[world, output_row] = contact * 3 + row
-        _join()
+        warp_sync()
 
 
 @wp.kernel(enable_backward=False)
@@ -886,8 +815,8 @@ def materialize_patch_fallback(
 ):
     """Reproject every general-world endpoint as :func:`materialize_fallback` does, with the patch law."""
     worker, _logical_lane = wp.tid()
-    lane = _lane()
-    stride = _stride_value()
+    lane = warp_lane()
+    stride = warp_stride()
     total = wp.min(data.count[0], data.point0.shape[0])
     for contact in range(worker, total, workers):
         if data.path[contact] != 0 or data.slot[contact] < 0:

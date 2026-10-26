@@ -9,6 +9,7 @@ from functools import cache
 import numpy as np
 import warp as wp
 
+from newton._src.solvers.feather_pgs.device_preludes import dual_native, lane_group
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseMassMatrixPlan
 from newton._src.solvers.feather_pgs.sparse_row_projection import _sparse_contact_projection_source
 from newton.tests.test_feather_pgs_sparse_mass_matrix import _endpoint_support
@@ -20,26 +21,21 @@ def projection_kernel(n, nnz):
     fragment = _sparse_contact_projection_source("shared_mask", dof_count=n, scratch_stride=n)
     body = f"""
     #if defined(__CUDA_ARCH__)
-    const int lane=threadIdx.x&31, stride=32;
     __shared__ float jacobian[{3 * n}];
     #else
-    const int lane=0, stride=1;
     float jacobian[{3 * n}];
     #endif
-    for(int i=lane;i<{3 * n};i+=stride)jacobian[i]=input.data[i];
-    #if defined(__CUDA_ARCH__)
-    __syncwarp();
-    #endif
-    const auto first_bit=[](unsigned long long m){{int i=0;while((m&1ull)==0){{m>>=1;++i;}}return i;}};
+    for(int i=LANE;i<{3 * n};i+=STRIDE)jacobian[i]=input.data[i];
+    SYNC();
     const int factor_base=0;
-    for(int node=lane;node<{n};node+=stride){{
+    for(int node=LANE;node<{n};node+=STRIDE){{
         if((mask&(1ull<<node))==0)continue;
         {fragment}
         for(int r=0;r<3;++r)output.data[node*3+r]=value.c[r];
     }}
     """
 
-    @wp.func_native(body)
+    @wp.func_native(dual_native(body, preludes=(lane_group(32),)))
     def native(
         factor_row_offsets: wp.array[int],
         inverse_factor: wp.array2d[float],

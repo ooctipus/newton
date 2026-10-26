@@ -166,8 +166,8 @@ class TestVelocityLimitLawSources(unittest.TestCase):
             velocity_limit_law="accumulated",
         )
         text = "\n".join(sources)
-        self.assertIn("const float old_mf_vlim = __shfl_sync(MASK, lane == 0 ? g_lam_mf[i] : 0.0f, 0);", text)
-        self.assertNotIn("lane == 0 ? __shfl_sync", text)
+        self.assertIn("const float old_mf_vlim = READ(lane == 0 ? g_lam_mf[i] : 0.0f, 0);", text)
+        self.assertNotIn("lane == 0 ? READ", text)
 
     def test_sparse_sweeps_without_limit_rows_ignore_the_law(self):
         """Fold the law away where a sparse sweep holds no velocity-limit row."""

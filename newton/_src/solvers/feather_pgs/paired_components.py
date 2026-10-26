@@ -20,6 +20,8 @@ from functools import cache
 
 import warp as wp
 
+from .device_preludes import dual_native, lane_group
+
 
 @wp.struct
 class PairedComponentData:
@@ -47,26 +49,19 @@ class PairedComponentData:
 
 
 FREE_BODY_DOFS = 6
+# Threads of one block, which qualifies and publishes one world at a time.
+PAIRED_COMPONENT_THREADS = 128
 
 _SOURCE = r"""
-#if defined(__CUDA_ARCH__)
-    const int tid = threadIdx.x;
-    const int nt = blockDim.x;
-    const int lane = tid & 31;
-    const int warp = tid >> 5;
-    const int nw = nt / 32;
-    __shared__ int accepted;
-#else
+#if !defined(__CUDA_ARCH__)
     if (logical_lane != 0) return;
-    const int tid = 0, nt = 1, lane = 0, warp = 0, nw = 1;
-    int accepted;
 #endif
     const int M = data.J.shape[1];
     const int F = data.mf_meta.shape[1] / 4;
     for (int world = worker; world < data.world_count; world += workers) {
         const int m = data.counts.data[world];
         const int mf = data.mf_counts.data[world];
-        if (tid == 0) data.selector.data[world] = mf == 0 ? 0 : wp::max(mf, 1);
+        if (LANE == 0) data.selector.data[world] = mf == 0 ? 0 : wp::max(mf, 1);
         if (mf == 0) continue;
         if (m < 0 || m > M || mf < 1 || mf > F) continue;
         const int po = data.primary_offset.data[world];
@@ -74,16 +69,12 @@ _SOURCE = r"""
         const int group = data.primary_group.data[world];
         if (!((po == 0 && so == PRIMARY) || (po == SECONDARY && so == 0))
             || group < 0 || group >= data.L.shape[0]) continue;
-        if (tid == 0) accepted = 1;
-#if defined(__CUDA_ARCH__)
-        __syncthreads();
-#endif
         int valid = 1;
-        for (int k = tid; k < PRIMARY * PRIMARY; k += nt) {
+        for (int k = LANE; k < PRIMARY * PRIMARY; k += STRIDE) {
             const float x = data.L.data[group * PRIMARY * PRIMARY + k];
             valid &= wp::isfinite(x) && wp::abs(x) <= 1.0e15f;
         }
-        for (int row = tid; row < m; row += nt) {
+        for (int row = LANE; row < m; row += STRIDE) {
             const int r = world * M + row;
             const int type = data.row_type.data[r];
             const float diag = data.diag.data[r];
@@ -107,7 +98,7 @@ _SOURCE = r"""
                 if (d >= so && d < so + SECONDARY) valid &= j == 0.0f && y == 0.0f;
             }
         }
-        for (int row = tid; row < mf; row += nt) {
+        for (int row = LANE; row < mf; row += STRIDE) {
             const int r = world * F + row;
             const int packed = data.mf_meta.data[r * 4];
             const int a = packed >> 16, b = static_cast<int>(static_cast<short>(packed & 65535));
@@ -140,20 +131,15 @@ _SOURCE = r"""
                     && wp::isfinite(data.mf_MiJt_b.data[r * SECONDARY + d]);
             }
         }
-#if defined(__CUDA_ARCH__)
-        if (!valid) atomicExch(&accepted, 0);
-        __syncthreads();
-#else
-        accepted = valid;
-#endif
-        if (accepted) {
-            for (int row = warp; row < m; row += nw) {
+        if (ALL(valid != 0)) {
+            for (int row = WARP; row < m; row += WARPS) {
                 const int base = (world * M + row) * WORLD + po;
 #if defined(__CUDA_ARCH__)
+                const int lane = LANE & 31;
                 const float y = lane < PRIMARY ? data.Y.data[base + lane] : 0.0f;
                 float z = 0.0f;
                 for (int k = 0; k < PRIMARY; ++k) {
-                    const float yk = __shfl_sync(0xffffffffu, y, k);
+                    const float yk = READ(y, k);
                     if (lane < PRIMARY && lane <= k)
                         z += data.L.data[group * PRIMARY * PRIMARY + k * PRIMARY + lane] * yk;
                 }
@@ -169,12 +155,8 @@ _SOURCE = r"""
                 }
 #endif
             }
-            if (tid == 0) data.selector.data[world] = -1;
+            if (LANE == 0) data.selector.data[world] = -1;
         }
-#if defined(__CUDA_ARCH__)
-        // Do not reuse the shared admission word while another warp consumes it.
-        __syncthreads();
-#endif
     }
 """
 
@@ -201,7 +183,7 @@ def get_prepare_kernel(primary_size: int, secondary_size: int = FREE_BODY_DOFS):
     A generous finite-product bound rejects extreme conditioning before any Y
     write; it never clips an impulse or changes the original fallback law.
     """
-    snippet = get_source(primary_size, secondary_size)
+    snippet = dual_native(get_source(primary_size, secondary_size), preludes=(lane_group(PAIRED_COMPONENT_THREADS),))
 
     @wp.func_native(snippet)
     def prepare_native(worker: int, logical_lane: int, workers: int, data: PairedComponentData): ...
@@ -274,5 +256,9 @@ class PairedComponents:
             setattr(data, target, getattr(solver, source))
         data.rhs, data.mf_meta, data.L = rhs, mf_meta, solver.L_by_size[self.primary_size]
         wp.launch_tiled(
-            self.kernel, dim=[self.workers], inputs=[self.workers, data], block_dim=128, device=solver.model.device
+            self.kernel,
+            dim=[self.workers],
+            inputs=[self.workers, data],
+            block_dim=PAIRED_COMPONENT_THREADS,
+            device=solver.model.device,
         )

@@ -1924,13 +1924,16 @@ def patch_normal_load(parents: wp.array2d[int], impulses: wp.array2d[float], wor
 
     A contact row's parent field links the next normal in its region (a circular
     list). Friction rows still point to their adjacent normal row. Other row
-    families retain their original parent semantics.
+    families retain their original parent semantics. The Warp form of the native
+    ``RING_LOAD`` (:mod:`.device_preludes`): the same order, the same hop guard.
     """
     load = impulses[world, first]
     row = parents[world, first]
-    while row >= 0 and row != first:
+    hop = int(0)
+    while row >= 0 and row != first and hop < parents.shape[1]:
         load += impulses[world, row]
         row = parents[world, row]
+        hop += 1
     return load
 
 

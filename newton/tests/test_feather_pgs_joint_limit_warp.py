@@ -60,6 +60,8 @@ def _resolved_mask(problem, resolved):
 def _scalar_rows(problem, resolved=None):
     """Build the joint-limit rows with the scalar per-articulation kernel."""
     outputs = _outputs(problem.articulation_count, problem.max_constraints, problem.size, problem.device)
+    counter, *rows = outputs
+    first_rejected = wp.full(problem.articulation_count, 2**31 - 1, dtype=wp.int32, device=problem.device)
     wp.launch(
         build_joint_limit_rows_for_size,
         dim=problem.articulation_count,
@@ -81,7 +83,7 @@ def _scalar_rows(problem, resolved=None):
             1.0e-6,
             _resolved_mask(problem, resolved),
         ],
-        outputs=list(outputs),
+        outputs=[counter, first_rejected, *rows],
         device=problem.device,
     )
     return outputs

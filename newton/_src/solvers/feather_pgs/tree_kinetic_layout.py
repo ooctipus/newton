@@ -6,24 +6,7 @@
 from dataclasses import dataclass
 from string import Template
 
-# Thread primitives of one tree's lane group, from its lane count alone. A tree
-# of LANES < 32 threads shares a warp with others (one per SUB) and
-# synchronizes, votes and shuffles within its MASK at width WIDTH; a tree of
-# 32 or 64 threads owns its block and uses block barriers and votes. A native
-# whose CUDA side uses LANE, STRIDE, SUB, MASK, WIDTH, SYNC(), ALL(p) or ANY(p)
-# starts with this prelude; names a native does not use compile away.
-THREADS = r"""
-#if defined(__CUDA_ARCH__)
-    constexpr int LANES=$LANES,WIDTH=LANES<32?LANES:32;
-    const unsigned MASK=(0xffffffffu>>(32-WIDTH))<<(threadIdx.x&(31&~(WIDTH-1)));
-    const int LANE=LANES<32?threadIdx.x&(LANES-1):threadIdx.x;
-    const int STRIDE=LANES<32?LANES:blockDim.x;
-    const int SUB=LANES<32?threadIdx.x/LANES:0;
-    auto SYNC=[&]{if constexpr(LANES<32)__syncwarp(MASK);else __syncthreads();};
-    auto ALL=[&](int p){if constexpr(LANES<32)return __all_sync(MASK,p);else return __syncthreads_and(p);};
-    auto ANY=[&](int p){if constexpr(LANES<32)return __any_sync(MASK,p);else return __syncthreads_or(p);};
-#endif
-"""
+from .device_preludes import dual_native, lane_group
 
 
 @dataclass(frozen=True)
@@ -174,6 +157,14 @@ class TreeLayout:
             raise ValueError(f"Native fragments shadow layout sizes: {sorted(clashes)}")
         values = {name: Template(text).substitute(sizes) for name, text in fragments.items()}
         return Template(source).substitute(sizes, **values)
+
+    def native(self, source, **fragments):
+        """Render a native template (see :meth:`render`) after the tree's lane group of :attr:`lanes` threads.
+
+        A tree of fewer than 32 lanes shares a warp with others (one per ``SUB``); a tree of 32 lanes owns its
+        warp and a tree of 64 its block (:func:`~.device_preludes.lane_group`).
+        """
+        return dual_native(self.render(source, **fragments), preludes=(lane_group(self.lanes),))
 
 
 # The 44-body, 43-coordinate free-root chain the kernels were first written for;

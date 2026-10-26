@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compose FeatherPGS native sweeps from declared device preludes only.
+"""Compose FeatherPGS native sources from declared device preludes only.
 
-A native sweep body declares the device helpers it calls, such as the paired
-friction law, and ``device_preludes.cuda_native`` places them after the body's
-one architecture guard. These tests check that layout on every native snippet
-of the point-stream inventory and scan the package for text splices of
-preludes or guards elsewhere.
+A native body declares the device helpers it calls, such as the paired
+friction law, a lane group or the patch ring, and ``device_preludes.cuda_native``
+places them after the body's one architecture guard; ``dual_native`` places
+their CPU twins after an ``#else`` for a body that also runs on the CPU. These
+tests check that layout on every native snippet of the point-stream inventory
+and scan the package for text splices of preludes or guards elsewhere.
 """
 
 import ast
@@ -17,7 +18,13 @@ import unittest
 from pathlib import Path
 
 from newton._src.solvers.feather_pgs import contact_unit, device_preludes, friction
-from newton._src.solvers.feather_pgs.device_preludes import ARCHITECTURE_GUARD, DevicePrelude, cuda_native
+from newton._src.solvers.feather_pgs.device_preludes import (
+    ARCHITECTURE_GUARD,
+    DevicePrelude,
+    cuda_native,
+    dual_native,
+    lane_group,
+)
 
 _PACKAGE = "newton._src.solvers.feather_pgs"
 # Helper names a body may call only after declaring the prelude that defines them.
@@ -25,7 +32,11 @@ _HELPERS = {
     "friction_pair_candidate(": "friction_pair",
     "friction_pair_metric(": "friction_pair_cached",
     "friction_pair_from_metric(": "friction_pair_cached",
+    "RING_LOAD(": "ring",
+    "RING_ANY(": "ring",
 }
+# The lane groups the package composes: warp groups, block groups and the run-time width of lane_minimum.
+_LANE_GROUPS = tuple(lane_group(lanes) for lanes in (1, 2, 4, 8, 16, 32, 64, 96, 128, "lanes"))
 
 
 def _modules():
@@ -127,26 +138,36 @@ def _splices(module_file, text, prelude_names):
 
 
 def split_preludes(snippet, preludes):
-    """Return ``(lead, declared prelude names, body)`` of a snippet composed by ``cuda_native``.
+    """Return ``(lead, declared prelude names, body, dual)`` of a snippet composed by ``cuda_native`` or ``dual_native``.
+
+    A ``dual_native`` snippet follows its CUDA preludes with ``#else``, their CPU twins in the same order and
+    ``#endif``.
 
     Raises:
-        AssertionError: The snippet does not open with one guard after an empty or newline lead.
+        AssertionError: The snippet does not open with one guard after an empty or newline lead, or a dual
+            snippet's CPU twins do not repeat its preludes.
     """
     lead, guard, rest = snippet.partition(ARCHITECTURE_GUARD)
     if not guard or lead not in ("", "\n"):
         raise AssertionError("the snippet does not open with its architecture guard")
-    names = []
+    declared = []
     matched = True
     while matched:
         matched = False
         # Longest first: no prelude may hide another one that it begins with.
         for prelude in sorted(preludes, key=lambda item: len(item.source), reverse=True):
             if rest.startswith(prelude.source + "\n"):
-                names.append(prelude.name)
+                declared.append(prelude)
                 rest = rest[len(prelude.source) + 1 :]
                 matched = True
                 break
-    return lead, names, rest
+    dual = rest.startswith("#else\n")
+    if dual:
+        twins = "#else\n" + "".join(f"{prelude.cpu}\n" for prelude in declared) + "#endif\n"
+        if any(prelude.cpu is None for prelude in declared) or not rest.startswith(twins):
+            raise AssertionError("the CPU twins of a dual snippet do not follow its preludes")
+        rest = rest[len(twins) :]
+    return lead, [prelude.name for prelude in declared], rest, dual
 
 
 class TestDevicePreludeComposition(unittest.TestCase):
@@ -162,6 +183,32 @@ class TestDevicePreludeComposition(unittest.TestCase):
         snippet = cuda_native("    body();\n#endif\n", preludes=(first, second))
         self.assertEqual(snippet, "\n#if defined(__CUDA_ARCH__)\n    int a;\n    int b;\n    body();\n#endif\n")
         self.assertEqual(cuda_native("x", lead=""), "#if defined(__CUDA_ARCH__)\nx")
+
+    def test_dual_native_places_cpu_twins_after_the_preludes(self):
+        """Compose the guard, the CUDA preludes, ``#else``, their CPU twins and ``#endif``, then the shared body."""
+        first = DevicePrelude("first", "    int a = 1;", "    int a = 0;")
+        second = DevicePrelude("second", "    int b = 1;", "    int b = 0;")
+        snippet = dual_native("    body(a, b);\n", preludes=(first, second))
+        self.assertEqual(
+            snippet,
+            "\n#if defined(__CUDA_ARCH__)\n    int a = 1;\n    int b = 1;\n#else\n    int a = 0;\n    int b = 0;\n"
+            "#endif\n    body(a, b);\n",
+        )
+        self.assertEqual(
+            split_preludes(snippet, (first, second)), ("\n", ["first", "second"], "    body(a, b);\n", True)
+        )
+        with self.assertRaisesRegex(ValueError, "CPU twin"):
+            dual_native("x", preludes=(DevicePrelude("cuda_only", "    int c;"),))
+
+    def test_lane_groups_differ_only_in_their_width(self):
+        """Name each lane group by its width, reject widths it cannot hold and keep one text per width."""
+        self.assertIs(lane_group(16), lane_group(16))
+        self.assertEqual(lane_group(16).name, "lane_group_16")
+        self.assertEqual(lane_group(16).cpu, lane_group(64).cpu)
+        self.assertEqual(lane_group(16).source.replace("LANES = 16,", "LANES = 64,"), lane_group(64).source)
+        for lanes in (0, 3, 24, 48):
+            with self.subTest(lanes=lanes), self.assertRaises(ValueError):
+                lane_group(lanes)
 
     def test_preludes_are_named_uniquely(self):
         """Give every declared prelude its own name, so a composed snippet names its preludes unambiguously."""
@@ -181,6 +228,7 @@ class TestNativeSweepLayout(unittest.TestCase):
         from newton.tests import test_feather_pgs_point_streams as pins  # noqa: PLC0415
 
         cls.preludes, _ = _preludes(_modules())
+        cls.preludes += list(_LANE_GROUPS)
         cls.snippets = {}
         for name, kernel in pins._factory_kernels().items():
             for snippet in _native_snippets(kernel):
@@ -193,15 +241,19 @@ class TestNativeSweepLayout(unittest.TestCase):
         self.assertIn(friction.FRICTION_PAIR_CACHED.source, text)
 
     def test_preludes_follow_one_guard(self):
-        """Open every snippet holding a prelude with one guard and its preludes, then a body without preludes."""
+        """Open every snippet holding a prelude with one guard and its preludes, then a body without preludes.
+
+        A CUDA-only body keeps that one guard; a body ``dual_native`` composes may guard its own CUDA code.
+        """
         checked = 0
         for snippet, kernel in self.snippets.items():
             if not any(prelude.source in snippet for prelude in self.preludes):
                 continue
             checked += 1
             with self.subTest(kernel=kernel):
-                self.assertEqual(snippet.count(ARCHITECTURE_GUARD), 1)
-                _, names, body = split_preludes(snippet, self.preludes)
+                _, names, body, dual = split_preludes(snippet, self.preludes)
+                if not dual:
+                    self.assertEqual(snippet.count(ARCHITECTURE_GUARD), 1)
                 self.assertTrue(names)
                 for prelude in self.preludes:
                     self.assertNotIn(prelude.source, body, f"{prelude.name} is spliced into the body")
@@ -217,7 +269,7 @@ class TestNativeSweepLayout(unittest.TestCase):
             if not calls:
                 continue
             with self.subTest(kernel=kernel):
-                _, names, _ = split_preludes(snippet, self.preludes)
+                _, names, _, _ = split_preludes(snippet, self.preludes)
                 self.assertTrue(any(_HELPERS[helper] in names for helper in calls))
 
 

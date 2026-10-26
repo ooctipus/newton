@@ -75,14 +75,37 @@ def _allocator_arrays(capacity, *, route=0, count=205, device="cpu"):
 
 
 def _allocate(arrays):
-    """Run the real allocator without enabling detailed telemetry."""
+    """Run the real allocator without enabling detailed telemetry, then close both row families' reservations.
+
+    Reservations record the first rejected slot; the families' count finalizers raise the status.
+    """
     kernel = kernels.allocate_world_contact_slots
+    device = arrays["contact_count"].device
     wp.launch(
         kernel,
         dim=1,
         inputs=[arrays[name] for name in inspect.signature(kernel.func).parameters],
-        device=arrays["contact_count"].device,
+        device=device,
     )
+    for family, counter, capacity, first_rejected in (
+        (0, "world_slot_counter", "max_constraints", "dense_first_rejected_slot"),
+        (1, "mf_slot_counter", "mf_max_constraints", "mf_first_rejected_slot"),
+    ):
+        wp.launch(
+            kernels.finalize_constraint_counts_with_status,
+            dim=1,
+            inputs=[arrays[counter], arrays[capacity], family, arrays[first_rejected]],
+            outputs=[wp.empty(1, dtype=wp.int32, device=device), arrays["capacity_status"]],
+            device=device,
+        )
+
+
+def _clear_reservations(arrays):
+    """Start a new step's reservations: empty counters, no rejected slot."""
+    for name in ("world_slot_counter", "mf_slot_counter"):
+        arrays[name].zero_()
+    for name in ("dense_first_rejected_slot", "mf_first_rejected_slot"):
+        arrays[name].fill_(2**31 - 1)
 
 
 class TestFeatherPGSCapacityStatus(unittest.TestCase):
@@ -104,6 +127,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
             if clear:
                 self.assertTrue(solver.constraint_capacity_status(clear=True)["dense"])
             arrays["contact_count"].assign(np.array([count], dtype=np.int32))
+            _clear_reservations(arrays)
             wp.capture_launch(capture.graph)
             self.assertEqual(solver.constraint_capacity_status()["dense"], expected)
 
@@ -235,6 +259,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
                 expected[route] = 1
                 np.testing.assert_array_equal(arrays["capacity_status"].numpy(), expected)
                 arrays["contact_count"].assign(np.array([0], dtype=np.int32))
+                _clear_reservations(arrays)
                 _allocate(arrays)
                 np.testing.assert_array_equal(arrays["capacity_status"].numpy(), expected)
 

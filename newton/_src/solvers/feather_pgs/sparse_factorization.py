@@ -58,7 +58,7 @@ def _sparse_cholesky_source(dof_count: int, nonzero_count: int) -> str:
     levels, one warp per articulation (or serial on CPU).
 
     The caller binds ``indices``, mutable ``factor``, ``status``, ``group`` and
-    ``lane``/``stride``. Producers, mass assembly, inverse generation and
+    ``lane``/``stride``, and declares a lane group (``SYNC``). Producers, mass assembly, inverse generation and
     publication are external to this operation. No pivot floor or
     numerical-policy change is introduced.
     """
@@ -82,9 +82,7 @@ def _sparse_cholesky_source(dof_count: int, nonzero_count: int) -> str:
             }
             factor[diagonal] = sqrtf(value);
         }
-#if defined(__CUDA_ARCH__)
-        __syncwarp();
-#endif
+        SYNC();
         const int entry_begin = indices.factor_level_entry_offsets.data[level];
         const int entry_end = indices.factor_level_entry_offsets.data[level + 1];
         for (int work = entry_begin + lane; work < entry_end; work += stride) {
@@ -102,8 +100,6 @@ def _sparse_cholesky_source(dof_count: int, nonzero_count: int) -> str:
             }
             factor[target] = value / factor[diagonal];
         }
-#if defined(__CUDA_ARCH__)
-        __syncwarp();
-#endif
+        SYNC();
     }
 """

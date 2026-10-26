@@ -8,7 +8,7 @@ from functools import cache
 
 import warp as wp
 
-from .device_preludes import cuda_native
+from .device_preludes import RING, cuda_native, lane_group
 from .friction import FRICTION_PAIR, FRICTION_PAIR_CACHED
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -196,7 +196,7 @@ def _get_pgs_solve_sparse_kernel(
 """
         factor_initialize = f"""
     for (int i = lane; i < count * {D}; i += {L}) local_factor[i] = 0.0f;
-    __syncwarp(MASK);
+    SYNC();
     for (int i = lane; i < count * {S}; i += {L}) {{
         const int row = i / {S}, entry = i % {S};
         const int index = {index_read};
@@ -233,7 +233,7 @@ def _get_pgs_solve_sparse_kernel(
     bool linked = false;
     for (int row = lane; row < count; row += 32)
         if (type[row] == {contact_type} && world_row_parent.data[offset + row] >= 0) linked = true;
-    const bool select_active = __ballot_sync(MASK, linked) == 0u && isfinite(omega) && omega >= 0.0f;
+    const bool select_active = BALLOT(linked) == 0u && isfinite(omega) && omega >= 0.0f;
 """
         tangent_selection = """selected = row == parent + 1 && (
                         ((normal_words[parent / 32] >> (parent & 31)) & 1u) != 0u
@@ -244,12 +244,10 @@ def _get_pgs_solve_sparse_kernel(
     const bool select_active = isfinite(omega) && omega >= 0.0f;
 """
             # Walk the ring as the pair update pools its load, from the pair's own normal.
-            tangent_selection = """selected = row == parent + 1 && (impulse[row] != 0.0f || impulse[parent + 2] != 0.0f);
-                    for (int next = parent; row == parent + 1 && !selected && next >= 0;) {
-                        selected = ((normal_words[next / 32] >> (next & 31)) & 1u) != 0u;
-                        next = world_row_parent.data[offset + next];
-                        if (next == parent) break;
-                    }"""
+            tangent_selection = """const auto normal_selected = [&](int r) { return ((normal_words[r / 32] >> (r & 31)) & 1u) != 0u; };
+                    selected = row == parent + 1 && (impulse[row] != 0.0f || impulse[parent + 2] != 0.0f
+                        || (parent >= 0 && (normal_selected(parent)
+                            || RING_ANY(parent, count, ring_parent, normal_selected))));"""
         active_scan = f"""
         for (int first = 0; first < count; first += 32) {{
             const int row = first + lane;
@@ -279,10 +277,10 @@ def _get_pgs_solve_sparse_kernel(
                     impulse[row] = 0.0f;
                 }}
             }}
-            const unsigned mask = __ballot_sync(MASK, selected);
+            const unsigned mask = BALLOT(selected);
             if (lane == 0) normal_words[first / 32] = mask;
         }}
-        __syncwarp(MASK);
+        SYNC();
         for (int first = 0; first < count; first += 32) {{
             const int row = first + lane;
             bool selected = false;
@@ -294,16 +292,16 @@ def _get_pgs_solve_sparse_kernel(
                     {tangent_selection}
                 }}
             }}
-            const unsigned mask = __ballot_sync(MASK, selected);
+            const unsigned mask = BALLOT(selected);
             if (lane == 0) selected_words[first / 32] = mask;
         }}
-        __syncwarp(MASK);
+        SYNC();
 """
         row_loop = """
         for (int word = 0; word < (count + 31) / 32; ++word) {
             unsigned pending = selected_words[word];
             while (pending != 0u) {
-                const int row = word * 32 + __ffs(pending) - 1;
+                const int row = word * 32 + FIRST(pending);
                 pending &= pending - 1u;"""
         row_loop_end = "            }\n        }"
     impulse_slack = "change_tolerance + relative_change_tolerance * fabsf(new_impulse)"
@@ -312,9 +310,7 @@ def _get_pgs_solve_sparse_kernel(
     __shared__ float rhs_storage[{W * M}];
     __shared__ float diagonal_storage[{W * M}];
     __shared__ unsigned char type_storage[{W * M}];
-    const unsigned MASK = {hex((1 << L) - 1)}u << (threadIdx.x & {32 - L});
-    const int lane = threadIdx.x & {L - 1};
-    const int slot = threadIdx.x / {L};
+    const int lane = LANE, slot = SUB;
     const int offset = world * {M};
     const int row_base = offset * {S};
     const int count = min(world_constraint_count.data[world], {M});
@@ -323,6 +319,9 @@ def _get_pgs_solve_sparse_kernel(
     float* rhs = rhs_storage + slot * {M};
     float* diagonal = diagonal_storage + slot * {M};
     unsigned char* type = type_storage + slot * {M};
+    // A contact normal's patch ring links the region's next normal (-1 ends a point contact).
+    const auto ring_parent = [&](int r) {{ return world_row_parent.data[offset + r]; }};
+    const auto ring_impulse = [&](int r) {{ return impulse[r]; }};
 
 {active_storage}
 {factor_storage}
@@ -336,7 +335,7 @@ def _get_pgs_solve_sparse_kernel(
     }}
 
 {factor_initialize}
-    __syncwarp(MASK);
+    SYNC();
 {active_initialize}
 """
     if warm_start:
@@ -358,7 +357,7 @@ def _get_pgs_solve_sparse_kernel(
                 }}
             }}
         }}
-        __syncwarp(MASK);
+        SYNC();
     }}
 """
     velocity_filter = velocity_sweep = ""
@@ -387,7 +386,7 @@ def _get_pgs_solve_sparse_kernel(
                     indent=" " * 12,
                     declare="const float ",
                 )
-                + "            __syncwarp(MASK);\n"
+                + "            SYNC();\n"
                 + "            if (lane == 0) impulse[row] = new_vlim;"
             )
         else:
@@ -411,9 +410,8 @@ def _get_pgs_solve_sparse_kernel(
                 responses[q] = response;
                 if (index >= 0) dot += response * delta[index];
             }}
-            for (int shift = {L // 2}; shift > 0; shift >>= 1)
-                dot += __shfl_down_sync(MASK, dot, shift, {L});
-            const float residual = __shfl_sync(MASK, dot, 0, {L}) + rhs[row];
+            SUM(dot);
+            const float residual = dot + rhs[row];
 {final_velocity_limit}
             if (correction != 0.0f) {{
 {velocity_vote}
@@ -421,7 +419,7 @@ def _get_pgs_solve_sparse_kernel(
                 for (int q = 0; q < {Q}; ++q)
                     if (indices[q] >= 0) delta[indices[q]] += responses[q] * correction;
             }}
-            __syncwarp(MASK);
+            SYNC();
         }}
 """
     row_vote = vote(
@@ -438,7 +436,7 @@ def _get_pgs_solve_sparse_kernel(
             const bool friction = row_type == {friction_type};
             if (friction && global_iteration < friction_start_iteration) {{
                 if (lane == 0) impulse[row] = 0.0f;
-                __syncwarp(MASK);
+                SYNC();
                 continue;
             }}
             const int parent = friction ? world_row_parent.data[offset + row] : -1;
@@ -450,10 +448,7 @@ def _get_pgs_solve_sparse_kernel(
             float old_sibling = 0.0f;
             float radius = 0.0f;
             if (friction) {{
-                float normal_load = impulse[parent];
-                for (int next = world_row_parent.data[offset + parent]; next >= 0 && next != parent;
-                     next = world_row_parent.data[offset + next])
-                    normal_load += impulse[next];
+                const float normal_load = RING_LOAD(impulse[parent], parent, count, ring_parent, ring_impulse);
                 radius = fmaxf(world_row_mu.data[offset + row] * normal_load, 0.0f);
                 old_sibling = impulse[sibling];
                 // A zero-radius, zero-impulse pair cannot change the velocity.
@@ -483,19 +478,15 @@ def _get_pgs_solve_sparse_kernel(
                     cross += value * sibling_value;
                 }}
             }}
-            for (int shift = {L // 2}; shift > 0; shift >>= 1) {{
-                dot += __shfl_down_sync(MASK, dot, shift, {L});
-                sibling_dot += __shfl_down_sync(MASK, sibling_dot, shift, {L});
-                cross += __shfl_down_sync(MASK, cross, shift, {L});
-            }}
-            const float residual = __shfl_sync(MASK, dot, 0, {L}) + rhs[row];
+            SUM(dot, sibling_dot, cross);
+            const float residual = dot + rhs[row];
             float new_impulse = old_impulse;
             float sibling_change = 0.0f;
             if (friction) {{
                 float2 pair = make_float2(0.0f, 0.0f);
                 if (radius > 0.0f) {{
-                    const float sibling_residual = __shfl_sync(MASK, sibling_dot, 0, {L}) + rhs[sibling];
-                    pair = friction_pair_candidate(denominator, __shfl_sync(MASK, cross, 0, {L}),
+                    const float sibling_residual = sibling_dot + rhs[sibling];
+                    pair = friction_pair_candidate(denominator, cross,
                         diagonal[sibling], residual, sibling_residual, old_impulse, old_sibling, radius, omega);
                 }}
                 const float magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
@@ -524,7 +515,7 @@ def _get_pgs_solve_sparse_kernel(
                     }}
                 }}
             }}
-            __syncwarp(MASK);
+            SYNC();
 """
     violation = None
     if active_rows:
@@ -551,24 +542,16 @@ for (int first = 0; first < count; first += 32) {{
         }}
     }}
 }}
-for (int offset = 16; offset > 0; offset >>= 1) {{
-    const float other = __shfl_xor_sync(MASK, sweep_violation, offset);
-    const int other_kind = __shfl_xor_sync(MASK, sweep_violation_kind, offset);
-    if (other > sweep_violation || (other == sweep_violation && other_kind > sweep_violation_kind)) {{
-        sweep_violation = other;
-        sweep_violation_kind = other_kind;
-    }}
-}}""",
+ARGMAX(sweep_violation, sweep_violation_kind);""",
             "sweep_violation",
             "sweep_violation_kind",
         )
     sweep_finish = "\n" + sweep_exit(
         solve_policy,
-        "        if (global_iteration >= friction_start_iteration && __ballot_sync(MASK, changed != 0) == 0u) break;\n",
+        "        if (global_iteration >= friction_start_iteration && BALLOT(changed != 0) == 0u) break;\n",
         gate="global_iteration >= friction_start_iteration",
-        quiet="__ballot_sync(MASK, changed != 0) == 0u",
+        quiet="BALLOT(changed != 0) == 0u",
         violation=violation,
-        lanes=L,
     )
     laws = (FRICTION_PAIR,)
     if single_stage:
@@ -595,10 +578,7 @@ for (int offset = 16; offset > 0; offset >>= 1) {{
                 "            int indices[",
             ),
             ("cross += value * sibling_value;", "if (!metric_ready) cross += value * sibling_value;"),
-            (
-                "cross += __shfl_down_sync(MASK, cross, shift, 32);",
-                "if (!metric_ready) cross += __shfl_down_sync(MASK, cross, shift, 32);",
-            ),
+            ("SUM(dot, sibling_dot, cross);", "SUM(dot, sibling_dot);\n            if (!metric_ready) SUM(cross);"),
             ("pair = friction_pair_candidate(denominator,", "pair = friction_pair_cached(metric_slot, denominator,"),
         ):
             if row_update.count(old) != 1:
@@ -628,7 +608,7 @@ for (int offset = 16; offset > 0; offset >>= 1) {{
 {writeback}
 #endif
 """,
-        preludes=(*laws, *solve_policy.preludes),
+        preludes=(lane_group(L), RING, *laws, *solve_policy.preludes),
         lead="",
     )
 
@@ -810,10 +790,7 @@ def _contact_triplet_code(
     ring_load, load = "", "new_normal"
     if linked:
         ring_load = """
-                float load = new_normal;
-                for (int next = world_row_parent.data[offset + row]; next >= 0 && next != row;
-                     next = world_row_parent.data[offset + next])
-                    load += impulse[next];"""
+                const float load = RING_LOAD(new_normal, row, count, ring_parent, ring_impulse);"""
         load = "load"
     tangent_state, tangent_keep, change_test = _triplet_change_vote(
         contact_type, friction_type, linked=linked, solve_policy=solve_policy
@@ -827,7 +804,7 @@ def _contact_triplet_code(
     int* metric_count = metric_count_storage + slot;
     for (int id = lane; id < {pairs}; id += 32) metric_map[id] = -1;
     if (lane == 0) *metric_count = 0;
-    __syncwarp(MASK);
+    SYNC();
     const auto contact_metric_slot = [&](int normal) {{
         if ({entry_guard}normal < 0 || normal + 2 >= count
             || type[normal] != {contact_type}
@@ -861,7 +838,7 @@ def _contact_triplet_code(
                 metric_map[id] = static_cast<signed char>(entry);
                 *metric_count = entry + 1;
             }}
-            __syncwarp(MASK);
+            SYNC();
         }}
         return friction_pair_from_metric(metric, r0, r1, old0, old1, radius, relaxation);
     }};
@@ -888,9 +865,8 @@ def _contact_triplet_code(
                     velocities[q] = index >= 0 ? delta[index] : 0.0f;
                     if (index >= 0) normal_dot += normal_responses[q] * velocities[q];
                 }}
-                for (int shift = 16; shift > 0; shift >>= 1)
-                    normal_dot += __shfl_down_sync(MASK, normal_dot, shift, 32);
-                const float normal_residual = __shfl_sync(MASK, normal_dot, 0, 32) + rhs[row];
+                SUM(normal_dot);
+                const float normal_residual = normal_dot + rhs[row];
                 const float old_normal = impulse[row];
                 const float new_normal = fmaxf(old_normal - omega * normal_residual / diagonal[row], 0.0f);
                 const float normal_change = new_normal - old_normal;{ring_load}
@@ -922,16 +898,13 @@ def _contact_triplet_code(
                             if (!ready) cross += value * sibling_value;
                         }}
                     }}
-                    for (int shift = 16; shift > 0; shift >>= 1) {{
-                        dot += __shfl_down_sync(MASK, dot, shift, 32);
-                        sibling_dot += __shfl_down_sync(MASK, sibling_dot, shift, 32);
-                        if (!ready) cross += __shfl_down_sync(MASK, cross, shift, 32);
-                    }}
-                    const float residual = __shfl_sync(MASK, dot, 0, 32) + rhs[tangent];
+                    SUM(dot, sibling_dot);
+                    if (!ready) SUM(cross);
+                    const float residual = dot + rhs[tangent];
                     float2 pair = make_float2(0.0f, 0.0f);
                     if (radius > 0.0f) {{
-                        const float sibling_residual = __shfl_sync(MASK, sibling_dot, 0, 32) + rhs[sibling];
-                        pair = friction_pair_cached(triplet_slot, diagonal[tangent], __shfl_sync(MASK, cross, 0, 32),
+                        const float sibling_residual = sibling_dot + rhs[sibling];
+                        pair = friction_pair_cached(triplet_slot, diagonal[tangent], cross,
                             diagonal[sibling], residual, sibling_residual, old_tangent, old_sibling, radius, omega);
                     }}
                     const float magnitude = sqrtf(pair.x * pair.x + pair.y * pair.y);
@@ -955,7 +928,7 @@ def _contact_triplet_code(
                         if (indices[q] >= 0) delta[indices[q]] = velocities[q];
                 }}
                 consumed_tangent = tangent;
-                __syncwarp(MASK);
+                SYNC();
                 continue;
             }}
 """
@@ -1072,7 +1045,7 @@ def _single_stage_triplet_code(
         *reinterpret_cast<int4*>({record.format(row="normal")} + {CONTACT_RECORD_FLOATS})
             = make_int4(first, second, third, others);
     }}
-    __syncwarp(MASK);
+    SYNC();
 """
         normal_parent, unlinked_guard = "", ""
         ring_read = f"""
@@ -1091,9 +1064,7 @@ def _single_stage_triplet_code(
                         if (ring.w > 1) load += impulse[ring.y];
                         if (ring.w > 2) load += impulse[ring.z];
                     } else {
-                        for (int next = world_row_parent.data[offset + row]; next >= 0 && next != row;
-                             next = world_row_parent.data[offset + next])
-                            load += impulse[next];
+                        load = RING_LOAD(load, row, count, ring_parent, ring_impulse);
                     }"""
     update = f"""
             if (row == consumed_tangent) continue;
@@ -1143,21 +1114,17 @@ def _single_stage_triplet_code(
                     const float old_tangent = impulse[tangent], old_sibling = impulse[sibling];
                     const float normal_rhs = rhs[row], tangent_rhs = rhs[tangent], sibling_rhs = rhs[sibling];
                     const float tangent_scale = fmaxf(fmaxf(diagonal[tangent], diagonal[sibling]), 1.0e-20f);
-                    for (int shift = 16; shift > 0; shift >>= 1) {{
-                        normal_dot += __shfl_down_sync(MASK, normal_dot, shift, 32);
-                        tangent_dot += __shfl_down_sync(MASK, tangent_dot, shift, 32);
-                        sibling_dot += __shfl_down_sync(MASK, sibling_dot, shift, 32);
-                    }}
-                    const float normal_residual = __shfl_sync(MASK, normal_dot, 0, 32) + normal_rhs;
-                    const float tangent_residual = __shfl_sync(MASK, tangent_dot, 0, 32) + tangent_rhs;
-                    const float sibling_residual = __shfl_sync(MASK, sibling_dot, 0, 32) + sibling_rhs;
+                    SUM(normal_dot, tangent_dot, sibling_dot);
+                    const float normal_residual = normal_dot + normal_rhs;
+                    const float tangent_residual = tangent_dot + tangent_rhs;
+                    const float sibling_residual = sibling_dot + sibling_rhs;
                     const float new_normal = fmaxf(old_normal - omega * normal_residual * coupling.w, 0.0f);
                     const float normal_change = new_normal - old_normal;{ring_load}
                     const float radius = fmaxf(mu * {load}, 0.0f);
                     {tangent_state}
                     // Shuffles order execution, not memory: every lane has read the three
                     // impulses before lane 0 writes them.
-                    __syncwarp(MASK);
+                    SYNC();
                     if (lane == 0) impulse[row] = new_normal;
                     if (!(radius == 0.0f && old_tangent == 0.0f && old_sibling == 0.0f)) {{
                         float2 pair = make_float2(0.0f, 0.0f);
@@ -1190,7 +1157,7 @@ def _single_stage_triplet_code(
                         }}
                     }}
                     consumed_tangent = tangent;
-                    __syncwarp(MASK);
+                    SYNC();
                     continue;
                 }}
             }}

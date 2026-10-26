@@ -177,10 +177,10 @@ def _definition(function):
 def _reserves_first(statements):
     """Whether every path through ``statements`` reserves rows before it returns.
 
-    Returns True when each path reaches a ``wp.atomic_add`` reservation before
-    any ``return``, False when some path returns first, and None when a path
-    falls through without either. A reservation inside a loop does not count,
-    since the loop may not run.
+    Returns True when each path reaches a ``reserve`` call (the row families'
+    slot reservation) before any ``return``, False when some path returns
+    first, and None when a path falls through without either. A reservation
+    inside a loop does not count, since the loop may not run.
     """
     for statement in statements:
         if isinstance(statement, ast.If):
@@ -192,7 +192,7 @@ def _reserves_first(statements):
         elif any(isinstance(node, ast.Return) for node in ast.walk(statement)):
             return False
         elif not isinstance(statement, (ast.For, ast.While)) and any(
-            isinstance(node, ast.Call) and ast.unparse(node.func) == "wp.atomic_add" for node in ast.walk(statement)
+            isinstance(node, ast.Call) and ast.unparse(node.func) == "reserve" for node in ast.walk(statement)
         ):
             return True
     return None

@@ -7,7 +7,7 @@ import re
 import unittest
 
 from newton._src.solvers.feather_pgs import tree_kinetic_state
-from newton._src.solvers.feather_pgs.tree_kinetic_layout import THREADS, TreeLayout
+from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 
 # A packed fixed-root tree, a one-warp free-root tree and a two-warp tree.
 _LAYOUTS = (
@@ -41,13 +41,13 @@ class TestTreeLayoutRender(unittest.TestCase):
             layout.render("$DOFS", DOFS="7")
 
     def test_prelude_differs_only_in_the_lane_count(self):
-        """Render one thread prelude per layout that differs only in its constexpr lane count."""
-        rendered = {layout.lanes: layout.render(THREADS) for layout in _LAYOUTS}
+        """Open every tree native with one lane-group prelude per layout that differs only in its lane count."""
+        rendered = {layout.lanes: layout.native("") for layout in _LAYOUTS}
         for lanes, text in rendered.items():
-            self.assertIn(f"constexpr int LANES={lanes},", text)
-        self.assertEqual(len({re.sub(r"LANES=\d+,", "LANES=N,", text) for text in rendered.values()}), 1)
+            self.assertIn(f"const int LANES = {lanes},", text)
+        self.assertEqual(len({re.sub(r"LANES = \d+,", "LANES = N,", text) for text in rendered.values()}), 1)
         for name in ("WIDTH", "MASK", "LANE", "STRIDE", "SUB", "SYNC", "ALL", "ANY"):
-            self.assertRegex(THREADS, rf"\b{name}=")
+            self.assertRegex(rendered[_LAYOUTS[0].lanes], rf"\b{name} =")
 
     def test_natives_take_the_prelude_mask(self):
         """Emit tree natives whose warp intrinsics take the prelude's mask, never a mask written per layout."""
@@ -79,7 +79,7 @@ class TestTreeLayoutRender(unittest.TestCase):
             with self.subTest(lanes=layout.lanes):
                 snippet = tree_kinetic_state._block_vote.__wrapped__(layout).native_snippet
                 self.assertNotIn("$", snippet)
-                self.assertIn(f"constexpr int LANES={layout.lanes},", snippet)
+                self.assertIn(f"const int LANES = {layout.lanes},", snippet)
                 self.assertIn("if constexpr(LANES<32)return __any_sync(0xffffffffu,value);", snippet)
                 self.assertIn("else return __syncthreads_or(value);", snippet)
 

@@ -372,9 +372,10 @@ class TestSingleStageTransaction(unittest.TestCase):
                 self.assertIn(f"normal / 3) * {width}" if linked else f"row / 3) * {width}", single)
                 start = single.index("if (row == consumed_tangent) continue;")
                 transaction = single[start : single.index("consumed_tangent = tangent;", start)]
-                # One interleaved reduction of the three residuals, and no other.
-                self.assertEqual(transaction.count("__shfl_down_sync"), 3)
-                self.assertEqual(transaction.count("for (int shift = 16; shift > 0; shift >>= 1)"), 1)
+                # One reduction of the three residuals together, and no other.
+                self.assertEqual(transaction.count("SUM("), 1)
+                self.assertIn("SUM(normal_dot, tangent_dot, sibling_dot);", transaction)
+                self.assertNotIn("__shfl", transaction)
                 self.assertIn(
                     "friction_pair_from_metric(metric, tangent_residual + coupling.x * normal_change", transaction
                 )
@@ -383,13 +384,13 @@ class TestSingleStageTransaction(unittest.TestCase):
                 # Linked visits pool listed members and walk only rings longer than four members.
                 self.assertEqual("ring.w >= 0" in transaction, linked)
                 self.assertEqual("make_int4(first, second, third, others)" in single, linked)
-                self.assertEqual(transaction.count("world_row_parent.data[offset + next]"), int(linked))
+                self.assertEqual(transaction.count("RING_LOAD("), int(linked))
                 # Every lane reads the visit's impulses with its rows, before the reduction, and a
                 # warp barrier orders all reads before lane 0's first write: shuffles order
                 # execution, not memory.
-                self.assertIn("__syncwarp(MASK);", transaction)
-                reduction = transaction.index("__shfl_down_sync")
-                barrier = transaction.index("__syncwarp(MASK);")
+                self.assertIn("SYNC();", transaction)
+                reduction = transaction.index("SUM(")
+                barrier = transaction.index("SYNC();")
                 self.assertLess(transaction.index("old_tangent = impulse[tangent]"), reduction)
                 self.assertLess(transaction.index("old_normal = impulse[row]"), reduction)
                 self.assertLess(barrier, transaction.index("if (lane == 0) impulse[row] = new_normal;"))

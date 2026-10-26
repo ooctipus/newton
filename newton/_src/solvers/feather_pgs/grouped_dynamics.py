@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import warp as wp
 
+from .device_preludes import cuda_native, lane_group
+
 
 def get_grouped_hinv_jt_kernel(
     n_dofs: int,
@@ -65,18 +67,14 @@ def get_grouped_hinv_jt_kernel(
         if compute_diag
         else ""
     )
-    snippet = f"""
-#if defined(__CUDA_ARCH__)
-    constexpr int N_ = {N};
+    body = f"""    constexpr int N_ = {N};
     constexpr int M_ = {M};
     constexpr int WPB = 4;
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
-    const int idx = block * warps_per_block + warp;
+    const int idx = block * warps_per_block + SUB;
     __shared__ float Ls[WPB * N_ * N_];
     __shared__ float Ds[WPB * N_];
-    float* L = Ls + warp * N_ * N_;
-    float* Dinv = Ds + warp * N_;
+    float* L = Ls + SUB * N_ * N_;
+    float* Dinv = Ds + SUB * N_;
     if (idx >= n_arts) return;
     const int art = group_to_art.data[idx];
     const int world = art_to_world.data[art];
@@ -85,16 +83,16 @@ def get_grouped_hinv_jt_kernel(
     // Worlds the parallel sweep kernel owns (dense rows within its budget, no matrix-free rows) form the
     // response in-kernel; their world-layout J/Y are never read.
     if (skip_rows_le > 0 && n_rows <= skip_rows_le && mf_constraint_count.data[world] == 0) return;
-    for (int e = lane; e < N_ * N_; e += 32) L[e] = L_group.data[(size_t)idx * N_ * N_ + e];
-    __syncwarp();
-    if (lane < N_) Dinv[lane] = 1.0f / L[lane * N_ + lane];
-    __syncwarp();
+    for (int e = LANE; e < N_ * N_; e += STRIDE) L[e] = L_group.data[(size_t)idx * N_ * N_ + e];
+    SYNC();
+    if (LANE < N_) Dinv[LANE] = 1.0f / L[LANE * N_ + LANE];
+    SYNC();
     const int world_rows = Y_world.shape[1];
     const int world_dofs = Y_world.shape[2];
     // Match the tiled kernel: every row of a touched 32-row chunk is written (inactive rows
     // carry zero Jacobians and get zero responses).
     const int n_pad = ((n_rows + 31) / 32) * 32;
-    for (int row = lane; row < n_pad && row < M_; row += 32) {{
+    for (int row = LANE; row < n_pad && row < M_; row += STRIDE) {{
         const size_t gbase = ((size_t)idx * M_ + row) * N_;
         float j[N_], y[N_];
         #pragma unroll
@@ -119,6 +117,7 @@ def get_grouped_hinv_jt_kernel(
     }}
 #endif
 """
+    snippet = cuda_native(body, preludes=(lane_group(32),))
 
     @wp.func_native(snippet)
     def grouped_hinv_jt_native(

@@ -95,7 +95,7 @@ def _row_metadata_codec(source):
     pack = re.search(r"s_meta_dense\[i\] = ([^;]+);", source).group(1)
     row_type = re.search(r"int row_type = (s_meta_dense\[i\] & \d+);", source).group(1)
     parent = re.search(r"int parent_idx = (\(s_meta_dense\[i\] >> \d+\) - 1);", source).group(1)
-    ring = re.search(r"patch_row = (\(\(s_meta_dense\[patch_row\] >> \d+\) - 1\))\)", source).group(1)
+    ring = re.search(r"return (\(\(s_meta_dense\[patch_row\] >> \d+\) - 1\));", source).group(1)
 
     @wp.func_native(f"int s_meta_dense[1]; const int i = 0; s_meta_dense[i] = {pack}; return s_meta_dense[i];")
     def pack_row(row_type: int, row_parent: int) -> int: ...
@@ -327,7 +327,7 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                 self.assertEqual(re.findall(r"__shared__ float\s+(\w+)", resident), shared)
                 self.assertEqual(_row_metadata_read_globally(resident), streamed)
         # Patch rings walk the resident array.
-        self.assertIn("patch_row = ((s_meta_dense[patch_row] >> 3) - 1)", _streamed_source(resident_row_metadata=True))
+        self.assertIn("return ((s_meta_dense[patch_row] >> 3) - 1);", _streamed_source(resident_row_metadata=True))
         with self.assertRaisesRegex(ValueError, "streamed metadata"):
             get_source(**_LARGE_STREAMED_SHAPE, resident_row_metadata=True)
 
@@ -433,11 +433,11 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                     self.assertIn("_glambda", kernel.key)
                     self.assertNotIn("__shared__ float s_lam_mf", source)
                     self.assertNotIn("mf_impulses.data[off_mf + i] =", source)
-                    self.assertIn("__shfl_sync(MASK, lane == 0 ? g_lam_mf[i] : 0.0f, 0)", source)
+                    self.assertIn("READ(lane == 0 ? g_lam_mf[i] : 0.0f, 0)", source)
                     self.assertIn(
                         "if (mf_friction_radius == 0.0f && "
-                        "__shfl_sync(MASK, lane == 0 ? g_lam_mf[i] : 0.0f, 0) == 0.0f && "
-                        "__shfl_sync(MASK, lane == 0 ? g_lam_mf[i + 1] : 0.0f, 0) == 0.0f)",
+                        "READ(lane == 0 ? g_lam_mf[i] : 0.0f, 0) == 0.0f && "
+                        "READ(lane == 0 ? g_lam_mf[i + 1] : 0.0f, 0) == 0.0f)",
                         source,
                     )
                     for line in source.splitlines():
@@ -459,7 +459,7 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                     stream_mf_impulses=friction == "current",
                 )
                 snippet = kernel.mf_native.native_snippet
-                self.assertIn("__shfl_sync(MASK, lane == 0 ? s_lam_dense[i] : 0.0f, 0)", snippet)
+                self.assertIn("READ(lane == 0 ? s_lam_dense[i] : 0.0f, 0)", snippet)
                 self.assertIn("if (lane == 0) s_lam_dense[i] = 0.0f;", snippet)
                 self.assertIn("if (lane == 0) s_lam_dense[i] = new_impulse;", snippet)
                 start = snippet.index("const float sibling_impulse = s_lam_dense[sib];")
@@ -468,8 +468,8 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                 self.assertIn("friction_pair_candidate(denom, cross, s_diag_dense[sib]", owner)
                 self.assertIn("float sib_delta = b * scale - sibling_impulse;", owner)
                 self.assertIn(
-                    "__syncwarp();\n                    if (lane == 0) s_lam_dense[sib] = b * scale;\n"
-                    "                    __syncwarp();",
+                    "SYNC();\n                    if (lane == 0) s_lam_dense[sib] = b * scale;\n"
+                    "                    SYNC();",
                     owner,
                 )
 

@@ -68,7 +68,7 @@ from .contact_unit_sweeps import (
     pgs_solve_loop_unit,
     pgs_solve_mf_loop_unit,
 )
-from .device_preludes import cuda_native
+from .device_preludes import RING, cuda_native, lane_group
 from .friction import FRICTION_PAIR
 from .friction_patches import (
     PatchRowLaw,
@@ -10214,6 +10214,7 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[
                     self.drive_slot,
                     self.slot_counter,
+                    self._dense_first_rejected_slot,
                 ],
                 device=model.device,
             )
@@ -10296,6 +10297,7 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[
                     self.mimic_slot,
                     self.slot_counter,
+                    self._dense_first_rejected_slot,
                 ],
                 device=model.device,
             )
@@ -10399,6 +10401,7 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[
                     self.connect_slot,
                     self.slot_counter,
+                    self._dense_first_rejected_slot,
                 ],
                 device=model.device,
             )
@@ -10587,6 +10590,7 @@ class SolverFeatherPGS(SolverBase):
                         ],
                         outputs=[
                             self.slot_counter,
+                            self._dense_first_rejected_slot,
                             self.J_by_size[size],
                             self.row_type,
                             self.row_parent,
@@ -10642,6 +10646,7 @@ class SolverFeatherPGS(SolverBase):
                     self.velocity_limit_slot,
                     self.velocity_limit_sign,
                     self.slot_counter,
+                    self._dense_first_rejected_slot,
                 ],
                 device=model.device,
             )
@@ -10771,7 +10776,6 @@ class SolverFeatherPGS(SolverBase):
                     contacts.rigid_contact_margin0,
                     contacts.rigid_contact_margin1,
                     state_in.body_q,
-                    model.shape_transform,
                     model.shape_body,
                     self.body_to_articulation,
                     self.art_to_world,
@@ -11477,6 +11481,7 @@ class SolverFeatherPGS(SolverBase):
                 outputs=[
                     self.rigid_velocity_limit_slot,
                     self.mf_slot_counter,
+                    self._mf_first_rejected_slot,
                 ],
                 device=model.device,
             )
@@ -12236,7 +12241,7 @@ class SolverFeatherPGS(SolverBase):
                 n_arts,
             ],
             outputs=[self.C, self.diag],
-            block_dim=128,
+            block_dim=_DELASSUS_THREADS,
             device=model.device,
         )
 
@@ -13361,19 +13366,15 @@ class SolverFeatherPGS(SolverBase):
 def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: int) -> "wp.Kernel":
     """Build a deterministic one-warp-per-articulation joint-limit row builder."""
     _ = device_arch
-    snippet = f"""
-#if defined(__CUDA_ARCH__)
-    constexpr unsigned MASK = 0xffffffffu;
-    const int lane = threadIdx.x & 31;
-    const int group_idx = block * {warps_per_block} + (threadIdx.x >> 5);
+    snippet = f"""    const int group_idx = block * {warps_per_block} + SUB;
     if (group_idx >= articulation_count) return;
 
     const int articulation = group_to_art.data[group_idx];
     const int world = art_to_world.data[articulation];
     if (world >= 0 && world < resolved_worlds.shape[0] && resolved_worlds.data[world] != 0) return;
     const int dof_start = articulation_dof_start.data[articulation];
-    for (int base = 0; base < {2 * size}; base += 32) {{
-        const int candidate = base + lane;
+    for (int base = 0; base < {2 * size}; base += STRIDE) {{
+        const int candidate = base + LANE;
         const int local_dof = candidate >> 1;
         const int side = candidate & 1;
         const int dof = dof_start + local_dof;
@@ -13387,15 +13388,10 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
             active = isfinite(bound) && (side == 0 ? q <= bound + activation_gap : q >= bound - activation_gap);
         }}
 
-        const unsigned active_mask = __ballot_sync(MASK, active != 0);
-        const int active_count = __popc(active_mask);
-        int first_slot = 0;
-        if (lane == 0 && active_count != 0)
-            first_slot = atomicAdd(&world_slot_counter.data[world], active_count);
-        first_slot = __shfl_sync(MASK, first_slot, 0);
+        const unsigned active_mask = BALLOT(active != 0);
+        const int first_slot = RESERVE(&world_slot_counter.data[world], COUNT(active_mask));
         if (active != 0) {{
-            const unsigned lower_lanes = lane == 0 ? 0u : ((1u << lane) - 1u);
-            const int slot = first_slot + __popc(active_mask & lower_lanes);
+            const int slot = first_slot + BELOW(active_mask);
             if (slot < max_constraints) {{
                 J_group.data[(group_idx * max_constraints + slot) * {size} + local_dof] = side == 0 ? 1.0f : -1.0f;
                 const int row = world * max_constraints + slot;
@@ -13412,7 +13408,7 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
 #endif
 """
 
-    @wp.func_native(snippet)
+    @wp.func_native(cuda_native(snippet, preludes=(lane_group(32),)))
     def joint_limit_warp_native(
         block: int,
         articulation_count: int,
@@ -13711,7 +13707,7 @@ def _get_composite_inertia_warp_kernel(
         const float mass = body_mass.data[body];
         const float* terms = &body_inertia_terms.data[body * 12];
         float* dst = reinterpret_cast<float*>(&body_I_c.data[body]);
-        for (int element = lane; element < 36; element += 32) {
+        for (int element = LANE; element < 36; element += STRIDE) {
             const int row = element / 6;
             const int col = element - row * 6;
             float value = 0.0f;
@@ -13738,12 +13734,9 @@ def _get_composite_inertia_warp_kernel(
         initialize = """
         const float* src = reinterpret_cast<const float*>(&body_I_s.data[body]);
         float* dst = reinterpret_cast<float*>(&body_I_c.data[body]);
-        for (int element = lane; element < 36; element += 32) dst[element] = src[element];
+        for (int element = LANE; element < 36; element += STRIDE) dst[element] = src[element];
 """
-    snippet = f"""
-#if defined(__CUDA_ARCH__)
-    const int lane = threadIdx.x & 31;
-    const int candidate = block * {warps_per_block} + (threadIdx.x >> 5);
+    snippet = f"""    const int candidate = block * {warps_per_block} + SUB;
     if (candidate >= composite_articulation_count) return;
     const int articulation = composite_articulations.data[candidate];
     const int start = articulation_start.data[articulation];
@@ -13752,7 +13745,7 @@ def _get_composite_inertia_warp_kernel(
         const int body = joint_child.data[joint];
 {initialize}
     }}
-    __syncwarp();
+    SYNC();
 
     for (int joint = end - 1; joint >= start; --joint) {{
         const int parent_joint = joint_ancestor.data[joint];
@@ -13761,12 +13754,13 @@ def _get_composite_inertia_warp_kernel(
             const int parent_body = joint_child.data[parent_joint];
             const float* src = reinterpret_cast<const float*>(&body_I_c.data[body]);
             float* dst = reinterpret_cast<float*>(&body_I_c.data[parent_body]);
-            for (int element = lane; element < 36; element += 32) dst[element] += src[element];
+            for (int element = LANE; element < 36; element += STRIDE) dst[element] += src[element];
         }}
-        __syncwarp();
+        SYNC();
     }}
 #endif
 """
+    snippet = cuda_native(snippet, preludes=(lane_group(32),))
 
     if compact_terms:
 
@@ -14101,6 +14095,10 @@ def _get_hinv_jt_fused_kernel(
     return wp.kernel(enable_backward=False, module="unique")(hinv_jt_tiled_fused_template)
 
 
+_DELASSUS_THREADS = 128
+"""Threads of a streaming Delassus block, one lane group."""
+
+
 @cache
 def _get_delassus_kernel(
     n_dofs: int, max_constraints: int, device_arch: str, chunk_size: int | None = None
@@ -14113,13 +14111,10 @@ def _get_delassus_kernel(
     else:
         CHUNK = 64 if (2 * TILE_M * TILE_D * 4 > 45000) else TILE_M
 
-    snippet = f"""
-#if defined(__CUDA_ARCH__)
-const int TILE_D = {TILE_D};
+    snippet = f"""const int TILE_D = {TILE_D};
 const int TILE_M = {TILE_M};
 const int CHUNK = {CHUNK};
 
-int lane = threadIdx.x;
 int art = group_to_art.data[idx];
 int world = art_to_world.data[art];
 int m = world_constraint_count.data[world];
@@ -14133,19 +14128,19 @@ int num_chunks = (m + CHUNK - 1) / CHUNK;
 for (int ci = 0; ci < num_chunks; ci++) {{
     int i0 = ci * CHUNK, i1 = min(i0 + CHUNK, m);
 
-    for (int t = lane; t < (i1 - i0) * TILE_D; t += blockDim.x)
+    for (int t = LANE; t < (i1 - i0) * TILE_D; t += STRIDE)
         s_J[t] = J_group.data[idx * TILE_M * TILE_D + i0 * TILE_D + t];
-    __syncthreads();
+    SYNC();
 
     for (int cj = 0; cj < num_chunks; cj++) {{
         int j0 = cj * CHUNK, j1 = min(j0 + CHUNK, m);
 
-        for (int t = lane; t < (j1 - j0) * TILE_D; t += blockDim.x)
+        for (int t = LANE; t < (j1 - j0) * TILE_D; t += STRIDE)
             s_Y[t] = Y_group.data[idx * TILE_M * TILE_D + j0 * TILE_D + t];
-        __syncthreads();
+        SYNC();
 
         // Each thread computes multiple C elements
-        for (int e = lane; e < (i1 - i0) * (j1 - j0); e += blockDim.x) {{
+        for (int e = LANE; e < (i1 - i0) * (j1 - j0); e += STRIDE) {{
             int il = e / (j1 - j0), jl = e % (j1 - j0);
             float sum = 0.0f;
             for (int k = 0; k < TILE_D; k++)
@@ -14156,13 +14151,13 @@ for (int ci = 0; ci < num_chunks; ci++) {{
                 if (ig == jg) atomicAdd(&world_diag.data[world * TILE_M + ig], sum);
             }}
         }}
-        __syncthreads();
+        SYNC();
     }}
 }}
 #endif
 """
 
-    @wp.func_native(snippet)
+    @wp.func_native(cuda_native(snippet, preludes=(lane_group(_DELASSUS_THREADS),)))
     def delassus_native(
         idx: int,
         J_group: wp.array3d[float],
@@ -14448,9 +14443,9 @@ def _get_paired_hinv_jt_kernel(
     __shared__ float s_primary_Hinv[{primary_dofs * primary_dofs}];
     __shared__ float s_secondary_Hinv[{secondary_dofs * secondary_dofs}];"""
     hinv_load = f"""
-    for (int element = threadIdx.x; element < {primary_dofs * primary_dofs}; element += blockDim.x)
+    for (int element = LANE; element < {primary_dofs * primary_dofs}; element += STRIDE)
         s_primary_Hinv[element] = primary_Hinv.data[primary_group * {primary_dofs * primary_dofs} + element];
-    for (int element = threadIdx.x; element < {secondary_dofs * secondary_dofs}; element += blockDim.x)
+    for (int element = LANE; element < {secondary_dofs * secondary_dofs}; element += STRIDE)
         s_secondary_Hinv[element] = secondary_Hinv.data[secondary_group * {secondary_dofs * secondary_dofs} + element];"""
     factor_shared = ""
     factor_load = ""
@@ -14459,12 +14454,12 @@ def _get_paired_hinv_jt_kernel(
         float y = 0.0f;
 #pragma unroll
         for (int k = 0; k < {primary_dofs}; ++k) {{
-            const float jk = __shfl_sync(MASK, j, k);
+            const float jk = READ(j, k);
             if (lane < {primary_dofs}) y += s_primary_Hinv[lane * {primary_dofs} + k] * jk;
         }}
 #pragma unroll
         for (int k = 0; k < {secondary_dofs}; ++k) {{
-            const float jk = __shfl_sync(MASK, j, {primary_dofs} + k);
+            const float jk = READ(j, {primary_dofs} + k);
             if (lane >= {primary_dofs} && lane < {total_dofs})
                 y += s_secondary_Hinv[(lane - {primary_dofs}) * {secondary_dofs} + k] * jk;
         }}"""
@@ -14477,9 +14472,9 @@ def _get_paired_hinv_jt_kernel(
     __shared__ float s_primary_Linv[{primary_dofs * primary_dofs}];
     __shared__ float s_secondary_Linv[{secondary_dofs * secondary_dofs}];"""
         factor_load = f"""
-    for (int element = threadIdx.x; element < {primary_dofs * primary_dofs}; element += blockDim.x)
+    for (int element = LANE; element < {primary_dofs * primary_dofs}; element += STRIDE)
         s_primary_Linv[element] = primary_Linv.data[primary_group * {primary_dofs * primary_dofs} + element];
-    for (int element = threadIdx.x; element < {secondary_dofs * secondary_dofs}; element += blockDim.x)
+    for (int element = LANE; element < {secondary_dofs * secondary_dofs}; element += STRIDE)
         s_secondary_Linv[element] = secondary_Linv.data[secondary_group * {secondary_dofs * secondary_dofs} + element];"""
         factor_world_declaration = "    const bool factor_world = world_mf_constraint_count.data[world] == 0;"
         response_calculation = f"""
@@ -14487,27 +14482,27 @@ def _get_paired_hinv_jt_kernel(
         float z = 0.0f;
 #pragma unroll
         for (int k = 0; k < {primary_dofs}; ++k) {{
-            const float jk = __shfl_sync(MASK, j, k);
+            const float jk = READ(j, k);
             if (lane < {primary_dofs} && k <= lane)
                 z += s_primary_Linv[lane * {primary_dofs} + k] * jk;
         }}
         const int secondary_lane = lane - {primary_dofs};
 #pragma unroll
         for (int k = 0; k < {secondary_dofs}; ++k) {{
-            const float jk = __shfl_sync(MASK, j, {primary_dofs} + k);
+            const float jk = READ(j, {primary_dofs} + k);
             if (lane >= {primary_dofs} && lane < {total_dofs} && k <= secondary_lane)
                 z += s_secondary_Linv[secondary_lane * {secondary_dofs} + k] * jk;
         }}
         if (!factor_world) {{
 #pragma unroll
             for (int k = 0; k < {primary_dofs}; ++k) {{
-                const float zk = __shfl_sync(MASK, z, k);
+                const float zk = READ(z, k);
                 if (lane < {primary_dofs} && k >= lane)
                     y += s_primary_Linv[k * {primary_dofs} + lane] * zk;
             }}
 #pragma unroll
             for (int k = 0; k < {secondary_dofs}; ++k) {{
-                const float zk = __shfl_sync(MASK, z, {primary_dofs} + k);
+                const float zk = READ(z, {primary_dofs} + k);
                 if (lane >= {primary_dofs} && lane < {total_dofs})
                     if (k >= secondary_lane)
                         y += s_secondary_Linv[k * {secondary_dofs} + secondary_lane] * zk;
@@ -14573,13 +14568,9 @@ def _get_paired_hinv_jt_kernel(
             + world_row_cfm.data[world * {max_constraints} + row];
     }}"""
 
-    snippet = f"""
-#if defined(__CUDA_ARCH__)
-{hinv_shared}
+    snippet = f"""{hinv_shared}
 {factor_shared}
-    const int lane = threadIdx.x & 31;
-    const int row_warp = threadIdx.x >> 5;
-    const unsigned MASK = 0xffffffffu;
+    const int lane = LANE & 31;
 
     const int secondary_group = secondary_group_by_primary.data[primary_group];
     const int primary_art = primary_group_to_art.data[primary_group];
@@ -14593,9 +14584,9 @@ def _get_paired_hinv_jt_kernel(
     const int secondary_offset = articulation_world_dof_offset.data[secondary_art];
 {hinv_load}
 {factor_load}
-    __syncthreads();
+    SYNC();
 
-    for (int constraint = row_warp; constraint < n_constraints; constraint += {warps_per_block}) {{
+    for (int constraint = WARP; constraint < n_constraints; constraint += WARPS) {{
         const int world_row = (world * {max_constraints} + constraint) * {max_world_dofs};
         float j = 0.0f;
         if (lane < {primary_dofs}) {{
@@ -14619,11 +14610,7 @@ def _get_paired_hinv_jt_kernel(
         }}
 
         float diagonal = lane < {total_dofs} ? {diagonal_value} : 0.0f;
-        diagonal += __shfl_down_sync(MASK, diagonal, 16);
-        diagonal += __shfl_down_sync(MASK, diagonal, 8);
-        diagonal += __shfl_down_sync(MASK, diagonal, 4);
-        diagonal += __shfl_down_sync(MASK, diagonal, 2);
-        diagonal += __shfl_down_sync(MASK, diagonal, 1);
+        SUM(diagonal);
         if (lane == 0) {{
             const int diag_index = world * {max_constraints} + constraint;
             world_diag.data[diag_index] = diagonal + world_row_cfm.data[diag_index];
@@ -14634,7 +14621,7 @@ def _get_paired_hinv_jt_kernel(
 #endif
 """
 
-    @wp.func_native(snippet)
+    @wp.func_native(cuda_native(snippet, preludes=(lane_group(32 * warps_per_block),)))
     def paired_hinv_jt_native(
         primary_group: int,
         primary_Hinv: wp.array3d[float],
@@ -15098,7 +15085,7 @@ def _get_pgs_solve_tiled_row_kernel(
                 unsupported = p < 0 || p > m - 3 || (lane != p + 1 && lane != p + 2);
             }
         }
-        unsupported = __ballot_sync(MASK, unsupported) != 0u;
+        unsupported = BALLOT(unsupported) != 0u;
     }
 """
         if small_budget:
@@ -15146,9 +15133,7 @@ def _get_pgs_solve_tiled_row_kernel(
     triangle_constant = "" if global_rows else f"\n    const int TILE_TRI = {TILE_TRI};"
     snippet = f"""    const int TILE_M = {TILE_M};{stride_constant}
     const int TILE_M_SQ = {TILE_M_SQ};{triangle_constant}
-    const unsigned MASK = 0xFFFFFFFF;
-
-    int lane = threadIdx.x;
+    const int lane = LANE;
 
     int m = world_constraint_count.data[world];
     if (m == 0) return;
@@ -15165,26 +15150,18 @@ def _get_pgs_solve_tiled_row_kernel(
     int off2 = world * TILE_M_SQ;
 
 {load_code}
-{triangle_load}    __syncwarp();
+{triangle_load}    SYNC();
 
 {precompute_j_code}
 
     for (int iter = 0; iter < iterations; iter++) {{
         int global_iter = iteration_offset + iter;
         for (int i = 0; i < m; i++) {{
-            // NOTE: single-warp kernel; __syncwarp here is typically unnecessary unless divergence occurs
-            // before the dot. If you want max perf, try removing it after verifying correctness.
-            // __syncwarp();
-
             {dot_code}
 
             // Warp reduce my_sum
-            my_sum += __shfl_down_sync(MASK, my_sum, 16);
-            my_sum += __shfl_down_sync(MASK, my_sum, 8);
-            my_sum += __shfl_down_sync(MASK, my_sum, 4);
-            my_sum += __shfl_down_sync(MASK, my_sum, 2);
-            my_sum += __shfl_down_sync(MASK, my_sum, 1);
-            float dot_sum = __shfl_sync(MASK, my_sum, 0);
+            SUM(my_sum);
+            float dot_sum = my_sum;
 
             float denom = s_diag[i];
             if (denom <= 0.0f && s_rtype[i] != 2) continue;
@@ -15209,9 +15186,8 @@ def _get_pgs_solve_tiled_row_kernel(
                 s_lam[i] = new_impulse;
             }} else if (row_type == 2) {{
                 int parent_idx = s_parent[i];
-                float lambda_n = s_lam[parent_idx];
-                for (int patch_row = s_parent[parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = s_parent[patch_row])
-                    lambda_n += s_lam[patch_row];
+                float lambda_n = RING_LOAD(s_lam[parent_idx], parent_idx, TILE_M,
+                    [&](int r) {{ return s_parent[r]; }}, [&](int r) {{ return s_lam[r]; }});
                 float mu = s_mu[i];
                 float radius = fmaxf(mu * lambda_n, 0.0f);
 
@@ -15219,9 +15195,8 @@ def _get_pgs_solve_tiled_row_kernel(
                 int sib = parent_idx + 2;
                 float sibling_residual = 0.0f;
 {sibling_row}
-                for (int offset = 16; offset > 0; offset >>= 1)
-                    sibling_residual += __shfl_down_sync(MASK, sibling_residual, offset);
-                sibling_residual = __shfl_sync(MASK, sibling_residual, 0) + s_rhs[sib];
+                SUM(sibling_residual);
+                sibling_residual = sibling_residual + s_rhs[sib];
                 float2 pair = friction_pair_candidate(denom, {sibling_coupling}, s_diag[sib],
                     w_val, sibling_residual, s_lam[i], s_lam[sib], radius, omega);
                 float a = pair.x;
@@ -15240,7 +15215,7 @@ def _get_pgs_solve_tiled_row_kernel(
 #endif
 """
 
-    snippet = cuda_native(snippet, preludes=(FRICTION_PAIR,))
+    snippet = cuda_native(snippet, preludes=(lane_group(32), RING, FRICTION_PAIR))
 
     @wp.func_native(snippet)
     def pgs_solve_native(
@@ -15352,7 +15327,7 @@ def _get_pgs_solve_mf_kernel(
     snippet = f"""    const int MF_MAX_C = {MF_MAX_C};
     const int MAX_BODIES = {MAX_BODIES};
 
-    int lane = threadIdx.x;
+    const int lane = LANE;
 
     int m = mf_constraint_count.data[world];
     if (m == 0) return;
@@ -15388,7 +15363,7 @@ def _get_pgs_solve_mf_kernel(
     for (int i = lane; i < m; i += 32) {{
         s_impulse[i] = mf_impulses.data[c_off + i];
     }}
-    __syncwarp();
+    SYNC();
 
     // ═══════════════════════════════════════════════════════════════
     // SOLVE PHASE (lane 0)
@@ -15457,9 +15432,8 @@ def _get_pgs_solve_mf_kernel(
                 // Project: friction
                 else if (row_type == 2) {{
                     int parent_idx = mf_row_parent.data[c_off + i];
-                    float lambda_n = s_impulse[parent_idx];
-                    for (int patch_row = mf_row_parent.data[c_off + parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = mf_row_parent.data[c_off + patch_row])
-                        lambda_n += s_impulse[patch_row];
+                    float lambda_n = RING_LOAD(s_impulse[parent_idx], parent_idx, MF_MAX_C,
+                        [&](int r) {{ return mf_row_parent.data[c_off + r]; }}, [&](int r) {{ return s_impulse[r]; }});
                     float mu = mf_row_mu.data[c_off + i];
                     float radius = fmaxf(mu * lambda_n, 0.0f);
 
@@ -15541,7 +15515,7 @@ def _get_pgs_solve_mf_kernel(
             }}
         }}
     }}
-    __syncwarp();
+    SYNC();
 
     // ═══════════════════════════════════════════════════════════════
     // STORE PHASE
@@ -15562,7 +15536,7 @@ def _get_pgs_solve_mf_kernel(
 #endif
 """
 
-    snippet = cuda_native(snippet, preludes=(FRICTION_PAIR,))
+    snippet = cuda_native(snippet, preludes=(lane_group(32), RING, FRICTION_PAIR))
 
     @wp.func_native(snippet)
     def pgs_solve_mf_native(
@@ -15660,14 +15634,11 @@ def _get_pack_mf_meta_kernel(mf_max_constraints: int, device_arch: str) -> "wp.K
     _validate_mf_metadata_encoding(mf_max_constraints)
     M_MF = mf_max_constraints
 
-    snippet = f"""
-#if defined(__CUDA_ARCH__)
-    int lane = threadIdx.x;
-    int m_mf = mf_constraint_count.data[world];
+    snippet = f"""    int m_mf = mf_constraint_count.data[world];
     int off_mf = world * {M_MF};
     int off_meta = off_mf * 4;
 
-    for (int i = lane; i < m_mf; i += 32) {{
+    for (int i = LANE; i < m_mf; i += STRIDE) {{
         int da = mf_dof_a.data[off_mf + i];
         int db = mf_dof_b.data[off_mf + i];
         float diag = mf_eff_mass_inv.data[off_mf + i];
@@ -15684,6 +15655,7 @@ def _get_pack_mf_meta_kernel(mf_max_constraints: int, device_arch: str) -> "wp.K
     }}
 #endif
 """
+    snippet = cuda_native(snippet, preludes=(lane_group(32),))
 
     @wp.func_native(snippet)
     def pack_mf_meta_native(
@@ -15773,11 +15745,8 @@ def _get_pgs_solve_local_owned_kernel(
     response_row_count = "row_count + mf_count" if local_mf_rows else "row_count"
     groups_per_block = warps_per_block * 32 // lanes_per_world
 
-    lane_mask = (1 << lanes_per_world) - 1
-    lane_base_mask = 32 - lanes_per_world
-    group_setup = f"""    const int local_group = threadIdx.x / {lanes_per_world};
-    const int lane = threadIdx.x & {lanes_per_world - 1};
-    const unsigned MASK = {hex(lane_mask)}u << (threadIdx.x & {lane_base_mask});"""
+    group_setup = """    const int local_group = SUB;
+    const int lane = LANE;"""
     pair_setup = (
         f"""
     const int secondary_art = candidate_secondary_articulations.data[candidate];
@@ -15937,8 +15906,8 @@ def _get_pgs_solve_local_owned_kernel(
         row_metadata_load = f"""        const int row_type = world_row_type.data[world_row_base + row];
         lane_joint_limit = row_type == {int(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)};"""
         active_store = "lane_active = active;"
-        row_masks = """    const unsigned active_rows = __ballot_sync(MASK, lane_active != 0);
-    const unsigned joint_limit_rows = __ballot_sync(MASK, lane_joint_limit != 0);"""
+        row_masks = """    const unsigned active_rows = BALLOT(lane_active != 0);
+    const unsigned joint_limit_rows = BALLOT(lane_joint_limit != 0);"""
         row_setup = """            const unsigned row_bit = 1u << row;
             if ((active_rows & row_bit) == 0u) continue;"""
         joint_limit_projection = "(joint_limit_rows & row_bit) != 0u && new_impulse < 0.0f"
@@ -15969,7 +15938,7 @@ def _get_pgs_solve_local_owned_kernel(
         f"""            if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}
                 && global_iteration < friction_start_iteration) {{
                 s_lambda[row] = 0.0f;
-                __syncwarp();
+                SYNC();
                 continue;
             }}"""
         if contact_capable
@@ -16001,23 +15970,15 @@ def _get_pgs_solve_local_owned_kernel(
         else f"""float sibling_partial = 0.0f;
                     if (lane < {total_dofs})
                         sibling_partial = s_J[sibling * {total_dofs} + lane] * s_v[lane];
-                    sibling_partial += __shfl_down_sync(MASK, sibling_partial, 16);
-                    sibling_partial += __shfl_down_sync(MASK, sibling_partial, 8);
-                    sibling_partial += __shfl_down_sync(MASK, sibling_partial, 4);
-                    sibling_partial += __shfl_down_sync(MASK, sibling_partial, 2);
-                    sibling_partial += __shfl_down_sync(MASK, sibling_partial, 1);
+                    SUM(sibling_partial);
                     const float sibling_residual =
-                        __shfl_sync(MASK, sibling_partial, 0) + s_rhs[sibling];
+                        sibling_partial + s_rhs[sibling];
                     float cross_partial = 0.0f;
                     if (lane < {total_dofs})
                         cross_partial = s_J[row * {total_dofs} + lane]
                             * s_Y[sibling * {total_dofs} + lane];
-                    cross_partial += __shfl_down_sync(MASK, cross_partial, 16);
-                    cross_partial += __shfl_down_sync(MASK, cross_partial, 8);
-                    cross_partial += __shfl_down_sync(MASK, cross_partial, 4);
-                    cross_partial += __shfl_down_sync(MASK, cross_partial, 2);
-                    cross_partial += __shfl_down_sync(MASK, cross_partial, 1);
-                    const float tangent_cross = __shfl_sync(MASK, cross_partial, 0);"""
+                    SUM(cross_partial);
+                    const float tangent_cross = cross_partial;"""
     )
     impulse_projection = (
         f"""            if ((row_type == {int(PGS_CONSTRAINT_TYPE_CONTACT)}
@@ -16028,11 +15989,8 @@ def _get_pgs_solve_local_owned_kernel(
                 if (row != parent + 1) {{
                     new_impulse = old_impulse;
                 }} else {{
-                    float lambda_n = s_lambda[parent];
-                    for (int patch_row = s_parent[parent];
-                         patch_row >= 0 && patch_row != parent;
-                         patch_row = s_parent[patch_row])
-                        lambda_n += s_lambda[patch_row];
+                    const float lambda_n = RING_LOAD(s_lambda[parent], parent, {local_rows},
+                        [&](int r) {{ return s_parent[r]; }}, [&](int r) {{ return s_lambda[r]; }});
                     const float radius = fmaxf(s_mu[row] * lambda_n, 0.0f);
                     const int sibling = parent + 2;
                     {dense_friction_pair_terms}
@@ -16158,7 +16116,7 @@ def _get_pgs_solve_local_owned_kernel(
             }}
             s_A[matrix_index] = response_entry;
         }}
-        __syncwarp();
+        SYNC();
     }}"""
     elif dense_response_matrix:
         response_matrix_setup = f"""
@@ -16189,7 +16147,7 @@ def _get_pgs_solve_local_owned_kernel(
                     s_J[matrix_row * {total_dofs} + d] * s_Y[column * {total_dofs} + d];
             s_A[matrix_index] = response_entry;
         }}
-        __syncwarp();
+        SYNC();
     }}"""
     else:
         response_matrix_setup = ""
@@ -16200,24 +16158,16 @@ def _get_pgs_solve_local_owned_kernel(
             }} else {{
                 float partial = 0.0f;
                 if (lane < {total_dofs}) partial = s_J[row * {total_dofs} + lane] * s_v[lane];
-                partial += __shfl_down_sync(MASK, partial, 16);
-                partial += __shfl_down_sync(MASK, partial, 8);
-                partial += __shfl_down_sync(MASK, partial, 4);
-                partial += __shfl_down_sync(MASK, partial, 2);
-                partial += __shfl_down_sync(MASK, partial, 1);
-                const float velocity = __shfl_sync(MASK, partial, 0);
+                SUM(partial);
+                const float velocity = partial;
                 residual = velocity + s_rhs[row];
             }}
             const float delta = -residual * inverse_diagonal;"""
         if dense_response_matrix
         else f"""            float partial = 0.0f;
             if (lane < {total_dofs}) partial = s_J[row * {total_dofs} + lane] * s_v[lane];
-            partial += __shfl_down_sync(MASK, partial, 16);
-            partial += __shfl_down_sync(MASK, partial, 8);
-            partial += __shfl_down_sync(MASK, partial, 4);
-            partial += __shfl_down_sync(MASK, partial, 2);
-            partial += __shfl_down_sync(MASK, partial, 1);
-            const float velocity = __shfl_sync(MASK, partial, 0);
+            SUM(partial);
+            const float velocity = partial;
             const float residual = velocity + s_rhs[row];
             const float delta = -residual * inverse_diagonal;"""
     )
@@ -16262,12 +16212,12 @@ def _get_pgs_solve_local_owned_kernel(
 {mf_velocity_commit}
             s_v[velocity_dof] = velocity;
         }}
-        __syncwarp();
+        SYNC();
     }}"""
         if dense_response_matrix
         else ""
     )
-    row_sync = "            __syncwarp();" if contact_capable else ""
+    row_sync = "            SYNC();" if contact_capable else ""
     early_exit = (
         sweep_exit(
             solve_policy,
@@ -16275,17 +16225,15 @@ def _get_pgs_solve_local_owned_kernel(
         // iteration. Do not mistake a stationary pre-friction sweep for the
         // fixed point of the complete constraint system.
         if (global_iteration >= friction_start_iteration
-            && __ballot_sync(MASK, changed != 0) == 0u) break;""",
+            && BALLOT(changed != 0) == 0u) break;""",
             gate="global_iteration >= friction_start_iteration",
-            quiet="__ballot_sync(MASK, changed != 0) == 0u",
-            lanes=lanes_per_world,
+            quiet="BALLOT(changed != 0) == 0u",
         )
         if contact_capable
         else sweep_exit(
             solve_policy,
-            "        if (__ballot_sync(MASK, changed != 0) == 0u) break;",
-            quiet="__ballot_sync(MASK, changed != 0) == 0u",
-            lanes=lanes_per_world,
+            "        if (BALLOT(changed != 0) == 0u) break;",
+            quiet="BALLOT(changed != 0) == 0u",
         )
     )
     mf_setup = (
@@ -16308,12 +16256,8 @@ def _get_pgs_solve_local_owned_kernel(
                 partial_mf = mf_J_a.data[mf6 + lane] * s_v[dof_a + lane];
             if (lane >= 6 && lane < 12 && dof_b >= 0)
                 partial_mf = mf_J_b.data[mf6 + lane - 6] * s_v[dof_b + lane - 6];
-            partial_mf += __shfl_down_sync(MASK, partial_mf, 16);
-            partial_mf += __shfl_down_sync(MASK, partial_mf, 8);
-            partial_mf += __shfl_down_sync(MASK, partial_mf, 4);
-            partial_mf += __shfl_down_sync(MASK, partial_mf, 2);
-            partial_mf += __shfl_down_sync(MASK, partial_mf, 1);
-            const float velocity_mf = __shfl_sync(MASK, partial_mf, 0);
+            SUM(partial_mf);
+            const float velocity_mf = partial_mf;
             const float residual_mf = velocity_mf + __int_as_float(meta.z);"""
     )
     mf_sibling_state_update = (
@@ -16364,13 +16308,9 @@ def _get_pgs_solve_local_owned_kernel(
                             if (lane >= 6 && lane < 12 && sibling_dof_b >= 0)
                                 sibling_partial_mf = mf_J_b.data[sibling_mf6 + lane - 6]
                                     * s_v[sibling_dof_b + lane - 6];
-                            sibling_partial_mf += __shfl_down_sync(MASK, sibling_partial_mf, 16);
-                            sibling_partial_mf += __shfl_down_sync(MASK, sibling_partial_mf, 8);
-                            sibling_partial_mf += __shfl_down_sync(MASK, sibling_partial_mf, 4);
-                            sibling_partial_mf += __shfl_down_sync(MASK, sibling_partial_mf, 2);
-                            sibling_partial_mf += __shfl_down_sync(MASK, sibling_partial_mf, 1);
+                            SUM(sibling_partial_mf);
                             const float sibling_residual_mf =
-                                __shfl_sync(MASK, sibling_partial_mf, 0)
+                                sibling_partial_mf
                                 + __int_as_float(mf_meta.data[sibling_meta_offset + 2]);
                             float tangent_cross_partial_mf = 0.0f;
                             if (lane < 6 && dof_a >= 0) {
@@ -16392,18 +16332,8 @@ def _get_pgs_solve_local_owned_kernel(
                                 tangent_cross_partial_mf =
                                     mf_J_b.data[mf6 + component] * sibling_response;
                             }
-                            tangent_cross_partial_mf +=
-                                __shfl_down_sync(MASK, tangent_cross_partial_mf, 16);
-                            tangent_cross_partial_mf +=
-                                __shfl_down_sync(MASK, tangent_cross_partial_mf, 8);
-                            tangent_cross_partial_mf +=
-                                __shfl_down_sync(MASK, tangent_cross_partial_mf, 4);
-                            tangent_cross_partial_mf +=
-                                __shfl_down_sync(MASK, tangent_cross_partial_mf, 2);
-                            tangent_cross_partial_mf +=
-                                __shfl_down_sync(MASK, tangent_cross_partial_mf, 1);
-                            const float tangent_cross_mf =
-                                __shfl_sync(MASK, tangent_cross_partial_mf, 0);"""
+                            SUM(tangent_cross_partial_mf);
+                            const float tangent_cross_mf = tangent_cross_partial_mf;"""
     )
     mf_main_state_update = (
         f"""const int matrix_row = row_count + mf_row;
@@ -16434,7 +16364,7 @@ def _get_pgs_solve_local_owned_kernel(
             if (mf_row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}
                 && global_iteration < friction_start_iteration) {{
                 s_mf_lambda[mf_row] = 0.0f;
-                __syncwarp();
+                SYNC();
                 continue;
             }}
             if (inverse_diagonal <= 0.0f) continue;
@@ -16456,13 +16386,9 @@ def _get_pgs_solve_local_owned_kernel(
                 if (mf_row != parent_mf + 1) {{
                     new_impulse_mf = old_impulse_mf;
                 }} else {{
-                    float lambda_n_mf = s_mf_lambda[parent_mf];
-                    for (int patch_row =
-                             ({_mf_parent_expression("mf_meta.data[mf_meta_offset + parent_mf * 4 + 3]", mf_max_constraints)});
-                         patch_row >= 0 && patch_row != parent_mf;
-                         patch_row =
-                             ({_mf_parent_expression("mf_meta.data[mf_meta_offset + patch_row * 4 + 3]", mf_max_constraints)}))
-                        lambda_n_mf += s_mf_lambda[patch_row];
+                    const float lambda_n_mf = RING_LOAD(s_mf_lambda[parent_mf], parent_mf, {local_mf_rows},
+                        [&](int patch_row) {{ return {_mf_parent_expression("mf_meta.data[mf_meta_offset + patch_row * 4 + 3]", mf_max_constraints)}; }},
+                        [&](int patch_row) {{ return s_mf_lambda[patch_row]; }});
                     const float radius_mf = fmaxf(
                         mf_row_mu.data[mf_offset + mf_row] * lambda_n_mf, 0.0f);
                     const int sibling_mf = parent_mf + 2;
@@ -16502,7 +16428,7 @@ def _get_pgs_solve_local_owned_kernel(
 {mf_main_vote}
                 {mf_main_state_update}
             }}
-            __syncwarp();
+            SYNC();
         }}"""
         if local_mf_rows
         else ""
@@ -16554,7 +16480,7 @@ def _get_pgs_solve_local_owned_kernel(
 {row_metadata_load}
     }}
 {velocity_load}
-    __syncwarp();
+    SYNC();
 
     for (int row = lane; row < row_count; row += {lanes_per_world}) {{
         float response[{dofs}];
@@ -16588,7 +16514,7 @@ def _get_pgs_solve_local_owned_kernel(
         s_inverse_diagonal[row] = effective_diagonal > 0.0f ? 1.0f / effective_diagonal : 0.0f;
         world_diag.data[world_row_base + row] = effective_diagonal;
     }}
-    __syncwarp();
+    SYNC();
 {response_matrix_setup}
 
 {row_masks}
@@ -16629,8 +16555,14 @@ def _get_pgs_solve_local_owned_kernel(
 {shared_cleanup}
 #endif
 """
-    snippet = cuda_native(snippet, preludes=((FRICTION_PAIR,) if contact_capable else ()) + solve_policy.preludes)
-    snippet = snippet.replace("__syncwarp();", "__syncwarp(MASK);")
+    snippet = cuda_native(
+        snippet,
+        preludes=(
+            lane_group(lanes_per_world),
+            *((RING, FRICTION_PAIR) if contact_capable else ()),
+            *solve_policy.preludes,
+        ),
+    )
 
     def pgs_solve_local_internal_signature(
         candidate: int,
@@ -16836,15 +16768,13 @@ def _get_build_independent_sparse_contact_groups_kernel(
     // inspect up to four normals concurrently, but any active batch is still
     // applied through this serial list in exact GS order.
 {_list_serial_contacts_source(count="triple_count", stride=3, head="true", serial_capacity=S)}
-    __syncwarp(MASK);
+    SYNC();
 """
         if build_serial_contacts
         else ""
     )
 
-    snippet = f"""
-#if defined(__CUDA_ARCH__)
-    constexpr unsigned MASK = 0xffffffffu;
+    snippet = f"""    const int lane = LANE;
     const int contact_start = dense_phase_bounds.data[world * 2 + 1];
     const int contact_end = world_constraint_count.data[world];
     const int head_base = world * {D};
@@ -16854,7 +16784,7 @@ def _get_build_independent_sparse_contact_groups_kernel(
     const int triple_count = contact_end > contact_start ? (contact_end - contact_start) / 3 : 0;
     for (int coordinate = lane; coordinate < {D}; coordinate += 32)
         group_heads.data[head_base + coordinate] = -1;
-    __syncwarp(MASK);
+    SYNC();
 
     // Reserve every diagonal coordinate used by a coupled contact. A scalar
     // row sharing one must remain in the serial chain to preserve GS order.
@@ -16868,7 +16798,7 @@ def _get_build_independent_sparse_contact_groups_kernel(
             if (coord_1 >= 0) atomicExch(&group_heads.data[head_base + coord_1], -2);
         }}
     }}
-    __syncwarp(MASK);
+    SYNC();
 
     // Link each coordinate's scalar triples in ascending row order, so that
     // every negative link reproduces the original GS order.
@@ -16879,23 +16809,21 @@ def _get_build_independent_sparse_contact_groups_kernel(
     for (int coordinate_base = 0; coordinate_base < {D}; coordinate_base += 32) {{
         const int coordinate = coordinate_base + lane;
         const int head = coordinate < {D} ? group_heads.data[head_base + coordinate] : -1;
-        const unsigned active = __ballot_sync(MASK, head >= 0);
-        const unsigned lower_lanes = lane == 0 ? 0u : 0xffffffffu >> (32 - lane);
+        const unsigned active = BALLOT(head >= 0);
         if (head >= 0) {{
-            const int output = count + __popc(active & lower_lanes);
+            const int output = count + BELOW(active);
             group_heads.data[head_base + output] = head;
         }}
-        count += __popc(active);
-        __syncwarp(MASK);
+        count += COUNT(active);
+        SYNC();
     }}
     if (lane == 0) group_count.data[world] = count;
 #endif
 """
 
-    @wp.func_native(snippet)
+    @wp.func_native(cuda_native(snippet, preludes=(lane_group(32),)))
     def build_independent_sparse_contact_groups_native(
         world: int,
-        lane: int,
         world_constraint_count: wp.array[int],
         dense_phase_bounds: wp.array2d[int],
         sparse_row_dof: wp.array3d[int],
@@ -16914,12 +16842,9 @@ def _get_build_independent_sparse_contact_groups_kernel(
         serial_count_out: wp.array[int],
         serial_normals: wp.array2d[int],
     ):
-        thread = wp.tid()
-        world = thread // 32
-        lane = thread % 32
+        world = wp.tid() // 32
         build_independent_sparse_contact_groups_native(
             world,
-            lane,
             world_constraint_count,
             dense_phase_bounds,
             sparse_row_dof,
@@ -16951,7 +16876,7 @@ def _link_scalar_contacts_source(*, count: str, stride: int, head: str, dofs: in
     ballot per coordinate bit, else to the coordinate's running head, and the chunk's first
     contact of the coordinate becomes that head.
 
-    The fragment runs on every lane of one world's warp and uses the builder's ``MASK``, ``lane``,
+    The fragment runs on every lane of one world's warp and uses the builder's lane group, ``lane``,
     ``contact_start``, ``sparse_world_base``, ``head_base``, ``sparse_row_dof`` and ``group_heads``,
     the names ``head`` reads, and ``earlier_lanes``, which must equal ``(1u << lane) - 1u``. A scalar
     contact's unmarked slot must hold a coordinate in ``[0, dofs)``, as the marker leaves it: the
@@ -16980,21 +16905,21 @@ def _link_scalar_contacts_source(*, count: str, stride: int, head: str, dofs: in
                 }}
             }}
         }}
-        unsigned peers = __ballot_sync(MASK, coordinate >= 0);
+        unsigned peers = BALLOT(coordinate >= 0);
         for (int bit = 0; bit < {coordinate_bits}; ++bit) {{
-            const unsigned ones = __ballot_sync(MASK, (coordinate >> bit) & 1);
+            const unsigned ones = BALLOT((coordinate >> bit) & 1);
             peers &= ((coordinate >> bit) & 1) ? ones : ~ones;
         }}
         if (coordinate >= 0) {{
             const unsigned later = peers & ~earlier_lanes & ~(1u << lane);
             const int next_normal = later != 0u
-                ? contact_start + (chunk * 32 + __ffs((int)later) - 1) * {stride} : running;
+                ? contact_start + (chunk * 32 + FIRST(later)) * {stride} : running;
             sparse_row_dof.data[link_row] = next_normal >= 0 ? -(next_normal + 3) : -2;
         }}
-        __syncwarp(MASK);
+        SYNC();
         if (coordinate >= 0 && (peers & earlier_lanes) == 0u)
             group_heads.data[head_base + coordinate] = normal;
-        __syncwarp(MASK);
+        SYNC();
     }}
 """
 
@@ -17006,10 +16931,10 @@ def _list_serial_contacts_source(*, count: str, stride: int, head: str, serial_c
     without a link (no marked coordinate left below ``-1``) joins ``serial_normals``, compacted
     by one ballot per chunk of 32 positions, and lane 0 writes their count.
 
-    The fragment runs on every lane of one world's warp and uses the builder's ``MASK``, ``lane``,
+    The fragment runs on every lane of one world's warp and uses the builder's lane group, ``lane``,
     ``world``, ``contact_start``, ``sparse_world_base``, ``sparse_row_dof``, ``serial_normals`` and
-    ``serial_count_out``, the names ``head`` reads, and ``earlier_lanes``, which must equal
-    ``(1u << lane) - 1u``. It declares ``serial_count`` in the scope it is placed in.
+    ``serial_count_out``, and the names ``head`` reads. It declares ``serial_count`` in the scope it
+    is placed in.
     """
     return f"""
     int serial_count = 0;
@@ -17022,10 +16947,10 @@ def _list_serial_contacts_source(*, count: str, stride: int, head: str, serial_c
             const int coord_1 = sparse_row_dof.data[sparse_row + 1];
             serial = ({head}) && !(coord_0 < -1 || coord_1 < -1);
         }}
-        const unsigned serial_lanes = __ballot_sync(MASK, serial);
+        const unsigned serial_lanes = BALLOT(serial);
         if (serial)
-            serial_normals.data[world * {serial_capacity} + serial_count + __popc(serial_lanes & earlier_lanes)] = normal;
-        serial_count += __popc(serial_lanes);
+            serial_normals.data[world * {serial_capacity} + serial_count + BELOW(serial_lanes)] = normal;
+        serial_count += COUNT(serial_lanes);
     }}
     if (lane == 0) serial_count_out.data[world] = serial_count;
 """
@@ -17084,7 +17009,7 @@ def _build_independent_sparse_contact_units_kernel(M: int, D: int, build_serial_
             row = normal - 1;
         }}
     }}
-    __syncwarp(MASK);
+    SYNC();
 """
     serial_schedule = (
         f"""
@@ -17107,7 +17032,7 @@ def _build_independent_sparse_contact_units_kernel(M: int, D: int, build_serial_
         }}
         serial_count_out.data[world] = serial_count;
     }}
-    __syncwarp(MASK);
+    SYNC();
 """
         if build_serial_contacts
         else ""
@@ -17119,9 +17044,7 @@ def _build_independent_sparse_contact_units_kernel(M: int, D: int, build_serial_
     )
     parallel_links = _link_scalar_contacts_source(count="contact_end - contact_start", stride=1, head=unit_head, dofs=D)
 
-    snippet = f"""
-#if defined(__CUDA_ARCH__)
-    constexpr unsigned MASK = 0xffffffffu;
+    snippet = f"""    const int lane = LANE;
     const int contact_start = dense_phase_bounds.data[world * 2 + 1];
     const int contact_end = world_constraint_count.data[world];
     const int head_base = world * {D};
@@ -17130,7 +17053,7 @@ def _build_independent_sparse_contact_units_kernel(M: int, D: int, build_serial_
     const unsigned earlier_lanes = (1u << lane) - 1u;
     for (int coordinate = lane; coordinate < {D}; coordinate += 32)
         group_heads.data[head_base + coordinate] = -1;
-    __syncwarp(MASK);
+    SYNC();
 
     // Reserve every diagonal coordinate used by a coupled unit. A scalar
     // unit sharing one must remain in the serial chain to preserve GS order.
@@ -17157,8 +17080,8 @@ def _build_independent_sparse_contact_units_kernel(M: int, D: int, build_serial_
             if (coord_1 >= 0) atomicExch(&group_heads.data[head_base + coord_1], -2);
         }}
     }}
-    rows_form_units = __all_sync(MASK, rows_form_units);
-    __syncwarp(MASK);
+    rows_form_units = ALL(rows_form_units);
+    SYNC();
 
     if (rows_form_units) {{
 {parallel_links}
@@ -17167,29 +17090,27 @@ def _build_independent_sparse_contact_units_kernel(M: int, D: int, build_serial_
 {serial_walks}
 {serial_schedule}
     }}
-    __syncwarp(MASK);
+    SYNC();
 
     int count = 0;
     for (int coordinate_base = 0; coordinate_base < {D}; coordinate_base += 32) {{
         const int coordinate = coordinate_base + lane;
         const int head = coordinate < {D} ? group_heads.data[head_base + coordinate] : -1;
-        const unsigned active = __ballot_sync(MASK, head >= 0);
-        const unsigned lower_lanes = lane == 0 ? 0u : 0xffffffffu >> (32 - lane);
+        const unsigned active = BALLOT(head >= 0);
         if (head >= 0) {{
-            const int output = count + __popc(active & lower_lanes);
+            const int output = count + BELOW(active);
             group_heads.data[head_base + output] = head;
         }}
-        count += __popc(active);
-        __syncwarp(MASK);
+        count += COUNT(active);
+        SYNC();
     }}
     if (lane == 0) group_count.data[world] = count;
 #endif
 """
 
-    @wp.func_native(snippet)
+    @wp.func_native(cuda_native(snippet, preludes=(lane_group(32),)))
     def build_independent_sparse_contact_units_native(
         world: int,
-        lane: int,
         world_constraint_count: wp.array[int],
         dense_phase_bounds: wp.array2d[int],
         world_row_type: wp.array2d[int],
@@ -17212,12 +17133,9 @@ def _build_independent_sparse_contact_units_kernel(M: int, D: int, build_serial_
         serial_count_out: wp.array[int],
         serial_normals: wp.array2d[int],
     ):
-        thread = wp.tid()
-        world = thread // 32
-        lane = thread % 32
+        world = wp.tid() // 32
         build_independent_sparse_contact_units_native(
             world,
-            lane,
             world_constraint_count,
             dense_phase_bounds,
             world_row_type,
@@ -17271,11 +17189,6 @@ def _get_pgs_solve_sparse_diagonal_kernel(
     batch_lanes = 8 if P + 2 <= 8 else 16
     batch_shift = 3 if batch_lanes == 8 else 4
     batch_contacts = 32 // batch_lanes
-    batch_reduction = "\n".join(
-        f"                    candidate_sum += __shfl_down_sync(candidate_mask, candidate_sum, {offset}, {batch_lanes});"
-        for offset in (8, 4, 2, 1)
-        if offset < batch_lanes
-    )
     elems_per_lane = (D + 31) // 32
 
     limit_declarations = []
@@ -17399,11 +17312,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 }}
 
                 // Patch normal load over the region's linked normal rows (circular parent list).
-                float lambda_n = s_lambda[normal];
-                for (int patch_row = (s_meta[normal] >> {_DENSE_META_ROW_TYPE_BITS}) - 1;
-                     patch_row >= 0 && patch_row != normal;
-                     patch_row = (s_meta[patch_row] >> {_DENSE_META_ROW_TYPE_BITS}) - 1)
-                    lambda_n += s_lambda[patch_row];
+                const float lambda_n = RING_LOAD(s_lambda[normal], normal, {M}, ring_parent, ring_impulse);
                 const float radius = fmaxf(s_mu[tangent1] * lambda_n, 0.0f);
                 const float old_tangent1 = s_lambda[tangent1];
                 const float old_tangent2 = s_lambda[tangent2];
@@ -17460,7 +17369,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 normal = next_normal;
             }}
         }}
-        __syncwarp(MASK);
+        SYNC();
 """
         skip_independent_contact = """
             if (row >= contact_start) {
@@ -17476,11 +17385,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
             if (row >= contact_start && (row - contact_start) % 3 == 0
                 && s_lambda[row + 1] == 0.0f
                 && s_lambda[row + 2] == 0.0f) {{
-                float patch_load = s_lambda[row];
-                for (int patch_row = (s_meta[row] >> {_DENSE_META_ROW_TYPE_BITS}) - 1;
-                     patch_row >= 0 && patch_row != row;
-                     patch_row = (s_meta[patch_row] >> {_DENSE_META_ROW_TYPE_BITS}) - 1)
-                    patch_load += s_lambda[patch_row];
+                const float patch_load = RING_LOAD(s_lambda[row], row, {M}, ring_parent, ring_impulse);
                 if (patch_load <= 0.0f) row += 2;
             }}"""
         if speculative_contact_batches:
@@ -17515,9 +17420,8 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                     if (candidate_coord < 0) candidate_jacobian = 0.0f;
                     float candidate_sum = candidate_coord >= 0
                         ? candidate_jacobian * s_v[candidate_coord] : 0.0f;
-                    const unsigned candidate_mask = {(1 << batch_lanes) - 1:#x}u << (batch_group * {batch_lanes});
-{batch_reduction}
-                    const float candidate_velocity = __shfl_sync(candidate_mask, candidate_sum, 0, {batch_lanes});
+                    SEGMENT_SUM({batch_lanes}, candidate_sum);
+                    const float candidate_velocity = candidate_sum;
                     bool candidate_noop = !candidate_valid;
                     if (candidate_valid) {{
                         const float old_impulse = s_lambda[candidate_normal];
@@ -17532,20 +17436,18 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                             && s_lambda[candidate_normal + 1] == 0.0f
                             && s_lambda[candidate_normal + 2] == 0.0f;
                         if (candidate_noop) {{
-                            for (int patch_row = (s_meta[candidate_normal] >> {_DENSE_META_ROW_TYPE_BITS}) - 1;
-                                 patch_row >= 0 && patch_row != candidate_normal;
-                                 patch_row = (s_meta[patch_row] >> {_DENSE_META_ROW_TYPE_BITS}) - 1)
-                                if (s_lambda[patch_row] > 0.0f) candidate_noop = false;
+                            candidate_noop = !RING_ANY(candidate_normal, {M}, ring_parent,
+                                [&](int r) {{ return s_lambda[r] > 0.0f; }});
                         }}
                     }}
-                    const unsigned noop_lanes = __ballot_sync(MASK, candidate_noop);
+                    const unsigned noop_lanes = BALLOT(candidate_noop);
                     if (noop_lanes == MASK) {{
                         const int remaining_contacts = serial_contact_count - contact_index;
                         const int batch_contacts = remaining_contacts < {batch_contacts} ? remaining_contacts : {batch_contacts};
                         serial_row += batch_contacts * 3 - 1;
                         continue;
                     }}
-                    const int first_active_contact = (__ffs((int)(~noop_lanes)) - 1) >> {batch_shift};
+                    const int first_active_contact = FIRST(~noop_lanes) >> {batch_shift};
                     serial_row += first_active_contact * 3;
                     contact_index += first_active_contact;
                 }}
@@ -17558,11 +17460,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
             if (contact_component == 0
                 && s_lambda[row + 1] == 0.0f
                 && s_lambda[row + 2] == 0.0f) {{
-                float patch_load = s_lambda[row];
-                for (int patch_row = (s_meta[row] >> {_DENSE_META_ROW_TYPE_BITS}) - 1;
-                     patch_row >= 0 && patch_row != row;
-                     patch_row = (s_meta[patch_row] >> {_DENSE_META_ROW_TYPE_BITS}) - 1)
-                    patch_load += s_lambda[patch_row];
+                const float patch_load = RING_LOAD(s_lambda[row], row, {M}, ring_parent, ring_impulse);
                 if (patch_load <= 0.0f) serial_row += 2;
             }}"""
     if contact_units:
@@ -17623,11 +17521,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 const int tangent2 = normal + 2;
 
                 // Patch normal load over the region's linked normal rows (circular parent list).
-                float lambda_n = s_lambda[normal];
-                for (int patch_row = (s_meta[normal] >> {type_bits}) - 1;
-                     patch_row >= 0 && patch_row != normal;
-                     patch_row = (s_meta[patch_row] >> {type_bits}) - 1)
-                    lambda_n += s_lambda[patch_row];
+                const float lambda_n = RING_LOAD(s_lambda[normal], normal, {M}, ring_parent, ring_impulse);
                 const float radius = fmaxf(s_mu[tangent1] * lambda_n, 0.0f);
                 const float old_tangent1 = s_lambda[tangent1];
                 const float old_tangent2 = s_lambda[tangent2];
@@ -17684,7 +17578,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 normal = next_normal;
             }}
         }}
-        __syncwarp(MASK);
+        SYNC();
 """
         # A tangent row's parent is its unit's head.
         skip_independent_contact = f"""
@@ -17703,20 +17597,11 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 && {owns_tangents("row", " " * 16)}
                 && s_lambda[row + 1] == 0.0f
                 && s_lambda[row + 2] == 0.0f) {{
-                float patch_load = s_lambda[row];
-                for (int patch_row = (s_meta[row] >> {type_bits}) - 1;
-                     patch_row >= 0 && patch_row != row;
-                     patch_row = (s_meta[patch_row] >> {type_bits}) - 1)
-                    patch_load += s_lambda[patch_row];
+                const float patch_load = RING_LOAD(s_lambda[row], row, {M}, ring_parent, ring_impulse);
                 if (patch_load <= 0.0f) row += 2;
             }}"""
         if speculative_contact_batches:
             skip_independent_contact = ""
-            unit_batch_reduction = "\n".join(
-                f"                        candidate_sum += __shfl_down_sync(candidate_mask, candidate_sum, {offset}, {batch_lanes});"
-                for offset in (8, 4, 2, 1)
-                if offset < batch_lanes
-            )
             # Units have one or three rows, so the loop walks real rows and enters
             # each serial unit at its head; the serial list has one entry per row.
             serial_loop_open = f"""        const int serial_unit_count = sparse_contact_serial_count.data[world];
@@ -17749,9 +17634,8 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                         if (candidate_coord < 0) candidate_jacobian = 0.0f;
                         float candidate_sum = candidate_coord >= 0
                             ? candidate_jacobian * s_v[candidate_coord] : 0.0f;
-                        const unsigned candidate_mask = {(1 << batch_lanes) - 1:#x}u << (batch_group * {batch_lanes});
-{unit_batch_reduction}
-                        const float candidate_velocity = __shfl_sync(candidate_mask, candidate_sum, 0, {batch_lanes});
+                        SEGMENT_SUM({batch_lanes}, candidate_sum);
+                        const float candidate_velocity = candidate_sum;
                         bool candidate_noop = !candidate_valid;
                         if (candidate_valid) {{
                             const float old_impulse = s_lambda[candidate_normal];
@@ -17768,19 +17652,17 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                                 candidate_noop = s_lambda[candidate_normal + 1] == 0.0f
                                     && s_lambda[candidate_normal + 2] == 0.0f;
                                 if (candidate_noop) {{
-                                    for (int patch_row = (s_meta[candidate_normal] >> {type_bits}) - 1;
-                                         patch_row >= 0 && patch_row != candidate_normal;
-                                         patch_row = (s_meta[patch_row] >> {type_bits}) - 1)
-                                        if (s_lambda[patch_row] > 0.0f) candidate_noop = false;
+                                    candidate_noop = !RING_ANY(candidate_normal, {M}, ring_parent,
+                                        [&](int r) {{ return s_lambda[r] > 0.0f; }});
                                 }}
                             }}
                         }}
-                        const unsigned noop_lanes = __ballot_sync(MASK, candidate_noop);
+                        const unsigned noop_lanes = BALLOT(candidate_noop);
                         if (noop_lanes == MASK) {{
                             serial_unit += {batch_contacts};
                             continue;
                         }}
-                        serial_unit += (__ffs((int)(~noop_lanes)) - 1) >> {batch_shift};
+                        serial_unit += FIRST(~noop_lanes) >> {batch_shift};
                     }}
                     unit_head = sparse_contact_serial_normals.data[world * {M} + serial_unit];
                     ++serial_unit;
@@ -17799,11 +17681,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
             if (row == tangent_unit
                 && s_lambda[row + 1] == 0.0f
                 && s_lambda[row + 2] == 0.0f) {{
-                float patch_load = s_lambda[row];
-                for (int patch_row = (s_meta[row] >> {type_bits}) - 1;
-                     patch_row >= 0 && patch_row != row;
-                     patch_row = (s_meta[patch_row] >> {type_bits}) - 1)
-                    patch_load += s_lambda[patch_row];
+                const float patch_load = RING_LOAD(s_lambda[row], row, {M}, ring_parent, ring_impulse);
                 if (patch_load <= 0.0f) row += 2;
             }}"""
 
@@ -17822,13 +17700,12 @@ def _get_pgs_solve_sparse_diagonal_kernel(
     sweep_end = sweep_exit(
         solve_policy,
         """        if (global_iteration >= friction_start_iteration
-            && __ballot_sync(MASK, iteration_changed != 0) == 0u) break;
+            && BALLOT(iteration_changed != 0) == 0u) break;
 """,
         gate="global_iteration >= friction_start_iteration",
-        quiet="__ballot_sync(MASK, iteration_changed != 0) == 0u",
+        quiet="BALLOT(iteration_changed != 0) == 0u",
     )
-    snippet = f"""    const unsigned MASK = 0xffffffffu;
-    const int lane = threadIdx.x & 31;
+    snippet = f"""    const int lane = LANE;
     int row_count = world_constraint_count.data[world];
     if (row_count > {M}) row_count = {M};
     const int row_base = world * {M};
@@ -17843,6 +17720,9 @@ def _get_pgs_solve_sparse_diagonal_kernel(
     __shared__ float s_diag[{M}];
     __shared__ int s_meta[{M}];
     __shared__ float s_mu[{M}];
+    // A contact normal's patch ring: the packed metadata holds each row's parent plus one.
+    const auto ring_parent = [&](int r) {{ return (s_meta[r] >> {_DENSE_META_ROW_TYPE_BITS}) - 1; }};
+    const auto ring_impulse = [&](int r) {{ return s_lambda[r]; }};
 
 {chr(10).join(limit_declarations)}
 
@@ -17862,14 +17742,14 @@ def _get_pgs_solve_sparse_diagonal_kernel(
         s_v[coord] = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;
     }}
 {chr(10).join(limit_loads)}
-    __syncwarp(MASK);
+    SYNC();
 
     for (int iteration = 0; iteration < iterations; ++iteration) {{
         const int global_iteration = iteration_offset + iteration;
         int iteration_changed = 0;
 
 {chr(10).join(limit_projection)}
-        __syncwarp(MASK);
+        SYNC();
 
 {independent_contact_phase}
 
@@ -17879,13 +17759,13 @@ def _get_pgs_solve_sparse_diagonal_kernel(
             if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}
                 && global_iteration < friction_start_iteration) {{
                 s_lambda[row] = 0.0f;
-                __syncwarp(MASK);
+                SYNC();
                 continue;
             }}
             const int parent = (s_meta[row] >> {_DENSE_META_ROW_TYPE_BITS}) - 1;
             if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)} && row != parent + 1) {{
                 // The first tangent row solved both tangents; the second visit is a no-op.
-                __syncwarp(MASK);
+                SYNC();
                 continue;
             }}
             const float denominator = s_diag[row];
@@ -17907,12 +17787,8 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 response = sparse_row_jy.data[sparse_row * 4 + sparse_slot * 2 + 1];
             }}
             float partial = coord >= 0 ? jacobian * s_v[coord] : 0.0f;
-            partial += __shfl_down_sync(MASK, partial, 16);
-            partial += __shfl_down_sync(MASK, partial, 8);
-            partial += __shfl_down_sync(MASK, partial, 4);
-            partial += __shfl_down_sync(MASK, partial, 2);
-            partial += __shfl_down_sync(MASK, partial, 1);
-            const float velocity = __shfl_sync(MASK, partial, 0);
+            SUM(partial);
+            const float velocity = partial;
 
             const float residual = velocity + s_rhs[row];
             const float old_impulse = s_lambda[row];
@@ -17924,11 +17800,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
             }} else if (row_type == {int(PGS_CONSTRAINT_TYPE_FRICTION)}) {{
                 // Paired tangent solve at the patch normal load, matching the general owner.
                 const int sibling = parent + 2;
-                float lambda_n = s_lambda[parent];
-                for (int patch_row = (s_meta[parent] >> {_DENSE_META_ROW_TYPE_BITS}) - 1;
-                     patch_row >= 0 && patch_row != parent;
-                     patch_row = (s_meta[patch_row] >> {_DENSE_META_ROW_TYPE_BITS}) - 1)
-                    lambda_n += s_lambda[patch_row];
+                const float lambda_n = RING_LOAD(s_lambda[parent], parent, {M}, ring_parent, ring_impulse);
                 const float radius = fmaxf(s_mu[row] * lambda_n, 0.0f);
                 const float sibling_old = s_lambda[sibling];
                 // Sibling row entries on this lane's coordinate and its own two sparse slots.
@@ -17960,12 +17832,9 @@ def _get_pgs_solve_sparse_diagonal_kernel(
                 if (radius > 0.0f) {{
                     float partial_sibling = sibling_coord >= 0 ? sibling_jacobian * s_v[sibling_coord] : 0.0f;
                     float partial_cross = coord >= 0 ? jacobian * sibling_response_here : 0.0f;
-                    for (int offset = 16; offset > 0; offset >>= 1) {{
-                        partial_sibling += __shfl_down_sync(MASK, partial_sibling, offset);
-                        partial_cross += __shfl_down_sync(MASK, partial_cross, offset);
-                    }}
-                    const float sibling_residual = __shfl_sync(MASK, partial_sibling, 0) + s_rhs[sibling];
-                    const float cross = __shfl_sync(MASK, partial_cross, 0);
+                    SUM(partial_sibling, partial_cross);
+                    const float sibling_residual = partial_sibling + s_rhs[sibling];
+                    const float cross = partial_cross;
                     pair = friction_pair_candidate(denominator, cross, s_diag[sibling],
                         residual, sibling_residual, old_impulse, sibling_old, radius, omega);
                 }}
@@ -17988,7 +17857,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
 {row_vote}
                 if (coord >= 0) s_v[coord] += response * delta_impulse;
             }}
-            __syncwarp(MASK);
+            SYNC();
 {skip_inactive_friction}
 {serial_loop_close}
 
@@ -18003,7 +17872,7 @@ def _get_pgs_solve_sparse_diagonal_kernel(
 {chr(10).join(limit_stores)}
 #endif
 """
-    snippet = cuda_native(snippet, preludes=(FRICTION_PAIR, *solve_policy.preludes))
+    snippet = cuda_native(snippet, preludes=(lane_group(32), RING, FRICTION_PAIR, *solve_policy.preludes))
 
     @wp.func_native(snippet)
     def pgs_solve_sparse_diagonal_native(
@@ -18407,7 +18276,7 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
                 const int i = s_vlim_rows[k];
                 const float residual_vlim = s_res[i];
 {vlim_law}
-                __syncwarp();
+                SYNC();
                 if (lane == 0) {{
                     s_lam[i] = {vlim_stored};
                     s_app[i] += delta_impulse_vlim;
@@ -18416,7 +18285,7 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
 {vlim_vote}
                     for (int r = lane; r < n_rows_total; r += 32) s_res[r] += s_A[i * {AM} + r] * delta_impulse_vlim;
                 }}
-                __syncwarp();
+                SYNC();
             }}
         }}"""
         if has_dense_velocity_limit_rows
@@ -18426,16 +18295,15 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
     sweep_end = sweep_exit(
         solve_policy,
         """        if (global_iter >= friction_start_iteration) {
-            const unsigned changed = __ballot_sync(MASK, iteration_changed != 0);
+            const unsigned changed = BALLOT(iteration_changed != 0);
             if (changed == 0u) break;
         }
 """,
         gate="global_iter >= friction_start_iteration",
-        quiet="__ballot_sync(MASK, iteration_changed != 0) == 0u",
+        quiet="BALLOT(iteration_changed != 0) == 0u",
         iteration="iter",
     )
-    snippet = f"""    const unsigned MASK = 0xFFFFFFFF;
-    const int lane = threadIdx.x;
+    snippet = f"""    const int lane = LANE;
 
     int m_dense = world_constraint_count.data[world];
     const int m_mf = mf_constraint_count.data[world];
@@ -18496,7 +18364,7 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
         const int global_dof = world_dof_indices.data[dof_map_base + d];
         s_v[d] = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;
     }}
-    __syncwarp();
+    SYNC();
 
     // ── Compact the rows this phase visits, in row order, with pre-decoded kind ──
     int n_active = 0;
@@ -18524,19 +18392,19 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
             else if (row_type == {T_VLIM}) kind = 2;
             else if (row_type == 1) kind = 3;
         }}
-        const unsigned admit_mask = __ballot_sync(MASK, admit != 0);
-        const unsigned vlim_mask = __ballot_sync(MASK, vlim != 0);
+        const unsigned admit_mask = BALLOT(admit != 0);
+        const unsigned vlim_mask = BALLOT(vlim != 0);
         if (admit) {{
-            const int slot = n_active + __popc(admit_mask & ((1u << lane) - 1u));
+            const int slot = n_active + BELOW(admit_mask);
             s_rows[slot] = row;
             s_kind[slot] = kind;
         }}
         if (vlim) {{
-            const int slot = n_vlim + __popc(vlim_mask & ((1u << lane) - 1u));
+            const int slot = n_vlim + BELOW(vlim_mask);
             s_vlim_rows[slot] = row;
         }}
-        n_active += __popc(admit_mask);
-        n_vlim += __popc(vlim_mask);
+        n_active += COUNT(admit_mask);
+        n_vlim += COUNT(vlim_mask);
     }}
 
     // Store each impulse's response contiguously: A[i][r] = J_r . Y_i.
@@ -18562,7 +18430,7 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
         for (int d = 0; d < {D}; ++d) r += Ji[d] * s_v[d];
         s_res[i] = r;
     }}
-    __syncwarp();
+    SYNC();
 
     for (int iter = 0; iter < iterations; iter++) {{
         const int global_iter = iteration_offset + iter;
@@ -18593,9 +18461,8 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
                         new_impulse = old_impulse;
                     }} else {{
                         sib = parent_idx + 2;
-                        float lambda_n = s_lam[parent_idx];
-                        for (int patch_row = s_parent[parent_idx]; patch_row >= 0 && patch_row != parent_idx; patch_row = s_parent[patch_row])
-                            lambda_n += s_lam[patch_row];
+                        const float lambda_n = RING_LOAD(s_lam[parent_idx], parent_idx, {AM},
+                            [&](int r) {{ return s_parent[r]; }}, [&](int r) {{ return s_lam[r]; }});
                         const float radius = fmaxf(s_mu[i] * lambda_n, 0.0f);
                         const float2 pair = friction_pair_candidate(
                             s_diag[i], s_A[sib * {AM} + i], s_diag[sib],
@@ -18613,7 +18480,7 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
                     delta_impulse = new_impulse - old_impulse;
                 }}
             }}
-            __syncwarp();
+            SYNC();
             if (lane == 0) {{
                 s_lam[i] = new_impulse;
                 s_app[i] += delta_impulse;
@@ -18630,7 +18497,7 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
 {sibling_vote}
                 for (int r = lane; r < n_rows_total; r += 32) s_res[r] += s_A[sib * {AM} + r] * sib_delta;
             }}
-            __syncwarp();
+            SYNC();
         }}
 {vlim_pass}
 {sweep_end}    }}
@@ -18651,7 +18518,7 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
 #endif
 """
 
-    snippet = cuda_native(snippet, preludes=(FRICTION_PAIR, *solve_policy.preludes))
+    snippet = cuda_native(snippet, preludes=(lane_group(32), RING, FRICTION_PAIR, *solve_policy.preludes))
 
     @wp.func_native(snippet)
     def pgs_solve_mf_gs_incremental_native(
@@ -19088,10 +18955,7 @@ def _get_pgs_solve_parallel_kernel(
         velocity_limit_shared = "    __shared__ int   s_vlim[AM];    // velocity-limit rows, for the last-word pass\n"
         velocity_limit_stage = f"        s_vlim[i] = row_type == {T_VLIM} ? 1 : 0;\n"
         velocity_limit_last_word = _parallel_velocity_limit_pass(matrix_free=bool(MF), inkernel=bool(INK), dofs=D)
-    snippet = f"""
-#if defined(__CUDA_ARCH__)
-    const unsigned MASK = 0xFFFFFFFF;
-    const int lane = threadIdx.x;      // 0 .. NT-1
+    snippet = f"""    const int lane = LANE;      // 0 .. NT-1
     constexpr int AM = {AM};
     constexpr int AP = {AP};
     constexpr int RPL = {RPL};
@@ -19102,11 +18966,6 @@ def _get_pgs_solve_parallel_kernel(
 #define ZAT(d, i) Y_world.data[jy_world_base + (i) * {D} + (d)]
 #else
 #define ZAT(d, i) s_Yt[(d) * YS + (i)]
-#endif
-#if {NT} == 32
-#define SYNC() __syncwarp()
-#else
-#define SYNC() __syncthreads()
 #endif
 
     int m_dense = world_constraint_count.data[world];
@@ -19442,8 +19301,8 @@ def _get_pgs_solve_parallel_kernel(
             const bool fr = (i < n_rows) && (s_kind[i] == 1);
             const int p = fr ? s_parent[i] : i;
             const int sib = fr ? ((i == p + 1) ? p + 2 : p + 1) : i;
-            const float xp = __shfl_sync(MASK, x_new[0], p & 31);
-            const float xs = __shfl_sync(MASK, x_new[0], sib & 31);
+            const float xp = READ(x_new[0], p & 31);
+            const float xs = READ(x_new[0], sib & 31);
             if (fr) {{
                 const float radius = fmaxf(s_mu[i] * xp, 0.0f);
                 const float a_val = x_new[0];
@@ -19480,8 +19339,7 @@ def _get_pgs_solve_parallel_kernel(
         float dot_local = 0.0f;
         if (lane < n_rows) dot_local = (s_y[lane] - x_new[0]) * (x_new[0] - x_old[0]);
         float dot = dot_local;
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(MASK, dot, off);
+        SUM(dot);
         if (NT > 32) {{
             if ((lane & 31) == 0) s_dot[lane >> 5] = dot;
             SYNC();
@@ -19506,7 +19364,7 @@ def _get_pgs_solve_parallel_kernel(
         SYNC();
         if (global_iter >= friction_start_iteration) {{
             if (NT == 32) {{
-                const unsigned any = __ballot_sync(MASK, changed != 0);
+                const unsigned any = BALLOT(changed != 0);
                 if (any == 0u) break;
             }} else {{
                 if (lane == 0) s_changed = 0;
@@ -19572,9 +19430,9 @@ def _get_pgs_solve_parallel_kernel(
     }}
 #undef A_AT
 #undef ZAT
-#undef SYNC
 #endif
 """
+    snippet = cuda_native(snippet, preludes=(lane_group(NT), *((RING,) if linked_rows else ())))
     if linked_rows:
         snippet = _link_parallel_friction_pairs(snippet)
 
@@ -19677,11 +19535,11 @@ def _parallel_velocity_limit_pass(*, matrix_free: bool, inkernel: bool, dofs: in
                 if (s_kind[i] != 0 || s_vlim[i] == 0) continue;
                 float part = 0.0f;
                 for (int j = lane; j < n_rows; j += 32) part += A_AT(i, j) * s_x[j];
-                for (int off = 16; off > 0; off >>= 1) part += __shfl_xor_sync(MASK, part, off);
+                SUM(part);
                 const float r_vlim = s_rhs[i] + part;
                 const float diag_vlim = world_diag.data[off_dense + i];
                 if (r_vlim < 0.0f && diag_vlim > 0.0f && lane == 0) s_x[i] += -r_vlim / diag_vlim;
-                __syncwarp();
+                WARP_SYNC();
             }
         }
         SYNC();
@@ -19712,10 +19570,7 @@ def _parallel_velocity_limit_pass(*, matrix_free: bool, inkernel: bool, dofs: in
                     part += row * s_dv[d];
                     zz += row * row;
                 }}
-                for (int off = 16; off > 0; off >>= 1) {{
-                    part += __shfl_xor_sync(MASK, part, off);
-                    zz += __shfl_xor_sync(MASK, zz, off);
-                }}
+                SUM(part, zz);
                 const float r_vlim = s_rhs[i] + part;
                 const float diag_vlim = {diagonal};
                 if (r_vlim < 0.0f && diag_vlim > 0.0f) {{
@@ -19723,7 +19578,7 @@ def _parallel_velocity_limit_pass(*, matrix_free: bool, inkernel: bool, dofs: in
                     if (lane == 0) s_x[i] += delta_vlim;
                     for (int d = lane; d < {dofs}; d += 32) s_dv[d] += {column} * delta_vlim;
                 }}
-                __syncwarp();
+                WARP_SYNC();
             }}
         }}
         SYNC();
@@ -19766,24 +19621,24 @@ def _link_parallel_friction_pairs(snippet: str) -> str:
     serial patch sweep share their friction solution, and their whole solution where
     both accumulate the velocity-limit rows.
     """
+    # A parent past the admitted rows ends the ring.
     ring = (
-        "float load = s_x[p];\n"
-        "{indent}for (int ring = s_parent[p], hop = 0; ring >= 0 && ring < n_rows && ring != p && hop < n_rows;"
-        " ring = s_parent[ring], ++hop)\n"
-        "{indent}    load += s_x[ring];\n"
+        "const float load = RING_LOAD(s_x[p], p, n_rows,\n"
+        "{indent}    [&](int r) {{ const int next = s_parent[r]; return next < n_rows ? next : -1; }},\n"
+        "{indent}    [&](int r) {{ return s_x[r]; }});\n"
         "{indent}const float radius = fmaxf(s_mu[i] * load, 0.0f);\n"
     )
     # One warp: the normals arrive by shuffle in the point law; stage them for the ring walk instead.
     warp_pair = (
-        "            const float xp = __shfl_sync(MASK, x_new[0], p & 31);\n"
-        "            const float xs = __shfl_sync(MASK, x_new[0], sib & 31);\n"
+        "            const float xp = READ(x_new[0], p & 31);\n"
+        "            const float xs = READ(x_new[0], sib & 31);\n"
         "            if (fr) {\n"
         "                const float radius = fmaxf(s_mu[i] * xp, 0.0f);\n"
     )
     warp_ring = (
-        "            const float xs = __shfl_sync(MASK, x_new[0], sib & 31);\n"
+        "            const float xs = READ(x_new[0], sib & 31);\n"
         "            if (i < n_rows) s_x[i] = x_new[0];\n"
-        "            __syncwarp();\n"
+        "            WARP_SYNC();\n"
         "            if (fr) {\n"
         "                " + ring.format(indent="                ")
     )

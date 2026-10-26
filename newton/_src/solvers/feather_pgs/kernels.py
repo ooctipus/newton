@@ -25,6 +25,16 @@ from ...sim.articulation import (
     eval_single_articulation_fk,
 )
 from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
+from .device_preludes import (
+    dual_native,
+    lane_group,
+    lane_minimum,
+    reserve,
+    reserved_count,
+    warp_scan,
+    warp_sum,
+    warp_sync,
+)
 from .friction import friction_pair_candidate
 from .friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, contact_tangent_basis, patch_normal_load
 
@@ -207,24 +217,6 @@ def _prescaled_axis_count(
     return joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1]
 
 
-@wp.func_native("""
-#if defined(__CUDA_ARCH__)
-    for (int offset = lanes >> 1; offset > 0; offset >>= 1) {
-        const float other = __shfl_xor_sync(0xffffffffu, ratio, offset);
-        if (other < ratio)
-            ratio = other;
-    }
-#endif
-    return ratio;
-""")
-def _articulation_lane_min(ratio: float, lanes: int) -> float:
-    """Return the smallest ``ratio`` of an aligned group of ``lanes`` CUDA lanes; one lane on CPU.
-
-    Every lane of a complete warp must call it with the same power-of-two
-    ``lanes``.
-    """
-
-
 @wp.kernel(enable_backward=False)
 def prescale_joint_velocity_limits(
     articulation_count: int,
@@ -294,7 +286,7 @@ def prescale_joint_velocity_limits(
                 if scale < ratio:
                     ratio = scale
     # Padding lanes past the last articulation take part with ratio 1.
-    ratio = _articulation_lane_min(ratio, lanes)
+    ratio = lane_minimum(ratio, lanes)
 
     if art == 0:
         # Joints ahead of the first articulation keep their velocity.
@@ -1467,15 +1459,6 @@ def eval_rigid_fk_id(
     fk_id_cache_valid[index] = 1
 
 
-@wp.func_native("""
-#if defined(__CUDA_ARCH__)
-    __syncwarp();
-#endif
-""")
-def _tree_warp_sync():
-    """Order dependent tree levels within one complete CUDA warp."""
-
-
 @cache
 def _get_tree_fk_kernel(lanes: int, mode: str):
     """Build a cooperative tree traversal without replacing its per-joint mathematics.
@@ -1554,7 +1537,7 @@ def _get_tree_fk_kernel(lanes: int, mode: str):
                             )
                         segment += lanes
                 if wp.static(lanes > 1):
-                    _tree_warp_sync()
+                    warp_sync()
 
         return tree_fk_public
 
@@ -1642,7 +1625,7 @@ def _get_tree_fk_kernel(lanes: int, mode: str):
                         origin = wp.transform_point(body_q[root_body], body_com[root_body])
                 articulation_origin[articulation] = origin
         if wp.static(lanes > 1):
-            _tree_warp_sync()
+            warp_sync()
 
         origin = wp.vec3()
         write_body_inertia = materialize_all_body_inertia
@@ -1738,7 +1721,7 @@ def _get_tree_fk_kernel(lanes: int, mode: str):
                     segment += lanes
             # Inactive groups still participate in every full-warp barrier.
             if wp.static(lanes > 1):
-                _tree_warp_sync()
+                warp_sync()
         if active and local == 0:
             fk_id_cache_valid[articulation] = 1
 
@@ -1987,7 +1970,7 @@ def _get_tree_tau_kernel(lanes: int):
                     segment += lanes
             # Tau is never skipped on FK cache hits: controls and wrenches can change.
             if wp.static(lanes > 1):
-                _tree_warp_sync()
+                warp_sync()
 
     return tree_tau
 
@@ -3145,6 +3128,7 @@ def allocate_physx_drive_slots(
     # outputs
     drive_slot: wp.array[int],
     world_slot_counter: wp.array[int],
+    first_rejected_slot: wp.array[int],
 ):
     """Allocate one dense PhysX-style drive row for each driven scalar DOF."""
     art = wp.tid()
@@ -3175,9 +3159,7 @@ def allocate_physx_drive_slots(
             if stiffness <= 0.0 and damping <= 0.0:
                 continue
 
-            slot = wp.atomic_add(world_slot_counter, world, 1)
-            if slot < max_constraints:
-                drive_slot[dof] = slot
+            drive_slot[dof] = reserve(world_slot_counter, world, 1, max_constraints, first_rejected_slot)
 
 
 @wp.kernel
@@ -3420,6 +3402,7 @@ def build_joint_limit_rows_for_size(
     resolved_worlds: wp.array[int],
     # outputs
     world_slot_counter: wp.array[int],
+    first_rejected_slot: wp.array[int],
     J_group: wp.array3d[float],
     world_row_type: wp.array2d[int],
     world_row_parent: wp.array2d[int],
@@ -3464,8 +3447,8 @@ def build_joint_limit_rows_for_size(
                 if not active:
                     continue
 
-                slot = wp.atomic_add(world_slot_counter, world, 1)
-                if slot >= max_constraints:
+                slot = reserve(world_slot_counter, world, 1, max_constraints, first_rejected_slot)
+                if slot < 0:
                     continue
 
                 J_group[group_idx, slot, local_dof] = sign
@@ -3505,6 +3488,7 @@ def allocate_mimic_slots(
     # outputs
     mimic_slot: wp.array[int],
     world_slot_counter: wp.array[int],
+    first_rejected_slot: wp.array[int],
 ):
     """Allocate one dense constraint slot per enabled, valid mimic constraint.
 
@@ -3517,9 +3501,7 @@ def allocate_mimic_slots(
         return
     if not mimic_enabled[k]:
         return
-    slot = wp.atomic_add(world_slot_counter, mimic_world[k], 1)
-    if slot < max_constraints:
-        mimic_slot[k] = slot
+    mimic_slot[k] = reserve(world_slot_counter, mimic_world[k], 1, max_constraints, first_rejected_slot)
 
 
 @wp.kernel
@@ -3618,6 +3600,7 @@ def allocate_connect_slots(
     # outputs
     connect_slot: wp.array[int],
     world_slot_counter: wp.array[int],
+    first_rejected_slot: wp.array[int],
 ):
     """Allocate three consecutive dense slots per enabled, valid loop closure.
 
@@ -3628,9 +3611,7 @@ def allocate_connect_slots(
     connect_slot[k] = -1
     if connect_valid[k] == 0 or connect_enabled[k] == 0:
         return
-    slot = wp.atomic_add(world_slot_counter, connect_world[k], 3)
-    if slot + 2 < max_constraints:
-        connect_slot[k] = slot
+    connect_slot[k] = reserve(world_slot_counter, connect_world[k], 3, max_constraints, first_rejected_slot)
 
 
 @wp.kernel
@@ -4074,6 +4055,7 @@ def allocate_joint_velocity_limit_slots(
     velocity_limit_slot: wp.array[int],
     velocity_limit_sign: wp.array[float],
     world_slot_counter: wp.array[int],
+    first_rejected_slot: wp.array[int],
 ):
     """Allocate lower/upper velocity-limit rows for every finitely limited DOF.
 
@@ -4170,21 +4152,19 @@ def allocate_joint_velocity_limit_slots(
 
     if n_eligible == 0:
         return
-    base = wp.atomic_add(world_slot_counter, world, 2 * n_eligible)
-    slot = base
+    # One reservation per articulation: its pairs fit together or none of them does.
+    slot = reserve(world_slot_counter, world, 2 * n_eligible, max_constraints, first_rejected_slot)
     for d in range(dof_count):
         dof = dof_base + d
         lower_idx = 2 * dof
         if velocity_limit_sign[lower_idx] != 1.0:
             continue
-        upper_idx = lower_idx + 1
-        if slot < max_constraints:
-            velocity_limit_slot[lower_idx] = slot
-        else:
+        if slot < 0:
             velocity_limit_sign[lower_idx] = 0.0
-        if slot + 1 < max_constraints:
-            velocity_limit_slot[upper_idx] = slot + 1
-            velocity_limit_sign[upper_idx] = -1.0
+            continue
+        velocity_limit_slot[lower_idx] = slot
+        velocity_limit_slot[lower_idx + 1] = slot + 1
+        velocity_limit_sign[lower_idx + 1] = -1.0
         slot += 2
 
 
@@ -4265,7 +4245,6 @@ def populate_joint_velocity_limit_J_for_size(
 @wp.func
 def _allocate_world_contact_slot(
     c: int,
-    total_contacts: int,
     contact_shape0: wp.array[int],
     contact_shape1: wp.array[int],
     contact_point0: wp.array[wp.vec3],
@@ -4274,7 +4253,6 @@ def _allocate_world_contact_slot(
     contact_thickness0: wp.array[float],
     contact_thickness1: wp.array[float],
     body_q: wp.array[wp.transform],
-    shape_transform: wp.array[wp.transform],
     shape_body: wp.array[int],
     body_to_articulation: wp.array[int],
     art_to_world: wp.array[int],
@@ -4306,7 +4284,6 @@ def _allocate_world_contact_slot(
     mf_dropped_contact_rows: wp.array[int],
     dense_first_rejected_slot: wp.array[int],
     mf_first_rejected_slot: wp.array[int],
-    capacity_status: wp.array[int],
 ):
     """Classify and allocate rows for one active contact.
 
@@ -4433,10 +4410,8 @@ def _allocate_world_contact_slot(
 
     if is_mf != 0:
         # Matrix-free path
-        slot = wp.atomic_add(mf_slot_counter, world, slots_needed)
-        if slot + slots_needed > mf_max_constraints:
-            wp.atomic_min(mf_first_rejected_slot, world, slot)
-            wp.atomic_max(capacity_status, 1, 1)
+        slot = reserve(mf_slot_counter, world, slots_needed, mf_max_constraints, mf_first_rejected_slot)
+        if slot < 0:
             if row_capacity_telemetry != 0:
                 wp.atomic_add(mf_dropped_contact_rows, world, slots_needed)
             contact_slot[c] = -1
@@ -4449,10 +4424,8 @@ def _allocate_world_contact_slot(
         contact_path[c] = 1
     else:
         # Dense path
-        slot = wp.atomic_add(world_slot_counter, world, slots_needed)
-        if slot + slots_needed > max_constraints:
-            wp.atomic_min(dense_first_rejected_slot, world, slot)
-            wp.atomic_max(capacity_status, 0, 1)
+        slot = reserve(world_slot_counter, world, slots_needed, max_constraints, dense_first_rejected_slot)
+        if slot < 0:
             if row_capacity_telemetry != 0:
                 wp.atomic_add(dense_dropped_contact_rows, world, slots_needed)
             contact_slot[c] = -1
@@ -4605,7 +4578,6 @@ def allocate_world_contact_slots(
     contact_thickness0: wp.array[float],
     contact_thickness1: wp.array[float],
     body_q: wp.array[wp.transform],
-    shape_transform: wp.array[wp.transform],
     shape_body: wp.array[int],
     body_to_articulation: wp.array[int],
     art_to_world: wp.array[int],
@@ -4690,7 +4662,6 @@ def allocate_world_contact_slots(
                 continue
         _allocate_world_contact_slot(
             c,
-            total_contacts,
             contact_shape0,
             contact_shape1,
             contact_point0,
@@ -4699,7 +4670,6 @@ def allocate_world_contact_slots(
             contact_thickness0,
             contact_thickness1,
             body_q,
-            shape_transform,
             shape_body,
             body_to_articulation,
             art_to_world,
@@ -4730,7 +4700,6 @@ def allocate_world_contact_slots(
             mf_dropped_contact_rows,
             dense_first_rejected_slot,
             mf_first_rejected_slot,
-            capacity_status,
         )
 
 
@@ -4750,7 +4719,6 @@ def allocate_world_contact_slots_patch_resolved(
     contact_thickness0: wp.array[float],
     contact_thickness1: wp.array[float],
     body_q: wp.array[wp.transform],
-    shape_transform: wp.array[wp.transform],
     shape_body: wp.array[int],
     body_to_articulation: wp.array[int],
     art_to_world: wp.array[int],
@@ -4858,7 +4826,6 @@ def allocate_world_contact_slots_patch_resolved(
                 continue
         _allocate_world_contact_slot(
             c,
-            total_contacts,
             contact_shape0,
             contact_shape1,
             contact_point0,
@@ -4867,7 +4834,6 @@ def allocate_world_contact_slots_patch_resolved(
             contact_thickness0,
             contact_thickness1,
             body_q,
-            shape_transform,
             shape_body,
             body_to_articulation,
             art_to_world,
@@ -4898,7 +4864,6 @@ def allocate_world_contact_slots_patch_resolved(
             mf_dropped_contact_rows,
             dense_first_rejected_slot,
             mf_first_rejected_slot,
-            capacity_status,
         )
 
 
@@ -4927,14 +4892,16 @@ def _contact_run_block(shape: int, global_lead: int, global_trail_start: int) ->
     return global_lead + 1 + shape - global_trail_start
 
 
-@wp.func_native("""
+@wp.func_native(
+    dual_native(
+        """
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     // The lanes of one warp iteration hold ascending contacts; the lanes of one run form a group,
     // whose lowest lane records the group's first and last contact and rows.
     const unsigned group = __match_any_sync(0xffffffffu, key);
-    const int leader = __ffs(group) - 1;
-    const int first = __shfl_sync(0xffffffffu, contact, leader);
-    const int last = __shfl_sync(0xffffffffu, contact, 31 - __clz(group));
+    const int leader = FIRST(group);
+    const int first = READ(contact, leader);
+    const int last = READ(contact, 31 - __clz(group));
 #if __CUDA_ARCH__ >= 800
     const int dense_rows = __reduce_add_sync(group, dense);
     const int mf_rows = __reduce_add_sync(group, mf);
@@ -4942,15 +4909,15 @@ def _contact_run_block(shape: int, global_lead: int, global_trail_start: int) ->
     int dense_rows = 0;
     int mf_rows = 0;
     for (int source = 0; source < 32; ++source) {
-        const int source_dense = __shfl_sync(0xffffffffu, dense, source);
-        const int source_mf = __shfl_sync(0xffffffffu, mf, source);
+        const int source_dense = READ(dense, source);
+        const int source_mf = READ(mf, source);
         if (group & (1u << source)) {
             dense_rows += source_dense;
             mf_rows += source_mf;
         }
     }
 #endif
-    if (key >= 0 && (int)(threadIdx.x & 31) == leader) {
+    if (key >= 0 && LANE == leader) {
         atomicMin(&run_first.data[key], first);
         atomicMax(&run_last.data[key], last);
         if (dense_rows != 0)
@@ -4975,7 +4942,10 @@ def _contact_run_block(shape: int, global_lead: int, global_trail_start: int) ->
         run_rows.data[key].c[1] += mf;
     }
 #endif
-""")
+""",
+        preludes=(lane_group(32),),
+    )
+)
 def _record_contact_run(
     key: int,
     contact: int,
@@ -5039,44 +5009,6 @@ def record_world_contact_runs(
         _record_contact_run(key, c, dense, mf, run_first, run_last, run_rows)
 
 
-@wp.func_native("""
-#if defined(__CUDA_ARCH__)
-    const int lane = threadIdx.x & 31;
-    int sum = value;
-    for (int offset = 1; offset < 32; offset <<= 1) {
-        const int lower = __shfl_up_sync(0xffffffffu, sum, offset);
-        if (lane >= offset)
-            sum += lower;
-    }
-    return sum - value;
-#else
-    return 0;
-#endif
-""")
-def _warp_sum_below(value: int) -> int:
-    """Sum ``value`` over the lower lanes of this lane's complete CUDA warp; 0 on CPU, where a thread is alone.
-
-    Every lane of the warp must call it.
-    """
-
-
-@wp.func_native("""
-#if defined(__CUDA_ARCH__)
-    int sum = value;
-    for (int offset = 16; offset > 0; offset >>= 1)
-        sum += __shfl_xor_sync(0xffffffffu, sum, offset);
-    return sum;
-#else
-    return value;
-#endif
-""")
-def _warp_sum(value: int) -> int:
-    """Sum ``value`` over this lane's complete CUDA warp; ``value`` on CPU, where a thread is alone.
-
-    Every lane of the warp must call it.
-    """
-
-
 @wp.kernel(enable_backward=False)
 def place_world_contact_runs(
     contact_shape0: wp.array[int],
@@ -5131,16 +5063,16 @@ def place_world_contact_runs(
                         dense = needed
                     if path == 1 and place_mf:
                         mf = needed
-            dense_below = _warp_sum_below(dense)
-            mf_below = _warp_sum_below(mf)
+            dense_below = warp_scan(dense)
+            mf_below = warp_scan(mf)
             if dense > 0:
                 contact_slot[c] = next_dense + dense_below
             if mf > 0:
                 contact_slot[c] = next_mf + mf_below
-            next_dense += _warp_sum(dense)
-            next_mf += _warp_sum(mf)
+            next_dense += warp_sum(dense)
+            next_mf += warp_sum(mf)
     # Every lane has read the records before any is reset.
-    _tree_warp_sync()
+    warp_sync()
     for block in range(lane, blocks, lanes):
         run_first[world, block] = _CONTACT_RUN_EMPTY
         run_last[world, block] = -1
@@ -6360,11 +6292,9 @@ def finalize_constraint_counts_with_status(
 ):
     """Clamp the accepted prefix while retaining sticky overflow from every row producer."""
     world = wp.tid()
-    count = slot_counter[world]
-    if count > capacity:
-        wp.atomic_max(capacity_status, family, 1)
-        count = capacity
-    constraint_count[world] = wp.min(count, first_rejected_slot[world])
+    constraint_count[world] = reserved_count(
+        slot_counter, world, capacity, first_rejected_slot, capacity_status, family
+    )
 
 
 @wp.kernel
@@ -7589,6 +7519,7 @@ def allocate_rigid_velocity_limit_slots(
     # outputs
     rigid_velocity_limit_slot: wp.array[int],
     mf_slot_counter: wp.array[int],
+    mf_first_rejected_slot: wp.array[int],
 ):
     """Allocate one MF speed row per finitely limited speed of a free rigid body.
 
@@ -7641,9 +7572,9 @@ def allocate_rigid_velocity_limit_slots(
             if speed < velocity_limit_activation_fraction * limit:
                 continue
 
-        slot = wp.atomic_add(mf_slot_counter, world, 1)
-        if slot < mf_max_constraints:
-            rigid_velocity_limit_slot[base + speed_row] = slot
+        rigid_velocity_limit_slot[base + speed_row] = reserve(
+            mf_slot_counter, world, 1, mf_max_constraints, mf_first_rejected_slot
+        )
 
 
 @wp.kernel

@@ -55,6 +55,7 @@ def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0
         ],
         outputs=[
             world_slot_counter,
+            wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
             J_group,
             world_row_type,
             world_row_parent,

@@ -10,6 +10,7 @@ import numpy as np
 import warp as wp
 
 from ...sim import JointType
+from .device_preludes import dual_native, lane_group
 
 
 @dataclass(frozen=True)
@@ -120,15 +121,8 @@ def prefix_kernel(layout, prefix_type, rows_type):
     """Generate ordered unary rows for eligible coordinates, using the existing laws."""
     source = r"""
     const int M = p.kind.shape[1];
-#if defined(__CUDA_ARCH__)
-    const int lane = threadIdx.x;
-#endif
 #if $VELOCITY
-#if defined(__CUDA_ARCH__)
-    for (int k = lane; k < $DOUBLE; k += 32) {
-#else
-    for (int k = 0; k < $DOUBLE; ++k) {
-#endif
+    for (int k = LANE; k < $DOUBLE; k += STRIDE) {
         const int d = k / 2;
         const int dof = p.starts.data[world * 2 + ($PRIMARY ? 0 : 1)] + $LOCAL;
         p.velocity_slots.data[dof * 2 + k % 2] = -1;
@@ -138,12 +132,8 @@ def prefix_kernel(layout, prefix_type, rows_type):
     int base = 0;
     $COORDINATE_DECL
     for (int phase = 0; phase < 2; ++phase) {
-        for (int chunk = 0; chunk < $CANDIDATES; chunk += 32) {
-#if !defined(__CUDA_ARCH__)
-            int phase_count = 0;
-            for (int lane = 0; lane < 32; ++lane) {
-#endif
-            const int candidate = chunk + lane, side = candidate & 1;
+        for (int chunk = 0; chunk < $CANDIDATES; chunk += STRIDE) {
+            const int candidate = chunk + LANE, side = candidate & 1;
             const int d = candidate < $CANDIDATES ? $COORDINATE_INDEX : 0;
             const int dof = p.starts.data[world * 2 + ($PRIMARY ? 0 : 1)] + $LOCAL;
             const float sign = side == 0 ? 1.0f : -1.0f;
@@ -167,15 +157,8 @@ def prefix_kernel(layout, prefix_type, rows_type):
                 }
 #endif
             }
-#if defined(__CUDA_ARCH__)
-            const unsigned mask = __ballot_sync(0xffffffffu, active);
-            const int phase_count = __popc(mask);
-            const int rank = __popc(mask & (lane == 0 ? 0u : ((1u << lane) - 1u)));
-#else
-            const int rank = phase_count;
-            phase_count += active;
-#endif
-            const int slot = base + rank;
+            const unsigned votes = BALLOT(active);
+            const int slot = base + BELOW(votes);
             if (active && slot < M) {
                 const int at = world * M + slot;
                 z.rowkeys.data[at] = ~(d * 2 + side);
@@ -193,20 +176,13 @@ def prefix_kernel(layout, prefix_type, rows_type):
                 }
 #endif
             }
-#if !defined(__CUDA_ARCH__)
-            }
-#endif
-            base += phase_count;
+            base += COUNT(votes);
         }
-#if defined(__CUDA_ARCH__)
-        if (lane == 0)
-#endif
-        p.bounds.data[world * 2 + phase] = base;
+        if (LANE == 0)
+            p.bounds.data[world * 2 + phase] = base;
     }
-#if defined(__CUDA_ARCH__)
-    if (lane == 0)
-#endif
-    p.counts.data[world] = base;
+    if (LANE == 0)
+        p.counts.data[world] = base;
 """
     coordinates = layout.limit_coordinates
     consecutive = bool(coordinates) and coordinates == tuple(range(coordinates[0], coordinates[-1] + 1))
@@ -229,12 +205,13 @@ def prefix_kernel(layout, prefix_type, rows_type):
     }.items():
         source = source.replace(key, str(value))
 
-    @wp.func_native(source)
-    def native(world: int, logical_lane: int, p: prefix_type, z: rows_type): ...
+    # A warp generates a world's rows on CUDA, one thread on the CPU.
+    @wp.func_native(dual_native(source, preludes=(lane_group(32),)))
+    def native(world: int, p: prefix_type, z: rows_type): ...
 
     @wp.kernel(module="unique", enable_backward=False)
     def keyed_limit_prefix(p: prefix_type, z: rows_type):
-        world, lane = wp.tid()
-        native(world, lane, p, z)
+        world, _lane = wp.tid()
+        native(world, p, z)
 
     return keyed_limit_prefix

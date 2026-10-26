@@ -6,7 +6,7 @@
 import re
 
 from .contact_torsion import torque_sweep_source
-from .device_preludes import cuda_native
+from .device_preludes import RING, cuda_native, lane_group
 from .friction import FRICTION_PAIR
 from .kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -368,10 +368,10 @@ def get_source(
                         }}
                     }}
 
-                    __syncwarp();
-                    new_lambda_t1 = __shfl_sync(MASK, new_lambda_t1, 0);
-                    d_n_total = __shfl_sync(MASK, d_n_total, 0);
-                    d_t2_total = __shfl_sync(MASK, d_t2_total, 0);
+                    SYNC();
+                    new_lambda_t1 = READ(new_lambda_t1, 0);
+                    d_n_total = READ(d_n_total, 0);
+                    d_t2_total = READ(d_t2_total, 0);
                     if (d_n_total != 0.0f || d_t2_total != 0.0f) iteration_changed = 1;
 
                     if (d_n_total != 0.0f) {{
@@ -384,7 +384,7 @@ def get_source(
                             s_v[d] += {dense_read("Y_world", "t2_row_base + d")} * d_t2_total;
                         }}
                     }}
-                    __syncwarp();
+                    SYNC();
                     new_impulse = new_lambda_t1;
                 }}
 """
@@ -408,20 +408,17 @@ def get_source(
                 }} else {{
                     int sib = parent_idx + 2;
                     int sib_row_base = jy_world_base + sib * {D};
-                    float lambda_n = s_lam_dense[parent_idx];
-                    for (int patch_row = ((s_meta_dense[parent_idx] >> __DENSE_META_ROW_TYPE_BITS__) - 1); patch_row >= 0 && patch_row != parent_idx; patch_row = ((s_meta_dense[patch_row] >> __DENSE_META_ROW_TYPE_BITS__) - 1))
-                        lambda_n += s_lam_dense[patch_row];
+                    const float lambda_n = RING_LOAD(s_lam_dense[parent_idx], parent_idx, {M_D},
+                        [&](int patch_row) {{ return ((s_meta_dense[patch_row] >> __DENSE_META_ROW_TYPE_BITS__) - 1); }},
+                        [&](int patch_row) {{ return s_lam_dense[patch_row]; }});
                     float radius = fmaxf(s_mu_dense[i] * lambda_n, 0.0f);
                     float sibling_residual = 0.0f;
                     {dense_sibling_dot_code}
-                    for (int offset = 16; offset > 0; offset >>= 1)
-                        sibling_residual += __shfl_down_sync(MASK, sibling_residual, offset);
-                    sibling_residual = __shfl_sync(MASK, sibling_residual, 0) + s_rhs_dense[sib];
+                    SUM(sibling_residual);
+                    sibling_residual += s_rhs_dense[sib];
                     float cross = 0.0f;
                     {dense_tangent_cross_code}
-                    for (int offset = 16; offset > 0; offset >>= 1)
-                        cross += __shfl_down_sync(MASK, cross, offset);
-                    cross = __shfl_sync(MASK, cross, 0);
+                    SUM(cross);
                     const float sibling_impulse = s_lam_dense[sib];
                     float2 pair = friction_pair_candidate(denom, cross, s_diag_dense[sib],
                         residual, sibling_residual, old_impulse, sibling_impulse, radius, omega);
@@ -431,9 +428,9 @@ def get_source(
                     float scale = mag > radius ? radius / mag : 1.0f;
                     new_impulse = a * scale;
                     float sib_delta = b * scale - sibling_impulse;
-                    __syncwarp();
+                    SYNC();
                     if (lane == 0) s_lam_dense[sib] = b * scale;
-                    __syncwarp();
+                    SYNC();
 {dense_sibling_vote}
                     {dense_sib_v_code}
                 }}
@@ -444,9 +441,7 @@ def get_source(
     # coulomb_newton differs only in its MF projector below. The existing
     # end-of-row barrier publishes each scalar result to the next dense row.
     dense_scalar_owner = friction_mode in ("current", "coulomb_newton")
-    dense_old_impulse = (
-        "__shfl_sync(MASK, lane == 0 ? s_lam_dense[i] : 0.0f, 0)" if dense_scalar_owner else "s_lam_dense[i]"
-    )
+    dense_old_impulse = "READ(lane == 0 ? s_lam_dense[i] : 0.0f, 0)" if dense_scalar_owner else "s_lam_dense[i]"
     dense_impulse_store = "if (lane == 0) " if dense_scalar_owner else ""
 
     # --- MF friction-row projection -------------------------------------
@@ -646,10 +641,10 @@ def get_source(
                         }
                     }
 
-                    __syncwarp();
-                    new_lambda_t1 = __shfl_sync(MASK, new_lambda_t1, 0);
-                    d_n_total = __shfl_sync(MASK, d_n_total, 0);
-                    d_t2_total = __shfl_sync(MASK, d_t2_total, 0);
+                    SYNC();
+                    new_lambda_t1 = READ(new_lambda_t1, 0);
+                    d_n_total = READ(d_n_total, 0);
+                    d_t2_total = READ(d_t2_total, 0);
                     if (d_n_total != 0.0f || d_t2_total != 0.0f) iteration_changed = 1;
 
                     // Apply the normal-row v_out delta (all lanes).
@@ -674,7 +669,7 @@ def get_source(
                                 mf_MiJt_b.data[t2_mf6 + lane - 6] * d_t2_total;
                         }
                     }
-                    __syncwarp();
+                    SYNC();
                     new_impulse = new_lambda_t1;
                 }
 """
@@ -708,7 +703,7 @@ def get_source(
         # :func:`friction_step_coulomb_newton`; mirrors the
         # bisection block's structure — lane 0 runs the serial
         # scalar Newton, then broadcasts (new_t1, d_n, d_t2) to
-        # every lane via ``__shfl_sync`` so the v_out deltas for
+        # every lane via ``READ`` so the v_out deltas for
         # the normal / t2 rows are applied cooperatively.
         mf_friction_block = """
                 // friction_mode="coulomb_newton": Gilles Daviet's
@@ -932,10 +927,10 @@ def get_source(
                         }
                     }
 
-                    __syncwarp();
-                    new_lambda_t1 = __shfl_sync(MASK, new_lambda_t1, 0);
-                    d_n_total = __shfl_sync(MASK, d_n_total, 0);
-                    d_t2_total = __shfl_sync(MASK, d_t2_total, 0);
+                    SYNC();
+                    new_lambda_t1 = READ(new_lambda_t1, 0);
+                    d_n_total = READ(d_n_total, 0);
+                    d_t2_total = READ(d_t2_total, 0);
                     if (d_n_total != 0.0f || d_t2_total != 0.0f) iteration_changed = 1;
 
                     // Apply normal-row v_out delta (all lanes).
@@ -960,7 +955,7 @@ def get_source(
                                 mf_MiJt_b.data[t2_mf6 + lane - 6] * d_t2_total;
                         }
                     }
-                    __syncwarp();
+                    SYNC();
                     new_impulse = new_lambda_t1;
                 }
 """
@@ -981,19 +976,15 @@ def get_source(
                             sibling_residual = mf_J_a.data[sib_mf6 + lane] {mf_velocity("dof_a + lane")};
                         if (lane >= 6 && lane < 12 && dof_b >= 0)
                             sibling_residual = mf_J_b.data[sib_mf6 + lane - 6] {mf_velocity("dof_b + lane - 6")};
-                        for (int offset = 16; offset > 0; offset >>= 1)
-                            sibling_residual += __shfl_down_sync(MASK, sibling_residual, offset);
-                        sibling_residual = __shfl_sync(MASK, sibling_residual, 0)
-                            + __int_as_float(mf_meta.data[off_meta + sib * 4 + 2]);
+                        SUM(sibling_residual);
+                        sibling_residual += __int_as_float(mf_meta.data[off_meta + sib * 4 + 2]);
                         float inv_sib = __int_as_float(mf_meta.data[off_meta + sib * 4 + 1]);
                         float cross = 0.0f;
                         if (lane < 6 && dof_a >= 0)
                             cross = mf_J_a.data[mf6_base + i * 6 + lane] * mf_MiJt_a.data[sib_mf6 + lane];
                         if (lane >= 6 && lane < 12 && dof_b >= 0)
                             cross = mf_J_b.data[mf6_base + i * 6 + lane - 6] * mf_MiJt_b.data[sib_mf6 + lane - 6];
-                        for (int offset = 16; offset > 0; offset >>= 1)
-                            cross += __shfl_down_sync(MASK, cross, offset);
-                        cross = __shfl_sync(MASK, cross, 0);
+                        SUM(cross);
                         pair = friction_pair_candidate(mf_diag > 0.0f ? 1.0f / mf_diag : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
                             residual, sibling_residual, old_impulse, s_lam_mf[sib], radius, omega);
                     }}
@@ -1017,15 +1008,15 @@ def get_source(
             float mf_friction_radius = 0.0f;
             if (mf_rt == 2) {
                 int parent = packed_tp >> 16;
-                float lambda_n = s_lam_mf[parent];
-                for (int patch_row = (mf_meta.data[off_meta + parent * 4 + 3] >> 16); patch_row >= 0 && patch_row != parent; patch_row = (mf_meta.data[off_meta + patch_row * 4 + 3] >> 16))
-                    lambda_n += s_lam_mf[patch_row];
+                const float lambda_n = RING_LOAD(s_lam_mf[parent], parent, __M_MF__,
+                    [&](int patch_row) { return mf_meta.data[off_meta + patch_row * 4 + 3] >> 16; },
+                    [&](int patch_row) { return s_lam_mf[patch_row]; });
                 mf_friction_radius = fmaxf(mf_row_mu.data[off_mf + i] * lambda_n, 0.0f);
                 // A zero disk with no carried impulse cannot change velocity.
                 if (mf_friction_radius == 0.0f && s_lam_mf[i] == 0.0f && s_lam_mf[i + 1] == 0.0f)
                     continue;
             }
-"""
+""".replace("__M_MF__", str(M_MF))
         if friction_mode == "current"
         else ""
     )
@@ -1076,7 +1067,7 @@ def get_source(
     if accumulated_limits:
         # Lane 0 owns a dense total, as it owns the scalar dense rows' impulses.
         dense_velocity_limit_law = (
-            "                const float old_vlim = __shfl_sync(MASK, lane == 0 ? s_lam_dense[i] : 0.0f, 0);\n"
+            "                const float old_vlim = READ(lane == 0 ? s_lam_dense[i] : 0.0f, 0);\n"
             + accumulated_update(
                 "old_vlim",
                 "residual_vlim / denom",
@@ -1085,7 +1076,7 @@ def get_source(
                 indent=" " * 16,
                 declare="float ",
             )
-            + "                __syncwarp();\n"
+            + "                SYNC();\n"
             + "                if (lane == 0) s_lam_dense[i] = new_vlim;"
         )
         # Every lane reads a free-body total before lane 0 stores the new one: a plain read stays
@@ -1100,7 +1091,7 @@ def get_source(
                 indent=" " * 16,
                 declare="float ",
             )
-            + "                __syncwarp();\n"
+            + "                SYNC();\n"
             + "                if (lane == 0) s_lam_mf[i] = new_mf_vlim;"
         )
         dense_velocity_limit_row = (
@@ -1150,12 +1141,8 @@ def get_source(
                 for (int d = lane; d < {D}; d += 32) {{
                     my_sum_vlim += {dense_read("J_world", "row_base_vlim + d")} * s_v[d];
                 }}
-                my_sum_vlim += __shfl_down_sync(MASK, my_sum_vlim, 16);
-                my_sum_vlim += __shfl_down_sync(MASK, my_sum_vlim, 8);
-                my_sum_vlim += __shfl_down_sync(MASK, my_sum_vlim, 4);
-                my_sum_vlim += __shfl_down_sync(MASK, my_sum_vlim, 2);
-                my_sum_vlim += __shfl_down_sync(MASK, my_sum_vlim, 1);
-                float jv_vlim = __shfl_sync(MASK, my_sum_vlim, 0);
+                SUM(my_sum_vlim);
+                float jv_vlim = my_sum_vlim;
 
                 float residual_vlim = jv_vlim + s_rhs_dense[i];
 {dense_velocity_limit_law}
@@ -1166,7 +1153,7 @@ def get_source(
                         s_v[d] += {dense_read("Y_world", "row_base_vlim + d")} * delta_impulse_vlim;
                     }}
                 }}
-                __syncwarp();
+                SYNC();
             }}
         }}"""
         if has_dense_velocity_limit_rows
@@ -1196,12 +1183,8 @@ def get_source(
                 for (int d = lane; d < {D}; d += 32) {{
                     my_sum_fvl += {dense_read("J_world", "row_base_fvl + d")} * s_v[d];
                 }}
-                my_sum_fvl += __shfl_down_sync(MASK, my_sum_fvl, 16);
-                my_sum_fvl += __shfl_down_sync(MASK, my_sum_fvl, 8);
-                my_sum_fvl += __shfl_down_sync(MASK, my_sum_fvl, 4);
-                my_sum_fvl += __shfl_down_sync(MASK, my_sum_fvl, 2);
-                my_sum_fvl += __shfl_down_sync(MASK, my_sum_fvl, 1);
-                float jv_fvl = __shfl_sync(MASK, my_sum_fvl, 0);
+                SUM(my_sum_fvl);
+                float jv_fvl = my_sum_fvl;
 
                 if (fabsf(jv_fvl) > qdot_max_fvl) {{
                     float delta_fvl = (fminf(fmaxf(jv_fvl, -qdot_max_fvl), qdot_max_fvl) - jv_fvl) / denom_fvl;
@@ -1210,7 +1193,7 @@ def get_source(
                         s_v[d] += {dense_read("Y_world", "row_base_fvl + d")} * delta_fvl;
                     }}
                 }}
-                __syncwarp();
+                SYNC();
             }}
         }}"""
         if fuse_vel_limits
@@ -1299,7 +1282,7 @@ def get_source(
             if (row_phase == 0 && mf_rt == 4) continue;
             if (mf_rt == 2 && global_iter < friction_start_iteration) {{
                 s_lam_mf[i] = 0.0f;
-                __syncwarp();
+                SYNC();
                 continue;
             }}
 
@@ -1316,12 +1299,8 @@ def get_source(
             if (lane >= 6 && lane < 12 && dof_b >= 0) {{
                 my_sum = cur_Jb {mf_velocity("dof_b + lane - 6")};
             }}
-            my_sum += __shfl_down_sync(MASK, my_sum, 16);
-            my_sum += __shfl_down_sync(MASK, my_sum, 8);
-            my_sum += __shfl_down_sync(MASK, my_sum, 4);
-            my_sum += __shfl_down_sync(MASK, my_sum, 2);
-            my_sum += __shfl_down_sync(MASK, my_sum, 1);
-            float jv = __shfl_sync(MASK, my_sum, 0);
+            SUM(my_sum);
+            float jv = my_sum;
 
             float residual = jv + __int_as_float(meta.z);
             float old_impulse = s_lam_mf[i];
@@ -1353,7 +1332,7 @@ def get_source(
                     s_v[dof_b + lane - 6] += cur_MiJtb * delta_impulse;
                 }}
             }}
-            __syncwarp();
+            SYNC();
         }}
         }}
 
@@ -1382,10 +1361,9 @@ def get_source(
                 int row_mf6 = mf6_base + i * 6;
                 const int speed_dof = dof_a + (mf_J_a.data[row_mf6 + 3] != 0.0f ? 3 : 0);
                 const float speed_component = lane < 3 ? s_v[speed_dof + lane] : 0.0f;
-                float speed_sq = speed_component * speed_component;
-                speed_sq += __shfl_down_sync(MASK, speed_sq, 1);
-                speed_sq += __shfl_down_sync(MASK, speed_sq, 2);
-                const float speed_mf_vlim = sqrtf(__shfl_sync(MASK, speed_sq, 0));
+                const float speed_sq = speed_component * speed_component;
+                // In lane order, (s0 + s1) + s2: not the group's widest-first SUM.
+                const float speed_mf_vlim = sqrtf((READ(speed_sq, 0) + READ(speed_sq, 1)) + READ(speed_sq, 2));
 
                 float residual_mf_vlim = __int_as_float(meta.z) - speed_mf_vlim;
 {mf_velocity_limit_law}
@@ -1397,7 +1375,7 @@ def get_source(
                         s_v[speed_dof + lane] -= (delta_impulse_mf_vlim / mf_diag) * speed_component / speed_mf_vlim;
                     }}
                 }}
-                __syncwarp();
+                SYNC();
             }}
         }}
 
@@ -1410,16 +1388,15 @@ def get_source(
     sweep_end = sweep_exit(
         solve_policy,
         """        if (global_iter >= friction_start_iteration) {
-            unsigned changed = __ballot_sync(MASK, iteration_changed != 0);
+            unsigned changed = BALLOT(iteration_changed != 0);
             if (changed == 0u) break;
         }
 """,
         gate="global_iter >= friction_start_iteration",
-        quiet="__ballot_sync(MASK, iteration_changed != 0) == 0u",
+        quiet="BALLOT(iteration_changed != 0) == 0u",
         iteration="iter",
     )
-    snippet = f"""    const unsigned MASK = 0xFFFFFFFF;
-    int lane = threadIdx.x;
+    snippet = f"""    const int lane = LANE;
 
     int m_dense = world_constraint_count.data[world];
     int m_mf = mf_constraint_count.data[world];
@@ -1494,7 +1471,7 @@ def get_source(
         int global_dof = world_dof_indices.data[dof_map_base + d];
         {velocity_load}
     }}
-    __syncwarp();
+    SYNC();
 
     // ═══════════════════════════════════════════════════════
     // SOLVE PHASE
@@ -1541,7 +1518,7 @@ def get_source(
             if (freeze_drive_rows != 0 && row_type == 1) continue;
             if (row_type == 2 && global_iter < friction_start_iteration) {{
                 {dense_impulse_store}s_lam_dense[i] = 0.0f;
-                __syncwarp();
+                SYNC();
                 continue;
             }}
 
@@ -1552,12 +1529,8 @@ def get_source(
             {dense_dot_code}
 
             // Warp reduce
-            my_sum += __shfl_down_sync(MASK, my_sum, 16);
-            my_sum += __shfl_down_sync(MASK, my_sum, 8);
-            my_sum += __shfl_down_sync(MASK, my_sum, 4);
-            my_sum += __shfl_down_sync(MASK, my_sum, 2);
-            my_sum += __shfl_down_sync(MASK, my_sum, 1);
-            float jv = __shfl_sync(MASK, my_sum, 0);
+            SUM(my_sum);
+            float jv = my_sum;
 
             float old_impulse = {dense_old_impulse};
             float w = regularize ? world_row_w.data[off_dense + i] : 1.0f;
@@ -1590,7 +1563,7 @@ def get_source(
 {dense_vote}
                 {dense_v_update_code}
             }}
-            __syncwarp();
+            SYNC();
         }}
 
 {mf_phase}{sweep_end}    }}
@@ -1720,7 +1693,7 @@ def get_source(
         )
         snippet = re.sub(
             r"s_lam_mf\[([^\]]*)\]",
-            r"__shfl_sync(MASK, lane == 0 ? g_lam_mf[\1] : 0.0f, 0)",
+            r"READ(lane == 0 ? g_lam_mf[\1] : 0.0f, 0)",
             snippet,
         )
 
@@ -1750,5 +1723,5 @@ def get_source(
     # array — a (1, 1) dummy when the fused clamp is off — and
     # fuse_vel_limits only gates the clamp code emission above.
 
-    snippet = cuda_native(snippet, preludes=(FRICTION_PAIR, *solve_policy.preludes))
+    snippet = cuda_native(snippet, preludes=(lane_group(32), RING, FRICTION_PAIR, *solve_policy.preludes))
     return snippet
