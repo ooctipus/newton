@@ -5,6 +5,7 @@
 
 import unittest
 
+import numpy as np
 import warp as wp
 
 import newton
@@ -48,23 +49,28 @@ def _build_two_revolute_chain(coef0: float, coef1: float):
     return b, j_leader, j_follower
 
 
-def _run_chain(coef0: float, coef1: float, leader_target: float, steps: int = 600, **solver_kwargs):
-    builder, _, _ = _build_two_revolute_chain(coef0, coef1)
-    model = builder.finalize()
-    solver = newton.solvers.SolverFeatherPGS(
-        model, pgs_mode="matrix_free", pgs_iterations=16, pgs_beta=0.1, **solver_kwargs
-    )
+def _step_chains(model, solver, leader_target: float, steps: int = 600):
+    """Drive every chain's leader joint to ``leader_target``; return the joint positions after ``steps`` steps."""
     state_0, state_1 = model.state(), model.state()
     control = model.control()
     targets = model.joint_target_q.numpy().copy()
-    targets[0] = leader_target
+    targets[0::2] = leader_target  # each chain's DOFs are (leader, follower)
     control.joint_target_q.assign(targets)
     dt = 1.0 / 240.0
     for _ in range(steps):
         state_0.clear_forces()
         solver.step(state_0, state_1, control, None, dt)
         state_0, state_1 = state_1, state_0
-    return solver, state_0.joint_q.numpy()
+    return state_0.joint_q.numpy()
+
+
+def _run_chain(coef0: float, coef1: float, leader_target: float, steps: int = 600, **solver_kwargs):
+    builder, _, _ = _build_two_revolute_chain(coef0, coef1)
+    model = builder.finalize()
+    solver = newton.solvers.SolverFeatherPGS(
+        model, pgs_mode="matrix_free", pgs_iterations=16, pgs_beta=0.1, **solver_kwargs
+    )
+    return solver, _step_chains(model, solver, leader_target, steps)
 
 
 @unittest.skipUnless(wp.get_device().is_cuda, "SolverFeatherPGS matrix-free mode requires CUDA")
@@ -105,20 +111,34 @@ class TestFeatherPGSMimic(unittest.TestCase):
         builder.constraint_mimic_enabled[0] = False
         model = builder.finalize()
         solver = newton.solvers.SolverFeatherPGS(model, pgs_mode="matrix_free", pgs_iterations=16)
-        state_0, state_1 = model.state(), model.state()
-        control = model.control()
-        targets = model.joint_target_q.numpy().copy()
-        targets[0] = 0.5
-        control.joint_target_q.assign(targets)
-        dt = 1.0 / 240.0
-        for _ in range(600):
-            state_0.clear_forces()
-            solver.step(state_0, state_1, control, None, dt)
-            state_0, state_1 = state_1, state_0
-        q = state_0.joint_q.numpy()
+        q = _step_chains(model, solver, leader_target=0.5)
         self.assertAlmostEqual(q[0], 0.5, delta=0.05)
         # The undriven follower swings free under gravity; it must NOT sit at the leader angle.
         self.assertNotAlmostEqual(q[1], q[0], delta=0.02)
+
+
+class TestFeatherPGSGlobalMimic(unittest.TestCase):
+    def test_global_mimic_is_solved_in_its_articulation_world(self):
+        """Verify a global mimic's row is reserved and solved in its articulation's world, world 0.
+
+        Two replicated chains keep their own mimic rows; the global chain's row joins world 0's rows instead of
+        taking a slot from another world's counter, and its follower tracks its leader like the others.
+        """
+        chain, _, _ = _build_two_revolute_chain(coef0=0.0, coef1=1.0)
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        builder.replicate(chain, world_count=2)
+        builder.add_builder(chain)  # outside a world: a global articulation and mimic
+        model = builder.finalize()
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=16, pgs_beta=0.1)
+        q = _step_chains(model, solver, leader_target=0.5).reshape(3, 2)
+
+        counts = solver.constraint_count.numpy()
+        row_types = solver.row_type.numpy()
+        mimic_rows = [int(np.sum(row_types[w, : counts[w]] == PGS_CONSTRAINT_TYPE_MIMIC)) for w in range(2)]
+        self.assertEqual(mimic_rows, [2, 1])
+        for leader, follower in q:
+            self.assertAlmostEqual(leader, 0.5, delta=0.05)
+            self.assertAlmostEqual(follower, leader, delta=0.02)
 
 
 if __name__ == "__main__":

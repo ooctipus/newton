@@ -3738,7 +3738,6 @@ class SolverFeatherPGS(SolverBase):
 
         j0 = model.constraint_mimic_joint0.numpy().astype(np.int32, copy=False)
         j1 = model.constraint_mimic_joint1.numpy().astype(np.int32, copy=False)
-        mimic_world = model.constraint_mimic_world.numpy().astype(np.int32, copy=False)
         articulation_start = model.articulation_start.numpy().astype(np.int64, copy=False)
         joint_type = model.joint_type.numpy().astype(np.int32, copy=False)
         joint_qd_start = model.joint_qd_start.numpy().astype(np.int32, copy=False)
@@ -3781,6 +3780,10 @@ class SolverFeatherPGS(SolverBase):
         art_start, order = host_index.group_by(art[valid_indices], model.articulation_count)
         art_start = art_start.astype(np.int32)
         order = valid_indices[order]
+        # A mimic row is reserved and solved in its articulation's solve world: a global articulation (and its
+        # mimic, world -1 in the model) solves in world 0.
+        mimic_world = np.zeros(n, dtype=np.int32)
+        mimic_world[valid_indices] = self._model_plan.articulation_world[art[valid_indices]]
 
         self._mimic_valid_np = valid
         self._mimic_world_np = mimic_world
