@@ -5,8 +5,7 @@
 
 ``get_path_selection()["routes"]["contact_rows"]["builder_by_dof"]`` names, per DOF
 size, the kernels that build the dense contact rows outside the sweep, in launch
-order, and ``row_check_by_dof`` those the debug row checks add.
-:func:`assert_row_builders_named` requires those names to be exactly the
+order. :func:`assert_row_builders_named` requires those names to be exactly the
 contact-row builders among the kernels one recorded step launched, in that order
 and with one launch per step or per size. The module also holds the keyed-row CPU
 stand-in and the row-builder switch table the record tests share. It defines no
@@ -23,7 +22,7 @@ from newton._src.solvers.feather_pgs import keyed_rows
 
 # The import-time row-builder switches of the solver module, held off unless a case sets one, whatever the
 # shell exports.
-ROW_SWITCHES_OFF = dict.fromkeys(("_ROWS_MASKED", "_CHECK_ROWS"), False)
+ROW_SWITCHES_OFF = {"_ROWS_MASKED": False}
 
 # Every kernel a contact-row producer launches to write dense contact rows outside the sweep: the general
 # builder's methods, the shared-metadata producers, the compact contact boundary, local row packets and keyed
@@ -115,8 +114,7 @@ def _launches_per_step(builders) -> collections.Counter:
 def assert_row_builders_named(test, contact_rows, keys):
     """Require the record to name exactly the contact-row builders among ``keys``, in order and count.
 
-    ``builder_by_dof``, with the debug checks' ``row_check_by_dof`` when a check runs, names every
-    launched builder and only those; each entry's kernels launch in the order the entry lists them
+    ``builder_by_dof`` names every launched builder and only those; each entry's kernels launch in the order the entry lists them
     (their launches, with repeats removed, start with the list); a per-size builder launches once for
     each size that names it and every other builder once.
 
@@ -126,7 +124,7 @@ def assert_row_builders_named(test, contact_rows, keys):
             the recorded step ran with.
         keys: The kernel keys of one whole step.
     """
-    groups = [contact_rows["builder_by_dof"], contact_rows["row_check_by_dof"] or {}]
+    groups = [contact_rows["builder_by_dof"]]
     entries = [(size, entry) for group in groups for size, entry in group.items()]
     launched = [key for key in keys if is_row_builder(key)]
     named = {kernel for _, entry in entries for kernel in entry["kernels"]}

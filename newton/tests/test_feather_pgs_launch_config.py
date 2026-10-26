@@ -222,30 +222,24 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 self.assertEqual(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)
 
     def test_point_row_builders_preserve_main_contact_defaults(self):
-        """Admit legacy row switches for explicit point friction, including debug dispatch.
+        """Admit the masked row switch for explicit point friction and patch friction.
 
-        Patch friction takes the masked builder's patch-law variant, never the
-        point-only row checks. The row build dispatches on contact_row_plan.
+        Patch friction takes the masked builder's patch-law variant. The row build
+        dispatches on contact_row_plan.
         """
         with wp.ScopedDevice("cpu"):  # the general builder; CUDA admits other producers first
             model = _build_chain_model(num_links=12, num_worlds=1)
-        for beta, point, patch_masked in ((None, False, True), (0.0, True, False)):
+        for beta, point in ((None, False), (0.0, True)):
             solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
             self.assertEqual(solver._point_contact_paths, point)
-            for switch in ("_ROWS_MASKED", "_CHECK_ROWS"):
-                with self.subTest(beta=beta, switch=switch):
-                    switches = dict.fromkeys(("_ROWS_MASKED", "_CHECK_ROWS"), False)
-                    switches[switch] = True
-                    # The plan reads the module's switches, as the solver's own admission does.
-                    with mock.patch.multiple(solver_module, **switches):
+            for masked in (False, True):
+                with self.subTest(beta=beta, masked=masked):
+                    # The plan reads the module's switch, as the solver's own admission does.
+                    with mock.patch.object(solver_module, "_ROWS_MASKED", masked):
                         plan = contact_row_plan(solver)
                     self.assertEqual(plan.producer, "general")
-                    masked = (point and switch != "_CHECK_ROWS") or (patch_masked and switch == "_ROWS_MASKED")
-                    method = {"_ROWS_MASKED": "masked_combined"}.get(switch, "per_contact")
-                    self.assertEqual(plan.methods, {12: method if masked else "per_contact"})
-                    self.assertEqual(bool(plan.combined), (point or patch_masked) and switch == "_ROWS_MASKED")
-                    # FEATHER_PGS_CHECK_ROWS checks the masked rows against the per-contact rows, point friction only.
-                    self.assertEqual(plan.check, "masked" if point and switch == "_CHECK_ROWS" else None)
+                    self.assertEqual(plan.methods, {12: "masked_combined" if masked else "per_contact"})
+                    self.assertEqual(bool(plan.combined), masked)
 
     def test_launch_geometry_kernels_use_dedicated_modules(self):
         """Keep custom-block-dimension kernels out of the general module."""

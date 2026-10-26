@@ -641,7 +641,6 @@ def check_compact_records(test, solvers, law):
         test.assertEqual(
             {size: (entry["method"], entry["kernels"]) for size, entry in record["builder_by_dof"].items()}, expected
         )
-        test.assertIsNone(record["row_check_by_dof"])
         records.append(record)
     return records
 

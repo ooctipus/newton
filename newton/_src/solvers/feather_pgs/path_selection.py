@@ -432,7 +432,7 @@ def _row_builder(solver, plan, size, source) -> dict:
     of them. Rows built elsewhere are not named: keyed rows' direct rows, which the parallel tiers
     build in the sweep (``direct_rows`` points to routes.sweep.tiers), and the free-body matrix-free
     rows, which build_mf_contact_rows writes for the contacts the allocation routes to them
-    (routes.free_rigid_bodies). _row_check names the debug row checks' builders.
+    (routes.free_rigid_bodies).
     """
     method, law = plan.methods[size], plan.law
     patch = law == "patch"
@@ -484,21 +484,6 @@ def _row_builder(solver, plan, size, source) -> dict:
     return entry
 
 
-def _row_check(plan, source) -> dict | None:
-    """Name, by DOF size, the builders the debug row checks launch besides builder_by_dof's.
-
-    FEATHER_PGS_CHECK_ROWS builds every size's masked rows into copies and compares them
-    with the per-contact rows the solve uses. None without a check (ContactRowPlan.check).
-    """
-    if plan.check is None:
-        return None
-    kernels = _general_kernels(plan.check, plan.law == "patch", source)
-    return {
-        str(int(size)): {"method": plan.check, "kernels": _kernel_names(kernels), "law": plan.law}
-        for size in plan.methods
-    }
-
-
 def _contact_rows(solver, source) -> dict:
     point = bool(solver._point_contact_paths)
     # The plan _stage4_build_rows dispatches on: the first admitted producer writes every
@@ -528,8 +513,6 @@ def _contact_rows(solver, source) -> dict:
         # Every producer, every size: the builder method, its kernels in launch order and the law they write,
         # for the dense contact rows built outside the sweep (_row_builder names the rows built elsewhere).
         "builder_by_dof": {str(int(size)): _row_builder(solver, plan, size, source) for size in plan.methods},
-        # The debug row checks only: the builders they launch besides those (None otherwise).
-        "row_check_by_dof": _row_check(plan, source),
         "general_method_by_dof": methods,
         "point_contact_paths": point,
         "row_packets": {
@@ -1236,7 +1219,7 @@ def _grouped_response_reason(solver, size, source) -> str:
         return "FEATHER_PGS_GROUPED_HINV=0 keeps the planned response kernel."
     if int(size) > source._GROUPED_HINV_MAX:
         return f"Above FEATHER_PGS_GROUPED_HINV_MAX={source._GROUPED_HINV_MAX}."
-    return "Free-body sizes keep the per-row kernel; FEATHER_PGS_GROUPED_HINV_FREE=1 opts in."
+    return "Free-body sizes keep the per-row kernel, which is faster there."
 
 
 def _grouped(solver, source) -> dict | None:

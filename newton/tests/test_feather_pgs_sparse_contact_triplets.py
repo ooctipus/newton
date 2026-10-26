@@ -208,12 +208,10 @@ class DeviceSolve:
             self.impulses,
             wp.full((1, 1, 1), -9, dtype=int, device=self.device),
             array(data["row_factor"]),
-            zeros((self.worlds, self.capacity, 0)),
             array(data["row_incident"]),
             array(data["row_type"], int),
             array(data["row_parent"], int),
             array(data["row_mu"]),
-            zeros((self.worlds, self.dofs), int),
             array(np.arange(self.worlds * self.dofs).reshape(self.worlds, self.dofs), int),
             zeros(self.worlds * self.dofs),
             zeros(self.worlds, int),
@@ -648,7 +646,7 @@ class TestSparseContactTriplets(unittest.TestCase):
                     (1, "world_constraint_count"),
                     (3, "diagonal"),
                     (6, "row_factor"),
-                    (8, "row_incident"),
+                    (7, "row_incident"),
                 ):
                     runner.inputs[slot].assign(data[key])
                 # The contact builder rewrites the records with the rows each step.

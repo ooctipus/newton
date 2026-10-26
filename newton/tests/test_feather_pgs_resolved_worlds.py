@@ -140,15 +140,11 @@ def _allocate(kernel, resolved):
         "body_has_response_dofs": integers([1, 0, 1, 1]),
         "is_free_rigid": integers([0, 0, 0, 1]),
         "has_free_rigid": 1,
-        "propagation_articulated_contacts": 0,
-        "propagation_same_articulation": 0,
-        "propagation_free_free": 0,
         "contact_gap_gate": 0.1,
         "same_articulation_contact_gap_gate": 0.0,
         "articulation_pair_contact_gap_gate": 0.0,
         "max_constraints": 32,
         "mf_max_constraints": 32,
-        "propagation_max_constraints": 32,
         "enable_friction": 1,
         "contact_friction_gap_threshold": float("inf"),
         "contact_friction_articulation_pairs_only": 0,
@@ -162,16 +158,11 @@ def _allocate(kernel, resolved):
         "world_slot_counter": integers([0, 0]),
         "contact_path": integers([-9] * count),
         "mf_slot_counter": integers([0, 0]),
-        "propagation_slot_counter": integers([0, 0]),
-        "dense_contact_world_flag": integers([0, 0]),
         "contact_slots_needed": integers([-9] * count),
         "dense_dropped_contact_rows": integers([0, 0]),
         "mf_dropped_contact_rows": integers([0, 0]),
-        "propagation_dropped_contact_rows": integers([0, 0]),
         "dense_first_rejected_slot": integers([2**31 - 1] * 2),
         "mf_first_rejected_slot": integers([2**31 - 1] * 2),
-        "propagation_first_rejected_slot": integers([2**31 - 1] * 2),
-        "capacity_status": integers([0] * 4),
     }
     wp.launch(kernel, dim=1, inputs=[arrays[name] for name in inspect.signature(kernel.func).parameters], device="cpu")
     return {name: value.numpy() for name, value in arrays.items() if isinstance(value, wp.array)}
@@ -185,10 +176,10 @@ def _definition(function):
 def _reserves_first(statements):
     """Whether every path through ``statements`` reserves rows before it returns.
 
-    Returns True when each path reaches a ``wp.atomic_add`` reservation before
-    any ``return``, False when some path returns first, and None when a path
-    falls through without either. A reservation inside a loop does not count,
-    since the loop may not run.
+    Returns True when each path reaches a ``reserve`` call (the row families'
+    slot reservation) before any ``return``, False when some path returns
+    first, and None when a path falls through without either. A reservation
+    inside a loop does not count, since the loop may not run.
     """
     for statement in statements:
         if isinstance(statement, ast.If):
@@ -200,7 +191,7 @@ def _reserves_first(statements):
         elif any(isinstance(node, ast.Return) for node in ast.walk(statement)):
             return False
         elif not isinstance(statement, (ast.For, ast.While)) and any(
-            isinstance(node, ast.Call) and ast.unparse(node.func) == "wp.atomic_add" for node in ast.walk(statement)
+            isinstance(node, ast.Call) and ast.unparse(node.func) == "reserve" for node in ast.walk(statement)
         ):
             return True
     return None
@@ -426,7 +417,7 @@ class TestResolvedWorlds(unittest.TestCase):
             np.testing.assert_array_equal(patch_friction[name][world_zero], point[name][world_zero], err_msg=name)
         np.testing.assert_array_equal(patch_friction["contact_slot"][world_zero], -1)
         # The resolved world reserves no rows; world 1 and the cross-world pair allocate as before.
-        for name in ("world_slot_counter", "mf_slot_counter", "capacity_status"):
+        for name in ("world_slot_counter", "mf_slot_counter"):
             np.testing.assert_array_equal(patch_friction[name], point[name], err_msg=name)
         self.assertEqual(int(patch_friction["world_slot_counter"][0]) + int(patch_friction["mf_slot_counter"][0]), 0)
         for name in ("contact_slot", "contact_path", "contact_slots_needed"):

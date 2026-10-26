@@ -25,7 +25,6 @@ from newton.solvers import SolverFeatherPGS
 
 PATH_DENSE = 0
 PATH_MATRIX_FREE = 1
-PATH_PROPAGATION = 2
 
 
 def _disabled_patches(device):
@@ -60,17 +59,12 @@ def _launch_contact_allocator(
     counters = {
         "dense_count": wp.zeros((1,), dtype=wp.int32, device=device),
         "mf_count": wp.zeros((1,), dtype=wp.int32, device=device),
-        "propagation_count": wp.zeros((1,), dtype=wp.int32, device=device),
-        "dense_world_flag": wp.zeros((1,), dtype=wp.int32, device=device),
         "dense_dropped": wp.zeros((1,), dtype=wp.int32, device=device),
         "mf_dropped": wp.zeros((1,), dtype=wp.int32, device=device),
-        "propagation_dropped": wp.zeros((1,), dtype=wp.int32, device=device),
         "dense_first_rejected": wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
         "mf_first_rejected": wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
-        "propagation_first_rejected": wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
     }
     is_free = route == PATH_MATRIX_FREE
-    propagation_enabled = route == PATH_PROPAGATION
     wp.launch(
         allocate_world_contact_slots,
         dim=1,
@@ -85,7 +79,6 @@ def _launch_contact_allocator(
             wp.zeros((1,), dtype=wp.float32, device=device),
             wp.zeros((1,), dtype=wp.float32, device=device),
             wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
-            wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
             wp.array([0], dtype=wp.int32, device=device),
             wp.array([0], dtype=wp.int32, device=device),
             wp.array([0], dtype=wp.int32, device=device),
@@ -94,13 +87,9 @@ def _launch_contact_allocator(
             wp.array([int(responsive)], dtype=wp.int32, device=device),
             wp.array([int(is_free)], dtype=wp.int32, device=device),
             1,
-            int(propagation_enabled),
-            0,
-            0,
             gate,
             scoped_gate,
             pair_gate,
-            8,
             8,
             8,
             int(enable_friction),
@@ -118,16 +107,11 @@ def _launch_contact_allocator(
             counters["dense_count"],
             outputs["path"],
             counters["mf_count"],
-            counters["propagation_count"],
-            counters["dense_world_flag"],
             outputs["slots_needed"],
             counters["dense_dropped"],
             counters["mf_dropped"],
-            counters["propagation_dropped"],
             counters["dense_first_rejected"],
             counters["mf_first_rejected"],
-            counters["propagation_first_rejected"],
-            wp.zeros(4, dtype=wp.int32, device=device),
         ],
         device=device,
     )
@@ -155,7 +139,6 @@ def _launch_articulation_pair_contact_allocator(
     dense_count = wp.zeros((1,), dtype=wp.int32, device=device)
     dense_dropped = wp.zeros((1,), dtype=wp.int32, device=device)
     mf_dropped = wp.zeros((1,), dtype=wp.int32, device=device)
-    propagation_dropped = wp.zeros((1,), dtype=wp.int32, device=device)
     wp.launch(
         allocate_world_contact_slots,
         dim=1,
@@ -170,7 +153,6 @@ def _launch_articulation_pair_contact_allocator(
             wp.zeros((1,), dtype=wp.float32, device=device),
             wp.zeros((1,), dtype=wp.float32, device=device),
             wp.array([wp.transform_identity(), wp.transform_identity()], dtype=wp.transform, device=device),
-            wp.array([wp.transform_identity(), wp.transform_identity()], dtype=wp.transform, device=device),
             wp.array([0, 1], dtype=wp.int32, device=device),
             wp.array(body_to_articulation, dtype=wp.int32, device=device),
             wp.array([0] * articulation_count, dtype=wp.int32, device=device),
@@ -179,13 +161,9 @@ def _launch_articulation_pair_contact_allocator(
             wp.ones((2,), dtype=wp.int32, device=device),
             wp.zeros((2,), dtype=wp.int32, device=device),
             0,
-            0,
-            0,
-            0,
             0.0,
             scoped_gate,
             pair_gate,
-            8,
             8,
             8,
             int(enable_friction),
@@ -203,16 +181,11 @@ def _launch_articulation_pair_contact_allocator(
             dense_count,
             contact_path,
             wp.zeros((1,), dtype=wp.int32, device=device),
-            wp.zeros((1,), dtype=wp.int32, device=device),
-            wp.zeros((1,), dtype=wp.int32, device=device),
             contact_slots_needed,
             dense_dropped,
             mf_dropped,
-            propagation_dropped,
             wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
             wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
-            wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
-            wp.zeros(4, dtype=wp.int32, device=device),
         ],
         device=device,
     )
@@ -239,8 +212,6 @@ def _dense_speculative_rhs(scale: float) -> float:
             scale,
             1.0,
             1.0,
-            wp.zeros(1, dtype=wp.int32, device="cpu"),
-            0,
         ],
         outputs=[rhs, wp.zeros((1, 1), dtype=wp.float32, device="cpu")],
         device="cpu",
@@ -512,12 +483,8 @@ class TestFeatherPGSContactControls(unittest.TestCase):
                 integers,
                 poisoned,
                 poisoned,
-                poisoned,
                 integers,
                 integers,
-                integers,
-                row_metadata,
-                row_metadata,
                 row_metadata,
                 row_metadata,
                 row_metadata,
@@ -532,7 +499,7 @@ class TestFeatherPGSContactControls(unittest.TestCase):
 
     def test_resolved_world_skips_all_contact_routes_and_refreshes_mapping(self):
         """Zero-world allocation must overwrite stale mappings without producing rows."""
-        for route in (PATH_DENSE, PATH_MATRIX_FREE, PATH_PROPAGATION):
+        for route in (PATH_DENSE, PATH_MATRIX_FREE):
             with self.subTest(route=route):
                 fallback = _launch_contact_allocator(route=route, gap=-0.01, gate=0.0)
                 self.assertGreaterEqual(fallback["slot"], 0)
@@ -544,15 +511,7 @@ class TestFeatherPGSContactControls(unittest.TestCase):
                 self.assertEqual(skipped["slot"], -1)
                 self.assertEqual(skipped["path"], -1)
                 self.assertEqual(skipped["slots_needed"], 0)
-                for name in (
-                    "dense_count",
-                    "mf_count",
-                    "propagation_count",
-                    "dense_world_flag",
-                    "dense_dropped",
-                    "mf_dropped",
-                    "propagation_dropped",
-                ):
+                for name in ("dense_count", "mf_count", "dense_dropped", "mf_dropped"):
                     self.assertEqual(skipped[name], 0, name)
 
     def test_compact_contact_builder_matches_tree_walk(self):
@@ -651,11 +610,7 @@ class TestFeatherPGSContactControls(unittest.TestCase):
 
     def test_scoped_gap_gate_preserves_other_contact_routes(self):
         """Do not shorten predictive contacts for ground, free-body, or cross-articulation rows."""
-        for route, counter in (
-            (PATH_DENSE, "dense_count"),
-            (PATH_MATRIX_FREE, "mf_count"),
-            (PATH_PROPAGATION, "propagation_count"),
-        ):
+        for route, counter in ((PATH_DENSE, "dense_count"), (PATH_MATRIX_FREE, "mf_count")):
             with self.subTest(route=route):
                 result = _launch_contact_allocator(
                     route=route,
@@ -690,7 +645,7 @@ class TestFeatherPGSContactControls(unittest.TestCase):
 
     def test_articulation_pair_friction_filter_preserves_free_and_ground_rows(self):
         """Scope tight friction controls to articulated pairs, not ball/ground routes."""
-        for route in (PATH_DENSE, PATH_MATRIX_FREE, PATH_PROPAGATION):
+        for route in (PATH_DENSE, PATH_MATRIX_FREE):
             with self.subTest(route=route):
                 result = _launch_contact_allocator(
                     route=route,
@@ -760,7 +715,7 @@ class TestFeatherPGSContactControls(unittest.TestCase):
 
     def test_gap_gate_prevents_all_route_allocations(self):
         """Drop positive gaps above the gate before any route reserves a slot."""
-        for route in (PATH_DENSE, PATH_MATRIX_FREE, PATH_PROPAGATION):
+        for route in (PATH_DENSE, PATH_MATRIX_FREE):
             with self.subTest(route=route):
                 allocated = _launch_contact_allocator(route=route, gap=0.002, gate=0.0)
                 self.assertEqual(allocated["path"], route)
@@ -770,16 +725,8 @@ class TestFeatherPGSContactControls(unittest.TestCase):
                 self.assertEqual(allocated["art_b"], -1)
                 self.assertEqual(allocated["slots_needed"], 1)
                 self.assertEqual(
-                    (
-                        allocated["dense_count"],
-                        allocated["mf_count"],
-                        allocated["propagation_count"],
-                    ),
-                    (
-                        int(route == PATH_DENSE),
-                        int(route == PATH_MATRIX_FREE),
-                        int(route == PATH_PROPAGATION),
-                    ),
+                    (allocated["dense_count"], allocated["mf_count"]),
+                    (int(route == PATH_DENSE), int(route == PATH_MATRIX_FREE)),
                 )
 
                 dropped = _launch_contact_allocator(route=route, gap=0.002, gate=0.001)
@@ -787,12 +734,10 @@ class TestFeatherPGSContactControls(unittest.TestCase):
                 self.assertEqual(dropped["path"], -1)
                 self.assertEqual(dropped["dense_count"], 0)
                 self.assertEqual(dropped["mf_count"], 0)
-                self.assertEqual(dropped["propagation_count"], 0)
-                self.assertEqual(dropped["dense_world_flag"], 0)
 
     def test_gap_gate_keeps_contacts_at_threshold(self):
         """Keep a contact whose gap equals the positive gate exactly."""
-        for route in (PATH_DENSE, PATH_MATRIX_FREE, PATH_PROPAGATION):
+        for route in (PATH_DENSE, PATH_MATRIX_FREE):
             with self.subTest(route=route):
                 result = _launch_contact_allocator(route=route, gap=0.001, gate=0.001)
                 self.assertEqual(result["path"], route)

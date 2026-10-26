@@ -55,7 +55,7 @@ def _export_inputs(device, capacity, count, rng):
     worlds, rows = 7, 48
     slot = rng.integers(0, rows - 3, capacity).astype(np.int32)
     world = rng.integers(0, worlds, capacity).astype(np.int32)
-    path = rng.integers(-1, 3, capacity).astype(np.int32)
+    path = rng.integers(-1, 2, capacity).astype(np.int32)
     row_type = np.full((worlds, rows), kernels.PGS_CONSTRAINT_TYPE_CONTACT, np.int32)
     row_parent = np.full((worlds, rows), -1, np.int32)
     for c in np.flatnonzero(rng.random(capacity) < 0.35):
@@ -79,11 +79,9 @@ def _export_inputs(device, capacity, count, rng):
         ints(path),
         floats((worlds, rows)),
         floats((worlds, rows)),
-        floats((worlds, rows)),
         counts,
         counts,
-        counts,
-        *(ints(values) for values in (row_type, row_parent) * 3),
+        *(ints(values) for values in (row_type, row_parent) * 2),
         1,
         240.0,
     ]

@@ -8,6 +8,7 @@ from functools import cache
 
 import warp as wp
 
+from .device_preludes import dual_native, lane_group
 from .friction import _PAIR_METRIC
 from .friction_patches import FrictionPatches
 from .kernels import (
@@ -69,14 +70,8 @@ def _insert_once(text: str, anchor: str, addition: str, *, replace: bool = False
 # diagonals as written. Lane sums meet in the same tree as the norms.
 _CONTACT_RECORD_SOURCE = """
     if (row_count == 3) {
-#if defined(__CUDA_ARCH__)
-        for (int shift = $LANES / 2; shift > 0; shift >>= 1) {
-            cross.c[0] += __shfl_down_sync(MASK, cross.c[0], shift, $LANES);
-            cross.c[1] += __shfl_down_sync(MASK, cross.c[1], shift, $LANES);
-            cross.c[2] += __shfl_down_sync(MASK, cross.c[2], shift, $LANES);
-        }
-#endif
-        if (lane == 0) {
+        SUM(cross.c[0], cross.c[1], cross.c[2]);
+        if (LANE == 0) {
             float* record = row_free_response.data
                 + (world * row_free_response.shape[1] + slot / 3) * row_free_response.shape[2];
             record[0] = cross.c[0];
@@ -152,9 +147,9 @@ def _get_sparse_contact_response_kernel(
         if (row >= row_count) continue;
 #pragma unroll
         for (int k = 0; k < 3; ++k) {
-            angular_a_shared.data[row][k] = __shfl_sync(MASK, angular_a.data[row][k], 0, $LANES);
-            angular_b_shared.data[row][k] = __shfl_sync(MASK, angular_b.data[row][k], 0, $LANES);
-            directions_shared.data[row][k] = __shfl_sync(MASK, directions.data[row][k], 0, $LANES);
+            angular_a_shared.data[row][k] = READ(angular_a.data[row][k], 0);
+            angular_b_shared.data[row][k] = READ(angular_b.data[row][k], 0);
+            directions_shared.data[row][k] = READ(directions.data[row][k], 0);
         }
     }
 """
@@ -187,8 +182,7 @@ def _get_sparse_contact_response_kernel(
         }
 """
         geometry_cuda = (
-            "volatile float* geometry = jacobian + $GEOMETRY;\n"
-            "if (lane == 0) {\n" + geometry_copy + "}\n__syncwarp(MASK);\n"
+            "volatile float* geometry = jacobian + $GEOMETRY;\nif (LANE == 0) {\n" + geometry_copy + "}\nSYNC();\n"
         )
         geometry_cpu = "float geometry[27];\n" + geometry_copy
         geometry_dot = """
@@ -199,40 +193,15 @@ def _get_sparse_contact_response_kernel(
 """
     snippet = """
 #if defined(__CUDA_ARCH__)
-    const int lane = tid & ($LANES - 1);
-    const int stride = $LANES;
-    const int group = threadIdx.x / $LANES;
-    const unsigned MASK = (0xffffffffu >> (32 - $LANES))
-        << ((threadIdx.x & 31) & ~($LANES - 1));
     __shared__ float storage[$STORAGE];
-    float* jacobian = storage + group * $SCRATCH;
+    float* jacobian = storage + SUB * $SCRATCH;
     $GEOMETRY_CUDA
 #else
     if ((tid & ($LANES - 1)) != 0) return;
-    const int lane = 0;
-    const int stride = 1;
     float jacobian[$SCRATCH];
     $GEOMETRY_CPU
 #endif
     float* free_factor = jacobian + $JACOBIAN;
-    const auto bit_count = [](unsigned long long mask) {
-#if defined(__CUDA_ARCH__)
-        return __popcll(mask);
-#else
-        int count = 0;
-        while (mask != 0) { mask &= mask - 1; ++count; }
-        return count;
-#endif
-    };
-    const auto first_bit = [](unsigned long long mask) {
-#if defined(__CUDA_ARCH__)
-        return __ffsll(mask) - 1;
-#else
-        int column = 0;
-        while ((mask & 1ull) == 0) { mask >>= 1; ++column; }
-        return column;
-#endif
-    };
     const auto jacobian_value = [&](const auto& motion, int side, int row) {
         const auto linear = wp::vec3(motion.c[0], motion.c[1], motion.c[2]);
         const auto angular = wp::vec3(motion.c[3], motion.c[4], motion.c[5]);
@@ -261,7 +230,7 @@ def _get_sparse_contact_response_kernel(
         const int start = articulation_dof_start.data[art];
         const int offset = articulation_world_dof_offset.data[art];
         if (is_free_rigid.data[art] != 0) {
-            for (int node = lane; node < 6; node += stride) {
+            for (int node = LANE; node < 6; node += STRIDE) {
                 const auto motion = joint_S_s.data[start + node];
                 const float velocity = v_hat.data[start + node];
 #pragma unroll
@@ -274,11 +243,9 @@ def _get_sparse_contact_response_kernel(
                     incident.c[row] += value * velocity;
                 }
             }
-#if defined(__CUDA_ARCH__)
-            __syncwarp(MASK);
-#endif
+            SYNC();
             const int factor_base = group * 36;
-            for (int node = lane; node < 6; node += stride) {
+            for (int node = LANE; node < 6; node += STRIDE) {
                 auto value = wp::vec3(0.0f);
                 for (int column = 0; column <= node; ++column) {
                     const float factor = free_inverse_factor.data[factor_base + node * 6 + column];
@@ -292,10 +259,8 @@ def _get_sparse_contact_response_kernel(
                     if (row < row_count) free_factor[row * $PLANE + node] = value.c[row];
                 }
             }
-#if defined(__CUDA_ARCH__)
-            __syncwarp(MASK);
-#endif
-            for (int node = lane; node < 6; node += stride) {
+            SYNC();
+            for (int node = LANE; node < 6; node += STRIDE) {
                 auto response = wp::vec3(0.0f);
                 for (int column = node; column < 6; ++column) {
                     const float factor = free_inverse_factor.data[factor_base + column * 6 + node];
@@ -320,7 +285,7 @@ def _get_sparse_contact_response_kernel(
             unsigned long long mask = 0;
             if (art == art_a) mask |= mask_a;
             if (art == art_b) mask |= mask_b;
-            for (int node = lane; node < $N; node += stride) {
+            for (int node = LANE; node < $N; node += STRIDE) {
                 const unsigned long long bit = 1ull << node;
                 if ((mask & bit) == 0) continue;
                 const int physical = permutation.data[node];
@@ -338,15 +303,13 @@ def _get_sparse_contact_response_kernel(
                     incident.c[row] += value * velocity;
                 }
             }
-#if defined(__CUDA_ARCH__)
-            __syncwarp(MASK);
-#endif
+            SYNC();
             const int factor_base = group * inverse_factor.shape[1];
-            for (int node = lane; node < $N; node += stride) {
+            for (int node = LANE; node < $N; node += STRIDE) {
                 const unsigned long long bit = 1ull << node;
                 if ((mask & bit) == 0) continue;
                 $SPARSE_PROJECTION
-                const int index = count + bit_count(mask & (bit - 1ull));
+                const int index = count + COUNT(mask & (bit - 1ull));
 #pragma unroll
                 for (int row = 0; row < 3; ++row) {
                     if (row >= row_count) continue;
@@ -356,28 +319,21 @@ def _get_sparse_contact_response_kernel(
                     norm.c[row] += value.c[row] * value.c[row];
                 }
             }
-            count += bit_count(mask);
+            count += COUNT(mask);
         }
         // The next endpoint reuses the same group-local Jacobian storage.
-#if defined(__CUDA_ARCH__)
-        __syncwarp(MASK);
-#endif
+        SYNC();
     }
 #pragma unroll
     for (int row = 0; row < 3; ++row) {
         if (row >= row_count) continue;
         const int response_offset = (row_offset + row) * support_capacity;
-        for (int index = count + lane; index < support_capacity; index += stride) {
+        for (int index = count + LANE; index < support_capacity; index += STRIDE) {
             if (!$SUPPORT_TABLE) row_dof.data[response_offset + index] = -1;
             row_factor.data[response_offset + index] = 0.0f;
         }
-#if defined(__CUDA_ARCH__)
-        for (int shift = $LANES / 2; shift > 0; shift >>= 1) {
-            norm.c[row] += __shfl_down_sync(MASK, norm.c[row], shift, $LANES);
-            incident.c[row] += __shfl_down_sync(MASK, incident.c[row], shift, $LANES);
-        }
-#endif
-        if (lane == 0) {
+        SUM(norm.c[row], incident.c[row]);
+        if (LANE == 0) {
             if ($SUPPORT_TABLE) {
                 const int class_a = mask_a != 0ull && art_a >= 0 && articulation_response_dof_count.data[art_a] > 0
                     ? support.body_class.data[body_a] : 0;
@@ -441,6 +397,7 @@ def _get_sparse_contact_response_kernel(
         .replace("$N", str(n))
         .replace("$SUPPORT_TABLE", str(bool(use_support_table)).lower())
     )
+    snippet = dual_native(snippet, preludes=(lane_group(lanes),))
 
     @wp.func_native(snippet)
     def project_native(
@@ -737,27 +694,13 @@ def finalize_sparse_joint_limit_rows(
 
 
 @wp.func_native(
-    """
+    dual_native(
+        """
     const int group = tid >> 5;
     if (group >= group_to_art.shape[0]) return;
-#if defined(__CUDA_ARCH__)
-    constexpr unsigned MASK = 0xffffffffu;
-    const int lane = tid & 31;
-    const int width = 32;
-#else
+#if !defined(__CUDA_ARCH__)
     if ((tid & 31) != 0) return;
-    const int lane = 0;
-    const int width = 1;
 #endif
-    const auto bit_count = [](unsigned long long mask) {
-#if defined(__CUDA_ARCH__)
-        return __popcll(mask);
-#else
-        int count = 0;
-        while (mask != 0) { mask &= mask - 1; ++count; }
-        return count;
-#endif
-    };
     const int art = group_to_art.data[group];
     const int world = art_to_world.data[art];
     const int start = articulation_dof_start.data[art];
@@ -765,8 +708,8 @@ def finalize_sparse_joint_limit_rows(
     const int capacity = row_type.shape[1];
     const int support_capacity = row_factor.shape[2];
     const int factor_base = group * inverse_factor.shape[1];
-    for (int base = 0; base < 2 * dofs; base += width) {
-        const int candidate = base + lane;
+    for (int base = 0; base < 2 * dofs; base += STRIDE) {
+        const int candidate = base + LANE;
         const int local_dof = candidate >> 1;
         const int side = candidate & 1;
         const int dof = start + local_dof;
@@ -780,18 +723,8 @@ def finalize_sparse_joint_limit_rows(
             active = wp::isfinite(bound)
                 && (side == 0 ? position <= bound + activation_gap : position >= bound - activation_gap);
         }
-#if defined(__CUDA_ARCH__)
-        const unsigned active_mask = __ballot_sync(MASK, active != 0);
-        const int active_count = __popc(active_mask);
-        int first_slot = 0;
-        if (lane == 0 && active_count != 0)
-            first_slot = atomicAdd(&slot_counter.data[world], active_count);
-        first_slot = __shfl_sync(MASK, first_slot, 0);
-#else
-        const unsigned active_mask = active != 0 ? 1u : 0u;
-        const int first_slot = slot_counter.data[world];
-        slot_counter.data[world] += active;
-#endif
+        const unsigned active_mask = BALLOT(active != 0);
+        const int first_slot = RESERVE(&slot_counter.data[world], COUNT(active_mask));
         // Visit the ballot in lane order, matching the existing lower/upper DOF order.
         unsigned pending = active_mask;
         int rank = 0;
@@ -799,26 +732,20 @@ def finalize_sparse_joint_limit_rows(
             const int row = first_slot + rank;
             // The reservation above still counts every over-capacity row.
             if (row >= capacity) break;
-#if defined(__CUDA_ARCH__)
-            const int source = __ffs(pending) - 1;
-            const int selected_dof = __shfl_sync(MASK, local_dof, source);
-            const int selected_side = __shfl_sync(MASK, side, source);
-            const float selected_gap = __shfl_sync(MASK, gap, source);
-#else
-            const int selected_dof = local_dof;
-            const int selected_side = side;
-            const float selected_gap = gap;
-#endif
+            const int source = FIRST(pending);
+            const int selected_dof = READ(local_dof, source);
+            const int selected_side = READ(side, source);
+            const float selected_gap = READ(gap, source);
             const float sign = selected_side == 0 ? 1.0f : -1.0f;
             const int column = inverse_permutation.data[selected_dof];
             const unsigned long long support_mask = dof_mask.data[selected_dof];
             const int row_offset = world * capacity + row;
             const int response_offset = row_offset * support_capacity;
             float norm = 0.0f;
-            for (int node = lane; node < dofs; node += width) {
+            for (int node = LANE; node < dofs; node += STRIDE) {
                 const unsigned long long bit = 1ull << node;
                 if ((support_mask & bit) == 0) continue;
-                const int index = bit_count(support_mask & (bit - 1ull));
+                const int index = COUNT(support_mask & (bit - 1ull));
                 const int entry = factor_lookup.data[node * dofs + column];
                 const float value = entry >= 0 ? sign * inverse_factor.data[factor_base + entry] : 0.0f;
                 if (!support.enabled)
@@ -826,15 +753,13 @@ def finalize_sparse_joint_limit_rows(
                 row_factor.data[response_offset + index] = value;
                 norm += value * value;
             }
-            const int support_count = bit_count(support_mask);
-            for (int index = support_count + lane; index < support_capacity; index += width) {
+            const int support_count = COUNT(support_mask);
+            for (int index = support_count + LANE; index < support_capacity; index += STRIDE) {
                 if (!support.enabled) row_dof.data[response_offset + index] = -1;
                 row_factor.data[response_offset + index] = 0.0f;
             }
-#if defined(__CUDA_ARCH__)
-            for (int shift = 16; shift > 0; shift >>= 1) norm += __shfl_down_sync(MASK, norm, shift);
-#endif
-            if (lane == 0) {
+            SUM(norm);
+            if (LANE == 0) {
                 if (support.enabled)
                     support.row_class.data[row_offset] = support.limit_class.data[selected_dof];
                 row_incident.data[row_offset] = sign * v_hat.data[start + selected_dof];
@@ -851,7 +776,9 @@ def finalize_sparse_joint_limit_rows(
             ++rank;
         }
     }
-""".replace("$LIMIT_TYPE", str(PGS_CONSTRAINT_TYPE_JOINT_LIMIT))
+""".replace("$LIMIT_TYPE", str(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)),
+        preludes=(lane_group(32),),
+    )
 )
 def _build_sparse_joint_limit_rows(
     tid: int,
@@ -960,27 +887,13 @@ def build_sparse_joint_limit_rows(
 
 
 @wp.func_native(
-    """
+    dual_native(
+        """
     const int group = tid >> 5;
     if (group >= group_to_art.shape[0]) return;
-#if defined(__CUDA_ARCH__)
-    constexpr unsigned MASK = 0xffffffffu;
-    const int lane = tid & 31;
-    const int width = 32;
-#else
+#if !defined(__CUDA_ARCH__)
     if ((tid & 31) != 0) return;
-    const int lane = 0;
-    const int width = 1;
 #endif
-    const auto bit_count = [](unsigned long long mask) {
-#if defined(__CUDA_ARCH__)
-        return __popcll(mask);
-#else
-        int count = 0;
-        while (mask != 0) { mask &= mask - 1; ++count; }
-        return count;
-#endif
-    };
     const int art = group_to_art.data[group];
     const int world = art_to_world.data[art];
     const int start = articulation_dof_start.data[art];
@@ -1004,10 +917,10 @@ def build_sparse_joint_limit_rows(
         const int upper_offset = (world * capacity + upper) * support_capacity;
         const int dof_offset = articulation_world_dof_offset.data[art];
         float norm = 0.0f;
-        for (int node = lane; node < dofs; node += width) {
+        for (int node = LANE; node < dofs; node += STRIDE) {
             const unsigned long long bit = 1ull << node;
             if ((support_mask & bit) == 0) continue;
-            const int index = bit_count(support_mask & (bit - 1ull));
+            const int index = COUNT(support_mask & (bit - 1ull));
             const int entry = factor_lookup.data[node * dofs + column];
             const float value = entry >= 0 ? inverse_factor.data[factor_base + entry] : 0.0f;
             if (write_lower) {
@@ -1021,8 +934,8 @@ def build_sparse_joint_limit_rows(
             // Allocator-owned unit signs share the same squared column norm.
             norm += value * value;
         }
-        const int support_count = bit_count(support_mask);
-        for (int index = support_count + lane; index < support_capacity; index += width) {
+        const int support_count = COUNT(support_mask);
+        for (int index = support_count + LANE; index < support_capacity; index += STRIDE) {
             if (write_lower) {
                 if (!support.enabled) row_dof.data[lower_offset + index] = -1;
                 row_factor.data[lower_offset + index] = 0.0f;
@@ -1032,10 +945,8 @@ def build_sparse_joint_limit_rows(
                 row_factor.data[upper_offset + index] = 0.0f;
             }
         }
-#if defined(__CUDA_ARCH__)
-        for (int shift = 16; shift > 0; shift >>= 1) norm += __shfl_down_sync(MASK, norm, shift);
-#endif
-        if (lane == 0) {
+        SUM(norm);
+        if (LANE == 0) {
             const float incident = v_hat.data[dof];
             const float target = -joint_velocity_limit.data[dof];
             for (int side = 0; side < 2; ++side) {
@@ -1058,7 +969,9 @@ def build_sparse_joint_limit_rows(
             }
         }
     }
-""".replace("$VELOCITY_LIMIT_TYPE", str(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT))
+""".replace("$VELOCITY_LIMIT_TYPE", str(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)),
+        preludes=(lane_group(32),),
+    )
 )
 def _build_sparse_joint_velocity_limit_rows(
     tid: int,
@@ -1156,27 +1069,13 @@ def build_sparse_joint_velocity_limit_rows(
 
 
 @wp.func_native(
-    """
+    dual_native(
+        """
     const int group = tid >> 5;
     if (group >= group_to_art.shape[0]) return;
-#if defined(__CUDA_ARCH__)
-    constexpr unsigned MASK = 0xffffffffu;
-    const int lane = tid & 31;
-    const int width = 32;
-#else
+#if !defined(__CUDA_ARCH__)
     if ((tid & 31) != 0) return;
-    const int lane = 0;
-    const int width = 1;
 #endif
-    const auto bit_count = [](unsigned long long mask) {
-#if defined(__CUDA_ARCH__)
-        return __popcll(mask);
-#else
-        int count = 0;
-        while (mask != 0) { mask &= mask - 1; ++count; }
-        return count;
-#endif
-    };
     const int art = group_to_art.data[group];
     const int world = art_to_world.data[art];
     const int start = articulation_dof_start.data[art];
@@ -1200,10 +1099,10 @@ def build_sparse_joint_velocity_limit_rows(
         const int row_offset = world * capacity + row;
         const int response_offset = row_offset * support_capacity;
         float norm = 0.0f;
-        for (int node = lane; node < dofs; node += width) {
+        for (int node = LANE; node < dofs; node += STRIDE) {
             const unsigned long long bit = 1ull << node;
             if ((support_mask & bit) == 0) continue;
-            const int index = bit_count(support_mask & (bit - 1ull));
+            const int index = COUNT(support_mask & (bit - 1ull));
             const int entry0 = factor_lookup.data[node * dofs + column0];
             const int entry1 = factor_lookup.data[node * dofs + column1];
             const float value0 = entry0 >= 0 ? inverse_factor.data[factor_base + entry0] : 0.0f;
@@ -1213,15 +1112,13 @@ def build_sparse_joint_velocity_limit_rows(
             row_factor.data[response_offset + index] = value;
             norm += value * value;
         }
-        const int support_count = bit_count(support_mask);
-        for (int index = support_count + lane; index < support_capacity; index += width) {
+        const int support_count = COUNT(support_mask);
+        for (int index = support_count + LANE; index < support_capacity; index += STRIDE) {
             row_dof.data[response_offset + index] = -1;
             row_factor.data[response_offset + index] = 0.0f;
         }
-#if defined(__CUDA_ARCH__)
-        for (int shift = 16; shift > 0; shift >>= 1) norm += __shfl_down_sync(MASK, norm, shift);
-#endif
-        if (lane == 0) {
+        SUM(norm);
+        if (LANE == 0) {
             row_incident.data[row_offset] = v_hat.data[dof0] - coefficient * v_hat.data[dof1];
             diagonal.data[row_offset] = norm;
             row_type.data[row_offset] = $MIMIC_TYPE;
@@ -1234,7 +1131,9 @@ def build_sparse_joint_velocity_limit_rows(
             target_velocity.data[row_offset] = 0.0f;
         }
     }
-""".replace("$MIMIC_TYPE", str(PGS_CONSTRAINT_TYPE_MIMIC))
+""".replace("$MIMIC_TYPE", str(PGS_CONSTRAINT_TYPE_MIMIC)),
+        preludes=(lane_group(32),),
+    )
 )
 def _build_sparse_mimic_rows(
     tid: int,

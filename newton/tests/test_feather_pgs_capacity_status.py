@@ -38,7 +38,6 @@ def _allocator_arrays(capacity, *, route=0, count=205, device="cpu"):
         "contact_thickness0": wp.zeros(length, dtype=float, device=device),
         "contact_thickness1": wp.zeros(length, dtype=float, device=device),
         "body_q": wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
-        "shape_transform": wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
         "shape_body": integers([0]),
         "body_to_articulation": integers([0]),
         "art_to_world": integers([0]),
@@ -47,15 +46,11 @@ def _allocator_arrays(capacity, *, route=0, count=205, device="cpu"):
         "body_has_response_dofs": integers([1]),
         "is_free_rigid": integers([int(route == 1)]),
         "has_free_rigid": int(route == 1),
-        "propagation_articulated_contacts": int(route == 2),
-        "propagation_same_articulation": 0,
-        "propagation_free_free": 0,
         "contact_gap_gate": 0.0,
         "same_articulation_contact_gap_gate": 0.0,
         "articulation_pair_contact_gap_gate": 0.0,
         "max_constraints": capacity,
         "mf_max_constraints": capacity,
-        "propagation_max_constraints": capacity,
         "enable_friction": 1,
         "contact_friction_gap_threshold": float("inf"),
         "contact_friction_articulation_pairs_only": 0,
@@ -69,28 +64,47 @@ def _allocator_arrays(capacity, *, route=0, count=205, device="cpu"):
         "world_slot_counter": zeros(1),
         "contact_path": integers([-9] * length),
         "mf_slot_counter": zeros(1),
-        "propagation_slot_counter": zeros(1),
-        "dense_contact_world_flag": zeros(1),
         "contact_slots_needed": zeros(length),
         "dense_dropped_contact_rows": zeros(1),
         "mf_dropped_contact_rows": zeros(1),
-        "propagation_dropped_contact_rows": zeros(1),
         "dense_first_rejected_slot": integers([2**31 - 1]),
         "mf_first_rejected_slot": integers([2**31 - 1]),
-        "propagation_first_rejected_slot": integers([2**31 - 1]),
-        "capacity_status": zeros(4),
+        "capacity_status": zeros(2),
     }
 
 
 def _allocate(arrays):
-    """Run the real allocator without enabling detailed telemetry."""
+    """Run the real allocator without enabling detailed telemetry, then close both row families' reservations.
+
+    Reservations record the first rejected slot; the families' count finalizers raise the status.
+    """
     kernel = kernels.allocate_world_contact_slots
+    device = arrays["contact_count"].device
     wp.launch(
         kernel,
         dim=1,
         inputs=[arrays[name] for name in inspect.signature(kernel.func).parameters],
-        device=arrays["contact_count"].device,
+        device=device,
     )
+    for family, counter, capacity, first_rejected in (
+        (0, "world_slot_counter", "max_constraints", "dense_first_rejected_slot"),
+        (1, "mf_slot_counter", "mf_max_constraints", "mf_first_rejected_slot"),
+    ):
+        wp.launch(
+            kernels.finalize_constraint_counts_with_status,
+            dim=1,
+            inputs=[arrays[counter], arrays[capacity], family, arrays[first_rejected]],
+            outputs=[wp.empty(1, dtype=wp.int32, device=device), arrays["capacity_status"]],
+            device=device,
+        )
+
+
+def _clear_reservations(arrays):
+    """Start a new step's reservations: empty counters, no rejected slot."""
+    for name in ("world_slot_counter", "mf_slot_counter"):
+        arrays[name].zero_()
+    for name in ("dense_first_rejected_slot", "mf_first_rejected_slot"):
+        arrays[name].fill_(2**31 - 1)
 
 
 class TestFeatherPGSCapacityStatus(unittest.TestCase):
@@ -112,6 +126,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
             if clear:
                 self.assertTrue(solver.constraint_capacity_status(clear=True)["dense"])
             arrays["contact_count"].assign(np.array([count], dtype=np.int32))
+            _clear_reservations(arrays)
             wp.capture_launch(capture.graph)
             self.assertEqual(solver.constraint_capacity_status()["dense"], expected)
 
@@ -231,27 +246,28 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
                 expected_first_rejected = accepted * 3 if overflow else 2**31 - 1
                 self.assertEqual(int(arrays["dense_first_rejected_slot"].numpy()[0]), expected_first_rejected)
                 self.assertEqual(int(arrays["dense_dropped_contact_rows"].numpy()[0]), 0)
-                np.testing.assert_array_equal(arrays["capacity_status"].numpy(), [int(overflow), 0, 0, 0])
+                np.testing.assert_array_equal(arrays["capacity_status"].numpy(), [int(overflow), 0])
 
     def test_every_contact_route_is_sticky(self):
         """Retain each failure flag across a later successful empty allocation."""
-        for route in range(3):
+        for route in range(2):
             with self.subTest(route=route):
                 arrays = _allocator_arrays(2, route=route, count=1)
                 _allocate(arrays)
-                expected = np.zeros(4, dtype=np.int32)
+                expected = np.zeros(2, dtype=np.int32)
                 expected[route] = 1
                 np.testing.assert_array_equal(arrays["capacity_status"].numpy(), expected)
                 arrays["contact_count"].assign(np.array([0], dtype=np.int32))
+                _clear_reservations(arrays)
                 _allocate(arrays)
                 np.testing.assert_array_equal(arrays["capacity_status"].numpy(), expected)
 
     def test_internal_row_overflow(self):
         """Report unclamped internal demand even without contact reservations."""
-        status = wp.zeros(4, dtype=wp.int32, device="cpu")
+        status = wp.zeros(2, dtype=wp.int32, device="cpu")
         counts = wp.zeros(2, dtype=wp.int32, device="cpu")
         kernel = kernels.finalize_constraint_counts_with_status
-        for family in range(3):
+        for family in range(2):
             wp.launch(
                 kernel,
                 dim=2,
@@ -265,7 +281,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
                 device="cpu",
             )
             np.testing.assert_array_equal(counts.numpy(), [3, 4])
-        np.testing.assert_array_equal(status.numpy(), [1, 1, 1, 0])
+        np.testing.assert_array_equal(status.numpy(), [1, 1])
 
     def test_finalizer_truncates_rejected_contact_reservations(self):
         """Exclude a rejected triple even when its first row fits the capacity."""
@@ -273,8 +289,8 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         counter = wp.array([6, 6], dtype=wp.int32, device=device)
         first_rejected = wp.array([3, 0], dtype=wp.int32, device=device)
         count = wp.empty(2, dtype=wp.int32, device=device)
-        status = wp.zeros(4, dtype=wp.int32, device=device)
-        for family in range(3):
+        status = wp.zeros(2, dtype=wp.int32, device=device)
+        for family in range(2):
             wp.launch(
                 kernels.finalize_constraint_counts_with_status,
                 dim=2,
@@ -283,7 +299,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
                 device=device,
             )
             np.testing.assert_array_equal(count.numpy(), [3, 0])
-        np.testing.assert_array_equal(status.numpy(), [1, 1, 1, 0])
+        np.testing.assert_array_equal(status.numpy(), [1, 1])
 
     def test_public_check_and_explicit_clear(self):
         """Keep historical audit flags separate from resettable per-world validity."""
@@ -294,7 +310,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         model = builder.finalize(device="cpu")
         solver = SolverFeatherPGS(model, dense_max_constraints=192, row_watermark=False)
         self.assertFalse(any(solver.constraint_capacity_status().values()))
-        solver._constraint_capacity_status.assign(np.array([1, 0, 0, 0], dtype=np.int32))
+        solver._constraint_capacity_status.assign(np.array([1, 0], dtype=np.int32))
         solver.constraint_overflow.fill_(True)
         with self.assertRaisesRegex(RuntimeError, "capacity exceeded"):
             solver.check_constraint_capacity()

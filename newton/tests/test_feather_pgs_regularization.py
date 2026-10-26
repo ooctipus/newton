@@ -398,8 +398,6 @@ def test_exact_surface_contact_is_regularized(test: unittest.TestCase, device):
                 1.0,
                 1.0,
                 0.5,
-                wp.zeros(1, dtype=wp.int32, device=device),
-                0,
             ],
             outputs=[wp.zeros((1, 1), dtype=wp.float32, device=device), row_w],
             device=device,

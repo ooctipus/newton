@@ -235,26 +235,29 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
             (
                 fpgs._get_pgs_solve_mf_gs_kernel(8, 65535, 29, "cpu"),
                 "pgs_solve_mf_gs_native",
-                "mf_meta.data[off_meta + parent * 4 + 3]",
+                "mf_meta.data[off_meta + patch_row * 4 + 3]",
             ),
             (
                 fpgs._get_pgs_solve_local_owned_kernel(
                     8, 8, 23, "cpu", paired_dof_count=6, mf_max_constraints=65535, local_mf_max_constraints=3
                 ),
                 "native",
-                "mf_meta.data[mf_meta_offset + parent_mf * 4 + 3]",
+                "mf_meta.data[mf_meta_offset + patch_row * 4 + 3]",
             ),
         )
         for kernel, native_name, word in cases:
             with self.subTest(kernel=kernel.key):
                 closure = inspect.getclosurevars(kernel.func)
                 source = (closure.globals | closure.nonlocals)[native_name].native_snippet
-                # Dense-row links use a different, unpacked array.
+                # Dense-row links use a different, unpacked array. The ring walk's parent accessor returns the
+                # decoded link of its row.
                 start = source.index(word)
-                start = source.rfind("int patch_row", 0, start)
+                start = source.rfind("return ", 0, start)
                 result = wp.zeros(len(parents), dtype=int, device="cpu")
                 wp.launch(
-                    _parent_decoder(source[start:], name="patch_row", packed=word),
+                    _parent_decoder(
+                        "int patch_row = " + source[start + len("return ") :], name="patch_row", packed=word
+                    ),
                     dim=len(parents),
                     inputs=[wp.array(packed, dtype=int, device="cpu")],
                     outputs=[result],
@@ -307,7 +310,6 @@ def _solve_parent_rows(device, friction, parents):
         friction_start_iteration=0,
         iteration_offset=0,
         freeze_drive_rows=0,
-        defer_dense_response=0,
     )
     kernel = fpgs._get_pgs_solve_mf_gs_kernel(
         8,

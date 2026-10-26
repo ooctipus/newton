@@ -60,12 +60,10 @@ class TestFeatherPGSIncremental(unittest.TestCase):
             "general_worlds": zero_int,
             "general_world_grid_stride": 1,
             "use_general_world_queue": 0,
-            "rb_class": zero_int,
             "world_constraint_count": array([2], wp.int32),
             "dense_phase_bounds": array([[0, 0]], wp.int32),
             "local_solve_owner": zero_int,
             "world_dof_indices": array([[0, 1]], wp.int32),
-            "world_deferred_dof_mask": array([[0, 0]], wp.int32),
             "rhs_bias": array([[0.0, -1.0]]),
             "world_diag": array([[1.0, 1.0]]),
             "world_row_w": array([[1.0, 1.0]]),
@@ -92,7 +90,6 @@ class TestFeatherPGSIncremental(unittest.TestCase):
             "friction_start_iteration": 0,
             "iteration_offset": 0,
             "freeze_drive_rows": 0,
-            "defer_dense_response": 0,
             "v_out": array([0.0, 0.0]),
         }
         for name in ("target_vel_bias", "vel_multiplier", "impulse_multiplier", "max_impulse", "vel_limit"):

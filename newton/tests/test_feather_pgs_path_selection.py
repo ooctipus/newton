@@ -560,9 +560,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertTrue(by_dof["1"]["grouped"])
         self.assertEqual(selected["kernel_plan_by_dof"][1]["hinv_jt_kernel"], "grouped")
         self.assertIn("routes.dynamics.grouped", selected["reasons"]["kernel_plan_by_dof"][1]["hinv_jt_kernel"])
-        # The free box's six-coordinate size keeps its planned kernel unless opted in.
+        # The free box's six-coordinate size keeps its planned kernel.
         self.assertFalse(by_dof["6"]["grouped"])
-        self.assertIn("FEATHER_PGS_GROUPED_HINV_FREE", by_dof["6"]["reason"])
+        self.assertIn("Free-body sizes keep the per-row kernel", by_dof["6"]["reason"])
         self.assertEqual(selected["kernel_plan_by_dof"][6]["hinv_jt_kernel"], "par_row")
 
     def test_cpu_route_record_matches_launched_kernels(self):
@@ -596,8 +596,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
 
         The general builder's methods: per-contact rows, masked rows in one launch for up to two
         sizes or per size for three, and a size above the masked builder's 32 DOFs; then keyed rows on
-        CPU stand-ins. Each record is taken under the switches its step runs with. The debug row checks
-        are not routes and stay off.
+        CPU stand-ins. Each record is taken under the switches its step runs with.
         """
         mixed, three, wide = _cpu_free_body_model(), _resting_arms_and_box(1, 2), _resting_arms_and_box(34)
         pair = ("6", "1")
@@ -625,7 +624,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 self.assertEqual((record["producer"], record["law"]), ("general", law))
                 self.assertEqual({size: entry["method"] for size, entry in record["builder_by_dof"].items()}, methods)
                 self.assertEqual(record["general_method_by_dof"], methods)
-                self.assertIsNone(record["row_check_by_dof"])
                 assert_row_builders_named(self, record, keys)
         model = standing_model(device="cpu", worlds=2)
         for law, beta in (("patch", 0.2), ("point", 0.0)):
@@ -649,53 +647,13 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                 )
                 assert_row_builders_named(self, record, keys)
 
-    def test_cpu_record_names_the_debug_row_check_builders(self):
-        """Name the builders the debug row checks launch in row_check_by_dof, and none without a check.
-
-        FEATHER_PGS_CHECK_ROWS (point friction) builds every size's masked rows into copies
-        and compares them with the per-contact rows the solve uses, which builder_by_dof and
-        general_method_by_dof name. Patch friction does not run the check. One CPU step launches exactly
-        the builders the two maps name, and the check compares the sizes its map lists.
-        """
-        model = _cpu_free_body_model()
-        pair = ("6", "1")
-        cases = (
-            # (switches, friction_anchor_beta, builder method, checked method or None, comparisons)
-            ({"_CHECK_ROWS": True}, 0.0, "per_contact", "masked", ["rows_J_6", "rows_J_1"]),
-            ({"_CHECK_ROWS": True, "_ROWS_MASKED": True}, 0.0, "per_contact", "masked", ["rows_J_6", "rows_J_1"]),
-            ({"_CHECK_ROWS": True, "_ROWS_MASKED": True}, None, "per_contact", None, []),
-        )
-        for switches, beta, method, check, comparisons in cases:
-            compared = []
-            with (
-                self.subTest(switches=switches, law="patch" if beta is None else "point"),
-                patch.multiple(solver_module, **{**ROW_SWITCHES_OFF, **switches}),
-                # The checks print their comparisons; keep the names of the compared outputs instead.
-                patch.object(
-                    solver_module, "_report_grouped_check", lambda name, *_, compared=compared: compared.append(name)
-                ),
-            ):
-                solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
-                record = solver.get_path_selection()["routes"]["contact_rows"]
-                keys = _launched_kernel_keys(model, solver)
-                self.assertEqual(record["general_method_by_dof"], dict.fromkeys(pair, method))
-                checked = record["row_check_by_dof"]
-                if check is None:
-                    self.assertIsNone(checked)
-                else:
-                    self.assertEqual(
-                        {size: entry["method"] for size, entry in checked.items()}, dict.fromkeys(pair, check)
-                    )
-                assert_row_builders_named(self, record, keys)
-                self.assertEqual([name for name in compared if name.startswith("rows_J_")], comparisons)
-
     def test_host_record_maps_every_producer_plan(self):
         """Map every producer's plan to its builder methods, kernels and law from host attributes alone.
 
         Stand-ins carry what contact_row_plan and the record read, so the producers that need CUDA are
         pinned on CPU as well: local row packets, keyed rows, the compact contact boundary, native sparse
         factors, the sparse-diagonal owner (with and without its schedule marker) and the compact Jacobian,
-        beside the general builder's methods and debug checks, each under both laws. The cases name every builder method, and every
+        beside the general builder's methods, each under both laws. The cases name every builder method, and every
         kernel they name is one the launch check recognizes.
         """
         layout = KeyedLayout(16, 6, 0, 16, 128, False, 0)
@@ -703,13 +661,16 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         response = SimpleNamespace(key="populate_sparse_contact_response_stand_in")
         prepare, compact = "prepare_world_contact_rows", "populate_world_J_for_compact_size"
         per_contact = ["populate_world_J_for_size"]
-        point_masked = ["contact_row_prelude", "populate_world_J_masked"]
         named, methods = set(), set()
         for law in ("point", "patch"):
             point = law == "point"
             p = "" if point else "patch_"
             produce = f"produce_{p}contacts"
-            masked = point_masked if point else ["contact_row_prelude_patch", "populate_world_J_masked_patch"]
+            masked = (
+                ["contact_row_prelude", "populate_world_J_masked"]
+                if point
+                else ["contact_row_prelude_patch", "populate_world_J_masked_patch"]
+            )
             fallback = (keyed_rows.get_fallback_kernel if point else keyed_rows.get_patch_fallback_kernel)(layout).key
             diagonal = {
                 "_sparse_diagonal_contact_solve": True,
@@ -722,16 +683,14 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
             def same(sizes, method, kernels):
                 return dict.fromkeys(sizes, (method, kernels))
 
-            # Under patch friction the general builder's point-only experiments and checks keep per-contact rows.
             cases = (
-                # (attributes, switches, sizes, producer, {size: (method, kernels)}, row check {size: (method, kernels)})
+                # (attributes, switches, sizes, producer, {size: (method, kernels)})
                 (
                     {"_row_packets": SimpleNamespace(patch_friction=not point)},
                     {},
                     (18, 6),
                     "local_packets",
                     same((18, 6), "local_packets", [produce, f"materialize_{p}fallback"]),
-                    None,
                 ),
                 (
                     {"_keyed_rows": SimpleNamespace(patch=not point, layout=layout)},
@@ -739,7 +698,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     (16, 6),
                     "keyed_rows",
                     same((16, 6), "keyed_rows", [f"scatter_{p}contact_keys", fallback]),
-                    None,
                 ),
                 (
                     {"_compact_contact_boundary": True, **diagonal, **schedule},
@@ -750,7 +708,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                         108: ("compact_contact_boundary", [produce, marker.key]),
                         6: ("compact_contact_boundary", ["clear_contact_response", produce]),
                     },
-                    None,
                 ),
                 (
                     {**sparse, "_sparse_prepare_contacts": True},
@@ -758,7 +715,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     (18,),
                     "sparse_contact_response",
                     {18: ("sparse_response", [response.key])},
-                    None,
                 ),
                 (
                     {**diagonal, **schedule},
@@ -769,7 +725,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                         108: ("sparse_diagonal", [prepare, "populate_sparse_diagonal_contact_response", marker.key]),
                         6: ("compact_jacobian", [prepare, compact]),
                     },
-                    None,
                 ),
                 (
                     diagonal,
@@ -780,7 +735,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                         108: ("sparse_diagonal", [prepare, "populate_sparse_diagonal_contact_response"]),
                         6: ("compact_jacobian", [prepare, compact]),
                     },
-                    None,
                 ),
                 (
                     {"_compact_contact_jacobian": True},
@@ -788,28 +742,18 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     (6, 1),
                     "compact_jacobian",
                     same((6, 1), "compact_jacobian", [prepare, compact]),
-                    None,
                 ),
-                ({}, {}, (34, 6), "general", same((34, 6), "per_contact", per_contact), None),
-                ({}, {"_ROWS_MASKED": True}, (6, 2, 1), "general", same((6, 2, 1), "masked", masked), None),
+                ({}, {}, (34, 6), "general", same((34, 6), "per_contact", per_contact)),
+                ({}, {"_ROWS_MASKED": True}, (6, 2, 1), "general", same((6, 2, 1), "masked", masked)),
                 (
                     {},
                     {"_ROWS_MASKED": True},
                     (34, 6),
                     "general",
                     {34: ("per_contact", per_contact), 6: ("masked_combined", masked)},
-                    None,
-                ),
-                (
-                    {},
-                    {"_CHECK_ROWS": True, "_ROWS_MASKED": True},
-                    (6, 1),
-                    "general",
-                    same((6, 1), "per_contact", per_contact),
-                    same((6, 1), "masked", point_masked) if point else None,
                 ),
             )
-            for attributes, switches, sizes, producer, expected, check in cases:
+            for attributes, switches, sizes, producer, expected in cases:
                 with (
                     self.subTest(producer, law=law, attributes=sorted(attributes), switches=switches),
                     patch.multiple(solver_module, **{**ROW_SWITCHES_OFF, **switches}),
@@ -819,7 +763,6 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     builders = {
                         size: path_selection._row_builder(stand_in, plan, size, solver_module) for size in plan.methods
                     }
-                    checked = path_selection._row_check(plan, solver_module)
                     self.assertEqual(plan.producer, producer)
                     self.assertEqual(
                         {size: (entry["method"], entry["kernels"]) for size, entry in builders.items()}, expected
@@ -827,13 +770,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
                     self.assertEqual({entry["law"] for entry in builders.values()}, {law})
                     pointer = "routes.sweep.tiers" if producer == "keyed_rows" else None
                     self.assertEqual({entry.get("direct_rows") for entry in builders.values()}, {pointer})
-                    if check is None:
-                        self.assertIsNone(checked)
-                    else:
-                        self.assertEqual(
-                            {int(size): (entry["method"], entry["kernels"]) for size, entry in checked.items()}, check
-                        )
-                    for entry in [*builders.values(), *(checked or {}).values()]:
+                    for entry in builders.values():
                         methods.add(entry["method"])
                         named.update(entry["kernels"])
         self.assertEqual(methods, set(BUILDER_METHODS))

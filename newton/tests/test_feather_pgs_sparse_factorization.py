@@ -10,24 +10,26 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import sparse_factorization
+from newton._src.solvers.feather_pgs.device_preludes import cuda_native, lane_group
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseMassMatrixIndices, _SparseMassMatrixPlan
 
 
 @cache
 def _factor_kernel(dofs, nonzeros):
     """Bind the factorization without a robot-specific producer or cache."""
-    source = f"""
-#if defined(__CUDA_ARCH__)
-    const int lane=threadIdx.x, stride=blockDim.x, group=0;
+    source = cuda_native(
+        f"""    const int lane=LANE, stride=STRIDE, group=0;
     __shared__ float factor[{nonzeros}];
     if(lane==0) status.data[0]=0;
     for(int entry=lane;entry<{nonzeros};entry+=stride)factor[entry]=matrix.data[entry];
-    __syncthreads();
+    SYNC();
     {sparse_factorization._sparse_cholesky_source(dofs, nonzeros)}
-    __syncthreads();
+    SYNC();
     for(int entry=lane;entry<{nonzeros};entry+=stride)result.data[entry]=factor[entry];
 #endif
-"""
+""",
+        preludes=(lane_group(32),),
+    )
 
     @wp.func_native(source)
     def native(

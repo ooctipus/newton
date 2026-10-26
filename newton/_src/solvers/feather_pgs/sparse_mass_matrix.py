@@ -15,6 +15,7 @@ import numpy as np
 import warp as wp
 
 from . import response_operator
+from .device_preludes import dual_native, lane_group
 from .sparse_factorization import _sparse_cholesky_source, _sparse_inverse_source
 
 
@@ -318,7 +319,7 @@ def _get_crba_sparse_factor_kernel(
         ""
         if geometric
         else f"""    __shared__ float forces[{warps * n * 6}];
-    float* force = forces + warp * {n * 6};"""
+    float* force = forces + SUB * {n * 6};"""
     )
     force_storage_cpu = "" if geometric else f"""    float force[{n * 6}];"""
     prepare_mass = (
@@ -340,25 +341,21 @@ def _get_crba_sparse_factor_kernel(
 """
     )
     mass_input_type = wp.array2d[float] if geometric else wp.array[wp.spatial_matrix]
-    snippet = f"""
+    body = f"""
     const int group = tid >> 5;
     if (group >= group_to_art.shape[0]) return;
     const int art = group_to_art.data[group];
     if (mass_update_mask.data[art] == 0) return;
+    const int lane = LANE, stride = STRIDE;
 #if defined(__CUDA_ARCH__)
-    const int lane = tid & 31;
-    const int stride = 32;
-    const int warp = threadIdx.x >> 5;
     __shared__ float factors[{warps * nnz}];
     __shared__ float inverses[{warps * nnz}];
 {force_storage_cuda}
-    float* factor = factors + warp * {nnz};
-    float* inverse = inverses + warp * {nnz};
+    float* factor = factors + SUB * {nnz};
+    float* inverse = inverses + SUB * {nnz};
 
 #else
     if ((tid & 31) != 0) return;
-    const int lane = 0;
-    const int stride = 1;
     float factor[{nnz}];
     float inverse[{nnz}];
 {force_storage_cpu}
@@ -366,9 +363,7 @@ def _get_crba_sparse_factor_kernel(
     const int start = articulation_dof_start.data[art];
 {prepare_mass}
     if (lane == 0) status.data[group] = 0;
-#if defined(__CUDA_ARCH__)
-    __syncwarp();
-#endif
+    SYNC();
     for (int entry = lane; entry < {nnz}; entry += stride) {{
         const int row = indices.entry_rows.data[entry];
         const int col = indices.columns.data[entry];
@@ -384,19 +379,16 @@ def _get_crba_sparse_factor_kernel(
         }}
         factor[entry] = value;
     }}
-#if defined(__CUDA_ARCH__)
-    __syncwarp();
-#endif
+    SYNC();
     {_sparse_cholesky_source(n, nnz)}
     {_sparse_inverse_source(n)}
-#if defined(__CUDA_ARCH__)
-    __syncwarp();
-#endif
+    SYNC();
     const bool valid = status.data[group] == 0;
     for (int entry = lane; entry < {nnz}; entry += stride) {{
         Linv_group.data[group * {nnz} + entry] = valid ? inverse[entry] : NAN;
     }}
 """
+    snippet = dual_native(body, preludes=(lane_group(32),))
 
     @wp.func_native(snippet)
     def factor_native(
@@ -471,34 +463,30 @@ _RESPONSE = response_operator.SparseInverseFactor(
 
 
 @wp.func_native(
-    Template("""
+    dual_native(
+        Template("""
     const int group = tid >> 5;
     if (group >= group_to_art.shape[0]) return;
-#if defined(__CUDA_ARCH__)
-    const int lane = tid & 31;
-    const int stride = 32;
-#else
+#if !defined(__CUDA_ARCH__)
     if ((tid & 31) != 0) return;
-    const int lane = 0;
-    const int stride = 1;
 #endif
     const int n = indices.dof_count;
     const int base = group * indices.nonzero_count;
     const int start = articulation_dof_start.data[group_to_art.data[group]];
-    for (int row = lane; row < n; row += stride) {
+    for (int row = LANE; row < n; row += STRIDE) {
         $FORWARD_ACTION
         scratch.data[group * n + row] = value;
     }
-#if defined(__CUDA_ARCH__)
-    __syncwarp();
-#endif
-    for (int col = lane; col < n; col += stride) {
+    SYNC();
+    for (int col = LANE; col < n; col += STRIDE) {
         $TRANSPOSE_ACTION
         qdd.data[start + indices.permutation.data[col]] = value;
     }
 """).substitute(
-        FORWARD_ACTION=_RESPONSE.forward("row", "tau.data[start+indices.permutation.data[$index]]"),
-        TRANSPOSE_ACTION=_RESPONSE.transpose("col", "scratch.data[group*n+$index]"),
+            FORWARD_ACTION=_RESPONSE.forward("row", "tau.data[start+indices.permutation.data[$index]]"),
+            TRANSPOSE_ACTION=_RESPONSE.transpose("col", "scratch.data[group*n+$index]"),
+        ),
+        preludes=(lane_group(32),),
     )
 )
 def _solve_native(

@@ -10,23 +10,22 @@ from string import Template
 
 import warp as wp
 
+from .device_preludes import cuda_native, lane_group
+
 _FACTOR = Template("""
-#if defined(__CUDA_ARCH__)
-    const int lane = tid & 31;
     const int group = tid >> 5;
     if (group >= n_arts) return;
 
     const int articulation = group_to_art.data[group];
     if (mass_update_mask.data[articulation] == 0) return;
 
-    const int warp = threadIdx.x >> 5;
     __shared__ float factors[$FACTOR_STORAGE];
 $FORCE_STORAGE
-    float* factor = factors + warp * $ELEMENTS;
+    float* factor = factors + SUB * $ELEMENTS;
 $FORCE_POINTER
     const int dof_start = articulation_dof_start.data[articulation];
 $FORCE_INIT
-    for (int schedule_index = lane; schedule_index < $LOWER; schedule_index += 32) {
+    for (int schedule_index = LANE; schedule_index < $LOWER; schedule_index += STRIDE) {
         const int packed = lower_schedule.data[schedule_index];
         const int element = $ELEMENT;
         const int row = element / $DOFS;
@@ -44,9 +43,9 @@ $MASS_INPUT
         }
         factor[element] = value;
     }
-    __syncwarp();
+    SYNC();
 
-    if (lane == 0) {
+    if (LANE == 0) {
 #pragma unroll
         for (int col = 0; col < $DOFS; ++col) {
             float diagonal = factor[col * $DOFS + col];
@@ -68,26 +67,26 @@ $MASS_INPUT
             }
         }
     }
-    __syncwarp();
+    SYNC();
 
-    if (lane < $DOFS) {
+    if (LANE < $DOFS) {
         const int factor_base = group * $ELEMENTS;
 #pragma unroll
-        for (int col = 0; col <= lane; ++col)
-            L_group.data[factor_base + lane * $DOFS + col] = factor[lane * $DOFS + col];
+        for (int col = 0; col <= LANE; ++col)
+            L_group.data[factor_base + LANE * $DOFS + col] = factor[LANE * $DOFS + col];
     }
 #endif
 """)
 
 _FORCE_INIT = Template("""
-    if (lane < $DOFS) {
-        const int joint = articulation_start.data[articulation] + dof_joint_offset.data[lane];
-        const auto force = wp::mul(body_I_c.data[joint_child.data[joint]], joint_S_s.data[dof_start + lane]);
+    if (LANE < $DOFS) {
+        const int joint = articulation_start.data[articulation] + dof_joint_offset.data[LANE];
+        const auto force = wp::mul(body_I_c.data[joint_child.data[joint]], joint_S_s.data[dof_start + LANE]);
         #pragma unroll
         for (int component = 0; component < 6; ++component)
-            force_components[lane * 6 + component] = force.c[component];
+            force_components[LANE * 6 + component] = force.c[component];
     }
-    __syncwarp();
+    SYNC();
 """)
 
 _COMPOSITE_INPUT = """
@@ -183,10 +182,11 @@ def get_kernel(
         FACTOR_STORAGE=warps_per_block * elements,
         LOWER=size * (size + 1) // 2,
         FORCE_STORAGE="" if geometric else f"    __shared__ float forces[{warps_per_block * size * 6}];",
-        FORCE_POINTER="" if geometric else f"    float* force_components = forces + warp * {size * 6};",
+        FORCE_POINTER="" if geometric else f"    float* force_components = forces + SUB * {size * 6};",
         FORCE_INIT="" if geometric else _FORCE_INIT.substitute(DOFS=size),
         MASS_INPUT=mass_input,
     )
+    snippet = cuda_native(snippet, preludes=(lane_group(32),))
     name = f"{'geometric_' if geometric else ''}crba_cholesky_warp{warps_per_block}_{size}"
     signature = ",\n    ".join(inputs)
     arguments = ", ".join(item.split(":")[0] for item in inputs)

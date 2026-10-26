@@ -127,10 +127,6 @@ def launch_masked(values, device):
     jacobian = wp.full((1, values["world_row_type"].shape[1], 3), -9.0, dtype=float, device=device)
     values.update(
         total_threads=3 * count,
-        world_constraint_count=wp.zeros(1, dtype=int, device=device),
-        mf_constraint_count=wp.zeros(1, dtype=int, device=device),
-        owned_rows_le=0,
-        contact_friction_anchor_limit=0,
         pre_flags=wp.full(count, -9, dtype=int, device=device),
         J_group_a=jacobian,
         J_group_b=jacobian,
@@ -193,15 +189,12 @@ class TestContactReservations(unittest.TestCase):
 
                 # Main's point allocator reserves all three rows for each eligible contact.
                 values, _ = metadata_inputs(device, [3, 3, 3], [0.0, 0.0, 0.0])
+                self.assertEqual(solver.contact_friction_anchor_limit, 0)
                 values.update(
                     total_threads=9,
-                    world_constraint_count=wp.array([9], dtype=int, device=device),
-                    mf_constraint_count=wp.zeros(1, dtype=int, device=device),
-                    owned_rows_le=0,
                     size_a=18,
                     size_b=-1,
                     articulation_response_dof_count=wp.array([18], dtype=int, device=device),
-                    contact_friction_anchor_limit=solver.contact_friction_anchor_limit,
                     pre_flags=wp.full(3, -9, dtype=int, device=device),
                 )
                 wp.launch(

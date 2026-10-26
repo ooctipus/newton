@@ -21,6 +21,7 @@ import warp as wp
 
 from ...sim import ModelFlags
 from .contact_input import ContactInput, bind
+from .device_preludes import dual_native, lane_group
 from .friction_patches import PatchRowLaw
 from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 from .keyed_row_layout import prefix_kernel
@@ -250,20 +251,7 @@ __PREFIX__
             }
         }
         if (materials) { mu /= static_cast<float>(materials); restitution /= static_cast<float>(materials); }
-        float friction = mu * c.friction_scale;
-        const bool filter = c.friction_pairs_only == 0 || (aa >= 0 && ab >= 0 && c.is_free.data[aa] == 0 && c.is_free.data[ab] == 0);
-        if (r > 0 && filter && c.friction_anchor_limit > 0) {
-            const int total = c.count.data[0];
-            int rank = 0;
-            for (int look = 1; look <= 8; ++look) {
-                const int prev = contact - look;
-                if (prev < 0 || prev >= total) break;
-                if (c.shape0.data[prev] != sa || c.shape1.data[prev] != sb) break;
-                ++rank;
-            }
-            const int next = contact + 1;
-            if (rank > 0 || (next < total && c.shape0.data[next] == sa && c.shape1.data[next] == sb)) friction *= 0.5f;
-        }
+        const float friction = mu * c.friction_scale;
 __PROJECTION__
         const float phi = r == 0 ? separation : 0.0f;
         float rhs = -target;
@@ -308,13 +296,8 @@ def _fallback_source(layout, *, patch=False):
     source = (
         """
     if (counts.data[world] <= $LIMIT && mf_counts.data[world] == 0) return;
-#if defined(__CUDA_ARCH__)
-    const int lane = threadIdx.x, stride = blockDim.x;
-#else
-    const int lane = 0, stride = 1;
-#endif
     const int ga = z.maps.groups.data[world * 2], gb = z.maps.groups.data[world * 2 + 1];
-    for (int row = lane; row < counts.data[world]; row += stride) {
+    for (int row = LANE; row < counts.data[world]; row += STRIDE) {
         float Jr[$DOFS];
 """
         + _row_source(layout=layout, patch=patch)
@@ -338,7 +321,8 @@ def _fallback_source(layout, *, patch=False):
         "$LOCAL_B": local_b,
     }.items():
         source = source.replace(key, str(value))
-    return source
+    # A warp per world on CUDA (launched in blocks of 32), one thread on the CPU.
+    return dual_native(source, preludes=(lane_group(32),))
 
 
 @cache
@@ -349,7 +333,6 @@ def get_fallback_kernel(layout):
     @wp.func_native(source)
     def native(
         world: int,
-        logical_lane: int,
         z: KineticRows,
         counts: wp.array[int],
         mf_counts: wp.array[int],
@@ -361,8 +344,8 @@ def get_fallback_kernel(layout):
     def keyed_rows_fallback(
         z: KineticRows, counts: wp.array[int], mf_counts: wp.array[int], J16: wp.array3d[float], J6: wp.array3d[float]
     ):
-        world, lane = wp.tid()
-        native(world, lane, z, counts, mf_counts, J16, J6)
+        world, _lane = wp.tid()
+        native(world, z, counts, mf_counts, J16, J6)
 
     return keyed_rows_fallback
 
@@ -375,7 +358,6 @@ def get_patch_fallback_kernel(layout):
     @wp.func_native(source)
     def native(
         world: int,
-        logical_lane: int,
         z: KineticRows,
         patch_law: PatchRowLaw,
         counts: wp.array[int],
@@ -393,8 +375,8 @@ def get_patch_fallback_kernel(layout):
         J16: wp.array3d[float],
         J6: wp.array3d[float],
     ):
-        world, lane = wp.tid()
-        native(world, lane, z, patch_law, counts, mf_counts, J16, J6)
+        world, _lane = wp.tid()
+        native(world, z, patch_law, counts, mf_counts, J16, J6)
 
     return keyed_rows_patch_fallback
 
@@ -662,9 +644,6 @@ def create_owner(solver):
         and solver._contact_w == 1.0
         and not solver._debug_buffers_enabled
         and source._INK_ON
-        and not source._INK_CHECK
-        and not source._CHECK_ROWS
-        and not source._FPGS_CAPTURE
     )
     if not supported:
         return None

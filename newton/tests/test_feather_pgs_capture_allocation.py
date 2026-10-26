@@ -68,7 +68,6 @@ class TestFeatherPGSTierPlaceholders(unittest.TestCase):
         solver = SimpleNamespace(
             model=SimpleNamespace(device=device),
             world_count=3,
-            pgs_warmstart_decay=0.5,
             row_cfm=wp.zeros((3, 4), dtype=float, device=device),
             _ink_sizes=None,
         )
@@ -82,19 +81,11 @@ class TestFeatherPGSTierPlaceholders(unittest.TestCase):
 
         with patch.object(wp, "zeros", allocate):
             ink = SolverFeatherPGS._inkernel_response_inputs(solver)
-            rows = SolverFeatherPGS._world_rows_inputs(solver)
-            again = SolverFeatherPGS._world_rows_inputs(solver)
+            again = SolverFeatherPGS._inkernel_response_inputs(solver)
         self.assertEqual(allocated, [])
         self.assertEqual(ink[0].shape, (4,))
         self.assertTrue(all(array is solver._ink_dummy3 for array in ink[1:5]))
-        # The warm-start table's placeholders: count, two shape tables, points and impulses.
-        table = rows[-6:-1]
-        self.assertTrue(all(a is b for a, b in zip(table, again[-6:-1], strict=True)))
-        self.assertEqual([array.shape[0] for array in table], [1, 1, 1, 1, 1])
-        self.assertEqual(rows[-1], 0.5)
-        for value in rows[:-6]:
-            if isinstance(value, wp.array):
-                self.assertTrue(any(value is placeholder for placeholder in solver._wr_dummies.values()))
+        self.assertTrue(all(a is b for a, b in zip(ink, again, strict=True)))
 
 
 @unittest.skipUnless(wp.is_cuda_available(), "Parallel matrix-free tiers require CUDA")

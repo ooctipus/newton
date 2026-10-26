@@ -544,7 +544,7 @@ def torque_sweep_source(dofs):
                             }}
                         }}
                         sliding_used += sqrtf(t1 * t1 + t2 * t2);
-                        __syncwarp();
+                        SYNC();
                     }}
                 }}
                 float bound = radius * fmaxf(normal_budget - sliding_used, 0.0f);
@@ -553,12 +553,8 @@ def torque_sweep_source(dofs):
                 float dot = 0.0f;
                 for (int d = lane; d < {dofs}; d += 32)
                     dot += J_world.data[jy_world_base + spin * {dofs} + d] * s_v[d];
-                dot += __shfl_down_sync(MASK, dot, 16);
-                dot += __shfl_down_sync(MASK, dot, 8);
-                dot += __shfl_down_sync(MASK, dot, 4);
-                dot += __shfl_down_sync(MASK, dot, 2);
-                dot += __shfl_down_sync(MASK, dot, 1);
-                float residual = __shfl_sync(MASK, dot, 0) + rhs_bias.data[off_dense + spin];
+                SUM(dot);
+                float residual = dot + rhs_bias.data[off_dense + spin];
                 float old = s_lam_dense[spin];
                 float diagonal = world_diag.data[off_dense + spin];
                 float trial = diagonal > 0.0f ? old - omega * residual / diagonal : 0.0f;
@@ -570,7 +566,7 @@ def torque_sweep_source(dofs):
                     for (int d = lane; d < {dofs}; d += 32)
                         s_v[d] += Y_world.data[jy_world_base + spin * {dofs} + d] * delta;
                 }}
-                __syncwarp();
+                SYNC();
             }}
         }}
 """

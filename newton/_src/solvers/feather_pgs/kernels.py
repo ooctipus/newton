@@ -25,6 +25,16 @@ from ...sim.articulation import (
     eval_single_articulation_fk,
 )
 from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
+from .device_preludes import (
+    dual_native,
+    lane_group,
+    lane_minimum,
+    reserve,
+    reserved_count,
+    warp_scan,
+    warp_sum,
+    warp_sync,
+)
 from .friction import friction_pair_candidate
 from .friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, contact_tangent_basis, patch_normal_load
 
@@ -207,24 +217,6 @@ def _prescaled_axis_count(
     return joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1]
 
 
-@wp.func_native("""
-#if defined(__CUDA_ARCH__)
-    for (int offset = lanes >> 1; offset > 0; offset >>= 1) {
-        const float other = __shfl_xor_sync(0xffffffffu, ratio, offset);
-        if (other < ratio)
-            ratio = other;
-    }
-#endif
-    return ratio;
-""")
-def _articulation_lane_min(ratio: float, lanes: int) -> float:
-    """Return the smallest ``ratio`` of an aligned group of ``lanes`` CUDA lanes; one lane on CPU.
-
-    Every lane of a complete warp must call it with the same power-of-two
-    ``lanes``.
-    """
-
-
 @wp.kernel(enable_backward=False)
 def prescale_joint_velocity_limits(
     articulation_count: int,
@@ -294,7 +286,7 @@ def prescale_joint_velocity_limits(
                 if scale < ratio:
                     ratio = scale
     # Padding lanes past the last articulation take part with ratio 1.
-    ratio = _articulation_lane_min(ratio, lanes)
+    ratio = lane_minimum(ratio, lanes)
 
     if art == 0:
         # Joints ahead of the first articulation keep their velocity.
@@ -1467,15 +1459,6 @@ def eval_rigid_fk_id(
     fk_id_cache_valid[index] = 1
 
 
-@wp.func_native("""
-#if defined(__CUDA_ARCH__)
-    __syncwarp();
-#endif
-""")
-def _tree_warp_sync():
-    """Order dependent tree levels within one complete CUDA warp."""
-
-
 @cache
 def _get_tree_fk_kernel(lanes: int, mode: str):
     """Build a cooperative tree traversal without replacing its per-joint mathematics.
@@ -1554,7 +1537,7 @@ def _get_tree_fk_kernel(lanes: int, mode: str):
                             )
                         segment += lanes
                 if wp.static(lanes > 1):
-                    _tree_warp_sync()
+                    warp_sync()
 
         return tree_fk_public
 
@@ -1642,7 +1625,7 @@ def _get_tree_fk_kernel(lanes: int, mode: str):
                         origin = wp.transform_point(body_q[root_body], body_com[root_body])
                 articulation_origin[articulation] = origin
         if wp.static(lanes > 1):
-            _tree_warp_sync()
+            warp_sync()
 
         origin = wp.vec3()
         write_body_inertia = materialize_all_body_inertia
@@ -1738,7 +1721,7 @@ def _get_tree_fk_kernel(lanes: int, mode: str):
                     segment += lanes
             # Inactive groups still participate in every full-warp barrier.
             if wp.static(lanes > 1):
-                _tree_warp_sync()
+                warp_sync()
         if active and local == 0:
             fk_id_cache_valid[articulation] = 1
 
@@ -1987,7 +1970,7 @@ def _get_tree_tau_kernel(lanes: int):
                     segment += lanes
             # Tau is never skipped on FK cache hits: controls and wrenches can change.
             if wp.static(lanes > 1):
-                _tree_warp_sync()
+                warp_sync()
 
     return tree_tau
 
@@ -2759,16 +2742,12 @@ def _contact_linear_force(
     contact_path: wp.array[wp.int32],
     world_impulses: wp.array2d[wp.float32],
     mf_impulses: wp.array2d[wp.float32],
-    propagation_impulses: wp.array2d[wp.float32],
     world_constraint_count: wp.array[wp.int32],
     mf_constraint_count: wp.array[wp.int32],
-    propagation_constraint_count: wp.array[wp.int32],
     world_row_type: wp.array2d[wp.int32],
     world_row_parent: wp.array2d[wp.int32],
     mf_row_type: wp.array2d[wp.int32],
     mf_row_parent: wp.array2d[wp.int32],
-    propagation_row_type: wp.array2d[wp.int32],
-    propagation_row_parent: wp.array2d[wp.int32],
     enable_friction: int,
     inv_dt: float,
     # outputs
@@ -2819,19 +2798,6 @@ def _contact_linear_force(
             ):
                 lam_t0 = mf_impulses[world, slot + 1]
                 lam_t1 = mf_impulses[world, slot + 2]
-        elif path == 2:
-            lam_n = propagation_impulses[world, slot]
-            count = propagation_constraint_count[world]
-            if (
-                enable_friction != 0
-                and slot + 2 < count
-                and propagation_row_type[world, slot + 1] == PGS_CONSTRAINT_TYPE_FRICTION
-                and propagation_row_parent[world, slot + 1] == slot
-                and propagation_row_type[world, slot + 2] == PGS_CONSTRAINT_TYPE_FRICTION
-                and propagation_row_parent[world, slot + 2] == slot
-            ):
-                lam_t0 = propagation_impulses[world, slot + 1]
-                lam_t1 = propagation_impulses[world, slot + 2]
 
         force = lam_n * normal
         if enable_friction != 0:
@@ -2851,16 +2817,12 @@ def compute_contact_linear_force_from_impulses(
     contact_path: wp.array[wp.int32],
     world_impulses: wp.array2d[wp.float32],
     mf_impulses: wp.array2d[wp.float32],
-    propagation_impulses: wp.array2d[wp.float32],
     world_constraint_count: wp.array[wp.int32],
     mf_constraint_count: wp.array[wp.int32],
-    propagation_constraint_count: wp.array[wp.int32],
     world_row_type: wp.array2d[wp.int32],
     world_row_parent: wp.array2d[wp.int32],
     mf_row_type: wp.array2d[wp.int32],
     mf_row_parent: wp.array2d[wp.int32],
-    propagation_row_type: wp.array2d[wp.int32],
-    propagation_row_parent: wp.array2d[wp.int32],
     enable_friction: int,
     inv_dt: float,
     # outputs
@@ -2876,16 +2838,12 @@ def compute_contact_linear_force_from_impulses(
         contact_path,
         world_impulses,
         mf_impulses,
-        propagation_impulses,
         world_constraint_count,
         mf_constraint_count,
-        propagation_constraint_count,
         world_row_type,
         world_row_parent,
         mf_row_type,
         mf_row_parent,
-        propagation_row_type,
-        propagation_row_parent,
         enable_friction,
         inv_dt,
         rigid_contact_force,
@@ -3170,6 +3128,7 @@ def allocate_physx_drive_slots(
     # outputs
     drive_slot: wp.array[int],
     world_slot_counter: wp.array[int],
+    first_rejected_slot: wp.array[int],
 ):
     """Allocate one dense PhysX-style drive row for each driven scalar DOF."""
     art = wp.tid()
@@ -3200,9 +3159,7 @@ def allocate_physx_drive_slots(
             if stiffness <= 0.0 and damping <= 0.0:
                 continue
 
-            slot = wp.atomic_add(world_slot_counter, world, 1)
-            if slot < max_constraints:
-                drive_slot[dof] = slot
+            drive_slot[dof] = reserve(world_slot_counter, world, 1, max_constraints, first_rejected_slot)
 
 
 @wp.kernel
@@ -3445,6 +3402,7 @@ def build_joint_limit_rows_for_size(
     resolved_worlds: wp.array[int],
     # outputs
     world_slot_counter: wp.array[int],
+    first_rejected_slot: wp.array[int],
     J_group: wp.array3d[float],
     world_row_type: wp.array2d[int],
     world_row_parent: wp.array2d[int],
@@ -3489,8 +3447,8 @@ def build_joint_limit_rows_for_size(
                 if not active:
                     continue
 
-                slot = wp.atomic_add(world_slot_counter, world, 1)
-                if slot >= max_constraints:
+                slot = reserve(world_slot_counter, world, 1, max_constraints, first_rejected_slot)
+                if slot < 0:
                     continue
 
                 J_group[group_idx, slot, local_dof] = sign
@@ -3530,6 +3488,7 @@ def allocate_mimic_slots(
     # outputs
     mimic_slot: wp.array[int],
     world_slot_counter: wp.array[int],
+    first_rejected_slot: wp.array[int],
 ):
     """Allocate one dense constraint slot per enabled, valid mimic constraint.
 
@@ -3542,9 +3501,7 @@ def allocate_mimic_slots(
         return
     if not mimic_enabled[k]:
         return
-    slot = wp.atomic_add(world_slot_counter, mimic_world[k], 1)
-    if slot < max_constraints:
-        mimic_slot[k] = slot
+    mimic_slot[k] = reserve(world_slot_counter, mimic_world[k], 1, max_constraints, first_rejected_slot)
 
 
 @wp.kernel
@@ -3643,6 +3600,7 @@ def allocate_connect_slots(
     # outputs
     connect_slot: wp.array[int],
     world_slot_counter: wp.array[int],
+    first_rejected_slot: wp.array[int],
 ):
     """Allocate three consecutive dense slots per enabled, valid loop closure.
 
@@ -3653,9 +3611,7 @@ def allocate_connect_slots(
     connect_slot[k] = -1
     if connect_valid[k] == 0 or connect_enabled[k] == 0:
         return
-    slot = wp.atomic_add(world_slot_counter, connect_world[k], 3)
-    if slot + 2 < max_constraints:
-        connect_slot[k] = slot
+    connect_slot[k] = reserve(world_slot_counter, connect_world[k], 3, max_constraints, first_rejected_slot)
 
 
 @wp.kernel
@@ -4099,6 +4055,7 @@ def allocate_joint_velocity_limit_slots(
     velocity_limit_slot: wp.array[int],
     velocity_limit_sign: wp.array[float],
     world_slot_counter: wp.array[int],
+    first_rejected_slot: wp.array[int],
 ):
     """Allocate lower/upper velocity-limit rows for every finitely limited DOF.
 
@@ -4195,21 +4152,19 @@ def allocate_joint_velocity_limit_slots(
 
     if n_eligible == 0:
         return
-    base = wp.atomic_add(world_slot_counter, world, 2 * n_eligible)
-    slot = base
+    # One reservation per articulation: its pairs fit together or none of them does.
+    slot = reserve(world_slot_counter, world, 2 * n_eligible, max_constraints, first_rejected_slot)
     for d in range(dof_count):
         dof = dof_base + d
         lower_idx = 2 * dof
         if velocity_limit_sign[lower_idx] != 1.0:
             continue
-        upper_idx = lower_idx + 1
-        if slot < max_constraints:
-            velocity_limit_slot[lower_idx] = slot
-        else:
+        if slot < 0:
             velocity_limit_sign[lower_idx] = 0.0
-        if slot + 1 < max_constraints:
-            velocity_limit_slot[upper_idx] = slot + 1
-            velocity_limit_sign[upper_idx] = -1.0
+            continue
+        velocity_limit_slot[lower_idx] = slot
+        velocity_limit_slot[lower_idx + 1] = slot + 1
+        velocity_limit_sign[lower_idx + 1] = -1.0
         slot += 2
 
 
@@ -4290,7 +4245,6 @@ def populate_joint_velocity_limit_J_for_size(
 @wp.func
 def _allocate_world_contact_slot(
     c: int,
-    total_contacts: int,
     contact_shape0: wp.array[int],
     contact_shape1: wp.array[int],
     contact_point0: wp.array[wp.vec3],
@@ -4299,7 +4253,6 @@ def _allocate_world_contact_slot(
     contact_thickness0: wp.array[float],
     contact_thickness1: wp.array[float],
     body_q: wp.array[wp.transform],
-    shape_transform: wp.array[wp.transform],
     shape_body: wp.array[int],
     body_to_articulation: wp.array[int],
     art_to_world: wp.array[int],
@@ -4308,15 +4261,11 @@ def _allocate_world_contact_slot(
     body_has_response_dofs: wp.array[int],
     is_free_rigid: wp.array[int],
     has_free_rigid: int,
-    propagation_articulated_contacts: int,
-    propagation_same_articulation: int,
-    propagation_free_free: int,
     contact_gap_gate: float,
     same_articulation_contact_gap_gate: float,
     articulation_pair_contact_gap_gate: float,
     max_constraints: int,
     mf_max_constraints: int,
-    propagation_max_constraints: int,
     enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_articulation_pairs_only: int,
@@ -4330,16 +4279,11 @@ def _allocate_world_contact_slot(
     world_slot_counter: wp.array[int],
     contact_path: wp.array[int],
     mf_slot_counter: wp.array[int],
-    propagation_slot_counter: wp.array[int],
-    dense_contact_world_flag: wp.array[int],
     contact_slots_needed: wp.array[int],
     dense_dropped_contact_rows: wp.array[int],
     mf_dropped_contact_rows: wp.array[int],
-    propagation_dropped_contact_rows: wp.array[int],
     dense_first_rejected_slot: wp.array[int],
     mf_first_rejected_slot: wp.array[int],
-    propagation_first_rejected_slot: wp.array[int],
-    capacity_status: wp.array[int],
 ):
     """Classify and allocate rows for one active contact.
 
@@ -4446,35 +4390,12 @@ def _allocate_world_contact_slot(
         return
 
     # Classify: MF path if both sides are free rigid or ground.
-    # Propagation path is an opt-in matrix-free route for any contact touching a
-    # non-free articulation. It stores fixed-size body-space rows instead of
-    # D-wide generalized rows.
     is_mf = 0
-    is_propagation = 0
-    a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
-    b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
     if has_free_rigid != 0:
         a_is_mf_compatible = not a_has_dofs or is_free_rigid[art_a] != 0
         b_is_mf_compatible = not b_has_dofs or is_free_rigid[art_b] != 0
         if a_is_mf_compatible and b_is_mf_compatible:
             is_mf = 1
-    if propagation_free_free != 0 and is_mf == 1:
-        # Opt-in: route free/free (and free/ground) contact rows to the
-        # propagation family. The row math is identical (free bodies use the
-        # plain spatial inverse inertia response seeded by
-        # copy_free_rigid_propagation_body_response); this puts pile rows on
-        # the colored solve path. Velocity-limit rows stay on the MF family.
-        is_mf = 0
-        is_propagation = 1
-    if propagation_articulated_contacts != 0 and is_mf == 0 and is_propagation == 0:
-        # Same-articulation two-link contacts need cross response terms between
-        # the two touched links. They route to propagation rows only when the
-        # cross-response path is enabled; otherwise they stay on the dense
-        # generalized-row path.
-        same_non_free_articulation = a_non_free and b_non_free and art_a == art_b
-        if a_non_free or b_non_free:
-            if propagation_same_articulation != 0 or not same_non_free_articulation:
-                is_propagation = 1
 
     # Every normal survives; only the selected patch anchors receive tangent rows.
     slots_needed = 1
@@ -4489,10 +4410,8 @@ def _allocate_world_contact_slot(
 
     if is_mf != 0:
         # Matrix-free path
-        slot = wp.atomic_add(mf_slot_counter, world, slots_needed)
-        if slot + slots_needed > mf_max_constraints:
-            wp.atomic_min(mf_first_rejected_slot, world, slot)
-            wp.atomic_max(capacity_status, 1, 1)
+        slot = reserve(mf_slot_counter, world, slots_needed, mf_max_constraints, mf_first_rejected_slot)
+        if slot < 0:
             if row_capacity_telemetry != 0:
                 wp.atomic_add(mf_dropped_contact_rows, world, slots_needed)
             contact_slot[c] = -1
@@ -4503,28 +4422,10 @@ def _allocate_world_contact_slot(
         contact_art_a[c] = art_a
         contact_art_b[c] = art_b
         contact_path[c] = 1
-    elif is_propagation != 0:
-        # Propagation articulated matrix-free path
-        slot = wp.atomic_add(propagation_slot_counter, world, slots_needed)
-        if slot + slots_needed > propagation_max_constraints:
-            wp.atomic_min(propagation_first_rejected_slot, world, slot)
-            wp.atomic_max(capacity_status, 2, 1)
-            if row_capacity_telemetry != 0:
-                wp.atomic_add(propagation_dropped_contact_rows, world, slots_needed)
-            contact_slot[c] = -1
-            contact_path[c] = -1
-            return
-        contact_world[c] = world
-        contact_slot[c] = slot
-        contact_art_a[c] = art_a
-        contact_art_b[c] = art_b
-        contact_path[c] = 2
     else:
         # Dense path
-        slot = wp.atomic_add(world_slot_counter, world, slots_needed)
-        if slot + slots_needed > max_constraints:
-            wp.atomic_min(dense_first_rejected_slot, world, slot)
-            wp.atomic_max(capacity_status, 0, 1)
+        slot = reserve(world_slot_counter, world, slots_needed, max_constraints, dense_first_rejected_slot)
+        if slot < 0:
             if row_capacity_telemetry != 0:
                 wp.atomic_add(dense_dropped_contact_rows, world, slots_needed)
             contact_slot[c] = -1
@@ -4535,9 +4436,6 @@ def _allocate_world_contact_slot(
         contact_art_a[c] = art_a
         contact_art_b[c] = art_b
         contact_path[c] = 0
-        # Dense contact rows write articulated generalized velocities during
-        # split GS phases; propagation tree refresh keys off this per world.
-        dense_contact_world_flag[world] = 1
 
 
 @wp.func
@@ -4680,7 +4578,6 @@ def allocate_world_contact_slots(
     contact_thickness0: wp.array[float],
     contact_thickness1: wp.array[float],
     body_q: wp.array[wp.transform],
-    shape_transform: wp.array[wp.transform],
     shape_body: wp.array[int],
     body_to_articulation: wp.array[int],
     art_to_world: wp.array[int],
@@ -4689,15 +4586,11 @@ def allocate_world_contact_slots(
     body_has_response_dofs: wp.array[int],
     is_free_rigid: wp.array[int],
     has_free_rigid: int,
-    propagation_articulated_contacts: int,
-    propagation_same_articulation: int,
-    propagation_free_free: int,
     contact_gap_gate: float,
     same_articulation_contact_gap_gate: float,
     articulation_pair_contact_gap_gate: float,
     max_constraints: int,
     mf_max_constraints: int,
-    propagation_max_constraints: int,
     enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_articulation_pairs_only: int,
@@ -4712,16 +4605,11 @@ def allocate_world_contact_slots(
     world_slot_counter: wp.array[int],
     contact_path: wp.array[int],
     mf_slot_counter: wp.array[int],
-    propagation_slot_counter: wp.array[int],
-    dense_contact_world_flag: wp.array[int],
     contact_slots_needed: wp.array[int],
     dense_dropped_contact_rows: wp.array[int],
     mf_dropped_contact_rows: wp.array[int],
-    propagation_dropped_contact_rows: wp.array[int],
     dense_first_rejected_slot: wp.array[int],
     mf_first_rejected_slot: wp.array[int],
-    propagation_first_rejected_slot: wp.array[int],
-    capacity_status: wp.array[int],
 ):
     """Allocate active contacts with work proportional to the materialized prefix.
 
@@ -4765,7 +4653,6 @@ def allocate_world_contact_slots(
                 continue
         _allocate_world_contact_slot(
             c,
-            total_contacts,
             contact_shape0,
             contact_shape1,
             contact_point0,
@@ -4774,7 +4661,6 @@ def allocate_world_contact_slots(
             contact_thickness0,
             contact_thickness1,
             body_q,
-            shape_transform,
             shape_body,
             body_to_articulation,
             art_to_world,
@@ -4783,15 +4669,11 @@ def allocate_world_contact_slots(
             body_has_response_dofs,
             is_free_rigid,
             has_free_rigid,
-            propagation_articulated_contacts,
-            propagation_same_articulation,
-            propagation_free_free,
             contact_gap_gate,
             same_articulation_contact_gap_gate,
             articulation_pair_contact_gap_gate,
             max_constraints,
             mf_max_constraints,
-            propagation_max_constraints,
             enable_friction,
             contact_friction_gap_threshold,
             contact_friction_articulation_pairs_only,
@@ -4804,16 +4686,11 @@ def allocate_world_contact_slots(
             world_slot_counter,
             contact_path,
             mf_slot_counter,
-            propagation_slot_counter,
-            dense_contact_world_flag,
             contact_slots_needed,
             dense_dropped_contact_rows,
             mf_dropped_contact_rows,
-            propagation_dropped_contact_rows,
             dense_first_rejected_slot,
             mf_first_rejected_slot,
-            propagation_first_rejected_slot,
-            capacity_status,
         )
 
 
@@ -4833,7 +4710,6 @@ def allocate_world_contact_slots_patch_resolved(
     contact_thickness0: wp.array[float],
     contact_thickness1: wp.array[float],
     body_q: wp.array[wp.transform],
-    shape_transform: wp.array[wp.transform],
     shape_body: wp.array[int],
     body_to_articulation: wp.array[int],
     art_to_world: wp.array[int],
@@ -4842,15 +4718,11 @@ def allocate_world_contact_slots_patch_resolved(
     body_has_response_dofs: wp.array[int],
     is_free_rigid: wp.array[int],
     has_free_rigid: int,
-    propagation_articulated_contacts: int,
-    propagation_same_articulation: int,
-    propagation_free_free: int,
     contact_gap_gate: float,
     same_articulation_contact_gap_gate: float,
     articulation_pair_contact_gap_gate: float,
     max_constraints: int,
     mf_max_constraints: int,
-    propagation_max_constraints: int,
     enable_friction: int,
     contact_friction_gap_threshold: float,
     contact_friction_articulation_pairs_only: int,
@@ -4865,16 +4737,11 @@ def allocate_world_contact_slots_patch_resolved(
     world_slot_counter: wp.array[int],
     contact_path: wp.array[int],
     mf_slot_counter: wp.array[int],
-    propagation_slot_counter: wp.array[int],
-    dense_contact_world_flag: wp.array[int],
     contact_slots_needed: wp.array[int],
     dense_dropped_contact_rows: wp.array[int],
     mf_dropped_contact_rows: wp.array[int],
-    propagation_dropped_contact_rows: wp.array[int],
     dense_first_rejected_slot: wp.array[int],
     mf_first_rejected_slot: wp.array[int],
-    propagation_first_rejected_slot: wp.array[int],
-    capacity_status: wp.array[int],
 ):
     """Allocate active contacts with work proportional to the materialized prefix.
 
@@ -4941,7 +4808,6 @@ def allocate_world_contact_slots_patch_resolved(
                 continue
         _allocate_world_contact_slot(
             c,
-            total_contacts,
             contact_shape0,
             contact_shape1,
             contact_point0,
@@ -4950,7 +4816,6 @@ def allocate_world_contact_slots_patch_resolved(
             contact_thickness0,
             contact_thickness1,
             body_q,
-            shape_transform,
             shape_body,
             body_to_articulation,
             art_to_world,
@@ -4959,15 +4824,11 @@ def allocate_world_contact_slots_patch_resolved(
             body_has_response_dofs,
             is_free_rigid,
             has_free_rigid,
-            propagation_articulated_contacts,
-            propagation_same_articulation,
-            propagation_free_free,
             contact_gap_gate,
             same_articulation_contact_gap_gate,
             articulation_pair_contact_gap_gate,
             max_constraints,
             mf_max_constraints,
-            propagation_max_constraints,
             enable_friction,
             contact_friction_gap_threshold,
             contact_friction_articulation_pairs_only,
@@ -4980,16 +4841,11 @@ def allocate_world_contact_slots_patch_resolved(
             world_slot_counter,
             contact_path,
             mf_slot_counter,
-            propagation_slot_counter,
-            dense_contact_world_flag,
             contact_slots_needed,
             dense_dropped_contact_rows,
             mf_dropped_contact_rows,
-            propagation_dropped_contact_rows,
             dense_first_rejected_slot,
             mf_first_rejected_slot,
-            propagation_first_rejected_slot,
-            capacity_status,
         )
 
 
@@ -5018,14 +4874,16 @@ def _contact_run_block(shape: int, global_lead: int, global_trail_start: int) ->
     return global_lead + 1 + shape - global_trail_start
 
 
-@wp.func_native("""
+@wp.func_native(
+    dual_native(
+        """
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     // The lanes of one warp iteration hold ascending contacts; the lanes of one run form a group,
     // whose lowest lane records the group's first and last contact and rows.
     const unsigned group = __match_any_sync(0xffffffffu, key);
-    const int leader = __ffs(group) - 1;
-    const int first = __shfl_sync(0xffffffffu, contact, leader);
-    const int last = __shfl_sync(0xffffffffu, contact, 31 - __clz(group));
+    const int leader = FIRST(group);
+    const int first = READ(contact, leader);
+    const int last = READ(contact, 31 - __clz(group));
 #if __CUDA_ARCH__ >= 800
     const int dense_rows = __reduce_add_sync(group, dense);
     const int mf_rows = __reduce_add_sync(group, mf);
@@ -5033,15 +4891,15 @@ def _contact_run_block(shape: int, global_lead: int, global_trail_start: int) ->
     int dense_rows = 0;
     int mf_rows = 0;
     for (int source = 0; source < 32; ++source) {
-        const int source_dense = __shfl_sync(0xffffffffu, dense, source);
-        const int source_mf = __shfl_sync(0xffffffffu, mf, source);
+        const int source_dense = READ(dense, source);
+        const int source_mf = READ(mf, source);
         if (group & (1u << source)) {
             dense_rows += source_dense;
             mf_rows += source_mf;
         }
     }
 #endif
-    if (key >= 0 && (int)(threadIdx.x & 31) == leader) {
+    if (key >= 0 && LANE == leader) {
         atomicMin(&run_first.data[key], first);
         atomicMax(&run_last.data[key], last);
         if (dense_rows != 0)
@@ -5066,7 +4924,10 @@ def _contact_run_block(shape: int, global_lead: int, global_trail_start: int) ->
         run_rows.data[key].c[1] += mf;
     }
 #endif
-""")
+""",
+        preludes=(lane_group(32),),
+    )
+)
 def _record_contact_run(
     key: int,
     contact: int,
@@ -5128,44 +4989,6 @@ def record_world_contact_runs(
         _record_contact_run(key, c, dense, mf, run_first, run_last, run_rows)
 
 
-@wp.func_native("""
-#if defined(__CUDA_ARCH__)
-    const int lane = threadIdx.x & 31;
-    int sum = value;
-    for (int offset = 1; offset < 32; offset <<= 1) {
-        const int lower = __shfl_up_sync(0xffffffffu, sum, offset);
-        if (lane >= offset)
-            sum += lower;
-    }
-    return sum - value;
-#else
-    return 0;
-#endif
-""")
-def _warp_sum_below(value: int) -> int:
-    """Sum ``value`` over the lower lanes of this lane's complete CUDA warp; 0 on CPU, where a thread is alone.
-
-    Every lane of the warp must call it.
-    """
-
-
-@wp.func_native("""
-#if defined(__CUDA_ARCH__)
-    int sum = value;
-    for (int offset = 16; offset > 0; offset >>= 1)
-        sum += __shfl_xor_sync(0xffffffffu, sum, offset);
-    return sum;
-#else
-    return value;
-#endif
-""")
-def _warp_sum(value: int) -> int:
-    """Sum ``value`` over this lane's complete CUDA warp; ``value`` on CPU, where a thread is alone.
-
-    Every lane of the warp must call it.
-    """
-
-
 @wp.kernel(enable_backward=False)
 def place_world_contact_runs(
     contact_shape0: wp.array[int],
@@ -5220,16 +5043,16 @@ def place_world_contact_runs(
                         dense = needed
                     if path == 1 and place_mf:
                         mf = needed
-            dense_below = _warp_sum_below(dense)
-            mf_below = _warp_sum_below(mf)
+            dense_below = warp_scan(dense)
+            mf_below = warp_scan(mf)
             if dense > 0:
                 contact_slot[c] = next_dense + dense_below
             if mf > 0:
                 contact_slot[c] = next_mf + mf_below
-            next_dense += _warp_sum(dense)
-            next_mf += _warp_sum(mf)
+            next_dense += warp_sum(dense)
+            next_mf += warp_sum(mf)
     # Every lane has read the records before any is reset.
-    _tree_warp_sync()
+    warp_sync()
     for block in range(lane, blocks, lanes):
         run_first[world, block] = _CONTACT_RUN_EMPTY
         run_last[world, block] = -1
@@ -6449,11 +6272,9 @@ def finalize_constraint_counts_with_status(
 ):
     """Clamp the accepted prefix while retaining sticky overflow from every row producer."""
     world = wp.tid()
-    count = slot_counter[world]
-    if count > capacity:
-        wp.atomic_max(capacity_status, family, 1)
-        count = capacity
-    constraint_count[world] = wp.min(count, first_rejected_slot[world])
+    constraint_count[world] = reserved_count(
+        slot_counter, world, capacity, first_rejected_slot, capacity_status, family
+    )
 
 
 @wp.kernel
@@ -6579,8 +6400,6 @@ def compute_world_contact_bias(
     contact_speculative_scale: float,
     joint_limit_speculative_scale: float,
     contact_w: float,
-    mf_constraint_count: wp.array[int],
-    owned_rows_le: int,
     # outputs
     world_rhs: wp.array2d[float],
     world_row_w: wp.array2d[float],
@@ -6605,10 +6424,6 @@ def compute_world_contact_bias(
         phi = world_phi[world, i]
         beta = world_row_beta[world, i]
         row_type = world_row_type[world, i]
-        if owned_rows_le > 0 and m <= owned_rows_le and mf_constraint_count[world] == 0:
-            # World owned by the sweep kernel with in-kernel contact rows: it forms the contact bias itself.
-            if row_type == PGS_CONSTRAINT_TYPE_CONTACT or row_type == PGS_CONSTRAINT_TYPE_FRICTION:
-                return
         target_vel = world_target_velocity[world, i]
 
         # Initialize with -target_velocity (will add J*v later)
@@ -6671,8 +6486,6 @@ def apply_world_contact_restitution_matrix_free(
     dt: float,
     restitution_velocity_threshold: float,
     write_row_w: int,
-    mf_constraint_count: wp.array[int],
-    owned_rows_le: int,
     # in/out
     world_rhs: wp.array2d[float],
     world_row_w: wp.array2d[float],
@@ -6684,8 +6497,6 @@ def apply_world_contact_restitution_matrix_free(
     m = world_constraint_count[world]
     if i >= m:
         return
-    if owned_rows_le > 0 and m <= owned_rows_le and mf_constraint_count[world] == 0:
-        return  # world_rows: the sweep kernel applies restitution to its own contact rows
     if world_row_type[world, i] != PGS_CONSTRAINT_TYPE_CONTACT:
         return
 
@@ -7551,7 +7362,6 @@ def snapshot_contact_warmstart(
     contact_normal: wp.array[wp.vec3],
     previous_dense_slot: wp.array[int],
     previous_mf_slot: wp.array[int],
-    previous_propagation_slot: wp.array[int],
     previous_normal: wp.array[wp.vec3],
 ):
     """Save all contact routes and live normals in one launch."""
@@ -7568,8 +7378,6 @@ def snapshot_contact_warmstart(
         previous_dense_slot[contact] = wp.where(path == 0, slot, -1)
     if previous_mf_slot.shape[0] > 0:
         previous_mf_slot[contact] = wp.where(path == 1, slot, -1)
-    if previous_propagation_slot.shape[0] > 0:
-        previous_propagation_slot[contact] = wp.where(path == 2, slot, -1)
 
 
 @wp.kernel
@@ -7691,6 +7499,7 @@ def allocate_rigid_velocity_limit_slots(
     # outputs
     rigid_velocity_limit_slot: wp.array[int],
     mf_slot_counter: wp.array[int],
+    mf_first_rejected_slot: wp.array[int],
 ):
     """Allocate one MF speed row per finitely limited speed of a free rigid body.
 
@@ -7743,9 +7552,9 @@ def allocate_rigid_velocity_limit_slots(
             if speed < velocity_limit_activation_fraction * limit:
                 continue
 
-        slot = wp.atomic_add(mf_slot_counter, world, 1)
-        if slot < mf_max_constraints:
-            rigid_velocity_limit_slot[base + speed_row] = slot
+        rigid_velocity_limit_slot[base + speed_row] = reserve(
+            mf_slot_counter, world, 1, mf_max_constraints, mf_first_rejected_slot
+        )
 
 
 @wp.kernel
@@ -10276,20 +10085,6 @@ def pgs_convergence_diagnostic_velocity(
     mf_dof_a: wp.array2d[int],
     mf_dof_b: wp.array2d[int],
     mf_max_constraints: int,
-    # Propagation articulated body-space constraints
-    propagation_constraint_count: wp.array[int],
-    propagation_rhs: wp.array2d[float],
-    propagation_impulses: wp.array2d[float],
-    prev_propagation_impulses: wp.array2d[float],
-    propagation_row_type: wp.array2d[int],
-    propagation_row_parent: wp.array2d[int],
-    propagation_row_mu: wp.array2d[float],
-    propagation_J_a: wp.array3d[float],
-    propagation_J_b: wp.array3d[float],
-    propagation_body_a: wp.array2d[int],
-    propagation_body_b: wp.array2d[int],
-    propagation_body_qd: wp.array2d[float],
-    propagation_max_constraints: int,
     # Velocity
     v_out: wp.array[float],
     # Output: [worlds, 4]
@@ -10307,7 +10102,6 @@ def pgs_convergence_diagnostic_velocity(
 
     m_dense = constraint_count[world]
     m_mf = mf_constraint_count[world]
-    m_propagation = propagation_constraint_count[world]
 
     max_dl = float(0.0)
     comp_gap = float(0.0)
@@ -10394,47 +10188,6 @@ def pgs_convergence_diagnostic_velocity(
                 if t_mag < radius * 0.999:
                     tang_res += residual * residual
 
-    # --- Propagation articulated body-space constraints ---
-    for i in range(m_propagation):
-        lam = propagation_impulses[world, i]
-        prev_lam = prev_propagation_impulses[world, i]
-        dl = wp.abs(lam - prev_lam)
-        if dl > max_dl:
-            max_dl = dl
-
-        ba = propagation_body_a[world, i]
-        bb = propagation_body_b[world, i]
-        jv = float(0.0)
-        if ba >= 0:
-            for k in range(6):
-                jv += propagation_J_a[world, i, k] * propagation_body_qd[ba, k]
-        if bb >= 0:
-            for k in range(6):
-                jv += propagation_J_b[world, i, k] * propagation_body_qd[bb, k]
-        residual = jv + propagation_rhs[world, i]
-
-        rt = propagation_row_type[world, i]
-        if rt == PGS_CONSTRAINT_TYPE_CONTACT:
-            comp_gap += lam * residual
-            fb_val = wp.sqrt(lam * lam + residual * residual) - lam - residual
-            fb_merit += fb_val * fb_val
-        elif rt == PGS_CONSTRAINT_TYPE_FRICTION:
-            parent_idx = propagation_row_parent[world, i]
-            lambda_n = patch_normal_load(propagation_row_parent, propagation_impulses, world, parent_idx)
-            mu = propagation_row_mu[world, i]
-            radius = mu * lambda_n
-            if radius > 0.0:
-                if i == parent_idx + 1:
-                    sib = parent_idx + 2
-                else:
-                    sib = parent_idx + 1
-                if sib < propagation_max_constraints and sib < m_propagation:
-                    lam_t1 = propagation_impulses[world, i]
-                    lam_t2 = propagation_impulses[world, sib]
-                    t_mag = wp.sqrt(lam_t1 * lam_t1 + lam_t2 * lam_t2)
-                    if t_mag < radius * 0.999:
-                        tang_res += residual * residual
-
     metrics[world, 0] = max_dl
     metrics[world, 1] = comp_gap
     metrics[world, 2] = tang_res
@@ -10499,20 +10252,6 @@ def pgs_ncp_residuals_diagnostic_velocity(
     mf_dof_a: wp.array2d[int],
     mf_dof_b: wp.array2d[int],
     mf_max_constraints: int,
-    # Propagation articulated body-space constraints
-    propagation_constraint_count: wp.array[int],
-    propagation_rhs: wp.array2d[float],
-    propagation_impulses: wp.array2d[float],
-    propagation_row_type: wp.array2d[int],
-    propagation_row_parent: wp.array2d[int],
-    propagation_row_mu: wp.array2d[float],
-    propagation_row_phi: wp.array2d[float],
-    propagation_J_a: wp.array3d[float],
-    propagation_J_b: wp.array3d[float],
-    propagation_body_a: wp.array2d[int],
-    propagation_body_b: wp.array2d[int],
-    propagation_body_qd: wp.array2d[float],
-    propagation_max_constraints: int,
     # Velocity
     v_out: wp.array[float],
     # Output: [worlds, 6]
@@ -10571,7 +10310,6 @@ def pgs_ncp_residuals_diagnostic_velocity(
 
     m_dense = constraint_count[world]
     m_mf = mf_constraint_count[world]
-    m_propagation = propagation_constraint_count[world]
 
     r_compl = float(0.0)
     r_cone = float(0.0)
@@ -10722,88 +10460,6 @@ def pgs_ncp_residuals_diagnostic_velocity(
         friction_load = ln
         if mu > 0.0:
             friction_load = patch_normal_load(mf_row_parent, mf_impulses, world, i)
-        friction_residual = contact_friction_residuals(
-            ln, friction_load, mu, u_n, wp.vec2(u_t1, u_t2), wp.vec2(lt1, lt2)
-        )
-        r_cone = wp.max(r_cone, friction_residual[0])
-        r_ds_compl = wp.max(r_ds_compl, friction_residual[1])
-        r_ds_dual = wp.max(r_ds_dual, friction_residual[2])
-        r_mdp_dir = wp.max(r_mdp_dir, friction_residual[3])
-
-    # ---- Propagation articulated body-space constraints ----
-    for i in range(m_propagation):
-        rt = propagation_row_type[world, i]
-        if rt != PGS_CONSTRAINT_TYPE_CONTACT:
-            continue
-
-        ba = propagation_body_a[world, i]
-        bb = propagation_body_b[world, i]
-        u_n = float(0.0)
-        if ba >= 0:
-            for k in range(6):
-                u_n += propagation_J_a[world, i, k] * propagation_body_qd[ba, k]
-        if bb >= 0:
-            for k in range(6):
-                u_n += propagation_J_b[world, i, k] * propagation_body_qd[bb, k]
-        b_n = propagation_rhs[world, i]
-        ln = propagation_impulses[world, i]
-
-        ubn = u_n + b_n
-        if ln < ubn:
-            compl = wp.abs(ln)
-        else:
-            compl = wp.abs(ubn)
-        if compl > r_compl:
-            r_compl = compl
-
-        neg_phi = -propagation_row_phi[world, i]
-        if neg_phi > r_gap:
-            r_gap = neg_phi
-
-        lt1 = float(0.0)
-        lt2 = float(0.0)
-        u_t1 = float(0.0)
-        u_t2 = float(0.0)
-        mu = float(0.0)
-
-        i1 = i + 1
-        if i1 < propagation_max_constraints and i1 < m_propagation:
-            if (
-                propagation_row_type[world, i1] == PGS_CONSTRAINT_TYPE_FRICTION
-                and propagation_row_parent[world, i1] == i
-            ):
-                lt1 = propagation_impulses[world, i1]
-                mu = propagation_row_mu[world, i1]
-                ba1 = propagation_body_a[world, i1]
-                bb1 = propagation_body_b[world, i1]
-                if ba1 >= 0:
-                    for k in range(6):
-                        u_t1 += propagation_J_a[world, i1, k] * propagation_body_qd[ba1, k]
-                if bb1 >= 0:
-                    for k in range(6):
-                        u_t1 += propagation_J_b[world, i1, k] * propagation_body_qd[bb1, k]
-
-        i2 = i + 2
-        if i2 < propagation_max_constraints and i2 < m_propagation:
-            if (
-                propagation_row_type[world, i2] == PGS_CONSTRAINT_TYPE_FRICTION
-                and propagation_row_parent[world, i2] == i
-            ):
-                lt2 = propagation_impulses[world, i2]
-                if mu == 0.0:
-                    mu = propagation_row_mu[world, i2]
-                ba2 = propagation_body_a[world, i2]
-                bb2 = propagation_body_b[world, i2]
-                if ba2 >= 0:
-                    for k in range(6):
-                        u_t2 += propagation_J_a[world, i2, k] * propagation_body_qd[ba2, k]
-                if bb2 >= 0:
-                    for k in range(6):
-                        u_t2 += propagation_J_b[world, i2, k] * propagation_body_qd[bb2, k]
-
-        friction_load = ln
-        if mu > 0.0:
-            friction_load = patch_normal_load(propagation_row_parent, propagation_impulses, world, i)
         friction_residual = contact_friction_residuals(
             ln, friction_load, mu, u_n, wp.vec2(u_t1, u_t2), wp.vec2(lt1, lt2)
         )

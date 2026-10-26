@@ -115,16 +115,11 @@ class SolveTrace:
 def count_skipped_solves(
     world_constraint_count: wp.array[int],
     mf_constraint_count: wp.array[int],
-    propagation_constraint_count: wp.array[int],
     skipped: wp.array[wp.int32],
 ):
-    """Count one skipped solve of every world without dense, matrix-free or propagation rows."""
+    """Count one skipped solve of every world without dense or matrix-free rows."""
     world = wp.tid()
-    if (
-        world_constraint_count[world] == 0
-        and mf_constraint_count[world] == 0
-        and propagation_constraint_count[world] == 0
-    ):
+    if world_constraint_count[world] == 0 and mf_constraint_count[world] == 0:
         skipped[world] = skipped[world] + 1
 
 
@@ -323,7 +318,6 @@ def sweep_exit(
     iteration: str = "iteration",
     iterations: str = "iterations",
     lane: str = "lane",
-    lanes: int = 32,
     indent: str = "        ",
 ) -> str:
     """Return the end-of-sweep exit of a native Gauss-Seidel sweep.
@@ -348,8 +342,7 @@ def sweep_exit(
         world: World index expression.
         iteration: Zero-based sweep index within this launch.
         iterations: Sweep budget of this launch.
-        lane: Lane index within the world's lanes.
-        lanes: Lanes per world, the width of the trace's reductions.
+        lane: Lane index within the world's lanes; the trace reduces over the sweep's lane group.
         indent: Indentation of the emitted statements.
     """
     if policy.exact and not policy.counts:
@@ -379,14 +372,7 @@ def sweep_exit(
     lines += [
         f"{inner}float sweep_change = solve_trace_max;",
         f"{inner}int sweep_kind = solve_trace_kind;",
-        f"{inner}for (int trace_offset = {lanes // 2}; trace_offset > 0; trace_offset >>= 1) {{",
-        f"{inner}    const float other_change = __shfl_xor_sync(MASK, sweep_change, trace_offset, {lanes});",
-        f"{inner}    const int other_kind = __shfl_xor_sync(MASK, sweep_kind, trace_offset, {lanes});",
-        f"{inner}    if (other_change > sweep_change || (other_change == sweep_change && other_kind > sweep_kind)) {{",
-        f"{inner}        sweep_change = other_change;",
-        f"{inner}        sweep_kind = other_kind;",
-        f"{inner}    }}",
-        f"{inner}}}",
+        f"{inner}ARGMAX(sweep_change, sweep_kind);",
         f"{inner}solve_trace_max = 0.0f;",
         f"{inner}solve_trace_kind = -1;",
     ]
@@ -446,8 +432,6 @@ class SolveReadoutRecord:
         self._slots: dict[tuple[str, str], _ReadoutSlot] = {}
         self._labels: dict[str, str] = {}
         self._skipped: dict[str, wp.array] = {}
-        # Row counts of a family a route does not build: no world holds such rows.
-        self._no_rows: wp.array | None = None
         self._pass = "position"
 
     def register(self, kernel, label: str, *, world_count: int, budget: int, device, velocity_budget: int = 0) -> None:
@@ -497,7 +481,6 @@ class SolveReadoutRecord:
         """
         if not self.policy.counts or self._skipped or int(world_count) <= 0:
             return
-        self._no_rows = wp.zeros(int(world_count), dtype=wp.int32, device=device)
         budgets = {"position": 1, "velocity": int(velocity_budget)}
         for solve_pass in SOLVE_PASSES:
             if budgets[solve_pass] > 0:
@@ -518,8 +501,7 @@ class SolveReadoutRecord:
         wp.launch(
             count_skipped_solves,
             dim=skipped.shape[0],
-            # The kernel's third row family has no rows on any route.
-            inputs=[world_constraint_count, mf_constraint_count, self._no_rows],
+            inputs=[world_constraint_count, mf_constraint_count],
             outputs=[skipped],
             device=skipped.device,
         )

@@ -31,6 +31,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import keyed_rows, path_selection
 from newton._src.solvers.feather_pgs import solver_feather_pgs as source
+from newton._src.solvers.feather_pgs.device_preludes import RING
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -547,26 +548,25 @@ def assert_budget_reaches_the_fixed_point(test, truncated, budget, scale):
 
 # Golden text of the parallel sweep's friction projection, one warp (NT == 32) and several warps. The point
 # pair scales into the disk of its own freshly clamped normal. The linked pair stages every row's fresh value
-# in shared memory (one warp: store, then __syncwarp; several warps stage before projecting) and walks its
-# ring from its own normal, summing in ring order.
+# in shared memory (one warp: store, then a warp barrier; several warps stage before projecting) and walks its
+# ring from its own normal, summing in ring order; a parent past the admitted rows ends the ring.
 _RING_WALK = (
-    "                float load = s_x[p];\n"
-    "                for (int ring = s_parent[p], hop = 0; ring >= 0 && ring < n_rows && ring != p && hop < n_rows;"
-    " ring = s_parent[ring], ++hop)\n"
-    "                    load += s_x[ring];\n"
+    "                const float load = RING_LOAD(s_x[p], p, n_rows,\n"
+    "                    [&](int r) { const int next = s_parent[r]; return next < n_rows ? next : -1; },\n"
+    "                    [&](int r) { return s_x[r]; });\n"
     "                const float radius = fmaxf(s_mu[i] * load, 0.0f);\n"
 )
 _POINT_WARP_PAIR = (
-    "            const float xp = __shfl_sync(MASK, x_new[0], p & 31);\n"
-    "            const float xs = __shfl_sync(MASK, x_new[0], sib & 31);\n"
+    "            const float xp = READ(x_new[0], p & 31);\n"
+    "            const float xs = READ(x_new[0], sib & 31);\n"
     "            if (fr) {\n"
     "                const float radius = fmaxf(s_mu[i] * xp, 0.0f);\n"
     "                const float a_val = x_new[0];\n"
 )
 _LINKED_WARP_PAIR = (
-    "            const float xs = __shfl_sync(MASK, x_new[0], sib & 31);\n"
+    "            const float xs = READ(x_new[0], sib & 31);\n"
     "            if (i < n_rows) s_x[i] = x_new[0];\n"
-    "            __syncwarp();\n"
+    "            WARP_SYNC();\n"
     "            if (fr) {\n" + _RING_WALK + "                const float a_val = x_new[0];\n"
 )
 _POINT_BLOCK_PAIR = (
@@ -599,7 +599,6 @@ _ISOTROPIC_STEP = (
     "        }\n"
     "    }\n"
     "    SYNC();\n"
-    "    if (0 == 3) return;\n"
     "    float t_k = 1.0f;\n"
 )
 
@@ -633,8 +632,9 @@ class TestParallelPatchReference(unittest.TestCase):
                     (linked_source, _ISOTROPIC_STEP),
                 ):
                     self.assertEqual(text.count(golden), 1, golden)
-                # Nothing but the two projections differs from the point tier.
-                restored = linked_source.replace(_LINKED_WARP_PAIR, _POINT_WARP_PAIR)
+                # Nothing but the ring walk's prelude and the two projections differs from the point tier.
+                self.assertEqual(linked_source.count(RING.source), 1)
+                restored = linked_source.replace(RING.source + "\n", "").replace(_LINKED_WARP_PAIR, _POINT_WARP_PAIR)
                 self.assertEqual(restored.replace(_LINKED_BLOCK_PAIR, _POINT_BLOCK_PAIR), point_source)
                 self.assertEqual(linked._fpgs_block_dim, point._fpgs_block_dim)
 
@@ -926,8 +926,6 @@ def _general_bias(solver, rows, dt):
             solver.contact_speculative_scale,
             1.0,
             1.0,
-            wp.zeros(rhs.shape[0], dtype=wp.int32, device=device),
-            0,
         ],
         outputs=[rhs, wp.zeros_like(rhs)],
         device=device,
@@ -1854,7 +1852,6 @@ class TestPatchParallelRoutes(unittest.TestCase):
                         "direct_rows": "routes.sweep.tiers",
                     }
                     self.assertEqual(record["builder_by_dof"], dict.fromkeys(record["builder_by_dof"], builder))
-                    self.assertIsNone(record["row_check_by_dof"])
                     with launched_kernels() as keys:
                         _rollout(model, solver, 1)
                     assert_row_builders_named(self, record, keys)

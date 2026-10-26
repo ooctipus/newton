@@ -33,7 +33,7 @@ def _sparse_contact_projection_source(
         // Include bit 63 without a shift by 64.
         unsigned long long pending = mask & (~0ull << first) & (~0ull >> (63 - node));
         while (pending != 0) {
-            const int column = first_bit(pending);
+            const int column = FIRST(pending);
             const int entry = begin + column - first;
             const float factor = inverse_factor.data[factor_base + entry];
         """

@@ -210,12 +210,10 @@ class _SparseCase:
         self.tail = [
             wp.array(row_dof, device=device),
             wp.array(row_factor, device=device),
-            wp.zeros((worlds, capacity, 12), device=device),
             padded(incident),
             padded(types, np.int32),
             padded(parents, np.int32),
             padded(mu),
-            wp.zeros((worlds, dofs), dtype=int, device=device),
             wp.array(np.arange(worlds * dofs).reshape(worlds, dofs), dtype=int, device=device),
             wp.zeros(worlds * dofs, device=device),
             wp.zeros(worlds, dtype=int, device=device),

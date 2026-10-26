@@ -31,14 +31,11 @@ class ContactInput:
     origin: wp.array[wp.vec3]
     motion: wp.array[wp.spatial_vector]
     prescribed: wp.array[int]
-    is_free: wp.array[int]
     material_mu: wp.array[float]
     material_restitution: wp.array[float]
     incident: wp.array[float]
     shared_anchor: int
     friction_shared_anchor: int
-    friction_anchor_limit: int
-    friction_pairs_only: int
     friction_scale: float
     beta: float
     cfm: float
@@ -86,7 +83,6 @@ def bind(solver, state_in, state_aug, contacts, dt, bias_scale):
         ("dof_start", "articulation_dof_start"),
         ("origin", "articulation_origin"),
         ("prescribed", "_prescribed_articulation"),
-        ("is_free", "is_free_rigid"),
         ("material_mu", "shape_material_mu"),
         ("material_restitution", "shape_material_restitution"),
         ("incident", "v_hat"),
@@ -109,9 +105,6 @@ def bind(solver, state_in, state_aug, contacts, dt, bias_scale):
     data.motion = state_aug.joint_S_s
     data.shared_anchor = int(solver.contact_shared_anchor)
     data.friction_shared_anchor = int(solver.contact_friction_shared_anchor)
-    # Point-contact producers follow the canonical path's ignored legacy limit.
-    data.friction_anchor_limit = 0
-    data.friction_pairs_only = int(solver.contact_friction_articulation_pairs_only)
     data.friction_scale = solver.contact_friction_scale
     data.beta, data.cfm = solver.pgs_beta, solver.pgs_cfm
     data.dt, data.bias_scale = dt, bias_scale

@@ -91,7 +91,7 @@ _SORT_EXTENT = wp.constant(1)
 # fraction covers squares wider than about 3 cm at 80 m from the origin and
 # 6 cm at 190 m, and narrower ones nearer to it.
 _FOOTPRINT_TOLERANCE = wp.constant(1.0e-3)
-# Contact paths 0, 1 and 2 hold dense, matrix-free and propagation rows, and -1 holds none.
+# Contact paths 0 and 1 hold dense and matrix-free rows, and -1 holds none.
 # CONTACT_PATH_RESOLVED marks a contact without rows in a world the resolved-world classifier
 # skipped, where the complete path would have reserved them: its patch anchor releases.
 CONTACT_PATH_RESOLVED = wp.constant(-2)
@@ -1851,13 +1851,16 @@ def patch_normal_load(parents: wp.array2d[int], impulses: wp.array2d[float], wor
 
     A contact row's parent field links the next normal in its region (a circular
     list). Friction rows still point to their adjacent normal row. Other row
-    families retain their original parent semantics.
+    families retain their original parent semantics. The Warp form of the native
+    ``RING_LOAD`` (:mod:`.device_preludes`): the same order, the same hop guard.
     """
     load = impulses[world, first]
     row = parents[world, first]
-    while row >= 0 and row != first:
+    hop = int(0)
+    while row >= 0 and row != first and hop < parents.shape[1]:
         load += impulses[world, row]
         row = parents[world, row]
+        hop += 1
     return load
 
 
@@ -2221,9 +2224,3 @@ def _reset_history(
             if w >= 0 and w < world_mask.shape[0] and not world_mask[w]:
                 continue
         prev_valid[c] = 0
-
-
-@wp.kernel(enable_backward=False)
-def _arange(values: wp.array[int]):
-    i = wp.tid()
-    values[i] = i

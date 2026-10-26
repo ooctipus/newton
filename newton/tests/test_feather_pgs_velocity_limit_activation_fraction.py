@@ -38,7 +38,12 @@ def _allocated_joint_velocity_slots(qd: float, *, fraction: float, qdot_max: flo
             wp.array([0], dtype=wp.int32, device=device),
             8,
         ],
-        outputs=[velocity_limit_slot, velocity_limit_sign, world_slot_counter],
+        outputs=[
+            velocity_limit_slot,
+            velocity_limit_sign,
+            world_slot_counter,
+            wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
+        ],
         device=device,
     )
     return (
@@ -72,7 +77,7 @@ def _allocated_rigid_velocity_slots(
             64,
             wp.array([int(resolved)], dtype=wp.int32, device=device),
         ],
-        outputs=[rigid_velocity_limit_slot, mf_slot_counter],
+        outputs=[rigid_velocity_limit_slot, mf_slot_counter, wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device)],
         device=device,
     )
     return rigid_velocity_limit_slot.numpy().tolist(), int(mf_slot_counter.numpy()[0])

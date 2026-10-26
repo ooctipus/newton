@@ -42,9 +42,6 @@ def _projection(point_world: wp.vec3, origin: wp.vec3, direction: wp.vec3, S: wp
 def contact_row_prelude(
     contact_count: wp.array[int],
     total_threads: int,
-    world_constraint_count: wp.array[int],
-    mf_constraint_count: wp.array[int],
-    owned_rows_le: int,
     contact_point0: wp.array[wp.vec3],
     contact_point1: wp.array[wp.vec3],
     contact_normal: wp.array[wp.vec3],
@@ -69,9 +66,6 @@ def contact_row_prelude(
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
     contact_friction_shared_anchor: int,
-    contact_friction_anchor_limit: int,
-    contact_friction_articulation_pairs_only: int,
-    is_free_rigid: wp.array[int],
     contact_friction_scale: float,
     contact_shared_anchor: int,
     pgs_beta: float,
@@ -96,15 +90,9 @@ def contact_row_prelude(
     r = tid % 3
     total_contacts = contact_count[0]
     for c in range(tid // 3, total_contacts, total_threads // 3):
-        if owned_rows_le > 0:
-            # Worlds the sweep kernel owns build their contact rows in-kernel (world_rows); skip them here.
-            w = contact_world[c]
-            if world_constraint_count[w] <= owned_rows_le and mf_constraint_count[w] == 0:
-                continue
         _contact_row_prelude_one(
             c,
             r,
-            total_contacts,
             contact_point0,
             contact_point1,
             contact_normal,
@@ -129,9 +117,6 @@ def contact_row_prelude(
             shape_material_mu,
             shape_material_restitution,
             contact_friction_shared_anchor,
-            contact_friction_anchor_limit,
-            contact_friction_articulation_pairs_only,
-            is_free_rigid,
             contact_friction_scale,
             contact_shared_anchor,
             pgs_beta,
@@ -152,7 +137,6 @@ def contact_row_prelude(
 def _contact_row_prelude_one(
     c: int,
     r: int,
-    total_contacts: int,
     contact_point0: wp.array[wp.vec3],
     contact_point1: wp.array[wp.vec3],
     contact_normal: wp.array[wp.vec3],
@@ -177,9 +161,6 @@ def _contact_row_prelude_one(
     shape_material_mu: wp.array[float],
     shape_material_restitution: wp.array[float],
     contact_friction_shared_anchor: int,
-    contact_friction_anchor_limit: int,
-    contact_friction_articulation_pairs_only: int,
-    is_free_rigid: wp.array[int],
     contact_friction_scale: float,
     contact_shared_anchor: int,
     pgs_beta: float,
@@ -251,32 +232,7 @@ def _contact_row_prelude_one(
     if mat_count > 0:
         mu /= float(mat_count)
     restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
-    a_non_free = art_a >= 0 and is_free_rigid[art_a] == 0
-    b_non_free = art_b >= 0 and is_free_rigid[art_b] == 0
-    apply_friction_filter = contact_friction_articulation_pairs_only == 0 or (a_non_free and b_non_free)
-    effective_friction_anchor_limit = int(0)
-    if apply_friction_filter:
-        effective_friction_anchor_limit = contact_friction_anchor_limit
-    friction_anchor_rank = int(0)
-    same_next_contact = int(0)
-    if effective_friction_anchor_limit > 0:
-        for lookback in range(1, 9):
-            prev = c - lookback
-            if prev < 0:
-                break
-            if prev >= total_contacts:
-                break
-            if contact_shape0[prev] == shape_a and contact_shape1[prev] == shape_b:
-                friction_anchor_rank += int(1)
-            else:
-                break
-        next = c + 1
-        if next < total_contacts and contact_shape0[next] == shape_a and contact_shape1[next] == shape_b:
-            same_next_contact = int(1)
-    friction_anchor_scale = 1.0
-    if effective_friction_anchor_limit > 0 and (friction_anchor_rank > 0 or same_next_contact != 0):
-        friction_anchor_scale = 0.5
-    friction_mu = mu * contact_friction_scale * friction_anchor_scale
+    friction_mu = mu * contact_friction_scale
 
     t0, t1 = contact_tangent_basis(normal)
     # Allocation owns the row extent; recomputing eligibility can cross a
@@ -376,10 +332,6 @@ def populate_world_J_masked(
     contact_friction_shared_anchor: int,
     contact_shared_anchor: int,
     pre_flags: wp.array[int],
-    contact_world: wp.array[int],
-    world_constraint_count: wp.array[int],
-    mf_constraint_count: wp.array[int],
-    owned_rows_le: int,
     # outputs: Jacobian blocks of the two size groups (the second may alias the first when only one group exists)
     J_group_a: wp.array3d[float],
     J_group_b: wp.array3d[float],
@@ -393,11 +345,6 @@ def populate_world_J_masked(
     lane = tid % lanes
     total_contacts = contact_count[0]
     for c in range(tid // lanes, total_contacts, total_threads // lanes):
-        if owned_rows_le > 0:
-            # Worlds the sweep kernel owns build their contact rows in-kernel (world_rows); skip them here.
-            w = contact_world[c]
-            if world_constraint_count[w] <= owned_rows_le and mf_constraint_count[w] == 0:
-                continue
         _populate_world_J_masked_one(
             c,
             lane,

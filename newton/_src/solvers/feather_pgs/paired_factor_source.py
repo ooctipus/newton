@@ -3,7 +3,7 @@
 
 """Share the paired GS recurrence through explicit representation entry and exit."""
 
-from .device_preludes import cuda_native
+from .device_preludes import RING, cuda_native, lane_group
 from .friction import FRICTION_PAIR
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -25,14 +25,14 @@ def _physical_entry(D, P, S, independent_components):
     float factor_velocity = 0.0f;
 #pragma unroll
     for (int k = 0; k < {P}; ++k) {{
-        const float xk = __shfl_sync(MASK, physical_velocity, primary_offset + k);
+        const float xk = READ(physical_velocity, primary_offset + k);
         if (primary_lane >= 0 && primary_lane <= k && primary_lane < {P})
             factor_velocity += primary_L.data[
                 primary_matrix_base + k * {P} + primary_lane] * xk;
     }}
 #pragma unroll
     for (int k = 0; k < {S}; ++k) {{
-        const float xk = __shfl_sync(MASK, physical_velocity, secondary_offset + k);
+        const float xk = READ(physical_velocity, secondary_offset + k);
         if (secondary_lane >= 0 && secondary_lane <= k && secondary_lane < {S})
             factor_velocity += secondary_L.data[
                 secondary_matrix_base + k * {S} + secondary_lane] * xk;
@@ -47,14 +47,14 @@ def _physical_exit(P, S, independent_components):
     return f"""    float physical_output = 0.0f;
 #pragma unroll
     for (int k = 0; k < {P}; ++k) {{
-        const float uk = __shfl_sync(MASK, factor_velocity, primary_offset + k);
+        const float uk = READ(factor_velocity, primary_offset + k);
         if (primary_lane >= 0 && primary_lane <= k && primary_lane < {P})
             physical_output += primary_Linv.data[
                 primary_matrix_base + k * {P} + primary_lane] * uk;
     }}
 #pragma unroll
     for (int k = 0; k < {S}; ++k) {{
-        const float uk = __shfl_sync(MASK, factor_velocity, secondary_offset + k);
+        const float uk = READ(factor_velocity, secondary_offset + k);
         if (secondary_lane >= 0 && secondary_lane <= k && secondary_lane < {S})
             physical_output += secondary_Linv.data[
                 secondary_matrix_base + k * {S} + secondary_lane] * uk;
@@ -78,7 +78,7 @@ def _unit_walk(D, factor_rows, contact_type, friction_type, joint_limit_type, jo
             const int row_type = static_cast<int>(s_type[i]);
             if (row_type == {friction_type}) {{
                 if (global_iter < friction_start_iteration) s_lam[i] = 0.0f;
-                __syncwarp(MASK);
+                SYNC();
                 ++i;
                 continue;
             }}
@@ -98,12 +98,8 @@ def _unit_walk(D, factor_rows, contact_type, friction_type, joint_limit_type, jo
             const float denom = s_diag[i];
             if (denom > 0.0f) {{
                 float sum = lane < {D} ? row_factor * factor_velocity : 0.0f;
-                sum += __shfl_down_sync(MASK, sum, 16);
-                sum += __shfl_down_sync(MASK, sum, 8);
-                sum += __shfl_down_sync(MASK, sum, 4);
-                sum += __shfl_down_sync(MASK, sum, 2);
-                sum += __shfl_down_sync(MASK, sum, 1);
-                const float residual = __shfl_sync(MASK, sum, 0) + s_rhs[i];
+                SUM(sum);
+                const float residual = sum + s_rhs[i];
                 const float raw_delta = -residual / denom;
                 const float old_impulse = s_lam[i];
                 float new_impulse = old_impulse + omega * raw_delta;
@@ -126,7 +122,7 @@ def _unit_walk(D, factor_rows, contact_type, friction_type, joint_limit_type, jo
 {row_vote}
                     factor_velocity += row_factor * delta_impulse;
                 }}
-                __syncwarp(MASK);
+                SYNC();
             }}
             if (!owns_tangents) {{
                 ++i;
@@ -135,17 +131,13 @@ def _unit_walk(D, factor_rows, contact_type, friction_type, joint_limit_type, jo
             if (global_iter < friction_start_iteration) {{
                 s_lam[tangent1] = 0.0f;
                 s_lam[tangent2] = 0.0f;
-                __syncwarp(MASK);
+                SYNC();
                 i += 3;
                 continue;
             }}
             // Solve both tangents on the friction disk of the patch normal load: normal rows link
             // the region's next normal (circular list, -1 ends a point contact).
-            float lambda_n = s_lam[i];
-            for (int patch_row = world_row_parent.data[off + i];
-                 patch_row >= 0 && patch_row != i;
-                 patch_row = world_row_parent.data[off + patch_row])
-                lambda_n += s_lam[patch_row];
+            const float lambda_n = RING_LOAD(s_lam[i], i, m, ring_parent, ring_impulse);
             const float radius = fmaxf(world_row_mu.data[off + tangent1] * lambda_n, 0.0f);
             const float old_tangent1 = s_lam[tangent1];
             const float old_tangent2 = s_lam[tangent2];
@@ -153,7 +145,7 @@ def _unit_walk(D, factor_rows, contact_type, friction_type, joint_limit_type, jo
                 // The pair solve would write zeros and change no velocity.
                 s_lam[tangent1] = 0.0f;
                 s_lam[tangent2] = 0.0f;
-                __syncwarp(MASK);
+                SYNC();
                 i += 3;
                 continue;
             }}
@@ -162,14 +154,10 @@ def _unit_walk(D, factor_rows, contact_type, friction_type, joint_limit_type, jo
                 float tangent1_sum = lane < {D} ? tangent1_factor * factor_velocity : 0.0f;
                 float tangent2_sum = lane < {D} ? tangent2_factor * factor_velocity : 0.0f;
                 float cross_sum = lane < {D} ? tangent1_factor * tangent2_factor : 0.0f;
-                for (int offset = 16; offset > 0; offset >>= 1) {{
-                    tangent1_sum += __shfl_down_sync(MASK, tangent1_sum, offset);
-                    tangent2_sum += __shfl_down_sync(MASK, tangent2_sum, offset);
-                    cross_sum += __shfl_down_sync(MASK, cross_sum, offset);
-                }}
-                const float tangent1_residual = __shfl_sync(MASK, tangent1_sum, 0) + s_rhs[tangent1];
-                const float tangent2_residual = __shfl_sync(MASK, tangent2_sum, 0) + s_rhs[tangent2];
-                const float cross = __shfl_sync(MASK, cross_sum, 0);
+                SUM(tangent1_sum, tangent2_sum, cross_sum);
+                const float tangent1_residual = tangent1_sum + s_rhs[tangent1];
+                const float tangent2_residual = tangent2_sum + s_rhs[tangent2];
+                const float cross = cross_sum;
                 pair = friction_pair_candidate(s_diag[tangent1], cross, s_diag[tangent2],
                     tangent1_residual, tangent2_residual, old_tangent1, old_tangent2, radius, omega);
             }}
@@ -189,7 +177,7 @@ def _unit_walk(D, factor_rows, contact_type, friction_type, joint_limit_type, jo
 {tangent1_vote}
                 factor_velocity += tangent1_factor * tangent1_delta;
             }}
-            __syncwarp(MASK);
+            SYNC();
             i += 3;
         }}
 """
@@ -256,7 +244,7 @@ def get_source(
     unsigned char* s_type = &s_type_storage[world_slot * {M}];
 {contact_mu_view}
 """
-    world_slot = "    const int world_slot = threadIdx.x >> 5;\n"
+    world_slot = "    const int world_slot = SUB;\n"
     primary_group_by_world = "primary_group_by_world"
     secondary_group_by_world = "secondary_group_by_world"
     primary_offset_by_world = "primary_offset_by_world"
@@ -328,14 +316,10 @@ def get_source(
                 const float denom = s_diag[i];
                 if (denom <= 0.0f) continue;
                 float sum = lane < {D} ? {product("row_factor", "i")} : 0.0f;
-                sum += __shfl_down_sync(MASK, sum, 16);
-                sum += __shfl_down_sync(MASK, sum, 8);
-                sum += __shfl_down_sync(MASK, sum, 4);
-                sum += __shfl_down_sync(MASK, sum, 2);
-                sum += __shfl_down_sync(MASK, sum, 1);
+                SUM(sum);
                 const float old_impulse = s_lam[i];
                 float new_impulse = old_impulse
-                    + omega * (-( __shfl_sync(MASK, sum, 0) + s_rhs[i]) / denom);
+                    + omega * (-( sum + s_rhs[i]) / denom);
                 const int row_type = static_cast<int>(s_type[i]);
                 if ((row_type == {contact_type} || row_type == {joint_limit_type}) && new_impulse < 0.0f)
                     new_impulse = 0.0f;
@@ -345,7 +329,7 @@ def get_source(
 {prefix_vote}
                     factor_velocity += row_factor * delta;
                 }}
-                __syncwarp(MASK);
+                SYNC();
             }}
 
             for (int contact = 0; contact < contact_count; ++contact) {{
@@ -355,16 +339,12 @@ def get_source(
                 const float normal_factor = lane < {D}
                     ? {factor_rows}.data[row_base + normal * {D} + lane] : 0.0f;
                 float normal_sum = lane < {D} ? {product("normal_factor", "normal")} : 0.0f;
-                normal_sum += __shfl_down_sync(MASK, normal_sum, 16);
-                normal_sum += __shfl_down_sync(MASK, normal_sum, 8);
-                normal_sum += __shfl_down_sync(MASK, normal_sum, 4);
-                normal_sum += __shfl_down_sync(MASK, normal_sum, 2);
-                normal_sum += __shfl_down_sync(MASK, normal_sum, 1);
+                SUM(normal_sum);
                 const float normal_denom = s_diag[normal];
                 if (normal_denom > 0.0f) {{
                     const float old_normal = s_lam[normal];
                     float new_normal = old_normal
-                        + omega * (-( __shfl_sync(MASK, normal_sum, 0) + s_rhs[normal]) / normal_denom);
+                        + omega * (-( normal_sum + s_rhs[normal]) / normal_denom);
                     if (new_normal < 0.0f) new_normal = 0.0f;
                     const float normal_delta = new_normal - old_normal;{fences[1]}
                     s_lam[normal] = new_normal;
@@ -373,7 +353,7 @@ def get_source(
                         factor_velocity += normal_factor * normal_delta;
                     }}
                 }}
-                __syncwarp(MASK);
+                SYNC();
 
                 const float tangent1_factor = lane < {D}
                     ? {factor_rows}.data[row_base + tangent1 * {D} + lane] : 0.0f;
@@ -381,22 +361,18 @@ def get_source(
                     ? {factor_rows}.data[row_base + tangent2 * {D} + lane] : 0.0f;
                 // Patch normal load: normal rows link the region's next normal (circular list, -1 ends a
                 // point contact). Solve both tangents together on the friction disk at that load.
-                float lambda_n = s_lam[normal];
-                for (int patch_row = world_row_parent.data[off + normal];
-                     patch_row >= 0 && patch_row != normal;
-                     patch_row = world_row_parent.data[off + patch_row])
-                    lambda_n += s_lam[patch_row];
+                const float lambda_n = RING_LOAD(s_lam[normal], normal, m, ring_parent, ring_impulse);
                 const float radius = fmaxf(s_contact_mu[contact] * lambda_n, 0.0f);
                 const float old_tangent1 = s_lam[tangent1];
                 const float old_tangent2 = s_lam[tangent2];
                 if (radius <= 0.0f && old_tangent1 == 0.0f && old_tangent2 == 0.0f) {{
-                    __syncwarp(MASK);
+                    SYNC();
                     continue;
                 }}
                 if (global_iter < friction_start_iteration) {{{fences[2]}
                     s_lam[tangent1] = 0.0f;
                     s_lam[tangent2] = 0.0f;
-                    __syncwarp(MASK);
+                    SYNC();
                     continue;
                 }}
                 float2 pair = make_float2(0.0f, 0.0f);
@@ -404,14 +380,10 @@ def get_source(
                     float tangent1_sum = lane < {D} ? {product("tangent1_factor", "tangent1")} : 0.0f;
                     float tangent2_sum = lane < {D} ? {product("tangent2_factor", "tangent2")} : 0.0f;
                     float cross_sum = lane < {D} ? tangent1_factor * tangent2_factor : 0.0f;
-                    for (int offset = 16; offset > 0; offset >>= 1) {{
-                        tangent1_sum += __shfl_down_sync(MASK, tangent1_sum, offset);
-                        tangent2_sum += __shfl_down_sync(MASK, tangent2_sum, offset);
-                        cross_sum += __shfl_down_sync(MASK, cross_sum, offset);
-                    }}
-                    const float tangent1_residual = __shfl_sync(MASK, tangent1_sum, 0) + s_rhs[tangent1];
-                    const float tangent2_residual = __shfl_sync(MASK, tangent2_sum, 0) + s_rhs[tangent2];
-                    const float cross = __shfl_sync(MASK, cross_sum, 0);
+                    SUM(tangent1_sum, tangent2_sum, cross_sum);
+                    const float tangent1_residual = tangent1_sum + s_rhs[tangent1];
+                    const float tangent2_residual = tangent2_sum + s_rhs[tangent2];
+                    const float cross = cross_sum;
                     pair = friction_pair_candidate(s_diag[tangent1], cross, s_diag[tangent2],
                         tangent1_residual, tangent2_residual, old_tangent1, old_tangent2, radius, omega);
                 }}
@@ -431,7 +403,7 @@ def get_source(
 {triple_tangent1_vote}
                     factor_velocity += tangent1_factor * tangent1_delta;
                 }}
-                __syncwarp(MASK);
+                SYNC();
             }}
         }} else {{
         float prefetched_factor = lane < {D} ? {factor_rows}.data[row_base + lane] : 0.0f;
@@ -444,7 +416,7 @@ def get_source(
             const int row_type = static_cast<int>(s_type[i]);
             if (row_type == {friction_type} && global_iter < friction_start_iteration) {{
                 s_lam[i] = 0.0f;
-                __syncwarp(MASK);
+                SYNC();
                 continue;
             }}
 
@@ -455,7 +427,7 @@ def get_source(
                 parent = world_row_parent.data[off + i];
                 if (i != parent + 1) {{
                     // The first tangent row solved both tangents; the second visit is a no-op.
-                    __syncwarp(MASK);
+                    SYNC();
                     continue;
                 }}
                 sibling = parent + 2;
@@ -465,12 +437,8 @@ def get_source(
             const float denom = s_diag[i];
             if (denom <= 0.0f && row_type != {friction_type}) continue;
             float sum = lane < {D} ? {product("row_factor", "i")} : 0.0f;
-            sum += __shfl_down_sync(MASK, sum, 16);
-            sum += __shfl_down_sync(MASK, sum, 8);
-            sum += __shfl_down_sync(MASK, sum, 4);
-            sum += __shfl_down_sync(MASK, sum, 2);
-            sum += __shfl_down_sync(MASK, sum, 1);
-            const float jv = __shfl_sync(MASK, sum, 0);
+            SUM(sum);
+            const float jv = sum;
 
             const float residual = jv + s_rhs[i];
             const float raw_delta = denom > 0.0f ? -residual / denom : 0.0f;
@@ -490,23 +458,16 @@ def get_source(
                 }}
             }} else if (row_type == {friction_type}) {{
                 // Paired tangent solve at the patch normal load, matching the general owner.
-                float lambda_n = s_lam[parent];
-                for (int patch_row = world_row_parent.data[off + parent];
-                     patch_row >= 0 && patch_row != parent;
-                     patch_row = world_row_parent.data[off + patch_row])
-                    lambda_n += s_lam[patch_row];
+                const float lambda_n = RING_LOAD(s_lam[parent], parent, m, ring_parent, ring_impulse);
                 const float radius = fmaxf(world_row_mu.data[off + i] * lambda_n, 0.0f);
                 const float sibling_impulse = s_lam[sibling];
                 float2 pair = make_float2(0.0f, 0.0f);
                 if (radius > 0.0f) {{
                     float sibling_sum = lane < {D} ? sibling_factor * factor_velocity : 0.0f;
                     float cross_sum = lane < {D} ? row_factor * sibling_factor : 0.0f;
-                    for (int offset = 16; offset > 0; offset >>= 1) {{
-                        sibling_sum += __shfl_down_sync(MASK, sibling_sum, offset);
-                        cross_sum += __shfl_down_sync(MASK, cross_sum, offset);
-                    }}
-                    const float sibling_residual = __shfl_sync(MASK, sibling_sum, 0) + s_rhs[sibling];
-                    const float cross = __shfl_sync(MASK, cross_sum, 0);
+                    SUM(sibling_sum, cross_sum);
+                    const float sibling_residual = sibling_sum + s_rhs[sibling];
+                    const float cross = cross_sum;
                     pair = friction_pair_candidate(denom, cross, s_diag[sibling],
                         residual, sibling_residual, old_impulse, sibling_impulse, radius, omega);
                 }}
@@ -530,21 +491,20 @@ def get_source(
 {general_vote}
                 factor_velocity += row_factor * delta_impulse;
             }}
-            __syncwarp(MASK);
+            SYNC();
         }}
         }}
 """
     sweep_end = sweep_exit(
         solve_policy,
-        """        const unsigned changed = __ballot_sync(MASK, iteration_changed != 0);
+        """        const unsigned changed = BALLOT(iteration_changed != 0);
         if (global_iter >= friction_start_iteration && changed == 0u) break;
 """,
         gate="global_iter >= friction_start_iteration",
-        quiet="__ballot_sync(MASK, iteration_changed != 0) == 0u",
+        quiet="BALLOT(iteration_changed != 0) == 0u",
         iteration="iter",
     )
-    body = f"""{storage}    constexpr unsigned MASK = 0xffffffffu;
-    const int lane = threadIdx.x & 31;
+    body = f"""{storage}    const int lane = LANE;
 {world_slot}
     int m = world_constraint_count.data[world];
 {row_guard}
@@ -558,7 +518,10 @@ def get_source(
     const int secondary_offset = {secondary_offset_by_world}.data[world];
     const int primary_matrix_base = primary_group * {P * P};
     const int secondary_matrix_base = secondary_group * {S * S};
-{views}{loads}{entry}    __syncwarp(MASK);
+{views}    // A contact normal's patch ring links the region's next normal (-1 ends a point contact).
+    const auto ring_parent = [&](int r) {{ return world_row_parent.data[off + r]; }};
+    const auto ring_impulse = [&](int r) {{ return s_lam[r]; }};
+{loads}{entry}    SYNC();
 
     for (int iter = 0; iter < iterations; ++iter) {{
         const int global_iter = iteration_offset + iter;
@@ -569,4 +532,4 @@ def get_source(
 
 {exit_code}    for (int i = lane; i < m; i += 32) world_impulses.data[off + i] = s_lam[i];
 """
-    return cuda_native(body + "#endif\n", preludes=(FRICTION_PAIR, *solve_policy.preludes))
+    return cuda_native(body + "#endif\n", preludes=(lane_group(32), RING, FRICTION_PAIR, *solve_policy.preludes))
