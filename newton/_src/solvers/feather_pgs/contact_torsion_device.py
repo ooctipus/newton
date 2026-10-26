@@ -13,32 +13,13 @@ import numpy as np
 import warp as wp
 
 from ...core.contact_pool import ContactField, ContactPool
+from .contact_laws import contact_bodies, contact_points_oracle, oracle_dot3
 from .contact_torsion import _NORMAL_COSINE, _SUPPORTED_TYPES, _TOUCH_TOLERANCE
 from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION, PGS_CONSTRAINT_TYPE_TORSION
 
 # Match the retained host oracle's rounding at angular cancellation and
 # touching/grouping thresholds. This option affects only this preparation module.
 wp.set_module_options({"fuse_fp": False})
-
-
-@wp.func
-def _host_dot3(a: wp.vec3, b: wp.vec3):
-    # Match contact_torsion._dot3's explicit arithmetic contract, not NumPy's
-    # platform-dependent BLAS. Fused or float32-only sums differ at thresholds.
-    x = wp.float64(a[0] * b[0])
-    y = wp.float64(a[1] * b[1])
-    z = wp.float64(a[2] * b[2])
-    return float(x + y + z)
-
-
-@wp.func
-def _host_transform_point(pose: wp.transform, point: wp.vec3):
-    # Use the oracle's cross-product expression, not the algebraically
-    # equivalent quaternion polynomial used by wp.transform_point.
-    q = wp.transform_get_rotation(pose)
-    v = wp.vec3(q[0], q[1], q[2])
-    cross = 2.0 * wp.cross(v, point)
-    return point + q[3] * cross + wp.cross(v, cross) + wp.transform_get_translation(pose)
 
 
 @wp.struct
@@ -146,18 +127,10 @@ def _gather(
         for k in range(1, 3):
             if row_type[world, slot + k] != PGS_CONSTRAINT_TYPE_FRICTION or parents[world, slot + k] != slot:
                 return
-    normal = -normals[c]
-    ba = shape_body[a]
-    bb = shape_body[b]
-    pa = point_a[c]
-    pb = point_b[c]
-    if ba >= 0:
-        pa = _host_transform_point(poses[ba], pa)
-    if bb >= 0:
-        pb = _host_transform_point(poses[bb], pb)
-    pa -= margin_a[c] * normal
-    pb += margin_b[c] * normal
-    gap = _host_dot3(normal, pa - pb)
+    ba, bb = contact_bodies(a, b, shape_body)
+    normal, pa, pb, gap = contact_points_oracle(
+        normals[c], point_a[c], point_b[c], margin_a[c], margin_b[c], ba, bb, poses
+    )
     if gap > _TOUCH_TOLERANCE and patch_mode == 0:
         work.eligible[c] = 0
         return
@@ -241,9 +214,9 @@ def _group_world(
             if patch_mode == 0:
                 member = other
                 while member >= 0:
-                    if _host_dot3(work.normal[c], work.normal[member]) < _NORMAL_COSINE:
+                    if oracle_dot3(work.normal[c], work.normal[member]) < _NORMAL_COSINE:
                         compatible = False
-                    if wp.abs(_host_dot3(work.normal[c], work.point[c] - work.point[member])) > _TOUCH_TOLERANCE:
+                    if wp.abs(oracle_dot3(work.normal[c], work.point[c] - work.point[member])) > _TOUCH_TOLERANCE:
                         compatible = False
                     member = work.next_member[member]
             if compatible and chosen < 0:
@@ -368,7 +341,7 @@ def _apply_rows(
             art = body_art[body]
             if art >= 0 and prescribed[art] != 0:
                 omega = wp.spatial_bottom(body_velocity[body])
-                velocity -= sign * _host_dot3(work.normal[lead], omega)
+                velocity -= sign * oracle_dot3(work.normal[lead], omega)
     target[world, row] = velocity
 
 
@@ -430,7 +403,7 @@ def _jacobians(
                 joint = body_joint[body]
                 while joint >= 0:
                     if qd_start[joint] <= global_dof and global_dof < qd_start[joint + 1]:
-                        value += sign * _host_dot3(work.normal[lead], wp.spatial_bottom(motion[global_dof]))
+                        value += sign * oracle_dot3(work.normal[lead], wp.spatial_bottom(motion[global_dof]))
                     joint = ancestor[joint]
     jacobian[group, row, dof] = value
 

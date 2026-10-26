@@ -20,22 +20,17 @@ from __future__ import annotations
 
 import warp as wp
 
-from .friction_patches import PatchRowLaw, patch_friction_location
-from .kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT,
-    PGS_CONSTRAINT_TYPE_FRICTION,
+from .contact_laws import (
+    contact_friction_points,
+    contact_geometry,
+    contact_materials,
+    contact_row_frame,
     contact_tangent_basis,
-    mixed_contact_restitution,
-    prescribed_relative_contact_target,
+    jacobian_entry,
+    prescribed_target,
 )
-
-
-@wp.func
-def _projection(point_world: wp.vec3, origin: wp.vec3, direction: wp.vec3, S: wp.spatial_vector) -> float:
-    lin = wp.vec3(S[0], S[1], S[2])
-    ang = wp.vec3(S[3], S[4], S[5])
-    v = lin + wp.cross(ang, point_world - origin)
-    return wp.dot(direction, v)
+from .friction_patches import PatchRowLaw, patch_friction_location
+from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 
 
 @wp.kernel(enable_backward=False)
@@ -196,60 +191,28 @@ def _contact_row_prelude_one(
         return
 
     world = contact_world[c]
-    normal = -contact_normal[c]
-    shape_a = contact_shape0[c]
-    shape_b = contact_shape1[c]
-    body_a = -1
-    body_b = -1
-    if shape_a >= 0:
-        body_a = shape_body[shape_a]
-    if shape_b >= 0:
-        body_b = shape_body[shape_b]
-    thickness_a = contact_thickness0[c]
-    thickness_b = contact_thickness1[c]
-    point_a_local = contact_point0[c]
-    point_b_local = contact_point1[c]
-    point_a_world = wp.vec3(0.0)
-    point_b_world = wp.vec3(0.0)
-    if body_a >= 0:
-        point_a_world = wp.transform_point(body_q[body_a], point_a_local) - thickness_a * normal
-    else:
-        point_a_world = point_a_local - thickness_a * normal
-    if body_b >= 0:
-        point_b_world = wp.transform_point(body_q[body_b], point_b_local) + thickness_b * normal
-    else:
-        point_b_world = point_b_local + thickness_b * normal
-    phi = wp.dot(normal, point_a_world - point_b_world)
-
-    mu = 0.0
-    mat_count = 0
-    if shape_a >= 0:
-        mu += shape_material_mu[shape_a]
-        mat_count += 1
-    if shape_b >= 0:
-        mu += shape_material_mu[shape_b]
-        mat_count += 1
-    if mat_count > 0:
-        mu /= float(mat_count)
-    restitution = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
-    friction_mu = mu * contact_friction_scale
-
-    t0, t1 = contact_tangent_basis(normal)
+    body_a, body_b, normal, point_a, point_b, phi = contact_geometry(
+        c,
+        contact_shape0,
+        contact_shape1,
+        contact_point0,
+        contact_point1,
+        contact_normal,
+        contact_thickness0,
+        contact_thickness1,
+        shape_body,
+        body_q,
+    )
+    mu, restitution = contact_materials(
+        contact_shape0[c], contact_shape1[c], shape_material_mu, shape_material_restitution
+    )
+    tangent0, tangent1 = contact_tangent_basis(normal)
+    friction_a, friction_b = contact_friction_points(
+        point_a, point_b, contact_shared_anchor, contact_friction_shared_anchor
+    )
     # Allocation owns the row extent; recomputing eligibility can cross a
     # floating-point threshold and overwrite the following contact.
     will_add_friction = contact_slots_needed[c] >= 3
-    contact_anchor_world = 0.5 * (point_a_world + point_b_world)
-    point_a_normal = point_a_world
-    point_b_normal = point_b_world
-    if contact_shared_anchor != 0:
-        point_a_normal = contact_anchor_world
-        point_b_normal = contact_anchor_world
-    point_a_friction = point_a_world
-    point_b_friction = point_b_world
-    if contact_shared_anchor != 0 or contact_friction_shared_anchor != 0:
-        point_a_friction = contact_anchor_world
-        point_b_friction = contact_anchor_world
-
     if r == 0:
         flags = 1
         if will_add_friction:
@@ -259,50 +222,29 @@ def _contact_row_prelude_one(
         if b_in:
             flags |= 8
         pre_flags[c] = flags
-        normal_target = prescribed_relative_contact_target(
-            body_a,
-            art_a,
-            body_b,
-            art_b,
-            point_a_normal,
-            point_b_normal,
-            normal,
-            prescribed_articulation,
-            articulation_origin,
-            body_v_s,
+    if r == 0 or will_add_friction:
+        direction, p0, p1 = contact_row_frame(
+            r, contact_shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
         )
-        world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONTACT
-        world_row_parent[world, slot] = -1
-        world_row_mu[world, slot] = mu
-        world_row_beta[world, slot] = pgs_beta
-        world_row_cfm[world, slot] = pgs_cfm
-        world_phi[world, slot] = phi
-        world_target_velocity[world, slot] = normal_target
-        world_row_restitution[world, slot] = restitution
-    elif will_add_friction:
-        direction = t0
-        if r == 2:
-            direction = t1
-        friction_target = prescribed_relative_contact_target(
-            body_a,
-            art_a,
-            body_b,
-            art_b,
-            point_a_friction,
-            point_b_friction,
-            direction,
-            prescribed_articulation,
-            articulation_origin,
-            body_v_s,
+        row = slot + r
+        if r == 0:
+            world_row_type[world, row] = PGS_CONSTRAINT_TYPE_CONTACT
+            world_row_parent[world, row] = -1
+            world_row_mu[world, row] = mu
+            world_row_beta[world, row] = pgs_beta
+            world_phi[world, row] = phi
+            world_row_restitution[world, row] = restitution
+        else:
+            world_row_type[world, row] = PGS_CONSTRAINT_TYPE_FRICTION
+            world_row_parent[world, row] = slot
+            world_row_mu[world, row] = mu * contact_friction_scale
+            world_row_beta[world, row] = 0.0
+            world_phi[world, row] = 0.0
+            world_row_restitution[world, row] = 0.0
+        world_row_cfm[world, row] = pgs_cfm
+        world_target_velocity[world, row] = prescribed_target(
+            body_a, art_a, body_b, art_b, p0, p1, direction, prescribed_articulation, articulation_origin, body_v_s
         )
-        world_row_type[world, slot + r] = PGS_CONSTRAINT_TYPE_FRICTION
-        world_row_parent[world, slot + r] = slot
-        world_row_mu[world, slot + r] = friction_mu
-        world_row_beta[world, slot + r] = 0.0
-        world_row_cfm[world, slot + r] = pgs_cfm
-        world_phi[world, slot + r] = 0.0
-        world_target_velocity[world, slot + r] = friction_target
-        world_row_restitution[world, slot + r] = 0.0
 
 
 @wp.kernel(enable_backward=False)
@@ -407,133 +349,48 @@ def _populate_world_J_masked_one(
     flags = pre_flags[c]
     if (flags & 1) == 0:
         return
-    slot = contact_slot[c]
-    art_a = contact_art_a[c]
-    art_b = contact_art_b[c]
-    a_in = (flags & 4) != 0
-    b_in = (flags & 8) != 0
-    will_add_friction = (flags & 2) != 0
-    shape_a = contact_shape0[c]
-    shape_b = contact_shape1[c]
-    body_a = -1
-    body_b = -1
-    if shape_a >= 0:
-        body_a = shape_body[shape_a]
-    if shape_b >= 0:
-        body_b = shape_body[shape_b]
-    # Geometry, identical arithmetic to the prelude / legacy builder.
-    normal = -contact_normal[c]
-    thickness_a = contact_thickness0[c]
-    thickness_b = contact_thickness1[c]
-    point_a_world = wp.vec3(0.0)
-    point_b_world = wp.vec3(0.0)
-    if body_a >= 0:
-        point_a_world = wp.transform_point(body_q[body_a], contact_point0[c]) - thickness_a * normal
-    else:
-        point_a_world = contact_point0[c] - thickness_a * normal
-    if body_b >= 0:
-        point_b_world = wp.transform_point(body_q[body_b], contact_point1[c]) + thickness_b * normal
-    else:
-        point_b_world = contact_point1[c] + thickness_b * normal
-    t0, t1 = contact_tangent_basis(normal)
-    contact_anchor_world = 0.5 * (point_a_world + point_b_world)
-    pan = point_a_world
-    pbn = point_b_world
-    if contact_shared_anchor != 0:
-        pan = contact_anchor_world
-        pbn = contact_anchor_world
-    paf = point_a_world
-    pbf = point_b_world
-    if contact_shared_anchor != 0 or contact_friction_shared_anchor != 0:
-        paf = contact_anchor_world
-        pbf = contact_anchor_world
-    bit = wp.uint32(1 << lane)
-
-    if a_in and lane < articulation_response_dof_count[art_a]:
-        group_a = art_group_idx[art_a]
-        origin_a = articulation_origin[art_a]
-        S_a = joint_S_s[art_dof_start[art_a] + lane]
-        jn = float(0.0)
-        jt0 = float(0.0)
-        jt1 = float(0.0)
-        if body_a >= 0 and (body_response_dof_mask[body_a] & bit) != wp.uint32(0):
-            jn += _projection(pan, origin_a, normal, S_a)
-            jt0 += _projection(paf, origin_a, t0, S_a)
-            jt1 += _projection(paf, origin_a, t1, S_a)
-        if b_in and art_b == art_a:
-            if body_b >= 0 and (body_response_dof_mask[body_b] & bit) != wp.uint32(0):
-                jn += -_projection(pbn, origin_a, normal, S_a)
-                jt0 += -_projection(pbf, origin_a, t0, S_a)
-                jt1 += -_projection(pbf, origin_a, t1, S_a)
-        if articulation_response_dof_count[art_a] == size_a:
-            J_group_a[group_a, slot, lane] = jn
-            if will_add_friction:
-                J_group_a[group_a, slot + 1, lane] = jt0
-                J_group_a[group_a, slot + 2, lane] = jt1
-        else:
-            J_group_b[group_a, slot, lane] = jn
-            if will_add_friction:
-                J_group_b[group_a, slot + 1, lane] = jt0
-                J_group_b[group_a, slot + 2, lane] = jt1
-    if b_in and (not a_in or art_b != art_a) and lane < articulation_response_dof_count[art_b]:
-        group_b = art_group_idx[art_b]
-        origin_b = articulation_origin[art_b]
-        S_b = joint_S_s[art_dof_start[art_b] + lane]
-        jn = float(0.0)
-        jt0 = float(0.0)
-        jt1 = float(0.0)
-        if body_b >= 0 and (body_response_dof_mask[body_b] & bit) != wp.uint32(0):
-            jn = -_projection(pbn, origin_b, normal, S_b)
-            jt0 = -_projection(pbf, origin_b, t0, S_b)
-            jt1 = -_projection(pbf, origin_b, t1, S_b)
-        if articulation_response_dof_count[art_b] == size_a:
-            J_group_a[group_b, slot, lane] = jn
-            if will_add_friction:
-                J_group_a[group_b, slot + 1, lane] = jt0
-                J_group_a[group_b, slot + 2, lane] = jt1
-        else:
-            J_group_b[group_b, slot, lane] = jn
-            if will_add_friction:
-                J_group_b[group_b, slot + 1, lane] = jt0
-                J_group_b[group_b, slot + 2, lane] = jt1
-
-
-@wp.func
-def _patch_contact_points(
-    c: int,
-    contact_point0: wp.array[wp.vec3],
-    contact_point1: wp.array[wp.vec3],
-    contact_normal: wp.array[wp.vec3],
-    contact_thickness0: wp.array[float],
-    contact_thickness1: wp.array[float],
-    body_a: int,
-    body_b: int,
-    body_q: wp.array[wp.transform],
-):
-    """Return the contact's normal (B to A) and its two world points, as the per-contact builder computes them."""
-    normal = -contact_normal[c]
-    point_a_world = wp.vec3(0.0)
-    point_b_world = wp.vec3(0.0)
-    if body_a >= 0:
-        point_a_world = wp.transform_point(body_q[body_a], contact_point0[c]) - contact_thickness0[c] * normal
-    else:
-        point_a_world = contact_point0[c] - contact_thickness0[c] * normal
-    if body_b >= 0:
-        point_b_world = wp.transform_point(body_q[body_b], contact_point1[c]) + contact_thickness1[c] * normal
-    else:
-        point_b_world = contact_point1[c] + contact_thickness1[c] * normal
-    return normal, point_a_world, point_b_world
-
-
-@wp.func
-def _contact_bodies(c: int, contact_shape0: wp.array[int], contact_shape1: wp.array[int], shape_body: wp.array[int]):
-    body_a = int(-1)
-    body_b = int(-1)
-    if contact_shape0[c] >= 0:
-        body_a = shape_body[contact_shape0[c]]
-    if contact_shape1[c] >= 0:
-        body_b = shape_body[contact_shape1[c]]
-    return body_a, body_b
+    body_a, body_b, normal, point_a, point_b, _phi = contact_geometry(
+        c,
+        contact_shape0,
+        contact_shape1,
+        contact_point0,
+        contact_point1,
+        contact_normal,
+        contact_thickness0,
+        contact_thickness1,
+        shape_body,
+        body_q,
+    )
+    tangent0, tangent1 = contact_tangent_basis(normal)
+    friction_a, friction_b = contact_friction_points(
+        point_a, point_b, contact_shared_anchor, contact_friction_shared_anchor
+    )
+    _write_contact_jacobian_lane(
+        lane,
+        flags,
+        contact_slot[c],
+        contact_art_a[c],
+        contact_art_b[c],
+        body_a,
+        body_b,
+        normal,
+        tangent0,
+        tangent1,
+        point_a,
+        point_b,
+        friction_a,
+        friction_b,
+        contact_shared_anchor,
+        size_a,
+        articulation_response_dof_count,
+        art_group_idx,
+        art_dof_start,
+        articulation_origin,
+        body_response_dof_mask,
+        joint_S_s,
+        J_group_a,
+        J_group_b,
+    )
 
 
 @wp.kernel(enable_backward=False)
@@ -699,31 +556,27 @@ def _contact_row_prelude_patch_one(
         return
 
     world = contact_world[c]
-    shape_a = contact_shape0[c]
-    shape_b = contact_shape1[c]
-    body_a, body_b = _contact_bodies(c, contact_shape0, contact_shape1, shape_body)
-    normal, point_a_world, point_b_world = _patch_contact_points(
+    body_a, body_b, normal, point_a, point_b, phi = contact_geometry(
         c,
+        contact_shape0,
+        contact_shape1,
         contact_point0,
         contact_point1,
         contact_normal,
         contact_thickness0,
         contact_thickness1,
-        body_a,
-        body_b,
+        shape_body,
         body_q,
     )
-    mu = 0.0
-    mat_count = 0
-    if shape_a >= 0:
-        mu += shape_material_mu[shape_a]
-        mat_count += 1
-    if shape_b >= 0:
-        mu += shape_material_mu[shape_b]
-        mat_count += 1
-    if mat_count > 0:
-        mu /= float(mat_count)
-
+    mu, restitution = contact_materials(
+        contact_shape0[c], contact_shape1[c], shape_material_mu, shape_material_restitution
+    )
+    tangent0, tangent1 = contact_tangent_basis(normal)
+    friction_a, friction_b = patch_friction_location(law.patches, c)
+    direction, p0, p1 = contact_row_frame(
+        r, contact_shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
+    )
+    row = slot + r
     if r == 0:
         flags = 1
         if will_add_friction:
@@ -733,58 +586,23 @@ def _contact_row_prelude_patch_one(
         if b_in:
             flags |= 8
         pre_flags[c] = flags
-        point_a_normal = point_a_world
-        point_b_normal = point_b_world
-        if contact_shared_anchor != 0:
-            contact_anchor_world = 0.5 * (point_a_world + point_b_world)
-            point_a_normal = contact_anchor_world
-            point_b_normal = contact_anchor_world
-        normal_target = prescribed_relative_contact_target(
-            body_a,
-            art_a,
-            body_b,
-            art_b,
-            point_a_normal,
-            point_b_normal,
-            normal,
-            prescribed_articulation,
-            articulation_origin,
-            body_v_s,
-        )
-        world_row_type[world, slot] = PGS_CONSTRAINT_TYPE_CONTACT
-        world_row_parent[world, slot] = -1
-        world_row_mu[world, slot] = mu
-        world_row_beta[world, slot] = pgs_beta
-        world_row_cfm[world, slot] = pgs_cfm
-        world_phi[world, slot] = wp.dot(normal, point_a_world - point_b_world)
-        world_target_velocity[world, slot] = normal_target
-        world_row_restitution[world, slot] = mixed_contact_restitution(shape_a, shape_b, shape_material_restitution)
+        world_row_type[world, row] = PGS_CONSTRAINT_TYPE_CONTACT
+        world_row_parent[world, row] = -1
+        world_row_mu[world, row] = mu
+        world_row_beta[world, row] = pgs_beta
+        world_phi[world, row] = phi
+        world_row_restitution[world, row] = restitution
     else:
-        t0, t1 = contact_tangent_basis(normal)
-        direction = t0
-        if r == 2:
-            direction = t1
-        point_a_friction, point_b_friction = patch_friction_location(law.patches, c)
-        friction_target = prescribed_relative_contact_target(
-            body_a,
-            art_a,
-            body_b,
-            art_b,
-            point_a_friction,
-            point_b_friction,
-            direction,
-            prescribed_articulation,
-            articulation_origin,
-            body_v_s,
-        )
-        world_row_type[world, slot + r] = PGS_CONSTRAINT_TYPE_FRICTION
-        world_row_parent[world, slot + r] = slot
-        world_row_mu[world, slot + r] = mu * contact_friction_scale
-        world_row_beta[world, slot + r] = law.beta
-        world_row_cfm[world, slot + r] = pgs_cfm
-        world_phi[world, slot + r] = law.patches.phi[c][r - 1]
-        world_target_velocity[world, slot + r] = friction_target
-        world_row_restitution[world, slot + r] = 0.0
+        world_row_type[world, row] = PGS_CONSTRAINT_TYPE_FRICTION
+        world_row_parent[world, row] = slot
+        world_row_mu[world, row] = mu * contact_friction_scale
+        world_row_beta[world, row] = law.beta
+        world_phi[world, row] = law.patches.phi[c][r - 1]
+        world_row_restitution[world, row] = 0.0
+    world_row_cfm[world, row] = pgs_cfm
+    world_target_velocity[world, row] = prescribed_target(
+        body_a, art_a, body_b, art_b, p0, p1, direction, prescribed_articulation, articulation_origin, body_v_s
+    )
 
 
 @wp.kernel(enable_backward=False)
@@ -830,26 +648,20 @@ def populate_world_J_masked_patch(
         flags = pre_flags[c]
         if (flags & 1) == 0:
             continue
-        body_a, body_b = _contact_bodies(c, contact_shape0, contact_shape1, shape_body)
-        normal, point_a_world, point_b_world = _patch_contact_points(
+        body_a, body_b, normal, point_a, point_b, _phi = contact_geometry(
             c,
+            contact_shape0,
+            contact_shape1,
             contact_point0,
             contact_point1,
             contact_normal,
             contact_thickness0,
             contact_thickness1,
-            body_a,
-            body_b,
+            shape_body,
             body_q,
         )
-        point_a_normal = point_a_world
-        point_b_normal = point_b_world
-        if contact_shared_anchor != 0:
-            contact_anchor_world = 0.5 * (point_a_world + point_b_world)
-            point_a_normal = contact_anchor_world
-            point_b_normal = contact_anchor_world
-        point_a_friction, point_b_friction = patch_friction_location(law.patches, c)
-        t0, t1 = contact_tangent_basis(normal)
+        tangent0, tangent1 = contact_tangent_basis(normal)
+        friction_a, friction_b = patch_friction_location(law.patches, c)
         _write_contact_jacobian_lane(
             lane,
             flags,
@@ -859,12 +671,13 @@ def populate_world_J_masked_patch(
             body_a,
             body_b,
             normal,
-            t0,
-            t1,
-            point_a_normal,
-            point_b_normal,
-            point_a_friction,
-            point_b_friction,
+            tangent0,
+            tangent1,
+            point_a,
+            point_b,
+            friction_a,
+            friction_b,
+            contact_shared_anchor,
             size_a,
             articulation_response_dof_count,
             art_group_idx,
@@ -887,12 +700,13 @@ def _write_contact_jacobian_lane(
     body_a: int,
     body_b: int,
     normal: wp.vec3,
-    t0: wp.vec3,
-    t1: wp.vec3,
-    point_a_normal: wp.vec3,
-    point_b_normal: wp.vec3,
-    point_a_friction: wp.vec3,
-    point_b_friction: wp.vec3,
+    tangent0: wp.vec3,
+    tangent1: wp.vec3,
+    point_a: wp.vec3,
+    point_b: wp.vec3,
+    friction_a: wp.vec3,
+    friction_b: wp.vec3,
+    shared_anchor: int,
     size_a: int,
     articulation_response_dof_count: wp.array[int],
     art_group_idx: wp.array[int],
@@ -905,57 +719,47 @@ def _write_contact_jacobian_lane(
 ):
     """Write one dof of a contact's normal row and, with flag bit 1, its two tangent rows.
 
-    Each entry is one signed projection, or two summed in the per-contact builder's order when both
-    bodies belong to the same articulation.
+    Each entry is one signed :func:`.contact_laws.jacobian_entry`, or two summed (A's first) when both bodies
+    belong to the same articulation. Rows act where :func:`.contact_laws.contact_row_frame` puts them.
     """
     a_in = (flags & 4) != 0
     b_in = (flags & 8) != 0
-    will_add_friction = (flags & 2) != 0
+    rows = 1
+    if (flags & 2) != 0:
+        rows = 3
     bit = wp.uint32(1 << lane)
     if a_in and lane < articulation_response_dof_count[art_a]:
-        group_a = art_group_idx[art_a]
-        origin_a = articulation_origin[art_a]
-        S_a = joint_S_s[art_dof_start[art_a] + lane]
-        jn = float(0.0)
-        jt0 = float(0.0)
-        jt1 = float(0.0)
-        if body_a >= 0 and (body_response_dof_mask[body_a] & bit) != wp.uint32(0):
-            jn += _projection(point_a_normal, origin_a, normal, S_a)
-            jt0 += _projection(point_a_friction, origin_a, t0, S_a)
-            jt1 += _projection(point_a_friction, origin_a, t1, S_a)
-        if b_in and art_b == art_a:
-            if body_b >= 0 and (body_response_dof_mask[body_b] & bit) != wp.uint32(0):
-                jn += -_projection(point_b_normal, origin_a, normal, S_a)
-                jt0 += -_projection(point_b_friction, origin_a, t0, S_a)
-                jt1 += -_projection(point_b_friction, origin_a, t1, S_a)
-        if articulation_response_dof_count[art_a] == size_a:
-            J_group_a[group_a, slot, lane] = jn
-            if will_add_friction:
-                J_group_a[group_a, slot + 1, lane] = jt0
-                J_group_a[group_a, slot + 2, lane] = jt1
-        else:
-            J_group_b[group_a, slot, lane] = jn
-            if will_add_friction:
-                J_group_b[group_a, slot + 1, lane] = jt0
-                J_group_b[group_a, slot + 2, lane] = jt1
+        group = art_group_idx[art_a]
+        origin = articulation_origin[art_a]
+        S = joint_S_s[art_dof_start[art_a] + lane]
+        a_moves = body_a >= 0 and (body_response_dof_mask[body_a] & bit) != wp.uint32(0)
+        b_moves = b_in and art_b == art_a and body_b >= 0 and (body_response_dof_mask[body_b] & bit) != wp.uint32(0)
+        for row in range(rows):
+            direction, p0, p1 = contact_row_frame(
+                row, shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
+            )
+            value = float(0.0)
+            if a_moves:
+                value += jacobian_entry(S, direction, p0, origin)
+            if b_moves:
+                value += -jacobian_entry(S, direction, p1, origin)
+            if articulation_response_dof_count[art_a] == size_a:
+                J_group_a[group, slot + row, lane] = value
+            else:
+                J_group_b[group, slot + row, lane] = value
     if b_in and (not a_in or art_b != art_a) and lane < articulation_response_dof_count[art_b]:
-        group_b = art_group_idx[art_b]
-        origin_b = articulation_origin[art_b]
-        S_b = joint_S_s[art_dof_start[art_b] + lane]
-        jn = float(0.0)
-        jt0 = float(0.0)
-        jt1 = float(0.0)
-        if body_b >= 0 and (body_response_dof_mask[body_b] & bit) != wp.uint32(0):
-            jn = -_projection(point_b_normal, origin_b, normal, S_b)
-            jt0 = -_projection(point_b_friction, origin_b, t0, S_b)
-            jt1 = -_projection(point_b_friction, origin_b, t1, S_b)
-        if articulation_response_dof_count[art_b] == size_a:
-            J_group_a[group_b, slot, lane] = jn
-            if will_add_friction:
-                J_group_a[group_b, slot + 1, lane] = jt0
-                J_group_a[group_b, slot + 2, lane] = jt1
-        else:
-            J_group_b[group_b, slot, lane] = jn
-            if will_add_friction:
-                J_group_b[group_b, slot + 1, lane] = jt0
-                J_group_b[group_b, slot + 2, lane] = jt1
+        group = art_group_idx[art_b]
+        origin = articulation_origin[art_b]
+        S = joint_S_s[art_dof_start[art_b] + lane]
+        b_moves = body_b >= 0 and (body_response_dof_mask[body_b] & bit) != wp.uint32(0)
+        for row in range(rows):
+            direction, p0, p1 = contact_row_frame(
+                row, shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
+            )
+            value = float(0.0)
+            if b_moves:
+                value = -jacobian_entry(S, direction, p1, origin)
+            if articulation_response_dof_count[art_b] == size_a:
+                J_group_a[group, slot + row, lane] = value
+            else:
+                J_group_b[group, slot + row, lane] = value

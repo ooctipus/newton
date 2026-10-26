@@ -8,9 +8,20 @@ from functools import cache
 
 import warp as wp
 
+from .contact_laws import (
+    contact_bodies,
+    contact_friction,
+    contact_friction_points,
+    contact_points,
+    contact_restitution,
+    contact_row_frame,
+    contact_tangent_basis,
+    free_body_jacobian,
+    prescribed_target,
+)
 from .device_preludes import dual_native, lane_group
 from .friction import _PAIR_METRIC
-from .friction_patches import FrictionPatches
+from .friction_patches import FrictionPatches, patch_friction_location
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -18,9 +29,6 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_CONSTRAINT_TYPE_MIMIC,
     contact_restitution_fires,
-    contact_tangent_basis,
-    mixed_contact_restitution,
-    prescribed_relative_contact_target,
 )
 from .sparse_mass_matrix import _SparseRowSupport
 from .sparse_row_projection import _sparse_contact_projection_source
@@ -484,15 +492,12 @@ def _get_sparse_contact_response_kernel(
             row_count = wp.min(contact_slots_needed[c], 3)
             if contact_path[c] != 0 or contact_slot[c] < 0 or row_count <= 0:
                 continue
-            body_a = int(-1)
-            body_b = int(-1)
-            if contact_shape0[c] >= 0:
-                body_a = shape_body[contact_shape0[c]]
-            if contact_shape1[c] >= 0:
-                body_b = shape_body[contact_shape1[c]]
+            body_a, body_b = contact_bodies(contact_shape0[c], contact_shape1[c], shape_body)
             art_a = contact_art_a[c]
             art_b = contact_art_b[c]
             normal = wp.vec3(0.0)
+            surface_a = wp.vec3(0.0)
+            surface_b = wp.vec3(0.0)
             point_a = wp.vec3(0.0)
             point_b = wp.vec3(0.0)
             friction_point_a = wp.vec3(0.0)
@@ -504,42 +509,51 @@ def _get_sparse_contact_response_kernel(
             if wp.static(prepare_rows):
                 cfm = rows.cfm
             if wp.static(prepare_rows) or lane == 0:
-                normal = -contact_normal[c]
-                point_a = contact_point0[c] - contact_thickness0[c] * normal
-                point_b = contact_point1[c] + contact_thickness1[c] * normal
-                if body_a >= 0:
-                    point_a = wp.transform_point(body_q[body_a], contact_point0[c]) - contact_thickness0[c] * normal
-                if body_b >= 0:
-                    point_b = wp.transform_point(body_q[body_b], contact_point1[c]) + contact_thickness1[c] * normal
-                gap = wp.dot(normal, point_a - point_b)
-                midpoint = 0.5 * (point_a + point_b)
-                if contact_shared_anchor != 0:
-                    point_a = midpoint
-                    point_b = midpoint
-                friction_point_a = point_a
-                friction_point_b = point_b
+                normal, surface_a, surface_b, gap = contact_points(
+                    contact_normal[c],
+                    contact_point0[c],
+                    contact_point1[c],
+                    contact_thickness0[c],
+                    contact_thickness1[c],
+                    body_a,
+                    body_b,
+                    body_q,
+                )
+                friction_point_a, friction_point_b = contact_friction_points(
+                    surface_a, surface_b, contact_shared_anchor, contact_friction_shared_anchor
+                )
                 if row_count > 1:
                     tangent0, tangent1 = contact_tangent_basis(normal)
-                    if contact_friction_shared_anchor != 0:
-                        friction_point_a = midpoint
-                        friction_point_b = midpoint
                     if friction_patches.enabled != 0:
-                        friction_point_a = friction_patches.point_a[c]
-                        friction_point_b = friction_patches.point_b[c]
+                        friction_point_a, friction_point_b = patch_friction_location(friction_patches, c)
+                # The normal row's endpoints.
+                _normal, point_a, point_b = contact_row_frame(
+                    0,
+                    contact_shared_anchor,
+                    normal,
+                    tangent0,
+                    tangent1,
+                    surface_a,
+                    surface_b,
+                    friction_point_a,
+                    friction_point_b,
+                )
             if wp.static(prepare_rows):
                 if lane < row_count:
                     world = contact_world[c]
                     slot = contact_slot[c] + lane
-                    direction = normal
-                    anchor_a = point_a
-                    anchor_b = point_b
-                    if lane != 0:
-                        direction = tangent0
-                        if lane == 2:
-                            direction = tangent1
-                        anchor_a = friction_point_a
-                        anchor_b = friction_point_b
-                    target = prescribed_relative_contact_target(
+                    direction, anchor_a, anchor_b = contact_row_frame(
+                        lane,
+                        contact_shared_anchor,
+                        normal,
+                        tangent0,
+                        tangent1,
+                        surface_a,
+                        surface_b,
+                        friction_point_a,
+                        friction_point_b,
+                    )
+                    target = prescribed_target(
                         body_a,
                         art_a,
                         body_b,
@@ -551,23 +565,14 @@ def _get_sparse_contact_response_kernel(
                         articulation_origin,
                         rows.body_velocity,
                     )
-                    mu = float(0.0)
-                    materials = int(0)
-                    if contact_shape0[c] >= 0:
-                        mu += rows.material_friction[contact_shape0[c]]
-                        materials += 1
-                    if contact_shape1[c] >= 0:
-                        mu += rows.material_friction[contact_shape1[c]]
-                        materials += 1
-                    if materials > 0:
-                        mu /= float(materials)
+                    mu = contact_friction(contact_shape0[c], contact_shape1[c], rows.material_friction)
                     beta = rows.beta
                     phi = gap
                     row_type = PGS_CONSTRAINT_TYPE_CONTACT
                     parent = int(-1)
                     restitution = float(0.0)
                     if lane == 0:
-                        restitution = mixed_contact_restitution(
+                        restitution = contact_restitution(
                             contact_shape0[c], contact_shape1[c], rows.material_restitution
                         )
                     else:
@@ -603,18 +608,20 @@ def _get_sparse_contact_response_kernel(
                 tangent1_a = wp.vec3(0.0)
                 tangent0_b = wp.vec3(0.0)
                 tangent1_b = wp.vec3(0.0)
+                # Each row's wrench about an endpoint's articulation origin: the angular part of the free-body
+                # Jacobian [d, (p - o) x d], whose product with a motion column is that column's Jacobian entry.
                 if art_a >= 0 and articulation_response_dof_count[art_a] > 0:
-                    normal_a = wp.cross(point_a - articulation_origin[art_a], normal)
+                    origin_a = articulation_origin[art_a]
+                    normal_a = wp.spatial_bottom(free_body_jacobian(normal, point_a, origin_a))
                     if row_count > 1:
-                        friction_arm_a = friction_point_a - articulation_origin[art_a]
-                        tangent0_a = wp.cross(friction_arm_a, tangent0)
-                        tangent1_a = wp.cross(friction_arm_a, tangent1)
+                        tangent0_a = wp.spatial_bottom(free_body_jacobian(tangent0, friction_point_a, origin_a))
+                        tangent1_a = wp.spatial_bottom(free_body_jacobian(tangent1, friction_point_a, origin_a))
                 if art_b >= 0 and articulation_response_dof_count[art_b] > 0:
-                    normal_b = wp.cross(point_b - articulation_origin[art_b], normal)
+                    origin_b = articulation_origin[art_b]
+                    normal_b = wp.spatial_bottom(free_body_jacobian(normal, point_b, origin_b))
                     if row_count > 1:
-                        friction_arm_b = friction_point_b - articulation_origin[art_b]
-                        tangent0_b = wp.cross(friction_arm_b, tangent0)
-                        tangent1_b = wp.cross(friction_arm_b, tangent1)
+                        tangent0_b = wp.spatial_bottom(free_body_jacobian(tangent0, friction_point_b, origin_b))
+                        tangent1_b = wp.spatial_bottom(free_body_jacobian(tangent1, friction_point_b, origin_b))
                 angular_a = wp.matrix_from_rows(normal_a, tangent0_a, tangent1_a)
                 angular_b = wp.matrix_from_rows(normal_b, tangent0_b, tangent1_b)
                 directions = wp.matrix_from_rows(normal, tangent0, tangent1)

@@ -21,6 +21,7 @@ import warp as wp
 
 from ...sim import ModelFlags
 from .contact_input import ContactInput, bind
+from .contact_laws import CONTACT_LAW, contact_friction
 from .device_preludes import dual_native, lane_group
 from .friction_patches import PatchRowLaw
 from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
@@ -95,16 +96,7 @@ def scatter_patch_contact_keys(data: ContactInput, z: KineticRows):
         if data.path[contact] == 0 and data.slot[contact] >= 0:
             world = data.world[contact]
             slot = data.slot[contact]
-            mu = float(0.0)
-            materials = int(0)
-            if data.shape0[contact] >= 0:
-                mu += data.material_mu[data.shape0[contact]]
-                materials += 1
-            if data.shape1[contact] >= 0:
-                mu += data.material_mu[data.shape1[contact]]
-                materials += 1
-            if materials > 0:
-                mu /= float(materials)
+            mu = contact_friction(data.shape0[contact], data.shape1[contact], data.material_mu)
             for direction in range(data.slots_needed[contact]):
                 row = slot + direction
                 z.rowkeys[world, row] = contact * 4 + direction
@@ -118,46 +110,19 @@ def scatter_patch_contact_keys(data: ContactInput, z: KineticRows):
                     data.row_mu[world, row] = mu * data.friction_scale
 
 
-def _patch_row_law(source):
-    """Turn a point row source into the patch row law, reading the linked parents and coefficients.
-
-    Tangent rows act at the patch friction location for both the Jacobian and
-    the prescribed target, carry the anchor's tangential phi, and correct it
-    with ``patch_law.beta``. The type, parent and coefficient of every contact
-    row stay as :func:`scatter_patch_contact_keys` and the patch link left them.
-    """
-    edits = (
-        (
-            "            const wp::vec3 anchor = 0.5f * (pa + pb); pa = anchor; pb = anchor;\n        }\n",
-            "            const wp::vec3 anchor = 0.5f * (pa + pb); pa = anchor; pb = anchor;\n        }\n"
-            "        if (r > 0) { pa = patch_law.patches.point_a.data[contact]; "
-            "pb = patch_law.patches.point_b.data[contact]; }\n",
-        ),
-        (
-            "const float phi = r == 0 ? separation : 0.0f;",
-            "const float phi = r == 0 ? separation : patch_law.patches.phi.data[contact][r - 1];",
-        ),
-        (
-            "        c.row_type.data[at] = r == 0 ? 0 : 2;\n"
-            "        c.row_parent.data[at] = r == 0 ? -1 : c.slot.data[contact];\n"
-            "        c.row_mu.data[at] = r == 0 ? mu : friction;\n"
-            "        c.row_beta.data[at] = r == 0 ? c.beta : 0.0f;\n",
-            "        if (r > 0) rhs += c.bias_scale * patch_law.beta * phi / c.dt;\n"
-            "        c.row_beta.data[at] = r == 0 ? c.beta : patch_law.beta;\n",
-        ),
-    )
-    for old, new in edits:
-        if source.count(old) != 1:
-            raise ValueError("the keyed row source changed; update the patch row law")
-        source = source.replace(old, new)
-    return source
+ROW_PRELUDES = CONTACT_LAW.preludes()
+"""Device preludes of the row source: the contact laws it calls (``ContactLaw::...``)."""
 
 
 def _row_source(*, layout, output="Jr[q]", private_metadata=False, patch=False):
     """Share row geometry and metadata between direct ingestion and the fallback.
 
-    ``patch`` writes the persistent patch row law and reads the linked parents
-    and coefficients (see :func:`_patch_row_law`).
+    A contact row takes its geometry, frame, target, materials and Jacobian entries
+    from the contact laws (:data:`ROW_PRELUDES`). ``patch`` writes the persistent
+    patch row law: tangent rows act at the patch friction location for both the
+    Jacobian and the prescribed target, carry the anchor's tangential phi and
+    correct it with ``patch_law.beta``; every row's type, parent and coefficient
+    stay as :func:`scatter_patch_contact_keys` and the patch link left them.
     """
     dofs = layout.dofs
     prefix = """
@@ -174,8 +139,7 @@ def _row_source(*, layout, output="Jr[q]", private_metadata=False, patch=False):
             if (n != ({layout.primary_test("q")} ? {layout.primary} : {layout.secondary})
                 || (c.body_mask.data[body] & (1u << local)) == 0u) continue;
             const wp::spatial_vector S = c.motion.data[c.dof_start.data[art] + local];
-            const wp::vec3 linear(S[0], S[1], S[2]), angular(S[3], S[4], S[5]);
-            value += sign * wp::dot(direction, linear + wp::cross(angular, point - c.origin.data[art]));
+            value += sign * ContactLaw::jacobian_entry(S, direction, point, c.origin.data[art]);
     """
     projection = """
         #pragma unroll
@@ -185,13 +149,31 @@ def _row_source(*, layout, output="Jr[q]", private_metadata=False, patch=False):
                 const int body = side == 0 ? ba : bb, art = side == 0 ? aa : ab;
                 if (body < 0 || art < 0) continue;
                 const float sign = side == 0 ? 1.0f : -1.0f;
-                const wp::vec3 point = side == 0 ? pa : pb;
+                const wp::vec3 point = side == 0 ? p0 : p1;
                 __PROJECT__
             }
             Jr[q] = value;
         }
         """.replace("__PROJECT__", physical_projection)
     incident = f"relative += Jr[q] * c.incident.data[z.maps.starts.data[world * 2 + ({layout.primary_test('q')} ? 0 : 1)] + {layout.local('q')}];"
+    if patch:
+        friction_location = (
+            "const wp::vec3 fa = patch_law.patches.point_a.data[contact], fb = patch_law.patches.point_b.data[contact];"
+        )
+        tangent_phi = "patch_law.patches.phi.data[contact][r - 1]"
+        row_law = (
+            "        if (r > 0) rhs += c.bias_scale * patch_law.beta * phi / c.dt;\n"
+            "        c.row_beta.data[at] = r == 0 ? c.beta : patch_law.beta;\n"
+        )
+    else:
+        friction_location = "const auto [fa, fb] = ContactLaw::contact_friction_points(pa, pb, c.shared_anchor, c.friction_shared_anchor);"
+        tangent_phi = "0.0f"
+        row_law = (
+            "        c.row_type.data[at] = r == 0 ? 0 : 2;\n"
+            "        c.row_parent.data[at] = r == 0 ? -1 : c.slot.data[contact];\n"
+            "        c.row_mu.data[at] = r == 0 ? mu : friction;\n"
+            "        c.row_beta.data[at] = r == 0 ? c.beta : 0.0f;\n"
+        )
     if not private_metadata:
         metadata = ""
     elif patch:
@@ -200,7 +182,7 @@ def _row_source(*, layout, output="Jr[q]", private_metadata=False, patch=False):
         metadata = (
             "built_rhs = rhs; built_mu = r == 0 ? mu : friction; built_parent = r == 0 ? -1 : c.slot.data[contact];"
         )
-    source = (
+    return (
         r"""
     const int at = world * z.rowkeys.shape[1] + row;
     const int key = z.rowkeys.data[at];
@@ -210,50 +192,24 @@ __PREFIX__
         const auto& c = z.contact;
         const int contact = key >> 2, r = key & 3;
         const int sa = c.shape0.data[contact], sb = c.shape1.data[contact];
-        const int ba = sa >= 0 ? c.shape_body.data[sa] : -1;
-        const int bb = sb >= 0 ? c.shape_body.data[sb] : -1;
+        const auto [ba, bb] = ContactLaw::contact_bodies(sa, sb, c.shape_body);
         const int aa = c.art0.data[contact], ab = c.art1.data[contact];
-        const wp::vec3 normal = -c.normal.data[contact];
-        wp::vec3 pa = ba >= 0 ? wp::transform_point(c.body_q.data[ba], c.point0.data[contact]) : c.point0.data[contact];
-        wp::vec3 pb = bb >= 0 ? wp::transform_point(c.body_q.data[bb], c.point1.data[contact]) : c.point1.data[contact];
-        pa = pa - c.margin0.data[contact] * normal;
-        pb = pb + c.margin1.data[contact] * normal;
-        const float separation = wp::dot(normal, pa - pb);
-        wp::vec3 direction = normal;
+        const auto [normal, pa, pb, separation] = ContactLaw::contact_points(
+            c.normal.data[contact], c.point0.data[contact], c.point1.data[contact],
+            c.margin0.data[contact], c.margin1.data[contact], ba, bb, c.body_q);
+        wp::vec3 t0(0.0f), t1(0.0f);
         if (r > 0) {
-            wp::vec3 t0 = wp::cross(normal, wp::vec3(1.0f, 0.0f, 0.0f));
-            if (wp::length_sq(t0) < 1.0e-12f) t0 = wp::cross(normal, wp::vec3(0.0f, 1.0f, 0.0f));
-            t0 = wp::normalize(t0);
-            direction = r == 1 ? t0 : wp::normalize(wp::cross(normal, t0));
+            const auto basis = ContactLaw::contact_tangent_basis(normal);
+            t0 = basis.v0;
+            t1 = basis.v1;
         }
-        if (c.shared_anchor != 0 || (r > 0 && c.friction_shared_anchor != 0)) {
-            const wp::vec3 anchor = 0.5f * (pa + pb); pa = anchor; pb = anchor;
-        }
-        float known = 0.0f;
-        for (int side = 0; side < 2; ++side) {
-            const int body = side == 0 ? ba : bb, art = side == 0 ? aa : ab;
-            if (body >= 0 && art >= 0 && c.prescribed.data[art] != 0) {
-                const wp::spatial_vector v = c.body_v.data[body];
-                const wp::vec3 linear(v[0], v[1], v[2]), angular(v[3], v[4], v[5]);
-                const wp::vec3 p = side == 0 ? pa : pb;
-                const float value = wp::dot(direction, linear + wp::cross(angular, p - c.origin.data[art]));
-                known += side == 0 ? value : -value;
-            }
-        }
-        const float target = -known;
-        float mu = 0.0f, restitution = 0.0f; int materials = 0;
-        for (int side = 0; side < 2; ++side) {
-            const int shape = side == 0 ? sa : sb;
-            if (shape >= 0) {
-                ++materials; mu += c.material_mu.data[shape];
-                const float rest = c.material_restitution.data[shape];
-                if (isfinite(rest)) restitution += rest < 0.0f ? 0.0f : (rest > 1.0f ? 1.0f : rest);
-            }
-        }
-        if (materials) { mu /= static_cast<float>(materials); restitution /= static_cast<float>(materials); }
+        __FRICTION_LOCATION__
+        const auto [direction, p0, p1] = ContactLaw::contact_row_frame(r, c.shared_anchor, normal, t0, t1, pa, pb, fa, fb);
+        const float target = ContactLaw::prescribed_target(ba, aa, bb, ab, p0, p1, direction, c.prescribed, c.origin, c.body_v);
+        const auto [mu, restitution] = ContactLaw::contact_materials(sa, sb, c.material_mu, c.material_restitution);
         const float friction = mu * c.friction_scale;
 __PROJECTION__
-        const float phi = r == 0 ? separation : 0.0f;
+        const float phi = r == 0 ? separation : __TANGENT_PHI__;
         float rhs = -target;
         if (r == 0) {
             rhs += (phi <= 0.0f ? c.bias_scale * c.beta : c.speculative_scale) * phi / c.dt;
@@ -265,24 +221,22 @@ __PROJECTION__
                     rhs = -target + restitution * relative;
             }
         }
-        c.row_type.data[at] = r == 0 ? 0 : 2;
-        c.row_parent.data[at] = r == 0 ? -1 : c.slot.data[contact];
-        c.row_mu.data[at] = r == 0 ? mu : friction;
-        c.row_beta.data[at] = r == 0 ? c.beta : 0.0f;
-        c.row_cfm.data[at] = c.cfm;
+__ROW_LAW__        c.row_cfm.data[at] = c.cfm;
         c.phi.data[at] = phi; c.target.data[at] = target;
         c.restitution.data[at] = r == 0 ? restitution : 0.0f;
         c.rhs.data[at] = rhs; c.diag.data[at] = c.cfm;
         __PRIVATE_METADATA__
     }
 """.replace("__PREFIX__", prefix)
+        .replace("__FRICTION_LOCATION__", friction_location)
         .replace("__PROJECTION__", projection)
         .replace("__INCIDENT__", incident)
+        .replace("__TANGENT_PHI__", tangent_phi)
+        .replace("__ROW_LAW__", row_law)
         .replace("__PRIVATE_METADATA__", metadata)
         .replace("__DOFS__", str(dofs))
         .replace("Jr[q]", output)
     )
-    return _patch_row_law(source) if patch else source
 
 
 def _fallback_source(layout, *, patch=False):
@@ -322,7 +276,7 @@ def _fallback_source(layout, *, patch=False):
     }.items():
         source = source.replace(key, str(value))
     # A warp per world on CUDA (launched in blocks of 32), one thread on the CPU.
-    return dual_native(source, preludes=(lane_group(32),))
+    return dual_native(source, preludes=(lane_group(32), *ROW_PRELUDES))
 
 
 @cache
@@ -411,6 +365,7 @@ def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=
         return ParallelRowInputs(
             stage=None,
             physical_row=reader,
+            preludes=ROW_PRELUDES,
             arguments=(
                 RowArgument("kinetic_rows", KineticRows, after="world_row_cfm"),
                 RowArgument("patch_law", PatchRowLaw, after="kinetic_rows"),
@@ -437,6 +392,7 @@ def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=
     return ParallelRowInputs(
         stage=None,
         physical_row=reader,
+        preludes=ROW_PRELUDES,
         arguments=(RowArgument("kinetic_rows", KineticRows, after="world_row_cfm"),),
         row_type=f"({key} >= 0 ? (({key} & 3) == 0 ? 0 : 2) : world_row_type.data[off_dense + i])",
         rhs=f"{key} < 0 ? rhs_bias.data[off_dense + i] : 0",

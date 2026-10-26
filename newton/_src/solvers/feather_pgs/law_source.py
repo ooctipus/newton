@@ -13,11 +13,12 @@ gives it two renderings:
   options (``fuse_fp`` included);
 * the CUDA function: a static member of the family's struct, which native
   sweeps call as ``Family::law(...)`` after declaring the family's device
-  prelude, :meth:`LawFamily.prelude`. :func:`render_cuda` writes it as a
-  sweep's author writes CUDA: one statement per Python statement, one
-  operation per Python operation in the same order, plain ``if``/``else``,
-  loops and component subscripts, so it compiles to the code of the
-  hand-written text it replaces.
+  prelude, :meth:`LawFamily.prelude` (whose CPU twin serves native bodies that
+  also run on the CPU, ``device_preludes.dual_native``). :func:`render_cuda`
+  writes it as a sweep's author writes CUDA: one statement per Python
+  statement, one operation per Python operation in the same order, plain
+  ``if``/``else``, loops and component subscripts, so it compiles to the code
+  of the hand-written text it replaces.
 
 Warp kernels call the Warp function rather than reach the CUDA text through
 ``wp.func_native``: a native function has no adjoint (its gradient is silently
@@ -57,13 +58,14 @@ from .device_preludes import DevicePrelude
 
 __all__ = ["LawFamily", "LawSignature", "law_preludes", "law_signature", "render_cuda"]
 
-# CUDA function qualifiers by inlining choice. A family's prelude sits after the native snippet's architecture
-# guard (``device_preludes.cuda_native``), so only NVRTC compiles it.
+# Function qualifiers by inlining choice. A family's prelude sits after the native snippet's architecture guard
+# (``device_preludes.cuda_native``); its CPU twin, for bodies ``dual_native`` composes, is the same text inline.
 _INLINE = {
     "force": "__device__ __forceinline__",
     "default": "__device__ inline",
     "never": "__device__ __noinline__",
 }
+_CPU_INLINE = "inline"
 
 # C++ keywords a Python name may collide with; such names take a trailing underscore.
 _CPP_KEYWORDS = frozenset(
@@ -258,7 +260,7 @@ class LawFamily:
     def prelude(self) -> DevicePrelude:
         """The device prelude declaring the family's struct of CUDA functions (rendered once)."""
         if self._prelude is None:
-            self._prelude = DevicePrelude(self.name, render_family(self))
+            self._prelude = DevicePrelude(self.name, render_family(self), cpu=render_family(self, cpu=True))
         return self._prelude
 
     def preludes(self) -> tuple[DevicePrelude, ...]:
@@ -319,8 +321,11 @@ def _required(family: LawFamily) -> list[LawFamily]:
     return found
 
 
-def render_family(family: LawFamily) -> str:
-    """Return the C++ text of ``family``'s struct: result structs, then one static function per law."""
+def render_family(family: LawFamily, *, cpu: bool = False) -> str:
+    """Return the C++ text of ``family``'s struct: result structs, then one static function per law.
+
+    ``cpu`` writes the CPU twin, whose functions are plain inline functions.
+    """
     laws = [entry for entry in family._laws if entry.cuda]
     lines = [f"    struct {family.name} {{"]
     for entry in laws:
@@ -328,19 +333,22 @@ def render_family(family: LawFamily) -> str:
             members = " ".join(f"{ctype} v{k};" for k, ctype in enumerate(entry.results))
             lines.append(f"        struct {entry.result_struct} {{ {members} }};")
     for entry in laws:
-        lines.append(render_cuda(entry.function, indent=" " * 8))
+        lines.append(render_cuda(entry.function, indent=" " * 8, cpu=cpu))
     lines.append("    };")
     return "\n".join(lines)
 
 
-def render_cuda(function, *, indent: str = "") -> str:
-    """Return the CUDA definition of a registered law: a static member of its family's struct."""
+def render_cuda(function, *, indent: str = "", cpu: bool = False) -> str:
+    """Return the CUDA definition of a registered law: a static member of its family's struct.
+
+    ``cpu`` writes it for the CPU twin of the family's prelude, the same text as a plain inline function.
+    """
     entry = _law_of(function)
     if entry is None:
         raise ValueError(f"{function!r} is not a registered law")
     if not entry.cuda:
         raise ValueError(f"law {entry.name} has no CUDA form")
-    return _Renderer(entry).render(indent)
+    return _Renderer(entry).render(indent, cpu)
 
 
 class LawSourceError(SyntaxError):
@@ -463,7 +471,7 @@ class _Renderer:
         return f"_{stem}{self.counter}"
 
     # --- rendering ------------------------------------------------------------------------------------------
-    def render(self, indent: str) -> str:
+    def render(self, indent: str, cpu: bool = False) -> str:
         entry = self.entry
         arguments = ", ".join(f"{_ctype(annotation)} {self.cname(name)}" for name, annotation in self.params.items())
         result = entry.result_struct if len(entry.results) > 1 else entry.results[0]
@@ -471,7 +479,8 @@ class _Renderer:
         self.lines = []
         if summary:
             self.lines.append(f"{indent}// {summary}")
-        self.lines.append(f"{indent}static {_INLINE[entry.inline]} {result} {entry.name}({arguments}) {{")
+        qualifiers = _CPU_INLINE if cpu else _INLINE[entry.inline]
+        self.lines.append(f"{indent}static {qualifiers} {result} {entry.name}({arguments}) {{")
         body = self.node.body
         if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
             body = body[1:]  # docstring

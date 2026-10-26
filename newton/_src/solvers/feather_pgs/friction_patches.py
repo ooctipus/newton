@@ -55,6 +55,7 @@ from ...core.live_sort import EXTENT_SIZE, SORT_CHUNK, launch_live_sort, publish
 from ...math.spatial import velocity_at_point
 from ...sim.contacts import GENERATION_SENTINEL, capture_scope, contact_frame_write
 from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
+from .contact_laws import contact_bodies, contact_points, contact_tangent_basis
 
 # Grids are fixed at construction so CUDA graphs replay them. Their sizes count
 # _BLOCK_THREADS threads per SM (one SM on the CPU); launches stride over the
@@ -125,9 +126,9 @@ class PatchRowLaw:
     displacement as phi and corrects it with ``beta`` (``friction_anchor_beta``). Producers write
     the undivided friction coefficient; the patch link (``_FrictionPatchState.link``, which
     launches ``link_patch_routes``) divides it and links the ring. The compact contact boundary
-    and the local row packets apply the law through :func:`patch_row_frame` and
-    :func:`patch_tangent_row`; keyed rows write it in their native row source
-    (``keyed_rows._patch_row_law``), and the masked row builder's patch variants
+    and the local row packets apply the law through ``contact_laws.contact_row_frame`` at
+    :func:`patch_friction_location` and :func:`patch_tangent_row`; keyed rows write it in their
+    native row source (``keyed_rows._patch_row_law``), and the masked row builder's patch variants
     (``row_build.contact_row_prelude_patch``) as the per-contact builder does.
     """
 
@@ -139,41 +140,6 @@ class PatchRowLaw:
 def patch_friction_location(patches: FrictionPatches, c: int):
     """Return contact ``c``'s friction location on each side, in world coordinates."""
     return patches.point_a[c], patches.point_b[c]
-
-
-@wp.func
-def patch_row_frame(
-    row: int,
-    shared_anchor: int,
-    normal: wp.vec3,
-    tangent0: wp.vec3,
-    tangent1: wp.vec3,
-    point0: wp.vec3,
-    point1: wp.vec3,
-    friction0: wp.vec3,
-    friction1: wp.vec3,
-):
-    """Return contact row ``row``'s direction and endpoints under the patch row law.
-
-    The normal row (row 0) acts at the contact points ``point0`` and ``point1``, or at their
-    midpoint with ``shared_anchor``. Tangent rows 1 and 2 act along ``tangent0`` and ``tangent1``
-    at the friction location ``friction0`` and ``friction1`` (:func:`patch_friction_location`),
-    which takes the place of both shared anchors.
-    """
-    direction = normal
-    p0 = point0
-    p1 = point1
-    if row == 0:
-        if shared_anchor != 0:
-            p0 = 0.5 * (point0 + point1)
-            p1 = p0
-    else:
-        direction = tangent0
-        if row == 2:
-            direction = tangent1
-        p0 = friction0
-        p1 = friction1
-    return direction, p0, p1
 
 
 @wp.func
@@ -273,22 +239,14 @@ def _prepare_contact(
         return
     sa = shape0[c]
     sb = shape1[c]
-    a = int(-1)
-    b = int(-1)
-    if sa >= 0:
-        a = shape_body[sa]
-    if sb >= 0:
-        b = shape_body[sb]
+    a, b = contact_bodies(sa, sb, shape_body)
     ka = a + 1
     kb = b + 1
     if a < 0:
         ka = q.shape[0] + (sa if sa >= 0 else shape_body.shape[0]) + 1
     if b < 0:
         kb = q.shape[0] + (sb if sb >= 0 else shape_body.shape[0]) + 1
-    n = -normal[c]
-    pa = _world_point(q, a, point0[c]) - margin0[c] * n
-    pb = _world_point(q, b, point1[c]) + margin1[c] * n
-    gap = wp.dot(n, pa - pb)
+    n, pa, pb, gap = contact_points(normal[c], point0[c], point1[c], margin0[c], margin1[c], a, b, q)
     art_a = int(-1)
     art_b = int(-1)
     if a >= 0 and a < body_to_articulation.shape[0]:
@@ -404,22 +362,14 @@ def _prepare_contact_fields(
         return wp.int64(0x7FFFFFFFFFFFFFFF)
     sa = shape0[c]
     sb = shape1[c]
-    a = int(-1)
-    b = int(-1)
-    if sa >= 0:
-        a = shape_body[sa]
-    if sb >= 0:
-        b = shape_body[sb]
+    a, b = contact_bodies(sa, sb, shape_body)
     ka = a + 1
     kb = b + 1
     if a < 0:
         ka = q.shape[0] + (sa if sa >= 0 else shape_body.shape[0]) + 1
     if b < 0:
         kb = q.shape[0] + (sb if sb >= 0 else shape_body.shape[0]) + 1
-    n = -normal[c]
-    pa = _world_point(q, a, point0[c]) - margin0[c] * n
-    pb = _world_point(q, b, point1[c]) + margin1[c] * n
-    gap = wp.dot(n, pa - pb)
+    n, pa, pb, gap = contact_points(normal[c], point0[c], point1[c], margin0[c], margin1[c], a, b, q)
     art_a = int(-1)
     art_b = int(-1)
     if a >= 0 and a < body_to_articulation.shape[0]:
@@ -2007,17 +1957,6 @@ def link_patch_routes(
             parents = _route_parents(routes, route)
             mu = _route_mu(routes, route)
             _link_contact(c, patches, world, slot, path, slots_needed, route, parents, mu)
-
-
-@wp.func
-def contact_tangent_basis(n: wp.vec3):
-    """Return the deterministic tangent pair every FeatherPGS friction row uses for ``n``."""
-    tangent0 = wp.cross(n, wp.vec3(1.0, 0.0, 0.0))
-    if wp.length_sq(tangent0) < 1.0e-12:
-        tangent0 = wp.cross(n, wp.vec3(0.0, 1.0, 0.0))
-    tangent0 = wp.normalize(tangent0)
-    tangent1 = wp.normalize(wp.cross(n, tangent0))
-    return tangent0, tangent1
 
 
 @wp.func

@@ -21,7 +21,8 @@ import os
 import numpy as np
 import warp as wp
 
-from .kernels import contact_restitution_fires, mixed_contact_restitution
+from .contact_laws import contact_points_endpoint_relative, contact_responds, contact_restitution, jacobian_entry
+from .kernels import contact_restitution_fires
 
 LANES = 32
 
@@ -369,7 +370,8 @@ def _endpoint_speed(
                 data.v_hat[start + 4],
                 data.v_hat[start + 5],
             )
-        value = wp.dot(normal, wp.spatial_top(twist) + wp.cross(wp.spatial_bottom(twist), lever))
+        # The lever is already relative to the twist's origin (endpoint-relative arithmetic).
+        value = jacobian_entry(twist, normal, lever, wp.vec3(0.0))
     return value
 
 
@@ -407,16 +409,14 @@ def _check_normal(c: int, raw: RawContacts, data: ResolvedWorldInput, scratch: R
     if art_a >= data.art_to_world.shape[0] or art_b >= data.art_to_world.shape[0]:
         wp.atomic_max(scratch.global_invalid, 0, 1)
         return
-    responds_a = False
-    responds_b = False
-    dofs_a = False
-    dofs_b = False
-    if art_a >= 0:
-        dofs_a = data.articulation_response_dof_count[art_a] > 0
-        responds_a = dofs_a and data.body_has_response_dofs[body_a] != 0 and (data.body_flags[body_a] & 2) == 0
-    if art_b >= 0:
-        dofs_b = data.articulation_response_dof_count[art_b] > 0
-        responds_b = dofs_b and data.body_has_response_dofs[body_b] != 0 and (data.body_flags[body_b] & 2) == 0
+    dofs_a = art_a >= 0 and data.articulation_response_dof_count[art_a] > 0
+    dofs_b = art_b >= 0 and data.articulation_response_dof_count[art_b] > 0
+    responds_a = contact_responds(
+        art_a, body_a, data.articulation_response_dof_count, data.body_has_response_dofs, data.body_flags
+    )
+    responds_b = contact_responds(
+        art_b, body_b, data.articulation_response_dof_count, data.body_has_response_dofs, data.body_flags
+    )
     if not responds_a and not responds_b:
         return
     if world < 0 or world >= scratch.resolved.shape[0]:
@@ -457,20 +457,9 @@ def _check_normal(c: int, raw: RawContacts, data: ResolvedWorldInput, scratch: R
         wp.atomic_max(scratch.rejected, world, 1)
         return
     # Endpoint-relative gap/lever arithmetic avoids subtracting rounded large world points.
-    translation_a = wp.vec3(0.0)
-    translation_b = wp.vec3(0.0)
-    offset_a = raw.point0[c] - raw.margin0[c] * n
-    offset_b = raw.point1[c] + raw.margin1[c] * n
-    if body_a >= 0:
-        pose = data.body_q[body_a]
-        translation_a = wp.transform_get_translation(pose)
-        offset_a = wp.quat_rotate(wp.transform_get_rotation(pose), raw.point0[c]) - raw.margin0[c] * n
-    if body_b >= 0:
-        pose = data.body_q[body_b]
-        translation_b = wp.transform_get_translation(pose)
-        offset_b = wp.quat_rotate(wp.transform_get_rotation(pose), raw.point1[c]) + raw.margin1[c] * n
-    separation = (translation_a - translation_b) + (offset_a - offset_b)
-    phi = wp.dot(n, separation)
+    _normal, translation_a, offset_a, translation_b, offset_b, separation, phi = contact_points_endpoint_relative(
+        raw.normal[c], raw.point0[c], raw.point1[c], raw.margin0[c], raw.margin1[c], body_a, body_b, data.body_q
+    )
     lever_a = offset_a
     lever_b = offset_b
     if art_a >= 0:
@@ -503,7 +492,7 @@ def _check_normal(c: int, raw: RawContacts, data: ResolvedWorldInput, scratch: R
                     cap = cap_b
             if cap > 0.0 and wp.isfinite(cap):
                 bias = wp.max(bias, -cap)
-    restitution = mixed_contact_restitution(shape_a, shape_b, raw.shape_restitution)
+    restitution = contact_restitution(shape_a, shape_b, raw.shape_restitution)
     if restitution > 0.0 and contact_restitution_fires(phi, incident, data.dt, data.restitution_threshold):
         bias = restitution * incident
     residual = incident + bias
@@ -575,20 +564,16 @@ def _free_route_world(c: int, raw: RawContacts, data: ResolvedWorldInput, worlds
         if world >= 0 and world != other:
             return int(-1)
         world = other
-    dofs_a = False
-    dofs_b = False
-    responds_a = False
-    responds_b = False
-    free_a = False
-    free_b = False
-    if art_a >= 0:
-        dofs_a = data.articulation_response_dof_count[art_a] > 0
-        responds_a = dofs_a and data.body_has_response_dofs[body_a] != 0 and (data.body_flags[body_a] & 2) == 0
-        free_a = data.is_free_rigid[art_a] != 0
-    if art_b >= 0:
-        dofs_b = data.articulation_response_dof_count[art_b] > 0
-        responds_b = dofs_b and data.body_has_response_dofs[body_b] != 0 and (data.body_flags[body_b] & 2) == 0
-        free_b = data.is_free_rigid[art_b] != 0
+    dofs_a = art_a >= 0 and data.articulation_response_dof_count[art_a] > 0
+    dofs_b = art_b >= 0 and data.articulation_response_dof_count[art_b] > 0
+    free_a = art_a >= 0 and data.is_free_rigid[art_a] != 0
+    free_b = art_b >= 0 and data.is_free_rigid[art_b] != 0
+    responds_a = contact_responds(
+        art_a, body_a, data.articulation_response_dof_count, data.body_has_response_dofs, data.body_flags
+    )
+    responds_b = contact_responds(
+        art_b, body_b, data.articulation_response_dof_count, data.body_has_response_dofs, data.body_flags
+    )
     if (not responds_a and not responds_b) or world < 0 or world >= worlds:
         return int(-1)
     if (dofs_a and not free_a) or (dofs_b and not free_b):

@@ -23,6 +23,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs.contact_filters import contact_friction_eligible, contact_normal_gap_limit
+from newton._src.solvers.feather_pgs.contact_laws import contact_tangent_basis
 from newton._src.solvers.feather_pgs.friction_patches import (
     _FOOTPRINT_TOLERANCE,
     FrictionPatches,
@@ -34,7 +35,6 @@ from newton._src.solvers.feather_pgs.friction_patches import (
     _point_velocity,
     _pose_motion,
     _world_point,
-    contact_tangent_basis,
     patch_normal_load,
     patch_routes,
 )

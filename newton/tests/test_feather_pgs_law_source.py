@@ -27,7 +27,6 @@ from newton.tests.feather_pgs_law_harness import (
     launch,
     mismatches,
     register_device_tests,
-    require_cuda,
     twin_inputs,
     twin_kernels,
 )
@@ -132,18 +131,17 @@ def test_twins_agree(test, device):
     An iterative law's samples agree within its tolerance but for rare ones whose solve takes the other branch of
     a convergence or sticking test (``TWIN_TOLERANCES``).
     """
-    require_cuda(test, device)
     rng = np.random.default_rng(1234)
     for name, law in LAWS.items():
         sig = law_source.law_signature(law)
         if not sig.cuda:
             continue
         with test.subTest(law=name):
-            warp_kernel, cuda_kernel = twin_kernels(law)
+            warp_kernel, native_kernel = twin_kernels(law)
             inputs = twin_inputs(name, rng, TWIN_SAMPLES, device)
             warp_results = launch(warp_kernel, TWIN_SAMPLES, inputs, sig, device)
-            cuda_results = launch(cuda_kernel, TWIN_SAMPLES, inputs, sig, device)
-            for k, (a, b) in enumerate(zip(warp_results, cuda_results, strict=True)):
+            native_results = launch(native_kernel, TWIN_SAMPLES, inputs, sig, device)
+            for k, (a, b) in enumerate(zip(warp_results, native_results, strict=True)):
                 if name in TWIN_TOLERANCES and a.dtype.kind == "f":
                     key, bound = TWIN_TOLERANCES[name]
                     a64 = a.reshape(TWIN_SAMPLES, -1).astype(np.float64)

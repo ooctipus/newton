@@ -448,24 +448,31 @@ class TestResolvedWorlds(unittest.TestCase):
         self.assertEqual(ast.dump(twin), ast.dump(base))
 
     def test_patch_release_repeats_the_allocator_admission(self):
-        """Mark a resolved contact after exactly the checks that precede the allocator's row reservation."""
+        """Mark a resolved contact by the allocator's own admission, the checks that precede its row reservation."""
         helper = _definition(kernels._allocate_world_contact_slot)
         release = _definition(kernels._mark_resolved_patch_contact)
         parameters = {argument.arg: ast.dump(argument.annotation) for argument in helper.args.args}
         for argument in release.args.args:
             with self.subTest(parameter=argument.arg):
                 self.assertEqual(ast.dump(argument.annotation), parameters.get(argument.arg))
-        # Docstrings aside, the release is the helper's leading checks, through the normal gap
-        # rejection, followed by the resolved marking.
-        checks, marking = release.body[1:-2], release.body[-2:]
-        self.assertEqual([ast.dump(s) for s in checks], [ast.dump(s) for s in helper.body[1 : 1 + len(checks)]])
-        self.assertEqual(ast.unparse(checks[-1].test), "phi > normal_gap_limit")
+        # Docstrings aside, both open with the one admission, called with the same arguments.
+        admissions = [function.body[1].value for function in (helper, release)]
+        for call in admissions:
+            self.assertEqual(ast.unparse(call.func), "_admit_contact")
+        self.assertEqual(ast.dump(admissions[0]), ast.dump(admissions[1]))
+        # The release marks exactly the admitted contacts.
         self.assertEqual(
-            [ast.unparse(statement) for statement in marking],
-            ["contact_slot[c] = -1", "contact_path[c] = CONTACT_PATH_RESOLVED"],
+            [ast.unparse(statement) for statement in release.body[2:]],
+            [
+                "contact_slot[c] = -1",
+                "contact_path[c] = -1",
+                "if admitted:\n    contact_path[c] = CONTACT_PATH_RESOLVED",
+            ],
         )
-        # Past those checks only classification runs: every path reserves rows before any exit.
-        self.assertIs(_reserves_first(helper.body[1 + len(checks) :]), True)
+        # The allocator rejects what the admission rejects; past it only classification runs: every path
+        # reserves rows before any exit.
+        self.assertEqual(ast.unparse(helper.body[2].test), "not admitted")
+        self.assertIs(_reserves_first(helper.body[3:]), True)
 
     def test_patch_finish_releases_resolved_contacts_only(self):
         """The finish epilogue releases CONTACT_PATH_RESOLVED anchors, keeps unrouted ones and finishes routed ones."""

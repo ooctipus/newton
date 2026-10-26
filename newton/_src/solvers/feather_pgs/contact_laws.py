@@ -15,8 +15,9 @@ One law each, written once for Warp kernels and native CUDA (:mod:`.law_source`)
   apart from the rotated offsets (the resolved-world classifier's rounding), and
   :func:`contact_points_oracle` reproduces the retained host oracle of contact
   torsion (its callers compile with ``fuse_fp`` off; Warp only);
-* materials: :func:`contact_materials`, the friction coefficient and the
-  restitution averaged over the present shapes;
+* materials: :func:`contact_materials`, the friction coefficient
+  (:func:`contact_friction`) and the restitution (:func:`contact_restitution`)
+  averaged over the present shapes;
 * row frame: :func:`contact_tangent_basis`, :func:`contact_friction_points` (the
   point law's friction location) and :func:`contact_row_frame`, each row's
   direction and endpoints under the point or patch law (``patch_row_frame``);
@@ -245,36 +246,53 @@ def contact_points_oracle(
 
 
 @CONTACT_LAW.law
+def contact_friction(shape_a: int, shape_b: int, shape_mu: wp.array[float]) -> float:
+    """Return a contact's friction coefficient: the plain mean over its present shapes."""
+    mu = float(0.0)
+    count = int(0)
+    if shape_a >= 0:
+        mu += shape_mu[shape_a]
+        count += 1
+    if shape_b >= 0:
+        mu += shape_mu[shape_b]
+        count += 1
+    if count > 0:
+        mu /= float(count)
+    return mu
+
+
+@CONTACT_LAW.law
+def contact_restitution(shape_a: int, shape_b: int, shape_restitution: wp.array[float]) -> float:
+    """Return a contact's restitution: the mean over its present shapes of each one clamped to ``[0, 1]``.
+
+    A non-finite value counts as 0.
+    """
+    restitution = float(0.0)
+    count = int(0)
+    if shape_a >= 0:
+        value_a = shape_restitution[shape_a]
+        if wp.isfinite(value_a):
+            restitution += wp.clamp(value_a, 0.0, 1.0)
+        count += 1
+    if shape_b >= 0:
+        value_b = shape_restitution[shape_b]
+        if wp.isfinite(value_b):
+            restitution += wp.clamp(value_b, 0.0, 1.0)
+        count += 1
+    if count > 0:
+        restitution /= float(count)
+    return restitution
+
+
+@CONTACT_LAW.law
 def contact_materials(
     shape_a: int,
     shape_b: int,
     shape_mu: wp.array[float],
     shape_restitution: wp.array[float],
 ) -> tuple[float, float]:
-    """Return a contact's friction coefficient and restitution: the means over its present shapes.
-
-    Restitution counts each present shape, ignores a non-finite value and clamps
-    each to ``[0, 1]``; the friction coefficient is the plain mean.
-    """
-    mu = float(0.0)
-    restitution = float(0.0)
-    count = int(0)
-    if shape_a >= 0:
-        mu += shape_mu[shape_a]
-        value_a = shape_restitution[shape_a]
-        if wp.isfinite(value_a):
-            restitution += wp.clamp(value_a, 0.0, 1.0)
-        count += 1
-    if shape_b >= 0:
-        mu += shape_mu[shape_b]
-        value_b = shape_restitution[shape_b]
-        if wp.isfinite(value_b):
-            restitution += wp.clamp(value_b, 0.0, 1.0)
-        count += 1
-    if count > 0:
-        mu /= float(count)
-        restitution /= float(count)
-    return mu, restitution
+    """Return a contact's friction coefficient and restitution (:func:`contact_friction`, :func:`contact_restitution`)."""
+    return contact_friction(shape_a, shape_b, shape_mu), contact_restitution(shape_a, shape_b, shape_restitution)
 
 
 @CONTACT_LAW.law

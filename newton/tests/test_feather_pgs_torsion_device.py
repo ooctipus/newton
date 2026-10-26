@@ -14,12 +14,8 @@ import newton
 from newton import GeoType
 from newton._src.solvers.feather_pgs import contact_torsion as host
 from newton._src.solvers.feather_pgs import solver_feather_pgs
-from newton._src.solvers.feather_pgs.contact_torsion_device import (
-    DeviceTorsionPreparation,
-    _host_dot3,
-    _host_transform_point,
-    enable_device_torsion,
-)
+from newton._src.solvers.feather_pgs.contact_laws import oracle_dot3, oracle_transform_point
+from newton._src.solvers.feather_pgs.contact_torsion_device import DeviceTorsionPreparation, enable_device_torsion
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -38,8 +34,8 @@ def _rounding_samples(
     dotted: wp.array[float],
 ):
     i = wp.tid()
-    transformed[i] = _host_transform_point(poses[i], points[i])
-    dotted[i] = _host_dot3(points[i], directions[i])
+    transformed[i] = oracle_transform_point(poses[i], points[i])
+    dotted[i] = oracle_dot3(points[i], directions[i])
 
 
 def synthetic_fixture(*, worlds=3, witnesses=5, patches=True, seed=4, device="cpu", padding=7):

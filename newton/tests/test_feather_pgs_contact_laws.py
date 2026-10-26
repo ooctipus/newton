@@ -1,10 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The contact front end against every contact-row producer it replaces.
+"""The contact-row producers against the contact laws they compose.
 
-Geometry, materials, row frames, prescribed targets and Jacobian entries, with the
-two arithmetic contracts kept as modes (endpoint-relative, torsion oracle).
+Geometry, materials, row frames, prescribed targets and Jacobian entries: each
+producer's rows equal the laws' composition written out in this module. The two
+arithmetic contracts kept as modes are tested with their consumers (endpoint-relative
+in ``test_feather_pgs_resolved_worlds``, the torsion oracle in
+``test_feather_pgs_torsion_device``).
 """
 
 import unittest
@@ -12,14 +15,10 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import contact_filters, contact_laws, contact_torsion_device, kernels
+from newton._src.solvers.feather_pgs import contact_filters, contact_laws, kernels
 from newton.tests.feather_pgs_law_harness import (
-    anchored,
     assert_reproduces,
     call,
-    dedent_block,
-    mismatches,
-    reference_kernel,
     register_device_tests,
     transforms,
     unit_vectors,
@@ -867,149 +866,6 @@ def test_jacobian_entry_matches_ancestor_walk(test, device):
     arm = np.abs(values["point"] - values["origin"]).sum(axis=1)
     entry = np.abs(values["joint_S_s"]).sum(axis=1).max() * (1.0 + arm)
     assert_reproduces(test, device, out["J_group"].numpy()[0], law["J_group"].numpy()[0], entry, "ancestor walk J")
-
-
-# The resolved-world classifier's endpoint-relative gap, as resolved_worlds._check_normal writes it; the test
-# first finds these lines there.
-_ENDPOINT_RELATIVE = """
-    translation_a = wp.vec3(0.0)
-    translation_b = wp.vec3(0.0)
-    offset_a = raw.point0[c] - raw.margin0[c] * n
-    offset_b = raw.point1[c] + raw.margin1[c] * n
-    if body_a >= 0:
-        pose = data.body_q[body_a]
-        translation_a = wp.transform_get_translation(pose)
-        offset_a = wp.quat_rotate(wp.transform_get_rotation(pose), raw.point0[c]) - raw.margin0[c] * n
-    if body_b >= 0:
-        pose = data.body_q[body_b]
-        translation_b = wp.transform_get_translation(pose)
-        offset_b = wp.quat_rotate(wp.transform_get_rotation(pose), raw.point1[c]) + raw.margin1[c] * n
-    separation = (translation_a - translation_b) + (offset_a - offset_b)
-    phi = wp.dot(n, separation)
-"""
-
-
-def test_endpoint_relative_mode_matches_resolved_worlds(test, device):
-    """Equal the resolved-world classifier's endpoint-relative gap and offsets bitwise."""
-    anchored(test, "resolved_worlds.py", _ENDPOINT_RELATIVE)
-    body = (
-        "c = wp.tid()\nn = normal[c]\nbody_a = bodies[c][0]\nbody_b = bodies[c][1]\n"
-        + dedent_block(_ENDPOINT_RELATIVE)
-        .replace("raw.point0", "point0")
-        .replace("raw.point1", "point1")
-        .replace("raw.margin0", "margin0")
-        .replace("raw.margin1", "margin1")
-        .replace("data.body_q", "body_q")
-        + "out_phi[c] = phi\nout_sep[c] = separation\n"
-    )
-    signature = (
-        "normal: wp.array[wp.vec3], point0: wp.array[wp.vec3], point1: wp.array[wp.vec3], "
-        "margin0: wp.array[float], margin1: wp.array[float], bodies: wp.array[wp.vec2i], "
-        "body_q: wp.array[wp.transform], out_phi: wp.array[float], out_sep: wp.array[wp.vec3]"
-    )
-    reference = reference_kernel("resolved_endpoint_relative", signature, body, {})
-    law_body = (
-        "c = wp.tid()\n"
-        "normal_ba, ta, oa, tb, ob, separation, phi = law(-normal[c], point0[c], point1[c], margin0[c], margin1[c], "
-        "bodies[c][0], bodies[c][1], body_q)\nout_phi[c] = phi\nout_sep[c] = separation\n"
-    )
-    law = reference_kernel(
-        "law_endpoint_relative", signature, law_body, {"law": contact_laws.contact_points_endpoint_relative}
-    )
-    rng = np.random.default_rng(36)
-    n = 2048
-    values = {
-        "normal": unit_vectors(rng, n),
-        "point0": rng.normal(size=(n, 3)).astype(np.float32),
-        "point1": rng.normal(size=(n, 3)).astype(np.float32),
-        "margin0": np.abs(rng.normal(scale=0.01, size=n)).astype(np.float32),
-        "margin1": np.abs(rng.normal(scale=0.01, size=n)).astype(np.float32),
-        "bodies": rng.integers(-1, 8, (n, 2)).astype(np.int32),
-        "body_q": transforms(rng, 8) * np.array([100, 100, 100, 1, 1, 1, 1], dtype=np.float32),
-    }
-    a = call(reference, n, device, out_phi=np.zeros(n, np.float32), out_sep=np.zeros((n, 3), np.float32), **values)
-    b = call(law, n, device, out_phi=np.zeros(n, np.float32), out_sep=np.zeros((n, 3), np.float32), **values)
-    # Endpoint-relative: rounding relative to the translations' difference and the offsets, not to the translations.
-    translation = np.vstack([np.zeros(3), values["body_q"][:, :3]])[values["bodies"] + 1]
-    separation_terms = (
-        np.abs(translation[:, 0] - translation[:, 1]).sum(axis=1)
-        + np.abs(values["point0"]).sum(axis=1)
-        + np.abs(values["point1"]).sum(axis=1)
-        + values["margin0"]
-        + values["margin1"]
-    )
-    for name in ("out_phi", "out_sep"):
-        assert_reproduces(test, device, a[name].numpy(), b[name].numpy(), separation_terms, f"endpoint-relative {name}")
-
-
-@wp.kernel(module="unique", module_options={"fuse_fp": False})
-def _kernel_oracle_gap(
-    normals: wp.array[wp.vec3],
-    point_a: wp.array[wp.vec3],
-    point_b: wp.array[wp.vec3],
-    margin_a: wp.array[float],
-    margin_b: wp.array[float],
-    bodies: wp.array[wp.vec2i],
-    poses: wp.array[wp.transform],
-    gap_out: wp.array[float],
-    point_out: wp.array[wp.vec3],
-):
-    c = wp.tid()
-    # contact_torsion_device._gather's arithmetic, with its oracle helpers.
-    normal = -normals[c]
-    ba = bodies[c][0]
-    bb = bodies[c][1]
-    pa = point_a[c]
-    pb = point_b[c]
-    if ba >= 0:
-        pa = contact_torsion_device._host_transform_point(poses[ba], pa)
-    if bb >= 0:
-        pb = contact_torsion_device._host_transform_point(poses[bb], pb)
-    pa -= margin_a[c] * normal
-    pb += margin_b[c] * normal
-    gap_out[c] = contact_torsion_device._host_dot3(normal, pa - pb)
-    point_out[c] = 0.5 * (pa + pb)
-
-
-@wp.kernel(module="unique", module_options={"fuse_fp": False})
-def _law_oracle_gap(
-    normals: wp.array[wp.vec3],
-    point_a: wp.array[wp.vec3],
-    point_b: wp.array[wp.vec3],
-    margin_a: wp.array[float],
-    margin_b: wp.array[float],
-    bodies: wp.array[wp.vec2i],
-    poses: wp.array[wp.transform],
-    gap_out: wp.array[float],
-    point_out: wp.array[wp.vec3],
-):
-    c = wp.tid()
-    _normal, pa, pb, gap = contact_laws.contact_points_oracle(
-        normals[c], point_a[c], point_b[c], margin_a[c], margin_b[c], bodies[c][0], bodies[c][1], poses
-    )
-    gap_out[c] = gap
-    point_out[c] = 0.5 * (pa + pb)
-
-
-def test_oracle_mode_matches_torsion_preparation(test, device):
-    """Equal contact torsion's device gather, which reproduces its host oracle's rounding, bitwise."""
-    rng = np.random.default_rng(37)
-    n = 2048
-    values = {
-        "normals": unit_vectors(rng, n),
-        "point_a": rng.normal(size=(n, 3)).astype(np.float32),
-        "point_b": rng.normal(size=(n, 3)).astype(np.float32),
-        "margin_a": np.abs(rng.normal(scale=0.01, size=n)).astype(np.float32),
-        "margin_b": np.abs(rng.normal(scale=0.01, size=n)).astype(np.float32),
-        "bodies": rng.integers(-1, 8, (n, 2)).astype(np.int32),
-        "poses": transforms(rng, 8),
-        "gap_out": np.zeros(n, dtype=np.float32),
-        "point_out": np.zeros((n, 3), dtype=np.float32),
-    }
-    a = call(_kernel_oracle_gap, n, device, **values)
-    b = call(_law_oracle_gap, n, device, **values)
-    for name in ("gap_out", "point_out"):
-        test.assertFalse(mismatches(a[name].numpy().reshape(n, -1), b[name].numpy().reshape(n, -1)).any(), name)
 
 
 class TestFeatherPGSContactLaws(unittest.TestCase):

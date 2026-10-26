@@ -14,7 +14,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import compact_contact, friction_patches, kernels
+from newton._src.solvers.feather_pgs import compact_contact, contact_laws, friction_patches, kernels
 from newton._src.solvers.feather_pgs import row_packets as rp
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, link_patch_routes, patch_routes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
@@ -555,11 +555,7 @@ class TestRowPacketPatchRows(_PatchRowTwins, unittest.TestCase):
     """CPU twins, the owner's choice of the friction law, and the shared row law."""
 
     def test_patch_producers_share_one_row_law(self):
-        """Write patch rows through one shared row law in the packet and compact producers.
-
-        The general route's row kernels serve point friction too and keep their own copy, which the
-        twins compare against.
-        """
+        """Write patch rows through the contact row frame law and the patch tangent row in the packet and compact producers."""
         producers = (
             rp.produce_patch_contacts,
             rp.materialize_patch_fallback,
@@ -568,7 +564,7 @@ class TestRowPacketPatchRows(_PatchRowTwins, unittest.TestCase):
         for kernel in producers:
             name = f"{kernel.func.__module__}.{kernel.key}"
             called = _called_functions(kernel)
-            self.assertIn(friction_patches.patch_row_frame, called, name)
+            self.assertIn(contact_laws.contact_row_frame, called, name)
             # The fallback writes Jacobians alone; the producers also write the tangent rows' metadata.
             if kernel is not rp.materialize_patch_fallback:
                 self.assertIn(friction_patches.patch_tangent_row, called, name)

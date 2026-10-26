@@ -19478,7 +19478,8 @@ def _get_pgs_solve_parallel_kernel(
 #undef ZAT
 #endif
 """
-    snippet = cuda_native(snippet, preludes=(lane_group(NT), *((RING,) if linked_rows else ())))
+    row_preludes = operands.preludes if operands is not None else ()
+    snippet = cuda_native(snippet, preludes=(lane_group(NT), *((RING,) if linked_rows else ()), *row_preludes))
     if linked_rows:
         snippet = _link_parallel_friction_pairs(snippet)
 

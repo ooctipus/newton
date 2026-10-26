@@ -9,7 +9,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.friction_patches import contact_tangent_basis
+from newton._src.solvers.feather_pgs.contact_laws import contact_tangent_basis
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_contact_reduction_body_pairs import _cylinder_foot
 

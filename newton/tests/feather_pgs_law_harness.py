@@ -19,7 +19,7 @@ import warp as wp
 
 from newton._src.sim import JointType
 from newton._src.solvers.feather_pgs import contact_laws, kernels, law_source, projection_laws, row_laws
-from newton._src.solvers.feather_pgs.device_preludes import cuda_native
+from newton._src.solvers.feather_pgs.device_preludes import cuda_native, dual_native
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 FAMILIES = (contact_laws.CONTACT_LAW, row_laws.ROW_LAW, projection_laws.PROJECTION_LAW, projection_laws.COULOMB_LAW)
@@ -52,10 +52,12 @@ _TWIN_KERNELS = {}
 
 
 def twin_kernels(law):
-    """Return ``(warp_kernel, cuda_kernel)`` that evaluate ``law`` per thread through each rendering.
+    """Return ``(warp_kernel, native_kernel)`` that evaluate ``law`` per thread through each rendering.
 
     Both take, per value argument, an array of that type indexed by the thread;
     array arguments pass through unchanged; each result lands in its own array.
+    The native kernel calls the family's CUDA function on a CUDA device and its
+    CPU twin on the CPU.
     """
     if law in _TWIN_KERNELS:
         return _TWIN_KERNELS[law]
@@ -92,7 +94,7 @@ def twin_kernels(law):
         + "\n".join(stores)
         + "\n"
     )
-    # The CUDA twin: one native call per thread that writes every result.
+    # The native twin: one native call per thread that writes every result.
     if len(sig.results) == 1:
         value = "result"
         native_stores = [f"wp::index(out_0, i) = {'result ? 1 : 0' if _is_bool(sig.results[0]) else 'result'};"]
@@ -106,16 +108,16 @@ def twin_kernels(law):
     body = (
         f"    const auto {value} = {sig.family}::{sig.name}({', '.join(native_args)});\n    "
         + "\n    ".join(native_stores)
-        + "\n#endif\n"
+        + "\n"
     )
-    namespace["snippet"] = cuda_native(body, preludes=family.preludes())
-    cuda_source = (
+    namespace["snippet"] = dual_native(body, preludes=family.preludes())
+    native_source = (
         f"@wp.func_native(snippet)\ndef native(i: int, {signature}): ...\n\n"
-        f"def cuda_twin({signature}):\n    native(wp.tid(), {arguments})\n"
+        f"def native_twin({signature}):\n    native(wp.tid(), {arguments})\n"
     )
     kernels_pair = (
         exec_kernel("warp_twin", warp_source, dict(namespace)),
-        exec_kernel("cuda_twin", cuda_source, dict(namespace)),
+        exec_kernel("native_twin", native_source, dict(namespace)),
     )
     _TWIN_KERNELS[law] = kernels_pair
     return kernels_pair
@@ -339,7 +341,7 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
             "margin1": np.abs(scalars(rng, n, 0.01)),
             "body_q": body_q,
         }
-    if name == "contact_materials":
+    if name in ("contact_materials", "contact_friction", "contact_restitution"):
         values = np.array([0.5, 0.8, np.nan, -0.5, 1.5, np.inf, 0.0, 0.3], dtype=np.float32)
         return {**common, "shape_mu": rng.uniform(0, 1.5, 8).astype(np.float32), "shape_restitution": values}
     if name == "contact_tangent_basis":

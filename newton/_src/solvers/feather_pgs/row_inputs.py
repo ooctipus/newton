@@ -78,6 +78,8 @@ class ParallelRowInputs:
     parent: str
     mu: str
     physical_row: str | None = None
+    preludes: tuple = ()
+    """Device preludes (``device_preludes.DevicePrelude``) that :attr:`physical_row` calls into."""
 
 
 def make_row_kernel(name, snippet, signature, arguments=(), *, dispatch, groups=1, lanes=32, launch_bounds=None):

@@ -28,6 +28,17 @@ import warp as wp
 
 from ...sim import ModelFlags
 from .contact_input import ContactInput, bind
+from .contact_laws import (
+    contact_bodies,
+    contact_friction_points,
+    contact_geometry,
+    contact_materials,
+    contact_points,
+    contact_row_frame,
+    contact_tangent_basis,
+    jacobian_entry,
+    prescribed_target,
+)
 from .device_preludes import (
     dual_native,
     lane_group,
@@ -37,15 +48,12 @@ from .device_preludes import (
     warp_stride,
     warp_sync,
 )
-from .friction_patches import PatchRowLaw, patch_friction_location, patch_row_frame, patch_tangent_row
+from .friction_patches import PatchRowLaw, patch_friction_location, patch_tangent_row
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     contact_restitution_fires,
-    contact_tangent_basis,
-    mixed_contact_restitution,
-    prescribed_relative_contact_target,
 )
 from .row_inputs import CompactLocalRows, RowArgument
 
@@ -444,22 +452,21 @@ def general_diag(
 
 
 @wp.func
-def contact_points(data: ContactInput, contact: int):
-    """Apply the body-local point transforms, margins and normal sign of the ordinary producer."""
-    body0 = int(-1)
-    body1 = int(-1)
-    if data.shape0[contact] >= 0:
-        body0 = data.shape_body[data.shape0[contact]]
-    if data.shape1[contact] >= 0:
-        body1 = data.shape_body[data.shape1[contact]]
-    normal = -data.normal[contact]
-    point0 = data.point0[contact] - data.margin0[contact] * normal
-    point1 = data.point1[contact] + data.margin1[contact] * normal
-    if body0 >= 0:
-        point0 = wp.transform_point(data.body_q[body0], data.point0[contact]) - data.margin0[contact] * normal
-    if body1 >= 0:
-        point1 = wp.transform_point(data.body_q[body1], data.point1[contact]) + data.margin1[contact] * normal
-    return body0, body1, point0, point1
+def contact_geometry_of(data: ContactInput, contact: int):
+    """Contact ``contact``'s bodies, normal, world points and gap (:func:`.contact_laws.contact_geometry`)."""
+    body0, body1, normal, point0, point1, separation = contact_geometry(
+        contact,
+        data.shape0,
+        data.shape1,
+        data.point0,
+        data.point1,
+        data.normal,
+        data.margin0,
+        data.margin1,
+        data.shape_body,
+        data.body_q,
+    )
+    return body0, body1, normal, point0, point1, separation
 
 
 @wp.func
@@ -470,9 +477,7 @@ def endpoint_projection(
     value = float(0.0)
     if body >= 0 and art >= 0 and data.response_dofs[art] == size:
         if (data.body_mask[body] & (wp.uint32(1) << wp.uint32(dof))) != wp.uint32(0):
-            motion = data.motion[data.dof_start[art] + dof]
-            velocity = wp.spatial_top(motion) + wp.cross(wp.spatial_bottom(motion), point - data.origin[art])
-            value = wp.dot(direction, velocity)
+            value = jacobian_entry(data.motion[data.dof_start[art] + dof], direction, point, data.origin[art])
     return value
 
 
@@ -507,25 +512,31 @@ def produce_contacts(workers: int, data: ContactInput, packet: ContactPacketData
         rows = data.slots_needed[contact]
         art0 = data.art0[contact]
         art1 = data.art1[contact]
-        body0 = int(-1)
-        body1 = int(-1)
-        if data.shape0[contact] >= 0:
-            body0 = data.shape_body[data.shape0[contact]]
-        if data.shape1[contact] >= 0:
-            body1 = data.shape_body[data.shape1[contact]]
-        normal = -data.normal[contact]
+        body0, body1 = contact_bodies(data.shape0[contact], data.shape1[contact], data.shape_body)
+        normal = wp.vec3()
         point0 = wp.vec3()
         point1 = wp.vec3()
+        separation = float(0.0)
         tangent0 = wp.vec3()
         tangent1 = wp.vec3()
         if lane == 0:
-            _body0, _body1, point0, point1 = contact_points(data, contact)
+            normal, point0, point1, separation = contact_points(
+                data.normal[contact],
+                data.point0[contact],
+                data.point1[contact],
+                data.margin0[contact],
+                data.margin1[contact],
+                body0,
+                body1,
+                data.body_q,
+            )
             tangent0, tangent1 = contact_tangent_basis(normal)
+        normal = warp_broadcast(normal)
         point0 = warp_broadcast(point0)
         point1 = warp_broadcast(point1)
         tangent0 = warp_broadcast(tangent0)
         tangent1 = warp_broadcast(tangent1)
-        anchor = 0.5 * (point0 + point1)
+        friction0, friction1 = contact_friction_points(point0, point1, data.shared_anchor, data.friction_shared_anchor)
         for coefficient in range(lane, rows * width, stride):
             row = coefficient // width
             coordinate = coefficient % width
@@ -536,45 +547,24 @@ def produce_contacts(workers: int, data: ContactInput, packet: ContactPacketData
                 if coordinate >= primary:
                     size = secondary
                     dof -= primary
-                direction = normal
-                p0 = point0
-                p1 = point1
-                if row > 0:
-                    direction = tangent0 if row == 1 else tangent1
-                if data.shared_anchor != 0 or (row > 0 and data.friction_shared_anchor != 0):
-                    p0 = anchor
-                    p1 = anchor
+                direction, p0, p1 = contact_row_frame(
+                    row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
+                )
                 value = endpoint_projection(data, body0, art0, size, dof, p0, direction)
                 value -= endpoint_projection(data, body1, art1, size, dof, p1, direction)
                 packet.jacobian[world, output_row, coordinate] = value
         warp_sync()
         if lane == 0:
-            mu = float(0.0)
-            materials = int(0)
-            if data.shape0[contact] >= 0:
-                mu += data.material_mu[data.shape0[contact]]
-                materials += 1
-            if data.shape1[contact] >= 0:
-                mu += data.material_mu[data.shape1[contact]]
-                materials += 1
-            if materials > 0:
-                mu /= float(materials)
-            restitution = mixed_contact_restitution(
-                data.shape0[contact], data.shape1[contact], data.material_restitution
+            mu, restitution = contact_materials(
+                data.shape0[contact], data.shape1[contact], data.material_mu, data.material_restitution
             )
             friction_mu = mu * data.friction_scale
-            separation = wp.dot(normal, point0 - point1)
             for row in range(rows):
                 output_row = slot + row
-                direction = normal
-                p0 = point0
-                p1 = point1
-                if row > 0:
-                    direction = tangent0 if row == 1 else tangent1
-                if data.shared_anchor != 0 or (row > 0 and data.friction_shared_anchor != 0):
-                    p0 = anchor
-                    p1 = anchor
-                target = prescribed_relative_contact_target(
+                direction, p0, p1 = contact_row_frame(
+                    row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
+                )
+                target = prescribed_target(
                     body0, art0, body1, art1, p0, p1, direction, data.prescribed, data.origin, data.body_v
                 )
                 phi = float(0.0)
@@ -641,10 +631,9 @@ def materialize_fallback(
         world = data.world[contact]
         if owner[world] != 0:
             continue
-        body0, body1, point0, point1 = contact_points(data, contact)
-        normal = -data.normal[contact]
+        body0, body1, normal, point0, point1, _separation = contact_geometry_of(data, contact)
         tangent0, tangent1 = contact_tangent_basis(normal)
-        anchor = 0.5 * (point0 + point1)
+        friction0, friction1 = contact_friction_points(point0, point1, data.shared_anchor, data.friction_shared_anchor)
         art0, art1 = data.art0[contact], data.art1[contact]
         group0, group1 = int(-1), int(-1)
         if art0 >= 0 and data.response_dofs[art0] == target_size:
@@ -654,12 +643,9 @@ def materialize_fallback(
         for coefficient in range(lane, data.slots_needed[contact] * target_size, stride):
             row = coefficient // target_size
             dof = coefficient % target_size
-            direction = normal
-            p0, p1 = point0, point1
-            if row > 0:
-                direction = tangent0 if row == 1 else tangent1
-            if data.shared_anchor != 0 or (row > 0 and data.friction_shared_anchor != 0):
-                p0, p1 = anchor, anchor
+            direction, p0, p1 = contact_row_frame(
+                row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
+            )
             value0 = endpoint_projection(data, body0, art0, target_size, dof, p0, direction)
             value1 = -endpoint_projection(data, body1, art1, target_size, dof, p1, direction)
             output_row = data.slot[contact] + row
@@ -677,7 +663,7 @@ def produce_patch_contacts(
 
     The normal row's metadata and packet are those of :func:`produce_contacts`. Tangent rows, present
     only when the contact owns an anchor, follow the patch row law that the compact producer shares
-    (``patch_row_frame`` and ``patch_tangent_row``): they act at the patch friction location, carry
+    (``contact_laws.contact_row_frame`` and ``patch_tangent_row``): they act at the patch friction location, carry
     the anchor's tangential phi with ``law.beta`` and keep the undivided coefficient. Every bias takes
     ``compute_world_contact_bias``'s form, ``x * (1 / dt)``, where :func:`produce_contacts` forms
     ``x / dt``, so the rows equal the general route's bitwise. A bouncing normal row sums its incident
@@ -699,20 +685,26 @@ def produce_patch_contacts(
         rows = data.slots_needed[contact]
         art0 = data.art0[contact]
         art1 = data.art1[contact]
-        body0 = int(-1)
-        body1 = int(-1)
-        if data.shape0[contact] >= 0:
-            body0 = data.shape_body[data.shape0[contact]]
-        if data.shape1[contact] >= 0:
-            body1 = data.shape_body[data.shape1[contact]]
-        normal = -data.normal[contact]
+        body0, body1 = contact_bodies(data.shape0[contact], data.shape1[contact], data.shape_body)
+        normal = wp.vec3()
         point0 = wp.vec3()
         point1 = wp.vec3()
+        separation = float(0.0)
         tangent0 = wp.vec3()
         tangent1 = wp.vec3()
         if lane == 0:
-            _body0, _body1, point0, point1 = contact_points(data, contact)
+            normal, point0, point1, separation = contact_points(
+                data.normal[contact],
+                data.point0[contact],
+                data.point1[contact],
+                data.margin0[contact],
+                data.margin1[contact],
+                body0,
+                body1,
+                data.body_q,
+            )
             tangent0, tangent1 = contact_tangent_basis(normal)
+        normal = warp_broadcast(normal)
         point0 = warp_broadcast(point0)
         point1 = warp_broadcast(point1)
         tangent0 = warp_broadcast(tangent0)
@@ -728,7 +720,7 @@ def produce_patch_contacts(
                 if coordinate >= primary:
                     size = secondary
                     dof -= primary
-                direction, p0, p1 = patch_row_frame(
+                direction, p0, p1 = contact_row_frame(
                     row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
                 )
                 value = endpoint_projection(data, body0, art0, size, dof, p0, direction)
@@ -736,27 +728,16 @@ def produce_patch_contacts(
                 packet.jacobian[world, output_row, coordinate] = value
         warp_sync()
         if lane == 0:
-            mu = float(0.0)
-            materials = int(0)
-            if data.shape0[contact] >= 0:
-                mu += data.material_mu[data.shape0[contact]]
-                materials += 1
-            if data.shape1[contact] >= 0:
-                mu += data.material_mu[data.shape1[contact]]
-                materials += 1
-            if materials > 0:
-                mu /= float(materials)
-            restitution = mixed_contact_restitution(
-                data.shape0[contact], data.shape1[contact], data.material_restitution
+            mu, restitution = contact_materials(
+                data.shape0[contact], data.shape1[contact], data.material_mu, data.material_restitution
             )
-            separation = wp.dot(normal, point0 - point1)
             inv_dt = 1.0 / data.dt
             for row in range(rows):
                 output_row = slot + row
-                direction, p0, p1 = patch_row_frame(
+                direction, p0, p1 = contact_row_frame(
                     row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
                 )
-                target = prescribed_relative_contact_target(
+                target = prescribed_target(
                     body0, art0, body1, art1, p0, p1, direction, data.prescribed, data.origin, data.body_v
                 )
                 phi = separation
@@ -824,8 +805,7 @@ def materialize_patch_fallback(
         world = data.world[contact]
         if owner[world] != 0:
             continue
-        body0, body1, point0, point1 = contact_points(data, contact)
-        normal = -data.normal[contact]
+        body0, body1, normal, point0, point1, _separation = contact_geometry_of(data, contact)
         tangent0, tangent1 = contact_tangent_basis(normal)
         friction0, friction1 = patch_friction_location(law.patches, contact)
         art0, art1 = data.art0[contact], data.art1[contact]
@@ -837,7 +817,7 @@ def materialize_patch_fallback(
         for coefficient in range(lane, data.slots_needed[contact] * target_size, stride):
             row = coefficient // target_size
             dof = coefficient % target_size
-            direction, p0, p1 = patch_row_frame(
+            direction, p0, p1 = contact_row_frame(
                 row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
             )
             value0 = endpoint_projection(data, body0, art0, target_size, dof, p0, direction)

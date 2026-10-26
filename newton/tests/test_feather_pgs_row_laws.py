@@ -890,6 +890,7 @@ def test_joint_limit_side_matches_limit_rows(test, device):
         pgs_cfm=0.0,
         resolved_worlds=np.zeros(0, dtype=np.int32),
         world_slot_counter=np.zeros(arts, dtype=np.int32),
+        first_rejected_slot=np.full(arts, np.iinfo(np.int32).max, dtype=np.int32),
         J_group=np.zeros((arts, rows, dofs), dtype=np.float32),
         world_row_type=np.zeros((arts, rows), dtype=np.int32),
         world_row_parent=np.zeros((arts, rows), dtype=np.int32),
@@ -952,6 +953,7 @@ def test_velocity_limit_active_matches_velocity_limit_slots(test, device):
                 velocity_limit_slot=np.full(2 * count, -1, dtype=np.int32),
                 velocity_limit_sign=np.zeros(2 * count, dtype=np.float32),
                 world_slot_counter=np.zeros(arts, dtype=np.int32),
+                first_rejected_slot=np.full(arts, np.iinfo(np.int32).max, dtype=np.int32),
             )
             law = call(
                 _law_velocity_limit_active,

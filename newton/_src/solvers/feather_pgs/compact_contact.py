@@ -13,14 +13,17 @@ links the patch rings and divides the friction coefficient, in one
 
 import warp as wp
 
-from .friction_patches import PatchRowLaw, patch_friction_location, patch_row_frame, patch_tangent_row
-from .kernels import (
-    PGS_CONSTRAINT_TYPE_CONTACT,
-    PGS_CONSTRAINT_TYPE_FRICTION,
+from .contact_laws import (
+    contact_friction_points,
+    contact_geometry,
+    contact_materials,
+    contact_row_frame,
     contact_tangent_basis,
-    mixed_contact_restitution,
-    prescribed_relative_contact_target,
+    jacobian_entry,
+    prescribed_target,
 )
+from .friction_patches import PatchRowLaw, patch_friction_location, patch_tangent_row
+from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 
 _Vec6 = wp.types.vector(length=6, dtype=wp.float32)
 
@@ -132,12 +135,6 @@ def solve_six(factor: wp.array3d[float], group: int, jacobian: _Vec6):
     return response
 
 
-@wp.func
-def point_projection(motion: wp.spatial_vector, direction: wp.vec3, point: wp.vec3, origin: wp.vec3):
-    velocity = wp.spatial_top(motion) + wp.cross(wp.spatial_bottom(motion), point - origin)
-    return wp.dot(direction, velocity)
-
-
 @wp.kernel
 def clear_limit_prefix(dense_groups: wp.array[int], J: wp.array3d[float], sparse_dof: wp.array3d[int]):
     """Clear every possible dense-six limit row before partial limit writers run."""
@@ -184,140 +181,53 @@ def _produce_contact(data: ContactBoundaryData, contact: int):
     world = data.world[contact]
     art0 = data.art0[contact]
     art1 = data.art1[contact]
-    shape0 = data.shape0[contact]
-    shape1 = data.shape1[contact]
-    body0 = -1
-    body1 = -1
-    if shape0 >= 0:
-        body0 = data.shape_body[shape0]
-    if shape1 >= 0:
-        body1 = data.shape_body[shape1]
+    body0, body1, normal, point0, point1, phi = contact_geometry(
+        contact,
+        data.shape0,
+        data.shape1,
+        data.point0,
+        data.point1,
+        data.normal,
+        data.margin0,
+        data.margin1,
+        data.shape_body,
+        data.body_q,
+    )
     has_dense = False
     if art0 >= 0 and body0 >= 0:
         has_dense = data.response_dofs[art0] == 6
     if art1 >= 0 and body1 >= 0:
         has_dense = has_dense or data.response_dofs[art1] == 6
-    normal = -data.normal[contact]
-    point0 = data.point0[contact] - data.margin0[contact] * normal
-    point1 = data.point1[contact] + data.margin1[contact] * normal
-    if body0 >= 0:
-        point0 = wp.transform_point(data.body_q[body0], data.point0[contact]) - data.margin0[contact] * normal
-    if body1 >= 0:
-        point1 = wp.transform_point(data.body_q[body1], data.point1[contact]) + data.margin1[contact] * normal
-    phi = wp.dot(normal, point0 - point1)
-    mu = float(0.0)
-    materials = int(0)
-    if shape0 >= 0:
-        mu += data.material_mu[shape0]
-        materials += 1
-    if shape1 >= 0:
-        mu += data.material_mu[shape1]
-        materials += 1
-    if materials > 0:
-        mu /= float(materials)
-    restitution = mixed_contact_restitution(shape0, shape1, data.material_restitution)
+    mu, restitution = contact_materials(
+        data.shape0[contact], data.shape1[contact], data.material_mu, data.material_restitution
+    )
     tangent0, tangent1 = contact_tangent_basis(normal)
-    anchor = 0.5 * (point0 + point1)
+    friction0, friction1 = contact_friction_points(point0, point1, data.shared_anchor, data.friction_shared_anchor)
     group = data.dense_group[world]
     for row in range(data.slots_needed[contact]):
-        direction = normal
-        p0 = point0
-        p1 = point1
-        if row == 0:
-            if data.shared_anchor != 0:
-                p0 = anchor
-                p1 = anchor
-        else:
-            if row == 1:
-                direction = tangent0
-            else:
-                direction = tangent1
-            if data.shared_anchor != 0 or data.friction_shared_anchor != 0:
-                p0 = anchor
-                p1 = anchor
+        direction, p0, p1 = contact_row_frame(
+            row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
+        )
         output_row = slot + row
-        target = prescribed_relative_contact_target(
+        data.target[world, output_row] = prescribed_target(
             body0, art0, body1, art1, p0, p1, direction, data.prescribed, data.origin, data.body_v
         )
-        data.target[world, output_row] = target
         data.row_cfm[world, output_row] = data.cfm
         if row == 0:
-            data.row_type[world, output_row] = 0
+            data.row_type[world, output_row] = PGS_CONSTRAINT_TYPE_CONTACT
             data.row_parent[world, output_row] = -1
             data.row_mu[world, output_row] = mu
             data.row_beta[world, output_row] = data.beta
             data.phi[world, output_row] = phi
             data.restitution[world, output_row] = restitution
         else:
-            data.row_type[world, output_row] = 2
+            data.row_type[world, output_row] = PGS_CONSTRAINT_TYPE_FRICTION
             data.row_parent[world, output_row] = slot
             data.row_mu[world, output_row] = mu * data.friction_scale
             data.row_beta[world, output_row] = 0.0
             data.phi[world, output_row] = 0.0
             data.restitution[world, output_row] = 0.0
-        diagonal = float(0.0)
-        if has_dense:
-            jacobian = _Vec6()
-            for dof in range(6):
-                value0 = float(0.0)
-                value1 = float(0.0)
-                bit = wp.uint32(1) << wp.uint32(dof)
-                if art0 >= 0 and body0 >= 0 and data.response_dofs[art0] == 6:
-                    if (data.body_mask[body0] & bit) != wp.uint32(0):
-                        value0 = point_projection(
-                            data.motion[data.dof_start[art0] + dof], direction, p0, data.origin[art0]
-                        )
-                if art1 >= 0 and body1 >= 0 and data.response_dofs[art1] == 6:
-                    if (data.body_mask[body1] & bit) != wp.uint32(0):
-                        value1 = -point_projection(
-                            data.motion[data.dof_start[art1] + dof], direction, p1, data.origin[art1]
-                        )
-                jacobian[dof] = value0 + value1
-            response = solve_six(data.factor, group, jacobian)
-            for dof in range(6):
-                data.J[group, output_row, dof] = jacobian[dof]
-                data.Y[group, output_row, dof] = response[dof]
-                diagonal += jacobian[dof] * response[dof]
-        coord0 = -1
-        coord1 = -1
-        value0 = float(0.0)
-        value1 = float(0.0)
-        response0 = float(0.0)
-        response1 = float(0.0)
-        if art0 >= 0 and body0 >= 0 and data.response_dofs[art0] == data.sparse_size:
-            dof0 = data.body_single_dof[body0]
-            if dof0 >= 0:
-                local0 = dof0 - data.dof_start[art0]
-                if local0 >= 0 and local0 < data.sparse_size:
-                    coord0 = data.dof_offset[art0] + local0
-                    value0 = point_projection(data.motion[dof0], direction, p0, data.origin[art0])
-                    response0 = value0 * data.inverse_mass[dof0]
-        if art1 >= 0 and body1 >= 0 and data.response_dofs[art1] == data.sparse_size:
-            dof1 = data.body_single_dof[body1]
-            if dof1 >= 0:
-                local1 = dof1 - data.dof_start[art1]
-                if local1 >= 0 and local1 < data.sparse_size:
-                    coord1 = data.dof_offset[art1] + local1
-                    value1 = -point_projection(data.motion[dof1], direction, p1, data.origin[art1])
-                    response1 = value1 * data.inverse_mass[dof1]
-        if coord0 >= 0 and coord0 == coord1:
-            value0 += value1
-            response0 += response1
-            coord1 = -1
-            value1 = 0.0
-            response1 = 0.0
-        data.sparse_dof[world, output_row, 0] = coord0
-        data.sparse_dof[world, output_row, 1] = coord1
-        data.sparse_jy[world, output_row, 0] = value0
-        data.sparse_jy[world, output_row, 1] = response0
-        data.sparse_jy[world, output_row, 2] = value1
-        data.sparse_jy[world, output_row, 3] = response1
-        sparse_diagonal = float(0.0)
-        if coord0 >= 0:
-            sparse_diagonal += value0 * response0
-        if coord1 >= 0:
-            sparse_diagonal += value1 * response1
-        data.diag[world, output_row] = (diagonal + sparse_diagonal) + data.cfm
+        _publish_row_response(data, world, output_row, group, has_dense, art0, body0, art1, body1, direction, p0, p1)
 
 
 @wp.func
@@ -335,7 +245,7 @@ def _publish_row_response(
     p0: wp.vec3,
     p1: wp.vec3,
 ):
-    """Write one row's dense-six and sparse response and its diagonal, as ``_produce_contact`` does."""
+    """Write one row's dense-six and sparse response and its diagonal."""
     diagonal = float(0.0)
     if has_dense:
         jacobian = _Vec6()
@@ -345,12 +255,10 @@ def _publish_row_response(
             bit = wp.uint32(1) << wp.uint32(dof)
             if art0 >= 0 and body0 >= 0 and data.response_dofs[art0] == 6:
                 if (data.body_mask[body0] & bit) != wp.uint32(0):
-                    value0 = point_projection(data.motion[data.dof_start[art0] + dof], direction, p0, data.origin[art0])
+                    value0 = jacobian_entry(data.motion[data.dof_start[art0] + dof], direction, p0, data.origin[art0])
             if art1 >= 0 and body1 >= 0 and data.response_dofs[art1] == 6:
                 if (data.body_mask[body1] & bit) != wp.uint32(0):
-                    value1 = -point_projection(
-                        data.motion[data.dof_start[art1] + dof], direction, p1, data.origin[art1]
-                    )
+                    value1 = -jacobian_entry(data.motion[data.dof_start[art1] + dof], direction, p1, data.origin[art1])
             jacobian[dof] = value0 + value1
         response = solve_six(data.factor, group, jacobian)
         for dof in range(6):
@@ -369,7 +277,7 @@ def _publish_row_response(
             local0 = dof0 - data.dof_start[art0]
             if local0 >= 0 and local0 < data.sparse_size:
                 coord0 = data.dof_offset[art0] + local0
-                value0 = point_projection(data.motion[dof0], direction, p0, data.origin[art0])
+                value0 = jacobian_entry(data.motion[dof0], direction, p0, data.origin[art0])
                 response0 = value0 * data.inverse_mass[dof0]
     if art1 >= 0 and body1 >= 0 and data.response_dofs[art1] == data.sparse_size:
         dof1 = data.body_single_dof[body1]
@@ -377,7 +285,7 @@ def _publish_row_response(
             local1 = dof1 - data.dof_start[art1]
             if local1 >= 0 and local1 < data.sparse_size:
                 coord1 = data.dof_offset[art1] + local1
-                value1 = -point_projection(data.motion[dof1], direction, p1, data.origin[art1])
+                value1 = -jacobian_entry(data.motion[dof1], direction, p1, data.origin[art1])
                 response1 = value1 * data.inverse_mass[dof1]
     if coord0 >= 0 and coord0 == coord1:
         value0 += value1
@@ -404,8 +312,8 @@ def _produce_patch_contact(data: ContactBoundaryData, law: PatchRowLaw, contact:
     """Publish one contact's rows with the persistent patch friction law.
 
     The normal row is ``_produce_contact``'s. Tangent rows, present only when the
-    contact owns an anchor, follow the patch row law (``patch_row_frame`` and
-    ``patch_tangent_row``): they act at the patch friction location, carry the
+    contact owns an anchor, follow the patch row law (``contact_laws.contact_row_frame`` at the
+    patch friction location, and ``patch_tangent_row``): they act at the patch friction location, carry the
     anchor's tangential phi with ``law.beta``, and keep the undivided friction
     coefficient.
     """
@@ -417,50 +325,37 @@ def _produce_patch_contact(data: ContactBoundaryData, law: PatchRowLaw, contact:
     world = data.world[contact]
     art0 = data.art0[contact]
     art1 = data.art1[contact]
-    shape0 = data.shape0[contact]
-    shape1 = data.shape1[contact]
-    body0 = -1
-    body1 = -1
-    if shape0 >= 0:
-        body0 = data.shape_body[shape0]
-    if shape1 >= 0:
-        body1 = data.shape_body[shape1]
+    body0, body1, normal, point0, point1, phi = contact_geometry(
+        contact,
+        data.shape0,
+        data.shape1,
+        data.point0,
+        data.point1,
+        data.normal,
+        data.margin0,
+        data.margin1,
+        data.shape_body,
+        data.body_q,
+    )
     has_dense = False
     if art0 >= 0 and body0 >= 0:
         has_dense = data.response_dofs[art0] == 6
     if art1 >= 0 and body1 >= 0:
         has_dense = has_dense or data.response_dofs[art1] == 6
-    normal = -data.normal[contact]
-    point0 = data.point0[contact] - data.margin0[contact] * normal
-    point1 = data.point1[contact] + data.margin1[contact] * normal
-    if body0 >= 0:
-        point0 = wp.transform_point(data.body_q[body0], data.point0[contact]) - data.margin0[contact] * normal
-    if body1 >= 0:
-        point1 = wp.transform_point(data.body_q[body1], data.point1[contact]) + data.margin1[contact] * normal
-    phi = wp.dot(normal, point0 - point1)
-    mu = float(0.0)
-    materials = int(0)
-    if shape0 >= 0:
-        mu += data.material_mu[shape0]
-        materials += 1
-    if shape1 >= 0:
-        mu += data.material_mu[shape1]
-        materials += 1
-    if materials > 0:
-        mu /= float(materials)
-    restitution = mixed_contact_restitution(shape0, shape1, data.material_restitution)
+    mu, restitution = contact_materials(
+        data.shape0[contact], data.shape1[contact], data.material_mu, data.material_restitution
+    )
     tangent0, tangent1 = contact_tangent_basis(normal)
     friction0, friction1 = patch_friction_location(law.patches, contact)
     group = data.dense_group[world]
     for row in range(data.slots_needed[contact]):
-        direction, p0, p1 = patch_row_frame(
+        direction, p0, p1 = contact_row_frame(
             row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
         )
         output_row = slot + row
-        target = prescribed_relative_contact_target(
+        data.target[world, output_row] = prescribed_target(
             body0, art0, body1, art1, p0, p1, direction, data.prescribed, data.origin, data.body_v
         )
-        data.target[world, output_row] = target
         data.row_cfm[world, output_row] = data.cfm
         if row == 0:
             data.row_type[world, output_row] = PGS_CONSTRAINT_TYPE_CONTACT
