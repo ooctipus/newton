@@ -541,10 +541,10 @@ def pass_launch(route: GeneralRoute, name: str, *, block_dim: int | None = None,
     m, solver, device = route.model, route.solver, route.model.device
     dynamics = solver._dynamics(route.state, route.aug, route.control, **values)
     kernels = {
-        "fk_kinematics": (tree_passes.fk_kinematics, 16),
-        "fk_id": (tree_passes.fk_id, 16),
-        "tau": (tree_passes.inverse_dynamics_tau, solver.serial_kernel_block_dim),
-        "composite_inertia": (tree_passes.composite_inertia, 128),
+        "fk_kinematics": (tree_passes.fk_kinematics, tree_passes.SERIAL_BLOCK_DIM),
+        "fk_id": (tree_passes.fk_id, tree_passes.SERIAL_BLOCK_DIM),
+        "tau": (tree_passes.inverse_dynamics_tau, tree_passes.SERIAL_BLOCK_DIM),
+        "composite_inertia": (tree_passes.composite_inertia, tree_passes.SERIAL_BLOCK_DIM),
     }
     if name in kernels:
         kernel, solver_block = kernels[name]

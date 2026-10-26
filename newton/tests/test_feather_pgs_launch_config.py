@@ -250,13 +250,13 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                 "prepare_augmented_joint_drives": "inverse_dynamics",
             },
             tree_passes: {
-                "fk_kinematics": "kinematics",
-                "fk_id": "kinematics",
-                "inverse_dynamics_tau": "inverse_dynamics",
-                "selected_inverse_dynamics_tau": "inverse_dynamics",
+                "fk_kinematics": "serial",
+                "fk_id": "serial",
+                "inverse_dynamics_tau": "serial",
+                "selected_inverse_dynamics_tau": "serial",
+                "composite_inertia": "serial",
                 "publish_body_dynamics": "mass_dynamics",
                 "refresh_body_inertia": "mass_dynamics",
-                "composite_inertia": "mass_dynamics",
                 "crba_fill": "mass_dynamics",
                 "diagonal_inverse_mass": "mass_dynamics",
             },
@@ -272,7 +272,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
     def test_defaults_preserved(self):
         model = newton.ModelBuilder().finalize()
         solver = SolverFeatherPGS(model)
-        self.assertEqual(solver.serial_kernel_block_dim, 256)
         self.assertEqual(solver.tile_threads, 64)
         self.assertEqual(solver.articulated_contact_response, "immediate")
 
@@ -321,7 +320,7 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
     def test_default_kwargs_produce_identical_kernel_selection(self):
         model = _build_chain_model()
         implicit = SolverFeatherPGS(model)
-        explicit = SolverFeatherPGS(model, serial_kernel_block_dim=256, tile_threads=64)
+        explicit = SolverFeatherPGS(model, tile_threads=64)
         for attr in (
             "_cholesky_kernels_by_size",
             "_triangular_solve_kernels_by_size",
@@ -870,16 +869,32 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
             solver.reset_diagnostic_logs()
         self.assertEqual((solver._pgs_convergence_log, solver._pgs_ncp_residual_log), ([], []))
 
-    def test_serial_kernel_block_dim_validation(self):
-        model = newton.ModelBuilder().finalize()
-        for bad in (0, -32, 1, 33, 100):
-            with self.subTest(value=bad):
-                with self.assertRaisesRegex(ValueError, "serial_kernel_block_dim"):
-                    SolverFeatherPGS(model, serial_kernel_block_dim=bad)
-        for good in (32, 64, 128, 256, 512):
-            with self.subTest(value=good):
-                solver = SolverFeatherPGS(model, serial_kernel_block_dim=good)
-                self.assertEqual(solver.serial_kernel_block_dim, good)
+    def test_serial_passes_launch_at_the_serial_block_size(self):
+        """A step launches every one-articulation-per-thread pass (FK/ID, the joint forces and drives, the composite
+        inertia) in blocks of ``tree_passes.SERIAL_BLOCK_DIM`` threads."""
+        model = _build_chain_model()
+        solver = SolverFeatherPGS(model, update_mass_matrix_interval=1)
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        serial = {
+            tree_passes.fk_id,
+            tree_passes.inverse_dynamics_tau,
+            tree_passes.selected_inverse_dynamics_tau,
+            tree_passes.composite_inertia,
+            feather_pgs_kernels.eval_rigid_tau_and_augmented_drives,
+            feather_pgs_kernels.prepare_augmented_joint_drives,
+        }
+        blocks = {}
+        launch = wp.launch
+
+        def record(kernel, *args, **kwargs):
+            if kernel in serial:
+                blocks.setdefault(kernel.key, set()).add(kwargs.get("block_dim"))
+            return launch(kernel, *args, **kwargs)
+
+        with mock.patch.object(wp, "launch", record):
+            solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+        self.assertIn(tree_passes.fk_id.key, blocks)
+        self.assertEqual(set().union(*blocks.values()), {tree_passes.SERIAL_BLOCK_DIM}, blocks)
 
     def test_tile_threads_validation(self):
         model = newton.ModelBuilder().finalize()
@@ -900,7 +915,6 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
         with mock.patch.object(SolverFeatherPGS, "_kernel_overrides", forced):
             solver = SolverFeatherPGS(
                 model,
-                serial_kernel_block_dim=64,
                 tile_threads=128,
                 pgs_mode="split",
                 pgs_kernel="loop",

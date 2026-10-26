@@ -357,16 +357,16 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         """Bind deprecated positional options like keywords, warning only for positional use.
 
         Every option after model is keyword-only. The deprecation shim binds positional values in
-        declaration order, so a positional call over the 54 legacy options must build the solver
-        the same keywords build: every requested and applied option, route and reason. A 55th
+        declaration order, so a positional call over the 53 legacy options must build the solver
+        the same keywords build: every requested and applied option, route and reason. A 54th
         positional value would bind an option that was always keyword-only, so it still raises.
         """
         model = _cpu_model()
         parameters = list(inspect.signature(SolverFeatherPGS).parameters.values())
         self.assertEqual(parameters[0].name, "model")
         self.assertEqual({parameter.kind for parameter in parameters[1:]}, {inspect.Parameter.KEYWORD_ONLY})
-        legacy = {parameter.name: parameter.default for parameter in parameters[1:55]}
-        self.assertEqual((parameters[1].name, parameters[54].name), ("angular_damping", "friction_anchor_beta"))
+        legacy = {parameter.name: parameter.default for parameter in parameters[1:54]}
+        self.assertEqual((parameters[1].name, parameters[53].name), ("angular_damping", "friction_anchor_beta"))
         legacy.update(
             angular_damping=0.1,
             joint_limit_activation_gap=0.123,
@@ -392,9 +392,9 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertEqual(selected, expected)
         self.assertEqual(selected["options"]["joint_limit_activation_gap"]["applied"], 0.123)
         self.assertEqual(selected["options"]["dense_max_constraints"]["source"], "argument")
-        self.assertEqual(parameters[55].name, "pgs_change_tolerance")
-        with self.assertRaisesRegex(TypeError, r"takes at most 56 positional arguments but 57 were given$"):
-            SolverFeatherPGS(model, *legacy.values(), parameters[55].default)
+        self.assertEqual(parameters[54].name, "pgs_change_tolerance")
+        with self.assertRaisesRegex(TypeError, r"takes at most 55 positional arguments but 56 were given$"):
+            SolverFeatherPGS(model, *legacy.values(), parameters[54].default)
 
     def test_constructor_warnings_name_the_caller(self):
         """Attribute construction warnings to the constructor's caller, not to the keyword-only shim."""

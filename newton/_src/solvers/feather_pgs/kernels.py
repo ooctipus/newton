@@ -108,7 +108,8 @@ PGS_CONSTRAINT_TYPE_TORSION = 7
 PGS_CONSTRAINT_TYPE_COUNT = 8
 
 # Keep launch-geometry-specific dynamics kernels out of the large general
-# kernel module. Warp compiles one whole module variant per block dimension.
+# kernel module. Warp compiles one whole module variant per block dimension:
+# the inverse-dynamics drives launch at tree_passes.SERIAL_BLOCK_DIM.
 _INVERSE_DYNAMICS_KERNEL_MODULE = wp.Module(f"{__name__}.inverse_dynamics")
 _MASS_DYNAMICS_KERNEL_MODULE = wp.Module(f"{__name__}.mass_dynamics")
 

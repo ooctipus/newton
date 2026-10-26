@@ -59,6 +59,7 @@ from .tree_scan import tree_scan as scan_source
 
 __all__ = [
     "DYNAMICS",
+    "SERIAL_BLOCK_DIM",
     "DynamicsData",
     "body_dynamics",
     "composite_inertia",
@@ -146,12 +147,22 @@ augmented state; ``control``; ``step``, the launch's switches."""
 DynamicsData = field_group.struct("DynamicsData", DYNAMICS, __name__)
 """The dynamics passes' one argument (:func:`.field_group.bind` fills it)."""
 
-# Kernels launched with one block size share a Warp module (a module builds once per block size): FK at 16,
-# inverse dynamics at the solver's serial block size, the mass passes at 128; the one-body branches' forces
-# (256) keep a module of their own.
-_KINEMATICS = wp.Module(f"{__name__}.kinematics")
-_INVERSE_DYNAMICS = wp.Module(f"{__name__}.inverse_dynamics")
+# Kernels launched with one block size share a Warp module (a module builds once per block size): the walks of
+# one articulation per thread at SERIAL_BLOCK_DIM, the per-body and per-column mass passes at 128; the one-body
+# branches' forces (256) keep a module of their own.
+_SERIAL = wp.Module(f"{__name__}.serial")
 _MASS_DYNAMICS = wp.Module(f"{__name__}.mass_dynamics")
+
+SERIAL_BLOCK_DIM = 4
+"""Threads per block of the passes that walk one articulation per thread: FK, FK/ID, the joint forces, the composite
+inertia and the drives.
+
+A thread's walk is serial and latency-bound, so these passes run fastest with few threads per warp: on the RTX PRO
+6000 (``tools/fpgs_bench/tree_scan_bench.py serial``; 2- to 60-body trees, 4096 to 65536 articulations) four lanes
+ran within 5% of the fastest block size of every pass but the 2-body tree's at 65536 articulations, where FK ran at
+a fixed 16 (1.1-1.7 times four's time) and the joint forces at 256 (1.2-3.4 times). One or two lanes waste issue slots;
+eight lost up to 1.6 times on 13-body trees at 65536 articulations."""
+
 
 # The serial scans of a joint range need no tree literal: a parent-first plan stands for every range.
 _SERIAL_PLAN = TreePlan.build([-1])
@@ -313,7 +324,7 @@ def articulation_poses(index: int, d: DynamicsData):
     d.articulation_origin[index] = origin
 
 
-@wp.kernel(module=_KINEMATICS)
+@wp.kernel(module=_SERIAL)
 def fk_kinematics(d: DynamicsData):
     """Body poses, COM frames, origins, motion columns, twists and bias accelerations; one thread per
     articulation."""
@@ -324,7 +335,7 @@ def fk_kinematics(d: DynamicsData):
     d.fk_id_cache_valid[index] = 1
 
 
-@wp.kernel(module=_KINEMATICS)
+@wp.kernel(module=_SERIAL)
 def fk_id(d: DynamicsData):
     """:data:`fk_kinematics` and each body's inertia and inverse-dynamics wrench (skipped on a reused cache)."""
     index = wp.tid()
@@ -449,13 +460,13 @@ def articulation_tau(index: int, d: DynamicsData):
     _JOINT_FORCES(start, end, d.joint_parent, d.joint_child, d.up_flags, d.body_ft_s, d)
 
 
-@wp.kernel(module=_INVERSE_DYNAMICS)
+@wp.kernel(module=_SERIAL)
 def inverse_dynamics_tau(d: DynamicsData):
     """Every articulation's joint forces; one thread per articulation."""
     articulation_tau(wp.tid(), d)
 
 
-@wp.kernel(module=_INVERSE_DYNAMICS)
+@wp.kernel(module=_SERIAL)
 def selected_inverse_dynamics_tau(selected: wp.array[int], d: DynamicsData):
     """The joint forces of the listed articulations; one thread per listed articulation."""
     articulation_tau(selected[wp.tid()], d)
@@ -479,7 +490,7 @@ def subtree_record(node: int, children: inertia_record, d: DynamicsData) -> iner
 _COMPOSITE = serial_scan(_SUM, Direction.UP, subtree_record, store_total=True)
 
 
-@wp.kernel(module=_MASS_DYNAMICS)
+@wp.kernel(module=_SERIAL)
 def composite_inertia(d: DynamicsData):
     """Every masked articulation's composite inertia records, each body's record plus its subtree's; one thread
     per articulation."""

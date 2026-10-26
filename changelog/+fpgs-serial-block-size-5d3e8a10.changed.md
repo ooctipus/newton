@@ -1,0 +1,1 @@
+Remove the ``serial_kernel_block_dim`` option of :class:`~newton.solvers.SolverFeatherPGS`: the one-articulation-per-thread dynamics passes now launch in blocks of four threads, measured fastest for them.

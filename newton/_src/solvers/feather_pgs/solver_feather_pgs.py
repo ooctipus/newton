@@ -300,6 +300,7 @@ from .sparse_pgs import (
 )
 from .spatial_laws import inertia_apply, inertia_record, unpack_inertia
 from .tree_passes import (
+    SERIAL_BLOCK_DIM,
     DynamicsData,
     composite_inertia,
     composite_inertia_lanes,
@@ -1240,7 +1241,6 @@ class SolverFeatherPGS(SolverBase):
         nvtx: bool = False,
         pgs_debug: bool = False,
         drive_mode: Literal["augmented", "physx_pgs"] = "augmented",
-        serial_kernel_block_dim: int = 256,
         tile_threads: int = 64,
         row_watermark: bool = False,
         restitution_velocity_threshold: float = 0.5,
@@ -1875,12 +1875,6 @@ class SolverFeatherPGS(SolverBase):
                 force-drive PGS formula each Gauss-Seidel iteration. The
                 PhysX row mode is currently supported only with
                 ``pgs_mode="matrix_free"``. Defaults to ``"augmented"``.
-            serial_kernel_block_dim (int, optional): CUDA block size for the serial
-                one-thread-per-articulation kernels (``tree_passes.inverse_dynamics_tau``,
-                ``eval_rigid_tau_and_augmented_drives``, ``prepare_augmented_joint_drives``).
-                These kernels have no cross-thread reductions, so changing this value is
-                bit-identical; it only changes occupancy/grid shape. Must be a positive
-                multiple of 32. Defaults to 256 (the Warp default).
             tile_threads (int, optional): Threads per block for the tiled
                 Cholesky / triangular-solve / H^-1 J^T kernels. Tile primitives may
                 change floating-point reduction order with the block size, so non-default
@@ -2402,11 +2396,6 @@ class SolverFeatherPGS(SolverBase):
 
         small_dof_threshold = _SMALL_DOF_THRESHOLD_DEFAULT
 
-        self.serial_kernel_block_dim = int(serial_kernel_block_dim)
-        if self.serial_kernel_block_dim <= 0 or self.serial_kernel_block_dim % 32 != 0:
-            raise ValueError(
-                f"serial_kernel_block_dim must be a positive multiple of 32, got {serial_kernel_block_dim!r}"
-            )
         self.tile_threads = int(tile_threads)
         if self.tile_threads not in (32, 64, 128, 256):
             raise ValueError(f"tile_threads must be one of (32, 64, 128, 256), got {tile_threads!r}")
@@ -8482,7 +8471,13 @@ class SolverFeatherPGS(SolverBase):
         if self._tree_plan is not None:
             self._launch_tree_fk("id", [dynamics])
         else:
-            wp.launch(fk_id, dim=model.articulation_count, inputs=[dynamics], block_dim=16, device=model.device)
+            wp.launch(
+                fk_id,
+                dim=model.articulation_count,
+                inputs=[dynamics],
+                block_dim=SERIAL_BLOCK_DIM,
+                device=model.device,
+            )
         global_inertia_ready = None
         if parallel_global_refresh:
             inertia_stream = self._global_inertia_stream
@@ -8572,7 +8567,7 @@ class SolverFeatherPGS(SolverBase):
                         self.aug_row_K,
                         state_aug.joint_tau,
                     ],
-                    block_dim=self.serial_kernel_block_dim,
+                    block_dim=SERIAL_BLOCK_DIM,
                     device=model.device,
                 )
         return dynamics_stream.record_event()
@@ -8612,7 +8607,7 @@ class SolverFeatherPGS(SolverBase):
                 inverse_dynamics_tau,
                 dim=model.articulation_count,
                 inputs=[dynamics],
-                block_dim=self.serial_kernel_block_dim,
+                block_dim=SERIAL_BLOCK_DIM,
                 device=model.device,
             )
             return
@@ -8622,7 +8617,7 @@ class SolverFeatherPGS(SolverBase):
                 selected_inverse_dynamics_tau,
                 dim=self._selected_tau_articulation_count,
                 inputs=[self._selected_tau_articulations, dynamics],
-                block_dim=self.serial_kernel_block_dim,
+                block_dim=SERIAL_BLOCK_DIM,
                 device=model.device,
             )
         direct_size = self._compact_diagonal_mass_size
@@ -8702,7 +8697,7 @@ class SolverFeatherPGS(SolverBase):
                         dt,
                     ],
                     outputs=[self.aug_row_counts, self.aug_row_dof_index],
-                    block_dim=self.serial_kernel_block_dim,
+                    block_dim=SERIAL_BLOCK_DIM,
                     device=model.device,
                 )
                 return
@@ -8777,7 +8772,11 @@ class SolverFeatherPGS(SolverBase):
         # masked scalar path for device-selected limit changes on reuse steps.
         if not (self._parallel_composite_inertia and global_flag):
             wp.launch(
-                composite_inertia, dim=model.articulation_count, inputs=[dynamics], device=model.device, block_dim=128
+                composite_inertia,
+                dim=model.articulation_count,
+                inputs=[dynamics],
+                device=model.device,
+                block_dim=SERIAL_BLOCK_DIM,
             )
 
         # Zeroing H is hygiene, not a correctness requirement: H is only read
@@ -12083,7 +12082,13 @@ class SolverFeatherPGS(SolverBase):
         if self._tree_plan is not None:
             self._launch_tree_fk("kinematics", [dynamics])
         else:
-            wp.launch(fk_kinematics, dim=model.articulation_count, inputs=[dynamics], block_dim=16, device=model.device)
+            wp.launch(
+                fk_kinematics,
+                dim=model.articulation_count,
+                inputs=[dynamics],
+                block_dim=SERIAL_BLOCK_DIM,
+                device=model.device,
+            )
         wp.launch(publish_body_dynamics, dim=model.body_count, inputs=[dynamics], block_dim=128, device=model.device)
         self._fk_id_cache_source_state = state_out
 

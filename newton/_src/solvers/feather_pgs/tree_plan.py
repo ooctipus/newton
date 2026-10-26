@@ -16,7 +16,9 @@ template tree and a whole model alike):
   so a subtree is the interval ``[position, end)``;
 * the heavy-light decomposition: heavy child, chains, light children and the
   packing of padded chains into warps;
-* ancestor masks over nodes and over each tree's coordinates;
+* ancestor masks over nodes and over each tree's coordinates, from the host
+  root-path scan (:meth:`TreePlan.scan_down`), and how a leaf-to-root walk
+  meets each node (:attr:`TreePlan.up_flags`);
 * the fill-free factor pattern of the joint-space inertia
   (:meth:`TreePlan.factor`) and its row support classes
   (:meth:`TreePlan.support_classes`).
