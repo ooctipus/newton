@@ -103,6 +103,16 @@ def cuda_native(body: str, *, preludes: tuple[DevicePrelude, ...] = (), lead: st
     return lead + ARCHITECTURE_GUARD + "".join(prelude.source + "\n" for prelude in preludes) + body
 
 
+def device_branches(cuda: str, cpu: str) -> str:
+    """Return native statements that run ``cuda`` on a CUDA device and ``cpu`` on the CPU, under one guard.
+
+    Args:
+        cuda: Statements for the device, each line newline-terminated.
+        cpu: Statements for the CPU, each line newline-terminated.
+    """
+    return ARCHITECTURE_GUARD + cuda + "#else\n" + cpu + "#endif\n"
+
+
 def dual_native(body: str, *, preludes: tuple[DevicePrelude, ...]) -> str:
     """Return a ``func_native`` snippet for both devices: the preludes for CUDA, their CPU twins otherwise, then ``body``.
 

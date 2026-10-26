@@ -12,13 +12,12 @@ from newton._src.sim.enums import JointType
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.kernels import (
-    eval_rigid_tau,
-    eval_rigid_tau_add,
     eval_rigid_tau_and_augmented_drives,
     populate_physx_drive_J_for_size,
     prepare_augmented_joint_drives,
 )
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _prepare_augmented_joint_drives_by_dof
+from newton._src.solvers.feather_pgs.tree_passes import DynamicsData, inverse_dynamics_tau
 
 
 def _mixed_target_model(coord_layout, device):
@@ -164,39 +163,42 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                     else:
                         zeros = wp.zeros(model.joint_dof_count, dtype=float, device=device)
                         body_forces = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=device)
+                        dynamics = field_group.upload(
+                            DynamicsData,
+                            device,
+                            articulation_start=model.articulation_start,
+                            articulation_joint_end=wp.array(
+                                model.articulation_start.numpy()[1:], dtype=int, device=device
+                            ),
+                            joint_type=model.joint_type,
+                            joint_parent=model.joint_parent,
+                            joint_child=model.joint_child,
+                            joint_articulation=model.joint_articulation,
+                            joint_qd_start=model.joint_qd_start,
+                            joint_q_start=model.joint_q_start,
+                            joint_dof_dim=model.joint_dof_dim,
+                            joint_f=control.joint_f,
+                            joint_q=state.joint_q,
+                            joint_qd=state.joint_qd,
+                            spring_stiffness=zeros,
+                            spring_reference=zeros,
+                            damping=zeros,
+                            joint_S_s=wp.zeros(model.joint_dof_count, dtype=wp.spatial_vector, device=device),
+                            body_f_s=body_forces,
+                            body_f=body_forces,
+                            body_flags=model.body_flags,
+                            body_q=state.body_q,
+                            body_com=model.body_com,
+                            articulation_origin=wp.zeros(model.articulation_count, dtype=wp.vec3, device=device),
+                            body_ft_s=wp.zeros_like(body_forces),
+                            tau=tau,
+                            row_K=row_K,
+                        )
                         wp.launch(
                             eval_rigid_tau_and_augmented_drives,
                             dim=model.articulation_count,
-                            inputs=[
-                                model.articulation_start,
-                                wp.array(model.articulation_start.numpy()[1:], dtype=int, device=device),
-                                counts,
-                                model.joint_type,
-                                model.joint_parent,
-                                model.joint_child,
-                                model.joint_articulation,
-                                model.joint_qd_start,
-                                model.joint_q_start,
-                                model.joint_target_q_start,
-                                model.joint_dof_dim,
-                                control.joint_f,
-                                state.joint_q,
-                                state.joint_qd,
-                                zeros,
-                                zeros,
-                                zeros,
-                                wp.zeros(model.joint_dof_count, dtype=wp.spatial_vector, device=device),
-                                body_forces,
-                                body_forces,
-                                model.body_flags,
-                                state.body_q,
-                                model.body_com,
-                                wp.zeros(model.articulation_count, dtype=wp.vec3, device=device),
-                                *gains,
-                                max_dofs,
-                                dt,
-                            ],
-                            outputs=[wp.zeros_like(body_forces), row_counts, row_indices, row_K, tau],
+                            inputs=[dynamics, counts, model.joint_target_q_start, *gains, max_dofs, dt],
+                            outputs=[row_counts, row_indices],
                             device=device,
                         )
                     np.testing.assert_allclose(tau.numpy(), expected, rtol=0, atol=2e-6)
@@ -306,38 +308,41 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
         target_qd = wp.array([0.0, 0.05], dtype=wp.float32, device=device)
         effort_limit = wp.array([1.25, 2.5], dtype=wp.float32, device=device)
 
+        def dynamics(body_ft_s, tau, row_K=None, add_existing_tau=0):
+            return field_group.upload(
+                DynamicsData,
+                device,
+                articulation_start=articulation_start,
+                articulation_joint_end=articulation_joint_end,
+                joint_type=joint_type,
+                joint_parent=joint_parent,
+                joint_child=joint_child,
+                joint_articulation=joint_articulation,
+                joint_qd_start=joint_start,
+                joint_q_start=joint_start,
+                joint_dof_dim=joint_dof_dim,
+                joint_f=joint_f,
+                joint_q=joint_q,
+                joint_qd=joint_qd,
+                spring_stiffness=spring_stiffness,
+                spring_reference=spring_ref,
+                damping=damping,
+                joint_S_s=joint_S_s,
+                body_f_s=body_fb_s,
+                body_f=body_f_ext,
+                body_flags=body_flags,
+                body_q=body_q,
+                body_com=body_com,
+                articulation_origin=articulation_origin,
+                body_ft_s=body_ft_s,
+                tau=tau,
+                row_K=row_K if row_K is not None else wp.zeros(1, dtype=wp.float32, device=device),
+                add_existing_tau=add_existing_tau,
+            )
+
         sequential_body_ft = wp.zeros(2, dtype=wp.spatial_vector, device=device)
         sequential_tau = wp.zeros(2, dtype=wp.float32, device=device)
-        wp.launch(
-            eval_rigid_tau,
-            dim=1,
-            inputs=[
-                articulation_start,
-                articulation_joint_end,
-                joint_type,
-                joint_parent,
-                joint_child,
-                joint_articulation,
-                joint_start,
-                joint_start,
-                joint_dof_dim,
-                joint_f,
-                joint_q,
-                joint_qd,
-                spring_stiffness,
-                spring_ref,
-                damping,
-                joint_S_s,
-                body_fb_s,
-                body_f_ext,
-                body_flags,
-                body_q,
-                body_com,
-                articulation_origin,
-            ],
-            outputs=[sequential_body_ft, sequential_tau],
-            device=device,
-        )
+        wp.launch(inverse_dynamics_tau, dim=1, inputs=[dynamics(sequential_body_ft, sequential_tau)], device=device)
 
         combined_body_ft = wp.zeros_like(sequential_body_ft)
         combined_tau = wp.zeros_like(sequential_tau)
@@ -348,30 +353,9 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
             eval_rigid_tau_and_augmented_drives,
             dim=1,
             inputs=[
-                articulation_start,
-                articulation_joint_end,
+                dynamics(combined_body_ft, combined_tau, row_K=combined_stiffness),
                 articulation_dof_count,
-                joint_type,
-                joint_parent,
-                joint_child,
-                joint_articulation,
                 joint_start,
-                joint_start,
-                joint_start,
-                joint_dof_dim,
-                joint_f,
-                joint_q,
-                joint_qd,
-                spring_stiffness,
-                spring_ref,
-                damping,
-                joint_S_s,
-                body_fb_s,
-                body_f_ext,
-                body_flags,
-                body_q,
-                body_com,
-                articulation_origin,
                 target_ke,
                 target_kd,
                 target_q,
@@ -380,13 +364,7 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                 2,
                 0.1,
             ],
-            outputs=[
-                combined_body_ft,
-                combined_counts,
-                combined_indices,
-                combined_stiffness,
-                combined_tau,
-            ],
+            outputs=[combined_counts, combined_indices],
             device=device,
         )
         np.testing.assert_array_equal(combined_body_ft.numpy(), sequential_body_ft.numpy())
@@ -455,33 +433,9 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
 
         additive_body_ft = wp.zeros_like(combined_body_ft)
         wp.launch(
-            eval_rigid_tau_add,
+            inverse_dynamics_tau,
             dim=1,
-            inputs=[
-                articulation_start,
-                articulation_joint_end,
-                joint_type,
-                joint_parent,
-                joint_child,
-                joint_articulation,
-                joint_start,
-                joint_start,
-                joint_dof_dim,
-                joint_f,
-                joint_q,
-                joint_qd,
-                spring_stiffness,
-                spring_ref,
-                damping,
-                joint_S_s,
-                body_fb_s,
-                body_f_ext,
-                body_flags,
-                body_q,
-                body_com,
-                articulation_origin,
-            ],
-            outputs=[additive_body_ft, prepared_tau],
+            inputs=[dynamics(additive_body_ft, prepared_tau, add_existing_tau=1)],
             device=device,
         )
         np.testing.assert_array_equal(additive_body_ft.numpy(), combined_body_ft.numpy())

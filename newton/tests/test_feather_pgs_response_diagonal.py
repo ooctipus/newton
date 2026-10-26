@@ -26,12 +26,17 @@ from newton._src.solvers.feather_pgs.projection_laws import friction_pair
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _FeatherPGSExecutionPlan,
     _get_build_independent_sparse_contact_groups_kernel,
-    _get_direct_diagonal_inverse_mass_kernel,
     _get_hinv_jt_kernel,
     _get_mark_independent_sparse_contact_candidates_kernel,
-    _get_partitioned_inverse_dynamics_kernels,
     _get_pgs_solve_paired_factor_kernel,
     _get_pgs_solve_sparse_diagonal_kernel,
+)
+from newton._src.solvers.feather_pgs.spatial_laws import inertia_record
+from newton._src.solvers.feather_pgs.tree_passes import (
+    DynamicsData,
+    diagonal_inverse_mass,
+    direct_branch_tau,
+    selected_inverse_dynamics_tau,
 )
 from newton.solvers import SolverFeatherPGS
 
@@ -1028,8 +1033,8 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         np.testing.assert_array_equal(impulses.numpy()[0, :6], np.zeros(6, dtype=np.float32))
 
     @unittest.skipUnless(wp.is_cuda_available(), "direct diagonal projection requires CUDA")
-    def test_direct_diagonal_inverse_mass_matches_compact_inertia_terms(self):
-        """Project a one-body branch directly from its compact inertia representation."""
+    def test_direct_diagonal_inverse_mass_matches_inertia_record(self):
+        """Project a one-body branch directly from its inertia record."""
         device = wp.get_device("cuda:0")
         mass = np.float32(2.5)
         com = np.array((0.2, -0.1, 0.3), dtype=np.float32)
@@ -1037,25 +1042,29 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         motion = np.array((0.3, -0.2, 0.4, 0.5, 0.1, -0.6), dtype=np.float32)
         armature = np.float32(0.25)
         drive_stiffness = np.float32(0.75)
-        terms = np.concatenate((com, inertia.reshape(-1)))[None, :]
+        record = np.concatenate(((mass,), mass * com, inertia.reshape(-1))).astype(np.float32)
         inverse_mass = wp.zeros(1, dtype=wp.float32, device=device)
-        kernel = _get_direct_diagonal_inverse_mass_kernel(1, str(device.arch))
+        dynamics = field_group.upload(
+            DynamicsData,
+            device,
+            mass_update_mask=wp.array((1,), dtype=wp.int32, device=device),
+            articulation_dof_start=wp.array((0,), dtype=wp.int32, device=device),
+            articulation_start=wp.array((0, 1), dtype=wp.int32, device=device),
+            joint_child=wp.array((0,), dtype=wp.int32, device=device),
+            joint_S_s=wp.array((wp.spatial_vector(*motion),), dtype=wp.spatial_vector, device=device),
+            drive_row_by_dof=wp.array((0,), dtype=wp.int32, device=device),
+            row_K=wp.array((drive_stiffness,), dtype=wp.float32, device=device),
+        )
         wp.launch(
-            kernel,
+            diagonal_inverse_mass,
             dim=1,
             inputs=[
-                wp.array((0, 1), dtype=wp.int32, device=device),
-                wp.array((0,), dtype=wp.int32, device=device),
-                wp.array((1,), dtype=wp.int32, device=device),
-                wp.array((0,), dtype=wp.int32, device=device),
-                wp.array((wp.spatial_vector(*motion),), dtype=wp.spatial_vector, device=device),
-                wp.array((mass,), dtype=wp.float32, device=device),
-                wp.array(terms, dtype=wp.float32, device=device),
+                dynamics,
+                wp.array((record,), dtype=inertia_record, device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
                 wp.array(((armature,),), dtype=wp.float32, device=device),
-                wp.array((0,), dtype=wp.int32, device=device),
-                wp.array((drive_stiffness,), dtype=wp.float32, device=device),
+                1,
             ],
             outputs=[inverse_mass],
             device=device,
@@ -1079,90 +1088,56 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
         device = wp.get_device("cuda:0")
         spatial = wp.spatial_vector(0.4, -0.2, 0.6, 0.1, 0.3, -0.5)
         external = wp.spatial_vector(-0.3, 0.5, 0.2, -0.4, 0.1, 0.7)
-        articulation_start = wp.array((0, 1), dtype=wp.int32, device=device)
-        articulation_end = wp.array((1,), dtype=wp.int32, device=device)
-        joint_type = wp.array((int(newton.JointType.PRISMATIC),), dtype=wp.int32, device=device)
-        joint_parent = wp.array((-1,), dtype=wp.int32, device=device)
-        joint_child = wp.array((0,), dtype=wp.int32, device=device)
-        joint_articulation = wp.array((0,), dtype=wp.int32, device=device)
-        starts = wp.array((0, 1), dtype=wp.int32, device=device)
-        dof_dim = wp.array(((1, 0),), dtype=wp.int32, device=device)
-        joint_f = wp.array((0.2,), dtype=wp.float32, device=device)
-        joint_q = wp.array((0.15,), dtype=wp.float32, device=device)
-        joint_qd = wp.array((-0.25,), dtype=wp.float32, device=device)
-        stiffness = wp.array((1.4,), dtype=wp.float32, device=device)
-        spring_ref = wp.array((0.05,), dtype=wp.float32, device=device)
-        damping = wp.array((0.3,), dtype=wp.float32, device=device)
-        joint_S_s = wp.array((spatial,), dtype=wp.spatial_vector, device=device)
-        body_force = wp.array((spatial,), dtype=wp.spatial_vector, device=device)
-        external_force = wp.array((external,), dtype=wp.spatial_vector, device=device)
-        body_flags = wp.zeros(1, dtype=wp.int32, device=device)
-        body_q = wp.array((wp.transform_identity(),), dtype=wp.transform, device=device)
-        body_com = wp.array((wp.vec3(0.2, -0.1, 0.3),), dtype=wp.vec3, device=device)
-        origin = wp.array((wp.vec3(),), dtype=wp.vec3, device=device)
+
+        def branch(tau, **values):
+            return field_group.upload(
+                DynamicsData,
+                device,
+                articulation_start=wp.array((0, 1), dtype=wp.int32, device=device),
+                articulation_joint_end=wp.array((1,), dtype=wp.int32, device=device),
+                joint_type=wp.array((int(newton.JointType.PRISMATIC),), dtype=wp.int32, device=device),
+                joint_parent=wp.array((-1,), dtype=wp.int32, device=device),
+                joint_child=wp.array((0,), dtype=wp.int32, device=device),
+                joint_articulation=wp.array((0,), dtype=wp.int32, device=device),
+                joint_q_start=wp.array((0, 1), dtype=wp.int32, device=device),
+                joint_qd_start=wp.array((0, 1), dtype=wp.int32, device=device),
+                joint_dof_dim=wp.array(((1, 0),), dtype=wp.int32, device=device),
+                joint_f=wp.array((0.2,), dtype=wp.float32, device=device),
+                joint_q=wp.array((0.15,), dtype=wp.float32, device=device),
+                joint_qd=wp.array((-0.25,), dtype=wp.float32, device=device),
+                spring_stiffness=wp.array((1.4,), dtype=wp.float32, device=device),
+                spring_reference=wp.array((0.05,), dtype=wp.float32, device=device),
+                damping=wp.array((0.3,), dtype=wp.float32, device=device),
+                joint_S_s=wp.array((spatial,), dtype=wp.spatial_vector, device=device),
+                body_f_s=wp.array((spatial,), dtype=wp.spatial_vector, device=device),
+                body_f=wp.array((external,), dtype=wp.spatial_vector, device=device),
+                body_flags=wp.zeros(1, dtype=wp.int32, device=device),
+                body_q=wp.array((wp.transform_identity(),), dtype=wp.transform, device=device),
+                body_com=wp.array((wp.vec3(0.2, -0.1, 0.3),), dtype=wp.vec3, device=device),
+                articulation_origin=wp.array((wp.vec3(),), dtype=wp.vec3, device=device),
+                tau=tau,
+                add_existing_tau=1,
+                **values,
+            )
+
         selected_tau = wp.array((0.7,), dtype=wp.float32, device=device)
         direct_tau = wp.clone(selected_tau)
         body_ft = wp.zeros(1, dtype=wp.spatial_vector, device=device)
-        selected_kernel, direct_kernel = _get_partitioned_inverse_dynamics_kernels(1, str(device.arch))
-        common = [
-            articulation_start,
-            articulation_end,
-            joint_type,
-            joint_parent,
-            joint_child,
-            joint_articulation,
-            starts,
-            starts,
-            dof_dim,
-            joint_f,
-            joint_q,
-            joint_qd,
-            stiffness,
-            spring_ref,
-            damping,
-            joint_S_s,
-            body_force,
-            external_force,
-            body_flags,
-            body_q,
-            body_com,
-            origin,
-        ]
         wp.launch(
-            selected_kernel,
+            selected_inverse_dynamics_tau,
             dim=1,
-            inputs=[wp.array((0,), dtype=wp.int32, device=device), *common, 1],
-            outputs=[body_ft, selected_tau],
+            inputs=[wp.array((0,), dtype=wp.int32, device=device), branch(selected_tau, body_ft_s=body_ft)],
             device=device,
         )
         wp.launch(
-            direct_kernel,
+            direct_branch_tau,
             dim=1,
             inputs=[
                 wp.array((0,), dtype=wp.int32, device=device),
                 wp.array((0,), dtype=wp.int32, device=device),
-                articulation_start,
-                joint_type,
-                joint_child,
-                starts,
-                starts,
-                dof_dim,
-                joint_f,
-                joint_q,
-                joint_qd,
-                stiffness,
-                spring_ref,
-                damping,
-                joint_S_s,
-                body_force,
-                external_force,
-                body_flags,
-                body_q,
-                body_com,
-                origin,
                 1,
+                branch(direct_tau),
             ],
-            outputs=[direct_tau],
             device=device,
         )
         wp.synchronize_device(device)

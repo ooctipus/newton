@@ -17,8 +17,8 @@
   units of the terms of those that emulate pointer jumping or chains.
 * :class:`TestScheduleRule`: the schedule follows from the plan's data.
 * :class:`TestPath`: a PATH visits the root path, natively and in Warp.
-* :class:`TestGeneralRoute`: the general route's passes as scan
-  configurations against the existing serial kernels, and their gradients.
+
+The general route's passes are tested in ``test_feather_pgs_tree_passes``.
 """
 
 import unittest
@@ -37,7 +37,6 @@ from newton.tests.feather_pgs_tree_scan_fixture import (
     MOTION,
     PASSES,
     POSE,
-    SERIAL_PASSES,
     SHAPES,
     TWIST_SUM,
     applies,
@@ -433,8 +432,8 @@ class _PathVisits:
 
 
 @wp.func
-def _record_visit(ancestor: int, node: int, value: int, d: _PathVisits):
-    d.visits[node * d.count + ancestor] = wp.atomic_add(d.rank, node, value) + value
+def _record_visit(ancestor: int, node: int, value: int, d: _PathVisits, count: int):
+    d.visits[node * count + ancestor] = wp.atomic_add(d.rank, node, value) + value
 
 
 _RECORD_PATH = ts.serial_path(_record_visit)
@@ -443,7 +442,7 @@ _RECORD_PATH = ts.serial_path(_record_visit)
 @wp.kernel
 def _warp_path(root: int, order: wp.array[int], position: wp.array[int], end: wp.array[int], d: _PathVisits):
     node = wp.tid()
-    _RECORD_PATH(root, node, 1, order, position, end, d)
+    _RECORD_PATH(root, node, 1, order, position, end, d, d.count)
 
 
 def check_path(test, device):
@@ -493,145 +492,13 @@ def check_path(test, device):
             np.testing.assert_array_equal(d.visits.numpy().reshape(n, n), expected, err_msg=f"Warp {shape} {label}")
 
 
-def check_general_route(test, device):
-    """The serial kernels and their scan configurations, one serial scan per pass with fused per-node laws.
-
-    Tau, composite inertia (all three forms) and CRBA keep their arithmetic order: bitwise, but for the
-    entries the existing CRBA kernel races on (CUDA). FK and ID compose a joint's pose and twist as the held
-    tree does, ``X_p (X_pj X_j X_c^-1)`` and ``a_p + v_p x v_j``, where the serial kernels compute
-    ``((X_p X_pj) X_j) X_c^-1`` and ``a_p + (v_p + v_j) x v_j``: equal in exact arithmetic, within a few
-    units of the largest value on a 64-joint chain.
-    """
-    from newton.tests.feather_pgs_tree_scan_fixture import (  # noqa: PLC0415
-        articulated_model,
-        crba_shared,
-        serial_compare,
-    )
-
-    model = articulated_model(("anymal13", "humanoid13", "g1_30", "chain64", "random60", "pendulum2"), 2, device)
-    results = serial_compare(model)
-    cuda = wp.get_device(device).is_cuda
-    test.assertEqual(set(results), {p for p in SERIAL_PASSES if cuda or not p.startswith("composite_inertia_")})
-    for key, output in (
-        ("tau", "tau"),
-        ("composite_inertia", "body_I_c"),
-        ("composite_inertia_warp", "body_I_c"),
-        ("composite_inertia_compact", "body_I_c"),
-    ):
-        if key in results:
-            a, b = results[key][output]
-            np.testing.assert_array_equal(a.view(np.uint32), b.view(np.uint32), err_msg=key)
-    # CRBA: in the existing kernel two column threads of one multi-coordinate joint both write the joint's
-    # off-diagonal entries, S_i.(I S_j) and S_j.(I S_i), and the schedule decides which lands. The scan
-    # writes each once, the later column's as a serial run leaves it: bitwise on CPU; on CUDA bitwise but at
-    # those entries, there within rounding, and exactly symmetric.
-    a, b = results["crba"]["H"]
-    shared, mirror = crba_shared(model)
-    np.testing.assert_array_equal(b.view(np.uint32)[mirror], b.view(np.uint32), err_msg="crba symmetry")
-    if cuda:
-        np.testing.assert_array_equal(a.view(np.uint32)[~shared], b.view(np.uint32)[~shared], err_msg="crba")
-        gap = np.abs(a[shared].astype(np.float64) - b[shared]).max(initial=0.0) / np.abs(a).max() / EPS
-        test.assertLess(gap, 8.0, "crba shared entries")
-    else:
-        np.testing.assert_array_equal(a.view(np.uint32), b.view(np.uint32), err_msg="crba")
-    for key, bound in (("fk_kinematics", 32.0), ("fk_id", 96.0)):
-        for output, (existing, generated) in results[key].items():
-            scale = max(float(np.abs(existing).max()), 1e-30)
-            gap = float(np.abs(existing.astype(np.float64) - generated).max()) / scale / EPS
-            test.assertLess(gap, bound, f"{key} {output}")
-
-
-def _unit_quaternion_tangent(model, gradient):
-    """``gradient`` with respect to ``joint_q`` less its components normal to each ball and free joint's unit
-    quaternion: the directions a joint can move in."""
-    import newton  # noqa: PLC0415
-
-    q, q_start = model.joint_q.numpy(), model.joint_q_start.numpy()
-    tangent = gradient.astype(np.float64).copy()
-    for joint, kind in enumerate(model.joint_type.numpy()):
-        if kind not in (int(newton.JointType.BALL), int(newton.JointType.FREE)):
-            continue
-        first = q_start[joint] + (3 if kind == int(newton.JointType.FREE) else 0)
-        unit = q[first : first + 4] / np.linalg.norm(q[first : first + 4])
-        tangent[first : first + 4] -= np.dot(tangent[first : first + 4], unit) * unit
-    return tangent
-
-
-def check_general_route_gradients(test, device):
-    """The general route is also the gradient route: Warp's tape through each generated pass.
-
-    Tau and composite inertia give the existing kernels' gradients (bitwise, but tau's wrench and pose inputs
-    within rounding). FK and ID match central differences; the arms agree on joint velocities, masses and
-    inertias within rounding, and on joint positions along the unit quaternions: off the unit sphere the
-    rotation formula is not multiplicative, so the association of the poses' compositions shows there. CRBA
-    matches central differences, where the existing kernel's gradient is zero (the tape does not see the joint
-    its in-kernel search finds).
-    """
-    from newton.tests.feather_pgs_tree_scan_fixture import (  # noqa: PLC0415
-        GRADIENT_INPUTS,
-        articulated_model,
-        serial_difference,
-        serial_gradients,
-    )
-
-    model = articulated_model(("anymal13", "humanoid13", "pendulum2"), 1, device, requires_grad=True)
-    rng = np.random.default_rng(7)
-
-    def relative(a, b):
-        return float(np.abs(a.astype(np.float64) - b).max() / max(np.abs(b).max(), 1e-30))
-
-    def against_differences(name, key, step, bound):
-        gradient = serial_gradients(model, name, "generated")[key].reshape(-1)
-        picks = rng.choice(gradient.size, min(gradient.size, 24), replace=False)
-        difference = serial_difference(model, name, "generated", key, step, indices=picks).reshape(-1)[picks]
-        test.assertGreater(np.abs(difference).max(), 0.0, f"{name} {key}")
-        test.assertLess(relative(gradient[picks], difference), bound, f"{name} {key} against differences")
-
-    for name in GRADIENT_INPUTS:
-        existing = serial_gradients(model, name, "existing")
-        generated = serial_gradients(model, name, "generated")
-        for key in GRADIENT_INPUTS[name]:
-            a, b = existing[key], generated[key]
-            if name == "composite_inertia" or (name == "tau" and key not in ("body_f_s", "body_f_ext", "body_q")):
-                np.testing.assert_array_equal(a.view(np.uint32), b.view(np.uint32), err_msg=f"{name} {key}")
-            elif name == "crba":
-                continue
-            elif key == "joint_q" and name != "tau":
-                test.assertLess(
-                    relative(_unit_quaternion_tangent(model, b), _unit_quaternion_tangent(model, a)), 1e-5, name
-                )
-            else:
-                test.assertLess(relative(b, a), 1e-5, f"{name} {key}")
-    for name in ("fk_kinematics", "fk_id"):
-        against_differences(name, "joint_qd", 1e-2, 1e-3)
-        against_differences(name, "joint_q", 1e-3, 2e-3)
-    for key in ("joint_S_s", "body_I_c"):
-        against_differences("crba", key, 1e-2, 1e-3)
-
-
 class TestPath(unittest.TestCase):
     pass
-
-
-class TestGeneralRoute(unittest.TestCase):
-    pass
-
-
-def _general_route(test, device):
-    check_general_route(test, device)
-
-
-def _general_route_gradients(test, device):
-    check_general_route_gradients(test, device)
 
 
 from newton.tests.unittest_utils import add_function_test, get_test_devices  # noqa: E402
 
 add_function_test(TestPath, "test_path", check_path, devices=get_test_devices())
-add_function_test(TestGeneralRoute, "test_general_route", _general_route, devices=get_test_devices())
-add_function_test(
-    TestGeneralRoute, "test_general_route_gradients", _general_route_gradients, devices=get_test_devices()
-)
 
 
 if __name__ == "__main__":

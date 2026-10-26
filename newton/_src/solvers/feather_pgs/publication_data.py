@@ -7,6 +7,7 @@ import warp as wp
 
 from . import field_group
 from .field_group import Field
+from .spatial_laws import inertia_record
 
 PUBLICATION = (
     Field("joint_type", wp.int32, ("joint",), owner="model"),
@@ -43,12 +44,10 @@ PUBLICATION = (
     Field("body_a_s", wp.spatial_vector, ("body",), owner="state_aug"),
     Field("body_f_s", wp.spatial_vector, ("body",), owner="state_aug"),
     Field("body_I_s", wp.spatial_matrix, ("body",), owner="state_aug"),
-    Field("body_inertia_terms", wp.float32, ("inertia_terms", 12), attr="_body_inertia_terms"),
+    Field("body_inertia_terms", inertia_record, ("body",), attr="_body_inertia_terms"),
     Field("fk_id_cache_valid", wp.int32, ("articulation",), attr="_fk_id_cache_valid"),
     Field("dt", wp.float32, owner="step"),
     Field("angular_damping", wp.float32),
-    Field("materialize_all_body_inertia", wp.int32, owner="step"),
-    Field("materialize_body_inertia_terms", wp.int32, owner="step"),
     # Per-group stage cycle counts when FEATHER_PGS_STAGE_CLOCKS=1 (a 1x1 placeholder otherwise).
     Field("stage_clocks", wp.int64, ("group", "stage"), owner="step"),
 )

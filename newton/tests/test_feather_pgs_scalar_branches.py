@@ -22,13 +22,13 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import environment_flags, path_selection
+from newton._src.solvers.feather_pgs import environment_flags, path_selection, tree_passes
 from newton._src.solvers.feather_pgs import kernels as fk
 from newton._src.solvers.feather_pgs import scalar_branches as sb
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.device_proof import DeviceProof
-from newton._src.solvers.feather_pgs.kernels import finalize_body_dynamics_body
 from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
+from newton._src.solvers.feather_pgs.spatial_laws import inertia_record
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_subtree_reduce import _assert_switch_within, _excess
 
@@ -233,8 +233,6 @@ def cpu_solver(model, size):
     solver._setup_parallel_augmented_drive_topology(model)
     solver._compact_diagonal_mass_size = size
     solver._fk_id_cache_enabled = True
-    # CPU does not allocate the compact inertia terms that the head kernels materialize.
-    solver._body_inertia_terms = wp.zeros((model.body_count, 12), dtype=float, device=model.device)
     return solver
 
 
@@ -366,14 +364,16 @@ def _write_linear_body(
     body_f_s: wp.array[wp.spatial_vector],
 ):
     dof = joint_qd_start[joint]
-    X_wpj = body_q[joint_parent[joint]] * joint_X_p[joint]
+    X_parent = body_q[joint_parent[joint]]
+    X_wpj = X_parent * joint_X_p[joint]
     axis = joint_axis[dof]
-    X_j = wp.transform(axis * joint_q[joint_q_start[joint]], wp.quat_identity())
-    X_wc = (X_wpj * X_j) * wp.transform_inverse(joint_X_c[joint])
+    q = joint_q[joint_q_start[joint]]
+    # The pose scan's composition: the parent's pose and the joint's relative pose.
+    X_wc = sb._leaf_pose(X_parent, joint_X_p[joint], False, axis, q, joint_X_c[joint])
     X_com = X_wc * body_X_com[body]
     body_q[body] = X_wc
     body_q_com[body] = X_com
-    motion = wp.spatial_vector(wp.quat_rotate(wp.transform_get_rotation(X_wpj), axis), wp.vec3())
+    motion = sb._leaf_motion(X_wpj, wp.vec3(), False, axis)
     joint_S_s[dof] = motion
     body_v_s[body] = motion * joint_qd[dof]
     body_a_s[body] = wp.spatial_vector()
@@ -454,20 +454,14 @@ def _finalize_linear_state(
     body_to_articulation: wp.array[int],
     body_q: wp.array[wp.transform],
     body_q_com: wp.array[wp.transform],
-    body_com: wp.array[wp.vec3],
     body_mass: wp.array[float],
-    body_inertia: wp.array[wp.mat33],
-    is_free_rigid: wp.array[int],
     articulation_origin: wp.array[wp.vec3],
-    materialize_all_body_inertia: int,
-    materialize_body_inertia_terms: int,
     gravity: wp.array[wp.vec3],
     body_v_s: wp.array[wp.spatial_vector],
     body_a_s: wp.array[wp.spatial_vector],
-    body_I_s: wp.array[wp.spatial_matrix],
-    body_inertia_terms: wp.array2d[float],
     body_f_s: wp.array[wp.spatial_vector],
     body_qd: wp.array[wp.spatial_vector],
+    dynamics: tree_passes.DynamicsData,
 ):
     """Publish admitted linear bodies and retain full dynamics for other bodies."""
     body = wp.tid()
@@ -498,26 +492,7 @@ def _finalize_linear_state(
         )
         body_qd[body] = body_v_s[body]
     else:
-        finalize_body_dynamics_body(
-            body,
-            body_to_articulation,
-            body_q,
-            body_q_com,
-            body_com,
-            body_mass,
-            body_inertia,
-            is_free_rigid,
-            articulation_origin,
-            materialize_all_body_inertia,
-            materialize_body_inertia_terms,
-            gravity,
-            body_v_s,
-            body_a_s,
-            body_I_s,
-            body_inertia_terms,
-            body_f_s,
-            body_qd,
-        )
+        tree_passes.publish_body(body, dynamics)
 
 
 @functools.cache
@@ -534,7 +509,7 @@ def _linear_inverse_mass_kernel(n_dofs: int) -> wp.Kernel:
         joint_child: wp.array[int],
         joint_S_s: wp.array[wp.spatial_vector],
         body_mass: wp.array[float],
-        body_inertia_terms: wp.array2d[float],
+        body_inertia_terms: wp.array[inertia_record],
         group_to_art: wp.array[int],
         dof_joint_offset: wp.array[int],
         armature: wp.array2d[float],
@@ -577,51 +552,15 @@ class _PrismaticRoute:
         self.offsets = solver._crba_dof_joint_offset_by_size[self.size]
         self.joint_end, self.body_joint = _linear_state_plan(solver)
         self.previous = wp.zeros(model.articulation_count, dtype=int, device=self.device)
-        _, self.direct_tau = solver_module._get_partitioned_inverse_dynamics_kernels(self.size, "cpu")
         self.inverse_mass = _linear_inverse_mass_kernel(self.size)
 
     def begin(self, state):
         s, model = self.solver, self.model
         wp.copy(self.previous, s._fk_id_cache_valid)
         wp.launch(
-            fk.eval_rigid_fk_id,
+            tree_passes.fk_id,
             dim=model.articulation_count,
-            inputs=[
-                model.articulation_start,
-                self.joint_end,
-                model.joint_type,
-                model.joint_parent,
-                model.joint_child,
-                model.joint_q_start,
-                model.joint_qd_start,
-                state.joint_q,
-                state.joint_qd,
-                model.joint_X_p,
-                model.joint_X_c,
-                s.body_X_com,
-                model.joint_axis,
-                model.joint_dof_dim,
-                model.body_com,
-                model.body_mass,
-                model.body_inertia,
-                s.is_free_rigid,
-                0,
-                0,
-                1,
-                model.gravity,
-            ],
-            outputs=[
-                state.body_q,
-                s.body_q_com,
-                s.articulation_origin,
-                s.joint_S_s,
-                s.body_I_s,
-                s._body_inertia_terms,
-                s.body_v_s,
-                s.body_f_s,
-                s.body_a_s,
-                s._fk_id_cache_valid,
-            ],
+            inputs=[s._dynamics(state, s, articulation_joint_end=self.joint_end, reuse_cached=1)],
             device=self.device,
         )
         wp.launch(
@@ -671,33 +610,9 @@ class _PrismaticRoute:
         )
         count = self.group.shape[0] * size
         wp.launch(
-            self.direct_tau,
+            tree_passes.direct_branch_tau,
             dim=count,
-            inputs=[
-                self.group,
-                self.offsets,
-                model.articulation_start,
-                model.joint_type,
-                model.joint_child,
-                model.joint_qd_start,
-                model.joint_q_start,
-                model.joint_dof_dim,
-                control.joint_f,
-                state.joint_q,
-                state.joint_qd,
-                s._passive_spring_stiffness,
-                s._passive_spring_ref,
-                s._passive_joint_damping,
-                s.joint_S_s,
-                s.body_f_s,
-                state.body_f,
-                model.body_flags,
-                state.body_q,
-                model.body_com,
-                s.articulation_origin,
-                1,
-            ],
-            outputs=[s.joint_tau],
+            inputs=[self.group, self.offsets, size, s._dynamics(state, s, control, add_existing_tau=1)],
             device=self.device,
         )
         wp.launch(
@@ -767,34 +682,9 @@ class _PrismaticRoute:
             device=self.device,
         )
         wp.launch(
-            fk.eval_rigid_fk_kinematics,
+            tree_passes.fk_kinematics,
             dim=model.articulation_count,
-            inputs=[
-                model.articulation_start,
-                self.joint_end,
-                model.joint_type,
-                model.joint_parent,
-                model.joint_child,
-                model.joint_q_start,
-                model.joint_qd_start,
-                state_out.joint_q,
-                state_out.joint_qd,
-                model.joint_X_p,
-                model.joint_X_c,
-                s.body_X_com,
-                model.joint_axis,
-                model.joint_dof_dim,
-                model.body_com,
-            ],
-            outputs=[
-                state_out.body_q,
-                s.body_q_com,
-                s.articulation_origin,
-                s.joint_S_s,
-                s.body_v_s,
-                s.body_a_s,
-                s._fk_id_cache_valid,
-            ],
+            inputs=[s._dynamics(state_out, s, articulation_joint_end=self.joint_end)],
             device=self.device,
         )
         wp.launch(
@@ -815,18 +705,15 @@ class _PrismaticRoute:
                 s.body_to_articulation,
                 state_out.body_q,
                 s.body_q_com,
-                model.body_com,
                 model.body_mass,
-                model.body_inertia,
-                s.is_free_rigid,
                 s.articulation_origin,
-                0,
-                1,
                 model.gravity,
                 s.body_v_s,
                 s.body_a_s,
+                s.body_f_s,
+                state_out.body_qd,
+                s._dynamics(state_out, s, write_inertia_records=1),
             ],
-            outputs=[s.body_I_s, s._body_inertia_terms, s.body_f_s, state_out.body_qd],
             device=self.device,
         )
 
@@ -840,51 +727,14 @@ class _OrdinaryRoute:
         self.size = solver._compact_diagonal_mass_size
         self.group = solver.group_to_art[self.size]
         self.offsets = solver._crba_dof_joint_offset_by_size[self.size]
-        _, self.direct_tau = solver_module._get_partitioned_inverse_dynamics_kernels(self.size, "cpu")
-        self.inverse_mass = solver_module._get_direct_diagonal_inverse_mass_kernel(self.size, "cpu")
 
     def begin(self, state):
         s, model = self.solver, self.model
         s._fk_id_cache_valid.zero_()
         wp.launch(
-            fk.eval_rigid_fk_id,
+            tree_passes.fk_id,
             dim=model.articulation_count,
-            inputs=[
-                model.articulation_start,
-                s.articulation_joint_end,
-                model.joint_type,
-                model.joint_parent,
-                model.joint_child,
-                model.joint_q_start,
-                model.joint_qd_start,
-                state.joint_q,
-                state.joint_qd,
-                model.joint_X_p,
-                model.joint_X_c,
-                s.body_X_com,
-                model.joint_axis,
-                model.joint_dof_dim,
-                model.body_com,
-                model.body_mass,
-                model.body_inertia,
-                s.is_free_rigid,
-                0,
-                1,
-                1,
-                model.gravity,
-            ],
-            outputs=[
-                state.body_q,
-                s.body_q_com,
-                s.articulation_origin,
-                s.joint_S_s,
-                s.body_I_s,
-                s._body_inertia_terms,
-                s.body_v_s,
-                s.body_f_s,
-                s.body_a_s,
-                s._fk_id_cache_valid,
-            ],
+            inputs=[s._dynamics(state, s, write_inertia_records=1, reuse_cached=1)],
             device=self.device,
         )
 
@@ -911,51 +761,21 @@ class _OrdinaryRoute:
             device=self.device,
         )
         wp.launch(
-            self.direct_tau,
+            tree_passes.direct_branch_tau,
             dim=count,
-            inputs=[
-                self.group,
-                self.offsets,
-                model.articulation_start,
-                model.joint_type,
-                model.joint_child,
-                model.joint_qd_start,
-                model.joint_q_start,
-                model.joint_dof_dim,
-                control.joint_f,
-                state.joint_q,
-                state.joint_qd,
-                s._passive_spring_stiffness,
-                s._passive_spring_ref,
-                s._passive_joint_damping,
-                s.joint_S_s,
-                s.body_f_s,
-                state.body_f,
-                model.body_flags,
-                state.body_q,
-                model.body_com,
-                s.articulation_origin,
-                1,
-            ],
-            outputs=[s.joint_tau],
+            inputs=[self.group, self.offsets, size, s._dynamics(state, s, control, add_existing_tau=1)],
             device=self.device,
         )
         wp.launch(
-            self.inverse_mass,
+            tree_passes.diagonal_inverse_mass,
             dim=count,
             inputs=[
-                model.articulation_start,
-                s.articulation_dof_start,
-                s.mass_update_mask,
-                model.joint_child,
-                s.joint_S_s,
-                model.body_mass,
+                s._dynamics(None, s),
                 s._body_inertia_terms,
                 self.group,
                 self.offsets,
                 s.R_by_size[size],
-                s._augmented_drive_row_by_dof,
-                s.aug_row_K,
+                size,
             ],
             outputs=[s._diagonal_inverse_mass],
             device=self.device,
@@ -1007,55 +827,15 @@ class _OrdinaryRoute:
             device=self.device,
         )
         wp.launch(
-            fk.eval_rigid_fk_kinematics,
+            tree_passes.fk_kinematics,
             dim=model.articulation_count,
-            inputs=[
-                model.articulation_start,
-                s.articulation_joint_end,
-                model.joint_type,
-                model.joint_parent,
-                model.joint_child,
-                model.joint_q_start,
-                model.joint_qd_start,
-                state_out.joint_q,
-                state_out.joint_qd,
-                model.joint_X_p,
-                model.joint_X_c,
-                s.body_X_com,
-                model.joint_axis,
-                model.joint_dof_dim,
-                model.body_com,
-            ],
-            outputs=[
-                state_out.body_q,
-                s.body_q_com,
-                s.articulation_origin,
-                s.joint_S_s,
-                s.body_v_s,
-                s.body_a_s,
-                s._fk_id_cache_valid,
-            ],
+            inputs=[s._dynamics(state_out, s)],
             device=self.device,
         )
         wp.launch(
-            fk.finalize_body_dynamics,
+            tree_passes.publish_body_dynamics,
             dim=model.body_count,
-            inputs=[
-                s.body_to_articulation,
-                state_out.body_q,
-                s.body_q_com,
-                model.body_com,
-                model.body_mass,
-                model.body_inertia,
-                s.is_free_rigid,
-                s.articulation_origin,
-                0,
-                1,
-                model.gravity,
-                s.body_v_s,
-                s.body_a_s,
-            ],
-            outputs=[s.body_I_s, s._body_inertia_terms, s.body_f_s, state_out.body_qd],
+            inputs=[s._dynamics(state_out, s, write_inertia_records=1)],
             device=self.device,
         )
 

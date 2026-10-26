@@ -101,17 +101,16 @@ class TestFeatherPGSNotifyInertial(unittest.TestCase):
         np.testing.assert_allclose(outputs[False]["joint_qd"], outputs[True]["joint_qd"], rtol=0.0, atol=1.0e-6)
 
     def test_notify_refreshes_baked_com_and_inertia_buffers(self):
-        """Verify BODY_INERTIAL_PROPERTIES re-derives body_X_com and body_I_m.
+        """Verify BODY_INERTIAL_PROPERTIES re-derives body_X_com and requests a mass update.
 
-        Both buffers are baked from the model at construction time; writing
-        model.body_com/body_mass alone must not change them until the solver
-        is notified.
+        The COM frames are baked from the model at construction time; writing
+        model.body_com alone must not change them until the solver is notified.
+        Mass and inertia are read live by the inertia records.
         """
         device = wp.get_device()
         model = _build_model(device)
         solver = SolverFeatherPGS(model)
         stale_X_com = solver.body_X_com.numpy().copy()
-        stale_I_m = solver.body_I_m.numpy().copy()
 
         body_com = model.body_com.numpy()
         body_com[0] = NEW_COM
@@ -126,7 +125,6 @@ class TestFeatherPGSNotifyInertial(unittest.TestCase):
         np.testing.assert_allclose(
             solver.body_X_com.numpy()[0][:3], np.asarray(NEW_COM, dtype=np.float32), rtol=0.0, atol=0.0
         )
-        self.assertFalse(np.allclose(solver.body_I_m.numpy(), stale_I_m))
         self.assertEqual(solver._mass_update_requested.numpy()[0], 1)
 
     def test_com_change_with_notify_matches_freshly_built_solver(self):

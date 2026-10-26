@@ -1,13 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The spatial kit: one source for Warp and CUDA, and the sites it replaces.
+"""The spatial kit: one source for Warp and CUDA, and each law against its float64 definition.
 
 Each law's two renderings agree bit for bit (up to the sign of a zero). Each
-site that spells a kit law today is compared with the law on random inputs:
-bitwise where the site computes the same operations in the same order, and
-otherwise within a stated bound, in float32 units of the magnitude of the
-terms (``term_ulps``), with the reason the order differs.
+law matches its definition within a stated bound, in float32 units of the
+magnitude of its terms (``term_ulps``); the joint transform matches the
+Featherstone solver's, the same law, bit for bit.
 """
 
 import unittest
@@ -15,18 +14,10 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.math import velocity_at_point
-from newton._src.math.spatial import transform_twist
 from newton._src.sim import JointType
-from newton._src.solvers.feather_pgs import (
-    cached_force,
-    kernels,
-    law_source,
-    scalar_branches,
-    spatial_laws,
-    tree_kinetic_state,
-)
-from newton._src.solvers.feather_pgs.device_preludes import cuda_native, dual_native
+from newton._src.solvers.feather_pgs import law_source, spatial_laws
+from newton._src.solvers.feather_pgs.device_preludes import dual_native
+from newton._src.solvers.featherstone import kernels as featherstone
 from newton.tests.feather_pgs_law_harness import exec_kernel, mismatches, term_ulps
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
@@ -149,298 +140,257 @@ class TestSpatialLawSource(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Sites: each spelling of a kit law today against the law
+# References: each law against its float64 definition
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-@wp.kernel(enable_backward=False)
-def _compose_sites(
-    parent_v: wp.array[wp.spatial_vector],
-    parent_a: wp.array[wp.spatial_vector],
-    joint_v: wp.array[wp.spatial_vector],
-    law_v: wp.array[wp.spatial_vector],
-    law_a: wp.array[wp.spatial_vector],
-    serial_v: wp.array[wp.spatial_vector],
-    serial_a: wp.array[wp.spatial_vector],
-):
-    i = wp.tid()
-    v, a = spatial_laws.twist_compose(parent_v[i], parent_a[i], joint_v[i], wp.spatial_vector())
-    law_v[i] = v
-    law_a[i] = a
-    # kernels.compute_link_kinematics: the velocity product of the child's total twist with the joint's.
-    v_s = parent_v[i] + joint_v[i]
-    serial_v[i] = v_s
-    serial_a[i] = parent_a[i] + kernels.spatial_cross(v_s, joint_v[i])
-
-
-@wp.kernel(enable_backward=False)
-def _twist_sites(
-    frame: wp.array[wp.transform],
-    twist: wp.array[wp.spatial_vector],
-    offset: wp.array[wp.vec3],
-    law: wp.array[wp.spatial_vector],
-    newton_twist: wp.array[wp.spatial_vector],
-    law_point: wp.array[wp.vec3],
-    finalize_point: wp.array[wp.vec3],
-    body_terms_point: wp.array[wp.vec3],
-    newton_point: wp.array[wp.vec3],
-):
-    i = wp.tid()
-    law[i] = spatial_laws.twist_transform(frame[i], twist[i])
-    newton_twist[i] = transform_twist(frame[i], twist[i])
-    law_point[i] = spatial_laws.point_velocity(twist[i], offset[i])
-    v_s = twist[i]
-    # kernels.finalize_body_dynamics_values and update_body_qd_from_featherstone.
-    finalize_point[i] = wp.spatial_top(v_s) + wp.cross(wp.spatial_bottom(v_s), offset[i])
-    # tree_kinetic_state.get_helpers._body_terms (the public COM twist) and scalar_branches' leaf velocity.
-    linear, omega = wp.spatial_top(v_s), wp.spatial_bottom(v_s)
-    body_terms_point[i] = linear + wp.cross(omega, offset[i])
-    # friction_patches._point_velocity.
-    newton_point[i] = velocity_at_point(v_s, offset[i])
-
-
-@wp.kernel(enable_backward=False)
-def _wrench_sites(
-    wrench: wp.array[wp.spatial_vector],
-    offset: wp.array[wp.vec3],
-    flags: wp.array[int],
-    zeros: wp.array[wp.spatial_vector],
-    poses: wp.array[wp.transform],
-    law: wp.array[wp.spatial_vector],
-    scalar: wp.array[wp.spatial_vector],
-    net: wp.array[wp.spatial_vector],
-    transport_law: wp.array[wp.vec3],
-    transport_site: wp.array[wp.vec3],
-):
-    i = wp.tid()
-    law[i] = spatial_laws.wrench_shift(wrench[i], offset[i])
-    scalar[i] = scalar_branches._external_at_origin(i, offset[i], wrench, flags)
-    # kernels._compute_body_net_wrench subtracts the shifted wrench; with no other wrench it returns its negative.
-    origin = wp.vec3()
-    net[i] = -kernels._compute_body_net_wrench(
-        i,
-        wp.spatial_vector(),
-        origin,
-        zeros,
-        wrench,
-        flags,
-        poses,
-        offset,
+def _quat_matrix(q):
+    """Rotation matrices of unit quaternions ``(x, y, z, w)`` (float64)."""
+    x, y, z, w = (q[:, k].astype(np.float64) for k in range(4))
+    return np.stack(
+        [
+            np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], axis=-1),
+            np.stack([2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)], axis=-1),
+            np.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], axis=-1),
+        ],
+        axis=1,
     )
-    linear, angular = wp.spatial_top(wrench[i]), wp.spatial_bottom(wrench[i])
-    transport_law[i] = spatial_laws.free_root_transport(linear, angular)
-    # kernels.apply_free_root_transport_to_predictor and _light_remove_free_root_transport_from_qdd.
-    transport_site[i] = wp.cross(angular, linear)
+
+
+def _quat_multiply(a, b):
+    x1, y1, z1, w1 = (a[:, k].astype(np.float64) for k in range(4))
+    x2, y2, z2, w2 = (b[:, k].astype(np.float64) for k in range(4))
+    return np.stack(
+        [
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        ],
+        axis=1,
+    )
+
+
+def _compose(a, b):
+    """Poses ``a * b`` (float64), each ``(p, q)``."""
+    p = a[:, :3] + np.einsum("nij,nj->ni", _quat_matrix(a[:, 3:]), b[:, :3])
+    return np.concatenate([p, _quat_multiply(a[:, 3:], b[:, 3:])], axis=1)
+
+
+def _inverse(a):
+    q = a[:, 3:].astype(np.float64) * np.array([-1.0, -1.0, -1.0, 1.0])
+    return np.concatenate([-np.einsum("nij,nj->ni", _quat_matrix(q), a[:, :3]), q], axis=1)
+
+
+def _skew(v):
+    zero = np.zeros(v.shape[0])
+    return np.stack(
+        [
+            np.stack([zero, -v[:, 2], v[:, 1]], axis=-1),
+            np.stack([v[:, 2], zero, -v[:, 0]], axis=-1),
+            np.stack([-v[:, 1], v[:, 0], zero], axis=-1),
+        ],
+        axis=1,
+    )
+
+
+def _kernel(name, law, arguments, results, device):
+    """Launch one law over arrays; returns its results as numpy."""
+    namespace = {"wp": wp, "law": law}
+    inputs, args = [], []
+    for k, values in enumerate(arguments):
+        namespace[f"T_{k}"] = values.dtype
+        inputs.append(f"a_{k}: wp.array[T_{k}]")
+        args.append(f"a_{k}[i]")
+    outputs = []
+    for j, dtype in enumerate(results):
+        namespace[f"R_{j}"] = dtype
+        outputs.append(f"r_{j}: wp.array[R_{j}]")
+    names = [f"v_{j}" for j in range(len(results))]
+    stores = "\n".join(f"    r_{j}[i] = v_{j}" for j in range(len(results)))
+    source = (
+        f"def {name}({', '.join(inputs + outputs)}):\n    i = wp.tid()\n"
+        f"    {', '.join(names)} = law({', '.join(args)})\n{stores}\n"
+    )
+    kernel = exec_kernel(name, source, namespace)
+    outs = [wp.zeros(arguments[0].shape[0], dtype=r, device=device) for r in results]
+    wp.launch(kernel, arguments[0].shape[0], inputs=list(arguments) + outs, device=device)
+    return [o.numpy() for o in outs]
+
+
+def _close(test, got, expected, magnitude, bound, tag):
+    gap = float(term_ulps(got, expected, magnitude).max())
+    test.assertLess(gap, bound, tag)
+
+
+def test_compose_laws(test, device):
+    """The pose and twist combines and the joint frame pose against their float64 definitions."""
+    rng = np.random.default_rng(1)
+    poses = [_value(wp.transform, rng, N) for _ in range(3)]
+    a, b, c = (wp.array(x, dtype=wp.transform, device=device) for x in poses)
+    (got,) = _kernel("compose", spatial_laws.transform_compose, [a, b], [wp.transform], device)
+    _close(test, got, _compose(poses[0], poses[1]), 4.0, 8.0, "transform_compose")
+    (got,) = _kernel("frame_pose", spatial_laws.joint_frame_pose, [a, b, c], [wp.transform], device)
+    expected = _compose(_compose(poses[0], poses[1]), _inverse(poses[2]))
+    _close(test, got, expected, 8.0, 16.0, "joint_frame_pose")
+    twists = [rng.standard_normal((N, 6)).astype(np.float32) for _ in range(4)]
+    arrays = [wp.array(x, dtype=wp.spatial_vector, device=device) for x in twists]
+    velocity, bias = _kernel(
+        "twist_compose", spatial_laws.twist_compose, arrays, [wp.spatial_vector, wp.spatial_vector], device
+    )
+    pv, pa, v, acc = (x.astype(np.float64) for x in twists)
+    linear = np.cross(pv[:, 3:], v[:, :3]) + np.cross(pv[:, :3], v[:, 3:])
+    angular = np.cross(pv[:, 3:], v[:, 3:])
+    _close(test, velocity, pv + v, np.abs(pv) + np.abs(v), 2.0, "twist_compose velocity")
+    expected = pa + acc + np.concatenate([linear, angular], axis=1)
+    _close(test, bias, expected, 8.0, 16.0, "twist_compose bias")
+
+
+def test_twist_and_wrench_laws(test, device):
+    """Frame changes, point velocities, wrench shifts, the transport and the dual cross product."""
+    rng = np.random.default_rng(2)
+    frame = _value(wp.transform, rng, N)
+    twist = rng.standard_normal((N, 6)).astype(np.float32)
+    wrench = rng.standard_normal((N, 6)).astype(np.float32)
+    offset = rng.standard_normal((N, 3)).astype(np.float32)
+    f = wp.array(frame, dtype=wp.transform, device=device)
+    t = wp.array(twist, dtype=wp.spatial_vector, device=device)
+    w = wp.array(wrench, dtype=wp.spatial_vector, device=device)
+    o = wp.array(offset, dtype=wp.vec3, device=device)
+    rotation = _quat_matrix(frame[:, 3:])
+    angular = np.einsum("nij,nj->ni", rotation, twist[:, 3:])
+    linear = np.einsum("nij,nj->ni", rotation, twist[:, :3]) + np.cross(frame[:, :3], angular)
+    (got,) = _kernel("twist_transform", spatial_laws.twist_transform, [f, t], [wp.spatial_vector], device)
+    _close(test, got, np.concatenate([linear, angular], axis=1), 8.0, 16.0, "twist_transform")
+    (got,) = _kernel("point_velocity", spatial_laws.point_velocity, [t, o], [wp.vec3], device)
+    _close(test, got, twist[:, :3] + np.cross(twist[:, 3:], offset), 4.0, 4.0, "point_velocity")
+    (got,) = _kernel("wrench_shift", spatial_laws.wrench_shift, [w, o], [wp.spatial_vector], device)
+    expected = np.concatenate([wrench[:, :3], wrench[:, 3:] + np.cross(offset, wrench[:, :3])], axis=1)
+    _close(test, got, expected, 4.0, 4.0, "wrench_shift")
+    v3 = wp.array(twist[:, :3], dtype=wp.vec3, device=device)
+    w3 = wp.array(twist[:, 3:], dtype=wp.vec3, device=device)
+    (got,) = _kernel("transport", spatial_laws.free_root_transport, [v3, w3], [wp.vec3], device)
+    _close(test, got, np.cross(twist[:, 3:], twist[:, :3]), 4.0, 4.0, "free_root_transport")
+    (got,) = _kernel("cross_wrench", spatial_laws.cross_wrench, [t, w], [wp.spatial_vector], device)
+    expected = np.concatenate(
+        [
+            np.cross(twist[:, 3:], wrench[:, :3]),
+            np.cross(twist[:, 3:], wrench[:, 3:]) + np.cross(twist[:, :3], wrench[:, :3]),
+        ],
+        axis=1,
+    )
+    _close(test, got, expected, 4.0, 8.0, "cross_wrench")
+
+
+def test_inertia_laws(test, device):
+    """Placing, applying, packing and acting with one inertia representation against the dense 6x6 algebra."""
+    rng = np.random.default_rng(4)
+    mass = _value(float, rng, N)
+    inertia = _inertias(rng, N)
+    rotation = _quaternions(rng, N)
+    offset = rng.standard_normal((N, 3)).astype(np.float32)
+    twist = rng.standard_normal((N, 6)).astype(np.float32)
+    m = wp.array(mass, dtype=float, device=device)
+    i3 = wp.array(inertia, dtype=wp.mat33, device=device)
+    q = wp.array(rotation, dtype=wp.quat, device=device)
+    o = wp.array(offset, dtype=wp.vec3, device=device)
+    tw = wp.array(twist, dtype=wp.spatial_vector, device=device)
+    placed_mass, moment, rotational = _kernel(
+        "inertia_at", spatial_laws.inertia_at, [m, i3, q, o], [float, wp.vec3, wp.mat33], device
+    )
+    R = _quat_matrix(rotation)
+    c = offset.astype(np.float64)
+    expected = np.einsum("nij,njk,nlk->nil", R, inertia, R) + mass[:, None, None] * (
+        np.einsum("ni,ni->n", c, c)[:, None, None] * np.eye(3) - np.einsum("ni,nj->nij", c, c)
+    )
+    np.testing.assert_array_equal(placed_mass, mass)
+    _close(test, moment, mass[:, None] * c, np.abs(mass[:, None] * c), 1.0, "inertia_at moment")
+    _close(test, rotational, expected, np.abs(expected).max(axis=(1, 2))[:, None, None] + 1.0, 16.0, "inertia_at")
+    dense = np.zeros((N, 6, 6))
+    dense[:, :3, :3] = mass[:, None, None] * np.eye(3)
+    dense[:, :3, 3:] = -_skew(mass[:, None] * c)
+    dense[:, 3:, :3] = _skew(mass[:, None] * c)
+    dense[:, 3:, 3:] = rotational.astype(np.float64)
+    pm = wp.array(placed_mass, dtype=float, device=device)
+    pv = wp.array(moment, dtype=wp.vec3, device=device)
+    pr = wp.array(rotational, dtype=wp.mat33, device=device)
+    (got,) = _kernel("inertia_apply", spatial_laws.inertia_apply, [pm, pv, pr, tw], [wp.spatial_vector], device)
+    _close(test, got, np.einsum("nij,nj->ni", dense, twist), 8.0 * np.abs(dense).max(), 8.0, "inertia_apply")
+    (got,) = _kernel("inertia_matrix", spatial_laws.inertia_matrix, [pm, pv, pr], [wp.spatial_matrix], device)
+    np.testing.assert_allclose(got, dense, rtol=1e-6, atol=1e-6)
+    (got,) = _kernel("inertia_action", spatial_laws.inertia_action, [q, i3, o], [wp.vec3], device)
+    expected = np.einsum("nij,njk,nlk,nl->ni", R, inertia, R, c)
+    _close(test, got, expected, 8.0 * np.abs(expected).max(), 8.0, "inertia_action")
 
 
 @wp.kernel(enable_backward=False)
-def _inertia_sites(
+def _records(
     mass: wp.array[float],
-    inertia: wp.array[wp.mat33],
-    pose: wp.array[wp.transform],
-    twist: wp.array[wp.spatial_vector],
-    law_moment: wp.array[wp.vec3],
-    law_rotational: wp.array[wp.mat33],
-    held_rotational: wp.array[wp.mat33],
-    compact_com: wp.array[wp.vec3],
-    compact_rotational: wp.array[wp.mat33],
-    law_apply: wp.array[wp.spatial_vector],
-    compact_apply: wp.array[wp.spatial_vector],
-    dense_apply: wp.array[wp.spatial_vector],
-    law_matrix: wp.array[wp.spatial_matrix],
-    compact_matrix: wp.array[wp.spatial_matrix],
-    adjoint_matrix: wp.array[wp.spatial_matrix],
-    law_action: wp.array[wp.vec3],
-    held_action: wp.array[wp.vec3],
+    moment: wp.array[wp.vec3],
+    rotational: wp.array[wp.mat33],
+    records: wp.array[spatial_laws.inertia_record],
+    unpacked_mass: wp.array[float],
+    unpacked_moment: wp.array[wp.vec3],
+    unpacked_rotational: wp.array[wp.mat33],
 ):
     i = wp.tid()
-    rotation = wp.transform_get_rotation(pose[i])
-    offset = wp.transform_get_translation(pose[i])
-    m, h, rotational = spatial_laws.inertia_at(mass[i], inertia[i], rotation, offset)
-    law_moment[i] = h
-    law_rotational[i] = rotational
-    # tree_kinetic_state: _body_terms rotates the inertia, _STORE_TERMS_SOURCE adds the parallel-axis term entry by entry.
-    matrix = wp.quat_to_matrix(rotation)
-    rotated = matrix * inertia[i] * wp.transpose(matrix)
-    square = wp.dot(offset, offset)
-    held = wp.mat33()
-    for r in range(3):
-        for c in range(3):
-            diagonal = float(0.0)
-            if r == c:
-                diagonal = square
-            held[r, c] = rotated[r, c] + m * (diagonal - offset[r] * offset[c])
-    held_rotational[i] = held
-    # kernels.transform_com_inertia_terms: the parallel-axis term as -m [c]x [c]x.
-    com, inertia_origin = kernels.transform_com_inertia_terms(pose[i], m, inertia[i])
-    compact_com[i] = com
-    compact_rotational[i] = inertia_origin
-    law_apply[i] = spatial_laws.inertia_apply(m, h, rotational, twist[i])
-    compact_apply[i] = kernels.mul_com_spatial_inertia(m, com, inertia_origin, twist[i])
-    law_matrix[i] = spatial_laws.inertia_matrix(m, h, rotational)
-    compact_matrix[i] = kernels.assemble_com_spatial_inertia(m, com, inertia_origin)
-    dense_apply[i] = compact_matrix[i] * twist[i]
-    # kernels.refresh_masked_body_inertia: the dense adjoint transform of the body-frame matrix.
-    body = wp.spatial_matrix()
-    for r in range(3):
-        body[r, r] = m
-        for c in range(3):
-            body[3 + r, 3 + c] = inertia[i][r, c]
-    adjoint_matrix[i] = kernels.transform_spatial_inertia(pose[i], body)
-    law_action[i] = spatial_laws.inertia_action(rotation, inertia[i], offset)
-    held_action[i] = tree_kinetic_state._inertia_action(rotation, inertia[i], offset)
+    records[i] = spatial_laws.pack_inertia(mass[i], moment[i], rotational[i])
+    m, h, r = spatial_laws.unpack_inertia(records[i])
+    unpacked_mass[i] = m
+    unpacked_moment[i] = h
+    unpacked_rotational[i] = r
+
+
+def test_inertia_records(test, device):
+    """An inertia record holds mass, first moment and rotational inertia exactly, row-major."""
+    rng = np.random.default_rng(5)
+    mass = _value(float, rng, N)
+    moment = rng.standard_normal((N, 3)).astype(np.float32)
+    rotational = _inertias(rng, N)
+    inputs = [
+        wp.array(mass, dtype=float, device=device),
+        wp.array(moment, dtype=wp.vec3, device=device),
+        wp.array(rotational, dtype=wp.mat33, device=device),
+    ]
+    records = wp.zeros(N, dtype=spatial_laws.inertia_record, device=device)
+    outputs = [
+        wp.zeros(N, dtype=float, device=device),
+        wp.zeros(N, dtype=wp.vec3, device=device),
+        wp.zeros(N, dtype=wp.mat33, device=device),
+    ]
+    wp.launch(_records, N, inputs=inputs, outputs=[records, *outputs], device=device)
+    np.testing.assert_array_equal(records.numpy(), np.c_[mass, moment, rotational.reshape(N, 9)])
+    for got, value in zip(outputs, (mass, moment, rotational), strict=True):
+        np.testing.assert_array_equal(got.numpy(), value)
 
 
 @wp.kernel(enable_backward=False)
-def _joint_sites(
+def _joints(
     joint_type: wp.array[int],
+    lin_count: wp.array[int],
+    ang_count: wp.array[int],
     joint_axis: wp.array[wp.vec3],
     joint_q: wp.array[float],
     joint_qd: wp.array[float],
-    lin_count: wp.array[int],
-    ang_count: wp.array[int],
     anchor: wp.array[wp.transform],
-    child: wp.array[wp.transform],
     law_transform: wp.array[wp.transform],
-    site_transform: wp.array[wp.transform],
-    law_axes: wp.array2d[wp.spatial_vector],
-    site_axes: wp.array[wp.spatial_vector],
-    law_leaf: wp.array[wp.transform],
-    scalar_leaf: wp.array[wp.transform],
-    law_leaf_axis: wp.array[wp.spatial_vector],
-    scalar_leaf_axis: wp.array[wp.spatial_vector],
+    reference_transform: wp.array[wp.transform],
+    twist: wp.array[wp.spatial_vector],
+    columns: wp.array[wp.spatial_vector],
 ):
     i = wp.tid()
     t = joint_type[i]
     law_transform[i] = spatial_laws.joint_transform(t, joint_axis, 6 * i, lin_count[i], ang_count[i], joint_q, 7 * i)
-    site_transform[i] = kernels.jcalc_transform(t, joint_axis, 6 * i, lin_count[i], ang_count[i], joint_q, 7 * i)
-    # jcalc_motion stores one column per coordinate; the kit forms each column with motion_axis, its kind a
-    # constant in each branch as at the call sites (a kind chosen at run time compiles to another FMA grouping).
-    kernels.jcalc_motion(t, joint_axis, lin_count[i], ang_count[i], anchor[i], joint_qd, 6 * i, site_axes)
-    for k in range(lin_count[i] + ang_count[i]):
-        if k < lin_count[i]:
-            law_axes[i, k] = spatial_laws.motion_axis(anchor[i], joint_axis[6 * i + k], False)
-        else:
-            law_axes[i, k] = spatial_laws.motion_axis(anchor[i], joint_axis[6 * i + k], True)
-    # scalar_branches: one-coordinate leaves, each kind in its own branch.
-    axis = joint_axis[6 * i]
-    q = joint_q[7 * i]
-    inverse_child = wp.transform_inverse(child[i])
-    if t == JointType.REVOLUTE:
-        law_leaf[i] = anchor[i] * spatial_laws.axis_transform(True, axis, q) * inverse_child
-        law_leaf_axis[i] = spatial_laws.motion_axis(anchor[i], axis, True)
-        scalar_leaf[i] = scalar_branches._revolute_pose(anchor[i], axis, q, child[i])
-        scalar_leaf_axis[i] = scalar_branches._revolute_motion(anchor[i], wp.vec3(), axis)
-    else:
-        law_leaf[i] = anchor[i] * spatial_laws.axis_transform(False, axis, q) * inverse_child
-        law_leaf_axis[i] = spatial_laws.motion_axis(anchor[i], axis, False)
-        scalar_leaf[i] = scalar_branches._prismatic_pose(anchor[i], axis, q, child[i])
-        scalar_leaf_axis[i] = scalar_branches._prismatic_motion(anchor[i], axis)
-
-
-def _launch(kernel, inputs, outputs, device, n=N):
-    wp.launch(kernel, n, inputs=inputs, outputs=outputs, device=device)
-    return [o.numpy() for o in outputs]
-
-
-def test_compose_sites(test, device):
-    """The scans' twist compose against the serial route's (ulps: ``(v_p + v) x v`` there, ``v_p x v`` here)."""
-    rng = np.random.default_rng(1)
-    arrays = [
-        wp.array(rng.standard_normal((N, 6)).astype(np.float32), dtype=wp.spatial_vector, device=device)
-        for _ in range(3)
-    ]
-    outs = [wp.zeros(N, dtype=wp.spatial_vector, device=device) for _ in range(4)]
-    law_v, law_a, serial_v, serial_a = _launch(_compose_sites, arrays, outs, device)
-    test.assertEqual(int(mismatches(law_v, serial_v).sum()), 0)
-    # Terms of the acceleration: the parent's and the velocity products, of order |v|^2.
-    v = np.linalg.norm(arrays[2].numpy(), axis=1, keepdims=True)
-    scale = np.abs(arrays[1].numpy()) + (np.linalg.norm(arrays[0].numpy(), axis=1, keepdims=True) + v) * v
-    test.assertLess(float(term_ulps(law_a, serial_a, scale).max()), 2.0)
-
-
-def test_twist_sites(test, device):
-    """Twist transform and point velocity: every site's spelling is the law's arithmetic."""
-    rng = np.random.default_rng(2)
-    frame = wp.array(_value(wp.transform, rng, N), dtype=wp.transform, device=device)
-    twist = wp.array(_value(wp.spatial_vector, rng, N), dtype=wp.spatial_vector, device=device)
-    offset = wp.array(_value(wp.vec3, rng, N), dtype=wp.vec3, device=device)
-    outs = [wp.zeros(N, dtype=wp.spatial_vector, device=device) for _ in range(2)]
-    outs += [wp.zeros(N, dtype=wp.vec3, device=device) for _ in range(4)]
-    law, site, point, *points = _launch(_twist_sites, [frame, twist, offset], outs, device)
-    test.assertEqual(int(mismatches(law, site).sum()), 0)
-    for other in points:
-        test.assertEqual(int(mismatches(point, other, signed_zeros=False).sum()), 0)
-
-
-def test_wrench_sites(test, device):
-    """Wrench shift and free-root transport: the scalar branches', the net wrench's and the transport sites'."""
-    rng = np.random.default_rng(3)
-    wrench = wp.array(_value(wp.spatial_vector, rng, N), dtype=wp.spatial_vector, device=device)
-    offset = wp.array(_value(wp.vec3, rng, N), dtype=wp.vec3, device=device)
-    flags = wp.zeros(N, dtype=int, device=device)
-    zeros = wp.zeros(N, dtype=wp.spatial_vector, device=device)
-    poses = wp.array(np.tile([0, 0, 0, 0, 0, 0, 1], (N, 1)).astype(np.float32), dtype=wp.transform, device=device)
-    outs = [wp.zeros(N, dtype=wp.spatial_vector, device=device) for _ in range(3)]
-    outs += [wp.zeros(N, dtype=wp.vec3, device=device) for _ in range(2)]
-    law, scalar, net, transport_law, transport_site = _launch(
-        _wrench_sites, [wrench, offset, flags, zeros, poses], outs, device
+    reference_transform[i] = featherstone.jcalc_transform(
+        t, joint_axis, 6 * i, lin_count[i], ang_count[i], joint_q, 7 * i
     )
-    test.assertEqual(int(mismatches(law, scalar).sum()), 0)
-    test.assertEqual(int(mismatches(law, net, signed_zeros=False).sum()), 0)
-    test.assertEqual(int(mismatches(transport_law, transport_site).sum()), 0)
+    twist[i] = spatial_laws.joint_motion(t, joint_axis, lin_count[i], ang_count[i], anchor[i], joint_qd, 6 * i, columns)
 
 
-def test_inertia_sites(test, device):
-    """One inertia representation against the held tree's (bitwise) and the compact and dense forms (ulps)."""
-    rng = np.random.default_rng(4)
-    mass = wp.array(_value(float, rng, N), dtype=float, device=device)
-    inertia = wp.array(_inertias(rng, N), dtype=wp.mat33, device=device)
-    pose = wp.array(_value(wp.transform, rng, N), dtype=wp.transform, device=device)
-    twist = wp.array(_value(wp.spatial_vector, rng, N), dtype=wp.spatial_vector, device=device)
-    types = [wp.vec3, wp.mat33, wp.mat33, wp.vec3, wp.mat33, wp.spatial_vector, wp.spatial_vector, wp.spatial_vector]
-    types += [wp.spatial_matrix] * 3 + [wp.vec3] * 2
-    outs = [wp.zeros(N, dtype=t, device=device) for t in types]
-    (
-        moment,
-        rotational,
-        held,
-        com,
-        compact,
-        law_apply,
-        compact_apply,
-        dense_apply,
-        law_matrix,
-        compact_matrix,
-        adjoint_matrix,
-        law_action,
-        held_action,
-    ) = _launch(_inertia_sites, [mass, inertia, pose, twist], outs, device)
-    m = mass.numpy()
-    test.assertEqual(int(mismatches(rotational, held).sum()), 0)
-    test.assertEqual(int(mismatches(moment, m[:, None] * com).sum()), 0)
-    # The parallel-axis term: entry by entry here, -m [c]x [c]x there; terms of order |I| + m |c|^2.
-    c = pose.numpy()[:, :3].astype(np.float64)
-    scale = np.abs(inertia.numpy()).max(axis=(1, 2)) + m * np.sum(c * c, axis=1)
-    test.assertLess(float(term_ulps(rotational, compact, scale[:, None, None]).max()), 4.0)
-    test.assertEqual(int(mismatches(law_action, held_action).sum()), 0)
-    # Applying the inertia: (m v + w x h, h x v + I w) here, m (v - c x w) and m c x v + I w in the compact form.
-    v = np.abs(twist.numpy()).max(axis=1)
-    apply_scale = (m * (1.0 + np.linalg.norm(c, axis=1)) + scale) * v
-    test.assertLess(float(term_ulps(law_apply, compact_apply, apply_scale[:, None]).max()), 4.0)
-    test.assertLess(float(term_ulps(law_apply, dense_apply, apply_scale[:, None]).max()), 4.0)
-    # The dense pack: bitwise but for the parallel-axis block, which follows the rotational inertia.
-    law_m, compact_m = law_matrix.reshape(N, 6, 6), compact_matrix.reshape(N, 6, 6)
-    test.assertEqual(int(mismatches(law_m[:, :, :3], compact_m[:, :, :3]).sum()), 0)
-    test.assertEqual(int(mismatches(law_m[:, :3, 3:], compact_m[:, :3, 3:]).sum()), 0)
-    # The adjoint form sums 6x6 triple products: terms of the size of the matrix's largest entry.
-    matrix_scale = np.abs(law_m).max(axis=(1, 2))
-    test.assertLess(float(term_ulps(law_matrix, adjoint_matrix, matrix_scale[:, None, None]).max()), 8.0)
-
-
-def test_joint_sites(test, device):
-    """Joint transform and motion subspace: jcalc's and the scalar branches' one-axis copies."""
-    rng = np.random.default_rng(5)
+def test_joint_laws(test, device):
+    """Joint transforms against the Featherstone solver's (the same law), and motion columns and twists against
+    their float64 definitions, for every joint type the passes see."""
+    rng = np.random.default_rng(6)
     kinds = [
         (int(JointType.PRISMATIC), 1, 0),
         (int(JointType.REVOLUTE), 0, 1),
@@ -448,95 +398,96 @@ def test_joint_sites(test, device):
         (int(JointType.FIXED), 0, 0),
         (int(JointType.FREE), 3, 3),
         (int(JointType.D6), 2, 1),
-        (int(JointType.D6), 1, 2),
-        (int(JointType.D6), 3, 3),
+        (int(JointType.D6), 0, 2),
+        (int(JointType.D6), 1, 3),
     ]
-    choice = rng.integers(0, len(kinds), N)
-    types = np.array([kinds[k][0] for k in choice], np.int32)
-    lin = np.array([kinds[k][1] for k in choice], np.int32)
-    ang = np.array([kinds[k][2] for k in choice], np.int32)
-    axes = rng.standard_normal((N * 6, 3))
+    count = 512
+    pick = rng.integers(0, len(kinds), count)
+    types = np.array([kinds[k][0] for k in pick], dtype=np.int32)
+    lin = np.array([kinds[k][1] for k in pick], dtype=np.int32)
+    ang = np.array([kinds[k][2] for k in pick], dtype=np.int32)
+    axes = rng.standard_normal((count * 6, 3))
     axes = (axes / np.linalg.norm(axes, axis=1, keepdims=True)).astype(np.float32)
-    q = rng.uniform(-1.5, 1.5, (N, 7)).astype(np.float32)
-    quaternion_joints = np.isin(types, [int(JointType.BALL), int(JointType.FREE)])
-    ball = types == int(JointType.BALL)
-    q[ball, :4] = _quaternions(rng, int(ball.sum()))
-    free = types == int(JointType.FREE)
-    q[free, 3:7] = _quaternions(rng, int(free.sum()))
-    del quaternion_joints
+    q = rng.uniform(-1.0, 1.0, count * 7).astype(np.float32)
+    for i in np.flatnonzero((types == int(JointType.BALL)) | (types == int(JointType.FREE))):
+        first = 7 * i + (3 if types[i] == int(JointType.FREE) else 0)
+        q[first : first + 4] /= np.linalg.norm(q[first : first + 4])
+    qd = rng.uniform(-1.0, 1.0, count * 6).astype(np.float32)
+    anchor = _value(wp.transform, rng, count)
     arrays = [
         wp.array(types, dtype=int, device=device),
-        wp.array(axes, dtype=wp.vec3, device=device),
-        wp.array(q.reshape(-1), dtype=float, device=device),
-        wp.array(rng.uniform(-1, 1, N * 6).astype(np.float32), dtype=float, device=device),
         wp.array(lin, dtype=int, device=device),
         wp.array(ang, dtype=int, device=device),
-        wp.array(_value(wp.transform, rng, N), dtype=wp.transform, device=device),
-        wp.array(_value(wp.transform, rng, N), dtype=wp.transform, device=device),
+        wp.array(axes, dtype=wp.vec3, device=device),
+        wp.array(q, dtype=float, device=device),
+        wp.array(qd, dtype=float, device=device),
+        wp.array(anchor, dtype=wp.transform, device=device),
     ]
-    outs = [
-        wp.zeros(N, dtype=wp.transform, device=device),
-        wp.zeros(N, dtype=wp.transform, device=device),
-        wp.zeros((N, 6), dtype=wp.spatial_vector, device=device),
-        wp.zeros(N * 6, dtype=wp.spatial_vector, device=device),
-        wp.zeros(N, dtype=wp.transform, device=device),
-        wp.zeros(N, dtype=wp.transform, device=device),
-        wp.zeros(N, dtype=wp.spatial_vector, device=device),
-        wp.zeros(N, dtype=wp.spatial_vector, device=device),
+    outputs = [
+        wp.zeros(count, dtype=wp.transform, device=device),
+        wp.zeros(count, dtype=wp.transform, device=device),
+        wp.zeros(count, dtype=wp.spatial_vector, device=device),
+        wp.zeros(count * 6, dtype=wp.spatial_vector, device=device),
     ]
-    law_t, site_t, law_axes, site_axes, law_leaf, scalar_leaf, law_leaf_axis, scalar_leaf_axis = _launch(
-        _joint_sites, arrays, outs, device
-    )
-    test.assertEqual(int(mismatches(law_t, site_t).sum()), 0)
-    site_axes = site_axes.reshape(N, 6, 6)
-    axis_joints = ~np.isin(types, [int(JointType.FREE), int(JointType.FIXED)])
-    for i in np.flatnonzero(axis_joints)[:2048]:
-        count = lin[i] + ang[i]
-        if types[i] == int(JointType.BALL):
-            # A ball joint's columns are the anchor's world axes, which jcalc_motion forms from unit twists.
+    wp.launch(_joints, count, inputs=arrays, outputs=outputs, device=device)
+    law, reference, twist, columns = (o.numpy() for o in outputs)
+    np.testing.assert_array_equal(law, reference)
+    R = _quat_matrix(anchor[:, 3:])
+    p = anchor[:, :3].astype(np.float64)
+    for i in range(count):
+        if types[i] == int(JointType.FIXED):
+            np.testing.assert_array_equal(twist[i], 0.0)
             continue
-        test.assertEqual(int(mismatches(law_axes[i, :count], site_axes[i, :count]).sum()), 0)
-    scalar = np.isin(types, [int(JointType.PRISMATIC), int(JointType.REVOLUTE)])
-    if wp.get_device(device).is_cuda:
-        # The same expression, inlined through the law instead of the scalar branch's function: NVCC groups the
-        # composed pose's multiply-adds differently in about a fifth of the samples (CPU code is identical).
-        scale = np.abs(scalar_leaf[scalar]).max(axis=1, keepdims=True)
-        test.assertLess(float(term_ulps(law_leaf[scalar], scalar_leaf[scalar], scale).max()), 4.0)
-    else:
-        test.assertEqual(int(mismatches(law_leaf[scalar], scalar_leaf[scalar]).sum()), 0)
-    test.assertEqual(int(mismatches(law_leaf_axis[scalar], scalar_leaf_axis[scalar], signed_zeros=False).sum()), 0)
+        if types[i] == int(JointType.FREE):
+            expected = [np.r_[R[i] @ e, 0, 0, 0] for e in np.eye(3)] + [np.r_[0, 0, 0, R[i] @ e] for e in np.eye(3)]
+        elif types[i] == int(JointType.BALL):
+            expected = [np.r_[np.cross(p[i], R[i] @ e), R[i] @ e] for e in np.eye(3)]
+        else:
+            kinds_of = [False] * lin[i] + [True] * ang[i]
+            expected = []
+            for k, angular in enumerate(kinds_of):
+                w = R[i] @ axes[6 * i + k]
+                expected.append(np.r_[np.cross(p[i], w), w] if angular else np.r_[w, 0, 0, 0])
+        expected = np.asarray(expected)
+        got = columns[6 * i : 6 * i + len(expected)]
+        _close(test, got, expected, 4.0 * (1.0 + np.abs(p[i]).max()), 8.0, f"joint_motion columns {types[i]}")
+        _close(test, twist[i], expected.T @ qd[6 * i : 6 * i + len(expected)], 16.0, 16.0, "joint_motion twist")
 
 
-def test_cached_force_shift(test, device):
-    """The held predictor's native wrench shift (``cached_force.shift_wrench``) is the law's arithmetic."""
-    if not wp.get_device(device).is_cuda:
-        return
-    rng = np.random.default_rng(6)
-    snippet = cuda_native(
-        "    wp::spatial_vector out;\n    float* o=reinterpret_cast<float*>(&out);\n"
-        + cached_force.shift_wrench("wrench", "offset", "o[k]", "o[3+k]")
-        + "    return out;\n#else\n    return wp::spatial_vector();\n#endif\n"
+@wp.kernel(enable_backward=False)
+def _forces(
+    motion: wp.array[wp.spatial_vector],
+    wrench: wp.array[wp.spatial_vector],
+    values: wp.array2d[float],
+    out: wp.array[float],
+):
+    i = wp.tid()
+    out[i] = spatial_laws.coordinate_force(
+        motion[i], wrench[i], values[i, 0], values[i, 1], values[i, 2], values[i, 3], values[i, 4], values[i, 5]
     )
 
-    @wp.func_native(snippet)
-    def shift(wrench: wp.spatial_vector, offset: wp.vec3) -> wp.spatial_vector: ...
 
-    @wp.kernel(enable_backward=False)
-    def run(
-        wrench: wp.array[wp.spatial_vector],
-        offset: wp.array[wp.vec3],
-        law: wp.array[wp.spatial_vector],
-        site: wp.array[wp.spatial_vector],
-    ):
-        i = wp.tid()
-        law[i] = spatial_laws.wrench_shift(wrench[i], offset[i])
-        site[i] = shift(wrench[i], offset[i])
-
-    wrench = wp.array(_value(wp.spatial_vector, rng, N), dtype=wp.spatial_vector, device=device)
-    offset = wp.array(_value(wp.vec3, rng, N), dtype=wp.vec3, device=device)
-    outs = [wp.zeros(N, dtype=wp.spatial_vector, device=device) for _ in range(2)]
-    law, site = _launch(run, [wrench, offset], outs, device)
-    test.assertEqual(int(mismatches(law, site).sum()), 0)
+def test_coordinate_force(test, device):
+    """A coordinate's generalized force: control force less the projected wrench, then spring and damper."""
+    rng = np.random.default_rng(7)
+    motion = rng.standard_normal((N, 6)).astype(np.float32)
+    wrench = rng.standard_normal((N, 6)).astype(np.float32)
+    values = rng.standard_normal((N, 6)).astype(np.float32)
+    out = wp.zeros(N, dtype=float, device=device)
+    wp.launch(
+        _forces,
+        N,
+        inputs=[
+            wp.array(motion, dtype=wp.spatial_vector, device=device),
+            wp.array(wrench, dtype=wp.spatial_vector, device=device),
+            wp.array(values, dtype=float, device=device),
+        ],
+        outputs=[out],
+        device=device,
+    )
+    v = values.astype(np.float64)
+    expected = -np.einsum("ni,ni->n", motion, wrench) + v[:, 0] + v[:, 1] * (v[:, 2] - v[:, 4]) - v[:, 3] * v[:, 5]
+    _close(test, out.numpy(), expected, 16.0, 16.0, "coordinate_force")
 
 
 class TestSpatialLaws(unittest.TestCase):
@@ -545,12 +496,12 @@ class TestSpatialLaws(unittest.TestCase):
 
 for _function in (
     test_twins_agree,
-    test_compose_sites,
-    test_twist_sites,
-    test_wrench_sites,
-    test_inertia_sites,
-    test_joint_sites,
-    test_cached_force_shift,
+    test_compose_laws,
+    test_twist_and_wrench_laws,
+    test_inertia_laws,
+    test_inertia_records,
+    test_joint_laws,
+    test_coordinate_force,
 ):
     add_function_test(TestSpatialLaws, _function.__name__, _function, devices=get_test_devices())
 

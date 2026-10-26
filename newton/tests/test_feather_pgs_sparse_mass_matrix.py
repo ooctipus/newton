@@ -12,6 +12,22 @@ from newton._src.solvers.feather_pgs.sparse_mass_matrix import (
     _SparseRowSupportPlan,
     solve_sparse_mass_matrix,
 )
+from newton._src.solvers.feather_pgs.spatial_laws import INERTIA_CHANNELS, inertia_record
+
+
+def _skew(v):
+    return np.array(((0.0, -v[2], v[1]), (v[2], 0.0, -v[0]), (-v[1], v[0], 0.0)))
+
+
+def _random_inertia(rng):
+    """A random rigid body's inertia about the origin: its inertia record and its dense spatial matrix."""
+    mass = rng.uniform(0.5, 2.0)
+    com = rng.normal(scale=0.3, size=3)
+    q = rng.normal(size=(3, 3))
+    rotational = q @ q.T + 0.1 * np.eye(3) + mass * (com @ com * np.eye(3) - np.outer(com, com))
+    moment = mass * com
+    dense = np.block([[mass * np.eye(3), -_skew(moment)], [_skew(moment), rotational]])
+    return np.concatenate(([mass], moment, rotational.reshape(-1))), dense
 
 
 def _endpoint_support(plan, joint_a, joint_b=-1):
@@ -137,20 +153,18 @@ class TestSparseMassMatrix(unittest.TestCase):
         n, j = plan.dof_count, len(parents)
         rng = np.random.default_rng(742)
         motion = rng.normal(size=(2 * n, 6)).astype(np.float32)
-        body_inertia = np.empty((2 * j, 6, 6), dtype=np.float32)
-        composite = np.zeros_like(body_inertia)
+        composite = np.zeros((2 * j, INERTIA_CHANNELS), dtype=np.float32)
         dense = np.zeros((2, n, n))
         for art in range(2):
             for joint in range(j):
-                q = rng.normal(size=(6, 6))
-                body_inertia[art * j + joint] = q @ q.T + np.eye(6)
+                record, body_inertia = _random_inertia(rng)
                 physical_support = plan.permutation[_endpoint_support(plan, joint)]
                 jacobian = np.zeros((6, n))
                 jacobian[:, physical_support] = motion[art * n + physical_support].T
-                dense[art] += jacobian.T @ body_inertia[art * j + joint] @ jacobian
+                dense[art] += jacobian.T @ body_inertia @ jacobian
                 ancestor = joint
                 while ancestor != -1:
-                    composite[art * j + ancestor] += body_inertia[art * j + joint]
+                    composite[art * j + ancestor] += record
                     ancestor = parents[ancestor]
         drive_map = np.arange(2 * n, dtype=np.int32)
         drive_map[::3] = -1
@@ -183,7 +197,7 @@ class TestSparseMassMatrix(unittest.TestCase):
             array([0, n, 2 * n], int),
             array(joint_child, int),
             array(motion, wp.spatial_vector),
-            array(reordered_composite, wp.spatial_matrix),
+            array(reordered_composite, inertia_record),
             array(regularizer, float),
             int(fused_drive),
             array(drive_map, int),

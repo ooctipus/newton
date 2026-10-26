@@ -14,8 +14,9 @@ structs) and ``generated-scan`` (on the scan plan, levels by CSR).
 shape, generated on the scan plan, for the rule that picks a schedule from the
 plan's data.
 
-``general``: the general route's serial kernels (``kernels``) and their scan
-configurations (``tree_passes``), one thread per articulation.
+``general``: the general route's passes (``tree_passes``) on a solver's own
+arrays and binding, one thread per articulation (CRBA: per column), at the
+solver's block sizes.
 
 Each timing is the median of ``--samples`` CUDA-event-timed launches after a
 warm-up, in microseconds per launch. Run on an otherwise idle GPU::
@@ -267,23 +268,20 @@ def bench_schedules(args, device):
 
 def bench_general(args, device):
     from newton.tests.feather_pgs_tree_scan_fixture import (  # noqa: PLC0415
-        SERIAL_PASSES,
+        GENERAL_PASSES,
         articulated_model,
-        serial_arrays,
-        serial_launch,
+        general_route,
+        pass_launch,
+        run_inputs,
     )
 
     rows = []
-    for shape in args.shapes or ("anymal13", "humanoid13", "g1_30", "chain64", "pendulum2"):
-        model = articulated_model((shape,), args.worlds, device)
-        data = serial_arrays(model)
-        for name in args.passes or SERIAL_PASSES:
-            for previous in ("fk_id", "tau", "composite_inertia"):
-                if SERIAL_PASSES.index(previous) < SERIAL_PASSES.index(name):
-                    serial_launch(previous, "existing", data)
-            row = {"shape": shape, "articulations": model.articulation_count, "pass": name}
-            for arm in ("existing", "generated"):
-                row[arm] = _time(functools.partial(serial_launch, name, arm, data), args.samples, device)
+    for shape in args.shapes or ("anymal13", "humanoid13", "g1_30", "chain64", "random60", "pendulum2"):
+        route = general_route(articulated_model((shape,), args.worlds, device))
+        for name in args.passes or GENERAL_PASSES:
+            run_inputs(route, name)
+            row = {"shape": shape, "articulations": route.model.articulation_count, "pass": name}
+            row["time"] = _time(pass_launch(route, name, write_inertia_records=1), args.samples, device)
             rows.append(row)
             print(_format(row), flush=True)
     return rows

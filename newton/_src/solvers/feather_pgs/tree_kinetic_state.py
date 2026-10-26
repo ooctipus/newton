@@ -14,7 +14,9 @@ from . import cached_force, field_group, kernels, response_operator, sparse_fact
 from .field_group import Field
 from .kernel_template import Dispatch, KernelTemplate, python_kernel
 from .publication_data import PublicationData
+from .spatial_laws import joint_frame_pose, joint_motion, joint_transform
 from .tree_kinetic_layout import REFERENCE_LAYOUT, TreeLayout
+from .tree_passes import body_dynamics
 
 
 @wp.func
@@ -571,7 +573,7 @@ $CLOCK0#if defined(__CUDA_ARCH__)
     for(int local=lane;local<$BODIES;local+=stride) {
         const int body=p.joint_child.data[js+local];
         // A kinematic body takes no external wrench, as in ordinary dynamics
-        // (kernels._compute_body_net_wrench): its wrench must not reach its ancestors.
+        // (tree_passes.net_wrench): its wrench must not reach its ancestors.
         auto input=f.body_f.data[body];
         if((f.body_flags.data[body]&$KINEMATIC_FLAG)!=0){for(int k=0;k<6;++k)input[k]=0.0f;}
         $SHIFT
@@ -965,21 +967,21 @@ def get_helpers(
             if data.is_free_rigid[data.body_to_articulation[body]] != 0:
                 data.body_q_com[body] = pose_com
                 data.body_a_s[body] = acceleration
-                kernels.finalize_body_dynamics_values(
+                body_dynamics(
                     body,
                     data.body_to_articulation[body],
                     pose,
                     pose_com,
-                    data.body_com,
-                    data.body_mass,
-                    data.body_inertia,
-                    data.is_free_rigid,
                     origin,
-                    0,
-                    0,
-                    data.gravity,
                     velocity,
                     acceleration,
+                    data.body_mass[body],
+                    data.body_inertia[body],
+                    data.body_com[body],
+                    data.gravity[0],
+                    1,
+                    0,
+                    1,
                     data.body_I_s,
                     data.body_inertia_terms,
                     data.body_f_s,
@@ -1250,7 +1252,7 @@ def get_state_kernel(
         """Store each joint's pose in its parent; a root's translation goes to its origin slot."""
         for local in range(g.lane, bodies, g.stride):
             joint = g.js + local
-            transform = kernels.jcalc_transform(
+            transform = joint_transform(
                 data.joint_type[joint],
                 data.joint_axis,
                 data.joint_qd_start[joint],
@@ -1259,7 +1261,7 @@ def get_state_kernel(
                 q,
                 data.joint_q_start[joint],
             )
-            relative = data.joint_X_p[joint] * transform * wp.transform_inverse(data.joint_X_c[joint])
+            relative = joint_frame_pose(data.joint_X_p[joint], transform, data.joint_X_c[joint])
             if wp.static(not forest):
                 if local == 0:
                     _store_origin(g.address, 1, wp.transform_get_translation(relative))
@@ -1315,7 +1317,7 @@ def get_state_kernel(
             anchor = wp.transform(wp.transform_get_translation(anchor) - origin, wp.transform_get_rotation(anchor))
             if wp.static(clocked):
                 clock_m1 = _clock()
-            velocity = kernels.jcalc_motion(
+            velocity = joint_motion(
                 data.joint_type[joint],
                 data.joint_axis,
                 data.joint_dof_dim[joint, 0],

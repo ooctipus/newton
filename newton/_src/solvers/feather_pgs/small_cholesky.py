@@ -9,6 +9,7 @@ import warp as wp
 
 from .device_preludes import lane_group, substitute
 from .kernel_template import THREADS, KernelTemplate
+from .spatial_laws import INERTIA_RECORDS, SPATIAL, inertia_record
 
 _FACTOR = """
     const int group = tid >> 5;
@@ -79,7 +80,7 @@ $MASS_INPUT
 _FORCE_INIT = """
     if (LANE < $DOFS) {
         const int joint = articulation_start.data[articulation] + dof_joint_offset.data[LANE];
-        const auto force = wp::mul(body_I_c.data[joint_child.data[joint]], joint_S_s.data[dof_start + LANE]);
+        const auto force = InertiaRecord::apply(body_I_c.data[joint_child.data[joint]].c, joint_S_s.data[dof_start + LANE]);
         #pragma unroll
         for (int component = 0; component < 6; ++component)
             force_components[LANE * 6 + component] = force.c[component];
@@ -107,7 +108,7 @@ _INPUTS = (
     ("mass_update_mask", wp.array[int]),
     ("joint_child", wp.array[int]),
     ("joint_S_s", wp.array[wp.spatial_vector]),
-    ("body_I_c", wp.array[wp.spatial_matrix]),
+    ("body_I_c", wp.array[inertia_record]),
     ("group_to_art", wp.array[int]),
     ("R_group", wp.array2d[float]),
     ("dof_joint_offset", wp.array[int]),
@@ -190,7 +191,7 @@ def get_kernel(
         tuple(inputs),
         snippet,
         THREADS,
-        preludes=(lane_group(32),),
+        preludes=(lane_group(32),) if geometric else (lane_group(32), *SPATIAL.preludes(), INERTIA_RECORDS),
         native_name="factor_native",
     ).kernel()
 

@@ -18,6 +18,7 @@ from .device_preludes import dual_native, lane_group
 from .field_group import Field
 from .kernel_template import THREADS, KernelTemplate, substitute
 from .sparse_factorization import _sparse_cholesky_source, _sparse_inverse_source
+from .spatial_laws import INERTIA_RECORDS, SPATIAL, inertia_record
 
 
 def _factor_levels(index):
@@ -307,7 +308,7 @@ def _get_crba_sparse_factor_kernel(
         if geometric
         else f"""    for (int physical = lane; physical < {n}; physical += stride) {{
         const int joint = articulation_start.data[art] + indices.dof_joint.data[physical];
-        const auto value = wp::mul(body_I_c.data[joint_child.data[joint]], joint_S_s.data[start + physical]);
+        const auto value = InertiaRecord::apply(body_I_c.data[joint_child.data[joint]].c, joint_S_s.data[start + physical]);
         for (int k = 0; k < 6; ++k) force[physical * 6 + k] = value.c[k];
     }}
 """
@@ -320,7 +321,7 @@ def _get_crba_sparse_factor_kernel(
         for (int k = 0; k < 6; ++k) value += motion.c[k] * force[physical_col * 6 + k];
 """
     )
-    mass_input_type = wp.array2d[float] if geometric else wp.array[wp.spatial_matrix]
+    mass_input_type = wp.array2d[float] if geometric else wp.array[inertia_record]
     body = f"""
     const int group = tid >> 5;
     if (group >= group_to_art.shape[0]) return;
@@ -368,7 +369,8 @@ def _get_crba_sparse_factor_kernel(
         Linv_group.data[group * {nnz} + entry] = valid ? inverse[entry] : NAN;
     }}
 """
-    snippet = dual_native(body, preludes=(lane_group(32),))
+    preludes = (lane_group(32),) if geometric else (lane_group(32), *SPATIAL.preludes(), INERTIA_RECORDS)
+    snippet = dual_native(body, preludes=preludes)
 
     name = f"crba_sparse_factor_{n}_{nnz}_{warps}"
     if geometric:

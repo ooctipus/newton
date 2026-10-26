@@ -51,7 +51,7 @@ from ..solver import SolverBase
 from . import contact_compliance as _contact_compliance
 from . import environment_flags as _environment_flags
 from . import execution_plan as _execution_plan
-from . import host_index, kernel_template
+from . import field_group, host_index, kernel_template
 from . import row_metadata as _row_metadata
 from .body_mapping import build_body_maps
 from .conditioning import ArmatureFloor, conditioning_armature
@@ -102,7 +102,6 @@ from .kernels import (
     RIGID_SPEED_ROWS,
     _get_tree_fk_kernel,
     _get_tree_tau_kernel,
-    accumulate_articulation_tau,
     accumulate_group_diag_worlds,
     accumulate_sparse_diagonal_response_diag,
     allocate_connect_slots,
@@ -133,8 +132,6 @@ from .kernels import (
     clear_sparse_diagonal_response_prefix,
     compact_local_pair_candidates,
     compute_com_transforms,
-    compute_compact_diagonal_inverse_mass,
-    compute_composite_inertia,
     compute_contact_linear_force_from_impulses,
     compute_delta_and_accumulate,
     compute_mf_body_Hinv,
@@ -142,21 +139,14 @@ from .kernels import (
     compute_mf_rhs_bias,
     compute_mf_world_dof_offsets,
     compute_physx_pgs_drive_desc,
-    compute_spatial_inertia,
     compute_velocity_predictor,
     compute_world_contact_bias,
     compute_world_contact_velocity_bias,
-    crba_fill_par_dof,
     delassus_par_row_col,
     diag_from_JY_par_art,
     diag_from_JY_world,
-    eval_rigid_fk_id,
-    eval_rigid_fk_kinematics,
-    eval_rigid_tau,
-    eval_rigid_tau_add,
     eval_rigid_tau_and_augmented_drives,
     factor_diagonal_mass,
-    finalize_body_dynamics,
     finalize_constraint_counts_with_status,
     finalize_world_diag_cfm,
     gather_dense_warmstart,
@@ -169,9 +159,7 @@ from .kernels import (
     integrate_generalized_joints,
     invalidate_articulation_fk_id_cache,
     invalidate_fk_id_cache_for_articulations,
-    jcalc_tau,
     local_solve_launch_gate,
-    mul_com_spatial_inertia,
     pack_contact_linear_force_as_spatial,
     pgs_convergence_diagnostic_velocity,
     pgs_ncp_residuals_diagnostic_velocity,
@@ -195,7 +183,6 @@ from .kernels import (
     prepare_world_impulses,
     prescale_joint_velocity_limits,
     record_world_contact_runs,
-    refresh_masked_body_inertia,
     remove_free_root_transport_from_qdd,
     reset_world_warmstart_buffers,
     rhs_accum_world_par_art,
@@ -255,6 +242,7 @@ from .solver_fields import (
     DOF_WORK,
     DRIVE_SLOTS,
     FUSED_DIAGONAL_LIMITS,
+    JOINT_DFS,
     MF_BODY_MAP,
     MF_CONTACT_UNITS,
     MF_COUNTERS,
@@ -310,6 +298,22 @@ from .sparse_pgs import (
     _get_pgs_solve_sparse_kernel,
     contact_transaction_launch_bounds,
 )
+from .spatial_laws import inertia_apply, inertia_record, unpack_inertia
+from .tree_passes import (
+    DynamicsData,
+    composite_inertia,
+    composite_inertia_lanes,
+    crba_fill,
+    diagonal_inverse_mass,
+    direct_branch_tau,
+    fk_id,
+    fk_kinematics,
+    inverse_dynamics_tau,
+    publish_body_dynamics,
+    refresh_body_inertia,
+    selected_inverse_dynamics_tau,
+)
+from .tree_plan import TreePlan
 from .velocity_limit_law import check_velocity_limit_law, velocity_limit_law_suffix
 
 _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
@@ -1860,7 +1864,7 @@ class SolverFeatherPGS(SolverBase):
                 PhysX row mode is currently supported only with
                 ``pgs_mode="matrix_free"``. Defaults to ``"augmented"``.
             serial_kernel_block_dim (int, optional): CUDA block size for the serial
-                one-thread-per-articulation kernels (``eval_rigid_tau``,
+                one-thread-per-articulation kernels (``tree_passes.inverse_dynamics_tau``,
                 ``eval_rigid_tau_and_augmented_drives``, ``prepare_augmented_joint_drives``).
                 These kernels have no cross-thread reductions, so changing this value is
                 bit-identical; it only changes occupancy/grid shape. Must be a positive
@@ -2760,7 +2764,11 @@ class SolverFeatherPGS(SolverBase):
             np.int32, copy=False
         )
         self._composite_articulation_count = int(composite_articulations.size)
-        self._parallel_composite_inertia = bool(model.device.is_cuda and np.any(response_articulations))
+        # The warp-per-articulation composite is native code without an adjoint: the gradient route keeps the
+        # serial Warp pass.
+        self._parallel_composite_inertia = bool(
+            model.device.is_cuda and not model.requires_grad and np.any(response_articulations)
+        )
         self._compact_inertia_refresh = self._parallel_composite_inertia and self.use_parallel_streams
         self._async_augmented_drives = bool(
             self.use_parallel_streams
@@ -2775,21 +2783,7 @@ class SolverFeatherPGS(SolverBase):
             else None
         )
         self._composite_inertia_warp_kernel = (
-            _get_composite_inertia_warp_kernel(
-                str(getattr(model.device, "arch", "")),
-                warps_per_block=_COMPOSITE_INERTIA_WARPS_PER_BLOCK,
-            )
-            if self._composite_articulation_count and not self._compact_inertia_refresh
-            else None
-        )
-        self._compact_composite_inertia_warp_kernel = (
-            _get_composite_inertia_warp_kernel(
-                str(getattr(model.device, "arch", "")),
-                warps_per_block=_COMPOSITE_INERTIA_WARPS_PER_BLOCK,
-                compact_terms=True,
-            )
-            if self._composite_articulation_count and self._compact_inertia_refresh
-            else None
+            composite_inertia_lanes(_COMPOSITE_INERTIA_WARPS_PER_BLOCK) if self._composite_articulation_count else None
         )
 
         # All inactive weight arguments alias this one element. Their producer
@@ -2830,12 +2824,11 @@ class SolverFeatherPGS(SolverBase):
             if self._sparse_diagonal_contact_solve and self._parallel_augmented_drive_topology
             else None
         )
+        # One-body branches of the compact diagonal size read their bodies' own inertia records (no composite)
+        # and take their joint forces from their own wrenches, one thread per coordinate.
         self._direct_compact_diagonal_inertia = bool(
             self._compact_inertia_refresh and self._compact_diagonal_mass_size in self._direct_diagonal_inertia_sizes
         )
-        self._direct_compact_diagonal_inertia_kernel = None
-        self._selected_articulation_tau_kernel = None
-        self._direct_branch_tau_kernel = None
         self._selected_tau_articulation_count = 0
         self._selected_tau_articulations = None
         if self._direct_compact_diagonal_inertia:
@@ -2844,19 +2837,10 @@ class SolverFeatherPGS(SolverBase):
             ).astype(np.int32, copy=False)
             self._composite_articulation_count = int(composite_articulations.size)
             self._composite_articulations = wp.array(composite_articulations, dtype=wp.int32, device=model.device)
-            self._direct_compact_diagonal_inertia_kernel = _get_direct_diagonal_inverse_mass_kernel(
-                self._compact_diagonal_mass_size, str(getattr(model.device, "arch", ""))
-            )
             direct_tau_articulations = response_dof_count == self._compact_diagonal_mass_size
             selected_tau_articulations = np.flatnonzero(~direct_tau_articulations).astype(np.int32, copy=False)
             self._selected_tau_articulation_count = int(selected_tau_articulations.size)
             self._selected_tau_articulations = wp.array(selected_tau_articulations, dtype=wp.int32, device=model.device)
-            (
-                self._selected_articulation_tau_kernel,
-                self._direct_branch_tau_kernel,
-            ) = _get_partitioned_inverse_dynamics_kernels(
-                self._compact_diagonal_mass_size, str(getattr(model.device, "arch", ""))
-            )
         self._row_watermark = bool(row_watermark)
         self._setup_sparse_mass_matrix(model)
         if sparse_mass_matrix == "on" and self._sparse_mass_matrix_size is None:
@@ -3114,7 +3098,7 @@ class SolverFeatherPGS(SolverBase):
                 wp.empty(group.segment_offsets.size - 1, dtype=wp.spatial_vector, device=model.device)
                 for group in self._tree_plan.groups
             )
-            if self._tree_plan is not None and self._direct_branch_tau_kernel is None
+            if self._tree_plan is not None and not self._direct_compact_diagonal_inertia
             else ()
         )
 
@@ -3557,16 +3541,8 @@ class SolverFeatherPGS(SolverBase):
             self._scatter_armature_to_groups()
             self._mass_update_requested.fill_(1)
         if flags & ModelFlags.BODY_INERTIAL_PROPERTIES and self.model.body_count:
-            # Re-derive the buffers baked from body_com/body_mass/body_inertia
-            # in _allocate_common_buffers so runtime CoM/mass randomization
-            # reaches FK and the articulated inertia.
-            wp.launch(
-                compute_spatial_inertia,
-                self.model.body_count,
-                inputs=[self.model.body_inertia, self.model.body_mass],
-                outputs=[self.body_I_m],
-                device=self.model.device,
-            )
+            # Re-derive the COM frames baked from body_com in _allocate_common_buffers so runtime
+            # CoM randomization reaches FK; mass and inertia are read live.
             wp.launch(
                 compute_com_transforms,
                 self.model.body_count,
@@ -4166,7 +4142,7 @@ class SolverFeatherPGS(SolverBase):
         """Select the passive spring/damping arrays applied in the inverse-dynamics pass.
 
         The toggles resolve here, once, to fixed device arrays (zeros when disabled or
-        absent on the model), so ``eval_rigid_tau`` launches stay CUDA-graph-safe. Springs
+        absent on the model), so inverse-dynamics launches stay CUDA-graph-safe. Springs
         on unsupported DOF types (BALL / FREE / DISTANCE coordinates) warn and are masked
         off — only REVOLUTE, PRISMATIC, and D6 DOFs receive the explicit spring torque.
         """
@@ -5434,6 +5410,20 @@ class SolverFeatherPGS(SolverBase):
             return None
         return int(diagonal_size[0]), int(dense_size[0]), dense_offsets, dense_groups
 
+    def _allocate_joint_dfs_intervals(self, model: Model) -> None:
+        """Upload the joint forest's depth-first order, positions and subtree ends (``tree_passes.crba_fill``'s
+        ancestor test, :class:`.tree_plan.TreePlan`)."""
+        if not model.joint_count:
+            self._joint_dfs_order = self._joint_dfs_position = self._joint_dfs_end = None
+            return
+        plan = TreePlan.build(model.joint_ancestor.numpy())
+        self._arrays.upload(
+            JOINT_DFS,
+            _joint_dfs_order=plan.dfs_order,
+            _joint_dfs_position=plan.dfs_position,
+            _joint_dfs_end=plan.dfs_end,
+        )
+
     def _allocate_common_buffers(self, model):
         arrays = self._arrays
         if model.joint_count:
@@ -5467,15 +5457,8 @@ class SolverFeatherPGS(SolverBase):
         )
 
         if model.body_count:
-            terms = model.body_count if self._compact_inertia_refresh else 1
-            arrays.allocate(BODY_INERTIA, body=model.body_count, inertia_terms=terms)
-            wp.launch(
-                compute_spatial_inertia,
-                model.body_count,
-                inputs=[model.body_inertia, model.body_mass],
-                outputs=[self.body_I_m],
-                device=model.device,
-            )
+            arrays.allocate(BODY_INERTIA, body=model.body_count)
+            self._allocate_joint_dfs_intervals(model)
             wp.launch(
                 compute_com_transforms,
                 model.body_count,
@@ -7939,7 +7922,7 @@ class SolverFeatherPGS(SolverBase):
         # graphs capturing a multiple of N steps, each buffer ping-pongs with
         # period 2 and is consumed by steps of a fixed flag parity, so the
         # baked memset cadence matches the baked rebuild cadence. Skipping the
-        # H memset is safe in every configuration because crba_fill_par_dof
+        # H memset is safe in every configuration because crba_fill
         # stores all structural nonzeros of a masked articulation before
         # apply_augmented_mass_diagonal_grouped adds onto the freshly stored
         # diagonal, structural zeros are never written after allocation, and
@@ -8362,13 +8345,40 @@ class SolverFeatherPGS(SolverBase):
             for size in self.size_groups:
                 yield size, self._size_ctx(size)
 
-    def _launch_parallel_composite_inertia(self, body_I_s: wp.array, *, compact_terms: bool = False) -> None:
+    def _dynamics(
+        self, state: State | None, state_aug: State, control: Control | None = None, **values
+    ) -> DynamicsData:
+        """Bind the dynamics passes' struct (:data:`.tree_passes.DynamicsData`).
+
+        ``state`` holds the coordinates the passes read and receives the poses and COM twists they publish
+        (``None`` for passes that read neither); ``state_aug`` the augmented state. ``values`` are the launch's
+        switches (zero unless given) and field overrides, such as the prescaled velocities of ``joint_qd``.
+        """
+        arrays = self._arrays
+        values.setdefault("write_inertia_records", 0)
+        values.setdefault("reuse_cached", 0)
+        values.setdefault("add_existing_tau", 0)
+        values.setdefault("fused_augmented_drive", int(self._parallel_augmented_drive_topology))
+        if state is None:
+            for name in ("joint_q", "joint_qd"):
+                values.setdefault(name, arrays.placeholder(wp.float32))
+            values.setdefault("body_q", arrays.placeholder(wp.transform))
+            values.setdefault("body_qd", arrays.placeholder(wp.spatial_vector))
+            values.setdefault("body_f", arrays.placeholder(wp.spatial_vector))
+        elif "body_f" not in values:
+            values["body_f"] = state.body_f if state.body_count else arrays.placeholder(wp.spatial_vector)
+        if control is None:
+            values.setdefault("joint_f", arrays.placeholder(wp.float32))
+        return field_group.bind(
+            DynamicsData, model=self.model, solver=self, state=state, aug=state_aug, control=control, **values
+        )
+
+    def _launch_parallel_composite_inertia(self) -> None:
+        """Composite inertia records of the listed articulations, a warp per articulation."""
         if not self._composite_articulation_count:
             return
-        kernel = self._compact_composite_inertia_warp_kernel if compact_terms else self._composite_inertia_warp_kernel
-        source = [self.model.body_mass, self._body_inertia_terms] if compact_terms else [body_I_s]
         wp.launch_tiled(
-            kernel,
+            self._composite_inertia_warp_kernel,
             dim=[
                 (self._composite_articulation_count + _COMPOSITE_INERTIA_WARPS_PER_BLOCK - 1)
                 // _COMPOSITE_INERTIA_WARPS_PER_BLOCK
@@ -8380,15 +8390,18 @@ class SolverFeatherPGS(SolverBase):
                 self.articulation_joint_end,
                 self.model.joint_ancestor,
                 self.model.joint_child,
-                *source,
+                self._body_inertia_terms,
+                self.body_I_c,
             ],
-            outputs=[self.body_I_c],
             block_dim=32 * _COMPOSITE_INERTIA_WARPS_PER_BLOCK,
             device=self.model.device,
         )
 
-    def _launch_tree_fk(self, mode: str, inputs: list, outputs: list) -> None:
-        """Run complete independent branches with one cooperative launch per width."""
+    def _launch_tree_fk(self, mode: str, inputs: list, outputs: list = ()) -> None:
+        """Run complete independent branches with one cooperative launch per width.
+
+        ``id`` and ``kinematics`` take ``[dynamics]`` (:meth:`_dynamics`); ``public`` the public FK's arrays.
+        """
         for group in self._tree_plan.groups:
             per_warp = 32 // group.lanes
             wp.launch(
@@ -8403,7 +8416,7 @@ class SolverFeatherPGS(SolverBase):
                     group.segment_joints,
                     *inputs,
                 ],
-                outputs=outputs,
+                outputs=list(outputs),
                 block_dim=32,
                 device=self.model.device,
             )
@@ -8461,62 +8474,27 @@ class SolverFeatherPGS(SolverBase):
             )
             return None, stage3_qd
         parallel_global_refresh = refresh_composite and self._global_inertia_stream is not None
-        fk_inputs = [
-            model.articulation_start,
-            self.articulation_joint_end,
-            model.joint_type,
-            model.joint_parent,
-            model.joint_child,
-            model.joint_q_start,
-            model.joint_qd_start,
-            state_in.joint_q,
-            stage3_qd,
-            model.joint_X_p,
-            model.joint_X_c,
-            self.body_X_com,
-            model.joint_axis,
-            model.joint_dof_dim,
-            model.body_com,
-            model.body_mass,
-            model.body_inertia,
-            self.is_free_rigid,
-            int(refresh_composite and not parallel_global_refresh),
-            int(parallel_global_refresh),
-            int(self._fk_id_cache_enabled),
-            model.gravity,
-        ]
-        fk_outputs = [
-            state_in.body_q,
-            state_aug.body_q_com,
-            self.articulation_origin,
-            state_aug.joint_S_s,
-            state_aug.body_I_s,
-            self._body_inertia_terms,
-            state_aug.body_v_s,
-            state_aug.body_f_s,
-            state_aug.body_a_s,
-            self._fk_id_cache_valid,
-        ]
+        # A refresh step places every body's inertia record for the composite inertia.
+        dynamics = self._dynamics(
+            state_in,
+            state_aug,
+            joint_qd=stage3_qd,
+            write_inertia_records=int(refresh_composite),
+            reuse_cached=int(self._fk_id_cache_enabled),
+        )
         if self._tree_plan is not None:
-            self._launch_tree_fk("id", fk_inputs, fk_outputs)
+            self._launch_tree_fk("id", [dynamics])
         else:
-            wp.launch(
-                eval_rigid_fk_id,
-                dim=model.articulation_count,
-                inputs=fk_inputs,
-                outputs=fk_outputs,
-                block_dim=16,
-                device=model.device,
-            )
+            wp.launch(fk_id, dim=model.articulation_count, inputs=[dynamics], block_dim=16, device=model.device)
         global_inertia_ready = None
         if parallel_global_refresh:
             inertia_stream = self._global_inertia_stream
             inertia_stream.wait_event(wp.get_stream(model.device).record_event())
             with wp.ScopedStream(inertia_stream, sync_enter=False):
-                self._launch_parallel_composite_inertia(state_aug.body_I_s, compact_terms=True)
+                self._launch_parallel_composite_inertia()
             global_inertia_ready = inertia_stream.record_event()
         elif self._parallel_composite_inertia and refresh_composite:
-            self._launch_parallel_composite_inertia(state_aug.body_I_s)
+            self._launch_parallel_composite_inertia()
         if model.body_count and not self._fk_id_cache_enabled:
             wp.launch(
                 update_body_qd_from_featherstone,
@@ -8607,34 +8585,11 @@ class SolverFeatherPGS(SolverBase):
     ) -> None:
         """Launch inverse dynamics for the non-actuator torque bucket."""
         model = self.model
-        body_f = state_in.body_f if state_in.body_count else None
-        state_aug.body_ft_s.zero_()
-        tau_inputs = [
-            model.articulation_start,
-            self.articulation_joint_end,
-            model.joint_type,
-            model.joint_parent,
-            model.joint_child,
-            model.joint_articulation,
-            model.joint_qd_start,
-            model.joint_q_start,
-            model.joint_dof_dim,
-            control.joint_f,
-            state_in.joint_q,
-            state_in.joint_qd,
-            self._passive_spring_stiffness,
-            self._passive_spring_ref,
-            self._passive_joint_damping,
-            state_aug.joint_S_s,
-            state_aug.body_f_s,
-            body_f,
-            model.body_flags,
-            state_in.body_q,
-            model.body_com,
-            self.articulation_origin,
-        ]
-        if self._direct_branch_tau_kernel is None:
+        dynamics = self._dynamics(state_in, state_aug, control, add_existing_tau=int(add_to_existing))
+        if not self._direct_compact_diagonal_inertia:
             if self._tree_plan is not None:
+                # The parallel reduction adds into the subtree sums; the serial scans set their own.
+                state_aug.body_ft_s.zero_()
                 for group, net_wrench in zip(self._tree_plan.groups, self._tree_net_wrenches, strict=True):
                     per_warp = 32 // group.lanes
                     wp.launch(
@@ -8649,19 +8604,17 @@ class SolverFeatherPGS(SolverBase):
                             group.segment_joints,
                             group.child_offsets,
                             group.child_segments,
-                            *tau_inputs,
-                            int(add_to_existing),
+                            dynamics,
                         ],
-                        outputs=[state_aug.body_ft_s, state_aug.joint_tau, net_wrench],
+                        outputs=[net_wrench],
                         block_dim=32,
                         device=model.device,
                     )
                 return
             wp.launch(
-                eval_rigid_tau_add if add_to_existing else eval_rigid_tau,
+                inverse_dynamics_tau,
                 dim=model.articulation_count,
-                inputs=tau_inputs,
-                outputs=[state_aug.body_ft_s, state_aug.joint_tau],
+                inputs=[dynamics],
                 block_dim=self.serial_kernel_block_dim,
                 device=model.device,
             )
@@ -8669,42 +8622,22 @@ class SolverFeatherPGS(SolverBase):
 
         if self._selected_tau_articulation_count:
             wp.launch(
-                self._selected_articulation_tau_kernel,
+                selected_inverse_dynamics_tau,
                 dim=self._selected_tau_articulation_count,
-                inputs=[self._selected_tau_articulations, *tau_inputs, int(add_to_existing)],
-                outputs=[state_aug.body_ft_s, state_aug.joint_tau],
+                inputs=[self._selected_tau_articulations, dynamics],
                 block_dim=self.serial_kernel_block_dim,
                 device=model.device,
             )
         direct_size = self._compact_diagonal_mass_size
         wp.launch(
-            self._direct_branch_tau_kernel,
+            direct_branch_tau,
             dim=self.n_arts_by_size[direct_size] * direct_size,
             inputs=[
                 self.group_to_art[direct_size],
                 self._crba_dof_joint_offset_by_size[direct_size],
-                model.articulation_start,
-                model.joint_type,
-                model.joint_child,
-                model.joint_qd_start,
-                model.joint_q_start,
-                model.joint_dof_dim,
-                control.joint_f,
-                state_in.joint_q,
-                state_in.joint_qd,
-                self._passive_spring_stiffness,
-                self._passive_spring_ref,
-                self._passive_joint_damping,
-                state_aug.joint_S_s,
-                state_aug.body_f_s,
-                body_f,
-                model.body_flags,
-                state_in.body_q,
-                model.body_com,
-                self.articulation_origin,
-                int(add_to_existing),
+                direct_size,
+                dynamics,
             ],
-            outputs=[state_aug.joint_tau],
             block_dim=256,
             device=model.device,
         )
@@ -8756,36 +8689,13 @@ class SolverFeatherPGS(SolverBase):
 
         if model.articulation_count:
             if self.drive_mode == "augmented" and self.articulation_max_dofs > 0:
-                body_f = state_in.body_f if state_in.body_count else None
-                state_aug.body_ft_s.zero_()
                 wp.launch(
                     eval_rigid_tau_and_augmented_drives,
                     dim=model.articulation_count,
                     inputs=[
-                        model.articulation_start,
-                        self.articulation_joint_end,
+                        self._dynamics(state_in, state_aug, control),
                         self.articulation_H_rows,
-                        model.joint_type,
-                        model.joint_parent,
-                        model.joint_child,
-                        model.joint_articulation,
-                        model.joint_qd_start,
-                        model.joint_q_start,
                         model.joint_target_q_start,
-                        model.joint_dof_dim,
-                        control.joint_f,
-                        state_in.joint_q,
-                        state_in.joint_qd,
-                        self._passive_spring_stiffness,
-                        self._passive_spring_ref,
-                        self._passive_joint_damping,
-                        state_aug.joint_S_s,
-                        state_aug.body_f_s,
-                        body_f,
-                        model.body_flags,
-                        state_in.body_q,
-                        model.body_com,
-                        self.articulation_origin,
                         model.joint_target_ke,
                         model.joint_target_kd,
                         control.joint_target_q,
@@ -8794,13 +8704,7 @@ class SolverFeatherPGS(SolverBase):
                         self.articulation_max_dofs,
                         dt,
                     ],
-                    outputs=[
-                        state_aug.body_ft_s,
-                        self.aug_row_counts,
-                        self.aug_row_dof_index,
-                        self.aug_row_K,
-                        state_aug.joint_tau,
-                    ],
+                    outputs=[self.aug_row_counts, self.aug_row_dof_index],
                     block_dim=self.serial_kernel_block_dim,
                     device=model.device,
                 )
@@ -8855,24 +8759,12 @@ class SolverFeatherPGS(SolverBase):
             self._force_mass_update = False
             return
 
+        # The composite and every mass consumer read inertia records about the origin: the records of
+        # articulations a reuse step's mask selects are placed at their current poses first.
+        dynamics = self._dynamics(None, state_aug)
         if not global_flag:
             wp.launch(
-                refresh_masked_body_inertia,
-                dim=model.joint_count,
-                inputs=[
-                    self.articulation_joint_end,
-                    model.joint_articulation,
-                    model.joint_child,
-                    self.mass_update_mask,
-                    state_aug.body_q_com,
-                    self.articulation_origin,
-                    self.body_I_m,
-                    model.body_mass,
-                    model.body_inertia,
-                    int(self._compact_inertia_refresh),
-                ],
-                outputs=[state_aug.body_I_s, self._body_inertia_terms],
-                device=model.device,
+                refresh_body_inertia, dim=model.joint_count, inputs=[dynamics], block_dim=128, device=model.device
             )
 
         if global_inertia_ready is not None:
@@ -8888,25 +8780,13 @@ class SolverFeatherPGS(SolverBase):
         # masked scalar path for device-selected limit changes on reuse steps.
         if not (self._parallel_composite_inertia and global_flag):
             wp.launch(
-                compute_composite_inertia,
-                dim=model.articulation_count,
-                inputs=[
-                    model.articulation_start,
-                    self.articulation_joint_end,
-                    self.mass_update_mask,
-                    model.joint_ancestor,
-                    model.joint_child,
-                    state_aug.body_I_s,
-                ],
-                outputs=[self.body_I_c],
-                device=model.device,
-                block_dim=128,
+                composite_inertia, dim=model.articulation_count, inputs=[dynamics], device=model.device, block_dim=128
             )
 
         # Zeroing H is hygiene, not a correctness requirement: H is only read
         # by the Cholesky kernels, which early-exit when mass_update_mask is 0,
         # and a masked rebuild never relies on a zeroed buffer because
-        # crba_fill_par_dof STORES every structural nonzero (full ancestor
+        # crba_fill STORES every structural nonzero (full ancestor
         # chain incl. the whole diagonal) before apply_augmented_mass_diagonal
         # _grouped ADDS K onto that freshly stored diagonal under the same
         # mask. Structural zeros are written by no kernel and stay zero from
@@ -8939,49 +8819,23 @@ class SolverFeatherPGS(SolverBase):
                 )
                 continue
             if size == self._compact_diagonal_mass_size:
-                if self._direct_compact_diagonal_inertia:
-                    wp.launch(
-                        self._direct_compact_diagonal_inertia_kernel,
-                        dim=n_arts * size,
-                        inputs=[
-                            model.articulation_start,
-                            self.articulation_dof_start,
-                            self.mass_update_mask,
-                            model.joint_child,
-                            state_aug.joint_S_s,
-                            model.body_mass,
-                            self._body_inertia_terms,
-                            self.group_to_art[size],
-                            self._crba_dof_joint_offset_by_size[size],
-                            self.R_by_size[size],
-                            self._augmented_drive_row_by_dof,
-                            self.aug_row_K,
-                        ],
-                        outputs=[self._diagonal_inverse_mass],
-                        device=model.device,
-                        block_dim=128,
-                    )
-                else:
-                    wp.launch(
-                        compute_compact_diagonal_inverse_mass,
-                        dim=n_arts * size,
-                        inputs=[
-                            model.articulation_start,
-                            self.articulation_dof_start,
-                            self.mass_update_mask,
-                            model.joint_child,
-                            state_aug.joint_S_s,
-                            self.body_I_c,
-                            self.group_to_art[size],
-                            self._crba_dof_joint_offset_by_size[size],
-                            self.R_by_size[size],
-                            self._augmented_drive_row_by_dof,
-                            self.aug_row_K,
-                            size,
-                        ],
-                        outputs=[self._diagonal_inverse_mass],
-                        device=model.device,
-                    )
+                # One-body branches read their bodies' own records, others their composites.
+                records = self._body_inertia_terms if self._direct_compact_diagonal_inertia else self.body_I_c
+                wp.launch(
+                    diagonal_inverse_mass,
+                    dim=n_arts * size,
+                    inputs=[
+                        dynamics,
+                        records,
+                        self.group_to_art[size],
+                        self._crba_dof_joint_offset_by_size[size],
+                        self.R_by_size[size],
+                        size,
+                    ],
+                    outputs=[self._diagonal_inverse_mass],
+                    device=model.device,
+                    block_dim=128,
+                )
                 continue
             fused_crba_cholesky_warp = self._crba_cholesky_warp_kernels_by_size[size]
             if fused_crba_cholesky_warp is not None:
@@ -8995,7 +8849,7 @@ class SolverFeatherPGS(SolverBase):
                         self.mass_update_mask,
                         model.joint_child,
                         state_aug.joint_S_s,
-                        state_aug.body_I_s if size in self._free_body_inertia_sizes else self.body_I_c,
+                        self._body_inertia_terms if size in self._free_body_inertia_sizes else self.body_I_c,
                         self.group_to_art[size],
                         self.R_by_size[size],
                         self._crba_dof_joint_offset_by_size[size],
@@ -9020,7 +8874,7 @@ class SolverFeatherPGS(SolverBase):
                         self.mass_update_mask,
                         model.joint_child,
                         state_aug.joint_S_s,
-                        state_aug.body_I_s if size in self._free_body_inertia_sizes else self.body_I_c,
+                        self._body_inertia_terms if size in self._free_body_inertia_sizes else self.body_I_c,
                         self.group_to_art[size],
                         self.R_by_size[size],
                         self._crba_dof_joint_offset_by_size[size],
@@ -9037,23 +8891,13 @@ class SolverFeatherPGS(SolverBase):
             if self._H_bufs is None and global_flag:  # not double-buffered
                 self.H_by_size[size].zero_()
             wp.launch(
-                crba_fill_par_dof,
+                crba_fill,
                 dim=int(n_arts * size),
                 inputs=[
-                    model.articulation_start,
-                    self.articulation_dof_start,
-                    self.mass_update_mask,
-                    model.joint_ancestor,
-                    model.joint_child,
-                    model.joint_qd_start,
-                    model.joint_dof_dim,
-                    state_aug.joint_S_s,
-                    state_aug.body_I_s if size in self._free_body_inertia_sizes else self.body_I_c,
+                    dynamics,
+                    self._body_inertia_terms if size in self._free_body_inertia_sizes else self.body_I_c,
                     self.group_to_art[size],
                     size,
-                    int(self._parallel_augmented_drive_topology),
-                    self._augmented_drive_row_by_dof,
-                    self.aug_row_K,
                 ],
                 outputs=[self.H_by_size[size]],
                 device=model.device,
@@ -12236,104 +12080,14 @@ class SolverFeatherPGS(SolverBase):
                 )
             return
 
-        body_q_com = state_aug.body_q_com
-        articulation_origin = self.articulation_origin
-        joint_S_s = state_aug.joint_S_s
-        body_I_s = state_aug.body_I_s
-        body_inertia_terms = self._body_inertia_terms
-        body_v_s = state_aug.body_v_s
-        body_f_s = state_aug.body_f_s
-        body_a_s = state_aug.body_a_s
+        # The next step reuses these inverse dynamics; a refresh step places every body's inertia record.
         next_refresh = ((self._step + 1) % self.update_mass_matrix_interval) == 0
-        parallel_next_refresh = next_refresh and self._global_inertia_stream is not None
-        fk_inputs = [
-            model.articulation_start,
-            self.articulation_joint_end,
-            model.joint_type,
-            model.joint_parent,
-            model.joint_child,
-            model.joint_q_start,
-            model.joint_qd_start,
-            state_out.joint_q,
-            state_out.joint_qd,
-            model.joint_X_p,
-            model.joint_X_c,
-            self.body_X_com,
-            model.joint_axis,
-            model.joint_dof_dim,
-            model.body_com,
-        ]
-        fk_outputs = [
-            state_out.body_q,
-            body_q_com,
-            articulation_origin,
-            joint_S_s,
-            body_v_s,
-            body_a_s,
-            self._fk_id_cache_valid,
-        ]
+        dynamics = self._dynamics(state_out, state_aug, write_inertia_records=int(next_refresh))
         if self._tree_plan is not None:
-            self._launch_tree_fk(
-                "kinematics",
-                [
-                    *fk_inputs,
-                    model.body_mass,
-                    model.body_inertia,
-                    self.is_free_rigid,
-                    0,
-                    0,
-                    0,
-                    model.gravity,
-                ],
-                [
-                    state_out.body_q,
-                    body_q_com,
-                    articulation_origin,
-                    joint_S_s,
-                    body_I_s,
-                    body_inertia_terms,
-                    body_v_s,
-                    body_f_s,
-                    body_a_s,
-                    self._fk_id_cache_valid,
-                ],
-            )
+            self._launch_tree_fk("kinematics", [dynamics])
         else:
-            wp.launch(
-                eval_rigid_fk_kinematics,
-                dim=model.articulation_count,
-                inputs=fk_inputs,
-                outputs=fk_outputs,
-                block_dim=16,
-                device=model.device,
-            )
-        wp.launch(
-            finalize_body_dynamics,
-            dim=model.body_count,
-            inputs=[
-                self.body_to_articulation,
-                state_out.body_q,
-                body_q_com,
-                model.body_com,
-                model.body_mass,
-                model.body_inertia,
-                self.is_free_rigid,
-                articulation_origin,
-                int(next_refresh and not parallel_next_refresh),
-                int(parallel_next_refresh),
-                model.gravity,
-                body_v_s,
-                body_a_s,
-            ],
-            outputs=[
-                body_I_s,
-                body_inertia_terms,
-                body_f_s,
-                state_out.body_qd,
-            ],
-            block_dim=128,
-            device=model.device,
-        )
+            wp.launch(fk_kinematics, dim=model.articulation_count, inputs=[dynamics], block_dim=16, device=model.device)
+        wp.launch(publish_body_dynamics, dim=model.body_count, inputs=[dynamics], block_dim=128, device=model.device)
         self._fk_id_cache_source_state = state_out
 
     def __del__(self):
@@ -12427,292 +12181,6 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
         snippet,
         preludes=(lane_group(32), *ROW_LAW.preludes()),
         native_name="joint_limit_warp_native",
-    ).kernel()
-
-
-@cache
-def _get_direct_diagonal_inverse_mass_kernel(n_dofs: int, device_arch: str) -> "wp.Kernel":
-    """Project one-body diagonal branches without materializing composite spatial inertia."""
-    del device_arch
-    N = int(n_dofs)
-    if N <= 0:
-        raise ValueError("direct diagonal inertia requires a positive DOF count")
-
-    def compute_direct_diagonal_inverse_mass_template(
-        articulation_start: wp.array[int],
-        articulation_dof_start: wp.array[int],
-        mass_update_mask: wp.array[int],
-        joint_child: wp.array[int],
-        joint_S_s: wp.array[wp.spatial_vector],
-        body_mass: wp.array[float],
-        body_inertia_terms: wp.array2d[float],
-        group_to_art: wp.array[int],
-        dof_joint_offset: wp.array[int],
-        armature: wp.array2d[float],
-        drive_row_by_dof: wp.array[int],
-        drive_row_K: wp.array[float],
-        diagonal_inverse_mass: wp.array[float],
-    ):
-        element = wp.tid()
-        group = element // N
-        dof = element - group * N
-        art = group_to_art[group]
-        if mass_update_mask[art] == 0:
-            return
-
-        global_dof = articulation_dof_start[art] + dof
-        joint = articulation_start[art] + dof_joint_offset[dof]
-        body = joint_child[joint]
-        motion = joint_S_s[global_dof]
-        com = wp.vec3(
-            body_inertia_terms[body, 0],
-            body_inertia_terms[body, 1],
-            body_inertia_terms[body, 2],
-        )
-        inertia = wp.mat33(
-            body_inertia_terms[body, 3],
-            body_inertia_terms[body, 4],
-            body_inertia_terms[body, 5],
-            body_inertia_terms[body, 6],
-            body_inertia_terms[body, 7],
-            body_inertia_terms[body, 8],
-            body_inertia_terms[body, 9],
-            body_inertia_terms[body, 10],
-            body_inertia_terms[body, 11],
-        )
-        mass = wp.dot(motion, mul_com_spatial_inertia(body_mass[body], com, inertia, motion)) + armature[group, dof]
-        drive_row = drive_row_by_dof[global_dof]
-        if drive_row >= 0:
-            stiffness = drive_row_K[drive_row]
-            if stiffness > 0.0:
-                mass += stiffness
-        diagonal_inverse_mass[global_dof] = 1.0 / mass
-
-    name = f"compute_direct_diagonal_inverse_mass_{N}"
-    return python_kernel(compute_direct_diagonal_inverse_mass_template, name)
-
-
-@cache
-def _get_partitioned_inverse_dynamics_kernels(direct_dofs: int, device_arch: str) -> tuple["wp.Kernel", "wp.Kernel"]:
-    """Build generic-articulation and independent one-body inverse-dynamics kernels."""
-    del device_arch
-    N = int(direct_dofs)
-    if N <= 0:
-        raise ValueError("partitioned inverse dynamics requires a positive direct DOF count")
-
-    def selected_articulation_tau_template(
-        selected_articulations: wp.array[int],
-        articulation_start: wp.array[int],
-        articulation_joint_end: wp.array[int],
-        joint_type: wp.array[int],
-        joint_parent: wp.array[int],
-        joint_child: wp.array[int],
-        joint_articulation: wp.array[int],
-        joint_qd_start: wp.array[int],
-        joint_q_start: wp.array[int],
-        joint_dof_dim: wp.array2d[int],
-        joint_f: wp.array[float],
-        joint_q: wp.array[float],
-        joint_qd: wp.array[float],
-        joint_spring_stiffness: wp.array[float],
-        joint_spring_ref: wp.array[float],
-        joint_damping: wp.array[float],
-        joint_S_s: wp.array[wp.spatial_vector],
-        body_fb_s: wp.array[wp.spatial_vector],
-        body_f_ext: wp.array[wp.spatial_vector],
-        body_flags: wp.array[int],
-        body_q: wp.array[wp.transform],
-        body_com: wp.array[wp.vec3],
-        articulation_origin: wp.array[wp.vec3],
-        add_existing_tau: int,
-        body_ft_s: wp.array[wp.spatial_vector],
-        tau: wp.array[float],
-    ):
-        articulation = selected_articulations[wp.tid()]
-        accumulate_articulation_tau(
-            articulation,
-            articulation_start,
-            articulation_joint_end,
-            joint_type,
-            joint_parent,
-            joint_child,
-            joint_articulation,
-            joint_qd_start,
-            joint_q_start,
-            joint_dof_dim,
-            joint_f,
-            joint_q,
-            joint_qd,
-            joint_spring_stiffness,
-            joint_spring_ref,
-            joint_damping,
-            joint_S_s,
-            body_fb_s,
-            body_f_ext,
-            body_flags,
-            body_q,
-            body_com,
-            articulation_origin,
-            add_existing_tau,
-            body_ft_s,
-            tau,
-        )
-
-    def direct_branch_tau_template(
-        group_to_art: wp.array[int],
-        dof_joint_offset: wp.array[int],
-        articulation_start: wp.array[int],
-        joint_type: wp.array[int],
-        joint_child: wp.array[int],
-        joint_qd_start: wp.array[int],
-        joint_q_start: wp.array[int],
-        joint_dof_dim: wp.array2d[int],
-        joint_f: wp.array[float],
-        joint_q: wp.array[float],
-        joint_qd: wp.array[float],
-        joint_spring_stiffness: wp.array[float],
-        joint_spring_ref: wp.array[float],
-        joint_damping: wp.array[float],
-        joint_S_s: wp.array[wp.spatial_vector],
-        body_fb_s: wp.array[wp.spatial_vector],
-        body_f_ext: wp.array[wp.spatial_vector],
-        body_flags: wp.array[int],
-        body_q: wp.array[wp.transform],
-        body_com: wp.array[wp.vec3],
-        articulation_origin: wp.array[wp.vec3],
-        add_existing_tau: int,
-        tau: wp.array[float],
-    ):
-        element = wp.tid()
-        group = element // N
-        local_dof = element - group * N
-        articulation = group_to_art[group]
-        joint = articulation_start[articulation] + dof_joint_offset[local_dof]
-        child = joint_child[joint]
-
-        external_com = wp.spatial_vector()
-        if (body_flags[child] & BodyFlags.KINEMATIC) == 0:
-            external_com = body_f_ext[child]
-        external_force = wp.spatial_bottom(external_com)
-        external_torque = wp.spatial_top(external_com)
-        com_world = wp.transform_point(body_q[child], body_com[child])
-        com_relative = com_world - articulation_origin[articulation]
-        external_origin = wp.spatial_vector(
-            external_torque,
-            external_force + wp.cross(com_relative, external_torque),
-        )
-        body_force = body_fb_s[child] - external_origin
-        jcalc_tau(
-            joint_type[joint],
-            joint_S_s,
-            joint_f,
-            joint_q,
-            joint_qd,
-            joint_spring_stiffness,
-            joint_spring_ref,
-            joint_damping,
-            joint_q_start[joint],
-            joint_qd_start[joint],
-            joint_dof_dim[joint, 0],
-            joint_dof_dim[joint, 1],
-            body_force,
-            add_existing_tau,
-            tau,
-        )
-
-    return (
-        python_kernel(selected_articulation_tau_template, f"selected_articulation_tau_excluding_direct_{N}"),
-        python_kernel(direct_branch_tau_template, f"direct_branch_tau_{N}"),
-    )
-
-
-@cache
-def _get_composite_inertia_warp_kernel(
-    device_arch: str, warps_per_block: int, *, compact_terms: bool = False
-) -> "wp.Kernel":
-    """Build a one-warp-per-articulation composite-inertia reduction."""
-    _ = device_arch
-    if compact_terms:
-        initialize = """
-        const float mass = body_mass.data[body];
-        const float* terms = &body_inertia_terms.data[body * 12];
-        float* dst = reinterpret_cast<float*>(&body_I_c.data[body]);
-        for (int element = LANE; element < 36; element += STRIDE) {
-            const int row = element / 6;
-            const int col = element - row * 6;
-            float value = 0.0f;
-            if (row < 3 && col < 3) {
-                if (row == col) value = mass;
-            } else if (row >= 3 && col >= 3) {
-                value = terms[3 + (row - 3) * 3 + col - 3];
-            } else {
-                const int cross_row = row < 3 ? row : row - 3;
-                const int cross_col = col < 3 ? col : col - 3;
-                float cross = 0.0f;
-                if (cross_row == 0 && cross_col == 1) cross = -terms[2];
-                if (cross_row == 0 && cross_col == 2) cross = terms[1];
-                if (cross_row == 1 && cross_col == 0) cross = terms[2];
-                if (cross_row == 1 && cross_col == 2) cross = -terms[0];
-                if (cross_row == 2 && cross_col == 0) cross = -terms[1];
-                if (cross_row == 2 && cross_col == 1) cross = terms[0];
-                value = (row < 3 ? -mass : mass) * cross;
-            }
-            dst[element] = value;
-        }
-"""
-    else:
-        initialize = """
-        const float* src = reinterpret_cast<const float*>(&body_I_s.data[body]);
-        float* dst = reinterpret_cast<float*>(&body_I_c.data[body]);
-        for (int element = LANE; element < 36; element += STRIDE) dst[element] = src[element];
-"""
-    snippet = f"""    const int candidate = block * {warps_per_block} + SUB;
-    if (candidate >= composite_articulation_count) return;
-    const int articulation = composite_articulations.data[candidate];
-    const int start = articulation_start.data[articulation];
-    const int end = articulation_joint_end.data[articulation];
-    for (int joint = start; joint < end; ++joint) {{
-        const int body = joint_child.data[joint];
-{initialize}
-    }}
-    SYNC();
-
-    for (int joint = end - 1; joint >= start; --joint) {{
-        const int parent_joint = joint_ancestor.data[joint];
-        if (parent_joint >= start) {{
-            const int body = joint_child.data[joint];
-            const int parent_body = joint_child.data[parent_joint];
-            const float* src = reinterpret_cast<const float*>(&body_I_c.data[body]);
-            float* dst = reinterpret_cast<float*>(&body_I_c.data[parent_body]);
-            for (int element = LANE; element < 36; element += STRIDE) dst[element] += src[element];
-        }}
-        SYNC();
-    }}
-#endif
-"""
-    snippet = cuda_native(snippet, preludes=(lane_group(32),))
-
-    # The compact variant reads the bodies' compact inertia terms in place of their spatial inertia.
-    inertia = (
-        (("body_mass", wp.array[float]), ("body_inertia_terms", wp.array2d[float]))
-        if compact_terms
-        else (("body_I_s", wp.array[wp.spatial_matrix]),)
-    )
-    return KernelTemplate(
-        f"compute_composite_inertia_warp{warps_per_block}" + ("_compact" if compact_terms else ""),
-        kernel_template.params(
-            ("composite_articulation_count", int),
-            ("composite_articulations", wp.array[int]),
-            ("articulation_start", wp.array[int]),
-            ("articulation_joint_end", wp.array[int]),
-            ("joint_ancestor", wp.array[int]),
-            ("joint_child", wp.array[int]),
-            *inertia,
-            ("body_I_c", wp.array[wp.spatial_matrix]),
-        ),
-        snippet,
-        composed=True,
-        native_name="composite_inertia_warp_compact_native" if compact_terms else "composite_inertia_warp_native",
     ).kernel()
 
 
@@ -13070,7 +12538,7 @@ def _get_crba_cholesky_kernel(n_dofs: int, device_arch: str, tile_threads: int =
         mass_update_mask: wp.array[int],
         joint_child: wp.array[int],
         joint_S_s: wp.array[wp.spatial_vector],
-        body_I_c: wp.array[wp.spatial_matrix],
+        body_I_c: wp.array[inertia_record],
         group_to_art: wp.array[int],
         R_group: wp.array2d[float],
         dof_joint_offset: wp.array[int],
@@ -13092,7 +12560,8 @@ def _get_crba_cholesky_kernel(n_dofs: int, device_arch: str, tile_threads: int =
         lane_has_dof = lane < dofs
         if lane_has_dof:
             joint = articulation_start[art] + dof_joint_offset[lane]
-            force = body_I_c[joint_child[joint]] * joint_S_s[dof_start + lane]
+            mass, moment, rotational = unpack_inertia(body_I_c[joint_child[joint]])
+            force = inertia_apply(mass, moment, rotational, joint_S_s[dof_start + lane])
         wp.tile_scatter_masked(force_tile, lane, force, lane_has_dof)
 
         # Every lane executes the same fixed number of cooperative scatters.

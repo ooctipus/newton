@@ -41,7 +41,7 @@ arguments; the plan (:class:`.tree_plan.TreePlan`) supplies the rest:
     chain packing), never from a timing. The CPU path of every schedule is the
     serial one: a native scan's ``#else`` branch, and :func:`serial_scan` and
     :func:`serial_path` for Warp kernels (differentiable, the general route's
-    fallback).
+    passes).
 
 SERIAL and LEVEL compute every node's result from its parent's final one, so
 they agree bit for bit; the jump, chain and interval schedules regroup the same
@@ -66,7 +66,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-from .device_preludes import DevicePrelude, dual_native, lane_group
+from .device_preludes import DevicePrelude, device_branches, dual_native, lane_group
 from .law_source import law_preludes
 from .spatial_laws import SPATIAL, transform_compose, twist_compose
 from .tree_plan import TreePlan
@@ -455,9 +455,7 @@ class ScanSource:
     @property
     def text(self) -> str:
         """The scan for both devices: the schedule under the architecture guard, the serial twin otherwise."""
-        if self.cuda == self.cpu:
-            return self.cuda
-        return "#if defined(__CUDA_ARCH__)\n" + self.cuda + "#else\n" + self.cpu + "#endif\n"
+        return self.cuda if self.cuda == self.cpu else device_branches(self.cuda, self.cpu)
 
 
 @dataclass(frozen=True)
@@ -935,13 +933,15 @@ def serial_scan(combine: Combine, direction: Direction, own, result=None, *, own
 
     ``UP`` (:func:`add`), visiting the range backwards so that every child precedes its parent:
 
-    * ``own_first=False``: the slots hold the sums of the children visited so far (the caller zeroes them);
-      a node's value is ``own(node, children, data)``, added to its parent's slot and handed to ``result``;
-      its own slot keeps its children's sum;
+    * ``own_first=False``: a first pass zeroes every slot, which then holds the sums of the children visited
+      so far; a node's value is ``own(node, children, data)``, added to its parent's slot and handed to
+      ``result``; its own slot keeps its children's sum;
     * ``own_first=True``: a first pass stores ``own(node, data)`` at every slot, then each node's slot is added
       to its parent's, children descending, by an atomic add (the parent's value never enters registers).
 
-    Each form reproduces the order of the serial passes it replaces.
+    Each form reproduces the order of the serial passes it replaces, and each leaves memory as its first run
+    did when run again: Warp's tape replays a calling function's forward, stores and all, before the adjoint
+    of the scan reads the sums back, so an up scan sets its slots itself rather than adding to what it finds.
     """
     has_result = result is not None
     if direction is Direction.UP:
@@ -968,6 +968,8 @@ def serial_scan(combine: Combine, direction: Direction, own, result=None, *, own
 
         @wp.func
         def scan_up(start: int, end: int, parent: wp.array[int], slot: wp.array[int], values: wp.array[Any], data: Any):
+            for node in range(start, end):
+                values[slot[node]] = values.dtype(0.0)
             for offset in range(end - start):
                 node = end - 1 - offset
                 value = own(node, values[slot[node]], data)
@@ -1042,15 +1044,15 @@ def serial_scan(combine: Combine, direction: Direction, own, result=None, *, own
 
 @functools.cache
 def serial_path(visit):
-    """Return the Warp walk up a node's root path: ``visit(ancestor, node, value, data)`` for every ancestor of
-    ``node`` and itself, root first, in one thread.
+    """Return the Warp walk up a node's root path: ``visit(ancestor, node, value, data, context)`` for every
+    ancestor of ``node`` and itself, root first, in one thread.
 
     The walk runs over the depth-first positions (:class:`.tree_plan.TreePlan`'s ``dfs_order``,
     ``dfs_position`` and ``dfs_end``) from the tree's root ``start`` to ``node``'s, visiting each node whose
     subtree interval holds ``node``'s position, rather than following parent pointers: no state passes between
     iterations, so Warp's tape differentiates it (its replay of a pointer walk runs with the last pointer and
-    loses the gradient). ``value`` is the walk's own operand (a column's force), passed through with the struct
-    ``data``.
+    loses the gradient). ``value`` is the walk's own operand (a column's force); ``data`` (the pass's arrays)
+    and ``context`` (the walk's own scalars) pass through.
     """
 
     @wp.func
@@ -1062,11 +1064,12 @@ def serial_path(visit):
         dfs_position: wp.array[int],
         dfs_end: wp.array[int],
         data: Any,
+        context: Any,
     ):
         here = dfs_position[node]
         for position in range(dfs_position[start], here + 1):
             if here < dfs_end[position]:
-                visit(dfs_order[position], node, value, data)
+                visit(dfs_order[position], node, value, data, context)
 
     return walk
 

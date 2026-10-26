@@ -8,7 +8,9 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import kernels
+from newton._src.solvers.feather_pgs import field_group
+from newton._src.solvers.feather_pgs.spatial_laws import inertia_record
+from newton._src.solvers.feather_pgs.tree_passes import DynamicsData, publish_body_dynamics
 
 
 class TestBodyPublicationValues(unittest.TestCase):
@@ -37,7 +39,7 @@ class TestBodyPublicationValues(unittest.TestCase):
         art = np.array([-1, 0, 1, 2])
         free = np.array([0, 1, 0])
         expected_i = np.empty((count, 6, 6))
-        expected_terms = np.empty((count, 12))
+        expected_terms = np.empty((count, 13))
         expected_f = np.empty((count, 6))
         expected_v = np.empty((count, 6))
         for body in range(count):
@@ -51,7 +53,7 @@ class TestBodyPublicationValues(unittest.TestCase):
             momentum = spatial @ velocity[body]
             bias = np.r_[np.cross(w, momentum[:3]), np.cross(v, momentum[:3]) + np.cross(w, momentum[3:])]
             expected_i[body] = spatial
-            expected_terms[body] = np.r_[c, inertia.ravel()]
+            expected_terms[body] = np.r_[mass[body], mass[body] * c, inertia.ravel()]
             expected_f[body] = (
                 spatial @ acceleration[body] + bias - np.r_[mass[body] * gravity, np.cross(c, mass[body] * gravity)]
             )
@@ -68,27 +70,22 @@ class TestBodyPublicationValues(unittest.TestCase):
             "body_v_s": wp.array(velocity, dtype=wp.spatial_vector, device=device),
             "body_a_s": wp.array(acceleration, dtype=wp.spatial_vector, device=device),
         }
-        for full, compact in ((0, 0), (1, 0), (0, 1)):
-            with self.subTest(device=device, full=full, compact=compact):
+        for compact in (0, 1):
+            with self.subTest(device=device, compact=compact):
                 values.update(
-                    materialize_all_body_inertia=full,
-                    materialize_body_inertia_terms=compact,
+                    write_inertia_records=compact,
                     body_I_s=wp.full(count, wp.spatial_matrix(17.0), dtype=wp.spatial_matrix, device=device),
-                    body_inertia_terms=wp.full((count, 12), 17.0, dtype=float, device=device),
+                    body_inertia_terms=wp.full(count, inertia_record(17.0), dtype=inertia_record, device=device),
                     body_f_s=wp.full(count, wp.spatial_vector(17.0), dtype=wp.spatial_vector, device=device),
                     body_qd=wp.zeros(count, dtype=wp.spatial_vector, device=device),
                 )
-                wp.launch(
-                    kernels.finalize_body_dynamics,
-                    count,
-                    [values[a.label] for a in kernels.finalize_body_dynamics.adj.args],
-                    device=device,
-                )
+                dynamics = field_group.upload(DynamicsData, device, **values)
+                wp.launch(publish_body_dynamics, count, [dynamics], device=device)
                 np.testing.assert_allclose(values["body_qd"].numpy(), expected_v, atol=2e-5, rtol=2e-6)
                 np.testing.assert_allclose(values["body_f_s"].numpy()[1:], expected_f[1:], atol=5e-5, rtol=3e-6)
                 np.testing.assert_array_equal(values["body_f_s"].numpy()[0], 17.0)
                 for body in range(count):
-                    materialize = art[body] >= 0 and (full or free[art[body]])
+                    materialize = art[body] >= 0 and free[art[body]]
                     np.testing.assert_allclose(
                         values["body_I_s"].numpy()[body],
                         expected_i[body] if materialize else 17.0,

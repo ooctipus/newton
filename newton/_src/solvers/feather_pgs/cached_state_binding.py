@@ -29,9 +29,6 @@ def publication(solver, state_in, state_aug, state_out, dt):
         state_aug=state_aug,
         state_out=state_out,
         dt=dt,
-        # Free finalization still materializes its original I_s on held steps.
-        materialize_all_body_inertia=0,
-        materialize_body_inertia_terms=0,
         stage_clocks=stage_clocks(solver),
     )
 

@@ -12,6 +12,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import kernels as feather_pgs_kernels
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
+from newton._src.solvers.feather_pgs import tree_passes
 from newton._src.solvers.feather_pgs.contact_row_plan import contact_row_plan
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _DENSE_META_MAX_PARENT,
@@ -242,24 +243,31 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
                     self.assertEqual(bool(plan.combined), masked)
 
     def test_launch_geometry_kernels_use_dedicated_modules(self):
-        """Keep custom-block-dimension kernels out of the general module."""
+        """Keep custom-block-dimension kernels out of the general modules, one module per launch block size."""
         expected_modules = {
-            "eval_rigid_fk_kinematics": "kinematics",
-            "eval_rigid_fk_id": "kinematics",
-            "eval_rigid_tau": "inverse_dynamics",
-            "eval_rigid_tau_add": "inverse_dynamics",
-            "eval_rigid_tau_and_augmented_drives": "inverse_dynamics",
-            "prepare_augmented_joint_drives": "inverse_dynamics",
-            "finalize_body_dynamics": "mass_dynamics",
-            "compute_composite_inertia": "mass_dynamics",
-            "crba_fill_par_dof": "mass_dynamics",
+            feather_pgs_kernels: {
+                "eval_rigid_tau_and_augmented_drives": "inverse_dynamics",
+                "prepare_augmented_joint_drives": "inverse_dynamics",
+            },
+            tree_passes: {
+                "fk_kinematics": "kinematics",
+                "fk_id": "kinematics",
+                "inverse_dynamics_tau": "inverse_dynamics",
+                "selected_inverse_dynamics_tau": "inverse_dynamics",
+                "publish_body_dynamics": "mass_dynamics",
+                "refresh_body_inertia": "mass_dynamics",
+                "composite_inertia": "mass_dynamics",
+                "crba_fill": "mass_dynamics",
+                "diagonal_inverse_mass": "mass_dynamics",
+            },
         }
-        general_module = feather_pgs_kernels.__name__
-        for kernel_name, module_suffix in expected_modules.items():
-            with self.subTest(kernel=kernel_name):
-                kernel_module = getattr(feather_pgs_kernels, kernel_name).module.name
-                self.assertNotEqual(kernel_module, general_module)
-                self.assertEqual(kernel_module, f"{general_module}.{module_suffix}")
+        for owner, kernels in expected_modules.items():
+            general_module = owner.__name__
+            for kernel_name, module_suffix in kernels.items():
+                with self.subTest(kernel=kernel_name):
+                    kernel_module = getattr(owner, kernel_name).module.name
+                    self.assertNotEqual(kernel_module, general_module)
+                    self.assertEqual(kernel_module, f"{general_module}.{module_suffix}")
 
     def test_defaults_preserved(self):
         model = newton.ModelBuilder().finalize()

@@ -165,9 +165,6 @@ def _solver(model, *, enabled, mode="split", velocity_limits=False):
     # Exercise the production cached Stage 7 on CPU, where it is normally off.
     if model.device.is_cpu:
         solver._fk_id_cache_enabled = True
-    # CPU does not normally allocate the optional parallel-refresh terms.
-    if model.device.is_cpu:
-        solver._body_inertia_terms = wp.empty((model.body_count, 12), dtype=float, device=model.device)
     solver._prepare_augmented_state(model.state(), model.state(), model.control())
     return solver
 
@@ -282,7 +279,8 @@ class TestLeafPublication(unittest.TestCase):
             )
 
     def test_complete_canonical_publication_and_held_inertia(self):
-        """Match all canonical fields, preserving held I/terms on each cadence arm."""
+        """Match all canonical fields on each cadence arm: inertia records are placed only for a refresh step,
+        and dense inertia only for free rigid bodies."""
         model, _, leaves = _build_model(locked_d6=True, leaves=108)
         baseline = _solver(model, enabled=False)
         candidate = _solver(model, enabled=True)
@@ -302,9 +300,8 @@ class TestLeafPublication(unittest.TestCase):
                 np.testing.assert_allclose(snapshots[1][name], snapshots[0][name], rtol=3e-6, atol=3e-6, err_msg=name)
             np.testing.assert_array_equal(snapshots[1]["valid"], np.ones(model.articulation_count))
             np.testing.assert_array_equal(snapshots[1]["a"][leaves], 0.0)
-            if step == 0 or compact:
-                np.testing.assert_array_equal(snapshots[1]["I"][leaves], -123.25)
-            if not compact:
+            np.testing.assert_array_equal(snapshots[1]["I"][leaves], -123.25)
+            if step == 0:
                 np.testing.assert_array_equal(snapshots[1]["terms"][leaves], -123.25)
             # Independent public FK computes COM velocities from q/qd, not our cache.
             reference = model.state()
@@ -346,6 +343,10 @@ class TestLeafPublication(unittest.TestCase):
             solver.notify_model_changed(newton.ModelFlags.ALL)
             np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 0)
             state = model.state()
+            # Entries the publication leaves alone (dense inertia of bodies that are not free rigid) compare equal.
+            for name, array in _fields(solver, state).items():
+                if name != "valid":
+                    array.fill_(-123.25)
             solver._stage7_update_kinematics(state, solver)
             after.append(
                 {name: array.numpy().copy() for name, array in _fields(solver, state).items() if name != "terms"}

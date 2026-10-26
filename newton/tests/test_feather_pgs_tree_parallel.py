@@ -11,7 +11,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import solver_feather_pgs
+from newton._src.solvers.feather_pgs import tree_passes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _FeatherPGSTreePlan
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_leaf_publication import (
@@ -86,22 +86,23 @@ def _build_fingers(device="cpu", *, articulations=3, include_chain=False, ragged
 
 class TestFeatherPGSTreePlan(unittest.TestCase):
     def test_torque_pass_runs_once(self):
-        """Dispatch exactly one torque pass, including accumulation into actuator torques."""
+        """Dispatch exactly one torque pass, including accumulation into actuator torques; the serial pass sets
+        its subtree sums itself."""
         for add_to_existing in (False, True):
             with self.subTest(add_to_existing=add_to_existing):
-                solver = Mock(model=Mock(articulation_count=2), _direct_branch_tau_kernel=None, _tree_plan=None)
+                solver = Mock(model=Mock(articulation_count=2), _direct_compact_diagonal_inertia=False, _tree_plan=None)
                 state_in, state_aug, control = Mock(body_count=2), Mock(), Mock()
                 with patch.object(wp, "launch") as serial_launch, patch.object(wp, "launch_tiled") as tiled_launch:
                     SolverFeatherPGS._launch_rigid_tau(
                         solver, state_in, state_aug, control, add_to_existing=add_to_existing
                     )
-                state_aug.body_ft_s.zero_.assert_called_once_with()
+                state_aug.body_ft_s.zero_.assert_not_called()
                 tiled_launch.assert_not_called()
                 serial_launch.assert_called_once()
-                expected = (
-                    solver_feather_pgs.eval_rigid_tau_add if add_to_existing else solver_feather_pgs.eval_rigid_tau
+                self.assertIs(serial_launch.call_args.args[0], tree_passes.inverse_dynamics_tau)
+                solver._dynamics.assert_called_once_with(
+                    state_in, state_aug, control, add_existing_tau=int(add_to_existing)
                 )
-                self.assertIs(serial_launch.call_args.args[0], expected)
 
     def test_parallel_tree_is_keyword_only_and_defaults_to_serial(self):
         """Require an explicit construction-only opt-in without shifting positional arguments."""

@@ -55,10 +55,18 @@ from dataclasses import dataclass
 import numpy as np
 import warp as wp
 
-from ...math.spatial import transform_twist
 from ...sim import BodyFlags, JointType
 from . import cached_state_binding
-from .kernels import mul_com_spatial_inertia, transform_com_inertia_terms
+from .spatial_laws import (
+    axis_transform,
+    coordinate_force,
+    inertia_apply,
+    inertia_at,
+    joint_frame_pose,
+    motion_axis,
+    transform_compose,
+    wrench_shift,
+)
 from .tree_kinetic_owner import proof_runs
 
 # Lanes of the repair launch: one warp per articulation, so a valid cache exits per warp.
@@ -72,30 +80,20 @@ _REPAIR_BLOCK_DIM = 128
 @wp.func
 def _root_pose(joint_X_p: wp.array[wp.transform], joint_X_c: wp.array[wp.transform], root_joint: int):
     """Pose of a world-fixed root: its joint frames with the identity joint transform between them."""
-    return joint_X_p[root_joint] * wp.transform_inverse(joint_X_c[root_joint])
+    return joint_frame_pose(joint_X_p[root_joint], wp.transform_identity(), joint_X_c[root_joint])
 
 
 @wp.func
-def _prismatic_pose(X_wpj: wp.transform, axis: wp.vec3, q: float, X_c: wp.transform):
-    return (X_wpj * wp.transform(axis * q, wp.quat_identity())) * wp.transform_inverse(X_c)
+def _leaf_pose(X_root: wp.transform, X_p: wp.transform, angular: bool, axis: wp.vec3, q: float, X_c: wp.transform):
+    """A one-coordinate leaf's pose: its relative pose composed with its root's, as the pose scan composes it."""
+    return transform_compose(X_root, joint_frame_pose(X_p, axis_transform(angular, axis, q), X_c))
 
 
 @wp.func
-def _revolute_pose(X_wpj: wp.transform, axis: wp.vec3, q: float, X_c: wp.transform):
-    return (X_wpj * wp.transform(wp.vec3(), wp.quat_from_axis_angle(axis, q))) * wp.transform_inverse(X_c)
-
-
-@wp.func
-def _prismatic_motion(X_wpj: wp.transform, axis: wp.vec3):
-    """Prismatic motion axis: translation only, so it does not depend on the articulation origin."""
-    return wp.spatial_vector(wp.quat_rotate(wp.transform_get_rotation(X_wpj), axis), wp.vec3())
-
-
-@wp.func
-def _revolute_motion(X_wpj: wp.transform, origin: wp.vec3, axis: wp.vec3):
-    """Revolute motion axis about the articulation origin, as ``jcalc_motion`` forms it."""
+def _leaf_motion(X_wpj: wp.transform, origin: wp.vec3, angular: bool, axis: wp.vec3):
+    """A one-coordinate leaf's motion column about the articulation origin (its joint anchor ``X_wpj``)."""
     local = wp.transform(wp.transform_get_translation(X_wpj) - origin, wp.transform_get_rotation(X_wpj))
-    return transform_twist(local, wp.spatial_vector(wp.vec3(), axis))
+    return motion_axis(local, axis, angular)
 
 
 @wp.func
@@ -109,9 +107,7 @@ def _external_at_origin(
     external = wp.spatial_vector()
     if (body_flags[body] & BodyFlags.KINEMATIC) == 0:
         external = body_f[body]
-    force = wp.spatial_top(external)
-    torque = wp.spatial_bottom(external)
-    return wp.spatial_vector(force, torque + wp.cross(com_relative, force))
+    return wrench_shift(external, com_relative)
 
 
 @wp.func
@@ -165,10 +161,10 @@ def _leaf_force(
     spring_ref: wp.array[float],
     damping: wp.array[float],
 ):
-    """``jcalc_tau`` of one scalar coordinate: body force, control force and passive spring and damping."""
-    passive = spring_stiffness[dof] * (spring_ref[dof] - q)
-    passive -= damping[dof] * qd
-    return -wp.dot(motion, body_force) + joint_f[dof] + passive
+    """One scalar coordinate's generalized force (:func:`.spatial_laws.coordinate_force`)."""
+    return coordinate_force(
+        motion, body_force, joint_f[dof], spring_stiffness[dof], spring_ref[dof], damping[dof], q, qd
+    )
 
 
 @wp.func
@@ -238,11 +234,11 @@ def repair_scalar_branches(
         q = joint_q[coordinate_start + local]
         child = joint_child[joint]
         if joint_type[joint] == JointType.PRISMATIC:
-            body_q[child] = _prismatic_pose(X_wpj, axis, q, joint_X_c[joint])
-            joint_S_s[dof] = _prismatic_motion(X_wpj, axis)
+            body_q[child] = _leaf_pose(X_root, joint_X_p[joint], False, axis, q, joint_X_c[joint])
+            joint_S_s[dof] = _leaf_motion(X_wpj, origin, False, axis)
         else:
-            body_q[child] = _revolute_pose(X_wpj, axis, q, joint_X_c[joint])
-            joint_S_s[dof] = _revolute_motion(X_wpj, origin, axis)
+            body_q[child] = _leaf_pose(X_root, joint_X_p[joint], True, axis, q, joint_X_c[joint])
+            joint_S_s[dof] = _leaf_motion(X_wpj, origin, True, axis)
 
 
 @wp.kernel(enable_backward=False)
@@ -418,10 +414,10 @@ def predict_scalar_branches(
             linear = wp.spatial_top(motion)
             projected = mass * wp.dot(linear, linear)
         else:
-            com, inertia_origin = transform_com_inertia_terms(
-                wp.transform(com_relative, wp.transform_get_rotation(pose)), mass, body_inertia[child]
+            mass_at, moment, rotational = inertia_at(
+                mass, body_inertia[child], wp.transform_get_rotation(pose), com_relative
             )
-            projected = wp.dot(motion, mul_com_spatial_inertia(mass, com, inertia_origin, motion))
+            projected = wp.dot(motion, inertia_apply(mass_at, moment, rotational, motion))
         diagonal = projected + armature[group, local]
         if stiffness > 0.0:
             diagonal += stiffness
@@ -495,8 +491,8 @@ def finish_prismatic_branches(
     X_wpj = X_root * joint_X_p[joint]
     axis = joint_axis[dof]
     child = joint_child[joint]
-    body_q[child] = _prismatic_pose(X_wpj, axis, q_new, joint_X_c[joint])
-    motion = _prismatic_motion(X_wpj, axis)
+    body_q[child] = _leaf_pose(X_root, joint_X_p[joint], False, axis, q_new, joint_X_c[joint])
+    motion = _leaf_motion(X_wpj, wp.vec3(), False, axis)
     joint_S_s[dof] = motion
     body_qd[child] = motion * qd_new
     if local == 0:
@@ -566,15 +562,15 @@ def finish_scalar_branches(
     axis = joint_axis[dof]
     child = joint_child[joint]
     if joint_type[joint] == JointType.PRISMATIC:
-        body_q[child] = _prismatic_pose(X_wpj, axis, q_new, joint_X_c[joint])
-        motion = _prismatic_motion(X_wpj, axis)
+        body_q[child] = _leaf_pose(X_root, joint_X_p[joint], False, axis, q_new, joint_X_c[joint])
+        motion = _leaf_motion(X_wpj, wp.vec3(), False, axis)
         joint_S_s[dof] = motion
         body_qd[child] = motion * qd_new
     else:
         origin = wp.transform_point(X_root, body_com[joint_child[root_joint]])
-        pose = _revolute_pose(X_wpj, axis, q_new, joint_X_c[joint])
+        pose = _leaf_pose(X_root, joint_X_p[joint], True, axis, q_new, joint_X_c[joint])
         body_q[child] = pose
-        motion = _revolute_motion(X_wpj, origin, axis)
+        motion = _leaf_motion(X_wpj, origin, True, axis)
         joint_S_s[dof] = motion
         velocity = motion * qd_new
         com_relative = wp.transform_point(pose, body_com[child]) - origin

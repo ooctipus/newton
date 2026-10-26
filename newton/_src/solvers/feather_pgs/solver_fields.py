@@ -14,6 +14,7 @@ row, one world) or not at all, as each allocation site says.
 import warp as wp
 
 from .field_group import Field, FieldGroup
+from .spatial_laws import inertia_record
 
 ROW_SLOT_UNBOUNDED = 2**31 - 1
 """First rejected slot of a row family that rejected none this step."""
@@ -43,14 +44,22 @@ ARTICULATION_WORK = FieldGroup(
 )
 
 BODY_INERTIA = FieldGroup(
-    Field("body_I_m", wp.spatial_matrix, ("body",), fill=None),
     Field("body_X_com", wp.transform, ("body",), fill=None),
-    Field("body_I_c", wp.spatial_matrix, ("body",), fill=None),
-    Field("_body_inertia_terms", wp.float32, ("inertia_terms", 12), fill=None),
+    Field("body_I_c", inertia_record, ("body",), fill=None),
+    Field("_body_inertia_terms", inertia_record, ("body",), fill=None),
 )
-"""Body inertia in its spatial and compact (center-of-mass) forms; the compact terms only when refreshed."""
+"""Body inertia about the articulation origin as inertia records (:data:`.spatial_laws.inertia_record`): each
+body's own (``_body_inertia_terms``) and its subtree's composite (``body_I_c``)."""
 
 ARTICULATION_ORIGIN = FieldGroup(Field("articulation_origin", wp.vec3, ("articulation",)))
+
+JOINT_DFS = FieldGroup(
+    Field("_joint_dfs_order", wp.int32, ("joint",), grad=False),
+    Field("_joint_dfs_position", wp.int32, ("joint",), grad=False),
+    Field("_joint_dfs_end", wp.int32, ("joint",), grad=False),
+)
+"""The joint forest's depth-first order, each joint's position and each position's subtree end
+(:class:`.tree_plan.TreePlan`): the CRBA's ancestor test."""
 
 AUGMENTED_DRIVE_ROWS = FieldGroup(
     Field("aug_row_counts", wp.int32, ("articulation",)),

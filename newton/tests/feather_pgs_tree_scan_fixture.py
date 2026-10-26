@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared machinery of the tree-scan tests and ``tools/fpgs_bench/tree_scan_bench.py``.
+"""Shared machinery of the tree-scan and tree-pass tests and ``tools/fpgs_bench/tree_scan_bench.py``.
 
 Tree shapes, the existing held-tree passes compiled as stand-alone natives
 (their module texts, unchanged), the ``tree_scan`` configuration of each, and
 kernels that run either on the same scratch so that the two can be compared
-bit for bit or timed with the same launch. It defines no tests.
+bit for bit or timed with the same launch; articulated models of the shapes
+and the general route's passes on a solver's own arrays (:class:`GeneralRoute`),
+with the tape and central-difference gradients of each. It defines no tests.
 """
 
 import functools
@@ -662,420 +664,212 @@ def articulated_model(shapes, worlds: int, device, seed: int = 0, requires_grad:
 
 
 @dataclass
-class SerialArrays:
-    """Inputs and outputs of the serial route's kernels on one model."""
+class GeneralRoute:
+    """A model's general-route passes on a solver's own arrays and binding (``_dynamics``), with random
+    external wrenches, generalized forces, and passive springs and dampers on the one-coordinate axes."""
 
     model: object
-    joint_end: wp.array
-    body_X_com: wp.array
-    is_free_rigid: wp.array
-    gravity: wp.array
-    joint_articulation: wp.array
+    solver: object
+    state: object
+    control: object
+    aug: object
+    """The augmented state: the solver, or with gradients the output state (``_prepare_augmented_state``)."""
     size_groups: list
-    articulations: wp.array
-    outputs: dict
+    """Per coordinate count: ``(size, group_to_art)``, the articulations of that size."""
+    H: dict
+    """Per coordinate count: the joint-space inertias of its articulations."""
 
 
-def serial_arrays(model) -> SerialArrays:
-    from newton._src.solvers.feather_pgs import kernels  # noqa: PLC0415
+def general_route(model, seed: int = 3) -> GeneralRoute:
+    """The general route of ``model`` (see :class:`GeneralRoute`)."""
+    import newton  # noqa: PLC0415
+    from newton.solvers import SolverFeatherPGS  # noqa: PLC0415
 
     device = model.device
-    starts = model.articulation_start.numpy()
-    body_X_com = wp.zeros(model.body_count, dtype=wp.transform, device=device)
-    wp.launch(
-        kernels.compute_com_transforms, model.body_count, inputs=[model.body_com], outputs=[body_X_com], device=device
-    )
-    joint_articulation = np.repeat(np.arange(model.articulation_count, dtype=np.int32), np.diff(starts))
-    counts = np.diff(model.joint_qd_start.numpy()[starts])
-    rng = np.random.default_rng(3)
-    n = model.body_count
-    # Float arrays follow the model's gradient flag, so a tape can differentiate the passes.
-    zeros = functools.partial(wp.zeros, device=device, requires_grad=model.requires_grad)
-
-    def values(data, dtype):
-        return wp.array(data.astype(np.float32), dtype=dtype, device=device, requires_grad=model.requires_grad)
-
+    solver = SolverFeatherPGS(model, use_parallel_streams=False)
+    state, control = model.state(), model.control()
+    aug = solver._prepare_augmented_state(state, model.state(), control)
+    rng = np.random.default_rng(seed)
+    if model.body_count:
+        state.body_f.assign(rng.standard_normal((model.body_count, 6)).astype(np.float32))
     dofs = model.joint_dof_count
-    outputs = {
-        "body_q": zeros(n, dtype=wp.transform),
-        "body_q_com": zeros(n, dtype=wp.transform),
-        "articulation_origin": zeros(model.articulation_count, dtype=wp.vec3),
-        "joint_S_s": zeros(dofs, dtype=wp.spatial_vector),
-        "body_I_s": zeros(n, dtype=wp.spatial_matrix),
-        "body_inertia_terms": zeros((n, 12), dtype=float),
-        "body_v_s": zeros(n, dtype=wp.spatial_vector),
-        "body_f_s": zeros(n, dtype=wp.spatial_vector),
-        "body_a_s": zeros(n, dtype=wp.spatial_vector),
-        "fk_id_cache_valid": wp.zeros(model.articulation_count, dtype=int, device=device),
-        "body_ft_s": zeros(n, dtype=wp.spatial_vector),
-        "tau": zeros(dofs, dtype=float),
-        "body_I_c": zeros(n, dtype=wp.spatial_matrix),
-        "body_f_ext": values(rng.standard_normal((n, 6)), wp.spatial_vector),
-        "joint_f": values(rng.standard_normal(dofs), float),
-        "spring": values(rng.uniform(0, 2, dofs), float),
-        "damping": values(rng.uniform(0, 1, dofs), float),
-        "mask": wp.ones(model.articulation_count, dtype=int, device=device),
-        "H": {
-            int(size): zeros((int(np.sum(counts == size)), int(size), int(size)), dtype=float)
-            for size in np.unique(counts)
-        },
-        "drive_row": wp.full(dofs, -1, dtype=int, device=device),
-        "row_K": zeros(1, dtype=float),
-    }
-    return SerialArrays(
+    control.joint_f.assign(rng.standard_normal(dofs).astype(np.float32))
+    dof_joint = np.repeat(np.arange(model.joint_count), np.diff(model.joint_qd_start.numpy()))
+    axes = np.isin(
+        model.joint_type.numpy()[dof_joint], (int(newton.JointType.REVOLUTE), int(newton.JointType.PRISMATIC))
+    )
+    for name, low, high in (
+        ("_passive_spring_stiffness", 0.5, 2.0),
+        ("_passive_spring_ref", -0.5, 0.5),
+        ("_passive_joint_damping", 0.1, 0.5),
+    ):
+        values = np.where(axes, rng.uniform(low, high, dofs), 0.0).astype(np.float32)
+        setattr(solver, name, wp.array(values, dtype=float, device=device, requires_grad=model.requires_grad))
+    solver.mass_update_mask.fill_(1)
+    starts = model.articulation_start.numpy()
+    counts = np.diff(model.joint_qd_start.numpy()[starts])
+    sizes = [int(size) for size in np.unique(counts)]
+    return GeneralRoute(
         model,
-        wp.array(starts[1:].astype(np.int32), dtype=int, device=device),
-        body_X_com,
-        wp.zeros(model.articulation_count, dtype=int, device=device),
-        wp.array([[0.0, 0.0, -9.81]], dtype=wp.vec3, device=device),
-        wp.array(joint_articulation, dtype=int, device=device),
-        [
-            (int(size), wp.array(np.flatnonzero(counts == size).astype(np.int32), dtype=int, device=device))
-            for size in np.unique(counts)
-        ],
-        wp.array(np.arange(model.articulation_count, dtype=np.int32), dtype=int, device=device),
-        outputs,
+        solver,
+        state,
+        control,
+        aug,
+        [(size, wp.array(np.flatnonzero(counts == size).astype(np.int32), dtype=int, device=device)) for size in sizes],
+        {
+            size: wp.zeros(
+                (int(np.sum(counts == size)), size, size), dtype=float, device=device, requires_grad=model.requires_grad
+            )
+            for size in sizes
+        },
     )
 
 
-SERIAL_PASSES = (
-    "fk_kinematics",
-    "fk_id",
-    "tau",
-    "composite_inertia",
-    "composite_inertia_warp",
-    "composite_inertia_compact",
-    "crba",
-)
-"""The general route's passes; the two warp forms of the composite inertia are CUDA only."""
+GENERAL_PASSES = ("fk_kinematics", "fk_id", "tau", "composite_inertia", "crba")
+"""The general route's passes, in step order (``fk_kinematics`` stands alone; the others follow ``fk_id``)."""
 
 
-def serial_launch(name: str, arm: str, data: SerialArrays):
-    """Launch one serial pass, ``existing`` (``kernels``) or ``generated`` (``tree_passes``), with one launch shape."""
-    from newton._src.solvers.feather_pgs import kernels, tree_passes  # noqa: PLC0415
+def pass_launch(route: GeneralRoute, name: str, **values):
+    """One general-route pass as a launch callable, bound once to the solver's binding of the route's state
+    (``values``: its switches) and with the solver's block sizes."""
+    from newton._src.solvers.feather_pgs import tree_passes  # noqa: PLC0415
 
-    m, o, device = data.model, data.outputs, data.model.device
-    arts = m.articulation_count
-    common = [m.articulation_start, data.joint_end, m.joint_type, m.joint_parent, m.joint_child, m.joint_q_start]
-    frames = [m.joint_qd_start, m.joint_q, m.joint_qd, m.joint_X_p, m.joint_X_c, data.body_X_com, m.joint_axis]
-    if name == "fk_kinematics":
-        kernel = kernels.eval_rigid_fk_kinematics if arm == "existing" else tree_passes.fk_kinematics
-        wp.launch(
-            kernel,
-            arts,
-            inputs=[*common, *frames, m.joint_dof_dim, m.body_com],
-            outputs=[
-                o[k]
-                for k in (
-                    "body_q",
-                    "body_q_com",
-                    "articulation_origin",
-                    "joint_S_s",
-                    "body_v_s",
-                    "body_a_s",
-                    "fk_id_cache_valid",
-                )
-            ],
-            device=device,
+    m, solver, device = route.model, route.solver, route.model.device
+    dynamics = solver._dynamics(route.state, route.aug, route.control, **values)
+    kernels = {
+        "fk_kinematics": (tree_passes.fk_kinematics, 16),
+        "fk_id": (tree_passes.fk_id, 16),
+        "tau": (tree_passes.inverse_dynamics_tau, solver.serial_kernel_block_dim),
+        "composite_inertia": (tree_passes.composite_inertia, 128),
+    }
+    if name in kernels:
+        kernel, block_dim = kernels[name]
+        return functools.partial(
+            wp.launch, kernel, m.articulation_count, inputs=[dynamics], block_dim=block_dim, device=device
         )
-    elif name == "fk_id":
-        kernel = kernels.eval_rigid_fk_id if arm == "existing" else tree_passes.fk_id
-        wp.launch(
-            kernel,
-            arts,
-            inputs=[
-                *common,
-                *frames,
-                m.joint_dof_dim,
-                m.body_com,
-                m.body_mass,
-                m.body_inertia,
-                data.is_free_rigid,
-                1,
-                1,
-                0,
-                data.gravity,
-            ],
-            outputs=[
-                o[k]
-                for k in (
-                    "body_q",
-                    "body_q_com",
-                    "articulation_origin",
-                    "joint_S_s",
-                    "body_I_s",
-                    "body_inertia_terms",
-                    "body_v_s",
-                    "body_f_s",
-                    "body_a_s",
-                    "fk_id_cache_valid",
-                )
-            ],
-            device=device,
-        )
-    elif name == "tau":
-        kernel = kernels.eval_rigid_tau if arm == "existing" else tree_passes.inverse_dynamics_tau
-        o["body_ft_s"].zero_()
-        inputs = [
-            m.articulation_start,
-            data.joint_end,
-            m.joint_type,
-            m.joint_parent,
-            m.joint_child,
-            data.joint_articulation,
-            m.joint_qd_start,
-            m.joint_q_start,
-            m.joint_dof_dim,
-            o["joint_f"],
-            m.joint_q,
-            m.joint_qd,
-            o["spring"],
-            m.joint_q,
-            o["damping"],
-            o["joint_S_s"],
-            o["body_f_s"],
-            o["body_f_ext"],
-            m.body_flags,
-            o["body_q"],
-            m.body_com,
-            o["articulation_origin"],
-        ]
-        if arm != "existing":
-            inputs.append(0)
-        wp.launch(kernel, arts, inputs=inputs, outputs=[o["body_ft_s"], o["tau"]], device=device)
-    elif name == "composite_inertia":
-        if arm == "existing":
-            wp.launch(
-                kernels.compute_composite_inertia,
-                arts,
-                inputs=[
-                    m.articulation_start,
-                    data.joint_end,
-                    o["mask"],
-                    m.joint_ancestor,
-                    m.joint_child,
-                    o["body_I_s"],
-                ],
-                outputs=[o["body_I_c"]],
-                device=device,
-            )
-        else:
-            wp.launch(
-                tree_passes.composite_inertia,
-                arts,
-                inputs=[m.articulation_start, data.joint_end, o["mask"], m.joint_parent, m.joint_child, o["body_I_s"]],
-                outputs=[o["body_I_c"]],
-                device=device,
-            )
-    elif name in ("composite_inertia_warp", "composite_inertia_compact"):
-        # The solver's CUDA form: one warp per articulation, lanes over the 36 channels.
-        from newton._src.solvers.feather_pgs.solver_feather_pgs import (  # noqa: PLC0415
-            _COMPOSITE_INERTIA_WARPS_PER_BLOCK as warps,
-        )
-        from newton._src.solvers.feather_pgs.solver_feather_pgs import (  # noqa: PLC0415
-            _get_composite_inertia_warp_kernel,
-        )
-
-        compact = name == "composite_inertia_compact"
-        if arm == "existing":
-            kernel = _get_composite_inertia_warp_kernel(str(getattr(device, "arch", "")), warps, compact_terms=compact)
-        else:
-            kernel = tree_passes.composite_inertia_lanes(warps, compact)
-        source = [m.body_mass, o["body_inertia_terms"]] if compact else [o["body_I_s"]]
-        wp.launch_tiled(
-            kernel,
-            dim=[(arts + warps - 1) // warps],
-            inputs=[
-                arts,
-                data.articulations,
-                m.articulation_start,
-                data.joint_end,
-                m.joint_ancestor,
-                m.joint_child,
-                *source,
-            ],
-            outputs=[o["body_I_c"]],
-            block_dim=32 * warps,
-            device=device,
-        )
-    elif name == "crba":
-        # One launch per size group, as the solver groups articulations by coordinate count.
-        for dofs, group_to_art in data.size_groups:
-            _crba_launch(arm, data, dofs, group_to_art)
-    else:
+    if name != "crba":
         raise KeyError(name)
-
-
-def _crba_launch(arm, data, dofs, group_to_art):
-    from newton._src.solvers.feather_pgs import kernels, tree_passes  # noqa: PLC0415
-
-    m, o = data.model, data.outputs
-    first = _articulation_dof_start(m)
-    tail = [o["joint_S_s"], o["body_I_c"], group_to_art, dofs, 0, o["drive_row"], o["row_K"]]
-    topology = [o["mask"], m.joint_ancestor, m.joint_child, m.joint_qd_start, m.joint_dof_dim]
-    if arm == "existing":
-        kernel, inputs = kernels.crba_fill_par_dof, [m.articulation_start, first, *topology, *tail]
-    else:
-        topology = [o["mask"], *_dfs_intervals(m), m.joint_child, m.joint_qd_start, m.joint_dof_dim]
-        kernel, inputs = tree_passes.crba_fill, [m.articulation_start, first, *topology, *tail]
-    wp.launch(kernel, group_to_art.size * dofs, inputs=inputs, outputs=[o["H"][dofs]], device=m.device)
-
-
-def crba_shared(model) -> tuple[np.ndarray, np.ndarray]:
-    """The mass matrices' entries in output order: flags of the off-diagonal entries two coordinates of one
-    joint share, and each entry's transpose."""
-    starts, q_start = model.articulation_start.numpy(), model.joint_qd_start.numpy()
-    counts = np.diff(q_start[starts])
-    shared, mirror, offset = [], [], 0
-    for size in np.unique(counts):
-        cells = np.arange(size * size).reshape(size, size)
-        for art in np.flatnonzero(counts == size):
-            joints = np.arange(starts[art], starts[art + 1])
-            joint = np.repeat(joints, np.diff(q_start[starts[art] : starts[art + 1] + 1]))
-            shared.append(((joint[:, None] == joint[None, :]) & ~np.eye(size, dtype=bool)).reshape(-1))
-            mirror.append(offset + cells.T.reshape(-1))
-            offset += size * size
-    return np.concatenate(shared), np.concatenate(mirror)
-
-
-def _numpy(value):
-    if isinstance(value, dict):
-        return np.concatenate([value[size].numpy().reshape(-1) for size in sorted(value)])
-    return value.numpy().copy()
-
-
-def _dfs_intervals(model):
-    """The joint forest's depth-first intervals (the generated CRBA's ancestor test)."""
-    cached = getattr(model, "_tree_scan_dfs", None)
-    if cached is None:
-        plan = TreePlan.build(model.joint_ancestor.numpy())
-        cached = tuple(
-            wp.array(a.astype(np.int32), dtype=int, device=model.device)
-            for a in (plan.dfs_order, plan.dfs_position, plan.dfs_end)
+    launches = [
+        functools.partial(
+            wp.launch,
+            tree_passes.crba_fill,
+            group_to_art.size * size,
+            inputs=[dynamics, solver.body_I_c, group_to_art, size],
+            outputs=[route.H[size]],
+            block_dim=128,
+            device=device,
         )
-        model._tree_scan_dfs = cached
-    return cached
+        for size, group_to_art in route.size_groups
+    ]
+    return lambda: [launch() for launch in launches]
 
 
-def _articulation_dof_start(model):
-    cached = getattr(model, "_tree_scan_dof_start", None)
-    if cached is None:
-        starts = model.articulation_start.numpy()
-        cached = wp.array(model.joint_qd_start.numpy()[starts[:-1]].astype(np.int32), dtype=int, device=model.device)
-        model._tree_scan_dof_start = cached
-    return cached
+def run_pass(route: GeneralRoute, name: str, **values):
+    """Launch one general-route pass (:func:`pass_launch`)."""
+    pass_launch(route, name, **values)()
 
 
-SERIAL_OUTPUTS = {
-    "fk_kinematics": ("body_q", "body_q_com", "articulation_origin", "joint_S_s", "body_v_s", "body_a_s"),
-    "fk_id": (
-        "body_q",
-        "body_q_com",
-        "joint_S_s",
-        "body_I_s",
-        "body_inertia_terms",
-        "body_v_s",
-        "body_f_s",
-        "body_a_s",
-    ),
-    "tau": ("tau",),
-    "composite_inertia": ("body_I_c",),
-    "composite_inertia_warp": ("body_I_c",),
-    "composite_inertia_compact": ("body_I_c",),
-    "crba": ("H",),
-}
+def run_inputs(route: GeneralRoute, name: str):
+    """Run the passes whose outputs ``name`` reads, with every inertia record."""
+    if name != "fk_kinematics":
+        for previous in GENERAL_PASSES[GENERAL_PASSES.index("fk_id") : GENERAL_PASSES.index(name)]:
+            run_pass(route, previous, write_inertia_records=1)
+
+
+def joint_space_inertias(route: GeneralRoute) -> np.ndarray:
+    """The route's joint-space inertias by articulation, zero-padded to the widest (Newton's mass-matrix layout)."""
+    width = max(size for size, _ in route.size_groups)
+    H = np.zeros((route.model.articulation_count, width, width), dtype=np.float32)
+    for size, group_to_art in route.size_groups:
+        H[group_to_art.numpy(), :size, :size] = route.H[size].numpy()
+    return H
 
 
 GRADIENT_INPUTS = {
     "fk_kinematics": ("joint_q", "joint_qd"),
     "fk_id": ("joint_q", "joint_qd", "body_mass", "body_inertia"),
-    "tau": ("joint_q", "joint_qd", "joint_f", "joint_S_s", "body_f_s", "body_f_ext", "body_q"),
-    "composite_inertia": ("body_I_s",),
+    "tau": ("joint_q", "joint_qd", "joint_f", "joint_S_s", "body_f_s", "body_f", "body_q"),
+    "composite_inertia": ("_body_inertia_terms",),
     "crba": ("joint_S_s", "body_I_c"),
 }
-"""The differentiable passes and the inputs whose gradients are compared (the model's or earlier passes')."""
+"""Each pass's inputs whose gradients the tests check: the state's, the control's, the augmented state's,
+the solver's or the model's arrays."""
+
+GRADIENT_OUTPUTS = {
+    "fk_kinematics": ("body_q", "body_q_com", "articulation_origin", "joint_S_s", "body_v_s", "body_a_s"),
+    "fk_id": ("body_q", "body_q_com", "joint_S_s", "_body_inertia_terms", "body_v_s", "body_f_s", "body_a_s"),
+    "tau": ("body_ft_s", "joint_tau"),
+    "composite_inertia": ("body_I_c",),
+    "crba": (),
+}
+"""Each pass's outputs, a random linear form of which the gradient tests differentiate (CRBA: its matrices)."""
 
 
-def _arrays(value):
-    return [value[size] for size in sorted(value)] if isinstance(value, dict) else [value]
+def owner_array(route: GeneralRoute, key: str) -> wp.array:
+    """The array ``key`` of the route's state, control, augmented state, solver or model, in that order."""
+    for owner in (route.state, route.control, route.aug, route.solver, route.model):
+        value = getattr(owner, key, None)
+        if isinstance(value, wp.array):
+            return value
+    raise KeyError(key)
 
 
-def _input(data: SerialArrays, key: str):
-    return data.outputs[key] if key in data.outputs else getattr(data.model, key)
+def _outputs(route: GeneralRoute, name: str) -> list:
+    if name == "crba":
+        return [route.H[size] for size, _ in route.size_groups]
+    return [owner_array(route, key) for key in GRADIENT_OUTPUTS[name]]
 
 
-def _gradient_setup(model, name, seed):
-    """Fresh arrays with the earlier passes run (existing arm), and fixed random weights of the pass's outputs."""
-    data = serial_arrays(model)
-    for previous in ("fk_id", "tau", "composite_inertia"):
-        if SERIAL_PASSES.index(previous) < SERIAL_PASSES.index(name):
-            serial_launch(previous, "existing", data)
+def _form(model, name: str, seed: int):
+    """A route with ``name``'s inputs in place, and random weights of a linear form of its outputs."""
+    route = general_route(model)
+    run_inputs(route, name)
     rng = np.random.default_rng(seed)
-    weights = [
-        (array, rng.standard_normal(array.numpy().shape).astype(np.float32))
-        for key in SERIAL_OUTPUTS[name]
-        for array in _arrays(data.outputs[key])
-        if array.dtype not in (wp.int32, int)
-    ]
-    return data, weights
+    return route, [(array, rng.standard_normal(array.numpy().shape)) for array in _outputs(route, name)]
 
 
-def serial_gradients(model, name: str, arm: str, seed: int = 5) -> dict:
-    """Input gradients of a fixed random linear form of one pass's outputs, by Warp's tape (``model`` requires
-    gradients)."""
-    data, weights = _gradient_setup(model, name, seed)
+def pass_gradients(model, name: str, seed: int = 5) -> dict:
+    """The gradients of a random linear form of pass ``name``'s outputs with respect to its inputs
+    (:data:`GRADIENT_INPUTS`), by Warp's tape (``model`` requires gradients)."""
+    route, weights = _form(model, name, seed)
+    inputs = {key: owner_array(route, key) for key in GRADIENT_INPUTS[name]}
     tape = wp.Tape()
     with tape:
-        serial_launch(name, arm, data)
-    tape.backward(grads={array: wp.array(w, dtype=array.dtype, device=model.device) for array, w in weights})
-    gradients = {key: _input(data, key).grad.numpy().copy() for key in GRADIENT_INPUTS[name]}
+        run_pass(route, name, write_inertia_records=1)
+    for array in inputs.values():
+        array.grad.zero_()
+    tape.backward(
+        grads={array: wp.array(w.astype(np.float32), dtype=array.dtype, device=model.device) for array, w in weights}
+    )
+    gradients = {key: array.grad.numpy().astype(np.float64) for key, array in inputs.items()}
     tape.zero()
     return gradients
 
 
-def serial_difference(model, name: str, arm: str, key: str, step: float, indices=None, seed: int = 5) -> np.ndarray:
-    """The same gradient with respect to input ``key`` by central differences of the linear form, at the flat
-    ``indices`` of the input (default all; NaN elsewhere)."""
-    data, weights = _gradient_setup(model, name, seed)
-    target = _input(data, key)
+def pass_difference(model, name: str, key: str, step: float, indices, seed: int = 5) -> np.ndarray:
+    """The same gradient with respect to input ``key`` by central differences, at the flat ``indices``
+    (``nan`` elsewhere)."""
+    route, weights = _form(model, name, seed)
+    target = owner_array(route, key)
     base = target.numpy().copy()
 
-    def form(values):
+    def outputs(values):
         target.assign(values.reshape(base.shape))
         for array, _ in weights:
             array.zero_()
-        serial_launch(name, arm, data)
-        return sum(float(np.sum(array.numpy().astype(np.float64) * w)) for array, w in weights)
+        run_pass(route, name, write_inertia_records=1)
+        return [array.numpy().astype(np.float64) for array, _ in weights]
 
     flat = base.reshape(-1)
     gradient = np.full(flat.size, np.nan)
-    for k in range(flat.size) if indices is None else indices:
+    for k in indices:
         values = flat.copy()
         values[k] += step
-        plus = form(values)
+        plus = outputs(values)
         values[k] -= 2.0 * step
-        gradient[k] = (plus - form(values)) / (2.0 * step)
+        minus = outputs(values)
+        gradient[k] = sum(float(np.sum((a - b) * w)) for a, b, (_, w) in zip(plus, minus, weights, strict=True)) / (
+            2.0 * step
+        )
     target.assign(base)
     return gradient.reshape(base.shape)
-
-
-def serial_compare(model):
-    """Run each serial pass's two arms in turn on identical inputs; return ``{pass: {output: (existing, generated)}}``.
-
-    The arms share the outputs of earlier passes as inputs (the existing arm's), so each comparison is one pass's.
-    """
-    results = {}
-    for name in SERIAL_PASSES:
-        if name.startswith("composite_inertia_") and not model.device.is_cuda:
-            continue
-        arms = {}
-        for arm in ("existing", "generated"):
-            data = serial_arrays(model)
-            # Earlier passes, existing arm, as inputs.
-            for previous in ("fk_id", "tau", "composite_inertia"):
-                if SERIAL_PASSES.index(previous) < SERIAL_PASSES.index(name):
-                    serial_launch(previous, "existing", data)
-            serial_launch(name, arm, data)
-            arms[arm] = {key: _numpy(data.outputs[key]) for key in SERIAL_OUTPUTS[name]}
-        results[name] = {key: (arms["existing"][key], arms["generated"][key]) for key in SERIAL_OUTPUTS[name]}
-    return results

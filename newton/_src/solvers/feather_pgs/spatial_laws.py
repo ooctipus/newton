@@ -69,6 +69,17 @@ def transform_compose(parent: wp.transform, child: wp.transform) -> wp.transform
 
 
 @SPATIAL.law
+def joint_frame_pose(parent_anchor: wp.transform, motion: wp.transform, child_anchor: wp.transform) -> wp.transform:
+    """Return a joint's child pose in its parent body's frame: ``parent_anchor * motion * child_anchor^-1``.
+
+    ``parent_anchor`` is the joint frame in the parent body, ``motion`` the joint's transform and
+    ``child_anchor`` the joint frame in the child body; the pose scan composes the result with the parent's
+    pose (:func:`transform_compose`).
+    """
+    return wp.transform_multiply(wp.transform_multiply(parent_anchor, motion), wp.transform_inverse(child_anchor))
+
+
+@SPATIAL.law
 def twist_compose(
     parent_velocity: wp.spatial_vector,
     parent_acceleration: wp.spatial_vector,
@@ -256,17 +267,16 @@ def pack_inertia(mass: float, moment: wp.vec3, rotational: wp.mat33) -> inertia_
     return record
 
 
-INERTIA_RECORDS = DevicePrelude(
-    "inertia_records",
-    """struct InertiaRecord {
-    // An inertia record: mass, first moment, rotational inertia about the origin (row-major), 13 floats.
-    static CUDA_CALLABLE inline wp::spatial_vector apply(const float* r, const wp::spatial_vector& twist) {
-        return Spatial::inertia_apply(r[0], wp::vec3(r[1], r[2], r[3]),
-            wp::mat33(r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12]), twist);
-    }
-};""",
-)
-"""Native reader of an inertia record: ``InertiaRecord::apply(record, twist)``, after the kit's prelude."""
+_INERTIA_RECORDS = """    struct InertiaRecord {
+        // An inertia record: mass, first moment, rotational inertia about the origin (row-major), 13 floats.
+        static CUDA_CALLABLE inline wp::spatial_vector apply(const float* r, const wp::spatial_vector& twist) {
+            return Spatial::inertia_apply(r[0], wp::vec3(r[1], r[2], r[3]),
+                wp::mat33(r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12]), twist);
+        }
+    };"""
+
+INERTIA_RECORDS = DevicePrelude("inertia_records", _INERTIA_RECORDS, cpu=_INERTIA_RECORDS)
+"""Native reader of an inertia record, ``InertiaRecord::apply(record, twist)``, after the kit's prelude."""
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -436,6 +446,24 @@ def joint_motion(
     return wp.spatial_vector()
 
 
+@SPATIAL.law
+def coordinate_force(
+    motion: wp.spatial_vector,
+    wrench: wp.spatial_vector,
+    force: float,
+    stiffness: float,
+    reference: float,
+    damping: float,
+    q: float,
+    qd: float,
+) -> float:
+    """Return one coordinate's generalized force: ``force - S . wrench`` with its passive spring and damper,
+    ``stiffness (reference - q) - damping qd``, added last."""
+    passive = stiffness * (reference - q)
+    passive -= damping * qd
+    return -wp.dot(motion, wrench) + force + passive
+
+
 @wp.func
 def joint_force(
     joint_type: int,
@@ -471,11 +499,20 @@ def joint_force(
         passive = 1
     for i in range(count):
         dof = qd_start + i
-        value = -wp.dot(joint_S_s[dof], wrench) + joint_f[dof]
+        value = float(0.0)
         if passive != 0:
-            spring = spring_stiffness[dof] * (spring_reference[dof] - joint_q[q_start + i])
-            spring -= damping[dof] * joint_qd[dof]
-            value += spring
+            value = coordinate_force(
+                joint_S_s[dof],
+                wrench,
+                joint_f[dof],
+                spring_stiffness[dof],
+                spring_reference[dof],
+                damping[dof],
+                joint_q[q_start + i],
+                joint_qd[dof],
+            )
+        else:
+            value = -wp.dot(joint_S_s[dof], wrench) + joint_f[dof]
         if add_existing != 0:
             value += tau[dof]
         tau[dof] = value
