@@ -600,7 +600,7 @@ def compare(item: Pass, plan: TreePlan, layout: TreeLayout, groups: int, flag: i
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def articulated_model(shapes, worlds: int, device, seed: int = 0):
+def articulated_model(shapes, worlds: int, device, seed: int = 0, requires_grad: bool = False):
     """A model of the named tree shapes per world: free roots, revolute, prismatic and ball joints, random inertia."""
     import newton  # noqa: PLC0415
 
@@ -642,7 +642,7 @@ def articulated_model(shapes, worlds: int, device, seed: int = 0):
         scene.add_articulation(joints)
     builder = newton.ModelBuilder()
     builder.replicate(scene, worlds)
-    model = builder.finalize(device=device)
+    model = builder.finalize(device=device, requires_grad=requires_grad)
     q = model.joint_q.numpy()
     types, q_start = model.joint_type.numpy(), model.joint_q_start.numpy()
     for j in range(model.joint_count):
@@ -689,31 +689,38 @@ def serial_arrays(model) -> SerialArrays:
     counts = np.diff(model.joint_qd_start.numpy()[starts])
     rng = np.random.default_rng(3)
     n = model.body_count
+    # Float arrays follow the model's gradient flag, so a tape can differentiate the passes.
+    zeros = functools.partial(wp.zeros, device=device, requires_grad=model.requires_grad)
+
+    def values(data, dtype):
+        return wp.array(data.astype(np.float32), dtype=dtype, device=device, requires_grad=model.requires_grad)
+
+    dofs = model.joint_dof_count
     outputs = {
-        "body_q": wp.zeros(n, dtype=wp.transform, device=device),
-        "body_q_com": wp.zeros(n, dtype=wp.transform, device=device),
-        "articulation_origin": wp.zeros(model.articulation_count, dtype=wp.vec3, device=device),
-        "joint_S_s": wp.zeros(model.joint_dof_count, dtype=wp.spatial_vector, device=device),
-        "body_I_s": wp.zeros(n, dtype=wp.spatial_matrix, device=device),
-        "body_inertia_terms": wp.zeros((n, 12), dtype=float, device=device),
-        "body_v_s": wp.zeros(n, dtype=wp.spatial_vector, device=device),
-        "body_f_s": wp.zeros(n, dtype=wp.spatial_vector, device=device),
-        "body_a_s": wp.zeros(n, dtype=wp.spatial_vector, device=device),
+        "body_q": zeros(n, dtype=wp.transform),
+        "body_q_com": zeros(n, dtype=wp.transform),
+        "articulation_origin": zeros(model.articulation_count, dtype=wp.vec3),
+        "joint_S_s": zeros(dofs, dtype=wp.spatial_vector),
+        "body_I_s": zeros(n, dtype=wp.spatial_matrix),
+        "body_inertia_terms": zeros((n, 12), dtype=float),
+        "body_v_s": zeros(n, dtype=wp.spatial_vector),
+        "body_f_s": zeros(n, dtype=wp.spatial_vector),
+        "body_a_s": zeros(n, dtype=wp.spatial_vector),
         "fk_id_cache_valid": wp.zeros(model.articulation_count, dtype=int, device=device),
-        "body_ft_s": wp.zeros(n, dtype=wp.spatial_vector, device=device),
-        "tau": wp.zeros(model.joint_dof_count, dtype=float, device=device),
-        "body_I_c": wp.zeros(n, dtype=wp.spatial_matrix, device=device),
-        "body_f_ext": wp.array(rng.standard_normal((n, 6)).astype(np.float32), dtype=wp.spatial_vector, device=device),
-        "joint_f": wp.array(rng.standard_normal(model.joint_dof_count).astype(np.float32), dtype=float, device=device),
-        "spring": wp.array(rng.uniform(0, 2, model.joint_dof_count).astype(np.float32), dtype=float, device=device),
-        "damping": wp.array(rng.uniform(0, 1, model.joint_dof_count).astype(np.float32), dtype=float, device=device),
+        "body_ft_s": zeros(n, dtype=wp.spatial_vector),
+        "tau": zeros(dofs, dtype=float),
+        "body_I_c": zeros(n, dtype=wp.spatial_matrix),
+        "body_f_ext": values(rng.standard_normal((n, 6)), wp.spatial_vector),
+        "joint_f": values(rng.standard_normal(dofs), float),
+        "spring": values(rng.uniform(0, 2, dofs), float),
+        "damping": values(rng.uniform(0, 1, dofs), float),
         "mask": wp.ones(model.articulation_count, dtype=int, device=device),
         "H": {
-            int(size): wp.zeros((int(np.sum(counts == size)), int(size), int(size)), dtype=float, device=device)
+            int(size): zeros((int(np.sum(counts == size)), int(size), int(size)), dtype=float)
             for size in np.unique(counts)
         },
-        "drive_row": wp.full(model.joint_dof_count, -1, dtype=int, device=device),
-        "row_K": wp.zeros(1, dtype=float, device=device),
+        "drive_row": wp.full(dofs, -1, dtype=int, device=device),
+        "row_K": zeros(1, dtype=float),
     }
     return SerialArrays(
         model,
@@ -906,8 +913,11 @@ def _crba_launch(arm, data, dofs, group_to_art):
     first = _articulation_dof_start(m)
     tail = [o["joint_S_s"], o["body_I_c"], group_to_art, dofs, 0, o["drive_row"], o["row_K"]]
     topology = [o["mask"], m.joint_ancestor, m.joint_child, m.joint_qd_start, m.joint_dof_dim]
-    kernel = kernels.crba_fill_par_dof if arm == "existing" else tree_passes.crba_fill
-    inputs = [m.articulation_start, first, *topology, *tail]
+    if arm == "existing":
+        kernel, inputs = kernels.crba_fill_par_dof, [m.articulation_start, first, *topology, *tail]
+    else:
+        topology = [o["mask"], *_dfs_intervals(m), m.joint_child, m.joint_qd_start, m.joint_dof_dim]
+        kernel, inputs = tree_passes.crba_fill, [m.articulation_start, first, *topology, *tail]
     wp.launch(kernel, group_to_art.size * dofs, inputs=inputs, outputs=[o["H"][dofs]], device=m.device)
 
 
@@ -932,6 +942,19 @@ def _numpy(value):
     if isinstance(value, dict):
         return np.concatenate([value[size].numpy().reshape(-1) for size in sorted(value)])
     return value.numpy().copy()
+
+
+def _dfs_intervals(model):
+    """The joint forest's depth-first intervals (the generated CRBA's ancestor test)."""
+    cached = getattr(model, "_tree_scan_dfs", None)
+    if cached is None:
+        plan = TreePlan.build(model.joint_ancestor.numpy())
+        cached = tuple(
+            wp.array(a.astype(np.int32), dtype=int, device=model.device)
+            for a in (plan.dfs_order, plan.dfs_position, plan.dfs_end)
+        )
+        model._tree_scan_dfs = cached
+    return cached
 
 
 def _articulation_dof_start(model):
@@ -961,6 +984,79 @@ SERIAL_OUTPUTS = {
     "composite_inertia_compact": ("body_I_c",),
     "crba": ("H",),
 }
+
+
+GRADIENT_INPUTS = {
+    "fk_kinematics": ("joint_q", "joint_qd"),
+    "fk_id": ("joint_q", "joint_qd", "body_mass", "body_inertia"),
+    "tau": ("joint_q", "joint_qd", "joint_f", "joint_S_s", "body_f_s", "body_f_ext", "body_q"),
+    "composite_inertia": ("body_I_s",),
+    "crba": ("joint_S_s", "body_I_c"),
+}
+"""The differentiable passes and the inputs whose gradients are compared (the model's or earlier passes')."""
+
+
+def _arrays(value):
+    return [value[size] for size in sorted(value)] if isinstance(value, dict) else [value]
+
+
+def _input(data: SerialArrays, key: str):
+    return data.outputs[key] if key in data.outputs else getattr(data.model, key)
+
+
+def _gradient_setup(model, name, seed):
+    """Fresh arrays with the earlier passes run (existing arm), and fixed random weights of the pass's outputs."""
+    data = serial_arrays(model)
+    for previous in ("fk_id", "tau", "composite_inertia"):
+        if SERIAL_PASSES.index(previous) < SERIAL_PASSES.index(name):
+            serial_launch(previous, "existing", data)
+    rng = np.random.default_rng(seed)
+    weights = [
+        (array, rng.standard_normal(array.numpy().shape).astype(np.float32))
+        for key in SERIAL_OUTPUTS[name]
+        for array in _arrays(data.outputs[key])
+        if array.dtype not in (wp.int32, int)
+    ]
+    return data, weights
+
+
+def serial_gradients(model, name: str, arm: str, seed: int = 5) -> dict:
+    """Input gradients of a fixed random linear form of one pass's outputs, by Warp's tape (``model`` requires
+    gradients)."""
+    data, weights = _gradient_setup(model, name, seed)
+    tape = wp.Tape()
+    with tape:
+        serial_launch(name, arm, data)
+    tape.backward(grads={array: wp.array(w, dtype=array.dtype, device=model.device) for array, w in weights})
+    gradients = {key: _input(data, key).grad.numpy().copy() for key in GRADIENT_INPUTS[name]}
+    tape.zero()
+    return gradients
+
+
+def serial_difference(model, name: str, arm: str, key: str, step: float, indices=None, seed: int = 5) -> np.ndarray:
+    """The same gradient with respect to input ``key`` by central differences of the linear form, at the flat
+    ``indices`` of the input (default all; NaN elsewhere)."""
+    data, weights = _gradient_setup(model, name, seed)
+    target = _input(data, key)
+    base = target.numpy().copy()
+
+    def form(values):
+        target.assign(values.reshape(base.shape))
+        for array, _ in weights:
+            array.zero_()
+        serial_launch(name, arm, data)
+        return sum(float(np.sum(array.numpy().astype(np.float64) * w)) for array, w in weights)
+
+    flat = base.reshape(-1)
+    gradient = np.full(flat.size, np.nan)
+    for k in range(flat.size) if indices is None else indices:
+        values = flat.copy()
+        values[k] += step
+        plus = form(values)
+        values[k] -= 2.0 * step
+        gradient[k] = (plus - form(values)) / (2.0 * step)
+    target.assign(base)
+    return gradient.reshape(base.shape)
 
 
 def serial_compare(model):

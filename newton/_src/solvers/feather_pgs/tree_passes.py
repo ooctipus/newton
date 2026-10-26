@@ -3,8 +3,10 @@
 
 """The general route's dynamics passes as tree-scan configurations: FK, ID, tau, composite inertia and CRBA.
 
-One thread per articulation, in Warp (differentiable), as the serial route
-runs today. Each pass is the serial schedule of :func:`.tree_scan.serial_scan`
+One thread per articulation, in Warp, as the serial route runs today, and
+differentiable: Warp's tape records them when a model requires gradients (the
+CUDA composite form, native, is forward only). Each pass is the serial
+schedule of :func:`.tree_scan.serial_scan` (or :func:`.tree_scan.serial_path`)
 over the articulation's tree joints with the pass's per-node laws as hooks:
 the node's own value and the consumer of its result, in the same visit, so
 the scan reads and writes the tree once. Values live in the body-indexed
@@ -23,7 +25,8 @@ bound into one struct per pass.
 * :data:`composite_inertia`: ADD up of the 36 inertia channels, own values
   first; :func:`composite_inertia_lanes` the solver's warp-per-articulation
   form, lanes over the channels.
-* :data:`crba_fill`: a PATH from each column's joint to the root.
+* :data:`crba_fill`: a PATH (:func:`.tree_scan.serial_path`) from each column's
+  joint to the root.
 
 The per-node laws are the solver's own (``kernels``); only the traversal is the
 scan's.
@@ -45,7 +48,19 @@ from .kernels import (
 )
 from .spatial_laws import joint_transform
 from .tree_plan import TreePlan
-from .tree_scan import TRANSFORM, TWIST, Direction, Group, PlanAccess, Schedule, Storage, add, serial_scan, tree_scan
+from .tree_scan import (
+    TRANSFORM,
+    TWIST,
+    Direction,
+    Group,
+    PlanAccess,
+    Schedule,
+    Storage,
+    add,
+    serial_path,
+    serial_scan,
+    tree_scan,
+)
 
 # The serial scans of a joint range need no tree literal: a parent-first plan stands for every range.
 _SERIAL_PLAN = TreePlan.build([-1])
@@ -242,7 +257,7 @@ def _bind_twists(
     return d
 
 
-@wp.kernel(enable_backward=False)
+@wp.kernel
 def fk_kinematics(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
@@ -305,7 +320,7 @@ def fk_kinematics(
     fk_id_cache_valid[index] = 1
 
 
-@wp.kernel(enable_backward=False)
+@wp.kernel
 def fk_id(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
@@ -457,7 +472,7 @@ def _joint_force(node: int, wrench: wp.spatial_vector, d: _Forces):
 _JOINT_FORCES = serial_scan(_SUM, Direction.UP, _net_wrench, _joint_force)
 
 
-@wp.kernel(enable_backward=False)
+@wp.kernel
 def inverse_dynamics_tau(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
@@ -527,7 +542,7 @@ def _body_inertia(node: int, d: _Inertias) -> wp.spatial_matrix:
 _COMPOSITE = serial_scan(_SUM, Direction.UP, _body_inertia, own_first=True)
 
 
-@wp.kernel(enable_backward=False)
+@wp.kernel
 def composite_inertia(
     articulation_start: wp.array[int],
     articulation_joint_end: wp.array[int],
@@ -548,12 +563,71 @@ def composite_inertia(
     _COMPOSITE(articulation_start[index], articulation_joint_end[index], joint_parent, joint_child, body_I_c, d)
 
 
-@wp.kernel(enable_backward=False)
+@wp.struct
+class _Column:
+    group: int
+    col: int
+    first_dof: int
+    column_dof: int
+    fused_augmented_drive: int
+    joint_qd_start: wp.array[int]
+    joint_dof_dim: wp.array2d[int]
+    joint_S_s: wp.array[wp.spatial_vector]
+    drive_row_by_dof: wp.array[int]
+    row_K: wp.array[float]
+    H_group: wp.array3d[float]
+
+
+@wp.func
+def _mass_entries(ancestor: int, pivot: int, force: wp.spatial_vector, d: _Column):
+    """Column ``d.col``'s entries in the rows of ``ancestor``'s coordinates, ``S_row . force``, and their mirrors.
+
+    Each entry is written once: in the column's own joint only the rows up to the column, so of two coordinates
+    ``i < j`` of one joint, column ``j`` writes the shared entries with ``S_i . (I S_j)``.
+    """
+    q_start = d.joint_qd_start[ancestor]
+    count = d.joint_dof_dim[ancestor, 0] + d.joint_dof_dim[ancestor, 1]
+    local = q_start - d.first_dof
+    if ancestor == pivot:
+        count = d.col - local + 1
+    for k in range(count):
+        row = local + k
+        value = wp.dot(d.joint_S_s[q_start + k], force)
+        if d.fused_augmented_drive != 0 and row == d.col:
+            drive_row = d.drive_row_by_dof[d.column_dof]
+            if drive_row >= 0:
+                K = d.row_K[drive_row]
+                if K > 0.0:
+                    value += K
+        d.H_group[d.group, row, d.col] = value
+        d.H_group[d.group, d.col, row] = value
+
+
+_MASS_COLUMN = serial_path(_mass_entries)
+
+
+@wp.func
+def _coordinate_joint(coordinate: int, first: int, last: int, joint_qd_start: wp.array[int]) -> int:
+    """The joint among ``first`` to ``last - 1`` whose coordinate range holds ``coordinate``, or ``-1``.
+
+    A function without an early exit: Warp's tape replays a function's loop, but not a loop in a kernel's own
+    body or one left by ``break``, whose result the gradient pass would not see.
+    """
+    joint = int(-1)
+    for j in range(first, last):
+        if coordinate >= joint_qd_start[j] and coordinate < joint_qd_start[j + 1]:
+            joint = j
+    return joint
+
+
+@wp.kernel
 def crba_fill(
     articulation_start: wp.array[int],
     articulation_dof_start: wp.array[int],
     mass_update_mask: wp.array[int],
-    joint_ancestor: wp.array[int],
+    dfs_order: wp.array[int],
+    dfs_position: wp.array[int],
+    dfs_end: wp.array[int],
     joint_child: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
@@ -569,13 +643,15 @@ def crba_fill(
 ):
     """``kernels.crba_fill_par_dof``: a PATH from each column's joint, one thread per (articulation, column).
 
-    Each entry is written once. Two coordinates ``i < j`` of one joint share the entries ``(i, j)`` and
-    ``(j, i)``; column ``j`` writes them with ``S_i . (I S_j)``, the value a serial run leaves, where
-    the existing kernel lets both columns write both and the schedule decide.
-
-    The column's joint is found by searching the articulation's coordinate ranges: reading it from the
-    plan's coordinate table instead measured 3-6% faster on trees of 13-30 joints but 27% slower on a
-    64-joint chain (RTX PRO 6000), so the search stays.
+    Differentiable, where the existing kernel's tape gradient is zero: the gradient pass does not see the
+    joint its in-kernel search finds (a loop in the kernel's body, left by ``break``) and replays its pointer
+    walk with the last pointer. Here a function searches the articulation's coordinate ranges for the
+    column's joint (:func:`_coordinate_joint`), and the walk tests the joint forest's depth-first intervals
+    (``dfs_order``, ``dfs_position``, ``dfs_end`` of :class:`.tree_plan.TreePlan`) in place of following
+    ``joint_ancestor``: independent loads where the pointer walk waits on each, measured 0.68-0.98 of the
+    existing kernel's time (RTX PRO 6000; the full search beat both the early exit and the plan's coordinate
+    table). Each entry is written once (:func:`_mass_entries`), where the existing kernel lets both columns of
+    a multi-coordinate joint write their shared entries and the schedule decide.
     """
     tid = wp.tid()
     group = tid // n_dofs
@@ -586,38 +662,23 @@ def crba_fill(
     first_dof = articulation_dof_start[art]
     column_dof = first_dof + col
     joint_start = articulation_start[art]
-    pivot = int(-1)
-    for j in range(joint_start, articulation_start[art + 1]):
-        if column_dof >= joint_qd_start[j] and column_dof < joint_qd_start[j + 1]:
-            pivot = j
-            break
+    pivot = _coordinate_joint(column_dof, joint_start, articulation_start[art + 1], joint_qd_start)
     if pivot == -1:
         return
-    S_col = joint_S_s[column_dof]
-    I_comp = body_I_c[joint_child[pivot]]
-    force = I_comp * S_col
-    ancestor = pivot
-    while ancestor != -1:
-        if ancestor < joint_start:
-            break
-        q_start = joint_qd_start[ancestor]
-        q_dim = joint_dof_dim[ancestor]
-        count = q_dim[0] + q_dim[1]
-        local = q_start - first_dof
-        if ancestor == pivot:
-            count = col - local + 1
-        for k in range(count):
-            row = local + k
-            value = wp.dot(joint_S_s[q_start + k], force)
-            if fused_augmented_drive != 0 and row == col:
-                drive_row = drive_row_by_dof[column_dof]
-                if drive_row >= 0:
-                    K = row_K[drive_row]
-                    if K > 0.0:
-                        value += K
-            H_group[group, row, col] = value
-            H_group[group, col, row] = value
-        ancestor = joint_ancestor[ancestor]
+    force = body_I_c[joint_child[pivot]] * joint_S_s[column_dof]
+    d = _Column()
+    d.group = group
+    d.col = col
+    d.first_dof = first_dof
+    d.column_dof = column_dof
+    d.fused_augmented_drive = fused_augmented_drive
+    d.joint_qd_start = joint_qd_start
+    d.joint_dof_dim = joint_dof_dim
+    d.joint_S_s = joint_S_s
+    d.drive_row_by_dof = drive_row_by_dof
+    d.row_K = row_K
+    d.H_group = H_group
+    _MASS_COLUMN(joint_start, pivot, force, dfs_order, dfs_position, dfs_end, d)
 
 
 # ---------------------------------------------------------------------------------------------------------------------

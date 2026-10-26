@@ -16,8 +16,9 @@
   bitwise with the existing CPU twins that already walk levels, within a few
   units of the terms of those that emulate pointer jumping or chains.
 * :class:`TestScheduleRule`: the schedule follows from the plan's data.
+* :class:`TestPath`: a PATH visits the root path, natively and in Warp.
 * :class:`TestGeneralRoute`: the general route's passes as scan
-  configurations against the existing serial kernels.
+  configurations against the existing serial kernels, and their gradients.
 """
 
 import unittest
@@ -424,6 +425,74 @@ class TestScheduleRule(unittest.TestCase):
 # ---------------------------------------------------------------------------------------------------------------------
 
 
+@wp.struct
+class _PathVisits:
+    rank: wp.array[int]
+    visits: wp.array[int]
+    count: int
+
+
+@wp.func
+def _record_visit(ancestor: int, node: int, value: int, d: _PathVisits):
+    d.visits[node * d.count + ancestor] = wp.atomic_add(d.rank, node, value) + value
+
+
+_RECORD_PATH = ts.serial_path(_record_visit)
+
+
+@wp.kernel
+def _warp_path(root: int, order: wp.array[int], position: wp.array[int], end: wp.array[int], d: _PathVisits):
+    node = wp.tid()
+    _RECORD_PATH(root, node, 1, order, position, end, d)
+
+
+def check_path(test, device):
+    """A PATH visits a node's ancestors and the node, root first: the native walk (parent-first plans and
+    others) and the Warp walk, against the parent pointers."""
+    for shape in ("random24", "binary31", "star32", "chain32", "humanoid44", "random60"):
+        parent = np.asarray(SHAPES[shape])
+        # The same tree with its nodes renumbered so that children precede parents.
+        reverse = np.where(parent[::-1] >= 0, parent.size - 1 - parent[::-1], -1)
+        for label, parents in (("parent-first", parent), ("children first", reverse)):
+            plan = TreePlan.build(parents)
+            n = plan.count
+            expected = np.zeros((n, n), np.int32)
+            for node in range(n):
+                path, a = [], node
+                while a >= 0:
+                    path.append(a)
+                    a = parents[a]
+                expected[node, path[::-1]] = np.arange(1, len(path) + 1)
+            scan = ts.tree_scan(
+                plan,
+                ts.add(ts.Group("v", 1)),
+                ts.Direction.PATH,
+                ts.Schedule.SERIAL,
+                visit="        visits.data[node*count+ancestor]=++rank;",
+            )
+
+            @wp.func_native("    int rank=0;\n" + ts.native_scan(scan, 1))
+            def native_path(plan: ts.ScanPlan, node: int, count: int, visits: wp.array[int]): ...
+
+            def run(plan: ts.ScanPlan, count: int, visits: wp.array[int]):
+                native_path(plan, wp.tid(), count, visits)
+
+            visits = wp.zeros(n * n, dtype=int, device=device)
+            kernel = wp.kernel(enable_backward=False, module="unique")(run)
+            wp.launch(kernel, n, inputs=[ts.device_plan(plan, device), n, visits], device=device)
+            np.testing.assert_array_equal(visits.numpy().reshape(n, n), expected, err_msg=f"native {shape} {label}")
+            d = _PathVisits()
+            d.rank = wp.zeros(n, dtype=int, device=device)
+            d.visits = wp.zeros(n * n, dtype=int, device=device)
+            d.count = n
+            arrays = [
+                wp.array(a.astype(np.int32), dtype=int, device=device)
+                for a in (plan.dfs_order, plan.dfs_position, plan.dfs_end)
+            ]
+            wp.launch(_warp_path, n, inputs=[int(plan.roots[0]), *arrays, d], device=device)
+            np.testing.assert_array_equal(d.visits.numpy().reshape(n, n), expected, err_msg=f"Warp {shape} {label}")
+
+
 def check_general_route(test, device):
     """The serial kernels and their scan configurations, one serial scan per pass with fused per-node laws.
 
@@ -472,6 +541,78 @@ def check_general_route(test, device):
             test.assertLess(gap, bound, f"{key} {output}")
 
 
+def _unit_quaternion_tangent(model, gradient):
+    """``gradient`` with respect to ``joint_q`` less its components normal to each ball and free joint's unit
+    quaternion: the directions a joint can move in."""
+    import newton  # noqa: PLC0415
+
+    q, q_start = model.joint_q.numpy(), model.joint_q_start.numpy()
+    tangent = gradient.astype(np.float64).copy()
+    for joint, kind in enumerate(model.joint_type.numpy()):
+        if kind not in (int(newton.JointType.BALL), int(newton.JointType.FREE)):
+            continue
+        first = q_start[joint] + (3 if kind == int(newton.JointType.FREE) else 0)
+        unit = q[first : first + 4] / np.linalg.norm(q[first : first + 4])
+        tangent[first : first + 4] -= np.dot(tangent[first : first + 4], unit) * unit
+    return tangent
+
+
+def check_general_route_gradients(test, device):
+    """The general route is also the gradient route: Warp's tape through each generated pass.
+
+    Tau and composite inertia give the existing kernels' gradients (bitwise, but tau's wrench and pose inputs
+    within rounding). FK and ID match central differences; the arms agree on joint velocities, masses and
+    inertias within rounding, and on joint positions along the unit quaternions: off the unit sphere the
+    rotation formula is not multiplicative, so the association of the poses' compositions shows there. CRBA
+    matches central differences, where the existing kernel's gradient is zero (the tape does not see the joint
+    its in-kernel search finds).
+    """
+    from newton.tests.feather_pgs_tree_scan_fixture import (  # noqa: PLC0415
+        GRADIENT_INPUTS,
+        articulated_model,
+        serial_difference,
+        serial_gradients,
+    )
+
+    model = articulated_model(("anymal13", "humanoid13", "pendulum2"), 1, device, requires_grad=True)
+    rng = np.random.default_rng(7)
+
+    def relative(a, b):
+        return float(np.abs(a.astype(np.float64) - b).max() / max(np.abs(b).max(), 1e-30))
+
+    def against_differences(name, key, step, bound):
+        gradient = serial_gradients(model, name, "generated")[key].reshape(-1)
+        picks = rng.choice(gradient.size, min(gradient.size, 24), replace=False)
+        difference = serial_difference(model, name, "generated", key, step, indices=picks).reshape(-1)[picks]
+        test.assertGreater(np.abs(difference).max(), 0.0, f"{name} {key}")
+        test.assertLess(relative(gradient[picks], difference), bound, f"{name} {key} against differences")
+
+    for name in GRADIENT_INPUTS:
+        existing = serial_gradients(model, name, "existing")
+        generated = serial_gradients(model, name, "generated")
+        for key in GRADIENT_INPUTS[name]:
+            a, b = existing[key], generated[key]
+            if name == "composite_inertia" or (name == "tau" and key not in ("body_f_s", "body_f_ext", "body_q")):
+                np.testing.assert_array_equal(a.view(np.uint32), b.view(np.uint32), err_msg=f"{name} {key}")
+            elif name == "crba":
+                continue
+            elif key == "joint_q" and name != "tau":
+                test.assertLess(
+                    relative(_unit_quaternion_tangent(model, b), _unit_quaternion_tangent(model, a)), 1e-5, name
+                )
+            else:
+                test.assertLess(relative(b, a), 1e-5, f"{name} {key}")
+    for name in ("fk_kinematics", "fk_id"):
+        against_differences(name, "joint_qd", 1e-2, 1e-3)
+        against_differences(name, "joint_q", 1e-3, 2e-3)
+    for key in ("joint_S_s", "body_I_c"):
+        against_differences("crba", key, 1e-2, 1e-3)
+
+
+class TestPath(unittest.TestCase):
+    pass
+
+
 class TestGeneralRoute(unittest.TestCase):
     pass
 
@@ -480,9 +621,17 @@ def _general_route(test, device):
     check_general_route(test, device)
 
 
+def _general_route_gradients(test, device):
+    check_general_route_gradients(test, device)
+
+
 from newton.tests.unittest_utils import add_function_test, get_test_devices  # noqa: E402
 
+add_function_test(TestPath, "test_path", check_path, devices=get_test_devices())
 add_function_test(TestGeneralRoute, "test_general_route", _general_route, devices=get_test_devices())
+add_function_test(
+    TestGeneralRoute, "test_general_route_gradients", _general_route_gradients, devices=get_test_devices()
+)
 
 
 if __name__ == "__main__":
