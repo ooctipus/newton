@@ -29,12 +29,15 @@ def _launch_workers(capacity, enabled):
         and isinstance(node.args[0], ast.Name)
         and node.args[0].id == "populate_sparse_diagonal_contact_response"
     )
-    dimension = next(item.value for item in call.keywords if item.arg == "dim")
+    # A launch through the contact pool takes its dimension as the second positional argument.
+    dimension = next((item.value for item in call.keywords if item.arg == "dim"), None) or call.args[1]
     arguments = next(item.value for item in call.keywords if item.arg == "inputs")
     if ast.dump(dimension) != ast.dump(arguments.elts[1]):
         raise AssertionError("launch dimension and device stride must agree")
     values = {
         "contacts": SimpleNamespace(rigid_contact_max=capacity),
+        # The rows contact launches are sized for (ContactPool.launch_rows), eagerly the ready rows.
+        "rows": capacity,
         "contact_jacobian_workers": min(capacity, implementation._CONTACT_JACOBIAN_WORKER_CAP),
         "contact_build_threads": min(
             capacity, implementation._CONTACT_BUILD_THREAD_CAP * implementation._CONTACT_THREADS_X
@@ -198,10 +201,10 @@ class TestSparseResponseOwner(unittest.TestCase):
                 np.testing.assert_array_equal(values["sparse_row_dof"].numpy(), expected[0])
                 np.testing.assert_allclose(values["sparse_row_jy"].numpy(), expected[1], rtol=2e-6, atol=2e-7)
 
-    def test_cpu_empty_and_overflow_prefix(self):
-        """Retain empty and bounded-overflow behavior without reading beyond storage."""
+    def test_cpu_empty_and_partial_prefix(self):
+        """Respond to empty, partial and full prefixes; a collision pass clamps its count to the rows."""
         values = _fixture("cpu", capacity=17)
-        for raw_count in (0, 18, 17):
+        for raw_count in (0, 9, 17):
             values["contact_count"].assign(np.array([raw_count], dtype=np.int32))
             values["sparse_row_dof"].fill_(-777)
             values["sparse_row_jy"].fill_(np.nan)
@@ -237,7 +240,7 @@ class TestSparseResponseOwner(unittest.TestCase):
             _launch(values, workers, device)
             with wp.ScopedCapture(device=device) as capture:
                 _launch(values, workers, device)
-            for raw_count in (capacity, 0, 65537, capacity + 1, capacity):
+            for raw_count in (capacity, 0, 65537, capacity - 1, capacity):
                 values["contact_count"].assign(np.array([raw_count], dtype=np.int32))
                 expected = _expected(values, raw_count)
                 for graph in (False, True, True):

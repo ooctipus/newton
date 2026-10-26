@@ -263,6 +263,9 @@ def simulate(
         pipeline_options["deterministic"] = True
     pipeline = newton.CollisionPipeline(model, **pipeline_options)
     contacts = pipeline.contacts()
+    # The history holds the rows the scene's contacts can fill (its budget), not every row the
+    # contact buffers' first pages map, which can be a hundred times more.
+    recorded = min(contacts.rigid_contact_max, pipeline.rigid_contact_max)
     if scene.contact_stiffness > 0.0:
         capacity = contacts.rigid_contact_normal.shape[0]
         for name in ("rigid_contact_stiffness", "rigid_contact_damping", "rigid_contact_friction"):
@@ -277,7 +280,7 @@ def simulate(
         initial = {name: getattr(state, name).numpy().copy() for name in STATE_FIELDS}
 
         def step_arrays():
-            arrays = {name: getattr(contacts, name) for name in CONTACT_FIELDS}
+            arrays = {name: getattr(contacts, name)[:recorded] for name in CONTACT_FIELDS}
             arrays.update({name: getattr(state, name) for name in STATE_FIELDS})
             arrays["contact_count"] = contacts.rigid_contact_count
             arrays["body_qd_solve"] = scratch.body_qd
@@ -295,7 +298,7 @@ def simulate(
                 contacts.rigid_contact_stiffness.fill_(scene.contact_stiffness)
                 contacts.rigid_contact_damping.fill_(scene.contact_damping)
                 contacts.rigid_contact_friction.fill_(1.0)
-            pre = {name: getattr(contacts, name) for name in CONTACT_FIELDS[:-1]}
+            pre = {name: getattr(contacts, name)[:recorded] for name in CONTACT_FIELDS[:-1]}
             pre["contact_count"] = contacts.rigid_contact_count
             if model.body_count:
                 pre["body_f"] = state.body_f
@@ -310,7 +313,7 @@ def simulate(
             recorder.record(
                 step,
                 {
-                    "rigid_contact_force": contacts.rigid_contact_force,
+                    "rigid_contact_force": contacts.rigid_contact_force[:recorded],
                     "body_qd_solve": scratch.body_qd,
                     **{name: getattr(state, name) for name in STATE_FIELDS},
                 },

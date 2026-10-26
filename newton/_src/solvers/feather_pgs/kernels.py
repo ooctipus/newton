@@ -4610,13 +4610,12 @@ def allocate_world_contact_slots(
     mf_dropped_contact_rows: wp.array[int],
     dense_first_rejected_slot: wp.array[int],
     mf_first_rejected_slot: wp.array[int],
-    capacity_status: wp.array[int],
 ):
     """Allocate active contacts with work proportional to the materialized prefix.
 
-    The narrow phase increments :paramref:`contact_count` before checking its
-    output capacity. An overflowed count therefore does not describe a fully
-    materialized prefix; clear the routing arrays and reject that frame.
+    A collision pass clamps :paramref:`contact_count` to the rows its writers
+    filled, every one of them, and flags an overflow in its own capacity
+    status, so the count always describes a materialized prefix.
 
     Slot counters only grow. A contact whose reservation does not fit records its
     slot in the family's ``*_first_rejected_slot`` (per world, preset to a large
@@ -4627,16 +4626,8 @@ def allocate_world_contact_slots(
     which the friction patch links then chained into.
     """
     thread = wp.tid()
+    # A collision pass clamps the count to the rows it wrote, all of them, and flags the overflow itself.
     total_contacts = contact_count[0]
-    capacity = contact_shape0.shape[0]
-    if total_contacts > capacity:
-        if thread == 0:
-            wp.atomic_max(capacity_status, 2, 1)
-        for c in range(thread, capacity, total_num_threads):
-            contact_slot[c] = -1
-            contact_path[c] = -1
-            contact_slots_needed[c] = 0
-        return
 
     for c in range(thread, total_contacts, total_num_threads):
         if resolved_worlds.shape[0] > 0:
@@ -4751,13 +4742,12 @@ def allocate_world_contact_slots_patch_resolved(
     mf_dropped_contact_rows: wp.array[int],
     dense_first_rejected_slot: wp.array[int],
     mf_first_rejected_slot: wp.array[int],
-    capacity_status: wp.array[int],
 ):
     """Allocate active contacts with work proportional to the materialized prefix.
 
-    The narrow phase increments :paramref:`contact_count` before checking its
-    output capacity. An overflowed count therefore does not describe a fully
-    materialized prefix; clear the routing arrays and reject that frame.
+    A collision pass clamps :paramref:`contact_count` to the rows its writers
+    filled, every one of them, and flags an overflow in its own capacity
+    status, so the count always describes a materialized prefix.
 
     Slot counters only grow. A contact whose reservation does not fit records its
     slot in the family's ``*_first_rejected_slot`` (per world, preset to a large
@@ -4768,16 +4758,8 @@ def allocate_world_contact_slots_patch_resolved(
     which the friction patch links then chained into.
     """
     thread = wp.tid()
+    # A collision pass clamps the count to the rows it wrote, all of them, and flags the overflow itself.
     total_contacts = contact_count[0]
-    capacity = contact_shape0.shape[0]
-    if total_contacts > capacity:
-        if thread == 0:
-            wp.atomic_max(capacity_status, 2, 1)
-        for c in range(thread, capacity, total_num_threads):
-            contact_slot[c] = -1
-            contact_path[c] = -1
-            contact_slots_needed[c] = 0
-        return
 
     for c in range(thread, total_contacts, total_num_threads):
         if resolved_worlds.shape[0] > 0:
@@ -4987,8 +4969,6 @@ def record_world_contact_runs(
     thread = wp.tid()
     lane = thread % lanes
     total_contacts = contact_count[0]
-    if total_contacts > contact_shape0.shape[0]:
-        return  # The allocators routed no contact of an overflowed frame.
     blocks = run_rows.shape[1]
     for base in range(thread - lane, total_contacts, total_num_threads):
         c = base + lane
@@ -5224,7 +5204,7 @@ def prepare_world_contact_rows(
     world_row_restitution: wp.array2d[float],
 ):
     """Build current metadata inside each allocator-recorded contact row reservation."""
-    total_contacts = wp.min(contact_count[0], contact_point0.shape[0])
+    total_contacts = contact_count[0]
     for c in range(wp.tid(), total_contacts, total_num_threads):
         if contact_path[c] != 0:
             continue
@@ -5388,7 +5368,7 @@ def populate_world_J_for_compact_size(
 ):
     """Project one dense contact row/DOF per lane for compact articulations."""
     worker, lane = wp.tid()
-    total_contacts = wp.min(contact_count[0], contact_point0.shape[0])
+    total_contacts = contact_count[0]
     row = lane // target_size
     local_dof = lane - row * target_size
     if row >= 3 or local_dof >= target_size:
@@ -5527,7 +5507,7 @@ def populate_sparse_diagonal_contact_response(
     contact Jacobian builders do, so the sparse coordinates see the same row geometry.
     """
     worker = wp.tid()
-    total_contacts = wp.min(contact_count[0], contact_point0.shape[0])
+    total_contacts = contact_count[0]
     for c in range(worker, total_contacts, total_num_workers):
         slot = contact_slot[c]
         if contact_path[c] != 0 or slot < 0:
@@ -6228,7 +6208,7 @@ def populate_world_J_for_size(
     world_row_restitution: wp.array2d[float],
 ):
     """Populate active dense contacts with a capacity-independent launch."""
-    total_contacts = wp.min(contact_count[0], contact_point0.shape[0])
+    total_contacts = contact_count[0]
     for c in range(wp.tid(), total_contacts, total_num_threads):
         _populate_world_J_for_size_contact(
             c,
@@ -7182,7 +7162,7 @@ def build_mf_contact_rows(
     mf_row_restitution: wp.array2d[float],
 ):
     """Build active matrix-free contacts with a capacity-independent launch."""
-    total_contacts = wp.min(contact_count[0], contact_point0.shape[0])
+    total_contacts = contact_count[0]
     for c in range(wp.tid(), total_contacts, total_num_threads):
         _build_mf_contact_row(
             c,
@@ -7386,17 +7366,17 @@ def snapshot_contact_warmstart(
 ):
     """Save all contact routes and live normals in one launch."""
     contact = wp.tid()
-    count = contact_count[0]
-    active = contact < count and count <= contact_normal.shape[0]
+    active = contact < contact_count[0]
     path = int(-1)
     slot = int(-1)
     if active:
         path = contact_path[contact]
         slot = contact_slot[contact]
         previous_normal[contact] = contact_normal[contact]
-    if contact < previous_dense_slot.shape[0]:
+    # One thread per ready row; an empty table is a path the solver does not take.
+    if previous_dense_slot.shape[0] > 0:
         previous_dense_slot[contact] = wp.where(path == 0, slot, -1)
-    if contact < previous_mf_slot.shape[0]:
+    if previous_mf_slot.shape[0] > 0:
         previous_mf_slot[contact] = wp.where(path == 1, slot, -1)
 
 

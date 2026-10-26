@@ -118,7 +118,6 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
             wp.zeros((1,), dtype=wp.int32, device=device),
             first_rejected,
             wp.full((1,), _UNBOUNDED, dtype=wp.int32, device=device),
-            wp.zeros(3, dtype=wp.int32, device=device),
         ],
         device=device,
     )
@@ -127,7 +126,7 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
         finalize_constraint_counts_with_status,
         dim=1,
         inputs=[counter, row_capacity, 0, first_rejected],
-        outputs=[count, wp.zeros(3, dtype=wp.int32, device=device)],
+        outputs=[count, wp.zeros(2, dtype=wp.int32, device=device)],
         device=device,
     )
     return (

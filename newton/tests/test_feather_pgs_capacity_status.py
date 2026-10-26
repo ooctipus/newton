@@ -38,7 +38,6 @@ def _allocator_arrays(capacity, *, route=0, count=205, device="cpu"):
         "contact_thickness0": wp.zeros(length, dtype=float, device=device),
         "contact_thickness1": wp.zeros(length, dtype=float, device=device),
         "body_q": wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
-        "shape_transform": wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
         "shape_body": integers([0]),
         "body_to_articulation": integers([0]),
         "art_to_world": integers([0]),
@@ -70,7 +69,7 @@ def _allocator_arrays(capacity, *, route=0, count=205, device="cpu"):
         "mf_dropped_contact_rows": zeros(1),
         "dense_first_rejected_slot": integers([2**31 - 1]),
         "mf_first_rejected_slot": integers([2**31 - 1]),
-        "capacity_status": zeros(3),
+        "capacity_status": zeros(2),
     }
 
 
@@ -247,7 +246,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
                 expected_first_rejected = accepted * 3 if overflow else 2**31 - 1
                 self.assertEqual(int(arrays["dense_first_rejected_slot"].numpy()[0]), expected_first_rejected)
                 self.assertEqual(int(arrays["dense_dropped_contact_rows"].numpy()[0]), 0)
-                np.testing.assert_array_equal(arrays["capacity_status"].numpy(), [int(overflow), 0, 0])
+                np.testing.assert_array_equal(arrays["capacity_status"].numpy(), [int(overflow), 0])
 
     def test_every_contact_route_is_sticky(self):
         """Retain each failure flag across a later successful empty allocation."""
@@ -255,7 +254,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
             with self.subTest(route=route):
                 arrays = _allocator_arrays(2, route=route, count=1)
                 _allocate(arrays)
-                expected = np.zeros(3, dtype=np.int32)
+                expected = np.zeros(2, dtype=np.int32)
                 expected[route] = 1
                 np.testing.assert_array_equal(arrays["capacity_status"].numpy(), expected)
                 arrays["contact_count"].assign(np.array([0], dtype=np.int32))
@@ -263,17 +262,9 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
                 _allocate(arrays)
                 np.testing.assert_array_equal(arrays["capacity_status"].numpy(), expected)
 
-    def test_raw_contact_prefix_overflow(self):
-        """Report an incomplete contact prefix separately from row overflow."""
-        arrays = _allocator_arrays(640, count=2)
-        arrays["contact_count"].assign(np.array([3], dtype=np.int32))
-        _allocate(arrays)
-        np.testing.assert_array_equal(arrays["capacity_status"].numpy(), [0, 0, 1])
-        np.testing.assert_array_equal(arrays["contact_slot"].numpy(), [-1, -1])
-
     def test_internal_row_overflow(self):
         """Report unclamped internal demand even without contact reservations."""
-        status = wp.zeros(3, dtype=wp.int32, device="cpu")
+        status = wp.zeros(2, dtype=wp.int32, device="cpu")
         counts = wp.zeros(2, dtype=wp.int32, device="cpu")
         kernel = kernels.finalize_constraint_counts_with_status
         for family in range(2):
@@ -290,7 +281,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
                 device="cpu",
             )
             np.testing.assert_array_equal(counts.numpy(), [3, 4])
-        np.testing.assert_array_equal(status.numpy(), [1, 1, 0])
+        np.testing.assert_array_equal(status.numpy(), [1, 1])
 
     def test_finalizer_truncates_rejected_contact_reservations(self):
         """Exclude a rejected triple even when its first row fits the capacity."""
@@ -298,7 +289,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         counter = wp.array([6, 6], dtype=wp.int32, device=device)
         first_rejected = wp.array([3, 0], dtype=wp.int32, device=device)
         count = wp.empty(2, dtype=wp.int32, device=device)
-        status = wp.zeros(3, dtype=wp.int32, device=device)
+        status = wp.zeros(2, dtype=wp.int32, device=device)
         for family in range(2):
             wp.launch(
                 kernels.finalize_constraint_counts_with_status,
@@ -308,7 +299,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
                 device=device,
             )
             np.testing.assert_array_equal(count.numpy(), [3, 0])
-        np.testing.assert_array_equal(status.numpy(), [1, 1, 0])
+        np.testing.assert_array_equal(status.numpy(), [1, 1])
 
     def test_public_check_and_explicit_clear(self):
         """Keep historical audit flags separate from resettable per-world validity."""
@@ -319,7 +310,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         model = builder.finalize(device="cpu")
         solver = SolverFeatherPGS(model, dense_max_constraints=192, row_watermark=False)
         self.assertFalse(any(solver.constraint_capacity_status().values()))
-        solver._constraint_capacity_status.assign(np.array([1, 0, 0], dtype=np.int32))
+        solver._constraint_capacity_status.assign(np.array([1, 0], dtype=np.int32))
         solver.constraint_overflow.fill_(True)
         with self.assertRaisesRegex(RuntimeError, "capacity exceeded"):
             solver.check_constraint_capacity()

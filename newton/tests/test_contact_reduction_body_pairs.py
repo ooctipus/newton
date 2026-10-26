@@ -30,6 +30,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.core import contact_pool
 from newton._src.geometry.contact_reduction_body_pairs import (
     _BP_FACE_NORMALS_DATA,
     CELL_COORD_MAX,
@@ -198,6 +199,11 @@ def _max_angular_hole(points_xy, center_xy):
     ang = np.sort(np.arctan2(points_xy[:, 1] - center_xy[1], points_xy[:, 0] - center_xy[0]))
     holes = np.diff(np.concatenate([ang, [ang[0] + 2.0 * np.pi]]))
     return float(holes.max())
+
+
+def _pool_rows(rows):
+    """Start the rigid contact rows of a model's pipelines at exactly ``rows``."""
+    return unittest.mock.patch.multiple(contact_pool, MIN_READY_ROWS=rows, ROW_QUANTUM=1)
 
 
 def _make_pipeline(model, reduce_body_pairs, *, reduce_mesh_contacts=True, **kwargs):
@@ -536,14 +542,12 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
         builder.add_ground_plane()
         model = builder.finalize(device=wp.get_device())
         state = model.state()
-        rigid_contact_max = 4096
 
         def contact_count(config):
             pipeline = newton.CollisionPipeline(
                 model,
                 broad_phase="nxn",
                 deterministic=True,
-                rigid_contact_max=rigid_contact_max,
                 reduce_contacts=config,
             )
             contacts = pipeline.contacts()
@@ -1277,13 +1281,13 @@ class TestBodyPairReductionTableSizing(unittest.TestCase):
         pipeline = _make_pipeline(model, True)
         desc = pipeline.body_pair_reduction_description()
         self.assertGreater(desc["group_pair_bound"], 0, "topology anchor was not derived")
-        # Capped at rigid_contact_max (a group needs a contact to create it),
-        # except that a minimum viable table always wins.
+        # A minimum viable table always wins.
         self.assertGreaterEqual(desc["hashtable_capacity_request"], 1024)
-        self.assertLessEqual(desc["hashtable_capacity_request"], max(1024, desc["rigid_contact_max"]))
-        # Same topology, 4x the contact buffer -> identical request.
-        wide = _make_pipeline(model, True, rigid_contact_max=model.rigid_contact_max * 4)
+        # Same topology, a contact buffer grown 4x -> identical request.
+        wide = _make_pipeline(model, True)
+        wide.contacts().reserve_rigid_contacts(4 * desc["rigid_contact_max"])
         wide_desc = wide.body_pair_reduction_description()
+        self.assertGreaterEqual(wide_desc["rigid_contact_max"], 4 * desc["rigid_contact_max"])
         self.assertEqual(wide_desc["group_pair_bound"], desc["group_pair_bound"])
         self.assertEqual(wide_desc["hashtable_capacity_request"], desc["hashtable_capacity_request"])
         # More bodies -> more reachable group pairs -> a larger anchor.
@@ -1474,24 +1478,21 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         model = builder.finalize(device=wp.get_device())
         state = model.state()
 
-        plain = newton.CollisionPipeline(
-            model,
-            broad_phase="nxn",
-            deterministic=True,
-            rigid_contact_max=8,  # deliberately far below the ~25 candidates
-        )
+        plain = newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True)
         reduced = newton.CollisionPipeline(
             model,
             broad_phase="nxn",
             deterministic=True,
-            rigid_contact_max=8,
             reduce_contacts=newton.CollisionPipeline.ContactReductionConfig(body_pairs=True),
         )
         contacts = reduced.contacts()
         plain.collide(state, contacts)
-        raw_count = int(contacts.rigid_contact_count.numpy()[0])
+        self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 25)
+        # A pass outside capture grows instead of overflowing; a graph replay that overflowed leaves
+        # its raw counter past the rows, as set here.
+        raw_count = contacts.rigid_contact_max + 17
+        contacts.rigid_contact_count.fill_(raw_count)
         rows_before = _full_contact_rows(contacts)
-        self.assertGreater(raw_count, 8, "scene must actually overflow the buffer")
 
         # Isolate the postpass from a second nondeterministic narrow-phase run:
         # applying it to this exact materialized prefix must be an identity.
@@ -1569,9 +1570,9 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         state = model.state()
         pipeline = _make_pipeline(model, True)
         oversized = Contacts(
-            rigid_contact_max=pipeline.rigid_contact_max * 2, soft_contact_max=0, device=wp.get_device()
+            rigid_contact_max=pipeline.contacts().rigid_contact_max * 2, soft_contact_max=0, device=wp.get_device()
         )
-        with self.assertRaisesRegex(ValueError, "rigid_contact_max"):
+        with self.assertRaisesRegex(ValueError, "exactly match the pipeline's ready rigid contact rows"):
             pipeline.collide(state, oversized)
 
     def test_invalid_configuration_rejected(self):
@@ -1774,7 +1775,7 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         pipeline.collide(state, plain)  # installs the property-less scratch
 
         rich = Contacts(
-            rigid_contact_max=pipeline.rigid_contact_max,
+            rigid_contact_max=plain.rigid_contact_max,
             soft_contact_max=0,
             device=wp.get_device(),
             per_contact_shape_properties=True,
@@ -1796,7 +1797,8 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         for k in range(4):
             builder.add_shape_sphere(-1, xform=wp.transform(wp.vec3(float(k), 0.0, 0.0), wp.quat_identity()))
         model = builder.finalize(device=wp.get_device())
-        pipeline = _make_pipeline(model, True, rigid_contact_max=4)
+        with _pool_rows(4):
+            pipeline = _make_pipeline(model, True)
         contacts = Contacts(
             rigid_contact_max=4,
             soft_contact_max=0,
@@ -1967,7 +1969,7 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         state = model.state()
         pipeline = _make_pipeline(model, True)
         contacts = Contacts(
-            rigid_contact_max=pipeline.rigid_contact_max,
+            rigid_contact_max=pipeline.contacts().rigid_contact_max,
             soft_contact_max=pipeline.soft_contact_max,
             device=device,
             per_contact_shape_properties=True,
@@ -1983,7 +1985,7 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         state_ref = model.state()
         ref = _make_pipeline(model, True)
         contacts_ref = Contacts(
-            rigid_contact_max=ref.rigid_contact_max,
+            rigid_contact_max=ref.contacts().rigid_contact_max,
             soft_contact_max=ref.soft_contact_max,
             device=device,
             per_contact_shape_properties=True,
@@ -2446,13 +2448,8 @@ class TestBodyPairReductionGroupAssignment(unittest.TestCase):
         ground = builder.add_ground_plane()
         model = builder.finalize(device=wp.get_device())
         state = model.state()
-        pipeline = _make_pipeline(
-            model,
-            True,
-            rigid_contact_max=2,
-            body_pair_cell_size=0.02,
-            body_pair_hysteresis=0.0,
-        )
+        with _pool_rows(2):
+            pipeline = _make_pipeline(model, True, body_pair_cell_size=0.02, body_pair_hysteresis=0.0)
         contacts = pipeline.contacts()
 
         normal = np.array([0.3, 0.0, np.sqrt(1.0 - 0.3**2)], dtype=np.float32)
@@ -2977,7 +2974,8 @@ class TestBodyPairReductionVerifier(unittest.TestCase):
             c_red, c_raw = pipe_red.contacts(), pipe_raw.contacts()
             # Seven colliders per body generate thousands of speculative rows.
             # Both consumers must retain them for this to test reduction stability.
-            mf_capacity = 3 * max(c_red.rigid_contact_max, c_raw.rigid_contact_max)
+            # Three matrix-free rows per contact for 4,096 contacts, more than the pile makes.
+            mf_capacity = 3 * 4096
             solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0, mf_max_constraints=mf_capacity)
             raw_not_less, strict_reduction_frames, peak_red = 0, 0, 0.0
             for _ in range(150):

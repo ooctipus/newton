@@ -1079,7 +1079,6 @@ class SolverCoupledADMM(SolverCoupled):
             admm_shape_pairs = (
                 self._build_admm_rigid_shape_pair_array() if self._admm_rigid_rigid_contact_specs else None
             )
-            rigid_contact_max = self._admm_rigid_contact_capacity() if self._admm_rigid_rigid_contact_specs else None
             if self._admm_rigid_rigid_contact_specs:
                 self._admm_dynamic_rr_contact_groups = self._build_collision_rigid_rigid_contact_groups()
             from ...sim import CollisionPipeline  # noqa: PLC0415
@@ -1099,7 +1098,6 @@ class SolverCoupledADMM(SolverCoupled):
                 # Cross-solver joints become compliant attachments here, so a body the model
                 # welds to the world through one can move: keep the pairs of welded bodies.
                 include_immobile_pairs=True,
-                rigid_contact_max=rigid_contact_max,
                 soft_contact_max=None if self._admm_rigid_particle_contact_specs else 0,
                 soft_contact_margin=0.0,
                 contact_matching=(
@@ -1129,7 +1127,7 @@ class SolverCoupledADMM(SolverCoupled):
         ) and self._admm_internal_contacts is None:
             self._admm_internal_contacts = self._admm_collision_pipeline.contacts()
             if self._admm_rigid_rigid_contact_specs:
-                # The exact pair capacity, not a guess: hold it from the start.
+                # The exact pair capacity of the coupled shape pairs: hold it from the start.
                 self._admm_internal_contacts.reserve_rigid_contacts(self._admm_rigid_contact_capacity())
 
         if coupling.gamma > 0.0:

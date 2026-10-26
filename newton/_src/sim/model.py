@@ -1308,7 +1308,13 @@ class Model:
         """Restitution coefficient of soft contacts [dimensionless] (used by :class:`SolverXPBD`)."""
 
         self.rigid_contact_max: int = 0
-        """Number of potential contact points between rigid bodies."""
+        """Number of potential contact points between rigid bodies, kept for compatibility with Newton main.
+
+        Contact buffers grow on demand and are not sized by it. A
+        :class:`~newton.CollisionPipeline` writes the budget it resolves here, as on
+        Newton main, and :class:`~newton.solvers.SolverKamino` sizes its fixed contact
+        container for converted Newton contacts by it.
+        """
 
         self.up_axis: int = 2
         """Up axis: 0 for x, 1 for y, 2 for z."""

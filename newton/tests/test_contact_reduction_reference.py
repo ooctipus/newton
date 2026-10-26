@@ -408,7 +408,7 @@ class TestContactReductionReference(unittest.TestCase):
     def test_terrain_routes(self):
         """Reproduce the terrain routes: typed rows, generic and finite queries, cleanup, determinism, cells."""
         model = _terrain_model()
-        options = {"rigid_contact_max": 4096, "max_triangle_pairs": 8192}
+        options = {"max_triangle_pairs": 8192}
         out = {}
         typed = {**_TERRAIN_FLAGS, "NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": "1"}
         generic = {
@@ -430,7 +430,7 @@ class TestContactReductionReference(unittest.TestCase):
     def test_mesh_pile(self):
         """Reproduce the mesh-plane and mesh-mesh writers in both reduction modes."""
         model = _mesh_pile_model()
-        options = {"rigid_contact_max": 4096, "max_triangle_pairs": 16384}
+        options = {"max_triangle_pairs": 16384}
         out = {}
         _run_passes(self, out, "plain", model, _TERRAIN_FLAGS, **options)
         _run_passes(self, out, "deterministic", model, _TERRAIN_FLAGS, deterministic=True, **options)
@@ -447,7 +447,6 @@ class TestContactReductionReference(unittest.TestCase):
             model,
             {**_TERRAIN_FLAGS, "NEWTON_HEIGHTFIELD_PRIMITIVE_QUERY": "1"},
             dt=0.02,
-            rigid_contact_max=4096,
             max_triangle_pairs=16384,
             speculative_config=newton.CollisionPipeline.SpeculativeContactConfig(max_speculative_extension=0.25),
         )
@@ -470,7 +469,7 @@ class TestContactReductionReference(unittest.TestCase):
             "NEWTON_TERRAIN_LAW": "none",
         }
         out = {}
-        pipeline = _run_passes(self, out, "pair_csr", model, flags, rigid_contact_max=128, max_triangle_pairs=256)
+        pipeline = _run_passes(self, out, "pair_csr", model, flags, max_triangle_pairs=256)
         self.assertTrue(pipeline.narrow_phase._heightfield_pair_csr)
         self._check("pair_csr", out)
 

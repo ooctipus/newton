@@ -109,7 +109,6 @@ def run(
     builder = newton.ModelBuilder()
     builder.replicate(template, worlds)
     model = builder.finalize(device="cuda:0")
-    model.rigid_contact_max = worlds * tiles * tiles * 4
     solver = newton.solvers.SolverFeatherPGS(
         model,
         pgs_mode="matrix_free",
@@ -122,9 +121,7 @@ def run(
         mf_max_constraints=max(256, 12 * tiles * tiles),
         warn_constraint_overflow=True,
     )
-    pipeline = newton.CollisionPipeline(
-        model, rigid_contact_max=model.rigid_contact_max, broad_phase="nxn", contact_matching="latest"
-    )
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest")
     contacts = pipeline.contacts()
     s0, s1 = model.state(), model.state()
     control = model.control()

@@ -35,7 +35,6 @@ def _pipeline(model, pairs, **kwargs):
     return newton.CollisionPipeline(
         model,
         shape_pairs_filtered=pairs,
-        rigid_contact_max=32,
         max_triangle_pairs=16,
         **kwargs,
     )
@@ -187,7 +186,7 @@ class TestCollisionOutputCapacity(unittest.TestCase):
             self.assertEqual(kwargs[key], 2)
         # The pipeline sorts with its own buffers; the narrow phase allocates no standalone sort buffer.
         self.assertEqual(kwargs["contact_max"], 0)
-        self.assertEqual(len(bounded._sort_key_array), 32)
+        self.assertEqual(len(bounded._sort_key_array), bounded.contacts().rigid_contact_max)
         baseline = _pipeline(model, pairs, deterministic=True)
         contacts = bounded.contacts()
         expected = baseline.contacts()

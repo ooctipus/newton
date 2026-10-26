@@ -10,6 +10,7 @@ from unittest import mock
 import numpy as np
 import warp as wp
 
+from newton._src.core.contact_pool import ContactPool
 from newton._src.solvers.feather_pgs import compact_contact as compact
 from newton.tests import test_feather_pgs_compact_contact as baseline
 from newton.tests.test_feather_pgs_compact_contact import OUTPUTS, fixture, install_prefix, run_original
@@ -213,6 +214,8 @@ class TestCoalescedContact(unittest.TestCase):
             _mark_independent_sparse_contact_candidates_kernel=marker,
             # The point producer: no patch row law.
             _friction_anchors_enabled=False,
+            # Launches sized by contact rows go through the pool, eagerly here.
+            _contact_pool=ContactPool(device="cpu", rows=16),
         )
         contacts = SimpleNamespace(
             rigid_contact_max=16,

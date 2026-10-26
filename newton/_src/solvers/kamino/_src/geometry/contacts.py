@@ -1211,11 +1211,11 @@ def _convert_active_contacts_kamino_to_newton(
     # Retrieve the contact index for this thread
     cid = wp.tid()
 
-    # Like Newton's collision writer, the output count keeps every active
-    # contact, while only the rows the output holds are written: a count past
-    # ``rigid_contact_max`` flags the dropped contacts.
+    # Like Newton's collision writer, only the rows the output holds are
+    # written and the count is clamped to them, so consumers read every row
+    # below it.
     if cid == 0:
-        newton_count[0] = model_active_contacts[0]
+        newton_count[0] = wp.min(model_active_contacts[0], newton_shape0.shape[0])
 
     # Determine the total number of contacts to convert, which is the
     # smaller of the number of active contacts and the output capacity.
@@ -1459,15 +1459,6 @@ def convert_contacts_newton_to_kamino(
             f"contacts_out.device={contacts_out.device}"
         )
 
-    # Issue warning to the user if the number of contacts to
-    # convert exceeds the capacity of the output contacts.
-    if contacts_in.rigid_contact_max > contacts_out.model_max_contacts_host:
-        msg.warning(
-            "Newton `rigid_contact_max` (%d) exceeds Kamino `model_max_contacts_host` (%d); active contacts may be truncated.",
-            contacts_in.rigid_contact_max,
-            contacts_out.model_max_contacts_host,
-        )
-
     # Skip conversion of contact forces if not requested
     contacts_in_force = contacts_in.force if convert_forces else None
 
@@ -1558,10 +1549,12 @@ def convert_contacts_kamino_to_newton(
       cleared and repopulated from scratch with the currently active Kamino
       contacts; Newton's ``shape0/shape1`` are written to match Kamino's A/B
       ordering. If ``convert_forces`` is true, ``contacts_out.force`` is
-      populated as well; otherwise it is left untouched. Contacts past the
-      output's ``rigid_contact_max`` rows are dropped, while its
-      ``rigid_contact_count`` keeps the active count, as Newton's collision
-      writer does.
+      populated as well; otherwise it is left untouched. The output first
+      reserves rows for Kamino's capacity
+      (:meth:`~newton.Contacts.reserve_rigid_contacts`), which grows them
+      outside graph capture; during capture, contacts past its ready rows are
+      dropped and its ``rigid_contact_count`` holds the rows kept, as Newton's
+      collision writer does.
     - ``clear_output=False``: the existing-contacts path. The geometric data
       already on ``contacts_out`` is preserved and only the per-contact
       reaction is converted into ``contacts_out.force``. This path requires
@@ -1590,8 +1583,8 @@ def convert_contacts_kamino_to_newton(
             using Newton's wrench convention. Required when ``clear_output=False``;
             with ``clear_output=False`` and ``convert_forces=False`` the call is a no-op.
     """
-    # Skip conversion if there are no contacts to convert or no capacity to store them.
-    if contacts_in.model_max_contacts_host == 0 or contacts_out.rigid_contact_max == 0:
+    # Skip conversion if there are no contacts to convert.
+    if contacts_in.model_max_contacts_host == 0:
         return
 
     # Ensure that the model, state, contacts_in and
@@ -1609,13 +1602,12 @@ def convert_contacts_kamino_to_newton(
             f"contacts_out.device={contacts_out.device}"
         )
 
-    # Only Kamino-generated contacts can be truncated during export.
-    if clear_output and contacts_in.model_max_contacts_host > contacts_out.rigid_contact_max:
-        msg.warning(
-            "Kamino `model_max_contacts_host` (%d) exceeds Newton `rigid_contact_max` (%d); active contacts may be truncated.",
-            contacts_in.model_max_contacts_host,
-            contacts_out.rigid_contact_max,
-        )
+    # Kamino-generated contacts must fit in the Newton rows: declare them, which grows the
+    # rows outside graph capture (during capture, rows past the ready ones are dropped and flagged).
+    if clear_output:
+        contacts_out.reserve_rigid_contacts(contacts_in.model_max_contacts_host)
+    if contacts_out.rigid_contact_max == 0:
+        return
 
     # Skip conversion of contact forces if not requested
     contacts_out_force = contacts_out.force if convert_forces else None

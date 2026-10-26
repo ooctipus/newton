@@ -84,6 +84,12 @@ the current frame's count, while ``build_report`` reads the *old*
 ``_prev_count`` to bound the broken-contact enumeration, and sticky
 ``replay_matched`` must see the post-sort ``match_index`` and the pre-save
 ``_prev_*`` buffers it reads from.
+
+Every per-contact launch goes through the contact pool
+(:meth:`~newton._src.core.contact_pool.ContactPool.launch`) and follows the
+current or the previous contact count, so a CUDA graph capture of the matcher
+follows the pool's growth. The kernels address the history through views of its
+whole reservation.
 """
 
 from __future__ import annotations
@@ -433,8 +439,6 @@ def _save_sorted_state_kernel(data: _SaveStateData):
     quantity.
     """
     i = wp.tid()
-    if i == 0:
-        data.dst_count[0] = wp.min(data.src_count[0], data.dst_keys.shape[0])
     if i < data.src_count[0]:
         data.dst_keys[i] = data.src_keys[i]
         data.dst_claim[i] = _CLAIM_SENTINEL
@@ -464,6 +468,12 @@ def _save_sorted_state_kernel(data: _SaveStateData):
             data.dst_offset0_body[i] = data.src_offset0[i]
             data.dst_offset1_body[i] = data.src_offset1[i]
             data.dst_normal_sticky[i] = data.src_normal[i]
+
+
+@wp.kernel(enable_backward=False)
+def _save_count_kernel(src_count: wp.array[wp.int32], dst_keys: wp.array[wp.int64], dst_count: wp.array[wp.int32]):
+    """Save the current count as the previous frame's, also when it is zero."""
+    dst_count[0] = wp.min(src_count[0], dst_keys.shape[0])
 
 
 # ------------------------------------------------------------------
@@ -561,11 +571,21 @@ def _replay_matched_kernel(data: _ReplayData):
 
 
 @wp.kernel(enable_backward=False)
-def _collect_contact_report_kernel(
+def _collect_new_contacts_kernel(
     match_index: wp.array[wp.int32],
     contact_count: wp.array[wp.int32],
     new_indices: wp.array[wp.int32],
     new_count: wp.array[wp.int32],
+):
+    """Collect the indices of the current contacts without a match."""
+    i = wp.tid()
+    if i < contact_count[0] and match_index[i] < wp.int32(0):
+        new_slot = wp.atomic_add(new_count, 0, wp.int32(1))
+        new_indices[new_slot] = wp.int32(i)
+
+
+@wp.kernel(enable_backward=False)
+def _collect_broken_contacts_kernel(
     prev_was_matched: wp.array[wp.int32],
     prev_keys: wp.array[wp.int64],
     prev_count: wp.array[wp.int32],
@@ -575,12 +595,8 @@ def _collect_contact_report_kernel(
     broken_indices: wp.array[wp.int32],
     broken_count: wp.array[wp.int32],
 ):
-    """Collect new and broken contact indices after matching and sorting."""
+    """Collect the indices of the previous frame's contacts that no current contact matched."""
     i = wp.tid()
-    if i < contact_count[0] and match_index[i] < wp.int32(0):
-        new_slot = wp.atomic_add(new_count, 0, wp.int32(1))
-        new_indices[new_slot] = wp.int32(i)
-
     if i < prev_count[0]:
         key = prev_keys[i]
         shape0 = wp.int32((key >> wp.int64(43)) & wp.int64(0xFFFFF))
@@ -640,7 +656,7 @@ class ContactMatcher:
             point/offset arrays are ``None`` and replay is skipped.
         device: Device to allocate on.
         pool: Contact pool whose ready rows the history holds and grows with,
-            keeping its contents; by default a fixed pool of ``capacity`` rows.
+            keeping its contents; by default a pool starting at ``capacity`` rows.
     """
 
     def __init__(
@@ -659,7 +675,8 @@ class ContactMatcher:
     ):
         with wp.ScopedDevice(device):
             if pool is None:
-                pool = ContactPool(capacity, device=wp.get_device(), rows=capacity)
+                pool = ContactPool(device=wp.get_device(), rows=capacity)
+            self._pool = pool
             self._capacity = pool.ready
             self._pos_threshold_sq = pos_threshold * pos_threshold
             self._normal_dot_threshold = normal_dot_threshold
@@ -713,6 +730,10 @@ class ContactMatcher:
         self._capacity = rows.rows
         if self._sticky:
             self._prev_normal_sticky = self._prev_normal
+
+    def _history(self, name: str) -> wp.array:
+        """Return a history field over its whole reservation, which kernels index up to the live counts."""
+        return self._rows.reserved[name]
 
     # ------------------------------------------------------------------
     # Properties
@@ -801,10 +822,10 @@ class ContactMatcher:
             device: Device to launch on.
         """
         data = _MatchData()
-        data.prev_keys = self._prev_sorted_keys
+        data.prev_keys = self._history("_prev_sorted_keys")
         # Owned history survives sorting and reduction of the current stream.
-        data.prev_pos_world = self._prev_pos_world
-        data.prev_normal = self._prev_normal
+        data.prev_pos_world = self._history("_prev_pos_world")
+        data.prev_normal = self._history("_prev_normal")
         data.prev_count = self._prev_count
         data.reset_world_mask = self._reset_world_mask
         data.shape_world = self._shape_world
@@ -819,23 +840,25 @@ class ContactMatcher:
         data.body_q = body_q
         data.shape_body = shape_body
         data.match_index = match_index_out
-        data.prev_claim = self._prev_claim
+        data.prev_claim = self._history("_prev_claim")
         data.pos_threshold_sq = self._pos_threshold_sq
         data.normal_dot_threshold = self._normal_dot_threshold
 
-        wp.launch(_match_contacts_kernel, dim=self._capacity, inputs=[data], device=device)
-        wp.launch(
+        pool = self._pool
+        rows = pool.launch_rows()
+        pool.launch(_match_contacts_kernel, rows, inputs=[data], extent=contact_count)
+        pool.launch(
             _resolve_claims_kernel,
-            dim=self._capacity,
+            rows,
             inputs=[
                 match_index_out,
                 sort_keys,
-                self._prev_claim,
-                self._prev_was_matched,
+                data.prev_claim,
+                self._history("_prev_was_matched") if self._has_report else self._prev_was_matched,
                 contact_count,
                 1 if self._has_report else 0,
             ],
-            device=device,
+            extent=contact_count,
         )
 
     def save_sorted_state(
@@ -890,39 +913,46 @@ class ContactMatcher:
         data.src_count = contact_count
         data.body_q = body_q
         data.shape_body = shape_body
-        data.dst_keys = self._prev_sorted_keys
+        data.dst_keys = self._history("_prev_sorted_keys")
         # Save world-space geometry independently of transient sorter scratch.
-        data.dst_pos_world = self._prev_pos_world
-        data.dst_normal = self._prev_normal
+        data.dst_pos_world = self._history("_prev_pos_world")
+        data.dst_normal = self._history("_prev_normal")
         data.dst_count = self._prev_count
-        data.dst_claim = self._prev_claim
+        data.dst_claim = self._history("_prev_claim")
 
-        data.dst_prev_was_matched = self._prev_was_matched
+        data.dst_prev_was_matched = self._history("_prev_was_matched") if self._has_report else self._prev_was_matched
         data.has_report = 1 if self._has_report else 0
         if self._sticky:
             if sorted_offset0 is None or sorted_offset1 is None:
                 raise ValueError("save_sorted_state requires sorted_offset0/offset1 when sticky is enabled")
             data.src_offset0 = sorted_offset0
             data.src_offset1 = sorted_offset1
-            data.dst_point0_body = self._prev_point0
-            data.dst_point1_body = self._prev_point1
-            data.dst_offset0_body = self._prev_offset0
-            data.dst_offset1_body = self._prev_offset1
-            data.dst_normal_sticky = self._prev_normal_sticky
+            data.dst_point0_body = self._history("_prev_point0")
+            data.dst_point1_body = self._history("_prev_point1")
+            data.dst_offset0_body = self._history("_prev_offset0")
+            data.dst_offset1_body = self._history("_prev_offset1")
+            data.dst_normal_sticky = data.dst_normal
             data.has_sticky = 1
         else:
             # The struct requires a valid array for every field -- the
             # kernel guards with has_sticky==0 and never reads/writes them.
             data.src_offset0 = sorted_point0
             data.src_offset1 = sorted_point0
-            data.dst_point0_body = self._prev_pos_world
-            data.dst_point1_body = self._prev_pos_world
-            data.dst_offset0_body = self._prev_pos_world
-            data.dst_offset1_body = self._prev_pos_world
-            data.dst_normal_sticky = self._prev_pos_world
+            data.dst_point0_body = data.dst_pos_world
+            data.dst_point1_body = data.dst_pos_world
+            data.dst_offset0_body = data.dst_pos_world
+            data.dst_offset1_body = data.dst_pos_world
+            data.dst_normal_sticky = data.dst_pos_world
             data.has_sticky = 0
 
-        wp.launch(_save_sorted_state_kernel, dim=self._capacity, inputs=[data], device=device)
+        pool = self._pool
+        pool.launch(_save_sorted_state_kernel, pool.launch_rows(), inputs=[data], extent=contact_count)
+        wp.launch(
+            _save_count_kernel,
+            dim=1,
+            inputs=[contact_count, data.dst_keys, self._prev_count],
+            device=pool.device,
+        )
         self._reset_world_mask.zero_()
 
     def replay_matched(
@@ -968,12 +998,12 @@ class ContactMatcher:
         data = _ReplayData()
         data.match_index = match_index
         data.contact_count = contact_count
-        data.prev_point0 = self._prev_point0
-        data.prev_point1 = self._prev_point1
-        data.prev_offset0 = self._prev_offset0
-        data.prev_offset1 = self._prev_offset1
+        data.prev_point0 = self._history("_prev_point0")
+        data.prev_point1 = self._history("_prev_point1")
+        data.prev_offset0 = self._history("_prev_offset0")
+        data.prev_offset1 = self._history("_prev_offset1")
         # Sorting and reduction cannot overwrite this owned normal history.
-        data.prev_normal = self._prev_normal_sticky
+        data.prev_normal = self._history("_prev_normal")
         data.point0 = point0
         data.point1 = point1
         data.offset0 = offset0
@@ -987,7 +1017,8 @@ class ContactMatcher:
         data.shape_body = shape_body
         data.pos_threshold_sq = self._pos_threshold_sq
 
-        wp.launch(_replay_matched_kernel, dim=self._capacity, inputs=[data], device=device)
+        pool = self._pool
+        pool.launch(_replay_matched_kernel, pool.launch_rows(), inputs=[data], extent=contact_count)
 
     def build_report(
         self,
@@ -1028,16 +1059,20 @@ class ContactMatcher:
         new_count.zero_()
         broken_count.zero_()
 
-        wp.launch(
-            _collect_contact_report_kernel,
-            dim=self._capacity,
+        pool = self._pool
+        rows = pool.launch_rows()
+        pool.launch(
+            _collect_new_contacts_kernel,
+            rows,
+            inputs=[match_index, contact_count, new_indices, new_count],
+            extent=contact_count,
+        )
+        pool.launch(
+            _collect_broken_contacts_kernel,
+            rows,
             inputs=[
-                match_index,
-                contact_count,
-                new_indices,
-                new_count,
-                self._prev_was_matched,
-                self._prev_sorted_keys,
+                self._history("_prev_was_matched"),
+                self._history("_prev_sorted_keys"),
                 self._prev_count,
                 self._shape_world,
                 self._reset_world_mask,
@@ -1045,5 +1080,5 @@ class ContactMatcher:
                 broken_indices,
                 broken_count,
             ],
-            device=device,
+            extent=self._prev_count,
         )

@@ -447,7 +447,7 @@ class DeviceTorsionPreparation:
         # Per-contact work holds the solver's contact rows and grows with them.
         pool = getattr(solver, "_contact_pool", None)
         if pool is None:
-            pool = ContactPool(solver._max_contacts_alloc, device=device, rows=solver._max_contacts_alloc)
+            pool = ContactPool(device=device, rows=solver._max_contacts_alloc)
         fields = [
             ContactField("keys", wp.int64, per_contact=2),
             ContactField("indices", wp.int32, per_contact=2),

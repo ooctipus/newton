@@ -301,9 +301,7 @@ def test_pipeline_rejection_capacity_status(test, device):
     ):
         # Preserve the original automatic split-admission threshold while
         # undersizing the genuinely overlapping 28,056-pair input domain.
-        pipeline = newton.CollisionPipeline(
-            model, broad_phase_output_max=27_776, rigid_contact_max=16, verify_buffers=True
-        )
+        pipeline = newton.CollisionPipeline(model, broad_phase_output_max=27_776, verify_buffers=True)
     narrow, cache = pipeline.narrow_phase, pipeline.narrow_phase._coherent_cache
     test.assertIsNotNone(cache)
     test.assertEqual(cache.data.unresolved_work_items.shape[0], narrow.split_query_results.shape[0])
@@ -335,16 +333,14 @@ def test_pipeline_rejection_capacity_status(test, device):
         finally:
             wp.synchronize_device(device)
             captured = messages.end()
+    # The contact rows grow with the demand (the first pass outside capture grew them), so only the
+    # broad phase, whose output stays undersized, overflows.
     test.assertIn("Broad phase pair buffer overflowed", captured)
-    test.assertIn("Contact buffer overflowed", captured)
     for line in captured.splitlines():
         if line.startswith("Module") and "load on device" in line:
             continue
         if line.strip():
-            test.assertRegex(
-                line,
-                r"^Warning: (Broad phase pair buffer overflowed \d+ > 27776|Contact buffer overflowed \d+ > 16)\.$",
-            )
+            test.assertRegex(line, r"^Warning: Broad phase pair buffer overflowed \d+ > 27776\.$")
 
 
 class TestCoherentConvexRejection(unittest.TestCase):

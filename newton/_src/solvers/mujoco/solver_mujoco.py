@@ -5199,12 +5199,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         (:meth:`~newton.Contacts.reserve_rigid_contacts`), which grows a buffer from
         :meth:`newton.CollisionPipeline.contacts` outside graph capture. During
         capture the growth waits for :meth:`newton.CollisionPipeline.service_capacity`;
-        until then ``rigid_contact_count`` keeps MJWarp's count, contacts past
-        ``rigid_contact_max`` are dropped and the ``source_contacts`` flag of
-        :meth:`contact_capacity_status` is set.
+        until then contacts past ``rigid_contact_max`` are dropped,
+        ``rigid_contact_count`` holds the rows kept, and the ``source_contacts``
+        flag of :meth:`contact_capacity_status` is set.
 
         Raises:
-            ValueError: If ``contacts`` cannot grow to that count.
+            MemoryError: If the device cannot back that many contact rows.
         """
         self._apply_module_options()
         if self.use_mujoco_cpu:
@@ -5220,14 +5220,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         rows = mj_data.naconmax
         if not self._use_mujoco_contacts:
             rows = min(rows, self._last_rigid_contact_max or 0)
-        try:
-            contacts.reserve_rigid_contacts(rows)
-        except ValueError as error:
-            raise ValueError(
-                f"MuJoCo holds up to {rows} contacts (naconmax {mj_data.naconmax}), more than contacts can hold "
-                f"(rigid_contact_bound {contacts.rigid_contact_bound}). Create Contacts with at least "
-                f"rigid_contact_max={rows}."
-            ) from error
+        contacts.reserve_rigid_contacts(rows)
 
         # The conversion rewrites the count, shapes, points and normals in place,
         # without a new contact generation.

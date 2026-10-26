@@ -3377,6 +3377,7 @@ class NarrowPhase:
         collision_update_dt: float = 0.0,
         max_speculative_extension: float = 0.0,
         writer_data: Any,
+        verify_contacts: bool = True,
         device: Devicelike | None = None,  # Device to launch on
     ) -> None:
         """
@@ -3416,6 +3417,8 @@ class NarrowPhase:
             collision_update_dt: Collision prediction horizon [s].
             max_speculative_extension: Maximum speculative clearance [m].
             writer_data: Custom struct instance for contact writing (type must match the custom writer function)
+            verify_contacts: Whether the buffer verifier flags contacts past ``writer_data.contact_max``. A
+                caller that grows its contact rows and reruns the pass on overflow turns it off.
             device: Device to launch on
 
         Raises:
@@ -4271,6 +4274,7 @@ class NarrowPhase:
                 self.shape_pairs_sdf_sdf_count,
                 writer_data,
                 hydroelastic_shape_sdf_data_prepared,
+                verify_contacts=verify_contacts,
             )
 
         # Verify no collision pipeline buffers overflowed
@@ -4320,7 +4324,7 @@ class NarrowPhase:
                     self.shape_pairs_sdf_sdf_count,
                     self.shape_pairs_sdf_sdf.shape[0] if self.shape_pairs_sdf_sdf is not None else 0,
                     writer_data.contact_count,
-                    writer_data.contact_max,
+                    writer_data.contact_max if verify_contacts else 2**31 - 1,
                     reduction_ht_active_slots,
                     reduction_ht_capacity,
                     reduction_ht_insert_failures,

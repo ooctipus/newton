@@ -1141,19 +1141,8 @@ class SolverKamino(SolverBase, CouplingInterface):
         if self._contacts_kamino is None or self._contacts_kamino.model_max_contacts_host == 0:
             return
 
-        # Kamino-generated contacts must fit in the Newton output buffer: declare them,
-        # which grows a buffer from CollisionPipeline.contacts() outside graph capture.
-        if self._detector is not None:
-            try:
-                contacts.reserve_rigid_contacts(self._contacts_kamino.model_max_contacts_host)
-            except ValueError as error:
-                raise RuntimeError(
-                    f"Contacts container has insufficient capacity for Kamino contacts: "
-                    f"model_max_contacts={self._contacts_kamino.model_max_contacts_host} > "
-                    f"contacts.rigid_contact_bound={contacts.rigid_contact_bound}"
-                ) from error
-
-        # If all checks pass, proceed to convert contacts from Kamino to Newton format
+        # Convert contacts from Kamino to Newton format. Kamino's own contacts declare their capacity to
+        # the output buffer, which grows to hold them (Contacts.reserve_rigid_contacts).
         self._kamino.convert_contacts_kamino_to_newton(
             model=self.model,
             state=state,

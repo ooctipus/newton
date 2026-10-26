@@ -6,7 +6,7 @@ from __future__ import annotations
 import itertools
 import warnings
 import weakref
-from typing import Literal, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 import warp as wp
 from warp import DeviceLike as Devicelike
@@ -124,6 +124,27 @@ def _increment_contact_generation(generation: wp.array[wp.int32]):
     else:
         g = g + 1
     generation[0] = g
+
+
+@wp.kernel(enable_backward=False)
+def _fill_rows(rows: wp.array[wp.int32], values: wp.array[Any], value: Any):
+    """Fill every ready row of a per-contact array."""
+    i = wp.tid()
+    if i < rows[0]:
+        values[i] = value
+
+
+@wp.kernel(enable_backward=False)
+def _fill_past_rows(rows: wp.array[wp.int32], values: wp.array[Any], value: Any):
+    """Fill the rows a per-contact array holds past its ready rows (e.g. soft contacts' forces)."""
+    values[rows[0] + wp.tid()] = value
+
+
+# Declared with the module, so a first debug clear adds no overload to a loaded module.
+for _dtype in (wp.int32, wp.float32, wp.vec3, wp.spatial_vector):
+    for _kernel in (_fill_rows, _fill_past_rows):
+        wp.overload(_kernel, {"rows": wp.array[wp.int32], "values": wp.array[_dtype], "value": _dtype})
+del _dtype, _kernel
 
 
 @wp.kernel(enable_backward=False)
@@ -297,13 +318,21 @@ class Contacts:
     for both rigid-rigid and soft-rigid contacts. The buffers are allocated on the specified device and can
     optionally require gradients for differentiable simulation.
 
-    Every rigid contact array holds :attr:`rigid_contact_max` rows. A buffer from
-    :meth:`newton.CollisionPipeline.contacts` starts with fewer rows than the pipeline's
-    :attr:`~newton.CollisionPipeline.rigid_contact_max` bound (:attr:`rigid_contact_bound`) when
-    the scene is large, and its rigid arrays grow toward the bound through
-    :meth:`newton.CollisionPipeline.service_capacity` and :meth:`reserve_rigid_contacts`;
-    growth replaces the array attributes with longer views of the same memory, so read them from
-    this object rather than keeping them, and recapture CUDA graphs after a growth.
+    Every rigid contact array holds :attr:`rigid_contact_max` rows, the rows the buffer holds
+    now. A :meth:`newton.CollisionPipeline.contacts` buffer holds its model's contact rows, which
+    start at the model's shape-pair contact estimate, trim to the measured demand once it holds
+    still and grow from it, limited only by the device memory: a collision pass outside graph
+    capture grows them as it needs, and :meth:`newton.CollisionPipeline.service_capacity` trims
+    or grows them between graph replays; a solver writing contacts of its own declares them with
+    :meth:`reserve_rigid_contacts`. Growth and trims replace the array attributes with other views
+    (on CUDA, of the same memory), so read them from this object rather than keeping them. After a collision pass :attr:`rigid_contact_count` never
+    exceeds the rows: the pass drops the contacts past them and flags its capacity status.
+
+    On CUDA with ``gpu_components``, graphs whose contact launches follow the rows (the collision
+    pipeline's and :class:`~newton.solvers.SolverFeatherPGS`'s) keep working after growth without a
+    recapture. A capture that reads :attr:`rigid_contact_max`, as other consumers do to size their
+    launches, must be recaptured after growth, which
+    :meth:`newton.CollisionPipeline.service_capacity` reports.
 
     .. experimental::
 
@@ -364,8 +393,11 @@ class Contacts:
         Initialize Contacts storage.
 
         Args:
-            rigid_contact_max: Number of rigid contacts the rigid arrays hold. Ignored when
-                ``rigid_contact_pool`` is given: the arrays then hold the pool's ready rows.
+            rigid_contact_max: Initial rows of the rigid arrays of a buffer built directly, which
+                grow as needed: the sizing input for code that builds its own ``Contacts`` (for
+                example to hold a solver's own contacts, see :meth:`reserve_rigid_contacts`).
+                Ignored when ``rigid_contact_pool`` is given: the arrays then hold the pool's ready
+                rows, as for :meth:`newton.CollisionPipeline.contacts`.
             soft_contact_max: Maximum number of soft contacts
             soft_contact_tids_size: Length of the internal per-thread replay-index array
                 (``soft_contact_tids``) used for differentiable backward. Defaults to
@@ -396,7 +428,7 @@ class Contacts:
                 :attr:`rigid_contact_broken_indices`,
                 :attr:`rigid_contact_broken_count`) populated each frame by
                 the collision pipeline.  Requires ``contact_matching=True``.
-            rigid_contact_pool: Internal: the growable rigid contact capacity of the
+            rigid_contact_pool: Internal: the rigid contact rows of the
                 :class:`newton.CollisionPipeline` that creates this buffer
                 (:meth:`newton.CollisionPipeline.contacts`). The rigid arrays then
                 hold the pool's ready rows and grow with it.
@@ -436,9 +468,7 @@ class Contacts:
             # They are views of a contact pool's ready rows: rigid_contact_max always equals
             # their length, and they grow with the pool (see newton._src.core.contact_pool).
             if rigid_contact_pool is None:
-                rigid_contact_pool = ContactPool(rigid_contact_max, device=wp.get_device(), rows=rigid_contact_max)
-            elif requires_grad and rigid_contact_pool.growable:
-                raise ValueError("Contacts with gradients need a rigid contact pool at its bound")
+                rigid_contact_pool = ContactPool(device=wp.get_device(), rows=rigid_contact_max)
             self._rigid_contact_pool = rigid_contact_pool
             rigid_contact_max = rigid_contact_pool.ready
             rigid_fields = [
@@ -540,17 +570,25 @@ class Contacts:
 
             This is an extended contact attribute; see :ref:`extended_contact_attributes` for more information.
             """
-            self.rigid_contact_max = rigid_contact_max
             self._rigid_rows: ContactRows = rigid_contact_pool.rows(rigid_fields, on_rows=self._on_rigid_rows)
 
-            # Deprecated compatibility outputs, retained for one deprecation cycle.
+            # Deprecated compatibility outputs, retained for one deprecation cycle. They grow with
+            # the rigid rows, as arrays with gradients that growth reallocates.
             if requires_grad:
-                self._rigid_contact_diff_distance = wp.zeros(rigid_contact_max, dtype=wp.float32, requires_grad=True)
+                self._rigid_contact_diff_distance: wp.array[wp.float32]
                 """Differentiable signed distance [m], shape (rigid_contact_max,), dtype float."""
-                self._rigid_contact_diff_point0_world = wp.zeros(rigid_contact_max, dtype=wp.vec3, requires_grad=True)
+                self._rigid_contact_diff_point0_world: wp.array[wp.vec3]
                 """World-space contact point on shape 0 [m], shape (rigid_contact_max,), dtype :class:`vec3`."""
-                self._rigid_contact_diff_point1_world = wp.zeros(rigid_contact_max, dtype=wp.vec3, requires_grad=True)
+                self._rigid_contact_diff_point1_world: wp.array[wp.vec3]
                 """World-space contact point on shape 1 [m], shape (rigid_contact_max,), dtype :class:`vec3`."""
+                self._rigid_diff_rows: ContactRows = rigid_contact_pool.rows(
+                    (
+                        ContactField("_rigid_contact_diff_distance", wp.float32, requires_grad=True),
+                        ContactField("_rigid_contact_diff_point0_world", wp.vec3, requires_grad=True),
+                        ContactField("_rigid_contact_diff_point1_world", wp.vec3, requires_grad=True),
+                    ),
+                    on_rows=self._on_diff_rows,
+                )
             else:
                 self._rigid_contact_diff_distance = None
                 """Differentiable signed distance [m], shape (rigid_contact_max,), dtype float."""
@@ -656,7 +694,23 @@ class Contacts:
     def _on_rigid_rows(self, rows: ContactRows) -> None:
         """Assign the rigid arrays at the pool's ready rows, on creation and after each growth."""
         rows.publish(self)
-        self.rigid_contact_max = rows.rows
+        self._rigid_contact_rows = rows.rows
+
+    @property
+    def rigid_contact_max(self) -> int:
+        """Rigid contact rows the arrays hold now: the ready rows of the buffer's contact pool.
+
+        Reading it during a CUDA graph capture sizes work there by today's rows,
+        so the capture is noted as one to recapture after the rows grow
+        (:meth:`newton.CollisionPipeline.service_capacity` reports it). Launches
+        that follow growth size themselves through the pool instead.
+        """
+        if _registered_capture(self.rigid_contact_count.device) is not None:
+            self._rigid_contact_pool.note_unbound()
+        return self._rigid_contact_rows
+
+    def _on_diff_rows(self, rows: ContactRows) -> None:
+        rows.publish(self)
 
     def _current_warp_capture_graph(self):
         """Return the Warp graph recording the current CUDA stream, if any."""
@@ -761,13 +815,14 @@ class Contacts:
         if self.clear_buffers:
             # Conservative path: clear all buffers with sentinel values and zeros.
             # Slower than the fast path but may be useful for debugging or special cases.
-            self.rigid_contact_shape0.fill_(-1)
-            self.rigid_contact_shape1.fill_(-1)
-            self.rigid_contact_tids.fill_(-1)
-            self.rigid_contact_force.zero_()
+            self._fill_rigid_rows(self.rigid_contact_shape0, -1)
+            self._fill_rigid_rows(self.rigid_contact_shape1, -1)
+            self._fill_rigid_rows(self.rigid_contact_tids, -1)
+            self._fill_rigid_rows(self.rigid_contact_force, wp.vec3(0.0))
 
             if self.force is not None:
-                self.force.zero_()
+                # The rigid rows, then the soft contacts' rows past them.
+                self._fill_rigid_rows(self.force, wp.spatial_vector(), past=self.soft_contact_max)
 
             if self._rigid_contact_diff_distance is not None:
                 self._rigid_contact_diff_distance.zero_()
@@ -777,12 +832,12 @@ class Contacts:
                 self._rigid_contact_diff_normal_override.zero_()
 
             if self.per_contact_shape_properties:
-                self.rigid_contact_stiffness.zero_()
-                self.rigid_contact_damping.zero_()
-                self.rigid_contact_friction.zero_()
+                self._fill_rigid_rows(self.rigid_contact_stiffness, 0.0)
+                self._fill_rigid_rows(self.rigid_contact_damping, 0.0)
+                self._fill_rigid_rows(self.rigid_contact_friction, 0.0)
 
             if self.rigid_contact_match_index is not None:
-                self.rigid_contact_match_index.fill_(-1)
+                self._fill_rigid_rows(self.rigid_contact_match_index, -1)
 
             self.soft_contact_indices.fill_(wp.vec3i(-1, -1, -1))
             self.soft_contact_particle.fill_(-1)
@@ -792,6 +847,23 @@ class Contacts:
         #   Collision detection overwrites all active contacts [0, contact_count)
         #   Solvers only read [0, contact_count), so stale data is never accessed
 
+    def _fill_rigid_rows(self, values: wp.array, value, *, past: int = 0) -> None:
+        """Fill the ready rows of a per-contact array, and ``past`` rows after them, following the rows.
+
+        In a capture whose contact launches bind, each replay fills the rows
+        ready then (:meth:`ContactPool.launch`).
+        """
+        pool = self._rigid_contact_pool
+        rows = pool.ready_rows
+        if rows is None:
+            # A pool created during capture holds its rows until a recapture.
+            pool.note_unbound()
+            values.fill_(value)
+            return
+        pool.launch(_fill_rows, pool.launch_rows(), inputs=[rows, values, value], extent=rows)
+        if past:
+            wp.launch(_fill_past_rows, dim=past, inputs=[rows, values, value], device=values.device)
+
     @property
     def device(self):
         """
@@ -799,37 +871,27 @@ class Contacts:
         """
         return self.rigid_contact_count.device
 
-    @property
-    def rigid_contact_bound(self) -> int:
-        """Most rigid contact rows the arrays can grow to; :attr:`rigid_contact_max` when they cannot grow.
-
-        Per-contact buffers kept beside this object that must hold every row it may
-        ever have are sized by this bound.
-        """
-        return self._rigid_contact_pool.bound
-
     def reserve_rigid_contacts(self, count: int) -> bool:
-        """Hold at least ``count`` rigid contact rows from now on, for a writer with a fixed contact capacity.
+        """Hold at least ``count`` rigid contact rows from now on, for a solver that writes contacts of its own.
 
-        A solver that writes contacts of its own into this buffer (e.g.
+        A solver that writes contacts into this buffer (e.g.
         :meth:`newton.solvers.SolverMuJoCo.update_contacts` with MuJoCo's collision)
         declares the most contacts it writes. Outside CUDA graph capture the rigid
         arrays grow now, keeping their contents. During capture the growth waits,
         with a warning, for :meth:`newton.CollisionPipeline.service_capacity` or the
-        next reservation outside capture; until then the writer keeps the demand in
-        :attr:`rigid_contact_count`, drops the rows past :attr:`rigid_contact_max` and
-        flags it.
+        next reservation outside capture; until then the writer drops the rows past
+        :attr:`rigid_contact_max`, holds :attr:`rigid_contact_count` at the rows kept
+        (a stream's count never exceeds its rows) and flags the drop.
 
         Args:
             count: Most rigid contacts the writer produces.
 
         Returns:
-            Whether the arrays grew now. CUDA graphs that captured them must be
-            recaptured; :meth:`~newton.CollisionPipeline.service_capacity` reports the
-            growth too.
+            Whether the arrays grew now and CUDA graphs that captured them must be
+            recaptured (see :meth:`~newton.CollisionPipeline.service_capacity`).
 
         Raises:
-            ValueError: If ``count`` exceeds :attr:`rigid_contact_bound`.
+            MemoryError: If the device cannot back ``count`` rows of these buffers.
         """
         return self._rigid_contact_pool.reserve(count)
 

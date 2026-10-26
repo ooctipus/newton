@@ -46,11 +46,9 @@ _PATCH_ONLY = frozenset(
         "friction_patches._build",
         "friction_patches._finish_and_store",
         "friction_patches._invalidate_geometry_history",
-        "friction_patches._merge_runs",
         "friction_patches._prepare",
         "friction_patches._prepare_frame",
         "friction_patches._reset_history",
-        "friction_patches._sort_chunks",
         "friction_patches.link_patch_routes",
         "friction_patches.seed_patch_routes",
         # The resolved-world classifier under persistent patch friction.

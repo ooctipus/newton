@@ -176,7 +176,7 @@ def clear_contact_response(
 
 @wp.func
 def _produce_contact(data: ContactBoundaryData, contact: int):
-    if contact >= wp.min(data.count[0], data.point0.shape[0]):
+    if contact >= data.count[0]:
         return
     slot = data.slot[contact]
     if data.path[contact] != 0 or slot < 0:
@@ -409,7 +409,7 @@ def _produce_patch_contact(data: ContactBoundaryData, law: PatchRowLaw, contact:
     anchor's tangential phi with ``law.beta``, and keep the undivided friction
     coefficient.
     """
-    if contact >= wp.min(data.count[0], data.point0.shape[0]):
+    if contact >= data.count[0]:
         return
     slot = data.slot[contact]
     if data.path[contact] != 0 or slot < 0:
@@ -595,17 +595,18 @@ def launch_contacts(solver, state_in, state_aug, contacts, workers):
         law = PatchRowLaw()
         law.patches = solver._friction_patches.view
         law.beta = solver.friction_anchor_beta
+    # One thread per contact; in a capture whose launches bind, each replay runs the live count.
+    pool = solver._contact_pool
+    count = contacts.rigid_contact_count
     if law is None:
-        wp.launch(produce_contacts, dim=contacts.rigid_contact_max, inputs=[data], device=solver.model.device)
+        pool.launch(produce_contacts, pool.launch_rows(), inputs=[data], extent=count)
     else:
-        wp.launch(
-            produce_patch_contacts, dim=contacts.rigid_contact_max, inputs=[data, law], device=solver.model.device
-        )
+        pool.launch(produce_patch_contacts, pool.launch_rows(), inputs=[data, law], extent=count)
     # These original kernels encode schedule links into the freshly published
     # sparse DOF slots. Never overwrite those fields after this point.
-    wp.launch(
+    pool.launch(
         solver._mark_independent_sparse_contact_candidates_kernel,
-        dim=workers,
+        workers,
         inputs=[
             contacts.rigid_contact_count,
             workers,
@@ -618,5 +619,6 @@ def launch_contacts(solver, state_in, state_aug, contacts, workers):
             solver.articulation_response_dof_count,
         ],
         outputs=[solver._sparse_diagonal_row_dof],
-        device=solver.model.device,
+        extent=count,
+        clamp=True,
     )

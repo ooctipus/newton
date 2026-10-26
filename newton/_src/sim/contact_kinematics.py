@@ -55,9 +55,8 @@ def eval_rigid_contact_kinematics(
     and does not need a derived output.
 
     Each output holds at least ``contacts.rigid_contact_max`` rows; only the
-    rows of live contacts are written. Outputs sized by
-    :attr:`newton.Contacts.rigid_contact_bound` stay valid when the contacts
-    grow (:meth:`newton.CollisionPipeline.service_capacity`).
+    rows of live contacts are written. The contacts' rows grow with the demand,
+    so outputs allocated earlier may need to grow with them.
 
     Args:
         model: Model providing the shape-to-body mapping.

@@ -1761,7 +1761,9 @@ class ModelBuilder:
         propagated to :attr:`Model.shape_gap`."""
 
         self.num_rigid_contacts_per_world: int | None = None
-        """Optional per-world rigid-contact allocation budget used to set :attr:`Model.rigid_contact_max`."""
+        """Optional per-world rigid-contact allocation budget, kept for compatibility with Newton main.
+
+        Contact buffers grow on demand and are not sized by it."""
 
         # mimic constraints
         self.constraint_mimic_joint0: list[int] = []

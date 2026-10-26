@@ -1206,7 +1206,6 @@ def check_owner_launches(test, device):
                     owner = MixedTreeKineticState(solver)
                 else:
                     model = build_branch_model(device, worlds=2, leaves=PRESS_LEAVES, shapes=True)
-                    model.rigid_contact_max = 1
                     solver = recipe_solver(model, scalar=True)
                     owner = solver._tree_kinetic_state
                 test.assertIsInstance(owner, MixedTreeKineticState)
@@ -1943,7 +1942,6 @@ class TestGripperContactBound(unittest.TestCase):
                 values = getattr(model, name).numpy()
                 values[layout.key_dofs] = 0.0
                 getattr(model, name).assign(values)
-        model.rigid_contact_max = model.world_count
         solver = recipe_solver(model, scalar=False, pgs_mode="split", pgs_iterations=iterations)
         return solver, _press_key_with_tip(self, model, layout, solver, shift=shift)
 
@@ -2069,7 +2067,6 @@ class TestScalarBranchOwner(unittest.TestCase):
         layout = _Layout(model)
         starts, child = model.articulation_start.numpy(), model.joint_child.numpy()
         floors = [int(child[starts[a] + 1 + k]) for a in layout.branches for k in (0, 17, 53, 107)]
-        model.rigid_contact_max = len(floors)
         # The head, the scalar route (captured below) and the scalar route's eager twin.
         solvers = [
             recipe_solver(model, scalar=False, cached_dynamics="off"),
@@ -2082,7 +2079,7 @@ class TestScalarBranchOwner(unittest.TestCase):
             self._poison(solver, layout)
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
-        contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]
+        contacts = [newton.Contacts(len(floors), 0, device=device) for _ in solvers]
         for index, pair in enumerate(states):
             newton.eval_fk(model, pair[0].joint_q, pair[0].joint_qd, pair[0])
             install_held_contacts(model, pair[0], contacts[index], [(body, -1) for body in floors])
@@ -2243,10 +2240,9 @@ class TestScalarBranchOwner(unittest.TestCase):
         """
         device = wp.get_device("cuda:0")
         model = build_branch_model(device, worlds=2, leaves=STAR_LEAVES, shapes=True)
-        model.rigid_contact_max = 1
         solver = recipe_solver(model, scalar=True)
         states, control = [model.state(), model.state()], model.control()
-        contacts = newton.Contacts(model.rigid_contact_max, 0, device=device)
+        contacts = newton.Contacts(1, 0, device=device)
         contacts.rigid_contact_count.zero_()
         newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
         launched = []
@@ -2283,12 +2279,11 @@ class TestScalarBranchOwner(unittest.TestCase):
         model.joint_limit_upper.assign(upper)
         model.joint_q.zero_()
         model.joint_qd.zero_()
-        model.rigid_contact_max = 1
         solvers = [recipe_solver(model, scalar=False, cached_dynamics="off"), recipe_solver(model, scalar=True)]
         self._assert_routes(*solvers)
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
-        contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]
+        contacts = [newton.Contacts(1, 0, device=device) for _ in solvers]
         for control, contact, pair in zip(controls, contacts, states, strict=True):
             control.joint_target_q.zero_()
             control.joint_target_qd.zero_()
@@ -2358,12 +2353,11 @@ class TestScalarBranchOwner(unittest.TestCase):
         mu = model.shape_material_mu.numpy()
         mu[np.isin(model.shape_body.numpy(), layout.key_leaves)] = 0.0
         model.shape_material_mu.assign(mu)
-        model.rigid_contact_max = worlds
         solvers = [recipe_solver(model, scalar=False, cached_dynamics="off"), recipe_solver(model, scalar=True)]
         self._assert_routes(*solvers)
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
-        contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]
+        contacts = [newton.Contacts(worlds, 0, device=device) for _ in solvers]
         for control, contact, pair in zip(controls, contacts, states, strict=True):
             control.joint_target_q.zero_()
             control.joint_target_qd.zero_()
@@ -2470,7 +2464,6 @@ class TestScalarBranchOwner(unittest.TestCase):
         device = wp.get_device("cuda:0")
         model = build_branch_model(device, worlds=2, leaves=STAR_LEAVES, shapes=True)
         layout = _Layout(model)
-        model.rigid_contact_max = model.world_count
         head = recipe_solver(model, scalar=False, cached_dynamics="off")
         scalar = recipe_solver(model, scalar=True)
         self._assert_routes(head, scalar)
@@ -2500,7 +2493,6 @@ class TestScalarBranchOwner(unittest.TestCase):
         starts, child = model.articulation_start.numpy(), model.joint_child.numpy()
         # Even leaves are prismatic and odd ones revolute.
         floors = [int(child[starts[a] + 1 + k]) for a in layout.branches for k in (0, 3, 6, 9)]
-        model.rigid_contact_max = len(floors)
         solvers = [
             recipe_solver(model, scalar=False, cached_dynamics="off"),
             recipe_solver(model, scalar=True),
@@ -2513,7 +2505,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         self.assertIs(owner.scalar.finish_kernel, sb.finish_scalar_branches)
         states = [[model.state(), model.state()] for _ in solvers]
         controls = [model.control() for _ in solvers]
-        contacts = [newton.Contacts(model.rigid_contact_max, 0, device=device) for _ in solvers]
+        contacts = [newton.Contacts(len(floors), 0, device=device) for _ in solvers]
         for index, pair in enumerate(states):
             newton.eval_fk(model, pair[0].joint_q, pair[0].joint_qd, pair[0])
             install_held_contacts(model, pair[0], contacts[index], [(body, -1) for body in floors])
@@ -2573,7 +2565,6 @@ class TestScalarBranchOwner(unittest.TestCase):
         """Record the scalar group, the request that opts out of it, and its decline without an owner."""
         device = wp.get_device("cuda:0")
         model = build_branch_model(device, worlds=2, leaves=STAR_LEAVES, shapes=True)
-        model.rigid_contact_max = 1
         record = recipe_solver(model, scalar=True).get_path_selection()
         json.dumps(record, allow_nan=False)
         held, publication = record["routes"]["held_tree"], record["routes"]["publication"]

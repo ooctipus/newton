@@ -18,10 +18,10 @@ import math
 
 import numpy as np
 
+from ...core.live_sort import SLOT_BITS
 from ...sim.contacts import CAPACITY_BLOCKS_PER_SM
 from .conditioning import DEEP_CHAIN_JOINTS
 from .contact_row_plan import contact_row_plan
-from .friction_patches import _SORT_SLOT_BITS
 
 # Options whose applied value lives under another attribute after construction.
 _APPLIED_ATTRIBUTES = {
@@ -1130,7 +1130,7 @@ def _pair_sort(patches) -> dict:
         reason = "The pair sort orders only the live slots, so its cost follows the live contacts."
     else:
         reason = (
-            f"{patches.key_bits}-bit pair keys leave no room for the live sort's {_SORT_SLOT_BITS} slot bits: the "
+            f"{patches.key_bits}-bit pair keys leave no room for the live sort's {SLOT_BITS} slot bits: the "
             "radix sort orders the whole capacity."
         )
     return {

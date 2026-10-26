@@ -163,7 +163,6 @@ def _allocate(kernel, resolved):
         "mf_dropped_contact_rows": integers([0, 0]),
         "dense_first_rejected_slot": integers([2**31 - 1] * 2),
         "mf_first_rejected_slot": integers([2**31 - 1] * 2),
-        "capacity_status": integers([0] * 3),
     }
     wp.launch(kernel, dim=1, inputs=[arrays[name] for name in inspect.signature(kernel.func).parameters], device="cpu")
     return {name: value.numpy() for name, value in arrays.items() if isinstance(value, wp.array)}
@@ -418,7 +417,7 @@ class TestResolvedWorlds(unittest.TestCase):
             np.testing.assert_array_equal(patch_friction[name][world_zero], point[name][world_zero], err_msg=name)
         np.testing.assert_array_equal(patch_friction["contact_slot"][world_zero], -1)
         # The resolved world reserves no rows; world 1 and the cross-world pair allocate as before.
-        for name in ("world_slot_counter", "mf_slot_counter", "capacity_status"):
+        for name in ("world_slot_counter", "mf_slot_counter"):
             np.testing.assert_array_equal(patch_friction[name], point[name], err_msg=name)
         self.assertEqual(int(patch_friction["world_slot_counter"][0]) + int(patch_friction["mf_slot_counter"][0]), 0)
         for name in ("contact_slot", "contact_path", "contact_slots_needed"):

@@ -76,7 +76,7 @@ class KineticRows:
 def scatter_contact_keys(data: ContactInput, z: KineticRows):
     """Emit only the original allocated raw contact ID and row direction."""
     contact = wp.tid()
-    if contact < wp.min(data.count[0], data.point0.shape[0]):
+    if contact < data.count[0]:
         if data.path[contact] == 0 and data.slot[contact] >= 0:
             for direction in range(data.slots_needed[contact]):
                 z.rowkeys[data.world[contact], data.slot[contact] + direction] = contact * 4 + direction
@@ -91,7 +91,7 @@ def scatter_patch_contact_keys(data: ContactInput, z: KineticRows):
     among the anchors that received rows.
     """
     contact = wp.tid()
-    if contact < wp.min(data.count[0], data.point0.shape[0]):
+    if contact < data.count[0]:
         if data.path[contact] == 0 and data.slot[contact] >= 0:
             world = data.world[contact]
             slot = data.slot[contact]
@@ -570,11 +570,12 @@ class KeyedRows:
             # patch view (which contact-pool growth replaces) every step.
             self.law.patches = self.solver._friction_patches.view
             self.law.beta = self.solver.friction_anchor_beta
-            wp.launch(
+            pool = self.solver._contact_pool
+            pool.launch(
                 scatter_patch_contact_keys,
-                dim=self.contact_input.point0.shape[0],
+                pool.launch_rows(),
                 inputs=[self.contact_input, self.data],
-                device=self.solver.model.device,
+                extent=self.contact_input.count,
                 max_blocks=self.solver._contact_capacity_blocks,
             )
 
@@ -582,11 +583,12 @@ class KeyedRows:
         """Publish current direct rows and fully materialize only fallback worlds."""
         s = self.solver
         if self.contact_input is not None and not self.patch:
-            wp.launch(
+            pool = s._contact_pool
+            pool.launch(
                 scatter_contact_keys,
-                dim=self.contact_input.point0.shape[0],
+                pool.launch_rows(),
                 inputs=[self.contact_input, self.data],
-                device=s.model.device,
+                extent=self.contact_input.count,
                 max_blocks=s._contact_capacity_blocks,
             )
         na, nb = self.layout.primary, self.layout.secondary

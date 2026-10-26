@@ -776,6 +776,92 @@ def _slot_index(entry_idx: int, slot: int) -> int:
 REDUCTION_MAX_THREADS = 262144
 
 
+SCAN_LANES = wp.constant(256)
+"""Keep flags one block of the keep scan sums at a time."""
+
+SCAN_MAX_BLOCKS = 1024
+"""Blocks of the keep scan's chunk passes; they stride over the chunks of the live count."""
+
+
+@wp.func
+def _live_value(value: wp.int32, local: int, first: int, end: int):
+    """Keep a loaded value below ``end``; values past it (stale rows) count as zero."""
+    if first + local < end:
+        return value
+    return wp.int32(0)
+
+
+@wp.func
+def _live_chunk(values: wp.array[wp.int32], first: int, end: int):
+    """Load the :data:`SCAN_LANES` values from ``first``, zero past ``end``.
+
+    Tiles have explicit shapes, so the scan runs alike on the CPU, where a
+    block has one thread, and on CUDA.
+    """
+    loaded = wp.tile_load(values, shape=SCAN_LANES, offset=first)
+    local = wp.tile_arange(SCAN_LANES, dtype=int)
+    start = wp.tile_full(SCAN_LANES, first, dtype=int)
+    stop = wp.tile_full(SCAN_LANES, end, dtype=int)
+    # Warp hashes a function passed to a builtin only through wp.static().
+    return wp.tile_map(wp.static(_live_value), loaded, local, start, stop)
+
+
+@wp.kernel(enable_backward=False)
+def _scan_chunk_totals(
+    keep_flags: wp.array[wp.int32],
+    frame_state: wp.array[wp.int32],
+    blocks: int,
+    # outputs
+    totals: wp.array[wp.int32],
+):
+    """Sum the keep flags of each chunk of :data:`SCAN_LANES` work items."""
+    block = wp.tid()
+    work = frame_state[wp.static(FRAME_WORK_COUNT)]
+    chunks = (work + SCAN_LANES - 1) // SCAN_LANES
+    for chunk in range(block, chunks, blocks):
+        wp.tile_store(totals, wp.tile_sum(_live_chunk(keep_flags, chunk * SCAN_LANES, work)), offset=chunk)
+
+
+@wp.kernel(enable_backward=False)
+def _scan_chunk_offsets(
+    frame_state: wp.array[wp.int32],
+    # in/out
+    totals: wp.array[wp.int32],
+):
+    """Turn the chunk totals into exclusive chunk offsets, :data:`SCAN_LANES` chunks at a time (one block)."""
+    work = frame_state[wp.static(FRAME_WORK_COUNT)]
+    chunks = (work + SCAN_LANES - 1) // SCAN_LANES
+    carry = int(0)
+    for start in range(0, chunks, SCAN_LANES):
+        group = _live_chunk(totals, start, chunks)
+        before = wp.tile_scan_exclusive(group) + wp.tile_full(SCAN_LANES, carry, dtype=wp.int32)
+        carry += wp.tile_extract(wp.tile_sum(group), 0)
+        # Entries past the chunks take offsets no pass reads.
+        wp.tile_store(totals, before, offset=start)
+
+
+@wp.kernel(enable_backward=False)
+def _scan_chunks(
+    keep_flags: wp.array[wp.int32],
+    frame_state: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    blocks: int,
+    # outputs
+    keep_scan: wp.array[wp.int32],
+):
+    """Write the inclusive scan of the keep flags over the work count, from each chunk's offset.
+
+    The last chunk also writes the slots past the work count, which no pass reads.
+    """
+    block = wp.tid()
+    work = frame_state[wp.static(FRAME_WORK_COUNT)]
+    chunks = (work + SCAN_LANES - 1) // SCAN_LANES
+    for chunk in range(block, chunks, blocks):
+        first = chunk * SCAN_LANES
+        kept = wp.tile_scan_inclusive(_live_chunk(keep_flags, first, work))
+        wp.tile_store(keep_scan, kept + wp.tile_full(SCAN_LANES, offsets[chunk], dtype=wp.int32), offset=first)
+
+
 @wp.kernel(enable_backward=False)
 def _detect_identity_kernel(
     ht_active_slots: wp.array[wp.int32],
@@ -1767,7 +1853,7 @@ class BodyPairContactReducer:
     the public API.
 
     Args:
-        rigid_contact_max: Capacity of the ``Contacts`` buffer being reduced;
+        rigid_contact_max: Initial rows of the ``Contacts`` buffer being reduced;
             ignored when ``pool`` is given.
         cell_size: Spatial cell edge [m] on the normal bin's face plane. Each
             (body pair, bin, cell) keeps its own deepest + extremes, so
@@ -1790,7 +1876,7 @@ class BodyPairContactReducer:
             returning it (``ContactSorter.borrow_full_scratch``) so growth
             borrows the current arrays.
         pool: Contact pool whose ready rows the per-contact buffers hold and
-            grow with; by default a fixed pool of ``rigid_contact_max`` rows.
+            grow with; by default a pool starting at ``rigid_contact_max`` rows.
     """
 
     def __init__(
@@ -1811,7 +1897,7 @@ class BodyPairContactReducer:
         pool: ContactPool | None = None,
     ):
         if pool is None:
-            pool = ContactPool(rigid_contact_max, device=device, rows=rigid_contact_max)
+            pool = ContactPool(device=device, rows=rigid_contact_max)
         self._pool = pool
         self.rigid_contact_max = pool.ready
         # Validate at KERNEL precision: the kernels receive float32, so a
@@ -1854,18 +1940,17 @@ class BodyPairContactReducer:
         # One entry per (body pair, bin, cell) actually touched. Sized from the
         # scene's own topology -- the distinct group pairs its contact-pair list
         # can produce (see build_reduction_group_pair_bound) -- rather than from
-        # rigid_contact_max, which counts CONTACTS and relates to the group
-        # count only through how many contacts share a patch, i.e. through
-        # exactly the quantity this pass exists to vary.
+        # the contact rows, which count CONTACTS and relate to the group count
+        # only through how many contacts share a patch, i.e. through exactly
+        # the quantity this pass exists to vary.
         #
         # The anchor is loose in both directions and deliberately so: it bounds
         # only the pair dimension of the key, and reachable pairs are not
-        # simultaneously active. Neither direction is unsafe. Undersizing
+        # simultaneously active. Neither direction is unsafe: undersizing
         # cannot drop a contact -- a bounded probe failure makes the whole
-        # frame keep everything, counted in fallback_frames -- and
-        # rigid_contact_max caps the request because a group cannot exist
-        # without a contact to create it. Tune with hashtable_headroom against
-        # the fallback_frames / max_hashtable_entries telemetry.
+        # frame keep everything, counted in fallback_frames. Tune with
+        # hashtable_headroom against the fallback_frames /
+        # max_hashtable_entries telemetry.
         if group_pair_bound is not None and group_pair_bound > 0:
             # A replicated scene can have only one reachable pair per body,
             # yet each pair occupies several normal bins / spatial cells.
@@ -1877,9 +1962,9 @@ class BodyPairContactReducer:
             capacity_request = int(max(group_pair_bound, group_budget) * hashtable_headroom)
         else:
             # No precomputed pair list to derive from; fall back to the old
-            # contact-anchored heuristic rather than guessing.
-            capacity_request = int(pool.bound * 0.25 * hashtable_headroom)
-        self.hashtable_capacity_request = max(1024, min(capacity_request, pool.bound))
+            # contact-anchored heuristic (at the initial rows) rather than guessing.
+            capacity_request = int(pool.ready * 0.25 * hashtable_headroom)
+        self.hashtable_capacity_request = max(1024, capacity_request)
         self.group_pair_bound = int(group_pair_bound) if group_pair_bound is not None else -1
         self.hashtable = HashTable(self.hashtable_capacity_request, device=device)
         self.ht_values = wp.zeros(BODY_PAIR_REDUCTION_SLOTS * self.hashtable.capacity, dtype=wp.uint64, device=device)
@@ -1895,8 +1980,11 @@ class BodyPairContactReducer:
         # canonical gap, face-plane position) and the gather scratch the sorter
         # does not lend.
         contact_fields = [
-            ContactField("keep_flags", wp.int32),
-            ContactField("keep_scan", wp.int32),
+            # The keep scan loads and stores whole chunks of SCAN_LANES: one more chunk stays mapped.
+            ContactField("keep_flags", wp.int32, extra=int(SCAN_LANES)),
+            ContactField("keep_scan", wp.int32, extra=int(SCAN_LANES)),
+            # Chunk totals of the keep scan: one per SCAN_LANES rows, held per row so it grows with them.
+            ContactField("_scan_chunk_totals", wp.int32, extra=int(SCAN_LANES)),
             ContactField("contact_entry", wp.int32),
             ContactField("contact_gap", wp.float32),
             ContactField("contact_pos2d", wp.vec2),
@@ -1962,10 +2050,6 @@ class BodyPairContactReducer:
         """Assign the per-contact buffers at the pool's ready rows, on creation and after each growth."""
         rows.publish(self)
         self.rigid_contact_max = rows.rows
-        # Fixed launch width for every pass; the kernels grid-stride over the
-        # live count, so this only has to fill the device. See
-        # REDUCTION_MAX_THREADS.
-        self.stride_threads = min(rows.rows, REDUCTION_MAX_THREADS)
         # The gather scratch is assembled again from the current arrays.
         self._scratch = None
 
@@ -2055,13 +2139,19 @@ class BodyPairContactReducer:
         # Derive this frame's validated work count (see the kernel docstring:
         # the raw narrow-phase counter is NOT a safe array bound on overflow).
         # Must run after the history snapshot, which reads last frame's flags.
-        wp.launch(
+        pool = self._pool
+        rows = pool.launch_rows()
+        # Fixed launch width for every contact pass; the kernels grid-stride over the live
+        # count, so this only has to fill the device (REDUCTION_MAX_THREADS). In a capture
+        # each replay runs at most one thread per live contact.
+        stride = min(rows, REDUCTION_MAX_THREADS)
+        count = contacts.rigid_contact_count
+        pool.launch(
             _prepare_frame_kernel,
-            dim=1,
-            inputs=[contacts.rigid_contact_count, self.rigid_contact_max],
+            1,
+            inputs=[count, rows],
             outputs=[self._frame_state, self._stats],
-            device=self.device,
-            record_tape=False,
+            row_args=(2,),
         )
 
         # keep_flags needs no memset: pass 1 writes every live entry, and
@@ -2097,9 +2187,9 @@ class BodyPairContactReducer:
             self.shape_world,
             self.up_rotation,
         ]
-        wp.launch(
+        pool.launch(
             _register_contacts_kernel,
-            dim=self.stride_threads,
+            stride,
             inputs=[
                 *geom_inputs,
                 self.cell_size,
@@ -2113,7 +2203,7 @@ class BodyPairContactReducer:
                 self.history_generation,
                 self.entry_generation,
                 self._frame_state,
-                self.stride_threads,
+                stride,
             ],
             outputs=[
                 self.keep_flags,
@@ -2123,8 +2213,8 @@ class BodyPairContactReducer:
                 self.contact_incumbent,
                 self._stats,
             ],
-            device=self.device,
-            record_tape=False,
+            extent=count,
+            clamp=True,
         )
         wp.launch(
             _detect_identity_kernel,
@@ -2134,9 +2224,9 @@ class BodyPairContactReducer:
             device=self.device,
             record_tape=False,
         )
-        wp.launch(
+        pool.launch(
             _select_winners_kernel,
-            dim=self.stride_threads,
+            stride,
             inputs=[
                 contacts.rigid_contact_count,
                 self.contact_entry,
@@ -2146,16 +2236,16 @@ class BodyPairContactReducer:
                 self.hysteresis,
                 self.ht_values,
                 self._frame_state,
-                self.stride_threads,
+                stride,
             ],
             outputs=[self.keep_flags],
-            device=self.device,
-            record_tape=False,
+            extent=count,
+            clamp=True,
         )
         if self.verify:
-            wp.launch(
+            pool.launch(
                 _verify_invariant_kernel,
-                dim=self.stride_threads,
+                stride,
                 inputs=[
                     contacts.rigid_contact_count,
                     self.contact_entry,
@@ -2166,13 +2256,48 @@ class BodyPairContactReducer:
                     self.ht_values,
                     self.keep_flags,
                     self._frame_state,
-                    self.stride_threads,
+                    stride,
                 ],
                 outputs=[self._stats],
-                device=self.device,
-                record_tape=False,
+                extent=count,
+                clamp=True,
             )
-        wp.utils.array_scan(self.keep_flags, self.keep_scan, True)
+        # Inclusive scan of the keep flags over the work count (a CUB scan would cover the rows of capture time).
+        # Its tiles load and store through views of the whole reservation, which a capture's
+        # rows do not clip after growth.
+        blocks = min(-(-rows // SCAN_LANES), SCAN_MAX_BLOCKS)
+        keep_flags = self._rows.reserved["keep_flags"]
+        keep_scan = self._rows.reserved["keep_scan"]
+        totals = self._rows.reserved["_scan_chunk_totals"]
+        pool.launch(
+            _scan_chunk_totals,
+            blocks,
+            inputs=[keep_flags, self._frame_state, blocks],
+            outputs=[totals],
+            extent=count,
+            clamp=True,
+            tiled=True,
+            block_dim=SCAN_LANES,
+        )
+        wp.launch_tiled(
+            _scan_chunk_offsets,
+            dim=[1],
+            inputs=[self._frame_state],
+            outputs=[totals],
+            block_dim=SCAN_LANES,
+            device=self.device,
+            record_tape=False,
+        )
+        pool.launch(
+            _scan_chunks,
+            blocks,
+            inputs=[keep_flags, self._frame_state, totals, blocks],
+            outputs=[keep_scan],
+            extent=count,
+            clamp=True,
+            tiled=True,
+            block_dim=SCAN_LANES,
+        )
         wp.launch(
             _detect_noop_kernel,
             dim=1,
@@ -2193,9 +2318,9 @@ class BodyPairContactReducer:
             if has_material
             else (sc["stiffness"], sc["damping"], sc["friction"])
         )
-        wp.launch(
+        pool.launch(
             _gather_kept_contacts_kernel,
-            dim=self.stride_threads,
+            stride,
             inputs=[
                 contacts.rigid_contact_count,
                 self.keep_flags,
@@ -2216,7 +2341,7 @@ class BodyPairContactReducer:
                 mat_src[1],
                 mat_src[2],
                 self._frame_state,
-                self.stride_threads,
+                stride,
             ],
             outputs=[
                 sc["point_id"],
@@ -2234,8 +2359,8 @@ class BodyPairContactReducer:
                 sc["damping"],
                 sc["friction"],
             ],
-            device=self.device,
-            record_tape=False,
+            extent=count,
+            clamp=True,
         )
         wp.launch(
             _write_reduced_count_kernel,
@@ -2245,9 +2370,9 @@ class BodyPairContactReducer:
             device=self.device,
             record_tape=False,
         )
-        wp.launch(
+        pool.launch(
             _scatter_back_kernel,
-            dim=self.stride_threads,
+            stride,
             inputs=[
                 contacts.rigid_contact_count,
                 sc["point_id"],
@@ -2266,7 +2391,7 @@ class BodyPairContactReducer:
                 sc["damping"],
                 sc["friction"],
                 self._frame_state,
-                self.stride_threads,
+                stride,
             ],
             outputs=[
                 contacts.rigid_contact_point_id,
@@ -2284,39 +2409,39 @@ class BodyPairContactReducer:
                 mat_dst[1],
                 mat_dst[2],
             ],
-            device=self.device,
-            record_tape=False,
+            extent=count,
+            clamp=True,
         )
 
         if sort_keys is not None:
             if self._sort_key_scratch is None:
                 raise ValueError("sort-key compaction requires preserve_sort_keys at construction")
-            wp.launch(
+            pool.launch(
                 _gather_reduced_sort_keys,
-                dim=self.stride_threads,
+                stride,
                 inputs=[
                     self._frame_state,
                     self.keep_flags,
                     self.keep_scan,
                     sort_keys,
                     self._sort_key_scratch,
-                    self.stride_threads,
+                    stride,
                 ],
-                device=self.device,
-                record_tape=False,
+                extent=count,
+                clamp=True,
             )
-            wp.launch(
+            pool.launch(
                 _scatter_reduced_sort_keys,
-                dim=self.stride_threads,
+                stride,
                 inputs=[
                     self._frame_state,
                     contacts.rigid_contact_count,
                     self._sort_key_scratch,
                     sort_keys,
-                    self.stride_threads,
+                    stride,
                 ],
-                device=self.device,
-                record_tape=False,
+                extent=count,
+                clamp=True,
             )
 
     def reset_history(self, world_mask=None):
