@@ -50,6 +50,7 @@ import warp as wp
 
 from ...sim import JointType
 from ...sim.articulation import compute_2d_rotational_dofs, compute_3d_rotational_dofs
+from .device_preludes import DevicePrelude
 from .law_source import LawFamily
 
 SPATIAL = LawFamily("Spatial")
@@ -135,6 +136,17 @@ def free_root_transport(linear: wp.vec3, angular: wp.vec3) -> wp.vec3:
     return wp.cross(angular, linear)
 
 
+@SPATIAL.law
+def cross_wrench(twist: wp.spatial_vector, wrench: wp.spatial_vector) -> wp.spatial_vector:
+    """Return ``twist x* wrench``, ``(w x f, w x t + v x f)``: the rate at which a frame moving with ``twist``
+    turns a fixed ``wrench`` (a body's gyroscopic wrench is its twist crossed with its momentum)."""
+    linear = wp.spatial_top(twist)
+    angular = wp.spatial_bottom(twist)
+    force = wp.spatial_top(wrench)
+    torque = wp.spatial_bottom(wrench)
+    return wp.spatial_vector(wp.cross(angular, force), wp.cross(angular, torque) + wp.cross(linear, force))
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # Inertia: (mass, first moment, rotational inertia) about the origin
 # ---------------------------------------------------------------------------------------------------------------------
@@ -212,6 +224,49 @@ def inertia_matrix(mass: float, moment: wp.vec3, rotational: wp.mat33) -> wp.spa
 def inertia_action(rotation: wp.quat, inertia: wp.mat33, vector: wp.vec3) -> wp.vec3:
     """Return a body-frame ``inertia`` applied to a world-frame ``vector``: ``R (I (R^T vector))``."""
     return wp.quat_rotate(rotation, inertia * wp.quat_rotate_inv(rotation, vector))
+
+
+INERTIA_CHANNELS = 13
+"""Channels of an inertia record: mass, first moment (3), rotational inertia about the origin (9, row-major)."""
+
+inertia_record = wp.types.vector(length=INERTIA_CHANNELS, dtype=wp.float32)
+"""A body's or a subtree's inertia about the origin as one value: channel-wise sums add inertias."""
+
+
+@wp.func
+def unpack_inertia(record: inertia_record):
+    """Return the ``(mass, moment, rotational)`` of an inertia record."""
+    moment = wp.vec3(record[1], record[2], record[3])
+    rotational = wp.mat33(
+        record[4], record[5], record[6], record[7], record[8], record[9], record[10], record[11], record[12]
+    )
+    return record[0], moment, rotational
+
+
+@wp.func
+def pack_inertia(mass: float, moment: wp.vec3, rotational: wp.mat33) -> inertia_record:
+    """Return the inertia record of ``(mass, moment, rotational)``."""
+    record = inertia_record()
+    record[0] = mass
+    for k in range(3):
+        record[1 + k] = moment[k]
+    for i in range(3):
+        for j in range(3):
+            record[4 + 3 * i + j] = rotational[i, j]
+    return record
+
+
+INERTIA_RECORDS = DevicePrelude(
+    "inertia_records",
+    """struct InertiaRecord {
+    // An inertia record: mass, first moment, rotational inertia about the origin (row-major), 13 floats.
+    static CUDA_CALLABLE inline wp::spatial_vector apply(const float* r, const wp::spatial_vector& twist) {
+        return Spatial::inertia_apply(r[0], wp::vec3(r[1], r[2], r[3]),
+            wp::mat33(r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12]), twist);
+    }
+};""",
+)
+"""Native reader of an inertia record: ``InertiaRecord::apply(record, twist)``, after the kit's prelude."""
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -300,3 +355,127 @@ def joint_transform(
             )
         return wp.transform(position, rotation)
     return wp.transform_identity()
+
+
+@SPATIAL.law(cuda=False)
+def joint_motion(
+    joint_type: int,
+    joint_axis: wp.array[wp.vec3],
+    lin_axis_count: int,
+    ang_axis_count: int,
+    anchor: wp.transform,
+    joint_qd: wp.array[float],
+    qd_start: int,
+    joint_S_s: wp.array[wp.spatial_vector],
+) -> wp.spatial_vector:
+    """Store a joint's motion-subspace columns about the origin in ``joint_S_s`` and return its twist.
+
+    ``anchor`` is the joint's parent anchor relative to the origin; every column is :func:`motion_axis`
+    of an axis (the kind a constant in each branch) but a free joint's, whose coordinates are the root's
+    velocity and angular velocity in its rotated frame.
+    """
+    if joint_type == JointType.PRISMATIC:
+        column = motion_axis(anchor, joint_axis[qd_start], False)
+        joint_S_s[qd_start] = column
+        return column * joint_qd[qd_start]
+    if joint_type == JointType.REVOLUTE:
+        column = motion_axis(anchor, joint_axis[qd_start], True)
+        joint_S_s[qd_start] = column
+        return column * joint_qd[qd_start]
+    if joint_type == JointType.D6:
+        twist = wp.spatial_vector()
+        # Unrolled, each axis kind a constant, as the one-axis branches.
+        if lin_axis_count > 0:
+            column = motion_axis(anchor, joint_axis[qd_start + 0], False)
+            twist += column * joint_qd[qd_start + 0]
+            joint_S_s[qd_start + 0] = column
+        if lin_axis_count > 1:
+            column = motion_axis(anchor, joint_axis[qd_start + 1], False)
+            twist += column * joint_qd[qd_start + 1]
+            joint_S_s[qd_start + 1] = column
+        if lin_axis_count > 2:
+            column = motion_axis(anchor, joint_axis[qd_start + 2], False)
+            twist += column * joint_qd[qd_start + 2]
+            joint_S_s[qd_start + 2] = column
+        first = qd_start + lin_axis_count
+        if ang_axis_count > 0:
+            column = motion_axis(anchor, joint_axis[first + 0], True)
+            twist += column * joint_qd[first + 0]
+            joint_S_s[first + 0] = column
+        if ang_axis_count > 1:
+            column = motion_axis(anchor, joint_axis[first + 1], True)
+            twist += column * joint_qd[first + 1]
+            joint_S_s[first + 1] = column
+        if ang_axis_count > 2:
+            column = motion_axis(anchor, joint_axis[first + 2], True)
+            twist += column * joint_qd[first + 2]
+            joint_S_s[first + 2] = column
+        return twist
+    if joint_type == JointType.BALL:
+        x = motion_axis(anchor, wp.vec3(1.0, 0.0, 0.0), True)
+        y = motion_axis(anchor, wp.vec3(0.0, 1.0, 0.0), True)
+        z = motion_axis(anchor, wp.vec3(0.0, 0.0, 1.0), True)
+        joint_S_s[qd_start + 0] = x
+        joint_S_s[qd_start + 1] = y
+        joint_S_s[qd_start + 2] = z
+        return x * joint_qd[qd_start + 0] + y * joint_qd[qd_start + 1] + z * joint_qd[qd_start + 2]
+    if joint_type == JointType.FREE or joint_type == JointType.DISTANCE:
+        rotation = wp.transform_get_rotation(anchor)
+        linear = wp.vec3(joint_qd[qd_start + 0], joint_qd[qd_start + 1], joint_qd[qd_start + 2])
+        angular = wp.vec3(joint_qd[qd_start + 3], joint_qd[qd_start + 4], joint_qd[qd_start + 5])
+        ex = wp.quat_rotate(rotation, wp.vec3(1.0, 0.0, 0.0))
+        ey = wp.quat_rotate(rotation, wp.vec3(0.0, 1.0, 0.0))
+        ez = wp.quat_rotate(rotation, wp.vec3(0.0, 0.0, 1.0))
+        joint_S_s[qd_start + 0] = wp.spatial_vector(ex, wp.vec3())
+        joint_S_s[qd_start + 1] = wp.spatial_vector(ey, wp.vec3())
+        joint_S_s[qd_start + 2] = wp.spatial_vector(ez, wp.vec3())
+        joint_S_s[qd_start + 3] = wp.spatial_vector(wp.vec3(), ex)
+        joint_S_s[qd_start + 4] = wp.spatial_vector(wp.vec3(), ey)
+        joint_S_s[qd_start + 5] = wp.spatial_vector(wp.vec3(), ez)
+        return wp.spatial_vector(wp.quat_rotate(rotation, linear), wp.quat_rotate(rotation, angular))
+    return wp.spatial_vector()
+
+
+@wp.func
+def joint_force(
+    joint_type: int,
+    joint_S_s: wp.array[wp.spatial_vector],
+    joint_f: wp.array[float],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    spring_stiffness: wp.array[float],
+    spring_reference: wp.array[float],
+    damping: wp.array[float],
+    q_start: int,
+    qd_start: int,
+    lin_axis_count: int,
+    ang_axis_count: int,
+    wrench: wp.spatial_vector,
+    add_existing: int,
+    tau: wp.array[float],
+):
+    """Write a joint's generalized forces: ``joint_f - S^T wrench``, with the passive spring and damper of
+    one-coordinate axes (prismatic, revolute and D6 joints), added to ``tau`` when ``add_existing``.
+
+    ``wrench`` is the joint's subtree wrench about the origin. Drive gains stay on the implicit augmented
+    path; a ball joint's quaternion is never a spring coordinate.
+    """
+    count = int(0)
+    passive = int(0)
+    if joint_type == JointType.BALL:
+        count = 3
+    elif joint_type == JointType.FREE or joint_type == JointType.DISTANCE:
+        count = 6
+    elif joint_type == JointType.PRISMATIC or joint_type == JointType.REVOLUTE or joint_type == JointType.D6:
+        count = lin_axis_count + ang_axis_count
+        passive = 1
+    for i in range(count):
+        dof = qd_start + i
+        value = -wp.dot(joint_S_s[dof], wrench) + joint_f[dof]
+        if passive != 0:
+            spring = spring_stiffness[dof] * (spring_reference[dof] - joint_q[q_start + i])
+            spring -= damping[dof] * joint_qd[dof]
+            value += spring
+        if add_existing != 0:
+            value += tau[dof]
+        tau[dof] = value

@@ -140,10 +140,10 @@ def test_twins_agree(test, device):
 
 
 class TestSpatialLawSource(unittest.TestCase):
-    def test_every_law_but_the_matrix_pack_and_joint_transform_renders(self):
-        """Native code reaches every law but the two whose consumers are Warp only."""
+    def test_every_law_but_the_matrix_pack_and_joint_laws_renders(self):
+        """Native code reaches every law but the three whose consumers are Warp only."""
         names = {law_source.law_signature(law).name for law in CUDA_LAWS}
-        self.assertEqual(set(spatial_laws.SPATIAL.laws) - names, {"inertia_matrix", "joint_transform"})
+        self.assertEqual(set(spatial_laws.SPATIAL.laws) - names, {"inertia_matrix", "joint_transform", "joint_motion"})
         source = spatial_laws.SPATIAL.prelude().source
         self.assertIn("return wp::transform_multiply(parent, child);", source)
 
