@@ -381,7 +381,7 @@ def _jacobians(
     motion: wp.array[wp.spatial_vector],
     jacobian: wp.array3d[float],
 ):
-    group, row, dof = wp.tid()
+    group, row = wp.tid()
     if work.status[0] != 0:
         return
     art = group_art[group]
@@ -389,23 +389,30 @@ def _jacobians(
     rep = work.spin_source[world, row]
     if rep < 0:
         return
+    size = jacobian.shape[2]
+    for dof in range(size):
+        jacobian[group, row, dof] = 0.0
+    if prescribed[art] != 0:
+        return
     lead = work.lead[rep]
-    value = float(0.0)
-    global_dof = art_start[art] + dof
-    if prescribed[art] == 0:
-        for side in range(2):
-            body = work.body_a[lead]
-            sign = float(1.0)
-            if side == 1:
-                body = work.body_b[lead]
-                sign = -1.0
-            if body >= 0 and body_art[body] == art:
-                joint = body_joint[body]
-                while joint >= 0:
-                    if qd_start[joint] <= global_dof and global_dof < qd_start[joint + 1]:
-                        value += sign * oracle_dot3(work.normal[lead], wp.spatial_bottom(motion[global_dof]))
-                    joint = ancestor[joint]
-    jacobian[group, row, dof] = value
+    first = art_start[art]
+    # Each endpoint's root path once, as the host twin walks it: side a's coordinates, then side b's.
+    for side in range(2):
+        body = work.body_a[lead]
+        sign = float(1.0)
+        if side == 1:
+            body = work.body_b[lead]
+            sign = -1.0
+        if body >= 0 and body_art[body] == art:
+            joint = body_joint[body]
+            while joint >= 0:
+                for global_dof in range(qd_start[joint], qd_start[joint + 1]):
+                    local = global_dof - first
+                    if local >= 0 and local < size:
+                        jacobian[group, row, local] += sign * oracle_dot3(
+                            work.normal[lead], wp.spatial_bottom(motion[global_dof])
+                        )
+                joint = ancestor[joint]
 
 
 class DeviceTorsionPreparation:
@@ -644,7 +651,7 @@ class DeviceTorsionPreparation:
         for size, jacobian in s.J_by_size.items():
             wp.launch(
                 _jacobians,
-                dim=jacobian.shape,
+                dim=jacobian.shape[:2],
                 inputs=[
                     w,
                     s.group_to_art[size],
