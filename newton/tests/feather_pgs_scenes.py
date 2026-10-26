@@ -1184,14 +1184,24 @@ def long_chain(*, links: int = 100, mu: float = 0.6, pull: float = 0.0, armature
 
     Every link carries a 2 cm sphere, so the chain lands on and rests along
     its whole length; an optional ``pull`` [N] on the head body along ``+x``
-    loads friction (a load that a few links share indeterminately makes the
-    run sensitive to the row order, so the gate leaves it at zero). The chain
-    has ``links + 1`` bodies and ``links + 6`` coordinates, above the
-    held-tree owner's caps. Joint ``armature`` [kg·m²] (a geared joint's rotor
-    inertia) bounds the condition number of the generalized mass matrix: a
-    passive 100-link cable without it reaches about 4e8, beyond float32, and
-    the solver adds the armature its factorization needs near the head (the
-    scene is then named ``long_chain_bare``).
+    loads friction (the gate leaves it at zero). The chain has ``links + 1``
+    bodies and ``links + 6`` coordinates, above the held-tree owner's caps.
+    Joint ``armature`` [kg·m²] (a geared joint's rotor inertia) bounds the
+    condition number of the generalized mass matrix: a passive 100-link cable
+    without it reaches about 4e8, beyond float32, and the solver adds the
+    armature its factorization needs near the head (the scene is then named
+    ``long_chain_bare``).
+
+    The support is statically indeterminate: the ``z`` joints leave the chain
+    rigid out of its plane, so ``links + 1`` contacts carry a body with three
+    such freedoms. The rigid contact problem then has a family of solutions,
+    and the order in which Gauss-Seidel visits the rows picks the member: at
+    rest, a sweep in the contacts' sorted order holds the chain to about
+    1e-6 rad/s, other orders leave up to 2e-3 rad/s and 2e-4 rad of drift by
+    the end, and more iterations do not remove it. The scene therefore sorts
+    its contacts, so every run and every route sweeps the same order;
+    otherwise the order would follow the warps of the atomic broad-phase,
+    contact and row allocations.
     """
     radius = 0.02
 
@@ -1237,5 +1247,6 @@ def long_chain(*, links: int = 100, mu: float = 0.6, pull: float = 0.0, armature
         solver_options={"dense_max_constraints": 384},
         rigid_contact_max=512,
         control=control,
+        deterministic_contacts=True,
         tags=frozenset({"articulated_contact", "large_articulation"}),
     )

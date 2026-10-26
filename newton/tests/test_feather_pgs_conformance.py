@@ -82,7 +82,8 @@ Reference and tolerances
     CPU. ``8 N`` is the converged reference. Its spread, the larger distance of
     the runs at ``N`` and ``8 N + 1`` (sequential Gauss-Seidel can cycle with
     period two) from it and, on CUDA, of a repeat of the run at ``N`` (atomic
-    row allocation varies the row order), sets every route's trajectory
+    allocation varies the row order; scenes whose support is statically
+    indeterminate sort their contacts instead), sets every route's trajectory
     tolerance:
     ``4 x spread + float32 floor`` in body position, rotation, velocity and
     angular velocity, over the run and at its end (a pose at rest under static
@@ -1062,11 +1063,15 @@ class Reference:
 def reference(physics: Physics, route: Route, device) -> Reference:
     """Run the reference route at the gate budget and converged, and derive the trajectory tolerance.
 
-    On CUDA the budget run repeats: contact rows are allocated with atomics,
-    so the row order, and with it a Gauss-Seidel iterate, varies from run to
-    run within the budget's convergence band, which the spread then includes.
-    A scene whose pipeline sorts its contacts (``deterministic_contacts``)
-    repeats bitwise, as FeatherPGS then gives the rows the contacts' order.
+    On CUDA the budget run repeats: the broad phase, the narrow phase and
+    FeatherPGS allocate pairs, contacts and rows with atomics, so the row
+    order, and with it a Gauss-Seidel iterate, follows the warps from run to
+    run. Where the contact problem is determinate the iterate stays within the
+    budget's convergence band, which the spread then includes. A statically
+    indeterminate support lets the order pick one of many rigid solutions,
+    which more iterations do not remove and one repeat cannot bound, so such
+    a scene sorts its contacts (``deterministic_contacts``) and repeats
+    bitwise, as FeatherPGS then gives the rows the contacts' order.
     """
     high = REFERENCE_FACTOR * physics.iterations
     converged = run_physics(physics, route, device, high)
