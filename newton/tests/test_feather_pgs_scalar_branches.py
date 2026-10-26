@@ -42,8 +42,12 @@ ARM_DROPPED_FIELDS = ("body_q_com", "body_a_s", "body_f_s", "body_I_s", "_body_i
 # inverse-mass projection and gravity force, which ordinary dynamics evaluates in another order;
 # the arm leaves the serial route for the held owner's float order.
 KEY_BOUND = {"rtol": 3.0e-5, "atol": 5.0e-6}
-# Key-only contact impulses [N·s] (1e-4 to 1e-2 per step in these tests) at the keys' relative bound.
-IMPULSE_BOUND = {"rtol": KEY_BOUND["rtol"], "atol": 1.0e-8}
+# Key-only contact impulses [N·s] (1e-4 to 1e-2 per step in these tests) at the split's rounding. A key's normal
+# row and its two tangent rows act on its one coordinate, and the tangents' diagonal is small (the key's axis is
+# nearly normal to the floor), so the rounding of a contact point moves the split between them: by up to 0.3% of
+# the normal impulse between the two routes, and by 0.13% within the ordinary route when only its pose arithmetic
+# rounds differently. The keys' coordinates and velocities, which the split leaves unchanged, keep KEY_BOUND.
+IMPULSE_BOUND = {"rtol": 5.0e-3, "atol": 1.0e-8}
 # The arm moves from ordinary dynamics (every reference here: no cached owner takes these worlds,
 # and cached_dynamics selects only that owner) to the held owner: the same law at the same mass
 # cadence in another float order. It is bounded by the held-solve tests' 1e-5 floor (ae6baadb) plus
@@ -2289,7 +2293,9 @@ class TestScalarBranchOwner(unittest.TestCase):
         for index, pair in enumerate(states):
             newton.eval_fk(model, pair[0].joint_q, pair[0].joint_qd, pair[0])
             install_held_contacts(model, pair[0], contacts[index], [(body, -1) for body in floors])
-        leaves = {"rtol": 1.0e-4, "atol": 1.0e-6}
+        # A resting leaf's velocity is its contact's residual after the sweeps (about 1e-6 m/s here), which the
+        # rounding of its pose moves by about as much.
+        leaves = {"rtol": 1.0e-4, "atol": 3.0e-6}
         for step in range(12):
             force = np.zeros((model.body_count, 6), dtype=np.float32)
             force[floors[1::2], 2] = -0.2 * (step + 1)

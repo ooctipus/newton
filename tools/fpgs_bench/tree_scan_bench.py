@@ -278,7 +278,8 @@ def bench_general(args, device):
         for name in args.passes or GENERAL_PASSES:
             run_inputs(route, name)
             row = {"shape": shape, "articulations": route.model.articulation_count, "pass": name}
-            row["time"] = _time(pass_launch(route, name, write_inertia_records=1), args.samples, device)
+            launch = pass_launch(route, name, block_dim=args.block_dim, write_inertia_records=1)
+            row["time"] = _time(launch, args.samples, device)
             rows.append(row)
             print(_format(row), flush=True)
     return rows
@@ -304,6 +305,7 @@ def main():
     parser.add_argument("--samples", type=int, default=21)
     parser.add_argument("--shapes", nargs="*")
     parser.add_argument("--passes", nargs="*")
+    parser.add_argument("--block-dim", type=int, help="general: one block size for every pass (default: the solver's)")
     parser.add_argument("--json")
     args = parser.parse_args()
     wp.init()

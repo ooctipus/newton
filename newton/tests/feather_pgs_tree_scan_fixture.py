@@ -533,9 +533,9 @@ GENERAL_PASSES = ("fk_kinematics", "fk_id", "tau", "composite_inertia", "crba")
 """The general route's passes, in step order (``fk_kinematics`` stands alone; the others follow ``fk_id``)."""
 
 
-def pass_launch(route: GeneralRoute, name: str, **values):
+def pass_launch(route: GeneralRoute, name: str, *, block_dim: int | None = None, **values):
     """One general-route pass as a launch callable, bound once to the solver's binding of the route's state
-    (``values``: its switches) and with the solver's block sizes."""
+    (``values``: its switches), with the solver's block sizes or ``block_dim``."""
     from newton._src.solvers.feather_pgs import tree_passes  # noqa: PLC0415
 
     m, solver, device = route.model, route.solver, route.model.device
@@ -547,9 +547,14 @@ def pass_launch(route: GeneralRoute, name: str, **values):
         "composite_inertia": (tree_passes.composite_inertia, 128),
     }
     if name in kernels:
-        kernel, block_dim = kernels[name]
+        kernel, solver_block = kernels[name]
         return functools.partial(
-            wp.launch, kernel, m.articulation_count, inputs=[dynamics], block_dim=block_dim, device=device
+            wp.launch,
+            kernel,
+            m.articulation_count,
+            inputs=[dynamics],
+            block_dim=block_dim or solver_block,
+            device=device,
         )
     if name != "crba":
         raise KeyError(name)
@@ -560,7 +565,7 @@ def pass_launch(route: GeneralRoute, name: str, **values):
             group_to_art.size * size,
             inputs=[dynamics, solver.body_I_c, group_to_art, size],
             outputs=[route.H[size]],
-            block_dim=128,
+            block_dim=block_dim or 128,
             device=device,
         )
         for size, group_to_art in route.size_groups

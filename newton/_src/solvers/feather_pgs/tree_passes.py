@@ -510,15 +510,16 @@ class _Column:
 def _mass_entries(ancestor: int, pivot: int, force: wp.spatial_vector, d: DynamicsData, column: _Column):
     """Column ``col``'s entries in the rows of ``ancestor``'s coordinates, ``S_row . force``, and their mirrors.
 
-    Each entry is written once: in the column's own joint only the rows up to the column, so of two coordinates
-    ``i < j`` of one joint, column ``j`` writes the shared entries with ``S_i . (I S_j)``.
+    Each entry is written once: in the column's own joint only the rows from the column on, so of two coordinates
+    ``i < j`` of one joint, the lower column ``i`` writes the shared entries with ``S_j . (I S_i)``.
     """
     q_start = d.joint_qd_start[ancestor]
     count = d.joint_dof_dim[ancestor, 0] + d.joint_dof_dim[ancestor, 1]
     local = q_start - column.first_dof
+    first = int(0)
     if ancestor == pivot:
-        count = column.col - local + 1
-    for k in range(count):
+        first = column.col - local
+    for k in range(first, count):
         row = local + k
         value = wp.dot(d.joint_S_s[q_start + k], force)
         if d.fused_augmented_drive != 0 and row == column.col:

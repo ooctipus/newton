@@ -528,7 +528,11 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         three revolute links (9 coordinates) put the root's six columns across a warp boundary in some of the
         64 worlds; with two writers per pair, the stored values and the symmetry followed the warp schedule.
         """
-        from newton._src.solvers.feather_pgs.kernels import crba_fill_par_dof  # noqa: PLC0415
+        from newton._src.solvers.feather_pgs import field_group  # noqa: PLC0415
+        from newton._src.solvers.feather_pgs.spatial_laws import inertia_record  # noqa: PLC0415
+        from newton._src.solvers.feather_pgs.tree_passes import DynamicsData, crba_fill  # noqa: PLC0415
+        from newton._src.solvers.feather_pgs.tree_plan import TreePlan  # noqa: PLC0415
+        from newton.tests.test_feather_pgs_sparse_mass_matrix import _random_inertia  # noqa: PLC0415
 
         device = wp.get_device("cuda:0")
         template = newton.ModelBuilder()
@@ -544,29 +548,38 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         model = builder.finalize(device=device)
         dofs = model.joint_dof_count // model.articulation_count
         rng = np.random.default_rng(1)
-        factors = rng.standard_normal((model.body_count, 6, 6))
-        inertia = factors @ np.swapaxes(factors, 1, 2) + 6.0 * np.eye(6)
+        records = np.asarray([_random_inertia(rng)[0] for _ in range(model.body_count)], dtype=np.float32)
+        plan = TreePlan.build(model.joint_ancestor.numpy())
+        dynamics = field_group.upload(
+            DynamicsData,
+            device,
+            articulation_start=model.articulation_start,
+            articulation_dof_start=wp.array(
+                model.joint_qd_start.numpy()[model.articulation_start.numpy()[:-1]], dtype=int, device=device
+            ),
+            mass_update_mask=wp.ones(model.articulation_count, dtype=int, device=device),
+            joint_child=model.joint_child,
+            joint_qd_start=model.joint_qd_start,
+            joint_dof_dim=model.joint_dof_dim,
+            joint_S_s=wp.array(rng.standard_normal((model.joint_dof_count, 6)), dtype=wp.spatial_vector, device=device),
+            dfs_order=plan.dfs_order,
+            dfs_position=plan.dfs_position,
+            dfs_end=plan.dfs_end,
+            fused_augmented_drive=0,
+            drive_row_by_dof=wp.full(model.joint_dof_count, -1, dtype=int, device=device),
+            row_K=wp.zeros(1, dtype=float, device=device),
+        )
         inputs = [
-            model.articulation_start,
-            wp.array(model.joint_qd_start.numpy()[model.articulation_start.numpy()[:-1]], dtype=int, device=device),
-            wp.ones(model.articulation_count, dtype=int, device=device),
-            model.joint_ancestor,
-            model.joint_child,
-            model.joint_qd_start,
-            model.joint_dof_dim,
-            wp.array(rng.standard_normal((model.joint_dof_count, 6)), dtype=wp.spatial_vector, device=device),
-            wp.array(inertia, dtype=wp.spatial_matrix, device=device),
+            dynamics,
+            wp.array(records, dtype=inertia_record, device=device),
             wp.array(np.arange(model.articulation_count), dtype=int, device=device),
             dofs,
-            0,
-            wp.full(model.joint_dof_count, -1, dtype=int, device=device),
-            wp.zeros(1, dtype=float, device=device),
         ]
         H = wp.zeros((model.articulation_count, dofs, dofs), dtype=float, device=device)
         first = None
         for _ in range(64):
             H.zero_()
-            wp.launch(crba_fill_par_dof, dim=H.size // dofs, inputs=inputs, outputs=[H], device=device, block_dim=128)
+            wp.launch(crba_fill, dim=H.size // dofs, inputs=inputs, outputs=[H], device=device, block_dim=128)
             values = H.numpy()
             np.testing.assert_array_equal(values, np.swapaxes(values, 1, 2))
             if first is None:
