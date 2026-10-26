@@ -720,46 +720,66 @@ def _write_contact_jacobian_lane(
     """Write one dof of a contact's normal row and, with flag bit 1, its two tangent rows.
 
     Each entry is one signed :func:`.contact_laws.jacobian_entry`, or two summed (A's first) when both bodies
-    belong to the same articulation. Rows act where :func:`.contact_laws.contact_row_frame` puts them.
+    belong to the same articulation. Rows act where :func:`.contact_laws.contact_row_frame` puts them. The three
+    rows are evaluated straight rather than in a row loop, so the tangent rows share their anchor's velocity and
+    no row frame stays live across iterations.
     """
     a_in = (flags & 4) != 0
     b_in = (flags & 8) != 0
-    rows = 1
-    if (flags & 2) != 0:
-        rows = 3
+    friction = (flags & 2) != 0
     bit = wp.uint32(1 << lane)
+    d0, a0, b0 = contact_row_frame(
+        0, shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
+    )
+    d1, a1, b1 = contact_row_frame(
+        1, shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
+    )
+    d2, a2, b2 = contact_row_frame(
+        2, shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
+    )
     if a_in and lane < articulation_response_dof_count[art_a]:
         group = art_group_idx[art_a]
         origin = articulation_origin[art_a]
         S = joint_S_s[art_dof_start[art_a] + lane]
-        a_moves = body_a >= 0 and (body_response_dof_mask[body_a] & bit) != wp.uint32(0)
-        b_moves = b_in and art_b == art_a and body_b >= 0 and (body_response_dof_mask[body_b] & bit) != wp.uint32(0)
-        for row in range(rows):
-            direction, p0, p1 = contact_row_frame(
-                row, shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
-            )
-            value = float(0.0)
-            if a_moves:
-                value += jacobian_entry(S, direction, p0, origin)
-            if b_moves:
-                value += -jacobian_entry(S, direction, p1, origin)
-            if articulation_response_dof_count[art_a] == size_a:
-                J_group_a[group, slot + row, lane] = value
-            else:
-                J_group_b[group, slot + row, lane] = value
+        jn = float(0.0)
+        jt0 = float(0.0)
+        jt1 = float(0.0)
+        if body_a >= 0 and (body_response_dof_mask[body_a] & bit) != wp.uint32(0):
+            jn += jacobian_entry(S, d0, a0, origin)
+            jt0 += jacobian_entry(S, d1, a1, origin)
+            jt1 += jacobian_entry(S, d2, a2, origin)
+        if b_in and art_b == art_a and body_b >= 0 and (body_response_dof_mask[body_b] & bit) != wp.uint32(0):
+            jn += -jacobian_entry(S, d0, b0, origin)
+            jt0 += -jacobian_entry(S, d1, b1, origin)
+            jt1 += -jacobian_entry(S, d2, b2, origin)
+        if articulation_response_dof_count[art_a] == size_a:
+            J_group_a[group, slot, lane] = jn
+            if friction:
+                J_group_a[group, slot + 1, lane] = jt0
+                J_group_a[group, slot + 2, lane] = jt1
+        else:
+            J_group_b[group, slot, lane] = jn
+            if friction:
+                J_group_b[group, slot + 1, lane] = jt0
+                J_group_b[group, slot + 2, lane] = jt1
     if b_in and (not a_in or art_b != art_a) and lane < articulation_response_dof_count[art_b]:
         group = art_group_idx[art_b]
         origin = articulation_origin[art_b]
         S = joint_S_s[art_dof_start[art_b] + lane]
-        b_moves = body_b >= 0 and (body_response_dof_mask[body_b] & bit) != wp.uint32(0)
-        for row in range(rows):
-            direction, p0, p1 = contact_row_frame(
-                row, shared_anchor, normal, tangent0, tangent1, point_a, point_b, friction_a, friction_b
-            )
-            value = float(0.0)
-            if b_moves:
-                value = -jacobian_entry(S, direction, p1, origin)
-            if articulation_response_dof_count[art_b] == size_a:
-                J_group_a[group, slot + row, lane] = value
-            else:
-                J_group_b[group, slot + row, lane] = value
+        jn = float(0.0)
+        jt0 = float(0.0)
+        jt1 = float(0.0)
+        if body_b >= 0 and (body_response_dof_mask[body_b] & bit) != wp.uint32(0):
+            jn = -jacobian_entry(S, d0, b0, origin)
+            jt0 = -jacobian_entry(S, d1, b1, origin)
+            jt1 = -jacobian_entry(S, d2, b2, origin)
+        if articulation_response_dof_count[art_b] == size_a:
+            J_group_a[group, slot, lane] = jn
+            if friction:
+                J_group_a[group, slot + 1, lane] = jt0
+                J_group_a[group, slot + 2, lane] = jt1
+        else:
+            J_group_b[group, slot, lane] = jn
+            if friction:
+                J_group_b[group, slot + 1, lane] = jt0
+                J_group_b[group, slot + 2, lane] = jt1
