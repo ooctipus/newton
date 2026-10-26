@@ -1252,12 +1252,14 @@ class ContactPool:
         replay dropped contacts, which its capacity status flags; this warns.
 
         Without a growth, once the mark has stayed within :data:`TRIM_BAND` of
-        where it stood :data:`TRIM_AFTER_PASSES` recorded passes earlier, it trims the rows to :data:`HEADROOM` rows per contact
-        of the mark, at least :data:`MIN_READY_ROWS`, a reservation and the rows
-        of any graph that sized work by the host's rows, in whole granules: it
-        lowers the ready rows in stream order and unmaps the pages past them in a
-        later call, once the replays submitted before have completed. Graphs keep
-        replaying meanwhile, and need no recapture. Only CUDA virtual memory trims.
+        where it stood :data:`TRIM_AFTER_PASSES` recorded passes earlier, it trims the rows to
+        :data:`HEADROOM` rows per contact of the mark, at least :data:`MIN_READY_ROWS`,
+        a reservation and the rows of any graph that sized work by the host's
+        rows, in whole granules: it lowers the ready rows in stream order on every
+        reader stream (:meth:`add_reader_stream`) and unmaps the pages past them in
+        a later call, once the work each of those streams submitted before has
+        completed. Graphs keep replaying meanwhile, and need no recapture. Only
+        CUDA virtual memory trims.
 
         Returns:
             Whether graphs that captured the buffers must be recaptured (see :meth:`grow`).
