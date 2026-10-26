@@ -22,8 +22,8 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import (
+    kernel_template,
     kernels,
-    mf_dispatch,
     mf_gs_source,
     paired_factor_source,
     path_selection,
@@ -31,7 +31,7 @@ from newton._src.solvers.feather_pgs import (
 )
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver
 from newton._src.solvers.feather_pgs.device_preludes import ARCHITECTURE_GUARD
-from newton._src.solvers.feather_pgs.row_inputs import make_row_kernel
+from newton._src.solvers.feather_pgs.kernel_template import KernelTemplate
 from newton._src.solvers.feather_pgs.solve_policy import (
     EXACT_POLICY,
     SWEEP_READOUT,
@@ -311,7 +311,7 @@ class TestSolvePolicy(unittest.TestCase):
                 self.assertEqual(
                     _kernel_hash(factory(*args, solve_policy=EXACT_POLICY, **kwargs)), _kernel_hash(kernel)
                 )
-                self.assertFalse(getattr(kernel, "_fpgs_solve_readout", False))
+                self.assertNotIn("readout", [argument.label for argument in kernel.adj.args])
                 self.assertNotIn("solve_readout_sweeps", "".join(_native_snippets(kernel)))
 
     def test_readout_appends_one_operand_prelude_and_exit_record(self):
@@ -321,7 +321,6 @@ class TestSolvePolicy(unittest.TestCase):
                 exact = factory(*args, **kwargs)
                 kernel = factory(*args, solve_policy=SWEEPS, **kwargs)
                 self.assertEqual(kernel.key, exact.key + "_sweeps")
-                self.assertTrue(kernel._fpgs_solve_readout)
                 labels = [argument.label for argument in kernel.adj.args]
                 self.assertEqual(labels, [argument.label for argument in exact.adj.args] + ["readout"])
                 self.assertIs(kernel.adj.args[-1].type, SolveReadout)
@@ -352,18 +351,27 @@ class TestSolvePolicy(unittest.TestCase):
 
         def signature(candidate: int, value: wp.array[float]): ...
 
-        for dispatch in ("tiles", "worlds"):
-            with self.subTest(dispatch=dispatch), self.assertRaisesRegex(ValueError, "world"):
-                make_row_kernel("bad_dispatch", "", signature, dispatch=dispatch)
+        for dispatch in (kernel_template.tiles(1, 32), kernel_template.WORLDS, kernel_template.WORLD_QUEUE):
+            with self.subTest(dispatch=dispatch.body), self.assertRaisesRegex(ValueError, "world"):
+                KernelTemplate.from_abi("bad_dispatch", signature, "", dispatch)
 
     def test_dispatch_operands_extend_the_native_abi(self):
-        """Append private operands to the matrix-free dispatch exactly as to its native declaration."""
-        native = mf_dispatch.make_native("", extra={"readout": SolveReadout})
-        dispatch = mf_dispatch.make_dispatch(native, extra={"readout": SolveReadout})
-        names = list(inspect.signature(dispatch).parameters)
-        self.assertEqual(names[-2:], ["v_out", "readout"])
-        plain = mf_dispatch.make_dispatch(mf_dispatch.make_native(""))
-        self.assertEqual(list(inspect.signature(plain).parameters), names[:-1])
+        """Append the readout operand to the matrix-free sweep's kernel signature exactly as to its native ABI."""
+
+        def template(policy):
+            return KernelTemplate.from_abi(
+                "mf_gs", solver._MF_GS_ABI, "", kernel_template.WORLD_QUEUE, extra=policy.arguments, composed=True
+            )
+
+        counted, plain = template(SWEEPS), template(EXACT_POLICY)
+        for names in ([name for name, _ in counted.signature], [name for name, _ in counted.native_params]):
+            self.assertEqual(names[-2:], ["v_out", "readout"])
+        self.assertIs(counted.signature[-1][1], SolveReadout)
+        self.assertEqual(plain.signature, counted.signature[:-1])
+        self.assertEqual(plain.native_params, counted.native_params[:-1])
+        # The world queue's operands lead the kernel's signature; the native function takes the world instead.
+        self.assertEqual(plain.signature[: len(kernel_template.WORLD_QUEUE.extra)], kernel_template.WORLD_QUEUE.extra)
+        self.assertEqual(plain.native_params[0], ("world", int))
 
 
 def _policy_snippet(test, kernel, marker):
@@ -456,11 +464,8 @@ class TestVelocityExitLaw(unittest.TestCase):
             for policy in (SWEEPS, VELOCITY, TRACED_VELOCITY):
                 kernel = factory(*args, solve_policy=policy, **kwargs)
                 self.assertEqual(kernel.key, plain.key + policy.suffix, kwargs)
-                self.assertEqual(getattr(kernel, "_fpgs_solve_readout", False), policy.counts and policy.readout)
                 labels = [argument.label for argument in kernel.adj.args]
                 self.assertEqual(labels, [argument.label for argument in plain.adj.args] + ["readout"] * policy.counts)
-                if hasattr(plain, "_fpgs_velocity_limit_law"):
-                    self.assertEqual(getattr(kernel, "_fpgs_velocity_limit_law", None), plain._fpgs_velocity_limit_law)
                 snippet = max(_native_snippets(kernel), key=len)
                 if len(_LAW_SITE.findall(snippet)) != law_sites or ("s_meta_dense" in snippet) != (
                     "s_meta_dense" in body
@@ -502,7 +507,6 @@ class TestVelocityExitLaw(unittest.TestCase):
         for name, factory, args, kwargs in _factory_calls():
             with self.subTest(factory=name):
                 kernel = factory(*args, solve_policy=TRACE, **kwargs)
-                self.assertEqual(kernel._fpgs_solve_readout, "trace")
                 self.assertIs(kernel.adj.args[-1].type, SolveTrace)
                 snippet = _policy_snippet(self, kernel, "solve_trace_sweep(")
                 body = snippet.split(SWEEP_TRACE.source, 1)[1]
@@ -531,7 +535,7 @@ class TestVelocityExitLaw(unittest.TestCase):
                 with self.subTest(options=options, policy=policy), self.assertRaises(SolvePolicyUnsupported):
                     solver._get_pgs_solve_mf_gs_kernel.__wrapped__(64, 32, 12, "120", solve_policy=policy, **options)
             kernel = solver._get_pgs_solve_mf_gs_kernel.__wrapped__(64, 32, 12, "120", solve_policy=SWEEPS, **options)
-            self.assertEqual(kernel._fpgs_solve_readout, "sweeps")
+            self.assertIs(kernel.adj.args[-1].type, SolveReadout)
 
     def test_active_rows_wait_for_violated_rows_under_a_tolerance(self):
         """Stop an active-row sparse sweep under a tolerance only after a scan bounds every unvisited violation.
@@ -558,11 +562,11 @@ class TestSolveReadoutRecord(unittest.TestCase):
     def test_record_allocates_slots_and_summarizes_counts(self):
         """Allocate counters for readout kernels only and summarize their cumulative histogram."""
         record = SolveReadoutRecord(SWEEPS)
-        counted = SimpleNamespace(key="counted_kernel", _fpgs_solve_readout=True)
+        counted = SimpleNamespace(key="counted_kernel")
         plain = SimpleNamespace(key="plain_kernel")
-        record.register(counted, "sparse_pgs", world_count=3, budget=4, device="cpu")
-        record.register(plain, "mf_gs", world_count=3, budget=4, device="cpu")
-        record.register(None, "paired_factor", world_count=3, budget=4, device="cpu")
+        record.register(counted, "sparse_pgs", readout="sweeps", world_count=3, budget=4, device="cpu")
+        record.register(plain, "mf_gs", readout=None, world_count=3, budget=4, device="cpu")
+        record.register(None, "paired_factor", readout="sweeps", world_count=3, budget=4, device="cpu")
         self.assertEqual(record.kernels, {"counted_kernel": "sparse_pgs"})
         self.assertEqual(record.operands(plain), [])
         (operand,) = record.operands(counted)
@@ -589,8 +593,8 @@ class TestSolveReadoutRecord(unittest.TestCase):
         would dilute the full-budget fraction of the worlds a tolerance could shorten.
         """
         record = SolveReadoutRecord(SWEEPS)
-        counted = SimpleNamespace(key="counted_kernel", _fpgs_solve_readout="sweeps")
-        record.register(counted, "sparse_pgs", world_count=3, budget=4, device="cpu")
+        counted = SimpleNamespace(key="counted_kernel")
+        record.register(counted, "sparse_pgs", readout="sweeps", world_count=3, budget=4, device="cpu")
         (operand,) = record.operands(counted)
         # World 0: two solves of four sweeps; world 1: one of two; world 2 has no rows: three one-sweep solves.
         sweeps = np.zeros((5, 3), dtype=np.int32)
@@ -604,8 +608,8 @@ class TestSolveReadoutRecord(unittest.TestCase):
         self.assertAlmostEqual(past["full_budget_fraction"], 2.0 / 3.0)
         self.assertAlmostEqual(past["mean_sweeps"], 10.0 / 3.0)
         # A one-sweep budget leaves nothing past the first sweep.
-        short = SimpleNamespace(key="short_kernel", _fpgs_solve_readout="sweeps")
-        record.register(short, "mf_gs", world_count=1, budget=1, device="cpu")
+        short = SimpleNamespace(key="short_kernel")
+        record.register(short, "mf_gs", readout="sweeps", world_count=1, budget=1, device="cpu")
         self.assertEqual(
             record.summary()["slots"][1]["past_first_sweep"],
             {"solves": 0, "full_budget_fraction": None, "mean_sweeps": None},
@@ -619,10 +623,10 @@ class TestSolveReadoutRecord(unittest.TestCase):
         solve's slot, those solves would read as full-budget position solves.
         """
         record = SolveReadoutRecord(SWEEPS)
-        counted = SimpleNamespace(key="counted_kernel", _fpgs_solve_readout="sweeps")
-        position_only = SimpleNamespace(key="position_only", _fpgs_solve_readout="sweeps")
-        record.register(counted, "mf_gs", world_count=2, budget=8, device="cpu", velocity_budget=2)
-        record.register(position_only, "sparse_pgs", world_count=2, budget=8, device="cpu")
+        counted = SimpleNamespace(key="counted_kernel")
+        position_only = SimpleNamespace(key="position_only")
+        record.register(counted, "mf_gs", readout="sweeps", world_count=2, budget=8, device="cpu", velocity_budget=2)
+        record.register(position_only, "sparse_pgs", readout="sweeps", world_count=2, budget=8, device="cpu")
         (position,) = record.operands(counted)
         with record.velocity_pass():
             (velocity,) = record.operands(counted)
@@ -651,8 +655,10 @@ class TestSolveReadoutRecord(unittest.TestCase):
         it; a world's solves are its slots' solves plus its skipped ones.
         """
         record = SolveReadoutRecord(SWEEPS)
-        counted = SimpleNamespace(key="counted_kernel", _fpgs_solve_readout="sweeps")
-        record.register(counted, "mf_gs_incremental", world_count=4, budget=4, device="cpu", velocity_budget=2)
+        counted = SimpleNamespace(key="counted_kernel")
+        record.register(
+            counted, "mf_gs_incremental", readout="sweeps", world_count=4, budget=4, device="cpu", velocity_budget=2
+        )
         record.register_skipped(world_count=4, device="cpu", velocity_budget=2)
         # World 0 holds dense rows and world 2 matrix-free rows; worlds 1 and 3 have none.
         dense = wp.array([4, 0, 0, 0], dtype=wp.int32, device="cpu")
@@ -685,8 +691,8 @@ class TestSolveReadoutRecord(unittest.TestCase):
     def test_trace_record_summarizes_stops_reasons_and_final_changes(self):
         """Summarize the trace's per-tolerance stopping sweeps, exit reasons and final-sweep changes."""
         record = SolveReadoutRecord(TRACE)
-        traced = SimpleNamespace(key="traced_kernel", _fpgs_solve_readout="trace")
-        record.register(traced, "mf_gs", world_count=2, budget=4, device="cpu")
+        traced = SimpleNamespace(key="traced_kernel")
+        record.register(traced, "mf_gs", readout="trace", world_count=2, budget=4, device="cpu")
         (operand,) = record.operands(traced)
         self.assertEqual(operand.stops.shape, (len(TRACE_GRID), 6))
         self.assertEqual(operand.limits.shape, (len(TRACE_KINDS), TRACE_BINS))
@@ -714,8 +720,8 @@ class TestSolveReadoutRecord(unittest.TestCase):
         training-length run; the per-world counts stay 32-bit.
         """
         record = SolveReadoutRecord(TRACE)
-        traced = SimpleNamespace(key="traced_kernel", _fpgs_solve_readout="trace")
-        record.register(traced, "sparse_pgs", world_count=16384, budget=8, device="cpu")
+        traced = SimpleNamespace(key="traced_kernel")
+        record.register(traced, "sparse_pgs", readout="trace", world_count=16384, budget=8, device="cpu")
         (operand,) = record.operands(traced)
         self.assertEqual(
             {name: getattr(operand, name).dtype for name in ("sweeps", "exhausted")},

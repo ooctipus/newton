@@ -69,6 +69,26 @@ class DevicePrelude:
     """The CPU twin of :attr:`source`, for bodies :func:`dual_native` composes; ``None`` for CUDA-only preludes."""
 
 
+def substitute(text: str, vocabulary: dict | None = None, /, **values) -> str:
+    """Fill the ``$NAME`` (or ``${NAME}``) slots of ``text``.
+
+    Every slot needs a value, and every keyword value a slot; ``vocabulary`` offers values a text may or may not use
+    (a layout's sizes). Values are converted with ``str`` and never searched for slots themselves.
+
+    Args:
+        text: A source template (``string.Template`` syntax; ``$$`` is a literal ``$``).
+        vocabulary: Values available to every slot, by name; keyword values take precedence.
+        values: The value of each slot.
+    """
+    template = Template(text)
+    slots = set(template.get_identifiers())
+    available = {**(vocabulary or {}), **values}
+    missing, unused = sorted(slots - available.keys()), sorted(values.keys() - slots)
+    if missing or unused:
+        raise ValueError(f"source slots without values {missing}, values without slots {unused}")
+    return template.substitute({name: str(available[name]) for name in slots})
+
+
 def cuda_native(body: str, *, preludes: tuple[DevicePrelude, ...] = (), lead: str = "\n") -> str:
     """Return a ``func_native`` snippet that opens with one architecture guard and the body's preludes.
 
@@ -104,8 +124,7 @@ def dual_native(body: str, *, preludes: tuple[DevicePrelude, ...]) -> str:
 # Lane groups
 # ---------------------------------------------------------------------------------------------------------------------
 
-_LANE_GROUP = Template(
-    """    const int LANES = $lanes, WIDTH = LANES < 32 ? LANES : 32;
+_LANE_GROUP = """    const int LANES = $lanes, WIDTH = LANES < 32 ? LANES : 32;
     const unsigned MASK = (0xffffffffu >> (32 - WIDTH)) << (threadIdx.x & (31 & ~(WIDTH - 1)));
     const int LANE = LANES <= 32 ? (int)(threadIdx.x & (LANES - 1)) : (int)threadIdx.x;
     const int STRIDE = LANES <= 32 ? LANES : (int)blockDim.x;
@@ -168,7 +187,6 @@ _LANE_GROUP = Template(
         if (LANE == 0 && n != 0) first = atomicAdd(counter, n);
         return READ(first, 0);
     };"""
-)
 
 # One thread runs the whole group on the CPU.
 _LANE_GROUP_CPU = """    const int LANES = 1, WIDTH = 1;
@@ -216,7 +234,7 @@ def lane_group(lanes: int | str) -> DevicePrelude:
     """
     if isinstance(lanes, int) and (lanes < 1 or (lanes & (lanes - 1) if lanes <= 32 else lanes % 32)):
         raise ValueError(f"a lane group needs a power of two up to 32 lanes or whole warps, got {lanes}")
-    return DevicePrelude(f"lane_group_{lanes}", _LANE_GROUP.substitute(lanes=lanes), _LANE_GROUP_CPU)
+    return DevicePrelude(f"lane_group_{lanes}", substitute(_LANE_GROUP, lanes=lanes), _LANE_GROUP_CPU)
 
 
 # ---------------------------------------------------------------------------------------------------------------------

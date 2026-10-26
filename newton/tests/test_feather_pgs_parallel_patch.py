@@ -32,6 +32,7 @@ import newton
 from newton._src.solvers.feather_pgs import keyed_rows, path_selection
 from newton._src.solvers.feather_pgs import solver_feather_pgs as source
 from newton._src.solvers.feather_pgs.device_preludes import RING
+from newton._src.solvers.feather_pgs.kernel_template import SweepTier
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -54,7 +55,14 @@ from newton.tests.feather_pgs_row_builders import (
     install_cpu_keyed_rows,
     launched_kernels,
 )
+from newton.tests.test_feather_pgs_native_prelude import _native_snippets
 from newton.tests.test_feather_pgs_velocity_limit_law import _HAND_LIMIT, _limited_hand
+
+
+def _source(tier):
+    """A parallel tier's native sweep source (its kernel's longest native snippet)."""
+    return max(_native_snippets(tier.kernel), key=len)
+
 
 _DOFS = 6
 _CAPACITY = 64
@@ -621,10 +629,10 @@ class TestParallelPatchReference(unittest.TestCase):
             with self.subTest(**options):
                 point = source._get_pgs_solve_parallel_kernel(_CAPACITY, 32, _DOFS, "120", **options)
                 linked = source._get_pgs_solve_parallel_kernel(_CAPACITY, 32, _DOFS, "120", linked_rows=True, **options)
-                self.assertTrue(point.key.endswith("_iso"), point.key)
-                self.assertEqual(linked.key, point.key.removesuffix("_iso") + "_linked_iso")
-                point_source = point._fpgs_row_native_source
-                linked_source = linked._fpgs_row_native_source
+                self.assertTrue(point.kernel.key.endswith("_iso"), point.kernel.key)
+                self.assertEqual(linked.kernel.key, point.kernel.key.removesuffix("_iso") + "_linked_iso")
+                point_source = _source(point)
+                linked_source = _source(linked)
                 for text, golden in (
                     (point_source, _POINT_WARP_PAIR),
                     (point_source, _POINT_BLOCK_PAIR),
@@ -638,7 +646,7 @@ class TestParallelPatchReference(unittest.TestCase):
                 self.assertEqual(linked_source.count(RING.source), 1)
                 restored = linked_source.replace(RING.source + "\n", "").replace(_LINKED_WARP_PAIR, _POINT_WARP_PAIR)
                 self.assertEqual(restored.replace(_LINKED_BLOCK_PAIR, _POINT_BLOCK_PAIR), point_source)
-                self.assertEqual(linked._fpgs_block_dim, point._fpgs_block_dim)
+                self.assertEqual(linked.block_dim, point.block_dim)
 
     def test_reference_holds_pooled_cones_and_restores_point_rings(self):
         """Keep each pair inside its pooled ring disk, and reduce to point friction without ring links."""
@@ -722,9 +730,9 @@ class TestParallelPatchReference(unittest.TestCase):
         ):
             for linked in (False, True):
                 with self.subTest(shape=shape, linked=linked, **extra):
-                    kernel = factory(*shape, rows=32, sweeps=24, linked_rows=linked, **extra)
-                    self.assertTrue(kernel.key.endswith("_linked_iso" if linked else "_iso"), kernel.key)
-                    self.assertEqual(kernel._fpgs_row_native_source.count(_ISOTROPIC_STEP), 1)
+                    tier = factory(*shape, rows=32, sweeps=24, linked_rows=linked, **extra)
+                    self.assertTrue(tier.kernel.key.endswith("_linked_iso" if linked else "_iso"), tier.kernel.key)
+                    self.assertEqual(_source(tier).count(_ISOTROPIC_STEP), 1)
         self.assertNotIn("pair_step", inspect.signature(source._get_pgs_solve_parallel_kernel).parameters)
 
     def test_isotropic_pairs_slide_with_maximal_dissipation(self):
@@ -792,10 +800,10 @@ class TestParallelPatchReference(unittest.TestCase):
                 settings = {"rows": 32, "sweeps": 24, "linked_rows": True, **options}
                 plain = factory(*args, **settings)
                 last_word = factory(*args, velocity_limit_pass=True, **settings)
-                self.assertEqual(last_word.key, plain.key + "_lw")
-                self.assertEqual((plain._fpgs_velocity_limit_pass, last_word._fpgs_velocity_limit_pass), (False, True))
-                text = last_word._fpgs_row_native_source
-                self.assertNotIn("s_vlim", plain._fpgs_row_native_source)
+                self.assertEqual(last_word.kernel.key, plain.kernel.key + "_lw")
+                self.assertEqual((plain.velocity_limit_pass, last_word.velocity_limit_pass), (False, True))
+                text = _source(last_word)
+                self.assertNotIn("s_vlim", _source(plain))
                 self.assertEqual(text.count("s_vlim[i] = row_type == 4 ? 1 : 0;"), 1)
                 self.assertEqual(text.count("Last word: ordered push-only velocity-limit pass"), 1)
                 self.assertIn(row_read, text)
@@ -1035,11 +1043,11 @@ class TestKeyedPatchRows(unittest.TestCase):
         options = {"rows": 32, "sweeps": 24, "matrix_free": True, "inkernel_response": (16, 6, 0, 16)}
         point = factory(128, 32, 22, "120", **options)
         linked = factory(128, 32, 22, "120", linked_rows=True, **options)
-        self.assertEqual(linked.key, point.key.removesuffix("_iso") + "_linked_iso")
-        self.assertTrue(linked.key.startswith("pgs_solve_kinetic_keyed_parallel_"))
-        self.assertIn("patch_law", inspect.signature(linked.func).parameters)
-        self.assertNotIn("patch_law", inspect.signature(point.func).parameters)
-        text = linked._fpgs_row_native_source
+        self.assertEqual(linked.kernel.key, point.kernel.key.removesuffix("_iso") + "_linked_iso")
+        self.assertTrue(linked.kernel.key.startswith("pgs_solve_kinetic_keyed_parallel_"))
+        self.assertIn("patch_law", inspect.signature(linked.kernel.func).parameters)
+        self.assertNotIn("patch_law", inspect.signature(point.kernel.func).parameters)
+        text = _source(linked)
         self.assertIn("s_parent[i] = world_row_parent.data[off_dense + i];", text)
         self.assertIn("s_mu[i] = world_row_mu.data[off_dense + i];", text)
         for written in ("c.row_parent.data", "c.row_mu.data", "c.row_type.data", "built_parent", "built_mu"):
@@ -1180,7 +1188,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 for rows, sweeps in ((32, 24), (64, 34))
             ]
             probe = SimpleNamespace(
-                _pgs_solve_mf_gs_incremental_kernels=kernels,
+                _mf_gs_tiers=kernels,
                 _par_tiers=[(32, 0), (64, 32)],
                 _par_sweeps_rule="auto",
                 _par_sweeps_reason="auto: ...",
@@ -1214,7 +1222,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 _CAPACITY, 32, _DOFS, "120", incremental_rows=32, velocity_limit_law=law
             )
             probe = SimpleNamespace(
-                _pgs_solve_mf_gs_incremental_kernels=[kernel],
+                _mf_gs_tiers=[SweepTier(kernel, velocity_limit_law=law)],
                 _ink_rows=0,
                 enable_joint_velocity_limits=True,
                 velocity_limit_activation_fraction=0.0,
@@ -1402,8 +1410,9 @@ def _dummy(arg):
     return arg.type(0)
 
 
-def _launch_parallel(kernel, case, *, inkernel, device):
+def _launch_parallel(tier, case, *, inkernel, device):
     """Launch one world through a parallel tier and return its impulses and velocity."""
+    kernel = tier.kernel
     count = len(case["J"])
     padded = np.zeros((1, _CAPACITY))
 
@@ -1448,7 +1457,7 @@ def _launch_parallel(kernel, case, *, inkernel, device):
         values[name] if name in values else _dummy(arguments[name])
         for name in inspect.signature(kernel.func).parameters
     ]
-    wp.launch_tiled(kernel, dim=[1], inputs=inputs, block_dim=kernel._fpgs_block_dim, device=device)
+    wp.launch_tiled(kernel, dim=[1], inputs=inputs, block_dim=tier.block_dim, device=device)
     return values["world_impulses"].numpy()[0, :count], values["v_out"].numpy()
 
 
@@ -1718,7 +1727,7 @@ def _assert_tier_owned(test, solver, budget):
     worlds, so a world in that domain is the tier's (``skip_incremental_rows``).
     """
     test.assertEqual(solver._ink_rows, budget)
-    test.assertTrue(solver._pgs_solve_mf_gs_incremental_kernels)
+    test.assertTrue(solver._mf_gs_tiers)
     test.assertFalse(solver._local_internal_fast_path)
     counts, free_rows = solver.constraint_count.numpy(), solver.mf_constraint_count.numpy()
     test.assertGreater(int(counts.max()), 0)
@@ -1793,7 +1802,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
             self.assertEqual(solver._ink_rows, 32)
             # The tier owns the ordinary buffers for either law.
             self.assertIsNone(solver._sparse_mass_matrix_size)
-            keys = [kernel.key for kernel in solver._pgs_solve_mf_gs_incremental_kernels]
+            keys = [tier.kernel.key for tier in solver._mf_gs_tiers]
             self.assertTrue(keys)
             self.assertTrue(all(key.endswith("_linked_iso" if linked else "_iso") for key in keys), keys)
             self.assertTrue(all(("_linked" in key) == linked for key in keys), keys)
@@ -1804,7 +1813,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
             self.assertEqual((tiers["sweeps"], tiers["sweeps_rule"]), (sweeps, "auto"))
         # Opted out, patch friction keeps the serial route it had before the tiers learned the ring.
         self.assertEqual(opted_out._ink_rows, 0)
-        self.assertEqual(opted_out._pgs_solve_mf_gs_incremental_kernels, [])
+        self.assertEqual(opted_out._mf_gs_tiers, [])
         expected, actual = serial.get_path_selection(), opted_out.get_path_selection()
         for record in (expected, actual):
             record["routes"]["contact_rows"]["keyed_rows"].pop("reason")
@@ -1971,7 +1980,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
         for (limits, requested), solver in built.items():
             with self.subTest(limits=limits, requested=requested):
                 last_word = limits and requested
-                keys = [kernel.key for kernel in solver._pgs_solve_mf_gs_incremental_kernels]
+                keys = [tier.kernel.key for tier in solver._mf_gs_tiers]
                 self.assertTrue(keys)
                 self.assertTrue(all(key.endswith("_linked_iso_lw" if last_word else "_linked_iso") for key in keys))
                 selected = solver.get_path_selection()
@@ -1988,7 +1997,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
                     self.assertLessEqual(speed, limit * (1.0 + 1.0e-5))
         velocities = {}
         for (sweeps, requested), solver in budgets.items():
-            keys = [kernel.key for kernel in solver._pgs_solve_mf_gs_incremental_kernels]
+            keys = [tier.kernel.key for tier in solver._mf_gs_tiers]
             self.assertTrue(
                 keys and all(f"_sweeps{sweeps}_" in key and key.endswith("_lw") == requested for key in keys), keys
             )
@@ -2029,7 +2038,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
                 else:
                     budget = sweeps if linked is None else linked
                     expected, rule = [budget, budget], "mf_gs_parallel_linked_sweeps"
-                keys = [kernel.key for kernel in solver._pgs_solve_mf_gs_incremental_kernels]
+                keys = [tier.kernel.key for tier in solver._mf_gs_tiers]
                 self.assertEqual(len(keys), 2, keys)
                 for key, budget in zip(keys, expected, strict=True):
                     self.assertIn(f"_sweeps{budget}_", key)
@@ -2069,7 +2078,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
 
     def _assert_budget(self, solver, parallel_rows):
         """Require the tiers to sweep the automatic budget of 32 rows at eight iterations."""
-        keys = [kernel.key for kernel in solver._pgs_solve_mf_gs_incremental_kernels]
+        keys = [tier.kernel.key for tier in solver._mf_gs_tiers]
         self.assertEqual(bool(keys), bool(parallel_rows), keys)
         budget = source._auto_tier_sweeps(32, 8, 24)
         self.assertTrue(all(f"_sweeps{budget}_" in key for key in keys), keys)
@@ -2221,8 +2230,8 @@ class TestPatchParallelPhysics(unittest.TestCase):
             routes["budgeted"] = _matrix_free_solver(model, beta=0.2, parallel_rows=32, **budgeted)
         for name in ("truncated", "budgeted"):
             sweeps = 2000 if name == "budgeted" else 2
-            kernels = routes[name]._pgs_solve_mf_gs_incremental_kernels
-            self.assertTrue(kernels and all(f"_sweeps{sweeps}_" in kernel.key for kernel in kernels), name)
+            tiers = routes[name]._mf_gs_tiers
+            self.assertTrue(tiers and all(f"_sweeps{sweeps}_" in tier.kernel.key for tier in tiers), name)
         velocities = {}
         for name, solver in routes.items():
             state, _ = _rollout(model, solver, 1)
@@ -2296,7 +2305,7 @@ class TestPatchParallelPhysics(unittest.TestCase):
             )
         for name, rows in (("declined", 8), ("owned", 32), ("serial", 0), ("accumulated", 0)):
             self.assertEqual(arms[name]._ink_rows, rows, name)
-            keys = [kernel.key for kernel in arms[name]._pgs_solve_mf_gs_incremental_kernels]
+            keys = [tier.kernel.key for tier in arms[name]._mf_gs_tiers]
             self.assertEqual(bool(keys), bool(rows), name)
             self.assertTrue(all(key.endswith("_linked_iso") for key in keys), keys)
         routes = arms["declined"].get_path_selection()["routes"]

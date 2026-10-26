@@ -22,8 +22,9 @@ from types import SimpleNamespace
 import warp as wp
 
 from . import field_group
-from .device_preludes import dual_native, lane_group
+from .device_preludes import lane_group
 from .field_group import Field
+from .kernel_template import Dispatch, KernelTemplate, substitute
 
 PAIRED_COMPONENTS = (
     Field("world_count", wp.int32, owner="components"),
@@ -72,11 +73,11 @@ _SOURCE = r"""
         const int po = data.primary_offset.data[world];
         const int so = data.secondary_offset.data[world];
         const int group = data.primary_group.data[world];
-        if (!((po == 0 && so == PRIMARY) || (po == SECONDARY && so == 0))
+        if (!((po == 0 && so == $PRIMARY) || (po == $SECONDARY && so == 0))
             || group < 0 || group >= data.L.shape[0]) continue;
         int valid = 1;
-        for (int k = LANE; k < PRIMARY * PRIMARY; k += STRIDE) {
-            const float x = data.L.data[group * PRIMARY * PRIMARY + k];
+        for (int k = LANE; k < $PRIMARY * $PRIMARY; k += STRIDE) {
+            const float x = data.L.data[group * $PRIMARY * $PRIMARY + k];
             valid &= wp::isfinite(x) && wp::abs(x) <= 1.0e15f;
         }
         for (int row = LANE; row < m; row += STRIDE) {
@@ -97,10 +98,10 @@ _SOURCE = r"""
                         && data.row_parent.data[base + 1] == p && data.row_parent.data[base + 2] == p;
                 }
             }
-            for (int d = 0; d < WORLD; ++d) {
-                const float j = data.J.data[r * WORLD + d], y = data.Y.data[r * WORLD + d];
+            for (int d = 0; d < $WORLD; ++d) {
+                const float j = data.J.data[r * $WORLD + d], y = data.Y.data[r * $WORLD + d];
                 valid &= wp::isfinite(j) && wp::isfinite(y) && wp::abs(y) <= 1.0e15f;
-                if (d >= so && d < so + SECONDARY) valid &= j == 0.0f && y == 0.0f;
+                if (d >= so && d < so + $SECONDARY) valid &= j == 0.0f && y == 0.0f;
             }
         }
         for (int row = LANE; row < mf; row += STRIDE) {
@@ -129,33 +130,33 @@ _SOURCE = r"""
                         && static_cast<int>(static_cast<unsigned int>(t2) >> 16) == p;
                 }
             }
-            for (int d = 0; d < SECONDARY; ++d) {
-                valid &= wp::isfinite(data.mf_J_a.data[r * SECONDARY + d])
-                    && wp::isfinite(data.mf_J_b.data[r * SECONDARY + d])
-                    && wp::isfinite(data.mf_MiJt_a.data[r * SECONDARY + d])
-                    && wp::isfinite(data.mf_MiJt_b.data[r * SECONDARY + d]);
+            for (int d = 0; d < $SECONDARY; ++d) {
+                valid &= wp::isfinite(data.mf_J_a.data[r * $SECONDARY + d])
+                    && wp::isfinite(data.mf_J_b.data[r * $SECONDARY + d])
+                    && wp::isfinite(data.mf_MiJt_a.data[r * $SECONDARY + d])
+                    && wp::isfinite(data.mf_MiJt_b.data[r * $SECONDARY + d]);
             }
         }
         if (ALL(valid != 0)) {
             for (int row = WARP; row < m; row += WARPS) {
-                const int base = (world * M + row) * WORLD + po;
+                const int base = (world * M + row) * $WORLD + po;
 #if defined(__CUDA_ARCH__)
                 const int lane = LANE & 31;
-                const float y = lane < PRIMARY ? data.Y.data[base + lane] : 0.0f;
+                const float y = lane < $PRIMARY ? data.Y.data[base + lane] : 0.0f;
                 float z = 0.0f;
-                for (int k = 0; k < PRIMARY; ++k) {
+                for (int k = 0; k < $PRIMARY; ++k) {
                     const float yk = READ(y, k);
-                    if (lane < PRIMARY && lane <= k)
-                        z += data.L.data[group * PRIMARY * PRIMARY + k * PRIMARY + lane] * yk;
+                    if (lane < $PRIMARY && lane <= k)
+                        z += data.L.data[group * $PRIMARY * $PRIMARY + k * $PRIMARY + lane] * yk;
                 }
-                if (lane < PRIMARY) data.Y.data[base + lane] = z;
+                if (lane < $PRIMARY) data.Y.data[base + lane] = z;
 #else
-                float y[PRIMARY];
-                for (int k = 0; k < PRIMARY; ++k) y[k] = data.Y.data[base + k];
-                for (int d = 0; d < PRIMARY; ++d) {
+                float y[$PRIMARY];
+                for (int k = 0; k < $PRIMARY; ++k) y[k] = data.Y.data[base + k];
+                for (int d = 0; d < $PRIMARY; ++d) {
                     float z = 0.0f;
-                    for (int k = d; k < PRIMARY; ++k)
-                        z += data.L.data[group * PRIMARY * PRIMARY + k * PRIMARY + d] * y[k];
+                    for (int k = d; k < $PRIMARY; ++k)
+                        z += data.L.data[group * $PRIMARY * $PRIMARY + k * $PRIMARY + d] * y[k];
                     data.Y.data[base + d] = z;
                 }
 #endif
@@ -170,14 +171,7 @@ def get_source(primary_size: int, secondary_size: int = FREE_BODY_DOFS) -> str:
     """The qualification and held-form publication for one articulation/free-body pair."""
     if not 1 <= primary_size <= 32 or secondary_size != FREE_BODY_DOFS:
         raise ValueError("Paired components take an articulation of at most 32 coordinates and one free rigid body")
-    source = _SOURCE
-    for token, value in (
-        ("PRIMARY", primary_size),
-        ("SECONDARY", secondary_size),
-        ("WORLD", primary_size + secondary_size),
-    ):
-        source = source.replace(token, str(value))
-    return source
+    return substitute(_SOURCE, PRIMARY=primary_size, SECONDARY=secondary_size, WORLD=primary_size + secondary_size)
 
 
 @cache
@@ -188,17 +182,16 @@ def get_prepare_kernel(primary_size: int, secondary_size: int = FREE_BODY_DOFS):
     A generous finite-product bound rejects extreme conditioning before any Y
     write; it never clips an impulse or changes the original fallback law.
     """
-    snippet = dual_native(get_source(primary_size, secondary_size), preludes=(lane_group(PAIRED_COMPONENT_THREADS),))
-
-    @wp.func_native(snippet)
-    def prepare_native(worker: int, logical_lane: int, workers: int, data: PairedComponentData): ...
-
-    def prepare(workers: int, data: PairedComponentData):
-        worker, lane = wp.tid()
-        prepare_native(worker, lane, workers, data)
-
-    prepare.__name__ = prepare.__qualname__ = f"paired_components_prepare{primary_size}_{secondary_size}"
-    return wp.kernel(enable_backward=False, module="unique")(prepare)
+    return KernelTemplate(
+        f"paired_components_prepare{primary_size}_{secondary_size}",
+        (("workers", int), ("data", PairedComponentData)),
+        get_source(primary_size, secondary_size),
+        # A lane group per worker: its worker index and the thread's lane in it.
+        Dispatch("worker, lane = wp.tid()\n$CALL", ("worker", "lane"), (("worker", int), ("logical_lane", int))),
+        preludes=(lane_group(PAIRED_COMPONENT_THREADS),),
+        dual=True,
+        native_name="prepare_native",
+    ).kernel()
 
 
 def supported(solver) -> bool:

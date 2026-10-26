@@ -9,7 +9,6 @@ ancestor pattern. Neither assembly nor factorization allocates a dense H.
 
 from dataclasses import dataclass
 from functools import cache
-from string import Template
 
 import numpy as np
 import warp as wp
@@ -17,6 +16,7 @@ import warp as wp
 from . import field_group, host_index, response_operator
 from .device_preludes import dual_native, lane_group
 from .field_group import Field
+from .kernel_template import THREADS, KernelTemplate, substitute
 from .sparse_factorization import _sparse_cholesky_source, _sparse_inverse_source
 
 
@@ -370,64 +370,32 @@ def _get_crba_sparse_factor_kernel(
 """
     snippet = dual_native(body, preludes=(lane_group(32),))
 
-    @wp.func_native(snippet)
-    def factor_native(
-        tid: int,
-        group_to_art: wp.array[int],
-        mass_update_mask: wp.array[int],
-        articulation_start: wp.array[int],
-        articulation_dof_start: wp.array[int],
-        joint_child: wp.array[int],
-        joint_S_s: wp.array[wp.spatial_vector],
-        body_I_c: mass_input_type,
-        R_group: wp.array2d[float],
-        fused_augmented_drive: int,
-        drive_row_by_dof: wp.array[int],
-        row_K: wp.array[float],
-        indices: _SparseMassMatrixIndices,
-        Linv_group: wp.array2d[float],
-        status: wp.array[int],
-    ): ...
-
-    def factor_kernel(
-        group_to_art: wp.array[int],
-        mass_update_mask: wp.array[int],
-        articulation_start: wp.array[int],
-        articulation_dof_start: wp.array[int],
-        joint_child: wp.array[int],
-        joint_S_s: wp.array[wp.spatial_vector],
-        body_I_c: mass_input_type,
-        R_group: wp.array2d[float],
-        fused_augmented_drive: int,
-        drive_row_by_dof: wp.array[int],
-        row_K: wp.array[float],
-        indices: _SparseMassMatrixIndices,
-        Linv_group: wp.array2d[float],
-        status: wp.array[int],
-    ):
-        factor_native(
-            wp.tid(),
-            group_to_art,
-            mass_update_mask,
-            articulation_start,
-            articulation_dof_start,
-            joint_child,
-            joint_S_s,
-            body_I_c,
-            R_group,
-            fused_augmented_drive,
-            drive_row_by_dof,
-            row_K,
-            indices,
-            Linv_group,
-            status,
-        )
-
-    factor_kernel.__name__ = f"crba_sparse_factor_{n}_{nnz}_{warps}"
+    name = f"crba_sparse_factor_{n}_{nnz}_{warps}"
     if geometric:
-        factor_kernel.__name__ = "cached_" + factor_kernel.__name__
-    factor_kernel.__qualname__ = factor_kernel.__name__
-    return wp.kernel(enable_backward=False, module="unique")(factor_kernel)
+        name = "cached_" + name
+    return KernelTemplate(
+        name,
+        (
+            ("group_to_art", wp.array[int]),
+            ("mass_update_mask", wp.array[int]),
+            ("articulation_start", wp.array[int]),
+            ("articulation_dof_start", wp.array[int]),
+            ("joint_child", wp.array[int]),
+            ("joint_S_s", wp.array[wp.spatial_vector]),
+            ("body_I_c", mass_input_type),
+            ("R_group", wp.array2d[float]),
+            ("fused_augmented_drive", int),
+            ("drive_row_by_dof", wp.array[int]),
+            ("row_K", wp.array[float]),
+            ("indices", _SparseMassMatrixIndices),
+            ("Linv_group", wp.array2d[float]),
+            ("status", wp.array[int]),
+        ),
+        snippet,
+        THREADS,
+        composed=True,
+        native_name="factor_native",
+    ).kernel()
 
 
 _RESPONSE = response_operator.SparseInverseFactor(
@@ -442,9 +410,20 @@ _RESPONSE = response_operator.SparseInverseFactor(
 )
 
 
-@wp.func_native(
-    dual_native(
-        Template("""
+# Apply physical H inverse as P.T Linv.T Linv P; launch 32 threads per group.
+solve_sparse_mass_matrix = KernelTemplate(
+    "solve_sparse_mass_matrix",
+    (
+        ("group_to_art", wp.array[int]),
+        ("articulation_dof_start", wp.array[int]),
+        ("indices", _SparseMassMatrixIndices),
+        ("Linv_group", wp.array2d[float]),
+        ("tau", wp.array[float]),
+        ("scratch", wp.array2d[float]),
+        ("qdd", wp.array[float]),
+    ),
+    substitute(
+        """
     const int group = tid >> 5;
     if (group >= group_to_art.shape[0]) return;
 #if !defined(__CUDA_ARCH__)
@@ -462,34 +441,13 @@ _RESPONSE = response_operator.SparseInverseFactor(
         $TRANSPOSE_ACTION
         qdd.data[start + indices.permutation.data[col]] = value;
     }
-""").substitute(
-            FORWARD_ACTION=_RESPONSE.forward("row", "tau.data[start+indices.permutation.data[$index]]"),
-            TRANSPOSE_ACTION=_RESPONSE.transpose("col", "scratch.data[group*n+$index]"),
-        ),
-        preludes=(lane_group(32),),
-    )
-)
-def _solve_native(
-    tid: int,
-    group_to_art: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    indices: _SparseMassMatrixIndices,
-    Linv_group: wp.array2d[float],
-    tau: wp.array[float],
-    scratch: wp.array2d[float],
-    qdd: wp.array[float],
-): ...
-
-
-@wp.kernel(enable_backward=False)
-def solve_sparse_mass_matrix(
-    group_to_art: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    indices: _SparseMassMatrixIndices,
-    Linv_group: wp.array2d[float],
-    tau: wp.array[float],
-    scratch: wp.array2d[float],
-    qdd: wp.array[float],
-):
-    """Apply physical H inverse as P.T Linv.T Linv P; launch 32 threads/group."""
-    _solve_native(wp.tid(), group_to_art, articulation_dof_start, indices, Linv_group, tau, scratch, qdd)
+""",
+        FORWARD_ACTION=_RESPONSE.forward("row", lambda index: f"tau.data[start+indices.permutation.data[{index}]]"),
+        TRANSPOSE_ACTION=_RESPONSE.transpose("col", lambda index: f"scratch.data[group*n+{index}]"),
+    ),
+    THREADS,
+    preludes=(lane_group(32),),
+    dual=True,
+    native_name="_solve_native",
+    module=__name__,
+).kernel()

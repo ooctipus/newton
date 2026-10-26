@@ -22,6 +22,7 @@ from .contact_laws import (
 from .dense_rows import DenseRows
 from .device_preludes import dual_native, lane_group
 from .friction_patches import FrictionPatches, patch_friction_location
+from .kernel_template import THREADS, KernelTemplate, python_kernel, substitute
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -39,13 +40,6 @@ CONTACT_RECORD_FLOATS = 8
 law's tangent eigenbasis ``largest, smallest, vx, vy`` relative to the larger tangent diagonal."""
 CONTACT_RING_FLOATS = 4
 """Floats a linked sparse sweep appends to each record: the anchor's other ring members, as int bits."""
-
-
-def _insert_once(text: str, anchor: str, addition: str, *, replace: bool = False) -> str:
-    """Return ``text`` with ``addition`` after (or, with ``replace``, instead of) its one ``anchor``."""
-    if text.count(anchor) != 1:
-        raise RuntimeError(f"expected one occurrence of {anchor!r}")
-    return text.replace(anchor, addition if replace else anchor + addition)
 
 
 # The contact block record of a full triplet (CONTACT_RECORD_FLOATS): the cross terms
@@ -163,7 +157,9 @@ def _get_sparse_contact_response_kernel(
         }
 """
         geometry_cuda = (
-            "volatile float* geometry = jacobian + $GEOMETRY;\nif (LANE == 0) {\n" + geometry_copy + "}\nSYNC();\n"
+            f"volatile float* geometry = jacobian + {3 * scratch_size};\nif (LANE == 0) {{\n"
+            + geometry_copy
+            + "}\nSYNC();\n"
         )
         geometry_cpu = "float geometry[27];\n" + geometry_copy
         geometry_dot = """
@@ -196,7 +192,7 @@ def _get_sparse_contact_response_kernel(
     const int support_capacity = row_factor.shape[2];
     int count = 0;
     auto norm = wp::vec3(0.0f);
-    auto incident = wp::vec3(0.0f);
+${CROSS_DECL}    auto incident = wp::vec3(0.0f);
     // Physical blocks remain a short prefix; ordinary free/free contacts use
     // native MF storage, so production rows have at most one such block.
     int first_endpoint = 0;
@@ -257,10 +253,9 @@ def _get_sparse_contact_response_kernel(
                     const float value = jacobian[row * $PLANE + node];
                     if (!$SUPPORT_TABLE) row_dof.data[response_offset + count + node] = offset + node;
                     row_factor.data[response_offset + count + node] = value;
-                    row_free_response.data[(row_offset + row) * row_free_response.shape[2] + count + node] = response.c[row];
-                    norm.c[row] += value * response.c[row];
+${FREE_RESPONSE}                    norm.c[row] += value * response.c[row];
                 }
-            }
+${FREE_CROSS}            }
             count += 6;
         } else {
             unsigned long long mask = 0;
@@ -299,7 +294,7 @@ def _get_sparse_contact_response_kernel(
                     row_factor.data[response_offset + index] = value.c[row];
                     norm.c[row] += value.c[row] * value.c[row];
                 }
-            }
+${FACTOR_CROSS}            }
             count += COUNT(mask);
         }
         // The next endpoint reuses the same group-local Jacobian storage.
@@ -327,55 +322,49 @@ def _get_sparse_contact_response_kernel(
             diagonal.data[row_offset + row] = norm.c[row] + cfm;
         }
     }
-"""
+${RECORD}"""
+    # Records ride in row_free_response: the support table's routes admit no free-body
+    # response, so its free branch writes no responses there, only the cross products.
+    records = {
+        "CROSS_DECL": "",
+        "FREE_RESPONSE": "                    row_free_response.data[(row_offset + row) * row_free_response.shape[2]"
+        " + count + node] = response.c[row];\n",
+        "FREE_CROSS": "",
+        "FACTOR_CROSS": "",
+        "RECORD": "",
+    }
     if contact_records:
-        # Records ride in row_free_response: the support table's routes admit no free-body
-        # response, so its free branch writes no responses there, only the cross products.
-        snippet = _insert_once(snippet, "    auto norm = wp::vec3(0.0f);\n", "    auto cross = wp::vec3(0.0f);\n")
-        snippet = _insert_once(
-            snippet,
-            "                    row_free_response.data[(row_offset + row) * row_free_response.shape[2]"
-            " + count + node] = response.c[row];\n",
-            "",
-            replace=True,
-        )
-        snippet = _insert_once(
-            snippet,
-            "                    norm.c[row] += value * response.c[row];\n                }\n",
-            """                if (row_count == 3) {
+        records = {
+            "CROSS_DECL": "    auto cross = wp::vec3(0.0f);\n",
+            "FREE_RESPONSE": "",
+            "FREE_CROSS": f"""                if (row_count == 3) {{
                     cross.c[0] += jacobian[node] * response.c[1];
                     cross.c[1] += jacobian[node] * response.c[2];
-                    cross.c[2] += jacobian[$PLANE + node] * response.c[2];
-                }
+                    cross.c[2] += jacobian[{scratch_size} + node] * response.c[2];
+                }}
 """,
-        )
-        snippet = _insert_once(
-            snippet,
-            "                    norm.c[row] += value.c[row] * value.c[row];\n                }\n",
-            """                if (row_count == 3) {
+            "FACTOR_CROSS": """                if (row_count == 3) {
                     cross.c[0] += value.c[0] * value.c[1];
                     cross.c[1] += value.c[0] * value.c[2];
                     cross.c[2] += value.c[1] * value.c[2];
                 }
 """,
-        )
-        snippet += _CONTACT_RECORD_SOURCE
-    snippet = (
-        snippet.replace(
-            "$SPARSE_PROJECTION",
-            _sparse_contact_projection_source("shared_mask", dof_count=n, scratch_stride=scratch_size),
-        )
-        .replace("$GEOMETRY_CUDA", geometry_cuda)
-        .replace("$GEOMETRY_CPU", geometry_cpu)
-        .replace("$GEOMETRY_DOT", geometry_dot)
-        .replace("$GEOMETRY", str(3 * scratch_size))
-        .replace("$STORAGE", str(groups * (3 * scratch_size + geometry_size)))
-        .replace("$LANES", str(lanes))
-        .replace("$SCRATCH", str(3 * scratch_size + geometry_size))
-        .replace("$PLANE", str(scratch_size))
-        .replace("$JACOBIAN", str(max(n, 6)))
-        .replace("$N", str(n))
-        .replace("$SUPPORT_TABLE", str(bool(use_support_table)).lower())
+            "RECORD": _CONTACT_RECORD_SOURCE,
+        }
+    snippet = substitute(
+        snippet,
+        SPARSE_PROJECTION=_sparse_contact_projection_source("shared_mask", dof_count=n, scratch_stride=scratch_size),
+        GEOMETRY_CUDA=geometry_cuda,
+        GEOMETRY_CPU=geometry_cpu,
+        GEOMETRY_DOT=geometry_dot,
+        STORAGE=groups * (3 * scratch_size + geometry_size),
+        LANES=lanes,
+        SCRATCH=3 * scratch_size + geometry_size,
+        PLANE=scratch_size,
+        JACOBIAN=max(n, 6),
+        N=n,
+        SUPPORT_TABLE=str(bool(use_support_table)).lower(),
+        **records,
     )
     snippet = dual_native(snippet, preludes=(lane_group(lanes), *PROJECTION_LAW.preludes()))
 
@@ -622,15 +611,14 @@ def _get_sparse_contact_response_kernel(
                         if fires:
                             data.rhs[world, slot] = bounce
 
-    contact_kernel.__name__ = f"populate_sparse_contact_response_{n}_{lanes}_{warps}"
+    name = f"populate_sparse_contact_response_{n}_{lanes}_{warps}"
     if prepare_rows:
-        contact_kernel.__name__ += "_prepared"
+        name += "_prepared"
     if use_support_table:
-        contact_kernel.__name__ += "_support_table"
+        name += "_support_table"
     if contact_records:
-        contact_kernel.__name__ += "_contact_records"
-    contact_kernel.__qualname__ = contact_kernel.__name__
-    return wp.kernel(enable_backward=False, module="unique")(contact_kernel)
+        name += "_contact_records"
+    return python_kernel(contact_kernel, name)
 
 
 @wp.kernel(enable_backward=False)
@@ -658,9 +646,7 @@ def finalize_sparse_joint_limit_rows(
         rows.rhs[world, row] = rhs
 
 
-@wp.func_native(
-    dual_native(
-        """
+_JOINT_LIMIT_ROWS_SOURCE = """
     const int group = tid >> 5;
     if (group >= group_to_art.shape[0]) return;
 #if !defined(__CUDA_ARCH__)
@@ -740,98 +726,49 @@ def finalize_sparse_joint_limit_rows(
             ++rank;
         }
     }
-""".replace("$LIMIT_TYPE", str(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)),
-        preludes=(lane_group(32), *ROW_LAW.preludes()),
-    )
-)
-def _build_sparse_joint_limit_rows(
-    tid: int,
-    group_to_art: wp.array[int],
-    art_to_world: wp.array[int],
-    articulation_world_dof_offset: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    limit_q_index: wp.array[int],
-    joint_limit_lower: wp.array[float],
-    joint_limit_upper: wp.array[float],
-    joint_q: wp.array[float],
-    activation_gap: float,
-    pgs_beta: float,
-    pgs_cfm: float,
-    dof_mask: wp.array[wp.uint64],
-    inverse_permutation: wp.array[int],
-    factor_lookup: wp.array2d[int],
-    inverse_factor: wp.array2d[float],
-    v_hat: wp.array[float],
-    slot_counter: wp.array[int],
-    rows: DenseRows,
-    row_dof: wp.array3d[int],
-    row_factor: wp.array3d[float],
-    row_incident: wp.array2d[float],
-    support: _SparseRowSupport,
-): ...
+"""
+
+# Build ordered limit rows and sparse responses with one warp per articulation.
+#
+# Launch ``32 * group_count`` threads in blocks divisible by 32. Active row
+# reservations include over-capacity demand; writes stay within row capacity.
+# Reservations retain each articulation's lower/upper DOF order.
+build_sparse_joint_limit_rows = KernelTemplate(
+    "build_sparse_joint_limit_rows",
+    (
+        ("group_to_art", wp.array[int]),
+        ("art_to_world", wp.array[int]),
+        ("articulation_world_dof_offset", wp.array[int]),
+        ("articulation_dof_start", wp.array[int]),
+        ("limit_q_index", wp.array[int]),
+        ("joint_limit_lower", wp.array[float]),
+        ("joint_limit_upper", wp.array[float]),
+        ("joint_q", wp.array[float]),
+        ("activation_gap", float),
+        ("pgs_beta", float),
+        ("pgs_cfm", float),
+        ("dof_mask", wp.array[wp.uint64]),
+        ("inverse_permutation", wp.array[int]),
+        ("factor_lookup", wp.array2d[int]),
+        ("inverse_factor", wp.array2d[float]),
+        ("v_hat", wp.array[float]),
+        ("slot_counter", wp.array[int]),
+        ("rows", DenseRows),
+        ("row_dof", wp.array3d[int]),
+        ("row_factor", wp.array3d[float]),
+        ("row_incident", wp.array2d[float]),
+        ("support", _SparseRowSupport),
+    ),
+    substitute(_JOINT_LIMIT_ROWS_SOURCE, LIMIT_TYPE=PGS_CONSTRAINT_TYPE_JOINT_LIMIT),
+    THREADS,
+    preludes=(lane_group(32), *ROW_LAW.preludes()),
+    dual=True,
+    native_name="_build_sparse_joint_limit_rows",
+    module=__name__,
+).kernel()
 
 
-@wp.kernel(enable_backward=False)
-def build_sparse_joint_limit_rows(
-    group_to_art: wp.array[int],
-    art_to_world: wp.array[int],
-    articulation_world_dof_offset: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    limit_q_index: wp.array[int],
-    joint_limit_lower: wp.array[float],
-    joint_limit_upper: wp.array[float],
-    joint_q: wp.array[float],
-    activation_gap: float,
-    pgs_beta: float,
-    pgs_cfm: float,
-    dof_mask: wp.array[wp.uint64],
-    inverse_permutation: wp.array[int],
-    factor_lookup: wp.array2d[int],
-    inverse_factor: wp.array2d[float],
-    v_hat: wp.array[float],
-    slot_counter: wp.array[int],
-    rows: DenseRows,
-    row_dof: wp.array3d[int],
-    row_factor: wp.array3d[float],
-    row_incident: wp.array2d[float],
-    support: _SparseRowSupport,
-):
-    """Build ordered limit rows and sparse responses with one warp per articulation.
-
-    Launch ``32 * group_count`` threads in blocks divisible by 32. Active row
-    reservations include over-capacity demand; writes stay within row capacity.
-    Reservations retain each articulation's lower/upper DOF order.
-    """
-    _build_sparse_joint_limit_rows(
-        wp.tid(),
-        group_to_art,
-        art_to_world,
-        articulation_world_dof_offset,
-        articulation_dof_start,
-        limit_q_index,
-        joint_limit_lower,
-        joint_limit_upper,
-        joint_q,
-        activation_gap,
-        pgs_beta,
-        pgs_cfm,
-        dof_mask,
-        inverse_permutation,
-        factor_lookup,
-        inverse_factor,
-        v_hat,
-        slot_counter,
-        rows,
-        row_dof,
-        row_factor,
-        row_incident,
-        support,
-    )
-
-
-@wp.func_native(
-    dual_native(
-        """
+_VELOCITY_LIMIT_ROWS_SOURCE = """
     const int group = tid >> 5;
     if (group >= group_to_art.shape[0]) return;
 #if !defined(__CUDA_ARCH__)
@@ -912,87 +849,46 @@ def build_sparse_joint_limit_rows(
             }
         }
     }
-""".replace("$VELOCITY_LIMIT_TYPE", str(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)),
-        preludes=(lane_group(32),),
-    )
-)
-def _build_sparse_joint_velocity_limit_rows(
-    tid: int,
-    group_to_art: wp.array[int],
-    art_to_world: wp.array[int],
-    articulation_world_dof_offset: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    joint_velocity_limit: wp.array[float],
-    velocity_limit_slot: wp.array[int],
-    velocity_limit_sign: wp.array[float],
-    pgs_cfm: float,
-    dof_mask: wp.array[wp.uint64],
-    inverse_permutation: wp.array[int],
-    factor_lookup: wp.array2d[int],
-    inverse_factor: wp.array2d[float],
-    v_hat: wp.array[float],
-    rows: DenseRows,
-    row_dof: wp.array3d[int],
-    row_factor: wp.array3d[float],
-    row_incident: wp.array2d[float],
-    support: _SparseRowSupport,
-): ...
+"""
+
+# Project allocated signed velocity-limit rows through the mass factor.
+#
+# Launch ``32 * group_count`` threads in blocks divisible by 32. The existing
+# allocator owns lower/upper slots, activation and capacity reporting. This
+# producer preserves even infinite limits and adds no position bias. Run
+# :func:`finalize_sparse_joint_limit_rows` once after building the prefix.
+build_sparse_joint_velocity_limit_rows = KernelTemplate(
+    "build_sparse_joint_velocity_limit_rows",
+    (
+        ("group_to_art", wp.array[int]),
+        ("art_to_world", wp.array[int]),
+        ("articulation_world_dof_offset", wp.array[int]),
+        ("articulation_dof_start", wp.array[int]),
+        ("joint_velocity_limit", wp.array[float]),
+        ("velocity_limit_slot", wp.array[int]),
+        ("velocity_limit_sign", wp.array[float]),
+        ("pgs_cfm", float),
+        ("dof_mask", wp.array[wp.uint64]),
+        ("inverse_permutation", wp.array[int]),
+        ("factor_lookup", wp.array2d[int]),
+        ("inverse_factor", wp.array2d[float]),
+        ("v_hat", wp.array[float]),
+        ("rows", DenseRows),
+        ("row_dof", wp.array3d[int]),
+        ("row_factor", wp.array3d[float]),
+        ("row_incident", wp.array2d[float]),
+        ("support", _SparseRowSupport),
+    ),
+    substitute(_VELOCITY_LIMIT_ROWS_SOURCE, VELOCITY_LIMIT_TYPE=PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT),
+    THREADS,
+    preludes=(lane_group(32),),
+    dual=True,
+    native_name="_build_sparse_joint_velocity_limit_rows",
+    module=__name__,
+).kernel()
 
 
-@wp.kernel(enable_backward=False)
-def build_sparse_joint_velocity_limit_rows(
-    group_to_art: wp.array[int],
-    art_to_world: wp.array[int],
-    articulation_world_dof_offset: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    joint_velocity_limit: wp.array[float],
-    velocity_limit_slot: wp.array[int],
-    velocity_limit_sign: wp.array[float],
-    pgs_cfm: float,
-    dof_mask: wp.array[wp.uint64],
-    inverse_permutation: wp.array[int],
-    factor_lookup: wp.array2d[int],
-    inverse_factor: wp.array2d[float],
-    v_hat: wp.array[float],
-    rows: DenseRows,
-    row_dof: wp.array3d[int],
-    row_factor: wp.array3d[float],
-    row_incident: wp.array2d[float],
-    support: _SparseRowSupport,
-):
-    """Project allocated signed velocity-limit rows through the mass factor.
-
-    Launch ``32 * group_count`` threads in blocks divisible by 32. The existing
-    allocator owns lower/upper slots, activation and capacity reporting. This
-    producer preserves even infinite limits and adds no position bias. Run
-    :func:`finalize_sparse_joint_limit_rows` once after building the prefix.
-    """
-    _build_sparse_joint_velocity_limit_rows(
-        wp.tid(),
-        group_to_art,
-        art_to_world,
-        articulation_world_dof_offset,
-        articulation_dof_start,
-        joint_velocity_limit,
-        velocity_limit_slot,
-        velocity_limit_sign,
-        pgs_cfm,
-        dof_mask,
-        inverse_permutation,
-        factor_lookup,
-        inverse_factor,
-        v_hat,
-        rows,
-        row_dof,
-        row_factor,
-        row_incident,
-        support,
-    )
-
-
-@wp.func_native(
-    dual_native(
-        """
+_MIMIC_ROWS_SOURCE = """
     const int group = tid >> 5;
     if (group >= group_to_art.shape[0]) return;
 #if !defined(__CUDA_ARCH__)
@@ -1053,104 +949,51 @@ def build_sparse_joint_velocity_limit_rows(
             rows.target.data[row_offset] = 0.0f;
         }
     }
-""".replace("$MIMIC_TYPE", str(PGS_CONSTRAINT_TYPE_MIMIC)),
-        preludes=(lane_group(32), *ROW_LAW.preludes()),
-    )
-)
-def _build_sparse_mimic_rows(
-    tid: int,
-    group_to_art: wp.array[int],
-    art_to_world: wp.array[int],
-    articulation_world_dof_offset: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    mimic_slot: wp.array[int],
-    mimic_art_start: wp.array[int],
-    mimic_art_list: wp.array[int],
-    mimic_dof0: wp.array[int],
-    mimic_dof1: wp.array[int],
-    mimic_q0: wp.array[int],
-    mimic_q1: wp.array[int],
-    mimic_coef0: wp.array[float],
-    mimic_coef1: wp.array[float],
-    joint_q: wp.array[float],
-    pgs_beta: float,
-    pgs_cfm: float,
-    dof_mask: wp.array[wp.uint64],
-    inverse_permutation: wp.array[int],
-    factor_lookup: wp.array2d[int],
-    inverse_factor: wp.array2d[float],
-    v_hat: wp.array[float],
-    rows: DenseRows,
-    row_dof: wp.array3d[int],
-    row_factor: wp.array3d[float],
-    row_incident: wp.array2d[float],
-): ...
+"""
 
-
-@wp.kernel(enable_backward=False)
-def build_sparse_mimic_rows(
-    group_to_art: wp.array[int],
-    art_to_world: wp.array[int],
-    articulation_world_dof_offset: wp.array[int],
-    articulation_dof_start: wp.array[int],
-    mimic_slot: wp.array[int],
-    mimic_art_start: wp.array[int],
-    mimic_art_list: wp.array[int],
-    mimic_dof0: wp.array[int],
-    mimic_dof1: wp.array[int],
-    mimic_q0: wp.array[int],
-    mimic_q1: wp.array[int],
-    mimic_coef0: wp.array[float],
-    mimic_coef1: wp.array[float],
-    joint_q: wp.array[float],
-    pgs_beta: float,
-    pgs_cfm: float,
-    dof_mask: wp.array[wp.uint64],
-    inverse_permutation: wp.array[int],
-    factor_lookup: wp.array2d[int],
-    inverse_factor: wp.array2d[float],
-    v_hat: wp.array[float],
-    rows: DenseRows,
-    row_dof: wp.array3d[int],
-    row_factor: wp.array3d[float],
-    row_incident: wp.array2d[float],
-):
-    """Project allocated same-articulation mimic rows through the mass factor.
-
-    Launch ``32 * group_count`` threads in blocks divisible by 32. Existing
-    validation and allocation own eligibility and slots. Rows use explicit
-    coordinate indices, with capacity for the union of both DOF supports,
-    including when the live scale is zero. The prefix finalizer adds bilateral
-    position bias and CFM once after this producer.
-    """
-    _build_sparse_mimic_rows(
-        wp.tid(),
-        group_to_art,
-        art_to_world,
-        articulation_world_dof_offset,
-        articulation_dof_start,
-        mimic_slot,
-        mimic_art_start,
-        mimic_art_list,
-        mimic_dof0,
-        mimic_dof1,
-        mimic_q0,
-        mimic_q1,
-        mimic_coef0,
-        mimic_coef1,
-        joint_q,
-        pgs_beta,
-        pgs_cfm,
-        dof_mask,
-        inverse_permutation,
-        factor_lookup,
-        inverse_factor,
-        v_hat,
-        rows,
-        row_dof,
-        row_factor,
-        row_incident,
-    )
+# Project allocated same-articulation mimic rows through the mass factor.
+#
+# Launch ``32 * group_count`` threads in blocks divisible by 32. Existing
+# validation and allocation own eligibility and slots. Rows use explicit
+# coordinate indices, with capacity for the union of both DOF supports,
+# including when the live scale is zero. The prefix finalizer adds bilateral
+# position bias and CFM once after this producer.
+build_sparse_mimic_rows = KernelTemplate(
+    "build_sparse_mimic_rows",
+    (
+        ("group_to_art", wp.array[int]),
+        ("art_to_world", wp.array[int]),
+        ("articulation_world_dof_offset", wp.array[int]),
+        ("articulation_dof_start", wp.array[int]),
+        ("mimic_slot", wp.array[int]),
+        ("mimic_art_start", wp.array[int]),
+        ("mimic_art_list", wp.array[int]),
+        ("mimic_dof0", wp.array[int]),
+        ("mimic_dof1", wp.array[int]),
+        ("mimic_q0", wp.array[int]),
+        ("mimic_q1", wp.array[int]),
+        ("mimic_coef0", wp.array[float]),
+        ("mimic_coef1", wp.array[float]),
+        ("joint_q", wp.array[float]),
+        ("pgs_beta", float),
+        ("pgs_cfm", float),
+        ("dof_mask", wp.array[wp.uint64]),
+        ("inverse_permutation", wp.array[int]),
+        ("factor_lookup", wp.array2d[int]),
+        ("inverse_factor", wp.array2d[float]),
+        ("v_hat", wp.array[float]),
+        ("rows", DenseRows),
+        ("row_dof", wp.array3d[int]),
+        ("row_factor", wp.array3d[float]),
+        ("row_incident", wp.array2d[float]),
+    ),
+    substitute(_MIMIC_ROWS_SOURCE, MIMIC_TYPE=PGS_CONSTRAINT_TYPE_MIMIC),
+    THREADS,
+    preludes=(lane_group(32), *ROW_LAW.preludes()),
+    dual=True,
+    native_name="_build_sparse_mimic_rows",
+    module=__name__,
+).kernel()
 
 
 @wp.kernel(enable_backward=False)

@@ -3,6 +3,8 @@
 
 """Generate factor-coordinate contact projection with an explicit operand mapping."""
 
+from .device_preludes import substitute
+
 
 def _sparse_contact_projection_source(
     mapping: str,
@@ -50,4 +52,4 @@ def _sparse_contact_projection_source(
 
     # One factor-product law over array bindings, which preserve ordinary direction admission.
     product = f"{output} += {weight} * {operand};"
-    return initialize + begin + accumulate.replace("$ACCUMULATE", product) + end
+    return initialize + begin + substitute(accumulate, ACCUMULATE=product) + end

@@ -3,10 +3,8 @@
 
 """Generate the native source of the matrix-free Gauss-Seidel sweep."""
 
-import re
-
 from .contact_torsion import torque_sweep_source
-from .device_preludes import RING, cuda_native, lane_group
+from .device_preludes import RING, cuda_native, lane_group, substitute
 from .kernels import (
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_TARGET,
@@ -86,6 +84,73 @@ def get_source(
     M_MF = mf_max_constraints
     D = max_world_dofs
 
+    def mf_parent(packed: str) -> str:
+        """The parent row a matrix-free row's packed type-and-parent word holds."""
+        return _mf_parent_expression(packed, M_MF)
+
+    # The dense rows' read-only data, staged in shared memory, or with shared_metadata=False read from the global
+    # arrays it is staged from: identical values, another storage class. Staged, the arrays are ~9/11ths of the
+    # kernel's shared footprint and pin occupancy to floor(smem_per_sm / (10*M_D*4B)). The packed row types and
+    # parents (s_meta_dense) are packed at load time from two arrays; they stay resident when shared_metadata or
+    # resident_row_metadata asks for it. Keeping them resident costs 4*M_D bytes of static shared memory per
+    # block; at M_D=1024 that is +4 KiB (e.g. 22.9 -> 27.0 KiB with M_MF=4096, D=604), dropping occupancy from 4
+    # to 3 blocks/SM on 100-KiB-smem parts (sm_86/89/120) and regressing dense-contact scenes by the lost
+    # concurrency. Replay of a captured launch confirms the streamed variant is bitwise-identical in v_out,
+    # impulses, and mf_impulses. A launch with at most one block per SM has no concurrency to lose;
+    # resident_row_metadata keeps the packed array there (execution_plan._select_mfgs_storage).
+    staged_sources = {
+        "s_rhs_dense": "rhs_bias",
+        "s_diag_dense": "world_diag",
+        "s_mu_dense": "world_row_mu",
+        "s_drive_target_dense": "world_drive_target_vel_bias",
+        "s_drive_vel_mul_dense": "world_drive_vel_multiplier",
+        "s_drive_imp_mul_dense": "world_drive_impulse_multiplier",
+        "s_drive_max_imp_dense": "world_drive_max_impulse",
+        "s_drive_vel_limit_dense": "world_drive_vel_limit",
+    }
+    resident_metadata = shared_metadata or resident_row_metadata
+
+    def dense_row(name: str, index: str) -> str:
+        """Dense row ``index``'s value of the staged array ``name``."""
+        if shared_metadata:
+            return f"{name}[{index}]"
+        return f"{staged_sources[name]}.data[off_dense + ({index})]"
+
+    def dense_type(index: str, *, scan: bool = False) -> str:
+        """Dense row ``index``'s type.
+
+        The end-of-iteration limit scans (``scan``) read the global type whenever the metadata streams, so
+        resident_row_metadata changes only the row loop and the friction projectors. Packed reads would be exact
+        there too: the scans run in row phases 0 and 2, which stage every dense row, and 5, which stages
+        [0, bounds[1]) and scans [0, bounds[0]).
+        """
+        if shared_metadata or (resident_metadata and not scan):
+            return f"s_meta_dense[{index}] & {_DENSE_META_ROW_TYPE_MASK}"
+        return f"world_row_type.data[off_dense + {index}]"
+
+    def dense_parent(index: str, *, enclosed: bool = False) -> str:
+        """Dense row ``index``'s parent row (``enclosed``: parenthesized to embed in an expression)."""
+        if not resident_metadata:
+            return f"world_row_parent.data[off_dense + {index}]"
+        decoded = f"(s_meta_dense[{index}] >> {_DENSE_META_ROW_TYPE_BITS}) - 1"
+        return f"({decoded})" if enclosed else decoded
+
+    # The matrix-free rows' impulses: staged in shared memory, or with stream_mf_impulses read and written in
+    # place by one lane. Reads broadcast its registers, including friction-parent/sibling values; no memory
+    # fence or race between independent lane loads and stores is needed. All these read sites are in
+    # warp-uniform row/projector branches, not lane-0 branches.
+    def mf_load(index: str) -> str:
+        """Matrix-free row ``index``'s impulse."""
+        if stream_mf_impulses:
+            return f"READ(lane == 0 ? g_lam_mf[{index}] : 0.0f, 0)"
+        return f"s_lam_mf[{index}]"
+
+    def mf_store(index: str, value: str) -> str:
+        """The statement that stores ``value`` as matrix-free row ``index``'s impulse."""
+        if stream_mf_impulses:
+            return f"if (lane == 0) g_lam_mf[{index}] = {value};"
+        return f"s_lam_mf[{index}] = {value};"
+
     # Change votes under the solve policy; the exact law keeps each site's own text.
     friction_type = int(PGS_CONSTRAINT_TYPE_FRICTION)
     velocity_limit_type = int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)
@@ -94,7 +159,7 @@ def get_source(
         solve_policy,
         "                    if (sib_delta != 0.0f) iteration_changed = 1;",
         flag="iteration_changed",
-        terms=(("sib_delta", "s_diag_dense[sib]", str(friction_type)),),
+        terms=(("sib_delta", dense_row("s_diag_dense", "sib"), str(friction_type)),),
     )
     mf_sibling_vote = vote(
         solve_policy,
@@ -133,11 +198,26 @@ def get_source(
         flag="iteration_changed",
         terms=(("delta_impulse", "denom", "row_type"),),
     )
-    dense_rhs = "rhs_bias.data[off_dense + i]"
-    velocity_load = "s_v[d] = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;"
+    # With independent components, the paired owner's signed selector arrives in the otherwise unused
+    # local-owner argument: negative means this world's matrix-free rows are the free body's alone, so the
+    # sweep reads and writes only its six coordinates and leaves the articulation's to the paired kernel.
+    dense_count = "int m_dense = world_constraint_count.data[world];"
+    component, owned = "", ""
+    if independent_components:
+        dense_count = (
+            "const bool split_component = local_solve_owner.data[world] < 0;\n"
+            "    int m_dense = split_component ? 0 : world_constraint_count.data[world];"
+        )
+        component = (
+            "\n    const int first_dofs = split_component ? mf_meta.data[off_meta] : 0;"
+            "\n    const int component_offset = split_component ? "
+            "max(first_dofs >> 16, static_cast<int>(static_cast<short>(first_dofs & 65535))) : 0;"
+        )
+        owned = " && (!split_component || (d >= component_offset && d < component_offset + 6))"
+    velocity_load = f"s_v[d] = global_dof >= 0{owned} ? v_out.data[global_dof] : 0.0f;"
     velocity_store = f"""    for (int d = lane; d < {D}; d += 32) {{
         int global_dof = world_dof_indices.data[dof_map_base + d];
-        if (global_dof >= 0) v_out.data[global_dof] = s_v[d];
+        if (global_dof >= 0{owned}) v_out.data[global_dof] = s_v[d];
     }}"""
 
     def dense_read(array: str, index: str) -> str:
@@ -145,9 +225,6 @@ def get_source(
 
     def mf_velocity(index: str) -> str:
         return f"* s_v[{index}]"
-
-    def shared(dtype: str, name: str, count: int, spacing: str) -> str:
-        return f"    __shared__ {dtype}{spacing}{name}[{count}];"
 
     def dense_j_read(base: str, dof: str) -> str:
         return f"""{dense_read("J_world", f"{base} + {dof}")}"""
@@ -241,8 +318,15 @@ def get_source(
     # projection while MF rows use a block Coulomb solve leaves the most
     # important grasp contacts in the old formulation.
     if friction_mode in ("bisection", "bisection_desaxce"):
+        if friction_mode == "bisection_desaxce":
+            dense_desaxce_note = (
+                "// Dense contacts use block Coulomb only; dense de Saxce\n"
+                "                            // normal amplification is not enabled until validated."
+            )
+        else:
+            dense_desaxce_note = '// (no de Saxce bias; friction_mode="bisection".)'
         dense_friction_block = f"""
-                int parent_idx = (s_meta_dense[i] >> __DENSE_META_ROW_TYPE_BITS__) - 1;
+                int parent_idx = {dense_parent("i")};
                 int i_t1 = parent_idx + 1;
                 int i_t2 = parent_idx + 2;
 
@@ -251,12 +335,12 @@ def get_source(
                     // pre-writes t2.  Collapse this row's delta to zero.
                     new_impulse = s_lam_dense[i];
                 }} else {{
-                    int n_row_base = jy_world_base + parent_idx * __D__;
-                    int t1_row_base = jy_world_base + i_t1 * __D__;
-                    int t2_row_base = jy_world_base + i_t2 * __D__;
+                    int n_row_base = jy_world_base + parent_idx * {D};
+                    int t1_row_base = jy_world_base + i_t1 * {D};
+                    int t2_row_base = jy_world_base + i_t2 * {D};
 
-                    float target_vel_n = -s_rhs_dense[parent_idx];
-                    float mu = s_mu_dense[i];
+                    float target_vel_n = -{dense_row("s_rhs_dense", "parent_idx")};
+                    float mu = {dense_row("s_mu_dense", "i")};
                     float old_lambda_n = s_lam_dense[parent_idx];
                     float old_lambda_t1 = s_lam_dense[i_t1];
                     float old_lambda_t2 = s_lam_dense[i_t2];
@@ -272,7 +356,7 @@ def get_source(
                         float G_nn = 0.0f, G_nt1 = 0.0f, G_nt2 = 0.0f;
                         float G_t1t1 = 0.0f, G_t1t2 = 0.0f, G_t2t2 = 0.0f;
 
-                        for (int k = 0; k < __D__; k++) {{
+                        for (int k = 0; k < {D}; k++) {{
                             float vk = s_v[k];
                             float Jn = {dense_read("J_world", "n_row_base + k")};
                             float Jt1 = {dense_read("J_world", "t1_row_base + k")};
@@ -293,7 +377,7 @@ def get_source(
                             G_t2t2 += Jt2 * Yt2;
                         }}
 
-                        // __DENSE_DESAXCE_BIAS__
+                        {dense_desaxce_note}
 
                         const wp::vec3 lambda = CoulombLaw::coulomb_bisection(
                             wp::mat33(G_nn, G_nt1, G_nt2, G_nt1, G_t1t1, G_t1t2, G_nt2, G_t1t2, G_t2t2),
@@ -314,12 +398,12 @@ def get_source(
                     if (d_n_total != 0.0f || d_t2_total != 0.0f) iteration_changed = 1;
 
                     if (d_n_total != 0.0f) {{
-                        for (int d = lane; d < __D__; d += 32) {{
+                        for (int d = lane; d < {D}; d += 32) {{
                             s_v[d] += {dense_read("Y_world", "n_row_base + d")} * d_n_total;
                         }}
                     }}
                     if (d_t2_total != 0.0f) {{
-                        for (int d = lane; d < __D__; d += 32) {{
+                        for (int d = lane; d < {D}; d += 32) {{
                             s_v[d] += {dense_read("Y_world", "t2_row_base + d")} * d_t2_total;
                         }}
                     }}
@@ -327,30 +411,18 @@ def get_source(
                     new_impulse = new_lambda_t1;
                 }}
 """
-        if friction_mode == "bisection_desaxce":
-            dense_friction_block = dense_friction_block.replace(
-                "// __DENSE_DESAXCE_BIAS__",
-                "// Dense contacts use block Coulomb only; dense de Saxce\n"
-                "                            // normal amplification is not enabled until validated.",
-            )
-        else:
-            dense_friction_block = dense_friction_block.replace(
-                "// __DENSE_DESAXCE_BIAS__",
-                '// (no de Saxce bias; friction_mode="bisection".)',
-            )
-        dense_friction_block = dense_friction_block.replace("__D__", str(D))
     else:
         dense_friction_block = f"""
-                int parent_idx = (s_meta_dense[i] >> __DENSE_META_ROW_TYPE_BITS__) - 1;
+                int parent_idx = {dense_parent("i")};
                 if (i != parent_idx + 1) {{
                     new_impulse = old_impulse;
                 }} else {{
                     int sib = parent_idx + 2;
                     int sib_row_base = jy_world_base + sib * {D};
                     const float lambda_n = RING_LOAD(s_lam_dense[parent_idx], parent_idx, {M_D},
-                        [&](int patch_row) {{ return ((s_meta_dense[patch_row] >> __DENSE_META_ROW_TYPE_BITS__) - 1); }},
+                        [&](int patch_row) {{ return {dense_parent("patch_row", enclosed=True)}; }},
                         [&](int patch_row) {{ return s_lam_dense[patch_row]; }});
-                    float radius = fmaxf(s_mu_dense[i] * lambda_n, 0.0f);
+                    float radius = fmaxf({dense_row("s_mu_dense", "i")} * lambda_n, 0.0f);
                     const float sibling_impulse = s_lam_dense[sib];
                     wp::vec2 pair(0.0f);
                     // Zero load gives a zero disk; avoid unused tangent reductions.
@@ -358,11 +430,11 @@ def get_source(
                         float sibling_residual = 0.0f;
                         {dense_sibling_dot_code}
                         SUM(sibling_residual);
-                        sibling_residual += s_rhs_dense[sib];
+                        sibling_residual += {dense_row("s_rhs_dense", "sib")};
                         float cross = 0.0f;
                         {dense_tangent_cross_code}
                         SUM(cross);
-                        pair = ProjectionLaw::disk(ProjectionLaw::friction_pair(denom, cross, s_diag_dense[sib],
+                        pair = ProjectionLaw::disk(ProjectionLaw::friction_pair(denom, cross, {dense_row("s_diag_dense", "sib")},
                             wp::vec2(residual, sibling_residual), wp::vec2(old_impulse, sibling_impulse), radius, omega), radius);
                     }}
                     new_impulse = pair[0];
@@ -375,7 +447,6 @@ def get_source(
                 }}
 """
 
-    dense_friction_block = dense_friction_block.replace("__DENSE_META_ROW_TYPE_BITS__", str(_DENSE_META_ROW_TYPE_BITS))
     # Both modes using the scalar dense disk law share this ownership rule;
     # coulomb_newton differs only in its MF projector below. The existing
     # end-of-row barrier publishes each scalar result to the next dense row.
@@ -400,8 +471,8 @@ def get_source(
     # by the per-contact solve).
     if friction_mode in ("bisection", "bisection_desaxce"):
         mf_friction_block = """
-                // __BISECTION_LABEL__
-                int mf_par = packed_tp >> 16;
+                $LABEL
+                int mf_par = $PARENT;
                 int i_t1 = mf_par + 1;
                 int i_t2 = mf_par + 2;
 
@@ -466,7 +537,7 @@ def get_source(
                             }
                         }
 
-                        // __DESAXCE_BIAS__
+                        $DESAXCE_BIAS
 
                         float G_nn = 0.0f, G_nt1 = 0.0f, G_nt2 = 0.0f;
                         float G_t1t1 = 0.0f, G_t1t2 = 0.0f, G_t2t2 = 0.0f;
@@ -547,28 +618,15 @@ def get_source(
                     new_impulse = new_lambda_t1;
                 }
 """
-        # Inject the per-mode label and the optional de Saxce bias
-        # correction (``μ · ‖c_T‖`` added to ``target_vel_n`` once per
-        # contact before the bisection) into the shared CUDA body.
+        # The per-mode label and the optional de Saxce bias correction (``μ · ‖c_T‖`` added to
+        # ``target_vel_n`` once per contact before the bisection); pure RAISim bisection has no bias.
         if friction_mode == "bisection_desaxce":
-            mf_friction_block = mf_friction_block.replace(
-                "// __BISECTION_LABEL__",
-                '// friction_mode="bisection_desaxce": RAISim bisection + de Saxce bias (μ·‖c_T‖).',
-            )
-            mf_friction_block = mf_friction_block.replace(
-                "// __DESAXCE_BIAS__",
-                "target_vel_n = CoulombLaw::de_saxce_target(target_vel_n, wp::vec3(u_n, u_t1, u_t2), mu);",
-            )
+            label = '// friction_mode="bisection_desaxce": RAISim bisection + de Saxce bias (μ·‖c_T‖).'
+            bias = "target_vel_n = CoulombLaw::de_saxce_target(target_vel_n, wp::vec3(u_n, u_t1, u_t2), mu);"
         else:
-            mf_friction_block = mf_friction_block.replace(
-                "// __BISECTION_LABEL__",
-                '// friction_mode="bisection": RAISim-style bisection on λ_n.',
-            )
-            # Pure RAISim bisection: no de Saxce bias.
-            mf_friction_block = mf_friction_block.replace(
-                "// __DESAXCE_BIAS__",
-                '// (no de Saxce bias; friction_mode="bisection".)',
-            )
+            label = '// friction_mode="bisection": RAISim-style bisection on λ_n.'
+            bias = '// (no de Saxce bias; friction_mode="bisection".)'
+        mf_friction_block = substitute(mf_friction_block, LABEL=label, PARENT=mf_parent("packed_tp"), DESAXCE_BIAS=bias)
     elif friction_mode == "coulomb_newton":
         # Gilles Daviet's 1D Coulomb Newton (7/13), as
         # :func:`friction_step_coulomb` runs it; mirrors the
@@ -580,7 +638,7 @@ def get_source(
                 // friction_mode="coulomb_newton": Gilles Daviet's
                 // scalar bracketed-Newton on alpha (CoulombLaw::coulomb_newton;
                 // friction_step_coulomb documents the matrix-free row data).
-                int mf_par = packed_tp >> 16;
+                int mf_par = $PARENT;
                 int i_t1 = mf_par + 1;
                 int i_t2 = mf_par + 2;
 
@@ -710,9 +768,10 @@ def get_source(
                     new_impulse = new_lambda_t1;
                 }
 """
+        mf_friction_block = substitute(mf_friction_block, PARENT=mf_parent("packed_tp"))
     else:
         mf_friction_block = f"""
-                int mf_par = packed_tp >> 16;
+                int mf_par = {mf_parent("packed_tp")};
                 if (i != mf_par + 1) {{
                     new_impulse = old_impulse;
                 }} else {{
@@ -737,12 +796,12 @@ def get_source(
                             cross = mf_J_b.data[mf6_base + i * 6 + lane - 6] * mf_MiJt_b.data[sib_mf6 + lane - 6];
                         SUM(cross);
                         pair = ProjectionLaw::friction_pair(mf_diag > 0.0f ? 1.0f / mf_diag : 0.0f, cross, inv_sib > 0.0f ? 1.0f / inv_sib : 0.0f,
-                            wp::vec2(residual, sibling_residual), wp::vec2(old_impulse, s_lam_mf[sib]), radius, omega);
+                            wp::vec2(residual, sibling_residual), wp::vec2(old_impulse, {mf_load("sib")}), radius, omega);
                     }}
                     pair = ProjectionLaw::disk(pair, radius);
                     new_impulse = pair[0];
-                    float sib_delta = pair[1] - s_lam_mf[sib];
-                    s_lam_mf[sib] = pair[1];
+                    float sib_delta = pair[1] - {mf_load("sib")};
+                    {mf_store("sib", "pair[1]")}
 {mf_sibling_vote}
                     if (lane < 6 && dof_a >= 0)
                         s_v[dof_a + lane] += mf_MiJt_a.data[sib_mf6 + lane] * sib_delta;
@@ -752,53 +811,91 @@ def get_source(
 """
 
     mf_friction_precheck = (
-        """
+        f"""
             float mf_friction_radius = 0.0f;
-            if (mf_rt == 2) {
-                int parent = packed_tp >> 16;
-                const float lambda_n = RING_LOAD(s_lam_mf[parent], parent, __M_MF__,
-                    [&](int patch_row) { return mf_meta.data[off_meta + patch_row * 4 + 3] >> 16; },
-                    [&](int patch_row) { return s_lam_mf[patch_row]; });
+            if (mf_rt == 2) {{
+                int parent = {mf_parent("packed_tp")};
+                const float lambda_n = RING_LOAD({mf_load("parent")}, parent, {M_MF},
+                    [&](int patch_row) {{ return {mf_parent("mf_meta.data[off_meta + patch_row * 4 + 3]")}; }},
+                    [&](int patch_row) {{ return {mf_load("patch_row")}; }});
                 mf_friction_radius = fmaxf(mf_row_mu.data[off_mf + i] * lambda_n, 0.0f);
                 // A zero disk with no carried impulse cannot change velocity.
-                if (mf_friction_radius == 0.0f && s_lam_mf[i] == 0.0f && s_lam_mf[i + 1] == 0.0f)
+                if (mf_friction_radius == 0.0f && {mf_load("i")} == 0.0f && {mf_load("i + 1")} == 0.0f)
                     continue;
-            }
-""".replace("__M_MF__", str(M_MF))
+            }}
+"""
         if friction_mode == "current"
         else ""
     )
 
-    drive_shared_declarations = (
-        f"""
-    __shared__ float s_drive_target_dense[{M_D}];
-    __shared__ float s_drive_vel_mul_dense[{M_D}];
-    __shared__ float s_drive_imp_mul_dense[{M_D}];
-    __shared__ float s_drive_max_imp_dense[{M_D}];"""
-        if has_drive_rows
-        else ""
+    # Shared-memory declarations and loads, in order: the staged dense data around the packed metadata goes when it
+    # streams.
+    staged_head, staged_tail = (["s_rhs_dense", "s_diag_dense"], ["s_mu_dense"]) if shared_metadata else ([], [])
+    drive_staged = []
+    if has_drive_rows and shared_metadata:
+        drive_staged = [
+            "s_drive_target_dense",
+            "s_drive_vel_mul_dense",
+            "s_drive_imp_mul_dense",
+            "s_drive_max_imp_dense",
+        ]
+        if fuse_vel_limits:
+            drive_staged.append("s_drive_vel_limit_dense")
+
+    def declare(dtype: str, name: str, count: int, spacing: str = " ") -> str:
+        return f"    __shared__ {dtype}{spacing}{name}[{count}];"
+
+    def load(name: str) -> str:
+        return f"        {name}[i] = {staged_sources[name]}.data[off_dense + i];"
+
+    packed_declaration, packed_load = [], []
+    if resident_metadata:
+        packed_declaration = [
+            "    // Low 3 bits: row type (0..4). Remaining bits: parent + 1 (-1 maps to 0).",
+            declare("int", "s_meta_dense", M_D, "   "),
+        ]
+        packed_load = [
+            "        int row_type = world_row_type.data[off_dense + i];",
+            "        int row_parent = world_row_parent.data[off_dense + i];",
+            f"        s_meta_dense[i] = (row_type & {_DENSE_META_ROW_TYPE_MASK}) | "
+            f"((row_parent + 1) << {_DENSE_META_ROW_TYPE_BITS});",
+        ]
+    if stream_mf_impulses:
+        mf_impulse_declaration = "    volatile float* g_lam_mf = (volatile float*)(&mf_impulses.data[off_mf]);"
+        mf_impulse_load = mf_impulse_store = ""
+    else:
+        mf_impulse_declaration = declare("float", "s_lam_mf", M_MF)
+        mf_impulse_load = "s_lam_mf[i] = mf_impulses.data[off_mf + i];"
+        mf_impulse_store = "mf_impulses.data[off_mf + i] = s_lam_mf[i];"
+    shared_declarations = "\n".join(
+        [
+            declare("float", "s_v", D),
+            declare("float", "s_lam_dense", M_D),
+            *(declare("float", name, M_D) for name in staged_head),
+            *packed_declaration,
+            *(declare("float", name, M_D) for name in staged_tail),
+            "",
+            *(declare("float", name, M_D) for name in drive_staged),
+            mf_impulse_declaration,
+        ]
     )
-    drive_loads = (
-        """
-        s_drive_target_dense[i] = world_drive_target_vel_bias.data[off_dense + i];
-        s_drive_vel_mul_dense[i] = world_drive_vel_multiplier.data[off_dense + i];
-        s_drive_imp_mul_dense[i] = world_drive_impulse_multiplier.data[off_dense + i];
-        s_drive_max_imp_dense[i] = world_drive_max_impulse.data[off_dense + i];"""
-        if has_drive_rows
-        else ""
-    )
-    if fuse_vel_limits:
-        drive_shared_declarations += f"""
-    __shared__ float s_drive_vel_limit_dense[{M_D}];"""
-        drive_loads += """
-        s_drive_vel_limit_dense[i] = world_drive_vel_limit.data[off_dense + i];"""
+    dense_loads = [
+        "        s_lam_dense[i] = world_impulses.data[off_dense + i];",
+        *(load(name) for name in staged_head),
+        *packed_load,
+        *(load(name) for name in staged_tail),
+    ]
+    # A blank line precedes the staged drive data; it goes with streamed drive data.
+    if shared_metadata or not has_drive_rows:
+        dense_loads += ["", *(load(name) for name in drive_staged)]
+    dense_loads = "\n".join(dense_loads)
     drive_projection = (
-        """
-            if (row_type == 1) {
-                new_impulse = ProjectionLaw::physx_drive(old_impulse, jv, s_drive_imp_mul_dense[i],
-                    s_drive_vel_mul_dense[i], s_drive_target_dense[i], s_drive_max_imp_dense[i]);
+        f"""
+            if (row_type == 1) {{
+                new_impulse = ProjectionLaw::physx_drive(old_impulse, jv, {dense_row("s_drive_imp_mul_dense", "i")},
+                    {dense_row("s_drive_vel_mul_dense", "i")}, {dense_row("s_drive_target_dense", "i")}, {dense_row("s_drive_max_imp_dense", "i")});
                 delta_impulse = new_impulse - old_impulse;
-            }"""
+            }}"""
         if has_drive_rows
         else """
             if (row_type == 1) {
@@ -817,7 +914,7 @@ def get_source(
         # rewrite it into a lane-0 broadcast.
         dense_old_vlim, mf_old_vlim = "old_vlim", "old_mf_vlim"
         dense_total = "                const float old_vlim = READ(lane == 0 ? s_lam_dense[i] : 0.0f, 0);\n"
-        mf_total = "                const float old_mf_vlim = s_lam_mf[i];\n"
+        mf_total = f"                const float old_mf_vlim = {mf_load('i')};\n"
         total_fence = "                SYNC();\n"
     else:
         # The stateless law stores the correction, not a total: it never reads the old one.
@@ -834,7 +931,7 @@ def get_source(
         f"{mf_total}"
         f"                const wp::vec3 speed_row = ProjectionLaw::speed_row(speed_mf_vlim, __int_as_float(meta.z), mf_diag, {mf_old_vlim}, {law});\n"
         f"{total_fence}"
-        "                if (lane == 0) s_lam_mf[i] = speed_row[0];"
+        f"                if (lane == 0) {mf_store('i', 'speed_row[0]')}"
     )
     dense_velocity_limit_row = f"""            // row_type 4=JOINT_VELOCITY_LIMIT: a signed Jacobian and target velocity, so residual < 0
             // means that side of the velocity box is violated; the unrelaxed velocity-limit law.
@@ -847,8 +944,8 @@ def get_source(
         f"""
         if (row_phase == 0 || row_phase == 2) {{
             for (int i = 0; i < m_dense; i++) {{
-                if ((s_meta_dense[i] & {_DENSE_META_ROW_TYPE_MASK}) != {int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)}) continue;
-                float denom = s_diag_dense[i];
+                if (({dense_type("i", scan=True)}) != {int(PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT)}) continue;
+                float denom = {dense_row("s_diag_dense", "i")};
                 if (denom <= 0.0f) continue;
 
                 float my_sum_vlim = 0.0f;
@@ -859,7 +956,7 @@ def get_source(
                 SUM(my_sum_vlim);
                 float jv_vlim = my_sum_vlim;
 
-                float residual_vlim = jv_vlim + s_rhs_dense[i];
+                float residual_vlim = jv_vlim + {dense_row("s_rhs_dense", "i")};
 {dense_velocity_limit_law}
 
                 if (delta_impulse_vlim != 0.0f) {{
@@ -888,9 +985,9 @@ def get_source(
         if (row_phase == 0 || row_phase == 2 || row_phase == 5) {{
             int drive_hi_fvl = min(dense_phase_bounds.data[world * 2 + 0], m_dense);
             for (int i = 0; i < drive_hi_fvl; i++) {{
-                if ((s_meta_dense[i] & {_DENSE_META_ROW_TYPE_MASK}) != {int(PGS_CONSTRAINT_TYPE_JOINT_TARGET)}) continue;
-                float qdot_max_fvl = s_drive_vel_limit_dense[i];
-                float denom_fvl = s_diag_dense[i];
+                if (({dense_type("i", scan=True)}) != {int(PGS_CONSTRAINT_TYPE_JOINT_TARGET)}) continue;
+                float qdot_max_fvl = {dense_row("s_drive_vel_limit_dense", "i")};
+                float denom_fvl = {dense_row("s_diag_dense", "i")};
                 if (denom_fvl <= 0.0f) continue;
 
                 float my_sum_fvl = 0.0f;
@@ -996,12 +1093,12 @@ def get_source(
             if ((row_phase == 1 || row_phase == 4) && mf_rt != 0 && mf_rt != 2) continue;
             if (row_phase == 0 && mf_rt == 4) continue;
             if (ProjectionLaw::friction_gate(mf_rt, global_iter, friction_start_iteration)) {{
-                s_lam_mf[i] = 0.0f;
+                {mf_store("i", "0.0f")}
                 SYNC();
                 continue;
             }}
 
-            if (mf_rt == 2 && i != (packed_tp >> 16) + 1) continue;
+            if (mf_rt == 2 && i != ({mf_parent("packed_tp")}) + 1) continue;
             if (mf_diag <= 0.0f{" && mf_rt != 2" if friction_mode == "current" else ""}) continue;
 
             {mf_friction_precheck}
@@ -1018,7 +1115,7 @@ def get_source(
             float jv = my_sum;
 
             float residual = jv + __int_as_float(meta.z);
-            float old_impulse = s_lam_mf[i];
+            float old_impulse = {mf_load("i")};
             float delta = -residual * mf_diag;
             // A contact row's regularization weight makes indeterminate normal-force splits unique.
             if (mf_rt == 0 && regularize)
@@ -1032,7 +1129,7 @@ def get_source(
             }}
 
             float delta_impulse = new_impulse - old_impulse;
-            s_lam_mf[i] = new_impulse;
+            {mf_store("i", "new_impulse")}
 
             // V update using prefetched MiJt values
             if (delta_impulse != 0.0f) {{
@@ -1109,7 +1206,7 @@ def get_source(
     )
     snippet = f"""    const int lane = LANE;
 
-    int m_dense = world_constraint_count.data[world];
+    {dense_count}
     int m_mf = mf_constraint_count.data[world];
     if (m_dense == 0 && m_mf == 0) return;
     if (m_dense > {M_D}) m_dense = {M_D};
@@ -1141,7 +1238,7 @@ def get_source(
     int dof_map_base = world * {D};
     int off_dense = world * {M_D};
     int off_mf = world * {M_MF};
-    int off_meta = off_mf * 4;
+    int off_meta = off_mf * 4;{component}
     int jy_world_base = world * {M_D} * {D};
     int mf6_base = world * {M_MF} * 6;
     int mf_load_lo = (row_phase == 5) ? mf_contact_end : 0;
@@ -1149,33 +1246,18 @@ def get_source(
     // ═══════════════════════════════════════════════════════
     // SHARED MEMORY
     // ═══════════════════════════════════════════════════════
-{shared("float", "s_v", D, " ")}
-{shared("float", "s_lam_dense", M_D, " ")}
-{shared("float", "s_rhs_dense", M_D, " ")}
-{shared("float", "s_diag_dense", M_D, " ")}
-    // Low 3 bits: row type (0..4). Remaining bits: parent + 1 (-1 maps to 0).
-{shared("int", "s_meta_dense", M_D, "   ")}
-{shared("float", "s_mu_dense", M_D, " ")}
-{drive_shared_declarations}
-{shared("float", "s_lam_mf", M_MF, " ")}
+{shared_declarations}
 
     // ═══════════════════════════════════════════════════════
     // LOAD PHASE
     // ═══════════════════════════════════════════════════════
     for (int i = {dense_load_start} + lane; i < dense_hi; i += 32) {{
-        s_lam_dense[i] = world_impulses.data[off_dense + i];
-        s_rhs_dense[i] = {dense_rhs};
-        s_diag_dense[i] = world_diag.data[off_dense + i];
-        int row_type = world_row_type.data[off_dense + i];
-        int row_parent = world_row_parent.data[off_dense + i];
-        s_meta_dense[i] = (row_type & {_DENSE_META_ROW_TYPE_MASK}) | ((row_parent + 1) << {_DENSE_META_ROW_TYPE_BITS});
-        s_mu_dense[i] = world_row_mu.data[off_dense + i];
-{drive_loads}
+{dense_loads}
     }}
     if (row_phase != 3 && row_phase != 6) {{
         // Dense-only phases touch no MF rows; leave their impulses unstaged.
         for (int i = mf_load_lo + lane; i < m_mf; i += 32) {{
-            s_lam_mf[i] = mf_impulses.data[off_mf + i];
+            {mf_impulse_load}
         }}
     }}
     for (int d = lane; d < {D}; d += 32) {{
@@ -1211,7 +1293,7 @@ def get_source(
                 {dense_prefetch_next_code}
             }}
 
-            int row_type = s_meta_dense[i] & {_DENSE_META_ROW_TYPE_MASK};
+            int row_type = {dense_type("i")};
             {torsion_skip}
             // row_phase 0: all rows.
             // row_phase 1: contact/friction rows.
@@ -1233,7 +1315,7 @@ def get_source(
                 continue;
             }}
 
-            float denom = s_diag_dense[i];
+            float denom = {dense_row("s_diag_dense", "i")};
             if (denom <= 0.0f{" && row_type != 2" if friction_mode == "current" else ""}) continue;
 
             // J_i · v (using prefetched J)
@@ -1244,7 +1326,7 @@ def get_source(
             float jv = my_sum;
 
             float old_impulse = {dense_old_impulse};
-            float residual = jv + s_rhs_dense[i];
+            float residual = jv + {dense_row("s_rhs_dense", "i")};
             float delta = denom > 0.0f ? -residual / denom : 0.0f;
             if (regularize && denom > 0.0f)
                 delta = ProjectionLaw::regularized_delta(delta, world_row_w.data[off_dense + i], old_impulse);
@@ -1289,146 +1371,11 @@ def get_source(
     }}
     if (row_phase != 3 && row_phase != 6) {{
         for (int i = mf_load_lo + lane; i < m_mf; i += 32) {{
-            mf_impulses.data[off_mf + i] = s_lam_mf[i];
+            {mf_impulse_store}
         }}
     }}
 #endif
 """
-
-    snippet = snippet.replace("packed_tp >> 16", _mf_parent_expression("packed_tp", M_MF))
-    for parent_row in ("parent", "patch_row"):
-        packed_parent = f"mf_meta.data[off_meta + {parent_row} * 4 + 3]"
-        snippet = snippet.replace(f"{packed_parent} >> 16", _mf_parent_expression(packed_parent, M_MF))
-    if not shared_metadata:
-        # Shared-memory diet: the nine read-only per-row metadata arrays are
-        # ~9/11ths of this kernel's shared footprint and pin occupancy to
-        # floor(smem_per_sm / (10*M_D*4B)). Stream them from global/L2 instead;
-        # values are identical, only the storage class changes.
-        # s_meta_dense cannot alias a single global stream (it is packed at
-        # load time from two arrays), so its reads are rewritten back to the
-        # source arrays below. Keeping the packed array resident costs 4*M_D
-        # bytes of static shared memory per block; at M_D=1024 that is +4 KiB
-        # (e.g. 22.9 -> 27.0 KiB with M_MF=4096, D=604), dropping occupancy
-        # from 4 to 3 blocks/SM on 100-KiB-smem parts (sm_86/89/120) and
-        # regressing dense-contact scenes by the lost concurrency. Replay of a
-        # captured launch confirms the streamed variant is bitwise-identical
-        # in v_out, impulses, and mf_impulses. A launch with at most one block
-        # per SM has no concurrency to lose; resident_row_metadata keeps the
-        # packed array there (execution_plan._select_mfgs_storage).
-        meta_map = {
-            "s_rhs_dense": ("float", "rhs_bias"),
-            "s_diag_dense": ("float", "world_diag"),
-            "s_mu_dense": ("float", "world_row_mu"),
-            "s_drive_target_dense": ("float", "world_drive_target_vel_bias"),
-            "s_drive_vel_mul_dense": ("float", "world_drive_vel_multiplier"),
-            "s_drive_imp_mul_dense": ("float", "world_drive_impulse_multiplier"),
-            "s_drive_max_imp_dense": ("float", "world_drive_max_impulse"),
-        }
-        if fuse_vel_limits:
-            meta_map["s_drive_vel_limit_dense"] = ("float", "world_drive_vel_limit")
-        for sname, (ctype, gname) in meta_map.items():
-            snippet = re.sub(rf"    __shared__ {ctype}\s+{sname}\[{M_D}\];\n", "", snippet)
-            snippet = re.sub(rf"\s*{sname}\[i\] = {gname}\.data\[off_dense \+ i\];", "", snippet, count=1)
-            snippet = re.sub(rf"{sname}\[([^\]]*)\]", rf"{gname}.data[off_dense + (\1)]", snippet)
-
-        # Stream the packed dense-row metadata: drop the resident array and
-        # its load-time packing, and read row type/parent straight from their
-        # global source arrays (identical values, S2-era storage classes).
-        # resident_row_metadata keeps the array, its packing and its reads in
-        # the dense row loop and the friction projectors: row types, friction
-        # parents and the patch-ring walks, chains of dependent loads that
-        # only visit rows the launch staged.
-        if not resident_row_metadata:
-            snippet = re.sub(
-                r"\s*// Low 3 bits[^\n]*\n\s*__shared__ int   s_meta_dense\[\d+\];\n",
-                "\n",
-                snippet,
-            )
-            snippet = re.sub(
-                r"\s*int row_type = world_row_type\.data\[off_dense \+ i\];"
-                r"\s*int row_parent = world_row_parent\.data\[off_dense \+ i\];"
-                r"\s*s_meta_dense\[i\] = [^\n]*\n",
-                "\n",
-                snippet,
-            )
-            snippet = re.sub(
-                r"int parent_idx = \(s_meta_dense\[i\] >> \d+\) - 1;",
-                "int parent_idx = world_row_parent.data[off_dense + i];",
-                snippet,
-            )
-            snippet = re.sub(
-                r"\(\(s_meta_dense\[(\w+)\] >> \d+\) - 1\)",
-                r"world_row_parent.data[off_dense + \1]",
-                snippet,
-            )
-            snippet = re.sub(
-                r"int row_type = s_meta_dense\[i\] & \d+;",
-                "int row_type = world_row_type.data[off_dense + i];",
-                snippet,
-            )
-        # The end-of-iteration limit scans keep the global row-type reads in
-        # both variants, so resident_row_metadata changes only the row loop
-        # and the friction projectors. Packed reads would be exact there too:
-        # the scans run in row phases 0 and 2, which stage every dense row,
-        # and 5, which stages [0, bounds[1]) and scans [0, bounds[0]).
-        snippet = re.sub(
-            r"\(s_meta_dense\[i\] & \d+\)",
-            "(world_row_type.data[off_dense + i])",
-            snippet,
-        )
-        if not resident_row_metadata and "s_meta_dense" in snippet:
-            raise RuntimeError(
-                "MF-GS shared-memory diet failed to stream s_meta_dense; "
-                "the generated snippet still references the resident array"
-            )
-
-    if stream_mf_impulses:
-        # One lane owns every global impulse access. Reads broadcast registers,
-        # including friction-parent/sibling values; no memory fence or race
-        # between independent lane loads and stores is needed. All these read
-        # sites are in warp-uniform row/projector branches, not lane-0 branches.
-        for statement in (
-            "s_lam_mf[i] = mf_impulses.data[off_mf + i];",
-            "mf_impulses.data[off_mf + i] = s_lam_mf[i];",
-        ):
-            if snippet.count(statement) != 1:
-                raise RuntimeError("MF-GS impulse staging source changed")
-            snippet = snippet.replace(statement, "")
-        snippet = snippet.replace(
-            f"    __shared__ float s_lam_mf[{M_MF}];",
-            "    volatile float* g_lam_mf = (volatile float*)(&mf_impulses.data[off_mf]);",
-        )
-        snippet = re.sub(
-            r"s_lam_mf\[([^\]]*)\](\s*=(?!=)\s*[^;]+;)",
-            r"if (lane == 0) g_lam_mf[\1]\2",
-            snippet,
-        )
-        snippet = re.sub(
-            r"s_lam_mf\[([^\]]*)\]",
-            r"READ(lane == 0 ? g_lam_mf[\1] : 0.0f, 0)",
-            snippet,
-        )
-
-    if independent_components:
-        # The paired owner's signed selector arrives in the otherwise unused
-        # local-owner argument: negative means this world's matrix-free rows
-        # are the free body's alone, so the sweep reads and writes only its
-        # six coordinates and leaves the articulation's to the paired kernel.
-        replacements = {
-            "int m_dense = world_constraint_count.data[world];": "const bool split_component = local_solve_owner.data[world] < 0;\n"
-            "    int m_dense = split_component ? 0 : world_constraint_count.data[world];",
-            "int off_meta = off_mf * 4;": "int off_meta = off_mf * 4;\n"
-            "    const int first_dofs = split_component ? mf_meta.data[off_meta] : 0;\n"
-            "    const int component_offset = split_component ? max(first_dofs >> 16, static_cast<int>(static_cast<short>(first_dofs & 65535))) : 0;",
-            "s_v[d] = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;": "s_v[d] = global_dof >= 0 && (!split_component || (d >= component_offset && d < component_offset + 6)) "
-            "? v_out.data[global_dof] : 0.0f;",
-            "if (global_dof >= 0) v_out.data[global_dof] = s_v[d];": "if (global_dof >= 0 && (!split_component || (d >= component_offset && d < component_offset + 6))) "
-            "v_out.data[global_dof] = s_v[d];",
-        }
-        for old, new in replacements.items():
-            if snippet.count(old) != 1:
-                raise RuntimeError("Independent MF ownership source seam changed")
-            snippet = snippet.replace(old, new)
 
     # Fixed signature (has_drive_rows precedent): world_drive_vel_limit is
     # always a parameter; launch sites pass the solver's drive_vel_limit

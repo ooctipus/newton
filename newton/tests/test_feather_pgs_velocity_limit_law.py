@@ -590,7 +590,7 @@ class TestVelocityLimitLawRollouts(unittest.TestCase):
             self.assertEqual(solver._ink_rows, 32 if name.startswith("tier") else 0)
             # Each serial route sweeps the hand's rows with kernels of the requested law.
             if name == "incremental":
-                route_kernels = list(solver._pgs_solve_mf_gs_incremental_kernels)
+                route_kernels = [tier.kernel for tier in solver._mf_gs_tiers]
                 self.assertTrue(route_kernels)
             else:
                 route_kernels = [solver._pgs_solve_mf_gs_kernel]

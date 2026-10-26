@@ -85,11 +85,9 @@ intrinsics around it: the CUDA binding is the device prelude
 ``wp.func_native`` functions of this module, which the Warp loop sweeps call.
 """
 
-from string import Template
-
 import warp as wp
 
-from .device_preludes import DevicePrelude
+from .device_preludes import DevicePrelude, substitute
 
 CONTACT_UNIT_RING_NORMALS = 8
 """Most normal rows of a ring unit; a larger ring solves its anchors as anchor units."""
@@ -117,7 +115,7 @@ RING_SOLUTION = 168
 RING_ALPHA = 180
 RING_BLOCK_SIZE = 192
 
-_UNIT = Template(r"""
+_UNIT = r"""
     // split: the root's load answers the contact's approach with the wrong sign or above ${gain} times the normal
     // row's own response, where the coupling of units can drive exact solves away from it.
     struct ContactUnitRoot { float s0, s1, alpha; int evaluations, split; };
@@ -787,7 +785,7 @@ _UNIT = Template(r"""
             }
             return evaluations;
         }
-    };""")
+    };"""
 
 
 def get_unit_source(*, cpu: bool = False) -> str:
@@ -816,7 +814,8 @@ def get_unit_source(*, cpu: bool = False) -> str:
             "abs": "fabsf",
         }
     # Float literals for the C++ text (``8.0f``, ``1e-06f``), whatever the constants' Python types.
-    return _UNIT.substitute(
+    return substitute(
+        _UNIT,
         bindings,
         gain=repr(float(CONTACT_UNIT_SPLIT_GAIN)),
         hold=f"{float(CONTACT_UNIT_SPLIT_HOLD):g}",

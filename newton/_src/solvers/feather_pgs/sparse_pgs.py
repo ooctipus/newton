@@ -8,7 +8,9 @@ from functools import cache
 
 import warp as wp
 
+from . import kernel_template
 from .device_preludes import RING, cuda_native, lane_group
+from .kernel_template import KernelTemplate
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -16,7 +18,7 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
 )
 from .projection_laws import PROJECTION_LAW
-from .row_inputs import RowArgument, make_row_kernel
+from .row_inputs import RowArgument
 from .solve_policy import EXACT_POLICY, SolvePolicy, sweep_exit, vote
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport
@@ -44,6 +46,40 @@ def contact_transaction_launch_bounds(max_constraints: int, *, transaction_block
     if transaction_blocks not in CONTACT_TRANSACTION_BLOCKS:
         raise ValueError(f"transaction_blocks must be one of {CONTACT_TRANSACTION_BLOCKS}")
     return 64, 12 if int(max_constraints) > 128 else int(transaction_blocks)
+
+
+_SWEEP_ABI = kernel_template.params(
+    ("world", int),
+    ("world_constraint_count", wp.array[int]),
+    ("rhs_bias", wp.array2d[float]),
+    ("world_diag", wp.array2d[float]),
+    ("world_impulses", wp.array2d[float]),
+    ("row_dof", wp.array3d[int]),
+    ("row_factor", wp.array3d[float]),
+    ("row_incident", wp.array2d[float]),
+    ("world_row_type", wp.array2d[int]),
+    ("world_row_parent", wp.array2d[int]),
+    ("world_row_mu", wp.array2d[float]),
+    ("world_dof_indices", wp.array2d[int]),
+    ("v_hat", wp.array[float]),
+    ("mf_constraint_count", wp.array[int]),
+    ("mf_meta", wp.array2d[int]),
+    ("mf_impulses", wp.array2d[float]),
+    ("mf_J_a", wp.array3d[float]),
+    ("mf_J_b", wp.array3d[float]),
+    ("mf_MiJt_a", wp.array3d[float]),
+    ("mf_MiJt_b", wp.array3d[float]),
+    ("mf_row_mu", wp.array2d[float]),
+    ("iterations", int),
+    ("omega", float),
+    ("change_tolerance", float),
+    ("relative_change_tolerance", float),
+    ("friction_start_iteration", int),
+    ("iteration_offset", int),
+    ("factor_velocity_delta", wp.array2d[float]),
+    ("support", _SparseRowSupport),
+)
+"""The native ABI of the sparse sweep (one world per call)."""
 
 
 @cache
@@ -426,6 +462,22 @@ def _get_pgs_solve_sparse_kernel(
         terms=(("change", "denominator", "row_type"), ("sibling_change", "diagonal[sibling]", str(friction_type))),
         slack=(impulse_slack, impulse_slack),
     )
+    # Under staged contact triplets a pair whose metric the triplets cached skips the coupling's dot product and
+    # reduction: its slot in the metric cache, the guard and the cached pair law.
+    cached_metric = contact_triplets and not single_stage
+    metric_lookup = (
+        "            const int metric_slot = friction ? contact_metric_slot(parent) : -1;\n"
+        "            const bool metric_ready = metric_slot >= 0 && metric_map[metric_slot] >= 0;\n"
+        if cached_metric
+        else ""
+    )
+    metric_guard = "if (!metric_ready) " if cached_metric else ""
+    pair_sums = (
+        "SUM(dot, sibling_dot);\n            if (!metric_ready) SUM(cross);"
+        if cached_metric
+        else "SUM(dot, sibling_dot, cross);"
+    )
+    pair_law = "friction_pair_cached(metric_slot, " if cached_metric else "ProjectionLaw::friction_pair("
     row_update = f"""
             const int row_type = static_cast<int>(type[row]);
 {velocity_filter}
@@ -451,7 +503,7 @@ def _get_pgs_solve_sparse_kernel(
                 if (radius == 0.0f && old_impulse == 0.0f && old_sibling == 0.0f) continue;
             }}
 
-            int indices[{Q}];
+{metric_lookup}            int indices[{Q}];
             float responses[{Q}];
             float sibling_responses[{Q}];
             float dot = 0.0f;
@@ -471,10 +523,10 @@ def _get_pgs_solve_sparse_kernel(
                     const float velocity = delta[index];
                     dot += value * velocity;
                     sibling_dot += sibling_value * velocity;
-                    cross += value * sibling_value;
+                    {metric_guard}cross += value * sibling_value;
                 }}
             }}
-            SUM(dot, sibling_dot, cross);
+            {pair_sums}
             const float residual = dot + rhs[row];
             float new_impulse = old_impulse;
             float sibling_change = 0.0f;
@@ -482,7 +534,7 @@ def _get_pgs_solve_sparse_kernel(
                 wp::vec2 pair(0.0f);
                 if (radius > 0.0f) {{
                     const float sibling_residual = sibling_dot + rhs[sibling];
-                    pair = ProjectionLaw::friction_pair(denominator, cross, diagonal[sibling],
+                    pair = {pair_law}denominator, cross, diagonal[sibling],
                         wp::vec2(residual, sibling_residual), wp::vec2(old_impulse, old_sibling), radius, omega);
                 }}
                 pair = ProjectionLaw::disk(pair, radius);
@@ -562,24 +614,6 @@ ARGMAX(sweep_violation, sweep_violation_kind);""",
         )
         setup += triplet_setup
         active_scan += "\n        int consumed_tangent = -1;\n"
-        # A pair whose metric the triplets cached skips the coupling's dot product and reduction.
-        for old, new in (
-            (
-                "            int indices[",
-                "            const int metric_slot = friction ? contact_metric_slot(parent) : -1;\n"
-                "            const bool metric_ready = metric_slot >= 0 && metric_map[metric_slot] >= 0;\n"
-                "            int indices[",
-            ),
-            ("cross += value * sibling_value;", "if (!metric_ready) cross += value * sibling_value;"),
-            ("SUM(dot, sibling_dot, cross);", "SUM(dot, sibling_dot);\n            if (!metric_ready) SUM(cross);"),
-            (
-                "pair = ProjectionLaw::friction_pair(denominator,",
-                "pair = friction_pair_cached(metric_slot, denominator,",
-            ),
-        ):
-            if row_update.count(old) != 1:
-                raise ValueError("the sparse row update changed; update the cached pair metric's edits")
-            row_update = row_update.replace(old, new)
         row_update = triplet_update + row_update
     writeback = f"""
     for (int d = lane; d < {D}; d += {L}) factor_velocity_delta.data[world * {D} + d] = delta[d];
@@ -607,105 +641,6 @@ ARGMAX(sweep_violation, sweep_violation_kind);""",
         lead="",
     )
 
-    @wp.func_native(snippet)
-    def solve_native(
-        world: int,
-        world_constraint_count: wp.array[int],
-        rhs_bias: wp.array2d[float],
-        world_diag: wp.array2d[float],
-        world_impulses: wp.array2d[float],
-        row_dof: wp.array3d[int],
-        row_factor: wp.array3d[float],
-        row_incident: wp.array2d[float],
-        world_row_type: wp.array2d[int],
-        world_row_parent: wp.array2d[int],
-        world_row_mu: wp.array2d[float],
-        world_dof_indices: wp.array2d[int],
-        v_hat: wp.array[float],
-        mf_constraint_count: wp.array[int],
-        mf_meta: wp.array2d[int],
-        mf_impulses: wp.array2d[float],
-        mf_J_a: wp.array3d[float],
-        mf_J_b: wp.array3d[float],
-        mf_MiJt_a: wp.array3d[float],
-        mf_MiJt_b: wp.array3d[float],
-        mf_row_mu: wp.array2d[float],
-        iterations: int,
-        omega: float,
-        change_tolerance: float,
-        relative_change_tolerance: float,
-        friction_start_iteration: int,
-        iteration_offset: int,
-        factor_velocity_delta: wp.array2d[float],
-        support: _SparseRowSupport,
-    ): ...
-
-    def solve(
-        world_count: int,
-        world_constraint_count: wp.array[int],
-        rhs_bias: wp.array2d[float],
-        world_diag: wp.array2d[float],
-        world_impulses: wp.array2d[float],
-        row_dof: wp.array3d[int],
-        row_factor: wp.array3d[float],
-        row_incident: wp.array2d[float],
-        world_row_type: wp.array2d[int],
-        world_row_parent: wp.array2d[int],
-        world_row_mu: wp.array2d[float],
-        world_dof_indices: wp.array2d[int],
-        v_hat: wp.array[float],
-        mf_constraint_count: wp.array[int],
-        mf_meta: wp.array2d[int],
-        mf_impulses: wp.array2d[float],
-        mf_J_a: wp.array3d[float],
-        mf_J_b: wp.array3d[float],
-        mf_MiJt_a: wp.array3d[float],
-        mf_MiJt_b: wp.array3d[float],
-        mf_row_mu: wp.array2d[float],
-        iterations: int,
-        omega: float,
-        change_tolerance: float,
-        relative_change_tolerance: float,
-        friction_start_iteration: int,
-        iteration_offset: int,
-        factor_velocity_delta: wp.array2d[float],
-        support: _SparseRowSupport,
-    ):
-        block, lane = wp.tid()
-        world = block * W + lane // L
-        if world < world_count:
-            solve_native(
-                world,
-                world_constraint_count,
-                rhs_bias,
-                world_diag,
-                world_impulses,
-                row_dof,
-                row_factor,
-                row_incident,
-                world_row_type,
-                world_row_parent,
-                world_row_mu,
-                world_dof_indices,
-                v_hat,
-                mf_constraint_count,
-                mf_meta,
-                mf_impulses,
-                mf_J_a,
-                mf_J_b,
-                mf_MiJt_a,
-                mf_MiJt_b,
-                mf_row_mu,
-                iterations,
-                omega,
-                change_tolerance,
-                relative_change_tolerance,
-                friction_start_iteration,
-                iteration_offset,
-                factor_velocity_delta,
-                support,
-            )
-
     suffix = "_active" if active_rows else ""
     if use_support_table:
         suffix += "_support_table"
@@ -726,32 +661,18 @@ ARGMAX(sweep_violation, sweep_violation_kind);""",
         suffix += "_local_factors"
     if warm_start:
         suffix += "_warm_start"
+    extra = solve_policy.arguments
     if single_stage:
-        name = f"pgs_solve_sparse_{M}_{D}_{S}_{F}_{P}{suffix}{solve_policy.suffix}"
-        records = RowArgument("contact_records", wp.array3d[float], after="iteration_offset")
-        kernel = make_row_kernel(
-            name,
-            snippet,
-            solve_native.func,
-            (records, *solve_policy.arguments),
-            dispatch="tiles",
-            groups=W,
-            lanes=L,
-            launch_bounds=launch_bounds,
-        )
-        if solve_policy.counts:
-            kernel._fpgs_solve_readout = solve_policy.readout
-        return kernel
-    if solve_policy.counts:
-        name = f"pgs_solve_sparse_{M}_{D}_{S}_{F}_{P}{suffix}{solve_policy.suffix}"
-        kernel = make_row_kernel(
-            name, snippet, solve_native.func, solve_policy.arguments, dispatch="tiles", groups=W, lanes=L
-        )
-        kernel._fpgs_solve_readout = solve_policy.readout
-        return kernel
-    solve.__name__ = f"pgs_solve_sparse_{M}_{D}_{S}_{F}_{P}{suffix}{solve_policy.suffix}"
-    solve.__qualname__ = solve.__name__
-    return wp.kernel(enable_backward=False, module="unique")(solve)
+        extra = (RowArgument("contact_records", wp.array3d[float], after="iteration_offset"), *extra)
+    return KernelTemplate.from_abi(
+        f"pgs_solve_sparse_{M}_{D}_{S}_{F}_{P}{suffix}{solve_policy.suffix}",
+        _SWEEP_ABI,
+        snippet,
+        kernel_template.tiles(W, L),
+        extra=extra,
+        composed=True,
+        launch_bounds=launch_bounds if single_stage else None,
+    ).kernel()
 
 
 def _contact_triplet_code(
@@ -1010,7 +931,11 @@ def _single_stage_triplet_code(
     ``solve_policy`` compiles the change vote.
     """
     width = CONTACT_RECORD_FLOATS + (CONTACT_RING_FLOATS if linked else 0)
-    record = f"contact_records.data + (static_cast<size_t>(world) * contact_records.shape[1] + {{row}} / 3) * {width}"
+
+    def record(row: str) -> str:
+        """The address of the contact record of the triplet that holds row ``row``."""
+        return f"contact_records.data + (static_cast<size_t>(world) * contact_records.shape[1] + {row} / 3) * {width}"
+
     entry_guard = "select_active && " if active else ""
     selected_guard = "\n                    & (((selected_words[(row + 1) / 32] >> ((row + 1) & 31)) & 1u) != 0u)"
     selected_guard = selected_guard if active else ""
@@ -1044,7 +969,7 @@ def _single_stage_triplet_code(
                 }}
             }}
         }}
-        *reinterpret_cast<int4*>({record.format(row="normal")} + {CONTACT_RECORD_FLOATS})
+        *reinterpret_cast<int4*>({record("normal")} + {CONTACT_RECORD_FLOATS})
             = make_int4(first, second, third, others);
     }}
     SYNC();
@@ -1084,7 +1009,7 @@ def _single_stage_triplet_code(
                 const int sibling_parent = world_row_parent.data[offset + sibling];{normal_parent}
                 if (tangent_parent == row && sibling_parent == row && tangent_class == sibling_class
                     && row_class == tangent_class{unlinked_guard}) {{
-                    const float* record = {record.format(row="row")};
+                    const float* record = {record("row")};
                     const float4 coupling = *reinterpret_cast<const float4*>(record);
                     const float4 basis = *reinterpret_cast<const float4*>(record + 4);{ring_read}
                     const float mu = world_row_mu.data[offset + tangent];

@@ -104,9 +104,10 @@ class TestFeatherPGSCaptureAllocation(unittest.TestCase):
             with self.subTest(configuration=name):
                 model = standing_model()
                 captured = _Scene(model, _tier_solver(model, name))
-                tiers = captured.solver._pgs_solve_mf_gs_incremental_kernels
+                tiers = captured.solver._mf_gs_tiers
                 self.assertTrue(tiers)
-                self.assertTrue(all(getattr(kernel, "_fpgs_extra_inputs", False) for kernel in tiers))
+                self.assertTrue(all(tier.response_inputs for tier in tiers))
+                tier_kernels = [tier.kernel for tier in tiers]
                 if name == "in_kernel_response":
                     self.assertIsNotNone(captured.solver._ink_sizes, "The in-kernel response must be admitted")
                 allocated, tier_inputs = [], []
@@ -117,8 +118,15 @@ class TestFeatherPGSCaptureAllocation(unittest.TestCase):
                     allocated.append(array)
                     return array
 
-                def launch(kernel, *args, tier_inputs=tier_inputs, launch_tiled=launch_tiled, **kwargs):
-                    if getattr(kernel, "_fpgs_extra_inputs", False):
+                def launch(
+                    kernel,
+                    *args,
+                    tier_inputs=tier_inputs,
+                    tier_kernels=tier_kernels,
+                    launch_tiled=launch_tiled,
+                    **kwargs,
+                ):
+                    if any(kernel is tier_kernel for tier_kernel in tier_kernels):
                         tier_inputs.extend(kwargs.get("inputs", ()))
                     return launch_tiled(kernel, *args, **kwargs)
 

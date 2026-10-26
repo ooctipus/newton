@@ -15,6 +15,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import solver_feather_pgs as fpgs
 from newton.tests.feather_pgs_paired_fixture import solve_fixture
+from newton.tests.test_feather_pgs_native_prelude import _native_snippets
 
 
 def _build_pendulums(device, worlds=5):
@@ -139,7 +140,7 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
         parents = np.array([-1, 0, 32767, 32768, 37247, 65534], np.int32)
         expected = (((parents.astype(np.int64) & 65535) << 16) | 2).astype(np.uint32).view(np.int32)
         kernel = fpgs._get_pack_mf_meta_kernel(65535, "cpu")
-        source = inspect.getclosurevars(kernel.func).nonlocals["pack_mf_meta_native"].native_snippet
+        source = max(_native_snippets(kernel), key=len)
         result = wp.zeros(len(parents), dtype=int, device="cpu")
         wp.launch(
             _metadata_packer(source),
@@ -167,10 +168,9 @@ class TestFeatherPGSMFMetadata(unittest.TestCase):
                     shared_metadata=False,
                     stream_mf_impulses=friction == "current",
                 )
-                native = inspect.getclosurevars(kernel.func).nonlocals["pgs_solve_mf_gs_native"]
                 result = wp.zeros(len(parents), dtype=int, device="cpu")
                 wp.launch(
-                    _parent_decoder(native.native_snippet),
+                    _parent_decoder(max(_native_snippets(kernel), key=len)),
                     dim=len(parents),
                     inputs=[wp.array(packed, dtype=int, device="cpu")],
                     outputs=[result],

@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import warp as wp
 
+from . import kernel_template
 from .device_preludes import cuda_native, lane_group
+from .kernel_template import KernelTemplate
 
 
 def get_grouped_hinv_jt_kernel(
@@ -119,64 +121,29 @@ def get_grouped_hinv_jt_kernel(
 """
     snippet = cuda_native(body, preludes=(lane_group(32),))
 
-    @wp.func_native(snippet)
-    def grouped_hinv_jt_native(
-        block: int,
-        warps_per_block: int,
-        n_arts: int,
-        L_group: wp.array3d[float],
-        J_group: wp.array3d[float],
-        group_to_art: wp.array[int],
-        art_to_world: wp.array[int],
-        articulation_world_dof_offset: wp.array[int],
-        world_constraint_count: wp.array[int],
-        Y_group: wp.array3d[float],
-        J_world: wp.array3d[float],
-        Y_world: wp.array3d[float],
-        diag_group: wp.array2d[float],
-        mf_constraint_count: wp.array[int],
-        skip_rows_le: int,
-    ): ...
-
-    def grouped_hinv_jt_template(
-        warps_per_block: int,
-        n_arts: int,
-        L_group: wp.array3d[float],
-        J_group: wp.array3d[float],
-        group_to_art: wp.array[int],
-        art_to_world: wp.array[int],
-        articulation_world_dof_offset: wp.array[int],
-        world_constraint_count: wp.array[int],
-        Y_group: wp.array3d[float],
-        J_world: wp.array3d[float],
-        Y_world: wp.array3d[float],
-        diag_group: wp.array2d[float],
-        mf_constraint_count: wp.array[int],
-        skip_rows_le: int,
-    ):
-        block, _lane = wp.tid()
-        grouped_hinv_jt_native(
-            block,
-            warps_per_block,
-            n_arts,
-            L_group,
-            J_group,
-            group_to_art,
-            art_to_world,
-            articulation_world_dof_offset,
-            world_constraint_count,
-            Y_group,
-            J_world,
-            Y_world,
-            diag_group,
-            mf_constraint_count,
-            skip_rows_le,
-        )
-
     suffix = (
         ("_world" if write_world else "") + ("_nogroup" if not write_group else "") + ("_diag" if compute_diag else "")
     )
     name = f"grouped_hinv_jt_{N}_{M}{suffix}"
-    grouped_hinv_jt_template.__name__ = name
-    grouped_hinv_jt_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(grouped_hinv_jt_template)
+    return KernelTemplate(
+        name,
+        kernel_template.params(
+            ("warps_per_block", int),
+            ("n_arts", int),
+            ("L_group", wp.array3d[float]),
+            ("J_group", wp.array3d[float]),
+            ("group_to_art", wp.array[int]),
+            ("art_to_world", wp.array[int]),
+            ("articulation_world_dof_offset", wp.array[int]),
+            ("world_constraint_count", wp.array[int]),
+            ("Y_group", wp.array3d[float]),
+            ("J_world", wp.array3d[float]),
+            ("Y_world", wp.array3d[float]),
+            ("diag_group", wp.array2d[float]),
+            ("mf_constraint_count", wp.array[int]),
+            ("skip_rows_le", int),
+        ),
+        snippet,
+        composed=True,
+        native_name="grouped_hinv_jt_native",
+    ).kernel()

@@ -12,6 +12,7 @@ import warp as wp
 from ...sim import BodyFlags
 from . import cached_force, field_group, kernels, response_operator, sparse_factor, tree_chain_scan
 from .field_group import Field
+from .kernel_template import Dispatch, KernelTemplate, python_kernel
 from .publication_data import PublicationData
 from .tree_kinetic_layout import REFERENCE_LAYOUT, TreeLayout
 
@@ -1490,8 +1491,7 @@ def get_state_kernel(
         name += "_listed"
     if banked:
         name += "_banked"
-    kinetic_state.__name__ = kinetic_state.__qualname__ = name
-    return wp.kernel(module="unique", enable_backward=False)(kinetic_state)
+    return python_kernel(kinetic_state, name)
 
 
 @functools.cache
@@ -1580,8 +1580,7 @@ def get_bank_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFERENCE_
         name += f"_l{layout.lanes}"
     if chain_scan:
         name += "_chain"
-    bank_pass.__name__ = bank_pass.__qualname__ = name
-    return wp.kernel(module="unique", enable_backward=False)(bank_pass)
+    return python_kernel(bank_pass, name)
 
 
 @functools.cache
@@ -1664,8 +1663,7 @@ def get_classify_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFERE
         name += f"_l{layout.lanes}"
     if chain_scan:
         name += "_chain"
-    classify.__name__ = classify.__qualname__ = name
-    return wp.kernel(module="unique", enable_backward=False)(classify)
+    return python_kernel(classify, name)
 
 
 @functools.cache
@@ -1715,10 +1713,10 @@ def get_predictor_kernel(
             + "\n    }"
         ),
         "REDUCE": reduction,
-        "TRANSPOSE_ACTION": inverse.transpose("col", "s[$WHITE+$index]"),
+        "TRANSPOSE_ACTION": inverse.transpose("col", lambda index: f"s[$WHITE+{index}]"),
         "RESPONSE_PHYSICAL": layout.physical("col"),
     }
-    forward = inverse.forward("row", f"s[$SIX_BODIES+{layout.physical('$index')}]")
+    forward = inverse.forward("row", lambda index: f"s[$SIX_BODIES+{layout.physical(index)}]")
     operations["FORWARD_STAGE"] = (
         """for(int row=lane;row<$DOFS;row+=stride) {
         """
@@ -1765,10 +1763,14 @@ def get_predictor_kernel(
                 )
                 continue
             held = response_operator.CholeskySolve(family, pointer)
+
+            def white(index, o=offset):
+                return f"s[$WHITE+{o}+{index}]"
+
             serial.append(
                 "if(lane==0){\n"
-                + held.forward(f"s[$SIX_BODIES+{offset}+$index]", f"s[$WHITE+{offset}+$index]")
-                + held.transpose(f"s[$WHITE+{offset}+$index]", f"s[$WHITE+{offset}+$index]")
+                + held.forward(lambda index, o=offset: f"s[$SIX_BODIES+{o}+{index}]", white)
+                + held.transpose(white, white)
                 + "\n}"
             )
             if family <= min(32, layout.lanes) and not reference:
@@ -1799,31 +1801,32 @@ def get_predictor_kernel(
     operations["TWIST_BLOCK"] = _TWIST_BLOCK if (layout.lanes <= 32 and not chain_scan) else ""
     source = layout.native(_PREDICT, **operations, **_native_clocks(clocked, "f", stages=5, column=8))
 
-    @wp.func_native(source)
-    def native(
-        group: int,
-        p: sparse_factor.SparsePlan,
-        d: data_type,
-        plan: plan_type,
-        cache: KineticData,
-        f: ForceInput,
-    ): ...
-
     _, _, _sub, _ = _thread_helpers(layout)
-    pack = layout.pack
-
-    def predict(p: sparse_factor.SparsePlan, d: data_type, plan: plan_type, cache: KineticData, f: ForceInput):
-        block, _ = wp.tid()
-        group = block * wp.static(pack) + _sub()
-        native(group, p, d, plan, cache, f)
-
-    predict.__name__ = predict.__qualname__ = f"tree_kinetic_predict{layout.dofs}"
+    name = f"tree_kinetic_predict{layout.dofs}"
     if layout.forest:
-        predict.__name__ = predict.__qualname__ = predict.__name__ + f"_forest{len(layout.roots)}"
+        name += f"_forest{len(layout.roots)}"
     if layout.pack > 1:
-        predict.__name__ = predict.__qualname__ = predict.__name__ + f"_l{layout.lanes}"
+        name += f"_l{layout.lanes}"
     if chain_scan:
-        predict.__name__ = predict.__qualname__ = predict.__name__ + "_chain"
+        name += "_chain"
     if response != "sparse":
-        predict.__name__ = predict.__qualname__ = predict.__name__ + "_" + response
-    return wp.kernel(module="unique", enable_backward=False)(predict)
+        name += "_" + response
+    return KernelTemplate(
+        name,
+        (
+            ("p", sparse_factor.SparsePlan),
+            ("d", data_type),
+            ("plan", plan_type),
+            ("cache", KineticData),
+            ("f", ForceInput),
+        ),
+        source,
+        # A packed group of trees per block: the block's group and this thread's tree in it.
+        Dispatch(
+            "block, _ = wp.tid()\ngroup = block * wp.static(pack) + _sub()\n$CALL",
+            ("group",),
+            (("group", int),),
+            constants=(("pack", layout.pack), ("_sub", _sub)),
+        ),
+        composed=True,
+    ).kernel()

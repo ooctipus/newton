@@ -28,6 +28,7 @@ from newton._src.solvers.feather_pgs.mf_gs_source import get_source
 from newton._src.solvers.feather_pgs.row_metadata import _DENSE_META_MAX_PARENT
 from newton.tests.feather_pgs_paired_fixture import pack_endpoints, solve_fixture
 from newton.tests.test_feather_pgs_masked_patch_rows import _three_size_model
+from newton.tests.test_feather_pgs_native_prelude import _native_snippets
 
 # A large streamed-metadata shape without drive or velocity-limit rows: 2304 dense and matrix-free rows
 # over 75 coordinates.
@@ -364,7 +365,7 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
         resident = factory(*shape, shared_metadata=False, resident_row_metadata=True, **options)
         self.assertEqual(streamed.key, "pgs_solve_mf_gs_2304_2304_75_current_drive0_densevlim0_gmeta_skipinc32")
         self.assertEqual(resident.key, "pgs_solve_mf_gs_2304_2304_75_current_drive0_densevlim0_gmeta_smeta_skipinc32")
-        self.assertEqual(resident.mf_native.native_snippet.count("__shared__ int   s_meta_dense[2304];"), 1)
+        self.assertEqual(max(_native_snippets(resident), key=len).count("__shared__ int   s_meta_dense[2304];"), 1)
         self.assertEqual(
             list(inspect.signature(resident.func).parameters), list(inspect.signature(streamed.func).parameters)
         )
@@ -428,8 +429,7 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                         shared_metadata=shared_metadata,
                         stream_mf_impulses=True,
                     )
-                    native = inspect.getclosurevars(kernel.func).nonlocals["pgs_solve_mf_gs_native"]
-                    source = native.native_snippet
+                    source = max(_native_snippets(kernel), key=len)
                     self.assertIn("_glambda", kernel.key)
                     self.assertNotIn("__shared__ float s_lam_mf", source)
                     self.assertNotIn("mf_impulses.data[off_mf + i] =", source)
@@ -458,7 +458,7 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
                     has_dense_velocity_limit_rows=False,
                     stream_mf_impulses=friction == "current",
                 )
-                snippet = kernel.mf_native.native_snippet
+                snippet = max(_native_snippets(kernel), key=len)
                 self.assertIn("READ(lane == 0 ? s_lam_dense[i] : 0.0f, 0)", snippet)
                 self.assertIn("if (lane == 0) s_lam_dense[i] = 0.0f;", snippet)
                 self.assertIn("if (lane == 0) s_lam_dense[i] = new_impulse;", snippet)
@@ -477,8 +477,7 @@ class TestFeatherPGSMFStorage(unittest.TestCase):
         """Keep contacts untouched and retain work for empty-segment fused clamps."""
         for fused in (False, True):
             kernel = fpgs._get_pgs_solve_mf_gs_kernel(16, 4096, 128, "cpu", fuse_vel_limits=fused)
-            native = inspect.getclosurevars(kernel.func).nonlocals["pgs_solve_mf_gs_native"]
-            source = native.native_snippet
+            source = max(_native_snippets(kernel), key=len)
             self.assertIn("int mf_load_lo = (row_phase == 5) ? mf_contact_end : 0;", source)
             self.assertEqual(source.count("for (int i = mf_load_lo + lane; i < m_mf; i += 32)"), 2)
             guard = "if (row_phase == 5 && dense_lo == dense_hi && mf_contact_end == m_mf) return;"

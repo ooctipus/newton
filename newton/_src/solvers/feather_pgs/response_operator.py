@@ -3,8 +3,9 @@
 
 """Author response actions independently of force production and publication.
 
-Vector operands are native expressions containing ``$index``. The caller binds
-physical/factor permutations and storage offsets there. A forward action maps
+Vector operands are functions from an index expression to the native expression
+of the element at that index. The caller binds physical/factor permutations and
+storage offsets in them. A forward action maps
 force into factor coordinates; its transpose maps back to physical response.
 Cholesky solves retain their dependency order; inverse factors retain products.
 
@@ -14,11 +15,15 @@ held-factor validity and output transactions. Operands are authored bindings,
 never extracted from another owner's source. No runtime method is selected here.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
+Vector = Callable[[str], str]
+"""A vector operand: the native expression of its element at an index expression."""
 
-def _at(vector: str, index: str) -> str:
-    return vector.replace("$index", f"({index})")
+
+def _at(vector: Vector, index: str) -> str:
+    return vector(f"({index})")
 
 
 def _accumulate(coefficient: str, operand: str) -> str:
@@ -37,7 +42,7 @@ class CholeskySolve:
     size: int | str
     lower: str
 
-    def forward(self, rhs: str, output: str) -> str:
+    def forward(self, rhs: Vector, output: Vector) -> str:
         """Solve L x = rhs in increasing row order."""
         return f"""for(int row=0;row<{self.size};++row){{
             float value={_at(rhs, "row")};
@@ -46,7 +51,7 @@ class CholeskySolve:
             {_at(output, "row")}=diagonal!=0.0f?value/diagonal:0.0f;
         }}"""
 
-    def transpose(self, rhs: str, output: str, *, post_row: str = "") -> str:
+    def transpose(self, rhs: Vector, output: Vector, *, post_row: str = "") -> str:
         """Solve L.T x = rhs in decreasing row order."""
         return f"""for(int row={self.size}-1;row>=0;--row){{
             float value={_at(rhs, "row")};
@@ -166,12 +171,12 @@ class SparseInverseFactor:
     factor: str
     support: IndexedSupport | CompressedSupport
 
-    def forward(self, row: str, rhs: str) -> str:
+    def forward(self, row: str, rhs: Vector) -> str:
         """Compute one sparse forward row, preserving the support's traversal order."""
         operation = _accumulate(f"({self.factor})[entry]", _at(rhs, "col"))
         return "float value=0.0f;" + self.support.row(row, operation)
 
-    def transpose(self, col: str, rhs: str) -> str:
+    def transpose(self, col: str, rhs: Vector) -> str:
         """Compute one sparse transpose column from completed forward coordinates."""
         operation = _accumulate(f"({self.factor})[entry]", _at(rhs, "row"))
         return "float value=0.0f;" + self.support.column(col, operation)

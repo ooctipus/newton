@@ -956,7 +956,7 @@ class TestSolveReadoutRoutes(unittest.TestCase):
         cover every world at every solve.
         """
         solver, summary, model = self._lockstep(_incremental_route())
-        self.assertTrue(solver._pgs_solve_mf_gs_incremental_kernels)
+        self.assertTrue(solver._mf_gs_tiers)
         self.assertTrue(solver.get_path_selection()["routes"]["resolved_worlds"]["enabled"])
         (skipped,) = summary["skipped"]
         self.assertEqual(skipped["pass"], "position")

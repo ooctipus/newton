@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import copy
+import dataclasses
 import math
 import os
 import sys
@@ -50,7 +51,7 @@ from ..solver import SolverBase
 from . import contact_compliance as _contact_compliance
 from . import environment_flags as _environment_flags
 from . import execution_plan as _execution_plan
-from . import host_index
+from . import host_index, kernel_template
 from . import row_metadata as _row_metadata
 from .body_mapping import build_body_maps
 from .conditioning import ArmatureFloor, conditioning_armature
@@ -83,6 +84,7 @@ from .friction_patches import (
 from .grouped_dynamics import (
     get_grouped_hinv_jt_kernel,
 )
+from .kernel_template import Dispatch, KernelTemplate, SweepTier, python_kernel
 from .kernels import (
     FRICTION_MODE_BISECTION,
     FRICTION_MODE_BISECTION_DESAXCE,
@@ -224,7 +226,6 @@ from .row_build import (
     populate_world_J_masked,
     populate_world_J_masked_patch,
 )
-from .row_inputs import make_row_kernel
 from .row_laws import ROW_LAW
 from .solve_policy import (
     EXACT_POLICY,
@@ -5060,7 +5061,8 @@ class SolverFeatherPGS(SolverBase):
         try:
             kernel = factory(*args, solve_policy=policy, **kwargs)
         except SolvePolicyUnsupported as error:
-            kernel = factory(*args, solve_policy=SolvePolicy(readout="sweeps" if policy.counts else "off"), **kwargs)
+            policy = SolvePolicy(readout="sweeps" if policy.counts else "off")
+            kernel = factory(*args, solve_policy=policy, **kwargs)
             self._solve_policy_declined[kernel.key] = f"{route}: {error}"
         else:
             if not policy.exact:
@@ -5068,6 +5070,7 @@ class SolverFeatherPGS(SolverBase):
         self._solve_readout.register(
             kernel,
             route,
+            readout=policy.readout if policy.counts else None,
             world_count=int(self.world_count),
             budget=max(int(self.pgs_iterations), 1),
             device=self.model.device,
@@ -6239,8 +6242,8 @@ class SolverFeatherPGS(SolverBase):
         self._mf_gs_block_count = int(
             self._local_general_solver_blocks if self._local_internal_fast_path else self.world_count
         )
-        self._pgs_solve_mf_gs_incremental_kernel = None
-        self._pgs_solve_mf_gs_incremental_kernels = []
+        # The tier sweeps ahead of the matrix-free sweep (SweepTier): parallel tiers or incremental tiers.
+        self._mf_gs_tiers = []
         self._ink_sizes = None
         self._ink_rows = 0
         # Row budget of the built incremental tiers (0 when none); recorded by get_path_selection().
@@ -6334,7 +6337,7 @@ class SolverFeatherPGS(SolverBase):
                 independent_components=self._paired_components is not None,
                 velocity_limit_law=self._velocity_limit_kernel_law(),
             )
-            self._pgs_solve_mf_gs_incremental_kernels = []
+            self._mf_gs_tiers = []
             self._ink_sizes = self._build_inkernel_response_meta() if (parallel_rows > 0 and _INK_ON) else None
             self._ink_rows = int(parallel_rows)
             self._incremental_rows = int(incremental_rows)
@@ -6363,27 +6366,25 @@ class SolverFeatherPGS(SolverBase):
                     self._tier_blocks = int(min(self.world_count, _TIER_BLOCKS))
                 tier_sweeps, self._par_sweeps_rule, self._par_sweeps_reason = self._parallel_tier_sweeps(tiers)
                 for tier_index, ((rows_, min_rows_), sweeps_) in enumerate(zip(tiers, tier_sweeps, strict=True)):
-                    self._pgs_solve_mf_gs_incremental_kernels.append(
-                        parallel_factory(
-                            self.dense_max_constraints,
-                            self.mf_max_constraints,
-                            self.max_world_dofs,
-                            device_arch,
-                            rows=rows_,
-                            sweeps=sweeps_,
-                            nesterov=self.mf_gs_parallel_nesterov,
-                            min_rows=min_rows_,
-                            tol=self.mf_gs_parallel_tol,
-                            matrix_free=self.mf_gs_parallel_matrix_free,
-                            skip_local_internal_worlds=self._local_internal_fast_path,
-                            inkernel_response=self._ink_sizes,
-                            has_drive_rows=has_drive_rows,
-                            exact_row_sums=_MF_EXACT_ROWSUM,
-                            linked_rows=self._friction_anchors_enabled,
-                            velocity_limit_pass=self._parallel_velocity_limit_pass(),
-                        )
+                    tier = parallel_factory(
+                        self.dense_max_constraints,
+                        self.mf_max_constraints,
+                        self.max_world_dofs,
+                        device_arch,
+                        rows=rows_,
+                        sweeps=sweeps_,
+                        nesterov=self.mf_gs_parallel_nesterov,
+                        min_rows=min_rows_,
+                        tol=self.mf_gs_parallel_tol,
+                        matrix_free=self.mf_gs_parallel_matrix_free,
+                        skip_local_internal_worlds=self._local_internal_fast_path,
+                        inkernel_response=self._ink_sizes,
+                        has_drive_rows=has_drive_rows,
+                        exact_row_sums=_MF_EXACT_ROWSUM,
+                        linked_rows=self._friction_anchors_enabled,
+                        velocity_limit_pass=self._parallel_velocity_limit_pass(),
                     )
-                    self._pgs_solve_mf_gs_incremental_kernels[-1]._fpgs_tier = tier_index
+                    self._mf_gs_tiers.append(dataclasses.replace(tier, tier=tier_index))
                 self._allocate_tier_placeholders()
             if incremental_rows > 0:
                 # Two tiers above 32 rows: the 32-row instance keeps its 4 KB response block and
@@ -6392,23 +6393,21 @@ class SolverFeatherPGS(SolverBase):
                 if incremental_rows > 32:
                     tiers.append((incremental_rows, 32))
                 for rows, min_rows in tiers:
-                    self._pgs_solve_mf_gs_incremental_kernels.append(
-                        self._sweep_kernel(
-                            "mf_gs_incremental",
-                            _get_pgs_solve_mf_gs_incremental_kernel,
-                            self.dense_max_constraints,
-                            self.mf_max_constraints,
-                            self.max_world_dofs,
-                            device_arch,
-                            incremental_rows=rows,
-                            has_drive_rows=has_drive_rows,
-                            has_dense_velocity_limit_rows=self.enable_joint_velocity_limits,
-                            skip_local_internal_worlds=self._local_internal_fast_path,
-                            min_rows=min_rows,
-                            velocity_limit_law=self._velocity_limit_kernel_law(),
-                        )
+                    kernel = self._sweep_kernel(
+                        "mf_gs_incremental",
+                        _get_pgs_solve_mf_gs_incremental_kernel,
+                        self.dense_max_constraints,
+                        self.mf_max_constraints,
+                        self.max_world_dofs,
+                        device_arch,
+                        incremental_rows=rows,
+                        has_drive_rows=has_drive_rows,
+                        has_dense_velocity_limit_rows=self.enable_joint_velocity_limits,
+                        skip_local_internal_worlds=self._local_internal_fast_path,
+                        min_rows=min_rows,
+                        velocity_limit_law=self._velocity_limit_kernel_law(),
                     )
-                self._pgs_solve_mf_gs_incremental_kernel = self._pgs_solve_mf_gs_incremental_kernels[0]
+                    self._mf_gs_tiers.append(SweepTier(kernel, velocity_limit_law=self._velocity_limit_kernel_law()))
             # No matrix-free sweep enters a world without rows; the readout counts those solves as skipped.
             self._solve_readout.register_skipped(
                 world_count=int(self.world_count),
@@ -6495,7 +6494,7 @@ class SolverFeatherPGS(SolverBase):
             and self._paired_factor_solve_kernel is not None
             and not self.pgs_debug
             and not self._mf_warmstart_enabled
-            and not getattr(self, "_pgs_solve_mf_gs_incremental_kernels", ())
+            and not getattr(self, "_mf_gs_tiers", ())
             and not _FPGS_SYNC_TIMINGS
         )
         self._paired_general_solve_stream = wp.Stream(model.device) if paired_overlap else None
@@ -7036,32 +7035,32 @@ class SolverFeatherPGS(SolverBase):
                         outputs=[self._tier_worlds, self._tier_counts],
                         device=self.model.device,
                     )
-                for gs_kernel in (*getattr(self, "_pgs_solve_mf_gs_incremental_kernels", ()), mf_gs_kernel):
-                    if gs_kernel is None:
-                        continue
+                sweeps = list(getattr(self, "_mf_gs_tiers", ()))
+                if mf_gs_kernel is not None:
+                    sweeps.append(SweepTier(mf_gs_kernel))
+                for sweep in sweeps:
                     inputs = mf_gs_inputs
                     dim = general_block_count
-                    tier = getattr(gs_kernel, "_fpgs_tier", None)
-                    if tier is not None and tier_lists:
+                    if sweep.tier is not None and tier_lists:
                         # This tier grid-strides over its own compacted world list.
                         inputs = [
-                            self._tier_count_views[tier],
-                            self._tier_world_views[tier],
+                            self._tier_count_views[sweep.tier],
+                            self._tier_world_views[sweep.tier],
                             self._tier_blocks,
                             1,
                             *mf_gs_inputs[4:],
                         ]
                         dim = self._tier_blocks
-                    if getattr(gs_kernel, "_fpgs_extra_inputs", False):
+                    if sweep.response_inputs:
                         inputs = inputs + self._inkernel_response_inputs()
-                        if getattr(gs_kernel, "_fpgs_kinetic_rows", False):
+                        if sweep.kinetic_rows:
                             inputs = [*inputs, *self._keyed_rows.parallel_arguments()]
                     wp.launch_tiled(
-                        gs_kernel,
+                        sweep.kernel,
                         dim=[dim],
                         inputs=inputs,
-                        outputs=[self.v_out, *self._solve_readout.operands(gs_kernel)],
-                        block_dim=getattr(gs_kernel, "_fpgs_block_dim", 32),
+                        outputs=[self.v_out, *self._solve_readout.operands(sweep.kernel)],
+                        block_dim=sweep.block_dim,
                         device=self.model.device,
                     )
             if factor_stream is not None:
@@ -12355,6 +12354,27 @@ class SolverFeatherPGS(SolverBase):
             pass
 
 
+_JOINT_LIMIT_WARP_PARAMS = kernel_template.params(
+    ("articulation_count", int),
+    ("articulation_dof_start", wp.array[int]),
+    ("art_to_world", wp.array[int]),
+    ("group_to_art", wp.array[int]),
+    ("limit_q_index", wp.array[int]),
+    ("joint_limit_lower", wp.array[float]),
+    ("joint_limit_upper", wp.array[float]),
+    ("joint_q", wp.array[float]),
+    ("activation_gap", float),
+    ("max_constraints", int),
+    ("pgs_beta", float),
+    ("pgs_cfm", float),
+    ("resolved_worlds", wp.array[int]),
+    ("world_slot_counter", wp.array[int]),
+    ("J_group", wp.array3d[float]),
+    ("rows", DenseRows),
+)
+"""The warp joint-limit row builder's operands."""
+
+
 @cache
 def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: int) -> "wp.Kernel":
     """Build a deterministic one-warp-per-articulation joint-limit row builder."""
@@ -12401,70 +12421,13 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
 #endif
 """
 
-    @wp.func_native(cuda_native(snippet, preludes=(lane_group(32), *ROW_LAW.preludes())))
-    def joint_limit_warp_native(
-        block: int,
-        articulation_count: int,
-        articulation_dof_start: wp.array[int],
-        art_to_world: wp.array[int],
-        group_to_art: wp.array[int],
-        limit_q_index: wp.array[int],
-        joint_limit_lower: wp.array[float],
-        joint_limit_upper: wp.array[float],
-        joint_q: wp.array[float],
-        activation_gap: float,
-        max_constraints: int,
-        pgs_beta: float,
-        pgs_cfm: float,
-        resolved_worlds: wp.array[int],
-        world_slot_counter: wp.array[int],
-        J_group: wp.array3d[float],
-        rows: DenseRows,
-    ): ...
-
-    def joint_limit_warp_template(
-        articulation_count: int,
-        articulation_dof_start: wp.array[int],
-        art_to_world: wp.array[int],
-        group_to_art: wp.array[int],
-        limit_q_index: wp.array[int],
-        joint_limit_lower: wp.array[float],
-        joint_limit_upper: wp.array[float],
-        joint_q: wp.array[float],
-        activation_gap: float,
-        max_constraints: int,
-        pgs_beta: float,
-        pgs_cfm: float,
-        resolved_worlds: wp.array[int],
-        world_slot_counter: wp.array[int],
-        J_group: wp.array3d[float],
-        rows: DenseRows,
-    ):
-        block, _lane = wp.tid()
-        joint_limit_warp_native(
-            block,
-            articulation_count,
-            articulation_dof_start,
-            art_to_world,
-            group_to_art,
-            limit_q_index,
-            joint_limit_lower,
-            joint_limit_upper,
-            joint_q,
-            activation_gap,
-            max_constraints,
-            pgs_beta,
-            pgs_cfm,
-            resolved_worlds,
-            world_slot_counter,
-            J_group,
-            rows,
-        )
-
-    name = f"build_joint_limit_rows_warp_{size}_{warps_per_block}"
-    joint_limit_warp_template.__name__ = name
-    joint_limit_warp_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(joint_limit_warp_template)
+    return KernelTemplate(
+        f"build_joint_limit_rows_warp_{size}_{warps_per_block}",
+        _JOINT_LIMIT_WARP_PARAMS,
+        snippet,
+        preludes=(lane_group(32), *ROW_LAW.preludes()),
+        native_name="joint_limit_warp_native",
+    ).kernel()
 
 
 @cache
@@ -12526,9 +12489,7 @@ def _get_direct_diagonal_inverse_mass_kernel(n_dofs: int, device_arch: str) -> "
         diagonal_inverse_mass[global_dof] = 1.0 / mass
 
     name = f"compute_direct_diagonal_inverse_mass_{N}"
-    compute_direct_diagonal_inverse_mass_template.__name__ = name
-    compute_direct_diagonal_inverse_mass_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(compute_direct_diagonal_inverse_mass_template)
+    return python_kernel(compute_direct_diagonal_inverse_mass_template, name)
 
 
 @cache
@@ -12659,15 +12620,9 @@ def _get_partitioned_inverse_dynamics_kernels(direct_dofs: int, device_arch: str
             tau,
         )
 
-    selected_name = f"selected_articulation_tau_excluding_direct_{N}"
-    selected_articulation_tau_template.__name__ = selected_name
-    selected_articulation_tau_template.__qualname__ = selected_name
-    direct_name = f"direct_branch_tau_{N}"
-    direct_branch_tau_template.__name__ = direct_name
-    direct_branch_tau_template.__qualname__ = direct_name
     return (
-        wp.kernel(enable_backward=False, module="unique")(selected_articulation_tau_template),
-        wp.kernel(enable_backward=False, module="unique")(direct_branch_tau_template),
+        python_kernel(selected_articulation_tau_template, f"selected_articulation_tau_excluding_direct_{N}"),
+        python_kernel(direct_branch_tau_template, f"direct_branch_tau_{N}"),
     )
 
 
@@ -12737,92 +12692,28 @@ def _get_composite_inertia_warp_kernel(
 """
     snippet = cuda_native(snippet, preludes=(lane_group(32),))
 
-    if compact_terms:
-
-        @wp.func_native(snippet)
-        def composite_inertia_warp_compact_native(
-            block: int,
-            composite_articulation_count: int,
-            composite_articulations: wp.array[int],
-            articulation_start: wp.array[int],
-            articulation_joint_end: wp.array[int],
-            joint_ancestor: wp.array[int],
-            joint_child: wp.array[int],
-            body_mass: wp.array[float],
-            body_inertia_terms: wp.array2d[float],
-            body_I_c: wp.array[wp.spatial_matrix],
-        ): ...
-
-        def composite_inertia_warp_compact_template(
-            composite_articulation_count: int,
-            composite_articulations: wp.array[int],
-            articulation_start: wp.array[int],
-            articulation_joint_end: wp.array[int],
-            joint_ancestor: wp.array[int],
-            joint_child: wp.array[int],
-            body_mass: wp.array[float],
-            body_inertia_terms: wp.array2d[float],
-            body_I_c: wp.array[wp.spatial_matrix],
-        ):
-            block, _lane = wp.tid()
-            composite_inertia_warp_compact_native(
-                block,
-                composite_articulation_count,
-                composite_articulations,
-                articulation_start,
-                articulation_joint_end,
-                joint_ancestor,
-                joint_child,
-                body_mass,
-                body_inertia_terms,
-                body_I_c,
-            )
-
-        name = f"compute_composite_inertia_warp{warps_per_block}_compact"
-        composite_inertia_warp_compact_template.__name__ = name
-        composite_inertia_warp_compact_template.__qualname__ = name
-        return wp.kernel(enable_backward=False, module="unique")(composite_inertia_warp_compact_template)
-
-    @wp.func_native(snippet)
-    def composite_inertia_warp_native(
-        block: int,
-        composite_articulation_count: int,
-        composite_articulations: wp.array[int],
-        articulation_start: wp.array[int],
-        articulation_joint_end: wp.array[int],
-        joint_ancestor: wp.array[int],
-        joint_child: wp.array[int],
-        body_I_s: wp.array[wp.spatial_matrix],
-        body_I_c: wp.array[wp.spatial_matrix],
-    ): ...
-
-    def composite_inertia_warp_template(
-        composite_articulation_count: int,
-        composite_articulations: wp.array[int],
-        articulation_start: wp.array[int],
-        articulation_joint_end: wp.array[int],
-        joint_ancestor: wp.array[int],
-        joint_child: wp.array[int],
-        body_I_s: wp.array[wp.spatial_matrix],
-        body_I_c: wp.array[wp.spatial_matrix],
-    ):
-        block, _lane = wp.tid()
-        composite_inertia_warp_native(
-            block,
-            composite_articulation_count,
-            composite_articulations,
-            articulation_start,
-            articulation_joint_end,
-            joint_ancestor,
-            joint_child,
-            body_I_s,
-            body_I_c,
-        )
-
-    name = f"compute_composite_inertia_warp{warps_per_block}"
-    composite_inertia_warp_template.__name__ = name
-    composite_inertia_warp_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(composite_inertia_warp_template)
+    # The compact variant reads the bodies' compact inertia terms in place of their spatial inertia.
+    inertia = (
+        (("body_mass", wp.array[float]), ("body_inertia_terms", wp.array2d[float]))
+        if compact_terms
+        else (("body_I_s", wp.array[wp.spatial_matrix]),)
+    )
+    return KernelTemplate(
+        f"compute_composite_inertia_warp{warps_per_block}" + ("_compact" if compact_terms else ""),
+        kernel_template.params(
+            ("composite_articulation_count", int),
+            ("composite_articulations", wp.array[int]),
+            ("articulation_start", wp.array[int]),
+            ("articulation_joint_end", wp.array[int]),
+            ("joint_ancestor", wp.array[int]),
+            ("joint_child", wp.array[int]),
+            *inertia,
+            ("body_I_c", wp.array[wp.spatial_matrix]),
+        ),
+        snippet,
+        composed=True,
+        native_name="composite_inertia_warp_compact_native" if compact_terms else "composite_inertia_warp_native",
+    ).kernel()
 
 
 @cache
@@ -12893,9 +12784,9 @@ def _get_hinv_jt_plain_kernel(
 
     suffix = "_world" if write_world else ""
     suffix += "_nogroup" if not write_group else ""
-    hinv_jt_tiled_template.__name__ = f"hinv_jt_tiled_{n_dofs}_{max_constraints}_c{chunk_size}_bd{tile_threads}{suffix}"
-    hinv_jt_tiled_template.__qualname__ = hinv_jt_tiled_template.__name__
-    return wp.kernel(enable_backward=False, module="unique")(hinv_jt_tiled_template)
+    return python_kernel(
+        hinv_jt_tiled_template, f"hinv_jt_tiled_{n_dofs}_{max_constraints}_c{chunk_size}_bd{tile_threads}{suffix}"
+    )
 
 
 @cache
@@ -12985,9 +12876,9 @@ def _get_hinv_jt_kernel(
     suffix = "_world" if write_world else ""
     suffix += "_nogroup" if not write_group else ""
     suffix += "_diag" if compute_diag else ""
-    hinv_jt_tiled_template.__name__ = f"hinv_jt_tiled_{n_dofs}_{max_constraints}_c{chunk_size}_bd{tile_threads}{suffix}"
-    hinv_jt_tiled_template.__qualname__ = hinv_jt_tiled_template.__name__
-    return wp.kernel(enable_backward=False, module="unique")(hinv_jt_tiled_template)
+    return python_kernel(
+        hinv_jt_tiled_template, f"hinv_jt_tiled_{n_dofs}_{max_constraints}_c{chunk_size}_bd{tile_threads}{suffix}"
+    )
 
 
 @cache
@@ -13065,9 +12956,9 @@ def _get_hinv_jt_fused_kernel(
                             if row < n_constraints:
                                 world_diag[world, row] = C_ji[r, r] + row_cfm[world, row]
 
-    hinv_jt_tiled_fused_template.__name__ = f"hinv_jt_tiled_fused_{n_dofs}_{max_constraints}_bd{tile_threads}"
-    hinv_jt_tiled_fused_template.__qualname__ = f"hinv_jt_tiled_fused_{n_dofs}_{max_constraints}_bd{tile_threads}"
-    return wp.kernel(enable_backward=False, module="unique")(hinv_jt_tiled_fused_template)
+    return python_kernel(
+        hinv_jt_tiled_fused_template, f"hinv_jt_tiled_fused_{n_dofs}_{max_constraints}_bd{tile_threads}"
+    )
 
 
 _DELASSUS_THREADS = 128
@@ -13132,37 +13023,28 @@ for (int ci = 0; ci < num_chunks; ci++) {{
 #endif
 """
 
-    @wp.func_native(cuda_native(snippet, preludes=(lane_group(_DELASSUS_THREADS),)))
-    def delassus_native(
-        idx: int,
-        J_group: wp.array3d[float],
-        Y_group: wp.array3d[float],
-        group_to_art: wp.array[int],
-        art_to_world: wp.array[int],
-        world_constraint_count: wp.array[int],
-        world_C: wp.array3d[float],
-        world_diag: wp.array2d[float],
-    ): ...
-
-    def delassus_template(
-        J_group: wp.array3d[float],
-        Y_group: wp.array3d[float],
-        group_to_art: wp.array[int],
-        art_to_world: wp.array[int],
-        world_constraint_count: wp.array[int],
-        n_arts: int,
-        world_C: wp.array3d[float],
-        world_diag: wp.array2d[float],
-    ):
-        idx, _lane = wp.tid()
-        if idx < n_arts:
-            delassus_native(
-                idx, J_group, Y_group, group_to_art, art_to_world, world_constraint_count, world_C, world_diag
-            )
-
-    delassus_template.__name__ = f"delassus_streaming_{n_dofs}_{max_constraints}_chunk{CHUNK}"
-    delassus_template.__qualname__ = f"delassus_streaming_{n_dofs}_{max_constraints}_chunk{CHUNK}"
-    return wp.kernel(enable_backward=False, module="unique")(delassus_template)
+    return KernelTemplate(
+        f"delassus_streaming_{n_dofs}_{max_constraints}_chunk{CHUNK}",
+        kernel_template.params(
+            ("J_group", wp.array3d[float]),
+            ("Y_group", wp.array3d[float]),
+            ("group_to_art", wp.array[int]),
+            ("art_to_world", wp.array[int]),
+            ("world_constraint_count", wp.array[int]),
+            ("n_arts", int),
+            ("world_C", wp.array3d[float]),
+            ("world_diag", wp.array2d[float]),
+        ),
+        snippet,
+        dispatch=Dispatch(
+            "idx, _lane = wp.tid()\nif idx < n_arts:\n    $CALL",
+            ("idx",),
+            (("idx", int),),
+            private=("n_arts",),
+        ),
+        preludes=(lane_group(_DELASSUS_THREADS),),
+        native_name="delassus_native",
+    ).kernel()
 
 
 @cache
@@ -13246,9 +13128,7 @@ def _get_crba_cholesky_kernel(n_dofs: int, device_arch: str, tile_threads: int =
         wp.tile_store(L_group[group], L_tile, bounds_check=False)
 
     name = f"crba_cholesky_{int(n_dofs)}_bd{int(tile_threads)}"
-    crba_cholesky_template.__name__ = name
-    crba_cholesky_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(crba_cholesky_template)
+    return python_kernel(crba_cholesky_template, name)
 
 
 @cache
@@ -13287,9 +13167,7 @@ def _get_cholesky_kernel(n_dofs: int, device_arch: str, tile_threads: int = 64) 
         # Store result
         wp.tile_store(L_group[idx], L_tile)
 
-    cholesky_tiled_template.__name__ = f"cholesky_tiled_{n_dofs}_bd{tile_threads}"
-    cholesky_tiled_template.__qualname__ = f"cholesky_tiled_{n_dofs}_bd{tile_threads}"
-    return wp.kernel(enable_backward=False, module="unique")(cholesky_tiled_template)
+    return python_kernel(cholesky_tiled_template, f"cholesky_tiled_{n_dofs}_bd{tile_threads}")
 
 
 @cache
@@ -13320,9 +13198,7 @@ def _get_cholesky_inverse_tiled_kernel(n_dofs: int, device_arch: str, tile_threa
         wp.tile_store(Hinv_group[group], Hinv_tile, bounds_check=False)
 
     name = f"cholesky_inverse_tiled_{int(n_dofs)}_bd{int(tile_threads)}"
-    cholesky_inverse_tiled_template.__name__ = name
-    cholesky_inverse_tiled_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(cholesky_inverse_tiled_template)
+    return python_kernel(cholesky_inverse_tiled_template, name)
 
 
 @cache
@@ -13369,27 +13245,20 @@ def _get_inverse_cholesky_register_kernel(n_dofs: int, device_arch: str, *, lowe
 #endif
 """
 
-    @wp.func_native(snippet)
-    def inverse_cholesky_register_native(
-        tid: int,
-        L_group: wp.array3d[float],
-        group_to_art: wp.array[int],
-        mass_update_mask: wp.array[int],
-        Hinv_group: wp.array3d[float],
-    ): ...
-
-    def inverse_cholesky_register_template(
-        L_group: wp.array3d[float],
-        group_to_art: wp.array[int],
-        mass_update_mask: wp.array[int],
-        Hinv_group: wp.array3d[float],
-    ):
-        inverse_cholesky_register_native(wp.tid(), L_group, group_to_art, mass_update_mask, Hinv_group)
-
     name = f"inverse_{'lower' if lower_only else 'cholesky'}_register_{n_dofs}"
-    inverse_cholesky_register_template.__name__ = name
-    inverse_cholesky_register_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(inverse_cholesky_register_template)
+    return KernelTemplate(
+        name,
+        kernel_template.params(
+            ("L_group", wp.array3d[float]),
+            ("group_to_art", wp.array[int]),
+            ("mass_update_mask", wp.array[int]),
+            ("Hinv_group", wp.array3d[float]),
+        ),
+        snippet,
+        dispatch=kernel_template.THREADS,
+        composed=True,
+        native_name="inverse_cholesky_register_native",
+    ).kernel()
 
 
 @cache
@@ -13596,80 +13465,72 @@ def _get_paired_hinv_jt_kernel(
 #endif
 """
 
-    @wp.func_native(cuda_native(snippet, preludes=(lane_group(32 * warps_per_block),)))
-    def paired_hinv_jt_native(
-        primary_group: int,
-        primary_Hinv: wp.array3d[float],
-        primary_Linv: wp.array3d[float],
-        primary_J: wp.array3d[float],
-        primary_group_to_art: wp.array[int],
-        secondary_Hinv: wp.array3d[float],
-        secondary_Linv: wp.array3d[float],
-        secondary_J: wp.array3d[float],
-        secondary_group_to_art: wp.array[int],
-        secondary_group_by_primary: wp.array[int],
-        art_to_world: wp.array[int],
-        articulation_world_dof_offset: wp.array[int],
-        world_constraint_count: wp.array[int],
-        world_mf_constraint_count: wp.array[int],
-        world_row_cfm: wp.array2d[float],
-        J_world: wp.array3d[float],
-        Y_world: wp.array3d[float],
-        world_diag: wp.array2d[float],
-    ): ...
-
-    def paired_hinv_jt_template(
-        primary_Hinv: wp.array3d[float],
-        primary_Linv: wp.array3d[float],
-        primary_J: wp.array3d[float],
-        primary_group_to_art: wp.array[int],
-        secondary_Hinv: wp.array3d[float],
-        secondary_Linv: wp.array3d[float],
-        secondary_J: wp.array3d[float],
-        secondary_group_to_art: wp.array[int],
-        secondary_group_by_primary: wp.array[int],
-        art_to_world: wp.array[int],
-        articulation_world_dof_offset: wp.array[int],
-        world_constraint_count: wp.array[int],
-        world_mf_constraint_count: wp.array[int],
-        world_row_cfm: wp.array2d[float],
-        J_world: wp.array3d[float],
-        Y_world: wp.array3d[float],
-        world_diag: wp.array2d[float],
-    ):
-        primary_group, lane = wp.tid()
-        if wp.static(cpu):
-            if lane != 0:
-                return
-        paired_hinv_jt_native(
-            primary_group,
-            primary_Hinv,
-            primary_Linv,
-            primary_J,
-            primary_group_to_art,
-            secondary_Hinv,
-            secondary_Linv,
-            secondary_J,
-            secondary_group_to_art,
-            secondary_group_by_primary,
-            art_to_world,
-            articulation_world_dof_offset,
-            world_constraint_count,
-            world_mf_constraint_count,
-            world_row_cfm,
-            J_world,
-            Y_world,
-            world_diag,
-        )
-
     block_dim = 32 * warps_per_block
     name = f"paired_hinv_jt_{primary_dofs}_{secondary_dofs}_{max_constraints}"
     name += f"_bd{block_dim}"
     if factor_coordinates:
         name += "_factor"
-    paired_hinv_jt_template.__name__ = name
-    paired_hinv_jt_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(paired_hinv_jt_template)
+    return KernelTemplate(
+        name,
+        kernel_template.params(
+            ("primary_Hinv", wp.array3d[float]),
+            ("primary_Linv", wp.array3d[float]),
+            ("primary_J", wp.array3d[float]),
+            ("primary_group_to_art", wp.array[int]),
+            ("secondary_Hinv", wp.array3d[float]),
+            ("secondary_Linv", wp.array3d[float]),
+            ("secondary_J", wp.array3d[float]),
+            ("secondary_group_to_art", wp.array[int]),
+            ("secondary_group_by_primary", wp.array[int]),
+            ("art_to_world", wp.array[int]),
+            ("articulation_world_dof_offset", wp.array[int]),
+            ("world_constraint_count", wp.array[int]),
+            ("world_mf_constraint_count", wp.array[int]),
+            ("world_row_cfm", wp.array2d[float]),
+            ("J_world", wp.array3d[float]),
+            ("Y_world", wp.array3d[float]),
+            ("world_diag", wp.array2d[float]),
+        ),
+        snippet,
+        dispatch=Dispatch(
+            "primary_group, lane = wp.tid()\nif wp.static(cpu):\n    if lane != 0:\n        return\n$CALL",
+            ("primary_group",),
+            (("primary_group", int),),
+            constants=(("cpu", cpu),),
+        ),
+        preludes=(lane_group(32 * warps_per_block),),
+        native_name="paired_hinv_jt_native",
+    ).kernel()
+
+
+_PAIRED_FACTOR_ABI = kernel_template.params(
+    ("world", int),
+    ("world_constraint_count", wp.array[int]),
+    ("dense_phase_bounds", wp.array2d[int]),
+    ("world_dof_indices", wp.array2d[int]),
+    ("rhs_bias", wp.array2d[float]),
+    ("world_diag", wp.array2d[float]),
+    ("world_impulses", wp.array2d[float]),
+    ("factor_rows", wp.array3d[float]),
+    ("world_row_type", wp.array2d[int]),
+    ("world_row_parent", wp.array2d[int]),
+    ("world_row_mu", wp.array2d[float]),
+    ("world_mf_constraint_count", wp.array[int]),
+    ("primary_L", wp.array3d[float]),
+    ("primary_Linv", wp.array3d[float]),
+    ("secondary_L", wp.array3d[float]),
+    ("secondary_Linv", wp.array3d[float]),
+    ("primary_group_by_world", wp.array[int]),
+    ("secondary_group_by_world", wp.array[int]),
+    ("primary_offset_by_world", wp.array[int]),
+    ("secondary_offset_by_world", wp.array[int]),
+    ("iterations", int),
+    ("omega", float),
+    ("friction_start_iteration", int),
+    ("iteration_offset", int),
+    ("v_out", wp.array[float]),
+)
+"""The native ABI of the paired factor sweep (one world per call)."""
 
 
 @cache
@@ -13719,93 +13580,6 @@ def _get_pgs_solve_paired_factor_kernel(
         solve_policy=solve_policy,
     )
 
-    @wp.func_native(snippet)
-    def pgs_solve_paired_factor_native(
-        world: int,
-        world_constraint_count: wp.array[int],
-        dense_phase_bounds: wp.array2d[int],
-        world_dof_indices: wp.array2d[int],
-        rhs_bias: wp.array2d[float],
-        world_diag: wp.array2d[float],
-        world_impulses: wp.array2d[float],
-        factor_rows: wp.array3d[float],
-        world_row_type: wp.array2d[int],
-        world_row_parent: wp.array2d[int],
-        world_row_mu: wp.array2d[float],
-        world_mf_constraint_count: wp.array[int],
-        primary_L: wp.array3d[float],
-        primary_Linv: wp.array3d[float],
-        secondary_L: wp.array3d[float],
-        secondary_Linv: wp.array3d[float],
-        primary_group_by_world: wp.array[int],
-        secondary_group_by_world: wp.array[int],
-        primary_offset_by_world: wp.array[int],
-        secondary_offset_by_world: wp.array[int],
-        iterations: int,
-        omega: float,
-        friction_start_iteration: int,
-        iteration_offset: int,
-        v_out: wp.array[float],
-    ): ...
-
-    def pgs_solve_paired_factor_template(
-        world_count: int,
-        world_constraint_count: wp.array[int],
-        dense_phase_bounds: wp.array2d[int],
-        world_dof_indices: wp.array2d[int],
-        rhs_bias: wp.array2d[float],
-        world_diag: wp.array2d[float],
-        world_impulses: wp.array2d[float],
-        factor_rows: wp.array3d[float],
-        world_row_type: wp.array2d[int],
-        world_row_parent: wp.array2d[int],
-        world_row_mu: wp.array2d[float],
-        world_mf_constraint_count: wp.array[int],
-        primary_L: wp.array3d[float],
-        primary_Linv: wp.array3d[float],
-        secondary_L: wp.array3d[float],
-        secondary_Linv: wp.array3d[float],
-        primary_group_by_world: wp.array[int],
-        secondary_group_by_world: wp.array[int],
-        primary_offset_by_world: wp.array[int],
-        secondary_offset_by_world: wp.array[int],
-        iterations: int,
-        omega: float,
-        friction_start_iteration: int,
-        iteration_offset: int,
-        v_out: wp.array[float],
-    ):
-        block, lane = wp.tid()
-        world = block * W + lane // 32
-        if world < world_count:
-            pgs_solve_paired_factor_native(
-                world,
-                world_constraint_count,
-                dense_phase_bounds,
-                world_dof_indices,
-                rhs_bias,
-                world_diag,
-                world_impulses,
-                factor_rows,
-                world_row_type,
-                world_row_parent,
-                world_row_mu,
-                world_mf_constraint_count,
-                primary_L,
-                primary_Linv,
-                secondary_L,
-                secondary_Linv,
-                primary_group_by_world,
-                secondary_group_by_world,
-                primary_offset_by_world,
-                secondary_offset_by_world,
-                iterations,
-                omega,
-                friction_start_iteration,
-                iteration_offset,
-                v_out,
-            )
-
     name = f"pgs_solve_paired_factor_{M}_{D}_{P}_{S}_w{W}"
     if contact_triples:
         name += "_contact3"
@@ -13813,22 +13587,14 @@ def _get_pgs_solve_paired_factor_kernel(
         name += "_units"
     if independent_components:
         name += "_components"
-    if solve_policy.counts:
-        name += solve_policy.suffix
-        kernel = make_row_kernel(
-            name,
-            snippet,
-            pgs_solve_paired_factor_native.func,
-            solve_policy.arguments,
-            dispatch="tiles",
-            groups=W,
-            lanes=32,
-        )
-        kernel._fpgs_solve_readout = solve_policy.readout
-        return kernel
-    pgs_solve_paired_factor_template.__name__ = name + solve_policy.suffix
-    pgs_solve_paired_factor_template.__qualname__ = name + solve_policy.suffix
-    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_paired_factor_template)
+    return KernelTemplate.from_abi(
+        name + solve_policy.suffix,
+        _PAIRED_FACTOR_ABI,
+        snippet,
+        kernel_template.tiles(W, 32),
+        extra=solve_policy.arguments,
+        composed=True,
+    ).kernel()
 
 
 @cache
@@ -13857,9 +13623,7 @@ def _get_triangular_solve_kernel(n_dofs: int, device_arch: str, tile_threads: in
 
         wp.tile_store(qdd_group[idx], qdd_tile)
 
-    trisolve_tiled_template.__name__ = f"trisolve_tiled_{n_dofs}_bd{tile_threads}"
-    trisolve_tiled_template.__qualname__ = f"trisolve_tiled_{n_dofs}_bd{tile_threads}"
-    return wp.kernel(enable_backward=False, module="unique")(trisolve_tiled_template)
+    return python_kernel(trisolve_tiled_template, f"trisolve_tiled_{n_dofs}_bd{tile_threads}")
 
 
 _TILED_ROW_THREADS = 32
@@ -14193,66 +13957,32 @@ def _get_pgs_solve_tiled_row_kernel(
 
     snippet = cuda_native(snippet, preludes=(lane_group(32), RING, *PROJECTION_LAW.preludes()))
 
-    @wp.func_native(snippet)
-    def pgs_solve_native(
-        world: int,
-        world_constraint_count: wp.array[int],
-        world_diag: wp.array2d[float],
-        world_C: wp.array3d[float],
-        world_rhs: wp.array2d[float],
-        world_impulses: wp.array2d[float],
-        iterations: int,
-        omega: float,
-        world_row_type: wp.array2d[int],
-        world_row_parent: wp.array2d[int],
-        world_row_mu: wp.array2d[float],
-        world_row_w: wp.array2d[float],
-        regularize: int,
-        friction_start_iteration: int,
-        iteration_offset: int,
-    ): ...
-
-    def pgs_solve_tiled_template(
-        world_constraint_count: wp.array[int],
-        world_diag: wp.array2d[float],
-        world_C: wp.array3d[float],
-        world_rhs: wp.array2d[float],
-        world_impulses: wp.array2d[float],
-        iterations: int,
-        omega: float,
-        world_row_type: wp.array2d[int],
-        world_row_parent: wp.array2d[int],
-        world_row_mu: wp.array2d[float],
-        world_row_w: wp.array2d[float],
-        regularize: int,
-        friction_start_iteration: int,
-        iteration_offset: int,
-    ):
-        world, _lane = wp.tid()
-        pgs_solve_native(
-            world,
-            world_constraint_count,
-            world_diag,
-            world_C,
-            world_rhs,
-            world_impulses,
-            iterations,
-            omega,
-            world_row_type,
-            world_row_parent,
-            world_row_mu,
-            world_row_w,
-            regularize,
-            friction_start_iteration,
-            iteration_offset,
-        )
-
     suffix = "" if row_budget is None else f"_b{row_budget}_m{min_rows}"
     if global_rows:
         suffix += "_global"
-    pgs_solve_tiled_template.__name__ = f"pgs_solve_tiled_row_{max_constraints}{suffix}"
-    pgs_solve_tiled_template.__qualname__ = pgs_solve_tiled_template.__name__
-    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_tiled_template)
+    return KernelTemplate(
+        f"pgs_solve_tiled_row_{max_constraints}{suffix}",
+        kernel_template.params(
+            ("world_constraint_count", wp.array[int]),
+            ("world_diag", wp.array2d[float]),
+            ("world_C", wp.array3d[float]),
+            ("world_rhs", wp.array2d[float]),
+            ("world_impulses", wp.array2d[float]),
+            ("iterations", int),
+            ("omega", float),
+            ("world_row_type", wp.array2d[int]),
+            ("world_row_parent", wp.array2d[int]),
+            ("world_row_mu", wp.array2d[float]),
+            ("world_row_w", wp.array2d[float]),
+            ("regularize", int),
+            ("friction_start_iteration", int),
+            ("iteration_offset", int),
+        ),
+        snippet,
+        dispatch=kernel_template.WORLDS,
+        composed=True,
+        native_name="pgs_solve_native",
+    ).kernel()
 
 
 @cache
@@ -14516,90 +14246,40 @@ def _get_pgs_solve_mf_kernel(
 
     snippet = cuda_native(snippet, preludes=(lane_group(32), RING, *PROJECTION_LAW.preludes()))
 
-    @wp.func_native(snippet)
-    def pgs_solve_mf_native(
-        world: int,
-        mf_constraint_count: wp.array[int],
-        mf_body_count: wp.array[int],
-        mf_body_dof_start: wp.array2d[int],
-        mf_local_body_a: wp.array2d[int],
-        mf_local_body_b: wp.array2d[int],
-        mf_J_a: wp.array3d[float],
-        mf_J_b: wp.array3d[float],
-        mf_MiJt_a: wp.array3d[float],
-        mf_MiJt_b: wp.array3d[float],
-        mf_eff_mass_inv: wp.array2d[float],
-        mf_rhs: wp.array2d[float],
-        mf_row_type: wp.array2d[int],
-        mf_row_parent: wp.array2d[int],
-        mf_row_mu: wp.array2d[float],
-        mf_row_w: wp.array2d[float],
-        mf_impulses: wp.array2d[float],
-        v_out: wp.array[float],
-        iterations: int,
-        omega: float,
-        regularize: int,
-        friction_start_iteration: int,
-        iteration_offset: int,
-    ): ...
-
-    def pgs_solve_mf_template(
-        mf_constraint_count: wp.array[int],
-        mf_body_count: wp.array[int],
-        mf_body_dof_start: wp.array2d[int],
-        mf_local_body_a: wp.array2d[int],
-        mf_local_body_b: wp.array2d[int],
-        mf_J_a: wp.array3d[float],
-        mf_J_b: wp.array3d[float],
-        mf_MiJt_a: wp.array3d[float],
-        mf_MiJt_b: wp.array3d[float],
-        mf_eff_mass_inv: wp.array2d[float],
-        mf_rhs: wp.array2d[float],
-        mf_row_type: wp.array2d[int],
-        mf_row_parent: wp.array2d[int],
-        mf_row_mu: wp.array2d[float],
-        mf_row_w: wp.array2d[float],
-        mf_impulses: wp.array2d[float],
-        v_out: wp.array[float],
-        iterations: int,
-        omega: float,
-        regularize: int,
-        friction_start_iteration: int,
-        iteration_offset: int,
-    ):
-        world, _lane = wp.tid()
-        pgs_solve_mf_native(
-            world,
-            mf_constraint_count,
-            mf_body_count,
-            mf_body_dof_start,
-            mf_local_body_a,
-            mf_local_body_b,
-            mf_J_a,
-            mf_J_b,
-            mf_MiJt_a,
-            mf_MiJt_b,
-            mf_eff_mass_inv,
-            mf_rhs,
-            mf_row_type,
-            mf_row_parent,
-            mf_row_mu,
-            mf_row_w,
-            mf_impulses,
-            v_out,
-            iterations,
-            omega,
-            regularize,
-            friction_start_iteration,
-            iteration_offset,
-        )
-
     name = f"pgs_solve_mf_{mf_max_constraints}_{max_mf_bodies}"
     if has_velocity_limit_rows:
         name += "_vlim"
-    pgs_solve_mf_template.__name__ = name
-    pgs_solve_mf_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_template)
+    return KernelTemplate(
+        name,
+        kernel_template.params(
+            ("mf_constraint_count", wp.array[int]),
+            ("mf_body_count", wp.array[int]),
+            ("mf_body_dof_start", wp.array2d[int]),
+            ("mf_local_body_a", wp.array2d[int]),
+            ("mf_local_body_b", wp.array2d[int]),
+            ("mf_J_a", wp.array3d[float]),
+            ("mf_J_b", wp.array3d[float]),
+            ("mf_MiJt_a", wp.array3d[float]),
+            ("mf_MiJt_b", wp.array3d[float]),
+            ("mf_eff_mass_inv", wp.array2d[float]),
+            ("mf_rhs", wp.array2d[float]),
+            ("mf_row_type", wp.array2d[int]),
+            ("mf_row_parent", wp.array2d[int]),
+            ("mf_row_mu", wp.array2d[float]),
+            ("mf_row_w", wp.array2d[float]),
+            ("mf_impulses", wp.array2d[float]),
+            ("v_out", wp.array[float]),
+            ("iterations", int),
+            ("omega", float),
+            ("regularize", int),
+            ("friction_start_iteration", int),
+            ("iteration_offset", int),
+        ),
+        snippet,
+        dispatch=kernel_template.WORLDS,
+        composed=True,
+        native_name="pgs_solve_mf_native",
+    ).kernel()
 
 
 @cache
@@ -14635,46 +14315,24 @@ def _get_pack_mf_meta_kernel(mf_max_constraints: int, device_arch: str) -> "wp.K
 """
     snippet = cuda_native(snippet, preludes=(lane_group(32),))
 
-    @wp.func_native(snippet)
-    def pack_mf_meta_native(
-        world: int,
-        mf_constraint_count: wp.array[int],
-        mf_dof_a: wp.array2d[int],
-        mf_dof_b: wp.array2d[int],
-        mf_eff_mass_inv: wp.array2d[float],
-        mf_rhs: wp.array2d[float],
-        mf_row_type: wp.array2d[int],
-        mf_row_parent: wp.array2d[int],
-        mf_meta: wp.array2d[int],
-    ): ...
-
-    def pack_mf_meta_template(
-        mf_constraint_count: wp.array[int],
-        mf_dof_a: wp.array2d[int],
-        mf_dof_b: wp.array2d[int],
-        mf_eff_mass_inv: wp.array2d[float],
-        mf_rhs: wp.array2d[float],
-        mf_row_type: wp.array2d[int],
-        mf_row_parent: wp.array2d[int],
-        mf_meta: wp.array2d[int],
-    ):
-        world, _lane = wp.tid()
-        pack_mf_meta_native(
-            world,
-            mf_constraint_count,
-            mf_dof_a,
-            mf_dof_b,
-            mf_eff_mass_inv,
-            mf_rhs,
-            mf_row_type,
-            mf_row_parent,
-            mf_meta,
-        )
-
     name = f"pack_mf_meta_{mf_max_constraints}"
-    pack_mf_meta_template.__name__ = name
-    pack_mf_meta_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(pack_mf_meta_template)
+    return KernelTemplate(
+        name,
+        kernel_template.params(
+            ("mf_constraint_count", wp.array[int]),
+            ("mf_dof_a", wp.array2d[int]),
+            ("mf_dof_b", wp.array2d[int]),
+            ("mf_eff_mass_inv", wp.array2d[float]),
+            ("mf_rhs", wp.array2d[float]),
+            ("mf_row_type", wp.array2d[int]),
+            ("mf_row_parent", wp.array2d[int]),
+            ("mf_meta", wp.array2d[int]),
+        ),
+        snippet,
+        dispatch=kernel_template.WORLDS,
+        composed=True,
+        native_name="pack_mf_meta_native",
+    ).kernel()
 
 
 @cache
@@ -15422,12 +15080,12 @@ def _get_pgs_solve_local_owned_kernel(
         else ""
     )
     factor_diagonal_solve = (
-        """            const float inverse_factor_diagonal = s_L[i * {dofs} + i];
+        f"""            const float inverse_factor_diagonal = s_L[i * {dofs} + i];
             response[i] = value * inverse_factor_diagonal;"""
         if contact_capable
-        else """            const float factor_diagonal = s_L[i * {dofs} + i];
+        else f"""            const float factor_diagonal = s_L[i * {dofs} + i];
             response[i] = factor_diagonal != 0.0f ? value / factor_diagonal : 0.0f;"""
-    ).format(dofs=dofs)
+    )
     snippet = f"""{group_setup}
     const int art = candidate_articulations.data[candidate];
     const int group = articulation_group_index.data[art];
@@ -15580,7 +15238,8 @@ def _get_pgs_solve_local_owned_kernel(
         v_out: wp.array[float],
     ): ...
 
-    name = f"pgs_solve_local_internal_{max_rows}_{local_rows}_{dofs}_{paired_dofs}"
+    family = "pgs_solve_local_internal" if row_inputs is None else "pgs_solve_local_packet"
+    name = f"{family}_{max_rows}_{local_rows}_{dofs}_{paired_dofs}"
     if warps_per_block != 1:
         name += f"_w{warps_per_block}"
     if lanes_per_world != 32:
@@ -15591,23 +15250,18 @@ def _get_pgs_solve_local_owned_kernel(
         name += f"_mf{local_mf_rows}"
     if dense_response_matrix:
         name += "_denseamat"
-    if row_inputs is not None:
-        name = name.replace("pgs_solve_local_internal_", "pgs_solve_local_packet_", 1)
     if persistent_queue:
         name += "_queue"
     arguments = () if row_inputs is None else row_inputs.arguments
-    kernel = make_row_kernel(
+    queue = kernel_template.candidate_queue if persistent_queue else kernel_template.candidates
+    return KernelTemplate.from_abi(
         name + solve_policy.suffix,
-        snippet,
         pgs_solve_local_internal_signature,
-        arguments + solve_policy.arguments,
-        dispatch="local_queue" if persistent_queue else "local",
-        groups=groups_per_block,
-        lanes=lanes_per_world,
-    )
-    if solve_policy.counts:
-        kernel._fpgs_solve_readout = solve_policy.readout
-    return kernel
+        snippet,
+        queue(groups_per_block, lanes_per_world),
+        extra=arguments + solve_policy.arguments,
+        composed=True,
+    ).kernel()
 
 
 @cache
@@ -15662,9 +15316,7 @@ def _get_mark_independent_sparse_contact_candidates_kernel(
 
     if units:
         name = f"mark_independent_sparse_contact_candidates_{sparse_size}_units"
-        mark_independent_sparse_contact_units_template.__name__ = name
-        mark_independent_sparse_contact_units_template.__qualname__ = name
-        return wp.kernel(enable_backward=False, module="unique")(mark_independent_sparse_contact_units_template)
+        return python_kernel(mark_independent_sparse_contact_units_template, name)
 
     def mark_independent_sparse_contact_candidates_template(
         data: ContactInput,
@@ -15699,9 +15351,7 @@ def _get_mark_independent_sparse_contact_candidates_kernel(
                 sparse_row_dof[world, slot, 0] = -2
 
     name = f"mark_independent_sparse_contact_candidates_{sparse_size}"
-    mark_independent_sparse_contact_candidates_template.__name__ = name
-    mark_independent_sparse_contact_candidates_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(mark_independent_sparse_contact_candidates_template)
+    return python_kernel(mark_independent_sparse_contact_candidates_template, name)
 
 
 @cache
@@ -15785,45 +15435,29 @@ def _get_build_independent_sparse_contact_groups_kernel(
 #endif
 """
 
-    @wp.func_native(cuda_native(snippet, preludes=(lane_group(32),)))
-    def build_independent_sparse_contact_groups_native(
-        world: int,
-        world_constraint_count: wp.array[int],
-        dense_phase_bounds: wp.array2d[int],
-        sparse_row_dof: wp.array3d[int],
-        group_count: wp.array[int],
-        group_heads: wp.array2d[int],
-        serial_count_out: wp.array[int],
-        serial_normals: wp.array2d[int],
-    ): ...
-
-    def build_independent_sparse_contact_groups_template(
-        world_constraint_count: wp.array[int],
-        dense_phase_bounds: wp.array2d[int],
-        sparse_row_dof: wp.array3d[int],
-        group_count: wp.array[int],
-        group_heads: wp.array2d[int],
-        serial_count_out: wp.array[int],
-        serial_normals: wp.array2d[int],
-    ):
-        world = wp.tid() // 32
-        build_independent_sparse_contact_groups_native(
-            world,
-            world_constraint_count,
-            dense_phase_bounds,
-            sparse_row_dof,
-            group_count,
-            group_heads,
-            serial_count_out,
-            serial_normals,
-        )
-
     name = f"build_independent_sparse_contact_groups_{M}_{D}"
     if build_serial_contacts:
         name += "_serial_contacts"
-    build_independent_sparse_contact_groups_template.__name__ = name
-    build_independent_sparse_contact_groups_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(build_independent_sparse_contact_groups_template)
+    return KernelTemplate(
+        name,
+        kernel_template.params(
+            ("world_constraint_count", wp.array[int]),
+            ("dense_phase_bounds", wp.array2d[int]),
+            ("sparse_row_dof", wp.array3d[int]),
+            ("group_count", wp.array[int]),
+            ("group_heads", wp.array2d[int]),
+            ("serial_count_out", wp.array[int]),
+            ("serial_normals", wp.array2d[int]),
+        ),
+        snippet,
+        dispatch=Dispatch(
+            "world = wp.tid() // 32\n$CALL",
+            ("world",),
+            (("world", int),),
+        ),
+        preludes=(lane_group(32),),
+        native_name="build_independent_sparse_contact_groups_native",
+    ).kernel()
 
 
 def _link_scalar_contacts_source(*, count: str, stride: int, head: str, dofs: int) -> str:
@@ -16072,52 +15706,68 @@ def _build_independent_sparse_contact_units_kernel(M: int, D: int, build_serial_
 #endif
 """
 
-    @wp.func_native(cuda_native(snippet, preludes=(lane_group(32),)))
-    def build_independent_sparse_contact_units_native(
-        world: int,
-        world_constraint_count: wp.array[int],
-        dense_phase_bounds: wp.array2d[int],
-        world_row_type: wp.array2d[int],
-        world_row_parent: wp.array2d[int],
-        sparse_row_dof: wp.array3d[int],
-        group_count: wp.array[int],
-        group_heads: wp.array2d[int],
-        serial_count_out: wp.array[int],
-        serial_normals: wp.array2d[int],
-    ): ...
-
-    def build_independent_sparse_contact_units_template(
-        world_constraint_count: wp.array[int],
-        dense_phase_bounds: wp.array2d[int],
-        world_row_type: wp.array2d[int],
-        world_row_parent: wp.array2d[int],
-        sparse_row_dof: wp.array3d[int],
-        group_count: wp.array[int],
-        group_heads: wp.array2d[int],
-        serial_count_out: wp.array[int],
-        serial_normals: wp.array2d[int],
-    ):
-        world = wp.tid() // 32
-        build_independent_sparse_contact_units_native(
-            world,
-            world_constraint_count,
-            dense_phase_bounds,
-            world_row_type,
-            world_row_parent,
-            sparse_row_dof,
-            group_count,
-            group_heads,
-            serial_count_out,
-            serial_normals,
-        )
-
     name = f"build_independent_sparse_contact_groups_{M}_{D}"
     if build_serial_contacts:
         name += "_serial_contacts"
     name += "_units"
-    build_independent_sparse_contact_units_template.__name__ = name
-    build_independent_sparse_contact_units_template.__qualname__ = name
-    return wp.kernel(enable_backward=False, module="unique")(build_independent_sparse_contact_units_template)
+    return KernelTemplate(
+        name,
+        kernel_template.params(
+            ("world_constraint_count", wp.array[int]),
+            ("dense_phase_bounds", wp.array2d[int]),
+            ("world_row_type", wp.array2d[int]),
+            ("world_row_parent", wp.array2d[int]),
+            ("sparse_row_dof", wp.array3d[int]),
+            ("group_count", wp.array[int]),
+            ("group_heads", wp.array2d[int]),
+            ("serial_count_out", wp.array[int]),
+            ("serial_normals", wp.array2d[int]),
+        ),
+        snippet,
+        dispatch=Dispatch(
+            "world = wp.tid() // 32\n$CALL",
+            ("world",),
+            (("world", int),),
+        ),
+        preludes=(lane_group(32),),
+        native_name="build_independent_sparse_contact_units_native",
+    ).kernel()
+
+
+_SPARSE_DIAGONAL_SWEEP_PARAMS = kernel_template.params(
+    ("world_constraint_count", wp.array[int]),
+    ("world_dof_indices", wp.array2d[int]),
+    ("rhs_bias", wp.array2d[float]),
+    ("world_diag", wp.array2d[float]),
+    ("world_impulses", wp.array2d[float]),
+    ("world_row_type", wp.array2d[int]),
+    ("world_row_parent", wp.array2d[int]),
+    ("world_row_mu", wp.array2d[float]),
+    ("dense_phase_bounds", wp.array2d[int]),
+    ("sparse_contact_group_count", wp.array[int]),
+    ("sparse_contact_group_heads", wp.array2d[int]),
+    ("sparse_contact_serial_count", wp.array[int]),
+    ("sparse_contact_serial_normals", wp.array2d[int]),
+    ("dense_offsets", wp.array[int]),
+    ("dense_groups", wp.array[int]),
+    ("dense_J", wp.array3d[float]),
+    ("dense_Y", wp.array3d[float]),
+    ("sparse_row_dof", wp.array3d[int]),
+    ("sparse_row_jy", wp.array3d[float]),
+    ("fused_limit_active", wp.array2d[int]),
+    ("fused_limit_lower_rhs", wp.array2d[float]),
+    ("fused_limit_upper_rhs", wp.array2d[float]),
+    ("diagonal_inverse_mass", wp.array[float]),
+    ("fused_limit_cfm", float),
+    ("iterations", int),
+    ("omega", float),
+    ("friction_start_iteration", int),
+    ("iteration_offset", int),
+    ("fused_limit_lower_lambda", wp.array2d[float]),
+    ("fused_limit_upper_lambda", wp.array2d[float]),
+    ("v_out", wp.array[float]),
+)
+"""The sparse-diagonal sweep's operands (one world per launch item)."""
 
 
 @cache
@@ -16836,111 +16486,6 @@ def _get_pgs_solve_sparse_diagonal_kernel(
 """
     snippet = cuda_native(snippet, preludes=(lane_group(32), RING, *PROJECTION_LAW.preludes(), *solve_policy.preludes))
 
-    @wp.func_native(snippet)
-    def pgs_solve_sparse_diagonal_native(
-        world: int,
-        world_constraint_count: wp.array[int],
-        world_dof_indices: wp.array2d[int],
-        rhs_bias: wp.array2d[float],
-        world_diag: wp.array2d[float],
-        world_impulses: wp.array2d[float],
-        world_row_type: wp.array2d[int],
-        world_row_parent: wp.array2d[int],
-        world_row_mu: wp.array2d[float],
-        dense_phase_bounds: wp.array2d[int],
-        sparse_contact_group_count: wp.array[int],
-        sparse_contact_group_heads: wp.array2d[int],
-        sparse_contact_serial_count: wp.array[int],
-        sparse_contact_serial_normals: wp.array2d[int],
-        dense_offsets: wp.array[int],
-        dense_groups: wp.array[int],
-        dense_J: wp.array3d[float],
-        dense_Y: wp.array3d[float],
-        sparse_row_dof: wp.array3d[int],
-        sparse_row_jy: wp.array3d[float],
-        fused_limit_active: wp.array2d[int],
-        fused_limit_lower_rhs: wp.array2d[float],
-        fused_limit_upper_rhs: wp.array2d[float],
-        diagonal_inverse_mass: wp.array[float],
-        fused_limit_cfm: float,
-        iterations: int,
-        omega: float,
-        friction_start_iteration: int,
-        iteration_offset: int,
-        fused_limit_lower_lambda: wp.array2d[float],
-        fused_limit_upper_lambda: wp.array2d[float],
-        v_out: wp.array[float],
-    ): ...
-
-    def pgs_solve_sparse_diagonal_template(
-        world_constraint_count: wp.array[int],
-        world_dof_indices: wp.array2d[int],
-        rhs_bias: wp.array2d[float],
-        world_diag: wp.array2d[float],
-        world_impulses: wp.array2d[float],
-        world_row_type: wp.array2d[int],
-        world_row_parent: wp.array2d[int],
-        world_row_mu: wp.array2d[float],
-        dense_phase_bounds: wp.array2d[int],
-        sparse_contact_group_count: wp.array[int],
-        sparse_contact_group_heads: wp.array2d[int],
-        sparse_contact_serial_count: wp.array[int],
-        sparse_contact_serial_normals: wp.array2d[int],
-        dense_offsets: wp.array[int],
-        dense_groups: wp.array[int],
-        dense_J: wp.array3d[float],
-        dense_Y: wp.array3d[float],
-        sparse_row_dof: wp.array3d[int],
-        sparse_row_jy: wp.array3d[float],
-        fused_limit_active: wp.array2d[int],
-        fused_limit_lower_rhs: wp.array2d[float],
-        fused_limit_upper_rhs: wp.array2d[float],
-        diagonal_inverse_mass: wp.array[float],
-        fused_limit_cfm: float,
-        iterations: int,
-        omega: float,
-        friction_start_iteration: int,
-        iteration_offset: int,
-        fused_limit_lower_lambda: wp.array2d[float],
-        fused_limit_upper_lambda: wp.array2d[float],
-        v_out: wp.array[float],
-    ):
-        world, _lane = wp.tid()
-        pgs_solve_sparse_diagonal_native(
-            world,
-            world_constraint_count,
-            world_dof_indices,
-            rhs_bias,
-            world_diag,
-            world_impulses,
-            world_row_type,
-            world_row_parent,
-            world_row_mu,
-            dense_phase_bounds,
-            sparse_contact_group_count,
-            sparse_contact_group_heads,
-            sparse_contact_serial_count,
-            sparse_contact_serial_normals,
-            dense_offsets,
-            dense_groups,
-            dense_J,
-            dense_Y,
-            sparse_row_dof,
-            sparse_row_jy,
-            fused_limit_active,
-            fused_limit_lower_rhs,
-            fused_limit_upper_rhs,
-            diagonal_inverse_mass,
-            fused_limit_cfm,
-            iterations,
-            omega,
-            friction_start_iteration,
-            iteration_offset,
-            fused_limit_lower_lambda,
-            fused_limit_upper_lambda,
-            v_out,
-        )
-
     name = f"pgs_solve_sparse_diagonal_{M}_{D}_{P}"
     if contact_triples:
         name += "_contact_groups"
@@ -16948,19 +16493,57 @@ def _get_pgs_solve_sparse_diagonal_kernel(
         name += "_speculative_batches"
     if contact_units:
         name += "_units"
-    if solve_policy.counts:
-        kernel = make_row_kernel(
-            name + solve_policy.suffix,
-            snippet,
-            pgs_solve_sparse_diagonal_native.func,
-            solve_policy.arguments,
-            dispatch="worlds",
-        )
-        kernel._fpgs_solve_readout = solve_policy.readout
-        return kernel
-    pgs_solve_sparse_diagonal_template.__name__ = name + solve_policy.suffix
-    pgs_solve_sparse_diagonal_template.__qualname__ = name + solve_policy.suffix
-    return wp.kernel(enable_backward=False, module="unique")(pgs_solve_sparse_diagonal_template)
+    return KernelTemplate(
+        name + solve_policy.suffix,
+        kernel_template.operands(_SPARSE_DIAGONAL_SWEEP_PARAMS, solve_policy.arguments),
+        snippet,
+        kernel_template.WORLDS,
+        composed=True,
+    ).kernel()
+
+
+_MF_GS_ABI = kernel_template.params(
+    ("world", int),
+    ("world_constraint_count", wp.array[int]),
+    ("dense_phase_bounds", wp.array2d[int]),
+    ("local_solve_owner", wp.array[int]),
+    ("world_dof_indices", wp.array2d[int]),
+    ("rhs_bias", wp.array2d[float]),
+    ("world_diag", wp.array2d[float]),
+    ("world_row_w", wp.array2d[float]),
+    ("world_impulses", wp.array2d[float]),
+    ("J_world", wp.array3d[float]),
+    ("Y_world", wp.array3d[float]),
+    ("world_row_type", wp.array2d[int]),
+    ("world_row_parent", wp.array2d[int]),
+    ("world_row_mu", wp.array2d[float]),
+    ("world_torsion_group", wp.array2d[int]),
+    ("contact_torsion_radius", float),
+    ("world_drive_target_vel_bias", wp.array2d[float]),
+    ("world_drive_vel_multiplier", wp.array2d[float]),
+    ("world_drive_impulse_multiplier", wp.array2d[float]),
+    ("world_drive_max_impulse", wp.array2d[float]),
+    ("world_drive_vel_limit", wp.array2d[float]),
+    ("mf_constraint_count", wp.array[int]),
+    ("mf_contact_rows_end", wp.array[int]),
+    ("mf_meta", wp.array2d[int]),
+    ("mf_impulses", wp.array2d[float]),
+    ("mf_J_a", wp.array3d[float]),
+    ("mf_J_b", wp.array3d[float]),
+    ("mf_MiJt_a", wp.array3d[float]),
+    ("mf_MiJt_b", wp.array3d[float]),
+    ("mf_row_mu", wp.array2d[float]),
+    ("mf_row_w", wp.array2d[float]),
+    ("iterations", int),
+    ("omega", float),
+    ("regularize", int),
+    ("row_phase", int),
+    ("friction_start_iteration", int),
+    ("iteration_offset", int),
+    ("freeze_drive_rows", int),
+    ("v_out", wp.array[float]),
+)
+"""The native ABI of the matrix-free Gauss-Seidel sweep (one world per call)."""
 
 
 @cache
@@ -17058,11 +16641,6 @@ def _get_pgs_solve_mf_gs_kernel(
         solve_policy=solve_policy,
     )
 
-    from .mf_dispatch import make_dispatch, make_native  # noqa: PLC0415
-
-    pgs_solve_mf_gs_native = make_native(snippet, extra=solve_policy.operands)
-    pgs_solve_mf_gs_template = make_dispatch(pgs_solve_mf_gs_native, extra=solve_policy.operands)
-
     name = (
         f"pgs_solve_mf_gs_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_{friction_mode}"
         f"_drive{int(has_drive_rows)}_densevlim{int(has_dense_velocity_limit_rows)}"
@@ -17087,12 +16665,15 @@ def _get_pgs_solve_mf_gs_kernel(
     if independent_components:
         name += "_components"
     name += solve_policy.suffix
-    pgs_solve_mf_gs_template.__name__ = name
-    pgs_solve_mf_gs_template.__qualname__ = name
-    result = wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_template)
-    result.mf_native = pgs_solve_mf_gs_native
-    if solve_policy.counts:
-        result._fpgs_solve_readout = solve_policy.readout
+    result = KernelTemplate.from_abi(
+        name,
+        _MF_GS_ABI,
+        snippet,
+        kernel_template.WORLD_QUEUE,
+        extra=solve_policy.arguments,
+        composed=True,
+        native_name="pgs_solve_mf_gs_native",
+    ).kernel()
     return result
 
 
@@ -17468,153 +17049,6 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
 
     snippet = cuda_native(snippet, preludes=(lane_group(32), RING, *PROJECTION_LAW.preludes(), *solve_policy.preludes))
 
-    @wp.func_native(snippet)
-    def pgs_solve_mf_gs_incremental_native(
-        world: int,
-        # Dense
-        world_constraint_count: wp.array[int],
-        dense_phase_bounds: wp.array2d[int],
-        local_solve_owner: wp.array[int],
-        world_dof_indices: wp.array2d[int],
-        rhs_bias: wp.array2d[float],
-        world_diag: wp.array2d[float],
-        world_row_w: wp.array2d[float],
-        world_impulses: wp.array2d[float],
-        J_world: wp.array3d[float],
-        Y_world: wp.array3d[float],
-        world_row_type: wp.array2d[int],
-        world_row_parent: wp.array2d[int],
-        world_row_mu: wp.array2d[float],
-        world_torsion_group: wp.array2d[int],
-        contact_torsion_radius: float,
-        world_drive_target_vel_bias: wp.array2d[float],
-        world_drive_vel_multiplier: wp.array2d[float],
-        world_drive_impulse_multiplier: wp.array2d[float],
-        world_drive_max_impulse: wp.array2d[float],
-        world_drive_vel_limit: wp.array2d[float],
-        # MF
-        mf_constraint_count: wp.array[int],
-        mf_contact_rows_end: wp.array[int],
-        mf_meta: wp.array2d[int],
-        mf_impulses: wp.array2d[float],
-        mf_J_a: wp.array3d[float],
-        mf_J_b: wp.array3d[float],
-        mf_MiJt_a: wp.array3d[float],
-        mf_MiJt_b: wp.array3d[float],
-        mf_row_mu: wp.array2d[float],
-        mf_row_w: wp.array2d[float],
-        # Shared
-        iterations: int,
-        omega: float,
-        regularize: int,
-        row_phase: int,
-        friction_start_iteration: int,
-        iteration_offset: int,
-        freeze_drive_rows: int,
-        # Output
-        v_out: wp.array[float],
-    ): ...
-
-    def pgs_solve_mf_gs_incremental_template(
-        general_world_count: wp.array[int],
-        general_worlds: wp.array[int],
-        general_world_grid_stride: int,
-        use_general_world_queue: int,
-        # Dense
-        world_constraint_count: wp.array[int],
-        dense_phase_bounds: wp.array2d[int],
-        local_solve_owner: wp.array[int],
-        world_dof_indices: wp.array2d[int],
-        rhs_bias: wp.array2d[float],
-        world_diag: wp.array2d[float],
-        world_row_w: wp.array2d[float],
-        world_impulses: wp.array2d[float],
-        J_world: wp.array3d[float],
-        Y_world: wp.array3d[float],
-        world_row_type: wp.array2d[int],
-        world_row_parent: wp.array2d[int],
-        world_row_mu: wp.array2d[float],
-        world_torsion_group: wp.array2d[int],
-        contact_torsion_radius: float,
-        world_drive_target_vel_bias: wp.array2d[float],
-        world_drive_vel_multiplier: wp.array2d[float],
-        world_drive_impulse_multiplier: wp.array2d[float],
-        world_drive_max_impulse: wp.array2d[float],
-        world_drive_vel_limit: wp.array2d[float],
-        # MF
-        mf_constraint_count: wp.array[int],
-        mf_contact_rows_end: wp.array[int],
-        mf_meta: wp.array2d[int],
-        mf_impulses: wp.array2d[float],
-        mf_J_a: wp.array3d[float],
-        mf_J_b: wp.array3d[float],
-        mf_MiJt_a: wp.array3d[float],
-        mf_MiJt_b: wp.array3d[float],
-        mf_row_mu: wp.array2d[float],
-        mf_row_w: wp.array2d[float],
-        # Shared
-        iterations: int,
-        omega: float,
-        regularize: int,
-        row_phase: int,
-        friction_start_iteration: int,
-        iteration_offset: int,
-        freeze_drive_rows: int,
-        # Output
-        v_out: wp.array[float],
-    ):
-        candidate, _lane = wp.tid()
-        general_index = candidate
-        general_count = general_world_count[0]
-        if use_general_world_queue == 0:
-            general_count = candidate + 1
-        while general_index < general_count:
-            world = candidate
-            if use_general_world_queue != 0:
-                world = general_worlds[general_index]
-            pgs_solve_mf_gs_incremental_native(
-                world,
-                world_constraint_count,
-                dense_phase_bounds,
-                local_solve_owner,
-                world_dof_indices,
-                rhs_bias,
-                world_diag,
-                world_row_w,
-                world_impulses,
-                J_world,
-                Y_world,
-                world_row_type,
-                world_row_parent,
-                world_row_mu,
-                world_torsion_group,
-                contact_torsion_radius,
-                world_drive_target_vel_bias,
-                world_drive_vel_multiplier,
-                world_drive_impulse_multiplier,
-                world_drive_max_impulse,
-                world_drive_vel_limit,
-                mf_constraint_count,
-                mf_contact_rows_end,
-                mf_meta,
-                mf_impulses,
-                mf_J_a,
-                mf_J_b,
-                mf_MiJt_a,
-                mf_MiJt_b,
-                mf_row_mu,
-                mf_row_w,
-                iterations,
-                omega,
-                regularize,
-                row_phase,
-                friction_start_iteration,
-                iteration_offset,
-                freeze_drive_rows,
-                v_out,
-            )
-            general_index += general_world_grid_stride
-
     name = (
         f"pgs_solve_mf_gs_incremental_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_rows{AM}_min{MIN_ROWS}"
         f"_drive{int(has_drive_rows)}_densevlim{int(has_dense_velocity_limit_rows)}"
@@ -17622,21 +17056,16 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
     )
     if skip_local_internal_worlds:
         name += "_local_fallback"
-    if solve_policy.counts:
-        kernel = make_row_kernel(
-            name + solve_policy.suffix,
-            snippet,
-            pgs_solve_mf_gs_incremental_native.func,
-            solve_policy.arguments,
-            dispatch="parallel",
-        )
-        kernel._fpgs_solve_readout = solve_policy.readout
-    else:
-        pgs_solve_mf_gs_incremental_template.__name__ = name + solve_policy.suffix
-        pgs_solve_mf_gs_incremental_template.__qualname__ = name + solve_policy.suffix
-        kernel = wp.kernel(enable_backward=False, module="unique")(pgs_solve_mf_gs_incremental_template)
-    kernel._fpgs_velocity_limit_law = velocity_limit_law  # recorded as routes.sweep.tiers.velocity_limit_law
-    return kernel
+    # The matrix-free sweep's ABI, unused operands included, so both sweeps share their launch.
+    return KernelTemplate.from_abi(
+        name + solve_policy.suffix,
+        _MF_GS_ABI,
+        snippet,
+        kernel_template.WORLD_QUEUE,
+        extra=solve_policy.arguments,
+        composed=True,
+        native_name="pgs_solve_mf_gs_incremental_native",
+    ).kernel()
 
 
 # The parallel tiers' automatic budget (_auto_tier_sweeps) grows with the serial sweep's iteration count, whose accuracy
@@ -17903,6 +17332,7 @@ def _get_pgs_solve_parallel_kernel(
         velocity_limit_shared = "    __shared__ int   s_vlim[AM];    // velocity-limit rows, for the last-word pass\n"
         velocity_limit_stage = f"        s_vlim[i] = row_type == {T_VLIM} ? 1 : 0;\n"
         velocity_limit_last_word = _parallel_velocity_limit_pass(matrix_free=bool(MF), inkernel=bool(INK), dofs=D)
+    warp_radius, block_radius = _parallel_friction_projection(linked_rows)
     snippet = f"""    const int lane = LANE;      // 0 .. NT-1
     constexpr int AM = {AM};
     constexpr int AP = {AP};
@@ -18247,11 +17677,7 @@ def _get_pgs_solve_parallel_kernel(
             const bool fr = (i < n_rows) && (s_kind[i] == 1);
             const int p = fr ? s_parent[i] : i;
             const int sib = fr ? ((i == p + 1) ? p + 2 : p + 1) : i;
-            const float xp = READ(x_new[0], p & 31);
-            const float xs = READ(x_new[0], sib & 31);
-            if (fr) {{
-                const float radius = fmaxf(s_mu[i] * xp, 0.0f);
-                x_new[0] = radius <= 0.0f ? 0.0f : ProjectionLaw::disk(wp::vec2(x_new[0], xs), radius)[0];
+{warp_radius}                x_new[0] = radius <= 0.0f ? 0.0f : ProjectionLaw::disk(wp::vec2(x_new[0], xs), radius)[0];
             }}
         }} else {{
         SYNC();
@@ -18264,8 +17690,7 @@ def _get_pgs_solve_parallel_kernel(
             if (i < n_rows && s_kind[i] == 1) {{
                 const int p = s_parent[i];
                 const int sib = (i == p + 1) ? p + 2 : p + 1;
-                const float radius = fmaxf(s_mu[i] * s_x[p], 0.0f);
-                x_new[q] = radius <= 0.0f ? 0.0f : ProjectionLaw::disk(wp::vec2(s_x[i], s_x[sib]), radius)[0];
+{block_radius}                x_new[q] = radius <= 0.0f ? 0.0f : ProjectionLaw::disk(wp::vec2(s_x[i], s_x[sib]), radius)[0];
             }}
         }}
         SYNC();
@@ -18372,8 +17797,6 @@ def _get_pgs_solve_parallel_kernel(
         snippet,
         preludes=(lane_group(NT), *((RING,) if linked_rows else ()), *row_preludes, *PROJECTION_LAW.preludes()),
     )
-    if linked_rows:
-        snippet = _link_parallel_friction_pairs(snippet)
 
     def pgs_solve_parallel_signature(
         world: int,
@@ -18428,7 +17851,8 @@ def _get_pgs_solve_parallel_kernel(
         v_out: wp.array[float],
     ): ...
 
-    name = f"pgs_solve_parallel_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_rows{AM}_min{MIN_ROWS}_sweeps{NSWEEPS}_nes{NESTEROV}_tol{TOL:g}_nt{NT}_rs5_mf{MF}c"
+    family = "pgs_solve_parallel" if row_inputs is None else "pgs_solve_kinetic_keyed_parallel"
+    name = f"{family}_{max_constraints}_{mf_max_constraints}_{max_world_dofs}_rows{AM}_min{MIN_ROWS}_sweeps{NSWEEPS}_nes{NESTEROV}_tol{TOL:g}_nt{NT}_rs5_mf{MF}c"
     if INK:
         name += f"_ink{NA}_{NB}_o{OA}_{OB}"
     name += f"_hd{HD}_z{ZG}_ex{EXACT}"
@@ -18439,18 +17863,25 @@ def _get_pgs_solve_parallel_kernel(
     name += "_iso"
     if velocity_limit_pass:
         name += "_lw"
-    if row_inputs is not None:
-        name = name.replace("pgs_solve_parallel_", "pgs_solve_kinetic_keyed_parallel_", 1)
-    kernel = make_row_kernel(name, snippet, pgs_solve_parallel_signature, input_arguments, dispatch="parallel")
-    kernel._fpgs_kinetic_rows = row_inputs is not None
-    kernel._fpgs_block_dim = NT  # two warps per world above 32 rows
-    kernel._fpgs_extra_inputs = True  # takes the in-kernel response inputs after freeze_drive_rows
-    kernel._fpgs_linked_rows = bool(linked_rows)  # recorded as routes.sweep.tiers.linked_rows
-    kernel._fpgs_velocity_limit_pass = velocity_limit_pass  # recorded as routes.sweep.tiers.velocity_limit_pass
-    # Velocity-limit rows are unilateral rows here (kind 0), whatever the serial sweeps' velocity_limit_law.
-    kernel._fpgs_velocity_limit_law = "accumulated"  # recorded as routes.sweep.tiers.velocity_limit_law
-    kernel._fpgs_sweeps = NSWEEPS  # recorded as routes.sweep.tiers.tiers[i].sweeps
-    return kernel
+    return SweepTier(
+        KernelTemplate.from_abi(
+            name,
+            pgs_solve_parallel_signature,
+            snippet,
+            kernel_template.WORLD_QUEUE,
+            extra=input_arguments,
+            composed=True,
+        ).kernel(),
+        # Two warps per world above 32 rows.
+        block_dim=NT,
+        response_inputs=True,
+        kinetic_rows=row_inputs is not None,
+        linked_rows=bool(linked_rows),
+        velocity_limit_pass=bool(velocity_limit_pass),
+        # Velocity-limit rows are unilateral rows here (kind 0), whatever the serial sweeps' velocity_limit_law.
+        velocity_limit_law="accumulated",
+        sweeps=NSWEEPS,
+    )
 
 
 def _parallel_velocity_limit_pass(*, matrix_free: bool, inkernel: bool, dofs: int) -> str:
@@ -18553,41 +17984,38 @@ _ISOTROPIC_PAIR_STEP = """    // Both tangent rows of a friction pair take the s
 """
 
 
-def _link_parallel_friction_pairs(snippet: str) -> str:
-    """Pool each friction pair's cone over its patch ring in a parallel sweep snippet.
+def _parallel_friction_projection(linked_rows: bool) -> tuple[str, str]:
+    """The friction pair's radius in a parallel sweep: one warp's (with its opening), and several warps'.
 
-    Normal rows keep their clamped value through the friction projection, so a pair
-    reads every normal of its ring at the value this sweep stores, summed in ring
-    order from the pair's own normal as the ordered sweeps sum it. Every tier steps
-    each pair isotropically (:data:`_ISOTROPIC_PAIR_STEP`), so the radial projection onto
-    that pooled disk has the serial pair solve's fixed point: the linked tiers and the
-    serial patch sweep share their friction solution, and their whole solution where
-    both accumulate the velocity-limit rows.
+    Unlinked, a pair's cone is its own normal's. Linked, each pair pools its cone over its patch ring: normal rows
+    keep their clamped value through the friction projection, so a pair reads every normal of its ring at the value
+    this sweep stores, summed in ring order from the pair's own normal as the ordered sweeps sum it. Every tier steps
+    each pair isotropically (:data:`_ISOTROPIC_PAIR_STEP`), so the radial projection onto that pooled disk has the
+    serial pair solve's fixed point: the linked tiers and the serial patch sweep share their friction solution, and
+    their whole solution where both accumulate the velocity-limit rows.
     """
+    if not linked_rows:
+        # One warp: the normals arrive by shuffle in the point law.
+        warp = (
+            "            const float xp = READ(x_new[0], p & 31);\n"
+            "            const float xs = READ(x_new[0], sib & 31);\n"
+            "            if (fr) {\n"
+            "                const float radius = fmaxf(s_mu[i] * xp, 0.0f);\n"
+        )
+        return warp, "                const float radius = fmaxf(s_mu[i] * s_x[p], 0.0f);\n"
     # A parent past the admitted rows ends the ring.
+    indent = " " * 16
     ring = (
-        "const float load = RING_LOAD(s_x[p], p, n_rows,\n"
-        "{indent}    [&](int r) {{ const int next = s_parent[r]; return next < n_rows ? next : -1; }},\n"
-        "{indent}    [&](int r) {{ return s_x[r]; }});\n"
-        "{indent}const float radius = fmaxf(s_mu[i] * load, 0.0f);\n"
+        f"{indent}const float load = RING_LOAD(s_x[p], p, n_rows,\n"
+        f"{indent}    [&](int r) {{ const int next = s_parent[r]; return next < n_rows ? next : -1; }},\n"
+        f"{indent}    [&](int r) {{ return s_x[r]; }});\n"
+        f"{indent}const float radius = fmaxf(s_mu[i] * load, 0.0f);\n"
     )
-    # One warp: the normals arrive by shuffle in the point law; stage them for the ring walk instead.
-    warp_pair = (
-        "            const float xp = READ(x_new[0], p & 31);\n"
-        "            const float xs = READ(x_new[0], sib & 31);\n"
-        "            if (fr) {\n"
-        "                const float radius = fmaxf(s_mu[i] * xp, 0.0f);\n"
-    )
-    warp_ring = (
+    # One warp stages the normals for the ring walk; several warps already stage every row in s_x.
+    warp = (
         "            const float xs = READ(x_new[0], sib & 31);\n"
         "            if (i < n_rows) s_x[i] = x_new[0];\n"
         "            WARP_SYNC();\n"
-        "            if (fr) {\n"
-        "                " + ring.format(indent="                ")
+        "            if (fr) {\n" + ring
     )
-    # Several warps already stage every row in s_x before projecting.
-    block_pair = "                const float radius = fmaxf(s_mu[i] * s_x[p], 0.0f);\n"
-    block_ring = "                " + ring.format(indent="                ")
-    if snippet.count(warp_pair) != 1 or snippet.count(block_pair) != 1:
-        raise ValueError("the parallel sweep's friction projection changed; update the patch ring walk")
-    return snippet.replace(warp_pair, warp_ring).replace(block_pair, block_ring)
+    return warp, ring

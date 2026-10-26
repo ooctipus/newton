@@ -7,11 +7,10 @@ Only tree traversal changes. All poses, common-origin motion, bias, moments,
 held-factor actions and publication retain their original physical meanings.
 """
 
-from string import Template
-
 import numpy as np
 import warp as wp
 
+from .device_preludes import substitute
 from .tree_kinetic_layout import REFERENCE_LAYOUT
 
 
@@ -223,7 +222,7 @@ _MOTION = (
 )
 
 # One stage loop of the CUDA subtree reduction over a fixed number of components.
-_VECTOR_REDUCTION = Template(r"""
+_VECTOR_REDUCTION = r"""
     {
     float values[$components];
     for(int stage=plan.chain_levels-1;stage>=0;--stage) {
@@ -252,9 +251,9 @@ _VECTOR_REDUCTION = Template(r"""
         __syncthreads();
     }
     }
-""")
+"""
 
-_REDUCTION = Template(r"""
+_REDUCTION = r"""
     {
     auto slot=[](int body,int k){return $address;};
 #if defined(__CUDA_ARCH__)
@@ -292,7 +291,7 @@ $vector
     }
 #endif
     }
-""")
+"""
 
 
 def reduction_source(*, moments, layout=REFERENCE_LAYOUT):
@@ -302,7 +301,7 @@ def reduction_source(*, moments, layout=REFERENCE_LAYOUT):
     # runtime component-major loop serialized every shuffle chain and repeated
     # the light-child list/address walk for all 6 or 19 channels. The new loop
     # order preserves each channel's exact light-child and suffix-add order.
-    vector = _VECTOR_REDUCTION.substitute(components=6)
+    vector = substitute(_VECTOR_REDUCTION, components=6)
     if moments:
-        vector = "if(refresh) " + _VECTOR_REDUCTION.substitute(components=19) + " else " + vector
-    return _REDUCTION.substitute(address=address, vector=vector, components="(refresh?19:6)" if moments else "6")
+        vector = "if(refresh) " + substitute(_VECTOR_REDUCTION, components=19) + " else " + vector
+    return substitute(_REDUCTION, address=address, vector=vector, components="(refresh?19:6)" if moments else "6")

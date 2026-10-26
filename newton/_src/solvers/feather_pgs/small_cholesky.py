@@ -3,16 +3,14 @@
 
 """Share small Cholesky arithmetic across current and cached mass producers."""
 
-import hashlib
-import linecache
 from functools import cache
-from string import Template
 
 import warp as wp
 
-from .device_preludes import cuda_native, lane_group
+from .device_preludes import lane_group, substitute
+from .kernel_template import THREADS, KernelTemplate
 
-_FACTOR = Template("""
+_FACTOR = """
     const int group = tid >> 5;
     if (group >= n_arts) return;
 
@@ -76,9 +74,9 @@ $MASS_INPUT
             L_group.data[factor_base + LANE * $DOFS + col] = factor[LANE * $DOFS + col];
     }
 #endif
-""")
+"""
 
-_FORCE_INIT = Template("""
+_FORCE_INIT = """
     if (LANE < $DOFS) {
         const int joint = articulation_start.data[articulation] + dof_joint_offset.data[LANE];
         const auto force = wp::mul(body_I_c.data[joint_child.data[joint]], joint_S_s.data[dof_start + LANE]);
@@ -87,7 +85,7 @@ _FORCE_INIT = Template("""
             force_components[LANE * 6 + component] = force.c[component];
     }
     SYNC();
-""")
+"""
 
 _COMPOSITE_INPUT = """
         const int source_code = (packed >> 8) & 255;
@@ -103,20 +101,20 @@ _COMPOSITE_INPUT = """
 """
 
 _INPUTS = (
-    "n_arts: int",
-    "articulation_start: wp.array[int]",
-    "articulation_dof_start: wp.array[int]",
-    "mass_update_mask: wp.array[int]",
-    "joint_child: wp.array[int]",
-    "joint_S_s: wp.array[wp.spatial_vector]",
-    "body_I_c: wp.array[wp.spatial_matrix]",
-    "group_to_art: wp.array[int]",
-    "R_group: wp.array2d[float]",
-    "dof_joint_offset: wp.array[int]",
-    "lower_schedule: wp.array[int]",
-    "fused_augmented_drive: int",
-    "drive_row_by_dof: wp.array[int]",
-    "row_K: wp.array[float]",
+    ("n_arts", int),
+    ("articulation_start", wp.array[int]),
+    ("articulation_dof_start", wp.array[int]),
+    ("mass_update_mask", wp.array[int]),
+    ("joint_child", wp.array[int]),
+    ("joint_S_s", wp.array[wp.spatial_vector]),
+    ("body_I_c", wp.array[wp.spatial_matrix]),
+    ("group_to_art", wp.array[int]),
+    ("R_group", wp.array2d[float]),
+    ("dof_joint_offset", wp.array[int]),
+    ("lower_schedule", wp.array[int]),
+    ("fused_augmented_drive", int),
+    ("drive_row_by_dof", wp.array[int]),
+    ("row_K", wp.array[float]),
 )
 
 
@@ -156,13 +154,13 @@ def get_kernel(
     elements = size * size
     inputs = list(_INPUTS)
     if geometric:
-        inputs.append("geometric: wp.array2d[float]")
+        inputs.append(("geometric", wp.array2d[float]))
         mass_input = f"        float value = geometric.data[group * {elements} + element];"
         if geometric_index:
-            inputs.append("geometry_lookup: wp.array[int]")
+            inputs.append(("geometry_lookup", wp.array[int]))
             row = "group"
             if geometric_group:
-                inputs.append("geometry_group: wp.array[int]")
+                inputs.append(("geometry_group", wp.array[int]))
                 row = "geometry_group.data[group]"
             stride = geometric_stride or max(geometric_index) + 1
             mass_input = (
@@ -172,8 +170,9 @@ def get_kernel(
             )
     else:
         mass_input = _COMPOSITE_INPUT
-    inputs.append("L_group: wp.array3d[float]")
-    snippet = _FACTOR.substitute(
+    inputs.append(("L_group", wp.array3d[float]))
+    snippet = substitute(
+        _FACTOR,
         DOFS=size,
         ELEMENTS=elements,
         # A packed composite schedule keeps the element in its low byte; a
@@ -183,23 +182,17 @@ def get_kernel(
         LOWER=size * (size + 1) // 2,
         FORCE_STORAGE="" if geometric else f"    __shared__ float forces[{warps_per_block * size * 6}];",
         FORCE_POINTER="" if geometric else f"    float* force_components = forces + SUB * {size * 6};",
-        FORCE_INIT="" if geometric else _FORCE_INIT.substitute(DOFS=size),
+        FORCE_INIT="" if geometric else substitute(_FORCE_INIT, DOFS=size),
         MASS_INPUT=mass_input,
     )
-    snippet = cuda_native(snippet, preludes=(lane_group(32),))
-    name = f"{'geometric_' if geometric else ''}crba_cholesky_warp{warps_per_block}_{size}"
-    signature = ",\n    ".join(inputs)
-    arguments = ", ".join(item.split(":")[0] for item in inputs)
-    # Author both ABIs directly; never inspect or rewrite a producer's Python.
-    source = (
-        f"@wp.func_native(snippet)\ndef factor_native(tid: int,\n    {signature}\n): ...\n\n"
-        f"def {name}(\n    {signature}\n):\n    factor_native(wp.tid(), {arguments})\n"
-    )
-    filename = f"<small-cholesky-{hashlib.sha256((source + snippet).encode()).hexdigest()}>"
-    linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
-    namespace = {"wp": wp, "snippet": snippet}
-    exec(compile(source, filename, "exec"), namespace)
-    return wp.kernel(enable_backward=False, module="unique")(namespace[name])
+    return KernelTemplate(
+        f"{'geometric_' if geometric else ''}crba_cholesky_warp{warps_per_block}_{size}",
+        tuple(inputs),
+        snippet,
+        THREADS,
+        preludes=(lane_group(32),),
+        native_name="factor_native",
+    ).kernel()
 
 
 def geometric_kernel(

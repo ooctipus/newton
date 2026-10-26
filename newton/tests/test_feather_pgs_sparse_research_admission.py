@@ -275,7 +275,7 @@ class TestSparseResearchAdmission(unittest.TestCase):
                 self.assertEqual(solver._sparse_row_factor.shape[2], support)
                 self.assertEqual(solver.mf_gs_incremental_rows, 32)
                 self.assertIsNone(solver._pgs_solve_mf_gs_kernel)
-                self.assertEqual(solver._pgs_solve_mf_gs_incremental_kernels, [])
+                self.assertEqual(solver._mf_gs_tiers, [])
                 self.assertIsNone(solver._ink_sizes)
                 self.assertEqual(solver._ink_rows, 0)
 

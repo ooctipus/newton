@@ -169,7 +169,7 @@ class TestFeatherPGSIncrementalPatch(unittest.TestCase):
                 self.assertEqual(reference[1]._friction_patches.capacity, candidate[1]._friction_patches.capacity)
                 self.assertEqual(reference[1]._incremental_rows, 0)
                 self.assertEqual(candidate[1]._incremental_rows, 32)
-                self.assertTrue(candidate[1]._pgs_solve_mf_gs_incremental_kernels)
+                self.assertTrue(candidate[1]._mf_gs_tiers)
                 # The route record the GPU gates grade: the tier, and the budget it serves.
                 for case, rows in ((reference, 0), (candidate, 32)):
                     selected = case[1].get_path_selection()

@@ -7,10 +7,10 @@ from dataclasses import dataclass
 from functools import cache
 
 import numpy as np
-import warp as wp
 
 from ...sim import JointType
-from .device_preludes import dual_native, lane_group
+from .device_preludes import lane_group
+from .kernel_template import WORLDS, KernelTemplate, substitute
 from .row_laws import ROW_LAW
 
 
@@ -196,26 +196,24 @@ def prefix_kernel(layout, prefix_type, rows_type):
         "" if consecutive else "const int coordinates[] = {" + (", ".join(map(str, coordinates)) or "0") + "};"
     )
     coordinate_index = f"candidate / 2 + {coordinates[0]}" if consecutive else "coordinates[candidate / 2]"
-    for key, value in {
-        "$VELOCITY": int(layout.velocity_limits),
-        "$DOUBLE": 2 * layout.dofs,
-        "$CANDIDATES": 2 * len(layout.limit_coordinates),
-        "$COORDINATE_DECL": coordinate_decl,
-        "$COORDINATE_INDEX": coordinate_index,
-        "$POSITION": f"{layout.position_eligibility}u",
-        "$PRIMARY": layout.primary_test("d"),
-        "$LOCAL": layout.local("d"),
-        "$MASK": f"{layout.velocity_mask}u",
-    }.items():
-        source = source.replace(key, str(value))
-
+    source = substitute(
+        source,
+        VELOCITY=int(layout.velocity_limits),
+        DOUBLE=2 * layout.dofs,
+        CANDIDATES=2 * len(layout.limit_coordinates),
+        COORDINATE_DECL=coordinate_decl,
+        COORDINATE_INDEX=coordinate_index,
+        POSITION=f"{layout.position_eligibility}u",
+        PRIMARY=layout.primary_test("d"),
+        LOCAL=layout.local("d"),
+        MASK=f"{layout.velocity_mask}u",
+    )
     # A warp generates a world's rows on CUDA, one thread on the CPU.
-    @wp.func_native(dual_native(source, preludes=(lane_group(32), *ROW_LAW.preludes())))
-    def native(world: int, p: prefix_type, z: rows_type): ...
-
-    @wp.kernel(module="unique", enable_backward=False)
-    def keyed_limit_prefix(p: prefix_type, z: rows_type):
-        world, _lane = wp.tid()
-        native(world, p, z)
-
-    return keyed_limit_prefix
+    return KernelTemplate(
+        "keyed_limit_prefix",
+        (("p", prefix_type), ("z", rows_type)),
+        source,
+        WORLDS,
+        preludes=(lane_group(32), *ROW_LAW.preludes()),
+        dual=True,
+    ).kernel()

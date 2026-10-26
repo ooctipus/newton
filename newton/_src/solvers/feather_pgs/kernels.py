@@ -51,6 +51,7 @@ from .device_preludes import (
     warp_sync,
 )
 from .friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, patch_friction_location, patch_normal_load
+from .kernel_template import python_kernel
 from .projection_laws import (
     coulomb_bisection,
     coulomb_newton,
@@ -1490,11 +1491,8 @@ def _get_tree_fk_kernel(lanes: int, mode: str):
         raise ValueError("Tree traversal lanes must be a power of two between 1 and 32")
     if mode not in ("id", "kinematics", "public"):
         raise ValueError(f"Unknown tree traversal mode: {mode}")
-    module = wp.Module(f"{__name__}.tree_fk_{mode}_{lanes}")
-
     if mode == "public":
 
-        @wp.kernel(module=module, enable_backward=False)
         def tree_fk_public(
             group_count: int,
             max_levels: int,
@@ -1556,11 +1554,10 @@ def _get_tree_fk_kernel(lanes: int, mode: str):
                 if wp.static(lanes > 1):
                     warp_sync()
 
-        return tree_fk_public
+        return python_kernel(tree_fk_public, f"tree_fk_{mode}_{lanes}")
 
     compute_dynamics = mode == "id"
 
-    @wp.kernel(module=module, enable_backward=False)
     def tree_fk(
         group_count: int,
         max_levels: int,
@@ -1742,7 +1739,7 @@ def _get_tree_fk_kernel(lanes: int, mode: str):
         if active and local == 0:
             fk_id_cache_valid[articulation] = 1
 
-    return tree_fk
+    return python_kernel(tree_fk, f"tree_fk_{mode}_{lanes}")
 
 
 @wp.kernel
@@ -1896,9 +1893,7 @@ def _get_tree_tau_kernel(lanes: int):
     """Reduce chain wrenches without atomics, preserving descending child order."""
     if lanes not in (1, 2, 4, 8, 16, 32):
         raise ValueError("Tree traversal lanes must be a power of two between 1 and 32")
-    module = wp.Module(f"{__name__}.tree_tau_{lanes}")
 
-    @wp.kernel(module=module, enable_backward=False)
     def tree_tau(
         group_count: int,
         max_levels: int,
@@ -1989,7 +1984,7 @@ def _get_tree_tau_kernel(lanes: int):
             if wp.static(lanes > 1):
                 warp_sync()
 
-    return tree_tau
+    return python_kernel(tree_tau, f"tree_tau_{lanes}")
 
 
 @wp.kernel(module=_INVERSE_DYNAMICS_KERNEL_MODULE)

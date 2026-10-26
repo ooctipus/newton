@@ -31,6 +31,7 @@ import unittest
 import warp as wp
 
 from newton._src.solvers.feather_pgs import environment_flags
+from newton._src.solvers.feather_pgs.kernel_template import SweepTier
 
 _PINS = os.path.join(os.path.dirname(__file__), "golden_data", "test_feather_pgs_point_streams", "pins.json")
 _PACKAGE = "newton._src.solvers.feather_pgs"
@@ -681,7 +682,8 @@ def _factory_kernels():
             kernel = factory(*args, **kwargs)
         except ValueError:
             continue  # The factory rejects this combination for every friction law.
-        kernels[_label(name, args, kwargs)] = kernel
+        # A tier factory returns the tier's launch descriptor.
+        kernels[_label(name, args, kwargs)] = kernel.kernel if isinstance(kernel, SweepTier) else kernel
     return kernels
 
 

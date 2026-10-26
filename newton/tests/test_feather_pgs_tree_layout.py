@@ -29,7 +29,7 @@ class TestTreeLayoutRender(unittest.TestCase):
     def test_render_rejects_code_tokens(self):
         """Fail on a thread or scratch token: the prelude declares those, the layout does not."""
         for token in ("SYNC", "MASK", "LANE", "STRIDE", "SUB", "SHFL", "ALL", "ANY", "STATE_SCRATCH_DECL"):
-            with self.subTest(token=token), self.assertRaises(KeyError):
+            with self.subTest(token=token), self.assertRaisesRegex(ValueError, "without values"):
                 _LAYOUTS[0].render(f"${token};")
 
     def test_render_places_fragments_in_one_pass(self):

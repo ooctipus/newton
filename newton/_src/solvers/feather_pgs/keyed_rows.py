@@ -26,6 +26,7 @@ from .contact_laws import CONTACT_LAW, contact_friction
 from .device_preludes import dual_native, lane_group
 from .field_group import Field, FieldGroup, SolverArrays
 from .friction_patches import PatchRowLaw, patch_row_law
+from .kernel_template import WORLDS, KernelTemplate, substitute
 from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 from .keyed_row_layout import prefix_kernel
 from .keyed_row_layout import topology_plan as direct_topology_plan
@@ -137,15 +138,18 @@ def _row_source(*, layout, output="Jr[q]", private_metadata=False, patch=False):
     stay as :func:`scatter_patch_contact_keys` and the patch link left them.
     """
     dofs = layout.dofs
-    prefix = """
+    prefix = substitute(
+        """
         const int token = ~key, d = token / 2;
         const float sign = (token & 1) == 0 ? 1.0f : -1.0f;
         #pragma unroll
-        for (int q = 0; q < __DOFS__; ++q) {
-            __PREFIX_VALUE__
+        for (int q = 0; q < $DOFS; ++q) {
+            $OUTPUT = q == d ? sign : 0.0f;
         }
-    """
-    prefix = prefix.replace("__PREFIX_VALUE__", "Jr[q] = q == d ? sign : 0.0f;")
+    """,
+        DOFS=dofs,
+        OUTPUT=output,
+    )
     physical_projection = f"""
             const int n = c.response_dofs.data[art], local = {layout.local("q")};
             if (n != ({layout.primary_test("q")} ? {layout.primary} : {layout.secondary})
@@ -153,21 +157,29 @@ def _row_source(*, layout, output="Jr[q]", private_metadata=False, patch=False):
             const wp::spatial_vector S = c.motion.data[c.dof_start.data[art] + local];
             value += sign * ContactLaw::jacobian_entry(S, direction, point, c.origin.data[art]);
     """
-    projection = """
+    projection = substitute(
+        """
         #pragma unroll
-        for (int q = 0; q < __DOFS__; ++q) {
+        for (int q = 0; q < $DOFS; ++q) {
             float value = 0.0f;
             for (int side = 0; side < 2; ++side) {
                 const int body = side == 0 ? ba : bb, art = side == 0 ? aa : ab;
                 if (body < 0 || art < 0) continue;
                 const float sign = side == 0 ? 1.0f : -1.0f;
                 const wp::vec3 point = side == 0 ? p0 : p1;
-                __PROJECT__
+                $PROJECT
             }
-            Jr[q] = value;
+            $OUTPUT = value;
         }
-        """.replace("__PROJECT__", physical_projection)
-    incident = f"relative += Jr[q] * c.incident.data[z.maps.starts.data[world * 2 + ({layout.primary_test('q')} ? 0 : 1)] + {layout.local('q')}];"
+        """,
+        DOFS=dofs,
+        PROJECT=physical_projection,
+        OUTPUT=output,
+    )
+    incident = (
+        f"relative += {output} * c.incident.data[z.maps.starts.data[world * 2 + ({layout.primary_test('q')} ? 0 : 1)]"
+        f" + {layout.local('q')}];"
+    )
     if patch:
         friction_location = (
             "const wp::vec3 fa = patch_law.patches.point_a.data[contact], fb = patch_law.patches.point_b.data[contact];"
@@ -193,12 +205,12 @@ def _row_source(*, layout, output="Jr[q]", private_metadata=False, patch=False):
         metadata = (
             "built_rhs = rhs; built_mu = r == 0 ? mu : friction; built_parent = r == 0 ? -1 : c.slot.data[contact];"
         )
-    return (
+    return substitute(
         r"""
     const int at = world * z.rowkeys.shape[1] + row;
     const int key = z.rowkeys.data[at];
     if (key < 0) {
-__PREFIX__
+${PREFIX}
     } else {
         const auto& c = z.contact;
         const int contact = key >> 2, r = key & 3;
@@ -214,39 +226,39 @@ __PREFIX__
             t0 = basis.v0;
             t1 = basis.v1;
         }
-        __FRICTION_LOCATION__
+        ${FRICTION_LOCATION}
         const auto [direction, p0, p1] = ContactLaw::contact_row_frame(r, c.shared_anchor, normal, t0, t1, pa, pb, fa, fb);
         const float target = ContactLaw::prescribed_target(ba, aa, bb, ab, p0, p1, direction, c.prescribed, c.origin, c.body_v);
         const auto [mu, restitution] = ContactLaw::contact_materials(sa, sb, c.material_mu, c.material_restitution);
         const float friction = mu * c.friction_scale;
-__PROJECTION__
-        const float phi = r == 0 ? separation : __TANGENT_PHI__;
-        float rhs = RowLaw::row_rhs(r == 0 ? 0 : 2, phi, r == 0 ? c.beta : __TANGENT_BETA__, target, 1.0f / c.dt,
+${PROJECTION}
+        const float phi = r == 0 ? separation : ${TANGENT_PHI};
+        float rhs = RowLaw::row_rhs(r == 0 ? 0 : 2, phi, r == 0 ? c.beta : ${TANGENT_BETA}, target, 1.0f / c.dt,
                                     c.bias_scale, c.speculative_scale, 0.0f, 1.0f).v0;
         if (r == 0 && restitution > 0.0f) {
             float relative = -target;
             #pragma unroll
-            for (int q = 0; q < __DOFS__; ++q) { __INCIDENT__ }
+            for (int q = 0; q < ${DOFS}; ++q) { ${INCIDENT} }
             const auto bounce = RowLaw::contact_restitution_rhs(phi, relative, target, restitution, c.dt,
                                                                 c.restitution_threshold);
             if (bounce.v0) rhs = bounce.v1;
         }
-__ROW_LAW__        c.row_cfm.data[at] = c.cfm;
+${ROW_LAW}        c.row_cfm.data[at] = c.cfm;
         c.phi.data[at] = phi; c.target.data[at] = target;
         c.restitution.data[at] = r == 0 ? restitution : 0.0f;
         c.rhs.data[at] = rhs; c.diag.data[at] = c.cfm;
-        __PRIVATE_METADATA__
+        ${PRIVATE_METADATA}
     }
-""".replace("__PREFIX__", prefix)
-        .replace("__FRICTION_LOCATION__", friction_location)
-        .replace("__PROJECTION__", projection)
-        .replace("__INCIDENT__", incident)
-        .replace("__TANGENT_PHI__", tangent_phi)
-        .replace("__TANGENT_BETA__", tangent_beta)
-        .replace("__ROW_LAW__", row_law)
-        .replace("__PRIVATE_METADATA__", metadata)
-        .replace("__DOFS__", str(dofs))
-        .replace("Jr[q]", output)
+""",
+        PREFIX=prefix,
+        FRICTION_LOCATION=friction_location,
+        PROJECTION=projection,
+        INCIDENT=incident,
+        TANGENT_PHI=tangent_phi,
+        TANGENT_BETA=tangent_beta,
+        ROW_LAW=row_law,
+        PRIVATE_METADATA=metadata,
+        DOFS=dofs,
     )
 
 
@@ -258,92 +270,58 @@ def _fallback_source(layout, *, patch=False):
     primary_test = layout.primary_test("q")
     local_a = f"q - {layout.primary_offset}"
     local_b = f"q - {layout.secondary_offset}"
-    source = (
+    source = substitute(
         """
     if (counts.data[world] <= $LIMIT && mf_counts.data[world] == 0) return;
     const int ga = z.maps.groups.data[world * 2], gb = z.maps.groups.data[world * 2 + 1];
     for (int row = LANE; row < counts.data[world]; row += STRIDE) {
         float Jr[$DOFS];
-"""
-        + _row_source(layout=layout, patch=patch)
-        + """
+$ROW
         #pragma unroll
         for (int q = 0; q < $DOFS; ++q) {
             if ($PRIMARY_TEST) J16.data[(ga * J16.shape[1] + row) * $NA + $LOCAL_A] = Jr[q];
             else J6.data[(gb * J6.shape[1] + row) * $NB + $LOCAL_B] = Jr[q];
         }
     }
-"""
+""",
+        ROW=_row_source(layout=layout, patch=patch),
+        LIMIT=limit,
+        DOFS=dofs,
+        PRIMARY_TEST=primary_test,
+        NA=primary,
+        NB=secondary,
+        LOCAL_A=local_a,
+        LOCAL_B=local_b,
     )
-
-    for key, value in {
-        "$LIMIT": limit,
-        "$DOFS": dofs,
-        "$PRIMARY_TEST": primary_test,
-        "$NA": primary,
-        "$NB": secondary,
-        "$LOCAL_A": local_a,
-        "$LOCAL_B": local_b,
-    }.items():
-        source = source.replace(key, str(value))
     # A warp per world on CUDA (launched in blocks of 32), one thread on the CPU.
     return dual_native(source, preludes=(lane_group(32), *ROW_PRELUDES))
+
+
+_FALLBACK_PARAMS = (
+    ("z", KineticRows),
+    ("counts", wp.array[int]),
+    ("mf_counts", wp.array[int]),
+    ("J16", wp.array3d[float]),
+    ("J6", wp.array3d[float]),
+)
+"""The fallback's operands; the patch fallback takes the patch row law after the rows."""
 
 
 @cache
 def get_fallback_kernel(layout):
     """Materialize current physical rows in one pass over fallback worlds only."""
-    source = _fallback_source(layout)
-
-    @wp.func_native(source)
-    def native(
-        world: int,
-        z: KineticRows,
-        counts: wp.array[int],
-        mf_counts: wp.array[int],
-        J16: wp.array3d[float],
-        J6: wp.array3d[float],
-    ): ...
-
-    @wp.kernel(module="unique", enable_backward=False)
-    def keyed_rows_fallback(
-        z: KineticRows, counts: wp.array[int], mf_counts: wp.array[int], J16: wp.array3d[float], J6: wp.array3d[float]
-    ):
-        world, _lane = wp.tid()
-        native(world, z, counts, mf_counts, J16, J6)
-
-    return keyed_rows_fallback
+    return KernelTemplate(
+        "keyed_rows_fallback", _FALLBACK_PARAMS, _fallback_source(layout), WORLDS, composed=True
+    ).kernel()
 
 
 @cache
 def get_patch_fallback_kernel(layout):
     """Materialize the fallback worlds' rows with the persistent patch row law."""
-    source = _fallback_source(layout, patch=True)
-
-    @wp.func_native(source)
-    def native(
-        world: int,
-        z: KineticRows,
-        patch_law: PatchRowLaw,
-        counts: wp.array[int],
-        mf_counts: wp.array[int],
-        J16: wp.array3d[float],
-        J6: wp.array3d[float],
-    ): ...
-
-    @wp.kernel(module="unique", enable_backward=False)
-    def keyed_rows_patch_fallback(
-        z: KineticRows,
-        patch_law: PatchRowLaw,
-        counts: wp.array[int],
-        mf_counts: wp.array[int],
-        J16: wp.array3d[float],
-        J6: wp.array3d[float],
-    ):
-        world, _lane = wp.tid()
-        native(world, z, patch_law, counts, mf_counts, J16, J6)
-
-    return keyed_rows_patch_fallback
+    params = (_FALLBACK_PARAMS[0], ("patch_law", PatchRowLaw), *_FALLBACK_PARAMS[1:])
+    return KernelTemplate(
+        "keyed_rows_patch_fallback", params, _fallback_source(layout, patch=True), WORLDS, composed=True
+    ).kernel()
 
 
 def get_direct_parallel_inputs(layout, na, nb, oa, ob, dofs, capacity, *, patch=False):

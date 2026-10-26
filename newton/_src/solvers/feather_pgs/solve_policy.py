@@ -242,7 +242,7 @@ class SolvePolicy:
 
     @property
     def arguments(self) -> tuple[RowArgument, ...]:
-        """The same operands as generated-kernel arguments (:func:`row_inputs.make_row_kernel`)."""
+        """The same operands as a generated kernel's extra operands (:func:`.kernel_template.operands`)."""
         return tuple(RowArgument(name, dtype) for name, dtype in self.operands.items())
 
 
@@ -425,19 +425,30 @@ class SolveReadoutRecord:
         self._skipped: dict[str, wp.array] = {}
         self._pass = "position"
 
-    def register(self, kernel, label: str, *, world_count: int, budget: int, device, velocity_budget: int = 0) -> None:
-        """Allocate the counters of a readout kernel; kernels without a readout operand are ignored.
+    def register(
+        self,
+        kernel,
+        label: str,
+        *,
+        readout: str | None,
+        world_count: int,
+        budget: int,
+        device,
+        velocity_budget: int = 0,
+    ) -> None:
+        """Allocate the counters of a readout kernel; kernels built without a readout are ignored.
 
         Args:
-            kernel: A sweep kernel built under a policy with a readout.
+            kernel: A sweep kernel.
             label: Route of the kernel in the record, such as ``"sparse_pgs"``.
+            readout: The readout of the policy the kernel was built under (``"sweeps"`` or ``"trace"``), or
+                ``None`` for a kernel without a readout operand.
             world_count: Number of worlds the kernel can solve.
             budget: Largest sweep budget a position-solve launch of the kernel passes.
             device: Device of the counters.
             velocity_budget: Sweep budget of the velocity pass, or 0 when the solver runs none.
         """
-        readout = getattr(kernel, "_fpgs_solve_readout", False) if kernel is not None else False
-        if not readout or kernel.key in self._labels:
+        if kernel is None or not readout or kernel.key in self._labels:
             return
         self._labels[kernel.key] = label
         budgets = {"position": budget, "velocity": velocity_budget}

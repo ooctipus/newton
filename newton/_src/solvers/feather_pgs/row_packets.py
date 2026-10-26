@@ -42,7 +42,6 @@ from .contact_laws import (
     prescribed_target,
 )
 from .device_preludes import (
-    dual_native,
     lane_group,
     reserved_count,
     warp_broadcast,
@@ -52,6 +51,7 @@ from .device_preludes import (
 )
 from .field_group import Field, FieldGroup, SolverArrays
 from .friction_patches import PatchRowLaw, patch_friction_location, patch_row_law, patch_tangent_row
+from .kernel_template import KernelTemplate, substitute
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -151,20 +151,20 @@ QueueData = field_group.struct("QueueData", QUEUE, __name__)
 
 _PREFIX_SOURCE = r"""
     // A warp runs each group on CUDA; on the CPU one thread runs the block's groups in turn.
-    for (int group = block * WARPS + SUB; group < (block + 1) * WARPS && group < data.group_to_art.shape[0]; group += GROUPS) {
+    for (int group = block * $WARPS + SUB; group < (block + 1) * $WARPS && group < data.group_to_art.shape[0]; group += GROUPS) {
     const int art = data.group_to_art.data[group];
     const int world = data.art_to_world.data[art];
     const int first_dof = data.dof_start.data[art];
     const int mimic_first = data.mimic_start.data[art];
     const int mimic_end = data.mimic_start.data[art + 1];
     const int M = data.kind.shape[1];
-    for (int row = LANE; row < PACKETS; row += STRIDE) data.row_contact.data[world * PACKETS + row] = -1;
+    for (int row = LANE; row < $PACKETS; row += STRIDE) data.row_contact.data[world * $PACKETS + row] = -1;
     int count = 0;
-    for (int chunk = 0; chunk < CANDIDATES; chunk += STRIDE) {
+    for (int chunk = 0; chunk < $CANDIDATES; chunk += STRIDE) {
         const int candidate = chunk + LANE;
         int active = 0, d0 = -1, d1 = -1, type = 3, mimic = -1;
         float w0 = 0.0f, w1 = 0.0f, phi = 0.0f;
-        if (candidate < MIMICS) {
+        if (candidate < $MIMICS) {
             if (mimic_first + candidate < mimic_end) {
                 mimic = data.mimic_list.data[mimic_first + candidate];
                 data.mimic_slot.data[mimic] = -1;
@@ -179,8 +179,8 @@ _PREFIX_SOURCE = r"""
                                             data.mimic_coef0.data[mimic], data.mimic_coef1.data[mimic]);
                 }
             }
-        } else if (candidate < CANDIDATES) {
-            const int local = (candidate - MIMICS) / 2, side = (candidate - MIMICS) & 1;
+        } else if (candidate < $CANDIDATES) {
+            const int local = (candidate - $MIMICS) / 2, side = (candidate - $MIMICS) & 1;
             const int dof = first_dof + local, qi = data.limit_q_index.data[dof];
             if (qi >= 0) {
                 const auto limit = RowLaw::joint_limit_side(data.q.data[qi], data.lower.data[dof], data.upper.data[dof],
@@ -194,8 +194,8 @@ _PREFIX_SOURCE = r"""
         const unsigned votes = BALLOT(active != 0);
         const int slot = count + BELOW(votes);
         count += COUNT(votes);
-        if (active && slot < PACKETS) {
-            const int sparse = (world * PACKETS + slot) * 2;
+        if (active && slot < $PACKETS) {
+            const int sparse = (world * $PACKETS + slot) * 2;
             data.dofs.data[sparse] = d0;
             data.dofs.data[sparse + 1] = d1;
             data.weights.data[sparse] = w0;
@@ -237,24 +237,17 @@ def get_prefix_kernel(primary: int, mimics: int, packets: int):
     """
     if primary <= 0 or mimics < 0 or mimics + 2 * primary > packets:
         raise ValueError("the prefix candidates must fit the packet capacity")
-    source = _PREFIX_SOURCE
-    for token, value in (
-        ("CANDIDATES", mimics + 2 * primary),
-        ("MIMICS", mimics),
-        ("PACKETS", packets),
-        ("WARPS", WARPS_PER_BLOCK),
-    ):
-        source = source.replace(token, str(value))
-
-    @wp.func_native(dual_native(source, preludes=(lane_group(32), *ROW_LAW.preludes())))
-    def prefix_native(block: int, data: PrefixData): ...
-
-    def prefix(data: PrefixData):
-        block, _lane = wp.tid()
-        prefix_native(block, data)
-
-    prefix.__name__ = prefix.__qualname__ = f"row_packet_prefix{primary}_m{mimics}_r{packets}"
-    return wp.kernel(module="unique", enable_backward=False)(prefix)
+    source = substitute(
+        _PREFIX_SOURCE, CANDIDATES=mimics + 2 * primary, MIMICS=mimics, PACKETS=packets, WARPS=WARPS_PER_BLOCK
+    )
+    return KernelTemplate(
+        f"row_packet_prefix{primary}_m{mimics}_r{packets}",
+        (("data", PrefixData),),
+        source,
+        preludes=(lane_group(32), *ROW_LAW.preludes()),
+        dual=True,
+        native_name="prefix_native",
+    ).kernel()
 
 
 @cache

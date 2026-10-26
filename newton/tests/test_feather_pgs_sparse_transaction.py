@@ -48,7 +48,7 @@ SHAPES = ((256, 16), (96, 16), (96, 14))
 
 def _snippet(kernel):
     """Return the sweep body a sparse sweep kernel compiles."""
-    return getattr(kernel, "_fpgs_row_native_source", None) or max(_native_snippets(kernel), key=len)
+    return max(_native_snippets(kernel), key=len)
 
 
 def _resized(data, capacity):

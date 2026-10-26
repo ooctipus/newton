@@ -4,9 +4,8 @@
 """Compile-time storage and coordinate contracts for cached tree dynamics."""
 
 from dataclasses import dataclass
-from string import Template
 
-from .device_preludes import dual_native, lane_group
+from .device_preludes import dual_native, lane_group, substitute
 
 
 @dataclass(frozen=True)
@@ -155,8 +154,7 @@ class TreeLayout:
         clashes = sizes.keys() & fragments.keys()
         if clashes:
             raise ValueError(f"Native fragments shadow layout sizes: {sorted(clashes)}")
-        values = {name: Template(text).substitute(sizes) for name, text in fragments.items()}
-        return Template(source).substitute(sizes, **values)
+        return substitute(source, sizes, **{name: substitute(text, sizes) for name, text in fragments.items()})
 
     def native(self, source, **fragments):
         """Render a native template (see :meth:`render`) after the tree's lane group of :attr:`lanes` threads.
