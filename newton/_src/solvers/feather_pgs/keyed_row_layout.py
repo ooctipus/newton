@@ -158,8 +158,7 @@ def prefix_kernel(layout, prefix_type, rows_type):
                 }
 #endif
             }
-            const unsigned votes = BALLOT(active);
-            const int slot = base + BELOW(votes);
+            const int slot = ORDERED(base, active);
             if (active && slot < M) {
                 const int at = world * M + slot;
                 z.rowkeys.data[at] = ~(d * 2 + side);
@@ -180,7 +179,6 @@ def prefix_kernel(layout, prefix_type, rows_type):
                 }
 #endif
             }
-            base += COUNT(votes);
         }
         if (LANE == 0)
             p.bounds.data[world * 2 + phase] = base;

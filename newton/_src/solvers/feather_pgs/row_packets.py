@@ -191,9 +191,7 @@ _PREFIX_SOURCE = r"""
                 w0 = limit.v2;
             }
         }
-        const unsigned votes = BALLOT(active != 0);
-        const int slot = count + BELOW(votes);
-        count += COUNT(votes);
+        const int slot = ORDERED(count, active != 0);
         if (active && slot < $PACKETS) {
             const int sparse = (world * $PACKETS + slot) * 2;
             data.dofs.data[sparse] = d0;

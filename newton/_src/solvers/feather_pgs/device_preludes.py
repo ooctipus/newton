@@ -28,14 +28,25 @@ from the same text:
     ``SEGMENT_SUM(width, values...)`` (sums over aligned segments of ``width``
     lanes, a power of two up to ``WIDTH``, on every lane of the group),
     ``MINIMUM(values...)``, ``MAXIMUM(values...)``, ``ARGMAX(value, index)``,
-    ``SCAN(value)`` (the exclusive prefix sum) and ``RESERVE(counter, n)``, one
+    ``SCAN(value)`` (the exclusive prefix sum), ``RESERVE(counter, n)``, one
     atomic reservation of ``n`` slots for the group that returns its first slot
     to every lane (the lanes then take their slots in lane order, ``BELOW`` of
-    the vote). The exchanges stay within a warp: ``WIDTH`` lanes. The reductions
+    the vote), and ``ORDERED(base, take)``, the ordered reservation of a group
+    that owns its counter: the lanes that take a slot get ``base`` onwards in
+    lane order, and ``base`` advances past them. The exchanges stay within a
+    warp: ``WIDTH`` lanes. The reductions
     run a butterfly from the widest offset down, so every lane holds the result
     its lane 0 would get from a descending shuffle-down ladder, bit for bit;
     ``SUM`` reduces several channels in one ladder. On the CPU one thread runs
     the group: one lane, and every operation is that lane's own value.
+
+``ORDERED_TILES``
+    Ordered reservation across a launch's blocks (:mod:`newton._src.core.ordered_reserve`):
+    ``ORDERED_TILE(tile)`` (one block per tile) and ``ORDERED_NEXT(site, block, live_tiles, blocks)`` (a grid
+    striding over a device-side count) claim a tile in input order, ``ORDERED_SCAN(site, claim, count, last,
+    counter)`` gives every thread of the block its first slot in input order after the ``counter`` slots
+    already taken (a block scan and a decoupled look-back). Warp kernels call :func:`ordered_tile`,
+    :func:`ordered_next` and :func:`ordered_scan`, built from the same text.
 
 ``ring``
     A patch ring: contact normal rows linked into a circular list by their
@@ -53,6 +64,16 @@ from functools import cache
 from string import Template
 
 import warp as wp
+
+# The ordered mode of the L0 reservation, shared with the collision pipeline's writers.
+from ...core.ordered_reserve import (  # noqa: F401
+    ORDERED_CPU,
+    ORDERED_CUDA,
+    OrderedTiles,
+    ordered_next,
+    ordered_scan,
+    ordered_tile,
+)
 
 ARCHITECTURE_GUARD = "#if defined(__CUDA_ARCH__)\n"
 
@@ -196,6 +217,12 @@ _LANE_GROUP = """    const int LANES = $lanes, WIDTH = LANES < 32 ? LANES : 32;
         int first = 0;
         if (LANE == 0 && n != 0) first = atomicAdd(counter, n);
         return READ(first, 0);
+    };
+    const auto ORDERED = [&](int& base, bool take) -> int {
+        const unsigned votes = BALLOT(take);
+        const int slot = base + BELOW(votes);
+        base += COUNT(votes);
+        return slot;
     };"""
 
 # One thread runs the whole group on the CPU.
@@ -230,6 +257,11 @@ _LANE_GROUP_CPU = """    const int LANES = 1, WIDTH = 1;
         const int first = *counter;
         *counter += n;
         return first;
+    };
+    const auto ORDERED = [](int& base, bool take) -> int {
+        const int slot = base;
+        base += take ? 1 : 0;
+        return slot;
     };"""
 
 
@@ -271,6 +303,11 @@ RING = DevicePrelude("ring", _RING, _RING)
 """The patch ring's walks, ``RING_LOAD(load, first, hops, parent, value)`` and ``RING_ANY``, for native sources."""
 
 
+ORDERED_TILES = DevicePrelude("ordered_tiles", ORDERED_CUDA, ORDERED_CPU)
+"""Ordered reservation across a launch's blocks (``ORDERED_TILE``, ``ORDERED_NEXT``, ``ORDERED_SCAN``), for native
+sources; :class:`OrderedTiles` holds a call site's claim counter, epoch and tile states."""
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # Slot reservations
 # ---------------------------------------------------------------------------------------------------------------------
@@ -283,11 +320,20 @@ def reserve(counter: wp.array[int], index: int, n: int, capacity: int, first_rej
     The overflow contract of every row family: counters only grow, so the counter keeps the demand; a reservation
     that does not fit lowers ``first_rejected[index]`` (preset to a large value) to its first slot, and
     :func:`reserved_count` truncates the count there and raises the family's status, so no accepted reservation
-    holds a slot at or past the count and none is partial. Rows reserve in three ways under this contract: here,
-    one atomic per reservation; the lane group's ``RESERVE``, one atomic for a group's one-slot reservations, which
-    take their slots in lane order; and ordered placement, where one group places a world's rows at
-    ``base + BELOW(BALLOT(active))`` and writes the counter. A one-slot reservation past capacity starts at or
-    past it, so the last two need no first-rejected slot.
+    holds a slot at or past the count and none is partial. Slots are reserved in one of three modes under this
+    contract:
+
+    - *atomic*: this function, one atomic per reservation; slots follow the order in which threads reach the
+      counter;
+    - *warp-aggregated*: the lane group's ``RESERVE``, one atomic for a group's one-slot reservations, which take
+      their slots in lane order;
+    - *ordered*: slots in input order. A group that owns its counter places its lanes' slots with the lane
+      group's ``ORDERED(base, take)`` and writes the counter; blocks that share a counter claim tiles in input
+      order and scan them (:func:`ordered_tile` or :func:`ordered_next`, then :func:`ordered_scan`; natively
+      ``ORDERED_TILES``), so no output order depends on the GPU's scheduling.
+
+    A one-slot reservation past capacity starts at or past it, so the last two need no first-rejected slot; an
+    ordered reservation rejects the inputs last in input order.
     """
     slot = wp.atomic_add(counter, index, n)
     if slot + n > capacity:

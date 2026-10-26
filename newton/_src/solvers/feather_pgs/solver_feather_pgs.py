@@ -14894,12 +14894,8 @@ def _get_build_independent_sparse_contact_groups_kernel(
     for (int coordinate_base = 0; coordinate_base < {D}; coordinate_base += 32) {{
         const int coordinate = coordinate_base + lane;
         const int head = coordinate < {D} ? group_heads.data[head_base + coordinate] : -1;
-        const unsigned active = BALLOT(head >= 0);
-        if (head >= 0) {{
-            const int output = count + BELOW(active);
-            group_heads.data[head_base + output] = head;
-        }}
-        count += COUNT(active);
+        const int output = ORDERED(count, head >= 0);
+        if (head >= 0) group_heads.data[head_base + output] = head;
         SYNC();
     }}
     if (lane == 0) group_count.data[world] = count;
@@ -15016,10 +15012,8 @@ def _list_serial_contacts_source(*, count: str, stride: int, head: str, serial_c
             const int coord_1 = sparse_row_dof.data[sparse_row + 1];
             serial = ({head}) && !(coord_0 < -1 || coord_1 < -1);
         }}
-        const unsigned serial_lanes = BALLOT(serial);
-        if (serial)
-            serial_normals.data[world * {serial_capacity} + serial_count + BELOW(serial_lanes)] = normal;
-        serial_count += COUNT(serial_lanes);
+        const int serial_slot = ORDERED(serial_count, serial);
+        if (serial) serial_normals.data[world * {serial_capacity} + serial_slot] = normal;
     }}
     if (lane == 0) serial_count_out.data[world] = serial_count;
 """
@@ -15165,12 +15159,8 @@ def _build_independent_sparse_contact_units_kernel(M: int, D: int, build_serial_
     for (int coordinate_base = 0; coordinate_base < {D}; coordinate_base += 32) {{
         const int coordinate = coordinate_base + lane;
         const int head = coordinate < {D} ? group_heads.data[head_base + coordinate] : -1;
-        const unsigned active = BALLOT(head >= 0);
-        if (head >= 0) {{
-            const int output = count + BELOW(active);
-            group_heads.data[head_base + output] = head;
-        }}
-        count += COUNT(active);
+        const int output = ORDERED(count, head >= 0);
+        if (head >= 0) group_heads.data[head_base + output] = head;
         SYNC();
     }}
     if (lane == 0) group_count.data[world] = count;
@@ -16391,19 +16381,13 @@ def _get_pgs_solve_mf_gs_incremental_kernel(
             else if (row_type == {T_VLIM}) kind = 2;
             else if (row_type == 1) kind = 3;
         }}
-        const unsigned admit_mask = BALLOT(admit != 0);
-        const unsigned vlim_mask = BALLOT(vlim != 0);
+        const int admit_slot = ORDERED(n_active, admit != 0);
+        const int vlim_slot = ORDERED(n_vlim, vlim != 0);
         if (admit) {{
-            const int slot = n_active + BELOW(admit_mask);
-            s_rows[slot] = row;
-            s_kind[slot] = kind;
+            s_rows[admit_slot] = row;
+            s_kind[admit_slot] = kind;
         }}
-        if (vlim) {{
-            const int slot = n_vlim + BELOW(vlim_mask);
-            s_vlim_rows[slot] = row;
-        }}
-        n_active += COUNT(admit_mask);
-        n_vlim += COUNT(vlim_mask);
+        if (vlim) s_vlim_rows[vlim_slot] = row;
     }}
 
     // Store each impulse's response contiguously: A[i][r] = J_r . Y_i.
