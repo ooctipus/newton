@@ -32,8 +32,9 @@ import warp as wp
 
 from ...sim import BodyFlags
 from .law_source import LawFamily
+from .spatial_laws import SPATIAL, point_velocity
 
-CONTACT_LAW = LawFamily("ContactLaw")
+CONTACT_LAW = LawFamily("ContactLaw", requires=(SPATIAL,))
 """The contact front end's family; native code calls ``ContactLaw::contact_points(...)``."""
 
 CONTACT_WORLDS_DIFFER = wp.constant(-2)
@@ -358,11 +359,9 @@ def jacobian_entry(motion: wp.spatial_vector, direction: wp.vec3, point: wp.vec3
 
     ``motion`` is a motion subspace column (or a body twist) about ``origin``,
     linear part first; the entry is the velocity of ``point`` along ``direction``
-    that a unit rate of the column produces.
+    that a unit rate of the column produces (:func:`.spatial_laws.point_velocity`).
     """
-    linear = wp.vec3(motion[0], motion[1], motion[2])
-    angular = wp.vec3(motion[3], motion[4], motion[5])
-    return wp.dot(direction, linear + wp.cross(angular, point - origin))
+    return wp.dot(direction, point_velocity(motion, point - origin))
 
 
 @CONTACT_LAW.law

@@ -242,7 +242,7 @@ from .solver_fields import (
     DOF_WORK,
     DRIVE_SLOTS,
     FUSED_DIAGONAL_LIMITS,
-    JOINT_DFS,
+    JOINT_FOREST,
     MF_BODY_MAP,
     MF_CONTACT_UNITS,
     MF_COUNTERS,
@@ -285,9 +285,9 @@ from .sparse_contact import (
 )
 from .sparse_mass_matrix import (
     _get_crba_sparse_factor_kernel,
-    _SparseMassMatrixPlan,
     _SparseRowSupport,
-    _SparseRowSupportPlan,
+    factor_indices,
+    row_supports,
     solve_sparse_mass_matrix,
 )
 from .sparse_pgs import (
@@ -313,7 +313,7 @@ from .tree_passes import (
     refresh_body_inertia,
     selected_inverse_dynamics_tau,
 )
-from .tree_plan import TreePlan
+from .tree_plan import TreePlan, local_parents
 from .velocity_limit_law import check_velocity_limit_law, velocity_limit_law_suffix
 
 _FK_ID_CACHE_OFF = os.environ.get("FEATHER_PGS_FK_ID_CACHE", "1") == "0"
@@ -782,6 +782,18 @@ class _FeatherPGSTreeGroup:
     """Offsets into the child-segment list for backward reductions."""
     child_segments: wp.array[int]
     """Child segments in descending authored joint order, preserving force sums."""
+
+
+def _joint_forest(model: Model) -> TreePlan:
+    """The forest of the model's articulation joints by their ancestry (``Model.joint_ancestor``); a joint
+    outside every articulation, a loop closure, stands alone."""
+    if not model.joint_count:
+        return TreePlan.build(np.zeros(0, dtype=np.int32))
+    member = model.joint_articulation.numpy() >= 0
+    try:
+        return TreePlan.build(np.where(member, model.joint_ancestor.numpy(), -1))
+    except ValueError as error:
+        raise ValueError(f"SolverFeatherPGS: the model's joint ancestry is not a forest ({error})") from error
 
 
 @dataclass(frozen=True)
@@ -2435,6 +2447,8 @@ class SolverFeatherPGS(SolverBase):
             self._allocate_state_aux_vars(model, self, False)
 
         self._model_plan: _FeatherPGSModelPlan | None = None
+        # The model's joint forest (Model.joint_ancestor): conditioning depths, body maps, CRBA's ancestor test.
+        self._joint_forest = _joint_forest(model)
         self._kinematic_joint_mask = wp.zeros(model.joint_count, dtype=wp.int32, device=model.device)
         self._kinematic_dof_mask = wp.zeros(model.joint_dof_count, dtype=wp.int32, device=model.device)
         self._apply_kinematic_state(self._kinematic_state())
@@ -3438,7 +3452,7 @@ class SolverFeatherPGS(SolverBase):
                         "A prescribed-response articulation changed kinematic membership; "
                         "reconstruct the solver and recapture its CUDA graph."
                     )
-        armature, floor = conditioning_armature(model, armature)
+        armature, floor = conditioning_armature(model, armature, self._joint_forest)
         return armature, joint_mask, dof_mask, floor
 
     def _apply_kinematic_state(self, kinematic: tuple[np.ndarray, np.ndarray, np.ndarray, ArmatureFloor]) -> None:
@@ -4595,22 +4609,13 @@ class SolverFeatherPGS(SolverBase):
 
             if compatible:
                 reference_offsets = offsets[0]
-                reference_parents = parents[0]
-                ancestor_sets = []
-                for joint_offset in reference_offsets:
-                    ancestors = set()
-                    current = int(joint_offset)
-                    while current >= 0:
-                        ancestors.add(current)
-                        current = int(reference_parents[current])
-                    ancestor_sets.append(ancestors)
-                sources = np.full((int(size), int(size)), -1, dtype=np.int32)
-                for row in range(int(size)):
-                    for col in range(int(size)):
-                        if int(reference_offsets[row]) in ancestor_sets[col]:
-                            sources[row, col] = col
-                        elif int(reference_offsets[col]) in ancestor_sets[row]:
-                            sources[row, col] = row
+                # Entry (row, col) is the inertia of the deeper of two related coordinates' joints, read at its
+                # column: col's when row's joint is col's or an ancestor of it, else row's when the reverse holds.
+                related = TreePlan.build(parents[0]).ancestor_matrix()[np.ix_(reference_offsets, reference_offsets)]
+                coordinates = np.arange(int(size), dtype=np.int32)
+                sources = np.where(related.T, coordinates[None, :], np.where(related, coordinates[:, None], -1)).astype(
+                    np.int32
+                )
                 if np.count_nonzero(sources >= 0) == int(size) and np.all(np.diag(sources) >= 0):
                     diagonal_mass_sizes.add(int(size))
                     # Direct when each DOF's child body has that DOF as its single
@@ -4626,14 +4631,12 @@ class SolverFeatherPGS(SolverBase):
                     reference_offsets, dtype=wp.int32, device=model.device
                 )
                 self._crba_source_dof_by_size[int(size)] = wp.array(sources, dtype=wp.int32, device=model.device)
-                lower_schedule = []
-                for row in range(int(size)):
-                    for col in range(row + 1):
-                        source = int(sources[row, col])
-                        projection = row if source == col else col
-                        lower_schedule.append(row * int(size) + col | (source + 1) << 8 | projection << 16)
+                rows, cols = np.tril_indices(int(size))
+                source = sources[rows, cols]
+                projection = np.where(source == cols, rows, cols)
+                lower_schedule = rows * int(size) + cols | (source + 1) << 8 | projection << 16
                 self._crba_lower_schedule_by_size[int(size)] = wp.array(
-                    np.asarray(lower_schedule, dtype=np.int32), dtype=wp.int32, device=model.device
+                    lower_schedule.astype(np.int32), dtype=wp.int32, device=model.device
                 )
 
         self._diagonal_mass_sizes = frozenset(diagonal_mass_sizes)
@@ -4793,9 +4796,10 @@ class SolverFeatherPGS(SolverBase):
         art = int(self.group_to_art[size].numpy()[0])
         start = int(articulation_start[art])
         end = int(self._model_plan.articulation_joint_end[art])
-        parents = joint_ancestor[start:end].astype(np.int32, copy=True)
-        parents = np.where(parents >= start, parents - start, -1)
-        plan = _SparseMassMatrixPlan.build(parents, np.diff(joint_qd_start[start : end + 1]))
+        tree = TreePlan.build(
+            local_parents(joint_ancestor, [start], end - start)[0], np.diff(joint_qd_start[start : end + 1])
+        )
+        plan = tree.factor
         # Velocity rows can benefit from factor-coordinate response even for a
         # serial chain; this owner does not require zeros in the mass factor.
         if plan.dof_count != size or (not velocity_candidate and plan.nonzero_count >= size * (size + 1) // 2):
@@ -4897,7 +4901,7 @@ class SolverFeatherPGS(SolverBase):
         self._double_buffer = False
         self._local_internal_fast_path = False
         self._sparse_mass_matrix_plan = plan
-        self._sparse_mass_matrix_indices = plan.to_device(model.device)
+        self._sparse_mass_matrix_indices = factor_indices(plan, model.device)
         self._sparse_body_dof_mask = wp.array(body_masks, dtype=wp.uint64, device=model.device)
         self._arrays.allocate(SPARSE_FACTOR, group=self.n_arts_by_size[size], nonzero=plan.nonzero_count, size=size)
         shape = (self.world_count, self.dense_max_constraints, max_support)
@@ -4909,17 +4913,16 @@ class SolverFeatherPGS(SolverBase):
             and size == self.max_world_dofs
             and np.all(offsets[articulated] == 0)
         ):
-            support_plan = _SparseRowSupportPlan.build(plan, body_masks, max_row_dofs=max_support)
-            if support_plan is not None:
+            classes = tree.support_classes(body_masks, max_support)
+            if classes is not None:
                 table_bytes = sum(
-                    getattr(support_plan, name).nbytes
-                    for name in ("body_class", "pair_class", "class_dof", "limit_class")
+                    getattr(classes, name).nbytes for name in ("body_class", "pair_class", "class_dof", "limit_class")
                 )
                 table_bytes += 4 * self.world_count * self.dense_max_constraints
                 # Small batches with many support patterns can favor direct indices.
                 if table_bytes < 4 * int(np.prod(shape)):
-                    self._sparse_row_support = support_plan.to_device(
-                        self.world_count, self.dense_max_constraints, model.device
+                    self._sparse_row_support = row_supports(
+                        classes, self.world_count, self.dense_max_constraints, model.device
                     )
         # Unsupported mixed worlds retain explicit row indices and their existing kernels.
         use_support_table = bool(self._sparse_row_support.enabled)
@@ -5218,13 +5221,6 @@ class SolverFeatherPGS(SolverBase):
             self._body_single_response_dof_host = None
             return
 
-        joint_child = model.joint_child.numpy()
-        joint_ancestor = model.joint_ancestor.numpy()
-        joint_qd_start = model.joint_qd_start.numpy()
-        articulation_start = model.articulation_start.numpy()
-        articulation_dof_start = self._model_plan.articulation_dof_start
-        response_dof_count = self._model_plan.response_dof_count
-
         (
             body_to_joint,
             body_to_articulation,
@@ -5233,13 +5229,13 @@ class SolverFeatherPGS(SolverBase):
             body_single_response_dof,
         ) = build_body_maps(
             model.body_count,
-            joint_child,
-            joint_ancestor,
-            joint_qd_start,
-            articulation_start,
+            model.joint_child.numpy(),
+            self._joint_forest,
+            model.joint_qd_start.numpy(),
+            model.articulation_start.numpy(),
             self._model_plan.articulation_joint_end,
-            articulation_dof_start,
-            response_dof_count,
+            self._model_plan.articulation_dof_start,
+            self._model_plan.response_dof_count,
         )
 
         self._arrays.upload(
@@ -5410,18 +5406,19 @@ class SolverFeatherPGS(SolverBase):
             return None
         return int(diagonal_size[0]), int(dense_size[0]), dense_offsets, dense_groups
 
-    def _allocate_joint_dfs_intervals(self, model: Model) -> None:
+    def _upload_joint_forest(self, model: Model) -> None:
         """Upload the joint forest's depth-first order, positions and subtree ends (``tree_passes.crba_fill``'s
-        ancestor test, :class:`.tree_plan.TreePlan`)."""
+        ancestor test) and its up flags (the up scans', :attr:`.tree_plan.TreePlan.up_flags`)."""
         if not model.joint_count:
-            self._joint_dfs_order = self._joint_dfs_position = self._joint_dfs_end = None
+            self._arrays.release(JOINT_FOREST)
             return
-        plan = TreePlan.build(model.joint_ancestor.numpy())
+        forest = self._joint_forest
         self._arrays.upload(
-            JOINT_DFS,
-            _joint_dfs_order=plan.dfs_order,
-            _joint_dfs_position=plan.dfs_position,
-            _joint_dfs_end=plan.dfs_end,
+            JOINT_FOREST,
+            _joint_dfs_order=forest.dfs_order,
+            _joint_dfs_position=forest.dfs_position,
+            _joint_dfs_end=forest.dfs_end,
+            _joint_up_flags=forest.up_flags,
         )
 
     def _allocate_common_buffers(self, model):
@@ -5458,7 +5455,7 @@ class SolverFeatherPGS(SolverBase):
 
         if model.body_count:
             arrays.allocate(BODY_INERTIA, body=model.body_count)
-            self._allocate_joint_dfs_intervals(model)
+            self._upload_joint_forest(model)
             wp.launch(
                 compute_com_transforms,
                 model.body_count,

@@ -34,8 +34,10 @@ mass ``c`` relative to the origin, and the rotational inertia about the
 origin, ``R I R^T + m (|c|^2 1 - c c^T)``. The three are linear in the body,
 so a subtree's composite inertia is the channel-wise sum of its bodies' (13
 channels, the tree scans' add combine). :func:`inertia_at` places a body's
-inertia, :func:`inertia_apply` maps a twist to the momentum wrench and
-:func:`inertia_matrix` packs the dense 6x6 matrix for consumers that read one.
+inertia, :func:`inertia_apply` maps a twist to the momentum wrench,
+:func:`inertia_matrix` packs the dense 6x6 matrix for consumers that read one
+and :func:`body_wrench` is a body's inverse-dynamics wrench, Newton-Euler at
+its center of mass moved to the origin.
 
 **Joints.** :func:`joint_transform` is a joint's transform for every joint
 type, :func:`axis_transform` its one-axis case and :func:`motion_axis` one
@@ -147,17 +149,6 @@ def free_root_transport(linear: wp.vec3, angular: wp.vec3) -> wp.vec3:
     return wp.cross(angular, linear)
 
 
-@SPATIAL.law
-def cross_wrench(twist: wp.spatial_vector, wrench: wp.spatial_vector) -> wp.spatial_vector:
-    """Return ``twist x* wrench``, ``(w x f, w x t + v x f)``: the rate at which a frame moving with ``twist``
-    turns a fixed ``wrench`` (a body's gyroscopic wrench is its twist crossed with its momentum)."""
-    linear = wp.spatial_top(twist)
-    angular = wp.spatial_bottom(twist)
-    force = wp.spatial_top(wrench)
-    torque = wp.spatial_bottom(wrench)
-    return wp.spatial_vector(wp.cross(angular, force), wp.cross(angular, torque) + wp.cross(linear, force))
-
-
 # ---------------------------------------------------------------------------------------------------------------------
 # Inertia: (mass, first moment, rotational inertia) about the origin
 # ---------------------------------------------------------------------------------------------------------------------
@@ -247,6 +238,35 @@ def inertia_matrix(mass: float, moment: wp.vec3, rotational: wp.mat33) -> wp.spa
 def inertia_action(rotation: wp.quat, inertia: wp.mat33, vector: wp.vec3) -> wp.vec3:
     """Return a body-frame ``inertia`` applied to a world-frame ``vector``: ``R (I (R^T vector))``."""
     return wp.quat_rotate(rotation, inertia * wp.quat_rotate_inv(rotation, vector))
+
+
+@SPATIAL.law
+def body_wrench(
+    mass: float,
+    rotation: wp.quat,
+    inertia: wp.mat33,
+    offset: wp.vec3,
+    velocity: wp.spatial_vector,
+    acceleration: wp.spatial_vector,
+    gravity: wp.vec3,
+) -> wp.spatial_vector:
+    """Return a body's inverse-dynamics wrench about the origin: its momentum rate at its twist ``velocity``
+    and bias ``acceleration``, less its weight.
+
+    ``inertia`` is the body-frame inertia about the center of mass, ``rotation``
+    the body's orientation and ``offset`` its center of mass relative to the
+    origin. Newton-Euler at the center of mass, ``f = m (a_c + w x v_c - g)``
+    and ``t_c = I alpha + w x (I w)``, with ``v_c`` and ``a_c`` the velocity and
+    acceleration of the center of mass (:func:`point_velocity`), moved to the
+    origin (:func:`wrench_shift`).
+    """
+    angular = wp.spatial_bottom(velocity)
+    velocity_com = point_velocity(velocity, offset)
+    force = mass * (point_velocity(acceleration, offset) + wp.cross(angular, velocity_com) - gravity)
+    torque = inertia_action(rotation, inertia, wp.spatial_bottom(acceleration)) + wp.cross(
+        angular, inertia_action(rotation, inertia, angular)
+    )
+    return wrench_shift(wp.spatial_vector(force, torque), offset)
 
 
 INERTIA_CHANNELS = 13

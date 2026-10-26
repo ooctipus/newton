@@ -9,6 +9,8 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import cached_force
+from newton._src.solvers.feather_pgs.device_preludes import dual_native
+from newton._src.solvers.feather_pgs.spatial_laws import SPATIAL
 
 
 def make_probe():
@@ -21,7 +23,7 @@ def make_probe():
         damping="damping.data",
         dt="dt",
     )
-    source = "float wrench[6]={};\n"
+    source = dual_native("float wrench[6]={};\n", preludes=SPATIAL.preludes())
     source += cached_force.shift_wrench("external.data[0]", "offset.data[0]", "wrench[k]", "wrench[k+3]")
     source += "float value=0.0f;\n"
     source += cached_force.project_wrench("axes.data[0]", "wrench[k]", "value")

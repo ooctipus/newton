@@ -71,7 +71,7 @@ from .device_preludes import DevicePrelude, device_branches, dual_native, lane_g
 from .field_group import Field
 from .law_source import law_preludes
 from .spatial_laws import SPATIAL, transform_compose, twist_compose
-from .tree_plan import TreePlan
+from .tree_plan import UP_FIRST, UP_SUMS, TreePlan
 
 __all__ = [
     "INERTIA",
@@ -929,7 +929,7 @@ def tree_scan(
 
 
 @functools.cache
-def serial_scan(combine: Combine, direction: Direction, own, result=None, *, own_first: bool = False):
+def serial_scan(combine: Combine, direction: Direction, own, result=None, *, store_total: bool = False):
     """Return the Warp serial schedule of ``combine``: one thread visits a joint range once, node by node.
 
     The scans are differentiable by Warp's tape (checked against central differences).
@@ -945,51 +945,47 @@ def serial_scan(combine: Combine, direction: Direction, own, result=None, *, own
     differentiable: Warp's tape replays the loop body backwards, where the node replayed before a node is the
     one after it in parent-first order, never its parent, so the replay reads the parent from memory.
 
-    ``UP`` (:func:`add`), visiting the range backwards so that every child precedes its parent:
+    ``UP`` (:func:`add`), visiting the range backwards so that every child precedes its parent, with each
+    node's :attr:`.tree_plan.TreePlan.up_flags` in ``flags``: a node's value is ``own(node, children, data)``,
+    ``children`` the sum its children left at its slot (zero at a leaf); the first child the walk visits stores
+    its value at its parent's slot and later siblings add theirs; the value is handed to ``result``. With
+    ``store_total`` the node's slot then holds its value, else its children's sum (a leaf stores its zero).
 
-    * ``own_first=False``: a first pass zeroes every slot, which then holds the sums of the children visited
-      so far; a node's value is ``own(node, children, data)``, added to its parent's slot and handed to
-      ``result``; its own slot keeps its children's sum;
-    * ``own_first=True``: a first pass stores ``own(node, data)`` at every slot, then each node's slot is added
-      to its parent's, children descending, by an atomic add (the parent's value never enters registers).
-
-    Each form reproduces the order of the serial passes it replaces, and each leaves memory as its first run
-    did when run again: Warp's tape replays a calling function's forward, stores and all, before the adjoint
-    of the scan reads the sums back, so an up scan sets its slots itself rather than adding to what it finds.
+    Each form sets every slot it reads, so it leaves memory as its first run did when run again: Warp's tape
+    replays a calling function's forward, stores and all, before the adjoint of the scan reads the sums back.
     """
     has_result = result is not None
     if direction is Direction.UP:
         if not combine.additive:
             raise ValueError("A leaf-to-root scan sums its values: it takes an additive combine")
-        if own_first:
-
-            @wp.func
-            def scan_up_own_first(
-                start: int, end: int, parent: wp.array[int], slot: wp.array[int], values: wp.array[Any], data: Any
-            ):
-                for node in range(start, end):
-                    values[slot[node]] = own(node, data)
-                for offset in range(end - start):
-                    node = end - 1 - offset
-                    up = parent[node]
-                    if up >= 0:
-                        # An atomic add: the parent's value is never read into registers.
-                        values[up] += values[slot[node]]
-                    if wp.static(has_result):
-                        result(node, values[slot[node]], data)
-
-            return scan_up_own_first
 
         @wp.func
-        def scan_up(start: int, end: int, parent: wp.array[int], slot: wp.array[int], values: wp.array[Any], data: Any):
-            for node in range(start, end):
-                values[slot[node]] = values.dtype(0.0)
+        def scan_up(
+            start: int,
+            end: int,
+            parent: wp.array[int],
+            slot: wp.array[int],
+            flags: wp.array[int],
+            values: wp.array[Any],
+            data: Any,
+        ):
             for offset in range(end - start):
                 node = end - 1 - offset
-                value = own(node, values[slot[node]], data)
+                meet = flags[node]
+                children = values.dtype(0.0)
+                if (meet & UP_SUMS) != 0:
+                    children = values[slot[node]]
+                elif wp.static(not store_total):
+                    values[slot[node]] = children
+                value = own(node, children, data)
+                if wp.static(store_total):
+                    values[slot[node]] = value
                 up = parent[node]
                 if up >= 0:
-                    values[up] = values[up] + value
+                    if (meet & UP_FIRST) != 0:
+                        values[up] = value
+                    else:
+                        values[up] = values[up] + value
                 if wp.static(has_result):
                     result(node, value, data)
 

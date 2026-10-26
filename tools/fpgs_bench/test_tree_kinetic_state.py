@@ -15,7 +15,7 @@ import newton
 from newton._src.solvers.feather_pgs import tree_kinetic_state
 from newton._src.solvers.feather_pgs import tree_scan as ts
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
-from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseMassMatrixPlan
+from newton._src.solvers.feather_pgs.sparse_mass_matrix import factor_indices
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
 from newton._src.solvers.feather_pgs.tree_kinetic_sparse import TreeSparseOperator
@@ -84,10 +84,10 @@ def fixture(floating, device):
     with patch.dict(os.environ, {"FEATHER_PGS_TREE_KINETIC_STATE": "0"}):
         solver, reference = (SolverFeatherPGS(model, **options) for _ in range(2))
     count = model.joint_dof_count // 2
-    mass = _SparseMassMatrixPlan.build(parents, np.diff(model.joint_qd_start.numpy())[: len(parents)])
+    mass = TreePlan.build(parents, np.diff(model.joint_qd_start.numpy())[: len(parents)]).factor
     solver._sparse_mass_matrix_size = count
     solver._sparse_mass_matrix_plan = mass
-    solver._sparse_mass_matrix_indices = mass.to_device(device)
+    solver._sparse_mass_matrix_indices = factor_indices(mass, device)
     solver._sparse_Linv = wp.zeros((2, mass.nonzero_count), dtype=float, device=device)
     solver._sparse_mass_matrix_status = wp.zeros(2, dtype=int, device=device)
     solver._sparse_factor_warps_per_block = 4

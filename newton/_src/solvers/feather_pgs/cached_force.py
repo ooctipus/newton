@@ -13,16 +13,15 @@ from dataclasses import dataclass
 
 
 def shift_wrench(external, offset, linear, angular):
-    """Shift a COM wrench to the current articulation origin and store it.
+    """Shift a COM wrench to the current articulation origin (:func:`.spatial_laws.wrench_shift`) and store it.
 
-    Output expressions use component index ``k``. The owner supplies the
-    current COM offset, including for independent free roots.
+    ``external`` is a ``wp::spatial_vector`` expression. Output expressions use
+    component index ``k``. The owner supplies the current COM offset, including
+    for independent free roots, and the spatial kit's preludes.
     """
     return f"""{{
-        const auto external_force={external};
-        const wp::vec3 force(external_force[0],external_force[1],external_force[2]);
-        const wp::vec3 torque=wp::vec3(external_force[3],external_force[4],external_force[5])+wp::cross({offset},force);
-        for(int k=0;k<3;++k){{{linear}=force[k];{angular}=torque[k];}}
+        const wp::spatial_vector shifted=Spatial::wrench_shift({external},{offset});
+        for(int k=0;k<3;++k){{{linear}=shifted[k];{angular}=shifted[3+k];}}
     }}\n"""
 
 
@@ -71,7 +70,7 @@ class ForceOperands:
         return f"{self.predictor_qd}[{dof}]+{self.dt}*{acceleration}"
 
     def transport(self, first_dof, output):
-        """Add free-root transport; the owner guards prescribed roots.
+        """Add free-root transport (:func:`.spatial_laws.free_root_transport`); the owner guards prescribed roots.
 
         Output is a component expression using ``k`` and may address scratch
         for deferred publication or the owner's existing output bank.
@@ -80,6 +79,6 @@ class ForceOperands:
         return f"""{{
             const wp::vec3 v({qd}[{d}],{qd}[{d}+1],{qd}[{d}+2]);
             const wp::vec3 w({qd}[{d}+3],{qd}[{d}+4],{qd}[{d}+5]);
-            const auto c=wp::cross(w,v);
+            const wp::vec3 c=Spatial::free_root_transport(v,w);
             for(int k=0;k<3;++k){output}+=c[k]*{self.dt};
         }}\n"""

@@ -6,7 +6,6 @@
 import numpy as np
 
 from ...sim import BodyFlags, JointType
-from .sparse_mass_matrix import _SparseMassMatrixPlan
 from .tree_kinetic_layout import TreeLayout
 from .tree_plan import TreePlan
 
@@ -127,7 +126,8 @@ def make_plan(model, operator, *, complete=True):
             # serves it as above, although a new plan would refuse it here.
             if families[r] != 0 and np.any(kinematic[:, root]):
                 raise ValueError("A dynamic forest root must not be kinematic")
-    mass = _SparseMassMatrixPlan.build(parent, counts[0])
+    tree = TreePlan.build(parent, counts[0])
+    mass = tree.factor
     if not np.array_equal(mass.lookup, operator.host["index"]) or not np.array_equal(
         mass.dof_joint, operator.host["dof_joint"]
     ):
@@ -138,7 +138,7 @@ def make_plan(model, operator, *, complete=True):
         dofs,
         mass.nonzero_count,
         operator.host["inverse_nodes"].shape[1],
-        TreePlan.build(parent).max_depth,
+        tree.max_depth,
         int(counts[0, 0]),
         tuple(map(int, mass.permutation)),
         roots=root_locals,

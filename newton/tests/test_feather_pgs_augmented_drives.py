@@ -18,6 +18,7 @@ from newton._src.solvers.feather_pgs.kernels import (
 )
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _prepare_augmented_joint_drives_by_dof
 from newton._src.solvers.feather_pgs.tree_passes import DynamicsData, inverse_dynamics_tau
+from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 
 
 def _mixed_target_model(coord_layout, device):
@@ -193,6 +194,9 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                             body_ft_s=wp.zeros_like(body_forces),
                             tau=tau,
                             row_K=row_K,
+                            up_flags=wp.array(
+                                TreePlan.build(model.joint_ancestor.numpy()).up_flags, dtype=int, device=device
+                            ),
                         )
                         wp.launch(
                             eval_rigid_tau_and_augmented_drives,
@@ -269,6 +273,7 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
         joint_parent = wp.array([-1, 0], dtype=wp.int32, device=device)
         joint_child = wp.array([0, 1], dtype=wp.int32, device=device)
         joint_articulation = wp.zeros(2, dtype=wp.int32, device=device)
+        up_flags = wp.array(TreePlan.build([-1, 0]).up_flags, dtype=int, device=device)
         joint_start = wp.array([0, 1], dtype=wp.int32, device=device)
         joint_dof_dim = wp.array([[0, 1], [0, 1]], dtype=wp.int32, device=device)
         joint_f = wp.array([0.4, -0.2], dtype=wp.float32, device=device)
@@ -338,6 +343,7 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                 tau=tau,
                 row_K=row_K if row_K is not None else wp.zeros(1, dtype=wp.float32, device=device),
                 add_existing_tau=add_existing_tau,
+                up_flags=up_flags,
             )
 
         sequential_body_ft = wp.zeros(2, dtype=wp.spatial_vector, device=device)

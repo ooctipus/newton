@@ -247,7 +247,7 @@ def test_compose_laws(test, device):
 
 
 def test_twist_and_wrench_laws(test, device):
-    """Frame changes, point velocities, wrench shifts, the transport and the dual cross product."""
+    """Frame changes, point velocities, wrench shifts and the transport."""
     rng = np.random.default_rng(2)
     frame = _value(wp.transform, rng, N)
     twist = rng.standard_normal((N, 6)).astype(np.float32)
@@ -271,15 +271,6 @@ def test_twist_and_wrench_laws(test, device):
     w3 = wp.array(twist[:, 3:], dtype=wp.vec3, device=device)
     (got,) = _kernel("transport", spatial_laws.free_root_transport, [v3, w3], [wp.vec3], device)
     _close(test, got, np.cross(twist[:, 3:], twist[:, :3]), 4.0, 4.0, "free_root_transport")
-    (got,) = _kernel("cross_wrench", spatial_laws.cross_wrench, [t, w], [wp.spatial_vector], device)
-    expected = np.concatenate(
-        [
-            np.cross(twist[:, 3:], wrench[:, :3]),
-            np.cross(twist[:, 3:], wrench[:, 3:]) + np.cross(twist[:, :3], wrench[:, :3]),
-        ],
-        axis=1,
-    )
-    _close(test, got, expected, 4.0, 8.0, "cross_wrench")
 
 
 def test_inertia_laws(test, device):
@@ -321,6 +312,38 @@ def test_inertia_laws(test, device):
     (got,) = _kernel("inertia_action", spatial_laws.inertia_action, [q, i3, o], [wp.vec3], device)
     expected = np.einsum("nij,njk,nlk,nl->ni", R, inertia, R, c)
     _close(test, got, expected, 8.0 * np.abs(expected).max(), 8.0, "inertia_action")
+    # The inverse-dynamics wrench, Newton-Euler at the center of mass, against the spatial algebra at the
+    # origin: I a + v x* (I v) - (m g, c x m g), with I the float64 placed inertia.
+    acceleration = rng.standard_normal((N, 6)).astype(np.float32)
+    gravity = rng.standard_normal((N, 3)).astype(np.float32)
+    placed = np.einsum("nij,njk,nlk->nil", R, inertia, R) + mass[:, None, None] * (
+        np.einsum("ni,ni->n", c, c)[:, None, None] * np.eye(3) - np.einsum("ni,nj->nij", c, c)
+    )
+    spatial = np.zeros((N, 6, 6))
+    spatial[:, :3, :3] = mass[:, None, None] * np.eye(3)
+    spatial[:, :3, 3:] = -_skew(mass[:, None] * c)
+    spatial[:, 3:, :3] = _skew(mass[:, None] * c)
+    spatial[:, 3:, 3:] = placed
+    momentum = np.einsum("nij,nj->ni", spatial, twist)
+    gyroscopic = np.concatenate(
+        [
+            np.cross(twist[:, 3:], momentum[:, :3]),
+            np.cross(twist[:, 3:], momentum[:, 3:]) + np.cross(twist[:, :3], momentum[:, :3]),
+        ],
+        axis=1,
+    )
+    weight = mass[:, None] * gravity
+    expected = (
+        np.einsum("nij,nj->ni", spatial, acceleration)
+        + gyroscopic
+        - np.concatenate([weight, np.cross(c, weight)], axis=1)
+    )
+    a = wp.array(acceleration, dtype=wp.spatial_vector, device=device)
+    g = wp.array(gravity, dtype=wp.vec3, device=device)
+    (got,) = _kernel("body_wrench", spatial_laws.body_wrench, [m, q, i3, o, tw, a, g], [wp.spatial_vector], device)
+    # The terms' size: the inertia times the acceleration, the velocity squared and gravity.
+    terms = np.abs(acceleration).max(axis=1) + (1.0 + np.abs(twist).max(axis=1)) ** 2 + np.abs(gravity).max(axis=1)
+    _close(test, got, expected, np.abs(spatial).max(axis=(1, 2))[:, None] * terms[:, None], 16.0, "body_wrench")
 
 
 @wp.kernel(enable_backward=False)

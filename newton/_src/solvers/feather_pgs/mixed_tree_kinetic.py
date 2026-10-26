@@ -13,10 +13,10 @@ from . import host_index
 from .device_proof import DeviceProof
 from .small_cholesky import geometric_kernel
 from .sparse_factor import bind_operator_plan, operator_metadata
-from .sparse_mass_matrix import _SparseMassMatrixPlan
 from .tree_kinetic_owner import TreeKineticState, kernel_switches, launch_switches, proof_runs
 from .tree_kinetic_plan import make_plan
 from .tree_kinetic_state import HeldResponse
+from .tree_plan import TreePlan, local_parents
 
 
 @wp.kernel(enable_backward=False)
@@ -157,8 +157,7 @@ class TreeHeldOperator:
         group = solver.group_to_art[size].numpy()
         starts = model.articulation_start.numpy()
         first, end = starts[group[0]], starts[group[0] + 1]
-        ancestors = model.joint_ancestor.numpy()[first:end]
-        parents = np.where(ancestors < 0, -1, ancestors - first)
+        parents = local_parents(model.joint_ancestor.numpy(), [first], end - first)[0]
         counts = np.diff(model.joint_qd_start.numpy())[first:end]
         root_type = model.joint_type.numpy()[first]
         fixed_root = counts[0] == 0 and root_type in (int(JointType.FIXED), int(JointType.D6))
@@ -168,16 +167,13 @@ class TreeHeldOperator:
         if not (fixed_root or free_root):
             raise ValueError("Mixed held tree groups require fixed or free roots")
         self.free_root = bool(free_root)
-        mass = self.mass = _SparseMassMatrixPlan.build(parents, counts)
+        mass = self.mass = TreePlan.build(parents, counts).factor
         if mass.dof_count != size:
             raise ValueError("Mixed tree physical and factor dimensions differ")
         self.host = operator_metadata(mass)
         self.plan = bind_operator_plan(solver, size, self.host)
         self.layout, _ = make_plan(model, self, complete=False)
-        physical_index = np.full((size, size), -1, np.int32)
-        for index, (row, col) in enumerate(zip(mass.entry_rows, mass.columns, strict=True)):
-            a, b = mass.permutation[row], mass.permutation[col]
-            physical_index[a, b] = physical_index[b, a] = index
+        physical_index = mass.physical_lookup
         self.diagonal = size == solver._compact_diagonal_mass_size
         if self.diagonal and mass.nonzero_count != size:
             raise ValueError("Compact diagonal cache requires independent physical coordinates")
@@ -278,7 +274,7 @@ class PrescribedRootOperator:
             raise ValueError("No prescribed articulations to own")
         self.free_root = True
         self.diagonal = True
-        self.mass = mass = _SparseMassMatrixPlan.build(np.array([-1], np.int32), np.array([6], np.int32))
+        self.mass = mass = TreePlan.build([-1], [6]).factor
         self.host = operator_metadata(mass)
         self.group_to_art = wp.array(arts, dtype=int, device=device)
         self.plan = bind_operator_plan(solver, 6, self.host, group_to_art=self.group_to_art)
@@ -384,20 +380,16 @@ class ForestHeldOperator:
         )
         starts = model.articulation_start.numpy()
         first, end = int(starts[arts[0, 0]]), int(starts[arts[0, -1] + 1])
-        ancestors = model.joint_ancestor.numpy()[first:end]
-        parents = np.where(ancestors < 0, -1, ancestors - first)
+        parents = local_parents(model.joint_ancestor.numpy(), [first], end - first)[0]
         joint_counts = np.diff(model.joint_qd_start.numpy())[first:end]
-        self.mass = mass = _SparseMassMatrixPlan.build(parents, joint_counts)
+        self.mass = mass = TreePlan.build(parents, joint_counts).factor
         self.host = operator_metadata(mass)
         self.group_to_art = wp.array(arts[:, 0].copy(), dtype=int, device=device)
         self.plan = bind_operator_plan(solver, 0, self.host, group_to_art=self.group_to_art)
         self.size = mass.dof_count
         self.layout, _ = make_plan(model, self, complete=False)
         # Physical (row, col) -> forest entry, for each root family's refresh.
-        physical_index = np.full((self.size, self.size), -1, np.int32)
-        for index, (row, col) in enumerate(zip(mass.entry_rows, mass.columns, strict=True)):
-            a, b = mass.permutation[row], mass.permutation[col]
-            physical_index[a, b] = physical_index[b, a] = index
+        physical_index = mass.physical_lookup
         self.data = HeldResponse()
         self.data.valid = wp.ones(worlds, dtype=int, device=device)
         self.data.status = wp.zeros(worlds, dtype=int, device=device)

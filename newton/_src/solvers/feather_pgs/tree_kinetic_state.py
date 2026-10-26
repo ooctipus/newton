@@ -19,13 +19,15 @@ from .kernel_template import Dispatch, KernelTemplate, python_kernel
 from .publication_data import PublicationData
 from .spatial_laws import (
     INERTIA_CHANNELS,
-    inertia_action,
+    SPATIAL,
+    body_wrench,
+    inertia_at,
     inertia_record,
-    inertia_shift,
     joint_frame_pose,
     joint_motion,
     joint_transform,
     pack_inertia,
+    point_velocity,
 )
 from .tree_kinetic_layout import REFERENCE_LAYOUT, TreeLayout
 from .tree_passes import body_dynamics
@@ -764,7 +766,9 @@ def get_helpers(
     def _scan_motion(address: wp.uint64, p: HeldPlan): ...
 
     @wp.func_native(layout.render(_STORE_TERMS_SOURCE))
-    def _store_terms(address: wp.uint64, body: int, wrench: wp.spatial_vector, record: inertia_record, refresh: int): ...
+    def _store_terms(
+        address: wp.uint64, body: int, wrench: wp.spatial_vector, record: inertia_record, refresh: int
+    ): ...
 
     # A root-only free body is a free rigid body (in a forest, a free root may
     # be one): the matrix-free contact path reads its spatial inertia and bias
@@ -799,29 +803,15 @@ def get_helpers(
         rotation = wp.transform_get_rotation(pose_com)
         mass = data.body_mass[body]
         inertia_local = data.body_inertia[body]
-        linear, omega = wp.spatial_top(velocity), wp.spatial_bottom(velocity)
-        a, alpha = wp.spatial_top(acceleration), wp.spatial_bottom(acceleration)
         record = inertia_record()
-        angular_momentum = wp.vec3()
-        angular_acceleration_force = wp.vec3()
         if g.refresh != 0:
-            matrix = wp.quat_to_matrix(rotation)
-            inertia_com = matrix * inertia_local * wp.transpose(matrix)
-            angular_momentum = inertia_com * omega
-            angular_acceleration_force = inertia_com * alpha
-            total, moment, rotational = inertia_shift(mass, inertia_com, radius)
+            total, moment, rotational = inertia_at(mass, inertia_local, rotation, radius)
             record = pack_inertia(total, moment, rotational)
-        else:
-            angular_momentum = inertia_action(rotation, inertia_local, omega)
-            angular_acceleration_force = inertia_action(rotation, inertia_local, alpha)
-        velocity_com = linear + wp.cross(omega, radius)
-        force = mass * (a + wp.cross(alpha, radius) + wp.cross(omega, velocity_com) - data.gravity[0])
-        torque = angular_acceleration_force + wp.cross(omega, angular_momentum) + wp.cross(radius, force)
-        wrench = wp.spatial_vector(force, torque)
+        wrench = body_wrench(mass, rotation, inertia_local, radius, velocity, acceleration, data.gravity[0])
         if wp.static(clocked):
             clock_b1 = _clock()
         public_radius = wp.transform_point(pose, data.body_com[body]) - origin
-        data.body_qd[body] = wp.spatial_vector(linear + wp.cross(omega, public_radius), omega)
+        data.body_qd[body] = wp.spatial_vector(point_velocity(velocity, public_radius), wp.spatial_bottom(velocity))
         if wp.static(body_velocity):
             data.body_v_s[body] = velocity
         cache.com_offset[g.group, local] = radius
@@ -1652,7 +1642,9 @@ def get_predictor_kernel(
     elif response != "sparse":
         raise ValueError("Unknown held tree response representation")
     operations["TWIST_BLOCK"] = _twist_block() if publishes_twists(layout, schedules) else ""
-    source = layout.native(_PREDICT, **operations, **_native_clocks(clocked, "f", stages=5, column=8))
+    source = layout.native(
+        _PREDICT, preludes=SPATIAL.preludes(), **operations, **_native_clocks(clocked, "f", stages=5, column=8)
+    )
 
     _, _, _sub, _ = _thread_helpers(layout)
     name = f"tree_kinetic_predict{layout.dofs}"

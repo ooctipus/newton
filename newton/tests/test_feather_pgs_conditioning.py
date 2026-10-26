@@ -16,6 +16,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import conditioning
+from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 
@@ -47,8 +48,13 @@ class TestFeatherPGSConditioning(unittest.TestCase):
 
     def test_depths_follow_the_longest_path(self):
         """Count the joints on the longest root-to-leaf path of each articulation."""
-        np.testing.assert_array_equal(conditioning.articulation_depths(scenes.long_chain().build("cpu")), [101])
-        self.assertLess(int(conditioning.articulation_depths(scenes.sprawl().build("cpu")).max()), 32)
+
+        def depths(scene):
+            model = scene.build("cpu")
+            return conditioning.articulation_depths(model, TreePlan.build(model.joint_ancestor.numpy()))
+
+        np.testing.assert_array_equal(depths(scenes.long_chain()), [101])
+        self.assertLess(int(depths(scenes.sprawl()).max()), 32)
 
     def test_bare_chain_gains_armature_near_its_head(self):
         """Add armature to the joints near a bare chain's head, record it and warn once."""

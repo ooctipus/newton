@@ -239,6 +239,31 @@ def check_stage_mass_symmetry(test, device):
             np.testing.assert_array_equal(again.numpy(), H, "determinism")
 
 
+def check_up_scans_read_no_stale_slot(test, device):
+    """The joint forces and the composite inertia set every slot they read: from scratch holding NaN they give the
+    words they give from zeroed scratch, each body's children's sum (zero at a leaf) and each subtree's inertia
+    included. (The up scans store a first child's sum and add the others; nothing clears their slots first.)"""
+    from newton.tests.feather_pgs_tree_scan_fixture import (  # noqa: PLC0415
+        articulated_model,
+        general_route,
+        run_inputs,
+        run_pass,
+    )
+
+    route = general_route(articulated_model(("humanoid13", "anymal13", "pendulum2"), 3, device))
+    for name, scratch in (("tau", "body_ft_s"), ("composite_inertia", "body_I_c")):
+        run_inputs(route, name)
+        results = []
+        for fill in (0.0, np.nan):
+            array = getattr(route.aug if name == "tau" else route.solver, scratch)
+            array.assign(np.full(array.numpy().shape, fill, dtype=np.float32))
+            route.aug.joint_tau.zero_()
+            run_pass(route, name, write_inertia_records=1)
+            results.append((array.numpy().copy(), route.aug.joint_tau.numpy().copy()))
+        for clean, stale in zip(*results, strict=True):
+            np.testing.assert_array_equal(stale, clean, f"{name}: the results depend on what the scratch held")
+
+
 class TestTreePassesPhysics(unittest.TestCase):
     pass
 
@@ -252,6 +277,12 @@ class TestGeneralRouteStages(unittest.TestCase):
 
 
 add_function_test(TestTreePassesPhysics, "test_physics", check_physics, devices=get_test_devices())
+add_function_test(
+    TestTreePassesPhysics,
+    "test_up_scans_read_no_stale_slot",
+    check_up_scans_read_no_stale_slot,
+    devices=get_test_devices(),
+)
 add_function_test(TestTreePassesGradients, "test_gradients", check_gradients, devices=get_test_devices())
 add_function_test(TestGeneralRouteStages, "test_mass_gradient", check_stage_mass_gradient, devices=get_test_devices())
 add_function_test(

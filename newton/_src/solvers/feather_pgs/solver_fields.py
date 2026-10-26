@@ -53,13 +53,15 @@ body's own (``_body_inertia_terms``) and its subtree's composite (``body_I_c``).
 
 ARTICULATION_ORIGIN = FieldGroup(Field("articulation_origin", wp.vec3, ("articulation",)))
 
-JOINT_DFS = FieldGroup(
+JOINT_FOREST = FieldGroup(
     Field("_joint_dfs_order", wp.int32, ("joint",), grad=False),
     Field("_joint_dfs_position", wp.int32, ("joint",), grad=False),
     Field("_joint_dfs_end", wp.int32, ("joint",), grad=False),
+    Field("_joint_up_flags", wp.int32, ("joint",), grad=False),
 )
-"""The joint forest's depth-first order, each joint's position and each position's subtree end
-(:class:`.tree_plan.TreePlan`): the CRBA's ancestor test."""
+"""The articulation joints' forest (:class:`.tree_plan.TreePlan`) on the device: its depth-first order, each
+joint's position and each position's subtree end (the CRBA's ancestor test), and how the up scans meet each
+joint (:attr:`.tree_plan.TreePlan.up_flags`)."""
 
 AUGMENTED_DRIVE_ROWS = FieldGroup(
     Field("aug_row_counts", wp.int32, ("articulation",)),

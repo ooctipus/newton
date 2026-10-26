@@ -25,11 +25,8 @@ from newton._src.solvers.feather_pgs.sparse_contact import (
     build_sparse_joint_limit_rows,
     finalize_sparse_joint_limit_rows,
 )
-from newton._src.solvers.feather_pgs.sparse_mass_matrix import (
-    _SparseMassMatrixPlan,
-    _SparseRowSupport,
-    _SparseRowSupportPlan,
-)
+from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport, factor_indices, row_supports
+from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.tests.test_feather_pgs_sparse_mass_matrix import _endpoint_support
 
 
@@ -75,7 +72,8 @@ def _fixture(device="cpu", joint_dof_count=(3, 2, 1, 0)):
     def array(value, dtype=float):
         return wp.array(value, dtype=dtype, device=device)
 
-    plan = _SparseMassMatrixPlan.build([-1, 0, 0, 1], joint_dof_count)
+    tree = TreePlan.build([-1, 0, 0, 1], joint_dof_count)
+    plan = tree.factor
     dofs = plan.dof_count
     rng = np.random.default_rng(916)
     lower = np.zeros((dofs, dofs))
@@ -93,8 +91,9 @@ def _fixture(device="cpu", joint_dof_count=(3, 2, 1, 0)):
     normals /= np.linalg.norm(normals, axis=1)[:, None]
     physical_masks = [sum(1 << int(plan.permutation[i]) for i in _endpoint_support(plan, j)) for j in range(4)]
     return {
+        "tree": tree,
         "plan": plan,
-        "indices": plan.to_device(device),
+        "indices": factor_indices(plan, device),
         "inverse": inverse,
         "packed": array(inverse[plan.entry_rows, plan.columns][None, :]),
         "patches": patches,
@@ -381,9 +380,9 @@ class TestSparseContacts(unittest.TestCase):
                 support = _SparseRowSupport()
                 law = {}
                 if use_support_table:
-                    support_plan = _SparseRowSupportPlan.build(p, p.joint_ancestor_mask, max_row_dofs=6)
+                    support_plan = f["tree"].support_classes(p.joint_ancestor_mask, 6)
                     self.assertIsNotNone(support_plan)
-                    support = support_plan.to_device(1, 9, device)
+                    support = row_supports(support_plan, 1, 9, device)
                     support.row_class.fill_(-9)
                 friction_beta = 0.0
                 if prepare_rows:
@@ -747,7 +746,8 @@ class TestSparseContacts(unittest.TestCase):
                     self.assertAlmostEqual(float(diagonal.numpy()[0, row]), float(expected @ expected), places=6)
 
     def _check_joint_limit_parallel_scan(self, device, capacity, *, use_support_table=False):
-        plan = _SparseMassMatrixPlan.build([-1, 0, 0], [2, 31, 31])
+        tree = TreePlan.build([-1, 0, 0], [2, 31, 31])
+        plan = tree.factor
         dofs, worlds = plan.dof_count, 3
         rng = np.random.default_rng(923)
         lower_factor = np.zeros((dofs, dofs))
@@ -780,7 +780,7 @@ class TestSparseContacts(unittest.TestCase):
         def full(shape, value, dtype=float):
             return wp.full(shape, value, dtype=dtype, device=device)
 
-        indices = plan.to_device(device)
+        indices = factor_indices(plan, device)
         counter = array(initial_count, int)
         row_type, parent = [full((worlds, capacity), -9, int) for _ in range(2)]
         mu, beta, cfm, phi, target, incident, diagonal = [full((worlds, capacity), -9.0) for _ in range(7)]
@@ -788,9 +788,9 @@ class TestSparseContacts(unittest.TestCase):
         row_factor = full((worlds, capacity, 34), -9.0)
         support = _SparseRowSupport()
         if use_support_table:
-            support_plan = _SparseRowSupportPlan.build(plan, np.zeros(0, dtype=np.uint64), max_row_dofs=34)
+            support_plan = tree.support_classes(np.zeros(0, dtype=np.uint64), 34)
             self.assertIsNotNone(support_plan)
-            support = support_plan.to_device(worlds, capacity, device)
+            support = row_supports(support_plan, worlds, capacity, device)
             support.row_class.fill_(-9)
         outputs = [counter, row_type, parent, mu, beta, cfm, phi, target, row_dof, row_factor, incident, diagonal]
         wp.launch(

@@ -8,11 +8,11 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import (
     _get_crba_sparse_factor_kernel,
-    _SparseMassMatrixPlan,
-    _SparseRowSupportPlan,
+    factor_indices,
     solve_sparse_mass_matrix,
 )
 from newton._src.solvers.feather_pgs.spatial_laws import INERTIA_CHANNELS, inertia_record
+from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 
 
 def _skew(v):
@@ -64,9 +64,10 @@ class TestSparseMassMatrix(unittest.TestCase):
     def test_row_support_catalogue(self):
         """Preserve ordered endpoint unions and full multi-DOF limit support."""
         for parents, counts in (([-1, 0, 0, 1], [3, 2, 1, 0]), ([-1], [64])):
-            plan = _SparseMassMatrixPlan.build(parents, counts)
+            tree = TreePlan.build(parents, counts)
+            plan = tree.factor
             body_masks = np.concatenate((np.zeros(1, dtype=np.uint64), plan.joint_ancestor_mask))
-            support = _SparseRowSupportPlan.build(plan, body_masks, max_row_dofs=plan.dof_count)
+            support = tree.support_classes(body_masks, plan.dof_count)
             self.assertIsNotNone(support)
             self.assertEqual(support.body_class[0], 0)
             for first, first_mask in enumerate(body_masks):
@@ -80,21 +81,22 @@ class TestSparseMassMatrix(unittest.TestCase):
                 expected = [i for i in range(plan.dof_count) if int(mask) & (1 << i)]
                 expected += [-1] * (plan.dof_count - len(expected))
                 np.testing.assert_array_equal(support.class_dof[support.limit_class[dof]], expected)
-        plan = _SparseMassMatrixPlan.build([-1, 0, 0, 1], [3, 2, 1, 0])
-        support = _SparseRowSupportPlan.build(plan, plan.joint_ancestor_mask, max_row_dofs=6)
+        tree = TreePlan.build([-1, 0, 0, 1], [3, 2, 1, 0])
+        plan = tree.factor
+        support = tree.support_classes(plan.joint_ancestor_mask, 6)
         np.testing.assert_array_equal(support.class_dof[support.limit_class[0]], [3, 4, 5, -1, -1, -1])
         # Structurally zero coefficients inside a joint block must retain their slots.
         np.testing.assert_array_equal(np.flatnonzero(plan.lookup[:, plan.inverse_permutation[0]] >= 0), [5])
 
     def test_row_support_rejects_oversized_union(self):
         """Decline a catalogue that would truncate a non-colliding body's union."""
-        plan = _SparseMassMatrixPlan.build([-1, 0, 0], [6, 3, 3])
-        self.assertIsNone(_SparseRowSupportPlan.build(plan, plan.joint_ancestor_mask, max_row_dofs=9))
+        tree = TreePlan.build([-1, 0, 0], [6, 3, 3])
+        self.assertIsNone(tree.support_classes(tree.factor.joint_ancestor_mask, 9))
 
     def test_factor_schedules_follow_dependencies(self):
         """Cover each packed factor entry once and schedule independent branch pivots together."""
         for parents, counts in [([2, -1, 1, 2, -1, 4], [2, 3, 0, 1, 1, 2]), _branched_humanoid_topology()]:
-            plan = _SparseMassMatrixPlan.build(parents, counts)
+            plan = TreePlan.build(parents, counts).factor
             levels = np.empty(plan.dof_count, dtype=int)
             for level in range(plan.factor_level_count):
                 begin, end = plan.factor_level_offsets[level : level + 2]
@@ -118,7 +120,7 @@ class TestSparseMassMatrix(unittest.TestCase):
 
     def test_forest_fixed_multidof_order(self):
         """Derive fill-free support for unordered forests and fixed joints."""
-        plan = _SparseMassMatrixPlan.build([2, -1, 1, 2, -1, 4], [2, 3, 0, 1, 1, 2])
+        plan = TreePlan.build([2, -1, 1, 2, -1, 4], [2, 3, 0, 1, 1, 2]).factor
         np.testing.assert_array_equal(np.sort(plan.permutation), np.arange(9))
         np.testing.assert_array_equal(plan.inverse_permutation[plan.permutation], np.arange(9))
         self.assertEqual(_endpoint_support(plan, 2).size, 3)
@@ -146,10 +148,10 @@ class TestSparseMassMatrix(unittest.TestCase):
             ([], []),
         ]:
             with self.subTest(parents=parents, counts=counts), self.assertRaises(ValueError):
-                _SparseMassMatrixPlan.build(parents, counts)
+                _ = TreePlan.build(parents, counts).factor
 
     def _factor(self, parents, counts, *, fused_drive=True, mask=None, armature=0.4, device="cpu"):
-        plan = _SparseMassMatrixPlan.build(parents, counts)
+        plan = TreePlan.build(parents, counts).factor
         n, j = plan.dof_count, len(parents)
         rng = np.random.default_rng(742)
         motion = rng.normal(size=(2 * n, 6)).astype(np.float32)
@@ -182,7 +184,7 @@ class TestSparseMassMatrix(unittest.TestCase):
         def array(value, dtype):
             return wp.array(value, dtype=dtype, device=device)
 
-        indices = plan.to_device(device)
+        indices = factor_indices(plan, device)
         inverse = wp.full((2, plan.nonzero_count), -98.0, dtype=float, device=device)
         status = wp.full(2, 17, dtype=int, device=device)
         if mask is None:
@@ -258,7 +260,7 @@ class TestSparseMassMatrix(unittest.TestCase):
 
     def test_mask_bit_63_and_fixed_root(self):
         """Preserve the highest mask bit and fixed-root endpoint support."""
-        plan = _SparseMassMatrixPlan.build([-1, 0], [0, 64])
+        plan = TreePlan.build([-1, 0], [0, 64]).factor
         self.assertEqual(int(plan.joint_ancestor_mask[0]), 0)
         self.assertEqual(int(plan.joint_ancestor_mask[1]), (1 << 64) - 1)
         self.assertEqual(int(plan.ancestor_mask[0]), (1 << 64) - 1)

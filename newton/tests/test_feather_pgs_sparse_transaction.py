@@ -27,7 +27,7 @@ from newton._src.solvers.feather_pgs.sparse_contact import (
     CONTACT_RING_FLOATS,
     _get_sparse_contact_response_kernel,
 )
-from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupportPlan
+from newton._src.solvers.feather_pgs.sparse_mass_matrix import row_supports
 from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel, contact_transaction_launch_bounds
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplets
@@ -142,8 +142,8 @@ class TestContactRecordBuilder(unittest.TestCase):
             law[name] = full((1, 9), -9, int)
         for name in ("row_mu", "row_beta", "row_cfm", "phi", "target", "restitution", "rhs"):
             law[name] = full((1, 9), -9.0)
-        support_plan = _SparseRowSupportPlan.build(plan, plan.joint_ancestor_mask, max_row_dofs=6)
-        support = support_plan.to_device(1, 9, device)
+        support_plan = f["tree"].support_classes(plan.joint_ancestor_mask, 6)
+        support = row_supports(support_plan, 1, 9, device)
         dense = full((1, 9, 6), 0.0)
         compact = _contact_input(
             f,

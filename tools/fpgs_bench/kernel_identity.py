@@ -231,7 +231,7 @@ def held_factor_calls():
     import numpy as np  # noqa: PLC0415
 
     from newton._src.solvers.feather_pgs import small_cholesky  # noqa: PLC0415
-    from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseMassMatrixPlan  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.tree_plan import TreePlan  # noqa: PLC0415
 
     def chains(count, length, *, base=()):
         """A fixed root, or ``base``, carrying ``count`` revolute chains of ``length`` joints at its last joint."""
@@ -259,11 +259,8 @@ def held_factor_calls():
             for position, tree in enumerate(trees)
             for parent, count in tree
         ]
-        mass = _SparseMassMatrixPlan.build(*map(np.asarray, zip(*joints, strict=True)))
-        physical = np.full((mass.dof_count, mass.dof_count), -1, np.int32)
-        for entry, (row, col) in enumerate(zip(mass.entry_rows, mass.columns, strict=True)):
-            a, b = mass.permutation[row], mass.permutation[col]
-            physical[a, b] = physical[b, a] = entry
+        mass = TreePlan.build(*map(np.asarray, zip(*joints, strict=True))).factor
+        physical = mass.physical_lookup
         if families is None:
             index = Named(f"{name}.index", tuple(map(int, physical.ravel())))
             yield "small_cholesky.get_kernel", small, (mass.dof_count,), {"geometric": True, "geometric_index": index}

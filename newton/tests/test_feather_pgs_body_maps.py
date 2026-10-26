@@ -8,16 +8,15 @@ import unittest
 import numpy as np
 
 from newton._src.solvers.feather_pgs.body_mapping import build_body_maps
+from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 
 
 def maps(bodies, child, ancestor, qd, starts, ends, response_start, response_count):
-    return build_body_maps(
-        bodies,
-        *[
-            np.asarray(values, dtype=np.int32)
-            for values in (child, ancestor, qd, starts, ends, response_start, response_count)
-        ],
+    child, qd, starts, ends, response_start, response_count = (
+        np.asarray(values, dtype=np.int32) for values in (child, qd, starts, ends, response_start, response_count)
     )
+    forest = TreePlan.build(np.asarray(ancestor, dtype=np.int32))
+    return build_body_maps(bodies, child, forest, qd, starts, ends, response_start, response_count)
 
 
 class TestBodyMaps(unittest.TestCase):
@@ -50,13 +49,11 @@ class TestBodyMaps(unittest.TestCase):
         np.testing.assert_array_equal(actual[3], [7, 2, 6])
         np.testing.assert_array_equal(actual[4], [-1, 1, -1])
 
-    def test_cycles_only_when_reachable_from_owned_bodies(self):
+    def test_cyclic_ancestry_is_no_forest(self):
+        """A joint ancestry with a cycle anywhere, reachable from an owned body or not, is no joint forest."""
         for ancestor in ([0, -1], [1, 0]):
-            with self.subTest(ancestor=ancestor), self.assertRaisesRegex(ValueError, "cyclic joint ancestry"):
-                maps(2, [0, 1], ancestor, [0, 1, 2], [0, 2], [2], [0], [2])
-        actual = maps(2, [-1, -1], [1, 0], [0, 1, 2], [0, 2], [2], [0], [2])
-        np.testing.assert_array_equal(actual[0], [-1, -1])
-        np.testing.assert_array_equal(actual[2], [0, 0])
+            with self.subTest(ancestor=ancestor), self.assertRaisesRegex(ValueError, "cycle|other nodes"):
+                TreePlan.build(np.asarray(ancestor, dtype=np.int32))
 
     def test_last_tree_owner_and_empty_articulation(self):
         actual = maps(1, [0, 0], [-1, 0], [0, 1, 2], [0, 0, 2], [0, 2], [0, 0], [0, 2])

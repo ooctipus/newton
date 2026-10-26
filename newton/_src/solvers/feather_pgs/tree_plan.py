@@ -36,7 +36,31 @@ import numpy as np
 
 from .host_index import expand, group_by, offsets, segmented_rank
 
-__all__ = ["ChainPacking", "FactorPattern", "SupportClasses", "TreePlan", "local_parents"]
+__all__ = [
+    "UP_FIRST",
+    "UP_SUMS",
+    "ChainPacking",
+    "FactorPattern",
+    "SupportClasses",
+    "TreePlan",
+    "bit_range",
+    "local_parents",
+]
+
+UP_SUMS = 1
+""":attr:`TreePlan.up_flags` bit: the node has children, whose values reach its slot before it is visited."""
+UP_FIRST = 2
+""":attr:`TreePlan.up_flags` bit: the node is its parent's highest child, the first a descending walk visits."""
+
+
+def bit_range(low, high) -> np.ndarray:
+    """Masks of bits ``[low, high)`` (``0 <= low <= high <= 64``) as ``uint64``."""
+    one = np.uint64(1)
+    low = np.asarray(low, dtype=np.uint64)
+    high = np.asarray(high, dtype=np.uint64)
+    below_high = np.where(high >= 64, ~np.uint64(0), np.left_shift(one, np.minimum(high, 63)) - one)
+    below_low = np.where(low >= 64, ~np.uint64(0), np.left_shift(one, np.minimum(low, 63)) - one)
+    return (below_high & ~below_low).astype(np.uint64)
 
 
 def local_parents(ancestor: np.ndarray, starts: np.ndarray, count: int) -> np.ndarray:
@@ -129,6 +153,10 @@ class FactorPattern:
     def nonzero_count(self) -> int:
         return int(self.columns.size)
 
+    @property
+    def factor_level_count(self) -> int:
+        return int(self.factor_level_offsets.size - 1)
+
 
 @dataclass(frozen=True, eq=False)
 class SupportClasses:
@@ -210,9 +238,14 @@ class TreePlan:
         Raises:
             ValueError: The parents name a node out of range or form a cycle.
         """
-        parent = np.asarray(parent, dtype=np.int64).ravel()
+        given_parent = np.asarray(parent).ravel()
+        given_dofs = None if dofs is None else np.asarray(dofs).ravel()
+        for values in (given_parent, given_dofs):
+            if values is not None and values.size and not np.issubdtype(values.dtype, np.integer):
+                raise ValueError("A tree plan's parents and coordinate counts are integers")
+        parent = given_parent.astype(np.int64)
         count = int(parent.size)
-        dofs = np.ones(count, dtype=np.int64) if dofs is None else np.asarray(dofs, dtype=np.int64).ravel()
+        dofs = np.ones(count, dtype=np.int64) if dofs is None else given_dofs.astype(np.int64)
         if dofs.shape != parent.shape or np.any(dofs < 0):
             raise ValueError("A tree plan needs a nonnegative coordinate count per node")
         if np.any(parent < -1) or np.any(parent >= count) or np.any(parent == np.arange(count)):
@@ -382,36 +415,55 @@ class TreePlan:
         """Whether every parent precedes its children (the order the serial loops walk)."""
         return bool(np.all(self.parent < np.arange(self.count)))
 
+    @functools.cached_property
+    def up_flags(self) -> np.ndarray:
+        """How a leaf-to-root walk in descending index meets each node: :data:`UP_SUMS` and :data:`UP_FIRST`.
+
+        A walk that sums children into their parent's slot stores the first child it visits there and adds the
+        others, so no slot needs clearing before it: the walk sets every slot it reads.
+        """
+        nodes = np.arange(self.count)
+        has_children = np.diff(self.children_offsets) > 0
+        highest = np.full(self.count, -1, dtype=np.int64)
+        highest[has_children] = self.children[self.children_offsets[:-1][has_children]]
+        first = (self.parent >= 0) & (highest[np.maximum(self.parent, 0)] == nodes)
+        flags = np.where(has_children, UP_SUMS, 0) | np.where(first, UP_FIRST, 0)
+        flags = flags.astype(np.int32)
+        flags.setflags(write=False)
+        return flags
+
     def tree_depths(self) -> np.ndarray:
         """Nodes on the longest root-to-leaf path of each tree, per root (a tree's depth in joints)."""
         deepest = np.zeros(self.count, dtype=np.int64)
         np.maximum.at(deepest, self.root_of, self.depth.astype(np.int64) + 1)
         return deepest[self.roots]
 
-    # --- masks ---------------------------------------------------------------------------------------------------
+    # --- root paths ----------------------------------------------------------------------------------------------
+    def scan_down(self, own, combine=np.add) -> np.ndarray:
+        """Combine each node's ``own`` value with its ancestors' along its root path, root first.
+
+        ``total[i] = combine(total[parent[i]], own[i])``, ``own[i]`` at a root: the host form of the
+        device scans' root-to-leaf direction, one vectorized step per depth. ``own`` may carry trailing
+        axes; ``combine`` is any elementwise binary function (``np.add``, ``np.bitwise_or``, ...).
+        """
+        total = np.array(own, copy=True)
+        for level in range(1, self.max_depth + 1):
+            level_set = self.level_nodes[self.level_offsets[level] : self.level_offsets[level + 1]]
+            total[level_set] = combine(total[self.parent[level_set]], total[level_set])
+        return total
+
     @functools.cached_property
     def ancestor_mask(self) -> np.ndarray:
         """Bit ``a`` of node ``i``'s mask is set when ``a`` is ``i`` or one of its ancestors (64 nodes at most)."""
         if self.count > 64:
             raise ValueError("Node ancestor masks cover at most 64 nodes")
-        mask = np.zeros(self.count, dtype=np.uint64)
-        bits = np.left_shift(np.uint64(1), np.arange(self.count, dtype=np.uint64))
-        for level in range(self.max_depth + 1):
-            level_set = self.level_nodes[self.level_offsets[level] : self.level_offsets[level + 1]]
-            above = np.where(self.parent[level_set] >= 0, mask[np.maximum(self.parent[level_set], 0)], np.uint64(0))
-            mask[level_set] = above | bits[level_set]
+        mask = self.scan_down(np.left_shift(np.uint64(1), np.arange(self.count, dtype=np.uint64)), np.bitwise_or)
         mask.setflags(write=False)
         return mask
 
     def ancestor_matrix(self) -> np.ndarray:
         """``matrix[i, a]`` tells whether ``a`` is ``i`` or one of its ancestors (a dense square of the nodes)."""
-        matrix = np.zeros((self.count, self.count), dtype=bool)
-        for level in range(self.max_depth + 1):
-            level_set = self.level_nodes[self.level_offsets[level] : self.level_offsets[level + 1]]
-            above = self.parent[level_set]
-            matrix[level_set[above >= 0]] = matrix[above[above >= 0]]
-            matrix[level_set, level_set] = True
-        return matrix
+        return self.scan_down(np.eye(self.count, dtype=bool), np.logical_or)
 
     @functools.cached_property
     def coordinate_mask(self) -> np.ndarray:
@@ -421,16 +473,7 @@ class TreePlan:
         high = low + self.dofs
         if np.any(high > 64):
             raise ValueError("Coordinate masks cover trees of at most 64 coordinates")
-        one = np.uint64(1)
-        own = (np.left_shift(one, high.astype(np.uint64), dtype=np.uint64) - one) ^ (
-            np.left_shift(one, low.astype(np.uint64), dtype=np.uint64) - one
-        )
-        own = np.where(high >= 64, ~(np.left_shift(one, low.astype(np.uint64)) - one), own).astype(np.uint64)
-        mask = np.zeros(self.count, dtype=np.uint64)
-        for level in range(self.max_depth + 1):
-            level_set = self.level_nodes[self.level_offsets[level] : self.level_offsets[level + 1]]
-            above = np.where(self.parent[level_set] >= 0, mask[np.maximum(self.parent[level_set], 0)], np.uint64(0))
-            mask[level_set] = above | own[level_set]
+        mask = self.scan_down(bit_range(low, high), np.bitwise_or)
         mask.setflags(write=False)
         return mask
 

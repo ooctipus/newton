@@ -18,12 +18,9 @@ from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
-from newton._src.solvers.feather_pgs.sparse_mass_matrix import (
-    _SparseMassMatrixPlan,
-    _SparseRowSupport,
-    _SparseRowSupportPlan,
-)
+from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport, factor_indices, row_supports
 from newton._src.solvers.feather_pgs.sparse_pgs import _get_pgs_solve_sparse_kernel
+from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplet_tests
 from newton.tests import test_feather_pgs_sparse_solver as sparse_tests
@@ -96,7 +93,8 @@ class TestSparseVelocityLimitRows(unittest.TestCase):
         for counts in ((2, 2, 2), (2, 19, 19)):
             for capacity, table in ((4, False), (5, False), (9, False), (4, True), (5, True), (9, True)):
                 with self.subTest(counts=counts, capacity=capacity, table=table):
-                    plan = _SparseMassMatrixPlan.build([-1, 0, 0], counts)
+                    tree = TreePlan.build([-1, 0, 0], counts)
+                    plan = tree.factor
                     dofs = plan.dof_count
                     width = max(int(mask).bit_count() for mask in plan.ancestor_mask)
                     rng = np.random.default_rng(932)
@@ -105,7 +103,7 @@ class TestSparseVelocityLimitRows(unittest.TestCase):
                     lower[np.diag_indices(dofs)] = 1.7
                     inverse = np.linalg.inv(lower)
                     packed = np.stack([scale * inverse[plan.entry_rows, plan.columns] for scale in (1.0, 1.3)])
-                    indices = plan.to_device(device)
+                    indices = factor_indices(plan, device)
 
                     def array(values, dtype=float):
                         return wp.array(values, dtype=dtype, device=device)
@@ -131,9 +129,9 @@ class TestSparseVelocityLimitRows(unittest.TestCase):
                     support = _SparseRowSupport()
                     support_plan = None
                     if table:
-                        support_plan = _SparseRowSupportPlan.build(plan, np.zeros(0, np.uint64), max_row_dofs=width)
+                        support_plan = tree.support_classes(np.zeros(0, np.uint64), width)
                         self.assertIsNotNone(support_plan)
-                        support = support_plan.to_device(2, capacity, device)
+                        support = row_supports(support_plan, 2, capacity, device)
                         support.row_class.fill_(-9)
                     kinds, parents = [full((2, capacity), -9, int) for _ in range(2)]
                     mu, beta, cfm, phi, target, incident, diagonal = [full((2, capacity), -9.0) for _ in range(7)]

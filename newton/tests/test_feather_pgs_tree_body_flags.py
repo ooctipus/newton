@@ -22,9 +22,9 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
 from newton._src.solvers.feather_pgs.sparse_factor import operator_metadata
-from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseMassMatrixPlan
 from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
 from newton._src.solvers.feather_pgs.tree_kinetic_plan import make_plan
+from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_split as sparse_split
 
@@ -515,7 +515,7 @@ def _replicated(scene, worlds=2):
 
 def _held_operator(model, arts, parents, counts, **attributes):
     """A cached-tree operator over articulations ``arts`` that share one topology, for make_plan alone."""
-    mass = _SparseMassMatrixPlan.build(np.asarray(parents, np.int32), np.asarray(counts, np.int32))
+    mass = TreePlan.build(np.asarray(parents, np.int32), np.asarray(counts, np.int32)).factor
     plan = SimpleNamespace(
         group_to_art=wp.array(np.asarray(arts, np.int32), dtype=int, device=model.device),
         art_to_world=wp.array(model.articulation_world.numpy(), dtype=int, device=model.device),

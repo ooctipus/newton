@@ -52,13 +52,13 @@ import warp as wp
 
 from ...core.contact_pool import ContactField, ContactPool
 from ...core.live_sort import EXTENT_SIZE, SORT_CHUNK, launch_live_sort, publish_sort_extent, slot_keys_fit, sort_grid
-from ...math.spatial import velocity_at_point
 from ...sim.contacts import GENERATION_SENTINEL, capture_scope, contact_frame_write
 from . import field_group
 from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
 from .contact_laws import contact_bodies, contact_points, contact_tangent_basis
 from .field_group import Field
 from .projection_laws import disk
+from .spatial_laws import point_velocity
 
 # Grids are fixed at construction so CUDA graphs replay them. Their sizes count
 # _BLOCK_THREADS threads per SM (one SM on the CPU); launches stride over the
@@ -2045,7 +2045,7 @@ def _point_velocity(
 ):
     velocity = wp.vec3(0.0)
     if body >= 0:
-        velocity = velocity_at_point(qd[body], wp.transform_vector(q[body], anchor - com[body]))
+        velocity = point_velocity(qd[body], wp.transform_vector(q[body], anchor - com[body]))
     return velocity
 
 

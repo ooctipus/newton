@@ -15,7 +15,7 @@ their generated code; fields those owners do not bind stay empty.
 import numpy as np
 import warp as wp
 
-from . import field_group
+from . import field_group, host_index
 from .field_group import Field
 
 SPARSE_PLAN = (
@@ -68,9 +68,8 @@ def operator_metadata(mass, *, inverse_column_width=None):
     if width < int(counts.max()):
         raise ValueError("Inverse-column storage does not cover the factor topology")
     nodes = np.full((mass.dof_count, width), -1, np.int32)
-    for col in range(mass.dof_count):
-        begin, end = mass.column_offsets[col : col + 2]
-        nodes[col, : end - begin] = mass.entry_rows[mass.column_entries[begin:end]]
+    col, rank = host_index.expand(counts)
+    nodes[col, rank] = mass.entry_rows[mass.column_entries]
     return {
         "index": mass.lookup,
         "row": mass.entry_rows,

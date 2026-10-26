@@ -17,7 +17,8 @@ from newton._src.solvers.feather_pgs import dense_rows, field_group, sparse_cont
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_MIMIC as MIMIC
-from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseMassMatrixPlan
+from newton._src.solvers.feather_pgs.sparse_mass_matrix import factor_indices
+from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_split as split_tests
 from newton.tests import test_feather_pgs_sparse_velocity_limits as velocity_tests
@@ -42,8 +43,8 @@ class TestSparseVelocityMimicAdmission(unittest.TestCase):
 class TestSparseVelocityMimicRows(unittest.TestCase):
     def _check_rows(self, device):
         """Project the union of sibling supports and retain bilateral ERP for either sign."""
-        plan = _SparseMassMatrixPlan.build([-1, 0, 0], [2, 2, 2])
-        indices = plan.to_device(device)
+        plan = TreePlan.build([-1, 0, 0], [2, 2, 2]).factor
+        indices = factor_indices(plan, device)
         dofs = plan.dof_count
         rng = np.random.default_rng(451)
         lower = np.zeros((dofs, dofs))

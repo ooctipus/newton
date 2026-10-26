@@ -29,6 +29,8 @@ import dataclasses
 import numpy as np
 import warp as wp
 
+from .tree_plan import TreePlan
+
 DEEP_CHAIN_JOINTS = 32
 """Root-to-leaf joint count from which an articulation's mass matrix is evaluated: a uniform chain of 32 links
 keeps its pivot ratios near 1e-4, ten times the floor."""
@@ -54,28 +56,16 @@ class ArmatureFloor:
     """Articulations whose mass matrix was evaluated (deep chains)."""
 
 
-def articulation_depths(model) -> np.ndarray:
-    """Number of joints on the longest root-to-leaf path of each articulation of ``model``."""
-    joint_count = model.joint_count
-    if joint_count == 0 or model.articulation_count == 0:
-        return np.zeros(model.articulation_count, dtype=np.int64)
-    parent = model.joint_parent.numpy()
-    child = model.joint_child.numpy()
-    articulation = model.joint_articulation.numpy()
-    # The tree joint whose child is each joint's parent body (-1 at a root); loop joints are no tree joints.
-    tree = (child >= 0) & (articulation >= 0)
-    body_joint = np.full(max(model.body_count, 1), -1, dtype=np.int64)
-    body_joint[child[tree]] = np.flatnonzero(tree)
-    parent_joint = np.where(parent >= 0, body_joint[np.maximum(parent, 0)], -1)
-    depth = np.ones(joint_count, dtype=np.int64)
-    for _ in range(joint_count):
-        deeper = np.where(parent_joint >= 0, depth[np.maximum(parent_joint, 0)] + 1, 1)
-        if np.array_equal(deeper, depth):
-            break
-        depth = deeper
+def articulation_depths(model, joint_forest: TreePlan) -> np.ndarray:
+    """Number of joints on the longest root-to-leaf path of each articulation of ``model``.
+
+    ``joint_forest`` is the forest of the model's joint ancestry (``Model.joint_ancestor``).
+    """
     depths = np.zeros(model.articulation_count, dtype=np.int64)
-    member = articulation >= 0
-    np.maximum.at(depths, articulation[member], depth[member])
+    if model.joint_count and model.articulation_count:
+        articulation = model.joint_articulation.numpy()
+        member = articulation >= 0
+        np.maximum.at(depths, articulation[member], joint_forest.depth[member].astype(np.int64) + 1)
     return depths
 
 
@@ -108,7 +98,7 @@ def pivot_floor(mass: np.ndarray, rounding: float = FLOAT32_ROUNDING) -> np.ndar
     return added
 
 
-def conditioning_armature(model, armature: np.ndarray) -> tuple[np.ndarray, ArmatureFloor]:
+def conditioning_armature(model, armature: np.ndarray, joint_forest: TreePlan) -> tuple[np.ndarray, ArmatureFloor]:
     """Return ``armature`` with the least additions that keep deep articulations' mass matrices factorable.
 
     Evaluates the mass matrix of every articulation with at least
@@ -120,11 +110,12 @@ def conditioning_armature(model, armature: np.ndarray) -> tuple[np.ndarray, Arma
     Args:
         model: The model.
         armature: Effective joint armature per coordinate [kg m^2 or kg], prescribed coordinates included.
+        joint_forest: The forest of the model's joint ancestry (``Model.joint_ancestor``).
 
     Returns:
         The armature with the additions, and a summary of them.
     """
-    depths = articulation_depths(model)
+    depths = articulation_depths(model, joint_forest)
     deep = np.flatnonzero(depths >= DEEP_CHAIN_JOINTS)
     if deep.size == 0:
         return armature, ArmatureFloor(0, 0, 0.0, 0)

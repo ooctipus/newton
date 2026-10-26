@@ -506,7 +506,9 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
 
 
 def _registered_laws():
-    """Every registered law with a CUDA form, by name."""
+    """Every law of :data:`FAMILIES` the modules define, by name (a law they import from another family, the
+    spatial kit's, is that family's to test)."""
+    families = {family.name for family in FAMILIES}
     laws = {}
     for module in (contact_laws, row_laws, projection_laws):
         for name, value in vars(module).items():
@@ -515,7 +517,7 @@ def _registered_laws():
                     sig = law_source.law_signature(value)
                 except ValueError:
                     continue
-                if sig.name == name:
+                if sig.name == name and sig.family in families:
                     laws[name] = value
     return laws
 

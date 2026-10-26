@@ -11,7 +11,8 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs import sparse_factorization
 from newton._src.solvers.feather_pgs.device_preludes import cuda_native, lane_group
-from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseMassMatrixIndices, _SparseMassMatrixPlan
+from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseMassMatrixIndices, factor_indices
+from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 
 
 @cache
@@ -65,7 +66,7 @@ class TestSparseFactorization(unittest.TestCase):
             ([-1, 0, 0, 1, 2], [6, 15, 15, 14, 14]),
         ]
         for parents, counts in cases:
-            plan = _SparseMassMatrixPlan.build(parents, counts)
+            plan = TreePlan.build(parents, counts).factor
             rng = np.random.default_rng(5208)
             expected = np.zeros_like(plan.lookup, dtype=np.float64)
             expected[plan.entry_rows, plan.columns] = rng.normal(0, 0.05, plan.nonzero_count)
@@ -75,7 +76,7 @@ class TestSparseFactorization(unittest.TestCase):
             reference = np.linalg.cholesky(matrix)[plan.entry_rows, plan.columns]
             packed = matrix[plan.entry_rows, plan.columns].astype(np.float32)
             kernel = _factor_kernel(plan.dof_count, plan.nonzero_count)
-            bound = plan.to_device("cuda:0")
+            bound = factor_indices(plan, "cuda:0")
             for invalid in (False, True):
                 with self.subTest(parents=parents, counts=counts, invalid=invalid):
                     values = packed.copy()

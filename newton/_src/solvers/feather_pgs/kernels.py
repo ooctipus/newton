@@ -71,7 +71,7 @@ from .row_laws import (
     row_rhs,
     velocity_limit_active,
 )
-from .spatial_laws import transform_compose, twist_compose
+from .spatial_laws import free_root_transport, point_velocity, transform_compose, twist_compose
 from .tree_passes import (
     DynamicsData,
     articulation_tau,
@@ -396,7 +396,7 @@ def jcalc_integrate(
         w_prev = w_s
         w_s = w_s + m_s * dt
         if parent < 0:
-            v_com = v_com + (a_s + wp.cross(w_prev, v_com)) * dt
+            v_com = v_com + (a_s + free_root_transport(v_com, w_prev)) * dt
         else:
             # A descendant free joint's coordinate is a RELATIVE twist in the parent anchor
             # frame; the root transport rule above is not derived for it, so integrate
@@ -1915,11 +1915,8 @@ def populate_connect_J_for_size(
             if prescribed:
                 # Prescribed parent: the anchor velocity comes from the body twist
                 # (v_com_world, omega_world) rather than from tree DOFs.
-                twist = body_qd[body_p]
-                v_com = wp.spatial_top(twist)
-                omega = wp.spatial_bottom(twist)
                 x_com = wp.transform_point(body_q[body_p], body_com[body_p])
-                v_a = v_com + wp.cross(omega, p_a - x_com)
+                v_a = point_velocity(body_qd[body_p], p_a - x_com)
         p_b = wp.transform_point(body_q[body_c], connect_anchor_c[k])
         origin = articulation_origin[art]
         delta = p_a - p_b
@@ -1939,20 +1936,38 @@ def populate_connect_J_for_size(
             if prescribed:
                 target = -wp.dot(e, v_a)
             else:
-                curr = body_to_joint[body_p]
-                while curr != -1:
-                    d0 = joint_qd_start[curr]
-                    d1 = joint_qd_start[curr + 1]
-                    for d in range(d0, d1):
-                        J_group[group_idx, slot, d - dof_start] += jacobian_entry(joint_S_s[d], e, p_a, origin)
-                    curr = joint_ancestor[curr]
-            curr = body_to_joint[body_c]
-            while curr != -1:
-                d0 = joint_qd_start[curr]
-                d1 = joint_qd_start[curr + 1]
-                for d in range(d0, d1):
-                    J_group[group_idx, slot, d - dof_start] -= jacobian_entry(joint_S_s[d], e, p_b, origin)
-                curr = joint_ancestor[curr]
+                accumulate_jacobian_row_world(
+                    body_p,
+                    1.0,
+                    p_a,
+                    origin,
+                    e,
+                    body_to_joint,
+                    joint_ancestor,
+                    joint_qd_start,
+                    joint_S_s,
+                    dof_start,
+                    n_dofs,
+                    group_idx,
+                    slot,
+                    J_group,
+                )
+            accumulate_jacobian_row_world(
+                body_c,
+                -1.0,
+                p_b,
+                origin,
+                e,
+                body_to_joint,
+                joint_ancestor,
+                joint_qd_start,
+                joint_S_s,
+                dof_start,
+                n_dofs,
+                group_idx,
+                slot,
+                J_group,
+            )
 
             # Normalize the row: on planar linkages one axis is near-redundant with the
             # tree, leaving ||J|| ~ 1e-4 — its Delassus diagonal collapses to pure CFM
@@ -3766,21 +3781,12 @@ def update_body_qd_from_featherstone(
     tid = wp.tid()
 
     twist = body_v_s[tid]  # spatial twist about origin
-    v0 = wp.spatial_top(twist)
-    w = wp.spatial_bottom(twist)
-
-    X_wb = body_q[tid]
-    com_local = body_com[tid]
-    com_world = wp.transform_point(X_wb, com_local)
+    com_world = wp.transform_point(body_q[tid], body_com[tid])
     art = body_to_articulation[tid]
     origin = wp.vec3()
     if art >= 0:
         origin = articulation_origin[art]
-    com_rel = com_world - origin
-
-    v_com = v0 + wp.cross(w, com_rel)
-
-    body_qd_out[tid] = wp.spatial_vector(v_com, w)
+    body_qd_out[tid] = wp.spatial_vector(point_velocity(twist, com_world - origin), wp.spatial_bottom(twist))
 
 
 # =============================================================================

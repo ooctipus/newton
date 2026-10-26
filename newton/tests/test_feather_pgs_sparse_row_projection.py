@@ -10,8 +10,8 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs.device_preludes import dual_native, lane_group
-from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseMassMatrixPlan
 from newton._src.solvers.feather_pgs.sparse_row_projection import _sparse_contact_projection_source
+from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.tests.test_feather_pgs_sparse_mass_matrix import _endpoint_support
 
 
@@ -76,7 +76,7 @@ class TestSparseRowProjection(unittest.TestCase):
         for n in (7, 18, 43, 64):
             for branched in (False, True):
                 parents = [-1] + [(i - 1) // 2 if branched else i - 1 for i in range(1, n)]
-                plan = _SparseMassMatrixPlan.build(parents, [1] * n)
+                plan = TreePlan.build(parents, [1] * n).factor
                 # Single endpoint for deep trees; union for branches. The final
                 # coordinate/root exercises bit 63 without shifting by 64.
                 endpoint = n - 1 if branched else min(n - 1, 19)

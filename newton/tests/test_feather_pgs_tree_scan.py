@@ -27,8 +27,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import tree_scan as ts
-from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseMassMatrixPlan, _SparseRowSupportPlan
-from newton._src.solvers.feather_pgs.tree_plan import TreePlan, local_parents
+from newton._src.solvers.feather_pgs.tree_plan import UP_FIRST, UP_SUMS, TreePlan, local_parents
 from newton.tests.feather_pgs_tree_scan_fixture import (
     EXTERNAL,
     MOTION,
@@ -155,46 +154,84 @@ class TestTreePlan(unittest.TestCase):
             self.assertEqual(packing.width, int(widths.max()))
 
     def test_factor_pattern_and_supports(self):
-        """_SparseMassMatrixPlan.build field by field, and _SparseRowSupportPlan.build's classes."""
+        """The factor pattern from its definition, on random forests: leaf-first subtrees, no fill, one entry per
+        related coordinate pair in consistent row, column, level and physical indices, and ancestor masks; the
+        support classes name each endpoint union and each coordinate's limit support."""
         rng = np.random.default_rng(1)
         for parent, dofs in self.forests():
-            if dofs.sum() > 64:
+            if not 1 <= dofs.sum() <= 64:
                 continue
             plan = TreePlan.build(parent, dofs)
-            mass = _SparseMassMatrixPlan.build(parent, dofs)
             factor = plan.factor
-            for name in (
-                "permutation",
-                "inverse_permutation",
-                "row_offsets",
-                "columns",
-                "entry_rows",
-                "lookup",
-                "dof_joint",
-                "ancestor_mask",
-                "joint_ancestor_mask",
-                "column_offsets",
-                "column_entries",
-                "factor_level_offsets",
-                "factor_level_columns",
-                "factor_level_entry_offsets",
-                "factor_level_entries",
-            ):
-                np.testing.assert_array_equal(getattr(factor, name), getattr(mass, name), err_msg=name)
-            # mixed_tree_kinetic's physical-index map, built entry by entry there.
-            physical = np.full((mass.dof_count, mass.dof_count), -1, np.int32)
-            for index, (row, col) in enumerate(zip(mass.entry_rows, mass.columns, strict=True)):
-                a, b = mass.permutation[row], mass.permutation[col]
-                physical[a, b] = physical[b, a] = index
-            np.testing.assert_array_equal(factor.physical_lookup, physical)
-            body_masks = mass.joint_ancestor_mask[rng.integers(0, parent.size, parent.size)]
-            for width in (min(4, mass.dof_count), mass.dof_count):
-                ours = plan.support_classes(body_masks, width)
-                reference = _SparseRowSupportPlan.build(mass, body_masks, max_row_dofs=width)
-                self.assertEqual(ours is None, reference is None)
-                if reference is not None:
-                    for name in ("body_class", "pair_class", "class_dof", "limit_class"):
-                        np.testing.assert_array_equal(getattr(ours, name), getattr(reference, name), err_msg=name)
+            n = factor.dof_count
+            node = plan.dof_node[factor.permutation]  # each factor coordinate's node
+            related = plan.ancestor_matrix()  # [i, a]: a is i or one of its ancestors
+            np.testing.assert_array_equal(factor.permutation[factor.inverse_permutation], np.arange(n))
+            # Leaf-first: an ancestor's coordinates follow its descendants'.
+            above = related[node[:, None], node[None, :]] & (node[:, None] != node[None, :])  # [c, r]: r's above c's
+            rows, cols = np.nonzero(above)
+            self.assertTrue(np.all(cols > rows))
+            # Entry (row, col), row >= col, exactly when row's node is col's or one of its ancestors.
+            pattern = np.tril(related[node[None, :], node[:, None]])
+            np.testing.assert_array_equal(factor.lookup >= 0, pattern)
+            # Entries row by row (CSR), and column by column, rows ascending (CSC).
+            entries = np.arange(factor.nonzero_count)
+            np.testing.assert_array_equal(factor.lookup[factor.entry_rows, factor.columns], entries)
+            self.assertTrue(np.all(np.diff(factor.entry_rows) >= 0))
+            np.testing.assert_array_equal(np.diff(factor.row_offsets), pattern.sum(axis=1))
+            np.testing.assert_array_equal(factor.column_entries, np.lexsort((factor.entry_rows, factor.columns)))
+            np.testing.assert_array_equal(np.diff(factor.column_offsets), pattern.sum(axis=0))
+            physical = factor.physical_lookup[factor.permutation[:, None], factor.permutation[None, :]]
+            np.testing.assert_array_equal(physical, np.where(pattern, factor.lookup, factor.lookup.T))
+            # No fill: the Cholesky factor of a positive definite matrix on the related pairs keeps to the pattern.
+            symmetric = rng.normal(size=(n, n))
+            symmetric = (symmetric + symmetric.T) * (pattern | pattern.T)
+            lower = np.linalg.cholesky(symmetric + np.diag(np.abs(symmetric).sum(axis=1) + 1.0))
+            np.testing.assert_array_equal(lower[~pattern], 0.0)
+            # A pivot's level follows every earlier column its row holds; the level lists group by level.
+            off = factor.entry_rows != factor.columns
+            self.assertTrue(np.all(factor.levels[factor.entry_rows[off]] > factor.levels[factor.columns[off]]))
+            for level in range(factor.factor_level_count):
+                columns = factor.factor_level_columns[
+                    factor.factor_level_offsets[level] : factor.factor_level_offsets[level + 1]
+                ]
+                np.testing.assert_array_equal(factor.levels[columns], level)
+                entries = factor.factor_level_entries[
+                    factor.factor_level_entry_offsets[level] : factor.factor_level_entry_offsets[level + 1]
+                ]
+                np.testing.assert_array_equal(factor.levels[factor.columns[entries]], level)
+            np.testing.assert_array_equal(np.sort(factor.factor_level_entries), np.flatnonzero(off))
+            # Masks: the factor coordinates of each node's ancestors and itself.
+            bits = np.left_shift(np.uint64(1), np.arange(n, dtype=np.uint64))
+            expected = np.bitwise_or.reduce(np.where(related[:, node], bits, np.uint64(0)), axis=1)
+            np.testing.assert_array_equal(factor.joint_ancestor_mask, expected)
+            np.testing.assert_array_equal(factor.ancestor_mask, expected[factor.dof_joint])
+
+            def coordinates(mask, n=n):
+                return [f for f in range(n) if int(mask) >> f & 1]
+
+            body_masks = factor.joint_ancestor_mask[rng.integers(0, parent.size, parent.size)]
+            for width in (min(4, n), n):
+                classes = plan.support_classes(body_masks, width)
+                unions = [int(a | b) for a in (0, *body_masks) for b in (0, *body_masks)] + list(factor.ancestor_mask)
+                self.assertEqual(classes is None, max(int(m).bit_count() for m in unions) > width)
+                if classes is None:
+                    continue
+
+                def pattern_of(index, classes=classes):
+                    """A class's coordinates, checked ascending and padded with -1."""
+                    row = classes.class_dof[index]
+                    used = int(np.count_nonzero(row >= 0))
+                    self.assertTrue(np.all(np.diff(row[:used]) > 0) and np.all(row[used:] == -1))
+                    return row[:used].tolist()
+
+                for a, mask_a in enumerate(body_masks):
+                    self.assertEqual(pattern_of(classes.pair_class[classes.body_class[a], 0]), coordinates(mask_a))
+                    for b, mask_b in enumerate(body_masks):
+                        pair = classes.pair_class[classes.body_class[a], classes.body_class[b]]
+                        self.assertEqual(pattern_of(pair), coordinates(mask_a | mask_b))
+                for dof, mask in enumerate(factor.ancestor_mask):
+                    self.assertEqual(pattern_of(classes.limit_class[dof]), coordinates(mask))
 
     def test_local_parents(self):
         """The held operators' and the solver's local-parent remaps (one function, both spellings)."""
@@ -246,6 +283,30 @@ class TestTreePlan(unittest.TestCase):
                     bits |= 1 << int(dof - start[root[node]])
                 walk = int(parent[walk])
             self.assertEqual(int(plan.coordinate_mask[node]), bits)
+
+    def test_up_flags_set_every_slot_they_read(self):
+        """A descending walk that follows the up flags (the serial up scans' protocol) sums every subtree from slots
+        holding NaN: each slot it reads, a first child stored first, so no slot needs clearing."""
+        rng = np.random.default_rng(4)
+        for parent, dofs in self.forests():
+            plan = TreePlan.build(parent, dofs)
+            own = rng.standard_normal(parent.size)
+            slot = np.full(parent.size, np.nan)
+            total = np.empty(parent.size)
+            for node in range(parent.size - 1, -1, -1):
+                flags = int(plan.up_flags[node])
+                children = slot[node] if flags & UP_SUMS else 0.0
+                total[node] = own[node] + children
+                up = int(parent[node])
+                if up >= 0:
+                    slot[up] = total[node] if flags & UP_FIRST else slot[up] + total[node]
+            expected = own.copy()
+            for level in range(plan.max_depth, 0, -1):
+                nodes = plan.level_nodes[plan.level_offsets[level] : plan.level_offsets[level + 1]]
+                np.add.at(expected, parent[nodes], expected[nodes])
+            np.testing.assert_allclose(total, expected, rtol=1e-12, atol=1e-12)
+            has_children = np.bincount(parent[parent >= 0], minlength=parent.size) > 0
+            np.testing.assert_array_equal((plan.up_flags & UP_SUMS) != 0, has_children)
 
     def test_cycles_and_bad_parents_raise(self):
         for parent in ([0], [-1, 2, 1], [-1, 5]):

@@ -39,7 +39,7 @@ from .field_group import Field
 from .kernel_template import KernelTemplate, params
 from .spatial_laws import (
     INERTIA_CHANNELS,
-    cross_wrench,
+    body_wrench,
     inertia_apply,
     inertia_at,
     inertia_matrix,
@@ -116,6 +116,7 @@ DYNAMICS = (
     Field("dfs_order", wp.int32, ("joint",), attr="_joint_dfs_order"),
     Field("dfs_position", wp.int32, ("joint",), attr="_joint_dfs_position"),
     Field("dfs_end", wp.int32, ("joint",), attr="_joint_dfs_end"),
+    Field("up_flags", wp.int32, ("joint",), attr="_joint_up_flags"),
     # The state the passes read coordinates from and publish poses and COM twists to.
     Field("joint_q", wp.float32, ("coord",), owner="state"),
     Field("joint_qd", wp.float32, ("dof",), owner="state"),
@@ -183,12 +184,11 @@ def body_dynamics(
     body_f_s: wp.array[wp.spatial_vector],
     body_qd: wp.array[wp.spatial_vector],
 ):
-    """Place a body's inertia at the origin and store its inverse-dynamics wrench; optionally its COM twist.
+    """Store a body's inverse-dynamics wrench about the origin (:func:`.spatial_laws.body_wrench`); optionally
+    its inertia there and its COM twist.
 
-    The wrench is the body's momentum rate at its twist and bias acceleration less its weight,
-    ``I a + v x* (I v) - (m g, c x m g)``, with ``c`` its center of mass relative to the origin.
-    ``write_matrix`` stores the dense spatial inertia, ``write_record`` the inertia record. A body outside
-    an articulation (``articulation < 0``) only publishes its COM twist.
+    ``write_matrix`` stores the dense spatial inertia, ``write_record`` the inertia record. A body outside an
+    articulation (``articulation < 0``) only publishes its COM twist.
     """
     if articulation < 0:
         if publish_twist != 0:
@@ -196,14 +196,14 @@ def body_dynamics(
             body_qd[body] = wp.spatial_vector(linear, wp.spatial_bottom(velocity))
         return
     offset = wp.transform_get_translation(pose_com) - origin
-    body_mass, moment, rotational = inertia_at(mass, inertia, wp.transform_get_rotation(pose_com), offset)
-    if write_matrix != 0:
-        body_I_s[body] = inertia_matrix(body_mass, moment, rotational)
-    if write_record != 0:
-        body_inertia_terms[body] = pack_inertia(body_mass, moment, rotational)
-    gyroscopic = cross_wrench(velocity, inertia_apply(body_mass, moment, rotational, velocity))
-    weight = wrench_shift(wp.spatial_vector(body_mass * gravity, wp.vec3()), offset)
-    body_f_s[body] = inertia_apply(body_mass, moment, rotational, acceleration) + gyroscopic - weight
+    rotation = wp.transform_get_rotation(pose_com)
+    if write_matrix != 0 or write_record != 0:
+        body_mass, moment, rotational = inertia_at(mass, inertia, rotation, offset)
+        if write_matrix != 0:
+            body_I_s[body] = inertia_matrix(body_mass, moment, rotational)
+        if write_record != 0:
+            body_inertia_terms[body] = pack_inertia(body_mass, moment, rotational)
+    body_f_s[body] = body_wrench(mass, rotation, inertia, offset, velocity, acceleration, gravity)
     if publish_twist != 0:
         linear = point_velocity(velocity, wp.transform_point(pose, com) - origin)
         body_qd[body] = wp.spatial_vector(linear, wp.spatial_bottom(velocity))
@@ -446,7 +446,7 @@ _JOINT_FORCES = serial_scan(_SUM, Direction.UP, net_wrench, generalized_force)
 def articulation_tau(index: int, d: DynamicsData):
     """The joint forces of articulation ``index``; ``body_ft_s`` receives each body's children's sum."""
     start, end = d.articulation_start[index], d.articulation_joint_end[index]
-    _JOINT_FORCES(start, end, d.joint_parent, d.joint_child, d.body_ft_s, d)
+    _JOINT_FORCES(start, end, d.joint_parent, d.joint_child, d.up_flags, d.body_ft_s, d)
 
 
 @wp.kernel(module=_INVERSE_DYNAMICS)
@@ -471,12 +471,12 @@ def direct_branch_tau(group_to_art: wp.array[int], dof_joint_offset: wp.array[in
 
 
 @wp.func
-def body_record(node: int, d: DynamicsData) -> inertia_record:
-    """A joint's child body's inertia record."""
-    return d.body_inertia_terms[d.joint_child[node]]
+def subtree_record(node: int, children: inertia_record, d: DynamicsData) -> inertia_record:
+    """A joint's subtree's inertia record: its child body's and its children's."""
+    return d.body_inertia_terms[d.joint_child[node]] + children
 
 
-_COMPOSITE = serial_scan(_SUM, Direction.UP, body_record, own_first=True)
+_COMPOSITE = serial_scan(_SUM, Direction.UP, subtree_record, store_total=True)
 
 
 @wp.kernel(module=_MASS_DYNAMICS)
@@ -487,7 +487,7 @@ def composite_inertia(d: DynamicsData):
     if d.mass_update_mask[index] == 0:
         return
     start, end = d.articulation_start[index], d.articulation_joint_end[index]
-    _COMPOSITE(start, end, d.joint_parent, d.joint_child, d.body_I_c, d)
+    _COMPOSITE(start, end, d.joint_parent, d.joint_child, d.up_flags, d.body_I_c, d)
 
 
 # ---------------------------------------------------------------------------------------------------------------------

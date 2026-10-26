@@ -1117,6 +1117,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 articulation_origin=wp.array((wp.vec3(),), dtype=wp.vec3, device=device),
                 tau=tau,
                 add_existing_tau=1,
+                up_flags=wp.zeros(1, dtype=wp.int32, device=device),
                 **values,
             )
 
