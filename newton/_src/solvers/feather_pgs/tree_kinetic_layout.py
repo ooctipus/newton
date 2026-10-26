@@ -18,8 +18,9 @@ class TreeLayout:
     root_dofs: int
     permutation: tuple[int, ...]
     # Threads per tree. Small trees share a 32-thread block (two 16-lane
-    # trees, eight 4-lane trees, ...) with warp-level barriers; 0 selects the
-    # unpacked default of one tree per block.
+    # trees, eight 4-lane trees, ...) with warp-level barriers; 64 gives a tree
+    # two warps (more than 32 bodies, or heavy chains packed into two warps);
+    # 0 selects one tree per block of the warps its bodies need.
     lanes: int = 0
     # A forest: local body index of every root (one tree: (0,)), each root's
     # coordinate count (0 fixed, 6 free), its coordinate offset within the
@@ -43,7 +44,7 @@ class TreeLayout:
             raise ValueError("Cached forest roots start at body 0 and are fixed or free")
         if self.lanes == 0:
             object.__setattr__(self, "lanes", 64 if self.bodies > 32 else 32)
-        if self.lanes not in (4, 8, 16, 32, 64) or self.lanes < self.bodies or (self.lanes == 64) != (self.bodies > 32):
+        if self.lanes not in (4, 8, 16, 32, 64) or self.lanes < self.bodies:
             raise ValueError("Cached tree lanes must be a power of two covering every body")
         if self.root_dofs not in (0, 6) or self.root_dofs > self.dofs:
             raise ValueError("Cached trees require a fixed or free root")
@@ -156,13 +157,14 @@ class TreeLayout:
             raise ValueError(f"Native fragments shadow layout sizes: {sorted(clashes)}")
         return substitute(source, sizes, **{name: substitute(text, sizes) for name, text in fragments.items()})
 
-    def native(self, source, **fragments):
-        """Render a native template (see :meth:`render`) after the tree's lane group of :attr:`lanes` threads.
+    def native(self, source, *, preludes=(), **fragments):
+        """Render a native template (see :meth:`render`) after the tree's lane group of :attr:`lanes` threads and
+        the ``preludes`` its fragments call.
 
         A tree of fewer than 32 lanes shares a warp with others (one per ``SUB``); a tree of 32 lanes owns its
         warp and a tree of 64 its block (:func:`~.device_preludes.lane_group`).
         """
-        return dual_native(self.render(source, **fragments), preludes=(lane_group(self.lanes),))
+        return dual_native(self.render(source, **fragments), preludes=(lane_group(self.lanes), *preludes))
 
 
 # The 44-body, 43-coordinate free-root chain the kernels were first written for;

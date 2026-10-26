@@ -164,32 +164,44 @@ def cross_wrench(twist: wp.spatial_vector, wrench: wp.spatial_vector) -> wp.spat
 
 
 @SPATIAL.law
+def inertia_shift(mass: float, rotational: wp.mat33, offset: wp.vec3) -> tuple[float, wp.vec3, wp.mat33]:
+    """Return the inertia about the origin of a body whose center of mass lies at ``offset`` from it.
+
+    ``rotational`` is the body's rotational inertia about its center of mass
+    in the origin's axes. The result is ``(mass, mass * offset, rotational +
+    mass (|offset|^2 1 - offset offset^T))``, the parallel-axis law entry by
+    entry.
+    """
+    square = wp.dot(offset, offset)
+    x = offset[0]
+    y = offset[1]
+    z = offset[2]
+    shifted = wp.mat33(
+        rotational[0, 0] + mass * (square - x * x),
+        rotational[0, 1] + mass * (0.0 - x * y),
+        rotational[0, 2] + mass * (0.0 - x * z),
+        rotational[1, 0] + mass * (0.0 - y * x),
+        rotational[1, 1] + mass * (square - y * y),
+        rotational[1, 2] + mass * (0.0 - y * z),
+        rotational[2, 0] + mass * (0.0 - z * x),
+        rotational[2, 1] + mass * (0.0 - z * y),
+        rotational[2, 2] + mass * (square - z * z),
+    )
+    return mass, mass * offset, shifted
+
+
+@SPATIAL.law
 def inertia_at(mass: float, inertia: wp.mat33, rotation: wp.quat, offset: wp.vec3) -> tuple[float, wp.vec3, wp.mat33]:
     """Return a body's inertia about the origin: ``(mass, mass * offset, rotational)``.
 
     ``inertia`` is the body-frame inertia about the center of mass, ``rotation``
     the body's orientation and ``offset`` its center of mass relative to the
-    origin. The rotational inertia is ``R I R^T + mass (|offset|^2 1 - offset
-    offset^T)``, the parallel-axis law entry by entry.
+    origin: the rotated inertia ``R I R^T`` shifted to the origin
+    (:func:`inertia_shift`).
     """
     basis = wp.quat_to_matrix(rotation)
-    rotated = basis * inertia * wp.transpose(basis)
-    square = wp.dot(offset, offset)
-    x = offset[0]
-    y = offset[1]
-    z = offset[2]
-    rotational = wp.mat33(
-        rotated[0, 0] + mass * (square - x * x),
-        rotated[0, 1] + mass * (0.0 - x * y),
-        rotated[0, 2] + mass * (0.0 - x * z),
-        rotated[1, 0] + mass * (0.0 - y * x),
-        rotated[1, 1] + mass * (square - y * y),
-        rotated[1, 2] + mass * (0.0 - y * z),
-        rotated[2, 0] + mass * (0.0 - z * x),
-        rotated[2, 1] + mass * (0.0 - z * y),
-        rotated[2, 2] + mass * (square - z * z),
-    )
-    return mass, mass * offset, rotational
+    total, moment, rotational = inertia_shift(mass, basis * inertia * wp.transpose(basis), offset)
+    return total, moment, rotational
 
 
 @SPATIAL.law

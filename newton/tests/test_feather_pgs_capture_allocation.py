@@ -31,14 +31,10 @@ _CONFIGURATIONS = {
 
 
 def _tier_solver(model, name):
-    """The named tier configuration; a held-tree owner, if admitted, keeps one tree per block.
-
-    The default times the owner's lane widths at construction, so two instances could run
-    different layouts.
-    """
+    """The named tier configuration."""
     switches, environment = _CONFIGURATIONS[name]
     with contextlib.ExitStack() as stack:
-        stack.enter_context(patch.dict(os.environ, {**environment, "FEATHER_PGS_TREE_LANE_PACK": "0"}))
+        stack.enter_context(patch.dict(os.environ, environment))
         for switch, value in switches.items():
             stack.enter_context(patch.object(source, switch, value))
         return _matrix_free_solver(model, beta=0.0, parallel_rows=32)

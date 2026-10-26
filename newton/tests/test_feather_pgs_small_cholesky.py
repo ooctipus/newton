@@ -9,6 +9,8 @@ import numpy as np
 import warp as wp
 
 from newton._src.solvers.feather_pgs import small_cholesky
+from newton._src.solvers.feather_pgs.spatial_laws import inertia_record
+from newton.tests.test_feather_pgs_sparse_mass_matrix import _random_inertia
 
 
 class TestSmallCholesky(unittest.TestCase):
@@ -33,8 +35,9 @@ class TestSmallCholesky(unittest.TestCase):
         masks = np.ones(articulations, dtype=np.int32)
         masks[group_to_art[1]] = 0
         motion = rng.normal(size=(articulations, size, 6)).astype(np.float32)
-        raw = rng.normal(size=(articulations, 6, 6)).astype(np.float32)
-        inertia = raw @ raw.transpose(0, 2, 1) + np.eye(6, dtype=np.float32)
+        pairs = [_random_inertia(rng) for _ in range(articulations)]
+        records = np.asarray([record for record, _ in pairs], dtype=np.float32)
+        inertia = np.asarray([dense for _, dense in pairs])
         regularizer = rng.uniform(1, 2, size=(groups, size)).astype(np.float32)
         drive = np.arange(articulations * size, dtype=np.int32)
         drive[::3] = -1
@@ -73,7 +76,7 @@ class TestSmallCholesky(unittest.TestCase):
             array(masks, int),
             array(np.arange(articulations * size), int),
             array(motion.reshape(-1, 6), wp.spatial_vector),
-            array(np.repeat(inertia, size, axis=0), wp.spatial_matrix),
+            array(np.repeat(records, size, axis=0), inertia_record),
             array(group_to_art, int),
             array(regularizer),
             array(np.arange(size), int),

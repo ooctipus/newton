@@ -801,7 +801,6 @@ class ScalarBranchState:
         self.repair_kernel = repair_scalar_branches
         self.predictor_kernel = predict_prismatic_branches if plan.prismatic else predict_scalar_branches
         self.finish_kernel = finish_prismatic_branches if plan.prismatic else finish_scalar_branches
-        self.lane_timing = {}
         # The predict folds the branches' augmented drives, so the drive
         # preparation runs only over the other DOFs.
         other = np.ones(model.joint_dof_count, dtype=bool)

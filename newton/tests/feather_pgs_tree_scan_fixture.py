@@ -3,12 +3,11 @@
 
 """Shared machinery of the tree-scan and tree-pass tests and ``tools/fpgs_bench/tree_scan_bench.py``.
 
-Tree shapes, the existing held-tree passes compiled as stand-alone natives
-(their module texts, unchanged), the ``tree_scan`` configuration of each, and
-kernels that run either on the same scratch so that the two can be compared
-bit for bit or timed with the same launch; articulated models of the shapes
-and the general route's passes on a solver's own arrays (:class:`GeneralRoute`),
-with the tape and central-difference gradients of each. It defines no tests.
+Tree shapes, every held-tree scan configuration compiled as a stand-alone
+native on a held tree's scratch layout (to compare with a float64 reference or
+time with one launch), articulated models of the shapes, and the general
+route's passes on a solver's own arrays (:class:`GeneralRoute`), with the tape
+and central-difference gradients of each. It defines no tests.
 """
 
 import functools
@@ -17,8 +16,9 @@ from dataclasses import dataclass
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import sparse_factor, tree_chain_scan, tree_kinetic_state
+from newton._src.solvers.feather_pgs import sparse_factor, tree_kinetic_state
 from newton._src.solvers.feather_pgs import tree_scan as ts
+from newton._src.solvers.feather_pgs.device_preludes import device_branches
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 
@@ -128,7 +128,7 @@ def plan_of(name: str) -> TreePlan:
 
 
 def lanes_of(plan: TreePlan, packed: int = 0) -> int:
-    """The held tree's lanes for ``plan``: 32 (or ``packed``) up to 32 bodies, 64 beyond."""
+    """A held tree's lanes for ``plan``: 32 (or ``packed``) up to 32 bodies, 64 beyond."""
     if plan.count > 32:
         return 64
     if packed:
@@ -142,78 +142,19 @@ def layout_of(plan: TreePlan, lanes: int) -> TreeLayout:
     return TreeLayout(n, n, n, 1, plan.max_depth, 0, tuple(range(n - 1, -1, -1)), lanes)
 
 
-def kinetic_plan(plan: TreePlan, device) -> tree_kinetic_state.KineticPlan:
-    """The held tree's kinetic plan struct, filled from ``plan`` (the arrays the scans and reductions read)."""
-    result = tree_kinetic_state.KineticPlan()
-    one = np.zeros(1, np.int32)
-    arrays = {
-        "parent": plan.parent,
-        "depth": plan.depth,
-        "jump": plan.jump,
-        "children_offsets": plan.children_offsets,
-        "children": plan.children if plan.children.size else one,
-        "q_index": one,
-        "root_slot": one,
-        "dfs_order": plan.dfs_order,
-        "dfs_end": plan.dfs_end,
-        "body_dof_start": np.arange(plan.count, dtype=np.int32),
-        "body_dof_count": np.ones(plan.count, np.int32),
-        "arts": one.reshape(1, 1),
-        "root_of": plan.root_of,
-        "root_local": plan.roots,
-        "free_root_local": one,
-        "free_root_dof": one,
-        "dof_passive": np.ones(plan.count, np.int32),
-    }
-    for name, values in arrays.items():
-        setattr(result, name, wp.array(np.ascontiguousarray(values, dtype=np.int32), dtype=int, device=device))
-    return result
-
-
-def chain_plan(plan: TreePlan, device):
-    """The held tree's chain plan struct, through the existing builder; ``None`` where it rejects the tree."""
-    try:
-        host = tree_chain_scan.make_plan(plan.parent)
-    except ValueError:
-        return None
-    result = tree_chain_scan.ChainPlan()
-    one = np.zeros(1, np.int32)
-    for name, values in (
-        ("parent", plan.parent),
-        ("depth", plan.depth),
-        ("jump", plan.jump),
-        ("children_offsets", plan.children_offsets),
-        ("children", plan.children if plan.children.size else one),
-        ("q_index", one),
-        ("root_slot", one),
-        ("chain_meta", host["meta"].reshape(-1)),
-        ("light_offsets", host["light_offsets"]),
-        ("light_children", host["light_children"] if host["light_children"].size else one),
-        ("stage_width", host["stage_width"]),
-    ):
-        setattr(result, name, wp.array(np.ascontiguousarray(values, dtype=np.int32), dtype=int, device=device))
-    result.chain_levels = int(host["levels"])
-    result.chain_width = int(host["widths"].max())
-    return result
-
-
 # ---------------------------------------------------------------------------------------------------------------------
-# Passes: each existing text and its generated configuration, on one scratch layout
+# Passes: each held-tree scan configuration, on one scratch layout
 # ---------------------------------------------------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class Pass:
-    """A held-tree pass: its existing native text and the ``tree_scan`` configuration that replaces it."""
+    """A held-tree pass: the ``tree_scan`` configuration a held kernel runs."""
 
     name: str
     combine: ts.Combine
     direction: ts.Direction
     schedule: ts.Schedule
-    site: str
-    """Where the existing text lives."""
-    plan_struct: str
-    """``kinetic`` or ``chain``: the struct the existing text reads."""
 
 
 POSE, MOTION = ts.TRANSFORM, ts.TWIST.with_zero_acceleration()
@@ -222,77 +163,39 @@ EXTERNAL = ts.add(ts.Group("wrench", 6))
 TWIST_SUM = ts.add(ts.Group("twist", 6))
 
 PASSES = {
-    "pose_smem": Pass(
-        "pose_smem", POSE, ts.Direction.DOWN, ts.Schedule.JUMP_SMEM, "tree_kinetic_state._POSE", "kinetic"
-    ),
-    "motion_smem": Pass(
-        "motion_smem", MOTION, ts.Direction.DOWN, ts.Schedule.JUMP_SMEM, "tree_kinetic_state._MOTION", "kinetic"
-    ),
-    "pose_shfl": Pass(
-        "pose_shfl", POSE, ts.Direction.DOWN, ts.Schedule.JUMP_SHFL, "tree_kinetic_state._POSE_SHFL", "kinetic"
-    ),
-    "motion_shfl": Pass(
-        "motion_shfl", MOTION, ts.Direction.DOWN, ts.Schedule.JUMP_SHFL, "tree_kinetic_state._MOTION_SHFL", "kinetic"
-    ),
-    "pose_chain": Pass(
-        "pose_chain", POSE, ts.Direction.DOWN, ts.Schedule.HEAVY_CHAIN, "tree_chain_scan._POSE", "chain"
-    ),
-    "motion_chain": Pass(
-        "motion_chain", MOTION, ts.Direction.DOWN, ts.Schedule.HEAVY_CHAIN, "tree_chain_scan._MOTION", "chain"
-    ),
-    "reduce_level": Pass(
-        "reduce_level",
-        WRENCH_MOMENTS,
-        ts.Direction.UP,
-        ts.Schedule.LEVEL,
-        "tree_kinetic_state._LEVEL_REDUCE",
-        "kinetic",
-    ),
-    "reduce_interval": Pass(
-        "reduce_interval",
-        WRENCH_MOMENTS,
-        ts.Direction.UP,
-        ts.Schedule.DFS_INTERVAL,
-        "tree_kinetic_state._INTERVAL_REDUCE",
-        "kinetic",
-    ),
-    "reduce_chain": Pass(
-        "reduce_chain",
-        WRENCH_MOMENTS,
-        ts.Direction.UP,
-        ts.Schedule.HEAVY_CHAIN,
-        "tree_chain_scan.reduction_source(moments=True)",
-        "chain",
-    ),
-    "external_level": Pass(
-        "external_level",
-        EXTERNAL,
-        ts.Direction.UP,
-        ts.Schedule.LEVEL,
-        "tree_kinetic_state._EXTERNAL_REDUCE",
-        "kinetic",
-    ),
-    "external_chain": Pass(
-        "external_chain",
-        EXTERNAL,
-        ts.Direction.UP,
-        ts.Schedule.HEAVY_CHAIN,
-        "tree_chain_scan.reduction_source(moments=False)",
-        "chain",
-    ),
-    "twist_shfl": Pass(
-        "twist_shfl", TWIST_SUM, ts.Direction.DOWN, ts.Schedule.JUMP_SHFL, "tree_kinetic_state._TWIST_BLOCK", "kinetic"
-    ),
+    item.name: item
+    for item in (
+        Pass("pose_smem", POSE, ts.Direction.DOWN, ts.Schedule.JUMP_SMEM),
+        Pass("motion_smem", MOTION, ts.Direction.DOWN, ts.Schedule.JUMP_SMEM),
+        Pass("pose_shfl", POSE, ts.Direction.DOWN, ts.Schedule.JUMP_SHFL),
+        Pass("motion_shfl", MOTION, ts.Direction.DOWN, ts.Schedule.JUMP_SHFL),
+        Pass("pose_chain", POSE, ts.Direction.DOWN, ts.Schedule.HEAVY_CHAIN),
+        Pass("motion_chain", MOTION, ts.Direction.DOWN, ts.Schedule.HEAVY_CHAIN),
+        Pass("pose_level", POSE, ts.Direction.DOWN, ts.Schedule.LEVEL),
+        Pass("reduce_level", WRENCH_MOMENTS, ts.Direction.UP, ts.Schedule.LEVEL),
+        Pass("reduce_interval", WRENCH_MOMENTS, ts.Direction.UP, ts.Schedule.DFS_INTERVAL),
+        Pass("reduce_chain", WRENCH_MOMENTS, ts.Direction.UP, ts.Schedule.HEAVY_CHAIN),
+        Pass("external_level", EXTERNAL, ts.Direction.UP, ts.Schedule.LEVEL),
+        Pass("external_chain", EXTERNAL, ts.Direction.UP, ts.Schedule.HEAVY_CHAIN),
+        Pass("twist_shfl", TWIST_SUM, ts.Direction.DOWN, ts.Schedule.JUMP_SHFL),
+    )
 }
-"""Every held-tree pass with its generated configuration."""
+"""Every held-tree scan configuration (the schedules the held kernels choose from)."""
+
+
+def chain_lanes(plan: TreePlan) -> int:
+    """Lanes of a heavy-chain launch of ``plan``: one tree per block of the warps its chains pack into."""
+    packing = plan.chain_packing(2)
+    return max(lanes_of(plan), packing.lanes if packing is not None else 32)
 
 
 def applies(item: Pass, plan: TreePlan, lanes: int) -> bool:
-    """Whether the existing pass runs on a tree of this plan at ``lanes`` lanes."""
-    if item.plan_struct == "chain":
-        return plan.chain_packing(2) is not None and plan.count <= 64
+    """Whether the pass runs on a tree of this plan at ``lanes`` lanes (one tree per block for a chain)."""
+    if item.schedule is ts.Schedule.HEAVY_CHAIN:
+        packing = plan.chain_packing(2)
+        return packing is not None and lanes >= 32 and packing.lanes <= lanes
     if item.schedule in (ts.Schedule.JUMP_SHFL, ts.Schedule.DFS_INTERVAL):
-        return lanes <= 32 and plan.count <= lanes
+        return plan.count <= min(lanes, 32)
     return plan.count <= lanes
 
 
@@ -319,8 +222,8 @@ def storage(layout: TreeLayout, item: Pass) -> ts.Storage:
     )
 
 
-# Wrappers: one native per pass with one signature, ``(address, plan, flag)``; ``flag`` is ``refresh`` for the
-# subtree reductions, ``nonzero`` for the external ones and the twist publication switch for the twist sum.
+# One native per pass with one signature, ``(address, plan, flag)``; ``flag`` is ``refresh`` for the subtree
+# reductions, ``nonzero`` for the external ones and the twist publication switch for the twist sum.
 _REDUCE_SCOPE = """    float* s=reinterpret_cast<float*>(address);
 #if defined(__CUDA_ARCH__)
     const int lane=LANE,stride=STRIDE;
@@ -335,7 +238,7 @@ _TWIST_SCOPE = """    const int lane=LANE;
 """
 
 _TWIST_SOURCE = (
-    "{{const int first=ds+$FIRST,count=$COUNT;"
+    "{{const int first=ds+plan.dof_start.data[{node}],count=plan.dof_start.data[{node}+1]-plan.dof_start.data[{node}];"
     "for(int d=0;d<count;++d){{const wp::spatial_vector axis=f.S.data[first+d];const float speed=f.vhat.data[first+d];"
     "for(int k=0;k<6;++k){value}[k]+=axis[k]*speed;}}}}"
 )
@@ -345,57 +248,14 @@ _TWIST_SINK = (
 )
 
 
-def existing_text(item: Pass, layout: TreeLayout) -> str:
-    """The pass's existing text, unchanged, in its wrapper scope."""
-    if item.name == "pose_smem":
-        return tree_kinetic_state._POSE
-    if item.name == "motion_smem":
-        return tree_kinetic_state._MOTION
-    if item.name == "pose_shfl":
-        return tree_kinetic_state._POSE_SHFL
-    if item.name == "motion_shfl":
-        return tree_kinetic_state._MOTION_SHFL
-    if item.name == "pose_chain":
-        return tree_chain_scan._POSE
-    if item.name == "motion_chain":
-        return tree_chain_scan._MOTION
-    if item.name == "reduce_level":
-        return _REDUCE_SCOPE + tree_kinetic_state._LEVEL_REDUCE
-    if item.name == "reduce_interval":
-        return _REDUCE_SCOPE + tree_kinetic_state._INTERVAL_REDUCE
-    if item.name == "reduce_chain":
-        return _REDUCE_SCOPE + tree_chain_scan.reduction_source(moments=True, layout=layout)
-    if item.name == "external_level":
-        return _REDUCE_SCOPE + tree_kinetic_state._EXTERNAL_REDUCE
-    if item.name == "external_chain":
-        return (
-            _REDUCE_SCOPE + "if(nonzero) {\n" + tree_chain_scan.reduction_source(moments=False, layout=layout) + "}\n"
-        )
-    if item.name == "twist_shfl":
-        return _TWIST_SCOPE + tree_kinetic_state._TWIST_BLOCK
-    raise KeyError(item.name)
-
-
-def generated_text(item: Pass, plan: TreePlan, layout: TreeLayout, *, dialect: str, cpu: bool = True) -> str:
-    """The pass's ``tree_scan`` configuration in its wrapper scope.
-
-    ``dialect`` ``"held"`` reads the existing plan structs (``p`` in scans, ``plan`` in reductions, depth tests
-    for levels); ``"scan"`` reads a :class:`~newton._src.solvers.feather_pgs.tree_scan.ScanPlan` named ``plan``,
-    levels in the form :func:`~newton._src.solvers.feather_pgs.tree_scan.tree_scan` picks, as the scans will
-    once the owners hold a tree plan.
-    """
+def generated_text(item: Pass, plan: TreePlan, layout: TreeLayout, *, cpu: bool = True) -> str:
+    """The pass's ``tree_scan`` configuration on a :class:`~newton._src.solvers.feather_pgs.tree_scan.ScanPlan`
+    named ``plan`` (``p`` in the down scans), in its wrapper scope."""
     reduction = item.direction is ts.Direction.UP or item.name == "twist_shfl"
     access = ts.PlanAccess() if reduction else ts.PlanAccess().renamed("p")
-    level_csr = False if dialect == "held" else None
     source = sink = None
     if item.name == "twist_shfl":
-        if dialect == "held":
-            first, count = "plan.body_dof_start.data[{node}]", "plan.body_dof_count.data[{node}]"
-        else:
-            first, count = "plan.dof_start.data[{node}]", "plan.dof_start.data[{node}+1]-plan.dof_start.data[{node}]"
-        source = _TWIST_SOURCE.replace("$FIRST", first).replace("$COUNT", count)
-        sink = _TWIST_SINK
-        access = ts.PlanAccess()
+        source, sink = _TWIST_SOURCE, _TWIST_SINK
     scan = ts.tree_scan(
         plan,
         item.combine,
@@ -404,17 +264,13 @@ def generated_text(item: Pass, plan: TreePlan, layout: TreeLayout, *, dialect: s
         storage=None if source is not None else storage(layout, item),
         access=access,
         lanes=layout.lanes,
-        level_csr=level_csr,
         source=source,
         sink=sink,
         cpu=item.name != "twist_shfl" and cpu,
     )
     if item.name == "twist_shfl":
-        return (
-            _TWIST_SCOPE
-            + "#if defined(__CUDA_ARCH__)\n    if(f.publish_twists!=0) {\n        SYNC();\n"
-            + scan.cuda
-            + "    }\n#endif\n"
+        return _TWIST_SCOPE + device_branches(
+            "    if(f.publish_twists!=0) {\n        SYNC();\n" + scan.cuda + "    }\n", ""
         )
     if reduction:
         if item.combine is EXTERNAL:
@@ -423,49 +279,24 @@ def generated_text(item: Pass, plan: TreePlan, layout: TreeLayout, *, dialect: s
     return "    float* s=reinterpret_cast<float*>(address);\n" + scan.text
 
 
-def _plan_type(item: Pass, dialect: str):
-    if dialect == "scan":
-        return ts.ScanPlan
-    return tree_chain_scan.ChainPlan if item.plan_struct == "chain" else tree_kinetic_state.KineticPlan
-
-
 @functools.cache
-def pass_kernel(item: Pass, layout: TreeLayout, arm: str, plan=None, repeat: int = 1):
-    """A kernel that runs one pass, ``repeat`` times, on each group's scratch: the ``existing`` text or a
-    ``generated`` configuration (``generated-held`` or ``generated-scan`` dialect).
+def pass_kernel(item: Pass, layout: TreeLayout, plan: TreePlan, repeat: int = 1, text: str | None = None):
+    """A kernel that runs one pass (or the native ``text`` in its scope), ``repeat`` times, on each group's
+    scratch.
 
-    Launch ``launch_tiled(dim=[groups // layout.pack], block_dim=layout.block)`` with ``(base, total, plan,
-    flag, f, sparse)``; ``base`` is the scratch's address and ``total`` its floats per group. ``staged``
-    copies each group's block into shared memory first, as the held-tree kernels hold it.
+    Launch ``launch_tiled(dim=[groups // layout.pack], block_dim=layout.block)`` with ``(base, total, sparse,
+    plan, f, flag)``; ``base`` is the scratch's address and ``total`` its floats per group.
     """
-    if arm == "existing":
-        text, dialect = existing_text(item, layout), "held"
-    else:
-        dialect = arm.split("-", 1)[1]
-        text = generated_text(item, plan, layout, dialect=dialect)
-    preludes = item.combine.preludes() if arm != "existing" else ()
-    snippet = layout.native(text) if not preludes else _with_preludes(layout, text, preludes)
-    plan_type = _plan_type(item, dialect)
+    text = generated_text(item, plan, layout) if text is None else text
+    snippet = layout.native(text, preludes=item.combine.preludes())
 
-    if item.name == "twist_shfl":
+    if item.direction is ts.Direction.UP or item.name == "twist_shfl":
 
         @wp.func_native(snippet)
         def run_pass(
             address: wp.uint64,
             p: sparse_factor.SparsePlan,
-            plan: plan_type,
-            f: tree_kinetic_state.ForceInput,
-            flag: int,
-            group: int,
-        ): ...
-
-    elif item.direction is ts.Direction.UP:
-
-        @wp.func_native(snippet)
-        def run_pass(
-            address: wp.uint64,
-            p: sparse_factor.SparsePlan,
-            plan: plan_type,
+            plan: ts.ScanPlan,
             f: tree_kinetic_state.ForceInput,
             flag: int,
             group: int,
@@ -477,21 +308,20 @@ def pass_kernel(item: Pass, layout: TreeLayout, arm: str, plan=None, repeat: int
         def run_pass(
             address: wp.uint64,
             p_unused: sparse_factor.SparsePlan,
-            p: plan_type,
+            p: ts.ScanPlan,
             f: tree_kinetic_state.ForceInput,
             flag: int,
             group: int,
         ): ...
 
     _lanes, _sync, _sub, _ = tree_kinetic_state._thread_helpers(layout)
-    # A chain scan addresses its block's threads directly: one tree per block, whatever the lane group says.
-    pack = 0 if item.plan_struct == "chain" else layout.pack
+    pack = layout.pack
 
     def run(
         base: wp.uint64,
         total: int,
         sparse: sparse_factor.SparsePlan,
-        plan: plan_type,
+        plan: ts.ScanPlan,
         f: tree_kinetic_state.ForceInput,
         flag: int,
     ):
@@ -499,29 +329,13 @@ def pass_kernel(item: Pass, layout: TreeLayout, arm: str, plan=None, repeat: int
         lanes = _lanes()
         if lanes[1] == 1 and logical != 0:
             return
-        group = block
-        if wp.static(pack > 0):
-            group = block * wp.static(pack) + lanes[2]
+        group = block * wp.static(pack) + lanes[2]
         address = base + wp.uint64(4) * wp.uint64(total) * wp.uint64(group)
         for _ in range(wp.static(repeat)):
             run_pass(address, sparse, plan, f, flag, group)
 
-    run.__name__ = run.__qualname__ = f"tree_scan_{item.name}_{arm.replace('-', '_')}_{layout.bodies}_{layout.lanes}"
+    run.__name__ = run.__qualname__ = f"tree_scan_{item.name}_{layout.bodies}_{layout.lanes}"
     return wp.kernel(module="unique", enable_backward=False)(run)
-
-
-def block_dim(item: Pass, plan: TreePlan, layout: TreeLayout) -> int:
-    """Threads per block: the layout's, or 64 where a chain packing spans two warps."""
-    if item.plan_struct == "chain":
-        packing = plan.chain_packing(2)
-        return max(layout.block, packing.lanes if packing is not None else 32)
-    return layout.block
-
-
-def _with_preludes(layout: TreeLayout, text: str, preludes) -> str:
-    from newton._src.solvers.feather_pgs.device_preludes import dual_native, lane_group  # noqa: PLC0415
-
-    return dual_native(layout.render(text), preludes=(lane_group(layout.lanes), *preludes))
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -547,16 +361,14 @@ class Inputs:
     scratch: wp.array
     total: int
     sparse: sparse_factor.SparsePlan
-    held: object
     scan: ts.ScanPlan
     force: tree_kinetic_state.ForceInput
     twists: wp.array
 
 
-def inputs(item: Pass, plan: TreePlan, layout: TreeLayout, groups: int, seed: int, device) -> Inputs:
+def inputs(plan: TreePlan, layout: TreeLayout, groups: int, seed: int, device) -> Inputs:
     total = layout.sizes()["TOTAL"]
     scratch = wp.array(random_scratch(layout, groups, seed).reshape(-1), dtype=float, device=device)
-    held = chain_plan(plan, device) if item.plan_struct == "chain" else kinetic_plan(plan, device)
     rng = np.random.default_rng(seed + 1)
     sparse = sparse_factor.SparsePlan()
     sparse.joint_child = wp.array(np.arange(groups * plan.count, dtype=np.int32), dtype=int, device=device)
@@ -568,37 +380,29 @@ def inputs(item: Pass, plan: TreePlan, layout: TreeLayout, groups: int, seed: in
     force.vhat = wp.array(rng.standard_normal(groups * plan.count).astype(np.float32), dtype=float, device=device)
     twists = wp.zeros(groups * plan.count, dtype=wp.spatial_vector, device=device)
     force.predicted_twist = twists
-    return Inputs(scratch, total, sparse, held, ts.device_plan(plan, device), force, twists)
+    return Inputs(scratch, total, sparse, ts.device_plan(plan, device), force, twists)
 
 
-def launch(
-    item: Pass, plan: TreePlan, layout: TreeLayout, arm: str, data: Inputs, groups: int, flag: int, device, repeat=1
-):
-    """Run one arm of a pass over ``groups`` trees in place on ``data``."""
-    kernel = pass_kernel(item, layout, arm, plan, repeat)
-    pack = 1 if item.plan_struct == "chain" else layout.pack
-    structure = data.scan if arm == "generated-scan" else data.held
+def launch(item: Pass, plan: TreePlan, layout: TreeLayout, data: Inputs, groups: int, flag: int, device, repeat=1):
+    """Run one pass over ``groups`` trees in place on ``data``."""
     wp.launch_tiled(
-        kernel,
-        dim=[groups // pack],
-        inputs=[wp.uint64(data.scratch.ptr), data.total, data.sparse, structure, data.force, flag],
-        block_dim=block_dim(item, plan, layout),
+        pass_kernel(item, layout, plan, repeat),
+        dim=[groups // layout.pack],
+        inputs=[wp.uint64(data.scratch.ptr), data.total, data.sparse, data.scan, data.force, flag],
+        block_dim=layout.block,
         device=device,
     )
 
 
-def compare(item: Pass, plan: TreePlan, layout: TreeLayout, groups: int, flag: int, seed: int, device):
-    """Run the existing text and both generated dialects on the same inputs; return their outputs per arm."""
-    results = {}
-    for arm in ("existing", "generated-held", "generated-scan"):
-        data = inputs(item, plan, layout, groups, seed, device)
-        launch(item, plan, layout, arm, data, groups, flag, device)
-        results[arm] = (data.scratch.numpy().copy(), data.twists.numpy().copy())
-    return results
+def run(item: Pass, plan: TreePlan, layout: TreeLayout, groups: int, flag: int, seed: int, device):
+    """Run the pass on random scratch; return the scratch and the published twists."""
+    data = inputs(plan, layout, groups, seed, device)
+    launch(item, plan, layout, data, groups, flag, device)
+    return data.scratch.numpy().copy(), data.twists.numpy().copy()
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# The general route: whole articulations through the existing serial kernels and their scan configurations
+# The general route
 # ---------------------------------------------------------------------------------------------------------------------
 
 

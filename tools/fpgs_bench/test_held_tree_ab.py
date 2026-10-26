@@ -104,15 +104,21 @@ class TestHeldTreeAB(unittest.TestCase):
         self.assertEqual(layout[:, [0, 2, 5]].tolist(), [[1, 1, 1], [4, 1, 1]])
         copied = records["mixed-arm-box/copied/begin/launched"].tolist()
         classified = records["mixed-arm-box/copied-classified/begin/launched"].tolist()
+
+        def launched(names, kernel, bodies, suffix=""):
+            """Whether ``names`` holds the ``kernel`` of ``bodies`` bodies, its scans' schedule tag aside."""
+            pattern = re.compile(rf"tree_kinetic_{kernel}{bodies}(_[a-z_]+?)?{suffix}")
+            return any(pattern.fullmatch(name) for name in names)
+
         for bodies in layout[:, 0].tolist():
             with self.subTest(bodies=bodies):
-                self.assertIn(f"tree_kinetic_repair{bodies}_banked", copied)
-                self.assertNotIn(f"tree_kinetic_classify{bodies}", copied)
-                for kernel in ("classify{}", "bank{}", "repair{}_listed"):
-                    self.assertIn("tree_kinetic_" + kernel.format(bodies), classified)
-                self.assertNotIn(f"tree_kinetic_repair{bodies}_banked", classified)
+                self.assertTrue(launched(copied, "repair", bodies, "_banked"), copied)
+                self.assertFalse(launched(copied, "classify", bodies), copied)
+                for kernel, suffix in (("classify", ""), ("bank", ""), ("repair", "_listed")):
+                    self.assertTrue(launched(classified, kernel, bodies, suffix), classified)
+                self.assertFalse(launched(classified, "repair", bodies, "_banked"), classified)
         # Every call records its launches; the hooks are gone afterwards.
-        self.assertIn("tree_kinetic_finish4", records["mixed-arm-box/0/finish/launched"].tolist())
+        self.assertTrue(launched(records["mixed-arm-box/0/finish/launched"].tolist(), "finish", 4))
         self.assertEqual(tree_kinetic_owner.TreeKineticState._publication.__name__, "_publication")
         self.assertEqual((wp.launch.__name__, wp.launch_tiled.__name__), ("launch", "launch_tiled"))
 
@@ -148,10 +154,14 @@ class TestHeldTreeAB(unittest.TestCase):
         ):
             records = ab.record(Path(directory) / "record.npz", scenes=tuple(_OWNER_SCENES))
         ordinary = {"finish", "predict", "repair", "banked", "listed", "classify", "bank"}
-        for scene, (forest, chain_scan, motion) in _OWNER_SCENES.items():
+        for scene, (forest, chains, motion) in _OWNER_SCENES.items():
             tag = scene if scene.startswith(("single-", "prescaled-")) else f"mixed-{scene}"
             with self.subTest(scene=tag):
-                self.assertEqual(records[f"{tag}/layout"][:, [3, 4, 6]].tolist(), [[forest, chain_scan, motion]])
+                layout = records[f"{tag}/layout"]
+                self.assertEqual(layout[:, [3, 6]].tolist(), [[forest, motion]])
+                # A chains1 scene runs every scan on the heavy chains; otherwise the tree's data chooses.
+                if chains:
+                    self.assertEqual(layout[:, 4].tolist(), [1])
                 launched = {
                     key
                     for name, keys in records.items()

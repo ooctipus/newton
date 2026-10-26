@@ -4,52 +4,54 @@
 
 """Generated current/next tree moments, bias and fused state publication."""
 
+import dataclasses
 import functools
 from types import SimpleNamespace
 
 import warp as wp
 
 from ...sim import BodyFlags
-from . import cached_force, field_group, kernels, response_operator, sparse_factor, tree_chain_scan
+from . import cached_force, field_group, kernels, response_operator, sparse_factor
+from . import tree_scan as ts
+from .device_preludes import device_branches
 from .field_group import Field
 from .kernel_template import Dispatch, KernelTemplate, python_kernel
 from .publication_data import PublicationData
-from .spatial_laws import joint_frame_pose, joint_motion, joint_transform
+from .spatial_laws import (
+    INERTIA_CHANNELS,
+    inertia_action,
+    inertia_record,
+    inertia_shift,
+    joint_frame_pose,
+    joint_motion,
+    joint_transform,
+    pack_inertia,
+)
 from .tree_kinetic_layout import REFERENCE_LAYOUT, TreeLayout
 from .tree_passes import body_dynamics
+from .tree_plan import TreePlan
 
+HELD_PLAN = (
+    *ts.SCAN_PLAN,
+    # Each coordinate's joint coordinate in the state bank (group-major) and each group's free-root slots.
+    Field("q_index", wp.int32, ("group_dof",), owner="plan"),
+    Field("root_slot", wp.int32, ("root_slot",), owner="plan"),
+    # Each local body's first local coordinate and coordinate count (its joint's coordinates).
+    Field("body_dof_start", wp.int32, ("node",), owner="plan"),
+    Field("body_dof_count", wp.int32, ("node",), owner="plan"),
+    # Forest groups: the articulation of each root, each body's root index, each root's local body, each free
+    # root's local body and coordinate offset, and whether a coordinate takes passive springs.
+    Field("arts", wp.int32, ("group", "root"), owner="plan"),
+    Field("root_of", wp.int32, ("node",), owner="plan"),
+    Field("root_local", wp.int32, ("root",), owner="plan"),
+    Field("free_root_local", wp.int32, ("free_root",), owner="plan"),
+    Field("free_root_dof", wp.int32, ("free_root",), owner="plan"),
+    Field("dof_passive", wp.int32, ("dof",), owner="plan"),
+)
+"""A held group's template tree as its kernels read it: the scan plan (:data:`.tree_scan.SCAN_PLAN`) and the
+group's coordinate maps."""
 
-@wp.func
-def _inertia_action(rotation: wp.quat, inertia: wp.mat33, value: wp.vec3):
-    """Apply a body-frame inertia to a world-frame vector."""
-    return wp.quat_rotate(rotation, inertia * wp.quat_rotate_inv(rotation, value))
-
-
-@wp.struct
-class KineticPlan:
-    parent: wp.array[int]
-    depth: wp.array[int]
-    jump: wp.array2d[int]
-    children_offsets: wp.array[int]
-    children: wp.array[int]
-    q_index: wp.array[int]
-    root_slot: wp.array[int]
-    # Depth-first order of the local bodies and, per lane of that order, the
-    # lane past its subtree: every subtree is the lane interval [lane, dfs_end).
-    dfs_order: wp.array[int]
-    dfs_end: wp.array[int]
-    # Each local body's first local DOF and DOF count (its joint's coordinates).
-    body_dof_start: wp.array[int]
-    body_dof_count: wp.array[int]
-    # Forest groups: the articulation of each root, each body's root index,
-    # each root's local body, each free root's local body and coordinate
-    # offset, and whether a coordinate takes passive springs.
-    arts: wp.array2d[int]
-    root_of: wp.array[int]
-    root_local: wp.array[int]
-    free_root_local: wp.array[int]
-    free_root_dof: wp.array[int]
-    dof_passive: wp.array[int]
+HeldPlan = field_group.struct("HeldPlan", HELD_PLAN, __name__)
 
 
 KINETIC_CACHE = field_group.FieldGroup(
@@ -341,149 +343,140 @@ def _store_pose(address: wp.uint64, body: int, pose: wp.transform): ...
 def _load_pose(address: wp.uint64, body: int) -> wp.transform: ...
 
 
-_POSE = r"""
-    float* s=reinterpret_cast<float*>(address);
-#if defined(__CUDA_ARCH__)
-    const int body=LANE;
-    wp::transform value;
-    if(body<$BODIES)for(int k=0;k<7;++k)value[k]=s[7*body+k];
-    for(int round=0;round<$ROUNDS;++round) {
-        const int parent=body<$BODIES?p.jump.data[round*$BODIES+body]:-1;
-        wp::transform ancestor;
-        if(parent>=0)for(int k=0;k<7;++k)ancestor[k]=s[7*parent+k];
-        SYNC();
-        if(parent>=0)value=wp::transform_multiply(ancestor,value);
-        if(body<$BODIES)for(int k=0;k<7;++k)s[7*body+k]=value[k];
-        SYNC();
-    }
-#else
-    wp::transform old[$BODIES];
-    for(int round=0;round<$ROUNDS;++round) {
-        for(int body=0;body<$BODIES;++body)for(int k=0;k<7;++k)old[body][k]=s[7*body+k];
-        for(int body=0;body<$BODIES;++body) {
-            const int parent=p.jump.data[round*$BODIES+body];
-            const wp::transform v=parent>=0?wp::transform_multiply(old[parent],old[body]):old[body];
-            for(int k=0;k<7;++k)s[7*body+k]=v[k];
-        }
-    }
-#endif
-"""
+# ---------------------------------------------------------------------------------------------------------------------
+# The tree's scans: tree_scan configurations on the state block, sized by the layout's names
+# ---------------------------------------------------------------------------------------------------------------------
 
-_MOTION = r"""
-    float* s=reinterpret_cast<float*>(address)+$MOTION;
-#if defined(__CUDA_ARCH__)
-    const int body=LANE;
-    float v[6]={},a[6]={};
-    if(body<$BODIES)for(int k=0;k<6;++k){v[k]=s[6*body+k];s[$SIX_BODIES+6*body+k]=0.0f;}
-    SYNC();
-    for(int round=0;round<$ROUNDS;++round) {
-        const int parent=body<$BODIES?p.jump.data[round*$BODIES+body]:-1;
-        float pv[6],pa[6];
-        if(parent>=0)for(int k=0;k<6;++k){pv[k]=s[6*parent+k];pa[k]=s[$SIX_BODIES+6*parent+k];}
-        SYNC();
-        if(parent>=0) {
-            const wp::vec3 pl(pv[0],pv[1],pv[2]),pw(pv[3],pv[4],pv[5]);
-            const wp::vec3 vl(v[0],v[1],v[2]),vw(v[3],v[4],v[5]);
-            const wp::vec3 c=wp::cross(pw,vl)+wp::cross(pl,vw),d=wp::cross(pw,vw);
-            for(int k=0;k<3;++k){a[k]=pa[k]+a[k]+c[k];a[k+3]=pa[k+3]+a[k+3]+d[k];}
-            for(int k=0;k<6;++k)v[k]=pv[k]+v[k];
-        }
-        if(body<$BODIES)for(int k=0;k<6;++k){s[6*body+k]=v[k];s[$SIX_BODIES+6*body+k]=a[k];}
-        SYNC();
-    }
-#else
-    float ov[$BODIES][6],oa[$BODIES][6];
-    for(int body=0;body<$BODIES;++body)for(int k=0;k<6;++k)s[$SIX_BODIES+6*body+k]=0.0f;
-    for(int round=0;round<$ROUNDS;++round) {
-        for(int body=0;body<$BODIES;++body)for(int k=0;k<6;++k){ov[body][k]=s[6*body+k];oa[body][k]=s[$SIX_BODIES+6*body+k];}
-        for(int body=0;body<$BODIES;++body) {
-            const int parent=p.jump.data[round*$BODIES+body];
-            if(parent<0)continue;
-            const float* pv=ov[parent],*pa=oa[parent],*v=ov[body];
-            const wp::vec3 pl(pv[0],pv[1],pv[2]),pw(pv[3],pv[4],pv[5]);
-            const wp::vec3 vl(v[0],v[1],v[2]),vw(v[3],v[4],v[5]);
-            const wp::vec3 c=wp::cross(pw,vl)+wp::cross(pl,vw),d=wp::cross(pw,vw);
-            for(int k=0;k<3;++k){s[$SIX_BODIES+6*body+k]=pa[k]+oa[body][k]+c[k];s[$SIX_BODIES_PLUS3+6*body+k]=pa[k+3]+oa[body][k+3]+d[k];}
-            for(int k=0;k<6;++k)s[6*body+k]=pv[k]+v[k];
-        }
-    }
-#endif
-"""
 
-# Register scans for warp-sized layouts: each lane carries its body's value and
-# pointer-jumps to the 2^round-th ancestor through shuffles, with no shared-memory
-# round trip and no barrier per round. Lanes past the last body idle in place.
-_POSE_SHFL = r"""
-    float* s=reinterpret_cast<float*>(address);
-#if defined(__CUDA_ARCH__)
-    const int lane=LANE,body=lane;
-    wp::transform value=wp::transform_identity<float>();
-    if(body<$BODIES)for(int k=0;k<7;++k)value[k]=s[7*body+k];
-    int parent=body<$BODIES?p.parent.data[body]:-1;
-    for(int round=0;round<$ROUNDS;++round) {
-        const int source=parent>=0?parent:lane;
-        wp::transform ancestor;
-        for(int k=0;k<7;++k)ancestor[k]=__shfl_sync(MASK,value[k],source,WIDTH);
-        const int next=__shfl_sync(MASK,parent,source,WIDTH);
-        if(parent>=0)value=wp::transform_multiply(ancestor,value);
-        parent=parent>=0?next:-1;
-    }
-    if(body<$BODIES)for(int k=0;k<7;++k)s[7*body+k]=value[k];
-    SYNC();
-#else
-    wp::transform old[$BODIES];
-    for(int round=0;round<$ROUNDS;++round) {
-        for(int body=0;body<$BODIES;++body)for(int k=0;k<7;++k)old[body][k]=s[7*body+k];
-        for(int body=0;body<$BODIES;++body) {
-            const int parent=p.jump.data[round*$BODIES+body];
-            const wp::transform v=parent>=0?wp::transform_multiply(old[parent],old[body]):old[body];
-            for(int k=0;k<7;++k)s[7*body+k]=v[k];
-        }
-    }
-#endif
-"""
+@dataclasses.dataclass(frozen=True)
+class HeldSchedules:
+    """The schedules of a held group's scans (:class:`.tree_scan.Schedule`), chosen from its plan's data."""
 
-_MOTION_SHFL = r"""
-    float* s=reinterpret_cast<float*>(address)+$MOTION;
-#if defined(__CUDA_ARCH__)
-    const int lane=LANE,body=lane;
-    float v[6]={},a[6]={};
-    if(body<$BODIES)for(int k=0;k<6;++k)v[k]=s[6*body+k];
-    int parent=body<$BODIES?p.parent.data[body]:-1;
-    for(int round=0;round<$ROUNDS;++round) {
-        const int source=parent>=0?parent:lane;
-        float pv[6],pa[6];
-        for(int k=0;k<6;++k){pv[k]=__shfl_sync(MASK,v[k],source,WIDTH);pa[k]=__shfl_sync(MASK,a[k],source,WIDTH);}
-        const int next=__shfl_sync(MASK,parent,source,WIDTH);
-        if(parent>=0) {
-            const wp::vec3 pl(pv[0],pv[1],pv[2]),pw(pv[3],pv[4],pv[5]);
-            const wp::vec3 vl(v[0],v[1],v[2]),vw(v[3],v[4],v[5]);
-            const wp::vec3 c=wp::cross(pw,vl)+wp::cross(pl,vw),d=wp::cross(pw,vw);
-            for(int k=0;k<3;++k){a[k]=pa[k]+a[k]+c[k];a[k+3]=pa[k+3]+a[k+3]+d[k];}
-            for(int k=0;k<6;++k)v[k]=pv[k]+v[k];
-        }
-        parent=parent>=0?next:-1;
-    }
-    if(body<$BODIES)for(int k=0;k<6;++k){s[6*body+k]=v[k];s[$SIX_BODIES+6*body+k]=a[k];}
-    SYNC();
-#else
-    float ov[$BODIES][6],oa[$BODIES][6];
-    for(int body=0;body<$BODIES;++body)for(int k=0;k<6;++k)s[$SIX_BODIES+6*body+k]=0.0f;
-    for(int round=0;round<$ROUNDS;++round) {
-        for(int body=0;body<$BODIES;++body)for(int k=0;k<6;++k){ov[body][k]=s[6*body+k];oa[body][k]=s[$SIX_BODIES+6*body+k];}
-        for(int body=0;body<$BODIES;++body) {
-            const int parent=p.jump.data[round*$BODIES+body];
-            if(parent<0)continue;
-            const float* pv=ov[parent],*pa=oa[parent],*v=ov[body];
-            const wp::vec3 pl(pv[0],pv[1],pv[2]),pw(pv[3],pv[4],pv[5]);
-            const wp::vec3 vl(v[0],v[1],v[2]),vw(v[3],v[4],v[5]);
-            const wp::vec3 c=wp::cross(pw,vl)+wp::cross(pl,vw),d=wp::cross(pw,vw);
-            for(int k=0;k<3;++k){s[$SIX_BODIES+6*body+k]=pa[k]+oa[body][k]+c[k];s[$SIX_BODIES_PLUS3+6*body+k]=pa[k+3]+oa[body][k+3]+d[k];}
-            for(int k=0;k<6;++k)s[6*body+k]=pv[k]+v[k];
-        }
-    }
-#endif
-"""
+    pose: ts.Schedule
+    motion: ts.Schedule
+    reduce: ts.Schedule
+    """The bias wrench and inertia moment sums of the collection."""
+    external: ts.Schedule
+    """The predictor's external wrench sums."""
+
+    @property
+    def chains(self) -> bool:
+        """Whether a scan runs on the heavy chains (whose texts address the block's threads)."""
+        return ts.Schedule.HEAVY_CHAIN in (self.pose, self.motion, self.reduce, self.external)
+
+    @property
+    def tag(self) -> str:
+        """The kernel-name suffix of the schedules."""
+        return "_" + "_".join(s.value for s in (self.pose, self.motion, self.reduce, self.external))
+
+
+def held_lanes(tree: TreePlan, groups: int, *, cuda: bool = True) -> int:
+    """Threads per tree of a held group of ``groups`` trees shaped like ``tree``, from the tree's data.
+
+    A tree of more than 32 bodies takes two warps. Any other takes the narrowest power of two of at least 8 lanes
+    covering its bodies, widened until the group fills whole 32-thread blocks. Measured on the RTX PRO 6000 (finish,
+    predict and repair of 4096 trees at each lane width, and the construction-time timings the replaced lane choice
+    recorded in the gate's tasks): this width ran within 3% of the fastest width of every tree of up to 32 bodies.
+    The coordinates do not set it: the 13-body, 21-coordinate Franka forest runs 27% slower at 32 lanes than at 16,
+    a one-body tree 8% slower at 4 lanes than at 8. On the CPU (``cuda`` false) each tree takes a block of its own:
+    one thread runs it serially.
+    """
+    bodies = tree.count
+    if bodies > 32:
+        return 64
+    if not cuda:
+        return 32
+    lanes = max(8, 1 << (bodies - 1).bit_length())
+    while lanes < 32 and groups % (32 // lanes):
+        lanes *= 2
+    return lanes
+
+
+def held_schedules(tree: TreePlan, lanes: int, *, chains: bool, reference: bool = False) -> HeldSchedules:
+    """The schedules of a held group's scans at ``lanes`` lanes per tree, from its tree's data
+    (:func:`.tree_scan.choose_schedule`).
+
+    ``chains``: the launch may give each tree its own block, which the heavy-chain scans address. ``reference``
+    selects the shared-memory jumps and depth levels the A/B tests compare against.
+    """
+    if reference:
+        return HeldSchedules(ts.Schedule.JUMP_SMEM, ts.Schedule.JUMP_SMEM, ts.Schedule.LEVEL, ts.Schedule.LEVEL)
+    own_block = chains and lanes >= 32
+
+    def choose(combine, direction):
+        return ts.choose_schedule(tree, direction, combine, cuda=True, lanes=lanes, chains=own_block)
+
+    return HeldSchedules(
+        choose(ts.TRANSFORM, ts.Direction.DOWN),
+        choose(_MOTION, ts.Direction.DOWN),
+        choose(_REDUCE, ts.Direction.UP),
+        choose(_EXTERNAL, ts.Direction.UP),
+    )
+
+
+def publishes_twists(layout: TreeLayout, schedules: HeldSchedules) -> bool:
+    """Whether the predictor can publish the predicted body twists: a warp-sized tree whose scans keep to their
+    lane groups (the twist sums are a register scan of :attr:`TreeLayout.lanes` lanes)."""
+    return layout.lanes <= 32 and not schedules.chains
+
+
+_SIZES = {"nodes": "$BODIES", "rounds": "$ROUNDS", "max_depth": "($LAST_PARENT+1)", "windows": "$WINDOWS"}
+"""The layout's size names in place of a plan's literals: one text serves every tree of a layout."""
+_ANY_TREE = TreePlan.build([-1, 0])
+"""Any parent-first plan stands for the layout's tree once the sizes are names."""
+_POSE_SLOTS = ts.Storage({"pose": "s[7*({node})+({k})]"})
+_MOTION_SLOTS = ts.Storage(
+    {"velocity": "s[$MOTION+6*({node})+({k})]", "acceleration": "s[$MOTION+$SIX_BODIES+6*({node})+({k})]"}
+)
+_REDUCE_SLOTS = ts.Storage({"wrench": "s[$WRENCH+6*({node})+({k})]", "moment": "s[$MOMENT+13*({node})+({k})]"})
+_EXTERNAL_SLOTS = ts.Storage({"wrench": "s[6*({node})+({k})]"})
+_MOTION = ts.TWIST.with_zero_acceleration()
+_REDUCE = ts.add(ts.Group("wrench", 6), ts.Group("moment", INERTIA_CHANNELS, "refresh"))
+_EXTERNAL = ts.add(ts.Group("wrench", 6))
+_TWIST_SUM = ts.add(ts.Group("twist", 6))
+# Predicted body twists for the resolved-world classifier: each lane sums its body's own axes against the final
+# predictor velocity, then pointer-jumps up the tree through shuffles (velocities at a common origin add).
+_TWIST_SOURCE = (
+    "{{const int first=ds+plan.body_dof_start.data[{node}],count=plan.body_dof_count.data[{node}];"
+    "for(int d=0;d<count;++d){{const wp::spatial_vector axis=f.S.data[first+d];const float speed=f.vhat.data[first+d];"
+    "for(int k=0;k<6;++k){value}[k]+=axis[k]*speed;}}}}"
+)
+_TWIST_SINK = (
+    "{{wp::spatial_vector twist;for(int k=0;k<6;++k)twist[k]={value}[k];"
+    "f.predicted_twist.data[p.joint_child.data[js+{node}]]=twist;}}"
+)
+
+
+def _held_scan(combine, direction, schedule, storage, access, **options) -> ts.ScanSource:
+    return ts.tree_scan(
+        _ANY_TREE, combine, direction, schedule, storage=storage, access=access, sizes=_SIZES, lanes="$LANES", **options
+    )
+
+
+def _down(layout: TreeLayout, combine, schedule: ts.Schedule, storage: ts.Storage) -> str:
+    """A pose or motion scan's native body over the state block ``address``, the plan struct named ``p``."""
+    scan = _held_scan(combine, ts.Direction.DOWN, schedule, storage, ts.PlanAccess().renamed("p"), level_csr=False)
+    return layout.native("    float* s=reinterpret_cast<float*>(address);\n" + scan.text, preludes=scan.preludes)
+
+
+def _reduction(combine, schedule: ts.Schedule, storage: ts.Storage) -> str:
+    """A subtree-sum fragment: ``s``, ``lane``, ``stride`` and the plan struct ``plan`` in scope."""
+    return _held_scan(combine, ts.Direction.UP, schedule, storage, ts.PlanAccess(), level_csr=False).text
+
+
+def _twist_block() -> str:
+    """The predictor's twist publication (CUDA only), a register scan of warp-sized trees."""
+    scan = _held_scan(
+        _TWIST_SUM,
+        ts.Direction.DOWN,
+        ts.Schedule.JUMP_SHFL,
+        None,
+        ts.PlanAccess(),
+        source=_TWIST_SOURCE,
+        sink=_TWIST_SINK,
+        cpu=False,
+    )
+    return device_branches("    if(f.publish_twists!=0) {\n        SYNC();\n" + scan.cuda + "    }\n", "")
 
 
 _COLLECT = r"""    $PHYSICAL_TABLE
@@ -622,110 +615,6 @@ $CLOCK4    // A prescribed (kinematic) free root keeps its given velocity: no tr
     $TRANSPORT_BLOCK
 $TWIST_BLOCK$CLOCK5"""
 
-_LEVEL_REDUCE = r"""    for(int level=$LAST_PARENT;level>=0;--level) {
-        for(int body=lane;body<$BODIES;body+=stride)if(plan.depth.data[body]==level) {
-            for(int pos=plan.children_offsets.data[body];pos<plan.children_offsets.data[body+1];++pos) {
-                const int child=plan.children.data[pos];
-                for(int k=0;k<6;++k)s[$WRENCH+6*body+k]+=s[$WRENCH+6*child+k];
-                if(refresh)for(int k=0;k<13;++k)s[$MOMENT+13*body+k]+=s[$MOMENT+13*child+k];
-            }
-        }
-#if defined(__CUDA_ARCH__)
-        SYNC();
-#endif
-    }
-"""
-
-# Subtree sums for warp-sized layouts: lanes walk the bodies in depth-first
-# order, so a subtree is a lane interval. Each lane builds the sums of the
-# 1, 2, 4, ... lanes starting at itself (shuffle-down, zero past the group),
-# then assembles its interval from the binary digits of its length: one
-# shuffle per digit, additions only, no barrier and no cancellation. The
-# CPU twin keeps the depth-level loop.
-_INTERVAL_REDUCE = (
-    r"""
-#if defined(__CUDA_ARCH__)
-    {
-    const int dfs_body=lane<$BODIES?plan.dfs_order.data[lane]:-1;
-    const int dfs_len=lane<$BODIES?plan.dfs_end.data[lane]-lane:0;
-    const int dfs_count=refresh?19:6;
-    for(int c=0;c<19;++c) {
-        if(c>=dfs_count)break;
-        const int slot=c<6?$WRENCH+6*dfs_body+c:$MOMENT+13*dfs_body+(c-6);
-        float w[$WINDOWS];
-        w[0]=dfs_body>=0?s[slot]:0.0f;
-        #pragma unroll
-        for(int b=1;b<$WINDOWS;++b){
-            const float t=__shfl_down_sync(MASK,w[b-1],1<<(b-1),WIDTH);
-            w[b]=w[b-1]+(lane+(1<<(b-1))<$LANES?t:0.0f);
-        }
-        float sum=0.0f;
-        int offset=lane;
-        #pragma unroll
-        for(int b=$WINDOWS-1;b>=0;--b){
-            const float t=__shfl_sync(MASK,w[b],offset,WIDTH);
-            if((dfs_len>>b)&1){sum+=t;offset+=1<<b;}
-        }
-        if(dfs_body>=0)s[slot]=sum;
-    }
-    SYNC();
-    }
-#else
-"""
-    + _LEVEL_REDUCE
-    + "#endif\n"
-)
-
-
-# Predicted body twists for the resolved-world classifier, published by the
-# predictor from the tree it already holds: each lane sums its body's own
-# axes against the final predictor velocity, then pointer-jumps up the tree
-# through shuffles (velocities at a common origin add). Warp-sized plans only.
-_TWIST_BLOCK = r"""
-#if defined(__CUDA_ARCH__)
-    if(f.publish_twists!=0) {
-        SYNC();
-        float tw[6]={};
-        if(lane<$BODIES) {
-            const int first=ds+plan.body_dof_start.data[lane],count=plan.body_dof_count.data[lane];
-            for(int d=0;d<count;++d) {
-                const wp::spatial_vector axis=f.S.data[first+d];
-                const float speed=f.vhat.data[first+d];
-                for(int k=0;k<6;++k)tw[k]+=axis[k]*speed;
-            }
-        }
-        int twist_parent=lane<$BODIES?plan.parent.data[lane]:-1;
-        for(int round=0;round<$ROUNDS;++round) {
-            const int source=twist_parent>=0?twist_parent:lane;
-            float ptw[6];
-            for(int k=0;k<6;++k)ptw[k]=__shfl_sync(MASK,tw[k],source,WIDTH);
-            const int next=__shfl_sync(MASK,twist_parent,source,WIDTH);
-            if(twist_parent>=0)for(int k=0;k<6;++k)tw[k]+=ptw[k];
-            twist_parent=twist_parent>=0?next:-1;
-        }
-        if(lane<$BODIES) {
-            wp::spatial_vector twist;
-            for(int k=0;k<6;++k)twist[k]=tw[k];
-            f.predicted_twist.data[p.joint_child.data[js+lane]]=twist;
-        }
-    }
-#endif
-"""
-
-_EXTERNAL_REDUCE = r"""    if(nonzero)for(int level=$LAST_PARENT;level>=0;--level) {
-        for(int local=lane;local<$BODIES;local+=stride)if(plan.depth.data[local]==level) {
-            for(int pos=plan.children_offsets.data[local];pos<plan.children_offsets.data[local+1];++pos) {
-                const int child=plan.children.data[pos];
-                for(int k=0;k<6;++k)s[6*local+k]+=s[6*child+k];
-            }
-        }
-#if defined(__CUDA_ARCH__)
-        SYNC();
-#endif
-    }
-"""
-
-
 # The default form, which CUDA owners launch, keeps one tree's state block in
 # shared memory; packed trees take consecutive blocks of one array. Its CPU
 # branch never links: Warp's CPU JIT links only a curated C runtime subset,
@@ -772,13 +661,7 @@ def _keep_static(address: wp.uint64): ...
 _STORE_TERMS_SOURCE = r"""
     float* s=reinterpret_cast<float*>(address);
     for(int k=0;k<6;++k)s[$WRENCH+6*body+k]=wrench[k];
-    if(refresh) {
-        float* t=s+$MOMENT+13*body;
-        t[0]=mass;
-        for(int k=0;k<3;++k)t[1+k]=mass*radius[k];
-        for(int i=0;i<3;++i)for(int j=0;j<3;++j)
-            t[4+3*i+j]=inertia.data[i][j]+mass*((i==j?wp::dot(radius,radius):0.0f)-radius[i]*radius[j]);
-    }
+    if(refresh)for(int k=0;k<13;++k)s[$MOMENT+13*body+k]=record[k];
 """
 
 
@@ -816,36 +699,24 @@ def _current_valid(layout):
 
 @functools.cache
 def get_helpers(
-    layout: TreeLayout = REFERENCE_LAYOUT,
-    chain_scan: bool = False,
+    layout: TreeLayout,
+    schedules: HeldSchedules,
     body_velocity: bool = False,
     *,
-    reference: bool = False,
     clocked: bool = False,
     host: bool = False,
 ):
-    """Bind one physical tree evaluation to its storage and traversal schedule.
+    """Bind one physical tree evaluation to its storage and its scans' schedules.
 
-    ``reference`` keeps the shared-memory scans and the depth-level subtree
-    reduction on warp-sized layouts (the forms the A/B tests compare against);
     ``clocked`` adds the collection (``stage_clocks`` columns 13-15) and body
-    term (16-21) counters. Both change the emitted code, so they are
+    term (16-21) counters. Both arguments change the emitted code, so they are
     arguments (cache-key members), never environment reads. ``host`` keeps
     the CPU scratch in static storage (see ``_HOST_STORAGE_SOURCE``); the
     default is the form CUDA owners launch.
     """
-    plan_type = tree_chain_scan.ChainPlan if chain_scan else KineticPlan
-    # A warp-sized layout scans in registers through shuffles; two-warp layouts
-    # keep the shared-memory jump table. Chain plans address their threads directly.
-    register_scan = not chain_scan and layout.lanes <= 32 and not reference
-    if chain_scan:
-        pose_source = layout.render(tree_chain_scan._POSE)
-        motion_source = layout.render(tree_chain_scan._MOTION)
-        reduction = tree_chain_scan.reduction_source(moments=True, layout=layout)
-    else:
-        pose_source = layout.native(_POSE_SHFL if register_scan else _POSE)
-        motion_source = layout.native(_MOTION_SHFL if register_scan else _MOTION)
-        reduction = _INTERVAL_REDUCE if register_scan else _LEVEL_REDUCE
+    pose_source = _down(layout, ts.TRANSFORM, schedules.pose, _POSE_SLOTS)
+    motion_source = _down(layout, _MOTION, schedules.motion, _MOTION_SLOTS)
+    reduction = _reduction(_REDUCE, schedules.reduce, _REDUCE_SLOTS)
     collect_source = layout.native(
         _COLLECT,
         PHYSICAL_TABLE=layout.physical_table(),
@@ -887,21 +758,13 @@ def get_helpers(
     def _store_axis(address: wp.uint64, dof: int, v: wp.spatial_vector): ...
 
     @wp.func_native(pose_source)
-    def _scan_poses(address: wp.uint64, p: plan_type): ...
+    def _scan_poses(address: wp.uint64, p: HeldPlan): ...
 
     @wp.func_native(motion_source)
-    def _scan_motion(address: wp.uint64, p: plan_type): ...
+    def _scan_motion(address: wp.uint64, p: HeldPlan): ...
 
     @wp.func_native(layout.render(_STORE_TERMS_SOURCE))
-    def _store_terms(
-        address: wp.uint64,
-        body: int,
-        mass: float,
-        radius: wp.vec3,
-        inertia: wp.mat33,
-        wrench: wp.spatial_vector,
-        refresh: int,
-    ): ...
+    def _store_terms(address: wp.uint64, body: int, wrench: wp.spatial_vector, record: inertia_record, refresh: int): ...
 
     # A root-only free body is a free rigid body (in a forest, a free root may
     # be one): the matrix-free contact path reads its spatial inertia and bias
@@ -938,7 +801,7 @@ def get_helpers(
         inertia_local = data.body_inertia[body]
         linear, omega = wp.spatial_top(velocity), wp.spatial_bottom(velocity)
         a, alpha = wp.spatial_top(acceleration), wp.spatial_bottom(acceleration)
-        inertia_com = wp.mat33()
+        record = inertia_record()
         angular_momentum = wp.vec3()
         angular_acceleration_force = wp.vec3()
         if g.refresh != 0:
@@ -946,9 +809,11 @@ def get_helpers(
             inertia_com = matrix * inertia_local * wp.transpose(matrix)
             angular_momentum = inertia_com * omega
             angular_acceleration_force = inertia_com * alpha
+            total, moment, rotational = inertia_shift(mass, inertia_com, radius)
+            record = pack_inertia(total, moment, rotational)
         else:
-            angular_momentum = _inertia_action(rotation, inertia_local, omega)
-            angular_acceleration_force = _inertia_action(rotation, inertia_local, alpha)
+            angular_momentum = inertia_action(rotation, inertia_local, omega)
+            angular_acceleration_force = inertia_action(rotation, inertia_local, alpha)
         velocity_com = linear + wp.cross(omega, radius)
         force = mass * (a + wp.cross(alpha, radius) + wp.cross(omega, velocity_com) - data.gravity[0])
         torque = angular_acceleration_force + wp.cross(omega, angular_momentum) + wp.cross(radius, force)
@@ -962,7 +827,7 @@ def get_helpers(
         cache.com_offset[g.group, local] = radius
         if wp.static(clocked):
             clock_b2 = _clock()
-        _store_terms(g.address, local, mass, radius, inertia_com, wrench, g.refresh)
+        _store_terms(g.address, local, wrench, record, g.refresh)
         if wp.static(free_rigid):
             if data.is_free_rigid[data.body_to_articulation[body]] != 0:
                 data.body_q_com[body] = pose_com
@@ -1002,11 +867,10 @@ def get_helpers(
 
     @wp.func_native(collect_source)
     def _collect(
-        address: wp.uint64, group: int, p: sparse_factor.SparsePlan, plan: plan_type, cache: KineticData, refresh: int
+        address: wp.uint64, group: int, p: sparse_factor.SparsePlan, plan: HeldPlan, cache: KineticData, refresh: int
     ): ...
 
     return SimpleNamespace(
-        plan_type=plan_type,
         _body_terms=_body_terms,
         _collect=_collect,
         _load_motion=_load_motion,
@@ -1024,14 +888,13 @@ def get_helpers(
 @functools.cache
 def get_state_kernel(
     finish: bool,
-    chain_scan: bool = False,
+    schedules: HeldSchedules,
     *,
     layout: TreeLayout = REFERENCE_LAYOUT,
     body_velocity: bool = False,
     motion_velocity: bool = False,
     listed: bool = False,
     bank_coordinates: int = 0,
-    reference: bool = False,
     clocked: bool = False,
     host: bool = False,
 ):
@@ -1067,8 +930,8 @@ def get_state_kernel(
     :func:`_bank_binding`) and, when they are equal, is restamped and takes the
     early exit. It serves launches too small to classify, where a comparison
     pass of its own would cost a launch. Classified launches compare in
-    :func:`get_bank_kernel` instead. ``reference`` and ``clocked`` select the
-    comparison forms and the stage counters (``stage_clocks`` columns 0-7 for
+    :func:`get_bank_kernel` instead. ``schedules`` are the scans' schedules;
+    ``clocked`` selects the stage counters (``stage_clocks`` columns 0-7 for
     the stages, 22-24 for motion; see :func:`get_helpers`); ``host`` the
     static CPU scratch of an owner on the CPU.
     """
@@ -1080,9 +943,8 @@ def get_state_kernel(
         raise ValueError("A listed launch is a contract of the repair of ordinary motion")
     if bank_coordinates and (finish or motion_velocity or listed):
         raise ValueError("A compared input bank is a contract of the one-pass repair of ordinary motion")
-    h = get_helpers(layout, chain_scan, body_velocity, reference=reference, clocked=clocked, host=host)
+    h = get_helpers(layout, schedules, body_velocity, clocked=clocked, host=host)
     release = _keep_static if host else _release
-    plan_type = h.plan_type
     _lanes, _sync, _sub, _different_motion = _thread_helpers(layout)
     banked = bank_coordinates != 0
     _bank_matches = _bank_binding(bank_coordinates, layout) if banked else None
@@ -1097,7 +959,7 @@ def get_state_kernel(
         block: int,
         logical_lane: int,
         p: sparse_factor.SparsePlan,
-        plan: plan_type,
+        plan: HeldPlan,
         data: PublicationData,
         cache: KineticData,
         requests: wp.array[int],
@@ -1197,7 +1059,7 @@ def get_state_kernel(
         _sync()
 
     @wp.func
-    def transport(g: TreeGroup, plan: plan_type, data: PublicationData):
+    def transport(g: TreeGroup, plan: HeldPlan, data: PublicationData):
         """Remove the free roots' velocity transport from their accelerations."""
         if wp.static(not forest):
             if wp.static(free_root) and g.lane == 0:
@@ -1248,7 +1110,7 @@ def get_state_kernel(
         _sync()
 
     @wp.func
-    def relative_poses(g: TreeGroup, plan: plan_type, data: PublicationData, q: wp.array[float]):
+    def relative_poses(g: TreeGroup, plan: HeldPlan, data: PublicationData, q: wp.array[float]):
         """Store each joint's pose in its parent; a root's translation goes to its origin slot."""
         for local in range(g.lane, bodies, g.stride):
             joint = g.js + local
@@ -1274,7 +1136,7 @@ def get_state_kernel(
         _sync()
 
     @wp.func
-    def poses(g: TreeGroup, plan: plan_type, data: PublicationData):
+    def poses(g: TreeGroup, plan: HeldPlan, data: PublicationData):
         """Complete the pose scan and publish each articulation's origin."""
         scan_poses(g.address, plan)
         if wp.static(not forest):
@@ -1294,7 +1156,7 @@ def get_state_kernel(
 
     @wp.func
     def motion(
-        g: TreeGroup, origin: wp.vec3, shift: wp.vec3, plan: plan_type, data: PublicationData, qd: wp.array[float]
+        g: TreeGroup, origin: wp.vec3, shift: wp.vec3, plan: HeldPlan, data: PublicationData, qd: wp.array[float]
     ):
         """Store each joint's axes and relative velocity at the origin, then complete the motion scan.
 
@@ -1345,7 +1207,7 @@ def get_state_kernel(
 
     @wp.func
     def publish(
-        g: TreeGroup, origin: wp.vec3, shift: wp.vec3, plan: plan_type, data: PublicationData, cache: KineticData
+        g: TreeGroup, origin: wp.vec3, shift: wp.vec3, plan: HeldPlan, data: PublicationData, cache: KineticData
     ):
         """Publish each body's pose and twist with its bias wrench and moments."""
         for local in range(g.lane, bodies, g.stride):
@@ -1375,7 +1237,7 @@ def get_state_kernel(
     def close(
         g: TreeGroup,
         p: sparse_factor.SparsePlan,
-        plan: plan_type,
+        plan: HeldPlan,
         data: PublicationData,
         cache: KineticData,
         q: wp.array[float],
@@ -1400,7 +1262,7 @@ def get_state_kernel(
     # kernel leaves them unread.
     def kinetic_state(
         p: sparse_factor.SparsePlan,
-        plan: plan_type,
+        plan: HeldPlan,
         data: PublicationData,
         cache: KineticData,
         requests: wp.array[int],
@@ -1485,8 +1347,7 @@ def get_state_kernel(
         name += f"_forest{roots}"
     if layout.pack > 1:
         name += f"_l{layout.lanes}"
-    if chain_scan:
-        name += "_chain"
+    name += schedules.tag
     if motion_velocity:
         name += "_motion"
     if listed:
@@ -1497,7 +1358,7 @@ def get_state_kernel(
 
 
 @functools.cache
-def get_bank_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFERENCE_LAYOUT, coordinates: int = 1):
+def get_bank_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, coordinates: int = 1):
     """Compare the input banks of the blocks :func:`get_classify_kernel` listed for comparison.
 
     Logical block ``item`` takes listed block ``compare_blocks[item]`` (items
@@ -1514,7 +1375,6 @@ def get_bank_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFERENCE_
     comparison raised a chain-scan repair's from 80 to 151 on a 13-body chain
     (sm_120).
     """
-    plan_type = tree_chain_scan.ChainPlan if chain_scan else KineticPlan
     _lanes, _, _, _ = _thread_helpers(layout)
     matches = _bank_binding(coordinates, layout)
     block_any = _block_vote(layout)
@@ -1522,7 +1382,7 @@ def get_bank_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFERENCE_
 
     def bank_pass(
         p: sparse_factor.SparsePlan,
-        plan: plan_type,
+        plan: HeldPlan,
         data: PublicationData,
         cache: KineticData,
         requests: wp.array[int],
@@ -1580,13 +1440,11 @@ def get_bank_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFERENCE_
         name += f"_forest{roots}"
     if pack > 1:
         name += f"_l{layout.lanes}"
-    if chain_scan:
-        name += "_chain"
     return python_kernel(bank_pass, name)
 
 
 @functools.cache
-def get_classify_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFERENCE_LAYOUT):
+def get_classify_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT):
     """List the repair blocks holding a group whose repair would not take its early exit; one thread per block.
 
     A group takes its early exit when its cache and its forest roots' caches
@@ -1609,12 +1467,11 @@ def get_classify_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFERE
     keeps its one-pass launch (see
     :class:`~.tree_kinetic_owner.TreeKineticState`).
     """
-    plan_type = tree_chain_scan.ChainPlan if chain_scan else KineticPlan
     pack, roots, forest = layout.pack, len(layout.roots), layout.forest
 
     def classify(
         p: sparse_factor.SparsePlan,
-        plan: plan_type,
+        plan: HeldPlan,
         data: PublicationData,
         cache: KineticData,
         requests: wp.array[int],
@@ -1663,14 +1520,12 @@ def get_classify_kernel(chain_scan: bool = False, *, layout: TreeLayout = REFERE
         name += f"_forest{roots}"
     if pack > 1:
         name += f"_l{layout.lanes}"
-    if chain_scan:
-        name += "_chain"
     return python_kernel(classify, name)
 
 
 @functools.cache
 def get_predictor_kernel(
-    chain_scan: bool = False,
+    schedules: HeldSchedules,
     *,
     layout: TreeLayout = REFERENCE_LAYOUT,
     response="sparse",
@@ -1679,14 +1534,10 @@ def get_predictor_kernel(
 ):
     """Apply current external/control force and both unchanged W actions.
 
-    ``reference`` keeps the serial one-lane held solve on CUDA; ``clocked``
-    adds the predictor stage counters (see :func:`get_helpers`).
+    ``schedules`` are the scans' schedules (the external wrench sums take ``external``); ``reference`` keeps the
+    serial one-lane held solve on CUDA; ``clocked`` adds the predictor stage counters (see :func:`get_helpers`).
     """
-    plan_type = tree_chain_scan.ChainPlan if chain_scan else KineticPlan
-    if chain_scan:
-        reduction = "if(nonzero) {\n" + tree_chain_scan.reduction_source(moments=False, layout=layout) + "}\n"
-    else:
-        reduction = _EXTERNAL_REDUCE
+    reduction = "    if(nonzero) {\n" + _reduction(_EXTERNAL, schedules.external, _EXTERNAL_SLOTS) + "    }\n"
     inverse = response_operator.SparseInverseFactor(
         "d.W.data+group*$NNZ",
         response_operator.IndexedSupport(
@@ -1800,7 +1651,7 @@ def get_predictor_kernel(
         data_type = HeldResponse
     elif response != "sparse":
         raise ValueError("Unknown held tree response representation")
-    operations["TWIST_BLOCK"] = _TWIST_BLOCK if (layout.lanes <= 32 and not chain_scan) else ""
+    operations["TWIST_BLOCK"] = _twist_block() if publishes_twists(layout, schedules) else ""
     source = layout.native(_PREDICT, **operations, **_native_clocks(clocked, "f", stages=5, column=8))
 
     _, _, _sub, _ = _thread_helpers(layout)
@@ -1809,8 +1660,7 @@ def get_predictor_kernel(
         name += f"_forest{len(layout.roots)}"
     if layout.pack > 1:
         name += f"_l{layout.lanes}"
-    if chain_scan:
-        name += "_chain"
+    name += schedules.tag
     if response != "sparse":
         name += "_" + response
     return KernelTemplate(
@@ -1818,7 +1668,7 @@ def get_predictor_kernel(
         (
             ("p", sparse_factor.SparsePlan),
             ("d", data_type),
-            ("plan", plan_type),
+            ("plan", HeldPlan),
             ("cache", KineticData),
             ("f", ForceInput),
         ),

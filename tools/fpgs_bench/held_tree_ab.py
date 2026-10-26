@@ -3,38 +3,33 @@
 
 """Record every array the held-tree kernels write, and compare two records bitwise.
 
-``record`` builds held-tree owners on small scenes: single trees on kinetic
-and chain-scan schedules with fixed and free roots and ordinary or prescaled
-repair motion, and per-size and forest groups with a free body, a short arm, a
-diagonal-mass family, mimic rows, velocity limits and stage clocks. It drives
-each through two steps of begin, predict, finish and a repeated begin; then
-two steps whose caller copies the published bank back into the input bank, one
-coordinate changed, so that the repair compares the two banks, first in the
-one-pass repair and then classified on a one-block grid (classification,
-comparison pass and listed repair); then an invalidated begin. A group of
-alternate motion validates by identity alone and is never classified, so both
-copy-back steps run its one-pass repair. After each call
-it stores every array of the publication the kernels received and of the
-owner's caches, with the state, response and spring arrays around them, and
-the held-tree kernels the call launched, in launch order
-(``<call>/launched``). Each scene also stores its groups' layouts
-(``<scene>/layout``: bodies, lanes, trees per block, forest, chain scan, bank
-comparison and alternate motion per group). ``compare`` lists the arrays that
-differ bitwise, so both arms must also have launched the same kernels on the
-same layouts; stage clocks (cycle counts) and the cached state-bank pointers
-are not compared.
+``record`` builds held-tree owners on small scenes: single trees on the
+schedules their data chooses and on the heavy chains, with fixed and free roots
+and ordinary or prescaled repair motion, and per-size and forest groups with a
+free body, a short arm, a diagonal-mass family, mimic rows, velocity limits and
+stage clocks. It drives each through two steps of begin, predict, finish and a
+repeated begin; then two steps whose caller copies the published bank back into
+the input bank, one coordinate changed, so that the repair compares the two
+banks, first in the one-pass repair and then classified on a one-block grid
+(classification, comparison pass and listed repair); then an invalidated begin.
+A group of alternate motion validates by identity alone and is never
+classified, so both copy-back steps run its one-pass repair. After each call it
+stores every array of the publication the kernels received and of the owner's
+caches, with the state, response and spring arrays around them, and the
+held-tree kernels the call launched, in launch order (``<call>/launched``).
+Each scene also stores its groups' layouts (``<scene>/layout``: bodies, lanes,
+trees per block, forest, heavy-chain schedules, bank comparison and alternate
+motion per group). ``compare`` lists the arrays that differ bitwise, so both
+arms must also have launched the same kernels on the same layouts; stage clocks
+(cycle counts) and the cached state-bank pointers are not compared.
 
 On CPU, owners build their kernels with static scratch and no release, as this
 Warp's CPU JIT cannot resolve ``malloc`` and ``free``, and keep one tree per
-block. Lane packing defaults to one tree per block, so construction times no
-lane width; on CUDA ``--lane-pack`` fixes the width of every tree it covers
-and skips the scenes with a wider tree. A group's trees must fill whole
-blocks, or the width doubles until they do
-(:func:`~newton._src.solvers.feather_pgs.tree_kinetic_plan.lanes_for`): a
-group of one tree per world packs 4 lanes when the world count is a multiple
-of 8, and 8 lanes when it is a multiple of 4. ``--worlds`` sets the mixed
-scenes' world count (default 2); the single trees' fixtures replicate two
-worlds in every checkout, so none runs narrower than 16 lanes. Each scene
+block. On CUDA the lanes follow from each tree's data
+(:func:`~newton._src.solvers.feather_pgs.tree_kinetic_state.held_lanes`);
+``--lanes`` fixes the width of every tree it covers and skips the scenes with a
+wider tree. ``--worlds`` sets the mixed scenes' world count (default 2); the
+single trees' fixtures replicate two worlds in every checkout. Each scene
 prints its groups' widths. ``--scene`` records only the named scenes.
 ``--poison`` fills freed device memory with a value before each scene, so a
 read of an array no kernel wrote shows in both arms' records.
@@ -61,6 +56,7 @@ import argparse
 import contextlib
 import os
 import sys
+import unittest.mock
 import zlib
 from pathlib import Path
 
@@ -117,6 +113,46 @@ def _environment(**values):
                 os.environ[name] = value
 
 
+@contextlib.contextmanager
+def _heavy_chains():
+    """Run every scan of the owners built inside on the heavy chains, a tree of one or two warps per block."""
+    from newton._src.solvers.feather_pgs import tree_kinetic_state  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs import tree_scan as ts  # noqa: PLC0415
+
+    def lanes(tree, groups, *, cuda):
+        packing = tree.chain_packing(2)
+        if packing is None:
+            raise ValueError("the heavy chains do not pack into two warps")
+        return max(packing.lanes, 32 if tree.count <= 32 else 64)
+
+    def schedules(tree, lanes, *, chains, reference=False):
+        return tree_kinetic_state.HeldSchedules(*(ts.Schedule.HEAVY_CHAIN,) * 4)
+
+    with (
+        unittest.mock.patch.object(tree_kinetic_state, "held_lanes", lanes),
+        unittest.mock.patch.object(tree_kinetic_state, "held_schedules", schedules),
+    ):
+        yield
+
+
+@contextlib.contextmanager
+def _fixed_lanes(width):
+    """Give every tree the owners built inside cover ``width`` lanes (0: the trees' data chooses)."""
+    from newton._src.solvers.feather_pgs import tree_kinetic_state  # noqa: PLC0415
+
+    if not width:
+        yield
+        return
+
+    def lanes(tree, groups, *, cuda):
+        if tree.count > width:
+            raise ValueError(f"a tree of {tree.count} bodies does not fit {width} lanes")
+        return width
+
+    with unittest.mock.patch.object(tree_kinetic_state, "held_lanes", lanes):
+        yield
+
+
 def single_scene_names():
     """Tags of the single-tree scenes, in recording order."""
     return [
@@ -136,7 +172,7 @@ def _describe(groups):
             name
             for name, present in (
                 ("forest", layout.forest),
-                ("chain scan", group.chain_scan),
+                ("heavy chains", group.schedules.chains),
                 ("compares banks", group.bank_compare),
                 ("alternate motion", group.motion_velocity),
             )
@@ -250,7 +286,7 @@ class Recorder:
                     group.layout.lanes,
                     group.layout.pack,
                     group.layout.forest,
-                    group.chain_scan,
+                    group.schedules.chains,
                     group.bank_compare,
                     group.motion_velocity,
                 )
@@ -356,7 +392,7 @@ class Recorder:
                     if not self.selected(tag):
                         continue
                     self.poison_heap()
-                    with _environment(FEATHER_PGS_TREE_CHAIN_SCAN=int(chains)):
+                    with _heavy_chains() if chains else contextlib.nullcontext():
                         try:
                             model, solver, _, operator, owner, _ = module.fixture(floating, self.device)
                         except ValueError as error:
@@ -405,14 +441,14 @@ class Recorder:
             self.drive(f"mixed-{tag}", model, solver, owner, owner.groups, owner.refresh, motion=motion)
 
 
-def record(path, *, root=None, device="cpu", lane_pack=0, poison=0.0, worlds=2, scenes=None):
+def record(path, *, root=None, device="cpu", lanes=0, poison=0.0, worlds=2, scenes=None):
     """Record the scenes' arrays to ``path`` (see the module docstring) and return them.
 
     Args:
         path: The ``.npz`` file to write.
         root: The Newton checkout to import (default: the one holding this script).
         device: The Warp device.
-        lane_pack: ``FEATHER_PGS_TREE_LANE_PACK``: 0 for one tree per block, or a fixed lane width.
+        lanes: A fixed lane width for every tree, or 0 for the width each tree's data chooses.
         poison: The value left in freed device memory before each scene (0: none).
         worlds: The mixed scenes' world count.
         scenes: The scenes to record, by single-tree tag or mixed scene name (default: every scene).
@@ -425,9 +461,8 @@ def record(path, *, root=None, device="cpu", lane_pack=0, poison=0.0, worlds=2, 
     unknown = sorted(set(scenes or ()) - set(single_scene_names()) - set(MIXED_SCENES))
     if unknown:
         raise SystemExit(f"Unknown scenes: {', '.join(unknown)}")
-    # One tree per block, or one fixed width: construction times no lane width. The
-    # scenes build their own owners; the solvers build none.
-    with _environment(FEATHER_PGS_TREE_LANE_PACK=lane_pack, FEATHER_PGS_TREE_KINETIC_STATE=0):
+    # The scenes build their own owners; the solvers build none.
+    with _environment(FEATHER_PGS_TREE_KINETIC_STATE=0):
         _import_newton(root)
         import numpy as np  # noqa: PLC0415
         import warp as wp  # noqa: PLC0415
@@ -435,7 +470,7 @@ def record(path, *, root=None, device="cpu", lane_pack=0, poison=0.0, worlds=2, 
         log_level, wp.config.log_level = wp.config.log_level, wp.LOG_WARNING
         recorder = Recorder(device, poison, worlds=worlds, scenes=scenes)
         try:
-            with recorder.hooks():
+            with recorder.hooks(), _fixed_lanes(lanes):
                 recorder.single_scenes()
                 recorder.mixed_scenes()
         finally:
@@ -492,7 +527,7 @@ def main(argv=None):
     record_parser.add_argument("--root", help="Newton checkout to import (default: the one holding this script)")
     record_parser.add_argument("--device", default="cpu", help="Warp device (default: cpu)")
     record_parser.add_argument(
-        "--lane-pack", type=int, default=0, choices=(0, 4, 8, 16, 32), help="FEATHER_PGS_TREE_LANE_PACK (default 0)"
+        "--lanes", type=int, default=0, choices=(0, 4, 8, 16, 32, 64), help="fixed lanes per tree (default 0: by tree)"
     )
     record_parser.add_argument("--poison", type=float, default=0.0, help="value left in freed memory before each scene")
     record_parser.add_argument("--worlds", type=int, default=2, help="world count of the mixed scenes (default 2)")
@@ -512,7 +547,7 @@ def main(argv=None):
             arguments.output,
             root=arguments.root,
             device=arguments.device,
-            lane_pack=arguments.lane_pack,
+            lanes=arguments.lanes,
             poison=arguments.poison,
             worlds=arguments.worlds,
             scenes=arguments.scenes,

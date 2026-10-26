@@ -145,7 +145,7 @@ FLAGS = declare(
         "FEATHER_PGS_G1_CHAIN_SCAN",
         "retired",
         ("environment_flags",),
-        "Retired G1 alias of the held-tree chain scan; ignored (FEATHER_PGS_TREE_CHAIN_SCAN=0 opts out of it).",
+        "Retired G1 alias of the held-tree chain scan; ignored.",
     ),
     _flag(
         "FEATHER_PGS_GROUPED_HINV",
@@ -469,9 +469,9 @@ FLAGS = declare(
     ),
     _flag(
         "FEATHER_PGS_TREE_CHAIN_SCAN",
-        "policy",
-        ("tree_kinetic_owner",),
-        "Chain-scan plan for the held-tree owner: 1 on, other values off (default per plan).",
+        "retired",
+        ("environment_flags",),
+        "Retired held-tree chain-scan selector; ignored (the scans' schedules follow from the tree's data).",
     ),
     _flag(
         "FEATHER_PGS_TREE_FOREST",
@@ -487,9 +487,9 @@ FLAGS = declare(
     ),
     _flag(
         "FEATHER_PGS_TREE_LANE_PACK",
-        "policy",
-        ("tree_kinetic_plan",),
-        "Held-tree lane width: 1 timed at construction (default), 0 one tree per block, 4/8/16/32 fixed.",
+        "retired",
+        ("environment_flags",),
+        "Retired held-tree lane width selector; ignored (the lanes follow from the tree's data).",
     ),
     _flag(
         "FEATHER_PGS_TREE_REFERENCE",
@@ -590,6 +590,8 @@ IGNORED_RETIRED = frozenset(
         "FEATHER_PGS_SPARSE_METRIC_TANGENTS",
         "FEATHER_PGS_SPARSE_PARALLEL_LIMITS",
         "FEATHER_PGS_SPARSE_SPECTRAL_TANGENTS",
+        "FEATHER_PGS_TREE_CHAIN_SCAN",
+        "FEATHER_PGS_TREE_LANE_PACK",
         "FEATHER_PGS_WORLD_ROWS",
         "FEATHER_PGS_WORLD_SCAN_PUBLICATION",
     )

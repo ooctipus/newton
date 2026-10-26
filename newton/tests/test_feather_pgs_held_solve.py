@@ -38,9 +38,6 @@ def _rollout(model, *, serial, steps=90, cached=True):
         "FEATHER_PGS_TREE_KINETIC_STATE": "0",
         "FEATHER_PGS_RESOLVED_WORLDS": "0",
         "FEATHER_PGS_TREE_REFERENCE": str(int(serial)),
-        # One tree per 32-lane block: no candidate width is timed, so both arms build the same
-        # layouts (the long arm needs more than 16 lanes).
-        "FEATHER_PGS_TREE_LANE_PACK": "0",
     }
     with patch.dict(os.environ, env):
         solver = SolverFeatherPGS(
@@ -83,8 +80,11 @@ _EARLY_STEPS = 8
 
 def _predictor(group, reference):
     """The predictor kernel the factory builds for a group's layout under ``reference``."""
+    schedules = tree_kinetic_state.held_schedules(
+        group.tree, group.layout.lanes, chains=group.chains, reference=reference
+    )
     return tree_kinetic_state.get_predictor_kernel(
-        group.chain_scan, layout=group.layout, response=group._response, reference=reference, clocked=group.clocked
+        schedules, layout=group.layout, response=group._response, reference=reference, clocked=group.clocked
     )
 
 

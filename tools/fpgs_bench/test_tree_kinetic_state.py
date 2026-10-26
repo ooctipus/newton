@@ -3,6 +3,7 @@
 
 """Check generated state caches against physical trees outside the G1 layout."""
 
+import contextlib
 import os
 import unittest
 from unittest.mock import patch
@@ -11,49 +12,50 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import tree_kinetic_state
+from newton._src.solvers.feather_pgs import tree_scan as ts
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseMassMatrixPlan
-from newton._src.solvers.feather_pgs.tree_chain_scan import make_plan
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
-from newton._src.solvers.feather_pgs.tree_kinetic_plan import cooperative_block_dim
 from newton._src.solvers.feather_pgs.tree_kinetic_sparse import TreeSparseOperator
+from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.tests import test_feather_pgs_sparse_split as split
 from tools.fpgs_bench.public_state_oracle import physical_mass, public_state
 
 
+@contextlib.contextmanager
+def _heavy_chains():
+    """Run every scan of the held trees built inside on the heavy chains (tools.fpgs_bench.held_tree_ab)."""
+    from tools.fpgs_bench.held_tree_ab import _heavy_chains as chains  # noqa: PLC0415
+
+    with chains():
+        yield
+
+
 class TestTreeLayout(unittest.TestCase):
     def test_complete_cooperative_lane_coverage(self):
-        """Keep every body and padded chain lane inside the selected block."""
-
-        small = TreeLayout(7, 11, 60, 11, 3, 6, tuple(range(11)))
-        self.assertEqual(cooperative_block_dim(small), 32)
-        self.assertEqual(cooperative_block_dim(small, make_plan([-1, 0, 0, 1, 2, 1, 4])), 32)
+        """Keep every body and padded chain lane inside a tree's lanes: a tree whose heavy chains pack into two
+        warps takes them, also at 32 bodies or fewer."""
+        small = TreePlan.build([-1, 0, 0, 1, 2, 1, 4], [6, 1, 1, 1, 1, 1, 1])
+        self.assertLessEqual(small.chain_packing(2).lanes, 32)
+        self.assertEqual(tree_kinetic_state.held_lanes(small, 64, cuda=True), 8)
         parents = [-1]
         for _ in range(10):
             parent = 0
             for _ in range(3):
                 parents.append(parent)
                 parent = len(parents) - 1
-        padded = TreeLayout(31, 36, 666, 36, 3, 6, tuple(range(36)))
-        self.assertEqual(cooperative_block_dim(padded), 32)
-        self.assertEqual(cooperative_block_dim(padded, make_plan(parents)), 64)
-        large = TreeLayout(44, 43, 434, 18, 10, 6, tuple(range(43)))
-        self.assertEqual(cooperative_block_dim(large), 64)
-
-    def test_root_only_and_large_tree_scratch_do_not_alias_live_axes(self):
-        """Keep the temporary projected inertia clear of live joint screws."""
-        for bodies, dofs in ((1, 6), (7, 12), (44, 43), (59, 64)):
-            layout = TreeLayout(bodies, dofs, dofs * (dofs + 1) // 2, dofs, min(5, bodies - 1), 6, tuple(range(dofs)))
-            self.assertGreaterEqual(layout.axis_offset, 6 * dofs)
-            self.assertGreaterEqual(layout.wrench_offset, layout.axis_offset + 6 * dofs)
-            self.assertGreaterEqual(layout.moment_offset, layout.wrench_offset + 6 * bodies)
-            self.assertGreaterEqual(layout.origin_offset, layout.moment_offset + 13 * bodies)
-
-    def test_reject_unsupported_coordinate_maps(self):
-        """Reject incomplete permutations before constructing generated kernels."""
-        with self.assertRaises(ValueError):
-            TreeLayout(3, 2, 3, 2, 2, 0, (0, 0))
+        padded = TreePlan.build(parents, [6] + [1] * 30)
+        self.assertEqual(padded.chain_packing(2).lanes, 64)
+        layout = TreeLayout(31, 36, 666, 36, 3, 6, tuple(range(36)), 64)
+        self.assertEqual((layout.block, layout.pack), (64, 1))
+        # A warp's lanes leave such a tree no chain schedule; its two warps admit them.
+        self.assertFalse(tree_kinetic_state.held_schedules(padded, 32, chains=True).chains)
+        self.assertIn(
+            ts.Schedule.HEAVY_CHAIN,
+            ts.schedule_costs(padded, ts.Direction.UP, ts.add(ts.Group("wrench", 6)), lanes=64, chains=True),
+        )
 
 
 def fixture(floating, device):
@@ -102,7 +104,7 @@ class TestTreePhysicalCPU(unittest.TestCase):
             for chains in (False, True):
                 with (
                     self.subTest(floating=floating, chains=chains),
-                    patch.dict(os.environ, {"FEATHER_PGS_TREE_CHAIN_SCAN": str(int(chains))}),
+                    _heavy_chains() if chains else contextlib.nullcontext(),
                 ):
                     model, solver, reference, operator, owner, mass = fixture(floating, device)
                     self.assertNotEqual(tuple(mass.permutation), tuple(range(mass.dof_count - 1, -1, -1)))
@@ -160,22 +162,16 @@ class TestTreePhysicalCPU(unittest.TestCase):
 
 class TestTreePhysicalCUDA(TestTreePhysicalCPU):
     def test_default_admission_and_motion_velocity(self):
-        """Select native trees, their default chain scan and the prescaled-velocity contract."""
+        """Select native trees, their launch from the tree's data and the prescaled-velocity contract."""
         if not wp.get_cuda_devices():
             self.skipTest("No leased CUDA device")
         with patch.dict(os.environ):
             os.environ.pop("FEATHER_PGS_TREE_KINETIC_STATE", None)
-            os.environ.pop("FEATHER_PGS_TREE_CHAIN_SCAN", None)
             case = split._case(True, floating=True, branches=3, depth=2, device="cuda:0")
-            self.assertIsNotNone(case[1]._tree_kinetic_state)
-            self.assertTrue(case[1]._tree_kinetic_state.chain_scan)
-            self.assertEqual(case[1]._tree_kinetic_state.block_dim, 32)
-            # The flag opts out of the chain scan, not of the native tree.
-            os.environ["FEATHER_PGS_TREE_CHAIN_SCAN"] = "0"
-            unscanned = split._solver(case[0], True)
-            self.assertIsNotNone(unscanned._tree_kinetic_state)
-            self.assertFalse(unscanned._tree_kinetic_state.chain_scan)
-            del os.environ["FEATHER_PGS_TREE_CHAIN_SCAN"]
+            owner = case[1]._tree_kinetic_state
+            self.assertIsNotNone(owner)
+            self.assertEqual(owner.layout.lanes, tree_kinetic_state.held_lanes(owner.tree, owner.group_count))
+            self.assertEqual(owner.block_dim, owner.layout.block)
             ordinary = split._solver(
                 case[0], True, pgs_mode="matrix_free", pgs_kernel="auto", enable_joint_velocity_limits=True
             )
@@ -200,9 +196,9 @@ class TestTreePhysicalCUDA(TestTreePhysicalCPU):
         for floating in (False, True):
             cases = []
             for enabled in (False, True):
-                with patch.dict(
-                    os.environ,
-                    {"FEATHER_PGS_TREE_KINETIC_STATE": str(int(enabled)), "FEATHER_PGS_TREE_CHAIN_SCAN": "1"},
+                with (
+                    patch.dict(os.environ, {"FEATHER_PGS_TREE_KINETIC_STATE": str(int(enabled))}),
+                    _heavy_chains(),
                 ):
                     # This helper preserves the existing split contact law.
 

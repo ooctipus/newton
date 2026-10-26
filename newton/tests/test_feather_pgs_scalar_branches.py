@@ -2363,7 +2363,6 @@ class TestScalarBranchOwner(unittest.TestCase):
         for name, group in groups.items():
             self.assertEqual(group["input_validation"], "identity", name)
             self.assertEqual((group["kernels"]["bank"], group["kernels"]["bank_repair"]), (None, None), name)
-        self.assertEqual(len(record["measurements"]["held_tree_lane_timing_us"]), 2)
         self.assertEqual(publication["owner"], "cached")
         head = recipe_solver(model, scalar=False).get_path_selection()["routes"]
         self.assertFalse(head["held_tree"]["scalar_branches"]["enabled"])

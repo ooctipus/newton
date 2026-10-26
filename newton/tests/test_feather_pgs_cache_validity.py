@@ -17,7 +17,13 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import cached_state_binding, capture_joins, path_selection, tree_kinetic_owner
+from newton._src.solvers.feather_pgs import (
+    cached_state_binding,
+    capture_joins,
+    path_selection,
+    tree_kinetic_owner,
+    tree_kinetic_state,
+)
 from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.test_feather_pgs_mixed_tree_free_body import _build
@@ -25,9 +31,18 @@ from newton.tests.test_feather_pgs_sparse_solver import STATE_FIELDS, _build_mod
 
 DT = 1.0 / 240.0
 JOINT = newton.ModelFlags.JOINT_PROPERTIES
-# One tree per block: by default each held-tree group times its candidate lane widths at
-# construction, so two solver instances could run different layouts (and reduction orders).
-ONE_TREE_PER_BLOCK = {"FEATHER_PGS_TREE_LANE_PACK": "0"}
+
+
+def fixed_lanes(lanes):
+    """Pin every held-tree group's lane width (``tree_kinetic_state.held_lanes``), for packed layouts on trees
+    whose data would choose another width."""
+    return patch.object(tree_kinetic_state, "held_lanes", lambda tree, groups, *, cuda: lanes)
+
+
+def _one_tree_per_block(build, *args, **kwargs):
+    """``build(*args, **kwargs)`` with every held-tree group at 32 lanes: one tree per block, chain scans."""
+    with fixed_lanes(32):
+        return build(*args, **kwargs)
 
 
 def _groups(owner):
@@ -64,16 +79,13 @@ def _fixed_root(model, world):
 def _mixed_solver(model, *, forest=False, owner=True, lanes=None, **options):
     """A dense-route solver with the mixed held-tree owner, or with ordinary dynamics when ``owner`` is False.
 
-    ``lanes`` fixes the held-tree lane width (several small trees per block); by default each tree has a block.
+    ``lanes`` fixes the held-tree lane width (several small trees per block); by default the trees' data chooses.
     """
     environment = {
         "FEATHER_PGS_MIXED_TREE_KINETIC_STATE": str(int(owner)),
         "FEATHER_PGS_TREE_KINETIC_STATE": "0",
         "FEATHER_PGS_TREE_FOREST": str(int(forest)),
-        **ONE_TREE_PER_BLOCK,
     }
-    if lanes is not None:
-        environment["FEATHER_PGS_TREE_LANE_PACK"] = str(lanes)
     settings = {
         "pgs_mode": "matrix_free",
         "pgs_iterations": 8,
@@ -82,7 +94,7 @@ def _mixed_solver(model, *, forest=False, owner=True, lanes=None, **options):
         "friction_anchor_beta": 0.0,
         **options,
     }
-    with patch.dict(os.environ, environment):
+    with patch.dict(os.environ, environment), fixed_lanes(lanes) if lanes is not None else contextlib.nullcontext():
         return SolverFeatherPGS(model, **settings)
 
 
@@ -100,8 +112,7 @@ def _owned_case(name, device, **options):
         model = _build(device, worlds=4, prescribed=True)
         return model, _mixed_solver(model, forest=True, **options)
     model = _build_model()
-    with patch.dict(os.environ, ONE_TREE_PER_BLOCK):
-        return model, _make_solver(model, True, **{"cached_dynamics": "on", "friction_anchor_beta": 0.0, **options})
+    return model, _make_solver(model, True, **{"cached_dynamics": "on", "friction_anchor_beta": 0.0, **options})
 
 
 class _Rollout:
@@ -110,7 +121,7 @@ class _Rollout:
     With ``copy_back`` the input bank stays the same object and each step copies the output bank
     back into it, as Isaac Lab does after an odd substep count. Rollouts of separate solver
     instances compare within 2e-6 (rtol 0), the bound the repository's other cross-instance tests
-    use. Their held-tree lane width is pinned (``ONE_TREE_PER_BLOCK``); what can remain between
+    use. Their held-tree layouts follow from the trees' data alone; what can remain between
     instances is the order of float atomic accumulations.
     """
 
@@ -1332,9 +1343,9 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
     def test_cuda_captured_motion_repair_above_two_grids_is_one_pass(self):
         """Capture a velocity-limit repair above two listed grids as the one-pass launch, without a classification.
 
-        Built with a one-block listed grid, the owners' four-world groups lie above the two-block
-        threshold, as a 16384-world scene's groups do on the device's own grid, and the owner
-        decides on CUDA unforced. In a captured block of two steps each velocity-limit group
+        Built with a one-block listed grid and one tree per block (32 lanes), the owners' four-world
+        groups lie above the two-block threshold, as a 16384-world scene's groups do on the device's
+        own grid, and the owner decides on CUDA unforced. In a captured block of two steps each velocity-limit group
         launches its one-pass repair twice, launches no classification, clears no block list and
         records ``one_pass`` twice; an ordinary-motion owner of the same size classifies the block's
         first repair and skips the second. Replays with a world reset before each match eager
@@ -1344,9 +1355,9 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
 
         def velocity_limits():
             model = _build(device, worlds=4, speed_limit=0.8)
-            return model, _mixed_solver(model, enable_joint_velocity_limits=True)
+            return model, _mixed_solver(model, enable_joint_velocity_limits=True, lanes=32)
 
-        for name, build in (("motion", velocity_limits), ("mixed", lambda: _owned_case("mixed", device))):
+        for name, build in (("motion", velocity_limits), ("mixed", lambda: _owned_case("mixed", device, lanes=32))):
             with self.subTest(owner=name):
                 motion = name == "motion"
                 finals = []
@@ -1588,8 +1599,8 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
 
         From one device state with random invalid, requested, geometrically stale and
         foreign-stamped groups, the one-pass repair and the classified repair write identical words
-        to every array the repair reaches, for packed per-size groups, a packed forest and chain-scan
-        sparse trees. The blocks the classification lists are exactly those with a group the
+        to every array the repair reaches, for packed per-size groups, a packed forest and sparse trees
+        of one tree per block. The blocks the classification lists are exactly those with a group the
         one-pass repair recomputed. (Velocity-limit layouts keep the one-pass repair.)
         """
         device = wp.get_device("cuda:0")
@@ -1598,7 +1609,7 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
         cases = {
             "mixed": lambda: _mixed_solver(_build(device, worlds=8), lanes=8),
             "forest": lambda: _mixed_solver(_build(device, worlds=8, prescribed=True), forest=True, lanes=8),
-            "sparse": lambda: _owned_case("sparse", device)[1],
+            "sparse": lambda: _one_tree_per_block(_owned_case, "sparse", device)[1],
         }
         for name, build in cases.items():
             with self.subTest(owner=name):
@@ -1609,7 +1620,7 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                 _classify_every_launch(owner)
                 packs = [group.layout.pack for group in _groups(owner)]
                 self.assertTrue(all(pack == 4 for pack in packs) if name != "sparse" else packs == [1], packs)
-                self.assertEqual(name == "sparse", _groups(owner)[0].chain_scan)
+                self.assertEqual(name == "sparse", _groups(owner)[0].chains)
                 rollout = _Rollout(solver.model, solver)
                 rollout.block()
                 state = rollout.states[0]
@@ -1665,7 +1676,7 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
         cases = {
             "mixed": lambda: _mixed_solver(_build(device, worlds=8), lanes=8),
             "forest": lambda: _mixed_solver(_build(device, worlds=8, prescribed=True), forest=True, lanes=8),
-            "sparse": lambda: _owned_case("sparse", device)[1],
+            "sparse": lambda: _one_tree_per_block(_owned_case, "sparse", device)[1],
         }
         for name, build in cases.items():
             with self.subTest(owner=name):

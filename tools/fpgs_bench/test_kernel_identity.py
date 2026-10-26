@@ -138,19 +138,20 @@ class TestKernelIdentity(unittest.TestCase):
         state = "tree_kinetic_state.get_state_kernel"
         classify = "tree_kinetic_state.get_classify_kernel"
         for name, (tree, chain, _, options) in identity.held_tree_layouts().items():
+            schedules = identity._schedules(tree, chain)
             with self.subTest(layout=name):
                 for finish in (False, True):
                     running = {
                         key: value for key, value in options.items() if not (finish and key == "motion_velocity")
                     }
-                    self.assertIn((state, (finish, chain), name, {**running, "body_velocity": True}), calls)
+                    self.assertIn((state, (finish, schedules), name, {**running, "body_velocity": True}), calls)
                 ordinary = not options.get("motion_velocity", False)
                 coordinates = tree.dofs + tree.free_roots
                 for call in (
-                    (state, (False, chain), name, {"body_velocity": True, "bank_coordinates": coordinates}),
-                    (classify, (chain,), name, {}),
-                    (state, (False, chain), name, {"body_velocity": True, "listed": True}),
-                    ("tree_kinetic_state.get_bank_kernel", (chain,), name, {"coordinates": coordinates}),
+                    (state, (False, schedules), name, {"body_velocity": True, "bank_coordinates": coordinates}),
+                    (classify, (), name, {}),
+                    (state, (False, schedules), name, {"body_velocity": True, "listed": True}),
+                    ("tree_kinetic_state.get_bank_kernel", (), name, {"coordinates": coordinates}),
                 ):
                     self.assertEqual(call in calls, ordinary, call)
         motion_classified = [

@@ -66,13 +66,16 @@ from typing import Any
 import numpy as np
 import warp as wp
 
+from . import field_group
 from .device_preludes import DevicePrelude, device_branches, dual_native, lane_group
+from .field_group import Field
 from .law_source import law_preludes
 from .spatial_laws import SPATIAL, transform_compose, twist_compose
 from .tree_plan import TreePlan
 
 __all__ = [
     "INERTIA",
+    "SCAN_PLAN",
     "TRANSFORM",
     "TWIST",
     "Combine",
@@ -86,6 +89,7 @@ __all__ = [
     "add",
     "choose_schedule",
     "device_plan",
+    "scan_arrays",
     "schedule_costs",
     "schedule_features",
     "serial_path",
@@ -267,40 +271,47 @@ class PlanAccess:
         return PlanAccess(**values)
 
 
-@wp.struct
-class ScanPlan:
-    """A :class:`.tree_plan.TreePlan` on the device, read by every generated scan (one tree, local indices)."""
+SCAN_PLAN = (
+    Field("parent", wp.int32, ("node",), owner="plan"),
+    Field("depth", wp.int32, ("node",), owner="plan"),
+    Field("dof_start", wp.int32, ("node_bound",), owner="plan"),
+    Field("jump", wp.int32, ("jump",), owner="plan"),
+    Field("children_offsets", wp.int32, ("node_bound",), owner="plan"),
+    Field("children", wp.int32, ("edge",), owner="plan"),
+    Field("level_offsets", wp.int32, ("level_bound",), owner="plan"),
+    Field("level_nodes", wp.int32, ("node",), owner="plan"),
+    Field("dfs_order", wp.int32, ("node",), owner="plan"),
+    Field("dfs_end", wp.int32, ("node",), owner="plan"),
+    Field("dfs_position", wp.int32, ("node",), owner="plan"),
+    Field("chain_meta", wp.int32, ("chain_lane",), owner="plan"),
+    Field("light_offsets", wp.int32, ("node_bound",), owner="plan"),
+    Field("light_children", wp.int32, ("light_edge",), owner="plan"),
+    Field("stage_width", wp.int32, ("chain_level",), owner="plan"),
+    Field("chain_levels", wp.int32, owner="plan"),
+    Field("chain_width", wp.int32, owner="plan"),
+)
+"""A :class:`.tree_plan.TreePlan` on the device, as every generated scan reads it (:class:`PlanAccess`): one
+tree in local indices, its jump table flat by rounds and its heavy chains packed into two warps."""
 
-    parent: wp.array[int]
-    depth: wp.array[int]
-    dof_start: wp.array[int]
-    jump: wp.array[int]
-    children_offsets: wp.array[int]
-    children: wp.array[int]
-    level_offsets: wp.array[int]
-    level_nodes: wp.array[int]
-    dfs_order: wp.array[int]
-    dfs_end: wp.array[int]
-    dfs_position: wp.array[int]
-    chain_meta: wp.array[int]
-    light_offsets: wp.array[int]
-    light_children: wp.array[int]
-    stage_width: wp.array[int]
-    chain_levels: int
-    chain_width: int
+ScanPlan = field_group.struct("ScanPlan", SCAN_PLAN, __name__)
+"""The device plan's struct; owners that keep more per tree extend :data:`SCAN_PLAN`."""
 
 
-def device_plan(plan: TreePlan, device, *, warps: int = 2) -> ScanPlan:
-    """Upload ``plan`` for the generated scans; the chain packing is empty when the chains do not fit ``warps``."""
+def scan_arrays(plan: TreePlan, *, warps: int = 2) -> dict:
+    """The host values of :data:`SCAN_PLAN` for ``plan``; the chain packing is empty when the chains do not fit
+    ``warps``. An empty edge list holds one unused entry."""
     packing = plan.chain_packing(warps)
-    result = ScanPlan()
-    arrays = {
+
+    def nonempty(values):
+        return values if values.size else np.zeros(1, np.int32)
+
+    return {
         "parent": plan.parent,
         "depth": plan.depth,
         "dof_start": plan.dof_start,
         "jump": plan.jump.reshape(-1),
         "children_offsets": plan.children_offsets,
-        "children": plan.children if plan.children.size else np.zeros(1, np.int32),
+        "children": nonempty(plan.children),
         "level_offsets": plan.level_offsets,
         "level_nodes": plan.level_nodes,
         "dfs_order": plan.dfs_order,
@@ -308,14 +319,16 @@ def device_plan(plan: TreePlan, device, *, warps: int = 2) -> ScanPlan:
         "dfs_position": plan.dfs_position,
         "chain_meta": (packing.meta if packing is not None else np.full((32, 5), -1, np.int32)).reshape(-1),
         "light_offsets": plan.light_offsets,
-        "light_children": plan.light_children if plan.light_children.size else np.zeros(1, np.int32),
+        "light_children": nonempty(plan.light_children),
         "stage_width": packing.stage_width if packing is not None else np.zeros(1, np.int32),
+        "chain_levels": packing.levels if packing is not None else 0,
+        "chain_width": packing.width if packing is not None else 1,
     }
-    for name, values in arrays.items():
-        setattr(result, name, wp.array(np.ascontiguousarray(values, dtype=np.int32), dtype=int, device=device))
-    result.chain_levels = packing.levels if packing is not None else 0
-    result.chain_width = packing.width if packing is not None else 1
-    return result
+
+
+def device_plan(plan: TreePlan, device, *, warps: int = 2) -> ScanPlan:
+    """Upload ``plan`` for the generated scans (:func:`scan_arrays`)."""
+    return field_group.upload(ScanPlan, device, **scan_arrays(plan, warps=warps))
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -397,7 +410,8 @@ def schedule_costs(
             feasible.append(Schedule.JUMP_SMEM)
     elif plan.count <= min(lanes, 32):
         feasible.append(Schedule.DFS_INTERVAL)
-    if chains and plan.chain_packing(2) is not None:
+    packing = plan.chain_packing(2) if chains else None
+    if packing is not None and packing.lanes <= lanes:
         feasible.append(Schedule.HEAVY_CHAIN)
     feasible.append(Schedule.LEVEL)
     costs = {}
@@ -416,9 +430,9 @@ def choose_schedule(
     The CPU, a path and a tree without edges run SERIAL. Otherwise each schedule the launch admits is
     costed from the plan's counts (:func:`schedule_features`) at unit costs measured once per schedule
     (``_UNIT_COSTS``), and the cheapest wins. The launch admits JUMP_SHFL and DFS_INTERVAL for a tree a warp's
-    lanes cover, JUMP_SMEM for one the group's lanes cover, HEAVY_CHAIN when the heavy chains pack into two
-    warps and the launch gives each tree its own block (``chains``: the chain scans address the block's
-    threads), and LEVEL always.
+    lanes cover, JUMP_SMEM for one the group's lanes cover, HEAVY_CHAIN when the heavy chains pack into the
+    group's lanes (one warp or two) and the launch gives each tree its own block (``chains``: the chain scans
+    address the block's threads), and LEVEL always.
 
     Args:
         plan: The group's template tree.
@@ -667,7 +681,7 @@ def _chain_down(c: _Context) -> str:
         const bool combine=node>=0&&position>=offset;
         const int source=combine?((lane-offset)&31):(lane&31);
         {c.combine.declare(up)}
-        {c.shuffle(up, value, "source", "0xffffffffu", "32")}
+        {c.shuffle(up, value, "source")}
         if(combine){c.combine.compose(value, up)}
     }}
     for(int stage=0;stage<{c.access.chain_levels};++stage) {{
@@ -721,7 +735,7 @@ def _chain_up(c: _Context) -> str:
             const int source=combine?((thread+offset)&31):(thread&31);
             #pragma unroll
             for(int k=0;k<{count};++k) {{
-                const float next=__shfl_sync(0xffffffffu,values[k],source,32);
+                const float next=__shfl_sync(MASK,values[k],source,WIDTH);
                 if(combine)values[k]+=next;
             }}
         }}

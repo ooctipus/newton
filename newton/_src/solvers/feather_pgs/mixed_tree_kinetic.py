@@ -173,7 +173,7 @@ class TreeHeldOperator:
             raise ValueError("Mixed tree physical and factor dimensions differ")
         self.host = operator_metadata(mass)
         self.plan = bind_operator_plan(solver, size, self.host)
-        self.layout, _, _ = make_plan(model, self, complete=False)
+        self.layout, _ = make_plan(model, self, complete=False)
         physical_index = np.full((size, size), -1, np.int32)
         for index, (row, col) in enumerate(zip(mass.entry_rows, mass.columns, strict=True)):
             a, b = mass.permutation[row], mass.permutation[col]
@@ -282,7 +282,7 @@ class PrescribedRootOperator:
         self.host = operator_metadata(mass)
         self.group_to_art = wp.array(arts, dtype=int, device=device)
         self.plan = bind_operator_plan(solver, 6, self.host, group_to_art=self.group_to_art)
-        self.layout, _, _ = make_plan(solver.model, self, complete=False)
+        self.layout, _ = make_plan(solver.model, self, complete=False)
         self.data = HeldResponse()
         self.data.valid = wp.ones(len(arts), dtype=int, device=device)
         self.data.status = wp.zeros(len(arts), dtype=int, device=device)
@@ -392,7 +392,7 @@ class ForestHeldOperator:
         self.group_to_art = wp.array(arts[:, 0].copy(), dtype=int, device=device)
         self.plan = bind_operator_plan(solver, 0, self.host, group_to_art=self.group_to_art)
         self.size = mass.dof_count
-        self.layout, _, _ = make_plan(model, self, complete=False)
+        self.layout, _ = make_plan(model, self, complete=False)
         # Physical (row, col) -> forest entry, for each root family's refresh.
         physical_index = np.full((self.size, self.size), -1, np.int32)
         for index, (row, col) in enumerate(zip(mass.entry_rows, mass.columns, strict=True)):
@@ -569,7 +569,7 @@ class MixedTreeKineticState:
             group = TreeKineticState(
                 operator,
                 admission=admission,
-                chain_scan_default=False,
+                chains=False,
                 complete=False,
                 response="diagonal" if operator.diagonal else "cholesky",
                 reference=self.reference,

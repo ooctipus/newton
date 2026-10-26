@@ -1,20 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The tree plan and the tree scan against every tree pass and builder they replace.
+"""The tree plan and the tree scan: the plan's structures, every held-tree scan configuration and the rule
+that picks them.
 
-* :class:`TestTreePlan`: ``TreePlan.build`` reproduces each host builder's
-  structures (depth-first intervals, the held tree's jump table and children,
-  the heavy-chain packing, the sparse factor pattern and its support classes,
-  articulation depths, body supports, local parents).
-* :class:`TestHeldTreePasses`: on CUDA, every held-tree pass (pose and motion
-  scans, subtree and external reductions, the twist publication) on every
-  schedule it runs, as its existing text and as its ``tree_scan``
-  configuration, on the existing plan structs and on the scan plan: bit for
-  bit, and close to a float64 reference.
-* :class:`TestSerialTwin`: the CPU path of every scan is the serial schedule:
-  bitwise with the existing CPU twins that already walk levels, within a few
-  units of the terms of those that emulate pointer jumping or chains.
+* :class:`TestTreePlan`: ``TreePlan.build``'s structures: depth-first intervals,
+  the held tree's jump table and children, the heavy-chain packing, the sparse
+  factor pattern and its support classes, articulation depths, body supports
+  and local parents.
+* :class:`TestHeldTreePasses`: every held-tree scan (pose and motion scans,
+  subtree and external reductions, the twist publication) on every schedule it
+  runs, close to a float64 reference: on CUDA its schedule, on the CPU its
+  serial twin.
+* :class:`TestHeldTreeChains`: trees of 32 bodies or fewer whose heavy chains
+  need two warps run the chain scans on two warps.
 * :class:`TestScheduleRule`: the schedule follows from the plan's data.
 * :class:`TestPath`: a PATH visits the root path, natively and in Warp.
 
@@ -22,16 +21,14 @@ The general route's passes are tested in ``test_feather_pgs_tree_passes``.
 """
 
 import unittest
+import unittest.mock
 
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import tree_chain_scan
 from newton._src.solvers.feather_pgs import tree_scan as ts
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseMassMatrixPlan, _SparseRowSupportPlan
-from newton._src.solvers.feather_pgs.tree_kinetic_owner import dfs_intervals
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan, local_parents
-from newton.tests.feather_pgs_law_harness import term_ulps
 from newton.tests.feather_pgs_tree_scan_fixture import (
     EXTERNAL,
     MOTION,
@@ -40,11 +37,12 @@ from newton.tests.feather_pgs_tree_scan_fixture import (
     SHAPES,
     TWIST_SUM,
     applies,
-    compare,
+    chain_lanes,
     lanes_of,
     layout_of,
     plan_of,
     random_scratch,
+    run,
 )
 
 EPS = float(np.finfo(np.float32).eps)
@@ -75,12 +73,27 @@ class TestTreePlan(unittest.TestCase):
             yield parent, dofs
 
     def test_depth_first_intervals(self):
-        """tree_kinetic_owner.dfs_intervals: children and roots ascending, each subtree one interval."""
+        """Children and roots ascending, each subtree one interval of positions."""
         for parent, dofs in self.forests():
             plan = TreePlan.build(parent, dofs)
-            order, end = dfs_intervals(parent)
-            np.testing.assert_array_equal(plan.dfs_order, order)
-            np.testing.assert_array_equal(plan.dfs_end, end)
+            n = parent.size
+            np.testing.assert_array_equal(np.sort(plan.dfs_order), np.arange(n))
+            np.testing.assert_array_equal(plan.dfs_order[plan.dfs_position], np.arange(n))
+            for node in range(n):
+                subtree = set()
+                for other in range(n):
+                    up = other
+                    while up >= 0 and up != node:
+                        up = parent[up]
+                    if up == node:
+                        subtree.add(other)
+                position = plan.dfs_position[node]
+                self.assertEqual(set(plan.dfs_order[position : plan.dfs_end[position]].tolist()), subtree)
+                children = np.flatnonzero(parent == node)
+                walk = plan.dfs_position[children]
+                self.assertTrue(np.all(np.diff(walk) > 0), "children ascend")
+            roots = np.flatnonzero(parent < 0)
+            self.assertTrue(np.all(np.diff(plan.dfs_position[roots]) > 0), "roots ascend")
 
     def test_held_tree_topology(self):
         """TreeKineticState's jump table, descending children CSR and depths (tree_kinetic_owner, tree_kinetic_plan)."""
@@ -106,23 +119,40 @@ class TestTreePlan(unittest.TestCase):
             np.testing.assert_array_equal(plan.children_offsets, offsets)
 
     def test_heavy_chain_packing(self):
-        """tree_chain_scan.make_plan: the same lanes, light children, levels and widths, or the same refusal."""
+        """Heavy chains partition each tree into paths along the largest subtrees; the packing pads each to a power
+        of two, keeps it within a warp and records its nodes, start, length, light level and anchor lane by lane."""
         for parent, dofs in self.forests():
             if np.count_nonzero(parent < 0) != 1:
                 continue
             plan = TreePlan.build(parent, dofs)
+            n = parent.size
+            for node in range(n):
+                children = np.flatnonzero(parent == node)
+                if children.size:
+                    sizes = plan.subtree_size[children]
+                    self.assertEqual(plan.heavy[node], children[np.flatnonzero(sizes == sizes.max())[0]])
             packing = plan.chain_packing(2)
-            try:
-                reference = tree_chain_scan.make_plan(parent)
-            except ValueError:
-                self.assertIsNone(packing)
+            widths = 1 << np.ceil(np.log2(plan.chain_lengths)).astype(np.int64)
+            if packing is None:
+                # Refused: a chain wider than a warp, or chains that no first-fit packing of two warps holds.
                 continue
-            np.testing.assert_array_equal(packing.meta, reference["meta"])
-            np.testing.assert_array_equal(plan.light_offsets, reference["light_offsets"])
-            np.testing.assert_array_equal(plan.light_children, reference["light_children"])
-            np.testing.assert_array_equal(packing.stage_width, reference["stage_width"])
-            self.assertEqual(packing.levels, reference["levels"])
-            self.assertEqual(packing.width, int(reference["widths"].max()))
+            meta = packing.meta
+            occupied = meta[:, 0] >= 0
+            np.testing.assert_array_equal(np.sort(meta[occupied, 0]), np.arange(n))
+            for chain, head in enumerate(plan.chain_heads):
+                lanes = np.flatnonzero(meta[:, 0] == head)
+                self.assertEqual(lanes.size, 1)
+                start = int(lanes[0])
+                length = int(plan.chain_lengths[chain])
+                self.assertEqual(start // 32, (start + widths[chain] - 1) // 32, "within a warp")
+                nodes = meta[start : start + length, 0]
+                np.testing.assert_array_equal(meta[start : start + length, 1], start)
+                np.testing.assert_array_equal(meta[start : start + length, 2], length)
+                np.testing.assert_array_equal(meta[start : start + length, 3], plan.chain_levels[chain])
+                np.testing.assert_array_equal(meta[start : start + length, 4], parent[head])
+                np.testing.assert_array_equal(nodes[1:], plan.heavy[nodes[:-1]])
+                self.assertEqual(plan.heavy[nodes[-1]], -1)
+            self.assertEqual(packing.width, int(widths.max()))
 
     def test_factor_pattern_and_supports(self):
         """_SparseMassMatrixPlan.build field by field, and _SparseRowSupportPlan.build's classes."""
@@ -305,77 +335,118 @@ def _cases(packed_widths=(0, 8)):
     for shape in SHAPES:
         plan = plan_of(shape)
         for packed in packed_widths:
-            lanes = lanes_of(plan, packed)
-            if packed and lanes >= 32:
-                continue
             for name, item in PASSES.items():
-                if not applies(item, plan, lanes) or (item.plan_struct == "chain" and packed):
+                chain = item.schedule is ts.Schedule.HEAVY_CHAIN
+                if chain and packed:
+                    continue
+                lanes = chain_lanes(plan) if chain else lanes_of(plan, packed)
+                if (packed and lanes >= 32) or not applies(item, plan, lanes):
                     continue
                 for flag in (0, 1) if item.direction is ts.Direction.UP else (1,):
                     yield shape, plan, lanes, name, item, flag
 
 
-def _assert_close_to_reference(test, item, plan, layout, start, result, flag, groups, twists=None, data=None):
+def _assert_close_to_reference(test, item, plan, layout, start, result, flag, groups, twists=None):
     if item.combine is TWIST_SUM:
         rng = np.random.default_rng(3 + 1)
         axes = rng.standard_normal((groups * plan.count, 6)).astype(np.float32).reshape(groups, plan.count, 6)
         vhat = rng.standard_normal(groups * plan.count).astype(np.float32).reshape(groups, plan.count)
         expected, _ = reference(item, plan, layout, start, flag, vhat, axes)
         got = twists.reshape(groups, plan.count, 6)
-        scale = np.abs(expected).max() + 1.0
     else:
         expected, _ = reference(item, plan, layout, start, flag)
         got = result.reshape(start.shape)
-        scale = np.abs(expected).max() + 1.0
+    scale = np.abs(expected).max() + 1.0
     error = np.abs(got.astype(np.float64) - expected).max() / scale
     test.assertLess(error, 64 * plan.count * EPS, f"{item.name} on {plan.count} nodes")
 
 
-@unittest.skipUnless(wp.is_cuda_available(), "The held tree's schedules are CUDA paths")
+def check_held_passes(test, device):
+    """Every pass, shape and lane width (warps of packed trees, a warp or two per tree): the scan close to a
+    float64 reference. On the CPU every pass runs its serial twin (the twist publication is CUDA only)."""
+    cuda = wp.get_device(device).is_cuda
+    groups = 64 if cuda else 4
+    for shape, plan, lanes, name, item, flag in _cases((0, 8) if cuda else (0,)):
+        if name == "twist_shfl" and not cuda:
+            continue
+        with test.subTest(shape=shape, lanes=lanes, scan=name, flag=flag):
+            layout = layout_of(plan, lanes)
+            scratch, twists = run(item, plan, layout, groups, flag, 3, device)
+            start = random_scratch(layout, groups, 3)
+            _assert_close_to_reference(test, item, plan, layout, start, scratch, flag, groups, twists=twists)
+
+
 class TestHeldTreePasses(unittest.TestCase):
-    def test_generated_scans_are_the_existing_passes(self):
-        """Every pass, shape and lane width: existing text == generated on the held structs == generated on the
-        scan plan, bit for bit; all close to a float64 reference."""
+    pass
+
+
+def _held_tree_model(shape: str, worlds: int, device):
+    """A free-root tree of ``shape``, revolute joints below the root, replicated over ``worlds``."""
+    import newton  # noqa: PLC0415
+
+    scene = newton.ModelBuilder()
+    bodies, joints = [], []
+    for index, parent in enumerate(SHAPES[shape]):
+        body = scene.add_link(mass=0.5 + 0.1 * index, inertia=wp.mat33(np.diag([0.04, 0.05, 0.07])))
+        bodies.append(body)
+        if index == 0:
+            joints.append(scene.add_joint_free(body))
+            continue
+        anchor = wp.transform(wp.vec3(0.07, 0.03 * (index % 5), -0.08), wp.quat_identity())
+        axis = (float(index % 3), float((index + 1) % 3), 1.0)
+        joints.append(scene.add_joint_revolute(bodies[parent], body, axis=axis, parent_xform=anchor, armature=0.05))
+    scene.add_articulation(joints)
+    builder = newton.ModelBuilder()
+    builder.replicate(scene, worlds)
+    return builder.finalize(device=device)
+
+
+@unittest.skipUnless(wp.is_cuda_available(), "The held tree is a CUDA path")
+class TestHeldTreeChains(unittest.TestCase):
+    def test_two_warp_chains_of_small_trees(self):
+        """Trees of 32 bodies or fewer whose padded heavy chains need two warps (g1_30, binary31) run every scan on
+        the heavy chains, a tree's two warps one block: the repair and the finish publish forward kinematics.
+
+        (The owner these schedules replaced launched such a tree's 64 threads with one warp's lane group, so the
+        second warp took a second tree's state block, past the block's shared memory: CUDA error 700.)
+        """
+        import newton  # noqa: PLC0415
+        from newton._src.solvers.feather_pgs import tree_kinetic_state  # noqa: PLC0415
+        from newton.tests.test_feather_pgs_sparse_solver import _make_solver  # noqa: PLC0415
+
         device = wp.get_cuda_device()
-        groups = 64
-        for shape, plan, lanes, name, item, flag in _cases():
-            with self.subTest(shape=shape, lanes=lanes, scan=name, flag=flag):
-                layout = layout_of(plan, lanes)
-                results = compare(item, plan, layout, groups, flag, 3, device)
-                existing = results["existing"]
-                for arm in ("generated-held", "generated-scan"):
-                    np.testing.assert_array_equal(existing[0].view(np.uint32), results[arm][0].view(np.uint32))
-                    np.testing.assert_array_equal(existing[1].view(np.uint32), results[arm][1].view(np.uint32))
-                start = random_scratch(layout, groups, 3)
-                _assert_close_to_reference(
-                    self, item, plan, layout, start, existing[0], flag, groups, twists=existing[1]
-                )
-
-
-class TestSerialTwin(unittest.TestCase):
-    """The CPU path of every scan is the serial schedule."""
-
-    def test_cpu_twins(self):
-        level_twins = {"reduce_level", "reduce_interval", "external_level"}
-        for shape, plan, lanes, name, item, flag in _cases(packed_widths=(0,)):
-            if name == "twist_shfl":
-                continue  # CUDA only: the classifier's twists are published from warp-sized plans.
-            with self.subTest(shape=shape, scan=name, flag=flag):
-                layout = layout_of(plan, lanes)
-                results = compare(item, plan, layout, 4, flag, 3, "cpu")
-                existing, generated = results["existing"][0], results["generated-scan"][0]
-                np.testing.assert_array_equal(results["generated-held"][0].view(np.uint32), generated.view(np.uint32))
-                if name in level_twins:
-                    # These CPU twins already walk levels, children descending: the serial order.
-                    np.testing.assert_array_equal(existing.view(np.uint32), generated.view(np.uint32))
-                else:
-                    # The old twins emulate pointer jumping or chains: the same combines, regrouped.
-                    scale = np.abs(existing).reshape(4, -1).max(axis=1)[:, None]
-                    gap = term_ulps(existing.reshape(4, -1), generated.reshape(4, -1), scale)
-                    test_bound = 8.0 * max(1, plan.max_depth)
-                    self.assertLess(float(gap.max()), test_bound)
-                start = random_scratch(layout, 4, 3)
-                _assert_close_to_reference(self, item, plan, layout, start, generated, flag, 4)
+        on_chains = tree_kinetic_state.HeldSchedules(*(ts.Schedule.HEAVY_CHAIN,) * 4)
+        for shape in ("g1_30", "binary31"):
+            with self.subTest(shape=shape):
+                self.assertEqual(plan_of(shape).chain_packing(2).lanes, 64)
+                self.assertLessEqual(plan_of(shape).count, 32)
+                model = _held_tree_model(shape, 8, device)
+                with (
+                    unittest.mock.patch.object(tree_kinetic_state, "held_lanes", lambda tree, groups, *, cuda: 64),
+                    unittest.mock.patch.object(
+                        tree_kinetic_state, "held_schedules", lambda tree, lanes, *, chains, reference=False: on_chains
+                    ),
+                ):
+                    solver = _make_solver(model, True, cached_dynamics="on")
+                owner = solver._tree_kinetic_state
+                self.assertIsNotNone(owner)
+                self.assertEqual((owner.layout.lanes, owner.layout.pack, owner.block_dim), (64, 1, 64))
+                self.assertEqual(owner.schedules, on_chains)
+                rng = np.random.default_rng(13)
+                state = model.state()
+                q = model.joint_q.numpy()
+                q_start, types = model.joint_q_start.numpy(), model.joint_type.numpy()
+                revolute = np.flatnonzero(types == int(newton.JointType.REVOLUTE))
+                q[q_start[revolute]] = rng.uniform(-1.0, 1.0, revolute.size)
+                state.joint_q.assign(q)
+                state.joint_qd.assign(rng.uniform(-0.5, 0.5, model.joint_dof_count).astype(np.float32))
+                expected = model.state()
+                newton.eval_fk(model, state.joint_q, state.joint_qd, expected)
+                augmented = solver._prepare_augmented_state(state, model.state(), model.control())
+                owner.begin(state, augmented, state.joint_qd, 1.0 / 240.0, True)
+                np.testing.assert_allclose(state.body_q.numpy(), expected.body_q.numpy(), atol=2e-6)
+                np.testing.assert_allclose(state.body_qd.numpy(), expected.body_qd.numpy(), atol=2e-5)
+                np.testing.assert_array_equal(owner.status.numpy(), 0)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -498,6 +569,7 @@ class TestPath(unittest.TestCase):
 
 from newton.tests.unittest_utils import add_function_test, get_test_devices  # noqa: E402
 
+add_function_test(TestHeldTreePasses, "test_held_passes", check_held_passes, devices=get_test_devices())
 add_function_test(TestPath, "test_path", check_path, devices=get_test_devices())
 
 

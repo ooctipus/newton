@@ -1,18 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Time each tree pass as its existing kernel and as its ``tree_scan`` configuration, with one launch.
-
-``passes``: every held-tree pass on every shape it runs on. A block per group
-of trees (the held tree's launch) stages each tree's state block in shared
-memory, as the held-tree kernels hold it, runs the pass ``--repeat`` times and
-writes the block back; the arms differ only in the pass text: ``existing``
-(the module text), ``generated-held`` (the configuration on the existing plan
-structs) and ``generated-scan`` (on the scan plan, levels by CSR).
+"""Time the tree scans, the held tree's launch widths and the general route's passes, one launch each.
 
 ``schedules``: every schedule of the pose, motion and subtree scans on every
 shape, generated on the scan plan, for the rule that picks a schedule from the
-plan's data.
+plan's data (``tree_scan.choose_schedule``). A block per group of trees (the
+held tree's launch) stages each tree's state block in shared memory, as the
+held-tree kernels hold it, and runs the scan ``--repeat`` times.
+
+``lanes``: the held tree's finish, predictor and repair on replicated trees of
+every shape at each lane width a tree admits (the scans' schedules chosen at
+that width) and on the heavy chains, for the rule that picks the width from the
+tree's data (``tree_kinetic_state.held_lanes``); ``rule`` marks its pick.
 
 ``general``: the general route's passes (``tree_passes``) on a solver's own
 arrays and binding, one thread per articulation (CRBA: per column), at the
@@ -21,23 +21,25 @@ solver's block sizes.
 Each timing is the median of ``--samples`` CUDA-event-timed launches after a
 warm-up, in microseconds per launch. Run on an otherwise idle GPU::
 
-    python tools/fpgs_bench/tree_scan_bench.py passes --groups 16384 --repeat 8
     python tools/fpgs_bench/tree_scan_bench.py schedules --groups 16384 --repeat 8
+    python tools/fpgs_bench/tree_scan_bench.py lanes --worlds 4096
     python tools/fpgs_bench/tree_scan_bench.py general --worlds 4096
 """
 
 import argparse
+import contextlib
 import functools
 import json
 import sys
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import warp as wp
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from newton._src.solvers.feather_pgs import sparse_factor, tree_chain_scan, tree_kinetic_state
+from newton._src.solvers.feather_pgs import sparse_factor, tree_kinetic_state
 from newton._src.solvers.feather_pgs import tree_scan as ts
 from newton._src.solvers.feather_pgs.device_preludes import dual_native, lane_group
 from newton.tests import feather_pgs_tree_scan_fixture as fx
@@ -45,61 +47,37 @@ from newton.tests import feather_pgs_tree_scan_fixture as fx
 _STAGE = """
 #if defined(__CUDA_ARCH__)
     __shared__ float stage_values[$STAGED];
-    const int stage_lane=$STAGE_LANE,stage_stride=$STAGE_STRIDE;
-    float* stage=stage_values+$STAGE_OFFSET;
+    float* stage=stage_values+SUB*$TOTAL;
     float* stage_global=reinterpret_cast<float*>(base)+group*$TOTAL;
-    for(int k=stage_lane;k<$TOTAL;k+=stage_stride)stage[k]=stage_global[k];
-    $STAGE_SYNC
+    for(int k=LANE;k<$TOTAL;k+=STRIDE)stage[k]=stage_global[k];
+    SYNC();
     const uint64_t address=reinterpret_cast<uint64_t>(stage);
     for(int repetition=0;repetition<$REPEAT;++repetition) {
 $PASS
     }
-    $STAGE_SYNC
-    for(int k=stage_lane;k<$TOTAL;k+=stage_stride)stage_global[k]=stage[k];
+    SYNC();
+    for(int k=LANE;k<$TOTAL;k+=STRIDE)stage_global[k]=stage[k];
 #endif
 """
 
 
-def _pass_text(item, plan, layout, arm, schedule=None):
-    if arm == "existing":
-        return fx.existing_text(item, layout)
-    if schedule is not None and schedule is not item.schedule:
-        item = fx.Pass(item.name, item.combine, item.direction, schedule, item.site, item.plan_struct)
-    return fx.generated_text(item, plan, layout, dialect=arm.split("-", 1)[1])
-
-
 @functools.cache
-def staged_kernel(item, layout, arm, plan, repeat, schedule=None):
+def staged_kernel(item, layout, plan, repeat):
     """The pass's kernel with each tree's state block staged in shared memory, run ``repeat`` times."""
-    chain = (item.plan_struct == "chain" and arm == "existing") or (
-        schedule or item.schedule
-    ) is ts.Schedule.HEAVY_CHAIN
     sizes = layout.sizes()
-    text = _pass_text(item, plan, layout, arm, schedule)
     body = (
-        _STAGE.replace("$PASS", text)
-        .replace("$STAGED", str(sizes["TOTAL"] * (1 if chain else layout.pack)))
-        .replace("$STAGE_LANE", "(int)threadIdx.x" if chain else "LANE")
-        .replace("$STAGE_STRIDE", "(int)blockDim.x" if chain else "STRIDE")
-        .replace("$STAGE_OFFSET", "0" if chain else f"SUB*{sizes['TOTAL']}")
-        .replace("$STAGE_SYNC", "__syncthreads();" if chain else "SYNC();")
+        _STAGE.replace("$PASS", fx.generated_text(item, plan, layout))
+        .replace("$STAGED", str(sizes["TOTAL"] * layout.pack))
         .replace("$REPEAT", str(repeat))
     )
-    preludes = item.combine.preludes() if arm != "existing" else ()
-    snippet = dual_native(layout.render(body), preludes=(lane_group(layout.lanes), *preludes))
-    if arm == "generated-scan":
-        plan_type = ts.ScanPlan
-    else:
-        plan_type = tree_chain_scan.ChainPlan if item.plan_struct == "chain" else tree_kinetic_state.KineticPlan
-    reduction = item.direction is ts.Direction.UP or item.name == "twist_shfl"
-
-    if reduction:
+    snippet = dual_native(layout.render(body), preludes=(lane_group(layout.lanes), *item.combine.preludes()))
+    if item.direction is ts.Direction.UP or item.name == "twist_shfl":
 
         @wp.func_native(snippet)
         def run_staged(
             base: wp.uint64,
             p: sparse_factor.SparsePlan,
-            plan: plan_type,
+            plan: ts.ScanPlan,
             f: tree_kinetic_state.ForceInput,
             flag: int,
             group: int,
@@ -111,33 +89,27 @@ def staged_kernel(item, layout, arm, plan, repeat, schedule=None):
         def run_staged(
             base: wp.uint64,
             p_unused: sparse_factor.SparsePlan,
-            p: plan_type,
+            p: ts.ScanPlan,
             f: tree_kinetic_state.ForceInput,
             flag: int,
             group: int,
         ): ...
 
     _lanes, _, _, _ = tree_kinetic_state._thread_helpers(layout)
-    pack = 0 if chain else layout.pack
+    pack = layout.pack
 
     def run(
         base: wp.uint64,
         sparse: sparse_factor.SparsePlan,
-        structure: plan_type,
+        structure: ts.ScanPlan,
         f: tree_kinetic_state.ForceInput,
         flag: int,
     ):
         block, _logical = wp.tid()
         lanes = _lanes()
-        group = block
-        if wp.static(pack > 0):
-            group = block * wp.static(pack) + lanes[2]
-        run_staged(base, sparse, structure, f, flag, group)
+        run_staged(base, sparse, structure, f, flag, block * wp.static(pack) + lanes[2])
 
-    label = (schedule or item.schedule).value
-    run.__name__ = run.__qualname__ = (
-        f"bench_{item.name}_{label}_{arm.replace('-', '_')}_{layout.bodies}_{layout.lanes}"
-    )
+    run.__name__ = run.__qualname__ = f"bench_{item.name}_{layout.bodies}_{layout.lanes}"
     return wp.kernel(module="unique", enable_backward=False)(run)
 
 
@@ -157,58 +129,20 @@ def _time(launch, samples, device):
     return float(np.median(times)), float(np.percentile(times, 90))
 
 
-def _launcher(item, plan, layout, arm, groups, repeat, device, schedule=None, flag=1):
-    data = fx.inputs(item, plan, layout, groups, 3, device)
-    kernel = staged_kernel(item, layout, arm, plan, repeat, schedule)
-    chain = (schedule or item.schedule) is ts.Schedule.HEAVY_CHAIN or (
-        item.plan_struct == "chain" and arm == "existing"
-    )
-    pack = 1 if chain else layout.pack
-    structure = data.scan if arm == "generated-scan" else data.held
-    block = fx.block_dim(item, plan, layout) if chain else layout.block
-    if chain and arm == "generated-scan":
-        packing = plan.chain_packing(2)
-        block = max(layout.block, packing.lanes if packing is not None else 32)
+def _launcher(item, plan, layout, groups, repeat, device, flag=1):
+    data = fx.inputs(plan, layout, groups, 3, device)
+    kernel = staged_kernel(item, layout, plan, repeat)
 
     def launch():
         wp.launch_tiled(
             kernel,
-            dim=[groups // pack],
-            inputs=[wp.uint64(data.scratch.ptr), data.sparse, structure, data.force, flag],
-            block_dim=block,
+            dim=[groups // layout.pack],
+            inputs=[wp.uint64(data.scratch.ptr), data.sparse, data.scan, data.force, flag],
+            block_dim=layout.block,
             device=device,
         )
 
     return launch
-
-
-def bench_passes(args, device):
-    rows = []
-    for shape in args.shapes or fx.SHAPES:
-        plan = fx.plan_of(shape)
-        for packed in (0, 8):
-            lanes = fx.lanes_of(plan, packed)
-            if packed and lanes >= 32:
-                continue
-            layout = fx.layout_of(plan, lanes)
-            for name, item in fx.PASSES.items():
-                if not fx.applies(item, plan, lanes) or (item.plan_struct == "chain" and packed):
-                    continue
-                if args.passes and name not in args.passes:
-                    continue
-                row = {
-                    "shape": shape,
-                    "bodies": plan.count,
-                    "lanes": lanes,
-                    "pass": name,
-                    "schedule": item.schedule.value,
-                }
-                for arm in ("existing", "generated-held", "generated-scan"):
-                    launch = _launcher(item, plan, layout, arm, args.groups, args.repeat, device)
-                    row[arm] = _time(launch, args.samples, device)
-                rows.append(row)
-                print(_format(row), flush=True)
-    return rows
 
 
 def bench_schedules(args, device):
@@ -238,29 +172,92 @@ def bench_schedules(args, device):
     rows = []
     for shape in args.shapes or fx.SHAPES:
         plan = fx.plan_of(shape)
-        lanes = fx.lanes_of(plan)
-        layout = fx.layout_of(plan, lanes)
         for scan, (combine, direction, schedules) in combos.items():
             row = {"shape": shape, "bodies": plan.count, "depth": plan.max_depth, "scan": scan}
             for schedule in schedules:
-                if schedule in (ts.Schedule.JUMP_SHFL, ts.Schedule.DFS_INTERVAL) and plan.count > 32:
+                lanes = fx.chain_lanes(plan) if schedule is ts.Schedule.HEAVY_CHAIN else fx.lanes_of(plan)
+                item = fx.Pass(f"{scan}_{schedule.value}", combine, direction, schedule)
+                if not fx.applies(item, plan, lanes):
                     continue
-                if schedule is ts.Schedule.HEAVY_CHAIN and plan.chain_packing(2) is None:
-                    continue
-                item = fx.Pass(
-                    f"{scan}_{schedule.value}",
-                    combine,
-                    direction,
-                    schedule,
-                    "",
-                    "chain" if schedule is ts.Schedule.HEAVY_CHAIN else "kinetic",
-                )
                 flag = 0 if scan == "reduce6" else 1
-                launch = _launcher(
-                    item, plan, layout, "generated-scan", args.groups, args.repeat, device, schedule, flag
-                )
+                launch = _launcher(item, plan, fx.layout_of(plan, lanes), args.groups, args.repeat, device, flag)
                 row[schedule.value] = _time(launch, args.samples, device)
-            row["rule"] = ts.choose_schedule(plan, direction, combine, cuda=True, lanes=lanes).value
+            row["rule"] = ts.choose_schedule(plan, direction, combine, cuda=True, lanes=fx.chain_lanes(plan)).value
+            rows.append(row)
+            print(_format(row), flush=True)
+    return rows
+
+
+def _held_tree(shape, worlds, device, lanes=None, schedules=None):
+    """A sparse-route solver whose held tree runs replicated trees of ``shape`` at the given lanes and schedules
+    (the rules' choices where ``None``)."""
+    from newton.tests.test_feather_pgs_sparse_solver import _make_solver  # noqa: PLC0415
+    from newton.tests.test_feather_pgs_tree_scan import _held_tree_model  # noqa: PLC0415
+
+    model = _held_tree_model(shape, worlds, device)
+    with contextlib.ExitStack() as stack:
+        if lanes is not None:
+            stack.enter_context(
+                mock.patch.object(tree_kinetic_state, "held_lanes", lambda tree, groups, *, cuda: lanes)
+            )
+        if schedules is not None:
+            stack.enter_context(
+                mock.patch.object(
+                    tree_kinetic_state, "held_schedules", lambda tree, lanes, *, chains, reference=False: schedules
+                )
+            )
+        solver = _make_solver(model, True, cached_dynamics="on")
+    return model, solver
+
+
+def _repair(owner, state_in, augmented, dt):
+    """A repair of every group: the caches invalidated, then a begin."""
+    owner.invalidate()
+    owner.begin(state_in, augmented, state_in.joint_qd, dt, True)
+
+
+def bench_lanes(args, device):
+    import newton  # noqa: PLC0415
+
+    rows = []
+    for shape in args.shapes or [name for name, parents in fx.SHAPES.items() if len(parents) <= 44]:
+        plan = fx.plan_of(shape)
+        rule = tree_kinetic_state.held_lanes(plan, args.worlds, cuda=True)
+        widths = [64] if plan.count > 32 else [w for w in (4, 8, 16, 32) if w >= plan.count]
+        configurations = [(lanes, None) for lanes in widths]
+        packing = plan.chain_packing(2)
+        if packing is not None:
+            chain_lanes = max(packing.lanes, 32 if plan.count <= 32 else 64)
+            configurations.append((chain_lanes, tree_kinetic_state.HeldSchedules(*(ts.Schedule.HEAVY_CHAIN,) * 4)))
+        for lanes, schedules in configurations:
+            model, solver = _held_tree(shape, args.worlds, device, lanes, schedules)
+            owner = solver._tree_kinetic_state
+            if owner is None:
+                continue
+            rng = np.random.default_rng(5)
+            state_in, state_out, control = model.state(), model.state(), model.control()
+            state_in.joint_qd.assign(rng.uniform(-0.5, 0.5, model.joint_dof_count).astype(np.float32))
+            state_in.body_f.assign(rng.normal(0, 0.1, (model.body_count, 6)).astype(np.float32))
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+            dt = 1.0 / 240.0
+            solver._last_step_dt = dt
+            augmented = solver._prepare_augmented_state(state_in, model.state(), control)
+
+            repair = functools.partial(_repair, owner, state_in, augmented, dt)
+            repair()
+            row = {
+                "shape": shape,
+                "bodies": plan.count,
+                "dofs": plan.dof_count,
+                "lanes": owner.layout.lanes,
+                "schedules": owner.schedules.tag[1:],
+                "rule": owner.layout.lanes == rule and schedules is None,
+            }
+            finish = functools.partial(owner.finish, state_in, augmented, state_out, dt, False)
+            predict = functools.partial(owner.predict, state_in, augmented, control, state_in.joint_qd, dt)
+            row["finish"] = _time(finish, args.samples, device)
+            row["predict"] = _time(predict, args.samples, device)
+            row["repair"] = _time(repair, args.samples, device)
             rows.append(row)
             print(_format(row), flush=True)
     return rows
@@ -299,7 +296,7 @@ def _format(row):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("mode", choices=("passes", "schedules", "general"))
+    parser.add_argument("mode", choices=("schedules", "lanes", "general"))
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--groups", type=int, default=16384)
     parser.add_argument("--worlds", type=int, default=4096)
@@ -311,7 +308,7 @@ def main():
     args = parser.parse_args()
     wp.init()
     device = wp.get_device(args.device)
-    rows = {"passes": bench_passes, "schedules": bench_schedules, "general": bench_general}[args.mode](args, device)
+    rows = {"schedules": bench_schedules, "lanes": bench_lanes, "general": bench_general}[args.mode](args, device)
     if args.json:
         Path(args.json).write_text(json.dumps(rows, indent=1))
 

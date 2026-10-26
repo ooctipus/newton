@@ -247,19 +247,11 @@ def route_selection(solver) -> dict:
 def measurement_selection(solver) -> dict:
     """Measured values, kept out of the routes so that runs of one configuration compare equal.
 
-    ``held_tree_lane_timing_us`` holds the construction-time lane timings. With
-    ``pgs_solve_readout`` on, ``solve_readout`` summarizes the sweep counters
+    With ``pgs_solve_readout`` on, ``solve_readout`` summarizes the sweep counters
     (:meth:`SolveReadoutRecord.summary`); reading them synchronizes the device.
     The counters accumulate, so a window is the difference of two records.
     """
-    _, groups = _held_tree_groups(solver)
-    record = {
-        # Aligned with routes.held_tree.groups; empty for a group whose lane width was not timed.
-        "held_tree_lane_timing_us": [
-            {str(int(lanes)): round(float(seconds) * 1.0e6, 3) for lanes, seconds in group.lane_timing.items()}
-            for group in groups
-        ],
-    }
+    record = {}
     if solver._solve_readout.kernels:
         record["solve_readout"] = json_value(solver._solve_readout.summary())
     return record
@@ -314,8 +306,8 @@ def _tree_group(group) -> dict:
         "root_coordinates": json_value(layout.root_coordinates),
         # Factor family per root: its coordinate count, negated for a diagonal-mass family, 0 when prescribed.
         "root_families": json_value(layout.root_families),
-        "chain_scan": bool(group.chain_scan),
-        "chain_scan_requested": bool(group.chain_scan_requested),
+        # The scans' schedules, chosen from the tree's data with its lanes (tree_kinetic_state.held_schedules).
+        "schedules": {name: getattr(group.schedules, name).value for name in ("pose", "motion", "reduce", "external")},
         "response": group._response,
         # "content": a repair whose input bank is not the bank the cache was published into
         # compares the two banks word for word; "identity": the bank's pointers alone.
@@ -333,9 +325,6 @@ def _tree_group(group) -> dict:
         "captured_repairs": list(group._captured_repairs[1]) if group._captured_repairs else [],
         "motion_velocity": bool(group.motion_velocity),
         "publishes_twists": bool(group.publishes_twists),
-        # Several admissible widths are timed once at construction (measurements.held_tree_lane_timing_us);
-        # one width is static.
-        "lane_choice": "timed" if group.lane_timing else "static",
         "kernels": {
             "repair": _key(group.repair_kernel),
             "finish": _key(group.finish_kernel),
@@ -378,8 +367,7 @@ def _scalar_group(group) -> dict:
         "root_coordinates": [0],
         # A diagonal-mass family, negated as for the tree groups.
         "root_families": [-size],
-        "chain_scan": False,
-        "chain_scan_requested": False,
+        "schedules": None,
         "response": "diagonal",
         "input_validation": "content" if group.bank_compare else "identity",
         "captured_repair_skip": bool(group.skip_captured_repairs),
@@ -387,7 +375,6 @@ def _scalar_group(group) -> dict:
         "captured_repairs": [],
         "motion_velocity": bool(group.motion_velocity),
         "publishes_twists": False,
-        "lane_choice": "static",
         "kinds": list(group.plan.kinds),
         "drive_dofs": 0 if others is None else int(others.shape[0]),
         "kernels": {

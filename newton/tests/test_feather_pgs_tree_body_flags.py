@@ -531,7 +531,7 @@ class TestTreePlanKinematicBodies(unittest.TestCase):
         scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         scene.add_body(mass=1.0, inertia=INERTIA, is_kinematic=True)
         model = _replicated(scene)
-        layout, _, _ = make_plan(model, _held_operator(model, [0, 1], [-1], [6]))
+        layout, _ = make_plan(model, _held_operator(model, [0, 1], [-1], [6]))
         self.assertEqual(layout.root_coordinates, (6,))
         for link in (0, 2):
             with self.subTest(link=link):
@@ -543,7 +543,7 @@ class TestTreePlanKinematicBodies(unittest.TestCase):
                 model = _replicated(scene)
                 # Body flags are live data; a link may be made kinematic after finalize.
                 _set_flag(model, link, KINEMATIC)
-                layout, _, _ = make_plan(model, _held_operator(model, [0, 1], [-1, 0, 1], [6, 1, 1]))
+                layout, _ = make_plan(model, _held_operator(model, [0, 1], [-1, 0, 1], [6, 1, 1]))
                 self.assertEqual((layout.bodies, layout.dofs), (3, 8))
 
     def test_factorless_roots_must_be_kinematic_free_bodies(self):
@@ -558,7 +558,7 @@ class TestTreePlanKinematicBodies(unittest.TestCase):
         scene.add_body(mass=1.0, inertia=INERTIA)
         model = _replicated(scene)
         forest = {"forest_arts": np.array([[0, 1], [2, 3]]), "root_families": (0, 6)}
-        layout, _, _ = make_plan(model, _held_operator(model, [0, 2], [-1, -1], [6, 6], **forest), complete=False)
+        layout, _ = make_plan(model, _held_operator(model, [0, 2], [-1, -1], [6, 6], **forest), complete=False)
         self.assertEqual(layout.root_families, (0, 6))
         for world in range(2):
             _set_flag(model, box + 2 * world, DYNAMIC)

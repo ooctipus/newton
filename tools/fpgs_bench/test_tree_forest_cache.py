@@ -3,6 +3,7 @@
 
 """Check complete cached publication with distinct group/articulation/world IDs."""
 
+import contextlib
 import os
 import unittest
 from unittest.mock import patch
@@ -77,6 +78,13 @@ def fixture(floating, device, *, permuted=True, motion=False):
     return model, solver, reference, operator, owner, mass
 
 
+def _heavy_chains():
+    """Run every scan of the held trees built inside on the heavy chains (tools.fpgs_bench.held_tree_ab)."""
+    from tools.fpgs_bench.held_tree_ab import _heavy_chains as chains  # noqa: PLC0415
+
+    return chains()
+
+
 class TestTreeForestCache(unittest.TestCase):
     def check_physical_forest(self, device):
         """Compare every articulation's physical operator and complete publication."""
@@ -88,7 +96,7 @@ class TestTreeForestCache(unittest.TestCase):
         ):
             with (
                 self.subTest(floating=floating, chains=chains, motion=motion),
-                patch.dict(os.environ, {"FEATHER_PGS_TREE_CHAIN_SCAN": str(int(chains))}),
+                _heavy_chains() if chains else contextlib.nullcontext(),
             ):
                 model, solver, reference, operator, owner, mass = fixture(floating, device, motion=motion)
                 count, arts, dt = mass.dof_count, model.articulation_count, native.DT

@@ -12,9 +12,10 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
+from newton._src.solvers.feather_pgs import tree_scan as ts
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
-from newton._src.solvers.feather_pgs.tree_kinetic_state import get_classify_kernel, get_state_kernel
+from newton._src.solvers.feather_pgs.tree_kinetic_state import HeldSchedules, get_classify_kernel, get_state_kernel
 from newton.tests import test_feather_pgs_sparse_split as split
 from newton.tests import test_feather_pgs_tree_stages as stages
 from tools.fpgs_bench.public_state_oracle import physical_mass
@@ -38,14 +39,18 @@ def fixture(floating, device):
     return model, solver, reference, operator, owner, mass
 
 
+# The reference forms' schedules: the factories' contracts hold at every schedule.
+_SCHEDULES = HeldSchedules(ts.Schedule.JUMP_SMEM, ts.Schedule.JUMP_SMEM, ts.Schedule.LEVEL, ts.Schedule.LEVEL)
+
+
 class TestPrescaledTreeContract(unittest.TestCase):
     def test_motion_input_is_an_explicit_factory_contract(self):
         """Select the alternate motion by factory argument; every repair and finish takes the motion input."""
         layout = TreeLayout(4, 3, 6, 3, 2, 0, (2, 1, 0))
-        ordinary = get_state_kernel(False, layout=layout)
-        alternate = get_state_kernel(False, layout=layout, motion_velocity=True)
-        finish = get_state_kernel(True, layout=layout)
-        self.assertIs(ordinary, get_state_kernel(False, layout=layout))
+        ordinary = get_state_kernel(False, _SCHEDULES, layout=layout)
+        alternate = get_state_kernel(False, _SCHEDULES, layout=layout, motion_velocity=True)
+        finish = get_state_kernel(True, _SCHEDULES, layout=layout)
+        self.assertIs(ordinary, get_state_kernel(False, _SCHEDULES, layout=layout))
         self.assertIsNot(ordinary, alternate)
         # One launch ABI keeps every stage one call below the kernel; only the alternate repair reads the input,
         # which follows the six common arguments.
@@ -79,13 +84,13 @@ class TestPrescaledTreeContract(unittest.TestCase):
                 "counts",
             ],
         )
-        listed = get_state_kernel(False, layout=layout, listed=True)
+        listed = get_state_kernel(False, _SCHEDULES, layout=layout, listed=True)
         labels = [arg.label for arg in listed.adj.args]
         self.assertEqual(labels[6:], ["motion_qd", "repair_blocks", "repair_count", "bank"])
         wp.init()
         self.assertEqual(stages._input_uses(listed), [])
         with self.assertRaisesRegex(ValueError, "ordinary motion"):
-            get_state_kernel(False, layout=layout, motion_velocity=True, listed=True)
+            get_state_kernel(False, _SCHEDULES, layout=layout, motion_velocity=True, listed=True)
 
     def check_current_motion(self, device, exclude_driven=False):
         for floating in (False, True):

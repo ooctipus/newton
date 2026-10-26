@@ -281,8 +281,23 @@ def held_factor_calls():
                 yield "small_cholesky.get_kernel", small, (family,), kwargs
 
 
+def _schedules(layout, chain, reference=False):
+    """A held layout's scan schedules: every scan on the heavy chains (``chain``), the shared-memory jumps and
+    depth levels of the reference forms, or the warp schedules (two warps: shared memory and levels)."""
+    from newton._src.solvers.feather_pgs import tree_kinetic_state as native  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs import tree_scan as ts  # noqa: PLC0415
+
+    schedule = ts.Schedule
+    if reference or (layout.lanes > 32 and not chain):
+        return native.HeldSchedules(schedule.JUMP_SMEM, schedule.JUMP_SMEM, schedule.LEVEL, schedule.LEVEL)
+    if chain:
+        return native.HeldSchedules(*(schedule.HEAVY_CHAIN,) * 4)
+    return native.HeldSchedules(schedule.JUMP_SHFL, schedule.JUMP_SHFL, schedule.DFS_INTERVAL, schedule.LEVEL)
+
+
 def held_tree_layouts():
-    """Return ``{name: (layout, chain_scan, response, repair_options)}`` at the suite's held-tree shapes.
+    """Return ``{name: (layout, chain, response, repair_options)}`` at the suite's held-tree shapes; ``chain``
+    runs every scan on the heavy chains (:func:`_schedules`).
 
     Chain plans with free and fixed roots (two at 64 lanes, one of them with a
     stored factor permutation), kinetic plans at 4, 8, 16, 32 and 64 lanes, and
@@ -417,23 +432,30 @@ def held_tree_calls():
         if layout_name in switched:
             variants += [{"reference": True}, {"clocked": True}, {"body_velocity": False}]
         for options in variants:
-            state_options = {"body_velocity": True, **options}
+            reference = options.get("reference", False)
+            schedules = _schedules(tree, chain, reference)
+            state_options = {
+                "body_velocity": True,
+                **{key: value for key, value in options.items() if key != "reference"},
+            }
             kwargs = {**layout, **repair_options, **state_options}
-            yield "tree_kinetic_state.get_state_kernel", state, (False, chain), kwargs
+            yield "tree_kinetic_state.get_state_kernel", state, (False, schedules), kwargs
             kwargs = {**layout, **finish_options, **state_options}
-            yield "tree_kinetic_state.get_state_kernel", state, (True, chain), kwargs
+            yield "tree_kinetic_state.get_state_kernel", state, (True, schedules), kwargs
             if options.keys() <= {"reference", "clocked"}:
                 kwargs = {**layout, "response": response, **options}
-                yield "tree_kinetic_state.get_predictor_kernel", predictor, (chain,), kwargs
+                yield "tree_kinetic_state.get_predictor_kernel", predictor, (schedules,), kwargs
         # A group's coordinates: a free root's quaternion takes one more than its three rotation velocities.
         coordinates = tree.dofs + tree.free_roots
+        schedules = _schedules(tree, chain)
         if "motion_velocity" not in repair_options:
             kwargs = {**layout, "body_velocity": True, "bank_coordinates": coordinates}
-            yield "tree_kinetic_state.get_state_kernel", state, (False, chain), kwargs
-            yield "tree_kinetic_state.get_classify_kernel", classify, (chain,), {**layout, **repair_options}
+            yield "tree_kinetic_state.get_state_kernel", state, (False, schedules), kwargs
+            classify_options = {key: value for key, value in repair_options.items() if key != "motion_velocity"}
+            yield "tree_kinetic_state.get_classify_kernel", classify, (), {**layout, **classify_options}
             kwargs = {**layout, **repair_options, "body_velocity": True, "listed": True}
-            yield "tree_kinetic_state.get_state_kernel", state, (False, chain), kwargs
-            yield "tree_kinetic_state.get_bank_kernel", bank, (chain,), {**layout, "coordinates": coordinates}
+            yield "tree_kinetic_state.get_state_kernel", state, (False, schedules), kwargs
+            yield "tree_kinetic_state.get_bank_kernel", bank, (), {**layout, "coordinates": coordinates}
 
 
 def _axis(name, values=(False, True)):

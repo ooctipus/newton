@@ -43,8 +43,7 @@ RECIPES = {
     # The original G1 recipe's packed sparse-factor opt-ins are retired; the
     # general route runs in their place.
     "g1": (
-        flags("TREE_CHAIN_SCAN")
-        + [
+        [
             f"NEWTON_HEIGHTFIELD_{name}=1"
             for name in (
                 "CELL_REJECT",

@@ -12,6 +12,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import tree_kinetic_state
+from newton._src.solvers.feather_pgs import tree_scan as ts
 from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
 from newton._src.solvers.feather_pgs.publication_data import PublicationData
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
@@ -38,6 +39,18 @@ _LAYOUTS = (
     ),
 )
 _STAGES = ("accelerations", "transport", "integrate", "relative_poses", "poses", "motion", "publish", "close")
+
+
+def _schedules(layout):
+    """Schedules a layout's lanes run: shuffles and intervals within a warp, shared memory and levels over two."""
+    schedule = ts.Schedule
+    if layout.lanes <= 32:
+        return tree_kinetic_state.HeldSchedules(
+            schedule.JUMP_SHFL, schedule.JUMP_SHFL, schedule.DFS_INTERVAL, schedule.LEVEL
+        )
+    return tree_kinetic_state.HeldSchedules(schedule.JUMP_SMEM, schedule.JUMP_SMEM, schedule.LEVEL, schedule.LEVEL)
+
+
 _ADMISSION = re.compile(r"admit_\d+\(")
 
 
@@ -47,13 +60,13 @@ def _kernels(layout):
     The listed and bank-comparing repairs are contracts of ordinary motion: owners keep the one-pass
     repair of a motion-velocity layout.
     """
-    state = tree_kinetic_state.get_state_kernel
-    yield "finish", state(True, layout=layout)
-    yield "repair", state(False, layout=layout)
-    yield "repair_motion", state(False, layout=layout, motion_velocity=True)
-    yield "repair_listed", state(False, layout=layout, listed=True)
+    state, schedules = tree_kinetic_state.get_state_kernel, _schedules(layout)
+    yield "finish", state(True, schedules, layout=layout)
+    yield "repair", state(False, schedules, layout=layout)
+    yield "repair_motion", state(False, schedules, layout=layout, motion_velocity=True)
+    yield "repair_listed", state(False, schedules, layout=layout, listed=True)
     # A group's coordinate count: a free root's quaternion takes one more than its three rotation velocities.
-    yield "repair_banked", state(False, layout=layout, bank_coordinates=layout.dofs + layout.free_roots)
+    yield "repair_banked", state(False, schedules, layout=layout, bank_coordinates=layout.dofs + layout.free_roots)
 
 
 def _input_uses(kernel, name="motion_qd"):
@@ -162,11 +175,18 @@ class TestTreeKineticStages(unittest.TestCase):
         """Build no listed or bank-comparing repair of an alternate motion, which no owner launches."""
         state = tree_kinetic_state.get_state_kernel
         for layout in _LAYOUTS:
+            schedules = _schedules(layout)
             with self.subTest(layout=layout.bodies):
                 with self.assertRaisesRegex(ValueError, "ordinary motion"):
-                    state(False, layout=layout, motion_velocity=True, listed=True)
+                    state(False, schedules, layout=layout, motion_velocity=True, listed=True)
                 with self.assertRaisesRegex(ValueError, "ordinary motion"):
-                    state(False, layout=layout, motion_velocity=True, bank_coordinates=layout.dofs + layout.free_roots)
+                    state(
+                        False,
+                        schedules,
+                        layout=layout,
+                        motion_velocity=True,
+                        bank_coordinates=layout.dofs + layout.free_roots,
+                    )
 
     def test_only_listed_and_comparing_repairs_read_their_inputs(self):
         """Read the block list only in the listed repair and the bank only in the repair that compares banks."""

@@ -13,25 +13,25 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import tree_kinetic_state
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
-from newton._src.solvers.feather_pgs.tree_kinetic_owner import dfs_intervals
+from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.tests.test_feather_pgs_mixed_tree_free_body import DT, _build
 
 
 class TestDepthFirstIntervals(unittest.TestCase):
     def test_breadth_first_input_is_reordered(self):
         """Legs added breadth-first still get one contiguous interval per subtree."""
-        order, end = dfs_intervals([-1, 0, 0, 1, 2, 3])
-        self.assertEqual(order.tolist(), [0, 1, 3, 5, 2, 4])
-        self.assertEqual(end.tolist(), [6, 4, 4, 4, 6, 6])
+        plan = TreePlan.build([-1, 0, 0, 1, 2, 3])
+        self.assertEqual(plan.dfs_order.tolist(), [0, 1, 3, 5, 2, 4])
+        self.assertEqual(plan.dfs_end.tolist(), [6, 4, 4, 4, 6, 6])
 
     def test_forest_roots_are_separate_intervals(self):
-        order, end = dfs_intervals([-1, 0, -1, 2, 2])
-        self.assertEqual(order.tolist(), [0, 1, 2, 3, 4])
-        self.assertEqual(end.tolist(), [2, 2, 5, 4, 5])
+        plan = TreePlan.build([-1, 0, -1, 2, 2])
+        self.assertEqual(plan.dfs_order.tolist(), [0, 1, 2, 3, 4])
+        self.assertEqual(plan.dfs_end.tolist(), [2, 2, 5, 4, 5])
 
     def test_cycle_is_rejected(self):
         with self.assertRaises(ValueError):
-            dfs_intervals([-1, 2, 1])
+            TreePlan.build([-1, 2, 1])
 
 
 def _interleaved_legs(device, worlds=4):
@@ -81,9 +81,6 @@ def _rollout(model, *, level_loop, steps=60):
         "FEATHER_PGS_TREE_KINETIC_STATE": "0",
         "FEATHER_PGS_RESOLVED_WORLDS": "0",
         "FEATHER_PGS_TREE_REFERENCE": str(int(level_loop)),
-        # A fixed width leaves no candidate to time, so both arms build the same layouts. Sixteen
-        # lanes cover every tree here and pack two trees per block (the segmented reduction).
-        "FEATHER_PGS_TREE_LANE_PACK": "16",
     }
     with patch.dict(os.environ, env):
         solver = SolverFeatherPGS(
@@ -121,13 +118,11 @@ def _rollout(model, *, level_loop, steps=60):
 
 def _finish(group, reference):
     """The finish kernel the factory builds for a group's layout under ``reference``."""
+    schedules = tree_kinetic_state.held_schedules(
+        group.tree, group.layout.lanes, chains=group.chains, reference=reference
+    )
     return tree_kinetic_state.get_state_kernel(
-        True,
-        group.chain_scan,
-        layout=group.layout,
-        body_velocity=group._body_velocity,
-        reference=reference,
-        clocked=group.clocked,
+        True, schedules, layout=group.layout, body_velocity=group._body_velocity, clocked=group.clocked
     )
 
 
@@ -164,8 +159,7 @@ def _assert_switch_within(test, label, switch, again, tolerance):
 
 
 def _assert_same_layouts(test, first, second):
-    """Both arms build the same, untimed layouts (the pinned lane width leaves no candidate to time)."""
-    test.assertFalse(any(group.lane_timing for arm in (first, second) for group in arm.groups))
+    """Both arms build the same layouts: the lanes follow from the trees' data alone."""
     test.assertEqual([group.layout for group in first.groups], [group.layout for group in second.groups])
 
 
@@ -177,7 +171,7 @@ class TestPrefixSubtreeReduction(unittest.TestCase):
         # A/A control: the default arm once more, for its run-to-run spread.
         _, poses_again, bias_again = _rollout(model, level_loop=False)
         self.assertIsNotNone(owner)
-        self.assertTrue(all(group.layout.lanes <= 32 and not group.chain_scan for group in owner.groups))
+        self.assertTrue(all(group.layout.lanes <= 32 and not group.schedules.chains for group in owner.groups))
         _assert_same_layouts(self, owner_reference, owner)
         # Each arm ran the finish kernel its own switch selects: the switch is a factory
         # argument, so the second arm cannot reuse the first arm's kernels, and on these

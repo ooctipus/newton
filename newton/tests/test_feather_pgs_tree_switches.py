@@ -18,17 +18,19 @@ from newton._src.solvers.feather_pgs import tree_kinetic_state
 from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
+from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.tests.test_feather_pgs_mixed_tree_free_body import _build
 
 # A packed, warp-sized fixed-root tree: both switches change every kernel built for it.
 _LAYOUT = TreeLayout(4, 3, 6, 3, 2, 0, (2, 1, 0), lanes=8)
+_TREE = TreePlan.build([-1, 0, 1, 0], [0, 1, 1, 1])
 # Modules that generate the tree kernels' code; owners read the environment for them, at construction.
 _GENERATION_MODULES = (
     "cached_force.py",
     "response_operator.py",
-    "tree_chain_scan.py",
     "tree_kinetic_layout.py",
     "tree_kinetic_state.py",
+    "tree_scan.py",
 )
 
 
@@ -40,11 +42,12 @@ def _switches(reference, clocked):
 
 
 def _kernels(reference, clocked):
+    schedules = tree_kinetic_state.held_schedules(_TREE, _LAYOUT.lanes, chains=False, reference=reference)
     return (
-        tree_kinetic_state.get_state_kernel(False, layout=_LAYOUT, reference=reference, clocked=clocked),
-        tree_kinetic_state.get_state_kernel(True, layout=_LAYOUT, reference=reference, clocked=clocked),
+        tree_kinetic_state.get_state_kernel(False, schedules, layout=_LAYOUT, clocked=clocked),
+        tree_kinetic_state.get_state_kernel(True, schedules, layout=_LAYOUT, clocked=clocked),
         tree_kinetic_state.get_predictor_kernel(
-            layout=_LAYOUT, response="cholesky", reference=reference, clocked=clocked
+            schedules, layout=_LAYOUT, response="cholesky", reference=reference, clocked=clocked
         ),
     )
 
@@ -274,19 +277,12 @@ class TestTreeKernelSwitches(unittest.TestCase):
         np.testing.assert_allclose(output.body_qd.numpy(), published.body_qd.numpy(), atol=2e-5)
         for group in owner.groups:
             np.testing.assert_array_equal(group.data.status.numpy(), 0)
-            options = {
-                "layout": group.layout,
-                "body_velocity": group._body_velocity,
-                "reference": group.reference,
-                "clocked": group.clocked,
-            }
+            options = {"layout": group.layout, "body_velocity": group._body_velocity, "clocked": group.clocked}
             repair = tree_kinetic_state.get_state_kernel(
-                False, group.chain_scan, motion_velocity=group.motion_velocity, **options
+                False, group.schedules, motion_velocity=group.motion_velocity, **options
             )
             self.assertIsNot(group.repair_kernel, repair)
-            self.assertIsNot(
-                group.finish_kernel, tree_kinetic_state.get_state_kernel(True, group.chain_scan, **options)
-            )
+            self.assertIsNot(group.finish_kernel, tree_kinetic_state.get_state_kernel(True, group.schedules, **options))
 
 
 if __name__ == "__main__":

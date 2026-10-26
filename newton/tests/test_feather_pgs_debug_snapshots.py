@@ -64,13 +64,8 @@ WARP_SIZE = 32
 
 @contextmanager
 def _snapshot_flag(enabled):
-    """Set ``FEATHER_PGS_DEBUG_SNAPSHOTS=1``, or leave it unset, for the duration.
-
-    The held-tree lane width is pinned to one tree per block: by default each
-    held-tree group times its candidate widths at construction, so two CUDA
-    instances could launch different kernels.
-    """
-    with patch.dict(os.environ, {"FEATHER_PGS_TREE_LANE_PACK": "0"}):
+    """Set ``FEATHER_PGS_DEBUG_SNAPSHOTS=1``, or leave it unset, for the duration."""
+    with patch.dict(os.environ, {}):
         os.environ.pop(FLAG, None)
         if enabled:
             os.environ[FLAG] = "1"

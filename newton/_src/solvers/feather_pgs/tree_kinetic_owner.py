@@ -12,9 +12,12 @@ import warp as wp
 
 from ...sim import ModelFlags
 from . import cached_state_binding, capture_joins, field_group
+from . import tree_scan as ts
 from .device_proof import DeviceProof, fingerprint
+from .host_index import expand
 from .publication_data import PLAN_FIELDS
-from .tree_kinetic_plan import cooperative_block_dim, lane_candidates, make_plan
+from .tree_kinetic_plan import make_plan
+from .tree_plan import TreePlan
 
 _NUMERIC_FLAGS = int(
     ModelFlags.JOINT_DOF_PROPERTIES
@@ -35,37 +38,6 @@ _FRAME_FIELDS = ("joint_X_p", "joint_X_c")
 _MAPPING_FIELDS = ("group_to_art", "art_to_world", "art_dof_start", "free_root_joint_indices")
 
 _fingerprint = fingerprint
-
-
-def dfs_intervals(parent):
-    """Depth-first order of a parent-first forest and, per position, the end of its subtree.
-
-    Children are visited in increasing local index; roots (parent -1) in
-    increasing local index. Returns ``order`` (position to body) and ``end``
-    (position to one past the subtree's last position), so the subtree of the
-    body at position ``p`` is exactly the interval ``[p, end[p])``.
-    """
-    parent = np.asarray(parent, dtype=np.int64)
-    count = int(parent.size)
-    children = [[] for _ in range(count)]
-    for body in range(count):
-        if parent[body] >= 0:
-            children[int(parent[body])].append(body)
-    order, end = [], np.zeros(count, np.int32)
-    stack = [(root, False) for root in range(count - 1, -1, -1) if parent[root] < 0]
-    starts = {}
-    while stack:
-        body, done = stack.pop()
-        if done:
-            end[starts[body]] = len(order)
-            continue
-        starts[body] = len(order)
-        order.append(body)
-        stack.append((body, True))
-        stack.extend((child, False) for child in reversed(children[body]))
-    if len(order) != count:
-        raise ValueError("Tree kinetic state requires a parent-first forest")
-    return np.asarray(order, np.int32), end
 
 
 def proof_runs(flags) -> bool:
@@ -203,7 +175,7 @@ class TreeKineticState:
         sparse_owner,
         *,
         admission=None,
-        chain_scan_default=None,
+        chains=True,
         complete=True,
         response="sparse",
         reference=None,
@@ -224,7 +196,7 @@ class TreeKineticState:
         self.admission = admission
         self.complete = complete
         host = sparse_owner.host
-        self.layout, parent, depth = make_plan(model, sparse_owner, complete=complete)
+        self.layout, parent = make_plan(model, sparse_owner, complete=complete)
         # Motion-velocity layouts keep identity validation: their repair reads the
         # prescaled velocity, and the solver keeps its host identity check for them.
         self.bank_compare = bool(compare_banks) and not self.motion_velocity
@@ -252,27 +224,14 @@ class TreeKineticState:
             solver._stage_clocks = wp.zeros((self.group_count, 28), dtype=wp.int64, device=solver.model.device)
         self._cache_to_art = sparse_owner.plan.group_to_art.reshape((self.group_count, 1))
         bodies, dofs = self.layout.bodies, self.layout.dofs
-        jump = np.empty((self.layout.rounds, bodies), np.int32)
-        jump[0] = parent
-        for level in range(1, self.layout.rounds):
-            previous = jump[level - 1]
-            jump[level] = np.where(previous >= 0, previous[np.maximum(previous, 0)], -1)
-        children, offsets = [], [0]
-        for body in range(bodies):
-            children.extend(np.flatnonzero(parent == body)[::-1].tolist())
-            offsets.append(len(children))
-        dfs_order, dfs_end = dfs_intervals(parent)
-        # Each body's DOF range: the plan's dof_joint is contiguous per body.
-        dof_joint_host = np.asarray(host["dof_joint"], dtype=np.int64)
-        body_dof_start = np.zeros(bodies, np.int32)
-        body_dof_count = np.zeros(bodies, np.int32)
-        for dof, body in enumerate(dof_joint_host):
-            if body_dof_count[body] == 0:
-                body_dof_start[body] = dof
-            elif body_dof_start[body] + body_dof_count[body] != dof:
-                raise ValueError("Tree kinetic state requires each body's coordinates to be contiguous")
-            body_dof_count[body] += 1
-        if len(children) != bodies - len(self.layout.roots):
+        # Each body's coordinate range: the plan's dof_joint is contiguous per body, in body order.
+        dof_joint = np.asarray(host["dof_joint"], dtype=np.int64)
+        body_dof_count = np.bincount(dof_joint, minlength=bodies).astype(np.int32)
+        if not np.array_equal(dof_joint, expand(body_dof_count)[0]):
+            raise ValueError("Tree kinetic state requires each body's coordinates to be contiguous")
+        # The group's template tree: every traversal structure the scans read (TreePlan).
+        self.tree = tree = TreePlan.build(parent, body_dof_count)
+        if tree.children.size != bodies - len(self.layout.roots):
             raise ValueError("Tree kinetic state requires every true parent edge")
 
         group_to_art = sparse_owner.plan.group_to_art.numpy()
@@ -286,8 +245,7 @@ class TreeKineticState:
         # Coordinate of each DOF: the joint's first coordinate plus the DOF's
         # offset within its joint (one coordinate per DOF; a ball joint's
         # quaternion is never a spring coordinate, its stiffness is zero).
-        dof_joint = np.asarray(host["dof_joint"], dtype=np.int64)
-        dof_offset = np.arange(dofs) - np.array([np.flatnonzero(dof_joint == dof_joint[d])[0] for d in range(dofs)])
+        dof_offset = np.arange(dofs) - tree.dof_start[dof_joint]
         for group, art in enumerate(group_to_art):
             start = int(starts[art])
             if self.layout.root_dofs and start not in root_lookup:
@@ -301,50 +259,26 @@ class TreeKineticState:
         if np.any(coordinates != coordinates[0]):
             raise ValueError("Tree kinetic state requires one coordinate count per group")
         self.bank_coordinates = int(coordinates[0])
-        if chain_scan_default is None:
-            chain_scan_default = True
-        self.chain_scan_requested = os.environ.get("FEATHER_PGS_TREE_CHAIN_SCAN", str(int(chain_scan_default))) == "1"
-        self.chain_scan = False
-        chain_host = None
-        if self.chain_scan_requested:
-            from . import tree_chain_scan  # noqa: PLC0415
-
-            try:
-                chain_host = tree_chain_scan.make_plan(parent)
-            except ValueError:
-                # Unsupported packing preserves the complete original owner.
-                pass
-        if chain_host is not None and self.layout.pack > 1:
-            # Packed chain scans address threads directly; keep one tree per block.
-            self.layout = dataclasses.replace(self.layout, lanes=0)
+        # The launch: lanes per tree and the scans' schedules, from the tree's data (forests keep their trees in
+        # lane groups: no chain schedules).
+        self.chains = bool(chains) and not self.layout.forest
+        lanes = native.held_lanes(tree, self.group_count, cuda=device.is_cuda)
+        self.layout = dataclasses.replace(self.layout, lanes=lanes)
+        self.schedules = native.held_schedules(tree, lanes, chains=self.chains, reference=self.reference)
         if self.group_count % self.layout.pack:
             raise ValueError("Tree kinetic lane packing requires whole blocks of trees")
-        self._chain_block_dim = cooperative_block_dim(self.layout, chain_host)
-        if chain_host is None:
-            self.plan = native.KineticPlan()
-        else:
-            self.plan = tree_chain_scan.ChainPlan()
-            self.plan.chain_meta = wp.array(chain_host["meta"].reshape(-1), dtype=int, device=device)
-            for name in ("light_offsets", "light_children", "stage_width"):
-                setattr(self.plan, name, wp.array(chain_host[name], dtype=int, device=device))
-            self.plan.chain_levels = chain_host["levels"]
-            self.plan.chain_width = int(chain_host["widths"].max())
-            self.chain_scan = True
         # Forest metadata (a single tree is the one-root case of the same arrays).
         root_locals = np.asarray(self.layout.roots, np.int32)
-        root_of = np.zeros(bodies, np.int32)
-        for local in range(1, bodies):
-            root_of[local] = (
-                root_of[parent[local]] if parent[local] >= 0 else int(np.flatnonzero(root_locals == local)[0])
-            )
+        if not np.array_equal(root_locals, tree.roots):
+            raise ValueError("Tree kinetic state requires its forest's roots in local order")
+        root_of = np.searchsorted(tree.roots, tree.root_of).astype(np.int32)
         arts = getattr(sparse_owner, "forest_arts", None)
         arts = np.asarray(arts, np.int32) if arts is not None else group_to_art.reshape(-1, 1).astype(np.int32)
-        # Predicted body twists for the resolved-world classifier: the predictor
-        # publishes them for warp-sized plans (the chain plan keeps its own scans);
-        # FEATHER_PGS_PREDICTED_TWISTS=0 leaves the classifier to its own kernel.
+        # Predicted body twists for the resolved-world classifier: the predictor publishes them for warp-sized
+        # trees whose scans keep to their lane groups; FEATHER_PGS_PREDICTED_TWISTS=0 leaves the classifier to its
+        # own kernel.
         self.publishes_twists = (
-            chain_host is None
-            and self.layout.lanes <= 32
+            native.publishes_twists(self.layout, self.schedules)
             and os.environ.get("FEATHER_PGS_PREDICTED_TWISTS", "1") == "1"
         )
         self._no_twists = solver._arrays.placeholder(wp.spatial_vector)
@@ -369,33 +303,21 @@ class TreeKineticState:
                     if root_slot[group, k] < 0:
                         raise ValueError("Tree kinetic state is missing a free-root transport slot")
             root_slot = root_slot.reshape(-1)
-        for name, values in (
-            ("parent", parent),
-            ("depth", depth),
-            ("jump", jump),
-            ("children_offsets", np.asarray(offsets, np.int32)),
-            ("children", np.asarray(children, np.int32)),
-            ("q_index", q_index.reshape(-1)),
-            ("root_slot", root_slot),
-        ):
-            setattr(self.plan, name, wp.array(values, dtype=int, device=device))
-        if chain_host is None:
-            # Chain-scan plans keep their own struct; forests are kinetic plans only.
-            for name, values in (
-                ("dfs_order", dfs_order),
-                ("dfs_end", dfs_end),
-                ("body_dof_start", body_dof_start),
-                ("body_dof_count", body_dof_count),
-                ("arts", arts),
-                ("root_of", root_of),
-                ("root_local", root_locals),
-                ("free_root_local", free_root_local),
-                ("free_root_dof", free_root_dof),
-                ("dof_passive", dof_passive),
-            ):
-                setattr(self.plan, name, wp.array(values, dtype=int, device=device))
-        elif self.layout.forest:
-            raise ValueError("Forest groups do not use the packed chain scan")
+        self.plan = field_group.upload(
+            native.HeldPlan,
+            device,
+            **ts.scan_arrays(tree),
+            q_index=q_index.reshape(-1),
+            root_slot=root_slot,
+            body_dof_start=tree.dof_start[:-1],
+            body_dof_count=body_dof_count,
+            arts=arts,
+            root_of=root_of,
+            root_local=root_locals,
+            free_root_local=free_root_local,
+            free_root_dof=free_root_dof,
+            dof_passive=dof_passive,
+        )
         groups = self.group_count
         self.data = native.KineticData()
         field_group.SolverArrays(self.data, device).allocate(
@@ -421,7 +343,6 @@ class TreeKineticState:
         self.status = self.data.status
         self._body_velocity = getattr(sparse_owner, "requires_body_velocity", False)
         self._response = response
-        self.lane_timing = {}
         # Pointers of the bank every current group is stamped with after the last
         # finish (its output bank) or repair (its input bank), as the host knows it,
         # and the capture that launch was recorded in (0 eagerly). It only chooses
@@ -432,8 +353,6 @@ class TreeKineticState:
         # for the route record.
         self._captured_repairs = None
         self._bind_kernels()
-        if not self.chain_scan:
-            self._choose_lanes()
         self._plan_dimensions = self._dimensions()
         # Everything make_plan and the kernels bake in, proven on the device, and the
         # joint frames, which the kernels read live, watched.
@@ -449,7 +368,7 @@ class TreeKineticState:
 
         layout = self.layout
         on_cpu = self.solver.model.device.is_cpu
-        self.block_dim = max(layout.block, self._chain_block_dim)
+        self.block_dim = layout.block
         self.launch_count = self.group_count // layout.pack
         # Only a launch of more blocks than _CLASSIFIED_GRIDS listed grids is classified, and
         # never a motion-velocity layout's, which repairs on every step (see the class docstring).
@@ -461,11 +380,10 @@ class TreeKineticState:
         )
         self.repair_kernel = native.get_state_kernel(
             False,
-            self.chain_scan,
+            self.schedules,
             layout=layout,
             body_velocity=self._body_velocity,
             motion_velocity=self.motion_velocity,
-            reference=self.reference,
             clocked=self.clocked,
             host=on_cpu,
         )
@@ -476,43 +394,40 @@ class TreeKineticState:
         # to 151 on a 13-body chain on sm_120, but not a packed one's, 72 either way).
         self.bank_kernel = self.bank_repair_kernel = None
         if self.bank_compare and self.classify_first:
-            self.bank_kernel = native.get_bank_kernel(self.chain_scan, layout=layout, coordinates=self.bank_coordinates)
+            self.bank_kernel = native.get_bank_kernel(layout=layout, coordinates=self.bank_coordinates)
         elif self.bank_compare:
             self.bank_repair_kernel = native.get_state_kernel(
                 False,
-                self.chain_scan,
+                self.schedules,
                 layout=layout,
                 body_velocity=self._body_velocity,
                 bank_coordinates=self.bank_coordinates,
-                reference=self.reference,
                 clocked=self.clocked,
                 host=on_cpu,
             )
         self.classify_kernel = self.listed_repair_kernel = None
         if self.classify_first:
             # Ordinary motion only: classify_first excludes motion-velocity layouts.
-            self.classify_kernel = native.get_classify_kernel(self.chain_scan, layout=layout)
+            self.classify_kernel = native.get_classify_kernel(layout=layout)
             self.listed_repair_kernel = native.get_state_kernel(
                 False,
-                self.chain_scan,
+                self.schedules,
                 layout=layout,
                 body_velocity=self._body_velocity,
                 listed=True,
-                reference=self.reference,
                 clocked=self.clocked,
                 host=on_cpu,
             )
         self.finish_kernel = native.get_state_kernel(
             True,
-            self.chain_scan,
+            self.schedules,
             layout=layout,
             body_velocity=self._body_velocity,
-            reference=self.reference,
             clocked=self.clocked,
             host=on_cpu,
         )
         self.predictor_kernel = native.get_predictor_kernel(
-            self.chain_scan, layout=layout, response=self._response, reference=self.reference, clocked=self.clocked
+            self.schedules, layout=layout, response=self._response, reference=self.reference, clocked=self.clocked
         )
 
     def _force_input(self, state_in, state_aug, control, predictor_qd, dt):
@@ -536,75 +451,6 @@ class TreeKineticState:
             predicted_twist=self._no_twists if twists is None else twists,
             publish_twists=int(self.publishes_twists and consumer is not None and consumer.published),
         )
-
-    def _choose_lanes(self):
-        """Time the candidate lane widths on this model and keep the fastest.
-
-        The finish kernel (scan, body terms, reduction, geometry, integration,
-        publication) is the owner's dominant launch and the one whose cost
-        depends on lanes per tree versus trees per block. No static rule fit
-        the measurements, so the width is chosen by running each candidate a
-        few times at construction, before any graph capture, on throwaway
-        states; the caches are then reset so the first real step repairs.
-        """
-        candidates = lane_candidates(self.layout.lanes, self.group_count)
-        if len(candidates) < 2:
-            return
-        import time  # noqa: PLC0415
-
-        model, device, solver = self.solver.model, self.solver.model.device, self.solver
-        probe_in, probe_out = model.state(), model.state()
-        data = self._publication(probe_in, solver, probe_out, 1.0 / 240.0)
-        # Steady state: finish without a geometry refresh, then predict (repair
-        # exits early on an unchanged bank and refresh is periodic).
-        finish_arguments = [
-            self.sparse.plan,
-            self.plan,
-            data,
-            self.data,
-            solver._mass_update_requested,
-            0,
-            probe_in.joint_qd,
-            self._repair_blocks,
-            self._list_counts,
-            self._no_bank,
-        ]
-        # The solver holds its own augmented state (joint_tau, joint_S_s, joint_qdd).
-        force = self._force_input(probe_in, solver, model.control(), probe_in.joint_qd, 1.0 / 240.0)
-        predict_arguments = [self.sparse.plan, self.sparse.data, self.plan, self.data, force]
-        base = self.layout
-        timings = {}
-        for lanes in candidates:
-            self.layout = dataclasses.replace(base, lanes=lanes)
-            self._bind_kernels()
-            launches = (
-                (self.finish_kernel, finish_arguments),
-                (self.predictor_kernel, predict_arguments),
-            )
-            # One warm pass populates the caches the timed launches read.
-            for kernel, arguments in launches:
-                wp.launch_tiled(
-                    kernel, dim=[self.launch_count], inputs=arguments, block_dim=self.block_dim, device=device
-                )
-            best = math.inf
-            for _ in range(6):
-                wp.synchronize_device(device)
-                started = time.perf_counter()
-                for kernel, arguments in launches:
-                    wp.launch_tiled(
-                        kernel, dim=[self.launch_count], inputs=arguments, block_dim=self.block_dim, device=device
-                    )
-                wp.synchronize_device(device)
-                best = min(best, time.perf_counter() - started)
-            timings[lanes] = best
-        self.lane_timing = timings
-        self.layout = dataclasses.replace(base, lanes=min(timings, key=timings.get))
-        self._bind_kernels()
-        # The probes wrote the caches and the solver's working arrays; make the
-        # first real step repair everything from its own state.
-        for name in ("current_valid", "geometry_valid", "status", "generation", "source_q", "source_qd"):
-            getattr(self.data, name).zero_()
-        self.data.geometry_generation.fill_(-1)
 
     def _dimensions(self):
         model = self.solver.model

@@ -479,7 +479,7 @@ class TestFeatherPGSPathSelection(unittest.TestCase):
         self.assertIn("CPU", routes["sparse_mass_matrix"]["reason"])
         self.assertIsNone(routes["dynamics"]["grouped"])
         self.assertEqual({plan["hinv_jt_kernel"] for plan in selected["kernel_plan_by_dof"].values()}, {"par_row"})
-        self.assertEqual(selected["measurements"], {"held_tree_lane_timing_us": []})
+        self.assertEqual(selected["measurements"], {})
         separate = SolverFeatherPGS(_cpu_separate_worlds_model()).get_path_selection()["routes"]
         self.assertFalse(separate["free_rigid_bodies"]["mixed_worlds"])
         self.assertEqual(separate["sweep"]["driver"], "dense_split")
