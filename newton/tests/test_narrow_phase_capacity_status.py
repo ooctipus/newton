@@ -29,7 +29,8 @@ VERIFIER_NAMES = (
 )
 TERRAIN_NAMES = ("terrain_rows", "terrain_stale", "terrain_jobs")
 """Bits 13 to 15, which the terrain law's kernels set."""
-NAMES = VERIFIER_NAMES + TERRAIN_NAMES
+NAMES = (*VERIFIER_NAMES, *TERRAIN_NAMES, "contact_launches")
+"""Every flag of a pipeline's narrow phase: ``contact_launches`` reports the pipeline's captured contact launches."""
 
 
 def make_pipeline(device="cpu", *, verify=True, capacity=1):
