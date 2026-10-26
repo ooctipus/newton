@@ -996,7 +996,8 @@ def test_failed_closed_launches_are_capacity_failures(test, device):
     with wp.ScopedCapture(device=device) as capture:
         solver.seed_double_buffer_events()
         simulate()
-        library = next(iter(pool._tables))._library
+        # The updater the next launch binds to (each loads its own handle of the bridge library).
+        library = pool._updates_for(contact_pool._capture_owner(wp.get_device(device)))._library
         with mock.patch.object(library, "bind_node", return_value=-999), test.assertRaisesRegex(RuntimeError, "bind"):
             pool.launch(
                 _write_counted_rows,
