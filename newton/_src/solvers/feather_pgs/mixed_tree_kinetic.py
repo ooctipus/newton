@@ -9,6 +9,7 @@ import numpy as np
 import warp as wp
 
 from ...sim import JointType
+from . import host_index
 from .device_proof import DeviceProof
 from .small_cholesky import geometric_kernel
 from .sparse_factor import bind_operator_plan, operator_metadata
@@ -327,13 +328,14 @@ def forest_families(solver):
     art_world = solver.art_to_world.numpy()
     prescribed = solver._prescribed_articulation.numpy()
     counts = np.diff([*solver.articulation_dof_start.numpy().tolist(), model.joint_dof_count])
-    world_arts = np.bincount(art_world, minlength=worlds)[:worlds]
+    world_bounds, order = host_index.group_by(art_world, worlds)
+    world_arts = np.diff(world_bounds)[:worlds]
     if not worlds or np.any(world_arts != world_arts[0]) or world_arts[0] == 0:
         return None
     if world_arts[0] > 4 or world_arts[0] < 2:
         return None
     # Each world's articulations in ascending order, one row per world.
-    per_world = np.argsort(art_world, kind="stable").reshape(worlds, world_arts[0])
+    per_world = order.reshape(worlds, world_arts[0])
     if np.any(np.diff(per_world, axis=1) != 1):
         return None
     if np.any(counts[per_world] != counts[per_world[0]]) or np.any(prescribed[per_world] != prescribed[per_world[0]]):
@@ -370,7 +372,9 @@ class ForestHeldOperator:
         art_world = solver.art_to_world.numpy()
         prescribed = solver._prescribed_articulation.numpy()
         counts = np.diff([*solver.articulation_dof_start.numpy().tolist(), model.joint_dof_count])
-        arts = np.stack([np.flatnonzero(art_world == w) for w in range(worlds)]).astype(np.int32)
+        # Each world's articulations in ascending order, one row per world (forest_families admits equal counts).
+        world_bounds, order = host_index.group_by(art_world, worlds)
+        arts = order.reshape(worlds, int(world_bounds[1] - world_bounds[0])).astype(np.int32)
         self.forest_arts = arts
         # Family per root: its coordinate count for a held Cholesky factor,
         # negated for a diagonal-mass size (compact inverse), 0 when prescribed.

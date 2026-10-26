@@ -50,6 +50,7 @@ from ..solver import SolverBase
 from . import contact_compliance as _contact_compliance
 from . import environment_flags as _environment_flags
 from . import execution_plan as _execution_plan
+from . import host_index
 from . import row_metadata as _row_metadata
 from .body_mapping import build_body_maps
 from .conditioning import ArmatureFloor, conditioning_armature
@@ -490,18 +491,6 @@ def _warn_constraint_row_overflow(
             )
 
 
-def _expand_ranges(counts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Enumerate consecutive ranges of non-negative lengths ``counts``, element ``k`` of range ``i`` as ``(i, k)``.
-
-    Returns:
-        ``(range_index, position)``, each of length ``counts.sum()``, in range order.
-    """
-    counts = np.asarray(counts, dtype=np.int64)
-    range_index = np.repeat(np.arange(counts.size), counts)
-    position = np.arange(range_index.size) - np.repeat(np.cumsum(counts) - counts, counts)
-    return range_index, position
-
-
 def _world_diagonal_pairs(
     articulation_world: np.ndarray, response_dof_count: np.ndarray, world_count: int, diagonal_sizes: frozenset[int]
 ) -> tuple[np.ndarray, np.ndarray] | None:
@@ -512,11 +501,11 @@ def _world_diagonal_pairs(
         world has exactly two response articulations, exactly one of them diagonal.
     """
     articulations = np.flatnonzero(response_dof_count > 0)
-    worlds = articulation_world[articulations]
-    if np.any(np.bincount(worlds, minlength=world_count) != 2):
+    bounds, order = host_index.group_by(articulation_world[articulations], world_count)
+    if np.any(np.diff(bounds) != 2):
         return None
     # Each world's pair, in ascending articulation order.
-    pairs = articulations[np.argsort(worlds, kind="stable")].reshape(world_count, 2)
+    pairs = articulations[order].reshape(world_count, 2)
     diagonal = np.isin(response_dof_count[pairs], list(diagonal_sizes))
     if np.any(diagonal.sum(axis=1) != 1):
         return None
@@ -630,11 +619,11 @@ class _FeatherPGSModelPlan:
                 # articulation_start may contain foreign entries after the tree — e.g.
                 # multi-source add_builder defers loop joints past a later articulation's
                 # free joint — so never adopt range members by position.
-                range_art, position = _expand_ranges(np.maximum(last_joint - first_joint, 0))
+                range_art, position = host_index.expand(np.maximum(last_joint - first_joint, 0))
                 member = joint_articulation[first_joint[range_art] + position] == range_art
                 member_count = np.bincount(range_art[member], minlength=articulation_count)
                 # Members must open their range: as many members precede each one as joints do.
-                members_before = np.cumsum(member) - member - (np.cumsum(member_count) - member_count)[range_art]
+                members_before = host_index.segmented_rank(range_art, member)
                 stray = np.flatnonzero(member & (members_before != position))
                 if stray.size:
                     art = int(range_art[stray[0]])
@@ -828,29 +817,27 @@ class _FeatherPGSTreePlan:
         groups = []
         for lanes, trees in sorted(grouped.items()):
             max_levels = max(len(levels) for _, levels in trees)
-            offsets = np.empty((len(trees), max_levels + 1), dtype=np.int32)
-            segments = []
-            for row, (_, levels) in enumerate(trees):
-                offsets[row, 0] = len(segments)
-                for level in range(max_levels):
-                    if level < len(levels):
-                        segments.extend(levels[level])
-                    offsets[row, level + 1] = len(segments)
+            # One CSR over every (tree, level) cell; a tree's row holds the bounds of its levels.
+            cells = [
+                len(levels[level]) if level < len(levels) else 0 for _, levels in trees for level in range(max_levels)
+            ]
+            level_bounds = host_index.offsets(cells)
+            level_offsets = level_bounds[np.arange(len(trees))[:, None] * max_levels + np.arange(max_levels + 1)]
+            segments = [segment for _, levels in trees for level in levels for segment in level]
             segment_ids = {segment[0]: index for index, segment in enumerate(segments)}
-            segment_offsets, joints = [0], []
-            child_offsets, child_segments = [0], []
-            for segment in segments:
-                joints.extend(segment)
-                segment_offsets.append(len(joints))
-                child_segments.extend(segment_ids[child] for child in reversed(joint_children[segment[-1]]))
-                child_offsets.append(len(child_segments))
+            joints = [joint for segment in segments for joint in segment]
+            child_segments = [
+                segment_ids[child] for segment in segments for child in reversed(joint_children[segment[-1]])
+            ]
+            segment_offsets = host_index.offsets([len(segment) for segment in segments])
+            child_offsets = host_index.offsets([len(joint_children[segment[-1]]) for segment in segments])
             groups.append(
                 _FeatherPGSTreeGroup(
                     lanes=lanes,
                     articulation_count=len(trees),
                     max_levels=max_levels,
                     articulations=wp.array([art for art, _ in trees], dtype=wp.int32, device=model.device),
-                    level_offsets=wp.array(offsets, dtype=wp.int32, device=model.device),
+                    level_offsets=wp.array(level_offsets, dtype=wp.int32, device=model.device),
                     segment_offsets=wp.array(segment_offsets, dtype=wp.int32, device=model.device),
                     segment_joints=wp.array(joints, dtype=wp.int32, device=model.device),
                     child_offsets=wp.array(child_offsets, dtype=wp.int32, device=model.device),
@@ -3431,13 +3418,10 @@ class SolverFeatherPGS(SolverBase):
             joint_qd_start = model.joint_qd_start.numpy()
             kinematic_joints = np.flatnonzero(kinematic_bodies[joint_child])
             joint_mask[kinematic_joints] = 1
-            for joint in kinematic_joints:
-                dof_start = joint_qd_start[joint]
-                dof_end = joint_qd_start[joint + 1]
-                if dof_end <= dof_start:
-                    continue
-                dof_mask[dof_start:dof_end] = 1
-                armature[dof_start:dof_end] = 1.0e10
+            dof_start = joint_qd_start[kinematic_joints]
+            joint, offset = host_index.expand(np.maximum(joint_qd_start[kinematic_joints + 1] - dof_start, 0))
+            dof_mask[dof_start[joint] + offset] = 1
+            armature[dof_start[joint] + offset] = 1.0e10
 
         if (getattr(self, "_sparse_split", False) or getattr(self, "_sparse_velocity_limits", False)) and np.any(
             dof_mask
@@ -3769,15 +3753,9 @@ class SolverFeatherPGS(SolverBase):
         joint_q_start = model.joint_q_start.numpy().astype(np.int32, copy=False)
         labels = list(getattr(model, "constraint_mimic_label", []) or [])
 
-        def art_of(joints: np.ndarray) -> np.ndarray:
-            a = np.searchsorted(articulation_start, joints, side="right") - 1
-            inside = (a >= 0) & (a < model.articulation_count)
-            bounded = np.where(inside, a, 0)
-            inside &= (articulation_start[bounded] <= joints) & (joints < articulation_start[bounded + 1])
-            return np.where(inside, a, -1)
-
         one_dof = (int(JointType.REVOLUTE), int(JointType.PRISMATIC))
-        a0, a1 = art_of(j0), art_of(j1)
+        articulation_bounds = articulation_start[: model.articulation_count + 1]
+        a0, a1 = host_index.lookup(articulation_bounds, j0), host_index.lookup(articulation_bounds, j1)
         spans = (a0 < 0) | (a1 < 0) | (a0 != a1)
         # Joint checks apply to the constraints within one articulation, in order.
         within = np.flatnonzero(~spans)
@@ -3808,14 +3786,9 @@ class SolverFeatherPGS(SolverBase):
                 )
 
         valid_indices = np.flatnonzero(valid).astype(np.int32, copy=False)
-        if valid_indices.size:
-            order = valid_indices[np.argsort(art[valid_indices], kind="stable")]
-            counts = np.bincount(art[order], minlength=model.articulation_count)
-        else:
-            order = np.empty(0, dtype=np.int32)
-            counts = np.zeros(model.articulation_count, dtype=np.int64)
-        art_start = np.zeros(model.articulation_count + 1, dtype=np.int32)
-        art_start[1:] = np.cumsum(counts, dtype=np.int64).astype(np.int32)
+        art_start, order = host_index.group_by(art[valid_indices], model.articulation_count)
+        art_start = art_start.astype(np.int32)
+        order = valid_indices[order]
 
         self._mimic_valid_np = valid
         self._mimic_world_np = mimic_world
@@ -4059,19 +4032,15 @@ class SolverFeatherPGS(SolverBase):
             return
 
         # Per-articulation bilateral row capacity (upper bound: every valid constraint).
-        counts: dict[int, int] = {}
+        counts = np.zeros(model.articulation_count, dtype=np.int64)
         if self._mimic_count and self.bilateral_preelimination_include_mimics:
-            for art, count in enumerate(np.diff(self._mimic_art_start_np)):
-                if count:
-                    counts[art] = int(count)
+            counts += np.diff(self._mimic_art_start_np)
         if self._connect_count:
-            connect_art_np = self._connect_art.numpy()
-            for k in range(self._connect_count):
-                a = int(connect_art_np[k])
-                counts[a] = counts.get(a, 0) + 3
-        if not counts:
+            counts += 3 * np.bincount(self._connect_art.numpy(), minlength=model.articulation_count)
+        arts = np.flatnonzero(counts)
+        if not arts.size:
             return
-        n_b_max = max(counts.values())
+        n_b_max = int(counts.max())
         if n_b_max > PREELIM_MAX_ROWS:
             warnings.warn(
                 f"SolverFeatherPGS: an articulation owns {n_b_max} bilateral rows, more "
@@ -4082,11 +4051,9 @@ class SolverFeatherPGS(SolverBase):
             return
 
         device = model.device
-        arts = sorted(counts)
         n_pe = len(arts)
         art_to_idx = np.full(model.articulation_count, -1, dtype=np.int32)
-        for i, a in enumerate(arts):
-            art_to_idx[a] = i
+        art_to_idx[arts] = np.arange(n_pe)
         self._preelim_art_to_idx = wp.array(art_to_idx, dtype=wp.int32, device=device)
         self._preelim_slots = wp.full((n_pe * PREELIM_MAX_ROWS,), -1, dtype=wp.int32, device=device)
         self._preelim_nB = wp.zeros((n_pe,), dtype=wp.int32, device=device)
@@ -4208,8 +4175,7 @@ class SolverFeatherPGS(SolverBase):
                 supported = (int(JointType.REVOLUTE), int(JointType.PRISMATIC), int(JointType.D6))
                 joint_type = model.joint_type.numpy()
                 # joint_qd_start is sentinel-closed (length joint_count + 1).
-                dof_counts = np.diff(model.joint_qd_start.numpy())
-                dof_joint = np.repeat(np.arange(model.joint_count), dof_counts)
+                dof_joint, _ = host_index.expand(np.diff(model.joint_qd_start.numpy()))
                 bad = (k_np != 0.0) & ~np.isin(joint_type[dof_joint], supported)
                 if np.any(bad):
                     warnings.warn(
@@ -4276,15 +4242,13 @@ class SolverFeatherPGS(SolverBase):
 
         # The diagonal articulations with a limited DOF fuse all their DOFs' limits.
         diagonal_size = response_dof_count[diagonal_articulations]
-        art, local_dof = _expand_ranges(diagonal_size)
+        art, local_dof = host_index.expand(diagonal_size)
         dof = articulation_dof_start[diagonal_articulations][art] + local_dof
         valid = self._joint_limit_q_index_host[dof] >= 0
         limited = np.bincount(art[valid], minlength=diagonal_articulations.size) > 0
         self._fused_diagonal_limit_dof_mask_host[dof[limited[art]]] = valid[limited[art]]
         # Add each size where a world first has it, as the per-world set did.
-        limited_size = diagonal_size[limited]
-        _, first_index = np.unique(limited_size, return_index=True)
-        selected_sizes: set[int] = {int(size) for size in limited_size[np.sort(first_index)]}
+        selected_sizes: set[int] = {int(size) for size in host_index.ordered_unique(diagonal_size[limited])}
         self._fused_diagonal_joint_limit_sizes = frozenset(selected_sizes)
         self._fused_diagonal_joint_limits = bool(selected_sizes)
 
@@ -4352,11 +4316,11 @@ class SolverFeatherPGS(SolverBase):
         # Every axis of every dense joint in each articulation's joint range, by articulation.
         articulation_count = int(model.articulation_count)
         first_joint = articulation_start[:articulation_count]
-        art, position = _expand_ranges(np.maximum(articulation_start[1 : articulation_count + 1] - first_joint, 0))
+        art, position = host_index.expand(np.maximum(articulation_start[1 : articulation_count + 1] - first_joint, 0))
         joint = first_joint[art] + position
         dense = np.isin(joint_type[joint], dense_joint_types)
         art, joint = art[dense], joint[dense]
-        axis_joint, axis = _expand_ranges(joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1])
+        axis_joint, axis = host_index.expand(joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1])
         art = art[axis_joint]
         dof = joint_qd_start[joint][axis_joint] + axis
 
@@ -4391,20 +4355,17 @@ class SolverFeatherPGS(SolverBase):
 
             # Jacobian sizes accumulate in int32, as they always have. Mass matrix
             # offsets reach wp.array as Python ints, so one past int32 still raises.
-            J_sizes = 6 * joint_count * dof_count
-            M_sizes = joint_count * 36
-            H_sizes = dof_count.astype(np.int64) ** 2
-            J_end = np.cumsum(J_sizes, dtype=np.int32)
-            M_end = np.cumsum(M_sizes, dtype=np.int64)
-            H_end = np.cumsum(H_sizes)
-            self.J_size = J_end[-1] if articulation_count else 0
-            self.M_size = int(M_end[-1]) if articulation_count else 0
-            self.H_size = int(H_end[-1]) if articulation_count else 0
+            J_bounds = host_index.offsets(6 * joint_count * dof_count, dtype=np.int32)
+            M_bounds = host_index.offsets(joint_count * 36)
+            H_bounds = host_index.offsets(dof_count.astype(np.int64) ** 2)
+            self.J_size = J_bounds[-1] if articulation_count else 0
+            self.M_size = int(M_bounds[-1])
+            self.H_size = int(H_bounds[-1])
 
             # matrix offsets for grouped gemm
-            self.articulation_J_start = wp.array(J_end - J_sizes, dtype=wp.int32, device=model.device)
-            self.articulation_M_start = wp.array((M_end - M_sizes).tolist(), dtype=wp.int32, device=model.device)
-            self.articulation_H_start = wp.array((H_end - H_sizes).tolist(), dtype=wp.int32, device=model.device)
+            self.articulation_J_start = wp.array(J_bounds[:-1], dtype=wp.int32, device=model.device)
+            self.articulation_M_start = wp.array(M_bounds[:-1].tolist(), dtype=wp.int32, device=model.device)
+            self.articulation_H_start = wp.array(H_bounds[:-1].tolist(), dtype=wp.int32, device=model.device)
 
             self.articulation_M_rows = wp.array(joint_count * 6, dtype=wp.int32, device=model.device)
             self.articulation_H_rows = wp.array(dof_count, dtype=wp.int32, device=model.device)
@@ -4473,15 +4434,19 @@ class SolverFeatherPGS(SolverBase):
         if self._model_plan is None:
             raise RuntimeError("FeatherPGS model plan must be built before size grouping")
         response_dof_count = self._model_plan.response_dof_count
-        solve_sizes = sorted(np.unique(response_dof_count[response_dof_count > 0]).tolist(), reverse=True)
+        # Each size group holds its articulations in ascending order, the groups by descending size.
+        negated_sizes, group = np.unique(-response_dof_count, return_inverse=True)
+        bounds, order = host_index.group_by(group, negated_sizes.size)
+        rank = np.empty(order.size, dtype=np.int64)
+        rank[order] = host_index.segmented_rank(group[order])
+        art_group_idx = np.where(response_dof_count > 0, rank, -1).astype(np.int32)
+        group_to_art = {
+            int(-size): order[bounds[g] : bounds[g + 1]].astype(np.int32)
+            for g, size in enumerate(negated_sizes)
+            if size < 0
+        }
+        solve_sizes = list(group_to_art)
         self.size_groups = solve_sizes
-
-        # Each size group holds its articulations in ascending order.
-        art_group_idx = np.full(model.articulation_count, -1, dtype=np.int32)
-        group_to_art = {}
-        for size in solve_sizes:
-            group_to_art[size] = np.flatnonzero(response_dof_count == size).astype(np.int32)
-            art_group_idx[group_to_art[size]] = np.arange(group_to_art[size].size)
         self.n_arts_by_size = {size: int(group_to_art[size].size) for size in solve_sizes}
 
         self.articulation_response_dof_count = wp.array(response_dof_count, dtype=wp.int32, device=model.device)
@@ -4502,21 +4467,20 @@ class SolverFeatherPGS(SolverBase):
             (int(JointType.PRISMATIC), int(JointType.REVOLUTE), int(JointType.D6)),
         )
         # Limit joints before each articulation's range ends, minus those before it starts.
-        limit_joints_before = np.concatenate(([0], np.cumsum(limit_joint)))
+        limit_joints_before = host_index.offsets(limit_joint)
         art_start = articulation_start[: model.articulation_count]
         art_end = articulation_start[1 : model.articulation_count + 1]
         limited_sizes = response_dof_count[
             (response_dof_count > 0) & (limit_joints_before[art_end] > limit_joints_before[art_start])
         ]
         # Insert each size where an articulation first has it, as the per-articulation set did.
-        _, first_index = np.unique(limited_sizes, return_index=True)
-        self._joint_limit_sizes = frozenset(int(size) for size in limited_sizes[np.sort(first_index)])
+        self._joint_limit_sizes = frozenset(int(size) for size in host_index.ordered_unique(limited_sizes))
         joint_q_start = model.joint_q_start.numpy().astype(np.int32, copy=False)
         joint_qd_start = model.joint_qd_start.numpy().astype(np.int32, copy=False)
         joint_dof_dim = model.joint_dof_dim.numpy().astype(np.int32, copy=False)
         limit_q_index = np.full(model.joint_dof_count, -1, dtype=np.int32)
         limit_joints = np.flatnonzero(limit_joint)
-        limit_joint_of, axis = _expand_ranges(joint_dof_dim[limit_joints, 0] + joint_dof_dim[limit_joints, 1])
+        limit_joint_of, axis = host_index.expand(joint_dof_dim[limit_joints, 0] + joint_dof_dim[limit_joints, 1])
         limit_q_index[joint_qd_start[limit_joints][limit_joint_of] + axis] = (
             joint_q_start[limit_joints][limit_joint_of] + axis
         )
@@ -4558,8 +4522,7 @@ class SolverFeatherPGS(SolverBase):
         )
 
         world_art_counts = np.bincount(articulation_world, minlength=self.world_count).astype(np.int32)
-        world_art_start = np.zeros(self.world_count + 1, dtype=np.int32)
-        world_art_start[1:] = np.cumsum(world_art_counts)
+        world_art_start = host_index.offsets(world_art_counts, dtype=np.int32)
         self.world_art_start = wp.array(world_art_start, dtype=wp.int32, device=model.device)
 
         response_world = articulation_world[self._model_plan.response_dof_count > 0]
@@ -4590,9 +4553,8 @@ class SolverFeatherPGS(SolverBase):
             worlds = art_to_world_np[arts]
             in_range = (worlds >= 0) & (worlds < world_count)
             arts, worlds = arts[in_range], worlds[in_range]
-            response_starts = np.zeros(world_count + 1, dtype=np.int32)
-            response_starts[1:] = np.cumsum(np.bincount(worlds, minlength=world_count))
-            response_flat_np = arts[np.argsort(worlds, kind="stable")].astype(np.int32)
+            response_starts, order = host_index.group_by(worlds, world_count)
+            response_flat_np = arts[order].astype(np.int32)
             self.world_response_group_art_start[int(size)] = wp.array(response_starts, dtype=wp.int32, device=device)
             self.world_response_group_to_art[int(size)] = wp.array(response_flat_np, dtype=wp.int32, device=device)
 
@@ -4626,11 +4588,11 @@ class SolverFeatherPGS(SolverBase):
             dof_start = articulation_dof_start[arts]
             # Each DOF's joint, as an offset from the articulation's first joint;
             # a later joint wins a DOF that an earlier one also spans.
-            art, position = _expand_ranges(joint_count)
+            art, position = host_index.expand(joint_count)
             joint = joint_start[art] + position
             local_start = np.maximum(0, joint_qd_start[joint] - dof_start[art])
             local_end = np.minimum(size, joint_qd_start[joint + 1] - dof_start[art])
-            entry, local_dof = _expand_ranges(np.maximum(local_end - local_start, 0))
+            entry, local_dof = host_index.expand(np.maximum(local_end - local_start, 0))
             offsets = np.full((arts.size, size), -1, dtype=np.int32)
             np.maximum.at(offsets, (art[entry], local_start[entry] + local_dof), position[entry].astype(np.int32))
             # One schedule serves the group only if every articulation has the first one's topology.
@@ -4856,12 +4818,11 @@ class SolverFeatherPGS(SolverBase):
 
         joint_masks = plan.joint_ancestor_mask
         body_masks = np.zeros(model.body_count, dtype=np.uint64)
-        for articulation in articulated:
-            first = int(articulation_start[articulation])
-            last = int(self._model_plan.articulation_joint_end[articulation])
-            children = joint_child[first:last]
-            valid = children >= 0
-            body_masks[children[valid]] = joint_masks[valid]
+        first_joint = articulation_start[articulated]
+        art, local_joint = host_index.expand(self._model_plan.articulation_joint_end[articulated] - first_joint)
+        children = joint_child[first_joint[art] + local_joint]
+        valid = children >= 0
+        body_masks[children[valid]] = joint_masks[local_joint[valid]]
         shape_body = model.shape_body.numpy()
         contact_masks = np.unique(body_masks[shape_body[shape_body >= 0]])
         max_support = max((int(mask).bit_count() for mask in joint_masks), default=0)
@@ -4872,7 +4833,7 @@ class SolverFeatherPGS(SolverBase):
             # Coefficients and enable bits stay live, so retain both endpoint
             # supports even when a coupling is initially disabled or zero.
             mimic_indices = self._mimic_art_list.numpy()
-            mimic_arts = np.repeat(np.arange(model.articulation_count), np.diff(self._mimic_art_start_np))
+            mimic_arts, _ = host_index.expand(np.diff(self._mimic_art_start_np))
             starts = self._model_plan.articulation_dof_start[mimic_arts]
             first_dofs = self._mimic_dof0.numpy()[mimic_indices] - starts
             second_dofs = self._mimic_dof1.numpy()[mimic_indices] - starts
@@ -5350,14 +5311,14 @@ class SolverFeatherPGS(SolverBase):
         counts = response_dof_count[articulations].astype(np.int64)
         world_dof_count = np.zeros(self.world_count, dtype=np.int64)
         np.add.at(world_dof_count, worlds, counts)
-        offsets = np.cumsum(counts) - counts - (np.cumsum(world_dof_count) - world_dof_count)[worlds]
-        articulation_world_dof_offset[articulations] = offsets
+        world_offset = host_index.segmented_rank(worlds, counts)
+        articulation_world_dof_offset[articulations] = world_offset
 
         world_dof_count = world_dof_count.astype(np.int32)
         self.max_world_dofs = int(np.max(world_dof_count)) if len(world_dof_count) else 0
         padded_indices = np.full((self.world_count, self.max_world_dofs), -1, dtype=np.int32)
-        entry, local_dof = _expand_ranges(counts)
-        padded_indices[worlds[entry], offsets[entry] + local_dof] = (
+        entry, local_dof = host_index.expand(counts)
+        padded_indices[worlds[entry], world_offset[entry] + local_dof] = (
             articulation_dof_start[articulations][entry] + local_dof
         )
 
@@ -5391,9 +5352,11 @@ class SolverFeatherPGS(SolverBase):
         response_dofs = self._model_plan.response_dof_count
         articulation_world = self._model_plan.articulation_world
         is_free_rigid = self._model_plan.is_free_rigid
-        response_by_world: list[list[int]] = [[] for _ in range(self.world_count)]
-        for art in np.flatnonzero(response_dofs > 0):
-            response_by_world[int(articulation_world[art])].append(int(art))
+        # Each world's response articulations, in ascending order.
+        responding = np.flatnonzero(response_dofs > 0)
+        world_bounds, order = host_index.group_by(articulation_world[responding], self.world_count)
+        responding = responding[order].tolist()
+        response_by_world = [responding[world_bounds[w] : world_bounds[w + 1]] for w in range(self.world_count)]
 
         secondary_group_arts = np.flatnonzero(response_dofs == 6)
         secondary_group_index = {int(art): group for group, art in enumerate(secondary_group_arts)}
@@ -5575,11 +5538,9 @@ class SolverFeatherPGS(SolverBase):
         dof_count = int(model.joint_dof_count)
         # Every DOF must lie in exactly one articulation's DOF range.
         range_start = self._model_plan.articulation_dof_start.astype(np.int64)
-        range_end = range_start + self._model_plan.articulation_dof_count
-        ownership = np.zeros(dof_count + 1, dtype=np.int64)
-        np.add.at(ownership, np.minimum(range_start, dof_count), 1)
-        np.add.at(ownership, np.minimum(range_end, dof_count), -1)
-        if np.any(np.cumsum(ownership[:dof_count]) != 1):
+        owner, local_dof = host_index.expand(self._model_plan.articulation_dof_count)
+        owned_dof = range_start[owner] + local_dof
+        if np.any(np.bincount(owned_dof[owned_dof < dof_count], minlength=dof_count)[:dof_count] != 1):
             return
 
         joint_type = model.joint_type.numpy()
@@ -5597,16 +5558,16 @@ class SolverFeatherPGS(SolverBase):
         supported = (int(JointType.PRISMATIC), int(JointType.REVOLUTE), int(JointType.D6))
         # Each articulation's supported joint axes, in joint order, take its first max_dofs row slots.
         first_joint = articulation_start[: model.articulation_count]
-        articulation, position = _expand_ranges(
+        articulation, position = host_index.expand(
             np.maximum(articulation_start[1 : model.articulation_count + 1] - first_joint, 0)
         )
         joint = first_joint[articulation] + position
         driven = np.isin(joint_type[joint], supported)
         articulation, joint = articulation[driven], joint[driven]
-        axis_joint, axis = _expand_ranges(joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1])
+        axis_joint, axis = host_index.expand(joint_dof_dim[joint, 0] + joint_dof_dim[joint, 1])
         articulation, joint = articulation[axis_joint], joint[axis_joint]
         axis_count = np.bincount(articulation, minlength=model.articulation_count)
-        slot = np.arange(articulation.size) - (np.cumsum(axis_count) - axis_count)[articulation]
+        slot = host_index.segmented_rank(articulation)
         slotted = slot < max_dofs
         articulation, joint, axis, slot = articulation[slotted], joint[slotted], axis[slotted], slot[slotted]
         dof = joint_qd_start[joint] + axis

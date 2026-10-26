@@ -5,6 +5,8 @@
 
 import numpy as np
 
+from . import host_index
+
 
 def build_body_maps(
     body_count: int,
@@ -19,7 +21,7 @@ def build_body_maps(
     """Build ownership, response presence, low-32 support and singleton indices."""
     body_joint = np.full(body_count, -1, dtype=np.int32)
     body_articulation = np.full(body_count, -1, dtype=np.int32)
-    joint_articulation = np.repeat(np.arange(len(articulation_joint_end), dtype=np.int32), np.diff(articulation_start))
+    joint_articulation, _ = host_index.expand(np.diff(articulation_start))
     indices = np.arange(len(joint_child), dtype=np.int32)
     tree = (indices < articulation_joint_end[joint_articulation]) & (joint_child >= 0)
     # Preserve the last tree owner without allowing a trailing loop joint to steal it.

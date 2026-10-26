@@ -14,7 +14,7 @@ from string import Template
 import numpy as np
 import warp as wp
 
-from . import response_operator
+from . import host_index, response_operator
 from .device_preludes import dual_native, lane_group
 from .sparse_factorization import _sparse_cholesky_source, _sparse_inverse_source
 
@@ -207,13 +207,13 @@ class _SparseMassMatrixPlan:
             pending.extend(children[joint][::-1])
         if len(preorder) != len(parents):
             raise ValueError("Joint parents must form an acyclic forest")
-        starts = np.concatenate(([0], np.cumsum(counts)))
+        starts = host_index.offsets(counts)
         permutation = np.array(
             [dof for joint in reversed(preorder) for dof in range(starts[joint + 1] - 1, starts[joint] - 1, -1)],
             dtype=np.int32,
         )
         inverse_permutation = np.argsort(permutation).astype(np.int32)
-        dof_joint = np.repeat(np.arange(len(parents), dtype=np.int32), counts)
+        dof_joint = host_index.expand(counts)[0].astype(np.int32)
         joint_masks = [0] * len(parents)
         for joint in range(len(parents)):
             ancestor = joint
@@ -244,8 +244,7 @@ class _SparseMassMatrixPlan:
         # branches can therefore be factored at the same dependency level.
         levels = _factor_levels(lookup)
         level_count = int(np.max(levels)) + 1
-        level_columns = np.argsort(levels, kind="stable").astype(np.int32)
-        level_offsets = np.concatenate(([0], np.cumsum(np.bincount(levels, minlength=level_count))))
+        level_offsets, level_columns = host_index.group_by(levels, level_count)
         level_entries = sorted(
             (entry for entry, (row, col) in enumerate(zip(entry_rows, columns, strict=True)) if row != col),
             key=lambda entry: (levels[columns[entry]], columns[entry], entry_rows[entry]),
@@ -265,9 +264,9 @@ class _SparseMassMatrixPlan:
             "joint_ancestor_mask": np.asarray(joint_masks, dtype=np.uint64),
             "column_offsets": np.asarray(column_offsets, dtype=np.int32),
             "column_entries": np.asarray(column_entries, dtype=np.int32),
-            "factor_level_offsets": np.asarray(level_offsets, dtype=np.int32),
-            "factor_level_columns": level_columns,
-            "factor_level_entry_offsets": np.asarray(np.concatenate(([0], np.cumsum(entry_counts))), dtype=np.int32),
+            "factor_level_offsets": level_offsets.astype(np.int32),
+            "factor_level_columns": level_columns.astype(np.int32),
+            "factor_level_entry_offsets": host_index.offsets(entry_counts, dtype=np.int32),
             "factor_level_entries": np.asarray(level_entries, dtype=np.int32),
         }
         for value in values.values():
