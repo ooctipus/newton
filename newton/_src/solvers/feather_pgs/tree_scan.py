@@ -84,6 +84,8 @@ __all__ = [
     "add",
     "choose_schedule",
     "device_plan",
+    "schedule_costs",
+    "schedule_features",
     "serial_scan",
     "tree_scan",
 ]
@@ -315,29 +317,110 @@ def device_plan(plan: TreePlan, device, *, warps: int = 2) -> ScanPlan:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
+# Unit costs of each schedule's critical-path counts (``schedule_features``), fitted by non-negative least
+# squares to tools/fpgs_bench/tree_scan_bench.py ``schedules`` on the RTX PRO 6000 (16384 trees per launch, every
+# shape of the tree-scan fixture, pose, motion and both reduction widths). Only their ratios matter.
+_UNIT_COSTS = {
+    (Direction.DOWN, Schedule.JUMP_SHFL): {"const": 34.86, "rounds": 7.70, "channel_rounds": 0.15},
+    (Direction.DOWN, Schedule.JUMP_SMEM): {"const": 13.70, "rounds": 21.97, "channel_rounds": 0.07},
+    (Direction.DOWN, Schedule.HEAVY_CHAIN): {
+        "const": 24.94,
+        "stages": 4.91,
+        "chain_rounds": 11.41,
+        "channel_stage_rounds": 0.11,
+        "channel_fan": 0.14,
+    },
+    (Direction.DOWN, Schedule.LEVEL): {"const": 74.82, "levels": 9.60, "channel_fan": 0.01},
+    (Direction.UP, Schedule.DFS_INTERVAL): {"const": 43.53, "channels": 9.12},
+    (Direction.UP, Schedule.HEAVY_CHAIN): {
+        "const": 37.95,
+        "stages": 5.88,
+        "channel_stage_rounds": 0.88,
+        "channel_fan": 0.60,
+    },
+    (Direction.UP, Schedule.LEVEL): {"const": 131.81, "levels": 8.33, "channel_fan": 0.95},
+}
+
+
+def schedule_features(plan: TreePlan, schedule: Schedule, channels: int) -> dict[str, int]:
+    """The counts on one tree's critical path under ``schedule``, which the unit costs weigh.
+
+    Rounds of pointer jumping, depth levels, light stages and chain rounds of the heavy chains, the widest
+    fan-out a lane walks (children per level, light children per stage), each times the value's channels where
+    they move it, and doubled for a tree that spans two warps.
+    """
+    warps = 2 if plan.count > 32 else 1
+    if schedule is Schedule.JUMP_SHFL:
+        return {"rounds": plan.rounds, "channel_rounds": channels * plan.rounds}
+    if schedule is Schedule.JUMP_SMEM:
+        return {"rounds": plan.rounds * warps, "channel_rounds": channels * plan.rounds * warps}
+    if schedule is Schedule.DFS_INTERVAL:
+        return {"channels": channels}
+    if schedule is Schedule.LEVEL:
+        fan = np.diff(plan.children_offsets)
+        widest = 0
+        for level in range(plan.max_depth):
+            nodes = plan.level_nodes[plan.level_offsets[level] : plan.level_offsets[level + 1]]
+            widest += int(fan[nodes].max()) if nodes.size else 0
+        return {"levels": plan.max_depth * warps, "channel_fan": channels * widest * warps}
+    if schedule is Schedule.HEAVY_CHAIN:
+        packing = plan.chain_packing(2)
+        warps = packing.lanes // 32
+        light = np.diff(plan.light_offsets)
+        stage_of = plan.chain_levels[plan.chain_of]
+        fan = sum(int(light[stage_of == stage].max()) for stage in range(packing.levels))
+        stage_rounds = sum(int(packing.stage_width[stage]).bit_length() - 1 for stage in range(packing.levels))
+        return {
+            "stages": packing.levels * warps,
+            "chain_rounds": (packing.width.bit_length() - 1) * warps,
+            "channel_stage_rounds": channels * stage_rounds * warps,
+            "channel_fan": channels * fan * warps,
+        }
+    raise ValueError(f"No cost of the {schedule.value} schedule")
+
+
+def schedule_costs(
+    plan: TreePlan, direction: Direction, combine: Combine, *, lanes: int, chains: bool = True
+) -> dict[Schedule, float]:
+    """The estimated cost of each schedule the plan and the launch admit (see :func:`choose_schedule`)."""
+    feasible = []
+    if direction is Direction.DOWN:
+        if plan.count <= min(lanes, 32):
+            feasible.append(Schedule.JUMP_SHFL)
+        if plan.count <= lanes:
+            feasible.append(Schedule.JUMP_SMEM)
+    elif plan.count <= min(lanes, 32):
+        feasible.append(Schedule.DFS_INTERVAL)
+    if chains and plan.chain_packing(2) is not None:
+        feasible.append(Schedule.HEAVY_CHAIN)
+    feasible.append(Schedule.LEVEL)
+    costs = {}
+    for schedule in feasible:
+        units = _UNIT_COSTS[(direction, schedule)]
+        counts = schedule_features(plan, schedule, combine.channels)
+        costs[schedule] = units["const"] + sum(units.get(name, 0.0) * count for name, count in counts.items())
+    return costs
+
+
 def choose_schedule(
     plan: TreePlan, direction: Direction, combine: Combine, *, cuda: bool, lanes: int, chains: bool = True
 ) -> Schedule:
-    """Pick the schedule of a tree group from its plan's data alone (deterministic, never timed).
+    """Pick the schedule of a tree group from its plan's data alone: deterministic, never timed.
+
+    The CPU, a path and a tree without edges run SERIAL. Otherwise each schedule the launch admits is
+    costed from the plan's counts (:func:`schedule_features`) at unit costs measured once per schedule
+    (``_UNIT_COSTS``), and the cheapest wins. The launch admits JUMP_SHFL and DFS_INTERVAL for a tree a warp's
+    lanes cover, JUMP_SMEM for one the group's lanes cover, HEAVY_CHAIN when the heavy chains pack into two
+    warps and the launch gives each tree its own block (``chains``: the chain scans address the block's
+    threads), and LEVEL always.
 
     Args:
         plan: The group's template tree.
         direction: The scan's direction.
-        combine: The scan's combine.
-        cuda: Whether the group runs on a CUDA device; the CPU runs SERIAL.
+        combine: The scan's combine; its channels weigh the counts.
+        cuda: Whether the group runs on a CUDA device.
         lanes: Lanes per tree of the launch (a power of two up to 32 within a warp, or 64 for two warps).
-        chains: Whether the launch gives each tree its own block, as the heavy-chain schedule addresses lanes
-            by thread index.
-
-    The rule, from the shapes measured in ``tests/test_feather_pgs_tree_scan.py``:
-
-    * nothing to scan (no edge), a path, or the CPU: SERIAL;
-    * a tree that fits one lane per node in a warp: JUMP_SHFL down (``ceil(log2(depth + 1))`` shuffle rounds,
-      no barrier) and, for additive combines, DFS_INTERVAL up (window sums, no barrier);
-    * otherwise, heavy chains packed into two warps (with a block per tree): HEAVY_CHAIN, whose shuffle rounds
-      cover a chain and whose barriers count light levels, not depth;
-    * otherwise a lane per node within the launch: JUMP_SMEM down, LEVEL up;
-    * otherwise LEVEL.
+        chains: Whether the launch gives each tree its own block.
     """
     if direction not in _DIRECTIONS:
         raise ValueError(f"Unknown direction {direction}")
@@ -345,13 +428,8 @@ def choose_schedule(
         raise ValueError("A leaf-to-root scan sums its values: it takes an additive combine")
     if not cuda or direction is Direction.PATH or plan.max_depth == 0:
         return Schedule.SERIAL
-    if plan.count <= min(lanes, 32):
-        return Schedule.JUMP_SHFL if direction is Direction.DOWN else Schedule.DFS_INTERVAL
-    if chains and plan.chain_packing(2) is not None:
-        return Schedule.HEAVY_CHAIN
-    if plan.count <= lanes:
-        return Schedule.JUMP_SMEM if direction is Direction.DOWN else Schedule.LEVEL
-    return Schedule.LEVEL
+    costs = schedule_costs(plan, direction, combine, lanes=lanes, chains=chains)
+    return min(costs, key=costs.get)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -681,21 +759,22 @@ def _interval_up(c: _Context) -> str:
         count = f"({condition})?{total}:{always}"
     else:
         count = str(total)
-    # Channel c's slot: the groups in order.
-    slot, offset = None, 0
+    # Channel c's slot, the groups in order; an idle lane addresses node 0's and never reads or writes it.
+    slot = None
     for group in reversed(groups):
         offset = sum(g.channels for g in groups[: groups.index(group)])
-        here = c.slot(group, "dfs_node", f"c-{offset}" if offset else "c")
+        here = c.slot(group, "dfs_slot", f"c-{offset}" if offset else "c")
         slot = here if slot is None else f"c<{offset + group.channels}?{here}:{slot}"
-    first_slot = slot
     return f"""    {{
     const int dfs_node=LANE<{c.nodes}?{dfs_node}:-1;
     const int dfs_length=LANE<{c.nodes}?{dfs_end}-LANE:0;
     const int dfs_count={count};
+    const int dfs_slot=dfs_node>=0?dfs_node:0;
     for(int c=0;c<{total};++c) {{
         if(c>=dfs_count)break;
+        float* const cell=&({slot});
         float w[{c.windows}];
-        w[0]=dfs_node>=0?({first_slot}):0.0f;
+        w[0]=dfs_node>=0?*cell:0.0f;
         #pragma unroll
         for(int b=1;b<{c.windows};++b) {{
             const float t=__shfl_down_sync(MASK,w[b-1],1<<(b-1),WIDTH);
@@ -708,7 +787,7 @@ def _interval_up(c: _Context) -> str:
             const float t=__shfl_sync(MASK,w[b],offset,WIDTH);
             if((dfs_length>>b)&1){{sum+=t;offset+=1<<b;}}
         }}
-        if(dfs_node>=0)({first_slot})=sum;
+        if(dfs_node>=0)*cell=sum;
     }}
     SYNC();
     }}
@@ -745,7 +824,7 @@ def tree_scan(
     access: PlanAccess | None = None,
     lanes: int | str = 32,
     sizes: dict[str, str] | None = None,
-    level_csr: bool = True,
+    level_csr: bool | None = None,
     channel_lanes: bool = False,
     source: str | None = None,
     sink: str | None = None,
@@ -763,7 +842,11 @@ def tree_scan(
         access: Plan array expressions (default: a :class:`ScanPlan` named ``plan``).
         lanes: Lanes per tree (the lane group's ``LANES``), a number or a name; the interval windows use it.
         sizes: Replacements of the plan's sizes by names: ``nodes``, ``rounds``, ``max_depth``, ``windows``.
-        level_csr: LEVEL enumerates a depth through the plan's level CSR, else by testing every node's depth.
+        level_csr: LEVEL enumerates a depth through the plan's level CSR, or by testing every node's depth. By
+            default the CSR serves a tree of more nodes than lanes; a tree the lanes cover tests depths, one
+            load per lane and level instead of three dependent ones: measured 1-24% faster on the 13 trees of
+            up to 32 nodes and 3-8% on 40- and 64-joint chains, where the CSR measured up to 13% faster on
+            bushy trees of 44-63 nodes over two warps (RTX PRO 6000).
         channel_lanes: SERIAL UP only: the lane group strides an additive value's channels (one tree per group,
             nodes in order, no barrier: a lane owns the same channels of every node).
         source: A register schedule's own-value fragment (``{value}``, ``{node}``) in place of a load.
@@ -785,6 +868,8 @@ def tree_scan(
         raise ValueError("Lanes over channels serve the serial sum of an additive combine")
     sizes = dict(sizes or {})
     nodes = sizes.get("nodes", str(plan.count))
+    if level_csr is None:
+        level_csr = isinstance(lanes, int) and "nodes" not in sizes and plan.count > lanes
     if isinstance(lanes, int):
         windows = str(lanes.bit_length() if lanes <= 32 else 6)
     else:
@@ -821,26 +906,61 @@ def tree_scan(
 
 
 @functools.cache
-def serial_scan(combine: Combine, direction: Direction):
-    """Return the Warp serial scan of ``combine`` in ``direction``: :data:`TRANSFORM`, :data:`TWIST` or an :func:`add`.
+def serial_scan(combine: Combine, direction: Direction, own, result=None, *, own_first: bool = False):
+    """Return the Warp serial schedule of ``combine``: one thread visits a joint range once, node by node.
 
-    The scan visits nodes ``start`` to ``end - 1`` (parent-first) of one tree or forest in place:
-    ``parent[i]`` is the slot of node ``i``'s parent value (``-1`` at a root) and ``slot[i]`` its own, so a
-    joint range scans body-indexed arrays through ``joint_parent`` and ``joint_child``. ``DOWN``: TRANSFORM
-    takes ``values: array[transform]``; TWIST ``velocity`` and ``acceleration`` arrays; ADD any array whose
-    values add. ``UP`` (ADD only) visits the range backwards, adding each node's value to its parent's.
+    The scan runs over nodes ``start`` to ``end - 1`` of a parent-first range in place on body-indexed values:
+    ``parent[i]`` is the slot of node ``i``'s parent (``-1`` at a root) and ``slot[i]`` node ``i``'s own. The
+    hooks are ``wp.func``; ``data`` is the struct of arrays they read, passed through.
+
+    ``DOWN`` (:data:`TRANSFORM`, :data:`TWIST`): each node's own value ``own(node, data)`` (a twist hook returns
+    the twist and its own bias acceleration) is composed with its parent's result, stored at its slot and handed
+    to ``result(node, value, data)``. The parent's result comes from registers when it is the previous node
+    (a chain), else from memory: one read of the tree per scan.
+
+    ``UP`` (:func:`add`), visiting the range backwards so that every child precedes its parent:
+
+    * ``own_first=False``: the slots hold the sums of the children visited so far (the caller zeroes them);
+      a node's value is ``own(node, children, data)``, added to its parent's slot and handed to ``result``;
+      its own slot keeps its children's sum;
+    * ``own_first=True``: a first pass stores ``own(node, data)`` at every slot, then each node's slot is added
+      to its parent's, children descending, by an atomic add (the parent's value never enters registers).
+
+    Each form reproduces the order of the serial passes it replaces.
     """
+    has_result = result is not None
     if direction is Direction.UP:
         if not combine.additive:
             raise ValueError("A leaf-to-root scan sums its values: it takes an additive combine")
+        if own_first:
+
+            @wp.func
+            def scan_up_own_first(
+                start: int, end: int, parent: wp.array[int], slot: wp.array[int], values: wp.array[Any], data: Any
+            ):
+                for node in range(start, end):
+                    values[slot[node]] = own(node, data)
+                for offset in range(end - start):
+                    node = end - 1 - offset
+                    up = parent[node]
+                    if up >= 0:
+                        # An atomic add: the parent's value is never read into registers.
+                        values[up] += values[slot[node]]
+                    if wp.static(has_result):
+                        result(node, values[slot[node]], data)
+
+            return scan_up_own_first
 
         @wp.func
-        def scan_up(start: int, end: int, parent: wp.array[int], slot: wp.array[int], values: wp.array[Any]):
+        def scan_up(start: int, end: int, parent: wp.array[int], slot: wp.array[int], values: wp.array[Any], data: Any):
             for offset in range(end - start):
                 node = end - 1 - offset
+                value = own(node, values[slot[node]], data)
                 up = parent[node]
                 if up >= 0:
-                    values[up] = values[up] + values[slot[node]]
+                    values[up] = values[up] + value
+                if wp.static(has_result):
+                    result(node, value, data)
 
         return scan_up
     if direction is not Direction.DOWN:
@@ -849,12 +969,23 @@ def serial_scan(combine: Combine, direction: Direction):
 
         @wp.func
         def scan_transform(
-            start: int, end: int, parent: wp.array[int], slot: wp.array[int], values: wp.array[wp.transform]
+            start: int, end: int, parent: wp.array[int], slot: wp.array[int], values: wp.array[wp.transform], data: Any
         ):
+            last = int(-1)
+            last_value = wp.transform_identity()
             for node in range(start, end):
+                value = own(node, data)
                 up = parent[node]
                 if up >= 0:
-                    values[slot[node]] = transform_compose(values[up], values[slot[node]])
+                    above = last_value
+                    if up != last:
+                        above = values[up]
+                    value = transform_compose(above, value)
+                last = slot[node]
+                last_value = value
+                values[last] = value
+                if wp.static(has_result):
+                    result(node, value, data)
 
         return scan_transform
     if combine.name == "twist":
@@ -867,27 +998,31 @@ def serial_scan(combine: Combine, direction: Direction):
             slot: wp.array[int],
             velocity: wp.array[wp.spatial_vector],
             acceleration: wp.array[wp.spatial_vector],
+            data: Any,
         ):
+            last = int(-1)
+            last_v = wp.spatial_vector()
+            last_a = wp.spatial_vector()
             for node in range(start, end):
+                v, a = own(node, data)
                 up = parent[node]
                 if up >= 0:
-                    own = slot[node]
-                    v, a = twist_compose(velocity[up], acceleration[up], velocity[own], acceleration[own])
-                    velocity[own] = v
-                    acceleration[own] = a
+                    above_v = last_v
+                    above_a = last_a
+                    if up != last:
+                        above_v = velocity[up]
+                        above_a = acceleration[up]
+                    v, a = twist_compose(above_v, above_a, v, a)
+                last = slot[node]
+                last_v = v
+                last_a = a
+                velocity[last] = v
+                acceleration[last] = a
+                if wp.static(has_result):
+                    result(node, v, a, data)
 
         return scan_twist
-    if combine.additive:
-
-        @wp.func
-        def scan_add(start: int, end: int, parent: wp.array[int], slot: wp.array[int], values: wp.array[Any]):
-            for node in range(start, end):
-                up = parent[node]
-                if up >= 0:
-                    values[slot[node]] = values[up] + values[slot[node]]
-
-        return scan_add
-    raise ValueError(f"Unknown combine {combine.name!r}")
+    raise ValueError(f"No serial down scan of {combine.name!r}")
 
 
 def native_scan(text: ScanSource, lanes: int | str, extra: tuple[DevicePrelude, ...] = ()) -> str:

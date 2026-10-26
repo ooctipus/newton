@@ -510,7 +510,7 @@ class TreePlan:
             [np.arange(start[node + 1] - 1, start[node] - 1, -1) for node in self.dfs_order[::-1]]
         ).astype(np.int32)
         inverse = np.argsort(permutation).astype(np.int32)
-        dof_joint = np.repeat(np.arange(self.count, dtype=np.int32), self.dofs)
+        dof_joint = self.dof_node
         # Support of each node in factor coordinates: the coordinates of its ancestors and itself.
         support = np.zeros((self.count, n), dtype=bool)
         support[:, inverse] = self.ancestor_matrix()[:, dof_joint]

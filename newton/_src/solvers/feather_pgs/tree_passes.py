@@ -4,21 +4,26 @@
 """The general route's dynamics passes as tree-scan configurations: FK, ID, tau, composite inertia and CRBA.
 
 One thread per articulation, in Warp (differentiable), as the serial route
-runs today. Each pass is three steps over the articulation's tree joints: a
-map that forms every node's own value, one :func:`.tree_scan.serial_scan`, and a
-map that consumes the results. Values live in the body-indexed arrays the
-solver already holds; a joint's slot is its child body and its parent slot its
-parent body (``joint_parent``).
+runs today. Each pass is the serial schedule of :func:`.tree_scan.serial_scan`
+over the articulation's tree joints with the pass's per-node laws as hooks:
+the node's own value and the consumer of its result, in the same visit, so
+the scan reads and writes the tree once. Values live in the body-indexed
+arrays the solver already holds; a joint's slot is its child body and its
+parent slot its parent body (``joint_parent``). The arrays the hooks read are
+bound into one struct per pass.
 
-* :data:`fk_kinematics`: relative poses ``X_p X_j X_c^-1``, the TRANSFORM scan,
-  COM poses and the articulation origin; then each joint's relative twist about
-  the origin, the TWIST scan (zero own acceleration: the velocity-product pass).
-* :data:`fk_id`: the same, then each body's inverse-dynamics wrench.
-* :data:`inverse_dynamics_tau`: each body's net wrench less its external one,
-  the ADD scan up, then the joint forces.
-* :data:`composite_inertia`: the ADD scan up of the 36 inertia channels.
-* :data:`crba_fill`: a PATH from each column's joint, its joint read from the
-  plan's coordinate-to-node table instead of a search.
+* :data:`fk_kinematics`: TRANSFORM down from each joint's pose in its parent,
+  ``X_p X_j X_c^-1``, publishing COM poses; then TWIST down from each joint's
+  relative twist about the origin (zero own acceleration: the velocity
+  product).
+* :data:`fk_id`: the same, each body's inverse-dynamics wrench formed as its
+  twist completes.
+* :data:`inverse_dynamics_tau`: ADD up, each body's net wrench from its
+  children's sum, then its joint forces.
+* :data:`composite_inertia`: ADD up of the 36 inertia channels, own values
+  first; :func:`composite_inertia_lanes` the solver's warp-per-articulation
+  form, lanes over the channels.
+* :data:`crba_fill`: a PATH from each column's joint to the root.
 
 The per-node laws are the solver's own (``kernels``); only the traversal is the
 scan's.
@@ -44,85 +49,122 @@ from .tree_scan import TRANSFORM, TWIST, Direction, Group, PlanAccess, Schedule,
 
 # The serial scans of a joint range need no tree literal: a parent-first plan stands for every range.
 _SERIAL_PLAN = TreePlan.build([-1])
-_POSES = serial_scan(TRANSFORM, Direction.DOWN)
-_TWISTS = serial_scan(TWIST, Direction.DOWN)
-_SUBTREE_SUM = serial_scan(add(Group("value", 1)), Direction.UP)
+_SUM = add(Group("value", 1))
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Kinematics and inverse dynamics: the hooks of the down scans
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+@wp.struct
+class _Poses:
+    joint_type: wp.array[int]
+    joint_child: wp.array[int]
+    joint_q_start: wp.array[int]
+    joint_qd_start: wp.array[int]
+    joint_q: wp.array[float]
+    joint_X_p: wp.array[wp.transform]
+    joint_X_c: wp.array[wp.transform]
+    joint_axis: wp.array[wp.vec3]
+    joint_dof_dim: wp.array2d[int]
+    body_X_com: wp.array[wp.transform]
+    body_q_com: wp.array[wp.transform]
 
 
 @wp.func
-def _relative_poses(
-    start: int,
-    end: int,
-    joint_type: wp.array[int],
-    joint_parent: wp.array[int],
-    joint_child: wp.array[int],
-    joint_q_start: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_q: wp.array[float],
-    joint_X_p: wp.array[wp.transform],
-    joint_X_c: wp.array[wp.transform],
-    body_X_com: wp.array[wp.transform],
-    joint_axis: wp.array[wp.vec3],
-    joint_dof_dim: wp.array2d[int],
-    body_q: wp.array[wp.transform],
-    body_q_com: wp.array[wp.transform],
-):
-    """World poses of the tree's bodies: each joint's pose in its parent, then the pose scan."""
-    for i in range(start, end):
-        X_j = joint_transform(
-            joint_type[i],
-            joint_axis,
-            joint_qd_start[i],
-            joint_dof_dim[i, 0],
-            joint_dof_dim[i, 1],
-            joint_q,
-            joint_q_start[i],
-        )
-        body_q[joint_child[i]] = joint_X_p[i] * X_j * wp.transform_inverse(joint_X_c[i])
-    _POSES(start, end, joint_parent, joint_child, body_q)
-    for i in range(start, end):
-        child = joint_child[i]
-        body_q_com[child] = body_q[child] * body_X_com[child]
+def _relative_pose(node: int, d: _Poses) -> wp.transform:
+    """A joint's child pose in its parent body's frame: ``X_p X_j X_c^-1``."""
+    X_j = joint_transform(
+        d.joint_type[node],
+        d.joint_axis,
+        d.joint_qd_start[node],
+        d.joint_dof_dim[node, 0],
+        d.joint_dof_dim[node, 1],
+        d.joint_q,
+        d.joint_q_start[node],
+    )
+    return d.joint_X_p[node] * X_j * wp.transform_inverse(d.joint_X_c[node])
 
 
 @wp.func
-def _twists(
-    start: int,
-    end: int,
-    origin: wp.vec3,
-    joint_type: wp.array[int],
-    joint_parent: wp.array[int],
-    joint_child: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_qd: wp.array[float],
-    joint_X_p: wp.array[wp.transform],
-    joint_axis: wp.array[wp.vec3],
-    joint_dof_dim: wp.array2d[int],
-    body_q: wp.array[wp.transform],
-    joint_S_s: wp.array[wp.spatial_vector],
-    body_v_s: wp.array[wp.spatial_vector],
-    body_a_s: wp.array[wp.spatial_vector],
-):
-    """Body twists and velocity-product accelerations about the origin: relative twists, then the twist scan."""
-    for i in range(start, end):
-        parent = joint_parent[i]
-        anchor = joint_X_p[i]
-        if parent >= 0:
-            anchor = body_q[parent] * anchor
-        local = wp.transform(wp.transform_get_translation(anchor) - origin, wp.transform_get_rotation(anchor))
-        child = joint_child[i]
-        body_v_s[child] = jcalc_motion(
-            joint_type[i],
-            joint_axis,
-            joint_dof_dim[i, 0],
-            joint_dof_dim[i, 1],
-            local,
-            joint_qd,
-            joint_qd_start[i],
-            joint_S_s,
-        )
-        body_a_s[child] = wp.spatial_vector()
-    _TWISTS(start, end, joint_parent, joint_child, body_v_s, body_a_s)
+def _com_pose(node: int, pose: wp.transform, d: _Poses):
+    child = d.joint_child[node]
+    d.body_q_com[child] = pose * d.body_X_com[child]
+
+
+@wp.struct
+class _Twists:
+    origin: wp.vec3
+    gravity: wp.vec3
+    write_body_inertia: int
+    write_body_inertia_terms: int
+    joint_type: wp.array[int]
+    joint_parent: wp.array[int]
+    joint_child: wp.array[int]
+    joint_qd_start: wp.array[int]
+    joint_qd: wp.array[float]
+    joint_X_p: wp.array[wp.transform]
+    joint_axis: wp.array[wp.vec3]
+    joint_dof_dim: wp.array2d[int]
+    body_q: wp.array[wp.transform]
+    body_q_com: wp.array[wp.transform]
+    body_mass: wp.array[float]
+    body_inertia: wp.array[wp.mat33]
+    joint_S_s: wp.array[wp.spatial_vector]
+    body_I_s: wp.array[wp.spatial_matrix]
+    body_inertia_terms: wp.array2d[float]
+    body_f_s: wp.array[wp.spatial_vector]
+
+
+@wp.func
+def _relative_twist(node: int, d: _Twists):
+    """A joint's relative twist about the origin, its motion columns stored; no own acceleration."""
+    parent = d.joint_parent[node]
+    anchor = d.joint_X_p[node]
+    if parent >= 0:
+        anchor = d.body_q[parent] * anchor
+    local = wp.transform(wp.transform_get_translation(anchor) - d.origin, wp.transform_get_rotation(anchor))
+    velocity = jcalc_motion(
+        d.joint_type[node],
+        d.joint_axis,
+        d.joint_dof_dim[node, 0],
+        d.joint_dof_dim[node, 1],
+        local,
+        d.joint_qd,
+        d.joint_qd_start[node],
+        d.joint_S_s,
+    )
+    return velocity, wp.spatial_vector()
+
+
+@wp.func
+def _body_wrench(node: int, v_s: wp.spatial_vector, a_s: wp.spatial_vector, d: _Twists):
+    """A body's inverse-dynamics wrench at the origin, as its twist completes (``kernels.compute_link_velocity``)."""
+    child = d.joint_child[node]
+    X_sm = d.body_q_com[child]
+    X_sm_local = wp.transform(wp.transform_get_translation(X_sm) - d.origin, wp.transform_get_rotation(X_sm))
+    mass = d.body_mass[child]
+    f_g = mass * d.gravity
+    com, inertia_origin = transform_com_inertia_terms(X_sm_local, mass, d.body_inertia[child])
+    f_g_s = wp.spatial_vector(f_g, wp.cross(com, f_g))
+    if d.write_body_inertia != 0:
+        d.body_I_s[child] = assemble_com_spatial_inertia(mass, com, inertia_origin)
+    if d.write_body_inertia_terms != 0:
+        d.body_inertia_terms[child, 0] = com[0]
+        d.body_inertia_terms[child, 1] = com[1]
+        d.body_inertia_terms[child, 2] = com[2]
+        for row in range(3):
+            for col in range(3):
+                d.body_inertia_terms[child, 3 + 3 * row + col] = inertia_origin[row, col]
+    coriolis = spatial_cross_dual(v_s, mul_com_spatial_inertia(mass, com, inertia_origin, v_s))
+    f_b_s = mul_com_spatial_inertia(mass, com, inertia_origin, a_s) + coriolis
+    d.body_f_s[child] = f_b_s - f_g_s
+
+
+_POSES = serial_scan(TRANSFORM, Direction.DOWN, _relative_pose, _com_pose)
+_TWISTS = serial_scan(TWIST, Direction.DOWN, _relative_twist)
+_TWISTS_AND_WRENCHES = serial_scan(TWIST, Direction.DOWN, _relative_twist, _body_wrench)
 
 
 @wp.func
@@ -140,6 +182,64 @@ def _origin(
         if root_body >= 0:
             origin = wp.transform_point(body_q[root_body], body_com[root_body])
     return origin
+
+
+@wp.func
+def _bind_poses(
+    joint_type: wp.array[int],
+    joint_child: wp.array[int],
+    joint_q_start: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_q: wp.array[float],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_dof_dim: wp.array2d[int],
+    body_X_com: wp.array[wp.transform],
+    body_q_com: wp.array[wp.transform],
+) -> _Poses:
+    d = _Poses()
+    d.joint_type = joint_type
+    d.joint_child = joint_child
+    d.joint_q_start = joint_q_start
+    d.joint_qd_start = joint_qd_start
+    d.joint_q = joint_q
+    d.joint_X_p = joint_X_p
+    d.joint_X_c = joint_X_c
+    d.joint_axis = joint_axis
+    d.joint_dof_dim = joint_dof_dim
+    d.body_X_com = body_X_com
+    d.body_q_com = body_q_com
+    return d
+
+
+@wp.func
+def _bind_twists(
+    origin: wp.vec3,
+    joint_type: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_qd_start: wp.array[int],
+    joint_qd: wp.array[float],
+    joint_X_p: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    joint_dof_dim: wp.array2d[int],
+    body_q: wp.array[wp.transform],
+    joint_S_s: wp.array[wp.spatial_vector],
+) -> _Twists:
+    d = _Twists()
+    d.origin = origin
+    d.joint_type = joint_type
+    d.joint_parent = joint_parent
+    d.joint_child = joint_child
+    d.joint_qd_start = joint_qd_start
+    d.joint_qd = joint_qd
+    d.joint_X_p = joint_X_p
+    d.joint_axis = joint_axis
+    d.joint_dof_dim = joint_dof_dim
+    d.body_q = body_q
+    d.joint_S_s = joint_S_s
+    return d
 
 
 @wp.kernel(enable_backward=False)
@@ -168,32 +268,27 @@ def fk_kinematics(
     body_a_s: wp.array[wp.spatial_vector],
     fk_id_cache_valid: wp.array[int],
 ):
-    """``kernels.eval_rigid_fk_kinematics`` as two scans: poses, then twists about the origin."""
+    """``kernels.eval_rigid_fk_kinematics`` as two serial scans: poses, then twists about the origin."""
     index = wp.tid()
     start = articulation_start[index]
     end = articulation_joint_end[index]
-    _relative_poses(
-        start,
-        end,
+    poses = _bind_poses(
         joint_type,
-        joint_parent,
         joint_child,
         joint_q_start,
         joint_qd_start,
         joint_q,
         joint_X_p,
         joint_X_c,
-        body_X_com,
         joint_axis,
         joint_dof_dim,
-        body_q,
+        body_X_com,
         body_q_com,
     )
+    _POSES(start, end, joint_parent, joint_child, body_q, poses)
     origin = _origin(start, articulation_start[index + 1], joint_child, body_q, body_com)
     articulation_origin[index] = origin
-    _twists(
-        start,
-        end,
+    twists = _bind_twists(
         origin,
         joint_type,
         joint_parent,
@@ -205,9 +300,8 @@ def fk_kinematics(
         joint_dof_dim,
         body_q,
         joint_S_s,
-        body_v_s,
-        body_a_s,
     )
+    _TWISTS(start, end, joint_parent, joint_child, body_v_s, body_a_s, twists)
     fk_id_cache_valid[index] = 1
 
 
@@ -247,34 +341,29 @@ def fk_id(
     body_a_s: wp.array[wp.spatial_vector],
     fk_id_cache_valid: wp.array[int],
 ):
-    """``kernels.eval_rigid_fk_id`` as two scans and a body map: the inverse-dynamics wrench of every body."""
+    """``kernels.eval_rigid_fk_id`` as two serial scans, each body's wrench formed as its twist completes."""
     index = wp.tid()
     if reuse_cached != 0 and fk_id_cache_valid[index] != 0:
         return
     start = articulation_start[index]
     end = articulation_joint_end[index]
-    _relative_poses(
-        start,
-        end,
+    poses = _bind_poses(
         joint_type,
-        joint_parent,
         joint_child,
         joint_q_start,
         joint_qd_start,
         joint_q,
         joint_X_p,
         joint_X_c,
-        body_X_com,
         joint_axis,
         joint_dof_dim,
-        body_q,
+        body_X_com,
         body_q_com,
     )
+    _POSES(start, end, joint_parent, joint_child, body_q, poses)
     origin = _origin(start, articulation_start[index + 1], joint_child, body_q, body_com)
     articulation_origin[index] = origin
-    _twists(
-        start,
-        end,
+    twists = _bind_twists(
         origin,
         joint_type,
         joint_parent,
@@ -286,35 +375,86 @@ def fk_id(
         joint_dof_dim,
         body_q,
         joint_S_s,
-        body_v_s,
-        body_a_s,
     )
-    write_body_inertia = materialize_all_body_inertia
+    twists.gravity = gravity[0]
+    twists.write_body_inertia = materialize_all_body_inertia
     if is_free_rigid[index] != 0:
-        write_body_inertia = 1
-    gravity_s = gravity[0]
-    for i in range(start, end):
-        child = joint_child[i]
-        X_sm = body_q_com[child]
-        X_sm_local = wp.transform(wp.transform_get_translation(X_sm) - origin, wp.transform_get_rotation(X_sm))
-        mass = body_mass[child]
-        f_g = mass * gravity_s
-        com, inertia_origin = transform_com_inertia_terms(X_sm_local, mass, body_inertia[child])
-        f_g_s = wp.spatial_vector(f_g, wp.cross(com, f_g))
-        if write_body_inertia != 0:
-            body_I_s[child] = assemble_com_spatial_inertia(mass, com, inertia_origin)
-        if materialize_body_inertia_terms != 0:
-            body_inertia_terms[child, 0] = com[0]
-            body_inertia_terms[child, 1] = com[1]
-            body_inertia_terms[child, 2] = com[2]
-            for row in range(3):
-                for col in range(3):
-                    body_inertia_terms[child, 3 + 3 * row + col] = inertia_origin[row, col]
-        v_s = body_v_s[child]
-        coriolis = spatial_cross_dual(v_s, mul_com_spatial_inertia(mass, com, inertia_origin, v_s))
-        f_b_s = mul_com_spatial_inertia(mass, com, inertia_origin, body_a_s[child]) + coriolis
-        body_f_s[child] = f_b_s - f_g_s
+        twists.write_body_inertia = 1
+    twists.write_body_inertia_terms = materialize_body_inertia_terms
+    twists.body_q_com = body_q_com
+    twists.body_mass = body_mass
+    twists.body_inertia = body_inertia
+    twists.body_I_s = body_I_s
+    twists.body_inertia_terms = body_inertia_terms
+    twists.body_f_s = body_f_s
+    _TWISTS_AND_WRENCHES(start, end, joint_parent, joint_child, body_v_s, body_a_s, twists)
     fk_id_cache_valid[index] = 1
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Joint forces and composite inertia: the up scans
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+@wp.struct
+class _Forces:
+    add_existing_tau: int
+    joint_type: wp.array[int]
+    joint_child: wp.array[int]
+    joint_articulation: wp.array[int]
+    joint_qd_start: wp.array[int]
+    joint_q_start: wp.array[int]
+    joint_dof_dim: wp.array2d[int]
+    joint_f: wp.array[float]
+    joint_q: wp.array[float]
+    joint_qd: wp.array[float]
+    joint_spring_stiffness: wp.array[float]
+    joint_spring_ref: wp.array[float]
+    joint_damping: wp.array[float]
+    joint_S_s: wp.array[wp.spatial_vector]
+    body_fb_s: wp.array[wp.spatial_vector]
+    body_f_ext: wp.array[wp.spatial_vector]
+    body_flags: wp.array[wp.int32]
+    body_q: wp.array[wp.transform]
+    body_com: wp.array[wp.vec3]
+    articulation_origin: wp.array[wp.vec3]
+    tau: wp.array[float]
+
+
+@wp.func
+def _net_wrench(node: int, children: wp.spatial_vector, d: _Forces) -> wp.spatial_vector:
+    """A body's wrench on its joint: its own, its subtree's, less its external wrench at the origin."""
+    articulation = d.joint_articulation[node]
+    origin = wp.vec3()
+    if articulation >= 0:
+        origin = d.articulation_origin[articulation]
+    return _compute_body_net_wrench(
+        d.joint_child[node], children, origin, d.body_fb_s, d.body_f_ext, d.body_flags, d.body_q, d.body_com
+    )
+
+
+@wp.func
+def _joint_force(node: int, wrench: wp.spatial_vector, d: _Forces):
+    jcalc_tau(
+        d.joint_type[node],
+        d.joint_S_s,
+        d.joint_f,
+        d.joint_q,
+        d.joint_qd,
+        d.joint_spring_stiffness,
+        d.joint_spring_ref,
+        d.joint_damping,
+        d.joint_q_start[node],
+        d.joint_qd_start[node],
+        d.joint_dof_dim[node, 0],
+        d.joint_dof_dim[node, 1],
+        wrench,
+        d.add_existing_tau,
+        d.tau,
+    )
+
+
+_JOINT_FORCES = serial_scan(_SUM, Direction.UP, _net_wrench, _joint_force)
 
 
 @wp.kernel(enable_backward=False)
@@ -346,41 +486,45 @@ def inverse_dynamics_tau(
     body_ft_s: wp.array[wp.spatial_vector],
     tau: wp.array[float],
 ):
-    """``kernels.eval_rigid_tau`` as one scan up: each body's subtree wrench, then the joint forces.
-
-    ``body_ft_s`` holds each body's subtree wrench (the existing kernel leaves its children's sum there).
-    """
+    """``kernels.eval_rigid_tau`` (and ``_add``) as one serial scan up: ``body_ft_s`` holds the children's sums."""
     index = wp.tid()
-    start = articulation_start[index]
-    end = articulation_joint_end[index]
-    for i in range(start, end):
-        child = joint_child[i]
-        articulation = joint_articulation[i]
-        origin = wp.vec3()
-        if articulation >= 0:
-            origin = articulation_origin[articulation]
-        body_ft_s[child] = _compute_body_net_wrench(
-            child, wp.spatial_vector(), origin, body_fb_s, body_f_ext, body_flags, body_q, body_com
-        )
-    _SUBTREE_SUM(start, end, joint_parent, joint_child, body_ft_s)
-    for i in range(start, end):
-        jcalc_tau(
-            joint_type[i],
-            joint_S_s,
-            joint_f,
-            joint_q,
-            joint_qd,
-            joint_spring_stiffness,
-            joint_spring_ref,
-            joint_damping,
-            joint_q_start[i],
-            joint_qd_start[i],
-            joint_dof_dim[i, 0],
-            joint_dof_dim[i, 1],
-            body_ft_s[joint_child[i]],
-            add_existing_tau,
-            tau,
-        )
+    d = _Forces()
+    d.add_existing_tau = add_existing_tau
+    d.joint_type = joint_type
+    d.joint_child = joint_child
+    d.joint_articulation = joint_articulation
+    d.joint_qd_start = joint_qd_start
+    d.joint_q_start = joint_q_start
+    d.joint_dof_dim = joint_dof_dim
+    d.joint_f = joint_f
+    d.joint_q = joint_q
+    d.joint_qd = joint_qd
+    d.joint_spring_stiffness = joint_spring_stiffness
+    d.joint_spring_ref = joint_spring_ref
+    d.joint_damping = joint_damping
+    d.joint_S_s = joint_S_s
+    d.body_fb_s = body_fb_s
+    d.body_f_ext = body_f_ext
+    d.body_flags = body_flags
+    d.body_q = body_q
+    d.body_com = body_com
+    d.articulation_origin = articulation_origin
+    d.tau = tau
+    _JOINT_FORCES(articulation_start[index], articulation_joint_end[index], joint_parent, joint_child, body_ft_s, d)
+
+
+@wp.struct
+class _Inertias:
+    joint_child: wp.array[int]
+    body_I_s: wp.array[wp.spatial_matrix]
+
+
+@wp.func
+def _body_inertia(node: int, d: _Inertias) -> wp.spatial_matrix:
+    return d.body_I_s[d.joint_child[node]]
+
+
+_COMPOSITE = serial_scan(_SUM, Direction.UP, _body_inertia, own_first=True)
 
 
 @wp.kernel(enable_backward=False)
@@ -394,27 +538,25 @@ def composite_inertia(
     # outputs
     body_I_c: wp.array[wp.spatial_matrix],
 ):
-    """``kernels.compute_composite_inertia`` as one scan up of the 36 inertia channels."""
+    """``kernels.compute_composite_inertia`` as one serial scan up of the 36 inertia channels, own values first."""
     index = wp.tid()
     if mass_update_mask[index] == 0:
         return
-    start = articulation_start[index]
-    end = articulation_joint_end[index]
-    for i in range(start, end):
-        body_I_c[joint_child[i]] = body_I_s[joint_child[i]]
-    _SUBTREE_SUM(start, end, joint_parent, joint_child, body_I_c)
+    d = _Inertias()
+    d.joint_child = joint_child
+    d.body_I_s = body_I_s
+    _COMPOSITE(articulation_start[index], articulation_joint_end[index], joint_parent, joint_child, body_I_c, d)
 
 
 @wp.kernel(enable_backward=False)
 def crba_fill(
+    articulation_start: wp.array[int],
     articulation_dof_start: wp.array[int],
     mass_update_mask: wp.array[int],
     joint_ancestor: wp.array[int],
     joint_child: wp.array[int],
     joint_qd_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
-    articulation_start: wp.array[int],
-    dof_joint: wp.array[int],
     joint_S_s: wp.array[wp.spatial_vector],
     body_I_c: wp.array[wp.spatial_matrix],
     group_to_art: wp.array[int],
@@ -425,7 +567,16 @@ def crba_fill(
     # outputs
     H_group: wp.array3d[float],
 ):
-    """``kernels.crba_fill_par_dof`` as a path from each column's joint, read from the plan's coordinate table."""
+    """``kernels.crba_fill_par_dof``: a PATH from each column's joint, one thread per (articulation, column).
+
+    Each entry is written once. Two coordinates ``i < j`` of one joint share the entries ``(i, j)`` and
+    ``(j, i)``; column ``j`` writes them with ``S_i . (I S_j)``, the value a serial run leaves, where
+    the existing kernel lets both columns write both and the schedule decide.
+
+    The column's joint is found by searching the articulation's coordinate ranges: reading it from the
+    plan's coordinate table instead measured 3-6% faster on trees of 13-30 joints but 27% slower on a
+    64-joint chain (RTX PRO 6000), so the search stays.
+    """
     tid = wp.tid()
     group = tid // n_dofs
     col = tid % n_dofs
@@ -435,16 +586,27 @@ def crba_fill(
     first_dof = articulation_dof_start[art]
     column_dof = first_dof + col
     joint_start = articulation_start[art]
-    pivot = dof_joint[column_dof]
-    force = body_I_c[joint_child[pivot]] * joint_S_s[column_dof]
+    pivot = int(-1)
+    for j in range(joint_start, articulation_start[art + 1]):
+        if column_dof >= joint_qd_start[j] and column_dof < joint_qd_start[j + 1]:
+            pivot = j
+            break
+    if pivot == -1:
+        return
+    S_col = joint_S_s[column_dof]
+    I_comp = body_I_c[joint_child[pivot]]
+    force = I_comp * S_col
     ancestor = pivot
     while ancestor != -1:
         if ancestor < joint_start:
             break
         q_start = joint_qd_start[ancestor]
         q_dim = joint_dof_dim[ancestor]
+        count = q_dim[0] + q_dim[1]
         local = q_start - first_dof
-        for k in range(q_dim[0] + q_dim[1]):
+        if ancestor == pivot:
+            count = col - local + 1
+        for k in range(count):
             row = local + k
             value = wp.dot(joint_S_s[q_start + k], force)
             if fused_augmented_drive != 0 and row == col:

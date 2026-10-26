@@ -385,29 +385,29 @@ class TestSerialTwin(unittest.TestCase):
 
 class TestScheduleRule(unittest.TestCase):
     def test_rule(self):
-        """Warp-sized trees jump by shuffles and reduce by intervals; wider ones take packed chains, else
-        jump through shared memory and reduce by levels; the CPU and paths are serial."""
-        add = ts.add(ts.Group("wrench", 6))
-        expected = {}
+        """The rule follows the plan's data: warp-sized trees jump by shuffles; narrow ones sum along heavy chains,
+        bushy ones (a star, a binary tree, chains needing two warps) by intervals; wide ones jump through shared
+        memory and sum by levels where no chains pack; the CPU and paths run serially."""
+        add6 = ts.add(ts.Group("wrench", 6))
+        picks = {}
         for shape in SHAPES:
             plan = plan_of(shape)
             lanes = lanes_of(plan)
             down = ts.choose_schedule(plan, ts.Direction.DOWN, ts.TRANSFORM, cuda=True, lanes=lanes)
-            up = ts.choose_schedule(plan, ts.Direction.UP, add, cuda=True, lanes=lanes)
-            expected[shape] = (down, up)
-            self.assertIs(
-                ts.choose_schedule(plan, ts.Direction.DOWN, ts.TRANSFORM, cuda=False, lanes=lanes), ts.Schedule.SERIAL
-            )
-            self.assertIs(ts.choose_schedule(plan, ts.Direction.PATH, add, cuda=True, lanes=lanes), ts.Schedule.SERIAL)
-            # The same data, the same choice.
-            self.assertIs(
-                ts.choose_schedule(plan_of(shape), ts.Direction.DOWN, ts.TRANSFORM, cuda=True, lanes=lanes), down
-            )
-        self.assertEqual(expected["anymal13"], (ts.Schedule.JUMP_SHFL, ts.Schedule.DFS_INTERVAL))
-        self.assertEqual(expected["g1_30"], (ts.Schedule.JUMP_SHFL, ts.Schedule.DFS_INTERVAL))
-        self.assertEqual(expected["humanoid44"], (ts.Schedule.HEAVY_CHAIN, ts.Schedule.HEAVY_CHAIN))
-        self.assertEqual(expected["chain64"], (ts.Schedule.JUMP_SMEM, ts.Schedule.LEVEL))
-        self.assertEqual(expected["pendulum2"][0], ts.Schedule.JUMP_SHFL)
+            up = ts.choose_schedule(plan, ts.Direction.UP, add6, cuda=True, lanes=lanes)
+            picks[shape] = (down, up)
+            cpu = ts.choose_schedule(plan, ts.Direction.DOWN, ts.TRANSFORM, cuda=False, lanes=lanes)
+            self.assertIs(cpu, ts.Schedule.SERIAL)
+            self.assertIs(ts.choose_schedule(plan, ts.Direction.PATH, add6, cuda=True, lanes=lanes), ts.Schedule.SERIAL)
+            # The same data, the same choice; a launch packing several trees per block leaves no heavy chain.
+            again = ts.choose_schedule(plan_of(shape), ts.Direction.UP, add6, cuda=True, lanes=lanes)
+            self.assertIs(again, up)
+            packed = ts.choose_schedule(plan, ts.Direction.UP, add6, cuda=True, lanes=lanes, chains=False)
+            self.assertIsNot(packed, ts.Schedule.HEAVY_CHAIN)
+        self.assertEqual(picks["anymal13"], (ts.Schedule.JUMP_SHFL, ts.Schedule.HEAVY_CHAIN))
+        self.assertEqual(picks["g1_30"], (ts.Schedule.JUMP_SHFL, ts.Schedule.DFS_INTERVAL))
+        self.assertEqual(picks["binary31"], (ts.Schedule.JUMP_SHFL, ts.Schedule.DFS_INTERVAL))
+        self.assertEqual(picks["chain64"], (ts.Schedule.JUMP_SMEM, ts.Schedule.LEVEL))
         with self.assertRaises(ValueError):
             ts.choose_schedule(plan_of("ant9"), ts.Direction.UP, ts.TRANSFORM, cuda=True, lanes=32)
 
@@ -425,32 +425,47 @@ class TestScheduleRule(unittest.TestCase):
 
 
 def check_general_route(test, device):
-    """The serial kernels and their scan configurations: composite inertia and CRBA bitwise (but for CRBA's
-    racing entries), FK and tau within a few units of their terms (the scans regroup the compositions)."""
-    from newton.tests.feather_pgs_tree_scan_fixture import articulated_model, serial_compare  # noqa: PLC0415
+    """The serial kernels and their scan configurations, one serial scan per pass with fused per-node laws.
+
+    Tau, composite inertia (all three forms) and CRBA keep their arithmetic order: bitwise, but for the
+    entries the existing CRBA kernel races on (CUDA). FK and ID compose a joint's pose and twist as the held
+    tree does, ``X_p (X_pj X_j X_c^-1)`` and ``a_p + v_p x v_j``, where the serial kernels compute
+    ``((X_p X_pj) X_j) X_c^-1`` and ``a_p + (v_p + v_j) x v_j``: equal in exact arithmetic, within a few
+    units of the largest value on a 64-joint chain.
+    """
+    from newton.tests.feather_pgs_tree_scan_fixture import (  # noqa: PLC0415
+        articulated_model,
+        crba_shared,
+        serial_compare,
+    )
 
     model = articulated_model(("anymal13", "humanoid13", "g1_30", "chain64", "random60", "pendulum2"), 2, device)
     results = serial_compare(model)
-    expected = (
-        set(SERIAL_PASSES)
-        if wp.get_device(device).is_cuda
-        else {p for p in SERIAL_PASSES if "_warp" not in p and "_compact" not in p}
-    )
-    test.assertEqual(set(results), expected)
-    for key in ("composite_inertia", "composite_inertia_warp", "composite_inertia_compact"):
-        if key in results:
-            a, b = results[key]["body_I_c"]
-            np.testing.assert_array_equal(a.view(np.uint32), b.view(np.uint32), err_msg=key)
-    # CRBA: two column threads of one multi-coordinate joint write each other's off-diagonal entry with
-    # S_i.(I S_j) and S_j.(I S_i): which one lands depends on scheduling, in both kernels. Elsewhere bitwise.
-    a, b = results["crba"]["H"]
-    differ = np.flatnonzero(a.view(np.uint32) != b.view(np.uint32))
-    test.assertLess(differ.size, a.size // 100)
-    for key, bound in (
-        ("fk_kinematics", 64.0),
-        ("fk_id", 256.0),
-        ("tau", 64.0),
+    cuda = wp.get_device(device).is_cuda
+    test.assertEqual(set(results), {p for p in SERIAL_PASSES if cuda or not p.startswith("composite_inertia_")})
+    for key, output in (
+        ("tau", "tau"),
+        ("composite_inertia", "body_I_c"),
+        ("composite_inertia_warp", "body_I_c"),
+        ("composite_inertia_compact", "body_I_c"),
     ):
+        if key in results:
+            a, b = results[key][output]
+            np.testing.assert_array_equal(a.view(np.uint32), b.view(np.uint32), err_msg=key)
+    # CRBA: in the existing kernel two column threads of one multi-coordinate joint both write the joint's
+    # off-diagonal entries, S_i.(I S_j) and S_j.(I S_i), and the schedule decides which lands. The scan
+    # writes each once, the later column's as a serial run leaves it: bitwise on CPU; on CUDA bitwise but at
+    # those entries, there within rounding, and exactly symmetric.
+    a, b = results["crba"]["H"]
+    shared, mirror = crba_shared(model)
+    np.testing.assert_array_equal(b.view(np.uint32)[mirror], b.view(np.uint32), err_msg="crba symmetry")
+    if cuda:
+        np.testing.assert_array_equal(a.view(np.uint32)[~shared], b.view(np.uint32)[~shared], err_msg="crba")
+        gap = np.abs(a[shared].astype(np.float64) - b[shared]).max(initial=0.0) / np.abs(a).max() / EPS
+        test.assertLess(gap, 8.0, "crba shared entries")
+    else:
+        np.testing.assert_array_equal(a.view(np.uint32), b.view(np.uint32), err_msg="crba")
+    for key, bound in (("fk_kinematics", 32.0), ("fk_id", 96.0)):
         for output, (existing, generated) in results[key].items():
             scale = max(float(np.abs(existing).max()), 1e-30)
             gap = float(np.abs(existing.astype(np.float64) - generated).max()) / scale / EPS

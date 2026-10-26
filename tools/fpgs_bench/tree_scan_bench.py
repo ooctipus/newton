@@ -222,7 +222,13 @@ def bench_schedules(args, device):
             ts.Direction.DOWN,
             (ts.Schedule.JUMP_SHFL, ts.Schedule.JUMP_SMEM, ts.Schedule.HEAVY_CHAIN, ts.Schedule.LEVEL),
         ),
-        "reduce": (
+        # The subtree sum of every step (6 wrench channels) and of a geometry refresh (19 with the moments).
+        "reduce6": (
+            fx.WRENCH_MOMENTS,
+            ts.Direction.UP,
+            (ts.Schedule.DFS_INTERVAL, ts.Schedule.HEAVY_CHAIN, ts.Schedule.LEVEL),
+        ),
+        "reduce19": (
             fx.WRENCH_MOMENTS,
             ts.Direction.UP,
             (ts.Schedule.DFS_INTERVAL, ts.Schedule.HEAVY_CHAIN, ts.Schedule.LEVEL),
@@ -248,7 +254,10 @@ def bench_schedules(args, device):
                     "",
                     "chain" if schedule is ts.Schedule.HEAVY_CHAIN else "kinetic",
                 )
-                launch = _launcher(item, plan, layout, "generated-scan", args.groups, args.repeat, device, schedule)
+                flag = 0 if scan == "reduce6" else 1
+                launch = _launcher(
+                    item, plan, layout, "generated-scan", args.groups, args.repeat, device, schedule, flag
+                )
                 row[schedule.value] = _time(launch, args.samples, device)
             row["rule"] = ts.choose_schedule(plan, direction, combine, cuda=True, lanes=lanes).value
             rows.append(row)
@@ -265,14 +274,14 @@ def bench_general(args, device):
     )
 
     rows = []
-    for shapes in (("anymal13",), ("humanoid13",), ("g1_30",), ("chain64",), ("pendulum2",)):
-        model = articulated_model(shapes, args.worlds, device)
+    for shape in args.shapes or ("anymal13", "humanoid13", "g1_30", "chain64", "pendulum2"):
+        model = articulated_model((shape,), args.worlds, device)
         data = serial_arrays(model)
-        for name in SERIAL_PASSES:
+        for name in args.passes or SERIAL_PASSES:
             for previous in ("fk_id", "tau", "composite_inertia"):
                 if SERIAL_PASSES.index(previous) < SERIAL_PASSES.index(name):
                     serial_launch(previous, "existing", data)
-            row = {"shape": shapes[0], "articulations": model.articulation_count, "pass": name}
+            row = {"shape": shape, "articulations": model.articulation_count, "pass": name}
             for arm in ("existing", "generated"):
                 row[arm] = _time(functools.partial(serial_launch, name, arm, data), args.samples, device)
             rows.append(row)

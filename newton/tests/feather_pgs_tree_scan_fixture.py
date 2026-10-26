@@ -378,12 +378,13 @@ def generated_text(item: Pass, plan: TreePlan, layout: TreeLayout, *, dialect: s
     """The pass's ``tree_scan`` configuration in its wrapper scope.
 
     ``dialect`` ``"held"`` reads the existing plan structs (``p`` in scans, ``plan`` in reductions, depth tests
-    for levels); ``"scan"`` reads a :class:`~newton._src.solvers.feather_pgs.tree_scan.ScanPlan` named ``plan``
-    with its level CSR, as the scans will once the owners hold a tree plan.
+    for levels); ``"scan"`` reads a :class:`~newton._src.solvers.feather_pgs.tree_scan.ScanPlan` named ``plan``,
+    levels in the form :func:`~newton._src.solvers.feather_pgs.tree_scan.tree_scan` picks, as the scans will
+    once the owners hold a tree plan.
     """
     reduction = item.direction is ts.Direction.UP or item.name == "twist_shfl"
     access = ts.PlanAccess() if reduction else ts.PlanAccess().renamed("p")
-    level_csr = dialect != "held"
+    level_csr = False if dialect == "held" else None
     source = sink = None
     if item.name == "twist_shfl":
         if dialect == "held":
@@ -670,7 +671,6 @@ class SerialArrays:
     is_free_rigid: wp.array
     gravity: wp.array
     joint_articulation: wp.array
-    dof_joint: wp.array
     size_groups: list
     articulations: wp.array
     outputs: dict
@@ -686,7 +686,6 @@ def serial_arrays(model) -> SerialArrays:
         kernels.compute_com_transforms, model.body_count, inputs=[model.body_com], outputs=[body_X_com], device=device
     )
     joint_articulation = np.repeat(np.arange(model.articulation_count, dtype=np.int32), np.diff(starts))
-    plan = TreePlan.build(model.joint_ancestor.numpy(), np.diff(model.joint_qd_start.numpy()))
     counts = np.diff(model.joint_qd_start.numpy()[starts])
     rng = np.random.default_rng(3)
     n = model.body_count
@@ -723,7 +722,6 @@ def serial_arrays(model) -> SerialArrays:
         wp.zeros(model.articulation_count, dtype=int, device=device),
         wp.array([[0.0, 0.0, -9.81]], dtype=wp.vec3, device=device),
         wp.array(joint_articulation, dtype=int, device=device),
-        wp.array(plan.dof_node, dtype=int, device=device),
         [
             (int(size), wp.array(np.flatnonzero(counts == size).astype(np.int32), dtype=int, device=device))
             for size in np.unique(counts)
@@ -908,11 +906,26 @@ def _crba_launch(arm, data, dofs, group_to_art):
     first = _articulation_dof_start(m)
     tail = [o["joint_S_s"], o["body_I_c"], group_to_art, dofs, 0, o["drive_row"], o["row_K"]]
     topology = [o["mask"], m.joint_ancestor, m.joint_child, m.joint_qd_start, m.joint_dof_dim]
-    if arm == "existing":
-        kernel, inputs = kernels.crba_fill_par_dof, [m.articulation_start, first, *topology, *tail]
-    else:
-        kernel, inputs = tree_passes.crba_fill, [first, *topology, m.articulation_start, data.dof_joint, *tail]
+    kernel = kernels.crba_fill_par_dof if arm == "existing" else tree_passes.crba_fill
+    inputs = [m.articulation_start, first, *topology, *tail]
     wp.launch(kernel, group_to_art.size * dofs, inputs=inputs, outputs=[o["H"][dofs]], device=m.device)
+
+
+def crba_shared(model) -> tuple[np.ndarray, np.ndarray]:
+    """The mass matrices' entries in output order: flags of the off-diagonal entries two coordinates of one
+    joint share, and each entry's transpose."""
+    starts, q_start = model.articulation_start.numpy(), model.joint_qd_start.numpy()
+    counts = np.diff(q_start[starts])
+    shared, mirror, offset = [], [], 0
+    for size in np.unique(counts):
+        cells = np.arange(size * size).reshape(size, size)
+        for art in np.flatnonzero(counts == size):
+            joints = np.arange(starts[art], starts[art + 1])
+            joint = np.repeat(joints, np.diff(q_start[starts[art] : starts[art + 1] + 1]))
+            shared.append(((joint[:, None] == joint[None, :]) & ~np.eye(size, dtype=bool)).reshape(-1))
+            mirror.append(offset + cells.T.reshape(-1))
+            offset += size * size
+    return np.concatenate(shared), np.concatenate(mirror)
 
 
 def _numpy(value):
