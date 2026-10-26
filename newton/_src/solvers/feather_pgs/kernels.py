@@ -50,6 +50,17 @@ from .device_preludes import (
 )
 from .friction import friction_pair_candidate
 from .friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, patch_friction_location, patch_normal_load
+from .row_laws import (
+    contact_depenetration_cap,
+    contact_restitution_fires,
+    contact_restitution_rhs,
+    contact_rhs,
+    joint_limit_side,
+    limit_rhs,
+    mimic_phi,
+    row_rhs,
+    velocity_limit_active,
+)
 
 PGS_CONSTRAINT_TYPE_CONTACT = 0
 PGS_CONSTRAINT_TYPE_JOINT_TARGET = 1
@@ -122,11 +133,6 @@ _FPGS_BISECTION_ITERS = 20
 # (``|phi| < ~5e-6`` at solution).
 _FPGS_COULOMB_NEWTON_EXPAND_ITERS = 30
 _FPGS_COULOMB_NEWTON_NEWTON_ITERS = 50
-
-# One-sided distance slop [m] for float32 cancellation at the speculative
-# bound. Rows within 1e-6 m are treated as reaching the surface, bounding early
-# activation to 1e-6 m of linearized separation.
-_FPGS_CONTACT_END_GAP_SLOP = wp.constant(1.0e-6)
 
 
 @wp.kernel
@@ -2307,19 +2313,13 @@ def prepare_fused_diagonal_joint_limits(
             lower = joint_limit_lower[global_dof]
             upper = joint_limit_upper[global_dof]
             inv_dt = 1.0 / dt
-            if wp.isfinite(lower) and q <= lower + activation_gap:
-                phi = q - lower
-                scale = 1.0
-                if phi < 0.0:
-                    scale = pgs_beta
-                rhs_lower = scale * phi * inv_dt
+            lower_active, lower_phi, _lower_sign = joint_limit_side(q, lower, upper, 0, activation_gap)
+            if lower_active:
+                rhs_lower = limit_rhs(lower_phi, pgs_beta, 0.0, inv_dt, 1.0, 1.0)
                 active |= 1
-            if wp.isfinite(upper) and q >= upper - activation_gap:
-                phi = upper - q
-                scale = 1.0
-                if phi < 0.0:
-                    scale = pgs_beta
-                rhs_upper = scale * phi * inv_dt
+            upper_active, upper_phi, _upper_sign = joint_limit_side(q, lower, upper, 1, activation_gap)
+            if upper_active:
+                rhs_upper = limit_rhs(upper_phi, pgs_beta, 0.0, inv_dt, 1.0, 1.0)
                 active |= 2
 
     active_sides[world, local_dof] = active
@@ -3450,13 +3450,7 @@ def build_joint_limit_rows_for_size(
             local_dof = dof - dof_start
 
             for side in range(2):
-                sign = 1.0
-                phi = q_val - lower
-                active = wp.isfinite(lower) and q_val <= lower + joint_limit_activation_gap
-                if side == 1:
-                    sign = -1.0
-                    phi = upper - q_val
-                    active = wp.isfinite(upper) and q_val >= upper - joint_limit_activation_gap
+                active, phi, sign = joint_limit_side(q_val, lower, upper, side, joint_limit_activation_gap)
                 if not active:
                     continue
 
@@ -3577,7 +3571,7 @@ def populate_mimic_J_for_size(
         world_row_mu[world, slot] = 0.0
         world_row_beta[world, slot] = pgs_beta
         world_row_cfm[world, slot] = pgs_cfm
-        world_phi[world, slot] = joint_q[mimic_q0[k]] - c1 * joint_q[mimic_q1[k]] - c0
+        world_phi[world, slot] = mimic_phi(joint_q[mimic_q0[k]], joint_q[mimic_q1[k]], c0, c1)
         world_target_velocity[world, slot] = 0.0
 
 
@@ -4081,10 +4075,9 @@ def allocate_joint_velocity_limit_slots(
     ``velocity_limit_activation_fraction`` proximity-gates the allocation:
     with a positive fraction the lower/upper pair is reserved only when
     ``|joint_qd[dof]| >= fraction * qdot_max``, i.e. the DOF is close enough
-    to the velocity box edge that the rows could act. A fraction of ``0.0``
-    short-circuits the gate (``joint_qd`` is not even read) so the default
-    allocation and slot ordering are bit-identical to the historical
-    always-allocate behavior. Because the gate samples the pre-solve
+    to the velocity box edge that the rows could act
+    (:func:`.row_laws.velocity_limit_active`). A fraction of ``0.0`` disables
+    the gate: every limited DOF takes its pair. Because the gate samples the pre-solve
     velocity, a DOF that crosses the threshold during a step is clamped one
     step late.
 
@@ -4129,25 +4122,14 @@ def allocate_joint_velocity_limit_slots(
 
         for axis in range(axis_count):
             dof = qd_start + axis
-            qdot_max = joint_velocity_limit[dof]
-
-            # Guard against degenerate limits. PhysX pins ``recipResponse``
-            # off for ``unitResponse <= 0``; here we drop the row entirely if
-            # the stored limit is non-positive (treated as "unlimited").
-            if qdot_max <= 0.0:
+            # A non-positive limit is unlimited (PhysX pins ``recipResponse`` off for ``unitResponse <= 0``);
+            # a positive fraction admits only a DOF whose speed reaches that fraction of the limit.
+            if not velocity_limit_active(joint_velocity_limit[dof], joint_qd[dof], velocity_limit_activation_fraction):
                 continue
 
             # Fused path: driven DOFs are clamped at the end of each iteration.
             if skip_driven != 0:
                 if drive_slot[dof] >= 0:
-                    continue
-
-            # Proximity gate: only reserve the row pair when the DOF speed is
-            # within ``fraction * qdot_max`` of the box edge. The fraction==0
-            # branch short-circuits before reading ``joint_qd`` so the default
-            # path allocates exactly as before (same slots, same order).
-            if velocity_limit_activation_fraction > 0.0:
-                if wp.abs(joint_qd[dof]) < velocity_limit_activation_fraction * qdot_max:
                     continue
 
             # Mark eligible; slots are reserved below with a single atomic per articulation (the
@@ -5464,9 +5446,11 @@ def apply_sparse_diagonal_contact_restitution_matrix_free(
 
     target_vel = world_target_velocity[world, row]
     relative_incident -= target_vel
-    phi = world_phi[world, row]
-    if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
-        world_rhs[world, row] = -target_vel + restitution * relative_incident
+    fires, bounce = contact_restitution_rhs(
+        world_phi[world, row], relative_incident, target_vel, restitution, dt, restitution_velocity_threshold
+    )
+    if fires:
+        world_rhs[world, row] = bounce
 
 
 @wp.func
@@ -5511,26 +5495,6 @@ def mf_contact_row_dot(
             if global_dof >= 0:
                 out += mf_J_b[world, i, k] * velocity[global_dof]
     return out
-
-
-@wp.func
-def contact_restitution_fires(
-    phi: float,
-    relative_incident: float,
-    dt: float,
-    restitution_velocity_threshold: float,
-):
-    """Return whether a frozen incident impact qualifies for a rebound target.
-
-    Fires only for a sufficiently fast closing contact that is already at the
-    surface or is predicted to reach it during the step; the end-gap slop
-    absorbs float32 residuals on rows that land exactly at contact.
-    """
-    if relative_incident >= -restitution_velocity_threshold:
-        return False
-    if phi <= _FPGS_CONTACT_END_GAP_SLOP:
-        return True
-    return phi + dt * relative_incident <= _FPGS_CONTACT_END_GAP_SLOP
 
 
 @wp.func
@@ -5938,11 +5902,11 @@ def compute_world_contact_bias(
     world_rhs: wp.array2d[float],
     world_row_w: wp.array2d[float],
 ):
-    """Compute the RHS bias term for world-level PGS solve.
+    """Compute the RHS bias term for world-level PGS solve: each row's position law (:func:`.row_laws.row_rhs`).
 
-    The RHS follows the convention: rhs = J*v + stabilization
-    For contacts with penetration (phi < 0): rhs = J*v + beta * phi / dt (negative)
-    This leads to positive impulses when resolved by PGS.
+    The RHS follows the convention: rhs = J*v + stabilization; a penetrating contact's
+    Baumgarte term ``bias_scale * beta * phi / dt`` is negative and leads to positive
+    impulses when resolved by PGS. ``J*v`` is added later.
 
     One thread per (world, row): ``dim = world_count * max_constraints``. The previous one-thread-per-world loop
     left the GPU idle (64-128 blocks) for 30-60 us per launch.
@@ -5955,51 +5919,17 @@ def compute_world_contact_bias(
     inv_dt = 1.0 / dt
 
     if i < m:
-        phi = world_phi[world, i]
-        beta = world_row_beta[world, i]
-        row_type = world_row_type[world, i]
-        target_vel = world_target_velocity[world, i]
-
-        # Initialize with -target_velocity (will add J*v later)
-        rhs = -target_vel
-        row_w = float(1.0)
-
-        # Contacts inside the speculative gap should not become sticky ghost
-        # contacts.  For separation (phi > 0), allow closing by the current gap
-        # over this substep: Jv + phi / dt >= 0.  For penetration, keep the
-        # Baumgarte correction and let velocity-only passes scale it to zero.
-        if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-            if phi <= 0.0:
-                rhs += bias_scale * beta * phi * inv_dt  # Negative for penetration
-                row_w = contact_w
-            else:
-                rhs += contact_speculative_scale * phi * inv_dt
-        elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
-            # Positional friction anchor (``phi`` = tangential anchor separation,
-            # ``beta`` = friction_anchor_beta; both zero when anchors are off).
-            rhs += bias_scale * beta * phi * inv_dt
-        elif row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
-            if phi < 0.0:
-                rhs += bias_scale * beta * phi * inv_dt  # Negative for violation
-            else:
-                # Speculative finite-limit row: allow motion up to the bound
-                # during the step, matching PhysX's nextErr limit branch.
-                rhs += joint_limit_speculative_scale * phi * inv_dt
-        elif row_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
-            # PhysX-style drive rows use world_target_velocity as drive-row
-            # input, not as a generic constraint target. Their RHS is handled
-            # by the per-row drive descriptor in the matrix-free GS kernel.
-            rhs = 0.0
-        elif row_type == PGS_CONSTRAINT_TYPE_MIMIC or row_type == PGS_CONSTRAINT_TYPE_CONNECT:
-            # Bilateral equality: Baumgarte-correct the violation from BOTH
-            # sides (contacts/limits only bias on penetration; an equality has
-            # no speculative branch).
-            rhs += bias_scale * beta * phi * inv_dt
-        # PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT: no phi-based bias. The
-        # constraint is an instantaneous velocity-space projection; the only
-        # RHS contribution is ``-target_vel`` (already set above) plus the
-        # ``J*v_hat`` term added by ``rhs_accum_world_par_art``.
-
+        rhs, row_w = row_rhs(
+            world_row_type[world, i],
+            world_phi[world, i],
+            world_row_beta[world, i],
+            world_target_velocity[world, i],
+            inv_dt,
+            bias_scale,
+            contact_speculative_scale,
+            joint_limit_speculative_scale,
+            contact_w,
+        )
         world_rhs[world, i] = rhs
         if contact_w < 1.0:
             world_row_w[world, i] = row_w
@@ -6045,10 +5975,13 @@ def apply_world_contact_restitution_matrix_free(
         - target_vel
     )
 
-    if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
+    fires, bounce = contact_restitution_rhs(
+        phi, relative_incident, target_vel, restitution, dt, restitution_velocity_threshold
+    )
+    if fires:
         # Matrix-free GS adds live J*v itself, so store only
         # -target + e*u_incident as the row bias.
-        world_rhs[world, i] = -target_vel + restitution * relative_incident
+        world_rhs[world, i] = bounce
         if write_row_w != 0:
             world_row_w[world, i] = 1.0
 
@@ -6083,9 +6016,10 @@ def apply_world_contact_restitution_accumulated(
         return
 
     phi = world_phi[world, i]
-    geometric_bias = contact_speculative_scale * phi / dt
-    if phi < 0.0:
-        geometric_bias = world_row_beta[world, i] * phi / dt
+    # The geometric bias the position pass added (bias scale 1): the contact law without a target.
+    geometric_bias, _row_w = contact_rhs(
+        phi, world_row_beta[world, i], 0.0, 1.0 / dt, 1.0, contact_speculative_scale, 1.0, 0.0, 0.0
+    )
     relative_incident = world_rhs[world, i] - geometric_bias
     if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
         # Impulse-space RHS contains u_incident already.  Replacing geometric
@@ -6127,10 +6061,12 @@ def compute_world_contact_velocity_bias(
     target_vel = world_target_velocity[world, i]
     rhs = -target_vel
 
+    # The velocity pass keeps no Baumgarte term: a closing contact rebounds by restitution, a separated one keeps
+    # its speculative bias while the position solution's end gap stays open, a limit allows motion up to its bound.
     if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
+        fires = bool(False)
+        bounce = float(0.0)
         restitution = float(0.0)
-        relative_incident = float(0.0)
-        bounce = int(0)
         if apply_restitution != 0:
             restitution = world_row_restitution[world, i]
         if restitution > 0.0:
@@ -6138,21 +6074,21 @@ def compute_world_contact_velocity_bias(
                 world_contact_row_dot(world_dof_count, world_dof_indices, world_J, world_incident_velocity, world, i)
                 - target_vel
             )
-            if contact_restitution_fires(phi, relative_incident, dt, restitution_velocity_threshold):
-                bounce = int(1)
-
-        if bounce != 0:
-            rhs += restitution * relative_incident
-        elif phi > 0.0:
-            jv_position = world_contact_row_dot(
-                world_dof_count, world_dof_indices, world_J, world_position_velocity, world, i
+            fires, bounce = contact_restitution_rhs(
+                phi, relative_incident, target_vel, restitution, dt, restitution_velocity_threshold
             )
-            end_gap = phi + dt * (jv_position - target_vel)
-            if end_gap > _FPGS_CONTACT_END_GAP_SLOP:
-                rhs += phi * inv_dt
+        if fires:
+            rhs = bounce
+        else:
+            end_gap = float(0.0)
+            if phi > 0.0:
+                jv_position = world_contact_row_dot(
+                    world_dof_count, world_dof_indices, world_J, world_position_velocity, world, i
+                )
+                end_gap = phi + dt * (jv_position - target_vel)
+            rhs, _row_w = contact_rhs(phi, 0.0, target_vel, inv_dt, 0.0, 0.0, 1.0, 0.0, end_gap)
     elif row_type == PGS_CONSTRAINT_TYPE_JOINT_LIMIT:
-        if phi >= 0.0:
-            rhs += phi * inv_dt
+        rhs = limit_rhs(phi, 0.0, target_vel, inv_dt, 0.0, 1.0)
     elif row_type == PGS_CONSTRAINT_TYPE_JOINT_TARGET:
         rhs = 0.0
 
@@ -6990,16 +6926,14 @@ def allocate_rigid_velocity_limit_slots(
         limit = rigid_body_max_linear_velocity[body]
         if speed_row == 1:
             limit = rigid_body_max_angular_velocity[body]
-        if limit <= 0.0 or not wp.isfinite(limit):
+        # An infinite speed limit is no limit; otherwise the velocity-limit activation law, whose proximity
+        # gate reserves the row only when the speed reaches ``fraction * limit``.
+        if not wp.isfinite(limit):
             continue
-
-        # Proximity gate: only reserve the row when the speed is within ``fraction * limit`` of the bound.
-        # The fraction==0 branch short-circuits before any velocity read.
-        if velocity_limit_activation_fraction > 0.0:
-            root_dof = articulation_root_dof_start[art] + 3 * speed_row
-            speed = wp.length(wp.vec3(joint_qd[root_dof], joint_qd[root_dof + 1], joint_qd[root_dof + 2]))
-            if speed < velocity_limit_activation_fraction * limit:
-                continue
+        root_dof = articulation_root_dof_start[art] + 3 * speed_row
+        speed = wp.length(wp.vec3(joint_qd[root_dof], joint_qd[root_dof + 1], joint_qd[root_dof + 2]))
+        if not velocity_limit_active(limit, speed, velocity_limit_activation_fraction):
+            continue
 
         rigid_velocity_limit_slot[base + speed_row] = reserve(
             mf_slot_counter, world, 1, mf_max_constraints, mf_first_rejected_slot
@@ -7352,32 +7286,19 @@ def compute_mf_effective_mass_and_rhs(
     else:
         mf_eff_mass_inv[world, i] = 0.0
 
-    # Contact bias only (not J*v -- recomputed each PGS iter). Penetrating
-    # contacts use Baumgarte stabilization; separated speculative contacts
-    # allow closing by the current positive gap over this substep.
-    bias = float(0.0)
+    # Contact bias only (not J*v -- recomputed each PGS iter): the contact law, its Baumgarte term capped by the
+    # bodies' depenetration speed, and a closing contact's rebound target.
+    target = float(0.0)
+    if has_target_velocity != 0:
+        target = mf_target_velocity[world, i]
+    inv_dt = 1.0 / dt
+    rhs = -target
     row_w = float(1.0)
     rtype = mf_row_type[world, i]
     if rtype == PGS_CONSTRAINT_TYPE_CONTACT:
         phi_val = mf_phi[world, i]
-        if phi_val <= 0.0:
-            # Positive-gap (speculative) rows stay rigid so a closing contact
-            # reaches the surface instead of leaking closing speed into penetration.
-            row_w = contact_w
-        if phi_val < 0.0:
-            bias = pgs_beta * phi_val / dt
-            max_depen = 1.0e20
-            if ba >= 0:
-                max_depen = rigid_body_max_depenetration_velocity[ba]
-            if bb >= 0:
-                max_depen_b = rigid_body_max_depenetration_velocity[bb]
-                if max_depen_b > 0.0 and wp.isfinite(max_depen_b):
-                    if max_depen_b < max_depen:
-                        max_depen = max_depen_b
-            if max_depen > 0.0 and wp.isfinite(max_depen):
-                bias = wp.max(bias, -max_depen)
-        else:
-            bias = contact_speculative_scale * phi_val / dt
+        cap = contact_depenetration_cap(ba, bb, rigid_body_max_depenetration_velocity)
+        rhs, row_w = contact_rhs(phi_val, pgs_beta, target, inv_dt, 1.0, contact_speculative_scale, contact_w, cap, 0.0)
         restitution = mf_row_restitution[world, i]
         if restitution > 0.0:
             relative_incident = float(0.0)
@@ -7389,22 +7310,21 @@ def compute_mf_effective_mass_and_rhs(
                 dof_start = articulation_dof_start[body_to_articulation[bb]]
                 for k in range(6):
                     relative_incident += mf_J_b[world, i, k] * incident_velocity[dof_start + k]
-            target_vel = float(0.0)
-            if has_target_velocity != 0:
-                target_vel = mf_target_velocity[world, i]
-            relative_incident -= target_vel
-            if contact_restitution_fires(phi_val, relative_incident, dt, restitution_velocity_threshold):
-                bias = restitution * relative_incident
+            relative_incident -= target
+            fires, bounce = contact_restitution_rhs(
+                phi_val, relative_incident, target, restitution, dt, restitution_velocity_threshold
+            )
+            if fires:
+                rhs = bounce
                 # An impact is impulsive, not a spring: keep the rebound exact.
                 row_w = 1.0
     elif rtype == PGS_CONSTRAINT_TYPE_FRICTION:
-        bias = mf_phi[world, i] / dt  # anchor gain pre-multiplied by the row builder
+        # The row builder pre-multiplies the anchor gain into phi.
+        rhs, _w = row_rhs(rtype, mf_phi[world, i], 1.0, target, inv_dt, 1.0, 0.0, 0.0, 1.0)
     elif rtype == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
-        bias = mf_phi[world, i]
-
-    if has_target_velocity != 0:
-        bias -= mf_target_velocity[world, i]
-    mf_rhs[world, i] = bias
+        # A free body's speed row carries its limit in phi.
+        rhs = mf_phi[world, i] - target
+    mf_rhs[world, i] = rhs
     if contact_w < 1.0:
         mf_row_w[world, i] = row_w
 
@@ -7445,47 +7365,43 @@ def compute_mf_rhs_bias(
     if i >= mf_constraint_count[world]:
         return
 
-    bias = float(0.0)
+    target = float(0.0)
+    if has_target_velocity != 0:
+        target = mf_target_velocity[world, i]
+    inv_dt = 1.0 / dt
+    rhs = -target
     row_type = mf_row_type[world, i]
     if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
         phi_val = mf_phi[world, i]
+        fires = bool(False)
+        bounce = float(0.0)
         restitution = float(0.0)
-        relative_incident = float(0.0)
-        bounce = int(0)
         if apply_restitution != 0:
             restitution = mf_row_restitution[world, i]
         if restitution > 0.0:
-            relative_incident = mf_contact_row_dot(
-                mf_J_a, mf_J_b, mf_dof_a[world, i], mf_dof_b[world, i], world_dof_indices, incident_velocity, world, i
+            relative_incident = (
+                mf_contact_row_dot(
+                    mf_J_a,
+                    mf_J_b,
+                    mf_dof_a[world, i],
+                    mf_dof_b[world, i],
+                    world_dof_indices,
+                    incident_velocity,
+                    world,
+                    i,
+                )
+                - target
             )
-            target_velocity = float(0.0)
-            if has_target_velocity != 0:
-                target_velocity = mf_target_velocity[world, i]
-            relative_incident -= target_velocity
-            if contact_restitution_fires(phi_val, relative_incident, dt, restitution_velocity_threshold):
-                bounce = int(1)
-
-        if bounce != 0:
-            bias = restitution * relative_incident
-        elif phi_val < 0.0:
-            ba = mf_body_a[world, i]
-            bb = mf_body_b[world, i]
-            bias = bias_scale * pgs_beta * phi_val / dt
-            max_depen = 1.0e20
-            if ba >= 0:
-                max_depen = rigid_body_max_depenetration_velocity[ba]
-            if bb >= 0:
-                max_depen_b = rigid_body_max_depenetration_velocity[bb]
-                if max_depen_b > 0.0 and wp.isfinite(max_depen_b):
-                    if max_depen_b < max_depen:
-                        max_depen = max_depen_b
-            if max_depen > 0.0 and wp.isfinite(max_depen):
-                bias = wp.max(bias, -max_depen)
+            fires, bounce = contact_restitution_rhs(
+                phi_val, relative_incident, target, restitution, dt, restitution_velocity_threshold
+            )
+        if fires:
+            rhs = bounce
         else:
+            # The velocity pass keeps a separated row's bias while the position solve's linearized end gap,
+            # evaluated with its realized velocity, stays open.
             end_gap = float(0.0)
             if preserve_unreached_speculative != 0 and phi_val > 0.0:
-                # Evaluate the same linearized end gap constrained by the
-                # position solve, using its realized velocity.
                 jv_position = mf_contact_row_dot(
                     mf_J_a,
                     mf_J_b,
@@ -7496,22 +7412,19 @@ def compute_mf_rhs_bias(
                     world,
                     i,
                 )
-                target_velocity = float(0.0)
-                if has_target_velocity != 0:
-                    target_velocity = mf_target_velocity[world, i]
-                end_gap = phi_val + dt * (jv_position - target_velocity)
-            if preserve_unreached_speculative != 0 and end_gap > _FPGS_CONTACT_END_GAP_SLOP:
-                bias = phi_val / dt
-            else:
-                bias = speculative_scale * phi_val / dt
+                end_gap = phi_val + dt * (jv_position - target)
+            cap = contact_depenetration_cap(
+                mf_body_a[world, i], mf_body_b[world, i], rigid_body_max_depenetration_velocity
+            )
+            rhs, _row_w = contact_rhs(
+                phi_val, pgs_beta, target, inv_dt, bias_scale, speculative_scale, 1.0, cap, end_gap
+            )
     elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
-        bias = bias_scale * mf_phi[world, i] / dt  # anchor gain pre-multiplied by the row builder
+        # The row builder pre-multiplies the anchor gain into phi.
+        rhs, _w = row_rhs(row_type, mf_phi[world, i], 1.0, target, inv_dt, bias_scale, 0.0, 0.0, 1.0)
     elif row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
-        bias = mf_phi[world, i]
-
-    if has_target_velocity != 0:
-        bias -= mf_target_velocity[world, i]
-    mf_rhs[world, i] = bias
+        rhs = mf_phi[world, i] - target
+    mf_rhs[world, i] = rhs
 
 
 # ---------------------------------------------------------------------------

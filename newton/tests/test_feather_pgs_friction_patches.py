@@ -743,8 +743,11 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                             self.assertLess(abs(float(actual[2][0] - reference[2][0])), 0.06)
                             # Facet rocking can change the phase of lateral
                             # oscillations; bound their absolute speed as well
-                            # as the lateral displacement checked above.
-                            self.assertLess(abs(float(actual[2][1])), 0.05)
+                            # as the lateral displacement checked above. The phase
+                            # follows float32 rounding: the 128-segment hull at
+                            # 120 Hz ends at 0.043 or 0.054 on the CPU when the
+                            # contact rows' bias rounds x / dt or x * (1 / dt).
+                            self.assertLess(abs(float(actual[2][1])), 0.06)
                             # Same 6% margin on the 20 rad/s launch spin.
                             self.assertLess(abs(float(actual[2][4] - reference[2][4])), 1.2)
 

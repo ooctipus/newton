@@ -53,9 +53,9 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
-    contact_restitution_fires,
 )
 from .row_inputs import CompactLocalRows, RowArgument
+from .row_laws import ROW_LAW, contact_restitution_rhs, contact_rhs, row_rhs
 
 WARPS_PER_BLOCK = 4
 PREFIX_WIDTH = 2  # a limit row has one coefficient, a mimic row two
@@ -162,22 +162,20 @@ _PREFIX_SOURCE = r"""
                     d1 = data.mimic_dof1.data[mimic] - first_dof;
                     w0 = 1.0f;
                     w1 = -data.mimic_coef1.data[mimic];
-                    phi = data.q.data[data.mimic_q0.data[mimic]]
-                        - data.mimic_coef1.data[mimic] * data.q.data[data.mimic_q1.data[mimic]]
-                        - data.mimic_coef0.data[mimic];
+                    phi = RowLaw::mimic_phi(data.q.data[data.mimic_q0.data[mimic]], data.q.data[data.mimic_q1.data[mimic]],
+                                            data.mimic_coef0.data[mimic], data.mimic_coef1.data[mimic]);
                 }
             }
         } else if (candidate < CANDIDATES) {
             const int local = (candidate - MIMICS) / 2, side = (candidate - MIMICS) & 1;
             const int dof = first_dof + local, qi = data.limit_q_index.data[dof];
             if (qi >= 0) {
-                const float q = data.q.data[qi];
-                const float bound = side == 0 ? data.lower.data[dof] : data.upper.data[dof];
-                phi = side == 0 ? q - bound : bound - q;
-                active = wp::isfinite(bound) && (side == 0 ? q <= bound + data.activation_gap
-                                                           : q >= bound - data.activation_gap);
+                const auto limit = RowLaw::joint_limit_side(data.q.data[qi], data.lower.data[dof], data.upper.data[dof],
+                                                            side, data.activation_gap);
+                active = limit.v0;
+                phi = limit.v1;
                 d0 = local;
-                w0 = side == 0 ? 1.0f : -1.0f;
+                w0 = limit.v2;
             }
         }
         const unsigned votes = BALLOT(active != 0);
@@ -198,10 +196,8 @@ _PREFIX_SOURCE = r"""
             data.phi.data[row] = phi;
             data.target.data[row] = 0.0f;
             data.restitution.data[row] = 0.0f;
-            float rhs = 0.0f;
-            if (type == 5 || phi < 0.0f) rhs = data.bias_scale * data.beta * phi * (1.0f / data.dt);
-            else rhs = data.limit_speculative_scale * phi * (1.0f / data.dt);
-            data.rhs.data[row] = rhs;
+            data.rhs.data[row] = RowLaw::row_rhs(type, phi, data.beta, 0.0f, 1.0f / data.dt, data.bias_scale, 0.0f,
+                                                 data.limit_speculative_scale, 1.0f).v0;
             data.diag.data[row] = data.cfm;
             data.impulses.data[row] = 0.0f;
             if (mimic >= 0) data.mimic_slot.data[mimic] = slot;
@@ -237,7 +233,7 @@ def get_prefix_kernel(primary: int, mimics: int, packets: int):
     ):
         source = source.replace(token, str(value))
 
-    @wp.func_native(dual_native(source, preludes=(lane_group(32),)))
+    @wp.func_native(dual_native(source, preludes=(lane_group(32), *ROW_LAW.preludes())))
     def prefix_native(block: int, data: PrefixData): ...
 
     def prefix(data: PrefixData):
@@ -559,6 +555,7 @@ def produce_contacts(workers: int, data: ContactInput, packet: ContactPacketData
                 data.shape0[contact], data.shape1[contact], data.material_mu, data.material_restitution
             )
             friction_mu = mu * data.friction_scale
+            inv_dt = 1.0 / data.dt
             for row in range(rows):
                 output_row = slot + row
                 direction, p0, p1 = contact_row_frame(
@@ -571,7 +568,7 @@ def produce_contacts(workers: int, data: ContactInput, packet: ContactPacketData
                 beta = float(0.0)
                 row_restitution = float(0.0)
                 row_mu = friction_mu
-                kind = int(2)
+                kind = int(PGS_CONSTRAINT_TYPE_FRICTION)
                 parent = slot
                 rhs = -target
                 weight = float(1.0)
@@ -580,19 +577,20 @@ def produce_contacts(workers: int, data: ContactInput, packet: ContactPacketData
                     beta = data.beta
                     row_restitution = restitution
                     row_mu = mu
-                    kind = 0
+                    kind = PGS_CONSTRAINT_TYPE_CONTACT
                     parent = -1
-                    if phi <= 0.0:
-                        rhs += data.bias_scale * beta * phi / data.dt
-                        weight = data.contact_w
-                    else:
-                        rhs += data.speculative_scale * phi / data.dt
+                    rhs, weight = contact_rhs(
+                        phi, beta, target, inv_dt, data.bias_scale, data.speculative_scale, data.contact_w, 0.0, 0.0
+                    )
                     if restitution > 0.0:
                         relative = incident_projection(data, body0, art0, p0, direction)
                         relative -= incident_projection(data, body1, art1, p1, direction)
                         relative -= target
-                        if contact_restitution_fires(phi, relative, data.dt, data.restitution_threshold):
-                            rhs = -target + restitution * relative
+                        fires, bounce = contact_restitution_rhs(
+                            phi, relative, target, restitution, data.dt, data.restitution_threshold
+                        )
+                        if fires:
+                            rhs = bounce
                             weight = 1.0
                 data.row_type[world, output_row] = kind
                 data.row_parent[world, output_row] = parent
@@ -664,9 +662,8 @@ def produce_patch_contacts(
     The normal row's metadata and packet are those of :func:`produce_contacts`. Tangent rows, present
     only when the contact owns an anchor, follow the patch row law that the compact producer shares
     (``contact_laws.contact_row_frame`` and ``patch_tangent_row``): they act at the patch friction location, carry
-    the anchor's tangential phi with ``law.beta`` and keep the undivided coefficient. Every bias takes
-    ``compute_world_contact_bias``'s form, ``x * (1 / dt)``, where :func:`produce_contacts` forms
-    ``x / dt``, so the rows equal the general route's bitwise. A bouncing normal row sums its incident
+    the anchor's tangential phi with ``law.beta`` and keep the undivided coefficient. Every rhs is the
+    row law's (``row_laws``), as the general route's, so the rows equal it bitwise. A bouncing normal row sums its incident
     velocity per body, as :func:`produce_contacts` does, instead of per world coordinate. It agrees
     with the general route's to rounding, unless the incident velocity lies within a rounding of a
     bounce threshold, where the two routes can disagree on whether the row bounces.
@@ -749,24 +746,25 @@ def produce_patch_contacts(
                 rhs = -target
                 weight = float(1.0)
                 if row == 0:
-                    if phi <= 0.0:
-                        rhs += data.bias_scale * beta * phi * inv_dt
-                        weight = data.contact_w
-                    else:
-                        rhs += data.speculative_scale * phi * inv_dt
+                    rhs, weight = contact_rhs(
+                        phi, beta, target, inv_dt, data.bias_scale, data.speculative_scale, data.contact_w, 0.0, 0.0
+                    )
                     if restitution > 0.0:
                         relative = incident_projection(data, body0, art0, p0, direction)
                         relative -= incident_projection(data, body1, art1, p1, direction)
                         relative -= target
-                        if contact_restitution_fires(phi, relative, data.dt, data.restitution_threshold):
-                            rhs = -target + restitution * relative
+                        fires, bounce = contact_restitution_rhs(
+                            phi, relative, target, restitution, data.dt, data.restitution_threshold
+                        )
+                        if fires:
+                            rhs = bounce
                             weight = 1.0
                 else:
                     phi, beta, row_mu = patch_tangent_row(law, contact, row, mu, data.friction_scale)
                     row_restitution = 0.0
                     kind = int(PGS_CONSTRAINT_TYPE_FRICTION)
                     parent = slot
-                    rhs += data.bias_scale * beta * phi * inv_dt
+                    rhs, _w = row_rhs(kind, phi, beta, target, inv_dt, data.bias_scale, 0.0, 0.0, 1.0)
                 data.row_type[world, output_row] = kind
                 data.row_parent[world, output_row] = parent
                 data.row_mu[world, output_row] = row_mu

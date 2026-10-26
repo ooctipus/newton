@@ -28,8 +28,8 @@ from .kernels import (
     PGS_CONSTRAINT_TYPE_JOINT_LIMIT,
     PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT,
     PGS_CONSTRAINT_TYPE_MIMIC,
-    contact_restitution_fires,
 )
+from .row_laws import ROW_LAW, contact_restitution_rhs, row_rhs
 from .sparse_mass_matrix import _SparseRowSupport
 from .sparse_row_projection import _sparse_contact_projection_source
 
@@ -581,10 +581,8 @@ def _get_sparse_contact_response_kernel(
                         mu *= rows.friction_scale
                         row_type = PGS_CONSTRAINT_TYPE_FRICTION
                         parent = contact_slot[c]
-                    inv_dt = 1.0 / dt
-                    bias = beta * phi * inv_dt
-                    if lane == 0 and phi > 0.0:
-                        bias = rows.speculative_scale * phi * inv_dt
+                    # The position pass's row law (bias scale and contact weight 1).
+                    rhs, _row_w = row_rhs(row_type, phi, beta, target, 1.0 / dt, 1.0, rows.speculative_scale, 0.0, 1.0)
                     rows.type[world, slot] = row_type
                     rows.parent[world, slot] = parent
                     rows.mu[world, slot] = mu
@@ -594,7 +592,7 @@ def _get_sparse_contact_response_kernel(
                         rows.phi[world, slot] = phi
                         rows.target_velocity[world, slot] = target
                         rows.restitution[world, slot] = restitution
-                    rows.rhs[world, slot] = -target + bias
+                    rows.rhs[world, slot] = rhs
 
             # Fixed component constructors avoid materializing dynamically
             # indexed matrices in local memory during geometry assembly.
@@ -661,13 +659,20 @@ def _get_sparse_contact_response_kernel(
                 if lane == 0:
                     world = contact_world[c]
                     slot = contact_slot[c]
-                    target = rows.target_velocity[world, slot]
-                    relative_incident = row_incident[world, slot] - target
-                    restitution = rows.restitution[world, slot]
-                    if restitution > 0.0 and contact_restitution_fires(
-                        rows.phi[world, slot], relative_incident, dt, rows.restitution_velocity_threshold
-                    ):
-                        rows.rhs[world, slot] = -target + restitution * relative_incident
+                    # Only a restitutive contact reads its row back for the rebound law.
+                    row_restitution = rows.restitution[world, slot]
+                    if row_restitution > 0.0:
+                        target = rows.target_velocity[world, slot]
+                        fires, bounce = contact_restitution_rhs(
+                            rows.phi[world, slot],
+                            row_incident[world, slot] - target,
+                            target,
+                            row_restitution,
+                            dt,
+                            rows.restitution_velocity_threshold,
+                        )
+                        if fires:
+                            rows.rhs[world, slot] = bounce
 
     contact_kernel.__name__ = f"populate_sparse_contact_response_{n}_{lanes}_{warps}"
     if prepare_rows:
@@ -688,16 +693,22 @@ def finalize_sparse_joint_limit_rows(
     dt: float,
     diagonal: wp.array2d[float],
 ):
-    """Finish the internal-constraint prefix; contacts are already complete."""
+    """Finish the internal-constraint prefix with each row's law; contacts are already complete."""
     world = wp.tid()
     for row in range(wp.min(phase_bounds[world, 1], constraint_count[world])):
-        phi = rows.phi[world, row]
-        inv_dt = 1.0 / dt
-        bias = phi * inv_dt
-        if phi < 0.0 or rows.type[world, row] == PGS_CONSTRAINT_TYPE_MIMIC:
-            bias = rows.beta_row[world, row] * phi * inv_dt
+        rhs, _row_w = row_rhs(
+            rows.type[world, row],
+            rows.phi[world, row],
+            rows.beta_row[world, row],
+            rows.target_velocity[world, row],
+            1.0 / dt,
+            1.0,
+            0.0,
+            1.0,
+            1.0,
+        )
         diagonal[world, row] += rows.cfm_row[world, row]
-        rows.rhs[world, row] = -rows.target_velocity[world, row] + bias
+        rows.rhs[world, row] = rhs
 
 
 @wp.func_native(
@@ -724,11 +735,10 @@ def finalize_sparse_joint_limit_rows(
         float gap = 0.0f;
         int active = 0;
         if (q_index >= 0) {
-            const float position = joint_q.data[q_index];
-            const float bound = side == 0 ? joint_limit_lower.data[dof] : joint_limit_upper.data[dof];
-            gap = side == 0 ? position - bound : bound - position;
-            active = wp::isfinite(bound)
-                && (side == 0 ? position <= bound + activation_gap : position >= bound - activation_gap);
+            const auto limit = RowLaw::joint_limit_side(joint_q.data[q_index], joint_limit_lower.data[dof],
+                                                        joint_limit_upper.data[dof], side, activation_gap);
+            active = limit.v0;
+            gap = limit.v1;
         }
         const unsigned active_mask = BALLOT(active != 0);
         const int first_slot = RESERVE(&slot_counter.data[world], COUNT(active_mask));
@@ -784,7 +794,7 @@ def finalize_sparse_joint_limit_rows(
         }
     }
 """.replace("$LIMIT_TYPE", str(PGS_CONSTRAINT_TYPE_JOINT_LIMIT)),
-        preludes=(lane_group(32),),
+        preludes=(lane_group(32), *ROW_LAW.preludes()),
     )
 )
 def _build_sparse_joint_limit_rows(
@@ -1133,13 +1143,13 @@ def build_sparse_joint_velocity_limit_rows(
             row_mu.data[row_offset] = 0.0f;
             row_beta.data[row_offset] = pgs_beta;
             row_cfm.data[row_offset] = pgs_cfm;
-            phi.data[row_offset] = joint_q.data[mimic_q0.data[k]]
-                - coefficient * joint_q.data[mimic_q1.data[k]] - mimic_coef0.data[k];
+            phi.data[row_offset] = RowLaw::mimic_phi(joint_q.data[mimic_q0.data[k]], joint_q.data[mimic_q1.data[k]],
+                                                     mimic_coef0.data[k], coefficient);
             target_velocity.data[row_offset] = 0.0f;
         }
     }
 """.replace("$MIMIC_TYPE", str(PGS_CONSTRAINT_TYPE_MIMIC)),
-        preludes=(lane_group(32),),
+        preludes=(lane_group(32), *ROW_LAW.preludes()),
     )
 )
 def _build_sparse_mimic_rows(

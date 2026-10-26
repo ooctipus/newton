@@ -220,6 +220,7 @@ from .row_build import (
     populate_world_J_masked_patch,
 )
 from .row_inputs import make_row_kernel
+from .row_laws import ROW_LAW
 from .solve_policy import (
     EXACT_POLICY,
     SOLVE_READOUTS,
@@ -13428,10 +13429,10 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
         float phi_value = 0.0f;
         int active = 0;
         if (q_index >= 0) {{
-            const float q = joint_q.data[q_index];
-            const float bound = side == 0 ? joint_limit_lower.data[dof] : joint_limit_upper.data[dof];
-            phi_value = side == 0 ? q - bound : bound - q;
-            active = isfinite(bound) && (side == 0 ? q <= bound + activation_gap : q >= bound - activation_gap);
+            const auto limit = RowLaw::joint_limit_side(joint_q.data[q_index], joint_limit_lower.data[dof],
+                                                        joint_limit_upper.data[dof], side, activation_gap);
+            active = limit.v0;
+            phi_value = limit.v1;
         }}
 
         const unsigned active_mask = BALLOT(active != 0);
@@ -13454,7 +13455,7 @@ def _get_joint_limit_warp_kernel(size: int, device_arch: str, warps_per_block: i
 #endif
 """
 
-    @wp.func_native(cuda_native(snippet, preludes=(lane_group(32),)))
+    @wp.func_native(cuda_native(snippet, preludes=(lane_group(32), *ROW_LAW.preludes())))
     def joint_limit_warp_native(
         block: int,
         articulation_count: int,

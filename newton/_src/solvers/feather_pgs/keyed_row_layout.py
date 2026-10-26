@@ -11,6 +11,7 @@ import warp as wp
 
 from ...sim import JointType
 from .device_preludes import dual_native, lane_group
+from .row_laws import ROW_LAW
 
 
 @dataclass(frozen=True)
@@ -143,16 +144,16 @@ def prefix_kernel(layout, prefix_type, rows_type):
                 if (phase == 0 && ($POSITION & (1u << d)) != 0u) {
                     const int qi = p.q_index.data[dof];
                     if (qi >= 0) {
-                        const float bound = side == 0 ? p.lower.data[dof] : p.upper.data[dof];
-                        const float q = p.q.data[qi];
-                        phi = side == 0 ? q - bound : bound - q;
-                        active = isfinite(bound) && (side == 0 ? q <= bound + p.gap : q >= bound - p.gap);
+                        const auto limit = RowLaw::joint_limit_side(p.q.data[qi], p.lower.data[dof], p.upper.data[dof],
+                                                                    side, p.gap);
+                        active = limit.v0;
+                        phi = limit.v1;
                     }
                 }
 #if $VELOCITY
                 else if (phase == 1 && ($MASK & (1u << d)) != 0u) {
                     const float limit = p.velocity_limit.data[dof];
-                    active = !(limit <= 0.0f) && !(p.activation > 0.0f && fabsf(p.vhat.data[dof]) < p.activation * limit);
+                    active = RowLaw::velocity_limit_active(limit, p.vhat.data[dof], p.activation);
                     target = -limit;
                 }
 #endif
@@ -168,7 +169,10 @@ def prefix_kernel(layout, prefix_type, rows_type):
                 p.cfm.data[at] = p.pgs_cfm;
                 p.phi.data[at] = phi; p.target.data[at] = target;
                 p.restitution.data[at] = 0.0f;
-                p.rhs.data[at] = phase == 1 ? -target : ((phi < 0.0f ? p.pgs_beta : 1.0f) * phi / p.dt);
+                // The position pass's row law (bias scale 1): a limit's Baumgarte or speculative term, a velocity
+                // limit's target.
+                p.rhs.data[at] = RowLaw::row_rhs(phase == 0 ? 3 : 4, phi, phase == 0 ? p.pgs_beta : 0.0f, target,
+                                                 1.0f / p.dt, 1.0f, 0.0f, 1.0f, 1.0f).v0;
 #if $VELOCITY
                 if (phase == 1) {
                     p.velocity_slots.data[dof * 2 + side] = slot;
@@ -206,7 +210,7 @@ def prefix_kernel(layout, prefix_type, rows_type):
         source = source.replace(key, str(value))
 
     # A warp generates a world's rows on CUDA, one thread on the CPU.
-    @wp.func_native(dual_native(source, preludes=(lane_group(32),)))
+    @wp.func_native(dual_native(source, preludes=(lane_group(32), *ROW_LAW.preludes())))
     def native(world: int, p: prefix_type, z: rows_type): ...
 
     @wp.kernel(module="unique", enable_backward=False)

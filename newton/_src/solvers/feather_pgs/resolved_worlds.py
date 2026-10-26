@@ -22,7 +22,7 @@ import numpy as np
 import warp as wp
 
 from .contact_laws import contact_points_endpoint_relative, contact_responds, contact_restitution, jacobian_entry
-from .kernels import contact_restitution_fires
+from .row_laws import contact_depenetration_cap, contact_restitution_rhs, contact_rhs, joint_limit_side, limit_rhs
 
 LANES = 32
 
@@ -177,20 +177,11 @@ def check_world_limits(data: ResolvedWorldInput, scratch: ResolvedWorldScratch):
             valid = False
             continue
         for side in range(2):
-            bound = lower
-            active = wp.isfinite(lower) and q <= lower + data.activation_gap
-            phi = q - lower
-            signed_velocity = velocity
-            if side == 1:
-                bound = upper
-                active = wp.isfinite(upper) and q >= upper - data.activation_gap
-                phi = upper - q
-                signed_velocity = -velocity
-            if active and wp.isfinite(bound):
+            active, phi, sign = joint_limit_side(q, lower, upper, side, data.activation_gap)
+            if active:
                 checked += 1
-                bias = phi / data.dt
-                if phi < 0.0:
-                    bias = data.beta * phi / data.dt
+                signed_velocity = sign * velocity
+                bias = limit_rhs(phi, data.beta, 0.0, 1.0 / data.dt, 1.0, 1.0)
                 residual = signed_velocity + bias
                 minimum = wp.min(minimum, residual)
                 valid = valid and _passes(residual, wp.abs(signed_velocity) + wp.abs(bias), data)
@@ -479,22 +470,19 @@ def _check_normal(c: int, raw: RawContacts, data: ResolvedWorldInput, scratch: R
     speed_a = _endpoint_speed(body_a, art_a, mf, lever_a, n, twist_a, data)
     speed_b = _endpoint_speed(body_b, art_b, mf, lever_b, n, twist_b, data)
     incident = speed_a - speed_b
-    bias = data.speculative_scale * phi / data.dt
-    if phi < 0.0:
-        bias = data.beta * phi / data.dt
-        if mf:
-            cap = float(1.0e20)
-            if responds_a:
-                cap = data.max_depenetration_velocity[body_a]
-            if responds_b:
-                cap_b = data.max_depenetration_velocity[body_b]
-                if cap_b > 0.0 and wp.isfinite(cap_b) and cap_b < cap:
-                    cap = cap_b
-            if cap > 0.0 and wp.isfinite(cap):
-                bias = wp.max(bias, -cap)
+    # The row law's bias: a matrix-free contact's Baumgarte term is capped by its responding bodies'
+    # depenetration speed (no cap elsewhere).
+    cap = float(0.0)
+    if mf:
+        cap = contact_depenetration_cap(
+            wp.where(responds_a, body_a, -1), wp.where(responds_b, body_b, -1), data.max_depenetration_velocity
+        )
+    bias, _row_w = contact_rhs(phi, data.beta, 0.0, 1.0 / data.dt, 1.0, data.speculative_scale, 1.0, cap, 0.0)
     restitution = contact_restitution(shape_a, shape_b, raw.shape_restitution)
-    if restitution > 0.0 and contact_restitution_fires(phi, incident, data.dt, data.restitution_threshold):
-        bias = restitution * incident
+    if restitution > 0.0:
+        fires, bounce = contact_restitution_rhs(phi, incident, 0.0, restitution, data.dt, data.restitution_threshold)
+        if fires:
+            bias = bounce
     residual = incident + bias
     wp.atomic_min(scratch.minimum_residual, world, residual)
     valid = _finite3(separation) and _finite3(lever_a) and _finite3(lever_b) and wp.isfinite(phi)

@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The row laws against every row builder and pass that forms a row's right-hand side or candidate.
+"""The row builders and passes that form a row's right-hand side or candidate, against the row laws.
 
-A replaced implementation is launched as the solver launches it, or compiled from
-its text anchored in its module; a unified rounding or literal variant is bounded
-in units of the terms and recorded in ``UNIFICATIONS``.
+Each kernel is launched as the solver launches it and compared with the laws'
+composition written out here: bitwise on the CPU, and on CUDA within rounding of the
+terms (``UNIFICATIONS`` records how many values moved).
 """
 
 import unittest
@@ -15,16 +15,10 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs import kernels, row_laws
 from newton.tests.feather_pgs_law_harness import (
-    anchored,
     call,
-    dedent_block,
     joint_type,
     mismatches,
-    native_kernel,
-    reference_kernel,
     register_device_tests,
-    require_cuda,
-    run_native,
     scalars,
     unified,
 )
@@ -132,25 +126,22 @@ def _law_restitution_fires(phi: wp.array[float], u: wp.array[float], dt: float, 
     out[i] = wp.where(row_laws.contact_restitution_fires(phi[i], u[i], dt, threshold), 1, 0)
 
 
-@wp.kernel
-def _kernel_restitution_fires(
-    phi: wp.array[float], u: wp.array[float], dt: float, threshold: float, out: wp.array[int]
-):
-    i = wp.tid()
-    out[i] = wp.where(kernels.contact_restitution_fires(phi[i], u[i], dt, threshold), 1, 0)
+def test_restitution_fires_where_the_impact_reaches_the_surface(test, device):
+    """Fire for a contact closing faster than the threshold that is at the surface or reaches it during the step.
 
-
-def test_restitution_fires_matches_kernels(test, device):
-    """Fire exactly where ``kernels.contact_restitution_fires`` fires, end-gap slop included."""
+    The end-gap slop absorbs float32 residuals of rows that land exactly at contact.
+    """
     rng = np.random.default_rng(12)
     n = 8192
     phi = scalars(rng, n, 0.01)
     u = scalars(rng, n, 1.0)
     u[::5] = -0.5  # at the threshold
-    values = {"phi": phi, "u": u, "dt": 1.0 / 60.0, "threshold": 0.5, "out": np.zeros(n, dtype=np.int32)}
+    dt = np.float32(1.0 / 60.0)
+    values = {"phi": phi, "u": u, "dt": float(dt), "threshold": 0.5, "out": np.zeros(n, dtype=np.int32)}
     law = call(_law_restitution_fires, n, device, **values)["out"].numpy()
-    reference = call(_kernel_restitution_fires, n, device, **values)["out"].numpy()
-    np.testing.assert_array_equal(law, reference)
+    slop = np.float32(row_laws.CONTACT_END_GAP_SLOP)
+    expected = (u < np.float32(-0.5)) & ((phi <= slop) | (phi + dt * u <= slop))
+    np.testing.assert_array_equal(law, expected.astype(np.int32))
     test.assertGreater(law.sum(), 0)
 
 
@@ -243,11 +234,7 @@ def _law_mf_position_rhs(
 
 
 def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
-    """Equal ``compute_mf_effective_mass_and_rhs`` up to its ``x / dt`` rounding, with the same caps and weights.
-
-    Unified variant: the matrix-free bias divides by ``dt`` where the canonical law multiplies by ``1 / dt``
-    (and penetration starts at ``phi <= 0``, where it was ``phi < 0``, which only flips the sign of a zero).
-    """
+    """Equal ``compute_mf_effective_mass_and_rhs``: the contact law with its bodies' depenetration cap and weights."""
     rng = np.random.default_rng(13)
     worlds, rows = 8, 48
     layout = _mf_layout(rng, worlds, rows)
@@ -371,7 +358,7 @@ def _law_mf_pass_rhs(
 
 
 def test_contact_rhs_matches_mf_rhs_bias(test, device):
-    """Equal ``compute_mf_rhs_bias`` in its position and velocity passes up to its ``x / dt`` rounding.
+    """Equal ``compute_mf_rhs_bias`` in its position and velocity passes.
 
     The velocity pass keeps a separated row's speculative bias while the position
     solve's linearized end gap is open; the law reads that gap as ``end_gap``.
@@ -510,11 +497,11 @@ def _law_velocity_pass(
 
 
 def test_velocity_pass_matches_world_contact_velocity_bias(test, device):
-    """Equal ``compute_world_contact_velocity_bias`` (the dense velocity pass), apart from signs of zero.
+    """Equal ``compute_world_contact_velocity_bias`` (the dense velocity pass).
 
     The pass is the contact law with no Baumgarte and no speculative scale, keeping
     a separated row's bias while its end gap is open, and the limit law with no
-    Baumgarte; a closed row's ``-target + 0`` may turn a ``-0`` target into ``+0``.
+    Baumgarte.
     """
     rng = np.random.default_rng(15)
     worlds, rows, dofs = 8, 32, 12
@@ -655,11 +642,10 @@ def _law_restitution_accumulated(
 
 
 def test_restitution_matches_accumulated_restitution(test, device):
-    """Equal ``apply_world_contact_restitution_accumulated`` up to its geometric bias's ``x / dt`` rounding.
+    """Equal ``apply_world_contact_restitution_accumulated``.
 
-    Unified variant: the split route recovers the incident velocity by removing a
-    bias it recomputes as ``beta * phi / dt``; the law removes the bias the position
-    pass added, ``bias_scale * beta * phi * (1 / dt)``.
+    The split route recovers the incident velocity by removing the bias the position
+    pass added, the contact law's ``beta * phi * (1 / dt)``.
     """
     rng = np.random.default_rng(17)
     worlds, rows = 8, 64
@@ -968,202 +954,8 @@ def test_velocity_limit_active_matches_velocity_limit_slots(test, device):
             np.testing.assert_array_equal(rows.astype(np.int32), law["active"].numpy())
 
 
-# The contact and limit rhs of the Warp row producers that the laws unify, as each writes it.
-_ROW_PACKETS_RHS = """
-                    if phi <= 0.0:
-                        rhs += data.bias_scale * beta * phi / data.dt
-                        weight = data.contact_w
-                    else:
-                        rhs += data.speculative_scale * phi / data.dt
-"""
-_SPARSE_CONTACT_RHS = """
-                    inv_dt = 1.0 / dt
-                    bias = beta * phi * inv_dt
-                    if lane == 0 and phi > 0.0:
-                        bias = rows.speculative_scale * phi * inv_dt
-"""
-_SPARSE_LIMIT_RHS = """
-        inv_dt = 1.0 / dt
-        bias = phi * inv_dt
-        if phi < 0.0 or rows.type[world, row] == PGS_CONSTRAINT_TYPE_MIMIC:
-            bias = rows.beta_row[world, row] * phi * inv_dt
-"""
-_RESOLVED_RESIDUAL = """
-    bias = data.speculative_scale * phi / data.dt
-    if phi < 0.0:
-        bias = data.beta * phi / data.dt
-        if mf:
-            cap = float(1.0e20)
-            if responds_a:
-                cap = data.max_depenetration_velocity[body_a]
-            if responds_b:
-                cap_b = data.max_depenetration_velocity[body_b]
-                if cap_b > 0.0 and wp.isfinite(cap_b) and cap_b < cap:
-                    cap = cap_b
-            if cap > 0.0 and wp.isfinite(cap):
-                bias = wp.max(bias, -cap)
-"""
-
-
-def test_contact_rhs_unifies_warp_row_producers(test, device):
-    """Unify the row producers' rhs variants with the canonical laws, within 2 units of the bias terms.
-
-    * ``row_packets.produce_contacts``: ``x / dt`` where the law has ``x * (1 / dt)``;
-    * ``sparse_contact``: the bias without ``bias_scale`` (always 1 there), selected before the add, so the
-      law's fused multiply-add rounds once less; its limit and mimic prefix the same way;
-    * ``resolved_worlds._check_normal``: the predicted residual's ``x / dt`` and ``phi < 0`` boundary.
-    """
-    for module, text in (
-        ("row_packets.py", _ROW_PACKETS_RHS),
-        ("sparse_contact.py", _SPARSE_CONTACT_RHS),
-        ("sparse_contact.py", _SPARSE_LIMIT_RHS),
-        ("resolved_worlds.py", _RESOLVED_RESIDUAL),
-    ):
-        anchored(test, module, text)
-    signature = (
-        "phi_in: wp.array[float], beta_in: wp.array[float], target_in: wp.array[float], kind_in: wp.array[int], "
-        "cap_in: wp.array[wp.vec2], incident_in: wp.array[float], out: wp.array[wp.vec4]"
-    )
-    settings = "dt = 1.0 / 60.0\nbias_scale = 0.8\nspeculative = 0.9\n"
-    reference_body = (
-        "i = wp.tid()\n"
-        + settings
-        + "phi = phi_in[i]\nbeta = beta_in[i]\ntarget = target_in[i]\nlane = int(0)\n"
-        + "rhs = -target\nweight = float(1.0)\n"
-        + dedent_block(_ROW_PACKETS_RHS)
-        .replace("data.bias_scale", "bias_scale")
-        .replace("data.dt", "dt")
-        .replace("data.contact_w", "0.5")
-        .replace("data.speculative_scale", "speculative")
-        + "packets = rhs\n"
-        + dedent_block(_SPARSE_CONTACT_RHS).replace("rows.speculative_scale", "speculative")
-        + "sparse = -target + bias\nworld = int(0)\nrow = i\n"
-        + dedent_block(_SPARSE_LIMIT_RHS)
-        .replace("rows.type[world, row]", "kind_in[i]")
-        .replace("rows.beta_row[world, row]", "beta")
-        + "limit = -target + bias\n"
-        + "mf = True\nresponds_a = cap_in[i][0] >= 0.0\nresponds_b = cap_in[i][1] >= 0.0\nbody_a = int(0)\nbody_b = int(1)\n"
-        + dedent_block(_RESOLVED_RESIDUAL)
-        .replace("data.speculative_scale", "speculative")
-        .replace("data.dt", "dt")
-        .replace("data.beta", "beta")
-        .replace("data.max_depenetration_velocity[body_a]", "cap_in[i][0]")
-        .replace("data.max_depenetration_velocity[body_b]", "cap_in[i][1]")
-        + "residual = incident_in[i] + bias\n"
-        + "out[i] = wp.vec4(packets, sparse, limit, residual)\n"
-    )
-    reference = reference_kernel(
-        "producer_rhs_reference",
-        signature,
-        reference_body,
-        {"PGS_CONSTRAINT_TYPE_MIMIC": kernels.PGS_CONSTRAINT_TYPE_MIMIC},
-    )
-    law_body = (
-        "i = wp.tid()\n"
-        + settings
-        + "phi = phi_in[i]\nbeta = beta_in[i]\ntarget = target_in[i]\ninv_dt = 1.0 / dt\n"
-        + "packets, w = row_laws.contact_rhs(phi, beta, target, inv_dt, bias_scale, speculative, 0.5, 0.0, 0.0)\n"
-        + "sparse, w2 = row_laws.contact_rhs(phi, beta, target, inv_dt, 1.0, speculative, 1.0, 0.0, 0.0)\n"
-        + "limit, w3 = row_laws.row_rhs(kind_in[i], phi, beta, target, inv_dt, 1.0, 0.0, 1.0, 1.0)\n"
-        + "body_a = int(-1)\nif cap_in[i][0] >= 0.0:\n    body_a = 2 * i\n"
-        + "body_b = int(-1)\nif cap_in[i][1] >= 0.0:\n    body_b = 2 * i + 1\n"
-        + "cap = row_laws.contact_depenetration_cap(body_a, body_b, caps_flat)\n"
-        + "bias, w4 = row_laws.contact_rhs(phi, beta, 0.0, inv_dt, 1.0, speculative, 1.0, cap, 0.0)\n"
-        + "residual = incident_in[i] + bias\n"
-        + "out[i] = wp.vec4(packets, sparse, limit, residual)\n"
-    )
-    law = reference_kernel(
-        "producer_rhs_law", signature + ", caps_flat: wp.array[float]", law_body, {"row_laws": row_laws}
-    )
-    rng = np.random.default_rng(55)
-    n = 32768
-    caps = rng.choice(np.array([-1.0, 0.5, 2.0, 0.0, np.inf], dtype=np.float32), (n, 2))
-    values = {
-        "phi_in": scalars(rng, n, 0.02),
-        "beta_in": rng.uniform(0.0, 1.0, n).astype(np.float32),
-        "target_in": scalars(rng, n),
-        "kind_in": rng.choice(np.array([3, 5], dtype=np.int32), n),
-        "cap_in": caps,
-        "incident_in": scalars(rng, n),
-        "out": np.zeros((n, 4), dtype=np.float32),
-    }
-    a = call(reference, n, device, **values)["out"].numpy()
-    b = call(law, n, device, caps_flat=caps.reshape(-1), **values)["out"].numpy()
-    magnitude = np.abs(values["phi_in"]) * 60.0 + np.abs(values["target_in"]) + np.abs(values["incident_in"])
-    for column, name in enumerate(
-        (
-            "row_packets.produce_contacts rhs",
-            "sparse_contact contact rhs",
-            "sparse_contact limit and mimic prefix rhs",
-            "resolved_worlds predicted residual",
-        )
-    ):
-        test.assertLessEqual(unified(name, a[:, column], b[:, column], magnitude, 2.0), 2.0, name)
-
-
-def test_keyed_rows_rhs_matches_native_rows(test, device):
-    """Unify the keyed rows' native rhs (``x / dt``) and literal ``1e-6`` slop with the canonical row laws.
-
-    Contact and limit biases move by the rounding of ``x / dt`` against ``x * (1 / dt)``;
-    the restitution test with the literal slop fires exactly where the law fires.
-    """
-    require_cuda(test, device)
-    contact = anchored(
-        test, "keyed_rows.py", "rhs += (phi <= 0.0f ? c.bias_scale * c.beta : c.speculative_scale) * phi / c.dt;"
-    )
-    fires = anchored(
-        test,
-        "keyed_rows.py",
-        "if (relative < -c.restitution_threshold && (phi <= 1.0e-6f || phi + c.dt * relative <= 1.0e-6f))",
-    )
-    limit = anchored(test, "keyed_row_layout.py", "((phi < 0.0f ? p.pgs_beta : 1.0f) * phi / p.dt)")
-    rng = np.random.default_rng(54)
-    n = 32768
-    values = {
-        "phi": scalars(rng, n, 0.02),
-        "target": scalars(rng, n),
-        "relative": scalars(rng, n),
-        "beta": rng.uniform(0.0, 1.0, n).astype(np.float32),
-    }
-    inputs = dict.fromkeys(values, float)
-    outputs = {"contact_rhs": float, "fired": float, "limit_rhs": float}
-    constants = "    const float bias_scale = 0.7f, speculative_scale = 0.9f, dt = 1.0f / 60.0f, threshold = 0.2f;\n"
-    reference_body = (
-        constants
-        + "    float rhs = -target;\n    "
-        + contact.replace("c.bias_scale", "bias_scale")
-        .replace("c.beta", "beta")
-        .replace("c.speculative_scale", "speculative_scale")
-        .replace("c.dt", "dt")
-        + "\n    const float contact_rhs = rhs;\n    float fired = 0.0f;\n    "
-        + fires.replace("c.restitution_threshold", "threshold").replace("c.dt", "dt")
-        + " fired = 1.0f;\n    const float limit_rhs = "
-        + limit.replace("p.pgs_beta", "beta").replace("p.dt", "dt")
-        + ";"
-    )
-    law_body = (
-        constants
-        + "    const float contact_rhs = RowLaw::contact_rhs(phi, beta, target, 1.0f / dt, bias_scale, speculative_scale, 1.0f, 0.0f, 0.0f).v0;\n"
-        "    const float fired = RowLaw::contact_restitution_fires(phi, relative, dt, threshold) ? 1.0f : 0.0f;\n"
-        "    const float limit_rhs = RowLaw::limit_rhs(phi, beta, 0.0f, 1.0f / dt, 1.0f, 1.0f);"
-    )
-    reference = native_kernel("native_keyed_rhs", inputs, outputs, reference_body)
-    law = native_kernel("law_keyed_rhs", inputs, outputs, law_body, preludes=row_laws.ROW_LAW.preludes())
-    a = run_native(reference, inputs, outputs, values, n, device)
-    b = run_native(law, inputs, outputs, values, n, device)
-    np.testing.assert_array_equal(a["fired"], b["fired"])
-    magnitude = np.abs(values["phi"]) * 60.0 + np.abs(values["target"])
-    test.assertLessEqual(
-        unified("keyed rows contact rhs (native)", a["contact_rhs"], b["contact_rhs"], magnitude, 2.0), 2.0
-    )
-    limit_magnitude = np.abs(values["phi"]) * 60.0
-    test.assertLessEqual(
-        unified("keyed rows limit prefix rhs (native)", a["limit_rhs"], b["limit_rhs"], limit_magnitude, 2.0), 2.0
-    )
-
-
 class TestFeatherPGSRowLaws(unittest.TestCase):
-    """Each row law against the implementations it replaces."""
+    """The row-rhs producers against the row laws they compose."""
 
 
 register_device_tests(TestFeatherPGSRowLaws, globals())

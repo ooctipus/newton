@@ -27,7 +27,9 @@ from .friction_patches import PatchRowLaw
 from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 from .keyed_row_layout import prefix_kernel
 from .keyed_row_layout import topology_plan as direct_topology_plan
+from .law_source import law_preludes
 from .row_inputs import ParallelRowInputs, RowArgument
+from .row_laws import ROW_LAW
 
 
 @wp.struct
@@ -110,15 +112,15 @@ def scatter_patch_contact_keys(data: ContactInput, z: KineticRows):
                     data.row_mu[world, row] = mu * data.friction_scale
 
 
-ROW_PRELUDES = CONTACT_LAW.preludes()
-"""Device preludes of the row source: the contact laws it calls (``ContactLaw::...``)."""
+ROW_PRELUDES = law_preludes(CONTACT_LAW, ROW_LAW)
+"""Device preludes of the row source: the contact and row laws it calls (``ContactLaw::...``, ``RowLaw::...``)."""
 
 
 def _row_source(*, layout, output="Jr[q]", private_metadata=False, patch=False):
     """Share row geometry and metadata between direct ingestion and the fallback.
 
     A contact row takes its geometry, frame, target, materials and Jacobian entries
-    from the contact laws (:data:`ROW_PRELUDES`). ``patch`` writes the persistent
+    from the contact laws and its rhs from the row laws (:data:`ROW_PRELUDES`). ``patch`` writes the persistent
     patch row law: tangent rows act at the patch friction location for both the
     Jacobian and the prescribed target, carry the anchor's tangential phi and
     correct it with ``patch_law.beta``; every row's type, parent and coefficient
@@ -161,13 +163,12 @@ def _row_source(*, layout, output="Jr[q]", private_metadata=False, patch=False):
             "const wp::vec3 fa = patch_law.patches.point_a.data[contact], fb = patch_law.patches.point_b.data[contact];"
         )
         tangent_phi = "patch_law.patches.phi.data[contact][r - 1]"
-        row_law = (
-            "        if (r > 0) rhs += c.bias_scale * patch_law.beta * phi / c.dt;\n"
-            "        c.row_beta.data[at] = r == 0 ? c.beta : patch_law.beta;\n"
-        )
+        tangent_beta = "patch_law.beta"
+        row_law = "        c.row_beta.data[at] = r == 0 ? c.beta : patch_law.beta;\n"
     else:
         friction_location = "const auto [fa, fb] = ContactLaw::contact_friction_points(pa, pb, c.shared_anchor, c.friction_shared_anchor);"
         tangent_phi = "0.0f"
+        tangent_beta = "0.0f"
         row_law = (
             "        c.row_type.data[at] = r == 0 ? 0 : 2;\n"
             "        c.row_parent.data[at] = r == 0 ? -1 : c.slot.data[contact];\n"
@@ -210,16 +211,15 @@ __PREFIX__
         const float friction = mu * c.friction_scale;
 __PROJECTION__
         const float phi = r == 0 ? separation : __TANGENT_PHI__;
-        float rhs = -target;
-        if (r == 0) {
-            rhs += (phi <= 0.0f ? c.bias_scale * c.beta : c.speculative_scale) * phi / c.dt;
-            if (restitution > 0.0f) {
-                float relative = -target;
-                #pragma unroll
-                for (int q = 0; q < __DOFS__; ++q) { __INCIDENT__ }
-                if (relative < -c.restitution_threshold && (phi <= 1.0e-6f || phi + c.dt * relative <= 1.0e-6f))
-                    rhs = -target + restitution * relative;
-            }
+        float rhs = RowLaw::row_rhs(r == 0 ? 0 : 2, phi, r == 0 ? c.beta : __TANGENT_BETA__, target, 1.0f / c.dt,
+                                    c.bias_scale, c.speculative_scale, 0.0f, 1.0f).v0;
+        if (r == 0 && restitution > 0.0f) {
+            float relative = -target;
+            #pragma unroll
+            for (int q = 0; q < __DOFS__; ++q) { __INCIDENT__ }
+            const auto bounce = RowLaw::contact_restitution_rhs(phi, relative, target, restitution, c.dt,
+                                                                c.restitution_threshold);
+            if (bounce.v0) rhs = bounce.v1;
         }
 __ROW_LAW__        c.row_cfm.data[at] = c.cfm;
         c.phi.data[at] = phi; c.target.data[at] = target;
@@ -232,6 +232,7 @@ __ROW_LAW__        c.row_cfm.data[at] = c.cfm;
         .replace("__PROJECTION__", projection)
         .replace("__INCIDENT__", incident)
         .replace("__TANGENT_PHI__", tangent_phi)
+        .replace("__TANGENT_BETA__", tangent_beta)
         .replace("__ROW_LAW__", row_law)
         .replace("__PRIVATE_METADATA__", metadata)
         .replace("__DOFS__", str(dofs))

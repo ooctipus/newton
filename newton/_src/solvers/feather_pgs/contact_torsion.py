@@ -24,11 +24,11 @@ import warp as wp
 from ...geometry import GeoType
 from ...utils.selection import match_labels
 from .kernels import (
-    _FPGS_CONTACT_END_GAP_SLOP,
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
     PGS_CONSTRAINT_TYPE_TORSION,
 )
+from .row_laws import CONTACT_END_GAP_SLOP
 
 _TOUCH_TOLERANCE = 1.0e-5
 _NORMAL_COSINE = 0.999
@@ -335,7 +335,7 @@ def _prepare_velocity_torsion_rows(
             # Retain touching support through rebound, with the existing end-gap
             # slop as the initial touching tolerance. Otherwise require contact
             # by the position end. Final normal load still bounds all traction.
-            if phi[world, row] <= _FPGS_CONTACT_END_GAP_SLOP or end_gap <= _FPGS_CONTACT_END_GAP_SLOP:
+            if phi[world, row] <= CONTACT_END_GAP_SLOP or end_gap <= CONTACT_END_GAP_SLOP:
                 touching = True
     # The angular row has no positional spring: retain prescribed angular
     # target motion but not position-solve contact correction or restitution.

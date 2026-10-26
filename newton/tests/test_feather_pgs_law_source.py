@@ -90,7 +90,6 @@ class TestLawSource(unittest.TestCase):
         """Keep the row kinds, slops and iteration counts of the kernels the laws replace."""
         for name in ("CONTACT", "JOINT_TARGET", "FRICTION", "JOINT_LIMIT", "JOINT_VELOCITY_LIMIT", "MIMIC", "CONNECT"):
             self.assertEqual(getattr(row_laws, f"ROW_{name}"), getattr(kernels, f"PGS_CONSTRAINT_TYPE_{name}"))
-        self.assertEqual(row_laws.CONTACT_END_GAP_SLOP, kernels._FPGS_CONTACT_END_GAP_SLOP)
         self.assertEqual(projection_laws.COULOMB_BISECTION_STEPS, kernels._FPGS_BISECTION_ITERS)
         self.assertEqual(projection_laws.COULOMB_NEWTON_EXPANSIONS, kernels._FPGS_COULOMB_NEWTON_EXPAND_ITERS)
         self.assertEqual(projection_laws.COULOMB_NEWTON_STEPS, kernels._FPGS_COULOMB_NEWTON_NEWTON_ITERS)
