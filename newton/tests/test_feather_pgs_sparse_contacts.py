@@ -6,6 +6,8 @@ import unittest
 import numpy as np
 import warp as wp
 
+from newton._src.solvers.feather_pgs import dense_rows, field_group
+from newton._src.solvers.feather_pgs.contact_input import ContactInput
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
@@ -18,7 +20,6 @@ from newton._src.solvers.feather_pgs.kernels import (
     prepare_world_contact_rows,
 )
 from newton._src.solvers.feather_pgs.sparse_contact import (
-    SparseContactRows,
     _get_sparse_contact_response_kernel,
     apply_sparse_factor_velocity,
     build_sparse_joint_limit_rows,
@@ -38,6 +39,34 @@ def _array(value, dtype=float):
 
 def _full(shape, value, dtype=float):
     return wp.full(shape, value, dtype=dtype, device="cpu")
+
+
+def _contact_input(f, device="cpu", **fields):
+    """The fixture's contacts and bodies as a ContactInput, with ``fields`` set too (host values go to ``device``)."""
+    values = {
+        "count": f["count"],
+        "point0": f["point0"],
+        "point1": f["point1"],
+        "normal": f["normal"],
+        "shape0": f["shape0"],
+        "shape1": f["shape1"],
+        "margin0": f["thickness0"],
+        "margin1": f["thickness1"],
+        "world": f["world"],
+        "slot": f["slot"],
+        "art0": f["art_a"],
+        "art1": f["art_b"],
+        "path": f["path"],
+        "slots_needed": f["needed"],
+        "dof_start": f["start"],
+        "origin": f["origin"],
+        "motion": f["motion"],
+        "shape_body": f["shape_body"],
+        "body_q": f["body_q"],
+        "incident": f["velocity"],
+    }
+    values.update(fields)
+    return field_group.upload(ContactInput, device, **values)
 
 
 def _fixture(device="cpu", joint_dof_count=(3, 2, 1, 0)):
@@ -164,47 +193,53 @@ class TestSparseContacts(unittest.TestCase):
         row_dof, row_factor = full(row_shape, -9, int), full(row_shape, -9.0)
         row_free_response = full(row_shape, -9.0)
         incident, diagonal = full(row_shape[:2], -9.0), full(row_shape[:2], -9.0)
+        data = field_group.upload(
+            ContactInput,
+            device,
+            count=array([contact_count], int),
+            point0=array(point_a, wp.vec3),
+            point1=array(point_b, wp.vec3),
+            normal=array(normal, wp.vec3),
+            shape0=array(body_a, int),
+            shape1=array(np.where(body_b < 0, len(transforms), body_b), int),
+            margin0=full(contact_count, 0.0),
+            margin1=full(contact_count, 0.0),
+            world=full(contact_count, 0, int),
+            slot=array(np.arange(contact_count), int),
+            art0=array(art_a, int),
+            art1=array(art_b, int),
+            path=full(contact_count, 0, int),
+            slots_needed=full(contact_count, 1, int),
+            response_dofs=array(np.where(articulated, dofs, 6), int),
+            dof_start=array(start, int),
+            origin=array(origin, wp.vec3),
+            motion=array(motion, wp.spatial_vector),
+            shape_body=array([*range(len(transforms)), -1], int),
+            body_q=array(transforms, wp.transform),
+            shared_anchor=0,
+            friction_shared_anchor=0,
+            incident=array(velocity),
+            dt=0.01,
+            diag=diagonal,
+        )
         wp.launch(
             _get_sparse_contact_response_kernel(dofs, lanes_per_contact=lanes),
             dim=workers * lanes,
             inputs=[
-                array([contact_count], int),
+                data,
                 workers,
-                array(point_a, wp.vec3),
-                array(point_b, wp.vec3),
-                array(normal, wp.vec3),
-                array(body_a, int),
-                array(np.where(body_b < 0, len(transforms), body_b), int),
-                full(contact_count, 0.0),
-                full(contact_count, 0.0),
-                full(contact_count, 0, int),
-                array(np.arange(contact_count), int),
-                array(art_a, int),
-                array(art_b, int),
-                full(contact_count, 0, int),
-                full(contact_count, 1, int),
                 array(group, int),
-                array(np.where(articulated, dofs, 6), int),
                 array(~articulated, int),
                 array(offset, int),
-                array(start, int),
-                array(origin, wp.vec3),
                 array(masks, wp.uint64),
-                array(motion, wp.spatial_vector),
-                array([*range(len(transforms)), -1], int),
-                array(transforms, wp.transform),
-                0,
                 f["patches"],
-                0,
                 indices.permutation,
                 indices.row_offsets,
                 array(articulated_inverse[:, p.entry_rows, p.columns]),
                 array(free_inverse),
-                array(velocity),
-                SparseContactRows(),
-                0.01,
+                0.0,
             ],
-            outputs=[row_dof, row_factor, row_free_response, incident, diagonal, _SparseRowSupport()],
+            outputs=[row_dof, row_factor, row_free_response, incident, _SparseRowSupport()],
             block_dim=128,
             device=device,
         )
@@ -335,7 +370,6 @@ class TestSparseContacts(unittest.TestCase):
                 points[contact] = np.asarray(point_b)
             f["point1"] = array(points, wp.vec3)
         response_dofs = array([6, 0] if prepare_rows else [6], int)
-        geometry = [f[name] for name in ("point0", "point1", "normal", "shape0", "shape1", "thickness0", "thickness1")]
         for shared, friction_shared, patch in [(0, 0, 0), (0, 1, 0), (1, 0, 0), (0, 0, 1), (1, 1, 1)]:
             with self.subTest(shared=shared, friction_shared=friction_shared, patch=patch):
                 f["patches"].enabled = patch
@@ -344,96 +378,82 @@ class TestSparseContacts(unittest.TestCase):
                 row_factor = full((1, 9, 6), -9.0)
                 incident = full((1, 9), -9.0)
                 diagonal = full((1, 9), -9.0)
-                rows = SparseContactRows()
                 support = _SparseRowSupport()
+                law = {}
                 if use_support_table:
                     support_plan = _SparseRowSupportPlan.build(p, p.joint_ancestor_mask, max_row_dofs=6)
                     self.assertIsNotNone(support_plan)
                     support = support_plan.to_device(1, 9, device)
                     support.row_class.fill_(-9)
+                friction_beta = 0.0
                 if prepare_rows:
                     velocity = np.zeros((4, 6), dtype=np.float32)
                     velocity[0, :3] = -0.2 * f["normal"].numpy()[0]
                     velocity[0, 3:] = [0.03, -0.04, 0.02]
-                    rows.body_velocity = array(velocity, wp.spatial_vector)
-                    rows.prescribed_articulation = array([0, 1], int)
-                    rows.material_friction = array([0.8, 0.5, 0.3, 0.6, 0.4])
-                    rows.material_restitution = array([0.4, 0.2, 0.5, 0.8, 0.6])
-                    rows.beta, rows.cfm = 0.05, 0.03
-                    rows.friction_scale, rows.friction_beta = 0.8, 0.23
-                    rows.speculative_scale, rows.restitution_velocity_threshold = 0.65, 0.1
-                    for name in ("type", "parent"):
-                        setattr(rows, name, full((1, 9), -9, int))
-                    for name in ("mu", "beta_row", "cfm_row", "phi", "target_velocity", "restitution", "rhs"):
-                        setattr(rows, name, full((1, 9), -9.0))
+                    friction_beta = 0.23
+                    law = {
+                        "body_v": array(velocity, wp.spatial_vector),
+                        "prescribed": array([0, 1], int),
+                        "material_mu": array([0.8, 0.5, 0.3, 0.6, 0.4]),
+                        "material_restitution": array([0.4, 0.2, 0.5, 0.8, 0.6]),
+                        "beta": 0.05,
+                        "cfm": 0.03,
+                        "friction_scale": 0.8,
+                        "speculative_scale": 0.65,
+                        "restitution_threshold": 0.1,
+                    }
+                    for name in ("row_type", "row_parent"):
+                        law[name] = full((1, 9), -9, int)
+                    for name in ("row_mu", "row_beta", "row_cfm", "phi", "target", "restitution", "rhs"):
+                        law[name] = full((1, 9), -9.0)
+                compact = _contact_input(
+                    f,
+                    device,
+                    response_dofs=response_dofs,
+                    body_mask=f["physical_mask"],
+                    shared_anchor=shared,
+                    friction_shared_anchor=friction_shared,
+                )
                 wp.launch(
                     populate_world_J_for_compact_size,
                     dim=(1, 32),
-                    inputs=[
-                        f["count"],
-                        1,
-                        *geometry,
-                        f["slot"],
-                        f["art_a"],
-                        f["art_b"],
-                        f["path"],
-                        f["needed"],
-                        6,
-                        response_dofs,
-                        f["group"],
-                        f["start"],
-                        f["origin"],
-                        f["physical_mask"],
-                        f["motion"],
-                        f["shape_body"],
-                        f["body_q"],
-                        friction_shared,
-                        f["patches"],
-                        shared,
-                    ],
+                    inputs=[compact, 1, 6, f["group"], f["patches"]],
                     outputs=[dense],
                     device=device,
                 )
                 if prepare_rows:
                     normal_jacobian = dense.numpy()[0, 0]
                     f["velocity"] = array(-1.7 * normal_jacobian / np.dot(normal_jacobian, normal_jacobian))
+                data = _contact_input(
+                    f,
+                    device,
+                    response_dofs=response_dofs,
+                    shared_anchor=shared,
+                    friction_shared_anchor=friction_shared,
+                    dt=0.01,
+                    diag=diagonal,
+                    **law,
+                )
                 wp.launch(
                     _get_sparse_contact_response_kernel(
                         6, lanes_per_contact=lanes, prepare_rows=prepare_rows, use_support_table=use_support_table
                     ),
                     dim=workers * lanes,
                     inputs=[
-                        f["count"],
+                        data,
                         workers,
-                        *geometry,
-                        f["world"],
-                        f["slot"],
-                        f["art_a"],
-                        f["art_b"],
-                        f["path"],
-                        f["needed"],
                         f["group"],
-                        response_dofs,
                         full(response_dofs.shape, 0, int),
                         full(response_dofs.shape, 0, int),
-                        f["start"],
-                        f["origin"],
                         f["sparse_mask"],
-                        f["motion"],
-                        f["shape_body"],
-                        f["body_q"],
-                        friction_shared,
                         f["patches"],
-                        shared,
                         indices.permutation,
                         indices.row_offsets,
                         f["packed"],
                         array(np.eye(6)[None]),
-                        f["velocity"],
-                        rows,
-                        0.01,
+                        friction_beta,
                     ],
-                    outputs=[row_dof, row_factor, full((1, 9, 12), -9.0), incident, diagonal, support],
+                    outputs=[row_dof, row_factor, full((1, 9, 12), -9.0), incident, support],
                     block_dim=128,
                     device=device,
                 )
@@ -459,7 +479,7 @@ class TestSparseContacts(unittest.TestCase):
                 )
                 np.testing.assert_allclose(
                     diagonal.numpy()[0, :7],
-                    np.sum(expected**2, axis=1) + (rows.cfm if prepare_rows else 0.0),
+                    np.sum(expected**2, axis=1) + (law["cfm"] if prepare_rows else 0.0),
                     rtol=3.0e-6,
                     atol=2.0e-6,
                 )
@@ -467,35 +487,28 @@ class TestSparseContacts(unittest.TestCase):
                 np.testing.assert_array_equal(row_factor.numpy()[0, 7:], -9.0)
                 if prepare_rows:
                     reference = [full((1, 9), -9, int) for _ in range(2)] + [full((1, 9), -9.0) for _ in range(6)]
+                    reference_data = _contact_input(
+                        f,
+                        device,
+                        response_dofs=response_dofs,
+                        shared_anchor=shared,
+                        friction_shared_anchor=friction_shared,
+                        **{
+                            **law,
+                            **dict(
+                                zip(
+                                    ("row_type", "row_parent", "row_mu", "row_beta", "row_cfm", "phi", "target"),
+                                    reference[:7],
+                                    strict=True,
+                                )
+                            ),
+                            "restitution": reference[7],
+                        },
+                    )
                     wp.launch(
                         prepare_world_contact_rows,
                         dim=workers,
-                        inputs=[
-                            f["count"],
-                            workers,
-                            *geometry,
-                            f["world"],
-                            f["slot"],
-                            f["art_a"],
-                            f["art_b"],
-                            f["path"],
-                            f["needed"],
-                            f["shape_body"],
-                            f["body_q"],
-                            rows.body_velocity,
-                            rows.prescribed_articulation,
-                            f["origin"],
-                            rows.material_friction,
-                            rows.material_restitution,
-                            friction_shared,
-                            rows.friction_scale,
-                            shared,
-                            rows.beta,
-                            rows.cfm,
-                            f["patches"],
-                            rows.friction_beta,
-                        ],
-                        outputs=reference,
+                        inputs=[reference_data, workers, f["patches"], friction_beta],
                         device=device,
                     )
                     count = array([7], int)
@@ -522,7 +535,7 @@ class TestSparseContacts(unittest.TestCase):
                             reference[6],
                             0.01,
                             1.0,
-                            rows.speculative_scale,
+                            law["speculative_scale"],
                             1.0,
                             1.0,
                         ],
@@ -545,7 +558,7 @@ class TestSparseContacts(unittest.TestCase):
                             array([np.arange(6)], int),
                             dense,
                             0.01,
-                            rows.restitution_velocity_threshold,
+                            law["restitution_threshold"],
                             0,
                         ],
                         outputs=[reference_rhs, full((1, 9), 1.0)],
@@ -556,12 +569,14 @@ class TestSparseContacts(unittest.TestCase):
                     self.assertNotEqual(float(reference[6].numpy()[0, 0]), 0.0)
                     # Prepared rows consume bias/CFM/restitution internally;
                     # compare their final solver inputs, not unused scratch.
-                    for name, expected_metadata in zip(("type", "parent", "mu"), reference[:3], strict=True):
+                    for name, expected_metadata in zip(
+                        ("row_type", "row_parent", "row_mu"), reference[:3], strict=True
+                    ):
                         np.testing.assert_allclose(
-                            getattr(rows, name).numpy(), expected_metadata.numpy(), atol=2.0e-6, rtol=3.0e-6
+                            law[name].numpy(), expected_metadata.numpy(), atol=2.0e-6, rtol=3.0e-6
                         )
                     np.testing.assert_allclose(diagonal.numpy(), reference_diag.numpy(), atol=3.0e-6, rtol=3.0e-6)
-                    np.testing.assert_allclose(rows.rhs.numpy(), reference_rhs.numpy(), atol=5.0e-6, rtol=3.0e-6)
+                    np.testing.assert_allclose(law["rhs"].numpy(), reference_rhs.numpy(), atol=5.0e-6, rtol=3.0e-6)
 
     def test_contact_metadata_honors_allocated_extent(self):
         """Keep reserved one-row contacts from writing newly eligible friction rows."""
@@ -573,43 +588,22 @@ class TestSparseContacts(unittest.TestCase):
         row_type = _full((1, 9), -9, int)
         row_parent = _full((1, 9), -9, int)
         other = [_full((1, 9), -9.0) for _ in range(6)]
-        wp.launch(
-            prepare_world_contact_rows,
-            dim=1,
-            inputs=[
-                f["count"],
-                1,
-                f["point0"],
-                f["point1"],
-                f["normal"],
-                f["shape0"],
-                f["shape1"],
-                f["thickness0"],
-                f["thickness1"],
-                f["world"],
-                f["slot"],
-                f["art_a"],
-                f["art_b"],
-                f["path"],
-                f["needed"],
-                f["shape_body"],
-                f["body_q"],
-                _full(4, wp.spatial_vector(0.0), wp.spatial_vector),
-                _array([0], int),
-                f["origin"],
-                _array([0.8] * 4),
-                _array([0.4] * 4),
-                0,
-                1.0,
-                0,
-                0.05,
-                1.0e-6,
-                f["patches"],
-                0.0,
-            ],
-            outputs=[row_type, row_parent, *other],
-            device="cpu",
+        data = _contact_input(
+            f,
+            body_v=_full(4, wp.spatial_vector(0.0), wp.spatial_vector),
+            prescribed=_array([0], int),
+            material_mu=_array([0.8] * 4),
+            material_restitution=_array([0.4] * 4),
+            shared_anchor=0,
+            friction_shared_anchor=0,
+            friction_scale=1.0,
+            beta=0.05,
+            cfm=1.0e-6,
+            row_type=row_type,
+            row_parent=row_parent,
+            **dict(zip(("row_mu", "row_beta", "row_cfm", "phi", "target", "restitution"), other, strict=True)),
         )
+        wp.launch(prepare_world_contact_rows, dim=1, inputs=[data, 1, f["patches"], 0.0], device="cpu")
         self.assertEqual(row_type.numpy()[0, 0], PGS_CONSTRAINT_TYPE_CONTACT)
         for output in [row_type, row_parent, *other]:
             np.testing.assert_array_equal(output.numpy()[0, 1:], -9)
@@ -629,16 +623,20 @@ class TestSparseContacts(unittest.TestCase):
         def array(value, dtype=float):
             return wp.array(value, dtype=dtype, device=device)
 
-        rows = SparseContactRows()
         shape = (3, 6)
-        rows.type = array(np.full(shape, PGS_CONSTRAINT_TYPE_JOINT_LIMIT), int)
-        rows.phi = array(np.tile([-0.02, 0.0, 0.03, -0.1, 0.2, -0.3], (3, 1)))
-        rows.beta_row = array(np.linspace(0.01, 0.2, 18).reshape(shape))
-        rows.cfm_row = array(np.linspace(0.02, 0.3, 18).reshape(shape))
-        rows.target_velocity = array(np.linspace(-0.3, 0.4, 18).reshape(shape))
-        rows.rhs = array(np.full(shape, -9.0))
         initial_diag = np.arange(18, dtype=np.float32).reshape(shape) + 1.0
-        diagonal = array(initial_diag)
+        rows = field_group.upload(
+            dense_rows.DenseRows,
+            device,
+            row_type=np.full(shape, PGS_CONSTRAINT_TYPE_JOINT_LIMIT),
+            phi=np.tile([-0.02, 0.0, 0.03, -0.1, 0.2, -0.3], (3, 1)),
+            row_beta=np.linspace(0.01, 0.2, 18).reshape(shape),
+            row_cfm=np.linspace(0.02, 0.3, 18).reshape(shape),
+            target=np.linspace(-0.3, 0.4, 18).reshape(shape),
+            rhs=np.full(shape, -9.0),
+            diag=initial_diag,
+        )
+        diagonal = rows.diag
         reference_diag = array(initial_diag)
         reference_rhs = array(np.full(shape, -9.0))
         prefix_count = array([4, 2, 0], int)
@@ -646,13 +644,12 @@ class TestSparseContacts(unittest.TestCase):
             finalize_sparse_joint_limit_rows,
             dim=3,
             inputs=[array([[0, 4], [0, 3], [0, 0]], int), array([6, 2, 5], int), rows, 0.0123],
-            outputs=[diagonal],
             device=device,
         )
         wp.launch(
             finalize_world_diag_cfm,
             dim=3,
-            inputs=[prefix_count, rows.cfm_row, array([0, 0, 0], int), 0],
+            inputs=[prefix_count, rows.row_cfm, array([0, 0, 0], int), 0],
             outputs=[reference_diag],
             device=device,
         )
@@ -663,9 +660,9 @@ class TestSparseContacts(unittest.TestCase):
                 prefix_count,
                 6,
                 rows.phi,
-                rows.beta_row,
-                rows.type,
-                rows.target_velocity,
+                rows.row_beta,
+                rows.row_type,
+                rows.target,
                 0.0123,
                 1.0,
                 1.0,
@@ -713,17 +710,21 @@ class TestSparseContacts(unittest.TestCase):
                     ],
                     outputs=[
                         count,
-                        row_type,
-                        parent,
-                        mu,
-                        beta,
-                        cfm,
-                        phi,
-                        target,
+                        field_group.upload(
+                            dense_rows.DenseRows,
+                            "cpu",
+                            row_type=row_type,
+                            row_parent=parent,
+                            row_mu=mu,
+                            row_beta=beta,
+                            row_cfm=cfm,
+                            phi=phi,
+                            target=target,
+                            diag=diagonal,
+                        ),
                         dof,
                         factor,
                         incident,
-                        diagonal,
                         _SparseRowSupport(),
                     ],
                     block_dim=128,
@@ -813,7 +814,25 @@ class TestSparseContacts(unittest.TestCase):
                 array(packed),
                 array(velocity),
             ],
-            outputs=[*outputs, support],
+            outputs=[
+                counter,
+                field_group.upload(
+                    dense_rows.DenseRows,
+                    device,
+                    row_type=row_type,
+                    row_parent=parent,
+                    row_mu=mu,
+                    row_beta=beta,
+                    row_cfm=cfm,
+                    phi=phi,
+                    target=target,
+                    diag=diagonal,
+                ),
+                row_dof,
+                row_factor,
+                incident,
+                support,
+            ],
             block_dim=128,
             device=device,
         )

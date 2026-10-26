@@ -7,6 +7,7 @@ from functools import cache
 
 import warp as wp
 
+from .contact_input import ContactInput
 from .contact_laws import (
     contact_bodies,
     contact_friction,
@@ -18,6 +19,7 @@ from .contact_laws import (
     free_body_jacobian,
     prescribed_target,
 )
+from .dense_rows import DenseRows
 from .device_preludes import dual_native, lane_group
 from .friction_patches import FrictionPatches, patch_friction_location
 from .kernels import (
@@ -31,32 +33,6 @@ from .projection_laws import PROJECTION_LAW
 from .row_laws import ROW_LAW, contact_restitution_rhs, row_rhs
 from .sparse_mass_matrix import _SparseRowSupport
 from .sparse_row_projection import _sparse_contact_projection_source
-
-
-@wp.struct
-class SparseContactRows:
-    """Material, prescribed motion and final row data for sparse preparation."""
-
-    body_velocity: wp.array[wp.spatial_vector]
-    prescribed_articulation: wp.array[int]
-    material_friction: wp.array[float]
-    material_restitution: wp.array[float]
-    beta: float
-    cfm: float
-    friction_scale: float
-    friction_beta: float
-    speculative_scale: float
-    restitution_velocity_threshold: float
-    type: wp.array2d[int]
-    parent: wp.array2d[int]
-    mu: wp.array2d[float]
-    beta_row: wp.array2d[float]
-    cfm_row: wp.array2d[float]
-    phi: wp.array2d[float]
-    target_velocity: wp.array2d[float]
-    restitution: wp.array2d[float]
-    rhs: wp.array2d[float]
-
 
 CONTACT_RECORD_FLOATS = 8
 """Floats of a contact triplet's block record: ``W_nt1, W_nt2, W_t1t2, 1/W_nn``, then the pair
@@ -438,59 +414,35 @@ def _get_sparse_contact_response_kernel(
     ): ...
 
     def contact_kernel(
-        contact_count: wp.array[int],
+        data: ContactInput,
         total_num_workers: int,
-        contact_point0: wp.array[wp.vec3],
-        contact_point1: wp.array[wp.vec3],
-        contact_normal: wp.array[wp.vec3],
-        contact_shape0: wp.array[int],
-        contact_shape1: wp.array[int],
-        contact_thickness0: wp.array[float],
-        contact_thickness1: wp.array[float],
-        contact_world: wp.array[int],
-        contact_slot: wp.array[int],
-        contact_art_a: wp.array[int],
-        contact_art_b: wp.array[int],
-        contact_path: wp.array[int],
-        contact_slots_needed: wp.array[int],
         art_group_idx: wp.array[int],
-        articulation_response_dof_count: wp.array[int],
         is_free_rigid: wp.array[int],
         articulation_world_dof_offset: wp.array[int],
-        articulation_dof_start: wp.array[int],
-        articulation_origin: wp.array[wp.vec3],
         body_dof_mask: wp.array[wp.uint64],
-        joint_S_s: wp.array[wp.spatial_vector],
-        shape_body: wp.array[int],
-        body_q: wp.array[wp.transform],
-        contact_friction_shared_anchor: int,
         friction_patches: FrictionPatches,
-        contact_shared_anchor: int,
         permutation: wp.array[int],
         factor_row_offsets: wp.array[int],
         inverse_factor: wp.array2d[float],
         free_inverse_factor: wp.array3d[float],
-        v_hat: wp.array[float],
-        rows: SparseContactRows,
-        dt: float,
+        friction_anchor_beta: float,
         row_dof: wp.array3d[int],
         row_factor: wp.array3d[float],
         row_free_response: wp.array3d[float],
         row_incident: wp.array2d[float],
-        diagonal: wp.array2d[float],
         support: _SparseRowSupport,
     ):
         tid = wp.tid()
         lane = tid % lanes
         worker = tid // lanes
-        total_contacts = contact_count[0]
+        total_contacts = data.count[0]
         for c in range(worker, total_contacts, total_num_workers):
-            row_count = wp.min(contact_slots_needed[c], 3)
-            if contact_path[c] != 0 or contact_slot[c] < 0 or row_count <= 0:
+            row_count = wp.min(data.slots_needed[c], 3)
+            if data.path[c] != 0 or data.slot[c] < 0 or row_count <= 0:
                 continue
-            body_a, body_b = contact_bodies(contact_shape0[c], contact_shape1[c], shape_body)
-            art_a = contact_art_a[c]
-            art_b = contact_art_b[c]
+            body_a, body_b = contact_bodies(data.shape0[c], data.shape1[c], data.shape_body)
+            art_a = data.art0[c]
+            art_b = data.art1[c]
             normal = wp.vec3(0.0)
             surface_a = wp.vec3(0.0)
             surface_b = wp.vec3(0.0)
@@ -503,20 +455,20 @@ def _get_sparse_contact_response_kernel(
             gap = float(0.0)
             cfm = float(0.0)
             if wp.static(prepare_rows):
-                cfm = rows.cfm
+                cfm = data.cfm
             if wp.static(prepare_rows) or lane == 0:
                 normal, surface_a, surface_b, gap = contact_points(
-                    contact_normal[c],
-                    contact_point0[c],
-                    contact_point1[c],
-                    contact_thickness0[c],
-                    contact_thickness1[c],
+                    data.normal[c],
+                    data.point0[c],
+                    data.point1[c],
+                    data.margin0[c],
+                    data.margin1[c],
                     body_a,
                     body_b,
-                    body_q,
+                    data.body_q,
                 )
                 friction_point_a, friction_point_b = contact_friction_points(
-                    surface_a, surface_b, contact_shared_anchor, contact_friction_shared_anchor
+                    surface_a, surface_b, data.shared_anchor, data.friction_shared_anchor
                 )
                 if row_count > 1:
                     tangent0, tangent1 = contact_tangent_basis(normal)
@@ -525,7 +477,7 @@ def _get_sparse_contact_response_kernel(
                 # The normal row's endpoints.
                 _normal, point_a, point_b = contact_row_frame(
                     0,
-                    contact_shared_anchor,
+                    data.shared_anchor,
                     normal,
                     tangent0,
                     tangent1,
@@ -536,11 +488,11 @@ def _get_sparse_contact_response_kernel(
                 )
             if wp.static(prepare_rows):
                 if lane < row_count:
-                    world = contact_world[c]
-                    slot = contact_slot[c] + lane
+                    world = data.world[c]
+                    slot = data.slot[c] + lane
                     direction, anchor_a, anchor_b = contact_row_frame(
                         lane,
-                        contact_shared_anchor,
+                        data.shared_anchor,
                         normal,
                         tangent0,
                         tangent1,
@@ -557,38 +509,38 @@ def _get_sparse_contact_response_kernel(
                         anchor_a,
                         anchor_b,
                         direction,
-                        rows.prescribed_articulation,
-                        articulation_origin,
-                        rows.body_velocity,
+                        data.prescribed,
+                        data.origin,
+                        data.body_v,
                     )
-                    mu = contact_friction(contact_shape0[c], contact_shape1[c], rows.material_friction)
-                    beta = rows.beta
+                    mu = contact_friction(data.shape0[c], data.shape1[c], data.material_mu)
+                    beta = data.beta
                     phi = gap
                     row_type = PGS_CONSTRAINT_TYPE_CONTACT
                     parent = int(-1)
                     restitution = float(0.0)
                     if lane == 0:
-                        restitution = contact_restitution(
-                            contact_shape0[c], contact_shape1[c], rows.material_restitution
-                        )
+                        restitution = contact_restitution(data.shape0[c], data.shape1[c], data.material_restitution)
                     else:
-                        beta = rows.friction_beta
+                        beta = friction_anchor_beta
                         phi = friction_patches.phi[c][lane - 1]
-                        mu *= rows.friction_scale
+                        mu *= data.friction_scale
                         row_type = PGS_CONSTRAINT_TYPE_FRICTION
-                        parent = contact_slot[c]
+                        parent = data.slot[c]
                     # The position pass's row law (bias scale and contact weight 1).
-                    rhs, _row_w = row_rhs(row_type, phi, beta, target, 1.0 / dt, 1.0, rows.speculative_scale, 0.0, 1.0)
-                    rows.type[world, slot] = row_type
-                    rows.parent[world, slot] = parent
-                    rows.mu[world, slot] = mu
+                    rhs, _row_w = row_rhs(
+                        row_type, phi, beta, target, 1.0 / data.dt, 1.0, data.speculative_scale, 0.0, 1.0
+                    )
+                    data.row_type[world, slot] = row_type
+                    data.row_parent[world, slot] = parent
+                    data.row_mu[world, slot] = mu
                     # Bias and CFM are already applied; only normal restitution
                     # consumes row metadata after the response projection.
                     if lane == 0:
-                        rows.phi[world, slot] = phi
-                        rows.target_velocity[world, slot] = target
-                        rows.restitution[world, slot] = restitution
-                    rows.rhs[world, slot] = rhs
+                        data.phi[world, slot] = phi
+                        data.target[world, slot] = target
+                        data.restitution[world, slot] = restitution
+                    data.rhs[world, slot] = rhs
 
             # Fixed component constructors avoid materializing dynamically
             # indexed matrices in local memory during geometry assembly.
@@ -604,14 +556,14 @@ def _get_sparse_contact_response_kernel(
                 tangent1_b = wp.vec3(0.0)
                 # Each row's wrench about an endpoint's articulation origin: the angular part of the free-body
                 # Jacobian [d, (p - o) x d], whose product with a motion column is that column's Jacobian entry.
-                if art_a >= 0 and articulation_response_dof_count[art_a] > 0:
-                    origin_a = articulation_origin[art_a]
+                if art_a >= 0 and data.response_dofs[art_a] > 0:
+                    origin_a = data.origin[art_a]
                     normal_a = wp.spatial_bottom(free_body_jacobian(normal, point_a, origin_a))
                     if row_count > 1:
                         tangent0_a = wp.spatial_bottom(free_body_jacobian(tangent0, friction_point_a, origin_a))
                         tangent1_a = wp.spatial_bottom(free_body_jacobian(tangent1, friction_point_a, origin_a))
-                if art_b >= 0 and articulation_response_dof_count[art_b] > 0:
-                    origin_b = articulation_origin[art_b]
+                if art_b >= 0 and data.response_dofs[art_b] > 0:
+                    origin_b = data.origin[art_b]
                     normal_b = wp.spatial_bottom(free_body_jacobian(normal, point_b, origin_b))
                     if row_count > 1:
                         tangent0_b = wp.spatial_bottom(free_body_jacobian(tangent0, friction_point_b, origin_b))
@@ -625,50 +577,50 @@ def _get_sparse_contact_response_kernel(
                 body_b,
                 art_a,
                 art_b,
-                contact_world[c],
-                contact_slot[c],
+                data.world[c],
+                data.slot[c],
                 row_count,
                 angular_a,
                 angular_b,
                 directions,
                 art_group_idx,
-                articulation_response_dof_count,
+                data.response_dofs,
                 is_free_rigid,
                 articulation_world_dof_offset,
-                articulation_dof_start,
+                data.dof_start,
                 body_dof_mask,
-                joint_S_s,
+                data.motion,
                 permutation,
                 factor_row_offsets,
                 inverse_factor,
                 free_inverse_factor,
-                v_hat,
+                data.incident,
                 cfm,
                 row_dof,
                 row_factor,
                 row_free_response,
                 row_incident,
-                diagonal,
+                data.diag,
                 support,
             )
             if wp.static(prepare_rows):
                 if lane == 0:
-                    world = contact_world[c]
-                    slot = contact_slot[c]
+                    world = data.world[c]
+                    slot = data.slot[c]
                     # Only a restitutive contact reads its row back for the rebound law.
-                    row_restitution = rows.restitution[world, slot]
+                    row_restitution = data.restitution[world, slot]
                     if row_restitution > 0.0:
-                        target = rows.target_velocity[world, slot]
+                        target = data.target[world, slot]
                         fires, bounce = contact_restitution_rhs(
-                            rows.phi[world, slot],
+                            data.phi[world, slot],
                             row_incident[world, slot] - target,
                             target,
                             row_restitution,
-                            dt,
-                            rows.restitution_velocity_threshold,
+                            data.dt,
+                            data.restitution_threshold,
                         )
                         if fires:
-                            rows.rhs[world, slot] = bounce
+                            data.rhs[world, slot] = bounce
 
     contact_kernel.__name__ = f"populate_sparse_contact_response_{n}_{lanes}_{warps}"
     if prepare_rows:
@@ -685,25 +637,24 @@ def _get_sparse_contact_response_kernel(
 def finalize_sparse_joint_limit_rows(
     phase_bounds: wp.array2d[int],
     constraint_count: wp.array[int],
-    rows: SparseContactRows,
+    rows: DenseRows,
     dt: float,
-    diagonal: wp.array2d[float],
 ):
     """Finish the internal-constraint prefix with each row's law; contacts are already complete."""
     world = wp.tid()
     for row in range(wp.min(phase_bounds[world, 1], constraint_count[world])):
         rhs, _row_w = row_rhs(
-            rows.type[world, row],
+            rows.row_type[world, row],
             rows.phi[world, row],
-            rows.beta_row[world, row],
-            rows.target_velocity[world, row],
+            rows.row_beta[world, row],
+            rows.target[world, row],
             1.0 / dt,
             1.0,
             0.0,
             1.0,
             1.0,
         )
-        diagonal[world, row] += rows.cfm_row[world, row]
+        rows.diag[world, row] += rows.row_cfm[world, row]
         rows.rhs[world, row] = rhs
 
 
@@ -719,7 +670,7 @@ def finalize_sparse_joint_limit_rows(
     const int world = art_to_world.data[art];
     const int start = articulation_dof_start.data[art];
     const int dofs = inverse_permutation.shape[0];
-    const int capacity = row_type.shape[1];
+    const int capacity = rows.row_type.shape[1];
     const int support_capacity = row_factor.shape[2];
     const int factor_base = group * inverse_factor.shape[1];
     for (int base = 0; base < 2 * dofs; base += STRIDE) {
@@ -776,14 +727,14 @@ def finalize_sparse_joint_limit_rows(
                 if (support.enabled)
                     support.row_class.data[row_offset] = support.limit_class.data[selected_dof];
                 row_incident.data[row_offset] = sign * v_hat.data[start + selected_dof];
-                diagonal.data[row_offset] = norm;
-                row_type.data[row_offset] = $LIMIT_TYPE;
-                row_parent.data[row_offset] = -1;
-                row_mu.data[row_offset] = 0.0f;
-                row_beta.data[row_offset] = pgs_beta;
-                row_cfm.data[row_offset] = pgs_cfm;
-                phi.data[row_offset] = selected_gap;
-                target_velocity.data[row_offset] = 0.0f;
+                rows.diag.data[row_offset] = norm;
+                rows.row_type.data[row_offset] = $LIMIT_TYPE;
+                rows.row_parent.data[row_offset] = -1;
+                rows.row_mu.data[row_offset] = 0.0f;
+                rows.row_beta.data[row_offset] = pgs_beta;
+                rows.row_cfm.data[row_offset] = pgs_cfm;
+                rows.phi.data[row_offset] = selected_gap;
+                rows.target.data[row_offset] = 0.0f;
             }
             pending &= pending - 1;
             ++rank;
@@ -812,17 +763,10 @@ def _build_sparse_joint_limit_rows(
     inverse_factor: wp.array2d[float],
     v_hat: wp.array[float],
     slot_counter: wp.array[int],
-    row_type: wp.array2d[int],
-    row_parent: wp.array2d[int],
-    row_mu: wp.array2d[float],
-    row_beta: wp.array2d[float],
-    row_cfm: wp.array2d[float],
-    phi: wp.array2d[float],
-    target_velocity: wp.array2d[float],
+    rows: DenseRows,
     row_dof: wp.array3d[int],
     row_factor: wp.array3d[float],
     row_incident: wp.array2d[float],
-    diagonal: wp.array2d[float],
     support: _SparseRowSupport,
 ): ...
 
@@ -846,17 +790,10 @@ def build_sparse_joint_limit_rows(
     inverse_factor: wp.array2d[float],
     v_hat: wp.array[float],
     slot_counter: wp.array[int],
-    row_type: wp.array2d[int],
-    row_parent: wp.array2d[int],
-    row_mu: wp.array2d[float],
-    row_beta: wp.array2d[float],
-    row_cfm: wp.array2d[float],
-    phi: wp.array2d[float],
-    target_velocity: wp.array2d[float],
+    rows: DenseRows,
     row_dof: wp.array3d[int],
     row_factor: wp.array3d[float],
     row_incident: wp.array2d[float],
-    diagonal: wp.array2d[float],
     support: _SparseRowSupport,
 ):
     """Build ordered limit rows and sparse responses with one warp per articulation.
@@ -884,17 +821,10 @@ def build_sparse_joint_limit_rows(
         inverse_factor,
         v_hat,
         slot_counter,
-        row_type,
-        row_parent,
-        row_mu,
-        row_beta,
-        row_cfm,
-        phi,
-        target_velocity,
+        rows,
         row_dof,
         row_factor,
         row_incident,
-        diagonal,
         support,
     )
 
@@ -911,7 +841,7 @@ def build_sparse_joint_limit_rows(
     const int world = art_to_world.data[art];
     const int start = articulation_dof_start.data[art];
     const int dofs = inverse_permutation.shape[0];
-    const int capacity = row_type.shape[1];
+    const int capacity = rows.row_type.shape[1];
     const int support_capacity = row_factor.shape[2];
     const int factor_base = group * inverse_factor.shape[1];
     for (int local_dof = 0; local_dof < dofs; ++local_dof) {
@@ -971,14 +901,14 @@ def build_sparse_joint_limit_rows(
                     support.row_class.data[row_offset] = support.limit_class.data[local_dof];
                 row_incident.data[row_offset] = sign * incident;
                 // The prefix finalizer adds CFM and forms RHS from target_velocity.
-                diagonal.data[row_offset] = norm;
-                row_type.data[row_offset] = $VELOCITY_LIMIT_TYPE;
-                row_parent.data[row_offset] = -1;
-                row_mu.data[row_offset] = 0.0f;
-                row_beta.data[row_offset] = 0.0f;
-                row_cfm.data[row_offset] = pgs_cfm;
-                phi.data[row_offset] = 0.0f;
-                target_velocity.data[row_offset] = target;
+                rows.diag.data[row_offset] = norm;
+                rows.row_type.data[row_offset] = $VELOCITY_LIMIT_TYPE;
+                rows.row_parent.data[row_offset] = -1;
+                rows.row_mu.data[row_offset] = 0.0f;
+                rows.row_beta.data[row_offset] = 0.0f;
+                rows.row_cfm.data[row_offset] = pgs_cfm;
+                rows.phi.data[row_offset] = 0.0f;
+                rows.target.data[row_offset] = target;
             }
         }
     }
@@ -1001,17 +931,10 @@ def _build_sparse_joint_velocity_limit_rows(
     factor_lookup: wp.array2d[int],
     inverse_factor: wp.array2d[float],
     v_hat: wp.array[float],
-    row_type: wp.array2d[int],
-    row_parent: wp.array2d[int],
-    row_mu: wp.array2d[float],
-    row_beta: wp.array2d[float],
-    row_cfm: wp.array2d[float],
-    phi: wp.array2d[float],
-    target_velocity: wp.array2d[float],
+    rows: DenseRows,
     row_dof: wp.array3d[int],
     row_factor: wp.array3d[float],
     row_incident: wp.array2d[float],
-    diagonal: wp.array2d[float],
     support: _SparseRowSupport,
 ): ...
 
@@ -1031,17 +954,10 @@ def build_sparse_joint_velocity_limit_rows(
     factor_lookup: wp.array2d[int],
     inverse_factor: wp.array2d[float],
     v_hat: wp.array[float],
-    row_type: wp.array2d[int],
-    row_parent: wp.array2d[int],
-    row_mu: wp.array2d[float],
-    row_beta: wp.array2d[float],
-    row_cfm: wp.array2d[float],
-    phi: wp.array2d[float],
-    target_velocity: wp.array2d[float],
+    rows: DenseRows,
     row_dof: wp.array3d[int],
     row_factor: wp.array3d[float],
     row_incident: wp.array2d[float],
-    diagonal: wp.array2d[float],
     support: _SparseRowSupport,
 ):
     """Project allocated signed velocity-limit rows through the mass factor.
@@ -1066,17 +982,10 @@ def build_sparse_joint_velocity_limit_rows(
         factor_lookup,
         inverse_factor,
         v_hat,
-        row_type,
-        row_parent,
-        row_mu,
-        row_beta,
-        row_cfm,
-        phi,
-        target_velocity,
+        rows,
         row_dof,
         row_factor,
         row_incident,
-        diagonal,
         support,
     )
 
@@ -1093,7 +1002,7 @@ def build_sparse_joint_velocity_limit_rows(
     const int world = art_to_world.data[art];
     const int start = articulation_dof_start.data[art];
     const int dofs = inverse_permutation.shape[0];
-    const int capacity = row_type.shape[1];
+    const int capacity = rows.row_type.shape[1];
     const int support_capacity = row_factor.shape[2];
     const int factor_base = group * inverse_factor.shape[1];
     for (int m = mimic_art_start.data[art]; m < mimic_art_start.data[art + 1]; ++m) {
@@ -1133,15 +1042,15 @@ def build_sparse_joint_velocity_limit_rows(
         SUM(norm);
         if (LANE == 0) {
             row_incident.data[row_offset] = v_hat.data[dof0] - coefficient * v_hat.data[dof1];
-            diagonal.data[row_offset] = norm;
-            row_type.data[row_offset] = $MIMIC_TYPE;
-            row_parent.data[row_offset] = -1;
-            row_mu.data[row_offset] = 0.0f;
-            row_beta.data[row_offset] = pgs_beta;
-            row_cfm.data[row_offset] = pgs_cfm;
-            phi.data[row_offset] = RowLaw::mimic_phi(joint_q.data[mimic_q0.data[k]], joint_q.data[mimic_q1.data[k]],
+            rows.diag.data[row_offset] = norm;
+            rows.row_type.data[row_offset] = $MIMIC_TYPE;
+            rows.row_parent.data[row_offset] = -1;
+            rows.row_mu.data[row_offset] = 0.0f;
+            rows.row_beta.data[row_offset] = pgs_beta;
+            rows.row_cfm.data[row_offset] = pgs_cfm;
+            rows.phi.data[row_offset] = RowLaw::mimic_phi(joint_q.data[mimic_q0.data[k]], joint_q.data[mimic_q1.data[k]],
                                                      mimic_coef0.data[k], coefficient);
-            target_velocity.data[row_offset] = 0.0f;
+            rows.target.data[row_offset] = 0.0f;
         }
     }
 """.replace("$MIMIC_TYPE", str(PGS_CONSTRAINT_TYPE_MIMIC)),
@@ -1171,17 +1080,10 @@ def _build_sparse_mimic_rows(
     factor_lookup: wp.array2d[int],
     inverse_factor: wp.array2d[float],
     v_hat: wp.array[float],
-    row_type: wp.array2d[int],
-    row_parent: wp.array2d[int],
-    row_mu: wp.array2d[float],
-    row_beta: wp.array2d[float],
-    row_cfm: wp.array2d[float],
-    phi: wp.array2d[float],
-    target_velocity: wp.array2d[float],
+    rows: DenseRows,
     row_dof: wp.array3d[int],
     row_factor: wp.array3d[float],
     row_incident: wp.array2d[float],
-    diagonal: wp.array2d[float],
 ): ...
 
 
@@ -1208,17 +1110,10 @@ def build_sparse_mimic_rows(
     factor_lookup: wp.array2d[int],
     inverse_factor: wp.array2d[float],
     v_hat: wp.array[float],
-    row_type: wp.array2d[int],
-    row_parent: wp.array2d[int],
-    row_mu: wp.array2d[float],
-    row_beta: wp.array2d[float],
-    row_cfm: wp.array2d[float],
-    phi: wp.array2d[float],
-    target_velocity: wp.array2d[float],
+    rows: DenseRows,
     row_dof: wp.array3d[int],
     row_factor: wp.array3d[float],
     row_incident: wp.array2d[float],
-    diagonal: wp.array2d[float],
 ):
     """Project allocated same-articulation mimic rows through the mass factor.
 
@@ -1251,17 +1146,10 @@ def build_sparse_mimic_rows(
         factor_lookup,
         inverse_factor,
         v_hat,
-        row_type,
-        row_parent,
-        row_mu,
-        row_beta,
-        row_cfm,
-        phi,
-        target_velocity,
+        rows,
         row_dof,
         row_factor,
         row_incident,
-        diagonal,
     )
 
 

@@ -21,7 +21,8 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import kernels, solver_feather_pgs
+from newton._src.solvers.feather_pgs import field_group, kernels, solver_feather_pgs
+from newton._src.solvers.feather_pgs.contact_input import ContactInput
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton._src.solvers.feather_pgs.kernels import (
     allocate_world_contact_slots,
@@ -75,20 +76,30 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
         allocate_world_contact_slots,
         dim=contact_count,
         inputs=[
-            wp.array([contact_count], dtype=wp.int32, device=device),
+            field_group.upload(
+                ContactInput,
+                device,
+                count=wp.array([contact_count], dtype=wp.int32, device=device),
+                shape0=contact_shape0,
+                shape1=contact_shape1,
+                point0=contact_point0,
+                point1=contact_point1,
+                normal=contact_normal,
+                margin0=wp.zeros((contact_count,), dtype=wp.float32, device=device),
+                margin1=wp.zeros((contact_count,), dtype=wp.float32, device=device),
+                body_q=wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
+                shape_body=wp.zeros((1,), dtype=wp.int32, device=device),
+                response_dofs=wp.array([6], dtype=wp.int32, device=device),
+                world=contact_world,
+                slot=contact_slot,
+                art0=wp.full((contact_count,), -1, dtype=wp.int32, device=device),
+                art1=wp.full((contact_count,), -1, dtype=wp.int32, device=device),
+                path=contact_path,
+                slots_needed=slots_needed,
+            ),
             contact_count,
-            contact_shape0,
-            contact_shape1,
-            contact_point0,
-            contact_point1,
-            contact_normal,
-            wp.zeros((contact_count,), dtype=wp.float32, device=device),
-            wp.zeros((contact_count,), dtype=wp.float32, device=device),
-            wp.array([wp.transform_identity()], dtype=wp.transform, device=device),
             wp.zeros((1,), dtype=wp.int32, device=device),
             wp.zeros((1,), dtype=wp.int32, device=device),
-            wp.zeros((1,), dtype=wp.int32, device=device),
-            wp.array([6], dtype=wp.int32, device=device),
             wp.zeros((1,), dtype=wp.int32, device=device),
             wp.ones((1,), dtype=wp.int32, device=device),
             wp.zeros((1,), dtype=wp.int32, device=device),
@@ -106,14 +117,8 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
             wp.empty(0, dtype=wp.int32, device=device),
         ],
         outputs=[
-            contact_world,
-            contact_slot,
-            wp.full((contact_count,), -1, dtype=wp.int32, device=device),
-            wp.full((contact_count,), -1, dtype=wp.int32, device=device),
             counter,
-            contact_path,
             wp.zeros((1,), dtype=wp.int32, device=device),
-            slots_needed,
             dropped,
             wp.zeros((1,), dtype=wp.int32, device=device),
             first_rejected,

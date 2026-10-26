@@ -15,6 +15,7 @@ import newton
 from newton._src.solvers.feather_pgs import kernels
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton.solvers import SolverFeatherPGS
+from newton.tests.feather_pgs_law_harness import contact_input
 
 
 def _allocator_arrays(capacity, *, route=0, count=205, device="cpu"):
@@ -80,10 +81,12 @@ def _allocate(arrays):
     """
     kernel = kernels.allocate_world_contact_slots
     device = arrays["contact_count"].device
+    data, _arrays = contact_input(arrays, device)
+    values = {**arrays, "data": data}
     wp.launch(
         kernel,
         dim=1,
-        inputs=[arrays[name] for name in inspect.signature(kernel.func).parameters],
+        inputs=[values[name] for name in inspect.signature(kernel.func).parameters],
         device=device,
     )
     for family, counter, capacity, first_rejected in (

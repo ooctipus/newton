@@ -14,8 +14,9 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import compact_contact, contact_laws, friction_patches, kernels
+from newton._src.solvers.feather_pgs import compact_contact, contact_laws, field_group, friction_patches, kernels
 from newton._src.solvers.feather_pgs import row_packets as rp
+from newton._src.solvers.feather_pgs.field_group import SolverArrays
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, link_patch_routes, patch_routes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import (
@@ -197,33 +198,15 @@ def _run_general(data, layout, beta):
     and the right-hand sides before the bounces.
     """
     device, rows = layout.device, SimpleNamespace(**_poisoned_rows(layout.device))
-    geometry = [data.point0, data.point1, data.normal, data.shape0, data.shape1, data.margin0, data.margin1]
-    metadata = [rows.row_type, rows.row_parent, rows.row_mu, rows.row_beta, rows.row_cfm, rows.phi, rows.target]
-    wp.launch(
-        kernels.prepare_world_contact_rows,
-        dim=16,
-        inputs=[
-            *(data.count, 16, *geometry),
-            *(data.world, data.slot, data.art0, data.art1, data.path, data.slots_needed),
-            *(data.shape_body, data.body_q, data.body_v, data.prescribed, data.origin),
-            *(data.material_mu, data.material_restitution, data.friction_shared_anchor, data.friction_scale),
-            *(data.shared_anchor, data.beta, data.cfm, layout.view, beta),
-        ],
-        outputs=[*metadata, rows.restitution],
-        device=device,
-    )
+    general = field_group.replace(data, **vars(rows))
+    wp.launch(kernels.prepare_world_contact_rows, dim=16, inputs=[general, 16, layout.view, beta], device=device)
     jacobians = {}
     for size in (PRIMARY, SECONDARY):
         jacobians[size] = wp.zeros((WORLDS, ROWS, size), dtype=float, device=device)
         wp.launch(
             kernels.populate_world_J_for_compact_size,
             dim=(4, 32),
-            inputs=[
-                *(data.count, 4, *geometry),
-                *(data.slot, data.art0, data.art1, data.path, data.slots_needed, size, data.response_dofs),
-                *(layout.groups, data.dof_start, data.origin, data.body_mask, data.motion, data.shape_body),
-                *(data.body_q, data.friction_shared_anchor, layout.view, data.shared_anchor),
-            ],
+            inputs=[general, 4, size, layout.groups, layout.view],
             outputs=[jacobians[size]],
             device=device,
         )
@@ -406,6 +389,8 @@ def _owner_solver(device, *, anchors, beta=0.0):
         _friction_anchors_enabled=anchors,
         _friction_patches=SimpleNamespace(view=view),
         friction_anchor_beta=beta,
+        # The owner's placeholders come from the solver's allocator.
+        _arrays=SolverArrays(None, wp.get_device(device)),
     )
 
 
@@ -586,13 +571,11 @@ class TestRowPacketPatchRows(_PatchRowTwins, unittest.TestCase):
                     solver.friction_anchor_beta = beta
                     contact_input = rp.ContactInput()
                     with (
-                        mock.patch.object(rp, "bind", return_value=contact_input) as bind,
                         mock.patch.object(rp.wp, "launch_tiled") as tiled,
                         mock.patch.object(rp.wp, "launch") as launch,
                     ):
-                        owner.produce_contacts("state_in", "state_aug", "contacts", 0.25)
+                        owner.produce_contacts(contact_input)
                         owner.finish_rows()
-                    bind.assert_called_once_with(solver, "state_in", "state_aug", "contacts", 0.25, 1.0)
                     self.assertEqual([call.args[0] for call in launch.call_args_list], [rp.finalize_and_queue])
                     producer = rp.produce_patch_contacts if anchors else rp.produce_contacts
                     fallback = rp.materialize_patch_fallback if anchors else rp.materialize_fallback

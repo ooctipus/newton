@@ -10,7 +10,8 @@ from types import SimpleNamespace
 import warp as wp
 
 from ...sim import BodyFlags
-from . import cached_force, kernels, response_operator, sparse_factor, tree_chain_scan
+from . import cached_force, field_group, kernels, response_operator, sparse_factor, tree_chain_scan
+from .field_group import Field
 from .publication_data import PublicationData
 from .tree_kinetic_layout import REFERENCE_LAYOUT, TreeLayout
 
@@ -48,21 +49,24 @@ class KineticPlan:
     dof_passive: wp.array[int]
 
 
-@wp.struct
-class KineticData:
-    # Geometry, forces and source tags follow factor groups. Current validity
-    # follows articulation IDs shared with the ordinary FK/ID cache.
-    bias: wp.array2d[float]
-    com_offset: wp.array2d[wp.vec3]
-    geometric: wp.array2d[float]
-    current_valid: wp.array[int]
-    geometry_valid: wp.array[int]
-    generation: wp.array[wp.int64]
-    geometry_generation: wp.array[wp.int64]
-    status: wp.array[int]
-    source_q: wp.array[wp.uint64]
-    source_qd: wp.array[wp.uint64]
-    stage_clocks: wp.array2d[wp.int64]
+KINETIC_CACHE = field_group.FieldGroup(
+    Field("bias", wp.float32, ("group", "dof"), fill=None, grad=False, owner="cache"),
+    Field("com_offset", wp.vec3, ("group", "body"), fill=None, grad=False, owner="cache"),
+    Field("geometric", wp.float32, ("group", "entry"), fill=None, grad=False, owner="cache"),
+    Field("current_valid", wp.int32, ("articulation",), owner="solver", attr="_fk_id_cache_valid"),
+    Field("geometry_valid", wp.int32, ("group",), grad=False, owner="cache"),
+    Field("generation", wp.int64, ("group",), grad=False, owner="cache"),
+    Field("geometry_generation", wp.int64, ("group",), fill=-1, grad=False, owner="cache"),
+    Field("status", wp.int32, ("group",), grad=False, owner="cache"),
+    Field("source_q", wp.uint64, ("group",), grad=False, owner="cache"),
+    Field("source_qd", wp.uint64, ("group",), grad=False, owner="cache"),
+    Field("stage_clocks", wp.int64, ("group", "stage"), owner="step"),
+)
+"""The held tree's cache. Geometry, forces and source tags follow factor groups (the cache allocates them);
+current validity follows articulation IDs, shared with the ordinary FK/ID cache (the solver's); the stage clocks
+are the owner's."""
+
+KineticData = field_group.struct("KineticData", KINETIC_CACHE, __name__)
 
 
 @wp.struct
@@ -88,26 +92,30 @@ class HeldResponse:
     factor_index: wp.array2d[int]
 
 
-@wp.struct
-class ForceInput:
-    joint_q: wp.array[float]
-    joint_qd: wp.array[float]
-    predictor_qd: wp.array[float]
-    joint_f: wp.array[float]
-    body_f: wp.array[wp.spatial_vector]
-    body_flags: wp.array[int]
-    stiffness: wp.array[float]
-    reference: wp.array[float]
-    damping: wp.array[float]
-    u0: wp.array[float]
-    S: wp.array[wp.spatial_vector]
-    kinematic_joint: wp.array[int]
-    qdd: wp.array[float]
-    vhat: wp.array[float]
-    dt: float
-    stage_clocks: wp.array2d[wp.int64]
-    predicted_twist: wp.array[wp.spatial_vector]
-    publish_twists: int
+FORCE_INPUT = (
+    Field("joint_q", wp.float32, ("coord",), owner="state_in"),
+    Field("joint_qd", wp.float32, ("dof",), owner="state_in"),
+    Field("predictor_qd", wp.float32, ("dof",), owner="step"),
+    Field("joint_f", wp.float32, ("dof",), owner="control"),
+    Field("body_f", wp.spatial_vector, ("body",), owner="state_in"),
+    Field("body_flags", wp.int32, ("body",), owner="model"),
+    Field("stiffness", wp.float32, ("dof",), attr="_passive_spring_stiffness"),
+    Field("reference", wp.float32, ("dof",), attr="_passive_spring_ref"),
+    Field("damping", wp.float32, ("dof",), attr="_passive_joint_damping"),
+    Field("u0", wp.float32, ("dof",), owner="state_aug", attr="joint_tau"),
+    Field("S", wp.spatial_vector, ("dof",), owner="state_aug", attr="joint_S_s"),
+    Field("kinematic_joint", wp.int32, ("joint",), attr="_kinematic_joint_mask"),
+    Field("qdd", wp.float32, ("dof",), owner="state_aug", attr="joint_qdd"),
+    Field("vhat", wp.float32, ("dof",), attr="v_hat"),
+    Field("dt", wp.float32, owner="step"),
+    Field("stage_clocks", wp.int64, ("group", "stage"), owner="step"),
+    Field("predicted_twist", wp.spatial_vector, ("body",), owner="step"),
+    Field("publish_twists", wp.int32, owner="step"),
+)
+"""The held-tree predictor's inputs: the step's state and control, the solver's passive and kinematic tables, the
+augmented state it writes, and the step's values."""
+
+ForceInput = field_group.struct("ForceInput", FORCE_INPUT, __name__)
 
 
 @wp.struct

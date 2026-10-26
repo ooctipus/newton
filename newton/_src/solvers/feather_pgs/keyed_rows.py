@@ -20,10 +20,12 @@ from functools import cache, partial
 import warp as wp
 
 from ...sim import ModelFlags
-from .contact_input import ContactInput, bind
+from . import field_group
+from .contact_input import ContactInput
 from .contact_laws import CONTACT_LAW, contact_friction
 from .device_preludes import dual_native, lane_group
-from .friction_patches import PatchRowLaw
+from .field_group import Field, FieldGroup, SolverArrays
+from .friction_patches import PatchRowLaw, patch_row_law
 from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 from .keyed_row_layout import prefix_kernel
 from .keyed_row_layout import topology_plan as direct_topology_plan
@@ -31,48 +33,56 @@ from .law_source import law_preludes
 from .row_inputs import ParallelRowInputs, RowArgument
 from .row_laws import ROW_LAW
 
+ROW_MAPS = FieldGroup(
+    Field("groups", wp.int32, ("world", "size"), owner="maps"),
+    Field("starts", wp.int32, ("world", "size"), owner="maps"),
+)
+"""Each world's size-group index and first coordinate of its articulation of each size."""
 
-@wp.struct
-class RowMaps:
-    groups: wp.array2d[int]
-    starts: wp.array2d[int]
+RowMaps = field_group.struct("RowMaps", ROW_MAPS, __name__)
+
+PREFIX_INPUT = (
+    ROW_MAPS["starts"],
+    Field("q_index", wp.int32, ("dof",), attr="_joint_limit_q_index"),
+    Field("lower", wp.float32, ("dof",), owner="model", attr="joint_limit_lower"),
+    Field("upper", wp.float32, ("dof",), owner="model", attr="joint_limit_upper"),
+    Field("velocity_limit", wp.float32, ("dof",), owner="model", attr="joint_velocity_limit"),
+    Field("q", wp.float32, ("coord",), owner="state_in", attr="joint_q"),
+    Field("vhat", wp.float32, ("dof",), attr="v_hat"),
+    Field("counts", wp.int32, ("world",), attr="slot_counter"),
+    Field("bounds", wp.int32, ("world", 2), attr="dense_phase_bounds"),
+    Field("velocity_slots", wp.int32, ("velocity_row",), attr="velocity_limit_slot"),
+    Field("velocity_signs", wp.float32, ("velocity_row",), attr="velocity_limit_sign"),
+    Field("kind", wp.int32, ("world", "row"), attr="row_type"),
+    Field("parent", wp.int32, ("world", "row"), attr="row_parent"),
+    Field("mu", wp.float32, ("world", "row"), attr="row_mu"),
+    Field("beta", wp.float32, ("world", "row"), attr="row_beta"),
+    Field("cfm", wp.float32, ("world", "row"), attr="row_cfm"),
+    Field("phi", wp.float32, ("world", "row")),
+    Field("target", wp.float32, ("world", "row"), attr="target_velocity"),
+    Field("restitution", wp.float32, ("world", "row"), attr="row_restitution"),
+    Field("rhs", wp.float32, ("world", "row")),
+    Field("gap", wp.float32, attr="joint_limit_activation_gap"),
+    Field("activation", wp.float32, attr="velocity_limit_activation_fraction"),
+    Field("pgs_beta", wp.float32),
+    Field("pgs_cfm", wp.float32),
+    Field("dt", wp.float32, owner="step"),
+)
+"""The keyed prefix's inputs and the dense rows it writes; without joint velocity limits, their tables take
+placeholders."""
+
+PrefixInput = field_group.struct("PrefixInput", PREFIX_INPUT, __name__)
 
 
-@wp.struct
-class PrefixInput:
-    starts: wp.array2d[int]
-    q_index: wp.array[int]
-    lower: wp.array[float]
-    upper: wp.array[float]
-    velocity_limit: wp.array[float]
-    q: wp.array[float]
-    vhat: wp.array[float]
-    counts: wp.array[int]
-    bounds: wp.array2d[int]
-    velocity_slots: wp.array[int]
-    velocity_signs: wp.array[float]
-    kind: wp.array2d[int]
-    parent: wp.array2d[int]
-    mu: wp.array2d[float]
-    beta: wp.array2d[float]
-    cfm: wp.array2d[float]
-    phi: wp.array2d[float]
-    target: wp.array2d[float]
-    restitution: wp.array2d[float]
-    rhs: wp.array2d[float]
-    gap: float
-    activation: float
-    pgs_beta: float
-    pgs_cfm: float
-    dt: float
+KINETIC_ROWS = (
+    Field("rowkeys", wp.int32, ("world", "row"), fill=None),
+    Field("maps", RowMaps),
+    Field("prefix", PrefixInput),
+    Field("contact", ContactInput),
+)
+"""The keyed kernels' input: each dense row's key, the maps, the prefix input and the contact input."""
 
-
-@wp.struct
-class KineticRows:
-    rowkeys: wp.array2d[int]
-    maps: RowMaps
-    prefix: PrefixInput
-    contact: ContactInput
+KineticRows = field_group.struct("KineticRows", KINETIC_ROWS, __name__)
 
 
 @wp.kernel(enable_backward=False)
@@ -441,22 +451,18 @@ class KeyedRows:
         self.layout, groups, starts = direct_topology_plan(solver)
         self.prefix_layout = self.layout
         dev, worlds, capacity = solver.model.device, solver.world_count, solver.dense_max_constraints
-        self.data, self.maps, self.prefix = KineticRows(), RowMaps(), PrefixInput()
-        self.data.rowkeys = wp.empty((worlds, capacity), dtype=int, device=dev)
-        self.maps.groups = wp.array(groups, dtype=int, device=dev)
-        self.maps.starts = wp.array(starts, dtype=int, device=dev)
+        self.data, self.prefix = KineticRows(), PrefixInput()
+        self.data.rowkeys = SolverArrays(None, dev).array(KINETIC_ROWS[0], {"world": worlds, "row": capacity})
+        self.maps = field_group.upload(RowMaps, dev, groups=groups, starts=starts)
         self.contact_input = None
-        self._dummy_int = wp.zeros(1, dtype=int, device=dev)
-        self._dummy_float = wp.zeros(1, dtype=float, device=dev)
+        # The placeholders of absent prefix tables, allocated before any capture.
+        solver._arrays.placeholder(wp.int32)
+        solver._arrays.placeholder(wp.float32)
         self._dummy_factor = wp.zeros((1, 1, 1), dtype=float, device=dev)
         self._signature = _signature(solver)
         # Persistent patch friction: the rows carry the patch law, and the patch link owns parents and coefficients.
         self.patch = bool(solver._friction_anchors_enabled)
-        self.law = None
-        if self.patch:
-            self.law = PatchRowLaw()
-            self.law.patches = solver._friction_patches.view
-            self.law.beta = solver.friction_anchor_beta
+        self.law = patch_row_law(solver)
 
     def validate_notification(self, flags=ModelFlags.ALL):
         """Reject static-plan changes before retiring any canonical producer."""
@@ -475,58 +481,33 @@ class KeyedRows:
 
     def begin_rows(self, state_in, state_aug, dt):
         """Read current motion and predictor with the current held-factor buffers."""
-        s, m, p = self.solver, self.maps, self.prefix
-        p.starts, p.q, p.vhat = m.starts, state_in.joint_q, s.v_hat
-        for name, source in (
-            ("q_index", "_joint_limit_q_index"),
-            ("counts", "slot_counter"),
-            ("bounds", "dense_phase_bounds"),
-            ("velocity_slots", "velocity_limit_slot"),
-            ("velocity_signs", "velocity_limit_sign"),
-            ("kind", "row_type"),
-            ("parent", "row_parent"),
-            ("mu", "row_mu"),
-            ("beta", "row_beta"),
-            ("cfm", "row_cfm"),
-            ("phi", "phi"),
-            ("target", "target_velocity"),
-            ("restitution", "row_restitution"),
-            ("rhs", "rhs"),
-        ):
-            value = getattr(s, source)
-            if value is None:
-                value = self._dummy_float if name == "velocity_signs" else self._dummy_int
-            setattr(p, name, value)
-        p.lower, p.upper, p.velocity_limit = (
-            s.model.joint_limit_lower,
-            s.model.joint_limit_upper,
-            s.model.joint_velocity_limit,
-        )
-        p.gap, p.activation, p.pgs_beta, p.pgs_cfm, p.dt = (
-            s.joint_limit_activation_gap,
-            s.velocity_limit_activation_fraction,
-            s.pgs_beta,
-            s.pgs_cfm,
-            dt,
+        s, m = self.solver, self.maps
+        # A table the solver does not have (joint velocity limits) takes a placeholder.
+        absent = {
+            field.name: s._arrays.placeholder(field.dtype)
+            for field in PREFIX_INPUT
+            if field.owner == "solver" and len(field.dims) == 1 and getattr(s, field.attr or field.name) is None
+        }
+        p = field_group.bind(
+            PrefixInput, self.prefix, solver=s, model=s.model, maps=m, state_in=state_in, dt=dt, **absent
         )
         self.contact_input = None
         self.data.maps, self.data.prefix = m, p
         prefix = prefix_kernel(self.prefix_layout, PrefixInput, KineticRows)
         wp.launch_tiled(prefix, dim=[s.world_count], inputs=[p, self.data], block_dim=32, device=s.model.device)
 
-    def produce_contacts(self, state_in, state_aug, contacts, dt):
-        """Defer current contact construction until final fallback counts are known.
+    def produce_contacts(self, contact_input):
+        """Defer current contact construction (the step's bound contact input) until final fallback counts are known.
 
         Under patch friction the contact keys are scattered now, with the type,
         parent and undivided coefficient the patch link reads and rewrites.
         """
-        self.contact_input = bind(self.solver, state_in, state_aug, contacts, dt, 1.0)
+        self.contact_input = contact_input
         self.data.contact = self.contact_input
         if self.patch:
-            # Like bind() and the other row producers, read the anchor coefficient and the
-            # patch view (which contact-pool growth replaces) every step.
-            self.law.patches = self.solver._friction_patches.view
-            self.law.beta = self.solver.friction_anchor_beta
+            # Like the other row producers, bind the anchor coefficient and the patch view (which
+            # contact-pool growth replaces) every step.
+            self.law = patch_row_law(self.solver)
             pool = self.solver._contact_pool
             pool.launch(
                 scatter_patch_contact_keys,

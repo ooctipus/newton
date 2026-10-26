@@ -21,6 +21,7 @@ from newton._src.solvers.feather_pgs import kernels
 from newton._src.solvers.feather_pgs import resolved_worlds as rw
 from newton._src.solvers.feather_pgs.friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, patch_routes
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
+from newton.tests.feather_pgs_law_harness import contact_input
 from newton.tests.feather_pgs_patch_parity import assert_history_close
 from newton.tests.test_feather_pgs_friction_patches import _patch_fixture
 from newton.tests.test_feather_pgs_mixed_tree_free_body import DT, _add_quadruped, _build
@@ -164,7 +165,9 @@ def _allocate(kernel, resolved):
         "dense_first_rejected_slot": integers([2**31 - 1] * 2),
         "mf_first_rejected_slot": integers([2**31 - 1] * 2),
     }
-    wp.launch(kernel, dim=1, inputs=[arrays[name] for name in inspect.signature(kernel.func).parameters], device="cpu")
+    data, _arrays = contact_input(arrays, "cpu")
+    values = {**arrays, "data": data}
+    wp.launch(kernel, dim=1, inputs=[values[name] for name in inspect.signature(kernel.func).parameters], device="cpu")
     return {name: value.numpy() for name, value in arrays.items() if isinstance(value, wp.array)}
 
 
@@ -464,9 +467,9 @@ class TestResolvedWorlds(unittest.TestCase):
         self.assertEqual(
             [ast.unparse(statement) for statement in release.body[2:]],
             [
-                "contact_slot[c] = -1",
-                "contact_path[c] = -1",
-                "if admitted:\n    contact_path[c] = CONTACT_PATH_RESOLVED",
+                "data.slot[c] = -1",
+                "data.path[c] = -1",
+                "if admitted:\n    data.path[c] = CONTACT_PATH_RESOLVED",
             ],
         )
         # The allocator rejects what the admission rejects; past it only classification runs: every path

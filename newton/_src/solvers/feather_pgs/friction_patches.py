@@ -54,8 +54,10 @@ from ...core.contact_pool import ContactField, ContactPool
 from ...core.live_sort import EXTENT_SIZE, SORT_CHUNK, launch_live_sort, publish_sort_extent, slot_keys_fit, sort_grid
 from ...math.spatial import velocity_at_point
 from ...sim.contacts import GENERATION_SENTINEL, capture_scope, contact_frame_write
+from . import field_group
 from .contact_filters import contact_friction_eligible, contact_normal_gap_limit
 from .contact_laws import contact_bodies, contact_points, contact_tangent_basis
+from .field_group import Field
 from .projection_laws import disk
 
 # Grids are fixed at construction so CUDA graphs replay them. Their sizes count
@@ -119,22 +121,33 @@ class FrictionPatches:
     phi: wp.array[wp.vec2]
 
 
-@wp.struct
-class PatchRowLaw:
-    """Tangent-row law of persistent patches, for producers that write their own friction rows.
+PATCH_ROW_LAW = (
+    Field("patches", FrictionPatches, owner="friction_patches", attr="view"),
+    Field("beta", wp.float32, attr="friction_anchor_beta"),
+)
 
-    A tangent row acts at its patch's friction location, carries the anchor's tangential
-    displacement as phi and corrects it with ``beta`` (``friction_anchor_beta``). Producers write
-    the undivided friction coefficient; the patch link (``_FrictionPatchState.link``, which
-    launches ``link_patch_routes``) divides it and links the ring. The compact contact boundary
-    and the local row packets apply the law through ``contact_laws.contact_row_frame`` at
-    :func:`patch_friction_location` and :func:`patch_tangent_row`; keyed rows write it in their
-    native row source (``keyed_rows._patch_row_law``), and the masked row builder's patch variants
-    (``row_build.contact_row_prelude_patch``) as the per-contact builder does.
+PatchRowLaw = field_group.struct("PatchRowLaw", PATCH_ROW_LAW, __name__)
+"""Tangent-row law of persistent patches, for producers that write their own friction rows.
+
+A tangent row acts at its patch's friction location, carries the anchor's tangential
+displacement as phi and corrects it with ``beta`` (``friction_anchor_beta``). Producers write
+the undivided friction coefficient; the patch link (``_FrictionPatchState.link``, which
+launches ``link_patch_routes``) divides it and links the ring. The compact contact boundary
+and the local row packets apply the law through ``contact_laws.contact_row_frame`` at
+:func:`patch_friction_location` and :func:`patch_tangent_row`; keyed rows write it in their
+native row source (``keyed_rows._patch_row_law``), and the masked row builder's patch variants
+(``row_build.contact_row_prelude_patch``) as the per-contact builder does.
+"""
+
+
+def patch_row_law(solver) -> "PatchRowLaw | None":
+    """The solver's patch row law for this step, or ``None`` without persistent patch friction.
+
+    Bound every step: contact-pool growth replaces the patch view.
     """
-
-    patches: FrictionPatches
-    beta: float
+    if not solver._friction_anchors_enabled:
+        return None
+    return field_group.bind(PatchRowLaw, solver=solver, friction_patches=solver._friction_patches)
 
 
 @wp.func

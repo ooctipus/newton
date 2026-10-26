@@ -1,114 +1,79 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bind the solver's current contact, body and row storage for a contact-row producer."""
+"""The contact-row producers' input: the contacts, the bodies, the row law and the dense row records.
+
+Declared once as fields (:mod:`.field_group`); :data:`ContactInput` is their
+Warp struct and :func:`bind` fills it from the solver's live storage.
+"""
 
 import warp as wp
 
+from . import dense_rows, field_group
+from .field_group import Field
 
-@wp.struct
-class ContactInput:
-    count: wp.array[int]
-    point0: wp.array[wp.vec3]
-    point1: wp.array[wp.vec3]
-    normal: wp.array[wp.vec3]
-    shape0: wp.array[int]
-    shape1: wp.array[int]
-    margin0: wp.array[float]
-    margin1: wp.array[float]
-    world: wp.array[int]
-    slot: wp.array[int]
-    art0: wp.array[int]
-    art1: wp.array[int]
-    path: wp.array[int]
-    slots_needed: wp.array[int]
-    shape_body: wp.array[int]
-    body_q: wp.array[wp.transform]
-    body_v: wp.array[wp.spatial_vector]
-    body_mask: wp.array[wp.uint32]
-    response_dofs: wp.array[int]
-    dof_start: wp.array[int]
-    origin: wp.array[wp.vec3]
-    motion: wp.array[wp.spatial_vector]
-    prescribed: wp.array[int]
-    material_mu: wp.array[float]
-    material_restitution: wp.array[float]
-    incident: wp.array[float]
-    shared_anchor: int
-    friction_shared_anchor: int
-    friction_scale: float
-    beta: float
-    cfm: float
-    dt: float
-    bias_scale: float
-    speculative_scale: float
-    restitution_threshold: float
-    contact_w: float
-    row_type: wp.array2d[int]
-    row_parent: wp.array2d[int]
-    row_mu: wp.array2d[float]
-    row_beta: wp.array2d[float]
-    row_cfm: wp.array2d[float]
-    phi: wp.array2d[float]
-    target: wp.array2d[float]
-    restitution: wp.array2d[float]
-    rhs: wp.array2d[float]
-    diag: wp.array2d[float]
-    row_w: wp.array2d[float]
+CONTACT_INPUT = (
+    # The collision pipeline's contacts.
+    Field("count", wp.int32, (1,), owner="contacts", attr="rigid_contact_count"),
+    Field("point0", wp.vec3, ("contact",), owner="contacts", attr="rigid_contact_point0"),
+    Field("point1", wp.vec3, ("contact",), owner="contacts", attr="rigid_contact_point1"),
+    Field("normal", wp.vec3, ("contact",), owner="contacts", attr="rigid_contact_normal"),
+    Field("shape0", wp.int32, ("contact",), owner="contacts", attr="rigid_contact_shape0"),
+    Field("shape1", wp.int32, ("contact",), owner="contacts", attr="rigid_contact_shape1"),
+    Field("margin0", wp.float32, ("contact",), owner="contacts", attr="rigid_contact_margin0"),
+    Field("margin1", wp.float32, ("contact",), owner="contacts", attr="rigid_contact_margin1"),
+    # The allocator's record of each contact.
+    Field("world", wp.int32, ("contact",), attr="contact_world"),
+    Field("slot", wp.int32, ("contact",), attr="contact_slot"),
+    Field("art0", wp.int32, ("contact",), attr="contact_art_a"),
+    Field("art1", wp.int32, ("contact",), attr="contact_art_b"),
+    Field("path", wp.int32, ("contact",), attr="contact_path"),
+    Field("slots_needed", wp.int32, ("contact",), attr="contact_slots_needed"),
+    # Shapes, bodies and articulations.
+    Field("shape_body", wp.int32, ("shape",), owner="model"),
+    Field("body_q", wp.transform, ("body",), owner="state_in"),
+    Field("body_v", wp.spatial_vector, ("body",), owner="state_aug", attr="body_v_s"),
+    Field("body_mask", wp.uint32, ("body",), attr="body_response_dof_mask"),
+    Field("response_dofs", wp.int32, ("articulation",), attr="articulation_response_dof_count"),
+    Field("dof_start", wp.int32, ("articulation",), attr="articulation_dof_start"),
+    Field("origin", wp.vec3, ("articulation",), attr="articulation_origin"),
+    Field("motion", wp.spatial_vector, ("dof",), owner="state_aug", attr="joint_S_s"),
+    Field("prescribed", wp.int32, ("articulation",), attr="_prescribed_articulation"),
+    Field("material_mu", wp.float32, ("shape",), attr="shape_material_mu"),
+    Field("material_restitution", wp.float32, ("shape",), attr="shape_material_restitution"),
+    Field("incident", wp.float32, ("dof",), attr="v_hat"),
+    # The row law.
+    Field("shared_anchor", wp.int32, attr="contact_shared_anchor"),
+    Field("friction_shared_anchor", wp.int32, attr="contact_friction_shared_anchor"),
+    Field("friction_scale", wp.float32, attr="contact_friction_scale"),
+    Field("beta", wp.float32, attr="pgs_beta"),
+    Field("cfm", wp.float32, attr="pgs_cfm"),
+    Field("dt", wp.float32, owner="step"),  # the step's values, given to bind() directly
+    Field("bias_scale", wp.float32, owner="step"),
+    Field("speculative_scale", wp.float32, attr="contact_speculative_scale"),
+    Field("restitution_threshold", wp.float32, attr="_effective_restitution_velocity_threshold"),
+    Field("contact_w", wp.float32, attr="_contact_w"),
+    # The dense row records the producers write.
+    *dense_rows.RECORDS,
+)
+
+ContactInput = field_group.struct("ContactInput", CONTACT_INPUT, __name__)
 
 
-def bind(solver, state_in, state_aug, contacts, dt, bias_scale):
-    """Bind the solver's live storage without allocating device memory or reading back."""
-    data = ContactInput()
-    for name, source in (
-        ("count", "count"),
-        ("point0", "point0"),
-        ("point1", "point1"),
-        ("normal", "normal"),
-        ("shape0", "shape0"),
-        ("shape1", "shape1"),
-        ("margin0", "margin0"),
-        ("margin1", "margin1"),
-    ):
-        setattr(data, name, getattr(contacts, "rigid_contact_" + source))
-    for name, source in (
-        ("world", "contact_world"),
-        ("slot", "contact_slot"),
-        ("art0", "contact_art_a"),
-        ("art1", "contact_art_b"),
-        ("path", "contact_path"),
-        ("slots_needed", "contact_slots_needed"),
-        ("body_mask", "body_response_dof_mask"),
-        ("response_dofs", "articulation_response_dof_count"),
-        ("dof_start", "articulation_dof_start"),
-        ("origin", "articulation_origin"),
-        ("prescribed", "_prescribed_articulation"),
-        ("material_mu", "shape_material_mu"),
-        ("material_restitution", "shape_material_restitution"),
-        ("incident", "v_hat"),
-        ("row_type", "row_type"),
-        ("row_parent", "row_parent"),
-        ("row_mu", "row_mu"),
-        ("row_beta", "row_beta"),
-        ("row_cfm", "row_cfm"),
-        ("phi", "phi"),
-        ("target", "target_velocity"),
-        ("restitution", "row_restitution"),
-        ("rhs", "rhs"),
-        ("diag", "diag"),
-        ("row_w", "row_w"),
-    ):
-        setattr(data, name, getattr(solver, source))
-    data.shape_body = solver.model.shape_body
-    data.body_q = state_in.body_q
-    data.body_v = state_aug.body_v_s
-    data.motion = state_aug.joint_S_s
-    data.shared_anchor = int(solver.contact_shared_anchor)
-    data.friction_shared_anchor = int(solver.contact_friction_shared_anchor)
-    data.friction_scale = solver.contact_friction_scale
-    data.beta, data.cfm = solver.pgs_beta, solver.pgs_cfm
-    data.dt, data.bias_scale = dt, bias_scale
-    data.speculative_scale = solver.contact_speculative_scale
-    data.restitution_threshold = solver._effective_restitution_velocity_threshold
-    data.contact_w = solver._contact_w
-    return data
+def bind(solver, state_in, state_aug, contacts, dt, bias_scale, data=None):
+    """Bind the solver's live storage into a :data:`ContactInput`, without allocating device memory or reading back.
+
+    Args:
+        data: An instance to refill, or ``None`` for a new one.
+    """
+    return field_group.bind(
+        ContactInput,
+        data,
+        solver=solver,
+        contacts=contacts,
+        model=solver.model,
+        state_in=state_in,
+        state_aug=state_aug,
+        dt=dt,
+        bias_scale=bias_scale,
+    )

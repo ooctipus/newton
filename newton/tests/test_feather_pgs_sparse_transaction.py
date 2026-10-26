@@ -25,7 +25,6 @@ from newton._src.solvers.feather_pgs.kernels import populate_world_J_for_compact
 from newton._src.solvers.feather_pgs.sparse_contact import (
     CONTACT_RECORD_FLOATS,
     CONTACT_RING_FLOATS,
-    SparseContactRows,
     _get_sparse_contact_response_kernel,
 )
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupportPlan
@@ -35,7 +34,7 @@ from newton.tests import test_feather_pgs_sparse_contact_triplets as triplets
 from newton.tests.feather_pgs_patch_parity import standing_model
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
 from newton.tests.test_feather_pgs_path_selection import _cpu_model
-from newton.tests.test_feather_pgs_sparse_contacts import _fixture
+from newton.tests.test_feather_pgs_sparse_contacts import _contact_input, _fixture
 from newton.tests.test_feather_pgs_sparse_pgs import _sweep
 from newton.tests.test_feather_pgs_sparse_solver import _make_solver
 
@@ -127,47 +126,37 @@ class TestContactRecordBuilder(unittest.TestCase):
         f["patches"].phi = array([[0.01, -0.02], [-0.03, 0.04], [0.0, 0.0]], wp.vec2)
         f["patches"].enabled = patch
         response_dofs = array([6, 0], int)
-        geometry = [f[name] for name in ("point0", "point1", "normal", "shape0", "shape1", "thickness0", "thickness1")]
-        rows = SparseContactRows()
-        rows.body_velocity = array(np.zeros((4, 6), dtype=np.float32), wp.spatial_vector)
-        rows.prescribed_articulation = array([0, 1], int)
-        rows.material_friction = array([0.8, 0.5, 0.3, 0.6, 0.4])
-        rows.material_restitution = array([0.4, 0.2, 0.5, 0.8, 0.6])
-        rows.beta, rows.cfm = 0.05, 0.03
-        rows.friction_scale, rows.friction_beta = 0.8, 0.23
-        rows.speculative_scale, rows.restitution_velocity_threshold = 0.65, 0.1
-        for name in ("type", "parent"):
-            setattr(rows, name, full((1, 9), -9, int))
-        for name in ("mu", "beta_row", "cfm_row", "phi", "target_velocity", "restitution", "rhs"):
-            setattr(rows, name, full((1, 9), -9.0))
+        law = {
+            "body_v": array(np.zeros((4, 6), dtype=np.float32), wp.spatial_vector),
+            "prescribed": array([0, 1], int),
+            "material_mu": array([0.8, 0.5, 0.3, 0.6, 0.4]),
+            "material_restitution": array([0.4, 0.2, 0.5, 0.8, 0.6]),
+            "beta": 0.05,
+            "cfm": 0.03,
+            "friction_scale": 0.8,
+            "speculative_scale": 0.65,
+            "restitution_threshold": 0.1,
+            "dt": 0.01,
+        }
+        for name in ("row_type", "row_parent"):
+            law[name] = full((1, 9), -9, int)
+        for name in ("row_mu", "row_beta", "row_cfm", "phi", "target", "restitution", "rhs"):
+            law[name] = full((1, 9), -9.0)
         support_plan = _SparseRowSupportPlan.build(plan, plan.joint_ancestor_mask, max_row_dofs=6)
         support = support_plan.to_device(1, 9, device)
         dense = full((1, 9, 6), 0.0)
+        compact = _contact_input(
+            f,
+            device,
+            response_dofs=response_dofs,
+            body_mask=f["physical_mask"],
+            shared_anchor=shared,
+            friction_shared_anchor=friction_shared,
+        )
         wp.launch(
             populate_world_J_for_compact_size,
             dim=(1, 32),
-            inputs=[
-                f["count"],
-                1,
-                *geometry,
-                f["slot"],
-                f["art_a"],
-                f["art_b"],
-                f["path"],
-                f["needed"],
-                6,
-                response_dofs,
-                f["group"],
-                f["start"],
-                f["origin"],
-                f["physical_mask"],
-                f["motion"],
-                f["shape_body"],
-                f["body_q"],
-                friction_shared,
-                f["patches"],
-                shared,
-            ],
+            inputs=[compact, 1, 6, f["group"], f["patches"]],
             outputs=[dense],
             device=device,
         )
@@ -180,46 +169,37 @@ class TestContactRecordBuilder(unittest.TestCase):
             "incident": full((1, 9), -9.0),
             "diagonal": full((1, 9), -9.0),
         }
+        data = _contact_input(
+            f,
+            device,
+            response_dofs=response_dofs,
+            shared_anchor=shared,
+            friction_shared_anchor=friction_shared,
+            diag=outputs["diagonal"],
+            **law,
+        )
         wp.launch(
             _get_sparse_contact_response_kernel(6, lanes_per_contact=lanes, **options),
             dim=workers * lanes,
             inputs=[
-                f["count"],
+                data,
                 workers,
-                *geometry,
-                f["world"],
-                f["slot"],
-                f["art_a"],
-                f["art_b"],
-                f["path"],
-                f["needed"],
                 f["group"],
-                response_dofs,
                 full(response_dofs.shape, 0, int),
                 full(response_dofs.shape, 0, int),
-                f["start"],
-                f["origin"],
                 f["sparse_mask"],
-                f["motion"],
-                f["shape_body"],
-                f["body_q"],
-                friction_shared,
                 f["patches"],
-                shared,
                 f["indices"].permutation,
                 f["indices"].row_offsets,
                 f["packed"],
                 array(np.eye(6)[None]),
-                f["velocity"],
-                rows,
-                0.01,
+                0.23,
             ],
             outputs=[
                 full((1, 1, 1), -9, int),
                 outputs["row_factor"],
                 record if records else full((1, 9, 12), -9.0),
                 outputs["incident"],
-                outputs["diagonal"],
                 support,
             ],
             block_dim=128,
@@ -228,8 +208,8 @@ class TestContactRecordBuilder(unittest.TestCase):
         # The independent oracle: dense contact rows through the inverse factor, with the rows' CFM.
         expected = dense.numpy()[0, :7][:, plan.permutation] @ f["inverse"].T
         results = {name: value.numpy() for name, value in outputs.items()}
-        results["rhs"] = rows.rhs.numpy()
-        return results, record.numpy(), expected, float(rows.cfm)
+        results["rhs"] = law["rhs"].numpy()
+        return results, record.numpy(), expected, law["cfm"]
 
     def _check_records(self, device, *, lanes=8, workers=1):
         """Check the records of the two full triplets against NumPy blocks, and the rows against the plain builder."""

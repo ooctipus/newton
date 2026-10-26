@@ -45,7 +45,9 @@ from dataclasses import dataclass, fields
 import numpy as np
 import warp as wp
 
+from . import field_group
 from .device_preludes import DevicePrelude
+from .field_group import Field, FieldGroup, SolverArrays
 from .row_inputs import RowArgument
 
 SOLVE_READOUTS = ("off", "sweeps", "trace")
@@ -71,44 +73,33 @@ class SolvePolicyUnsupported(ValueError):
     """A sweep variant cannot compile the requested stopping rule or readout."""
 
 
-@wp.struct
-class SolveReadout:
-    """Device counters of one sweep kernel under ``readout="sweeps"``."""
+READOUT_COUNTERS = FieldGroup(
+    # Solves by executed sweeps and world: row k counts the solves that executed k sweeps; executed counts beyond the
+    # last row add to the last row.
+    Field("sweeps", wp.int32, ("budget_row", "world")),
+    # Solves per world that executed every sweep of their budget without stopping.
+    Field("exhausted", wp.int32, ("world",)),
+)
+"""The per-world counters of a readout operand (``readout="sweeps"`` and ``"trace"``)."""
 
-    sweeps: wp.array2d[wp.int32]
-    """Solves by executed sweeps and world, shape ``[rows, world_count]``.
+TRACE_COUNTERS = FieldGroup(
+    # Solves by grid tolerance and stopping sweep: column k counts the solves whose largest velocity-scaled change
+    # first fell to the tolerance after sweep k; the last column counts the solves for which it never did within
+    # their executed sweeps.
+    Field("stops", wp.int64, (len(TRACE_GRID), "stop")),
+    # Solves by exit reason (TRACE_REASONS).
+    Field("reasons", wp.int64, (len(TRACE_REASONS),)),
+    # Final sweeps by the kind of their largest velocity-scaled change and its magnitude bin.
+    Field("limits", wp.int64, (len(TRACE_KINDS), TRACE_BINS)),
+)
+"""The whole-run counters a trace adds: they sum over every world, so they are 64-bit and do not wrap within a
+training-length run."""
 
-    Row ``k`` counts the solves that executed ``k`` sweeps; executed counts
-    beyond the last row add to the last row.
-    """
-    exhausted: wp.array[wp.int32]
-    """Solves per world that executed every sweep of their budget without stopping."""
+SolveReadout = field_group.struct("SolveReadout", READOUT_COUNTERS, __name__)
+"""Device counters of one sweep kernel under ``readout="sweeps"``."""
 
-
-@wp.struct
-class SolveTrace:
-    """Device counters of one sweep kernel under ``readout="trace"``.
-
-    The per-world counts are 32-bit like :class:`SolveReadout`'s; the
-    stopping, reason and final-change counts sum over every world, so they
-    are 64-bit and do not wrap within a training-length run.
-    """
-
-    sweeps: wp.array2d[wp.int32]
-    """Solves by executed sweeps and world, as :attr:`SolveReadout.sweeps`."""
-    exhausted: wp.array[wp.int32]
-    """Solves per world that ran out of budget, as :attr:`SolveReadout.exhausted`."""
-    stops: wp.array2d[wp.int64]
-    """Solves by grid tolerance and stopping sweep, shape ``[len(TRACE_GRID), rows + 1]``.
-
-    Column ``k`` counts the solves whose largest velocity-scaled change first
-    fell to the tolerance after sweep ``k``; the last column counts the solves
-    for which it never did within their executed sweeps.
-    """
-    reasons: wp.array[wp.int64]
-    """Solves by exit reason (:data:`TRACE_REASONS`)."""
-    limits: wp.array2d[wp.int64]
-    """Final sweeps by the kind of their largest velocity-scaled change and its magnitude bin, ``[kinds, bins]``."""
+SolveTrace = field_group.struct("SolveTrace", (*READOUT_COUNTERS, *TRACE_COUNTERS), __name__)
+"""Device counters of one sweep kernel under ``readout="trace"``."""
 
 
 @wp.kernel
@@ -455,18 +446,12 @@ class SolveReadoutRecord:
             if solve_pass != "position" and int(budgets[solve_pass]) <= 0:
                 continue
             rows = max(int(budgets[solve_pass]), 1) + 1
-            arrays = {
-                "sweeps": wp.zeros((rows, worlds), dtype=wp.int32, device=device),
-                "exhausted": wp.zeros(worlds, dtype=wp.int32, device=device),
-            }
-            operand = SolveReadout()
-            if readout == "trace":
-                arrays["stops"] = wp.zeros((len(TRACE_GRID), rows + 1), dtype=wp.int64, device=device)
-                arrays["reasons"] = wp.zeros(len(TRACE_REASONS), dtype=wp.int64, device=device)
-                arrays["limits"] = wp.zeros((len(TRACE_KINDS), TRACE_BINS), dtype=wp.int64, device=device)
-                operand = SolveTrace()
-            for name, array in arrays.items():
-                setattr(operand, name, array)
+            trace = readout == "trace"
+            operand = SolveTrace() if trace else SolveReadout()
+            counters = SolverArrays(operand, device)
+            arrays = counters.allocate(READOUT_COUNTERS, budget_row=rows, world=worlds)
+            if trace:
+                arrays.update(counters.allocate(TRACE_COUNTERS, stop=rows + 1))
             self._slots[(kernel.key, solve_pass)] = _ReadoutSlot(label, solve_pass, operand, arrays)
 
     def register_skipped(self, *, world_count: int, device, velocity_budget: int = 0) -> None:

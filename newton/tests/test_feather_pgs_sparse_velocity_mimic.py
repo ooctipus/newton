@@ -13,7 +13,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import sparse_contact
+from newton._src.solvers.feather_pgs import dense_rows, field_group, sparse_contact
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_MIMIC as MIMIC
@@ -97,7 +97,23 @@ class TestSparseVelocityMimicRows(unittest.TestCase):
                         array(packed),
                         array(velocity),
                     ],
-                    outputs=[kinds, parents, mu, beta, cfm, phi, target, row_dof, factors, incident, diagonal],
+                    outputs=[
+                        field_group.upload(
+                            dense_rows.DenseRows,
+                            device,
+                            row_type=kinds,
+                            row_parent=parents,
+                            row_mu=mu,
+                            row_beta=beta,
+                            row_cfm=cfm,
+                            phi=phi,
+                            target=target,
+                            diag=diagonal,
+                        ),
+                        row_dof,
+                        factors,
+                        incident,
+                    ],
                 )
                 for output in (kinds, parents, mu, beta, cfm, phi, target, row_dof, factors, incident, diagonal):
                     np.testing.assert_array_equal(output.numpy()[1], -9)
@@ -116,15 +132,21 @@ class TestSparseVelocityMimicRows(unittest.TestCase):
                 self.assertAlmostEqual(incident.numpy()[0, 0], velocity[2] - scale * velocity[4], places=6)
                 expected_phi = float(position[2]) - offset - scale * float(position[4])
                 self.assertAlmostEqual(phi.numpy()[0, 0], expected_phi, places=6)
-                rows = sparse_contact.SparseContactRows()
-                rows.type, rows.phi, rows.beta_row, rows.cfm_row = kinds, phi, beta, cfm
-                rows.target_velocity = target
-                rows.rhs = full((2, 2), -9.0)
+                rows = field_group.upload(
+                    dense_rows.DenseRows,
+                    device,
+                    row_type=kinds,
+                    phi=phi,
+                    row_beta=beta,
+                    row_cfm=cfm,
+                    target=target,
+                    rhs=full((2, 2), -9.0),
+                    diag=diagonal,
+                )
                 wp.launch(
                     sparse_contact.finalize_sparse_joint_limit_rows,
                     dim=2,
                     inputs=[array([[0, 1], [0, 0]], int), array([1, 0], int), rows, 0.0123],
-                    outputs=[diagonal],
                     device=device,
                 )
                 self.assertAlmostEqual(diagonal.numpy()[0, 0], expected @ expected + 2e-4, places=6)

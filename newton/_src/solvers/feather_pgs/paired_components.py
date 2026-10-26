@@ -17,35 +17,40 @@ independent components.
 """
 
 from functools import cache
+from types import SimpleNamespace
 
 import warp as wp
 
+from . import field_group
 from .device_preludes import dual_native, lane_group
+from .field_group import Field
 
+PAIRED_COMPONENTS = (
+    Field("world_count", wp.int32, owner="components"),
+    Field("counts", wp.int32, ("world",), attr="constraint_count"),
+    Field("mf_counts", wp.int32, ("world",), attr="mf_constraint_count"),
+    Field("primary_offset", wp.int32, ("world",), attr="_paired_factor_primary_offsets_by_world"),
+    Field("secondary_offset", wp.int32, ("world",), attr="_paired_factor_secondary_offsets_by_world"),
+    Field("primary_group", wp.int32, ("world",), attr="_paired_factor_primary_groups_by_world"),
+    Field("selector", wp.int32, ("world",), owner="components"),
+    Field("J", wp.float32, ("world", "row", "world_dof"), attr="J_world"),
+    Field("Y", wp.float32, ("world", "row", "world_dof"), attr="Y_world"),
+    Field("L", wp.float32, ("art", "size", "size"), owner="step"),
+    Field("rhs", wp.float32, ("world", "row"), owner="step"),
+    Field("diag", wp.float32, ("world", "row")),
+    Field("mu", wp.float32, ("world", "row"), attr="row_mu"),
+    Field("row_type", wp.int32, ("world", "row")),
+    Field("row_parent", wp.int32, ("world", "row")),
+    Field("mf_meta", wp.int32, ("world", "mf_meta"), owner="step"),
+    Field("mf_J_a", wp.float32, ("world", "mf_row", 6)),
+    Field("mf_J_b", wp.float32, ("world", "mf_row", 6)),
+    Field("mf_MiJt_a", wp.float32, ("world", "mf_row", 6)),
+    Field("mf_MiJt_b", wp.float32, ("world", "mf_row", 6)),
+    Field("mf_mu", wp.float32, ("world", "mf_row"), attr="mf_row_mu"),
+)
+"""The component classifier's inputs: the dense and matrix-free rows, the pair layout and its own selector."""
 
-@wp.struct
-class PairedComponentData:
-    world_count: int
-    counts: wp.array[int]
-    mf_counts: wp.array[int]
-    primary_offset: wp.array[int]
-    secondary_offset: wp.array[int]
-    primary_group: wp.array[int]
-    selector: wp.array[int]
-    J: wp.array3d[float]
-    Y: wp.array3d[float]
-    L: wp.array3d[float]
-    rhs: wp.array2d[float]
-    diag: wp.array2d[float]
-    mu: wp.array2d[float]
-    row_type: wp.array2d[int]
-    row_parent: wp.array2d[int]
-    mf_meta: wp.array2d[int]
-    mf_J_a: wp.array3d[float]
-    mf_J_b: wp.array3d[float]
-    mf_MiJt_a: wp.array3d[float]
-    mf_MiJt_b: wp.array3d[float]
-    mf_mu: wp.array2d[float]
+PairedComponentData = field_group.struct("PairedComponentData", PAIRED_COMPONENTS, __name__)
 
 
 FREE_BODY_DOFS = 6
@@ -223,8 +228,8 @@ class PairedComponents:
     def __init__(self, solver):
         self.primary_size = int(solver._paired_response_primary_size)
         self.secondary_size = int(solver._paired_response_secondary_size)
+        self.world_count = solver.world_count
         self.data = PairedComponentData()
-        self.data.world_count = solver.world_count
         self.data.selector = wp.zeros(solver.world_count, dtype=wp.int32, device=solver.model.device)
         self.workers = min(solver.world_count, 512)
         self.kernel = get_prepare_kernel(self.primary_size, self.secondary_size)
@@ -234,27 +239,15 @@ class PairedComponents:
         return self.data.selector
 
     def prepare(self, solver, rhs, mf_meta):
-        data = self.data
-        for target, source in (
-            ("counts", "constraint_count"),
-            ("mf_counts", "mf_constraint_count"),
-            ("primary_offset", "_paired_factor_primary_offsets_by_world"),
-            ("secondary_offset", "_paired_factor_secondary_offsets_by_world"),
-            ("primary_group", "_paired_factor_primary_groups_by_world"),
-            ("J", "J_world"),
-            ("Y", "Y_world"),
-            ("diag", "diag"),
-            ("mu", "row_mu"),
-            ("row_type", "row_type"),
-            ("row_parent", "row_parent"),
-            ("mf_J_a", "mf_J_a"),
-            ("mf_J_b", "mf_J_b"),
-            ("mf_MiJt_a", "mf_MiJt_a"),
-            ("mf_MiJt_b", "mf_MiJt_b"),
-            ("mf_mu", "mf_row_mu"),
-        ):
-            setattr(data, target, getattr(solver, source))
-        data.rhs, data.mf_meta, data.L = rhs, mf_meta, solver.L_by_size[self.primary_size]
+        data = field_group.bind(
+            PairedComponentData,
+            self.data,
+            solver=solver,
+            components=SimpleNamespace(world_count=self.world_count, selector=self.data.selector),
+            L=solver.L_by_size[self.primary_size],
+            rhs=rhs,
+            mf_meta=mf_meta,
+        )
         wp.launch_tiled(
             self.kernel,
             dim=[self.workers],

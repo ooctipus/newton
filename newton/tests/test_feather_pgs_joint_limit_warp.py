@@ -8,6 +8,8 @@ import numpy as np
 import warp as wp
 
 from newton._src.sim.enums import JointType
+from newton._src.solvers.feather_pgs import field_group
+from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.kernels import build_joint_limit_rows_for_size
 from newton._src.solvers.feather_pgs.solver_feather_pgs import _get_joint_limit_warp_kernel
 
@@ -24,6 +26,12 @@ def _outputs(articulation_count: int, max_constraints: int, size: int, device):
         wp.zeros((articulation_count, max_constraints), dtype=wp.float32, device=device),
         wp.zeros((articulation_count, max_constraints), dtype=wp.float32, device=device),
     )
+
+
+def _dense_rows(outputs, device):
+    """The row records of ``outputs`` (after the counter and the Jacobian), as the kernels' DenseRows."""
+    names = ("row_type", "row_parent", "row_mu", "row_beta", "row_cfm", "phi", "target")
+    return field_group.upload(DenseRows, device, **dict(zip(names, outputs[2:], strict=True)))
 
 
 def _problem(device, articulation_count=257, size=6):
@@ -83,7 +91,7 @@ def _scalar_rows(problem, resolved=None):
             1.0e-6,
             _resolved_mask(problem, resolved),
         ],
-        outputs=[counter, first_rejected, *rows],
+        outputs=[counter, first_rejected, rows[0], _dense_rows(outputs, problem.device)],
         device=problem.device,
     )
     return outputs
@@ -111,7 +119,7 @@ def _warp_rows(problem, resolved=None, warps_per_block=4):
             1.0e-6,
             _resolved_mask(problem, resolved),
         ],
-        outputs=list(outputs),
+        outputs=[*outputs[:2], _dense_rows(outputs, problem.device)],
         block_dim=32 * warps_per_block,
         device=problem.device,
     )

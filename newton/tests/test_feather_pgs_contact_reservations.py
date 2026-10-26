@@ -17,6 +17,7 @@ from newton._src.solvers.feather_pgs.kernels import (
     prepare_world_contact_rows,
 )
 from newton._src.solvers.feather_pgs.row_build import contact_row_prelude, populate_world_J_masked
+from newton.tests.feather_pgs_law_harness import contact_input
 
 # Normal +X gives tangents +Z and -Y: against three unit translation dofs, these are the
 # Jacobian rows of a contact's normal and its two tangents.
@@ -98,11 +99,13 @@ def translation_dofs(device):
 
 
 def launch(kernel, values, threads, device):
-    """Launch an actual row producer using its declared argument names."""
+    """Launch an actual row producer using its declared argument names; ``data`` binds the contact input."""
+    data, _arrays = contact_input(values, device)
+    arguments = {**values, "data": data}
     wp.launch(
         kernel,
         dim=threads,
-        inputs=[values[name] for name in inspect.signature(kernel.func).parameters],
+        inputs=[arguments[name] for name in inspect.signature(kernel.func).parameters],
         device=device,
     )
 
@@ -197,12 +200,7 @@ class TestContactReservations(unittest.TestCase):
                     articulation_response_dof_count=wp.array([18], dtype=int, device=device),
                     pre_flags=wp.full(3, -9, dtype=int, device=device),
                 )
-                wp.launch(
-                    contact_row_prelude,
-                    dim=9,
-                    inputs=[values[name] for name in inspect.signature(contact_row_prelude.func).parameters],
-                    device=device,
-                )
+                launch(contact_row_prelude, values, 9, device)
                 axes = np.zeros((18, 6), dtype=np.float32)
                 axes[:3, :3] = np.eye(3)
                 jacobian = wp.full((1, 11, 18), -9.0, dtype=float, device=device)
@@ -215,12 +213,7 @@ class TestContactReservations(unittest.TestCase):
                     J_group_a=jacobian,
                     J_group_b=jacobian,
                 )
-                wp.launch(
-                    populate_world_J_masked,
-                    dim=54,
-                    inputs=[values[name] for name in inspect.signature(populate_world_J_masked.func).parameters],
-                    device=device,
-                )
+                launch(populate_world_J_masked, values, 54, device)
                 # Normal +X gives tangents +Z and -Y against the three unit translation axes.
                 expected_jacobian = np.zeros((9, 18), dtype=np.float32)
                 expected_jacobian[0::3, 0] = 1.0

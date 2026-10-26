@@ -16,6 +16,7 @@ import warp as wp
 from newton._src.solvers.feather_pgs import kernels
 from newton._src.solvers.feather_pgs import solver_feather_pgs as implementation
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
+from newton.tests.feather_pgs_law_harness import contact_input
 
 
 def _launch_workers(capacity, enabled):
@@ -98,7 +99,7 @@ def _fixture(device, capacity=4353, shared_anchor=0):
         "contact_slots_needed": array(1 + indices % 3, int),
         "target_size": 108,
         "articulation_response_dof_count": array([108, 6], int),
-        "articulation_dof_start": array([0, 108], int),
+        "art_dof_start": array([0, 108], int),
         "articulation_world_dof_offset": array([6, 0], int),
         "articulation_origin": array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], wp.vec3),
         "body_single_response_dof": array([0, 1, -1], int),
@@ -117,11 +118,11 @@ def _fixture(device, capacity=4353, shared_anchor=0):
 
 def _launch(values, workers, device):
     """Launch the unchanged source kernel with the selected complete-prefix owner."""
-    values = {**values, "total_num_workers": workers}
-    arguments = [
-        values[name] for name in inspect.signature(kernels.populate_sparse_diagonal_contact_response.func).parameters
-    ]
-    wp.launch(kernels.populate_sparse_diagonal_contact_response, dim=workers, inputs=arguments, device=device)
+    data, _arrays = contact_input(values, device)
+    values = {**values, "data": data, "total_num_workers": workers}
+    kernel = kernels.populate_sparse_diagonal_contact_response
+    arguments = [values[name] for name in inspect.signature(kernel.func).parameters]
+    wp.launch(kernel, dim=workers, inputs=arguments, device=device)
 
 
 def _expected(values, active_count):

@@ -18,7 +18,9 @@ import numpy as np
 import warp as wp
 
 from newton._src.sim import JointType
-from newton._src.solvers.feather_pgs import contact_laws, kernels, law_source, projection_laws, row_laws
+from newton._src.solvers.feather_pgs import contact_laws, field_group, kernels, law_source, projection_laws, row_laws
+from newton._src.solvers.feather_pgs.contact_input import ContactInput
+from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.device_preludes import cuda_native, dual_native
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
@@ -521,13 +523,104 @@ def _registered_laws():
 LAWS = _registered_laws()
 
 
+CONTACT_ARGUMENTS = {
+    "count": "contact_count",
+    "point0": "contact_point0",
+    "point1": "contact_point1",
+    "normal": "contact_normal",
+    "shape0": "contact_shape0",
+    "shape1": "contact_shape1",
+    "margin0": "contact_thickness0",
+    "margin1": "contact_thickness1",
+    "world": "contact_world",
+    "slot": "contact_slot",
+    "art0": "contact_art_a",
+    "art1": "contact_art_b",
+    "path": "contact_path",
+    "slots_needed": "contact_slots_needed",
+    "shape_body": "shape_body",
+    "body_q": "body_q",
+    "body_v": "body_v_s",
+    "body_mask": "body_response_dof_mask",
+    "response_dofs": "articulation_response_dof_count",
+    "dof_start": "art_dof_start",
+    "origin": "articulation_origin",
+    "motion": "joint_S_s",
+    "prescribed": "prescribed_articulation",
+    "material_mu": "shape_material_mu",
+    "material_restitution": "shape_material_restitution",
+    "incident": "v_hat",
+    "shared_anchor": "contact_shared_anchor",
+    "friction_shared_anchor": "contact_friction_shared_anchor",
+    "friction_scale": "contact_friction_scale",
+    "beta": "pgs_beta",
+    "cfm": "pgs_cfm",
+    "row_type": "world_row_type",
+    "row_parent": "world_row_parent",
+    "row_mu": "world_row_mu",
+    "row_beta": "world_row_beta",
+    "row_cfm": "world_row_cfm",
+    "phi": "world_phi",
+    "target": "world_target_velocity",
+    "restitution": "world_row_restitution",
+}
+"""The scenes' names of the :data:`ContactInput` fields: the reference laws take them as separate arguments."""
+
+
+DENSE_ROW_ARGUMENTS = {
+    "row_type": "world_row_type",
+    "row_parent": "world_row_parent",
+    "row_mu": "world_row_mu",
+    "row_beta": "world_row_beta",
+    "row_cfm": "world_row_cfm",
+    "phi": "world_phi",
+    "target": "world_target_velocity",
+    "restitution": "world_row_restitution",
+}
+"""The scenes' names of the :data:`DenseRows` fields."""
+
+STRUCT_ARGUMENTS = {ContactInput: CONTACT_ARGUMENTS, DenseRows: DENSE_ROW_ARGUMENTS}
+"""The scenes' field names of each struct a kernel takes in place of separate arguments."""
+
+
+def bind_struct(struct_type, values, device):
+    """An instance of ``struct_type`` from a scene's values by the scenes' names (host values go to ``device``).
+
+    Returns the instance and its arrays by the scenes' names.
+    """
+    arguments = STRUCT_ARGUMENTS[struct_type]
+    fields = {field.name: field for field in field_group.fields_of(struct_type)}
+    bound = {}
+    for name, argument in arguments.items():
+        if argument not in values:
+            continue
+        value = values[argument]
+        if fields[name].dims and not isinstance(value, wp.array):
+            value = wp.array(np.asarray(value), dtype=fields[name].dtype, device=device)
+        bound[name] = value
+    instance = field_group.upload(struct_type, device, **bound)
+    return instance, {arguments[name]: value for name, value in bound.items() if isinstance(value, wp.array)}
+
+
+def contact_input(values, device):
+    """The :data:`ContactInput` of a scene's values (:func:`bind_struct`)."""
+    return bind_struct(ContactInput, values, device)
+
+
 def call(kernel, dim, device, **values):
     """Launch ``kernel`` with arguments by name; numpy inputs become arrays of the argument's dtype.
 
-    Returns every array argument by name, so a test reads the outputs it needs.
+    A struct argument of :data:`STRUCT_ARGUMENTS` is bound from the values by the scenes' names
+    (:func:`bind_struct`). Returns every array argument (and every array of such a struct) by name, so a test
+    reads the outputs it needs.
     """
     args, arrays = [], {}
     for var in kernel.adj.args:
+        if var.type in STRUCT_ARGUMENTS and var.label not in values:
+            value, struct_arrays = bind_struct(var.type, values, device)
+            arrays.update(struct_arrays)
+            args.append(value)
+            continue
         value = values[var.label]
         if wp.types.is_array(var.type):
             if not isinstance(value, wp.array):

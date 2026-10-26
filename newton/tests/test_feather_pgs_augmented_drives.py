@@ -9,6 +9,8 @@ import warp as wp
 
 import newton
 from newton._src.sim.enums import JointType
+from newton._src.solvers.feather_pgs import field_group
+from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.kernels import (
     eval_rigid_tau,
     eval_rigid_tau_add,
@@ -231,7 +233,21 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                         wp.array(slots, dtype=int, device=device),
                         wp.array(joints, dtype=int, device=device),
                     ],
-                    outputs=[wp.zeros((4, 2, 1), dtype=float, device=device), *fields],
+                    outputs=[
+                        wp.zeros((4, 2, 1), dtype=float, device=device),
+                        field_group.upload(
+                            DenseRows,
+                            device,
+                            **dict(
+                                zip(
+                                    ("row_type", "row_parent", "row_mu", "row_beta", "row_cfm", "phi", "target"),
+                                    fields[:7],
+                                    strict=True,
+                                )
+                            ),
+                        ),
+                        *fields[7:],
+                    ],
                     device=device,
                 )
                 np.testing.assert_allclose(

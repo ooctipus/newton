@@ -17,80 +17,91 @@ response mask.
 
 import math
 import os
+from types import SimpleNamespace
 
 import numpy as np
 import warp as wp
 
+from . import field_group
 from .contact_laws import contact_points_endpoint_relative, contact_responds, contact_restitution, jacobian_entry
+from .field_group import Field, FieldGroup, SolverArrays
 from .row_laws import contact_depenetration_cap, contact_restitution_rhs, contact_rhs, joint_limit_side, limit_rhs
 
 LANES = 32
 
 
-@wp.struct
-class ResolvedWorldInput:
-    world_dof_indices: wp.array2d[int]
-    world_dof_count: wp.array[int]
-    limit_q_index: wp.array[int]
-    lower: wp.array[float]
-    upper: wp.array[float]
-    q: wp.array[float]
-    v_hat: wp.array[float]
-    body_to_articulation: wp.array[int]
-    art_to_world: wp.array[int]
-    articulation_dof_start: wp.array[int]
-    articulation_response_dof_count: wp.array[int]
-    prescribed_articulation: wp.array[int]
-    is_free_rigid: wp.array[int]
-    body_flags: wp.array[int]
-    body_has_response_dofs: wp.array[int]
-    body_response_dof_mask: wp.array[wp.uint32]
-    body_q: wp.array[wp.transform]
-    body_v_s: wp.array[wp.spatial_vector]
-    joint_S_s: wp.array[wp.spatial_vector]
-    articulation_origin: wp.array[wp.vec3]
-    max_linear_velocity: wp.array[float]
-    max_angular_velocity: wp.array[float]
-    max_depenetration_velocity: wp.array[float]
-    free_bodies: wp.array[int]
+RESOLVED_WORLD_INPUT = (
+    Field("world_dof_indices", wp.int32, ("world", "world_dof")),
+    Field("world_dof_count", wp.int32, ("world",)),
+    Field("limit_q_index", wp.int32, ("dof",), attr="_joint_limit_q_index"),
+    Field("lower", wp.float32, ("dof",), owner="model", attr="joint_limit_lower"),
+    Field("upper", wp.float32, ("dof",), owner="model", attr="joint_limit_upper"),
+    Field("q", wp.float32, ("coord",), owner="state_in", attr="joint_q"),
+    Field("v_hat", wp.float32, ("dof",)),
+    Field("body_to_articulation", wp.int32, ("body",)),
+    Field("art_to_world", wp.int32, ("articulation",)),
+    Field("articulation_dof_start", wp.int32, ("articulation",)),
+    Field("articulation_response_dof_count", wp.int32, ("articulation",)),
+    Field("prescribed_articulation", wp.int32, ("articulation",), attr="_prescribed_articulation"),
+    Field("is_free_rigid", wp.int32, ("articulation",)),
+    Field("body_flags", wp.int32, ("body",), owner="model"),
+    Field("body_has_response_dofs", wp.int32, ("body",)),
+    Field("body_response_dof_mask", wp.uint32, ("body",)),
+    Field("body_q", wp.transform, ("body",), owner="state_in"),
+    Field("body_v_s", wp.spatial_vector, ("body",), owner="state_aug"),
+    Field("joint_S_s", wp.spatial_vector, ("dof",), owner="state_aug"),
+    Field("articulation_origin", wp.vec3, ("articulation",)),
+    Field("max_linear_velocity", wp.float32, ("body",), owner="limits"),
+    Field("max_angular_velocity", wp.float32, ("body",), owner="limits"),
+    Field("max_depenetration_velocity", wp.float32, ("body",), owner="limits"),
+    Field("free_bodies", wp.int32, ("free_body",), owner="classifier"),
     # Predictor body twists published by the held-tree owner (use_published != 0).
-    predicted_twist: wp.array[wp.spatial_vector]
-    use_published: int
-    dt: float
-    beta: float
-    speculative_scale: float
-    activation_gap: float
-    restitution_threshold: float
-    shared_anchor: int
-    absolute_margin: float
-    relative_margin: float
+    Field("predicted_twist", wp.spatial_vector, ("body",), owner="classifier", attr="twists"),
+    Field("use_published", wp.int32, owner="classifier", attr="published"),
+    Field("dt", wp.float32, owner="step"),
+    Field("beta", wp.float32, attr="pgs_beta"),
+    Field("speculative_scale", wp.float32, attr="contact_speculative_scale"),
+    Field("activation_gap", wp.float32, attr="joint_limit_activation_gap"),
+    Field("restitution_threshold", wp.float32, attr="_effective_restitution_velocity_threshold"),
+    Field("shared_anchor", wp.int32, attr="contact_shared_anchor"),
+    Field("absolute_margin", wp.float32, owner="classifier"),
+    Field("relative_margin", wp.float32, owner="classifier"),
+)
+"""The classifier's inputs: the solver's maps and limits, the step's state and predictor, its own margins."""
+
+ResolvedWorldInput = field_group.struct("ResolvedWorldInput", RESOLVED_WORLD_INPUT, __name__)
+
+RAW_CONTACTS = (
+    Field("count", wp.int32, (1,), owner="contacts", attr="rigid_contact_count"),
+    Field("shape0", wp.int32, ("contact",), owner="contacts", attr="rigid_contact_shape0"),
+    Field("shape1", wp.int32, ("contact",), owner="contacts", attr="rigid_contact_shape1"),
+    Field("point0", wp.vec3, ("contact",), owner="contacts", attr="rigid_contact_point0"),
+    Field("point1", wp.vec3, ("contact",), owner="contacts", attr="rigid_contact_point1"),
+    Field("normal", wp.vec3, ("contact",), owner="contacts", attr="rigid_contact_normal"),
+    Field("margin0", wp.float32, ("contact",), owner="contacts", attr="rigid_contact_margin0"),
+    Field("margin1", wp.float32, ("contact",), owner="contacts", attr="rigid_contact_margin1"),
+    Field("shape_body", wp.int32, ("shape",), owner="model"),
+    Field("shape_mu", wp.float32, ("shape",), attr="shape_material_mu"),
+    Field("shape_restitution", wp.float32, ("shape",), attr="shape_material_restitution"),
+)
+"""The collision pipeline's contacts and the shapes' bodies and materials, before any row exists."""
+
+RawContacts = field_group.struct("RawContacts", RAW_CONTACTS, __name__)
 
 
-@wp.struct
-class RawContacts:
-    count: wp.array[int]
-    shape0: wp.array[int]
-    shape1: wp.array[int]
-    point0: wp.array[wp.vec3]
-    point1: wp.array[wp.vec3]
-    normal: wp.array[wp.vec3]
-    margin0: wp.array[float]
-    margin1: wp.array[float]
-    shape_body: wp.array[int]
-    shape_mu: wp.array[float]
-    shape_restitution: wp.array[float]
+RESOLVED_WORLD_SCRATCH = FieldGroup(
+    Field("rejected", wp.int32, ("world",)),
+    Field("resolved", wp.int32, ("world",)),
+    Field("checked_limits", wp.int32, ("world",)),
+    Field("checked_normals", wp.int32, ("world",)),
+    Field("minimum_residual", wp.float32, ("world",), fill=None),
+    Field("body_twist", wp.spatial_vector, ("body",), fill=None),
+    Field("body_valid", wp.int32, ("body",), fill=None),
+    Field("global_invalid", wp.int32, (1,)),
+)
+"""The classifier's per-world verdicts and per-body scratch."""
 
-
-@wp.struct
-class ResolvedWorldScratch:
-    rejected: wp.array[int]
-    resolved: wp.array[int]
-    checked_limits: wp.array[int]
-    checked_normals: wp.array[int]
-    minimum_residual: wp.array[float]
-    body_twist: wp.array[wp.spatial_vector]
-    body_valid: wp.array[int]
-    global_invalid: wp.array[int]
+ResolvedWorldScratch = field_group.struct("ResolvedWorldScratch", RESOLVED_WORLD_SCRATCH, __name__)
 
 
 @wp.func
@@ -739,17 +750,12 @@ class ResolvedWorlds:
             self.row_bound = (int(solver.dense_max_constraints), int(solver.mf_max_constraints))
         device = solver.model.device
         worlds = solver.world_count if self.enabled else 0
-        self.resolved = wp.zeros(worlds, dtype=wp.int32, device=device)
         self.scratch = ResolvedWorldScratch()
         if not self.enabled:
+            self.resolved = wp.zeros(0, dtype=wp.int32, device=device)
             return
-        self.scratch.resolved = self.resolved
-        for name in ("rejected", "checked_limits", "checked_normals"):
-            setattr(self.scratch, name, wp.zeros(worlds, dtype=wp.int32, device=device))
-        self.scratch.minimum_residual = wp.empty(worlds, dtype=wp.float32, device=device)
-        self.scratch.body_twist = wp.empty(solver.model.body_count, dtype=wp.spatial_vector, device=device)
-        self.scratch.body_valid = wp.empty(solver.model.body_count, dtype=wp.int32, device=device)
-        self.scratch.global_invalid = wp.zeros(1, dtype=wp.int32, device=device)
+        SolverArrays(self.scratch, device).allocate(RESOLVED_WORLD_SCRATCH, world=worlds, body=solver.model.body_count)
+        self.resolved = self.scratch.resolved
         # Per-world count of checked contacts on matrix-free rows, for the patch bound.
         self.free_normals = wp.zeros(worlds if self.row_bound is not None else 0, dtype=wp.int32, device=device)
         # A model without rigid velocity or depenetration limits bounds nothing.
@@ -778,45 +784,24 @@ class ResolvedWorlds:
         if contacts is None or getattr(state_in, "requires_grad", False):
             self.resolved.zero_()
             return
-        data = ResolvedWorldInput()
-        for name in (
-            "world_dof_indices",
-            "world_dof_count",
-            "v_hat",
-            "body_to_articulation",
-            "art_to_world",
-            "articulation_dof_start",
-            "articulation_response_dof_count",
-            "is_free_rigid",
-            "body_has_response_dofs",
-            "body_response_dof_mask",
-            "articulation_origin",
-        ):
-            setattr(data, name, getattr(solver, name))
-        data.limit_q_index = solver._joint_limit_q_index
-        data.lower, data.upper, data.q = (
-            solver.model.joint_limit_lower,
-            solver.model.joint_limit_upper,
-            state_in.joint_q,
+        # Absent rigid-body speed limits read as unbounded.
+        limits = {
+            name: self.unbounded
+            if getattr(solver, "rigid_body_" + name) is None
+            else getattr(solver, "rigid_body_" + name)
+            for name in ("max_linear_velocity", "max_angular_velocity", "max_depenetration_velocity")
+        }
+        data = field_group.bind(
+            ResolvedWorldInput,
+            solver=solver,
+            model=solver.model,
+            state_in=state_in,
+            state_aug=state_aug,
+            limits=SimpleNamespace(**limits),
+            classifier=self,
+            dt=dt,
         )
-        data.prescribed_articulation = solver._prescribed_articulation
-        data.body_flags, data.body_q = solver.model.body_flags, state_in.body_q
-        data.body_v_s, data.joint_S_s = state_aug.body_v_s, state_aug.joint_S_s
-        for name in ("max_linear_velocity", "max_angular_velocity", "max_depenetration_velocity"):
-            limit = getattr(solver, "rigid_body_" + name)
-            setattr(data, name, self.unbounded if limit is None else limit)
-        data.dt, data.beta, data.speculative_scale = dt, solver.pgs_beta, solver.contact_speculative_scale
-        data.activation_gap = solver.joint_limit_activation_gap
-        data.restitution_threshold = solver._effective_restitution_velocity_threshold
-        data.shared_anchor = int(solver.contact_shared_anchor)
-        data.absolute_margin, data.relative_margin = self.absolute_margin, self.relative_margin
-        data.predicted_twist, data.use_published, data.free_bodies = self.twists, int(self.published), self.free_bodies
-        raw = RawContacts()
-        raw.count = contacts.rigid_contact_count
-        for name in ("shape0", "shape1", "point0", "point1", "normal", "margin0", "margin1"):
-            setattr(raw, name, getattr(contacts, "rigid_contact_" + name))
-        raw.shape_body, raw.shape_mu = solver.model.shape_body, solver.shape_material_mu
-        raw.shape_restitution = solver.shape_material_restitution
+        raw = field_group.bind(RawContacts, solver=solver, model=solver.model, contacts=contacts)
         pool = solver._contact_pool
         launch(
             data,

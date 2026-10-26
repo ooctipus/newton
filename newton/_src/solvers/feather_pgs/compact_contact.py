@@ -13,6 +13,8 @@ links the patch rings and divides the friction coefficient, in one
 
 import warp as wp
 
+from . import field_group
+from .contact_input import ContactInput
 from .contact_laws import (
     contact_friction_points,
     contact_geometry,
@@ -22,63 +24,29 @@ from .contact_laws import (
     jacobian_entry,
     prescribed_target,
 )
-from .friction_patches import PatchRowLaw, patch_friction_location, patch_tangent_row
+from .field_group import Field
+from .friction_patches import PatchRowLaw, patch_friction_location, patch_row_law, patch_tangent_row
 from .kernels import PGS_CONSTRAINT_TYPE_CONTACT, PGS_CONSTRAINT_TYPE_FRICTION
 
 _Vec6 = wp.types.vector(length=6, dtype=wp.float32)
 
 
-@wp.struct
-class ContactBoundaryData:
-    count: wp.array[int]
-    point0: wp.array[wp.vec3]
-    point1: wp.array[wp.vec3]
-    normal: wp.array[wp.vec3]
-    shape0: wp.array[int]
-    shape1: wp.array[int]
-    margin0: wp.array[float]
-    margin1: wp.array[float]
-    world: wp.array[int]
-    slot: wp.array[int]
-    art0: wp.array[int]
-    art1: wp.array[int]
-    path: wp.array[int]
-    slots_needed: wp.array[int]
-    shape_body: wp.array[int]
-    body_q: wp.array[wp.transform]
-    body_v: wp.array[wp.spatial_vector]
-    body_mask: wp.array[wp.uint32]
-    body_single_dof: wp.array[int]
-    response_dofs: wp.array[int]
-    dof_start: wp.array[int]
-    dof_offset: wp.array[int]
-    origin: wp.array[wp.vec3]
-    motion: wp.array[wp.spatial_vector]
-    prescribed: wp.array[int]
-    material_mu: wp.array[float]
-    material_restitution: wp.array[float]
-    inverse_mass: wp.array[float]
-    dense_group: wp.array[int]
-    factor: wp.array3d[float]
-    sparse_size: int
-    shared_anchor: int
-    friction_shared_anchor: int
-    friction_scale: float
-    beta: float
-    cfm: float
-    row_type: wp.array2d[int]
-    row_parent: wp.array2d[int]
-    row_mu: wp.array2d[float]
-    row_beta: wp.array2d[float]
-    row_cfm: wp.array2d[float]
-    phi: wp.array2d[float]
-    target: wp.array2d[float]
-    restitution: wp.array2d[float]
-    J: wp.array3d[float]
-    Y: wp.array3d[float]
-    sparse_dof: wp.array3d[int]
-    sparse_jy: wp.array3d[float]
-    diag: wp.array2d[float]
+COMPACT_BOUNDARY = (
+    Field("body_single_dof", wp.int32, ("body",), attr="body_single_response_dof"),
+    Field("dof_offset", wp.int32, ("articulation",), attr="articulation_world_dof_offset"),
+    Field("inverse_mass", wp.float32, ("dof",), attr="_diagonal_inverse_mass"),
+    Field("dense_group", wp.int32, ("world",), attr="_sparse_diagonal_dense_groups"),
+    Field("factor", wp.float32, ("group", 6, 6), owner="six"),
+    Field("sparse_size", wp.int32, attr="_sparse_diagonal_response_size"),
+    Field("J", wp.float32, ("group", "row", 6), owner="six"),
+    Field("Y", wp.float32, ("group", "row", 6), owner="six"),
+    Field("sparse_dof", wp.int32, ("world", "row", 2), attr="_sparse_diagonal_row_dof"),
+    Field("sparse_jy", wp.float32, ("world", "row", 4), attr="_sparse_diagonal_row_jy"),
+)
+"""What the compact boundary producer writes besides the contact input's row records: each row's dense-six
+Jacobian and response (by the six-DOF size group's factor) and its two sparse response coordinates."""
+
+CompactBoundary = field_group.struct("CompactBoundary", COMPACT_BOUNDARY, __name__)
 
 
 def supported(solver) -> bool:
@@ -172,7 +140,7 @@ def clear_contact_response(
 
 
 @wp.func
-def _produce_contact(data: ContactBoundaryData, contact: int):
+def _produce_contact(data: ContactInput, boundary: CompactBoundary, contact: int):
     if contact >= data.count[0]:
         return
     slot = data.slot[contact]
@@ -203,7 +171,7 @@ def _produce_contact(data: ContactBoundaryData, contact: int):
     )
     tangent0, tangent1 = contact_tangent_basis(normal)
     friction0, friction1 = contact_friction_points(point0, point1, data.shared_anchor, data.friction_shared_anchor)
-    group = data.dense_group[world]
+    group = boundary.dense_group[world]
     for row in range(data.slots_needed[contact]):
         direction, p0, p1 = contact_row_frame(
             row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
@@ -227,12 +195,15 @@ def _produce_contact(data: ContactBoundaryData, contact: int):
             data.row_beta[world, output_row] = 0.0
             data.phi[world, output_row] = 0.0
             data.restitution[world, output_row] = 0.0
-        _publish_row_response(data, world, output_row, group, has_dense, art0, body0, art1, body1, direction, p0, p1)
+        _publish_row_response(
+            data, boundary, world, output_row, group, has_dense, art0, body0, art1, body1, direction, p0, p1
+        )
 
 
 @wp.func
 def _publish_row_response(
-    data: ContactBoundaryData,
+    data: ContactInput,
+    boundary: CompactBoundary,
     world: int,
     output_row: int,
     group: int,
@@ -260,10 +231,10 @@ def _publish_row_response(
                 if (data.body_mask[body1] & bit) != wp.uint32(0):
                     value1 = -jacobian_entry(data.motion[data.dof_start[art1] + dof], direction, p1, data.origin[art1])
             jacobian[dof] = value0 + value1
-        response = solve_six(data.factor, group, jacobian)
+        response = solve_six(boundary.factor, group, jacobian)
         for dof in range(6):
-            data.J[group, output_row, dof] = jacobian[dof]
-            data.Y[group, output_row, dof] = response[dof]
+            boundary.J[group, output_row, dof] = jacobian[dof]
+            boundary.Y[group, output_row, dof] = response[dof]
             diagonal += jacobian[dof] * response[dof]
     coord0 = -1
     coord1 = -1
@@ -271,34 +242,34 @@ def _publish_row_response(
     value1 = float(0.0)
     response0 = float(0.0)
     response1 = float(0.0)
-    if art0 >= 0 and body0 >= 0 and data.response_dofs[art0] == data.sparse_size:
-        dof0 = data.body_single_dof[body0]
+    if art0 >= 0 and body0 >= 0 and data.response_dofs[art0] == boundary.sparse_size:
+        dof0 = boundary.body_single_dof[body0]
         if dof0 >= 0:
             local0 = dof0 - data.dof_start[art0]
-            if local0 >= 0 and local0 < data.sparse_size:
-                coord0 = data.dof_offset[art0] + local0
+            if local0 >= 0 and local0 < boundary.sparse_size:
+                coord0 = boundary.dof_offset[art0] + local0
                 value0 = jacobian_entry(data.motion[dof0], direction, p0, data.origin[art0])
-                response0 = value0 * data.inverse_mass[dof0]
-    if art1 >= 0 and body1 >= 0 and data.response_dofs[art1] == data.sparse_size:
-        dof1 = data.body_single_dof[body1]
+                response0 = value0 * boundary.inverse_mass[dof0]
+    if art1 >= 0 and body1 >= 0 and data.response_dofs[art1] == boundary.sparse_size:
+        dof1 = boundary.body_single_dof[body1]
         if dof1 >= 0:
             local1 = dof1 - data.dof_start[art1]
-            if local1 >= 0 and local1 < data.sparse_size:
-                coord1 = data.dof_offset[art1] + local1
+            if local1 >= 0 and local1 < boundary.sparse_size:
+                coord1 = boundary.dof_offset[art1] + local1
                 value1 = -jacobian_entry(data.motion[dof1], direction, p1, data.origin[art1])
-                response1 = value1 * data.inverse_mass[dof1]
+                response1 = value1 * boundary.inverse_mass[dof1]
     if coord0 >= 0 and coord0 == coord1:
         value0 += value1
         response0 += response1
         coord1 = -1
         value1 = 0.0
         response1 = 0.0
-    data.sparse_dof[world, output_row, 0] = coord0
-    data.sparse_dof[world, output_row, 1] = coord1
-    data.sparse_jy[world, output_row, 0] = value0
-    data.sparse_jy[world, output_row, 1] = response0
-    data.sparse_jy[world, output_row, 2] = value1
-    data.sparse_jy[world, output_row, 3] = response1
+    boundary.sparse_dof[world, output_row, 0] = coord0
+    boundary.sparse_dof[world, output_row, 1] = coord1
+    boundary.sparse_jy[world, output_row, 0] = value0
+    boundary.sparse_jy[world, output_row, 1] = response0
+    boundary.sparse_jy[world, output_row, 2] = value1
+    boundary.sparse_jy[world, output_row, 3] = response1
     sparse_diagonal = float(0.0)
     if coord0 >= 0:
         sparse_diagonal += value0 * response0
@@ -308,7 +279,7 @@ def _publish_row_response(
 
 
 @wp.func
-def _produce_patch_contact(data: ContactBoundaryData, law: PatchRowLaw, contact: int):
+def _produce_patch_contact(data: ContactInput, boundary: CompactBoundary, law: PatchRowLaw, contact: int):
     """Publish one contact's rows with the persistent patch friction law.
 
     The normal row is ``_produce_contact``'s. Tangent rows, present only when the
@@ -347,7 +318,7 @@ def _produce_patch_contact(data: ContactBoundaryData, law: PatchRowLaw, contact:
     )
     tangent0, tangent1 = contact_tangent_basis(normal)
     friction0, friction1 = patch_friction_location(law.patches, contact)
-    group = data.dense_group[world]
+    group = boundary.dense_group[world]
     for row in range(data.slots_needed[contact]):
         direction, p0, p1 = contact_row_frame(
             row, data.shared_anchor, normal, tangent0, tangent1, point0, point1, friction0, friction1
@@ -372,19 +343,21 @@ def _produce_patch_contact(data: ContactBoundaryData, law: PatchRowLaw, contact:
             data.row_beta[world, output_row] = beta
             data.phi[world, output_row] = tangent_phi
             data.restitution[world, output_row] = 0.0
-        _publish_row_response(data, world, output_row, group, has_dense, art0, body0, art1, body1, direction, p0, p1)
+        _publish_row_response(
+            data, boundary, world, output_row, group, has_dense, art0, body0, art1, body1, direction, p0, p1
+        )
 
 
 @wp.kernel
-def produce_contacts(data: ContactBoundaryData):
+def produce_contacts(data: ContactInput, boundary: CompactBoundary):
     """Publish contacts in their original collision order."""
-    _produce_contact(data, wp.tid())
+    _produce_contact(data, boundary, wp.tid())
 
 
 @wp.kernel
-def produce_patch_contacts(data: ContactBoundaryData, law: PatchRowLaw):
+def produce_patch_contacts(data: ContactInput, boundary: CompactBoundary, law: PatchRowLaw):
     """Publish contacts with the patch friction law in their original collision order."""
-    _produce_patch_contact(data, law, wp.tid())
+    _produce_patch_contact(data, boundary, law, wp.tid())
 
 
 @wp.kernel
@@ -414,70 +387,17 @@ def produce_limit_response(
     diag[world, row] = diagonal + cfm[world, row]
 
 
-def launch_contacts(solver, state_in, state_aug, contacts, workers):
-    """Bind actual current owners; Warp capture retains these launch descriptors."""
-    data = ContactBoundaryData()
-    for name, source in (
-        ("count", "count"),
-        ("point0", "point0"),
-        ("point1", "point1"),
-        ("normal", "normal"),
-        ("shape0", "shape0"),
-        ("shape1", "shape1"),
-        ("margin0", "margin0"),
-        ("margin1", "margin1"),
-    ):
-        setattr(data, name, getattr(contacts, "rigid_contact_" + source))
-    for name, source in (
-        ("world", "contact_world"),
-        ("slot", "contact_slot"),
-        ("art0", "contact_art_a"),
-        ("art1", "contact_art_b"),
-        ("path", "contact_path"),
-        ("slots_needed", "contact_slots_needed"),
-        ("body_mask", "body_response_dof_mask"),
-        ("body_single_dof", "body_single_response_dof"),
-        ("response_dofs", "articulation_response_dof_count"),
-        ("dof_start", "articulation_dof_start"),
-        ("dof_offset", "articulation_world_dof_offset"),
-        ("origin", "articulation_origin"),
-        ("prescribed", "_prescribed_articulation"),
-        ("material_mu", "shape_material_mu"),
-        ("material_restitution", "shape_material_restitution"),
-        ("inverse_mass", "_diagonal_inverse_mass"),
-        ("dense_group", "_sparse_diagonal_dense_groups"),
-        ("sparse_size", "_sparse_diagonal_response_size"),
-        ("friction_scale", "contact_friction_scale"),
-        ("beta", "pgs_beta"),
-        ("cfm", "pgs_cfm"),
-        ("row_type", "row_type"),
-        ("row_parent", "row_parent"),
-        ("row_mu", "row_mu"),
-        ("row_beta", "row_beta"),
-        ("row_cfm", "row_cfm"),
-        ("phi", "phi"),
-        ("target", "target_velocity"),
-        ("restitution", "row_restitution"),
-        ("sparse_dof", "_sparse_diagonal_row_dof"),
-        ("sparse_jy", "_sparse_diagonal_row_jy"),
-        ("diag", "diag"),
-    ):
-        setattr(data, name, getattr(solver, source))
-    data.shape_body = solver.model.shape_body
-    data.body_q = state_in.body_q
-    data.body_v = state_aug.body_v_s
-    data.motion = state_aug.joint_S_s
-    data.factor = solver.L_by_size[6]
-    data.J = solver.J_by_size[6]
-    data.Y = solver.Y_by_size[6]
-    data.shared_anchor = int(solver.contact_shared_anchor)
-    data.friction_shared_anchor = int(solver.contact_friction_shared_anchor)
+def launch_contacts(solver, data, workers):
+    """Produce the contact rows from the step's bound contact input; Warp capture retains these launch descriptors."""
+    boundary = field_group.bind(
+        CompactBoundary, solver=solver, factor=solver.L_by_size[6], J=solver.J_by_size[6], Y=solver.Y_by_size[6]
+    )
     # Allocation has completed, but constraint_count is finalized later. Keep
     # this clear and the following producer ordered on the current stream.
     wp.launch(
         clear_contact_response,
         dim=(solver.world_count, 256),
-        inputs=[solver.slot_counter, solver.dense_phase_bounds, data.dense_group, data.J, data.Y],
+        inputs=[solver.slot_counter, solver.dense_phase_bounds, boundary.dense_group, boundary.J, boundary.Y],
         block_dim=256,
         device=solver.model.device,
     )
@@ -485,34 +405,20 @@ def launch_contacts(solver, state_in, state_aug, contacts, workers):
     # patch link (_FrictionPatchState.link, one link_patch_routes launch) still
     # runs after this producer: it alone links normal rows into patch rings and
     # divides the tangent coefficient.
-    law = None
-    if solver._friction_anchors_enabled:
-        law = PatchRowLaw()
-        law.patches = solver._friction_patches.view
-        law.beta = solver.friction_anchor_beta
+    law = patch_row_law(solver)
     # One thread per contact; in a capture whose launches bind, each replay runs the live count.
     pool = solver._contact_pool
-    count = contacts.rigid_contact_count
+    count = data.count
     if law is None:
-        pool.launch(produce_contacts, pool.launch_rows(), inputs=[data], extent=count)
+        pool.launch(produce_contacts, pool.launch_rows(), inputs=[data, boundary], extent=count)
     else:
-        pool.launch(produce_patch_contacts, pool.launch_rows(), inputs=[data, law], extent=count)
+        pool.launch(produce_patch_contacts, pool.launch_rows(), inputs=[data, boundary, law], extent=count)
     # These original kernels encode schedule links into the freshly published
     # sparse DOF slots. Never overwrite those fields after this point.
     pool.launch(
         solver._mark_independent_sparse_contact_candidates_kernel,
         workers,
-        inputs=[
-            contacts.rigid_contact_count,
-            workers,
-            solver.contact_world,
-            solver.contact_slot,
-            solver.contact_art_a,
-            solver.contact_art_b,
-            solver.contact_path,
-            solver.contact_slots_needed,
-            solver.articulation_response_dof_count,
-        ],
+        inputs=[data, workers],
         outputs=[solver._sparse_diagonal_row_dof],
         extent=count,
         clamp=True,

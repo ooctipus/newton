@@ -14,8 +14,9 @@ import warp as wp
 import newton
 from newton._src.core.contact_pool import ContactPool
 from newton._src.solvers.feather_pgs import compact_contact as compact
-from newton._src.solvers.feather_pgs import kernels
+from newton._src.solvers.feather_pgs import contact_input, field_group, kernels
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
+from newton._src.solvers.feather_pgs.contact_input import CONTACT_INPUT, ContactInput
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches
 from newton.tests.feather_pgs_patch_parity import (
     assert_contact_impulses_close,
@@ -25,6 +26,18 @@ from newton.tests.feather_pgs_patch_parity import (
     contact_rows,
 )
 from newton.tests.feather_pgs_row_builders import assert_row_builders_named, launched_kernels
+
+_FIELDS = (*CONTACT_INPUT, *compact.COMPACT_BOUNDARY)
+"""The fields of the compact producer's two structs."""
+
+
+def structs(data):
+    """The producer's contact input and compact boundary, bound from the fixture's fields."""
+    return tuple(
+        field_group.bind(struct, **{field.name: getattr(data, field.name) for field in field_group.fields_of(struct)})
+        for struct in (ContactInput, compact.CompactBoundary)
+    )
+
 
 OUTPUTS = (
     "row_type",
@@ -50,7 +63,8 @@ def fixture(device="cpu", *, prefix=(2, 3), kept=(7, 7), shared=0, friction_shar
     for a patch contact without an anchor.
     """
     rng = np.random.default_rng(191)
-    data = compact.ContactBoundaryData()
+    # Every field of the producer's two structs (contact input and compact boundary), unused ones empty.
+    data = SimpleNamespace(**{field.name: None if field.dims else 0 for field in _FIELDS})
 
     def array(values, dtype):
         return wp.array(values, dtype=dtype, device=device)
@@ -172,6 +186,7 @@ def run_original(data, aux, patches=None, friction_anchor_beta=0.0):
         patches = FrictionPatches()
         patches.phi = wp.zeros(data.point0.shape[0], dtype=wp.vec2, device=aux.device)
     values = {
+        "data": structs(data)[0],
         "contact_count": data.count,
         "total_num_threads": 16,
         "total_num_workers": 16,
@@ -272,9 +287,9 @@ def run_candidate(data, aux, law=None):
         device=aux.device,
     )
     if law is None:
-        wp.launch(compact.produce_contacts, dim=16, inputs=[data], device=aux.device)
+        wp.launch(compact.produce_contacts, dim=16, inputs=[*structs(data)], device=aux.device)
     else:
-        wp.launch(compact.produce_patch_contacts, dim=16, inputs=[data, law], device=aux.device)
+        wp.launch(compact.produce_patch_contacts, dim=16, inputs=[*structs(data), law], device=aux.device)
     wp.launch(
         compact.produce_limit_response,
         dim=(2, 12),
@@ -292,43 +307,8 @@ def run_candidate(data, aux, law=None):
     )
 
 
-# Solver attributes that launch_contacts binds, by the ContactBoundaryData field they fill.
-_LAUNCH_FIELDS = {
-    "contact_world": "world",
-    "contact_slot": "slot",
-    "contact_art_a": "art0",
-    "contact_art_b": "art1",
-    "contact_path": "path",
-    "contact_slots_needed": "slots_needed",
-    "body_response_dof_mask": "body_mask",
-    "body_single_response_dof": "body_single_dof",
-    "articulation_response_dof_count": "response_dofs",
-    "articulation_dof_start": "dof_start",
-    "articulation_world_dof_offset": "dof_offset",
-    "articulation_origin": "origin",
-    "_prescribed_articulation": "prescribed",
-    "shape_material_mu": "material_mu",
-    "shape_material_restitution": "material_restitution",
-    "_diagonal_inverse_mass": "inverse_mass",
-    "_sparse_diagonal_dense_groups": "dense_group",
-    "_sparse_diagonal_response_size": "sparse_size",
-    "contact_friction_scale": "friction_scale",
-    "pgs_beta": "beta",
-    "pgs_cfm": "cfm",
-    "row_type": "row_type",
-    "row_parent": "row_parent",
-    "row_mu": "row_mu",
-    "row_beta": "row_beta",
-    "row_cfm": "row_cfm",
-    "phi": "phi",
-    "target_velocity": "target",
-    "row_restitution": "restitution",
-    "_sparse_diagonal_row_dof": "sparse_dof",
-    "_sparse_diagonal_row_jy": "sparse_jy",
-    "diag": "diag",
-    "contact_shared_anchor": "shared_anchor",
-    "contact_friction_shared_anchor": "friction_shared_anchor",
-}
+# Solver attributes that launch_contacts binds, by the struct field they fill.
+_LAUNCH_FIELDS = {field.attr or field.name: field.name for field in _FIELDS if field.owner == "solver"}
 
 
 def launch_solver(data, aux, *, anchors, beta=0.0):
@@ -744,13 +724,15 @@ class TestCompactContact(unittest.TestCase):
             with self.subTest(anchors=anchors):
                 solver = launch_solver(data, aux, anchors=anchors, beta=0.375 if anchors else 0.0)
                 with mock.patch.object(compact.wp, "launch") as launch:
-                    compact.launch_contacts(
+                    bound = contact_input.bind(
                         solver,
                         SimpleNamespace(body_q=data.body_q),
                         SimpleNamespace(body_v_s=data.body_v, joint_S_s=data.motion),
                         contacts,
-                        16,
+                        0.0,
+                        1.0,
                     )
+                    compact.launch_contacts(solver, bound, 16)
                 marker = solver._mark_independent_sparse_contact_candidates_kernel
                 self.assertEqual(
                     [call.args[0] for call in launch.call_args_list],
@@ -759,10 +741,10 @@ class TestCompactContact(unittest.TestCase):
                 produce = launch.call_args_list[-2]
                 self.assertEqual(produce.kwargs["dim"], 16)
                 inputs = produce.kwargs["inputs"]
-                # The data, then the patch row law under anchors.
-                self.assertEqual(len(inputs), 1 + int(anchors))
+                # The contact input and the compact boundary, then the patch row law under anchors.
+                self.assertEqual(len(inputs), 2 + int(anchors))
                 if anchors:
-                    law, view = inputs[1], solver._friction_patches.view
+                    law, view = inputs[2], solver._friction_patches.view
                     self.assertEqual(law.beta, 0.375)
                     self.assertEqual(law.patches.enabled, 1)
                     for name in ("weight", "next_contact", "point_a", "point_b", "phi"):
@@ -1077,7 +1059,7 @@ class TestCompactContact(unittest.TestCase):
                         block_dim=256,
                         device=device,
                     )
-                    wp.launch(compact.produce_contacts, dim=16, inputs=[candidate], device=device)
+                    wp.launch(compact.produce_contacts, dim=16, inputs=[*structs(candidate)], device=device)
                     wp.launch(
                         compact.produce_limit_response,
                         dim=(2, 12),

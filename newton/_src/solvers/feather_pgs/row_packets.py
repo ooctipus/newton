@@ -22,12 +22,14 @@ local owners pool each ring's normal load from the linked parents.
 """
 
 from functools import cache, partial
+from types import SimpleNamespace
 
 import numpy as np
 import warp as wp
 
 from ...sim import ModelFlags
-from .contact_input import ContactInput, bind
+from . import field_group
+from .contact_input import ContactInput
 from .contact_laws import (
     contact_bodies,
     contact_friction_points,
@@ -48,7 +50,8 @@ from .device_preludes import (
     warp_stride,
     warp_sync,
 )
-from .friction_patches import PatchRowLaw, patch_friction_location, patch_tangent_row
+from .field_group import Field, FieldGroup, SolverArrays
+from .friction_patches import PatchRowLaw, patch_friction_location, patch_row_law, patch_tangent_row
 from .kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -61,79 +64,89 @@ WARPS_PER_BLOCK = 4
 PREFIX_WIDTH = 2  # a limit row has one coefficient, a mimic row two
 
 
-@wp.struct
-class PrefixData:
-    group_to_art: wp.array[int]
-    art_to_world: wp.array[int]
-    dof_start: wp.array[int]
-    mimic_start: wp.array[int]
-    mimic_list: wp.array[int]
-    mimic_valid: wp.array[int]
-    mimic_enabled: wp.array[wp.bool]
-    mimic_dof0: wp.array[int]
-    mimic_dof1: wp.array[int]
-    mimic_q0: wp.array[int]
-    mimic_q1: wp.array[int]
-    mimic_coef0: wp.array[float]
-    mimic_coef1: wp.array[float]
-    limit_q_index: wp.array[int]
-    lower: wp.array[float]
-    upper: wp.array[float]
-    q: wp.array[float]
-    activation_gap: float
-    beta: float
-    cfm: float
-    dt: float
-    bias_scale: float
-    limit_speculative_scale: float
-    # Sparse private prefix coefficients, never a global dense J allocation.
-    dofs: wp.array3d[int]
-    weights: wp.array3d[float]
-    row_contact: wp.array2d[int]
-    mimic_slot: wp.array[int]
-    slot_counter: wp.array[int]
-    first_rejected_slot: wp.array[int]
-    bounds: wp.array2d[int]
-    kind: wp.array2d[int]
-    parent: wp.array2d[int]
-    mu: wp.array2d[float]
-    row_beta: wp.array2d[float]
-    row_cfm: wp.array2d[float]
-    phi: wp.array2d[float]
-    target: wp.array2d[float]
-    restitution: wp.array2d[float]
-    rhs: wp.array2d[float]
-    diag: wp.array2d[float]
-    impulses: wp.array2d[float]
+PREFIX = (
+    Field("group_to_art", wp.int32, ("art",), owner="step"),
+    Field("art_to_world", wp.int32, ("articulation",)),
+    Field("dof_start", wp.int32, ("articulation",), attr="articulation_dof_start"),
+    Field("mimic_start", wp.int32, ("articulation_bound",), owner="mimics", attr="_mimic_art_start"),
+    Field("mimic_list", wp.int32, ("mimic",), owner="mimics", attr="_mimic_art_list"),
+    Field("mimic_valid", wp.int32, ("mimic",), owner="mimics", attr="_mimic_valid"),
+    Field("mimic_enabled", wp.bool, ("mimic",), owner="mimic_model", attr="constraint_mimic_enabled"),
+    Field("mimic_dof0", wp.int32, ("mimic",), owner="mimics", attr="_mimic_dof0"),
+    Field("mimic_dof1", wp.int32, ("mimic",), owner="mimics", attr="_mimic_dof1"),
+    Field("mimic_q0", wp.int32, ("mimic",), owner="mimics", attr="_mimic_q0"),
+    Field("mimic_q1", wp.int32, ("mimic",), owner="mimics", attr="_mimic_q1"),
+    Field("mimic_coef0", wp.float32, ("mimic",), owner="mimic_model", attr="constraint_mimic_coef0"),
+    Field("mimic_coef1", wp.float32, ("mimic",), owner="mimic_model", attr="constraint_mimic_coef1"),
+    Field("limit_q_index", wp.int32, ("dof",), attr="_joint_limit_q_index"),
+    Field("lower", wp.float32, ("dof",), owner="model", attr="joint_limit_lower"),
+    Field("upper", wp.float32, ("dof",), owner="model", attr="joint_limit_upper"),
+    Field("q", wp.float32, ("coord",), owner="state_in", attr="joint_q"),
+    Field("activation_gap", wp.float32, attr="joint_limit_activation_gap"),
+    Field("beta", wp.float32, attr="pgs_beta"),
+    Field("cfm", wp.float32, attr="pgs_cfm"),
+    Field("dt", wp.float32, owner="step"),
+    Field("bias_scale", wp.float32, owner="step"),
+    Field("limit_speculative_scale", wp.float32, owner="step"),
+    # Sparse private prefix coefficients, never a global dense J allocation, and each packet row's contact.
+    Field("dofs", wp.int32, ("world", "packet", PREFIX_WIDTH), fill=None, owner="packets"),
+    Field("weights", wp.float32, ("world", "packet", PREFIX_WIDTH), fill=None, owner="packets"),
+    Field("row_contact", wp.int32, ("world", "packet"), fill=-1, owner="packets"),
+    Field("mimic_slot", wp.int32, ("mimic",), owner="mimics"),
+    Field("slot_counter", wp.int32, ("world",)),
+    Field("first_rejected_slot", wp.int32, ("world",), attr="_dense_first_rejected_slot"),
+    Field("bounds", wp.int32, ("world", 2), attr="dense_phase_bounds"),
+    Field("kind", wp.int32, ("world", "row"), attr="row_type"),
+    Field("parent", wp.int32, ("world", "row"), attr="row_parent"),
+    Field("mu", wp.float32, ("world", "row"), attr="row_mu"),
+    Field("row_beta", wp.float32, ("world", "row")),
+    Field("row_cfm", wp.float32, ("world", "row")),
+    Field("phi", wp.float32, ("world", "row")),
+    Field("target", wp.float32, ("world", "row"), attr="target_velocity"),
+    Field("restitution", wp.float32, ("world", "row"), attr="row_restitution"),
+    Field("rhs", wp.float32, ("world", "row")),
+    Field("diag", wp.float32, ("world", "row")),
+    Field("impulses", wp.float32, ("world", "row")),
+)
+"""The prefix kernel's inputs and outputs: the size group, the mimic tables (``mimics``: the solver's, or the
+placeholders of a model without mimics), the limits, the state, the private prefix packets and the dense rows."""
+
+PrefixData = field_group.struct("PrefixData", PREFIX, __name__)
 
 
-@wp.struct
-class ContactPacketData:
-    jacobian: wp.array3d[float]
-    row_contact: wp.array2d[int]
+PACKETS = FieldGroup(*(field for field in PREFIX if field.owner == "packets"))
+"""The prefix's private packets: its coefficients and the contact of each packet row (-1 for none)."""
+
+CONTACT_PACKETS = (Field("jacobian", wp.float32, ("world", "packet", "coordinate")), PACKETS["row_contact"])
+"""The contact packets: each packet row's Jacobian over the pair's coordinates, and its contact."""
+
+ContactPacketData = field_group.struct("ContactPacketData", CONTACT_PACKETS, __name__)
 
 
-@wp.struct
-class QueueData:
-    primary: wp.array[int]
-    secondary: wp.array[int]
-    residual_secondary: wp.array[int]
-    mf_count: wp.array[int]
-    mf_body0: wp.array2d[int]
-    mf_body1: wp.array2d[int]
-    mf_row_type: wp.array2d[int]
-    body_art: wp.array[int]
-    count: wp.array[int]
-    owner: wp.array[int]
-    status: wp.array[int]
-    general_count: wp.array[int]
-    general: wp.array[int]
-    pair_count: wp.array[int]
-    pair: wp.array[int]
-    pair_secondary: wp.array[int]
-    residual_count: wp.array[int]
-    residual: wp.array[int]
-    residual_pair: wp.array[int]
+QUEUE = (
+    Field("primary", wp.int32, ("articulation",), attr="_local_primary_articulation"),
+    Field("secondary", wp.int32, ("articulation",), attr="_local_pair_articulation"),
+    Field("residual_secondary", wp.int32, ("articulation",), attr="_local_residual_pair_articulation"),
+    Field("mf_count", wp.int32, ("world",), attr="mf_constraint_count"),
+    Field("mf_body0", wp.int32, ("world", "mf_row"), attr="mf_body_a"),
+    Field("mf_body1", wp.int32, ("world", "mf_row"), attr="mf_body_b"),
+    Field("mf_row_type", wp.int32, ("world", "mf_row")),
+    Field("body_art", wp.int32, ("body",), attr="body_to_articulation"),
+    Field("count", wp.int32, ("world",), attr="constraint_count"),
+    Field("owner", wp.int32, ("world",), attr="_local_solve_owner"),
+    Field("status", wp.int32, (2,), attr="_constraint_capacity_status"),
+    Field("general_count", wp.int32, (1,), attr="_local_general_world_count"),
+    Field("general", wp.int32, ("world",), attr="_local_general_worlds"),
+    Field("pair_count", wp.int32, (1,), owner="size"),
+    Field("pair", wp.int32, ("candidate",), owner="size"),
+    Field("pair_secondary", wp.int32, ("candidate",), owner="size"),
+    Field("residual_count", wp.int32, (1,), owner="size"),
+    Field("residual", wp.int32, ("candidate",), owner="size"),
+    Field("residual_pair", wp.int32, ("candidate",), owner="size"),
+)
+"""The local owners' world queues: the solver's, and this size group's active pair and residual candidates."""
+
+QueueData = field_group.struct("QueueData", QUEUE, __name__)
 
 
 _PREFIX_SOURCE = r"""
@@ -905,43 +918,28 @@ class LocalRowPackets:
         worlds = solver.world_count
         self.workers = max(1, min(worlds, int(device.sm_count) * 4))
         self.prefix = PrefixData()
-        self.prefix.dofs = wp.empty((worlds, self.packets, PREFIX_WIDTH), dtype=int, device=device)
-        self.prefix.weights = wp.empty((worlds, self.packets, PREFIX_WIDTH), dtype=float, device=device)
-        self.packet = ContactPacketData()
-        self.packet.jacobian = wp.zeros(
-            (worlds, self.packets, self.primary + self.secondary), dtype=float, device=device
+        arrays = SolverArrays(None, device)
+        self._packets = SimpleNamespace(**arrays.allocate(PACKETS, owner={}, world=worlds, packet=self.packets))
+        sizes = {"world": worlds, "packet": self.packets, "coordinate": self.primary + self.secondary}
+        self.packet = field_group.bind(
+            ContactPacketData, packets=self._packets, jacobian=arrays.array(CONTACT_PACKETS[0], sizes)
         )
-        self.packet.row_contact = wp.full((worlds, self.packets), -1, dtype=wp.int32, device=device)
-        self.prefix.row_contact = self.packet.row_contact
-        self._empty_int = wp.zeros(1, dtype=int, device=device)
-        self._empty_float = wp.zeros(1, dtype=float, device=device)
-        self._empty_bool = wp.zeros(1, dtype=wp.bool, device=device)
-        self._no_mimics = wp.zeros(solver.model.articulation_count + 1, dtype=int, device=device)
-        self.queue = QueueData()
-        for name, source in (
-            ("primary", "_local_primary_articulation"),
-            ("secondary", "_local_pair_articulation"),
-            ("residual_secondary", "_local_residual_pair_articulation"),
-            ("mf_count", "mf_constraint_count"),
-            ("mf_body0", "mf_body_a"),
-            ("mf_body1", "mf_body_b"),
-            ("mf_row_type", "mf_row_type"),
-            ("body_art", "body_to_articulation"),
-            ("count", "constraint_count"),
-            ("owner", "_local_solve_owner"),
-            ("general_count", "_local_general_world_count"),
-            ("general", "_local_general_worlds"),
-        ):
-            setattr(self.queue, name, getattr(solver, source))
-        for name, source in (
-            ("pair_count", "_local_pair_active_counts"),
-            ("pair", "_local_pair_active_candidates"),
-            ("pair_secondary", "_local_pair_active_secondaries"),
-            ("residual_count", "_local_residual_active_counts"),
-            ("residual", "_local_residual_active_candidates"),
-            ("residual_pair", "_local_residual_active_secondaries"),
-        ):
-            setattr(self.queue, name, getattr(solver, source)[self.primary])
+        # A model without mimics binds the prefix's mimic tables to placeholders: no mimic per articulation.
+        placeholder = solver._arrays.placeholder
+        self._absent_mimics = {
+            field.name: placeholder(field.dtype) for field in PREFIX if field.owner in ("mimics", "mimic_model")
+        }
+        self._absent_mimics["mimic_start"] = placeholder(wp.int32, (solver.model.articulation_count + 1,))
+        # The capacity status is allocated after tiled-kernel construction; prepare_prefix binds it.
+        size = SimpleNamespace(
+            pair_count=solver._local_pair_active_counts[self.primary],
+            pair=solver._local_pair_active_candidates[self.primary],
+            pair_secondary=solver._local_pair_active_secondaries[self.primary],
+            residual_count=solver._local_residual_active_counts[self.primary],
+            residual=solver._local_residual_active_candidates[self.primary],
+            residual_pair=solver._local_residual_active_secondaries[self.primary],
+        )
+        self.queue = field_group.bind(QueueData, solver=solver, size=size, status=None)
         # The friction law is fixed at construction; produce_contacts binds its current arrays.
         self.patch_friction = bool(solver._friction_anchors_enabled)
         self.contact_input = None
@@ -954,12 +952,7 @@ class LocalRowPackets:
 
     def row_law(self):
         """Bind the persistent patch friction row law, or return ``None`` for point friction."""
-        if not self.patch_friction:
-            return None
-        law = PatchRowLaw()
-        law.patches = self.solver._friction_patches.view
-        law.beta = self.solver.friction_anchor_beta
-        return law
+        return patch_row_law(self.solver) if self.patch_friction else None
 
     def validate_notification(self, flags: ModelFlags | int = ModelFlags.ALL):
         """Validate structural changes without reading back numeric-only updates."""
@@ -978,58 +971,24 @@ class LocalRowPackets:
 
     def prepare_prefix(self, state_in, dt):
         """Bind current coefficients/state and the current double-buffered row owners."""
-        solver, data = self.solver, self.prefix
+        solver = self.solver
         # Sticky status is allocated after tiled-kernel construction.
         self.queue.status = solver._constraint_capacity_status
-        for name, source in (
-            ("art_to_world", "art_to_world"),
-            ("dof_start", "articulation_dof_start"),
-            ("limit_q_index", "_joint_limit_q_index"),
-            ("slot_counter", "slot_counter"),
-            ("first_rejected_slot", "_dense_first_rejected_slot"),
-            ("bounds", "dense_phase_bounds"),
-            ("kind", "row_type"),
-            ("parent", "row_parent"),
-            ("mu", "row_mu"),
-            ("row_beta", "row_beta"),
-            ("row_cfm", "row_cfm"),
-            ("phi", "phi"),
-            ("target", "target_velocity"),
-            ("restitution", "row_restitution"),
-            ("rhs", "rhs"),
-            ("diag", "diag"),
-            ("impulses", "impulses"),
-        ):
-            setattr(data, name, getattr(solver, source))
-        data.group_to_art = solver.group_to_art[self.primary]
-        if self.mimics:
-            for name, source in (
-                ("mimic_start", "_mimic_art_start"),
-                ("mimic_list", "_mimic_art_list"),
-                ("mimic_valid", "_mimic_valid"),
-                ("mimic_dof0", "_mimic_dof0"),
-                ("mimic_dof1", "_mimic_dof1"),
-                ("mimic_q0", "_mimic_q0"),
-                ("mimic_q1", "_mimic_q1"),
-                ("mimic_slot", "mimic_slot"),
-            ):
-                setattr(data, name, getattr(solver, source))
-            for name, source in (
-                ("mimic_enabled", "constraint_mimic_enabled"),
-                ("mimic_coef0", "constraint_mimic_coef0"),
-                ("mimic_coef1", "constraint_mimic_coef1"),
-            ):
-                setattr(data, name, getattr(solver.model, source))
-        else:
-            data.mimic_start = self._no_mimics
-            for name in ("mimic_list", "mimic_valid", "mimic_dof0", "mimic_dof1", "mimic_q0", "mimic_q1", "mimic_slot"):
-                setattr(data, name, self._empty_int)
-            data.mimic_enabled = self._empty_bool
-            data.mimic_coef0 = data.mimic_coef1 = self._empty_float
-        data.lower, data.upper = solver.model.joint_limit_lower, solver.model.joint_limit_upper
-        data.q, data.dt = state_in.joint_q, dt
-        data.activation_gap, data.beta, data.cfm = solver.joint_limit_activation_gap, solver.pgs_beta, solver.pgs_cfm
-        data.bias_scale, data.limit_speculative_scale = 1.0, 1.0
+        data = field_group.bind(
+            PrefixData,
+            self.prefix,
+            solver=solver,
+            model=solver.model,
+            mimics=solver,
+            mimic_model=solver.model,
+            state_in=state_in,
+            packets=self._packets,
+            group_to_art=solver.group_to_art[self.primary],
+            dt=dt,
+            bias_scale=1.0,
+            limit_speculative_scale=1.0,
+            **({} if self.mimics else self._absent_mimics),
+        )
         self.contact_input = None
         self.law = None
         wp.launch_tiled(
@@ -1040,13 +999,13 @@ class LocalRowPackets:
             device=solver.model.device,
         )
 
-    def produce_contacts(self, state_in, state_aug, contacts, dt):
-        """Publish private current J and complete canonical contact metadata/RHS.
+    def produce_contacts(self, contact_input):
+        """Publish private current J and complete canonical contact metadata/RHS from the step's bound contact input.
 
         Persistent patch friction writes its tangent rows with the patch row law. The patch link
         runs after this producer; :meth:`finish_rows` writes neither row parents nor coefficients.
         """
-        self.contact_input = bind(self.solver, state_in, state_aug, contacts, dt, 1.0)
+        self.contact_input = contact_input
         self.law = self.row_law()
         kernel, law = (produce_contacts, ()) if self.law is None else (produce_patch_contacts, (self.law,))
         wp.launch_tiled(

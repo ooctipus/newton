@@ -5,91 +5,60 @@
 
 import warp as wp
 
+from . import field_group
+from .field_group import Field
 
-@wp.struct
-class PublicationData:
-    joint_type: wp.array[int]
-    joint_parent: wp.array[int]
-    joint_child: wp.array[int]
-    joint_q_start: wp.array[int]
-    joint_qd_start: wp.array[int]
-    joint_dof_dim: wp.array2d[int]
-    joint_axis: wp.array[wp.vec3]
-    joint_X_p: wp.array[wp.transform]
-    joint_X_c: wp.array[wp.transform]
-    kinematic_dof_mask: wp.array[int]
-    kinematic_joint_mask: wp.array[int]
-    free_root_joint_indices: wp.array[int]
-    body_X_com: wp.array[wp.transform]
-    body_com: wp.array[wp.vec3]
-    body_mass: wp.array[float]
-    body_inertia: wp.array[wp.mat33]
-    body_to_articulation: wp.array[int]
-    is_free_rigid: wp.array[int]
-    gravity: wp.array[wp.vec3]
-    joint_q: wp.array[float]
-    joint_qd: wp.array[float]
-    v_out: wp.array[float]
-    joint_qdd: wp.array[float]
-    joint_q_new: wp.array[float]
-    joint_qd_new: wp.array[float]
-    body_q: wp.array[wp.transform]
-    body_qd: wp.array[wp.spatial_vector]
-    body_q_com: wp.array[wp.transform]
-    joint_S_s: wp.array[wp.spatial_vector]
-    articulation_origin: wp.array[wp.vec3]
-    body_v_s: wp.array[wp.spatial_vector]
-    body_a_s: wp.array[wp.spatial_vector]
-    body_f_s: wp.array[wp.spatial_vector]
-    body_I_s: wp.array[wp.spatial_matrix]
-    body_inertia_terms: wp.array2d[float]
-    fk_id_cache_valid: wp.array[int]
-    dt: float
-    angular_damping: float
-    materialize_all_body_inertia: int
-    materialize_body_inertia_terms: int
-    # Per-group stage cycle counts when FEATHER_PGS_STAGE_CLOCKS=1 (a 1x1 dummy otherwise).
-    stage_clocks: wp.array2d[wp.int64]
-
-
-# Model arrays bound by name, solver arrays bound through their attribute,
-# state-cache arrays taken from the augmented state, and the model plan
-# fields an owner freezes into its kernels.
-MODEL_FIELDS = (
-    "joint_type",
-    "joint_parent",
-    "joint_child",
-    "joint_q_start",
-    "joint_qd_start",
-    "joint_dof_dim",
-    "joint_axis",
-    "joint_X_p",
-    "joint_X_c",
-    "body_com",
-    "body_mass",
-    "body_inertia",
-    "gravity",
+PUBLICATION = (
+    Field("joint_type", wp.int32, ("joint",), owner="model"),
+    Field("joint_parent", wp.int32, ("joint",), owner="model"),
+    Field("joint_child", wp.int32, ("joint",), owner="model"),
+    Field("joint_q_start", wp.int32, ("joint",), owner="model"),
+    Field("joint_qd_start", wp.int32, ("joint",), owner="model"),
+    Field("joint_dof_dim", wp.int32, ("joint", 2), owner="model"),
+    Field("joint_axis", wp.vec3, ("dof",), owner="model"),
+    Field("joint_X_p", wp.transform, ("joint",), owner="model"),
+    Field("joint_X_c", wp.transform, ("joint",), owner="model"),
+    Field("kinematic_dof_mask", wp.int32, ("dof",), attr="_kinematic_dof_mask"),
+    Field("kinematic_joint_mask", wp.int32, ("joint",), attr="_kinematic_joint_mask"),
+    Field("free_root_joint_indices", wp.int32, ("free_root",), attr="_free_root_joint_indices"),
+    Field("body_X_com", wp.transform, ("body",)),
+    Field("body_com", wp.vec3, ("body",), owner="model"),
+    Field("body_mass", wp.float32, ("body",), owner="model"),
+    Field("body_inertia", wp.mat33, ("body",), owner="model"),
+    Field("body_to_articulation", wp.int32, ("body",)),
+    Field("is_free_rigid", wp.int32, ("articulation",)),
+    Field("gravity", wp.vec3, ("world",), owner="model"),
+    Field("joint_q", wp.float32, ("coord",), owner="state_in"),
+    Field("joint_qd", wp.float32, ("dof",), owner="state_in"),
+    Field("v_out", wp.float32, ("dof",)),
+    Field("joint_qdd", wp.float32, ("dof",), owner="state_aug"),
+    Field("joint_q_new", wp.float32, ("coord",), owner="state_out", attr="joint_q"),
+    Field("joint_qd_new", wp.float32, ("dof",), owner="state_out", attr="joint_qd"),
+    Field("body_q", wp.transform, ("body",), owner="state_out"),
+    Field("body_qd", wp.spatial_vector, ("body",), owner="state_out"),
+    Field("body_q_com", wp.transform, ("body",), owner="state_aug"),
+    Field("joint_S_s", wp.spatial_vector, ("dof",), owner="state_aug"),
+    Field("articulation_origin", wp.vec3, ("articulation",)),
+    Field("body_v_s", wp.spatial_vector, ("body",), owner="state_aug"),
+    Field("body_a_s", wp.spatial_vector, ("body",), owner="state_aug"),
+    Field("body_f_s", wp.spatial_vector, ("body",), owner="state_aug"),
+    Field("body_I_s", wp.spatial_matrix, ("body",), owner="state_aug"),
+    Field("body_inertia_terms", wp.float32, ("inertia_terms", 12), attr="_body_inertia_terms"),
+    Field("fk_id_cache_valid", wp.int32, ("articulation",), attr="_fk_id_cache_valid"),
+    Field("dt", wp.float32, owner="step"),
+    Field("angular_damping", wp.float32),
+    Field("materialize_all_body_inertia", wp.int32, owner="step"),
+    Field("materialize_body_inertia_terms", wp.int32, owner="step"),
+    # Per-group stage cycle counts when FEATHER_PGS_STAGE_CLOCKS=1 (a 1x1 placeholder otherwise).
+    Field("stage_clocks", wp.int64, ("group", "stage"), owner="step"),
 )
-SOLVER_FIELDS = {
-    "kinematic_dof_mask": "_kinematic_dof_mask",
-    "kinematic_joint_mask": "_kinematic_joint_mask",
-    "free_root_joint_indices": "_free_root_joint_indices",
-    "body_X_com": "body_X_com",
-    "body_to_articulation": "body_to_articulation",
-    "is_free_rigid": "is_free_rigid",
-    "v_out": "v_out",
-    "fk_id_cache_valid": "_fk_id_cache_valid",
-}
-CACHE_FIELDS = (
-    "body_q_com",
-    "joint_S_s",
-    "articulation_origin",
-    "body_v_s",
-    "body_a_s",
-    "body_f_s",
-    "body_I_s",
-    "body_inertia_terms",
-)
+"""The model, solver, state and cache arrays a cached-dynamics owner publishes through: the model's by name, the
+solver's through its attributes, the step's states (``state_in``, ``state_aug``, ``state_out``) and the step's
+values."""
+
+PublicationData = field_group.struct("PublicationData", PUBLICATION, __name__)
+
+
 # Body flags are live inputs, not plan fields: the kernels read the kinematic
 # masks and effective armature derived from them, which the solver re-derives
 # in place on a body-property notification. Their structural consequence, the

@@ -11,7 +11,7 @@ import numpy as np
 import warp as wp
 
 from ...sim import ModelFlags
-from . import cached_state_binding, capture_joins
+from . import cached_state_binding, capture_joins, field_group
 from .device_proof import DeviceProof, fingerprint
 from .publication_data import PLAN_FIELDS
 from .tree_kinetic_plan import cooperative_block_dim, lane_candidates, make_plan
@@ -347,7 +347,7 @@ class TreeKineticState:
             and self.layout.lanes <= 32
             and os.environ.get("FEATHER_PGS_PREDICTED_TWISTS", "1") == "1"
         )
-        self._no_twists = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+        self._no_twists = solver._arrays.placeholder(wp.spatial_vector)
         if self.publishes_twists:
             if getattr(solver, "_predicted_twist", None) is None:
                 solver._predicted_twist = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=device)
@@ -396,19 +396,13 @@ class TreeKineticState:
                 setattr(self.plan, name, wp.array(values, dtype=int, device=device))
         elif self.layout.forest:
             raise ValueError("Forest groups do not use the packed chain scan")
-        self.data = native.KineticData()
-        self.data.stage_clocks = cached_state_binding.stage_clocks(solver)
         groups = self.group_count
-        self.data.bias = wp.empty((groups, dofs), dtype=float, device=device)
-        self.data.com_offset = wp.empty((groups, bodies), dtype=wp.vec3, device=device)
-        self.data.geometric = wp.empty((groups, self.layout.entries), dtype=float, device=device)
+        self.data = native.KineticData()
+        field_group.SolverArrays(self.data, device).allocate(
+            native.KINETIC_CACHE.owned("cache"), group=groups, dof=dofs, body=bodies, entry=self.layout.entries
+        )
         self.data.current_valid = solver._fk_id_cache_valid
-        self.data.geometry_valid = wp.zeros(groups, dtype=int, device=device)
-        self.data.generation = wp.zeros(groups, dtype=wp.int64, device=device)
-        self.data.geometry_generation = wp.full(groups, -1, dtype=wp.int64, device=device)
-        self.data.source_q = wp.zeros(groups, dtype=wp.uint64, device=device)
-        self.data.source_qd = wp.zeros(groups, dtype=wp.uint64, device=device)
-        self.data.status = wp.zeros(groups, dtype=int, device=device)
+        self.data.stage_clocks = cached_state_binding.stage_clocks(solver)
         # A classified repair's block lists (at most one entry per block each) and their
         # counts (repair, comparison), allocated before any capture.
         self._repair_blocks = wp.empty(groups, dtype=int, device=device)
@@ -521,6 +515,28 @@ class TreeKineticState:
             self.chain_scan, layout=layout, response=self._response, reference=self.reference, clocked=self.clocked
         )
 
+    def _force_input(self, state_in, state_aug, control, predictor_qd, dt):
+        """Bind the predictor's inputs (tree_kinetic_state.FORCE_INPUT) for one step."""
+        from .tree_kinetic_state import ForceInput  # noqa: PLC0415
+
+        solver = self.solver
+        twists = getattr(solver, "_predicted_twist", None)
+        # Publish only when the classifier, built after this owner, consumes them.
+        consumer = getattr(solver, "_resolved_worlds_owner", None)
+        return field_group.bind(
+            ForceInput,
+            solver=solver,
+            model=solver.model,
+            state_in=state_in,
+            state_aug=state_aug,
+            control=control,
+            predictor_qd=predictor_qd,
+            dt=dt,
+            stage_clocks=cached_state_binding.stage_clocks(solver),
+            predicted_twist=self._no_twists if twists is None else twists,
+            publish_twists=int(self.publishes_twists and consumer is not None and consumer.published),
+        )
+
     def _choose_lanes(self):
         """Time the candidate lane widths on this model and keep the fastest.
 
@@ -535,8 +551,6 @@ class TreeKineticState:
         if len(candidates) < 2:
             return
         import time  # noqa: PLC0415
-
-        from .tree_kinetic_state import ForceInput  # noqa: PLC0415
 
         model, device, solver = self.solver.model, self.solver.model.device, self.solver
         probe_in, probe_out = model.state(), model.state()
@@ -555,19 +569,8 @@ class TreeKineticState:
             self._list_counts,
             self._no_bank,
         ]
-        force = ForceInput()
-        force.joint_q, force.joint_qd, force.predictor_qd = probe_in.joint_q, probe_in.joint_qd, probe_in.joint_qd
-        force.joint_f, force.body_f, force.body_flags = model.control().joint_f, probe_in.body_f, model.body_flags
-        force.stiffness, force.reference = solver._passive_spring_stiffness, solver._passive_spring_ref
-        force.damping, force.u0, force.S = solver._passive_joint_damping, solver.joint_tau, solver.joint_S_s
-        force.kinematic_joint, force.qdd, force.vhat = solver._kinematic_joint_mask, solver.joint_qdd, solver.v_hat
-        force.dt = 1.0 / 240.0
-        force.stage_clocks = cached_state_binding.stage_clocks(solver)
-        twists = getattr(solver, "_predicted_twist", None)
-        force.predicted_twist = self._no_twists if twists is None else twists
-        # Publish only when the classifier, built after this owner, consumes them.
-        consumer = getattr(solver, "_resolved_worlds_owner", None)
-        force.publish_twists = int(self.publishes_twists and consumer is not None and consumer.published)
+        # The solver holds its own augmented state (joint_tau, joint_S_s, joint_qdd).
+        force = self._force_input(probe_in, solver, model.control(), probe_in.joint_qd, 1.0 / 240.0)
         predict_arguments = [self.sparse.plan, self.sparse.data, self.plan, self.data, force]
         base = self.layout
         timings = {}
@@ -872,31 +875,13 @@ class TreeKineticState:
 
     def predict(self, state_in, state_aug, control, stage3_qd, dt):
         """Apply live force buckets through held W with original root transport."""
-        from .tree_kinetic_state import ForceInput  # noqa: PLC0415
 
         self._validate_call(state_in, state_aug, dt)
         binding = self._validate_motion(state_in, state_aug, stage3_qd)
         if self.motion_velocity and binding != self._motion_binding:
             raise RuntimeError("Tree kinetic predictor motion velocity differs from the current-cache binding")
         solver = self.solver
-        force = ForceInput()
-        force.joint_q, force.joint_qd = state_in.joint_q, state_in.joint_qd
-        force.predictor_qd = stage3_qd
-        force.joint_f, force.body_f = control.joint_f, state_in.body_f
-        force.body_flags = solver.model.body_flags
-        force.stiffness = solver._passive_spring_stiffness
-        force.reference = solver._passive_spring_ref
-        force.damping = solver._passive_joint_damping
-        force.u0, force.S = state_aug.joint_tau, state_aug.joint_S_s
-        force.kinematic_joint = solver._kinematic_joint_mask
-        force.qdd, force.vhat = state_aug.joint_qdd, solver.v_hat
-        force.dt = dt
-        force.stage_clocks = cached_state_binding.stage_clocks(solver)
-        twists = getattr(solver, "_predicted_twist", None)
-        force.predicted_twist = self._no_twists if twists is None else twists
-        # Publish only when the classifier, built after this owner, consumes them.
-        consumer = getattr(solver, "_resolved_worlds_owner", None)
-        force.publish_twists = int(self.publishes_twists and consumer is not None and consumer.published)
+        force = self._force_input(state_in, state_aug, control, stage3_qd, dt)
         wp.launch_tiled(
             self.predictor_kernel,
             dim=[self.launch_count],

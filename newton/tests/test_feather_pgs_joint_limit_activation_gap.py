@@ -9,6 +9,8 @@ import warp as wp
 import newton
 from newton._src.core.types import MAXVAL
 from newton._src.sim.enums import JointType
+from newton._src.solvers.feather_pgs import field_group
+from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_FRICTION,
@@ -57,13 +59,17 @@ def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0
             world_slot_counter,
             wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
             J_group,
-            world_row_type,
-            world_row_parent,
-            world_row_mu,
-            world_row_beta,
-            world_row_cfm,
-            world_phi,
-            world_target_velocity,
+            field_group.upload(
+                DenseRows,
+                device,
+                row_type=world_row_type,
+                row_parent=world_row_parent,
+                row_mu=world_row_mu,
+                row_beta=world_row_beta,
+                row_cfm=world_row_cfm,
+                phi=world_phi,
+                target=world_target_velocity,
+            ),
         ],
         device=device,
     )

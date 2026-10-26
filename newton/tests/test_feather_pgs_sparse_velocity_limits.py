@@ -13,7 +13,8 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import sparse_contact
+from newton._src.solvers.feather_pgs import field_group, sparse_contact
+from newton._src.solvers.feather_pgs.dense_rows import DenseRows
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_FRICTION as FRICTION
 from newton._src.solvers.feather_pgs.kernels import PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT as VELOCITY_LIMIT
@@ -159,17 +160,21 @@ class TestSparseVelocityLimitRows(unittest.TestCase):
                             array(velocity),
                         ],
                         outputs=[
-                            kinds,
-                            parents,
-                            mu,
-                            beta,
-                            cfm,
-                            phi,
-                            target,
+                            field_group.upload(
+                                DenseRows,
+                                device,
+                                row_type=kinds,
+                                row_parent=parents,
+                                row_mu=mu,
+                                row_beta=beta,
+                                row_cfm=cfm,
+                                phi=phi,
+                                target=target,
+                                diag=diagonal,
+                            ),
                             row_dof,
                             factors,
                             incident,
-                            diagonal,
                             support,
                         ],
                     )

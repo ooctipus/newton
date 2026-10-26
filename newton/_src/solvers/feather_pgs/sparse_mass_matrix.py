@@ -14,8 +14,9 @@ from string import Template
 import numpy as np
 import warp as wp
 
-from . import host_index, response_operator
+from . import field_group, host_index, response_operator
 from .device_preludes import dual_native, lane_group
+from .field_group import Field
 from .sparse_factorization import _sparse_cholesky_source, _sparse_inverse_source
 
 
@@ -29,37 +30,41 @@ def _factor_levels(index):
     return levels
 
 
-@wp.struct
-class _SparseMassMatrixIndices:
-    dof_count: int
-    nonzero_count: int
-    factor_level_count: int
-    permutation: wp.array[int]
-    inverse_permutation: wp.array[int]
-    row_offsets: wp.array[int]
-    columns: wp.array[int]
-    entry_rows: wp.array[int]
-    lookup: wp.array2d[int]
-    dof_joint: wp.array[int]
-    ancestor_mask: wp.array[wp.uint64]
-    column_offsets: wp.array[int]
-    column_entries: wp.array[int]
-    factor_level_offsets: wp.array[int]
-    factor_level_columns: wp.array[int]
-    factor_level_entry_offsets: wp.array[int]
-    factor_level_entries: wp.array[int]
+SPARSE_MASS_INDICES = (
+    Field("dof_count", wp.int32),
+    Field("nonzero_count", wp.int32),
+    Field("factor_level_count", wp.int32),
+    Field("permutation", wp.int32, ("dof",)),
+    Field("inverse_permutation", wp.int32, ("dof",)),
+    Field("row_offsets", wp.int32, ("dof_bound",)),
+    Field("columns", wp.int32, ("entry",)),
+    Field("entry_rows", wp.int32, ("entry",)),
+    Field("lookup", wp.int32, ("dof", "dof")),
+    Field("dof_joint", wp.int32, ("dof",)),
+    Field("ancestor_mask", wp.uint64, ("dof",)),
+    Field("column_offsets", wp.int32, ("dof_bound",)),
+    Field("column_entries", wp.int32, ("entry",)),
+    Field("factor_level_offsets", wp.int32, ("level_bound",)),
+    Field("factor_level_columns", wp.int32, ("dof",)),
+    Field("factor_level_entry_offsets", wp.int32, ("level_bound",)),
+    Field("factor_level_entries", wp.int32, ("entry",)),
+)
+"""The packed factor's topology (:class:`_SparseMassMatrixPlan`), uploaded once."""
+
+_SparseMassMatrixIndices = field_group.struct("_SparseMassMatrixIndices", SPARSE_MASS_INDICES, __name__)
 
 
-@wp.struct
-class _SparseRowSupport:
-    """Model-owned support patterns and each live row's pattern index."""
+SPARSE_ROW_SUPPORT = (
+    Field("enabled", wp.int32),
+    Field("body_class", wp.int32, ("body",)),
+    Field("pair_class", wp.int32, ("class", "class")),
+    Field("class_dof", wp.int32, ("class", "dof")),
+    Field("row_class", wp.int32, ("world", "row")),
+    Field("limit_class", wp.int32, ("dof",)),
+)
+"""Model-owned support patterns and each live row's pattern index."""
 
-    enabled: int
-    body_class: wp.array[int]
-    pair_class: wp.array2d[int]
-    class_dof: wp.array2d[int]
-    row_class: wp.array2d[int]
-    limit_class: wp.array[int]
+_SparseRowSupport = field_group.struct("_SparseRowSupport", SPARSE_ROW_SUPPORT, __name__)
 
 
 @dataclass(frozen=True, eq=False)
@@ -109,11 +114,8 @@ class _SparseRowSupportPlan:
 
     def to_device(self, world_count: int, max_constraints: int, device) -> _SparseRowSupport:
         """Upload the catalogue and allocate only one support index per row."""
-        support = _SparseRowSupport()
-        support.enabled = 1
-        for name in ("body_class", "pair_class", "class_dof", "limit_class"):
-            setattr(support, name, wp.array(getattr(self, name), dtype=int, device=device))
-        support.row_class = wp.empty((world_count, max_constraints), dtype=int, device=device)
+        row_class = wp.empty((world_count, max_constraints), dtype=int, device=device)
+        support = field_group.upload(_SparseRowSupport, device, self, enabled=1, row_class=row_class)
         return support
 
 
@@ -275,28 +277,7 @@ class _SparseMassMatrixPlan:
 
     def to_device(self, device) -> _SparseMassMatrixIndices:
         """Upload the topology once; all per-step values remain caller-owned."""
-        indices = _SparseMassMatrixIndices()
-        indices.dof_count = self.dof_count
-        indices.nonzero_count = self.nonzero_count
-        indices.factor_level_count = self.factor_level_count
-        for name in (
-            "permutation",
-            "inverse_permutation",
-            "row_offsets",
-            "columns",
-            "entry_rows",
-            "lookup",
-            "dof_joint",
-            "ancestor_mask",
-            "column_offsets",
-            "column_entries",
-            "factor_level_offsets",
-            "factor_level_columns",
-            "factor_level_entry_offsets",
-            "factor_level_entries",
-        ):
-            dtype = wp.uint64 if name == "ancestor_mask" else int
-            setattr(indices, name, wp.array(getattr(self, name), dtype=dtype, device=device))
+        indices = field_group.upload(_SparseMassMatrixIndices, device, self)
         return indices
 
 

@@ -19,7 +19,9 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
+from newton._src.solvers.feather_pgs.contact_input import ContactInput
 from newton._src.solvers.feather_pgs.kernels import (
     PGS_CONSTRAINT_TYPE_CONTACT,
     PGS_CONSTRAINT_TYPE_COUNT,
@@ -475,15 +477,19 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
             _get_mark_independent_sparse_contact_candidates_kernel(108, "cpu"),
             dim=4,
             inputs=[
-                wp.array((4,), dtype=wp.int32, device=device),
+                field_group.upload(
+                    ContactInput,
+                    device,
+                    count=wp.array((4,), dtype=wp.int32, device=device),
+                    world=wp.zeros(4, dtype=wp.int32, device=device),
+                    slot=wp.array((0, 3, 6, 9), dtype=wp.int32, device=device),
+                    art0=wp.zeros(4, dtype=wp.int32, device=device),
+                    art1=wp.array((-1, 1, -1, -1), dtype=wp.int32, device=device),
+                    path=wp.zeros(4, dtype=wp.int32, device=device),
+                    slots_needed=wp.full(4, 3, dtype=wp.int32, device=device),
+                    response_dofs=wp.array((108, 6), dtype=wp.int32, device=device),
+                ),
                 4,
-                wp.zeros(4, dtype=wp.int32, device=device),
-                wp.array((0, 3, 6, 9), dtype=wp.int32, device=device),
-                wp.zeros(4, dtype=wp.int32, device=device),
-                wp.array((-1, 1, -1, -1), dtype=wp.int32, device=device),
-                wp.zeros(4, dtype=wp.int32, device=device),
-                wp.full(4, 3, dtype=wp.int32, device=device),
-                wp.array((108, 6), dtype=wp.int32, device=device),
             ],
             outputs=[marked],
             device=device,

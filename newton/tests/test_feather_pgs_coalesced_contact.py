@@ -12,8 +12,16 @@ import warp as wp
 
 from newton._src.core.contact_pool import ContactPool
 from newton._src.solvers.feather_pgs import compact_contact as compact
+from newton._src.solvers.feather_pgs import contact_input
 from newton.tests import test_feather_pgs_compact_contact as baseline
-from newton.tests.test_feather_pgs_compact_contact import OUTPUTS, fixture, install_prefix, run_original
+from newton.tests.test_feather_pgs_compact_contact import (
+    _LAUNCH_FIELDS,
+    OUTPUTS,
+    fixture,
+    install_prefix,
+    run_original,
+    structs,
+)
 
 
 def clear(data, aux):
@@ -30,7 +38,7 @@ def clear(data, aux):
 def publish(data, aux):
     """Run all new output owners without host readbacks inside the captured sequence."""
     clear(data, aux)
-    wp.launch(compact.produce_contacts, dim=16, inputs=[data], device=aux.device)
+    wp.launch(compact.produce_contacts, dim=16, inputs=[*structs(data)], device=aux.device)
     wp.launch(
         compact.produce_limit_response,
         dim=(2, 12),
@@ -66,7 +74,7 @@ class TestCoalescedContact(unittest.TestCase):
         data, aux = fixture(shared=1)
         data.J.fill_(713.0)
         data.Y.fill_(-919.0)
-        wp.launch(compact.produce_contacts, dim=16, inputs=[data], device=aux.device)
+        wp.launch(compact.produce_contacts, dim=16, inputs=[*structs(data)], device=aux.device)
         response_dofs = data.response_dofs.numpy()
         arts = (data.art0.numpy(), data.art1.numpy())
         for contact, slot in enumerate(data.slot.numpy()):
@@ -164,42 +172,8 @@ class TestCoalescedContact(unittest.TestCase):
     def test_launch_binding_uses_current_counts_before_original_marker(self):
         """Bind the live slot counter, not stale finalized counts, and retain same-stream publication order."""
         data, aux = fixture()
-        mapping = {
-            "contact_world": "world",
-            "contact_slot": "slot",
-            "contact_art_a": "art0",
-            "contact_art_b": "art1",
-            "contact_path": "path",
-            "contact_slots_needed": "slots_needed",
-            "body_response_dof_mask": "body_mask",
-            "body_single_response_dof": "body_single_dof",
-            "articulation_response_dof_count": "response_dofs",
-            "articulation_dof_start": "dof_start",
-            "articulation_world_dof_offset": "dof_offset",
-            "articulation_origin": "origin",
-            "_prescribed_articulation": "prescribed",
-            "shape_material_mu": "material_mu",
-            "shape_material_restitution": "material_restitution",
-            "_diagonal_inverse_mass": "inverse_mass",
-            "_sparse_diagonal_dense_groups": "dense_group",
-            "_sparse_diagonal_response_size": "sparse_size",
-            "contact_friction_scale": "friction_scale",
-            "pgs_beta": "beta",
-            "pgs_cfm": "cfm",
-            "target_velocity": "target",
-            "row_restitution": "restitution",
-            "_sparse_diagonal_row_dof": "sparse_dof",
-            "_sparse_diagonal_row_jy": "sparse_jy",
-            "contact_shared_anchor": "shared_anchor",
-            "contact_friction_shared_anchor": "friction_shared_anchor",
-        }
-        values = {name: getattr(data, source) for name, source in mapping.items()}
-        values.update(
-            {
-                name: getattr(data, name)
-                for name in ("row_type", "row_parent", "row_mu", "row_beta", "row_cfm", "phi", "diag")
-            }
-        )
+        # Every solver attribute the producer's structs bind, from the fixture's fields.
+        values = {name: getattr(data, field) for name, field in _LAUNCH_FIELDS.items()}
         marker = object()
         solver = SimpleNamespace(
             **values,
@@ -225,13 +199,15 @@ class TestCoalescedContact(unittest.TestCase):
             },
         )
         with mock.patch.object(compact.wp, "launch") as launch:
-            compact.launch_contacts(
+            bound = contact_input.bind(
                 solver,
                 SimpleNamespace(body_q=data.body_q),
                 SimpleNamespace(body_v_s=data.body_v, joint_S_s=data.motion),
                 contacts,
-                16,
+                0.0,
+                1.0,
             )
+            compact.launch_contacts(solver, bound, 16)
         self.assertEqual(
             [call.args[0] for call in launch.call_args_list],
             [compact.clear_contact_response, compact.produce_contacts, marker],

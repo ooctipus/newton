@@ -14,6 +14,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import solver_feather_pgs as source
+from newton._src.solvers.feather_pgs.field_group import SolverArrays
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import standing_model
 from newton.tests.test_feather_pgs_parallel_patch import _matrix_free_solver
@@ -70,6 +71,7 @@ class TestFeatherPGSTierPlaceholders(unittest.TestCase):
             world_count=3,
             row_cfm=wp.zeros((3, 4), dtype=float, device=device),
             _ink_sizes=None,
+            _arrays=SolverArrays(None, device),
         )
         SolverFeatherPGS._allocate_tier_placeholders(solver)
         allocated, zeros = [], wp.zeros

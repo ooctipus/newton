@@ -15,35 +15,40 @@ their generated code; fields those owners do not bind stay empty.
 import numpy as np
 import warp as wp
 
+from . import field_group
+from .field_group import Field
 
-@wp.struct
-class SparsePlan:
-    index: wp.array2d[int]
-    row: wp.array[int]
-    col: wp.array[int]
-    source: wp.array[int]
-    level_offsets: wp.array2d[int]
-    level_pivots: wp.array[int]
-    level_scales: wp.array[int]
-    level_entries: wp.array[int]
-    level_term_offsets: wp.array[int]
-    level_terms: wp.array2d[int]
-    inverse_nodes: wp.array2d[int]
-    inverse_count: wp.array[int]
-    support_nodes: wp.array2d[int]
-    support_count: wp.array[int]
-    limit_support: wp.array[int]
-    pair_support: wp.array2d[int]
-    body_mask: wp.array[wp.uint64]
-    body_tag: wp.array[int]
-    dof_joint: wp.array[int]
-    physical: wp.array[int]
-    sparse: wp.array[int]
-    group_to_art: wp.array[int]
-    art_to_world: wp.array[int]
-    art_dof_start: wp.array[int]
-    art_joint_start: wp.array[int]
-    joint_child: wp.array[int]
+SPARSE_PLAN = (
+    Field("index", wp.int32, ("i", "j"), owner="host"),
+    Field("row", wp.int32, ("i",), owner="host"),
+    Field("col", wp.int32, ("i",), owner="host"),
+    Field("source", wp.int32, ("i",), owner="host"),
+    Field("level_offsets", wp.int32, ("i", "j"), owner="host"),
+    Field("level_pivots", wp.int32, ("i",), owner="host"),
+    Field("level_scales", wp.int32, ("i",), owner="host"),
+    Field("level_entries", wp.int32, ("i",), owner="host"),
+    Field("level_term_offsets", wp.int32, ("i",), owner="host"),
+    Field("level_terms", wp.int32, ("i", "j"), owner="host"),
+    Field("inverse_nodes", wp.int32, ("i", "j"), owner="host"),
+    Field("inverse_count", wp.int32, ("i",), owner="host"),
+    Field("support_nodes", wp.int32, ("i", "j"), owner="host"),
+    Field("support_count", wp.int32, ("i",), owner="host"),
+    Field("limit_support", wp.int32, ("i",), owner="host"),
+    Field("pair_support", wp.int32, ("i", "j"), owner="host"),
+    Field("body_mask", wp.uint64, ("i",), owner="host"),
+    Field("body_tag", wp.int32, ("i",), owner="host"),
+    Field("dof_joint", wp.int32, ("i",), owner="host"),
+    Field("physical", wp.int32, ("i",), owner="host"),
+    Field("sparse", wp.int32, ("i",), owner="host"),
+    Field("group_to_art", wp.int32, ("art",), owner="step"),
+    Field("art_to_world", wp.int32, ("articulation",)),
+    Field("art_dof_start", wp.int32, ("articulation",), attr="articulation_dof_start"),
+    Field("art_joint_start", wp.int32, ("articulation_bound",), owner="model", attr="articulation_start"),
+    Field("joint_child", wp.int32, ("joint",), owner="model"),
+)
+"""A size group's packed factor pattern (host metadata), coordinate permutations and articulation ownership."""
+
+SparsePlan = field_group.struct("SparsePlan", SPARSE_PLAN, __name__)
 
 
 @wp.struct
@@ -86,12 +91,13 @@ def bind_operator_plan(solver, size, host, *, group_to_art=None):
     are the solver's factor group of ``size`` coordinates.
     """
     model = solver.model
-    plan = SparsePlan()
-    for name, values in host.items():
-        setattr(plan, name, wp.array(values, dtype=wp.uint64 if name == "body_mask" else int, device=model.device))
-    plan.group_to_art = solver.group_to_art[size] if group_to_art is None else group_to_art
-    plan.art_to_world = solver.art_to_world
-    plan.art_dof_start = solver.articulation_dof_start
-    plan.art_joint_start = model.articulation_start
-    plan.joint_child = model.joint_child
-    return plan
+    return field_group.upload(
+        SparsePlan,
+        model.device,
+        **host,
+        group_to_art=solver.group_to_art[size] if group_to_art is None else group_to_art,
+        art_to_world=solver.art_to_world,
+        art_dof_start=solver.articulation_dof_start,
+        art_joint_start=model.articulation_start,
+        joint_child=model.joint_child,
+    )

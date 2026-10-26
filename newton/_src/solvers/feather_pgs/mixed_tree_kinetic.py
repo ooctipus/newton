@@ -287,7 +287,7 @@ class PrescribedRootOperator:
         self.data.valid = wp.ones(len(arts), dtype=int, device=device)
         self.data.status = wp.zeros(len(arts), dtype=int, device=device)
         # Zero inverse mass: the prescribed coordinates never respond.
-        self.data.inverse = wp.zeros(solver.model.joint_dof_count, dtype=float, device=device)
+        self.data.inverse = solver._arrays.placeholder(wp.float32, (solver.model.joint_dof_count,))
         self.kinetic_state = None
 
     def refresh(self, state_aug):
