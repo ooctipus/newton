@@ -8604,6 +8604,10 @@ def crba_fill_par_dof(
 
         for k in range(count):
             row_idx = dof_offset_local + k
+            # Within its own joint a column shares each off-diagonal pair with another column of that joint: the
+            # lower column owns the pair, so every entry has one writer whatever the thread schedule.
+            if curr == pivot_joint and row_idx < col_idx:
+                continue
 
             S_row = joint_S_s[q_start + k]
             val = wp.dot(S_row, F)
