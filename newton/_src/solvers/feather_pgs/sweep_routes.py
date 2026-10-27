@@ -123,6 +123,16 @@ MF_GS_ABI = kernel_template.params(
 DENSE_SUPPORT = DenseSupport()
 """Where a matrix-free sweep keeps its dense rows' support (:class:`.response_operator.DenseSupport`)."""
 
+
+def dense_support(max_world_dofs: int, lanes: Lanes = Lanes(32)) -> DenseSupport | None:
+    """The dense rows' support of a sweep over worlds of ``max_world_dofs`` coordinates, or None.
+
+    The support skips a lane's coordinates that no row touches, so it can only pay when a lane owns more than one
+    coordinate. A world of at most ``lanes.width`` coordinates keeps the dense loop, whose software pipeline loads the
+    next row's entries while a row is solved (the support's loop reads them at use).
+    """
+    return DENSE_SUPPORT if int(max_world_dofs) > lanes.width else None
+
 MAPPINGS = ("warp", "colored")
 """The matrix-free sweep's thread mappings of a world's free-body rows: one warp visits them in row order, or a block
 visits their colors in order and each color's units at once (:mod:`.sweep_units`)."""
@@ -369,12 +379,13 @@ def mf_gs_staging(
         colored = (Buffer("s_color_offset", "int", COLOR_CHUNK + 1),)
         if traces:
             colored += block_argmax(warps, warp="warp", lane="lane")[1]
+    support = dense_support(max_world_dofs)
     return Staging(
         (
             Buffer("s_v", "float", max_world_dofs),
             *dense.buffers(),
             *free.buffers(),
-            *DENSE_SUPPORT.buffers(max_world_dofs),
+            *(support.buffers(max_world_dofs) if support is not None else ()),
             *colored,
         ),
         threads=COLORED_THREADS if mapping == "colored" else 32,
@@ -447,7 +458,8 @@ def mf_gs_source(
         lanes=lanes,
     )
     free = FreeBodyRows(M_MF, stream=stream_mf_impulses, lanes=lanes)
-    dense_op = DenseJY(D, lanes, support=DENSE_SUPPORT)
+    support = dense_support(D, lanes)
+    dense_op = DenseJY(D, lanes, support=support)
     free_op = FreeBody6(lanes)
     staging = mf_gs_staging(
         M_D,
@@ -560,19 +572,25 @@ def mf_gs_source(
         offsets = trace_reduction = ""
 
     # The dense rows' support: the coordinates their J or Y touch, from rows [0, m_dense) (every pass reads them).
-    support_build = DENSE_SUPPORT.build(
-        dofs=D,
-        rows="m_dense",
-        J="J_world",
-        Y="Y_world",
-        base="jy_world_base",
-        thread="tid" if colored else "lane",
-        threads="(int)blockDim.x" if colored else "32",
-        first_warp="warp == 0" if colored else "true",
-        lane="lane",
-        sync="__syncthreads();" if colored else "SYNC();",
+    support_build = (
+        support.build(
+            dofs=D,
+            rows="m_dense",
+            J="J_world",
+            Y="Y_world",
+            base="jy_world_base",
+            thread="tid" if colored else "lane",
+            threads="(int)blockDim.x" if colored else "32",
+            first_warp="warp == 0" if colored else "true",
+            lane="lane",
+            sync="__syncthreads();" if colored else "SYNC();",
+        )
+        if support is not None
+        else ""
     )
     metric_build = _colored_metrics(M_MF) if colored else ""
+    # The launch's prologue after the loads: the dense rows' support and the colored units' pair metrics.
+    prologue = "\n".join(part for part in (support_build, metric_build) if part)
     body = f"""{head}
 
     {dense_count}
@@ -622,8 +640,7 @@ def mf_gs_source(
         s_v[d] = global_dof >= 0{owned} ? v_out.data[global_dof] : 0.0f;
     }}
 {end_first_warp}    {barrier}
-{support_build}
-{metric_build}
+{prologue}
 {dense_op.pipeline_registers("    ")}
 
     for (int iter = 0; iter < iterations; iter++) {{
