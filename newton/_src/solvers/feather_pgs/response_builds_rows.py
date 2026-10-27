@@ -1174,10 +1174,13 @@ def bilateral_correct_kernel(
 
 @wp.kernel(enable_backward=False)
 def bilateral_project_kernel(
-    preelim: Preelim,
     group_to_art: wp.array[int],
     art_to_world: wp.array[int],
+    art_to_preelim: wp.array[int],
     articulation_dof_start: wp.array[int],
+    preelim_slots: wp.array[int],
+    preelim_nB: wp.array[int],
+    LS: wp.array[float],
     J_group: wp.array3d[float],
     Y_group: wp.array3d[float],
     world_rhs: wp.array2d[float],
@@ -1192,10 +1195,10 @@ def bilateral_project_kernel(
     """
     group = wp.tid()
     art = group_to_art[group]
-    pe = preelim.art_to_preelim[art]
+    pe = art_to_preelim[art]
     if pe < 0:
         return
-    m = preelim.nB[pe]
+    m = preelim_nB[pe]
     if m == 0:
         return
     base = pe * PREELIM_MAX_ROWS
@@ -1203,11 +1206,11 @@ def bilateral_project_kernel(
     dof_start = articulation_dof_start[art]
     r = _preelim_vec()
     for p in range(m):
-        sp = preelim.slots[base + p]
+        sp = preelim_slots[base + p]
         r[p] = bilateral_velocity(J_group, group, sp, v_out, dof_start, n_dofs, world_rhs[world, sp])
-    z = preelim_solve(m, preelim.LS, pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS, r)
+    z = preelim_solve(m, LS, pe * PREELIM_MAX_ROWS * PREELIM_MAX_ROWS, r)
     for d in range(n_dofs):
-        acc = bilateral_response(Y_group, group, preelim.slots, base, m, z, d)
+        acc = bilateral_response(Y_group, group, preelim_slots, base, m, z, d)
         if acc != 0.0:
             v_out[dof_start + d] -= acc
 

@@ -409,28 +409,22 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, dev
             device=device,
         )
     elif family == "mf_velocity":
-        mf = field_group.upload(
-            MfRows,
-            device,
-            body_a=neg1,
-            body_b=neg1,
-            dof_a=neg1,
-            dof_b=neg1,
-            J_a=zJ(),
-            J_b=zJ(),
-            phi=phi_arr,
-            row_type=row_type,
-            target=zeros3(),
-            restitution=zeros3(),
-            rhs=rhs,
-        )
         wp.launch(
             compute_mf_rhs_bias,
             dim=3,
             inputs=[
-                mf,
                 count,
+                neg1,
+                neg1,
+                neg1,
+                neg1,
+                zJ(),
+                zJ(),
                 wp.zeros((1, 1), dtype=wp.int32, device=device),
+                phi_arr,
+                row_type,
+                zeros3(),
+                zeros3(),
                 0,
                 inf,
                 pgs_beta,
@@ -444,6 +438,7 @@ def _rhs_for_family(family: str, *, phi, row_beta, pgs_beta, dt, bias_scale, dev
                 0.5,
                 3,
             ],
+            outputs=[rhs],
             device=device,
         )
     else:

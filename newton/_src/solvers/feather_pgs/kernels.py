@@ -4224,9 +4224,18 @@ def spatial_matrix_block_inverse(M: wp.spatial_matrix):
 
 @wp.kernel
 def compute_mf_rhs_bias(
-    mf: MfRows,
     mf_constraint_count: wp.array[int],
+    mf_body_a: wp.array2d[int],
+    mf_body_b: wp.array2d[int],
+    mf_dof_a: wp.array2d[int],
+    mf_dof_b: wp.array2d[int],
+    mf_J_a: wp.array3d[float],
+    mf_J_b: wp.array3d[float],
     world_dof_indices: wp.array2d[int],
+    mf_phi: wp.array2d[float],
+    mf_row_type: wp.array2d[int],
+    mf_target_velocity: wp.array2d[float],
+    mf_row_restitution: wp.array2d[float],
     has_target_velocity: int,
     rigid_body_max_depenetration_velocity: wp.array[float],
     pgs_beta: float,
@@ -4239,6 +4248,8 @@ def compute_mf_rhs_bias(
     apply_restitution: int,
     restitution_velocity_threshold: float,
     mf_max_constraints: int,
+    # outputs
+    mf_rhs: wp.array2d[float],
 ):
     """Compute only the MF contact RHS bias for a previously-built contact set."""
     tid = wp.tid()
@@ -4249,24 +4260,24 @@ def compute_mf_rhs_bias(
 
     target = float(0.0)
     if has_target_velocity != 0:
-        target = mf.target[world, i]
+        target = mf_target_velocity[world, i]
     inv_dt = 1.0 / dt
     rhs = -target
-    row_type = mf.row_type[world, i]
+    row_type = mf_row_type[world, i]
     if row_type == PGS_CONSTRAINT_TYPE_CONTACT:
-        phi_val = mf.phi[world, i]
+        phi_val = mf_phi[world, i]
         fires = bool(False)
         bounce = float(0.0)
         restitution = float(0.0)
         if apply_restitution != 0:
-            restitution = mf.restitution[world, i]
+            restitution = mf_row_restitution[world, i]
         if restitution > 0.0:
             relative_incident = (
                 mf_contact_row_dot(
-                    mf.J_a,
-                    mf.J_b,
-                    mf.dof_a[world, i],
-                    mf.dof_b[world, i],
+                    mf_J_a,
+                    mf_J_b,
+                    mf_dof_a[world, i],
+                    mf_dof_b[world, i],
                     world_dof_indices,
                     incident_velocity,
                     world,
@@ -4285,10 +4296,10 @@ def compute_mf_rhs_bias(
             end_gap = float(0.0)
             if preserve_unreached_speculative != 0 and phi_val > 0.0:
                 jv_position = mf_contact_row_dot(
-                    mf.J_a,
-                    mf.J_b,
-                    mf.dof_a[world, i],
-                    mf.dof_b[world, i],
+                    mf_J_a,
+                    mf_J_b,
+                    mf_dof_a[world, i],
+                    mf_dof_b[world, i],
                     world_dof_indices,
                     position_velocity,
                     world,
@@ -4296,17 +4307,17 @@ def compute_mf_rhs_bias(
                 )
                 end_gap = phi_val + dt * (jv_position - target)
             cap = contact_depenetration_cap(
-                mf.body_a[world, i], mf.body_b[world, i], rigid_body_max_depenetration_velocity
+                mf_body_a[world, i], mf_body_b[world, i], rigid_body_max_depenetration_velocity
             )
             rhs, _row_w = contact_rhs(
                 phi_val, pgs_beta, target, inv_dt, bias_scale, speculative_scale, 1.0, cap, end_gap
             )
     elif row_type == PGS_CONSTRAINT_TYPE_FRICTION:
         # The row builder pre-multiplies the anchor gain into phi.
-        rhs, _w = row_rhs(row_type, mf.phi[world, i], 1.0, target, inv_dt, bias_scale, 0.0, 0.0, 1.0)
+        rhs, _w = row_rhs(row_type, mf_phi[world, i], 1.0, target, inv_dt, bias_scale, 0.0, 0.0, 1.0)
     elif row_type == PGS_CONSTRAINT_TYPE_JOINT_VELOCITY_LIMIT:
-        rhs = mf.phi[world, i] - target
-    mf.rhs[world, i] = rhs
+        rhs = mf_phi[world, i] - target
+    mf_rhs[world, i] = rhs
 
 
 @wp.kernel
