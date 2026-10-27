@@ -80,7 +80,7 @@ from .contact_torsion import (
     validate_torsion_step,
 )
 from .contact_unit import CONTACT_UNIT_STATE_FIELDS, RING_BLOCK_SIZE, check_contact_update
-from .dense_rows import DenseRows
+from .dense_rows import DenseRows, bind_mf_body_map
 from .dense_rows import bind as bind_dense_rows
 from .dense_rows import bind_mf as bind_mf_rows
 from .device_preludes import lane_group
@@ -11002,19 +11002,12 @@ class SolverFeatherPGS(SolverBase):
             response_builds_rows.free_body_map_kernel,
             dim=self.world_count,
             inputs=[
+                bind_mf_rows(self),
+                bind_mf_body_map(self),
                 self.mf_constraint_count,
-                self.mf_body_a,
-                self.mf_body_b,
                 self.body_to_articulation,
                 self.articulation_dof_start,
                 self.max_mf_bodies,
-            ],
-            outputs=[
-                self.mf_body_list,
-                self.mf_body_dof_start,
-                self.mf_body_count,
-                self.mf_local_body_a,
-                self.mf_local_body_b,
             ],
             device=self.model.device,
         )
@@ -11035,11 +11028,8 @@ class SolverFeatherPGS(SolverBase):
             response_builds_rows.free_body_publish_kernel,
             dim=self.world_count * self.max_mf_bodies * 6,
             inputs=[
+                bind_mf_body_map(self),
                 self.mf_constraint_count,
-                self.mf_body_count,
-                self.mf_body_dof_start,
-                self.mf_local_body_a,
-                self.mf_local_body_b,
                 self.mf_MiJt_a,
                 self.mf_MiJt_b,
                 self.mf_impulses,

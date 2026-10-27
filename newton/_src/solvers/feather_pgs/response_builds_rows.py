@@ -64,7 +64,7 @@ from .contact_laws import (
     jacobian_entry,
     prescribed_target,
 )
-from .dense_rows import DenseRows, MfRows
+from .dense_rows import DenseRows, MfBodyMap, MfRows
 from .device_preludes import cuda_native, dual_native, lane_group
 from .field_group import Field
 from .friction_patches import FrictionPatches, patch_friction_location
@@ -407,18 +407,12 @@ def free_body_rows_kernel(
 
 @wp.kernel(enable_backward=False)
 def free_body_map_kernel(
+    mf: MfRows,
+    bodies: MfBodyMap,
     mf_constraint_count: wp.array[int],
-    mf_body_a: wp.array2d[int],
-    mf_body_b: wp.array2d[int],
     body_to_articulation: wp.array[int],
     art_dof_start: wp.array[int],
     max_mf_bodies: int,
-    # outputs
-    mf_body_list: wp.array2d[int],
-    mf_body_dof_start: wp.array2d[int],
-    mf_body_count: wp.array[int],
-    mf_local_body_a: wp.array2d[int],
-    mf_local_body_b: wp.array2d[int],
 ):
     """List each world's bodies in row order and give every row its bodies' local slots (:func:`free_body_slot`).
 
@@ -430,27 +424,27 @@ def free_body_map_kernel(
     for i in range(mf_constraint_count[world]):
         slot_a, count = free_body_slot(
             world,
-            mf_body_a[world, i],
+            mf.body_a[world, i],
             count,
             max_mf_bodies,
             body_to_articulation,
             art_dof_start,
-            mf_body_list,
-            mf_body_dof_start,
+            bodies.body_list,
+            bodies.body_dof_start,
         )
-        mf_local_body_a[world, i] = slot_a
+        bodies.local_body_a[world, i] = slot_a
         slot_b, count = free_body_slot(
             world,
-            mf_body_b[world, i],
+            mf.body_b[world, i],
             count,
             max_mf_bodies,
             body_to_articulation,
             art_dof_start,
-            mf_body_list,
-            mf_body_dof_start,
+            bodies.body_list,
+            bodies.body_dof_start,
         )
-        mf_local_body_b[world, i] = slot_b
-    mf_body_count[world] = count
+        bodies.local_body_b[world, i] = slot_b
+    bodies.body_count[world] = count
 
 
 @wp.kernel(enable_backward=False)
@@ -477,11 +471,8 @@ def free_body_coordinates_kernel(
 
 @wp.kernel(enable_backward=False)
 def free_body_publish_kernel(
+    bodies: MfBodyMap,
     mf_constraint_count: wp.array[int],
-    mf_body_count: wp.array[int],
-    mf_body_dof_start: wp.array2d[int],
-    mf_local_body_a: wp.array2d[int],
-    mf_local_body_b: wp.array2d[int],
     mf_MiJt_a: wp.array3d[float],
     mf_MiJt_b: wp.array3d[float],
     mf_impulses: wp.array2d[float],
@@ -499,16 +490,16 @@ def free_body_publish_kernel(
     component = tid % 6
     local_body = (tid // 6) % max_mf_bodies
     world = tid // (6 * max_mf_bodies)
-    if local_body >= mf_body_count[world]:
+    if local_body >= bodies.body_count[world]:
         return
-    global_dof = mf_body_dof_start[world, local_body] + component
+    global_dof = bodies.body_dof_start[world, local_body] + component
     delta = free_body_publish(
         world,
         local_body,
         component,
         mf_constraint_count[world],
-        mf_local_body_a,
-        mf_local_body_b,
+        bodies.local_body_a,
+        bodies.local_body_b,
         mf_MiJt_a,
         mf_MiJt_b,
         mf_impulses,

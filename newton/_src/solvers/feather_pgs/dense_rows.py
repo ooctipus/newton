@@ -14,7 +14,7 @@ import warp as wp
 
 from . import field_group
 from .field_group import Field
-from .solver_fields import MF_ROWS
+from .solver_fields import MF_BODY_MAP, MF_ROWS
 
 RECORDS = (
     Field("row_type", wp.int32, ("world", "row")),
@@ -58,6 +58,23 @@ MF_RECORDS = (
 coefficient, gap, restitution, rhs and target, by world and row."""
 
 MfRows = field_group.struct("MfRows", MF_RECORDS, __name__)
+
+
+MfBodyMap = field_group.struct(
+    "MfBodyMap",
+    (
+        dataclasses.replace(MF_BODY_MAP[attr], name=attr.removeprefix("mf_"), attr=attr)
+        for attr in ("mf_body_list", "mf_body_dof_start", "mf_body_count", "mf_local_body_a", "mf_local_body_b")
+    ),
+    __name__,
+)
+"""Each world's matrix-free bodies in row order, their coordinate starts and count, and every row's two local body
+slots (split mode's tiled sweep)."""
+
+
+def bind_mf_body_map(solver):
+    """Bind the solver's matrix-free body map into an :data:`MfBodyMap`."""
+    return field_group.bind(MfBodyMap, solver=solver)
 
 
 def bind_mf(solver, **records):
