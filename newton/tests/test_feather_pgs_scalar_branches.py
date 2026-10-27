@@ -27,7 +27,7 @@ from newton._src.solvers.feather_pgs import kernels as fk
 from newton._src.solvers.feather_pgs import scalar_branches as sb
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
 from newton._src.solvers.feather_pgs.device_proof import DeviceProof
-from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
+from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton._src.solvers.feather_pgs.spatial_laws import inertia_record
 from newton.solvers import SolverFeatherPGS
 from newton.tests.test_feather_pgs_subtree_reduce import _assert_switch_within, _excess
@@ -999,12 +999,12 @@ def check_owner_launches(test, device):
                     model = build_branch_model(device, worlds=2)
                     solver = cpu_solver(model, branch_size(model))
                     solver._scalar_branches, _reason = sb.plan_scalar_branches(solver, requested=True)
-                    owner = MixedTreeKineticState(solver)
+                    owner = HeldTree(solver)
                 else:
                     model = build_branch_model(device, worlds=2, leaves=PRESS_LEAVES, shapes=True)
                     solver = recipe_solver(model, scalar=True)
                     owner = solver._tree_kinetic_state
-                test.assertIsInstance(owner, MixedTreeKineticState)
+                test.assertIsInstance(owner, HeldTree)
                 test.assertIsInstance(owner.scalar, sb.ScalarBranchState)
                 test.assertFalse(owner.bank_compare)
                 groups = []
@@ -1182,7 +1182,7 @@ class TestScalarBranchRule(unittest.TestCase):
         model = build_branch_model(worlds=2)
         solver = cpu_solver(model, 7)
         solver._scalar_branches, _reason = sb.plan_scalar_branches(solver, requested=True)
-        owner = MixedTreeKineticState(solver)
+        owner = HeldTree(solver)
         self.assertIsInstance(owner.scalar, sb.ScalarBranchState)
         self.assertEqual([type(group).__name__ for group in owner.groups], ["TreeKineticState", "ScalarBranchState"])
         self.assertEqual([group.sparse.size for group in owner.groups], [6, 7])
@@ -1193,7 +1193,7 @@ class TestScalarBranchRule(unittest.TestCase):
         owner.invalidate()
         np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), 0)
         with mock.patch.dict(os.environ, {"FEATHER_PGS_TREE_FOREST": "1"}):
-            forced = MixedTreeKineticState(solver)
+            forced = HeldTree(solver)
         self.assertIn("Scalar branches own", forced.forest_reason)
         self.assertEqual(len(forced.groups), 2)
 
@@ -1212,9 +1212,9 @@ class TestScalarBranchRule(unittest.TestCase):
         model = build_branch_model(worlds=2)
         solver = cpu_solver(model, 7)
         solver._scalar_branches, _reason = sb.plan_scalar_branches(solver, requested=True)
-        owners = {"scalar": MixedTreeKineticState(solver)}
+        owners = {"scalar": HeldTree(solver)}
         with mock.patch.object(solver, "_scalar_branches", None):
-            owners["plain"] = MixedTreeKineticState(solver)
+            owners["plain"] = HeldTree(solver)
         s0, s1 = model.state(), model.state()
         solver._last_step_dt = DT
         augmented = solver._prepare_augmented_state(s0, s1, model.control())
@@ -1277,7 +1277,7 @@ class TestScalarBranchRule(unittest.TestCase):
         model = build_branch_model(worlds=2)
         solver = cpu_solver(model, 7)
         solver._scalar_branches, _reason = sb.plan_scalar_branches(solver, requested=True)
-        owner = MixedTreeKineticState(solver)
+        owner = HeldTree(solver)
         validate = DeviceProof.validate
         with mock.patch.object(DeviceProof, "validate", autospec=True, side_effect=validate) as proofs:
             self.assertTrue(owner.validate_model(joint))
@@ -1309,7 +1309,7 @@ class TestScalarBranchRule(unittest.TestCase):
         model = build_branch_model(worlds=2)
         solver = cpu_solver(model, 7)
         solver._scalar_branches, solver._scalar_branches_reason = sb.plan_scalar_branches(solver, requested=True)
-        with mock.patch.object(solver, "_tree_kinetic_state", MixedTreeKineticState(solver)):
+        with mock.patch.object(solver, "_tree_kinetic_state", HeldTree(solver)):
             held = path_selection._held_tree(solver)
         json.dumps(held, allow_nan=False)
         self.assertEqual(held["owner"], "mixed")
@@ -1835,7 +1835,7 @@ class TestScalarBranchOwner(unittest.TestCase):
         self.assertIsNone(head._tree_kinetic_state)
         self.assertIsNone(head._scalar_branches)
         owner = scalar._tree_kinetic_state
-        self.assertIsInstance(owner, MixedTreeKineticState)
+        self.assertIsInstance(owner, HeldTree)
         self.assertIsInstance(owner.scalar, sb.ScalarBranchState)
         self.assertIs(owner.scalar.predictor_kernel, sb.predict_prismatic_branches)
         self.assertNotEqual(owner.scalar.size, ARM_DOFS)

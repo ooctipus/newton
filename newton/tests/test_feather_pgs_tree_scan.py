@@ -246,7 +246,7 @@ class TestTreePlan(unittest.TestCase):
         ours = local_parents(ancestor, starts, 9)
         for a, start in enumerate(starts):
             slice_ = ancestor[start : start + 9]
-            np.testing.assert_array_equal(ours[a], np.where(slice_ < 0, -1, slice_ - start))  # mixed_tree_kinetic
+            np.testing.assert_array_equal(ours[a], np.where(slice_ < 0, -1, slice_ - start))  # held_tree
             np.testing.assert_array_equal(ours[a], np.where(slice_ >= start, slice_ - start, -1))  # the solver
         # A range that starts inside a tree leaves its first joint's ancestor outside: not a group of whole trees.
         with self.assertRaises(ValueError):
@@ -489,8 +489,9 @@ class TestHeldTreeChains(unittest.TestCase):
                     ),
                 ):
                     solver = _make_solver(model, True, cached_dynamics="on")
-                owner = solver._tree_kinetic_state
-                self.assertIsNotNone(owner)
+                self.assertIsNotNone(solver._tree_kinetic_state)
+                # The sparse factor's held group is the owner's only group.
+                (owner,) = solver._tree_kinetic_state.groups
                 self.assertEqual((owner.layout.lanes, owner.layout.pack, owner.block_dim), (64, 1, 64))
                 self.assertEqual(owner.schedules, on_chains)
                 rng = np.random.default_rng(13)

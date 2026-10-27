@@ -140,7 +140,7 @@ class TestTreeMimicCache(unittest.TestCase):
                             rtol=4e-4,
                             err_msg=name,
                         )
-                    np.testing.assert_array_equal(cases[1][0]._tree_kinetic_state.status.numpy(), 0)
+                    np.testing.assert_array_equal(cases[1][0]._tree_kinetic_state.groups[0].status.numpy(), 0)
                 self.assertTrue(contact_seen)
 
     def test_mimic_closure_converges(self):

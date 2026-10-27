@@ -404,7 +404,7 @@ class Recorder:
         """Held factor groups: per-size trees and forests over the mixed free-body scenes."""
         import warp as wp  # noqa: PLC0415
 
-        from newton._src.solvers.feather_pgs import mixed_tree_kinetic  # noqa: PLC0415
+        from newton._src.solvers.feather_pgs import held_tree  # noqa: PLC0415
         from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS  # noqa: PLC0415
         from newton.tests.test_feather_pgs_mixed_tree_free_body import _build  # noqa: PLC0415
 
@@ -418,22 +418,22 @@ class Recorder:
                 solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
             # Velocity limits are solved by matrix-free sweeps; the owner's motion contract reads only the flag.
             solver.enable_joint_velocity_limits = owner_options.get("motion", False)
-            supported = mixed_tree_kinetic.supported
+            admitted = held_tree.admitted
             if forest:
                 # Admission is CUDA-only; both arms lift it to build the forest group on any device.
-                mixed_tree_kinetic.supported = lambda solver: True
+                held_tree.admitted = lambda solver: True
             switches = {
                 "FEATHER_PGS_TREE_FOREST": int(forest),
                 "FEATHER_PGS_STAGE_CLOCKS": int(owner_options.get("clocked", False)),
             }
             try:
                 with _environment(**switches):
-                    owner = mixed_tree_kinetic.MixedTreeKineticState(solver)
+                    owner = held_tree.HeldTree(solver)
             except ValueError as error:
                 print(f"skipped {tag}: {error}", flush=True)
                 continue
             finally:
-                mixed_tree_kinetic.supported = supported
+                held_tree.admitted = admitted
             if forest and not any(group.layout.forest for group in owner.groups):
                 print(f"skipped {tag}: no forest group", flush=True)
                 continue

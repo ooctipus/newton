@@ -15,7 +15,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import tree_kinetic_state
-from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
+from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
@@ -211,7 +211,7 @@ class TestTreeKernelSwitches(unittest.TestCase):
             ("clocked", False, True),
         ):
             with _switches(reference, clocked):
-                owners[name] = MixedTreeKineticState(solver)
+                owners[name] = HeldTree(solver)
             self.assertEqual((owners[name].reference, owners[name].clocked), (reference, clocked))
             for group in owners[name].groups:
                 self.assertEqual((group.reference, group.clocked), (reference, clocked))
@@ -237,7 +237,7 @@ class TestTreeKernelSwitches(unittest.TestCase):
         """
         model = _build(wp.get_device("cpu"), worlds=2)
         solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
-        owner = MixedTreeKineticState(solver)
+        owner = HeldTree(solver)
         self.assertTrue(owner.groups)
         dt = 1.0 / 240.0
         state, expected = model.state(), model.state()

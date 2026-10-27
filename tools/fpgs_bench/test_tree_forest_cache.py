@@ -12,11 +12,11 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs.held_tree import TreeSparseOperator
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import factor_indices
 from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
 from newton._src.solvers.feather_pgs.tree_kinetic_plan import make_plan
-from newton._src.solvers.feather_pgs.tree_kinetic_sparse import TreeSparseOperator
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.tests import test_feather_pgs_sparse_solver as native
 from tools.fpgs_bench.public_state_oracle import physical_mass, public_state
@@ -314,10 +314,10 @@ class TestTreeForestCache(unittest.TestCase):
         with patch.dict(os.environ, {"FEATHER_PGS_TREE_KINETIC_STATE": "1"}):
             case = native._case(True, robot_count=2)
         self.assertIsNotNone(case[1]._tree_kinetic_state)
-        self.assertEqual(case[1]._tree_kinetic_state.data.bias.shape, (4, 9))
+        self.assertEqual(case[1]._tree_kinetic_state.groups[0].data.bias.shape, (4, 9))
         native._step(case)
         public_state(self, case[0], case[3])
-        np.testing.assert_array_equal(case[1]._tree_kinetic_state.data.current_valid.numpy(), 1)
+        np.testing.assert_array_equal(case[1]._tree_kinetic_state.groups[0].data.current_valid.numpy(), 1)
         np.testing.assert_array_equal(case[1]._sparse_mass_matrix_status.numpy(), 0)
 
 

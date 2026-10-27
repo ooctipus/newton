@@ -222,7 +222,7 @@ def held_factor_calls():
     A topology lists each joint's parent and coordinate count. Its sparse mass
     plan numbers the packed physical geometry, and the refresh of a held
     factor reads that record through a physical (row, col) index, as the tree
-    and forest operators of ``mixed_tree_kinetic`` bind it: a tree reads its
+    and forest operators of ``held_tree`` bind it: a tree reads its
     own record; each held family of a forest reads its root's block of the
     forest's record, whose stride is the forest's entry count, through a group
     map. A prescribed root (family 0) holds no factor.

@@ -11,7 +11,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
+from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton.solvers import SolverFeatherPGS
 from tools.fpgs_bench.public_state_oracle import physical_mass, public_state
 
@@ -126,7 +126,7 @@ class TestMixedTreeCache(unittest.TestCase):
         for reordered in (False, True):
             model = model_fixture(reordered=reordered)
             solver = make_solver(model, permuted=True)
-            owner = MixedTreeKineticState(solver)
+            owner = HeldTree(solver)
             self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [4, 9])
             covered = np.concatenate([group.sparse.plan.group_to_art.numpy() for group in owner.groups])
             np.testing.assert_array_equal(np.sort(covered), np.arange(6))
@@ -138,7 +138,7 @@ class TestMixedTreeCache(unittest.TestCase):
             model.joint_target_ke.zero_()
             model.joint_target_kd.zero_()
             solver, reference = (make_solver(model, permuted=True) for _ in range(2))
-            owner = MixedTreeKineticState(solver)
+            owner = HeldTree(solver)
             state, output, control = model.state(), model.state(), model.control()
             rng = np.random.default_rng(3401)
             state.joint_q.assign(rng.uniform(-0.15, 0.15, model.joint_coord_count).astype(np.float32))
@@ -253,7 +253,7 @@ class TestMixedTreeCache(unittest.TestCase):
         """Reject omitted, duplicated and rebound factor ownership without writes."""
         model = model_fixture()
         solver = make_solver(model)
-        owner = MixedTreeKineticState(solver)
+        owner = HeldTree(solver)
         solver._fk_id_cache_valid.fill_(1)
         original = solver.group_to_art[9]
         values = original.numpy()

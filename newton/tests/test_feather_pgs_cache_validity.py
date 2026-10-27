@@ -25,7 +25,7 @@ from newton._src.solvers.feather_pgs import (
     tree_kinetic_owner,
     tree_kinetic_state,
 )
-from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
+from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.test_feather_pgs_mixed_tree_free_body import _build
 from newton.tests.test_feather_pgs_sparse_solver import STATE_FIELDS, _build_model, _make_solver
@@ -188,7 +188,7 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         """
         model = _build(wp.get_device("cpu"), worlds=2)
         solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
-        owner = MixedTreeKineticState(solver)
+        owner = HeldTree(solver)
         # Install the owner as cached_dynamics does on CUDA; CPU admission keeps ordinary dynamics.
         solver._tree_kinetic_state = owner
         solver._fk_id_cache_enabled = True
@@ -277,7 +277,7 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         """
         model = _build(wp.get_device("cpu"), worlds=2)
         solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
-        owner = MixedTreeKineticState(solver)
+        owner = HeldTree(solver)
         # Install the owner as cached_dynamics does on CUDA; CPU admission keeps ordinary dynamics.
         solver._tree_kinetic_state = owner
         solver._fk_id_cache_enabled = True
@@ -475,7 +475,7 @@ def _cpu_owner(*, motion_velocity=False, worlds=2):
     model = _build(wp.get_device("cpu"), worlds=worlds)
     solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
     solver.enable_joint_velocity_limits = motion_velocity
-    owner = MixedTreeKineticState(solver)
+    owner = HeldTree(solver)
     solver._tree_kinetic_state = owner
     solver._fk_id_cache_enabled = True
     states = [model.state(), model.state()]
@@ -1534,7 +1534,7 @@ class TestFeatherPGSClassifiedRepair(unittest.TestCase):
                     model = _build(device, worlds=2, speed_limit=0.8 if motion else None)
                     solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
                     solver.enable_joint_velocity_limits = motion
-                    owner = MixedTreeKineticState(solver)
+                    owner = HeldTree(solver)
                     groups = []
                     for group in owner.groups:
                         if forced:
@@ -1863,7 +1863,7 @@ class TestFeatherPGSHeldMassMatrix(unittest.TestCase):
             return [array for array in matrices if any(item is array for item in touched)]
 
         refreshed = []
-        solver._tree_kinetic_state = SimpleNamespace(sparse=SimpleNamespace(refresh=refreshed.append))
+        solver._tree_kinetic_state = SimpleNamespace(refresh=refreshed.append)
         self.assertEqual(touched_matrices(), [])
         self.assertEqual(refreshed, [state_aug])
         solver._tree_kinetic_state = None

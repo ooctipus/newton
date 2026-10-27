@@ -2660,9 +2660,9 @@ class SolverFeatherPGS(SolverBase):
             "FEATHER_PGS_COMPACT_CONTACT_BOUNDARY admitted the six-coordinate sparse-diagonal triples or units."
         )
 
-        from .cached_dynamics import install as install_cached_dynamics  # noqa: PLC0415
+        from .held_tree import install as install_held_tree  # noqa: PLC0415
 
-        install_cached_dynamics(self)
+        install_held_tree(self)
         if self._scalar_branches is not None and getattr(self._tree_kinetic_state, "scalar", None) is None:
             self._scalar_branches = None
             if self._tree_kinetic_state is None:
@@ -7983,7 +7983,7 @@ class SolverFeatherPGS(SolverBase):
         if getattr(self, "_tree_kinetic_state", None) is not None:
             if drive_rows_ready is not None:
                 wp.get_stream(model.device).wait_event(drive_rows_ready)
-            self._tree_kinetic_state.sparse.refresh(state_aug)
+            self._tree_kinetic_state.refresh(state_aug)
             # Consume requests just like the common tail. Leaving either set
             # changes the held-factor cadence on subsequent captured steps.
             self._mass_update_requested.zero_()

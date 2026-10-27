@@ -9,7 +9,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
+from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from tools.fpgs_bench import test_mixed_tree_steps as mixed_steps
 from tools.fpgs_bench.public_state_oracle import public_state
 from tools.fpgs_bench.test_mixed_tree_cache import DT, make_solver, model_fixture
@@ -30,7 +30,7 @@ class TestTreeCacheCopies(unittest.TestCase):
     def check_copied_state(self, device):
         model = model_fixture(device, reordered=True)
         solver = make_solver(model, permuted=True)
-        owner = MixedTreeKineticState(solver)
+        owner = HeldTree(solver)
         state, output, control = model.state(), model.state(), model.control()
         state.joint_qd.assign(np.linspace(-0.2, 0.3, model.joint_dof_count, dtype=np.float32))
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)

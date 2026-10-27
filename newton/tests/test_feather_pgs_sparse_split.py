@@ -367,12 +367,14 @@ class TestSparseSplitPhysics(unittest.TestCase):
                 _step(case)
                 owner = solver._tree_kinetic_state
                 self.assertEqual(owner is not None, cached)
+                # The sparse factor's held group is the owner's only group.
+                group = owner.groups[0] if owner else None
                 old_host = solver._kinematic_dof_mask_host.copy()
                 old_device = solver._kinematic_dof_mask.numpy().copy()
                 old_fk = solver._fk_id_cache_valid.numpy().copy()
                 self.assertTrue(old_fk.all())
                 names = ("current_valid", "geometry_valid", "generation", "geometry_generation", "status")
-                old_cache = {name: getattr(owner.data, name).numpy().copy() for name in names} if owner else {}
+                old_cache = {name: getattr(group.data, name).numpy().copy() for name in names} if owner else {}
                 flags = model.body_flags.numpy().copy()
                 flags[0] |= int(newton.BodyFlags.KINEMATIC)
                 model.body_flags.assign(flags)
@@ -389,7 +391,7 @@ class TestSparseSplitPhysics(unittest.TestCase):
                 np.testing.assert_array_equal(solver._kinematic_dof_mask.numpy(), old_device)
                 np.testing.assert_array_equal(solver._fk_id_cache_valid.numpy(), old_fk)
                 for name, values in old_cache.items():
-                    np.testing.assert_array_equal(getattr(owner.data, name).numpy(), values)
+                    np.testing.assert_array_equal(getattr(group.data, name).numpy(), values)
 
     def test_unsupported_actual_models_and_seeded_modes_fall_back(self):
         """Keep dense allocation for mixed and prescribed recipes; patch friction and carried impulses are admitted."""

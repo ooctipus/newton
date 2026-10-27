@@ -13,7 +13,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import tree_kinetic_state
 from newton._src.solvers.feather_pgs import tree_scan as ts
-from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
+from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton._src.solvers.feather_pgs.publication_data import PublicationData
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
@@ -210,7 +210,7 @@ class TestTreeKineticStages(unittest.TestCase):
         """Refuse a velocity other than the state's in begin and predict, before any cache changes."""
         model = _build(wp.get_device("cpu"), worlds=2)
         solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
-        owner = MixedTreeKineticState(solver)
+        owner = HeldTree(solver)
         state, output, control = model.state(), model.state(), model.control()
         augmented = solver._prepare_augmented_state(state, output, control)
         other = wp.clone(state.joint_qd)
@@ -239,7 +239,7 @@ class TestTreeKineticStages(unittest.TestCase):
             model = _build(device, worlds=2, speed_limit=0.8 if alternate else None)
             solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
             solver.enable_joint_velocity_limits = alternate
-            owner = MixedTreeKineticState(solver)
+            owner = HeldTree(solver)
             state, output, control = model.state(), model.state(), model.control()
             rng = np.random.default_rng(41)
             state.joint_qd.assign(rng.uniform(-0.4, 0.4, model.joint_dof_count).astype(np.float32))

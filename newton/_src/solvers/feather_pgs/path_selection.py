@@ -234,12 +234,11 @@ def _held_tree_groups(solver) -> tuple:
     owner = solver._tree_kinetic_state
     if owner is None:
         return None, []
-    if hasattr(owner, "groups"):
-        groups = list(owner.groups)
-        # Scalar branch groups hold no tree layout.
-        forest = any(getattr(getattr(group, "layout", None), "forest", False) for group in groups)
-        return ("forest" if forest else "mixed"), groups
-    return "tree", [owner]
+    groups = list(owner.groups)
+    # Scalar branch groups hold no tree layout.
+    if any(getattr(getattr(group, "layout", None), "forest", False) for group in groups):
+        return "forest", groups
+    return ("tree" if solver._sparse_mass_matrix_size is not None else "mixed"), groups
 
 
 def _held_tree(solver) -> dict:

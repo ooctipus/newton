@@ -263,7 +263,7 @@ class TestPrescaledTreeContract(unittest.TestCase):
                     self.assertIsNotNone(solvers[1]._tree_kinetic_state)
                     self.assertFalse(solvers[0]._fk_id_cache_enabled)
                     self.assertTrue(solvers[1]._fk_id_cache_enabled)
-                    self.assertTrue(solvers[1]._tree_kinetic_state.motion_velocity)
+                    self.assertTrue(solvers[1]._tree_kinetic_state.groups[0].motion_velocity)
                     pairs = [[model.state(), model.state()] for _ in solvers]
                     controls = [model.control() for _ in solvers]
                     pipelines = [newton.CollisionPipeline(model, rigid_contact_max=32) for _ in solvers]
@@ -375,7 +375,7 @@ class TestPrescaledTreeContract(unittest.TestCase):
                             rtol=3e-4,
                             err_msg=name,
                         )
-                    np.testing.assert_array_equal(cases[1][0]._tree_kinetic_state.status.numpy(), 0)
+                    np.testing.assert_array_equal(cases[1][0]._tree_kinetic_state.groups[0].status.numpy(), 0)
                 self.assertTrue(contact_seen)
 
 

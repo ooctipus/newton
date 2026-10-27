@@ -1,7 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compose complete tree caches over retained heterogeneous factor groups."""
+"""The held-tree owner: the CUDA evaluator of articulated dynamics, its groups chosen from the topology.
+
+One owner (:class:`HeldTree`) composes the groups that evaluate every articulation
+(:class:`~.tree_kinetic_owner.TreeKineticState`, plus the scalar branches' group). The solver's data chooses them:
+the native sparse factor, when the solver admitted one, makes one complete group (:class:`TreeSparseOperator`);
+otherwise each size group of the dense factors is a group with its held Cholesky or diagonal response
+(:class:`TreeHeldOperator`), kinematic free bodies a zero-response group (:class:`PrescribedRootOperator`), or one
+group per world spans its articulations (:class:`ForestHeldOperator`). :func:`decline` names why a solver's
+dynamics stay on the serial passes; :func:`install` installs the owner.
+"""
 
 import os
 
@@ -12,7 +21,8 @@ from ...sim import JointType
 from . import host_index
 from .device_proof import DeviceProof
 from .response_builds_dense import factor_warps_kernel
-from .sparse_factor import bind_operator_plan, operator_metadata
+from .response_builds_rows import sparse_factor_kernel
+from .sparse_factor import SparseData, bind_operator_plan, operator_metadata
 from .tree_kinetic_owner import TreeKineticState, kernel_switches, launch_switches, proof_runs
 from .tree_kinetic_plan import make_plan
 from .tree_kinetic_state import HeldResponse
@@ -46,66 +56,89 @@ def _diagonal_geometry(
     inverse[dof] = 1.0 / mass
 
 
-def supported(solver):
-    """Require original immediate rows and complete scalar-tree factor families."""
-    return bool(
-        solver.model.device.is_cuda
-        and not solver.model.requires_grad
-        and not solver.model.particle_count
-        and len(solver.size_groups) >= 1
-        and solver._sparse_mass_matrix_size is None
-        # The owner holds no rows, impulses or patch frames: the patch build,
-        # link, seed and finish stay on the solver pipeline around it, so it
-        # serves point and patch friction alike.
-        and solver._law_agnostic_contact_paths
-        # Split mode composes its rows from the same held factors this owner
-        # refreshes; the sparse tree owner has served split sweeps since it
-        # existed, and the dense held owner does the same.
-        and solver.pgs_mode in ("matrix_free", "split")
-        # The paired response (a 17-26 coordinate robot and one free body per
-        # world) reads the robot's held factor in the fused kernel's layout
-        # when it runs in factor coordinates, which this owner's refresh
-        # writes; its secondary lower inverse is materialized in stage 2 from
-        # the box family's factor. The register-inverse variant is not.
-        and (
-            getattr(solver, "_paired_response_primary_size", None) is None
-            or bool(getattr(solver, "_paired_factor_coordinates", False))
-        )
-        and solver.drive_mode == "augmented"
-        and solver.pgs_velocity_iterations == 0
-        # Joint velocity limits are ordinary rows over the owner's motion
-        # velocity binding (TreeKineticState.motion_velocity); they only
-        # exclude the copied-state shortcut.
-        # Prescribed (kinematic) free bodies are owned as zero-response roots;
-        # see PrescribedRootOperator. Mimic rows are ordinary matrix-free rows
-        # over the held factors this owner refreshes; they need nothing from
-        # the predictor itself.
-        and not solver._connect_count
-        and not solver._has_loop_joints
-        and solver._fk_id_cache_available
-        and solver._async_augmented_drives
+def decline(solver) -> str | None:
+    """Why the held tree does not evaluate the solver's dynamics, or ``None`` when it does.
+
+    The terms every group needs, then those of the representation the solver's data chose: the native sparse
+    factor when it admitted one, else its dense size groups. A term is read only once the earlier ones hold.
+    """
+    model = solver.model
+    if not model.device.is_cuda:
+        return "The held tree runs on CUDA."
+    if model.requires_grad:
+        return "Gradients keep the differentiable serial passes."
+    if model.particle_count:
+        return "Particles are outside the held tree."
+    sparse = solver._sparse_mass_matrix_size is not None
+    if sparse:
+        if solver._has_free_rigid_bodies:
+            return "The sparse factor's group holds no free rigid bodies."
+        if solver._mimic_count and not (
+            solver._sparse_velocity_limits and solver._mimic_valid_np is not None and np.all(solver._mimic_valid_np)
+        ):
+            return "Mimic rows on the sparse factor need its velocity-limit rows and valid mimic pairs."
+    else:
+        if not solver.size_groups:
+            return "No articulation has response coordinates."
+        # The owner holds no rows, impulses or patch frames: the patch build, link, seed and finish stay on the
+        # solver pipeline around it, so it serves point and patch friction alike.
+        if not solver._law_agnostic_contact_paths:
+            return "Contact torsion and compliance rows are outside the held tree."
+        # Split mode composes its rows from the same held factors the owner refreshes.
+        if solver.pgs_mode not in ("matrix_free", "split"):
+            return "The held tree serves the matrix-free and split modes."
+        # The paired response (a 17-26 coordinate robot and one free body per world) reads the robot's held
+        # factor in the fused kernel's layout when it runs in factor coordinates, which the owner's refresh
+        # writes; its secondary lower inverse is materialized in stage 2 from the box family's factor. The
+        # register-inverse variant is not.
+        if getattr(solver, "_paired_response_primary_size", None) is not None and not getattr(
+            solver, "_paired_factor_coordinates", False
+        ):
+            return "The paired response's register inverse is outside the held factors."
+        if solver.drive_mode != "augmented":
+            return "PhysX drive rows keep the ordinary dynamics."
+        if solver.pgs_velocity_iterations != 0:
+            return "Velocity iterations keep the ordinary dynamics."
+    if solver._connect_count or solver._has_loop_joints:
+        return "Loop closures keep the serial passes."
+    if sparse and solver._has_prescribed_response:
+        return "The sparse factor's group holds no prescribed articulations."
+    if not solver._fk_id_cache_available:
+        return "The FK/ID cache is unavailable."
+    if sparse and not (solver.pgs_mode == "matrix_free" or solver._sparse_split):
+        return "The sparse factor's group serves the matrix-free and sparse split sweeps."
+    if not (
+        solver._async_augmented_drives
         and solver._parallel_augmented_drive_topology
         and solver._articulation_dynamics_stream is not None
-        and not solver._debug_buffers_enabled
-        # Every family refreshes through the geometric small Cholesky (one lane
-        # per factor row, up to 32 coordinates) into the solver's dense factor
-        # of the same shape; a diagonal-mass size keeps its compact inverse.
-        # The solver's own factor stage must be fused into its CRBA stage for
-        # the size (warp or tiled kernel), which the owner's refresh replaces;
-        # otherwise stage 2 would refactor the held L from an unbuilt H.
-        and all(
-            size == solver._compact_diagonal_mass_size
-            or (
-                1 <= size <= 32
-                and not solver._execution_plan.use_diagonal_mass(size)
-                and (
-                    solver._crba_cholesky_warp_kernels_by_size.get(size) is not None
-                    or solver._crba_cholesky_kernels_by_size.get(size) is not None
-                )
+    ):
+        return "The held tree needs the per-coordinate drive preparation on the dynamics stream (CUDA streams)."
+    if solver._debug_buffers_enabled:
+        return "Debug buffers keep the ordinary dynamics."
+    if sparse:
+        return "The double buffer keeps the ordinary dynamics." if solver._double_buffer else None
+    # Every family refreshes through the geometric small Cholesky (one lane per factor row, up to 32
+    # coordinates) into the solver's dense factor of the same shape; a diagonal-mass size keeps its compact
+    # inverse. The solver's own factor stage must be fused into its CRBA stage for the size (warp or tiled
+    # kernel), which the owner's refresh replaces; otherwise stage 2 would refactor the held L from an
+    # unbuilt H.
+    for size in solver.size_groups:
+        if size != solver._compact_diagonal_mass_size and not (
+            1 <= size <= 32
+            and not solver._execution_plan.use_diagonal_mass(size)
+            and (
+                solver._crba_cholesky_warp_kernels_by_size.get(size) is not None
+                or solver._crba_cholesky_kernels_by_size.get(size) is not None
             )
-            for size in solver.size_groups
-        )
-    )
+        ):
+            return f"Size {size} has no fused held Cholesky family."
+    return None
+
+
+def admitted(solver) -> bool:
+    """Whether the held tree evaluates the solver's dynamics (:func:`decline`); its groups re-check it on every
+    call."""
+    return decline(solver) is None
 
 
 def _prescribed_articulations(solver):
@@ -145,6 +178,56 @@ def _coverage(solver):
         solver._compact_diagonal_mass_size,
         int(prescribed.size),
     )
+
+
+class TreeSparseOperator:
+    """Respond through the solver's native sparse factor, refreshed from the held geometry."""
+
+    def __init__(self, solver):
+        self.solver = solver
+        self.requires_body_velocity = True
+        mass = solver._sparse_mass_matrix_plan
+        n, device = mass.dof_count, solver.model.device
+        self.host = operator_metadata(mass)
+        self.plan = bind_operator_plan(solver, n, self.host)
+        self.data = SparseData()
+        self.data.W = solver._sparse_Linv
+        # The native factor publishes status instead of a second validity bit.
+        # Initial and reset mass requests are consumed before any prediction.
+        self.data.valid = wp.ones(self.plan.group_to_art.size, dtype=int, device=device)
+        self.data.status = solver._sparse_mass_matrix_status
+        self.refresh_kernel = sparse_factor_kernel(
+            n, mass.nonzero_count, warps_per_block=solver._sparse_factor_warps_per_block, geometric=True
+        )
+        self.kinetic_state = None
+
+    def refresh(self, state_aug):
+        """Read cached physical mass terms through the unchanged sparse factor."""
+        s, n = self.solver, self.solver._sparse_mass_matrix_size
+        wp.launch(
+            self.refresh_kernel,
+            dim=s.n_arts_by_size[n] * 32,
+            inputs=[
+                s.group_to_art[n],
+                s.mass_update_mask,
+                s.model.articulation_start,
+                s.articulation_dof_start,
+                s.model.joint_child,
+                state_aug.joint_S_s,
+                self.kinetic_state.geometric,
+                s.R_by_size[n],
+                1,
+                s._augmented_drive_row_by_dof,
+                s.aug_row_K,
+                s._sparse_mass_matrix_indices,
+            ],
+            outputs=[s._sparse_Linv, s._sparse_mass_matrix_status],
+            block_dim=32 * s._sparse_factor_warps_per_block,
+            device=s.model.device,
+        )
+
+    def bind_response(self):
+        """The native factor's descriptors are bound once."""
 
 
 class TreeHeldOperator:
@@ -316,7 +399,7 @@ def forest_default(solver):
 
 def forest_families(solver):
     """The per-root family sizes of the forest (0 for a prescribed root), or ``None``."""
-    if not supported(solver):
+    if not admitted(solver):
         return None
     if getattr(solver, "_scalar_branches", None) is not None:
         # Scalar branches own their size group outside any tree plan.
@@ -517,18 +600,39 @@ class ForestHeldOperator:
                 setattr(self.data, "lower" if r == 0 else f"lower{r}", self.solver.L_by_size[family])
 
 
-class MixedTreeKineticState:
-    """Compose disjoint factor-group caches with complete public-state coverage."""
+class HeldTree:
+    """Evaluate every articulation's dynamics in held groups chosen from the topology (see the module docstring).
+
+    ``admission`` (:func:`admitted` when installed) is re-checked by every group on every call.
+    """
 
     def __init__(self, solver, *, admission=None):
         self.solver = solver
+        # One read of the kernel and launch switches for every group this owner composes.
+        self.reference, self.clocked = kernel_switches()
+        skip, classify = launch_switches()
+        self.scalar = None
+        if solver._sparse_mass_matrix_size is not None:
+            # The native sparse factor: one complete group, which proves its own coverage (make_plan).
+            self.coverage = self.forest_reason = None
+            operator = TreeSparseOperator(solver)
+            group = TreeKineticState(
+                operator,
+                admission=admission,
+                reference=self.reference,
+                clocked=self.clocked,
+                skip=skip,
+                classify=classify,
+            )
+            operator.kinetic_state = group
+            self.groups = [group]
+            self.bank_compare = group.bank_compare
+            self.skip_captured_repairs = group.skip_captured_repairs
+            return
         self.coverage = _coverage(solver)
         self._dimensions = (solver.model.joint_count, solver.model.body_count, solver.model.articulation_count)
         # The coverage proof's inputs, compared on the device on notification.
         self._proof = DeviceProof(list(self._coverage_arrays()), solver.model.device)
-        # One read of the kernel and launch switches for every group this owner composes.
-        self.reference, self.clocked = kernel_switches()
-        skip, classify = launch_switches()
         # A size group of scalar branches (scalar_branches.py) is owned in place
         # of a tree group: one thread per coordinate, no tree plan.
         scalar = getattr(solver, "_scalar_branches", None)
@@ -578,7 +682,6 @@ class MixedTreeKineticState:
             )
             operator.kinetic_state = group
             self.groups.append(group)
-        self.scalar = None
         if scalar is not None:
             from .scalar_branches import ScalarBranchState  # noqa: PLC0415
 
@@ -588,8 +691,6 @@ class MixedTreeKineticState:
             # sparse-diagonal pair always leaves a tree group beside it.
             self.scalar = ScalarBranchState(solver, scalar, admission=admission)
             self.groups.append(self.scalar)
-        # The existing solver lifecycle delegates factor refresh to this binding.
-        self.sparse = self
         # Every tree group compares input banks (fixed and free roots alike) and skips
         # captured repairs unless the solver prescales velocities; see TreeKineticState.
         # Beside scalar branches, which do neither, every group validates a changed
@@ -620,19 +721,20 @@ class MixedTreeKineticState:
             # Numeric notifications cannot change ownership; see TreeKineticState.
             return False
         solver = self.solver
-        sizes = (
-            tuple(solver.size_groups),
-            tuple(sorted(solver.n_arts_by_size.items())),
-            solver._compact_diagonal_mass_size,
-        )
-        if (
-            solver.model.joint_count,
-            solver.model.body_count,
-            solver.model.articulation_count,
-        ) != self._dimensions or sizes != self.coverage[:3]:
-            raise RuntimeError("Mixed tree factor groups changed; reconstruct and recapture")
-        current = dict(self._coverage_arrays())
-        self._proof.validate(current.__getitem__, "Mixed tree factor")
+        if self.coverage is not None:
+            sizes = (
+                tuple(solver.size_groups),
+                tuple(sorted(solver.n_arts_by_size.items())),
+                solver._compact_diagonal_mass_size,
+            )
+            if (
+                solver.model.joint_count,
+                solver.model.body_count,
+                solver.model.articulation_count,
+            ) != self._dimensions or sizes != self.coverage[:3]:
+                raise RuntimeError("Mixed tree factor groups changed; reconstruct and recapture")
+            current = dict(self._coverage_arrays())
+            self._proof.validate(current.__getitem__, "Mixed tree factor")
         # Each group's plan binds the same group map it was built from.
         proven = [group.validate_model(flags) for group in self.groups]
         return bool(proven) and all(proven)
@@ -669,13 +771,43 @@ class MixedTreeKineticState:
             group.finish(state, augmented, output, dt, refresh)
 
 
-def create_owner(solver):
-    """Keep unsupported structures on their complete ordinary solver route."""
-    if not supported(solver):
-        return None
-    try:
-        owner = MixedTreeKineticState(solver, admission=supported)
-    except ValueError:
-        return None
-    solver._fk_id_cache_enabled = True
-    return owner
+def install(solver) -> None:
+    """Install the held tree as ``solver._tree_kinetic_state`` where :func:`decline` admits it, with the reason.
+
+    ``cached_dynamics='off'``, an explicit dense kernel choice and the CPU keep the serial passes. Under ``auto``,
+    ``FEATHER_PGS_TREE_KINETIC_STATE=0`` (the sparse factor's group) and ``FEATHER_PGS_MIXED_TREE_KINETIC_STATE=0``
+    (the dense groups) disable it; ``cached_dynamics='on'`` raises where it is not admitted.
+    """
+    solver._tree_kinetic_state = None
+    choice = solver.cached_dynamics
+    if solver._sparse_mass_matrix_size is not None:
+        switch, enabled = "FEATHER_PGS_TREE_KINETIC_STATE", os.environ.get("FEATHER_PGS_TREE_KINETIC_STATE", "1")
+    else:
+        switch = "FEATHER_PGS_MIXED_TREE_KINETIC_STATE"
+        enabled = os.environ.get("FEATHER_PGS_MIXED_TREE_KINETIC_STATE", "1")
+    if choice == "off":
+        reason = "Explicit cached_dynamics='off' retains ordinary dynamics."
+    elif solver._explicit_dense_kernels:
+        reason = "An explicit dense kernel choice retains ordinary dynamics."
+    elif solver.model.device.is_cpu:
+        reason = "CPU uses ordinary dynamics; cached prediction requires CUDA."
+    elif choice != "on" and enabled != "1":
+        reason = f"Disabled cache option: {switch}."
+    else:
+        reason = decline(solver)
+        if reason is None:
+            try:
+                solver._tree_kinetic_state = HeldTree(solver, admission=admitted)
+            except ValueError as error:
+                reason = f"The topology does not fit the held groups: {error}"
+        if reason is None:
+            solver._fk_id_cache_enabled = True
+            source = "Explicit cached_dynamics='on'" if choice == "on" else "Automatic cache selection"
+            reason = f"{source}: tree cache admitted for this topology, representation and state lifecycle."
+        else:
+            reason = f"Ordinary dynamics retained: {reason}"
+    solver._cached_dynamics_selection_reason = reason
+    if choice == "on" and solver._tree_kinetic_state is None:
+        raise ValueError(
+            "cached_dynamics='on' has no admitted cache for this topology, representation and solver policy"
+        )

@@ -20,9 +20,8 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
+from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton._src.solvers.feather_pgs.sparse_factor import operator_metadata
-from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
 from newton._src.solvers.feather_pgs.tree_kinetic_plan import make_plan
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.solvers import SolverFeatherPGS
@@ -289,7 +288,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                         _set_flag(model, links[2], KINEMATIC)
                         solver = _solver(model, beta, cached, pgs_mode="matrix_free")
                         if cached == "auto":
-                            self.assertIsInstance(solver._tree_kinetic_state, MixedTreeKineticState)
+                            self.assertIsInstance(solver._tree_kinetic_state, HeldTree)
                         runs[cached, bool(load.any())] = _Rollout(model, solver, links[2], load).run(40)
                     moving = runs["off", True]
                     self.assertGreater(float(np.abs(moving["joint_qd"]).max()), 0.1, "the chain keeps moving")
@@ -308,7 +307,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                     solver = case[1]
                     self.assertIsNotNone(solver._sparse_mass_matrix_size)
                     if cached == "auto":
-                        self.assertIsInstance(solver._tree_kinetic_state, TreeKineticState)
+                        self.assertEqual(solver.get_path_selection()["routes"]["held_tree"]["owner"], "tree")
                     for _ in range(40):
                         sparse_split._step(case)
                     runs[cached] = _snapshot(case[2])
@@ -331,7 +330,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                         model, body = _toggle_scene()
                         solver = _solver(model, beta, cached, pgs_mode=mode, update_mass_matrix_interval=100)
                         if cached == "auto":
-                            self.assertIsInstance(solver._tree_kinetic_state, MixedTreeKineticState)
+                            self.assertIsInstance(solver._tree_kinetic_state, HeldTree)
                         runs[cached] = self._phases(
                             model, solver, body, (DYNAMIC, KINEMATIC), load=body, wrench=wrench, steps=60
                         )
@@ -365,7 +364,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                             model, solver, body, (DYNAMIC, KINEMATIC), load=body, wrench=wrench, steps=60, graph=graph
                         )
                     replayed = runs["replayed owner"]
-                    self.assertIsInstance(solver._tree_kinetic_state, MixedTreeKineticState)
+                    self.assertIsInstance(solver._tree_kinetic_state, HeldTree)
                     self._assert_phases_close(replayed, runs["eager owner"])
                     self._assert_phases_close(replayed, runs["eager ordinary"])
                     self.assertGreater(float(replayed[1]["body_q"][body, 0]), 0.05)
@@ -418,7 +417,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                         model, links = _chain(floating=base == "floating")
                         solver = _solver(model, beta, cached, pgs_mode="matrix_free")
                         if cached == "auto":
-                            self.assertIsInstance(solver._tree_kinetic_state, MixedTreeKineticState)
+                            self.assertIsInstance(solver._tree_kinetic_state, HeldTree)
                         runs[cached] = self._phases(
                             model, solver, links[link], flags, load=links[load], wrench=wrench, steps=20
                         )
@@ -431,7 +430,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                         case = _sparse_case(beta, cached)
                         model, solver = case[0], case[1]
                         if cached == "auto":
-                            self.assertIsInstance(solver._tree_kinetic_state, TreeKineticState)
+                            self.assertEqual(solver.get_path_selection()["routes"]["held_tree"]["owner"], "tree")
                         phases = []
                         for flag in (None, *flags):
                             if flag is not None:
@@ -466,7 +465,7 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                         model, driver, struck = scene()
                         solver = _solver(model, beta, cached, pgs_mode="matrix_free")
                         if cached == "auto":
-                            self.assertIsInstance(solver._tree_kinetic_state, MixedTreeKineticState)
+                            self.assertIsInstance(solver._tree_kinetic_state, HeldTree)
                             classifier = solver._resolved_worlds_owner
                             self.assertIsNotNone(classifier, solver._resolved_worlds_reason)
                             self.assertTrue(classifier.published)

@@ -22,7 +22,7 @@ PREFIXES = ("FEATHER_PGS_", "IL_NEWTON_FPGS_")
 
 _PACKAGE = "solvers.feather_pgs."
 _SOLVER = ("solver_feather_pgs",)
-_CACHE = ("cached_dynamics",)
+_CACHE = ("held_tree",)
 
 
 def _flag(name: str, kind: FlagKind, modules: tuple[str, ...], meaning: str) -> EnvironmentFlag:
@@ -287,7 +287,7 @@ _READ = (
     (
         "FEATHER_PGS_TREE_FOREST",
         "policy",
-        ("mixed_tree_kinetic",),
+        _CACHE,
         "Held-tree groups: 1 one group per world, other values per-size groups (default by layout).",
     ),
     (

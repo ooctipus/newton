@@ -239,6 +239,7 @@ def bench_lanes(args, device):
             owner = solver._tree_kinetic_state
             if owner is None:
                 continue
+            (group,) = owner.groups
             rng = np.random.default_rng(5)
             state_in, state_out, control = model.state(), model.state(), model.control()
             state_in.joint_qd.assign(rng.uniform(-0.5, 0.5, model.joint_dof_count).astype(np.float32))
@@ -254,9 +255,9 @@ def bench_lanes(args, device):
                 "shape": shape,
                 "bodies": plan.count,
                 "dofs": plan.dof_count,
-                "lanes": owner.layout.lanes,
-                "schedules": owner.schedules.tag[1:],
-                "rule": owner.layout.lanes == rule and schedules is None,
+                "lanes": group.layout.lanes,
+                "schedules": group.schedules.tag[1:],
+                "rule": group.layout.lanes == rule and schedules is None,
             }
             finish = functools.partial(owner.finish, state_in, augmented, state_out, dt, False)
             predict = functools.partial(owner.predict, state_in, augmented, control, state_in.joint_qd, dt)

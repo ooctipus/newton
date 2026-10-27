@@ -10,7 +10,7 @@ product of a one-coordinate body projects to zero on its own axis, and the
 leaf's pose, motion axis and body velocity follow from its coordinate and the
 model frames alone. This module evaluates such a size group with one thread per
 coordinate and no tree plan, so no body or coordinate cap applies. By default the
-held-tree owner composes it in place of a tree group (``mixed_tree_kinetic.py``)
+held-tree owner composes it in place of a tree group (``held_tree.py``)
 wherever :func:`plan_scalar_branches` admits the group;
 ``FEATHER_PGS_SCALAR_BRANCHES=0`` keeps the group on a tree group or on ordinary
 dynamics:

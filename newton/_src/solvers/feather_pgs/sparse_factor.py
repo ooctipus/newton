@@ -5,9 +5,8 @@
 
 ``SparsePlan`` binds a size group's packed factor pattern, its coordinate
 permutations and articulation ownership; ``SparseData`` holds the packed factor
-values. The sparse-route and dense-route tree caches (``tree_kinetic_sparse``,
-``mixed_tree_kinetic``) fill them through :func:`operator_metadata` and
-:func:`bind_operator_plan`. The structs keep the layout the retired packed
+values. The held tree's sparse and dense operators (:mod:`.held_tree`) fill them
+through :func:`operator_metadata` and :func:`bind_operator_plan`. The structs keep the layout the retired packed
 sparse-factor route also used, so the held-tree kernels that take them keep
 their generated code; fields those owners do not bind stay empty.
 """

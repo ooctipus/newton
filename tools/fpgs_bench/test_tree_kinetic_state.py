@@ -14,11 +14,11 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import tree_kinetic_state
 from newton._src.solvers.feather_pgs import tree_scan as ts
+from newton._src.solvers.feather_pgs.held_tree import TreeSparseOperator
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import factor_indices
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_kinetic_owner import TreeKineticState
-from newton._src.solvers.feather_pgs.tree_kinetic_sparse import TreeSparseOperator
 from newton._src.solvers.feather_pgs.tree_plan import TreePlan
 from newton.tests import test_feather_pgs_sparse_split as split
 from tools.fpgs_bench.public_state_oracle import physical_mass, public_state
@@ -168,15 +168,15 @@ class TestTreePhysicalCUDA(TestTreePhysicalCPU):
         with patch.dict(os.environ):
             os.environ.pop("FEATHER_PGS_TREE_KINETIC_STATE", None)
             case = split._case(True, floating=True, branches=3, depth=2, device="cuda:0")
-            owner = case[1]._tree_kinetic_state
-            self.assertIsNotNone(owner)
+            self.assertIsNotNone(case[1]._tree_kinetic_state)
+            (owner,) = case[1]._tree_kinetic_state.groups
             self.assertEqual(owner.layout.lanes, tree_kinetic_state.held_lanes(owner.tree, owner.group_count))
             self.assertEqual(owner.block_dim, owner.layout.block)
             ordinary = split._solver(
                 case[0], True, pgs_mode="matrix_free", pgs_kernel="auto", enable_joint_velocity_limits=True
             )
             self.assertIsNotNone(ordinary._tree_kinetic_state)
-            self.assertTrue(ordinary._tree_kinetic_state.motion_velocity)
+            self.assertTrue(ordinary._tree_kinetic_state.groups[0].motion_velocity)
             self.assertTrue(ordinary._fk_id_cache_enabled)
             os.environ["FEATHER_PGS_TREE_KINETIC_STATE"] = "0"
             explicit = split._solver(case[0], True)

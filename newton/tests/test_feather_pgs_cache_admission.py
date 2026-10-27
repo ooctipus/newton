@@ -12,7 +12,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import mixed_tree_kinetic, tree_kinetic_sparse
+from newton._src.solvers.feather_pgs import held_tree
 from newton.solvers import SolverFeatherPGS
 
 # (law-agnostic, point) contact-path predicates of each contact law.
@@ -84,7 +84,7 @@ class TestSparseTreeAdmission(unittest.TestCase):
         """Admit lazy kinematics on the sparse route, where nothing defers publication."""
         for lazy in (False, True):
             with self.subTest(lazy_kinematics=lazy):
-                self.assertTrue(tree_kinetic_sparse.supported(_sparse_tree_solver(lazy_kinematics=lazy)))
+                self.assertIsNone(held_tree.decline(_sparse_tree_solver(lazy_kinematics=lazy)))
 
 
 class TestHeldTreeContactLaw(unittest.TestCase):
@@ -92,7 +92,7 @@ class TestHeldTreeContactLaw(unittest.TestCase):
         """Admit the dense held-tree owner under either friction law, but not under torsion or compliance."""
         for law, admitted in (("point", True), ("patch", True), ("torsion", False), ("compliance", False)):
             with self.subTest(law=law):
-                self.assertEqual(mixed_tree_kinetic.supported(_held_tree_solver(law)), admitted)
+                self.assertEqual(held_tree.admitted(_held_tree_solver(law)), admitted)
 
     def test_contact_law_predicates_precede_route_selection(self):
         """Define the contact-law predicates, the parallel-row one included, before sparse route selection."""

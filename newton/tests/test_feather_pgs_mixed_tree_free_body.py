@@ -12,7 +12,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import tree_kinetic_state
-from newton._src.solvers.feather_pgs.mixed_tree_kinetic import MixedTreeKineticState
+from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.feather_pgs_patch_parity import assert_history_close
 
@@ -366,7 +366,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
                 self.assertIsNone(plain_owner)
                 self.assertTrue(plain_solver._has_free_rigid_bodies)
                 owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, friction_anchor_beta=beta)
-                self.assertIsInstance(owner, MixedTreeKineticState)
+                self.assertIsInstance(owner, HeldTree)
                 self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [3, 6])
                 self.assertEqual(sorted(group.layout.bodies for group in owner.groups), [1, 4])
                 self.assertTrue(any(group.layout.root_dofs == 6 for group in owner.groups))
@@ -395,7 +395,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
                 owner_solver, owner, cached, cached_qd = _rollout(
                     model, owner=True, friction_anchor_beta=beta, pgs_mode="split"
                 )
-                self.assertIsInstance(owner, MixedTreeKineticState)
+                self.assertIsInstance(owner, HeldTree)
                 self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
                 np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
                 np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
@@ -410,7 +410,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         _plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False)
         self.assertIsNone(plain_owner)
         _owner_solver, owner, cached, cached_qd = _rollout(model, owner=True)
-        self.assertIsInstance(owner, MixedTreeKineticState)
+        self.assertIsInstance(owner, HeldTree)
         self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [4, 6])
         self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
         np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
@@ -427,7 +427,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
             _owner_solver, owner, cached, cached_qd = _rollout(model, owner=True)
         finally:
             _rollout.forest = False
-        self.assertIsInstance(owner, MixedTreeKineticState)
+        self.assertIsInstance(owner, HeldTree)
         self.assertEqual(len(owner.groups), 1)
         layout = owner.groups[0].layout
         self.assertEqual(layout.roots, (0, 4, 5))
@@ -477,7 +477,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         self.assertIn(18, plain_solver.size_groups)
         self.assertFalse(plain_solver.constraint_capacity_status()["dense"])
         _owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, rows=256)
-        self.assertIsInstance(owner, MixedTreeKineticState)
+        self.assertIsInstance(owner, HeldTree)
         self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [3, 6, 18])
         self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
         # Same physics through both routes; the walker's twenty-odd contact rows
@@ -497,7 +497,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         _plain_solver, plain_owner, plain, plain_qd = _rollout(model, owner=False, rows=256, attrs=recipe)
         self.assertIsNone(plain_owner)
         _owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, rows=256, attrs=recipe)
-        self.assertIsInstance(owner, MixedTreeKineticState)
+        self.assertIsInstance(owner, HeldTree)
         self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [3, 6, 18])
         self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
         np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=3.0e-4, rtol=0.0)
@@ -526,7 +526,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
                     )
                 finally:
                     _rollout.forest = False
-                self.assertIsInstance(owner, MixedTreeKineticState)
+                self.assertIsInstance(owner, HeldTree)
                 self.assertEqual(len(owner.groups), 1)
                 layout = owner.groups[0].layout
                 self.assertEqual(layout.roots, (0, 4))
@@ -562,7 +562,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
                 owner_solver, owner, cached, cached_qd = _rollout(
                     model, owner=True, friction_anchor_beta=beta, scalar=True
                 )
-                self.assertIsInstance(owner, MixedTreeKineticState)
+                self.assertIsInstance(owner, HeldTree)
                 self.assertIsInstance(owner.scalar, ScalarBranchState)
                 self.assertIs(owner_solver._scalar_branches, owner.scalar.plan)
                 self.assertEqual([group.sparse.size for group in owner.groups], [3, 2])
@@ -595,7 +595,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
                 owner_solver, owner, cached, cached_qd = _rollout(
                     model, owner=True, friction_anchor_beta=beta, attrs=recipe
                 )
-                self.assertIsInstance(owner, MixedTreeKineticState)
+                self.assertIsInstance(owner, HeldTree)
                 self.assertFalse(owner.bank_compare)
                 self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
                 np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
@@ -614,7 +614,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         self.assertEqual(plain_solver._paired_response_primary_size, 17)
         self.assertTrue(plain_solver._paired_factor_coordinates)
         owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, rows=192, swing_stride=17)
-        self.assertIsInstance(owner, MixedTreeKineticState)
+        self.assertIsInstance(owner, HeldTree)
         self.assertEqual(owner_solver._paired_response_primary_size, 17)
         self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [6, 17])
         self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
@@ -637,7 +637,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
                 owner_solver, owner, cached, cached_qd = _rollout(
                     model, owner=True, friction_anchor_beta=beta, swing_joint=1
                 )
-                self.assertIsInstance(owner, MixedTreeKineticState)
+                self.assertIsInstance(owner, HeldTree)
                 self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
                 np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
                 np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
@@ -657,7 +657,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
                 self.assertIsNone(plain_owner)
                 self.assertTrue(plain_solver._has_prescribed_response)
                 owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, friction_anchor_beta=beta)
-                self.assertIsInstance(owner, MixedTreeKineticState)
+                self.assertIsInstance(owner, HeldTree)
                 self.assertEqual(sorted(group.layout.dofs for group in owner.groups), [3, 6, 6])
                 self.assertTrue(any(getattr(group.sparse, "prescribed", False) for group in owner.groups))
                 # Lane widths follow from each group's tree (tree_kinetic_state.held_lanes); every block is whole.
@@ -717,7 +717,7 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         (model, _plain_solver, plain_owner, plain, plain_qd) = rollouts[0]
         (_, owner_solver, owner, cached, cached_qd) = rollouts[1]
         self.assertIsNone(plain_owner)
-        self.assertIsInstance(owner, MixedTreeKineticState)
+        self.assertIsInstance(owner, HeldTree)
         self.assertIs(owner_solver._tree_kinetic_state, owner)
         self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
         np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
@@ -814,7 +814,7 @@ class TestFeatherPGSMixedTreeFrames(unittest.TestCase):
         joint = newton.ModelFlags.JOINT_PROPERTIES
         model = _build(wp.get_device("cpu"), worlds=2)
         solver = SolverFeatherPGS(model, pgs_mode="split", friction_anchor_beta=0.0)
-        owner = MixedTreeKineticState(solver)
+        owner = HeldTree(solver)
         self.assertTrue(owner.groups)
         roots = _fixed_root_joints(model)
         self.assertEqual(len(roots), model.world_count)
