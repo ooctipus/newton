@@ -270,7 +270,7 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
 #pragma unroll
                     for (int f = 0; f < 5; ++f) metric[f] = slot_metric.data[unit_slot * {5 * M_MF} + p + f * {M_MF}];
 #pragma unroll
-                    for (int r = 0; r < 3; ++r) {{
+                    for (int r = 0; r < 2; ++r) {{
                         if (r >= rows) break;
                         // One pass of the row law; its `continue` leaves the row.
                         for (int once = 0; once < 1; ++once) {{
@@ -286,6 +286,9 @@ def _colored_units(free: FreeBodyRows, laws: RowLaws, M_MF: int) -> str:
 {visit}
                         }}
                     }}
+                    // The pair's second tangent: the first's visit solved it; only the delayed-friction gate holds it.
+                    if (rows == 3 && ProjectionLaw::friction_gate(W[2 * 3 + 2] & 0xFFFF, global_iter, friction_start_iteration))
+                        s_lam_mf[unit_row + 2] = 0.0f;
                 }}
                 __syncthreads();
             }}"""
