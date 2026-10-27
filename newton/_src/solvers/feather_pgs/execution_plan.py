@@ -7,50 +7,17 @@ These construction-time rules describe storage feasibility and existing routing.
 They do not change the numerical method, row capacity, or iteration budget.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import NamedTuple
 
+from .staging import Staging
+
 _MFGS_RESIDENT_METADATA_MAX_BYTES = 4096
-_MFGS_TILE_SHARED_STORAGE_BYTES = 128
+"""Row metadata a matrix-free sweep keeps resident at most [B]: larger working sets cost more occupancy than their
+repeated global loads (one 4-KiB set)."""
 # Static shared memory a block may declare to keep its packed row metadata resident [B].
 _MFGS_STATIC_SHARED_MAX_BYTES = 48 * 1024
-
-
-class _MFGSMetadataFootprint(NamedTuple):
-    """Shared memory of resident MF-GS row metadata and the decision it implies [B].
-
-    ``metadata_bytes`` counts the per-row metadata arrays; ``total_bytes`` is what
-    the block would declare with them resident (tile storage, world velocity,
-    dense and MF impulses and metadata). ``resident`` applies the compact-shape
-    rule of :func:`_mfgs_metadata_footprint` to both.
-    """
-
-    resident: bool
-    metadata_bytes: int
-    total_bytes: int
-
-
-def _mfgs_metadata_footprint(
-    max_constraints: int,
-    mf_max_constraints: int,
-    max_world_dofs: int,
-    max_shared_memory: int,
-    *,
-    has_drive_rows: bool,
-    fuse_vel_limits: bool,
-) -> _MFGSMetadataFootprint:
-    """Measure resident MF-GS metadata and decide whether compact solver shapes keep it.
-
-    Resident row metadata removes repeated global loads across PGS iterations,
-    but larger shapes lose more throughput from the resulting occupancy drop.
-    Keep at most one 4-KiB metadata working set resident and stream larger sets.
-    """
-    metadata_arrays = 4 + 4 * int(has_drive_rows) + int(fuse_vel_limits)
-    metadata_bytes = 4 * max_constraints * metadata_arrays
-    base_shared_bytes = 4 * (max_world_dofs + max_constraints + mf_max_constraints)
-    total_bytes = _MFGS_TILE_SHARED_STORAGE_BYTES + base_shared_bytes + metadata_bytes
-    resident = metadata_bytes <= _MFGS_RESIDENT_METADATA_MAX_BYTES and total_bytes <= max_shared_memory
-    return _MFGSMetadataFootprint(resident, metadata_bytes, total_bytes)
 
 
 class _MFGSStorage(NamedTuple):
@@ -69,86 +36,73 @@ class _MFGSStorage(NamedTuple):
 
 
 def _select_mfgs_storage(
-    max_constraints: int,
-    mf_max_constraints: int,
-    max_world_dofs: int,
-    max_shared_memory: int,
+    staging: Callable[..., Staging],
+    budget: int,
     *,
-    has_drive_rows: bool,
-    fuse_vel_limits: bool,
     block_count: int,
     sm_count: int,
     force_stream_mf_impulses: bool = False,
 ) -> _MFGSStorage:
     """Select metadata and impulse storage without changing row capacity or order.
 
-    Stream MF impulses only when they cannot fit alongside the shared world
-    velocity and dense state. This is a construction-time capacity fallback,
-    not a claim that global storage is faster for resident-sized workloads.
-    ``force_stream_mf_impulses`` streams them regardless, as the solver's
-    ``FEATHER_PGS_MFGS_STREAM_LAMBDA`` reference override requests; the
-    row-metadata budget below then counts them as streamed.
+    ``staging(shared_metadata=, resident_row_metadata=, stream_mf_impulses=)`` is the sweep block's own declaration
+    (``sweep_routes.mf_gs_staging``) and ``budget`` the device's static shared memory per block
+    (:func:`.staging.static_budget`): every choice below is a fit of the declared working set, not a mirrored count.
 
-    Streamed metadata keeps the packed dense row types and parents resident
-    when the launch grid of ``block_count`` blocks holds at most one block per
-    SM, so their ``4 * max_constraints`` bytes cannot cost concurrency, and the
-    block then declares at most 48 KiB of static shared memory. The sweep reads
-    them on every row and along every patch ring, as chains of dependent loads.
-    Both storage classes hold identical values, so results are bitwise
-    identical.
+    Row metadata stays resident when it takes at most :data:`_MFGS_RESIDENT_METADATA_MAX_BYTES` and the block fits.
+    MF impulses stream only when they cannot fit alongside the world velocity and the dense state (a capacity
+    choice, not a claim that global storage is faster), or on ``force_stream_mf_impulses`` (the solver's
+    ``FEATHER_PGS_MFGS_STREAM_LAMBDA`` reference override). Streamed metadata keeps the packed dense row types and
+    parents resident when the launch grid of ``block_count`` blocks holds at most one block per SM, so they cannot
+    cost concurrency, and the block then declares at most :data:`_MFGS_STATIC_SHARED_MAX_BYTES`. Both storage
+    classes hold identical values, so results are bitwise identical.
     """
-    footprint = _mfgs_metadata_footprint(
-        max_constraints,
-        mf_max_constraints,
-        max_world_dofs,
-        max_shared_memory,
-        has_drive_rows=has_drive_rows,
-        fuse_vel_limits=fuse_vel_limits,
-    )
-    shared_metadata = footprint.resident
+    resident = staging(shared_metadata=True, resident_row_metadata=False, stream_mf_impulses=False)
+    streamed = staging(shared_metadata=False, resident_row_metadata=False, stream_mf_impulses=False)
+    metadata_bytes = resident.bytes - streamed.bytes
     metadata_budget = _MFGS_RESIDENT_METADATA_MAX_BYTES
+    shared_metadata = metadata_bytes <= metadata_budget and resident.fits(budget)
     if shared_metadata:
-        reason = f"Row metadata is resident: {footprint.metadata_bytes} bytes fit the {metadata_budget}-byte budget."
-    elif footprint.metadata_bytes > metadata_budget:
-        reason = f"Row metadata streams: {footprint.metadata_bytes} bytes exceed the {metadata_budget}-byte budget."
+        reason = f"Row metadata is resident: {metadata_bytes} bytes fit the {metadata_budget}-byte budget."
+    elif metadata_bytes > metadata_budget:
+        reason = f"Row metadata streams: {metadata_bytes} bytes exceed the {metadata_budget}-byte budget."
     else:
         reason = (
-            f"Row metadata streams: resident, the block would need {footprint.total_bytes} bytes of shared memory; "
-            f"the device exposes {max_shared_memory}."
+            f"Row metadata streams: resident, the block would declare {resident.bytes} bytes of static shared "
+            f"memory; the device's budget is {budget}."
         )
-    metadata_bytes = footprint.metadata_bytes if shared_metadata else 0
-    fixed_bytes = _MFGS_TILE_SHARED_STORAGE_BYTES + 4 * (max_world_dofs + max_constraints) + metadata_bytes
-    if fixed_bytes > max_shared_memory:
+    fixed = staging(shared_metadata=shared_metadata, resident_row_metadata=False, stream_mf_impulses=True)
+    if not fixed.fits(budget):
         raise ValueError(
-            f"MF-GS world velocity and dense state require {fixed_bytes} bytes of shared memory "
-            f"even with streamed MF impulses, but the device exposes {max_shared_memory} bytes"
+            f"MF-GS world velocity and dense state require {fixed.bytes} bytes of static shared memory even with "
+            f"streamed MF impulses, but the device's budget is {budget} bytes"
         )
-    impulse_bytes = fixed_bytes + 4 * mf_max_constraints
-    stream_mf_impulses = impulse_bytes > max_shared_memory
+    with_impulses = staging(shared_metadata=shared_metadata, resident_row_metadata=False, stream_mf_impulses=False)
+    stream_mf_impulses = not with_impulses.fits(budget)
     if stream_mf_impulses:
-        reason += f" MF impulses stream: {impulse_bytes} bytes exceed the device's {max_shared_memory}."
+        reason += f" MF impulses stream: {with_impulses.bytes} bytes exceed the device's {budget}."
     elif force_stream_mf_impulses:
         stream_mf_impulses = True
         reason += " MF impulses stream on request (FEATHER_PGS_MFGS_STREAM_LAMBDA)."
     resident_row_metadata = False
     if not shared_metadata:
-        static_bytes = fixed_bytes + 4 * max_constraints + (0 if stream_mf_impulses else 4 * mf_max_constraints)
-        budget = min(_MFGS_STATIC_SHARED_MAX_BYTES, max_shared_memory)
+        candidate = staging(shared_metadata=False, resident_row_metadata=True, stream_mf_impulses=stream_mf_impulses)
+        limit = min(_MFGS_STATIC_SHARED_MAX_BYTES, budget)
         if block_count > sm_count:
             reason += (
                 f" Row types and parents stream too: the {block_count}-block grid exceeds one block per SM "
                 f"({sm_count} SMs)."
             )
-        elif static_bytes > budget:
+        elif not candidate.fits(limit):
             reason += (
-                f" Row types and parents stream too: resident, the block would declare {static_bytes} bytes of "
-                f"static shared memory, over the {budget}-byte budget."
+                f" Row types and parents stream too: resident, the block would declare {candidate.bytes} bytes of "
+                f"static shared memory, over the {limit}-byte budget."
             )
         else:
             resident_row_metadata = True
             reason += (
                 f" Row types and parents stay resident: the {block_count}-block grid fits one block per SM "
-                f"({sm_count} SMs) and the block declares {static_bytes} <= {budget} bytes of static shared memory."
+                f"({sm_count} SMs) and the block declares {candidate.bytes} <= {limit} bytes of static shared memory."
             )
     return _MFGSStorage(shared_metadata, stream_mf_impulses, resident_row_metadata, reason)
 

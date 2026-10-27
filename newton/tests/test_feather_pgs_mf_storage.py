@@ -3,6 +3,7 @@
 
 """Check capacity-safe storage selection without changing the MF-GS schedule."""
 
+import functools
 import inspect
 import itertools
 import os
@@ -207,92 +208,98 @@ def _replay_rewrite(source: wp.array[float], velocity: wp.array[float]):
     velocity[i] = velocity[i] - 3.0
 
 
+def _storage(shape, budget, *, block_count=16384, sm_count=188, has_drive_rows=False, fuse_vel_limits=False, **request):
+    """The storage selection of a sweep of ``shape`` (rows, free-body rows, coordinates) under a static ``budget``."""
+    staging = functools.partial(
+        sweep_routes.mf_gs_staging, *shape, has_drive_rows=has_drive_rows, fuse_vel_limits=fuse_vel_limits
+    )
+    return execution_plan._select_mfgs_storage(staging, budget, block_count=block_count, sm_count=sm_count, **request)
+
+
 class TestFeatherPGSMFStorage(unittest.TestCase):
     def test_hardware_capacity_streams_only_when_required(self):
         """Preserve all hardware rows when resident impulses exceed the device limit."""
-        options = {"has_drive_rows": False, "fuse_vel_limits": False, "block_count": 16384, "sm_count": 188}
-        self.assertEqual(fpgs._select_mfgs_storage(256, 37248, 1551, 101376, **options)[:2], (False, True))
-        self.assertEqual(fpgs._select_mfgs_storage(256, 37248, 1551, 232448, **options)[:2], (True, False))
-        self.assertEqual(fpgs._select_mfgs_storage(256, 15984, 3135, 101376, **options)[:2], (True, False))
+        self.assertEqual(_storage((256, 37248, 1551), 100352)[:2], (False, True))
+        self.assertEqual(_storage((256, 37248, 1551), 231424)[:2], (True, False))
+        self.assertEqual(_storage((256, 15984, 3135), 100352)[:2], (True, False))
 
     def test_storage_boundary_and_remaining_state(self):
         """Include tile storage and reject an unrepresentable velocity working set."""
-        options = {"has_drive_rows": False, "fuse_vel_limits": False, "block_count": 16384, "sm_count": 188}
         # Four streamed metadata arrays leave velocities and two impulse arrays.
         required = 128 + 4 * (29 + 1024 + 4096)
-        self.assertEqual(fpgs._select_mfgs_storage(1024, 4096, 29, required, **options)[:2], (False, False))
-        self.assertEqual(fpgs._select_mfgs_storage(1024, 4096, 29, required - 1, **options)[:2], (False, True))
+        self.assertEqual(_storage((1024, 4096, 29), required)[:2], (False, False))
+        self.assertEqual(_storage((1024, 4096, 29), required - 1)[:2], (False, True))
         with self.assertRaisesRegex(ValueError, "MF-GS.*shared memory"):
-            fpgs._select_mfgs_storage(256, 37248, 26000, 101376, **options)
+            _storage((256, 37248, 26000), 100352)
 
     def test_metadata_reasons_report_the_footprint_they_compared(self):
         """Report the metadata and block bytes the residency decision compared, for each outcome."""
         options = {"has_drive_rows": False, "fuse_vel_limits": False}
-        launch = {"block_count": 16384, "sm_count": 188}
         cases = (
-            ((192, 64, 29), 101376, "Row metadata is resident: {metadata} bytes fit the 4096-byte budget."),
-            ((1024, 4096, 604), 101376, "Row metadata streams: {metadata} bytes exceed the 4096-byte budget."),
-            ((192, 64, 29), 4096, "the block would need {total} bytes of shared memory; the device exposes 4096."),
+            ((192, 64, 29), 100352, True, "Row metadata is resident: {metadata} bytes fit the 4096-byte budget."),
+            ((1024, 4096, 604), 100352, False, "Row metadata streams: {metadata} bytes exceed the 4096-byte budget."),
+            (
+                (192, 64, 29),
+                4096,
+                False,
+                "the block would declare {total} bytes of static shared memory; the device's budget is 4096.",
+            ),
         )
-        for shape, shared_memory, text in cases:
-            with self.subTest(shape=shape, shared_memory=shared_memory):
-                footprint = execution_plan._mfgs_metadata_footprint(*shape, shared_memory, **options)
-                storage = fpgs._select_mfgs_storage(*shape, shared_memory, **options, **launch)
-                self.assertEqual(storage.shared_metadata, footprint.resident)
-                self.assertIn(
-                    text.format(metadata=footprint.metadata_bytes, total=footprint.total_bytes), storage.reason
-                )
+        for shape, budget, resident, text in cases:
+            with self.subTest(shape=shape, budget=budget):
+                total = sweep_routes.mf_gs_staging(*shape, **options).bytes
+                metadata = total - sweep_routes.mf_gs_staging(*shape, shared_metadata=False, **options).bytes
+                storage = _storage(shape, budget)
+                self.assertEqual(storage.shared_metadata, resident)
+                self.assertIn(text.format(metadata=metadata, total=total), storage.reason)
 
     def test_single_wave_launches_keep_row_types_and_parents_resident(self):
         """Keep packed row metadata resident only for grids of one block per SM within 48 KiB of static memory."""
-        options = {"has_drive_rows": False, "fuse_vel_limits": False}
 
-        def select(shape, shared_memory, blocks, sms=188, **request):
-            return fpgs._select_mfgs_storage(
-                *shape, shared_memory, **options, block_count=blocks, sm_count=sms, **request
-            )
+        def select(shape, budget, blocks, sms=188, **request):
+            return _storage(shape, budget, block_count=blocks, sm_count=sms, **request)
 
         large = (2304, 2304, 75)
         # 128 worlds, one block each, on 188 SMs: velocities, dense and MF impulses and the packed
         # row metadata take 128 + 4 * (75 + 3 * 2304) = 28076 bytes; the float metadata streams.
-        storage = select(large, 101376, 128)
+        storage = select(large, 100352, 128)
         self.assertEqual(storage[:3], (False, False, True))
         self.assertIn("28076 <= 49152 bytes", storage.reason)
-        self.assertEqual(select(large, 232448, 128)[:3], (False, False, True))
+        self.assertEqual(select(large, 231424, 128)[:3], (False, False, True))
         # A grid of one block per SM is the largest that cannot lose concurrency to the extra bytes.
-        self.assertTrue(select(large, 101376, 188).resident_row_metadata)
+        self.assertTrue(select(large, 100352, 188).resident_row_metadata)
         for blocks in (189, 16384):
             with self.subTest(blocks=blocks):
-                storage = select(large, 101376, blocks)
+                storage = select(large, 100352, blocks)
                 self.assertEqual(storage[:3], (False, False, False))
                 self.assertIn(f"{blocks}-block grid exceeds one block per SM (188 SMs)", storage.reason)
         # 48 KiB of static shared memory: 128 + 4 * (5344 + 2 * 2304 + 2304) bytes is exactly the budget.
-        self.assertTrue(select((2304, 2304, 5344), 101376, 128).resident_row_metadata)
-        storage = select((2304, 2304, 5345), 101376, 128)
+        self.assertTrue(select((2304, 2304, 5344), 100352, 128).resident_row_metadata)
+        storage = select((2304, 2304, 5345), 100352, 128)
         self.assertFalse(storage.resident_row_metadata)
         self.assertIn("49156 bytes of static shared memory, over the 49152-byte budget", storage.reason)
         # A device that exposes less than 48 KiB sets the budget.
         self.assertTrue(select(large, 28076, 128).resident_row_metadata)
         self.assertFalse(select(large, 28075, 128).resident_row_metadata)
         # Streamed MF impulses leave room: 128 + 4 * (1551 + 2 * 256) = 8380 bytes.
-        storage = select((256, 37248, 1551), 101376, 32)
+        storage = select((256, 37248, 1551), 100352, 32)
         self.assertEqual(storage[:3], (False, True, True))
         self.assertIn("8380 <= 49152", storage.reason)
         # Resident MF impulses do not: 22528 of them hold the block at 98492 bytes.
-        self.assertEqual(select((256, 22528, 1551), 101376, 32)[:3], (False, False, False))
+        self.assertEqual(select((256, 22528, 1551), 100352, 32)[:3], (False, False, False))
         # Streaming them on request takes their bytes out of the block before the budget is checked.
-        storage = select((256, 22528, 1551), 101376, 32, force_stream_mf_impulses=True)
+        storage = select((256, 22528, 1551), 100352, 32, force_stream_mf_impulses=True)
         self.assertEqual(storage[:3], (False, True, True))
         self.assertIn("MF impulses stream on request (FEATHER_PGS_MFGS_STREAM_LAMBDA)", storage.reason)
         self.assertIn("8380 <= 49152", storage.reason)
         # The request changes nothing where capacity streams them already, or where nothing is resident to free.
         for shape, blocks in (((256, 37248, 1551), 32), ((2304, 2304, 75), 16384)):
             with self.subTest(shape=shape, blocks=blocks):
-                requested = select(shape, 101376, blocks, force_stream_mf_impulses=True)
+                requested = select(shape, 100352, blocks, force_stream_mf_impulses=True)
                 self.assertTrue(requested.stream_mf_impulses)
-                self.assertEqual(requested.resident_row_metadata, select(shape, 101376, blocks).resident_row_metadata)
+                self.assertEqual(requested.resident_row_metadata, select(shape, 100352, blocks).resident_row_metadata)
         # Resident metadata already holds the packed rows.
-        storage = select((192, 64, 22), 101376, 16384)
+        storage = select((192, 64, 22), 100352, 16384)
         self.assertEqual(storage[:3], (True, False, False))
         self.assertIn("Row metadata is resident", storage.reason)
 

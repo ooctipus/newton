@@ -15,6 +15,7 @@
 
 import copy
 import dataclasses
+import functools
 import math
 import os
 import sys
@@ -62,6 +63,7 @@ from . import (
     sweep_routes_sparse,
     sweep_routes_split,
     sweep_routes_tiers,
+    sweep_units,
 )
 from . import row_metadata as _row_metadata
 from .body_mapping import build_body_maps
@@ -890,10 +892,8 @@ _mf_parent_expression = _row_metadata._mf_parent_expression
 
 # Retain internal imports while launch-resource policy has one implementation.
 _MFGS_RESIDENT_METADATA_MAX_BYTES = _execution_plan._MFGS_RESIDENT_METADATA_MAX_BYTES
-_MFGS_TILE_SHARED_STORAGE_BYTES = _execution_plan._MFGS_TILE_SHARED_STORAGE_BYTES
 _HINV_JT_MAX_CHUNK_SIZE = _execution_plan._HINV_JT_MAX_CHUNK_SIZE
 _MFGSStorage = _execution_plan._MFGSStorage
-_select_mfgs_storage = _execution_plan._select_mfgs_storage
 _align_shared_memory = _execution_plan._align_shared_memory
 _estimate_cholesky_shared_memory = _execution_plan._estimate_cholesky_shared_memory
 _estimate_hinv_jt_shared_memory = _execution_plan._estimate_hinv_jt_shared_memory
@@ -6052,6 +6052,9 @@ class SolverFeatherPGS(SolverBase):
             else None
         )
         self._pgs_solve_mf_gs_kernel = None
+        # The colored mapping of the matrix-free sweep and its units, when a world can take it.
+        self._pgs_solve_mf_colored_kernel = None
+        self._colored_units = None
         # Storage classes of the MF-GS kernel (_MFGSStorage); recorded by get_path_selection().
         self._mfgs_storage = None
         # Blocks of every MF-GS sweep launch: one per world, or the general-world queue's grid. The
@@ -6093,13 +6096,16 @@ class SolverFeatherPGS(SolverBase):
                 False, force_stream_mf_impulses, False, "Without CUDA no shared-memory storage applies."
             )
             if model.device.is_cuda:
-                storage = _select_mfgs_storage(
-                    self.dense_max_constraints,
-                    self.mf_max_constraints,
-                    self.max_world_dofs,
-                    int(model.device.max_shared_memory_per_block),
-                    has_drive_rows=has_drive_rows,
-                    fuse_vel_limits=self.fuse_joint_velocity_limits,
+                storage = _execution_plan._select_mfgs_storage(
+                    functools.partial(
+                        sweep_routes.mf_gs_staging,
+                        self.dense_max_constraints,
+                        self.mf_max_constraints,
+                        self.max_world_dofs,
+                        has_drive_rows=has_drive_rows,
+                        fuse_vel_limits=self.fuse_joint_velocity_limits,
+                    ),
+                    arch_budget(device_arch),
                     block_count=self._mf_gs_block_count,
                     sm_count=int(model.device.sm_count),
                     force_stream_mf_impulses=force_stream_mf_impulses,
@@ -6130,27 +6136,52 @@ class SolverFeatherPGS(SolverBase):
                 )
                 parallel_rows -= parallel_rows % 4
                 incremental_rows = 0
+            # The colored mapping takes the worlds with many free-body contact rows (sweep_routes.COLORED_ROWS):
+            # built when the row capacity admits one such world, it runs beside the one-warp mapping.
+            colored_rows = (
+                sweep_routes.COLORED_ROWS
+                if model.device.is_cuda and self.mf_max_constraints >= sweep_routes.COLORED_ROWS
+                else 0
+            )
+            mf_gs_options = {
+                "has_drive_rows": has_drive_rows,
+                "has_dense_velocity_limit_rows": self.enable_joint_velocity_limits,
+                "fuse_vel_limits": self.fuse_joint_velocity_limits,
+                "shared_metadata": storage.shared_metadata,
+                "resident_row_metadata": storage.resident_row_metadata,
+                "stream_mf_impulses": storage.stream_mf_impulses,
+                "skip_local_internal_worlds": self._local_internal_fast_path,
+                "local_internal_max_constraints": self._dense_internal_max_rows,
+                "contact_torsion": self._contact_torsion_enabled,
+                "factor_coordinates": self._paired_factor_coordinates,
+                "skip_incremental_rows": max(incremental_rows, parallel_rows),
+                "independent_components": self._paired_components is not None,
+                "colored_rows": colored_rows,
+            }
+            mf_gs_shape = (self.dense_max_constraints, self.mf_max_constraints, self.max_world_dofs, device_arch)
             self._pgs_solve_mf_gs_kernel = self._sweep_kernel(
                 "mf_gs",
                 sweep_routes.mf_gs_kernel,
-                self.dense_max_constraints,
-                self.mf_max_constraints,
-                self.max_world_dofs,
-                device_arch,
-                has_drive_rows=has_drive_rows,
-                has_dense_velocity_limit_rows=self.enable_joint_velocity_limits,
-                fuse_vel_limits=self.fuse_joint_velocity_limits,
-                shared_metadata=storage.shared_metadata,
-                resident_row_metadata=storage.resident_row_metadata,
-                stream_mf_impulses=storage.stream_mf_impulses,
-                skip_local_internal_worlds=self._local_internal_fast_path,
-                local_internal_max_constraints=self._dense_internal_max_rows,
-                contact_torsion=self._contact_torsion_enabled,
-                factor_coordinates=self._paired_factor_coordinates,
-                skip_incremental_rows=max(incremental_rows, parallel_rows),
-                independent_components=self._paired_components is not None,
+                *mf_gs_shape,
                 velocity_limit_law=self._velocity_limit_kernel_law(),
+                **mf_gs_options,
             )
+            if colored_rows > 0:
+                self._colored_units = sweep_units.ColoredUnits(
+                    self.world_count,
+                    self.mf_max_constraints,
+                    self.max_world_dofs,
+                    model.device,
+                    min_rows=colored_rows,
+                )
+                self._pgs_solve_mf_colored_kernel = self._sweep_kernel(
+                    "mf_colored",
+                    sweep_routes.mf_gs_kernel,
+                    *mf_gs_shape,
+                    mapping="colored",
+                    velocity_limit_law=self._velocity_limit_kernel_law(),
+                    **mf_gs_options,
+                )
             self._mf_gs_tiers = []
             self._ink_sizes = self._build_inkernel_response_meta() if (parallel_rows > 0 and _INK_ON) else None
             self._ink_rows = int(parallel_rows)
@@ -6423,6 +6454,19 @@ class SolverFeatherPGS(SolverBase):
             block_dim=32,
             device=self.model.device,
         )
+        if self._colored_units is not None:
+            # The colored worlds' units and colors follow the rows the pack just published.
+            self._colored_units.build(
+                self.mf_constraint_count,
+                self.mf_contact_rows_end,
+                self.mf_meta_packed,
+                self.mf_J_a,
+                self.mf_J_b,
+                self.mf_MiJt_a,
+                self.mf_MiJt_b,
+                self.mf_row_mu,
+                self.mf_row_w,
+            )
 
     def _launch_local_internal_solve(
         self,
@@ -6852,6 +6896,7 @@ class SolverFeatherPGS(SolverBase):
                 sweeps = list(getattr(self, "_mf_gs_tiers", ()))
                 if mf_gs_kernel is not None:
                     sweeps.append(SweepTier(mf_gs_kernel))
+                colored_kernel = self._pgs_solve_mf_colored_kernel
                 for sweep in sweeps:
                     inputs = mf_gs_inputs
                     dim = general_block_count
@@ -6875,6 +6920,16 @@ class SolverFeatherPGS(SolverBase):
                         inputs=inputs,
                         outputs=[self.v_out, *self._solve_readout.operands(sweep.kernel)],
                         block_dim=sweep.block_dim,
+                        device=self.model.device,
+                    )
+                if colored_kernel is not None:
+                    # The worlds with many free-body contact rows: a block each, a color's units at once.
+                    wp.launch_tiled(
+                        colored_kernel,
+                        dim=[general_block_count],
+                        inputs=[*mf_gs_inputs, *self._colored_units.operands()],
+                        outputs=[self.v_out, *self._solve_readout.operands(colored_kernel)],
+                        block_dim=sweep_routes.COLORED_THREADS,
                         device=self.model.device,
                     )
             if factor_stream is not None:

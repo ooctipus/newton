@@ -83,7 +83,12 @@ Reference and tolerances
     period two) from it and, on CUDA, of a repeat of the run at ``N`` (atomic
     allocation varies the row order; scenes whose support is statically
     indeterminate sort their contacts instead), sets every route's trajectory
-    tolerance:
+    tolerance. A statically indeterminate support also turns rounding into a
+    different motion (the box stack's patch reference ends 1.6e-3 m/s from
+    itself with its time step one float32 ulp longer, three times the bound its
+    convergence alone sets), so such a scene's spread includes the run at ``N``
+    with the time step one ulp longer and shorter: a route's arithmetic differs
+    from the reference's by rounding at least:
     ``4 x spread + float32 floor`` in body position, rotation, velocity and
     angular velocity, over the run and at its end (a pose at rest under static
     friction is one of a continuum, so the end pose takes the run's spread). A
@@ -1080,6 +1085,13 @@ def reference(physics: Physics, route: Route, device) -> Reference:
     if wp.get_device(device).is_cuda:
         repeat = run_physics(physics, dataclasses.replace(route, name=f"{route.name}_repeat"), device)
         spread = np.maximum(spread, distance(repeat, budget).as_array())
+    if physics.scene.deterministic_contacts:
+        # The support's rounding sensitivity: the run at N with the time step one float32 ulp off either way.
+        for toward in (np.inf, -np.inf):
+            dt = float(np.nextafter(np.float32(physics.scene.dt), np.float32(toward)))
+            nudged = dataclasses.replace(physics, scene=dataclasses.replace(physics.scene, dt=dt))
+            rounding = run_physics(nudged, dataclasses.replace(route, name=f"{route.name}_dt{dt!r}"), device)
+            spread = np.maximum(spread, distance(rounding, budget).as_array())
     # A pose at rest under static friction is one of a continuum: a perturbation of the transient leaves an offset
     # of its own size, so the end pose is held to the transient's spread. A rest velocity is unique (zero).
     fields = Distance.FIELDS

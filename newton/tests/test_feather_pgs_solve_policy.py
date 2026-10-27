@@ -816,6 +816,7 @@ def _sweep_record(**fields):
             "sparse_diagonal",
             "paired_factor",
             "free_body_matrix_free",
+            "mf_colored",
             "tiers",
             "local",
             "dense",

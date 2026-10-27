@@ -309,6 +309,7 @@ def sweep_exit(
     iteration: str = "iteration",
     iterations: str = "iterations",
     lane: str = "lane",
+    argmax: str = "ARGMAX",
     indent: str = "        ",
 ) -> str:
     """Return the end-of-sweep exit of a native Gauss-Seidel sweep.
@@ -334,6 +335,8 @@ def sweep_exit(
         iteration: Zero-based sweep index within this launch.
         iterations: Sweep budget of this launch.
         lane: Lane index within the world's lanes; the trace reduces over the sweep's lane group.
+        argmax: The reduction that takes the trace's largest change and its row kind over the world's lanes
+            (``ARGMAX(value, kind)``; a block of several warps names its own).
         indent: Indentation of the emitted statements.
     """
     if policy.exact and not policy.counts:
@@ -363,7 +366,7 @@ def sweep_exit(
     lines += [
         f"{inner}float sweep_change = solve_trace_max;",
         f"{inner}int sweep_kind = solve_trace_kind;",
-        f"{inner}ARGMAX(sweep_change, sweep_kind);",
+        f"{inner}{argmax}(sweep_change, sweep_kind);",
         f"{inner}solve_trace_max = 0.0f;",
         f"{inner}solve_trace_kind = -1;",
     ]

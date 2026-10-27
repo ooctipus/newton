@@ -20,7 +20,7 @@ import numpy as np
 
 from ...core.live_sort import SLOT_BITS
 from ...sim.contacts import CAPACITY_BLOCKS_PER_SM
-from . import response_builds_rows, sweep_routes_split
+from . import response_builds_rows, sweep_routes, sweep_routes_split
 from .conditioning import DEEP_CHAIN_JOINTS
 from .contact_row_plan import contact_row_plan
 
@@ -742,6 +742,7 @@ def _sweep(solver, source) -> dict:
         "paired_factor": _key(solver._paired_factor_solve_kernel),
         "mf_gs": _key(solver._pgs_solve_mf_gs_kernel),
         "mf_gs_storage": _mf_gs_storage(solver),
+        "mf_colored": _mf_colored(solver),
         "tiers": _tiers(solver),
         "local": local,
         "dense": dense,
@@ -753,9 +754,25 @@ def _sweep(solver, source) -> dict:
     return record
 
 
+def _mf_colored(solver) -> dict | None:
+    """The colored mapping of the matrix-free sweep: its kernel and the worlds it takes, or ``None`` unbuilt."""
+    kernel = solver._pgs_solve_mf_colored_kernel
+    if kernel is None:
+        return None
+    return {
+        "kernel": _key(kernel),
+        "min_rows": int(sweep_routes.COLORED_ROWS),
+        "reason": (
+            f"Worlds of at least {sweep_routes.COLORED_ROWS} free-body contact rows sweep a color's units at once, a "
+            "block each; the others keep the one-warp mapping (the measured crossover of their solve times)."
+        ),
+    }
+
+
 def _sweep_kernels(solver, record) -> set:
     """Every sweep kernel key of a sweep record."""
     keys = {record[name] for name in ("sparse", "sparse_diagonal", "paired_factor", "mf_gs", "free_body_matrix_free")}
+    keys.add((record["mf_colored"] or {}).get("kernel"))
     keys.update(tier["kernel"] for tier in (record["tiers"] or {}).get("tiers", ()))
     for owner in ("internal", "pair", "residual"):
         keys.update((record["local"] or {}).get(owner, {}).values())

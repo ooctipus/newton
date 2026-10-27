@@ -87,6 +87,7 @@ def _pack_state(has_free_rigid_bodies):
     """Stand in for a solver with opaque metadata-pack operands."""
     state = SimpleNamespace(
         _pack_mf_meta_kernel=object(),
+        _colored_units=None,
         _has_free_rigid_bodies=has_free_rigid_bodies,
         world_count=7,
         model=SimpleNamespace(device="mock-device"),

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
 import inspect
 import unittest
 import warnings
@@ -10,9 +11,9 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.feather_pgs import execution_plan, sweep_routes, tree_passes
 from newton._src.solvers.feather_pgs import kernels as feather_pgs_kernels
 from newton._src.solvers.feather_pgs import solver_feather_pgs as solver_module
-from newton._src.solvers.feather_pgs import tree_passes
 from newton._src.solvers.feather_pgs.contact_row_plan import contact_row_plan
 from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _DENSE_META_MAX_PARENT,
@@ -21,7 +22,6 @@ from newton._src.solvers.feather_pgs.solver_feather_pgs import (
     _estimate_hinv_jt_shared_memory,
     _FeatherPGSExecutionPlan,
     _select_hinv_jt_chunk_size,
-    _select_mfgs_storage,
     _validate_dense_metadata_encoding,
 )
 from newton.solvers import SolverFeatherPGS
@@ -852,10 +852,14 @@ class TestFeatherPGSLaunchConfig(unittest.TestCase):
 
     def test_mfgs_metadata_storage_respects_resource_budget(self):
         """Keep resident metadata only when its complete working set fits."""
-        options = {"has_drive_rows": False, "fuse_vel_limits": False, "block_count": 16384, "sm_count": 188}
-        compact = _select_mfgs_storage(192, 64, 29, 101376, **options).shared_metadata
-        large = _select_mfgs_storage(1024, 4096, 604, 101376, **options).shared_metadata
-        overcommitted = _select_mfgs_storage(192, 64, 29, 4096, **options).shared_metadata
+
+        def storage(shape, budget):
+            staging = functools.partial(sweep_routes.mf_gs_staging, *shape, has_drive_rows=False, fuse_vel_limits=False)
+            return execution_plan._select_mfgs_storage(staging, budget, block_count=16384, sm_count=188)
+
+        compact = storage((192, 64, 29), 100352).shared_metadata
+        large = storage((1024, 4096, 604), 100352).shared_metadata
+        overcommitted = storage((192, 64, 29), 4096).shared_metadata
 
         self.assertTrue(compact)
         self.assertFalse(large)

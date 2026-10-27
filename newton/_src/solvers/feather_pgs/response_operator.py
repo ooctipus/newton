@@ -761,10 +761,6 @@ class FreeBody6(ResponseOperator):
     free-body loop's order (``order="loop"``) adds the residual's products
     one at a time instead, body ``a``'s six then ``b``'s.
     The builder stores ``1 / A_ii`` (``A_ii = cfm + J_a MiJt_a + J_b MiJt_b``).
-
-    With ``copies`` (one thread), ``dof_a``/``dof_b`` are the first coordinates of the bodies' copies and each
-    side's response is scaled by its copy count: a copy of a split body carries ``1 / k`` of its mass, so its
-    ``M^-1 J^T`` is ``k`` times the body's (:mod:`.sweep_units`); the diagonal is the caller's (:attr:`inverse`).
     """
 
     lanes: Lanes = Lanes()
@@ -779,8 +775,6 @@ class FreeBody6(ResponseOperator):
     order: str = "split"
     """One thread's residual order: ``"split"`` (each body's products as one expression) or ``"loop"`` (one product
     at a time)."""
-    copies: tuple[str, str] | None = None
-    """One thread: the copy counts ``(k_a, k_b)`` (native expressions) that scale each side's response."""
     entry: Callable[[str, str, str], str] | None = None
     """One thread: where entry ``k`` of a row's ``J_a``, ``J_b``, ``MiJt_a`` or ``MiJt_b`` (the array's name) is
     read, ``entry(array, row, k)``, when a mapping stages the rows elsewhere (default: the array, by row)."""
@@ -791,8 +785,8 @@ class FreeBody6(ResponseOperator):
     def __post_init__(self):
         if self.order not in self.ORDERS:
             raise ValueError(f"order must be one of {self.ORDERS}, got {self.order!r}")
-        if (self.copies is not None or self.entry is not None) and self.lanes.parallel:
-            raise ValueError("body copies and staged entries take the one-thread layout")
+        if self.entry is not None and self.lanes.parallel:
+            raise ValueError("staged entries take the one-thread layout")
 
     # -- build (response_builds_rows) ---------------------------------------------------------------------------------
 
@@ -948,7 +942,7 @@ class FreeBody6(ResponseOperator):
         """``float out = J_i MiJt_s`` (lanes 0-11, reduced; one thread: from zero)."""
         if not self.lanes.parallel:
             return self._per_coordinate(
-                out, "0.0f", lambda J, M, body: f"{self._at(J, row, 'k')} * {self._response(M, sibling, 'k')}", indent
+                out, "0.0f", lambda J, M, body: f"{self._at(J, row, 'k')} * {self._at(M, sibling, 'k')}", indent
             )
         lane = self.lanes.lane
         i_row, s_row = f"{self.base} + {row} * 6", f"{self.base} + {sibling} * 6"
@@ -1000,9 +994,7 @@ class FreeBody6(ResponseOperator):
         if not self.lanes.parallel:
             return "".join(
                 f"\n{indent}if ({body} >= 0) {{"
-                + "".join(
-                    f"\n{indent}    {self._v(body, k)} += {self._response(M, row, k)} * {delta};" for k in range(6)
-                )
+                + "".join(f"\n{indent}    {self._v(body, k)} += {self._at(M, row, k)} * {delta};" for k in range(6))
                 + f"\n{indent}}}"
                 for M, body in ((self.MiJt_a, "dof_a"), (self.MiJt_b, "dof_b"))
             )
@@ -1021,13 +1013,6 @@ class FreeBody6(ResponseOperator):
         if self.entry is not None:
             return self.entry(array, row, str(k))
         return f"{array}.data[{self.base} + {row} * 6 + {k}]"
-
-    def _response(self, array: str, row: str, k) -> str:
-        """Entry ``k`` of row ``row``'s ``M^-1 J^T`` on one side, times the side's copy count with copies."""
-        if self.copies is None:
-            return self._at(array, row, k)
-        copies = self.copies[0] if array == self.MiJt_a else self.copies[1]
-        return f"({copies} * {self._at(array, row, k)})"
 
     def _v(self, first: str, k) -> str:
         return self.velocity.at(f"{first} + {k}" if k != 0 else first)
